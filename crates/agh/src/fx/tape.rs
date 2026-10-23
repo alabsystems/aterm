@@ -547,7 +547,6 @@ enum Remedy {
     /// The file is flushed and durable, but its directory entry is not (`durable_dir` failed,
     /// as under a parent that cannot be opened for reading): the file is whole and kept, and
     /// the next is `replay it: agh --replay {path}`.
-    #[cfg(unix)]
     Unflushed,
 }
 
@@ -607,7 +606,6 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
         }
         Remedy::Whole => not_written(path, why).with_next(replay_it()),
         Remedy::Discarded => not_written(path, why),
-        #[cfg(unix)]
         Remedy::Unflushed => Error::could_not_run(format!(
             "the tape {} is whole, but its directory could not be flushed: {why}",
             path.display()
@@ -742,19 +740,16 @@ impl TapeSink {
             state.failed = Some(e.clone());
             return Err(latched_error(&state.path, &e, Remedy::Kept));
         }
-        #[cfg(unix)]
-        {
-            let dir = state
-                .path
-                .parent()
-                .filter(|dir| !dir.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            if let Err(e) = aterm_durable::durable_dir(dir) {
-                let e = e.to_string();
-                state.failed = Some(e.clone());
-                state.remedy = Remedy::Unflushed;
-                return Err(latched_error(&state.path, &e, Remedy::Unflushed));
-            }
+        let dir = state
+            .path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Err(e) = aterm_durable::durable_dir(dir) {
+            let e = e.to_string();
+            state.failed = Some(e.clone());
+            state.remedy = Remedy::Unflushed;
+            return Err(latched_error(&state.path, &e, Remedy::Unflushed));
         }
         state.finished = true;
         Ok(())

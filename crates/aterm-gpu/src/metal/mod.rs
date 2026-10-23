@@ -35,10 +35,11 @@ pub(crate) mod test_support {
         pub(crate) pad: f32,
     }
 
-    ///
+    /// View `v` as a byte slice for GPU upload.
     ///
     /// # Safety
-    /// `T` must be `repr(C)` and free of padding-sensitive invariants; the bytes are copied straight into a GPU-visible buffer.
+    /// `T` must be `repr(C)` and free of padding-sensitive invariants; the bytes are copied
+    /// straight into a GPU-visible buffer.
     pub(crate) unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
         // SAFETY: `T: Copy` + `repr(C)`; read-only, lives only for the copy.
         unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
@@ -145,8 +146,6 @@ mod tests {
         w: i32,
     }
 
-    /// EMBERFORGE: the MSL fire field must equal `aterm_render::fire_field`
-    /// exactly, at every pixel, for every parameter extreme.
     #[test]
     fn fire_field_matches_the_cpu_bit_for_bit() {
         use aterm_render::fire_field::{
@@ -288,7 +287,6 @@ mod tests {
         );
     }
 
-    /// PHOSPHOR: the MSL rain halo falloff must equal `aterm_render`'s.
     #[test]
     fn rain_halo_matches_the_cpu_bit_for_bit() {
         use aterm_render::{halo_row_ny, halo_weight};
@@ -399,8 +397,6 @@ mod tests {
         pad: [f32; 2],
     }
 
-    /// The objects every state probe shares: a device, the compiled probe
-    /// library, and a queue.
     struct StateProbe {
         dev: Device,
         lib: ffi::Library,
@@ -416,8 +412,6 @@ mod tests {
             Self { dev, lib, queue }
         }
 
-        /// `vs_probe` + `fragment`, at one destination format, write mask and
-        /// blend state.
         fn pipeline(
             &self,
             fragment: &str,
@@ -449,8 +443,6 @@ mod tests {
             b
         }
 
-        /// A render target pre-filled with `fill`, so a `LoadAction::Load` pass
-        /// starts from known bytes and untouched texels stay byte-exact.
         fn filled_target(&self, format: PixelFormat, w: usize, h: usize, fill: &[u8]) -> ffi::Obj {
             assert_eq!(fill.len(), format.bytes_per_texel(), "fill is one texel");
             let tex = self
@@ -480,7 +472,6 @@ mod tests {
             tex
         }
 
-        /// Run one pass and return the destination as tightly packed bytes.
         fn read(&self, pass: &Pass<'_>, format: PixelFormat) -> Vec<u8> {
             let row = pass.dst_w * format.bytes_per_texel();
             let n = row * pass.dst_h;
@@ -491,7 +482,6 @@ mod tests {
         }
     }
 
-    /// The colour write mask, one channel at a time.
     #[test]
     fn color_write_mask_gates_each_channel_on_the_gpu() {
         let dev = device();
@@ -499,10 +489,7 @@ mod tests {
         const W: usize = 8;
         const H: usize = 8;
         const FMT: PixelFormat = PixelFormat::Rgba8Unorm;
-        /// Loaded destination: RGB plus the 64/255 translucent-window alpha.
         const DST: [u8; 4] = [10, 20, 30, 64];
-        /// Emitted: exact multiples of 1/255, so the store adds no rounding of
-        /// its own, and alpha 1.0 as the additive effect shaders emit.
         const SRC: [u8; 4] = [51, 68, 85, 255];
 
         let uniform = p.uniform(ProbeUniform {
@@ -583,9 +570,6 @@ mod tests {
         }
     }
 
-    /// Draw `fs_probe_sample` over a `dw` x `dh` destination, fetching a
-    /// `sw` x `sh` RGBA8 source through `desc`, and return the destination
-    /// bytes.
     fn sample_through(
         p: &StateProbe,
         (sw, sh): (usize, usize),
@@ -629,8 +613,6 @@ mod tests {
         )
     }
 
-    /// `setMagFilter:` reaches the sampled bytes, proven by a magnifying pass
-    /// (the only kind that consults it).
     #[test]
     fn sampler_mag_filter_changes_the_magnified_bytes() {
         let dev = device();
@@ -673,7 +655,6 @@ mod tests {
         );
     }
 
-    /// `setMinFilter:` reaches the sampled bytes, proven by a minifying pass.
     #[test]
     fn sampler_min_filter_changes_the_minified_bytes() {
         let dev = device();
@@ -714,11 +695,6 @@ mod tests {
         );
     }
 
-    /// Every aterm library compiles with `preserveInvariance` ON (so
-    /// `cell.metal`'s `to_ndc` and `hdr_glow.metal`'s inline NDC math compute
-    /// the same quad corners, as the HDR crown re-emits aurora quads) and with
-    /// `languageVersion` pinned to the macOS 11 floor, not inherited from the
-    /// running OS's compiler.
     #[test]
     fn compile_options_pin_invariance_and_the_language_version() {
         let _ = device();
@@ -799,9 +775,6 @@ mod tests {
         chrome_first: Option<usize>,
     }
 
-    /// The Metal blit must be byte-identical to the wgpu blit on the same
-    /// source texels and 112 uniform bytes, across every reachable `fs_blit`
-    /// arm.
     #[test]
     #[cfg(wgpu_arm)]
     fn blit_matches_wgpu_byte_for_byte() {
@@ -1096,9 +1069,6 @@ mod tests {
         gpu.set_chrome_bleed(None);
     }
 
-    /// Armed inline-image differential: `render_input` with a real OSC 1337
-    /// image through the wgpu arm and the armed Metal arm (which re-mints the
-    /// plane from `ImagePlane::metal_texels`).
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_inline_image_plane_matches_the_wgpu_arm_byte_for_byte() {
@@ -1215,8 +1185,6 @@ mod tests {
         );
     }
 
-    /// Armed readback-effects differential: `render_input` with bloom, shimmer
-    /// (phase pinned) and a tray card live, wgpu vs armed, byte-identical x N=5.
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_readback_effects_match_the_wgpu_arm_byte_for_byte() {
@@ -1266,7 +1234,6 @@ mod tests {
             .collect();
         let mut card_b = card_a.clone();
         for px in card_b.as_chunks_mut::<4>().0 {
-            // a visibly different card, same dims
             px[2] = 40;
         }
         let tray = |rgba: &'static [u8]| TrayQuad {
@@ -1370,10 +1337,6 @@ mod tests {
         );
     }
 
-    /// Armed tap-ring differential: the production ring with Metal staging
-    /// slots rides the armed Submit B onto a real standalone drawable (copy
-    /// before commit, status-polled harvest), and every harvested frame must
-    /// equal the drawable bytes of the same present.
     #[test]
     fn armed_present_tap_ring_captures_the_submit_b_destination_byte_for_byte() {
         const N: usize = 3;
@@ -1467,9 +1430,6 @@ mod tests {
         );
     }
 
-    /// Armed scissor differential: the same typed-then-scrolled present
-    /// sequence through the wgpu arm and the armed arm (residency keyed by
-    /// `PresentPrev::on_metal`).
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_scissored_present_cadence_matches_wgpu_byte_for_byte() {
@@ -1544,9 +1504,6 @@ mod tests {
         );
     }
 
-    /// Submit-A pipelining: N armed frames stay byte-identical to wgpu while the
-    /// arm holds each frame's Submit A in flight at return and, by the next
-    /// frame's staging, has consumed exactly the prior frames' submits.
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_submit_a_pipelines_and_stays_byte_identical() {
@@ -1589,9 +1546,6 @@ mod tests {
         );
     }
 
-    /// Multi-window disarm edge: window A attaches an armed swapchain; window
-    /// B's attach fails (no parent layer) and disarms the renderer; A's next
-    /// present must drop its armed surface so A's parent has zero sublayers.
     #[test]
     #[cfg(wgpu_arm)]
     fn a_disarm_unparents_the_previously_armed_windows_stale_layer() {
@@ -1653,10 +1607,6 @@ mod tests {
         );
     }
 
-    /// Armed present differential with a translucent destination, alpha
-    /// compared: wgpu's `present_to_view` body onto a PostMultiplied-shaped
-    /// destination (`wgpu_present_bytes_for_test`) against the armed present
-    /// onto a standalone `opaque = false` drawable.
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_present_translucency_matches_wgpu_end_to_end() {
@@ -1726,9 +1676,6 @@ mod tests {
         }
     }
 
-    /// Armed virtual-present differential: `present_virtual` plus the tap ring
-    /// (`virtual_presented_snapshot_current`), wgpu vs armed, byte-identical
-    /// including the tap's harvest and swizzle.
     #[test]
     #[cfg(wgpu_arm)]
     fn armed_virtual_present_feeds_the_unchanged_tap_ring_byte_for_byte() {
@@ -1800,8 +1747,6 @@ mod tests {
         crate::stderr_line!("armed virtual-present tap differential: byte-identical x {N} runs");
     }
 
-    /// Full-frame differential: `render_input`'s frame, wgpu vs Metal, byte
-    /// equal, on fixtures shaped like the parity suites:
     #[test]
     #[cfg(wgpu_arm)]
     fn full_frame_render_input_matches_wgpu_byte_for_byte() {
@@ -2236,9 +2181,6 @@ mod tests {
         }
     }
 
-    /// Scissored Load frame: present A (full), then present B (dirty), with B's
-    /// recorded Load+scissor plan replayed on Metal over a seed of the
-    /// pre-encode bytes.
     #[test]
     #[cfg(wgpu_arm)]
     fn the_scissored_load_frame_is_byte_identical_across_arms() {
@@ -2340,11 +2282,6 @@ mod tests {
         crate::stderr_line!("scissored Load frame: byte-identical + isolated x {N} runs");
     }
 
-    /// Present-path differential: one cropped, letterboxed present through the
-    /// wgpu body (`present_virtual_with_crop` → `present_to_view`, captured by
-    /// the virtual snapshot tap) against the Metal arm's Submit B on a real
-    /// standalone swapchain, N=5 for each of `fx_tray` (bloom, shimmer, card),
-    /// `fx_only` (bloom, shimmer) and `plain` (the blit samples the offscreen).
     #[test]
     #[cfg(wgpu_arm)]
     fn present_path_matches_wgpu_virtual_present_byte_for_byte() {
@@ -2538,9 +2475,6 @@ mod tests {
         }
     }
 
-    /// Crown pair from one fixture: `hdr_glow` onto a seeded `Rgba16Float`
-    /// target (One/One, both `s2l` branches, the headroom clamp) and `sdr_glow`
-    /// onto a seeded `Bgra8Unorm` target (screen blend).
     #[test]
     #[cfg(wgpu_arm)]
     fn crown_rows_match_wgpu_byte_for_byte() {

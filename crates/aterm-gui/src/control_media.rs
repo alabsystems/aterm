@@ -2730,7 +2730,6 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             }
             from = Some(aterm_session::SessionId::new(v));
         } else if tok.starts_with("len=") {
-            // The frame's length, which the serve loop read and consumed.
             framed = true;
         } else {
             return Err(());
@@ -4041,7 +4040,7 @@ mod close_arg_tests {
 #[cfg(test)]
 mod wire_tab_close_guard_tests {
     use crate::app_window::{CloseConfirm, WIRE_CLOSE_REFUSED, WIRE_TAB_CLOSE_REFUSED};
-    use crate::session_store::{ExitActor, ExitReason, RosterChange};
+    use crate::session_store::{ExitActor, ExitReason};
     use crate::{App, TabAction, WindowId};
 
     use crate::feed_session_for_test as feed;
@@ -4072,11 +4071,13 @@ mod wire_tab_close_guard_tests {
         state
     }
 
+    /// The newest close's reason and closer, from the closed index (6G-9).
     fn last_exit(app: &App) -> (ExitReason, String) {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let row = g
-            .roster_since(0)
-            .rfind(|r| r.change == RosterChange::Exited)
+            .closed_logs()
+            .exits_since(0)
+            .next_back()
             .expect("an exit row after the close");
         (row.reason, row.actor.as_wire().to_string())
     }
@@ -5705,8 +5706,6 @@ mod video_parse_tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&root).unwrap();
         for index in 0..=VIDEO_RECORDING_SCAN_MAX {
-            // Invalid names count too: otherwise an attacker could hide unbounded
-            // work behind entries the server later ignores.
             std::fs::create_dir(root.join(format!("junk-{index:04}"))).unwrap();
         }
 

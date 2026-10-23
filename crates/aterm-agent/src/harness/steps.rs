@@ -13,19 +13,18 @@ use super::transcript;
 use super::usage::{Seen, SeenIds, TokenUsage};
 use crate::supervise::run::wall_confirm::{self, Class, Entry, Row, TranscriptEnd};
 
-/// The Claude Code builds whose transcript rows the lab read, each with its key-only reduction committed (`harness/testdata/steps/<build>.jsonl`).
+/// The Claude Code builds whose transcript rows the lab read, each with its key-only reduction committed.
 pub const MEASURED_BUILDS: &[&str] = &["2.1.303"];
 
-/// The most steps the fold holds between two takes; past it the oldest is dropped and counted ([`StepBatch::overflow`]).
+/// The most steps the fold holds between two takes; past it the oldest is dropped and counted.
 pub const STEP_QUEUE: usize = 1024;
 
 /// The most message ids a vendor turn's token count dedupes.
 pub const TURN_IDS_MAX: usize = 64;
 
-/// How many decoded bytes of a user row's first text the shape test reads.
 const LEAD_BYTES: usize = 63;
 
-/// A background task's wake (`<task-notification>…`): Claude Code's own, no prompt (`upgrade::asked_by` reads it as nobody's).
+/// A background task's wake (`<task-notification>…`): Claude Code's own, no prompt.
 pub(crate) const TASK_NOTIFICATION: &str = "<task-notification>";
 /// A shell-mode command (`! cmd`), which asks the model nothing.
 pub(crate) const BASH_INPUT: &str = "<bash-input>";
@@ -33,11 +32,9 @@ pub(crate) const BASH_INPUT: &str = "<bash-input>";
 pub(crate) const BASH_STDOUT: &str = "<bash-stdout>";
 /// A shell-mode command's error output.
 pub(crate) const BASH_STDERR: &str = "<bash-stderr>";
-/// Esc's row (`[Request interrupted by user]`, `… for tool use]`).
+/// Esc's row (`Request interrupted by user`, `… for tool use`).
 pub(crate) const INTERRUPTED: &str = "[Request interrupted by user";
 
-/// A LOCAL COMMAND's own rows, as `wall_confirm`'s `local_command` reads a
-/// user row's string content: no turn of the conversation's.
 const LOCAL_COMMAND: [&str; 4] = [
     "<command-name>",
     "<command-message>",
@@ -78,7 +75,7 @@ const KEY_PROMPT_ID: &str = anchor_text("transcript.promptId");
 const KEY_PARENT: &str = anchor_text("transcript.parentUuid");
 const KEY_LOCAL_COMMAND: &str = anchor_text("transcript.local_command");
 
-/// An id as the session log takes one (`aterm_slog::ShortId`'s rule): 1 to 40 bytes of `[A-Za-z0-9._:@-]`.
+/// An id as the session log takes one (`aterm_slog::ShortId`'s rule).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StepId {
     bytes: [u8; StepId::MAX],
@@ -220,9 +217,8 @@ pub enum StepState {
 pub enum StepEvent {
     /// The fold bound a file: its first `len` bytes are history.
     Bind {
-        /// The file's length at the bind; for the file the registry named
-        /// while it did not exist ([`StepFold::note_vacant`]), its seed
-        /// (none of it, but a watermark the log held).
+        /// The file's length at the bind; for the file the registry named while it did not
+        /// exist ([`StepFold::note_vacant`]), its seed.
         len: u64,
     },
     /// A user row that starts a vendor turn.
@@ -254,20 +250,19 @@ pub enum StepEvent {
     TurnEnd {
         /// Its `durationMs`.
         vdur_ms: u64,
-        /// Input tokens over its rows (input, cache writes and reads), each
-        /// message counted once at its largest ([`TURN_IDS_MAX`]).
+        /// Input tokens over its rows (input, cache writes and reads), each message counted once at its largest.
         tok_in: u64,
         /// Output tokens over its rows.
         tok_out: u64,
     },
-    /// The turn the row just ended ended on Claude Code's own notice of this wall (the harness's `transcript_wall`).
+    /// The turn the row just ended ended on Claude Code's own notice of this wall.
     EndWall {
         /// The notice's wall.
         kind: WallKind,
     },
     /// `system subtype=compact_boundary`.
     Compact,
-    /// A main-chain assistant row whose model or effort is not the last one this fold said (the first after a bind included).
+    /// A main-chain assistant row whose model or effort is not the last one this fold said.
     Model {
         /// `message.model`.
         model: StepId,
@@ -299,15 +294,15 @@ pub struct Step {
 pub struct StepBatch {
     /// The steps, oldest first.
     pub steps: Vec<Step>,
-    /// Steps dropped from a full queue (the oldest): the join is desynced until the next prompt (`TxEvent::Overflow`).
+    /// Steps dropped from a full queue (the oldest): the join is desynced until the next prompt.
     pub overflow: u64,
-    /// Rows past the seed the fold could not read (not UTF-8, not JSON, longer than the line bound): `TxEvent::Lost`.
+    /// Rows past the seed the fold could not read.
     pub lost: u64,
     /// The main chain's end after the last row read.
     pub end: End,
 }
 
-/// What the newest main-chain entry is (the harness's `Entry`, without its text, and the opaque local command).
+/// What the newest main-chain entry is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EndClass {
     /// Nothing of the conversation's yet.
@@ -340,7 +335,6 @@ pub struct End {
     classes: u8,
 }
 
-/// One screen wall of each class, for asking `confirms` once per class.
 const CLASSES: [WallKind; 5] = [
     WallKind::UsageSession,
     WallKind::Context,
@@ -415,7 +409,6 @@ struct EndFold {
     end: End,
 }
 
-/// What the end reads of a main-chain row.
 enum EndRow {
     Entry(EndClass, Option<(Option<WallKind>, u8)>),
     Closed,
@@ -444,8 +437,6 @@ impl EndFold {
     }
 }
 
-/// A notice row (`isApiErrorMessage`) read as the harness reads it, its
-/// classes and wall kept and its text dropped.
 fn notice_of(line: &str) -> (Option<WallKind>, u8) {
     notice_read(line).map_or((None, 0), |n| {
         let classes = CLASSES
@@ -472,13 +463,13 @@ pub struct NoticeRead {
     pub limit: Option<String>,
     /// The wall it is once its turn is closed (`transcript_wall`).
     pub wall: Option<WallKind>,
-    /// Whether it confirms a screen wall of each class, in the order of a usage limit, a full context, the lost login, an API error and the memory wall (`confirms`, which reads the screen's class alone).
+    /// Whether it confirms a screen wall of each class, in the order of a usage limit, a full context, the lost login, an API error and the memory wall.
     pub confirms: [bool; 5],
     /// Which limit it names (`limit_named`: by its words, else by its `rateLimitType`).
     pub named: Option<WallKind>,
 }
 
-/// [`NoticeRead`] of one transcript line; `None` for a line that is no notice, and one that is no JSON.
+/// [`NoticeRead`] of one transcript line.
 #[must_use]
 pub fn notice_read(line: &str) -> Option<NoticeRead> {
     let v = transcript::conversation(line).ok()?;
@@ -540,9 +531,6 @@ pub(super) fn quoted(line: &str, word: &str) -> bool {
     false
 }
 
-/// The first decoded bytes of a user row's first text: its string content,
-/// or its content's first `text` part, with whether it was the string and
-/// whether it was read whole.
 struct Lead {
     bytes: [u8; LEAD_BYTES],
     len: usize,
@@ -559,8 +547,6 @@ impl Lead {
         }
     }
 
-    /// Whether this is a local command's own row (`wall_confirm`'s
-    /// `local_command`, on a string content only, as `user_entry` asks).
     fn local(&self) -> bool {
         if !self.string {
             return false;
@@ -576,8 +562,6 @@ impl Lead {
     }
 }
 
-/// [`Lead`] of `line`, found after its `"message":` key; `None` where the
-/// content is neither a string nor holds a text part.
 fn lead(line: &str) -> Option<Lead> {
     let m = line.find("\"message\":")?;
     let rest = &line[m..];
@@ -650,8 +634,6 @@ fn lead(line: &str) -> Option<Lead> {
     Some(lead)
 }
 
-/// A `\uXXXX` escape at the start of `b` (a surrogate pair as one), and how
-/// many bytes it spans.
 fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
     let hex = |s: &[u8]| -> Option<u32> {
         let t = std::str::from_utf8(s.get(2..6)?).ok()?;
@@ -673,8 +655,6 @@ fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
     Some((char::from_u32(hi)?, 6))
 }
 
-/// A row's `timestamp` as wall ms: whole seconds (`parse_utc_fractional`'s
-/// rule) and the first three digits of its fraction.
 fn stamp_ms(s: &str) -> Option<u64> {
     let secs = u64::try_from(aterm_types::rfc3339::parse_utc_fractional(s)?).ok()?;
     let ms = s
@@ -760,7 +740,6 @@ struct Pending {
     wake: bool,
 }
 
-/// A local command's output, which says the command before it ran no turn.
 const LOCAL_OUTPUT: &str = "<local-command-";
 
 /// What a user row that is no local command's asks.
@@ -779,14 +758,12 @@ enum Ask {
     Nothing,
 }
 
-/// A vendor turn's name on a user row: its `promptId`, else its `uuid`.
 fn vref_of(obj: &Map) -> Option<StepId> {
     [KEY_PROMPT_ID, "uuid"]
         .iter()
         .find_map(|k| obj.get(*k).and_then(Value::as_str).and_then(StepId::new))
 }
 
-/// A `promptId` as the fold compares it (any string, never kept).
 const fn fingerprint(id: &str) -> u64 {
     aterm_hash::fnv1a_64(id.as_bytes())
 }
@@ -843,7 +820,7 @@ pub struct StepFold {
 }
 
 impl StepFold {
-    /// A fold whose rows older than `floor_ms` (wall ms) are history, and whose log holds the watermark `given` (the glue's read of `TxView::through`; `None` for none).
+    /// A fold whose rows older than `floor_ms` (wall ms) are history, and whose log holds the watermark `given`.
     #[must_use]
     pub fn new(floor_ms: u64, given: Option<StepMark>) -> StepFold {
         StepFold {
@@ -868,7 +845,7 @@ impl StepFold {
         }
     }
 
-    /// The floor and the log's watermark again (a later process, a fold the glue re-read the log for): the floor only rises.
+    /// The floor and the log's watermark again.
     pub fn set_floor(&mut self, floor_ms: u64, given: Option<StepMark>) {
         self.floor_ms = self.floor_ms.max(floor_ms);
         self.given = given;
@@ -975,7 +952,7 @@ impl StepFold {
         );
     }
 
-    /// A line of the main transcript longer than the line bound, ending at `end`: counted lost when it is past the seed.
+    /// A line of the main transcript longer than the line bound, ending at `end`.
     pub const fn long_line(&mut self, end: u64) {
         if end > self.seed {
             self.lost = self.lost.saturating_add(1);
@@ -1136,15 +1113,10 @@ impl StepFold {
         self.through = self.through.max(end);
     }
 
-    /// End the opening hold: what it held goes on in the queue as it was
-    /// read.
     const fn release(&mut self) {
         self.hold = None;
     }
 
-    /// A main-chain assistant row of a model's (never Claude Code's own
-    /// `<synthetic>` notice) with a row waiting for it: the turn it asked
-    /// ran.
     fn ran(&mut self, obj: &Map) -> Option<(StepId, Option<u64>)> {
         let model = obj
             .get("message")
@@ -1183,7 +1155,6 @@ impl StepFold {
         self.through = self.through.max(end);
     }
 
-    /// The state of the rows now.
     fn state(&self) -> StepState {
         state_for(MEASURED_BUILDS, self.version.as_ref().map(StepId::as_str))
     }
@@ -1193,13 +1164,11 @@ impl StepFold {
         self.enqueue_as(pos, state, ev);
     }
 
-    /// Queue one step, dropping the oldest non-`Bind`/non-`Off` step when full.
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         self.trim();
     }
 
-    /// Bound the queue to [`STEP_QUEUE`] as [`Self::enqueue_as`] says.
     fn trim(&mut self) {
         while self.queue.len() > STEP_QUEUE {
             let pinned = |s: &Step| matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Off { .. });
@@ -1214,8 +1183,6 @@ impl StepFold {
         }
     }
 
-    /// `live`: a row the log takes, past the seed and no older than the
-    /// floor (the model is said only on one).
     fn assistant(
         &mut self,
         line: &str,
@@ -1283,9 +1250,6 @@ impl StepFold {
         EndRow::Entry(EndClass::Reply, None)
     }
 
-    /// A user row: its end entry, and the vendor turn's name when it is the
-    /// conversation's first prompt written after newer rows (the harness's
-    /// exception), for [`Self::push`] to hand to the opening hold.
     fn user(
         &mut self,
         line: &str,
@@ -1395,8 +1359,6 @@ impl StepFold {
         (EndRow::Entry(EndClass::Input, None), None)
     }
 
-    /// A vendor turn's prompt: its tokens start over, and it is named by
-    /// its `promptId`, else its row's `uuid` (none: counted lost).
     fn prompt(&mut self, obj: &Map, out: &mut Vec<StepEvent>) {
         self.turn = TurnTokens::default();
         match vref_of(obj) {
@@ -1447,7 +1409,6 @@ pub(super) fn state_for(measured: &[&str], version: Option<&str>) -> StepState {
     }
 }
 
-/// A message's content parts (the `steps` projection's), as objects.
 fn parts(message: Option<&Map>) -> impl Iterator<Item = &Map> {
     message
         .and_then(|m| m.get("content"))

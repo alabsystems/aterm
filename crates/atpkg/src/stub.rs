@@ -35,7 +35,7 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
     ("ty", "ALab's specification checker"),
 ];
 
-/// The coding agents aterm is the version manager for: default-set members like every program the index names.
+/// Coding agents managed by `aterm` as default-set members.
 pub const AGENT_PROGRAMS: &[&str] = &{
     use crate::vendor_direct::VENDORS;
     let mut names = [""; VENDORS.len()];
@@ -63,8 +63,6 @@ pub fn describe(name: &str) -> Option<&'static str> {
         .or_else(|| crate::vendor_direct::spec(name).map(|s| s.description))
 }
 
-/// Every name a compiled roster covers before the first signed index resolves: the
-/// default-set members, then the agent programs.
 fn compiled_names() -> impl Iterator<Item = &'static str> {
     DEFAULT_SET_STUB_NAMES
         .iter()
@@ -72,9 +70,6 @@ fn compiled_names() -> impl Iterator<Item = &'static str> {
         .chain(AGENT_PROGRAMS.iter().copied())
 }
 
-/// The commands a pending program answers for beside its own name: the branded names
-/// people and agents type (`targo`, `trustc`, `tippy`, `trustfmt`, `trustdoc` for `trust`),
-/// from the table that maps each to its program ([`crate::reroute::TABLE`]).
 fn commands_of(program: &str) -> impl Iterator<Item = &'static str> + '_ {
     crate::reroute::TABLE
         .iter()
@@ -107,8 +102,6 @@ pub fn program_of_in(layout: &Layout, name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-/// The program the pending stub at `path` names on its [`COMES_WITH`] line, if it is a
-/// pending stub that names one (and the name is one a stub could carry).
 fn stub_comes_with(path: &Path) -> Option<String> {
     let text = crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).ok()?;
     if !text.lines().any(|l| is_marker_line(l, STUB_MARKER)) {
@@ -125,11 +118,6 @@ fn stub_comes_with(path: &Path) -> Option<String> {
         .map(|program| program.as_str().to_string())
 }
 
-/// The stubs for `program`'s commands in `bin/` — the branded ones ([`commands_of`]) and the
-/// ones its signed manifest exposes (`exposed`, the index-resolve reconcile's) — rendered,
-/// each naming `program` ([`COMES_WITH`]) and each only where [`pending_stub_executable`]
-/// would lay one; `keep` gains every command name whose slot is the program's to answer
-/// for — laid now, or already standing.
 fn command_stub_executables<'a>(
     layout: &Layout,
     program: &str,
@@ -160,16 +148,11 @@ fn command_stub_executables<'a>(
     }
 }
 
-/// The marker line that identifies a pending stub — the recognition gate for every
-/// rewrite/removal below.
 const STUB_MARKER: &str = "# atpkg pending-program stub v1";
 
-/// What a command's stub says of the program that brings it, on a comment line of its own
-/// (`# comes with: trust`, or behind a batch `rem`): `__pending` reads it to wait for that
-/// program ([`program_of_in`]).
 const COMES_WITH: &str = "comes with: ";
 
-/// The static last-resort message (fallback 3) — the one line the stub can always say without an atpkg to ask.
+/// Static last-resort fallback message when `atpkg` is unavailable.
 pub const STUB_UNREACHABLE_MSG: &str =
     "aterm's package manager is not reachable — open aterm to finish installing";
 
@@ -187,9 +170,6 @@ pub(crate) fn sh_single_quote(s: &str) -> String {
     out
 }
 
-/// The inverse of [`sh_single_quote`]:
-/// the text a word made of `'…'` runs and `\'` escapes stands for, or `None` for any other
-/// spelling — a value this crate did not quote is never guessed at.
 fn sh_single_unquote(word: &str) -> Option<String> {
     let mut out = String::new();
     let mut rest = word;
@@ -233,7 +213,6 @@ fn cmd_named_atpkg(body: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The atpkg the pending stub `body` names, in either spelling.
 fn stub_named_atpkg(body: &str) -> Option<PathBuf> {
     sh_named_atpkg(body, "ATPKG").or_else(|| cmd_named_atpkg(body))
 }
@@ -284,12 +263,6 @@ fn stub_content_sh(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> S
     s
 }
 
-/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. `cmd`
-/// resumes a rewritten batch file only after a line end of the old file, and the only old
-/// line end that can fall inside the frame head ([`crate::platform::CMD_FRAME_HEAD`], 13
-/// bytes) is the first line's: a pre-frame stub's ends on the head's own CRLF, byte 11,
-/// which reads as an empty line; a byte shorter would end on `n` of `:main` and run the
-/// body again.
 const CMD_STUB_FIRST_LINE: &str = "@echo off\r\n";
 
 const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HEAD.len() - 2);
@@ -349,8 +322,6 @@ pub(crate) fn co_located_atpkg_path() -> PathBuf {
     }
 }
 
-/// The path this process runs from (`current_exe`), which [`co_located_atpkg_path`] reads —
-/// or, inside a test, the one [`with_current_exe`] stood this thread at.
 fn running_exe() -> io::Result<PathBuf> {
     #[cfg(all(test, unix))]
     {
@@ -409,17 +380,13 @@ pub(crate) enum Durability {
     Bundle,
 }
 
-/// The first bytes of every `CACHEDIR.TAG` (the Cache Directory Tagging Specification), the
-/// file cargo writes at the root of every target directory.
 const CACHEDIR_TAG_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
-/// Whether `dir` carries a cache-directory tag.
 fn is_cache_dir(dir: &Path) -> bool {
     crate::metadata_io::read_bounded_regular_utf8(&dir.join("CACHEDIR.TAG"), 4096)
         .is_ok_and(|text| text.starts_with(CACHEDIR_TAG_SIGNATURE))
 }
 
-/// Whether `path` sits exactly at `…/<X>.app/Contents/MacOS/<file>`.
 fn in_app_bundle(path: &Path) -> bool {
     let Some(macos) = path.parent() else {
         return false;
@@ -453,20 +420,16 @@ pub(crate) fn durability(atpkg: &Path, temp_roots: &[PathBuf]) -> Durability {
     }
 }
 
-/// Whether the executable at `path` keeps standing where it is: anything but [`Durability::Transient`] ([`temp_roots`]).
+/// Whether the executable at `path` is not in a transient root ([`Durability::Transient`]).
 #[must_use]
 pub fn lasting(path: &Path) -> bool {
     durability(path, &temp_roots()) != Durability::Transient
 }
 
-/// This machine's temporary directories, each as spelled and as it resolves (`/tmp` is
-/// `/private/tmp` on macOS, and `$TMPDIR` sits under `/private/var/folders`): the system
-/// temp dir, `/tmp` and `/var/tmp`.
 fn temp_roots() -> Vec<PathBuf> {
     temp_roots_from(std::env::temp_dir())
 }
 
-/// [`temp_roots`] with `temp_dir` as the system temp dir.
 fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for root in [temp_dir, PathBuf::from("/tmp"), PathBuf::from("/var/tmp")] {
@@ -530,8 +493,6 @@ impl Embedder {
     }
 }
 
-/// Whether `line` is `marker` bare (the sh body) or behind a batch `rem` (the `.cmd`
-/// body).
 fn is_marker_line(line: &str, marker: &str) -> bool {
     let l = line.trim();
     l == marker
@@ -539,7 +500,7 @@ fn is_marker_line(line: &str, marker: &str) -> bool {
             .is_some_and(|rest| rest.trim() == marker)
 }
 
-/// Whether the file at `path` is a pending stub this module wrote, the recognition gate for every rewrite and removal.
+/// Whether the file at `path` is a pending stub written by this module.
 #[must_use]
 pub fn is_pending_stub(path: &Path) -> bool {
     crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024)
@@ -569,8 +530,6 @@ pub(crate) fn pending_stub_executable(
     pending_bin_stub_executable(layout, tool, None)
 }
 
-/// [`pending_stub_executable`] for a command `program` brings ([`command_stub_executables`]):
-/// its body names `program` ([`COMES_WITH`]).
 fn pending_command_stub_executable(
     layout: &Layout,
     tool: &ToolName,
@@ -587,19 +546,15 @@ fn pending_command_stub_executable(
     pending_bin_stub_executable(layout, tool, Some(program.as_str()))
 }
 
-/// The `bin/` stub for `tool`, naming the program it comes with when it is a command.
 fn pending_bin_stub_executable(
     layout: &Layout,
     tool: &ToolName,
     comes_with: Option<&str>,
 ) -> io::Result<Option<crate::lay::Executable>> {
     if cfg!(windows) && !cmd_stub_name_safe(tool.as_str()) {
-        // See `cmd_stub_name_safe`: no inert embedding exists, so no stub.
         return Ok(None);
     }
     if tool.is_alias() {
-        // An alias is never a stub: it names the managed copy once
-        // installed, and the plain name's stub already answers until then.
         return Ok(None);
     }
     pending_stub_at(layout, tool, comes_with, layout.shim(tool))
@@ -614,7 +569,6 @@ pub(crate) fn pending_stub_executable_at(
     pending_stub_at(layout, tool, None, shim)
 }
 
-/// [`pending_stub_executable_at`], naming the program a command's stub comes with.
 fn pending_stub_at(
     layout: &Layout,
     tool: &ToolName,
@@ -640,8 +594,6 @@ fn pending_stub_at(
     Ok(Some(crate::lay::Executable::new(shim, body)))
 }
 
-/// Whether the pending stub at `shim` is current: exactly the bytes this pass would
-/// render (`body`).
 fn stub_is_current(shim: &Path, body: &str) -> bool {
     std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
@@ -681,7 +633,7 @@ pub fn remove_all_stubs(layout: &Layout) {
     }
 }
 
-/// Lay the compiled rosters' stubs at adoption time, before a network byte moves, so `PATH` coverage exists from the first instant.
+/// Lay the compiled roster stubs at adoption time before any network activity.
 pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) {
     let installed = crate::ops::active_builds(layout);
     let removed = layout.removed_programs();
@@ -797,9 +749,6 @@ mod tests {
         ToolName::new(name).unwrap()
     }
 
-    /// An agent program's pending stub stands in `agents/` too, carries the caller's
-    /// arguments through, and leaves once the program installs or is de-listed; a
-    /// non-agent program gets no twin.
     #[test]
     fn an_agent_programs_pending_stub_stands_in_agents_too_and_passes_arguments() {
         let l = layout("agents-stub");
@@ -836,11 +785,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A command only a program's signed manifest exposes stands with it like a branded one:
-    /// the reconcile lays it naming its program — which `program_of_in` answers and the table
-    /// alone (`program_of`) cannot — keeps it while the program is wanted and absent, also
-    /// through a pass that read no manifest of it, sweeps it once the manifest read no longer
-    /// exposes it or the program is installed, and `remove_stub` takes it with the program.
     #[test]
     fn a_command_only_the_manifest_exposes_is_stubbed_naming_its_program() {
         let l = layout("exposed");
@@ -905,9 +849,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A command's stub names its program on a comment line of the script, so a program name
-    /// that would end that line early lays no stub for its commands: the rest of the name
-    /// would be a line of the stub's shell script.
     #[test]
     fn a_program_name_that_would_break_the_comes_with_line_lays_no_command_stub() {
         let l = layout("comes-with-line");
@@ -922,11 +863,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A program's commands stand with it: `targo`, `trustc`, `tippy`, `trustfmt` and
-    /// `trustdoc` answer from the adoption lay on, each naming itself to `__pending` (which
-    /// reports `trust`'s state); the index reconcile keeps them while `trust` is wanted and
-    /// absent and sweeps them once it is installed or no longer wanted; `remove_stub` takes
-    /// them with the program.
     #[test]
     fn a_programs_commands_are_stubbed_while_it_is_wanted_and_absent() {
         let l = layout("commands");
@@ -983,8 +919,6 @@ mod tests {
         );
     }
 
-    /// A command stub is the lowest-precedence occupant like every stub: a file it did not
-    /// lay under the name is never overwritten, and never swept.
     #[test]
     fn a_command_stub_never_takes_a_file_it_did_not_lay() {
         let l = layout("command-foreign");
@@ -1006,8 +940,6 @@ mod tests {
         );
     }
 
-    /// A stub lost in a crash (gone, or cut short with its marker still on top) is laid whole
-    /// again by the next lay.
     #[test]
     fn a_lost_or_cut_short_stub_is_laid_again() {
         let l = layout("relay");
@@ -1030,8 +962,6 @@ mod tests {
         );
     }
 
-    /// An alias is never a stub: the reconcile lays plain names only, and the writer is a
-    /// no-op for an `alab-` name even when asked directly.
     #[test]
     fn an_alias_is_never_a_stub() {
         let l = layout("alias-stub");
@@ -1054,9 +984,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The stub body: marker present, the tool name and embedded path quote-safe, and it
-    /// parses as no shim target, so `which`/`active_builds`/`prune_stale_shims` never take a
-    /// stub for an installed tool.
     #[test]
     fn stub_content_shape_and_shim_invisibility() {
         let body = stub_content_sh(
@@ -1076,8 +1003,6 @@ mod tests {
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
     }
 
-    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot. Pinned from
-    /// every build host (pure string).
     #[test]
     fn cmd_stub_shape_marker_and_safety() {
         let body = stub_content_cmd(
@@ -1134,11 +1059,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A pre-frame stub (the body alone) re-laid to its framed successor while it runs: at
-    /// every line end of the old file (the only offsets `cmd` resumes at) and every offset
-    /// up to its end, the new file reads a colon label, an empty line or `@exit /b`, even
-    /// for the longest stub the writer lays (a `MAX_PATH` atpkg path at three UTF-8 bytes a
-    /// unit, embedded twice).
     #[test]
     fn a_pre_frame_cmd_stub_re_laid_while_executing_resumes_into_the_frame() {
         use crate::platform::{
@@ -1244,7 +1164,6 @@ mod tests {
         );
     }
 
-    /// A stub written with the batch marker is a stub to every consumer, on both platforms.
     #[test]
     fn rem_marker_recognition_round_trips() {
         let dir = crate::testdir::dir("atpkg-stub-rem-");
@@ -1717,9 +1636,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// What a laid file names reads back exactly as written: every quoting the renderers
-    /// produce, the empty value as none, nothing from a line this crate did not quote; the
-    /// batch stub leaves its `if exist` block out when it names none.
     #[test]
     fn the_named_atpkg_reads_back_as_written() {
         let t = tool("trust");

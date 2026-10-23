@@ -126,8 +126,6 @@ pub struct ProgressFile {
     pub ended_unix: Option<u64>,
 }
 
-/// Current unix seconds, saturating at 0 for a clock before the epoch (backward skew
-/// then reads as epoch-stale — the safe, "not running" direction).
 fn unix_now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
@@ -144,8 +142,6 @@ enum PassClock {
 }
 
 impl PassClock {
-    /// The clock a sink opened NOW runs on: the system's, unless a test set
-    /// `CLOCK_OVERRIDE` on this thread.
     fn for_new_sink() -> Self {
         #[cfg(test)]
         {
@@ -233,13 +229,10 @@ impl Drop for ClockOverride {
 
 #[cfg(test)]
 thread_local! {
-    /// TESTS ONLY: the clock [`PassClock::for_new_sink`] hands the sinks THIS thread
-    /// opens, read on it and moved into the sink, so no other test's passes see it.
     static CLOCK_OVERRIDE: std::cell::RefCell<Option<Arc<ManualPassClock>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The writer's mutable state, behind the sink's one lock.
 struct SinkState {
     /// Where the snapshot lands. The GUI passes `<prefix>/progress.json`.
     path: PathBuf,
@@ -511,7 +504,6 @@ impl ProgressSink {
         }
     }
 
-    /// Run `f` under the lock, then apply the rate-capped write policy.
     fn with(&self, f: impl FnOnce(&mut SinkState)) {
         if let Ok(mut s) = self.inner.lock() {
             f(&mut s);
@@ -525,9 +517,6 @@ impl ProgressSink {
     }
 }
 
-/// The write policy: on change and ≥ [`WRITE_MIN_INTERVAL_MS`] since the last write, plus
-/// an unconditional heartbeat refresh every [`HEARTBEAT_MIN_INTERVAL_SECS`] so a quiet
-/// transfer never lets a live writer's file go stale.
 fn maybe_write(s: &mut SinkState) {
     if s.disabled {
         return;
@@ -542,8 +531,6 @@ fn maybe_write(s: &mut SinkState) {
     }
 }
 
-/// Serialize and land the snapshot atomically (temp + rename), refreshing the heartbeat
-/// and the overall download rollup.
 fn write_now(s: &mut SinkState) -> bool {
     if s.disabled {
         return false;
@@ -597,21 +584,13 @@ pub(crate) fn stop_and_join(stop: &AtomicBool, handle: Option<std::thread::JoinH
     }
 }
 
-/// The pass heartbeat: a thread that ticks the live sink every [`HEARTBEAT_TICK_MS`] for the
-/// whole pass, independent of flow calls, so a phase with no sink calls (a multi-GB Verify,
-/// an Extract) never ages the file past [`HEARTBEAT_STALE_SECS`].
 struct PassHeartbeat {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// How often the pass heartbeat ticks: well under [`HEARTBEAT_MIN_INTERVAL_SECS`] (the write
-/// policy decides whether a tick lands) and the readers' [`HEARTBEAT_STALE_SECS`].
 const HEARTBEAT_TICK_MS: u64 = 500;
 
-/// The tick a pass-owned thread spawned now parks for: `ms`, unless a test set
-/// `TICK_OVERRIDE` on the spawning thread (read there and moved into the new thread, so no
-/// other test's threads see it).
 fn pass_tick(ms: u64) -> Duration {
     #[cfg(test)]
     {
@@ -624,7 +603,6 @@ fn pass_tick(ms: u64) -> Duration {
 
 #[cfg(test)]
 thread_local! {
-    /// Tests only: the tick [`pass_tick`] hands the pass-owned threads this thread spawns.
     static TICK_OVERRIDE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
 }
@@ -685,7 +663,8 @@ fn stdio_lost_its_reader() -> bool {
             revents: 0,
         },
     ];
-    // SAFETY: `poll` reads and writes only the array handed to it, for its stated length, and a zero timeout never blocks.
+    // SAFETY: `poll` reads and writes only the array handed to it, for its stated length, and a
+    // zero timeout never blocks.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
     if rc < 0 {
         return false;
@@ -699,8 +678,6 @@ fn stdio_lost_its_reader() -> bool {
     false
 }
 
-/// How often the orphan watch polls: each poll is two cheap syscalls, so the residual
-/// EPIPE window, not the cost, sets it.
 const ORPHAN_POLL_MS: u64 = 100;
 
 /// Point stdout and stderr at `log` (appended, `0600`) and say so there. A log that cannot
@@ -736,9 +713,6 @@ fn quiet_stdio(log: &Path) {
 #[cfg(not(unix))]
 fn quiet_stdio(_log: &Path) {}
 
-/// A process's live pass: its sink, the thread that owns it and its heartbeat — at most
-/// one at a time ([`begin_pass`]) — and whether one is live, the one atomic load the
-/// flow hooks' idle path costs.
 struct PassSlot {
     live: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>>,
     enabled: AtomicBool,
@@ -753,13 +727,8 @@ impl PassSlot {
     }
 }
 
-/// THE process's pass slot.
 static PROCESS_PASS: PassSlot = PassSlot::new();
 
-/// The pass slot this thread's calls answer to: [`PROCESS_PASS`], in every build. A test
-/// thread may hold one of its own (`own_pass_slot`), and lends it with its pass
-/// ([`lend`]), so tests that begin passes run side by side, each its own process's one
-/// pass, and none sees another's — the production rule, one slot per process, unbent.
 fn slot() -> &'static PassSlot {
     #[cfg(test)]
     {
@@ -772,7 +741,6 @@ fn slot() -> &'static PassSlot {
 
 #[cfg(test)]
 thread_local! {
-    /// TESTS ONLY: the pass slot [`slot`] answers on this thread, when not the process's.
     static TEST_SLOT: std::cell::Cell<Option<&'static PassSlot>> =
         const { std::cell::Cell::new(None) };
 }
@@ -864,10 +832,7 @@ pub fn active() -> Option<ProgressSink> {
 }
 
 thread_local! {
-    /// The pass a lane thread was lent ([`Lent::adopt`]): what [`active`] answers on it.
     static LENT: std::cell::RefCell<Option<ProgressSink>> = const { std::cell::RefCell::new(None) };
-    /// The program THIS thread's extract loop credits ([`extract_scope`]): two lanes of one
-    /// pass extract at once, each into its own row.
     static EXTRACTING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -996,8 +961,6 @@ impl Drop for ExtractScope {
     }
 }
 
-/// How often the `.part` poller stats the growing asset: the 10 Hz the sink's
-/// own write cap is sized for.
 const PART_POLL_TICK_MS: u64 = 100;
 
 /// Flow hook: watch a growing `<asset>.part` while a download runs.
@@ -1034,8 +997,6 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
                 {
                     sink.download_bytes(&program, m.len(), total);
                 } else {
-                    // No .part (yet, or a dir-registry copy): still let the sink
-                    // refresh its heartbeat through the rate-cap policy.
                     sink.download_bytes(&program, 0, total);
                 }
                 tick_or_stop(&stop2, tick);
@@ -1263,7 +1224,6 @@ pub fn retire_promise_of(layout: &crate::store::Layout, holders: &[u32]) {
     }
 }
 
-/// `pass-owed.json` as written, bounded and symlink-refusing ([`PROMISE_READ_CAP`]).
 fn read_promise(layout: &crate::store::Layout) -> Option<PassPromise> {
     let text =
         crate::metadata_io::read_bounded_regular_utf8(&layout.pass_owed_file(), PROMISE_READ_CAP)
@@ -1299,7 +1259,6 @@ pub const fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool 
 mod tests {
     use super::*;
 
-    /// The v1 example snapshot round-trips field for field.
     #[test]
     fn the_v1_example_snapshot_round_trips() {
         let json = r#"{"v":1, "pid":41234, "pass":"net", "started_unix":0, "heartbeat_unix":0,
@@ -1323,8 +1282,6 @@ mod tests {
         assert_eq!(reparsed, parsed);
     }
 
-    /// The wire vocabulary, pinned string by string: a renamed variant is a protocol
-    /// break for every reader, and this is the test that makes it loud.
     #[test]
     fn phase_strings_are_the_documented_lowercase_vocabulary() {
         for (phase, wire) in [
@@ -1342,8 +1299,6 @@ mod tests {
         }
     }
 
-    /// A newer writer's extra fields never break an older reader, and a minimal snapshot
-    /// degrades to the safe reading (no pid, epoch-stale heartbeat), not a parse failure.
     #[test]
     fn unknown_fields_are_ignored_and_missing_fields_fail_safe() {
         let future = r#"{"v":1, "hologram":true,
@@ -1376,8 +1331,6 @@ mod writer_tests {
         aterm_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    /// The writer's landing is atomic (temp+rename — no temp survives) and the pass
-    /// start truncates: a stale snapshot from a previous run never bleeds through.
     #[test]
     fn create_truncates_and_leaves_no_temp() {
         let l = layout("create");
@@ -1398,8 +1351,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The terminal snapshot: `finish` clears the pid, stamps `ended_unix`, and writes
-    /// unconditionally (no rate cap can swallow the last word).
     #[test]
     fn finish_writes_the_terminal_snapshot() {
         let l = layout("finish");
@@ -1440,9 +1391,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A first write that cannot land (the prefix does not exist yet, or is not writable)
-    /// yields no sink, so [`begin_pass`] reports no pass rather than an owned one whose file
-    /// never appears.
     #[test]
     fn writer_refuses_a_destination_the_first_write_cannot_reach() {
         let l = layout("unreachable");
@@ -1457,7 +1405,6 @@ mod writer_tests {
         let _slot = own_pass_slot();
         let began = begin_pass(&unreachable, "net");
         if began {
-            // Never leak a live pass into the next test when this assertion fails.
             end_pass();
         }
         assert!(
@@ -1467,8 +1414,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Staleness is the reader's law: a fresh-heartbeat live-pid file is running; a
-    /// cleared pid, an old heartbeat, or a far-future heartbeat (backward skew) is not.
     #[test]
     fn snapshot_running_applies_the_heartbeat_window() {
         let now = 1_000_000u64;
@@ -1491,8 +1436,6 @@ mod writer_tests {
         assert!(!snapshot_running(&file, now), "no pid = not running");
     }
 
-    /// A scheduler's in-flight read: no file, a file whose writer ended or went stale,
-    /// and a live writer's — only the last is a pass running now.
     #[test]
     fn pass_running_reads_a_live_writer_off_the_progress_file() {
         let l = layout("pass-running");
@@ -1541,8 +1484,6 @@ mod writer_tests {
         assert!(!snapshot_running(&file, 1_000_000));
     }
 
-    /// TTY sanitization: control characters (escape injection) stripped, length capped
-    /// with a visible elision.
     #[test]
     fn sanitize_for_tty_strips_and_caps() {
         assert_eq!(sanitize_for_tty("plain error", 64), "plain error");
@@ -1554,9 +1495,6 @@ mod writer_tests {
         assert_eq!(sanitize_for_tty("abcdef", 3), "abc…");
     }
 
-    /// The bump channel: appended names round-trip; garbage and shim-refused names
-    /// are ignored; an oversized file reads as absent; a symlinked bump is refused on
-    /// both the append and the read.
     #[test]
     fn bump_round_trips_and_refuses_garbage() {
         let l = layout("bump");
@@ -1579,9 +1517,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A script's bump names its program as a person's does, for every reader that orders
-    /// work by it, and says nobody at a terminal asked: a person's line for the same name,
-    /// before or after it, makes it a person's.
     #[test]
     fn a_bump_says_whether_a_person_asked() {
         let l = layout("bump-asker");
@@ -1628,12 +1563,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// STOPPING A PASS POLLER MUST NOT COST ITS TICK. Both pass-owned threads
-    /// are joined by the PASS thread — the one holding the store flock — and an
-    /// uninterruptible `sleep` made each join wait out whatever remained of the
-    /// current tick: up to 100 ms between download-complete and the sha256 on
-    /// EVERY downloaded artifact, and up to 500 ms at `end_pass` before the
-    /// terminal snapshot the GUI retires its row on.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
         let l = layout("prompt-stop");
@@ -1673,9 +1602,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A pass that makes no sink calls for longer than the writer's minimum interval (a
-    /// multi-GB Verify, an Extract) still reads as running: the heartbeat thread ticks the
-    /// file on its own.
     #[test]
     fn a_silent_phase_keeps_the_pass_heartbeat_live() {
         let _slot = own_pass_slot();
@@ -1711,11 +1637,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// THE HEARTBEAT INTERVAL IS THE WRITE POLICY'S, TO THE MILLISECOND: a sink with
-    /// nothing new to say rewrites its file once [`HEARTBEAT_MIN_INTERVAL_SECS`] have
-    /// passed on its clock since its last write, and a tick a millisecond before writes
-    /// nothing — the stamp a reader's staleness window ([`HEARTBEAT_STALE_SECS`]) is
-    /// sized against.
     #[test]
     fn a_quiet_sink_refreshes_its_heartbeat_at_the_interval_and_not_before() {
         let clock = ManualPassClock::new();
@@ -1743,8 +1664,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A LANE THREAD CREDITS THE PASS IT WAS LENT, and no other thread does: `active`
-    /// answers the owner and the thread that adopted the pass, never a bystander.
     #[test]
     fn a_lent_pass_credits_its_lane_and_each_lane_extracts_into_its_own_row() {
         let _slot = own_pass_slot();
@@ -1783,10 +1702,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The promise holds while its owner lives and its deadline is ahead, and not a moment
-    /// longer: retired, past its deadline, from a clock that stepped back (a deadline
-    /// further ahead than any writer promises), of another version, oversized or malformed,
-    /// it promises nothing.
     #[test]
     fn a_promise_holds_only_while_its_owner_lives_and_its_deadline_is_ahead() {
         let l = layout("promise");
@@ -1849,9 +1764,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A promise records its owner's start time, and a process that took over the owner's
-    /// pid — another start time — keeps nothing: the stub stops waiting for a pass that is
-    /// not coming.
     #[test]
     fn a_promise_ends_when_its_owners_pid_is_another_process() {
         let l = layout("promise-born");
@@ -1882,10 +1794,6 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The owner's start time decides only when the reader can read it: another start time,
-    /// or nothing under the pid, breaks the promise; a start time the kernel will not give
-    /// this reader (a sandbox denying process-info) leaves the pid to answer, as a promise
-    /// recorded without one does.
     #[test]
     fn an_owner_start_time_the_reader_cannot_read_leaves_the_pid_to_answer() {
         use crate::platform::Birth;
@@ -1939,8 +1847,6 @@ mod writer_tests {
         drop(child);
     }
 
-    /// An update ending retires only a promise its own process or its spawner holds: a
-    /// promise another window's seed wrote stays for the update that window spawns.
     #[test]
     fn a_promise_is_retired_only_by_its_holders() {
         let l = layout("promise-holders");

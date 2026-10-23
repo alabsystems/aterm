@@ -3686,9 +3686,11 @@ const SHELL_KEYWORDS: &[&str] = &[
 #[cfg(not(windows))]
 const SHELL_KEYWORDS: &[&str] = &["shell", "bash", "zsh", "command", "login", "argv"];
 
+/// The shells it takes ride in an aside, so a narrow field says the short
+/// form, `Platform (default)`, instead of cutting the list.
 #[cfg(windows)]
 const SHELL_PLACEHOLDER: &str =
-    "Platform (default) — pwsh, powershell, cmd, bash, wsl, nu, or a path";
+    "Platform (default) (pwsh, powershell, cmd, bash, wsl, nu, or a path)";
 #[cfg(not(windows))]
 const SHELL_PLACEHOLDER: &str = "Platform (default)";
 
@@ -5416,7 +5418,7 @@ pub(crate) fn save_prefs_snapshot(
     save_prefs_snapshot_observed(plan).outcome
 }
 
-/// Worker-facing form of [`save_prefs_snapshot`] that retains the committed proof.
+/// Worker-facing form of `save_prefs_snapshot` that retains the committed proof.
 pub(crate) fn save_prefs_snapshot_observed(
     plan: &crate::native_config_service::ConfigPersistencePlan,
 ) -> ConfigSnapshotSaveResult {
@@ -5913,8 +5915,12 @@ mod trail_style_tests {
     #[test]
     fn the_unset_default_is_the_full_body_pet_all_the_way_to_the_draw_seam() {
         let unset = crate::app_config::Config::default();
-        let raw = unset.cursor_trail_style_raw();
-        assert_eq!(raw, super::DEFAULT_CURSOR_TRAIL_STYLE);
+        assert_eq!(
+            unset.cursor_trail_style_raw(),
+            crate::app_config::default_cursor_trail_style(),
+            "Windows draws no trail until one is chosen"
+        );
+        let raw = super::DEFAULT_CURSOR_TRAIL_STYLE;
         assert!(
             CURSOR_TRAIL_STYLES.contains(&raw),
             "the default must be a selectable option, got {raw:?}"

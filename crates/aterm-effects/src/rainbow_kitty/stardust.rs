@@ -869,7 +869,12 @@ impl Star {
     #[inline]
     #[must_use]
     pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
-        let age = self.age_s(now);
+        self.envelope_at_age(self.age_s(now), now, reduced_motion)
+    }
+
+    #[inline]
+    #[must_use]
+    fn envelope_at_age(&self, age: f32, now: Instant, reduced_motion: bool) -> f32 {
         let fin = self.finish.map_or(1.0, |f| f.gain(now));
         if self.lane == StarLane::Field {
             return field_lane_envelope(age, self.idle_s(now), fin, reduced_motion);
@@ -1074,7 +1079,13 @@ impl Star {
         if reduced_motion {
             return self.origin();
         }
-        let age_ms = self.age_s(now) * 1000.0;
+        self.pos_at_age(self.age_s(now))
+    }
+
+    #[inline]
+    #[must_use]
+    fn pos_at_age(&self, age_s: f32) -> (i32, i32) {
+        let age_ms = age_s * 1000.0;
         let (x, y) = self.at_k(self.lane.motion().k_at(age_ms));
         (x - self.stream_px(age_ms) - self.pull_px(age_ms), y)
     }
@@ -1838,6 +1849,9 @@ impl Stardust {
     /// The cadence law: the next instant a star changes what is on glass, or `None` when the sky is empty (T6).
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.stars.is_empty() && self.veil.is_empty() {
+            return None;
+        }
         let mut cad = Cadence::at(now);
         if self.brisk(now) {
             cad.brisk();
@@ -2881,18 +2895,24 @@ impl Paint {
     #[inline]
     fn of(star: &Star, probe: &GlyphProbe, ctx: &Ctx<'_>) -> Option<Self> {
         let rm = ctx.cfg.reduced_motion;
-        let alpha = star.envelope(ctx.now, rm);
+        let age_s = star.age_s(ctx.now);
+        let alpha = star.envelope_at_age(age_s, ctx.now, rm);
         if alpha < STAR_CULL_ALPHA {
             return None;
         }
-        let held = rm || star.in_hold(ctx.now);
-        let tw = if rm { 1.0 } else { star.twinkle(ctx.now) };
+        let held = rm || age_s < star.class.envelope_s(star.lane).0;
+        let phase = star.lum_phase();
+        let tw = if rm { 1.0 } else { twinkle_env(age_s, phase) };
         let (env, e) = if held {
             (1.0, 1.0)
         } else {
             (tw, clamp01((tw - 0.55) / 0.45))
         };
-        let (x, y) = star.pos(ctx.now, rm);
+        let (x, y) = if rm {
+            star.origin()
+        } else {
+            star.pos_at_age(age_s)
+        };
         let floor = star.class.core_floor();
         let mut c = star.class.cov(star.lane) * alpha * clamp01(ctx.cfg.intensity);
         if star.lane.is_transient() && probe.at_px(x, y, ctx.geom) != Some(false) {
@@ -2903,7 +2923,7 @@ impl Paint {
             lane: star.lane,
             x,
             y,
-            arm: arm_px(star, ctx.geom.ch as f32, held, ctx.now),
+            arm: arm_px_with(star, ctx.geom.ch as f32, held, age_s, phase),
             arm_lo: arm_trough_px(star.class, ctx.geom.ch as f32),
             c,
             alpha,
@@ -3175,15 +3195,21 @@ fn arm_trough_px(class: StarClass, ch: f32) -> i32 {
 }
 
 #[inline]
-fn arm_px(star: &Star, ch: f32, held: bool, now: Instant) -> i32 {
+fn arm_px_with(star: &Star, ch: f32, held: bool, age_s: f32, phase: f32) -> i32 {
     let nominal = star_arm(ch, star.class.arm_ratio());
     let min = star.class.arm_min_px(ch);
     if held {
         return (nominal.round() as i32).max(min);
     }
     let floor = star.class.arm_floor();
-    let s = (std::f32::consts::TAU * star.f * star.age_s(now) + star.lum_phase()).sin();
+    let s = (std::f32::consts::TAU * star.f * age_s + phase).sin();
     ((nominal * (floor + (1.0 - floor) * s * s)).round() as i32).max(min)
+}
+
+#[cfg(test)]
+#[inline]
+fn arm_px(star: &Star, ch: f32, held: bool, now: Instant) -> i32 {
+    arm_px_with(star, ch, held, star.age_s(now), star.lum_phase())
 }
 
 #[inline]
@@ -3883,26 +3909,22 @@ pub const SETTLE_PIXELS: usize = 9;
 
 fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((i32, i32), u32)]) {
     let table = relative_luminance_table();
-    let own_at = |k: u8, (x, y): (i32, i32)| -> u32 {
+    let own_at_max = |(x, y): (i32, i32)| -> u32 {
         let mut own = 0u32;
         for q in &frame.out[q0..] {
             if quad_covers(q, x, y) {
-                own = add_sat(own, premul_rgb(q.color, k));
+                own = add_sat(own, q.color & 0x00FF_FFFF);
             }
         }
         for h in &frame.halos[h0..] {
-            let piece = RainHalo {
-                color: premul_rgb(h.color, k),
-                ..*h
-            };
-            own = add_sat(own, halo_add_at(&piece, x, y));
+            own = add_sat(own, halo_add_at(h, x, y));
         }
         own
     };
     let mut over = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
     let mut over_len = 0usize;
     for &(p, ground) in watch {
-        if !under_ceil_with(table, add_sat(ground, own_at(u8::MAX, p)))
+        if !under_ceil_with(table, add_sat(ground, own_at_max(p)))
             && let Some(slot) = over.get_mut(over_len)
         {
             *slot = (p, ground);
@@ -3913,6 +3935,27 @@ fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((
         return;
     }
     let over = &over[..over_len];
+    let own_at = |k: u8, (x, y): (i32, i32)| -> u32 {
+        let mut own = 0u32;
+        for q in &frame.out[q0..] {
+            if quad_covers(q, x, y) {
+                own = add_sat(own, premul_rgb(q.color, k));
+            }
+        }
+        for h in &frame.halos[h0..] {
+            if !(i32::from(h.x)..i32::from(h.x) + i32::from(h.w)).contains(&x)
+                || !(i32::from(h.y)..i32::from(h.y) + i32::from(h.h)).contains(&y)
+            {
+                continue;
+            }
+            let piece = RainHalo {
+                color: premul_rgb(h.color, k),
+                ..*h
+            };
+            own = add_sat(own, halo_add_at(&piece, x, y));
+        }
+        own
+    };
     let fits = |k: u8| {
         over.iter()
             .all(|&(p, ground)| under_ceil_with(table, add_sat(ground, own_at(k, p))))

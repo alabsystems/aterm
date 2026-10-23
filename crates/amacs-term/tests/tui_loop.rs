@@ -16,11 +16,8 @@ use aterm_tty::tty::{MemPeer, MemTty, Mode, Modes, Readiness, Size, Tty};
 
 const SIZE: Size = Size { cols: 80, rows: 24 };
 
-/// The bytes that put the drawing state back: the first of every restore,
-/// so what comes before the last of them is the last frame drawn.
 const RESTORE: &[u8] = b"\x1b[?2026l\x1b[m\x1b[0 q\x1b[?25h";
 
-/// A face whose store edits through a test-minted capability.
 fn tui(options: Options) -> Tui {
     // SAFETY: a test process holding no untrusted input; the launcher-mint guard lets a test, and
     // only a test, mint below the launchers.
@@ -35,7 +32,6 @@ fn target(path: &Path) -> Target {
     }
 }
 
-/// A scratch directory and a file in it holding `bytes`.
 fn file(name: &str, bytes: &[u8]) -> (aterm_tempfile::TempDir, PathBuf) {
     let dir = aterm_tempfile::tempdir().expect("a scratch directory");
     let path = dir.path().join(name);
@@ -44,29 +40,24 @@ fn file(name: &str, bytes: &[u8]) -> (aterm_tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// aterm's replies to the probe, as its own engine answers it.
 fn aterm_replies() -> Vec<u8> {
     let mut term = Terminal::new(SIZE.rows, SIZE.cols);
     term.process(probe::QUERY);
     term.take_response().expect("aterm answers the probe")
 }
 
-/// A terminal of `size` that has answered the probe as aterm does.
 fn terminal(size: Size) -> (MemTty, MemPeer) {
     let (tty, peer) = MemTty::pair(size);
     peer.send(&aterm_replies());
     (tty, peer)
 }
 
-/// What aterm shows after `output`, on a screen of `size`.
 fn shown(output: &[u8], size: Size) -> Terminal {
     let mut term = Terminal::new(size.rows, size.cols);
     term.process(output);
     term
 }
 
-/// What aterm showed in the last frame of `output`, before the terminal was
-/// put back.
 fn last_frame(output: &[u8], size: Size) -> Terminal {
     let end = output
         .windows(RESTORE.len())
@@ -82,8 +73,6 @@ fn row(term: &Terminal, row: u16) -> String {
         .to_string()
 }
 
-/// The modeline's row (the lowest that reads as one) and the echo area's
-/// text below it, its rows joined: a long line wraps there.
 fn modeline_and_echo(term: &Terminal, size: Size) -> (u16, String, String) {
     let modeline = (0..size.rows)
         .rev()
@@ -97,14 +86,12 @@ fn modeline_and_echo(term: &Terminal, size: Size) -> (u16, String, String) {
     (modeline, row(term, modeline), echo.trim_end().to_string())
 }
 
-/// Whether the cell at `row`, `col` is drawn in reverse video.
 fn reversed(term: &Terminal, row: u16, col: u16) -> bool {
     term.grid()
         .cell(row, col)
         .is_some_and(|cell| cell.flags().0 & (1 << 5) != 0)
 }
 
-/// Run the face over `path` with `keys` typed, one terminal read each.
 fn edit(path: &Path, options: Options, keys: &[&[u8]]) -> (Outcome, Vec<u8>, MemPeer) {
     let (mut tty, peer) = terminal(SIZE);
     for key in keys {
@@ -122,8 +109,6 @@ fn done() -> Outcome {
     }
 }
 
-/// How many times `output` cleared the whole screen: once per frame drawn
-/// whole.
 fn clears(output: &[u8]) -> usize {
     output
         .windows(4)
@@ -131,9 +116,6 @@ fn clears(output: &[u8]) -> usize {
         .count()
 }
 
-/// Typing, `C-x C-s` and `C-x C-c`: the file holds what was typed, the run
-/// exits 0 saying nothing, every mode is put back, and the frame aterm
-/// showed was the buffer, the modeline and the echo area.
 #[test]
 fn type_save_quit_round_trip() {
     let (_dir, path) = file("COMMIT_EDITMSG", b"world\n");
@@ -174,8 +156,6 @@ fn type_save_quit_round_trip() {
     assert_eq!((cursor.row, cursor.col), (0, 6), "the cursor is the caret");
 }
 
-/// `C-s` is isearch in the terminal profile, and a kill yanks back: the
-/// echo area shows the search as it is typed, then the kill moves text.
 #[test]
 fn isearch_and_kill_yank_in_terminal_profile() {
     let (_dir, path) = file("notes.txt", b"one two three\n");
@@ -206,8 +186,6 @@ fn isearch_and_kill_yank_in_terminal_profile() {
     assert_eq!(peer.modes(), Modes::NONE);
 }
 
-/// Closing a changed file asks `Save FILE? (y, n, q)`; `q` takes the
-/// question back, and `n` closes without saving.
 #[test]
 fn dirty_quit_prompts_and_n_discards() {
     let (_dir, path) = file("notes.txt", b"kept\n");
@@ -258,8 +236,6 @@ fn dirty_quit_prompts_and_n_discards() {
     assert_eq!(std::fs::read(&path).expect("read"), b"ykept\n");
 }
 
-/// A resize repaints the whole frame at the new size: the modeline and the
-/// echo area move to the new bottom rows.
 #[test]
 fn resize_repaints_to_new_size() {
     let (_dir, path) = file("notes.txt", b"alpha\nbeta\n");
@@ -293,8 +269,6 @@ fn resize_repaints_to_new_size() {
     );
 }
 
-/// A save of a file that changed on disk since it was read refuses and says
-/// so, leaving the disk alone; `C-x C-s` straight after overwrites it.
 #[test]
 fn save_refuses_when_disk_changed() {
     let (_dir, path) = file("notes.txt", b"base\n");
@@ -341,13 +315,7 @@ fn save_refuses_when_disk_changed() {
     assert_eq!(std::fs::read(&path).expect("read"), b"theirs again\n");
 }
 
-/// A SAVE THE FILESYSTEM REFUSES SAYS WHY IN THE SAVE WORDS aterm says too
-/// (`amacs_files::save_words`), never the writer's own account of it: a
-/// folder this user cannot write (before the save lock is made, then with
-/// it), a file this user cannot read, a save lock another user left, and a
-/// save lock another writer holds. Each leaves the disk as it was.
-/// Before, the echo area printed the step's message ("Could not save
-/// notes.txt: could not create …: Permission denied (os error 13)").
+/// A SAVE THE FILESYSTEM REFUSES SAYS WHY IN THE SAVE WORDS aterm says too.
 #[cfg(unix)]
 #[test]
 fn a_refused_save_says_why_in_the_save_words() {
@@ -454,13 +422,7 @@ fn a_refused_save_says_why_in_the_save_words() {
     assert_eq!(std::fs::read(&path).expect("read"), b"base\n");
 }
 
-/// AN OPEN THE FILE HOST REFUSES SAYS WHY IN THE SAVE WORDS, by what it
-/// refused: a link to a file that is not there says so (no retry finds a
-/// file there), a name that is not UTF-8 says so, and a folder that is not
-/// there does not exist. Before, the open of a link to nothing read "a link
-/// on the way to it changed · try again" (and, before the save words, the
-/// host's own "symbolic-link path components are not writable
-/// capabilities").
+/// AN OPEN THE FILE HOST REFUSES SAYS WHY IN THE SAVE WORDS.
 #[cfg(unix)]
 #[test]
 fn a_refused_open_says_why_in_the_save_words() {
@@ -502,8 +464,6 @@ fn a_refused_open_says_why_in_the_save_words() {
     );
 }
 
-/// A kill goes to the terminal's clipboard as one OSC 52 write, when that is
-/// on, and never when it is off.
 #[test]
 fn kill_writes_osc52_when_enabled() {
     let (_dir, path) = file("notes.txt", b"copy me\n");
@@ -532,8 +492,6 @@ fn kill_writes_osc52_when_enabled() {
     assert_eq!(std::fs::read(&path).expect("read"), b"copy me\n");
 }
 
-/// A file with a byte order mark and CRLF line breaks shows neither, and
-/// saves with both.
 #[test]
 fn bom_and_crlf_survive_edit_and_save() {
     let (_dir, path) = file("crlf.txt", b"\xef\xbb\xbfline one\r\nline two\r\n");
@@ -548,8 +506,6 @@ fn bom_and_crlf_survive_edit_and_save() {
     assert_eq!(row(&term, 1), "line two");
 }
 
-/// A press sets point where it lands, and the wheel scrolls the buffer
-/// without moving point.
 #[test]
 fn a_press_sets_point_and_the_wheel_scrolls() {
     let lines: String = (0..100).map(|n| format!("line {n}\n")).collect();
@@ -576,11 +532,6 @@ fn a_press_sets_point_and_the_wheel_scrolls() {
     assert_eq!(saved.lines().nth(2), Some("linXe 2"));
 }
 
-/// Files edited one after another share the kill ring and nothing else. Each
-/// has a store of its own whose first document id is the one the file before
-/// had, so the workspace must not carry that file's undo history or marks
-/// over: an undo in the second file stops at its own first edit, and a
-/// pop-mark finds no mark there, while a yank takes the first file's kill.
 #[test]
 fn files_in_turn_share_the_kill_ring_and_nothing_else() {
     let (_dir, first) = file("a.txt", b"aaaa\n");
@@ -617,9 +568,6 @@ fn files_in_turn_share_the_kill_ring_and_nothing_else() {
     assert_eq!(peer.modes(), Modes::NONE);
 }
 
-/// `C-c C-c` saves and closes the file, and the run goes on to the next;
-/// `C-c C-k` closes without saving and ends the run with status 1, opening
-/// no file after it.
 #[test]
 fn finish_saves_and_abort_ends_the_run() {
     let (_dir, first) = file("a.txt", b"aaaa\n");
@@ -656,10 +604,6 @@ fn finish_saves_and_abort_ends_the_run() {
     assert_eq!(peer.modes(), Modes::NONE);
 }
 
-/// A terminal whose window changes size while the program is stopped. The
-/// shell has the terminal then, so the kernel's SIGWINCH goes to it: the
-/// program, continued by `fg`, gets only its SIGCONT, and reads the new size
-/// or never learns it.
 struct ResizedWhileStopped {
     tty: MemTty,
     size: Size,
@@ -704,9 +648,6 @@ impl Tty for ResizedWhileStopped {
     }
 }
 
-/// `C-z` stops the process, and a SIGTSTP from outside stops it as `C-z`
-/// does. Each continue draws the frame whole once, at the size the terminal
-/// has then, though no SIGWINCH said it changed.
 #[test]
 fn a_stop_redraws_once_at_the_size_it_continues_at() {
     let (_dir, path) = file("notes.txt", b"alpha\nbeta\n");

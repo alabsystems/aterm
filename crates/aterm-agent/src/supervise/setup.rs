@@ -92,15 +92,15 @@ pub struct SessionSetup {
     pub(super) probe_waits: ProbeWaits,
     /// The limit reset step's bounds ([`reset_loop::RESET_WAITS`]; a test shortens them).
     pub(super) reset_waits: reset_loop::ResetWaits,
-    /// [`BOX_SETTLE`] ([`Session::set_box_settle`]).
+    /// [`BOX_SETTLE`] (`Session::set_box_settle`).
     pub(super) box_settle: Duration,
-    /// [`AUTOCOMPACT_SETTLE`] ([`Session::set_autocompact_settle`]): the box settle of Claude Code's autocompact offer, at least [`Self::box_settle`].
+    /// [`AUTOCOMPACT_SETTLE`] (`Session::set_autocompact_settle`): the box settle of Claude Code's autocompact offer, at least [`Self::box_settle`].
     pub(super) autocompact_settle: Duration,
-    /// [`background_settle`] ([`Session::set_background_settle`]): read from the live upgrade's settle once, here.
+    /// [`background_settle`] (`Session::set_background_settle`): read from the live upgrade's settle once, here.
     pub(super) background_settle: Duration,
     /// The step of the waits a host's request is read between ([`next_wait_step`]: [`WAIT_STEP`], never longer than the live upgrade's settle as this process runs it): read once, here, as [`Self::background_settle`] is.
     pub(super) wait_step: Duration,
-    /// How long apart the agent's transcript is read again for a box's call ([`crate::supervise::policy::box_call::LAG_STEP`]; [`Session::set_box_call_step`], a test shortens it).
+    /// How long apart the agent's transcript is read again for a box's call ([`crate::supervise::policy::box_call::LAG_STEP`]; `Session::set_box_call_step`, a test shortens it).
     pub(super) box_call_step: Duration,
     /// How long a screen must read busy on background work alone before the stuck-busy canary asks the server what the agent's own title says ([`wall_memory::STUCK_AFTER`]; a test shortens it).
     pub(super) stuck_after: Duration,
@@ -175,7 +175,8 @@ impl SessionSetup {
         &self.approval_env
     }
 
-    /// The same setup with its ledger at `ledger_path`: a tape's header holds the path the loop opens ([`Header::capture`]).
+    /// The same setup with its ledger at `ledger_path`: a tape's header holds the path the loop
+    /// opens ([`Header::capture`](crate::supervise::tape::header::Header::capture)).
     #[must_use]
     pub(crate) fn with_ledger_path(&self, ledger_path: Option<PathBuf>) -> Self {
         Self {

@@ -7,6 +7,18 @@
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 //! Deserialization for internally tagged enums:
+//!
+//! ```
+//! # extern crate aterm_serde as serde;
+//! #[derive(aterm_serde_derive::Deserialize)]
+//! #[serde(tag = "kind")]
+//! enum Event {
+//!     Ready,
+//!     Data { value: u32 },
+//! }
+//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
+//! # assert_deserializable::<Event>();
+//! ```
 
 use aterm_macro_support::q;
 use proc_macro::{Literal, TokenStream};

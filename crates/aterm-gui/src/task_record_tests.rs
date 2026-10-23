@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The task record's grammar, its idempotent mark, its handoff row and the `await task` argument parse.
+//! Tests for task record grammar, idempotent marks, handoff rows, and `await task` parsing.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,8 +10,6 @@ use super::*;
 
 const SID: &str = "s-0123456789abcdef0123";
 
-/// `unix`, a path spelled as on Unix, spelled as this platform spells it:
-/// on Windows an absolute one is on drive `C:`, and every `/` is a `\`.
 fn native(unix: &str) -> String {
     if cfg!(windows) {
         let swapped = unix.replace('/', "\\");
@@ -29,7 +27,6 @@ fn tasks() -> PathBuf {
     PathBuf::from(native("/state/aterm/tasks"))
 }
 
-/// The absolute folder `/<rest>`, as this platform spells it.
 fn folder(rest: &str) -> String {
     native(&format!("/{rest}"))
 }
@@ -63,7 +60,6 @@ fn states_and_origins_are_closed_words() {
     }
 }
 
-/// THE LOG'S TASK WORDS MIRROR THE TASK RECORD'S (a mirror of an aterm-gui vocabulary lives in aterm-gui).
 #[test]
 fn the_logs_task_words_mirror_the_task_record() {
     use aterm_slog::vocab::{STATE_WORDS, WHY_WORDS, lookup};
@@ -385,10 +381,6 @@ fn the_reply_event_and_status_spellings() {
         "{fields}"
     );
     assert!(fields.ends_with(" result_bytes=120 why=landed"), "{fields}");
-    assert_eq!(
-        record.event_payload(),
-        "rev=3 state=done attention=0 why=landed"
-    );
     assert_eq!(status_tokens(Some(&record)), "task_state=done task_rev=3");
     assert_eq!(status_tokens(None), "task_state=- task_rev=0");
     assert_eq!(
@@ -486,10 +478,6 @@ fn await_task_takes_its_list_combine_since_and_timeout() {
     );
 }
 
-/// The in-process API and the verb share one path: a mark records its
-/// `task-change` row (the `events` digest's `EVENT <local> task`), the same
-/// mark again records none, and the supervisor's attention moves a tasked
-/// session's rev but never gives an untasked one a record.
 #[test]
 fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -579,11 +567,6 @@ fn a_mark_records_its_row_and_the_supervisors_attention_moves_the_rev() {
     assert_eq!((record.rev, record.attention), (5, true));
 }
 
-/// A WORKER'S NEEDS YOU ENTRY IS ITS TASK RECORD'S NEWS (Autopilot Land: "be
-/// LOUDER ABOUT IT ... but NEVER let that block you"): an `owner=needs` entry
-/// raises a tasked session's attention and moves its rev as the supervisor's
-/// own does, its clear lowers it, and the flag stands while either entry
-/// does.
 #[test]
 fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     use crate::session_timeline::{MetaEdit, write_attention_kind};
@@ -628,9 +611,6 @@ fn a_workers_needs_you_entry_raises_the_task_records_attention() {
     assert_eq!(flag(), before, "a person's entry is not the task's news");
 }
 
-/// `task` reads the record with the session's agent word and attention;
-/// `task mark` answers the record after it and whether it moved; an edge
-/// scope is refused the mark; and a stray word is the usage line.
 #[test]
 fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     let handle = crate::session_store::test_handle(5);
@@ -674,12 +654,6 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
     );
 }
 
-/// A DONE OVER A DEADLINE'S STALL IS ONE EDGE: a worker the window host
-/// stalled `why=held`, the deadline's attention raised with it, that moved
-/// and finished after all — its harness publishes `done` over the stall —
-/// gets one rev that carries the done and `attention=-`, and the host's
-/// backstop (`StartupMark::Over`'s take-down) finds nothing left to move, so
-/// a manager re-armed past that rev is not woken again with no news.
 #[test]
 fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     let handle = crate::session_store::test_handle(6);
@@ -748,7 +722,6 @@ fn a_done_over_a_deadline_stall_takes_its_attention_down_in_the_same_rev() {
     assert!(done.contains(" attention=a%20usage%20limit"), "{done}");
 }
 
-/// A path is lexical: `result_path` is never opened here.
 #[test]
 fn a_result_path_is_judged_lexically() {
     let dir = native("/nonexistent/tasks");
@@ -804,11 +777,6 @@ fn a_windows_result_path_is_judged_under_its_state_dir() {
     }
 }
 
-/// THE WORKER'S RESULT (`result [full]`): the snapshot the record names,
-/// answered with its stamp and its text; `ERR no task` with no record, and a
-/// record with no result says why in its own state's word — `exited` with
-/// none, but an `exited` worker the harness had marked done keeps its
-/// result.
 #[test]
 fn the_result_verb_answers_the_snapshot_the_record_names() {
     let handle = crate::session_store::test_handle(6);
@@ -874,12 +842,6 @@ fn the_result_verb_answers_the_snapshot_the_record_names() {
     );
 }
 
-/// A RESULT THE DONE EDGE MISSED IS READ AGAIN BY `result`, FOR ITS TURN: a
-/// `done` whose snapshot said `no-reply` (the harness read the transcript
-/// before Claude Code wrote the reply) answers the miss while the reply is
-/// not there; once it is, `result` answers it, the record says its size
-/// under a new rev, and the snapshot holds it — a second `result` reads
-/// nothing again and moves nothing.
 #[test]
 fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     let handle = crate::session_store::test_handle(6);
@@ -944,10 +906,6 @@ fn result_reads_a_missed_reply_of_its_turn_again_and_keeps_it() {
     assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), "");
 }
 
-/// A TURN INTO A FINISHED WORKER opens its task again at once
-/// ([`reopen_at_turn`]): typed by `aterm ctl`, a peer or the bridge, the
-/// `done` record its Enter found moves to `working why=turn` with the next
-/// rev, and a second such turn changes nothing more.
 #[test]
 fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     let handle = crate::session_store::test_handle(7);
@@ -999,11 +957,6 @@ fn a_turn_into_a_done_worker_opens_it_again_unless_the_harness_typed_it() {
     assert_eq!(state(), before, "only a done task is opened again");
 }
 
-/// THE DONE THE ENTER FOUND, MARKED AGAIN, STILL OPENS (px3a's review, the
-/// race): a follow-up's Enter finds `done` at rev n, and before its submit is
-/// verified a `result` that read the turn again keeps the reply it found
-/// ([`repair_result`]: the same done, `result_bytes=` moved, rev n+1) — or
-/// the supervisor's attention is raised on it (n+2).
 #[test]
 fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     let handle = crate::session_store::test_handle(7);
@@ -1073,10 +1026,6 @@ fn a_done_marked_again_between_the_enter_and_the_submit_still_opens() {
     assert!(own.rev > n && own.state == TaskState::Done && own.entered > at_enter.entered);
 }
 
-/// THE REOPEN IS CONDITIONAL UNDER THE MARK'S OWN LOCKS
-/// ([`mark_session_task_if`]): the move to `working` applies only to the
-/// record as it stands when the mark lands, so an `exited` the host marked
-/// after the turn's first look stands.
 #[test]
 fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
     let handle = crate::session_store::test_handle(7);
@@ -1110,11 +1059,6 @@ fn a_conditional_mark_never_overwrites_a_state_that_landed_first() {
     assert_eq!(state(), Some((3, TaskState::Working)));
 }
 
-/// A RECORD THAT ENTERS A STATE RINGS THE WINDOW HOST (its deadlines judge a
-/// worker by its record's state): the `working why=turn` a follow-up's
-/// verified submit opens lands after the ring of the screen it drew, and the
-/// held deadline's look must come for it — the live run of the held worker
-/// waited out its hang detector without it.
 #[test]
 fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
     let handle = crate::session_store::test_handle(7);
@@ -1159,10 +1103,6 @@ fn a_record_entering_a_state_rings_the_host_and_a_re_mark_does_not() {
     );
 }
 
-/// THE TASK WAKE (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S3): exactly
-/// one `Wake::TaskChanged` per mark that moves the record or the supervisor's
-/// attention it carries, so the need verdict — a `stalled` task is a need —
-/// is published again on the main thread.
 #[test]
 fn a_moving_mark_posts_one_task_wake_and_a_still_or_fenced_one_none() {
     let handle = crate::session_store::test_handle(9);

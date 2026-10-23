@@ -493,7 +493,14 @@ fn rustup_row(
     match stable::run(&machine.repo, &machine.homes, host.rustup(), init, say) {
         Ok(acquired) if acquired.is_empty() => State::Present(machine.homes.rustup_home.clone()),
         Ok(_) => State::Placed(machine.homes.rustup_home.clone()),
-        Err(why) => State::Failed(format!("rustup: {why}")),
+        // A failed run need not prove rustup-init's exit: its scratch stays.
+        Err(why) => match fetched {
+            Some((scratch, _)) => State::Failed(format!(
+                "rustup: {why}; keeping rustup-init's scratch at {}",
+                scratch.keep().display()
+            )),
+            None => State::Failed(format!("rustup: {why}")),
+        },
     }
 }
 
@@ -553,20 +560,6 @@ fn unpack_row(
     Ok(t.dir.join(&t.exe))
 }
 
-/// wasm-bindgen's `--version` words at `pin`, read from `exe`.
-fn bindgen_answers(host: &dyn Host, exe: &Path, cwd: &Path) -> Option<String> {
-    let out = host
-        .run(&Spawn {
-            program: exe.to_path_buf(),
-            args: vec!["--version".into()],
-            cwd: cwd.to_path_buf(),
-            set: Vec::new(),
-            remove: Vec::new(),
-        })
-        .ok()?;
-    crate::wasm_glue::reports_pin(&out).then(|| out.trim().to_string())
-}
-
 /// The `--record` row.
 fn cargo_row(
     row: &Row,
@@ -592,16 +585,29 @@ fn cargo_row(
             "building wasm-bindgen-cli {}: targo --unverified install --locked",
             t.version
         ));
-        host.run(&Spawn {
+        let install = Spawn {
             program: targo,
             args,
             cwd: scratch.path().to_path_buf(),
             set: Vec::new(),
             remove: fish::removed(),
-        })?;
+        };
+        let scratch = scratch.run_build(host, &install)?;
         let built = root.join(&t.exe);
-        let reports = bindgen_answers(host, &built, scratch.path())
-            .ok_or_else(|| format!("{} does not answer {}", built.display(), t.version))?;
+        let probe = Spawn {
+            program: built.clone(),
+            args: vec!["--version".into()],
+            cwd: scratch.path().to_path_buf(),
+            set: Vec::new(),
+            remove: Vec::new(),
+        };
+        let (scratch, out) = scratch
+            .run_copied(host, &probe)
+            .map_err(|e| format!("{} did not answer --version: {e}", built.display()))?;
+        if !crate::wasm_glue::reports_pin(&out) {
+            return Err(format!("{} does not answer {}", built.display(), t.version));
+        }
+        let reports = out.trim().to_string();
         let url = format!("https://crates.io/crates/wasm-bindgen-cli/{}", t.version);
         place::write_stamp(
             &root,

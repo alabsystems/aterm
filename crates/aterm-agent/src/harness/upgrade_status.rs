@@ -52,7 +52,9 @@ const _: () = assert!(QUIET_MOVE_S >= super::LATER[super::LATER.len() - 1].as_se
 /// The longest a usage limit lasts (the weekly limits).
 pub const LONGEST_LIMIT_S: u64 = 7 * 24 * 3_600;
 
-/// The move clock: how long a session may be behind before an upgrade that asks again on its own ([`Row::asks_on_its_own`]) is no longer only a record, whatever it waits on.
+/// The move clock: how long a session may be behind before an upgrade that asks again on its own
+/// ([`Row::asks_on_its_own`]) is no longer only a record, whatever it waits on (a usage limit alone
+/// excepted, unless [`Row::spend_held`]).
 pub const MOVE_BUDGET_S: u64 = 24 * 3_600;
 
 const _: () = assert!(MOVE_BUDGET_S > STALLED_AFTER_S);

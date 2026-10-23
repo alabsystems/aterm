@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Window-side PTY keeper client (`KeeperLink` worker).
-//!
-//! * Lifecycle: [`register`] duplicates session masters on spawn, [`META_POLL`] streams scalar
-//!   metadata and fabric carry, [`release`] drops claims, [`pending_before_grant`] announces
-//!   update successors, and [`bye`] closes on final exit.
-//! * Recovery: boot `HELLO` admits offered crash masters via [`admit_recovered_master`], while
-//!   update candidates wait until [`activate`] at Commit.
 
 #[cfg(unix)]
 use std::collections::{BTreeMap, VecDeque};
@@ -26,9 +20,6 @@ use aterm_keeper::wire::{Birth, Frame, MarkerRef, MasterHeader};
 #[cfg(unix)]
 use aterm_update::recovery_ledger::KeeperAtLaunch;
 
-/// Whether this process takes part at all: the fast path every call site
-/// reads before anything else, so a window with the keeper off pays one
-/// relaxed load per spawn, close and exit.
 static ON: AtomicBool = AtomicBool::new(false);
 
 /// The update's parent (`0`: none), whose sessions a candidate's adopted sessions
@@ -322,8 +313,7 @@ impl Claim {
         self.handed
     }
 
-    /// The pair the crash journal image its registrant took over keys the
-    /// shell by ([`Tag::keyed`]).
+    /// The pair the crash journal image its registrant took over keys the shell by.
     pub(crate) const fn keyed(&self) -> Option<(u32, u64)> {
         self.keyed
     }
@@ -345,7 +335,6 @@ impl Claim {
         self.recovery_count.as_ref().map(std::sync::Arc::clone)
     }
 
-    /// The master became a registered session: nothing to release here.
     fn discharge(mut self) {
         self.armed = false;
     }
@@ -373,8 +362,6 @@ pub(crate) fn released_unclaimed(rdev: u64) -> bool {
         .contains(&rdev)
 }
 
-/// Release offered master `rdev` that became no session: the keeper closes
-/// its copy, and with this window's already closed the shell is hung up.
 fn release_unclaimed(rdev: u64) {
     #[cfg(test)]
     UNCLAIMED_RELEASES
@@ -569,10 +556,6 @@ const JOURNAL: bool = true;
 #[cfg(unix)]
 static KEEPER_JOURNALS: AtomicBool = AtomicBool::new(true);
 
-/// Development seam `$ATERM_DEBUG_NO_CRASH_JOURNAL` (`aterm_types::dev_seam!`, debug builds
-/// only): a window that journals no session, whatever its keeper takes — every claim settled
-/// with COMPANION_RELEASE — so a live test's negative control sees the restore it makes
-/// without a region (the META rung).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 
 /// Why a session spawned now gets no crash-restore journal (`crash_restore`).
@@ -620,9 +603,7 @@ const fn takes_part(headless: bool, installed_keeper: bool) -> bool {
     !(headless && installed_keeper)
 }
 
-/// `cfg` is the config this window builds a live session's engine with: a recovered
-/// session's crash restore replays into an engine built the same way
-/// (`crash_restore::restore_offered`).
+/// `cfg` is the config this window builds a live session's engine with: a recovered session's crash restore replays into an engine built the same way.
 pub(crate) fn boot(
     enabled: bool,
     candidate: bool,
@@ -1009,10 +990,7 @@ fn admit_recovered_journaled(
         attempts,
         cfg,
     } = journaled;
-    // SAFETY: `companion` came with the boot HELLO's OFFER, which a keeper makes only
-    // beside an orphaned master, after every window that claimed it (the region's only
-    // writers) has died; the keeper holds it unmapped and read-only, so nothing modifies
-    // or resizes the object while the restore maps it.
+    // SAFETY: `companion` came with the boot HELLO's OFFER, which a keeper makes only beside an orphaned master, after every window that claimed it (the region's only writers) has died; the keeper holds it unmapped and read-only, so nothing modifies or resizes the object while the restore maps it.
     let restored =
         unsafe { crate::crash_restore::restore_offered(companion, attempts, cfg, used_cells) };
     if let Some(carry) = &restored.control {
@@ -1113,14 +1091,9 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
         return false;
     }
     let Some(shell_birth) = session.shell_identity.birth else {
-        // Nothing proves the shell is the one on this terminal: a keeper could
-        // never check it, and a recovery would refuse it.
         return false;
     };
-    // SAFETY: `session.master` is this live session's open master (its sink
-    // owns it for as long as the session exists, and the session is borrowed
-    // here); the borrow ends with this statement, which only duplicates it
-    // (`F_DUPFD_CLOEXEC`).
+    // SAFETY: `session.master` is this live session's open master (its sink owns it for as long as the session exists, and the session is borrowed here); the borrow ends with this statement, which only duplicates it (`F_DUPFD_CLOEXEC`).
     let dup = unsafe { BorrowedFd::borrow_raw(session.master) }.try_clone_to_owned();
     let Ok(dup) = dup else {
         return false;
@@ -1786,9 +1759,6 @@ mod tests {
         Tag::decode(&bytes).is_some_and(|t| t == long) && bytes.len() <= aterm_keeper::wire::MAX_TAG
     }
 
-    /// A headless launch of the installed app never joins the installed app's keeper; a
-    /// windowed launch does, and so does a dev or test build's headless instance, whose keeper
-    /// is its own.
     #[test]
     fn a_headless_launch_of_the_installed_app_takes_no_part() {
         assert!(!takes_part(true, true));
@@ -1797,8 +1767,6 @@ mod tests {
         assert!(takes_part(false, false));
     }
 
-    /// Off means off: with `[keeper] enabled = false` the boot does not dial, and a spawn's
-    /// registration, a close's release, the update's PENDING and the exit's BYE do nothing.
     #[test]
     fn with_the_keeper_off_nothing_registers() {
         let recovery = boot(false, false, false, None);
@@ -1842,7 +1810,6 @@ mod tests {
         );
     }
 
-    /// `[keeper] enabled` is off unless the file says `true`.
     #[test]
     fn the_keeper_is_off_unless_the_file_turns_it_on() {
         let parse = |text: &str| crate::app_config::Config::parse(text).expect("parses");
@@ -1852,11 +1819,6 @@ mod tests {
         assert!(parse("[keeper]\nenabled = true\n").keeper_enabled());
     }
 
-    /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES. A
-    /// launch whose overlap pair was refused with nothing offered boots fresh
-    /// as a plain window; armed as a candidate it would never say its HELLO —
-    /// no crashed window's shells taken, every registration only buffered,
-    /// crash survival off though `[keeper] enabled = true`.
     #[test]
     fn only_an_admitted_overlap_pair_or_an_adopted_handoff_arms_a_candidate() {
         assert!(

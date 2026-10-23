@@ -3,21 +3,10 @@
 // Author: Andrew Yates
 
 //! macOS privacy-consent (TCC) and debugger-access posture probes and classifiers.
-//!
-//! * TCC posture: Full Disk Access ([`FdaState`], [`FdaScope`], [`SpikeEvidence`], [`probe_fda`]),
-//!   process responsibility ([`responsible_pid`], [`responsible_pids_detailed`],
-//!   [`responsible_app`]), session [`Attribution`], and [`ResetPlan`] ([`tccutil_reset_command`],
-//!   [`tccutil_presence`]).
-//! * Debugger and Developer Tools posture ([`TASKPORT_DEBUG_RIGHT`]): [`DebuggerMode`]
-//!   ([`probe_debugger`], [`run_devtools_change`]), [`DebuggerMember`] ([`debugger_membership`]),
-//!   [`SelfHardening`] ([`self_hardening`], [`process_birth`]), and [`devtool_grant`]
-//!   ([`DevToolState`], [`DevToolListing`], [`probe_devtool`], [`probe_devtool_list`]).
-//! * [`path_is_in_app_bundle`] fences bundle-only probes ([`ProbeLabel::RefusedOutOfBundle`]),
-//!   and [`protected_roots`] derives sensitive paths from [`crate::sbpl::PRIVATE_SUBDIRS`].
 
 use std::path::{Component, Path, PathBuf};
 
-/// `EPERM`. A TCC denial is `EPERM`, not `EACCES` ().
+/// `EPERM`. A TCC denial is `EPERM`, not `EACCES`.
 pub const ERRNO_EPERM: i32 = 1;
 
 /// `ESRCH` — "no such process".
@@ -409,8 +398,7 @@ pub fn path_is_in_app_bundle(exe: &Path) -> bool {
     app_bundle_root(exe).is_some()
 }
 
-/// The `.app` directory `exe` lives inside, if any (`/Applications/aterm.app/Contents/MacOS/aterm`
-/// ⇒ `/Applications/aterm.app`); also the cache key's bundle half.
+/// The `.app` directory `exe` lives inside, if any.
 #[must_use]
 pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
     bundle_root_where(exe, |dir| {
@@ -439,19 +427,11 @@ pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBu
 }
 
 /// Whether the bundle macOS keys this process's consent decisions to can still be found.
-///
-/// ```text
-///              current_exe()                 proc_pidpath
-/// before       …/A.app/Contents/MacOS/p      …/A.app/Contents/MacOS/p
-/// after swap   …/A.app/Contents/MacOS/p      …/A.app.rollback/Contents/MacOS/p
-/// after GC     …/A.app/Contents/MacOS/p      rc=0, errno ENOENT
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageAnchor {
     /// The image sits in a `.app` bundle.
     Live,
-    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory
-    /// is no longer named `<something>.app` — `aterm.app.rollback` after an apply.
+    /// The image sits in a bundle layout whose directory is no longer named `<something>.app`.
     Displaced,
     /// The image no longer has a path.
     Deleted,
@@ -1128,9 +1108,7 @@ impl Claimant {
 pub enum TrashOffer {
     /// The button takes it.
     Offered,
-    /// Signed with a certificate, as a release is — a Developer ID copy is
-    /// never moved, whatever its requirement says — or with a signature that
-    /// could not be read, so it is not known to be a build either.
+    /// Signed with a certificate or with an unreadable signature.
     Signature,
     /// Signed ad hoc, but its requirement does not read as its cdhash.
     Requirement,
@@ -1182,8 +1160,7 @@ pub struct Claimants {
 }
 
 impl Claimants {
-    /// The claimants whose requirement differs from the running copy's — the
-    /// ones that can reset a grant.
+    /// The claimants whose requirement differs from the running copy's.
     #[must_use]
     pub fn conflicting(&self) -> Vec<&Claimant> {
         let Some(running) = self.found.iter().find(|c| c.running) else {
@@ -1800,9 +1777,8 @@ pub enum Retired {
     Failed(String),
 }
 
-/// Move to the Trash each copy in `plan` (the copies the owner was shown) that a fresh census
-/// still offers ([`Claimants::retirable`]), that is still the same bundle right before the move
-/// (`unchanged`, see [`still_claims`]), and that no process runs from.
+/// Move to the Trash each copy in `plan` that a fresh census still offers, that is still the same
+/// bundle right before the move (`unchanged`), and that no process runs from.
 pub fn retire_claimants(
     plan: &[PathBuf],
     fresh: &Claimants,
@@ -1980,8 +1956,7 @@ impl Folder {
         }
     }
 
-    /// The display name, so every surface spells it alike and none derives a sentence from
-    /// the config token.
+    /// The display name.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -2373,7 +2348,7 @@ pub fn folders_declined(attempts: &[ResetAttempt]) -> Vec<(Folder, Option<i32>)>
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOLSSECURITY_PATH: &str = "/usr/sbin/DevToolsSecurity";
 
-/// The one right `DevToolsSecurity` reads and writes ().
+/// The one right `DevToolsSecurity` reads and writes.
 pub const TASKPORT_DEBUG_RIGHT: &str = "system.privilege.taskport.debug";
 
 /// The one-line undo every surface that mentions developer mode prints.
@@ -2585,7 +2560,7 @@ const fn devtools_disable_command() -> [&'static str; 2] {
     [DEVTOOLSSECURITY_PATH, "-disable"]
 }
 
-/// Which way the owner's gesture changes the debugger rule ().
+/// Which way the owner's gesture changes the debugger rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DebuggerChange {
     /// *Allow debugger access…*.
@@ -4028,7 +4003,7 @@ pub fn process_birth(pid: u32) -> Option<ProcessBirth> {
     }
 }
 
-/// The `DevToolsSecurity` change child, as the `privacy-debugger-change` marker records it (.3).
+/// The `DevToolsSecurity` change child, as the `privacy-debugger-change` marker records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DevtoolsChild {
     /// The child's pid.
@@ -4266,7 +4241,7 @@ impl FsConsent {
     }
 }
 
-/// Which blocking measurements from (and the debugger design's ) have been made.
+/// Which blocking measurements have been made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -4631,8 +4606,6 @@ mod imp {
     pub(super) fn probe_descriptor(db: &Path) -> Result<std::os::fd::OwnedFd, i32> {
         use std::os::fd::FromRawFd as _;
         let Ok(path) = CString::new(db.as_os_str().as_bytes()) else {
-            // Unreachable: the caller already rejected interior NULs. Report
-            // an errno rather than panicking in a probe.
             return Err(libc::EINVAL);
         };
         // SAFETY: `path` is a valid NUL-terminated C string that outlives the
@@ -4878,11 +4851,7 @@ mod imp {
 /// # Errors
 /// Returns the setup failure when a disk image cannot be created or attached.
 ///
-/// Returns the setup failure when a disk image cannot be created or attached.
-///
 /// # Panics
-/// If detaching fails or the mounted/detached policy judgments are incorrect.
-///
 /// Panics if detaching fails or the mounted/detached policy judgments are incorrect.
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub fn a_real_volume_mounted_in_the_bundle_is_not_crossed(dir: &Path) -> std::io::Result<()> {

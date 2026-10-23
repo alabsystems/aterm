@@ -3,25 +3,11 @@
 
 //! The AI-facing manual behind `aterm help [topic]`: what this environment is and how to use
 //! aterm and the verification toolchain (trust, clean, ty, ay, ny, nn).
-//!
-//! * Outside an aterm session, `aterm help` prints the overview + command map
-//!   and `aterm help <topic>` a per-tool deep dive.
-//! * Inside a session (`$ATERM_PARENT_SESSION_ID` set), `aterm help` prints the
-//!   agent operating brief with the session's sid wired in; topics still print
-//!   their deep dive.
-//!
-//! [`TOPICS`] is the one table of deep dives; the front-page command map and
-//! `every_topic_renders` derive from it. The
-//! `introspection` topic's verb list is generated from
-//! [`aterm_types::control_verbs::catalog_lines_full`], the table the control
-//! server answers `help` from.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// The environment blurb at the top of the front page and the agent brief. The
-/// self-update sentence is per platform ([`OVERVIEW_SELF_UPDATE`]): the appcast
-/// lane exists on macOS and Linux only.
+/// The environment blurb at the top of the front page and the agent brief.
 fn overview() -> String {
     format!(
         "aterm is a terminal an AI agent can read and drive, and the front door to the ALab\n\
@@ -47,15 +33,13 @@ struct Topic {
     name: &'static str,
     /// One-line identity for the command map.
     tagline: &'static str,
-    /// The full page (plain text, printed as-is). `None` for a page generated at render time
-    /// (`introspection`, `rust`).
+    /// The full page (plain text, printed as-is).
     body: Option<&'static str>,
 }
 
 /// The words `aterm help aterm` puts around [`crate::session_shell!`] (the
 /// phrase `--help` also prints), per platform, so the page names the shell a
-/// plain `aterm` session runs. `what` ends the WHAT IT IS sentence, `start` is
-/// the bare-`aterm` usage row, `doctor` closes the doctor row.
+/// plain `aterm` session runs.
 #[cfg(not(windows))]
 macro_rules! aterm_page_shell {
     (what) => {
@@ -68,9 +52,7 @@ macro_rules! aterm_page_shell {
         ""
     };
 }
-/// Windows twin of the above. The doctor row checks the window's shell
-/// (`driver_windows::WindowShell`, which reads aterm.toml `shell`), which a
-/// plain `aterm` session never reads.
+/// Windows twin of the above.
 #[cfg(windows)]
 macro_rules! aterm_page_shell {
     (what) => {
@@ -102,6 +84,13 @@ const TOPICS: &[Topic] = &[
   aterm doctor --apply         apply or repair only the macOS settings profile
   aterm doctor --restore       restore the preferences saved before setup
   Add --json for a structured report on stdout, including on failure.
+
+On a develop machine (~/.config/aterm/init.toml records [develop] checkouts) doctor,
+bare or --read-only, also reads the develop items: each checkout against origin as
+it was last fetched, its vendor/astream submodule, and, where `aterm init` runs it
+too (a clean checkout of aterm's origin with HEAD on a branch, any branch), its
+tools' `verify provision --check` (cargo --offline, stopped after two minutes). It
+reaches no network for them and changes none of them: `aterm init --develop` does.
 
 The first Mac window opens System State with every setup choice checked.
 Apply starts immediately; otherwise checked items apply after 30 active seconds
@@ -754,8 +743,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   accounts ["early"]              account rotation: `"early"`, `"on_limit"` or `"off"`
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
-  usage_tap [false]               pass aterm's status-line tap on Claude Code relaunches;
-                                  its figures time a usage limit's continuation
+  usage_tap [true]                pass aterm's status-line tap on Claude Code relaunches;
+                                  its figures give the footer its weekly figure and time
+                                  a usage limit's continuation
   usage_notes [false]             record single-account usage when no accounts are listed
   usage_credits [false]           allow carrying a session onto paid usage credits
   logins ["renew"]                renew expired logins listed with an email (`"renew"`|`"off"`)
@@ -1320,10 +1310,7 @@ WHAT IT IS NOT
     },
 ];
 
-/// `aterm help theme` (also `themes`), the prose before the key list. The
-/// key list is generated ([`theme_page`]) from
-/// [`aterm_types::scheme::THEME_KEYS`], the table the parser reads keys by, so
-/// the page cannot name a key the parser refuses or miss one it reads.
+/// `aterm help theme` (also `themes`), the prose before the key list.
 const THEME_PAGE_HEAD: &str = r#"theme — aterm's colour themes: where they live, the file format, light/dark
 pairs, trying one live, and the `aterm theme` commands that list, write, check,
 import and install them. `aterm help themes` is this page.
@@ -1475,8 +1462,7 @@ fn theme_page() -> String {
 }
 
 /// The dispatchable pages that are not [`TOPICS`] entries (generated, or named
-/// after a verb). Shared by the unknown-topic listing and its test. `agent`
-/// also answers to the alias `instructions`.
+/// after a verb).
 const EXTRA_PAGES: &[&str] = &[
     "config",
     "ship",
@@ -1491,10 +1477,7 @@ const EXTRA_PAGES: &[&str] = &[
     "topics",
 ];
 
-/// `aterm help kitty`, the prose half of the page. The vocabulary below it is
-/// generated ([`kitty_page`]) from the table the typed-line listener compiles;
-/// the prose describes `aterm_effects::typed_tricks` (when a word fires),
-/// `PetBrain::note_trick` (what the pet does) and the trick flash.
+/// `aterm help kitty`, the prose half of the page.
 const KITTY_PAGE_HEAD: &str = r#"kitty — talk to the cursor cat: the words it obeys when you TYPE them
 
   aterm list-kitty-commands   every word, language by language
@@ -1600,9 +1583,6 @@ fn overview_page() -> String {
     s.push_str("\n\n");
     s.push_str(&overview());
     s.push_str("\n\nONE COMMAND, MANY VERBS — `aterm <verb>`\n");
-    // Keyed on the `crate::Verb` roster. The signature column comes from
-    // `Verb::usage()`; the description is a one-line summary (`blurb()` is a
-    // `--help` paragraph). A missing line is a compile error (exhaustive match).
     let line = |v: crate::Verb| -> &'static str {
         match v {
             crate::Verb::Ctl => {
@@ -1676,8 +1656,6 @@ fn overview_page() -> String {
     };
     const HELP_USAGE: &str = "aterm help [topic]";
     const HELP_LINE: &str = "this manual — start here (a deep dive on any verb or tool)";
-    // Column width across the verb signatures and the topic names. A signature wider than
-    // `WIDEST` (init's flags) gets a line of its own instead of widening every row.
     const WIDEST: usize = 40;
     let width = TOPICS
         .iter()
@@ -1696,14 +1674,11 @@ fn overview_page() -> String {
             let _ = writeln!(s, "  {:<width$}  {}", v.usage(), line(*v));
         }
     }
-    // A topic named after a verb is already listed above: `aterm help <verb>`
-    // resolves to it, so a second row would only say the same thing again.
     let is_verb = |name: &str| crate::Verb::ALL.iter().any(|v| v.name() == name);
     s.push_str("\nTOPICS — `aterm help <name>`\n");
     for t in TOPICS.iter().filter(|t| !is_verb(t.name)) {
         let _ = writeln!(s, "  {:<width$}  {}", t.name, t.tagline);
     }
-    // The pages that are neither a verb nor a TOPICS entry; `topics` is this page.
     let also: Vec<&str> = EXTRA_PAGES
         .iter()
         .copied()
@@ -1717,11 +1692,7 @@ fn overview_page() -> String {
 }
 
 /// `aterm help sys`: what `aterm ctl sys` reads, with THIS machine read at
-/// the moment of the call (design §14.2: built at call time, as
-/// [`rust_page`] is, so it never states a remembered fact). Every reader is
-/// `aterm_sysprobe`'s own (the ones the window's sampler calls); one that
-/// reads nothing here says so. What the OS can and cannot measure is this
-/// build's coverage for the platform the page runs on.
+/// the moment of the call.
 fn sys_page() -> String {
     let words = aterm_sysprobe::machine_words();
     let layout = aterm_sysprobe::cpu_layout();
@@ -2149,9 +2120,7 @@ CUT — from a clean clone of the dev repo on main, never the shared checkout
                              stops half-way
 "#;
 
-/// `aterm help update`. The Windows lane is spliced in from `crate::WINDOWS_UPDATE_LANE`, the
-/// line `aterm update status|check` prints on Windows, so the page and the verb name one lane;
-/// its parenthetical goes on its own line to keep the page width.
+/// `aterm help update`.
 fn update_page() -> String {
     format!(
         "{UPDATE_PAGE_HEAD}{}{UPDATE_PAGE_MSIX}{}",
@@ -2217,9 +2186,7 @@ const UPDATE_PAGE_MSIX: &str = r#"
 #[cfg(not(win_scripts))]
 const UPDATE_PAGE_MSIX: &str = "\n";
 
-/// [`update_page`], after the Windows lane. The two switches are named by the
-/// updater's one name for each ([`aterm_update_core::settings::CHECK_LABEL`]),
-/// the words Settings paints on them.
+/// [`update_page`], after the Windows lane.
 fn update_page_tail() -> String {
     let check = aterm_update_core::settings::CHECK_LABEL;
     let install = aterm_update_core::settings::INSTALL_LABEL;
@@ -2346,9 +2313,7 @@ CLOSING A TAB
   with its tab, stop it first.
 "#;
 
-/// `aterm help workers`: the manager's pattern of
-/// `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §1-§4, the verbs as built
-/// (`spawn agent=`, `await task`, `result`, `task`, `survey`).
+/// `aterm help workers`: the manager's pattern (`spawn agent=`, `await task`, `result`, `task`, `survey`).
 const WORKERS_PAGE: &str = r#"workers — Claude Code in other tabs on tasks you give it, and the survey
 
 WHAT IT IS
@@ -2420,7 +2385,7 @@ GOTCHAS
   * `ERR unsupervised: <switch>` means `[harness]` or `[harness.<agent>]` is off."#;
 
 /// `aterm help needs`: what the window and the menu bar say needs the person,
-/// and how they step in (`docs/DESIGN-owner-surfaces-2026-10-16.md`).
+/// and how they step in.
 const NEEDS_PAGE: &str = r#"needs — what needs you, where it shows, and stepping in with Take Over
 
 WHAT IT IS
@@ -2517,8 +2482,7 @@ COMMANDS
   aterm help introspection the control protocol underneath"#;
 
 /// The folders macOS asks about, from the consent module's table: the path literals live only
-/// in `aterm_containment::consent` (aterm-census guard `protected-folder`), so the manual names
-/// what the warm-up and `aterm ctl privacy` use. Names only; nothing is opened.
+/// in `aterm_containment::consent`, so the manual names what the warm-up and `aterm ctl privacy` use.
 fn protected_folder_names() -> String {
     aterm_containment::Folder::ALL
         .iter()
@@ -2600,9 +2564,7 @@ GOTCHAS
     )
 }
 
-/// The rustup `trust` row when rustup says the toolchain is not installed. Repair
-/// re-points the link at the store's build, so it is the fix only when the store HAS one;
-/// without it the gap is the toolchain itself, and the act is [`trust_install_act`]'s.
+/// The rustup `trust` row when rustup says the toolchain is not installed.
 fn rustup_unlinked_row(store_has_targo: bool, unserved: bool) -> String {
     if store_has_targo {
         "NOT LINKED — `cargo +trust` fails here; `targo` still works. Fix: `aterm pkg repair`.\n\
@@ -2617,11 +2579,7 @@ fn rustup_unlinked_row(store_has_targo: bool, unserved: bool) -> String {
 }
 
 /// The one act that puts a Trust toolchain on this machine: `aterm pkg install trust`
-/// where the index serves one, else — `unserved`, trust's own recorded row saying the
-/// index publishes no build for this target ([`atpkg::reroute::unserved_here`]) — the
-/// local route, a dev link of a locally built sysroot. On aarch64 Linux the install
-/// answers "unavailable … no build is published for this target", so naming it sent the
-/// reader round a loop.
+/// where the index serves one, else a dev link of a locally built sysroot.
 const fn trust_install_act(unserved: bool) -> &'static str {
     if unserved {
         "`aterm pkg link trust <sysroot> …` (no Trust build is published for this target; \
@@ -2730,21 +2688,7 @@ NOT IN THE GROUP
 "#;
 
 /// `aterm help rust` (also `cargo`, `targo`, `rustc`, `trustc`, `toolchain`): measures which
-/// Rust toolchain the current directory gets rather than restating a table that goes stale
-/// (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md §7). It calls the discovery aterm's
-/// checks use (`atpkg::toolchain::Toolchain::discover_with_store`, as `crates/aterm-verify`
-/// does), so there is no second copy of "which toolchain the checks pick" to drift.
-///
-/// Discovery is not what a bare `targo` runs: it ranks the rustup `trust` link ahead of the
-/// atpkg store (below it when older, `demoted`), while a shell resolves `targo` through PATH.
-/// So the discovery line is labelled as the checks' pick under the checks' own pin
-/// ([`checks_toolchain`]), `targo` is resolved as the shell does ([`resolve_on_path`]), and
-/// the two are compared ([`compare_toolchains`]).
-///
-/// The page leads with the Trust default and says when this directory is not on it; it
-/// prevents nothing (`atpkg::reroute` holds that policy). Every subprocess the page spawns is
-/// bounded (2 s; discovery's own `--print sysroot` checks are not), every file read is
-/// optional, and a failed probe says so rather than filling in a plausible answer.
+/// Rust toolchain the current directory gets rather than restating a table that goes stale.
 fn rust_page() -> String {
     use atpkg::toolchain::{atpkg_prefix, pinned_channel};
 
@@ -2761,9 +2705,6 @@ fn rust_page() -> String {
     let rustup = atpkg::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &home);
     let tools = checks_toolchain(explicit.as_deref(), &rustup, &prefix, &path_env);
     let store_bin = prefix.join("bin");
-    // Trust's recorded row when the index publishes no build for this target and nothing
-    // here runs `targo` (aarch64 Linux): the page then says so first, and names the local
-    // route wherever it would name an install that answers "unavailable".
     let unserved = atpkg::reroute::unserved_here(
         &atpkg::store::Layout {
             prefix: prefix.clone(),
@@ -2813,7 +2754,6 @@ fn rust_page() -> String {
          MEASURED (this call, this directory, this PATH):"
     );
 
-    // Where we are, and what the project itself says.
     match &cwd {
         Some(d) => {
             let _ = writeln!(out, "  directory        {}", d.display());
@@ -2875,15 +2815,10 @@ fn rust_page() -> String {
         }
     }
 
-    // What discovery chose and refused, gated on `have_targo()` (a refused candidate or a
-    // non-executable `targo` answers no), labelled as the checks' pick under the checks' pin;
-    // what PATH gives is measured separately below.
     let checks_pin_label = checks_pin.as_deref().map_or_else(
         || "no channel (aterm's rust-toolchain.toml names none)".to_string(),
         |ch| format!("channel = \"{ch}\""),
     );
-    // The checks' `targo`, followed through an atpkg shim like PATH's below:
-    // discovery can settle on the shim directory, which is not a toolchain.
     let checks_targo = tools
         .have_targo()
         .then(|| resolve_from(tools.targo.clone()));
@@ -2915,8 +2850,6 @@ fn rust_page() -> String {
             r.display()
         );
     }
-    // A formatter or lint driver the check toolchain lacks, taken from the managed
-    // Trust build (`Toolchain::borrowed`): the checks run it rather than skip.
     for (name, file) in &tools.borrowed {
         let _ = writeln!(
             out,
@@ -2924,11 +2857,6 @@ fn rust_page() -> String {
             file.display()
         );
     }
-    // A rustup `trust` older than the store's build ranks below the store (atpkg's
-    // `stale_against_store`, which `aterm pkg doctor` warns by and `aterm pkg repair` fixes).
-    // Said, because a reader who knows where `~/.rustup/toolchains/trust` points would expect
-    // it above. The fix is `Demoted::remedy`'s: repair re-points a link but refuses a real
-    // directory, which goes to the by-hand removal first.
     if let Some(d) = &tools.demoted {
         let _ = writeln!(
             out,
@@ -2971,16 +2899,11 @@ fn rust_page() -> String {
         let _ = writeln!(out, "  managed tools    {}", m.join(" "));
     }
 
-    // What the names on this PATH answer; bounded so a wedged toolchain cannot
-    // wedge the manual.
     let probe = |cmd: &str, args: &[&str]| -> String {
         bounded_first_line(cmd, args, std::time::Duration::from_secs(2))
             .unwrap_or_else(|| "(no answer within 2 s, or not on PATH)".to_string())
     };
     let _ = writeln!(out, "  rustc --version  {}", probe("rustc", &["--version"]));
-    // Trust's own version: `rustc --version` prints a rustc-shaped release
-    // (`rustc 1.99.0-dev …`) that reads as a Rust version; the `trust:` line of
-    // `-vV` names the toolchain.
     let _ = writeln!(
         out,
         "  trust version    {}",
@@ -2995,14 +2918,8 @@ fn rust_page() -> String {
         "  rustc sysroot    {}",
         probe("rustc", &["--print", "sysroot"])
     );
-    // Where a bare `targo` runs: PATH order, through an atpkg shim (to its exec
-    // root's file when the guard holds), to the canonical file. Directory walks
-    // and small reads only. `trustc` and `tippy` are resolved the same way, as
-    // nothing guarantees the three share a directory.
     let on_path = |name: &str| resolve_on_path(name, &path_env);
     let targo_on_path = on_path("targo");
-    // An atpkg PENDING STUB is no targo to ask: `trust` is still to come, and while a pass
-    // installs it the stub waits for it — each probe below would sit out its whole bound.
     let targo_pending = targo_on_path
         .as_ref()
         .is_some_and(|t| atpkg::stub::is_pending_stub(&t.found));
@@ -3037,8 +2954,6 @@ fn rust_page() -> String {
             let _ = writeln!(out, "  targo on PATH    {}", describe_on_path(t));
         }
     }
-    // What that `targo` compiles with here, from the inputs cargo reads
-    // ([`rustc_movers`]); targo never reads the pin.
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| Some(home.join(".cargo")));
@@ -3052,8 +2967,6 @@ fn rust_page() -> String {
         "  targo here       {}",
         targo_here_row(path_dir.as_deref(), &movers)
     );
-    // The two tools a stock pin is often read as selecting, asked through
-    // targo in this directory (bounded).
     let _ = writeln!(
         out,
         "  targo fmt        {}",
@@ -3064,13 +2977,8 @@ fn rust_page() -> String {
         "  targo tippy      {}",
         probe_targo(&["tippy", "--version"])
     );
-    // A version line is only evidence when it IS one: the probe's failure text, or
-    // a stock cargo rejecting the flag, must not be compared as a build.
     let as_version = |line: &str| line.starts_with("targo ").then(|| line.to_string());
     let path_ver = as_version(&targo_ver);
-    // The checks' own targo, skipped when it is the directory already probed.
-    // A shim hop is printed so the compared directory is visibly the exec'd
-    // one.
     let checks_differs = checks_dir.is_some() && checks_dir != path_dir;
     let checks_ver = match &checks_targo {
         Some(t) if checks_differs || !t.shims.is_empty() => {
@@ -3134,12 +3042,8 @@ fn rust_page() -> String {
     }
 
     let rustup_trust = probe("rustup", &["which", "cargo", "--toolchain", "trust"]);
-    // No answer at all is not "not linked": with `rustup` off PATH (or wedged) the
-    // channel was never asked, and the line says that instead.
     let rustup_answered = !rustup_trust.starts_with("(no answer");
     let rustup_linked = rustup_answered && !rustup_trust.contains("not installed");
-    // rustup answers a file path; its canonical directory is what a proxied
-    // `cargo`/`rustc` under the pin runs. Anything else resolves to no directory.
     let rustup_dir = rustup_linked
         .then(|| std::fs::canonicalize(&rustup_trust).ok())
         .flatten()
@@ -3160,8 +3064,6 @@ fn rust_page() -> String {
         }
     );
 
-    // PATH against the checks: the page must say when a bare `targo` is from
-    // another build than the checks' pick.
     let rustup_clause = || match &rustup_dir {
         Some(d) if Some(d) == checks_dir.as_ref() => "is the checks' directory".to_string(),
         Some(d) if Some(d) == path_dir.as_ref() => "is the PATH directory".to_string(),
@@ -3202,13 +3104,8 @@ fn rust_page() -> String {
                     toolchain_bin: path_bin,
                 },
             );
-            // atpkg's rustup seam points rustup at a copy-on-write view of the
-            // store build (`<prefix>/rustup`): one build in two directories.
             let in_view = std::fs::canonicalize(prefix.join("rustup"))
                 .is_ok_and(|view| checks.starts_with(view));
-            // A routed shim runs its build from atpkg's exec root
-            // (`<prefix>/compat/trust/<build>`), so PATH can be that root while
-            // the checks run the store's directory of the same build.
             let exec_roots = std::fs::canonicalize(prefix.join(EXEC_ROOTS_DIR)).ok();
             let in_exec_root = |dir: &Path| exec_roots.as_ref().is_some_and(|r| dir.starts_with(r));
             let mut where_notes = String::new();
@@ -3238,8 +3135,6 @@ fn rust_page() -> String {
                 if path_names.len() == 1 { "runs" } else { "run" },
                 rustup_clause(),
             );
-            // `aterm pkg doctor` is silent about a rustup `trust` that is atpkg's
-            // managed view, exactly this shape.
             let doctor = "\n                   `aterm pkg doctor` flags a rustup `trust` that is not atpkg's managed view.";
             match agreement {
                 Agreement::Same => {
@@ -3345,8 +3240,6 @@ fn rust_page() -> String {
 }
 
 /// The `rust-toolchain` row: what the directory's pin means for a stock-spelled `cargo`.
-/// rustup ranks `RUSTUP_TOOLCHAIN` above `rust-toolchain.toml`, so a differing value there is
-/// reported instead; empty is unset. Pure.
 fn rust_toolchain_row(pinned: Option<&str>, rustup_env: Option<&str>) -> String {
     let overridden = rustup_env.filter(|env| !env.is_empty() && Some(*env) != pinned);
     match (pinned, overridden) {
@@ -3377,9 +3270,7 @@ fn rust_toolchain_row(pinned: Option<&str>, rustup_env: Option<&str>) -> String 
 /// What moves a bare `targo` off the `trustc` beside it in `cwd`, in cargo's
 /// resolution order: `$RUSTC`, `$CARGO_BUILD_RUSTC`, then `build.rustc` in each
 /// `.cargo/config.toml` / `.cargo/config` from `cwd` up (nearest first), then
-/// `$CARGO_HOME`'s. Entries are `(where, value)`, highest precedence first;
-/// empty means nothing does. `RUSTUP_TOOLCHAIN` and the pin do not move it.
-/// Files are read line by line ([`build_rustc_in`]), not parsed as TOML.
+/// `$CARGO_HOME`'s.
 fn rustc_movers(
     cwd: Option<&Path>,
     var: &dyn Fn(&str) -> Option<String>,
@@ -3420,7 +3311,6 @@ fn rustc_movers(
 
 /// The `rustc` key of a cargo config's `[build]` table (or a top-level dotted
 /// `build.rustc`), verbatim between its quotes; the last one wins.
-/// `rustc-wrapper` and `rustc` under other tables do not count.
 fn build_rustc_in(text: &str) -> Option<String> {
     let mut table = String::new();
     let mut found = None;
@@ -3460,8 +3350,7 @@ fn build_rustc_in(text: &str) -> Option<String> {
 }
 
 /// The `targo here` row: the compiler a bare `targo` runs here, from the
-/// directory it resolves into (`dir`) and [`rustc_movers`]. Pure but for one
-/// `is_file`.
+/// directory it resolves into (`dir`) and [`rustc_movers`].
 fn targo_here_row(dir: Option<&Path>, movers: &[(String, String)]) -> String {
     if let Some((what, value)) = movers.first() {
         return format!(
@@ -3487,7 +3376,7 @@ fn targo_here_row(dir: Option<&Path>, movers: &[(String, String)]) -> String {
 
 /// The `trust version` row from a full `rustc -vV`: Trust's own version (its
 /// `trust:` line); NONE when the compiler prints no such line (stock rustc);
-/// the probe's excuse when it did not answer. Pure.
+/// the probe's excuse when it did not answer.
 fn trust_version_row(vv: Option<String>) -> String {
     let Some(vv) = vv else {
         return "(no answer within 2 s, or not on PATH)".to_string();
@@ -3525,9 +3414,7 @@ fn bounded_first_line(cmd: &str, args: &[&str], limit: std::time::Duration) -> O
 }
 
 /// The whole stdout of `cmd args…` (stderr when stdout is blank), or `None` when it does not
-/// exit within `limit` (the child is killed) or cannot be spawned. Built through
-/// `aterm_uds::spawnfd::command` (the one child constructor, clippy.toml), so the child shares
-/// the console `aterm help rust` was typed in.
+/// exit within `limit` (the child is killed) or cannot be spawned.
 fn bounded_output(cmd: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
     use aterm_uds::spawnfd::Stdio;
     use std::io::Read as _;
@@ -3574,12 +3461,10 @@ const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
 /// `routed_shims_resolve_to_where_the_shell_execs`.
 const EXEC_ROOTS_DIR: &str = "compat/trust";
 
-/// Shim hops [`resolve_on_path`] follows before reporting the last target. One
-/// hop is the real shape; the bound stops a shim loop.
+/// Shim hops [`resolve_on_path`] follows before reporting the last target.
 const MAX_SHIM_HOPS: usize = 4;
 
-/// Largest shim file followed (atpkg's own bound). A Unix shim is a few hundred
-/// bytes; a Windows `.cmd` shim is ~4.5 KB.
+/// Largest shim file followed (atpkg's own bound).
 const MAX_SHIM_BYTES: u64 = 64 * 1024;
 
 /// Where a bare command name typed in this shell really runs.
@@ -3695,9 +3580,7 @@ impl ShimScript {
 }
 
 /// Parse an atpkg `sh` shim ([`ShimScript`]), reading the store `exec` line as atpkg's
-/// `platform::parse_sh_shim_target` does. `None` for a script with no `exec '<path>' "$@"`
-/// line. Other lines are skipped, and guard lines after the store `exec` are unreachable and
-/// not collected.
+/// `platform::parse_sh_shim_target` does.
 fn sh_shim_script(content: &str) -> Option<ShimScript> {
     let mut guards = Vec::new();
     for line in content.lines().map(str::trim) {
@@ -3743,7 +3626,7 @@ fn sh_guard_line(line: &str) -> Option<ShimGuard> {
 
 /// The single-quoted `sh` word at the start of `s`, unquoted, and the rest:
 /// `'…'` segments and `\'` escapes (`'it'\''s'` is `it's`), the quoting atpkg's
-/// shim renderer emits. `None` when `s` does not start with one.
+/// shim renderer emits.
 fn sh_quoted_word(s: &str) -> Option<(String, &str)> {
     let mut word = String::new();
     let mut rest = s;
@@ -3767,7 +3650,6 @@ fn sh_quoted_word(s: &str) -> Option<(String, &str)> {
 /// Why `guard` is false now, or `None` when it holds, evaluated like `sh`'s
 /// `test`: `[ ! -h P ]` is false only for a symlink (`lstat`), `[ -f P ]` is
 /// true for a regular file (following links), `[ -x R ]` for an execute bit.
-/// Off Unix atpkg routes no shim, so no guard holds.
 fn guard_refusal(guard: &ShimGuard) -> Option<Refusal> {
     let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
     let regular = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file());
@@ -3821,8 +3703,7 @@ fn resolve_on_path(name: &str, path_env: &std::ffi::OsStr) -> Option<OnPath> {
 
 /// `found`, followed through every `#!` script [`sh_shim_script`] reads (up to
 /// [`MAX_SHIM_BYTES`] each, at most [`MAX_SHIM_HOPS`]) to the file the shell
-/// would exec now ([`ShimScript::hop`]), then canonicalised. Used for both
-/// PATH's `targo` and the checks'.
+/// would exec now ([`ShimScript::hop`]), then canonicalised.
 fn resolve_from(found: PathBuf) -> OnPath {
     let mut shims = Vec::new();
     let mut at = found.clone();
@@ -3847,8 +3728,7 @@ fn resolve_from(found: PathBuf) -> OnPath {
 }
 
 /// aterm's own `rust-toolchain.toml` as built, the file the checks read at their
-/// repo root. Only its `channel` line is used. Named relative to this source
-/// file, so the compile records the file it read, not the checkout's path.
+/// repo root.
 const ATERM_RUST_TOOLCHAIN: &str = include_str!("../../../rust-toolchain.toml");
 
 /// The channel aterm's checks run discovery under: [`ATERM_RUST_TOOLCHAIN`]'s,
@@ -3875,8 +3755,7 @@ fn checks_toolchain(
 }
 
 /// A Trust toolchain `bin`: an executable `trustc` with a `lib/rustlib` sysroot
-/// above it. Wrapper-script and atpkg shim directories are not; an atpkg exec
-/// root's `bin/` is (it clones the build's `trustc` and `lib/`).
+/// above it.
 fn is_toolchain_bin(dir: &Path) -> bool {
     atpkg::toolchain::is_executable_file(&dir.join("trustc"))
         && dir
@@ -3973,9 +3852,7 @@ struct Side<'a> {
     toolchain_bin: bool,
 }
 
-/// Compare the checks' side with PATH's. Canonical directories: equal paths are
-/// one directory; versions compare by [`build_of`]. A matching line is one
-/// build only when both directories are toolchain `bin`s.
+/// Compare the checks' side with PATH's.
 fn compare_toolchains(checks: &Side<'_>, path: &Side<'_>) -> Agreement {
     let same_build = checks
         .ver
@@ -4057,9 +3934,7 @@ THE SERVER'S VERB CATALOG (generated from the protocol table):",
     s
 }
 
-/// The agent operating brief, what `aterm help` prints inside an aterm session. `sid` is the
-/// caller's own session id when known (so the agent can read itself), else a placeholder for
-/// an explicit `help agent` outside a session.
+/// The agent operating brief, what `aterm help` prints inside an aterm session.
 fn agent_page(sid: Option<&str>) -> String {
     let mut s = String::new();
     let you = match sid {
@@ -4150,11 +4025,6 @@ fn agent_page(sid: Option<&str>) -> String {
          records each removal in `aterm harness ledger disk`. A build directory deleted by hand\n  \
          can be one another session's build is using.\n",
     );
-    // §5.5, before the tool list: an EPERM with no dialog reads as a broken
-    // tool, and retry, `sudo` or another path are all wrong. Folder names come
-    // from the consent module (the `protected-folder` guard). macOS only: TCC and
-    // Developer Tools Access exist nowhere else, and on Linux these ~20 lines sent
-    // an agent that hit EPERM to System Settings ▸ Full Disk Access.
     if cfg!(target_os = "macos") {
         push_macos_walls(&mut s);
     }
@@ -4203,7 +4073,7 @@ fn agent_page(sid: Option<&str>) -> String {
 }
 
 /// The agent brief's two macOS walls: TCC file permissions and Developer Tools
-/// Access. macOS only ([`agent_page`] gates it).
+/// Access.
 fn push_macos_walls(s: &mut String) {
     let _ = write!(
         s,
@@ -4229,20 +4099,6 @@ fn push_macos_walls(s: &mut String) {
          valid recovery. Full page: `aterm help permissions`.\n",
         protected_folder_names(),
     );
-    // Debugger-access design §3.11: the rarer wall beside it, three lines. A
-    // "Developer Tools Access" dialog reads like a privacy prompt, and the
-    // reflexes are the same three wrong moves plus a fourth that is worse:
-    // running `DevToolsSecurity`, which with no flag ENABLES developer mode for
-    // the whole Mac behind an administrator dialog on the owner's screen. A
-    // parked lldb survives only an answer within about 30 s (spike D6's lldb
-    // runs): later, its attach fails and its target is killed. The switch is the owner's yes in aterm's own alert: their press in
-    // aterm's Settings, or the alert aterm raises once per Mac at
-    // first launch. The brief is at its line budget, so `await
-    // consent kind=debugger` and the launch ask live on the page. Its last
-    // sentence is the other macOS gotcha with "Developer Tools" in its name,
-    // the first-run check that parks a new program at `_dyld_start` (owner,
-    // design §9.1 O18, which reverses O16's "no
-    // agent-brief line"): one pointer to doctor's row.
     s.push_str(
         "\nDEBUGGER ACCESS (a password dialog, not privacy)\n  \
          \"Developer Tools Access\" is a macOS password dialog, not privacy (`aterm ctl privacy`'s\n  \
@@ -4263,11 +4119,6 @@ pub fn in_session() -> Option<String> {
 }
 
 /// `aterm help fabric`: peer messaging for any agent from any vendor.
-///
-/// Nothing wakes an agent for mail; it is typed to, and an agent may run the
-/// verbs itself. A Codex's model is sandboxed from the socket; codex-alab's own
-/// TUI reads its mail for it, and a vendor `codex` takes no part. The
-/// primer's inbox line points here.
 const FABRIC_PAGE: &str = r#"fabric — peer messaging between aterm sessions and humans
 
 WHAT IT IS
@@ -4388,39 +4239,25 @@ fn page_of(t: &str) -> &str {
         "askpass" | "root" => "sudo",
         "new-tab" | "new-window" | "split-pane" => "windowing",
         "settings" => "config",
-        // Words an agent types when it has mail, the `link` verb that runs the
-        // bridge, and broadcast words (`topic` opts a session in; `say` and
-        // `broadcast` are guesses from `to=say:<topic>`): all land on the
-        // fabric page, which explains mailbox and fan-out together.
         "inbox" | "post" | "mail" | "link" | "topic" | "say" | "broadcast" | "messaging" => {
             "fabric"
         }
-        // The worker verbs, the survey, and the word a model reaches for when it
-        // means another window running Claude Code: all land on the workers page.
         "worker" | "result" | "survey" | "subagent" | "subagents" => "workers",
-        // What someone types for the owner surfaces: a need, stepping in, the opt-in.
         "need" | "take-over" | "takeover" | "hand-back" | "notify" => "needs",
-        // What someone guesses when they want the cursor cat's words.
         "pet" | "cat" | "tricks" | "kitty-commands" | "list-kitty-commands" => "kitty",
-        // The front-door diagnostics and containment flags the aterm page documents.
         "doctor" | "show-config" | "explain-config" | "list-fonts" | "show-face"
         | "list-themes" | "containment" | "sandbox" => "aterm",
         "exceptions" => "update",
-        // The plural and the words someone reaches for when they want colours.
         "themes" | "colors" | "colours" | "color-scheme" | "colour-scheme" => "theme",
-        // What someone types who wants the Mac kept awake.
         "awake" | "keep-awake" => "caffeine",
-        // The words someone reaches for when they want the credentials vault.
         "secret" | "vault" | "credentials" => "secrets",
-        // The editor's own name, and the word for what it is.
         "amacs" | "editor" => "edit",
         other => other,
     }
 }
 
 /// Render the manual: `topic` is the optional `help <topic>` argument, `session` the caller's
-/// sid inside an aterm session ([`in_session`]). No topic is the agent brief inside a session
-/// and the front page outside; an unknown topic is a usage error listing the topics, exit 2.
+/// sid inside an aterm session ([`in_session`]).
 pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     let topic = topic.map(page_of);
     match topic {
@@ -4450,9 +4287,6 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("kitty") => (kitty_page(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
-                // `introspection`, `rust`, `sys`, `theme` and `agh` have generated
-                // bodies, all handled above, so every remaining TOPICS entry
-                // carries an authored body.
                 let body = t.body.unwrap_or_else(|| {
                     unreachable!("introspection, rust, sys, theme and agh are generated")
                 });
@@ -4466,8 +4300,6 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
                 for t in TOPICS {
                     let _ = writeln!(msg, "  {}", t.name);
                 }
-                // The pages that are not TOPICS entries: generated or
-                // verb-shaped, but every bit as real to someone guessing.
                 for extra in EXTRA_PAGES {
                     let _ = writeln!(msg, "  {extra}");
                 }
@@ -4784,8 +4616,7 @@ mod tests {
     }
 
     /// The probe helper is bounded: `sleep 120` against a 200 ms limit returns
-    /// `None` well within the 60 s check. Windows has no `sleep` or `echo` program:
-    /// there `ping -n 120` (one request a second) is the wedge and `cmd /c echo` the echo.
+    /// `None` well within the 60 s check.
     #[test]
     fn bounded_first_line_kills_a_wedged_probe() {
         let (wedge, wedge_args): (&str, &[&str]) = if cfg!(windows) {
@@ -4809,8 +4640,6 @@ mod tests {
             "the bound did not hold: {:?}",
             t0.elapsed()
         );
-        // A probe that exits is answered as soon as it does; the limit is only
-        // the hang detector (a loaded box can take seconds to start `echo`).
         assert_eq!(
             bounded_first_line(echo, echo_args, std::time::Duration::from_secs(60)).as_deref(),
             Some("hello")
@@ -4845,11 +4674,7 @@ mod tests {
         run_once(path);
     }
 
-    /// Run `path` once, unbounded, output discarded: the first exec of a new
-    /// file waits on macOS `syspolicyd`'s assessment (seconds under load), which
-    /// would otherwise eat the page's 2 s probe bounds. Past Linux's `ETXTBSY`
-    /// too ([`aterm_spec::wait::past_text_busy`]): once one exec of the closed
-    /// file has started, no later one can meet it.
+    /// Run `path` once, unbounded, output discarded.
     #[cfg(unix)]
     fn run_once(path: &Path) {
         let _ = aterm_spec::wait::past_text_busy(|| {
@@ -4866,12 +4691,6 @@ mod tests {
     /// marker and the shim shape (plain, env-exporting, and with a single quote
     /// in the target), each rendered by atpkg's writer and read back by
     /// [`sh_exec_target`].
-    ///
-    /// The shim half is unix's: atpkg's Windows writer renders a `.cmd` batch
-    /// wrapper, not an `sh` script, and refuses a target with a quote in it. This
-    /// page reads no shim there — [`first_executable_on_path`] looks for
-    /// `<name>.exe` and [`resolve_from`] follows `#!` scripts only — so on Windows
-    /// the one shape to pin is that a `.cmd` wrapper is never read as an `sh` shim.
     #[test]
     fn reroute_marker_and_shim_shape_match_atpkg() {
         assert_eq!(REROUTE_DIR_MARKER, atpkg::reroute::DIR_MARKER_FILE);
@@ -4911,11 +4730,8 @@ mod tests {
             let body = String::from_utf8(shim.body).expect("a shim is UTF-8");
             assert_eq!(sh_exec_target(&body), None, "{body}");
         }
-        // No exec line, no target: a tombstone-shaped script and a binary-ish blob.
         assert_eq!(sh_exec_target("#!/bin/sh\necho gone >&2\nexit 127\n"), None);
         assert_eq!(sh_exec_target("\u{7f}ELF"), None);
-        // A guard-shaped line is atpkg's only with one `R` in all four places, one `M` in
-        // both, and the exact `"$@"` tail; a guard after the store `exec` is never reached.
         let guard = "[ ! -h '/r/bin/t' ] && [ -f '/r/bin/t' ] && [ -x '/r/bin/t' ] && [ -f \
                      '/s/bin/t' ] && [ ! -h '/r/.atpkg-root' ] && [ -f '/r/.atpkg-root' ] && \
                      exec '/r/bin/t' \"$@\"";
@@ -4934,7 +4750,6 @@ mod tests {
             guard.replacen("[ -f '/r/.atpkg-root' ]", "[ -f '/x/.atpkg-root' ]", 1),
             guard.replacen(" \"$@\"", "", 1),
             guard.replacen("[ ! -h '/r/bin/t' ]", "[ -h '/r/bin/t' ]", 1),
-            // The inode guard atpkg rendered before clones is not this guard.
             String::from(
                 "[ ! -h '/r/bin/t' ] && [ '/r/bin/t' -ef '/s/bin/t' ] && exec '/r/bin/t' \"$@\"",
             ),
@@ -4957,19 +4772,7 @@ mod tests {
         assert_eq!(sh_quoted_word("'unterminated"), None);
     }
 
-    /// A routed shim runs from where its guard sends the shell. A trust build with a separate `bin/rustc` under a prefix whose
-    /// path has a space and a single quote; atpkg's own `compat::ensure_root`
-    /// lays the exec root and `shim_executable_to_env` renders the shim. Then:
-    ///
-    ///  * root laid (clone + marker): taken; the page names the root's file and
-    ///    the store file, and the root's `bin/` is a toolchain `bin`;
-    ///  * marker gone: refused, the store path;
-    ///  * root's file not executable: refused;
-    ///  * a symlink to the store file there: refused;
-    ///  * nothing there: refused.
-    ///
-    /// Each answer is checked against `/bin/sh`: the fixture `targo` prints its
-    /// `$0`, which must equal [`ShimHop::execs`].
+    /// A routed shim runs from where its guard sends the shell.
     #[cfg(unix)]
     #[test]
     fn routed_shims_resolve_to_where_the_shell_execs() {
@@ -5009,8 +4812,6 @@ mod tests {
         let root_bin = atpkg::compat::root_dir(&layout, 8595).join("bin");
         let (store_targo, root_targo) = (bin.join("targo"), root_bin.join("targo"));
         let marker = atpkg::compat::root_marker(&atpkg::compat::root_dir(&layout, 8595));
-        // atpkg just wrote the root's file (a copy where the filesystem has no clones),
-        // and the shim's shell execs it, out of `past_text_busy`'s reach: paid here.
         run_once(&root_targo);
 
         let shims = prefix.join("bin");
@@ -5046,7 +4847,6 @@ mod tests {
             PathBuf::from(String::from_utf8_lossy(&run.stdout).trim_end())
         };
 
-        // Taken: the root atpkg laid.
         let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
         assert_eq!(
             got.shims,
@@ -5061,8 +4861,6 @@ mod tests {
         assert_eq!(got.real_dir(), Some(root_bin.clone()));
         assert!(is_toolchain_bin(&root_bin) && is_toolchain_bin(&bin));
 
-        // Refused: no marker, not executable, a symbolic link, nothing. Each from the root
-        // atpkg laid, restored after.
         let marker_body = std::fs::read(&marker).expect("the marker reads");
         let root_body = std::fs::read(&root_targo).expect("the root file reads");
         let restore = || {
@@ -5132,10 +4930,8 @@ mod tests {
         let plain = root.join("plain");
         let shims = root.join("shims");
         let store = root.join("store/trust/8595/bin");
-        // A reroute dir that (unlike the real one) carries a `targo`: skipped by marker.
         put_exec(&reroute.join("targo"), b"#!/bin/sh\nexit 9\n");
         std::fs::write(reroute.join(REROUTE_DIR_MARKER), "marker\n").expect("marker");
-        // A non-executable `targo` earlier on PATH does not count.
         std::fs::create_dir_all(&plain).expect("mkdir");
         std::fs::write(plain.join("targo"), "not executable").expect("write");
         let real = store.join("targo");
@@ -5167,13 +4963,11 @@ mod tests {
         let described = describe_on_path(&got);
         assert!(described.contains("a shim that execs"), "{described}");
 
-        // A plain executable is its own answer, and a missing name is None.
         let plain_only = std::env::join_paths([&store]).expect("join");
         let got = resolve_on_path("targo", &plain_only).expect("the store file itself");
         assert!(got.shims.is_empty());
         assert!(resolve_on_path("trustc", &plain_only).is_none());
 
-        // A shim whose target is gone says so instead of naming a directory.
         put_exec(
             &root.join("dangling/targo"),
             b"#!/bin/sh\nexec '/nonexistent/aterm-cli-test/targo' \"$@\"\n",
@@ -5235,8 +5029,6 @@ mod tests {
             ),
             Agreement::SameBuild
         );
-        // A wrapper: a script first on PATH that echoes the checks'
-        // line is a matching LINE, never "one build", on either side.
         assert_eq!(
             cmp(side(tree, Some(old), true), side(script, Some(old), false)),
             Agreement::SameLine
@@ -5249,8 +5041,6 @@ mod tests {
             cmp(side(tree, Some(old), true), side(store, Some(new), true)),
             Agreement::OtherBuild
         );
-        // One directory answering two different builds (rewritten between the
-        // probes) is still a measured difference, never "agree".
         assert_eq!(
             cmp(side(store, Some(old), true), side(store, Some(new), true)),
             Agreement::OtherBuild
@@ -5281,10 +5071,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A PENDING `targo` IS NOT ASKED (2026-10-15): before `trust` lands, PATH's `targo` is
-    /// atpkg's stub, which waits for the install while a pass runs it — so the page names
-    /// it and never runs it, instead of sitting out each probe's bound. Re-executed as a
-    /// child with a clean environment and cwd, so the scratch PATH is the one it reads.
+    /// Before `trust` lands, PATH's `targo` is atpkg's stub, which the page names and never runs.
     #[cfg(unix)]
     #[test]
     fn page_never_runs_a_pending_targo() {
@@ -5300,7 +5087,6 @@ mod tests {
         let stubs = root.join("stubs");
         std::fs::create_dir_all(&home).expect("home");
         let ran = root.join("targo-ran");
-        // The stub's shape as atpkg lays it, marker on its second line; run, it leaves a mark.
         put_exec(
             &stubs.join("targo"),
             format!(
@@ -5453,12 +5239,7 @@ mod tests {
         }
     }
 
-    /// Autopilot Cruise / Land (owner, 2026-10-19) retired the
-    /// completion token: the agent brief, which `aterm help` prints into an
-    /// agent's context inside a session and out of one, names it nowhere, so
-    /// no agent is taught to end its work on it (the harness page still says
-    /// how the retired token is read). NEGATIVE CONTROL: a brief with the
-    /// token planted in it is caught.
+    /// Autopilot Cruise / Land retired the completion token: the agent brief names it nowhere.
     #[test]
     fn the_agent_brief_names_no_retired_token() {
         let names = |text: &str| text.contains("ATERM-TASK-DONE");
@@ -5470,10 +5251,7 @@ mod tests {
     }
 
     /// Every `aterm ctl` verb a help page or the agent brief teaches is one
-    /// the server's table or the client serves: a page that taught a removed
-    /// verb would send an agent to `ERR unknown verb`. The commands are read by
-    /// the primer's own rule (`aterm_primer::taught_ctl_verbs`), so the help
-    /// and the skills are held to one reading of a command.
+    /// the server's table or the client serves.
     #[test]
     fn every_help_page_teaches_served_verbs() {
         let pages = topic_names()

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Task record publication over [`Ctl`] under [`super::claim`] ([`SuperviseOpts::tasks`],
-//! [`Session::supervise`], [`mark_task_exited`]).
+//! `Session::supervise`, [`mark_task_exited`]).
 //!
 //! Publishes [`TurnEndState::landed`] points ([`TurnEndState::point_number`],
 //! [`TurnEndState::left_to_person`], [`TurnEndState::followed`]) with result snapshots

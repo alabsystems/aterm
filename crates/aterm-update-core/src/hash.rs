@@ -85,7 +85,7 @@ fn sha256_stream(input: impl std::io::Read) -> Result<String, String> {
 /// Lowercase SHA-256 of everything `input` yields on ring, which drives the CPU's
 /// SHA-256 instructions (ARMv8 SHA2 on Apple silicon, SHA-NI on x86_64): the macOS
 /// arm of [`sha256_file`]. A 47 MiB update container hashes in tens of
-/// milliseconds; the same FIPS 180-4 digest as [`sha256_stream`], which the
+/// milliseconds; the same FIPS 180-4 digest as `sha256_stream`, which the
 /// recorded answers below hold both to.
 #[cfg(any(all(unix, not(target_os = "linux")), test))]
 fn hardware_sha256_stream(input: impl std::io::Read) -> Result<String, String> {

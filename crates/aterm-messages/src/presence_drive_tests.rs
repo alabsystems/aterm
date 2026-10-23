@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::presence::drive::{self, Desk, Shown, Table};
 use crate::presence::{
     ChipLevel, Facts, HoldFact, Level, NeedFact, NeedSeverity, PillAct, PillKind, Rim, StopCause,
-    StoryVerb, TurnFact, View,
+    TurnFact, View,
 };
 use crate::presence_tests::{TestHost, need};
 use crate::{Duration, Instant};
@@ -700,9 +700,9 @@ fn a_calm_key_reads_the_story_and_a_hold_keeps_it() {
     drive::refresh_session(&mut d, 1);
     drive::human_acted(&mut d, 1);
     assert_eq!(drive::session_level(&d, 1), Level::Quiet, "read");
-    let seq = drive::tell(&mut d, 1, StoryVerb::Chose).expect("held");
+    let seq = drive::tell(&mut d, 1).expect("held");
     assert!(drive::status_tail(&d, 1).contains(&format!("story={seq}")));
-    assert_eq!(drive::tell(&mut d, 99, StoryVerb::Chose), None);
+    assert_eq!(drive::tell(&mut d, 99), None);
 }
 
 /// `chrome_line` prints the border, the pressing session, and the pill.

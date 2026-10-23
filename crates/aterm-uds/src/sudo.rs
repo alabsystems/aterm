@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kernel parent attestation and scrubbed [`Secret`] for the `sudo` askpass relay.
+//! Kernel parent attestation and scrubbed [`Secret`](crate::sudo::Secret) for the `sudo` askpass relay.
 
 /// A password in flight, held off the agent's reach.
 pub struct Secret {

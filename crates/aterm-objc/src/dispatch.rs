@@ -86,6 +86,29 @@ where
 }
 
 /// Runs `f` on the process main thread inside an autorelease pool and returns its result.
+///
+/// # Blocking
+/// Off the main thread this waits for the main queue, so two situations hang silently: a main
+/// thread that never services its queue (call this only where the main thread runs an event
+/// loop; a libtest binary's main thread is parked joining workers), and a main thread inside a
+/// `run_on_main` closure that waits on a thread calling `run_on_main` (reachable from safe code,
+/// e.g. a closure that spawns and joins a helper). Both are `dispatch_sync` semantics.
+///
+/// # Panics
+///
+/// Re-raises any panic from `f`, or panics with [`ContainedInRunOnMain`] if an
+/// `NSException` was contained. Off the main thread, an `NSException` that `f`
+/// raises is contained on the main thread (reported against `"run_on_main"`
+/// through [`crate::exception`], Rust frames dropped, main thread continuing).
+/// Also panics if libdispatch never runs the submitted function.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aterm_objc::run_on_main;
+/// let scale = run_on_main(|_mt| 2.0_f64);
+/// assert_eq!(scale, 2.0);
+/// ```
 pub fn run_on_main<F, R>(f: F) -> R
 where
     F: Send + FnOnce(MainThread) -> R,

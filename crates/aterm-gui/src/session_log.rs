@@ -388,7 +388,6 @@ pub(crate) struct SessionLog {
     person_seen: u64,
     reached_seen: u64,
     marked_through: u64,
-    burst_rows: u32,
     rollout: transcript::TapAnswers,
     /// This log is the one a seamless update's predecessor wrote, carried and read ([`Self::adopt`]), not one that started over after a gap.
     carried: bool,
@@ -469,7 +468,6 @@ impl SessionLog {
             person_seen: 0,
             reached_seen: 0,
             marked_through: 0,
-            burst_rows: 0,
             rollout: transcript::TapAnswers::default(),
             carried: false,
         }
@@ -1529,7 +1527,7 @@ impl SessionLog {
         let own_reaches = own.is_some_and(|g| g.reaches);
         let Some(p) = self.person.as_ref() else {
             if let Some(g) = own {
-                let marked = self.deliver_person(
+                self.deliver_person(
                     true,
                     g.reaches,
                     (g.burst.is_some(), false),
@@ -1537,7 +1535,6 @@ impl SessionLog {
                     0,
                     at,
                 );
-                self.burst_rows += u32::from(marked);
             }
             return;
         };
@@ -1550,7 +1547,7 @@ impl SessionLog {
         let unmarked_burst = c.burst > self.marked_through;
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        let marked = self.deliver_person(
+        self.deliver_person(
             fresh,
             reached,
             (burst, unmarked_burst),
@@ -1558,18 +1555,6 @@ impl SessionLog {
             c.seq,
             at,
         );
-        self.burst_rows += u32::from(marked);
-    }
-
-    /// The `human` rows the burst marks [`Self::person_input`] wrote owe the timeline, taken: the timeline records them before its next row and at the end of the key's own delivery ([`crate::session_timeline::SessionTimeline::pay_burst_rows`]).
-    pub(crate) fn take_burst_rows(&mut self) -> u32 {
-        std::mem::take(&mut self.burst_rows)
-    }
-
-    /// The `human` rows the burst marks owe the timeline, not taken (the timeline's debug cross-check).
-    #[cfg(debug_assertions)]
-    pub(crate) const fn burst_rows_owed(&self) -> u32 {
-        self.burst_rows
     }
 
     /// [`Self::person_input`] for a gesture no count names (a test's, or a log no store bound): delivered whole, as one that reached the program, `burst` its own.
@@ -1578,9 +1563,7 @@ impl SessionLog {
         let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        let marked = self.deliver_person(true, true, (burst, false), true, c.seq, at);
-        // Its mark owes the timeline its `human` row, as every burst's does.
-        self.burst_rows += u32::from(marked);
+        self.deliver_person(true, true, (burst, false), true, c.seq, at);
     }
 
     fn deliver_person(
@@ -1591,9 +1574,9 @@ impl SessionLog {
         own_reaches: bool,
         seq: u64,
         at: Stamp,
-    ) -> bool {
+    ) {
         if !fresh && !reached && !burst {
-            return false;
+            return;
         }
         self.resync();
         if fresh {
@@ -1623,13 +1606,11 @@ impl SessionLog {
                 .at(Node::SESSION)
                 .by(Actor::Human)
                 .fields(f);
-            let wrote = self.log.mark(mark, at).is_ok();
+            let _ = self.log.mark(mark, at);
             if a_bursts {
                 self.marked_through = self.marked_through.max(seq);
             }
-            return a_bursts && wrote;
         }
-        false
     }
 
     /// A `ctl turn` exchange from `by`, ledger id `ledger`, handed its input to the seam (`cmd_turn` calls this at the exchange's first byte and again at each Enter): the turn it opens carries `by=` and `ledger=` (of a run a waiting name opens later too, [`Typed`]).

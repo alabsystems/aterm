@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[path = "../aterm-log/clean_islands.rs"]
 mod clean_islands;
 
-// `cfg(anchor_rules)`
+// `cfg(anchor_rules)`: which anchor attributes this crate writes.
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
 

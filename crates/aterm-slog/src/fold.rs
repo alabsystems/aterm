@@ -20,7 +20,6 @@ pub use snap::SnapError;
 
 /// The most needs the state holds; a less urgent one gives way.
 pub const MAX_NEEDS: usize = 8;
-/// The most open nodes the fold tracks.
 const MAX_TRACKED: usize = 64;
 /// A label's default lifetime (§7.4): 600 s.
 pub const LABEL_TTL_MS: u64 = 600_000;
@@ -70,8 +69,6 @@ impl NodeFields {
         }
     }
 
-    /// Hold `val` for `key` at `conf` from record `seq` whatever is held:
-    /// in the held one's place, so the fields keep their order.
     fn put(&mut self, key: Key, val: Val, conf: Conf, seq: u64) {
         let held = Held {
             key,
@@ -254,9 +251,6 @@ pub struct Claim {
 }
 
 impl Claim {
-    /// The claim a `verdict` or `label` mark makes: its word or text and
-    /// `ttl=`, `as=` and `re=` (`None` for a mark that carries neither a word
-    /// nor a text).
     fn of(r: &Rec, label: bool) -> Option<Claim> {
         let (word, text, until) = if label {
             let text = r.f.get_str(Key::Text)?.to_string();
@@ -479,9 +473,6 @@ impl std::fmt::Debug for Words {
     }
 }
 
-/// Whether `c` extends the character before it (a combining mark, a joiner,
-/// a variation selector, an emoji modifier): a cut is never placed before
-/// one.
 const fn is_extend(c: char) -> bool {
     matches!(c,
         '\u{0300}'..='\u{036f}'
@@ -495,7 +486,6 @@ const fn is_extend(c: char) -> bool {
         | '\u{e0100}'..='\u{e01ef}')
 }
 
-/// The longest prefix of `s` within `room` bytes cut between clusters.
 fn cut_subject(s: &str, room: usize) -> &str {
     if s.len() <= room {
         return s;
@@ -741,9 +731,6 @@ impl Fold {
         self.in_since_human
     }
 
-    /// A turn opened: link it to the one mail waiting in its window, or
-    /// count it ambiguous, and take what it weighed off the waiting list
-    /// ([`mail::mail_link_of`], [`mail::after_turn`]).
     fn link_turn(&mut self, r: &Rec) {
         let decided = mail_link_of(&self.mail, r);
         match decided {
@@ -762,7 +749,6 @@ impl Fold {
         mail::after_turn(&mut self.mail, r, decided);
     }
 
-    /// Keep the links of the open turns and the newest closed one.
     fn prune_links(&mut self) {
         let last = self.st.last[1].as_ref().map(|c| c.node);
         let tracked = &self.tracked;
@@ -1308,8 +1294,6 @@ impl Fold {
         }
     }
 
-    /// Add a need in precedence order; when full, the least urgent (newest
-    /// among equals) gives way to a more urgent one.
     fn raise(&mut self, need: Need) {
         let mut all: Vec<Need> = self.st.needs.iter_mut().filter_map(Option::take).collect();
         all.retain(|n| !(n.node == need.node && n.word == need.word && n.by == need.by));
@@ -1351,7 +1335,6 @@ pub const fn amend_refines_out(held_conf: Conf, held_seq: u64, conf: Conf, seq: 
     matches!(conf, Conf::Exact) && confidence_law(held_conf, held_seq, conf, seq)
 }
 
-/// The totals' bucket a turn closed `out` is counted in.
 fn turn_bucket<'a>(t: &'a mut Totals, out: &str) -> &'a mut u32 {
     match out {
         "done" => &mut t.done,
@@ -1457,7 +1440,6 @@ pub fn step_need(r: &Rec) -> Option<&'static str> {
     }
 }
 
-/// What a tool class reads as in the clause.
 fn tool_words(cls: Option<&str>) -> &'static str {
     match cls {
         Some("edit" | "write") => "editing",
@@ -1561,7 +1543,6 @@ pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
     }
 }
 
-/// The clause policy over the label rule `label`.
 fn clause_with(
     st: &SessionState,
     now_wall: u64,

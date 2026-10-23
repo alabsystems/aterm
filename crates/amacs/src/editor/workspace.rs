@@ -302,11 +302,19 @@ impl EditorWorkspace {
         }
         if view.minibuffer_active() {
             if matches!(view.minibuffer, Minibuffer::Search { .. }) {
-                if chord == KeyChord::parse("C-s").expect("static chord") {
-                    return self.navigate_search(store, view, true);
-                }
-                if chord == KeyChord::parse("C-r").expect("static chord") {
-                    return self.navigate_search(store, view, false);
+                // The chord that started the search searches again: the
+                // keymap's (`M-s` on Windows, where `C-s` saves) or emacs's.
+                let forward = match self.keymap.resolve(std::slice::from_ref(&chord)) {
+                    KeyResolution::Command(
+                        EditorCommand::IncrementalSearch | EditorCommand::SearchNext,
+                    ) => Some(true),
+                    KeyResolution::Command(EditorCommand::SearchPrevious) => Some(false),
+                    _ if chord == KeyChord::parse("C-s").expect("static chord") => Some(true),
+                    _ if chord == KeyChord::parse("C-r").expect("static chord") => Some(false),
+                    _ => None,
+                };
+                if let Some(forward) = forward {
+                    return self.navigate_search(store, view, forward);
                 }
             }
             return Ok(vec![EditorEffect::Status(

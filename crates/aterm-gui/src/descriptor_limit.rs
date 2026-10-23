@@ -74,7 +74,7 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
 
 static PARK_RAISED_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// See [`PARK_RAISED_FROM`].
+/// The soft `RLIMIT_NOFILE` this process would hold had no park raised it; `None` without one.
 pub(crate) fn park_raised_from() -> Option<u64> {
     Some(PARK_RAISED_FROM.load(std::sync::atomic::Ordering::Relaxed)).filter(|from| *from > 0)
 }

@@ -569,6 +569,14 @@ const REDACTED: &str = "[redacted]";
 
 /// Every credential in `text` replaced by `[redacted]`, word by word (split on spaces; the
 /// controls are spaces by now):
+///
+/// * a word shaped like a token ([`is_secret_shaped`]) — GitHub's, Anthropic's and OpenAI's
+///   `sk-…`, GitLab's, Slack's, npm's, an AWS key id, or a long random-looking run;
+/// * the value of a credential-named key, glued (`token=…`, `password:…`, `"api_key":"…"`)
+///   or as the next word (`token: …`) — [`is_credential_key`];
+/// * the word after `Bearer` or `token`, and after `Authorization:` its scheme word (kept,
+///   when it is one) AND the credential after it — `Authorization: Bearer [redacted]`,
+///   where hiding only the next word used to redact `Bearer` and print the token.
 fn redact_tokens(text: &str) -> String {
     /// What the words that follow owe the redactor.
     #[derive(Clone, Copy, PartialEq, Eq)]

@@ -5,23 +5,23 @@
 
 use std::sync::RwLock;
 
-/// Parsed CLI: the `-e` command to run instead of `$SHELL` (if any), the `--working-directory` to start it in (if any), whether to `--hold` the window open after the command exits, and whether `--headless` was passed.
+/// Parsed CLI options (`-e` command, `--working-directory`, `--hold`, `--headless`, and flags).
 pub(crate) struct Cli {
-    /// The `-e` payload as the OS gave it: a program's arguments are bytes, not text, so they are never re-encoded on the way to the spawn.
+    /// The `-e` payload as the OS gave it: a program's arguments are bytes, not text.
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
-    /// `--headless`: no window — engine + PTY + control socket only — and on macOS no application object either (no Dock tile, never the front app, no WindowServer connection; `main_entry` in `lib.rs`), so a harness may boot one beside a person who is typing.
+    /// `--headless`: no window — engine + PTY + control socket only.
     pub(crate) headless: bool,
-    /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file means the process that started this instance is gone, so it shuts down ([`crate::lifeline`]).
+    /// `--lifeline-fd <n>` (headless only).
     pub(crate) lifeline_fd: Option<i32>,
-    /// `--ready-fd <n>` (headless only): the pipe's write end this instance writes one byte to, then closes, once its control socket listens ([`crate::lifeline`]'s ready signal).
+    /// `--ready-fd <n>` (headless only).
     pub(crate) ready_fd: Option<i32>,
     /// The render/font flags, for `main` to [`crate::launch::install`].
     pub(crate) launch: crate::launch::Launch,
 }
 
-/// The launch flags: what this process's command line asked of it, recorded by [`parse_cli`] before any thread exists and read wherever the window needs it (the socket plan, the initial grid, the shell, the containment funnel).
+/// Process launch flags recorded by [`parse_cli`] before any thread exists.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaunchFlags {
     /// `--columns <n>` (20..=500, validated on the way in).
@@ -30,9 +30,9 @@ pub(crate) struct LaunchFlags {
     pub(crate) lines: Option<u16>,
     /// `--shell <name|path>`: outranks the config `shell` for every new tab.
     pub(crate) shell: Option<String>,
-    /// `--containment <mode>` / `--sandbox` / `--no-sandbox`, as typed: the parse, and its fail-closed fallback, are the launch funnel's in `main`.
+    /// `--containment <mode>` / `--sandbox` / `--no-sandbox`, as typed.
     pub(crate) containment: Option<String>,
-    /// `--control-sock <path|0|off>` / `--no-control-sock`: the socket directive's two inputs ([`aterm_types::control_socket::socket_directive`]).
+    /// `--control-sock <path|0|off>` / `--no-control-sock`: the socket directive's two inputs.
     pub(crate) control_sock: Option<String>,
     /// `--no-control-sock`.
     pub(crate) no_control_sock: bool,
@@ -43,7 +43,6 @@ pub(crate) struct LaunchFlags {
 }
 
 impl LaunchFlags {
-    /// Nothing asked — the ordinary launch.
     const NONE: Self = Self {
         columns: None,
         lines: None,
@@ -55,7 +54,7 @@ impl LaunchFlags {
         verbose: false,
     };
 
-    /// The control-socket directive these flags ask for: the same decision a client makes about a socket path ([`aterm_types::control_socket::socket_directive`]).
+    /// Control-socket directive requested by these launch flags.
     pub(crate) fn socket_directive(&self) -> aterm_types::control_socket::SocketDirective {
         aterm_types::control_socket::socket_directive(
             self.control_sock.as_deref(),
@@ -64,9 +63,6 @@ impl LaunchFlags {
     }
 }
 
-/// The process's launch flags. Written only by [`parse_cli`] (single-threaded
-/// startup, so a diagnostic verb later on the same command line — `--columns 120
-/// --show-config` — reports what the flags before it asked for).
 static LAUNCH_FLAGS: RwLock<LaunchFlags> = RwLock::new(LaunchFlags::NONE);
 
 /// This process's launch flags (a copy; a poisoned lock still yields its value).
@@ -77,7 +73,6 @@ pub(crate) fn launch_flags() -> LaunchFlags {
     )
 }
 
-/// Record one flag. Only [`parse_cli`] calls this.
 fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
     let mut flags = LAUNCH_FLAGS
         .write()
@@ -85,7 +80,7 @@ fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
     set(&mut flags);
 }
 
-/// The `--shell` lines of [`HELP_HEAD`], as this platform resolves a shell: Windows discovers a name (Git Bash off PATH, the `wsl`/`cmd` aliases); Unix looks it up on PATH.
+/// The `--shell` lines of [`HELP_HEAD`], as this platform resolves a shell.
 #[cfg(windows)]
 macro_rules! shell_flag_help {
     () => {
@@ -111,8 +106,6 @@ macro_rules! shell_flag_help {
     };
 }
 
-/// The `--help` text: every user-facing flag with its argument, a one-line description and its
-/// `[config: key]` where it has one.
 const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
     "\n",
@@ -277,9 +270,6 @@ const HELP_TAIL: &str = concat!(
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
 );
 
-/// The placeholder in [`HELP_TAIL`]'s CONFIG line and [`STARTER_CONFIG`]'s header, filled at
-/// print/write time with the path the loader resolves (`app_config::config_path`), since the
-/// path differs by platform (Windows reads `%APPDATA%\aterm\aterm.toml`).
 const CONFIG_PATH_SLOT: &str = "<aterm.toml>";
 
 /// The variables the loader resolves the config path from, for the one message
@@ -289,7 +279,6 @@ const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME, APPDATA and HOME";
 #[cfg(not(windows))]
 const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME and HOME";
 
-/// The resolved config path as `--help` prints it, or why there is none.
 fn config_path_display() -> String {
     match crate::app_config::config_path() {
         Some(path) => path.display().to_string(),
@@ -297,12 +286,10 @@ fn config_path_display() -> String {
     }
 }
 
-/// [`HELP_TAIL`] with the config path filled in — what `--help` prints.
 fn help_tail() -> String {
     HELP_TAIL.replacen(CONFIG_PATH_SLOT, &config_path_display(), 1)
 }
 
-/// [`STARTER_CONFIG`] headed by the path it is being written to.
 fn starter_config_for(path: &std::path::Path) -> String {
     STARTER_CONFIG.replacen(CONFIG_PATH_SLOT, &path.display().to_string(), 1)
 }
@@ -317,7 +304,7 @@ const WINDOWS_HELP_TAIL: &str = concat!(
     "                               terminal's registration is left alone.\n",
 );
 
-/// The shell block of [`STARTER_CONFIG`], as this platform resolves a shell (see `shell_flag_help!`).
+/// The shell block of [`STARTER_CONFIG`], as this platform resolves a shell.
 #[cfg(windows)]
 macro_rules! starter_shell_block {
     () => {
@@ -349,8 +336,6 @@ macro_rules! starter_shell_block {
     };
 }
 
-/// The documented starter config `--write-config` writes: Linux-tuned, every line commented so
-/// writing it changes nothing.
 const STARTER_CONFIG: &str = concat!(
     "\
 # aterm — <aterm.toml>
@@ -589,8 +574,6 @@ const STARTER_CONFIG: &str = concat!(
 ",
 );
 
-/// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
-/// missing.
 fn flag_value(flag: &str, args: &mut impl Iterator<Item = std::ffi::OsString>) -> String {
     match args.next() {
         Some(v) => v.to_string_lossy().into_owned(),
@@ -607,7 +590,6 @@ fn valid_font_px_flag(value: &str) -> bool {
         .is_ok_and(|px| px.is_finite() && (crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&px))
 }
 
-/// `value` as an initial grid dimension within `min..=max`, or `None`.
 fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
     value
         .parse::<u16>()
@@ -615,8 +597,6 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
         .filter(|dimension| (min..=max).contains(dimension))
 }
 
-/// Write a print-and-exit flag's answer to stdout and end the process with the flag's `code`, or
-/// 1 when the answer could not be written.
 fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     use std::io::Write as _;
     let written = aterm_uds::stdout::write_all(text.as_bytes());
@@ -633,9 +613,6 @@ fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     std::process::exit(status)
 }
 
-/// The status a print-and-exit flag ends with: its own `code` when the answer was written or the
-/// reader closed the pipe (`BrokenPipe`, which both Windows pipe-closed errors map to; aterm-ctl's
-/// rule for `| head`), else the stderr line naming the failure, which exits 1.
 fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String> {
     aterm_uds::stdout::answer_status("aterm-gui", written, code)
 }
@@ -1061,14 +1038,11 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
     }
 }
 
-/// The usage error `-d <dir>` stops a launch with, or `None` to take the folder.
 fn start_dir_refusal(dir: &str, update_successor: bool) -> Option<String> {
     (!update_successor && !std::path::Path::new(dir).is_dir())
         .then(|| format!("not a directory: {dir}"))
 }
 
-/// The `--lifeline-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
-/// when it is well-formed on a headless launch, and the usage error otherwise.
 fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, String> {
     let Some(value) = value else {
         return Ok(None);
@@ -1087,9 +1061,6 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
     Ok(Some(fd))
 }
 
-/// The `--ready-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
-/// when it is well-formed on a headless launch, and the usage error otherwise — refused for a
-/// window (a person sees it come up) and for 0-2 (the instance's own stdio).
 fn ready_request(
     value: Option<&str>,
     headless: bool,
@@ -1145,8 +1116,6 @@ mod tests {
         }
     }
 
-    /// A `-d` folder that has gone since the window opened stops a person's launch (exit 2) and
-    /// never an update's relaunch of that window.
     #[test]
     fn a_vanished_start_folder_stops_a_launch_and_never_an_update_relaunch() {
         let gone = std::env::temp_dir().join("aterm-start-dir-that-is-not-there-r8-6");
@@ -1162,8 +1131,6 @@ mod tests {
         assert_eq!(super::start_dir_refusal(&here, true), None);
     }
 
-    /// A reader that closed the pipe (Windows os errors 232 and 109 included) ends the answer
-    /// quietly with the flag's own status; any other failure is said, with status 1.
     #[test]
     fn a_closed_pipe_ends_the_answer_quietly_and_any_other_failure_is_said() {
         use std::io::{Error, ErrorKind};
@@ -1194,9 +1161,6 @@ mod tests {
         );
     }
 
-    /// The line under an answer that went straight onto a prompt's console names
-    /// the command to type instead — the console image with the same flags — and
-    /// keeps an argument with a space in it one argument.
     #[test]
     fn the_unwaited_answer_line_names_the_waited_for_spelling() {
         let line = super::unwaited_answer_line(&["--version".to_string()]);
@@ -1214,8 +1178,6 @@ mod tests {
         );
     }
 
-    /// `--headless` arms the mode through the `Cli` field alone: nothing is
-    /// exported, so a child the window spawns inherits no headless request.
     #[test]
     fn the_headless_flag_is_recorded_and_exports_nothing() {
         let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
@@ -1224,9 +1186,6 @@ mod tests {
         assert_eq!(cli.ready_fd, None);
     }
 
-    /// `--ready-fd` arms only a headless launch, in either order, with a descriptor above stdio;
-    /// an update's relaunch of a running instance drops the first image's number unread;
-    /// everything else is a usage error that names the fix.
     #[test]
     fn the_ready_flag_arms_only_a_headless_launch() {
         use super::ready_request as req;
@@ -1269,9 +1228,6 @@ mod tests {
         );
     }
 
-    /// `--lifeline-fd` arms only a headless launch, in either order, with a
-    /// descriptor number; everything else is a usage error that names the fix —
-    /// and the `-e` payload after it is still the payload.
     #[test]
     fn the_lifeline_flag_arms_only_a_headless_launch() {
         use super::lifeline_request as req;
@@ -1299,8 +1255,6 @@ mod tests {
         }
     }
 
-    /// The socket directive of the launch flags is the shared one: a path binds
-    /// there, `0`/`off` and `--no-control-sock` disable, nothing is per-instance.
     #[test]
     fn launch_flags_decide_the_socket_like_every_client() {
         use aterm_types::control_socket::SocketDirective as D;
@@ -1359,9 +1313,6 @@ mod tests {
         }
     }
 
-    /// `--cpu` / `--gpu` are symmetric, the last one wins, and neither — nor any
-    /// other launch flag — writes the environment: the render/font flags reach
-    /// their readers through `Cli::launch` alone.
     #[test]
     fn render_flags_ride_the_launch_struct_and_the_last_renderer_flag_wins() {
         use crate::launch::RendererFlag;
@@ -1405,8 +1356,6 @@ mod tests {
         );
     }
 
-    /// `--help`'s CONFIG line and the starter's header name the path the loader resolves on this
-    /// machine, never a literal (Windows reads `%APPDATA%\aterm\aterm.toml`).
     #[test]
     fn help_and_starter_name_the_resolved_config_path() {
         assert!(
@@ -1521,8 +1470,6 @@ mod tests {
         }
     }
 
-    /// The `[matrix_rain]` starter block is table-scoped, so the line-by-line check above skips
-    /// it: uncomment the whole block and parse it as one document.
     #[test]
     fn starter_config_matrix_rain_block_deserializes() {
         use crate::app_config::Config;

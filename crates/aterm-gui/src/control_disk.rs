@@ -194,7 +194,7 @@ fn largest_need(wait: &SysWait, row: &VolumeRow) -> Option<u64> {
         .max()
 }
 
-/// External readers injected into the wait ([`Env::live`] in production).
+/// External readers injected into the wait ([`cmd_await_sys`] injects the production ones).
 pub(crate) struct Env<'a> {
     /// A fresh reading of the volume holding a path (one `statfs`).
     pub(crate) read: &'a dyn Fn(&Path) -> Result<Reading, Unread>,

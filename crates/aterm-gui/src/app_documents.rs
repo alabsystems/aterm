@@ -7291,9 +7291,10 @@ mod tests {
     #[test]
     fn an_absent_number_comes_in_at_its_default_as_settings_writes_it() {
         let source = "agents_auto_prime = false\n";
+        let line_height = format!("line_height = {}", crate::app_config::DEFAULT_LINE_HEIGHT);
         for (key, line) in [
             (crate::prefs::EDIT_WINDOW_PADDING, "window_padding = 12"),
-            (crate::prefs::EDIT_LINE_HEIGHT, "line_height = 1"),
+            (crate::prefs::EDIT_LINE_HEIGHT, line_height.as_str()),
             ("output_streak.idle_secs", "idle_secs = 10"),
             ("output_streak.intensity", "intensity = 1"),
             (crate::prefs::EDIT_WALLPAPER_DIM, "wallpaper_dim = 0.3"),

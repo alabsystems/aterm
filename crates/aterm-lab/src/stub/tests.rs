@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub on typed request bodies, and served for real on loopback to the
-//! workspace's HTTP client (an independent parser of its framing).
+//! Tests for the stub on typed request bodies and over loopback.
 use super::*;
 
 fn body(v: &str) -> Vec<u8> {
@@ -51,8 +50,6 @@ fn the_tool_script_is_answered_one_call_per_request_from_toolstart() {
     assert_eq!(tool_turn(&two, &script), Some(ToolTurn::Done));
 }
 
-/// A `calls` step is several tool uses in ONE assistant message (parallel
-/// calls), answered by one request holding all their results: one step.
 #[test]
 fn a_calls_step_makes_its_calls_in_one_message_and_counts_as_one_step() {
     let script = J::parse(
@@ -82,9 +79,6 @@ fn a_calls_step_makes_its_calls_in_one_message_and_counts_as_one_step() {
     assert!(matches!(tool_turn(&start, &empty), Some(ToolTurn::Call(n, _, 0)) if n == "Read"));
 }
 
-/// Each input of a `calls` step has its `@SID:<k>@` filled from the `k`th
-/// tool result, as a single call's is ([`fill_sids`]): every call in the
-/// message, not the first alone.
 #[test]
 fn a_calls_steps_inputs_have_their_sids_filled() {
     let script = J::parse(
@@ -115,12 +109,6 @@ fn a_calls_steps_inputs_have_their_sids_filled() {
     }
 }
 
-/// Served for real: a `calls` step streams one assistant message with one
-/// `tool_use` block per call, at indexes 0, 1, …, each block's input
-/// reassembled from its own `input_json_delta`s, and stops for `tool_use`
-/// (what Claude Code answered with two boxes in the breaker-4 lab), each
-/// block with an id of its own (Claude Code pairs each result with its call
-/// by that id).
 #[test]
 fn served_a_calls_step_streams_every_call_in_one_message() {
     let scratch = aterm_tempfile::Builder::new()
@@ -382,9 +370,6 @@ fn rate_headers_rise_per_answer_served_and_clamp_at_one() {
     );
 }
 
-/// One `--headers-file` serves both of the stub's readers: `headers` changes
-/// the `on200`/`on429` blocks alone, `ratelimits` the flat entries alone, and
-/// each keeps what the other wrote.
 #[test]
 fn each_headers_verb_keeps_the_others_entries() {
     let old = r#"{"x-codex-primary-used-percent":"76.0","on200":{"a":"1"},"on429":{"b":"2"}}"#;
@@ -420,8 +405,6 @@ fn each_headers_verb_keeps_the_others_entries() {
     );
 }
 
-/// The server, for real: the modes a lab switches between, the SSE framing an
-/// independent client decodes, the control paths, the black hole and the log.
 #[test]
 fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
     let dir = std::env::temp_dir().join(format!("lab-stub-{}", std::process::id()));
@@ -602,10 +585,6 @@ fn served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A SIDE CALL IS DUMPED APART FROM THE TURNS (`side-<n>.json`, `req-<n>.json`
-/// for a turn, one count over both), and the turns' reader reads `req-`
-/// alone, newest first: every kind the stub logs is a turn or a side call by
-/// [`is_side`].
 #[test]
 fn a_side_call_is_dumped_apart_from_the_turns() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -661,9 +640,6 @@ fn a_side_call_is_dumped_apart_from_the_turns() {
     );
 }
 
-/// ONLY THE NEWEST [`DUMPS_KEPT`] DUMPS STAY, turns and side calls alike:
-/// once the one count passes an old dump's index by [`DUMPS_KEPT`], that
-/// dump goes, whichever it was.
 #[test]
 fn the_oldest_dumps_go_turns_and_side_calls_alike() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -746,7 +722,6 @@ fn a_codex_request_is_read_for_its_items_and_its_structured_side_requests() {
     );
 }
 
-/// A raw GET (the workspace client only posts): status and body.
 fn get(port: &str, path: &str, auth: Option<&str>) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
     let auth = auth
@@ -770,9 +745,6 @@ fn get(port: &str, path: &str, auth: Option<&str>) -> (u16, String) {
     (status, body)
 }
 
-/// The Responses API and the ChatGPT backend, served for real: the SSE Codex
-/// reads, the walls in its shapes, the flat `x-codex-*` headers on every
-/// answer, the account usage, the refresh, the note, and the credential labels.
 #[test]
 fn served_on_loopback_it_answers_codex_as_the_modes_say() {
     let dir = std::env::temp_dir().join(format!("lab-stub-codex-{}", std::process::id()));
@@ -951,10 +923,6 @@ fn served_on_loopback_it_answers_codex_as_the_modes_say() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The claude.ai account routes, served for real: each answers its key of
-/// the account file with the instants expanded, a missing key is a 404, and
-/// the log names the route, the read and the credential's lab label, never
-/// the credential.
 #[test]
 fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
     let dir = std::env::temp_dir().join(format!("lab-stub-account-{}", std::process::id()));
@@ -1010,8 +978,6 @@ fn served_on_loopback_the_account_routes_answer_from_the_account_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A mode name is judged without case, as the case-insensitive scratch volume
-/// names its file: `Refresh` is Codex's `refresh.json`, `SLOW` the built-in.
 #[test]
 fn a_mode_name_is_judged_as_the_volume_names_its_file() {
     for name in [
@@ -1029,9 +995,6 @@ fn a_mode_name_is_judged_as_the_volume_names_its_file() {
     }
 }
 
-/// A Gemini API request's credentials are labelled, never logged: the lab's
-/// key alone is `gemini-key`, nothing is `none`, a bearer token alone is its
-/// own label, and a bearer token beside the key is both labels joined.
 #[test]
 fn a_gemini_requests_credentials_are_labelled_both_when_two_ride() {
     let key = Some(gemini::LAB_GEMINI_KEY);
@@ -1045,10 +1008,6 @@ fn a_gemini_requests_credentials_are_labelled_both_when_two_ride() {
     assert!(!both.contains("ya29"));
 }
 
-/// The Gemini API's side requests and turns are classed as both CLIs send
-/// them, the `tool` script is stepped by the results after the last
-/// `toolstart` (agy returns them in a `model` content), and a schema is
-/// filled as the router needs it.
 #[test]
 fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
     let turn = body(
@@ -1150,10 +1109,6 @@ fn a_gemini_request_is_classed_and_its_tool_script_stepped() {
     assert_eq!(gemini::route("POST", "/v1beta/models/m:embedContent"), None);
 }
 
-/// Each wall a mode puts on a Gemini turn is Google's error body with the
-/// status and the details both CLIs read: the per-day quota's QuotaFailure
-/// and its hour-long RetryInfo (agy retried a per-day 429 with a 5 s delay),
-/// the API_KEY_INVALID reason; a mode that is no wall gets none.
 #[test]
 fn a_gemini_wall_is_googles_error_body() {
     let (st, e) = gemini::mode_error("rate-limit", "gemini-3.5-flash").unwrap();
@@ -1206,12 +1161,6 @@ fn a_gemini_wall_is_googles_error_body() {
     assert!(q.py().contains("\"retryDelay\": \"42s\""));
 }
 
-/// A Google ACCOUNT's spent usage limit (`exhausted_error`, the claim
-/// `code_assist`) is Code Assist's 429 in the shape Gemini CLI 0.46.0's
-/// `classifyGoogleError` takes as its terminal quota error WITH a delay —
-/// an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in a Code Assist domain,
-/// and a `RetryInfo` — so its usage-limit dialog names the reset; the reset
-/// is in the message and the metadata too.
 #[test]
 fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
     let reset = 1_792_584_000;
@@ -1266,11 +1215,6 @@ fn a_google_accounts_spent_limit_is_code_assists_quota_exhausted() {
     assert_eq!(gemini::ACCOUNT_CLAIM, "code_assist");
 }
 
-/// The Gemini API's other refusals the lab measured (`measured_refusals`):
-/// each a custom mode's spec (`status` and `json`) whose body is Google's
-/// error with that code, under a name the stub serves as a custom mode and
-/// no built-in mode has; the per-minute and per-day 429s name their quota and
-/// carry their RetryInfo, the 403 its SERVICE_DISABLED reason.
 #[test]
 fn the_measured_refusals_are_custom_modes_in_googles_shape() {
     let refusals = gemini::measured_refusals();
@@ -1305,11 +1249,6 @@ fn the_measured_refusals_are_custom_modes_in_googles_shape() {
     assert!(not_custom("rate-limit").is_some(), "the control");
 }
 
-/// The Gemini API, served for real: the SSE framing an independent client
-/// decodes (one `data:` line a chunk, the last one finishing), a side
-/// request answered in a wall's mode, the turn walled, a scripted call with
-/// its signature, the slow turn's thoughts before its text, the custom
-/// modes, and the key logged by its lab label only.
 #[test]
 fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     let scratch = aterm_tempfile::Builder::new()
@@ -1413,8 +1352,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         key.contains("PerDay") && !key.contains("QUOTA_EXHAUSTED"),
         "the control: {key}"
     );
-    // the account's Pro bucket (`code_assist_pro`): the router's side request
-    // routed to the Pro model while it stands, the turn Code Assist's 429
     let side_answer = |p: &str| -> String {
         let side = post("/v1beta/models/gemini-3.1-flash-lite:generateContent", p);
         assert_eq!(side.status(), 200);
@@ -1431,8 +1368,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     assert!(side_answer(classifier).contains(r#""model_choice":"pro""#));
     let bucket = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
     assert!(bucket.contains("\"QUOTA_EXHAUSTED\""), "{bucket}");
-    // NEGATIVE CONTROLS: the account's own limit routes to flash, and so
-    // does the bucket's once its reset has passed
     control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
     assert_eq!(side_answer(router), r#"{"complexity_score":10}"#);
     assert!(side_answer(classifier).contains(r#""model_choice":"flash""#));
@@ -1521,8 +1456,6 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
     );
 }
 
-/// The modes every API answers alike (`401`, `500`, `bad-key`), in each
-/// one's own shape: Claude Code's and Codex's 401s, their 500s.
 #[test]
 fn the_shared_wall_modes_answer_each_api_in_its_shape() {
     let scratch = aterm_tempfile::Builder::new()
@@ -1571,12 +1504,6 @@ fn the_shared_wall_modes_answer_each_api_in_its_shape() {
     }
 }
 
-/// REQUESTS IN FLIGHT TOGETHER ARE EACH DUMPED: a dump's index is taken as
-/// it is written, never from the request count `record` bumps once the
-/// reply's delay and pace are over — sixteen bodies dumped at once from
-/// sixteen threads are sixteen files, each its own body (measured
-/// 2026-10-20: a lab whose replies overlapped kept 27 dumps of 32
-/// requests).
 #[test]
 fn requests_in_flight_together_are_each_dumped() {
     let dir = std::env::temp_dir().join(format!("lab-stub-dumps-{}", std::process::id()));

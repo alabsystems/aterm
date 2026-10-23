@@ -598,7 +598,7 @@
 ["messages_tick after dismiss 999",["number",0]],
 ["notice act 1 details",["string","OK acted=Details%20%E2%80%BA performed=1"]],
 ["messages_tick after act 1 details",["number",0]],
-["notice unknown verb",["string","ERR usage: notice <post|progress|done|ask|later|dismiss|act> …"]],
+["notice unknown verb",["string","ERR usage: notice <post|progress|done|settle|ask|later|dismiss|act> …"]],
 ["messages_tick after unknown verb",["number",0]],
 ["messages_next_wake_ms",["number",1420]],
 ["band state",{"band_height_px":["number",57],"band_rows":["number",3],"base_y":["number",4057],"bracketed_paste_mode":["boolean",false],"cell_height":["number",19],"cell_width":["number",10],"chrome_head":["number",0],"chrome_pad":["number",0],"cursor_color":["number",14737632],"cursor_pet_alpha":["number",0],"cursor_pet_enabled":["boolean",false],"cursor_style":["number",1],"cursor_x":["number",0],"cursor_y":["number",2],"display_offset":["number",0],"display_origin_absolute":["number",4057],"grid_top_px":["number",57],"height":["number",456],"is_alt_screen":["boolean",false],"is_alternate_scroll":["boolean",false],"is_app_cursor_mode":["boolean",false],"is_color_scheme_updates_mode":["boolean",false],"is_focus_event_mode":["boolean",false],"is_mouse_tracking":["boolean",false],"keyboard_mode_bits":["number",899],"matrix_rain_enabled":["boolean",false],"mouse_wants_any_motion":["boolean",false],"mouse_wants_motion":["boolean",false],"reflow_pending":["boolean",false],"scroll_frac_px":["number",0],"scroll_frac_rows":["number",0],"search_display_origin":["number",4057],"sparkle_lexicon_warnings":["string",""],"sparkle_words_enabled":["boolean",false],"width":["number",800]}],

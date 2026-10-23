@@ -18,42 +18,30 @@ use std::time::{Duration, Instant};
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// One private HOME/XDG/TMPDIR root for every launch of one test (the parity check's pair
-/// included), removed when its guard drops. Without it a verb that dials (`aterm ctl …`) would
-/// reach the live aterm on the machine running the suite.
 fn private_root() -> aterm_tempfile::TempDir {
     launch_isolation::scratch_root("aterm-front-door")
 }
 
-/// `cmd` launched in `root` ([`private_root`]).
 fn isolated<'a>(cmd: &'a mut Command, root: &Path) -> &'a mut Command {
     launch_isolation::apply(cmd, root);
     cmd
 }
 
-/// How long a verb gets to answer: generous (`--help` returns in milliseconds) because the one
-/// failure it catches is the verb not exiting, and `cargo test` has no per-test timeout.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// A command for the aterm under test ([`launch_isolation::aterm_executable`]).
 fn aterm_cmd() -> Command {
     Command::new(launch_isolation::aterm_executable())
 }
 
-/// Run `aterm <args…>` with a real terminal on all three streams and return everything it
-/// wrote: an operator's situation.
 fn on_a_terminal(root: &Path, args: &[&str]) -> String {
     let mut cmd = aterm_cmd();
     isolated(&mut cmd, root).args(args);
     capture_on_a_terminal(cmd)
 }
 
-/// Run `cmd` with a real terminal on all three streams and return everything it wrote, CR
-/// stripped.
 fn capture_on_a_terminal(mut cmd: Command) -> String {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: both fds come from the successful open above and are owned
-    // here — nothing else holds or closes them.
+    // SAFETY: both fds come from the successful open above and are owned here — nothing else holds or closes them.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("make the pty master non-blocking");
 
@@ -86,9 +74,6 @@ fn capture_on_a_terminal(mut cmd: Command) -> String {
     String::from_utf8_lossy(&out).replace('\r', "")
 }
 
-/// Read what the non-blocking pty master holds now, appending it to `out`. Stops
-/// at the deadline too, so a child that floods the terminal can never starve the
-/// caller's hang detector.
 fn read_available(pty: &mut std::fs::File, out: &mut Vec<u8>, start: Instant) {
     let mut chunk = [0u8; 4096];
     while start.elapsed() < DEADLINE {
@@ -102,7 +87,6 @@ fn read_available(pty: &mut std::fs::File, out: &mut Vec<u8>, start: Instant) {
     }
 }
 
-/// The same invocation with stdio piped, for the parity check.
 fn through_a_pipe(root: &Path, args: &[&str]) -> String {
     let out = isolated(&mut aterm_cmd(), root)
         .args(args)
@@ -116,11 +100,6 @@ fn through_a_pipe(root: &Path, args: &[&str]) -> String {
     text
 }
 
-/// Every verb is routed by the front door at a real terminal. The probe is a flag no tool
-/// defines, so each verb answers in its own voice (its tool's usage error), and the answer must
-/// not be the session parser's. A verb is a verb whether or not stdin is a terminal, so its
-/// first line at a terminal is its first line through a pipe. `aterm_cli::Verb::ALL` drives the
-/// loop, so a new verb is covered when it joins the roster.
 #[test]
 fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     const PROBE: &str = "--aterm-front-door-routing-probe";
@@ -155,13 +134,6 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
     }
 }
 
-/// amacs answers under each of its names: `aterm edit --help`, `aterm amacs --help` and
-/// `amacs --help` (the argv0 alias, a link onto the binary as every install lays it) print the
-/// editor's help and exit 0. The alias runs `Verb::Edit`, not the front door: inside a session
-/// with no terminal on stdin it says so and exits 2 (an agent's tool call never hangs), and
-/// outside any aterm window it edits in the terminal (`/dev/tty`), so with no controlling
-/// terminal at all (a new session, `setsid`) it says there is none to edit in and exits 2.
-/// None of these dials a socket: the face is decided before any handoff.
 #[test]
 fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
     let root = private_root();
@@ -183,8 +155,7 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
         if let Some(sid) = session {
             cmd.env("ATERM_PARENT_SESSION_ID", sid);
         }
-        // SAFETY: the hook runs in the forked child before `exec` and calls only
-        // `setsid`, which is async-signal-safe.
+        // SAFETY: the hook runs in the forked child before `exec` and calls only `setsid`, which is async-signal-safe.
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
                 if libc::setsid() < 0 {
@@ -231,8 +202,6 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
     }
 }
 
-/// A roster tool that is not installed says so, at a terminal and through a pipe —
-/// never a parser's "unknown command".
 #[test]
 fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
     let root = private_root();
@@ -258,13 +227,6 @@ fn an_uninstalled_roster_tool_names_the_install_not_an_unknown_command() {
     }
 }
 
-/// An answer into a reader that has already gone (`| head -1`, `| grep -q`) ends
-/// there: exit 0 and no panic. std's `print!` panicked on that EPIPE ("failed
-/// printing to stdout: Broken pipe", exit 101) — every one of these verbs did,
-/// deterministically, once the reader closed before the first write; only a long
-/// answer did under a `| head -1` that closed mid-way. The verbs a library answers
-/// in-process (drive, fleet, link, fabric, keeper, caffeine) print through the same writer
-/// (`aterm_uds::stdout`) as the front door's own.
 #[test]
 fn an_answer_into_a_closed_pipe_exits_cleanly() {
     let root = private_root();
@@ -362,12 +324,6 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
     }
 }
 
-/// `aterm drive` reaches the control client of the SAME executable (`ctl` is one
-/// of its verbs, and `aterm-ctl` its argv0 alias; `drive phase` dials it, `drive
-/// read` having left with the other driving verbs), with no alias beside it and
-/// none on PATH: a plain `target/debug/aterm` answered "could not run aterm-ctl:
-/// No such file or directory", and with an older install's `aterm-ctl` on PATH it
-/// drove that one instead.
 #[test]
 fn drive_reaches_this_images_own_control_client() {
     let root = private_root();
@@ -391,7 +347,6 @@ fn drive_reaches_this_images_own_control_client() {
 
 /// A refused `--sandbox` (no OS sandbox off macOS) at a terminal says only that
 /// no shell was started: the session banner waits for a shell that HAS spawned.
-/// It used to print "session started" first, then the refusal.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_refused_sandbox_never_says_the_session_started() {

@@ -9,7 +9,6 @@ use super::{
 use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
 use crate::native_updater_service::ApplyMode;
 
-/// A machine idle in every sense, with a take running.
 fn recording(mode: ApplyMode, phase: ApplyPhase, held_for: std::time::Duration) -> ParkGate {
     prelaunch_park_admitted(
         ParkGateFacts {
@@ -34,8 +33,6 @@ fn recording(mode: ApplyMode, phase: ApplyPhase, held_for: std::time::Duration) 
     )
 }
 
-/// The wait is typed and bounded twice over: `Land` and the verb's own
-/// maximum take both end it, and an explicit apply never waits at all.
 #[test]
 fn a_live_take_holds_the_automatic_park_before_land_and_only_until_its_bound() {
     let early = std::time::Duration::from_secs(1);
@@ -76,11 +73,6 @@ fn a_live_take_holds_the_automatic_park_before_land_and_only_until_its_bound() {
     );
 }
 
-/// A take running when the successor's park lands is answered at Commit, not at
-/// the park: in between the attempt can still fail and roll back with this
-/// process running (`rollback_overlap`), and the take must then still be running
-/// with its client told nothing. Only the Commit arm calls
-/// `App::video_answer_before_commit`.
 #[test]
 fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -155,8 +147,6 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The upgrade rim starts at the launched lane's park rather than at apply
-/// begin, with its 125 s cap counted from the freeze it explains.
 #[test]
 fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -195,8 +185,6 @@ fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
     aterm_pty::close_fd(master);
 }
 
-/// A re-park after a missed park restarts the upgrade rim's cap from the new
-/// freeze while keeping the visual animation continuous.
 #[test]
 fn a_re_park_counts_the_rims_cap_from_its_own_freeze() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -236,9 +224,6 @@ fn a_re_park_counts_the_rims_cap_from_its_own_freeze() {
     aterm_pty::close_fd(master);
 }
 
-/// When a missed park resumes the readers and the park gate waits again (e.g.
-/// for pending output or typing), the upgrade rim is cleared until the next
-/// park is admitted.
 #[test]
 fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -284,11 +269,6 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
     aterm_pty::close_fd(slave);
 }
 
-/// The Commit's messages flush runs before `try_begin_commit`, under the
-/// dispatch fence, while the video answer stays after `try_begin_commit`
-/// because earlier steps can still roll the attempt back. When the worker has
-/// already moved the attempt to `Rejecting`, the live take stays running and
-/// its client is told nothing.
 #[test]
 fn a_commit_the_worker_took_first_never_answers_a_live_take() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -355,14 +335,6 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// When answering a live `video` request under the Commit claim takes at least
-/// one fence grain (`HANDOFF_INPUT_DRAIN_YIELD`), the pass keeps the claim and
-/// re-posts through the drain gate so the run loop can dispatch any OS input
-/// queued during the wait before writing the Commit. If admission refuses on
-/// the re-posted pass (e.g. quit requested during the fence), the claim goes
-/// to rejection and uncarried messages stay open; otherwise the re-posted pass
-/// writes the Commit and closes uncarried messages. Answers costing under one
-/// grain (`App::handoff_commit_answers_took`) write the Commit immediately.
 #[test]
 fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
     let model = aterm_models_misc::native_update_overlap_handoff_model();
@@ -553,11 +525,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
     }
 }
 
-/// The harness host stops at the Commit write, after the held pass's last
-/// admission check (`carried_claims_held`), rather than at the initial claim.
-/// Otherwise a stopped worker's `release_attention` badge clear during the
-/// held claim's input-dispatch fence would look like an escalation change and
-/// refuse the Commit as activity.
 #[test]
 fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     use std::sync::Arc;
@@ -735,7 +702,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_held_claim_activates_the_successor_only_at_its_write() {
-    /// The stand-in successor, killed (`SIGKILL`) and reaped however the test ends.
     struct StandIn(aterm_uds::spawnfd::Child);
     impl Drop for StandIn {
         fn drop(&mut self) {
@@ -867,10 +833,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     }
 }
 
-/// A Commit messages flush that takes at least one fence grain
-/// (`HANDOFF_INPUT_DRAIN_YIELD`) restarts the dispatch fence's clock once per
-/// attempt so any OS input queued during `MESSAGES_FLUSH_COMMIT_WAIT` drains
-/// before the claim, without answering a live `video` request early.
 #[test]
 fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let mut app = crate::App::headless_for_test();
@@ -928,7 +890,6 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A live take on `session 0`'s window, answering on the returned channel.
 fn live_take(
     app: &mut crate::App,
 ) -> (
@@ -965,11 +926,6 @@ fn live_take(
     (root, replies)
 }
 
-/// A park that misses keeps the take: an explicit apply's park is admitted with a
-/// take running, then its capture meets an engine held past the deadline; the
-/// park misses, the readers resume, and the take keeps running, its client not
-/// told of an update that did not happen. Control: the re-park lands and Commit
-/// answers the take.
 #[test]
 fn a_park_that_misses_keeps_a_live_take() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1028,12 +984,6 @@ fn a_park_that_misses_keeps_a_live_take() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// `App::video_answer_before_commit` aborts a live take, cancels an in-flight
-/// export, and waits until the connection threads have written both replies and
-/// released their [`ReplyWire`] guards (within the caller's bound) before
-/// returning for `_exit`. Each stand-in connection writes only once the step
-/// waits on its wire (`ReplyWritten::awaited_within`), so a step that went on
-/// without waiting finds its reply unwritten on every run.
 #[test]
 fn commit_waits_until_every_video_reply_is_written() {
     const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
@@ -1158,9 +1108,6 @@ fn commit_waits_until_every_video_reply_is_written() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A `video` request arriving after the park is refused, since Commit would cut
-/// it off. The event loop asks [`crate::App::video_request_refusal`] before
-/// starting any take.
 #[test]
 fn a_video_request_after_the_park_is_refused() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

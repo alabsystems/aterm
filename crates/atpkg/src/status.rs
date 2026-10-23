@@ -18,7 +18,7 @@ pub const MAX_STATUS_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum number of per-program rows admitted from one status snapshot.
 pub const MAX_STATUS_PROGRAMS: usize = 2048;
 
-/// The clause an update pass that did not reach the signed index appends to its `outcome` (`<outcome> (index from cache — <why>)`), naming the cause (a rate limit, a 5xx, a captive portal).
+/// Suffix appended to `outcome` when an update pass used the cached index.
 pub const INDEX_FROM_CACHE_CLAUSE: &str = "(index from cache \u{2014} ";
 
 /// One program's last-known state, for `status.toml`.
@@ -28,26 +28,26 @@ pub struct ProgramStatus {
     pub installed_build: Option<u64>,
     /// The program's state line.
     pub state: String,
-    /// The signed `tree_root` (§8) of the active build, from the release-key-verified manifest at install/update time.
+    /// Signed `tree_root` (§8) of the active build from the release-key-verified manifest.
     #[serde(default)]
     pub tree_root: String,
 }
 
-/// The most refused names one program's entry keeps ([`RefusedShims::names`]); the rest are counted.
+/// The most refused names one program's entry keeps ([`RefusedShims::names`]).
 pub const MAX_REFUSED_RECORDED: usize = 16;
 
 /// The longest refused name an entry keeps, in characters; a longer one is cut, ending in `…`.
 pub const MAX_REFUSED_NAME_CHARS: usize = 64;
 
-/// The most builds one program's list keeps an entry for ([`Status::refused_shims`]): the newest, as the store keeps them.
+/// The most builds one program's list keeps an entry for ([`Status::refused_shims`]).
 pub const MAX_REFUSED_BUILDS: usize = 8;
 
-/// One build's exposed names that were refused a shim ([`crate::store::shim_allowed`]: a shell, another command a shim must never intercept, or no tool name at all), in the order its manifest lists them (design S13).
+/// Exposed names of one build that were refused a shim ([`crate::store::shim_allowed`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RefusedShims {
     /// The build whose manifest named them.
     pub build: u64,
-    /// The names, at most [`MAX_REFUSED_RECORDED`], each at most [`MAX_REFUSED_NAME_CHARS`] characters.
+    /// Refused names, capped at [`MAX_REFUSED_RECORDED`] entries.
     pub names: Vec<String>,
     /// How many names were refused; more than `names` holds when the list was cut.
     pub count: u64,
@@ -80,8 +80,7 @@ impl RefusedShims {
     }
 }
 
-/// Record that `program`'s `build` was refused a shim for `refused`, pruning entries for builds no longer in the store.
-///
+/// Record that `program`'s `build` was refused a shim for `refused`, pruning removed builds.
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn record_refused_shims(
@@ -139,12 +138,12 @@ pub struct Status {
     pub enabled: bool,
     /// The resolved index source, `owner/repo`.
     pub index_source: String,
-    /// The last aggregate decision (`"up to date"`, `"staged …"`, `"idle: no token"`, `"rejected unsigned index at build N"`, …).
+    /// The last aggregate decision.
     pub outcome: String,
     /// The rustup toolchain seams atpkg owns, as `rustup:<name>` ([`crate::seam`]).
     #[serde(default)]
     pub seams: Vec<String>,
-    /// RFC3339 UTC time of the last full update pass that reached the signed index (one the channel served this pass, not the §14 cache's) and ran to its end.
+    /// RFC3339 UTC time of the last full update pass that reached the live signed index.
     #[serde(default)]
     pub last_success_at: String,
     /// The `index_build` the last pass resolved, and when it last changed.
@@ -159,13 +158,13 @@ pub struct Status {
     /// RFC3339 UTC time that pass ended.
     #[serde(default)]
     pub last_pass_at: String,
-    /// The highest index this full pass was asked to check or resolved, when it attempted a signed index resolve; zero is unknown.
+    /// The highest index this full pass was asked to check or resolved.
     #[serde(default)]
     pub last_pass_attempted_index_build: u64,
     /// The exact pass-end stamp that owns `last_pass_attempted_index_build`.
     #[serde(default)]
     pub last_pass_attempted_at: String,
-    /// How many full passes have recorded their end on this store, bumped only by the pass-end stamp, so a queued pass can tell exactly whether one ended since it was queued (`last_pass_at` is whole seconds).
+    /// Count of full passes that have recorded their end on this store.
     #[serde(default)]
     pub pass_seq: u64,
     /// The [`Self::pass_seq`] of the last full pass that ended `failed` for one reason only.
@@ -174,16 +173,15 @@ pub struct Status {
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
-    /// Per-program builds (up to [`MAX_REFUSED_BUILDS`]) whose signed `exposes` held refused shim names ([`RefusedShims`], [`record_refused_shims`]).
+    /// Per-program builds (up to [`MAX_REFUSED_BUILDS`]) with refused shim names in `exposes`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub refused_shims: BTreeMap<String, Vec<RefusedShims>>,
-    /// Every top-level key this build does not know, carried verbatim through each rewrite, so builds sharing a store never erase each other's fields.
+    /// Every top-level key this build does not know, carried verbatim through each rewrite.
     #[serde(flatten)]
     pub extra: BTreeMap<String, aterm_toml::Value>,
 }
 
 /// Stamp the index build the pass resolved.
-///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_index_build(layout: &Layout, now: &str, index_build: Option<u64>) -> io::Result<()> {
@@ -206,7 +204,6 @@ pub(crate) fn never_checked(layout: &Layout) -> bool {
 }
 
 /// Stamp a full pass that reached the signed index and ran to its end.
-///
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
@@ -216,8 +213,7 @@ pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
     write(layout, &status)
 }
 
-/// Stamp how a full `update` pass ended: `last_pass` (the outcome's word), `last_pass_at` and `updated_at`.
-///
+/// Stamp how a full `update` pass ended.
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_pass_end(
@@ -228,8 +224,7 @@ pub fn stamp_pass_end(
     stamp_pass_end_with_index(layout, now, outcome, 0)
 }
 
-/// [`stamp_pass_end`] with this pass's target or resolved index, in the same write as the outcome and end time.
-///
+/// [`stamp_pass_end`] with this pass's target or resolved index in the same write.
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_pass_end_with_index(
@@ -241,8 +236,7 @@ pub fn stamp_pass_end_with_index(
     stamp_pass_end_recorded(layout, now, outcome, attempted_index_build, false)
 }
 
-/// [`stamp_pass_end_with_index`], also recording `stale_index_only` ([`Status::stale_index_only_pass_seq`]).
-///
+/// [`stamp_pass_end_with_index`], also recording `stale_index_only`.
 /// # Errors
 /// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_pass_end_recorded(
@@ -273,7 +267,7 @@ pub fn stamp_pass_end_recorded(
     write(layout, &status)
 }
 
-/// Whether `status`'s last recorded full pass ended `failed` only because its index came from the cache ([`Status::stale_index_only_pass_seq`] naming the current [`Status::pass_seq`]).
+/// Whether `status`'s last full pass ended `failed` only because its index came from cache.
 #[inline]
 #[must_use]
 pub fn stale_index_only_end(status: &Status) -> bool {
@@ -282,7 +276,7 @@ pub fn stale_index_only_end(status: &Status) -> bool {
         && status.last_pass == aterm_update_core::pkg_check::PassOutcome::Failed.word()
 }
 
-/// The machine-wide stamps every lane schedules a full pass on (the window's gate and walk, the session lane, a window's launch), read now.
+/// Machine-wide stamps on which every lane schedules a full pass, read now.
 #[must_use]
 pub fn pass_stamps(layout: &Layout, now_unix: i64) -> aterm_update_core::pkg_check::Stamps {
     let stamps = aterm_update_core::pkg_check::Stamps::read(&layout.status());
@@ -295,7 +289,7 @@ pub fn pass_stamps(layout: &Layout, now_unix: i64) -> aterm_update_core::pkg_che
     }
 }
 
-/// How many full passes have recorded their end on this store ([`Status::pass_seq`]); zero with no readable record.
+/// How many full passes have recorded their end on this store ([`Status::pass_seq`]).
 #[must_use]
 pub fn pass_seq(layout: &Layout) -> u64 {
     read(layout).map_or(0, |status| status.pass_seq)
@@ -313,7 +307,6 @@ impl Status {
     }
 
     /// Serialize to TOML.
-    ///
     /// # Errors
     /// The serializer's message, prefixed, when the map cannot be rendered.
     pub fn to_toml(&self) -> Result<String, String> {
@@ -341,10 +334,6 @@ pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `a` and `b` differ only in what a pass stamps as it goes (the outcome sentence
-/// and the clocks), which is all a hold coalesces: a lost stamp is re-stamped by the next
-/// pass, while a lost row (an activated build and its signed root, a seam, a tombstone)
-/// lets the next pass record a new build under an old root, which `verify` calls drift.
 fn only_stamps_differ(a: &Status, b: &Status) -> bool {
     let unstamped = |s: &Status| Status {
         updated_at: String::new(),
@@ -363,9 +352,6 @@ fn only_stamps_differ(a: &Status, b: &Status) -> bool {
     unstamped(a) == unstamped(b)
 }
 
-/// Refuse a record with more per-program rows than [`MAX_STATUS_PROGRAMS`], in either map
-/// keyed by program, or a program with more refused-name entries than
-/// [`MAX_REFUSED_BUILDS`]: the bound every read and every write holds.
 fn bounded_rows(status: &Status) -> io::Result<()> {
     for (what, rows) in [
         ("programs", status.programs.len()),
@@ -395,7 +381,6 @@ fn bounded_rows(status: &Status) -> io::Result<()> {
     Ok(())
 }
 
-/// `status` as the bytes [`write`] puts on disk, or why it may not be written.
 fn render(status: &Status) -> io::Result<String> {
     bounded_rows(status)?;
     let text = status
@@ -410,8 +395,6 @@ fn render(status: &Status) -> io::Result<String> {
     Ok(text)
 }
 
-/// Put `text` at `layout.status()` so a power loss leaves the old record or this one: a
-/// temp beside it, `fsync`, `rename(2)`, then a directory sync.
 fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     let dest = layout.status();
     let tmp = dest.with_file_name(format!("status.toml.tmp-{}", std::process::id()));
@@ -433,7 +416,7 @@ fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// How many times each store's record reached the disk in this test process — the instrument behind "one write per pass".
+/// How many times each store's record reached the disk in this test process.
 #[cfg(test)]
 pub(crate) mod counted {
     use super::{Layout, PathBuf};
@@ -470,7 +453,6 @@ pub fn read_checked(layout: &Layout) -> io::Result<Option<Status>> {
     read_disk(layout)
 }
 
-/// [`read_checked`] of the file itself.
 fn read_disk(layout: &Layout) -> io::Result<Option<Status>> {
     let path = layout.status();
     let text = match crate::metadata_io::read_bounded_regular_utf8(&path, MAX_STATUS_BYTES) {
@@ -496,9 +478,9 @@ pub fn read(layout: &Layout) -> Option<Status> {
 }
 
 /// Seed a writer that rebuilds the whole record.
-///
 /// # Errors
-/// The record cannot be read for a reason that is not corruption (a permission, an I/O error, a descriptor limit; it is left as it is), or it is corrupt and could not be kept aside.
+/// The record cannot be read for a reason that is not corruption (a permission, an I/O error, a
+/// descriptor limit; it is left as it is), or it is corrupt and could not be kept aside.
 pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
     match read_checked(layout) {
         Ok(Some(status)) => Ok(status),
@@ -510,16 +492,11 @@ pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
     }
 }
 
-/// Whether the read error `why` means the record itself is bad, rather than that this read
-/// failed: bytes that do not parse, are not UTF-8 or exceed the bounds (`InvalidData`), or
-/// a path that is not a regular file.
 fn is_corrupt(layout: &Layout, why: &io::Error) -> bool {
     why.kind() == io::ErrorKind::InvalidData
         || std::fs::symlink_metadata(layout.status()).is_ok_and(|m| !m.file_type().is_file())
 }
 
-/// Replace a corrupt record with [`rebuilt_from_store`]'s, keeping the corrupt one beside
-/// it as `status.toml.corrupt-<unix>`, said once as a notice.
 fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
     if !is_corrupt(layout, &why) {
         return Err(why);
@@ -543,8 +520,6 @@ fn heal(layout: &Layout, why: io::Error) -> io::Result<Status> {
     Ok(rebuilt)
 }
 
-/// `status.toml.corrupt-<unix>`, or `…-<unix>-<pid>` when a record was already kept aside
-/// in the same second.
 fn corrupt_path(layout: &Layout, unix: u64) -> PathBuf {
     let first = layout.prefix.join(format!("status.toml.corrupt-{unix}"));
     if std::fs::symlink_metadata(&first).is_err() {
@@ -621,7 +596,7 @@ pub fn with_shadows(
     status
 }
 
-/// Hold `layout`'s stamps in memory until the returned guard drops, and write them once then, so a mutating verb writes `status.toml` once however often it moves the outcome and the clocks.
+/// Hold `layout`'s stamps in memory until the returned guard drops, and write them once then.
 #[must_use]
 pub fn hold(layout: &Layout) -> HeldRecord {
     held::begin(layout);
@@ -645,12 +620,9 @@ impl Drop for HeldRecord {
     }
 }
 
-/// The in-memory records of the stores this process holds ([`hold`]), keyed by prefix.
 mod held {
     use super::{Layout, PathBuf, Status, io};
 
-    /// One held store: `record` is the record as it stands and `disk` as the file holds
-    /// it — each `None` until first read or written (`Some(None)`: the store has none).
     struct Held {
         prefix: PathBuf,
         depth: u32,
@@ -744,8 +716,6 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-status-{label}-"))
     }
 
-    /// A pass that reached the index stamps its success and ends `ok`; one that did not ends
-    /// `failed` and keeps the success; the build fields move only on a different build.
     #[test]
     fn the_pass_end_stamps_say_what_the_pass_did() {
         use aterm_update_core::pkg_check::{PassOutcome, Stamps};
@@ -870,9 +840,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A rewriting writer heals an unreadable record (garbage, truncated, empty) by keeping
-    /// the bytes aside and rebuilding from the store, and its stamp lands; an absent record
-    /// seeds a fresh one and keeps nothing aside.
     #[test]
     fn rewriting_writers_heal_an_unreadable_record() {
         let l = layout("unreadable");
@@ -957,7 +924,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Keys another build wrote (a field, a table) survive an older writer's full rebuild.
     #[test]
     fn an_unknown_field_survives_a_rewrite() {
         let l = layout("unknown-field");
@@ -1105,9 +1071,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The `seams` record round-trips beside the program rows (aterm-toml orders values
-    /// before sub-tables, so the array never lands inside the last `[programs.*]` table),
-    /// and a record without the field parses as no seams.
     #[test]
     fn seams_round_trip_and_default_empty() {
         let l = layout("seams");
@@ -1164,9 +1127,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The refused names a landing records (design S13): kept per build, beside the
-    /// program's other builds, bounded, dropped with the build, and never a write for a
-    /// landing that refused nothing, so a record without them is the bytes it was.
     #[test]
     fn refused_shims_are_recorded_per_build_bounded_and_dropped_with_the_build() {
         let l = layout("refused-shims");
@@ -1245,9 +1205,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The record's refused-name map holds the bound every read and write holds: no more
-    /// programs than [`MAX_STATUS_PROGRAMS`], no more than [`MAX_REFUSED_BUILDS`] entries
-    /// for one.
     #[test]
     fn a_record_over_the_refused_shims_bounds_is_neither_written_nor_read() {
         let l = layout("refused-bounds");
@@ -1299,8 +1256,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// "Never checked" is exactly `status.toml` absent or `last_success_at` empty: a record
-    /// a failed pass wrote still reads as never checked; only [`stamp_success`] clears it.
     #[test]
     fn never_checked_holds_until_a_successful_pass_stamps_last_success_at() {
         let l = layout("never-checked");
@@ -1350,10 +1305,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Tier-1 of the derived model `AtpkgFullPassRule` (aterm-spec): every record the model
-    /// reaches at `Buggy=0`, laid down by the real writers and read as the session lane reads
-    /// it ([`pass_stamps`], then `full_pass_owed`), gives the model's `verdict` and pass in
-    /// flight, and starts a pass exactly when `SessionLook` does.
     #[test]
     fn the_full_pass_rule_conforms_to_its_derived_model() {
         use super::full_pass_rule_tier1::{legacy_stamps, looks, realize, records};
@@ -1441,7 +1392,7 @@ mod tests {
     }
 }
 
-/// Tier-1 fixtures of the derived model `AtpkgFullPassRule` (aterm-spec), shared by this module's conformance test and `cli`'s (a queued pass's stand-down).
+/// Tier-1 fixtures of `AtpkgFullPassRule` shared by this module's conformance test and `cli`'s.
 #[cfg(test)]
 pub(crate) mod full_pass_rule_tier1 {
     use super::*;
@@ -1450,7 +1401,6 @@ pub(crate) mod full_pass_rule_tier1 {
 
     pub(crate) type State = BTreeMap<&'static str, i64>;
     pub(crate) const AGE_SECS: [i64; 5] = [60, 15 * 60, 3 * 3600, 6 * 3600 + 60, 9 * 3600];
-    /// What a reader sees of a state: the record and the pass in flight.
     const RECORD: [&str; 6] = [
         "rec",
         "pass_age",

@@ -7,7 +7,7 @@
 //!
 //! A seal line sits in the file's first [`HEAD_LINES`] lines and carries both [`MARK`] and
 //! `seal ` followed by 16 lowercase hex digits: the FNV-1a 64 digest of the whole file with
-//! those 16 digits read as `0`. A generator writes the line with zeros ([`line`]), formats its
+//! those 16 digits read as `0`. A generator writes the line with zeros ([`fn@line`]), formats its
 //! output if it formats, and then calls [`stamp`] on what it will write; the `generated-seal`
 //! guard calls [`check`] on every file `.gitattributes` marks `linguist-generated`.
 

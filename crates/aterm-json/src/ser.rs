@@ -136,6 +136,11 @@ fn split_exp(text: &str) -> (String, i32) {
 
 /// Lay the digits out the way `serde_json` lays them out, with `kk` the count
 /// of digits before the decimal point (`10^(kk-1) <= |v| < 10^kk`):
+///
+/// * `kk` inside `fixed_range` → fixed notation, gaining a `.0` when there is
+///   no fractional part (`1e15` is `1000000000000000.0`, never
+///   `1000000000000000`, which JSON would read back as an integer);
+/// * otherwise → `d.ddde±XX`, the exponent signed even when positive.
 fn write_layout(
     out: &mut Vec<u8>,
     negative: bool,

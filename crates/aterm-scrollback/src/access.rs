@@ -2,7 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`ScrollbackAccess`]: shared trait dispatched by [`ScrollbackStorage`] across concrete backends.
+//! [`ScrollbackAccess`]: shared trait dispatched by
+//! [`ScrollbackStorage`](super::ScrollbackStorage) across concrete backends.
 
 use std::borrow::Cow;
 

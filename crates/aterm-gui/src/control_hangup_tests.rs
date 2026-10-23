@@ -16,10 +16,6 @@ use super::{
     hangup_park,
 };
 
-/// Run `await <args>` on a fresh thread that is SERVING `server` (exactly what
-/// a control lane does for the length of a connection), and return its reply
-/// and its session's watchers. The await registers on them before its first
-/// hangup check, so a watcher there says it is parked.
 fn await_while_serving(
     server: CtlStream,
     args: &'static str,
@@ -37,23 +33,19 @@ fn await_while_serving(
     (waiter, watchers)
 }
 
-/// Wait for `seen` (the lane's view of its caller's hangup) with a hang detector
-/// ([`aterm_spec::wait::MUST_HAPPEN`]), never a latency budget.
+/// Wait for `seen` (the lane's view of its caller's hangup) with a hang detector.
 #[track_caller]
 fn until_seen(what: &str, mut seen: impl FnMut() -> bool) {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || seen().then_some(()));
 }
 
-/// Join an await thread with a hang detector: the await asks a ten-minute
-/// timeout, so the test's own minute decides when a never-seen hangup fails.
+/// Join an await thread with a hang detector.
 #[track_caller]
 fn join_await(waiter: std::thread::JoinHandle<String>, what: &str) -> String {
     until_seen(what, || waiter.is_finished());
     waiter.join().expect("await thread")
 }
 
-/// A killed client (both halves closed, as SIGKILL does) gives back the lane of an `await`
-/// parked on it at the hangup, not at the await's ten-minute timeout.
 #[test]
 fn a_hung_up_caller_releases_a_parked_await_within_a_poll() {
     let (client, server) = CtlStream::pair().expect("socket pair");
@@ -65,11 +57,6 @@ fn a_hung_up_caller_releases_a_parked_await_within_a_poll() {
     assert_eq!(reply, HUNG_UP_REPLY, "the parked await must see the hangup");
 }
 
-/// THE NEGATIVE CONTROL: a caller that only HALF-closed (sent its request and
-/// shut its write side) is still waiting for the answer, so the same await
-/// runs to its own deadline and answers it. That deadline is just past one
-/// [`HANGUP_POLL`] slice: the await asks after its caller before it parks and
-/// again after each slice, so a half-close read as a hangup fails at once.
 #[test]
 fn a_half_closed_caller_still_gets_its_answer() {
     let (client, server) = CtlStream::pair().expect("socket pair");
@@ -85,19 +72,11 @@ fn a_half_closed_caller_still_gets_its_answer() {
     drop(client);
 }
 
-/// Whether a main-thread hop made now would be refused because its caller
-/// hung up — the first check [`super::control_media::call_main`] makes, the
-/// gate a Front- or Local-routed turn's keys and Enter go through.
 fn main_hop_refused_for_hangup() -> bool {
     use super::control_media::{CLIENT_HUNG_UP, MainHopError, main_thread_refusal};
     main_thread_refusal() == Some(MainHopError::Reason(CLIENT_HUNG_UP))
 }
 
-/// A `turn` whose caller hangs up after its text is typed still presses its submit through
-/// the main-thread gate (`call_main`): abandoning it would leave the text unsubmitted in the
-/// composer, where the next turn's text is appended. The turn is committed once its text is
-/// in the composer; only the waits before the first byte and after a verified submit give
-/// the lane back.
 #[test]
 fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thread_gate() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -151,8 +130,6 @@ fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thre
     );
 }
 
-/// `typed=1`: a caller that hangs up after the first key still gets the rest of its keys and
-/// its Enter through the main-thread gate, or a partial prompt is left in the composer.
 #[test]
 fn a_typed_turn_whose_caller_hangs_up_mid_typing_still_types_and_submits() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,8 +182,6 @@ fn a_typed_turn_whose_caller_hangs_up_mid_typing_still_types_and_submits() {
     );
 }
 
-/// Negative control for the two above: a caller that hung up before the first byte has
-/// nothing half-applied, so the turn's first hop is refused and nothing is typed.
 #[test]
 fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -242,14 +217,6 @@ fn a_turn_whose_caller_hung_up_before_typing_types_nothing() {
     assert_eq!(reply, "ERR paste delivery failed\n");
 }
 
-/// A `turn` whose caller hangs up AFTER its submit landed: the settle gives
-/// the lane back at once (nothing is left half-typed), and the turn — typed
-/// AND submitted — is still in the turn ledger, as `status=hangup`, because
-/// `history`, the events digest and the harness's report reader read it back. Its
-/// verdict still says `submitted=1`, for an in-process reader. The old code
-/// returned `ERR exited` from the settle ahead of the ledger push, so a
-/// submitted turn vanished from `history` (2026-09-28 review). The negative
-/// control keeps its caller and settles: `status=settled`.
 #[test]
 fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
     let handle = crate::session_store::test_handle(0);
@@ -331,13 +298,6 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
     );
 }
 
-/// A WRITE HANDED TO THE SESSION'S ORDERED WRITER GIVES ITS LANE BACK WHEN ITS
-/// CALLER HANGS UP. [`super::await_written`] waits in the one park every
-/// blocking verb waits in: a write the writer never runs, waited on for ten
-/// minutes, answers `HungUp` once the serving connection's caller is gone, so
-/// only a seen hangup answers within the test's hang detector. Off a serving
-/// lane the writer's own answers are what they say: its receipt is the write's,
-/// and a write dropped unrun wrote nothing.
 #[test]
 fn a_write_waited_on_gives_its_lane_back_when_its_caller_hangs_up() {
     use super::{Waited, await_written};
@@ -397,8 +357,6 @@ fn a_write_waited_on_gives_its_lane_back_when_its_caller_hangs_up() {
     ));
 }
 
-/// Off a serving lane (an in-process caller, a unit test) nothing is ever hung
-/// up and every park is exactly as long as asked.
 #[test]
 fn an_unserved_thread_never_hangs_up_and_parks_as_asked() {
     assert!(!caller_hung_up());
@@ -411,15 +369,14 @@ fn an_unserved_thread_never_hangs_up_and_parks_as_asked() {
     assert_eq!(hangup_park(Duration::from_secs(9)), Duration::from_secs(9));
 }
 
-/// A lane service whose one wait, `park`, parks as every blocking verb does
-/// ([`hangup_park`] slices, [`caller_hung_up`] on each wake) and records each check's answer.
+/// A lane service whose one wait, `park`, parks as every blocking verb does and records each
+/// check's answer.
 #[derive(Default)]
 struct ParkingService {
     checks: Mutex<Vec<bool>>,
 }
 
 impl ParkingService {
-    /// Each answer the parked wait's [`caller_hung_up`] gave so far, in order.
     fn checks(&self) -> Vec<bool> {
         self.checks
             .lock()
@@ -487,9 +444,6 @@ impl LaneService for ParkingService {
     }
 }
 
-/// The real [`Lanes`] mark the connection a wait lane serves, so a wait parked there sees its
-/// caller hang up and gives the lane back. Negative control: while the client lives, every
-/// answer the parked wait's own check gave says it is there.
 #[test]
 fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
     let service = Arc::new(ParkingService::default());
@@ -532,9 +486,6 @@ fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
     });
 }
 
-/// A main-thread request whose caller hung up is refused before anything is posted, so a
-/// stalled main thread does not pile up requests whose clients gave up. Negative controls: a
-/// connected caller, and a half-closed one that still reads its reply, are not refused.
 #[test]
 fn a_main_thread_request_whose_caller_hung_up_is_refused_before_it_is_posted() {
     use super::control_media::{CLIENT_HUNG_UP, MainHopError, main_thread_refusal};

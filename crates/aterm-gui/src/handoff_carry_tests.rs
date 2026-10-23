@@ -9,7 +9,6 @@ use crate::turn_ledger::LEDGER_CAP;
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// A Claude-shaped screen (synthetic): transcript rows over a composer.
 fn screen(doc: &[String], rows: u16, cols: u16) -> Vec<String> {
     let t = usize::from(rows) - 5;
     let rule = "─".repeat(usize::from(cols) - 1);
@@ -56,14 +55,10 @@ fn record(id: u64, submitted: bool, arch: ArchMark) -> TurnRecord {
     }
 }
 
-/// A session whose app printed `n` rows under origin 7, with a turn marked
-/// every ten rows: its engine and ledger, shared the way `SessionCtx` shares
-/// them.
 fn session(n: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<TurnLedger>>) {
     session_every(n, 10)
 }
 
-/// [`session`], a turn marked every `every` rows.
 fn session_every(n: usize, every: usize) -> (Arc<Mutex<Terminal>>, Arc<Mutex<TurnLedger>>) {
     let mut t = Terminal::new(ROWS, COLS);
     t.set_alt_archive_enabled(true);
@@ -90,7 +85,6 @@ fn capture(
     capture_head(3, &guard, term, turns, None, differ)
 }
 
-/// The turn-id ceiling the export runs under, as the handoff worker takes it.
 fn ceiling() -> u64 {
     crate::control::turn_ids_for_handoff()
 }
@@ -101,9 +95,6 @@ fn decoded(sources: &[CarrySource]) -> ControlCarry {
     decode(&out[0].1).expect("a sidecar this build reads")
 }
 
-/// The tail reaches back to the earliest mark among the newest eight
-/// submitted turns, and no further (here the turns are far enough apart that
-/// the mark is older than the differ's own reach).
 #[test]
 fn the_tail_starts_after_the_eighth_newest_submitted_turn() {
     let (term, turns) = session_every(400, 30);
@@ -129,9 +120,6 @@ fn the_tail_starts_after_the_eighth_newest_submitted_turn() {
     assert!(carry.turns.iter().all(|r| r.carried));
 }
 
-/// The tail never stops short of what the adopting differ may point back at (`aterm-core`
-/// widens it to the last eight screens of rows), so a scroll-back past the turns' marks is
-/// recognized after the handoff.
 #[test]
 fn the_tail_reaches_back_as_far_as_the_differ_can_point() {
     let (term, turns) = session(300);
@@ -149,7 +137,6 @@ fn the_tail_reaches_back_as_far_as_the_differ_can_point() {
     assert_eq!(archive.first, reach);
 }
 
-/// With no turn the tail is the newest rows, as many as the cap holds.
 #[test]
 fn with_no_turn_the_newest_rows_are_carried_up_to_the_cap() {
     let (term, turns) = session(120);
@@ -161,9 +148,6 @@ fn with_no_turn_the_newest_rows_are_carried_up_to_the_cap() {
     assert_eq!(archive.rows.len(), t.alt_archive().len());
 }
 
-/// A lock another thread keeps, or an archive that moved since the freeze, carries the
-/// counters alone (the rows count as lost), and past half the budget the freeze leaves the
-/// differ's state out as well.
 #[test]
 fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     let (term, turns) = session(80);
@@ -242,8 +226,6 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     assert!(archive.differ.is_none(), "the differ moved: not taken");
 }
 
-/// A lock the export gives up on is logged by session and cause, like every other carry loss;
-/// a carry that took both locks notes nothing.
 #[test]
 fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     let _own = crate::control::own_turn_ids();
@@ -296,9 +278,6 @@ fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     assert_eq!(losses(src), vec![(3, CarryLoss::ArchiveMoved)]);
 }
 
-/// Over the per-sidecar room the rows go first, then the differ's state,
-/// then the ledger's older records — and a room nothing fits in carries
-/// nothing.
 #[test]
 fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     let (term, turns) = session(150);
@@ -362,8 +341,6 @@ fn a_sidecar_that_does_not_fit_sheds_rows_then_state_then_history() {
     assert!(encode_within(&turns_v, whole, archive, 10).is_none());
 }
 
-/// A ROOM SHORT OF THE WHOLE TAIL STILL CARRIES ITS NEWEST ROWS
-/// .
 #[test]
 fn a_room_short_of_the_whole_tail_carries_its_newest_rows() {
     let (term, turns) = session(150);
@@ -416,11 +393,6 @@ fn a_room_short_of_the_whole_tail_carries_its_newest_rows() {
     }
 }
 
-/// A CROWDED DESK SHARES ITS ROWS ALIKE, EVERY SESSION'S NEWEST FIRST
-/// : every session carries the rows after its newest
-/// turn's mark (what `drive report` reads back), then as many of its older
-/// rows as every other session, and keeps the differ's state, which is shed
-/// only after the rows.
 #[test]
 fn a_crowded_desk_shares_its_rows_alike_each_sessions_newest_first() {
     let (term, turns) = session_every(8000, 2000);
@@ -491,8 +463,6 @@ fn a_crowded_desk_shares_its_rows_alike_each_sessions_newest_first() {
     );
 }
 
-/// The codec keeps every carried field, unknown fields are skipped and
-/// missing ones default, and an unknown version is dropped whole.
 #[test]
 fn the_sidecar_round_trips_and_tolerates_what_it_does_not_know() {
     let (term, turns) = session(60);
@@ -580,9 +550,6 @@ fn the_stamp_names_exact_bytes() {
     assert_eq!(manifest_turn_id(u64::MAX), None, "past a TOML integer");
 }
 
-/// A carried record whose id is past what a manifest can carry is left out
-/// (the rest of the ledger comes): an id at `u64::MAX` would use up the
-/// turn-id count.
 #[test]
 fn a_turn_id_past_the_manifest_range_is_left_out() {
     let (term, turns) = session(30);
@@ -625,8 +592,6 @@ fn a_turn_id_past_the_manifest_range_is_left_out() {
     );
 }
 
-/// A record the receiver cannot read is left out and its id no longer vouched for, and a hop
-/// to an older build spells every record in that build's words so none is left out.
 #[test]
 fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
     let (term, turns) = session(30);
@@ -710,8 +675,6 @@ fn a_record_the_receiver_cannot_read_is_not_vouched_for() {
     assert!(to_v0_100.contains("\"status\":\"hangup\""), "{to_v0_100}");
 }
 
-/// THE HARNESS'S `send` AND `key enter` (`status=pressed`) CROSS TO EVERY
-/// SUCCESSOR.
 #[test]
 fn a_pressed_record_crosses_to_a_build_that_never_heard_the_word() {
     use crate::turn_ledger::STATUS_PRESSED;
@@ -766,11 +729,6 @@ fn a_pressed_record_crosses_to_a_build_that_never_heard_the_word() {
     }
 }
 
-/// A LEDGER THAT SHED THE HARNESS'S RECORDS FROM INSIDE ITS RING (its
-/// share, `turn_ledger::HARNESS_SHARE`) carries that floor, `shed_below`:
-/// the manager's turn the shedding kept crosses, and the adopted ledger's
-/// low-water is the sender's, so a `since-turn=` resume across the handoff
-/// below it is told it missed records, as it was before.
 #[test]
 fn a_ledger_that_shed_harness_records_carries_its_low_water() {
     use crate::turn_ledger::STATUS_PRESSED;
@@ -814,9 +772,6 @@ fn a_ledger_that_shed_harness_records_carries_its_low_water() {
     assert_eq!(decode(text.as_bytes()).unwrap().shed_below, 0);
 }
 
-/// A session adopted without its ledger (no sidecar, a bad one) starts with
-/// an empty ledger that no longer vouches for any turn id up to the count
-/// this process continued from; one carried whole vouches for everything.
 #[test]
 fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
     let floor = crate::control::turn_ids_minted() + 1;
@@ -838,9 +793,6 @@ fn an_adopted_ledger_says_which_turn_ids_it_cannot_vouch_for() {
     assert_eq!(ledger.low_id(), Some(40), "a held record is the low-water");
 }
 
-/// A `turn` still waiting when the park exported records into the exiting process afterwards,
-/// so the carry must not vouch for its id: a subscriber resuming from before it is told, one
-/// resuming from it is not.
 #[test]
 fn a_turn_open_at_the_export_is_not_vouched_for_by_the_carry() {
     let ledger = Arc::new(Mutex::new(TurnLedger::default()));
@@ -865,10 +817,6 @@ fn a_turn_open_at_the_export_is_not_vouched_for_by_the_carry() {
     assert!(4 + 1 >= low, "anchor 4 saw it, and is not told (low {low})");
 }
 
-/// A turn open at the export whose record lands under an id minted after it
-/// (`TurnLedger::record` re-numbers a record that lands behind a later one) is as lost to the
-/// successor as one under its own id, so the carry vouches for no id up to the manifest's
-/// turn-id ceiling.
 #[test]
 fn a_preempted_open_turn_renumbered_after_the_export_is_not_vouched_for() {
     let ceiling = crate::control::turn_ids_for_handoff();
@@ -915,9 +863,6 @@ fn a_preempted_open_turn_renumbered_after_the_export_is_not_vouched_for() {
     assert!(ceiling < low, "turn {ceiling} is vouched for (low {low})");
 }
 
-/// When the ledgers alone overflow the aggregate it is shared out: every session keeps its
-/// newest records (a short ledger all of them, wherever it stands in pool order), the long
-/// ones are cut evenly by no more than needed, and each carry names the ids it shed.
 #[test]
 fn a_desk_whose_ledgers_overflow_the_aggregate_keeps_every_sessions_newest_turns() {
     let (term, _) = session(20);
@@ -966,8 +911,6 @@ fn a_desk_whose_ledgers_overflow_the_aggregate_keeps_every_sessions_newest_turns
     assert_eq!(carries[64].unheld_below, 0);
 }
 
-/// The aggregate goes to every session's ledger and counters first, and to archive rows only
-/// with what is left.
 #[test]
 fn a_crowded_desk_keeps_every_sessions_ledger() {
     let (term, turns) = session_every(8000, 2000);
@@ -1020,9 +963,6 @@ impl Rng {
     }
 }
 
-/// A mangled sidecar (bytes flipped, cut short, spliced, numbers swapped for huge ones)
-/// decodes to something the adopting engine installs or to nothing, and the engine then takes
-/// random frames at random sizes without a panic.
 #[test]
 fn a_mangled_sidecar_never_panics_the_adopting_engine() {
     let (term, turns) = session(90);
@@ -1122,7 +1062,6 @@ fn a_mangled_sidecar_never_panics_the_adopting_engine() {
     );
 }
 
-/// A timeline whose session log holds `n` person-burst marks after its open.
 fn timeline_with_log(n: usize) -> Arc<Mutex<crate::session_timeline::SessionTimeline>> {
     let tl = Arc::new(Mutex::new(
         crate::session_timeline::SessionTimeline::default(),
@@ -1138,8 +1077,6 @@ fn timeline_with_log(n: usize) -> Arc<Mutex<crate::session_timeline::SessionTime
     tl
 }
 
-/// [`capture`] with the session's timeline, as the park takes a handed
-/// session's.
 fn capture_with_log(
     term: &Arc<Mutex<Terminal>>,
     turns: &Arc<Mutex<TurnLedger>>,
@@ -1149,10 +1086,8 @@ fn capture_with_log(
     capture_head(3, &guard, term, turns, Some(timeline), true)
 }
 
-/// Each session's sidecar, `(local_id, JSON)`.
 type Sidecars = Vec<(u64, Vec<u8>)>;
 
-/// Export with logs, the losses collected.
 fn export_logs(sources: &[CarrySource]) -> (Sidecars, Vec<(u64, CarryLoss)>) {
     let mut losses = Vec::new();
     let out = export_noting(
@@ -1167,10 +1102,6 @@ fn export_logs(sources: &[CarrySource]) -> (Sidecars, Vec<(u64, CarryLoss)>) {
     (out, losses)
 }
 
-/// THE LOG RIDES THE SIDECAR, and an older receiver reads past it: this
-/// build reads the member back as the carry's lines, while a receiver built
-/// before it (its `Wire` with no `log`, mirrored here) decodes the same
-/// ledger and archive it decodes from a sidecar without the member.
 #[test]
 fn the_log_rides_the_sidecar_and_an_older_receiver_reads_past_it() {
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -1207,9 +1138,6 @@ fn the_log_rides_the_sidecar_and_an_older_receiver_reads_past_it() {
     );
 }
 
-/// THE MEMBER IS WRITTEN ONLY FOR A SUCCESSOR THAT READS IT: the export for
-/// an older target (a rollback, a channel switch) is byte for byte the export
-/// without any log, so that receiver's aggregate is spent as before.
 #[test]
 fn an_export_for_an_older_target_is_byte_identical_to_one_without_a_log() {
     let (term, turns) = session(40);
@@ -1229,10 +1157,6 @@ fn an_export_for_an_older_target_is_byte_identical_to_one_without_a_log() {
     assert!(!successor_reads_session_log(running - 1, running));
 }
 
-/// A BAD OR OVERSIZED LOG COSTS ONLY THE LOG: a member of the wrong type,
-/// past a carry's line bound, or holding lines no log reads, leaves the
-/// ledger and archive exactly as a log-less carry's; the adopting log then
-/// starts over after `gap why=handoff`.
 #[test]
 fn a_bad_or_oversized_log_costs_only_the_log() {
     let (term, turns) = session(40);
@@ -1287,9 +1211,6 @@ fn a_bad_or_oversized_log_costs_only_the_log() {
     assert_eq!(first.seq, 100);
 }
 
-/// THE LOG NEVER COSTS THE TURN LEDGER: a timeline another thread holds
-/// through the whole log pass costs its session's log (said, `LogBusy`), and
-/// every session still carries its whole ledger and archive.
 #[test]
 fn the_log_never_costs_the_turn_ledger() {
     let (term, turns) = session(40);
@@ -1323,10 +1244,6 @@ fn the_log_never_costs_the_turn_ledger() {
     );
 }
 
-/// LOG DETAIL IS SHED BEFORE ANY SESSION'S ARCHIVE ROWS: a desk whose rows
-/// overflow the aggregate carries each log's skeleton (the open path, the
-/// state) and no detail, while the desk keeps the rows it keeps without
-/// logs, less only what the skeletons take.
 #[test]
 fn log_detail_is_shed_before_any_sessions_archive_rows() {
     let (term, turns) = session_every(8000, 2000);
@@ -1379,9 +1296,6 @@ fn log_detail_is_shed_before_any_sessions_archive_rows() {
     assert!(lines.len() > 1000, "the detail crossed: {}", lines.len());
 }
 
-/// THE LOG MEMBER IS SPLICED INTO THE SIDECAR ALREADY ENCODED: the export no
-/// longer serializes a session's ledger and archive a second time to add its
-/// log.
 #[test]
 fn a_spliced_log_member_reads_as_the_sidecar_and_its_lines() {
     let (term, turns) = session(30);
@@ -1412,10 +1326,6 @@ fn a_spliced_log_member_reads_as_the_sidecar_and_its_lines() {
     }
 }
 
-/// FIXER F6: a MIRRORED log's cursor and head ride its sidecar whether or
-/// not its log does, so a successor whose `Log::from_carry` refuses the
-/// carried log still owes the old space's tail as one exact `why=reset`
-/// cover — not only one whose log did not cross.
 #[test]
 fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_its_tail() {
     let (term, turns) = session(30);
@@ -1454,9 +1364,6 @@ fn a_mirrored_logs_cursor_crosses_beside_its_log_and_a_refused_carry_still_owes_
     );
 }
 
-/// THE BUS MIRROR'S OLD-SPACE CURSOR rides a sidecar whose log did not
-/// cross, spliced in as the log member is:
-/// it reads back as the sidecar without it plus the cursor exactly.
 #[test]
 fn a_mirrored_log_that_does_not_cross_carries_its_cursor_in_the_sidecar() {
     let (term, turns) = session(30);
@@ -1483,10 +1390,6 @@ fn a_mirrored_log_that_does_not_cross_carries_its_cursor_in_the_sidecar() {
     }
 }
 
-/// M2 for the log member: a valid sidecar with a log, mangled (bytes
-/// flipped, cut short, numbers swapped for huge ones), either decodes or is
-/// dropped; when it decodes, its log is adopted or refused, never a panic,
-/// and the adopted log's records stay in seq order.
 #[test]
 fn a_mangled_log_member_never_panics_the_adopting_log() {
     let (term, turns) = session(20);
@@ -1536,9 +1439,6 @@ fn a_mangled_log_member_never_panics_the_adopting_log() {
     }
 }
 
-/// Mirror metadata shares the control carry's existing cap. Ordinary cores fill
-/// that cap exactly; engaging the same logs must keep every session's newest
-/// turns and its mirror cursor, shedding older turns before exceeding it.
 #[test]
 fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
     const SESSIONS: usize = 16;
@@ -1626,7 +1526,6 @@ fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
     );
 }
 
-/// A ledger of the records `ids`, as a session holds one.
 fn ledger_with(ids: impl IntoIterator<Item = u64>) -> TurnLedger {
     let mut ledger = TurnLedger::default();
     for id in ids {
@@ -1642,10 +1541,6 @@ fn ledger_with(ids: impl IntoIterator<Item = u64>) -> TurnLedger {
     ledger
 }
 
-/// THE CRASH CARRY (`crash_restore`'s increment 7) round-trips through the decoder an
-/// update's sidecar goes through: every record (its text, caller, archive mark, words),
-/// the floors and the writer's turn-id count, each record read as carried; no archive and
-/// no log, whatever the bytes held.
 #[test]
 fn a_crash_carry_round_trips_the_ledger_alone() {
     let mut ledger = ledger_with(1..=20);
@@ -1694,8 +1589,6 @@ fn a_crash_carry_round_trips_the_ledger_alone() {
     assert_eq!(crash.turns.len(), 20);
 }
 
-/// An update's sidecar names no turn-id count: its bytes are what they were before the
-/// crash carry's field.
 #[test]
 fn an_update_sidecar_carries_no_turn_id_count() {
     let ledger = ledger_with(1..=3);
@@ -1710,8 +1603,6 @@ fn an_update_sidecar_carries_no_turn_id_count() {
     assert_eq!(decode_why(&bytes).expect("decodes").turn_ids, 0);
 }
 
-/// A ledger too large for the slot sheds its OLDEST records, the fewest that let the rest
-/// fit, and no longer vouches for their ids; when not even its floors fit, nothing.
 #[test]
 fn a_crash_carry_sheds_its_oldest_records_to_fit() {
     let ledger = ledger_with(1..=50);
@@ -1751,7 +1642,6 @@ fn a_crash_carry_sheds_its_oldest_records_to_fit() {
     assert_eq!((bytes, shed), (floors_only, 3));
 }
 
-/// An archive carry under `origin`, one row.
 fn archive_of(origin: u64) -> AltArchiveCarry {
     AltArchiveCarry {
         origin,

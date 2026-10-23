@@ -16,7 +16,7 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Every `.toml` file under the repository root.
+/// Every `.toml` file under the repository root, minus `corpus_skips` directories.
 pub fn corpus() -> Vec<PathBuf> {
     let out = corpus_under(&repo_root());
     assert!(
@@ -27,7 +27,7 @@ pub fn corpus() -> Vec<PathBuf> {
     out
 }
 
-/// Every `.toml` under `root`, sorted.
+/// Every `.toml` under `root` outside the directories `corpus_skips` names, sorted.
 pub fn corpus_under(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk(root, root, &mut out);

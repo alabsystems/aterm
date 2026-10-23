@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CPU/GPU byte-parity tests for `harness_card` fx layers.
+//! CPU/GPU byte-parity tests for `harness_card` fx layers: delta 0, or one
+//! LSB where `common::assert_byte_exact` names the GPU. No GPU: COULD NOT RUN.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,6 +99,28 @@ fn input_with(t: &mut Terminal, layers: Vec<FxLayer>, occluders: Vec<PxRect>) ->
     i
 }
 
+/// The card's frame on the GPU is byte-exact with the CPU's
+/// ([`common::assert_byte_exact`]: delta 0, or the one LSB a GPU whose blend
+/// unit rounds each product on its own may miss a source-over pixel by, where
+/// that module names the GPU).
+#[track_caller]
+fn exact(
+    gpu: &aterm_gpu::GpuRenderer,
+    what: &str,
+    c: &aterm_render::Frame,
+    g: &aterm_render::Frame,
+    which: std::fmt::Arguments<'_>,
+) {
+    let delta = max_channel_delta(&c.pixels, &g.pixels);
+    common::assert_byte_exact(
+        "the_cards_layers_are_byte_exact_on_the_gpu",
+        &format!("{what}: {which}"),
+        gpu,
+        delta,
+        format_args!("{what}: {which}: CPU vs GPU max per-channel delta {delta}"),
+    );
+}
+
 /// The RGB comparator must see complete frames, rather than a shared prefix.
 fn same_extent(c: &aterm_render::Frame, g: &aterm_render::Frame) {
     assert_eq!((c.width, c.height), (g.width, g.height));
@@ -150,11 +173,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                     gpu.present_input_readback(&mut win, &input),
                 );
                 same_extent(&c, &g);
-                assert_eq!(
-                    max_channel_delta(&c.pixels, &g.pixels),
-                    0,
-                    "{what}: episode frame {drawn}"
-                );
+                exact(&gpu, &what, &c, &g, format_args!("episode frame {drawn}"));
                 if drawn == 0 {
                     assert_ne!(c.pixels, cb.pixels, "{what}: the card paints");
                     assert!(
@@ -185,11 +204,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 gpu.present_input_readback(&mut win, &input),
             );
             same_extent(&c, &g);
-            assert_eq!(
-                max_channel_delta(&c.pixels, &g.pixels),
-                0,
-                "{what}: settled"
-            );
+            exact(&gpu, &what, &c, &g, format_args!("settled"));
             let replayed = card
                 .replay(&at, false, &frames)
                 .expect("a settled card replays");
@@ -200,11 +215,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 gpu.present_input_readback(&mut win, &input),
             );
             same_extent(&c, &g);
-            assert_eq!(
-                max_channel_delta(&c.pixels, &g.pixels),
-                0,
-                "{what}: replayed"
-            );
+            exact(&gpu, &what, &c, &g, format_args!("replayed"));
             assert_eq!(
                 gpu.frame_shape().fx_upload_bytes,
                 0,
@@ -224,11 +235,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 gpu.present_input_readback(&mut win, &input),
             );
             same_extent(&c, &g);
-            assert_eq!(
-                max_channel_delta(&c.pixels, &g.pixels),
-                0,
-                "{what}: scrolled"
-            );
+            exact(&gpu, &what, &c, &g, format_args!("scrolled"));
             let (cw, ch) = cpu.cell_size();
             let (pad, grid_top) = (cpu.pad(), cpu.grid_top());
             let menu = PxRect::new(
@@ -243,11 +250,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 gpu.present_input_readback(&mut win, &input),
             );
             same_extent(&c, &g);
-            assert_eq!(
-                max_channel_delta(&c.pixels, &g.pixels),
-                0,
-                "{what}: occluded"
-            );
+            exact(&gpu, &what, &c, &g, format_args!("occluded"));
             let mut nudged = settled_layers.clone();
             for l in nudged.iter_mut().filter(|l| l.slot == FxSlot::Over) {
                 l.offset.0 += 1;
@@ -258,8 +261,9 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
             let g = gpu.present_input_readback(&mut win, &input);
             same_extent(&c, &g);
             assert!(
-                max_channel_delta(&c.pixels, &g.pixels) > 0,
-                "{what}: CONTROL, the comparator sees the kitty moved a pixel"
+                max_channel_delta(&c.pixels, &g.pixels) > 1,
+                "{what}: CONTROL, the comparator sees the kitty moved a pixel, past the one \
+                 LSB a waived GPU may miss by"
             );
         }
     }

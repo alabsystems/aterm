@@ -59,7 +59,7 @@ impl std::fmt::Debug for GithubResponse {
 /// One tool run.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Cmd {
-    /// Absolute path of the program. Never resolved through `PATH`.
+    /// Absolute path of the program.
     pub program: PathBuf,
     /// Arguments after the program.
     pub args: Vec<OsString>,
@@ -75,17 +75,13 @@ pub struct Cmd {
     pub env: Vec<(String, String)>,
     /// Variable names in `env` whose values [`Cmd::display`] masks.
     pub masked: Vec<String>,
-    /// Kill the process group at the deadline and return `Ok` with `status: None` and captured
-    /// output instead of [`RunFailed::TimedOut`].
+    /// Kill the process group at the deadline and return `Ok` with `status: None` and captured output instead of [`RunFailed::TimedOut`].
     pub keep_on_timeout: bool,
-    /// The directory the program starts in; `/` when `None`. A tool that reads where it
-    /// runs (cargo finds a checkout's `.cargo/config.toml` and its aliases from there) is
-    /// given its directory ([`Cmd::current_dir`]).
+    /// The directory the program starts in; `/` when `None`.
     pub cwd: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Cmd {
-    /// Every field, with each `env` value masked as [`Cmd::display`] masks it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let env: Vec<String> = self
             .env
@@ -199,10 +195,7 @@ impl Cmd {
         self
     }
 
-    /// The command as one shell-quoted line: the form revert lines and logs print, and the
-    /// key the test arm's script is matched on (`cd <dir> && ` first when [`Cmd::cwd`] is
-    /// set, then `<user>$ ` when `user` is, each [`Cmd::env`] variable as a `NAME=value`
-    /// word before the program).
+    /// The command as one shell-quoted line.
     #[must_use]
     pub fn display(&self) -> String {
         let mut out = String::new();
@@ -324,7 +317,7 @@ pub enum RunFailed {
     Spawn(String),
     /// The deadline passed; the process group was killed.
     TimedOut(Duration),
-    /// The port refused the run before starting it (e.g. `as_user` without root).
+    /// The port refused the run before starting it (such as `as_user` without root).
     Refused(String),
 }
 
@@ -366,8 +359,7 @@ pub trait Relaying {
 
 /// The operating system, as items see it.
 pub trait System: Sync {
-    /// Read one GitHub API endpoint through `agh` as `user` using the admitted development
-    /// credential.
+    /// Read one GitHub API endpoint through `agh` as `user` using the admitted development credential.
     fn github_api(
         &self,
         _user: &User,
@@ -377,8 +369,7 @@ pub trait System: Sync {
         Err("GitHub reads are not implemented by this backend".into())
     }
 
-    /// Send one GitHub REST request as the controller account with `token` in `Authorization`
-    /// and optional JSON `body`, refusing redirects.
+    /// Send one GitHub REST request as the controller account with `token` in `Authorization` and optional JSON `body`, refusing redirects.
     fn github_rest(
         &self,
         _token: &Secret,
@@ -447,8 +438,7 @@ pub trait System: Sync {
     /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
-    /// Read a bounded regular file at `_path` (at most `_max` bytes) after verifying it is not a
-    /// symlink, is owned by `_uid`, and has safe mode bits.
+    /// Read a bounded regular file at `_path` (at most `_max` bytes) after verifying it is not a symlink, is owned by `_uid`, and has safe mode bits.
     fn read_owned_file(
         &self,
         path: &Path,
@@ -481,8 +471,7 @@ pub trait System: Sync {
     /// Change owner and group of `path` without following symlinks.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
 
-    /// Set owner `uid:gid` and permission bits `mode` on the single-linked regular file at `path`
-    /// via an open descriptor (`O_NOFOLLOW`).
+    /// Set owner `uid:gid` and permission bits `mode` on the single-linked regular file at `path` via an open descriptor.
     fn set_owner_and_mode(&self, path: &Path, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
         let _ = (path, uid, gid, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
@@ -503,8 +492,7 @@ pub trait System: Sync {
     /// Rename `from` to `to`.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Atomically rename `from` to an absent `to`, failing with [`io::ErrorKind::AlreadyExists`]
-    /// on collision.
+    /// Atomically rename `from` to an absent `to`, failing with [`io::ErrorKind::AlreadyExists`] on collision.
     fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _ = (from, to);
         Err(io::ErrorKind::Unsupported.into())
@@ -528,8 +516,7 @@ pub trait System: Sync {
         false
     }
 
-    /// When `pid` started, in unix seconds, as the kernel recorded it for any uid's process
-    /// (what `ps -o lstart=` printed), or `None` when there is no such process.
+    /// When `pid` started, in unix seconds, as the kernel recorded it for any uid's process (what `ps -o lstart=` printed), or `None` when there is no such process.
     fn process_started(&self, pid: u32) -> Option<u64> {
         let _ = pid;
         None
@@ -619,22 +606,12 @@ pub trait System: Sync {
         None
     }
 
-    /// Whether this process holds Full Disk Access, as whoever runs the items measured it,
-    /// once and without a prompt, before the run (`aterm_containment::probe_fda`, which this
-    /// crate does not link): `Some(true)` granted, `Some(false)` refused, `None` not
-    /// measured, which every reader takes as no grant. A workstation pass carries it into
-    /// its context ([`crate::model::HostFacts::full_disk_access`]), which decides whether
-    /// it may touch another app's sandbox container ([`crate::items::defaults::withheld`]).
-    /// [`Live`] answers what its runner gave it ([`Live::with_full_disk_access`]); the test
-    /// arm what the test set; the default `None`.
+    /// Whether this process holds Full Disk Access, as whoever runs the items measured it, once and without a prompt, before the run.
     fn full_disk_access(&self) -> Option<bool> {
         None
     }
 
-    /// The app bundle this process runs from (`/Users//bob/Applications/aterm.app`),
-    /// canonical, or `None` outside a bundle or when it cannot be read: which copy of aterm
-    /// is this account's when there are two. [`Live`] reads its executable's path; the
-    /// test arm answers what the test set; the default `None`.
+    /// The app bundle this process runs from (`/Users//bob/Applications/aterm.app`), canonical, or `None` outside a bundle or when it cannot be read.
     fn running_app(&self) -> Option<PathBuf> {
         None
     }
@@ -657,8 +634,7 @@ pub struct Live {
 }
 
 impl Live {
-    /// The live port, with the running executable as the agent, and Full Disk Access not
-    /// measured.
+    /// The live port, with the running executable as the agent, and Full Disk Access not measured.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -667,15 +643,13 @@ impl Live {
         }
     }
 
-    /// This port, answering `measured` for [`System::full_disk_access`]: what the runner
-    /// measured of this process, once, before the run (`aterm_containment::probe_fda`).
+    /// This port, answering `measured` for [`System::full_disk_access`].
     #[must_use]
     pub const fn with_full_disk_access(mut self, measured: Option<bool>) -> Self {
         self.full_disk_access = measured;
         self
     }
 
-    /// Build the real program and argv for `cmd`, wrapping with `sudo` and `launchctl` as needed.
     fn argv(&self, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
         Self::argv_from(self.euid(), cmd)
     }
@@ -687,7 +661,6 @@ impl Live {
         Ok((program, args, self.child_env(cmd)))
     }
 
-    /// Build the program and argv for `cmd` assuming effective uid `euid`.
     fn argv_from(euid: u32, cmd: &Cmd) -> Result<(PathBuf, Vec<OsString>), RunFailed> {
         let Some(user) = &cmd.user else {
             return Ok((cmd.program.clone(), cmd.args.clone()));
@@ -735,7 +708,6 @@ impl Live {
         Ok((program, args))
     }
 
-    /// Build the complete child environment for `cmd` (account defaults plus [`Cmd::env`]).
     fn child_env(&self, cmd: &Cmd) -> Vec<(String, String)> {
         let mut env: Vec<(String, String)> = match &cmd.user {
             Some(user) if self.euid() != 0 => account_env(user).to_vec(),
@@ -760,7 +732,6 @@ impl Live {
         env
     }
 
-    /// Run a [`Cmd::keep_on_timeout`] command with output redirected to temporary files.
     fn run_until_deadline(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let failed = |e: io::Error| RunFailed::Spawn(e.to_string());
@@ -815,7 +786,6 @@ impl Live {
     }
 }
 
-/// Base environment variables (`HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `LC_ALL`) for `user`.
 fn account_env(user: &User) -> [(String, String); 6] {
     let shell = if user.shell.is_empty() {
         "/bin/zsh"
@@ -833,7 +803,6 @@ fn account_env(user: &User) -> [(String, String); 6] {
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
 }
 
-/// `SIGKILL` `child` and its process group, then reap `child`.
 fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `child` is not yet reaped, so its pid and process group id remain valid.
@@ -843,7 +812,6 @@ fn end_group(child: &mut aterm_uds::spawnfd::Child) {
     let _ = child.wait();
 }
 
-/// Read at most the last [`aterm_uds::deadline::OUTPUT_KEEP`] bytes of `path`.
 fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -859,7 +827,6 @@ fn kept_tail(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Build a command for `program` and `args` in `/` with only `env` set.
 fn fixed_command(
     program: &Path,
     args: &[OsString],
@@ -1427,7 +1394,6 @@ impl System for Live {
         crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
 
-    /// Open `<state_dir>/converge/journal.ndjson` under the target account's state directory.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
         aterm_types::dirs::account_state_dir()
             .map(|root| {
@@ -1438,7 +1404,6 @@ impl System for Live {
     }
 }
 
-/// Exclusive `flock` guard that unlocks before closing on drop.
 struct Exclusive(std::fs::File);
 
 impl Exclusive {
@@ -1547,7 +1512,6 @@ mod fake {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    /// A tool a test models from its own state ([`Fake::simulate`]).
     type Model = Arc<dyn Fn(&Fake, &Cmd) -> Option<Ran> + Send + Sync>;
 
     /// Scripted [`System`] implementation for unit tests.
@@ -1562,6 +1526,8 @@ mod fake {
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, String>>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
+        /// The commands whose [`System::run`] gives no answer within its budget ([`Fake::time_out`]).
+        timeouts: Mutex<std::collections::BTreeSet<String>>,
         stage_commit_refused: Mutex<bool>,
         stage_abort_refused: Mutex<bool>,
         start_answers: Mutex<std::collections::VecDeque<Result<(), RunFailed>>>,
@@ -1903,6 +1869,13 @@ mod fake {
             self
         }
 
+        /// Make [`System::run`] of the command whose display is `key` give no answer within its
+        /// budget: [`RunFailed::TimedOut`] with that budget.
+        pub fn time_out(&self, key: &str) -> &Self {
+            self.timeouts.lock().unwrap().insert(key.to_owned());
+            self
+        }
+
         /// Script `reply` for the command whose display is `key`.
         pub fn on(&self, key: &str, reply: Ran) -> &Self {
             self.replies
@@ -2164,6 +2137,9 @@ mod fake {
         fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
             let key = cmd.display();
             self.calls.lock().unwrap().push(key.clone());
+            if self.timeouts.lock().unwrap().contains(&key) {
+                return Err(RunFailed::TimedOut(cmd.budget));
+            }
             let model = self.model.lock().unwrap().clone();
             if let Some(model) = model
                 && let Some(ran) = model(self, cmd)
@@ -2677,12 +2653,9 @@ mod fake {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
 
-        /// `path` with each seeded link ([`Fake::link`]) a prefix of it names followed, as
-        /// `realpath(3)` would; a path through no link is its own canonical form.
         fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
             let links = self.links.lock().unwrap();
             let mut path = path.to_path_buf();
-            // macOS's MAXSYMLINKS: a cycle of links fails as ELOOP does.
             for _ in 0..32 {
                 let Some((link, target)) = links.iter().find(|(link, _)| path.starts_with(link))
                 else {
@@ -3168,8 +3141,6 @@ mod tests {
         );
     }
 
-    /// The Dock pins the copy [`System::running_app`] names, so the live answer follows
-    /// the link on PATH (`~/.local/bin/aterm`) into the bundle it runs from.
     #[test]
     fn the_running_app_is_the_bundle_the_resolved_executable_sits_in() {
         let dir = aterm_tempfile::tempdir().unwrap();

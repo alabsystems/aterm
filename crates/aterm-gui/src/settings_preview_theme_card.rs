@@ -58,8 +58,8 @@ impl Section {
 }
 
 /// The format the parser names another terminal's theme by (`label`,
-/// [`ForeignFormat::label`]), in the one word a chooser row has room for:
-/// `JSON` for `JSON (Windows Terminal)`.
+/// [`ForeignFormat::label`](aterm_types::scheme::ForeignFormat::label)), in the
+/// one word a chooser row has room for: `JSON` for `JSON (Windows Terminal)`.
 fn format_word(label: &str) -> &str {
     use aterm_types::scheme::ForeignFormat;
     for format in [

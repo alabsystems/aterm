@@ -53,7 +53,7 @@ pub struct MessageAsKeyEvent {
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
-    /// The Alt code being typed, and the character the last one composed.
+    /// LOCAL PATCH (aterm): the Alt code being typed, and the character the last one composed.
     alt_code: Mutex<AltCode>,
     alt_code_commit: Mutex<Option<String>>,
 }
@@ -68,19 +68,22 @@ impl Default for KeyEventBuilder {
     }
 }
 impl KeyEventBuilder {
-    /// The character the last Alt code composed, once.
+    /// LOCAL PATCH (aterm): the character the last Alt code composed, once. Windows posts it as a
+    /// WM_CHAR with no key-down after Alt is released, which upstream dropped as "probably IME";
+    /// the event loop sends it on as `Ime::Commit`.
     pub(crate) fn take_alt_code_commit(&self) -> Option<String> {
         self.alt_code_commit.lock().unwrap().take()
     }
 
-    /// Record a key-down for [`AltCode`], with the live Alt and Ctrl state.
+    /// LOCAL PATCH (aterm): a key-down for [`AltCode`], with the live Alt and Ctrl state.
     fn note_alt_code_key(&self, vkey: VIRTUAL_KEY) {
         let held = |vk: VIRTUAL_KEY| key_state(vk) < 0;
         let (alt, ctrl) = (held(VK_MENU), held(VK_CONTROL));
         self.alt_code.lock().unwrap().key_down(vkey, alt, ctrl);
     }
 
-    /// Handle a `WM_CHAR` no key-down claimed ([`Self::take_alt_code_commit`]).
+    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
+    /// code; the last unit of the character stores it for [`Self::take_alt_code_commit`].
     fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
         if !self.alt_code.lock().unwrap().push(unit) {
             return false;
@@ -447,7 +450,9 @@ impl KeyEventBuilder {
     }
 }
 
-/// Windows Alt-code entry state.
+/// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
+/// keypad (Alt, 0, 2, 3, 3), and on Alt's release the system posts the composed character
+/// (`é`) as a WM_CHAR no key-down belongs to.
 #[derive(Default)]
 struct AltCode {
     armed: bool,
@@ -694,7 +699,8 @@ fn ex_scancode_from_lparam(lparam: LPARAM) -> ExScancode {
     new_ex_scancode(lparam.scancode, lparam.extended)
 }
 
-/// Recorded message-sequence replay hooks for tests and debug builds (`super::recorded`).
+/// LOCAL PATCH (aterm): what the key path reads from Windows, answered from a recorded message
+/// sequence while one is replayed on this thread (`super::recorded`). Tests and debug builds only.
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod replay {
     use std::cell::RefCell;
@@ -745,7 +751,7 @@ pub(crate) mod replay {
     }
 }
 
-/// `GetKeyState(vk)`, or the replay's recorded state while one runs.
+/// LOCAL PATCH (aterm): `GetKeyState(vk)` (the replay's recorded state while one runs).
 pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     #[cfg(any(test, debug_assertions))]
     if let Some(keys) = replay::keys() {
@@ -755,7 +761,8 @@ pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     unsafe { GetKeyState(vk as i32) }
 }
 
-/// The layout `MapVirtualKeyExW` maps a scan code through.
+/// LOCAL PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code through; a replay maps with
+/// the thread's own, since a recorded layout is none Windows loaded.
 pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
     #[cfg(any(test, debug_assertions))]
     if replay::layout().is_some() {

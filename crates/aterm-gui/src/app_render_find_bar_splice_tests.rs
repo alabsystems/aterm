@@ -3,8 +3,6 @@
 
 use crate::{App, WindowId, term_lock};
 
-/// Fill the window's render scratch from the engine, as the redraw does before its
-/// splices, so the splice under test has a real grid to overwrite.
 fn fill_scratch(app: &mut App, wid: WindowId) -> (usize, usize) {
     let (rows, cols) = {
         let ws = app.windows.get(&wid).unwrap();
@@ -33,8 +31,6 @@ fn top_row_text(app: &App, wid: WindowId) -> String {
     row_text(app, wid, 0)
 }
 
-/// Frame text of the find panel's field row (`Find: ` plus the well), located
-/// through the splice's recorded geometry.
 fn field_row_text(app: &App, wid: WindowId) -> String {
     let hit = app.windows[&wid]
         .find_bar_hit
@@ -43,8 +39,6 @@ fn field_row_text(app: &App, wid: WindowId) -> String {
     row_text(app, wid, app.tab_strip_rows as usize + hit.row)
 }
 
-/// The whole find panel band as one string (rows joined) — for content assertions
-/// that don't care which row of the panel a run landed on.
 fn panel_text(app: &App, wid: WindowId) -> String {
     let hit = app.windows[&wid]
         .find_bar_hit
@@ -58,8 +52,6 @@ fn panel_text(app: &App, wid: WindowId) -> String {
         .join("\n")
 }
 
-/// Seed the open find's query the way a user's typing does — through the one seam
-/// that keeps the caret on a char boundary at the end of the text.
 fn seed_query(app: &mut App, wid: WindowId, query: &str) {
     app.windows
         .get_mut(&wid)
@@ -70,10 +62,6 @@ fn seed_query(app: &mut App, wid: WindowId, query: &str) {
         .set_query(query.to_string());
 }
 
-/// The Cmd-F find panel appears on the top terminal rows once find is active,
-/// using the real search path (`search_recompute`) so the match count comes
-/// from the engine; before searching the splice is a no-op. The matches sit
-/// below the band, so this is the default top placement.
 #[test]
 fn find_bar_appears_on_top_row_while_searching() {
     let mut app = App::headless_for_test();
@@ -142,8 +130,6 @@ fn find_bar_appears_on_top_row_while_searching() {
     );
 }
 
-/// A terminal shorter than the panel shrinks the band (dropping the pad,
-/// then the hints); the field row always survives, exactly `cols` wide.
 #[test]
 fn find_panel_degrades_on_a_terminal_shorter_than_the_band() {
     for rows in [1u16, 2, 3] {
@@ -175,8 +161,6 @@ fn find_panel_degrades_on_a_terminal_shorter_than_the_band() {
     }
 }
 
-/// With 100,000 sorted hits and one screen visible, the compositor's work is
-/// two binary searches plus the visible rows, not total history.
 #[test]
 fn find_bar_100k_history_work_is_logarithmic_plus_visible() {
     let mut app = App::headless_for_test();
@@ -209,8 +193,6 @@ fn find_bar_100k_history_work_is_logarithmic_plus_visible() {
     );
 }
 
-/// When the terminal cursor sits on the top line (⌘F on a fresh screen whose prompt
-/// is at home), the splice hides it so its block doesn't paint over the bar's caret.
 #[test]
 fn find_bar_hides_cursor_on_covered_row() {
     let mut app = App::headless_for_test();
@@ -338,8 +320,6 @@ fn bottom_floated_find_bar_scrubs_upward_neighbour_decoration_spill() {
     assert!(ws.input_scratch.word_decorations.is_empty());
 }
 
-/// End-to-end: `search_recompute` honors the case + regex toggles through the real
-/// App path, and flags an invalid regex — the machinery the ⌥⌘C/⌥⌘R chords drive.
 #[test]
 fn recompute_honors_case_and_regex_toggles() {
     let mut app = App::headless_for_test();
@@ -386,12 +366,6 @@ fn recompute_honors_case_and_regex_toggles() {
     assert!(s.matches.is_empty(), "bad regex yields no matches");
 }
 
-/// The highlight-all colour `splice_find_bar` paints: the default theme's
-/// search-match token (`aterm_messages::tokens::ChromeTokens::search_match`; no
-/// OSC 11 in headless, and Default's accent is its green cursor whatever the
-/// palette). It must stand apart from the selection the current match is
-/// painted in, or the tests below could not tell a tinted cell from a selected
-/// one.
 fn highlight_bg() -> [u8; 3] {
     let t = aterm_render::Theme::default();
     let selection = crate::settings::u32_rgb(t.selection);
@@ -402,9 +376,6 @@ fn highlight_bg() -> [u8; 3] {
     hi
 }
 
-/// A hit straddling a soft wrap is one match: the tint covers the tail
-/// columns of its first row and the head columns of the wrapped row, and
-/// nothing else on either.
 #[test]
 fn a_hit_that_straddles_a_soft_wrap_is_tinted_on_both_rows_it_occupies() {
     let mut app = App::headless_for_test();
@@ -461,11 +432,6 @@ fn a_hit_that_straddles_a_soft_wrap_is_tinted_on_both_rows_it_occupies() {
     );
 }
 
-/// On a BiDi row the hit's logical columns are painted elsewhere: in
-/// `abc שלום עולם def` the search finds עולם at logical 9..=12, which the frame
-/// paints reversed at 4..=7, while 9..=12 paint שלום. The tint follows the
-/// frame's visual→logical map onto the cells that show the match, and the
-/// current match's selection lights the same cells.
 #[test]
 fn highlight_all_tints_the_cells_that_paint_an_rtl_match() {
     let mut app = App::headless_for_test();
@@ -502,10 +468,6 @@ fn highlight_all_tints_the_cells_that_paint_an_rtl_match() {
     assert_eq!(lit, tinted, "the current match's selection lights them too");
 }
 
-/// A band painted over a BiDi row is host content in logical order, so the row's
-/// visual→logical map goes with the cells it replaced: the find panel's band and a generic
-/// band splice (`splice_band_rows_at`) both drop it, so the terminal row's permutation cannot
-/// steer a selection on that row onto the band's cells.
 #[test]
 fn a_band_painted_over_a_bidi_row_drops_its_map() {
     let mut app = App::headless_for_test();
@@ -559,9 +521,6 @@ fn a_band_painted_over_a_bidi_row_drops_its_map() {
     );
 }
 
-/// Highlight-all maps a scrollback match through `display_offset`
-/// (`screen = sel_row + display_offset`): the current match lands, tinted, on the first screen
-/// row below the top-anchored band.
 #[test]
 fn highlight_all_maps_scrollback_current_below_top_bar() {
     let mut app = App::headless_for_test();
@@ -608,8 +567,6 @@ fn highlight_all_maps_scrollback_current_below_top_bar() {
     }
 }
 
-/// When the current match sits on the top row, the bar floats to the bottom and its seam flips
-/// to an overline facing the content above.
 #[test]
 fn find_bar_floats_to_bottom_when_current_match_on_top() {
     use aterm_core::terminal::UnderlineStyle;
@@ -665,9 +622,6 @@ fn find_bar_floats_to_bottom_when_current_match_on_top() {
     );
 }
 
-/// A frame extracted after a non-uniform absolute-row splice never uses
-/// pre-splice cached match rows: the bar stays, but adaptive placement and
-/// the highlight-all tint fail closed until search recomputes.
 #[test]
 fn find_bar_suppresses_stale_absolute_row_geometry() {
     let mut app = App::headless_for_test();
@@ -721,7 +675,6 @@ fn find_bar_suppresses_stale_absolute_row_geometry() {
     );
 }
 
-/// Screen rows carrying the highlight-all tint, in frame order.
 fn tinted_rows(app: &App, wid: WindowId, hi: [u8; 3]) -> Vec<usize> {
     app.windows[&wid]
         .input_scratch
@@ -733,11 +686,6 @@ fn tinted_rows(app: &App, wid: WindowId, hi: [u8; 3]) -> Vec<usize> {
         .collect()
 }
 
-/// A width reflow (edge drag, font zoom, divider move) rewraps retained
-/// history and renumbers every absolute row without moving any
-/// `absolute_row_revision`, so cached match rows would tint the wrong line.
-/// The overlay fails closed until the search recomputes, as
-/// `finalize_resize` drops the text selection.
 #[test]
 fn find_bar_suppresses_matches_a_width_reflow_renumbered() {
     let mut app = App::headless_for_test();
@@ -830,10 +778,6 @@ fn find_bar_suppresses_matches_a_width_reflow_renumbered() {
     );
 }
 
-/// A width reflow with empty scrollback also renumbers rows: every splice-site
-/// bump early-returns, but `resize_with_reflow_mode` raises
-/// `history_renumber_epoch` for every width rewrap, so the tint still fails
-/// closed.
 #[test]
 fn find_bar_suppresses_matches_a_viewport_only_width_reflow_moved() {
     let mut app = App::headless_for_test();
@@ -930,9 +874,6 @@ fn find_bar_suppresses_matches_a_viewport_only_width_reflow_moved() {
     );
 }
 
-/// A non-current highlighted match whose fg is close to the tint is lifted
-/// to a legible (WCAG) contrast; the current match's fg is left to the
-/// renderer's own selection-fg floor.
 #[test]
 fn highlight_floors_noncurrent_fg_for_contrast() {
     let mut app = App::headless_for_test();
@@ -998,8 +939,6 @@ fn highlight_floors_noncurrent_fg_for_contrast() {
     );
 }
 
-/// The match-case / regex modes persist across find sessions rather than
-/// resetting to the literal / case-insensitive defaults.
 #[test]
 fn find_toggles_persist_across_sessions() {
     let mut app = App::headless_for_test();
@@ -1021,11 +960,6 @@ fn find_toggles_persist_across_sessions() {
     assert!(s.is_regex, "regex toggle persisted across sessions");
 }
 
-/// THE TOOLBAR'S BUTTONS DO WHAT THEIR KEYS DO (Windows,
-/// `find_bar::FIND_TOOLBAR`): a click on `↓`, hit-tested against the geometry
-/// `splice_find_bar` recorded, steps to the next match as F3 does, `↑` back as
-/// Shift+F3 does, and `✕` closes the bar as Esc does. NEGATIVE CONTROL: off
-/// Windows no button is recorded, and a click on the well moves no match.
 #[test]
 fn clicking_the_toolbar_buttons_steps_and_closes() {
     let mut app = App::headless_for_test();
@@ -1081,9 +1015,6 @@ fn clicking_the_toolbar_buttons_steps_and_closes() {
     assert!(app.windows[&wid].search.is_none(), "✕ closed the bar");
 }
 
-/// A click on the `Aa` / `.*` indicators, hit-tested against the geometry
-/// `splice_find_bar` recorded, flips match-case / regex (and the sticky
-/// default); a click off the indicators changes nothing.
 #[test]
 fn clicking_indicators_toggles_via_recorded_geometry() {
     let mut app = App::headless_for_test();
@@ -1176,10 +1107,6 @@ fn clicking_indicators_toggles_via_recorded_geometry() {
     );
 }
 
-/// With a tab strip prepended, `splice_find_bar` places the bar and match
-/// tints by frame index (`strip + terminal_row`). The current match is on
-/// the top terminal row, so the bar floats to the true frame bottom, the
-/// matches are tinted at shifted rows, and the strip row is untouched.
 #[test]
 fn find_bar_splices_below_tab_strip() {
     let mut app = App::headless_for_test();
@@ -1232,9 +1159,6 @@ fn find_bar_splices_below_tab_strip() {
     );
 }
 
-/// Default top placement with a tab strip: the bar lands at frame row
-/// `strip + 0`, directly below the strip, and match tints land at their
-/// shifted rows.
 #[test]
 fn find_bar_default_top_sits_below_tab_strip() {
     let mut app = App::headless_for_test();
@@ -1282,8 +1206,6 @@ fn find_bar_default_top_sits_below_tab_strip() {
     }
 }
 
-/// Accept (⏎): closing find keeps the viewport, keeps the current match
-/// selected (ready for ⌘C), and remembers the query for empty-query recall.
 #[test]
 fn accept_keeps_viewport_and_remembers_query() {
     let mut app = App::headless_for_test();
@@ -1373,9 +1295,6 @@ fn find_again_never_reuses_an_absolute_anchor_from_another_session() {
     );
 }
 
-/// Cmd-G's parked anchor is an absolute row, so it is refused when either
-/// the footer revision or the width-reflow renumber stamp moved; a refused
-/// anchor resumes at the first forward hit.
 #[test]
 fn find_again_refuses_an_absolute_anchor_a_width_reflow_renumbered() {
     let mut app = App::headless_for_test();
@@ -1519,9 +1438,6 @@ fn active_search_defers_then_recomputes_after_codex_footer_row_splice() {
     );
 }
 
-/// Cancel (⎋ / ^G) restores the viewport captured at `search_enter`, even
-/// after navigating deep into scrollback, clears the match highlight, and
-/// does not remember the cancelled query.
 #[test]
 fn cancel_restores_origin_viewport() {
     let mut app = App::headless_for_test();
@@ -1578,10 +1494,6 @@ fn cancel_restores_origin_viewport() {
     );
 }
 
-/// A find opened at the live tail cancels back to the live tail, even across
-/// a protected-footer splice that archives the row the viewport showed.
-/// `FindOrigin::was_live` keeps a tail follower on the tail; without it the
-/// anchored row lands one line up in history.
 #[test]
 fn cancel_at_the_live_tail_survives_a_codex_footer_splice() {
     let mut app = App::headless_for_test();
@@ -1616,9 +1528,6 @@ fn cancel_at_the_live_tail_survives_a_codex_footer_splice() {
     );
 }
 
-/// `^S`/`^R` on an empty query recall the last accepted query (emacs
-/// `C-s C-s`): forward lands on the first match, backward on the last, a
-/// further `^S` steps normally, and with nothing accepted it is a no-op.
 #[test]
 fn repeat_recalls_last_accepted_query() {
     let mut app = App::headless_for_test();
@@ -1652,9 +1561,6 @@ fn repeat_recalls_last_accepted_query() {
     assert_eq!(state(&app), ("hit".to_string(), 3, 2), "backward recall");
 }
 
-/// A left press on the `Aa` indicator through the full `on_mouse_input` seam
-/// (modal misses, strip miss, find-bar pixel gate, cell map, toggle) flips
-/// match-case and its sticky default.
 #[test]
 fn find_bar_toggle_fires_through_on_mouse_input() {
     use aterm_window::event::{ElementState, MouseButton};
@@ -1716,9 +1622,6 @@ fn find_bar_toggle_fires_through_on_mouse_input() {
     );
 }
 
-/// A left press in the bottom `pad` border that `pixel_to_cell` clamps onto
-/// the bar's bottom row does not toggle a mode: the pixel-band gate admits
-/// only presses inside the bar's cell band.
 #[test]
 fn find_bar_pixel_gate_rejects_pad_clamp_click() {
     use aterm_window::event::{ElementState, MouseButton};
@@ -1777,8 +1680,6 @@ fn find_bar_pixel_gate_rejects_pad_clamp_click() {
     );
 }
 
-/// The match re-anchor (`delta = base_y_now − match_base_y`) at delta > 0: output scrolls the
-/// grid after the search while the match stays on screen, and the tint follows the match's row.
 #[test]
 fn splice_reanchors_highlight_after_output_scrolls_in() {
     let mut app = App::headless_for_test();
@@ -1848,10 +1749,6 @@ fn splice_reanchors_highlight_after_output_scrolls_in() {
     );
 }
 
-/// `find_bar_pixel_hit` admits a click only inside the panel's cell band
-/// `[top, top + rows*ch)` and inside the grid columns: the first/last device
-/// rows of the band accept, one px outside rejects, and a press past the last
-/// column rejects (so the column clamp cannot land it on an indicator).
 #[test]
 fn find_bar_pixel_hit_boundaries_and_right_edge() {
     let mut app = App::headless_for_test();
@@ -1906,11 +1803,6 @@ fn find_bar_pixel_hit_boundaries_and_right_edge() {
     );
 }
 
-/// FIND WORKS IN A SPLIT, on a real composed frame: the panel covers the FOCUSED
-/// pane's top rows only — the sibling beside it keeps its own cells on those rows
-/// and its clicks — and highlight-all tints the focused pane's hits at the pane's
-/// origin in the composite, never the sibling's. Before this the panel spanned
-/// every pane, hid both pane's top rows, and highlight-all was switched off.
 #[test]
 fn find_in_a_split_rides_the_focused_pane_with_highlight_all() {
     let mut app = App::headless_for_test();
@@ -2027,13 +1919,6 @@ fn find_in_a_split_rides_the_focused_pane_with_highlight_all() {
     );
 }
 
-/// THE TOOLBAR ENDS AT ITS PANE'S MARGIN (Windows, `find_bar::FIND_TOOLBAR`):
-/// in a full-width pane and in the focused pane of a split, the field row's
-/// last mark is the right group's (the `✕`, drawn as the band's cross, or the
-/// count where a narrow pane dropped the buttons), the band's two-cell margin
-/// from the pane's right edge in window columns, as the mouse reads them.
-/// NEGATIVE CONTROL: the 2026-10-18 build packed the group against the well,
-/// its `✕` short of the end; off Windows no button is recorded.
 #[test]
 fn the_toolbar_ends_at_its_panes_margin_full_and_split() {
     let wid = WindowId(0);
@@ -2115,7 +2000,6 @@ fn the_toolbar_ends_at_its_panes_margin_full_and_split() {
     }
 }
 
-/// No room below the words: no rail at all.
 #[test]
 fn a_pane_scoped_rail_never_lifts_its_row() {
     use super::unlifted_rail_h;
@@ -2131,12 +2015,6 @@ fn a_pane_scoped_rail_never_lifts_its_row() {
     assert_eq!(aterm_render::chrome_fit(&well, (2, 2)).0, 1);
 }
 
-/// THE PANEL'S RULE RUNS ON ITS LAST PIXEL ROW, NOT THROUGH ITS WORDS. At the top
-/// (content below), where the cell and face can keep the words a clear row off a
-/// rail (`band::seam_can_rail`, the message band's own test), the rule is a 1 px
-/// rail raster on the band's last row, laid under the panel's cells only, and no
-/// band cell carries an underline (which ran through the hints' descenders five
-/// pixels above the edge); elsewhere it stays the face's underline. Never both.
 #[test]
 fn the_top_panel_closes_on_a_rail_under_its_last_row() {
     let mut app = App::headless_for_test();
@@ -2227,14 +2105,6 @@ fn the_top_panel_closes_on_a_rail_under_its_last_row() {
     }
 }
 
-/// THE CURRENT MATCH IS PAINTED IN ITS OWN FILL while the bar is open: the live
-/// selection (which `search_apply_current_in` set to it) takes
-/// `find_bar::current_match_fill`, a step in luminance from the other matches'
-/// tint, with its text in `find_bar::current_match_ink` — the background the
-/// fill stands off, not the renderer's automatic floor, which settled the
-/// default theme's text on a mid-grey `#535353` over the green (the 2026-10-18
-/// judge). NEGATIVE CONTROL: with no hit the selection keeps the frame's own
-/// colours.
 #[test]
 fn the_current_match_is_painted_in_its_own_fill() {
     let mut app = App::headless_for_test();
@@ -2282,12 +2152,6 @@ fn the_current_match_is_painted_in_its_own_fill() {
     );
 }
 
-/// AN AUTHORED SEARCH MATCH AND BORDER REACH THE FIND SPLICE: with
-/// `search_match_color` and `border_color` in `aterm.toml`, every visible
-/// non-current match is the authored tint lifted to its rise off the live
-/// background, and the panel's seam is the authored border floored on the band.
-/// NEGATIVE CONTROL: without the keys the tint is the derived one and the seam
-/// the band's label tone.
 #[test]
 fn authored_search_match_and_border_reach_the_find_splice() {
     let paint = |config: &str| {
@@ -2339,8 +2203,6 @@ fn authored_search_match_and_border_reach_the_find_splice() {
     assert_eq!(seam, band.label, "CONTROL: the label seam");
 }
 
-/// A find over `lines` with `query`, painted, with this thread's UI faces
-/// installed (`faces`) or cleared: the Fluent face's precondition.
 fn painted_with_faces(faces: bool, lines: &[u8], query: &str) -> App {
     let mut app = App::headless_for_test();
     if faces {
@@ -2359,14 +2221,6 @@ fn painted_with_faces(faces: bool, lines: &[u8], query: &str) -> App {
     app
 }
 
-/// THE WINDOWS BAR LAYS ITS FLUENT FACE OVER THE BAND (`find_bar::fluent_bar`):
-/// with a UI face installed, every band row carries one raster across the
-/// panel's columns, drawn over the cells' glyphs, while the cells keep the
-/// panel's words for the text grid; the raster draws the seam, the focus line
-/// and the `✕` itself, so no chrome raster and no cell rule is left on the band
-/// to draw over it at the cells' places. NEGATIVE CONTROL: without a UI face the
-/// cells stand with their rail and drawn cross, and off Windows no raster is
-/// ever laid.
 #[test]
 fn the_windows_bar_lays_its_fluent_face_over_the_band() {
     let wid = WindowId(0);
@@ -2447,12 +2301,6 @@ fn the_windows_bar_lays_its_fluent_face_over_the_band() {
     );
 }
 
-/// A PRESS IN THE FLUENT QUERY BOX LANDS ON THE CHARACTER UNDER THE POINTER
-/// (`App::find_bar_click_at`, `find_bar::well_click`), through the full mouse
-/// handler: the box sets the query in the UI face, so the press's pixel, not
-/// its cell, picks the caret, and a press on the prompt's cells the box took is
-/// the box's. NEGATIVE CONTROL: the cell mapping puts the same press several
-/// characters short.
 #[test]
 fn a_press_in_the_fluent_box_lands_on_the_character_under_the_pointer() {
     use aterm_window::event::{ElementState, MouseButton};
@@ -2514,7 +2362,6 @@ fn a_press_in_the_fluent_box_lands_on_the_character_under_the_pointer() {
     assert_eq!(s.query, query, "a press never edits the text");
 }
 
-/// NEGATIVE CONTROL: the cell bar underlines the composed cell.
 #[test]
 fn the_fluent_box_owns_the_composition_underline() {
     let wid = WindowId(0);
@@ -2548,8 +2395,6 @@ fn the_fluent_box_owns_the_composition_underline() {
     }
 }
 
-/// The control of the find bar `hit` records at terminal cell `(row, col)`:
-/// one of its toolbar's buttons or toggles, on its field row.
 fn control_at(hit: &crate::FindBarHit, (row, col): (usize, usize)) -> Option<&'static str> {
     if row != hit.row {
         return None;
@@ -2569,17 +2414,11 @@ fn control_at(hit: &crate::FindBarHit, (row, col): (usize, usize)) -> Option<&'s
     })
 }
 
-/// What a press on the find bar can change: the toggles, the current match,
-/// whether find is open.
 fn find_state(app: &App, wid: WindowId) -> Option<(bool, bool, usize)> {
     let s = app.windows[&wid].search.as_ref()?;
     Some((s.case_sensitive, s.is_regex, s.current))
 }
 
-/// NEGATIVE CONTROLS: the zoom undone, the grid is the one the bar was laid on
-/// and the band answers the resting pointer with what it painted there; and
-/// the last frame's band stamped as the zoomed grid's (no stamp, as before),
-/// the same pixel is the control's, which a press fires.
 #[test]
 fn a_regrid_leaves_the_find_bars_last_band_answering_nothing() {
     use aterm_window::event::{ElementState, MouseButton};

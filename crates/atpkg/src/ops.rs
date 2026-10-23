@@ -278,6 +278,13 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     uninstall_name_shape(program)?;
 
     let prog_store = layout.prefix.join("store").join(program);
+    if let Some(held) = crate::store::held_build_in(&prog_store) {
+        return Err(io::Error::other(format!(
+            "{} stays in place: a resolve check's child in it never exited on its own, and \
+             macOS may still be assessing that first exec; uninstall again in a few minutes",
+            held.display()
+        )));
+    }
 
     for dir in [layout.bin_dir(), layout.agents_dir()] {
         let Ok(entries) = std::fs::read_dir(&dir) else {

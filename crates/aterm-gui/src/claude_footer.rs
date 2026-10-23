@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts, LaunchFacts};
+use aterm_agent::harness::profile::{SubscriptionDisplay, USAGE_SHOWN_S, WeeklyFigure, WeeklyGap};
+use aterm_agent::harness::tap;
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
 use aterm_effects::cli_marks::{Build, CliMark};
@@ -275,7 +277,7 @@ struct CachedPaneText {
     weekly: std::cell::OnceCell<Option<aterm_phase::muse::UsageCardWeekly>>,
     /// Muse Code's subscription tier on `rows` ([`PaneTextCache::subscription_plan`]).
     plan: std::cell::OnceCell<Option<String>>,
-    /// The rule's coverable run and its glyph on frame row `.0` ([`rule_mask`], [`Self::stamps`]).
+    /// The rule's coverable run and its glyph on frame row `.0` ([`rule_mask_into`], [`Self::stamps`]).
     rule_run: std::cell::Cell<Option<KeptRun>>,
     /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`], [`Self::rule_run`]).
     top_run: std::cell::Cell<Option<KeptTop>>,
@@ -1117,7 +1119,8 @@ impl PaneTextCache {
 #[derive(Debug, Default)]
 struct PaneFooter {
     session: u64,
-    /// What [`Self::shown`] is made of: the facts the timeline holds for the group in front.
+    /// What [`Self::shown`] is made of: the facts the timeline holds for the group in front, the
+    /// launch card it keeps for them, the usage switch and the facts the person hid.
     from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool, FactMask)>,
     /// The live upgrade's note the timeline holds for the pane ([`Self::lay_upgrade`]).
     note: Option<footer::UpgradeNote>,
@@ -1177,7 +1180,7 @@ struct RuleKey {
     lit: Option<FactKind>,
 }
 
-/// Every part of a chips' block.
+/// Every part of a chips' block a composition reads.
 #[derive(Debug, Default)]
 struct BlockCopy {
     lights: Vec<RenderCell>,
@@ -1272,7 +1275,8 @@ impl PaneFooter {
         }
     }
 
-    /// Lay in the upgrade's words for a composer that holds a draft.
+    /// Lay in the upgrade's words for a composer that holds a draft (`Some(true)`) or none
+    /// (`Some(false)`).
     fn lay_upgrade(&mut self, draft: Option<bool>) {
         let words = draft.and_then(|draft| self.note.as_ref()?.words(draft));
         if self.shown.upgrade.as_ref() != words {
@@ -1545,7 +1549,8 @@ fn post_log_moved(session: u64) {
     }
 }
 
-/// One resolution: the session ([`LogWake`]).
+/// One resolution: the session, its timeline and the Claude Code process, and what a moved log
+/// wakes ([`LogWake`]).
 #[derive(Clone)]
 struct Job {
     session: u64,
@@ -1578,8 +1583,8 @@ impl From<crate::claude_registry::Told> for Command {
     }
 }
 
-/// The one background thread footer facts are read on, started on first use and shared by both
-/// askers.
+/// The one background thread footer facts are read on, started on first use and shared by every
+/// asker.
 static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
 /// Requests an off-thread footer-fact refresh for `pgid` into `timeline`.
@@ -1682,7 +1687,8 @@ struct WatchSchedule {
     watched: HashMap<u64, Watch>,
 }
 
-/// One watched session: its latest job ([`IDLE_RECHECK`], [`crate::claude_registry`]).
+/// One watched session: its latest job, when it was last asked for and last read
+/// ([`IDLE_RECHECK`]), and whether its process is awaited ([`crate::claude_registry`]).
 struct Watch {
     job: Job,
     asked: std::time::Instant,
@@ -1702,7 +1708,9 @@ struct Accepted {
 }
 
 impl WatchSchedule {
-    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask ([`still_watched`]).
+    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask, unless `walled_alive`
+    /// says the session's footer shows a wall or weekly percentage and its process lives
+    /// ([`still_watched`]).
     fn prune(&mut self, now: std::time::Instant, mut walled_alive: impl FnMut(u64, &Job) -> bool) {
         self.watched.retain(|session, watch| {
             still_watched(now, watch.asked, || walled_alive(*session, &watch.job))
@@ -1770,7 +1778,7 @@ impl WatchSchedule {
     }
 
     /// Watch `job`, asked for and read at `asked`, that read having found its process's registry
-    /// row.
+    /// row (`row`) or not.
     fn watch(&mut self, job: Job, asked: std::time::Instant, row: bool) {
         self.owed
             .retain(|(_, pending)| pending.session != job.session);
@@ -1813,7 +1821,8 @@ impl WatchSchedule {
         jobs
     }
 
-    /// `session` was read at `at`, the read having found its process's registry row.
+    /// `session` was read at `at`, the read having found its process's registry row (`row`) or
+    /// not.
     fn read(&mut self, session: u64, at: std::time::Instant, row: bool) {
         if let Some(watch) = self.watched.get_mut(&session) {
             watch.read = at;
@@ -1870,7 +1879,8 @@ const MAX_KEPT: usize = 64;
 /// watches, still live ([`ProcessTails`]).
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
-/// The transcript caches ([`WATCH_FOR`]).
+/// The transcript caches of the Claude Code processes the resolver has read, keyed by process,
+/// not by watch ([`WATCH_FOR`]).
 #[derive(Default)]
 struct ProcessTails {
     kept: HashMap<(i32, Option<u64>), KeptTail>,
@@ -1966,14 +1976,15 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>, registry: crate::claude_registry
     }
 }
 
-/// The resolver thread's whole state ([`run`]): its schedule ([`Asks`]).
+/// The resolver thread's whole state ([`run`]).
 struct Resolver {
-    /// Per session: its latest job ([`IDLE_RECHECK`], [`Watch`]).
+    /// Per session: its latest job, when it was last asked for and last read ([`IDLE_RECHECK`]),
+    /// and whether its process is awaited ([`Watch`]).
     schedule: WatchSchedule,
     known: HashMap<u64, Identity>,
     /// Per PROCESS: its transcript-tail memo, kept while the process lives.
     tails: ProcessTails,
-    /// Per watched session.
+    /// Per watched session: its usage fold.
     folds: HashMap<u64, footer::FooterCache>,
     /// Sessions whose footer has a wall or weekly percentage to expire on the slow clock.
     walled: HashSet<u64>,
@@ -1997,7 +2008,9 @@ impl Resolver {
         }
     }
 
-    /// Before the thread sleeps at `now`.
+    /// Before the thread sleeps at `now`: the watches whose time is up go, with what the reads
+    /// hold for their sessions, the tails of processes gone, and the registry watches nothing
+    /// awaits now.
     fn retain(&mut self, now: std::time::Instant) {
         let walled = &self.walled;
         self.schedule.prune(now, |session, job| {
@@ -2131,7 +2144,7 @@ impl Resolver {
     }
 }
 
-/// The resolver's state one read touches: per session.
+/// The resolver's state one read touches.
 struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
@@ -2322,7 +2335,7 @@ struct Identity {
     started: Option<u64>,
     dir: Option<PathBuf>,
     launch: LaunchFacts,
-    /// The image (`startedAt`) `launch`.
+    /// The image (`startedAt`) `launch`, `login` and `argv` were read for.
     launch_for: Option<Option<u64>>,
     /// What the process's exec environment says of its login.
     login: Option<accounts::ProcessLogin>,
@@ -2335,6 +2348,10 @@ struct Identity {
     login_checked_for: Option<(Option<u64>, PathBuf)>,
     /// Settings, provider and profile-store evidence leave the stored login selected.
     stored_login: bool,
+    /// Why no relaunch line of this image's argv in its directory would carry the usage tap,
+    /// judged beside [`Self::stored_login`] ([`tap_line_refusal`]: its options and settings;
+    /// its home and login are judged at each read, [`tap_refusal`]); `None` where one would.
+    unoffered: Option<tap::Refusal>,
     /// Exact captured exec environment, fingerprinted without retaining credentials.
     env_stamp: Option<[u8; 32]>,
 }
@@ -2382,6 +2399,13 @@ pub(crate) fn claude_dir_of_args(
 /// ([`accounts::ProcessLogin::of_exec_env`]).
 fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<accounts::ProcessLogin> {
     accounts::ProcessLogin::of_exec_env(&args?.env)
+}
+
+/// The value `name` has in exec environment `env` (`KEY=value` entries), where it is set.
+fn env_value(env: &[String], name: &str) -> Option<String> {
+    env.iter()
+        .find_map(|entry| entry.strip_prefix(name)?.strip_prefix('='))
+        .map(str::to_owned)
 }
 
 /// Reuse an image's auth verdict only for its exact captured environment.
@@ -2443,14 +2467,72 @@ struct Asks {
     roster: fn() -> Option<accounts::Roster>,
     home: fn() -> Option<PathBuf>,
     stored_login: fn(u32, &[String], &str) -> bool,
+    tap: TapAsks,
 }
 
-/// [`process_args`], [`live_roster`] and [`aterm_types::dirs::home_dir`].
+/// What a read asks of the usage tap ([`Asks::tap`]).
+#[derive(Clone, Copy)]
+struct TapAsks {
+    /// The window's seat ([`TapSeat`]), asked at each read whose profile passed its gate.
+    seat: fn() -> TapSeat,
+    /// Whether the settings chain a relaunch line of the process's argv in its directory reads
+    /// admits the tap, read as the relaunch reads it (`upgrade_drive::tap_settings_admit`),
+    /// asked once per image beside [`Asks::stored_login`].
+    settings: fn(&[String], &str) -> bool,
+    /// Whether aterm's restart in place is offered for process `pid` in tab `tab` now
+    /// ([`crate::restart_act::offered_for`]), asked at a read whose footer would promise it.
+    restart: fn(&str, u32) -> bool,
+}
+
+/// A window with no usage tap: no seat, every settings chain quiet, every restart offered.
+#[cfg(test)]
+const NO_TAP: TapAsks = TapAsks {
+    seat: TapSeat::default,
+    settings: |_, _| true,
+    restart: |_, _| true,
+};
+
+/// What the usage tap gives a read ([`TapAsks::seat`]).
+#[derive(Clone, Debug, Default)]
+struct TapSeat {
+    /// `[harness] usage_tap` is on and the harness supervises Claude Code
+    /// ([`crate::harness_host::usage_tap_on`]).
+    on: bool,
+    /// An aterm the tap's command can name ([`tap::stable_exe`]).
+    named: bool,
+    /// Where its readings are ([`tap::rl_dir_in`]).
+    dir: Option<PathBuf>,
+    /// The harness state whose accounts store holds this machine's own home's weeks and
+    /// walls ([`own_stored_week`]) and its lone login (`tap::Armed::lone_login`); `None`
+    /// where the home read is not this machine's own.
+    store: Option<PathBuf>,
+}
+
+/// [`TapSeat`] as this window has it now: its readings in the directory `aterm harness tap`
+/// writes them to ([`tap::rl_dir`]).
+fn live_tap() -> TapSeat {
+    let state = crate::harness_host::harness_state();
+    let own_home = aterm_types::dirs::home_dir()
+        .is_some_and(|home| aterm_primer::home_dir().as_ref() == Some(&home));
+    TapSeat {
+        on: crate::harness_host::usage_tap_on(),
+        named: tap::stable_exe().is_some(),
+        dir: state.as_deref().map(tap::rl_dir_in),
+        store: state.filter(|_| own_home),
+    }
+}
+
+/// [`process_args`], [`live_roster`], [`aterm_types::dirs::home_dir`] and [`live_tap`].
 const LIVE: Asks = Asks {
     args: process_args,
     roster: live_roster,
     home: aterm_types::dirs::home_dir,
     stored_login: crate::harness_netprobe::stored_login_of_agent,
+    tap: TapAsks {
+        seat: live_tap,
+        settings: crate::harness_netprobe::tap_settings_admit_line,
+        restart: crate::restart_act::offered_for,
+    },
 };
 
 /// [`resolve_into`], then wake the loop when the facts moved.
@@ -2480,6 +2562,7 @@ fn resolve_and_post(
         task: None,
         login_checked_for: None,
         stored_login: false,
+        unoffered: None,
         env_stamp: None,
     });
     if identity.launch_for.is_none() {
@@ -2685,12 +2768,14 @@ fn resolve_facts_at_with_cwd(
                 {
                     identity.stored_login = false;
                     if identity.launch_for == Some(entry.started_at) {
-                        identity.stored_login = u32::try_from(identity.pid)
-                            .ok()
-                            .zip(entry.cwd.to_str())
-                            .is_some_and(|(pid, cwd)| {
-                                (asks.stored_login)(pid, &identity.argv, cwd)
-                            });
+                        let asked = u32::try_from(identity.pid).ok().zip(entry.cwd.to_str());
+                        identity.stored_login = asked.is_some_and(|(pid, cwd)| {
+                            (asks.stored_login)(pid, &identity.argv, cwd)
+                        });
+                        let tapped = tap::carried_by(&identity.argv);
+                        identity.unoffered = asked
+                            .filter(|_| !tapped)
+                            .and_then(|(_, cwd)| tap_line_refusal(identity, asks, cwd));
                         identity.login_checked_for = Some((entry.started_at, entry.cwd.clone()));
                     }
                 }
@@ -2828,6 +2913,7 @@ fn resolve_facts_at_with_cwd(
             {
                 return None;
             }
+            let tab = env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID);
             aterm_agent::harness::profile::subscription_and_plan_for(
                 &args.env,
                 &(asks.home)()?,
@@ -2836,58 +2922,30 @@ fn resolve_facts_at_with_cwd(
                 clock.now,
                 model.as_deref(),
             )
+            .map(|(shown, plan)| (shown, plan, tab))
         })
     });
     let plan = read.as_ref().and_then(|read| read.as_ref()?.1);
-    let mut subscription = read.map(|read| read.map(|(shown, _)| shown).unwrap_or_default());
+    // The account gate passed for this process's profile (`gated`): its own figures read
+    // below are its account's, and the store's are read only under its own login's label.
+    let gated = read
+        .as_ref()
+        .and_then(|read| read.as_ref())
+        .map(|(_, _, tab)| tab.clone());
+    let mut subscription = read.map(|read| read.map(|(shown, ..)| shown).unwrap_or_default());
     if let Some(facts) = facts.as_mut()
         && is_claude
     {
-        if let Some(sub) = subscription.as_mut()
-            && sub.weekly.is_none()
-        {
-            if facts
-                .usage
-                .as_ref()
-                .and_then(|u| u.wall.as_ref())
-                .is_some_and(|w| w.label == "7d")
-            {
-                sub.weekly = Some("weekly 0% left".into());
-            } else if (asks.home)().is_some_and(|h| aterm_primer::home_dir().as_ref() == Some(&h))
-                && let Some(state_root) = aterm_types::dirs::state_dir()
-                    .map(|r| r.join("harness").join(aterm_agent::harness::cli::HARNESS))
-                && let Ok((state, _)) = accounts::Store::at(&state_root).load(clock.now)
-            {
-                let label = facts
-                    .account
-                    .as_deref()
-                    .or(state.active.as_deref())
-                    .unwrap_or(aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL);
-                if let Some(acct) = state.accounts.get(label) {
-                    if acct
-                        .walls
-                        .get(accounts::WEEK_LIMIT)
-                        .is_some_and(|w| !w.cleared && w.until.is_some_and(|u| u > clock.now))
-                    {
-                        sub.weekly = Some("weekly 0% left".into());
-                    } else if let Some(win) = acct
-                        .windows
-                        .get("seven_day")
-                        .filter(|w| w.current(clock.now) && !w.cut())
-                    {
-                        let left = 100u32.saturating_sub(win.whole().min(100));
-                        sub.weekly = Some(format!("weekly {left}% left"));
-                    } else if let Some(sample) = acct
-                        .sample
-                        .as_ref()
-                        .filter(|s| s.week_reset.is_some_and(|r| r > clock.now))
-                        && let Some(used) = sample.week_pct
-                    {
-                        let left = 100u32.saturating_sub(used.min(100));
-                        sub.weekly = Some(format!("weekly {left}% left"));
-                    }
-                }
-            }
+        if let Some(sub) = subscription.as_mut() {
+            weekly_into(
+                sub,
+                facts,
+                identity,
+                gated.as_ref().map(Option::as_deref),
+                roster.at(std::time::Instant::now(), asks.roster),
+                asks,
+                clock.now,
+            );
         }
         facts.subscription = subscription.clone();
         facts.plan = plan;
@@ -2918,6 +2976,30 @@ fn resolve_facts_at_with_cwd(
         )
     });
     let row = facts.is_some();
+    if facts.is_none()
+        && identity.started.is_some()
+        && let Some(sub) = subscription.as_mut()
+    {
+        // A footer kept over a transient registry miss: its week judged as a fresh read's,
+        // read outside the timeline's lock.
+        let kept = {
+            let held = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (held.claude_footer_identity() == Some((identity.pid, identity.started)))
+                .then(|| held.claude_footer().cloned())
+                .flatten()
+        };
+        if let Some(kept) = kept {
+            weekly_into(
+                sub,
+                &kept,
+                identity,
+                gated.as_ref().map(Option::as_deref),
+                roster.at(std::time::Instant::now(), asks.roster),
+                asks,
+                clock.now,
+            );
+        }
+    }
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     if facts.is_none()
         && identity.started.is_some()
@@ -2959,6 +3041,254 @@ fn resolve_facts_at_with_cwd(
             timed: needs_recheck(&timeline),
         },
     )
+}
+
+/// THE WEEKLY FIGURE a Claude Code footer shows in `sub`, one age rule for every source
+/// ([`WeeklyFigure::words`]). Where the profile read passed its account gate (`gated`,
+/// naming the process's tab where its environment does), its own figures (the newer of
+/// this process's usage-tap reading, [`own_tap_figure`], and Claude Code's `/usage` cache as
+/// `sub` was read) say it while current; else a 7d wall in the transcript, or one the
+/// accounts store holds of this process's own account, says `weekly 0% left`; else the newest
+/// figure still shown (its own, aged, or the store's of its own account, [`own_stored_week`]);
+/// and where none is, why ([`WeeklyGap`]). `roster` is the accounts roster as the resolver
+/// read it, which names the account the store keeps this process's week under.
+fn weekly_into(
+    sub: &mut SubscriptionDisplay,
+    facts: &FooterFacts,
+    identity: &Identity,
+    gated: Option<Option<&str>>,
+    roster: Option<&accounts::Roster>,
+    asks: Asks,
+    now: i64,
+) {
+    let shown = |figure: Option<WeeklyFigure>| figure.filter(|f| f.words(now).is_some());
+    let tapped = tap::carried_by(&identity.argv);
+    sub.label = gated.and_then(|_| own_label(identity, roster, asks));
+    let seat = gated.map(|_| (asks.tap.seat)());
+    let reading = gated
+        .zip(seat.as_ref())
+        .and_then(|(tab, seat)| tab.filter(|_| tapped).zip(seat.dir.as_deref()))
+        .and_then(|(tab, dir)| own_tap_figure(identity, tab, dir));
+    let own = gated.and_then(|_| WeeklyFigure::newer(shown(sub.weekly_figure), shown(reading)));
+    let walled = facts
+        .usage
+        .as_ref()
+        .and_then(|u| u.wall.as_ref())
+        .is_some_and(|w| w.label == "7d");
+    let figure = match own.filter(|own| own.current(now)) {
+        Some(own) => Some(own),
+        None => {
+            let store = seat.as_ref().and_then(|seat| {
+                own_stored_week(identity, roster, asks, seat.store.as_deref()?, now)
+            });
+            if walled || store.is_some_and(|week| week.walled) {
+                sub.weekly = Some("weekly 0% left".into());
+                (sub.weekly_figure, sub.weekly_gap) = (None, None);
+                return;
+            }
+            WeeklyFigure::newer(own, store.and_then(|week| week.figure))
+        }
+    };
+    sub.weekly = figure.and_then(|figure| figure.words(now));
+    sub.weekly_figure = figure.filter(|_| sub.weekly.is_some());
+    sub.weekly_gap = seat.filter(|_| sub.weekly.is_none()).map(|seat| {
+        if tapped {
+            let stale = reading.is_some_and(|f| now.saturating_sub(f.at) > USAGE_SHOWN_S);
+            if stale {
+                WeeklyGap::Stale
+            } else {
+                WeeklyGap::NoReply
+            }
+        } else if !seat.on {
+            WeeklyGap::TapOff
+        } else if !seat.named {
+            WeeklyGap::Unoffered(tap::Refusal::Exe)
+        } else if let Some(why) = tap_refusal(identity, asks, roster, now) {
+            WeeklyGap::Unoffered(why)
+        } else if gated
+            .flatten()
+            .zip(u32::try_from(identity.pid).ok())
+            .is_some_and(|(tab, pid)| (asks.tap.restart)(tab, pid))
+        {
+            WeeklyGap::Untapped
+        } else {
+            WeeklyGap::Unrestarted
+        }
+    });
+}
+
+/// THIS PROCESS'S OWN USAGE-TAP FIGURE: the week of the reading its tap wrote for tab `tab`
+/// in `dir` since the process started ([`tap::Reading::read`]), whatever its age, for its own
+/// login in the default home only (the tap's words of its login and home, against the
+/// process's exec environment). A reading names no account: after a `/login` to another
+/// account inside the same login, the week the process last held reads as the new account's
+/// until a reply brings the new one's (the `/usage` cache names its account, and a cache of
+/// another is dropped when the profile is read).
+fn own_tap_figure(identity: &Identity, tab: &str, dir: &std::path::Path) -> Option<WeeklyFigure> {
+    let pid = u32::try_from(identity.pid).ok()?;
+    let started = i64::try_from(identity.started?).ok()?;
+    let login = identity.login.as_ref().filter(|login| login.default_home)?;
+    let (reading, _) = tap::Reading::read(dir, tab, pid, started)?;
+    let said = |value: Option<String>| value.filter(|value| !value.is_empty());
+    if said(reading.home).is_some() || said(reading.login) != login.login {
+        return None;
+    }
+    let week = reading.seven_day?;
+    Some(WeeklyFigure {
+        used_x10: week.x10(),
+        resets_at: week.resets_at,
+        at: reading.at,
+    })
+}
+
+/// WHY NO RELAUNCH LINE WOULD CARRY THE USAGE TAP for this process (`relaunch::tap_of`'s and
+/// `tap::gate`'s refusals), at each read: a Claude home or `HOME` of its own; a login no line
+/// taps as the machine's own (`tap::Armed::lone_for`: neither the default one, the lone one
+/// `roster`'s one row is bound to in the seat's store, nor, where the machine has none, one
+/// `roster` names), judged against the roster as it reads now; else the image's own reason
+/// ([`tap_line_refusal`], `Identity::unoffered`). `None` where a line would, and where its
+/// login was not read. Whether aterm restarts the tab at all is asked at each read
+/// (`TapAsks::restart`), not here. A process that carries the tap is not asked: its footer
+/// never says why a line would not (`weekly_into`).
+fn tap_refusal(
+    identity: &Identity,
+    asks: Asks,
+    roster: Option<&accounts::Roster>,
+    now: i64,
+) -> Option<tap::Refusal> {
+    let login = identity.login.as_ref()?;
+    let own_home = (asks.home)()
+        .zip(identity.dir.as_deref())
+        .is_some_and(|(home, dir)| tap::own_records(&home, dir));
+    if !login.default_home || !own_home {
+        return Some(tap::Refusal::Home);
+    }
+    if let Some(dir) = login.login.as_deref().filter(|dir| !dir.is_empty()) {
+        let lone = roster
+            .filter(|roster| roster.rows.len() == 1)
+            .and_then(|roster| {
+                let store = (asks.tap.seat)().store?;
+                accounts::Store::at(&store)
+                    .bound(roster, now)
+                    .ok()?
+                    .lone_login()
+                    .map(str::to_owned)
+            });
+        let listed = || {
+            roster.is_some_and(|roster| {
+                roster.row_for_login(Some(dir)).is_some() || roster.row_left(Some(dir)).is_some()
+            })
+        };
+        let tapped = match lone.as_deref() {
+            Some(lone) => lone == dir,
+            None => listed(),
+        };
+        if !tapped {
+            return Some(tap::Refusal::Login);
+        }
+    }
+    identity.unoffered
+}
+
+/// WHY NO RELAUNCH LINE OF THIS IMAGE'S ARGV IN `cwd` WOULD CARRY THE USAGE TAP, judged once per
+/// image beside its stored login: options no relaunch line can repeat, its own `--settings` or
+/// `--bare` (`tap::line_refusal`), or a settings chain that does not admit it
+/// (`TapAsks::settings`). `None` where a line would.
+fn tap_line_refusal(identity: &Identity, asks: Asks, cwd: &str) -> Option<tap::Refusal> {
+    if let Some(why) = tap::line_refusal(&identity.argv) {
+        return Some(why);
+    }
+    (!(asks.tap.settings)(&identity.argv, cwd)).then_some(tap::Refusal::Settings)
+}
+
+/// What the accounts store holds of one account's week ([`store_week`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StoreWeek {
+    /// A weekly wall stands.
+    walled: bool,
+    /// The newer of its usage-tap figure (not cut by a limit reset since) and its sample's,
+    /// while [`WeeklyFigure::words`] still says one.
+    figure: Option<WeeklyFigure>,
+}
+
+/// The store's figures of `acct`'s week at `now`, whatever their age: its usage-tap figure
+/// (`windows["seven_day"]`, not cut by a limit reset since) and its sample's
+/// ([`accounts::Sample::week`]), each while its window runs. A sample carries its weekly
+/// observation time separately from its publication time: a tap heartbeat keeps the held
+/// window's time, while a settled `/usage` panel is a new observation even when its figures
+/// match (`accounts::note_reading_held`, `accounts::note_sample`). Older records without that
+/// time use the sample's `at`. The footer ([`store_week`]) and the account menu's rows
+/// (`fact_menu::account_menu_rows_from`) judge their age.
+pub(crate) fn store_figures(acct: &accounts::Account, now: i64) -> [Option<WeeklyFigure>; 2] {
+    let window = acct.windows.get(accounts::WEEK_LIMIT);
+    let tapped = window
+        .filter(|w| w.current(now) && !w.cut())
+        .map(|w| WeeklyFigure {
+            used_x10: w.pct_x10,
+            resets_at: w.reset,
+            at: w.at,
+        });
+    let sampled = acct.sample.as_ref().and_then(|sample| {
+        let (pct, resets_at) = sample.week(now)?;
+        Some(WeeklyFigure {
+            used_x10: pct.saturating_mul(10),
+            resets_at,
+            at: sample.week_read_at.unwrap_or(sample.at),
+        })
+    });
+    [tapped, sampled]
+}
+
+/// [`StoreWeek`] of `acct` at `now`: the store's figures under the same age rule as the
+/// footer's own ([`WeeklyFigure::words`]), never only while their window runs.
+fn store_week(acct: &accounts::Account, now: i64) -> StoreWeek {
+    let shown = |figure: Option<WeeklyFigure>| figure.filter(|f| f.words(now).is_some());
+    let [tapped, sampled] = store_figures(acct, now);
+    StoreWeek {
+        walled: acct
+            .walls
+            .get(accounts::WEEK_LIMIT)
+            .is_some_and(|w| !w.cleared && w.until.is_some_and(|until| until > now)),
+        figure: WeeklyFigure::newer(shown(tapped), shown(sampled)),
+    }
+}
+
+/// [`store_week`] of THIS PROCESS'S OWN ACCOUNT, from the accounts store under harness state
+/// `store`: only for a process in the machine's default Claude home and `HOME` (the only one
+/// whose readings the store keeps, `harness_host`'s tap step), under the label its own login
+/// is judged to (`accounts::judged_label` over `roster`, the machine's own row where it lists
+/// none, as the tap's note judges it); `None` for any other process, and where no label is
+/// judged, so no other account's week or wall reaches its footer.
+fn own_stored_week(
+    identity: &Identity,
+    roster: Option<&accounts::Roster>,
+    asks: Asks,
+    store: &std::path::Path,
+    now: i64,
+) -> Option<StoreWeek> {
+    let label = own_label(identity, roster, asks)?;
+    let (state, _) = accounts::Store::at(store).load(now).ok()?;
+    Some(store_week(state.accounts.get(&label)?, now))
+}
+
+/// THE ROSTER LABEL OF THIS PROCESS'S OWN ACCOUNT, for a process in the machine's default Claude
+/// home and `HOME` only: the label its own login is judged to (`accounts::judged_label` over
+/// `roster`, the machine's own row where it lists none), as the tap's note judges it. The
+/// store's week is read under it ([`own_stored_week`]), and the account menu's row it names is
+/// the only one the footer's week reaches (`SubscriptionDisplay::label`).
+fn own_label(identity: &Identity, roster: Option<&accounts::Roster>, asks: Asks) -> Option<String> {
+    let login = identity.login.as_ref().filter(|login| login.default_home)?;
+    let home = (asks.home)()?;
+    if !tap::own_records(&home, identity.dir.as_deref()?) {
+        return None;
+    }
+    let own = accounts::Roster::own();
+    let roster = roster.map(|roster| if roster.rows.is_empty() { &own } else { roster })?;
+    let who = accounts::ProcessLogin {
+        stored_login: login.stored_login && identity.stored_login,
+        ..login.clone()
+    };
+    accounts::judged_label(roster, &who).map(str::to_owned)
 }
 
 /// One known reset occurrence has arrived.
@@ -3126,7 +3456,7 @@ fn rule_mask(
     Some((mask, rule))
 }
 
-/// [`rule_mask`] into `mask`.
+/// `rule_mask` into `mask`.
 fn rule_mask_into(
     mask: &mut Vec<bool>,
     scratch: &RenderInput,
@@ -3822,7 +4152,8 @@ fn write_edits<'a>(
 }
 
 impl App {
-    /// Computes the combined repaint fingerprint of footer facts.
+    /// Computes the combined repaint fingerprint of footer facts, lights, card, and panel state
+    /// for window `wid`.
     pub(crate) fn claude_footer_fp(
         &self,
         wid: WindowId,
@@ -3976,7 +4307,7 @@ impl App {
         }
     }
 
-    /// The harness switch and the theme GEMINI CLI's or CODEX's top line.
+    /// The harness switch and the theme GEMINI CLI's or CODEX's top line (`prog`) wears.
     fn bare_top_harness(
         &self,
         ws: &crate::WindowState,
@@ -5250,7 +5581,7 @@ fn read_rule_row(rows: &[String]) -> FooterRead {
     read_rule_under(rows, aterm_phase::phase::FrameReach::of(rows))
 }
 
-/// [`read_rule_row`] for a frame already found (`reach`).
+/// `read_rule_row` for a frame already found (`reach`).
 fn read_rule_under(rows: &[String], reach: aterm_phase::phase::FrameReach) -> FooterRead {
     reach.rules().map(|(_, rule)| RuleRead {
         rule,
@@ -5782,7 +6113,8 @@ fn switch_cell(
     cell
 }
 
-/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink`.
+/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink` quieted 30% toward the
+/// ground, then floored back to 4.5:1 against it.
 fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     legible_on(mix(ink, ground, 0.3), ground)
 }
@@ -5821,7 +6153,7 @@ const fn pack_rgb(c: [u8; 3]) -> u32 {
 struct FactInks {
     /// A value at rest ([`VALUE_LIFT`], [`value_fg`], [`legible_on`]).
     value: [u8; 3],
-    /// A lit value: the pane's ink, floored the same way.
+    /// A lit value: the pane's ink, floored to 4.5:1 ([`legible_on`]).
     lit: [u8; 3],
     /// A word greyed on purpose ([`greyed_on`]).
     stub: [u8; 3],
@@ -5897,7 +6229,8 @@ struct Rung {
     need: usize,
 }
 
-/// The most rungs a ladder has: a full rung a switch tier.
+/// The most rungs a ladder has: a full rung a switch tier, then the icon, the icon compact and
+/// the switch alone.
 const LADDER_MAX: usize = SWITCH_TIERS + 3;
 
 /// THE NARROW LADDER of a top line whose switch is `switch` ([`lay_top`]).
@@ -6039,7 +6372,8 @@ struct KeyFace {
 /// The ghost's cells.
 const GHOST_CELLS: usize = aterm_primer::CLAUDE_TOP_EFFORT_KEY.len() + 6;
 
-/// The shortest run the ghost is drawn in: itself.
+/// The shortest run the ghost is drawn in: itself, the `─` after it and the rule's lead of `─`
+/// before it.
 const GHOST_RUN: usize = GHOST_CELLS + 1 + footer::RULE_LEAD;
 
 /// The ghost's glyphs, in order.
@@ -6056,7 +6390,8 @@ struct ComposedTop {
     key: Option<TopKey>,
     cells: Vec<RenderCell>,
     col: usize,
-    /// Indices into `cells`: on a bare line ([`compose_top`]).
+    /// Indices into `cells`: on a bare line, the vendor's own cells the write leaves out
+    /// ([`compose_top`]).
     glass: std::ops::Range<usize>,
     switch: Option<LaidSwitch>,
     ghost: Option<(usize, usize)>,
@@ -6369,7 +6704,7 @@ impl HoverTitle<'_> {
     }
 }
 
-/// The widest hover title.
+/// The widest hover title whose words fit `room` cells.
 fn hover_title<'a>(
     product: &'a str,
     version: Option<&'a str>,
@@ -7503,6 +7838,10 @@ pub(crate) mod probe;
 #[path = "claude_footer_cost_tests.rs"]
 mod cost_tests;
 
+#[cfg(all(test, unix))]
+#[path = "claude_footer_weekly_tests.rs"]
+mod weekly_tests;
+
 #[cfg(test)]
 #[path = "claude_footer_top_tests.rs"]
 mod top_tests;
@@ -7531,7 +7870,7 @@ pub(crate) mod rig {
 
     use aterm_agent::harness::footer;
 
-    use super::{Asks, Identity, LaunchFacts, LogWake, RosterMemo};
+    use super::{Asks, Identity, LaunchFacts, LogWake, NO_TAP, RosterMemo};
     use crate::session_log::transcript::Applied;
     use crate::session_timeline::SessionTimeline;
 
@@ -7597,9 +7936,11 @@ pub(crate) mod rig {
             task: None,
             login_checked_for: None,
             stored_login: false,
+            unoffered: None,
             env_stamp: None,
         };
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| {
                 Some(atpkg::caller_shell::ProcArgs {
                     argv: vec!["claude".into()],
@@ -8750,6 +9091,7 @@ mod tests {
                     task: None,
                     login_checked_for: None,
                     stored_login: false,
+                    unoffered: None,
                     env_stamp: None,
                 },
             );
@@ -8917,6 +9259,7 @@ mod tests {
             wake: LogWake::new(false),
         };
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| None,
             roster: || None,
             home: scratch_home,
@@ -9046,6 +9389,7 @@ mod tests {
             wake: LogWake::new(false),
         };
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| args(false),
             roster: || None,
             home: scratch_home,
@@ -9206,6 +9550,7 @@ mod tests {
             task: None,
             login_checked_for: None,
             stored_login: false,
+            unoffered: None,
             env_stamp: None,
         }
     }
@@ -9274,6 +9619,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| {
                 let root = super::rig::home_root("footer-subscription-resolve");
                 Some(args_of(&[
@@ -9396,7 +9742,7 @@ mod tests {
                         email: Some("first@example.test".into()),
                         plan: Some("Muse Code Max Usage".into()),
                         weekly: Some("weekly 29% left".into()),
-                        weekly_reset: None,
+                        ..Default::default()
                     },),
                     ..FooterFacts::default()
                 }),
@@ -9407,6 +9753,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| {
                 let root = crate::test_scratch::process_root("footer-muse-account-switch");
                 Some(atpkg::caller_shell::ProcArgs {
@@ -9591,6 +9938,7 @@ mod tests {
         let mut fold = footer::FooterCache::default();
         let mut memo = RosterMemo::default();
         let asks = Asks {
+            tap: NO_TAP,
             args,
             roster: || None,
             home: scratch_home,
@@ -9710,6 +10058,7 @@ mod tests {
         let profile =
             aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| {
                 let root = super::rig::home_root("footer-subscription-expiry");
                 Some(args_of(&[
@@ -9721,8 +10070,10 @@ mod tests {
             home: scratch_home,
             stored_login: |_, _, _| true,
         };
-        for (reset, expires_after) in [("2099-01-01T00:00:00Z", 900), ("2026-10-15T07:50:50Z", 650)]
-        {
+        for (reset, expires_after) in [
+            ("2099-01-01T00:00:00Z", 3600),
+            ("2026-10-15T07:50:50Z", 650),
+        ] {
             let content = aterm_json::json!({
                 "oauthAccount": {
                     "accountUuid": "expiry-account",
@@ -9796,7 +10147,7 @@ mod tests {
                 schedule.watched.contains_key(&7),
                 "quota keeps the idle clock"
             );
-            for elapsed in (661..=961).step_by(60) {
+            for elapsed in (661..=3661).step_by(60) {
                 let at = asked + Duration::from_secs(elapsed as u64);
                 assert_eq!(schedule.next(at), Some(at));
                 assert!(schedule.due_idle(at).is_some());
@@ -9815,7 +10166,15 @@ mod tests {
                     assert!(elapsed <= expires_after + 60, "bounded by the slow clock");
                     break;
                 }
-                assert!(display.weekly.is_some());
+                let aged = elapsed > 900;
+                assert!(
+                    display
+                        .weekly
+                        .as_deref()
+                        .is_some_and(|words| words.ends_with(" ago") == aged),
+                    "past fifteen minutes, with its age: {elapsed} {:?}",
+                    display.weekly
+                );
             }
             assert!(schedule.watched.is_empty());
         }
@@ -9827,12 +10186,14 @@ mod tests {
         const PID: i32 = 4242;
         let (root, claude) = claude_home("footer-account", PID, 1_790_607_848);
         let listed = |args| Asks {
+            tap: NO_TAP,
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
             stored_login: |_, _, _| true,
         };
         let unasked = |args| Asks {
+            tap: NO_TAP,
             args,
             roster: || unreachable!("no login was read: the roster is not asked"),
             home: scratch_home,
@@ -9855,6 +10216,7 @@ mod tests {
         };
         assert_eq!(read(listed(nobody)), (Some(None), true), "no row names it");
         let none = Asks {
+            tap: NO_TAP,
             args: on_main,
             roster: || None,
             home: scratch_home,
@@ -9883,6 +10245,7 @@ mod tests {
         );
         std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
         let nothing = Asks {
+            tap: NO_TAP,
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
@@ -9911,6 +10274,7 @@ mod tests {
         )
         .unwrap();
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
@@ -9942,6 +10306,7 @@ mod tests {
         assert_eq!(excerpts.task, None, "no task file named");
         std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
         let nothing = Asks {
+            tap: NO_TAP,
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
@@ -9959,6 +10324,7 @@ mod tests {
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
         timeline.lock().unwrap().note_foreground_group(PID);
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
@@ -10066,6 +10432,7 @@ mod tests {
         const IMAGE: u64 = 1_790_607_848;
         let (root, claude) = claude_home("footer-login", PID, IMAGE);
         let listed = |args| Asks {
+            tap: NO_TAP,
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
@@ -10208,7 +10575,7 @@ mod tests {
                 email: Some("jose\u{0301}👩‍💻@example.com".into()),
                 plan: Some("Pro".into()),
                 weekly: Some("weekly 29% left".into()),
-                weekly_reset: None,
+                ..Default::default()
             }),
             ..FooterFacts::default()
         };
@@ -11952,6 +12319,7 @@ mod tests {
             &mut RosterMemo::default(),
             (
                 Asks {
+                    tap: NO_TAP,
                     args: |_| None,
                     roster: || None,
                     home: || None,
@@ -12188,6 +12556,7 @@ mod tests {
                 .clone()
         };
         let asks = Asks {
+            tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,

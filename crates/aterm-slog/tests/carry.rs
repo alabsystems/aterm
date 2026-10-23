@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The carry across a seamless update (design §5.2, phase 2A).
+//! Seamless-update carry tests for `aterm-slog`.
 
 use aterm_slog::{
     Actor, BoxWord, CarryAdopt, CarryBudget, CarryError, Close, Conf, Cursor, Fields, Fold, GapWhy,
@@ -12,8 +12,6 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::{WALL0, agent_session, at};
 
-/// Seeded traffic on an agent session: turns with steps and verdict marks,
-/// needs, claims, mail, commands.
 fn traffic(log: &mut Log, rng: &mut XorShift, n: usize, ms0: u64) -> Node {
     let run = log
         .open_nodes()
@@ -140,8 +138,6 @@ fn adopt_at(log: &Log, ms: u64) -> CarryAdopt {
     }
 }
 
-/// The receiver accepts the same mandatory excess the live ring permits,
-/// without accepting an arbitrary overfull ring of ordinary detail.
 #[test]
 fn a_carry_of_a_legal_over_cap_open_path_reads_under_the_same_limits() {
     let limits = Limits::new(2, 1 << 20).expect("two records");
@@ -279,8 +275,6 @@ fn a_carry_of_a_legal_over_cap_open_path_reads_under_the_same_limits() {
     assert!(back.is_open(r) && back.is_open(t));
 }
 
-/// Content-tier fields accepted by the typed library API remain in RAM;
-/// neither the fold sidecar nor a closed summary may bypass the Host tier.
 #[test]
 fn carry_and_closed_summary_exclude_content_fields_from_the_fold() {
     let mut leaked = Vec::new();
@@ -365,10 +359,6 @@ fn carry_and_closed_summary_exclude_content_fields_from_the_fold() {
     assert!(leaked.is_empty(), "Content fields escaped RAM: {leaked:?}");
 }
 
-/// THE FOLD CROSSES AS IT STANDS: a snapshot restored folds on exactly as
-/// the original, over the same later records, for seeded traffic (needs,
-/// claims, totals, the open path, the newest closed nodes and every field's
-/// confidence).
 #[test]
 fn fold_snapshot_round_trips_and_folds_on_identically() {
     for seed in 1..=20u64 {
@@ -413,12 +403,6 @@ fn fold_snapshot_round_trips_and_folds_on_identically() {
     );
 }
 
-/// THE CARRIED LOG CONTINUES ITS PREDECESSOR: the successor holds the same
-/// records (at the host tier), the same open path with its rollups, the same
-/// fold, at the next epoch; its first new record is `mark - handoff
-/// carried= shed= epoch=` above the overlap's reserve; a reader of the
-/// predecessor's epoch reads on and is told `gap why=handoff` across the
-/// seqs it never held.
 #[test]
 fn a_carried_log_reads_like_its_predecessor_and_says_the_handoff_hole() {
     let mut rng = XorShift::new(9);
@@ -519,11 +503,6 @@ fn a_carried_log_reads_like_its_predecessor_and_says_the_handoff_hole() {
     assert!(continued.is_open(Node::SESSION));
 }
 
-/// THE CUT IS THE EVICTION ORDER: under a tight budget the carry sheds what
-/// memory would evict first (closed detail before the open records of
-/// closed turns, those before closes), never the open path, and counts each
-/// shed record as an eviction: in `lost=` and its nearest open node's
-/// rollup.
 #[test]
 fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
     let mut log = Log::new(1);
@@ -627,8 +606,6 @@ fn the_carry_cut_is_the_eviction_order_and_counts_what_it_shed() {
     );
 }
 
-/// A carry whose part that always crosses (the open path, the fold) passes
-/// 32 KiB is not made: the update then carries no records for the session.
 #[test]
 fn a_carry_whose_open_path_passes_32_kib_is_not_carried() {
     let mut small = Log::new(1);
@@ -702,8 +679,6 @@ fn a_carry_whose_open_path_passes_32_kib_is_not_carried() {
     );
 }
 
-/// A carried open node closes measured by the wall clock (`dur=wall`): its
-/// monotonic start is another process's.
 #[test]
 fn a_carried_open_node_closes_dur_wall() {
     let mut log = Log::new(1);
@@ -735,9 +710,6 @@ fn a_carried_open_node_closes_dur_wall() {
     assert!(line.contains(" dur_ms=40000 dur=wall "), "{line}");
 }
 
-/// THE TRACKER CROSSES MID-TURN: carried at any point of a verdict sequence,
-/// it writes what the uncarried one writes (the same turns, steps and
-/// outcomes), modulo the successor's seqs, its handoff mark and `dur=wall`.
 #[test]
 fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
     let script: Vec<(Verdict, u64)> = vec![
@@ -882,9 +854,6 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
     assert_eq!(carried.view(2000).last_close, plain.view(11_000).last_close);
 }
 
-/// ATTRIBUTION ACROSS AN UPDATE (by both clocks): an input an hour old is
-/// carried as nothing and attributes no turn in the successor, however young
-/// its clock; one 2 s old still does.
 #[test]
 fn a_carried_input_attributes_only_while_recent_by_the_wall() {
     let opened_by = |input_ms_ago: u64| -> Actor {
@@ -927,9 +896,6 @@ fn a_carried_input_attributes_only_while_recent_by_the_wall() {
     );
 }
 
-/// THE READERS' FENCE: once a carry is taken, readers see nothing past it
-/// until the fence lifts, the fold as it stood included; the log goes on
-/// recording.
 #[test]
 fn a_fenced_log_shows_readers_nothing_past_its_carry() {
     let mut log = Log::new(1);
@@ -972,10 +938,6 @@ fn a_fenced_log_shows_readers_nothing_past_its_carry() {
     );
 }
 
-/// HOSTILE CARRIES: flipped bytes, truncations, splices, huge numbers, seqs
-/// out of order, ids past the counters, an oversized carry: none panics; each
-/// is read whole or refused whole, and one read is a log that holds together
-/// (its records in order, its open nodes' open records live).
 #[test]
 fn a_hostile_carry_never_panics_and_is_refused_whole() {
     let mut rng = XorShift::new(17);
@@ -1156,9 +1118,6 @@ fn a_hostile_carry_never_panics_and_is_refused_whole() {
     ));
 }
 
-/// The carry's `ids=` never let a successor issue a node id the manifest's
-/// counters reserved: the successor takes the larger, and issues past a
-/// 16-bit id (a long session's commands pass 65,535 runs).
 #[test]
 fn a_carried_log_takes_the_manifests_reserved_ids() {
     let mut log = Log::new(1);
@@ -1183,12 +1142,6 @@ fn a_carried_log_takes_the_manifests_reserved_ids() {
     assert_eq!(n.n, 65_536);
 }
 
-/// THE SEQS A CARRY CONTINUES ARE ONES A LOG CAN REACH, AND BELOW THE
-/// MANIFEST'S COUNT: a head edited to near `u64::MAX` (or just past
-/// `SEQ_LIMIT`), or one at or above the count the successor is told to start
-/// from, refuses the carry, so no successor saturates and repeats its seqs or
-/// draws a ceiling below its own head (which would stand every later Commit
-/// down).
 #[test]
 fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
     let mut rng = XorShift::new(23);
@@ -1253,12 +1206,6 @@ fn a_carry_past_the_seq_limit_or_the_manifests_count_is_refused() {
     );
 }
 
-/// EVERY LINE A SENDER WRITES IS ONE ITS RECEIVER READS: a host line past
-/// the per-line bound (with its tag), or past the host lines' count or
-/// bytes, is left out, never written, and the carry reads with the rest of
-/// the host's lines; a tracker on a wall whose detail is of any length
-/// writes a line within the bound (the step's field as the log holds it) and
-/// its successor continues that wall with the same field.
 #[test]
 fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
     let mut log = Log::new(1);
@@ -1356,9 +1303,6 @@ fn a_host_line_past_the_bound_is_left_out_and_the_carry_reads() {
     assert!(refused(&over), "host lines one byte past their bytes");
 }
 
-/// One line put before line `i` of a carry, its header's line count raised
-/// to match: framed so the outer reader admits it, and only the fold's own
-/// agreement with the log can refuse it.
 fn with_line_at(lines: &[String], i: usize, line: String) -> Vec<String> {
     let mut v = lines.to_vec();
     v.insert(i, line);
@@ -1377,7 +1321,6 @@ fn with_line_at(lines: &[String], i: usize, line: String) -> Vec<String> {
     v
 }
 
-/// The index of `node`'s `fold open` line in a carry.
 fn fold_open_line(lines: &[String], node: Node) -> usize {
     lines
         .iter()
@@ -1385,8 +1328,6 @@ fn fold_open_line(lines: &[String], node: Node) -> usize {
         .expect("the node's fold open line")
 }
 
-/// An agent session's carry with a turn open under its run, and a `cmd`
-/// run before it the log holds closed.
 fn carried_turn() -> (Log, Node, Node, Node, Vec<String>) {
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
@@ -1411,8 +1352,6 @@ fn carried_turn() -> (Log, Node, Node, Node, Vec<String>) {
     (log, run, turn, ghost, out.lines)
 }
 
-/// a carried fold that tracks an open node
-/// twice disagrees with its log, which holds it open once.
 #[test]
 fn a_duplicated_fold_open_line_is_refused() {
     let (log, _, turn, _, lines) = carried_turn();
@@ -1449,9 +1388,6 @@ fn a_duplicated_fold_open_line_is_refused() {
     }
 }
 
-/// a carried fold's open node must be one the
-/// carried log holds open, of the same kind and under the same parent (the
-/// deepest open node above it).
 #[test]
 fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
     let (log, run, turn, ghost, lines) = carried_turn();
@@ -1499,9 +1435,6 @@ fn a_fold_open_line_for_a_node_the_log_does_not_hold_open_is_refused() {
     refused(&retyped, "the open run's fold line of another run kind");
 }
 
-/// a closed session holds
-/// nothing open, so a summary whose fold tracks an open node disagrees with
-/// it and is refused whole.
 #[test]
 fn a_closed_summary_whose_fold_holds_a_node_open_is_refused() {
     let mut log = Log::new(1);

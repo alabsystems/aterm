@@ -9,8 +9,6 @@ use aterm_render::{
     display_face_mix_for_family, display_face_scale, display_layer_ids, display_mix_face_index,
 };
 
-/// Every single face and every 2- and 3-face mix of the registry, in every
-/// order: the layers a person can switch on.
 fn every_layer() -> Vec<Vec<&'static str>> {
     let ids: Vec<&'static str> = DISPLAY_FACES.iter().map(|face| face.id).collect();
     let mut layers = Vec::new();
@@ -26,8 +24,6 @@ fn every_layer() -> Vec<Vec<&'static str>> {
     layers
 }
 
-/// Every SET of faces a person can switch on — each single face and each 2-
-/// and 3-face mix once, in registry order.
 fn every_set() -> Vec<Vec<&'static str>> {
     let rank = |id: &&str| DISPLAY_FACES.iter().position(|face| face.id == *id);
     every_layer()
@@ -36,9 +32,6 @@ fn every_set() -> Vec<Vec<&'static str>> {
         .collect()
 }
 
-/// The primaries the layer is drawn over: the embedded DejaVu Sans Mono and
-/// the bundled Iosevka Term, whose cells differ (Iosevka's is narrower and
-/// shorter), so a fit that only works in one cell fails here.
 fn primaries() -> Vec<(&'static str, &'static [u8])> {
     let mut faces = Vec::new();
     #[cfg(feature = "embedded-font")]
@@ -61,10 +54,6 @@ fn layered(primary: &[u8], ids: &[&str], px: f32) -> Renderer {
     renderer
 }
 
-/// THE GRID IS THE PERSON'S FONT'S. A display face is a layer over the
-/// primary, so turning one on — or mixing two or three, in either order —
-/// leaves the cell and baseline exactly the bare primary's: no column and no
-/// row is ever lost to a face.
 #[test]
 fn a_display_face_never_changes_the_grid() {
     for (name, primary) in primaries() {
@@ -83,9 +72,6 @@ fn a_display_face_never_changes_the_grid() {
     }
 }
 
-/// One set of faces draws ONE way: the layer is kept in registry order, so
-/// the order the switches were turned on in changes neither the grid, nor
-/// which face a letter takes, nor the glyph it draws.
 #[test]
 fn the_order_faces_were_switched_on_in_changes_nothing() {
     let (_, primary) = primaries()[0];
@@ -113,12 +99,6 @@ fn the_order_faces_were_switched_on_in_changes_nothing() {
     }
 }
 
-/// THE INVARIANT THE FIT EXISTS FOR: every glyph the layer draws is WHOLE and
-/// inside its cell — never wider than the cell (it would paint over its
-/// neighbour: "minecraft" drew as "m ncraft"), never above the cell's top
-/// (the first row's ink was cut at the window edge and under a pane header)
-/// and never below its floor — and never cut to get there: its ink is as tall
-/// as the face draws it at the fitted size.
 #[test]
 fn every_display_glyph_is_drawn_whole_inside_its_cell() {
     let fits: std::collections::HashMap<&str, _> = DISPLAY_FACES
@@ -199,7 +179,6 @@ fn every_display_glyph_is_drawn_whole_inside_its_cell() {
     }
 }
 
-/// A glyph raster as comparable facts: its box, placement and coverage.
 fn raster(img: &aterm_render::GlyphImage) -> (usize, usize, i32, i32, Vec<u8>) {
     (
         img.width(),
@@ -210,7 +189,6 @@ fn raster(img: &aterm_render::GlyphImage) -> (usize, usize, i32, i32, Vec<u8>) {
     )
 }
 
-/// The rows of a coverage mask `width` wide that carry ink.
 fn ink_rows(width: usize, coverage: &[u8]) -> usize {
     if width == 0 {
         return 0;
@@ -228,17 +206,11 @@ fn ink_rows(width: usize, coverage: &[u8]) -> usize {
     }
 }
 
-/// Which layer face draws `ch` (the pick the renderer makes).
 fn renderer_face_of(renderer: &Renderer, ch: char) -> &'static str {
     let faces = renderer.display_faces();
     faces[display_mix_face_index(ch, faces.len())]
 }
 
-/// The fit does not buy containment by drawing letters small: the scale is
-/// set by a typical letter (the median advance) and the ink band, never by
-/// the widest glyph (Cinzel's `Q` tail at 1.27 em would have drawn every
-/// letter at half size), so over either primary — Iosevka Term's cell is a
-/// narrow 0.5 em — a face keeps at least 0.7 of the size asked for.
 #[test]
 fn a_display_face_keeps_most_of_its_size() {
     for (name, primary) in primaries() {
@@ -258,8 +230,6 @@ fn a_display_face_keeps_most_of_its_size() {
     }
 }
 
-/// The scale is the largest that fits: a roomier cell never shrinks a face,
-/// the result never exceeds 1, and a degenerate cell still draws something.
 #[test]
 fn the_display_scale_is_monotone_and_bounded() {
     let fit = display_face_fit(display_face_bytes("chunky").unwrap()).unwrap();
@@ -352,9 +322,6 @@ fn a_first_row_draws_exactly_like_the_rows_below_it() {
     assert_eq!(row(0), row(3), "row 0 lost ink row 3 keeps");
 }
 
-/// THE CHROME IS THE PERSON'S FONT: Settings' code text, the palette and the
-/// Manual editor take their face from the terminal's primary
-/// (`chrome_primary_face`).
 #[test]
 fn the_chrome_face_is_the_primary_under_a_display_layer() {
     let plain = Renderer::from_system(16.0, Theme::default()).expect("a system font");
@@ -369,10 +336,6 @@ fn the_chrome_face_is_the_primary_under_a_display_layer() {
     assert!(face(&layered).is_some_and(|(bytes, _)| bytes != engraved));
 }
 
-/// A layer cell is not the primary's to shape: a primary with programming
-/// ligatures (Iosevka Term) ligates `=>` bare, and under the layer the
-/// letters the layer draws stay per-cell, so a primary ligature never
-/// replaces display-face letters.
 #[test]
 fn a_display_cell_is_never_ligated_by_the_primary() {
     let Some(iosevka) = aterm_render::bundled::face_for_id(aterm_render::bundled::IOSEVKA_ID)
@@ -407,8 +370,6 @@ fn a_display_cell_is_never_ligated_by_the_primary() {
     }
 }
 
-/// The monospaced bundled face (Monocraft, `pixel`) is not centred by its ink
-/// and takes no weight boost: its own bearings and weight are kept.
 #[test]
 fn the_monospaced_display_face_keeps_its_bearings_and_weight() {
     let fit =
@@ -417,9 +378,6 @@ fn the_monospaced_display_face_keeps_its_bearings_and_weight() {
     assert!(!fit.embolden, "no weight change");
 }
 
-/// A face that is NOT bundled is never a display face: the fit keys off the
-/// registry bytes, and the layer takes registry ids only, so a person's own
-/// font is the primary and draws as itself.
 #[test]
 fn only_a_bundled_face_is_ever_a_display_face() {
     #[cfg(feature = "embedded-font")]
@@ -432,8 +390,6 @@ fn only_a_bundled_face_is_ever_a_display_face() {
     assert!(renderer.display_faces().is_empty());
 }
 
-/// The proportional faces take the fit, so an asset swap that changes the bytes the registry
-/// lookup matches cannot leave the policy inert.
 #[test]
 fn proportional_display_faces_are_fitted() {
     for id in ["chunky", "engraved", "bubble"] {
@@ -447,8 +403,6 @@ fn proportional_display_faces_are_fitted() {
     }
 }
 
-/// The `display:` scheme is exact: every registry id resolves under it; bare ids, unknown
-/// ids and real family names never match, so an installed font cannot be shadowed.
 #[test]
 fn display_scheme_resolution_is_exact() {
     for font in DISPLAY_FACES {
@@ -468,9 +422,6 @@ fn display_scheme_resolution_is_exact() {
     assert!(display_face_ids_for_family("Menlo").is_none());
 }
 
-/// A `display:` family is a request for the layer, never a face: no resolver
-/// answers it — the catalogue batch and the config resolver both refuse it,
-/// saying where display faces are set — so the primary is always a real font.
 #[test]
 fn no_resolver_answers_a_display_family_with_a_face() {
     let requests = vec![(
@@ -490,8 +441,6 @@ fn no_resolver_answers_a_display_family_with_a_face() {
     assert!(refusal.contains("display_font"), "{refusal}");
 }
 
-/// Startup construction honors the scheme as a layer: the default font is the
-/// primary — its path, its grid — and the face is drawn over it.
 #[test]
 fn from_system_with_family_draws_a_display_family_over_the_default_font() {
     let plain = Renderer::from_system(16.0, Theme::default()).expect("a system font");
@@ -503,8 +452,6 @@ fn from_system_with_family_draws_a_display_family_over_the_default_font() {
     assert_eq!(renderer.display_faces(), vec!["engraved"]);
 }
 
-/// Mix parsing is exact: 1..=3 distinct known ids joined by `+`; anything else rejects the
-/// whole request, never a partial mix.
 #[test]
 fn display_mix_family_parsing_is_exact() {
     let solo = display_face_mix_for_family("display:pixel").expect("single id");
@@ -530,9 +477,6 @@ fn display_mix_family_parsing_is_exact() {
     }
 }
 
-/// End-to-end: a layered renderer routes every letter to the layer (each face
-/// covers ASCII), none to the primary, and the routing is stable across
-/// repeated lookups; each routed glyph owns exactly its cell.
 #[test]
 fn a_layer_routes_every_letter_across_its_faces() {
     let mut renderer = Renderer::from_system_with_family(
@@ -563,8 +507,6 @@ fn a_layer_routes_every_letter_across_its_faces() {
     assert_eq!(served.len(), 3, "every face of the mix draws some letter");
 }
 
-/// With ligatures on (the default), a display face alone or mixed never puts `.notdef` on
-/// screen: Monocraft's operator ligatures shape to glyph 0, so those runs stay per-cell.
 #[test]
 fn display_face_operators_never_shape_to_notdef() {
     let operators = "a => b -> c != d <= e >= f";
@@ -603,10 +545,6 @@ fn display_face_operators_never_shape_to_notdef() {
     }
 }
 
-/// THE LAYER SURVIVES EVERY REBUILD: `rebuild_from_admitted` (a zoom, a theme
-/// flip, the config hot-reload) and the semantic fork rebuild the renderer from
-/// copies, and each must carry the layer — the same faces, drawing the same
-/// glyphs in the same cell.
 #[test]
 fn the_layer_survives_a_rebuild_and_a_fork() {
     let mut base =
@@ -639,10 +577,6 @@ fn the_layer_survives_a_rebuild_and_a_fork() {
     }
 }
 
-/// A VARIATION CHANGE OR A NEW PRIMARY REFITS THE LAYER TO THE NEW CELL: the
-/// fit is computed from the cell the glyph is drawn into, so whatever the
-/// primary's geometry becomes, the pure read agrees with paint and every layer
-/// glyph stays inside the new cell.
 #[test]
 fn the_layer_follows_the_primary_into_a_new_cell() {
     let mut renderer =
@@ -678,8 +612,6 @@ fn the_layer_follows_the_primary_into_a_new_cell() {
     }
 }
 
-/// A `display_font` VALUE IS A HUMAN-TYPED CONFIG STRING, so it folds case like
-/// every other one.
 #[test]
 fn a_display_face_id_folds_ascii_case_like_every_other_config_value() {
     for (typed, want) in [

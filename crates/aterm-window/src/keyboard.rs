@@ -1,15 +1,10 @@
 // Copyright The winit contributors
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from winit 0.30.13 src/keyboard.rs,
-// modified by the aterm project in 2026 (see the repository NOTICE).
+// Derived from winit 0.30.13 src/keyboard.rs, modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Keyboard key and modifier types.
 
-// Variant names in `Key` and `KeyCode`, and their documentation, are derived from the W3C UI
-// Events KeyboardEvent `key` (https://www.w3.org/TR/2017/CR-uievents-key-20170601/) and `code`
-// (https://www.w3.org/TR/2017/CR-uievents-code-20170601/) specifications,
-// Copyright © 2017 W3C® (MIT, ERCIM, Keio, Beihang), under the license below.
+// Variant names in `Key` and `KeyCode`, and their documentation, are derived from the W3C UI Events KeyboardEvent `key` (https://www.w3.org/TR/2017/CR-uievents-key-20170601/) and `code` (https://www.w3.org/TR/2017/CR-uievents-code-20170601/) specifications, Copyright © 2017 W3C® (MIT, ERCIM, Keio, Beihang), under the license below.
 
 // Beginning of W3C License.
 //
@@ -855,6 +850,13 @@ impl Key<SmolStr> {
 
 impl NamedKey {
     /// Converts a named key to its approximate textual equivalent.
+    ///
+    /// ```
+    /// use aterm_window::keyboard::NamedKey;
+    ///
+    /// assert_eq!(NamedKey::Enter.to_text(), Some("\r"));
+    /// assert_eq!(NamedKey::F20.to_text(), None);
+    /// ```
     #[inline]
     pub const fn to_text(&self) -> Option<&'static str> {
         match self {
@@ -870,6 +872,14 @@ impl NamedKey {
 
 impl Key {
     /// Converts a key to its approximate textual equivalent.
+    ///
+    /// ```
+    /// use aterm_window::keyboard::{Key, NamedKey};
+    ///
+    /// assert_eq!(Key::Character("a".into()).to_text(), Some("a"));
+    /// assert_eq!(Key::Named(NamedKey::Enter).to_text(), Some("\r"));
+    /// assert_eq!(Key::Named(NamedKey::F20).to_text(), None);
+    /// ```
     #[inline]
     pub fn to_text(&self) -> Option<&str> {
         match self {

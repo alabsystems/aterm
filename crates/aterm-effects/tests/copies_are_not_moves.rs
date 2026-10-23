@@ -92,8 +92,6 @@ mod a2 {
             self.frame();
         }
 
-        /// `(followed, retired)` since `m`, then the frames `row` is lit over
-        /// the next ~1.4 s.
         fn verdict(&mut self, m: (u64, u64), row: u16) -> Outcome {
             let (f, r) = self.counts();
             let cells = self.cells(row);
@@ -542,7 +540,6 @@ mod a3 {
             Self { c, paced }
         }
 
-        /// Let `ms` pass with the frames the host would draw in that time.
         fn advance(&mut self, ms: u64) {
             let end = self.now + Duration::from_millis(ms);
             if !self.paced {
@@ -633,7 +630,6 @@ mod a3 {
         }
     }
 
-    /// A precondition of the case; a miss is a bad verdict, named.
     fn fixture(ok: bool, what: &str, o: Outcome) -> Outcome {
         if ok {
             o
@@ -1089,7 +1085,6 @@ mod l3c {
             self.now = end;
         }
 
-        /// Flat: `now += ms` with no frame. Paced: the frames due in `ms`.
         fn wait(&mut self, ms: u64) {
             if self.paced {
                 self.idle(ms);
@@ -1285,8 +1280,6 @@ mod l3c {
 mod d4 {
     use super::*;
 
-    /// T4: a line typed under an identical line (twins at arming), an edit the shape pass reads as
-    /// not evidence, then Ctrl-U `wait` ms later.
     fn t4(pace: Pace, edit: u8, wait: u64) -> Outcome {
         let mut h = PacedHost::new(24, 80, pace, false);
         h.land(b"\x1b[10;1H$ git status --short\r\n$ ");
@@ -1326,8 +1319,6 @@ mod d4 {
         Outcome::ff(f - m.0, r - m.1, lit)
     }
 
-    /// T5: a typo fixed in place in a line typed under a similar previous command (the fix makes
-    /// them agree at those columns), then the line killed `wait` ms later.
     fn t5(
         pace: Pace,
         above: &'static str,
@@ -1367,9 +1358,6 @@ mod d4 {
         Outcome::ff(f - m.0, r - m.1, lit)
     }
 
-    /// T7: `test lib` typed on row 9 above `$ test lib` on row 11, row 10 blank or (`near`)
-    /// holding `$ hest liv`; the line relocated onto row 10 in one write (caret with it), then
-    /// Ctrl-U `wait` ms later.
     fn t7(pace: Pace, near: bool, wait: u64) -> Outcome {
         let text = "test lib";
         let mut h = PacedHost::new(24, 80, pace, false);
@@ -1476,15 +1464,11 @@ fn all_cases() -> Vec<Case> {
     v
 }
 
-/// Four commands typed under an identical line, echoed one to forty keys a frame and zero to three
-/// frames late, then erased by Ctrl-U, Ctrl-W or Backspaces, on the full and the composed host.
 #[test]
 fn a_line_erased_under_its_twin_goes_nowhere() {
     holds(all_cases(), "a2.f1.twin_erase/");
 }
 
-/// fzf's list lands after the query's first keys, its best match holding the query's text above
-/// or (`--layout=reverse`) below the prompt; then Ctrl-U.
 #[test]
 fn fzf_s_list_landing_after_the_query_s_first_keys_is_not_where_the_query_went() {
     holds_where(all_cases(), |id| {
@@ -1492,8 +1476,6 @@ fn fzf_s_list_landing_after_the_query_s_first_keys_is_not_where_the_query_went()
     });
 }
 
-/// A popup opened after one to three keys, or an identical line drawn beside the command after its
-/// first keys, then the erase: records armed before learn the twin by time, those after at once.
 #[test]
 fn a_completion_menu_or_a_twin_drawn_late_is_not_where_the_line_went() {
     holds_where(all_cases(), |id| {
@@ -1501,16 +1483,11 @@ fn a_completion_menu_or_a_twin_drawn_late_is_not_where_the_line_went() {
     });
 }
 
-/// A full row budget still sees the twin: six to ten other bands resident
-/// (overflowing `WITNESS_ROWS`), then a line erased under its twin.
 #[test]
 fn a_full_row_budget_still_sees_the_twin() {
     holds(all_cases(), "a2.f3.");
 }
 
-/// Scrolls, band moves and alt screens: a bottom-row line, then a scroll writing
-/// a job notice and a copy on the new last row (`v0`); a scroll and erase on one
-/// frame; an alt-screen round trip.
 #[test]
 fn scrolls_band_moves_and_alt_screens_do_not_make_a_copy_an_arrival() {
     holds_but(
@@ -1520,8 +1497,6 @@ fn scrolls_band_moves_and_alt_screens_do_not_make_a_copy_an_arrival() {
     );
 }
 
-/// A streaming region's last row quotes the composer one or two rows up, then the composer is
-/// cleared.
 #[test]
 fn a_streamed_row_quoting_the_composer_two_rows_up_is_not_where_it_went() {
     holds_but(
@@ -1531,15 +1506,11 @@ fn a_streamed_row_quoting_the_composer_two_rows_up_is_not_where_it_went() {
     );
 }
 
-/// Ctrl-U and the next key in one SSH batch under fzf's info line, and a first item sharing only
-/// the query's directory.
 #[test]
 fn fzf_s_info_line_and_first_item_are_not_where_the_query_went() {
     holds_where(all_cases(), |id| id.starts_with("a2.ce"));
 }
 
-/// fzf redraws its list in the Ctrl-U batch with an item holding the query's text one or two rows
-/// away.
 #[test]
 fn fzf_re_sorting_its_list_under_ctrl_u_is_not_where_the_query_went() {
     holds_but(
@@ -1549,23 +1520,16 @@ fn fzf_re_sorting_its_list_under_ctrl_u_is_not_where_the_query_went() {
     );
 }
 
-/// A split or zoomed pane drops the rows past the caret's `±1` while a list streams above the
-/// query, then Ctrl-U: an undelivered row defers only a run the follow pass could carry, for one
-/// walk, never one the copy stood on unseen.
 #[test]
 fn a_row_the_composed_host_drops_is_not_a_door_for_a_copy() {
     holds(all_cases(), "a3.h5.");
 }
 
-/// Two to four bands resident, a query typed under a list, then Ctrl-U with the next key's echo
-/// 51–90 ms behind: the arming rows (the key's row and its `±1`) have their own slots.
 #[test]
 fn a_full_row_budget_hides_no_copy_behind_a_key() {
     holds(all_cases(), "a3.h4");
 }
 
-/// An alternating flicker: a copy drawn and erased on alternate frames one or
-/// two rows above for 100–800 ms, then the line erased.
 #[test]
 fn an_alternating_flicker_two_rows_up_is_not_where_the_line_went() {
     holds_but(
@@ -1575,7 +1539,6 @@ fn an_alternating_flicker_two_rows_up_is_not_where_the_line_went() {
     );
 }
 
-/// The pause, in ms, of `id`'s `/pause<n>/` segment.
 fn pause_of(id: &str) -> u64 {
     let at = id.find("/pause").expect("a paused case") + "/pause".len();
     id[at..]
@@ -1585,18 +1548,11 @@ fn pause_of(id: &str) -> u64 {
         .expect("a pause")
 }
 
-/// A copy erased `pause` ms after landing, before the witness saw it stand `TWIN_MIN` (the torn
-/// repaint's shape, a limit of every `a3.p*` family): up to 40 ms, or under the no-pet pacing
-/// (idle frames 110–130 ms apart, so it is seen on one frame only) up to `paced_until` ms, which
-/// each family sets from where its idle train stands.
 fn erased_before_it_stood_twin_min(id: &str, paced_until: u64) -> bool {
     let pause = pause_of(id);
     pause <= 40 || (id.ends_with("/paced") && pause <= paced_until)
 }
 
-/// A streamed quote, then Ctrl-U, at every pause and pacing: the composer quoted
-/// one or two rows up, Ctrl-U 20–900 ms later, at the flat train and both GUI
-/// pacings.
 #[test]
 fn a_streamed_quote_then_ctrl_u_at_every_pause_and_pacing() {
     holds_but(
@@ -1610,8 +1566,6 @@ fn a_streamed_quote_then_ctrl_u_at_every_pause_and_pacing() {
     );
 }
 
-/// fzf's list lands after four to six keys, Ctrl-U 20–900 ms after the last. Limit: the list after
-/// the last key (`k6`) erased before it stood `TWIN_MIN` (paced until 150 ms).
 #[test]
 fn fzf_s_late_list_then_ctrl_u_at_every_pause_and_pacing() {
     holds_but(
@@ -1621,8 +1575,6 @@ fn fzf_s_late_list_then_ctrl_u_at_every_pause_and_pacing() {
     );
 }
 
-/// A copy drawn on the row above after the last key, then the line cleared (redraw or kill)
-/// 20–900 ms later.
 #[test]
 fn a_copy_drawn_after_the_last_key_then_erased_at_every_pause_and_pacing() {
     holds_but(
@@ -1632,21 +1584,11 @@ fn a_copy_drawn_after_the_last_key_then_erased_at_every_pause_and_pacing() {
     );
 }
 
-/// vim's `yyp`, then `S`, at every pause and pacing: the row the band move
-/// opened is not clear until a frame shows it without the glyph, so the put
-/// copy is no arrival (`Witness::translate_band`).
 #[test]
 fn vim_s_yyp_then_s_at_every_pause_and_pacing() {
     holds(all_cases(), "a3.p4.");
 }
 
-/// A copy beside the line is not where the line went, on the flat 16 ms train
-/// and under the GUI's pacing once typing stops (16 ms only while a fade needs
-/// it, otherwise at the next deadline, 110–130 ms apart): a completion popup
-/// opened after two keys, then Ctrl-W; a copy of the line drawn after its
-/// first two keys; a copy a scroll wrote on the new last row, dated from the
-/// last walk before the scroll
-/// (`Witness::translate`).
 #[test]
 fn a_copy_beside_the_line_is_not_where_the_line_went_flat_and_paced() {
     holds_but(
@@ -1656,15 +1598,11 @@ fn a_copy_beside_the_line_is_not_where_the_line_went_flat_and_paced() {
     );
 }
 
-/// Two interior glyphs of a line typed under its twin overwritten and restored (or a torn read),
-/// then Ctrl-U: the shape pass forgives the rewrite and arms the caught-up record again
-/// (`Witness::shape_verdicts`), so the kill is an erase under a twin.
 #[test]
 fn a_glyph_caught_up_under_its_twin_is_armed_again() {
     holds(all_cases(), "d4.t4.");
 }
 
-/// The wait, in ms, of `id`'s `/wait<n>` segment.
 fn wait_of(id: &str) -> u64 {
     let at = id.find("/wait").expect("a waited case") + "/wait".len();
     id[at..]
@@ -1674,7 +1612,6 @@ fn wait_of(id: &str) -> u64 {
         .expect("a wait")
 }
 
-/// The limit: a line moved beside its twin and killed before the twin was learned lights the twin.
 #[test]
 fn the_limit_a_line_moved_beside_its_twin_and_killed_before_it_was_learned_lights_it() {
     holds_but(
@@ -1689,9 +1626,6 @@ fn the_limit_a_line_moved_beside_its_twin_and_killed_before_it_was_learned_light
     );
 }
 
-/// `git sattus --short` under `git status --short` (and three more shapes), fixed by Ctrl-T or two
-/// vi `r`s, then Ctrl-U 0–700 ms later: the fixed glyphs are armed again beside the copy, so they
-/// are twins at once.
 #[test]
 fn a_typo_fixed_in_place_under_the_previous_command_then_killed_goes_nowhere() {
     holds(all_cases(), "d4.t5.");

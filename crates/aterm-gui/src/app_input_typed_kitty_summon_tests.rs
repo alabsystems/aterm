@@ -58,9 +58,6 @@ fn drive_cursor_cat_momentum(app: &mut App, wid: WindowId, enabled: bool) {
     }
 }
 
-/// Host binding for the derived cursor-cat owner gate: with `cursor_trail = false` the
-/// echo-correlated momentum seam withholds the decisive pulse and the glass/capture predicate
-/// does not draw the ordinary branch; enabling the master proves the fixture can arm.
 #[test]
 fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     let model = cursor_cat_model();
@@ -159,10 +156,6 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     assert!(model.check_invariant("HelloIndependentOfTrailMaster", &off_spec));
 }
 
-/// Typing `dog` through the REAL input path summons the dog cameo — but
-/// only after the window has typed a lot ([`aterm_effects::kitty_summon`]'s
-/// `DOG_SUMMON_KEYS`), and nothing lands in the Kitty Log (dogs are
-/// visitors).
 #[test]
 fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     let mut app = App::headless_for_test();
@@ -196,9 +189,6 @@ fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     );
 }
 
-/// The word engine's "a human typed" witness is wired. A spent cat re-arms only on a committed
-/// edit keystroke, a signal only this input path produces, so a dropped seam would silently stop
-/// every retype replaying its cat.
 #[test]
 fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     use aterm_types::keyboard::Key;
@@ -245,9 +235,7 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     );
 }
 
-/// An app whose session sink writes to a test-owned pipe. The private fd matters: the ordering
-/// FIFO is a process-global registry keyed by PTY master, and every plain `headless_for_test`
-/// shares master `-1`, so pinning that key would divert concurrent tests' keystrokes.
+/// Build a headless app whose session sink writes to a private pipe.
 #[cfg(unix)]
 pub(super) fn app_with_private_pty() -> (
     App,
@@ -281,22 +269,17 @@ pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// A frame observing a key is presented at most one refresh after the key's edge (its dispatch
-/// inline, the writer's completed write when queued).
+/// Frame refresh interval for observing a key edge.
 #[cfg(unix)]
 pub(super) const OBSERVING_FRAME: Duration = Duration::from_millis(16);
 
-/// The clock of the `nth` (1-based) frame after the key edge `edge`
-/// ([`OBSERVING_FRAME`]): never before `edge` (an edge the caller has
-/// already observed), monotone in `nth` and in real time.
+/// Clock of the `nth` (1-based) frame after `edge`.
 #[cfg(unix)]
 pub(super) fn observing_frame(edge: Instant, nth: u32) -> Instant {
     Instant::now().min(edge + OBSERVING_FRAME * nth)
 }
 
-/// The delivery edge of a queued write: the newest of the `receipts`
-/// receipts `wid`'s session published past the window's baseline
-/// (`delivery_seen`), placed as the render prelude places it.
+/// Wait for `receipts` delivery receipts on `wid` and return the latest edge instant.
 #[cfg(unix)]
 pub(super) fn delivery_edge(app: &App, wid: WindowId, receipts: u64) -> Instant {
     let session = app.front_terminal(wid).expect("a terminal").session;
@@ -1033,10 +1016,7 @@ fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
     }
 }
 
-/// A real PTY pair whose slave this test puts into `lflag` mode, with no
-/// child: the master reflects the slave's termios directly (as aterm-pty's
-/// real-spawn test proves for IUTF8 + B230400), so the session sink
-/// reads what a `read -s` / raw TUI would set.
+/// Open a real PTY pair and apply `edit` to the slave's `c_lflag`.
 #[cfg(unix)]
 pub(super) fn pty_pair_with_lflag(edit: impl FnOnce(&mut libc::tcflag_t)) -> (i32, i32) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -1057,8 +1037,7 @@ pub(super) fn pty_pair_with_lflag(edit: impl FnOnce(&mut libc::tcflag_t)) -> (i3
     (master, slave)
 }
 
-/// A headless app on a real pty pair whose slave is in `lflag` mode, with
-/// the rainbow kitty trail on.
+/// Build a headless app on a real PTY pair with the rainbow kitty trail enabled.
 #[cfg(unix)]
 fn pty_app(
     edit: impl FnOnce(&mut libc::tcflag_t),
@@ -1093,10 +1072,7 @@ fn close_pty(
     }
 }
 
-/// The three tty modes a press can meet: cooked (a shell's baseline),
-/// canonical no-echo (`read -s`, `sudo`, an `ssh` passphrase) and raw
-/// (Claude Code's `setRawMode`, vim, ZLE at rest: the program echoes for
-/// itself), each with whether the tty echoes what is typed.
+/// TTY modes under test (cooked, canonical no-echo, and raw).
 #[cfg(unix)]
 type SetMode = fn(&mut libc::tcflag_t);
 #[cfg(unix)]
@@ -1578,8 +1554,6 @@ fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
     }
 }
 
-/// Typing `kitty` never wakes an animal on the input path: the screen scanner answers the echoed
-/// word with the ambient word-cat, centred on it.
 #[test]
 fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
     let mut app = App::headless_for_test();
@@ -1626,9 +1600,6 @@ fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
     );
 }
 
-/// Keys alone build no cat momentum: the metric builds only from a real
-/// keystroke correlated with its forward echo (the glow's
-/// `take_momentum_pulse`, fed in `cursor_frame`).
 #[test]
 fn key_only_input_builds_no_cat_momentum() {
     let mut app = App::headless_for_test();
@@ -1650,8 +1621,6 @@ fn key_only_input_builds_no_cat_momentum() {
     );
 }
 
-/// A word-breaking key (plain Enter) clears the run on the real path:
-/// `kit` ⏎ `ty` was never the typed word.
 #[test]
 fn enter_breaks_the_typed_run() {
     let mut app = App::headless_for_test();
@@ -1670,11 +1639,6 @@ fn enter_breaks_the_typed_run() {
     );
 }
 
-/// With sparkle words off, or the feline family off while other families
-/// keep the master on (`[sparkle_words.feline] enabled = false`), nothing
-/// can draw a cat, so the typed summon is inert: no companion, no log
-/// entry (a `head_peek` row would land in a category the config can never
-/// produce ambiently).
 #[test]
 fn summon_is_inert_with_sparkle_words_off() {
     use crate::app_config::{SparkleFelineConfig, SparkleWordsConfig};
@@ -1716,9 +1680,6 @@ fn summon_is_inert_with_sparkle_words_off() {
     }
 }
 
-/// Unresolved is not off: with the vocabulary on, the first keystroke
-/// summons before any frame has filled the cache, which is the state at
-/// launch and for a headless instance driven over the control socket.
 #[test]
 fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
     let mut app = App::headless_for_test();
@@ -1735,9 +1696,6 @@ fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
     );
 }
 
-/// Every granted summon is a fresh `(session, ident)` episode, so the
-/// dedupe ring (which absorbs recounts of one episode for its TTL) does not
-/// eat a later summon of the same session.
 #[test]
 fn each_granted_summon_logs_a_fresh_episode() {
     let mut app = App::headless_for_test();
@@ -1755,9 +1713,6 @@ fn each_granted_summon_logs_a_fresh_episode() {
     );
 }
 
-/// The typed summon logs the cat on glass: its roster row wears the
-/// companion verdict's look (the launch kitty, or the pinned favourite),
-/// never `KittyLook::default()`.
 #[test]
 fn a_typed_summon_records_the_verdicts_look() {
     use aterm_effects::kitty_registry::{KittyLook, glyph_key};

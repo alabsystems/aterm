@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A SESSION'S REPOSITORY HOLDS THAT NO REMOTE MAIN HAS: the probe behind the turn-end policy's repository suffix on Cruise's done check and Land's nudge (`supervise::policy::turn_end::repo_work_suffix`), and behind Land's fourth landing condition: no defense lands a task over a finding (Autopilot Land: all of the work in the remote main branch, no exceptions).
+//! WHAT A SESSION'S REPOSITORY HOLDS THAT NO REMOTE MAIN HAS.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long the whole probe may take ([`probe`]): every call shares it. A
-/// one-minute hang detector, never a latency budget: Land judges a defense
-/// by the probe, and a probe cut short reads as less work than the
-/// repository holds, so a defense landed over the rest. With ten seconds,
-/// under a CPU clamp beside 56 busy loops, the probes after two defenses ran
-/// out (the next exchange came 10.5 and 11.3 s after the screen was read)
-/// and both tasks landed, over an unpushed commit and over a changed file
-/// (docs/measured/typing-under-load-2026-10-22.md).
+/// How long the whole probe may take ([`probe`]).
 pub const PROBE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The most paths a finding names ([`RepoWork::paths`]).
@@ -22,8 +15,6 @@ pub const NAMED_PATHS: usize = 3;
 /// The most files the work's state is read over ([`RepoWork::state`]): past that it is not read.
 pub const STATE_FILES: usize = 4096;
 
-/// The longest path, in characters, a finding names whole: a longer one
-/// keeps its last characters after `…`.
 const PATH_CHARS: usize = 72;
 
 /// WHAT ONE REPOSITORY HOLDS THAT NO REMOTE MAIN HAS ([`probe`]).
@@ -39,13 +30,13 @@ pub struct RepoWork {
     pub stashes: usize,
     /// Commits on `HEAD` no remote-tracking ref contains.
     pub unpushed: usize,
-    /// Commits on `HEAD` the remote's default branch ([`Self::main_ref`]) does not contain, pushed elsewhere or not at all; zero where no default branch is known.
+    /// Commits on `HEAD` the remote's default branch ([`Self::main_ref`]) does not contain.
     pub unlanded: usize,
-    /// The remote default branch [`Self::unlanded`] counts against, as `git` names it short (`origin/main`); empty where none is known.
+    /// The remote default branch [`Self::unlanded`] counts against.
     pub main_ref: String,
     /// The first [`NAMED_PATHS`] changed or untracked paths, each printable ([`printable`]).
     pub paths: Vec<String>,
-    /// THE WORK'S STATE, hashed ([`state_of`]): `HEAD`'s commit, the stash entries of its branch, and every changed or untracked file git does not ignore (an untracked directory's files each), by its status code, its size and its modification time.
+    /// THE WORK'S STATE.
     pub state: Option<u64>,
 }
 
@@ -60,7 +51,7 @@ impl RepoWork {
             || self.unlanded > 0
     }
 
-    /// The finding of the reads' output: `repo` the top level, `status` the NUL-separated `git status --porcelain -z`, `stash` the stash entries of `HEAD`'s branch, one a line ([`stashes_on`]), `unpushed` the count of commits no remote-tracking ref contains, `unlanded` the count of commits the remote default branch `main_ref` (short, `origin/main`; empty where none is known) does not contain.
+    /// The finding of the reads' output.
     #[must_use]
     pub fn of_git(
         repo: &str,
@@ -100,7 +91,7 @@ impl RepoWork {
         work.found().then_some(work)
     }
 
-    /// WHETHER TWO PROBES FOUND THE SAME WORK, nothing in it touched between them: both found nothing, or both found the same finding and the same known state ([`Self::state`]).
+    /// WHETHER TWO PROBES FOUND THE SAME WORK.
     #[must_use]
     pub fn same(a: Option<&Self>, b: Option<&Self>) -> bool {
         match (a, b) {
@@ -110,7 +101,7 @@ impl RepoWork {
         }
     }
 
-    /// The finding in a few words, for the repository suffix and the journal: `/r: 2 changed, 1 untracked (a.rs, b/, …), 1 stash, 3 unpushed commits, 4 commits not on origin/main`.
+    /// The finding in a few words.
     #[must_use]
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -165,16 +156,10 @@ impl RepoWork {
     }
 }
 
-/// REPOSITORY HYGIENE & DRIFT FROM `origin/main` ([`probe_hygiene`]): how far
-/// `HEAD` has drifted from the target main branch (`ahead` / `behind`), local
-/// unsynced work (`changed`, `untracked`, `stashes`, `unpushed`), how many
-/// worktrees are attached, which local branches are diverging
-/// (`unmerged_branches`) or already merged and stale (`stale_branches`), and
-/// disk space accumulated in worktrees, temp/build directories, and drive free space.
+/// REPOSITORY HYGIENE & DRIFT FROM `origin/main` ([`probe_hygiene`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoHygiene {
-    /// Target main branch (`origin/main`, `origin/master`, or local `main`),
-    /// empty where none is known.
+    /// Target main branch (`origin/main`, `origin/master`, or local `main`).
     pub main_ref: String,
     /// Commits on `HEAD` not in `main_ref`.
     pub ahead: usize,
@@ -192,8 +177,8 @@ pub struct RepoHygiene {
     pub worktrees: usize,
     /// Local branches with commits not yet merged into `main_ref`.
     pub unmerged_branches: Vec<String>,
-    /// Local branches already merged into `main_ref` (besides `main`/`master`
-    /// and the current branch) that can be cleaned up.
+    /// Local branches already merged into `main_ref` (besides `main`/`master` and the current
+    /// branch) that can be cleaned up.
     pub stale_branches: Vec<String>,
     /// Bytes held across linked worktrees of this repository.
     pub worktree_bytes: u64,
@@ -213,12 +198,7 @@ fn join_named(names: &[String], cap: usize) -> String {
 }
 
 impl RepoHygiene {
-    /// Parse `git` outputs into [`RepoHygiene`]:
-    /// - `ahead_behind`: `git rev-list --left-right --count <main_ref>...HEAD`
-    ///   (`"<behind>\t<ahead>"`)
-    /// - `worktree_list`: `git worktree list --porcelain`
-    /// - `unmerged`: `git for-each-ref --no-merged=<main_ref> --format=%(refname:short) refs/heads`
-    /// - `merged`: `git for-each-ref --merged=<main_ref> --format=%(refname:short) refs/heads`
+    /// Parse `git` outputs into [`RepoHygiene`].
     #[must_use]
     pub fn of_git(
         main_ref: &str,
@@ -330,9 +310,7 @@ impl RepoHygiene {
         parts
     }
 
-    /// Compact note rows for the Branch & Hygiene menu (`crate::fact_menu`):
-    /// drift against `origin/main` + unsynced local work first, then worktree and
-    /// branch accumulation, then disk & drive space when present.
+    /// Compact note rows for the Branch & Hygiene menu (`crate::fact_menu`).
     #[must_use]
     pub fn notes(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -383,8 +361,7 @@ impl RepoHygiene {
         out
     }
 
-    /// Compact note rows for the Folder (`Fact::Path`) menu: worktrees, temp/build
-    /// disk space, drive free space, and unsynced local file counts.
+    /// Compact note rows for the Folder (`Fact::Path`) menu.
     #[must_use]
     pub fn folder_notes(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -400,7 +377,7 @@ impl RepoHygiene {
     }
 }
 
-/// THE DIRECTORY THE SESSION WORKS IN, for [`probe`]: the last `cwd` the conversation's transcript tail `tail` records (Claude Code writes the shell's working directory on each row, so a `cd` into a worktree moves it), else the directory the agent was started in (`started`, the process's own).
+/// THE DIRECTORY THE SESSION WORKS IN.
 #[must_use]
 pub fn session_dir(started: &str, tail: Option<&str>) -> Option<std::path::PathBuf> {
     let written = tail.and_then(|t| {
@@ -422,7 +399,8 @@ pub fn session_dir(started: &str, tail: Option<&str>) -> Option<std::path::PathB
         .map(Path::to_path_buf)
 }
 
-/// `text` with every control character, and every character that is no printable one, as `?`, and kept to [`PATH_CHARS`] characters (its end, after `…`): a path a typed line names can neither end the line nor fill the composer.
+/// `text` with every control character as `?`, kept to [`PATH_CHARS`] characters (its end,
+/// after `…`).
 #[must_use]
 pub fn printable(text: &str) -> String {
     let clean: String = text
@@ -437,7 +415,7 @@ pub fn printable(text: &str) -> String {
     format!("…{tail}")
 }
 
-/// WHAT THE REPOSITORY `dir` IS IN HOLDS THAT NO REMOTE MAIN HAS, by `git`, the whole probe within `limit`: `None` where nothing is found or the probe cannot run (the module's rules).
+/// WHAT THE REPOSITORY `dir` IS IN HOLDS THAT NO REMOTE MAIN HAS.
 #[must_use]
 pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> Option<RepoWork> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
@@ -536,8 +514,7 @@ pub fn probe_with(
     Some(work)
 }
 
-/// Probe repository hygiene and drift from `origin/main` (or local `main`) at
-/// `dir`, within `limit`: unattended and bounded by the same rules as [`probe`].
+/// Probe repository hygiene and drift from `origin/main` (or local `main`) at `dir`.
 #[must_use]
 pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option<RepoHygiene> {
     let home = home?;
@@ -797,7 +774,7 @@ fn bounded_dir_bytes(
     total
 }
 
-/// THE WORK'S STATE ([`RepoWork::state`]) of the repository at `root`: `head` its `HEAD` commit (empty where it has none), `stash` its branch's stash entries ([`stashes_on`]), `listed` the NUL-separated `git status --porcelain -z --untracked-files=all`, each entry hashed with its status code and the file's size and modification time (`-` for a path with no file, a deletion).
+/// THE WORK'S STATE ([`RepoWork::state`]) of the repository at `root`.
 #[must_use]
 pub fn state_of(root: &Path, head: &str, stash: &str, listed: &str) -> Option<u64> {
     let mut text = format!("{head}\n{stash}\n");
@@ -830,7 +807,7 @@ pub fn state_of(root: &Path, head: &str, stash: &str, listed: &str) -> Option<u6
     Some(aterm_hash::fnv1a_64(text.as_bytes()))
 }
 
-/// THE STASH ENTRIES OF ONE BRANCH among `list` (`git stash list --format=%gs`: each entry's subject, one a line), one a line: those Git wrote on `branch` (`WIP on <branch>: …`, or `On <branch>: …` for a message given), `None` for a detached `HEAD` (`(no branch)`).
+/// THE STASH ENTRIES OF ONE BRANCH among `list`.
 #[must_use]
 pub fn stashes_on(list: &str, branch: Option<&str>) -> String {
     let name = branch.unwrap_or("(no branch)");
@@ -841,10 +818,6 @@ pub fn stashes_on(list: &str, branch: Option<&str>) -> String {
         .collect()
 }
 
-/// WHETHER THE REPOSITORY AT `root` SETS ITS OWN `core.excludesFile`: its
-/// own configuration (`git config --includes --get`, the system and global
-/// files shut out as for every read here, so the local file, a worktree's and
-/// what they include answer).
 fn own_excludes(root: &Path, reads: &Reads<'_>) -> bool {
     git(
         root,
@@ -854,12 +827,6 @@ fn own_excludes(root: &Path, reads: &Reads<'_>) -> bool {
     .is_some_and(|p| !p.trim().is_empty())
 }
 
-/// THE PERSON'S GLOBAL EXCLUDES FILE, which the probe's `git` — run with no
-/// global configuration (the module's rules) — would not read:
-/// `core.excludesFile` as their global configuration sets it, the files it
-/// includes followed (`git config --global --includes --path --get`, with
-/// their home and `XDG_CONFIG_HOME` and nothing else), else Git's default,
-/// `<xdg>/git/ignore` (`<home>/.config/git/ignore` where `xdg` is unset).
 fn global_excludes(
     root: &Path,
     table: &aterm_sysprobe::volumes::Table,
@@ -894,10 +861,6 @@ fn global_excludes(
     (!atpkg::protected::under_protected_root(home, &path) && path.is_file()).then_some(path)
 }
 
-/// THE REMOTE'S DEFAULT BRANCH in the repository at `root`, as a full ref,
-/// for [`RepoWork::unlanded`]: `refs/remotes/origin/HEAD`'s target, else
-/// `refs/remotes/origin/main`, else `refs/remotes/origin/master` — the first
-/// that names a commit.
 fn main_ref(root: &Path, reads: &Reads<'_>) -> Option<String> {
     let head = git(
         root,
@@ -923,8 +886,6 @@ fn main_ref(root: &Path, reads: &Reads<'_>) -> Option<String> {
         })
 }
 
-/// Resolve the home and path before applying the lexical protected-root
-/// predicate.
 fn unattended_dir(
     dir: &Path,
     home: Option<&Path>,
@@ -946,29 +907,19 @@ fn unattended_dir(
     (!atpkg::protected::under_protected_root(&home, &dir)).then_some(dir)
 }
 
-/// `git <args>` in `dir`, with complete UTF-8 stdout and a successful exit.
 fn git(dir: &Path, args: &[&str], reads: &Reads<'_>) -> Option<String> {
     git_as(dir, args, reads, false)
 }
 
-/// What every read of one probe shares ([`git`]): its deadline, and the
-/// person's home and `XDG_CONFIG_HOME`.
 struct Reads<'a> {
     /// Every child shares it; expired calls do not start.
     deadline: Instant,
-    /// The person's home: every read's `HOME`, so a `~/` in a path the
-    /// repository's own configuration names expands as in their own `git`
-    /// (with none, Git dies on it at the first read: `fatal: failed to
-    /// expand user dir`, and the probe found nothing).
+    /// The person's home.
     home: &'a Path,
-    /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s
-    /// read alone.
+    /// The person's `XDG_CONFIG_HOME` (absolute), for [`global_excludes`]'s read alone.
     xdg: Option<&'a Path>,
 }
 
-/// [`git`], or with `global` the one read of the person's global
-/// configuration [`global_excludes`] makes: their `XDG_CONFIG_HOME` set, the
-/// global configuration not shut out.
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
     let deadline = reads.deadline;
     #[cfg(test)]
@@ -1010,9 +961,7 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
     String::from_utf8(output.stdout).ok()
 }
 
-/// A starved `git` for this thread's probes (tests), on the probe's clock:
-/// the time a starved read loses is taken as gone from the probe's deadline,
-/// with no sleep, so a test of the deadline spends no time of its own.
+/// A starved `git` for this thread's probes (tests).
 #[cfg(test)]
 mod read_stall {
     use std::cell::Cell;
@@ -1023,16 +972,14 @@ mod read_stall {
         static SPENT: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// The next read this thread starts is starved `ms` (0: none), and the
-    /// time starved so far starts again from nothing.
+    /// The next read this thread starts is starved `ms` (0: none).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) fn set(ms: u64) {
         NEXT.with(|n| n.set(ms));
         SPENT.with(|s| s.set(0));
     }
 
-    /// The time this thread's reads have lost so far, the read starting now
-    /// included.
+    /// The time this thread's reads have lost so far, the read starting now included.
     pub(super) fn spent() -> Duration {
         let next = NEXT.with(|n| n.replace(0));
         SPENT.with(|s| {

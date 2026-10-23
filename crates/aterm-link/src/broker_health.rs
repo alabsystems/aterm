@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BROKER'S OWN HEALTH: what a serving `aterm link broker` watches in the astream broker it runs, the one cure it applies itself.
+//! Broker health monitoring and poisoned-log handling.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,6 @@ use std::time::Duration;
 /// How often the serving loop looks for a poisoned log.
 pub const POLL: Duration = Duration::from_secs(2);
 
-/// [`POLL`] at test pace (`bridge::fast_timers`, a development seam a shipped build never reads).
 const FAST_POLL: Duration = Duration::from_millis(100);
 
 /// The serving loop's wake in this process: [`POLL`], or [`FAST_POLL`] at test pace.
@@ -25,17 +24,17 @@ pub(crate) fn poll() -> Duration {
 /// How often a serving broker has astream rewrite `<log>.health`.
 pub const HEALTH_EVERY: Duration = Duration::from_secs(30);
 
-/// The exit status of a broker that left its poisoned log for its supervisor to reopen.
+/// Exit status of a broker that left its poisoned log for its supervisor to reopen.
 pub const POISONED_EXIT: u8 = 75;
 
-/// The word every line the broker writes about a poisoned log names the condition by (the exit's, the `stay` seam's, a stop's over one).
+/// Word naming a poisoned log condition.
 pub const POISONED_WORDS: &str = "poisoned";
-/// The words that OPEN [`poisoned_line`] right after `<log>: `, the condition and the exit together, which doctor picks the remedy of a quoted `broker.err` line by (`enable.rs`'s `quoted_broker_fix`).
+/// Prefix of [`poisoned_line`] after `<log>: `.
 pub const POISONED_EXIT_WORDS: &str = "poisoned, exiting 75";
-/// The words of the line a broker no `aterm fabric on` job runs writes, which doctor tells it by.
+/// Phrase emitted when no `aterm fabric on` job runs the broker.
 pub const UNSUPERVISED_WORDS: &str = "no `aterm fabric on` job runs this broker";
 
-/// The one line a broker leaves when it exits over a poisoned log, naming astream's `reason` on one line.
+/// Format the diagnostic line emitted when a broker exits over a poisoned log.
 #[must_use]
 pub fn poisoned_line(log: &str, reason: &str, restart: Option<&str>) -> String {
     let head = format!("aterm link broker: {log}: {POISONED_EXIT_WORDS}");
@@ -49,14 +48,10 @@ pub fn poisoned_line(log: &str, reason: &str, restart: Option<&str>) -> String {
     }
 }
 
-/// `text` on one line: a line break in astream's reason would split the one
-/// line `broker.err`'s reader quotes.
 fn one_line(text: &str) -> String {
     text.replace(['\n', '\r'], " ")
 }
 
-/// The flushes a log has issued since it opened ([`astream_broker::FlushCounts`]),
-/// as one phrase.
 fn flushes(f: &astream_broker::FlushCounts) -> String {
     format!(
         "flushes since it opened: {} full, {} barrier, {} skipped, {} failed",
@@ -64,7 +59,7 @@ fn flushes(f: &astream_broker::FlushCounts) -> String {
     )
 }
 
-/// The BROKER section's `health` row and doctor's `health:` line, from the broker's own `Hello` (entry 0x04, [`astream_broker::HelloHealth`]).
+/// Format the `health` row from the broker's `Hello` (`0x04`).
 #[must_use]
 pub fn in_band(h: &astream_broker::HelloHealth) -> String {
     match &h.poisoned {
@@ -78,10 +73,10 @@ pub fn in_band(h: &astream_broker::HelloHealth) -> String {
     }
 }
 
-/// The word [`in_band`] opens a poisoned log's row with, which doctor and the tests read it by.
+/// Prefix of [`in_band`] for a poisoned log.
 pub const POISONED_ROW_WORD: &str = "POISONED";
 
-/// What the log holds and who is attached ([`astream_broker::BrokerHealth`], R5), as one phrase.
+/// Format what the log holds and who is attached.
 #[must_use]
 pub fn holds(h: &astream_broker::BrokerHealth) -> String {
     format!(
@@ -97,16 +92,13 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
     )
 }
 
-/// Whether `read` — a `<log>.health` as astream's reader found it — is the
-/// health of the broker serving the socket NOW: the reader says its writer
-/// still serves the log, and that writer is `serving`, the pid the process
-/// table names for the socket.
+/// Whether `read` reflects the broker currently serving the socket.
 #[must_use]
 pub fn is_current(read: &astream_broker::HealthRead, serving: Option<u32>) -> bool {
     read.writer == astream_broker::HealthWriter::Serving && serving == Some(read.health.pid)
 }
 
-/// The BROKER section's `holds` row, at `now_ms`, from astream's snapshot beside the log.
+/// Format the `holds` row at `now_ms` from `<log>.health`.
 #[must_use]
 pub fn snapshot_row(
     read: &astream_broker::HealthRead,
@@ -148,8 +140,6 @@ pub fn snapshot_row(
     )
 }
 
-/// `n` bytes as a person reads them: `512 B`, `3.1 KiB`, `2.0 MiB`, rounded to
-/// a tenth, in integers.
 fn bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if n < 1024 {
@@ -168,7 +158,7 @@ fn bytes(n: u64) -> String {
     format!("{}.{} {unit}", tenths / 10, tenths % 10)
 }
 
-/// Whether THIS process runs as an `aterm fabric on` job.
+/// Whether this process runs as an `aterm fabric on` job.
 #[must_use]
 pub fn supervised() -> bool {
     #[cfg(target_os = "linux")]
@@ -181,9 +171,6 @@ pub fn supervised() -> bool {
     )
 }
 
-/// [`supervised`]'s rule on what the process was told: launchd's service name,
-/// and the text of `/proc/self/cgroup` (one `<id>:<controllers>:<path>` line a
-/// hierarchy).
 fn supervised_by(xpc_service: Option<&OsStr>, cgroup: Option<&str>) -> bool {
     let launchd = xpc_service
         .and_then(OsStr::to_str)
@@ -199,8 +186,6 @@ fn supervised_by(xpc_service: Option<&OsStr>, cgroup: Option<&str>) -> bool {
     launchd || systemd
 }
 
-/// Whether `name` is a label `aterm fabric on` gives a broker job: the plain
-/// [`crate::enable::LABEL`] (the default root) or `LABEL.<cksum>` (any other).
 fn is_job_label(name: &str) -> bool {
     use crate::enable::LABEL;
     name == LABEL
@@ -210,10 +195,7 @@ fn is_job_label(name: &str) -> bool {
             .is_some_and(|sum| !sum.is_empty() && sum.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// What the broker does when it finds its log poisoned: exit (the cure, and
-/// the only behaviour of a shipped build), or — the dev seam's `stay`, the
-/// negative control a test runs to show the exit is the cure — say so and keep
-/// serving.
+/// Action taken when the broker finds its log poisoned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnPoison {
     #[default]
@@ -221,7 +203,7 @@ pub enum OnPoison {
     Stay,
 }
 
-/// THE BROKER'S FAULT SEAM, `$ATERM_LINK_BROKER_FAULT`.
+/// Broker fault-injection seam (`$ATERM_LINK_BROKER_FAULT`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Seam {
     /// Fail every full flush, from before anything is served.
@@ -231,14 +213,14 @@ pub struct Seam {
     pub on_poison: OnPoison,
 }
 
-/// The seam's variable.
+/// Environment variable for [`Seam`].
 pub const FAULT_SEAM: &str = "ATERM_LINK_BROKER_FAULT";
 
-/// What the marker that makes `sync` one-shot adds to the log's name.
+/// Filename suffix for the one-shot `sync` fault marker.
 pub const FAULT_FIRED_SUFFIX: &str = ".aterm-fault-fired";
 
 impl Seam {
-    /// The seam as this process's environment sets it for `log` — the default (nothing) in a release build, or with the variable unset.
+    /// Read the fault seam from the environment for `log`.
     #[must_use]
     pub fn from_env(log: &Path) -> Self {
         let Some(raw) = aterm_types::dev_seam!(FAULT_SEAM) else {
@@ -247,8 +229,6 @@ impl Seam {
         Self::parse(&raw.to_string_lossy(), fired_marker(log).exists())
     }
 
-    /// The words of `raw`; `sync` only while it has not `fired`. An unknown
-    /// word arms nothing.
     fn parse(raw: &str, fired: bool) -> Self {
         let mut seam = Self::default();
         for word in raw.split([' ', ',']).filter(|w| !w.is_empty()) {
@@ -262,7 +242,7 @@ impl Seam {
         seam
     }
 
-    /// The rules the open adds to this build's escalation table.
+    /// Escalation rules configured by this seam.
     #[must_use]
     pub fn escalation(&self) -> Vec<astream_broker::Escalate> {
         self.escalate
@@ -271,7 +251,7 @@ impl Seam {
             .collect()
     }
 
-    /// Arm `sync` on `broker`, once: the marker beside `log` first, so a broker that exits over the fault never arms it again.
+    /// Arm the one-shot `sync` fault on `broker`.
     pub fn arm(&self, broker: &astream_broker::Broker, log: &Path) {
         if !self.sync {
             return;
@@ -294,7 +274,6 @@ impl Seam {
     }
 }
 
-/// `<log>.aterm-fault-fired`.
 fn fired_marker(log: &Path) -> PathBuf {
     let mut name = log.as_os_str().to_os_string();
     name.push(FAULT_FIRED_SUFFIX);
@@ -329,11 +308,6 @@ pub(crate) fn astream_poisoned_reason() -> String {
 mod tests {
     use super::*;
 
-    /// **THE EXIT LINE SAYS WHAT DOCTOR READS FIRST AND ASTREAM'S REASON
-    /// LAST, ON ONE LINE, AND WHO REOPENS THE LOG.** Supervised, the
-    /// supervisor; with no `aterm fabric on` job, the line says so and names
-    /// the command — unless something else restarts it, which this build
-    /// cannot see.
     #[test]
     fn the_exit_line_names_astreams_reason_and_who_reopens_the_log() {
         let reason = "a flush failed (EIO)\nbadly";
@@ -372,10 +346,6 @@ mod tests {
         }
     }
 
-    /// **A SUPERVISOR IS READ OFF THE PROCESS, AND ONLY `aterm fabric on`'S
-    /// JOB COUNTS.** launchd's service name and systemd's unit cgroup name the
-    /// job: the default root's plain label and a per-root `LABEL.<cksum>` are
-    /// supervised.
     #[test]
     fn a_supervisor_is_the_jobs_own_word() {
         use crate::enable::LABEL;
@@ -404,10 +374,6 @@ mod tests {
         assert!(!supervised_by(None, None));
     }
 
-    /// **THE SEAM'S `sync` IS ONE-SHOT, ITS SWITCHES ARE NOT.** With the
-    /// marker absent `sync` is armed; once it exists (the broker that armed it
-    /// wrote it) the restarted broker arms nothing, while `escalate=` and
-    /// `stay` still hold.
     #[test]
     fn the_seam_arms_its_fault_once() {
         let first = Seam::parse("sync,escalate=/f/*/in/> stay escalate=/x bogus", false);
@@ -425,13 +391,6 @@ mod tests {
         assert_eq!(Seam::parse("bogus syncs stays", false), Seam::default());
     }
 
-    /// **ARMING WRITES THE MARKER FIRST, AND THE FAULT IS ASTREAM'S OWN.** On a
-    /// real broker at Relaxed, with the seam's escalation naming one subject:
-    /// before arming, an escalated publish is acked and nothing is poisoned
-    /// (the negative control); armed, an ordinary publish is still acked — a
-    /// relaxed batch flushes nothing — and the next escalated one's full flush
-    /// fails, which poisons the log; the marker is beside it, so the seam
-    /// read again for the same log arms nothing.
     #[test]
     fn the_armed_seam_poisons_a_relaxed_log_at_its_first_escalated_record() {
         let dir = aterm_tempfile::Builder::new()
@@ -473,11 +432,6 @@ mod tests {
         assert_eq!(broker.poisoned().as_deref(), Some(why.as_str()));
     }
 
-    /// **THE FACTS ARE ASTREAM'S OWN, IN BAND AND ON DISK**, read off a real
-    /// broker kept the way the serving loop keeps it (Relaxed, astream's
-    /// `<log>.health` every [`HEALTH_EVERY`]) through astream's own readers —
-    /// a fresh `Hello`'s entry 0x04 and `read_health` — and said by this
-    /// module's rows.
     #[test]
     fn the_facts_name_what_astream_decided() {
         use astream_broker::{HealthWriter, ServedReason, Tier};
@@ -598,9 +552,6 @@ mod tests {
         );
     }
 
-    /// The rows' arithmetic and whose-word wording: bytes in tenths, rounded
-    /// in integers; a snapshot whose writer the reader cannot tell is never
-    /// current, and its row says so.
     #[test]
     fn a_snapshot_says_whose_word_it_is() {
         use astream_broker::{BrokerHealth, HealthRead, HealthWriter};
@@ -634,9 +585,6 @@ mod tests {
         assert!(!other.contains(POISONED_ROW_WORD), "{other}");
     }
 
-    /// **A HEALTHY LOG READS UNPOISONED AFTER ITS LISTENERS GO** — the
-    /// negative control of the look the stop path makes after the drop: a
-    /// relaxed log closed cleanly is not reported poisoned.
     #[test]
     fn a_healthy_log_reads_unpoisoned_after_its_listeners_go() {
         let dir = aterm_tempfile::Builder::new()

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The pushes that tell the window's host a newer Claude Code or Codex is installed, and the one that says an agent has exited.
+//! Upgrade activation watches and process exit waiters for the window host.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -277,9 +277,6 @@ impl ActivationWake {
 
 #[cfg(target_os = "macos")]
 impl ActivationWake {
-    /// Whether a wake mark changed since it was last seen. Every mark is
-    /// looked at; a side mark that changed is told to its own listener
-    /// ([`Self::with_side`]) instead.
     fn any_changed(&mut self) -> bool {
         self.marks.iter_mut().fold(false, |woke, m| {
             let changed = m.changed();
@@ -296,8 +293,6 @@ impl ActivationWake {
     }
 }
 
-/// Whether a watched thing is another than when last seen, `next` being what
-/// it is now (`None`: not there); `seen` becomes `next`.
 fn moved<T: PartialEq>(seen: &mut Option<T>, next: Option<T>) -> bool {
     if next == *seen {
         return false;
@@ -357,8 +352,6 @@ impl SidePoll {
         }
     }
 
-    /// One look: the listener is told when the marker is another than at the
-    /// last look ([`moved`]), and whether it was.
     fn look(&mut self) -> bool {
         let next = self.path.as_deref().and_then(side_stamp);
         let changed = moved(&mut self.seen, next);
@@ -541,15 +534,11 @@ impl Mark {
         }
     }
 
-    /// This mark is looked at again while its own directory does not exist
-    /// ([`Self::watching_an_ancestor`]).
     const fn rechecked_before_its_dir(mut self) -> Self {
         self.recheck = true;
         self
     }
 
-    /// Whether this mark's watch sits on an ancestor of its own directory,
-    /// and it is to be looked at again ([`ANCESTOR_RECHECK`]).
     fn watching_an_ancestor(&self) -> bool {
         self.recheck
             && self
@@ -559,7 +548,6 @@ impl Mark {
                 .is_some_and(|own| self.watch.as_ref().is_none_or(|(dir, _)| dir != own))
     }
 
-    /// Whether the thing moved elsewhere (re-armed there).
     fn relocated(&mut self) -> bool {
         let now = (self.locate)();
         if now == self.path {
@@ -571,14 +559,11 @@ impl Mark {
         true
     }
 
-    /// Whether the thing changed since it was last seen (then seen).
     fn changed(&mut self) -> bool {
         let next = self.path.as_deref().and_then(identity);
         moved(&mut self.seen, next)
     }
 
-    /// Watch the nearest existing directory holding the thing, moving the
-    /// watch inward as its directories are created.
     fn ensure_watch(&mut self, kq: &std::os::fd::OwnedFd) {
         let desired = self.path.as_deref().and_then(watch_dir);
         if self.watch.as_ref().map(|(dir, _)| dir) == desired.as_ref() {
@@ -708,7 +693,6 @@ fn watch(kq: &std::os::fd::OwnedFd, dir: &Path) -> std::io::Result<std::fs::File
 mod tests {
     use super::*;
 
-    /// [`stat_exited`] reads the state after the command's last `)`: `Z` or `X` is exited.
     #[test]
     fn a_proc_stat_line_names_an_exited_process_by_its_state() {
         assert!(stat_exited("4242 (claude) Z 4100 4242 4100 0 -1"));
@@ -718,22 +702,14 @@ mod tests {
         assert!(!stat_exited(""));
     }
 
-    /// A wake that must come is waited for this long: a hang detector, never a
-    /// latency budget (AGENTS.md).
     const HANG: Duration = Duration::from_secs(60);
 
-    /// The fallback a parked wait is given where the test tells a push from the
-    /// fallback running out: twice [`HANG`], so the one outcome lands inside
-    /// the detector and the other far outside it whatever the machine's load.
     const FALLBACK: Duration = Duration::from_secs(120);
 
     fn fixed(path: PathBuf) -> Box<dyn FnMut() -> Option<PathBuf> + Send> {
         Box::new(move || Some(path.clone()))
     }
 
-    /// A failed notice publication cannot hide a managed Claude Code update. The
-    /// same source set production arms sees the actual entrypoint change, even
-    /// with vnode events withheld; unchanged and neighbouring files are no news.
     #[test]
     fn a_managed_claude_twin_move_is_seen_without_its_notice() {
         let root = aterm_tempfile::Builder::new()
@@ -826,8 +802,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The owner's word marker ([`ActivationWake::with_word`]) wakes a parked host; its
-    /// directory is made up front so the watch sits on it.
     #[test]
     fn the_owners_word_wakes_a_parked_host() {
         let root =
@@ -859,8 +833,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A side mark ([`ActivationWake::with_side`]) is told to its listener and ends no wait,
-    /// while a wake mark's change answers `true` and tells the listener nothing.
     #[test]
     fn a_side_mark_tells_its_listener_and_ends_no_wait() {
         let root =
@@ -932,11 +904,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// AN AGENT'S OWN MARKER ([`ActivationWake::with_agent`], Muse Code's
-    /// `activation-notices/muse`) is told to its own listener and is NO wake:
-    /// atpkg's replacement of it tells the listener once — the host counts it
-    /// for that agent's workers alone — and the wait answers nothing, so no
-    /// other agent's loop is parked.
     #[test]
     fn an_agents_own_marker_tells_its_listener_and_wakes_no_other_agent() {
         let root =
@@ -983,7 +950,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Claude's native updater repointing `~/.local/bin/claude` wakes the parked host.
     #[test]
     fn a_repointed_native_link_wakes_the_host_and_its_neighbours_do_not() {
         let home = std::env::temp_dir().join(format!("aterm-native-wake-{}", std::process::id()));
@@ -1020,8 +986,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// The trigger ends a parked wait at once, reporting no activation (the
-    /// host's shutdown), inside [`HANG`], which the fallback is ten times.
     #[test]
     fn the_trigger_ends_a_parked_wait_at_once() {
         let mut wake = ActivationWake::with_marks(Vec::new());
@@ -1038,9 +1002,6 @@ mod tests {
         );
     }
 
-    /// A first install: with the package prefix's parent missing, the watch sits on the
-    /// nearest existing ancestor, and the marker atpkg then creates, nested dirs and all,
-    /// wakes the host before its fallback.
     #[test]
     fn first_install_wakes_even_when_the_package_parent_did_not_exist() {
         let root = std::env::temp_dir().join(format!(
@@ -1069,10 +1030,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A lost ancestor wake: with every vnode event lost (the fault injected),
-    /// a marker created under a missing directory is still seen by the
-    /// [`ANCESTOR_RECHECK`] look inside [`HANG`], which the [`FALLBACK`] is
-    /// twice.
     #[test]
     fn first_install_rechecks_a_missing_path_after_a_lost_ancestor_notification() {
         let root = std::env::temp_dir().join(format!(
@@ -1103,9 +1060,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// An agent's exit is a push: [`wait_exit`] returns as the process ends,
-    /// inside [`HANG`], which the [`FALLBACK`] limit is twice, and at once for
-    /// one already gone.
     #[test]
     fn an_exit_is_seen_as_it_happens() {
         let mut child = aterm_uds::spawnfd::command("/bin/sleep")
@@ -1128,8 +1082,6 @@ mod tests {
         runs.wait().unwrap();
     }
 
-    /// A zombie (ended, not yet reaped) is refused by `EVFILT_PROC` (`ESRCH`) while
-    /// `kill(pid, 0)` still finds it; [`wait_exit`] says it exited, at once.
     #[test]
     fn a_zombie_has_exited() {
         let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
@@ -1158,9 +1110,6 @@ mod tests {
         child.wait().unwrap();
     }
 
-    /// Where the package prefix exists but no atpkg pass has made the notice
-    /// directory, the host makes it, so the watch sits on it and no recheck
-    /// runs.
     #[test]
     fn an_existing_prefix_gets_its_notice_dir_and_no_recheck() {
         let root = std::env::temp_dir().join(format!("aterm-wake-prepare-{}", std::process::id()));
@@ -1200,8 +1149,6 @@ mod poll_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A marker replaced as the accounts store replaces its own: a new file
-    /// renamed over it.
     fn replace(path: &Path) {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, b"").unwrap();
@@ -1220,9 +1167,6 @@ mod poll_tests {
         (side, move || told.load(Ordering::SeqCst))
     }
 
-    /// The fallback's poll tells a side listener only when the marker is another file: a
-    /// marker that is not there (no store, no path) is told at no tick; made, replaced or
-    /// removed, once each.
     #[test]
     fn a_fallback_tick_tells_a_side_listener_only_when_its_marker_changed() {
         let root =

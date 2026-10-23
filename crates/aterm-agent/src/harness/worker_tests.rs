@@ -430,9 +430,16 @@ type HomesCase = (
 
 #[test]
 fn a_starters_homes_are_its_lanes_and_absolute() {
-    let user = Path::new("/Users//u");
+    // Homes absolute as this platform reads a path: Windows roots one at a drive.
+    let (other, mine) = if cfg!(windows) {
+        ("C:/Users//other", "C:/Users//u")
+    } else {
+        ("/Users//other", "/Users//u")
+    };
+    let user = Path::new(mine);
+    let (home_other, home_mine) = (format!("HOME={other}"), format!("HOME={mine}"));
     let env = [
-        "HOME=/Users//other",
+        home_other.as_str(),
         "GEMINI_CLI_HOME=/g",
         "XDG_DATA_HOME=/d",
         "XDG_CONFIG_HOME=/c",
@@ -442,20 +449,16 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
         (
             Program::Gemini,
             &["node", "/opt/homebrew/bin/gemini"],
-            vec![("HOME", "/Users//other"), ("GEMINI_CLI_HOME", "/g")],
+            vec![("HOME", other), ("GEMINI_CLI_HOME", "/g")],
         ),
-        (
-            Program::Agy,
-            &["/opt/bin/agy"],
-            vec![("HOME", "/Users//other")],
-        ),
+        (Program::Agy, &["/opt/bin/agy"], vec![("HOME", other)]),
         (
             Program::Muse,
             &["/opt/bin/muse"],
             vec![
                 ("XDG_DATA_HOME", "/d"),
                 ("XDG_CONFIG_HOME", "/c"),
-                ("HOME", "/Users//other"),
+                ("HOME", other),
             ],
         ),
     ];
@@ -475,7 +478,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
         assert_eq!(got, want, "{agent:?}");
-        let own = proc_args(argv, &["HOME=/Users//u"]);
+        let own = proc_args(argv, &[home_mine.as_str()]);
         let s = starter_of(cli, Some(image), &own, user, || None).expect("a starter");
         assert!(
             s.env.iter().all(|(n, _)| n != "HOME"),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A torn full-screen repaint must not spend the typed keys.
+//! Tests that torn repaints with a hidden write cursor keep the composer band intact.
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ClockReading, Terminal};
@@ -16,12 +16,9 @@ const ROWS: usize = 45;
 const COLS: usize = 130;
 const CW: usize = 8;
 const CH: usize = 16;
-/// Claude Code 2.1.284's fullscreen composer row at 130x45 (CUP 41).
 const ROW: u16 = 40;
-/// The text starts two cells in, after `❯ `.
 const COL0: u16 = 2;
 const FRAME_MS: u64 = 16;
-/// `app_render.rs`'s `SYNC_HOLD_CAP`.
 const SYNC_HOLD_CAP: Duration = Duration::from_millis(150);
 
 const SYNC_ON: &str = "\x1b[?2026h";
@@ -66,7 +63,6 @@ fn cfg() -> GlowConfig {
     }
 }
 
-/// `app_render.rs`'s `sync_frame_hold` logic, with the timeout fixed at [`SYNC_HOLD_CAP`].
 fn sync_frame_hold(
     active: bool,
     open_dirty: bool,
@@ -137,8 +133,6 @@ impl Host {
         Self::with_composer(contract, "")
     }
 
-    /// [`Host::new`] with `after` already standing after the composer's
-    /// caret when the first frame is presented.
     fn with_composer(contract: Contract, after: &str) -> Self {
         let mut term = Terminal::new(ROWS as u16, COLS as u16);
         let now = Instant::now();
@@ -183,7 +177,6 @@ impl Host {
         );
     }
 
-    /// The frame hold and the tick, as the single-pane present runs them.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let visible = self.term.cursor_visible();
@@ -228,8 +221,6 @@ impl Host {
             .tick(cur, self.now, &self.cfg, geom(), &mut self.out);
     }
 
-    /// The host's present rule (SYNC-1): a held frame runs nothing; a
-    /// bracket open past the cap is presented as it stands.
     fn present(&mut self) {
         let active = self.term.modes().synchronized_output();
         let (deadline, hold, seq) = sync_frame_hold(
@@ -252,7 +243,6 @@ impl Host {
         self.frame();
     }
 
-    /// Run the 16 ms frame train up to `t0 + ms`.
     fn to(&mut self, ms: u64) {
         let t = self.t0 + Duration::from_millis(ms);
         while self.now + Duration::from_millis(FRAME_MS) <= t {
@@ -272,7 +262,6 @@ impl Host {
         self.glow.note_typed_glyph(self.now, 1, false, class);
     }
 
-    /// A key as the window notes it: its exact glyph rides the stamp.
     fn typed(&mut self, ms: u64, ch: char) {
         self.to(ms);
         let class = if ch == ' ' {
@@ -288,7 +277,6 @@ impl Host {
         self.process(bytes);
     }
 
-    /// Whether `col` on the composer row is lit: a live owner with coverage.
     fn lit(&self, col: u16) -> bool {
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
         let owned = rib
@@ -327,8 +315,6 @@ impl Host {
     }
 }
 
-/// Claude Code's letter frame: hide, home, CR, CUF, CUD, the glyph(s), park
-/// at the last row, the caret after them, show.
 fn letter_frame(col: u16, glyphs: &str, caret: u16) -> String {
     format!(
         "{SYNC_ON}{HIDE}\x1b[H\r\x1b[{col}C\x1b[{ROW}B{glyphs}\x1b[{ROWS};1H\x1b[{};{}H{SHOW}{SYNC_OFF}",
@@ -337,7 +323,6 @@ fn letter_frame(col: u16, glyphs: &str, caret: u16) -> String {
     )
 }
 
-/// Claude Code's space frame: hide, the caret one on, show.
 fn space_frame(caret: u16) -> String {
     format!(
         "{SYNC_ON}{HIDE}\x1b[{};{}H{SHOW}{SYNC_OFF}",
@@ -346,7 +331,6 @@ fn space_frame(caret: u16) -> String {
     )
 }
 
-/// Its spinner frame three rows up, the caret returned to `caret`.
 fn spinner_frame(glyph: char, caret: u16) -> String {
     format!(
         "{SYNC_ON}{HIDE}\x1b[H\r\x1b[{}B{glyph}\x1b[{ROWS};1H\x1b[{};{}H{SHOW}{SYNC_OFF}",
@@ -356,14 +340,10 @@ fn spinner_frame(glyph: char, caret: u16) -> String {
     )
 }
 
-/// One transcript row's repaint: home, CR, CUD to the row, the text.
 fn transcript_row(row: u16, text: &str) -> String {
     format!("\x1b[H\r\x1b[{row}B{text}\x1b[K")
 }
 
-/// `was a` typed and echoed, then ` bu` typed while a transcript repaint's bracket stays open
-/// `open_ms` (presented torn at the cap, Ink's write cursor parked in the transcript) and echoed
-/// after it closes: the space in a spinner frame, `bu` in the next.
 fn take(contract: Contract, open_ms: u64) -> Host {
     let gap = ((open_ms - 20) / 3).min(100);
     take_shaped(
@@ -376,8 +356,6 @@ fn take(contract: Contract, open_ms: u64) -> Host {
     )
 }
 
-/// When the torn bracket's reads and the keys typed into it land, each in
-/// ms after the bracket's `open` instant.
 struct Shape {
     open_ms: u64,
     /// ` `, `b`, `u`.
@@ -477,8 +455,6 @@ fn report(h: &Host) -> (Vec<u16>, String) {
     )
 }
 
-/// The licensed rows that left the composer row: a move judged from, or
-/// to, the torn frame's write cursor.
 fn cross_row_licences(h: &Host) -> Vec<String> {
     h.glow
         .admission_log()
@@ -492,9 +468,6 @@ fn cross_row_licences(h: &Host) -> Vec<String> {
         .collect()
 }
 
-/// The shipping single-pane contract: the torn present's hidden write
-/// cursor is not judged as the caret, no licence leaves the composer row,
-/// no foreign-row park is held on it, and the line stays one band.
 #[test]
 fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     let pre_fix = take(Contract::HandedOver, 280);
@@ -525,9 +498,6 @@ fn a_torn_full_screen_repaint_keeps_the_boundary_space_lit() {
     );
 }
 
-/// A bracket the terminal times out mid-frame: open 1.26 s, the middle read at +1.06 s (past the
-/// 1 s `sync_timeout_ms`, which force-clears the mode with Ink's hidden write cursor still in the
-/// transcript), ` bu` typed late in it at +0.9..1.02 s.
 fn outliving_the_timeout() -> Shape {
     Shape {
         open_ms: 1_260,
@@ -536,8 +506,6 @@ fn outliving_the_timeout() -> Shape {
     }
 }
 
-/// Past the terminal's timeout the program's frame is still unfinished, so its hidden write
-/// cursor is still no caret and the line stays one band.
 #[test]
 fn a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole() {
     let withheld = take_shaped(Contract::Withheld, outliving_the_timeout());
@@ -566,9 +534,6 @@ fn a_torn_repaint_outliving_the_terminal_timeout_keeps_the_line_whole() {
     );
 }
 
-/// Bracket-length sweep from inside the hold cap to well past the
-/// terminal's timeout, keys typed early and late: the shipping contract
-/// keeps the line whole wherever the withheld contract does.
 #[test]
 fn every_bracket_length_keeps_the_line_whole_under_the_shipping_contract() {
     for open_ms in [200_u64, 500, 900, 1_100, 1_500, 2_500] {
@@ -599,7 +564,6 @@ fn every_bracket_length_keeps_the_line_whole_under_the_shipping_contract() {
     }
 }
 
-/// A Backspace among a take's keys.
 const BS: char = '\u{8}';
 
 /// Claude Code's mid-line insert (the owner's 2026-10-16 screenshot: `all
@@ -622,7 +586,6 @@ struct MidLine<'a> {
 }
 
 impl MidLine<'_> {
-    /// The take of the owner's keys, echoed 12 ms after each.
     const PLAIN: MidLine<'static> = MidLine {
         keys: TYPED,
         lag_ms: 12,
@@ -632,12 +595,9 @@ impl MidLine<'_> {
     };
 }
 
-/// The owner's typed line, and the composer's tail after it.
 const TYPED: &str = "all the subtrees";
 const TAIL: &str = " carefully and ultrathink design this.";
 
-/// Run a [`MidLine`] take; returns the host after the settle, and the
-/// composer line it left.
 fn mid_line(contract: Contract, take: MidLine) -> (Host, String) {
     let mut h = Host::with_composer(contract, TAIL);
     let mut line: Vec<char> = TAIL.chars().collect();
@@ -734,8 +694,6 @@ fn mid_line(contract: Contract, take: MidLine) -> (Host, String) {
     (h, line.iter().collect())
 }
 
-/// The owner's take with the Space's echo torn for `stall_ms`; returns the
-/// host and the Space's column.
 fn mid_line_take(contract: Contract, stall_ms: u64, shimmer_ms: Option<u64>) -> (Host, u16) {
     let space = TYPED.find("the ").expect("the Space") + 3;
     let take = MidLine {
@@ -746,12 +704,10 @@ fn mid_line_take(contract: Contract, stall_ms: u64, shimmer_ms: Option<u64>) -> 
     (mid_line(contract, take).0, COL0 + space as u16)
 }
 
-/// The owner's typed line's dark columns, by glyph.
 fn mid_line_report(h: &Host) -> (Vec<u16>, String) {
     mid_line_report_of(h, TYPED)
 }
 
-/// The dark columns of the typed line `typed`, by glyph.
 fn mid_line_report_of(h: &Host, typed: &str) -> (Vec<u16>, String) {
     let dark: Vec<u16> = (COL0..COL0 + typed.chars().count() as u16)
         .filter(|&c| !h.lit(c))
@@ -776,8 +732,6 @@ fn mid_line_report_of(h: &Host, typed: &str) -> (Vec<u16>, String) {
     )
 }
 
-/// A licence on the composer row landing right of the typed text: the key in
-/// flight spent where the torn echo's print run ended.
 fn line_end_licences(h: &Host) -> Vec<String> {
     let typed_end = COL0 + TYPED.len() as u16;
     h.glow
@@ -794,10 +748,6 @@ fn line_end_licences(h: &Host) -> Vec<String> {
         .collect()
 }
 
-/// Negative control: with the echo anchor handed over raw, the torn Space
-/// echo's run end (the tail's end) is judged on the hidden-caret lane, the
-/// Space's licence is spent there, and its column stays dark under a new
-/// band (the owner's `the▯subtrees`).
 #[test]
 fn a_raw_echo_anchor_spends_a_torn_space_at_the_line_end() {
     let (h, space) = mid_line_take(Contract::CaretOnly, 200, None);
@@ -818,10 +768,6 @@ fn a_raw_echo_anchor_spends_a_torn_space_at_the_line_end() {
     );
 }
 
-/// The owner's shape, fixed: a torn mid-line echo hands over no echo anchor
-/// (`motion_print_anchor`), so the Space is judged when its caret shows and
-/// `all the subtrees` stays one band, under the single-pane contract and the
-/// composed/headless one, which the same law fixes.
 #[test]
 fn a_torn_mid_line_echo_keeps_the_space_lit() {
     for shimmer in [None, Some(130), Some(50)] {
@@ -856,8 +802,6 @@ fn a_torn_mid_line_echo_keeps_the_space_lit() {
     }
 }
 
-/// The derived erase-order licence on `path`: whether the next key is lit
-/// (`aterm_models_effects::erased_key_echo_order_model`).
 fn erase_order_lights(path: &[&str]) -> bool {
     let model = aterm_models_effects::erased_key_echo_order_model();
     let mut state = model.init_state();
@@ -867,9 +811,6 @@ fn erase_order_lights(path: &[&str]) -> bool {
     state["lit"] == 1
 }
 
-/// The owner's `the▯subtrees` (2026-10-16) with Claude Code lagging: `all
-/// thes`, Backspace, Space, `subtrees`, each key's echo `lag` ms after it, the
-/// Backspace's echo apart or carried by the Space's repaint.
 #[test]
 fn a_key_erased_before_its_echo_keeps_the_next_key_lit() {
     let erase = "all thes".len();
@@ -919,11 +860,6 @@ fn a_key_erased_before_its_echo_keeps_the_next_key_lit() {
     ]));
 }
 
-/// Corrections of more than one key, echoed late, apart or as one repaint: an
-/// overshoot (`thes⌫⌫e␣`, the retyped `e` the one erased), a transposition
-/// (`teh⌫⌫he`), two keys erased before their echoes (`thexs⌫⌫`) and an
-/// overshoot whose first Backspace echoes alone exactly as the correction
-/// would (`thee⌫⌫e`: `the`, the caret after it).
 #[test]
 fn every_correction_echoed_late_or_merged_keeps_the_line_lit() {
     for keys in [
@@ -950,11 +886,6 @@ fn every_correction_echoed_late_or_merged_keeps_the_line_lit() {
     }
 }
 
-/// A correction's one repaint stalled before its parking CUP past the hold
-/// cap: the torn frames withhold the caret and probe the write cursor's row,
-/// so the repaint is judged when the caret returns, against the probe that
-/// last showed it, whether the caret returns to that cell (`s⌫␣`) or a cell
-/// left of it (`⌫⌫h`).
 #[test]
 fn a_correction_repainted_torn_keeps_its_keys_lit() {
     for keys in ["all thes\u{8} subtrees", "all teh\u{8}\u{8}he subtrees"] {
@@ -988,9 +919,6 @@ fn a_correction_repainted_torn_keeps_its_keys_lit() {
     }
 }
 
-/// Negative control of the late echo's glyph: a key typed and erased inside
-/// one echo lag that the app never draws (`s⌫` processed with the Space, one
-/// repaint).
 #[test]
 fn a_key_erased_and_never_drawn_leaves_the_next_key_its_echo() {
     let keys = "all thes\u{8} subtrees";
@@ -1009,8 +937,6 @@ fn a_key_erased_and_never_drawn_leaves_the_next_key_its_echo() {
     }
 }
 
-/// Negative control of the correction's change: a key retyped equal to the
-/// one it erased (`thee⌫e`).
 #[test]
 fn a_correction_the_app_has_not_drawn_spends_no_key() {
     let keys = "all thee\u{8}e subtrees";

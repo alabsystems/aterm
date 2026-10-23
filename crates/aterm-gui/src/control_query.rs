@@ -1447,7 +1447,7 @@ pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", t.title())
 }
 
-/// The usage line `story` answers every junk form with, spelled from [`StoryVerb::TOLD_WORDS`] so it and the parser agree.
+/// The usage line `story` answers every junk form with, spelled from [`StoryVerb::TOLD_WORDS`](crate::presence::StoryVerb::TOLD_WORDS) so it and the parser agree.
 pub(crate) fn story_usage() -> String {
     format!(
         "ERR usage: story <{}> [<text>]\n",
@@ -1520,7 +1520,7 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> 
     )
 }
 
-/// [`cmd_text_json_opt`] as the dispatch answers it.
+/// `cmd_text_json_opt` as the dispatch answers it.
 pub(crate) fn cmd_text_json_looked(
     term: &Arc<Mutex<Terminal>>,
     ctx: &crate::SessionCtx,

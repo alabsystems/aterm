@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Prism wake output comets and ribbon ([`OutputStreak::note_output`],
-//! [`OutputStreak::note_output_cells`], [`OutputStreak::rebase`], [`ECHO_DISCOUNT_MS`],
-//! [`TypingMomentum`], [`SPAWN_MIN_GAP_MS`], [`MAX_COMETS`], [`SATURATED`], [`ALPHA_DEFAULT`],
-//! [`ALPHA_CLAMP`], [`StreakSound::Shimmer`], [`EPISODE_LOW`], [`StreakSound::Settle`],
-//! [`RIBBON_LINGER_MS`], [`StreakConfig::idle_secs`], [`GlowQuad`],
-//! [`crate::nova::MAX_NOVA_QUADS`]).
+//! Prism wake output comets and ribbon
+//! ([`OutputStreak::note_output`](crate::output_streak::OutputStreak::note_output),
+//! [`OutputStreak::note_output_cells`](crate::output_streak::OutputStreak::note_output_cells),
+//! [`OutputStreak::rebase`](crate::output_streak::OutputStreak::rebase),
+//! [`ECHO_DISCOUNT_MS`](crate::output_streak::ECHO_DISCOUNT_MS),
+//! [`TypingMomentum`](crate::typing_momentum::TypingMomentum),
+//! [`SPAWN_MIN_GAP_MS`](crate::output_streak::SPAWN_MIN_GAP_MS),
+//! [`MAX_COMETS`](crate::output_streak::MAX_COMETS),
+//! [`SATURATED`](crate::output_streak::SATURATED),
+//! [`ALPHA_DEFAULT`](crate::output_streak::ALPHA_DEFAULT),
+//! [`ALPHA_CLAMP`](crate::output_streak::ALPHA_CLAMP),
+//! [`StreakSound::Shimmer`](crate::output_streak::StreakSound::Shimmer),
+//! [`EPISODE_LOW`](crate::output_streak::EPISODE_LOW),
+//! [`StreakSound::Settle`](crate::output_streak::StreakSound::Settle),
+//! [`RIBBON_LINGER_MS`](crate::output_streak::RIBBON_LINGER_MS),
+//! [`StreakConfig::idle_secs`](crate::output_streak::StreakConfig::idle_secs),
+//! [`GlowQuad`](aterm_render::GlowQuad), [`crate::nova::MAX_NOVA_QUADS`]).
 
 use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
@@ -62,8 +73,6 @@ pub const RIBBON_DRIFT: f32 = 0.25;
 /// The most comets resident at once (`max_streaks` is clamped into `1..=MAX_COMETS`).
 pub const MAX_COMETS: usize = 4;
 
-/// Largest frame step the sweep clock honours, in seconds, so a window that slept does not
-/// fling every comet to its end in one tick.
 const MAX_DT_S: f32 = 0.25;
 
 /// What the host must play, recorded only on an edge that also minted light.
@@ -185,8 +194,7 @@ struct Pending {
     right: u16,
 }
 
-/// The glyph identity a `RenderCell` carries, without colours. Grapheme tails live in
-/// `RenderInput` channels this API does not receive, so a tail-only change claims nothing.
+/// The glyph identity a `RenderCell` carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ObservedGlyph {
     ch: char,
@@ -304,8 +312,7 @@ impl OutputStreak {
         Some(last.checked_add(idle).unwrap_or(last))
     }
 
-    /// The instant the current episode drains, if one is open and owed a
-    /// [`StreakSound::Settle`].
+    /// The instant the current episode drains, if one is open and owed a [`StreakSound::Settle`].
     #[inline]
     fn pending_settle_deadline(&self) -> Option<Instant> {
         if !self.in_episode {
@@ -385,8 +392,8 @@ impl OutputStreak {
         now: Instant,
         input_hot: bool,
     ) -> bool {
-        // Geometry can change before the terminal publishes a new token, so
-        // the walk is skipped only when both are unchanged.
+        // Geometry can change before the terminal publishes a new token, so the walk is skipped
+        // only when both are unchanged.
         if self.last_token == Some(token) && self.observed_viewport == Some(viewport) {
             return self.note_output(token, &[], now, input_hot);
         }
@@ -457,9 +464,6 @@ impl OutputStreak {
         )
     }
 
-    /// Retire every comet (and the flood ribbon) whose licensed ink is gone
-    /// from the rows just observed: a cleared screen (`Ctrl+L`, `clear`), an
-    /// erased line.
     fn retire_light_over_erased_ink(&mut self) {
         let observed = &self.observed_rows;
         let inked = |row: u16, from: i32, to: i32| {
@@ -502,8 +506,7 @@ impl OutputStreak {
         cfg: &StreakConfig,
         out: &mut Vec<GlowQuad>,
     ) -> StreakFrame {
-        // Fully inert: off, zero amplitude, or degenerate geometry. A reset,
-        // not a dimming.
+        // Fully inert: off, zero amplitude, or degenerate geometry. A reset, not a dimming.
         if !cfg.enabled
             || cfg.intensity <= 0.0
             || geom.cw == 0
@@ -546,19 +549,15 @@ impl OutputStreak {
         StreakFrame { fp, cue }
     }
 
-    /// Whether the idle drain has expired. A non-finite or non-positive
-    /// `idle_secs` drains immediately rather than animating forever.
+    /// Whether the idle drain has expired.
     #[inline]
     fn idle_drained(&self, now: Instant, cfg: &StreakConfig) -> bool {
         let Some(last) = self.last_output else {
-            // No-op / fallback.
             return self.comets.iter().all(Option::is_none) && self.ribbon.is_none();
         };
         idle_duration(cfg.idle_secs).is_none_or(|idle| now.saturating_duration_since(last) >= idle)
     }
 
-    /// Spend a pending licensed observation: spawn a comet, refresh the flood
-    /// ribbon, or decline.
     fn spend_pending(
         &mut self,
         now: Instant,
@@ -617,8 +616,7 @@ impl OutputStreak {
         self.comets.iter().take(cap).position(Option::is_none)
     }
 
-    /// Governor 6, opening half: one pip on the quiet→active crossing, then mute. A fire denied
-    /// by [`SOUND_MIN_GAP_MS`] is not heard and does not re-arm.
+    /// Governor 6, opening half: one pip on the quiet→active crossing, then mute.
     #[inline]
     fn open_episode_cue(
         &mut self,
@@ -667,8 +665,8 @@ impl OutputStreak {
         })
     }
 
-    /// Per-theme character: the theme's cursor colour, snapped to its nearest named spectrum
-    /// stop, decides where the comet's head enters the arc; the genome jitters within that stop.
+    /// Per-theme character: the theme's cursor colour, snapped to its nearest named spectrum stop,
+    /// decides where the comet's head enters the arc; the genome jitters within that stop.
     #[inline]
     fn hue_for(&self, pending: Pending, cfg: &StreakConfig) -> f32 {
         let named = nearest_spectrum_stop_by_hue(cfg.theme_cursor);
@@ -679,10 +677,6 @@ impl OutputStreak {
         (anchor + jitter).clamp(0.0, 1.0)
     }
 
-    /// Refresh, open or move the flood ribbon on the newest output row. A move takes light off
-    /// one row and puts it on another, so it spends from the shared ignition floor
-    /// (`last_spawn`); otherwise a cursor alternating between two rows (a two-line progress
-    /// display) would re-home it at the frame rate.
     fn refresh_ribbon(&mut self, now: Instant, pending: Pending, cfg: &StreakConfig, geom: Geom) {
         let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
             return;
@@ -691,7 +685,6 @@ impl OutputStreak {
         if let Some(r) = self.ribbon.as_mut() {
             r.since_output_s = 0.0;
             if (r.row, r.from_col, r.to_col) == want {
-                // Same geometry. No light moved, so there is nothing to charge.
                 return;
             }
         }
@@ -742,7 +735,6 @@ impl OutputStreak {
         }
     }
 
-    /// Emit this frame's light and return its fingerprint (`0` ⇒ nothing drawn).
     fn emit(&self, geom: Geom, cfg: &StreakConfig, out: &mut Vec<GlowQuad>) -> u64 {
         let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
         let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
@@ -801,7 +793,7 @@ impl OutputStreak {
         fp | 1
     }
 
-    /// One cell of streak light, in the polarity the theme calls for.
+    /// One cell of streak light.
     #[allow(
         clippy::too_many_arguments,
         reason = "cell coordinate + hue + shape + the frame's geometry/config; one internal \
@@ -840,8 +832,8 @@ impl OutputStreak {
     }
 }
 
-/// Clip one licensed span to the visible columns without relocating a wholly
-/// off-screen or malformed span onto the viewport edge.
+/// Clip one licensed span to the visible columns without relocating a wholly off-screen or
+/// malformed span onto the viewport edge.
 #[inline]
 fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
     if pending.right < pending.left || usize::from(pending.left) >= cols {
@@ -854,8 +846,7 @@ fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
     ))
 }
 
-/// The mandatory idle duration. Scheduling and consumption share this one rounded `Duration`,
-/// so a wake at the promised boundary is consumed on that tick.
+/// The mandatory idle duration.
 #[inline]
 fn idle_duration(idle_secs: f32) -> Option<Duration> {
     (idle_secs.is_finite() && idle_secs > 0.0)
@@ -871,9 +862,7 @@ const fn pan_of(pending: Pending, geom: Geom) -> f32 {
     ((centre / cols) * 2.0 - 1.0).clamp(-1.0, 1.0)
 }
 
-/// Nearest named spectrum colour by circular HSV hue. Comparing hues, not
-/// `spectrum_stop_position`'s arc parameter, keeps the two domains apart when the arc is
-/// perceptually re-paced.
+/// Nearest named spectrum colour by circular HSV hue.
 #[inline]
 fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
     static STOP_HUES: std::sync::OnceLock<[f32; crate::spectrum::SPECTRUM_STOPS]> =
@@ -894,8 +883,7 @@ fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
     nearest
 }
 
-/// Half the narrower adjacent arc gap of one named stop: its Voronoi radius, so genome jitter
-/// cannot cross into a neighbour however the arc is paced.
+/// Half the narrower adjacent arc gap of one named stop.
 #[inline]
 const fn spectrum_stop_jitter_radius(index: usize) -> f32 {
     let last = crate::spectrum::SPECTRUM_STOPS.saturating_sub(1);
@@ -914,8 +902,7 @@ const fn spectrum_stop_jitter_radius(index: usize) -> f32 {
     gap.max(0.0) * 0.5
 }
 
-/// A colour's circular HSV hue turn (`0..1`), used only to pick the theme's named stop; it is
-/// not a spectrum-arc parameter.
+/// A colour's circular HSV hue turn (`0..1`).
 #[inline]
 fn hue_position_of(rgb: u32) -> f32 {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
@@ -963,13 +950,10 @@ mod tests {
         }
     }
 
-    /// The host's spans for one ordinary line of output.
     fn span(row: u16) -> [(u16, u16, u16); 1] {
         [(row, 0, 40)]
     }
 
-    /// Drive `steps` frames of `step` from `t0`, returning every cue heard and
-    /// the peak quad count any single frame put on glass.
     fn run(
         e: &mut OutputStreak,
         t0: Instant,
@@ -993,8 +977,6 @@ mod tests {
         (cues, peak)
     }
 
-    /// An unchanged token is a repaint, not an arrival, and [`OutputStreak::rebase`] makes the
-    /// next observation baseline.
     #[test]
     fn an_unchanged_token_is_no_arrival_and_rebase_baselines() {
         let t0 = Instant::now();
@@ -1016,8 +998,6 @@ mod tests {
         assert!(e.note_output(9_001, &span(1), t0 + Duration::from_millis(40), false));
     }
 
-    /// The cell path checks the host's token before deriving geometry: glyph churn under an
-    /// unchanged token is no observation, and an advanced token licenses only the changed run.
     #[test]
     fn cell_observation_is_gated_by_the_host_token_before_geometry() {
         let t0 = Instant::now();
@@ -1056,9 +1036,6 @@ mod tests {
         );
     }
 
-    /// A comet over output that a clear then erases retires with it (critic
-    /// #15's ghost: the old prompt's `$` cell kept a dim tint for the rest of
-    /// the comet's sweep after `Ctrl+L`).
     #[test]
     fn a_comet_retires_when_its_ink_is_cleared() {
         let row_lit = |clear: bool| {
@@ -1206,7 +1183,6 @@ mod tests {
         );
     }
 
-    /// Accepted editor input (its receipt, or the host's `input_hot`) mints nothing.
     #[test]
     fn echo_discount_mints_nothing_including_paste() {
         let t0 = Instant::now();
@@ -1244,7 +1220,6 @@ mod tests {
         );
     }
 
-    /// A token step with no ink-bearing span (`\x1b[2K` over a blank line) licenses nothing.
     #[test]
     fn empty_damage_mints_nothing() {
         let t0 = Instant::now();
@@ -1257,8 +1232,6 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// Reduced motion is exact zero, not eased: amplitude 0 resets the machine, emits no quads,
-    /// records no cue, and reports fingerprint 0.
     #[test]
     fn reduced_motion_emits_nothing() {
         let t0 = Instant::now();
@@ -1282,7 +1255,6 @@ mod tests {
         assert!(!e.is_active(), "and the host may disarm the lane");
     }
 
-    /// Off is byte-identical off: a disabled engine is inert whatever it is fed.
     #[test]
     fn disabled_is_inert() {
         let t0 = Instant::now();
@@ -1300,8 +1272,6 @@ mod tests {
         }
     }
 
-    /// A ribbon re-home is an ignition: a cursor alternating between two rows every frame
-    /// re-homes it no faster than [`SPAWN_MIN_GAP_MS`] allows.
     #[test]
     fn a_two_row_alternation_cannot_strobe_the_ribbon() {
         let t0 = Instant::now();
@@ -1343,8 +1313,6 @@ mod tests {
         );
     }
 
-    /// A flood (1000 content steps a second for 3 s) yields one ribbon at constant cost and at
-    /// most one pip.
     #[test]
     fn a_flood_coalesces_to_one_quiet_ribbon() {
         let t0 = Instant::now();
@@ -1370,7 +1338,6 @@ mod tests {
         );
     }
 
-    /// The spawn floor bounds ignitions, and since a cue rides only a spawn edge, the sound too.
     #[test]
     fn the_spawn_gap_clamps_eye_and_ear_together() {
         let t0 = Instant::now();
@@ -1393,8 +1360,6 @@ mod tests {
         );
     }
 
-    /// The episode rule: sustained sparse output (a test runner) speaks once,
-    /// stays mute until the metric drains, and closes with one exhale.
     #[test]
     fn an_episode_is_one_pip_and_one_exhale() {
         let t0 = Instant::now();
@@ -1433,8 +1398,6 @@ mod tests {
         assert_eq!(exhales, 1, "one exhale closes it: {exhales}");
     }
 
-    /// Idle to zero: after the drain the engine is inactive, owes no deadline,
-    /// and draws nothing.
     #[test]
     fn idle_settles_to_fingerprint_zero_and_no_deadline() {
         let t0 = Instant::now();
@@ -1462,8 +1425,6 @@ mod tests {
         assert_eq!(e.next_change_deadline(late, cfg.idle_secs), None);
     }
 
-    /// An idle cutoff earlier than momentum's Settle: the parked engine wakes at it, consumes it
-    /// on the boundary, then arms only the later Settle.
     #[test]
     fn parked_episode_wakes_at_idle_cutoff_before_later_settle() {
         let t0 = Instant::now();
@@ -1557,8 +1518,6 @@ mod tests {
         assert!(e.idle_drained(last, &cfg));
     }
 
-    /// Amplitude is clamped: no configuration can put more than [`ALPHA_CLAMP`]
-    /// of light on a cell, and a light theme is halved again.
     #[test]
     fn no_configuration_can_exceed_the_amplitude_ceiling() {
         let t0 = Instant::now();
@@ -1590,8 +1549,6 @@ mod tests {
         }
     }
 
-    /// Polarity: a light theme emits source-over shadow, a dark theme additive
-    /// light (additive light would be invisible on Solarized Light).
     #[test]
     fn light_themes_get_shadow_not_invisible_additive_light() {
         let t0 = Instant::now();
@@ -1625,8 +1582,6 @@ mod tests {
         );
     }
 
-    /// The sweep is gapless: every comet frame's cells form one contiguous run on
-    /// one row.
     #[test]
     fn a_comet_paints_one_contiguous_run() {
         let t0 = Instant::now();

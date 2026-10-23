@@ -24,12 +24,8 @@ pub const EXCLUDED: [&str; 6] = [
     "crates/aterm-gui/src/config_watcher_protocol_island.rs",
 ];
 
-/// How a formatter names an unformatted file: `Diff in <path>:<line>:`. A
-/// non-zero exit without one is a formatter that could not read the files.
 const DIFF_MARKER: &str = "Diff in ";
 
-/// Files per `trustfmt` child: small enough that the pass spreads over every
-/// core, large enough that process start-up stays a fraction of it.
 const CHUNK: usize = 48;
 
 /// A file the formatter would change, and the edition it was judged at.
@@ -83,7 +79,6 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     record_editions(r, &edition_gaps(&ctx.root, &files, &mut editions));
 }
 
-/// The sweep's rows: the files it found unformatted, fixed under `--fix`.
 fn record_sweep(ctx: &Ctx, r: &mut Report, bin: &Path, found: &Sweep) {
     if !found.unread.is_empty() {
         r.raw(found.unread.join("\n"));
@@ -160,8 +155,6 @@ pub(crate) fn borrowed_suffix(ctx: &Ctx, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The edition rows: one finding per directory whose `rustfmt.toml` must name
-/// its manifest's edition.
 fn record_editions(r: &mut Report, gaps: &[EditionGap]) {
     if gaps.is_empty() {
         r.pass("rustfmt.toml editions match the manifests");
@@ -194,15 +187,10 @@ fn record_editions(r: &mut Report, gaps: &[EditionGap]) {
     );
 }
 
-/// Every `*.rs` path git tracks outside `vendor/` (third-party source
-/// mirrored, not authored), and every UNTRACKED one cargo builds
-/// ([`built_by_cargo`]) that git does not ignore, present on disk,
-/// repo-relative and sorted, bar [`EXCLUDED`].
 fn rs_files(ctx: &Ctx) -> Result<Vec<String>, String> {
     rs_files_in(&ctx.root, &ctx.path_env)
 }
 
-/// [`rs_files`] of the checkout at `root`, git run on `path_env`.
 fn rs_files_in(root: &Path, path_env: &std::ffi::OsStr) -> Result<Vec<String>, String> {
     let tracked = ls_files(root, path_env, &["--cached"])?;
     let untracked = ls_files(root, path_env, &["--others", "--exclude-standard"])?;
@@ -217,7 +205,6 @@ fn rs_files_in(root: &Path, path_env: &std::ffi::OsStr) -> Result<Vec<String>, S
     Ok(files)
 }
 
-/// The `*.rs` paths `git ls-files <which>` names in `root`, repo-relative.
 fn ls_files(
     root: &Path,
     path_env: &std::ffi::OsStr,
@@ -243,16 +230,8 @@ fn ls_files(
         .collect())
 }
 
-/// The directories under a package whose `.rs` files cargo builds: its
-/// library and binaries (and every module they declare), and the targets it
-/// discovers by itself.
 const TARGET_DIRS: [&str; 4] = ["src", "tests", "benches", "examples"];
 
-/// Whether cargo builds `rel` (repo-relative): it sits under a
-/// [`TARGET_DIRS`] directory of the package whose `Cargo.toml` is the
-/// nearest above it, or is that package's `build.rs`, or sits where that
-/// manifest declares a target by path ([`declared_dirs`]: a fuzz crate's
-/// `fuzz_targets/`).
 fn built_by_cargo(root: &Path, rel: &str) -> bool {
     let path = Path::new(rel);
     let Some(dir) = path
@@ -281,10 +260,6 @@ fn built_by_cargo(root: &Path, rel: &str) -> bool {
             }))
 }
 
-/// The directories, under its package, of the `.rs` targets a manifest
-/// declares by path (`path = "fuzz_targets/decode.rs"` under a `[[bin]]`,
-/// `build = "…"`): cargo builds what sits there, and the modules beside and
-/// under it, though it is no [`TARGET_DIRS`] directory.
 fn declared_dirs(manifest: &str) -> Vec<PathBuf> {
     manifest
         .lines()
@@ -304,7 +279,6 @@ fn declared_dirs(manifest: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `files` grouped by the edition each is formatted at.
 fn by_edition(files: &[String], editions: &mut Editions) -> Vec<(String, Vec<String>)> {
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in files {
@@ -316,8 +290,6 @@ fn by_edition(files: &[String], editions: &mut Editions) -> Vec<(String, Vec<Str
     groups.into_iter().collect()
 }
 
-/// One formatter pass over `groups`, chunked across the machine's cores:
-/// `--check` reports, `write` rewrites.
 fn sweep(ctx: &Ctx, bin: &Path, groups: &[(String, Vec<String>)], write: bool) -> Sweep {
     let jobs: Vec<(&str, &[String])> = groups
         .iter()
@@ -381,8 +353,6 @@ pub fn trustfmt_cmd(bin: &Path, edition: &str, files: &[String], write: bool) ->
     .args(files)
 }
 
-/// What one child said: the files it would change, or the lines naming files
-/// it could not read.
 fn read_run(
     out: &exec::Run,
     edition: &str,
@@ -435,9 +405,6 @@ pub fn diff_paths(output: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// `abs` relative to the root as given or as canonicalised (macOS reports
-/// `/private/var` for `/var`); unchanged when neither prefix matches, so a
-/// finding is never silently dropped.
 fn relative_to(abs: &str, root: &Path, canonical_root: Option<&Path>) -> String {
     let p = Path::new(abs);
     std::iter::once(root)
@@ -539,8 +506,6 @@ impl Editions {
     }
 }
 
-/// The directory of the nearest `Cargo.toml` above `rel`, repo-relative:
-/// where a reconciling `rustfmt.toml` goes.
 fn manifest_dir_of(root: &Path, rel: &str) -> String {
     Path::new(rel)
         .parent()
@@ -581,7 +546,6 @@ mod tests {
         dir
     }
 
-    /// `git` in the scratch checkout `root`, each call asserted.
     fn git_in(root: &Path, calls: &[&[&str]]) {
         let env = crate::EnvSnapshot::capture();
         for args in calls {
@@ -593,12 +557,6 @@ mod tests {
         }
     }
 
-    /// THE CHECK HOLDS A NEW SOURCE BEFORE IT IS STAGED: an untracked `.rs`
-    /// under a package's `src/`, `tests/`, `benches/` or `examples/`, its
-    /// `build.rs`, or where its manifest declares a target by path (a fuzz
-    /// crate's `fuzz_targets/` and below; a `[lib]` at the package's top and
-    /// the files beside it) is listed beside every tracked one (tracked only,
-    /// `gemini_proof.rs` passed unformatted until it was added).
     #[test]
     fn an_untracked_source_cargo_builds_is_listed_and_nothing_else_untracked() {
         let t = tree(&[
@@ -702,8 +660,6 @@ mod tests {
         );
     }
 
-    /// Each file is formatted at its own crate's edition, inherited from the
-    /// workspace or declared, and the root's when no manifest owns it.
     #[test]
     fn each_file_takes_its_own_crates_edition() {
         let t = tree(&[
@@ -731,9 +687,6 @@ mod tests {
         );
     }
 
-    /// A crate whose `rustfmt.toml` names another edition than its manifest
-    /// is a gap until the file says the manifest's; a tree with no
-    /// `rustfmt.toml` at all reads rustfmt's 2015.
     #[test]
     fn a_rustfmt_edition_that_contradicts_its_manifest_is_a_gap_until_written() {
         let t = tree(&[
@@ -788,9 +741,6 @@ mod tests {
         }
     }
 
-    /// A clean child decides nothing; a diff names its files; a failure with
-    /// no diff read nothing; a diff beside `error` lines read only some, and a
-    /// source line reading `error` inside the diff is drift, never unread.
     #[test]
     fn a_child_separates_drift_from_files_it_could_not_read() {
         let root = Path::new("/r");
@@ -831,11 +781,6 @@ mod tests {
         assert_eq!(mixed.unread, ["error: expected item, found `≐`"]);
     }
 
-    /// The real formatter over a scratch checkout: a file whose diff carries
-    /// a context line reading `error: …` is one drift and nothing unread, and
-    /// so is a new source not yet staged; `--fix` rewrites both, and leaves an
-    /// untracked scratch file cargo builds nothing from as it was; the next
-    /// check passes.
     #[test]
     fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
         use crate::ladder::{Outcome, Severity};

@@ -16,7 +16,9 @@ mod view;
 
 #[cfg(test)]
 pub(super) use view::SHEET_TITLE;
-pub(super) use view::{demo_font_candidate, demo_spec, themes_page};
+pub(super) use view::{
+    BlocksShared, SharedBlocks, SharedSheet, demo_font_candidate, demo_spec, themes_page,
+};
 #[cfg(test)]
 pub(super) use view::{list_blocks, section_items};
 
@@ -100,7 +102,7 @@ pub(crate) struct SaveAsState {
     pub(crate) include_type: bool,
 }
 
-/// Typography config keys included when [`SaveModal::include_type`] is enabled.
+/// Typography config keys included when [`SaveAsState::include_type`] is enabled.
 pub(super) const SAVE_TYPE_KEYS: [&str; 5] = [
     prefs::EDIT_FONT_FAMILY,
     prefs::EDIT_LINE_HEIGHT,
@@ -553,7 +555,7 @@ impl SettingsViewState {
         {
             self.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             self.invalidate_result_page_limit();
-            self.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+            self.scroll_to_results();
             return true;
         }
         if self.showcase.pending_select.take().is_some() {
@@ -582,6 +584,34 @@ impl SettingsViewState {
             self.land_on_control(row);
         }
         self.common.last_focus = Some(UiKey::new(CUSTOMIZE));
+    }
+
+    /// A FILTER CHANGE SHOWS THE FILTER AND THEN ITS FIRST RESULTS (R5 of
+    /// [`Self::seat_scroll`]): where the list lists the filter, the list
+    /// stays where it shows the filter whole, else goes to the filter's
+    /// stop, and reveals the first result, the filter kept in view as the
+    /// keyboard's control; else the list from its top. Sent to the top, a
+    /// letter typed in the filter at 178x348 showed the demo and the strip,
+    /// the results off the screen. The page's chrome is chosen again for the
+    /// new results: held for the short list, Erase at 380x300 brought the
+    /// whole list back 16pt shorter and its first result off the screen.
+    pub(super) fn scroll_to_results(&mut self) {
+        let filter = UiKey::new(SHOWCASE_FILTER);
+        let shown = self.keyboard_shown(true).is_some_and(|key| key == filter);
+        let stop = self.scroll_plan().and_then(|plan| plan.stop_of(&filter));
+        self.drop_list_nudge();
+        self.page_chrome_at.set(None);
+        if !shown || stop.is_none() {
+            let at = stop.unwrap_or(0);
+            self.reduce_page_scroll(at, SettingsPageScrollCommand::Absolute(at));
+        }
+        let first =
+            self.showcase.visible().first().map(|&index| {
+                UiKey::new(format!("{CARD_PREFIX}{}", self.showcase.cards[index].slug))
+            });
+        if let Some(first) = first.filter(|_| stop.is_some()) {
+            self.reveal_control(first);
+        }
     }
 
     /// Scroll target key for the highlighted chooser row when the chooser appears.
@@ -1465,13 +1495,13 @@ impl SettingsApp {
         } else if action == FILTER_CLEAR {
             view.showcase.filter = crate::native_text_input::TextInputState::new(String::new());
             view.invalidate_result_page_limit();
-            view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+            view.scroll_to_results();
             view.common.last_focus = Some(UiKey::new(SHOWCASE_FILTER));
         } else if action == SHOWCASE_FILTER {
             if let Some(text) = text {
                 view.showcase.filter = crate::native_text_input::TextInputState::new(text.into());
                 view.invalidate_result_page_limit();
-                view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+                view.scroll_to_results();
             }
             view.common.last_focus = Some(UiKey::new(SHOWCASE_FILTER));
         } else if action == SHOWCASE_SAVE_AS {
@@ -2315,7 +2345,7 @@ impl SettingsApp {
             ShowcaseText::Filter => {
                 if changed {
                     view.invalidate_result_page_limit();
-                    view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+                    view.scroll_to_results();
                 }
                 let listed = view.showcase.trial_id().is_some_and(|id| {
                     view.showcase
@@ -2385,7 +2415,7 @@ impl SettingsApp {
         match target {
             ShowcaseText::Filter => {
                 view.invalidate_result_page_limit();
-                view.reduce_page_scroll(0, SettingsPageScrollCommand::Absolute(0));
+                view.scroll_to_results();
             }
             ShowcaseText::SaveName => {
                 if let Some(save) = view.showcase.save.as_mut() {

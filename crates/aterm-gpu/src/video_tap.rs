@@ -381,29 +381,23 @@ struct Slot {
     state: SlotState,
 }
 
-/// Which backend's staging buffer a slot holds. A ring is homogeneous; the
-/// cross-arm enqueue guards finalize a recording if a disarm switches the
-/// present path mid-take.
+/// Backend staging buffer for a slot; cross-arm enqueue guards finalize a recording on a mid-take switch.
 enum SlotBuf {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Buffer),
-    /// Metal slot: a shared-storage `MTLBuffer` plus, once Submit B commits, a
-    /// probe onto that command buffer for status polling.
+    /// Metal slot holding a shared-storage `MTLBuffer` and its post-Submit-B status probe.
     #[cfg(target_os = "macos")]
     Metal {
         buf: crate::metal::resources::SharedBuffer,
         probe: Option<crate::metal::encoder::CbProbe>,
     },
-    /// GL slot: the destination's padded rows, read back when the present
-    /// drew them (GL's readback waits for the draws, so a filled slot is
-    /// complete; `gl_present.rs`).
+    /// GL slot holding the destination's padded rows (`gl_present.rs`).
     #[cfg(gl_arm)]
     Gl(Vec<u8>),
 }
 
 impl SlotBuf {
-    /// Whether this slot stages through the wgpu arm (always false on the
-    /// wgpu-free build).
+    /// Whether this slot stages through the wgpu arm (always false on the wgpu-free build).
     #[inline]
     #[cfg(target_os = "macos")]
     const fn is_wgpu(&self) -> bool {
@@ -443,8 +437,7 @@ impl SlotBuf {
 /// Per-window recording state.
 pub struct VideoTap {
     slots: Vec<Slot>,
-    /// Map-completion channel: the map_async callback sends its slot index
-    /// (the wgpu arm's readback; the Metal arm's slots complete in place).
+    /// Map-completion channel where `map_async` sends its slot index.
     #[cfg(wgpu_arm)]
     done_tx: mpsc::Sender<(usize, bool)>,
     #[cfg(wgpu_arm)]
@@ -452,8 +445,7 @@ pub struct VideoTap {
     store: VecDeque<CapturedFrame>,
     store_bytes: usize,
     budget_bytes: usize,
-    /// Mid-stream losses (ring saturation / map failure / conversion backlog
-    /// or failure / device loss).
+    /// Mid-stream losses (ring saturation, map failure, conversion backlog/failure, or device loss).
     dropped: u64,
     /// Head truncations (budget drop-oldest evictions).
     evicted: u64,
@@ -461,23 +453,19 @@ pub struct VideoTap {
     decimated: u64,
     /// `fps=` capture cap; `None` captures every present.
     fps_cap: Option<u32>,
-    /// The client's requested duration (ms), echoed in the dump; the GUI owns the stop
-    /// deadline.
+    /// Client's requested duration (ms), echoed in the dump; the GUI owns the stop deadline.
     requested_ms: u64,
     /// Earliest gate time (µs on the `epoch` clock) the next frame is accepted.
     next_capture_us: u64,
-    /// Monotonic origin for the fps gate, which only compares spacing on this clock
-    /// (`aterm_time`, wasm-safe like the renderer's present clocks).
+    /// Monotonic origin for the fps gate (`aterm_time`, wasm-safe like the renderer's present clocks).
     epoch: aterm_time::Instant,
     seq: u64,
     half_res: bool,
-    /// Source swapchain geometry/format the ring was built for; a mismatch at
-    /// enqueue time (resize / format flip) finalizes the recording.
+    /// Source swapchain geometry/format the ring was built for; a mismatch finalizes the recording.
     src_w: u32,
     src_h: u32,
     format: crate::device_layer::TexelFormat,
-    /// First source encoding actually copied. Later metadata changes are
-    /// transformed per-slot and make the aggregate source label explicit.
+    /// First source encoding copied; later metadata changes transform per-slot and mark the source mixed.
     first_capture_encoding: Option<CaptureEncoding>,
     mixed_capture_encoding: bool,
     bpp: u32,
@@ -487,20 +475,16 @@ pub struct VideoTap {
     worker: Option<ConvertWorker>,
 }
 
-/// Staging-ring depth: enough to absorb a GPU running a frame or two behind
-/// without ever blocking the present path.
+/// Staging-ring depth to absorb a GPU running a frame or two behind without blocking present.
 const RING: usize = 4;
 /// Default RAM budget for the harvested store (bytes).
 pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
-/// Upper bound on conversions dispatched and not yet adopted. At ring depth, so
-/// transient raw-copy memory stays within what the ring already commits; a
-/// worker this far behind counts a drop instead of slowing the present thread.
+/// Upper bound on conversions dispatched and not yet adopted, matching [`RING`].
 #[cfg(not(target_arch = "wasm32"))]
 const CONVERT_BACKLOG: usize = RING;
 
-/// One mapped slot's raw padded bytes for the conversion worker, with the
-/// per-frame inputs [`mapped_to_rgba8`] needs.
+/// One mapped slot's raw padded bytes and per-frame inputs for [`mapped_to_rgba8`].
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertJob {
     raw: Vec<u8>,
@@ -509,9 +493,7 @@ struct ConvertJob {
     capture_encoding: CaptureEncoding,
 }
 
-/// The recording's conversion lane. The worker lives as long as the tap (its
-/// job sender drops at `finish`), runs [`mapped_to_rgba8`] per job, and returns
-/// `Some(frame)` or `None` on error (one counted loss).
+/// Off-thread conversion worker running [`mapped_to_rgba8`] per job until `finish` drops `job_tx`.
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertWorker {
     job_tx: mpsc::Sender<ConvertJob>,
@@ -521,8 +503,7 @@ struct ConvertWorker {
     handle: std::thread::JoinHandle<()>,
 }
 
-/// Spawn the conversion worker for one recording, or `None` when no thread can
-/// be spawned (the harvest then converts inline).
+/// Spawn the conversion worker for one recording, or `None` when inline conversion must be used.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_convert_worker(
     src_w: u32,
@@ -556,7 +537,6 @@ fn spawn_convert_worker(
                         rgba,
                     });
                     if result_tx.send(frame).is_err() {
-                        // tap gone: nothing is left to adopt results
                         return;
                     }
                 }
@@ -587,8 +567,7 @@ const fn padded_row_bytes(width: u32, bpp: u32) -> u64 {
     (width as u64 * bpp as u64).div_ceil(256) * 256
 }
 
-/// How one mapped texel becomes straight, non-linear sRGB RGBA8: the
-/// destination format's layout and the colour space its coordinates are in.
+/// Destination format layout and colour space for decoding mapped texels to sRGB RGBA8.
 #[derive(Clone, Copy, Debug)]
 struct TexelDecode {
     bpp: usize,
@@ -612,8 +591,7 @@ impl TexelDecode {
         })
     }
 
-    /// The texel at byte `base` of `data` as straight, non-linear sRGB RGBA8
-    /// channels.
+    /// The texel at byte `base` of `data` as straight, non-linear sRGB RGBA8 channels.
     #[inline]
     fn fetch(&self, data: &[u8], base: usize) -> [u32; 4] {
         if self.f16 {
@@ -656,9 +634,7 @@ impl TexelDecode {
     }
 }
 
-/// The source size of a mapped `src_w`×`src_h` destination of `bpp`-byte
-/// texels in rows `padded_row` bytes apart, once `data_len` bytes are known to
-/// hold every row.
+/// Validated `(width, height)` for a mapped `src_w`×`src_h` buffer with `padded_row` stride.
 fn mapped_geometry(
     data_len: usize,
     src_w: u32,
@@ -694,8 +670,7 @@ fn mapped_geometry(
     Ok((sw, sh))
 }
 
-/// Strip row padding, swizzle or decode the source format, and optionally box
-/// downsample 2×2.
+/// Strip row padding, swizzle or decode the source format, and optionally box downsample 2×2.
 fn mapped_to_rgba8(
     data: &[u8],
     src_w: u32,
@@ -1094,9 +1069,7 @@ impl VideoTap {
         }
     }
 
-    /// Metal harvest (status-polled twin of [`Self::harvest_ready`]): a
-    /// `Completed` probe hands the slot's bytes to the conversion lane; any
-    /// other terminal outcome or a lost probe is one counted drop.
+    /// Metal harvest (status-polled twin of [`Self::harvest_ready`]).
     #[cfg(target_os = "macos")]
     fn metal_harvest_ready(&mut self, block: bool) {
         self.adopt_converted();
@@ -1156,8 +1129,7 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// Metal twin of [`Self::convert_or_dispatch`]: reads the raw padded bytes
-    /// from the slot's shared buffer (coherent after `Completed`).
+    /// Metal twin of [`Self::convert_or_dispatch`] reading raw padded bytes from the slot's shared buffer.
     #[cfg(target_os = "macos")]
     fn metal_convert_or_dispatch(
         &mut self,
@@ -1173,8 +1145,7 @@ impl VideoTap {
                 #[cfg(multi_arm)]
                 _ => unreachable!("a Metal harvest reads a Metal slot"),
             };
-            // SAFETY: shared storage of exactly `len` bytes; the probe
-            // reported the writing command buffer terminal.
+            // SAFETY: shared storage of exactly `len` bytes; the probe reported the writing command buffer terminal.
             unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
         };
         if let Some(worker) = self.worker.as_mut() {
@@ -1439,8 +1410,7 @@ impl VideoTap {
         self.into_take()
     }
 
-    /// Hand one slot's raw padded bytes to the conversion lane, or convert
-    /// inline without a worker (the GL twin of `metal_convert_or_dispatch`).
+    /// Hand one slot's raw padded bytes to the conversion lane, or convert inline (GL twin of `metal_convert_or_dispatch`).
     #[cfg(gl_arm)]
     fn convert_raw(
         &mut self,
@@ -1506,10 +1476,7 @@ impl VideoTap {
         }
     }
 
-    /// The `fps=` gate, pure on `(self, now_us)`. With no cap every frame is
-    /// accepted; with cap `n` a frame is accepted iff at least `1_000_000 / n` µs
-    /// have passed since the last accepted frame (rejections accrue no catch-up
-    /// debt).
+    /// The `fps=` gate on `(self, now_us)`: accepts every frame when uncapped, or once per `1_000_000 / n` µs.
     fn should_capture(&mut self, now_us: u64) -> bool {
         let Some(fps) = self.fps_cap else {
             return true;
@@ -1522,8 +1489,7 @@ impl VideoTap {
         true
     }
 
-    /// Apply the fps gate before validating this present's colour metadata, so
-    /// invalid metadata counts a loss only on a requested frame.
+    /// Apply the fps gate before validating colour metadata so invalid metadata counts a loss only on a requested frame.
     fn capture_encoding_for_present(
         &mut self,
         now_us: u64,
@@ -1641,8 +1607,7 @@ impl VideoTap {
         self.metal_harvest_ready(false);
     }
 
-    /// Drain the completion channel: adopt finished conversions, then route
-    /// newly mapped slots toward RGBA8.
+    /// Drain the completion channel, adopting finished conversions and routing newly mapped slots toward RGBA8.
     #[cfg(wgpu_arm)]
     fn harvest_ready(&mut self) {
         self.adopt_converted();
@@ -1677,9 +1642,7 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// Route one mapped slot's bytes toward RGBA8. With a live worker the bytes
-    /// are copied out and converted off-thread (adopted later by
-    /// [`Self::adopt_converted`]), returning `None`.
+    /// Route one mapped slot's bytes toward RGBA8 via the worker ([`Self::adopt_converted`]) or inline.
     #[cfg(wgpu_arm)]
     fn convert_or_dispatch(
         &mut self,
@@ -1716,8 +1679,7 @@ impl VideoTap {
         Some(self.copy_out(idx, seq, t_us, capture_encoding))
     }
 
-    /// Adopt finished conversions into the store without blocking. A failure is
-    /// one counted loss.
+    /// Adopt finished conversions into the store without blocking; a failure counts one loss.
     fn adopt_converted(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         loop {
@@ -1735,8 +1697,7 @@ impl VideoTap {
         }
     }
 
-    /// Inline fallback (no worker): convert one mapped slot to a tightly packed
-    /// RGBA8 frame on the calling thread.
+    /// Inline fallback (no worker): convert one mapped slot to a tightly packed RGBA8 frame.
     #[cfg(wgpu_arm)]
     fn copy_out(
         &self,
@@ -1767,8 +1728,7 @@ impl VideoTap {
         }
     }
 
-    /// [`ordered_capture_store_push`] into this tap's store; evictions count in `evicted`
-    /// (head truncation), not `dropped`.
+    /// [`ordered_capture_store_push`] into this tap's store; evictions count in `evicted`, not `dropped`.
     #[inline]
     fn push_frame(&mut self, f: CapturedFrame) {
         self.evicted += ordered_capture_store_push(
@@ -1844,8 +1804,7 @@ impl VideoTap {
         self.into_take()
     }
 
-    /// Drain the conversion lane: dropping the job sender lets the worker finish
-    /// and exit; every result is adopted.
+    /// Drain the conversion lane by dropping the job sender and adopting every result.
     fn drain_convert_lane(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ConvertWorker {
@@ -2048,8 +2007,7 @@ pub const fn presented_frame_transition(
 enum PresentedFrameState {
     /// Waiting for the next successful present to enqueue the one copy.
     Armed,
-    /// The copy is in a command encoder that has not yet reached the
-    /// caller's post-present hook.
+    /// The copy is in a command encoder that has not yet reached the caller's post-present hook.
     Pending,
     /// `map_async` is outstanding.
     InFlight { t_us: u64 },
@@ -2404,8 +2362,7 @@ impl PresentedFrameTap {
         }
     }
 
-    /// Metal harvest: a `Completed` probe copies the shared bytes out as they
-    /// are; any other terminal outcome is the error result.
+    /// Metal harvest: a `Completed` probe copies the shared bytes out; any other terminal outcome is an error.
     #[cfg(target_os = "macos")]
     fn metal_harvest(&mut self, block: bool) {
         let PresentedFrameState::InFlight { t_us } = self.state else {
@@ -2435,8 +2392,7 @@ impl PresentedFrameTap {
                     #[cfg(multi_arm)]
                     _ => unreachable!("matched above"),
                 };
-                // SAFETY: shared storage of exactly `len` bytes; the probe
-                // reported the writing command buffer terminal.
+                // SAFETY: shared storage of exactly `len` bytes; the probe reported the writing command buffer terminal.
                 unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
             };
             RawCapture::new(
@@ -2961,14 +2917,12 @@ const fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f)
 }
 
-/// The 8-bit sRGB encode of a linear channel: clamp to [0, 1] (a NaN stays
-/// NaN and casts to 0), apply the OETF, round half up.
+/// The 8-bit sRGB encode of a linear channel: clamp to `[0, 1]`, apply the OETF, and round half up.
 fn srgb8_from_linear_powf(linear: f32) -> u32 {
     (linear_to_srgb(linear.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32
 }
 
-/// Entry `k - 1` is the least `f32` whose [`srgb8_from_linear_powf`] is at
-/// least `k`, for `k` in 1..=255.
+/// Entry `k - 1` is the least `f32` whose [`srgb8_from_linear_powf`] is at least `k`, for `k` in `1..=255`.
 static SRGB8_ENCODE_THRESHOLDS: LazyLock<[f32; 255]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         let byte = index as u32 + 1;
@@ -2991,8 +2945,7 @@ fn srgb8_from_linear(linear: f32) -> u32 {
     srgb8_by_thresholds(&SRGB8_ENCODE_THRESHOLDS, linear)
 }
 
-/// The number of `thresholds` at or below `linear`, by an eight-step binary
-/// search of the sorted table.
+/// Number of `thresholds` at or below `linear`, by an eight-step binary search of the sorted table.
 #[inline]
 fn srgb8_by_thresholds(thresholds: &[f32; 255], linear: f32) -> u32 {
     let (mut below, mut step) = (0_usize, 128_usize);
@@ -3012,17 +2965,13 @@ fn display_p3_linear_to_srgb_linear([r, g, b]: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Convert 8-bit Display-P3 coordinates to sRGB: decode the shared transfer
-/// curve, apply the Display-P3-to-linear-sRGB matrix, clip to the sRGB gamut,
-/// re-encode.
+/// Convert 8-bit Display-P3 coordinates to sRGB via the Display-P3-to-linear-sRGB matrix.
 fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
     display_p3_linear_to_srgb_linear(p3.map(srgb8_to_linear))
         .map(|channel| srgb8_from_linear(channel) as u8)
 }
 
-/// scRGB/EDR to SDR-linear: remove Windows' presentation-only SDR-white multiplier, then divide
-/// an over-white pixel by its peak channel (max-RGB compression), so in-range pixels stay
-/// byte-stable and highlight hue survives instead of clipping per channel.
+/// Tone-map scRGB/EDR to SDR-linear by removing `sdr_white_scale` and compressing over-white channels by peak.
 fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
     let mut linear = scrgb.map(|channel| {
         let bounded = if channel.is_nan() || channel <= 0.0 {
@@ -3046,8 +2995,7 @@ mod tests {
     use super::*;
     use aterm_render::srgb_to_linear;
 
-    /// Device-free tap for the store and gate laws. `budget_bytes` is taken as
-    /// given (no 16 MiB floor), so a tiny budget evicts.
+    /// Device-free tap for the store and gate laws; `budget_bytes` is taken without the 16 MiB floor.
     fn test_tap(budget_bytes: usize, fps_cap: Option<u32>) -> VideoTap {
         #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
@@ -3101,8 +3049,7 @@ mod tests {
         CaptureEncoding::new(format, color_space, sdr_white_scale).unwrap()
     }
 
-    /// The worker's conversion is byte-identical to inline [`mapped_to_rgba8`] (SDR swizzle and
-    /// f16 tone map), passes stamps through, and exits when its job sender drops.
+    /// The worker's conversion matches inline [`mapped_to_rgba8`], passes stamps through, and exits on sender drop.
     #[test]
     fn convert_worker_matches_inline_conversion_and_drains_on_drop() {
         let stride = 256;
@@ -3182,11 +3129,7 @@ mod tests {
         }
     }
 
-    /// A raw capture's rows are its conversion's: for every format and colour
-    /// space a swapchain tap maps (8-bit sRGB in either channel order, 8-bit
-    /// Display-P3, f16 scRGB above its SDR white), with padded rows, every span
-    /// of every row [`RawCapture::rgba_row`] appends is the matching slice of
-    /// [`RawCapture::convert`], which is [`mapped_to_rgba8`] at full size.
+    /// Every span [`RawCapture::rgba_row`] appends matches the corresponding slice of [`RawCapture::convert`].
     #[test]
     fn raw_capture_rows_are_its_conversion() {
         use crate::device_layer::TexelFormat::{Bgra8Unorm, Rgba8Unorm, Rgba16Float};
@@ -3268,8 +3211,7 @@ mod tests {
         assert_eq!(tap.decimated, 0);
     }
 
-    /// Device-free format contract: both byte-order variants retain source
-    /// alpha exactly while BGRA performs only the RGB swizzle.
+    /// Device-free format contract: both byte-order variants retain source alpha while BGRA swizzles RGB.
     #[test]
     fn mapped_sdr_formats_preserve_alpha() {
         let rgba_source = [10, 20, 30, 0, 40, 50, 60, 173];
@@ -3308,8 +3250,7 @@ mod tests {
         assert_eq!(rgba, [10, 20, 30, 7, 40, 50, 60, 241]);
     }
 
-    /// f16 RGB is converted from extended-linear to sRGB8, but alpha is linear
-    /// coverage: 0.5 must become 128, not the ~188 an sRGB transfer would yield.
+    /// f16 RGB converts from extended-linear to sRGB8 while alpha remains linear coverage.
     #[test]
     fn mapped_f16_preserves_linear_alpha() {
         let mut source = half_pixel([0x3c00, 0x3800, 0x0000, 0x3800]);
@@ -3332,8 +3273,7 @@ mod tests {
         assert_eq!(rgba, [255, 188, 0, 128, 0, 255, 188, 64]);
     }
 
-    /// The 2×2 downscale averages alpha too, for every supported format, on padded rows like
-    /// the staging buffers'.
+    /// The 2×2 downscale averages alpha across every supported format on padded rows.
     #[test]
     fn half_res_preserves_alpha_for_every_format() {
         let rgba_rows: [&[u8]; 2] = [
@@ -3522,8 +3462,7 @@ mod tests {
         assert_eq!(rgba, one);
     }
 
-    /// The Windows scRGB multiplier is presentation metadata, not scene
-    /// exposure.
+    /// The Windows scRGB multiplier is presentation metadata, not scene exposure.
     #[test]
     fn scrgb_capture_undoes_sdr_white_scale_before_encoding() {
         let source = half_pixel([0x3c00, 0x3800, 0x0000, 0x3800]);
@@ -3552,8 +3491,7 @@ mod tests {
         );
     }
 
-    /// Over-white channels are compressed together, retaining their ratios
-    /// instead of independent clamping.
+    /// Over-white channels are compressed together, retaining their ratios instead of independent clamping.
     #[test]
     fn scrgb_highlight_tone_map_is_bounded_and_chromatic() {
         let source = half_pixel([0x4400, 0x4000, 0x3c00, 0x3400]);
@@ -3579,8 +3517,7 @@ mod tests {
         );
     }
 
-    /// P3-tagged coordinates must become actual sRGB before an unprofiled PNG
-    /// consumes them.
+    /// P3-tagged coordinates must become actual sRGB before an unprofiled PNG consumes them.
     #[test]
     fn display_p3_capture_converts_primaries_and_srgb_is_byte_exact() {
         let source = [128, 255, 0, 73];
@@ -3626,10 +3563,7 @@ mod tests {
     /// The ulps on each side of a threshold that are walked one by one.
     const THRESHOLD_WINDOW_ULPS: u32 = 4096;
 
-    /// Where `thresholds` departs from the encode's definition near its own
-    /// entries, if it does: each entry must be the first `f32` of its byte, and
-    /// across the window around it the definition must be non-decreasing and
-    /// equal to the table search.
+    /// Where `thresholds` departs from the encode's definition near its own entries, if it does.
     fn threshold_table_error(thresholds: &[f32; 255]) -> Option<String> {
         for (index, &threshold) in thresholds.iter().enumerate() {
             let byte = index as u32 + 1;
@@ -3661,9 +3595,7 @@ mod tests {
         None
     }
 
-    /// `srgb8_from_linear_powf` before its floor, once in its own `f32`
-    /// arithmetic and once in `f64` over the same `f32` constants, which is
-    /// exact to far below the `f32` rounding.
+    /// `srgb8_from_linear_powf` before its floor, in both `f32` and `f64` over the same `f32` constants.
     fn srgb8_unrounded(linear: f32) -> (f64, f64) {
         let clamped = linear.clamp(0.0, 1.0);
         let in_f32 = f64::from(linear_to_srgb(clamped) * 255.0 + 0.5);
@@ -3676,8 +3608,7 @@ mod tests {
         (in_f32, encoded * 255.0 + 0.5)
     }
 
-    /// The table is the definition for every `f32`. Inside each window the two
-    /// are compared one value at a time.
+    /// The table matches the definition for every `f32` across each threshold window.
     #[test]
     fn encode_thresholds_are_exact_and_locally_monotone() {
         let thresholds = &*SRGB8_ENCODE_THRESHOLDS;
@@ -3729,9 +3660,7 @@ mod tests {
         );
     }
 
-    /// The decode table holds `srgb_to_linear` of each byte bit for bit, so
-    /// the two conversions part only at the encode; every linear triple the
-    /// matrix makes from a P3 triple encodes alike by table and by `powf`.
+    /// The decode table holds `srgb_to_linear` bit for bit and every P3 triple encodes alike by table and `powf`.
     #[test]
     fn display_p3_lut_matches_powf_over_every_input() {
         let decoded: [f32; 256] = std::array::from_fn(|byte| {
@@ -3828,8 +3757,7 @@ mod tests {
         );
     }
 
-    /// A recording whose surface encoding changes mid-capture keeps the first
-    /// encoding and flags the recording as mixed.
+    /// A recording whose surface encoding changes mid-capture keeps the first encoding and marks the recording mixed.
     #[test]
     fn a_mid_recording_encoding_change_marks_the_recording_mixed() {
         let srgb = encoding(

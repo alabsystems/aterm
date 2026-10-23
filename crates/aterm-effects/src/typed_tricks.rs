@@ -11,21 +11,12 @@ use aterm_time::{Duration, Instant};
 /// A trick word within this long of the previous fire on the same line belongs to that fire's phrase (`sit down`) and is absorbed; later it is a new request.
 pub const PHRASE_GAP: Duration = Duration::from_millis(1500);
 
-/// The token window, in characters: exactly the longest surface the
-/// vocabulary can hold, so a token that overflows it could never have matched.
 const TOKEN_CHARS: usize = TrickLexicon::MAX_SURFACE_CHARS;
-
-/// Bytes behind one inline word: every character is at most four.
 const WORD_BYTES: usize = TOKEN_CHARS * 4;
 
 const _: () = assert!(WORD_BYTES <= u8::MAX as usize);
 
-/// Characters of the delimiter run left of the caret that are remembered, so
-/// Backspace inside the run knows what it ends with.
 const GAP_WINDOW: usize = 8;
-
-/// Dirty sessions remembered across switches (least recently left is
-/// forgotten first, and a forgotten session reads as new).
 const SESSION_MEMORY: usize = 8;
 
 /// What the listener heard; at most one per fed press.
@@ -94,7 +85,6 @@ struct Cuts {
 }
 
 impl Cuts {
-    /// Not glued: an empty name at byte 0, the whole word the command.
     const WHOLE: Cuts = Cuts {
         at: 1,
         name_first: true,
@@ -239,12 +229,8 @@ const fn is_unspaced_script(c: char) -> bool {
     is_no_space_script(c) && !matches!(c as u32, 0x1100..=0x11FF | 0xAC00..=0xD7AF)
 }
 
-/// The shortest name a glued run may hold: a lone ideograph is a syllable of
-/// prose far more often than a name (`猫爪` is a claw).
 const GLUED_NAME_CHARS: usize = 2;
 
-/// The glued reading of a token that is no vocabulary word, a name and a trick word in either
-/// order: the trick it asks for and every cut that reads it so.
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
     let mut chars = 0usize;
     for c in token.chars() {
@@ -598,7 +584,6 @@ impl TrickListener {
             return false;
         };
         if let Some(rest) = self.dirty.get_mut(at..) {
-            // Close the hole, keeping the order; the freed slot ends up last.
             rest.rotate_left(1);
         }
         if let Some(last) = self.dirty.last_mut() {
@@ -831,12 +816,8 @@ impl TrickListener {
         } else {
             let run = self.line.gap_chars as usize;
             if (2..=GAP_WINDOW).contains(&run) {
-                // Inside a remembered delimiter run (`sit!!⌫`, a doubled
-                // space): the run now ends with the character before.
                 self.line.left = self.line.gap.get(run.saturating_sub(2)).copied();
             } else {
-                // A second boundary crossed backwards, or a run longer than
-                // the window: the content left of the caret is unknown.
                 out = self.go_impure();
             }
             self.line.gap_chars = self.line.gap_chars.saturating_sub(1);
@@ -872,11 +853,6 @@ impl TrickListener {
             && self.line.token_chars as usize >= TOKEN_CHARS
             && aterm_grapheme::char_width(c) == 0
         {
-            // Past the window a mark rides with its base, uncounted: it is not
-            // stored, so Backspace could not know it belongs to the previous
-            // character, and counting it would leave the count high (a Thai
-            // line backspaced to its start would look non-empty). A mark on the
-            // window's last character is thereby left out of the lookup too.
             return None;
         }
         let joins = kind == Kind::Joiner && self.line.token_chars > 0;
@@ -892,7 +868,6 @@ impl TrickListener {
             Kind::Alien => self.poison(),
         };
         if self.line.poisoned {
-            // An alien (or a mark with no base): the count means nothing now.
             return out;
         }
         if kind != Kind::Word && !joins {
@@ -928,8 +903,6 @@ impl TrickListener {
         let mut out = None;
         if self.line.token_chars == 0 {
             if aterm_grapheme::char_width(c) == 0 {
-                // A combining mark with no base in this token attaches to the
-                // delimiter, and Backspace would take both: alien.
                 return self.poison();
             }
             let glued = self.line.tail.is_some()
@@ -969,11 +942,8 @@ impl TrickListener {
             Edge::Stop => {
                 let run_continues = self.line.left.is_some_and(|l| kind_of(l) == Kind::Stop);
                 if run_continues || self.line.any_word || !self.line.pure {
-                    // `sit!!`, `sit...`: the parked verdict stays parked. After
-                    // a word and a space it is French spacing (`assis !`).
                     None
                 } else {
-                    // Before any word it is code: `!sit`, `.hidden`, `..`.
                     self.go_impure()
                 }
             }
@@ -1037,7 +1007,6 @@ impl TrickListener {
         let end_at = self.line.line_chars;
         let (word, word_chars) = self.end_token();
         if !self.line.pure {
-            // An impure line asks nothing: no fold, no probe.
             return None;
         }
         let role = match lexicon {
@@ -1074,7 +1043,6 @@ impl TrickListener {
                 let attention_only =
                     self.line.last_trick == Some(Trick::Look) && trick != Trick::Look;
                 if in_phrase && !attention_only {
-                    // One phrase, one trick: `down` of `sit down` is absorbed.
                     None
                 } else if cuts != Cuts::WHOLE {
                     self.line.guess = Some(Verdict::Fire {
@@ -1312,9 +1280,6 @@ impl TrickListener {
 mod tests {
     use super::*;
 
-    /// A small hermetic vocabulary, so these tests pin the listener rather than
-    /// the shipped word lists (tests against shipped English say so in their
-    /// names).
     const VOCAB: &str = r#"
 [[trick]]
 id      = "sit"
@@ -1467,8 +1432,6 @@ words = ["请"]
 cjk   = true
 "#;
 
-    /// One keystroke of the rig's clock: a brisk typist. Five of them (a
-    /// four-letter word and its space) stay well inside [`PHRASE_GAP`].
     const KEY_GAP: Duration = Duration::from_millis(80);
 
     /// What the rig saw, owned (an event borrows the listener).
@@ -1495,8 +1458,6 @@ cjk   = true
         }
     }
 
-    /// Logs the event, and a fire's command surfaces into `commands`: each a
-    /// non-empty prefix or suffix of the fired word, in every test.
     fn record(seen: &mut Vec<Seen>, commands: &mut Vec<Vec<String>>, feed: TrickFeed<'_>) {
         match feed.event {
             Some(TrickEvent::Fire {
@@ -1527,9 +1488,6 @@ cjk   = true
         }
     }
 
-    /// A listener, a vocabulary, an injected clock and a log. It hands over the
-    /// vocabulary only when the matching `needs_lexicon` predicate asks, so every
-    /// test also proves the predicates never under-ask.
     struct Rig {
         listener: TrickListener,
         lexicon: TrickLexicon,
@@ -1616,8 +1574,6 @@ cjk   = true
             self.now += pause;
         }
 
-        /// A typed script: `␣` is the Space key, `⏎` Enter, `⌫` Backspace,
-        /// anything else a typed character.
         fn run(&mut self, script: &str) -> &mut Rig {
             for c in script.chars() {
                 match c {
@@ -1640,8 +1596,6 @@ cjk   = true
                 .collect()
         }
 
-        /// The line's verdict as the pet would live it: some fire ended
-        /// final (addressed, confirmed, or tentative and never revoked).
         fn something_stuck(&self) -> bool {
             let mut stuck = false;
             let mut tentative = false;
@@ -1878,8 +1832,6 @@ cjk   = true
             rig.run("sit␣");
             rig.key(mark);
             if mark == '_' {
-                // `_` is a token character: it opens a token that is not a
-                // word, which is judged at its own boundary.
                 rig.run("␣");
             }
             assert_eq!(rig.seen.last(), Some(&Seen::Revoke), "{mark:?}");
@@ -2989,9 +2941,6 @@ cjk   = true
         }
     }
 
-    /// The owner's examples, each two-word phrase said once, and `good night
-    /// kitty` as one final sleep (never the praise), against the shipped
-    /// English word lists rather than the fixture vocabulary.
     #[test]
     fn the_shipped_english_answers_the_owners_examples() {
         let mut rig = Rig::shipped_english();
@@ -3025,8 +2974,6 @@ cjk   = true
         assert_eq!(rig.listener.tentative(), None, "final");
     }
 
-    /// Ordinary prose, shell and REPL lines, each typed character by character
-    /// and submitted.
     const ORDINARY_LINES: &[&str] = &[
         "roll back the last commit",
         "jump to line 40",
@@ -3123,9 +3070,6 @@ cjk   = true
         }
     }
 
-    /// The same lines against the shipped English. Which survive depends on the
-    /// word lists; what is pinned is the listener's half: a fire becomes final
-    /// only while every word typed so far is shipped pet vocabulary.
     #[test]
     fn under_the_shipped_english_a_fire_is_final_only_on_an_all_vocabulary_prefix() {
         let shipped = TrickLexicon::shared_en();
@@ -3147,8 +3091,6 @@ cjk   = true
                     )
                 });
                 if is_final && final_at.is_none() {
-                    // Final at the character just typed: judge what stood
-                    // before it.
                     final_at = Some(typed.clone());
                 }
                 typed.push(c);
@@ -3171,7 +3113,6 @@ cjk   = true
         }
     }
 
-    /// xorshift64*: a deterministic stream, no dependency.
     struct Dice(u64);
 
     impl Dice {
@@ -3184,8 +3125,6 @@ cjk   = true
         }
     }
 
-    /// Letters that spell vocabulary, every kind of punctuation, no-space
-    /// scripts, zero-width marks, a four-byte letter and a fold that expands.
     const ALPHABET: &[char] = &[
         's', 'i', 't', 'k', 'y', 'g', 'o', 'd', 'n', 'a', 'p', 'l', 'u', 'm', 'j', 'S', 'T', ' ',
         ' ', ' ', ' ', '\u{3000}', '.', '!', '?', ',', '…', '。', '！', '、', ':', ';', '/', '-',
@@ -3279,8 +3218,6 @@ cjk   = true
             }
         }
 
-        /// The line's words as a reader splits them: at whitespace and fullwidth
-        /// stops, each allowed trailing sentence punctuation.
         fn roles(&self, lexicon: &TrickLexicon) -> Vec<Option<TrickRole>> {
             let text: String = self.line.iter().collect();
             let mut scratch = String::new();
@@ -3291,7 +3228,6 @@ cjk   = true
                 .collect()
         }
 
-        /// `line[start..end]` is a whole word: nothing word-like touches it.
         fn is_whole_word(&self, start: usize, end: usize) -> bool {
             let line = &self.line;
             let bounded_left =
@@ -3302,8 +3238,6 @@ cjk   = true
             bounded_left && bounded_right
         }
 
-        /// The fired word stands where the event says it does — `back_chars`
-        /// left of the caret at the end of the line — as a whole word.
         fn assert_word_at(&self, word: &str, back_chars: u16) {
             let word: Vec<char> = word.chars().collect();
             let line = &self.line;
@@ -3316,8 +3250,6 @@ cjk   = true
             assert!(self.is_whole_word(start, end), "{word:?} on {line:?}");
         }
 
-        /// The same for a word heard inside a commit: the caret stood before the
-        /// whole commit, so the word may lie on either side of it.
         fn assert_word_near(&self, caret: usize, word: &str, back_chars: u16) {
             let word: Vec<char> = word.chars().collect();
             assert!(!word.is_empty());
@@ -3341,10 +3273,6 @@ cjk   = true
         }
     }
 
-    /// One word as a reader takes it. A run that is no word reads as its
-    /// command when any cut makes it a name of two or more characters and a
-    /// trick word, neither `unglued`, all in a script written without spaces
-    /// (not as a name: it names nothing).
     fn read(lexicon: &TrickLexicon, word: &str, scratch: &mut String) -> Option<TrickRole> {
         if let Some(role) = lexicon.classify(word, scratch) {
             return Some(role);
@@ -3376,12 +3304,9 @@ cjk   = true
         })
     }
 
-    /// The events of one closing press (a character, or Enter when
-    /// `closer = None`), judged against the line as it stood.
     fn judge(rig: &Rig, before: usize, editor: &Editor, closer: Option<char>, judging: bool) {
         let heard = &rig.seen[before..];
         if heard.iter().all(|seen| *seen == Seen::Revoke) {
-            // Taking a fire back needs no licence.
             return;
         }
         let line = &editor.line;
@@ -3420,15 +3345,11 @@ cjk   = true
         }
     }
 
-    /// An editing key fires nothing, ever: all it may say is `Revoke`.
     fn assert_only_takes_back(rig: &Rig, before: usize) {
         let heard = &rig.seen[before..];
         assert!(heard.iter().all(|seen| *seen == Seen::Revoke), "{heard:?}");
     }
 
-    /// The event of an IME commit, judged against the text before it and the
-    /// commit: whatever it fired was licensed at a boundary inside it, with
-    /// only pet talk to its left.
     fn judge_commit(rig: &Rig, before: usize, editor: &Editor, commit: &[char], judging: bool) {
         let heard = &rig.seen[before..];
         if heard.iter().all(|seen| *seen == Seen::Revoke) {
@@ -3455,12 +3376,9 @@ cjk   = true
         }
     }
 
-    /// What the listener believes, held against the text.
     fn assert_beliefs_hold(rig: &Rig, editor: &Editor) {
         let listener = &rig.listener;
         if listener.is_poisoned() {
-            // Poison claims nothing, and only a reset — which empties the
-            // editor too — lifts it.
             return;
         }
         let line = &editor.line;

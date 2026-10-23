@@ -265,14 +265,16 @@ impl Judged {
         self.board = Some(board);
     }
 
-    /// Record a sample between looks ([module docs](self)): `board` from `snap`, judged with the last look's sessions and no ring row.
+    /// Record a sample between looks: `board` from `snap`, judged with the last look's sessions
+    /// and no ring row.
     pub(crate) fn sample(&mut self, board: FactsBoard, snap: Option<&Snapshot>) {
         self.sampled_ms = Some(board.taken_unix_ms);
         let sessions = std::mem::take(&mut self.sessions);
         self.step(board, snap, &sessions);
     }
 
-    /// Record that session `sid`'s loop asked the board at `now_unix_ms` under `mode` ([`Self::sampling`]).
+    /// Record that session `sid`'s loop asked the board at `now_unix_ms` under `prompt`; any other
+    /// `mode` clears every ask ([`Self::sampling`]).
     pub(crate) fn asked(&mut self, sid: &str, now_unix_ms: i64, mode: Occupancy) {
         if mode == Occupancy::Prompt {
             self.wanting.insert(sid.to_string(), now_unix_ms);
@@ -571,7 +573,7 @@ struct Waiting {
     asked_ms: i64,
 }
 
-/// THE PACE AND RESERVATION TABLE ([module docs](self)).
+/// THE PACE AND RESERVATION TABLE.
 #[derive(Debug, Default)]
 pub(crate) struct Pace {
     /// When each line of the last hour was granted, unix ms.
@@ -775,6 +777,15 @@ pub(crate) fn mode() -> Occupancy {
         2 => Occupancy::Prompt,
         _ => Occupancy::Observe,
     }
+}
+
+/// THE GUI'S OWN GATE ON A WRITE OF THE OCCUPANCY DOOR'S (the occupancy design's §8 row 2):
+/// whether the owner's mode in force ([`mode`], set from their root `[harness] occupancy`) is
+/// `prompt`. Every host-side writer of slice 2's (a wake's claim, the task record's fact word, a
+/// ready-idle Entry, a wake's event) asks it beside the loop's own grant, so a word a loop tells,
+/// or a replay or an older loop says, never stands for the owner's `prompt`.
+pub(crate) fn prompt_now() -> bool {
+    mode() == Occupancy::Prompt
 }
 
 /// Which look the board takes: the minute tick (which records a ring row) or a poke between ticks.

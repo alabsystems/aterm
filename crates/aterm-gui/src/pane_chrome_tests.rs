@@ -21,7 +21,6 @@ fn cell_box(row: usize, col: usize, rows: usize, cols: usize) -> CellBox {
     }
 }
 
-/// The focus ring of an allocation with no header row.
 fn bare(alloc: CellBox) -> FocusRing {
     FocusRing {
         alloc,
@@ -29,7 +28,6 @@ fn bare(alloc: CellBox) -> FocusRing {
     }
 }
 
-/// A Fluent composite of `rows × cols` seeded by the shipping divider fill.
 fn seeded(rows: usize, cols: usize) -> RenderInput {
     with_split_chrome(SplitChrome::Fluent, || {
         let mut dst = RenderInput::empty();
@@ -48,8 +46,6 @@ fn every_arm_set_has_its_light_box_glyph() {
     assert_eq!(seam_glyph(false, false, false, false), None);
 }
 
-/// The Fluent gap is the terminal's own ground with no glyph until the seam
-/// pass draws it: no seam-tone slab.
 #[test]
 fn a_fluent_gap_is_the_terminal_ground_and_a_classic_one_the_slab() {
     let theme = Theme::default();
@@ -65,10 +61,6 @@ fn a_fluent_gap_is_the_terminal_ground_and_a_classic_one_the_slab() {
     assert_ne!(classic.bg, crate::settings::u32_rgb(theme.bg), "CONTROL");
 }
 
-/// Two panes side by side, each under its header: the gap column is one
-/// hairline from the grid's top to its bottom, in the seam ink (the focus ring
-/// is not a cell colour), on the header band's ground beside the header row
-/// and the terminal's below it.
 #[test]
 fn a_side_by_side_split_gets_one_seam_hairline() {
     let (rows, cols) = (5, 11);
@@ -90,9 +82,6 @@ fn a_side_by_side_split_gets_one_seam_hairline() {
     }
 }
 
-/// A tee: a full-height left pane beside a right column split in two. The
-/// hairlines join (`├`) where the horizontal gap meets the vertical one and
-/// run to the grid's right edge, all in the seam ink.
 #[test]
 fn a_tee_joins_its_hairlines() {
     let (rows, cols) = (7, 11);
@@ -122,7 +111,6 @@ fn a_tee_joins_its_hairlines() {
     assert_eq!(at(1, 5), ('│', INKS.line));
 }
 
-/// The pixels a set of quads covers, `(x, y)`.
 fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(u16, u16)> {
     quads
         .iter()
@@ -130,11 +118,6 @@ fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(u16, u16)> {
         .collect()
 }
 
-/// THE FOCUS RING SAYS WHICH SIDE HAS FOCUS. Two panes side by side at the
-/// 9×23 Windows cell (hairline at the gap's pixel 4): the left pane focused
-/// puts one accent line at the gap's pixel 2, the right pane at pixel 6, each
-/// the whole allocation tall, two pixels from the text and one stroke from
-/// the hairline; nothing on the window's edges.
 #[test]
 fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
     let (rows, cols) = (30, 111);
@@ -192,9 +175,6 @@ fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
     assert!(ring_of(cell_box(0, 0, rows, cols)).is_empty());
 }
 
-/// In a 2×2 grid the ring is an L hugging the focused pane's inner corner:
-/// the vertical line stops on the horizontal one, both one stroke inside the
-/// hairlines, and at 2x every offset doubles.
 #[test]
 fn the_ring_turns_the_inner_corner_at_every_scale() {
     for (cw, ch, t) in [(9u32, 23u32, 1u32), (18, 46, 2)] {
@@ -236,13 +216,6 @@ fn the_ring_turns_the_inner_corner_at_every_scale() {
     }
 }
 
-/// THE RING MEETS THE HEADER'S RULE IN AN L. Two panes side by side, each
-/// under a header, either focused, at the 100%, 150% and 200% Windows cells:
-/// the ring's side line starts on the top row of the header's accent rule
-/// (`crate::pane_header::focus_rule_rows`) and runs to the grid's foot, and on
-/// the rule's rows the ring fills every pixel between that line and the
-/// pane's edge, where the rule itself begins, so the two strokes join; nothing
-/// of the ring stands above the rule or past the line.
 #[test]
 fn the_ring_meets_the_header_rule_in_an_l() {
     for (cw, ch) in [(9u32, 23u32), (13, 33), (14, 35), (18, 46)] {
@@ -304,7 +277,6 @@ fn the_ring_meets_the_header_rule_in_an_l() {
     }
 }
 
-/// The pixels a set of rectangles `(x, y, w, h)` covers.
 fn covered_rects(rects: &[(u32, u32, u32, u32)]) -> std::collections::BTreeSet<(u32, u32)> {
     rects
         .iter()
@@ -312,7 +284,6 @@ fn covered_rects(rects: &[(u32, u32, u32, u32)]) -> std::collections::BTreeSet<(
         .collect()
 }
 
-/// A retained row keeps what the last frame drew there.
 #[test]
 fn a_retained_row_is_left_alone() {
     let (rows, cols) = (3, 7);
@@ -327,11 +298,6 @@ fn a_retained_row_is_left_alone() {
     assert_eq!(dst.cells[2][3].ch, '│');
 }
 
-/// A real split composed under each chrome: Fluent draws the hairline down
-/// the gap column in the seam ink, inks no half-block, and rings the focused
-/// pane on its own side of the hairline, moving with focus and gone while the
-/// window is unfocused; Classic keeps its slab and ring
-/// (`app_render_active_pane_mark_compose_tests`).
 #[test]
 fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -458,10 +424,6 @@ fn a_composed_fluent_split_has_a_hairline_gap_and_no_half_block() {
     });
 }
 
-/// A ROW OF PANE HEADERS IS ONE BAR ACROSS THE DIVIDER: in a composed Fluent
-/// split the gap cell of the header row wears the headers' own fill
-/// ([`SeamInks::band`], `crate::pane_header::header_colors`), whatever that
-/// fill is.
 #[test]
 fn the_gap_between_two_headers_wears_their_fill() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -524,8 +486,6 @@ fn inputs() -> OverlayInputs {
     }
 }
 
-/// What `quad` shows over `under`: its premultiplied colour plus what its
-/// opacity lets through.
 fn seen(quad: &GlowQuad, under: [u8; 3]) -> [u8; 3] {
     let a = u32::from(quad.alpha);
     std::array::from_fn(|i| {
@@ -548,7 +508,6 @@ fn pane(session: u64, rect: CellBox, focused: bool, offset: u32, history: u32) -
     }
 }
 
-/// One frame of `facts` at `now`: the quads, and whether a bar is fading.
 fn frame(
     overlay: &mut PaneOverlay,
     pill: &mut crate::scroll_motion::PillFade,
@@ -573,10 +532,6 @@ fn max_alpha(quads: &[GlowQuad]) -> u8 {
     quads.iter().map(|q| q.alpha).max().unwrap_or(0)
 }
 
-/// THE SCROLLBAR'S STATES: nothing at the live bottom; a scrolling pane's thumb
-/// at the active opacity, fading after the hold; a view parked in history keeps
-/// a quieter resting thumb; every quad in the window's right padding, none on a
-/// column of text.
 #[test]
 fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
     let lit = |alpha: u8| scrollbar::rest_alpha(alpha, inputs().fluent);
@@ -622,7 +577,6 @@ fn the_bar_is_hidden_live_active_while_scrolling_and_resting_while_parked() {
     assert!(quads.is_empty() && !fading, "faded out at the bottom");
 }
 
-/// THE RESTING THUMB IN A FLUENT GAP KEEPS A STROKE OF GROUND FROM THE RING.
 #[test]
 fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
     let ring_rgb = [0x50, 0xfa, 0x7b];
@@ -720,9 +674,6 @@ fn a_resting_gap_thumb_keeps_a_stroke_of_ground_from_the_ring() {
     }
 }
 
-/// ONE RESTING IDIOM IN A SPLIT (the Fluent chrome): two panes side by side,
-/// both parked in history, so the left pane's thumb rests in the divider gap
-/// and the right pane's in the window's padding.
 #[test]
 fn a_split_rests_both_its_thumbs_in_one_idiom() {
     let (left, right) = (cell_box(0, 0, 30, 55), cell_box(0, 56, 30, 55));
@@ -825,9 +776,6 @@ fn a_split_rests_both_its_thumbs_in_one_idiom() {
     }
 }
 
-/// THE WIDENED GAP THUMB LEAVES THE RING WHOLE (the Fluent chrome): two panes
-/// side by side, the left one parked in history and under the pointer, either
-/// pane focused, at the 100%, 150% and 200% Windows cells.
 #[test]
 fn a_hovered_gap_thumb_leaves_the_ring_whole() {
     let ring_rgb = [0x50, 0xfa, 0x7b];
@@ -927,8 +875,6 @@ fn a_hovered_gap_thumb_leaves_the_ring_whole() {
     }
 }
 
-/// Reduce Motion hides the bar without a ramp: full until the hold ends, then
-/// gone.
 #[test]
 fn reduce_motion_shows_and_hides_without_a_ramp() {
     let mut overlay = PaneOverlay::default();
@@ -959,8 +905,6 @@ fn reduce_motion_shows_and_hides_without_a_ramp() {
     assert_eq!(step(0, mid_ramp), 0, "no half-faded frame");
 }
 
-/// Under the pointer the thumb widens over a faint track; dragged, it is the
-/// most opaque.
 #[test]
 fn the_hovered_bar_widens_over_a_track() {
     let mut overlay = PaneOverlay::default();
@@ -989,7 +933,6 @@ fn the_hovered_bar_widens_over_a_track() {
     assert!(overlay.drag.is_none() && overlay.hover.is_none());
 }
 
-/// No history, or the alternate screen up: no bar, even hovered.
 #[test]
 fn a_pane_without_history_or_on_the_alternate_screen_has_no_bar() {
     let mut overlay = PaneOverlay::default();
@@ -1007,9 +950,6 @@ fn a_pane_without_history_or_on_the_alternate_screen_has_no_bar() {
     assert!(quads.is_empty());
 }
 
-/// THE UNFOCUSED PANE'S CURSOR: a hollow outline of its own cursor colour on
-/// its cursor cell (the chrome rows above counted); the focused pane's cursor
-/// is the frame's own and gets none, and a hidden cursor none.
 #[test]
 fn an_unfocused_pane_shows_a_hollow_cursor_and_the_focused_one_none() {
     let mut overlay = PaneOverlay::default();
@@ -1044,8 +984,6 @@ fn an_unfocused_pane_shows_a_hollow_cursor_and_the_focused_one_none() {
     assert!(quads.is_empty());
 }
 
-/// The splice takes back what it appended last, wherever it is, and appends
-/// this frame's: run twice over an unrefilled stream it does not double.
 #[test]
 fn the_splice_never_doubles_its_quads() {
     let mut app = App::headless_for_test();
@@ -1081,17 +1019,12 @@ fn the_splice_never_doubles_its_quads() {
     assert_eq!(app.windows[&wid].input_scratch.nova_add, vec![foreign]);
 }
 
-/// The window pixel at terminal-grid pixel `(gx, gy)` of a headless window
-/// (frame origin at the window's).
 fn window_px(app: &App, wid: WindowId, gx: f64, gy: f64) -> (f64, f64) {
     let ch = app.win_cell_size(wid).1;
     let top = app.win_pad_top(wid) + app.win_head(wid) + usize::from(app.chrome_rows(wid)) * ch;
     (gx + app.win_pad(wid) as f64, gy + top as f64)
 }
 
-/// THE POINTER: hovering the bar's gutter widens it; a press on the thumb
-/// grabs it and dragging up scrolls that pane into history; the release lets
-/// go; a press on the track above the thumb pages up.
 #[test]
 fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     let mut app = App::headless_for_test();
@@ -1166,8 +1099,6 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     assert_eq!(app.windows[&wid].pane_overlay.hover, None);
 }
 
-/// A RE-GRID LEAVES THE LAST FRAME'S BARS ANSWERING NOTHING: the bar laid and
-/// the pointer on its thumb.
 #[test]
 fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     let mut app = App::headless_for_test();
@@ -1278,8 +1209,6 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     );
 }
 
-/// THE ROW LAW (`docs/DESIGN-render-integrity-2026-09-28.md` §3, clause 1): the
-/// bar is a zero-row, zero-column surface.
 #[test]
 fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
     with_split_chrome(SplitChrome::Fluent, || {
@@ -1376,8 +1305,6 @@ fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
     });
 }
 
-/// `scrollbar = false` draws and hit-tests nothing (the legacy pill keeps its
-/// place); the Fluent split's hollow cursors still draw.
 #[test]
 fn the_scrollbar_off_draws_no_bar() {
     let mut app = App::headless_for_test();

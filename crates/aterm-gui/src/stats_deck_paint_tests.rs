@@ -22,7 +22,6 @@ pub(crate) const MIN_MS: i64 = 60_000;
 pub(crate) const GIB: f64 = 1_073_741_824.0;
 /// The front tab's key.
 pub(crate) const FRONT: u64 = 2;
-/// T-G4's 40-character tab label.
 const LONG_TAB: &str = "release build of the whole workspace now";
 const EPS: f64 = 0.01;
 
@@ -43,7 +42,6 @@ pub(crate) enum Scene {
     Costly,
 }
 
-/// A fixed sequence of numbers in `a..b`.
 struct Rng(u64);
 
 impl Rng {
@@ -56,7 +54,6 @@ impl Rng {
     }
 }
 
-/// Each row's last ten minutes.
 struct Story {
     heat: [Vec<Option<f64>>; 7],
     over: [Vec<bool>; 7],
@@ -187,7 +184,6 @@ fn series(now: f64, capacity: f64) -> Series {
     }
 }
 
-/// Builds a resource row from `now`, `cap`, `story` row `i`, and front-tab figure `tab`.
 fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig) -> ResourceView {
     let (heat, over) = (&st.heat[i], &st.over[i]);
     let ring: Vec<Cell> = heat
@@ -215,7 +211,6 @@ fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig)
     }
 }
 
-/// The owner's M5: six Super cores and twelve Performance cores, busy.
 const M5: [(&str, &str, &[f32]); 2] = [
     ("Super", "S", &[1.0, 0.99, 1.0, 0.98, 1.0, 0.97]),
     (
@@ -639,12 +634,10 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     }
 }
 
-/// The deck's height in pt for `form`, over 14 pt cells.
 fn deck_pt(form: DeckForm, s: f64) -> f64 {
     deck_px(StatsBars::Deck, form, s, (14.0 * s) as usize) as f64 / s
 }
 
-/// A deck `w` pt wide at scale `s`.
 fn geom(w: f64, s: f64, form: DeckForm) -> DeckGeom {
     DeckGeom {
         w: (w * s) as f32,
@@ -662,12 +655,10 @@ fn laid(sc: Scene, w: f64, s: f64, form: DeckForm, m: &FaceMetrics, draw: bool) 
     lay(&geom(w, s, form), &input, &words, m, draw)
 }
 
-/// Every width of T-G4's sweep: 160 to 5120 pt in 1 pt steps.
 fn sweep_widths() -> impl Iterator<Item = f64> {
     (160..=5120).map(f64::from)
 }
 
-/// One deck of the sweep and how it was laid.
 struct Swept<'a> {
     face: &'static str,
     m: &'a FaceMetrics,
@@ -677,7 +668,6 @@ struct Swept<'a> {
     laid: Laid,
 }
 
-/// T-G4's sweep over `scenes`.
 fn sweep(scenes: &[Scene], check: impl Fn(&Swept<'_>) -> Vec<String> + Sync) -> Vec<String> {
     let snaps: Vec<(Scene, Snapshot)> = scenes.iter().map(|&sc| (sc, scene(sc))).collect();
     let faces = [
@@ -738,11 +728,6 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] < b[2] - EPS && b[0] < a[2] - EPS && a[1] < b[3] - EPS && b[1] < a[3] - EPS
 }
 
-/// T-G4: in every scene, the worst case and the calm, troubled, first-run
-/// and harness-off ones, every text box stays inside its column and the
-/// card; no box meets another (a text, a mark, a strip and its caps' room, a
-/// bar, a swatch or a cluster of cores), so descenders clear the next row's
-/// caps at every pitch.
 #[test]
 fn no_text_overlaps_and_none_leaves_the_card() {
     let scenes = [
@@ -803,9 +788,6 @@ fn no_text_overlaps_and_none_leaves_the_card() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// T-G14: the key's "over max" is drawn wherever the header leaves a span
-/// wide enough for it, which it always does but in fslim with a state label
-/// in both blocks; the time label is drawn once in Folded.
 #[test]
 fn key_is_placed() {
     let failed = sweep(&[Scene::Worst], |d| {
@@ -843,8 +825,6 @@ fn key_is_placed() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// T-G9: §13's worst case draws at most 1000 prims at 5120 px, and no width
-/// draws more than 420 strip cells.
 #[test]
 fn work_counts_deck() {
     let m = FaceMetrics::helvetica_neue();
@@ -867,8 +847,6 @@ fn work_counts_deck() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// The CPU row's Details column and its row's top, where the deck draws one
-/// (the Full table's, or the Folded first block's).
 fn cpu_details(w: f64, form: DeckForm, m: &FaceMetrics) -> Option<(Col, f64, f64)> {
     match form {
         DeckForm::Full => {
@@ -882,15 +860,6 @@ fn cpu_details(w: f64, form: DeckForm, m: &FaceMetrics) -> Option<(Col, f64, f64
     }
 }
 
-/// RD §4.1: the cause clause folds after busiest and before the load, so
-/// the CPU row's Details read the load, then `∵ Spotlight`, then busiest, a
-/// prefix of that order at every width, one ` · ` between each two clauses
-/// drawn (held at the three widths below); its ∵ is a Mark box keyed `cause`
-/// just ahead of its words, three dots two above one. In Helvetica Neue at
-/// 2×, all three are long at W 1424 (a 439 pt column), all three short at
-/// W 1175 (250 pt), busiest is gone at W 1119 (194 pt), and W 900
-/// draws no Details and so no clause; the Calm scene, with no cause held,
-/// draws none anywhere.
 #[test]
 fn the_cause_clause_folds_before_load_and_after_busiest() {
     let m = FaceMetrics::helvetica_neue();
@@ -937,8 +906,6 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
         cause[0].r,
         words.r
     );
-    // The ∵ is three dots inside its box, two above and one below between
-    // them, in words2 whatever its words' ink.
     let inks = super::tests::dark_inks();
     assert_ne!(inks.words2, inks.words, "CONTROL: the inks differ");
     let [x0, y0, x1, y1] = cause[0].r.map(|v| (v * 2.0) as f32);
@@ -1037,7 +1004,6 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
     assert!(seen > 100, "CONTROL: the clause drawn at {seen} widths");
 }
 
-/// The boxes T-G2 holds fixed: the strips, the bars and the cores.
 fn frame(laid: &Laid) -> Vec<(BoxKind, [f64; 4])> {
     laid.boxes
         .iter()
@@ -1046,8 +1012,6 @@ fn frame(laid: &Laid) -> Vec<(BoxKind, [f64; 4])> {
         .collect()
 }
 
-/// T-G2: the layout reads no data. Calm and trouble lay the same strips,
-/// bars and cores at every kind of either form.
 #[test]
 fn layout_ignores_data() {
     let m = FaceMetrics::helvetica_neue();
@@ -1065,9 +1029,6 @@ fn layout_ignores_data() {
     }
 }
 
-/// Every core square stands apart from the next by a device px at 1× and
-/// 2×, in every cores mode the widths reach (the block's sizes, big, stack
-/// and tiny), so a 128-core grid reads as squares, never as bars.
 #[test]
 fn core_squares_never_touch() {
     let m = FaceMetrics::helvetica_neue();
@@ -1113,9 +1074,6 @@ fn core_squares_never_touch() {
     assert!(squares > 10_000, "CONTROL: {squares} squares drawn");
 }
 
-/// §6.4 and §19 item 2: freed reaches the compact Disk amount in fwide (W
-/// 1119, Folded, no Details) and in Full slim from W 348, in Helvetica
-/// Neue's metrics: "1.11 TB used · freed 41 GB" fits their 117 pt.
 #[test]
 fn freed_reaches_the_compact_amounts() {
     let m = FaceMetrics::helvetica_neue();
@@ -1140,15 +1098,12 @@ fn freed_reaches_the_compact_amounts() {
     }
 }
 
-/// `v` pt in device px, as the painter rounds.
 fn px(v: f64, s: f64) -> f32 {
     (v * s + 0.5).floor() as f32
 }
 
-/// A table's strip, its rows, and which resource each row index reads.
 type StripRows = (Strip, Rows, Vec<(u32, Resource)>);
 
-/// The strips the tables lay, each with its rows' tops and resources.
 fn strips(w: f64, form: DeckForm, m: &FaceMetrics) -> Vec<StripRows> {
     match form {
         DeckForm::Full => {
@@ -1180,8 +1135,6 @@ fn strips(w: f64, form: DeckForm, m: &FaceMetrics) -> Vec<StripRows> {
     }
 }
 
-/// T-G7: a column with no reading is a hollow outline (cells of 4 × 4 px
-/// and more) or a 1 px tick along its bottom (smaller), never a heat cell.
 #[test]
 fn a_gap_is_never_drawn_as_step_zero() {
     let m = FaceMetrics::helvetica_neue();
@@ -1263,7 +1216,6 @@ fn a_gap_is_never_drawn_as_step_zero() {
     );
 }
 
-/// The widths at which a Full plan is of each kind (Helvetica Neue).
 fn full_width(kind: FullKind, m: &FaceMetrics) -> f64 {
     let ws: Vec<f64> = sweep_widths()
         .filter(|&w| {
@@ -1284,7 +1236,6 @@ fn folded_width(kind: BlockKind, m: &FaceMetrics) -> f64 {
     ws.get(ws.len() / 3).copied().unwrap_or(0.0)
 }
 
-/// What a row's column draws, left to right.
 fn texts_in(laid: &Laid, col: Col, y0: f64, y1: f64) -> Vec<String> {
     let mut found: Vec<&Boxed> = laid
         .boxes
@@ -1353,9 +1304,6 @@ fn rule_s(
     }
 }
 
-/// T-G8: a row's warn, critical, stuck or low is said in words where
-/// Details is absent, at rule S's first tier that fits; fslim says each
-/// block's worst state in its header, naming the resource.
 #[test]
 fn state_is_said_in_words_without_details() {
     let m = FaceMetrics::helvetica_neue();
@@ -1464,7 +1412,6 @@ fn state_is_said_in_words_without_details() {
     assert!(said >= 10, "CONTROL: {said} states read");
 }
 
-/// What the pointer at `(x, y)` pt names: the first hit containing it.
 fn hit_at(hits: &[Hit], x: f64, y: f64, s: f64) -> Option<HitKind> {
     let (x, y) = ((x * s) as f32, (y * s) as f32);
     hits.iter()
@@ -1530,10 +1477,6 @@ fn strip_col(strip: Strip) -> Col {
     }
 }
 
-/// T-G10: the Full and Folded hit maps of §11.1 and §11.2. Each row from
-/// its name to its Details names the row, its aterm and Tab cells their
-/// scope; the cores name Cores; the header names How to read; the
-/// divider's gutter names nothing; fslim's state label names its row.
 #[test]
 fn hit_map() {
     let m = FaceMetrics::helvetica_neue();
@@ -1630,9 +1573,6 @@ fn hit_map() {
     }
 }
 
-/// The gallery: each scene at each width, scale, form and ground, as PNGs
-/// in the directory `ATERM_DECK_GALLERY` names, drawn in the installed UI
-/// face. Run by hand and read beside the mockups.
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_gallery() {

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Glint wave field for the mascot and harness glass ([`GLINT_PERIOD_MS`], [`FLOW_STEP_MS`],
-//! [`GLINT_CELLS_PER_S`], [`GLINT_TAIL_CELLS`], [`GLINT_RISE_CELLS`], [`GLINT_ECHO_CELLS`],
-//! [`GLINT_ECHO_GAIN`], [`GLINT_LEVELS`], [`GLINT_ROW_ASPECT`], [`cell_distance`],
-//! [`claude_glint`], [`GLINT_LAP`], [`glint`], [`TWINKLE_FLASH_BOUND_HZ`]).
+//! Glint wave field for the mascot and harness glass ([`GLINT_PERIOD_MS`](crate::ripple::GLINT_PERIOD_MS), [`FLOW_STEP_MS`](crate::ripple::FLOW_STEP_MS),
+//! [`GLINT_CELLS_PER_S`](crate::ripple::GLINT_CELLS_PER_S), [`GLINT_TAIL_CELLS`](crate::ripple::GLINT_TAIL_CELLS), [`GLINT_RISE_CELLS`](crate::ripple::GLINT_RISE_CELLS), [`GLINT_ECHO_CELLS`](crate::ripple::GLINT_ECHO_CELLS),
+//! [`GLINT_ECHO_GAIN`](crate::ripple::GLINT_ECHO_GAIN), [`GLINT_LEVELS`](crate::ripple::GLINT_LEVELS), [`GLINT_ROW_ASPECT`](crate::ripple::GLINT_ROW_ASPECT), [`cell_distance`](crate::ripple::cell_distance),
+//! [`claude_glint`](crate::ripple::claude_glint), [`GLINT_LAP`](crate::ripple::GLINT_LAP), [`glint`](crate::ripple::glint), [`TWINKLE_FLASH_BOUND_HZ`]).
 
 use crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
 

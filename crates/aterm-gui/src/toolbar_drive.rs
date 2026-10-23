@@ -186,6 +186,8 @@ mod macos {
         }
     }
 
+    /// `+[NSEvent mouseEventWithType:…]`, encoded
+    /// `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`.
     unsafe fn mouse_event(
         kind: usize,
         loc: CGPoint,
@@ -193,7 +195,9 @@ mod macos {
         win: isize,
         clicks: isize,
     ) -> Id {
-        // SAFETY: a class method on `NSEvent` (linked), cast to the exact prototype above; every argument is a plain scalar or nil.
+        // SAFETY: a class method on `NSEvent` (linked), cast to its exact prototype
+        // `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88` (`pressure` is `f32`); every argument is
+        // a plain scalar or nil.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -224,8 +228,10 @@ mod macos {
         }
     }
 
+    /// `+[NSEvent keyEventWithType:…]`, encoded
+    /// `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
-        // SAFETY: as [`mouse_event`], against the signature above.
+        // SAFETY: as [`mouse_event`], against `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,

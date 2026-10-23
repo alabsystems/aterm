@@ -617,8 +617,7 @@ impl Via {
 pub struct Peer {
     /// Its node id; `None` for a peer a person named (or a copy of one).
     pub node: Option<String>,
-    /// The node key the book binds that node id to; `None` for a node an older aterm recorded,
-    /// bound at its next registration, and for a peer a person named.
+    /// The node key the book binds that node id to; `None` for a node an older aterm recorded, bound at its next registration, and for a peer a person named.
     pub key: Option<NodeKey>,
     /// Where a node bound to no key may bind one, when that is not [`Peer::addr`]: the address its entry was recorded from before a registration that proved no key moved it ([`record`]).
     pub key_from: Option<IpAddr>,
@@ -1061,9 +1060,7 @@ pub fn remove(book: &mut Vec<Peer>, copies: &[Peer], what: &str) -> Result<Peer,
     }
 }
 
-/// The node keys this machine binds, node id to key: its book's — on the issuer every member that
-/// registered since keys came, on a member its issuer — then a member's copy of its issuer's
-/// book's.
+/// The node keys this machine binds, node id to key: its book's — on the issuer every member that registered since keys came, on a member its issuer — then a member's copy of its issuer's book's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keyring {
     own: Vec<(String, NodeKey)>,
@@ -2098,9 +2095,7 @@ pub enum Unreached {
         /// The node the book holds there: what `aterm fleet peers rm` takes when that machine left.
         want: String,
     },
-    /// The address claimed this node and proved another key than the one this machine binds it to
-    /// ([`Keyring`]): not that node, so its survey was never asked; and the peer's name did not
-    /// answer as that node either.
+    /// The address claimed this node and proved another key than the one this machine binds it to ([`Keyring`]): not that node, so its survey was never asked; and the peer's name did not answer as that node either.
     Impostor {
         /// The address that answered.
         at: SocketAddr,
@@ -3359,9 +3354,7 @@ fn reply_node(
 ) -> Result<(Option<String>, bool), Unreached> {
     match answered {
         Some((node, proven)) => {
-            // A peer that proved a node speaks for that node alone: a header
-            // anywhere in its reply that names another is its word against
-            // its proof, and nothing it sent is read.
+            // A peer that proved a node speaks for that node alone: a header anywhere in its reply that names another is its word against its proof, and nothing it sent is read.
             if let Some(claimed) = header_nodes(lines).find(|claimed| *claimed != node) {
                 return Err(Unreached::Misnamed {
                     at,
@@ -3372,8 +3365,7 @@ fn reply_node(
             Ok((Some(node), proven || mine))
         }
         None => {
-            // A header that names a node bound to a key, from a peer that
-            // proved none, is that node's name without its key.
+            // A header that names a node bound to a key, from a peer that proved none, is that node's name without its key.
             if let Some(said) = header_nodes(lines).find(|said| keys.bound(said).is_some()) {
                 return Err(Unreached::Unproved { at, node: said });
             }

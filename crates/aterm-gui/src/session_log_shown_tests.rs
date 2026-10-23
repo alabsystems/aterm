@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE PERSON IS SHOWN IS A `shown` MARK:
-//! each move of the printed need tuple (`status needs=`, its
-//! severity, `hold_by=`) the one verdict writer publishes
-//! (`SessionTimeline::set_need`) is one `mark - shown` by aterm, never a
-//! publication that moves only the verdict's other facts; a per-session
-//! bucket coalesces a flapping verdict to its newest tuple, which is never
-//! lost; the mark is local and journaled, one `brief` count line, and the
-//! carry keeps the tuple so a successor does not restate it. Every test is
-//! driven by explicit publications on a hand-set clock.
+//! Tests for `shown` session-log marks emitted on need-tuple changes.
 
 use aterm_slog::{Kind, Op, Rec, Tier, Val};
 use aterm_types::needs::{HoldWord, NeedWord, Severity, WaitWord};
@@ -24,7 +16,6 @@ use crate::session_store::{SessionHandle, SessionStore, test_handle};
 use crate::session_timeline::SessionTimeline;
 use crate::{App, WindowId};
 
-/// The need `word` as a verdict shows it.
 fn need(word: NeedWord) -> Option<Need> {
     Some(Need {
         word,
@@ -34,7 +25,6 @@ fn need(word: NeedWord) -> Option<Need> {
     })
 }
 
-/// A verdict that prints `word` and `held`.
 fn verdict(word: Option<NeedWord>, held: Option<HoldWord>) -> Verdict {
     Verdict {
         need: word.and_then(need),
@@ -43,7 +33,6 @@ fn verdict(word: Option<NeedWord>, held: Option<HoldWord>) -> Verdict {
     }
 }
 
-/// A registered session on a hand clock.
 fn rig(local: u64) -> (SessionHandle, SessionStore, Hand) {
     let h = test_handle(local);
     let hand = hand_clock(&h.ctx.timeline);
@@ -52,12 +41,10 @@ fn rig(local: u64) -> (SessionHandle, SessionStore, Hand) {
     (h, store, hand)
 }
 
-/// One publication of the verdict writer.
 fn publish(h: &SessionHandle, v: Verdict) -> bool {
     h.ctx.timeline.lock().unwrap().set_need(v)
 }
 
-/// A field as its row prints it, `-` for none.
 fn word(r: &Rec, key: Key) -> String {
     match r.f.get(key) {
         Some(Val::U(n)) => n.to_string(),
@@ -66,17 +53,14 @@ fn word(r: &Rec, key: Key) -> String {
     }
 }
 
-/// The session's shown marks, each `<need> <sev> <held>[ coalesced=<n>]`.
 fn shown(h: &SessionHandle) -> Vec<String> {
     shown_after(h, 0)
 }
 
-/// [`shown`] past log seq `seq` (a successor's own, past what it carried).
 fn shown_after(h: &SessionHandle, seq: u64) -> Vec<String> {
     shown_in(&h.ctx.timeline, seq)
 }
 
-/// The shown marks past log seq `seq` in the session log `tl` holds.
 fn shown_in(tl: &Mutex<SessionTimeline>, seq: u64) -> Vec<String> {
     tl.lock()
         .unwrap()
@@ -99,8 +83,6 @@ fn shown_in(tl: &Mutex<SessionTimeline>, seq: u64) -> Vec<String> {
         .collect()
 }
 
-/// The `i`th publication of a verdict that flaps between an approval and a
-/// question.
 fn flap(i: u64) -> Verdict {
     let word = if i.is_multiple_of(2) {
         NeedWord::Approval
@@ -110,10 +92,6 @@ fn flap(i: u64) -> Verdict {
     verdict(Some(word), None)
 }
 
-/// A TUPLE MOVE IS ONE MARK: the first publication, which shows nothing, is
-/// no news; then a need, a hold over it, another need under the hold, and
-/// nothing, each one publication and one `mark - shown` by aterm on the
-/// session, its fields the printed words (each absent for none).
 #[test]
 fn a_move_of_the_printed_tuple_is_one_shown_mark() {
     let (h, _store, hand) = rig(81);
@@ -154,11 +132,6 @@ fn a_move_of_the_printed_tuple_is_one_shown_mark() {
     );
 }
 
-/// 100 SWEEPS THAT MOVE NO PRINTED TUPLE WRITE NO MARK: a need shown, then
-/// 100 publications a second apart, each moving the verdict (its recheck
-/// instant every time, its wait every other) and none what it prints.
-/// NEGATIVE CONTROL (by scratch revert): keyed on the verdict's `moved`,
-/// each writes one.
 #[test]
 fn sweeps_that_move_no_printed_tuple_write_no_shown_mark() {
     let (h, _store, hand) = rig(82);
@@ -180,12 +153,6 @@ fn sweeps_that_move_no_printed_tuple_write_no_shown_mark() {
     assert_eq!(shown(&h), ["question decide -"], "no tuple moved");
 }
 
-/// A VERDICT FLAPPING 200 TIMES IN ONE HAND-SET SECOND writes the bucket
-/// ([`PROGRAM_BURST`] marks) at once, then, once a token frees (the status
-/// sweep's tick a second on), its newest tuple with `coalesced=` the tuples
-/// it replaced: the newest is never lost. NEGATIVE CONTROL (by scratch
-/// revert): a bucket that keeps its oldest pending tuple (drop-newest) ends
-/// on a stale one.
 #[test]
 fn a_flapping_verdict_writes_the_bucket_then_its_newest_tuple() {
     let (h, _store, hand) = rig(83);
@@ -210,15 +177,9 @@ fn a_flapping_verdict_writes_the_bucket_then_its_newest_tuple() {
     );
 }
 
-/// THE NEWEST TUPLE IS WRITTEN BEFORE THE CLOSE AND THE CARRY: a flap past
-/// the bucket, then the session closes: its pending tuple is a mark before
-/// the session's close. Across a seamless update, the carry names the tuple
-/// last shown (the pending one written first), so the successor's
-/// publication of the same tuple writes nothing and another one does.
 #[test]
 fn the_newest_shown_tuple_is_written_before_the_close_and_the_carry() {
     let burst = PROGRAM_BURST + 1;
-    // The close.
     let (h, mut store, hand) = rig(84);
     hand.set(1_000);
     for i in 0..burst {
@@ -239,7 +200,6 @@ fn the_newest_shown_tuple_is_written_before_the_close_and_the_carry() {
     assert!(last_shown < close, "written before the close");
     assert_eq!(word(tail[last_shown], Key::Held), "local", "the newest");
     drop(g);
-    // The carry.
     let (h, store, hand) = rig(85);
     hand.set(1_000);
     for i in 0..burst {
@@ -270,9 +230,6 @@ fn the_newest_shown_tuple_is_written_before_the_close_and_the_carry() {
     );
 }
 
-/// THE SHOWN WORDS ARE THE LOG'S: every printed need word, severity and
-/// hold word is in its key's list, so every tuple's mark carries each of
-/// its fields. NEGATIVE CONTROL: a word outside a list is refused.
 #[test]
 fn the_shown_words_are_the_logs() {
     for w in NeedWord::ALL {
@@ -309,9 +266,6 @@ fn the_shown_words_are_the_logs() {
     assert!(Fields::new().word(Key::Held, "fleet").is_err());
 }
 
-/// THE MARK IS LOCAL AND JOURNALED, ONE COUNT LINE: a shown mark is no bus
-/// class (the mirror refuses it), is in the journal's lines, and `brief`
-/// counts the shown marks on a count line (`shown <n>`).
 #[test]
 fn the_shown_mark_is_local_journaled_and_one_brief_count_line() {
     let (h, _store, hand) = rig(87);
@@ -354,9 +308,6 @@ fn the_shown_mark_is_local_journaled_and_one_brief_count_line() {
     assert!(brief.lines().any(|l| l == "shown 2"), "{brief}");
 }
 
-/// THE PRESENCE SWEEP'S PUBLICATION IS THE WRITER (`App::publish_need`): a
-/// person's attention text (an ask) published is one shown mark on the
-/// session; the same verdict published again is none.
 #[test]
 fn the_need_publication_writes_the_shown_mark() {
     let mut app = App::headless_for_test();
@@ -387,14 +338,6 @@ fn the_need_publication_writes_the_shown_mark() {
     assert_eq!(marks, ["ask decide"]);
 }
 
-/// THE STATUS SWEEP WRITES THE NEWEST TUPLE ONCE A TOKEN FREES (U44; the
-/// review of 6F-9): on an App's session, a verdict flapping 200 times in one
-/// hand-set second writes the bucket, then the real status sweep
-/// (`observe_session_statuses`, the pass that ticks the program and shown
-/// buckets) a hand-set second later writes its newest tuple, `coalesced=`
-/// the 179 it replaced, with no later move and no close to force it out.
-/// NEGATIVE CONTROL (by scratch revert): a sweep that does not call
-/// `shown_tick` leaves the newest tuple pending.
 #[test]
 fn the_status_sweep_writes_the_newest_shown_tuple_once_a_token_frees() {
     let mut app = App::headless_for_test();
@@ -422,14 +365,6 @@ fn the_status_sweep_writes_the_newest_shown_tuple_once_a_token_frees() {
     );
 }
 
-/// THE NEED PUBLICATION WAKES THE LOG'S READERS (the review of 6F-9): the
-/// presence sweep's publication (`App::publish_need`) that moves the
-/// printed tuple writes the shown mark and, in its hold, rings the
-/// session's watchers, where a parked `await log` or `subscribe … log`
-/// waits (a one-minute hang detector); `await log kind=shown` then answers
-/// with the mark. NEGATIVE CONTROL (by scratch revert): a publication that
-/// does not take the log's wake leaves the watchers unrung, and the wait
-/// hangs.
 #[test]
 fn the_need_publication_wakes_the_logs_readers() {
     let mut app = App::headless_for_test();

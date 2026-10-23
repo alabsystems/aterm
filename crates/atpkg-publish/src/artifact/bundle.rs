@@ -142,7 +142,6 @@ pub fn derive_version(tools: &dyn Tools, src_repo: &Path, sysroot: &Path) -> Res
     )))
 }
 
-/// Everything a bundle pack carries from its admission to its manifest.
 struct Bundle<'a> {
     ctx: &'a Ctx,
     req: &'a BundleRequest,
@@ -198,9 +197,6 @@ fn home_of(stage: &aterm_tempfile::TempDir) -> PathBuf {
     stage.path().join("smoke-home")
 }
 
-/// The packed compiler a bundle names its triple and its hello by: the program's own
-/// (trust-mc's `bin/trust-mc-compiler`), else `bin/rustc`, else `bin/trustc` — the first
-/// that is there.
 fn packed_compiler(def: &BundleDef, root: &Path) -> Option<PathBuf> {
     let own = match def.hello {
         Hello::TrustSysroot { compiler } => Some(compiler),
@@ -474,7 +470,6 @@ fn same_inode(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Every path under `root` (no symlink followed), relative, sorted, with its type.
 fn walk(root: &Path) -> Result<Vec<(PathBuf, std::fs::FileType)>> {
     let mut out = Vec::new();
     let mut stack = vec![PathBuf::new()];
@@ -945,7 +940,6 @@ pub fn smoke(tools: &dyn Tools, root: &Path, home: &Path, tool: &str) -> Result<
     }
 }
 
-/// `run` under `env -i HOME=<home> TMPDIR=<home> PATH=<root>/bin:/usr/bin:/bin`.
 fn hidden(mut run: Run, root: &Path, home: &Path) -> Run {
     let mut path = root.join("bin").into_os_string();
     path.push(":/usr/bin:/bin");
@@ -1079,78 +1073,124 @@ impl<'a> Relocated<'a> {
     /// Every gate, over the final bytes.
     ///
     /// # Errors
-    /// The first refusal.
+    /// The first refusal; one from a step that started a staged program keeps the stage and
+    /// names it.
     pub fn gate(self) -> Result<Gated<'a>> {
         let Relocated { b, stage } = self;
-        let root = root_of(&stage);
-        let home = home_of(&stage);
-        compiler_gate(&root)?;
-        let probe = |p: &Path| tools::version(b.tools, p);
-        if b.own_compiler && b.proven {
-            super::lineage::stamp_with(&root, &b.sysroot.join("bin"), &probe).map_err(|r| {
-                Error::refused(format!(
-                    "cannot stamp LINEAGE over the staged compiler:\n  {}",
-                    r.join("\n  ")
+        match gates(&b, &root_of(&stage), &home_of(&stage)) {
+            Ok(provenance) => Ok(Gated {
+                b,
+                stage,
+                provenance,
+            }),
+            Err((e, Started::Staged)) => Err(stage_kept(e, &stage.keep())),
+            Err((e, Started::Nothing)) => Err(e),
+        }
+    }
+}
+
+/// What the gate step that refused had started.
+enum Started {
+    /// Only reads of the tree, or programs outside it.
+    Nothing,
+    /// A program in the stage, which may have been killed before it showed it ran.
+    Staged,
+}
+
+/// Every gate over the staged `root`, with `home` as the smoke HOME: the payload's
+/// provenance, or the first refusal and what its step had started.
+fn gates(
+    b: &Bundle<'_>,
+    root: &Path,
+    home: &Path,
+) -> std::result::Result<atpkg::manifest::Provenance, (Error, Started)> {
+    let read = |e: Error| (e, Started::Nothing);
+    let ran = |e: Error| (e, Started::Staged);
+    compiler_gate(root).map_err(read)?;
+    let probe = |p: &Path| tools::version(b.tools, p);
+    if b.own_compiler && b.proven {
+        super::lineage::stamp_with(root, &b.sysroot.join("bin"), &probe).map_err(|r| {
+            ran(Error::refused(format!(
+                "cannot stamp LINEAGE over the staged compiler:\n  {}",
+                r.join("\n  ")
+            )))
+        })?;
+    }
+    let scan_bin = match (&b.hello, b.own_compiler) {
+        (_, true) => root.join("bin"),
+        (HelloPlan::Trust { sysroot, .. }, false) => sysroot.join("bin"),
+        _ => root.join("bin"),
+    };
+    let scan_compiler = toolchain::admit(b.tools, &scan_bin, &b.switch).map_err(|e| {
+        if scan_bin.starts_with(root) {
+            ran(e)
+        } else {
+            read(e)
+        }
+    })?;
+    let provenance = pack::scan(root, &scan_compiler).map_err(read)?;
+    let tree = arch::gate_tree(b.triple, &root.join("bin")).map_err(|e| read(e.into()))?;
+    eprintln!(
+        "atpkg-publish: arch gate OK — {} object(s) in bin/ ({} script(s) named, not \
+         gated)",
+        tree.objects,
+        tree.scripts.len()
+    );
+    for script in &tree.scripts {
+        eprintln!("atpkg-publish:   not gated (a #! script): {script}");
+    }
+    require_exposed(root, b.def.exposes).map_err(read)?;
+    if b.req.smoke {
+        for tool in b.def.exposes {
+            smoke(b.tools, root, home, tool).map_err(ran)?;
+        }
+    }
+    match &b.hello {
+        _ if !b.req.hello.enabled => {
+            eprintln!("atpkg-publish: hello-world skipped on purpose");
+        }
+        HelloPlan::Skip => {
+            eprintln!("atpkg-publish: hello-world skipped on purpose");
+        }
+        HelloPlan::Staged => {
+            let compiler = packed_compiler(&b.def, root).ok_or_else(|| {
+                read(Error::refused(
+                    "hello-world FAIL — no rustc-like compiler in the staged bin/, so the \
+                     gate could not be attempted (skip it on purpose with no hello)",
                 ))
             })?;
+            hello(b.tools, root, home, &compiler, root).map_err(ran)?;
         }
-        let scan_bin = match (&b.hello, b.own_compiler) {
-            (_, true) => root.join("bin"),
-            (HelloPlan::Trust { sysroot, .. }, false) => sysroot.join("bin"),
-            _ => root.join("bin"),
-        };
-        let scan_compiler = toolchain::admit(b.tools, &scan_bin, &b.switch)?;
-        let provenance = pack::scan(&root, &scan_compiler)?;
-        let tree = arch::gate_tree(b.triple, &root.join("bin"))?;
-        eprintln!(
-            "atpkg-publish: arch gate OK — {} object(s) in bin/ ({} script(s) named, not \
-             gated)",
-            tree.objects,
-            tree.scripts.len()
-        );
-        for script in &tree.scripts {
-            eprintln!("atpkg-publish:   not gated (a #! script): {script}");
+        HelloPlan::Trust { sysroot, compiler } => {
+            hello(
+                b.tools,
+                root,
+                home,
+                &root.join("bin").join(compiler),
+                sysroot,
+            )
+            .map_err(ran)?;
         }
-        require_exposed(&root, b.def.exposes)?;
-        if b.req.smoke {
-            for tool in b.def.exposes {
-                smoke(b.tools, &root, &home, tool)?;
-            }
-        }
-        match &b.hello {
-            _ if !b.req.hello.enabled => {
-                eprintln!("atpkg-publish: hello-world skipped on purpose");
-            }
-            HelloPlan::Skip => {
-                eprintln!("atpkg-publish: hello-world skipped on purpose");
-            }
-            HelloPlan::Staged => {
-                let compiler = packed_compiler(&b.def, &root).ok_or_else(|| {
-                    Error::refused(
-                        "hello-world FAIL — no rustc-like compiler in the staged bin/, so the \
-                         gate could not be attempted (skip it on purpose with no hello)",
-                    )
-                })?;
-                hello(b.tools, &root, &home, &compiler, &root)?;
-            }
-            HelloPlan::Trust { sysroot, compiler } => {
-                hello(
-                    b.tools,
-                    &root,
-                    &home,
-                    &root.join("bin").join(compiler),
-                    sysroot,
-                )?;
-            }
-        }
-        if b.req.smoke {
-            tippy_gate(b.tools, &root, &home)?;
-        }
-        Ok(Gated {
-            b,
-            stage,
-            provenance,
-        })
+    }
+    if b.req.smoke {
+        tippy_gate(b.tools, root, home).map_err(ran)?;
+    }
+    Ok(provenance)
+}
+
+/// `e`, naming the stage a failed gate keeps: a staged program it started may have been
+/// killed or died before it showed it ran, and unlinking a Mach-O macOS is still assessing
+/// at its first exec crashes syspolicyd.
+fn stage_kept(e: Error, stage: &Path) -> Error {
+    let note = format!(
+        "\n  the stage is kept at {}: a staged program may not have shown it ran; remove it \
+         once nothing runs from it",
+        stage.display()
+    );
+    match e {
+        Error::Refused(m) => Error::Refused(m + &note),
+        Error::Usage(m) => Error::Usage(m + &note),
+        Error::CannotRun(m) => Error::CannotRun(m + &note),
     }
 }
 

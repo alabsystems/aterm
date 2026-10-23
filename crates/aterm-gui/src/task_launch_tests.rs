@@ -4,10 +4,6 @@
 use super::*;
 use aterm_phase::Program;
 
-/// A worker's frame announces 0 to 64 KiB; a length past that, or none at
-/// all, is refused unread (the connection then closes), naming the cap and
-/// the spawn's own agent word ([`worker_word`]: a word no worker goes by is
-/// named `claude`, as before the line is parsed whole).
 #[test]
 fn a_task_frame_is_at_most_64_kib() {
     assert_eq!(frame_len("0", "claude"), Ok(0));
@@ -38,9 +34,6 @@ fn a_task_frame_is_at_most_64_kib() {
     }
 }
 
-/// The order a worker's spawn makes of its frame: no frame, an empty task
-/// and a NUL byte are refused by name; a task with every other byte is kept
-/// as given, and the cwd named is the canonical trusted folder.
 #[test]
 fn a_task_is_refused_empty_absent_or_holding_a_nul() {
     let refused = |frame: Option<&[u8]>| {
@@ -105,10 +98,6 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
     );
 }
 
-/// The task file is the task, its last line ended, a blank line, then the
-/// one line of fact: it names the starter and the worker's Autopilot, and the
-/// `Nothing left:` defense that ends a Land worker's work, without the retired
-/// token.
 #[test]
 fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     let fact = fact_line("s-ab12", Autopilot::Land, "claude");
@@ -162,13 +151,6 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     );
 }
 
-/// A LINE THAT DRAWS AS A BLANK ROW IS A BLANK LINE OF AN AGY WORKER'S TASK
-/// ([`without_blank_lines`]; the review of b9/spawn-residuals, F3): agy's
-/// reader reads a row of Unicode white space alone as blank (a no-break
-/// space, an ideographic space, an em space), and a zero-width or control
-/// character draws nothing beside it — so such a line ends agy's message as
-/// an empty one does, the fact line under it read as agy's reply, its
-/// `NEEDS YOU:` with it.
 #[test]
 fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
     use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
@@ -210,8 +192,6 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
     );
 }
 
-/// AN AGY WORKER'S FIRST PROMPT HOLDS NO BLANK LINE ([`task_text`],
-/// `WorkerCli::blank_lines`).
 #[test]
 fn an_agy_workers_first_prompt_holds_no_blank_line() {
     use aterm_agent::supervise::policy::needs::needs_you;
@@ -288,8 +268,6 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
     );
 }
 
-/// A worker's order is under Land unless the spawn said otherwise
-/// ([`WORKER_AUTOPILOT`], [`TaskOrder::under`]).
 #[test]
 fn a_worker_is_under_land_unless_its_spawn_says_cruise() {
     assert_eq!(WORKER_AUTOPILOT, Autopilot::Land);
@@ -384,8 +362,6 @@ fn the_task_file_is_private_and_never_overwritten() {
     );
 }
 
-/// The frame a request carried is the dispatch's alone: taken once, and
-/// gone when the guard drops.
 #[test]
 fn a_carried_task_is_taken_once_and_cleared_with_its_request() {
     {
@@ -403,8 +379,6 @@ fn a_carried_task_is_taken_once_and_cleared_with_its_request() {
     );
 }
 
-/// A worker's shell is zsh, bash or fish, by its program's name; another is
-/// refused by name.
 #[test]
 fn a_worker_shell_is_zsh_bash_or_a_fish_that_takes_dollar_paren() {
     assert_eq!(worker_dialect(Path::new("/bin/zsh")), Ok(Dialect::Zsh));
@@ -427,9 +401,6 @@ fn a_worker_shell_is_zsh_bash_or_a_fish_that_takes_dollar_paren() {
     }
 }
 
-/// A worker carries its starter's program, homes and config flags (agy's
-/// data directories, Muse Code's provider) when found, and otherwise starts
-/// the agent's plain command under the shell's configuration.
 #[test]
 fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
     use aterm_agent::harness::worker::{Starter, WORKERS};
@@ -459,10 +430,6 @@ fn a_worker_carries_its_starters_configuration_or_uses_the_plain_command() {
     }
 }
 
-/// THE LINE TRUSTS ITS FOLDER FOR THIS RUN ONLY WHERE THE SHELL STANDS IN
-/// THE ONE ITS STARTER TRUSTED: Muse Code's `--trust-workspace` rides the
-/// line only where the agent has the flag, the spawn named a `cwd=`, and the
-/// shell's own directory, read at its prompt, is exactly that folder.
 #[test]
 fn a_workers_line_trusts_only_the_folder_its_shell_stands_in() {
     let at = |dir: &'static str| move || Some(PathBuf::from(dir));
@@ -538,10 +505,6 @@ fn a_gemini_workers_trust_file_is_private_and_goes_with_it() {
     assert!(other.exists(), "another worker's stays");
 }
 
-/// A STARTER THE SWEEP HAS NOT NAMED YET is read from its terminal: a
-/// manager that spawns within half a second of its composer is asked before
-/// the status sweep reads its screen (the workers lab's three silent stalls,
-/// 2026-10-18), and its line then carried plain `claude`.
 #[test]
 fn a_starter_not_named_yet_is_read_from_its_terminal() {
     use aterm_phase::Program;
@@ -582,10 +545,6 @@ fn a_starter_not_named_yet_is_read_from_its_terminal() {
     }
 }
 
-/// A WORKER THAT NEVER STARTED SAYS WHAT BECAME OF ITS LINE: the startup
-/// stall's log line names what the launcher noted on the worker's timeline —
-/// typed, with the receipt's word and the program, or never typed and why —
-/// and says so where this process's launcher noted nothing.
 #[test]
 fn a_stalled_worker_says_whether_its_line_was_typed() {
     let session = crate::stub_session(1);

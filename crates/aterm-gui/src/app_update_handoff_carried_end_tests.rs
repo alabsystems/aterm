@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for carrying supervised session ends and task work across a seamless update (`SessionRecord::autopilot_end`, `App::adopt_end_carry`).
+//! Tests for carrying supervised session ends and task work across a seamless update.
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,6 @@ use crate::{App, HarnessFact, WindowId};
 
 const SEC: u64 = 1_000;
 
-/// A host that supervises nothing: what the App's posture needs to read
-/// `On`, shut down by the caller.
 fn idle_host() -> crate::harness_host::HostHandle {
     crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -24,10 +22,6 @@ fn idle_host() -> crate::harness_host::HostHandle {
     )
 }
 
-/// An App whose host supervises nothing and whose table's default is Land
-/// (`[harness] autopilot = "land"`): under Autopilot Land only Land ends a
-/// task, and a session that follows the default keeps no user field (the
-/// review's R6).
 fn desk(host: &crate::harness_host::HostHandle) -> App {
     let mut app = App::headless_for_test();
     app.harness = Some(host.clone());
@@ -37,8 +31,6 @@ fn desk(host: &crate::harness_host::HostHandle) -> App {
     app
 }
 
-/// Session `session` runs Claude Code under NO WORD OF ITS OWN — the
-/// desk's default, Land — claimed by this host.
 fn claude(app: &App, session: u64) {
     let ctx = app.pool.get(session).expect("pooled").ctx.clone();
     {
@@ -56,7 +48,6 @@ fn claude(app: &App, session: u64) {
     .expect("claimed");
 }
 
-/// Window 0 looked at: the frontmost, on screen.
 fn look(app: &mut App) {
     app.frontmost_window = Some(WindowId(0));
     app.windows
@@ -65,7 +56,6 @@ fn look(app: &mut App) {
         .band_on_screen_for_test = true;
 }
 
-/// The agent word the status sweep publishes for session `session`.
 fn publish(app: &App, session: u64, word: &'static str) -> bool {
     app.pool
         .get(session)
@@ -86,9 +76,6 @@ fn publish(app: &App, session: u64, word: &'static str) -> bool {
         )
 }
 
-/// Session `session`'s agent goes busy, works `ms` on the ledger clock
-/// (moved on, not waited), and sits at its prompt: both words fed to the A/B
-/// book as the sweep feeds them.
 fn work(app: &mut App, session: u64, ms: u64) {
     assert!(publish(app, session, "busy"), "busy published");
     app.note_harness_phase(session);
@@ -97,12 +84,10 @@ fn work(app: &mut App, session: u64, ms: u64) {
     app.note_harness_phase(session);
 }
 
-/// Session `sid`'s loop tells `face` through the host's wake.
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, HarnessFact::Task(face));
 }
 
-/// Every tab's mark in window 0, as its strip is stamped.
 fn marks(app: &App) -> Vec<ChipLevel> {
     let ws = &app.windows[&WindowId(0)];
     let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = ws
@@ -115,7 +100,6 @@ fn marks(app: &App) -> Vec<ChipLevel> {
     metadata.iter().map(|m| m.attention).collect()
 }
 
-/// Land's landings past the floor the book counted this week.
 fn landings(app: &App) -> u32 {
     app.harness_screen
         .ab
@@ -124,7 +108,6 @@ fn landings(app: &App) -> u32 {
         .landed
 }
 
-/// Session `session`'s sid.
 fn sid(app: &App, session: u64) -> String {
     app.pool
         .get(session)
@@ -135,17 +118,12 @@ fn sid(app: &App, session: u64) -> String {
         .to_string()
 }
 
-/// The local day `unix_ms` falls on.
 fn local_day(unix_ms: i64) -> i64 {
     let at = unix_ms.div_euclid(1000);
     let offset = crate::presence::local_offset_at(at).expect("the zone reads");
     (at + offset).div_euclid(86_400)
 }
 
-/// 17:42:37.123 local, yesterday: an end's time that no restate today can
-/// read, and off the minute, so the end's instant (the timeline's, which
-/// the park carries and the row reads) is told apart from its own minute
-/// (the glass's `Stamp`, whose `Stamp::unix_ms` is 17:42:00).
 fn yesterday_1742() -> i64 {
     let day = local_day(crate::harness_screen::unix_ms_now()) - 1;
     let local = day * 86_400 + 17 * 3_600 + 42 * 60;
@@ -153,7 +131,6 @@ fn yesterday_1742() -> i64 {
     (local - offset) * 1000 + 37_123
 }
 
-/// The Autopilot chip's title of session `session`, as the footer builds it.
 fn chip_title(app: &App, session: u64) -> String {
     let today = Some(local_day(crate::harness_screen::unix_ms_now()));
     crate::claude_lights::autopilot_title(
@@ -166,8 +143,6 @@ fn chip_title(app: &App, session: u64) -> String {
     .0
 }
 
-/// Session `session`'s state line on Settings ▸ Harness's SESSIONS card, as
-/// the page publishes it (the page is opened in window 0 to read it).
 fn page_state_line(app: &mut App, session: u64) -> Option<String> {
     assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
     app.publish_native_harness_state();
@@ -188,9 +163,6 @@ fn page_state_line(app: &mut App, session: u64) -> Option<String> {
         .state_line()
 }
 
-/// Session `session`'s Done for you row (§11.4.3), as the menu bar's glance
-/// is built off the real App (`App::status_glance`): the one row whose click
-/// goes to its tab.
 fn done_row(app: &App, session: u64) -> Option<crate::status_item::DoneRow> {
     let glance = app.status_glance();
     let mut rows = glance.done.iter().filter(|row| {
@@ -202,17 +174,12 @@ fn done_row(app: &App, session: u64) -> Option<crate::status_item::DoneRow> {
     row
 }
 
-/// Session `session`'s end no pet has cheered yet: the room's `landed`
-/// (§11.3.3, item 1).
 fn uncheered(app: &App, session: u64) -> Option<u32> {
     app.harness_glass
         .get(&session)
         .and_then(crate::harness_glass::SessionGlass::landed)
 }
 
-/// The kitty as cheer tests keep it (§11.3): the resident pet the
-/// trail, Full motion, window 0 presenting through a scripted CPU surface
-/// (the real redraw path) and focused; drawn for a moment on its front tab.
 fn with_the_pet(app: &mut App, t: &mut Instant) {
     app.config.serious_mode = Some(false);
     app.config.cursor_trail = Some(true);
@@ -232,8 +199,6 @@ fn with_the_pet(app: &mut App, t: &mut Instant) {
     }
 }
 
-/// Window 0 switched to tab `tab` (the sighting, §11.3.3 item 3) and drawn
-/// for a second: whether its pet owed a cheer on any of those frames.
 fn cheers_at(app: &mut App, tab: usize, t: &mut Instant) -> bool {
     app.switch_tab_in(WindowId(0), tab);
     let mut cheered = false;
@@ -249,9 +214,6 @@ fn cheers_at(app: &mut App, tab: usize, t: &mut Instant) -> bool {
     cheered
 }
 
-/// A quiet, close-on-exec PTY master for every session of `app`, as the
-/// park needs them (a stub's `-1` master reads as activity): each session
-/// owns a duplicate of one pair.
 fn quiet(app: &mut App) -> Vec<i32> {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     let mut fds = vec![slave, master];
@@ -265,7 +227,6 @@ fn quiet(app: &mut App) -> Vec<i32> {
     fds
 }
 
-/// Hand every session's master back and close the test's descriptors.
 fn release(app: &mut App, fds: Vec<i32>) {
     for pooled in app.pool.sessions.values_mut() {
         pooled.session.master = -1;
@@ -276,9 +237,6 @@ fn release(app: &mut App, fds: Vec<i32>) {
     }
 }
 
-/// THE PARK, the prelaunched lane's own
-/// (`App::park_and_transfer_to_prelaunched_successor`), of `parent`'s desk:
-/// the manifest it hands over, as the successor reads it back off the wire.
 fn park(parent: &mut App) -> SessionHandoff {
     let fds = quiet(parent);
     let (attempt, transferred) =
@@ -298,7 +256,6 @@ fn park(parent: &mut App) -> SessionHandoff {
     SessionHandoff::from_toml(&wire).expect("the successor reads it")
 }
 
-/// Record `sid`'s of manifest `read`.
 fn record_of(read: &SessionHandoff, sid: &str) -> SessionRecord {
     read.sessions
         .iter()
@@ -307,10 +264,6 @@ fn record_of(read: &SessionHandoff, sid: &str) -> SessionRecord {
         .expect("its record")
 }
 
-/// A successor's adopted shell answering to `sid`, as `spawn_session`
-/// builds one before registration: the stub of a handed shell, its timeline
-/// seeded from the record's Autopilot end row through the spawn's own seam
-/// (`spawn::seed_adopted_end`).
 fn adopted(id: u64, rec: &SessionRecord) -> crate::Session {
     crate::prime_test_timing();
     let session = crate::ptyless_session(
@@ -329,13 +282,6 @@ fn adopted(id: u64, rec: &SessionRecord) -> crate::Session {
     session
 }
 
-/// THE SUCCESSOR of a park whose manifest held `records` (as read back off
-/// the wire): its window's own first shell in front of window 0 (looked
-/// at), then each record's shell adopted under its sid in a tab of its own
-/// behind it, under no word of its own (the desk's default, Land) and claimed by
-/// this host's own supervisor — the intake mapping each record's row by sid
-/// (`seamless::end_carry_of`, as the real intake does) — and each
-/// adopted session's first publication (`App::refresh_presence_session`).
 fn successor(records: &[SessionRecord], host: &crate::harness_host::HostHandle) -> (App, Vec<u64>) {
     let mut app = desk(host);
     app.end_carry = crate::seamless::end_carry_of(records);
@@ -354,8 +300,6 @@ fn successor(records: &[SessionRecord], host: &crate::harness_host::HostHandle) 
     (app, ids)
 }
 
-/// AN UNSEEN END AND THE TASK'S WORK CROSS A SEAMLESS UPDATE (§11.2.5 "The
-/// carry").
 #[test]
 fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -531,13 +475,6 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
     host.shutdown_and_join();
 }
 
-/// A CARRIED END IS JUDGED AT ONCE, AND NEVER OUTLIVES ITS WORK (§11.2.3,
-/// item 8; §11.2.4): spent where its session is in the front tab of a window
-/// someone looks at, the end is seen as it lands and marks nothing, even
-/// once another tab comes in front; one the outgoing process had seen
-/// crosses seen; one whose loop has already restated another face (open:
-/// it moved on) is dropped, fail-closed, and its work kept; one the loop
-/// moves on from after the spend is cleared with its `•` (one re-stamp).
 #[test]
 fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     let host = idle_host();
@@ -623,10 +560,6 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
     host.shutdown_and_join();
 }
 
-/// A LANDING WITHDRAWN BEFORE THE SPEND BRINGS NO END BACK (the review of
-/// `c5af3a7507`): the loop's start restates the seeded landing (it takes
-/// the carried 17:42 back), then WITHDRAWS it — `open`, then a new landing,
-/// both before the session's first publication.
 #[test]
 fn a_landing_withdrawn_before_the_spend_brings_no_end_back() {
     let host = idle_host();

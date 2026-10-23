@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`] step folding, wall judgment, cursor tap, and S6 text-leak guards.
+//! Tests for [`super`] step folding, wall judgment, cursor tap, and text-leak guards.
 
 use super::*;
 use crate::supervise::run::wall_confirm::{confirms, transcript_ends_on, transcript_wall};
 
 const FP: u64 = 0x5eed_0000_0000_0001;
 const ID: Option<(u64, u64)> = Some((16_777_220, 77));
-/// 2026-10-15T20:00:00Z, wall ms.
+/// Fixed wall timestamp in milliseconds.
 const T0: u64 = 1_792_094_400_000;
 /// A session id's fingerprint ([`StepFold::note_vacant`]).
 const SID: u64 = 0x5e55_0000_0000_0001;
@@ -120,10 +120,7 @@ fn id(s: &str) -> StepId {
     StepId::new(s).expect("an id")
 }
 
-/// Plan §2.4: a turn's rows fold to its steps in order — the prompt, the
-/// model, a parallel pair of calls (a `Task` among them), their results
-/// (one failed), the turn's end with its tokens — and each step of a row
-/// has its own offset inside the row's line, the row's last at its end.
+/// A turn's rows fold to its steps in order, and each step of a row has its own offset inside the row's line.
 #[test]
 fn a_turn_folds_to_its_steps_in_order() {
     let mut f = Fed::new();
@@ -192,9 +189,7 @@ fn a_turn_folds_to_its_steps_in_order() {
     assert!(batch.steps.iter().all(|s| s.state == StepState::Partial));
 }
 
-/// A11: a turn's tokens count each message id once, at its largest (a
-/// streamed message's rows grow), by the usage fold's own dedupe; a prompt
-/// starts the count over.
+/// A turn's tokens count each message id once, at its largest, and a prompt starts the count over.
 #[test]
 fn a_turns_tokens_count_each_message_once_at_its_largest() {
     let mut f = Fed::new();
@@ -232,10 +227,7 @@ fn a_turns_tokens_count_each_message_once_at_its_largest() {
     );
 }
 
-/// S3, A10: the user rows that are no prompt — a task notification (by its
-/// words or its origin), a shell-mode command and its output, a meta row, a
-/// compaction's summary, a command's own rows — emit nothing at their row;
-/// Esc's row is the interrupt.
+/// User rows that are not prompts emit nothing at their row, while Esc's row is the interrupt.
 #[test]
 fn the_user_rows_that_ask_nothing_emit_no_prompt() {
     let quiet = [
@@ -318,12 +310,7 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
     assert!(f.push(&part).events().is_empty());
 }
 
-/// A TURN WITH NO PROMPT ROW (S3 as `upgrade.rs`'s `TaskScan` reads it):
-/// a prompt command's row (`/init`, as Claude Code writes it) and its
-/// `isMeta` expansion start the vendor turn the model's next row says ran:
-/// its steps are the same as after a typed prompt, the prompt named by the
-/// command row's `promptId`, dated at the command row and queued before the
-/// reply's steps, its tokens counted from there.
+/// A prompt command's row and its `isMeta` expansion start the vendor turn the model's next row says ran.
 #[test]
 fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
     let command = prompt(
@@ -445,9 +432,7 @@ fn a_prompt_command_or_a_wake_starts_the_turn_its_reply_says_ran() {
     assert_eq!(prompts, 1, "the wake joined the running turn");
 }
 
-/// A8: a row whose words are spelt with `\u` escapes is read as the words
-/// they spell — a prompt whose every `user` is escaped, a call whose
-/// `tool_use` is, a result whose `tool_result` is.
+/// A row whose words are spelt with `\u` escapes is read as the words they spell.
 #[test]
 fn an_escaped_key_is_read_as_its_word() {
     let ask = prompt("v1", 0, "go").replace(r#""user""#, r#""\u0075ser""#);
@@ -519,15 +504,7 @@ fn no_model(evs: Vec<StepEvent>) -> Vec<StepEvent> {
         .collect()
 }
 
-/// A TURN CLAUDE CODE NUMBERS OF ITS OWN starts the vendor turn its model's
-/// row says ran, as a task notification's wake does (by `upgrade.rs`'s
-/// `numbered_anew`): a `/loop`'s wake, written `isMeta` and
-/// no prompt by its words, under a `promptId` of its own (with the
-/// `promptSource`, `scheduledTaskId` and `turnOrigin` 2.1.302 writes), or
-/// under none with a `scheduledTaskId` (the 2.1.252 and 2.1.267 bundles) or
-/// a `turnOrigin`, and a missed one-shot task's notice under none: its
-/// call, result and turn end follow its `Prompt`, which is dated at the
-/// wake's row, and the turn end carries the wake's tokens.
+/// A turn Claude Code numbers of its own starts the vendor turn its model's row says ran.
 #[test]
 fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
     let loop_words = "keep going: check the land log";
@@ -676,10 +653,7 @@ fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
     }
 }
 
-/// A RUNNING TURN THE BIND DID NOT READ. A tap armed after
-/// the footer's first read binds at the file's length (`bind_tap`), so the
-/// fold knows neither the running turn's `promptId` nor whether one runs
-/// (`Fed::new` is such a bind).
+/// A tap armed after the footer's first read binds at the file's length (`bind_tap`), so a running turn it did not read is no new turn.
 #[test]
 fn a_running_turn_the_bind_did_not_read_is_no_new_one() {
     use super::super::transcript::corpus_tests::TURN_ROWS;
@@ -1053,8 +1027,7 @@ fn every_fixtures_turn_steps_follow_a_prompt() {
     assert!(checked >= 40 && prompts >= 20, "{checked} {prompts}");
 }
 
-/// S24: a compaction's boundary is an instant step; its summary row is no
-/// prompt.
+/// A compaction's boundary is an instant step, and its summary row is no prompt.
 #[test]
 fn a_compact_boundary_is_a_compact_step() {
     let boundary = format!(
@@ -1065,9 +1038,7 @@ fn a_compact_boundary_is_a_compact_step() {
     assert_eq!(f.push(&boundary).events(), vec![StepEvent::Compact]);
 }
 
-/// §2.6: a limit notice closed by its turn's end is the turn's wall
-/// (`EndWall`), and the end confirms the screen's limit wall of any limit
-/// kind and no other class.
+/// A limit notice closed by its turn's end is the turn's wall (`EndWall`), and the end confirms the screen's limit wall of any limit kind.
 #[test]
 fn a_notice_closed_by_the_turn_end_is_the_turns_wall() {
     let mut f = Fed::new();
@@ -1104,8 +1075,7 @@ fn a_notice_closed_by_the_turn_end_is_the_turns_wall() {
     );
 }
 
-/// Plan §2.8: each discriminant of the wrong shape latches the fold off,
-/// says so once, and nothing more is queued from the path.
+/// Each discriminant of the wrong shape latches the fold off once and queues nothing more from the path.
 #[test]
 fn a_wrong_shaped_discriminant_latches_the_fold_off() {
     let bad = [
@@ -1166,10 +1136,7 @@ fn a_latch_lifts_on_a_bind_of_another_file() {
     );
 }
 
-/// S1, S23: rows older than the floor, and rows ending at or below the
-/// seed (the file's length at the bind, else the log's watermark for that
-/// file), queue nothing, and are still folded into the end; a restart
-/// re-reads from the first byte and queues nothing it queued before.
+/// Rows older than the floor or ending at or below the seed queue nothing while still folding into the end.
 #[test]
 fn history_below_the_floor_or_the_seed_queues_nothing() {
     let rows = [
@@ -1249,9 +1216,7 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
     }
 }
 
-/// A11: the model is said from the first row past the seed, even when the
-/// history's rows named the same one (the history's model is the run's to
-/// name, never the fold's).
+/// The model is said from the first row past the seed, even when the history's rows named the same one.
 #[test]
 fn a_fresh_row_names_the_model_the_history_had() {
     let old = reply("m0", 0, 1);
@@ -1279,11 +1244,7 @@ fn a_fresh_row_names_the_model_the_history_had() {
     assert_eq!(evs, vec![vec![], vec![model], vec![]]);
 }
 
-/// A11 AT THE FLOOR: a row past the seed but older than the floor (the
-/// run's open, which the host arms the fold with, on a file read from its
-/// first byte) is history the log never takes, so it names no model either:
-/// the first row no older than the floor says it, though it is the same
-/// model.
+/// A row past the seed but older than the floor names no model, so the first row no older than the floor says it.
 #[test]
 fn a_row_below_the_floor_names_no_model() {
     let mut fold = StepFold::new(T0 + 15, None);
@@ -1345,10 +1306,7 @@ fn a_full_queue_drops_its_oldest_and_unread_rows_are_counted() {
     assert_eq!(fold.take().lost, 0);
 }
 
-/// S9, A19, T8: the lab measured 2.1.303 alone, so its steps are exact and
-/// every other build's partial; a build the set names is exact, and any
-/// other — older, newer or unnamed — is partial (no "at or below": an
-/// older build stays partial until its own reduction is committed).
+/// A build the measured set names is exact, and any other is partial.
 #[test]
 fn every_build_is_partial_until_one_is_measured() {
     assert_eq!(MEASURED_BUILDS, ["2.1.303"]);
@@ -1371,18 +1329,13 @@ fn every_build_is_partial_until_one_is_measured() {
     assert_eq!(state_for(&["2.1.300"], None), StepState::Partial);
 }
 
-/// Where a measured build's reduction is committed (T8).
+/// Where a measured build's reduction is committed.
 const MEASURED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/harness/testdata/steps");
 
-/// How a Codex rollout's reduction is named beside them (session log 5G).
+/// How a Codex rollout's reduction is named beside them.
 const CODEX_REDUCTION: &str = "codex-";
 
-/// THE GUARD (T8): every build `builds` names has its reduction in `dir`
-/// (`<build>.jsonl`, as `targo --unverified lab reduce` writes one), which
-/// folds with no `Off`, no loss and no overflow, every step at the state
-/// the set gives its build, holding what a lab run reads (a prompt, a
-/// shell call and its good result, a turn end and a limit's wall); and
-/// every reduction in `dir` names a build `builds` names.
+/// Every build `builds` names has its reduction in `dir`, and every reduction in `dir` names a build `builds` names.
 fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), String> {
     for b in builds {
         let path = dir.join(format!("{b}.jsonl"));
@@ -1439,15 +1392,14 @@ fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), St
     Ok(())
 }
 
-/// T8: a build is exact exactly when its reduction is committed.
+/// A build is exact iff its reduction is committed.
 #[test]
 fn a_build_is_exact_iff_its_reduction_is_committed() {
     measured_builds_hold(std::path::Path::new(MEASURED_DIR), MEASURED_BUILDS)
         .expect("the measured builds and their reductions agree");
 }
 
-/// NEGATIVE CONTROL (T8): a listed build with no reduction fails the guard,
-/// and so does a reduction no listed build names.
+/// A listed build with no reduction fails the guard, and so does a reduction no listed build names.
 #[test]
 fn a_listed_build_with_no_reduction_fails_the_guard() {
     let dir = std::path::Path::new(MEASURED_DIR);
@@ -1461,9 +1413,7 @@ fn a_listed_build_with_no_reduction_fails_the_guard() {
     assert!(e.contains("lacks a lab run's events"), "{e}");
 }
 
-/// A11: the class table by name. The names the approval policy knows
-/// (`box_call::PROVABLE` and the tools `unvoiced_tools` can name) are
-/// classed by what they are, never by the box a Bash `sed -i` is drawn as.
+/// The names the approval policy knows are classed by what they are, never by the box a Bash `sed -i` is drawn as.
 #[test]
 fn tools_are_classed_by_name() {
     for (name, want) in [
@@ -1512,8 +1462,7 @@ fn tools_are_classed_by_name() {
     assert!(StepId::new(&"a".repeat(41)).is_none() && StepId::new("a b").is_none());
 }
 
-/// S6, plan §2.7: no text of a prompt, a reply, a tool's input or result,
-/// a notice or a local command's output reaches a step or the end.
+/// No text of a prompt, a reply, a tool's input or result, a notice, or a local command's output reaches a step or the end.
 #[test]
 fn a_transcripts_text_never_reaches_a_step() {
     let local = format!(
@@ -1551,8 +1500,7 @@ fn a_transcripts_text_never_reaches_a_step() {
     assert_eq!(batch.end.last, EndClass::Opaque);
 }
 
-/// Every transcript under `supervise/fixtures` (A9: all of them, so one
-/// added there is in the agreement without a list to keep), by name.
+/// Every transcript under `supervise/fixtures`, by name.
 fn fixtures() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/supervise/fixtures");
     let mut all: Vec<(String, String)> = std::fs::read_dir(&dir)
@@ -1605,12 +1553,8 @@ fn class_of(e: &Entry) -> EndClass {
     }
 }
 
-/// THE AGREEMENT (A9, S7): after every line of every `supervise/fixtures`
-/// transcript, and of the corpus rows, the fold's end is the harness's
-/// `transcript_ends_on` of the lines so far — its entry, its close, its
-/// row's time, the wall a closed notice is, whether it lags — and for every
-/// screen wall the fold confirms exactly where `confirms` does; or the end
-/// is opaque and the judge waits.
+/// After every line of every `supervise/fixtures` transcript and corpus row, the fold's end
+/// agrees with `transcript_ends_on` and `confirms`, or is opaque and the judge waits.
 #[test]
 fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
     let corpus: String = super::super::transcript::corpus_tests::ROWS
@@ -1695,9 +1639,7 @@ fn the_end_agrees_with_the_harness_on_every_fixture_and_corpus_row() {
     assert_ne!(fold.end().last, class_of(&theirs.last));
 }
 
-/// §2.6: the judge confirms the end's own class, waits while the end lags,
-/// is opaque, or is older than the wall's turn, never asks a memory wall,
-/// and refutes anything else.
+/// The judge confirms the end's own class, waits while the end lags, is opaque, or is older than the wall's turn, never asks a memory wall, and refutes anything else.
 #[test]
 fn the_wall_judge_confirms_waits_and_refutes() {
     let mut f = Fed::new();
@@ -1768,10 +1710,7 @@ fn append(path: &std::path::Path, rows: &[String]) {
     }
 }
 
-/// A20: the cursor hands the tap each completed main-chain line once, with
-/// its end offset, binds it at its first read (the file's length then is
-/// history), and a torn last line waits for its newline and is tapped
-/// whole once it comes.
+/// The cursor hands the tap each completed main-chain line once with its end offset, binds at its first read, and waits for a torn last line's newline.
 #[test]
 fn the_cursor_taps_each_line_once_with_its_end_offset() {
     use super::super::session_usage::TranscriptCursor;
@@ -1841,10 +1780,7 @@ fn the_cursor_taps_each_line_once_with_its_end_offset() {
     );
 }
 
-/// A FILE THAT DID NOT EXIST HELD NO HISTORY (S1 as built): a fold told
-/// the registry's session had no transcript, then shown that session's
-/// file, binds the file from its first byte (`Bind { len: 0 }`), its rows
-/// older than the floor still history.
+/// A fold told the registry's session had no transcript and then shown that session's file binds it from its first byte (`Bind { len: 0 }`).
 #[test]
 fn a_file_the_fold_saw_absent_is_bound_from_its_first_byte() {
     let rows = [
@@ -1971,9 +1907,7 @@ fn the_footer_cache_keys_a_vacancy_to_its_session() {
     );
 }
 
-/// The footer's cache taps nothing until the glue arms it; armed on a
-/// transcript it already reads, the tap seeds at the file's length then
-/// (S1), and what is appended after comes through `take_steps`.
+/// The footer's cache taps nothing until the glue arms it, then seeds at the file's length and hands on appended steps through `take_steps`.
 #[test]
 fn the_footer_cache_taps_only_once_armed() {
     use super::super::footer::FooterCache;

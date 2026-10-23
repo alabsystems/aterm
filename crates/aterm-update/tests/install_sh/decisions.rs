@@ -44,7 +44,8 @@ fn a_manifest_identity_field_is_one_plain_string() {
     }
 }
 
-/// On the official repository the Developer-ID team is pinned in the script: a manifest that omits or contradicts it is refused.
+/// On the official repository the Developer-ID team is pinned in the script: a manifest that omits
+/// or contradicts it is refused unless `ATERM_TEAM_ID` names a team.
 #[test]
 fn the_official_channel_pins_its_signing_team() {
     let scratch = Scratch::new();
@@ -285,7 +286,11 @@ fn the_container_election_matrix() {
     }
 }
 
-/// The lean default's deferral is a function of who owns this Mac's console (docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install"): the toolset waits for the window only when the installing user is at the screen, and is seeded here for any other owner (another login, loginwindow's root) or one that cannot be read.
+/// The lean default's deferral is a function of who owns this Mac's console
+/// (docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install"): the toolset waits for the
+/// window only when the installing user is at the screen, and is seeded here for any other owner
+/// (another login, loginwindow's root) or one that cannot be read; a root run never seeds
+/// (`TOOLSET_AS_ROOT`).
 #[test]
 fn the_toolsets_deferral_is_a_function_of_the_console_owner() {
     let scratch = Scratch::new();

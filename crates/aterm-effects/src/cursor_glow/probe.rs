@@ -72,6 +72,7 @@ impl CursorGlow {
         self.row_above_prev.clear();
         self.row_below_cur.clear();
         self.row_below_prev.clear();
+        self.probed_spans = TextSpans::default();
     }
 
     /// Host observation.

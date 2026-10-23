@@ -241,6 +241,8 @@ fn roots(
         home: Some(home.to_path_buf()),
         agent_target_dirs: targets.into_iter().filter(keep).collect(),
         device: Some(device),
+        // Windows' walk stays on this volume and enters nothing without it.
+        volume: aterm_agent::harness::disk::target::VolumeGuid::of_path(home, table),
         mounts: table.points(),
         ..Roots::default()
     })
@@ -343,11 +345,20 @@ const fn remedy(origin: &Origin) -> &'static str {
     }
 }
 
-/// Format `path` for display (`~/…` when under `home`, else full path).
+/// Format `path` for display: `~/…` when under `home`, its names joined by
+/// `/` on every platform (Windows' walk spells them with `\`), else the full
+/// path, never with the verbatim `\\?\` prefix the survey's canonical paths
+/// carry on Windows.
 pub(crate) fn shown(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
-        Ok(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
-        _ => path.display().to_string(),
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            let names: Vec<_> = rel
+                .components()
+                .map(|name| name.as_os_str().to_string_lossy())
+                .collect();
+            format!("~/{}", names.join("/"))
+        }
+        _ => aterm_sysprobe::paths::plain(path).display().to_string(),
     }
 }
 
@@ -503,15 +514,23 @@ mod tests {
         );
         assert!(!cut);
         let paths: Vec<&str> = hogs.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(paths.len(), 3, "{hogs:?}");
+        assert_eq!(paths.len(), 3, "{hogs:?} of {found:?} under {roots:?}");
         assert!(paths.contains(&"~/proj/target"), "{hogs:?}");
-        let beside = outside.join("target").display().to_string();
+        let beside = outside.join("target");
+        let beside = aterm_sysprobe::paths::plain(&beside).display().to_string();
+        assert!(!beside.starts_with(r"\\?\"), "{beside}");
         assert!(paths.contains(&beside.as_str()), "{hogs:?}");
         let wt = hogs.iter().find(|h| h.path == "~/wt").expect("grouped");
         assert_eq!(wt.remedy, "3 target folders");
         assert!(wt.bytes >= 30_000, "{wt:?}");
+        // Below the scratch root: Windows keeps the root itself in a guarded
+        // folder (AppData\Local\Temp).
+        let scratch = aterm_sysprobe::paths::plain(&root).display().to_string();
         assert!(
-            !paths.iter().any(|p| p.contains(guarded)),
+            !paths.iter().any(|p| p
+                .strip_prefix(scratch.as_str())
+                .unwrap_or(p)
+                .contains(guarded)),
             "a guarded folder was entered: {hogs:?}"
         );
         assert_eq!(tree(&root), before, "the survey removed or changed nothing");
@@ -520,8 +539,10 @@ mod tests {
     /// T-G15: a working or build directory is a root only where its spelling
     /// alone places it on `$HOME`'s own local volume, outside the places never
     /// looked into; nothing is placed by an incomplete mount table, or when
-    /// `$HOME` itself is on a network volume.
+    /// `$HOME` itself is on a network volume. The table is a Unix one
+    /// (Windows places paths by drive and volume).
     #[test]
+    #[cfg(unix)]
     fn roots_are_only_on_homes_own_local_volume() {
         use aterm_sysprobe::volumes::Mount;
         let mount = |on: &str, local: bool, automounted: bool, fstype: &str| Mount {

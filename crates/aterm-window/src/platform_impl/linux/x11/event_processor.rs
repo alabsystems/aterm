@@ -42,6 +42,12 @@ use crate::platform_impl::x11::{
     ReportExt, ScrollOrientation, UnownedWindow, WindowId,
 };
 
+// LOCAL PATCH (aterm): events are read through aterm-x11's Xlib and XInput 2 declarations and the
+// requests are its encoders, where upstream used x11-dl and x11rb. No device events: the raw XInput
+// 2 events are not selected on the root, and `WindowEvent::AxisMotion` is not reported. A window
+// manager's `_NET_WM_SYNC_REQUEST` is noted on its window (`sync_request.rs`). A failed request is
+// reported (`XConnection::report`), where upstream's `expect`s panicked.
+
 /// The core protocol's modifier bits in a key event's state (`KeyButMask`).
 mod mod_mask {
     pub const SHIFT: u16 = 1 << 0;
@@ -73,7 +79,7 @@ fn xi_mask_is_set(mask: &[u8], bit: c_int) -> bool {
 /// The maximum amount of X modifiers to replay.
 pub const MAX_MOD_REPLAY_LEN: usize = 32;
 
-/// The X11 documentation states.
+/// X11 keycodes lie in the inclusive range `[8, 255]`.
 const KEYCODE_OFFSET: u8 = 8;
 
 pub struct EventProcessor {
@@ -1136,6 +1142,9 @@ impl EventProcessor {
 
             BUTTON3 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Right },
 
+            // LOCAL PATCH (aterm): a wheel button with no scroll valuator (XTEST: xdotool, x11vnc,
+            // Barrier/Synergy) sends a press and a release per notch; one notch is one step, so the
+            // release is dropped.
             4..=7 if state == ElementState::Released => return,
             4..=7 => WindowEvent::MouseWheel {
                 device_id,

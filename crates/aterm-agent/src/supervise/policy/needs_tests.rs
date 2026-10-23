@@ -80,12 +80,6 @@ fn a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need() {
     }
 }
 
-/// A NEEDS YOU TOKEN A LINE'S START NAMES IS NO NEED ([`names_a_head`]; the
-/// review of b9/spawn-residuals, F1): aterm's own instruction (`put what only
-/// a person can give on a line starting NEEDS YOU: and carry on`), in every
-/// act it types and a worker's first prompt, read back where a screen
-/// cannot bound the message (agy) or quoted by a worker, on its row or
-/// wrapped at any word of it.
 #[test]
 fn a_needs_token_a_lines_start_names_is_no_need() {
     for tail in [
@@ -128,9 +122,6 @@ fn a_needs_token_a_lines_start_names_is_no_need() {
     );
 }
 
-/// A NEEDS YOU line in a quote, in ticks, inside a sentence or spelled
-/// `NEED YOU` is a need (each was
-/// lost, and a lost need lands with the need off the screen).
 #[test]
 fn a_needs_line_quoted_ticked_or_inside_a_sentence_is_a_need() {
     for tail in [
@@ -170,8 +161,6 @@ fn needs_are_one_a_line_each_once_and_the_items_under_a_bare_head() {
     assert_eq!(without_needs(bare), "All else is landed.");
 }
 
-/// ONE NEED A LINE: a head whose words name a need is that one need, and the list under it is
-/// the report's own.
 #[test]
 fn a_head_that_names_its_need_is_one_need_over_any_list() {
     let clean = "Nothing left: the parser is committed and pushed to origin/main.";
@@ -209,11 +198,6 @@ fn a_head_that_names_its_need_is_one_need_over_any_list() {
     );
 }
 
-/// A BARE HEAD WITH NO LIST UNDER IT names the paragraph under it, blank rows
-/// between them passed over, its wrapped rows joined; with no words under it
-/// at all (another head, a fence, the report's end) it still names a need
-/// ([`UNREAD_NEED`]), so no defense lands beside a head nobody can read as
-/// `nothing`.
 #[test]
 fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
     let defense = "Nothing left: every branch is merged into the remote main branch and pushed.";
@@ -264,9 +248,6 @@ fn a_bare_head_names_the_paragraph_under_it_or_a_need_it_cannot_read() {
     );
 }
 
-/// A HEADING AND A DASH OPEN EITHER HEAD: `## NEEDS YOU: …`, `NEEDS YOU — …`,
-/// `## Nothing left:`, `### Nothing left` (a heading that is the head alone)
-/// and `Nothing left to do:` are read as the plain heads are.
 #[test]
 fn a_heading_or_a_dash_opens_either_head() {
     for line in [
@@ -310,13 +291,6 @@ fn a_heading_or_a_dash_opens_either_head() {
     }
 }
 
-/// EVERY HEAD FORM A WORKER WRITES NAMES ITS NEED, before the defense line
-/// and after it, and no defense lands beside it: `**NEEDS YOU**` or a bare
-/// `NEEDS YOU` alone on its line over a list (the items the needs), the same
-/// heads with nothing under them ([`UNREAD_NEED`]), a head led by an emoji
-/// (`🚨`, `⚠️`) or a task list's checkbox (`- [ ]`), a qualifier in
-/// parentheses (`NEEDS YOU (blocking):`), a double dash (`NEEDS YOU --`), and
-/// the need's words straight after the token.
 #[test]
 fn every_head_form_names_its_need_beside_a_defense() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -401,10 +375,6 @@ fn a_wrapped_need_is_joined_and_a_new_sentence_is_not() {
     assert_eq!(without_needs(stops), "then the tag goes out");
 }
 
-/// A NONE LINE'S CLAUSE IS READ FOR OPEN WORK ([`without_needs`] keeps it,
-/// the head dropped): `NEEDS YOU: none — all of it is pushed to the branch`
-/// names no need, but what its restatement leaves open (a branch, not main)
-/// is open, under Land's strict reading as on an ordinary line.
 #[test]
 fn a_none_lines_clause_is_read_for_open_work() {
     use crate::supervise::policy::turn_end::{clean_defense, open_work_strict};
@@ -460,9 +430,6 @@ fn a_none_lines_clause_is_read_for_open_work() {
     assert!(!says_no_needs(&line));
 }
 
-/// PROSE THAT WRAPS BEFORE `needs you` IS NO HEAD ([`need_rest`]): a
-/// sentence a screen row cut right before `needs` puts `needs you.` at the
-/// start of a row, and `Needs you? No.` asks.
 #[test]
 fn prose_wrapped_before_needs_you_is_no_head() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -557,7 +524,6 @@ fn equal_sets_key_equal_and_none_keys_zero() {
     assert_eq!(needs_key(&[]), 0);
 }
 
-/// The word lists of [`NoneWords`] by name, each to be mutated in turn.
 fn none_list<'b, 'a>(
     by: &'b mut NoneWords<'a>,
     k: usize,
@@ -585,9 +551,6 @@ fn none_list<'b, 'a>(
     })
 }
 
-/// The needs table's NONE and NEED rows the needs reader misreads with the
-/// word lists `by`: a NONE row it names a need in (a phantom), a NEED row it
-/// names none in, or none carrying the row's words (a lost need).
 fn misread_by(by: &NoneWords<'_>) -> Vec<String> {
     needs_table()
         .iter()
@@ -595,8 +558,6 @@ fn misread_by(by: &NoneWords<'_>) -> Vec<String> {
         .collect()
 }
 
-/// How the needs reader misreads the table's `report`, labelled `row`, with
-/// the word lists `by` ([`misread_by`]), if it does.
 fn misread(row: &NeedsRow, report: &str, by: &NoneWords<'_>) -> Option<String> {
     let named: Vec<String> = needs_lines_by(report, by)
         .needs
@@ -614,13 +575,6 @@ fn misread(row: &NeedsRow, report: &str, by: &NoneWords<'_>) -> Option<String> {
     misread.then(|| format!("{row:?} {report:?} -> {named:?}"))
 }
 
-/// EVERY WORD OF THE NONE READER'S LISTS IS LOAD-BEARING (the mutation
-/// check, as `every_land_family_is_load_bearing` is Land's): with any one
-/// word taken out of any one list of [`NONE_WORDS`], the needs table
-/// (`fixtures/needs-table.txt`) reads some row otherwise — a none it held
-/// becomes a phantom need, or a need it kept is lost — so no word is dead
-/// weight, and none can be dropped without the table naming the report it
-/// changes.
 #[test]
 fn every_none_word_is_load_bearing() {
     assert_eq!(misread_by(&NONE_WORDS), Vec::<String>::new());
@@ -672,12 +626,6 @@ fn every_none_word_is_load_bearing() {
     );
 }
 
-/// A NONE IN COMMON WORDS READS AS NONE (the review of b8/residuals,
-/// 2026-10-20): `no action needed from you.`, `nothing at this point.`,
-/// `None at this point.`, `nothing to do.`, `nothing else to do.`,
-/// `nothing from my side.`, `zero.`, a dash alone, a none closed by its
-/// sentence's stop with a statement after it, and `you're all set` after a
-/// none.
 #[test]
 fn a_none_in_common_words_reads_as_none() {
     use crate::supervise::policy::turn_end::clean_defense;
@@ -728,10 +676,6 @@ fn a_none_in_common_words_reads_as_none() {
     );
 }
 
-/// A NEEDS-YOU HEAD WITH ITS WORDS HYPHENATED IS A HEAD (the review of
-/// b8/residuals, 2026-10-20): `NEEDS-YOU: approve the deploy` (and the
-/// underscore form) was read as an ordinary line, so the need never
-/// reached the person and the turn's defense could land past it.
 #[test]
 fn a_hyphenated_needs_you_head_is_a_head() {
     use crate::supervise::policy::turn_end::clean_defense;

@@ -6,10 +6,10 @@
 /// The longest control request line the server reads, its newline not counted (a frame's body is bounded on its own).
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
 
-/// The longest task a WORKER is given (`spawn agent=<word> … len=<n>`, its task the n raw bytes after the line): the server refuses a longer frame unread and closes, and the client refuses one before sending it.
+/// The longest task a worker is given (`spawn agent=<word> … len=<n>`, its task the n raw bytes after the line).
 pub const MAX_TASK_BYTES: usize = 64 * 1024;
 
-/// The longest `timeout=` a `turn` over another Mac's drive takes (the step-in): the driven Mac cuts a drive connection at 30 s, the dial and the reply inside it.
+/// The longest `timeout=` a `turn` over another Mac's drive takes (the step-in).
 pub const DRIVE_TURN_MAX_MS: u64 = 22_000;
 
 /// The line a server answers a worker's spawn head (`spawn … agent=<word> len=<n>`) with when it will read the n bytes of task that follow, its newline included.
@@ -24,18 +24,18 @@ pub fn request_line_too_long() -> String {
     format!("request line too long (max {MAX_REQUEST_LINE} bytes)")
 }
 
-/// Why a selector that names nothing is refused, in the server's `ERR` line and in the client's refusal before it sends one: a bare `@` (what `@$W` becomes when `$W` is empty) or an `@` whose body is blank ([`selector_body_names_something`]).
+/// Why a selector that names nothing is refused, in the server's `ERR` line and in the client's refusal before it sends one.
 pub const EMPTY_SELECTOR: &str = "ERR usage: empty or malformed selector: an @ names a session \
      (@self, @<sid>, @<n>; @. is the active tab)";
 
-/// Whether a selector's body (what follows its `@`) names something: it is not empty and holds no whitespace or control character.
+/// Whether a selector's body (what follows its `@`) names something.
 #[inline]
 #[must_use]
 pub fn selector_body_names_something(body: &str) -> bool {
     !body.is_empty() && !body.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// The byte cap of one keyed attention entry (`meta set attention owner=<k> <text>`), after trim: the server refuses a longer one and a supervisor cuts its text to it.
+/// The byte cap of one keyed attention entry (`meta set attention owner=<k> <text>`), after trim.
 pub const META_ATTENTION_KEYED_MAX: usize = 200;
 
 /// A verb's authority class.
@@ -47,9 +47,9 @@ pub enum OpClass {
     Write,
     /// The out-of-band `signal` class.
     Signal,
-    /// Rewrites the durable on-disk config (`settings set|unset` → `aterm.toml`): greater than `Write`, so a keystroke-injection edge cannot flip a default-off security knob.
+    /// Rewrites the durable on-disk config (`settings set|unset` → `aterm.toml`).
     ConfigWrite,
-    /// Moves the selection onto the system clipboard (`copy`, the exfil boundary): split out of `Read` because it leaves the process.
+    /// Moves the selection onto the system clipboard (`copy`, the exfil boundary).
     ClipboardWrite,
     /// Owner-only privilege verb or build/meta verb — no op-class; gated separately.
     Owner,
@@ -62,9 +62,9 @@ pub enum Access {
     Scoped,
     /// Non-sensitive build/meta provenance and instance posture, answered for any authenticated scope before target resolution (`version`/`update`/`help`/`verbs`/ `privacy`).
     AnyScopeMeta,
-    /// Owner-only: only an OWNER-CLASS connection may run it, regardless of op-class (`sessions`/`who`/`grant`/`revoke`/`whoami`) — the instance god-token, and the bridge connection, which carries Owner's power.
+    /// Owner-only: only an owner-class connection may run it, regardless of op-class (`sessions`/`who`/`grant`/`revoke`/`whoami`) — the instance god-token, and the bridge connection, which carries Owner's power.
     OwnerOnly,
-    /// Bridge-only: only the fabric bridge connection may run it (the `socketpair` end the instance keeps for its `aterm-link serve` child, served with the bridge scope pre-resolved instead of an `AUTH` line): `deliver`, `link`, `hello`, `outbox`, `outbox sent`.
+    /// Bridge-only: only the fabric bridge connection may run it (the `socketpair` end the instance keeps for its `aterm-link serve` child, served with the bridge scope pre-resolved instead of an `AUTH` line).
     BridgeOnly,
 }
 
@@ -86,7 +86,7 @@ pub enum Framing {
 pub enum Target {
     /// Acts on the resolved session (text/turn/image/send/…).
     Session,
-    /// APP-level: acts on the resolved instance's FRONT window; the selector routes to the instance (window/chrome/controls/open/settings/invoke/…).
+    /// App-level: acts on the resolved instance's front window.
     App,
     /// Self-scoped / fleet-wide; a selector is rejected (sessions/who/grant/version/…).
     Meta,
@@ -97,16 +97,16 @@ pub enum Target {
 pub enum Lane {
     /// Answers at once: an RPC lane.
     Rpc,
-    /// Mostly waits — for an event, a settle, the owner, the bridge — or hands the connection to a relay: a wait lane.
+    /// Mostly waits — for an event, a settle, the owner, the bridge — or hands the connection to a relay.
     Wait,
-    /// A wait lane when an explicit `@<sid>` other than `@self` aims it, else an RPC lane: a `paste` into a session not on screen waits, bounded, for its bytes to reach the program, and a flagless one goes to the front tab.
+    /// A wait lane when an explicit `@<sid>` other than `@self` aims it, else an RPC lane.
     WaitWhenAimed,
 }
 
 /// What a verb does with a `--json`/`json` token in its request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Json {
-    /// The token is an ordinary argument: a payload verb (`send --json`, `search json`, `meta set title json`) receives it verbatim.
+    /// The token is an ordinary argument.
     None,
     /// The verb has no structured form, and its grammar never carries the token as data, so the server answers `ERR json: not supported for <verb>`.
     Refused,
@@ -135,7 +135,7 @@ pub struct Input(u16);
 impl Input {
     /// No input gate asks the verb.
     pub const NONE: Self = Self(0);
-    /// A fleet halt refuses it (design §5.3): it can reach a session's PTY, signal its child, retire a live session, or re-aim the seam that writes.
+    /// A fleet halt refuses it: it can reach a session's PTY, signal its child, retire a live session, or re-aim the seam that writes.
     pub const PTY: Self = Self(1);
     /// Writes input bytes to a session's PTY, so the unread-input gate asks it.
     pub const WRITES: Self = Self(1 << 1);
@@ -143,19 +143,19 @@ impl Input {
     pub const FLOORED: Self = Self(1 << 2);
     /// Refused while a `turn` or another connection's hard drive lease holds the session, so raw writes cannot corrupt a turn's output.
     pub const LEASED: Self = Self(1 << 3);
-    /// Takes a leading `id=<epoch>:<producer>:<seq>` idempotency key (§11.2's set): every keyed verb can put bytes on the PTY, and no other verb may claim a mark.
+    /// Takes a leading `id=<epoch>:<producer>:<seq>` idempotency key.
     pub const KEYED: Self = Self(1 << 4);
-    /// Takes a leading `if=<re>` guard, the `if-gen=`/`if-fp=`/`if-human=` fences and `unread=ok`: the keystroke-shaped writes a driver answers a prompt with.
+    /// Takes a leading `if=<re>` guard, the `if-gen=`/`if-fp=`/`if-human=` fences and `unread=ok`.
     pub const GUARDED: Self = Self(1 << 5);
     /// Can drive a modal overlay or native Settings tab in front through the App input seam (or races a human in one), so a scoped caller's flagless request is checked against the front surface first.
     pub const FRONT_DRIVING: Self = Self(1 << 6);
     /// A successful reply carries ` seq=<content_seq>`, the baseline `await seq` waits past.
     pub const STAMPS_SEQ: Self = Self(1 << 7);
-    /// An authorized attempt, malformed or not, is a newer input boundary for the cursor's move licence: it can inject bytes, signal the child, or move the cursor's coordinate space.
+    /// An authorized attempt, malformed or not, is a newer input boundary for the cursor's move licence.
     pub const FENCES: Self = Self(1 << 8);
     /// An App-lane gesture that takes a leading `unread=ok`, lifting the unread-input gate for itself.
     pub const APP_UNREAD: Self = Self(1 << 9);
-    /// Its argument is the program's own bytes (`send`, `feed`, a frame's body), not a gesture: a self-targeted request is delivered pinned to the session it was authorized against, never to an overlay or another tab that came to the front, and a background write stamps the input-arrival instant as a raw write does.
+    /// Its argument is the program's own bytes (`send`, `feed`, a frame's body), not a gesture.
     pub const PINNED: Self = Self(1 << 10);
     /// Takes a leading `if-supervisor=<holder>` fence: the verbs a supervisor types into its session with.
     pub const SUPERVISED: Self = Self(1 << 11);
@@ -245,9 +245,9 @@ pub struct VerbSpec {
     pub framing: Framing,
     /// What an `@<sid>` selector means for the verb.
     pub target: Target,
-    /// The connection-scope gate (orthogonal to `op`): `Scoped` for the common case, the other [`Access`] values for the exceptions.
+    /// The connection-scope gate (orthogonal to `op`).
     pub access: Access,
-    /// The FIRST SENTENCE of the verb's help, at most `summary_max_chars!()` (96) chars: the whole of this verb's row in the SHORT catalog (a bare `help`) and the head of its full entry.
+    /// The first sentence of the verb's help, at most `summary_max_chars!` (96) chars.
     pub summary: &'static str,
     /// The rest of the entry, or `""`.
     pub detail: &'static str,
@@ -261,9 +261,9 @@ pub struct VerbSpec {
     pub forms: &'static [Form],
     /// What follows the request's line on the stream.
     pub body: Body,
-    /// What the request does to a session's input ([`Input`]); `None` only on a read row that declares nothing ([`VerbSpec::input_class`] reads it as [`Input::NONE`]).
+    /// What the request does to a session's input ([`Input`]).
     pub input: Option<Input>,
-    /// Whether a FLEET peer may run the verb: a connection the fleet listener authenticated (`[fleet]`, `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5), served under the server's `Scope::Fleet`.
+    /// Whether a fleet peer may run the verb.
     pub fleet: bool,
 }
 
@@ -279,7 +279,7 @@ impl VerbSpec {
     }
 }
 
-/// What a [`Form`] matches in a request's TAIL: the text after the verb, and after the sub-word too when the request names a listed sub-form row (`inbox get`).
+/// What a [`Form`] matches in a request's tail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum When {
     /// The first word is exactly this one.
@@ -301,7 +301,7 @@ pub struct Form {
     pub when: When,
     /// The authority class the form needs instead of its row's.
     pub op: Option<OpClass>,
-    /// Only an owner-class connection may run the form, whatever its row's [`Access`]: no fine op expresses what it reaches.
+    /// Only an owner-class connection may run the form, whatever its row's [`Access`].
     pub owner_only: bool,
     /// How the form's reply is framed instead of its row's.
     pub framing: Option<Framing>,
@@ -311,7 +311,7 @@ pub struct Form {
     pub ack: Option<bool>,
 }
 
-/// [`HOLD_COST`] as a literal, so the `hold` entry and the window's Take Over tool tip quote it through `concat!`: one sentence, never two that drift.
+/// [`HOLD_COST`] as a literal, so the `hold` entry and the window's Take Over tool tip quote it through `concat!`.
 #[macro_export]
 macro_rules! hold_cost {
     () => {
@@ -320,17 +320,17 @@ macro_rules! hold_cost {
          and a sudo with no terminal cannot ask for its password in any tab."
     };
 }
-/// WHAT A HOLD COSTS THE WHOLE INSTANCE, in the one sentence every surface that states it uses (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): Take Over's tool tip, the menu bar's You hold section and the `hold` entry.
+/// What a hold costs the whole instance, in the one sentence every surface that states it uses.
 pub const HOLD_COST: &str = hold_cost!();
 
-/// The cap on a [`VerbSpec::summary`] as a literal: one readable row after the [`CATALOG_TEXT_COLUMN`] gutter on a 125-column line.
+/// The cap on a [`VerbSpec::summary`] as a literal.
 macro_rules! summary_max_chars {
     () => {
         96
     };
 }
 
-/// THE ONE TABLE OF GUI TARGETS: each row a target's variant, its keyword, the aliases that resolve to it, and — by its group — which verbs take it.
+/// The one table of GUI targets.
 macro_rules! aux_targets {
     (
         front: $(#[$fdoc:meta])* $front:ident = $fkw:literal $(| $falias:literal)*;
@@ -338,7 +338,7 @@ macro_rules! aux_targets {
             $(, $(#[$odoc:meta])* $o:ident = $okw:literal $(| $oalias:literal)*)*;
         gestures: $($(#[$gdoc:meta])* $g:ident = $gkw:literal $(| $galias:literal)*),*;
     ) => {
-        /// A GUI surface the `window`, `controls` and `open` verbs name, beyond the bare front window: Settings routes and the front window's overlays.
+        /// A GUI surface the `window`, `controls` and `open` verbs name, beyond the bare front window.
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub enum AuxTarget {
             $(#[$fdoc])* $front,
@@ -411,49 +411,24 @@ macro_rules! aux_targets {
 
 aux_targets! {
     front:
-        /// The frontmost terminal window (the plain `window`/`chrome`
-        /// capture).
+        /// The frontmost terminal window (the plain `window`/`chrome` capture).
         Front = "front" | "window" | "terminal";
     opens:
-        /// The native Settings tab. `controls prefs` keeps its historical
-        /// line prefixes; its route, preference rows and `ui` records come
-        /// from the compiled native semantic tree (`inspect app/v1` is the
-        /// versioned form).
+        /// The native Settings tab.
         Prefs = "prefs" | "preferences" | "settings",
-        /// The native Settings `/about` route, projected from its compiled
-        /// semantic frame while that route is open.
+        /// The native Settings `/about` route, projected from its compiled semantic frame while that route is open.
         About = "about",
-        /// The in-window command palette, an own-rendered card on the front
-        /// window; `controls menu` lists its (filtered) command rows.
+        /// The in-window command palette, an own-rendered card on the front window.
         Menu = "menu" | "palette",
-        /// The in-grid session context menu (the tab menu); `controls
-        /// tab-menu` lists the open card's rows and cursor, and a closed one
-        /// is `tab-menu open=false`.
+        /// The in-grid session context menu (the tab menu).
         TabMenu = "tab-menu",
-        /// The Autopilot menu, the chip's card over the pane; `controls
-        /// autopilot-menu` lists the open card's rows by their stable keys
-        /// (`autopilot-menu/mode/<word>`, `autopilot-menu/land-in/<minutes>`,
-        /// `autopilot-menu/land-at`, `autopilot-menu/land-cancel`,
-        /// `autopilot-menu/settings`), and `open autopilot-menu` opens it
-        /// from the front window's focused session's chip.
+        /// The Autopilot menu, the chip's card over the pane.
         AutopilotMenu = "autopilot-menu",
-        /// A fact's menu, the same card hung from a fact of Claude Code's
-        /// composer rule (the usage's: its Traffic card, a graph over time);
-        /// `open fact-menu <model|effort|path|branch|context|usage>` opens the front
-        /// window's focused session's, `open fact-menu close`
-        /// closes it, and `controls fact-menu` lists its rows by their stable
-        /// keys (`fact-menu/<fact>/<act>`), its first line naming the fact.
+        /// A fact's menu, the same card hung from a fact of Claude Code's composer rule (the usage's: its Traffic card, a graph over time).
         FactMenu = "fact-menu",
-        /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
-        /// the Connection Map); `open overview` raises it on the front window,
-        /// `controls overview` reads the open card's groups, chips and manages
-        /// lines (where this aterm's fabric is on, its "On the fabric" group
-        /// too: `overview fabric chip node= sid= need= age= mark= older=`
-        /// lines, read off the fabric's log and never acted on), and every
-        /// wire read of it is Owner-gated.
+        /// The Overview; `open overview` raises it on the front window, `controls overview` reads the open card's groups, chips and manages lines (where this aterm's fabric is on, its "On the fabric" group too: `overview fabric chip node= sid= need= age= mark= older=` lines, read off the fabric's log and never acted on), and every wire read of it is Owner-gated.
         Overview = "overview" | "connections",
-        /// The native Settings `/updates` route, projected from its compiled
-        /// semantic frame while that route is open.
+        /// The native Settings `/updates` route, projected from its compiled semantic frame while that route is open.
         Update = "update" | "software-update";
     gestures: ;
 }
@@ -606,7 +581,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
     true
 }
 
-/// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated): what discovering a verb costs.
+/// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
 pub const SHORT_CATALOG_MAX_BYTES: usize = 13874;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
@@ -646,7 +621,7 @@ impl VerbSpec {
         }
     }
 
-    /// The verb's full entry as `help <verb>` prints it: `<name padded> <text…>`, greedily word-wrapped at [`ENTRY_WRAP_COLUMNS`] with continuation lines indented to [`CATALOG_TEXT_COLUMN`].
+    /// The verb's full entry as `help <verb>` prints it.
     #[must_use]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn entry_lines(&self) -> Vec<String> {
@@ -691,8 +666,7 @@ use OpClass::{ClipboardWrite, ConfigWrite, Owner, Read, Signal, Write};
 use Target::{App, Meta, Session};
 use When::{AnyOf, Args, AtWord, Flag, Word};
 
-/// A `const`-friendly [`VerbSpec`] constructor for a normally-`Scoped` verb (keeps
-/// the table terse; the vast majority of rows).
+/// A `const`-friendly [`VerbSpec`] constructor for a normally-`Scoped` verb (keeps the table terse; the vast majority of rows).
 const fn v(
     name: &'static str,
     op: OpClass,
@@ -742,8 +716,7 @@ impl VerbSpec {
     }
 }
 
-/// A driven write's class: the halt, the unread-input gate, the self-feed floor,
-/// the drive lease, the front-surface fence and the licence fence all ask it.
+/// A driven write's class: the halt, the unread-input gate, the self-feed floor, the drive lease, the front-surface fence and the licence fence all ask it.
 const DRIVEN: Input = Input::PTY
     .with(Input::WRITES)
     .with(Input::FLOORED)
@@ -751,8 +724,7 @@ const DRIVEN: Input = Input::PTY
     .with(Input::FRONT_DRIVING)
     .with(Input::FENCES);
 
-/// A [`Form`] matching `when` that differs from its row in nothing yet; the chained
-/// setters below state how it differs.
+/// A [`Form`] matching `when` that differs from its row in nothing yet.
 const fn form(when: When) -> Form {
     Form {
         when,
@@ -809,8 +781,7 @@ impl Form {
     }
 }
 
-/// A [`VerbSpec`] constructor with an explicit non-`Scoped` [`Access`] gate, so the dispatch
-/// reads the exception from the table instead of hardcoding a verb list.
+/// A [`VerbSpec`] constructor with an explicit non-`Scoped` [`Access`] gate, so the dispatch reads the exception from the table instead of hardcoding a verb list.
 const fn va(
     name: &'static str,
     op: OpClass,
@@ -838,7 +809,7 @@ const fn va(
     }
 }
 
-/// THE TABLE.
+/// The table.
 pub const VERBS: &[VerbSpec] = &[
     va(
         "version",
@@ -1407,7 +1378,8 @@ pub const VERBS: &[VerbSpec] = &[
          state=<held|live|review|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded|quit> \
          glass=<row|-> rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
          [progress=<n>/100|busy=1] [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>] \
-         [need=<now|working|notice|later>]` (free text pct-encoded). Bare `<n>` keeps the newest \
+         [need=<now|working|notice|later>] [rev=<digest_revision>]` (free text pct-encoded; \
+         `rev` is present on open digest entries). Bare `<n>` keeps the newest \
          `n` (default 64, max 512); `since=<id>` pages forward from `<id>`; `tag=` and `sev=` \
          (floor) filter; `need=later` selects exceptions to review; `live` selects unretired band \
          rows (`need=later live` for open exceptions; `reveal=pending` marks a row still inside \
@@ -1419,8 +1391,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "notice <post|progress|done|ask|later|dismiss|act> …: record, show work, ask, file, end \
-         or press",
+        "notice <post|progress|done|settle|ask|later|dismiss|act> …: record, ask, file, end or press",
         "Owner-only. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- \
          <detail>]`: `sev=success|info` (default `info`) logs only (`OK recorded message=<id>`); \
          `sev=warn|error` raises a band row (`OK message=<id>`). `notice progress <key> \
@@ -1433,7 +1404,12 @@ pub const VERBS: &[VerbSpec] = &[
          `notice later <key> [tag=<tag>] [url=<https-url>] <title> -- <reason> -- <step>[ -- \
          <detail>]` files a non-urgent exception in the menu-bar item and Settings ▸ Messages \
          (`OK later=<id> how=<new|restated|duplicate|quiet>`, up to 4 wire entries, auto-filed \
-         after 14 d; `url=` adds an Open in browser button). `notice dismiss <id|review>` \
+         after 14 d; `url=` adds an Open in browser button). `notice settle <key> <id> <revision>` \
+         resolves only that open digest entry when its key and the observed digest revision \
+         still match (`OK settled=<id|-> how=<resolved-ok|gone>`); a changed, replaced or filed \
+         entry is left alone, and the owner's dismissal is never forgotten. Take `id` and `rev` \
+         from its `messages need=later live` row; an unrelated digest change may conservatively \
+         refuse settlement. `notice dismiss <id|review>` \
          dismisses a row or files open exceptions; `notice act <id> <label|index|details>` \
          presses a button (`OK acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars; \
          keys `1..=40` of `[a-z0-9._-]` (stored as `wire.<key>`); built-in tags are reserved (use \
@@ -1882,8 +1858,10 @@ pub const VERBS: &[VerbSpec] = &[
          `hold`, `inbox`, `inbox-seen`, `post`, `fetch`, `post-landed`, `topic`. Other kinds: \
          `render` (`desync-risk run=<r> displaced=<+-k> net=zero at=<ms>` or `healed run=<r> \
          after_ms=<ms>`), `harness-act` (`act=<act> holder=<holder>`), and `program-state` \
-         (`state=<idle|working|blocked|done|error|-> kind=<permission|question|auth|->`, the \
-         newest 64 a run; `log` coalesces flaps with `coalesced=<n>`). Final `closing reason= \
+         (`state=<idle|working|blocked|done|error|-> kind=<permission|question|auth|->`, kept \
+         as the program marks are: 64 a run, 20 at once then one a second, a flap past that \
+         coalesced into the newest state, which is never dropped; `log` says `coalesced=<n>`). \
+         Final `closing reason= \
          by=` is delivered via `subscribe @<sid> events` and retained in `exits`.",
     ),
     v(
@@ -2831,7 +2809,9 @@ pub const VERBS: &[VerbSpec] = &[
          job=<id> class=<class> rev=<n> [task=<id>] [code=<n>]` (`status job=`), `resize n=<k> \
          id=<last> to=<CxR> run=<r>[ dropped=<n>]`, `render desync-risk run=<r> displaced=<+-k> \
          net=zero at=<ms>` / `render healed run=<r> after_ms=<ms>` (`status render=`), `closing \
-         reason= by=`, `exited`, and `GAP <local> events-dropped=<n>`). `sessions` (Owner-only) \
+         reason= by=`, `exited`, and `GAP <local> events-dropped=<n>`: the timeline's rows are a \
+         view of the session `log`, and a GAP counts the rows past the watermark it no longer \
+         holds). `sessions` (Owner-only) \
          pushes `EVENT * session-created <sid>[ watch=deferred]`, `EVENT * session-exited <sid> \
          reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown>`, `EVENT * \
          fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
@@ -3176,8 +3156,9 @@ pub const VERBS: &[VerbSpec] = &[
         "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
         "— one `exit <id> t=<ms> sid=<sid> local=<n> \
          reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown> exit_code=<n|-> \
-         by=<sid|human|ctl|bridge|->` line per exited session (in-memory ring; also pushed live \
-         via `subscribe @<sid> events` `closing reason= by=` and `subscribe … sessions` \
+         by=<sid|human|ctl|bridge|->` line per exited session, read from the closed-session \
+         index (its last 512 closes, in the order they left the registry; also pushed live via \
+         `subscribe @<sid> events` `closing reason= by=` and `subscribe … sessions` \
          `session-exited <sid> reason=`).",
     )
     .input(Input::NONE),
@@ -3319,7 +3300,7 @@ pub struct Resolved {
     pub ack: bool,
 }
 
-/// THE ONE RESOLUTION of a request's verb facts: `verb` and `rest`, the text after it (no selector).
+/// The one resolution of a request's verb facts: `verb` and `rest`, the text after it (no selector).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spec_for(verb: &str, rest: &str) -> Option<Resolved> {
@@ -3393,10 +3374,10 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::AnyScopeMeta))
 }
 
-/// The bridge lane's grammar generation, which the bridge and the instance serving it each state in `hello` (`lane=`) so either can tell which side reads less of the lane: the bridge binary is whatever `[fabric] command` names, not necessarily the instance's own build.
+/// The bridge lane's grammar generation, which the bridge and the instance serving it each state in `hello` (`lane=`) so either can tell which side reads less of the lane.
 pub const BRIDGE_LANE: u32 = 6;
 
-/// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both sides: a bridge says it only to an instance at this lane or later, and an instance reads off a bridge's `hello lane=` whether that bridge will ever say it.
+/// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both sides.
 pub const LINK_QUARANTINE_LANE: u32 = 5;
 
 /// Whether `verb` is bridge-only per the table: no token unlocks it, Owner included.
@@ -3425,7 +3406,7 @@ pub const CONTROL_BUSY_LINE: &str = concat!(control_busy_reply!(), "\n");
 /// What leads a [`host_gone_line`], up to its pid.
 const HOST_GONE_PREFIX: &str = "ERR gone pid=";
 
-/// The forward's host went away: the line an aterm forwarding a connection to the aterm hosting its session writes, instead of a bare end of stream, when that host hung up first and no longer serves at `sock` (an update's Commit `_exit`, a crash, a quit).
+/// The forward's host went away.
 #[must_use]
 pub fn host_gone_line(pid: u32, sock: &str) -> String {
     format!("{HOST_GONE_PREFIX}{pid} sock={sock}\n")
@@ -3444,10 +3425,10 @@ pub fn host_gone(line: &str) -> Option<(u32, &str)> {
     Some((pid.parse().ok()?, sock))
 }
 
-/// Maximum UTF-8 bytes in one control-protocol reply line: the client enforces it on every line, and producers of large single-line payloads stay under it.
+/// Maximum UTF-8 bytes in one control-protocol reply line.
 pub const MAX_CONTROL_REPLY_LINE_BYTES: usize = 8 << 20;
 
-/// The screen's generation, `(invalidation epoch, content seq)`, spelled `<epoch>.<seq>` on the wire: `status gen=`, `text --json`'s `"gen"`, `agent_gen=`, and the `if-gen=` fence a typed act names.
+/// The screen's generation, `(invalidation epoch, content seq)`, spelled `<epoch>.<seq>` on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreenGen {
     /// The terminal-wide invalidation epoch.
@@ -3481,7 +3462,7 @@ impl core::fmt::Display for ScreenGen {
     }
 }
 
-/// The rows fence, `turn if-rows=<first>-<last>:<hex16>`: type only while the visible rows `first..=last` (0-based) still hash to `hash`, checked where `if-gen=` is.
+/// The rows fence, `turn if-rows=<first>-<last>:<hex16>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowsFence {
     /// The first grid row hashed.
@@ -3493,7 +3474,7 @@ pub struct RowsFence {
 }
 
 impl RowsFence {
-    /// Parse the wire spelling `<first>-<last>:<hex16>` (two unsigned decimals with `first <= last`, exactly sixteen hex digits); any other shape is `None`.
+    /// Parse the wire spelling `<first>-<last>:<hex16>` (two unsigned decimals with `first <= last`, exactly sixteen hex digits).
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         let (range, hex) = value.split_once(':')?;
@@ -3546,7 +3527,7 @@ pub fn valid_artifact_ack_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Whether a successful reply for this request may carry exact capture/video retention: [`spec_for`]'s acknowledgement for the text after the verb, so the shipping client and the server share one classification.
+/// Whether a successful reply for this request may carry exact capture/video retention.
 #[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -3554,7 +3535,7 @@ pub fn artifact_reply_requires_ack(verb: &str, request: &str) -> bool {
     spec_for(verb, head(request).rest).is_some_and(|r| r.ack)
 }
 
-/// The reply framing of `verb` for the full `request` line: [`spec_for`]'s framing for the text after the verb, so a sub-form (`image read`, `cast drift`, `inbox get`) and a `--json` on a JSON-emitting verb frame as the table says.
+/// The reply framing of `verb` for the full `request` line.
 #[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -3579,8 +3560,6 @@ pub fn catalog_lines_full() -> impl Iterator<Item = String> {
 
 #[cfg(test)]
 mod tests {
-    /// The forward's host-gone line reads back what it wrote — a socket path
-    /// with spaces included, as it is last — and no other line reads as one.
     #[test]
     fn the_host_gone_line_round_trips_and_nothing_else_reads_as_it() {
         use super::{host_gone, host_gone_line};
@@ -3600,8 +3579,6 @@ mod tests {
         }
     }
 
-    /// The rows fence's wire spelling round-trips, refuses other shapes, and hashes the rows
-    /// as the screen's `hash=` does.
     #[test]
     fn a_rows_fence_round_trips_refuses_bad_shapes_and_hashes_the_rows_joined() {
         use super::RowsFence;
@@ -3633,9 +3610,6 @@ mod tests {
 
     use super::*;
 
-    /// A selector body names something only when it is a non-empty run with no
-    /// whitespace or control character: the bare `@` of an empty `$W`, and `@`
-    /// followed by blanks, name nothing; every form the help teaches does.
     #[test]
     fn a_selector_body_names_something_only_when_it_is_a_nonblank_word() {
         for named in [".", "self", "env", "12", "s-0f1e", "*", "s-ab:3"] {
@@ -3648,8 +3622,6 @@ mod tests {
         assert!(!EMPTY_SELECTOR.contains('\n'));
     }
 
-    /// The wire spelling round-trips, and every other shape (a `u64` overflow included) is
-    /// refused.
     #[test]
     fn screen_gen_parses_exactly_the_wire_spelling() {
         let g = ScreenGen::parse("3.15").expect("canonical spelling");
@@ -3678,8 +3650,6 @@ mod tests {
         }
     }
 
-    /// Under `--json`/`json` every json-capable verb frames as Lines, so the client keeps the
-    /// JSON body.
     #[test]
     fn json_flag_switches_every_json_capable_verb_to_lines() {
         assert!(json_verbs().count() >= 10, "non-vacuity");
@@ -3810,8 +3780,6 @@ mod tests {
         assert!(!valid_artifact_ack_nonce("artifact"));
     }
 
-    /// `entry_lines` wraps every verb within the width (bar a lone long word), indents
-    /// continuations to the text column, and re-joins to `help_line` exactly.
     #[test]
     fn entry_lines_wrap_every_verb_deterministically_and_losslessly() {
         let gutter = " ".repeat(CATALOG_TEXT_COLUMN);
@@ -3872,8 +3840,6 @@ mod tests {
         assert!(spec("image").unwrap().entry_lines().len() > 5);
     }
 
-    /// The fabric rows carry the classes the fabric design's §11.2 gives them; a silent change
-    /// to one is a protocol change.
     #[test]
     fn fabric_verbs_carry_their_designed_classes() {
         for (name, op, framing, target, access) in [
@@ -3916,8 +3882,6 @@ mod tests {
         assert_eq!(framing_of("outbox", "outbox sent s-a 3 off=91"), Status);
     }
 
-    /// `copy` (clipboard exfil) and `settings` (durable config) each have their own op-class,
-    /// out of a read-only or keystroke-only edge's reach.
     #[test]
     fn copy_and_settings_have_their_own_op_class() {
         assert_eq!(spec("copy").unwrap().op, OpClass::ClipboardWrite);
@@ -3926,9 +3890,6 @@ mod tests {
         assert_eq!(spec("select").unwrap().op, OpClass::Read);
     }
 
-    /// The `privacy` row's shape is load-bearing: `AnyScopeMeta` so a `--headless` instance
-    /// answers it, `Meta` to reject a selector, `Read` because each fact is one `status` already
-    /// exposes or one the user's own processes can read, `Lines` for `OK <n>` + rows.
     #[test]
     fn privacy_is_a_headless_answerable_meta_read() {
         let s = spec("privacy").expect("privacy is in the table");
@@ -3955,10 +3916,6 @@ mod tests {
         assert_eq!(framing_of("privacy", "privacy"), Lines);
     }
 
-    /// The `theme` rows carry the class each sub-form needs (the read forms
-    /// Read, the runtime preview lane Write, the forms that rewrite `aterm.toml`
-    /// ConfigWrite), and `theme list` and `theme palette` alone flip to Lines
-    /// framing.
     #[test]
     fn theme_rows_carry_their_classes_and_only_list_is_lines() {
         for (name, op) in [
@@ -3998,11 +3955,6 @@ mod tests {
         }
     }
 
-    /// [`spec_for`] reads the longest name a request spells, then the first form of
-    /// that row matching what follows: a listed sub-form row wins over its verb's
-    /// forms, a word no form names falls to the catch-all, and an `@` word, an
-    /// argument or a sub-word moves the lane and authority exactly where the table
-    /// says — and nowhere else.
     #[test]
     fn spec_for_prefers_the_listed_sub_form_row() {
         let r = |verb: &str, rest: &str| spec_for(verb, rest).expect("a table verb");
@@ -4056,8 +4008,6 @@ mod tests {
         assert!(spec_for("bogus", "").is_none());
     }
 
-    /// THE SHIPPED `help hold` TEXT ENUMERATES THE HALT SET, SO IT IS PINNED TO
-    /// THE HALT SET: the rows whose [`Input`] class has [`Input::PTY`].
     #[test]
     fn the_hold_help_enumerates_exactly_the_halt_set() {
         const MARKER: &str = "from ANY scope — `";

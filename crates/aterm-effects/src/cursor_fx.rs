@@ -47,6 +47,8 @@ pub struct CursorFx {
     pub(crate) momentum_unwarmed: bool,
     /// The comet cells this tick produced, projected through load shedding, brightness, and legibility.
     pub trail_scratch: Vec<TrailCell>,
+    /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
+    pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
 }
 
 /// Everything one [`CursorFx::tick`] reads besides the two folded configs.
@@ -306,7 +308,13 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
     };
     let target = BED_INK_FLOOR.min(contrast_ink(ground));
-    let holds = |alpha: u8| contrast_ink(aterm_render::blend_rgb(ground, color, alpha)) >= target;
+    let holds = |alpha: u8| {
+        let lb = crate::color_math::relative_luminance_with(
+            table,
+            aterm_render::blend_rgb(ground, color, alpha),
+        );
+        lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
+    };
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     if holds(peak) {
         return 1.0;
@@ -1192,7 +1200,15 @@ impl CursorFx {
         let legible = if self.trail_scratch.is_empty() {
             1.0
         } else {
-            bed_legible_share(trail_cfg.color, f.default_bg, glow_cfg.theme_fg)
+            let key = (trail_cfg.color, f.default_bg, glow_cfg.theme_fg);
+            match self.legible_memo {
+                Some((prev, share)) if prev == key => share,
+                _ => {
+                    let share = bed_legible_share(key.0, key.1, key.2);
+                    self.legible_memo = Some((key, share));
+                    share
+                }
+            }
         };
         let trail_fp = crate::cursor_trail::project_trail_presentation(
             &mut self.trail_scratch,

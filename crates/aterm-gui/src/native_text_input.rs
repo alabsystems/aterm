@@ -201,7 +201,8 @@ impl TextInputState {
         self.replace_selection("");
     }
 
-    /// Delete the whitespace-delimited word before the caret (or active selection) as one undo frame (Ctrl-W).
+    /// Delete the whitespace-delimited word before the caret (an active selection is deleted
+    /// as-is) as one undo frame (Ctrl-W).
     pub(crate) fn delete_word_backward(&mut self) {
         if self.selection.is_caret() {
             self.selection.anchor = previous_word_boundary(&self.value, self.selection.head);

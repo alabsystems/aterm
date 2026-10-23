@@ -590,39 +590,6 @@ pub(crate) fn drain_timeline_events(
     Some(hi)
 }
 
-/// The ring's digest as it read before the view: what the tests that hold the view's reader to it compare.
-#[cfg(test)]
-pub(crate) fn drain_ring_events(
-    tl: &crate::session_timeline::SessionTimeline,
-    sid: &str,
-    last_id: Option<u64>,
-    out: &mut String,
-) -> Option<u64> {
-    let hi = match tl.high_id() {
-        None => return last_id,
-        Some(hi) if last_id.is_some_and(|a| hi <= a) => return Some(hi),
-        Some(hi) => hi,
-    };
-    let missed = match (last_id, tl.low_id()) {
-        (Some(a), Some(lo)) => lo.saturating_sub(a + 1),
-        _ => 0,
-    };
-    if missed > 0 {
-        out.push_str(&format!("GAP {sid} events-dropped={missed}\n"));
-    }
-    for e in tl.since(last_id) {
-        let Some(kind) = timeline_wire_kind(e.kind) else {
-            continue;
-        };
-        if e.payload.is_empty() {
-            out.push_str(&format!("EVENT {sid} {kind}\n"));
-        } else {
-            out.push_str(&format!("EVENT {sid} {kind} {}\n", e.payload));
-        }
-    }
-    Some(hi)
-}
-
 fn drain_resize_events(
     tl: &mut crate::session_timeline::SessionTimeline,
     sid: &str,
@@ -3635,9 +3602,9 @@ mod tests {
             let at = g.slog().now();
             g.slog_mut().human_input(true, at);
             assert_eq!(
-                g.slog().burst_rows_owed(),
-                1,
-                "PRECONDITION: the ring owes the row"
+                g.view_head(),
+                Some(2),
+                "PRECONDITION: the burst's mark, written outside the timeline's writers, is the view's head"
             );
         }
         let (seeded, _) = initial_timeline_watermarks(
@@ -3693,7 +3660,6 @@ mod tests {
 
     #[test]
     fn an_evicted_timeline_record_is_reported_as_a_gap() {
-        use crate::session_timeline::TIMELINE_CAP;
         let timeline = std::sync::Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::for_test(),
         ));
@@ -3732,7 +3698,8 @@ mod tests {
         };
         assert_eq!(high, 2 + flood as u64);
         assert!(low > 3, "the log evicted the oldest rows");
-        assert!(held > TIMELINE_CAP, "it holds more than the ring did");
+        let floor = aterm_slog::row_floor(crate::session_log::ring_limits()).records;
+        assert!(held > floor, "it holds more than its row floor");
         let mut out = String::new();
         let wm = drain_timeline_events(&timeline.lock().unwrap(), "7", wm, &mut out);
         let missed = low - 2 - 1;
@@ -6935,7 +6902,7 @@ mod log_stream_tests {
                 class_turn: true,
             },
         );
-        let _ = tl.lock().unwrap().note_program_state(Some(ProgramState {
+        tl.lock().unwrap().note_program_state(Some(ProgramState {
             state: ProgramStateWord::Working,
             kind: None,
         }));

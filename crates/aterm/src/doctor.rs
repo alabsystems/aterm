@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm doctor` entry point, convergence runner, and macOS base init items.
+//! `aterm doctor` entry point, convergence runner, and macOS base init items (design:
+//! docs/DESIGN-init-system-2026-10-20.md).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -46,6 +47,17 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             .unwrap_or_default()
     };
     let state = aterm_types::dirs::account_state_dir();
+    #[cfg(target_os = "macos")]
+    let reading = aterm_machines::init::Doctor::new(Some(Arc::new(targo)));
+    #[cfg(target_os = "macos")]
+    let compose = |asked| develop_layer(&reading, asked);
+    #[cfg(target_os = "macos")]
+    let develop = Some(Develop {
+        names: &aterm_machines::init_develop::names,
+        compose: &compose,
+    });
+    #[cfg(not(target_os = "macos"))]
+    let develop = None;
     let ran = run(
         &args,
         &Ports {
@@ -54,10 +66,51 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
             packages: &packages,
             state: state.as_deref(),
             not_own_account: aterm_types::dirs::not_own_account(),
+            develop,
         },
     );
     cli::answer(&ran.text, ran.code, ran.json)
 }
+
+/// The develop layer as `reading` composes it, for [`Develop::compose`].
+#[cfg(target_os = "macos")]
+fn develop_layer(reading: &aterm_machines::init::Doctor, asked: bool) -> DevelopLayer<'_> {
+    let composed = reading.compose(asked);
+    DevelopLayer {
+        items: composed
+            .items
+            .iter()
+            .map(|(item, _)| (item.id(), item.family().to_owned()))
+            .collect(),
+        unreadable: composed.unreadable,
+        rows: Box::new(move |only| reading.rows(&composed, only)),
+    }
+}
+
+/// The develop layer doctor reads on a develop machine (design §5, S9): macOS's
+/// [`aterm_machines::init::Doctor`], a stand-in in tests, none elsewhere.
+pub(crate) struct Develop<'a> {
+    /// Whether an `--only` word can name a develop item at all (an id with or without its
+    /// `@<path>`, a develop family, or `develop`: [`aterm_machines::init_develop::names`]).
+    pub(crate) names: &'a dyn Fn(&str) -> bool,
+    /// The layer, its profile read and nothing else; `true` when an `--only` word asked for
+    /// it, so a Mac that records none reads its record row.
+    pub(crate) compose: &'a dyn Fn(bool) -> DevelopLayer<'a>,
+}
+
+/// One run's develop layer, composed.
+pub(crate) struct DevelopLayer<'a> {
+    /// Each item's id and family.
+    pub(crate) items: Vec<(String, String)>,
+    /// The profile could not be read: its one row says why, whatever `--only` says.
+    pub(crate) unreadable: bool,
+    /// The rows, each item read and none applied, narrowed to the `--only` words.
+    pub(crate) rows: DevelopRows<'a>,
+}
+
+/// [`DevelopLayer::rows`]: the `--only` words in, the rows or why they cannot be ordered out.
+pub(crate) type DevelopRows<'a> =
+    Box<dyn FnOnce(&[String]) -> Result<Vec<ItemReport>, String> + 'a>;
 
 /// What a doctor run reads and writes, injected so a test runs it over a scratch home
 /// and prefix.
@@ -77,6 +130,9 @@ pub(crate) struct Ports<'a> {
     /// state root: [`aterm_types::dirs::not_own_account`]): every item is read and none
     /// changed, the store is not locked and nothing is journaled (design §3.2).
     pub(crate) not_own_account: Option<&'static str>,
+    /// The develop layer ([`Develop`]), read only in the account's own shell; `None` where
+    /// aterm has none (not macOS).
+    pub(crate) develop: Option<Develop<'a>>,
 }
 
 /// A run's answer: the text (the report, the JSON, or the refusal), its exit status, and
@@ -105,13 +161,19 @@ enum How {
 /// Run `aterm doctor` as `args` asks over `ports`.
 pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let tokens = &args.only;
+    let develop_word = |token: &str| {
+        ports
+            .develop
+            .as_ref()
+            .is_some_and(|develop| (develop.names)(token))
+    };
     let (repairs, missed) = match ports.ground {
         Some(ground) => aterm_converge::select(repair::items(ground), tokens),
         None => (Vec::new(), tokens.clone()),
     };
     let mut unmatched: Vec<String> = missed
         .into_iter()
-        .filter(|token| !cli::names(token))
+        .filter(|token| !cli::names(token) && !develop_word(token))
         .collect();
     let mut read_early = None;
     if !unmatched.is_empty() {
@@ -133,6 +195,53 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     }
 
     let own = ports.not_own_account.is_none();
+    // The develop layer (design §5, S9), composed in the account's own shell when no word
+    // narrows the run or one names a develop item, its profile read and nothing more (a
+    // shell that is not the account's reads none: its checkouts and their code are the
+    // account's). A develop word that names no item of this Mac's layer is the usage
+    // refusal, as `aterm init`'s is, before anything else is read or handed over.
+    let asked = tokens.iter().any(|token| develop_word(token));
+    let develop = match &ports.develop {
+        Some(develop) if own && (tokens.is_empty() || asked) => Some((develop.compose)(asked)),
+        _ => None,
+    };
+    if let Some(layer) = develop.as_ref().filter(|layer| !layer.unreadable) {
+        let nothing: Vec<&str> = tokens
+            .iter()
+            .filter(|token| develop_word(token))
+            .filter(|token| {
+                !layer.items.iter().any(|(id, family)| {
+                    aterm_converge::selects(token, id, family, Some(Layer::Develop))
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if !nothing.is_empty() {
+            let checkouts: Vec<&str> = layer
+                .items
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .filter(|id| id.starts_with("develop.checkout@"))
+                .collect();
+            return Ran {
+                text: format!(
+                    "aterm doctor: --only {}: names no develop item of this Mac ({}) — usage: \
+                     aterm doctor {}\n",
+                    nothing.join(","),
+                    if checkouts.is_empty() {
+                        "init.toml's [develop] records no checkout; `aterm init --develop` \
+                         records one"
+                            .to_owned()
+                    } else {
+                        format!("its checkouts: {}", checkouts.join(", "))
+                    },
+                    cli::GRAMMAR
+                ),
+                code: 2,
+                json: false,
+            };
+        }
+    }
     let gathered = (ports.gather)(own && !args.read_only && cli::hands_over(tokens));
     let fact_tokens: Vec<String> = if tokens.is_empty() {
         Vec::new()
@@ -207,6 +316,20 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     }
     drop(lock);
 
+    // The develop rows, read once the store is free again (a checkout's `--check` may build
+    // its verifier first): each item probed, none applied, nothing journaled.
+    let develop_rows = develop.map_or_else(Vec::new, |layer| {
+        (layer.rows)(tokens).unwrap_or_else(|refusal| {
+            refused.push(unmeasured(
+                "doctor.develop",
+                "develop",
+                Some(Layer::Develop),
+                refusal,
+            ));
+            Vec::new()
+        })
+    });
+
     let changed = fact_rows
         .iter()
         .chain(&repair_rows)
@@ -243,6 +366,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         if !fact_rows
             .iter()
             .chain(&repair_rows)
+            .chain(&develop_rows)
             .chain(&packages)
             .chain(&refused)
             .any(|row| named_by(token, row))
@@ -258,6 +382,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let rows: Vec<ItemReport> = fact_rows
         .iter()
         .chain(&repair_rows)
+        .chain(&develop_rows)
         .chain(&packages)
         .chain(&refused)
         .cloned()
@@ -288,10 +413,10 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let mut sections: Vec<Section> = refused
         .into_iter()
         .map(|row| Section {
-            label: if row.family == "pkg" {
-                "packages:"
-            } else {
-                "repair:"
+            label: match row.family.as_str() {
+                "pkg" => "packages:",
+                "develop" => "develop:",
+                _ => "repair:",
             },
             mark: Mark::Warn,
             fact: row.why.unwrap_or_default(),
@@ -299,6 +424,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
         .collect();
     let hold = ports.not_own_account.map(aterm_converge::not_own_account);
     sections.extend(repair_section(&repair_rows, &how, hold.as_deref()));
+    sections.extend(develop_section(&develop_rows));
     if !packages.is_empty() {
         let (healthy, lines) = atpkg::doctor::packages_view(&packages);
         sections.push(Section {
@@ -395,7 +521,10 @@ impl Item for AiAccountsItem {
     fn probe(&self) -> aterm_converge::Probe {
         use aterm_agent::harness::{
             accounts,
-            accounts_sync::{FLEET_ROSTER_FILE, configured_source, has_init_accounts_source},
+            accounts_sync::{
+                FLEET_ROSTER_FILE, configured_source, has_init_accounts_source,
+                needs_init_accounts_sync,
+            },
             cli::Env,
         };
         use aterm_converge::Probe;
@@ -427,18 +556,24 @@ impl Item for AiAccountsItem {
             && !raw.rows.is_empty()
             && fleet_path.is_file()
             && configured_source(Some(&config_path), Some(&roster_path)).is_some()
+            && !needs_init_accounts_sync(home, &env.state, &roster_path, env.now)
         {
             let bound = store.bound(&raw, env.now).unwrap_or(raw);
             let enrolled = accounts::enrolled(&bound);
+            let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
             let ready = bound
                 .rows
                 .iter()
-                .filter(|r| r.dir.is_none() || enrolled.contains(&r.label))
+                .filter(|r| {
+                    (r.dir.is_none() || enrolled.contains(&r.label))
+                        && state
+                            .accounts
+                            .get(&r.label)
+                            .is_none_or(|a| a.auth != accounts::Auth::SignedOut)
+                })
                 .count();
-            let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
             let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
             let next_hint = accounts::renew_next(&bound, &state, &enrolled, own_label, env.now)
-                .filter(|_| ready < bound.rows.len())
                 .map(|label| format!("; next: `aterm harness accounts renew {label}`"))
                 .unwrap_or_default();
             return Probe::Ok {
@@ -571,16 +706,63 @@ fn named_by(token: &str, row: &ItemReport) -> bool {
     aterm_converge::selects(token, &row.id, &row.family, row.layer)
 }
 
+/// The act a row's explanation names, as a line's tail: an em dash and the command in
+/// backticks, or nothing when it names none.
+fn remedy(row: &ItemReport) -> String {
+    match row.explain.as_ref().map(|e| &e.remedy) {
+        Some(Remedy::Command(command)) => format!(" — `{command}`"),
+        Some(Remedy::Repair) => " — `aterm pkg repair`".to_owned(),
+        Some(Remedy::Init { only }) => format!(" — `aterm init --only {only}`"),
+        Some(Remedy::Develop) => " — `aterm init --develop`".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The develop rows' section (design §5, S9): one line per item of the recorded checkouts,
+/// by its id, saying what it read and, where something is to do, the act that does it.
+/// `None` when no develop row was read.
+fn develop_section(rows: &[ItemReport]) -> Option<Section> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut warn = false;
+    let mut lines = Vec::with_capacity(rows.len());
+    for row in rows {
+        let why = row.why.as_deref().unwrap_or("not read");
+        let said = match row.outcome {
+            Outcome::Ok | Outcome::Changed => row.to.clone().unwrap_or_else(|| "ok".to_owned()),
+            Outcome::NotApplicable => format!("not applicable: {why}"),
+            Outcome::Planned => {
+                warn = true;
+                format!(
+                    "{} → {}{}",
+                    row.from.as_deref().unwrap_or("not as wanted"),
+                    row.to.as_deref().unwrap_or("as wanted"),
+                    remedy(row)
+                )
+            }
+            Outcome::Person
+            | Outcome::Blocked
+            | Outcome::Deferred
+            | Outcome::Unknown
+            | Outcome::Failed => {
+                warn = true;
+                format!("{why}{}", remedy(row))
+            }
+        };
+        lines.push(format!("{}: {said}", row.id));
+    }
+    Some(Section {
+        label: "develop:",
+        mark: if warn { Mark::Warn } else { Mark::Ok },
+        fact: lines.join("\n"),
+    })
+}
+
 fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<Section> {
     if rows.is_empty() {
         return None;
     }
-    let remedy = |row: &ItemReport| match row.explain.as_ref().map(|e| &e.remedy) {
-        Some(Remedy::Command(command)) => format!(" — `{command}`"),
-        Some(Remedy::Repair) => " — `aterm pkg repair`".to_owned(),
-        Some(Remedy::Init { only }) => format!(" — `aterm init --only {only}`"),
-        _ => String::new(),
-    };
     let (lead, lead_warns) = match how {
         How::StoodAside(line) => (Some(line.as_str()), false),
         How::HeldBack(line) => (Some(line.as_str()), true),

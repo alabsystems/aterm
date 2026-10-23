@@ -4,6 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): the server is spoken to through aterm-x11 and the loop waits in
+// `common::poll`, where upstream used x11rb, x11-dl and calloop. The startup notification token
+// request is gone (`startup_notify.rs` keeps the launchee's half). A broken connection ends the
+// loop (`end_if_connection_lost`), and no failed request panics (`XConnection::report`). Each turn
+// answers the resize sync requests no frame is coming for (`sync_request.rs`).
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;

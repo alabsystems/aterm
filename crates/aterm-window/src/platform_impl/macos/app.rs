@@ -4,12 +4,18 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/app.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): upstream's `#[cfg(test)] mod tests` is removed;
+// `aterm-objc/tests/swizzle.rs` covers the swizzle.
+
 #![allow(clippy::unnecessary_cast)]
 
 use std::cell::RefCell;
 use std::panic::AssertUnwindSafe;
 use std::rc::Weak;
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{send_id, send_usize, send_v_id};
 use aterm_objc::swizzle::SwizzleSite;
 use aterm_objc::{abort_on_unwind, class, class_of, sel, Id, MainThread, Sel};
@@ -18,12 +24,31 @@ use super::aterm_objc_seam::consts::{NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_TY
 use super::event_loop::{stop_app_on_panic, PanicInfo};
 
 /// `-[NSApplication sendEvent:]`'s prototype, as the runtime enters it.
+///
+/// LOCAL PATCH (aterm): `unsafe extern "C-unwind" fn(Id, Sel, Id)` where upstream had `extern "C"
+/// fn(&NSApplication, Sel, &NSEvent)`: AppKit's routing behind the original can raise, and a `"C"`
+/// frame has no landing pad.
 type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
 
 /// The site the swizzle publishes the displaced implementation into.
+///
+/// LOCAL PATCH (aterm): a `SwizzleSite` where upstream had a `static mut` stored after the swap;
+/// `SwizzleSite::install` publishes the original before it.
 static SEND_EVENT: SwizzleSite<SendEvent> = SwizzleSite::new();
 
 thread_local! {
+    // LOCAL PATCH (aterm): the event loop's panic slot, installed by
+    // [`set_send_event_panic_info`] from `AppKitEventLoop::new` right after the
+    // override. `sendEvent:` can reach the application's handlers directly
+    // (the original's routing → a `WinitView` row → `maybe_queue_event` →
+    // `handle_event` when no other event is being handled), so a Rust panic in
+    // there must take the same road every other handler panic takes on this
+    // backend:
+    // `stop_app_on_panic` stores it here, stops the app, and `run_on_demand`
+    // resumes the unwind on the main thread once `-[NSApplication run]`
+    // returns. Thread-local rather than a `static mut`: the slot is written
+    // and read on the main thread only, and a thread-local says so without an
+    // `unsafe` block or a `static_mut_refs` allow.
     static PANIC_INFO: RefCell<Option<Weak<PanicInfo>>> = const { RefCell::new(None) };
 }
 
@@ -38,6 +63,13 @@ pub(crate) fn set_send_event_panic_info(mtm: MainThread, panic_info: Weak<PanicI
 /// # Safety
 /// `app` must be the live `NSApplication` and `event` the live `NSEvent` the
 /// runtime dispatched with.
+///
+/// This is an IMP: it is entered by the Objective-C runtime with the receiver
+/// in the first argument position and the selector in the second, which is what
+/// [`SwizzleSite::install`]'s encoding check verifies for the row it replaces.
+///
+/// LOCAL PATCH (aterm): the body runs under [`aterm_objc::contain`], so an NSException from the
+/// original `sendEvent:` and the routing behind it is reported here and the run loop goes on.
 unsafe extern "C-unwind" fn send_event(app: Id, cmd: Sel, event: Id) {
     let panic_info = PANIC_INFO.with(|slot| slot.borrow().clone());
     let contained = AssertUnwindSafe(move || {
@@ -76,6 +108,9 @@ unsafe fn send_event_body(app: Id, cmd: Sel, event: Id) {
         return;
     }
 
+    // LOCAL PATCH (aterm): upstream also queued every mouse event's deltas and buttons as
+    // `DeviceEvent`s here; nothing in aterm handles one, so the override only forwards the Cmd
+    // key-up above.
     let _ = mtm;
 
     let original = SEND_EVENT.original().expect("no existing sendEvent: handler set");

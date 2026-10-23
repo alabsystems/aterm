@@ -26,9 +26,11 @@ pub struct Report {
     pub unchanged: Vec<String>,
     /// Moved aside before being overwritten: name and where it went.
     pub moved_aside: Vec<(String, PathBuf)>,
-    /// Removed because the vault dropped them, or because they are anchored ` if-absent` entries whose anchor is the machine's own.
+    /// Removed because the vault dropped them or took them back.
     pub removed: Vec<String>,
-    /// Left in place: dropped (or taken back) by the vault but changed since it wrote them, or not looked at (reached only through a symlinked or refused directory, or the file an entry behind one names; these stay in the manifest), or ` if-absent` entries whose target is the machine's own (a file the vault never wrote or that changed since it did, a link, a directory) or whose anchor is (a gap left unfilled), or cannot be looked at (a file the vault wrote, not written and still in the manifest).
+    /// Left in place: dropped (or taken back) by the vault but changed since it wrote them, not
+    /// looked at, or ` if-absent` entries whose target or anchor is the machine's own or whose
+    /// anchor could not be looked at.
     pub left: Vec<String>,
     /// Not written: the name and why (never the value).
     pub failed: Vec<(String, String)>,
@@ -37,13 +39,10 @@ pub struct Report {
 /// The directory under `~/.secrets` that moved-aside files go to.
 pub const REPLACED_DIR: &str = ".replaced";
 
-/// The most numbered suffixes tried for a moved-aside name that is taken.
 const MAX_ASIDE_SUFFIX: u32 = 1000;
 
-/// The longest file name a Unix volume takes, in bytes (`NAME_MAX`).
 const NAME_MAX: usize = 255;
 
-/// The hex digits of the full name's digest a shortened moved-aside name carries.
 const ASIDE_DIGEST: usize = 16;
 
 /// Lowercase hex SHA-256 of `bytes`: a manifest digest.
@@ -74,7 +73,7 @@ pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     })
 }
 
-/// The name a moved-aside copy of entry `name` gets (before any `.1`, `.2` suffix): the name with each `/` spelled `%2F`, then `.<now>`.
+/// The name a moved-aside copy of entry `name` gets (before any `.1`, `.2` suffix).
 pub fn aside_name(name: &str, now: u64) -> String {
     let flat = name.replace('/', "%2F");
     let stamp = format!(".{now}");
@@ -91,7 +90,7 @@ pub fn aside_name(name: &str, now: u64) -> String {
     format!("{}~{}{stamp}", &flat[..keep], &digest[..ASIDE_DIGEST])
 }
 
-/// Make the files under `home` match `entries` (already merged for this machine), given what the vault wrote last time (`held`).
+/// Make the files under `home` match `entries`, given what the vault wrote last time.
 pub fn apply(
     home: &Path,
     entries: &[Entry],
@@ -108,7 +107,7 @@ pub fn apply(
     )
 }
 
-/// What a pass is to write, or what a pass cut short was writing: entry name → digest of the value ([`apply_resuming`]).
+/// What a pass is to write, or what a pass cut short was writing: entry name → digest of the value.
 pub type Pending = BTreeMap<String, String>;
 
 /// [`apply`], resuming a pass cut short and saving ahead for this one.
@@ -261,7 +260,6 @@ pub fn apply_resuming(
         };
         let id = fsx::file_id(&target);
         if id.is_some_and(|id| claimed.get(&id).is_some_and(|by| by != name)) {
-            // Another entry lands on this file now: it is that entry's.
             continue;
         }
         if !places.reachable(name) || id.is_some_and(|id| spared.contains(&id)) {
@@ -292,7 +290,6 @@ pub fn apply_resuming(
     Ok((manifest, report))
 }
 
-/// What [`apply_resuming`] is to write, as it tells `ahead`, judged by `standings`.
 fn to_write(
     places: &Places<'_>,
     entries: &[Entry],
@@ -333,9 +330,6 @@ fn to_write(
         .collect()
 }
 
-/// What the vault wrote under a name of `held` that is none of `names` now, by the file it
-/// wrote: an entry respelled by case lands on that file on a case-insensitive volume, and
-/// keeps its history there.
 fn history<'m>(
     home: &Path,
     names: &BTreeSet<&str>,
@@ -356,7 +350,6 @@ fn history<'m>(
     history
 }
 
-/// Where entries land, and whether `~/.secrets` may be written to.
 struct Places<'a> {
     home: &'a Path,
     secrets: &'a Path,
@@ -373,7 +366,6 @@ struct Places<'a> {
 }
 
 impl<'a> Places<'a> {
-    /// The places under `home`, with `~/.secrets` (`secrets`) made private.
     fn new(home: &'a Path, secrets: &'a Path, now: u64) -> Places<'a> {
         Places {
             home,
@@ -386,8 +378,6 @@ impl<'a> Places<'a> {
         }
     }
 
-    /// Make entry `name`'s directory ready to write in: `~/.secrets` for a file name, the
-    /// directories between home and the file for a home path ([`make_parents`]).
     fn prepare(&self, name: &str) -> Result<(), String> {
         match name.strip_prefix("~/") {
             Some(rel) => make_parents(self.home, rel, self.own),
@@ -395,8 +385,6 @@ impl<'a> Places<'a> {
         }
     }
 
-    /// Whether entry `name`'s file is reached without a symlinked directory, aterm's own, or
-    /// a refused `~/.secrets` on the way.
     fn reachable(&self, name: &str) -> bool {
         match name.strip_prefix("~/") {
             Some(rel) => refused_dir(self.home, rel, self.own).is_none(),
@@ -405,7 +393,6 @@ impl<'a> Places<'a> {
     }
 }
 
-/// What placing one entry did.
 enum Placed {
     Written,
     Unchanged,
@@ -437,7 +424,6 @@ enum Standing {
     Unseen,
 }
 
-/// What an existing regular file holds, against the new value and the manifest.
 enum Judged {
     /// The new value already.
     Same,
@@ -447,8 +433,6 @@ enum Judged {
     Foreign,
 }
 
-/// Place one entry at `target`, whose directory [`Places::prepare`] made ready; `Err` is
-/// the reason it was not written (a path and an OS error at most, never a value).
 fn place(
     places: &Places<'_>,
     entry: &Entry,
@@ -492,8 +476,6 @@ fn place(
     Ok(Placed::Written)
 }
 
-/// Place an ` if-absent` entry at `target`, which holds `kind`, given how it stands
-/// ([`standings`]: its own file, then its anchors).
 fn fill(
     target: &Path,
     kind: Kind,
@@ -535,8 +517,6 @@ fn fill(
     }
 }
 
-/// How each ` if-absent` entry of `entries` stands, its anchors counted: an anchored entry
-/// goes by its anchor's standing ([`apply`]).
 fn standings<'a>(
     places: &Places<'_>,
     entries: &'a [Entry],
@@ -592,8 +572,6 @@ fn standings<'a>(
     }
 }
 
-/// Whether a plain entry's target is a regular file the vault never wrote (`wrote` is
-/// `None`) that already holds the entry's value: adopted, never written.
 fn adoptable(target: &Path, entry: &Entry, wrote: Option<&String>) -> bool {
     !entry.if_absent
         && wrote.is_none()
@@ -601,7 +579,6 @@ fn adoptable(target: &Path, entry: &Entry, wrote: Option<&String>) -> bool {
         && holds(target, entry.value.as_slice())
 }
 
-/// Whether the regular file at `target` holds `value`.
 fn holds(target: &Path, value: &[u8]) -> bool {
     fsx::read_public(target, text::MAX_VALUE)
         .ok()
@@ -609,11 +586,9 @@ fn holds(target: &Path, value: &[u8]) -> bool {
         .is_some_and(|bytes| aterm_digest::ct_eq(SecretBytes::new(bytes).as_slice(), value))
 }
 
-/// Judge the regular file at `target`.
 fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
     let len = std::fs::symlink_metadata(target).map_or(u64::MAX, |meta| meta.len());
     if len > u64::try_from(text::MAX_VALUE).unwrap_or(u64::MAX) {
-        // Larger than any value the vault writes: neither the new value nor ours.
         return Judged::Foreign;
     }
     match fsx::read_public(target, text::MAX_VALUE) {
@@ -632,17 +607,12 @@ fn judge(target: &Path, value: &[u8], held: Option<&String>) -> Judged {
     }
 }
 
-/// The digest of the regular file at `target`, if it can be read and is not larger than a
-/// value.
 fn file_digest(target: &Path) -> Option<String> {
     let bytes = fsx::read_public(target, text::MAX_VALUE).ok()??;
     let bytes = SecretBytes::new(bytes);
     Some(digest_hex(bytes.as_slice()))
 }
 
-/// Narrow an adopted file this user owns to 0600 when group or other bits are set, through a
-/// descriptor opened without following a link: a link swapped in since the look is refused,
-/// and what it names keeps its mode.
 fn narrow(target: &Path) -> Result<(), String> {
     let at = |error: std::io::Error| format!("{}: {error}", target.display());
     let file = std::fs::OpenOptions::new()
@@ -658,7 +628,6 @@ fn narrow(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The directories between home and home path `rel`'s file: `a/b/c` → `~/a`, `~/a/b`.
 fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
     let components: Vec<&str> = rel.split('/').collect();
     let mut dir = home.to_path_buf();
@@ -671,10 +640,6 @@ fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create the missing directories between home and home path `rel`'s file at 0700. An
-/// existing directory is used as it is and never chmodded; a symlink in a directory's place
-/// is refused, never followed, as is anything else that is not a directory, and aterm's own
-/// directory (`own`, [`Places`]).
 fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), String> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir).map_err(|error| error.0)? {
@@ -706,8 +671,6 @@ fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), S
     Ok(())
 }
 
-/// The first directory between home and home path `rel`'s file that is a symlink, or aterm's
-/// own directory (`own`, [`Places`]), if any.
 fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBuf> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir) {
@@ -719,8 +682,6 @@ fn refused_dir(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Option<PathBu
     None
 }
 
-/// Whether a directory between home and home path `name`'s file is a file (or another
-/// non-directory), so nothing can be at that path.
 fn under_a_file(home: &Path, name: &str) -> bool {
     name.strip_prefix("~/").is_some_and(|rel| {
         parents(home, rel)
@@ -729,9 +690,6 @@ fn under_a_file(home: &Path, name: &str) -> bool {
     })
 }
 
-/// Wipe what a pass cut short while writing `digest` left beside `target`: a temp, named as
-/// `aterm_uds::atomic_file` names one (`.<file>.tmp.<pid>.<hex>`), that holds that value, so
-/// another writer's temp is never touched.
 fn sweep_temps(target: &Path, digest: &str) {
     let (Some(dir), Some(file)) = (target.parent(), target.file_name()) else {
         return;
@@ -755,8 +713,6 @@ fn sweep_temps(target: &Path, digest: &str) {
     }
 }
 
-/// Move `target` to `~/.secrets/.replaced/<`[`aside_name`]`>` (or that with `.1`, `.2`, …
-/// when taken), never replacing anything there.
 fn move_aside(places: &Places<'_>, name: &str, target: &Path) -> Result<PathBuf, String> {
     places.secrets_ok.clone()?;
     let dir = places.secrets.join(REPLACED_DIR);
@@ -1270,7 +1226,6 @@ mod tests {
         assert_eq!(read(&foo), b"a file now");
     }
 
-    /// Whether `dir`'s volume folds case (APFS's default does; most Linux volumes do not).
     fn folds_case(dir: &Path) -> bool {
         let probe = dir.join("CaseProbe");
         std::fs::write(&probe, b"").expect("probe");
@@ -1534,9 +1489,6 @@ mod tests {
     const TOML: &str = "~/.aterm/machine.toml";
     const PROFILE: &str = "~/.aterm/release-credentials.toml";
 
-    /// The release identity as the vault carries it, sorted by name as a merge leaves it:
-    /// a ring, the key anchored to machine.toml, machine.toml to the profile and the profile
-    /// to the key, so any one of them the machine's own keeps the other two away.
     fn identity(value: &[u8]) -> [Entry; 3] {
         [
             anchored(KEY, value, TOML),

@@ -9,20 +9,20 @@ use aterm_grapheme::GraphemeClusters;
 
 use crate::turn_ledger::now_ms;
 
-/// Byte cap for `meta set title` (after trim). Small: it is a tab label.
+/// Byte cap for `meta set title` (after trim).
 pub(crate) const META_TITLE_MAX: usize = 120;
-/// Byte cap for `meta set description` (after trim) — a paragraph, not a doc.
+/// Byte cap for `meta set description` (after trim).
 pub(crate) const META_DESCRIPTION_MAX: usize = 1024;
-/// Byte cap for `meta set icon` (after trim) — an emoji / short token.
+/// Byte cap for `meta set icon` (after trim).
 pub(crate) const META_ICON_MAX: usize = 64;
 /// Byte cap for `meta set role` (after trim).
 pub(crate) const META_ROLE_MAX: usize = 64;
-/// Byte cap for `meta set attention` (after trim): a one-line needs-human message.
+/// Byte cap for `meta set attention` (after trim).
 pub(crate) const META_ATTENTION_MAX: usize = 256;
 /// Byte cap for one keyed attention entry (`meta set attention owner=<k>`), after trim.
 pub(crate) const META_ATTENTION_KEYED_MAX: usize =
     aterm_types::control_verbs::META_ATTENTION_KEYED_MAX;
-/// How many attention owners one session holds at once, the bare `-` owner included (its slot is always kept).
+/// Maximum attention owners one session holds at once, the bare `-` owner included.
 pub(crate) const ATTENTION_OWNERS_MAX: usize = 8;
 /// Byte cap for an attention owner key or a supervisor holder name.
 pub(crate) const META_OWNER_MAX: usize = 64;
@@ -125,9 +125,6 @@ pub(crate) fn carried_attention(value: &str) -> Option<String> {
     sanitize_metadata_value("attention", value)
         .filter(|value| !value.starts_with(RETIRED_HOOK_BADGE))
 }
-
-/// How many timeline events a session retains (drop-oldest past this), sized like the turn ledger.
-pub(crate) const TIMELINE_CAP: usize = 512;
 
 const MAX_PAYLOAD: usize = 256;
 
@@ -380,8 +377,7 @@ impl SessionMeta {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
     }
 
-    /// The claim a seamless update carries at `now_us`, as `(row, claim_known)` for the
-    /// handoff record.
+    /// The claim a seamless update carries at `now_us`, as `(row, claim_known)` for the handoff record.
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_supervisor(
@@ -451,14 +447,9 @@ impl SessionMeta {
     /// Set (or with `None`, unset) a named field.
     pub(crate) fn set(&mut self, field: &str, value: Option<String>) -> Option<bool> {
         if field == "attention" {
-            // The bare field is the bare owner: existing callers (the wire's bare
-            // form, a restore seed) keep their meaning, and keyed entries are
-            // untouched.
             return Some(self.set_bare_attention(value).effective);
         }
         if field == "autopilot" {
-            // The word alone is a hand write of it: its timer goes with it
-            // (§9.3.6, item 1).
             return Some(self.set_autopilot(value, None));
         }
         let slot = match field {
@@ -848,18 +839,13 @@ fn try_apply_meta_value(
     by: aterm_slog::Actor,
 ) -> Result<bool, MetaWriteError> {
     if field == MetaField::Autopilot {
-        // A wire write (or an in-process one through it): no window surface.
         return Ok(apply_autopilot(ctx, value, None, by, None).moved);
     }
-    let payload = meta_change_payload(field, value.as_deref());
     #[cfg(all(test, unix))]
     if matches!(field, MetaField::Attention | MetaField::Description) {
         attention_delivery_tests::before_effect();
     }
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    // A deadline may have closed this lane's caller while it waited for meta.
-    // Check under the effect lock: a replacement lane can already have settled
-    // newer display annotations, which this abandoned request must not undo.
     if matches!(field, MetaField::Attention | MetaField::Description)
         && crate::control::caller_hung_up()
     {
@@ -875,7 +861,7 @@ fn try_apply_meta_value(
     };
     if changed {
         let change = MetaChange::written_by(field.wire_name(), meta.get(field.wire_name()), by);
-        record_meta(ctx, payload, change, &meta);
+        record_meta(ctx, change, &meta);
     }
     drop(meta);
     if changed && field == MetaField::Autopilot {
@@ -1050,15 +1036,6 @@ pub(crate) fn cancel_land_at(
     }
 }
 
-fn autopilot_change_payload(meta: &SessionMeta) -> String {
-    let mut payload = meta_change_payload(MetaField::Autopilot, meta.autopilot.as_deref());
-    if let Some(ms) = meta.land_at {
-        payload.push_str(" land_at=");
-        payload.push_str(&ms.div_euclid(1000).to_string());
-    }
-    payload
-}
-
 /// Why a keyed attention write was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttentionWriteError {
@@ -1118,13 +1095,12 @@ pub(crate) fn write_attention_kind(
     if changed || supervisor.is_some() {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         if changed {
-            let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
             let change = MetaChange::written_by(
                 MetaField::Attention.wire_name(),
                 meta.attention.as_deref(),
                 by,
             );
-            timeline.record_meta_change(payload, change, &meta);
+            timeline.record_meta_change(change, &meta);
         }
         if let Some(raised) = supervisor {
             task_moved = timeline.note_task_attention(raised);
@@ -1153,13 +1129,12 @@ pub(crate) fn put_supervisor_attention(
     };
     meta.driver_writes |= MetaField::Attention.bit();
     if changed {
-        let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
         let change = MetaChange::written_by(
             MetaField::Attention.wire_name(),
             meta.attention.as_deref(),
             aterm_slog::Actor::Aterm,
         );
-        timeline.record_meta_change(payload, change, meta);
+        timeline.record_meta_change(change, meta);
     }
     true
 }
@@ -1574,17 +1549,16 @@ pub(crate) fn seed_carried_claims(
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     let by = aterm_slog::Actor::Aterm;
     if attention_moved {
-        let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
         let change = MetaChange::written_by(
             MetaField::Attention.wire_name(),
             meta.attention.as_deref(),
             by,
         );
-        timeline.record_meta_change(payload, change, &meta);
+        timeline.record_meta_change(change, &meta);
     }
     if let Some((holder, _)) = claim {
         let change = MetaChange::written_by(SUPERVISOR_FIELD, Some(holder), by);
-        timeline.record_meta_change(supervisor_change_payload(Some(holder)), change, &meta);
+        timeline.record_meta_change(change, &meta);
     }
     drop(timeline);
     drop(meta);
@@ -1635,16 +1609,11 @@ impl<'a> MetaChange<'a> {
     }
 }
 
-fn record_meta(
-    ctx: &crate::SessionCtx,
-    payload: String,
-    change: MetaChange<'_>,
-    meta: &SessionMeta,
-) {
+fn record_meta(ctx: &crate::SessionCtx, change: MetaChange<'_>, meta: &SessionMeta) {
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .record_meta_change(payload, change, meta);
+        .record_meta_change(change, meta);
 }
 
 fn record_autopilot(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog::Actor) {
@@ -1654,17 +1623,16 @@ fn record_autopilot(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog:
         by,
     )
     .with_land_at(meta.land_at);
-    record_meta(ctx, autopilot_change_payload(meta), change, meta);
+    record_meta(ctx, change, meta);
 }
 
 fn record_attention(ctx: &crate::SessionCtx, meta: &SessionMeta, by: aterm_slog::Actor) {
-    let payload = meta_change_payload(MetaField::Attention, meta.attention.as_deref());
     let change = MetaChange::written_by(
         MetaField::Attention.wire_name(),
         meta.attention.as_deref(),
         by,
     );
-    record_meta(ctx, payload, change, meta);
+    record_meta(ctx, change, meta);
 }
 
 /// THE LONGEST RE-EXEC GAP (µs, `SessionTimeline::self_reexec_since_us`).
@@ -1680,17 +1648,7 @@ fn record_supervisor(
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     timeline.forget_holder_acts();
     timeline.note_supervisor_moved(holder.is_some(), crate::metrics::now_us());
-    timeline.record_meta_change(supervisor_change_payload(holder), change, meta);
-}
-
-fn supervisor_change_payload(holder: Option<&str>) -> String {
-    let value = holder.map_or_else(|| "-".to_string(), crate::control::pct_encode);
-    format!("field=supervisor value={value}")
-}
-
-fn meta_change_payload(field: MetaField, value: Option<&str>) -> String {
-    let value = value.map_or_else(|| "-".to_string(), crate::control::pct_encode);
-    format!("field={} value={value}", field.wire_name())
+    timeline.record_meta_change(change, meta);
 }
 
 /// Put a carried identity back onto a session already live here, which a reader may have seen bare and a driver may have written since.
@@ -1724,9 +1682,8 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
             continue;
         }
         moved = true;
-        let payload = meta_change_payload(field, meta.get(name));
         let change = MetaChange::written_by(name, meta.get(name), aterm_slog::Actor::Aterm);
-        record_meta(ctx, payload, change, &meta);
+        record_meta(ctx, change, &meta);
     }
     drop(meta);
     if autopilot_moved {
@@ -1778,9 +1735,6 @@ pub(crate) const HARNESS_ACT: &str = "harness-act";
 /// The timeline kind of a move of the program's own state report as the status sweep honoured it.
 pub(crate) const PROGRAM_STATE: &str = "program-state";
 
-/// How many [`PROGRAM_STATE`] rows the ring holds at once.
-pub(crate) const PROGRAM_STATE_ROWS_MAX: usize = TIMELINE_CAP / 2;
-
 /// Published foreground custody for an input decision, independent of ordinary phase or screen revisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForegroundStamp {
@@ -1790,11 +1744,11 @@ pub(crate) struct ForegroundStamp {
     agent: aterm_phase::Program,
 }
 
-/// A session's bounded event timeline, newest-last, drop-oldest at [`TIMELINE_CAP`], with per-session monotonic ids minted here.
+/// A session's lifecycle state under one lock: its session log, whose rows are the timeline ([`crate::session_timeline_view`]; the ring it replaced was deleted in phase 6, 6G-5), and what the session publishes beside it.
 #[derive(Default)]
 pub(crate) struct SessionTimeline {
-    events: VecDeque<TimelineEvent>,
-    next_id: u64,
+    /// The view's head the session's watchers were last rung at ([`Self::ring_rows`]).
+    rows_rung: u64,
     agent: AgentPublication,
     foreground_generation: u64,
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
@@ -1825,9 +1779,6 @@ pub(crate) struct SessionTimeline {
     gauges: AgentGauges,
     screen_rung_at: Option<std::time::Instant>,
     slog: crate::session_log::SessionLog,
-    /// Whether the debug cross-check ([`Self::cross_check`]) saw this session's ring and view apart: a dev instance logs only the first.
-    #[cfg(all(debug_assertions, not(test)))]
-    view_disagreed: std::sync::atomic::AtomicBool,
     need: crate::needs::Verdict,
     last_act: Option<String>,
     pending_self_tasks: VecDeque<aterm_agent::harness::acts::TaskFace>,
@@ -2116,7 +2067,8 @@ impl SessionTimeline {
         }
         let at = self.slog.now();
         self.slog.self_claim_act(act, holder, by, at)?;
-        Some(self.record(HARNESS_ACT, format!("act={act} holder={holder}")))
+        self.record(HARNESS_ACT);
+        Some(self.slog.row_head())
     }
 
     /// The last act [`Self::note_harness_act`] kept, if any.
@@ -2176,55 +2128,53 @@ impl SessionTimeline {
     pub(crate) fn note_program_state(
         &mut self,
         shown: Option<aterm_core::terminal::program_state::ProgramState>,
-    ) -> u64 {
+    ) {
         let at = self.slog.now();
         self.slog.observe_program(shown, at);
-        let (state, kind) = shown.map_or(("-", "-"), |s| {
-            (s.state.as_str(), s.kind.map_or("-", |k| k.as_str()))
-        });
-        let held = self
-            .events
-            .iter()
-            .filter(|e| e.kind == PROGRAM_STATE)
-            .count();
-        if held >= PROGRAM_STATE_ROWS_MAX
-            && let Some(oldest) = self.events.iter().position(|e| e.kind == PROGRAM_STATE)
-        {
-            self.events.remove(oldest);
-        }
-        self.record(PROGRAM_STATE, format!("state={state} kind={kind}"))
+        self.record(PROGRAM_STATE);
     }
 
-    /// Append one event, evicting the oldest past the cap, and wake the session's watchers for a record. Returns its id.
-    pub(crate) fn record(&mut self, kind: &'static str, payload: String) -> u64 {
+    /// A `kind` row's writer wrote its session log mark in this hold (the mark is the row, [`crate::session_timeline_view::rows_of`]): wake the session's watchers for a record.
+    pub(crate) fn record(&mut self, kind: &'static str) {
         debug_assert_ne!(kind, META_CHANGE, "a meta-change is record_meta_change's");
         debug_assert!(
             !crate::session_timeline_view::ROW_ONLY.contains(&kind),
             "a {kind} row is record_row's: the log holds it as its row alone"
         );
-        if kind == META_CHANGE {
-            return self.next_id;
-        }
-        self.append(kind, payload)
+        self.ring();
     }
 
-    /// THE ONE WRITER OF A ROW-ONLY KIND ([`crate::session_timeline_view::ROW_ONLY`]): the session log's `row` mark, then the ring's row, in this one hold. Returns the ring row's id.
-    pub(crate) fn record_row(&mut self, kind: &'static str, payload: String) -> u64 {
+    /// THE ONE WRITER OF A ROW-ONLY KIND ([`crate::session_timeline_view::ROW_ONLY`]): the session log's `row` mark, which is the row, then the watchers rung, in this one hold.
+    pub(crate) fn record_row(&mut self, kind: &'static str, payload: String) {
         debug_assert!(
             crate::session_timeline_view::ROW_ONLY.contains(&kind),
             "{kind} is no row-only kind: its writer writes its own mark"
         );
         let at = self.slog.now();
         self.slog.observe_row(kind, &payload, at);
-        self.append(kind, payload)
+        self.ring();
     }
 
-    /// A row a test writes by hand, of any kind, as [`Self::record_row`] writes it: a `row` mark and the ring's row.
+    /// A row a test writes by hand, of any kind, as [`Self::record_row`] writes it: a `row` mark. Returns the view's head.
     #[cfg(test)]
     pub(crate) fn record_hand_row(&mut self, kind: &'static str, payload: String) -> u64 {
         let at = self.slog.now();
         self.slog.observe_row(kind, &payload, at);
-        self.append(kind, payload)
+        self.ring();
+        self.slog.row_head()
+    }
+
+    /// Wake the session's watchers for a record, at the view's head now.
+    fn ring(&mut self) {
+        self.rows_rung = self.slog.row_head();
+        self.watchers.ring_record();
+    }
+
+    /// Wake the session's watchers for a record iff the view's head moved since they were last rung: a row a mark wrote outside a writer of this timeline (a person's burst, [`crate::session_log::SessionLog::person_input`]).
+    pub(crate) fn ring_rows(&mut self) {
+        if self.slog.row_head() != self.rows_rung {
+            self.ring();
+        }
     }
 
     /// The view past `after`, its newest `keep` rows (0: every one), copied under this lock to format after it (the `timeline` verb's).
@@ -2233,7 +2183,6 @@ impl SessionTimeline {
         after: Option<u64>,
         keep: usize,
     ) -> crate::session_timeline_view::ViewCopy {
-        self.cross_check();
         crate::session_timeline_view::ViewCopy::of(self.slog.log(), after, keep)
     }
 
@@ -2242,7 +2191,6 @@ impl SessionTimeline {
         &self,
         after: Option<u64>,
     ) -> crate::session_timeline_view::TimelineView {
-        self.cross_check();
         crate::session_timeline_view::timeline_rows_since(self.slog.log(), after)
     }
 
@@ -2253,49 +2201,16 @@ impl SessionTimeline {
 
     /// The view's rows newest first, as `(kind, process-clock ms)`: the tab chrome's tail.
     pub(crate) fn view_newest_first(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
-        self.cross_check();
         crate::session_timeline_view::newest_first(self.slog.log())
     }
 
-    /// The ring held to the view at a reader's read, in a debug build ([`crate::session_timeline_view::ring_against_view`]): a test panics on a disagreement, a dev instance logs the session's first and reads on.
-    #[cfg(debug_assertions)]
-    fn cross_check(&self) {
-        let held = crate::session_timeline_view::ring_against_view(
-            self.events.iter(),
-            self.slog.burst_rows_owed(),
-            self.slog.log(),
-            self.slog.program_pending(),
-        );
-        if let Err(why) = held {
-            #[cfg(test)]
-            panic!("THE RING AND THE VIEW DISAGREE: {why}");
-            #[cfg(not(test))]
-            if !self
-                .view_disagreed
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                aterm_log::error!("timeline: the ring and the view disagree: {why}");
-            }
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[inline]
-    fn cross_check(&self) {}
-
     /// THE ONE `meta-change` WRITER, under the meta → timeline hold its writer already takes (`meta` is the store as the write left it).
-    pub(crate) fn record_meta_change(
-        &mut self,
-        payload: String,
-        change: MetaChange<'_>,
-        meta: &SessionMeta,
-    ) -> u64 {
-        let id = self.append(META_CHANGE, payload);
+    pub(crate) fn record_meta_change(&mut self, change: MetaChange<'_>, meta: &SessionMeta) {
         let escalated = meta.attention_owners.effective_owner()
             == Some(aterm_agent::supervise::run::ATTENTION_OWNER);
         let at = self.slog.now();
         self.slog.observe_meta(change, escalated, at);
-        id
+        self.ring();
     }
 
     /// A raw `meta-change` row for a test that pins the timeline's own shapes and not a writer's.
@@ -2304,58 +2219,23 @@ impl SessionTimeline {
         self.record_hand_row(META_CHANGE, payload)
     }
 
-    fn append(&mut self, kind: &'static str, payload: String) -> u64 {
-        self.pay_burst_rows();
-        self.push_row(kind, payload)
-    }
-
-    /// THE `human` ROWS THE SESSION LOG'S BURST MARKS OWE (the review of 6F-8).
-    pub(crate) fn pay_burst_rows(&mut self) {
-        for _ in 0..self.slog.take_burst_rows() {
-            let _ = self.push_row(HUMAN, String::new());
-        }
-    }
-
-    fn push_row(&mut self, kind: &'static str, payload: String) -> u64 {
-        self.next_id += 1;
-        if self.events.len() == TIMELINE_CAP {
-            self.events.pop_front();
-        }
-        self.events.push_back(TimelineEvent {
-            id: self.next_id,
-            t_ms: now_ms(),
-            kind,
-            payload: clamp_payload(payload),
-        });
-        self.watchers.ring_record();
-        self.next_id
-    }
-
     /// THE `cwd-change` WRITER: a row iff the session log's `cwd` mark moved; returns whether it recorded one.
     pub(crate) fn record_cwd_change(&mut self, cwd: Option<&str>) -> bool {
         let at = self.slog.now();
-        let Some(held) = self.slog.observe_cwd(cwd, at) else {
+        if !self.slog.observe_cwd(cwd, at) {
             return false;
-        };
-        let payload = if held.is_empty() {
-            "cwd=-".to_string()
-        } else {
-            format!("cwd={}", crate::control::pct_encode(&held))
-        };
-        self.record(CWD_CHANGE, payload);
+        }
+        self.record(CWD_CHANGE);
         true
     }
 
     /// THE `title-change` WRITER (DESIGN §8: "the C-tier title keeps the `title-change` rows").
     pub(crate) fn record_title(&mut self, shown: &str) -> bool {
         let at = self.slog.now();
-        let Some(held) = self.slog.observe_title(shown, at) else {
+        if !self.slog.observe_title(shown, at) {
             return false;
-        };
-        self.record(
-            TITLE_CHANGE,
-            format!("title={}", crate::control::pct_encode(&held)),
-        );
+        }
+        self.record(TITLE_CHANGE);
         true
     }
 
@@ -2465,7 +2345,7 @@ impl SessionTimeline {
         });
     }
 
-    /// Only entry into and exit from `desync-risk` reach the lifecycle ring.
+    /// Only entry into and exit from `desync-risk` reach the timeline, each a `render` mark.
     pub(crate) fn record_render(
         &mut self,
         transitions: &[crate::resize_ledger::Transition],
@@ -2477,35 +2357,25 @@ impl SessionTimeline {
             );
         }
         for transition in transitions {
-            self.record("render", transition.payload());
             let at = self.slog.now();
             self.slog.observe_render(transition, at);
+            self.record("render");
         }
         !transitions.is_empty()
     }
 
-    /// Events with `id > after` (all with `None`), oldest first: a test's, holding the view to the ring.
+    /// The view's rows with `id > after` (all with `None`, or with an id past the view's head), oldest first: a test's read of the timeline.
     #[cfg(test)]
-    pub(crate) fn since(
-        &self,
-        after: Option<u64>,
-    ) -> impl DoubleEndedIterator<Item = &TimelineEvent> + ExactSizeIterator {
-        let start = match after {
-            Some(a) if a <= self.next_id => self.events.partition_point(|e| {
-                crate::work_counts::retained_record_touched();
-                e.id <= a
-            }),
-            Some(_) | None => 0,
-        };
-        self.events.range(start..)
+    pub(crate) fn since(&self, after: Option<u64>) -> std::vec::IntoIter<TimelineEvent> {
+        self.view_since(after).rows.into_iter()
     }
 
     /// The id a seamless update's manifest carries (`SessionRecord::timeline_id`).
     #[cfg(any(unix, test))]
     pub(crate) fn handoff_id(&mut self) -> u64 {
         let carried = self
-            .next_id
-            .max(self.slog.row_head())
+            .slog
+            .row_head()
             .saturating_add(HANDOFF_ID_RESERVE)
             .min(i64::MAX as u64);
         self.handoff_ceiling = Some(carried);
@@ -2516,7 +2386,7 @@ impl SessionTimeline {
     #[cfg(any(unix, test))]
     pub(crate) fn past_handoff_ceiling(&self) -> bool {
         self.handoff_ceiling
-            .is_some_and(|ceiling| self.next_id > ceiling || self.slog.row_head() > ceiling)
+            .is_some_and(|ceiling| self.slog.row_head() > ceiling)
             || self.slog.past_handoff_ceiling()
     }
 
@@ -2585,27 +2455,25 @@ impl SessionTimeline {
 
     /// Count on from a seamless update.
     pub(crate) fn continue_ids(&mut self, carried: u64) {
-        let carried = carried.min(i64::MAX as u64);
-        self.next_id = self.next_id.max(carried);
-        self.slog.continue_rows(carried);
+        self.slog.continue_rows(carried.min(i64::MAX as u64));
     }
 
-    /// The highest recorded event id, or `None` when empty.
+    /// The newest row's id in the view, or `None` when it holds none (a test's).
     #[cfg(test)]
     pub(crate) fn high_id(&self) -> Option<u64> {
-        self.events.back().map(|e| e.id)
+        self.since(None).next_back().map(|e| e.id)
     }
 
-    /// The lowest retained event id, or `None` when empty.
+    /// The oldest row's id in the view, or `None` when it holds none (a test's).
     #[cfg(test)]
     pub(crate) fn low_id(&self) -> Option<u64> {
-        self.events.front().map(|e| e.id)
+        self.since(None).next().map(|e| e.id)
     }
 
-    /// Retained event count.
+    /// How many rows the view holds (a test's).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.events.len()
+        self.since(None).len()
     }
 
     /// The server's published program and agent verdict for this session.
@@ -2627,7 +2495,6 @@ impl SessionTimeline {
     }
 
     const fn advance_foreground_generation(&mut self) {
-        // Exhaustion disables new stamps instead of aliasing an older one.
         self.foreground_generation = self.foreground_generation.saturating_add(1);
     }
 
@@ -2679,9 +2546,9 @@ impl SessionTimeline {
     ) -> (crate::task_record::TaskRecord, bool) {
         let (next, changed) = mark.apply(self.task.as_ref(), attention, now, now_unix_ms);
         if changed {
-            self.record("task-change", next.event_payload());
             let at = self.slog.now();
             self.slog.observe_task(&next, at);
+            self.record("task-change");
             self.task = Some(next.clone());
         }
         (next, changed)
@@ -2694,10 +2561,9 @@ impl SessionTimeline {
         };
         task.attention = raised;
         task.rev = task.rev.saturating_add(1);
-        let payload = task.event_payload();
         let at = self.slog.now();
         self.slog.observe_task(task, at);
-        self.record("task-change", payload);
+        self.record("task-change");
         true
     }
 
@@ -2761,7 +2627,6 @@ impl SessionTimeline {
             // One wake after publication, even if both reader and phase moved.
             crate::harness_host::ring_phase();
         } else if self.note_screen_move(std::time::Instant::now()) {
-            // Only record screen movement when the phase word itself did not change.
             crate::harness_host::ring_phase();
         }
         changed
@@ -2805,8 +2670,6 @@ impl SessionTimeline {
         }
         self.agent.changed_ms = now_ms();
         self.agent.changed_continuous_ms = aterm_uds::process::continuous_ms();
-        let (generation, fp) = self.agent.stamp_fields();
-        let payload = format!("{word} rev={} gen={generation} fp={fp}", self.agent.rev);
         let at = self.slog.now();
         let moved = crate::session_log::AgentMove {
             word,
@@ -2817,7 +2680,7 @@ impl SessionTimeline {
             pgid: self.agent.program_pgid,
         };
         let _ = self.slog.agent_moved(moved, at);
-        self.record("agent-change", payload);
+        self.record("agent-change");
         true
     }
 
@@ -2884,8 +2747,6 @@ impl SessionTimeline {
         self.leader_no_harness = None;
         self.leader_no_harness_applied = None;
         if self.agent.program.take().is_some() || had_reader {
-            // A runtime identified by its screen can have no named program;
-            // its worker must still see the foreground group leave.
             crate::harness_host::ring();
         }
         let at = self.slog.now();
@@ -3506,8 +3367,7 @@ impl SessionTimeline {
         }
     }
 
-    /// Record whether `pgid`'s leader was started with `--no-harness` / `--no-alab-harness`
-    /// (`ATERM_NO_HARNESS=1`).
+    /// Record whether `pgid`'s leader was started with `--no-harness` / `--no-alab-harness` (`ATERM_NO_HARNESS=1`).
     pub(crate) fn set_leader_no_harness(&mut self, pgid: i32, no_harness: bool) -> bool {
         if self.agent.program_pgid != pgid {
             return false;
@@ -3524,16 +3384,12 @@ impl SessionTimeline {
             .is_some_and(|pgid| pgid > 0 && pgid == self.agent.program_pgid)
     }
 
-    /// Whether the current foreground leader requested `--no-harness` and the window has not yet
-    /// applied `Autopilot::Off` to the session metadata for this process group.
+    /// Whether the current foreground leader requested `--no-harness` and `Autopilot::Off` has not yet been applied for this process group.
     pub(crate) fn unapplied_leader_no_harness(&self) -> bool {
         self.leader_no_harness() && self.leader_no_harness_applied != self.leader_no_harness
     }
 
-    /// Claim the current foreground leader's `--no-harness` request once per process group so
-    /// launching a CLI with `--no-harness` disables the harness even in a tab whose Autopilot
-    /// word was set earlier, while still letting the user manually turn the harness back on
-    /// during that CLI run.
+    /// Claim the current foreground leader's `--no-harness` request once per process group.
     pub(crate) fn take_leader_no_harness(&mut self) -> bool {
         if !self.unapplied_leader_no_harness() {
             return false;
@@ -3818,163 +3674,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_ids_are_monotonic_and_ring_drops_oldest() {
-        let mut tl = SessionTimeline::default();
-        for _ in 0..(TIMELINE_CAP + 3) {
-            tl.record("state-change", "state=alive".to_string());
-        }
-        assert_eq!(tl.len(), TIMELINE_CAP, "capped");
-        assert_eq!(tl.high_id(), Some(TIMELINE_CAP as u64 + 3));
-        let ids: Vec<u64> = tl.since(None).map(|e| e.id).collect();
-        assert_eq!(ids[0], 4, "oldest three evicted");
-        assert!(ids.windows(2).all(|w| w[1] == w[0] + 1), "monotonic ids");
-        let tail: Vec<u64> = tl
-            .since(Some(TIMELINE_CAP as u64 + 1))
-            .map(|e| e.id)
-            .collect();
-        assert_eq!(tail, vec![TIMELINE_CAP as u64 + 2, TIMELINE_CAP as u64 + 3]);
-        let ts: Vec<u64> = tl.since(None).map(|e| e.t_ms).collect();
-        assert!(ts.windows(2).all(|w| w[1] >= w[0]));
-    }
-
-    #[test]
-    fn program_state_rows_name_the_report_and_hold_at_most_their_share() {
-        use aterm_core::terminal::program_state::{
-            ProgramBlockedKind, ProgramState, ProgramStateWord as W,
-        };
-        let blocked = ProgramState {
-            state: W::Blocked,
-            kind: Some(ProgramBlockedKind::Question),
-        };
-        let working = ProgramState {
-            state: W::Working,
-            kind: None,
-        };
-        let mut tl = SessionTimeline::default();
-        let spawned = tl.record("spawned", "pid=1".to_string());
-        for i in 0..1000 {
-            let shown = match i % 3 {
-                0 => Some(working),
-                1 => Some(blocked),
-                _ => None,
-            };
-            tl.note_program_state(shown);
-        }
-        let rows: Vec<&TimelineEvent> =
-            tl.since(None).filter(|e| e.kind == PROGRAM_STATE).collect();
-        assert_eq!(rows.len(), PROGRAM_STATE_ROWS_MAX, "held to the share");
-        assert!(tl.len() <= TIMELINE_CAP);
-        assert_eq!(
-            tl.since(None).next().map(|e| (e.id, e.kind)),
-            Some((spawned, "spawned")),
-            "the session's own rows stay"
-        );
-        assert!(rows.windows(2).all(|w| w[1].id > w[0].id));
-        assert_eq!(rows.last().map(|e| e.id), tl.high_id());
-        let tail: Vec<&str> = rows[rows.len() - 3..].iter().map(|e| &*e.payload).collect();
-        assert_eq!(
-            tail,
-            [
-                "state=blocked kind=question",
-                "state=- kind=-",
-                "state=working kind=-"
-            ]
-        );
-        let others = |tl: &SessionTimeline| -> Vec<u64> {
-            tl.since(None)
-                .filter(|e| e.kind == "state-change")
-                .map(|e| e.id)
-                .collect()
-        };
-        let mut full = SessionTimeline::default();
-        let mut ids: Vec<u64> = (0..TIMELINE_CAP)
-            .map(|_| full.record("state-change", "state=alive".to_string()))
-            .collect();
-        for i in 0..1000 {
-            full.note_program_state((i % 2 == 0).then_some(working));
-        }
-        let kept = ids.split_off(PROGRAM_STATE_ROWS_MAX);
-        assert_eq!(
-            others(&full),
-            kept,
-            "the newest {} other rows stay",
-            TIMELINE_CAP - PROGRAM_STATE_ROWS_MAX
-        );
-        assert_eq!(full.len(), TIMELINE_CAP);
-        let mut flood = SessionTimeline::default();
-        flood.record("spawned", "pid=1".to_string());
-        for _ in 0..1000 {
-            flood.record(PROGRAM_STATE, "state=working kind=-".to_string());
-        }
-        assert!(
-            flood.since(None).all(|e| e.kind != "spawned"),
-            "control: without the share the spawned row is evicted"
-        );
-        let mut unshared = SessionTimeline::default();
-        for _ in 0..TIMELINE_CAP {
-            unshared.record("state-change", "state=alive".to_string());
-        }
-        for _ in 0..1000 {
-            unshared.record(PROGRAM_STATE, "state=working kind=-".to_string());
-        }
-        assert!(
-            others(&unshared).is_empty(),
-            "control: without the share a full ring loses every other row"
-        );
-    }
-
-    #[test]
-    fn since_seek_matches_the_linear_filter_for_every_watermark() {
-        let mut tl = SessionTimeline::default();
-        for _ in 0..(TIMELINE_CAP + 5) {
-            tl.record("state-change", "state=alive".to_string());
-        }
-        let low = tl.since(None).next().expect("non-empty").id;
-        let high = tl.high_id().expect("non-empty");
-        assert!(
-            low > 1,
-            "the fixture must have evicted, or the below-low arm is vacuous"
-        );
-
-        let reference = |after: Option<u64>| -> Vec<u64> {
-            tl.events
-                .iter()
-                .filter(|e| after.is_none_or(|a| a > high || e.id > a))
-                .map(|e| e.id)
-                .collect()
-        };
-        let observed = |after: Option<u64>| -> Vec<u64> { tl.since(after).map(|e| e.id).collect() };
-
-        let mut probes: Vec<Option<u64>> = vec![None, Some(0), Some(1)];
-        for id in [low - 1, low, low + 1, high - 1, high, high + 1, high + 100] {
-            probes.push(Some(id));
-        }
-        for after in probes {
-            assert_eq!(
-                observed(after),
-                reference(after),
-                "since({after:?}) diverged"
-            );
-        }
-        assert_eq!(
-            observed(Some(low - 1)).len(),
-            TIMELINE_CAP,
-            "below low-water = all retained"
-        );
-        assert!(
-            observed(Some(high)).is_empty(),
-            "at the high-water = nothing new"
-        );
-        assert_eq!(
-            observed(Some(high + 1)).len(),
-            TIMELINE_CAP,
-            "above every id handed out = all retained"
-        );
-        let newest: Vec<u64> = tl.since(None).rev().take(3).map(|e| e.id).collect();
-        assert_eq!(newest, vec![high, high - 1, high - 2]);
-    }
-
-    #[test]
     fn cwd_change_records_only_actual_changes_and_clears_to_dash() {
         let mut tl = SessionTimeline::default();
         tl.record_cwd_change(Some("/a"));
@@ -3982,7 +3681,8 @@ mod tests {
         tl.record_cwd_change(Some("/b b")); // space -> pct-encoded
         tl.record_cwd_change(None); // OSC 7 cleared
         tl.record_cwd_change(None); // still cleared: no new event
-        let got: Vec<(&str, &str)> = tl.since(None).map(|e| (e.kind, &*e.payload)).collect();
+        let rows: Vec<TimelineEvent> = tl.since(None).collect();
+        let got: Vec<(&str, &str)> = rows.iter().map(|e| (e.kind, &*e.payload)).collect();
         assert_eq!(
             got,
             vec![
@@ -3993,25 +3693,25 @@ mod tests {
         );
     }
 
+    /// The clamp, and a row the view prints: a long payload is cut on a char boundary.
     #[test]
     fn payload_clamps_on_a_char_boundary() {
-        let mut tl = SessionTimeline::default();
         let long = "é".repeat(400); // 800 bytes
+        let clamped = clamp_payload(long.clone());
+        assert!(clamped.len() <= MAX_PAYLOAD && clamped.len() >= MAX_PAYLOAD - 5);
+        assert!(clamped.chars().all(|c| c == 'é'), "boundary-safe clamp");
+        let mut tl = SessionTimeline::default();
         tl.record_raw_meta_change(long);
         let e = tl.since(None).next().unwrap();
         assert!(e.payload.len() <= MAX_PAYLOAD);
-        assert!(e.payload.chars().all(|c| c == 'é'), "boundary-safe clamp");
+        assert!(e.payload.chars().all(|c| c == 'é'), "boundary-safe row");
     }
 
+    /// The clamp, and a row the view prints (whose text its field's own
+    /// encoded cap cut first): no `%XX` escape is bisected.
     #[test]
     fn payload_clamp_never_bisects_a_pct_escape() {
-        for pad in 0..3usize {
-            let encoded = crate::control::pct_encode(&"中".repeat(MAX_PAYLOAD)); // %E4%B8%AD…
-            let payload = format!("{}{encoded}", "x".repeat(pad));
-            let mut tl = SessionTimeline::default();
-            tl.record_raw_meta_change(payload);
-            let stored = &tl.since(None).next().unwrap().payload;
-            assert!(stored.len() <= MAX_PAYLOAD, "cap holds (pad {pad})");
+        let whole = |stored: &str, pad: usize| {
             let b = stored.as_bytes();
             for (i, &c) in b.iter().enumerate() {
                 if c == b'%' {
@@ -4023,6 +3723,18 @@ mod tests {
                     );
                 }
             }
+        };
+        for pad in 0..3usize {
+            let encoded = crate::control::pct_encode(&"中".repeat(MAX_PAYLOAD)); // %E4%B8%AD…
+            let payload = format!("{}{encoded}", "x".repeat(pad));
+            let clamped = clamp_payload(payload.clone());
+            assert!(clamped.len() <= MAX_PAYLOAD, "cap holds (pad {pad})");
+            whole(&clamped, pad);
+            let mut tl = SessionTimeline::default();
+            tl.record_raw_meta_change(payload);
+            let stored = tl.since(None).next().unwrap().payload;
+            assert!(stored.len() <= MAX_PAYLOAD, "cap holds (pad {pad})");
+            whole(&stored, pad);
         }
     }
 
@@ -4148,9 +3860,10 @@ mod write_api_tests {
             !apply_meta_value(&ctx, MetaField::Title, None, aterm_slog::Actor::Ctl),
             "clearing an unset field is a no-op"
         );
-        let tl = ctx.timeline.lock().unwrap();
-        let payloads: Vec<&str> = tl
-            .since(None)
+        let rows: Vec<crate::session_timeline::TimelineEvent> =
+            ctx.timeline.lock().unwrap().since(None).collect();
+        let payloads: Vec<&str> = rows
+            .iter()
             .filter(|e| e.kind == "meta-change")
             .map(|e| &*e.payload)
             .collect();

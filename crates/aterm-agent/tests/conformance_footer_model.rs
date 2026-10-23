@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ClaudeFooterModel, Tier-1: which model the Claude Code footer names (`harness::footer`), driven from the states of the derived model within [`WALK_DEPTH`] actions of its start and projected back onto it.
+//! Tier-1 conformance suite for `ClaudeFooterModel`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write as _;
@@ -15,16 +15,13 @@ use aterm_spec::{verify, xref};
 
 type Vars = BTreeMap<&'static str, i64>;
 
-/// The process's start: the floor.
 const START: u64 = 1_790_607_848;
 const PID: u32 = 4242;
 
-/// The session id the registry names for the `n`th session of the process.
 fn session_id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012}")
 }
 
-/// D's session number: the conversation another process began at the floor.
 const LATE: u32 = 999;
 
 /// Which reader a replay drives.
@@ -54,8 +51,6 @@ enum Reader {
     FloorOnly,
 }
 
-/// A replay's world: a Claude directory, its registry file, the transcripts,
-/// the screen and the reader's cache.
 struct World {
     _root: aterm_tempfile::TempDir,
     claude: PathBuf,
@@ -123,9 +118,6 @@ fn project(model: Option<&str>) -> i64 {
     }
 }
 
-/// A recorded 2.1.283 bypass screen whose card names `Opus 5.5 with xhigh
-/// effort`: the card naming the model `card` says, or the same screen with its
-/// card scrolled away.
 fn screen(card: Option<i64>) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-phase/src/fixtures/claude-2.1.283-footer-bypass-idle.txt");
@@ -193,9 +185,6 @@ impl World {
         world
     }
 
-    /// The world at the process's launch: the project's transcripts only those
-    /// from before the floor, the registry naming a fresh launch's session, a
-    /// fresh cache, and nothing chosen, resumed or drawn.
     fn reset(&mut self) {
         let first = self.named.is_none();
         let gone = std::mem::take(&mut self.wrote);
@@ -283,14 +272,12 @@ impl World {
         stamp(START + self.clock)
     }
 
-    /// The registry names session `n` now, whose transcript the rows go to.
     fn switch_to(&mut self, n: u32) {
         register(&self.claude, &self.cwd, n);
         self.named = Some(n);
         self.transcript = self.project.join(format!("{}.jsonl", session_id(n)));
     }
 
-    /// The model's action `name`, done to the real world.
     fn act(&mut self, name: &str) -> Option<i64> {
         match name {
             "Flag" => {
@@ -390,9 +377,6 @@ impl World {
         None
     }
 
-    /// [`Reader::RestoreNoPin`]'s cache, just before a `/resume` only a
-    /// restore's pin keeps: a fresh cache whose process answered with the
-    /// model it runs in a session of its own — its model kept, the pin gone.
     fn forget_the_restore_pin(&mut self) {
         self.cache = TailCache::default();
         let own = self.next_session;
@@ -403,7 +387,6 @@ impl World {
         assert_eq!(self.read(), self.runs, "the process's model is kept");
     }
 
-    /// The footer's model now, through `reader`.
     fn read(&mut self) -> i64 {
         let entry: SessionEntry =
             footer::session_of_pid(&self.claude, PID, Some(START)).expect("the registry");
@@ -483,8 +466,6 @@ impl World {
     }
 }
 
-/// Write the registry file of the process for its `n`th session: the same
-/// pid, `procStart` and `startedAt` every time — only the session id moves.
 fn register(claude: &Path, cwd: &Path, n: u32) {
     std::fs::write(
         claude.join(format!("sessions/{PID}.json")),
@@ -522,10 +503,8 @@ fn stdout_row(at: &str, text: &str) -> String {
     )
 }
 
-/// [`paths`]'s result.
 type Space = Vec<(Vars, Vec<&'static str>)>;
 
-/// Every reachable state of `model` with the shortest path to it.
 fn paths(model: &Model) -> Space {
     let init = model.init_state();
     let mut seen: BTreeMap<Vars, Vec<&'static str>> = BTreeMap::new();
@@ -546,8 +525,6 @@ fn paths(model: &Model) -> Space {
     seen.into_iter().collect()
 }
 
-/// The derived model and every state it reaches with its shortest path ([`paths`]),
-/// built once per process for the walk and every control.
 fn footer() -> &'static (Model, Space) {
     static FOOTER: std::sync::OnceLock<(Model, Space)> = std::sync::OnceLock::new();
     FOOTER.get_or_init(|| {
@@ -557,8 +534,6 @@ fn footer() -> &'static (Model, Space) {
     })
 }
 
-/// The last `Read` of a replay, for both tiers to judge: the real successor
-/// must be admitted, and every forged one — any other model shown — refused.
 struct Last {
     path: Vec<&'static str>,
     reader: Reader,
@@ -566,8 +541,6 @@ struct Last {
     after: Vars,
 }
 
-/// Judge `last` by both tiers ([`verify::validate_transition_tiered`]); the first
-/// disagreement is the `Err`.
 fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
     let Last {
         path,
@@ -607,8 +580,6 @@ fn judge_last(model: &Model, last: &Last) -> Result<(), String> {
     Ok(())
 }
 
-/// Replay `path` on `world`, reset ([`World::reset`]), through its reader; every
-/// `Read` is checked against the model, and the first disagreement returned.
 fn replay(
     model: &Model,
     world: &mut World,
@@ -650,8 +621,6 @@ fn replay(
     Ok(reads)
 }
 
-/// Every reachable state whose path `keep` takes, reached and read, and read again
-/// after a flood.
 fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<usize, String> {
     let (model, space) = footer();
     let mut replayed = BTreeSet::new();
@@ -729,7 +698,6 @@ fn enumerate(reader: Reader, keep: impl Fn(&[&'static str]) -> bool) -> Result<u
     })
 }
 
-/// The most replay threads one [`enumerate`] runs (half the cores, at most this).
 const POOL: usize = 4;
 
 /// [`judge_last`] on many threads, one `before` state at a time: every judgement of a
@@ -755,11 +723,8 @@ impl Judging {
     }
 }
 
-/// One replay's outcome, a panic included, at its place in the walk.
 type Outcome = (usize, std::thread::Result<Result<usize, String>>);
 
-/// The `len` replays' outcomes in walk order, whichever finished first: their
-/// reads summed, or the first disagreement in walk order.
 fn in_walk_order(
     len: usize,
     outcomes: &std::sync::mpsc::Receiver<Outcome>,
@@ -779,11 +744,6 @@ fn in_walk_order(
     Ok(reads)
 }
 
-/// Where the reader is anchored in the shipping code (`#[refines]` on
-/// `Read`, expanded in every test and debug build of this crate):
-/// every part of the one read the host's resolver runs — the facts for a
-/// registry entry, the tail cache's read and its session switch, the scan,
-/// and a command result's fold.
 const READERS: [&str; 5] = [
     "facts_for_entry_from",
     "fold_result",
@@ -792,19 +752,12 @@ const READERS: [&str; 5] = [
     "scan",
 ];
 
-/// The walk: every state within this many actions of the model's start (its
-/// breadth-first depth in [`paths`]), each read, and read again after a flood, by the
-/// real chain and judged by both tiers.
 const WALK_DEPTH: usize = 5;
 
-/// The paths of at most `depth` actions: a prefix-closed part of the space, so
-/// [`replay`]'s argument that every `Read` is judged by both tiers holds in it.
 fn within(depth: usize) -> impl Fn(&[&'static str]) -> bool {
     move |path| path.len() <= depth
 }
 
-/// The real reader's bind over the states within `depth` actions: the walk, then the
-/// anchors, linked, naming the one projection, and entered by it.
 fn bind(depth: usize) {
     assert!(xref::reset_entered_anchors(), "the evidence window opens");
     let model = &footer().0;
@@ -837,26 +790,19 @@ fn bind(depth: usize) {
     assert_eq!(waived, actions, "every other action waived, `Read` not");
 }
 
-/// The real reader names the running model from every state within
-/// [`WALK_DEPTH`] actions ([`bind`]).
 #[test]
 fn the_footer_names_the_running_model_from_every_state_within_five_actions() {
     bind(WALK_DEPTH);
 }
 
-/// A path of a process launched onto a resumed conversation.
 fn launch_resumed(path: &[&'static str]) -> bool {
     path.contains(&"LaunchResume")
 }
 
-/// A path through D, the conversation begun since the process started.
 fn late(path: &[&'static str]) -> bool {
     path.contains(&"ResumeLate")
 }
 
-/// Negative controls: each defect the model's `Buggy` branches describe, put
-/// into the reader, is caught by the same enumeration in the part of the space
-/// where that defect lives, so no control passes on another's catch.
 fn old_readers_are_caught(depth: usize) {
     let inside = within(depth);
     let fresh = |p: &[&'static str]| !launch_resumed(p) && !late(p) && inside(p);

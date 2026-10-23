@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Child process spawning with explicit descriptor inheritance ([`command`]).
+//! Child process spawning with explicit descriptor inheritance ([`command`](crate::spawnfd::command)).
 
 #![cfg(unix)]
 
@@ -661,7 +661,7 @@ mod platform {
         Ok(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(found) })
     }
 
-    /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`.
+    /// `posix_spawn`, with `POSIX_SPAWN_CLOEXEC_DEFAULT` unless `place.inherit_all`.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         let argv = Image::pointers(&image.argv);
         let envp = Image::pointers(&image.envp);
@@ -1147,7 +1147,8 @@ fn past_text_busy<T>(
     }
 }
 
-/// A spawn this module does not make.
+/// Run `spawn`, a spawn this module does not make (an [`InheritNothing`] `std::process::Command`),
+/// retrying an `ETXTBSY` exec for up to a second off Darwin; on Darwin it runs once.
 pub fn spawn_past_text_busy<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(not(target_vendor = "apple"))]
     {

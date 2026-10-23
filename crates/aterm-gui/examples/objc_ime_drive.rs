@@ -9,7 +9,6 @@ const PASS: i32 = 0;
 /// At least one finding. See the transcript.
 #[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
-/// The drive could not execute here. Not a pass.
 const NOT_RUN: i32 = 2;
 /// Every stage agreed, but stage 8's control did not compose, so "no dead key"
 /// was not measured.
@@ -46,27 +45,18 @@ mod macos {
 
     use super::{FAIL, NOT_RUN, PASS, PASS_UNCONTROLLED};
 
-    /// Long enough for macOS to launch its `NSApplication` and hand back a
-    /// window; past it the drive reports NOT RUN rather than passing.
     const BUDGET: Duration = Duration::from_secs(30);
 
-    /// How long stage 7 waits for macOS to make the drive the active app before
-    /// it runs anyway and reports that its control could not compose.
     const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
-    /// `NSNotFound`, which is `NSIntegerMax`. `replacementRange:` is documented
-    /// to be `{NSNotFound, 0}` when the input method is not replacing anything,
-    /// which is what a composing IME always sends.
     const NS_NOT_FOUND: usize = isize::MAX as usize;
 
-    /// The whole `replacementRange:` an IME sends while composing.
     const NO_REPLACEMENT: NSRange = NSRange {
         location: NS_NOT_FOUND,
         length: 0,
     };
 
     /// Send `-setMarkedText:selectedRange:replacementRange:`.
-    ///
     /// # Safety
     /// `view` must be a live `WinitView` and `string` a live `NSString` or `NSAttributedString`.
     unsafe fn set_marked_text(view: Id, string: Id, selected: NSRange, replacement: NSRange) {
@@ -84,7 +74,6 @@ mod macos {
     }
 
     /// Send `-insertText:replacementRange:`.
-    ///
     /// # Safety
     /// Same preconditions as [`set_marked_text`].
     unsafe fn insert_text(view: Id, string: Id, replacement: NSRange) {
@@ -101,7 +90,6 @@ mod macos {
     }
 
     /// Send `-hasMarkedText`.
-    ///
     /// # Safety
     /// `view` must be a live `WinitView`.
     unsafe fn has_marked_text(view: Id) -> bool {
@@ -113,7 +101,6 @@ mod macos {
     }
 
     /// Send `-markedRange`.
-    ///
     /// # Safety
     /// `view` must be a live `WinitView`.
     unsafe fn marked_range(view: Id) -> NSRange {
@@ -125,7 +112,6 @@ mod macos {
     }
 
     /// Send a zero-argument `v@:` selector (`unmarkText`).
-    ///
     /// # Safety
     /// `view` must be a live `WinitView` and `s` one of its `v@:` rows.
     unsafe fn send_void(view: Id, s: Sel) {
@@ -137,7 +123,6 @@ mod macos {
     }
 
     /// Send `-doCommandBySelector:`.
-    ///
     /// # Safety
     /// `view` must be a live `WinitView`.
     unsafe fn do_command(view: Id, command: Sel) {
@@ -206,11 +191,6 @@ mod macos {
         },
     ];
 
-    /// An Option+`code` key-down `NSEvent` built as a key press is: a CoreGraphics
-    /// keyboard event (`keyCode` `code` with `kCGEventFlagMaskAlternate`) wrapped by
-    /// `+eventWithCGEvent:`, so AppKit reads its characters off the current layout
-    /// (on the U.S. layout Option+E's `characters` is empty, the acute dead key, and
-    /// its `charactersIgnoringModifiers` is `e`).
     fn option_key_down(code: u16) -> Option<Obj> {
         const CG_FLAG_ALTERNATE: u64 = 1 << 19;
         // SAFETY: CoreGraphics/NSEvent calls follow their ownership contracts; `cg` is released after `+eventWithCGEvent:`.
@@ -228,7 +208,6 @@ mod macos {
     }
 
     /// Read `-charactersIgnoringModifiers` from a key `NSEvent`.
-    ///
     /// # Safety
     /// `event` must be a live key `NSEvent`.
     unsafe fn chars_ignoring_modifiers(event: Id) -> Option<String> {
@@ -240,7 +219,6 @@ mod macos {
         }
     }
 
-    /// `+[NSApplication sharedApplication]`.
     fn ns_app() -> Id {
         // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication`.
         unsafe {
@@ -272,7 +250,6 @@ mod macos {
     }
 
     /// Snapshot `view`'s [`Focus`].
-    ///
     /// # Safety
     /// `view` must be a live `WinitView`.
     unsafe fn focus_of(view: Id) -> Focus {
@@ -295,9 +272,9 @@ mod macos {
     }
 
     /// Send `-firstRectForCharacterRange:actualRange:`.
-    ///
     /// # Safety
-    /// `view` must be a live `WinitView` and `actual` must be null or valid for one `NSRange` write.
+    /// `view` must be a live `WinitView` and `actual` must be null or valid for one `NSRange`
+    /// write.
     unsafe fn first_rect(view: Id, range: NSRange, actual: *mut NSRange) -> CGRect {
         // SAFETY: `-firstRectForCharacterRange:actualRange:` matches its audited `CGRect`-returning signature.
         unsafe {
@@ -312,8 +289,6 @@ mod macos {
         }
     }
 
-    /// A +1 `NSAttributedString` over `s`, for the other half of
-    /// `setMarkedText:`'s runtime type test.
     fn attributed(s: &str) -> Option<Obj> {
         let inner = ns_string(s)?;
         // SAFETY: `+alloc` and `-initWithString:` follow +1 ownership on a live `NSString`.
@@ -338,8 +313,6 @@ mod macos {
             self.findings.push(what);
         }
 
-        /// Assert one thing, printing it either way, so a green run is still a
-        /// transcript a reader can check rather than a word.
         fn expect(&mut self, what: &str, ok: bool, detail: String) {
             if ok {
                 println!("    ok   {what}: {detail}");
@@ -349,7 +322,6 @@ mod macos {
         }
     }
 
-    /// Expectations a stage writes down to be checked one pump later.
     type Deferred = Box<dyn FnOnce(&mut Driver)>;
 
     struct Driver {
@@ -380,18 +352,15 @@ mod macos {
     }
 
     impl Driver {
-        /// The `WinitView` AppKit is holding, or `None` if there is no window.
         fn view(&self) -> Option<Id> {
             let view = aterm_objc::HasNsView::ns_view(self.window.as_ref()?);
             (!view.is_null()).then_some(view)
         }
 
-        /// Everything winit has queued, in order, cleared.
         fn drain(&mut self) -> Vec<Ime> {
             std::mem::take(&mut self.ime)
         }
 
-        /// Prints, and clears, the key presses the drive did not send.
         fn show_foreign(&mut self) {
             let foreign = std::mem::take(&mut self.foreign);
             if !foreign.is_empty() {
@@ -403,8 +372,6 @@ mod macos {
         }
     }
 
-    /// Pretty-print an `Ime` for the transcript without depending on its
-    /// `Debug`, which winit is free to change.
     fn show(e: &Ime) -> String {
         match e {
             Ime::Enabled => "Enabled".to_owned(),
@@ -503,7 +470,6 @@ mod macos {
     }
 
     impl Driver {
-        /// Stage 1: a whole composition in ASCII.
         fn stage_ascii(&mut self, view: Id) {
             println!("\n=== 1. A COMPOSITION, ASCII ===");
             let _ = self.drain();
@@ -565,9 +531,6 @@ mod macos {
             }));
         }
 
-        /// Stage 2: the same, in CJK. `selectedRange:` counts UTF-16 code units and
-        /// `Ime::Preedit` promises UTF-8 byte offsets; each character here is one unit
-        /// and three bytes, so an unconverted range answers 2 where 6 is correct.
         fn stage_cjk(&mut self, view: Id) {
             println!("\n=== 2. A COMPOSITION, CJK (the UTF-16 -> UTF-8 conversion) ===");
             let _ = self.drain();
@@ -608,10 +571,6 @@ mod macos {
             }));
         }
 
-        /// Stage 3: the `NSAttributedString` branch. `setMarkedText:`'s first
-        /// argument is declared `@` and the body tests its class with
-        /// `-isKindOfClass:`; Japanese and Korean input methods send attributed
-        /// strings, a path no other stage takes.
         fn stage_attributed(&mut self, view: Id) {
             println!("\n=== 3. setMarkedText: WITH AN NSAttributedString ===");
             let _ = self.drain();
@@ -656,7 +615,6 @@ mod macos {
             }));
         }
 
-        /// Stage 4: the clamp, both halves.
         fn stage_clamp(&mut self, view: Id) {
             println!("\n=== 4. OUT-OF-BOUNDS AND OVERFLOWING SELECTED RANGES ===");
             let _ = self.drain();
@@ -705,7 +663,6 @@ mod macos {
             }));
         }
 
-        /// Stage 5: leaving preedit without committing.
         fn stage_leave_preedit(&mut self, view: Id) {
             println!("\n=== 5. doCommandBySelector: AND unmarkText ===");
             let _ = self.drain();
@@ -772,9 +729,6 @@ mod macos {
             }));
         }
 
-        /// Stage 6: the candidate-window rectangle, the row whose encoding is
-        /// dangerous, checked by its answer against a cursor area set through
-        /// winit's public API.
         fn stage_candidate_rect(&mut self, view: Id) {
             println!("\n=== 6. THE CANDIDATE-WINDOW RECTANGLE ===");
             let Some(w) = self.window.as_ref() else {
@@ -841,10 +795,6 @@ mod macos {
             );
         }
 
-        /// Stage 7's precondition: the input method sees only the keys of the
-        /// key window in the active app, so the first call shows the window and
-        /// asks macOS to activate the drive (the quiet builder launched it inactive,
-        /// beside whatever the developer is typing in).
         fn focused_for_control(&mut self, view: Id) -> bool {
             let asked = *self.focus_asked.get_or_insert_with(|| {
                 if let Some(window) = self.window.as_ref() {
@@ -857,10 +807,6 @@ mod macos {
             unsafe { focus_of(view) }.sees_keys() || asked.elapsed() > FOCUS_WAIT
         }
 
-        /// Stage 7: real `NSEvent`s through `keyDown:`, the only path into
-        /// `-interpretKeyEvents:` and so the system input method (where a dead key
-        /// becomes marked text): each chord of [`CHORDS`], its composition (if any)
-        /// discarded before the next.
         fn stage_dead_key(&mut self, view: Id) {
             println!("\n=== 7. REAL KEY EVENTS (the dead-key path) ===");
             let _ = self.drain();
@@ -933,9 +879,6 @@ mod macos {
             }));
         }
 
-        /// Stage 8: Option as Alt, which aterm sets in Meta mode (config
-        /// `option_as_meta`, the default) on a window whose typing reaches the
-        /// terminal (`App::sync_option_as_alt`).
         fn stage_option_as_alt(&mut self, view: Id) {
             println!("\n=== 8. OPTION AS ALT: no Option chord is a dead key ===");
             let Some(window) = self.window.as_ref() else {
@@ -1027,7 +970,6 @@ mod macos {
             }));
         }
 
-        /// Stage 9: the mouse paths through `update_modifiers`.
         fn stage_mouse_paths(&mut self, view: Id) {
             println!("\n=== 9. THE MOUSE PATHS: a non-key event through update_modifiers ===");
             self.mouse.clear();

@@ -291,7 +291,7 @@ struct CAction {
     updates: Vec<(usize, Rhs)>,
 }
 
-/// A model resolved for the walks in [`crate::interp`]; see the module docs.
+/// A model resolved for the walks in [`crate::interp`].
 #[derive(Debug)]
 pub(crate) struct Compiled {
     /// The state variables in sorted order: slot `i` is `names[i]`.

@@ -206,6 +206,40 @@ mod tests {
         assert_eq!(after.text, original.text);
     }
 
+    /// On Windows `C-s` saves and isearch is `M-s`: in a search, `M-s`
+    /// searches again, as `C-s` does wherever it starts the search
+    /// (`C-s` and `C-r` keep doing so everywhere).
+    #[test]
+    fn the_chord_that_starts_a_search_searches_again() {
+        use crate::editor::{Keymap, Platform, Profile};
+        for (platform, again) in [(Platform::Windows, "M-s"), (Platform::Mac, "C-s")] {
+            let (mut store, _, _, document) = editor("needle α needle β needle");
+            let mut workspace = EditorWorkspace::with_keymap(Keymap::emacs(Profile::Gui(platform)));
+            let mut view = workspace
+                .attach(&mut store, document, crate::store::DocumentViewId(93))
+                .unwrap();
+            let chord = |s: &str| KeyChord::parse(s).unwrap();
+            workspace
+                .handle_chord(&mut store, &mut view, chord(again))
+                .unwrap();
+            assert!(view.minibuffer_active(), "{platform:?}: {again} starts it");
+            workspace
+                .insert_text(&mut store, &mut view, "needle")
+                .unwrap();
+            assert_eq!(view.primary_selection().range(), 0..6);
+            for (press, at) in [(again, 10), ("C-s", 20), ("C-r", 10)] {
+                workspace
+                    .handle_chord(&mut store, &mut view, chord(press))
+                    .unwrap();
+                assert_eq!(
+                    view.primary_selection().range(),
+                    at..at + 6,
+                    "{platform:?}: {press}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn incremental_typing_stays_at_its_origin_until_explicit_navigation_wraps() {
         let (mut store, mut workspace, mut view, _) = editor("needle α");

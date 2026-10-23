@@ -349,17 +349,21 @@ pub(crate) fn lay_dark_bed(
         };
         taper.clear();
         taper.extend(run.iter().map(|s| taper_at(s.x)));
-        let mut prev: Option<((i32, i32), u32)> = None;
-        for ((s, &rgb), &k) in run.iter().zip(ink).zip(taper.iter()) {
-            let a = shape.at(s.cov, chf, k).0 as u8;
-            let composite = aterm_render::over_premul(page, premul_rgb(rgb, a), a);
-            let here = cell_of(s.x, s.y);
-            ledger.lay_under(here, composite);
-            if let Some((cell, before)) = prev {
-                ledger.lay_under(here, before);
-                ledger.lay_under(cell, composite);
+        if ledger.is_on() {
+            let mut prev: Option<((i32, i32), u32)> = None;
+            for ((s, &rgb), &k) in run.iter().zip(ink).zip(taper.iter()) {
+                let a = shape.at(s.cov, chf, k).0 as u8;
+                let composite = aterm_render::over_premul(page, premul_rgb(rgb, a), a);
+                let here = cell_of(s.x, s.y);
+                ledger.lay_under(here, composite);
+                if let Some((cell, before)) = prev
+                    && cell != here
+                {
+                    ledger.lay_under(here, before);
+                    ledger.lay_under(cell, composite);
+                }
+                prev = Some((here, composite));
             }
-            prev = Some((here, composite));
         }
         if one_row {
             let vertex = |x: f32, s: &CometSample, rgb: u32, k: f32| {
@@ -932,7 +936,8 @@ impl CursorGlow {
     }
 
     /// What this frame shows of text.
-    pub(crate) fn text_view(&self) -> TextView<'_> {
+    #[inline]
+    pub(crate) const fn text_view(&self) -> TextView<'_> {
         TextView::new(self.probed_text_spans(), Some(&self.frame_text))
     }
 

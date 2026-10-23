@@ -90,7 +90,6 @@ impl InputVerb {
         }
     }
 
-    /// The `verb=` word.
     const fn word(self) -> &'static str {
         match self {
             InputVerb::Send => "send",
@@ -102,18 +101,8 @@ impl InputVerb {
     }
 }
 
-/// The authors whose control-input bursts are told apart: the
-/// trusted actors (the harness, the bridge, `ctl`, the person) each have a
-/// burst clock of their own outside every table, so no flood of other
-/// authors suppresses their `mark - input`; sessions (edge sources) and the
-/// unattributed share a table of eight, each slot reused once its burst
-/// ended, and one slot every author past them shares, so they open a burst
-/// at most once a window together.
 const INPUT_BURST_ACTORS: usize = 8;
 
-/// Which reserved burst clock a trusted actor's input keeps
-/// ([`Consumers::reserved`]), or `None`: a session or nobody, which share
-/// the table.
 const fn reserved_burst(by: &Actor) -> Option<usize> {
     match by {
         Actor::Harness => Some(0),
@@ -161,8 +150,6 @@ impl Default for Consumers {
 }
 
 impl Consumers {
-    /// Whether input from `by` at `now_mono` opens a burst: its first after
-    /// [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without one.
     fn burst_starts(&mut self, by: Actor, now_mono: u64) -> bool {
         let gap = crate::session_timeline::HUMAN_BURST_GAP_MS;
         let ended = |t: u64| now_mono.saturating_sub(t) >= gap;
@@ -346,17 +333,12 @@ impl SessionLog {
         }
     }
 
-    /// Whether this log's mail records name broker offset `off` (a `mail`
-    /// mark's `off=`).
     fn names_mail(&self, off: u64) -> bool {
         self.log
             .window()
             .any(|r| r.k == Kind::Mail && r.f.get_u(Key::Off) == Some(off))
     }
 
-    /// Whether seq `n` lies in this log's current seq space: from its first
-    /// accounted seq to the head a reader is shown, outside every seq range it
-    /// never held.
     fn in_seq_space(&self, n: u64) -> bool {
         let log = &self.log;
         n >= log.first_seq().max(1)
@@ -424,7 +406,6 @@ pub(crate) fn validate_cause(ctx: &crate::SessionCtx, cause: CauseRef) -> Result
 pub(crate) const MARK_USAGE: &str = "ERR usage: mark <node|-> note|verdict|label|need|clear|act \
      [word=<w>] [text=<pct>] [re=<seq|@off>] [as=<name>] [ttl=<s>] [rule=<id>]\n";
 
-/// The words each kind's `word=` takes (design §7.4's table).
 const VERDICT_WORDS: &[&str] = &[
     "on-track",
     "off-track",
@@ -446,10 +427,8 @@ const ACT_WORDS: &[&str] = &[
     "dispatch",
 ];
 
-/// A `label`'s bounds: what the clause can show beside ` · <age>` (§7.3).
 const LABEL_MAX_GRAPHEMES: usize = 32;
 const LABEL_MAX_BYTES: usize = 40;
-/// A label's longest life, seconds.
 const LABEL_TTL_MAX_S: u64 = 3600;
 
 /// A parsed `mark` request: what it asks to write, checked for shape (the
@@ -467,17 +446,12 @@ pub(crate) struct MarkReq {
     rule: Option<ShortId>,
 }
 
-/// Whether `s` is an `as=` name: `[A-Za-z0-9._-]{1,32}`.
 fn is_as_name(s: &str) -> bool {
     (1..=32).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// A `text=` value through the `meta set` ladder (design §7.4): percent-
-/// decoded, trimmed, never empty, never with control, bidi or invisible
-/// formatting (refused, not stripped), within the field's 160 encoded bytes
-/// (refused, not clamped).
 fn mark_text(raw: &str) -> Result<String, String> {
     let decoded = aterm_codec::pct::decode(raw);
     let text = decoded.trim();
@@ -605,8 +579,6 @@ impl MarkReq {
         Ok(req)
     }
 
-    /// The record's fields: `word= text= ttl= rule= re= as=`, existing keys
-    /// only (at most six, inside a record's bound).
     fn fields(&self, re: Option<ShortId>) -> Fields {
         let mut f = Fields::new();
         if let Some(w) = self.word {
@@ -783,7 +755,6 @@ pub(crate) enum LogWait {
 }
 
 impl LogWait {
-    /// The predicate one comma-separated member names, or `None`.
     fn parse(member: &str) -> Option<LogWait> {
         match member.split_once('=') {
             None if member == "need" => Some(LogWait::Need),
@@ -797,7 +768,6 @@ impl LogWait {
         }
     }
 
-    /// Whether `r` satisfies the wait.
     fn matches(self, r: &aterm_slog::Rec) -> bool {
         use aterm_slog::Op;
         match self {
@@ -828,8 +798,6 @@ impl LogWaits {
         }
     }
 
-    /// The comma-separated list `token` names: each member a predicate, none
-    /// twice, at most [`LOG_WAITS_MAX`]; `None` otherwise.
     fn parse(token: &str) -> Option<LogWaits> {
         let mut waits: Option<LogWaits> = None;
         for member in token.split(',') {
@@ -857,7 +825,6 @@ impl LogWaits {
         self.members().contains(&LogWait::Need)
     }
 
-    /// Whether `r` satisfies any of them.
     fn matches(&self, r: &aterm_slog::Rec) -> bool {
         self.members().iter().any(|w| w.matches(r))
     }

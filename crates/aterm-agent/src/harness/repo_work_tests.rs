@@ -62,11 +62,6 @@ fn found(dir: &Path) -> Option<RepoWork> {
     probe(dir, Some(dir), PROBE_LIMIT)
 }
 
-/// THE READS' OUTPUT, PARSED ([`RepoWork::of_git`]): a tracked change
-/// staged or not, a rename (its source field skipped), an untracked path,
-/// stash lines, unpushed commits and commits not on the remote's default
-/// branch each count; ignored paths do not; at most [`NAMED_PATHS`] paths
-/// are named, each printable.
 #[test]
 fn the_reads_output_is_counted_and_a_clean_repository_is_no_finding() {
     let status = " M src/a.rs\0M  b.rs\0R  new.rs\0old.rs\0?? notes/\0!! target/\0";
@@ -124,7 +119,6 @@ fn the_reads_output_is_counted_and_a_clean_repository_is_no_finding() {
     assert!(w.summary().contains("(one, …)"));
 }
 
-/// A long path keeps its end, and the whole stays within the bound.
 #[test]
 fn a_long_path_keeps_its_end() {
     let long = format!("{}/tail.rs", "d".repeat(200));
@@ -177,9 +171,6 @@ fn the_probe_finds_uncommitted_unpushed_and_stashed_work_and_nothing_once_pushed
 /// one-minute hang detector): its first read starved 11 s, past the ten
 /// seconds the probe had before (on the probe's clock: the time is taken as
 /// gone, with no sleep), the probe finds the one commit no remote has.
-/// NEGATIVE CONTROL: the same starved read under those ten seconds does not
-/// start, and the probe finds nothing, the reading Land took as a clean
-/// repository.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
@@ -203,9 +194,6 @@ fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
     assert_eq!(cut, None, "the starved probe cut at ten seconds");
 }
 
-/// ONE BRANCH'S STASH ENTRIES ([`stashes_on`], over `git stash list
-/// --format=%gs`): those Git wrote on the branch, a message given or not;
-/// on a detached `HEAD`, those written with no branch.
 #[test]
 fn a_branchs_stash_entries_are_those_written_on_it() {
     let list = "WIP on main: 1a2b3c4 one\nOn main: a message\nWIP on side: 5d6e7f8 two\n\
@@ -256,7 +244,6 @@ fn the_persons_global_excludes_hold() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
     let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, PROBE_LIMIT);
-    // NEGATIVE CONTROL: no excludes.
     let w = probe_at(None).expect("untracked");
     assert_eq!(
         (w.untracked, w.paths.as_slice()),
@@ -593,39 +580,37 @@ fn a_guarded_folder_is_never_probed() {
     }
 }
 
-/// THE SESSION'S DIRECTORY ([`session_dir`]): the transcript's last `cwd`
-/// (a `cd` into a worktree moves it), else where the agent started; a row
-/// that cannot be read, or names no absolute directory, is passed over.
 #[test]
 fn the_session_works_in_the_transcript_s_last_cwd_else_where_it_started() {
-    let tail = concat!(
-        "{\"type\":\"user\",\"cwd\":\"/Users//a/aterm\"}\n",
-        "{\"type\":\"assistant\",\"cwd\":\"/Users//a/Developer/H-wt\"}\n",
-        "{\"type\":\"summary\"}\n",
-        "{\"cwd\":\"/Users//a/Developer/cut-off\n",
+    // Absolute as this platform reads a path: Windows roots one at a drive.
+    let abs = |unix: &str| {
+        if cfg!(windows) {
+            format!("C:{unix}")
+        } else {
+            unix.to_owned()
+        }
+    };
+    let (started, moved) = (abs("/Users//a/aterm"), abs("/Users//a/Developer/H-wt"));
+    let tail = format!(
+        "{{\"type\":\"user\",\"cwd\":\"{started}\"}}\n\
+         {{\"type\":\"assistant\",\"cwd\":\"{moved}\"}}\n\
+         {{\"type\":\"summary\"}}\n\
+         {{\"cwd\":\"{}\n",
+        abs("/Users//a/Developer/cut-off")
     );
     assert_eq!(
-        session_dir("/Users//a/aterm", Some(tail)),
-        Some(PathBuf::from("/Users//a/Developer/H-wt"))
+        session_dir(&started, Some(&tail)),
+        Some(PathBuf::from(&moved))
     );
     assert_eq!(
-        session_dir("/Users//a/aterm", Some("{\"cwd\":\"relative\"}\n")),
-        Some(PathBuf::from("/Users//a/aterm"))
+        session_dir(&started, Some("{\"cwd\":\"relative\"}\n")),
+        Some(PathBuf::from(&started))
     );
-    assert_eq!(
-        session_dir("/Users//a/aterm", None),
-        Some(PathBuf::from("/Users//a/aterm"))
-    );
+    assert_eq!(session_dir(&started, None), Some(PathBuf::from(&started)));
     assert_eq!(session_dir("", None), None);
     assert_eq!(session_dir("relative", Some("no json\n")), None);
 }
 
-/// THE WORK'S STATE TELLS APART WORK THE COUNTS CANNOT ([`RepoWork::state`],
-/// [`RepoWork::same`]): an edit to a file already changed, and a new file in
-/// a directory already untracked, leave the counts and the named paths as
-/// they were, and only the state moves — the review of b8/residuals found a
-/// wake's edit to an already changed path compared equal on the counts and
-/// forgiven as someone else's.
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn the_works_state_tells_apart_work_the_counts_cannot() {
@@ -662,9 +647,6 @@ fn the_works_state_tells_apart_work_the_counts_cannot() {
     assert!(RepoWork::same(None, None));
 }
 
-/// [`state_of`] OVER `git status -z`: a rename's source field is no entry of
-/// its own, a deleted path hashes as no file, and past [`STATE_FILES`]
-/// entries the state is not read.
 #[test]
 fn the_state_reads_the_listing_by_its_entries() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
@@ -697,9 +679,6 @@ fn the_state_reads_the_listing_by_its_entries() {
     assert!(state_of(root, "abc", "", &enough).is_some());
 }
 
-/// [`RepoHygiene`] parses drift from `origin/main`, worktree counts, and
-/// unmerged / merged-stale branches, excluding `main` and the active branch
-/// from stale candidates.
 #[test]
 fn repo_hygiene_summarises_drift_worktrees_and_stale_branches() {
     let wt = "worktree /repo\nHEAD 111\nbranch refs/heads/main\n\n\

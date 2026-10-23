@@ -11,14 +11,12 @@ use aterm_core::terminal::Terminal;
 
 use crate::App;
 
-/// The bytes codex-alab writes (`terminal_program_status.rs`'s
-/// `SetTerminalProgramStatus` and `ClearTerminalProgramStatus`).
+/// OSC 7501 program-state bytes written by codex-alab.
 const IDLE: &[u8] = b"\x1b]7501;state=idle:app=codex\x1b\\";
 const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
 const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
 
-/// One tab under Land whose `codex` holds a proven self-claim, bound to
-/// connection 1, beside a host that supervises nothing.
+/// Tab under Land whose `codex` holds a proven self-claim on connection 1.
 struct Tab {
     app: App,
     host: crate::harness_host::HostHandle,
@@ -73,7 +71,7 @@ impl Tab {
         }
     }
 
-    /// codex-alab writes `bytes` to its terminal.
+    /// Write `bytes` to the terminal.
     fn says(&self, bytes: &[u8]) {
         crate::term_lock(&self.term).process(bytes);
     }
@@ -84,8 +82,7 @@ impl Tab {
         self.t += Duration::from_secs(1);
     }
 
-    /// The claim's own connection serves `meta set harness_act <act>`: the
-    /// wakes the arm posts, not yet applied.
+    /// Serve `meta set harness_act <act>` on connection 1 and return its wakes.
     fn act(&self, act: &str) -> Vec<crate::Wake> {
         let (reply, wakes) = crate::control::meta_wakes_for_test(
             &self.app.store,
@@ -110,7 +107,7 @@ impl Tab {
         }
     }
 
-    /// codex-alab records its landing, applied at once.
+    /// Record and apply `landed@v1`.
     fn lands(&mut self) {
         let wakes = self.act("landed@v1");
         self.apply(wakes);
@@ -132,12 +129,7 @@ impl Tab {
     }
 }
 
-/// THE GAP (`docs/measured/codex-alab-proof-2026-10-20.md`, "Reopen needs a
-/// turn the status sweep sees"): after codex-alab's landing, a person's turn
-/// that the model answers at once — `working` then `done`, both written
-/// between two sweeps — reopens the landing at the next sweep, though no
-/// sweep ever read the turn running and the report it reads says `done`, as
-/// it did before.
+/// A turn that begins and ends (`working`, `done`) between two sweeps reopens a landed task.
 #[test]
 fn a_turn_begun_and_ended_between_two_sweeps_reopens_the_landing() {
     let mut tab = Tab::new();
@@ -159,12 +151,7 @@ fn a_turn_begun_and_ended_between_two_sweeps_reopens_the_landing() {
     tab.done();
 }
 
-/// THE LANDING TURN'S OWN REPORTS ARE NOT A TURN AFTER IT — A MUTANT GUARD
-/// (3a43d9bf20, which reopened only at "running now", passes it too):
-/// codex-alab's land turn runs and ends (`working`, `done`) with no sweep
-/// between it and the landing — a short turn, a background tab's slow sweep —
-/// so the sweep after the landing is the first to read the count those
-/// reports moved.
+/// Reports from the landing turn itself read on the sweep after the landing do not reopen it.
 #[test]
 fn the_landing_turns_own_reports_read_after_it_reopen_nothing() {
     let mut tab = Tab::new();
@@ -185,11 +172,7 @@ fn the_landing_turns_own_reports_read_after_it_reopen_nothing() {
     tab.done();
 }
 
-/// THE LANDING TURN'S `working`, FIRST READ AFTER THE LANDING, IS NO TURN
-/// AFTER IT: the land turn begins with no sweep between its `working` and the
-/// landing, and that report still stands as the landing is recorded
-/// (codex-alab reports `working` while background work the turn started runs
-/// on past its end), so the sweep after the landing is the first to read it.
+/// A `working` report from the landing turn first read after the landing does not reopen it.
 #[test]
 fn the_landing_turns_working_first_read_after_it_reopens_nothing() {
     let mut tab = Tab::new();
@@ -212,9 +195,7 @@ fn the_landing_turns_working_first_read_after_it_reopens_nothing() {
     tab.done();
 }
 
-/// A TURN BEGUN WHILE THE LANDING IS ADMITTED IS A TURN AFTER IT: codex-alab
-/// has decided its landing and sent `landed@v1`, and while aterm admits the
-/// act a person's turn begins and its `working` is parsed.
+/// A turn begun while `landed@v1` is being admitted reopens the landing.
 #[test]
 fn a_turn_begun_while_the_landing_is_admitted_reopens_it() {
     for turn in [true, false] {
@@ -258,11 +239,7 @@ fn a_turn_begun_while_the_landing_is_admitted_reopens_it() {
     }
 }
 
-/// THE SCREEN'S COUNT IS READ BEFORE THE ADMISSION TOO: a read of the screen
-/// that finds the agent busy after a read that did not, made while the
-/// landing's act is admitted, is a turn begun after the landing — reopened as
-/// its face is applied (`App::reopen_self_claim_landing`), where a count read
-/// after the commit held it.
+/// A busy screen read while `landed@v1` is being admitted reopens the landing.
 #[test]
 fn a_busy_read_while_the_landing_is_admitted_reopens_it() {
     let stamp = |seq: u64| crate::session_timeline::AgentStamp {
@@ -318,10 +295,7 @@ fn a_busy_read_while_the_landing_is_admitted_reopens_it() {
     }
 }
 
-/// A REPORT WRITTEN AGAIN IS NO NEW TURN. codex-alab clears its report when it
-/// lets the terminal go (an external editor, Ctrl+Z) and writes its state
-/// again when it takes it back, and it reports `working` while background
-/// work runs on after a turn's end.
+/// Re-reporting the same state after a terminal handoff does not reopen a landed task.
 #[test]
 fn a_report_written_again_after_a_handoff_reopens_nothing() {
     const CLEAR: &[u8] = b"\x1b]7501;state=clear\x1b\\";
@@ -360,9 +334,7 @@ fn a_report_written_again_after_a_handoff_reopens_nothing() {
     tab.done();
 }
 
-/// A TURN BEGUN BETWEEN THE ACT AND ITS FACE: the `meta` arm has served
-/// `landed@v1` (the landing marked) but the app loop has not yet applied its
-/// wakes when a turn runs and a sweep counts it.
+/// A turn counted between `landed@v1` admission and wake application reopens the landing.
 #[test]
 fn a_turn_counted_before_the_landings_face_reopens_it_as_the_face_lands() {
     let records = |tab: &Tab| {
@@ -457,10 +429,7 @@ fn a_turn_counted_before_the_landings_face_reopens_it_as_the_face_lands() {
     }
 }
 
-/// THE SCREEN'S PATH IS A TURN BEGUN TOO, never "busy now": a landing
-/// recorded while the screen still read the agent busy is not reopened by a
-/// later read that moves only the busy verdict's detail; a read that finds it
-/// busy again after a read that did not is a turn begun, and reopens it.
+/// Screen-based busy verdicts reopen a landing only when a new busy state begins after it.
 #[test]
 fn the_screens_busy_reopens_only_at_a_busy_begun_after_the_landing() {
     let mut tab = Tab::new();
@@ -498,11 +467,7 @@ fn the_screens_busy_reopens_only_at_a_busy_begun_after_the_landing() {
     tab.done();
 }
 
-/// A RE-EXEC AT REST KEEPS THE LANDING: codex-alab lands, then upgrades in
-/// place (`meta set harness_act upgrade@v1`, the one act it records at rest
-/// after a landing; the next image resumes the same conversation with the
-/// landing carried across), and the tab stays landed through the act and the
-/// sweep after it.
+/// An in-place upgrade (`upgrade@v1`) at rest preserves the landed state.
 #[test]
 fn a_reexec_onto_a_new_build_at_rest_keeps_the_landing() {
     let mut tab = Tab::new();
@@ -525,11 +490,7 @@ fn a_reexec_onto_a_new_build_at_rest_keeps_the_landing() {
     tab.done();
 }
 
-/// A PERSON'S OWN EXCHANGE, LEFT BY THE SELF-CLAIM, READS THEIRS: after its
-/// landing a person's turn reopens the task, and codex-alab, leaving the
-/// point after that turn to the person, records `left-to-person@v1` (never
-/// typed): the face is `theirs`, as aterm's own loop tells it at its `LEFT`
-/// rule, and a sweep with no turn since keeps it.
+/// `left-to-person@v1` sets the task face to `theirs` until another turn or act occurs.
 #[test]
 fn a_persons_exchange_the_self_claim_left_reads_theirs() {
     let mut tab = Tab::new();
@@ -581,12 +542,7 @@ fn a_persons_exchange_the_self_claim_left_reads_theirs() {
     tab.done();
 }
 
-/// A POINT LEFT TO A PERSON REOPENS AT THEIR NEXT TURN, as a landing does
-/// (`harness_task::holds_until_another_turn`): codex-alab records
-/// `left-to-person@v1` once and nothing after it (the person's next turn is
-/// theirs; it decides nothing at its end), so the face it told must not stand
-/// through the person's next exchange; aterm's own loop reads `open` once a
-/// turn it did not start is read after its `LEFT` (`TaskFace::of`, rule 1).
+/// A task left to a person (`left-to-person@v1`) reopens on their next turn.
 #[test]
 fn a_point_left_to_a_person_reopens_at_their_next_turn() {
     for (case, between) in [("read running", false), ("before the face", true)] {
@@ -757,10 +713,7 @@ fn a_point_left_to_a_person_reopens_at_their_next_turn() {
     }
 }
 
-/// THE RELAND FACE RACE (codex-alab parity-4, `harness_task::landing_turns`):
-/// codex-alab records its land act once the land turn has started and
-/// `landed@v1` at that turn's yield, both on the control socket, while its
-/// TUI writes the turn's OSC 7501 reports to the PTY.
+/// A landing whose `land@v1` and `landed@v1` acts outran its own turn's OSC 7501 reports stays landed.
 #[test]
 fn a_landing_whose_acts_outran_its_own_turns_begin_stays_landed() {
     let mut wrong = Vec::new();
@@ -840,10 +793,7 @@ fn a_landing_whose_acts_outran_its_own_turns_begin_stays_landed() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// AN ACT THAT STARTS NO TURN NAMES NO LANDING'S TURN (review of codex-alab
-/// parity-4, R1): after the land turn's reports were all parsed, codex-alab
-/// records an act that types nothing at rest — a report mailed, an approval,
-/// a box's answer — and then its landing.
+/// Non-turn acts (`mail-report@v1`, `approve-all@v1`, `answer-recommended@v1`) do not advance the landing's turn.
 #[test]
 fn an_act_that_starts_no_turn_leaves_the_landings_turn_as_it_was() {
     let mut wrong = Vec::new();
@@ -895,12 +845,7 @@ fn an_act_that_starts_no_turn_leaves_the_landings_turn_as_it_was() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A SELF-CLAIM'S FACE STANDS ACROSS ITS OWN RE-EXEC (Autopilot Land:
-/// `upgrade@v1` moves no face, the landing carried across; seen live in
-/// aterm-lab's codex-alab proof, 2026-10-22, where the exchange left to the
-/// person and every landed Land leg read `task=open` past the upgrade):
-/// codex-alab records `upgrade@v1`, gives its claim back as its image execs,
-/// and its next image claims again.
+/// A self-claim's task face (`landed` or `theirs`) persists across an `upgrade@v1` re-exec.
 #[test]
 fn a_self_claims_face_stands_across_its_own_reexec() {
     for case in ["theirs", "landed", "passive", "passive after the re-exec"] {

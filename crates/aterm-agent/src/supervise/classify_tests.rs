@@ -1907,7 +1907,8 @@ fn git_remote_show_contacts_the_remote_only_when_it_names_one() {
     }
 }
 
-/// Sed script options, git cat-file driver abbreviations, and shell hazard variables are refused.
+/// Sed options that can write, git cat-file driver abbreviations, and shell hazard variables are
+/// refused.
 #[test]
 fn the_v6_spellings_of_a_write_or_a_hazard_are_each_refused() {
     for cmd in [

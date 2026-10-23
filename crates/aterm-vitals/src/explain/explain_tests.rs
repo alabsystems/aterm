@@ -3,7 +3,8 @@
 
 use super::fixtures::{
     Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, finished_1032, lane_off_1032,
-    liar_1032, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048, wrapped_1218,
+    liar_1032, reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048,
+    wrapped_1218,
 };
 use super::*;
 use crate::model::{MemRates, MemSample, MemView, Pressure, Thermal, Throttle, Vitals};
@@ -306,6 +307,50 @@ fn a_calm_mac_holds_no_cause() {
         (Role::Minor, true, Some(120), Some(300)),
         "0.12 of 0.40 is a third, under the floor: minor on a calm machine"
     );
+}
+
+/// Work no coalition held past a core (coalition 2000 reaped inside the
+/// calm Mac's window after 1.50 cores): `unexplained` covers the residual,
+/// with no coalition and no context, so the reply never says nothing is
+/// needed and a bare `sys why` names the CPU. NEGATIVE CONTROLS: 0.90 cores
+/// of it holds nothing and nothing needs doing; and `unexplained` blind to
+/// the residual (`Fault::IgnoreUnaccounted`) leaves 1.50 cores uncovered
+/// beside "nothing needed", the defect the ruling closes.
+#[test]
+fn work_no_coalition_held_past_a_core_is_never_nothing_needed() {
+    let s = snap(&reaped_1510());
+    let f = s.why.as_deref().expect("a window");
+    assert_eq!((f.split.global_mc, f.split.unaccounted_mc), (1900, 1500));
+    assert_eq!(causes(&s), [CauseId::Unexplained]);
+    let u = cause(&s, CauseId::Unexplained);
+    assert_eq!(
+        (u.covers_mc, u.coalitions.as_slice(), u.contexts.as_slice()),
+        (1500, &[][..], &[][..])
+    );
+    assert_eq!(u.src(), ["derived"]);
+    assert_eq!(u.evidence, Evidence::Unaccounted);
+    let a = account(WhySubject::Cpu, Some(1), &s);
+    assert_eq!(a.headline, Some((CauseId::Unexplained, None)));
+    assert!(!a.nothing_needed);
+    assert_eq!(a.cannot.first(), Some(&("remedy", "unsupported")));
+    assert_eq!(bare_subject(&s), Bare::Subject(WhySubject::Cpu));
+
+    let mut under = reaped_1510();
+    under.busy_mc -= 600;
+    for c in under.coalitions.iter_mut().filter(|c| c.id == 2000) {
+        c.mc = 900;
+    }
+    let s = snap(&under);
+    assert_eq!(s.why.as_deref().map(|f| f.split.unaccounted_mc), Some(900));
+    assert_eq!(causes(&s), []);
+    assert!(account(WhySubject::Cpu, Some(1), &s).nothing_needed);
+
+    let blind = ticks(&reaped_1510(), 1, Some(Fault::IgnoreUnaccounted))
+        .pop()
+        .expect("a window");
+    assert_eq!(causes(&blind), []);
+    assert!(account(WhySubject::Cpu, Some(1), &blind).nothing_needed);
+    assert_eq!(bare_subject(&blind), Bare::Calm);
 }
 
 /// `wake`: 2 minutes after a wake that restarted nothing, with a core of
@@ -1040,6 +1085,63 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
         (Role::Main, Some(6000), Some(1000))
     );
     assert!(!g.cannot.contains(&("finished_tab_work", "not_sampled")));
+}
+
+/// An idle tab beside aterm's coalition and its live work 0.30 mc apart
+/// (aterm's coalition 200.50 mc, aterm itself 200.20): rounded on their own
+/// they read a millicore apart, rounded once from their nanoseconds none, so
+/// the role stays `none` and no `finished_tab_work` is claimed. NEGATIVE
+/// CONTROL: 0.80 mc apart is a millicore no live process holds, and the
+/// bound rule reads `not_sampled`.
+#[test]
+fn the_parts_rounding_never_reads_as_unattributed_work() {
+    let idle = |coalition_ns: u64| {
+        let mut scene = calm_1510();
+        for c in scene.coalitions.iter_mut().filter(|c| c.id == 1342) {
+            c.mc = 200;
+        }
+        for p in scene.procs.iter_mut() {
+            match p.pid {
+                1187 => *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "aterm", 200),
+                1210 => *p = Proc::new(p.pid, p.ppid, p.uid, p.coalition, p.birth_ms, "claude", 0),
+                _ => {}
+            }
+        }
+        let mut v = Vitals::new();
+        let [base, sweep, mut now] = scene.samples();
+        for r in now.coalitions.iter_mut().flat_map(|c| c.rows.iter_mut()) {
+            if r.id == 1342 {
+                r.cpu_ns += coalition_ns;
+            }
+        }
+        for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1187) {
+            p.cpu_ns = p.cpu_ns.map(|ns| ns + 1_000_000);
+        }
+        v.absorb(&base);
+        v.absorb(&sweep);
+        let s = v.absorb(&now);
+        let f = s.why.as_deref().expect("a window");
+        assert_eq!(
+            (f.split.aterm_mc - f.split.own_mc, f.split.tabs.as_slice()),
+            (1, &[(1, 0)][..]),
+            "{coalition_ns} ns: the parts rounded on their own"
+        );
+        (
+            f.split.unattributed_mc,
+            account(WhySubject::Cpu, Some(1), &s),
+        )
+    };
+    let (unattributed, a) = idle(2_500_000);
+    assert_eq!(unattributed, 0);
+    assert_eq!((a.you.role, a.you.unattributed_mc), (Role::None, None));
+    assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
+    let (unattributed, a) = idle(5_000_000);
+    assert_eq!(unattributed, 1);
+    assert_eq!(
+        (a.you.role, a.you.unattributed_mc),
+        (Role::Unavailable("not_sampled"), Some(1))
+    );
+    assert!(a.cannot.contains(&("finished_tab_work", "not_sampled")));
 }
 
 /// Memory's `you`: the tab's footprint of used memory, minor under the

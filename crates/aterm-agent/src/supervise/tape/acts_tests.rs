@@ -7,7 +7,6 @@ use super::*;
 use crate::supervise::CtlReply;
 use crate::supervise::tape::codec::{ctl_reply, ctl_request};
 
-/// A control round trip asking `words`, its reply `OK <what>`.
 fn ctl(words: &[&str], what: &str) -> EffectRecord {
     EffectRecord::Exchange {
         door: doors::CTL.to_string(),
@@ -20,7 +19,6 @@ fn ctl(words: &[&str], what: &str) -> EffectRecord {
     }
 }
 
-/// The reply `ctl(_, what)` holds.
 fn said(what: &str) -> Vec<u8> {
     ctl_reply(&Ok(CtlReply {
         code: 0,
@@ -29,20 +27,15 @@ fn said(what: &str) -> Vec<u8> {
     }))
 }
 
-/// A cursor over `records`, none stamped.
 fn cursor(records: Vec<EffectRecord>) -> ActsCursor {
     let n = records.len();
     ActsCursor::new(records, vec![None; n])
 }
 
-/// Ask the control lane `words`.
 fn ask(c: &mut ActsCursor, words: &[&str]) -> Result<Served, Refusal> {
     c.exchange(doors::CTL, &ctl_request(words))
 }
 
-/// Each request's class, as §5.1 has it: writes, signals, restarts and the
-/// host's acts are acts; the claim's renewal and the teller are housekeeping;
-/// `await` waits; a line printed and the bound are outputs; the rest reads.
 #[test]
 fn requests_are_classed_as_the_plan_classes_them() {
     let class = |words: &[&str]| act_class(doors::CTL, &ctl_request(words));
@@ -85,8 +78,6 @@ fn requests_are_classed_as_the_plan_classes_them() {
     assert_eq!(act_class("host.wants", b""), ActClass::Read);
 }
 
-/// A run that asks what the recorded one asked, in its order, takes every
-/// record as a strict replay would: the account says EXACT.
 #[test]
 fn an_unchanged_run_is_served_record_for_record() {
     let mut c = ActsCursor::new(
@@ -114,10 +105,6 @@ fn an_unchanged_run_is_served_record_for_record() {
     assert_eq!((c.account.taken, c.account.acts), (1, 1));
 }
 
-/// Within its segment a read is resynced forward (what it skips dropped) or
-/// served again; it never crosses the act, and a read the segment does not
-/// hold is STALE — a read held only past the act included (a policy that
-/// looks once more before it acts asks one; it skipped nothing yet).
 #[test]
 fn a_read_is_served_from_its_own_segment_alone() {
     let tape = || {
@@ -149,10 +136,6 @@ fn a_read_is_served_from_its_own_segment_alone() {
     assert_eq!(c.position(), 0, "and nothing consumed");
 }
 
-/// A WAIT the recorded run waited for only after the segment's act — the
-/// very request, or the same wait with another timeout, past the act — is
-/// that act SKIPPED: the candidate went on without it. A wait held nowhere,
-/// and a file read held only past the act, are STALE.
 #[test]
 fn a_wait_held_only_past_the_act_is_the_act_skipped() {
     let wait = ["await", "seq", "102", "timeout", "20000"];
@@ -197,9 +180,6 @@ fn a_wait_held_only_past_the_act_is_the_act_skipped() {
     assert_eq!(c.position(), 1, "nothing past the act consumed");
 }
 
-/// Whether the tape is SPENT where the cursor stands: no round trip left to
-/// ask and no file to read — a clock or an output after the cursor does not
-/// count, an exchange does.
 #[test]
 fn the_tape_is_spent_when_only_clocks_and_outputs_are_left() {
     let mut c = cursor(vec![
@@ -217,9 +197,6 @@ fn the_tape_is_spent_when_only_clocks_and_outputs_are_left() {
     assert!(!c.spent(), "an act is left");
 }
 
-/// An act must be the segment's closing act: taken with its reads unasked
-/// (dropped), or refused naming that act; one past the tape's last act names
-/// none.
 #[test]
 fn an_act_is_the_segments_closing_act_or_the_first_divergence() {
     let tape = || {
@@ -250,9 +227,6 @@ fn an_act_is_the_segments_closing_act_or_the_first_divergence() {
     assert_eq!(c.acts_left(), (Some(1), 1));
 }
 
-/// A derived probe the segment does not hold is answered from before the
-/// cursor by astream's keyed view's rule — the latest recorded answer, never
-/// one from past the cursor.
 #[test]
 fn a_probe_is_answered_from_before_the_cursor() {
     let probe = |reply: &[u8]| EffectRecord::Exchange {
@@ -279,9 +253,6 @@ fn a_probe_is_answered_from_before_the_cursor() {
     );
 }
 
-/// A wait with other arguments takes the segment's next wait of its kind
-/// (schedule taint); a wait served again moves the virtual clock by its
-/// timeout.
 #[test]
 fn a_wait_with_other_arguments_is_tainted() {
     let wait = |seq: &str| ctl(&["await", "seq", seq, "timeout", "20000"], "woke");
@@ -320,9 +291,6 @@ fn a_wait_with_other_arguments_is_tainted() {
     );
 }
 
-/// A clock read with no clock record under the cursor is virtual: the last
-/// record's stamp plus the sleeps since, never running back; a sleep with no
-/// identical one under the cursor adds to it.
 #[test]
 fn an_extra_clock_read_is_virtual_time() {
     let mut c = ActsCursor::new(
@@ -345,9 +313,6 @@ fn an_extra_clock_read_is_virtual_time() {
     assert_eq!((c.account.virtual_clock, c.account.slept), (2, 1));
 }
 
-/// A flag is raised at the read the recorded run saw it at (its false reads
-/// counted), and once the cursor has passed its record; while the loop
-/// follows the tape, the virtual clock does not raise it early.
 #[test]
 fn a_raised_flag_follows_the_cursor() {
     let stop = |false_reads| EffectRecord::Raised {
@@ -381,9 +346,6 @@ fn a_raised_flag_follows_the_cursor() {
     assert!(c.raised(doors::RAISED_STOP), "passed by a resync");
 }
 
-/// Housekeeping is served from any segment before the loop's own; an output
-/// is never compared, its outcome the last one recorded at its door or
-/// success.
 #[test]
 fn housekeeping_and_outputs_are_never_compared() {
     let renew = ["meta", "set", "supervisor", "h"];
@@ -416,11 +378,6 @@ fn housekeeping_and_outputs_are_never_compared() {
     assert_eq!(c.account.unmatched_outputs, 2);
 }
 
-/// HOUSEKEEPING IS NEVER REFUSED (the plan's §5.1: never compared): the
-/// claim's release where the recorded run had not released it — its release
-/// past the act, or nowhere — is answered with the latest of its kind before
-/// the cursor, else its door's success, and so is a teller's story in other
-/// words; nothing is served from past the act, and the cursor stays.
 #[test]
 fn housekeeping_is_never_refused() {
     let renew = ["meta", "set", "supervisor", "h"];
@@ -458,10 +415,6 @@ fn housekeeping_is_never_refused() {
     assert_eq!(c.acts_left(), (Some(1), 1), "the act still to take");
 }
 
-/// THE PROGRESS GUARD: a counterfactual served on and on with nothing
-/// consumed — one read asked again for ever — ends DIVERGED (no progress)
-/// past the guard's count, and never runs for ever (the one-minute wait is
-/// the hang detector).
 #[test]
 fn a_candidate_that_asks_again_for_ever_ends_at_the_progress_guard() {
     use crate::supervise::fx::Fx;
@@ -501,14 +454,6 @@ fn a_candidate_that_asks_again_for_ever_ends_at_the_progress_guard() {
     );
 }
 
-/// A DERIVED PROBE'S ANSWER FROM BEFORE THE CURSOR is astream-effects' own:
-/// at every position of generated tapes — probes at two doors over a few
-/// requests, control reads and acts between them — the cursor's keyed answer
-/// (read from its own index) is the record and reply `KeyedView::lookup`
-/// gives with `seen` the cursor's position, a miss for a miss. The negative
-/// control: an answer that also admits the record under the cursor (an
-/// inclusive bound, one record from the future) disagrees with astream on
-/// the same tapes.
 #[test]
 fn a_keyed_answer_is_astreams_at_every_cursor() {
     use astream_effects::KeyedView;

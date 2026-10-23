@@ -49,7 +49,11 @@
 //!
 //! ```compile_fail,E0308
 //! use aterm_messages::{Intent, UpgradeWord, need::Then};
-//! let skip = Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip };
+//! let skip = Intent::AgentUpgrade {
+//!     tab: "s-1".into(),
+//!     to: "2.1.284".into(),
+//!     word: UpgradeWord::Skip,
+//! };
 //! let _ = Then::press(skip, "Skip this build");
 //! ```
 //!
@@ -57,7 +61,11 @@
 //!
 //! ```compile_fail,E0423
 //! use aterm_messages::{Intent, UpgradeWord, need::Mover};
-//! let _ = Mover(Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip });
+//! let _ = Mover(Intent::AgentUpgrade {
+//!     tab: "s-1".into(),
+//!     to: "2.1.284".into(),
+//!     word: UpgradeWord::Skip,
+//! });
 //! ```
 //!
 //! A reason that may only be a flash cannot be made standing:
@@ -111,8 +119,6 @@ pub const RESTATE_QUIET: Duration = Duration::from_mins(10);
 /// A standing row the owner has read (it folded) or answered is not raised again for this long, unless its key changes.
 pub const STANDING_QUIET: Duration = Duration::from_hours(24);
 
-/// Stems a reason may not lean on: it says why a person is needed, not that something
-/// is pending.
 const WAITING_STEMS: [&str; 10] = [
     "waiting",
     "retry",
@@ -125,7 +131,6 @@ const WAITING_STEMS: [&str; 10] = [
     "eventually",
     "automatically",
 ];
-/// Leading words of a step that are a snooze, not an action.
 const SNOOZE_LEADS: [&str; 8] = [
     "skip", "snooze", "dismiss", "ignore", "wait", "defer", "postpone", "not",
 ];

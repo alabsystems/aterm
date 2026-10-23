@@ -515,7 +515,8 @@ const MIN_EYE_CONTRAST: f32 = 3.0;
 pub struct CatColorKey {
     /// `0..=11` = 30-degree hue family, `12` = neutral foreground.
     pub accent: u8,
-    /// Background WCAG-luminance band, darkest `0` to lightest `3`.
+    /// Background WCAG-luminance band, darkest `0` to lightest `3`; `4` = mixed (spans the
+    /// crossover).
     pub background: u8,
 }
 

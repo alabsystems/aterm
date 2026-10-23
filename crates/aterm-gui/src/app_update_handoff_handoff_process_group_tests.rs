@@ -13,8 +13,6 @@ use aterm_uds::spawnfd::InheritNothing as _;
 use std::io::{BufRead as _, Read as _};
 use std::os::unix::process::CommandExt as _;
 
-/// Panic-safe ownership for fixtures that deliberately leave a descendant alive
-/// while assertions exercise reaper ordering.
 struct ProcessGroupCleanup {
     leader: i32,
     armed: bool,
@@ -57,9 +55,6 @@ impl Drop for ProcessGroupCleanup {
     }
 }
 
-/// The process a fixture parks where a test then waits, under a one-minute hang detector,
-/// to see the kill or the group sweep under test end it: `sleep` for
-/// [`aterm_spec::wait::PARKED_SECS`], past that minute.
 fn parked() -> String {
     format!("sleep {}", aterm_spec::wait::PARKED_SECS)
 }
@@ -236,9 +231,6 @@ fn final_handoff_admission_conforms_to_every_model_guard() {
     assert_eq!(exact["arbiter"], 1);
 }
 
-/// Descriptor level: readable bytes on a handed master are visible to the
-/// pre-park admission peek but not the mid-flight death peek; closing the peer
-/// flips the death peek without consuming the queued bytes.
 #[test]
 fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -274,8 +266,6 @@ fn queued_output_is_buffered_mid_flight_but_peer_death_still_revokes() {
     aterm_pty::close_fd(master);
 }
 
-/// A hung-up master is not output waiting: an exited `--hold` pane's master is
-/// reported `POLLIN|POLLHUP` forever on macOS.
 #[test]
 fn a_hung_up_master_is_never_output_waiting() {
     let open = || aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -317,9 +307,6 @@ fn a_hung_up_master_is_never_output_waiting() {
     aterm_pty::close_fd(exited);
 }
 
-/// Worker level: the ready wait completes to `ProofReady` while a handed master
-/// has queued output, and a cancel poke is typed `ActivityRevoked`, never a
-/// generic rejection.
 #[test]
 fn ready_wait_types_a_handed_session_s_death_as_activity() {
     let expected = crate::seamless::adoption_proof(
@@ -425,9 +412,6 @@ fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
     aterm_pty::close_fd(master_wr);
 }
 
-/// Anti-spin: the ready-wait poll classifier routes a merely readable master (queued shell
-/// output) to `NoProgress`, the yielding branch, never to `ReadProof`/`SessionDied` or an
-/// immediate re-poll.
 #[test]
 fn ready_poll_classifies_queued_master_output_as_a_yield() {
     let pfd = |revents: libc::c_short| libc::pollfd {
@@ -654,9 +638,7 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
     );
 }
 
-/// LaunchServices' answer is read beside the proof wait: a pid mismatch after the
-/// transfer still refuses before Commit, by a kill-and-reap of the corroborated
-/// candidate, and only then may the parent resume its readers.
+/// LaunchServices' answer is read beside the proof wait.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
@@ -754,8 +736,6 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
     );
 }
 
-/// The stray writer: a copy of the proof pipe's write end outliving the
-/// candidate holds EOF back.
 #[test]
 fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
     let expected = crate::seamless::adoption_proof(
@@ -833,7 +813,6 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
     );
 }
 
-/// A live candidate is never reported gone, whatever the pipes say.
 #[test]
 fn a_live_candidate_is_not_gone() {
     let (candidate, mut handle, mut cleanup) = sleeping_candidate();
@@ -845,10 +824,6 @@ fn a_live_candidate_is_not_gone() {
     cleanup.disarm();
 }
 
-/// [`kill_and_reap_handoff_child`] on a fork child that outlives the reap's own wait,
-/// required to have died of the path's SIGKILL: the warrant alone read `Reaped` for a
-/// child the path never signalled, once its sleep ran out (a `sleep 30` half a minute
-/// later, a leader waiting on a [`parked`] descendant two minutes later).
 fn killed_and_reaped(
     candidate: HandoffCandidate,
     handle: &mut HandoffCandidateHandle,
@@ -864,8 +839,6 @@ fn killed_and_reaped(
     reaped.warrant
 }
 
-/// A 30-second candidate in its own group; a failed assertion kills and reaps it
-/// through the guard rather than leaving it holding the harness's output.
 fn sleeping_candidate() -> (
     HandoffCandidate,
     HandoffCandidateHandle,
@@ -874,8 +847,6 @@ fn sleeping_candidate() -> (
     candidate_in_own_group("exec sleep 30")
 }
 
-/// `/bin/sh -c script` as a candidate leading its own group, under the same guard
-/// as [`sleeping_candidate`].
 fn candidate_in_own_group(
     script: &str,
 ) -> (
@@ -898,9 +869,6 @@ fn candidate_in_own_group(
     (candidate, HandoffCandidateHandle::Forked(child), cleanup)
 }
 
-/// A stopped candidate is not a dead one: Darwin's `waitid` reports a stopped
-/// child even when only `WEXITED` is asked for, and a paused successor must not
-/// be rejected as gone.
 #[test]
 fn a_stopped_candidate_is_not_gone() {
     let (candidate, mut handle, mut cleanup) =
@@ -936,8 +904,7 @@ fn a_stopped_candidate_is_not_gone() {
     cleanup.disarm();
 }
 
-/// The matching answer, and no answer at all, change nothing: the wait runs to
-/// its real outcome (here proof EOF, the child's death).
+/// The matching answer, and no answer at all, change nothing: the wait runs to its real outcome.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_matching_or_pending_launch_answer_leaves_the_proof_wait_to_its_outcome() {
@@ -1029,8 +996,6 @@ fn emergency_reaper_kills_group_even_after_leader_exits() {
     );
 }
 
-/// The fallback authority's pid-vacancy proof in both directions: a running
-/// candidate never satisfies it, and one whose pid came free always does.
 #[test]
 fn a_running_candidate_is_unproven_and_a_vacant_pid_is_the_proof() {
     let mut child = aterm_uds::spawnfd::command("/bin/sh")
@@ -1054,9 +1019,7 @@ fn a_running_candidate_is_unproven_and_a_vacant_pid_is_the_proof() {
     );
 }
 
-/// A candidate this process did not fork (the LaunchServices shape) is proven terminated
-/// anyway: `waitpid` answers `ECHILD` and the orphan leads no process group (`sh -c` has no job
-/// control), so only the identity-corroborated direct signal can end it.
+/// A candidate this process did not fork (the LaunchServices shape) is proven terminated anyway.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_candidate_we_never_forked_is_still_proven_terminated() {
@@ -1107,8 +1070,7 @@ fn a_candidate_we_never_forked_is_still_proven_terminated() {
     }
 }
 
-/// A pid whose birth stamp disagrees with the candidate's was recycled: proof the candidate
-/// terminated, and a bystander the reap path must not SIGKILL.
+/// A pid whose birth stamp disagrees with the candidate's was recycled.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled() {
@@ -1146,10 +1108,7 @@ fn a_pid_whose_birth_record_disagrees_is_proof_of_death_and_is_never_signalled()
     );
 }
 
-/// The launched lane's group-sweep gate is a kernel read: a process that made its
-/// own group (as `contain_own_process_group` does) reads as leading it, and one
-/// that inherited its parent's does not, so `-pid` is sent only when it names the
-/// candidate's own group.
+/// The launched lane's group-sweep gate is a kernel read.
 #[cfg(unix)]
 #[test]
 fn the_group_sweep_gate_reads_whether_the_candidate_leads_its_own_group() {
@@ -1191,10 +1150,8 @@ fn the_group_sweep_gate_reads_whether_the_candidate_leads_its_own_group() {
     member.wait().expect("reap the member fixture");
 }
 
-/// The corroborated arm's group sweep reaches the helpers of a fork-lane candidate
-/// whose leader exited between the identity read and the sweep: the leader is an
-/// unreaped zombie, Darwin answers `getpgid` on it with ESRCH, and the fork lane's
-/// pin (`candidate_is_our_child`) licenses the sweep.
+/// The corroborated arm's group sweep reaches the helpers of a fork-lane candidate whose leader
+/// exited between the identity read and the sweep.
 #[cfg(unix)]
 #[test]
 fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swept() {
@@ -1251,10 +1208,6 @@ fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swep
     );
 }
 
-/// Runs [`contain_own_process_group`] in a forked child (`setpgid` is process-wide and
-/// irreversible) and reports through its exit status whether it leads its own group; a second
-/// `setpgid(0, 0)` must be refused exactly when it is a session leader, witnessing which kernel
-/// path the first call took.
 fn forked_child_contains_itself(become_session_leader: bool) -> bool {
     // SAFETY: fork from a multi-threaded harness; child runs async-signal-safe calls only.
     let pid = unsafe { libc::fork() };
@@ -1286,9 +1239,6 @@ fn forked_child_contains_itself(become_session_leader: bool) -> bool {
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
-/// The launch shape with no `pre_exec` hook: a successor starting inside another
-/// process group must end up leading its own, or `kill(-pid)` misses the helpers
-/// it forks.
 #[test]
 fn a_successor_started_in_a_foreign_group_contains_itself() {
     assert!(
@@ -1298,9 +1248,6 @@ fn a_successor_started_in_a_foreign_group_contains_itself() {
     );
 }
 
-/// `setpgid(0, 0)` can be refused without failing to contain: a session leader is
-/// the one process refused, and it already has `pgid == sid == pid`, so the
-/// postcondition read back from the kernel holds.
 #[test]
 fn a_session_leader_is_already_contained_when_the_call_refuses_it() {
     assert!(

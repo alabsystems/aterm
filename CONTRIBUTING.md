@@ -44,9 +44,14 @@ aterm first if it is missing).
 What to run before a pull request:
 
 * `targo --unverified test --locked -p <crate>` for every crate you touched.
-  A test that needs a tool this machine lacks ends COULD NOT RUN, naming where
-  the tool comes from: for a tool the checkout pins (fish, pwsh, binaryen, the
-  browsers), `targo --unverified verify provision`.
+  A fresh clone is green once `targo --unverified verify provision` has run:
+  it places the tools the checkout pins (fish, pwsh, binaryen, the browsers,
+  rustup stable's targets). A test that needs a tool this machine still lacks
+  ends COULD NOT RUN and names what provides it. After `verify provision`,
+  with ALab's default set and the Command Line Tools installed, the only
+  COULD NOT RUN left are for a tool aterm provides no copy of yet (zstd,
+  which only a publish host carries), a tool only another OS or the Linux
+  guest has, or hardware this machine lacks.
 * `targo --unverified run -q -p aterm-verify -- fmt`, the formatter check
   (`fmt --fix` rewrites what it finds).
 * `targo-tippy --workspace --all-targets --keep-going -- -D warnings`,

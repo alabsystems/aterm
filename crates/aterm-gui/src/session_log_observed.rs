@@ -12,11 +12,10 @@ use super::{SessionLog, name_fp, tok, with};
 /// A bell is said at most this often (monotonic ms): a flood of BELs is one count a second.
 pub(crate) const BELL_EVERY_MS: u64 = 1_000;
 
-/// A program's moves written at once before its run's bucket is empty (6F-4, U17): the mark limiter's burst.
+/// A program's moves written at once before its run's bucket is empty (6F-4, U17).
 pub(crate) const PROGRAM_BURST: u64 = 20;
 /// Past the burst, a program's run earns one program mark this often (monotonic ms).
 pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
-/// A full bucket, in thousandths of a token.
 const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
 
 /// A THROTTLED MARK CLASS'S BUCKET.
@@ -33,7 +32,6 @@ impl Default for MarkBucket {
 }
 
 impl MarkBucket {
-    /// A full bucket as of `at` (monotonic ms).
     const fn full(at: u64) -> Self {
         MarkBucket {
             milli: PROGRAM_FULL_MILLI,
@@ -41,9 +39,6 @@ impl MarkBucket {
         }
     }
 
-    /// Refill to `now` (monotonic ms; a clock read behind the last is the
-    /// last), then spend a whole token, or spend one anyway (`force`: a
-    /// close or a carry, which never loses the newest value).
     fn spend(&mut self, now: u64, force: bool) -> bool {
         let now = now.max(self.at);
         let earned = (now - self.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
@@ -120,8 +115,6 @@ impl ShownTuple {
         )
     }
 
-    /// The tuple a carry's token names, each word one its list holds (`-`:
-    /// none); `None` for a token that does not read.
     fn read(token: &str) -> Option<Self> {
         let mut it = token.split('.');
         let word = |raw: Option<&str>, words: &[&'static str]| match raw? {
@@ -145,7 +138,7 @@ pub(crate) struct ShownMarks {
     pending: Option<(ShownTuple, u64)>,
 }
 
-/// What the engine says, read under the status sweep's terminal guard ([`Self::of`]) and written once that guard is released.
+/// What the engine says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EngineRead {
     /// The shell integration's posture.
@@ -199,45 +192,32 @@ pub(crate) struct Observed {
     /// The context left, in tenths.
     ctx: Option<u8>,
     goal: Option<bool>,
-    /// The notify and bell totals last counted from (this process's engine:
-    /// neither crosses an update, so the first read is a baseline).
+    /// The notify and bell totals last counted from (this process's engine: neither crosses an
+    /// update, so the first read is a baseline).
     notify: Option<u64>,
     bell: Option<u64>,
     /// When a bell was last said (monotonic ms).
     bell_at: Option<u64>,
     /// The progress state and its tenth.
     progress: Option<(&'static str, Option<u8>)>,
-    /// The cwd and the informative title last said, as fingerprints
-    /// ([`name_fp`]; 0: cleared): the carry holds no text.
+    /// The cwd and the informative title last said.
     cwd: Option<u64>,
     title: Option<u64>,
-    /// Whether the effective attention owner was the supervisor's when a
-    /// meta write last said (the `escalated` need's standing).
+    /// Whether the effective attention owner was the supervisor's when a meta write last said.
     escalated: Option<bool>,
-    /// Each meta field's value as the log last said it, a fingerprint
-    /// ([`name_fp`]; 0: unset), at most [`META_FIELDS_MAX`] fields.
+    /// Each meta field's value as the log last said it.
     meta: Vec<(String, u64)>,
-    /// The program marks' bucket (this process's: a successor starts a full
-    /// one, and the carry writes any pending state first).
+    /// The program marks' bucket.
     program: ProgramMarks,
-    /// The shown marks' tuple and bucket (6F-9): the tuple crosses an
-    /// update (`obs_shown=`), the bucket is this process's.
+    /// The shown marks' tuple and bucket (6F-9).
     shown: ShownMarks,
 }
 
-/// The most meta fields [`Observed`] remembers: every user field and the
-/// supervisor's claim (`SUPERVISOR_FIELD`).
 const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 1;
 
-/// A meta field whose value is free text that can hold what must never
-/// leave RAM (a box's command, a question's words, the screen's last line:
-/// the supervisor's escalation): its mark says a fingerprint below the
-/// content tier, and the text only at it (`attn_text=`;
-/// "never stored" became "never leaves RAM", the ring's own
-/// exposure).
 const FINGERPRINTED_META: &[&str] = &["attention"];
 
-/// A title's fingerprint, its leading busy-spinner frame left out ([`crate::toolbar::busy_spinner_title_parts`]).
+/// A title's fingerprint.
 pub(crate) fn title_fp(title: &str) -> u64 {
     if title.is_empty() {
         return 0;
@@ -248,7 +228,6 @@ pub(crate) fn title_fp(title: &str) -> u64 {
     }
 }
 
-/// The `state` word of a shell integration posture.
 const fn integration_word(p: aterm_core::terminal::ShellIntegrationPosture) -> &'static str {
     use aterm_core::terminal::ShellIntegrationPosture as P;
     match p {
@@ -258,7 +237,6 @@ const fn integration_word(p: aterm_core::terminal::ShellIntegrationPosture) -> &
     }
 }
 
-/// The `state` word and percent of an OSC 9;4 progress (`none` for none).
 const fn progress_of(p: Option<aterm_types::osc::TaskbarProgress>) -> (&'static str, Option<u8>) {
     use aterm_types::osc::TaskbarProgress as P;
     match p {
@@ -271,7 +249,6 @@ const fn progress_of(p: Option<aterm_types::osc::TaskbarProgress>) -> (&'static 
     }
 }
 
-/// A word of `words` a carried token names, as the `&'static` word.
 fn carried_word(words: &[&'static str], raw: &str) -> Option<&'static str> {
     words.iter().copied().find(|w| *w == raw)
 }
@@ -287,7 +264,7 @@ const PROGRESS_WORDS: &[&str] = &[
 ];
 
 impl Observed {
-    /// The carry's tokens for the `state` host line (additive: a reader without them reads the line as it did).
+    /// The carry's tokens for the `state` host line.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_tokens(&self) -> String {
         let mut s = String::new();
@@ -329,7 +306,7 @@ impl Observed {
         s
     }
 
-    /// Read back the tokens of [`Self::carry_tokens`] off a `state` line; what is absent or unreadable stays unknown.
+    /// Read back the tokens of [`Self::carry_tokens`] off a `state` line.
     pub(crate) fn read_carry(&mut self, kv: impl Fn(&str) -> Option<String>) {
         self.integration = kv("obs_int").and_then(|w| carried_word(INTEGRATION_WORDS, &w));
         self.ctx = kv("obs_ctx")
@@ -369,8 +346,6 @@ impl Observed {
             .unwrap_or_default();
     }
 
-    /// Note that the log says meta field `field` holds the value of
-    /// fingerprint `fp`: whether that moved it from what the log last said.
     fn meta_moved(&mut self, field: &str, fp: u64) -> bool {
         match self.meta.iter_mut().find(|(f, _)| f == field) {
             Some((_, held)) if *held == fp => false,
@@ -389,8 +364,6 @@ impl Observed {
 }
 
 impl SessionLog {
-    /// The run in front: the agent's, else the program's, else the
-    /// command's; the session when none is open.
     fn front_run(&self) -> Node {
         let open = |n: Node| self.log.is_open(n).then_some(n);
         self.agent
@@ -401,8 +374,6 @@ impl SessionLog {
             .unwrap_or(Node::SESSION)
     }
 
-    /// The open agent run of Claude Code, the one reader whose screen facts
-    /// the log keeps (plan §3.2; Codex is Phase 5).
     fn claude_run(&self) -> Option<Node> {
         self.agent
             .as_ref()
@@ -505,12 +476,12 @@ impl SessionLog {
         self.write_program(at, false);
     }
 
-    /// THE PROGRAM BUCKET'S TICK, each status sweep: a pending state is written once its run's bucket has a token again.
+    /// THE PROGRAM BUCKET'S TICK.
     pub(crate) fn program_tick(&mut self, at: Stamp) {
         self.write_program(at, false);
     }
 
-    /// Write the pending program state now, whatever the bucket holds: the session closes, or its log is carried across an update.
+    /// Write the pending program state now.
     pub(crate) fn flush_program(&mut self, at: Stamp) {
         self.write_program(at, true);
     }
@@ -525,11 +496,6 @@ impl SessionLog {
         }
     }
 
-    /// Refill the bucket to `at`, and write the pending state with a token
-    /// (or without one, `force`), on the bucket's run while it is open and
-    /// on the session (`-`) once it is not: never on whatever node is
-    /// deepest open ([`aterm_slog::Log::mark`]'s rule for a mark that names
-    /// none).
     fn write_program(&mut self, at: Stamp, force: bool) {
         let open = self.observed.program.run.filter(|n| self.log.is_open(*n));
         let p = &mut self.observed.program;
@@ -565,18 +531,16 @@ impl SessionLog {
         self.write_shown(at, false);
     }
 
-    /// THE SHOWN BUCKET'S TICK, each status sweep: a pending tuple is written once the session's bucket has a token again.
+    /// THE SHOWN BUCKET'S TICK.
     pub(crate) fn shown_tick(&mut self, at: Stamp) {
         self.write_shown(at, false);
     }
 
-    /// Write the pending shown tuple now, whatever the bucket holds: the session closes, or its log is carried across an update.
+    /// Write the pending shown tuple now.
     pub(crate) fn flush_shown(&mut self, at: Stamp) {
         self.write_shown(at, true);
     }
 
-    /// Refill the bucket to `at`, and write the pending tuple with a token
-    /// (or without one, `force`), on the session, by aterm.
     fn write_shown(&mut self, at: Stamp, force: bool) {
         let s = &mut self.observed.shown;
         let Some((tuple, replaced)) = s.pending else {
@@ -603,7 +567,7 @@ impl SessionLog {
         );
     }
 
-    /// `mark <run> status …`: one published status transition (the status sweep dedups transitions; every call writes).
+    /// `mark <run> status …`.
     pub(crate) fn observe_status(&mut self, s: StatusFacts, at: Stamp) {
         let mut f = with(Fields::new(), Key::Phase, Some(Val::Word(s.phase)));
         if let Some((out, code)) = s.out {
@@ -614,14 +578,14 @@ impl SessionLog {
         self.put(Kind::Status, Src::Status, s.conf, run, f, at);
     }
 
-    /// The screen saw a person stop the turn (Esc): its idle close reads `out=interrupted` (called before the verdict is published).
+    /// The screen saw a person stop the turn (Esc).
     pub(crate) const fn agent_interrupted(&mut self) {
         if let Some(a) = self.agent.as_mut() {
             a.tracker.note_interrupted();
         }
     }
 
-    /// Claude Code's context left (`pct`, when its screen shows it) and its goal (`None`: not read), after the verdict is published.
+    /// Claude Code's context left (`pct`, when its screen shows it) and its goal.
     pub(crate) fn observe_screen_facts(
         &mut self,
         ctx_pct: Option<u8>,
@@ -652,7 +616,7 @@ impl SessionLog {
         }
     }
 
-    /// THE LAUNCH CARD's names, kept anew for the process in front (`SessionTimeline::note_claude_card`).
+    /// THE LAUNCH CARD's names.
     pub(crate) fn observe_card(&mut self, card: &aterm_phase::LaunchCard, at: Stamp) {
         let Some(run) = self.claude_run() else {
             return;
@@ -730,51 +694,43 @@ impl SessionLog {
         self.put(Kind::Render, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
     }
 
-    /// `mark - cwd cwd=<path>`: the OSC 7 directory the drift flush read (`SessionTimeline::record_cwd_change`), when it moved.
-    pub(crate) fn observe_cwd(&mut self, cwd: Option<&str>, at: Stamp) -> Option<String> {
+    /// `mark - cwd cwd=<path>`: the OSC 7 directory the drift flush read (`SessionTimeline::record_cwd_change`), when it moved; returns whether it marked.
+    pub(crate) fn observe_cwd(&mut self, cwd: Option<&str>, at: Stamp) -> bool {
         let cwd = cwd.filter(|c| !c.is_empty());
         let fp = name_fp(cwd);
         if self.observed.cwd == Some(fp) {
-            return None;
+            return false;
         }
         let first = self.observed.cwd.is_none();
         self.observed.cwd = Some(fp);
         if first && cwd.is_none() {
-            return None;
+            return false;
         }
         let mut f = Fields::new();
-        let text = cwd.and_then(|c| BoundedText::new(Key::Cwd, c));
-        let held = text
-            .as_ref()
-            .map_or_else(String::new, |t| t.as_str().to_string());
-        if let Some(t) = text {
+        if let Some(t) = cwd.and_then(|c| BoundedText::new(Key::Cwd, c)) {
             let _ = f.set(Key::Cwd, Val::Text(t));
         }
         self.put(Kind::Cwd, Src::Engine, Conf::Exact, Node::SESSION, f, at);
-        Some(held)
+        true
     }
 
-    /// `mark - title title=<informative title>`.
-    pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) -> Option<String> {
+    /// `mark - title title=<informative title>`, when it moved; returns whether it marked.
+    pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) -> bool {
         let fp = title_fp(title);
         if self.observed.title == Some(fp) {
-            return None;
+            return false;
         }
         let first = self.observed.title.is_none();
         self.observed.title = Some(fp);
         if first && fp == 0 {
-            return None;
+            return false;
         }
         let mut f = Fields::new();
-        let text = BoundedText::new(Key::Title, title);
-        let held = text
-            .as_ref()
-            .map_or_else(String::new, |t| t.as_str().to_string());
-        if let Some(t) = text {
+        if let Some(t) = BoundedText::new(Key::Title, title) {
             let _ = f.set(Key::Title, Val::Text(t));
         }
         self.put(Kind::Title, Src::Engine, Conf::Exact, Node::SESSION, f, at);
-        Some(held)
+        true
     }
 
     /// `mark - modes n=<k> …`.
@@ -808,7 +764,7 @@ impl SessionLog {
         );
     }
 
-    /// THE FABRIC'S MARKS ([`crate::fabric::FabricFact`], through the one hook `fabric_bind` implements, in the timeline row's hold).
+    /// THE FABRIC'S MARKS.
     pub(crate) fn observe_fabric(&mut self, fact: crate::fabric::FabricFact<'_>, at: Stamp) {
         use crate::fabric::FabricFact as F;
         self.reconcile_person(at);
@@ -974,11 +930,6 @@ impl SessionLog {
         let _ = self.mark_within_record(mark, f, elastic, at);
     }
 
-    /// `mark(f)` appended; when its record would pass
-    /// [`aterm_slog::MAX_RECORD_BYTES`], the free-text key `elastic` is cut
-    /// by the excess ([`aterm_slog::field::clamp_encoded`], never inside a
-    /// character) and the mark appended once more, so a record its writer
-    /// owes is never refused for one long field.
     fn mark_within_record(
         &mut self,
         mark: impl Fn(Fields) -> Mark,
@@ -1007,7 +958,8 @@ impl SessionLog {
         self.log.mark(mark(f), at).ok()
     }
 
-    /// `mark - meta field=<f> value=<v>` from [`crate::session_timeline::SessionTimeline::record_meta_change`] (`fp=` and RAM-only `attn_text=` for [`FINGERPRINTED_META`]).
+    /// `mark - meta field=<f> value=<v>` from
+    /// [`crate::session_timeline::SessionTimeline::record_meta_change`].
     pub(crate) fn observe_meta(
         &mut self,
         change: crate::session_timeline::MetaChange<'_>,
@@ -1178,17 +1130,7 @@ impl SessionLog {
         self.put(Kind::InDoubt, Src::Aterm, Conf::Exact, Node::SESSION, f, at);
     }
 
-    /// `mark - row row=<kind> row_text=<payload>`: a timeline row the log
-    /// holds as its row alone, from its one writer
-    /// ([`crate::session_timeline::SessionTimeline::record_row`]) in the
-    /// row's hold: the ring's kind as a token
-    /// ([`crate::session_timeline_view::row_token`]) and its payload whole,
-    /// at the content tier (RAM only, as the ring row was), so the
-    /// timeline's view prints the row the ring does. Every row-only payload
-    /// is a few closed words and numbers, far under the key's cap (360
-    /// encoded bytes, a space or an escape three); one past it would be cut
-    /// to fit the record's bound, and the timeline's debug cross-check
-    /// would name the row the view then prints short.
+    /// `mark - row row=<kind> row_text=<payload>`.
     pub(crate) fn observe_row(&mut self, kind: &str, payload: &str, at: Stamp) {
         let f = with(
             Fields::new(),
@@ -1210,15 +1152,6 @@ impl SessionLog {
             Some(Key::RowText),
             at,
         );
-    }
-
-    /// Whether a program state is pending in its run's bucket, written
-    /// later: until it is, the ring's newest `program-state` row is
-    /// newer than the log's newest `program` mark (the timeline's debug
-    /// cross-check reads the retention rule by it).
-    #[cfg(debug_assertions)]
-    pub(crate) const fn program_pending(&self) -> bool {
-        self.observed.program.pending.is_some()
     }
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deadlines for potentially blocking in-process calls ([`Gate`]) and child processes ([`output_until`], [`output_while_progressing`], [`outputs_until`]).
+//! Deadlines for blocking in-process calls and child processes.
 
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -50,7 +50,6 @@ pub fn copy_wait_left(home: &std::path::Path, now: std::time::SystemTime) -> Opt
     copy_wait_left_at(home, now, crate::process::awake_ms())
 }
 
-/// [`copy_wait_left`] with the awake clock reading `awake_now`.
 fn copy_wait_left_at(
     home: &std::path::Path,
     now: std::time::SystemTime,
@@ -95,7 +94,6 @@ pub enum Refused {
     Failed(String),
 }
 
-/// What the caller and the helper share.
 enum Slot<T> {
     /// The helper is still working and the caller is still waiting.
     Pending,
@@ -153,7 +151,8 @@ impl Gate {
     /// Runs `work` on a helper thread if it completes within `deadline`.
     ///
     /// # Errors
-    /// Returns [`Refused::Unanswered`] on timeout or overdue gate, or [`Refused::Failed`] on spawn failure or panic.
+    /// Returns [`Refused::Unanswered`] on timeout or overdue gate, or [`Refused::Failed`] on spawn
+    /// failure or panic.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn run<T, F>(
         &'static self,
@@ -173,7 +172,8 @@ impl Gate {
     /// Starts `work` on a helper thread and returns a [`Pending`] handle to wait on.
     ///
     /// # Errors
-    /// Returns [`Refused::Unanswered`] if an earlier call is overdue, or [`Refused::Failed`] if no thread could start.
+    /// Returns [`Refused::Unanswered`] if an earlier call is overdue, or [`Refused::Failed`] if no
+    /// thread could start.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start<T, F>(&'static self, suspect: Duration, work: F) -> Result<Pending<T>, Refused>
     where
@@ -225,7 +225,6 @@ impl Gate {
         Ok(Pending { slot: ours })
     }
 
-    /// The helper `id` has returned.
     fn forget(&self, id: u64) {
         let mut helpers = self.helpers.lock().unwrap_or_else(PoisonError::into_inner);
         helpers.running.retain(|helper| helper.id != id);
@@ -301,14 +300,9 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-/// The first sleep tick of an [`ExitWait`] with no exit descriptor, doubled up to
-/// [`POLL_MAX`] so a tool that takes tens of milliseconds is not rounded up to a fixed tick.
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
 
-/// How long [`output_until`] reads the streams after the child exits: a pipe a descendant
-/// still holds open past it gives what it gave by then. Past it a drain reads on a pipe
-/// nothing else holds ([`Grace`]).
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// The bound on reading on past [`DRAIN_GRACE`] a pipe no writer holds: its end is a read
@@ -317,13 +311,6 @@ const DRAIN_GRACE: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const SLOW_READER: Duration = Duration::from_secs(60);
 
-/// When a drain of an exited child's stream stops while the stream is open: at `by` while
-/// a descendant may hold its pipe ([`children::descendant_may_hold`]); past `by`, a pipe no
-/// writer holds is read to its end (bounded by [`SLOW_READER`]), and one only something
-/// outside the child's process group holds is read until `until`, the call's deadline. That
-/// holder is a child another thread of this process forked and has not exec'd yet, which
-/// lets go at its exec (a test binary at full load kept one past the grace, and `fish
-/// --version`'s line was refused), or a descendant that left the group.
 struct Grace {
     by: Instant,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -344,7 +331,6 @@ impl Grace {
         }
     }
 
-    /// How much longer past `by` a drain waits for its stream's end, if at all.
     fn read_on(&self, pipe: Option<&PipeEnd>) -> Option<Duration> {
         #[cfg(unix)]
         {
@@ -387,7 +373,8 @@ fn pipe_end<T>(_stream: &T) -> Option<PipeEnd> {
 /// Maximum tail bytes retained per output stream by [`output_until`].
 pub const OUTPUT_KEEP: usize = 1024 * 1024;
 
-/// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at `deadline`.
+/// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at
+/// `deadline`.
 ///
 /// # Errors
 /// Returns [`RunError::Spawn`], [`RunError::Wait`], or [`RunError::TimedOut`].
@@ -417,15 +404,13 @@ pub fn output_until_from(
     })
 }
 
-/// The most time [`output_while_progressing`] lets pass between two reads of its progress
-/// probe (a quarter of its window, when that is shorter): a stall is named within one tick of
-/// its window, and a probe that reads a file's length costs nothing at this rate.
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
 
 /// Runs `cmd` while `progress()` keeps advancing at least once every `window`.
 ///
 /// # Errors
-/// Returns [`RunError::TimedOut`] if `progress()` stays unchanged for `window`, or spawn/wait errors.
+/// Returns [`RunError::TimedOut`] if `progress()` stays unchanged for `window`, or spawn/wait
+/// errors.
 pub fn output_while_progressing(
     cmd: &mut Command,
     window: Duration,
@@ -448,10 +433,6 @@ pub fn output_while_progressing(
     })
 }
 
-/// The one child run behind [`output_until_from`] and [`output_while_progressing`]: each time
-/// the child is found still running, `left` says how long to wait for its exit before looking
-/// again, and zero ends the run (the group is killed and the child reaped,
-/// [`RunError::TimedOut`]).
 fn output_by(
     cmd: &mut Command,
     stdin: Stdio,
@@ -594,8 +575,6 @@ impl ExitWait {
     }
 }
 
-/// Kill (`SIGKILL`; on Unix the child's whole process group, which
-/// [`output_until`] made it lead) and reap.
 fn end(child: &mut Child) {
     #[cfg(unix)]
     children::kill_group(child);
@@ -610,8 +589,6 @@ pub fn kill_within(child: &mut Child, hang: Duration) {
     reap_within(child, None, Instant::now() + hang);
 }
 
-/// Reap a killed `child` by `by`, waiting on its exit as the kernel reports
-/// it.
 fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
     let mut fallback;
     let exit = match exit {
@@ -711,8 +688,6 @@ impl Drop for Held {
     }
 }
 
-/// One stream being read on a thread of its own: the tail so far, and a
-/// signal when the stream has ended.
 struct Drain {
     tail: Arc<Mutex<Vec<u8>>>,
     ended: mpsc::Receiver<()>,
@@ -720,7 +695,6 @@ struct Drain {
 }
 
 impl Drain {
-    /// The tail, once the stream ends or when `grace` stops it.
     fn collect(self, grace: &Grace) -> Vec<u8> {
         let ended = self
             .ended
@@ -777,8 +751,6 @@ mod tests {
     };
     use super::{Gate, Refused};
 
-    /// A copy's age is awake time since its exec when it is stamped, wall-clock time since its
-    /// directory changed when not, and a copy a program ran from goes at once.
     #[test]
     fn a_copy_ages_on_the_awake_clock_from_its_exec() {
         use super::{EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, stamp_exec};
@@ -821,9 +793,7 @@ mod tests {
         assert!(first <= second, "{first:?} then {second:?}");
     }
 
-    /// Short: the work never answers on its own; the assertion is that the call comes back.
     const DEADLINE: Duration = Duration::from_millis(200);
-    /// A wait for something that must happen: a hang detector, not a budget.
     const HANG: Duration = Duration::from_secs(60);
 
     /// A reader that first waits for its release, as one the scheduler has not run yet.
@@ -881,8 +851,6 @@ mod tests {
         let pipe = super::pipe_end(&reader);
         let (release, held) = mpsc::channel();
         let drain = super::drain(Late { held, reader }, pipe, "late").expect("reader");
-        // An empty group: a child another test's thread forks meanwhile, holding a copy of
-        // the writer until its exec, is read past too.
         let grace = super::Grace {
             by: Instant::now(),
             until: Instant::now() + HANG,
@@ -944,7 +912,6 @@ mod tests {
         assert!(waited < HANG, "waited on a pipe a descendant holds");
     }
 
-    /// Work that reports, on a channel, whether it ever ran.
     fn witness() -> (impl FnOnce() + Send + 'static, mpsc::Receiver<()>) {
         let (ran, seen) = mpsc::channel::<()>();
         (
@@ -955,12 +922,10 @@ mod tests {
         )
     }
 
-    /// Its work was dropped unrun: the channel closed without a message.
     fn never_ran(seen: &mpsc::Receiver<()>) -> bool {
         seen.recv_timeout(HANG) == Err(mpsc::RecvTimeoutError::Disconnected)
     }
 
-    /// Waits (under the hang detector) until no helper is running.
     fn drained(gate: &Gate) {
         let since = Instant::now();
         while gate.running() != 0 {
@@ -969,7 +934,6 @@ mod tests {
         }
     }
 
-    /// Waits (under the hang detector) until `n` helpers are running.
     fn started(gate: &Gate, n: usize) {
         let since = Instant::now();
         while gate.running() < n {

@@ -3712,6 +3712,42 @@ impl Session<'_> {
         }
     }
 
+    /// The `wl_pointer` (`wl_pointer@N`) aterm-gui's wire log `log` names.
+    fn wire_pointer(&self, log: &str) -> Result<String, String> {
+        let wire = self.sh(&["cat".into(), log.into()]);
+        let tag = "wl_pointer@";
+        let at = wire
+            .text
+            .find(tag)
+            .ok_or_else(|| format!("{log} names no wl_pointer"))?;
+        let id: String = wire.text[at + tag.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Ok(format!("{tag}{id}"))
+    }
+
+    /// How many times the wire log `log` shows `pointer` leaving a surface.
+    fn wire_leaves(&self, log: &str, pointer: &str) -> usize {
+        let leave = format!("{pointer}.leave(");
+        let wire = self.sh(&["cat".into(), log.into()]);
+        wire.text.lines().filter(|l| l.contains(&leave)).count()
+    }
+
+    /// Wait (a hang detector) until the wire log `log` shows the `request`
+    /// (`move` or `resize`) and then one more leave of `pointer` than
+    /// `leaves`: Mutter and weston take the pointer as a grab starts. The seat
+    /// drags only after it, or a starved aterm-gui reads press, drag and
+    /// release in one batch and asks with the release's serial, which the
+    /// compositor refuses.
+    fn await_grab(&self, log: &str, request: &str, pointer: &str, leaves: usize) {
+        let asked = format!(".{request}(wl_seat@");
+        if self.sh(&guest::wait_lines(log, &asked, 1, 60)).ok() {
+            let left = format!("{pointer}.leave(");
+            let _ = self.sh(&guest::wait_lines(log, &left, leaves + 1, 60));
+        }
+    }
+
     fn header_gestures_run(&self) -> Result<Vec<(bool, String, String)>, String> {
         let log = format!("{}/wayland-debug-frame.txt", self.gui.dir);
         let marks = format!("{}/frame", self.gui.dir);
@@ -3768,7 +3804,7 @@ impl Session<'_> {
             format!("wait:{}", mark("drag-band")),
             "press:left".to_string(),
             "move:6,0".to_string(),
-            "sleep:300".to_string(),
+            format!("wait:{}", mark("move-grabbed")),
             format!("move:@{}", mark("to-move")),
             "sleep:300".to_string(),
             "release:left".to_string(),
@@ -3778,7 +3814,7 @@ impl Session<'_> {
             format!("touch:{}", mark("at-edge")),
             format!("wait:{}", mark("drag-edge")),
             "press:left".to_string(),
-            "sleep:300".to_string(),
+            format!("wait:{}", mark("resize-grabbed")),
             "move:60,0".to_string(),
             "sleep:300".to_string(),
             "release:left".to_string(),
@@ -3821,7 +3857,11 @@ impl Session<'_> {
             let room = guest::SCREEN.0 - (left + 46 + logical(w));
             let dx = if room > 60 + 2 * slack { 40 } else { -40 };
             self.put_file(&mark("to-move"), &format!("{dx} 30"))?;
+            let pointer = self.wire_pointer(&log)?;
+            let leaves = self.wire_leaves(&log, &pointer);
             go("drag-band");
+            self.await_grab(&log, "move", &pointer, leaves);
+            go("move-grabbed");
             self.seat_reached(&seat, &marks, "moved")?;
             let (mx, my) = self
                 .settled_px()
@@ -3843,7 +3883,10 @@ impl Session<'_> {
             self.seat_reached(&seat, &marks, "at-edge")?;
             self.px_at(edge, slack)
                 .map_err(|e| format!("on the edge: {e}"))?;
+            let leaves = self.wire_leaves(&log, &pointer);
             go("drag-edge");
+            self.await_grab(&log, "resize", &pointer, leaves);
+            go("resize-grabbed");
             self.seat_reached(&seat, &marks, "resized")?;
             let d = self.settled_dims()?;
             let wider = proof::field(&d, "frame_w")

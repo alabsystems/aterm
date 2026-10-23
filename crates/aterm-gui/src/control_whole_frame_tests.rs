@@ -268,7 +268,8 @@ fn a_read_facing_an_unfinished_frame_at_its_bound_says_frame_open() {
 fn a_row_fence_declines_an_unfinished_frame_and_the_event_loop_never_waits() {
     use std::os::fd::FromRawFd as _;
     let (h, rx) = guarded_pipe_session(1);
-    // SAFETY: guarded_pipe_session returned this new write descriptor.
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the session and sink
+    // borrow it, and no other owner closes it.
     let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
     let h = session(h, EVENTUALLY);
     burst(&h, WHOLE);

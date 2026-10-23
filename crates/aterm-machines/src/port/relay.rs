@@ -28,7 +28,9 @@ pub(super) struct Live {
     listener: std::sync::Weak<TcpListener>,
 }
 
-/// Listen on a free loopback port and carry each connection over a run of `cmd`, in the cleared environment `env` ([`super::Live`]'s `child_env`, as [`super::Live::run`] gives).
+/// Listen on a free loopback port and carry each connection over a run of `cmd`, in the
+/// cleared environment `env` ([`super::Live`]'s `child_env`, as
+/// [`super::Live::run`](super::Live#method.run) gives).
 pub(super) fn listen(cmd: &Cmd, env: Vec<(String, String)>) -> Result<Live, RunFailed> {
     if cmd.user.is_some() || cmd.session || cmd.stdin.is_some() || cmd.keep_on_timeout {
         return Err(RunFailed::Refused(format!(

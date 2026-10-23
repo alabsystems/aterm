@@ -35,13 +35,7 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
     hash=7adef2d5e8547a9e";
 
 /// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
-/// descriptors: this process and two children, one given the file through a symlink. On a Mac
-/// where some agent of this uid holds a file in a protected folder, the scan reads those
-/// descriptors as no file sought once their refusal is shown to be the file's, so its answer
-/// is complete there too. NEGATIVE CONTROLS: nobody holds the lock once each lets go, and a
-/// path that is not there is unknown. Run ALONE in a re-run of this binary: a sibling test's
-/// child forked short of its exec holds this process's descriptors for one read and not the
-/// other.
+/// descriptors: this process and two children, one given the file through a symlink.
 #[cfg(target_os = "macos")]
 #[test]
 fn file_holders_are_lsof_s() {
@@ -147,8 +141,6 @@ fn file_holders_are_lsof_s() {
 /// [`open_files`] (read in process) names the files `/usr/sbin/lsof -p <pid> -d 0-1023 -Fn`
 /// names for a process's descriptors, the reader it replaced, in descriptor order: a child
 /// holding one file as its stdin, `/dev/null` as its stdout and another file as its stderr.
-/// NEGATIVE CONTROLS: a file it does not hold is in neither list, and once it has exited
-/// [`open_files`] reads nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn open_files_are_lsof_s() {
@@ -201,9 +193,7 @@ fn open_files_are_lsof_s() {
 }
 
 /// ONLY A COMPLETE SCAN NAMES THE HOLDERS: an unreadable table leaves them unknown, with or
-/// without a holder found. A sealed table (Linux's non-dumpable process, such as
-/// `ssh-agent`) is no holder, as `lsof -t` run as this uid, which this read replaced, named
-/// none of it. NEGATIVE CONTROL: a sealed table beside an unreadable one is still unknown.
+/// without a holder found.
 #[test]
 fn only_a_complete_holder_scan_can_establish_the_holder_set() {
     let scan = |holders, unreadable, sealed| aterm_uds::holders::HolderScan {
@@ -1804,9 +1794,7 @@ fn park_when_asked() {
     std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
 }
 
-/// A stand-in agent in [`TAB`]: this test binary, parked. Not `/bin/sleep`: a
-/// platform binary's environment is hidden from `KERN_PROCARGS2`, a real
-/// agent's is not.
+/// A stand-in agent in [`TAB`]: this test binary, parked.
 fn parked() -> Command {
     let mut c = parked_bare();
     c.arg(PARK[1]);
@@ -11089,6 +11077,7 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
         Some(tap::Armed {
             exe: exe.to_path_buf(),
             lone_login: lone_login.map(str::to_owned),
+            listed: Vec::new(),
         })
     };
     let run = |label: &str, usage_tap: Option<tap::Armed>, why: &Restart, roster: &Roster| {
@@ -13998,6 +13987,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     opts.usage_tap = Some(tap::Armed {
         exe: exe.to_path_buf(),
         lone_login: None,
+        listed: Vec::new(),
     });
     let pair = format!("'--settings' '{value}'");
     let tapped = planned(&opts, &argv, true);
@@ -14013,11 +14003,12 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     assert!(other.contains("HOME=/Users//other"), "{other}");
     assert!(!other.contains("harness tap"), "{other}");
     let renewed = "/tmp/aterm-state/logins/home-a.1";
-    let on_login = |lone: Option<&str>| {
+    let on_login_of = |lone: Option<&str>, listed: &[&str]| {
         let opts = Opts {
             usage_tap: Some(tap::Armed {
                 exe: exe.to_path_buf(),
                 lone_login: lone.map(str::to_owned),
+                listed: listed.iter().map(|l| (*l).to_owned()).collect(),
             }),
             ..opts.clone()
         };
@@ -14040,6 +14031,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             .unwrap_or_else(|_| panic!("a plan"))
             .line
     };
+    let on_login = |lone: Option<&str>| on_login_of(lone, &[]);
     let renewed_line = on_login(Some(renewed));
     assert!(renewed_line.contains(renewed), "{renewed_line}");
     assert!(renewed_line.contains(&pair), "{renewed_line}");
@@ -14048,6 +14040,22 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
         assert!(line.contains(renewed), "{line}");
         assert!(!line.contains("--settings"), "{lone:?}: {line}");
     }
+    let work = "/tmp/aterm-state/logins/work";
+    let listed = on_login_of(None, &[work, renewed]);
+    assert!(
+        listed.contains(&pair),
+        "no lone login, a login the roster names: tapped as the machine's own: {listed}"
+    );
+    let unlisted = on_login_of(None, &[work]);
+    assert!(
+        !unlisted.contains("--settings"),
+        "a login the roster does not name: {unlisted}"
+    );
+    let beside_lone = on_login_of(Some("/tmp/aterm-state/logins/home-a.2"), &[renewed]);
+    assert!(
+        !beside_lone.contains("--settings"),
+        "a lone login is the only one: {beside_lone}"
+    );
     let stale = tap::settings_value(Path::new("/Users//example/old/aterm")).expect("a path");
     let rerun: Vec<String> = argv
         .iter()
@@ -14058,20 +14066,38 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     assert_eq!(line, tapped, "the stale tap is replaced");
     assert!(!line.contains("/Users//example/old"), "{line}");
     let status = r#"{"statusLine":{"type":"command","command":"echo mine"}}"#;
+    let helper = r#"{"apiKeyHelper":"/bin/echo"}"#;
+    let credential = r#"{"env":{"ANTHROPIC_API_KEY":"k"}}"#;
     for file in [
         opts.home.join(".claude/settings.json"),
         opts.home.join(".claude/cowork_settings.json"),
         project.join(".claude/settings.json"),
         project.join(".claude/settings.local.json"),
     ] {
-        std::fs::write(&file, status).expect("write");
-        assert_eq!(planned(&opts, &argv, true), plain, "{}", file.display());
+        for text in [status, helper, credential] {
+            std::fs::write(&file, text).expect("write");
+            assert_eq!(
+                planned(&opts, &argv, true),
+                plain,
+                "{}: {text}",
+                file.display()
+            );
+            assert!(
+                !super::tap_settings_admit(&opts.home, &argv, &cwd),
+                "the footer's reason judges the line's documents alike: {}: {text}",
+                file.display()
+            );
+        }
         std::fs::remove_file(&file).expect("remove");
     }
     assert_eq!(
         planned(&opts, &argv, true),
         tapped,
         "every document quiet again"
+    );
+    assert!(
+        super::tap_settings_admit(&opts.home, &argv, &cwd),
+        "and so does the footer's reason"
     );
     let managed = dir.join("managed");
     std::fs::create_dir_all(&managed).expect("managed");
@@ -14973,10 +14999,6 @@ impl Parked {
     /// The stand-in agent handed to a thread that reaps it the moment it ends
     /// and removes its session file, as Claude's own exit does, so a restart's
     /// wait for it to be gone ends on the event; says how it ended.
-    ///
-    /// The thread asks whether it ended under the lock the rig's drop takes to
-    /// kill it, so the agent a test never ended is ended with the rig, and the
-    /// signal reaches it before its reap, never a pid reused after.
     fn reaped(&mut self) -> std::sync::mpsc::Receiver<std::process::ExitStatus> {
         let agent = self.agent.take().expect("the agent");
         let file = self
@@ -15167,9 +15189,7 @@ const PTY_HOST: [&str; 2] = [
 const PTY_HOST_ENV: &str = "UPGRADE_DRIVE_TEST_PTY_HOST";
 
 /// The pty host's body ([`pty_host`]): `script(1)`'s part, without `script(1)`, whose BSD
-/// and util-linux forms differ (S12 of the init design). A pty pair of its own, the argv on
-/// its slave in a session it leads, the master drained, until the argv's process exits or
-/// this one's parent goes.
+/// and util-linux forms differ.
 #[cfg(unix)]
 #[test]
 fn host_a_pty_when_asked() {
@@ -15228,7 +15248,7 @@ fn host_a_pty_when_asked() {
 }
 
 /// `argv` on a pty a process of its own opened ([`host_a_pty_when_asked`]): the shape of
-/// `script -q /dev/null argv…`, of every tmux or screen pane. Its pid is the terminal's owner.
+/// `script -q /dev/null argv…`, of every tmux or screen pane.
 #[cfg(target_os = "macos")]
 fn pty_host(argv: &[&std::ffi::OsStr]) -> Command {
     use std::os::unix::ffi::OsStrExt as _;
@@ -20872,8 +20892,7 @@ fn a_quiet_restart_is_carried_on_with_nothing() {
 }
 
 /// The resumed build's own warning that something did not come back, as
-/// 2.1.300 wrote it (2026-10-15, transcript `71159b44`), by build `version`
-/// at `at` (unix seconds), at `level`.
+/// 2.1.300 wrote it, by build `version` at `at` (unix seconds), at `level`.
 #[cfg(unix)]
 fn resumed_warning(version: &str, at: u64, level: &str) -> String {
     format!(
@@ -22851,8 +22870,7 @@ fn a_finished_conversation_is_carried_on_with_nothing() {
     }
 }
 
-/// A relaunch into a done report in words asks the done check, never `KEEP GOING` (the live lab's
-/// live-rl-1).
+/// A relaunch into a done report in words asks the done check, never `KEEP GOING`.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
@@ -23069,12 +23087,7 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
     }
 }
 
-/// A RELAUNCH INTO A TASK LAND'S ACT OR A WALL-CUT CHECK'S RETRY ENDED TYPES
-/// NOTHING (the merge review's M5-R1 and XM-LAND-RECORD): the turn-end
-/// policy ends the task on a done reply to [`LAND`] (Autopilot Land's
-/// instruction, its done check) and on the done reply to the retry of a wall
-/// that cut the done check's turn; the record (`FinishedScan`) reads both
-/// the same, so the carry-on is `done:finished`, nothing typed.
+/// A RELAUNCH INTO A TASK LAND'S ACT OR A WALL-CUT CHECK'S RETRY ENDED TYPES NOTHING.
 #[cfg(unix)]
 /// A relaunch into a task land's act landed types nothing.
 #[cfg(unix)]

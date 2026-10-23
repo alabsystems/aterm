@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's X11 binding.
+//! The GL arm's X11 binding. No GLX call is made once the server has hung up the connection
+//! ([`GlxContext::gone`]): Xlib keeps queueing on a broken connection until a caller dies of SIGSEGV
+//! (Mesa's drisw asks a drawable's geometry inside a swap), and `glXQueryDrawable` reads a failed
+//! reply unchecked (an abort); a window's size is asked of Xlib's `XGetGeometry`, which checks it.
 
 use std::ffi::{CStr, c_int, c_uint, c_void};
 
@@ -117,6 +120,9 @@ impl GlxContext {
     /// Create a context as [`Self::new`], appending `also` to GLX's extension list.
     fn offering(display: XDisplay, screen: c_int, also: &str) -> Result<Self, String> {
         let glx = Glx::get()?;
+        if hung_up(glx, display) {
+            return Err(GONE.to_owned());
+        }
         let fns = &glx.fns;
         // SAFETY: a live display and one of its screens; the string is GLX's.
         let mut exts = unsafe { ffi::c_string((fns.query_extensions_string)(display, screen)) };
@@ -291,6 +297,9 @@ impl GlxContext {
     }
 
     fn bind(&self, drawable: GLXDrawable) -> Result<(), String> {
+        if self.gone() {
+            return Err(GONE.to_owned());
+        }
         // SAFETY: a drawable made on this display with the context's config; the device lock keeps every other thread off the context.
         let ok = unsafe {
             (self.glx.fns.make_context_current)(self.display, drawable, drawable, self.context)
@@ -304,6 +313,9 @@ impl GlxContext {
 
     /// Release the calling thread's context (flushing it).
     pub(crate) fn release(&self) {
+        if self.gone() {
+            return;
+        }
         // SAFETY: unbinding with no drawables and no context is always legal.
         unsafe {
             (self.glx.fns.make_context_current)(self.display, 0, 0, std::ptr::null_mut());
@@ -336,13 +348,17 @@ impl GlxContext {
         }
     }
 
-    /// Destroy a `GLXWindow` this context made, which no thread holds current.
+    /// Destroy a `GLXWindow` this context made, which no thread holds current
+    /// (on a gone connection the server freed it).
     pub(crate) fn destroy_window(&self, window: GLXDrawable) {
+        if self.gone() {
+            return;
+        }
         // SAFETY: as documented; the X11 window under it is still alive.
         unsafe { (self.glx.fns.destroy_window)(self.display, window) };
     }
 
-    /// The X11 window `xid`'s width and height now, which its `GLXWindow` follows: one round trip (`glXQueryDrawable` takes one a side).
+    /// The X11 window `xid`'s width and height now, which its `GLXWindow` follows: one round trip; (0, 0) when the server answers none.
     pub(crate) fn size(&self, xid: u64) -> (u32, u32) {
         let (mut root, mut x, mut y) = (0, 0, 0);
         let (mut w, mut h, mut border, mut depth): (c_uint, c_uint, c_uint, c_uint) = (0, 0, 0, 0);
@@ -387,15 +403,34 @@ impl GlxContext {
         }
     }
 
-    /// Post `window`'s back buffer.
-    pub(crate) fn swap(&self, window: GLXDrawable) {
+    /// Post `window`'s back buffer, current on the calling thread.
+    pub(crate) fn swap(&self, window: GLXDrawable) -> Result<(), String> {
+        if self.gone() {
+            return Err(GONE.to_owned());
+        }
         // SAFETY: a `GLXWindow` of this display, current here.
         unsafe { (self.glx.fns.swap_buffers)(self.display, window) };
+        Ok(())
+    }
+
+    /// Whether the X server has hung up this context's connection
+    /// ([`hung_up`]): no GLX call is made on it after (see the module header).
+    pub(crate) fn gone(&self) -> bool {
+        hung_up(self.glx, self.display)
+    }
+
+    /// The hang-up as a loss's reason, where the server has hung up.
+    pub(crate) fn hung_up_reason(&self) -> Option<&'static str> {
+        self.gone().then_some(GONE)
     }
 }
 
 impl Drop for GlxContext {
     fn drop(&mut self) {
+        // On a gone connection the server freed both with it.
+        if self.gone() {
+            return;
+        }
         // SAFETY: the device owning this context is gone, so no thread holds
         // it current; the pbuffer and the context were made on this display.
         unsafe {
@@ -403,6 +438,43 @@ impl Drop for GlxContext {
             (self.glx.fns.destroy_context)(self.display, self.context);
         }
     }
+}
+
+/// What a GLX call answers once the server has hung up its connection.
+const GONE: &str = "gl: the X server hung up the connection";
+
+/// Whether the X server has hung up `display`'s connection (it died, or
+/// closed it), read off the socket before Xlib has: a hang-up or an error
+/// polled, or a readable socket whose next byte is its end. Bytes still queued
+/// ahead of the end hide it until Xlib has read them.
+fn hung_up(glx: &Glx, display: XDisplay) -> bool {
+    // SAFETY: a live display; `XConnectionNumber` reads its socket's number
+    // and sends nothing.
+    let fd = unsafe { (glx.x.connection_number)(display) };
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live pollfd; a zero timeout never blocks.
+    if unsafe { libc::poll(&raw mut p, 1, 0) } <= 0 {
+        return false;
+    }
+    if p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    let mut byte = 0u8;
+    // SAFETY: one byte into a live local; a peek that does not block takes
+    // nothing off the socket.
+    let peeked = unsafe {
+        libc::recv(
+            fd,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    peeked == 0
 }
 
 /// Whether a compositing manager runs on `display`'s screen `screen` (it owns the `_NET_WM_CM_S<screen>` selection, EWMH).
@@ -553,8 +625,25 @@ mod tests {
                 free = "XFree": fn(*mut c_void) -> c_int;
                 intern_atom = "XInternAtom": fn(Display, *const c_char, c_int) -> c_ulong;
                 get_selection_owner = "XGetSelectionOwner": fn(Display, c_ulong) -> c_ulong;
+                connection_number = "XConnectionNumber": fn(Display) -> c_int;
+                set_io_error_handler = "XSetIOErrorHandler":
+                    fn(Option<IoErrorHandler>) -> Option<IoErrorHandler>;
+                set_io_error_exit_handler = "XSetIOErrorExitHandler":
+                    fn(Display, Option<IoErrorExitHandler>, *mut c_void);
             }
         }
+
+        pub(super) type IoErrorHandler = unsafe extern "C" fn(Display) -> c_int;
+        pub(super) type IoErrorExitHandler = unsafe extern "C" fn(Display, *mut c_void);
+
+        /// An IO error handler that returns, as aterm-window's does (Xlib's
+        /// default ends the process).
+        pub(super) unsafe extern "C" fn io_error_returns(_: Display) -> c_int {
+            0
+        }
+
+        /// An IO error exit handler that returns, as aterm-window's does.
+        pub(super) unsafe extern "C" fn io_error_exit_returns(_: Display, _: *mut c_void) {}
 
         #[repr(C)]
         pub(super) struct XEvent {
@@ -1505,5 +1594,147 @@ mod tests {
         desk.sync();
         let errors = xlib::ERRORS.load(Ordering::Relaxed);
         println!("{REFUSED} ({errors} X errors)");
+    }
+
+    /// What the child prints once a present whose window answered no size
+    /// bound nothing and latched nothing.
+    const UNANSWERED: &str =
+        "GL-X11-UNANSWERED: a window that answers no size is not bound and latches nothing";
+
+    /// The window under a surface that has posted is destroyed (by another
+    /// client, as a crashed server's window goes): the next present's ask of
+    /// its size goes unanswered (`BadDrawable`), so the present binds
+    /// nothing, fails as an unavailable surface a retry may recover, and
+    /// latches nothing. Binding it would have Mesa's software GLX (drisw)
+    /// ask the same question after the swap, unchecked, and draw into a
+    /// buffer of the uninitialized size it read: the Linux lane's display
+    /// gone mid-resize, x86_64, 2026-10-22, all eight llvmpipe threads dead
+    /// of SIGSEGV with the server killed under that ask. The control: the
+    /// first present posts. It runs in a child ([`in_child`]).
+    #[test]
+    fn a_window_that_answers_no_size_is_not_bound() {
+        let _ = in_child(
+            "a_window_that_answers_no_size_is_not_bound",
+            UNANSWERED,
+            presents_with_no_size,
+        );
+    }
+
+    /// The child's work.
+    fn presents_with_no_size() {
+        let x = xlib::Xlib::open();
+        let (w, h) = (32, 24);
+        let desk = Desk::open(&x, w, h);
+        let dev = desk.device();
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+            .expect("a window surface");
+        surface.standin(&dev).expect("the stand-in");
+        surface
+            .present(&dev, FILL)
+            .expect("a present on the live window posts");
+        // SAFETY: the window this test made, on its live display.
+        unsafe { (x.destroy_window)(desk.dpy, desk.win) };
+        desk.sync();
+        let failed = surface
+            .present(&dev, FILL)
+            .expect_err("a present on a window that answers no size posted");
+        assert_eq!(
+            failed.kind,
+            crate::SurfacePresentFailure::Unavailable,
+            "the unanswered present's kind: {}",
+            failed.detail
+        );
+        assert!(
+            failed.detail.contains("answered no size"),
+            "the unanswered present says why: {}",
+            failed.detail
+        );
+        assert!(
+            !dev.shared().lost(),
+            "an unanswered size latches nothing: {:?}",
+            dev.shared().loss_reason()
+        );
+        drop(surface);
+        drop(dev);
+        // The window is gone already: the desk's close alone.
+        // SAFETY: the display this test opened, closed once.
+        unsafe { (x.close_display)(desk.dpy) };
+        std::mem::forget(desk);
+        println!("{UNANSWERED}");
+    }
+
+    /// What the child prints once its presents on a hung-up connection all
+    /// failed without a GLX call and the device latched lost.
+    const HUNG_UP: &str =
+        "GL-X11-GONE: a hung-up connection takes no GLX call and latches the device lost";
+
+    /// The X server hangs up under a device that has posted (a crash or a
+    /// restart): every present after fails, the first latching the device
+    /// lost with the hang-up as the cause, and the process lives to say so.
+    /// The hang-up is the test's `shutdown` of the connection's socket, both
+    /// ways, as aterm-window's `x11/gone_tests.rs` makes it, under IO error
+    /// handlers that return, as aterm-window installs them (Xlib's own end
+    /// the process). The control: the first present, before the hang-up,
+    /// posts. The negative control: with `hung_up` answering `false`, the
+    /// first present after the hang-up reports a post (its swap is queued
+    /// on the dead socket and nothing latches), and the GLX calls go on
+    /// into a connection Xlib has given up on (the Linux lane's
+    /// display-gone rows died of that on 2026-10-22, by SIGSEGV after Xlib's
+    /// `request … would exceed buffer size` and by an abort in
+    /// `glXQueryDrawable`'s unchecked reply). It runs in a child
+    /// ([`in_child`]).
+    #[test]
+    fn a_hung_up_connection_takes_no_glx_call_and_latches_the_device_lost() {
+        let _ = in_child(
+            "a_hung_up_connection_takes_no_glx_call_and_latches_the_device_lost",
+            HUNG_UP,
+            presents_after_a_hang_up,
+        );
+    }
+
+    /// The child's work.
+    fn presents_after_a_hang_up() {
+        let x = xlib::Xlib::open();
+        let (w, h) = (32, 24);
+        let desk = Desk::open(&x, w, h);
+        let dev = desk.device();
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+            .expect("a window surface");
+        surface.standin(&dev).expect("the stand-in");
+        surface
+            .present(&dev, FILL)
+            .expect("a present on the live connection posts");
+        assert!(!dev.shared().lost(), "a post latches nothing");
+        // SAFETY: a live display; both handlers have Xlib's signatures and
+        // touch nothing.
+        let fd = unsafe {
+            (x.set_io_error_handler)(Some(xlib::io_error_returns));
+            (x.set_io_error_exit_handler)(
+                desk.dpy,
+                Some(xlib::io_error_exit_returns),
+                std::ptr::null_mut(),
+            );
+            (x.connection_number)(desk.dpy)
+        };
+        // SAFETY: the display's own socket, shut both ways and left open
+        // (Xlib still holds it).
+        assert_eq!(
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) },
+            0,
+            "the hang-up"
+        );
+        for n in 1..=64 {
+            let failed = surface.present(&dev, FILL);
+            assert!(failed.is_err(), "present {n} after the hang-up posted");
+        }
+        assert!(dev.shared().lost(), "the hang-up latched the device lost");
+        let why = dev.shared().loss_reason().unwrap_or_default().to_owned();
+        assert!(why.contains(GONE), "the loss names the hang-up: {why}");
+        // The surface's and the device's drops make no GLX call either; the
+        // display is left to the process's end (its close would sync).
+        drop(surface);
+        drop(dev);
+        std::mem::forget(desk);
+        println!("{HUNG_UP}: {why}");
     }
 }

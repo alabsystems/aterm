@@ -1180,7 +1180,10 @@ mod tests {
         assert_eq!(checked[0].versions, vec!["2.12.3".to_string()]);
     }
 
+    /// macOS and Linux only: the restore publishes by an atomic directory
+    /// rename ([`publish_directory`]), which no other platform offers.
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn stranded_reinstall_aside_is_restored_without_discarding_other_payloads() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let p = Prefix::at(tmp.path());

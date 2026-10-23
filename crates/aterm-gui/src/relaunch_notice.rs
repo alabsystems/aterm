@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! App state behind the "update ready" nudge: the ⬆️-suffixed version menu title and
-//! its "Install aterm v<staged> now" item (`crate::menu::update_version_menu`, the
+//! its "Install aterm `v<staged>` now" item (`crate::menu::update_version_menu`, the
 //! palette's Version row), plus the leading `↻` in the off-macOS tab strip
 //! ([`crate::tab_bar`] `TabHit::Update`). Holds the staged build/version (the repaint
 //! fingerprint) and the post-update realized-arrow timing (TTL, fade law, bucket).

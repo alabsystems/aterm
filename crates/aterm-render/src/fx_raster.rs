@@ -990,7 +990,8 @@ pub fn fx_bloom_quads(
     );
 }
 
-/// One span of a [`GlowQuad`](aterm_core::render::GlowQuad)-law rect: column `k` of `span` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1`.
+/// One span of a [`GlowQuad`]-law rect: column `k` of `span` is ramp column `i0 + k` of a
+/// `qw`-wide ramp from `c0` to `c1`.
 #[inline]
 pub(crate) fn fill_glow_span(span: &mut [u32], i0: u32, qw: u32, c0: FxInk, c1: FxInk) {
     if c0 == c1 {

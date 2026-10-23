@@ -10,12 +10,8 @@ use crate::prompt::fixtures::{
     TRANSCRIPT_DEGRADED_EACCES_2_1_304, composer, ink_wrap, rows, screen,
 };
 
-/// The measured words the vendor maps `EACCES` to, in the measured row.
 const MEASURED_CODE: &str = "permission denied — EACCES";
 
-/// The measured screen with the notice's mapped words `mapped` in place of
-/// [`MEASURED_CODE`]: the row as Claude Code draws it for that code (2.1.304
-/// maps each code to its words in the one template), and the row it is on.
 fn measured_with(mapped: &str) -> (Vec<String>, usize) {
     let r: Vec<String> = screen(TRANSCRIPT_DEGRADED_EACCES_2_1_304)
         .into_iter()
@@ -28,11 +24,6 @@ fn measured_with(mapped: &str) -> (Vec<String>, usize) {
     (r, at)
 }
 
-/// THE NOTICE AS CLAUDE CODE DRAWS IT (2.1.304, MEASURED): under the
-/// composer's bottom rule, over the mode row, two columns in, after the
-/// vendor's `⚠` and one space — read with its code, its message from the
-/// anchor on; the glyph's emoji form (U+FE0F after it) the same. The
-/// measured screen itself names `EACCES`, no full disk: not read.
 #[test]
 fn the_measured_notice_reads_after_the_vendors_glyph() {
     let measured = screen(TRANSCRIPT_DEGRADED_EACCES_2_1_304);
@@ -63,11 +54,6 @@ fn the_measured_notice_reads_after_the_vendors_glyph() {
     assert_eq!(disk_full(&emoji).map(|d| d.row), Some(at));
 }
 
-/// NEGATIVE CONTROLS, each the vendor's row, glyph and all, from the
-/// measured screen: typed as a draft into the composer, queued by a person
-/// under a running turn, behind any other text than the glyph alone (a
-/// label, a quote, a second glyph, a glyph with no space) — none is the
-/// notice. CONTROL: the row as drawn is.
 #[test]
 fn the_glyphs_row_anywhere_else_is_not_the_notice() {
     let (full, at) = measured_with("disk full — ENOSPC");
@@ -101,7 +87,6 @@ fn the_glyphs_row_anywhere_else_is_not_the_notice() {
     }
 }
 
-/// The notification as 2.1.302 composes it for `code`'s mapping.
 fn notice(mapped: &str) -> String {
     format!(
         "{}{mapped}) · recent messages may not be saved for resume",
@@ -109,8 +94,6 @@ fn notice(mapped: &str) -> String {
     )
 }
 
-/// A busy screen: a turn under way, its status row, then `live` rows in the
-/// live zone, then the composer with `draft` and the footer `footer`.
 fn busy(live: &[&str], draft: &str, footer: &str) -> Vec<String> {
     let mut r = rows(&[
         "⏺ Building the workspace.",
@@ -127,10 +110,6 @@ fn busy(live: &[&str], draft: &str, footer: &str) -> Vec<String> {
     r
 }
 
-/// THE NOTIFICATION IS READ WHERE CLAUDE CODE DRAWS ONE: right-aligned in
-/// the footer under the composer, alone on a footer row, and in the live zone
-/// between the status row and the composer; ENOSPC and EDQUOT each read with
-/// their code.
 #[test]
 fn the_notification_reads_under_the_composer_and_in_the_live_zone() {
     let full = notice("disk full — ENOSPC");
@@ -159,10 +138,6 @@ fn the_notification_reads_under_the_composer_and_in_the_live_zone() {
     assert_eq!(disk_full(&bare).map(|d| d.code), Some(Code::Enospc));
 }
 
-/// NEGATIVE CONTROLS, each the same words: a draft in the composer, a
-/// message a person queued in the live zone, a transcript row above the
-/// status row, a tool's `⎿` row quoting the notification — and the same
-/// notification for an error that is no full disk (EROFS, EACCES).
 #[test]
 fn the_same_words_anywhere_else_are_not_the_notice() {
     let full = notice("disk full — ENOSPC");
@@ -183,8 +158,6 @@ fn the_same_words_anywhere_else_are_not_the_notice() {
     assert_eq!(disk_full(&rows(&[&full])), None);
 }
 
-/// The measured 2.1.309 screen, the row its notice opens on, and how many
-/// rows the notice takes.
 fn measured_tool() -> (Vec<String>, usize, usize) {
     let r = screen(TOOL_DISK_FULL_2_1_309);
     let head = format!("{RESULT_BODY}{}", anchor_text("wall.disk_full.tool"));
@@ -199,7 +172,6 @@ fn measured_tool() -> (Vec<String>, usize, usize) {
     (r, at, rows)
 }
 
-/// The measured screen with its notice's rows replaced by `notice`'s.
 fn with_notice(notice: &[&str]) -> Vec<String> {
     let (mut r, at, rows) = measured_tool();
     r.splice(
@@ -209,12 +181,6 @@ fn with_notice(notice: &[&str]) -> Vec<String> {
     r
 }
 
-/// A FAILED COMMAND'S NOTICE AS CLAUDE CODE DRAWS IT (2.1.309, MEASURED):
-/// the first row of the command's output, five columns in, right under the
-/// vendor's `⎿  Error: Exit code 1` — not on the `⎿` row, so a reader of
-/// the `⎿` row alone never sees it. Read with ENOSPC; the inodes form the
-/// same; the quota form with EDQUOT; and the head builds before 2.1.309
-/// drew, in the same place.
 #[test]
 fn the_measured_tool_notice_reads_under_its_exit_row() {
     let (r, at, rows) = measured_tool();
@@ -269,8 +235,6 @@ fn the_measured_tool_notice_reads_under_its_exit_row() {
         disk_full(&old).map(|d| (d.code, d.row)),
         Some((Code::Enospc, at))
     );
-    // On the measured `⎿` row itself (its no-break space and all), as a
-    // result with no exit line would draw it.
     let mut on_glyph = with_notice(&[]);
     let glyph_row = on_glyph[at - 1].replacen("Error: Exit code 1", &before, 1);
     assert_ne!(glyph_row, on_glyph[at - 1]);
@@ -281,16 +245,6 @@ fn the_measured_tool_notice_reads_under_its_exit_row() {
     );
 }
 
-/// NEGATIVE CONTROLS, each the measured notice moved or cut: without its
-/// directory phrase; a later row of the command's output (a row between it
-/// and the `⎿` row); under a `⎿` row that is no failed command's exit line
-/// (a command that succeeded, whose output's SECOND line it then is; a
-/// first line wrapped onto it; an exit line with no code; a `⎿` with no
-/// white space after it); deeper than five columns (no head opens with
-/// white space); under a `⏺` row instead of a `⎿` row; as a `⏺` reply of
-/// the worker's; in an earlier turn (a person's message drawn since); its
-/// directory phrase only on a row under it that is no row of its result.
-/// CONTROL: the measured screen reads.
 #[test]
 fn the_tool_notice_anywhere_else_is_not_read() {
     let (r, at, rows) = measured_tool();
@@ -393,17 +347,6 @@ fn the_tool_notice_anywhere_else_is_not_read() {
     );
 }
 
-/// A NARROW PANE'S NOTICE READS ACROSS ITS WRAP: each of 2.1.309's four
-/// forms (the statfs form MEASURED; the inodes, quota and test-write forms
-/// the bundle's templates around the measured directory and tail),
-/// rewrapped as Ink wraps a result's text five columns in, reads with its
-/// code at every width down to a 40-column pane. CONTROL: the rewrap is
-/// the measured rows at 144 columns. At 60 columns the statfs form's
-/// directory phrase ends on its third row and at 40 the quota form's on
-/// its fifth, so a join of fewer rows than [`TOOL_NOTICE_ROWS`] misses
-/// them. NEGATIVE CONTROL: the phrase one row past [`TOOL_NOTICE_ROWS`]
-/// (a later line of the command's output) is not read; on the bound's last
-/// row, it is.
 #[test]
 fn a_narrow_panes_notice_reads_across_its_wrap() {
     let (r, at, rows) = measured_tool();
@@ -451,7 +394,6 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
             Code::Enospc,
         ),
     ];
-    // The row (from 0) a wrapped notice's directory phrase ends on.
     let phrase_ends = |wrapped: &[String]| {
         (0..wrapped.len())
             .find(|&k| wrapped[..=k].join(" ").contains(dir))
@@ -496,9 +438,6 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
     );
 }
 
-/// A TOOL'S ROW of the head builds before 2.1.309 drew is read as the
-/// vendor's `⎿` row at column two, its rest wrapped onto the rows under it;
-/// the same words opening a row of the worker's message are not.
 #[test]
 fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
     let tool = TOOL_HEAD_BEFORE_2_1_309;
@@ -537,8 +476,6 @@ fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
     assert_eq!(disk_full(&quota).map(|d| d.code), Some(Code::Edquot));
 }
 
-/// A GOAL THE VENDOR CLEARED ON A FULL DISK reads from its vendor row; the
-/// same words in the composer do not.
 #[test]
 fn a_goal_cleared_on_a_full_disk_reads_from_its_row() {
     let goal = format!(
@@ -552,9 +489,6 @@ fn a_goal_cleared_on_a_full_disk_reads_from_its_row() {
     assert_eq!(disk_full(&busy(&[], &goal, "  ? for shortcuts")), None);
 }
 
-/// The measured Bash error result (2.1.309, an auto-mode refusal): its
-/// screen, the `⎿` row the result opens on, and how many rows its message
-/// takes.
 fn measured_error() -> (Vec<String>, usize, usize) {
     let r = screen(TOOL_ERROR_AUTO_MODE_2_1_309);
     let at = r
@@ -568,12 +502,8 @@ fn measured_error() -> (Vec<String>, usize, usize) {
     (r, at, rows)
 }
 
-/// The directory 2.1.309's notices name on the measured build (its
-/// temporary directory, `/private/tmp/claude-` and a three-digit uid).
 const MEASURED_DIR: &str = "/private/tmp/claude-502";
 
-/// The words of 2.1.309's pre-start notice, from the bundle's template:
-/// `said` naming `code`, the measured directory, and the advice.
 fn pre_start_words(said: &str, code: &str) -> String {
     format!(
         "{}{said}{code}){}{MEASURED_DIR}{}{} {}",
@@ -585,15 +515,10 @@ fn pre_start_words(said: &str, code: &str) -> String {
     )
 }
 
-/// The pre-start notice of a disk with no space left.
 fn full_words() -> String {
     pre_start_words(anchor_text("wall.disk_full.pre_start_full"), "ENOSPC")
 }
 
-/// The measured error result's rows replaced by `text` behind `Error: `,
-/// wrapped as Claude Code wraps a result's message in a `cols`-column pane:
-/// the first row after the measured `⎿` and its white space, the rest five
-/// columns in.
 fn in_error_place(text: &str, cols: usize) -> Vec<String> {
     let (mut r, at, rows) = measured_error();
     let glyph = r[at][..r[at].find("Error: ").expect("the measured head")].to_string();
@@ -604,16 +529,6 @@ fn in_error_place(text: &str, cols: usize) -> Vec<String> {
     r
 }
 
-/// A CALL CLAUDE CODE DID NOT START (2.1.309): its pre-start notice is the
-/// call's error result, which Claude Code draws as it draws every Bash error
-/// result (MEASURED: an auto-mode refusal): on the vendor's `⎿` row after
-/// `Error: `, the rest wrapped exactly five columns in. The bundle's words,
-/// rewrapped as the measured message is, read there with their code (ENOSPC
-/// for the full form, EDQUOT for the quota form) at every width down to a
-/// 40-column pane, where the anchor's own row ends `started:`. CONTROL: the
-/// rewrap of the measured message is the
-/// vendor's, and the measured screen itself (the classifier's words) reads
-/// as no full disk.
 #[test]
 fn a_command_not_started_reads_in_the_place_of_its_error_result() {
     let (r, at, rows) = measured_error();
@@ -654,15 +569,6 @@ fn a_command_not_started_reads_in_the_place_of_its_error_result() {
     }
 }
 
-/// A PRINTED COPY READS ONLY WHERE ITS ROWS ARE A WORD WRAP'S: the bundle's
-/// words printed by a command, drawn in every pane from 40 to 220 columns,
-/// read as the notice exactly where each of their row breaks falls just
-/// after a space or inside the directory (rows a word wrap of the same
-/// words also draws, told apart only by the pane's wrap width) and nowhere
-/// else; the notice itself, word-wrapped into its error result's place,
-/// reads with its code at every one of those widths. CONTROL: the copy of
-/// the full form at 144 (the measured capture), 100, 120, 145, 165 and 200
-/// columns breaks a word or opens a row on a space, and does not read.
 #[test]
 fn a_printed_copy_reads_only_where_its_rows_are_a_word_wraps() {
     let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
@@ -696,12 +602,6 @@ fn a_printed_copy_reads_only_where_its_rows_are_a_word_wraps() {
     }
 }
 
-/// The rows of a command's printed output `line` as Claude Code 2.1.309
-/// draws them in a `cols`-column pane, in the place of the measured printed
-/// capture's: wrapped by column at `cols - 10` (MEASURED: the capture's
-/// 447-character line breaks every 134 characters at 144 columns, `tel|l`
-/// included), the first row on the vendor's `⎿` row, the rest five columns
-/// in, so a row that opens on a space sits six in.
 fn in_printed_place(line: &str, cols: usize) -> Vec<String> {
     let mut r = screen(TOOL_PRESTART_PRINTED_2_1_309);
     let at = r
@@ -727,19 +627,6 @@ fn in_printed_place(line: &str, cols: usize) -> Vec<String> {
     r
 }
 
-/// NEGATIVE CONTROLS, each the pre-start notice moved, cut or changed: a
-/// command's printed output of the same words (MEASURED: wrapped by column,
-/// a row six columns in and a word broken across rows; the line it prints
-/// is the bundle's words, which read in the error result's place); a row
-/// of the message one column deeper; the rows under the composer; the
-/// words on the `⎿` row with no `Error: `; as a failed command's output
-/// under its exit line, with or without `Error: `; without the directory
-/// phrase, or with no directory named; with another volume phrase, another account of what failed, or
-/// other advice; the full words with EDQUOT, the quota words with ENOSPC,
-/// another code, a code with more words in its parenthesis; the `⎿` one
-/// column deeper; a `⏺` reply of the worker's; in an earlier turn (a
-/// person's message drawn since). CONTROL: the notice in the measured
-/// place reads.
 #[test]
 fn the_pre_start_words_anywhere_else_are_not_read() {
     let words = full_words();

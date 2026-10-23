@@ -5,7 +5,8 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! The model engine: [`ty_model`], the [`derive`] types, the interpreter, [`verify`], and [`xref`].
+//! The model engine: [`ty_model`], the [`mod@derive`] types, the interpreter, [`verify`], and
+//! [`xref`].
 
 #![allow(
     clippy::disallowed_types,

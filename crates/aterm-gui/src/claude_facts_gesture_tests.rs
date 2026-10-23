@@ -15,7 +15,6 @@ use super::{Fact, FactHit, Target, UnderlineStyle};
 use crate::claude_footer::FactSide;
 use crate::{App, WindowId};
 
-/// Where the painter put `fact` this frame.
 fn fact_hit(app: &App, wid: WindowId, fact: Fact) -> FactHit {
     *app.windows[&wid]
         .claude_lights
@@ -25,7 +24,6 @@ fn fact_hit(app: &App, wid: WindowId, fact: Fact) -> FactHit {
         .unwrap_or_else(|| panic!("{fact:?} is on the glass"))
 }
 
-/// The glyphs on the glass under `hit`'s cells, blanks left out.
 fn glyphs(app: &App, wid: WindowId, hit: &FactHit) -> String {
     app.windows[&wid].input_scratch.cells[hit.frame_row][hit.cols.0..hit.cols.1]
         .iter()
@@ -34,8 +32,6 @@ fn glyphs(app: &App, wid: WindowId, hit: &FactHit) -> String {
         .collect()
 }
 
-/// A press and release of `button` at frame cell `cell`, the pointer moved
-/// there first.
 fn press_at(app: &mut App, wid: WindowId, cell: (usize, usize), button: MouseButton) {
     let (x, y) = px_of(app, wid, cell);
     app.on_cursor_moved(wid, x, y);
@@ -43,20 +39,17 @@ fn press_at(app: &mut App, wid: WindowId, cell: (usize, usize), button: MouseBut
     app.on_mouse_input(wid, ElementState::Released, button);
 }
 
-/// A left click on `fact` where the painter put it.
 fn click_fact(app: &mut App, wid: WindowId, fact: Fact) {
     let hit = fact_hit(app, wid, fact);
     press_at(app, wid, (hit.frame_row, hit.cols.0), MouseButton::Left);
 }
 
-/// The mask of `kinds`.
 fn mask(kinds: &[FactKind]) -> FactMask {
     kinds
         .iter()
         .fold(FactMask::default(), |m, k| m.with(*k, true))
 }
 
-/// The facts as the owner's [`publish_facts`] sets them, glyph for glyph.
 const SET: [(Fact, &str); 4] = [
     (Fact::Model, "\u{25C6}Opus5.5"),
     (Fact::Effort, "xhigh"),
@@ -64,9 +57,6 @@ const SET: [(Fact, &str); 4] = [
     (Fact::Branch, "\u{2387}main"),
 ];
 
-/// Claude Code's bottom block as [`draw_claude`] draws it, at the bottom of
-/// the session's terminal however many rows it has, its two rules in a gray
-/// of Claude's own (`gray`, a 256-colour index; `None`: the default ink).
 fn draw_bottom(app: &App, session: u64, mode: &str, gray: Option<u8>) {
     let term = app.pool.get(session).expect("session").term.clone();
     let (rows, cols) = {
@@ -86,19 +76,12 @@ fn draw_bottom(app: &App, session: u64, mode: &str, gray: Option<u8>) {
     feed(app, session, screen.as_bytes());
 }
 
-/// Publish `cwd` beside the session's facts, as the resolver does.
 fn publish_side(app: &App, session: u64, cwd: &str) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     timeline.set_claude_side(PGID, Some(Arc::new(FactSide::at(Some(cwd.into()), None))));
 }
 
-/// THE TARGETS ARE WHERE THE WRITE PUT THE FACTS: each fact's hit covers
-/// exactly its mark and its glyphs on the glass — with no chips' block, in
-/// the one edit at the rule's column; with one, in the tail edit past the
-/// rule's own glyphs (`claude_footer::FactWrite`). NEGATIVE CONTROL: a
-/// write the splice skips (a side channel under the facts' cells) records
-/// no fact, while the chips' own edit still records its chips.
 #[test]
 fn the_spans_land_on_the_written_tail_edit() {
     let (mut app, wid, session, _reader) = app();
@@ -150,13 +133,6 @@ fn the_spans_land_on_the_written_tail_edit() {
     assert_eq!(app.windows[&wid].claude_lights.fact_hits.len(), SET.len());
 }
 
-/// A LEFT CLICK HIDES, A CLICK ON `off` SHOWS AGAIN (owner, 2026-10-19:
-/// "if it is off, show greyed out text and say off … and likewise for
-/// model, effort, working directory, branch"): the branch reads `⎇ main
-/// off`, its name and its `off` in Claude's rule gray, not bold, and is a
-/// stub that shows the branch again; nothing reaches the PTY and no
-/// person's gesture is stamped. CONTROL: a click between two facts, and one on the rule's own
-/// glyphs, hide nothing.
 #[test]
 fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     let (mut app, wid, session, mut reader) = app();
@@ -230,8 +206,6 @@ fn a_click_on_the_branch_greys_it_off_and_a_click_on_off_brings_it_back() {
     assert!(pty(&mut reader, 0).is_empty());
 }
 
-/// The owner's facts ([`publish_facts`]) and the context fact read off
-/// Claude Code's indicator ([`plan_with_indicator`]), `◐ ctx 84% left`.
 fn publish_with_context(app: &App, session: u64) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -250,9 +224,6 @@ fn publish_with_context(app: &App, session: u64) {
     ));
 }
 
-/// The plan-mode row with Claude Code's own context indicator against its
-/// right edge (`84% until auto-compact`, as 2.1.305 draws it), `cols` wide:
-/// the reading the context fact follows, so the frame keeps it.
 fn plan_with_indicator(app: &App, session: u64) -> String {
     let term = app.pool.get(session).expect("session").term.clone();
     let cols = usize::from(crate::term_lock(&term).cols());
@@ -261,13 +232,6 @@ fn plan_with_indicator(app: &App, session: u64) -> String {
     format!("{PLAN}{}{end}", " ".repeat(pad))
 }
 
-/// THE CONTEXT FACT IS CLICKED AS THE OTHERS ARE (main's `◐ ctx` fact,
-/// clickable on the composed rule): a click on `◐ ctx 84% left` hides it
-/// behind `◐ ctx 84% left off`, its words and its `off` in Claude's rule gray, not
-/// bold, a stub that restores it; the stub's click shows it again. Nothing
-/// reaches the PTY.
-/// CONTROL: before the click the context's words are lifted from the gray,
-/// as a shown fact's are.
 #[test]
 fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() {
     let (mut app, wid, session, mut reader) = wide_app();
@@ -330,10 +294,6 @@ fn a_click_on_the_context_greys_it_off_and_a_click_on_its_stub_brings_it_back() 
     assert!(pty(&mut reader, 0).is_empty(), "nothing reached the PTY");
 }
 
-/// Each hideable fact hides by its own click and reads greyed with `off`
-/// after it — the model's `◆ Opus 5.5 off xhigh`, the effort's `◆ Opus 5.5
-/// xhigh off`, both `◆ Opus 5.5 off xhigh off` — and each stub's click shows
-/// its own fact again, the other still hidden.
 #[test]
 fn each_fact_hides_alone_and_each_stub_shows_its_own() {
     let (mut app, wid, session, mut reader) = app();
@@ -369,8 +329,6 @@ fn each_fact_hides_alone_and_each_stub_shows_its_own() {
     assert!(pty(&mut reader, 0).is_empty());
 }
 
-/// THE POINTER: a hand over a fact, and the fact the hover's; off it, over
-/// the rule's own glyphs, no hand and no hover.
 #[test]
 fn the_pointer_is_a_hand_over_a_fact_and_not_off_it() {
     let (mut app, wid, session, _reader) = app();
@@ -391,9 +349,6 @@ fn the_pointer_is_a_hand_over_a_fact_and_not_off_it() {
     assert_eq!(app.windows[&wid].claude_lights.hover, None);
 }
 
-/// A HOVER LIGHTS ITS FACT AND MOVES NONE: the row reads the same, every
-/// fact where it was; the hovered fact's glyphs underlined, the others not.
-/// With a block, the fact's title stands in the block's title slot.
 #[test]
 fn hovering_a_fact_moves_no_fact() {
     let (mut app, wid, session, _reader) = wider_app();
@@ -447,12 +402,6 @@ fn hovering_a_fact_moves_no_fact() {
     );
 }
 
-/// EVERY OTHER BUTTON ON A FACT IS THE FACT'S: with the program reporting
-/// the mouse, a middle and a right press on the branch send no report and
-/// hide nothing — the right press opens the branch's menu
-/// (`crate::fact_menu`), the middle one does nothing. CONTROL: the same
-/// middle press on the rule's own glyphs, no menu open, is reported to the
-/// program.
 #[test]
 fn any_other_button_on_a_fact_reaches_no_program() {
     let (mut app, wid, session, mut reader) = app();
@@ -479,9 +428,6 @@ fn any_other_button_on_a_fact_reaches_no_program() {
     );
 }
 
-/// A FACT UNDER A BAND IS NO TARGET: once the paste banner claims the
-/// footer's row, the fact the last paint recorded there is under no pixel,
-/// and a click saved from before the band hides nothing.
 #[test]
 fn a_fact_under_a_band_is_no_target() {
     use crate::input::{PasteFraming, Source};
@@ -520,9 +466,6 @@ fn a_fact_under_a_band_is_no_target() {
     assert_eq!(app.fact_mask(session), FactMask::default());
 }
 
-/// HIDDEN IS THE SESSION'S, IN EVERY VIEW OF IT: two panes showing the one
-/// session both read `⎇ main off` after a click in either, and both show the
-/// branch again after a click on either's stub.
 #[test]
 fn the_hidden_state_is_the_sessions_in_every_view_of_it() {
     let (mut app, wid, session, _reader) = wider_app();
@@ -586,11 +529,7 @@ fn the_hidden_state_is_the_sessions_in_every_view_of_it() {
     assert_eq!(off(&app), ["\u{2387}main", "\u{2387}main"], "shown in both");
 }
 
-/// THE KEYBOARD WALKS THE CHIPS, THEN THE FACTS (macOS: elsewhere the
-/// chord is `prev_tab`): Autopilot, the plan light, then each fact the
-/// glass shows left to right, and round; Escape lets go. NEGATIVE CONTROL:
-/// in a narrow pane the rule gives up the branch and the path, and the walk
-/// never selects a fact the glass does not show.
+/// THE KEYBOARD WALKS THE CHIPS.
 #[cfg(target_os = "macos")]
 #[test]
 fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
@@ -641,9 +580,7 @@ fn ctrl_shift_tab_walks_the_chips_then_the_facts_that_fit() {
     assert!(pty(&mut reader, 0).is_empty(), "the walk types nothing");
 }
 
-/// RETURN ON A SELECTED FACT IS ITS CLICK, AND SPACE TOO: the branch hides,
-/// nothing is typed and the selection lets go; the stub selected, Space
-/// shows it again. CONTROL: with nothing selected, Return is Claude's.
+/// RETURN ON A SELECTED FACT IS ITS CLICK.
 #[cfg(target_os = "macos")]
 #[test]
 fn return_on_a_selected_fact_is_its_click() {
@@ -678,9 +615,7 @@ fn return_on_a_selected_fact_is_its_click() {
     assert_eq!(pty(&mut reader, 1), b"\r", "CONTROL: Return is Claude's");
 }
 
-/// THE FACTS ARE BUTTONS NAMED IN WORDS: one node per fact on the glass,
-/// at its cells, named as a reader says it and what a press does.
-/// NEGATIVE CONTROL: a band over the row leaves no fact node.
+/// THE FACTS ARE BUTTONS NAMED IN WORDS.
 #[cfg(a11y_tree)]
 #[test]
 fn facts_are_buttons_named_in_words() {
@@ -739,8 +674,7 @@ fn facts_are_buttons_named_in_words() {
     );
 }
 
-/// A READER'S PRESS IS THE CLICK: the branch hides and shows again, and a
-/// press for a fact the glass no longer shows does nothing.
+/// A READER'S PRESS IS THE CLICK.
 #[cfg(a11y_tree)]
 #[test]
 fn a_reader_press_is_the_click() {

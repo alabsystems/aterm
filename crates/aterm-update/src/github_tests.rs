@@ -4,7 +4,6 @@
 use super::*;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`).
 fn b64(raw: &[u8]) -> String {
     aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")
 }
@@ -16,7 +15,6 @@ fn test_source() -> Source {
     }
 }
 
-/// [`observe_floor_and_withdraw_at`] with the roster read just now.
 fn observe_floor_and_withdraw(
     staging: &Staging,
     current_build: u64,
@@ -59,9 +57,6 @@ fn manifest_bytes(version: &str, build_number: u64, min_build: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Zip staging is preferred when the manifest carries a resolvable zip
-/// (`ditto` works in an orphaned post-handoff process where `hdiutil attach`
-/// cannot), falling back to the DMG when the zip is absent or unusable.
 #[test]
 fn stage_selection_prefers_the_zip_and_falls_back_to_the_dmg() {
     const VERSION: &str = "0.54.0";
@@ -134,9 +129,6 @@ fn write_bundle_identity(staging: &Staging, build: u64, commit: &str) {
     .unwrap();
 }
 
-/// [`container_sha256`] runs on a dedicated thread and answers within its bound
-/// as a passing refusal when `open(2)` blocks indefinitely (here on a reader-only
-/// FIFO), rather than holding the checker lane and `stage.lock`.
 #[test]
 fn the_container_hash_answers_within_its_bound() {
     let dir = Staging::scratch("hash-fifo");
@@ -173,9 +165,6 @@ fn the_container_hash_answers_within_its_bound() {
     assert!(crate::is_passing_refusal(&error), "{error}");
 }
 
-/// Inside a wake's grace (`AfterWakeScope`), a failed container download books
-/// `network` without starting a `pipeline` streak or clearing a standing `stage`
-/// streak.
 #[test]
 fn an_asset_fetch_that_fails_just_after_a_wake_books_network() {
     let manifest = candidate_manifest();
@@ -206,9 +195,6 @@ fn an_asset_fetch_that_fails_just_after_a_wake_books_network() {
     );
 }
 
-/// A manual check (`Asked::Person`) bypasses a moment-class re-download backoff
-/// (e.g. after freeing disk space), whereas scheduled checks (`Asked::Schedule`)
-/// honour it, and verdict backoffs or quarantines hold against both.
 #[test]
 fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
     let staging = Staging::scratch("full-disk-person");
@@ -258,9 +244,6 @@ fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// [`check_container_digest`] books a hash thread spawn failure or timeout as a
-/// moment (no release backoff) and an unreadable container or digest mismatch as
-/// a verdict.
 #[test]
 fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
     use crate::manifest::FailedMark;
@@ -337,9 +320,6 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// If a sibling check records a signer revocation, yank, or quarantine while a
-/// release is downloading, `end_failed_stage` ends the check as held (`Ok(None)`)
-/// rather than failed.
 #[test]
 fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     let manifest = Manifest {
@@ -389,9 +369,6 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Local write/space failures (free-space refusal before unpack, `ditto` running
-/// out of space mid-copy, `curl` write failure) are booked as moment-class
-/// `stage` failures rather than release verdicts or host `pipeline` failures.
 #[test]
 fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
     use crate::manifest::FailedMark;
@@ -492,9 +469,6 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
     let _ = std::fs::remove_dir_all(&volume.root);
 }
 
-/// A stale `stage.lock` stamp is booked as [`STOPPED_STAGE_HOLDER`] only when
-/// two consecutive checks that actually needed the lock read the same stamp; an
-/// intervening check that did not need the lock resets the streak.
 #[test]
 fn a_stale_stage_lock_reading_pairs_only_with_the_next_check_that_needs_the_lock() {
     let wait = std::time::Duration::from_millis(400);
@@ -532,9 +506,6 @@ fn a_stale_stage_lock_reading_pairs_only_with_the_next_check_that_needs_the_lock
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// When a running process's checker generation is retired by the watchdog while
-/// holding `stage.lock`, its lock heartbeat stops stamping and a waiting check
-/// books [`STOPPED_STAGE_HOLDER`] on the second stale reading.
 #[test]
 fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
     use crate::checker_watch::{CheckerPhase, CheckerWatch};
@@ -597,9 +568,6 @@ fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// A stage re-download backoff throttles re-staging the candidate, but still
-/// reports an already-staged bundle that is strictly newer than the running
-/// build as `applicable`.
 #[test]
 fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
     use crate::manifest::{FailedMark, RETRY_BACKOFF_SECS};
@@ -670,10 +638,6 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Every removal on the download path is keyed to the CURRENT artifact's name, and
-/// those names carry the version — so a `.part` (or a whole container abandoned
-/// between the finalize rename and the post-stage removal) for a version the channel
-/// has moved past is unreachable by every other code path.
 #[test]
 fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
     let staging = Staging::scratch("download-sweep");
@@ -711,16 +675,12 @@ fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
     sweep_download_scratch(&staging);
 }
 
-/// Obviously synthetic seeds, distinct from each other so a mix-up between the
-/// master and a machine key cannot pass by coincidence.
 const MASTER_SEED_FIXTURE: [u8; 32] = [0xA7; 32];
 const M3_SEED_FIXTURE: [u8; 32] = [0xB7; 32];
 const OTHER_MASTER_FIXTURE: [u8; 32] = [0xA8; 32];
 
-/// 2026-08-04T00:00:00Z.
 const ROSTER_NOW: i64 = 1_785_801_600;
 
-/// An appcast carrying the two attribution keys, signed by `machine`.
 fn attributed_manifest(machine_id: &str, roster_seq: u64) -> Vec<u8> {
     let mut text = String::from_utf8(manifest_bytes("0.10.0", 10, 0)).unwrap();
     text.push_str(&format!(
@@ -784,8 +744,6 @@ fn chain(
     }
 }
 
-/// Serve a [`Chain`]'s four assets by name, as the download host serves the derived
-/// tag-specific URLs [`web_release`] addresses.
 fn serve_chain(c: &Chain, url: &str) -> Result<Vec<u8>, String> {
     match url.rsplit('/').next().unwrap_or_default() {
         APPCAST_ASSET => Ok(c.manifest.clone()),
@@ -796,7 +754,6 @@ fn serve_chain(c: &Chain, url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Drive the real path over a [`Chain`] with an explicit master policy.
 fn run_chain(c: &Chain, masters: &[&str], floor_seq: u64, now_unix: i64) -> AuthoritativeFetch {
     fetch_authoritative_release(
         Some(web_release(&test_source(), WEB_TAG).unwrap()),
@@ -810,8 +767,6 @@ fn run_chain(c: &Chain, masters: &[&str], floor_seq: u64, now_unix: i64) -> Auth
     )
 }
 
-/// A signature that verifies under `m3`'s key while the manifest claims `m99`
-/// is refused after parsing.
 #[test]
 fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
     let lying = chain(
@@ -830,8 +785,6 @@ fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
     );
 }
 
-/// The authoritative appcast must be the tag's own release: a genuine, attributed
-/// appcast naming the tag's DMG under another version is refused.
 #[test]
 fn an_appcast_of_another_version_under_the_tag_is_refused() {
     let signed = |version: &str| {
@@ -867,10 +820,6 @@ fn an_appcast_of_another_version_under_the_tag_is_refused() {
     );
 }
 
-/// After the chain selected a release and before anything is staged, the check refuses
-/// one whose signed manifest names no container URL under the pointer's tag, and one
-/// whose signer this client's durable revocation set holds, though the roster in hand
-/// lists it.
 #[test]
 fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
     let bound = tag_url(WEB_TAG, "aterm-0.10.0.dmg");
@@ -906,9 +855,6 @@ fn a_selected_release_unbound_to_its_tag_or_durably_revoked_is_refused() {
     }
 }
 
-/// `observed_roster_seq` is reported when a roster passes `admit`, even when
-/// artifact authorization subsequently fails, and is `None` when the roster
-/// itself fails `admit`.
 #[test]
 fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
     let revoking = chain(
@@ -967,9 +913,6 @@ fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
     assert_eq!(accepted.observed_roster_seq, Some(9));
 }
 
-/// When `floor_refresh` is provided, admission consults the re-read floor so a
-/// roster generation superseded by a concurrent check during asset download is
-/// refused despite a stale pre-download `floor_seq` snapshot.
 #[test]
 fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
     let c = chain(
@@ -1008,9 +951,6 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
     assert!(unread.selected.is_none() && unread.manifest_rejected);
 }
 
-/// A marker written before the attribution fields existed names no machine. A
-/// revocation must LEAVE IT ALONE: "I cannot tell who signed this" is not evidence of
-/// withdrawal, and retiring on it would re-download on every check forever.
 #[test]
 fn a_revocation_leaves_an_unattributed_stage_alone() {
     let revoked = vec!["m11".to_string()];
@@ -1018,7 +958,6 @@ fn a_revocation_leaves_an_unattributed_stage_alone() {
     assert!(!revocation_withdraws_stage(&revoked, None));
 }
 
-/// A published stage of `build` signed by `machine`, as the stager leaves it.
 fn publish_attributed_stage(staging: &Staging, build: u64, machine: &str) {
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let ready = Ready {
@@ -1037,9 +976,6 @@ fn publish_attributed_stage(staging: &Staging, build: u64, machine: &str) {
     write_bundle_identity(staging, build, commit);
 }
 
-/// Revoking a machine key withdraws the `min_build` and `high_water` floors it
-/// set (and retires its staged bundle) so the next release from a trusted
-/// machine with a lower build number is not held back.
 #[test]
 fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_held() {
     let staging = Staging::scratch("floor-revocation");
@@ -1124,10 +1060,6 @@ fn a_revoked_machines_floors_are_withdrawn_so_the_next_genuine_release_is_not_he
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// `handoff_cached_pass_refusal_at` refuses a cached pre-verification pass when
-/// the staged bundle was retired, replaced by another build, or had its bundle
-/// directory removed, and returns a non-passing verdict when replaced by a
-/// different commit of the same build.
 #[test]
 fn a_cached_pass_does_not_hand_off_to_a_stage_the_check_retired() {
     let staging = Staging::scratch("cached-pass-retired");
@@ -1181,8 +1113,6 @@ fn a_cached_pass_does_not_hand_off_to_a_stage_the_check_retired() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// A stage of build 20 signed by `machine`, its roster authorization last
-/// confirmed at `confirmed` (unix seconds).
 fn publish_stage_confirmed_at(staging: &Staging, machine: &str, confirmed: u64) -> Ready {
     publish_attributed_stage(staging, 20, machine);
     let mut ready = Ready::read(&staging.ready).unwrap();
@@ -1191,10 +1121,6 @@ fn publish_stage_confirmed_at(staging: &Staging, machine: &str, confirmed: u64) 
     ready
 }
 
-/// When a staged bundle's `roster_confirmed_at` is older than
-/// `ROSTER_FRESHNESS_SECS`, `stage_owes_roster_reconfirmation` requests a roster
-/// re-read even on an unchanged head, and an admitted roster refreshes the
-/// confirmation timestamp.
 #[test]
 fn the_check_after_a_launch_confirms_a_stale_stage() {
     let now = crate::install::unix_now_secs();
@@ -1238,9 +1164,6 @@ fn the_check_after_a_launch_confirms_a_stale_stage() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// An unchanged pointer proceeds to re-judge the head when a newer staged bundle
-/// is past `ROSTER_RECONFIRM_AFTER_SECS`, and stays on the single-HEAD shortcut
-/// when confirmed within the window or not newer than the running build.
 #[test]
 fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -1281,12 +1204,6 @@ fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Tier-1 for `NativeUpdateRosterFreshness`. Every reachable
-/// state of the model with a stage on disk is laid out in a real staging root —
-/// build 20 by m11, its marker stamped at the state's confirmation tick (a tick
-/// is half the window of the real clock), the floor at the generation that
-/// authorized it; one root per distinct thing the real code reads — and the real
-/// code is asked.
 #[test]
 fn roster_freshness_conformance() {
     use aterm_spec::interp::State;
@@ -1462,9 +1379,6 @@ fn roster_freshness_conformance() {
     assert!(!model.check_invariant("NoSwapPastTheWindow", &swapped));
 }
 
-/// A stage withdrawn by the floor (`min_build` yank or signer revocation) is
-/// omitted from `applicable_stage`, `stage_backoff`, and `Ready::read_publishable`,
-/// and is retired from disk by `observe_floor_and_withdraw`.
 #[test]
 fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
     let staging = Staging::scratch("floor-withdraws-stage");
@@ -1548,10 +1462,6 @@ fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// When `observe_floor_and_withdraw` cannot read the floor back from disk, it
-/// returns a passing refusal rather than treating `min_build`, `high_water`, and
-/// `roster_seq` as zero, while still retiring a stage whose signer the current
-/// roster revokes.
 #[test]
 fn a_floor_the_check_could_not_read_back_ends_the_check_as_a_moment() {
     use std::os::unix::fs::PermissionsExt;
@@ -1650,10 +1560,6 @@ fn a_release_is_held_when_its_roster_generation_was_superseded_mid_check() {
     assert!(!roster_authority_superseded(None, u64::MAX));
 }
 
-/// A roster that fails verification under the pinned paper master keys carries
-/// [`STALE_ANCHOR_KEY`] and the reinstall remedy in
-/// [`AuthoritativeFetch::rejection_reason`], whereas publisher-side roster
-/// refusals (lapsed or rolled-back generation, unsupported schema) do not.
 #[test]
 fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
     let good = chain(
@@ -1719,9 +1625,6 @@ fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
     assert!(accepted.selected.is_some() && accepted.rejection_reason.is_none());
 }
 
-/// A downloaded signature that is not 64 bytes (e.g. an HTTP 200 proxy block
-/// page) is classified as a transport/delivery failure (`appcast_fetch_error`)
-/// rather than a stale-anchor or manifest verdict.
 #[test]
 fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anchor() {
     let base = chain(
@@ -1772,10 +1675,6 @@ fn a_signature_that_is_not_signature_shaped_is_a_delivery_fault_not_a_stale_anch
     );
 }
 
-/// The signed appcast may not claim a `roster_seq` newer than the roster that
-/// authorized it, but may claim an older generation (e.g. after a roster join
-/// re-dresses the head), advancing `observed_roster_seq` to the roster's
-/// generation.
 #[test]
 fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest() {
     let lying = chain(
@@ -1809,28 +1708,21 @@ fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest()
     assert_eq!(admitted.observed_roster_seq, Some(6));
 }
 
-/// The release the fixture channel's pointer names.
 const WEB_TAG: &str = "v0.10.0";
 
-/// The DERIVED tag-specific URL of `name` on the fixture channel.
 fn tag_url(tag: &str, name: &str) -> String {
     aterm_update_core::cdn::release_download_url("alabsystems", "aterm", tag, name).unwrap()
 }
 
-/// The DERIVED tag-specific URL prefix (`…/releases/download/<tag>/`) every GET of
-/// `tag` must carry.
 fn tag_prefix(tag: &str) -> String {
     let url = tag_url(tag, "x");
     url[..url.len() - 1].to_string()
 }
 
-/// The one evergreen URL a check is allowed to HEAD.
 fn evergreen_url() -> String {
     aterm_update_core::pointer::latest_download_url("alabsystems", "aterm", APPCAST_ASSET).unwrap()
 }
 
-/// GitHub's measured answer to the evergreen HEAD: a 302 whose `Location` is the
-/// tag-specific appcast URL of `tag`.
 fn redirect_to(tag: &str) -> Result<HeadAnswer, HttpError> {
     Ok(HeadAnswer {
         code: 302,
@@ -1838,9 +1730,6 @@ fn redirect_to(tag: &str) -> Result<HeadAnswer, HttpError> {
     })
 }
 
-/// The owner side of one release: a master-signed roster naming m3, and an
-/// appcast for [`WEB_TAG`] signed by m3 whose `url` field is `container_url` — the
-/// derived DMG URL by default, or whatever a test wants to bind against.
 struct WebChannel {
     master_pub: String,
     appcast: Vec<u8>,
@@ -1882,8 +1771,6 @@ fn web_channel(container_url: Option<&str>) -> WebChannel {
 }
 
 impl WebChannel {
-    /// The pinned-master policy every armed client runs, over `masters` (the
-    /// caller's `[channel.master_pub.as_str()]` — a borrow the policy outlives).
     fn policy<'a>(&self, masters: &'a [&'a str]) -> RosterPolicy<'a> {
         RosterPolicy {
             master_pubkeys: masters,
@@ -1893,8 +1780,6 @@ impl WebChannel {
         }
     }
 
-    /// Serve the four assets of [`WEB_TAG`] by their DERIVED URL — nothing else
-    /// exists, exactly like the real download host.
     fn serve(&self, url: &str) -> Result<Vec<u8>, String> {
         let base = tag_prefix(WEB_TAG);
         let Some(name) = url.strip_prefix(base.as_str()) else {
@@ -1910,11 +1795,8 @@ impl WebChannel {
     }
 }
 
-/// The build every fixture check runs as.
 const WEB_BUILD: u64 = 5;
 
-/// Run the check's acquisition against a pointer that answers `answer`, counting
-/// every HEAD it makes.
 fn acquire_web(
     staging: &Staging,
     known: Option<&str>,
@@ -1928,7 +1810,6 @@ fn acquire_web(
     acquire_web_from(staging, &test_source(), answer)
 }
 
-/// A ledger that authorized `tag` while running `build`, against `source`.
 fn write_ledger(staging: &Staging, tag: &str, build: u64, source: &str) {
     std::fs::write(
         &staging.status,
@@ -1941,7 +1822,6 @@ fn write_ledger(staging: &Staging, tag: &str, build: u64, source: &str) {
     .unwrap();
 }
 
-/// [`acquire_web`] over whatever ledger is on disk, as `source`.
 fn acquire_web_from(
     staging: &Staging,
     source: &Source,
@@ -1956,10 +1836,6 @@ fn acquire_web_from(
     (outcome, heads)
 }
 
-/// A check whose pointer has moved makes one HEAD to the evergreen URL plus four
-/// tag-specific GETs (appcast, appcast sig, roster, roster sig) with zero
-/// `api.github.com` requests, verifies the release through the roster chain, and
-/// binds the manifest's `url` to the pointer's tag.
 #[test]
 fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2040,9 +1916,6 @@ fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// When the status ledger names the pointer's tag for a newer release but the
-/// staged bundle on disk is missing, an unchanged pointer proceeds to re-fetch
-/// rather than reporting `UpToDate`.
 #[test]
 fn an_unchanged_web_head_refetches_a_release_whose_stage_is_lost() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2079,10 +1952,6 @@ fn an_unchanged_web_head_refetches_a_release_whose_stage_is_lost() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Every pointer failure path ends the check without an API request: 404 records
-/// a stranded state, 429/5xx defers without a health entry, and a refused
-/// redirect or transport error books a `network` failure without fetching from
-/// the refused location.
 #[test]
 fn every_web_lane_failure_path_ends_without_an_api_request() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2166,11 +2035,6 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Invariant (d): the pointer alone can never choose what is installed. The tag it
-/// names must equal `v` + the signed manifest's `version` (the `url` half is
-/// `the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else`):
-/// on the real fetch path, a pointer at v0.11.0 whose appcast says 0.10.0 is refused
-/// as a manifest defect, never staged, and every GET is addressed by the pointer's tag.
 #[test]
 fn the_pointers_tag_and_the_manifest_version_must_agree() {
     let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
@@ -2195,8 +2059,6 @@ fn the_pointers_tag_and_the_manifest_version_must_agree() {
     );
 }
 
-/// Invariant (c) on the download host: a roster that cannot be FETCHED refuses the
-/// release as a transport failure — there is nothing else a client could accept it on.
 #[test]
 fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {
     let source = test_source();
@@ -2243,10 +2105,6 @@ fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {
     assert!(fetched.asset_fetch_rate_limited);
 }
 
-/// The steady-state `UpToDate` shortcut applies only when the ledger recorded the
-/// pointer's tag under the running build and current source; a ledger written by
-/// another build or source, or cleared by `retire_published`, proceeds to
-/// re-judge the release.
 #[test]
 fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retirement() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2309,10 +2167,6 @@ fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retire
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// [`web_container_url_agrees`] accepts a container `url` under either the
-/// configured source or the compiled-in channel slug when the tag and DMG name
-/// match, and refuses any other host, slug, tag, container, query, or missing
-/// `url`.
 #[test]
 fn the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else() {
     let mirror = Source {
@@ -2360,9 +2214,6 @@ fn the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else()
     web_container_url_agrees(&mirror, tag, &with_url(None)).expect_err("no container `url`");
 }
 
-/// The published `v0.90.0` release fixtures (`tests/fixtures/v0.90.0`, signed by
-/// roster machine `m3`) verify under `pins::PAPER_MASTER_PUBKEYS` alone, and a
-/// single flipped appcast byte is refused.
 #[test]
 fn a_published_release_verifies_under_the_committed_master_alone() {
     const APPCAST: &[u8] = include_bytes!("../tests/fixtures/v0.90.0/aterm-appcast.toml");
@@ -2420,9 +2271,6 @@ fn a_published_release_verifies_under_the_committed_master_alone() {
     assert!(refused.selected.is_none() && refused.manifest_rejected);
 }
 
-/// A canonical tag whose appcast returns 404 is classified as `appcast_missing`
-/// and `record_head_without_app` leaves no authorized tag in the ledger so the
-/// next check re-reads the head.
 #[test]
 fn a_source_only_head_is_never_the_authorized_tag() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2449,9 +2297,6 @@ fn a_source_only_head_is_never_the_authorized_tag() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// When `latest` resolves to a non-app tag (e.g. `atpkg-index-44`), `acquire`
-/// makes only the single evergreen HEAD request, never probes older or newer
-/// tags, and preserves the previously authorized tag in the ledger.
 #[test]
 fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2497,10 +2342,6 @@ fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// `record_source_only_head` compares a source-only `latest` tag against the
-/// ledger's authorized tag for the same repository regardless of which local
-/// build is running, so two builds on the same machine agree on whether a head
-/// is in flight.
 #[test]
 fn every_build_calls_the_same_head_in_flight() {
     let _guard = crate::STRANDED_TEST_LOCK
@@ -2535,9 +2376,6 @@ fn every_build_calls_the_same_head_in_flight() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// The count the quick ladder keys on is the RECEIPT's, machine-wide: consecutive
-/// completed checks that found the same head in flight count up; a deferral, a
-/// check that found none and a different head each end the run.
 #[test]
 fn a_head_in_flight_is_counted_on_the_receipt_of_completed_checks_only() {
     let _guard = crate::STRANDED_TEST_LOCK

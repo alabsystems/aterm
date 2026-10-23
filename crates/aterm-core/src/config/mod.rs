@@ -23,8 +23,6 @@
 //!     println!("Changed: {:?}", change);
 //! }
 //! ```
-//! use aterm_core::config::TerminalConfig;
-//! use aterm_core::terminal::{CursorStyle, Terminal};
 
 mod types;
 

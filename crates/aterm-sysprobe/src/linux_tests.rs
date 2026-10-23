@@ -9,11 +9,8 @@ use crate::jobs::RunState;
 use crate::linux::{self, Root, ThrottleReader, TripKind, Zone};
 use crate::{Cap, CapSource, MemoryLevel, ThrottleLevel, Why};
 
-/// One process as the sweep tests compare it: pid, parent, name, CPU
-/// time and footprint.
 type Row<'a> = (u32, u32, &'a str, Option<u64>, Option<u64>);
 
-/// A scratch root holding `files` (`(path under the root, text)`).
 fn tree(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
     let root = aterm_tempfile::tempdir().expect("scratch root");
     for (rel, text) in files {
@@ -36,8 +33,6 @@ fn names(layout: &crate::CpuLayout) -> Vec<(&str, Vec<u16>)> {
         .collect()
 }
 
-/// An Alder Lake laptop (i7-1260P: 4 P-cores with SMT, 8 E-cores): the
-/// kernel's hybrid PMUs split the present cores, P first.
 #[test]
 fn a_hybrid_intel_laptop_is_split_by_its_pmus() {
     let root = tree(&[
@@ -58,10 +53,6 @@ fn a_hybrid_intel_laptop_is_split_by_its_pmus() {
     );
 }
 
-/// The same laptop with a core taken offline (`echo 0 > cpuN/online`): the
-/// PMUs list only online cores, so they partition the online ones, and each
-/// offline core keeps its place beside its nearest online neighbour, a P
-/// core among the P cores and an E core among the E cores.
 #[test]
 fn a_hybrid_laptop_with_an_offline_core_keeps_its_split() {
     let root = tree(&[
@@ -88,9 +79,6 @@ fn a_hybrid_laptop_with_an_offline_core_keeps_its_split() {
     assert_eq!(names(&one), [("CPU", present.clone())]);
 }
 
-/// ARM boards name no level; `cpu_capacity` ranks them. An RK3588 (four
-/// Cortex-A55 at 414, four A76 at 1024) reads two levels, fastest first; a
-/// phone SoC's three (160, 498, 1024) reads Performance, Mid, Efficiency.
 #[test]
 fn an_arm_board_is_split_by_cpu_capacity() {
     let mut files = vec![(
@@ -140,9 +128,6 @@ fn an_arm_board_is_split_by_cpu_capacity() {
     );
 }
 
-/// A DGX Spark's GB10 as its sysfs reads (2026-10-23): ten Cortex-X925 at
-/// 3.9 GHz whose `cpu_capacity` firmware spreads over 997, 1017 and 1024, and
-/// ten A725 at 2.8 GHz over 718 and 731, are two kinds, not five levels.
 #[test]
 fn a_gb10_is_two_kinds_however_its_capacities_spread() {
     let core = |id: u16| -> (u32, &str, &str) {
@@ -194,10 +179,6 @@ fn a_gb10_is_two_kinds_however_its_capacities_spread() {
     );
 }
 
-/// One design at two clocks is two kinds (a Dimensity 1200's Cortex-A78 at
-/// 3.0 and 2.6 GHz), a revision is not a design, and a core with no MIDR
-/// leaves every capacity as firmware gave it. NEGATIVE CONTROL: the GB10's
-/// capacities without their designs read five levels.
 #[test]
 fn a_design_is_its_part_at_its_clock() {
     let a78 = 0x411f_d410_u64;
@@ -235,9 +216,6 @@ fn a_design_is_its_part_at_its_clock() {
     );
 }
 
-/// A machine whose cores are alike is one `"CPU"` cluster. NEGATIVE
-/// CONTROLS: equal capacities; a capacity missing for one core; PMUs that
-/// overlap or leave a present core out; a single PMU.
 #[test]
 fn alike_cores_and_inconsistent_sources_are_one_cpu_cluster() {
     let present: Vec<u16> = (0..4).collect();
@@ -269,7 +247,6 @@ fn alike_cores_and_inconsistent_sources_are_one_cpu_cluster() {
     assert_eq!(layout.clusters[0].name, "CPU");
 }
 
-/// Present but offline cores are the ones the OS withdrew.
 #[test]
 fn offline_cores_are_withdrawn() {
     let root = tree(&[
@@ -290,8 +267,6 @@ some avg10=0.00 avg60=0.12 avg300=0.04 total=1234567
 full avg10=0.00 avg60=0.03 avg300=0.01 total=345678
 ";
 
-/// PSI's ten-second averages and the level they map to: warn at lmkd's 7 %
-/// partial stall, critical at systemd-oomd's 60 % full stall.
 #[test]
 fn psi_gives_its_averages_and_the_pressure_level() {
     let p = linux::psi(PSI_QUIET).expect("a PSI file");
@@ -340,9 +315,6 @@ CommitLimit:    24772604 kB
 Committed_AS:   18000000 kB
 ";
 
-/// The root's memory reading adds the PSI level, and a zswap that is off
-/// reads no compressed memory (its pool's keys say 0, which is not a
-/// measurement of a compressor that is not running).
 #[test]
 fn memory_reads_psi_and_drops_a_disabled_zswap() {
     let root = tree(&[
@@ -371,7 +343,6 @@ fn memory_reads_psi_and_drops_a_disabled_zswap() {
     assert_eq!(Root::new(tree(&[]).path()).memory_detail(), None);
 }
 
-/// cgroup v2's files. NEGATIVE CONTROLS: malformed texts and a zero period.
 #[test]
 fn cgroup_files_parse_into_limits() {
     assert_eq!(linux::cpu_max_millicores("max 100000\n"), Some(None));
@@ -395,8 +366,6 @@ fn cgroup_files_parse_into_limits() {
     assert_eq!(linux::cgroup_v2_path("0::relative\n"), None);
 }
 
-/// The capacity is the tightest limit on the cgroup's path: a 2-core quota
-/// on its slice and a 4 GiB memory limit two levels up.
 #[test]
 fn the_capacity_is_the_tightest_cgroup_limit_on_the_path() {
     let root = tree(&[
@@ -469,7 +438,6 @@ fn zone(temp_c: i64, trips: &[(TripKind, i64)]) -> Zone {
     }
 }
 
-/// The heuristic level from trip points and the throttle counters.
 #[test]
 fn the_throttle_level_reads_trip_points_and_counters() {
     use TripKind::{Critical, Hot, Passive};
@@ -500,9 +468,6 @@ fn the_throttle_level_reads_trip_points_and_counters() {
     assert_eq!(linux::trip_kind("active"), None, "fans are not throttling");
 }
 
-/// The reader on a laptop's tree: zones with trips (an active trip and a
-/// disabled 0 °C trip left out), and the counters, whose rise between two
-/// readings is a throttle.
 #[test]
 fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
     let root = tree(&[
@@ -592,11 +557,6 @@ fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
     );
 }
 
-/// The GPU from DRM sysfs, never waking a card or holding one awake. An
-/// awake amdgpu card answers its busy percent only where the read cannot
-/// move its runtime PM (forbidden `on`, runtime PM `unsupported`, or the
-/// boot display), and is then picked over an i915 iGPU that cannot answer;
-/// a hybrid laptop's awake dGPU (`auto`, not the boot display) is not read.
 #[test]
 fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     let root = tree(&[
@@ -722,9 +682,6 @@ fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     assert_eq!(crate::caps::gpu_cap(None), Cap::No(Why::Absent));
 }
 
-/// An NVIDIA card as this desk's DGX Spark shows it (GB10, driver 580): the
-/// proprietary driver's DRM device, its PCI slot, runtime PM `auto` on the
-/// boot display.
 fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
     tree(&[
         (
@@ -745,21 +702,15 @@ fn nvidia_card(control: &str, boot_vga: &str) -> aterm_tempfile::TempDir {
     ])
 }
 
-/// An NVIDIA arm that answers 42 % for the fixture's slot.
 fn nvml_42(slot: &str) -> Result<u8, Why> {
     assert_eq!(slot, "000f:01:00.0", "the card's PCI_SLOT_NAME");
     Ok(42)
 }
 
-/// An NVIDIA arm that must not be asked: asking would wake a sleeping card.
 fn nvml_never(slot: &str) -> Result<u8, Why> {
     panic!("NVML asked for {slot}, a card whose runtime PM a read could move");
 }
 
-/// A fixture NVIDIA card reads through its root's injected arm, by its PCI
-/// slot name, with the amdgpu card's power rule: only where the read
-/// cannot move runtime PM (the boot display, PM forbidden `on`, or PM
-/// `unsupported`).
 #[test]
 fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     let gpu = |root: &aterm_tempfile::TempDir, arm: linux::NvidiaBusy| {
@@ -877,8 +828,6 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     assert_eq!(linux::no_nvml("000f:01:00.0"), Err(Why::NotRead));
 }
 
-/// `status`'s anonymous memory, resident and swapped. NEGATIVE CONTROL: a
-/// kernel thread's status has no `RssAnon`.
 #[test]
 fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
     let status = "Name:\tclaude\nState:\tS (sleeping)\nPPid:\t4100\nVmRSS:\t  412000 kB\n\
@@ -893,12 +842,6 @@ fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
     assert_eq!(linux::status_footprint("Name:\tkthreadd\nPPid:\t0\n"), None);
 }
 
-/// One sweep of a fixture `/proc`: parents, names (a `comm` with spaces and
-/// parentheses), CPU time at the clock rate, memory from `status` with
-/// `statm` where it names no anonymous memory, none read for a kernel thread
-/// (`PF_KTHREAD`, whose `status` and `statm` are absent here), and what the
-/// stuck-process engine forms job units from (state, group, session
-/// leadership, a terminal, the owner).
 #[test]
 fn the_sweep_reads_a_fixture_proc() {
     let root = tree(&[
@@ -984,14 +927,16 @@ fn the_sweep_reads_a_fixture_proc() {
             (4400, RunState::Sleeping, true, false),
         ]
     );
-    assert!(sweep.procs.iter().all(|p| p.uid.is_some()), "{sweep:?}");
+    // The owner is the entry's uid, which only a Unix file system keeps.
+    assert_eq!(
+        sweep.procs.iter().all(|p| p.uid.is_some()),
+        cfg!(unix),
+        "{sweep:?}"
+    );
     assert!(!sweep.truncated);
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);
 }
 
-/// A user in thousands of supplementary groups has a `status` whose
-/// `Groups:` line pushes the memory lines past one stack buffer: the
-/// footprint still counts the swapped pages after it.
 #[test]
 fn a_long_groups_line_never_cuts_the_footprint() {
     let status = |groups: usize| {
@@ -1030,8 +975,6 @@ fn a_long_groups_line_never_cuts_the_footprint() {
     }
 }
 
-/// The capability report measured on two trees: a laptop with everything,
-/// and a stripped virtual machine where each row says why not.
 #[test]
 fn the_capability_report_says_what_each_tree_can_give() {
     let full = tree(&[
@@ -1106,8 +1049,6 @@ fn the_capability_report_says_what_each_tree_can_give() {
     }
 }
 
-/// The machine words: the first CPU's model (x86 `model name`, an ARM
-/// board's `Model`) and the OS's pretty name, unquoted.
 #[test]
 fn machine_words_are_the_first_cpu_model_and_the_os_pretty_name() {
     let cpuinfo = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU\n";

@@ -19,7 +19,7 @@ pub(crate) struct Pinned {
 }
 
 /// The pinned archives, one per platform this lane can run on.
-pub(crate) const PINNED: [Pinned; 3] = [
+pub(crate) const PINNED: [Pinned; 4] = [
     Pinned {
         platform: "mac-arm64",
         sha256: "7f111980bcb41e908d0fa3e969a625e7777ff683c1fc43fd7759d05ec3ffe52b",
@@ -34,6 +34,11 @@ pub(crate) const PINNED: [Pinned; 3] = [
         platform: "linux64",
         sha256: "a5d71b91aa996fef00517cd212b2dfb816b43055edefbe727e6fd562d4ae1f9c",
         bytes: 125_033_980,
+    },
+    Pinned {
+        platform: "linux-arm64",
+        sha256: "0c83c2520b513835c712590781adbdbcab4c14ca04d4809be5055ff2c8937a51",
+        bytes: 125_197_892,
     },
 ];
 
@@ -50,6 +55,7 @@ pub(crate) fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "aarch64") => Some("mac-arm64"),
         ("macos", "x86_64") => Some("mac-x64"),
         ("linux", "x86_64") => Some("linux64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
         _ => None,
     }
 }
@@ -194,7 +200,7 @@ pub(crate) fn pinned_product() -> String {
     format!("HeadlessChrome/{PIN_VERSION}")
 }
 
-/// The browser the wasm drivers run in ([`super::page`]), or why there is none:
+/// The browser the wasm drivers run in ([`mod@super::page`]), or why there is none:
 /// `ATERM_BROWSER` when it is set, else the pinned chrome-headless-shell exactly as
 /// `verify provision` placed it on this machine (its stamp admits the pin). Never an
 /// installed Chrome or a copy laid by hand: what the checks and the bench run in is the
@@ -326,7 +332,7 @@ mod tests {
         assert_eq!(platform_for("macos", "aarch64"), Some("mac-arm64"));
         assert_eq!(platform_for("macos", "x86_64"), Some("mac-x64"));
         assert_eq!(platform_for("linux", "x86_64"), Some("linux64"));
-        assert_eq!(platform_for("linux", "aarch64"), None);
+        assert_eq!(platform_for("linux", "aarch64"), Some("linux-arm64"));
         assert_eq!(platform_for("windows", "x86_64"), None);
         assert_eq!(
             archive_url("mac-arm64"),

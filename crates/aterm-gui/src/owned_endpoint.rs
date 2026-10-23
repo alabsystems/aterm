@@ -59,7 +59,8 @@ mod imp {
             reason = "dev_t and ino_t are narrower than u64 on some targets; widened as std widens them"
         )]
         pub(super) fn remove_if_still_ours(&self) -> bool {
-            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it.
+            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it; `self.path` is a
+            // live NUL-terminated string; `lstat`/`unlink` are async-signal-safe.
             unsafe {
                 let mut now: libc::stat = std::mem::zeroed();
                 if libc::lstat(self.path.as_ptr(), &mut now) != 0
@@ -83,7 +84,9 @@ mod imp {
         /// Unlink the alias iff it still points where this instance pointed it.
         pub(super) fn remove_if_still_ours(&self) -> bool {
             let mut buf = [0u8; 1024];
-            // SAFETY: `buf` is a live, writable stack buffer of the passed length.
+            // SAFETY: `buf` is a live, writable stack buffer of the passed length;
+            // `readlink`/`unlink`
+            // are async-signal-safe.
             unsafe {
                 let n = libc::readlink(self.link.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
                 let Ok(n) = usize::try_from(n) else {
@@ -207,7 +210,9 @@ mod imp {
                 reason = "a signal number is under 64"
             )]
             let byte = [sig as u8];
-            // SAFETY: `write(2)` of one byte from a live stack buffer to the pipe's write end.
+            // SAFETY: `write(2)` of one byte from a live stack buffer to the pipe's write end,
+            // which is
+            // never closed; async-signal-safe.
             if unsafe { libc::write(fd, byte.as_ptr().cast(), 1) } == 1 {
                 return;
             }
@@ -220,7 +225,9 @@ mod imp {
         if let Some(published) = PUBLISHED.get() {
             published.remove();
         }
-        // SAFETY: a zeroed `sigaction` with `SIG_DFL` restores the default action.
+        // SAFETY: a zeroed `sigaction` with `SIG_DFL` restores the default action;
+        // `sigaction`/`raise`
+        // are async-signal-safe.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
@@ -284,7 +291,8 @@ mod imp {
         }
     }
 
-    /// At the end of a quit: when a terminating signal asked for it ([`arm_orderly_quit`]).
+    /// At the end of a quit: when a terminating signal asked for it ([`arm_orderly_quit`]), die of
+    /// that signal now; else return.
     pub(crate) fn die_of_quit_signal() {
         let sig = QUIT_SIGNAL.load(Ordering::Acquire);
         if sig > 0 {
@@ -293,7 +301,8 @@ mod imp {
         }
     }
 
-    /// The graceful exit's removal ([`super`]) ([`publish`]).
+    /// The graceful exit's removal ([`super`]): what [`publish`] recorded, by the rule the
+    /// signal handler uses.
     pub(crate) fn release(_plan: &crate::control_auth::SocketPlan) {
         if let Some(published) = PUBLISHED.get() {
             published.remove();
@@ -318,7 +327,8 @@ mod imp {
     /// [`on_exit_signal`] for each of [`EXIT_SIGNALS`] whose disposition is still the default.
     fn install_exit_handlers() {
         for sig in EXIT_SIGNALS {
-            // SAFETY: both `sigaction` structs are zeroed POD.
+            // SAFETY: both `sigaction` structs are zeroed POD; the first call only reads the
+            // disposition, the second installs a valid `extern "C"` handler with an empty mask.
             unsafe {
                 let mut old: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(sig, std::ptr::null(), &mut old) != 0

@@ -45,8 +45,6 @@ fn meter(done: u64) -> Meter {
     }
 }
 
-/// A live update download: determinate, with an amount (an ETA slot where
-/// the width affords one).
 fn download(done: u64) -> Message {
     Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
         .meter(meter(done))
@@ -56,7 +54,6 @@ fn download(done: u64) -> Message {
         .key("update.progress")
 }
 
-/// A live row with no fraction: the comet.
 fn busy(title: &str) -> Message {
     Message::new(tags::PACKAGES, Severity::Info, title)
         .in_flight()
@@ -69,12 +66,6 @@ fn present(c: &MessageCenter, cols: usize) -> Presentation {
     c.presentation(cols, &char_width, None, Links::Painted)
 }
 
-/// What a frame DRAWS: the row's surface at its cells (the engine's
-/// cell-resolution reading, [`aterm_messages::Surface::cells`] — the
-/// fractions the host maps onto its window's pixels),
-/// its fill's EDGE to a sixteenth of a cell (the host rasters it to the
-/// pixel), the two time slots, the fade and the glyph —
-/// `RowMotion` without its `anim` descriptor.
 type Drawn = Vec<(
     Vec<Tone>,
     Option<u64>,
@@ -109,8 +100,6 @@ struct Audit {
     missed: Vec<String>,
 }
 
-/// Walk the host's loop from `from` to `to`, waking at each motion deadline: a frame before
-/// it that draws differently is missed, a wake that draws the same is wasted.
 fn audit(c: &MessageCenter, p: &Presentation, look: Look, from: Instant, to: Instant) -> Audit {
     let mut a = Audit::default();
     let mut t = from;
@@ -154,9 +143,6 @@ const FLAT_STILL: Look = Look {
 };
 const LOOKS: [Look; 4] = [Look::MOVING, Look::STILL, FLAT, FLAT_STILL];
 
-/// A download fed every 500 ms for 8 s (its ETA latches), then silent: the
-/// bytes stop at the returned instant and the stall is due `STALL_AFTER`
-/// later.
 fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
     let now = minted_now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
@@ -178,8 +164,6 @@ fn fed(start: u64) -> (MessageCenter, MessageId, Instant) {
     (c, id, t)
 }
 
-/// The comet at `cols` in `look` for 75 s, its elapsed words included: the
-/// frames it missed, after its cadence is held to the look's pace.
 fn comet_walk(cols: usize, look: Look) -> Vec<String> {
     let now = minted_now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
@@ -203,16 +187,6 @@ fn comet_walk(cols: usize, look: Look) -> Vec<String> {
         .collect()
 }
 
-/// No missed frame, in any look: the comet at three widths for 75 s (its
-/// elapsed words included), a download through its latched ETA, its glint
-/// and its stall where the width lays out the ETA slot, a data glide, and
-/// every echo kind for both fills — each walked frame by frame between its
-/// deadlines. A moving comet wakes on the grid exactly at the frames it
-/// draws something new — none missed, none wasted (a flat comet's hand-over
-/// sleeps through its blank frames, and the frames where a crossing's faint
-/// last sliver and the hand-over round to the same cells are skipped, not
-/// drawn twice); a still look wakes at most once a second, and a
-/// still echo asks no frame at all.
 #[test]
 fn deadlines_never_miss_a_change_the_motion_draws() {
     let comets: Vec<(usize, Look)> = [60usize, 80, 120]
@@ -285,11 +259,6 @@ fn deadlines_never_miss_a_change_the_motion_draws() {
     assert!(missed.is_empty(), "missed frames:\n{}", missed.join("\n"));
 }
 
-/// A bar wakes only for a frame that draws something new (the glint's
-/// centre off a short fill at either end of its travel, or glides inside
-/// one eighth of a cell): a download at short and long fills
-/// and two widths, and a data glide of half a per-mille, waste no wake in the
-/// moving look — and still miss none.
 #[test]
 fn a_bar_never_wakes_for_a_frame_that_draws_nothing_new() {
     for start in [1_000_000u64, 7_400_000, 40_000_000] {
@@ -321,10 +290,6 @@ fn a_bar_never_wakes_for_a_frame_that_draws_nothing_new() {
     }
 }
 
-/// Where the width starves the ETA slot (52 columns here, over the
-/// full-width meter), the stall's tone change (`Tone::STALLED`) is the only
-/// stall signal left on the row, so `motion_deadline` must schedule a wake
-/// for it in both `Look::STILL` and `Look::MOVING`, regardless of bar length.
 #[test]
 fn a_stall_repaints_the_bar_even_where_the_eta_slot_starved() {
     let mut missed = Vec::new();
@@ -349,8 +314,6 @@ fn a_stall_repaints_the_bar_even_where_the_eta_slot_starved() {
     assert!(missed.is_empty(), "missed:\n{}", missed.join("\n"));
 }
 
-/// A deterministic stream of readings from a small LCG: gaps of 50 ms–4 s,
-/// advances of 0–3 MB, the odd regression and change of total.
 fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
     let mut x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
     let mut next = move || {
@@ -386,13 +349,6 @@ fn stream(seed: u64, n: usize) -> Vec<(u64, Amount)> {
     out
 }
 
-/// Over 64 random streams (bytes and steps; bursts, droughts, regressions, a
-/// growing total), an ETA number appears only after at least five readings
-/// spanning at least five seconds since the estimator last started over
-/// (three samples for the first secant over `RATE_MIN_SPAN`, then three
-/// agreeing projections over `STABLE_MIN`); it is at most 48 h; its words are
-/// `<5 s left` or `N … left` — no `~`, since `left` already says it is an
-/// estimate — never zero; and between two readings it never grows.
 #[test]
 fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     for seed in 0..64u64 {
@@ -438,10 +394,6 @@ fn the_eta_never_speaks_from_too_little_and_never_goes_negative_or_absurd() {
     }
 }
 
-/// Once the latched completion instant is overdue by more than its grace
-/// window with no further advance, `eta()` unlatches (`Hidden`) for work
-/// counted in `Unit::Steps` or `Unit::Items` rather than continuing to
-/// report `<5 s left` indefinitely.
 #[test]
 fn an_overdue_eta_stops_promising_under_five_seconds() {
     for unit in [Unit::Steps, Unit::Items] {
@@ -475,10 +427,6 @@ fn an_overdue_eta_stops_promising_under_five_seconds() {
     }
 }
 
-/// The elapsed clock and its deadline agree to the frame, from the first
-/// word at `ELAPSED_AFTER`, in the still look — an unfocused window's only
-/// wake: no missed tick, no wasted one, the first exactly on the grid step
-/// at `ELAPSED_AFTER`.
 #[test]
 fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
     let now = minted_now();
@@ -493,9 +441,6 @@ fn the_elapsed_clock_ticks_exactly_on_its_deadlines() {
     assert!(first >= now + ELAPSED_AFTER && first < now + ELAPSED_AFTER + ANIM_FRAME);
 }
 
-/// A same-activity supersede by key preserves the activity's started-at
-/// instant so the elapsed readout continues counting from the original post
-/// rather than resetting.
 #[test]
 fn the_elapsed_clock_survives_a_same_activity_supersede() {
     let now = minted_now();
@@ -539,11 +484,6 @@ fn the_elapsed_clock_survives_a_same_activity_supersede() {
     );
 }
 
-/// A fault echo's hold asks no frame: a bar's
-/// warn wash stands still from `ECHO_FAULT_CROSS` to `ECHO_FAULT_FLASH`, a
-/// busy row's drain from `ECHO_DRAIN` — no display frame there draws
-/// anything new, so none wakes; the fade's first frame is the next wake, and
-/// nothing is missed.
 #[test]
 fn a_fault_echo_never_wakes_through_its_hold() {
     for indeterminate in [false, true] {

@@ -1022,6 +1022,9 @@ pub(crate) struct CoalProbe {
     pub(crate) births: fn() -> Option<Births>,
     /// A process's image and signature ([`aterm_sysprobe::identity::identity`]).
     pub(crate) identity: fn(u32) -> Option<aterm_sysprobe::identity::Identity>,
+    /// A process's pid version ([`pid_version`]), which an exec moves: what
+    /// a lead's identity is kept under between split ticks.
+    pub(crate) version: fn(u32) -> Option<i32>,
     /// The machine's timeline ([`aterm_sysprobe::timeline::timeline`]).
     pub(crate) timeline: fn() -> Option<aterm_sysprobe::timeline::Timeline>,
     /// When the machine last woke ([`aterm_sysprobe::timeline::waketime_ms`]).
@@ -1044,6 +1047,7 @@ impl CoalProbe {
             )
         },
         identity: aterm_sysprobe::identity::identity,
+        version: pid_version,
         timeline: aterm_sysprobe::timeline::timeline,
         waketime_ms: aterm_sysprobe::timeline::waketime_ms,
     };
@@ -1056,9 +1060,25 @@ impl CoalProbe {
         birth: |_| None,
         births: || None,
         identity: |_| None,
+        version: |_| None,
         timeline: || None,
         waketime_ms: || None,
     };
+}
+
+/// `pid`'s pid version (`p_idversion`, `PROC_PIDUNIQIDENTIFIERINFO`, which
+/// any process may read of any other): an exec moves it while the pid, the
+/// birth and often the short name stay. `None` off macOS.
+fn pid_version(pid: u32) -> Option<i32> {
+    #[cfg(target_vendor = "apple")]
+    {
+        aterm_uds::process::uniq_identifier(i32::try_from(pid).ok()?).map(|i| i.p_idversion)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Threshold above which a split tick reads the whole process table for births.
@@ -1091,6 +1111,15 @@ struct Birth {
     ms: i64,
 }
 
+/// A lead's identity as read, and the birth and pid version it was read
+/// under.
+#[derive(Clone, Debug)]
+struct Ident {
+    birth: i64,
+    version: i32,
+    id: aterm_sysprobe::identity::Identity,
+}
+
 /// The split set's host reader and cached process births/timeline.
 pub(crate) struct SplitReader {
     probe: CoalProbe,
@@ -1099,6 +1128,9 @@ pub(crate) struct SplitReader {
     armed: &'static Arming,
     last: Option<Instant>,
     births: HashMap<u32, Birth>,
+    /// Each lead's identity by pid, kept while it leads and its birth and
+    /// pid version stay ([`Self::identity`]).
+    idents: HashMap<u32, Ident>,
     wake_seen: Option<Option<i64>>,
     timeline: Option<TimelineSample>,
 }
@@ -1132,6 +1164,7 @@ impl SplitReader {
             armed,
             last: None,
             births: HashMap::new(),
+            idents: HashMap::new(),
             wake_seen: None,
             timeline: None,
         }
@@ -1163,6 +1196,7 @@ impl SplitReader {
             .is_some_and(|t| now.saturating_duration_since(t) > SPLIT_WINDOW_MAX)
         {
             self.births.clear();
+            self.idents.clear();
         }
         let swept: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
         self.births.retain(|pid, _| swept.contains(pid));
@@ -1187,18 +1221,61 @@ impl SplitReader {
             .iter()
             .filter_map(|p| Some((p.pid, p.coalition?, p.birth_ms?)))
             .collect();
+        let mut kept = HashMap::new();
         for (_, pid) in aterm_vitals::explain::leads(&members) {
             let Some(&birth) = born.get(&pid) else {
                 continue;
             };
-            let id = (self.probe.identity)(pid).unwrap_or_default();
+            let id = self.identity(pid, birth, &mut kept);
             sample
                 .leads
                 .push(lead_identity(pid, birth, id, self.vouches));
         }
+        self.idents = kept;
         sample.coalitions = Some(coal_sample(read));
         sample.timeline = self.timeline();
         self.last = Some(now);
+    }
+
+    /// Lead `pid`'s identity (born at `birth`), kept into `kept`: the one
+    /// read under its pid version now, read again only once an exec moved
+    /// that version or the birth moved. A read an exec raced (the version
+    /// moved across it) and a read that missed are unknown and kept for no
+    /// later tick; with no version read, it is read at every split tick.
+    fn identity(
+        &mut self,
+        pid: u32,
+        birth: i64,
+        kept: &mut HashMap<u32, Ident>,
+    ) -> aterm_sysprobe::identity::Identity {
+        let version = (self.probe.version)(pid);
+        if let Some(k) = self
+            .idents
+            .remove(&pid)
+            .filter(|k| k.birth == birth && Some(k.version) == version)
+        {
+            let id = k.id.clone();
+            kept.insert(pid, k);
+            return id;
+        }
+        let Some(id) = (self.probe.identity)(pid) else {
+            return aterm_sysprobe::identity::Identity::default();
+        };
+        match version {
+            None => id,
+            Some(v) if (self.probe.version)(pid) == Some(v) => {
+                kept.insert(
+                    pid,
+                    Ident {
+                        birth,
+                        version: v,
+                        id: id.clone(),
+                    },
+                );
+                id
+            }
+            Some(_) => aterm_sysprobe::identity::Identity::default(),
+        }
     }
 
     fn known(&self, p: &ProcSample) -> Option<i64> {
@@ -1309,9 +1386,14 @@ pub(crate) enum WhyFixture {}
 impl WhyFixture {
     fn from_seam() -> Option<Self> {
         let named = aterm_types::dev_seam!(WHY_FIXTURE_SEAM)?;
+        let calm = aterm_vitals::explain::fixtures::calm_1510();
         let scene = match named.to_str()? {
-            "spotlight" => aterm_vitals::explain::fixtures::spotlight_1032(),
-            "calm" => aterm_vitals::explain::fixtures::calm_1510(),
+            "spotlight" => aterm_vitals::explain::fixtures::Scene {
+                mem: calm.mem,
+                thermal: calm.thermal,
+                ..aterm_vitals::explain::fixtures::spotlight_1032()
+            },
+            "calm" => calm,
             other => {
                 aterm_log::warn!("system vitals: {WHY_FIXTURE_SEAM}={other} names no scene");
                 return None;
@@ -1333,8 +1415,14 @@ impl WhyFixture {
         )
     }
 
+    /// The scene's reading `at_ms` in, over the machine's `live` one: its
+    /// tabs are the machine's tabs in order (the live tab's keys and label,
+    /// the scene's shell), so a caller in a live tab reads the scene's tab.
     fn at(&self, live: &Sample, split: bool, at_ms: u64) -> Sample {
-        let scene = self.scene.reading(at_ms, split);
+        let mut scene = self.scene.reading(at_ms, split);
+        for (t, l) in scene.tabs.iter_mut().zip(&live.tabs) {
+            (t.key, t.tab, t.label) = (l.key, l.tab, l.label.clone());
+        }
         let cores = scene.cores.as_ref().map_or(0, Vec::len);
         Sample {
             clusters: vec![ClusterSpec {
@@ -1838,7 +1926,7 @@ fn home_volume(
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn local_volume(
     path: &Path,
     table: &aterm_sysprobe::volumes::Table,

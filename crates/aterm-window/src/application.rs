@@ -20,7 +20,8 @@ pub trait ApplicationHandler<T: 'static = ()> {
     /// Emitted when the application has been resumed.
     fn resumed(&mut self, event_loop: &ActiveEventLoop);
 
-    /// Emitted when an event is sent from [`EventLoopProxy::send_event`].
+    /// Emitted when an event is sent from
+    /// [`EventLoopProxy::send_event`](crate::event_loop::EventLoopProxy::send_event).
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: T) {
         let _ = (event_loop, event);
     }

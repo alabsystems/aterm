@@ -6,8 +6,7 @@ use std::collections::HashMap;
 
 use super::pill::{Pill, PillAct, PillKind};
 use super::{
-    Facts, Host, Level, NeedSeverity, Rim, Slot, StopCause, StoryVerb, View, pill_due, pill_text,
-    pill_words,
+    Facts, Host, Level, NeedSeverity, Rim, Slot, StopCause, View, pill_due, pill_text, pill_words,
 };
 use crate::Instant;
 
@@ -57,11 +56,11 @@ impl<V: Host> Table<V> {
     }
 
     /// One told point on `session`'s slot (minted at `now` if none): its seq.
-    fn tell(&mut self, session: u64, verb: StoryVerb, now: Instant) -> u64 {
+    fn tell(&mut self, session: u64, now: Instant) -> u64 {
         self.slots
             .entry(session)
             .or_insert_with(|| Slot::new(now))
-            .tell(verb, now)
+            .tell()
     }
 
     /// The sessions whose cooperative lease has lapsed by `now`.
@@ -457,14 +456,15 @@ pub fn human_acted<D: Desk>(d: &mut D, w: D::Win) {
     }
 }
 
-/// Records a told story verb for `session` and returns its sequence number.
-pub fn tell<D: Desk>(d: &mut D, session: u64, verb: StoryVerb) -> Option<u64> {
+/// Records a told story point for `session` (`ctl story <verb>`, whose word
+/// is the host's log mark) and returns its sequence number.
+pub fn tell<D: Desk>(d: &mut D, session: u64) -> Option<u64> {
     if !d.holds_session(session) {
         return None;
     }
     refresh_session(d, session);
     let now = d.clock();
-    Some(d.table_mut().tell(session, verb, now))
+    Some(d.table_mut().tell(session, now))
 }
 
 /// Returns the earliest timer deadline across visible pills, leases, supervisors, and the herald.

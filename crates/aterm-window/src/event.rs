@@ -5,6 +5,8 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! The [`Event`] enum and supporting types for [`EventLoop::run_app`].
+//!
+//! [`EventLoop::run_app`]: crate::event_loop::EventLoop::run_app
 use std::path::PathBuf;
 use std::sync::{Mutex, Weak};
 use std::time::Instant;
@@ -230,6 +232,9 @@ pub struct KeyEvent {
         allow(rustdoc::broken_intra_doc_links)
     )]
     /// Logical key value affected by all modifiers except Ctrl (see [`key_without_modifiers`]).
+    ///
+    /// [`key_without_modifiers`]:
+    /// crate::platform::modifier_supplement::KeyEventExtModifierSupplement::key_without_modifiers
     pub logical_key: keyboard::Key,
 
     /// Text produced by this keypress, or `None` if non-printable.

@@ -149,7 +149,6 @@ impl Tag {
     pub(crate) const MAX_LEN: usize = 24;
 
     /// Validate a wire word into a tag.
-    ///
     /// # Errors
     /// [`TagError`] names the first reason the word is not a tag.
     pub(crate) fn try_new(s: &str) -> Result<Self, TagError> {
@@ -175,7 +174,6 @@ impl Tag {
         &self.0
     }
 
-    /// A vocabulary constant; validated by the closed-set test.
     const fn word(s: &'static str) -> Self {
         Self(Cow::Borrowed(s))
     }
@@ -234,20 +232,9 @@ pub struct Glyph(char);
 impl Glyph {
     /// The admitted glyphs.
     pub const ALLOWED: &'static [char] = &[
-        '\u{2139}', // ℹ
-        '\u{2713}', // ✓
-        '\u{26a0}', // ⚠
-        '\u{2715}', // ✕
-        '\u{21e3}', // ⇣
-        '\u{21bb}', // ↻
-        '\u{2191}', // ↑
-        '\u{23f8}', // ⏸
-        '\u{2726}', // ✦
-        '!', '\u{2026}', // …
-        '\u{2296}', // ⊖ a removal in flight
+        '\u{2139}', '\u{2713}', '\u{26a0}', '\u{2715}', '\u{21e3}', '\u{21bb}', '\u{2191}',
+        '\u{23f8}', '\u{2726}', '!', '\u{2026}', '\u{2296}',
     ];
-    /// Retired glyphs and what they read back as, for a record an older build logged or
-    /// carried (`·` was the removal's lead glyph).
     const RETIRED: &'static [(char, char)] = &[('\u{00b7}', '\u{2296}')];
     /// What stands in for a glyph outside the set.
     pub const FALLBACK: Glyph = Glyph('!');
@@ -405,13 +392,10 @@ pub enum Intent {
     },
     /// Close every tab whose shell the PTY keeper held through the last run's crash.
     EndRecovered,
-    /// Open System State with its review set for the vault sync: a navigation beside the vault
-    /// lines' step, so a press never answers them.
+    /// Open System State with its review set for the vault sync.
     ReviewVaultSync,
 }
 
-/// `Show tab N` for tabs 1–9, the only numbers a tab strip shows by number
-/// (labels are static: the reader and the capsule share one table).
 const SHOW_TAB: [&str; 10] = [
     "Show tab",
     "Show tab 1",
@@ -425,7 +409,6 @@ const SHOW_TAB: [&str; 10] = [
     "Show tab 9",
 ];
 
-/// The short form: `Tab N`.
 const TAB_N: [&str; 10] = [
     "Tab", "Tab 1", "Tab 2", "Tab 3", "Tab 4", "Tab 5", "Tab 6", "Tab 7", "Tab 8", "Tab 9",
 ];
@@ -696,8 +679,6 @@ impl Intent {
     }
 }
 
-/// [`escape_payload`] with the codec's own separator escaped too: a field
-/// between two `:`s.
 fn escape_field(s: &str) -> String {
     escape_payload(s).replace(':', "%3A")
 }
@@ -801,8 +782,6 @@ pub(crate) fn every_intent() -> Vec<Intent> {
     ]
 }
 
-/// `%` and every control character as `%XX`, so a payload can never carry
-/// the codec's separators; everything else verbatim (a path stays readable).
 fn escape_payload(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
@@ -821,7 +800,6 @@ fn escape_payload(s: &str) -> String {
     out
 }
 
-/// The inverse of [`escape_payload`]; a malformed `%` passes through.
 fn unescape_payload(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -939,8 +917,6 @@ impl Hold {
     }
 }
 
-/// What the engine's own tests, and a host's tests, build bare persistent
-/// rows from.
 #[cfg(any(test, debug_assertions))]
 impl Hold {
     /// A standing hold.
@@ -1026,8 +1002,6 @@ impl Meter {
     }
 }
 
-/// The fill span a whole-number count in the stats' first clause allows: `3 of 4 tabs` →
-/// `(750, 1000)`, `(A/B, (A+1)/B)` in permille, the whole bar once the count is complete.
 fn count_span(stats: &str) -> Option<(u16, u16)> {
     let (done, total) = count_of(stats)?;
     let at = |n: u64| {
@@ -1037,7 +1011,6 @@ fn count_span(stats: &str) -> Option<(u16, u16)> {
     Some((at(done), at(done + 1)))
 }
 
-/// `(A, B)` of a whole-number count `A of B unit` in the stats' first clause.
 fn count_of(stats: &str) -> Option<(u64, u64)> {
     let clause = stats.split(crate::PIECE_SEP).next()?.trim();
     let mut words = clause.split(' ');
@@ -1057,8 +1030,7 @@ fn count_of(stats: &str) -> Option<(u64, u64)> {
 /// The continuous quantity behind a determinate fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Amount {
-    /// Which run of work this is: [`Amount::series_of`] the deliverable's
-    /// label, so a new download is a new series.
+    /// Which run of work this is: [`Amount::series_of`] the deliverable's label.
     pub series: u64,
     /// How much is done.
     pub done: u64,
@@ -1435,10 +1407,6 @@ impl Message {
             .is_some_and(|m| m.fill_permille.is_some() || m.busy)
     }
 
-    /// The reason and the action as the first two detail lines, so the band's excerpt is
-    /// the reason and Details opens on the action, but only for a message that brought no
-    /// detail of its own: a builder that wrote its lines (`gpu_lost`, the screen-reader
-    /// row) wrote them to be read in that order.
     fn lead_with(&mut self, why: &str, then: &str) {
         if !self.detail.is_empty() {
             return;
@@ -1520,8 +1488,6 @@ impl Message {
         }
     }
 
-    /// `true` when the message has capsules and every one of them declines
-    /// ([`Intent::is_snooze`]): they fix nothing.
     fn declines_only(&self) -> bool {
         !self.actions.is_empty() && self.actions.iter().all(Intent::is_snooze)
     }
@@ -1577,8 +1543,7 @@ impl Message {
         self.finished_words().unwrap_or_else(|| self.title.clone())
     }
 
-    /// The row's words in the past tense, when there are any: the declared finished words,
-    /// else the title's participle read finished.
+    /// The row's words in the past tense, when there are any.
     #[must_use]
     pub fn finished_words(&self) -> Option<String> {
         match &self.finished {
@@ -1751,8 +1716,6 @@ impl Restatement {
 mod tests {
     use super::*;
 
-    /// The tag vocabulary is closed and every word in it is a tag; the glyph set admits
-    /// the band's glyphs and nothing else.
     #[test]
     fn tags_and_glyphs_are_closed_sets() {
         for tag in tags::ALL {
@@ -1781,10 +1744,6 @@ mod tests {
         assert!(Severity::Info > Severity::Success);
     }
 
-    /// Invariant 23: one label table. Every variant has a non-empty label
-    /// ≤ 16 chars and a short ≤ 8 (the width law's budget); only `NotNow`
-    /// closes its row or asks; a consequential press (the Primary chip,
-    /// ruling 18) never closes its row and is never a decline (ruling 403).
     #[test]
     fn labels_are_one_table() {
         for intent in every_intent() {
@@ -1837,7 +1796,6 @@ mod tests {
         );
     }
 
-    /// Every intent round-trips its encoding; junk decodes to `None`.
     #[test]
     fn intents_round_trip_and_junk_is_dropped() {
         for intent in every_intent() {
@@ -1909,9 +1867,6 @@ mod tests {
         assert_eq!(Hold::decode("for:x"), None);
     }
 
-    /// `Open in browser` round-trips a web page's address, and the decoder drops every
-    /// address the wire's `url=` would refuse: a log line or a carry is text, and the
-    /// button opens what it names.
     #[test]
     fn an_open_link_decodes_only_an_https_page() {
         for url in [
@@ -1967,8 +1922,6 @@ mod tests {
         assert!(!link.is_consequential() && !link.is_snooze() && !link.ends_with_row());
     }
 
-    /// A busy meter never carries a fill (`normalized` clears the flag where one arrives),
-    /// and its stats are clipped like any meter's.
     #[test]
     fn a_busy_meter_never_carries_a_fill() {
         let m = Meter::busy("45 MB");
@@ -2003,8 +1956,6 @@ mod tests {
         assert!(!posted.meter.unwrap().busy);
     }
 
-    /// `in_flight` declares a busy meter, or marks a fill-less one busy, and keeps a fill;
-    /// `normalized` never invents an indicator (a Live row that declared none is still).
     #[test]
     fn in_flight_declares_busy_and_normalized_invents_nothing() {
         let live = Hold::Live {
@@ -2033,8 +1984,6 @@ mod tests {
         assert_eq!(still.meter, None, "a Live row blocked on the person");
     }
 
-    /// The builder caps everything, and `normalized` re-applies the caps to a
-    /// literal.
     #[test]
     fn the_builder_and_normalized_apply_every_cap() {
         let long = "x".repeat(TITLE_CAP + 40);

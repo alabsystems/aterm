@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of the harness tape's models (the replay plan's §9).
+//! Tier-1 conformance tests for the harness tape models.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -45,7 +45,6 @@ pub(crate) fn project(read: &Recovered) -> BTreeMap<&'static str, i64> {
     ])
 }
 
-/// The model's state after `schedule`, each action required enabled.
 fn walk(model: &Model, schedule: &[&str]) -> State {
     let mut state = model.init_state();
     for action in schedule {
@@ -57,16 +56,12 @@ fn walk(model: &Model, schedule: &[&str]) -> State {
     state
 }
 
-/// The real tape, written step by step: its bytes, each frame's end, and the items of
-/// each records frame.
 struct Tape {
     bytes: Vec<u8>,
     ends: Vec<usize>,
     records: Vec<Vec<crate::supervise::tape::codec::Item>>,
 }
 
-/// Write a tape of `frames` frames (the header and `frames - 1` records frames) with the
-/// real writer, each frame's write one `Write` step checked against the model's `written`.
 fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
     let sink = Memory::default();
     let mut state = model.init_state();
@@ -126,15 +121,12 @@ fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
     }
 }
 
-/// One reading the bind checks: what it is, the bytes, and the model's schedule for them.
 struct Case {
     what: String,
     bytes: Vec<u8>,
     schedule: Vec<&'static str>,
 }
 
-/// Every truncation of `tape`, and every byte of it flipped under three masks, with its
-/// schedule.
 fn cases(tape: &Tape) -> Vec<Case> {
     let mut out = Vec::new();
     for cut in 0..=tape.bytes.len() {
@@ -205,8 +197,6 @@ fn cases(tape: &Tape) -> Vec<Case> {
     out
 }
 
-/// A reading the model does not admit: the case, what the model holds, what the real
-/// reading was, and the invariants that reading breaks.
 struct Disagreement {
     what: String,
     schedule: Vec<&'static str>,
@@ -225,8 +215,6 @@ impl std::fmt::Debug for Disagreement {
     }
 }
 
-/// Bind `reader` to the model over every case: the disagreements. With `ev`, each read
-/// is a `Recover` step window.
 fn bind(
     model: &Model,
     tape: &Tape,
@@ -263,9 +251,6 @@ fn bind(
     out
 }
 
-/// The shipping writer and reader refine `SuperviseTapeRecovery` on every truncation, every
-/// byte flipped under three masks and every arrangement of the whole frames of tapes of one,
-/// two and three frames, each step witnessed by its own anchor.
 #[test]
 fn the_real_writer_and_reader_conform_to_the_model() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
@@ -304,9 +289,6 @@ fn the_real_writer_and_reader_conform_to_the_model() {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
-/// The negative control: the shipping reader with its checksum test off is rejected by
-/// the bind — a damaged frame read as written breaks `RotRefused` on the real reading —
-/// and what it reads there is what the `Buggy = 1` machine predicts.
 #[test]
 fn a_reader_that_ignores_xxh64_is_rejected() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
@@ -337,11 +319,6 @@ fn a_reader_that_ignores_xxh64_is_rejected() {
     assert!(bind(&model, &tape, &recover, None).is_empty());
 }
 
-/// The second negative control: the shipping reader taking a whole frame at any place —
-/// what format 1's sums, which name none, let a reader do — is rejected by the bind: frames
-/// repeated, dropped or moved read as written break `MisplacedRefused` on the real reading,
-/// what it reads there is what the `Buggy = 6` machine predicts, and every disagreement is
-/// an arrangement (its checksum still refuses every flip).
 #[test]
 fn a_reader_that_ignores_places_is_rejected() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
@@ -374,10 +351,8 @@ fn a_reader_that_ignores_places_is_rejected() {
 
 const CURSOR: &str = "SuperviseReplayCursor";
 
-/// The four records' requests, in order: read, act, read, act.
 const TAPE_WORDS: [&[&str]; 4] = [&["status"], &["key", "1"], &["meta"], &["key", "2"]];
 
-/// Every move of the machine, in both arms.
 const CURSOR_MOVES: [&str; 7] = [
     "AskNext",
     "AskOtherRead",
@@ -388,9 +363,6 @@ const CURSOR_MOVES: [&str; 7] = [
     "AskAfterDivergence",
 ];
 
-/// The strict arm's moves before the acts arm joined it: what the lenient
-/// cursor's negative control draws from (it drops a read before an act as
-/// readily as the acts arm does, a rejection of its own kind).
 const STRICT_MOVES: [&str; 5] = [
     "AskNext",
     "AskOtherRead",
@@ -399,7 +371,6 @@ const STRICT_MOVES: [&str; 5] = [
     "AskAfterDivergence",
 ];
 
-/// A control reply saying `OK <what>`.
 fn ok_reply(what: &str) -> Result<CtlReply, String> {
     Ok(CtlReply {
         code: 0,
@@ -408,7 +379,6 @@ fn ok_reply(what: &str) -> Result<CtlReply, String> {
     })
 }
 
-/// The real four-record tape.
 fn cursor_tape() -> Vec<EffectRecord> {
     TAPE_WORDS
         .iter()
@@ -420,7 +390,6 @@ fn cursor_tape() -> Vec<EffectRecord> {
         .collect()
 }
 
-/// What the move `action` asks at cursor `pos` (the model's).
 fn ask_for(action: &str, pos: i64) -> Vec<&'static str> {
     let at = |p: i64| TAPE_WORDS[usize::try_from(p.clamp(0, 3)).unwrap_or(0)].to_vec();
     match action {
@@ -435,14 +404,12 @@ fn ask_for(action: &str, pos: i64) -> Vec<&'static str> {
     }
 }
 
-/// The record whose reply `reply` is, by its request.
 fn record_of(reply: &CtlReply) -> Option<usize> {
     TAPE_WORDS
         .iter()
         .position(|w| reply.stdout == format!("OK {}\n", w.join(" ")))
 }
 
-/// The tape's act at or past `pos` (records 1 and 3), or past the tape.
 fn closing_at(pos: usize) -> usize {
     (pos..TAPE_WORDS.len())
         .find(|&p| is_act(TAPE_WORDS[p]))
@@ -472,14 +439,11 @@ pub(crate) fn project_cursor(seen: &CursorSeen) -> BTreeMap<&'static str, i64> {
     ])
 }
 
-/// A cursor a schedule drives: one request at a time.
 trait Cursor {
-    /// Ask `words`; whether it was served.
     fn ask(&mut self, words: &[&str]) -> bool;
     fn seen(&self) -> CursorSeen;
 }
 
-/// The real core, asked through its replaying door.
 struct RealCursor {
     core: Arc<ReplayCore>,
     fx: Fx,
@@ -490,7 +454,6 @@ struct RealCursor {
 }
 
 impl RealCursor {
-    /// The strict core, or with `acts` the counterfactual's.
     fn new(acts: bool) -> Self {
         let core = if acts {
             ReplayCore::start_acts(cursor_tape(), Vec::new(), VERBATIM, VERBATIM, "test", None)
@@ -647,8 +610,6 @@ impl Cursor for UnboundedActsCursor {
     }
 }
 
-/// A schedule of up to `len` of `moves`, each drawn from those the committed
-/// model has enabled after the moves before it.
 fn cursor_schedule(
     model: &Model,
     moves: &[&'static str],
@@ -672,8 +633,6 @@ fn cursor_schedule(
     out
 }
 
-/// Drive `cursor` by `schedule`: the first step whose projection the
-/// committed model does not hold, with both states.
 fn bind_cursor(
     model: &Model,
     schedule: &[&'static str],
@@ -700,7 +659,6 @@ fn bind_cursor(
     None
 }
 
-/// Model 2 in the arm `acts` (0: strict, 1: the acts scenario), mutant `buggy`.
 fn cursor_machine(acts: i64, buggy: i64) -> Model {
     interp::with_consts(
         &supervise_replay_cursor_model(),
@@ -708,8 +666,6 @@ fn cursor_machine(acts: i64, buggy: i64) -> Model {
     )
 }
 
-/// The real core of the arm `acts` bound to its machine over two hundred
-/// schedules, every move witnessed by its own anchors.
 fn conforms(acts: bool) {
     let model = cursor_machine(i64::from(acts), 0);
     let mut ev = StepEvidence::new(CURSOR);
@@ -738,27 +694,16 @@ fn conforms(acts: bool) {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
-/// The real strict replay core refines `SuperviseReplayCursor` at `Acts = 0`
-/// over two hundred schedules, every move witnessed by its own anchors.
 #[test]
 fn the_real_replay_cursor_conforms_to_the_model() {
     conforms(false);
 }
 
-/// The real COUNTERFACTUAL core (`tape::acts`) refines `SuperviseReplayCursor`
-/// at `Acts = 1` over two hundred schedules: a read served again in its
-/// segment, an act asked before its read taking the act and dropping the
-/// read, nothing across an act and nothing from the future, every move
-/// witnessed by its own anchors.
 #[test]
 fn the_real_acts_cursor_conforms_to_the_model() {
     conforms(true);
 }
 
-/// Bind `make()`'s cursor to the arm `acts` over schedules of `moves`: every
-/// rejection breaks `NoActSkipped` on the cursor's projection, at least one
-/// happens, and where the cursor resyncs — a read the tape holds only past
-/// the act — it is that arm's `Buggy = 2` machine, variable for variable.
 fn rejected_for_passing_an_act<C: Cursor>(acts: i64, moves: &[&'static str], make: impl Fn() -> C) {
     let model = cursor_machine(acts, 0);
     let lenient_model = cursor_machine(acts, 2);
@@ -792,18 +737,11 @@ fn rejected_for_passing_an_act<C: Cursor>(acts: i64, moves: &[&'static str], mak
     }
 }
 
-/// The negative control of the strict arm: a cursor that resyncs across an
-/// act is rejected by the bind — it passes the act between unasked
-/// (`NoActSkipped` broken on its projection) — and where it resyncs, it is
-/// the `Buggy = 2` machine.
 #[test]
 fn a_cursor_that_resyncs_across_an_act_is_rejected() {
     rejected_for_passing_an_act(0, &STRICT_MOVES, LenientCursor::default);
 }
 
-/// The negative control of the acts arm: the acts cursor with no segment
-/// bound on its resync is rejected by the bind for passing an act, and where
-/// it resyncs it is the acts arm's `Buggy = 2` machine.
 #[test]
 fn an_acts_cursor_unbounded_by_its_segment_is_rejected() {
     rejected_for_passing_an_act(1, &CURSOR_MOVES, UnboundedActsCursor::default);
@@ -828,7 +766,6 @@ pub(crate) fn project_latch(seen: &LatchSeen) -> BTreeMap<&'static str, i64> {
     ])
 }
 
-/// A transport that answers every round trip `OK`.
 struct Answers;
 
 impl Ctl for Answers {
@@ -837,7 +774,6 @@ impl Ctl for Answers {
     }
 }
 
-/// The loop's round trip at operation `op`.
 fn door_words(op: usize) -> Vec<String> {
     vec![
         "await".to_string(),
@@ -848,9 +784,6 @@ fn door_words(op: usize) -> Vec<String> {
     ]
 }
 
-/// Record the four-operation loop, the flag raised by another thread before
-/// operation `raise_at` (`4`: after the last; `None`: never), the setter
-/// appending the flag's record itself when `setter_tapes`; then replay it.
 fn latch_run(
     raise_at: Option<usize>,
     setter_tapes: bool,
@@ -976,8 +909,6 @@ fn latch_run(
     (seen, reads, replayed)
 }
 
-/// The model's schedule for a run with the flag raised before operation
-/// `raise_at`, through the replay's end (or its divergence).
 fn latch_schedule(model: &Model, raise_at: Option<usize>) -> State {
     let mut state = model.init_state();
     let fire = |action: &str, state: &mut State| {
@@ -1004,9 +935,6 @@ fn latch_schedule(model: &Model, raise_at: Option<usize>) -> State {
     state
 }
 
-/// The real recorder and replay refine `SupervisorRaisedLatch` with the flag raised by
-/// another thread before every operation of the loop, after the last, and never: the
-/// flag's record is the loop's own read's, and no replay diverges.
 #[test]
 fn the_real_latch_conforms_to_the_model() {
     let model = interp::with_buggy(&supervisor_raised_latch_model(), 0);
@@ -1033,9 +961,6 @@ fn the_real_latch_conforms_to_the_model() {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
-/// The negative control: a setter that tapes the flag itself, as it raises it, is
-/// rejected by the bind — raised before a door, its record sits in front of the door and
-/// the replay diverges there — and every run of it is the `Buggy = 1` machine.
 #[test]
 fn a_setter_that_tapes_the_flag_itself_is_rejected() {
     let model = interp::with_buggy(&supervisor_raised_latch_model(), 0);
@@ -1068,9 +993,6 @@ fn a_setter_that_tapes_the_flag_itself_is_rejected() {
     );
 }
 
-/// The flag raised by another thread at moments of its own — racing the loop over a
-/// longer run, no handshake — over many seeds: whichever read first sees it tapes it, and
-/// no replay diverges; every replayed read answers as the recorded one did.
 #[test]
 fn a_flag_raised_at_any_moment_replays_exactly() {
     use super::core::TapeCore;
@@ -1146,11 +1068,6 @@ fn a_flag_raised_at_any_moment_replays_exactly() {
     }
 }
 
-/// The racing run of [`a_flag_raised_at_any_moment_replays_exactly`] EXTENDED TO THE WINDOW'S
-/// HOST (the replay plan's T7): beside the stop flag, the loop asks its host whether it wants
-/// a point (`host.wants`, through the taped host the loop is handed, `Fx::host_door`), and
-/// the host's thread raises the stop and turns the host's answer at moments of its own,
-/// racing the loop, over many seeds.
 #[test]
 fn a_host_racing_the_loop_replays_exactly() {
     use super::core::TapeCore;

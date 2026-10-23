@@ -58,7 +58,8 @@ impl HashTable4KU16 {
 impl HashTable for HashTable4KU16 {
     #[inline]
     fn get_at(&self, hash: usize) -> usize {
-        // `hash < 2^16`, so `% HASHTABLE_SIZE_4K` is a mask that bounds the index across the trait boundary.
+        // `hash < 2^16`, so `hash >> 4 < 4096`; the `%` (a mask) states that across the
+        // trait boundary.
         let dict: &[u16; HASHTABLE_SIZE_4K] = core::ops::Deref::deref(&self.dict);
         dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }

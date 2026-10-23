@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S PROFILE, READ BY AN ALLOWLIST (`docs/DESIGN-account-stats-2026-10-15.md` §3.1, §3.3, §4.2).
+//! Claude Code's profile, read by an allowlist.
 
 use std::fmt;
 use std::io::Read as _;
@@ -19,13 +19,11 @@ pub const PROFILE_MAX: u64 = 32 * 1024 * 1024;
 /// The longest text kept from the file ([`Word`]).
 pub const WORD_MAX: usize = 64;
 
-/// The longest id hashed into an [`AccountKey`]: a uuid is 36 bytes.
+/// The longest id hashed into an [`AccountKey`].
 const ID_MAX: usize = 128;
 
-/// What the account key's hash starts with (design §3.1).
 const KEY_DOMAIN: &[u8] = b"aterm-account-v1";
 
-/// The digest bytes a key keeps: twelve hex digits.
 const KEY_BYTES: usize = 6;
 
 /// ONE ACCOUNT'S KEY, the same on every machine and holding no secret (design §3.1).
@@ -38,7 +36,7 @@ pub struct AccountKey {
 }
 
 impl AccountKey {
-    /// The key of the Claude Code account whose `accountUuid` is `id`; `None` for an empty or overlong id.
+    /// The key of the Claude Code account whose `accountUuid` is `id`.
     #[must_use]
     pub fn claude(id: &str) -> Option<AccountKey> {
         Self::hashed(b'c', "claude", &[id])
@@ -76,7 +74,7 @@ impl AccountKey {
         out
     }
 
-    /// A key back from its text ([`fmt::Display`]: `c-` or `x-` and twelve lowercase hex digits), as the accounts state keeps it.
+    /// A key back from its text ([`fmt::Display`]).
     #[must_use]
     pub fn parse(text: &str) -> Option<AccountKey> {
         let (agent, hex) = match text.split_once('-')? {
@@ -128,7 +126,7 @@ impl Word {
     }
 }
 
-/// THE PLAN, from `oauthAccount.organizationType` as Claude Code maps it (`claude_max` → `max`, … — READ in 2.1.301), any other value [`PlanWord::Other`].
+/// THE PLAN, from `oauthAccount.organizationType` as Claude Code maps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanWord {
     /// `claude_max`.
@@ -154,7 +152,7 @@ impl PlanWord {
         }
     }
 
-    /// The word JSON carries; for the four plans also the subscription word Claude Code compares with its flags.
+    /// The word JSON carries.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -201,7 +199,7 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The plan as a person reads it: its word and, where the tier is a multiple, the multiple (`Max 5x`, `Pro`).
+    /// The plan as a person reads it.
     #[must_use]
     pub fn title(&self) -> Option<String> {
         let word = self.word?.title();
@@ -214,7 +212,7 @@ impl Plan {
     }
 }
 
-/// WHETHER USAGE CREDITS ARE ON, from `cachedExtraUsageDisabledReason`, which Claude Code rewrites from every served reply's headers (design F5).
+/// Whether usage credits are on, from `cachedExtraUsageDisabledReason`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Credits {
     /// The key is absent, or holds neither text nor `null`.
@@ -223,7 +221,7 @@ pub enum Credits {
     On,
     /// `out_of_credits`.
     Out,
-    /// Any other reason; `None` for one that is not a [`Word`].
+    /// Any other reason ([`Word`]).
     Off(Option<Word>),
 }
 
@@ -311,7 +309,7 @@ pub struct CreditsMoney {
     pub disabled_reason: Option<Word>,
 }
 
-/// WHICH ONE-TIME CREDIT BLOCK, in aterm's words for the panel's titles (the vendor's keys for them are codenames, which stay here).
+/// WHICH ONE-TIME CREDIT BLOCK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OneTimeKind {
     /// The panel's "Claude Code and Cowork credit".
@@ -455,13 +453,13 @@ pub fn path_of(
     Records::at(user_home, HomeVars { config, home }, cwd).profile(user_home)
 }
 
-/// The profile of the home whose records are in `dir`, the raw `CLAUDE_CONFIG_DIR` that named it being `config` ([`path_of`], for a caller that resolved the directory already).
+/// The profile of the home whose records are in `dir` ([`path_of`]).
 #[must_use]
 pub fn path_in(user_home: &Path, config: Option<&str>, dir: &Path) -> PathBuf {
     super::upgrade_drive::profile_in(user_home, HomeVars::config(config), dir)
 }
 
-/// Profile file Claude Code reads for the home whose plain profile is `plain` ([`path_of`]) and whose records live in `records`.
+/// Profile file Claude Code reads for the home whose plain profile is `plain` ([`path_of`]).
 #[must_use]
 pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> PathBuf {
     let plain = if custom_oauth {
@@ -535,7 +533,7 @@ pub struct Context {
     pub records: PathBuf,
     /// The filename choice from its own captured exec environment.
     pub selection: Selection,
-    /// The captured HOME, USERPROFILE on Windows ([`super::accounts::HOMEDIR_ENV`]; unset/empty remain distinct).
+    /// The captured HOME ([`super::accounts::HOMEDIR_ENV`]).
     pub home: Option<String>,
     /// The captured CLAUDE_CONFIG_DIR (unset/empty remain distinct).
     pub config: Option<String>,
@@ -543,8 +541,6 @@ pub struct Context {
     pub login: Option<String>,
 }
 
-/// One exec variable, known unset versus unknown/conflicting. No environment
-/// of the supervising process is consulted.
 fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
     if env.is_empty() {
         return None;
@@ -564,7 +560,7 @@ fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
 }
 
 impl Context {
-    /// The profile paths of already-resolved records, with the process's own HOME/config/login and filename selector.
+    /// The profile paths of already-resolved records.
     pub(super) fn of_exec_env(user_home: &Path, records: &Path, env: &[String]) -> Option<Self> {
         let vars = HomeVars {
             config: exec_var(env, super::accounts::HOME_ENV)?,
@@ -647,7 +643,6 @@ pub(super) struct LaunchEnv {
 }
 
 /// The effective profile, with selection uncertainty preserved for a billing decision.
-///
 /// # Errors
 /// Missing process context or records, or selection metadata that cannot be read.
 pub(super) fn effective_for_billing(
@@ -682,13 +677,13 @@ pub(super) fn effective_for_billing(
     }
 }
 
-/// Whether a raw `CLAUDE_CODE_CUSTOM_OAUTH_URL` renames the profile ([`effective`]): set and not empty, as JavaScript tests it.
+/// Whether a raw `CLAUDE_CODE_CUSTOM_OAUTH_URL` renames the profile ([`effective`]).
 #[must_use]
 pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
     raw.is_some_and(|url| !url.is_empty())
 }
 
-/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS, for the one key the harness presses on `/login`'s method picker (`supervise::policy::login`).
+/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS.
 #[must_use]
 pub fn login_method(
     env: &[String],
@@ -707,10 +702,7 @@ pub fn login_method(
     (plan != PlanWord::Other).then_some(aterm_phase::LoginMethod::Subscription)
 }
 
-/// The profile Claude Code reads for the home a process's exec environment
-/// `env` names ([`effective`] over [`path_of`]'s home), for a user whose
-/// home is `user_home`; `None` where the records cannot be named (a
-/// relative or empty config directory with no working directory).
+/// The profile Claude Code reads for the home `env` names ([`effective`], [`path_of`]).
 fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let var = |name: &str| {
         env.iter()
@@ -734,7 +726,7 @@ fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     ))
 }
 
-/// WHETHER THE LOGIN A CLAUDE CODE PROCESS'S HOME HOLDS ANSWERS TO `email`, a roster row's address ([`super::accounts::email_matches`]).
+/// Whether a process's home login matches `email` ([`super::accounts::email_matches`]).
 #[must_use]
 pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool> {
     let path = effective_of(env, user_home)?;
@@ -754,10 +746,18 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
     .flatten()
 }
 
-/// How long a cached `/usage` reading stays current ([`current_windows`]). Claude Code
-/// writes the cache only when a person opens `/usage`, so an older reading cannot say
-/// what is used now.
+/// How long a cached `/usage` reading stays current ([`current_windows`]).
 const USAGE_CURRENT_S: i64 = 15 * 60;
+
+/// How long a weekly figure is shown at all ([`WeeklyFigure::words`]): past
+/// [`USAGE_CURRENT_S`] with its age, past this not at all (Claude Code reuses its own
+/// `/usage` cache for as long).
+pub const USAGE_SHOWN_S: i64 = 60 * 60;
+
+/// How far ahead of the reader's clock a weekly figure may be stamped and still read as just
+/// read ([`WeeklyFigure::words`]): a tap reading written in the second after the resolver
+/// took its clock, or a fleet peer's clock a little ahead.
+const USAGE_SKEW_S: i64 = 60;
 
 /// Facts for the requested on-screen account/subscription display.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -766,10 +766,148 @@ pub struct SubscriptionDisplay {
     pub email: Option<String>,
     /// The selected account's subscription plan.
     pub plan: Option<String>,
-    /// Its weekly quota, only while the selected account's cached sample is current.
+    /// Its weekly quota's words: a figure's under the one age rule ([`WeeklyFigure::words`]),
+    /// a wall's `weekly 0% left`, or a screen's.
     pub weekly: Option<String>,
+    /// The figure [`Self::weekly`] says, where a read gave one (`None`: a wall's or a screen's
+    /// words, or no figure).
+    pub weekly_figure: Option<WeeklyFigure>,
+    /// Why there is no [`Self::weekly`] (`None`: nothing told it, and the footer says
+    /// `weekly unavailable`).
+    pub weekly_gap: Option<WeeklyGap>,
+    /// The roster label of the account [`Self::weekly_figure`] is, where the process runs in
+    /// the machine's default Claude home on a login the roster judges
+    /// ([`super::accounts::judged_label`]); `None` elsewhere, where only [`Self::email`] names
+    /// the account.
+    pub label: Option<String>,
     /// The screen reading's placed reset, retained after expiry so an unchanged card cannot revive the same window.
     pub weekly_reset: Option<WeeklyReset>,
+}
+
+/// ONE WEEKLY FIGURE, whichever source read it (Claude Code's `/usage` cache, this
+/// process's usage tap, the accounts store), for the one age rule ([`Self::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WeeklyFigure {
+    /// Its share used, in tenths of a percent (0..=1000).
+    pub used_x10: u32,
+    /// When its window resets, Unix seconds.
+    pub resets_at: i64,
+    /// When it was read, Unix seconds.
+    pub at: i64,
+}
+
+impl WeeklyFigure {
+    /// THE ONE AGE RULE of every weekly source, the footer's words at `now`: `weekly N% left`
+    /// while the figure is at most [`USAGE_CURRENT_S`] old (or stamped at most
+    /// [`USAGE_SKEW_S`] ahead), `weekly N% left · Mm ago` up to [`USAGE_SHOWN_S`], and nothing
+    /// for an older figure, one from further in the future, or one whose window has reset.
+    #[must_use]
+    pub fn words(&self, now: i64) -> Option<String> {
+        let age = now
+            .checked_sub(self.at)
+            .filter(|age| (-USAGE_SKEW_S..=USAGE_SHOWN_S).contains(age))?
+            .max(0);
+        if self.resets_at <= now {
+            return None;
+        }
+        let left = 1000_u32.saturating_sub(self.used_x10.min(1000));
+        let left = if left.is_multiple_of(10) {
+            format!("{}", left / 10)
+        } else {
+            format!("{}.{}", left / 10, left % 10)
+        };
+        Some(if age <= USAGE_CURRENT_S {
+            format!("weekly {left}% left")
+        } else {
+            format!("weekly {left}% left \u{b7} {}m ago", age / 60)
+        })
+    }
+
+    /// Whether [`Self::words`] says it at `now` with no age.
+    #[must_use]
+    pub fn current(&self, now: i64) -> bool {
+        self.words(now).is_some() && now.saturating_sub(self.at) <= USAGE_CURRENT_S
+    }
+
+    /// The newer of `a` and `b` by [`Self::at`] (`a` on a tie).
+    #[must_use]
+    pub fn newer(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if b.at > a.at { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// WHY A CLAUDE CODE FOOTER HAS NO WEEKLY FIGURE ([`SubscriptionDisplay::weekly_gap`]),
+/// where it once said `weekly unavailable` and no more (owner, 2026-10-22: *"you also need
+/// to fix the weekly budget reporting for claude code harness"*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WeeklyGap {
+    /// `[harness] usage_tap` is off, or the harness is off for Claude Code: only a person's
+    /// `/usage` gives a figure.
+    TapOff,
+    /// The tap is on, and no relaunch line could carry it for this process (why: the
+    /// [`super::tap::Refusal`]): only a person's `/usage` gives a figure.
+    Unoffered(super::tap::Refusal),
+    /// The tap is on, and a relaunch line would carry it, but this process was not started
+    /// with it, and aterm's restart in place is offered for it now: a restart adds it (the
+    /// host's hand, a hold or a driver's lease, is judged at the restart).
+    Untapped,
+    /// As [`Self::Untapped`], but no restart in place is offered for it now (the host
+    /// supervises no such process in its tab, as with its Autopilot off, or its relaunch would
+    /// not bring it back): only a person's `/usage` gives a figure.
+    Unrestarted,
+    /// The process carries the tap, and no reply since it started brought a weekly figure.
+    NoReply,
+    /// The process carries the tap, and its last weekly figure is older than
+    /// [`USAGE_SHOWN_S`]: no reply in the last hour.
+    Stale,
+}
+
+impl WeeklyGap {
+    /// The footer's words.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::TapOff | Self::Unoffered(_) | Self::Unrestarted => "weekly ? \u{b7} /usage",
+            Self::Untapped => "weekly ? \u{b7} restart tab",
+            Self::NoReply => "weekly ? \u{b7} no reply yet",
+            Self::Stale => "weekly ? \u{b7} no reply 1h",
+        }
+    }
+
+    /// A screen reader's words for [`Self::words`]: the reason in full, with no glyph.
+    #[must_use]
+    pub const fn spoken(self) -> &'static str {
+        match self {
+            Self::TapOff | Self::Unoffered(_) | Self::Unrestarted => {
+                "weekly figure unknown, /usage shows it"
+            }
+            Self::Untapped => "weekly figure unknown, a restart of the tab adds it",
+            Self::NoReply => "weekly figure unknown, no reply has brought it yet",
+            Self::Stale => "weekly figure unknown, no reply in the last hour",
+        }
+    }
+}
+
+/// THE FOOTER'S NARROW FORM of weekly words [`WeeklyFigure::words`] or [`WeeklyGap::words`]
+/// said, for a rule too narrow for them beside the account: an aged figure without its
+/// `weekly ` and ` ago` (`61.5% left \u{b7} 59m`, after the week's own mark), any reason's
+/// `weekly ?`; `None` for words that are already their narrowest (a current figure, a wall's
+/// `weekly 0% left`).
+#[must_use]
+pub fn narrow_weekly(words: &str) -> Option<String> {
+    if let Some(aged) = words
+        .strip_prefix("weekly ")
+        .and_then(|rest| rest.strip_suffix(" ago"))
+        .filter(|aged| aged.contains('%'))
+    {
+        return Some(aged.to_owned());
+    }
+    words
+        .starts_with("weekly ? ")
+        .then(|| "weekly ?".to_owned())
 }
 
 /// One reset occurrence, placed when the card is first observed.
@@ -797,7 +935,7 @@ pub struct PlanUsage {
 }
 
 impl PlanUsage {
-    /// Whether this reading still says what is used at `now` (Unix seconds), by the currency rule [`plan_usage_for`] read it under ([`current_windows`]).
+    /// Whether this reading still reflects `now` ([`plan_usage_for`], [`current_windows`]).
     #[must_use]
     pub const fn current_at(&self, now: i64) -> bool {
         self.read_at <= now
@@ -831,7 +969,7 @@ pub fn plan_usage_for(
     selected_profile(env, user_home, records, roster)?.plan_usage(now, model)
 }
 
-/// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile, for the caller that keeps both (the Claude footer's resolver).
+/// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile.
 #[must_use]
 pub fn subscription_and_plan_for(
     env: &[String],
@@ -846,7 +984,7 @@ pub fn subscription_and_plan_for(
     Some((selected.subscription(now), plan))
 }
 
-/// THE ACCOUNT A MUSE CODE PROCESS IS SIGNED IN AS, for the footer's volatile display ([`SubscriptionDisplay`]).
+/// The account a Muse Code process is signed in as ([`SubscriptionDisplay`]).
 #[must_use]
 pub fn muse_subscription_for(
     argv: &[String],
@@ -905,15 +1043,10 @@ pub fn muse_subscription_for(
     .ok()??;
     Some(SubscriptionDisplay {
         email: Some(email),
-        plan: None,
-        weekly: None,
-        weekly_reset: None,
+        ..SubscriptionDisplay::default()
     })
 }
 
-/// The provider a Muse Code command line names (`--provider` in either
-/// spelling, a `-c`/`--config provider=…` for this run; the last one
-/// named, as its launch flags read), lower-cased.
 fn muse_provider_arg(argv: &[String]) -> Option<String> {
     let config_provider = |spec: &str| {
         let (key, value) = spec.split_once('=')?;
@@ -961,8 +1094,7 @@ struct Selected {
 }
 
 impl Drop for Selected {
-    /// An address no display took — a refused selection's, or one that only gated the
-    /// plan — is zeroed before it is freed, as [`answers_to`]'s is.
+    /// An address no display took is zeroed before it is freed, as [`answers_to`]'s is.
     fn drop(&mut self) {
         if let Some(email) = self.email.take() {
             wipe(&mut email.into_bytes());
@@ -970,10 +1102,7 @@ impl Drop for Selected {
     }
 }
 
-/// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`]: the profile the
-/// process's own exec environment selects, for a stored login only, read once, and kept
-/// only where the roster binds that login to the address the profile names (see
-/// [`subscription_for`] for the cases).
+/// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`].
 fn selected_profile(
     env: &[String],
     user_home: &Path,
@@ -1036,17 +1165,13 @@ fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
 }
 
 impl Selected {
-    /// The footer's display of this read at `now`.
     fn subscription(mut self, now: i64) -> SubscriptionDisplay {
-        let weekly = self.profile.usage.as_ref().and_then(|usage| {
-            let window = current_windows(usage, now).find(|row| row.bucket == Bucket::SevenDay)?;
-            let left = 1000_u16.saturating_sub(window.used_pct_x10?);
-            Some(if left.is_multiple_of(10) {
-                format!("weekly {}% left", left / 10)
-            } else {
-                format!("weekly {}.{}% left", left / 10, left % 10)
-            })
-        });
+        let figure = self
+            .profile
+            .usage
+            .as_ref()
+            .and_then(|usage| cached_weekly(usage, now));
+        let weekly = figure.and_then(|figure| figure.words(now));
         let plan = self
             .profile
             .plan
@@ -1057,7 +1182,10 @@ impl Selected {
         SubscriptionDisplay {
             email: self.email.take(),
             plan,
+            weekly_figure: figure.filter(|_| weekly.is_some()),
             weekly,
+            weekly_gap: None,
+            label: None,
             weekly_reset: None,
         }
     }
@@ -1098,8 +1226,6 @@ impl Selected {
     }
 }
 
-/// THE CURRENCY RULE of a cached `/usage` reading: the windows of `usage` that still say
-/// what is used at `now`.
 fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &CachedWindow> {
     let current = usage
         .fetched_at_ms
@@ -1114,9 +1240,20 @@ fn current_windows(usage: &UsageCache, now: i64) -> impl Iterator<Item = &Cached
         .filter(move |row| row.resets_at.is_some_and(|reset| reset > now))
 }
 
-/// The weekly bucket of `model`'s own family, for a model named by id
-/// (`claude-opus-5-5`), alias (`opus`) or display name (`Opus 5.5`); `None` for a family
-/// the usage body keeps no bucket of.
+/// The `seven_day` row of a cached `/usage` reading whose window still runs at `now`, as
+/// read when Claude Code fetched it: its age is [`WeeklyFigure::words`]' to judge, not
+/// [`current_windows`]'.
+fn cached_weekly(usage: &UsageCache, now: i64) -> Option<WeeklyFigure> {
+    let row = usage.windows.iter().find(|row| {
+        row.bucket == Bucket::SevenDay && row.resets_at.is_some_and(|reset| reset > now)
+    })?;
+    Some(WeeklyFigure {
+        used_x10: u32::from(row.used_pct_x10?),
+        resets_at: row.resets_at?,
+        at: usage.fetched_at_ms.checked_div(1000)?,
+    })
+}
+
 fn model_bucket(model: &str) -> Option<Bucket> {
     let short = super::usage::model_short(model);
     let family: String = short
@@ -1132,15 +1269,13 @@ fn model_bucket(model: &str) -> Option<Bucket> {
 }
 
 /// READ THE PROFILE AT `path` ([`parse`]).
-///
 /// # Errors
 /// [`NoProfile`]: why nothing was read.
 pub fn read(path: &Path) -> Result<Profile, NoProfile> {
     read_with(path, parse)
 }
 
-/// [`read`]'s file handling, its bytes handed to `parse` before they are
-/// zeroed.
+/// [`read`]'s file handling, its bytes handed to `parse` before they are zeroed.
 fn read_with<T>(
     path: &Path,
     parse: impl FnOnce(&[u8]) -> Result<T, NoProfile>,
@@ -1182,8 +1317,6 @@ fn read_with<T>(
     answer
 }
 
-/// Zero `buf`, and keep the compiler from dropping the writes as dead
-/// before the free.
 fn wipe(buf: &mut [u8]) {
     buf.fill(0);
     std::hint::black_box(&*buf);
@@ -1201,9 +1334,7 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// READ A PROFILE FROM ITS BYTES: the allowlist and nothing else (the six keys `RawFile`
-/// names; every other key is skipped, its value never built).
-///
+/// READ A PROFILE FROM ITS BYTES.
 /// # Errors
 /// [`NoProfile::Unreadable`] for bytes that are not one JSON object.
 pub fn parse(bytes: &[u8]) -> Result<Profile, NoProfile> {
@@ -1268,8 +1399,6 @@ fn profile_of(raw: RawFile) -> Profile {
     }
 }
 
-/// A rate-limit tier's word: a trailing `_<digits>x` taken as the multiple
-/// (`default_claude_max_20x` → `20x`), else the word itself.
 fn tier_word(raw: Word) -> Word {
     let multiple = raw
         .as_str()
@@ -1279,7 +1408,6 @@ fn tier_word(raw: Word) -> Word {
     multiple.and_then(Word::new).unwrap_or(raw)
 }
 
-/// Whether `tier` is a multiple of the plan's base usage (`5x`, `20x`).
 fn is_multiple(tier: &str) -> bool {
     tier.strip_suffix('x')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -1415,8 +1543,6 @@ fn fable_plan(plan: &Plan, flags: RawFeatures) -> FablePlan {
     }
 }
 
-/// A share in percent (0-100, as the body carries it) in tenths, capped at
-/// 100%; `None` for a negative or non-finite one.
 fn pct_x10(pct: f64) -> Option<u16> {
     if !pct.is_finite() || pct < 0.0 {
         return None;
@@ -1429,14 +1555,11 @@ fn pct_x10(pct: f64) -> Option<u16> {
     Some((pct * 10.0).round().min(1000.0) as u16)
 }
 
-/// A whole number the file wrote as a JSON number; `None` past `i64` or not
-/// finite.
 fn whole(n: f64) -> Option<i64> {
     #[expect(clippy::cast_possible_truncation, reason = "range checked")]
     (n.is_finite() && n.abs() < 9.0e15).then(|| n.round() as i64)
 }
 
-/// Milliseconds since the epoch, in seconds.
 fn ms_to_s(ms: f64) -> Option<i64> {
     whole(ms).map(|ms| ms.div_euclid(1000))
 }
@@ -1471,8 +1594,6 @@ pub fn instant(text: &str) -> Option<i64> {
     Some(at - sign * (hours * 3600 + minutes * 60))
 }
 
-/// A MODEL FAMILY'S NAME as a key or a flag spells it (`Fable`, `nimbus`),
-/// lowercased: letters alone, at most 32 — an id (digits, hyphens) is none.
 fn family(name: &str) -> Option<String> {
     (!name.is_empty() && name.len() <= 32 && name.bytes().all(|b| b.is_ascii_alphabetic()))
         .then(|| name.to_ascii_lowercase())
@@ -1621,8 +1742,6 @@ struct RawEnabled {
     enabled: Leaf,
 }
 
-/// Drain one container's values unread, for a visitor handed a shape it
-/// does not keep.
 fn drain_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
     while seq.next_element::<IgnoredAny>()?.is_some() {}
     Ok(())
@@ -1633,7 +1752,6 @@ fn drain_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<(), A::Error> {
     Ok(())
 }
 
-/// The scalar visitor methods of a reader that keeps no scalar: each answers `$none`.
 macro_rules! lenient_scalars {
     ($none:expr) => {
         fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
@@ -1660,9 +1778,7 @@ macro_rules! lenient_scalars {
     };
 }
 
-/// Muse Code's login store (`auth.json`), the `meta` provider's address
-/// alone kept: every other key read past unkept, as [`RawWho`]'s are, so
-/// no credential material another mechanism keeps there is materialized.
+/// Muse Code's login store (`auth.json`), the `meta` provider's address alone kept ([`RawWho`]).
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawMuseAuth {
@@ -1751,8 +1867,6 @@ impl<'de> Deserialize<'de> for Address {
     }
 }
 
-/// AN OBJECT OF THE ALLOWLIST: `T` where the value is an object, `None`
-/// for any other value (read past, unkept).
 struct Obj<T>(Option<T>);
 
 impl<T> Default for Obj<T> {
@@ -1781,8 +1895,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
     }
 }
 
-/// AN ARRAY OF ALLOWLIST OBJECTS: each object element read as `T`, every
-/// other element read past; empty for any value that is not an array.
 struct List<T>(Vec<T>);
 
 impl<T> Default for List<T> {
@@ -1899,9 +2011,7 @@ impl<'de> Deserialize<'de> for Leaf {
     }
 }
 
-/// A CLAUDE ACCOUNT ID, HASHED AS IT IS READ ([`AccountKey::claude`]): the
-/// parser hands the string over borrowed from the file's bytes, and only
-/// the key is kept.
+/// A CLAUDE ACCOUNT ID, HASHED AS IT IS READ ([`AccountKey::claude`]).
 #[derive(Default)]
 struct Hashed(Option<AccountKey>);
 
@@ -2045,8 +2155,7 @@ impl<'de> Deserialize<'de> for Consent {
     }
 }
 
-/// THE STORED CONSENTS PER FAMILY (`{ "<family>": { "<org or acct:id>":
-/// true } }`): the families ([`family`]) whose [`Consent`] holds.
+/// THE STORED CONSENTS PER FAMILY ([`family`], [`Consent`]).
 #[derive(Default)]
 struct Consents(Vec<String>);
 
@@ -2098,7 +2207,6 @@ impl<'de> Deserialize<'de> for Family {
     }
 }
 
-/// An object key, read for whether it names a Fable model and not kept.
 struct IsFable(bool);
 
 impl<'de> Deserialize<'de> for IsFable {

@@ -28,7 +28,6 @@ const DMG64: &str =
     "https://github.com/alabsystems/aterm/releases/download/v0.64.0/aterm-0.64.0.dmg";
 const LINUX63: &str = "https://github.com/alabsystems/aterm/releases/download/v0.63.0/aterm-0.63.0-linux-x86_64.tar.gz";
 const GHOST: &str = "ffffffffffffffffffffffffffffffffffffffff";
-/// The pages whose download anchor carries the platform attributes.
 const PAGES_WITH_PICKS: [&str; 2] = ["aterm.html", "terminal.html"];
 
 fn fixture(rel: &str) -> PathBuf {
@@ -37,8 +36,6 @@ fn fixture(rel: &str) -> PathBuf {
         .join(rel)
 }
 
-/// `case` over each of `cases`, all at once: the cases of one test that share nothing (each
-/// its own lab and world).
 fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, case: impl Fn(T) + Sync) {
     std::thread::scope(|scope| {
         let case = &case;
@@ -54,7 +51,6 @@ fn at_once<T: Send>(cases: impl IntoIterator<Item = T>, case: impl Fn(T) + Sync)
     });
 }
 
-/// This checkout's `tools/install.sh`, which the fixture public commits carry.
 fn installer() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -65,15 +61,12 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// aterm-wasm-abi's committed toy module: a real `#[export]` module with its `aterm_abi`
-/// descriptor, standing in for the CPU module the stock build would write.
 fn toy_module() -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-wasm-abi/tests/toy/aterm_wasm_abi_toy.wasm");
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// A wasm custom section `name` holding `payload`.
 fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
     fn leb(mut n: usize, out: &mut Vec<u8>) {
         loop {
@@ -96,12 +89,10 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
     section
 }
 
-/// What the fixture `wasm-opt` appends: a module that went through it ends with this.
 fn optimised_mark() -> Vec<u8> {
     custom_section("fixture-wasm-opt", b"-O3")
 }
 
-/// The engine pair in `term`: its hash (from its name), its glue, its module.
 fn installed_pair(term: &Path) -> (String, String, Vec<u8>) {
     let mut modules: Vec<String> = std::fs::read_dir(term)
         .unwrap()
@@ -147,7 +138,6 @@ impl Git {
             .unwrap()
     }
 
-    /// stdout, trimmed; the test fails on a git that fails.
     fn ok(&self, dir: &Path, args: &[&str]) -> String {
         let o = self.output(dir, args);
         assert!(
@@ -159,7 +149,6 @@ impl Git {
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
-    /// A fixture commit of everything in `dir`.
     fn commit_all(&self, dir: &Path, msg: &str) {
         self.ok(dir, &["add", "-A"]);
         self.ok(
@@ -266,9 +255,6 @@ impl Launch for Signals {
     }
 }
 
-/// The fixture world: canned GitHub answers, a directory as the live site, the
-/// engine's stock build (the toy module) and `wasm-opt`, and the deploy as the site's
-/// script behaves.
 struct Fake {
     releases: String,
     main_sha: Option<String>,
@@ -460,7 +446,6 @@ impl World for Fake {
     fn sleep(&mut self, _secs: u64) {}
 }
 
-/// A promote's public repo and a site checkout with its origin, in one scratch dir.
 struct Lab {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -474,9 +459,6 @@ struct Lab {
     live: PathBuf,
 }
 
-/// A fresh lab's whole scratch dir, built once per process for each shape (in the scratch dir
-/// of the test that first asks, which then uses it) and laid down for every other test:
-/// building one takes fifteen git processes, a clone and a push among them.
 struct Built {
     root: PathBuf,
     tree: Tree,
@@ -489,7 +471,6 @@ impl Lab {
         Self::at("site-repo", true)
     }
 
-    /// The site repo at `<scratch>/<site_root>`; the public tree with a CHANGELOG.md or not.
     fn at(site_root: &str, changelog: bool) -> Self {
         type Shapes = BTreeMap<(String, bool), Arc<OnceLock<Built>>>;
         static BUILT: Mutex<Shapes> = Mutex::new(BTreeMap::new());
@@ -521,7 +502,6 @@ impl Lab {
         lab
     }
 
-    /// [`Lab::at`], built from nothing.
     fn build(site_root: &str, changelog: bool) -> Self {
         let mut lab = Self::empty(site_root);
         std::fs::create_dir_all(lab.root.join("home")).unwrap();
@@ -535,7 +515,6 @@ impl Lab {
         lab
     }
 
-    /// A scratch dir that holds nothing yet, and where each part of a lab goes in it.
     fn empty(site_root: &str) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-site-sync-")
@@ -572,13 +551,10 @@ impl Lab {
         }
     }
 
-    /// A promote: a new public commit (CHANGELOG.md or not) carrying this checkout's
-    /// own installer, as the only commit of a fresh bare repo.
     fn publish(&mut self, changelog: bool) {
         self.publish_with(changelog, |_| {});
     }
 
-    /// [`Lab::publish`], with `edit` applied to the tree before it is committed.
     fn publish_with(&mut self, changelog: bool, edit: impl FnOnce(&Path)) {
         self.generation += 1;
         let src = self.root.join(format!("public-src-{}", self.generation));
@@ -616,10 +592,6 @@ impl Lab {
         self.public_sha = self.git.ok(&src, &["rev-parse", "HEAD"]);
     }
 
-    /// The site checkout (the fixture's public/ and its deploy script, which the
-    /// fixture world stands in for and nothing runs — and no engine build script: the
-    /// sync builds the engine itself), pushed to a fresh bare origin; the live site
-    /// serves the same public/.
     fn make_site(&mut self) {
         for d in [&self.site_root, &self.origin, &self.live] {
             let _ = std::fs::remove_dir_all(d);
@@ -664,7 +636,6 @@ impl Lab {
         copy_tree(&self.site.join("public"), &self.live);
     }
 
-    /// What the release's after-cut step hands the sync, for this lab.
     fn env(&self) -> Env {
         Env {
             slug: SLUG.into(),
@@ -693,7 +664,6 @@ impl Lab {
         }
     }
 
-    /// The world, serving `releases` (a fixture file's name, or JSON).
     fn fake(&self, releases: &str) -> Fake {
         let releases = if releases.starts_with(['[', '{']) {
             releases.to_string()
@@ -728,7 +698,6 @@ impl Lab {
         (ended, String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// The default run: the env as given, no flags.
     fn run(&self, world: &mut Fake) -> (Result<Outcome, Failure>, String) {
         self.sync(&Options::default(), &self.env(), world)
     }
@@ -741,7 +710,6 @@ impl Lab {
         self.git.ok(&self.site_root, &["rev-parse", "HEAD"])
     }
 
-    /// origin's main, as a fetch sees it now.
     fn origin_main(&self) -> String {
         self.git.ok(&self.origin, &["rev-parse", "main"])
     }
@@ -761,7 +729,6 @@ impl Lab {
         self.site_root.join(".git").join(crate::site::OWED_MARK)
     }
 
-    /// The site origin refuses every push (a protected branch, a lost credential).
     fn refuse_pushes(&self, refuse: bool) {
         if refuse {
             self.git
@@ -789,7 +756,6 @@ fn failure(ended: Result<Outcome, Failure>, out: &str) -> Failure {
     }
 }
 
-/// The child that failed, or a panic naming what ended the sync instead.
 fn failed_child(ended: Result<Outcome, Failure>, out: &str) -> (&'static str, String) {
     match failure(ended, out) {
         Failure::Child { child, said } => (child, said),
@@ -797,7 +763,6 @@ fn failed_child(ended: Result<Outcome, Failure>, out: &str) -> (&'static str, St
     }
 }
 
-/// The words of a refusal of `kind`, or a panic naming what ended the sync instead.
 fn refused(ended: Result<Outcome, Failure>, out: &str, kind: Refusal) -> String {
     match failure(ended, out) {
         Failure::Refused { kind: k, why } if k == kind => why,
@@ -805,11 +770,6 @@ fn refused(ended: Result<Outcome, Failure>, out: &str, kind: Refusal) -> String 
     }
 }
 
-/// TODAY'S RELEASE: the newest stable release's versioned DMG is what the buttons name,
-/// at its true size; the engine is rebuilt from the promoted commit on the wasm32 pin,
-/// bound, optimised and installed as one pair named by its module's hash;
-/// `/releases` and the sitemap follow; ONE commit of exactly the owned files is pushed,
-/// deployed once and verified live.
 #[test]
 fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     let lab = Lab::new();
@@ -1021,9 +981,6 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     );
 }
 
-/// THE NEXT RELEASE: the lean cut's DMG, 31 MB in decimal units; no Linux tarball in the
-/// whole history removes the attribute rather than deriving one; and flipping back to
-/// the older list rewrites every page again.
 #[test]
 fn the_next_release_moves_every_page_and_back() {
     let lab = Lab::new();
@@ -1073,8 +1030,6 @@ fn the_next_release_moves_every_page_and_back() {
     );
 }
 
-/// The public snapshot exports no CHANGELOG.md: `/releases` is rendered from the stable
-/// release bodies, the cutter's asset legend dropped — the reviewed bytes.
 #[test]
 fn release_bodies_render_releases_when_the_public_tree_has_no_changelog() {
     let lab = Lab::at("site-repo", false);
@@ -1087,8 +1042,6 @@ fn release_bodies_render_releases_when_the_public_tree_has_no_changelog() {
     );
 }
 
-/// A DRY RUN plans and changes nothing — the same plan a real run would carry out, the
-/// engine rebuild included — whether asked by flag or by `PUB_DRY_RUN`.
 #[test]
 fn a_dry_run_plans_and_changes_nothing() {
     let lab = Lab::new();
@@ -1138,8 +1091,6 @@ fn a_dry_run_plans_and_changes_nothing() {
     }
 }
 
-/// A DMG the API gave no size for is still the download; the page names it alone,
-/// never a guessed size.
 #[test]
 fn an_unsized_dmg_is_linked_by_name_alone() {
     let lab = Lab::new();
@@ -1158,8 +1109,6 @@ fn an_unsized_dmg_is_linked_by_name_alone() {
     }
 }
 
-/// NO USABLE SITE CHECKOUT is exit 3 having touched nothing — a missing directory, or one
-/// without its deploy script, which is named; `--skip-site` is always a clean no-op.
 #[test]
 fn no_usable_site_checkout_touches_nothing() {
     let lab = Lab::new();
@@ -1197,8 +1146,6 @@ fn no_usable_site_checkout_touches_nothing() {
     assert!(world.calls.is_empty());
 }
 
-/// A MISSING OR EXPIRED FIREBASE LOGIN is not a failure of the release: committed and
-/// pushed, not deployed, and owed.
 #[test]
 fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() {
     at_once(
@@ -1213,7 +1160,6 @@ fn a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure() 
     );
 }
 
-/// One case of [`a_missing_firebase_login_commits_and_pushes_but_never_hides_a_real_failure`].
 fn a_missing_firebase_login_case((deploy, firebase_ok, want_failure): (Deploy, bool, bool)) {
     let lab = Lab::new();
     let mut world = lab.fake("releases-fat.json");
@@ -1260,9 +1206,6 @@ fn a_missing_firebase_login_case((deploy, firebase_ok, want_failure): (Deploy, b
     );
 }
 
-/// `--no-deploy` (or SITE_NO_DEPLOY=1) commits and pushes only, and says so — never
-/// "already shown"; a re-run with nothing to commit stays off the live site rather than
-/// calling the undeployed site wrong.
 #[test]
 fn no_deploy_commits_and_pushes_only() {
     let lab = Lab::new();
@@ -1287,9 +1230,6 @@ fn no_deploy_commits_and_pushes_only() {
     assert!(world.deploys().is_empty());
 }
 
-/// AN INTERRUPT STARTS NOTHING FURTHER: a SIGTERM that arrives while the push runs lets
-/// the push finish, and then no deploy, login probe or live check starts — the sync
-/// says so, the commit is owed, and the next run deploys it.
 #[test]
 fn an_interrupt_starts_nothing_further() {
     let lab = Lab::new();
@@ -1348,10 +1288,6 @@ fn an_interrupt_starts_nothing_further() {
     assert_eq!((lab.head(), lab.status()), (before, String::new()));
 }
 
-/// AN INTERRUPTED SYNC'S OWN FILES ARE PUT BACK, a person's never are: a sync stopped
-/// after it wrote (and staged) the owned files but before its commit leaves them dirty
-/// and itself in flight; the next run, with no commit of ours owed, restores them from
-/// HEAD and finishes the job.
 #[test]
 fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
     let lab = Lab::new();
@@ -1401,9 +1337,6 @@ fn an_interrupted_syncs_own_files_are_put_back_and_a_persons_are_refused() {
     assert!(read(&path).ends_with("<!-- wip -->\n"));
 }
 
-/// A STAGED FILE THE SYNC DOES NOT OWN, beside an interrupted sync's own: the put-back
-/// touches only what the sync owns, and the staged change still refuses the run, left
-/// staged as it was.
 #[test]
 fn an_interrupted_sync_beside_a_staged_file_it_does_not_own_is_refused() {
     let lab = Lab::new();
@@ -1436,9 +1369,6 @@ fn an_interrupted_sync_beside_a_staged_file_it_does_not_own_is_refused() {
     );
 }
 
-/// DEPLOYED, BUT THE LIVE SITE COULD NOT BE READ: never reported as synced — the
-/// outcome says the release was not verified live, the CLI warns and exits 0, and the
-/// release's after-cut step carries it as a note, not a stop.
 #[test]
 fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
     let lab = Lab::new();
@@ -1467,9 +1397,6 @@ fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
     );
 }
 
-/// DEPLOYED, BUT THE LIVE SITE DISAGREES: exit 4, naming what differs — a CDN that still
-/// serves the old engine, or a live engine built from a commit the site repo never
-/// committed (any clean-checkout deploy would silently roll it back).
 #[test]
 fn a_live_site_that_disagrees_after_the_deploy_is_named() {
     let lab = Lab::new();
@@ -1508,9 +1435,6 @@ fn a_live_site_that_disagrees_after_the_deploy_is_named() {
     );
 }
 
-/// WHAT IS DEPLOYED MUST BE WHAT IS COMMITTED: an engine the site repo ignores is refused
-/// at the commit (git's own words), and one git cannot see (the marker assume-unchanged)
-/// by comparing the marker on disk with the committed one — both before any deploy.
 #[test]
 fn an_engine_the_site_repo_does_not_hold_is_never_deployed() {
     let lab = Lab::new();
@@ -1566,9 +1490,6 @@ fn an_engine_the_site_repo_does_not_hold_is_never_deployed() {
     assert!(world.deploys().is_empty());
 }
 
-/// A PAGE THAT LOST A RULE'S SHAPE fails loudly, before the engine rebuild makes the first
-/// write — so the checkout is left exactly as it was; and edits to an owned page that
-/// are not committed are refused, never swept into the release commit.
 #[test]
 fn a_page_out_of_shape_or_dirty_is_refused_before_anything_is_written() {
     for (page, from, to, rule) in [
@@ -1616,8 +1537,6 @@ fn a_page_out_of_shape_or_dirty_is_refused_before_anything_is_written() {
     );
 }
 
-/// A RELEASE STREAM WITH NO VERSIONED DMG ANYWHERE is refused before anything is written:
-/// the site keeps its previous link.
 #[test]
 fn a_stream_with_nothing_installable_keeps_the_previous_link() {
     let lab = Lab::new();
@@ -1635,9 +1554,6 @@ fn a_stream_with_nothing_installable_keeps_the_previous_link() {
     );
 }
 
-/// THE COMMIT IS THE PROMOTED ONE: an unknown or short sha, or none, is refused; `--latest`
-/// asks the authenticated gh for main's tip; a gh that cannot answer stops both GitHub
-/// reads, naming gh, with nothing fetched around it.
 #[test]
 fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
     let lab = Lab::new();
@@ -1653,7 +1569,6 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
         };
         let (ended, out) = lab.sync(&Options::default(), &env, &mut world);
         if fetched {
-            // a full sha the public repo does not have: the fetch of it fails
             assert_eq!(failed_child(ended, &out).0, "git fetch", "{commit:?}");
         } else {
             let _ = refused(ended, &out, Refusal::Commit);
@@ -1702,7 +1617,6 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
     );
 }
 
-/// A site checkout whose path holds spaces plans and syncs like any other.
 #[test]
 fn a_site_dir_with_spaces_syncs() {
     let lab = Lab::at("site repo", true);
@@ -1726,9 +1640,6 @@ fn a_site_dir_with_spaces_syncs() {
     assert_eq!(lab.head(), lab.origin_main());
 }
 
-/// THE ENGINE'S COMPILER: the engine is built on the wasm32 pin and the transcript says
-/// so; with no pin it is built on rustup's stable, as the site's script did, and the
-/// transcript says that instead.
 #[test]
 fn the_engine_is_built_on_the_pin_and_says_which() {
     let lab = Lab::new();
@@ -1754,10 +1665,6 @@ fn the_engine_is_built_on_the_pin_and_says_which() {
     assert!(!out.contains("wasm32 pin"), "{out}");
 }
 
-/// AN ENGINE THAT CANNOT BE SHIPPED IS NEVER INSTALLED: a build that fails, a module the
-/// glue generator refuses, one that still holds the builder's home, or one wasm-opt left
-/// as it was each fail the sync before the checkout is written — the old pair, no
-/// marker, no commit, no deploy — and say which.
 #[test]
 fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
     for (fault, said) in [
@@ -1800,9 +1707,6 @@ fn an_engine_that_cannot_ship_fails_the_sync_and_writes_nothing() {
     }
 }
 
-/// THE PROMOTE-TIME RUN DEFERS TO THE CUT: the engine's hook carries PUB_STAGING_COMMIT and
-/// no `--latest`, before the version has a release — nothing is asked, built, committed or
-/// deployed (a dry run too).
 #[test]
 fn the_promote_time_run_defers_to_the_cut() {
     let lab = Lab::new();
@@ -1837,9 +1741,6 @@ fn the_promote_time_run_defers_to_the_cut() {
     deployed(&ended, &out);
 }
 
-/// ORIGIN HAS IT BEFORE ANYTHING IS DEPLOYED: a refused push or a failed pull stops the run
-/// before deploy.sh with the sync commit kept here, and the next run finishes the job —
-/// pushing the leftover and deploying it.
 #[test]
 fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     let lab = Lab::new();
@@ -1888,8 +1789,6 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     assert_eq!(failed_child(ended, &out).0, "git push");
 }
 
-/// A FAILED PULL is as fatal and as early, leaves no rebase behind, and its remedy leads to
-/// a deploy: following it (a pull by hand, no push) the re-run pushes and deploys.
 #[test]
 fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_once() {
     let latest = Options {
@@ -1978,8 +1877,6 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
     assert!(world.deploys().is_empty());
 }
 
-/// The other ways a pushed sync commit goes undeployed — `--no-deploy`, no Firebase login —
-/// leave it owed, and the next plain run deploys it.
 #[test]
 fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
     at_once([Deploy::Ok, Deploy::AuthErr], |first| {
@@ -2002,9 +1899,6 @@ fn an_undeployed_sync_commit_is_deployed_by_the_next_run() {
     });
 }
 
-/// THE INTEL MARK: the chosen release's record of running its x86_64 slice, and how much
-/// of the pinned toolset the index publishes per Mac architecture (read from the download
-/// host), reach the committed `/aterm` and `/terminal` anchors and are compared live.
 #[test]
 fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
     let lab = Lab::new();
@@ -2091,10 +1985,6 @@ fn the_intel_mark_and_the_toolchain_facts_reach_the_committed_pages() {
     }
 }
 
-/// `/install.sh` IS THE PUBLIC COMMIT'S INSTALLER, and one it cannot serve honestly is
-/// refused before anything is written: a public commit with no `tools/install.sh`
-/// (the Linux command would fetch a 404), or one whose piped run would install from
-/// another repository than the one whose releases the site links.
 #[test]
 fn an_installer_the_site_cannot_serve_is_refused_before_anything_is_written() {
     for (label, edit, words) in [
@@ -2136,9 +2026,6 @@ fn an_installer_the_site_cannot_serve_is_refused_before_anything_is_written() {
     }
 }
 
-/// The live check holds `/install.sh` to the checkout's: one the live site does not
-/// serve, or serves stale, is a disagreement named as such — never redeployed on a
-/// guess.
 #[test]
 fn a_live_installer_that_is_missing_or_stale_is_named() {
     let lab = Lab::new();

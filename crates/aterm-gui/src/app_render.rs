@@ -1469,7 +1469,7 @@ impl CompanionInk {
     }
 }
 
-/// The companion seam (`docs/design/RAINBOW-KITTY-V2.md` §7.2, D13).
+/// The companion seam.
 pub(crate) fn route_v2_companion(
     ws: &mut WindowState,
     ink: CompanionInk,
@@ -2051,9 +2051,6 @@ fn recheck_sync_frame_hold(
         return false;
     }
     if preflight.terminal_id != current.terminal_id {
-        // The pane changed terminal identity after the plan snapshot: do not
-        // authorize extraction against a different owner. The next redraw
-        // rebuilds the visible set.
         return true;
     }
     let (hold, _) = step_sync_pane_hold(&mut window.sync_holds, current, now, timeout);
@@ -3309,15 +3306,7 @@ pub(crate) fn scrub_overlay_card(
     }
 }
 
-/// [`scrub_overlay_card`]'s chrome rule, run once the card's cells are in
-/// `cells`: a raster on the card's rows loses what spans the row (ground,
-/// rail, rings, the ink split and the glyph lift, which cannot be cut at the
-/// card's edge) and keeps the drawn icons it carries beside the card, which
-/// are per cell; an icon on the card's cells goes, and so does one that would
-/// spill into a blank cell of the card (`aterm_render::chrome_icon_spills`,
-/// the renderers' own rule: a band's badge between blanks, never a glass mark,
-/// which keeps to its own cell). A raster left with nothing to draw goes. A
-/// raster off the card's rows is untouched.
+/// [`scrub_overlay_card`]'s chrome rule, run once the card's cells are in `cells`.
 fn cut_chrome_rasters(
     rasters: &mut Vec<aterm_render::ChromeRaster>,
     cells: &[Vec<RenderCell>],
@@ -4597,8 +4586,6 @@ fn plan_composed_retention(
     }
     let retained = keep.iter().filter(|k| **k).count();
     if retained == 0 {
-        // The whole-composite rebuild, as the empty slice every other caller
-        // passes: one length compare per row over the plain fill and blit.
         keep.clear();
     }
     #[cfg(test)]
@@ -5229,8 +5216,6 @@ pub(crate) fn blit_pane_into_retained(
                 }
             }
             if pane_line_size.is_some() {
-                // Panes are not guaranteed to blit left-to-right, and
-                // `line_size_run_at` binary-searches by `start_col`.
                 spans.sort_unstable_by_key(|s| s.start_col);
             }
         }
@@ -7220,7 +7205,9 @@ impl App {
         self.backend.cell_size()
     }
 
-    /// The cell size (px) for window `wid` from its own [`MetricsView`] (`font_px`), resolved against the shared faces via [`crate::Backend::cell_geometry`], so it is right even while the shared renderer is activated to another window's size.
+    /// The cell size (px) for window `wid` from its own [`MetricsView`](crate::MetricsView)
+    /// (`font_px`), resolved against the shared faces via [`crate::Backend::cell_geometry`], so
+    /// it is right even while the shared renderer is activated to another window's size.
     pub(crate) fn win_cell_size(&self, wid: WindowId) -> (usize, usize) {
         match self.windows.get(&wid) {
             Some(ws) => {
@@ -7270,12 +7257,6 @@ impl App {
                     )
                 };
                 if !pulse_holds {
-                    // The PTY learns it too, with the same rows/cols and new pixels,
-                    // so `TIOCGWINSZ` is right for the boot session (spawned at 0x0
-                    // before the backend build joined) and after a font zoom or DPI
-                    // change that keeps rows/cols (where `apply_term_resize` returns
-                    // early). Memoized on `cell_px_reported`, so it cannot churn
-                    // SIGWINCH.
                     aterm_pty::resize_with_cell_px(s.master, grid.0, grid.1, Some(px));
                 }
                 send_window_reports(s, reports);
@@ -7293,7 +7274,8 @@ impl App {
         }
     }
 
-    /// Interior padding (device px per edge) for window `wid`, from its own per-window [`MetricsView`] (mixed-DPI).
+    /// Interior padding (device px per edge) for window `wid`, from its own per-window
+    /// [`MetricsView`](crate::MetricsView) (mixed-DPI).
     pub(crate) fn win_pad(&self, wid: WindowId) -> usize {
         self.windows
             .get(&wid)
@@ -7307,7 +7289,8 @@ impl App {
             .map_or_else(|| self.backend.pad_top(), |ws| ws.metrics.pad_top)
     }
 
-    /// Chrome headroom (device px) above window `wid`'s padded grid (the titlebar band the effects layer may draw into), from its own per-window [`MetricsView`].
+    /// Chrome headroom (device px) above window `wid`'s padded grid (the titlebar band the effects
+    /// layer may draw into), from its own per-window [`MetricsView`](crate::MetricsView).
     pub(crate) fn win_head(&self, wid: WindowId) -> usize {
         match self.windows.get(&wid) {
             Some(ws) if ws.os_window.is_some() => ws.metrics.head,
@@ -7398,7 +7381,8 @@ impl App {
         )
     }
 
-    /// Glyph rasterization size (physical px) for window `wid`, from its own per-window [`MetricsView`] (mixed-DPI).
+    /// Glyph rasterization size (physical px) for window `wid`, from its own per-window
+    /// [`MetricsView`](crate::MetricsView) (mixed-DPI).
     pub(crate) fn win_font_px(&self, wid: WindowId) -> f32 {
         self.windows
             .get(&wid)
@@ -8328,11 +8312,6 @@ impl App {
 
     fn retire_composed_cursor_effects_for_history(&mut self, wid: WindowId) {
         if let Some(window) = self.windows.get_mut(&wid) {
-            // History, not a new space: the live grid the band describes has not
-            // moved, so the band is kept. This frame projects none of it
-            // (`composed_cursor_effect_valid` is dropped below), but it is still
-            // there when the live viewport returns. No one-frame hide is armed:
-            // this arm advances no effect clock (see [`TornBand::Keep`]).
             retire_torn_cursor_fx_with(window, TornBand::Keep);
         }
     }
@@ -10676,9 +10655,6 @@ impl App {
             state.rain_hidden_band.clear();
         }
         if composed {
-            // The scroll-pill latch belongs to single-pane viewport chrome; a
-            // composed frame does not paint it, so do not leave its erase
-            // cadence armed.
             state.pill_shown = false;
         } else {
             state.composed_cursor_effect_valid = false;
@@ -11702,8 +11678,6 @@ impl App {
                         })
                         .fp;
                     if deco_rescan {
-                        // This present supplied the birth tick; a later capture must
-                        // not reuse its output stamp.
                         ws.pending_deco_birth = None;
                     }
                     self.kitty_log.observe_ambient(
@@ -11795,8 +11769,6 @@ impl App {
                     fp
                 }
             } else {
-                // The config-admission edge already retired word episodes; keep the
-                // shared placement and atlas warm for the cursor companion below.
                 0
             };
             deco_fp ^= emit_routed_cursor_companion(
@@ -12122,8 +12094,6 @@ impl App {
             }
             if let Some((pmode, editing)) = single_pane_pred_mode {
                 if pmode == crate::predict::PredictMode::Off {
-                    // Switched off with guesses pending: flush them, or the stranded
-                    // past deadline spins the event loop.
                     ws.predictor.reset();
                 } else {
                     ws.predictor.set_mode(pmode);
@@ -12215,8 +12185,6 @@ impl App {
         {
             let now = frame_started;
             if scrolled {
-                // The expiry flush still runs: an in-flight guess must expire, or
-                // `next_deadline()` stays in the past and the repaint spins.
                 let _ = ws.predictor.overlay(now);
             } else {
                 let painted = paint_prediction_overlay(
@@ -13565,9 +13533,6 @@ impl App {
                     )
                 });
                 if advance_cursor_fx {
-                    // This headless capture is the presentation boundary: consume
-                    // only the damage the snapshot represents; later writes stay
-                    // pending.
                     term.take_damage();
                 }
                 (focus, cursor_fx_sample)
@@ -13705,8 +13670,6 @@ impl App {
                     .clone_from(&ws.pane_scratch);
             }
             if focused {
-                // Re-probe the hover under a still pointer against this pane's own
-                // hold, as the composed route does for its focused pane.
                 self.refresh_hover_for_frame_locked(wid, &term);
             }
             let ws = self.windows.get_mut(&wid)?;
@@ -13948,9 +13911,6 @@ impl App {
         }
         let active = ws.fx.streak_panes().any(|engine| engine.is_active());
         if active {
-            // Composed panes share the single-pane engine's phase-locked
-            // decoration lane; refresh it while any pane has moving light (the
-            // idle/Settle interval is handled by `output_streak_next_change_deadline`).
             ws.note_deco_animating(ctx.now);
         }
         fp
@@ -15605,10 +15565,6 @@ impl App {
             let (sub_rows, sub_cols) = (r.rows as usize, r.cols as usize);
             let focused_pane = pane_index == focus_index;
             if focused_pane {
-                // Move the focused extraction into the ordinary pane slot for
-                // host-only prediction/blit work (allocation-free; restored after
-                // this pane). The return leg must be told whether the region
-                // below wrote cells; see [`take_focused_pane_scratch`].
                 take_focused_pane_scratch(ws);
             } else {
                 let buf = ws.unfocused_pane_scratch.entry(pane_index).or_default();
@@ -15634,8 +15590,6 @@ impl App {
                     ws.predictor.set_mode(pmode);
                     ws.predictor.set_editing(pediting);
                     if focus_scrolled {
-                        // Scrolled into history: never paint over scrollback,
-                        // but still run the expiry flush after this branch.
                         Some(false)
                     } else {
                         let input = &ws.pane_scratch;
@@ -16249,11 +16203,6 @@ impl App {
                     }
                 }
                 if r + 1 == strip {
-                    // The band's bottom edge on Linux, stamped after the paint on
-                    // whatever the last row is (segments or bare chrome). On
-                    // Windows it is a rail on the last row's last pixel rows
-                    // (`tab_bar::strip_seam_rail`, installed after the prepend). A
-                    // no-op on macOS.
                     tab_bar::seal_strip_bottom(&mut row, palette);
                 }
                 rows.push(row);

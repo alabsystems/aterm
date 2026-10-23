@@ -236,7 +236,7 @@ pub(crate) struct EditorViewState {
     pub(crate) edit_header: Option<EditHeader>,
 }
 
-/// The header row of an `edit` ticket's view (amacs design §6.5), e.g. `Editing for git · C-c C-c done · C-c C-k abort`.
+/// The header row of an `edit` ticket's view (`app_edit`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EditHeader {
     /// The program the edit is for (the request's `for=`), when it named one.
@@ -387,9 +387,7 @@ pub(crate) enum RecoveryCapability {
     Document {
         kind: AppKind,
         uri: String,
-        /// Preserve the privileged config-editor reducer on Retry. Treating
-        /// this document as an ordinary Editor would bypass schema diagnostics
-        /// and the versioned config save lane after a failed restore.
+        /// Preserve the privileged config-editor reducer on Retry.
         config_editor: bool,
     },
 }
@@ -2092,13 +2090,13 @@ pub(crate) enum HarnessRequest {
     AiFleetFetch,
     /// Open a tab that runs one AI CLI's fix.
     AiSignIn { id: &'static str },
-    /// Raise session `session`'s tab and focus its pane (a press on its row's Show, design §10.3.1; `App::raise_session_pane`).
+    /// Raise session `session`'s tab and focus its pane (`App::raise_session_pane`).
     Show { session: u64 },
-    /// A press on SESSIONS' `Every session` row (design §11.5).
+    /// A press on SESSIONS' `Every session` row.
     Every(crate::harness_screen::EveryPress),
 }
 
-/// Settings ▸ Harness's TIMER press (design §9.3.4, `AppEffect::HarnessTimer`): session `session`'s timed Cruise.
+/// Settings ▸ Harness's TIMER press (`AppEffect::HarnessTimer`): session `session`'s timed Cruise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HarnessTimerRequest {
     pub(crate) session: u64,
@@ -3774,8 +3772,6 @@ fn shortest_unique_document_parent(uri: &str, group: &[(AppInstanceId, String)])
 }
 
 const fn stable_uri_tag(uri: &str) -> u64 {
-    // Explicit FNV-1a keeps presentation stable across runs/toolchains. This is
-    // a disambiguating display tag, never authority or a security decision.
     aterm_hash::fnv1a_64(uri.as_bytes())
 }
 
@@ -5370,9 +5366,7 @@ fn markdown_range_from_action(action: &str) -> Option<std::ops::Range<usize>> {
     Some(start.parse().ok()?..end.parse().ok()?)
 }
 
-/// Resolve only the link rows intersecting a materialized source window. Links
-/// are parser-ordered, so the initial partition is logarithmic and the remainder
-/// is capped by `limit` rather than total document size.
+/// Resolve only the link rows intersecting a materialized source window.
 fn markdown_links_in_range(
     document: &crate::native_markdown::MarkdownDocument,
     source: std::ops::Range<usize>,
@@ -5508,9 +5502,7 @@ fn bounded_markdown_text(text: &str, limit: usize) -> String {
     output
 }
 
-/// Bounded visual label projection. Unlike byte caps used for clipboard and
-/// semantic block materialization, chrome is sized in displayed characters so
-/// compact layouts receive a deliberate ellipsis instead of relying on clipping.
+/// Bounded visual label projection in displayed characters.
 fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -5536,9 +5528,7 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
         .max(minimum)
 }
 
-/// Filename-like chrome keeps both identity-bearing ends. A long document title
-/// should retain its extension and distinguishing prefix instead of relying on a
-/// parent clip that can also cover the cursor/save indicators beside it.
+/// Filename-like chrome keeps both identity-bearing ends.
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
     bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
@@ -6755,9 +6745,6 @@ impl NativeAppModel for EditorApp {
     }
 
     fn prepare_close(&mut self, _request: CloseRequest, _cx: &mut UpdateCx<'_>) -> CloseReadiness {
-        // Durability belongs to `DocumentStore` and the document host: one document can
-        // back several Markdown and editor views, so only the host knows the final view
-        // and performs its proof-gated checkpoint before committing a detach.
         CloseReadiness::Ready
     }
 }
@@ -6882,7 +6869,6 @@ fn editor_status_message(
         .as_deref()
         .filter(|status| status.starts_with("Save "))
     {
-        // The answer to the person's own Save outranks a standing recovery note.
         blocked.to_string()
     } else if let Some(recovery) = app.recovery_status.as_deref() {
         format!("Recovery · {recovery}")
@@ -6895,8 +6881,6 @@ fn editor_status_message(
     {
         summary
     } else if let Some(status) = view.status.as_deref().filter(|status| {
-        // Command feedback may outlive its command, but a clean-buffer notice
-        // cannot describe edits made after that save or checkpoint.
         !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
     }) {
         status.to_string()
@@ -6930,9 +6914,7 @@ fn command_palette_status(matches: usize, compact: bool) -> String {
     }
 }
 
-/// Scanning form: derives the caret's line by walking the document. Kept for
-/// one-shot callers; the render path uses [`editor_cursor_label_with`] with the
-/// resident line index instead of re-scanning every frame.
+/// Scanning form: derives the caret's line by walking the document.
 #[cfg(test)]
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
     editor_cursor_label_with(&crate::native_editor::EditorLines::scanning(text), view)
@@ -7906,7 +7888,6 @@ mod markdown_reader_tests {
                 (390.0, 568.0),
             ] {
                 if mode == MarkdownViewMode::Split && width < 620.0 {
-                    // The reader does not offer Split at this width.
                     continue;
                 }
                 let (mut runtime, instance, view) = markdown_runtime(&source);
@@ -8130,12 +8111,7 @@ mod markdown_reader_tests {
         }
     }
 
-    /// The config editor's problem buttons compile at every width, each
-    /// named by the words it paints ("Prev Issue", "Prev", "!›"): the UI
-    /// compiler refuses a button whose painted words are not in its name
-    /// ([`crate::native_ui::visible_label_in_name`]), and the wide "Prev
-    /// Issue" / "Next Issue" were named "Previous config problem" and "Next
-    /// config problem", which no test compiled.
+    /// The config editor's problem buttons compile at every width with visible labels matching their semantic names.
     #[test]
     fn config_problem_buttons_compile_at_every_width() {
         let source = "future_first_setting = 1\nfuture_second_setting = 2\n";
@@ -8517,13 +8493,7 @@ mod markdown_reader_tests {
         compiled.validate_parity().unwrap();
     }
 
-    /// THE EDITOR TOOLBAR IS ONE MEASURED PLAN IN WHOLE WORDS: at every
-    /// width from a wide window to a phone-width one, with and without config
-    /// problems and a disk conflict's Reload, every button paints whole words
-    /// from the toolbar's own vocabulary at its own width (no "‹!", no "…",
-    /// no shared-slot squeeze); the rows the view draws are the rows the
-    /// metrics count; and the file's rect is the one the host sizes the caret
-    /// for.
+    /// The editor toolbar compiles as a measured whole-word plan across widths and toolbar variants.
     #[test]
     fn the_editor_toolbar_is_one_measured_plan_in_whole_words() {
         const WORDS: [&str; 11] = [

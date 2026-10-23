@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Default broker retention rules ([`retain`], [`crate::mirror::NODE_WINDOW_BYTES`],
+//! Default broker retention rules ([`retain`](crate::broker_rules::retain), [`crate::mirror::NODE_WINDOW_BYTES`],
 //! [`crate::subject::inbox_group`]).
 
 use std::io;

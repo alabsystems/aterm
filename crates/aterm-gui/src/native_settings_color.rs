@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings colour picker ([`crate::native_ui::UiContent::ColorWheel`], [`color_picker_node`]) for
-//! [`ColorTarget::Key`] and [`ColorTarget::Slot`], with HSV retention
-//! ([`SettingsViewState::color_kept`]), default swatches ([`unset_color_swatch`]), pointer picks
-//! ([`SemanticInput::ColorPick`]), and cursor-matched trail colour ([`prefs::TRAIL_COLOR_CURSOR`]).
+//! Settings colour picker for [`ColorTarget::Key`] and [`ColorTarget::Slot`].
 
 use super::*;
 use crate::native_ui::ColorWheelSpec;
@@ -17,23 +14,17 @@ pub(super) struct KeptColor {
     hsv: [f32; 3],
 }
 
-/// How many colours the picker remembers: enough for an Undo trail back
-/// through every colour of a session's picking.
 const KEPT_COLORS: usize = 32;
 
-/// One turn of the wheel's hue under one Left or Right (Shift: six).
 const HUE_STEP: f32 = 1.0 / 72.0;
 
-/// One step of the wheel's saturation under one Up or Down.
 const SATURATION_STEP: f32 = 0.05;
 
-/// Brightness moves in whole twentieths, the slider's grid.
 const BRIGHTNESS_STEP: f64 = 0.05;
 
 /// The node keys' and actions' name for the palette slot Themes' Customize sheet has open.
 pub(super) const PALETTE_SLOT_ID: &str = "palette-slot";
 
-/// The names the picker remembers each palette slot's colours under.
 const PALETTE_SLOT_KEPT: [&str; 16] = [
     "palette-slot/0",
     "palette-slot/1",
@@ -61,7 +52,6 @@ pub(super) enum ColorTarget {
 }
 
 impl ColorTarget {
-    /// The node keys' and actions' name: the key, or [`PALETTE_SLOT_ID`].
     const fn id(self) -> &'static str {
         match self {
             Self::Key(key) => key,
@@ -69,7 +59,6 @@ impl ColorTarget {
         }
     }
 
-    /// The name the picker remembers this target's colours under.
     fn kept(self) -> &'static str {
         match self {
             Self::Key(key) => key,
@@ -91,9 +80,6 @@ pub(super) fn color_target(state: &SettingsViewState, id: &str) -> Option<ColorT
 }
 
 impl SettingsViewState {
-    /// Remember that the picker made `key`'s colour from `hsv` (`key` as
-    /// [`ColorTarget::kept`] names it), most recent first, and return the
-    /// colour.
     fn keep_color(&mut self, key: &'static str, hsv: [f32; 3]) -> [u8; 3] {
         let rgb = crate::widget::hsv_to_rgb(hsv[0], hsv[1], hsv[2]);
         self.color_kept
@@ -151,14 +137,10 @@ pub(super) fn color_key(state: &SettingsViewState, key: &str) -> Option<&'static
         .map(|field| field.key)
 }
 
-/// `#RRGGBB`.
 fn hex(rgb: [u8; 3]) -> String {
     format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
 
-/// The colours the theme itself draws for the colour keys while they are
-/// unset: the working theme (pinned, drafted or saved, on the side the
-/// preview shows) with no colour key over it.
 fn theme_own_colors(state: &SettingsViewState) -> crate::resolved_colors::ResolvedColors {
     let theme = state
         .environment_override(prefs::EDIT_THEME)
@@ -225,7 +207,6 @@ pub(super) fn default_color_chip(state: &SettingsViewState, field: &EditField) -
 pub(super) fn color_now(state: &SettingsViewState, key: &str) -> Option<[u8; 3]> {
     let raw = state.raw_value(key);
     if trail_color_is_cursor(key, raw.as_deref()) {
-        // The cursor's colour, which a program may recolour: no one colour.
         return None;
     }
     raw.as_deref()
@@ -234,15 +215,11 @@ pub(super) fn color_now(state: &SettingsViewState, key: &str) -> Option<[u8; 3]>
         .or_else(|| unset_color_swatch(state, key))
 }
 
-/// Whether `raw` is the trail colour's word for the cursor's colour
-/// ([`prefs::TRAIL_COLOR_CURSOR`]).
 fn trail_color_is_cursor(key: &str, raw: Option<&str>) -> bool {
     key == prefs::EDIT_CURSOR_TRAIL_COLOR
         && prefs::trail_color_setting(raw) == aterm_effects::cursor_fx::TrailColor::Cursor
 }
 
-/// The colour `target` draws now: a key's ([`color_now`]), or the open
-/// palette slot's draft, else the colour the slot shows.
 fn target_now(state: &SettingsViewState, target: ColorTarget) -> Option<[u8; 3]> {
     match target {
         ColorTarget::Key(key) => color_now(state, key),
@@ -260,9 +237,6 @@ fn target_now(state: &SettingsViewState, target: ColorTarget) -> Option<[u8; 3]>
     }
 }
 
-/// THE PICKER'S MODEL of `target`'s colour, as hue, saturation and
-/// brightness: the exact ones the picker made the colour now drawn from,
-/// where it made it, else the colour's own.
 fn target_hsv(state: &SettingsViewState, target: ColorTarget) -> Option<[f32; 3]> {
     let rgb = target_now(state, target)?;
     let kept = target.kept();
@@ -286,8 +260,6 @@ pub(super) fn color_target_hsv(state: &SettingsViewState, target: ColorTarget) -
     target_hsv(state, target)
 }
 
-/// What a picker shows for its target: the names its controls speak and
-/// the colour in words.
 struct ColorSubject {
     target: ColorTarget,
     /// "Foreground color wheel", "Colour wheel for palette colour 3, yellow".
@@ -333,8 +305,6 @@ impl ColorSubject {
     }
 }
 
-/// The colour a row names, in words: the saved `#RRGGBB`, or the default's
-/// words and the colour they name ("Automatic (default), #3A3A3E").
 fn color_words(state: &SettingsViewState, field: &EditField) -> String {
     if trail_color_is_cursor(field.key, state.raw_value(field.key).as_deref()) {
         return prefs::TRAIL_COLOR_CURSOR_LABEL.to_string();
@@ -352,7 +322,6 @@ fn color_words(state: &SettingsViewState, field: &EditField) -> String {
     }
 }
 
-/// "foreground color", "cursor color": the setting as the colour it is.
 fn color_noun(label: &str) -> String {
     let lower = label.to_lowercase();
     if lower.ends_with("color") {
@@ -362,9 +331,6 @@ fn color_noun(label: &str) -> String {
     }
 }
 
-/// The subject's colour wheel, `height` tall. Its value is the colour in
-/// words; it takes a pick ([`SemanticInput::ColorPick`]), a `#RRGGBB`, or,
-/// pressed with no value, sends the keyboard to the hex row.
 fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f32) -> UiNode {
     let id = subject.target.id();
     UiNode::new(
@@ -389,8 +355,6 @@ fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f
     )
 }
 
-/// The subject's Brightness slider: the colour's brightness in whole
-/// percent, its hue and saturation kept.
 fn color_brightness_node(state: &SettingsViewState, subject: &ColorSubject) -> UiNode {
     let id = subject.target.id();
     let hsv = target_hsv(state, subject.target);
@@ -430,8 +394,6 @@ fn color_brightness_node(state: &SettingsViewState, subject: &ColorSubject) -> U
     )
 }
 
-/// Brightness as a row of a column `column_width` wide, laid out the way a
-/// registry row is at `width`.
 fn color_brightness_row(
     state: &SettingsViewState,
     subject: &ColorSubject,
@@ -480,17 +442,10 @@ fn color_brightness_row(
     )
 }
 
-/// The node key of the trail colour picker's Cursor color.
 fn cursor_color_button_key(key: &str) -> String {
     format!("settings/color/{key}/cursor")
 }
 
-/// THE TRAIL COLOUR'S CURSOR COLOR, in its picker, and its width: chosen
-/// (marked, Brightness idle with no one colour to brighten), the trail is
-/// drawn in the cursor's colour, following it as a program recolours it
-/// (`cursor`, [`prefs::TRAIL_COLOR_CURSOR`], what the old `classic mono` style
-/// says); pressed again, or a pick on the wheel, and the trail takes a colour
-/// of its own.
 fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Option<(UiNode, f32)> {
     let ColorTarget::Key(key) = subject.target else {
         return None;
@@ -550,16 +505,11 @@ fn cursor_color_button(state: &SettingsViewState, subject: &ColorSubject) -> Opt
     Some((button, width))
 }
 
-/// The wheel beside its controls, at least `floor` wide.
 const SIDE_WHEEL_FLOOR: f32 = 96.0;
-/// The wheel over its controls, at least this tall.
 const WHEEL_FLOOR: f32 = 120.0;
-/// Between the wheel and the column beside it.
 const SIDE_GAP: f32 = 16.0;
-/// The least column that still holds a label over its control.
 const SIDE_COLUMN_FLOOR: f32 = 220.0;
 
-/// The wheel's natural size at this width.
 fn natural_wheel(width: SettingsWidth) -> f32 {
     if width == SettingsWidth::Compact {
         200.0
@@ -568,10 +518,6 @@ fn natural_wheel(width: SettingsWidth) -> f32 {
     }
 }
 
-/// THE PICKER BESIDE ITS CONTROLS: the wheel, and the column `controls`
-/// builds for a column so wide (laid out as a `column` page lays its rows
-/// out: a compact column puts each label over its control), in one row
-/// `text_width` wide and at most `room` tall.
 fn color_picker_beside(
     state: &SettingsViewState,
     subject: &ColorSubject,
@@ -614,8 +560,6 @@ fn color_picker_beside(
     ))
 }
 
-/// The rows of the picker over its controls: the wheel, yielding height
-/// toward its `floor` where `room` is short, then the controls.
 fn color_picker_stacked(
     state: &SettingsViewState,
     subject: &ColorSubject,
@@ -631,12 +575,8 @@ fn color_picker_stacked(
     rows
 }
 
-/// The least wheel a picker under a row draws, on a page whose list is
-/// short (80x24's Search, a preview above it): still a disk to pick on.
 const ROW_WHEEL_FLOOR: f32 = 64.0;
 
-/// The least wheel beside its controls in a list shorter than any other
-/// form of the picker: a disk the arrow keys and a pointer still pick on.
 const TIGHT_WHEEL_FLOOR: f32 = 40.0;
 
 /// `row` (a colour row, `key`'s) with its open picker under it, as one stop of the list.
@@ -696,8 +636,6 @@ pub(super) fn palette_slot_picker(
     )
 }
 
-/// The wheel and Brightness for `target`, beside each other where the
-/// column has room, else stacked, at most `room` tall.
 fn color_picker_card(
     state: &SettingsViewState,
     target: ColorTarget,
@@ -818,8 +756,6 @@ pub(super) fn page_owned_control_form(
     }
 }
 
-/// Whether Modified's wallpaper row is a way to the Wallpaper page: while
-/// the row holds no draft of its own to correct.
 fn wallpaper_row_links(state: &SettingsViewState, field: &EditField, modified_only: bool) -> bool {
     field.key == prefs::EDIT_WALLPAPER
         && modified_only
@@ -828,10 +764,6 @@ fn wallpaper_row_links(state: &SettingsViewState, field: &EditField, modified_on
         && !state.field_errors.contains_key(field.key)
 }
 
-/// MODIFIED'S WALLPAPER ROW: its control becomes a button that names the
-/// image as the Wallpaper page's status does (the file's name and size, not
-/// the head of its path; [`wallpaper_words`]), the whole path its value, and
-/// opens the Wallpaper page, which chooses and removes it.
 fn link_wallpaper_row(state: &SettingsViewState, field: &EditField, row: &mut UiNode) {
     let key = format!("settings/control/{}", field.key);
     let Some((visual, spoken)) = wallpaper_words(state) else {
@@ -906,10 +838,6 @@ fn find_node<'a>(node: &'a mut UiNode, key: &str) -> Option<&'a mut UiNode> {
         .find_map(|child| find_node(child, key))
 }
 
-/// The Window page's selected tab color row: its control becomes a button
-/// that names the colour in use, wears its chip (the automatic colour's
-/// while none is set) and opens the Tab Color page, which holds the wheel,
-/// the brightness and the hex field.
 fn link_tab_color_row(state: &SettingsViewState, field: &EditField, row: &mut UiNode) {
     let key = format!("settings/control/{}", field.key);
     let Some(control) = find_node(row, &key) else {
@@ -953,9 +881,6 @@ fn link_tab_color_row(state: &SettingsViewState, field: &EditField, row: &mut Ui
     );
 }
 
-/// A colour row's Choose…: after its hex field (narrowed to what a hex
-/// colour needs) and ahead of its Reset; it opens the picker under the row,
-/// and closes it again.
 fn add_color_chooser(
     state: &SettingsViewState,
     field: &EditField,
@@ -1150,9 +1075,6 @@ pub(super) fn tab_color_page(
 }
 
 impl SettingsApp {
-    /// Make `target`'s colour the one `hsv` gives and remember the exact hue,
-    /// saturation and brightness that made it, even where the colour is the
-    /// one already in force (the model still follows the slider).
     fn commit_color_hsv(
         &mut self,
         view: &mut SettingsViewState,
@@ -1177,8 +1099,6 @@ impl SettingsApp {
         self.commit_color_value(view, key, hex(rgb), cx);
     }
 
-    /// Save `value` as `key`'s colour at once, replacing any draft in its
-    /// row's hex field; nothing is written where the key already holds it.
     fn commit_color_value(
         &mut self,
         view: &mut SettingsViewState,
@@ -1210,10 +1130,6 @@ impl SettingsApp {
         cx.repaint(crate::native_app::DamageRegion::All);
     }
 
-    /// The trail colour's Cursor color ([`cursor_color_button`]): chosen,
-    /// it saves the cursor's colour by its word; unchosen, the colour the
-    /// cursor has now as the trail's own, so the trail looks the same and
-    /// the wheel starts from it.
     fn commit_cursor_color(
         &mut self,
         view: &mut SettingsViewState,

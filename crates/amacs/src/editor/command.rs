@@ -11,15 +11,12 @@ const COMMAND_COMPLETION_LIMIT: usize = 8;
 /// Columns between tab stops.
 pub const TAB_STOP: usize = 4;
 
-/// A pending `C-u` argument: Emacs's raw prefix argument, waiting for the one
-/// command that takes it.
+/// A pending `C-u` argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrefixArgument {
     /// `C-u` alone, pressed n times: 4ⁿ.
     Raw(i64),
-    /// Decimal digits typed after `C-u` (`C-u 2`). While `open`, one more
-    /// digit extends the number; a `C-u` after the digits closes it, as
-    /// Emacs's `universal-argument-more` does, so a digit after that is text.
+    /// Decimal digits typed after `C-u` (`C-u 2`).
     Numeric { value: i64, open: bool },
 }
 
@@ -35,9 +32,7 @@ impl PrefixArgument {
         repeat_count(self.value()) as usize
     }
 
-    /// The argument after one more `C-u`, as in Emacs: it multiplies a bare
-    /// `C-u` by four, closes a number being typed, and starts over at four
-    /// after a closed one.
+    /// The argument after one more `C-u`, as in Emacs.
     pub(super) const fn after_universal(argument: Option<Self>) -> Self {
         match argument {
             None | Some(Self::Numeric { open: false, .. }) => Self::Raw(4),
@@ -46,8 +41,7 @@ impl PrefixArgument {
         }
     }
 
-    /// The argument after one more decimal digit, or `None` once the number
-    /// is closed.
+    /// The argument after one more decimal digit, or `None` once the number is closed.
     pub(super) fn after_digit(self, digit: u32) -> Option<Self> {
         let digit = i64::from(digit);
         match self {
@@ -63,9 +57,7 @@ impl PrefixArgument {
         }
     }
 
-    /// The argument after `M-<digit>` (`digit-argument`): a number being
-    /// typed takes the digit, and anything else starts a new number with it,
-    /// which more digits, plain or `M-`, then extend (`M-1 2` is twelve).
+    /// The argument after `M-<digit>` (`digit-argument`).
     pub(super) fn after_meta_digit(argument: Option<Self>, digit: u32) -> Self {
         match argument {
             Some(open @ Self::Numeric { open: true, .. }) => {
@@ -81,8 +73,7 @@ impl PrefixArgument {
         }
     }
 
-    /// `C-u 4`: how the HUD names the argument, alone or before a half-typed
-    /// key sequence.
+    /// `C-u 4`: how the HUD names the argument, alone or before a half-typed key sequence.
     pub(super) fn label(self) -> String {
         format!("C-u {}", self.value())
     }
@@ -186,9 +177,7 @@ pub enum EditorCommand {
     MoveWordForward,
     DeleteBackward,
     DeleteForward,
-    /// TAB: indent to the next tab stop. Until the Language table's indent
-    /// rules arrive (slice L1) it inserts spaces at each caret up to the next
-    /// multiple of [`TAB_STOP`] columns.
+    /// TAB: indent to the next tab stop.
     IndentForTab,
     SetMark,
     KillRegion,
@@ -210,14 +199,11 @@ pub enum EditorCommand {
     StartMacro,
     EndMacro,
     PlayMacro,
-    /// Page Down (and `C-v` off Windows, `PAGE_CHORDS`): the view and every
-    /// caret a screen down, less two lines of context (Emacs'
-    /// `next-screen-context-lines`).
+    /// Page Down (and `C-v` off Windows, `PAGE_CHORDS`).
     ScrollPageDown,
-    /// Page Up (and `M-v` off Windows): the same, a screen up.
+    /// Page Up (and `M-v` off Windows): the view and every caret a screen up.
     ScrollPageUp,
-    /// `C-x k`: close a buffer's view (this one by default), saving its
-    /// draft first as closing any view does.
+    /// `C-x k`: close a buffer's view (this one by default), saving its draft first.
     KillBuffer,
     /// `C-x C-c`: in the GUI, close this view (a terminal face exits).
     SaveBuffersKillTerminal,
@@ -229,8 +215,7 @@ pub enum EditorCommand {
     BeginningOfBuffer,
     /// `M->`: point to the end of the buffer, leaving the mark behind.
     EndOfBuffer,
-    /// `C-l`: scroll so the caret's line is in the middle, then at the top,
-    /// then at the bottom, as the key repeats.
+    /// `C-l`: scroll so the caret's line cycles through middle, top, and bottom.
     RecenterTopBottom,
     /// `M-d`: kill to the end of the word.
     KillWord,
@@ -242,8 +227,7 @@ pub enum EditorCommand {
     ExchangePointAndMark,
     /// `C-x h`: the region is the whole buffer, point at its start.
     MarkWholeBuffer,
-    /// `C-u C-SPC`: point back to the last mark set in this buffer, cycling
-    /// through the earlier ones as it repeats.
+    /// `C-u C-SPC`: jump back to the last mark set in this buffer, cycling through earlier marks.
     PopMark,
     /// `C-o`: a newline after the caret, which stays put.
     OpenLine,
@@ -260,20 +244,15 @@ pub enum EditorCommand {
 /// Authority class required to execute an editor command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandAuthority {
-    /// Moves the caret, the view or the mark, or opens a minibuffer; the
-    /// document's bytes stay as they are.
+    /// Moves the caret, the view or the mark, or opens a minibuffer.
     Read,
     /// Changes the document's text in memory, as one undo unit.
     Edit,
-    /// Writes the document to its file, or closes its view (which saves a
-    /// changed draft first).
+    /// Writes the document to its file, or closes its view (which saves a changed draft first).
     Save,
     /// Opens or writes a file the command names (S9's find-file).
     Files,
-    /// Puts document text on the system clipboard: `kill-ring-save`, and
-    /// the clipboard copy of every kill
-    /// ([`super::EditorEffect::KillToClipboard`]), which an input without
-    /// this class never gets.
+    /// Puts document text on the system clipboard.
     Clipboard,
     /// Runs a program (P2's filter-region); never reachable from the wire.
     Spawn,
@@ -565,7 +544,6 @@ pub fn command_completions(query: &str) -> Vec<EditorCommand> {
 
 fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
     if query.is_empty() {
-        // Keep a constant score so blank queries stay in curated table order.
         return Some((5, 0, 0));
     }
     let hyphenated = query
@@ -577,7 +555,6 @@ fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
         return Some((0, 0, name.len()));
     }
     if name.starts_with(&hyphenated) {
-        // Prefix matches tie as a class and fall back to curated table order.
         return Some((1, 0, 0));
     }
     if let Some(position) = name.find(&hyphenated) {
@@ -588,7 +565,6 @@ fn command_match_score(name: &str, query: &str) -> Option<(u8, usize, usize)> {
         .filter(|character| character.is_ascii_alphanumeric())
         .collect::<Vec<_>>();
     if needle.is_empty() {
-        // Punctuation-only queries fall back to the curated blank-query order.
         return Some((5, 0, 0));
     }
     let mut matched = 0;
@@ -647,9 +623,6 @@ mod tests {
         }
     }
 
-    /// One C-u argument goes to exactly one command. Line motion, kill-line and
-    /// yank take it; a command with no use for it drops it, so it can never
-    /// multiply a later C-f.
     #[test]
     fn universal_argument_is_consumed_once() {
         let text = (0..10)
@@ -795,9 +768,6 @@ mod tests {
         );
     }
 
-    /// A second C-u closes a typed number, as in Emacs: C-u 1 C-u 3 types a 3
-    /// rather than making the argument 13, and a C-u after a closed number
-    /// starts over at four.
     #[test]
     fn a_second_universal_argument_closes_the_number() {
         let (mut store, mut workspace, mut view, document) = editor("ab");
@@ -830,7 +800,6 @@ mod tests {
         );
     }
 
-    /// Press `keys`, space-separated chords, and answer the last one's effects.
     fn keys(
         store: &mut DocumentStore,
         workspace: &mut EditorWorkspace,
@@ -854,8 +823,6 @@ mod tests {
         store.snapshot(document).unwrap().text.to_string()
     }
 
-    /// Every command has exactly the authority this table pins: a change to
-    /// one is a decision, made here on purpose.
     #[test]
     fn authority_table_is_total_and_pinned() {
         use CommandAuthority::{Clipboard, Edit, Read, Save};
@@ -930,8 +897,6 @@ mod tests {
         assert_ne!(moved, pinned);
     }
 
-    /// `from_name` finds every command by its exact name and nothing else:
-    /// not a prefix, not another case, not a name with spaces around it.
     #[test]
     fn from_name_round_trips_every_command() {
         let mut names = std::collections::BTreeSet::new();
@@ -952,8 +917,6 @@ mod tests {
         }
     }
 
-    /// M-x lists every command: its exact name puts it first, and the new
-    /// P0 commands are found by the words people type for them.
     #[test]
     fn m_x_lists_every_command() {
         for command in EditorCommand::ALL {
@@ -978,9 +941,6 @@ mod tests {
         );
     }
 
-    /// An Invocation runs a command with its count and its prompts'
-    /// answers in one call; with no answers a prompting command asks for
-    /// them, and with the wrong number it runs nothing.
     #[test]
     fn an_invocation_carries_its_count_and_answers() {
         let text = "one\ntwo\nthree\nfour\n";
@@ -1072,8 +1032,6 @@ mod tests {
         text(store, document)
     }
 
-    /// `kill-buffer` (C-x k) asks which buffer, this one by default: Enter
-    /// alone closes this view, and a name asks the host for that buffer.
     #[test]
     fn kill_buffer_asks_and_defaults_to_this_buffer() {
         let (mut store, mut workspace, mut view, document) = editor("keep");
@@ -1106,9 +1064,6 @@ mod tests {
         assert_eq!(workspace.kill_ring.len(), 0);
     }
 
-    /// `save-buffers-kill-terminal` (C-x C-c) closes the view; `finish-edit`
-    /// (C-c C-c, C-x #) and `abort-edit` (C-c C-k) ask the host to answer
-    /// the client waiting on the edit.
     #[test]
     fn closing_keys_ask_the_host_to_close_the_view() {
         let (mut store, mut workspace, mut view, document) = editor("text");
@@ -1127,9 +1082,6 @@ mod tests {
         assert_eq!(text(&store, document), "text");
     }
 
-    /// `beginning-of-buffer` (M-<) and `end-of-buffer` (M->) go to the ends
-    /// and leave the mark where the caret was, so C-u C-SPC comes back; an
-    /// active region stretches instead.
     #[test]
     fn buffer_ends_leave_the_mark_behind() {
         let (mut store, mut workspace, mut view, _) = editor("alpha\nbeta\ngamma");
@@ -1156,9 +1108,6 @@ mod tests {
         );
     }
 
-    /// `recenter-top-bottom` (C-l) puts the caret's line in the middle, then
-    /// at the top, then at the bottom, and starts over after another key;
-    /// `C-u 0 C-l` is the top row and `C-u -1`… counts from the bottom.
     #[test]
     fn recenter_puts_the_line_middle_top_then_bottom() {
         let text = (0..100)
@@ -1189,8 +1138,6 @@ mod tests {
         );
     }
 
-    /// `kill-word` (M-d) and `backward-kill-word` (M-DEL, and C-backspace off
-    /// macOS) kill by the words M-f and M-b move over, and take a count.
     #[test]
     fn kill_word_kills_by_words() {
         let (mut store, mut workspace, mut view, document) = editor("alpha beta gamma delta");
@@ -1225,8 +1172,6 @@ mod tests {
         );
     }
 
-    /// `kill-ring-save` (M-w) copies the region to the kill ring and leaves
-    /// the text; the region is done with, and with none it says so.
     #[test]
     fn kill_ring_save_copies_the_region() {
         let (mut store, mut workspace, mut view, document) = editor("copy this text");
@@ -1247,9 +1192,6 @@ mod tests {
         assert_eq!(text(&store, document), "thiscopy this text");
     }
 
-    /// Every kill, and `kill-ring-save`, hands the kill ring's newest entry
-    /// to the face for the system clipboard: the joined entry after a kill
-    /// that appends, and a macro's once, when it is done.
     #[test]
     fn kills_reach_the_clipboard_only_with_clipboard_authority() {
         let clipboard = |effects: Vec<EditorEffect>| {
@@ -1297,9 +1239,6 @@ mod tests {
         assert_eq!(workspace.kill_ring, [" c d", "a b"]);
     }
 
-    /// A command runs only when the input carries every authority it needs,
-    /// whichever path runs it: its key, M-x, an [`Invocation`] or a macro
-    /// that replays it.
     #[test]
     fn a_command_runs_only_with_the_authority_it_needs() {
         let refusal = || {
@@ -1373,8 +1312,6 @@ mod tests {
         );
     }
 
-    /// `exchange-point-and-mark` (C-x C-x) swaps the caret and the mark and
-    /// activates the region; without a region it uses the last mark set.
     #[test]
     fn exchange_point_and_mark_swaps_them() {
         let (mut store, mut workspace, mut view, document) = editor("one two three");
@@ -1414,8 +1351,6 @@ mod tests {
         assert_eq!(text(&store, document), "one two three");
     }
 
-    /// `mark-whole-buffer` (C-x h) makes the whole buffer the region, caret
-    /// at the start, and C-w then kills it all.
     #[test]
     fn mark_whole_buffer_selects_everything() {
         let (mut store, mut workspace, mut view, document) = editor("all\nof it");
@@ -1436,9 +1371,6 @@ mod tests {
         );
     }
 
-    /// `pop-to-mark-command` (C-u C-SPC) returns to the marks set in this
-    /// buffer, most recent first, cycling; the marks move with edits made
-    /// before them.
     #[test]
     fn pop_mark_cycles_through_this_buffers_marks() {
         let (mut store, mut workspace, mut view, document) = editor("a b c d e");
@@ -1466,8 +1398,6 @@ mod tests {
         assert_eq!(view.selections, [Selection::caret(4)]);
     }
 
-    /// `open-line` (C-o) breaks the line after the caret, which stays put;
-    /// `newline` (Enter) breaks it before, and both take a count.
     #[test]
     fn open_line_and_newline_break_the_line() {
         let (mut store, mut workspace, mut view, document) = editor("ab");
@@ -1504,10 +1434,6 @@ mod tests {
         assert_eq!(view.selections, [Selection::caret(3)]);
     }
 
-    /// A CRLF line's text ends before its `\r` (design §2.2 keeps the
-    /// ending byte-exact): C-e, C-n and C-p stop there, C-k kills the text
-    /// and then the whole CRLF, and C-t at the end swaps the two characters
-    /// before it.
     #[test]
     fn crlf_line_ends_stop_before_the_carriage_return() {
         let (mut store, mut workspace, mut view, document) = editor("abc\r\nd\r\nefg");
@@ -1538,9 +1464,6 @@ mod tests {
         assert_eq!(view.selections, [Selection::caret(2)]);
     }
 
-    /// `transpose-chars` (C-t) drags the character before the caret over
-    /// the one after it; at a line's end it swaps the two before; at the
-    /// start of the buffer it refuses.
     #[test]
     fn transpose_chars_swaps_around_the_caret() {
         let (mut store, mut workspace, mut view, document) = editor("abcd\nxy");
@@ -1566,8 +1489,6 @@ mod tests {
         assert_eq!(text(&store, document), "xe\u{301}");
     }
 
-    /// `indent-for-tab-command` (TAB) reads the workspace's options: the tab
-    /// width, and a tab character when they indent with tabs.
     #[test]
     fn tab_reads_the_indent_options() {
         let (mut store, mut workspace, mut view, document) = editor("ab");
@@ -1587,9 +1508,6 @@ mod tests {
         );
     }
 
-    /// `fill-paragraph` (M-q) refills the paragraph at the caret to the fill
-    /// column: a comment as a comment, a list item hanging under its text,
-    /// and the next paragraph left alone.
     #[test]
     fn fill_paragraph_fills_to_the_fill_column() {
         let text = "Subject\n\nThe body of a commit message that someone typed as one very long line without any breaks.\n\nNext paragraph.\n";
@@ -1652,10 +1570,6 @@ mod tests {
         );
     }
 
-    /// The fill's one arithmetic decision, exhaustively over small widths:
-    /// a word fits in the room a line leaves exactly when the line, a space
-    /// and the word stay within the fill column, and nothing overflows at
-    /// the top of the range.
     #[test]
     fn word_fits_is_room_for_a_space_and_the_word() {
         let fits =
@@ -1676,9 +1590,6 @@ mod tests {
         assert!(!fits(1, u64::MAX - 1, u64::MAX));
     }
 
-    /// Redo has Emacs's `C-?` (and the GUI's Ctrl+Shift+/), and `M-<digit>`
-    /// types a numeric argument as `C-u <digits>` does, which plain digits
-    /// then extend.
     #[test]
     fn redo_key_and_digit_argument() {
         let (mut store, mut workspace, mut view, document) = editor("");

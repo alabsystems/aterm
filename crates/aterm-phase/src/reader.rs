@@ -152,15 +152,7 @@ impl Program {
 pub struct Reading {
     pub program: Program,
     pub phase: Phase,
-    /// Whether [`Self::phase`] is the reader's evidence rather than its
-    /// default: `false` for the generic reader and the Codex reader always, for
-    /// agy's and Muse Code's off their measured shapes ([`crate::agy::phase`],
-    /// [`crate::muse::phase`]), and for
-    /// Claude Code's `idle` with no composer frame drawn (its launch, before
-    /// the REPL is up) — each says `idle` there because it cannot tell
-    /// working from waiting, not because it saw either — and, read with the
-    /// cursor ([`ScreenReader::read_at`]), for Claude Code's `idle` at a
-    /// prompt box that does not hold the cursor (an earlier run's).
+    /// Whether [`Self::phase`] is the reader's evidence rather than its default.
     pub phase_authoritative: bool,
     /// The wall the last turn ended on: `None` under a box, and while a turn runs only a
     /// health wall ([`ScreenReader::health_wall`]).
@@ -182,15 +174,7 @@ pub struct Reading {
     /// No turn yet ([`ScreenReader::fresh`]: [`crate::turn::fresh`]): an idle point here ended nothing — a
     /// session nobody has asked anything is not a worker stopped short.
     pub fresh: bool,
-    /// The composer as `(caret row, lines)`, the caret row's text first —
-    /// typed text or the dim placeholder, which only the cursor tells apart
-    /// (at column 2 of the caret row: the placeholder, for Claude Code,
-    /// and Muse Code's prompt hint, by its colour; agy draws none but
-    /// its permission mode's hint, which its reader reads as no text, and its
-    /// empty composer's text is empty: [`ScreenReader::placeholder`]; Gemini
-    /// CLI's reader takes its placeholder out by its text, so its empty
-    /// composer's is empty too); `None` with no composer on the screen (a
-    /// box, a shell).
+    /// The composer as `(caret row, lines)` with the caret row's text first, or `None` with no composer on the screen.
     pub composer: Option<(usize, Vec<String>)>,
     /// Usage credits carry the session, by the program's own notice
     /// ([`ScreenReader::credits`]).
@@ -1035,12 +1019,7 @@ pub fn may_host_agent(program: &str) -> bool {
         .any(|runtime| word.eq_ignore_ascii_case(runtime))
 }
 
-/// The program word of a `program=` / `detail=` value: the basename of its
-/// first word, a login shell's `-` dropped — borrowed, and matched against
-/// the tables without regard to case ([`program_of`], [`may_host_agent`],
-/// [`NOT_AGENTS`]; every name in them is ASCII), never lowercased into a new
-/// string: the GUI asks it of every pane's program on every frame
-/// (`harness_host::agent_of`), so it allocates nothing.
+/// Borrowed basename of `program`'s first word with any leading login-shell `-` stripped.
 fn program_word(program: &str) -> &str {
     let head = program.split_whitespace().next().unwrap_or(program);
     let base = head.rsplit('/').next().unwrap_or(head);
@@ -1061,10 +1040,7 @@ mod tests {
     };
     use crate::wall::WallKind;
 
-    /// A MESSAGE ON THE SCREEN IS DRAWN, answered or not, with words under
-    /// it or none ([`ScreenReader::message_drawn`]; the review of
-    /// `b9/forever-gaps`, RV-2: a turn ended on a tool's box read as no
-    /// conversation where only the words were asked).
+    /// [`ScreenReader::message_drawn`] detects a drawn message with or without words under it.
     #[test]
     fn a_message_on_the_screen_is_drawn_and_a_launch_holds_none() {
         use crate::prompt::fixtures::{first_turn_under_a_table, launch_under_a_table};
@@ -1325,11 +1301,7 @@ mod tests {
         );
     }
 
-    /// THE CODEX READER READS NOTHING (aterm's Codex screen lane, retired on
-    /// 2026-10-16): on its trust gate and on a running turn it names no box,
-    /// wall, composer, question or busy row, and has no caret or paste
-    /// guard, so nothing acts on a Codex's screen and `aterm drive` waits on
-    /// nothing there.
+    /// The Codex screen reader reports an inert reading with no prompt, wall, composer, or guards.
     #[test]
     fn the_codex_reader_reads_nothing() {
         let working = codex_working();
@@ -1486,14 +1458,7 @@ mod tests {
         assert_eq!(read(Some("claude"), &none, None).context_left, None);
     }
 
-    /// CLAUDE CODE'S OWN RETRY OF A USAGE LIMIT IS A TURN IN PROGRESS (accounts
-    /// v2 S5): the watchdog's ticking row, measured on 2.1.300 and 2.1.301 —
-    /// the inline renderer with and without a statusLine (with one, the
-    /// footer draws no `esc to interrupt`), the fullscreen renderer, 110, 80
-    /// and 50 columns (Ink's two columns under the glyph alone on its row),
-    /// the five-hour and the weekly limit, a turn's first request and its
-    /// second — reads busy on its status row and no wall, and so does the
-    /// same row a second later, its span ticked.
+    /// Claude Code's watchdog usage-limit retry row reads as [`Phase::Busy`] with no wall.
     #[test]
     fn the_watchdogs_retry_row_is_a_turn_in_progress() {
         use crate::phase::{Zone, background_only, transcript_end};
@@ -2167,11 +2132,7 @@ mod tests {
         assert!(!head.contains("--continue"), "{head}");
     }
 
-    /// agy ALONE CANNOT BOUND A MESSAGE THAT HOLDS A BLANK LINE
-    /// ([`ScreenReader::bounds_messages`]): on the L15 worker's measured
-    /// screen the first prompt's blank line, drawn as a blank row, ends the
-    /// message as agy's reader reads it — the task alone — and the fact line
-    /// under it, two columns in, reads as agy's reply.
+    /// [`ScreenReader::bounds_messages`] is `false` for agy because a blank line splits a multi-line prompt.
     #[test]
     fn agy_alone_cannot_bound_a_message_that_holds_a_blank_line() {
         let rows = crate::prompt::fixtures::screen(crate::agy::fixtures::lab::WORKER_FIRST_PROMPT);
@@ -2201,15 +2162,7 @@ mod tests {
         assert!(!Program::Agy.reader().bounds_messages());
     }
 
-    /// ONLY AGY READS A MESSAGE'S ROWS AS ITS REPLY, which is what
-    /// [`ScreenReader::bounds_messages`] says of each worker's reader: on
-    /// each one's measured end of a turn (Claude Code's drawn in its frame),
-    /// rows put in the message under its first row — a blank row, then a row
-    /// at the message's own indent saying `NEEDS YOU: y` (two columns in,
-    /// Gemini CLI's three inside its band), agy's drawing of a message's
-    /// blank line and the worst case for every reader — change the reply
-    /// agy's reader reads and no other's: Claude Code's, Gemini CLI's and
-    /// Muse Code's take the reply from its head's mark.
+    /// Only agy reads subsequent indented message rows after a blank line as the reply.
     #[test]
     fn only_agy_reads_a_messages_rows_as_its_reply() {
         use crate::prompt::fixtures::screen;

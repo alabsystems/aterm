@@ -232,7 +232,7 @@ pub fn authorize_cut(
     })
 }
 
-/// Which key the roster maps `id` to, for refusal messages only: the mismatch refusal in [`crate::publish::channel_signature_policy`] offers "cut with the key that belongs to <id>" only when the roster names that machine.
+/// Which key the roster maps `id` to, for refusal messages only: the mismatch refusal in [`crate::publish::channel_signature_policy`] offers `cut with the key that belongs to <id>` only when the roster names that machine.
 #[must_use]
 pub fn roster_pubkey_for(
     master_pubkeys: &[&str],

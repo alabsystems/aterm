@@ -6,6 +6,23 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Pure Rust, high-performance LZ4 **block-format** compression.
+//!
+//! Block format only (no frame format, so no `xxhash`). The wire format is
+//! upstream `lz4_flex` block mode's: either side decompresses the other's data.
+//!
+//! ```
+//! use aterm_lz4::block::{compress_prepend_size, decompress_size_prepended};
+//! let input: &[u8] = b"Hello people, what's up?";
+//! let compressed = compress_prepend_size(input);
+//! let uncompressed = decompress_size_prepended(&compressed).unwrap();
+//! assert_eq!(input, uncompressed);
+//! ```
+//!
+//! # Safety
+//!
+//! Only upstream's safe encoder and bounds-checked decoder are carried
+//! (`safe-encode` / `safe-decode` / `checked-decode`). The crate forbids
+//! `unsafe` code.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::unnecessary_map_or)]

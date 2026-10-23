@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! STRICT REPLAY: a harness tape run again, offline and exactly.
+//! Strict offline replay of a recorded harness tape.
 
 use std::any::Any;
 use std::io;
@@ -32,17 +32,13 @@ use crate::supervise::policy::trace::{Outcome, TraceStep};
 use crate::supervise::run::{IdleHost, Session, SuperviseOpts};
 use crate::supervise::{CtlReply, SupervisorConfig};
 
-/// How many flag reads in a row may consume no record before the replay is called stuck (the plan's progress guard).
+/// How many flag reads in a row may consume no record before the replay is called stuck.
 pub(crate) const PROGRESS_READS: u64 = 100_000;
 
-/// How far ahead of this process's monotonic clock a replay's origin stands:
-/// an `Instant` a recorded run placed before its tape's origin (an offset
-/// subtracted from a read) lands after the replay's own boot, never under it.
+/// How far ahead of this process's monotonic clock a replay's origin stands.
 const ORIGIN_AHEAD: Duration = Duration::from_secs(400 * 24 * 3600);
 
-/// The payload a replay unwinds its loop with: never a panic's, so
-/// `resume_unwind` runs no hook and the driver tells it from the recorded
-/// run's own panic reproduced.
+/// The payload a replay unwinds its loop with.
 struct Halted;
 
 /// A no-op at every record a replay consumes, `n` its ordinal (`#n` in `tape cat`).
@@ -68,17 +64,13 @@ pub(crate) struct ReplayCore {
     state: Mutex<Replayer>,
     /// The instant every `Mono` record counts from in this replay.
     origin: Instant,
-    /// The run's roots, remapped: every file the loop opens is under one of
-    /// these, and is asked as the recorder wrote it.
+    /// The run's roots, remapped.
     roots: Roots,
-    /// The run's roots as recorded: a path that is a VALUE rather than a file
-    /// the loop opens — a screen's operand, the approval policy's home — is
-    /// not remapped, and is asked under these, as the recorder wrote it.
+    /// The run's roots as recorded.
     recorded: Roots,
     /// The seed of the worker's digest, the recording's ([`Self::seed`]).
     seed: u64,
-    /// A COUNTERFACTUAL: the acts cursor serves in place of astream's strict
-    /// seam ([`super::acts`]).
+    /// A counterfactual: the acts cursor serves in place of astream's strict seam.
     acts: bool,
 }
 
@@ -94,8 +86,7 @@ impl std::fmt::Debug for ReplayCore {
     }
 }
 
-/// What serves the replayed loop: astream's strict seam, or the
-/// counterfactual's acts cursor.
+/// What serves the replayed loop.
 enum Cursor {
     Strict(ReplaySeam),
     Acts(Box<ActsCursor>),
@@ -129,58 +120,42 @@ struct Replayer {
     reached: Option<u64>,
     /// Flag reads in a row that consumed nothing (the progress guard).
     idle: u64,
-    /// The last monotonic read (nanoseconds since the origin) and wall read
-    /// (nanoseconds since the epoch): where a peek stands.
+    /// The last monotonic read (nanoseconds since the origin) and wall read.
     mono_ns: u64,
     wall_ns: i64,
-    /// The ordinal of the last round trip consumed, and the screens parsed
-    /// from replies — kept exactly as the recorder keeps them, so a
-    /// decision's mark names the record it named.
+    /// The ordinal of the last round trip consumed, and the screens parsed from replies.
     last_exchange: Option<u64>,
     screens: Screens,
     requests: Vec<Vec<String>>,
     told: Vec<Vec<String>>,
     lines: Vec<String>,
-    /// The round trip the loop asked where the tape was over (astream's
-    /// `Exhausted`), its door and request: where a run that died inside a
-    /// door's live call is reached again (`core::NOTE_UNWOUND_IN`).
+    /// Door and request of the round trip asked after the tape was exhausted.
     past_end: Option<(String, Vec<u8>)>,
-    /// A counterfactual's refusal came where its tape was SPENT
-    /// ([`ActsCursor::spent`]): no round trip or file read left at or past
-    /// the cursor — on a tape with no end, everything on it taken.
+    /// A counterfactual's refusal came where its tape was spent ([`ActsCursor::spent`]).
     acts_spent: bool,
-    /// The door and request the tape says the recorded run died inside
-    /// (`core::NOTE_UNWOUND_IN`), when it says one ([`ReplayCore::died_inside`]).
+    /// Door and request the tape says the recorded run died inside (`core::NOTE_UNWOUND_IN`).
     unwound_in: Option<(String, Vec<u8>)>,
-    /// The notification the recorded run died telling its host, once the
-    /// replay has told it as the tape's last record ([`ReplayCore::emit`]).
+    /// Notification the recorded run died telling its host, once emitted by the replay.
     died_in: Option<String>,
-    /// The decision's mark whose RULE TRACE the replay is asked for (the
-    /// ordinal of its record: `Options::trace_at`), the steps of the decision
-    /// about to be marked, and the trace kept once that mark is reached.
+    /// Target mark ordinal (`Options::trace_at`), pending steps, and captured rule trace.
     trace_at: Option<u64>,
     pending: Vec<TraceStep>,
     traced: Option<Vec<TraceStep>>,
-    /// A counterfactual's: the record of the last screen the loop parsed,
-    /// and the loop's decisions in the segment it stands in (`decided_in`,
-    /// that segment's first record).
+    /// A counterfactual's: the record of the last screen the loop parsed, and the loop's decisions
+    /// in the segment it stands in (`decided_in`, that segment's first record).
     last_screen: Option<u64>,
     decided: Vec<Decided>,
     decided_in: usize,
-    /// A SHADOW replay's candidate policy (`super::shadow`), the candidate's
-    /// decision on the turn end about to be marked, and each one kept with
-    /// its mark's ordinal.
+    /// Shadow replay candidate policy, pending turn-end decision, and recorded shadow rows.
     shadow: Option<SupervisorConfig>,
     pending_shadow: Option<Decided>,
     shadowed: Vec<(u64, Decided)>,
-    /// The host's doors the recording build had, as the tape's header names
-    /// them (`Header::host_doors`; none named on a tape from before):
-    /// [`ReplayCore::lacks_door`].
+    /// The host's doors the recording build had, as the tape's header names them.
     host_doors: Option<Vec<String>>,
 }
 
 impl ReplayCore {
-    /// Replay `records` under `roots` and `recorded` with worker digest seeded by `tape`, stopping after `#until` when set.
+    /// Starts a replay of `records` under `roots` and `recorded`, stopping at `until` if set.
     pub(crate) fn start(
         records: Vec<EffectRecord>,
         roots: Roots,
@@ -193,7 +168,7 @@ impl ReplayCore {
         Self::with(cursor, effects, roots, recorded, tape, until)
     }
 
-    /// The core of a COUNTERFACTUAL replay of `records`, each stamped as `stamps` says ([`super::acts`]); otherwise as [`Self::start`].
+    /// The core of a counterfactual replay of `records`, each stamped as `stamps` says.
     pub(crate) fn start_acts(
         records: Vec<EffectRecord>,
         stamps: Vec<Option<Stamp>>,
@@ -259,7 +234,7 @@ impl ReplayCore {
         self.state.lock_or_recover()
     }
 
-    /// Records left on the tape past what the replay consumed: a run that returned with one left did not reproduce the recorded run.
+    /// Records left on the tape past what the replay consumed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -306,7 +281,7 @@ impl ReplayCore {
         String::from_utf8_lossy(&roots.encode(path)).into_owned()
     }
 
-    /// `at` as an offset from this replay's origin: what the recorder wrote for the same instant of the recorded run.
+    /// `at` as an offset from this replay's origin.
     pub(crate) fn offset_text(&self, at: Instant) -> String {
         offset_from(self.origin, at)
     }
@@ -327,9 +302,7 @@ impl ReplayCore {
         )
     }
 
-    /// Take one record through `take`, which asks the seam at `door` for
-    /// what the loop `asked`; a refusal is the replay's first divergence, and
-    /// unwinds the loop from here.
+    /// Take one record through `take`, which asks the seam at `door` for what the loop `asked`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -395,8 +368,6 @@ impl ReplayCore {
         let served = {
             let mut st = self.lock();
             if st.diverged.is_some() || st.reached.is_some() || st.died_in.is_some() {
-                // Nothing is served after the first divergence (or the stop,
-                // or the place the recorded run died).
                 None
             } else {
                 let at = st.cursor.position() as u64;
@@ -440,8 +411,7 @@ impl ReplayCore {
         }
     }
 
-    /// A COUNTERFACTUAL's step ([`super::acts`]): `take` asks the acts cursor
-    /// at `door` for what the loop `asked`.
+    /// A counterfactual's step ([`super::acts`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -507,8 +477,6 @@ impl ReplayCore {
         let served = {
             let mut st = self.lock();
             if st.diverged.is_some() || st.reached.is_some() || st.died_in.is_some() {
-                // Nothing is served after the first divergence (or the stop,
-                // or the place the recorded run died).
                 None
             } else {
                 let Cursor::Acts(c) = &mut st.cursor else {
@@ -695,7 +663,7 @@ impl ReplayCore {
         reply
     }
 
-    /// The recorded reply at `door`, effect `#at`, does not decode as the value the loop asked for: the replay's divergence.
+    /// The recorded reply at `door`, effect `#at`, does not decode as the value the loop asked for.
     pub(crate) fn undecodable(&self, door: &str, why: &str) -> ! {
         let at = self.lock().last_exchange.unwrap_or(0);
         self.diverge(Divergence {
@@ -709,7 +677,7 @@ impl ReplayCore {
         })
     }
 
-    /// The tape says the recorded run died inside `door`'s live call asking `request` (`core::NOTE_UNWOUND_IN`).
+    /// The tape says the recorded run died inside `door`'s live call asking `request`.
     pub(crate) fn died_inside(&self, door: String, request: Vec<u8>) {
         self.lock().unwound_in = Some((door, request));
     }
@@ -827,12 +795,12 @@ impl ReplayCore {
         self.lock().trace_at = Some(n);
     }
 
-    /// The host's doors the recording build had (`Header::host_doors`; an empty set for a tape from before headers named them).
+    /// The host's doors the recording build had.
     pub(crate) fn recorded_doors(&self, doors: Vec<String>) {
         self.lock().host_doors = Some(doors);
     }
 
-    /// Whether the recording build had no host door `door`, as its header names its doors ([`Self::recorded_doors`]).
+    /// Whether the recording build had no host door `door`, as its header names its doors.
     pub(crate) fn lacks_door(&self, door: &str) -> bool {
         self.lock()
             .host_doors
@@ -840,12 +808,12 @@ impl ReplayCore {
             .is_some_and(|doors| !doors.iter().any(|d| d == door))
     }
 
-    /// The candidate policy this SHADOW replay decides each turn end again under, if it is one (`Fx::shadow_policy`).
+    /// The candidate policy this shadow replay decides each turn end again under, if it is one.
     pub(crate) fn shadow_policy(&self) -> Option<SupervisorConfig> {
         self.lock().shadow.clone()
     }
 
-    /// The candidate's decision on the turn end about to be marked (`Fx::shadowed`): kept with that mark.
+    /// The candidate's decision on the turn end about to be marked (`Fx::shadowed`).
     pub(crate) fn shadowed(&self, rule: Option<&str>, outcome: String) {
         self.lock().pending_shadow = Some(Decided {
             door: String::new(),
@@ -901,8 +869,7 @@ impl ReplayCore {
     }
 }
 
-/// A counterfactual's divergence for `refusal` at `door`, the loop having
-/// `asked` what it asked, read off the cursor `c` where it refused.
+/// Builds a counterfactual [`Divergence`] for `refusal` at `door` from cursor `c`.
 fn acts_divergence(
     c: &ActsCursor,
     refusal: &Refusal,
@@ -965,8 +932,7 @@ fn acts_divergence(
     }
 }
 
-/// An act (or any round trip) as a report names it: a control request's
-/// words, a host call's arguments as text.
+/// An act (or any round trip) as a report names it.
 fn act_side(at: Option<u64>, door: &str, request: &[u8]) -> ActSide {
     let words = if door == doors::CTL || door == doors::TELLER {
         codec::ctl_args(request).map_or_else(
@@ -1004,8 +970,7 @@ fn is_output(door: &str) -> bool {
     .contains(&door)
 }
 
-/// The class of a divergence ([`super::report::Class`]): the loop `asked`,
-/// at `door`, where the tape holds `found`.
+/// The class of a divergence ([`super::report::Class`]).
 fn class_of(asked: &Asked<'_>, found: Option<&EffectRecord>, door: Option<&str>) -> Class {
     let lane = |d: &str| d == doors::CTL || d == doors::TELLER;
     let act = |door: &str, request: &[u8]| {
@@ -1042,21 +1007,21 @@ fn class_of(asked: &Asked<'_>, found: Option<&EffectRecord>, door: Option<&str>)
 pub struct Options {
     /// Stop after effect `#until` is consumed (`--until door=N`).
     pub until: Option<u64>,
-    /// The directory every root is remapped under, which must not exist; by default `<tmp>/aterm-replay-<tape>/absent`.
+    /// The directory every root is remapped under, which must not exist.
     pub base: Option<PathBuf>,
-    /// Keep the RULE TRACE of the decision whose mark is effect `#trace_at` ([`replay_traced`]).
+    /// Keep the rule trace of the decision whose mark is effect `#trace_at` ([`replay_traced`]).
     pub trace_at: Option<u64>,
-    /// A COUNTERFACTUAL: replay in ACTS MODE ([`super::acts`]) under this candidate policy (`--set k=v`, `--policy FILE`), up to the first act it takes otherwise.
+    /// A counterfactual: replay in acts mode ([`super::acts`]) under this candidate policy.
     pub candidate: Option<Candidate>,
 }
 
-/// How a `watch` run's end is said on its tape (`drive_cli`'s recorder and the tests' alike): its exit code.
+/// How a `watch` run's end is said on its tape (`drive_cli`'s recorder and the tests' alike).
 #[must_use]
 pub fn watch_end(code: u8) -> String {
     format!("exit {code}")
 }
 
-/// How a `supervise` run's end is said on its tape (the engine tests' seam, an older build's `aterm drive supervise`).
+/// How a `supervise` run's end is said on its tape.
 #[must_use]
 pub fn supervise_end(end: &Result<(String, u8), String>) -> String {
     match end {
@@ -1084,7 +1049,7 @@ pub fn panic_message(panic: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
-/// REPLAY the tape `bytes` (its file form or its text form) strictly.
+/// Replay the tape `bytes` (its file form or its text form) strictly.
 ///
 /// # Errors
 /// A tape that cannot be replayed at all.
@@ -1092,7 +1057,7 @@ pub fn replay(bytes: &[u8], options: &Options) -> Result<Report, String> {
     replay_traced(bytes, options).map(|(report, _)| report)
 }
 
-/// [`replay`], and the RULE TRACE of the decision at [`Options::trace_at`] when one is asked for and the replay reached its mark.
+/// Runs [`replay`] and returns the rule trace at [`Options::trace_at`] when reached.
 ///
 /// # Errors
 /// As [`replay`].
@@ -1103,7 +1068,7 @@ pub fn replay_traced(
     run_replay(bytes, options, None).map(|(report, core)| (report, core.trace()))
 }
 
-/// A STRICT replay that decides each turn end again under `candidate` beside the loop's own decision (`super::shadow`).
+/// Strict replay that also evaluates each turn end under `candidate` (`super::shadow`).
 ///
 /// # Errors
 /// As [`replay`].
@@ -1117,9 +1082,7 @@ pub(crate) fn replay_shadowed(
     })
 }
 
-/// [`replay_traced`]'s body: the report, and the core it ran on (its trace,
-/// its shadow's rows), a shadow's candidate given to the core before the
-/// loop runs.
+/// [`replay_traced`]'s body.
 fn run_replay(
     bytes: &[u8],
     options: &Options,
@@ -1222,16 +1185,14 @@ fn run_replay(
     Ok((report, core))
 }
 
-/// A tape's id as a path's word: what it may hold besides letters and digits
-/// becomes `_` (an id is sixteen hex digits; a hand-made header's need not be).
+/// A tape's id as a path's word.
 fn sanitized(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
 
-/// Run the recorded entry over `fx`, under `catch_unwind`: how it ended, as a
-/// tape says an end, or what it unwound with.
+/// Run the recorded entry over `fx`, under `catch_unwind`.
 fn run_entry(header: &Header, fx: &Fx) -> std::thread::Result<String> {
     let mut ctl = ReplayCtl::new(fx.clone(), doors::CTL);
     let mut session = Session::from_setup(&mut ctl, header.setup.clone());
@@ -1261,10 +1222,7 @@ fn run_entry(header: &Header, fx: &Fx) -> std::thread::Result<String> {
 }
 
 impl ReplayCore {
-    /// The report of a replay whose run ended `run`, the tape's own end
-    /// `end` (none for a tape cut short), the door and request the recorded
-    /// run died inside when the tape says one (`core::NOTE_UNWOUND_IN`),
-    /// `tail` how its bytes ended.
+    /// Builds the [`Report`] for a strict replay run from its outcome and tape end.
     fn report(
         &self,
         header: &Header,
@@ -1415,13 +1373,7 @@ impl ReplayCore {
         }
     }
 
-    /// The report of a COUNTERFACTUAL whose run ended `run` under
-    /// `candidate` ([`super::acts`]), the rest as [`Self::report`]'s: the
-    /// first divergent act (or the act the candidate went on without, or its
-    /// end with acts left), a STALE read, the place the recorded run died in
-    /// the last segment, a tape with no end spent (ENDED), else REPRODUCED —
-    /// every act the tape holds taken as recorded, whatever was read, printed
-    /// or decided on the way.
+    /// Builds the [`Report`] for a counterfactual replay run under `candidate`.
     fn report_acts(
         &self,
         header: &Header,

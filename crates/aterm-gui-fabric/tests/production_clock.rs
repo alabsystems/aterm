@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_gui_fabric::{FabricSession, HOLD_BUSY, HOLD_FENCE_WAIT, SessionFabric, cmd_topic};
+use aterm_gui_fabric::{
+    FabricFact, FabricSession, HOLD_BUSY, HOLD_FENCE_WAIT, SessionFabric, cmd_topic,
+};
 use aterm_session::SessionId;
 
 struct Session {
@@ -20,7 +22,9 @@ impl FabricSession for Session {
     fn fabric(&self) -> &SessionFabric {
         &self.fabric
     }
-    fn record(&self, _kind: &'static str, _payload: String) {}
+    fn record_fact(&self, _kind: &'static str, _fact: FabricFact<'_>) -> bool {
+        false
+    }
     fn fabric_changed(&self) {}
     fn holder_token(&self) -> Option<String> {
         None

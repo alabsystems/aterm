@@ -71,10 +71,7 @@ fn wheel_and_terminal_pixel_geometry_use_the_target_windows_cell_size() {
     );
 }
 
-/// End to end through the winit handler on a free desktop: one wheel notch
-/// (`LineDelta(0, ±1)`, what X11's button 4/5 and Wayland's discrete axis
-/// deliver) moves the scrollback viewport VTE's `ceil(rows / 10)` rows, three at
-/// the default 24, where it used to move one.
+/// On a free desktop, one wheel notch (`LineDelta(0, ±1)`) moves the scrollback viewport `ceil(rows / 10)` rows.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_free_desktop_notch_scrolls_vtes_distance_and_a_precise_row_scrolls_one() {
@@ -710,10 +707,7 @@ fn a_glide_tick_at_a_history_end_never_snaps_a_live_bounce() {
     );
 }
 
-/// The event path obeys the same rule. A momentum tail keeps sending small
-/// deltas at the edge after the push that released the bounce: an excess of
-/// 1-3 px that resists to a zero impulse, and a sub-pixel delta that rounds
-/// onto the edge (no excess), must both leave the bounce live and presented.
+/// Small momentum deltas at the edge after the push that released the bounce leave the bounce live and presented.
 #[test]
 fn a_small_delta_at_a_history_end_keeps_the_bounce_presented() {
     let mut app = App::headless_for_test();
@@ -743,9 +737,7 @@ fn a_small_delta_at_a_history_end_keeps_the_bounce_presented() {
     }
 }
 
-/// …and a tracked band that a partial history drop lands on live presents at
-/// rest: its rest target rounds half a cell toward history, so the parked start
-/// can sink below live, and must not lift the live screen with no row under it.
+/// A tracked band that a partial history drop lands on live presents at rest.
 #[test]
 fn a_partial_drop_that_lands_a_tracked_band_on_live_presents_it_at_rest() {
     let mut app = App::headless_for_test();
@@ -775,9 +767,7 @@ fn a_partial_drop_that_lands_a_tracked_band_on_live_presents_it_at_rest() {
     );
 }
 
-/// …but a bounce belongs to its own edge: one precise delta that crosses the
-/// whole history from a sagging top bounce lands at rest on live, whether it
-/// lands exactly or overshoots.
+/// One precise delta that crosses the whole history from a sagging top bounce lands at rest on live.
 #[test]
 fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
     for overshoot in [0.0, 2.0] {
@@ -819,10 +809,7 @@ fn a_delta_that_crosses_the_history_ends_the_other_edges_bounce() {
     }
 }
 
-/// Alt over a main-screen tracking app scrolls locally, all of the finger: Alt
-/// is the selection-custody override that routes the wheel to the local
-/// viewport, so sub-row deltas track too (tier 1 of `track_precise_scroll`
-/// exempts Alt as well as Shift).
+/// Alt over a main-screen tracking app routes the wheel to the local viewport so sub-row deltas track too.
 #[test]
 fn alt_over_a_main_screen_tracking_app_tracks_every_pixel() {
     use aterm_window::dpi::PhysicalPosition;
@@ -1026,10 +1013,7 @@ fn a_glide_bound_for_live_lands_on_live_while_output_streams() {
     }
 }
 
-/// …and an offset that drops under it is followed, not undone. The re-pin
-/// only ever raises the offset; a drop (the app clearing its scrollback
-/// with `CSI 3 J`, which Ink-based TUIs send on a full redraw) already moved
-/// the reader to live, and the glide must not scroll them back up.
+/// An offset that drops under a live-bound glide when scrollback is cleared is followed rather than undone.
 #[test]
 fn a_live_bound_glide_follows_a_cleared_history_instead_of_climbing_it() {
     let mut app = App::headless_for_test();

@@ -22,20 +22,13 @@ use aterm_time::Instant;
 
 use crate::WebTerminal;
 
-/// How many drained prepend buffers the band keeps for the next frame (the
-/// band's most rows).
 const POOL_CAP: usize = MAX_ROWS as usize;
 
-/// How many drained log lines the page can still take
-/// ([`WebTerminal::messages_log_since`]): the ring's record count.
 const JOURNAL_CAP: usize = LOG_CAP;
 
-/// How many of the page's kept lines a restore reads — the newest: twice the
-/// ring, room for a full ring of records each posted and retired.
 const RESTORE_CAP: usize = 2 * LOG_CAP;
 
-/// Percent-encode a string into one space-free reply token: every byte that is not
-/// ASCII-graphic, and `%`, becomes `%XX`.
+/// Percent-encode a string into one space-free reply token.
 pub(crate) fn pct_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
@@ -87,9 +80,7 @@ fn tick_bits(changed: bool, rows_moved: bool) -> u32 {
     u32::from(changed || rows_moved) | (u32::from(rows_moved) << 1)
 }
 
-/// The band's host metrics a lib hands this module: one cell's width and
-/// height, the frame's pad, and the grid's first pixel row before the band
-/// (the chrome's top pad and head) — all device px.
+/// Host metrics for the message band in device pixels.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BandMetrics {
     pub(crate) cell_w: usize,
@@ -98,8 +89,7 @@ pub(crate) struct BandMetrics {
     pub(crate) grid_top: usize,
 }
 
-/// The band's state on one terminal: the engine's center and wire gate, the inks the
-/// page's theme derives, and the painted rows the next frame composes.
+/// Message band state on one terminal.
 pub(crate) struct WebBand {
     /// The engine: rows, holds, the log ring, the motion grid.
     pub(crate) center: MessageCenter,
@@ -355,8 +345,6 @@ impl WebBand {
         self.restored = false;
     }
 
-    /// Whether the page's kept log may still be loaded: nothing restored, minted, queued
-    /// or drained yet.
     fn restorable(&self) -> bool {
         let log = self.center.log();
         !self.restored
@@ -413,8 +401,6 @@ impl WebBand {
         }
     }
 
-    /// Move the drained lines into the journal, evicting the oldest past
-    /// [`JOURNAL_CAP`].
     fn journal_push(&mut self, lines: Vec<(LogLine, Shelf)>) {
         for (line, _) in lines {
             self.journal.push_back(line.encode());
@@ -425,8 +411,6 @@ impl WebBand {
         }
     }
 
-    /// `OK <next> <n>` then the journal's lines from `cursor` on, a `dropped`
-    /// line first when lines the page never took were evicted.
     fn log_since(&self, cursor: u64) -> String {
         let end = self.journal_first + self.journal.len() as u64;
         let from = cursor.min(end);
@@ -446,7 +430,6 @@ impl WebBand {
     }
 }
 
-/// What a restore read from the page's kept lines.
 struct Kept {
     /// The decoded lines, ordered by id as the native loader orders its two
     /// files (a stable sort: a record's own lines keep their order).
@@ -460,9 +443,6 @@ struct Kept {
     over: usize,
 }
 
-/// Read the page's kept lines (`\n`-separated, oldest first): the newest
-/// [`RESTORE_CAP`] non-empty ones, each exact repeat once, through the
-/// engine's codec (`LogLine::decode`, the native loader's).
 fn read_kept(text: &str) -> Kept {
     let mut newest = Vec::new();
     let mut over = 0;
@@ -496,9 +476,6 @@ fn read_kept(text: &str) -> Kept {
     }
 }
 
-/// The page's host for [`WebTerminal::messages_page`] (`page::Host`): the wall clock
-/// at the export and the page's UTC offset, and none of the facts only a native host
-/// has.
 struct WebDesk {
     /// The wall clock at the export.
     now_unix_ms: u64,
@@ -511,14 +488,10 @@ impl page::Host for WebDesk {
         self.now_unix_ms
     }
 
-    /// No log folder: the web writes no `messages.log`; the page keeps the
-    /// lines [`WebTerminal::messages_log_since`] hands it.
     fn log_folder(&self) -> Option<String> {
         None
     }
 
-    /// Saved: the page keeps its log itself, and the engine's not-saved note speaks of a
-    /// log file the web never has.
     fn saved(&self) -> bool {
         true
     }
@@ -527,36 +500,26 @@ impl page::Host for WebDesk {
         self.utc_offset_s
     }
 
-    /// No updater: nothing is staged, so an `Install now` is never pressable.
     fn staged_build(&self) -> Option<u64> {
         None
     }
 
-    /// No filesystem, so `Open log` is never pressable: a page cannot see a file, and a
-    /// press on an authored intent is only logged (`performed=0`).
     fn is_regular_file(&self, _path: &str) -> bool {
         false
     }
 
-    /// No harness: no agent upgrade runs under a page, so none takes a word.
     fn upgrade_takes(&self, _tab: &str, _to: &str, _word: UpgradeWord) -> bool {
         false
     }
 
-    /// No harness: no tab's upgrade stands here, so upgrade words are not offered.
     fn upgrade_stands(&self, _tab: &str) -> bool {
         false
     }
 
-    /// No navigation: the web performs no authored intent, and every capsule a page
-    /// lists is a record's, which neither press route reaches (`notice act` and a band
-    /// press take only live rows).
     fn performs_navigation(&self) -> bool {
         false
     }
 
-    /// One: the native reporters give every record a one-line sentence except agent
-    /// upgrade rows, which only the native harness writes.
     fn sentence_lines(&self, _key: Option<&str>, _detail: &[String]) -> usize {
         1
     }
@@ -567,8 +530,6 @@ impl page::Host for WebDesk {
 #[inline]
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
-        // The sign flips in the float (exact, and `round` is symmetric), so
-        // no integer negation is left that could overflow.
         (timezone_offset_min * -60.0).round() as i64
     } else {
         0
@@ -741,9 +702,6 @@ impl WebTerminal {
         }
     }
 
-    /// Re-prepare the band at `now` after a change of how it is drawn (the
-    /// look, the links, the hover, the inks): a band change reopens the frame
-    /// gate.
     fn band_redraw_at(&mut self, now: Instant) {
         self.band.now = now;
         let m = self.band_metrics();
@@ -829,8 +787,6 @@ impl WebTerminal {
         true
     }
 
-    /// The chip a pointer at frame pixel `(x, y)` lights, through the layout
-    /// the painter drew; `None` off the band and where a press does nothing.
     fn band_hover_under(&self, x: f64, y: f64) -> Option<Hover> {
         let m = self.band_metrics();
         self.band
@@ -844,9 +800,6 @@ impl WebTerminal {
             })
     }
 
-    /// Resolve the hover again from the pointer's last pixel: a press, a hold's fold, a
-    /// `done` or a new row moves the chips under a still pointer, and the page resolves
-    /// hover only on `pointermove`.
     fn settle_band_hover(&mut self) -> bool {
         let hover = self
             .band
@@ -975,9 +928,6 @@ impl WebTerminal {
     }
 }
 
-/// The JS-visible surface, which each crate's `web_terminal_impl!` expands onto its
-/// own terminal type under its own export attribute: the attribute names the JS class
-/// after the impl's type, which this shared file cannot spell.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
@@ -1137,7 +1087,6 @@ mod tests {
         aterm_messages::Duration::from_millis(n)
     }
 
-    /// Frame pixel `(x, y)` at the middle of band cell `(row, col)`.
     fn band_px(t: &Host, row: usize, col: usize) -> (f64, f64) {
         let m = t.band_metrics();
         (
@@ -1146,7 +1095,6 @@ mod tests {
         )
     }
 
-    /// The `rev=` and `total=` fields of the page's head line.
     fn page_head(page: &str) -> (String, String) {
         let head = page.lines().nth(1).expect("the page's head line");
         let field = |name: &str| {
@@ -1158,11 +1106,6 @@ mod tests {
         (field("rev="), field("total="))
     }
 
-    /// The pet's drawn body in FRAME px `(x0, x1, y0, y1)`, read off the frame
-    /// the renderer drew: the free sprite whose atlas tile is the body's
-    /// natural size (`ART_ROWS` cells tall at `ART_ASPECT` — motes and
-    /// word-cats bake at other sizes), placed where the rasterizer stamps it,
-    /// `pad` in and `grid_top` down (any band rows are already in its `y`).
     fn drawn_pet_body(frame: &RenderInput, m: BandMetrics) -> Option<(f32, f32, f32, f32)> {
         use aterm_effects::kitty_pet::{ART_ASPECT, ART_ROWS};
         let nat_h = (ART_ROWS * m.cell_h as f32).round();
@@ -1173,9 +1116,6 @@ mod tests {
         Some((x0, x0 + f32::from(s.w), y0, y0 + f32::from(s.h)))
     }
 
-    /// Drive the pet onto the glass through the binding alone — the glow
-    /// style that names it, the seed door, then witnessed keystrokes at 33 ms
-    /// — until `cursor_pet_alpha` goes positive.
     fn wake_the_pet(t: &mut Host) -> bool {
         t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
         t.set_cursor_pet(true, 7);
@@ -1195,10 +1135,6 @@ mod tests {
         false
     }
 
-    /// The pet under a band is pressed where it is drawn: the page presses in
-    /// canvas pixels, band included, so with a row committed a press on the drawn
-    /// body's centre or feet pets the cat and a press on the text half a row
-    /// above passes to the terminal.
     #[test]
     fn the_pet_is_pressed_where_the_band_draws_it() {
         let (mut t, t0) = clocked(12, 60);
@@ -1240,9 +1176,6 @@ mod tests {
         }
     }
 
-    /// A still pointer's lit chip follows the layout: when the progress row under
-    /// the pointer ends `done … ok`, its echo is `Hit::Nothing`, so the band draws
-    /// as a twin's that took the same lines with no pointer.
     #[test]
     fn a_still_pointers_chip_never_lights_the_echo() {
         let (mut t, t0) = clocked(12, 60);
@@ -1292,8 +1225,6 @@ mod tests {
         );
     }
 
-    /// A restore moves the page's `rev=`, as any observable log change does; a
-    /// post after it moves it again (control).
     #[test]
     fn the_restore_moves_the_pages_rev() {
         let (mut prev, p0) = clocked(20, 80);

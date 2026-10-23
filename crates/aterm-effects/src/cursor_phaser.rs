@@ -105,6 +105,8 @@ pub struct CursorPhaser {
     last: Option<Instant>,
     /// Latched charge at the last tick (so [`Self::is_active`] answers without a clock).
     energy: f32,
+    /// Cached `((hue_bits, e_bits), fill)` for [`light_emitter_fill`].
+    light_fill_memo: Option<((u32, u32), u32)>,
 }
 
 impl CursorPhaser {
@@ -167,7 +169,18 @@ impl CursorPhaser {
                 let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
                 mix_rgb(BASE_DARK_THEME, beam, lerp(MIX_IDLE, MIX_MAX, e))
             }
-            None => light_emitter_fill(hue, e),
+            None => {
+                let key = (hue.to_bits(), e.to_bits());
+                if let Some((cached_key, cached_fill)) = self.light_fill_memo
+                    && cached_key == key
+                {
+                    cached_fill
+                } else {
+                    let solved = light_emitter_fill(hue, e);
+                    self.light_fill_memo = Some((key, solved));
+                    solved
+                }
+            }
         };
 
         let charge = COV_IDLE / COV_MAX * (0.45 + PULSE_DEPTH * breath) + e;

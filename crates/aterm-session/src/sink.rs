@@ -131,7 +131,8 @@ impl BulkMeter {
         self.finish(BulkState::Stopped);
     }
 
-    /// Settle a frame that was not written through [`MeteredSink::write_frame`].
+    /// Settle a frame that was not written through
+    /// [`SinkWriter::write_frame_metered_with_receipt`].
     pub fn settle_unmetered(&self, delivered: bool) {
         self.finish(if delivered {
             BulkState::Delivered

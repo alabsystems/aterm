@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-png` decode and encode integration tests over the repository's PNG corpus, a
-//! synthesized format matrix pinned to `MATRIX_DIGEST`, malformed and misordered files,
-//! and encoder round trips.
+//! `aterm-png` decode and encode integration tests over the repository's PNG corpus.
 
 use std::path::{Path, PathBuf};
 
@@ -18,8 +16,7 @@ struct Decoded {
     pixels: Vec<u8>,
 }
 
-/// Which transform set to decode under: all FOUR points of the public
-/// transform surface, not just the pair the shipped call sites use.
+/// Which transform set to decode under.
 #[derive(Clone, Copy)]
 enum Mode {
     /// What aterm's shipped decode sites ask for.
@@ -32,7 +29,6 @@ enum Mode {
     Strip16Only,
 }
 
-/// Every mode, with the label a failure will be reported under.
 const ALL_MODES: [(Mode, &str); 4] = [
     (Mode::ExpandStrip16, "EXPAND|STRIP_16"),
     (Mode::Identity, "identity"),
@@ -70,7 +66,6 @@ fn decode_mine(bytes: &[u8], mode: Mode) -> Result<Decoded, String> {
     })
 }
 
-/// FNV-1a over the decoded matrix, so the whole matrix is pinned by one value.
 struct Fnv(u64);
 
 impl Fnv {
@@ -95,7 +90,6 @@ impl Fnv {
     }
 }
 
-/// Encode 8-bit `pixels` with this crate's encoder.
 fn encode(color: aterm_png::ColorType, w: u32, h: u32, pixels: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut encoder = aterm_png::Encoder::new(&mut out, w, h);
@@ -107,7 +101,6 @@ fn encode(color: aterm_png::ColorType, w: u32, h: u32, pixels: &[u8]) -> Vec<u8>
     out
 }
 
-/// Every `.png` in the repository, excluding build output.
 fn corpus() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -117,12 +110,6 @@ fn corpus() -> Vec<PathBuf> {
     corpus_under(&root)
 }
 
-/// Whether the corpus walk stays out of the directory `name` inside `parent`:
-/// `target`, `.git` and every `*.noindex` build dir a tool chose
-/// (`libc-oracle/target.noindex`) at any depth, and at the repository root every
-/// `target-*` sibling build dir (`target-trust.noindex`, older lanes' leftovers)
-/// and a leftover `.aterm-verify` state dir, which the checked-in .gitignore names
-/// as `/target-*` and `/.aterm-verify/`.
 fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
     name == "target"
         || name == ".git"
@@ -130,8 +117,6 @@ fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
         || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
 }
 
-/// Every `.png` under `root`, sorted, minus the directories [`corpus_skips`]
-/// names.
 fn corpus_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -156,10 +141,6 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// No file-count floor: the corpus is whatever the checkout holds (tracked
-/// files plus any local capture dumps), and pinning its size would be a
-/// registry of repository contents. The compression check below still needs
-/// at least one image to have been round-tripped.
 #[test]
 fn the_repository_corpus_decodes_and_round_trips() {
     let files = corpus();
@@ -203,8 +184,6 @@ fn the_repository_corpus_decodes_and_round_trips() {
     );
 }
 
-/// CRC-32 (ISO-HDLC), written out here so the fixture builder does not borrow
-/// the implementation under test.
 fn crc32(data: &[u8]) -> u32 {
     let mut c: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -220,9 +199,6 @@ fn crc32(data: &[u8]) -> u32 {
     c ^ 0xFFFF_FFFF
 }
 
-/// A zlib stream that uses only STORED (uncompressed) DEFLATE blocks — three
-/// lines of format, no compressor, so nothing about the fixtures depends on
-/// code being tested.
 fn zlib_stored(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x78u8, 0x01];
     let mut chunks: Vec<&[u8]> = data.chunks(65535).collect();
@@ -286,7 +262,6 @@ fn build_png(
     out
 }
 
-/// Samples per pixel for a PNG colour-type code.
 fn samples_of(color: u8) -> usize {
     match color {
         0 | 3 => 1,
@@ -296,7 +271,6 @@ fn samples_of(color: u8) -> usize {
     }
 }
 
-/// Adam7 pass geometry, written out independently of the decoder's copy.
 const ADAM7: [(u32, u32, u32, u32); 7] = [
     (0, 0, 8, 8),
     (4, 0, 8, 8),
@@ -307,8 +281,6 @@ const ADAM7: [(u32, u32, u32, u32); 7] = [
     (0, 1, 1, 2),
 ];
 
-/// Deterministic pseudo-random filtered scanline data for one image geometry,
-/// with every row carrying a DIFFERENT filter type so all five are exercised.
 fn synth_filtered(width: u32, height: u32, depth: u8, color: u8, interlace: u8) -> Vec<u8> {
     let samples = samples_of(color);
     let mut state = 0x2545_F491u32;
@@ -353,12 +325,8 @@ fn synth_filtered(width: u32, height: u32, depth: u8, color: u8, interlace: u8) 
     out
 }
 
-/// Pinned FNV-1a digest of the decoded format matrix across all transforms.
 const MATRIX_DIGEST: &str = "873b3aed06c78dbf";
 
-/// Every legal (colour type x bit depth) pair, both interlace settings, with and
-/// without `tRNS`, under every transform mode — the formats a colour font, a
-/// wallpaper or a pasted image are allowed to arrive in.
 #[test]
 fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
     let combos: [(u8, &[u8]); 5] = [
@@ -395,8 +363,6 @@ fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
                         let trns: Option<Vec<u8>> = if with_trns {
                             Some(match color {
                                 0 => {
-                                    // A grey sample value at the source depth. The
-                                    // shift is done in u32 because depth reaches 16.
                                     let max = ((1u32 << depth) - 1) as u16;
                                     let key = 1u16.min(max);
                                     key.to_be_bytes().to_vec()
@@ -451,7 +417,6 @@ fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
     );
 }
 
-/// A one-row indexed PNG, assembled from raw chunks.
 fn indexed_png(palette: &[u8], trns: Option<&[u8]>, indices: &[u8]) -> Vec<u8> {
     let mut filtered = vec![0u8]; // filter type None
     filtered.extend_from_slice(indices);
@@ -467,9 +432,6 @@ fn indexed_png(palette: &[u8], trns: Option<&[u8]>, indices: &[u8]) -> Vec<u8> {
     )
 }
 
-/// The Adler-32 lives at the END OF THE STREAM, not at the end of the buffer.
-/// A decoder that takes the last four bytes of the IDAT payload to be the
-/// checksum reports a perfectly good image as corrupt.
 #[test]
 fn idat_padded_after_the_zlib_stream_still_decodes() {
     let filtered = synth_filtered(9, 7, 8, 6, 0);
@@ -493,9 +455,6 @@ fn idat_padded_after_the_zlib_stream_still_decodes() {
     }
 }
 
-/// A stream that decompresses to far more than the header's geometry is a
-/// decompression bomb, not padding: one maximal stored block of slack is
-/// honoured, and the excess beyond it is refused with `ExcessImageData`.
 #[test]
 fn image_data_far_past_the_declared_size_is_refused_as_its_own_error() {
     let (w, h) = (9u32, 7u32);
@@ -531,10 +490,6 @@ fn image_data_far_past_the_declared_size_is_refused_as_its_own_error() {
     );
 }
 
-/// A limit of exactly the output buffer decodes every format: the image data
-/// is streamed, so nothing else the decoder allocates scales with the image.
-/// One byte less is refused when the header is read, before the caller sizes a
-/// buffer by `output_buffer_size`.
 #[test]
 fn a_limit_of_exactly_the_output_buffer_decodes_every_format() {
     let palette: Vec<u8> = (0..=255u8).flat_map(|i| [i, i, i]).collect();
@@ -600,8 +555,6 @@ fn a_limit_of_exactly_the_output_buffer_decodes_every_format() {
     }
 }
 
-/// Reading a source is bounded even if it never reaches EOF. The guard turns
-/// an unbounded read into an immediate regression failure instead of an OOM.
 #[test]
 fn encoded_input_cannot_bypass_the_pixel_budget() {
     use std::cell::Cell;
@@ -670,11 +623,6 @@ fn encoded_input_cannot_bypass_the_pixel_budget() {
     );
 }
 
-/// A zlib stream of `n` zero bytes — one literal, then distance-1
-/// back-references in a fixed-Huffman block — written out here so it shares no
-/// code with the decoder. Zero is filter type None and a black pixel, so this
-/// is the filtered data of an all-black image of any geometry, at about 1/160
-/// of its size.
 fn zlib_zeros(n: usize) -> Vec<u8> {
     struct Bits {
         out: Vec<u8>,
@@ -682,7 +630,6 @@ fn zlib_zeros(n: usize) -> Vec<u8> {
         len: u32,
     }
     impl Bits {
-        /// `count` bits of `value`, least-significant first.
         fn put(&mut self, value: u32, count: u32) {
             self.acc |= u64::from(value) << self.len;
             self.len += count;
@@ -692,7 +639,6 @@ fn zlib_zeros(n: usize) -> Vec<u8> {
                 self.len -= 8;
             }
         }
-        /// A Huffman code, most-significant bit first.
         fn code(&mut self, code: u32, count: u32) {
             for i in (0..count).rev() {
                 self.put((code >> i) & 1, 1);
@@ -728,7 +674,6 @@ fn zlib_zeros(n: usize) -> Vec<u8> {
     out
 }
 
-/// An all-black `w` x `h` PNG at `depth`/`color`, non-interlaced.
 fn black_png(w: u32, h: u32, depth: u8, color: u8) -> Vec<u8> {
     let stride = (w as usize * samples_of(color) * depth as usize).div_ceil(8);
     let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -742,11 +687,6 @@ fn black_png(w: u32, h: u32, depth: u8, color: u8) -> Vec<u8> {
     bytes
 }
 
-/// `decode_rgba8` decodes every image inside the dimension budget its caller
-/// names: the renderer's inline-image cap is 4096 per side, the wallpaper's
-/// 8192. A 4096x4096 RGBA8 image is exactly the inline budget, a 16-bit one
-/// decompresses to twice its output, and a wallpaper past 64 MiB of RGBA (a 6K
-/// display's own resolution is) is still inside 8192 per side.
 #[test]
 fn decode_rgba8_decodes_every_image_inside_the_callers_dimension_budget() {
     for (w, h, depth, color, max_dimension) in [
@@ -770,8 +710,6 @@ fn decode_rgba8_decodes_every_image_inside_the_callers_dimension_budget() {
     assert!(aterm_png::decode_rgba8(&black_png(1, 4097, 8, 6), 4096).is_none());
 }
 
-/// A palette index past the end of PLTE renders as opaque black rather than
-/// killing the whole image.
 #[test]
 fn an_index_past_the_palette_renders_black() {
     let palette = [255u8, 0, 0];
@@ -784,8 +722,6 @@ fn an_index_past_the_palette_renders_black() {
     assert_eq!(mine.pixels, vec![255, 0, 0, 9, 0, 0, 0, 255]);
 }
 
-/// A tRNS with more entries than the palette is IGNORED, not honoured — but its
-/// presence still decides the output shape.
 #[test]
 fn a_trns_longer_than_the_palette_is_ignored() {
     let palette = [255u8, 0, 0, 0, 255, 0];
@@ -809,8 +745,6 @@ fn a_trns_longer_than_the_palette_is_ignored() {
     }
 }
 
-/// Below 16 bits only the low byte of a tRNS colour key is the sample; a key
-/// with a stray high byte still matches (masked), rather than matching nothing.
 #[test]
 fn an_out_of_range_trns_key_still_matches_its_low_byte() {
     let bytes = build_png(2, 1, 8, 0, 0, None, Some(&[0x01, 0x2A]), &[0u8, 0x2A, 0x00]);
@@ -829,8 +763,6 @@ fn an_out_of_range_trns_key_still_matches_its_low_byte() {
     assert_eq!(mine.pixels[3], 0, "RGB: the masked key must match");
 }
 
-/// A ZERO-LENGTH tRNS is absent: it must not promote an indexed image to Rgba
-/// (only the `EXPAND`-alone mode can see the shape).
 #[test]
 fn a_zero_length_trns_is_absent() {
     let palette = [255u8, 0, 0, 0, 255, 0];
@@ -843,8 +775,6 @@ fn a_zero_length_trns_is_absent() {
     );
 }
 
-/// Chunk ORDERING rules: a duplicate `PLTE`, a `tRNS` before `PLTE`, and `IDAT`
-/// chunks interrupted by another chunk are refused; consecutive IDATs are not.
 #[test]
 fn illegal_chunk_orderings_are_refused() {
     let mut ihdr = Vec::new();
@@ -901,12 +831,6 @@ fn illegal_chunk_orderings_are_refused() {
     assert_eq!(mine.pixels, vec![255, 0, 0, 0, 255, 0]);
 }
 
-/// Every chunk the encoder writes carries the CRC this file's own bitwise
-/// `crc32` computes. The encoder and decoder share one `Crc32` (astream-wire's
-/// fold), so a round trip alone could not see them agree on a wrong CRC; the
-/// independent reference can. A stored CRC one bit off is then refused as
-/// `BadCrc` naming its chunk, under every transform. Negative control: the same
-/// bytes with the CRC left alone decode to the pixels written.
 #[test]
 fn encoded_chunk_crcs_match_an_independent_crc_and_a_flipped_one_is_refused() {
     let pixels: Vec<u8> = (0u8..18).map(|b| b.wrapping_mul(29)).collect();
@@ -941,8 +865,6 @@ fn encoded_chunk_crcs_match_an_independent_crc_and_a_flipped_one_is_refused() {
     }
 }
 
-/// Test images for the encoder round trip: a gradient, a flat fill, noise, and
-/// a single pixel, at each of the colour types aterm writes.
 fn encoder_cases() -> Vec<(&'static str, aterm_png::ColorType, u32, u32, Vec<u8>)> {
     let mut cases = Vec::new();
     for (name, color, samples) in [
@@ -986,7 +908,6 @@ fn encoder_cases() -> Vec<(&'static str, aterm_png::ColorType, u32, u32, Vec<u8>
     cases
 }
 
-/// This decoder reads back exactly the pixels this encoder was given.
 #[test]
 fn this_decoder_reads_back_exactly_what_this_encoder_wrote() {
     for (label, color, w, h, data) in encoder_cases() {
@@ -999,8 +920,6 @@ fn this_decoder_reads_back_exactly_what_this_encoder_wrote() {
     }
 }
 
-/// The encoder's indexed path: what it writes reads back as exactly the colours
-/// that went in, and an index past the palette is REFUSED at encode time.
 #[test]
 fn indexed_encoding_round_trips_and_refuses_an_index_past_the_palette() {
     let palette = vec![255u8, 0, 0, 0, 255, 0, 0, 0, 255];
@@ -1047,7 +966,6 @@ fn indexed_encoding_round_trips_and_refuses_an_index_past_the_palette() {
     );
 }
 
-/// The `sRGB` chunk round-trips — the screenshot verbs assert on it.
 #[test]
 fn srgb_intent_round_trips() {
     let data = vec![9u8; 4 * 4 * 4];
@@ -1070,7 +988,6 @@ fn srgb_intent_round_trips() {
     );
 }
 
-/// Seeded RGBA8 pixels, `w` x `h`.
 fn seeded_rgba(w: u32, h: u32, seed: u32) -> Vec<u8> {
     let mut state = seed | 1;
     (0..w as usize * h as usize * 4)
@@ -1087,7 +1004,6 @@ fn seeded_rgba(w: u32, h: u32, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-/// An RGBA8 sRGB encoder ready for its pixels.
 fn rgba_writer(out: &mut Vec<u8>, w: u32, h: u32) -> aterm_png::Writer<&mut Vec<u8>> {
     let mut encoder = aterm_png::Encoder::new(out, w, h);
     encoder.set_color(aterm_png::ColorType::Rgba);
@@ -1096,9 +1012,6 @@ fn rgba_writer(out: &mut Vec<u8>, w: u32, h: u32) -> aterm_png::Writer<&mut Vec<
     encoder.write_header().expect("header")
 }
 
-/// Streaming rows via `write_rows` produces the exact same bytes as
-/// `write_image_data` across widths 1, 3, 17, and 256, and rejects rows one
-/// byte short or long with `WrongDataSize`.
 #[test]
 fn write_rows_is_byte_identical_to_write_image_data() {
     for (w, h) in [(1u32, 5u32), (3, 7), (17, 33), (256, 300)] {
@@ -1152,9 +1065,6 @@ fn write_rows_is_byte_identical_to_write_image_data() {
     }
 }
 
-/// [`aterm_png::max_encoded_len`] bounds every file the encoder writes, and is
-/// not vacuous: incompressible noise, the worst case for a fixed-Huffman
-/// stream, lands within a tenth of it.
 #[test]
 fn max_encoded_len_bounds_every_encode() {
     let mut state = 0xDEAD_BEEFu32;

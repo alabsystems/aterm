@@ -30,9 +30,7 @@ const fn output_cost(len: usize) -> usize {
     EVENT_SLOT_BYTES + 2 * std::mem::size_of::<usize>() + len
 }
 
-/// Events per sealed chunk of a recording's event list ([`EventLog`]). A snapshot
-/// takes one refcount per sealed chunk and clones fewer than two chunks of open
-/// events: with [`MAX_RETAINED_EVENTS`], at most 256 refcounts and 511 clones.
+/// Events per sealed chunk of a recording's event list ([`EventLog`]).
 const CHUNK_EVENTS: usize = 256;
 
 /// One recorded asciicast v2 event: program output (`"o"`) or a resize (`"r"`).
@@ -147,8 +145,7 @@ pub(crate) struct CastWatermark {
 }
 
 impl CastWatermark {
-    /// Count one reader hold and return its count. The caller holds the engine's lock,
-    /// which orders this against a [`CastCut::take`], so `Relaxed` suffices.
+    /// Count one reader hold and return its count.
     fn note(&self) -> u64 {
         self.holds.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -247,10 +244,7 @@ const RELEASED: Event = Event::Resize {
     key: None,
 };
 
-/// A recording's events, oldest first, kept so a snapshot shares most of them. The
-/// older ones sit in sealed chunks of [`CHUNK_EVENTS`], immutable once sealed, which a
-/// snapshot takes by refcount; the newest sit in an open deque, where engine-order
-/// insertion lands, which a snapshot clones.
+/// A recording's events, oldest first, kept so a snapshot shares most of them.
 #[derive(Default)]
 struct EventLog {
     /// Sealed chunks, oldest first.
@@ -314,8 +308,6 @@ impl EventLog {
             self.sealed.push_back(Arc::new(chunk));
         }
         if unsealing {
-            // The unsealed run grew the deque; resealed, it gives those slots back,
-            // or they would outlive it uncharged.
             self.open.shrink_to(2 * CHUNK_EVENTS);
         }
     }
@@ -439,10 +431,7 @@ pub(crate) struct CastRecorder {
     evicted: u64,
     /// The last emitted timestamp; an unstamped event's `t` is clamped up to it.
     last_t: Duration,
-    /// Monotonic epoch of this recorder's timeline, captured at construction. Reader
-    /// bursts are stamped against it ([`epoch`](Self::epoch)) and resize instants are
-    /// converted onto it ([`record_resize_stamped`](Self::record_resize_stamped)), so
-    /// both taps share one timeline per session.
+    /// Monotonic epoch of this recorder's timeline, captured at construction.
     epoch: Instant,
     /// Trailing incomplete UTF-8 lead bytes (at most 3) carried from the previous burst
     /// and prepended to the next, so a character split across reads is reassembled
@@ -450,8 +439,7 @@ pub(crate) struct CastRecorder {
     pending: Vec<u8>,
     /// Shared with the session's readers and `cast drift` ([`CastWatermark`]).
     watermark: Arc<CastWatermark>,
-    /// The hold count of the newest burst recorded. Bursts arrive in hold order: one
-    /// reader at a time, each recording after its holds.
+    /// The hold count of the newest burst recorded.
     recorded: u64,
     /// The resizes recorded from the newest engine lifetime seen: its token, how many,
     /// and the newest ordinal.
@@ -897,10 +885,8 @@ fn incomplete_tail_len(bytes: &[u8]) -> usize {
         } else if b >> 3 == 0b11110 {
             4
         } else if b >> 6 == 0b10 {
-            // A continuation byte; the lead is further back — keep scanning.
             continue;
         } else {
-            // ASCII (complete) or an invalid lead — nothing to carry.
             return 0;
         };
         return if back < needed { back } else { 0 };
@@ -1525,12 +1511,7 @@ mod tests {
         assert_eq!(parse_event(cast.lines().nth(2).unwrap()).0, 0.400);
     }
 
-    /// The header names the geometry in force at the first retained event. While the
-    /// resize is retained (even with the output before it evicted) the header keeps
-    /// the construction size and the replay applies the resize; once drop-oldest
-    /// evicts it, the asciicast (and `cast drift`, which audits the same values) and
-    /// the flipbook all start at its size, so a 100-column line replays unwrapped on
-    /// 30 rows.
+    /// The header names the geometry in force at the first retained event.
     #[test]
     fn evicted_resize_moves_the_header_geometry() {
         let line: Vec<u8> = [&b"\r\n"[..], &[b'X'; 100]].concat();
@@ -1987,7 +1968,6 @@ mod tests {
         let fan = Arc::new(ByteFanout::with_budget(10));
         let sub = fan.subscribe();
         for i in 0..100 {
-            // 4 bytes each, budget 10
             fan.tee(&Arc::from(&b"abcd"[..]), i);
         }
         let (bursts, dropped) = sub.drain();

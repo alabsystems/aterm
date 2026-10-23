@@ -52,7 +52,8 @@ pub(crate) const STARTUP_DOORS: StartupDoors = StartupDoors {
     enable: crate::launchd::enable,
 };
 
-/// `aterm caffeine bridge`: keep the Mac awake while the mug restarts onto an update ([`bridge`]).
+/// `aterm caffeine bridge`: keep the Mac awake while the mug restarts onto an update
+/// ([`mod@bridge`]).
 pub(crate) fn bridge() -> ExitCode {
     bridge::run()
 }

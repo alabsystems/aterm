@@ -22,8 +22,7 @@ use crate::native_editor::EditorCommand;
 use crate::tab_model::{TabId, ViewId};
 use crate::{App, WindowId};
 
-/// One run: the App, the ticket and the views it watches, and the ghosts the
-/// projection keeps once the real state is gone.
+/// One conformance run: the `App`, the watched ticket and views, and the projection's ghosts.
 pub(crate) struct Rig {
     app: App,
     wid: WindowId,
@@ -207,8 +206,6 @@ impl Rig {
         .collect()
     }
 
-    /// The document's head and durable checkpoint now, or the last ones read
-    /// once the store no longer has it.
     fn numbers(&self) -> (u64, u64) {
         let Some(document) = self.document else {
             return (self.head, self.durable);
@@ -220,9 +217,6 @@ impl Rig {
         }
     }
 
-    /// Read what the real step left behind that the projection keeps: the
-    /// document and its opening checkpoint, the ticket's view and start, the
-    /// numbers while they can be read, and the answers delivered.
     fn settle(&mut self) {
         let open = self
             .ticket
@@ -284,8 +278,6 @@ impl Rig {
         self.durable = durable.0;
     }
 
-    /// Settle, project, and check the step as the chain `actions` from the
-    /// previous state, then every invariant on the state reached.
     fn step(&mut self, what: &str, actions: &[&str]) {
         self.settle();
         let next = self.project();
@@ -323,7 +315,6 @@ impl Rig {
         super::tests::call(ticket, self.session, self.request(), reply)
     }
 
-    /// `edit`, admitted inline (headless, no event loop).
     fn edit(&mut self) -> String {
         let call = self.call();
         self.app.begin_edit(call);
@@ -336,8 +327,6 @@ impl Rig {
         line
     }
 
-    /// `edit` with its admission left in flight; returns the outcome its
-    /// worker would deliver.
     fn edit_in_flight(&mut self) -> DocumentAdmissionOutcome {
         let call = self.call();
         let (wid, key, ticket) = self
@@ -360,7 +349,6 @@ impl Rig {
         }
     }
 
-    /// `await edit ticket=…`.
     fn wait(&mut self, actions: &[&str]) -> WaiterId {
         let key = AwaitKey::Ticket(self.ticket.expect("a ticket to wait on"));
         self.wait_on(key, actions)
@@ -395,7 +383,6 @@ impl Rig {
         self.step("type", &["Edit"]);
     }
 
-    /// Bring the tab holding `view` to the front (not a model step).
     fn front(&mut self, view: ViewId) {
         let tab = self.app.windows[&self.wid]
             .tab_set
@@ -408,9 +395,6 @@ impl Rig {
         self.step("select a tab", &[]);
     }
 
-    /// Close the ticket's view's tab. A close that was requested (it closed, or
-    /// it waits for its checkpoint) froze the head as the model's `close_seq`;
-    /// a refused one requested nothing.
     fn close_edit_view(&mut self, actions: &[&str]) -> Result<(), String> {
         self.front(self.edit_view.expect("the ticket's view"));
         let head = self.state["head"];
@@ -429,8 +413,6 @@ impl Rig {
         }
     }
 
-    /// Split the ticket's tab with a terminal and focus the ticket's view
-    /// again (not a model step), so its close is one leaf's.
     fn split_edit_tab(&mut self) {
         let view = self.edit_view.expect("the ticket's view");
         self.front(view);
@@ -440,7 +422,6 @@ impl Rig {
         self.step("split the ticket's tab", &[]);
     }
 
-    /// Close the ticket's view, one leaf of a split tab.
     fn close_edit_leaf(&mut self, actions: &[&str]) -> Result<(), String> {
         let head = self.state["head"];
         let closed = self.app.close_focused_mixed_leaf(self.wid);
@@ -449,9 +430,6 @@ impl Rig {
         closed
     }
 
-    /// The person presses done (C-c C-c) in the ticket's view. The press
-    /// froze the head as the model's `finish_seq`, and a close it led to the
-    /// head then as `close_seq` (a save made the head no newer).
     fn finish(&mut self, actions: &[&str]) {
         let head = self.state["head"];
         self.finish_seq = head;
@@ -460,10 +438,6 @@ impl Rig {
         self.step("done (C-c C-c)", actions);
     }
 
-    /// The person presses abort (C-c C-k) in the ticket's view. Its discard
-    /// moved the head on only when the buffer was dirty and held no text the
-    /// edit did not type; the close it then asks for freezes the head the
-    /// discard left.
     fn abort(&mut self, actions: &[&str]) {
         let dirty = self.state["durable"] < self.state["head"];
         let foreign = self.state["foreign"] == 1;
@@ -483,22 +457,17 @@ impl Rig {
         self.step("abort (C-c C-k)", actions);
     }
 
-    /// Whether the document's head moved since the last step (while the
-    /// store still has the document).
     fn text_moved(&self) -> bool {
         let (head, _) = self.numbers();
         head as i64 - self.base as i64 != self.state["head"]
     }
 
-    /// An abort pressed while the document held text the edit did not type
-    /// (`foreign`) that then moved the text threw that text away: `lost`.
     fn note_abort_discard(&mut self, foreign: bool, discarded: bool) {
         if foreign && discarded {
             self.lost = 1;
         }
     }
 
-    /// The person opens the file in a tab of their own.
     fn person_opens(&mut self) {
         let uri = self.uri.clone();
         self.app.open_document_tab(AppKind::Editor, &uri).unwrap();
@@ -506,7 +475,6 @@ impl Rig {
         self.step("the person opens the file", &["PersonOpens"]);
     }
 
-    /// The person types in their own view of the file.
     fn person_types(&mut self, text: &str) {
         let view = self.person_view.expect("the person's view");
         let tab = super::tests::tab_of(&self.app, self.wid, view);
@@ -521,28 +489,22 @@ impl Rig {
         self.step("the person types in their view", &["PersonEdits"]);
     }
 
-    /// The person closes their own view of the file.
     fn person_closes(&mut self) {
         self.front(self.person_view.expect("the person's view"));
         self.app.close_active_native_tab(self.wid).unwrap();
         self.step("the person closes their view", &["PersonCloses"]);
     }
 
-    /// The caller's tab in front (not a model step), so an `edit` opens in
-    /// front of the person.
     fn caller_in_front(&mut self) {
         super::tests::select(&mut self.app, self.wid, self.caller_tab);
         self.step("the caller's tab in front", &[]);
     }
 
-    /// Another program writes the file. aterm wrote nothing, so the rig
-    /// counts no write.
     fn write_externally(&mut self, bytes: &[u8]) {
         std::fs::write(&self.path, bytes).unwrap();
         self.file = read_file(&self.path);
     }
 
-    /// The document's text now.
     fn text(&self) -> String {
         let document = self.document.expect("the document");
         self.app
@@ -554,7 +516,6 @@ impl Rig {
             .to_string()
     }
 
-    /// The status line of Editor view `view`.
     fn status_of(&self, view: Option<ViewId>) -> Option<String> {
         match self.app.native_runtime.view_state(view?) {
             Some(crate::native_app::AppViewState::Editor(state)) => state.status.clone(),
@@ -562,7 +523,6 @@ impl Rig {
         }
     }
 
-    /// Dispatch `command` to the ticket's view, in front.
     fn press(&mut self, command: EditorCommand) {
         let view = self.edit_view.expect("the ticket's view");
         let tab = super::tests::tab_of(&self.app, self.wid, view);
@@ -579,9 +539,6 @@ impl Rig {
     }
 }
 
-/// The file at `path` as the rig compares it between steps: what tells it
-/// from a file renamed over it ([`file_identity`]) and its bytes, or `None`
-/// while it does not exist.
 fn read_file(path: &Path) -> Option<(Option<u128>, Vec<u8>)> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((file_identity(&metadata), std::fs::read(path).ok()?))
@@ -604,8 +561,6 @@ fn file_identity(metadata: &std::fs::Metadata) -> Option<u128> {
     Some(since.as_nanos())
 }
 
-/// Whether the chain of `actions` leads from `prev` to `next` (no actions: a
-/// stutter, `next == prev`).
 fn chain_admits(model: &Model, prev: &State, actions: &[&str], next: &State) -> bool {
     let mut states = vec![prev.clone()];
     for action in actions {
@@ -626,8 +581,6 @@ fn broken_invariants(model: &Model, state: &State) -> BTreeSet<&'static str> {
         .collect()
 }
 
-/// A dirty leaf's close waits in the close protocol for its save; the outcome
-/// comes once the save is durable, and the waiter hears it then.
 fn dirty_close_after_its_ack() {
     let mut rig = Rig::new("dirty");
     let admission = rig.edit_in_flight();
@@ -662,9 +615,6 @@ fn dirty_close_after_its_ack() {
     assert_eq!(rig.answers.len(), 2, "a late waiter reads the ring");
 }
 
-/// A dirty whole tab's close is refused while its save is in flight (nothing
-/// is requested, nothing answers); once the save lands, closing it again
-/// answers `saved=1`.
 fn refused_whole_tab_close_then_closed() {
     let mut rig = Rig::new("whole-tab");
     rig.edit();
@@ -684,8 +634,6 @@ fn refused_whole_tab_close_then_closed() {
     assert_eq!((rig.state["answered"], rig.state["saved"]), (1, 1));
 }
 
-/// The waiter leaves, the ticket is orphaned after five seconds and keeps its
-/// view, a waiter comes back and adopts it, and a clean close answers.
 fn orphan_and_adopt() {
     let mut rig = Rig::new("orphan");
     rig.edit();
@@ -707,8 +655,6 @@ fn orphan_and_adopt() {
     );
 }
 
-/// The person's own view of the file closes without answering the ticket
-/// (`Buggy = 4` would); the ticket's final dirty close saves and answers.
 fn the_persons_view_never_answers() {
     let mut rig = Rig::new("person");
     let uri = rig.uri.clone();
@@ -742,8 +688,6 @@ fn the_persons_view_never_answers() {
     assert_eq!((rig.state["answered"], rig.state["saved"]), (1, 1));
 }
 
-/// Refusals and cancels: a missing file refuses at admission, a cancelled
-/// in-flight admission is dropped when it lands, and nothing is answered.
 fn refuse_and_cancel() {
     let mut rig = Rig::new("refuse");
     rig.uri.push_str(".gone");
@@ -760,8 +704,6 @@ fn refuse_and_cancel() {
     assert_eq!(rig.state["view"], 0);
 }
 
-/// The `edit` gives up just as its view opens (the cancel-after-admit race:
-/// its deadline or a hangup, with the install already on the main thread).
 fn cancel_after_the_view_opened() {
     let mut rig = Rig::new("cancel-open");
     let admission = rig.edit_in_flight();
@@ -784,8 +726,6 @@ fn cancel_after_the_view_opened() {
     assert_eq!(rig.state["answered"], 1);
 }
 
-/// NEGATIVE CONTROL: the dirty close's run, with the ticket resolved while its
-/// close still waits for `checkpoint_ack`.
 fn answer_before_ack_is_caught() {
     let mut rig = Rig::new("control");
     rig.edit();
@@ -823,10 +763,6 @@ fn answer_before_ack_is_caught() {
     );
 }
 
-/// Done on a dirty buffer whose earlier save is still in flight: the view is
-/// finishing (its save queued behind the one in flight) and nothing answers;
-/// once the saves land, the view closes and the ticket answers `finished
-/// saved=1`. Done on a clean buffer closes at once: `finished saved=0`.
 fn finish_waits_for_its_save() {
     let mut rig = Rig::new("finish");
     rig.edit();
@@ -892,9 +828,6 @@ fn finish_waits_for_its_save() {
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "six base\n");
 }
 
-/// Abort discards the buffer's changes, writing nothing, and closes: the
-/// ticket answers `aborted saved=0` and the file is as the last save left
-/// it.
 fn abort_discards_and_writes_nothing() {
     let mut rig = Rig::new("abort");
     rig.edit();
@@ -948,8 +881,6 @@ fn abort_discards_and_writes_nothing() {
     assert_eq!((rig.state["result"], rig.state["saved"]), (2, 1));
 }
 
-/// NEGATIVE CONTROL (`AbortSaves`, `Buggy = 5`): the abort's run, rigged to
-/// save the buffer where the implementation discards it.
 fn abort_that_saves_is_caught() {
     let mut rig = Rig::new("abort-control");
     rig.edit();
@@ -996,9 +927,6 @@ fn abort_that_saves_is_caught() {
     ));
 }
 
-/// Done whose save does not land stops finishing (`FinishHalts`). Done is
-/// pressed behind a save in flight, so its own save queues; an abort pressed
-/// then is refused and leaves the done finishing.
 fn finish_halts_when_its_save_does_not_land() {
     let mut rig = Rig::new("finish-halts");
     rig.edit();
@@ -1052,8 +980,6 @@ fn finish_halts_when_its_save_does_not_land() {
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "theirs\n");
 }
 
-/// Abort throws away only what the edit typed. With the person's own view
-/// of the file clean, the discard reverts that view too.
 fn abort_keeps_text_it_did_not_type() {
     let mut rig = Rig::new("abort-shared-clean");
     rig.person_opens();
@@ -1128,9 +1054,6 @@ fn abort_keeps_text_it_did_not_type() {
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "mine base\n");
 }
 
-/// NEGATIVE CONTROL (`AbortDiscardsOthersText`, `Buggy = 7`): the abort's
-/// run with the person's unsaved text in their own view, rigged to discard
-/// the shared document anyway.
 fn abort_that_discards_others_text_is_caught() {
     let mut rig = Rig::new("abort-others-control");
     rig.person_opens();

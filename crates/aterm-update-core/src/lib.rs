@@ -6,7 +6,7 @@
 //! Here: the GitHub release [`Source`] (the compiled channel, repointable only in a development
 //! build) with a URL-safety allowlist; the `[update] enabled` switch ([`settings`]); an
 //! advisory [`FileLock`] and [`same_volume`]; `curl` plumbing for GitHub's web host ([`cdn`]
-//! derives a tag's download URL, [`pointer`] learns the newest tag from one redirect-refusing
+//! derives a tag's download URL, [`mod@pointer`] learns the newest tag from one redirect-refusing
 //! HEAD, [`download_bytes`]/[`download_to`] never attach a credential) and for vendor-direct
 //! hosts ([`vendor_get`]); the publishers' credentialed GitHub REST lane over the same curl
 //! ([`github_rest`], with [`github_pages`]' listing reader), which no updater path calls;

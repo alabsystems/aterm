@@ -242,11 +242,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     audit_policy(ctx, r, &policy, &cells);
 }
 
-/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and WB.3 of
-/// docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the registry crates of
-/// its version. Each verb compiles both Windows triples, so a run that checks either Windows
-/// cell runs each once. The same STOCK EXCEPTION as the cells: stock stable compiles Windows
-/// std, and no Windows program runs.
+/// The windows-sys oracles (`aterm-win32-oracle`'s two verbs) and what each holds to its
+/// registry crate version (STOCK EXCEPTION: stock stable compiles Windows std).
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
@@ -998,11 +995,7 @@ struct CellCargo<'a> {
 }
 
 impl CellCargo<'_> {
-    /// `<toolchain cargo> <verb> --target <triple> …` with this cell's
-    /// environment: the toolchain's own `rustc`, its bin first on PATH (so
-    /// `cargo clippy` finds `cargo-clippy` beside it), its lib first on the
-    /// loader path ([`crate::rustup::Toolchain::loader_env`]), and the cells
-    /// lane's job cap, since the cells compile beside the run's other builds.
+    /// Build `<toolchain cargo> <verb> --target <triple>` with this cell's toolchain environment and job cap.
     fn base(&self, verb: &str) -> Cmd {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
@@ -1294,7 +1287,7 @@ pub fn read_cargo_json(
     read
 }
 
-/// The `error` lines cargo printed itself, at column zero (a failing build script's output is re-emitted indented; `could not compile` summarises diagnostics the JSON already carried).
+/// Column-zero `error` lines printed by cargo itself (excluding `error: could not compile`).
 #[must_use]
 pub fn cargo_level_errors(output: &str) -> Vec<String> {
     output
@@ -1603,9 +1596,7 @@ mod tests {
         assert!(parse_test_forest("0other v1.0.0\n", &one).is_err());
     }
 
-    /// A member a selected proc macro depends on is printed as two roots, its
-    /// target node and its host node (the SP.6 shape: aterm-serde-derive on
-    /// aterm-macro-support).
+    /// A member a selected proc macro depends on is printed as both its target node and its host node.
     #[test]
     fn a_member_a_proc_macro_uses_is_read_as_its_target_copy() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");

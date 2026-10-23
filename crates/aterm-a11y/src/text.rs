@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under Apache-2.0) src/text.rs.
+// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under Apache-2.0)
+// src/text.rs, modified by the aterm project in 2026.
 
 //! Text documents: positions, ranges, and navigation by character, word, line, and paragraph.
 

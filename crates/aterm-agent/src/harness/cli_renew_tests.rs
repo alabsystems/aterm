@@ -10,8 +10,6 @@ use super::*;
 const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
-/// This machine's own login (renewable, a browser profile of its own), a
-/// renewable second account, and one with no email.
 fn roster_text(work_dir: &str) -> String {
     let dir = |d: &str| aterm_toml::Value::from(d).to_string();
     format!(
@@ -38,11 +36,6 @@ fn renew_env(tag: &str) -> (Tmp, Env) {
     (tmp, env)
 }
 
-/// A SCRIPTED MACHINE for `renew`: its sign-in "signs in" by writing the
-/// home's `.claude.json` with the account it is told to (`signs_in_as`, the
-/// address the browser holds — `None`: the address it was hinted with), and
-/// exits `flow`; its check answers what THAT HOME's `.claude.json` says, as
-/// the vendor's does.
 struct RenewHost {
     tty: bool,
     ssh_session: bool,
@@ -73,9 +66,6 @@ impl RenewHost {
     }
 }
 
-/// What the vendor's `auth status --json` prints for a home whose
-/// `.claude.json` holds `email`: the keys the check reads, and the
-/// organization's, which it must drop.
 fn status_for(email: Option<&str>) -> Captured {
     match email {
         Some(email) => Captured {
@@ -172,7 +162,6 @@ fn renew(labels: &[&str], due: bool, on: Option<&[&str]>) -> AccountsCmd {
     }
 }
 
-/// No address in anything this command printed or wrote but the roster.
 fn no_address(env: &Env, said: &[&str]) {
     for text in said {
         assert!(
@@ -249,11 +238,6 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
     }
 }
 
-/// THE HAPPY PATH: the sign-in into a NEW staging home with the row's
-/// address as its hint and the account's own profile as its opener, ONE
-/// check in that home, the binding repointed there (the login it replaced
-/// remembered), the login recorded `ok` with its `renewed` row — and no
-/// address in anything printed or written.
 #[test]
 fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding() {
     let (_tmp, env) = renew_env("renew-happy");
@@ -359,12 +343,6 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     );
 }
 
-/// WHAT A RENEWAL SAYS OF THE SESSIONS ON THE LOGIN IT REPLACED is what the
-/// window's supervisor does with them, by this machine's aterm.toml: moved
-/// at their next idle turn end with `[harness] enabled`, `logins`, `relaunch` and
-/// `resume_limits` on; with one of them off nothing moves them, and the
-/// switch is named (the master switch, which leaves the others on in the
-/// file, by its own name).
 #[test]
 fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     for (switch, off) in [
@@ -414,10 +392,6 @@ fn a_renewal_says_what_moves_its_sessions_and_the_line_to_start_one_by_hand() {
     }
 }
 
-/// A STAGING HOME IS NO ROW'S LOGIN DIRECTORY: renewed, `main` is bound to
-/// `logins/main+1`, and a label that reads like it — `main.1`, which `add`
-/// admits — gets a login directory of its own, empty, never `main`'s live
-/// one adopted as "a login made under this name before".
 #[test]
 fn a_staging_home_is_never_a_rows_login_directory() {
     let (_tmp, env) = renew_env("renew-names");
@@ -455,9 +429,6 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     assert!(err.contains("already held files"), "{err}");
 }
 
-/// THE WRONG ACCOUNT: the browser signed in another account. Nothing live
-/// changes — no binding, no auth word, the staging home gone — and the
-/// attempt is recorded by label.
 #[test]
 fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
@@ -491,8 +462,6 @@ fn a_renewal_that_answers_another_account_changes_nothing_live() {
     assert!(report.contains("last renewal: wrong account"), "{report}");
 }
 
-/// A FLOW THAT FAILS (Ctrl-C's 130, a denial's 1) RUNS NOTHING MORE: no
-/// check, nothing recorded, the staging home gone.
 #[test]
 fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
     for flow in [130, 1] {
@@ -542,8 +511,6 @@ fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstr
     no_address(&env, &[&out, &err]);
 }
 
-/// A recording failure is not a rollback: the binding and auth word can
-/// already be durable when appending the ledger fails.
 #[test]
 fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     let (_tmp, env) = renew_env("renew-published-ledger-failure");
@@ -573,10 +540,6 @@ fn a_renewal_keeps_its_published_home_when_the_ledger_cannot_be_appended() {
     no_address(&env, &[&out, &err]);
 }
 
-/// OVER SSH: nothing opens here — `BROWSER` is aterm's opener with no
-/// profile, which opens nothing (MEASURED: Claude Code calls its opener under
-/// `SSH_CONNECTION` too, `open` where `BROWSER` is unset) — and the line says
-/// which profile to open the URL it prints in.
 #[test]
 fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     let (_tmp, env) = renew_env("renew-ssh");
@@ -592,7 +555,6 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     assert_eq!(
         host.flows.borrow()[0].2,
         RenewBrowser::Remote {
-            // Only Unix makes the opener's link (`opener_link`).
             opener: cfg!(unix).then_some(opener),
         },
         "nothing opens on the machine the owner is not at"
@@ -611,7 +573,6 @@ fn over_ssh_the_paste_code_flow_runs_and_the_profile_is_named() {
     assert!(!env.accounts_store().dir.join("bin").exists());
 }
 
-/// `--due` RENEWS THE DUE ONES ALONE, and nothing due is said, exit 0.
 #[test]
 fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let (_tmp, env) = renew_env("renew-due");
@@ -691,8 +652,6 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     no_address(&env, &[&out, &err]);
 }
 
-/// Due selection needs the auth observations. A state this build cannot
-/// read must refuse the whole sitting before any local flow or remote run.
 #[test]
 fn due_renewal_refuses_foreign_state_before_local_or_remote_actions() {
     let (_tmp, env) = renew_env("renew-due-foreign-state");
@@ -741,9 +700,6 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
     no_address(&env, &[&out, &err]);
 }
 
-/// THE OTHER MACHINES, in the same sitting: `ssh -t <host> <aterm> harness
-/// accounts renew --due --here`, for `--on`'s and, under `--due`, the
-/// config's.
 #[test]
 fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     let (_tmp, env) = renew_env("renew-on");
@@ -807,10 +763,6 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     }
 }
 
-/// EVERY LINE THAT TELLS THE OWNER TO SIGN A ROW IN NAMES THE VERB THAT
-/// ROW TAKES: `renew` for a row with an email (`login` refuses it), `login`
-/// for one without — the report's not-enrolled reason, `use`'s refusal of a
-/// row not enrolled, and `add`'s of a row already listed.
 #[test]
 fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (_tmp, env) = renew_env("renew-verbs");
@@ -855,8 +807,6 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
     }
 }
 
-/// A ROW WITH AN EMAIL SIGNS IN ONLY THROUGH `renew`: `login` refuses it,
-/// running nothing; one with none is refused by `renew`, by name.
 #[test]
 fn login_and_renew_each_refuse_the_other_ones_rows() {
     let (_tmp, env) = renew_env("renew-refusals");
@@ -880,8 +830,6 @@ fn login_and_renew_each_refuse_the_other_ones_rows() {
     no_address(&env, &[&err]);
 }
 
-/// `adopt-default` LISTS THIS MACHINE'S OWN LOGIN AS ONE RENEWABLE ROW, and
-/// refuses a second own login, a listed label and a bad address (unquoted).
 #[test]
 fn adopt_default_lists_this_machines_own_login_once() {
     let tmp = tmp_dir("adopt");
@@ -937,12 +885,6 @@ fn adopt_default_lists_this_machines_own_login_once() {
     );
 }
 
-/// THE REAL COMMAND BUILDERS, exactly: the sign-in's argv and environment
-/// for each browser, and the check run in the staging home by a `/bin/sh`
-/// stand-in that answers signed in ONLY there and only with no login
-/// variable set — and records each run, so a whole sitting through the real
-/// runner can be read back: every `auth status` ran in a staging home this
-/// sitting made.
 #[test]
 fn the_sign_in_and_the_check_are_built_exactly() {
     let envs = |cmd: &aterm_uds::spawnfd::Command| -> BTreeSet<(String, Option<String>)> {
@@ -1018,7 +960,6 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
         ),
     )
     .expect("stand-in");
-    /// [`AccountsHost`] over the REAL builders with the stand-in's path.
     struct StandIn(PathBuf);
     impl AccountsHost for StandIn {
         fn stdin_is_terminal(&self) -> bool {
@@ -1079,11 +1020,6 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
     no_address(&env, &[&out, &err]);
 }
 
-/// WHAT A RENEWAL SAYS OF THE SESSIONS ON THE OLD LOGIN names the switch
-/// that holds them, Claude Code's own among them: the logins are its
-/// sessions', and the window's host turns the accounts and logins off with
-/// `[harness.claude] enabled = false`, so a renewal promised a move nothing
-/// would make.
 #[test]
 fn a_renewal_names_claude_codes_own_switch_when_it_holds_the_sessions() {
     let read =

@@ -459,10 +459,7 @@ mod tests {
         let (one, two) = (Observed::default(), Observed::default());
         let on_one = Subscription::single(&one.watchers);
         let on_two = Subscription::single(&two.watchers);
-        one.timeline
-            .lock()
-            .unwrap()
-            .record("cwd-change", "cwd=/tmp".to_string());
+        one.timeline.lock().unwrap().record("cwd-change");
         assert!(on_one.wait(Duration::ZERO), "a timeline record wakes it");
         assert!(!on_two.wait(Duration::ZERO), "another session's does not");
         assert_eq!(

@@ -1,7 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `/terminal` engine, built by `ship site` itself.
+//! The `/terminal` engine, built by `ship site` itself. Until 2026-10-16 the sync ran
+//! the site checkout's `build-terminal-wasm.sh`; this is that script as Trust code
+//! (AGENTS.md: no shell scripts), so the sync runs nothing the site repo carries but
+//! its `deploy.sh` (docs/AUDIT-third-party-2026-10-15.md, the site-engine follow-up of
+//! wasm-platform WP.7). In order:
+//!
+//! 1. the CPU module: `aterm-wasm` built in the clone of the public commit for wasm32,
+//!    release profile, on the wasm32 pin `publish/config.sh` names (a STOCK EXCEPTION:
+//!    Trust ships only its host std), `+simd128`, the builder's paths remapped out
+//!    ([`World::build_module`]);
+//! 2. its ES-module glue from `verify glue`'s generator, in process
+//!    ([`aterm_verify::wasm_glue::glue`], its ES module glue);
+//! 3. the shipping `wasm-opt` pass over the bound module ([`World::optimise`]): a
+//!    module it left unchanged is refused, so nothing ships pre-opt;
+//! 4. refused when a remapped path survives in the module: a panic location must never
+//!    show a visitor the builder's home;
+//! 5. installed at `aterm_wasm.<sha12>.js` and `.wasm`, where `sha12` hashes the
+//!    optimized WASM. Both names are immutable: existing non-link regular files must
+//!    match exactly. A JS-only generator change under the same WASM hash refuses and
+//!    needs a deliberate URL-contract change. The glue names the hashed module, and
+//!    `boot.js` imports the atomically replaced stable `engine.js` pointer.
+//!
+//! The commit it was built from (`ENGINE_SOURCE`) is the sync's to write.
 
 use std::io::Write;
 use std::path::Path;
@@ -103,6 +125,10 @@ fn leaked<'p>(module: &[u8], paths: impl IntoIterator<Item = &'p Path>) -> Optio
     })
 }
 
+/// `js` with its module URL (`<STEM>_bg.wasm` between two quotes) renamed to `wasm`.
+///
+/// # Errors
+/// The glue never names its module that way.
 fn rename_module(js: &str, wasm: &str) -> Result<String, String> {
     let from = format!("{STEM}_bg.wasm");
     let quote = |c: Option<char>| matches!(c, Some('"' | '\''));

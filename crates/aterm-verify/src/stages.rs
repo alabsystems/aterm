@@ -94,8 +94,6 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-/// The measuring stage's benchmark targets in aterm-conformance. Each must
-/// report its complete nonempty matrix ([`decide_measuring_child`]).
 const MEASURING_TARGETS: [&str; 2] = ["paint", "spin"];
 
 /// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin`: the measuring stage's one child, the paint and spin matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames and idle wakes on a live instance.
@@ -112,8 +110,6 @@ pub fn measure_prebuild_args() -> Vec<String> {
     a
 }
 
-/// The measuring child and its prebuild share their target selection and the
-/// main lane's test profile; only the prebuild adds `--no-run`.
 fn measuring_targets_args() -> Vec<String> {
     let mut a: Vec<String> = [
         "--unverified",
@@ -181,9 +177,6 @@ pub fn doctest_split(ctx: &Ctx) -> Option<DocSplit> {
     Some(DocSplit { run, skip })
 }
 
-/// Every workspace member under `<root>/crates`, by package name, with its
-/// directory: each `crates/*/Cargo.toml` with a `[package]`, except a crate that
-/// is a workspace of its own (`[workspace]`, which the root excludes).
 fn workspace_member_dirs(root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
     let mut v: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(root.join("crates"))
         .into_iter()
@@ -547,16 +540,12 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
     })
 }
 
-/// Run, print what the child said, and decide. Returns whether the child ran and
-/// passed.
 fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     run_child(ctx, r, label, cmd, |r, run, label| {
         r.decide_child(run, label)
     })
 }
 
-/// [`run_labeled`] for a child that runs tests: a failure is itemized per failed
-/// test ([`Report::decide_test_child`]).
 fn run_tests_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     let env = crate::findings::rerun_env(cmd, ctx.test_threads);
     run_child(ctx, r, label, cmd, |r, run, label| {
@@ -577,9 +566,6 @@ fn run_child(
     out.ok
 }
 
-/// [`run_labeled`] for the stages that compile the selected crates. An empty
-/// cone never falls through to a bare `targo build`, which would build the
-/// whole workspace under a narrow label: it is a named skip ([`EMPTY_CONE`]).
 fn run_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
     if ctx.scope.selects_nothing() {
         r.skip(format!("{label} {EMPTY_CONE}"));
@@ -591,7 +577,6 @@ fn run_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
 /// Why a selection-reading stage did nothing on an empty change cone, and the fix.
 pub const EMPTY_CONE: &str = "(the change cone holds no crate — fix: pass -p <crate> or --all)";
 
-/// A bare `targo` invocation; [`in_lane`] puts it in a side lane.
 fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
     Cmd::new(&ctx.tools.targo).args(args)
 }
@@ -657,7 +642,6 @@ pub fn main_example(ctx: &Ctx, name: &str) -> std::path::PathBuf {
     main_bin(ctx, "examples").join(name)
 }
 
-/// Bind Trust's renamed documentation driver for the stages that run doctests.
 fn with_trustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
     cmd.env("RUSTDOC", ctx.tools.trustdoc.as_os_str())
 }
@@ -679,8 +663,6 @@ fn doc_driver(ctx: &Ctx) -> DocDriver {
     )
 }
 
-/// Would this scope's `targo test` compile any doctests? Cargo spawns rustdoc
-/// only for lib targets.
 fn scope_compiles_doctests(ctx: &Ctx) -> bool {
     match &ctx.scope {
         Scope::Packages(ps) => ps
@@ -690,10 +672,6 @@ fn scope_compiles_doctests(ctx: &Ctx) -> bool {
     }
 }
 
-/// The rule as a pure truth table. The stage2's own copy outranks everything
-/// (its `RUSTDOC` binding overrides even a caller's export); the caller's export
-/// outranks the PATH walk, as cargo ranks it; the farm link is the fallback for
-/// a stage2 without trustdoc.
 const fn doc_driver_from(
     stage2_has_trustdoc: bool,
     ambient_override: bool,
@@ -710,10 +688,6 @@ const fn doc_driver_from(
     }
 }
 
-/// The doc-driver binding the test children share, and the label suffix that
-/// names it: the stage2's trustdoc when it has one, the caller's own export,
-/// or nothing — no test child spawns rustdoc, so an absent driver is the
-/// doctests stage's to diagnose.
 fn test_doc_binding(ctx: &Ctx) -> (&'static str, bool) {
     match doc_driver(ctx) {
         DocDriver::Stage2 => (" (trustdoc)", true),
@@ -737,10 +711,6 @@ fn test_compile(ctx: &Ctx, r: &mut Report) {
     let _ = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
 }
 
-/// Run the test compile and decide `label` on its output with cargo's JSON taken
-/// out; return whether it compiled and the test executables its JSON reported
-/// ([`crate::testrun::take_test_executables`]), which the recording is checked
-/// against.
 fn compile_tests(
     ctx: &Ctx,
     r: &mut Report,
@@ -754,8 +724,6 @@ fn compile_tests(
     (out.ok, exes)
 }
 
-/// The test stage's two children, compile then run, with trustdoc bound when
-/// `bind`.
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let cmd = |args: Vec<String>| {
         let c = main_targo(ctx, args);
@@ -776,9 +744,6 @@ pub fn not_run_behind(r: &mut Report, what: &str, because: &str) {
     r.cannot_run(format!("{what} — {because}{NOT_RUN_BEHIND}"));
 }
 
-/// Build what a stage drives, in the main target: `true` when it built. When it
-/// did not, the build's own row and, behind it, a could-not-run row for `drive`
-/// ([`not_run_behind`]); only one row when the machine refused the build.
 fn build_to_drive(
     ctx: &Ctx,
     r: &mut Report,
@@ -833,13 +798,9 @@ fn test(ctx: &Ctx, r: &mut Report) {
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
 pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path to aterm.app>)";
 
-/// The paint and spin suites' prebuilt-artifact overrides, both set to the
-/// handed bundle's `Contents/MacOS/aterm` ([`crate::MeasureArtifact::bin`]).
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
 
-/// The measuring stage's benchmark child, [`measuring_args`] handed the release
-/// bundle's `aterm` through both overrides, and its ladder label.
 fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
     let label = format!("targo {}", args[1..].join(" "));
     let bin = artifact.bin("aterm");
@@ -849,8 +810,6 @@ fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>
     (label, cmd)
 }
 
-/// The measuring rows' compile, before the barrier: nothing to compile without
-/// a bundle to judge ([`NO_APP`]), and a failure is the measure check's.
 fn measure_prebuild(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("measuring rows' compile (no targo)");
@@ -888,7 +847,6 @@ struct MeasuringCounts {
 }
 
 impl MeasuringCounts {
-    /// The benches print one final summary derived from their execution table.
     fn parse(fields: &str) -> Option<Self> {
         let mut fields = fields.split_whitespace();
         let mut count = |key: &str| fields.next()?.strip_prefix(key)?.parse().ok();
@@ -911,8 +869,6 @@ impl MeasuringCounts {
     }
 }
 
-/// A measurement is green only after both complete nonempty matrices decide
-/// every row.
 fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str) {
     let mut incomplete = Vec::new();
     let mut refused = Vec::new();
@@ -997,8 +953,6 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
     run_tests_labeled(ctx, r, &label, &doctest_cmd(ctx, &driver, &skip));
 }
 
-/// The doctests' child: [`doctest_args`] in the main target with its doc driver
-/// bound.
 fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
     let cmd = main_targo(ctx, doctest_args(&ctx.scope));
     let stand_in = ctx
@@ -1019,8 +973,6 @@ fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Cmd {
         )
 }
 
-/// The file cargo would run as its doc driver, absolute, so the stand-in runs
-/// that file and no other; `None` when this cannot name it.
 fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf> {
     use aterm_toolchain::build_cache::{Machine, configs_name, read_config};
     let on_path = |name: &std::ffi::OsStr| crate::find_on_path(name, &ctx.path_env);
@@ -1075,9 +1027,6 @@ fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf>
     file.filter(|f| f.is_absolute())
 }
 
-/// Whether a cargo config line sets a doc driver: a `rustdoc` key, bare,
-/// dotted (`build.rustdoc`), quoted or in an inline table, never `rustdocflags`
-/// or another key that only holds the word.
 fn names_rustdoc(line: &str) -> bool {
     let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     line.match_indices("rustdoc").any(|(at, key)| {
@@ -1090,8 +1039,6 @@ fn names_rustdoc(line: &str) -> bool {
     })
 }
 
-/// The exact command the lint stage spawns, so the test asserts on it rather
-/// than a replica.
 fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     let dir = bin.parent().unwrap_or(&ctx.tools.stage2_dir).to_path_buf();
     let mut path = std::ffi::OsString::from(dir.as_os_str());
@@ -1155,11 +1102,8 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// The file every aterm checkout has: the in-process checks read the tree's
-/// own sources and policy files, and nothing elsewhere.
 const CHECKOUT_MARKER: &str = "crates/aterm-gui/Cargo.toml";
 
-/// Is the run's root an aterm checkout? A NOT RUN row naming `what` when not.
 fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
     let here = ctx.root.join(CHECKOUT_MARKER).is_file();
     if !here {
@@ -1171,8 +1115,6 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
     here
 }
 
-/// Run the `names` walks of `aterm_census::CENSUSES` over the checkout for
-/// `check`: one row each, and NOT RUN for a name the library no longer has.
 fn walks(ctx: &Ctx, r: &mut Report, check: &str, names: &[&str]) {
     if !in_checkout(ctx, r, check) {
         return;
@@ -1225,8 +1167,6 @@ pub fn export_cmd(ctx: &Ctx) -> Cmd {
     .term_grace(EXPORT_TERM_GRACE)
 }
 
-/// The `fix:` lines a transcript printed, joined: what a skip row shows. Only
-/// shown, never read for the verdict, which is the exit code.
 fn fixes(transcript: &str) -> Option<String> {
     let fixes: Vec<&str> = transcript
         .lines()
@@ -1407,14 +1347,11 @@ pub fn gpu_oracle_args() -> Vec<String> {
     a
 }
 
-/// `args` compiling and running nothing: a feature build's compile row.
 fn no_run(mut args: Vec<String>) -> Vec<String> {
     args.push("--no-run".to_string());
     args
 }
 
-/// A feature build's compile, demoted like the test compile: its lane's tests then
-/// compile nothing when their turn comes after the test run.
 fn feature_compile(ctx: &Ctx, r: &mut Report, lane: Lane, args: Vec<String>, what: &str) {
     if !ctx.tools.have_targo() {
         r.skip(format!("{what} compile (no targo)"));
@@ -1679,8 +1616,6 @@ pub fn codex_aterm_binary(ctx: &Ctx) -> std::path::PathBuf {
     main_bin(ctx, "aterm")
 }
 
-/// The line a transcript printed after `prefix`, last one first: what a row
-/// names as its reason.
 fn said<'a>(transcript: &'a str, prefix: &str) -> Option<&'a str> {
     transcript
         .lines()
@@ -1690,8 +1625,6 @@ fn said<'a>(transcript: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|l| !l.is_empty())
 }
 
-/// The reason the lab gave for not running: its `aterm-lab: NOT RUN: <why>`
-/// line.
 fn not_run_reason(transcript: &str) -> Option<&str> {
     said(transcript, "aterm-lab: NOT RUN:")
 }
@@ -1768,8 +1701,6 @@ pub fn codex_alab_proof_outcome(code: Option<i32>, transcript: &str) -> (Outcome
     )
 }
 
-/// The `codex-alab` check, in order: the platform, a toolchain, the build of
-/// both binaries, the binaries, the proof.
 fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
     let name = CODEX_ALAB_LANE;
     if !cfg!(target_os = "macos") {
@@ -1808,8 +1739,6 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
     }
     r.record_child(&out, outcome, label);
 }
-
-// The guest compiles on a stock toolchain (STOCK EXCEPTION: no Linux build of Trust exists).
 
 /// `targo --unverified build --profile test -q -p aterm-lab --bin aterm-lab` ([`MAIN_PROFILE`]).
 #[must_use]
@@ -1867,7 +1796,6 @@ pub fn linux_lane_outcome(code: Option<i32>, transcript: &str) -> (Outcome, Stri
     )
 }
 
-/// The `linux` check: the platform, a toolchain, the lab's build, the lane.
 fn linux_lane(ctx: &Ctx, r: &mut Report) {
     let name = LINUX_LANE;
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -1904,12 +1832,6 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
     r.record_child(&out, outcome, label);
 }
 
-/// The `wasm-glue` check, two rows in the cells lane's directory:
-/// [`crate::wasm_glue`]'s toy (aterm-wasm-abi's toy module built on rustup's
-/// stable, bound and held to its goldens, driven in a headless Chromium, and
-/// a planted conversion bug the driver must catch), then its oracle (the
-/// goldens and the driver held to wasm-bindgen 0.2.108 on the toy's
-/// `#[wasm_bindgen]` twin, with its negative controls).
 fn wasm_glue(ctx: &Ctx, r: &mut Report) {
     let work = crate::plan::cells_dir(ctx).join("wasm-glue");
     let root = ctx.root.clone();
@@ -1932,8 +1854,6 @@ fn wasm_glue(ctx: &Ctx, r: &mut Report) {
     );
 }
 
-/// One `wasm-glue` row: `gate` run under the child ceiling, its log, then
-/// its verdict.
 fn glue_row(
     ctx: &Ctx,
     r: &mut Report,
@@ -1968,19 +1888,12 @@ fn glue_row(
     }
 }
 
-/// The `cells` check ([`crate::cells`]): the forge cells no fleet machine
-/// hosts (or each `--cell`), each linted for its own triple on rustup's
-/// toolchain (a STOCK EXCEPTION), one row per cell.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if in_checkout(ctx, r, "cells") {
         crate::cells::run(ctx, r);
     }
 }
 
-/// The `forge` check: the third-party surface policy
-/// (`aterm_forge::check::run`, the function `targo --unverified forge check`
-/// runs) — forks live and patched, carved paths absent, provenance attested,
-/// the budget ratchet, the fork ledger.
 fn forge_gate(ctx: &Ctx, r: &mut Report) {
     const LABEL: &str = "forge check (the third-party surface)";
     if !in_checkout(ctx, r, LABEL) {
@@ -2013,9 +1926,6 @@ mod tests {
     use crate::EnvSnapshot;
     use std::path::PathBuf;
 
-    /// The ordinary pass retains Cargo's exact package spec, and so does the
-    /// required-feature pass ([`Scope::spec_of`]): a versioned package keeps
-    /// it, and a spec naming another package, or none, has no such pass.
     #[test]
     fn a_versioned_package_keeps_its_required_feature_lint_pass() {
         let gated = vec![("aterm-gui".to_string(), "control-conformance".to_string())];
@@ -2060,9 +1970,6 @@ mod tests {
         )
     }
 
-    /// A fixture tree's `crates/*/Cargo.toml` — two gated packages (one
-    /// target gated twice), one with none, one directory with no manifest —
-    /// read by [`gated_lint_features`], as the lint reads the real one.
     fn fixture_gated() -> Vec<(String, String)> {
         let root = crate::mktemp_dir("atv-gated").expect("mktemp");
         for (dir, manifest) in [
@@ -2090,9 +1997,6 @@ mod tests {
         gated
     }
 
-    /// The measuring stage judges the bundle the run was handed:
-    /// `ATERM_PAINT_BIN` and `ATERM_SPIN_BIN` are its `Contents/MacOS/aterm`,
-    /// and no child of the stage builds a release `aterm`.
     #[test]
     fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
         let c = ctx(Scope::workspace());
@@ -2134,11 +2038,6 @@ mod tests {
         assert_eq!(outcome, crate::Outcome::Skip, "{label}");
     }
 
-    /// A `wasm-glue` row whose gate found no pinned browser (or another tool
-    /// a provider gives every develop machine) is COULD NOT RUN, naming the
-    /// fix once: never a skip, which `verify` reads as a pass. NEGATIVE
-    /// CONTROL: a record-only tool's absence stays a named skip, and a page
-    /// that failed is a FAIL.
     #[test]
     fn a_glue_row_without_its_browser_could_not_run() {
         use crate::wasm_page::Refused;
@@ -2172,8 +2071,6 @@ mod tests {
         assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "{label}");
     }
 
-    /// The oracle's own verdicts are read as given: 1 is a finding even beside
-    /// a full disk, 3 and a signal decided nothing.
     #[test]
     fn libc_oracle_reads_the_gates_verdict_before_the_machine() {
         let run = |code: Option<i32>, output: &str| exec::Run {
@@ -2294,11 +2191,6 @@ mod tests {
         assert_eq!(doc_driver_from(false, false, false), DocDriver::Absent);
     }
 
-    /// THE DOCTESTS RESOLVE WHAT THE TEST COMPILE RESOLVED. Cargo unifies
-    /// features over the packages a command selects, so a doctests argv that
-    /// selected fewer would build units of its own (aterm-core without `serde`,
-    /// and all above it); every scope's doctests select exactly its test
-    /// compile's packages, and the doc driver's stand-in drops the passes.
     #[test]
     fn the_doctests_select_exactly_what_the_test_compile_selects() {
         fn selection(argv: &[String]) -> Vec<String> {
@@ -2334,10 +2226,6 @@ mod tests {
         }
     }
 
-    /// The split the stand-in applies: a library whose docs hold a doctest runs,
-    /// one whose docs hold none is skipped, a package with no library is in
-    /// neither (cargo runs no doc pass for it), and what the walk cannot find
-    /// or list runs.
     #[test]
     fn the_doctests_split_the_scopes_libraries_by_what_their_docs_hold() {
         let tmp = crate::mktemp_dir("atv-doc-split").expect("mktemp");
@@ -2394,7 +2282,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The value `cmd` gives `k`, the last binding winning as at spawn.
     fn env_of(cmd: &Cmd, k: &str) -> Option<std::ffi::OsString> {
         cmd.envs
             .iter()
@@ -2403,10 +2290,6 @@ mod tests {
             .map(|(_, v)| v.clone())
     }
 
-    /// Cargo's `RUSTDOC` is this binary's stand-in exactly when the scan
-    /// cleared a library in scope, and the stand-in is told the driver cargo
-    /// would otherwise have run; with nothing cleared, cargo runs that driver
-    /// itself, the stage2's bound as it always was.
     #[test]
     fn the_stand_in_drives_rustdoc_only_where_the_scan_cleared_a_library() {
         let (driver, skip_env) = (crate::docdriver::DRIVER_ENV, crate::docdriver::SKIP_ENV);
@@ -2549,8 +2432,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A config line names a doc driver only by a `rustdoc` key, in each of
-    /// TOML's spellings of one; the word inside another key or a value does not.
     #[test]
     fn a_config_names_a_doc_driver_only_by_its_key() {
         for line in [
@@ -2572,11 +2453,6 @@ mod tests {
         }
     }
 
-    /// THE COVERAGE FLAGS AND THE SELECTION reach every argv that reads one:
-    /// `--no-fail-fast` on each test argv and `--keep-going` before the lint's
-    /// separator (without them cargo stops at the first red binary or crate,
-    /// and the row reports a PREFIX of its scope), `-D warnings` after it, and
-    /// one `-p` per selected crate.
     #[test]
     fn every_argv_reaches_its_whole_selection() {
         let has = |argv: &[String], w: &str| argv.iter().any(|a| a == w);
@@ -2626,9 +2502,6 @@ mod tests {
         );
     }
 
-    /// The gpu oracle decided something only when a suite that drives the
-    /// oracle passed a test: another binary's passes, or a tree with no such
-    /// suite, compared the renderer against nothing.
     #[test]
     fn the_gpu_oracle_counts_only_the_suites_that_drive_it() {
         let run = |ok: bool, output: &str| exec::Run {
@@ -2710,9 +2583,6 @@ mod tests {
         }
     }
 
-    /// A lint driver taken from the managed Trust build (`Toolchain::borrowed`)
-    /// runs under that build: its directory first on PATH and as the children's
-    /// `TRUST_STAGE2_BIN`, and the row names it.
     #[test]
     fn a_borrowed_lint_driver_runs_under_its_own_build_and_says_so() {
         use crate::toolchain::TIPPY;
@@ -2747,8 +2617,6 @@ mod tests {
         assert_eq!(crate::fmt::borrowed_suffix(&c, TIPPY), "");
     }
 
-    /// Every row a borrowed lint driver decides names it: the selection's, the
-    /// oracle's arm and the release-only `required-features` pass.
     #[test]
     fn every_row_a_borrowed_lint_driver_decides_names_it() {
         use crate::toolchain::TIPPY;
@@ -2796,8 +2664,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Which children yield the CPU ([`Cmd::demoted`]): every child that only
-    /// compiles.
     #[test]
     fn compile_only_children_yield_and_children_that_run_code_do_not() {
         let mut c = ctx(Scope::workspace());
@@ -2840,9 +2706,6 @@ mod tests {
         }
     }
 
-    /// The gated list is the manifests' own: each `required-features` key counts
-    /// under its `[package]` name (never the target's `name =`, never comments),
-    /// inline or spanning lines; a manifest with no `[package]` names nothing.
     #[test]
     fn the_gated_features_are_read_from_the_manifests() {
         assert_eq!(
@@ -2938,9 +2801,6 @@ mod tests {
         assert_eq!(tippy_oracle_args(&Scope::crate_only("aterm-core")), None);
     }
 
-    /// The shipped build is linted as `ship` builds it: `--release`, so with
-    /// `debug_assertions` off, its lib and bin only (a test's debug seams do not
-    /// compile there), and wherever the selection holds the shipped package.
     #[test]
     fn the_shipped_build_is_linted_with_debug_assertions_off() {
         let want = [
@@ -3007,9 +2867,6 @@ mod tests {
         }
     }
 
-    /// `spec-check` builds in the main target, after the test compile, whole
-    /// under `release` (`--full`); its exit is read as the libc gate's, and a
-    /// missing checker's own line is the row's reason.
     #[test]
     fn the_spec_check_runs_whole_under_release_and_names_a_missing_checker() {
         let c = ctx(Scope::workspace());
@@ -3070,9 +2927,6 @@ mod tests {
         assert_eq!(libc_oracle_outcome(&run(Some(0), "")), Outcome::Ok);
     }
 
-    /// `ship check --export`'s exit code is the verdict: `0` passes, `1` and
-    /// `2` are findings, `3` is a skip that shows the fix lines it printed, and
-    /// an interrupt is never green.
     #[test]
     fn the_export_check_reads_ship_checks_exit_code() {
         let cmd = export_cmd(&ctx(Scope::workspace()));
@@ -3094,8 +2948,6 @@ mod tests {
         }
     }
 
-    /// The redraw harness and the objc drivers build in the main target with no
-    /// feature, the way a plain `targo build` would, and are driven from there.
     #[test]
     fn appkit_builds_and_drives_from_the_main_target_with_no_feature() {
         let a = redraw_conformance_build_args();
@@ -3119,9 +2971,6 @@ mod tests {
         );
     }
 
-    /// `--no-windows`: each windowed stage is one named skip with its fix,
-    /// decided before anything is built or launched; the flag removes no stage
-    /// and touches no other.
     #[test]
     fn no_windows_skips_each_windowed_stage_by_name_and_nothing_else() {
         use crate::plan::{WINDOWED, plan};
@@ -3163,8 +3012,6 @@ mod tests {
         }
     }
 
-    /// Every row's exit contract ([`objc_drive_outcome`]), each reading of `3`
-    /// some row's.
     #[test]
     fn every_objc_drive_reads_its_exit_contract() {
         for drive in &OBJC_DRIVES {
@@ -3223,8 +3070,6 @@ mod tests {
         }
     }
 
-    /// Both named matrices must account for all their rows; test-shaped output,
-    /// missing or partial summaries and host refusals never count as a pass.
     #[test]
     fn a_measuring_child_requires_complete_decided_matrices() {
         let result = |target: &str, planned, passed, failed, refused| {
@@ -3313,9 +3158,6 @@ mod tests {
         );
     }
 
-    /// A caller's `CARGO_BUILD_JOBS` is a ceiling for the side lanes' constants,
-    /// never a floor, never a parse error: a small machine's export holds on
-    /// every lane, not only on the ones that inherit it.
     #[test]
     fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
         for lane in [
@@ -3358,10 +3200,6 @@ mod tests {
         assert!(envs(&export_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())));
     }
 
-    /// THE MAIN LANE SHARES PLAIN TARGO'S CACHE: where the run found the
-    /// shim's build-cache value, every main-lane child leads with it as
-    /// `--config` and no child is pinned to a CARGO_TARGET_DIR; a side lane
-    /// never gets it.
     #[test]
     fn the_main_lanes_children_lead_with_the_shims_build_dir() {
         let mut c = ctx(Scope::workspace());
@@ -3397,9 +3235,6 @@ mod tests {
         );
     }
 
-    /// THE DRIVEN BINARY IS THE ONE ITS STAGE BUILT: the codex-alab proof's build
-    /// child only compiles, in the main target the plan schedules the row in, and the
-    /// suite is handed that target's `aterm` as its argument and nothing else.
     #[test]
     fn the_codex_alab_proof_drives_the_main_targets_aterm() {
         let lane = |cmd: &Cmd| {
@@ -3451,11 +3286,6 @@ mod tests {
         );
     }
 
-    /// The Linux lane builds the lab in the main target under the test
-    /// profile and runs `linux proof` from there; its NOT RUN is COULD NOT RUN with the lab's
-    /// reason, and the verdict over it exits 3 outside `release` too, where
-    /// the codex-alab proof's same `3` is a skip that passes (the negative
-    /// control).
     #[test]
     fn the_linux_lane_runs_the_main_targets_lab_and_its_not_run_is_never_a_pass() {
         use crate::Outcome;
@@ -3515,10 +3345,6 @@ mod tests {
         assert_eq!(code, crate::exit::PASS, "{line}");
     }
 
-    /// The codex-alab proof without a package is a NAMED SKIP quoting the
-    /// lab's reason, never a pass; a failed leg and any other code are findings;
-    /// it drives the driver lane's fresh `aterm` (its own build), never a stale
-    /// one.
     #[test]
     fn the_codex_alab_proof_without_a_package_is_a_named_skip_never_a_pass() {
         use crate::Outcome;

@@ -1230,10 +1230,6 @@ pub fn doctor_summary(withheld: Option<&str>) -> DoctorSummary {
     )
 }
 
-/// [`doctor_summary`] over the bridge command found (`None`: the fabric is off), the process
-/// table read through `table` and never while `withheld` says why: then a configured
-/// fabric is an unmeasured note that says why, and an off fabric and a config fault answer
-/// as ever, since they read none.
 fn summary_for(
     found: Result<Option<Vec<String>>, String>,
     withheld: Option<&str>,
@@ -2972,10 +2968,7 @@ fn session_title(s: &SessionRow) -> &str {
         .unwrap_or("-")
 }
 
-/// Which node a NODES row is, from where this report stands: `this` — the node the command's
-/// state dir names; `local` — another instance on this machine answers as it (its own state
-/// dir); `remote` — no instance here answers as it: on this one-machine bus, an unhosted or
-/// ghost node of this machine, never another host.
+/// Classify which node a NODES row names (`this`, `local`, or `remote`).
 #[must_use]
 pub fn node_where(r: &Report, node: &str) -> &'static str {
     if r.node.as_deref() == Some(node) {
@@ -5256,9 +5249,6 @@ mod tests {
         );
     }
 
-    /// While doctor withholds its argument reads, a configured fabric's row says why and
-    /// never reads the process table; an off fabric and a config fault answer as ever.
-    /// NEGATIVE CONTROL: with nothing withheld the same command reads the table and probes.
     #[test]
     fn a_withheld_fabric_row_says_why_and_reads_no_process_table() {
         let absent = std::env::temp_dir().join(format!("atl-withheld-{}", std::process::id()));

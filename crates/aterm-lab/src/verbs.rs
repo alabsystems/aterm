@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Small verbs on a running lab: stub modes/scripts, scratch settings, tab typing/reading, witnesses, and fixtures.
+//! Small verbs on a running lab.
 
 use std::fs;
 
@@ -18,7 +18,6 @@ use crate::stub::{control, query_escape};
 use crate::util::{atomic_write, hms, now_secs, scratch_text};
 use crate::{Fail, Res};
 
-/// The lab a verb acts on, and its remaining arguments.
 fn lab(args: &[String]) -> Result<(Run, Vec<String>), Fail> {
     let mut a = args.to_vec();
     let tag = take_tag(&mut a)?;
@@ -32,7 +31,6 @@ const SETTINGS_STYLE: Style = Style {
 };
 
 /// Deep-merge `patch` into the scratch `settings.json` (a running Claude re-reads it); the result.
-///
 /// # Errors
 /// The settings could not be read, parsed or written.
 pub fn settings_merge(run: &Run, patch: &J) -> Result<J, Fail> {
@@ -45,7 +43,6 @@ pub fn settings_merge(run: &Run, patch: &J) -> Result<J, Fail> {
 }
 
 /// Read a regular file in the scratch directory through no symlinks.
-///
 /// # Errors
 /// It is missing, or refused.
 pub fn read_scratch(p: &Path) -> Result<String, Fail> {
@@ -59,8 +56,7 @@ pub fn read_scratch(p: &Path) -> Result<String, Fail> {
     }
 }
 
-/// Switch the stub's mode (a `bg` mode also allows `Bash(sleep …)` in the scratch settings); its answer.
-///
+/// Switch the stub's mode (a `bg` mode also allows `Bash(sleep …)` in the scratch settings).
 /// # Errors
 /// The stub did not answer, or the settings could not be edited.
 pub fn set_mode(run: &Run, m: &str) -> Result<String, Fail> {
@@ -91,9 +87,9 @@ pub fn cmd_mode(args: &[String]) -> Res {
 }
 
 /// Write the custom mode `m` (`modes/<m>.json`) and switch the stub to it.
-///
 /// # Errors
-/// `m` is no custom mode's name ([`custom_mode_name`]), `spec` no JSON object, or the write or switch failed.
+/// `m` is no custom mode's name ([`custom_mode_name`]), `spec` no JSON object, or the write or
+/// switch failed.
 pub fn set_custom_mode(run: &Run, m: &str, spec: &J) -> Result<String, Fail> {
     let name = custom_mode_name(m)?;
     if !matches!(spec, J::Obj(_)) {
@@ -108,7 +104,6 @@ pub fn set_custom_mode(run: &Run, m: &str, spec: &J) -> Result<String, Fail> {
 }
 
 /// Validate `m` as the name of a custom mode served from `modes/<m>.json`.
-///
 /// # Errors
 /// `m` is not such a name.
 pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
@@ -126,8 +121,6 @@ pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
     Ok(name)
 }
 
-/// The `bg` mode's tool use runs `sleep N` in the background: let Claude run it
-/// without asking (a prompt would stall it).
 fn allow_sleep(run: &Run) -> Result<(), Fail> {
     let p = run.settings();
     let text = read_scratch(&p)?;
@@ -225,7 +218,6 @@ pub fn cmd_tool(args: &[String]) -> Res {
 }
 
 /// Write the tool mode's script and switch the stub to that mode.
-///
 /// # Errors
 /// Not JSON, the script could not be written, or the stub did not take the mode.
 pub fn set_tool(run: &Run, text: &str) -> Result<(J, String), Fail> {
@@ -245,7 +237,6 @@ pub fn set_tool(run: &Run, text: &str) -> Result<(J, String), Fail> {
 }
 
 /// Parse `headers`' argument into `{"on200":{…},"on429":{…}}` blocks.
-///
 /// # Errors
 /// Not JSON, or not that shape.
 pub fn rate_blocks(text: Option<&str>) -> Result<J, String> {
@@ -265,7 +256,6 @@ pub fn rate_blocks(text: Option<&str>) -> Result<J, String> {
 }
 
 /// Write `new`'s entries into `scratch/headers.json` while keeping the other verb's entries.
-///
 /// # Errors
 /// The file could not be written.
 pub fn write_headers(w: &Path, new: J, blocks: bool) -> Result<(), Fail> {
@@ -310,7 +300,6 @@ pub fn cmd_setenv(args: &[String]) -> Res {
 }
 
 /// Set (or, with no value, remove) `key` in the scratch settings' env block; the block.
-///
 /// # Errors
 /// The settings could not be read, parsed or written.
 pub fn set_env(run: &Run, key: &str, value: Option<&str>) -> Result<String, Fail> {
@@ -332,7 +321,7 @@ fn setenv(run: &Run, key: &str, value: Option<&str>) -> Res {
     Ok(0)
 }
 
-/// `survey [tag] on|off [--reread]`: set `CLAUDE_FORCE_DISPLAY_SURVEY` in the running Claude's settings env.
+/// `survey [tag] on|off [--reread]`.
 pub fn cmd_survey(args: &[String]) -> Res {
     const KEY: &str = "CLAUDE_FORCE_DISPLAY_SURVEY";
     let (run, a) = lab(args)?;
@@ -350,9 +339,8 @@ pub fn cmd_survey(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// `survey`'s words after the tag: the flag's value (`on`: `1`, `off`: none)
-/// and whether the write waits for Claude Code's re-read (`--reread`).
-///
+/// `survey`'s words after the tag: the flag's value (`on`: `1`, `off`: none) and whether the
+/// write waits for Claude Code's re-read (`--reread`).
 /// # Errors
 /// Anything else.
 fn survey_words(a: &[String]) -> Result<(Option<&'static str>, bool), Fail> {
@@ -414,7 +402,6 @@ pub fn harness_set(text: &str, kvs: &[(String, String)]) -> String {
 }
 
 /// Set `[harness]` keys in the scratch `aterm.toml` (live); the new text.
-///
 /// # Errors
 /// The file could not be read or written.
 pub fn set_harness(run: &Run, kvs: &[(String, String)]) -> Result<String, Fail> {
@@ -426,7 +413,6 @@ pub fn set_harness(run: &Run, kvs: &[(String, String)]) -> Result<String, Fail> 
 }
 
 /// Format a `harness` value as a TOML value for the scratch `aterm.toml`.
-///
 /// # Errors
 /// Value opens as a string, array, or table and is not a valid TOML value.
 pub fn toml_value(v: &str) -> Result<String, String> {
@@ -472,20 +458,18 @@ pub fn cmd_harness(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// `send [tag] text…`
+/// `send [tag] text…`.
 pub fn cmd_send(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     Ok(Door::new(&run)?.ctl_inherit(&["send", &a.join(" ")])?)
 }
 
-/// `enter [tag]`
+/// `enter [tag]`.
 pub fn cmd_enter(args: &[String]) -> Res {
     let (run, _) = lab(args)?;
     Ok(Door::new(&run)?.ctl_inherit(&["key", "enter"])?)
 }
 
-/// Whether `text` stands in the composer of the agent in the tab now;
-/// `None` when the screen could not be read (never taken for "sent").
 fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
     let r = door.ctl(&["text"]).ok()?;
     if r.code != 0 {
@@ -495,7 +479,6 @@ fn standing(door: &Door<'_>, text: &str) -> Option<bool> {
 }
 
 /// Type `text` and press Enter once `text` stands in the composer.
-///
 /// # Errors
 /// A door rule refused it, or the run was interrupted.
 pub fn turn(door: &Door<'_>, text: &str) -> Result<bool, Fail> {
@@ -567,7 +550,7 @@ pub fn cmd_passthrough(verb: Option<&str>, args: &[String]) -> Res {
     Ok(Door::new(&run)?.ctl_inherit(&v)?)
 }
 
-/// `image [tag] [name]`
+/// `image [tag] [name]`.
 pub fn cmd_image(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let name = a
@@ -596,7 +579,7 @@ pub fn sid(door: &Door<'_>) -> String {
         .to_string()
 }
 
-/// `sid [tag]`
+/// `sid [tag]`.
 pub fn cmd_sid(args: &[String]) -> Res {
     let (run, _) = lab(args)?;
     println!("{}", sid(&Door::new(&run)?));
@@ -636,7 +619,7 @@ pub fn cmd_security(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// `paths`
+/// `paths`.
 pub fn cmd_paths() -> Res {
     let p = paths();
     println!("LAB_STATE={}", p.state.display());
@@ -713,8 +696,6 @@ pub fn cmd_journal(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The pids of a lab's processes that live: everything in its jail (the
-/// instance's tree, the agents, codex-runs) and the stub.
 fn live_pids(run: &Run) -> Vec<String> {
     crate::procs::lab_tree(run)
         .into_iter()
@@ -725,7 +706,6 @@ fn live_pids(run: &Run) -> Vec<String> {
 }
 
 /// `lsof -nP -i` of a lab's own processes: the text, or why there is none.
-///
 /// # Errors
 /// No process of the lab lives.
 pub fn lsof_text(run: &Run) -> Result<String, Fail> {
@@ -944,7 +924,7 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
     )
 }
 
-/// `header [tag] "<what>"`
+/// `header [tag] "<what>"`.
 pub fn cmd_header(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     println!(
@@ -959,7 +939,6 @@ pub fn cmd_header(args: &[String]) -> Res {
 }
 
 /// Write `$LAB_STATE/captures/claude-<version>-<name>.txt` and its PNG; return their paths.
-///
 /// # Errors
 /// The captures directory could not be made or written.
 pub fn write_fixture_rows(
@@ -973,7 +952,6 @@ pub fn write_fixture_rows(
 }
 
 /// [`write_fixture_rows`] into `dir`.
-///
 /// # Errors
 /// The directory could not be made or written.
 pub fn write_fixture_rows_in(
@@ -1014,7 +992,6 @@ pub fn png(door: &Door<'_>, dir: &Path, full: &str) -> Option<std::path::PathBuf
 }
 
 /// Capture the screen into `$LAB_STATE/captures/<agent>-<version>-<name>.txt` (and `.png`).
-///
 /// # Errors
 /// The screen could not be read, or the capture could not be written.
 pub fn capture(
@@ -1059,10 +1036,6 @@ pub fn capture(
     Ok((out, png))
 }
 
-/// What of the owner's a capture's `text` carries, by the PII guard: the
-/// login name, the host's short name, and every home the lab guards (the
-/// account's, whatever `HOME` says, and the caller's `HOME` when it names
-/// another: [`crate::paths::Paths::guarded_homes`]).
 fn pii_found(p: &crate::paths::Paths, host: &str, text: &str) -> Vec<String> {
     [p.user.clone(), host.to_string()]
         .into_iter()
@@ -1079,7 +1052,6 @@ pub fn cmd_capture(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Whether `v` is a three-number version (`2.1.300`).
 fn semver_like(v: &str) -> bool {
     let p: Vec<&str> = v.split('.').collect();
     p.len() >= 3
@@ -1097,14 +1069,13 @@ pub fn version_key(v: &str) -> Vec<u64> {
         .collect()
 }
 
-/// `twin [tag] <claude-bin>|--crashing [ver]`: present a build as a newer managed Claude Code in the scratch package prefix.
+/// `twin [tag] <claude-bin>|--crashing [ver]`.
 pub fn cmd_twin(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     twin(&run, &a)
 }
 
 /// [`cmd_twin`] on a loaded lab.
-///
 /// # Errors
 /// A bad argument, a build that names no version, or a write refused (a link on its way).
 pub fn twin(run: &Run, a: &[String]) -> Res {
@@ -1229,10 +1200,6 @@ pub fn security_masked(run: &Run) -> String {
 mod tests {
     use super::*;
 
-    /// THE CAPTURE'S PII GUARD LOOKS FOR EVERY HOME THE LAB GUARDS: under a
-    /// scratch `HOME` (a fake account home handed in through
-    /// [`crate::paths::Paths::resolve_with`]) a capture naming the account's
-    /// home or the scratch one is flagged, as is the login name.
     #[test]
     fn the_capture_pii_guard_looks_for_the_account_home_and_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -1267,8 +1234,6 @@ mod tests {
         assert!(pii_found(&own, host, &format!("cwd {s}/x")).is_empty());
     }
 
-    /// `survey on|off [--reread]`: `on` sets the flag, `off` removes it, and
-    /// `--reread` after either waits for Claude Code's re-read.
     #[test]
     fn survey_takes_on_or_off_and_reread_after_it() {
         let w = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
@@ -1313,9 +1278,6 @@ mod tests {
         );
     }
 
-    /// `harness TAG approve=none` writes `approve = "none"`, a file aterm can
-    /// read; a TOML value is written as typed, and a word with a quote or a
-    /// backslash is escaped.
     #[test]
     fn a_harness_value_is_written_as_toml() {
         let parses = |t: &str| aterm_toml::from_str::<aterm_toml::Value>(t).is_ok();
@@ -1355,7 +1317,6 @@ mod tests {
         assert_eq!(journal_line("not json"), "not json");
     }
 
-    /// `headers` takes the two blocks alone, objects each; nothing is `{}`.
     #[test]
     fn headers_takes_the_on200_and_on429_blocks_alone() {
         assert_eq!(rate_blocks(None).unwrap().py(), "{}");
@@ -1370,9 +1331,6 @@ mod tests {
         }
     }
 
-    /// Both verbs write the one `--headers-file` through [`write_headers`],
-    /// and each leaves the other's entries: `headers` then `ratelimits` on
-    /// one file reads back the block and the flat entry.
     #[test]
     fn both_headers_verbs_writes_stand_in_the_one_file() {
         let d = std::fs::canonicalize(std::env::temp_dir())

@@ -100,7 +100,7 @@ impl MemoryLevel {
     }
 }
 
-/// The working directory of process `pid`, read from the OS: `None` where it cannot be read (the process is gone, not ours, or the platform has no reader here). macOS asks `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, Linux resolves `/proc/<pid>/cwd`, Windows reads the process environment block's `CurrentDirectory` ([`peb`]: a process of this account that grants `PROCESS_VM_READ`, never an elevated one), spelled as that process's own `GetCurrentDirectoryW` answers it — no trailing separator but at a root, and an 8.3 short name kept if the process was handed one.
+/// The working directory of process `pid`, read from the OS: `None` where it cannot be read (the process is gone, not ours, or the platform has no reader here). macOS asks `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, Linux resolves `/proc/<pid>/cwd`, Windows reads the process environment block's `CurrentDirectory` (`peb`: a process of this account that grants `PROCESS_VM_READ`, never an elevated one), spelled as that process's own `GetCurrentDirectoryW` answers it — no trailing separator but at a root, and an 8.3 short name kept if the process was handed one.
 #[must_use]
 pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]

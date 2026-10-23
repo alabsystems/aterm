@@ -3891,10 +3891,10 @@ fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
 /// red-team's F14, R9): the policy wake alone — the watcher's post, which comes at every
 /// launch and on a read no config generation admits — whose root `[harness]` table says it
 /// raises the entry naming that the harness types occupancy lines, once however many posts say
-/// it, and the board takes the mode; a later post that no longer says it clears it. No config
-/// generation is applied here: the launch's unchanged file sends none. NEGATIVE CONTROLS:
-/// `observe`, `off`, a word that is no mode, and no key raise nothing, and a stale stamp
-/// changes nothing.
+/// it, and the board takes the mode, which opens the GUI's own gate (`prompt_now`) under `prompt`
+/// alone; a later post that no longer says it clears it. No config generation is applied here:
+/// the launch's unchanged file sends none. NEGATIVE CONTROLS: `observe`, `off`, a word that is no
+/// mode, and no key raise nothing and leave the gate shut, and a stale stamp changes nothing.
 #[test]
 fn the_owners_prompt_is_one_entry_while_the_policy_in_force_says_it() {
     use crate::app_config::HarnessPolicy;
@@ -3912,6 +3912,7 @@ fn the_owners_prompt_is_one_entry_while_the_policy_in_force_says_it() {
     assert_eq!(entry.key, mr::occupancy_prompt_key());
     assert!(entry.key.starts_with(&Family::Occupancy.prefix()));
     assert_eq!(crate::occupancy_host::mode(), Occupancy::Prompt);
+    assert!(crate::occupancy_host::prompt_now(), "the GUI's own gate");
     mr::occupancy_prompt_entry()
         .message()
         .expect("the words pass the rule");
@@ -3938,6 +3939,7 @@ fn the_owners_prompt_is_one_entry_while_the_policy_in_force_says_it() {
         app.adopt_harness_policy(stamps.stamp(HarnessPolicy::read(text)));
         assert!(app.messages.digest().is_empty(), "{text:?}");
         assert_eq!(crate::occupancy_host::mode(), mode, "{text:?}");
+        assert!(!crate::occupancy_host::prompt_now(), "{text:?}");
     }
     crate::occupancy_host::set_mode(Occupancy::Observe);
 }
@@ -3953,7 +3955,7 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
     use aterm_agent::supervise::occupancy::{
         OccupancyReading, OccupancySaid, RuleId, SaidHold, SaidRule, SaidVerdict,
     };
-    let word = |mode: Occupancy, verdicts: [SaidVerdict; 2]| OccupancySaid {
+    let word = |mode: Occupancy, verdicts: [SaidVerdict; RuleId::COUNT]| OccupancySaid {
         mode,
         hold: Some(SaidHold {
             since_ms: 1_792_600_000_000,
@@ -3961,7 +3963,7 @@ fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
         }),
         ready: false,
         guards: None,
-        rules: [
+        rules: vec![
             SaidRule {
                 rule: RuleId::WaitNudge,
                 verdict: verdicts[0],

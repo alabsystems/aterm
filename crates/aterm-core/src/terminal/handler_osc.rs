@@ -127,7 +127,8 @@ impl TerminalHandler<'_> {
         self.report_cwd(params.get(1..).unwrap_or_default(), false);
     }
 
-    /// Apply a `file://` cwd report ([`Self::shell_sits_at_prompt`]).
+    /// Apply a `file://` cwd report (`uri`), unless the report is unsigned and either unchanged
+    /// under a signing shell or [`Self::shell_sits_at_prompt`] is true with no program running.
     pub(super) fn report_cwd(&mut self, uri: &[&[u8]], signed: bool) {
         if signed {
             self.shell.signs_cwd = true;
@@ -161,7 +162,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// What an OSC 7 whose URI is `uri`.
+    /// What an OSC 7 whose URI is `uri` does to the reported cwd; `None` leaves it unchanged.
     fn osc_7_report(uri: &[&[u8]]) -> Option<super::shell::CwdReport> {
         let uri_bytes = uri.join(&b';');
         let uri = std::str::from_utf8(&uri_bytes).unwrap_or_default();

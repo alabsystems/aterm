@@ -7,13 +7,10 @@ fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-/// The parent's first two words, typed by name (measured, 0.46.0 Homebrew).
 const NODE: &str = "/opt/homebrew/opt/node/bin/node";
 const SCRIPT: &str = "/opt/homebrew/bin/gemini";
-/// A session id as 0.46.0 printed one, and another.
 const S1: &str = "11edd4f1-7048-4ff7-8ff2-83cce0095a7c";
 const S2: &str = "88409a32-5b1e-4c2a-9d7f-0e1f2a3b4c5d";
-/// The measured project, and its `projectHash`.
 const ROOT: &str = "/private/tmp/at.u46v/proj";
 const HASH: &str = "d944508ee7adf907b4df9f68c97455f0ffc044f6295c471e7e4c8db9cdb4af41";
 
@@ -23,8 +20,6 @@ fn launch(rest: &[&str]) -> Vec<String> {
     out
 }
 
-/// The process Gemini CLI runs as is told by its script, under `node`: typed
-/// by name (the PATH link), by path (the bundle), npm's `bin/gemini`.
 #[test]
 fn the_process_is_node_running_gemini_clis_script() {
     let node = std::path::Path::new("/opt/homebrew/Cellar/node/26.3.0/bin/node");
@@ -59,13 +54,6 @@ fn the_process_is_node_running_gemini_clis_script() {
     assert!(!is_gemini_process(None, &launch(&[])));
 }
 
-/// The relaunch carries what this run chose and the CLI does not keep with
-/// the session (the model, the approval posture, YOLO, the sandbox, the
-/// policy and extension lists, the include directories, trust, debug, the
-/// screen reader and raw output), drops what names the session or sends a
-/// prompt again (`--resume`, `--session-id`, `--session-file`, `-i`, a
-/// positional prompt), and resumes the witnessed session as `--resume
-/// <uuid>`, every word kept as typed.
 #[test]
 fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
     let old = "00000000-1111-4222-8333-444444444444";
@@ -146,8 +134,6 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_names_the_session() {
     );
 }
 
-/// A launch no relaunch brings back is refused with its word, a flag the
-/// table does not know refuses, and so does a session that is no full UUID.
 #[test]
 fn a_launch_no_resume_carries_is_refused() {
     for (words, want) in [
@@ -192,8 +178,6 @@ fn a_launch_no_resume_carries_is_refused() {
     }
 }
 
-/// A TUI is any launch but a one-shot or a subcommand; a launch the rewrite
-/// refuses for a flag it does not know or one that refuses is still a TUI.
 #[test]
 fn a_tui_is_every_launch_but_a_one_shot() {
     for (words, tui) in [
@@ -212,8 +196,6 @@ fn a_tui_is_every_launch_but_a_one_shot() {
     }
 }
 
-/// The session an argv names, by its full UUID only. NEGATIVE CONTROLS: an
-/// index, `latest`, a custom id and a resume with no value name none.
 #[test]
 fn an_argv_names_a_session_by_its_full_uuid_alone() {
     for (words, want) in [
@@ -233,9 +215,6 @@ fn an_argv_names_a_session_by_its_full_uuid_alone() {
     assert!(!is_session_uuid("11edd4f17048-4ff7-8ff2-83cce0095a7c0"));
 }
 
-/// The Gemini directory: `GEMINI_CLI_HOME`'s where set (it moves the whole
-/// home), else `HOME`'s, else the fallback's; a relative `GEMINI_CLI_HOME`
-/// is unmeasured and names none.
 #[test]
 fn the_gemini_directory_follows_its_cli_home_then_its_home() {
     let fb = std::path::Path::new("/Users//me");
@@ -271,23 +250,18 @@ fn the_gemini_directory_follows_its_cli_home_then_its_home() {
     ));
 }
 
-/// A header line as 0.46.0 writes one.
 fn header(session: &str, at: &str) -> String {
     format!(
         r#"{{"sessionId":"{session}","projectHash":"{HASH}","startTime":"{at}","lastUpdated":"{at}","kind":"main"}}"#
     )
 }
 
-/// The `$set.messages` a launch writes after its header: the CLI's own
-/// `<session_context>`, stamped `at`.
 fn context(at: &str, id: &str) -> String {
     format!(
         r#"{{"$set":{{"lastUpdated":"{at}","messages":[{{"id":"{id}","timestamp":"{at}","type":"user","content":[{{"text":"<session_context>\nThis is the Gemini CLI.\n</session_context>"}}]}}]}}}}"#
     )
 }
 
-/// One turn: a person's message and the model's reply (a plain string, as a
-/// live turn leaves it), each with `$set.lastUpdated`.
 fn turn(at: &str, user: &str, reply: &str) -> String {
     format!(
         "{{\"id\":\"{user}\",\"timestamp\":\"{at}\",\"type\":\"user\",\"content\":[{{\"text\":\"remember DELTA-FOUR\"}}]}}\n\
@@ -301,9 +275,6 @@ fn lines(parts: &[String]) -> String {
     parts.join("\n") + "\n"
 }
 
-/// The turn-holding file of the measured chain A (`session-…T18-21-…`): its
-/// launch, one turn, resume 1's rewrite bumping `lastUpdated`, resume 2's
-/// switch onto it (no bump: its minute differs), and a later start's summary.
 fn chain_a_turns(rewrite_at: Option<&str>) -> String {
     let mut parts = vec![
         header(S1, "2026-10-17T18:21:34.531Z"),
@@ -323,7 +294,6 @@ fn chain_a_turns(rewrite_at: Option<&str>) -> String {
     lines(&parts)
 }
 
-/// A resume's header-only duplicate, begun at `at`.
 fn duplicate(session: &str, at: &str) -> String {
     lines(&[header(session, at), context(at, &format!("ctx-{at}"))])
 }
@@ -336,11 +306,6 @@ fn file<'a>(name: &'a str, text: &'a str) -> ChatsFile<'a> {
     }
 }
 
-/// THE PRE-CHECK PREDICTS WHAT THE RESUME LOADS (the premeasure's chain A,
-/// record for record): after a turn and resume 1 (its rewrite bumps the
-/// turn-holding file), the pick holds the turn — SAFE; after resume 2 with no
-/// turn between (its duplicate newest), the pick is that empty duplicate —
-/// UNSAFE, which typed would bring the session back without its turn.
 #[test]
 fn the_precheck_folds_the_sessions_files_as_the_cli_does() {
     let turns_after_1 = chain_a_turns(Some("2026-10-17T18:22:40.322Z"));
@@ -413,10 +378,6 @@ fn the_precheck_folds_the_sessions_files_as_the_cli_does() {
     ));
 }
 
-/// The fold follows the CLI's records: a message written again keeps its
-/// place, `$set.messages` replaces them, `$rewindTo` drops that message and
-/// every one after it (all of them where it names none), and the
-/// `<session_context>` is no turn while it makes the file a session.
 #[test]
 fn the_fold_follows_the_clis_records() {
     let text = lines(&[
@@ -441,7 +402,6 @@ fn the_fold_follows_the_clis_records() {
     assert!(f.turns.is_empty() && !f.valid);
 }
 
-/// Unix ms of the measured tab's parent start (18:28:18.0 UTC).
 const START: u64 = 1_792_261_698_000;
 
 fn at(ms_after_start: u64) -> String {
@@ -453,9 +413,6 @@ fn at(ms_after_start: u64) -> String {
     )
 }
 
-/// THE START-TIME RULE NAMES THE ONE SESSION BEGUN SINCE THE PROCESS
-/// STARTED: a fresh launch's file, a resume's duplicate, a resume whose
-/// header was appended to its own minute's file.
 #[test]
 fn the_start_time_rule_names_one_session_begun_since_the_start() {
     let older = chain_a_turns(None);
@@ -573,11 +530,6 @@ fn the_start_time_rule_names_one_session_begun_since_the_start() {
     assert_eq!(w(&[file(n_launch, &own)]), Ok(S2.to_string()));
 }
 
-/// A LONE HEADER BEGUN LATER THAN ITS OWN COULD BE NAMES NO SESSION: a
-/// process that died before writing its own header, and another launch of
-/// the project begun 30 s after its start (gone since, or never seen as
-/// started together), is never read as running that launch's session
-/// (`late-header`).
 #[test]
 fn a_lone_header_begun_later_than_its_own_could_be_names_none() {
     let none = |_: &str| false;
@@ -621,11 +573,6 @@ fn a_lone_header_begun_later_than_its_own_could_be_names_none() {
     assert_eq!(rule(&own_then_clear), Err(NoWitness::TwoHeaders));
 }
 
-/// A SWITCH ONTO A SESSION NO STAMPED WRITE FOLLOWS is its file's trailing
-/// switch, whatever unstamped records follow it (a start's background
-/// summary, the process's own `$set.summary` or `$set.directories`, a
-/// `$rewindTo`); a stamped write after it (a message, a `$set.lastUpdated`, a
-/// header) ends it.
 #[test]
 fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_headers() {
     let switch = format!(r#"{{"$set":{{"sessionId":"{S1}"}}}}"#);
@@ -691,10 +638,6 @@ fn a_trailing_switch_is_read_through_unstamped_records_and_counted_against_heade
     ));
 }
 
-/// The exit table: `0` and `130` clean; `41`, `42`, `44`, `52`-`55` a refused
-/// start; `1` and a signal death nothing catches (`137` measured) a crash; a
-/// stop signal's status stopped; anything else (the parent ignores TERM, HUP
-/// and INT) no witness.
 #[test]
 fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
     #[cfg(unix)]
@@ -735,10 +678,6 @@ fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
     }
 }
 
-/// A WORKER'S OWN RESTART NAMES THE ID IT REFUSED ([`restart_id`]): `42`
-/// from a launch under `--session-id <uuid>` (a worker's line: the id, then
-/// its attached first prompt), the id whichever way it is written — the
-/// caller holds it to the start-time rule.
 #[test]
 fn a_workers_own_restart_names_the_id_it_refused() {
     let worker = launch(&[
@@ -770,9 +709,6 @@ fn a_workers_own_restart_names_the_id_it_refused() {
     assert_eq!(ExitKind::Restarted.word(), "restarted");
 }
 
-/// A WORKER'S TRUSTED-FOLDERS FILE IS READ OFF A RECORD'S WORDS BY NAME
-/// ([`trusted_folders_of_words`]), where absolute: what its relaunch carries
-/// while the file stands.
 #[test]
 fn a_workers_trusted_folders_file_is_read_off_its_record() {
     let words = env_words(&[
@@ -800,11 +736,6 @@ fn a_workers_trusted_folders_file_is_read_off_its_record() {
     );
 }
 
-/// The homes a line carries: `GEMINI_CLI_HOME` where set, `HOME` where it is
-/// another than the user's, and a worker's own trusted-folders file where an
-/// absolute one is set (its relaunch stays trusted in its folder alone);
-/// read back from a record by name alone, which keeps no trusted-folders
-/// file (the live worker's, removed with its session).
 #[test]
 fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
     let user = std::path::Path::new("/Users//me");
@@ -903,11 +834,6 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
     assert_eq!(package_version(r#"{"name":"other","version":"1"}"#), None);
 }
 
-/// A SESSION FILE GEMINI CLI WROTE BEFORE ITS FOLDER-TRUST DIALOG WAS
-/// ANSWERED — MEASURED in the lab (0.46.0, 2026-10-21, a launch under
-/// `--session-id` and no first prompt in a folder it did not trust; the
-/// lab's scratch home path elided to `/lab/gemini-home`): its header and the
-/// CLI's own `<session_context>`, nothing else.
 const TURNLESS_SESSION: &str = concat!(
     r##"{"sessionId":"22222222-3333-4444-8555-666666666666","projectHash":"db63f153cf1f3aa6fe8af943ea8677baf866f81f77f020c6f1fce682f46d9db2","startTime":"2026-10-22T05:07:59.626Z","lastUpdated":"2026-10-22T05:07:59.626Z","kind":"main"}"##,
     "\n",
@@ -915,12 +841,6 @@ const TURNLESS_SESSION: &str = concat!(
     "\n"
 );
 
-/// WHAT A RESTART BEFORE THE FIRST TURN LEAVES, AND WHETHER ITS LAUNCH
-/// CARRIED A FIRST PROMPT: the measured session file of a folder-trust
-/// restart holds no turn ([`Precheck::NoTurns`]: its `<session_context>` is
-/// the CLI's, no person's message), and [`carries_first_prompt`] reads the
-/// launch's `-i`/`--prompt-interactive` (either spelling), a positional and
-/// words after `--`.
 #[test]
 fn a_restart_before_the_first_turn_leaves_no_turn_and_its_prompt_is_read() {
     let id = "22222222-3333-4444-8555-666666666666";

@@ -315,7 +315,7 @@ impl App {
         self.write_session_meta_field(session, MetaField::Title, text)
     }
 
-    /// [`Self::write_session_title_pin`] for any presentation field.
+    /// `Self::write_session_title_pin` for any presentation field.
     pub(crate) fn write_session_meta_field(
         &mut self,
         session: u64,

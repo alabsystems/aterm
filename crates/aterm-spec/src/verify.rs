@@ -3,6 +3,38 @@
 // Author: Andrew Yates
 
 //! The shared verification helpers for aterm's derived models and their conformance tests, in two tiers with one switch between them.
+//!
+//! ## Caller idioms
+//!
+//! ```no_run
+//! use std::collections::BTreeMap;
+//! use aterm_spec::{derive::Model, verify::{self, Covered, NotRun}};
+//!
+//! // SCALAR derived model — the common case. The interpreter always runs, so
+//! // coverage is unconditional and the returned Covered is a log line.
+//! fn check_scalar(m: &Model) -> Covered {
+//!     verify::prove_and_catch_scalar(m, "Thing non-vacuity")
+//! }
+//!
+//! // FUNCTION-VALUED derived model — only `ty` can walk it, so outside a
+//! // checker run the obligation does NOT run, and the `_tiered` forms return
+//! // `Result<Covered, NotRun>` so the caller must state a policy (a registered
+//! // one is `spec-check models`'s). Propagate NotRun; it is not coverage.
+//! fn check_function_valued(m: &Model) -> Result<Covered, NotRun> {
+//!     verify::prove_and_catch_tiered(m, "Thing Tier-0")
+//! }
+//!
+//! fn check_transition(
+//!     m: &Model,
+//!     overrides: &[(&'static str, i64)],
+//!     prev: &BTreeMap<&'static str, i64>,
+//!     next: &BTreeMap<&'static str, i64>,
+//! ) -> (bool, String) {
+//!     verify::validate_transition_tiered(
+//!         m, overrides, prev, next, Some("Push"), "Thing conformance",
+//!     )
+//! }
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -1872,7 +1904,7 @@ pub(crate) fn ty_check_liveness(
     (out.status.success(), evidence)
 }
 
-/// Tiered liveness: [`audit_liveness`] on the interpreter.
+/// Tiered liveness: [`audit_liveness`] on the interpreter, plus `ty` when checkers run.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &str) -> Covered {
     assert_scalar(m, label, "liveness_proves_and_catches_tiered");

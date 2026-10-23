@@ -9,6 +9,21 @@
 // src/deprecated.rs; the rest of it is aterm's.
 
 //! `#[derive(Serialize, Deserialize)]` proc macros for `aterm-serde`.
+//!
+//! ```
+//! # extern crate aterm_serde as serde;
+//! use aterm_serde_derive::{Deserialize, Serialize};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! #[serde(rename_all = "snake_case", deny_unknown_fields)]
+//! struct Window {
+//!     #[serde(default, skip_serializing_if = "Option::is_none")]
+//!     title: Option<String>,
+//!     #[serde(rename = "cols", alias = "columns")]
+//!     width: u16,
+//! }
+//! # fn main() {}
+//! ```
 
 #![allow(
     clippy::enum_variant_names,

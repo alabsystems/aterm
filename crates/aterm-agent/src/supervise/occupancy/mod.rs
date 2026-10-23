@@ -1,36 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HARNESS OCCUPANCY (`docs/DESIGN-harness-occupancy-2026-10-20.md`): what the harness measures
-//! of a session's wait on its own background work, under `[harness] occupancy`
-//! ([`super::config::Occupancy`]). Measures, judges and books, and types only under the
-//! owner's `prompt`:
-//!
-//! * [`hold`]: the hold's clock — when the wait began, whether the agent declared it
-//!   (`WAITING:`), when it ended — and its `fact-hold@v1` ledger rows, which a successor loop
-//!   carries the hold by.
-//! * [`reading`]: the machine as the window's facts board reads it for one session
-//!   (`IdleHost::occupancy`, taped), the empty reading where none is.
-//! * [`rules`]: the built-in rules, `wait-nudge@v1` and `hold-room@v1`, and [`decide`], the pure
-//!   decider of whether one is due at a break and what holds it.
-//! * [`templates`]: the closed lines they type.
-//! * [`door`]: the pure parts of the write under `prompt`: the `status` read before it, the
-//!   write's own holds, the host's pace, and the intent and outcome rows.
-//! * [`said`]: what the loop tells its host once a change ([`OccupancySaid`],
-//!   `IdleHost::occupancy_said`) and its `occupancy why` form.
-//! * [`ring`]: the board's facts ring (`<state>/occupancy/facts.ring`) and the slot-time idle
-//!   while a session was ready; [`replay`]: `occupancy check --replay`, the decider run again
-//!   over it.
-//!
-//! The loop feeds the clock and asks the decider from `run::occupancy_loop` on hosted,
-//! unattended loops only, and only while the key is not `off`; there it journals `OCCUPANCY`
-//! lines and books the rows. Under `observe` what `prompt` would type is booked as
-//! `fact-would@v1`, and that is all; only the owner's `occupancy = "prompt"` reaches the write
-//! ([`super::config::Occupancy::grant`]), at a drawn break, fenced, after every guard.
+//! HARNESS OCCUPANCY (`docs/DESIGN-harness-occupancy-2026-10-20.md`).
 
 pub mod door;
 #[cfg(any(test, debug_assertions))]
 mod door_environment;
+pub mod fact_word;
 pub mod hold;
 pub mod reading;
 pub mod replay;
@@ -38,20 +14,21 @@ pub mod ring;
 pub mod rules;
 pub mod said;
 pub mod templates;
+pub mod wakes_seen;
 
 pub use door::{AtWrite, PaceGrant, PaceRefusal, StatusSeen, write_held};
+pub use fact_word::{FactWord, NoteOutcome};
 pub use hold::{Close, HoldChange, HoldClock, HoldEvent, waiting_declared};
 pub use reading::{OccupancyReading, SlotsSeen};
 pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, decide};
 pub use said::{OccupancySaid, SaidHold, SaidRule, SaidVerdict};
 pub use templates::FactLine;
+pub use wakes_seen::{WakeClaim, WakeDoor, WakesSeen};
 
 #[cfg(any(test, debug_assertions))]
 pub use door_environment::occupancy_door_environment;
 
-/// THE NEGATIVE CONTROLS' FAULT POINTS, debug and test builds only: each, armed on this thread,
-/// plants one defect `OccupancyDoor`'s Tier-1 bind (`tests/conformance_occupancy.rs`) must catch,
-/// as `aterm_keeper::core::fault` plants its. The shipped build's check is constant `false`.
+/// THE NEGATIVE CONTROLS' FAULT POINTS.
 #[cfg(any(test, debug_assertions))]
 pub mod fault {
     use std::cell::Cell;
@@ -59,34 +36,30 @@ pub mod fault {
     /// A planted defect.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Fault {
-        /// [`Books::hold`](super::Books::hold) keeps a closed hold's per-hold counts: a rule told
-        /// in one hold is never due in the next, deduplicated by its name, not its episode.
+        /// [`Books::hold`](super::Books::hold) keeps a closed hold's per-hold counts.
         DedupeByRule,
-        /// [`HoldClock::step`](super::HoldClock::step) restarts the open hold at each new break
-        /// (on 10-19 a clock restarted at each short idle window would never have reached 2 h).
+        /// [`HoldClock::step`](super::HoldClock::step) restarts the open hold at each new break.
         RestartOnIdle,
         /// [`HoldClock::step`](super::HoldClock::step) ends the hold at the turn that answers a
-        /// line the harness typed, as if no line were owed.
+        /// line the harness typed.
         CloseOnOurTurn,
-        /// [`HoldClock::step`](super::HoldClock::step) judges the point that ends a harness
-        /// line's answer as any other point.
+        /// [`HoldClock::step`](super::HoldClock::step) judges the point that ends a harness line's
+        /// answer as any other point.
         CloseAtTheAnswer,
         /// [`HoldClock::step`](super::HoldClock::step) ends the hold at a point that decides
-        /// nothing while the work still shows (F5).
+        /// nothing while the work still shows.
         CloseAtAnyPoint,
-        /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed) reads an intent with
-        /// no outcome after it as told.
+        /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed) reads an intent with no
+        /// outcome after it as told.
         SeedIntentAsTold,
-        /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed) reads a skipped
-        /// episode as told.
+        /// [`FactsState::seed`](crate::supervise::facts::FactsState::seed) reads a skipped episode
+        /// as told.
         SeedSkipAsTold,
-        /// The door's write under `prompt` makes no `status` read before it, judging the
-        /// person, a driver's hand, the halt and unread input from the loop's last read alone.
+        /// The door's write under `prompt` makes no `status` read before it.
         DoorSkipsStatus,
         /// The door's write books its outcome (`typed`) before the write.
         DoorOutcomeFirst,
-        /// The door's line is taken as the host's notice (`TurnEndState::host_typed`), not a fact
-        /// line of its own (`TurnEndState::fact_typed`).
+        /// The door's line is taken as the host's notice (`TurnEndState::host_typed`).
         DoorHostTyped,
         /// The door's write falls back to the guarded submit on a read it cannot fence.
         DoorGuardedFallback,
@@ -96,27 +69,21 @@ pub mod fault {
         DoorIgnoresDraft,
         /// The door's write ignores the brakes and the host's withhold (a full disk).
         DoorIgnoresBrakes,
-        /// [`write_held`](super::write_held) lets a nudge go while the upgrade's notice is due
-        /// (F11's order turned).
+        /// [`write_held`](super::write_held) lets a nudge go while the upgrade's notice is due.
         NudgeOverNotice,
         /// [`write_held`](super::write_held) lets the door's line go at the break the host's own
-        /// line went at: a second line at one door.
+        /// line went at.
         StackOnHostLine,
-        /// The door's untaken-act guard leaves out the host's line awaiting its answer (the
-        /// policy's acts alone, `TurnEndState::act_untaken`): a line typed over a host line the
-        /// agent has not taken.
+        /// The door's untaken-act guard leaves out the host's line awaiting its answer.
         OverUntakenHostLine,
         /// The door's write, held after its reads, makes them again at every settled read of the
-        /// same episode, not once a board look.
+        /// same episode.
         DoorRereads,
-        /// The door books a `fact-held@v1` row at every change of a rule's word to a held one,
-        /// not once an episode a guard: a guard that flaps spends the ledger's newest-rows ring.
+        /// The door books a `fact-held@v1` row at every change of a rule's word to a held one.
         HeldEachChange,
-        /// `Session::drive` tells its host no hold on its return alone: a loop that unwinds
-        /// leaves its last told hold on the window's board, where `ready=` counts it.
+        /// `Session::drive` tells its host no hold on its return alone.
         UntoldOnReturnOnly,
-        /// The door keeps the held verdicts it booked past a change of hold: the next hold's
-        /// guard, holding the same rule's line of the same ordinal, books no row.
+        /// The door keeps the held verdicts it booked past a change of hold.
         HeldAcrossHolds,
     }
 

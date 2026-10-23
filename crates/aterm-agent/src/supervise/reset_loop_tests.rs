@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// A key request with its generation's number masked: the fence is asserted
-/// to be there, and which read it names is the script's.
 fn ungen(request: &str) -> String {
     request
         .split(' ')
@@ -14,24 +12,18 @@ fn ungen(request: &str) -> String {
         .join(" ")
 }
 
-/// The row guard of `row`, as a key request spells it.
 fn guard_of(row: &str) -> String {
     crate::supervise::policy::row_guard(row)
 }
 
-/// A day and hour of the vendor's on the tests' clock and zone.
 fn placed(when: &str) -> i64 {
     let spec = limit::parse_reset(when).expect("a dated clock time");
     limit::reset_at_with(&spec, TEST_NOW, PDT, &test_zones)
 }
 
-/// The whole of the confirmation's body and detail as the composed fixture
-/// draws it, joined as the reader joins it.
 const RESET_HEAD: &str = "Refills your weekly limit now · your weekly reset day stays Oct 9 at 5am \
                           2 weekly resets left · use by Oct 5 at 3pm";
 
-/// A reset spent, as a host reads it: the vendor queued its own
-/// continuation.
 fn spent() -> ResetOutcome {
     ResetOutcome::Spent {
         kind: aterm_phase::ResetKind::Weekly,
@@ -41,11 +33,6 @@ fn spent() -> ResetOutcome {
     }
 }
 
-/// The whole path: with the key on and the host's go, the loop moves the
-/// cursor onto the grant row and enters it, waits out `Checking…`, enters
-/// the confirmation's yes — once, fenced on the person count, the read's
-/// generation and the yes row as drawn — waits out `Resetting…`, and tells
-/// its host once.
 #[test]
 fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
     let host = ResetHost::reading(spent());
@@ -248,9 +235,6 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
     assert_eq!(waiting, 2, "once a mount: {:#?}", unsure_run.journal);
 }
 
-/// The loop's own gates, each shut before the host is asked: `resume_limits`
-/// off (a reset is a way of resuming a limit), and no host at all (the drive
-/// loop's own run takes no reset).
 #[test]
 fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
     let host = ResetHost::reading(spent());
@@ -276,14 +260,6 @@ fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
     assert!(said[0].ends_with("rule=limit-reset@v1 gate=no-host"));
 }
 
-/// A spend is said, whatever it left standing: after the whole path, a host
-/// that read the still-walled line (`ResetOutcome::Walled`, a reset spent
-/// at a wall it did not lift) has the step say `RESET … used (no Fable
-/// resets left), the wall still stands` — a line, not a journal note — book
-/// `ended: used`, and leave the one continuation a kept reset leaves owed,
-/// typed under `usage-resume@v1`; and a spend whose line named no count
-/// (`Spent { left: None }`) is said `used (weekly reset)`, booked the same,
-/// with nothing typed (the vendor queued its own continuation).
 #[test]
 fn a_walled_or_countless_spend_is_said_and_booked_as_used() {
     let walled = ResetOutcome::Walled {
@@ -336,10 +312,6 @@ fn a_walled_or_countless_spend_is_said_and_booked_as_used() {
     }
 }
 
-/// The early-use confirmation — the vendor's line that the limit is not
-/// reached — is escaped, never entered: one `key if-human=<n> if=<the title
-/// row> esc`, the reset kept (`inexact-early`), the ledger's `declined` row
-/// on the confirmation's title, and no reset spent.
 #[test]
 fn the_early_use_confirmation_is_escaped_and_one_continuation_is_owed() {
     use aterm_phase::prompt::fixtures::screen;
@@ -409,8 +381,6 @@ fn the_early_use_confirmation_is_escaped_and_one_continuation_is_owed() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// The focus on no: a confirmation whose cursor is not on its yes is
-/// Escaped — never an arrow to move it, never an Enter on the row it is on.
 #[test]
 fn a_confirmation_with_the_focus_on_no_is_escaped_never_arrowed() {
     use aterm_phase::prompt::fixtures::screen;
@@ -441,12 +411,6 @@ fn a_confirmation_with_the_focus_on_no_is_escaped_never_arrowed() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A kind drawn beside the row while the arrows move: the full reset, the one
-/// reset on offer when the dialog was decided, is reached; as the arrow lands,
-/// the dialog draws another kind's row (2.1.304 draws a row per kind as its
-/// offers come in, and its Select keeps the focus on the row's value, so the
-/// cursor stays on the full reset) — a weekly reset above it, or a Fable reset
-/// under it.
 #[test]
 fn a_kind_drawn_beside_the_row_as_the_arrow_lands_is_never_entered() {
     use aterm_phase::prompt::fixtures::screen;
@@ -538,9 +502,6 @@ fn a_kind_drawn_beside_the_row_as_the_arrow_lands_is_never_entered() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// Under the owner's order (`[harness] limit_reset_kinds`), the row's press
-/// reads the dialog again by that order, as the row was chosen
-/// ([`Session::reset_take`] keeps it).
 #[test]
 fn under_the_owners_order_the_press_reads_the_dialog_again_by_that_order() {
     use aterm_phase::ResetKind::{Full, Weekly};
@@ -647,10 +608,6 @@ fn under_the_owners_order_the_press_reads_the_dialog_again_by_that_order() {
     }
 }
 
-/// The claim is asked about again before the Enter, and anything but the
-/// host's go keeps the reset (`claim`): a claim the host no longer answers
-/// for, and a claim asked for longer ago than an Enter may still be written
-/// on (its ten minutes must outlast the vendor's claim and its line).
 #[test]
 fn a_claim_that_is_no_longer_the_sessions_keeps_the_reset() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -694,8 +651,6 @@ fn a_claim_that_is_no_longer_the_sessions_keeps_the_reset() {
     assert_eq!(reset_world(&mut m).yes_taken, 0);
 }
 
-/// A person, three ways, and in none of them is a key of the reset's
-/// written under their hand:
 #[test]
 fn a_person_holds_every_key_of_the_reset() {
     let host = ResetHost::reading(spent());
@@ -766,10 +721,6 @@ fn a_person_holds_every_key_of_the_reset() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A pending line is waited on, never keyed — but `Checking for a reset…`
-/// past its bound, which gets one guarded Escape on its own row
-/// (`check-timeout`); `Resetting your limits…` past its bound gets no key at
-/// all: the host is asked one last time and the step ends.
 #[test]
 fn a_pending_line_is_never_keyed_but_checking_past_its_bound() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -842,9 +793,6 @@ fn a_pending_line_is_never_keyed_but_checking_past_its_bound() {
     );
 }
 
-/// No Enter follows an Escape. The confirmation's cursor is on its no: the
-/// loop Escapes — and the Escape does not take, while a person's arrow moves
-/// the cursor onto the yes.
 #[test]
 fn no_enter_follows_an_escape_whatever_the_confirmation_then_reads() {
     use aterm_phase::prompt::fixtures::screen;
@@ -879,10 +827,6 @@ fn no_enter_follows_an_escape_whatever_the_confirmation_then_reads() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// The loop's stop, set in every wait of the whole path in turn: no wait
-/// and no key reaches the transport after it, and the run ends as a stop —
-/// what the step had reached stays in the session ledger for the loop that
-/// follows.
 #[test]
 fn a_stop_in_any_wait_of_the_step_ends_it_with_nothing_written_after() {
     let host = ResetHost::reading(spent());
@@ -900,8 +844,6 @@ fn a_stop_in_any_wait_of_the_step_ends_it_with_nothing_written_after() {
     assert!(armed.len() > 6, "{armed:#?}");
 }
 
-/// The session ledger's row of a grant row an earlier loop took, as it
-/// wrote it.
 fn taken_row(ledger: &Path) {
     let row = approvals::Row {
         rule_id: "limit-reset@v1",
@@ -914,9 +856,6 @@ fn taken_row(ledger: &Path) {
     std::fs::write(ledger, format!("{}\n", row.to_json(now, None))).expect("the ledger");
 }
 
-/// A world that opens on the plain confirmation: what a loop finds that did
-/// not see the row taken — or on `confirm` in its place, a box that does
-/// not read exactly.
 fn at_the_confirmation(host: &Arc<ResetHost>, confirm: Option<Vec<String>>) -> Mock {
     let mut m = reset_mock(vec![], &RESET_ROWS, 1, host);
     let world = reset_world(&mut m);
@@ -933,11 +872,6 @@ fn at_the_confirmation(host: &Arc<ResetHost>, confirm: Option<Vec<String>>) -> M
     m
 }
 
-/// A confirmation of another kind than the row taken is kept: the 5-hour row
-/// taken, at a wall drawn by both the session's and the week's names, the box
-/// that mounts is the weekly reset's — exact as it reads, its count and day
-/// the row's — and it is Escaped (`kind`): no reset spent, the host told it
-/// was kept.
 #[test]
 fn a_confirmation_of_another_kind_than_the_row_is_kept() {
     use aterm_phase::prompt::fixtures::screen;
@@ -1018,20 +952,12 @@ fn a_confirmation_of_another_kind_than_the_row_is_kept() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A host whose key is off under a world an earlier loop left its step in:
-/// the claim that loop was given still stands, its row taken (`ph`: 1, or 2
-/// where the confirmation's Enter was written), and nobody will be told how
-/// it ends ([`ResetWorld::untold`]).
 fn key_off_after(m: &mut Mock, host: &ResetHost, ph: i64) {
     host.shared.claim.store(1, Ordering::SeqCst);
     host.shared.ph.store(ph, Ordering::SeqCst);
     reset_world(m).untold = true;
 }
 
-/// What the `declined` row of a successor's Escape names on the world's
-/// confirmation: its title as drawn (`Use a weekly reset?`), or, where none
-/// is drawn, the untitled name — a successor holds no go whose kind would
-/// name one.
 fn declined_as(m: &mut Mock) -> String {
     reset_world(m)
         .confirm
@@ -1043,11 +969,6 @@ fn declined_as(m: &mut Mock) -> String {
         )
 }
 
-/// What a key-off successor's step left, the same at every confirmation it
-/// meets: one key, the Escape, no reset spent; the host neither asked nor
-/// told nor left a record; the earlier loop's row, the `declined` row and
-/// the `waiting` row that ends the step untold; nothing typed, nothing
-/// continued, no badge; and no key the model forbids.
 fn assert_ended_untold(tag: &str, m: &mut Mock, host: &ResetHost, run: &ResetRun) {
     assert_eq!(reset_keys(m), ["esc@confirm"], "{tag}: {:#?}", run.journal);
     assert_eq!(reset_world(m).yes_taken, 0, "{tag}");
@@ -1081,8 +1002,6 @@ fn assert_ended_untold(tag: &str, m: &mut Mock, host: &ResetHost, run: &ResetRun
     assert_eq!(reset_violations(m, host), Vec::<String>::new(), "{tag}");
 }
 
-/// The successor: a loop that starts on a ledger whose last row of the rule
-/// is the row's `approved` one finds the confirmation up.
 #[test]
 fn a_successor_escapes_the_confirmation_and_never_enters_it() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1149,10 +1068,6 @@ fn a_successor_escapes_the_confirmation_and_never_enters_it() {
     assert_ended_untold("key-off", &mut m, &host, &run);
 }
 
-/// A successor's first look meets a box with nothing of the confirmation
-/// left, its head off the pane, and it is the step's all the same: Escaped
-/// once it has stood one person's grace in this loop's sight (`successor`),
-/// never answered, no reset spent.
 #[test]
 fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1197,11 +1112,6 @@ fn a_successor_escapes_a_box_with_nothing_of_the_confirmation_left() {
     assert_ended_untold("successor-key-off", &mut m, &host, &run);
 }
 
-/// The weekly reset's confirmation in Claude Code 2.1.304's screen-reader
-/// layout (`sr` @234846790 draws `oir` @234804179 where `ot()` says a
-/// screen reader is on): the title and body as ever, then lettered answers
-/// and a typed one — `y. Yes, use my weekly reset`, `n. No, keep it`,
-/// `Enter y/n: `.
 fn screen_reader_confirmation() -> Vec<String> {
     let rows = confirm_frame(&[
         "   Use a weekly reset?",
@@ -1220,14 +1130,6 @@ fn screen_reader_confirmation() -> Vec<String> {
     rows
 }
 
-/// A confirmation with no box the reader takes, its title still up, is the
-/// step's until its Enter is written (`reset_shows`: an owed step whose Enter
-/// was not written reads a `Use a <kind>?` row as its confirmation,
-/// `inexact-options`): a successor facing 2.1.304's screen-reader layout
-/// ([`screen_reader_confirmation`]) Escapes it once it has stood one
-/// person's grace, under the guard of the title row (the vendor's Escape
-/// keeps the reset there too), and never types `y` or presses Enter: no
-/// reset spent.
 #[test]
 fn a_successor_escapes_a_titled_confirmation_with_no_box_until_its_enter_is_written() {
     let frame = screen_reader_confirmation();
@@ -1298,10 +1200,6 @@ fn a_successor_escapes_a_titled_confirmation_with_no_box_until_its_enter_is_writ
     assert_eq!(m.attention, None);
 }
 
-/// The yes full power would take: a key-off successor's first look meets the
-/// confirmation reworded whole with its head on the pane, its yes worded as
-/// a limit's consent to go on (`Continue with …`) — the one box of the
-/// row's that the approval rules answer yes to (`allow-once@v1`).
 #[test]
 fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1414,10 +1312,6 @@ fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
     }
 }
 
-/// `Resetting…` met by a key-off successor — the earlier loop wrote the
-/// confirmation's Enter and died — is never keyed, and when the dialog has
-/// left the step ends untold: the `waiting` row, the host neither asked nor
-/// told, and nothing owed — the composer is left as it is.
 #[test]
 fn a_key_off_successor_waits_out_resetting_and_owes_nothing() {
     let entered_row = |ledger: &Path| {
@@ -1505,8 +1399,6 @@ fn a_key_off_successor_waits_out_resetting_and_owes_nothing() {
     assert!(run.typed()[0].contains("usage-resume@v1"));
 }
 
-/// The row's press got no answer: its Enter was written and taken, and the
-/// reply never came.
 #[test]
 fn a_row_press_with_no_answer_is_closed_and_never_entered() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1546,9 +1438,6 @@ fn a_row_press_with_no_answer_is_closed_and_never_entered() {
     );
 }
 
-/// A day and hour of the vendor's is placed in the wall notice's zone where
-/// the loop holds one, else the local zone, in the year nearest now — and
-/// nothing that is not a dated clock time places at all.
 #[test]
 fn a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one() {
     let mut m = Mock::new(vec![idle_screen()]);
@@ -1601,8 +1490,6 @@ fn a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one() {
     assert_eq!(s.reset_place("Oct 5 at 3pm"), Some(local - 7 * 3600));
 }
 
-/// The composed confirmation's frame above its dialog, and `body` under it:
-/// a confirmation as a server's flag payload might redraw it.
 fn confirm_frame(body: &[&str]) -> Vec<String> {
     use aterm_phase::prompt::fixtures::screen;
     let mut rows: Vec<String> = screen(aterm_phase::reset::fixtures::CONFIRM)[..3].to_vec();
@@ -1610,10 +1497,6 @@ fn confirm_frame(body: &[&str]) -> Vec<String> {
     rows
 }
 
-/// The composed confirmation with nothing of it left — its body and both
-/// labels reworded — and its head scrolled off the pane's top: a box of no
-/// known kind whose head no rule can read, which the approval policy hands
-/// to a person at every level.
 fn nothing_left_head_off() -> Vec<String> {
     let rows: Vec<String> = [
         "   This takes effect at once",
@@ -1636,11 +1519,6 @@ fn nothing_left_head_off() -> Vec<String> {
     rows
 }
 
-/// The composed confirmation with nothing of it left and its head on the
-/// pane, its yes reworded to a limit's consent to go on: a box of no known
-/// kind, unnumbered, that full power answers yes to (`allow-once@v1`, the
-/// consent arm of the rules for a dialog of no kind) — and so the one
-/// rewording of the confirmation whose yes the approval policy would take.
 fn nothing_left_consent() -> Vec<String> {
     use crate::supervise::policy::approval::{ApprovalCtx, Choice, decide};
     let rows = confirm_frame(&[
@@ -1683,11 +1561,6 @@ fn nothing_left_consent() -> Vec<String> {
     rows
 }
 
-/// The Enter is judged on the wall as the host reads it at the Enter, not as
-/// it stood when the row was taken: a wall that stood more than a day at the
-/// row and no longer does when the claim is asked about again is held to
-/// the deadline's rule — and a deadline eighteen days off keeps the reset
-/// (`not-qualifying`).
 #[test]
 fn the_enter_is_judged_on_the_wall_as_the_host_reads_it_then() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1716,12 +1589,6 @@ fn the_enter_is_judged_on_the_wall_as_the_host_reads_it_then() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A person who keys after the dialog was judged — after its read and its
-/// `status`, while the host is asked for the claim — gets no key of the
-/// row's under their hand: every key of the grant row carries the judged
-/// read's person count, the server skips the arrow (`OK skipped
-/// reason=person`), and the row is taken only once their grace has passed,
-/// on the claim the session still holds.
 #[test]
 fn a_person_keying_before_the_rows_first_key_holds_the_row() {
     let host = ResetHost::reading(spent());
@@ -1758,18 +1625,12 @@ fn a_person_keying_before_the_rows_first_key_holds_the_row() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// A reconnect window for a run whose server drops an exchange.
 fn riding_out(s: &mut Watched<'_, '_>) {
     s.set_reconnect(Duration::from_secs(30));
     s.setup.pause = Duration::from_millis(5);
     s.setup.pause_max = Duration::from_millis(20);
 }
 
-/// An Enter whose answer never came is on the books: cut mid-exchange, the
-/// key may have been written — here it was, and the yes taken — so the
-/// ledger's `approved` row on the vendor's yes and the journal's `confirmed`
-/// line are written before the outage is ridden out, and the host is told
-/// the Enter was written.
 #[test]
 fn an_enter_whose_answer_never_came_is_on_the_books() {
     let host = ResetHost::reading(spent());
@@ -1814,9 +1675,6 @@ fn an_enter_whose_answer_never_came_is_on_the_books() {
     );
 }
 
-/// A row older than a step can be is ended untold, at either key: a loop that
-/// starts finds a grant row's `approved` row from long ago with no end (no
-/// loop ran since).
 #[test]
 fn a_row_older_than_a_step_can_be_is_escaped_and_ended_untold() {
     let old_row = |ledger: &Path| {
@@ -1872,10 +1730,6 @@ fn a_row_older_than_a_step_can_be_is_escaped_and_ended_untold() {
     }
 }
 
-/// `Checking…` met by a key-off successor and standing past its bound gets
-/// the step's one guarded Escape on its own row (`check-timeout`), as with
-/// the key on, and the step ends untold: the host neither asked nor told,
-/// nothing typed, no badge.
 #[test]
 fn a_key_off_successor_escapes_checking_past_its_bound_and_ends_untold() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1912,10 +1766,6 @@ fn a_key_off_successor_escapes_checking_past_its_bound_and_ends_untold() {
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// An Escape that does not take, with the key off: tried again on the same
-/// ladder, the one record at the second failure — the only word an owner
-/// has of a session held behind a dialog, a record and never a badge — and
-/// the step still ends untold once it closes.
 #[test]
 fn a_key_off_successors_escape_that_does_not_take_is_tried_again_and_recorded_once() {
     let host = ResetHost::reading(ResetOutcome::Kept);
@@ -1956,8 +1806,6 @@ fn a_key_off_successors_escape_that_does_not_take_is_tried_again_and_recorded_on
     assert_eq!(reset_violations(&m, &host), Vec::<String>::new());
 }
 
-/// An attended loop (`supervise`) takes no step up, at either key: it never
-/// makes the step's look, so a step it owed could not end.
 #[test]
 fn an_attended_loop_takes_no_step_up() {
     for on in [false, true] {
@@ -1999,8 +1847,6 @@ fn an_attended_loop_takes_no_step_up() {
     }
 }
 
-/// The box the row opened is the step's, whatever it is reworded to. Every
-/// text of the reset is the vendor's server's to change.
 #[test]
 fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
     let no_title = confirm_frame(&[
@@ -2075,13 +1921,6 @@ fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
     }
 }
 
-/// The step never escapes an MCP server dialog: Claude Code saves its Esc
-/// as a refusal for good (2.1.301, measured; the several-server dialog's is
-/// `Esc to reject all`), so the box is never read as a reworded
-/// confirmation, on the step's first read or after `Checking…`: not as
-/// drawn, not retitled (no MCP kind), and not with the several-server
-/// dialog's head cut — its rule alone (the title still drawn) or its rule,
-/// title and subtitle — where the box reads with its head off the screen.
 #[test]
 fn the_step_never_escapes_an_mcp_server_dialog() {
     use aterm_phase::prompt::fixtures::{
@@ -2198,12 +2037,6 @@ fn the_step_never_escapes_an_mcp_server_dialog() {
     }
 }
 
-/// The step never escapes an answer kept for good by its label under a rest
-/// that opens with no capital: the safety check's box, synthetic
-/// ([`crate::supervise::policy::approval::tests::always_under_a_lowercase_rest`]),
-/// of no kind the reader knows, unnumbered, `❯ Continue with tools, always
-/// on` over `Keep waiting for` over `now`, met where the confirmation
-/// should be, on the step's first read and after `Checking…`.
 #[test]
 fn the_step_never_escapes_an_answer_kept_for_good_by_its_label() {
     use crate::supervise::policy::approval::tests::always_under_a_lowercase_rest as frame;

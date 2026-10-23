@@ -12,8 +12,6 @@ use crate::supervise::tape::recover::recover;
 use crate::supervise::tape::replay::{Options, replay_traced};
 use crate::supervise::tape::testing::written;
 
-/// The scripted worker: a read box approved, a question and an idle point
-/// handed over, then the session gone.
 fn script() -> Mock {
     let mut m = fenced(vec![
         busy_screen(),
@@ -27,8 +25,6 @@ fn script() -> Mock {
     m
 }
 
-/// A run of [`script`] recorded as the engine tests record one: its
-/// header's text and its tape's items.
 fn recorded() -> (String, Vec<Item>) {
     let mut m = script();
     let run = record_watch(&mut m, &auto(30), |_| {});
@@ -37,34 +33,22 @@ fn recorded() -> (String, Vec<Item>) {
     (header, read.items)
 }
 
-/// The zone reader for a point named by no local time: never asked — such a
-/// point is found on the tape alone, with no look at the machine.
 fn no_zone(unix: i64) -> Option<i64> {
     panic!("the local zone read for a point named by no local time (at {unix})")
 }
 
-/// UTC as the local zone.
 fn utc(_: i64) -> Option<i64> {
     Some(0)
 }
 
-/// `--why` at `at` on the tape of `items` under `header`.
 fn explained(header: &str, items: &[Item], at: &At) -> Why {
     why(&written(header, items), at, &no_zone).unwrap_or_else(|e| panic!("why at {at:?}: {e}"))
 }
 
-/// Whether `item` is a round trip at `door`.
 fn crosses(item: &Item, door: &str) -> bool {
     matches!(item.record(), Some(EffectRecord::Exchange { door: d, .. }) if d == door)
 }
 
-/// WHY DID IT PRESS 1? — the recorded approval explained from the tape
-/// alone: the judged screen and the box this build reads on it, the facts it
-/// was decided on with the door each came through, the act, its reply, the
-/// journal line; and the decision made again by this build's policy on
-/// those facts agrees with the recorded one, its trace naming the rule that
-/// decided — the very rule the recorded mark names — with nothing needed
-/// that the tape did not hold.
 #[test]
 fn why_explains_a_recorded_approval() {
     let (header, items) = recorded();
@@ -123,10 +107,6 @@ fn why_explains_a_recorded_approval() {
     }
 }
 
-/// THE SAME DECISION BY EVERY NAME: an effect's ordinal after the mark (the
-/// decision in force there), the journal line it was followed by, and its
-/// screen's sequence each find the one approval; a point with no decision
-/// is refused.
 #[test]
 fn why_finds_a_decision_by_door_and_by_line() {
     let (header, items) = recorded();
@@ -139,10 +119,6 @@ fn why_finds_a_decision_by_door_and_by_line() {
     assert!(why(&written(&header, &items), &At::Door(0), &no_zone).is_err());
 }
 
-/// A MARK FROM A BUILD THAT DID NOT WRITE A FACT: the facts read back without
-/// it, the decision made again at its default — and the explanation NAMES
-/// it among what the re-decision needed (`fact screen_cols`), never
-/// presenting the default as what the recorded run knew.
 #[test]
 fn a_fact_the_recording_build_did_not_write_is_named_in_needs() {
     let (header, mut items) = recorded();
@@ -169,10 +145,6 @@ fn a_fact_the_recording_build_did_not_write_is_named_in_needs() {
     assert!(w.trace.is_some(), "decided again all the same");
 }
 
-/// A LOOK THE TAPE DOES NOT HOLD: the approval's git read (`probe.git_view`)
-/// taken off the tape, the re-decision asks the tape for it, finds nothing
-/// before the mark, decides the cautious way an unreadable look goes — and
-/// says the look among what it needed, so it does not agree in silence.
 #[test]
 fn a_look_the_tape_does_not_hold_is_named_and_decided_cautiously() {
     let (header, items) = recorded();
@@ -186,10 +158,6 @@ fn a_look_the_tape_does_not_hold_is_named_and_decided_cautiously() {
     decided_cautiously_without_the_look(&w);
 }
 
-/// The re-decision of [`a_look_the_tape_does_not_hold_is_named_and_decided_cautiously`]
-/// and [`a_look_recorded_after_the_point_is_not_an_answer`]: the git read
-/// named among what it needed, the cautious answer shown, and no agreement
-/// either way.
 fn decided_cautiously_without_the_look(w: &Why) {
     assert!(
         w.needs.iter().any(|n| n.starts_with("look probe.git_view")),
@@ -206,13 +174,6 @@ fn decided_cautiously_without_the_look(w: &Why) {
     assert_eq!(w.agrees, None, "{:?}", w.decided);
 }
 
-/// NEVER AN ANSWER FROM AFTER THE POINT: the approval's git read moved from
-/// before its mark to right after it — the same door, the same request, the
-/// same answer, on the same tape — is no answer to the decision made before
-/// it: the keyed probe stands where the recorded loop had read the records
-/// before the mark (astream's keyed view, bounded by that count), so the
-/// re-decision names the look it needed and decides cautiously, exactly as
-/// with the look gone.
 #[test]
 fn a_look_recorded_after_the_point_is_not_an_answer() {
     let (header, mut items) = recorded();
@@ -234,11 +195,6 @@ fn a_look_recorded_after_the_point_is_not_an_answer() {
     decided_cautiously_without_the_look(&w);
 }
 
-/// A TURN END'S TRACE COMES FROM A STRICT REPLAY TO THE POINT, on the build
-/// that recorded it: the question handed over at its turn end is explained
-/// with the fold and reading the recorder noted, and a trace computed by
-/// replaying the tape to the mark, ending on the step that decided, each
-/// pass of the point named.
 #[test]
 fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
     let (header, items) = recorded();
@@ -299,12 +255,6 @@ fn a_turn_ends_trace_is_computed_in_a_replay_on_the_recording_build() {
     );
 }
 
-/// A HEADER THIS BUILD CANNOT READ — another build's format, which a tape
-/// read after an update may carry — still leaves the decision explained as
-/// far as the tape alone goes: its screen, its act, its journal line and
-/// the build that recorded it, as the header writes it; there is no
-/// re-decision (no policy reads), and the explanation says why rather than
-/// refusing the tape.
 #[test]
 fn a_header_this_build_cannot_read_still_explains_what_the_tape_holds() {
     let (header, items) = recorded();
@@ -329,7 +279,6 @@ fn a_header_this_build_cannot_read_still_explains_what_the_tape_holds() {
     );
 }
 
-/// The decision marks at `door` on the tape of `items`: each one's seq.
 fn marked(items: &[Item], door: &str) -> Vec<u64> {
     items
         .iter()
@@ -343,12 +292,6 @@ fn marked(items: &[Item], door: &str) -> Vec<u64> {
         .collect()
 }
 
-/// A POLICY KEY THE HEADER DOES NOT SAY — a tape from a build before the key
-/// (`approve` taken out of its `[policy]`) — is decided again at this
-/// build's value, and the explanation NAMES it among what the re-decision
-/// needed (`supplied by this build: [policy] approve`), its note saying the
-/// policy is the header's WITH what this build supplied, never the header's
-/// alone.
 #[test]
 fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
     let (header, items) = recorded();
@@ -377,12 +320,6 @@ fn a_policy_key_the_header_lacks_is_named_as_supplied_by_this_build() {
     );
 }
 
-/// A TURN END'S DECISION CUT SHORT LEAVES NO STEPS FOR THE NEXT ONE: the
-/// connection lost inside the turn end at seq=104 (its bare `meta`, the
-/// autopilot's read), the loop rides the loss out and that point is never
-/// marked; the next turn end's trace, computed in a strict replay to its
-/// mark, is that decision's alone — one cruise pass, opening the trace —
-/// never the cut decision's steps ahead of its own.
 #[test]
 fn a_turn_end_cut_short_leaves_no_steps_in_the_next_ones_trace() {
     let mut m = script();
@@ -408,11 +345,6 @@ fn a_turn_end_cut_short_leaves_no_steps_in_the_next_ones_trace() {
     assert_eq!(steps.first().map(|s| s.check), Some("pass:cruise"));
 }
 
-/// The NOTE ON A MARK WITH NO FACTS blames no cause the recorded outcome does
-/// not name: a box handed over before the facts were read — here by the
-/// question latch, which is neither another supervisor nor `approve =
-/// "none"` — is said to be handed over for the reason recorded, with no
-/// re-decision.
 #[test]
 fn a_mark_with_no_facts_blames_no_cause_its_outcome_does_not_name() {
     let (header, mut items) = recorded();
@@ -442,8 +374,6 @@ fn a_mark_with_no_facts_blames_no_cause_its_outcome_does_not_name() {
     assert!(note.contains("the reason recorded"), "{note}");
 }
 
-/// `items` with every wall reading (a clock read, a stamp) at or before item
-/// `split` at `before` and every one after it at `after` (Unix ms).
 fn walls(items: &mut [Item], split: usize, before: i64, after: i64) {
     for (i, item) in items.iter_mut().enumerate() {
         let ms = if i <= split { before } else { after };
@@ -458,7 +388,6 @@ fn walls(items: &mut [Item], split: usize, before: i64, after: i64) {
     }
 }
 
-/// The item index of the approval's mark.
 fn approval_mark(items: &[Item]) -> usize {
     items
         .iter()
@@ -469,12 +398,9 @@ fn approval_mark(items: &[Item]) -> usize {
         .expect("the approval's mark")
 }
 
-/// 2026-10-19T23:55:00Z and 2026-10-20T00:05:00Z, Unix ms.
 const LATE: i64 = 1_792_454_100_000;
 const EARLY: i64 = LATE + 600_000;
 
-/// `--at HH:MM` ACROSS MIDNIGHT: a tape whose approval was decided at 23:55
-/// and whose later decisions were made at 00:05 the next day.
 #[test]
 fn a_local_time_names_an_instant_on_a_tape_that_runs_past_midnight() {
     let (header, mut items) = recorded();
@@ -511,9 +437,6 @@ fn a_local_time_names_an_instant_on_a_tape_that_runs_past_midnight() {
     assert!(at("2026-10-19T12:00").is_err(), "before every decision");
 }
 
-/// EACH DECISION'S LOCAL TIME IS READ BY THE OFFSET ITS OWN INSTANT HAD: a
-/// zone that left daylight saving between the approval (04:00Z, 00:00 at
-/// UTC−4) and the later decisions (06:30Z, 01:30 at UTC−5).
 #[test]
 fn a_decisions_local_time_is_read_by_its_own_instants_offset() {
     const BEFORE: i64 = 1_793_505_600_000;
@@ -543,10 +466,6 @@ fn a_decisions_local_time_is_read_by_its_own_instants_offset() {
     );
 }
 
-/// The rm breaker cut `off` rows under its top rule on a fenced host's main
-/// screen, its head (and an older box above its transcript) in the history,
-/// the screen sitting until a key; full power (`box_head_tests.rs`'s
-/// `breaker_host`), and `spoil` applied.
 fn breaker_recorded(off: usize, spoil: impl FnOnce(&mut Mock)) -> (String, Vec<Item>) {
     use aterm_phase::prompt::fixtures as boxes;
     let rows = boxes::screen(boxes::BOX_RM_BREAKER_2_1_287);
@@ -570,10 +489,6 @@ fn breaker_recorded(off: usize, spoil: impl FnOnce(&mut Mock)) -> (String, Vec<I
     (header.clone(), recover(&run.tape.reframed(&header)).items)
 }
 
-/// A BOX WHOSE HEAD THE LOOP READ FROM THE HISTORY IS DECIDED AGAIN WHOLE:
-/// the rm breaker cut eight rows under its rule, joined by the loop with its
-/// head (`search`, a `line` read a row, the screen read again unmoved) and
-/// pressed `1` at full power.
 #[test]
 fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
     let (header, items) = breaker_recorded(8, |_| {});
@@ -687,11 +602,6 @@ fn a_box_head_read_from_the_history_is_rebuilt_from_the_tape() {
     }
 }
 
-/// THE RUN'S PYTHON GLOBS REACH THE DECISION MADE AGAIN: a run that reads
-/// `python3 tools/report.py` as a read by its own `--allow-python` glob
-/// approves the box by the read-only rule, and the explanation — deciding
-/// it again under the globs the header carries, as the loop decides with
-/// them (`SuperviseOpts::allow`: the run's, else the defaults) — agrees.
 #[test]
 fn the_runs_python_globs_reach_the_decision_made_again() {
     let mut m = fenced(vec![

@@ -3,6 +3,10 @@
 
 //! Offline trainer for the tone-of-typing classifier (`aterm_effects::tone`). Run by
 //! hand when the corpus or architecture changes:
+//!
+//! ```sh
+//! targo --unverified run -p aterm-effects --example tone_train --release
+//! ```
 
 use aterm_effects::tone::{self, BUCKETS, EMBED, HIDDEN, TONE_COUNT, Tone, ToneModel, ToneScratch};
 

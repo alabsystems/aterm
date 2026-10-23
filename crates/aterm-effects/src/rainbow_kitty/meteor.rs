@@ -1330,6 +1330,9 @@ impl Meteors {
     /// Hand the decided births to the sky.
     #[inline]
     pub fn sow_into(&mut self, dust: &mut Stardust, ctx: &Ctx<'_>) {
+        if self.landings.is_empty() && self.sown.is_empty() {
+            return;
+        }
         for l in &mut self.landings {
             if l.sky.is_none() {
                 l.sky = Some(SkyMask::probe(l.x, l.y, dust.probe(), ctx.geom));
@@ -1698,6 +1701,13 @@ fn dark_petal_rgb(stop: u32) -> u32 {
     }
 }
 
+#[inline]
+fn dark_petal_stop_rgb(i: usize) -> u32 {
+    static LUT: OnceLock<[u32; COMA_PETALS]> = OnceLock::new();
+    LUT.get_or_init(|| std::array::from_fn(|i| dark_petal_rgb(spectrum_stop(i))))
+        [i.min(COMA_PETALS - 1)]
+}
+
 struct Flight {
     l: f32,
     unit: (f32, f32),
@@ -1949,60 +1959,73 @@ fn build_stations(
         .map(|k| span * (k as f32) / ((n - 1) as f32))
         .filter(|&s| s >= ease_head && s <= span - ease_tail);
     let tail_zone = (1..=END_EASE_STATIONS).map(|i| span - ease_tail * (fine - i as f32) / fine);
+    let light_cap = if rail > 0.0 {
+        LIGHT_RAIL_ALPHA_CAP
+    } else {
+        LIGHT_ALPHA_CAP
+    };
+    let light_peak = (f.colour_cov * LIGHT_INK_GAIN).min(light_cap);
+    let rows_off = (m.y1 - m.y0).abs();
     for s in head_zone.chain(body).chain(tail_zone) {
+        let end_ease = ends(s);
+        if end_ease <= 0.0 {
+            continue;
+        }
         let px = f.head.0 - f.unit.0 * s;
         let py = f.head.1 - f.unit.1 * s + rail;
 
         let (color, cov, half) = match layer {
             Layer::Colour => {
-                let stop = spectrum(walk_pace(m.arc((f.to_go + s) / cw)));
-                let mut half = f.width_at(s) * 0.5;
                 if light {
-                    half *= LIGHT_RAIL_SQUASH;
-                    let cap = if rail > 0.0 {
-                        LIGHT_RAIL_ALPHA_CAP
-                    } else {
-                        LIGHT_ALPHA_CAP
-                    };
-                    let peak = (f.colour_cov * LIGHT_INK_GAIN).min(cap);
                     let ink = if s <= f.shoulder {
-                        peak
+                        light_peak
                     } else {
-                        peak * (-(s - f.shoulder) / (COLOUR_FALLOFF_SHARE * f.l)).exp()
+                        light_peak * (-(s - f.shoulder) / (COLOUR_FALLOFF_SHARE * f.l)).exp()
                     };
+                    let cov = ink * alpha * end_ease;
+                    if cov < 1.0 {
+                        continue;
+                    }
+                    let stop = spectrum(walk_pace(m.arc((f.to_go + s) / cw)));
+                    let half = f.width_at(s) * 0.5 * LIGHT_RAIL_SQUASH;
                     let rgb = if rail > 0.0 {
                         paper_caret_ink(stop, ctx.cfg.theme_bg)
                     } else {
                         paper_ink(stop, ctx.cfg.theme_fg, ctx.cfg.theme_bg, InkRole::OverText)
                     };
-                    (rgb, ink * alpha, half)
+                    (rgb, cov, half)
                 } else {
                     let c = f.colour_cov * (-s / (COLOUR_FALLOFF_SHARE * f.l)).exp();
-                    (stop, c * alpha, half)
+                    let cov = c * alpha * end_ease;
+                    if cov < 1.0 {
+                        continue;
+                    }
+                    let stop = spectrum(walk_pace(m.arc((f.to_go + s) / cw)));
+                    (stop, cov, f.width_at(s) * 0.5)
                 }
             }
             Layer::White => {
                 let tail = (s - f.white_shoulder).max(0.0);
                 let printed = if square {
-                    if (m.y1 - m.y0).abs() >= 0.5 * ch && (py - m.y0).abs() < 0.5 * ch {
+                    if rows_off >= 0.5 * ch && (py - m.y0).abs() < 0.5 * ch {
                         WHITE_PRINTED_SHARE
                     } else {
                         1.0
                     }
                 } else {
-                    white_printed_share(py - m.y0, (m.y1 - m.y0).abs(), ch)
+                    white_printed_share(py - m.y0, rows_off, ch)
                 };
                 let c = f.head_cov * (-tail / f.white_fall).exp() * printed;
+                let cov = c * alpha * end_ease;
+                if cov < 1.0 {
+                    continue;
+                }
                 let blend = smoothstep01((s - f.white_shoulder) / f.white_shoulder.max(1.0));
                 let share =
                     SHOULDER_WIDTH_SHARE + (WHITE_WIDTH_SHARE - SHOULDER_WIDTH_SHARE) * blend;
-                (0x00FF_FFFF, c * alpha, f.width_at(s) * 0.5 * share)
+                (0x00FF_FFFF, cov, f.width_at(s) * 0.5 * share)
             }
         };
-        let cov = cov * ends(s);
-        if cov < 1.0 {
-            continue;
-        }
         let half = half.max(0.5);
         let (major, spine) = match f.axis {
             Axis::Horizontal => (px, py),
@@ -2094,6 +2117,7 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         return;
     }
     if coma_on {
+        let coma_alpha = coma_cov as u8;
         for i in 0..COMA_PETALS {
             let (px, py) = petal_at(i);
             push_halo_add(
@@ -2103,7 +2127,7 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 py,
                 petal_x,
                 petal_y,
-                premul_rgb(dark_petal_rgb(spectrum_stop(i)), coma_cov as u8),
+                premul_rgb(dark_petal_stop_rgb(i), coma_alpha),
             );
         }
     }

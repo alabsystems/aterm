@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A composer redrawn under a scrolling transcript keeps its light.
+//! Integration tests for composer stability under a scrolling transcript.
 
 use std::time::Duration;
 
@@ -14,23 +14,15 @@ use crate::trail_host::{Core, Opts, Theme};
 
 const ROWS: usize = 30;
 const COLS: usize = 120;
-/// The lab's window (Claude Code 2.1.305 at 144×50, 2026-10-20): the owner's
-/// sentence word-wraps after `pasted`, its Space on the composer's last
-/// column.
 const LAB_COLS: usize = 144;
-/// The composer's text row: the box sits on the four rows above the bottom.
 const TEXT_ROW: u16 = (ROWS - 4) as u16;
-/// The grid column of the first text glyph: `❯` + NBSP before it.
 const COL0: u16 = 2;
-/// The owner's link.
 const URL: &str = "https://claude.ai/artifact/XB78QX8U9sp935PNjq8FpB";
-/// The recorded cadence: about 115 ms between keys.
 const KEY_MS: u64 = 115;
 const FRAME_MS: u64 = 16;
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 
-/// Claude Code under a transcript, on the trail host.
 struct Claude {
     h: Core,
     /// The screen's columns.
@@ -56,15 +48,12 @@ struct Claude {
 }
 
 impl Claude {
-    /// Claude Code under a full transcript: the box on the screen's bottom rows.
     fn new() -> Self {
         let c = Self::with_transcript(ROWS + 10, COLS);
         assert_eq!(c.row, TEXT_ROW, "fixture: the box is on the bottom rows");
         c
     }
 
-    /// A fresh session's screen, `cols` wide: `lines` transcript rows above
-    /// the box, which tool steps push down until it reaches the bottom.
     fn with_transcript(lines: usize, cols: usize) -> Self {
         let h = Core::new(
             ROWS,
@@ -103,8 +92,6 @@ impl Claude {
         c
     }
 
-    /// The composer's text as drawn: its first line, and its second when it
-    /// wraps or holds a line break.
     fn lines(&self) -> (String, Option<String>) {
         if let Some((first, second)) = self.text.split_once('\n') {
             return (first.to_string(), Some(second.to_string()));
@@ -129,21 +116,15 @@ impl Claude {
         }
     }
 
-    /// The caret's column, after the text on the caret's line (the second
-    /// when the text wraps, indented as the first).
     fn caret_col(&self) -> u16 {
         let (first, second) = self.lines();
         COL0 + second.unwrap_or(first).chars().count() as u16
     }
 
-    /// The region's rows: one more when the composer holds two lines.
     fn region_rows(&self) -> usize {
         if self.lines().1.is_some() { 9 } else { 8 }
     }
 
-    /// The bottom-anchored region from the spinner row down, each row erased to
-    /// its end and ended by `CR LF` but the last: spinner, tip, blank, rule, the
-    /// composer with Claude Code's own drawn caret, rule, footer, blank.
     fn region(&self) -> String {
         let rule = "\u{2500}".repeat(self.cols);
         let rows = [
@@ -175,12 +156,6 @@ impl Claude {
             .join("\r\n")
     }
 
-    /// The GUI's frame (`app_render.rs`): the content-scroll seam first (a
-    /// scroll fences the row probe), the caret row's probe and every row the
-    /// witness names (the witness's rows on a scroll's frame too), the echo
-    /// anchor and the drawn-caret bit, then the tick with the motion caret (a
-    /// hidden caret on a finished frame whose row draws ink is the caret,
-    /// `aterm_effects::host::motion_caret`).
     fn frame(&mut self) {
         if self.h.term.sync_open_dirty() {
             return;
@@ -188,8 +163,6 @@ impl Claude {
         self.present();
     }
 
-    /// [`Self::frame`] whatever the synchronized update's state: the GUI's
-    /// hold capped, a frame the program has not finished presented as it is.
     fn present(&mut self) {
         let h = &mut self.h;
         let scroll = h.term.content_scroll_state();
@@ -247,9 +220,6 @@ impl Claude {
         }
     }
 
-    /// One echo in Claude Code's per-key shape: from the caret down to the
-    /// bottom row, back up to the composer, the new text and the drawn caret,
-    /// down again, and the caret put after the text.
     fn echo(&mut self, s: &str) {
         let c = self.caret_col();
         let grows = self.region_rows();
@@ -281,8 +251,6 @@ impl Claude {
         self.h.term.process(bytes.as_bytes());
     }
 
-    /// A key's press, `KEY_MS` after the last event: the window's stamp
-    /// (`note_typed_expected`, the glyph riding it), 2 ms before anything else.
     fn press(&mut self, ch: char) {
         self.idle(KEY_MS - 2);
         let class = if ch == ' ' {
@@ -295,7 +263,6 @@ impl Claude {
         self.h.now += Duration::from_millis(2);
     }
 
-    /// A key: the press, and its echo 2 ms later.
     fn key(&mut self, ch: char) {
         self.press(ch);
         self.echo(&ch.to_string());
@@ -308,22 +275,17 @@ impl Claude {
         }
     }
 
-    /// `App::input_paste`: the gesture stamped and revoked at dispatch, the
-    /// delivered-insert licence armed from the writer's receipt (priced by
-    /// `Terminal::paste_insert_cells`), then the echo.
     fn paste(&mut self, s: &str) {
         self.deliver(s);
         self.echo(s);
         self.frame();
     }
 
-    /// [`Self::paste`] up to its echo: the licence armed, 2 ms gone.
     fn deliver(&mut self, s: &str) {
         let cells = u16::try_from(s.chars().count()).expect("a short paste");
         self.deliver_as(InsertWidth::Cells(cells));
     }
 
-    /// [`Self::deliver`] of a paste the host priced `width`.
     fn deliver_as(&mut self, width: InsertWidth) {
         self.idle(KEY_MS - 2);
         let at = self.h.now;
@@ -335,20 +297,10 @@ impl Claude {
         self.h.now += Duration::from_millis(1);
     }
 
-    /// A tool result lands: one frame rewrites the region from the spinner row
-    /// down with the result's three transcript rows first, and the rows past the
-    /// bottom scroll the screen three rows, the composer back on its screen row
-    /// (on a screen not full yet, the box pushed down instead).
     fn tool_result(&mut self) {
         self.tool_rows(3);
     }
 
-    /// The frame of a tool step that adds `rows` transcript rows above the
-    /// spinner (the call's line, its `Running…` row and a blank are three; its
-    /// result in place of the `Running…` row is one), scrolling the screen
-    /// that many rows, or on a screen not full yet pushing the box down as far
-    /// as the bottom and scrolling the rest; its frame drawn, and the band
-    /// cells it left off the composer recorded.
     fn tool_rows(&mut self, rows: usize) {
         self.land_tool_rows(rows);
         self.frame();
@@ -356,14 +308,11 @@ impl Claude {
         self.on_scroll_frames.extend(off);
     }
 
-    /// [`Self::tool_rows`]' bytes, processed with no frame drawn.
     fn land_tool_rows(&mut self, rows: usize) {
         self.land_tool_rows_unfinished(rows);
         self.h.term.process(SYNC_END.as_bytes());
     }
 
-    /// [`Self::land_tool_rows`] up to the synchronized update's end: every row
-    /// drawn and the caret put back on the composer, the update still open.
     fn land_tool_rows_unfinished(&mut self, rows: usize) {
         self.steps += 1;
         let c = self.caret_col();
@@ -398,8 +347,6 @@ impl Claude {
         self.row = row;
     }
 
-    /// The admission verdicts judged since the tally `judged` was read:
-    /// `reason origin->target licence`, oldest first.
     fn verdicts_since(&self, judged: AdmissionTally) -> String {
         let now = self.h.glow.admission_tally();
         let since = (now.licensed + now.declined) - (judged.licensed + judged.declined);
@@ -411,9 +358,6 @@ impl Claude {
             .join("; ")
     }
 
-    /// The composer's columns that hold text, and of those the ones with no
-    /// resident ribbon cell on the composer row (on the first line too, a row
-    /// up, when the text wraps).
     fn dark_text(&self) -> Vec<u16> {
         let live = self.h.live(self.row);
         let mut dark: Vec<u16> = (COL0..self.caret_col())
@@ -426,9 +370,6 @@ impl Claude {
         dark
     }
 
-    /// Ribbon cells on the rows above the composer, where no key was typed,
-    /// leaving ones included (a band melting where a scroll left it):
-    /// `(row, col)`.
     fn stray(&self) -> Vec<(u16, u16)> {
         let top = self.row - u16::from(self.lines().1.is_some());
         (0..top)
@@ -437,9 +378,6 @@ impl Claude {
     }
 }
 
-/// What a take left: the composer's text columns with no band, the band
-/// cells off the composer (read after each scroll and at the end), and the
-/// cells retired (`ribbon_retired=`).
 fn take(tool_results: bool) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::new();
     c.type_str("check ");
@@ -475,8 +413,6 @@ fn take(tool_results: bool) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     (dark, stray, c.h.counts().1, note)
 }
 
-/// The negative control: with no tool result the take is lit from the first
-/// glyph to the caret and nothing strays.
 #[test]
 fn the_owners_take_with_no_tool_result_is_lit() {
     let (dark, stray, retired, note) = take(false);
@@ -488,10 +424,6 @@ fn the_owners_take_with_no_tool_result_is_lit() {
     assert_eq!(retired, 0, "nothing melts ({note})");
 }
 
-/// The owner's take under a streaming transcript: the pasted link's band and
-/// the typed band after it stay on the composer through each tool result's
-/// three-row scroll, on the scroll's own frame and after, nothing is left on
-/// the rows the scroll carried them to, and nothing melts.
 #[test]
 fn a_paste_and_the_keys_after_it_keep_their_band_through_a_tool_result_scroll() {
     let (dark, stray, retired, note) = take(true);
@@ -503,12 +435,8 @@ fn a_paste_and_the_keys_after_it_keep_their_band_through_a_tool_result_scroll() 
     assert_eq!(retired, 0, "nothing melts ({note})");
 }
 
-/// One sample of the band at rest: the composer row's live columns, and every
-/// live cell off it.
 type RestSample = (Vec<u16>, Vec<(u16, u16)>);
 
-/// The band's life over a rest after the paste, sampled every 100 ms for four
-/// seconds.
 fn rest_after_paste(tool_result: bool) -> Vec<RestSample> {
     let mut c = Claude::new();
     c.type_str("check ");
@@ -527,10 +455,6 @@ fn rest_after_paste(tool_result: bool) -> Vec<RestSample> {
         .collect()
 }
 
-/// The hand returns with its line: the scroll carried the caret's mirror up
-/// with the band, and the box redrawn in place carries both back, so the band
-/// is not taken for text that left the caret's row (which would flow at once)
-/// and rests, holds and leaves exactly as it does with no scroll under it.
 #[test]
 fn a_band_at_rest_lives_the_same_life_through_a_tool_result_scroll() {
     let calm = rest_after_paste(false);
@@ -559,9 +483,6 @@ enum Step {
     EchoLater,
 }
 
-/// The owner's take with a tool step landing between one key's press and its
-/// echo: what it left (as [`take`]) and the admission verdicts from the press
-/// on.
 fn step_under_a_key(step: Step) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::new();
     c.type_str("check ");
@@ -599,11 +520,6 @@ fn step_under_a_key(step: Step) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     (c.dark_text(), stray, c.h.counts().1, verdicts)
 }
 
-/// A key pressed as a tool step lands keeps its press for its echo: the box
-/// redrawn in place under the step's scrolls leaves the caret on its screen
-/// row, which the hand's seam reads in its line's own frame (no move), so the
-/// press is not spent on the rows the scroll carried the caret's mirror, and
-/// the echo is lit like every other key's.
 #[test]
 fn a_key_pressed_as_a_tool_step_lands_keeps_its_press_for_its_echo() {
     for step in [Step::TwoFrames, Step::OneFrame, Step::EchoLater] {
@@ -625,10 +541,6 @@ fn a_key_pressed_as_a_tool_step_lands_keeps_its_press_for_its_echo() {
     }
 }
 
-/// The owner's link pasted after `typed` with its echo drawn in a tool result's
-/// frame (the result's three rows scroll the screen in the same synchronized
-/// update the box is redrawn in, the link in it), then the typed run after it:
-/// what it left (as [`take`]) and the paste's verdict.
 fn paste_in_a_step(typed: &str) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::new();
     c.type_str(typed);
@@ -645,10 +557,6 @@ fn paste_in_a_step(typed: &str) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     (c.dark_text(), stray, c.h.counts().1, verdict)
 }
 
-/// A paste whose echo lands in a tool result's frame is lit: the box redrawn in
-/// place under the result's scroll returned with the caret's line, which the
-/// insert's own width proves (the caret back on its screen row exactly the
-/// link's 49 cells on), in an empty composer too, with no typed glyph to follow.
 #[test]
 fn a_paste_echoed_in_a_tool_result_s_frame_is_lit() {
     for typed in ["", "check "] {
@@ -675,8 +583,6 @@ fn a_paste_echoed_in_a_tool_result_s_frame_is_lit() {
     }
 }
 
-/// One glyph typed into the composer, at rest, then a tool step of `rows` rows:
-/// what it left (as [`take`]) and the verdicts the step's frames drew.
 fn one_glyph_under_a_step(rows: usize) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::new();
     c.type_str("t");
@@ -690,10 +596,6 @@ fn one_glyph_under_a_step(rows: usize) -> (Vec<u16>, Vec<(u16, u16)>, u64, Strin
     (c.dark_text(), stray, c.h.counts().1, verdicts)
 }
 
-/// A line of one typed glyph returns with the box redrawn in place under a
-/// tool step's scroll: the follow pass alone wants two of a run's records to
-/// carry it, and the hand's seam carries the hand's own run on one, with the
-/// caret standing on its screen row as the second witness, key or no key.
 #[test]
 fn a_one_glyph_line_returns_with_the_box_under_a_tool_step() {
     for rows in [1, 3, 4] {
@@ -711,16 +613,8 @@ fn a_one_glyph_line_returns_with_the_box_under_a_tool_step() {
     }
 }
 
-/// A wrapped take's record: each sample's live columns on the composer's first
-/// and second lines, the band cells that strayed off the composer, and the
-/// ribbons retired.
 type WrappedTake = (Vec<(Vec<u16>, Vec<u16>)>, Vec<(u16, u16)>, u64);
 
-/// The owner's take on a composer that wraps (the box grows a row as the text
-/// passes its first line, the input going on on a second line under it), every
-/// key's composer rows sampled, and every 100 ms of the rest after it: with
-/// `steps`, a tool step lands after every third key and at each rest sample, a
-/// frame drawn at the same instant either way.
 fn wrapped_take(steps: bool) -> WrappedTake {
     let mut c = Claude::new();
     c.wrap = Some(72);
@@ -757,11 +651,6 @@ fn wrapped_take(steps: bool) -> WrappedTake {
     (lives, stray, c.h.counts().1)
 }
 
-/// A wrapped composer's two lines live the same lives under tool steps as with
-/// none: the first line's band flows once the hand has gone down to the second
-/// (the fold), at the same instant, and the second line is lit from its first
-/// glyph, which the step after the wrap found with only a blank after it (the
-/// lab's take, 2026-10-20, melted the `th` that began it).
 #[test]
 fn a_wrapped_take_lives_the_same_life_under_tool_steps() {
     let (calm, calm_stray, calm_retired) = wrapped_take(false);
@@ -784,8 +673,6 @@ fn a_wrapped_take_lives_the_same_life_under_tool_steps() {
     assert_eq!(retired, 0, "nothing melts");
 }
 
-/// The owner's link pasted with its line ending (copied from a line of text, so
-/// the host prices one line and its break, `InsertWidth::Line`).
 #[test]
 fn a_link_pasted_with_its_line_ending_is_lit_and_so_are_the_words_after_it() {
     let mut c = Claude::new();
@@ -831,9 +718,6 @@ fn a_link_pasted_with_its_line_ending_is_lit_and_so_are_the_words_after_it() {
     assert_eq!(c.h.counts().1, 0, "nothing melts");
 }
 
-/// A streamed tool result that adds its rows on every frame: `n` tool steps of
-/// three rows on back-to-back frames, no frame between them that only walks
-/// (each scroll's own frame skips the walk).
 fn back_to_back_steps(n: usize) -> (Vec<u16>, Vec<(u16, u16)>, u64) {
     let mut c = Claude::new();
     c.type_str("check ");
@@ -853,11 +737,6 @@ fn back_to_back_steps(n: usize) -> (Vec<u16>, Vec<(u16, u16)>, u64) {
     (c.dark_text(), stray, c.h.counts().1)
 }
 
-/// Scrolls on back-to-back frames each carry the band their own rows: the
-/// follow pass that searched one scroll's carry ends it, so the next frame's
-/// scroll is searched at its own three rows, not at the six or nine the two or
-/// three of them add up to, and the box redrawn in place keeps its band through
-/// every one of them.
 #[test]
 fn back_to_back_scrolls_each_carry_their_own_rows() {
     for n in [2, 3] {
@@ -871,11 +750,6 @@ fn back_to_back_scrolls_each_carry_their_own_rows() {
     }
 }
 
-/// The band at rest after the paste, sampled as [`rest_after_paste`] does, with
-/// a tool step whose frame is presented before its synchronized update ends
-/// (the GUI's hold capped): the hidden caret is withheld on that frame, so no
-/// key and no caret says where the hand is, and the update's end is drawn a
-/// frame later.
 fn rest_after_a_torn_step() -> Vec<RestSample> {
     let mut c = Claude::new();
     c.type_str("check ");
@@ -895,10 +769,6 @@ fn rest_after_a_torn_step() -> Vec<RestSample> {
         .collect()
 }
 
-/// A tool step presented torn, its caret withheld, still returns the hand with
-/// its line: the box was redrawn in place before the update's end, and on the
-/// scroll's own frame the follow pass names the hand's line back on the caret's
-/// screen row, past the follow offsets, with no caret to say so.
 #[test]
 fn a_torn_tool_step_returns_the_hand_with_its_line() {
     let calm = rest_after_paste(false);
@@ -913,19 +783,10 @@ fn a_torn_tool_step_returns_the_hand_with_its_line() {
     }
 }
 
-/// The transcript rows above the box on the take's fresh screen: the composer
-/// starts on row 7, and four-row tool steps push it to the bottom in five.
 const FRESH_LINES: usize = 3;
 
-/// The lab's tool step (Claude Code 2.1.305, 2026-10-20): the call's line, its
-/// result's two rows and a blank.
 const STEP_ROWS: usize = 4;
 
-/// The owner's take on a fresh session's screen, the transcript not yet down to
-/// the box: with `steps`, a tool step after the paste and after each word, each
-/// pushing the box down [`STEP_ROWS`] rows with no scroll until it reaches the
-/// bottom, then one that pushes it the last three rows and scrolls one, then
-/// steps that scroll it in place.
 fn pushed_take(steps: bool) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     assert_eq!(c.row, 7, "fixture: the box starts high on the screen");
@@ -967,8 +828,6 @@ fn pushed_take(steps: bool) -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     (dark, stray, c.h.counts().1, note)
 }
 
-/// The negative control: on the fresh screen with no tool step the take is lit
-/// from the first glyph to the caret, and nothing strays or melts.
 #[test]
 fn the_owners_take_on_a_fresh_screen_with_no_tool_step_is_lit() {
     let (dark, stray, retired, note) = pushed_take(false);
@@ -980,11 +839,6 @@ fn the_owners_take_on_a_fresh_screen_with_no_tool_step_is_lit() {
     assert_eq!(retired, 0, "nothing melts ({note})");
 }
 
-/// The owner's take on a fresh session's screen, the box pushed down four rows
-/// by each tool step while the transcript has not filled the screen (past the
-/// follow pass's `±1`/`±2`, and no scroll to say how far), then pushed the last
-/// rows under a scroll, then scrolled in place: the band rides the box all the
-/// way down, nothing is left on the rows it stood on, and nothing melts.
 #[test]
 fn a_band_rides_a_box_the_growing_transcript_pushes_down() {
     let (dark, stray, retired, note) = pushed_take(true);
@@ -996,9 +850,6 @@ fn a_band_rides_a_box_the_growing_transcript_pushes_down() {
     assert_eq!(retired, 0, "nothing melts ({note})");
 }
 
-/// The band's life over a rest after the paste on the fresh screen, sampled as
-/// [`rest_after_paste`] does on whatever row the box stands on, with or without
-/// one tool step pushing the box down [`STEP_ROWS`] rows.
 fn rest_after_a_push(push: bool) -> Vec<RestSample> {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("check ");
@@ -1020,9 +871,6 @@ fn rest_after_a_push(push: bool) -> Vec<RestSample> {
         .collect()
 }
 
-/// A band pushed down with its box lives the same life at rest as one left in
-/// place: it is still the hand's band on the hand's line, so it rests, holds
-/// and leaves on the same clocks, and nothing is left where it stood.
 #[test]
 fn a_band_pushed_down_with_its_box_lives_the_same_life_at_rest() {
     let calm = rest_after_a_push(false);
@@ -1037,12 +885,6 @@ fn a_band_pushed_down_with_its_box_lives_the_same_life_at_rest() {
     }
 }
 
-/// The owner's take on the lab's fresh screen ([`LAB_COLS`] wide), the
-/// composer word-wrapping after `pasted` as Claude Code wraps it, the box
-/// growing down a row: then the rest of the sentence on the second line with,
-/// with `steps`, a four-row tool step after every third key and at each rest
-/// sample, pushing the two-line box down until it reaches the bottom, then
-/// scrolling it in place.
 fn pushed_wrapped_take(steps: bool) -> WrappedTake {
     let mut c = Claude::with_transcript(FRESH_LINES, LAB_COLS);
     c.wrap = Some(140);
@@ -1091,11 +933,6 @@ fn pushed_wrapped_take(steps: bool) -> WrappedTake {
     (lives, stray, c.h.counts().1)
 }
 
-/// The owner's two-line composer pushed down by four-row tool steps on the lab's
-/// fresh screen, then scrolled in place once it reaches the bottom, lives the same
-/// lives as with no step: both lines ride the box down (the first line a row above
-/// the caret, the caret's carry naming its row), the first line's band folding
-/// away and the second's lit on the same clocks, nothing strays and nothing melts.
 #[test]
 fn a_wrapped_box_pushed_down_lives_the_same_life() {
     let (calm, calm_stray, calm_retired) = pushed_wrapped_take(false);
@@ -1118,8 +955,6 @@ fn a_wrapped_box_pushed_down_lives_the_same_life() {
     assert_eq!(retired, 0, "nothing melts");
 }
 
-/// One glyph typed into the composer on the fresh screen, at rest, then a tool
-/// step pushing the box down [`STEP_ROWS`] rows: what it left (as [`take`]).
 fn one_glyph_under_a_push() -> (Vec<u16>, Vec<(u16, u16)>, u64) {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("t");
@@ -1132,10 +967,6 @@ fn one_glyph_under_a_push() -> (Vec<u16>, Vec<(u16, u16)>, u64) {
     (c.dark_text(), stray, c.h.counts().1)
 }
 
-/// A line of one typed glyph rides a box pushed down past the follow offsets:
-/// the follow pass alone wants two of a run's records to carry it, and the
-/// hand's seam carries the hand's own run on one, with the caret standing on
-/// the box's new row as the second witness, key or no key.
 #[test]
 fn a_one_glyph_line_rides_a_box_pushed_down() {
     let (dark, stray, retired) = one_glyph_under_a_push();
@@ -1144,9 +975,6 @@ fn a_one_glyph_line_rides_a_box_pushed_down() {
     assert_eq!(retired, 0, "nothing melts");
 }
 
-/// The owner's take on the fresh screen with a tool step pushing the box down
-/// between one key's press and its echo: what it left (as [`take`]) and the
-/// admission verdicts from the press on.
 fn push_under_a_key() -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     let mut c = Claude::with_transcript(FRESH_LINES, COLS);
     c.type_str("check ");
@@ -1170,9 +998,6 @@ fn push_under_a_key() -> (Vec<u16>, Vec<(u16, u16)>, u64, String) {
     (c.dark_text(), stray, c.h.counts().1, verdicts)
 }
 
-/// A key pressed as a tool step pushes the box down keeps its press for its
-/// echo: the hand rides its line to the box's new row, so the press is not
-/// spent on the rows the box moved, and the echo is lit like every other key's.
 #[test]
 fn a_key_pressed_as_a_tool_step_pushes_the_box_keeps_its_press() {
     let (dark, stray, retired, verdicts) = push_under_a_key();

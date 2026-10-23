@@ -252,7 +252,8 @@ impl YankLatch {
         self.checked_at > 0 && (-LATCH_CLOCK_SLACK_SECS..=LATCH_CURRENT_FOR_SECS).contains(&age)
     }
 
-    /// Record `channel`'s vendor yanks from `index_build`, verified at `checked_at`.
+    /// Record `channel`'s vendor yanks from `index_build`, verified at `checked_at`, unless the
+    /// latch holds a newer index.
     ///
     /// # Errors
     /// The latch could not be written.
@@ -271,7 +272,8 @@ impl YankLatch {
         )
     }
 
-    /// Record every channel's yanks from `index`, verified at `checked_at`.
+    /// Record every channel's yanks from `index`, verified at `checked_at`, unless the latch
+    /// holds a newer index.
     ///
     /// # Errors
     /// The latch could not be written.
@@ -283,7 +285,8 @@ impl YankLatch {
         Self::update(layout, rank(index), Policy::from_index(index), checked_at)
     }
 
-    /// Carry yanks forward from cached `index` while preserving the last live verification stamp.
+    /// Carry yanks forward from cached `index`, unless the latch holds a newer index, while
+    /// preserving the last live verification stamp.
     ///
     /// # Errors
     /// The latch could not be written.

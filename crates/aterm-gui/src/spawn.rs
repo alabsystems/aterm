@@ -1112,6 +1112,10 @@ impl Drop for HandedMaster {
     }
 }
 
+/// # Safety
+///
+/// The caller owns `master` outright (an open descriptor on Unix, a ConPTY master key on Windows)
+/// and gives that ownership up by this call.
 unsafe fn master_sink(master: i32) -> Arc<SinkWriter> {
     // SAFETY: the caller's contract above — `master` is open and solely ours.
     #[cfg(unix)]
@@ -1214,9 +1218,9 @@ pub(crate) fn mark_handoff_gap(
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
         tl.note_carried_glass();
         tl.continue_ids(timeline_id);
-        tl.record("handoff", gap.payload());
         let at = tl.slog().now();
         tl.slog_mut().adopt(log, keeper, from_build, at);
+        tl.record("handoff");
     }
     cast.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2220,7 +2224,7 @@ mod adoption_wiring_tests {
             timeline
                 .lock()
                 .unwrap()
-                .record("spawned", "state=spawning".to_string());
+                .record_hand_row("spawned", "state=spawning".to_string());
             let rows: Vec<(u64, &str, String)> = timeline
                 .lock()
                 .unwrap()
@@ -2267,13 +2271,13 @@ mod adoption_wiring_tests {
         };
         let mut producer = SessionTimeline::default();
         for _ in 0..3 {
-            producer.record("state-change", "state=alive".to_string());
+            producer.record_hand_row("state-change", "state=alive".to_string());
         }
         let updated = adopt(producer.handoff_id(), false);
         updated
             .lock()
             .unwrap()
-            .record("state-change", "state=alive".to_string());
+            .record_hand_row("state-change", "state=alive".to_string());
         let anchor = updated.lock().unwrap().high_id().expect("rows");
         assert_eq!(anchor, 3 + HANDOFF_ID_RESERVE + 2);
 
@@ -2294,7 +2298,7 @@ mod adoption_wiring_tests {
         recovered
             .lock()
             .unwrap()
-            .record("state-change", "state=alive".to_string());
+            .record_hand_row("state-change", "state=alive".to_string());
         assert_eq!(
             page(anchor),
             vec![(1, "handoff"), (2, "state-change")],

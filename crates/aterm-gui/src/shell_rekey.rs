@@ -336,7 +336,7 @@ pub(crate) mod typed {
     /// This process's typed re-key numbers: each file's name is its own.
     static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-    /// One issue at a time. [`issue_in`] is a sequence (settle the previous key,
+    /// One issue at a time. `issue_in` is a sequence (settle the previous key,
     /// sweep, write, authorize, record); two interleaved issues of one tab each
     /// settle nothing and the later record overwrites the earlier, leaving a
     /// live key in an unsettled file.
@@ -399,7 +399,7 @@ pub(crate) mod typed {
         issue_upgrading_in(dir, term, sid, None)
     }
 
-    /// [`issue_in`] with the typed upgrade's lines for a shell that is [`behind`].
+    /// `issue_in` with the typed upgrade's lines for a shell that is [`behind`].
     pub(crate) fn issue_upgrading_in(
         dir: &Path,
         term: &Mutex<Terminal>,

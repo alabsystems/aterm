@@ -89,8 +89,6 @@ fn scratch() -> (aterm_tempfile::TempDir, PathBuf, Git) {
     (dir, root, git)
 }
 
-/// A repository whose first commit records `ONE` beside a submodule, whose second
-/// records `TWO`, and whose working tree holds an uncommitted `THREE`.
 fn repo_with_history(root: &Path, git: &Git) -> (PathBuf, String) {
     let sub = root.join("sub");
     git.init(&sub);
@@ -123,11 +121,6 @@ fn worktrees(git: &Git, repo: &Path) -> usize {
         .count()
 }
 
-/// PRE-PROMOTE ASKS THE COMMIT'S OWN TREE: the check runs in a worktree of exactly the
-/// engine's commit (never the working tree, which may hold another branch or edits),
-/// its submodules at the gitlinks it records, building into the target dir's own
-/// `pre-promote.noindex` directory —
-/// and the check's verdict is the hook's. The worktree is gone afterwards.
 #[test]
 fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
     let (_dir, root, git) = scratch();
@@ -185,10 +178,6 @@ fn pre_promote_asks_the_commits_own_tree_and_leaves_no_worktree() {
     );
 }
 
-/// UNDER `ship release` THE RUNNING RELEASE'S CUTTER ANSWERS: `ATERM_RELEASE_CUTTER` is
-/// R's own binary, so it is asked from the repository root, with no worktree and no
-/// build; a name that is not an executable file refuses rather than fall back to
-/// another cutter. It runs as from the operator's shell.
 #[test]
 fn pre_promote_asks_the_running_releases_cutter_and_builds_nothing() {
     let (_dir, root, git) = scratch();
@@ -282,10 +271,6 @@ fn pre_promote_asks_the_running_releases_cutter_and_builds_nothing() {
     assert_eq!(removed, ["CARGO", "TARGO_LANE"]);
 }
 
-/// THE COMMIT'S OWN CUTTER RUNS AS FROM THE OPERATOR'S SHELL: what the `ship` alias
-/// handed the hook (cargo's and targo's own variables, the frontend's library path) never
-/// reaches it; the caller's toolchain pin and PATH do, and it builds into the shared
-/// target directory, in the commit's worktree.
 #[test]
 fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
     let inherited = [
@@ -352,9 +337,6 @@ fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
     assert_eq!(cmd.get_current_dir(), Some(Path::new("/scratch/tree")));
 }
 
-/// PRE-PROMOTE REFUSES RATHER THAN CHECK SOME OTHER CODE (exit 2, the check never asked):
-/// no commit named, one this repository does not hold, no checkout to run from, or a
-/// check that could not run.
 #[test]
 fn pre_promote_refuses_rather_than_check_some_other_code() {
     let (_dir, root, git) = scratch();
@@ -406,7 +388,6 @@ fn pre_promote_refuses_rather_than_check_some_other_code() {
     assert_eq!(worktrees(&git, &repo), 1);
 }
 
-/// One astream fixture crate: `crates/<name>` with `deps` below its `[package]`.
 fn astream_crate(dir: &Path, name: &str, deps: &str) {
     std::fs::create_dir_all(dir.join(format!("crates/{name}/src"))).unwrap();
     std::fs::write(
@@ -417,11 +398,6 @@ fn astream_crate(dir: &Path, name: &str, deps: &str) {
     std::fs::write(dir.join(format!("crates/{name}/src/lib.rs")), "// ONE\n").unwrap();
 }
 
-/// The astream fixture. Its crates depend on each other in every shape cargo follows
-/// (`workspace = true` and a dotted key through the root's `[workspace.dependencies]`, an
-/// optional row, a target table), beside a dev-dependency and a crate nothing reaches;
-/// the wire crate says `ONE` at the first commit and `TWO` at the second, which also adds
-/// astream-hash and cap's path dependency on it.
 fn astream(root: &Path, git: &Git) -> PathBuf {
     let dir = root.join("astream");
     git.init(&dir);
@@ -476,7 +452,6 @@ fn astream(root: &Path, git: &Git) -> PathBuf {
     dir
 }
 
-/// The exported crate that path-depends on astream's `dep`, as aterm-link does.
 fn link_crate(export: &Path, dep: &str) {
     let link = export.join("crates/link");
     std::fs::create_dir_all(&link).unwrap();
@@ -490,7 +465,6 @@ fn link_crate(export: &Path, dep: &str) {
     .unwrap();
 }
 
-/// The astream crates an export carries.
 fn exported_astream(export: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(export.join("vendor/astream/crates"))
         .unwrap()
@@ -500,8 +474,6 @@ fn exported_astream(export: &Path) -> Vec<String> {
     v
 }
 
-/// A superproject whose CAPTURED commit gitlinks astream at ONE while its checkout has
-/// moved on to TWO; the captured sha.
 fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
     let sp = root.join("super");
     git.init(&sp);
@@ -523,9 +495,6 @@ fn superproject(root: &Path, git: &Git, astream: &Path) -> (PathBuf, String) {
     (sp, captured)
 }
 
-/// The export as the engine hands it over: the workspace manifests and toolchain pin as
-/// committed, the file whose bare `/Users/` is behaviour, every shape a rewrite exists
-/// for, and a crate declaring a target whose file the export withholds.
 fn export_fixture(export: &Path) -> String {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for f in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
@@ -571,7 +540,6 @@ fn export_fixture(export: &Path) -> String {
     lib
 }
 
-/// Every guarded shape the rewrites answer to, found in `text`.
 fn guarded(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let bytes = text.as_bytes();
@@ -604,17 +572,6 @@ fn tree_text(dir: &Path, out: &mut String) {
     }
 }
 
-/// THE EXPORT TRANSFORMS: astream written as files from the EXPORTED commit's gitlink (not
-/// the checkout's), only the crates the export's path
-/// dependencies reach (optional, target and workspace rows, and an exported member's
-/// dev-dependency; never an astream crate's own dev-dependency, no unreached crate), each
-/// with its build script and the files beside src/ but none of its test, example or bench
-/// targets;
-/// every guarded shape
-/// rewritten to exactly the guards' form and nothing else moved — the toolchain pin, the
-/// version (a patch slot other than 0 reaches the engine as declared) and a bare
-/// `/Users/` that is behaviour all ship as written; a declared target whose file is
-/// withheld is dropped with its comment.
 #[test]
 fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_shape() {
     let (_dir, root, git) = scratch();
@@ -741,10 +698,6 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
     assert!(toml_before.contains(&format!("version = \"{dev_version}\"")));
 }
 
-/// THE ASTREAM SET IS READ AT THE CAPTURED GITLINK, never listed: a crate the newer
-/// gitlink adds (and a dependency names) is exported from it; an export depending on a
-/// crate the gitlink lacks is refused, naming it, rather than staged with a manifest no
-/// public clone resolves.
 #[test]
 fn the_astream_crates_are_derived_at_the_captured_gitlink() {
     let (_dir, root, git) = scratch();
@@ -784,10 +737,6 @@ fn the_astream_crates_are_derived_at_the_captured_gitlink() {
     );
 }
 
-/// THE EXPORTED LOCKFILE HOLDS WHAT THE EXPORT CARRIES: a workspace package whose manifest
-/// the exported commit has and the export withholds leaves Cargo.lock with what only it
-/// reached, as cargo writes the lock of the exported workspace; a lock that names nothing
-/// withheld is left byte for byte.
 #[test]
 fn a_withheld_package_leaves_the_exported_lock() {
     let (_dir, root, git) = scratch();
@@ -866,8 +815,6 @@ fn a_withheld_package_leaves_the_exported_lock() {
     );
 }
 
-/// A checkout that never initialized the submodule (a pre-submodule branch) holds the
-/// exported commit but not astream's objects: refused by name, not staged from.
 #[test]
 fn an_uninitialized_astream_checkout_is_refused_by_name() {
     let (_dir, root, git) = scratch();
@@ -897,8 +844,6 @@ fn an_uninitialized_astream_checkout_is_refused_by_name() {
     );
 }
 
-/// A repository whose first commit has no cutter, whose second's transforms say `ONE`
-/// and whose third's say `TWO`, beside a lockfile and a README: (repo, [c0, c1, c2]).
 fn cutter_history(root: &Path, git: &Git) -> (PathBuf, [String; 3]) {
     let repo = root.join("cutter");
     git.init(&repo);
@@ -975,12 +920,6 @@ fn dispatch(facts: &Transforms) -> (i32, Ran, String) {
     (code, ran, said)
 }
 
-/// THE EXPORT IS REWRITTEN BY THE EXPORTED COMMIT'S OWN RULES: this cutter runs them only
-/// when its whole source tree is the captured commit's; an edited or untracked
-/// file, an edited lockfile, or a captured
-/// commit older than the checkout hands the export to that commit's own cutter, built
-/// in a throwaway worktree of exactly it, into the target dir's `pre-promote.noindex` — never
-/// this working tree's code.
 #[test]
 fn the_transforms_run_as_the_captured_commits_own_code() {
     let (_dir, root, git) = scratch();
@@ -1044,10 +983,6 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
     assert_eq!(std::fs::read_to_string(&rules).unwrap(), "// TWO\n");
 }
 
-/// The transforms refuse (exit 1, nothing run) rather than rewrite the export with some
-/// other commit's rules: a captured commit this repository does not hold, one with no
-/// `ship hook transforms` to ask, or a commit's own cutter that still finds its source
-/// differs (it would only hand the export on again).
 #[test]
 fn the_transforms_refuse_rather_than_run_other_rules() {
     let (_dir, root, git) = scratch();
@@ -1084,12 +1019,6 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
     assert!(matches!(ran, Ran::There { .. }), "{ran:?}");
 }
 
-/// The cutter's path dependencies and Cargo inputs are executable rules too.
-/// Exercise the real source judge over a committed checkout: each local
-/// difference is a source other than the captured commit's, and restoring it
-/// makes it that commit's again. Ignored includes/config files matter just as
-/// untracked files do. The dispatcher runs end to end on one tracked input and
-/// one ignored one: the captured worktree, then the identical checkout again.
 #[test]
 fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
     let (_dir, root, git) = scratch();
@@ -1180,8 +1109,6 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
     assert_eq!(worktrees(&git, &repo), 1, "delegated trees were removed");
 }
 
-/// A path dependency behind a gitlink is part of the cutter's source too:
-/// the recorded revision alone does not attest dirty or extra local files.
 #[test]
 fn export_cutter_attests_submodule_working_sources() {
     let (_dir, root, git) = scratch();

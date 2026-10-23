@@ -131,7 +131,8 @@ fn apply_is_idempotent_across_a_handoff() {
 }
 
 /// A claim never outranks an observation: a `need` mark raises only `review`,
-/// `decision` or `help`, and ranks below every observed need.
+/// `decision` or `help` (`escalated` only from the owner's attention flag), and
+/// ranks below every observed need.
 #[test]
 fn a_claimed_need_never_displaces_an_observed_one() {
     let now = |ms: u64| WALL0 + ms;

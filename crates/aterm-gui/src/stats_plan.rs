@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Layout planner for the stats deck (`DeckForm`, column coordinates, core cluster modes, and header key placement).
+//! Layout planner for the stats deck.
 use aterm_render::font::Font;
 
 use crate::stats_deck::{FOLDED_PT, FULL_TABLE_PT};
@@ -66,10 +66,7 @@ impl DeckSizePref {
     }
 }
 
-/// Auto turns a Folded window Full once its avail reaches this (pt)...
 const FULL_FROM_AVAIL: f64 = 870.0;
-/// ...and keeps a Full window Full down to this, so a window resized across
-/// one line does not flap between the forms.
 const FULL_DOWN_TO_AVAIL: f64 = 850.0;
 
 /// Chooses the [`DeckForm`] for `avail_pt` with hysteresis from `prev`.
@@ -109,8 +106,6 @@ pub(crate) fn full_delta_px(scale: f64, cell_px: usize) -> usize {
     need.div_ceil(cell) * cell
 }
 
-/// The chars a [`FaceMetrics`] table holds, in char order: printable ASCII
-/// and the punctuation the deck's text uses (§10).
 fn deck_glyphs() -> impl Iterator<Item = char> {
     (' '..='~').chain(['·', '×', '–', '’', '…'])
 }
@@ -298,7 +293,6 @@ impl FaceMetrics {
         m
     }
 
-    /// A face pair's own advances alone, with no kerning or tracking.
     fn advances_of(regular: &Font, bold: &Font) -> Self {
         Self::from_rows(
             deck_glyphs()
@@ -381,43 +375,27 @@ impl FaceMetrics {
     }
 }
 
-/// `ch`'s advance per em in `font`, measured at the face's own units per em
-/// so the f32 arithmetic is exact.
 fn em_advance(font: &Font, ch: char) -> f64 {
     let upem = (1.0 / font.scale_factor(1.0)).round();
     f64::from(font.char_metrics(ch, upem).advance_width) / f64::from(upem)
 }
 
-/// The kerning per em `font` puts between the glyphs `left` and `right`, as
-/// the pen reads it ([`UnicodeChars::char_kern`], by the same glyph ids);
-/// zero for a pair it does not kern.
 fn em_kern(font: &Font, left: u16, right: u16) -> f64 {
     let upem = (1.0 / font.scale_factor(1.0)).round();
     font.horizontal_kern_indexed(left, right, upem)
         .map_or(0.0, |k| f64::from(k) / f64::from(upem))
 }
 
-/// The table's side margins: it runs from `X0` to `W − X0` (§3.2).
 const X0: f64 = 12.0;
-/// Under this width the deck draws its ground only (§3.2).
 const MIN_TABLE_W: f64 = 160.0;
-/// Details' least width, and its greatest (§3.2).
 const DETAILS_MIN: f64 = 120.0;
 const DETAILS_MAX: f64 = 560.0;
-/// The most each gap right of the strip grows in a very wide window (§3.3).
 const GROW_GAP_MAX: f64 = 16.0;
-/// The least amount column of slim and of fnarrow (§3.2, §4.1).
 const SLIM_AMOUNT_MIN: f64 = 92.0;
-/// Below its fit, slim's amount is not drawn under this width (§3.2).
 const AMOUNT_DRAWN_MIN: f64 = 40.0;
-/// The gutter between the Folded blocks; the divider sits 14 pt into it.
 const BLOCK_GUTTER: f64 = 29.0;
-/// A Folded block's greatest width: fwide's columns, then Details at its
-/// greatest (§4.1).
 const B_MAX: f64 = 528.0 + 10.0 + DETAILS_MAX;
-/// The cores block's width (§3.4).
 const CORES_BLOCK_W: f64 = 68.0;
-/// The labels a name column must hold (§3.2).
 const ROW_NAMES: [&str; 8] = [
     "CPU",
     "GPU",
@@ -428,22 +406,13 @@ const ROW_NAMES: [&str; 8] = [
     "Processes",
     "Cores",
 ];
-/// The size of the header's words and of the key's (§3.1).
 const HEADER_PT: f64 = 9.5;
-/// The time label over a strip (§3.5).
 const TIME_LABEL: &str = "10 min ago";
-/// The Details header when it fits, else its first word (§3.5).
 const DETAILS_LONG: &str = "Details · point at a row for more";
-/// A scope swatch's advance before its words: a Panel 0.62 em wide, then
-/// 3 pt of air (§3.5).
 const SWATCH_ADVANCE: f64 = 0.62 * HEADER_PT + 3.0;
-/// A mark's advance before its words (§10).
 const MARK_ADVANCE: f64 = 1.1 * HEADER_PT;
-/// The gap a key item keeps from the label before it and the item after it.
 const KEY_GAP: f64 = 10.0;
 
-/// A name column at least `base` wide that holds every row name in UiBold
-/// at `pt`, with 1.5 pt to spare: wider on a wider face (§3.2).
 fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
     let widest = ROW_NAMES
         .iter()
@@ -452,7 +421,6 @@ fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
     base.max((widest + 1.5).ceil())
 }
 
-/// The deck's width in whole points.
 const fn whole_width(w_pt: f64) -> f64 {
     if w_pt.is_finite() {
         w_pt.max(0.0).floor()
@@ -479,7 +447,6 @@ impl Col {
     }
 }
 
-/// Lays columns out left to right, each after a gap.
 struct Pen(f64);
 
 impl Pen {
@@ -501,7 +468,6 @@ pub(crate) struct Strip {
 }
 
 impl Strip {
-    /// Every strip spans ten minutes: cells coarsen instead (§5.5).
     const SPAN_S: u32 = 600;
 
     fn new(x: f64, cols: u32, pitch: f64) -> Self {
@@ -519,7 +485,6 @@ impl Strip {
         self.x + f64::from(self.cols.saturating_sub(1)) * self.pitch + self.cell
     }
 
-    /// Where the cells and their gaps end: the next column's room starts here.
     fn after(self) -> f64 {
         self.x + f64::from(self.cols) * self.pitch
     }
@@ -673,7 +638,6 @@ impl FullPlan {
         }
     }
 
-    /// Moves the whole table right by `dx`.
     fn shift(&mut self, dx: f64) {
         self.cores = match self.cores {
             CoresAt::Block { at, divider } => CoresAt::Block {
@@ -700,8 +664,6 @@ impl FullPlan {
         }
     }
 
-    /// A very wide window (§3.3): Details has `extra` pt more than its
-    /// greatest.
     fn grow(&mut self, extra: f64) {
         let grow = (extra / 6.0).min(GROW_GAP_MAX).floor();
         let mut moved = 0.0;
@@ -744,7 +706,6 @@ pub(crate) fn plan_full(w_pt: f64, m: &FaceMetrics) -> FullPlan {
     plan
 }
 
-/// The `kind` columns at `w`, and whether they fit it.
 fn lay_full(w: f64, kind: FullKind, m: &FaceMetrics) -> (FullPlan, bool) {
     let right = w - X0;
     let rows = Rows::full(kind);
@@ -946,7 +907,6 @@ pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
     }
 }
 
-/// A `kind` block at `x`, `b` wide, and whether it fits.
 fn lay_block(x: f64, b: f64, kind: BlockKind, m: &FaceMetrics) -> (BlockPlan, bool) {
     let rows = Rows::folded(kind);
     let (name_base, well_w, strip_gap, cols, pitch) = match kind {
@@ -1051,16 +1011,11 @@ pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
     }
 }
 
-/// The size of a Cores row's captions and of the count (§3.4).
 const CORES_CAPTION_PT: f64 = 9.5;
 
-/// The cores block's square sizes, `(pitch, square)`, largest first (§3.4).
 const CORES_BLOCK_SIZES: [(f64, f64); 5] =
     [(11.0, 9.0), (9.0, 7.0), (7.0, 5.5), (5.5, 4.0), (2.5, 2.0)];
 
-/// The cores' words before the OS's topology is read, longest first. The
-/// cluster list is empty then, and unknown is never zero (§5.1), so no form
-/// says "0 cores".
 const CORES_NOT_READ: [&str; 2] = ["cores not read", "not read"];
 
 /// CPU core cluster in OS performance order.
@@ -1087,8 +1042,6 @@ pub(crate) enum CoresMode {
 }
 
 impl CoresMode {
-    /// The block's squares at `(pitch, sq)`, as many to a row as its 68 pt
-    /// hold.
     fn block((pitch, sq): (f64, f64)) -> Self {
         Self::Block {
             pitch,
@@ -1098,7 +1051,6 @@ impl CoresMode {
     }
 }
 
-/// How many cores the clusters count: 0 before the topology is read.
 fn total_cores(clusters: &[Cluster<'_>]) -> usize {
     clusters.iter().map(|c| c.count).sum()
 }
@@ -1237,7 +1189,6 @@ pub(crate) fn cores_block_title(clusters: &[Cluster<'_>], m: &FaceMetrics) -> St
     )
 }
 
-/// The count's shortest words: the total ("128 cores"), or "not read".
 fn count_words(clusters: &[Cluster<'_>]) -> String {
     match total_cores(clusters) {
         0 => CORES_NOT_READ[1].to_owned(),
@@ -1321,12 +1272,9 @@ pub(crate) enum KeyItem {
 }
 
 impl KeyItem {
-    /// The order the search assigns them in, most important first.
     const SEARCH: [Self; 3] = [Self::Over, Self::Ramp, Self::NotRead];
-    /// The order they draw in within one span.
     const DRAW: [Self; 3] = [Self::Ramp, Self::Over, Self::NotRead];
 
-    /// What placing it is worth.
     const fn weight(self) -> u32 {
         match self {
             Self::Over => 4,
@@ -1458,7 +1406,6 @@ pub(crate) struct HeaderPlan {
     pub(crate) key: KeyPlan,
 }
 
-/// A header line being laid out: its labels, and the spans they leave free.
 struct Header<'m> {
     m: &'m FaceMetrics,
     labels: Vec<HeaderLabel>,
@@ -1490,7 +1437,6 @@ impl<'m> Header<'m> {
         self.spans.push(KeySpan { x0, x1, strip });
     }
 
-    /// The time label over `strip`; the rest of the strip's header is a span.
     fn time(&mut self, strip: Strip) {
         self.label(Label::Time, strip.x, TIME_LABEL);
         self.span(
@@ -1500,16 +1446,12 @@ impl<'m> Header<'m> {
         );
     }
 
-    /// A scope's swatch and words at `x`; answers their width.
     fn scope(&mut self, bar: Bar, x: f64, words: String) -> f64 {
         let w = SWATCH_ADVANCE + self.words(&words);
         self.label(Label::Scope(bar), x, words);
         w
     }
 
-    /// "■ Global ■ aterm ■ Tab 2" from `x`, 8 pt apart, none past `limit`
-    /// (the tab's label cut to fit); answers where the run and its trailing
-    /// gap end.
     fn scope_keys(&mut self, mut x: f64, limit: f64, tab: &str) -> f64 {
         for (bar, words) in [
             (Bar::Global, "Global"),
@@ -1715,7 +1657,6 @@ mod tests {
         FaceMetrics::helvetica_neue()
     }
 
-    /// A device pixel: `P(v) = floor(v·s + 0.5)`.
     fn px(v: f64, s: f64) -> f64 {
         (v * s + 0.5).floor()
     }
@@ -1724,7 +1665,6 @@ mod tests {
         Col::new(strip.x, strip.end() - strip.x)
     }
 
-    /// A Full plan's columns, left to right.
     fn full_cols(plan: &FullPlan) -> Vec<Col> {
         let mut cols = Vec::new();
         if let CoresAt::Block { at, divider } = plan.cores {
@@ -1746,7 +1686,6 @@ mod tests {
         cols
     }
 
-    /// A Folded block's columns, left to right.
     fn block_cols(block: &BlockPlan) -> Vec<Col> {
         let mut cols = vec![block.name, block.well, strip_col(block.strip)];
         cols.extend(
@@ -1764,8 +1703,6 @@ mod tests {
         cols
     }
 
-    /// Columns that keep their order, none overlapping the next, all inside
-    /// `[x0, x1]`.
     fn assert_in_order(cols: &[Col], x0: f64, x1: f64, what: &str) {
         let mut edge = x0;
         for col in cols {
@@ -1778,7 +1715,6 @@ mod tests {
         assert!(edge <= x1, "{what}: the columns end at {edge}, past {x1}");
     }
 
-    /// Every edge lands on a whole device pixel at 1× and at 2×.
     fn assert_on_pixels(cols: &[Col], what: &str) {
         for s in [1.0, 2.0] {
             for edge in cols.iter().flat_map(|col| [col.x, col.end()]) {
@@ -1787,10 +1723,6 @@ mod tests {
         }
     }
 
-    /// T-G1, Full (§3.2, §3.3) on Helvetica Neue, at 1× and 2×. The plan
-    /// reads the width in points (`W · s` px at either scale): every edge
-    /// lands on a device pixel at both, and an odd px count at 2× plans as
-    /// the whole point under it.
     #[test]
     fn plan_golden_tables_full() {
         let m = hn();
@@ -1881,7 +1813,6 @@ mod tests {
         assert_eq!([1700.0, 2000.0].map(|w| at(w).offset), [2.0, 119.0]);
     }
 
-    /// T-G1, Folded (§4.1) on Helvetica Neue.
     #[test]
     fn plan_golden_tables_folded() {
         let m = hn();
@@ -1955,7 +1886,6 @@ mod tests {
         assert!(!p.ground_only);
     }
 
-    /// §3.1 and §4.1's vertical tables, in device px at 2× and 1×.
     #[test]
     fn rows_sit_where_the_vertical_tables_say() {
         let m = hn();
@@ -2012,9 +1942,6 @@ mod tests {
         assert_eq!(plan_folded(350.0, &m).blocks[0].rows.name_pt, 9.5);
     }
 
-    /// T-G1's breakpoints: Helvetica Neue's are the spec's; the test stack's
-    /// wider face (DejaVu Sans Mono) widens the name columns and so starts
-    /// every kind a few points later.
     #[test]
     fn breakpoints_follow_the_face() {
         let helvetica = breakpoints(&hn());
@@ -2060,10 +1987,6 @@ mod tests {
         }
     }
 
-    /// §3.2, §3.3, §4.1 and §5.5 at every width from 160 to 5120 pt, on both
-    /// faces: the columns keep their order inside the card (inside their
-    /// block), each strip spans ten minutes in the kind's cells, and no
-    /// deck draws more than 420 cells.
     #[test]
     fn every_width_plans_inside_the_card() {
         for m in [hn(), FaceMetrics::test_stack()] {
@@ -2121,8 +2044,6 @@ mod tests {
         }
     }
 
-    /// T-G5: the form is a function of the window and the setting, with a
-    /// 20 pt band of hysteresis, and Full adds whole cells.
     #[test]
     fn deck_height_is_a_function_of_the_window() {
         use crate::stats_deck::{StatsBars, deck_px};
@@ -2186,8 +2107,6 @@ mod tests {
         assert_eq!(DeckSizePref::from_word("huge"), None);
     }
 
-    /// Every machine T-G3 asks about: 4 to 128 cores in one unnamed cluster
-    /// and in one to four named ones, split as evenly as the count allows.
     fn machines() -> Vec<Vec<Cluster<'static>>> {
         const NAMES: [&[&str]; 4] = [
             &["Performance"],
@@ -2218,8 +2137,6 @@ mod tests {
         machines
     }
 
-    /// A Cores row that fits its room, in one of its modes or by the count,
-    /// and never loses the count.
     fn assert_row_fits(
         clusters: &[Cluster<'_>],
         mode: CoresMode,
@@ -2247,9 +2164,6 @@ mod tests {
         }
     }
 
-    /// T-G3: every machine's cores fit the Full block, the Full Cores row and
-    /// the Folded Cores row at the narrowest width of every kind, in one of
-    /// their modes, and the count is always there.
     #[test]
     fn cores_fit_every_machine() {
         let machines = machines();
@@ -2355,8 +2269,6 @@ mod tests {
         assert_eq!(cores_block_mode(&huge, FULL_TABLE_PT), CoresMode::CountOnly);
     }
 
-    /// The modes each width chooses for a familiar machine: 18 cores as 6
-    /// Super and 12 Performance.
     #[test]
     fn an_m5_draws_its_cores_large_where_it_can() {
         let m = hn();
@@ -2409,7 +2321,6 @@ mod tests {
         head.labels.iter().find(|l| l.label == label).map(|l| l.x)
     }
 
-    /// §3.6's results on Helvetica Neue.
     #[test]
     fn the_key_goes_where_the_spec_says() {
         let m = hn();
@@ -2476,9 +2387,6 @@ mod tests {
         assert_eq!(placed(&head, KeyItem::NotRead), Some(ramp_end));
     }
 
-    /// fslim names its block's worst state in the header (§4.4): over the
-    /// name when it fits there, else spilling over the strip, which then
-    /// lends the time label to the other block.
     #[test]
     fn an_fslim_state_takes_the_header() {
         let m = hn();
@@ -2514,11 +2422,6 @@ mod tests {
         assert_eq!(label_x(&head, Label::Time), Some(b.strip.x));
     }
 
-    /// T-G14: over every plan of the T-G4 sweep (W 160 to 5120 pt in steps of
-    /// a device pixel at 2×, which covers 1× too; both faces; both forms),
-    /// "over max" is drawn exactly when some free span holds it, which is
-    /// always but in fslim with a state in both blocks; every item sits
-    /// inside a span; the time label is drawn once.
     #[test]
     fn key_is_placed() {
         let long = StateLabel {
@@ -2585,7 +2488,6 @@ mod tests {
         }
     }
 
-    /// Rule F, as the header uses it.
     #[test]
     fn rule_f_takes_the_first_form_that_fits_else_cuts_the_last() {
         let m = hn();
@@ -2644,11 +2546,6 @@ mod tests {
         );
     }
 
-    /// The deck measures its words as the pen draws them: with this host's
-    /// UI faces installed, a width is the pen's own, its kerning and
-    /// tracking in it, so the Details separator after a clause sits where it
-    /// was planned whatever the clause's length (Disk's dot drew 13 px after
-    /// its clause and GPU's 9 when the measure left them out).
     #[test]
     fn the_deck_measures_its_words_as_the_pen_draws_them() {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();

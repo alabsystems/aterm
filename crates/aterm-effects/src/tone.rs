@@ -374,7 +374,10 @@ impl ToneModel {
     }
 }
 
-/// Quantize and serialize full-precision weights into the asset format, beside the decoder so the byte layout has one author.
+/// Quantize and serialize full-precision weights into the asset format, beside the decoder so
+/// the byte layout has one author.
+///
+/// Panics unless the slices have the compiled lengths (trainer-only code).
 pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32]) -> Vec<u8> {
     assert_eq!(emb.len(), EMB_LEN);
     assert_eq!(w1.len(), W1_LEN);

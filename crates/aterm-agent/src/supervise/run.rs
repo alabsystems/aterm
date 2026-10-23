@@ -368,15 +368,13 @@ pub enum Guard {
     Draft,
     /// Launch card is on screen with no user task beneath it.
     Taskless,
-    /// A manager waits on the session (`TurnEndState::managed`): the occupancy door types it
-    /// nothing until a manager's own note can carry the fact.
+    /// Manager awaits the session (`TurnEndState::managed`).
     Managed,
-    /// The host withholds the session's continuations (`IdleHost::withholds_turn_end`: a full
-    /// disk) or owns its turn ends (`IdleHost::owns_turn_end`: the upgrade's wind-down).
+    /// Host withholds or owns the session's turn ends (`IdleHost::withholds_turn_end` or `IdleHost::owns_turn_end`).
     HostWithheld,
-    /// The upgrade's notice is due (`IdleHost::upgrade_due`): a nudge waits for it.
+    /// Upgrade notice is due (`IdleHost::upgrade_due`).
     UpgradeDue,
-    /// This break's one line went already: the host's (the upgrade's notice).
+    /// Host line was already sent during this break.
     HostLine,
 }
 
@@ -786,11 +784,9 @@ const SETTLE_CAP: Duration = Duration::from_millis(1500);
 const FRAME_WAIT: Duration = Duration::from_secs(61);
 const FRAME_REREADS: u32 = 8;
 const WRITING_CAP: Duration = Duration::from_secs(3);
-/// How long an idle read its reader does not vouch for must stand, every read reading it,
-/// before it is a point: over twice the longest such read measured inside a turn (0.385 s).
+/// Duration an unvouched idle read must persist before being treated as a point.
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
-/// A hang detector for an idle read held while the program's own title says its run goes
-/// on: never a latency budget (the longest end-of-turn review measured took 4.4 s).
+/// Hang-detector cap for an idle read held while the program's window title still reports a running turn.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
 const UNSCOPED_CAP: Duration = WRITING_CAP;
 const BOXED_BUSY_CAP: Duration = Duration::from_secs(2);
@@ -2869,16 +2865,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         let asked = self.fx.mono();
         let (screen, read_by) = self.read_once()?;
         self.fx.screen_read(&screen);
-        // Tests may put the reads on a clock of their own
-        // ([`Self::set_read_clock`]).
         #[cfg(test)]
         let asked = self.read_clock_now().unwrap_or(asked);
-        // The box's auto-deny countdown, placed at the instant the read was
-        // asked for: the vendor's deny, give or take a tick, believed once a
-        // later read sees it tick ([`approval_loop::Countdown`]); and the box
-        // episode, from the first read that shows a box to the first that
-        // shows none, its baseline the person count of the read before it
-        // ([`approval_loop::Episode`]).
         self.keep_countdown(&screen.rows, asked);
         self.keep_episode(&screen, self.last_read_count);
         self.last_read_count = Some(screen.human_seq);
@@ -2896,8 +2884,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         } else if self.footer.is_none() && !self.busy_read {
             self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
         }
-        // Gemini CLI's usage-limit dialog read, a point or not, and the
-        // worker working past it ([`Self::note_limit_dialog`]).
         let busy = self.limit_dialog_read.is_some() && reader.phase(&screen.rows) == Phase::Busy;
         self.note_limit_dialog(reader.program(), &screen.rows, busy);
         let credits = reader.credits(&screen.rows);
@@ -3254,10 +3240,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// Whether the program's own window title says its run goes on: one `title` read (the
-    /// OSC 0/2 title the program set, whatever is pinned over it, which `status`'s `subject=`
-    /// shows instead). `false` where the reader reads no titles (no read is made) and where
-    /// the host refuses the read.
+    /// Returns `true` if the program's OSC 0/2 window title reports a running turn.
     fn title_says_running(&mut self, reader: &dyn ScreenReader) -> Result<bool, Fail> {
         if reader.title_runs("").is_none() {
             return Ok(false);
@@ -3279,9 +3262,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.wait_at(cond, step).map(|(wait, _)| wait)
     }
 
-    /// [`Self::wait`], with the content seq the host says the condition
-    /// latched at (`OK <kind> <seq>`): `None` when it did not latch or the
-    /// host said no seq.
+    /// Executes `await` for `cond` and returns the wait outcome along with any latched content sequence.
     fn wait_at(&mut self, cond: &[&str], step: Duration) -> Result<(Wait, Option<u64>), Fail> {
         let ms = step.as_nanos().div_ceil(1_000_000).to_string();
         let mut args = vec!["await"];
@@ -3401,12 +3382,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         let mut background_since: Option<Instant> = None;
         let mut footer_seen = false;
-        // Since when every read has been idle (or a question) under the program's own title
-        // saying its run goes on ([`TITLE_HOLD`]); a busy read ends it.
         let mut title_held: Option<Instant> = None;
-        // Since when every read has been idle with no evidence ([`NO_EVIDENCE_HOLD`]).
         let mut unvouched_since: Option<Instant> = None;
-        // The next short settle's cap while that hold runs: its read lands as the hold ends.
         let mut settle_cap = SETTLE_CAP;
         loop {
             // The hosted loop's stop ends a turn that may run for hours:
@@ -3493,13 +3470,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                     footer_seen = false;
                     continue;
                 }
-                // An idle read its reader does not vouch for (a row nobody knows, a first
-                // frame, a menu) is a point only once it has stood NO_EVIDENCE_HOLD, every read
-                // between reading it too, or after the idle window held still (`settled`). Each
-                // settle in the hold is capped to land its read as the hold ends, so a standing
-                // one is told NO_EVIDENCE_HOLD after its first read, still or animated. Not for a
-                // read the transcript calls idle, nor while the `/usage` panel or a limit reset's
-                // step is owed (their screens are the loop's).
                 if phase == Phase::Idle
                     && !settled
                     && !transcript_idle
@@ -3519,11 +3489,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 } else {
                     unvouched_since = None;
                 }
-                // An idle or question read under the program's own running title (Muse Code's
-                // end-of-turn review: the reply whole, the screen still, only the title's
-                // spinner says the run goes on) is held, read again after the short settle,
-                // until the title rests, or until the hold has run TITLE_HOLD without a busy
-                // read, when it is taken as it stands. Nothing is typed into the review.
                 if matches!(phase, Phase::Idle | Phase::Question) && self.fx.mono() < deadline {
                     match title_held {
                         Some(at) if self.fx.since(at) >= TITLE_HOLD => {
@@ -3549,7 +3514,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                     timed_out: false,
                 });
             }
-            // A busy read, or one still writing: neither hold stood.
             unvouched_since = None;
             title_held = None;
             if writing {
@@ -4119,14 +4083,11 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn drive(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
-        // The window's own host, untaped, for an unwind to tell (none on a replay: its host is
-        // the tape's).
         let live = opts.idle_host.clone().filter(|_| !self.fx.replaying());
         let mut guard = occupancy_loop::UntoldOnUnwind::over(self, live);
         guard.session().drive_to_end(opts, review)
     }
 
-    /// [`Self::drive`]'s body, under its unwind's guard.
     fn drive_to_end(
         &mut self,
         opts: &SuperviseOpts,
@@ -4233,8 +4194,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         if review.unattended() {
             if std::mem::take(&mut self.claimed_at_naming) {
-                // Taken before the first read: what it found is said here,
-                // where the start's take said it.
                 self.claim_said(review);
             } else {
                 self.take_claim(review);
@@ -4390,21 +4349,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                 .composer(&turn.screen.rows)
                 .is_some()
         {
-            // No read saw it busy, and yet the worker sits at its composer
-            // with no dialog up: the dialog in hand is done, however it ended
-            // (a dialog between its tabs, or at its review, is still a box:
-            // `Phase::Prompt`). One the loop answered in a reply short enough
-            // to start and end inside the settle after its Enter is told
-            // here. One that went with no answer of the loop's — a person's
-            // Esc after the loop's text — is forgotten here, its text among
-            // it: remembered, the same question asked again would read as
-            // the text "gone" from a new dialog's empty field, and be handed
-            // over (F4). The composer itself is the evidence
-            // (a box replaces it): a frame that reads neither a dialog nor
-            // the composer — a dialog the reader misses, an exit to a shell —
-            // keeps the memory, whose worst is a hand-over; forgotten there,
-            // the loop's text in a dialog still up would read as a person's,
-            // and their act or a key in flight would be lost.
             self.question_done(turn.screen.seq, review)?;
         }
         if worked {
@@ -4508,8 +4452,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 TurnEndAction::Nothing
             };
-            // The limit episode's badge carried to a point off its screen,
-            // its episode ended by this point's fold: it goes now.
             if self.limit_badge_off_ended() {
                 self.close_box(point.screen.seq, review)?;
             }
@@ -4546,10 +4488,6 @@ impl<'a, C: Ctl> Session<'a, C> {
                     }
                     _ => {}
                 }
-                // GEMINI CLI'S USAGE LIMIT THAT NAMES NO RESET, ITS DIALOG
-                // ANSWERED `Stop` with no badge of the dialog's carried here
-                // (no point decided it): raised now, while its resume is
-                // typed on the ladder ([`Self::limit_stopped_badge`]).
                 if !point_escalated && self.limit_retry.is_some() {
                     let key = self.review_key(&point);
                     if let Some(reason) = self.limit_stopped_badge(&point, &key) {
@@ -4730,8 +4668,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             && !busy
             && let Some(why) = block.as_ref().and_then(aterm_phase::SurveyBlock::withheld)
         {
-            // Said on a busy read (which badges nothing: the worker is at work), the card is
-            // still open at the idle look: the badge goes there, once.
             self.tell_withheld_survey(turn, why, review)?;
         }
         if !open {
@@ -5320,22 +5256,11 @@ impl<C: Ctl> Session<'_, C> {
             .filter(|_| !held)
             .and_then(|_| self.file_request(&seen));
         let mut asked = false;
-        // Every pass after the first is a wake: a step of the wait ran.
         let mut woke = false;
         loop {
             if self.stopped() {
                 return Ok(None);
             }
-            // THE CARET READ AGAIN AT EACH WAKE while it alone withholds the
-            // host's point ([`Self::caret_withholds`]). Claude Code paints its
-            // frame, then moves the terminal's cursor into the composer; a
-            // read between the two finds the composer drawn and the cursor
-            // under it, and the cursor's move bumps no content seq, so no wait
-            // on the content wakes for it. Measured (host_live, 8 suites
-            // beside 14 CPU hogs): a relaunched agent's first point read 34 ms
-            // before its caret, its owed carry-on withheld `not-authoritative`
-            // at every wake for good. Content that moved since ends the wait
-            // (the loop looks again); the same content takes the fresh cursor.
             if std::mem::replace(&mut woke, true) && self.caret_withholds(&seen, opts) {
                 let now = self.screen()?;
                 if !seen.screen.take_cursor_of(&now) {
@@ -5369,7 +5294,6 @@ impl<C: Ctl> Session<'_, C> {
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }
-            // The usage tap moved the wall's reset: decided again now, not at the back-off's end.
             if self.tap_edge(opts, seen.screen.seq) {
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
@@ -5681,9 +5605,6 @@ impl<C: Ctl> Session<'_, C> {
         }
         let at_point = matches!(seen.phase, Phase::Idle | Phase::Limited { .. });
         if over.is_some_and(|o| o.acts()) {
-            // An idle point — a wall's own among them — and a limit notice
-            // (waited out for hours, or days): the reading takes the measure
-            // as the memory wall there ([`Self::turn_end_reading`]).
             return Ok(at_point && self.memory_seen.is_none());
         }
         if !at_point {
@@ -5842,10 +5763,7 @@ impl<C: Ctl> Session<'_, C> {
         Some(words)
     }
 
-    /// A BUSY READ OF THE AGENT'S OWN BACKGROUND WORK: the break offered to the host's step,
-    /// or withheld, and the hold's clock and the occupancy door fed. Under `prompt` alone the
-    /// door's write is the break's last step (§2.1: the brakes, then the host's line, then the
-    /// door), and only its reads and its write can fail here.
+    /// Offers a settled background-work break to [`IdleHost::at_background`] and updates occupancy state.
     fn host_steps_in_background(
         &mut self,
         screen: &Screen,
@@ -5889,7 +5807,6 @@ impl<C: Ctl> Session<'_, C> {
             self.say_hold(screen.seq, hold, review);
             return Ok(());
         }
-        // A break read after the door's line was taken: its answer ended here.
         self.turn_end.fact_answered();
         let at = *since.get_or_insert_with(|| self.fx.mono());
         let Some(host) = host.filter(|h| h.wants()) else {
@@ -5920,10 +5837,10 @@ impl<C: Ctl> Session<'_, C> {
         } else if self.turn_end.act_untaken() {
             Some(Guard::ActUntaken)
         } else if self.settling().is_some() {
-            // A busy read's request is what sees the sleep here ([`Self::call`]).
+            // Wake settle guard (`Guard::WakeSettle`).
             Some(Guard::WakeSettle)
         } else if cfg.is_some_and(|cfg| self.credits_hold_here(cfg, &screen.rows)) {
-            // Nor onto usage credits the key keeps the session off.
+            // Usage credits guard (`Guard::Credits`).
             Some(Guard::Credits)
         } else {
             None
@@ -5944,7 +5861,6 @@ impl<C: Ctl> Session<'_, C> {
             self.host_turn(kind, screen.seq);
             self.hold_line(screen.seq, cfg, review);
             *since = None;
-            // The break's one line went: the host's (§2.1, the upgrade's notice first).
             line_gone = Some(Guard::HostLine);
         }
         if self.occupancy_write(screen, line_gone, cfg, review)? {
@@ -6004,37 +5920,23 @@ impl<C: Ctl> Session<'_, C> {
         } else if reading.wall.is_some() && !(spent && limit_wall) {
             Some(Guard::Wall)
         } else if reading.wall.is_none() && self.turn_end.holds_left_retry() {
-            // A retry's wall whose notice left the screen with no work since
-            // (a person's `/status`, a scroll): the policy holds its rung
-            // there, so the host's turn would meet the outage too (RR-DEC-3).
+            // Retry wall still active off-screen.
             Some(Guard::Wall)
         } else if reading.prompt.is_some() {
             Some(Guard::Prompt)
         } else if self.limit.is_some() && !spent {
             Some(Guard::LimitEpisode)
         } else if self.policy_limit_holds() || self.limit_retry_is_away() {
-            // A limit the turn-end policy still waits on, met under a
-            // screen-alone agent: through its relaunch, where the episode
-            // closed ([`TurnEndState::limit_holds_host`]); or Gemini CLI's
-            // dialog held when the agent left the tab, before its relaunch's
-            // start-up is read as that limit ([`Self::limit_retry_away`]).
+            // Turn-end policy or dialog limit still active.
             Some(Guard::LimitEpisode)
         } else if self.turn_end.act_in_flight() {
             Some(Guard::ActInFlight)
         } else if self.settling().is_some() {
-            // The wait offers the point again once the settle falls ([`Self::wait_for_next`]).
             Some(Guard::WakeSettle)
         } else if self.credits_hold_here(&opts.policy, &point.screen.rows) {
-            // Usage credits carry the session, and the key keeps it on its
-            // subscription: the step's turn would be billed to them.
             Some(Guard::Credits)
         } else if self.limit.is_none() && !limit_wall && self.standing_holds(host.as_ref()) {
-            // A LIMIT ONLY THE TRANSCRIPT SHOWS, asked last, of a step about
-            // to be taken: the host's step goes before the decision that
-            // would read it as the wall ([`Self::read_standing_limit`]), and
-            // a relaunch's carry-on was typed into a weekly limit the
-            // resumed screen no longer drew (KI-1015-1 LIM-1). The host
-            // names none the harness moved the conversation off.
+            // Transcript standing limit still active.
             Some(Guard::LimitEpisode)
         } else {
             None
@@ -6079,10 +5981,6 @@ impl<C: Ctl> Session<'_, C> {
                 }
             }
             let stood = !step.as_ref().is_some_and(|s| s.moved);
-            // A LOOK THAT FOUND NOTHING (no step) at a point whose decision was carried out
-            // holds nothing for a redecision: the screen, the decision and its due are as they
-            // were (docs/measured/vitals-3-2026-10-22.md, V2). A step moved the point: its
-            // decision is owed no more.
             if !stood {
                 self.decision_owed = false;
                 self.host_held = false;
@@ -6112,8 +6010,6 @@ impl<C: Ctl> Session<'_, C> {
         Ok(idle)
     }
 
-    /// [`TurnEndState::limit_holds_host`] now, with the grace a limit's notice
-    /// gets past its reset ([`crate::harness::upgrade_drive::LIMIT_GRACE_S`]).
     fn policy_limit_holds(&self) -> bool {
         let grace = Duration::from_secs(crate::harness::upgrade_drive::LIMIT_GRACE_S);
         self.turn_end.limit_holds_host(self.fx.mono(), grace)
@@ -6153,8 +6049,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether the host's point `seen` stands withheld on its caret alone; [`Self::wait_for_next`]
-    /// reads such a point's cursor again at each wake.
     fn caret_withholds(&self, seen: &Turn, opts: &SuperviseOpts) -> bool {
         self.withheld == Some(Guard::NotAuthoritative)
             && opts.idle_host.as_ref().is_some_and(|h| h.wants())
@@ -6697,11 +6591,7 @@ fn emit(out: &mut dyn Write, line: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot write a line to stdout: {e}"))
 }
 
-/// A prompt's lines ([`render_phase`]). `verdict` is the read-only rule's
-/// verdict on a Bash box's command alone ([`readings_read_only`] over every
-/// reading of its rows), said as `classify read-only` or `classify
-/// not-read-only <reason>`; `None` on a Bash box is one whose rows were not
-/// read whole, which is no proof.
+/// Formats prompt details and read-only classification (`verdict`) for [`render_phase`].
 fn render_prompt(p: &Prompt, esc: Option<&str>, verdict: Option<Result<(), String>>) -> String {
     let mut out = format!("kind {}\n", p.kind.name());
     if !p.command.is_empty() {

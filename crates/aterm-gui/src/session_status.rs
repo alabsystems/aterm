@@ -1344,7 +1344,8 @@ pub(crate) fn needs_told_field(told: &crate::needs::ToldNeeds, entry: Option<&st
     }
 }
 
-/// Formats a `status-change` timeline event payload from `status`.
+/// A test's reading of `status` in its `status-change` row's words (the view prints the row from the mark, [`status_facts`]).
+#[cfg(test)]
 pub(crate) fn status_event_payload(status: &Status) -> String {
     let (exit_code, signal) = status.last_outcome.wire_fields();
     format!(
@@ -1805,18 +1806,18 @@ impl StatusObserver {
             .is_some_and(|slot| slot.failure.failing && !slot.failure.unseen())
     }
 
-    /// Takes a pending `status-change` event payload for `session` if its phase or outcome changed.
+    /// Takes a pending `status-change` for `session` if its phase or outcome changed, read in its row's words ([`status_event_payload`]).
     #[cfg(test)]
     pub(crate) fn take_status_event(&mut self, session: u64) -> Option<String> {
-        self.take_status_transition(session)
-            .map(|(payload, _)| payload)
+        self.take_status_transition(session)?;
+        self.status(session).map(status_event_payload)
     }
 
-    /// Takes a pending `status-change` payload and typed [`crate::session_log::observed::StatusFacts`] for `session`.
+    /// Takes a pending `status-change`'s typed [`crate::session_log::observed::StatusFacts`] for `session` (its mark is the row).
     pub(crate) fn take_status_transition(
         &mut self,
         session: u64,
-    ) -> Option<(String, crate::session_log::observed::StatusFacts)> {
+    ) -> Option<crate::session_log::observed::StatusFacts> {
         let slot = self.sessions.get_mut(&session)?;
         let status = slot.fsm.status();
         let key = (status.phase, status.last_outcome);
@@ -1824,7 +1825,7 @@ impl StatusObserver {
             return None;
         }
         slot.evented = Some(key);
-        Some((status_event_payload(status), status_facts(status)))
+        Some(status_facts(status))
     }
 
     /// Returns `session`'s published agent reading and sequence number.
@@ -2405,15 +2406,15 @@ impl crate::App {
             let status_event = status_changed
                 .then(|| self.session_status.take_status_transition(id))
                 .flatten();
-            if let Some((payload, facts)) = status_event.as_ref() {
+            if let Some(facts) = status_event {
                 let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                timeline.record(STATUS_CHANGE, payload.clone());
                 let at = timeline.slog().now();
-                timeline.slog_mut().observe_status(*facts, at);
+                timeline.slog_mut().observe_status(facts, at);
+                timeline.record(STATUS_CHANGE);
             }
             let (previous_group, wake) = {
                 let mut timeline = session
@@ -2750,11 +2751,11 @@ impl crate::App {
             .then(|| self.session_status.take_status_transition(session))
             .flatten()
             .filter(|_| carried.is_none());
-        if let Some((payload, facts)) = event {
+        if let Some(facts) = event {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
-            timeline.record(STATUS_CHANGE, payload);
             let at = timeline.slog().now();
             timeline.slog_mut().observe_status(facts, at);
+            timeline.record(STATUS_CHANGE);
             let _ = timeline.slog_take_wake();
         }
         let quieted =

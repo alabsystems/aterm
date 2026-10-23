@@ -7,9 +7,6 @@ use super::*;
 use crate::harness::disk::discover;
 use std::os::windows::fs::OpenOptionsExt as _;
 
-/// One of cargo's locks held as cargo holds it: opened by a handle of its own (std's
-/// read-write-delete sharing) and locked whole with `File::lock` (`LockFileEx`, exclusive),
-/// released by `unlock` on drop.
 struct CargoHolds(std::fs::File);
 
 impl CargoHolds {
@@ -35,9 +32,6 @@ impl Drop for CargoHolds {
     }
 }
 
-/// A `cmd.exe` of this test's whose working directory is `dir`, blocked reading its stdin
-/// until dropped: the drop closes the stdin, so it reads end-of-file and exits, and waits for
-/// that exit.
 struct Worker(aterm_uds::spawnfd::Child);
 
 impl Worker {
@@ -63,15 +57,12 @@ impl Drop for Worker {
     }
 }
 
-/// A test's process universe: the processes `pids` (its own) and no other, each read for real.
 fn among(
     pids: Vec<u32>,
 ) -> impl Fn(&[PathBuf], &[u32]) -> std::io::Result<aterm_uds::holders::PathScan> {
     move |dirs, skip| aterm_uds::holders::scan_path_users_of(&pids, dirs, skip)
 }
 
-/// What deleting everything under `root` releases, read independently of the reclaim: each
-/// distinct file's allocation once, however many names it has inside.
 fn allocated_once(root: &Path) -> u64 {
     let mut seen = std::collections::HashSet::new();
     let mut total = 0;
@@ -92,11 +83,8 @@ fn allocated_once(root: &Path) -> u64 {
     total
 }
 
-/// A non-Microsoft, non-surrogate reparse tag: a third party's placeholder (a cloud file),
-/// which a standard user may set ([`aterm_dirfd::seam::set_reparse_tag`]).
 const FOREIGN_TAG: u32 = 0x0000_7A7E;
 
-/// Make the file at `path` a third party's reparse point ([`FOREIGN_TAG`], no payload).
 fn tag_foreign(path: &Path) {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let file = std::fs::OpenOptions::new()
@@ -109,11 +97,8 @@ fn tag_foreign(path: &Path) {
         .expect("FSCTL_SET_REPARSE_POINT");
 }
 
-/// A volume GUID name no volume carries: a stand-in mount point's target, never reachable.
 const NO_VOLUME: &str = r"\??\Volume{00000000-0000-0000-0000-000000000000}\";
 
-/// Make `path` (a new, empty folder) a folder a volume is mounted on, as
-/// `SetVolumeMountPointW` writes one: the junction's tag onto [`NO_VOLUME`].
 fn mount_point(path: &Path) {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -126,15 +111,10 @@ fn mount_point(path: &Path) {
     aterm_dirfd::seam::set_mount_point(&dir, NO_VOLUME).expect("FSCTL_SET_REPARSE_POINT");
 }
 
-/// `p`'s plain spelling with every letter upper-cased: another spelling of the same path,
-/// which only the one path-identity rule places.
 fn shouted(p: &Path) -> PathBuf {
     PathBuf::from(plain(p).to_uppercase())
 }
 
-/// A build holding `.cargo-lock` through a handle of its own (`LockFileEx`, as cargo takes
-/// it) keeps its profile, in the report and in the reclaim, and nothing is touched; released,
-/// the reclaim takes only `incremental/` and every other entry is byte-identical.
 #[test]
 fn a_lock_another_handle_holds_keeps_the_profile_and_once_released_only_incremental_goes() {
     let tmp = Tmp::new("win-held");
@@ -179,8 +159,6 @@ fn a_lock_another_handle_holds_keeps_the_profile_and_once_released_only_incremen
     );
 }
 
-/// A whole removal asks the caller, under every lock, whether a process works in the
-/// directory: a `cmd.exe` whose working directory is inside refuses it, and nothing goes.
 #[test]
 fn a_process_working_inside_keeps_a_whole_removal_and_once_it_exits_the_directory_goes() {
     let tmp = Tmp::new("win-whole-user");
@@ -234,8 +212,6 @@ fn a_process_working_inside_keeps_a_whole_removal_and_once_it_exits_the_director
     assert!(!t.exists());
 }
 
-/// A junction inside a build directory is removed as itself — by a whole removal and by an
-/// idle reclaim of `incremental/` — and what it points at, outside, is byte-identical.
 #[test]
 fn a_junction_inside_is_removed_as_itself_and_what_it_points_at_survives() {
     let tmp = Tmp::new("win-junction");
@@ -260,9 +236,6 @@ fn a_junction_inside_is_removed_as_itself_and_what_it_points_at_survives() {
     assert_eq!(snapshot(&outside, &|_| false), outside_before);
 }
 
-/// A build directory deeper than `MAX_PATH` (260 UTF-16 units; long paths are off on this
-/// host) is assessed, reclaimed and removed whole: every step past the volume root is relative
-/// to a handle.
 #[test]
 fn a_build_directory_past_max_path_is_reclaimed_and_removed() {
     let tmp = Tmp::new("win-long");
@@ -292,9 +265,6 @@ fn a_build_directory_past_max_path_is_reclaimed_and_removed() {
     assert!(!t.exists());
 }
 
-/// A third party's reparse point (a cloud placeholder) inside `incremental/` is never
-/// entered or deleted: it is kept and said, its siblings still go, and `incremental/` is not
-/// claimed as gone.
 #[test]
 fn a_third_partys_reparse_point_is_kept_and_said() {
     let tmp = Tmp::new("win-placeholder");
@@ -320,7 +290,6 @@ fn a_third_partys_reparse_point_is_kept_and_said() {
     assert!(done.bytes > 0, "{done:?}");
 }
 
-/// The owner of the directory at `dir`, read through a facts-only handle of its own.
 fn owner_of(dir: &Path) -> aterm_dirfd::Sid {
     let pinned = aterm_dirfd::pin(dir).expect("pinned");
     let facts = aterm_dirfd::openat(
@@ -333,8 +302,6 @@ fn owner_of(dir: &Path) -> aterm_dirfd::Sid {
     aterm_dirfd::owner(&facts).expect("its owner")
 }
 
-/// Owners are read through each entry's own handle: a build directory of this user's
-/// passes the other-user fence of a whole removal.
 #[test]
 fn another_users_entry_keeps_the_directory_from_going_whole() {
     let tmp = Tmp::new("win-owner");
@@ -373,10 +340,6 @@ fn another_users_entry_keeps_the_directory_from_going_whole() {
     assert!(why.contains("another user"), "{why}");
 }
 
-/// A folder a volume is mounted on, inside a build directory, is never removed — that would
-/// unmount the volume — nor entered: it is kept and said as on another device, as unix keeps a
-/// mount point, by an idle reclaim of `incremental/` (its siblings still go) and by a whole
-/// removal (which then leaves the directory).
 #[test]
 fn a_volume_mounted_inside_is_kept_as_another_device() {
     let tmp = Tmp::new("win-mounted");
@@ -421,10 +384,6 @@ fn a_volume_mounted_inside_is_kept_as_another_device() {
     );
 }
 
-/// Tier 3 judges the entry its listing named, the one its delete is held to: a name that,
-/// between the listing and the judgement, comes to name a true uplift (a hard link of its
-/// `deps\` twin) is judged as the file listed — not cargo's: kept and said — and neither file
-/// is deleted.
 #[test]
 fn tier_3_judges_the_file_it_listed_never_one_renamed_into_its_name() {
     let tmp = Tmp::new("win-judged");
@@ -475,10 +434,6 @@ fn tier_3_judges_the_file_it_listed_never_one_renamed_into_its_name() {
     );
 }
 
-/// Only a fixed disk's build caches are reclaimed: a build directory whose volume reads as
-/// not fixed (a removable stick) or of a kind that cannot be read (the drive seam: this
-/// machine has fixed disks only) is no candidate — the report's fences say why — and every
-/// reclaim, of each tier, refuses it before opening anything, everything byte-identical.
 #[test]
 fn a_build_directory_off_a_fixed_disk_is_never_a_candidate_nor_reclaimed() {
     let tmp = Tmp::new("win-drive");
@@ -522,13 +477,6 @@ fn a_build_directory_off_a_fixed_disk_is_never_a_candidate_nor_reclaimed() {
     assert_eq!(done.units, vec![at(&t, "debug/incremental")], "{done:?}");
 }
 
-/// The watch's device fence holds on Windows: it names the volume it measures by `dev_of` a
-/// plain path there (its home; sysprobe's `FILE_ID_INFO` serial, links followed) and by the
-/// GUID its free-space reading is keyed by (`super::volume_of`, as the host's look reads it),
-/// and a reclaim reads both of its build directory's through the pinned handle (dirfd's): one
-/// figure and one GUID, so a reclaim under that judge proceeds — tier 2 and tier 1 — where one
-/// under any other refuses ([`the_delete_never_enters_another_device`],
-/// [`a_clone_of_the_measured_volume_is_refused_by_its_guid`]).
 #[test]
 fn the_volume_the_watch_measures_is_the_one_the_reclaim_reads() {
     let tmp = Tmp::new("win-watch-device");
@@ -573,11 +521,6 @@ fn the_volume_the_watch_measures_is_the_one_the_reclaim_reads() {
     assert_eq!(done.units, std::slice::from_ref(&t), "{done:?}");
 }
 
-/// A CLONE OF THE MEASURED VOLUME IS REFUSED BY ITS GUID: a build directory whose handle
-/// reads the measured serial but another volume GUID ([`mark_cloned`]: a sector-cloned disk or
-/// an attached VHD copy keeps its source's serial) is refused by every tier before anything
-/// is opened under it, and so is any build directory while the measured volume's GUID is
-/// unread; nothing is touched.
 #[test]
 fn a_clone_of_the_measured_volume_is_refused_by_its_guid() {
     let tmp = Tmp::new("win-cloned-volume");
@@ -629,7 +572,6 @@ fn a_clone_of_the_measured_volume_is_refused_by_its_guid() {
     assert_eq!(done.units, vec![at(&t, "debug/incremental")], "{done:?}");
 }
 
-/// Every file and folder at or under `root`, folders before what they hold.
 fn tree_of(root: &Path) -> Vec<PathBuf> {
     let mut out = vec![root.to_path_buf()];
     let mut i = 0;
@@ -647,10 +589,6 @@ fn tree_of(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A BUILD DIRECTORY IN A REAL CLOUD SYNC ROOT LOSES NOTHING. A scratch folder registered as
-/// a cloud sync root ([`aterm_dirfd::seam::SyncRoot`], as OneDrive registers its folder, with
-/// Documents and Desktop moved into it) holds a checkout's idle build directory, every file
-/// and folder of it made an in-sync placeholder, as a sync client leaves what it uploaded.
 #[test]
 fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     let tmp = Tmp::new("win-sync-root");
@@ -696,10 +634,6 @@ fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     drop(root);
 }
 
-/// One path, any spelling (the one path-identity rule): the pressure pass's pick named by
-/// its plain, upper-cased spelling is the profile the walk found by its verbatim one, and is
-/// taken; a build directory named inside, to be left to its own row, is left whatever its
-/// spelling; one that cannot be placed leaves every profile it might hold — here all.
 #[test]
 fn a_profile_or_a_nested_build_directory_is_one_path_in_any_spelling() {
     let tmp = Tmp::new("win-spelling");
@@ -731,9 +665,6 @@ fn a_profile_or_a_nested_build_directory_is_one_path_in_any_spelling() {
     assert!(at(&nested, "debug/incremental").exists());
 }
 
-/// Tier 3 empties a profile's uplifts that are cargo's: an unhashed twin of a `deps\` entry
-/// that is the same file (a hard link) or holds the same bytes goes; one whose bytes differ,
-/// and a file cargo never writes, stay and are said; the locks and the profile stay.
 #[test]
 fn tier_3_takes_an_unhashed_uplift_only_when_its_twin_is_the_same_artifact() {
     let tmp = Tmp::new("win-uplift");
@@ -781,10 +712,6 @@ fn tier_3_takes_an_unhashed_uplift_only_when_its_twin_is_the_same_artifact() {
     assert!(CARGO_LOCKS.iter().all(|l| debug.join(l).exists()));
 }
 
-/// A MEASUREMENT, run by hand (`-- --ignored --nocapture reclaim_wall_time`), never a gate:
-/// the wall time of the report walks and of each reclaim over a synthetic build directory of
-/// a realistic size — 20,000 files of 4 KiB (10,000 in `incremental/`, 5,000 in `deps/`,
-/// 5,000 under `.fingerprint/`).
 #[test]
 #[ignore = "a measurement, run by hand"]
 fn reclaim_wall_time() {

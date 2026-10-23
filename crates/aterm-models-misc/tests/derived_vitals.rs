@@ -149,6 +149,7 @@ fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
         (7, "RoleNeedsBound"),
         (8, "UnknownNeverZero"),
         (9, "ClauseNeverFlickers"),
+        (10, "LostWorkNeverNothingNeeded"),
     ] {
         let broken = interp::violated_invariants(&interp::with_buggy(&model, dial));
         assert_eq!(
@@ -181,8 +182,18 @@ fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
             s["actstart"],
             s["tabstart"],
             s["role"],
-            s["start"]
+            s["start"],
+            s["none"]
         ),
-        (1, 0, 1, 0, 1, 0)
+        (1, 0, 1, 0, 1, 0, 1)
+    );
+
+    let mut s = model.init_state();
+    for action in ["Lost", "Detect"] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!(
+        s["none"], 0,
+        "a core no coalition held is never nothing needed"
     );
 }

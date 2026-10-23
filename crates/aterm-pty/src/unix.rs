@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! POSIX backend of the PTY seam: the pty pair ([`open_pty_pair_cloexec`]), `fork` and `login_tty`, `execve`, `read`/`write` and the tty ioctls.
+//! POSIX PTY backend: [`open_pty_pair_cloexec`], `fork`, `login_tty`, `execve`, and tty ioctls.
 
 use std::ffi::CString;
 use std::io;
@@ -70,7 +70,7 @@ fn is_utf8_locale(loc: &str) -> bool {
     norm == "utf8"
 }
 
-/// The locale overrides that make the spawned child run under a UTF-8 `LC_CTYPE`. aterm's parser is UTF-8-only, and a program under a non-UTF-8 `LC_CTYPE` turns multibyte text into a `?` per character.
+/// Returns locale overrides ensuring the spawned child runs under a UTF-8 `LC_CTYPE`.
 #[must_use]
 pub fn resolve_spawn_locale(
     lc_all: Option<&str>,
@@ -96,7 +96,9 @@ const PTS_NAME_LEN: usize = 128;
 fn pts_name(master: libc::c_int) -> io::Result<CString> {
     let mut buf = [0 as libc::c_char; PTS_NAME_LEN];
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    // SAFETY: `TIOCPTYGNAME` is an `_IOC_OUT` ioctl whose payload size is exactly `PTS_NAME_LEN`; `buf` is a live, owned buffer of precisely that size, and the kernel NUL-terminates the name it writes into it.
+    // SAFETY: `TIOCPTYGNAME` is an `_IOC_OUT` ioctl whose payload size is exactly
+    // `PTS_NAME_LEN`; `buf` is a live, owned buffer of precisely that size, and the kernel
+    // NUL-terminates the name it writes into it.
     let rc = unsafe {
         libc::ioctl(
             master,
@@ -109,13 +111,13 @@ fn pts_name(master: libc::c_int) -> io::Result<CString> {
         return Err(io::Error::last_os_error());
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    // SAFETY: `buf` is a live, owned buffer and we pass its exact length; `ptsname_r` either NUL-terminates within that length or fails (ERANGE).
+    // SAFETY: `buf` is a live owned buffer of `buf.len()` bytes that `ptsname_r` NUL-terminates.
     let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     if rc != 0 {
         return Err(ptsname_r_error(rc));
     }
-    // SAFETY: `rc == 0` means the primitive wrote a NUL-terminated path into `buf`, which is live for this borrow; `to_owned` copies it out at once.
+    // SAFETY: `rc == 0` guarantees `buf` holds a NUL-terminated string live for this borrow.
     Ok(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_owned())
 }
 
@@ -131,9 +133,7 @@ fn ptsname_r_error(rc: libc::c_int) -> io::Error {
 fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `master` is a live `/dev/ptmx` descriptor. `TIOCGPTPEER` takes
-        // its argument by value (an `open(2)` flag word, not a pointer) and
-        // returns a fresh descriptor or -1, writing through no memory we own.
+        // SAFETY: `master` is a live ptmx fd and `TIOCGPTPEER` takes its flag word by value.
         let peer = unsafe {
             libc::ioctl(
                 master,
@@ -151,7 +151,7 @@ fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     const NAME_STEP: &str = "ptsname_r";
     let name = pts_name(master).map_err(|err| pty_step_failed(NAME_STEP, err))?;
-    // SAFETY: `name` is the NUL-terminated pts path the kernel just reported for `master`; `open` reads it and returns a fresh fd or -1.
+    // SAFETY: `name` is a NUL-terminated pts path; `open` reads it and returns a fresh fd or -1.
     let slave = unsafe {
         libc::open(
             name.as_ptr(),
@@ -168,7 +168,7 @@ fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
 }
 
 fn fd_is_cloexec_or_make_it(fd: libc::c_int) -> bool {
-    // SAFETY: `fd` is a descriptor the caller just opened and still owns; `F_GETFD`/`F_SETFD` only read and write the descriptor-flag word.
+    // SAFETY: `fd` is an open owned descriptor; `F_GETFD`/`F_SETFD` only access descriptor flags.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags == -1 {
@@ -251,7 +251,7 @@ fn open_pty_pair_cloexec(
         return Err(err);
     }
 
-    // SAFETY: `master` is a live /dev/ptmx descriptor; both calls are ioctls on it and write nothing through any pointer we own.
+    // SAFETY: `master` is a live ptmx fd; `grantpt` and `unlockpt` take no pointer arguments.
     let refused = unsafe {
         if libc::grantpt(master) != 0 {
             Some("grantpt")
@@ -291,13 +291,13 @@ fn open_pty_pair_cloexec(
     }
 
     if let Some(t) = termp {
-        // SAFETY: `t` is a live, fully-initialized termios and `slave` is a freshly-opened pts; `tcsetattr` only reads through the pointer.
+        // SAFETY: `t` is an initialized `termios` and `slave` is a live pts fd.
         unsafe {
             libc::tcsetattr(slave, libc::TCSAFLUSH, ptr::from_ref(t));
         }
     }
     if let Some(w) = winp {
-        // SAFETY: `w` is a live, fully-initialized winsize; `TIOCSWINSZ` reads exactly that struct through the pointer.
+        // SAFETY: `w` is an initialized `winsize` read by `TIOCSWINSZ` on `slave`.
         unsafe {
             libc::ioctl(slave, libc::TIOCSWINSZ, ptr::from_ref(w));
         }
@@ -305,7 +305,7 @@ fn open_pty_pair_cloexec(
     Ok((master, slave))
 }
 
-/// A bare PTY pair `(master, slave)`, both ends close-on-exec from birth ([`open_pty_pair_cloexec`] with no termios or winsize), for a caller that needs a pair and no child.
+/// Opens a bare `(master, slave)` PTY pair with `FD_CLOEXEC` set on both ends.
 pub fn open_pty_pair() -> io::Result<(i32, i32)> {
     open_pty_pair_cloexec(None, None)
 }
@@ -314,7 +314,7 @@ fn kernel_default_termios() -> Option<libc::termios> {
     static DEFAULTS: std::sync::OnceLock<Option<libc::termios>> = std::sync::OnceLock::new();
     *DEFAULTS.get_or_init(|| {
         let (m, s) = open_pty_pair_cloexec(None, None).ok()?;
-        // SAFETY: `s`/`m` are the live pair just opened and owned here; `tcgetattr` only fills the zeroed out-param, and both are closed before this returns on every path.
+        // SAFETY: `s` and `m` are live owned fds closed before return; `t` is a valid out-param.
         unsafe {
             let mut t: libc::termios = std::mem::zeroed();
             let ok = libc::tcgetattr(s, &mut t) == 0;
@@ -327,7 +327,7 @@ fn kernel_default_termios() -> Option<libc::termios> {
 
 fn build_spawn_termios(mut t: libc::termios) -> libc::termios {
     t.c_iflag |= libc::IUTF8;
-    // SAFETY: `cfsetspeed` only writes the speed fields (and, on Linux, CBAUD bits) of the valid, stack-owned `t`.
+    // SAFETY: `cfsetspeed` only writes the speed fields of the valid stack-owned `t`.
     unsafe {
         libc::cfsetspeed(&mut t, libc::B230400);
     }
@@ -338,19 +338,6 @@ fn spawn_termios() -> Option<libc::termios> {
     kernel_default_termios().map(build_spawn_termios)
 }
 
-/// How long a spawn waits for its child's exec verdict: a hang detector,
-/// never a latency budget. A start that must happen is waited for. A child
-/// that cannot exec writes its failure byte before it exits, so a real
-/// failure is reported at once, however long this is. The bound keeps a
-/// leaked write end (whose EOF never comes) from hanging a spawn for good,
-/// and such a spawn fails closed.
-///
-/// Measured 2026-10-22: `supervise_turn_end_live_headless` in eight binaries
-/// at nice 20 beside 28 CPU hogs, the machine at 1-minute load 71 to 232.
-/// With 10 s here, 55 instance boots failed `spawn failed: `/bin/sh` did not
-/// start within 10 s`, and 49 of the 96 tests with them. The shells were
-/// starved, not hung: with 60 s, 93 of 96 passed at load 34 to 187 and no
-/// boot failed (docs/measured/typing-under-load-2026-10-22.md).
 const EXEC_START_HANG: std::time::Duration = crate::START_HANG;
 
 const EXEC_STATUS_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -390,13 +377,13 @@ fn note_racy_exec_status_carrier(why: &io::Error) {
 }
 
 fn fd_is_cloexec(fd: libc::c_int) -> bool {
-    // SAFETY: `fd` is a descriptor the caller just opened and still owns; `F_GETFD` only reads the descriptor-flag word.
+    // SAFETY: `fd` is an open owned descriptor; `F_GETFD` only reads the descriptor-flag word.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     flags != -1 && flags & libc::FD_CLOEXEC != 0
 }
 
 fn fd_set_nonblocking(fd: libc::c_int) -> bool {
-    // SAFETY: `fd` is a descriptor the caller just opened and still owns; `F_GETFL`/`F_SETFL` only read and write the file-status flag word.
+    // SAFETY: `fd` is an open owned descriptor; `F_GETFL`/`F_SETFL` only access status flags.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         flags != -1 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
@@ -425,7 +412,7 @@ fn exec_status_fifo_path() -> io::Result<CString> {
 
     let mut path = exec_status_fifo_dir().to_vec();
     let mut rnd = [0u8; 8];
-    // SAFETY: `getentropy` fills exactly the 8-byte buffer it is given (its documented limit is 256 bytes) and returns 0 on success.
+    // SAFETY: `getentropy` fills the 8-byte `rnd` buffer (within its 256-byte limit).
     let entropy_ok =
         unsafe { libc::getentropy(rnd.as_mut_ptr().cast::<libc::c_void>(), rnd.len()) } == 0;
     let unpredictable = if entropy_ok {
@@ -451,7 +438,7 @@ fn exec_status_fifo_path() -> io::Result<CString> {
 
 #[cfg(target_os = "macos")]
 fn fifo_ends_are_one_private_object(rd: libc::c_int, wr: libc::c_int) -> bool {
-    // SAFETY: both are live descriptors this function just opened; `fstat` writes exactly one `stat` through each pointer, and `geteuid` takes none.
+    // SAFETY: `rd` and `wr` are live fds; `fstat` fills valid `stat` structs and `geteuid` is safe.
     unsafe {
         let mut a: libc::stat = std::mem::zeroed();
         let mut b: libc::stat = std::mem::zeroed();
@@ -475,7 +462,7 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
     );
     for _attempt in 0..4 {
         let path = exec_status_fifo_path()?;
-        // SAFETY: `path` is a NUL-terminated path; `mkfifo` reads it and creates a fifo, or returns -1.
+        // SAFETY: `path` is a valid NUL-terminated path read by `mkfifo`.
         if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
             last = io::Error::last_os_error();
             if last.kind() == io::ErrorKind::AlreadyExists {
@@ -487,7 +474,7 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
         unsafe {
             libc::chmod(path.as_ptr(), 0o600);
         }
-        // SAFETY: `path` is the fifo we just created; `open` reads the path and returns a fresh descriptor or -1.
+        // SAFETY: `path` is a valid NUL-terminated fifo path read by `open`.
         let rd = unsafe {
             libc::open(
                 path.as_ptr(),
@@ -511,8 +498,7 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
         };
         if wr < 0 {
             let err = io::Error::last_os_error();
-            // SAFETY: closing the read end we opened in (3) and removing the
-            // name we created in (1). Nothing else was created.
+            // SAFETY: closing `rd` opened in (3) and unlinking `path` created in (1).
             unsafe {
                 libc::close(rd);
                 libc::unlink(path.as_ptr());
@@ -542,7 +528,7 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
     #[cfg(target_os = "linux")]
     let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> = {
         let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is a valid 2-element buffer; `pipe2` fills exactly it and applies the flag word to both descriptors as it creates them.
+        // SAFETY: `fds` is a valid 2-int buffer filled by `pipe2` with `O_CLOEXEC`.
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
             let (rd, wr) = (fds[0], fds[1]);
             if fd_is_cloexec(rd) && fd_is_cloexec(wr) {
@@ -621,7 +607,7 @@ enum ExecStatus {
 fn read_exec_status_now(rd: libc::c_int) -> Option<ExecStatus> {
     let mut byte = [0u8; 1];
     loop {
-        // SAFETY: `rd` is the parent's live read end; `byte` is a 1-byte buffer and `read` writes at most the 1 byte it is asked for.
+        // SAFETY: `rd` is a live read fd and `byte` is a 1-byte buffer.
         let n = unsafe { libc::read(rd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
         if n > 0 {
             return Some(ExecStatus::FailedBeforeExec(byte[0]));
@@ -640,7 +626,7 @@ fn read_exec_status_now(rd: libc::c_int) -> Option<ExecStatus> {
 
 fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
     if fd >= 0 && (fd as usize) < libc::FD_SETSIZE {
-        // SAFETY: `set` is a zeroed `fd_set` and `fd` is verified in range for its bitmap, so `FD_SET` writes within it; `select` reads and writes only `set` and `tv`.
+        // SAFETY: `fd` is in `0..FD_SETSIZE`, and `set` and `tv` are valid initialized locals.
         unsafe {
             let mut set: libc::fd_set = std::mem::zeroed();
             libc::FD_SET(fd, &mut set);
@@ -652,7 +638,7 @@ fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
         }
         return;
     }
-    // SAFETY: `ts` is a fully-initialized timespec; `nanosleep` reads it and writes nothing through the null remainder pointer.
+    // SAFETY: `ts` is an initialized `timespec` and the remainder pointer is null.
     unsafe {
         let ts = libc::timespec {
             tv_sec: slice.as_secs() as libc::time_t,
@@ -691,7 +677,7 @@ pub(crate) mod pre_exec_stall {
             tv_sec: libc::time_t::try_from(ms / 1000).unwrap_or(libc::time_t::MAX),
             tv_nsec: libc::c_long::try_from((ms % 1000) * 1_000_000).unwrap_or(0),
         };
-        // SAFETY: `ts` is a fully-initialized timespec; `nanosleep` reads it and writes nothing through the null remainder pointer.
+        // SAFETY: `ts` is an initialized `timespec` and the remainder pointer is null.
         unsafe {
             libc::nanosleep(&ts, std::ptr::null_mut());
         }
@@ -756,7 +742,7 @@ impl SpawnKit {
                 status_wr,
             }),
             Err(err) => {
-                // SAFETY: closing the two channel ends opened above; no pty exists, since `open_pty_pair_cloexec` fails closed.
+                // SAFETY: closing the two channel ends opened above after pty open failed.
                 unsafe {
                     libc::close(status_rd);
                     libc::close(status_wr);
@@ -767,7 +753,7 @@ impl SpawnKit {
     }
 
     fn size(&self, w: &libc::winsize) {
-        // SAFETY: `w` is a live, fully-initialized winsize; `TIOCSWINSZ` reads exactly that struct through the pointer, on a slave this kit owns.
+        // SAFETY: `w` is an initialized `winsize` for `TIOCSWINSZ` on the owned `self.slave`.
         unsafe {
             libc::ioctl(self.slave, libc::TIOCSWINSZ, ptr::from_ref(w));
         }
@@ -781,7 +767,7 @@ impl SpawnKit {
 
 impl Drop for SpawnKit {
     fn drop(&mut self) {
-        // SAFETY: the four descriptors this kit opened and still owns: an unused kit, whose ends no spawn took.
+        // SAFETY: closing the four descriptors exclusively owned by this unused kit.
         unsafe {
             libc::close(self.master);
             libc::close(self.slave);
@@ -864,7 +850,7 @@ fn retire_spent(fd: libc::c_int) {
     }
 }
 
-/// The folder a child spawned with no `cwd` `chdir`s into before `exec`: `$HOME` for a process whose own folder is `/` (an app started from Finder or launchd), else none, and the child stays in this process's folder.
+/// Returns `$HOME` when the current working directory is `/`, or `None` otherwise.
 pub fn default_start_folder() -> Option<std::ffi::OsString> {
     if std::env::current_dir().ok().as_deref() == Some(std::path::Path::new("/")) {
         std::env::var_os("HOME")
@@ -873,7 +859,7 @@ pub fn default_start_folder() -> Option<std::ffi::OsString> {
     }
 }
 
-/// Open spawn kits until `depth` are ready, and close the channel ends spawns left since the last call.
+/// Opens spawn kits until `depth` are ready and closes spent status descriptors.
 pub fn fill_spawn_kits(depth: usize) -> io::Result<usize> {
     fill_kits(kit_pool(), depth)
 }
@@ -920,7 +906,7 @@ fn fill_kits(kits: &std::sync::Mutex<KitPool>, depth: usize) -> io::Result<usize
     Ok(opened)
 }
 
-/// Spawn the shell in a fresh PTY of `rows`×`cols`, returning the master fd and the child pid (see [`SpawnedShell`]).
+/// Spawns a shell in a fresh `rows`×`cols` PTY, returning [`SpawnedShell`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_shell_with_pid(
     rows: u16,
@@ -1122,11 +1108,11 @@ pub fn spawn_shell_with_pid_cell_px(
     };
     let (master, slave, status_rd, status_wr) = kit.into_raw();
     let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
-    // SAFETY: `fork` takes no arguments and returns the child pid in the parent, 0 in the child, or -1 on failure.
+    // SAFETY: `fork` takes no arguments and returns child pid, 0, or -1.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
-        // SAFETY: closing the pty pair and the two pipe fds (fork failed, so there is no child holding a copy of any of them).
+        // SAFETY: fork failed, so no child exists; closing the four owned descriptors.
         unsafe {
             libc::close(slave);
             libc::close(master);
@@ -1140,9 +1126,7 @@ pub fn spawn_shell_with_pid_cell_px(
         unsafe {
             libc::close(status_rd);
         }
-        // SAFETY: `slave` is this child's inherited pty slave fd; `login_tty`,
-        // `dup2` and `close` are all async-signal-safe. Nothing allocates, takes
-        // a lock, or reads the environment.
+        // SAFETY: `slave` is the child's inherited pty fd; `login_tty`/`dup2`/`close` are a-s-safe.
         unsafe {
             if libc::login_tty(slave) == -1 {
                 libc::dup2(slave, libc::STDIN_FILENO);
@@ -1153,7 +1137,7 @@ pub fn spawn_shell_with_pid_cell_px(
                 }
             }
         }
-        // SAFETY: sigaction / sigemptyset / sigprocmask are async-signal-safe; the sigaction/sigset values are stack-local and fully initialized by zeroed() + sigemptyset before use; no allocation, no locks.
+        // SAFETY: `sa` and `empty` are zeroed/initialized locals; signal calls are a-s-safe.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = libc::SIG_DFL;
@@ -1176,7 +1160,7 @@ pub fn spawn_shell_with_pid_cell_px(
         }
         inherit_strip.apply();
         if limits.apply(sandbox_cap).is_err() {
-            // SAFETY: `write`/`_exit` are async-signal-safe; b'S' tells the parent the sandbox failed.
+            // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack local.
             unsafe {
                 let b: u8 = b'S';
                 libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
@@ -1204,7 +1188,8 @@ pub fn spawn_shell_with_pid_cell_px(
         }
         #[cfg(test)]
         pre_exec_stall::in_child();
-        // SAFETY: exec_target/argv/envp are null-terminated arrays of live C strings that outlive the call; `write`/`_exit` are async-signal-safe.
+        // SAFETY: `exec_target` is a live C string, and `argv` and `envp` null-terminated arrays
+        // of live C strings, all outliving the call; `write`/`_exit` are async-signal-safe.
         unsafe {
             libc::execve(exec_target.as_ptr(), argv.as_ptr(), envp.as_ptr());
             let b: u8 = b'E';
@@ -1212,7 +1197,7 @@ pub fn spawn_shell_with_pid_cell_px(
             libc::_exit(127);
         }
     }
-    // SAFETY: `slave` is the parent's own copy of the pty slave fd (pid > 0 here, so the child has its own); `close` releases just this copy.
+    // SAFETY: `slave` is the parent's copy of the pty slave fd; `close` releases this copy.
     unsafe {
         libc::close(slave);
     }
@@ -1259,7 +1244,7 @@ pub fn spawn_shell_with_pid_cell_px(
         )),
     };
     if let Some((kind, what)) = failure {
-        // SAFETY: `pid` is this call's own child and `master` the parent's pty master fd; `kill` posts a signal and `close` releases one descriptor.
+        // SAFETY: `pid` is this call's child and `master` is the parent's owned pty master fd.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::close(master);
@@ -1275,13 +1260,13 @@ pub fn hangup(pid: i32) {
     if pid <= 1 {
         return;
     }
-    // SAFETY: `killpg` only posts SIGHUP to the group, the child's own job tree; an error (an already-reaped child) is ignored.
+    // SAFETY: `killpg` posts `SIGHUP` to the child's process group and takes no pointers.
     unsafe {
         libc::killpg(pid, libc::SIGHUP);
     }
 }
 
-/// The kernel's start time for `pid`, an opaque number that differs between two processes that held the same pid: what a [`ShellIdentity`] records and re-reads.
+/// Returns the kernel start time for `pid` recorded and verified by [`ShellIdentity`].
 #[must_use]
 pub fn process_birth(pid: i32) -> Option<u64> {
     if pid <= 1 {
@@ -1294,7 +1279,7 @@ pub fn process_birth(pid: i32) -> Option<u64> {
 fn process_birth_platform(pid: i32) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote and reads nothing through the pointer.
+    // SAFETY: `info` points to `size` writable bytes matching `PROC_PIDTBSDINFO`.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -1338,7 +1323,7 @@ fn is_unreaped_child(pid: i32) -> bool {
         return false;
     };
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    // SAFETY: `waitid` writes at most one `siginfo_t` through the valid pointer; `WNOWAIT` leaves any waitable status in place, so this reaps nothing.
+    // SAFETY: `info` is a valid `siginfo_t` out-param and `WNOWAIT` leaves child state intact.
     let rc = unsafe {
         libc::waitid(
             libc::P_PID,
@@ -1350,17 +1335,17 @@ fn is_unreaped_child(pid: i32) -> bool {
     rc == 0
 }
 
-/// Record the identity of a shell this process just spawned ([`spawn_shell_with_pid`]'s `pid`), before anything could reap it.
+/// Records the [`ShellIdentity`] of a shell this process just spawned.
 #[must_use]
 pub fn record_spawned_shell(pid: i32) -> ShellIdentity {
     ShellIdentity::from_parts(pid, process_birth(pid), true)
 }
 
-/// Record the identity of a shell adopted with its PTY master (the seamless-update handoff), proving first that `pid` is still the shell on that PTY: `tcgetsid(master) == pid`.
+/// Records the [`ShellIdentity`] of an adopted shell after verifying `tcgetsid(master) == pid`.
 #[must_use]
 pub fn record_adopted_shell(pid: i32, master: i32) -> ShellIdentity {
     let leads_the_pty = || {
-        // SAFETY: `tcgetsid` is a read-only `TIOCGSID` ioctl on a descriptor the caller holds; a bad descriptor answers -1.
+        // SAFETY: `tcgetsid` is a read-only `TIOCGSID` ioctl on a caller-held descriptor.
         master >= 0 && pid > 1 && unsafe { libc::tcgetsid(master) } == pid
     };
     let birth = if leads_the_pty() {
@@ -1372,7 +1357,7 @@ pub fn record_adopted_shell(pid: i32, master: i32) -> ShellIdentity {
 }
 
 impl ShellIdentity {
-    /// Whether [`Self::pid`] still names the shell this identity was recorded for; every signal sent by pid asks immediately before it is sent.
+    /// Returns whether [`Self::pid`] still names the shell this identity was recorded for.
     #[must_use]
     pub fn verify(&self) -> bool {
         if self.pid <= 1 {
@@ -1397,19 +1382,19 @@ pub fn hangup_shell(identity: &ShellIdentity, master: i32) -> ShellHangup {
     if master < 0 {
         return ShellHangup::Nothing;
     }
-    // SAFETY: `tcgetpgrp` is a read-only ioctl on a descriptor the caller holds; a bad descriptor answers -1.
+    // SAFETY: `tcgetpgrp` is a read-only ioctl on a caller-held descriptor.
     let foreground = unsafe { libc::tcgetpgrp(master) };
     if foreground <= 1 {
         return ShellHangup::Nothing;
     }
-    // SAFETY: `killpg` posts SIGHUP to the terminal's own foreground group, read from the master just above; it takes no pointers.
+    // SAFETY: `killpg` posts `SIGHUP` to the foreground process group and takes no pointers.
     unsafe {
         libc::killpg(foreground, libc::SIGHUP);
     }
     ShellHangup::Foreground(foreground)
 }
 
-/// Collect an exited child's status without blocking, at the PTY-exit edge, before [`reap`] runs on the teardown thread and discards it. aterm installs no `SIGCHLD` handler, so between the reader's EOF and the session's drop the child is a collectable zombie.
+/// Non-blockingly collects an exited child's status before [`reap`] discards it.
 #[must_use]
 pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
     if pid <= 1 {
@@ -1429,12 +1414,12 @@ pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
     None
 }
 
-/// [`reap_shell`] for a pid the caller knows is its own unreaped child (a spawn that failed half-way, a test).
+/// Runs [`reap_shell`] for an unreaped child `pid` owned by the caller.
 pub fn reap(pid: i32) {
     reap_shell(ShellIdentity::from_parts(pid, None, true));
 }
 
-/// Reap a session's shell without ever blocking unboundedly, on the detached teardown thread after [`hangup_shell`].
+/// Reaps a session's shell on the teardown thread after [`hangup_shell`].
 pub fn reap_shell(identity: ShellIdentity) {
     reap_shell_scheduled(
         identity,
@@ -1470,13 +1455,11 @@ fn reap_shell_scheduled(
     for tick in 0..deadline {
         // Distinct branch.
         if !identity.verify() {
-            // Distinct branch.
             return;
         }
         // SAFETY: `WNOHANG` `waitpid`; `&mut status` is a valid out-param.
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
-            // Distinct branch.
             return;
         }
         #[cfg(any(test, debug_assertions))]
@@ -1486,7 +1469,7 @@ fn reap_shell_scheduled(
             }
         }
         if Some(tick) == kill_at && identity.verify() {
-            // SAFETY: best-effort signal post to the verified shell's own process group; it takes no pointers.
+            // SAFETY: `killpg` posts `SIGKILL` to the verified shell's process group.
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
@@ -1546,7 +1529,7 @@ impl Drop for InGrace {
     }
 }
 
-/// Wait, at most `bound`, until every [`reap_shell`] in flight has settled its shell or sent its SIGKILL; `true` when they all have.
+/// Waits up to `bound` until every in-flight [`reap_shell`] settles or sends `SIGKILL`.
 pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
     let in_grace = IN_GRACE
         .lock()
@@ -1560,7 +1543,7 @@ pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
 #[cfg(any(test, debug_assertions))]
 static HOLD_REAP_KILLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Test seam (a debug build's, for other crates' tests): until the returned guard drops, every [`reap_shell`] in this process stays in its grace at its SIGKILL tick, so a test can read "a closed tab's reap is in its grace" without racing the ~250 ms grace.
+/// Test seam holding every [`reap_shell`] in its grace window until the guard drops.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn hold_reap_kills_for_test() -> ReapKillHold {
@@ -1717,7 +1700,7 @@ const fn classify_write_result(r: isize, is_eintr: bool) -> WriteStep {
     }
 }
 
-/// Write all of `bytes` to the PTY master, retrying short writes and `EINTR` (dropping the rest would lose terminal input).
+/// Writes all of `bytes` to the PTY master, retrying short writes and `EINTR`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1737,7 +1720,7 @@ const fn classify_write_result(r: isize, is_eintr: bool) -> WriteStep {
 pub fn write_all(master: i32, bytes: &[u8]) {
     let mut data = bytes;
     while !data.is_empty() {
-        // SAFETY: `master` is a PTY master fd from `spawn_shell`; `data` is a valid slice of `data.len()` bytes.
+        // SAFETY: `master` is a valid PTY master fd and `data` is a valid slice.
         let r = unsafe { libc::write(master, data.as_ptr() as *const libc::c_void, data.len()) };
         let is_eintr = r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted;
         match classify_write_result(r, is_eintr) {
@@ -1748,14 +1731,14 @@ pub fn write_all(master: i32, bytes: &[u8]) {
     }
 }
 
-/// Write `bytes` to the PTY master with a single `write(2)` (retrying only `EINTR`), returning how many bytes the kernel accepted, so a sink (aterm-session's `SinkWriter`) applies real backpressure instead of dropping the tail.
+/// Writes `bytes` to the PTY master with a single `write(2)` (retrying `EINTR`).
 #[inline]
 pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
     if bytes.is_empty() {
         return Ok(0);
     }
     loop {
-        // SAFETY: `master` is a PTY master fd from `spawn_shell`; `bytes` is a valid slice of `bytes.len()` bytes.
+        // SAFETY: `master` is a valid PTY master fd and `bytes` is a valid slice.
         let r = unsafe { libc::write(master, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -1768,17 +1751,17 @@ pub fn write_some(master: i32, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// Unix twin of the Windows `as_reply`, which lets the terminal's answers to queries pass a ConPTY session's resize guard: a PTY has no such guard, so this is `write()`.
+/// Unix twin of Windows `as_reply`; invokes `write()` directly.
 #[inline]
 pub fn as_reply<T>(write: impl FnOnce() -> T) -> T {
     write()
 }
 
-/// Unix twin of the Windows `settle_input`, which runs a ConPTY session's resize-guard client before an input writer takes the lock the terminal's answers need: a PTY has no such guard, so this does nothing.
+/// Unix twin of Windows `settle_input`; a no-op on POSIX PTYs.
 #[inline]
 pub const fn settle_input(_master: i32) {}
 
-/// A single non-parking `write(2)`, classified for aterm-session's `SinkWriter::write_frame_nonparking`, which must tell `WouldBlock` from a fatal error without dropping an `io::Error`.
+/// Outcome of a single non-parking `write(2)` in [`write_some_nonparking`].
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum NonParkWrite {
@@ -1800,7 +1783,7 @@ pub fn write_some_nonparking(master: i32, bytes: &[u8]) -> NonParkWrite {
         return NonParkWrite::Closed;
     }
     loop {
-        // SAFETY: identical to `write_some` — `master` is a PTY master fd; `bytes` is a valid slice of `bytes.len()` bytes.
+        // SAFETY: `master` is a valid PTY master fd and `bytes` is a valid slice.
         let r = unsafe { libc::write(master, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -1839,10 +1822,10 @@ pub fn poll_writable(fd: i32, timeout_ms: i32) -> io::Result<bool> {
     }
 }
 
-/// Duplicate an fd into an [`std::os::fd::OwnedFd`] the caller owns: the same open file description with an independent lifetime, so a detached thread (the sink's spill drainer) keeps naming the PTY even if the original fd number is closed and recycled.
+/// Duplicates `fd` with `F_DUPFD_CLOEXEC` into an owned [`std::os::fd::OwnedFd`].
 #[inline]
 pub fn dup_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
-    // SAFETY: `fcntl(F_DUPFD_CLOEXEC, 0)` returns a fresh descriptor or -1; the negative return is checked before `from_raw_fd`.
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC, 0)` returns a fresh fd or -1, checked before `from_raw_fd`.
     let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if d < 0 {
         return Err(io::Error::last_os_error());
@@ -1851,7 +1834,7 @@ pub fn dup_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(d) })
 }
 
-/// Toggle `O_NONBLOCK` on the PTY master, so [`write_some`] returns [`io::ErrorKind::WouldBlock`] when the input buffer is full instead of blocking.
+/// Toggles `O_NONBLOCK` on the PTY master descriptor.
 pub fn set_nonblocking(master: i32, nonblocking: bool) -> io::Result<()> {
     // SAFETY: `master` is a valid fd; `F_GETFL`/`F_SETFL` only read/modify flags.
     let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
@@ -1897,7 +1880,7 @@ pub fn set_cloexec(fd: i32, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// The size the kernel holds for this PTY (`TIOCGWINSZ` on the master), `(rows, cols)`, or `None` off a tty or at 0 x 0: what the child reads, so a host that briefly sets another size (the repaint nudge) can verify it put the size back.
+/// Returns the kernel `(rows, cols)` size (`TIOCGWINSZ`) of `master`, or `None` if unset.
 #[must_use]
 pub fn size(master: i32) -> Option<(u16, u16)> {
     if master < 0 {
@@ -1905,33 +1888,36 @@ pub fn size(master: i32) -> Option<(u16, u16)> {
     }
     // SAFETY: `libc::winsize` is a plain struct of integer fields; all zeros is a valid value.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: `master` may be any integer; the ioctl fails cleanly on a bad or non-tty fd, and `ws` is a valid out-param on success.
+    // SAFETY: `master` may be any integer: the ioctl fails cleanly on a bad or non-tty fd, and
+    // `ws` is a valid `winsize` out-param on success.
     let rc = unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut ws) };
     (rc == 0 && (ws.ws_row, ws.ws_col) != (0, 0)).then_some((ws.ws_row, ws.ws_col))
 }
 
-/// Whether `fd` is a tty (`TIOCGWINSZ` succeeds): a sanity check on the seamless re-exec's incoming side, not its authenticity gate.
+/// Returns whether `fd` responds to `TIOCGWINSZ` as a terminal.
 #[must_use]
 pub fn fd_is_tty(fd: i32) -> bool {
     if fd < 0 {
         return false;
     }
-    // SAFETY: `libc::winsize` is a plain struct of integer fields (rows/cols/pixels); an all-zeros bit pattern is a valid, fully-initialized value.
+    // SAFETY: `libc::winsize` is a plain integer struct; all zeros is a valid value.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` may be any integer; `ioctl` fails cleanly (rc<0) on a bad/non-tty fd and `ws` is a valid winsize out-param on success.
+    // SAFETY: `fd` may be any integer: the ioctl fails cleanly on a bad or non-tty fd, and `ws`
+    // is a valid `winsize` out-param on success.
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
     rc == 0
 }
 
-/// The slave's ECHO and ICANON bits, and its signal characters while ISIG is set, read through the master ([`crate::TtyEcho`]).
+/// Reads the slave's `ECHO`, `ICANON`, and `ISIG` signal characters via `fd` ([`crate::TtyEcho`]).
 #[must_use]
 pub fn tty_echo(fd: i32) -> Option<crate::TtyEcho> {
     if fd < 0 {
         return None;
     }
-    // SAFETY: `libc::termios` is a plain struct of integer fields and a `c_cc` byte array; an all-zeros bit pattern is a valid, fully-initialized value.
+    // SAFETY: `libc::termios` is a plain integer/byte-array struct; all zeros is valid.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` may be any integer; `tcgetattr` fails cleanly (rc != 0, EBADF/ENOTTY) on a bad or non-tty fd and fills `t` on success.
+    // SAFETY: `fd` may be any integer: `tcgetattr` fails cleanly on a bad or non-tty fd, and `t`
+    // is a valid `termios` out-param on success.
     let rc = unsafe { libc::tcgetattr(fd, &mut t) };
     if rc != 0 {
         return None;
@@ -1952,15 +1938,16 @@ pub fn tty_echo(fd: i32) -> Option<crate::TtyEcho> {
     })
 }
 
-/// Whether the slave's line discipline hands every byte written into this PTY to the program's input queue, so a queue holding fewer bytes than were written means the program read some.
+/// Returns whether the slave line discipline passes every written byte to the input queue.
 #[must_use]
 pub fn tty_passes_every_byte(fd: i32) -> Option<bool> {
     if fd < 0 {
         return None;
     }
-    // SAFETY: `libc::termios` is a plain struct of integer fields and a `c_cc` byte array; an all-zeros bit pattern is a valid, fully-initialized value.
+    // SAFETY: `libc::termios` is a plain integer/byte-array struct; all zeros is valid.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` may be any integer; `tcgetattr` fails cleanly (rc != 0, EBADF/ENOTTY) on a bad or non-tty fd and fills `t` on success.
+    // SAFETY: `fd` may be any integer: `tcgetattr` fails cleanly on a bad or non-tty fd, and `t`
+    // is a valid `termios` out-param on success.
     let rc = unsafe { libc::tcgetattr(fd, &mut t) };
     if rc != 0 {
         return None;
@@ -1974,7 +1961,7 @@ pub fn tty_passes_every_byte(fd: i32) -> Option<bool> {
 #[cfg(target_os = "macos")]
 const TIOCOUTQ: libc::c_ulong = 0x4004_7473;
 
-/// How many bytes written into this PTY the program at the slave has not read yet (`ioctl(FIONREAD)` on the master, which the Darwin driver answers from the slave's input queue).
+/// Returns unread slave input queue bytes (`FIONREAD`) on `fd`.
 #[must_use]
 pub fn input_queue_len(fd: i32) -> Option<usize> {
     #[cfg(target_os = "macos")]
@@ -1988,7 +1975,7 @@ pub fn input_queue_len(fd: i32) -> Option<usize> {
     }
 }
 
-/// How many bytes the program at the slave has written that the master has not read (`ioctl(TIOCOUTQ)` on the master).
+/// Returns unread master output queue bytes (`TIOCOUTQ`) on `fd`.
 #[must_use]
 pub fn output_queue_len(fd: i32) -> Option<usize> {
     #[cfg(target_os = "macos")]
@@ -2002,13 +1989,13 @@ pub fn output_queue_len(fd: i32) -> Option<usize> {
     }
 }
 
-/// Discard every byte written into this PTY that the program at the slave has not read (`tcflush(master, TCIFLUSH)`) and return how many there were.
+/// Flushes unread slave input bytes (`TCIFLUSH`) on `fd` and returns the flushed count.
 #[must_use]
 pub fn flush_input_queue(fd: i32) -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
         let unread = queue_len(fd, libc::FIONREAD)?;
-        // SAFETY: `fd` is a tty (checked by `queue_len` just above) and `tcflush` only discards queued data; a stale fd fails with rc < 0.
+        // SAFETY: `fd` is a verified tty fd and `tcflush` takes no pointers.
         if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } != 0 {
             return None;
         }
@@ -2019,7 +2006,7 @@ pub fn flush_input_queue(fd: i32) -> Option<usize> {
         if !fd_is_tty(fd) {
             return None;
         }
-        // SAFETY: `fd` is a tty (checked by `fd_is_tty` just above) and `tcflush` only discards queued data; a stale fd fails with rc < 0.
+        // SAFETY: `fd` is a verified tty fd and `tcflush` takes no pointers.
         if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } != 0 {
             return None;
         }
@@ -2032,12 +2019,12 @@ fn queue_len(fd: i32, request: libc::c_ulong) -> Option<usize> {
     if fd < 0 {
         return None;
     }
-    // SAFETY: `isatty` takes any integer and only asks the kernel about it; a bad or closed fd answers 0, never undefined behaviour.
+    // SAFETY: `isatty` takes an integer fd and queries the kernel without UB.
     if unsafe { libc::isatty(fd) } != 1 {
         return None;
     }
     let mut n: libc::c_int = 0;
-    // SAFETY: `request` is FIONREAD or TIOCOUTQ, both `_IOR(.., int)`: the kernel writes exactly one `c_int` through the pointer, and `n` is a live `c_int` on this stack.
+    // SAFETY: `request` is `FIONREAD` or `TIOCOUTQ`, writing one `c_int` into `n`.
     let rc = unsafe { libc::ioctl(fd, request, &mut n) };
     if rc != 0 {
         return None;
@@ -2051,12 +2038,12 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
     unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }
 }
 
-/// A wake pipe for cancelling a parked PTY reader: `(read_end, write_end)`, both close-on-exec (they must not survive a seamless re-exec) and non-blocking ([`wake`] runs on the event loop, which a full pipe must never block).
+/// Creates a non-blocking, close-on-exec `(read_end, write_end)` wake pipe.
 pub fn make_wake_pipe() -> Option<(i32, i32)> {
     #[cfg(target_os = "linux")]
     {
         let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a valid 2-int out-array; `pipe2` applies both flags to both descriptors as it creates them.
+        // SAFETY: `fds` is a valid 2-int out-array for `pipe2`.
         (unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0)
             .then_some((fds[0], fds[1]))
     }
@@ -2094,9 +2081,9 @@ pub enum ReadOutcome {
     Data(usize),
     /// The master reached EOF / error — the child's slave closed (the shell exited).
     Eof,
-    /// The wake pipe fired: the owning `Session` dropped (tab/pane close) though the master has not EOF'd, since an orphaned child may still hold the slave.
+    /// The wake pipe fired because the owning session closed.
     Wake,
-    /// The wake-pipe-less fallback (`wake_rd < 0`) timed out with no master activity: the caller re-checks its fd-free stop flag and calls again if still live.
+    /// The wakeless poll timed out with no master activity.
     Idle,
     /// The shell's exit watch (`exit_rd`) fired.
     Exited,
@@ -2142,7 +2129,7 @@ pub fn read_or_wake(
             exit_watch,
             proc_watch,
         ];
-        // SAFETY: `fds` is a valid 3-element pollfd array for the duration of the call; a negative `fd` (no exit or process watch) is skipped by `poll`.
+        // SAFETY: `fds` is a valid 3-element `pollfd` array live for the `poll` call.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, WAKELESS_POLL_TIMEOUT_MS) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -2153,7 +2140,6 @@ pub fn read_or_wake(
             };
         }
         if r == 0 {
-            // Distinct branch.
             return ReadOutcome::Idle;
         }
         if exit_fired(&fds[1]) {
@@ -2195,7 +2181,7 @@ pub fn read_or_wake(
         proc_watch,
     ];
     loop {
-        // SAFETY: `fds` is a valid 4-element pollfd array for the duration of the call; a negative `fd` (no exit or process watch) is skipped by `poll`.
+        // SAFETY: `fds` is a valid 4-element `pollfd` array live for the `poll` call.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -2211,14 +2197,12 @@ pub fn read_or_wake(
             return ReadOutcome::Exited;
         }
         if fds[2].revents != 0 {
-            // Distinct branch.
             fds[2].fd = -1;
         }
         if proc_fired(&fds[3]) {
             return ReadOutcome::Proc;
         }
         if fds[3].revents != 0 {
-            // Distinct branch.
             fds[3].fd = -1;
         }
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -2240,12 +2224,12 @@ pub fn read_or_wake(
     }
 }
 
-/// Top up `buf` past an initial [`read_or_wake`] read. macOS caps every master `read` at ~1 KiB (the tty output-queue high-water mark), so gathering many chunks into one batch amortizes every downstream per-read cost.
+/// Tops up `buf` with immediately available bytes after an initial [`read_or_wake`] read.
 pub fn drain_more(master: i32, buf: &mut [u8], filled: usize) -> usize {
     drain_more_watched(master, buf, filled, -1, &mut |_| false)
 }
 
-/// [`drain_more`] with the session's process watch `proc_rd` (`-1`: none) in each of its polls, before the master: when the watch is readable, `heard(filled)` runs at that offset, before any byte read after the poll (the host drains the watch there), and `true` ends the batch.
+/// [`drain_more`] polling `proc_rd` before `master` and invoking `heard(filled)` when readable.
 pub fn drain_more_watched(
     master: i32,
     buf: &mut [u8],
@@ -2270,7 +2254,7 @@ pub fn drain_more_watched(
                 revents: 0,
             },
         ];
-        // SAFETY: `fds` is a valid 2-element pollfd array for the duration of the call; a negative `fd` is ignored.
+        // SAFETY: `fds` is a valid 2-element `pollfd` array live for the `poll` call.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
         if r > 0 && proc_fired(&fds[0]) {
             proven = true;
@@ -2283,7 +2267,6 @@ pub fn drain_more_watched(
         if r > 0 && fds[1].revents & libc::POLLIN != 0 {
             let n = read(master, &mut buf[filled..]);
             if n <= 0 {
-                // Distinct branch.
                 break;
             }
             filled += n as usize;
@@ -2352,7 +2335,6 @@ fn end_poll(master: i32, proc_rd: i32) -> EndPoll {
         return EndPoll::Proc;
     }
     if fds[0].revents != 0 {
-        // Distinct branch.
         return EndPoll::Unknown;
     }
     let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -2440,15 +2422,12 @@ fn bridge_poll(master: i32, wake_rd: i32, proc_rd: i32, timeout_ms: i32) -> Brid
     // SAFETY: polling fds this gather owns, with a bounded timeout.
     let r = unsafe { libc::poll(fds.as_mut_ptr(), 3, timeout_ms) };
     if r == 0 {
-        // Distinct branch.
         return BridgeWait::Quiet;
     }
     if r < 0 {
-        // Distinct branch.
         return BridgeWait::Deliver;
     }
     if fds[1].revents != 0 {
-        // Distinct branch.
         return BridgeWait::Deliver;
     }
     if proc_fired(&fds[2]) {
@@ -2514,16 +2493,13 @@ fn idle_refill_wait(master: i32, wake_rd: i32, proc_rd: i32, wait_us: u32) -> Br
         break (r, set);
     };
     if r == 0 {
-        // Distinct branch.
         return BridgeWait::Quiet;
     }
     if r < 0 {
-        // Distinct branch.
         return BridgeWait::Deliver;
     }
     // SAFETY: reading a set select just filled; fds are < FD_SETSIZE.
     if wake_rd >= 0 && unsafe { libc::FD_ISSET(wake_rd, &set) } {
-        // Distinct branch.
         return BridgeWait::Deliver;
     }
     // SAFETY: as above.
@@ -2537,7 +2513,7 @@ fn idle_refill_wait(master: i32, wake_rd: i32, proc_rd: i32, wait_us: u32) -> Br
     BridgeWait::Deliver
 }
 
-/// [`drain_more`] for an `O_NONBLOCK` master: `read(2)` directly to `EAGAIN`, then bridge the writer's µs refill gaps with up to `NB_SPIN_MAX` immediate re-reads (the ~0.4 µs failed `read` is the pause; a paced spin overshoots the 1-2 µs refill).
+/// Non-blocking [`drain_more`] that spins across brief writer refill gaps before polling.
 #[allow(
     clippy::too_many_arguments,
     reason = "the gather threads its owned descriptors and independent scheduling inputs explicitly"
@@ -2617,7 +2593,6 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
             continue;
         }
         if n == 0 {
-            // Distinct branch.
             break;
         }
         match io::Error::last_os_error().kind() {
@@ -2643,7 +2618,6 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
                 {
                     // Distinct branch.
                     if idle_wait_us == 0 {
-                        // Distinct branch.
                         break;
                     }
                     if at_gap(filled, false) {
@@ -2733,12 +2707,12 @@ pub fn close_fd(fd: i32) {
 /// Focus-linked shell QoS boost: a no-op on Unix.
 pub const fn set_focus_boost(_master: i32, _on: bool) {}
 
-/// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`) with the pixel fields zero; prefer [`resize_with_cell_px`] when the cell metrics are known.
+/// Resizes the PTY to `rows`×`cols` (`TIOCSWINSZ`) with zero pixel dimensions.
 pub fn resize(master: i32, rows: u16, cols: u16) {
     resize_with_cell_px(master, rows, cols, None);
 }
 
-/// [`resize`] with the winsize pixel fields filled from `cell_px` (the host's device-pixel cell size, `(width, height)`).
+/// Resizes the PTY to `rows`×`cols` with pixel dimensions computed from `cell_px`.
 pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, cell_px: Option<(u16, u16)>) {
     let (ws_xpixel, ws_ypixel) = winsize_pixels(rows, cols, cell_px);
     let ws = libc::winsize {
@@ -2747,7 +2721,7 @@ pub fn resize_with_cell_px(master: i32, rows: u16, cols: u16, cell_px: Option<(u
         ws_xpixel,
         ws_ypixel,
     };
-    // SAFETY: `master` is a valid PTY master fd; `&ws` is a valid `winsize` for the `TIOCSWINSZ` ioctl.
+    // SAFETY: `master` is a valid PTY master fd and `&ws` is a valid `winsize`.
     unsafe {
         libc::ioctl(master, libc::TIOCSWINSZ, &ws);
     }

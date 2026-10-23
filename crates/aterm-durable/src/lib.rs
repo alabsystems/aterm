@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! File and directory flush primitives: [`durable`] ([`File::sync_all`], [`durable_data`],
-//! [`durable_dir`], [`Flush::Durable`]) and [`ordered`] ([`ordered_dir`],
-//! [`Flush::ordered_if_same_device`]), with [`seam::Recording`] for test/debug inspection.
-//!
-//! Every application flushes in full, debug builds included (astream 46e7c1b's ruling):
-//! only a test binary that asks ([`plain_durable_flushes_in_tests!`]), and every process
-//! it starts, astream's broker included, takes a plain `fsync(2)` for its durable flushes
-//! in a debug build on Apple targets (`astream_sys::TEST_PLAIN_FSYNC_ENV`).
+//! File and directory flush primitives.
 
 use std::fs::File;
 use std::io;
@@ -127,7 +120,6 @@ impl Flush {
     }
 
     /// Finish a write to `file` with this flush.
-    ///
     /// # Errors
     /// The flush's own error.
     #[inline]
@@ -138,16 +130,20 @@ impl Flush {
         }
     }
 
-    /// Finish a directory-entry change in `dir` with this flush.
+    /// Finish a directory-entry change in `dir` with this flush. Windows has no flush of a
+    /// directory (one opens as no file to flush: `Access is denied`, os error 5) and NTFS
+    /// commits a directory's entries through its own log, so there the flush is only noted.
     ///
     /// # Errors
     /// The directory could not be opened, or the flush's own error.
     #[inline]
     pub fn dir(self, dir: &Path) -> io::Result<()> {
-        match File::open(dir) {
-            Ok(f) => self.file(&f),
-            Err(e) => Err(e),
+        if cfg!(windows) {
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            seam::note(self);
+            return Ok(());
         }
+        self.file(&File::open(dir)?)
     }
 
     /// [`Flush::Ordered`] when `written` and `later` are on one device, else [`Flush::Durable`].
@@ -162,7 +158,6 @@ impl Flush {
 }
 
 /// Make everything written to `file` durable.
-///
 /// # Errors
 /// The flush's own error.
 pub fn durable(file: &File) -> io::Result<()> {
@@ -172,7 +167,6 @@ pub fn durable(file: &File) -> io::Result<()> {
 }
 
 /// [`durable`] for `file`'s data and size metadata, without its timestamps.
-///
 /// # Errors
 /// The flush's own error.
 pub fn durable_data(file: &File) -> io::Result<()> {
@@ -193,10 +187,7 @@ fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<(
 }
 
 /// Make the durable flushes of this test binary, and of every process it starts, plain
-/// `fsync(2)`s in a debug build on Apple targets: a crate's root says
-/// `#[cfg(test)] aterm_durable::plain_durable_flushes_in_tests!();`, which expands only
-/// under `cfg(test)` to a load-time hook that marks the process tree
-/// (`astream_sys::TEST_PLAIN_FSYNC_ENV`). Applications keep the full flush.
+/// `fsync(2)`s in a debug build on Apple targets.
 #[macro_export]
 macro_rules! plain_durable_flushes_in_tests {
     () => {
@@ -214,7 +205,6 @@ macro_rules! plain_durable_flushes_in_tests {
 }
 
 /// Order everything written to `file`.
-///
 /// # Errors
 /// The flush's own error (the full flush's, when the barrier was refused).
 pub fn ordered(file: &File) -> io::Result<()> {
@@ -224,25 +214,17 @@ pub fn ordered(file: &File) -> io::Result<()> {
 }
 
 /// [`durable`] for the directory `dir`.
-///
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
 pub fn durable_dir(dir: &Path) -> io::Result<()> {
-    match File::open(dir) {
-        Ok(f) => durable(&f),
-        Err(e) => Err(e),
-    }
+    Flush::Durable.dir(dir)
 }
 
 /// [`ordered`] for the directory `dir`.
-///
 /// # Errors
 /// The directory could not be opened, or the flush's own error.
 pub fn ordered_dir(dir: &Path) -> io::Result<()> {
-    match File::open(dir) {
-        Ok(f) => ordered(&f),
-        Err(e) => Err(e),
-    }
+    Flush::Ordered.dir(dir)
 }
 
 #[cfg(unix)]
@@ -256,7 +238,6 @@ fn same_device(a: &Path, b: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn same_device(_a: &Path, _b: &Path) -> bool {
-    // Off unix `ordered` is the full flush anyway, so the answer changes nothing.
     false
 }
 
@@ -266,7 +247,6 @@ pub mod primitive {
     use std::io;
 
     /// The full flush: [`File::sync_all`].
-    ///
     /// # Errors
     /// The flush's own error.
     pub fn full(file: &File) -> io::Result<()> {
@@ -278,7 +258,6 @@ pub mod primitive {
     }
 
     /// The full flush of the data and the size.
-    ///
     /// # Errors
     /// The flush's own error.
     pub fn full_data(file: &File) -> io::Result<()> {
@@ -290,7 +269,6 @@ pub mod primitive {
     }
 
     /// The ordering flush: `fcntl(F_BARRIERFSYNC)` on Apple targets.
-    ///
     /// # Errors
     /// The barrier's own error when it failed.
     pub fn barrier(file: &File) -> io::Result<()> {
@@ -319,14 +297,13 @@ pub mod primitive {
     }
 
     /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`.
-    ///
     /// # Errors
     /// The flush's own error.
     #[cfg(unix)]
     pub fn fsync(file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer;
-        // for a descriptor that is not open it fails with `EBADF`.
+        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer; for a
+        // descriptor that is not open it fails with `EBADF`.
         unsafe extern "C" {
             safe fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
         }
@@ -395,11 +372,7 @@ pub mod seam {
     }
 
     /// Mark this process, and every process it starts, as a test's
-    /// (`astream_sys::TEST_PLAIN_FSYNC_ENV`): in a debug build on Apple targets their
-    /// durable flushes, and the broker's, are plain `fsync(2)`s. Only
-    /// [`plain_durable_flushes_in_tests!`](crate::plain_durable_flushes_in_tests)'s
-    /// load-time hook calls it.
-    ///
+    /// (`astream_sys::TEST_PLAIN_FSYNC_ENV`).
     /// # Safety
     /// No other thread may be running: it sets an environment variable.
     pub unsafe fn plain_durable_flushes() {
@@ -413,9 +386,7 @@ pub mod seam {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flush, durable, durable_data, ordered, primitive, seam};
-    #[cfg(unix)]
-    use super::{durable_dir, ordered_dir};
+    use super::{Flush, durable, durable_data, durable_dir, ordered, ordered_dir, primitive, seam};
     use std::io::Write as _;
 
     fn scratch() -> aterm_tempfile::TempDir {
@@ -454,16 +425,11 @@ mod tests {
         let recording = seam::Recording::start();
         ordered(&file).unwrap();
         durable(&file).unwrap();
-        #[cfg(unix)]
-        {
-            ordered_dir(dir.path()).unwrap();
-            durable_dir(dir.path()).unwrap();
-        }
+        ordered_dir(dir.path()).unwrap();
+        durable_dir(dir.path()).unwrap();
         Flush::Ordered.file(&file).unwrap();
-        #[cfg(unix)]
         Flush::Durable.dir(dir.path()).unwrap();
         durable_data(&file).unwrap();
-        #[cfg(unix)]
         let expected = [
             Flush::Ordered,
             Flush::Durable,
@@ -471,13 +437,6 @@ mod tests {
             Flush::Durable,
             Flush::Ordered,
             Flush::Durable,
-            Flush::Durable,
-        ];
-        #[cfg(not(unix))]
-        let expected = [
-            Flush::Ordered,
-            Flush::Durable,
-            Flush::Ordered,
             Flush::Durable,
         ];
         assert_eq!(recording.take(), expected);
@@ -520,8 +479,6 @@ mod tests {
         assert_eq!(recording.take(), []);
     }
 
-    /// The real primitives on a regular file, and on Unix also on a directory of
-    /// the test volume: the barrier and the full flush.
     #[test]
     fn the_real_barrier_and_full_flush_take_a_file_and_a_directory() {
         let dir = scratch();
@@ -537,8 +494,7 @@ mod tests {
         }
     }
 
-    /// The barrier itself, with no fallback behind it, on a regular file and on a directory
-    /// of the test volume (Apple).
+    /// The barrier itself.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn this_volume_takes_the_barrier_on_a_file_and_a_directory() {
@@ -557,8 +513,7 @@ mod tests {
         }
     }
 
-    /// What [`primitive::barrier_or_full`] did with one injected barrier answer: its
-    /// result, and how many times it asked the barrier and the full flush.
+    /// What [`primitive::barrier_or_full`] did with one injected barrier answer.
     #[cfg(target_vendor = "apple")]
     fn barrier_answering(
         answer: std::io::Error,
@@ -586,9 +541,8 @@ mod tests {
         (result, barriers, fulls)
     }
 
-    /// The four errnos astream-sys reads as a REFUSED barrier (`ENODEV`, `EINVAL`,
-    /// `ENOTTY`, `ENOTSUP`) promise no ordering, so each gets the full flush, whose
-    /// own answer is the result.
+    /// The four errnos astream-sys reads as a REFUSED barrier (`ENODEV`, `EINVAL`, `ENOTTY`,
+    /// `ENOTSUP`) promise no ordering.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_refused_barrier_is_answered_by_the_full_flush() {
@@ -621,8 +575,7 @@ mod tests {
         assert_eq!(fulls, 0, "a barrier that succeeds owes no full flush");
     }
 
-    /// THE NEGATIVE CONTROL of the test above: the same harness, with a barrier that
-    /// FAILED rather than was refused.
+    /// THE NEGATIVE CONTROL of the test above.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_failed_barrier_is_returned_and_never_covered_by_a_full_flush() {
@@ -643,8 +596,7 @@ mod tests {
         }
     }
 
-    /// The pair [`primitive::barrier`] itself hands [`primitive::barrier_or_full`] on
-    /// Apple: astream-sys's barrier and this crate's real full flush.
+    /// The pair [`primitive::barrier`] itself hands [`primitive::barrier_or_full`] on Apple.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_shipped_barrier_answers_a_refusal_with_the_real_full_flush() {
@@ -692,8 +644,7 @@ mod tests {
         );
     }
 
-    /// Two volumes, where this host has them: `/dev` is its own filesystem on Apple
-    /// and Linux, so a write there is never ordered by a barrier on the temp volume.
+    /// Two volumes.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_later_write_on_another_device_is_durable() {

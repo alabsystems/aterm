@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`): the real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven under Autopilot LAND along every reachable state of the model — Autopilot Land: land everything into the remote main, no exceptions, and only then go quiet.
+//! Tier-1 for `SupervisorLand` (aterm-models-harness `supervisor_land_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -21,19 +21,11 @@ use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Real work, long enough that no turn is short for its length.
 const LONG: Duration = Duration::from_secs(4 * 60);
-/// A turn too short to be work: a yield that asks is one.
 const SHORT: Duration = Duration::from_secs(30);
-/// Someone else's turn of real work: past `EXCHANGE_WORK`, never a person's
-/// own exchange.
 const JOB: Duration = Duration::from_secs(12 * 60);
-/// A person's keystroke inside their quick turn.
 const KEYED: Duration = Duration::from_secs(20);
 
-/// A turn's last words: progress, a question, the retired token, a clean
-/// defense, one with a need, one naming work not merged, and the worker's
-/// answer to a person's quick message.
 const PROGRESS: &str = "Stage 2 is on its branch; the parser is next.";
 const QUESTION: &str = "Does the parser have to keep the old syntax?";
 const TOKEN: &str = "Built and tested the parser.\nATERM-TASK-DONE";
@@ -44,8 +36,6 @@ const NEEDS: &str = "Nothing left: the parser and its tests are on origin/main.\
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
 const ANSWERED: &str = "Yes: the old syntax still parses.";
 
-/// What the host's probe finds in the session's repository at a
-/// `YieldDefenseDirty` point: a commit pushed only to a feature branch.
 fn finding() -> RepoWork {
     RepoWork {
         repo: "/Users//a/Developer/parser".to_string(),
@@ -60,10 +50,7 @@ fn finding() -> RepoWork {
     }
 }
 
-/// An authoritative point under Land whose turn worked `worked`, ending on
-/// `said` — or on a `529 Overloaded` wall; `busy`, someone else's turn read
-/// running; `dirty`, the probe finds work no remote main has ([`finding`]);
-/// `keyed`, a person's keystroke inside the turn.
+/// What an authoritative point under Land saw.
 #[derive(Clone, Copy, Default)]
 struct Seen {
     walled: bool,
@@ -198,9 +185,6 @@ fn expected(m: &Model, st: &State) -> Verdict {
     }
 }
 
-/// The nudge the model asks for at `st`: its suffixes the open work the
-/// defense named (`said` 3, in the real reader's spelling) and the probe's
-/// finding (`dirty`).
 fn nudge(st: &State, real: &TurnEndState) -> String {
     let mut text = LAND_NUDGE.to_string();
     if st["said"] == 3 {
@@ -214,12 +198,10 @@ fn nudge(st: &State, real: &TurnEndState) -> String {
     text
 }
 
-/// HOW THE TASK'S FACE IS TOLD to the host: the loop's own discipline, and
-/// three that miss a move (the negative controls).
+/// HOW THE TASK'S FACE IS TOLD to the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Teller {
-    /// The loop's: [`TurnEndState::face_moved`] after each point folded in
-    /// and after each live read of someone else's turn.
+    /// The loop's.
     Loop,
     /// Told only where the journal says a task's end (`DONE`, `LEFT`).
     OnEndNotes,
@@ -229,26 +211,20 @@ enum Teller {
     LandedForDone,
 }
 
-/// HOW THE HOLD IS TOLD to the host: the loop's one teller, and three that
-/// miss a move (the negative controls).
+/// HOW THE HOLD IS TOLD to the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HoldTeller {
-    /// The loop's (`Session::tell_hold`): [`TurnEndState::held_moved`] at
-    /// the start, after each point folded in, after each live read of
-    /// someone else's turn, and after each act's ledger row.
+    /// The loop's (`Session::tell_hold`).
     Loop,
     /// The face told, the hold never.
     Never,
-    /// At points (and the start, and the acts' rows) alone, never at a live
-    /// read: beside `fold_point`'s call to the face's teller, not inside it.
+    /// At points (and the start, and the acts' rows) alone.
     AtPointsOnly,
     /// At points and live reads, never at an act's ledger row.
     NotAtActs,
 }
 
-/// The real side of one walk: the decider's state, the loop's clock, the
-/// last words of the point it stands at, and the face and the hold its host
-/// was last told, by `teller` and `hold_teller`.
+/// The real side of one walk.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
@@ -267,9 +243,6 @@ struct Real {
 }
 
 impl Real {
-    /// The decision at the point now, the wall's own wait run through (its
-    /// ladder's clock, which the model does not count) — never the short
-    /// back-off's, which the model's `BackoffDue` moves.
     fn decide(&mut self) -> TurnEndAction {
         let r = point(
             self.said,
@@ -294,8 +267,6 @@ impl Real {
         panic!("the decider waits for ever at {:?}", self.said)
     }
 
-    /// A point was folded in (`busy`: no — a live read of someone else's
-    /// turn): the face told, by this walk's teller.
     fn tell(&mut self, busy: bool) {
         match self.teller {
             Teller::Loop => {
@@ -335,16 +306,12 @@ impl Real {
         }
     }
 
-    /// The hold told where it moved ([`TurnEndState::held_moved`]).
     fn tell_hold(&mut self) {
         if let Some(held) = self.st.held_moved(true) {
             self.held = held;
         }
     }
 
-    /// An act typed and its ledger row written (`ledger_row`): the row's
-    /// stamp is the hold's `since` where the act began it
-    /// ([`TurnEndState::ledgered`]), and the row tells the hold.
     fn ledgered(&mut self, rule: &'static str) {
         self.row_ms += 60_000;
         self.st.ledgered(rule, self.row_ms);
@@ -356,14 +323,11 @@ impl Real {
         }
     }
 
-    /// The act's turn — read running — ended on `said` after `worked`.
     fn yields(&mut self, said: &'static str, at: Seen, worked: Duration) {
         self.st.took();
         self.ends(said, at, worked);
     }
 
-    /// A turn ended on `said` after `worked`: its point folded in, the face
-    /// told.
     fn ends(&mut self, said: &'static str, at: Seen, worked: Duration) {
         self.now += worked;
         self.said = said;
@@ -373,8 +337,6 @@ impl Real {
     }
 }
 
-/// The model's face of `st` among the three: open while someone else's turn
-/// runs, else theirs, landed or open.
 fn face(st: &State) -> TaskFace {
     if st["other"] == 1 {
         TaskFace::Open
@@ -387,10 +349,6 @@ fn face(st: &State) -> TaskFace {
     }
 }
 
-/// The hold of `held` as the model's `hold` and `hlegs` name it: none 0, a
-/// hold unread 1, a hold read 2; its legs, the engine's own bits but
-/// [`HoldLeg::Cut`], which no reply of the walk is (the model's `cut` is a
-/// wall's cut of a land act, no leg).
 fn hold_of(held: Option<LandHeld>) -> (i64, i64) {
     match held {
         None => (0, 0),
@@ -401,8 +359,6 @@ fn hold_of(held: Option<LandHeld>) -> (i64, i64) {
     }
 }
 
-/// The hold the host was told by `real` against the model's at `st`: the
-/// walk's teller's miss is the error handed back.
 fn holds(real: &Real, st: &State) -> Result<(), String> {
     if hold_of(real.held) == (st["hold"], st["hlegs"]) {
         Ok(())
@@ -414,7 +370,6 @@ fn holds(real: &Real, st: &State) -> Result<(), String> {
     }
 }
 
-/// The face the model's `told` names.
 fn told(st: &State) -> TaskFace {
     match st["told"] {
         0 => TaskFace::Open,
@@ -423,10 +378,6 @@ fn told(st: &State) -> TaskFace {
     }
 }
 
-/// The task's face of `real` against the model's at `st`: someone else's
-/// turn and the face itself must be the model's (a panic), and the face the
-/// host was last told too — by the walk's teller, whose miss is the error
-/// handed back.
 fn faces(real: &Real, st: &State) -> Result<(), String> {
     assert_eq!(
         real.st.other_turn(),
@@ -450,7 +401,6 @@ fn faces(real: &Real, st: &State) -> Result<(), String> {
     }
 }
 
-/// The real state's projection at a point (`pending` 0) of `st`.
 fn projects(real: &TurnEndState, st: &State) {
     let done = st["landed"] == 1 || st["left"] == 1;
     assert_eq!(real.landed(), st["landed"] == 1, "the landing at {st:?}");
@@ -561,9 +511,6 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
     }
 }
 
-/// The real side at the walk's start: a point that ended someone's turn of
-/// real work, the loop's start told first (the face, and the hold whatever
-/// stands: `Session::tell_start_face`).
 fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
     let mut real = Real {
         st: TurnEndState::default(),
@@ -587,7 +534,6 @@ fn start(base: Instant, teller: Teller, hold_teller: HoldTeller) -> Real {
     real
 }
 
-/// `path` fired on the model `m` from its start, mirrored on the real side.
 fn walk(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
     let mut st = m.init_state();
     let mut real = start(base, Teller::Loop, HoldTeller::Loop);
@@ -599,10 +545,6 @@ fn walk(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
     (st, real)
 }
 
-/// Every reachable state of `m` walked against the real decider, the face
-/// told by `teller` and the hold by `hold_teller`: the verdicts seen and the
-/// holds told (`hold=<n> hlegs=<n>`), or the first state where the face or
-/// the hold the host was told is not the model's.
 fn walk_all(
     m: &Model,
     teller: Teller,
@@ -691,9 +633,6 @@ fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
     }
 }
 
-/// NEGATIVE CONTROLS: three tellers that miss a move fail the walk, and
-/// where the `Buggy = 1` model says what a policy before it did, the real
-/// decider says otherwise.
 #[test]
 fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     let m = supervisor_land_model();
@@ -799,14 +738,6 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert_eq!(verdict(&real.clone().decide()), Verdict::WallAct);
 }
 
-/// WHY LAND STILL HOLDS, TOLD (the Autopilot design's §12.3.3): along every
-/// reachable state the hold the loop's teller told its host is the model's —
-/// none before the instruction, at a landing and until Land's next act, at a
-/// person's own exchange; unread once the instruction is typed and again
-/// from someone else's turn (its live read, or its end where no read saw it
-/// run); read, with the yield's own legs, from a land act's yield that did
-/// not land — and every hold the model can tell is told somewhere on the
-/// walk.
 #[test]
 fn tier1_the_real_teller_tells_what_holds_the_landing() {
     let m = supervisor_land_model();

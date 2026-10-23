@@ -788,6 +788,11 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// `ay`'s shim as this platform names it (`ay.cmd` on Windows).
+    fn ay_shim(layout: &Layout) -> PathBuf {
+        layout.shim(&crate::store::ToolName::new("ay").expect("a tool name"))
+    }
+
     #[test]
     fn guarded_link_replaces_only_the_still_selected_checkout() {
         let root = crate::testdir::dir("atpkg-guarded-link-");
@@ -836,12 +841,12 @@ mod tests {
         assert_eq!(linked_checkout(&layout, "ay"), Some(new.to_path_buf()));
         link(&layout, "ay", &manual, &bins).unwrap();
         let marker = fs::read(layout.link_marker("ay")).unwrap();
-        let shim = fs::read(layout.bin_dir().join("ay")).unwrap();
+        let shim = fs::read(ay_shim(&layout)).unwrap();
         assert!(
             link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &old, &layout.prefix).is_err()
         );
         assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), marker);
-        assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+        assert_eq!(fs::read(ay_shim(&layout)).unwrap(), shim);
         let valid = read_marker_for_program(&layout, "ay").unwrap();
         for kind in ["schema", "program", "relative", "malformed"] {
             let mut invalid = valid.clone();
@@ -874,7 +879,7 @@ mod tests {
                 fs::read(layout.link_marker("ay")).unwrap(),
                 bytes.as_bytes()
             );
-            assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+            assert_eq!(fs::read(ay_shim(&layout)).unwrap(), shim);
         }
     }
 
@@ -898,12 +903,12 @@ mod tests {
         assert!(
             link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &old, &layout.prefix).is_err()
         );
-        let shim = fs::read(layout.bin_dir().join("ay")).unwrap();
+        let shim = fs::read(ay_shim(&layout)).unwrap();
         assert!(
             link_if_checkout(&mut guard, &layout, "ay", &new, &both, &old, &layout.prefix).is_err()
         );
         assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), marker);
-        assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+        assert_eq!(fs::read(ay_shim(&layout)).unwrap(), shim);
         fs::write(new.join("target/release/aux"), b"fixture\n").unwrap();
         let outcome =
             link_if_checkout(&mut guard, &layout, "ay", &new, &both, &old, &layout.prefix)
@@ -917,7 +922,7 @@ mod tests {
             link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &new, &layout.prefix).is_err()
         );
         assert!(!layout.link_marker("ay").exists());
-        assert!(!layout.bin_dir().join("ay").exists());
+        assert!(!ay_shim(&layout).exists());
     }
 
     #[test]

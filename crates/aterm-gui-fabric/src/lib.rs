@@ -17,12 +17,9 @@ use aterm_gui_timing::now_ms;
 pub trait FabricSession: Send + Sync {
     fn self_id(&self) -> &SessionId;
     fn fabric(&self) -> &SessionFabric;
-    fn record(&self, kind: &'static str, payload: String);
-    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-        let _ = fact;
-        self.record(kind, payload);
-        false
-    }
+    /// Record one `kind` row on the session's timeline: what it says, typed ([`FabricFact`]), for the session log's mark, which is the row; returns whether the log's readers were owed a wake.
+    fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool;
+    /// Tell the presence band this session's mail or hold moved.
     fn fabric_changed(&self);
     fn holder_token(&self) -> Option<String>;
 }
@@ -34,11 +31,8 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
     fn fabric(&self) -> &SessionFabric {
         (**self).fabric()
     }
-    fn record(&self, kind: &'static str, payload: String) {
-        (**self).record(kind, payload);
-    }
-    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-        (**self).record_fact(kind, payload, fact)
+    fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool {
+        (**self).record_fact(kind, fact)
     }
     fn fabric_changed(&self) {
         (**self).fabric_changed();
@@ -50,12 +44,9 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
 
 /// A session's timeline, as the fabric writes it.
 pub trait Timeline {
-    fn record(&mut self, kind: &'static str, payload: String);
-    fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-        let _ = fact;
-        self.record(kind, payload);
-        false
-    }
+    /// One `kind` row, its typed [`FabricFact`] (see [`FabricSession::record_fact`]).
+    fn record_fact(&mut self, kind: &'static str, fact: FabricFact<'_>) -> bool;
+    /// Whether this session's log is the one the predecessor of a seamless update wrote, carried and read (not one that started over after a gap), so every [`FabricFact::MailIn`] that predecessor recorded is already in it ([`FabricCarry::marked`]).
     fn log_carried(&self) -> bool {
         false
     }
@@ -653,15 +644,6 @@ impl Holds {
         if slot.is_none() {
             *slot = Some(hold.reason);
         }
-    }
-
-    fn event(&self, lifted: &str) -> String {
-        let (origin, reason, hold_origin) = self.event_fields(lifted);
-        format!(
-            "{} reason={} origin={origin} hold_origin={hold_origin}",
-            u8::from(reason.is_some()),
-            reason.as_deref().unwrap_or("-"),
-        )
     }
 
     fn event_fields(&self, lifted: &str) -> (String, Option<String>, String) {
@@ -1402,11 +1384,11 @@ impl SessionFabric {
         since: &str,
         timeline: &Mutex<impl Timeline>,
     ) -> Result<bool, TopicsFull> {
-        self.topic_add_recording(t, since, &|kind, payload, fact| {
+        self.topic_add_recording(t, since, &|kind, fact| {
             let _ = timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record_fact(kind, payload, fact);
+                .record_fact(kind, fact);
         })
     }
 
@@ -1415,7 +1397,7 @@ impl SessionFabric {
         &self,
         t: &str,
         since: &str,
-        record: &dyn Fn(&'static str, String, FabricFact<'_>),
+        record: &dyn Fn(&'static str, FabricFact<'_>),
     ) -> Result<bool, TopicsFull> {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         if set.contains_key(t) {
@@ -1435,17 +1417,17 @@ impl SessionFabric {
             name: t,
             since: Some(since),
         };
-        record("topic", format!("add {t} since={since}"), fact);
+        record("topic", fact);
         Ok(true)
     }
 
     /// Drop a topic.
     pub fn topic_drop(&self, t: &str, timeline: &Mutex<impl Timeline>) -> bool {
-        self.topic_drop_recording(t, &|kind, payload, fact| {
+        self.topic_drop_recording(t, &|kind, fact| {
             let _ = timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record_fact(kind, payload, fact);
+                .record_fact(kind, fact);
         })
     }
 
@@ -1453,7 +1435,7 @@ impl SessionFabric {
     pub fn topic_drop_recording(
         &self,
         t: &str,
-        record: &dyn Fn(&'static str, String, FabricFact<'_>),
+        record: &dyn Fn(&'static str, FabricFact<'_>),
     ) -> bool {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         let dropped = set.remove(t).is_some();
@@ -1463,7 +1445,7 @@ impl SessionFabric {
                 name: t,
                 since: None,
             };
-            record("topic", format!("drop {t}"), fact);
+            record("topic", fact);
         }
         dropped
     }
@@ -1853,11 +1835,7 @@ impl SessionFabric {
                 off: None,
                 why: Some(NOT_CARRIED),
             };
-            let _ = tl.record_fact(
-                "post-landed",
-                format!("{id} off=- reason={NOT_CARRIED}"),
-                fact,
-            );
+            let _ = tl.record_fact("post-landed", fact);
         }
         let mut rids = HashSet::new();
         let unknown_log = inbox.bus_log.is_none();
@@ -1946,11 +1924,7 @@ impl SessionFabric {
         let _ = timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record_fact(
-                "hold",
-                format!("{} carried=1", inbox.holds.event("local")),
-                fact,
-            );
+            .record_fact("hold", fact);
         self.hold_serial.fetch_add(1, Ordering::AcqRel);
         drop(inbox);
         self.changed.notify_all();
@@ -2218,11 +2192,7 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
                     off: None,
                     why: Some(LOG_REPLACED),
                 };
-                let _ = ctx.record_fact(
-                    "post-landed",
-                    format!("{id} off=- reason={LOG_REPLACED}"),
-                    fact,
-                );
+                let _ = ctx.record_fact("post-landed", fact);
             }
         }
         inbox.bus_log = Some(clock.ident);
@@ -2299,7 +2269,10 @@ fn stale_in() -> Option<std::time::Duration> {
 }
 
 fn note_work_owed() {
-    // It is also the gate every other writer of this struct has and this one was missing: `bridge_attached`, `link_report` and `link_evidence` all refuse a write that does not belong to the live bridge generation, so a caller with no bridge cannot move the link's state.
+    // Only a connected bridge can owe anything. This is also the gate every other writer of this
+    // struct has: `bridge_attached`, `link_report` and `link_evidence` all refuse a write that
+    // does not belong to the live bridge generation, so a caller with no bridge cannot move the
+    // link's state.
     if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
         return;
     }
@@ -2979,11 +2952,7 @@ fn cmd_link_log(
                     off: None,
                     why: Some(LOG_REPLACED),
                 };
-                let _ = ctx.record_fact(
-                    "post-landed",
-                    format!("{id} off=- reason={LOG_REPLACED}"),
-                    fact,
-                );
+                let _ = ctx.record_fact("post-landed", fact);
             }
             changed = true;
         }
@@ -3172,13 +3141,12 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
     if inbox.holds.is_held() {
         return false;
     }
-    let record = format!("1 reason={} origin={}", lost.reason, lost.origin);
     let fact = FabricFact::Advisory {
         origin: &lost.origin,
         reason: &lost.reason,
         generation: generation.0,
     };
-    let _ = ctx.record_fact("hold-advisory", record, fact);
+    let _ = ctx.record_fact("hold-advisory", fact);
     inbox.advisory = Some((lost, generation.0));
     drop(inbox);
     ctx.fabric().changed.notify_all();
@@ -3537,7 +3505,6 @@ fn apply_hold_as(
     if changed {
         let lifted = act.origin().unwrap_or("local");
         ctx.fabric().hold_serial.fetch_add(1, Ordering::AcqRel);
-        let mark = if carried { " carried=1" } else { "" };
         let (origin, reason, hold_origin) = inbox.holds.event_fields(lifted);
         let fact = FabricFact::Hold {
             held,
@@ -3547,8 +3514,7 @@ fn apply_hold_as(
             reason: reason.as_deref(),
             carried,
         };
-        let payload = format!("{}{mark}", inbox.holds.event(lifted));
-        owed = ctx.record_fact("hold", payload, fact);
+        owed = ctx.record_fact("hold", fact);
     }
     drop(inbox);
     if owed {
@@ -4249,11 +4215,7 @@ fn retire_post(
             off,
             why: None,
         };
-        let payload = match off {
-            Some(n) => format!("{post_id} off={n}"),
-            None => format!("{post_id} off=-"),
-        };
-        owed = ctx.record_fact("post-landed", payload, fact);
+        owed = ctx.record_fact("post-landed", fact);
     }
     inbox.trim_retired_posts();
     drop(inbox);
@@ -4536,7 +4498,10 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         .filter(|r| !r.listed && quota_key(&r.from) == key)
         .count();
     if unread_from_peer >= SENDER_QUOTA {
-        // AND COUNTED ONCE: its offset is remembered as delivered, so a bridge that starts and walks this topic again from an earlier unhandled row ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no more — rather than refused, and counted, a second time.
+        // A refused broadcast is counted once: its offset is remembered as delivered, so a bridge
+        // that starts and walks this topic again from an earlier unhandled row
+        // ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no more — rather than
+        // refused, and counted, a second time.
         if topic.is_some() {
             inbox.dropped += 1;
             remember_offset(&mut inbox, off, false);
@@ -4596,11 +4561,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         off,
         inbox: id,
     };
-    let owed = ctx.record_fact(
-        "inbox",
-        format!("{id} from={from} kind={kind} off={off}"),
-        fact,
-    );
+    let owed = ctx.record_fact("inbox", fact);
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -4684,11 +4645,9 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             else {
                 return HOLD_BUSY.to_string();
             };
-            let added = ctx
-                .fabric()
-                .topic_add_recording(t, &since, &|kind, payload, fact| {
-                    let _ = ctx.record_fact(kind, payload, fact);
-                });
+            let added = ctx.fabric().topic_add_recording(t, &since, &|kind, fact| {
+                let _ = ctx.record_fact(kind, fact);
+            });
             drop(unfenced);
             let Ok(added) = added else {
                 return format!("ERR topics full (max {MAX_TOPICS}): drop one first\n");
@@ -4709,11 +4668,9 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
             else {
                 return HOLD_BUSY.to_string();
             };
-            let dropped = ctx
-                .fabric()
-                .topic_drop_recording(t, &|kind, payload, fact| {
-                    let _ = ctx.record_fact(kind, payload, fact);
-                });
+            let dropped = ctx.fabric().topic_drop_recording(t, &|kind, fact| {
+                let _ = ctx.record_fact(kind, fact);
+            });
             if dropped {
                 for row in unfenced
                     .rows
@@ -5043,7 +5000,7 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
                 );
             }
             inbox.fetches.push_back((off, FetchSlot::Pending));
-            let _ = ctx.record_fact("fetch", format!("off={off}"), FabricFact::Fetch { off });
+            let _ = ctx.record_fact("fetch", FabricFact::Fetch { off });
         }
     }
     let deadline = std::time::Instant::now() + wait;
@@ -5123,11 +5080,9 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     let off = inbox.rows[at].off;
     let earlier_log = !inbox.rows[at].on_log;
     let decided = verdict.filter(|v| inbox.rows[at].decision.as_deref() != Some(v));
-    let mut verdict_tail = String::new();
     if let Some(v) = decided {
         let row = &mut inbox.rows[at];
         row.decision = Some(v.to_string());
-        verdict_tail = format!(" verdict={v} kind={} from={}", row.kind, row.from);
         if matches!(row.kind.as_str(), "ask" | "task") {
             let (kind, from) = (row.kind.clone(), row.from.clone());
             owe_receipt(&mut inbox, off, v, &kind, &from, earlier_log);
@@ -5142,8 +5097,6 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     }
     let seen = inbox.seen;
     let floor_at = addressed_floor(&inbox);
-    let floor = floor_at.map_or_else(|| "-".to_string(), |f| f.to_string());
-    let payload = format!("{id} off={off} floor={floor} seen={seen}{verdict_tail}");
     let row = &inbox.rows[at];
     let fact = FabricFact::MailSeen {
         inbox: id,
@@ -5155,7 +5108,7 @@ pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
         from: &row.from,
         moved: seen > seen_before || decided.is_some(),
     };
-    let _ = ctx.record_fact("inbox-seen", payload, fact);
+    let _ = ctx.record_fact("inbox-seen", fact);
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -5355,10 +5308,9 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     inbox.next_post_id += 1;
     inbox.outbox_moves += 1;
     let id = inbox.next_post_id;
-    let to_tok = pct_encode(&to);
     inbox.posts.push_back(PostRow {
         id,
-        to: to_tok.clone(),
+        to: pct_encode(&to),
         kind: kind.clone(),
         off: None,
         landed_on_log: false,
@@ -5372,19 +5324,6 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         body,
     });
     inbox.trim_retired_posts();
-    let mut payload = format!("{id} to={to_tok} kind={kind}");
-    if let Some(re) = re {
-        payload.push_str(&format!(" re={re}"));
-    }
-    if let Some(dl) = dl {
-        payload.push_str(&format!(" dl={dl}"));
-    }
-    if let Some(v) = &via {
-        payload.push_str(&format!(" via={v}"));
-    }
-    if let Some(k) = &key {
-        payload.push_str(&format!(" key={k}"));
-    }
     note_work_owed();
     let fact = FabricFact::MailOut {
         kind: &kind,
@@ -5395,7 +5334,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         via: via.as_deref(),
         idem: key.as_deref(),
     };
-    let _ = ctx.record_fact("post", payload, fact);
+    let _ = ctx.record_fact("post", fact);
     drop(inbox);
     ctx.fabric().changed.notify_all();
     ctx.fabric_changed();
@@ -5708,10 +5647,90 @@ mod test_support {
         }
     }
 
-    /// One timeline record.
+    /// One timeline record: its kind and what its fact says ([`said`]).
     pub(crate) struct Event {
         pub(crate) kind: &'static str,
-        pub(crate) payload: String,
+        pub(crate) fact: String,
+    }
+
+    /// What a fact says, as these tests read it: its words and offsets in the `k=v` order of the row aterm-gui's view prints for it (which its own goldens pin), so a test names the floor, the verdict or the hold a move stated.
+    pub(crate) fn said(fact: FabricFact<'_>) -> String {
+        let or_dash = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
+        match fact {
+            FabricFact::MailIn {
+                kind,
+                from,
+                off,
+                inbox,
+            } => format!("{inbox} from={from} kind={kind} off={off}"),
+            FabricFact::MailSeen {
+                inbox,
+                off,
+                floor,
+                seen,
+                verdict,
+                kind,
+                from,
+                moved: _,
+            } => {
+                let tail = verdict.map_or_else(String::new, |v| {
+                    format!(" verdict={v} kind={kind} from={from}")
+                });
+                format!(
+                    "{inbox} off={off} floor={} seen={seen}{tail}",
+                    or_dash(floor)
+                )
+            }
+            FabricFact::MailOut {
+                kind,
+                to,
+                post,
+                re,
+                dl,
+                via,
+                idem,
+            } => {
+                let mut out = format!("{post} to={} kind={kind}", super::pct_encode(to));
+                for (k, v) in [
+                    ("re", re.map(|n| n.to_string())),
+                    ("dl", dl.map(|n| n.to_string())),
+                    ("via", via.map(str::to_string)),
+                    ("key", idem.map(str::to_string)),
+                ] {
+                    if let Some(v) = v {
+                        out.push_str(&format!(" {k}={v}"));
+                    }
+                }
+                out
+            }
+            FabricFact::MailLanded { post, off, why } => {
+                let why = why.map_or_else(String::new, |w| format!(" reason={w}"));
+                format!("{post} off={}{why}", or_dash(off))
+            }
+            FabricFact::Hold {
+                held,
+                bridge: _,
+                origin,
+                hold_origin,
+                reason,
+                carried,
+            } => format!(
+                "{} reason={} origin={origin} hold_origin={hold_origin}{}",
+                u8::from(held),
+                reason.unwrap_or("-"),
+                if carried { " carried=1" } else { "" }
+            ),
+            FabricFact::Topic {
+                add: true,
+                name,
+                since,
+            } => format!("add {name} since={}", since.unwrap_or("-")),
+            FabricFact::Topic { name, .. } => format!("drop {name}"),
+            FabricFact::Advisory { origin, reason, .. } => {
+                format!("1 reason={reason} origin={origin}")
+            }
+            FabricFact::Fetch { off } => format!("off={off}"),
+        }
     }
 
     /// A session's timeline.
@@ -5729,21 +5748,23 @@ mod test_support {
             assert!(after.is_none(), "the tests read the whole timeline");
             self.events.iter()
         }
+
+        /// The registry's own row, as the real store writes its session's open.
+        fn spawned(&mut self) {
+            self.events.push(Event {
+                kind: "spawned",
+                fact: "state=alive".to_string(),
+            });
+        }
     }
 
     impl Timeline for TestTimeline {
-        fn record(&mut self, kind: &'static str, payload: String) {
-            self.events.push(Event { kind, payload });
-        }
-
-        fn record_fact(
-            &mut self,
-            kind: &'static str,
-            payload: String,
-            fact: FabricFact<'_>,
-        ) -> bool {
+        fn record_fact(&mut self, kind: &'static str, fact: FabricFact<'_>) -> bool {
             self.facts.push(format!("{kind}: {fact:?}"));
-            self.record(kind, payload);
+            self.events.push(Event {
+                kind,
+                fact: said(fact),
+            });
             true
         }
 
@@ -5767,19 +5788,12 @@ mod test_support {
         fn fabric(&self) -> &SessionFabric {
             &self.fabric
         }
-        fn record(&self, kind: &'static str, payload: String) {
-            self.timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record(kind, payload);
-            self.watchers.ring();
-        }
-        fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+        fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool {
             let owed = self
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record_fact(kind, payload, fact);
+                .record_fact(kind, fact);
             self.watchers.ring();
             owed
         }
@@ -5828,7 +5842,12 @@ mod test_support {
         /// Register a session; a first registration records `spawned`, as the real store's does.
         pub(crate) fn register(&mut self, h: TestHandle) {
             if !self.by_local.values().any(|c| c.self_id == h.sid) {
-                h.ctx.record("spawned", "state=alive".to_string());
+                h.ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .spawned();
+                h.ctx.watchers.ring();
             }
             self.by_local.insert(h.local_id, h.ctx);
         }
@@ -8021,7 +8040,7 @@ mod inbox_hold {
                 .unwrap()
                 .since(None)
                 .filter(|e| e.kind == "hold")
-                .map(|e| e.payload.to_string())
+                .map(|e| e.fact.clone())
                 .collect();
             assert_eq!(
                 events,
@@ -8040,7 +8059,7 @@ mod inbox_hold {
                 .unwrap()
                 .since(None)
                 .rfind(|e| e.kind == "hold")
-                .map(|e| e.payload.clone());
+                .map(|e| e.fact.clone());
             assert_eq!(
                 last.as_deref(),
                 Some("0 reason=- origin=local hold_origin=-")
@@ -8264,7 +8283,7 @@ mod inbox_hold {
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
                 .rfind(|e| e.kind == "inbox-seen")
-                .map(|e| e.payload.to_string())
+                .map(|e| e.fact.clone())
                 .unwrap_or_default()
         };
         assert_eq!(broadcast(&store, &sid, 1000, "t", "b0"), "OK 1\n");
@@ -8571,7 +8590,7 @@ mod inbox_hold {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
-                .map(|e| (e.kind.to_string(), e.payload.to_string()))
+                .map(|e| (e.kind.to_string(), e.fact.clone()))
                 .collect();
             let kinds: Vec<&str> = events
                 .iter()
@@ -8631,7 +8650,7 @@ mod inbox_hold {
                 .unwrap_or_else(|p| p.into_inner())
                 .since(None)
                 .filter(|e| e.kind == "inbox-seen")
-                .map(|e| e.payload.to_string())
+                .map(|e| e.fact.clone())
                 .collect();
             assert_eq!(
                 seen,
@@ -9171,7 +9190,7 @@ mod inbox_hold {
                     .unwrap_or_else(|p| p.into_inner())
                     .since(None)
                     .rfind(|e| e.kind == "inbox-seen")
-                    .map(|e| e.payload.to_string())
+                    .map(|e| e.fact.clone())
                     .unwrap_or_default()
             };
             assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
@@ -9796,7 +9815,7 @@ mod inbox_hold {
             .unwrap_or_else(|p| p.into_inner())
             .since(None)
             .rfind(|e| e.kind == "inbox-seen")
-            .map(|e| e.payload.clone())
+            .map(|e| e.fact.clone())
             .unwrap_or_default()
     }
 

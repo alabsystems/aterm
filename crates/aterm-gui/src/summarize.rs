@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SUMMARIZE IN A NEW TAB (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4): prose about the alab costs one click.
+//! Summarize in a new tab (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4).
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,8 +24,7 @@ land.";
 /// [`FLEET_BRIEF`]'s survey sentence, after which [`FABRIC_READ`] goes.
 const FLEET_SURVEY: &str = "Run `aterm ctl survey --fleet` once.";
 
-/// [`MAC_BRIEF`]'s survey sentence (the survey, then the local brief), after
-/// which [`FABRIC_READ`] goes.
+/// [`MAC_BRIEF`]'s survey sentence, after which [`FABRIC_READ`] goes.
 const MAC_SURVEY: &str = "Run `aterm ctl survey` once, then `aterm ctl survey --brief` once, \
 for what each session's log says.";
 
@@ -68,8 +67,7 @@ pub(crate) fn summary_folder() -> Option<std::path::PathBuf> {
     summary_folder_under(&aterm_types::dirs::state_dir()?)
 }
 
-/// [`summary_folder`] under the state root `state`: made if it is not there
-/// yet, then made owner-only; a folder whose mode cannot be set is no folder.
+/// [`summary_folder`] under the state root `state`, created owner-only.
 fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = state.join(SUMMARY_FOLDER);
     std::fs::create_dir_all(&dir).ok()?;
@@ -81,11 +79,12 @@ fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Why Summarize books nothing where aterm has no folder of its own to start the worker in ([`summary_folder`]).
+/// Why Summarize books nothing when no summary folder can be prepared ([`summary_folder`]).
 pub(crate) const NO_SUMMARY_FOLDER: &str =
     "no folder of aterm's own to start the summary in (no state directory)";
 
-/// Whether `dir` is the summary folder under the state root `state` ([`summary_folder`]) or inside it, as given or resolved.
+/// Whether `dir` is the summary folder under the state root `state` ([`summary_folder`])
+/// or inside it.
 pub(crate) fn in_summary_folder_under(dir: &std::path::Path, state: &std::path::Path) -> bool {
     let folder = state.join(SUMMARY_FOLDER);
     dir.starts_with(&folder)
@@ -107,10 +106,7 @@ pub(crate) fn summary_booking(
     }
 }
 
-/// What Summarize books in `folder` ([`summary_folder`]): its order
-/// ([`summary_order`]: the fleet's brief or this Mac's, the fabric's
-/// sentence where `fabric` is configured), trusting that folder alone as a
-/// spawn's named folder is, and its booking ([`summary_booking`]).
+/// What Summarize books in `folder` ([`summary_folder`], [`summary_order`], [`summary_booking`]).
 fn summary_spawn(
     fleet: bool,
     fabric: bool,
@@ -165,15 +161,13 @@ impl StartBlock {
     }
 }
 
-/// Why a second Summarize press books nothing while the first one's tab is still booking ([`crate::App::summarize_in_new_tab`]).
+/// Why a second Summarize press books nothing ([`crate::App::summarize_in_new_tab`]).
 pub(crate) const SUMMARY_STARTING: &str = "a summary is already starting";
 
-/// How long one look for `claude` answers [`claude_on_path`]: the menu's
-/// live bits are published on the way to every wait, and an install or
-/// uninstall is noticed within this.
+/// How long one look for `claude` answers [`claude_on_path`].
 const CLAUDE_LOOK_TTL: Duration = Duration::from_secs(2);
 
-/// Whether the agent CLI (`claude`) is launchable from a new tab: a file by that name on the PATH that tab's shell starts from.
+/// Whether the agent CLI (`claude`) is launchable from a new tab.
 pub(crate) fn claude_on_path() -> bool {
     #[cfg(test)]
     if let Some(answer) = CLAUDE_ON_PATH_FOR_TEST.get() {
@@ -188,7 +182,7 @@ pub(crate) fn claude_on_path() -> bool {
     )
 }
 
-/// A yes or no about the file system that the main thread asks on the way to every wait (the menu's live bits: [`claude_on_path`], [`in_fleet`]).
+/// Cached file-system check the main thread asks ([`claude_on_path`], [`in_fleet`]).
 pub(crate) struct Look {
     state: Mutex<LookState>,
 }
@@ -211,7 +205,7 @@ impl Look {
         }
     }
 
-    /// The answer at `now`: the first look's, made here.
+    /// The answer at `now`.
     pub(crate) fn answer(
         &'static self,
         ttl: Duration,
@@ -275,9 +269,7 @@ fn claude_on_path_now() -> bool {
         .any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
 }
 
-/// How long one look at the fleet secret answers [`in_fleet`]: the menu's
-/// live bits are published on the way to every wait, and membership changes
-/// only at an `aterm fleet init|join|leave`.
+/// How long one look at the fleet secret answers [`in_fleet`].
 const FLEET_LOOK_TTL: Duration = Duration::from_secs(15);
 
 /// WHETHER THIS MAC IS IN A FLEET, for the Agents rows and Summarize's brief.
@@ -303,10 +295,7 @@ impl crate::App {
         (!claude_on_path()).then_some(StartBlock::NoClaude)
     }
 
-    /// What a Summarize press books in `folder` ([`summary_spawn`]): the
-    /// fleet's brief where this Mac is in a fleet ([`in_fleet`]), this Mac's
-    /// otherwise, with the fabric's sentence where THIS aterm's fabric is
-    /// configured ([`Self::fabric_configured`]).
+    /// What a Summarize press books ([`summary_spawn`], [`in_fleet`], [`Self::fabric_configured`]).
     fn summary_spawn_in(
         &self,
         folder: Option<&std::path::Path>,
@@ -354,10 +343,6 @@ mod tests {
     use super::*;
     use crate::App;
 
-    /// The two briefs are one finishable task each: the survey they read
-    /// (the fleet's with `--fleet`, this Mac's without), an ordinary report, no
-    /// standing order, no filesystem path, no role for the worker, and
-    /// nothing to land, under Land.
     #[test]
     fn the_briefs_read_the_survey_once_and_end() {
         for (fleet, fabric, survey) in [
@@ -381,11 +366,6 @@ mod tests {
         }
     }
 
-    /// THE FABRIC'S SENTENCE, ONLY WHERE THE FABRIC IS ON,
-    /// in all four arms: with no fabric each
-    /// brief is [`FLEET_BRIEF`] or [`MAC_BRIEF`] byte for byte and names no
-    /// fabric; with it, the same brief with exactly [`FABRIC_READ`] added,
-    /// right after its survey and before what it asks for.
     #[test]
     fn the_briefs_read_the_fabric_only_where_it_is_on() {
         let task = |fleet: bool, fabric: bool| {
@@ -409,9 +389,6 @@ mod tests {
         }
     }
 
-    /// THIS MAC'S BRIEF READS THE SURVEY, THEN THE LOCAL BRIEF:
-    /// `aterm ctl survey` once, then `aterm ctl survey
-    /// --brief` once, and where the fabric is on its sentence follows both.
     #[test]
     fn this_macs_brief_reads_the_survey_then_the_local_brief() {
         for fabric in [false, true] {
@@ -429,10 +406,6 @@ mod tests {
         }
     }
 
-    /// A PRESS NAMES THE FABRIC WHERE THIS ATERM'S IS ON,
-    /// at the press: the order Summarize books
-    /// ([`App::summary_spawn_in`]) carries [`FABRIC_READ`] exactly where
-    /// [`App::fabric_configured`] says this aterm's fabric is configured.
     #[test]
     fn a_press_names_the_fabric_where_this_aterms_fabric_is_on() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -507,9 +480,6 @@ mod tests {
         assert!(found.is_some_and(|w| w.untracked == 1));
     }
 
-    /// THE SUMMARY FOLDER IS PRIVATE ([`summary_folder_under`]): made under
-    /// the state root it is given, owner-only (0o700) on unix even where the
-    /// umask would leave it readable by others, and found again.
     #[test]
     fn the_summary_folder_is_private_to_its_owner() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -542,10 +512,6 @@ mod tests {
         );
     }
 
-    /// WITH NO FOLDER OF ITS OWN, SUMMARIZE REFUSES ([`summary_spawn`]) with
-    /// a plain reason instead of booking a tab where the focused pane was (a
-    /// person's repository, where Land would press the summary to commit and
-    /// push their work).
     #[test]
     fn summarize_with_no_folder_of_its_own_refuses_in_plain_words() {
         let refused = summary_spawn(true, false, None).map(|_| ());
@@ -557,17 +523,17 @@ mod tests {
         assert_eq!(booking.cwd.as_deref(), folder.to_str(), "started there");
         assert!(booking.raise && booking.split.is_none());
         let canonical = std::fs::canonicalize(&folder).expect("canonical");
+        let canonical = canonical.to_str().expect("a UTF-8 folder");
+        // Said without the verbatim prefix Windows' canonical form carries.
+        let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
         assert_eq!(
             order.trusted_cwd.as_deref(),
-            canonical.to_str(),
+            Some(canonical),
             "trusted there"
         );
         assert_eq!(order.autopilot, aterm_agent::supervise::Autopilot::Land);
     }
 
-    /// Summarize starts nothing where no worker can start: a headless test
-    /// App hosts no harness, so the row's block is the spawn's own, and the
-    /// press is refused with that reason before anything is booked.
     #[test]
     fn summarize_refuses_with_the_block_before_booking_anything() {
         let mut app = crate::App::headless_for_test();
@@ -576,11 +542,6 @@ mod tests {
         assert_eq!(app.summarize_in_new_tab(), Err(block.hint()));
     }
 
-    /// An App whose worker spawn this test can steer: a window harness
-    /// hosted (as a control socket starts one) and on for a headless
-    /// instance, shell integration on, a zsh — what a worker's spawn needs
-    /// (`App::worker_shell`) — and `claude` on the PATH a new tab starts
-    /// from ([`CLAUDE_ON_PATH_FOR_TEST`]).
     fn workers_app() -> App {
         CLAUDE_ON_PATH_FOR_TEST.set(Some(true));
         let mut app = App::headless_for_test();
@@ -596,11 +557,6 @@ mod tests {
         app
     }
 
-    /// A SUMMARY WHOSE TAB DID NOT OPEN IS SAID ON THE BAND, not a stderr
-    /// line a Dock-launched aterm's nobody reads: past every check, a unit
-    /// test's App (no event loop) answers the booked spawn at once with an
-    /// error, and the press's own row says so; a second failure restates the
-    /// one row, and the single-flight reservation was released each time.
     #[test]
     fn a_summary_whose_tab_did_not_open_is_said_on_the_band() {
         let said = |app: &App| {
@@ -620,11 +576,6 @@ mod tests {
         assert!(said(&app).is_some());
     }
 
-    /// SUMMARIZE IS GREY FOR WHAT ITS SPAWN WOULD REFUSE: with no window
-    /// harness hosted (no control socket), the harness off, shell integration
-    /// off, a shell no worker's line is written for, or no `claude` to start,
-    /// the row's block names it, and a press is refused that way before
-    /// anything is created — no tab.
     #[test]
     fn summarize_is_grey_for_what_its_spawn_would_refuse() {
         use crate::control::control_media::WorkerBlock;
@@ -734,11 +685,6 @@ mod tests {
         }
     }
 
-    /// THE MENU'S LIVE FILE BITS ARE LOOKED AT AGAIN OFF THE MAIN THREAD: the
-    /// first answer is looked at where it is asked; once it is older than its
-    /// TTL the next ask starts one look on a thread of its own and answers the
-    /// last at once, without waiting for it, and asks while it is out start no
-    /// other; once it has ended its answer stands.
     #[test]
     fn a_stale_look_is_looked_at_again_off_the_asking_thread() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

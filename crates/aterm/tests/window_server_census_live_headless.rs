@@ -29,6 +29,9 @@ const IDLE: Duration = Duration::from_secs(3);
 /// out rather than turned into a COULD NOT RUN.
 const CONTROL_VISIBLE_DEADLINE: Duration = Duration::from_secs(60);
 const LOG_SHOW_DEADLINE: Duration = Duration::from_secs(60);
+/// How long the census waits for a `sys why` pull's split to land: a hang
+/// detector, never the pull's own wait (a latency budget it does not judge).
+const SPLIT_LANDED_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The unified-log predicate: every line tccd writes that names WindowServer as
 /// a TCC preflight's requester, whatever its kind (`AttributionChain:`,
@@ -88,6 +91,11 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 }
 
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
+    client_reply(inst, args).0
+}
+
+/// The client's stdout and its stderr, where a counted reply's `OK` header goes.
+fn client_reply(inst: &Instance, args: &[&str]) -> (String, String) {
     let out = headless_boot::until_served(|| {
         let mut cmd = Command::new(launch_isolation::aterm_executable());
         cmd.args(["ctl", "--sock", &inst.sock])
@@ -107,7 +115,10 @@ fn client_ok(inst: &Instance, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr),
         log_tail(&inst.log),
     );
-    String::from_utf8(out.stdout).expect("client stdout is UTF-8")
+    (
+        String::from_utf8(out.stdout).expect("client stdout is UTF-8"),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// Local wall-clock `YYYY-MM-DD HH:MM:SS`, the shape `log show --start` reads.
@@ -237,6 +248,47 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
         ],
     );
     assert!(posted.starts_with("OK "), "notice: {posted:?}");
+    // A `sys why` pull arms the vitals thread's coalition, code-signature and
+    // kernel-timeline reads, so the census covers them too. A pull past its own
+    // wait answers stale with no split, so `sys why mem` is pulled until it
+    // prints the split's `owners` line (those reads ran) or the lane's
+    // `cannot what=coalitions` (its self-check missed or a read misread, so
+    // the lane turned off and not every split read was checked).
+    let at = format!("@{}", spawned.split_whitespace().nth(1).unwrap_or_default());
+    let why_pull = |view: &[&str]| {
+        let args = [&[at.as_str()][..], view].concat();
+        let (body, head) = client_reply(&inst, &args);
+        assert!(
+            head.contains(" view=why "),
+            "{args:?} answers the why view: {head:?} {body:?}"
+        );
+        (body, head.trim().to_owned())
+    };
+    let why_head = why_pull(&["sys", "why"]).1;
+    let until = Instant::now() + SPLIT_LANDED_DEADLINE;
+    let (mem_head, lane) = loop {
+        let (body, head) = why_pull(&["sys", "why", "mem"]);
+        if let Some(l) = body
+            .lines()
+            .find(|l| l.starts_with("owners ") || l.starts_with("cannot what=coalitions "))
+        {
+            break (head, l.to_owned());
+        }
+        assert!(
+            Instant::now() < until,
+            "no `sys why mem` pull read a split within {}s: {head:?} {body:?}",
+            SPLIT_LANDED_DEADLINE.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let lane = if lane.starts_with("cannot ") {
+        format!(
+            "the coalition lane is off ({lane}): its self-check missed or a read misread, so \
+             not every split read was checked"
+        )
+    } else {
+        format!("the coalition reads ran ({lane})")
+    };
     let chrome = client_ok(&inst, &["chrome"]);
     std::thread::sleep(IDLE);
     let log = inst.log.clone();
@@ -291,7 +343,8 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
     );
     notice(&format!(
         "window-server census: pid {pid} drew 0 WindowServer preflights; the osascript control \
-         (pid {control}) was seen, as were {} other preflighted pid(s) since {start}",
+         (pid {control}) was seen, as were {} other preflighted pid(s) since {start}; its \
+         sys why pulls answered {why_head:?} and {mem_head:?}, and {lane}",
         pids.len().saturating_sub(1)
     ));
 }

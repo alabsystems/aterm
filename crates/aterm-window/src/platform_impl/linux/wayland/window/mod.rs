@@ -5,6 +5,14 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! The Wayland window.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the window's
+//! objects are made here on first-party `aterm-wayland`'s tables (sctk's `XdgShell::
+//! create_window` made them before), with listeners that record their events in the loop's
+//! inbox: the `xdg_surface`'s configure is acked as it arrives, as sctk acked it. A window
+//! dropped on another thread lets go of its state before it tells the loop it closed, so the
+//! loop's reference is the last and the window's objects are destroyed on the loop's thread,
+//! between dispatches, never while it dispatches their events.
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -447,7 +455,8 @@ impl Window {
         self.window_state.lock().unwrap().is_decorated()
     }
 
-    /// The decorations the application must draw ([`WindowState::client_decorations`]).
+    /// LOCAL PATCH (aterm), LW.5: the decorations the application must draw
+    /// ([`WindowState::client_decorations`]).
     #[inline]
     pub fn client_decorations(&self) -> Option<crate::platform::wayland::ClientDecorations> {
         self.window_state.lock().unwrap().client_decorations()
@@ -657,7 +666,9 @@ impl Window {
         None
     }
 
-    /// The window's handles for `aterm_types::native_window`.
+    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
+    /// the Linux half): the window's handles for first-party `aterm_types::native_window`, which
+    /// the GL arm and the CPU presenter read; the opt-in `rwh_06` handle wraps this same answer.
     #[inline]
     pub fn native_window(&self) -> NativeWindow {
         NativeWindow::Wayland {
@@ -714,6 +725,13 @@ impl TryFrom<&str> for Theme {
     type Error = ();
 
     /// Parse `"dark"` or `"light"` case-insensitively into a [`Theme`].
+    ///
+    /// ```
+    /// use aterm_window::window::Theme;
+    ///
+    /// assert_eq!("dark".try_into(), Ok(Theme::Dark));
+    /// assert_eq!("lIghT".try_into(), Ok(Theme::Light));
+    /// ```
     fn try_from(theme: &str) -> Result<Self, Self::Error> {
         if theme.eq_ignore_ascii_case("dark") {
             Ok(Self::Dark)

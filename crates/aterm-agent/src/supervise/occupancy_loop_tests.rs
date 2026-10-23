@@ -11,10 +11,8 @@ use crate::supervise::run::occupancy_loop::CARRY_GAP_MS;
 
 const T0: i64 = 1_760_000_000_000;
 
-/// A minute, in the clock's milliseconds.
 const MIN: i64 = 60_000;
 
-/// Claude Code's break screen whose last words declare the wait.
 fn waiting_break() -> Vec<String> {
     let mut r = rows(&[
         "⏺ WAITING: the mint, about 6 h; nothing else is ready.",
@@ -26,13 +24,10 @@ fn waiting_break() -> Vec<String> {
     r
 }
 
-/// An `OCCUPANCY` record: its seq, the measure, and the change's first word.
 type Said = (Option<u64>, String, String);
 
-/// A `fact-hold@v1` row: its decision and its reason's words.
 type HoldRow = (String, Vec<String>);
 
-/// The `OCCUPANCY` records of `noted`.
 fn occupancy(noted: &[String]) -> Vec<Said> {
     noted
         .iter()
@@ -45,12 +40,10 @@ fn occupancy(noted: &[String]) -> Vec<Said> {
         .collect()
 }
 
-/// `(seq, word)` as an `OCCUPANCY` record of the hold.
 fn change(seq: u64, word: &str) -> Said {
     (Some(seq), "hold".to_string(), word.to_string())
 }
 
-/// The `fact-hold@v1` rows of the ledger at `path`.
 fn hold_rows(path: &Path) -> Vec<HoldRow> {
     let rule = crate::supervise::facts::FactKind::Hold.rule();
     std::fs::read_to_string(path)
@@ -71,8 +64,6 @@ fn hold_rows(path: &Path) -> Vec<HoldRow> {
         .collect()
 }
 
-/// The `fact-held@v1` rows of the ledger text `body`, oldest first: each `(rule, guard)` its
-/// reason names, every one `waiting` with no command (nothing follows it, nothing was typed).
 fn held_rows_of(body: &str) -> Vec<(String, String)> {
     let rule = crate::supervise::occupancy::rules::HELD_RULE;
     body.lines()
@@ -94,13 +85,10 @@ fn held_rows_of(body: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `(rule, guard)` as [`held_rows_of`] gives them.
 fn held_by(rule: &str, guard: &str) -> (String, String) {
     (rule.to_string(), guard.to_string())
 }
 
-/// `body` with every row stamped `ts`, in its order: the scripted clock's time, where the rows a
-/// test's ledger stamps are the machine's.
 fn stamped(body: &str, ts: i64) -> String {
     body.lines()
         .map(|line| {
@@ -113,18 +101,15 @@ fn stamped(body: &str, ts: i64) -> String {
         .collect()
 }
 
-/// The reasons of `rows`, each its words; every row `waiting` (no act follows one).
 fn reasons(rows: &[HoldRow]) -> Vec<Vec<String>> {
     assert!(rows.iter().all(|(d, _)| d == "waiting"), "{rows:?}");
     rows.iter().map(|(_, w)| w.clone()).collect()
 }
 
-/// A reason's words, as [`reasons`] gives them.
 fn said(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-/// The `held_ms` a row's words name.
 fn held_ms(words: &[String]) -> i64 {
     words
         .iter()
@@ -132,8 +117,6 @@ fn held_ms(words: &[String]) -> i64 {
         .unwrap_or_else(|| panic!("no held_ms in {words:?}"))
 }
 
-/// A session on scripted time at `T0`, its ledger at `path`, the host `host` and the break's
-/// settle `settle`.
 fn hold_session<'m>(
     m: &'m mut Mock,
     path: &Path,
@@ -151,15 +134,12 @@ fn hold_session<'m>(
     (s, clock)
 }
 
-/// `clock` moved on `ms`, its wall time with it.
 fn skip(clock: &crate::supervise::fx::ScriptedClock, at_ms: &mut i64, ms: i64) {
     clock.skip(Duration::from_millis(u64::try_from(ms).expect("forward")));
     *at_ms += ms;
     clock.set_at_ms(*at_ms);
 }
 
-/// One run of a break that stands 11 min (its first read inside the settle), then the agent's
-/// own wake: the `OCCUPANCY` records, the hold rows and the requests the session made.
 fn one_hold(
     tag: &str,
     hosted: bool,
@@ -199,10 +179,6 @@ fn one_hold(
     (occupancy(&noted), rows, m.requests)
 }
 
-/// UNDER OBSERVE, ON A HOSTED UNATTENDED LOOP, A HOLD IS JOURNALED ONCE A CHANGE AND BOOKED ONCE
-/// IT HAS STOOD 10 MIN: opened at the settled read (none inside the settle), its open row at the
-/// read past 10 min, closed at the agent's own wake with its close row — `waiting` rows that
-/// type nothing; and the session made exactly the requests it makes with occupancy off.
 #[test]
 fn a_hold_is_said_once_a_change_on_a_hosted_unattended_loop_only() {
     let observe = SupervisorConfig::default();
@@ -238,9 +214,6 @@ fn a_hold_is_said_once_a_change_on_a_hosted_unattended_loop_only() {
     }
 }
 
-/// A DECIDED POINT, through the loop's own executor (F5): nothing decided while the background
-/// work still shows keeps the hold; nothing decided, or a wait, with no background work on the
-/// screen closes it.
 #[test]
 fn a_point_keeps_the_hold_only_over_the_work() {
     let (dir, path) = ledger_at("occ-point");
@@ -285,7 +258,6 @@ fn a_point_keeps_the_hold_only_over_the_work() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A wait the policy decides at a point.
 fn wait_a_while() -> TurnEndAction {
     TurnEndAction::WaitUntil {
         until: Instant::now() + Duration::from_secs(600),
@@ -294,9 +266,6 @@ fn wait_a_while() -> TurnEndAction {
     }
 }
 
-/// WHAT SHOWS THE AGENT'S BACKGROUND WORK AT A POINT (F5, the review of 1a's D2, M8 and M13):
-/// a hold opened at a break, then one point decided on `rows` (its seq 2, the transcript's wait
-/// kept for it where `transcript`) with `action`: whether the hold still stands.
 fn kept_at_point(rows: Vec<String>, transcript: bool, action: TurnEndAction) -> bool {
     let (dir, path) = ledger_at("occ-shows");
     let mut m = Mock::new(Vec::new());
@@ -329,10 +298,6 @@ fn kept_at_point(rows: Vec<String>, transcript: bool, action: TurnEndAction) -> 
     said.len() == 1
 }
 
-/// THE BACKGROUND WORK A POINT KEEPS THE HOLD OVER is the loop's own reading of a break: the
-/// screen reader's background wait — a shell left running, or a dynamic workflow with no shell
-/// counted — or the session's transcript's wait kept for that very screen (BG-1); and a wait the
-/// policy decides over it keeps the hold as nothing decided does.
 #[test]
 fn a_point_reads_the_background_work_as_a_break_does() {
     let nothing = || TurnEndAction::Nothing;
@@ -364,11 +329,6 @@ fn a_point_reads_the_background_work_as_a_break_does() {
     assert!(!kept_at_point(break_screen(), false, escalate()));
 }
 
-/// THE ANSWER TO THE HARNESS'S OWN LINE KEEPS THE HOLD, AND ITS `WAITING:` DECLARES IT: the host
-/// types its line at a settled break, the agent's live turn answers it — read as the loop reads
-/// one (`Session::took`, which reads the edge before it marks the act taken: read after, the
-/// answer is the agent's own wake, the review of 1a's M22) — and the next break's last words
-/// start `WAITING:`: declared, and booked once the hold stood 10 min.
 #[test]
 fn the_answer_to_a_harness_line_keeps_the_hold_and_declares_it() {
     let run = |host: Arc<dyn IdleHost>, tag: &str| {
@@ -415,10 +375,6 @@ fn the_answer_to_a_harness_line_keeps_the_hold_and_declares_it() {
     );
 }
 
-/// A COMMAND'S CONTINUATION STILL OWED IS NOTHING TYPED (the review of 1a's M12): the policy
-/// typed a command whose continuation follows at the next point, its turn was read and taken,
-/// and the hold opened at the break after it: the agent's own wake there is no answer of the
-/// harness's, and closes the hold.
 #[test]
 fn a_commands_owed_continuation_is_no_turn_the_harness_typed() {
     let run = |taken_first: bool| {
@@ -455,8 +411,7 @@ fn a_commands_owed_continuation_is_no_turn_the_harness_typed() {
     assert_eq!(run(false), [change(3, "open")], "control");
 }
 
-/// A host that steps at an idle point once `wanting`: the live upgrade's notice typed
-/// (`typed`), or a step that moved nothing and typed nothing.
+/// A host that steps at an idle point once `wanting`.
 #[derive(Debug)]
 struct StepsAtIdle {
     typed: bool,
@@ -483,9 +438,6 @@ impl IdleHost for StepsAtIdle {
     }
 }
 
-/// THE HOST'S STEP AT AN IDLE POINT IS THAT POINT'S ACT (the review of 1a's M14): a hold booked
-/// at 11 min, then an idle point where the host types its notice: the hold closes there
-/// (`why=point`).
 #[test]
 fn the_hosts_step_at_an_idle_point_closes_the_hold() {
     let run = |typed: bool| {
@@ -542,10 +494,6 @@ fn the_hosts_step_at_an_idle_point_closes_the_hold() {
     assert_eq!(run(false), [booked], "control");
 }
 
-/// A TURN A LIMIT RESET'S END READS RUNNING IS READ AT ITS EDGE TOO (the review of 1a's D3):
-/// the step's end paid by the worker already at work (`Session::reset_at_work`) takes that turn
-/// through `Session::took`, so a hold booked before it closes there as the agent's own
-/// (`why=foreign`).
 #[test]
 fn a_turn_a_limit_resets_end_reads_running_closes_the_hold() {
     let run = |owed: bool| {
@@ -625,9 +573,6 @@ impl IdleHost for Launched {
     }
 }
 
-/// A predecessor's hold, from `T0` and booked at 11 min, then `declared` by the agent's answer
-/// to a host's line where asked, and booked again as the loop ended a minute later
-/// ([`Session::hold_left`]) where `ends`: the ledger's text.
 fn predecessor(tag: &str, declared: bool, ends: bool) -> String {
     let (dir, path) = ledger_at(tag);
     let mut m = Mock::new(Vec::new());
@@ -666,9 +611,6 @@ fn predecessor(tag: &str, declared: bool, ends: bool) -> String {
     body
 }
 
-/// What a successor makes of the ledger text `body`: started with its wall clock at `now_ms`,
-/// Off lifted since where `lifted_off`, its agent launched at `launched`, it reads a break and
-/// then the agent's own wake, and ends where `ends`.
 fn successor(
     body: &str,
     now_ms: i64,
@@ -703,8 +645,6 @@ fn successor(
     reasons(&rows)
 }
 
-/// A SUCCESSOR CARRIES THE HOLD ONLY FROM A LOOP THAT WATCHED IT UNTIL JUST BEFORE IT BEGAN (the
-/// red-team's F3; the review of 1a's D1).
 #[test]
 fn a_successor_carries_the_hold_only_from_a_loop_that_watched_it_till_just_now() {
     let body = predecessor("occ-seed", false, false);
@@ -752,12 +692,6 @@ fn a_successor_carries_the_hold_only_from_a_loop_that_watched_it_till_just_now()
     );
 }
 
-/// A LOOP THAT ENDS WITH A BOOKED HOLD OPEN BOOKS IT AGAIN, declared as it stands (the review of
-/// 1a's M16), so a successor that begins within the carry's gap of the END carries it: the
-/// predecessor's hold, declared and booked at 11 min, is booked again as the loop ends a minute
-/// later, held to the last read that saw it (so the `since` it gives errs late, never early); a
-/// successor 4 min after that end carries it declared, and its own end books it so, held 15
-/// min.
 #[test]
 fn a_loop_that_ends_with_the_hold_open_books_it_for_its_successor() {
     let body = predecessor("occ-left", true, true);
@@ -822,10 +756,6 @@ fn a_loop_that_ends_with_the_hold_open_books_it_for_its_successor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE HOSTED LOOP CARRIES THE HOLD ACROSS ITS RESTARTS, end to end (`Session::run_hosted`,
-/// stopped by its host; the review of 1a's M29): its start seeds the hold from the ledger
-/// (`drive_loop`'s `hold_seed_from`), and its end books the hold it leaves open
-/// (`drive`'s `hold_left`).
 #[test]
 fn the_hosted_loop_carries_the_hold_across_its_restarts() {
     let run = |age_ms: i64, tag: &str| {

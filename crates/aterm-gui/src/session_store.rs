@@ -1054,7 +1054,10 @@ impl ExitActor {
     }
 }
 
-/// Single membership-change entry in the bounded roster lifecycle journal.
+/// Single membership-change entry in the bounded roster lifecycle journal:
+/// the registry's membership feed. An exit's code and closer are the
+/// closed-session index's ([`crate::session_log::ClosedExit`]), which
+/// `exits` reads; the roster's copies were deleted in phase 6 (6G-9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RosterRecord {
     pub seq: u64,
@@ -1063,8 +1066,6 @@ pub(crate) struct RosterRecord {
     pub change: RosterChange,
     pub t_ms: u64,
     pub reason: ExitReason,
-    pub exit_code: Option<i32>,
-    pub actor: ExitActor,
 }
 
 /// Process-wide session registry indexed by both [`SessionId`] and local `u64` ID.
@@ -1126,13 +1127,13 @@ impl SessionStore {
             tl.slog_mut().bind_mirror(self.mirror.shared());
             tl.slog_mut()
                 .bind_person(std::sync::Arc::clone(&handle.ctx.human_input));
-            tl.record("spawned", format!("state={}", handle.state.as_str()));
             let at = tl.slog().now();
             tl.slog_mut().open_session(
                 handle.parent.as_ref().map(SessionId::as_str),
                 Some(handle.state.as_str()),
                 at,
             );
+            tl.record("spawned");
         }
         let journal = first.then(|| (handle.sid.as_str().to_string(), handle.local_id));
         self.by_local.insert(handle.local_id, handle.sid.clone());
@@ -1143,26 +1144,18 @@ impl SessionStore {
                 local_id,
                 RosterChange::Created,
                 ExitReason::Unknown,
-                None,
-                ExitActor::Unknown,
                 crate::turn_ledger::now_ms(),
             );
         }
     }
 
     /// Appends one roster record stamped `t_ms`, evicting the oldest past [`ROSTER_JOURNAL_CAP`]; returns its seq.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one record's fields, every caller naming each"
-    )]
     fn record_roster(
         &mut self,
         sid: String,
         local_id: u64,
         change: RosterChange,
         reason: ExitReason,
-        exit_code: Option<i32>,
-        actor: ExitActor,
         t_ms: u64,
     ) -> u64 {
         self.roster_seq += 1;
@@ -1176,8 +1169,6 @@ impl SessionStore {
             change,
             t_ms,
             reason,
-            exit_code,
-            actor,
         });
         crate::harness_host::ring();
         self.instance_watchers.ring_watchers();
@@ -1200,8 +1191,6 @@ impl SessionStore {
             0,
             RosterChange::RetireRequested,
             ExitReason::Unknown,
-            None,
-            ExitActor::Unknown,
             crate::turn_ledger::now_ms(),
         );
         true
@@ -1215,8 +1204,6 @@ impl SessionStore {
             0,
             RosterChange::Bye(bye),
             ExitReason::Unknown,
-            None,
-            ExitActor::Unknown,
             crate::turn_ledger::now_ms(),
         );
     }
@@ -1397,10 +1384,6 @@ impl SessionStore {
                 reason
             };
             let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            if reason != ExitReason::Unknown {
-                tl.record("closing", closing_payload(reason, &actor));
-            }
-            tl.record("state-change", "state=closed".to_string());
             let at = tl.slog().now();
             tl.slog_mut().close_session(
                 crate::session_log::exit_out(reason),
@@ -1409,6 +1392,7 @@ impl SessionStore {
                 exit_code,
                 at,
             );
+            tl.record("state-change");
             if let Some(retirements) = retirements.as_mut() {
                 retirements.retire(&sid, &h.ctx.timeline, tl.slog());
             }
@@ -1427,8 +1411,6 @@ impl SessionStore {
                 local_id,
                 RosterChange::Exited,
                 reason,
-                exit_code,
-                actor.clone(),
                 t_ms,
             );
             closed.freed = self.closed_logs.link(crate::session_log::ClosedExit {
@@ -1652,16 +1634,8 @@ fn record_state_change(
     let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
     let at = tl.slog().now();
     tl.slog_mut().observe_state(state.as_str(), at);
-    tl.record("state-change", format!("state={}", state.as_str()));
+    tl.record("state-change");
     let _ = tl.slog_take_wake();
-}
-
-fn closing_payload(reason: ExitReason, actor: &ExitActor) -> String {
-    format!(
-        "reason={} by={}",
-        reason.as_str(),
-        crate::control::pct_encode(actor.as_wire())
-    )
 }
 
 thread_local! {
@@ -3115,11 +3089,9 @@ title = \"zsh\"
         store.set_state(4, SessionState::Exited);
         store.deregister_local(4);
 
-        let tl = timeline.lock().unwrap();
-        let got: Vec<(u64, &str, &str)> = tl
-            .since(None)
-            .map(|e| (e.id, e.kind, &*e.payload))
-            .collect();
+        let rows: Vec<_> = timeline.lock().unwrap().since(None).collect();
+        let got: Vec<(u64, &str, &str)> =
+            rows.iter().map(|e| (e.id, e.kind, &*e.payload)).collect();
         assert_eq!(
             got,
             vec![
@@ -3252,8 +3224,15 @@ title = \"zsh\"
         assert_eq!(rec.sid, sid);
         assert_eq!(rec.local_id, 7);
         assert_eq!(rec.reason, ExitReason::CtlClose);
-        assert_eq!(rec.actor, ExitActor::Sid("s-caller".into()));
-        assert_eq!(rec.exit_code, Some(3));
+        // The closer and the code are the closed index's (6G-9).
+        let exit = store
+            .closed_logs()
+            .exits_since(0)
+            .next()
+            .expect("the close was indexed");
+        assert_eq!((exit.seq, exit.t_ms), (rec.seq, rec.t_ms));
+        assert_eq!(exit.actor, ExitActor::Sid("s-caller".into()));
+        assert_eq!(exit.exit_code, Some(3));
         assert!(
             rec.t_ms >= before && rec.t_ms <= crate::turn_ledger::now_ms(),
             "stamped on the process-epoch clock: {} not in [{before}, now]",
@@ -3263,10 +3242,7 @@ title = \"zsh\"
             .roster_since(0)
             .find(|r| r.change == RosterChange::Created)
             .expect("the birth was journalled");
-        assert_eq!(
-            (created.reason, created.exit_code, &created.actor),
-            (ExitReason::Unknown, None, &ExitActor::Unknown)
-        );
+        assert_eq!(created.reason, ExitReason::Unknown);
         let tl = timeline_of(&h);
         assert_eq!(tl[0].0, "spawned");
         assert_eq!(
@@ -3288,9 +3264,9 @@ title = \"zsh\"
         store.deregister_local(1);
         store.deregister_local(2);
         let reasons: Vec<(String, ExitReason, ExitActor)> = store
-            .roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited)
-            .map(|r| (r.sid.clone(), r.reason, r.actor.clone()))
+            .closed_logs()
+            .exits_since(0)
+            .map(|e| (e.sid.as_str().to_string(), e.reason, e.actor.clone()))
             .collect();
         assert_eq!(
             reasons,
@@ -3326,10 +3302,7 @@ title = \"zsh\"
         let mut store = SessionStore::default();
         store.register(handle_in_state(4, None, SessionState::Exited));
         store.deregister_local_as(4, ExitReason::UiClose, ExitActor::Human);
-        let rec = store
-            .roster_since(0)
-            .find(|r| r.change == RosterChange::Exited)
-            .unwrap();
+        let rec = store.closed_logs().exits_since(0).next().unwrap();
         assert_eq!(
             (rec.reason, &rec.actor),
             (ExitReason::UiClose, &ExitActor::Human)
@@ -3348,9 +3321,9 @@ title = \"zsh\"
         store.register(handle(9, None));
         store.deregister_local(9);
         let codes: Vec<Option<i32>> = store
-            .roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited)
-            .map(|r| r.exit_code)
+            .closed_logs()
+            .exits_since(0)
+            .map(|e| e.exit_code)
             .collect();
         assert_eq!(codes, vec![None, Some(7), None]);
     }
@@ -3371,9 +3344,15 @@ title = \"zsh\"
         assert_eq!(exits.len(), ROSTER_JOURNAL_CAP / 2);
         let newest = exits.last().unwrap();
         assert_eq!(newest.seq, store.roster_seq());
-        assert_eq!(newest.actor, ExitActor::Sid(format!("s-{}", n - 1)));
+        let indexed = store
+            .closed_logs()
+            .exits_since(0)
+            .next_back()
+            .expect("the newest close is indexed");
+        assert_eq!(indexed.seq, newest.seq);
+        assert_eq!(indexed.actor, ExitActor::Sid(format!("s-{}", n - 1)));
         assert_eq!(
-            newest.exit_code,
+            indexed.exit_code,
             Some(i32::try_from((n - 1) % 256).unwrap())
         );
         let third = exits[exits.len() - 3].seq;

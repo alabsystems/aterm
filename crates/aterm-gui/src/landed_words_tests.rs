@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LANDED IS LANDED (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.1 and §12.4.3 item 1; slice 4a): every word the window has for a landing says `landed`, seen or not.
+//! Tests that every window surface for a landing says `landed`, seen or not.
 
 use std::sync::Arc;
 
@@ -11,16 +11,12 @@ use crate::status_item::{EndRow, Glance, SessionRow, TaskRow, compose_status_men
 use crate::task_record::TaskState;
 use crate::{App, WindowId};
 
-/// The menu's clock: every row's age is read from it.
 const NOW: i64 = 1_800_000_000;
 
-/// `secs` (unix seconds) in unix milliseconds.
 fn ms(secs: i64) -> u64 {
     u64::try_from(secs).expect("a positive time") * 1000
 }
 
-/// A worker's row: its label, its task started by `from`, in `state`, moved
-/// there by `why` four minutes ago, with a result of `result` bytes.
 fn worker(
     id: u64,
     label: &str,
@@ -48,15 +44,11 @@ fn worker(
     }
 }
 
-/// The composed menu as `chrome` prints it.
 fn menu(rows: &[SessionRow]) -> Vec<String> {
     let glance = Glance::build(rows, &[], None, ms(NOW), None);
     menu_lines(&compose_status_menu(&glance, NOW), &[])
 }
 
-/// The one printed menu line that carries `words`, without the row's path a
-/// debug build ends it with (` at=…`, always last, §12.5.2: read apart by
-/// `status_item`'s `every_row_path_chrome_prints_names_its_row`).
 fn line_with(lines: &[String], words: &str) -> String {
     let found: Vec<&String> = lines.iter().filter(|l| l.contains(words)).collect();
     assert_eq!(found.len(), 1, "one line with {words:?}: {lines:#?}");
@@ -65,11 +57,6 @@ fn line_with(lines: &[String], words: &str) -> String {
         .map_or_else(|| found[0].clone(), |(line, _)| line.to_string())
 }
 
-/// A LANDED WORKER READS `landed`, AN OLDER BUILD'S DONE READS `done`
-/// (§12.4.1, the worker and its manager): `lint`, whose record reads `done
-/// why=landed`, is `✓ lint — landed 4m · 2.1 KB`; `fmt`, an older build's
-/// `done why=marker`, keeps `✓ fmt — done 4m`; the manager counts them apart,
-/// `1 working, 1 landed, 1 done`.
 #[test]
 fn a_landed_worker_reads_landed_and_an_older_done_reads_done() {
     let manager = SessionRow {
@@ -113,10 +100,6 @@ fn a_landed_worker_reads_landed_and_an_older_done_reads_done() {
     );
 }
 
-/// THIS MAC COUNTS LANDED AND EXITED APART (§12.4.1): a plain Land tab whose
-/// chip wears `✓ landed` (no worker), a worker whose record reads `done
-/// why=landed` and a worker whose agent exited give `This Mac — 2 landed · 1
-/// exited`.
 #[test]
 fn this_mac_counts_landed_and_exited_apart() {
     let plain = SessionRow {
@@ -166,10 +149,6 @@ fn this_mac_counts_landed_and_exited_apart() {
     );
 }
 
-/// A SEEN LANDING STAYS LANDED IN DONE FOR YOU (§12.4.1): a `ctl` worker that
-/// Land landed (`done why=landed`), whose end was looked at, or that landed
-/// under the work floor and told no end at all, reads `✓ … — landed`; an
-/// older build's `done why=marker` reads `done`.
 #[test]
 fn a_seen_landing_stays_landed_in_done_for_you() {
     let landed = |id, label| {
@@ -212,8 +191,6 @@ fn a_seen_landing_stays_landed_in_done_for_you() {
     );
 }
 
-/// Session `local` of `app`: a `ctl` worker that Land landed, titled
-/// `title` by its pin.
 fn land_worker(app: &mut App, local: u64, title: &str) {
     let ctx = app.pool.get(local).expect("pooled").ctx.clone();
     ctx.meta
@@ -226,9 +203,6 @@ fn land_worker(app: &mut App, local: u64, title: &str) {
     app.on_task_changed(local);
 }
 
-/// An App whose session 0 is in window 0's first tab and a second session in
-/// its second, each a `ctl` worker that Land landed, titled `first` and
-/// `second` by their pins.
 fn two_landed_workers(first: &str, second: &str) -> (App, u64) {
     let mut app = App::headless_for_test();
     let id = app.next_session_id;
@@ -238,7 +212,6 @@ fn two_landed_workers(first: &str, second: &str) -> (App, u64) {
     (app, id)
 }
 
-/// The Done for you rows of `app`'s glance, as `chrome` prints them.
 fn done_rows(app: &App) -> Vec<String> {
     let glance = app.status_glance();
     assert_eq!(glance.done.len(), 2, "both landings: {:?}", glance.done);
@@ -247,9 +220,6 @@ fn done_rows(app: &App) -> Vec<String> {
     labels
 }
 
-/// TWO ROWS WITH ONE LABEL SAY WHERE THEY ARE (§12.4.1, §11.14's W4): two
-/// landed workers both titled `Claude Code`, in tabs 1 and 2, are `Claude
-/// Code in tab 1` and `Claude Code in tab 2`.
 #[test]
 fn two_rows_with_one_label_say_where_they_are() {
     let (app, _) = two_landed_workers("Claude Code", "Claude Code");
@@ -259,20 +229,12 @@ fn two_rows_with_one_label_say_where_they_are() {
     );
 }
 
-/// A UNIQUE ROW NAMES NO PLACE (§12.4.1): `Claude Code` beside `lint` is
-/// named by its label alone.
 #[test]
 fn a_unique_row_names_no_place() {
     let (app, _) = two_landed_workers("Claude Code", "lint");
     assert_eq!(done_rows(&app), ["Claude Code", "lint"]);
 }
 
-/// TWO PANES OF ONE TAB WITH ONE LABEL SAY WHICH PANE (§12.4.9): two
-/// landed workers both titled `Claude Code`, side by side in tab 1, where
-/// `session_place` names no pane (no agent runs in either), are told apart by
-/// the pane every pane counts in (`pane_place`): `Claude Code in tab 1,
-/// <pane>`, two labels. NEGATIVE CONTROL (as run): `place_alike_rows` without
-/// its pane pass gives `Claude Code in tab 1` twice.
 #[test]
 fn two_panes_of_one_tab_with_one_label_say_which_pane() {
     let mut app = App::headless_for_test();
@@ -286,7 +248,6 @@ fn two_panes_of_one_tab_with_one_label_say_which_pane() {
     }
 }
 
-/// A host that supervises nothing, shut down on drop.
 struct TestHost(crate::harness_host::HostHandle);
 
 impl Drop for TestHost {
@@ -295,8 +256,6 @@ impl Drop for TestHost {
     }
 }
 
-/// An App whose session 0 runs Claude Code under its own word `word`,
-/// claimed by this host, in window 0's first tab, a second tab in front.
 fn desk(word: &str) -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = TestHost(crate::harness_host::HostHandle::for_supervised_test(
@@ -327,12 +286,10 @@ fn desk(word: &str) -> (App, String, TestHost) {
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
-/// Session `sid`'s loop tells `face` through the host's wake.
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
 
-/// The hover's who-drives words for session 0, as composed now.
 fn driven(app: &App) -> Option<String> {
     app.presence_hover(0, None).and_then(|hover| {
         hover
@@ -343,19 +300,11 @@ fn driven(app: &App) -> Option<String> {
     })
 }
 
-/// Session 0's tab's hover (window 0's first tab) as the strip was last
-/// stamped with it.
 fn pushed(_app: &App) -> String {
     let tips = crate::work_counts::last_tooltips_pushed(WindowId(0)).expect("a stamp");
     tips.first().cloned().flatten().unwrap_or_default()
 }
 
-/// THE HOVER NAMES THE CHIP'S FACE (§12.4.1, "one helper; no clock"): under
-/// Land, open and unknown read `driven by aterm (land)`, landed `(land,
-/// landed)` with no clock, a person's own exchange `(land, quiet)`; under
-/// Cruise `(cruise)`, and a timed Cruise names its time `(cruise, lands at
-/// HH:MM)`. NEGATIVE CONTROL (as run): main's `view.wire()` alone prints
-/// `driven by aterm (land)` for the landed face.
 #[test]
 fn the_hover_names_the_chips_face() {
     let (mut app, sid, _host) = desk("land");
@@ -384,7 +333,6 @@ fn the_hover_names_the_chips_face() {
     );
 }
 
-/// The wire's `meta` on session 0, its wake applied where it changed.
 fn meta(app: &mut App, rest: &str) {
     let session = app.pool.get(0).expect("session 0");
     let (term, ctx) = (session.term.clone(), session.ctx.clone());
@@ -395,11 +343,6 @@ fn meta(app: &mut App, rest: &str) {
     }
 }
 
-/// THE HOVER FOLLOWS THE FACE (§12.3.6's `the_hover_follows_the_hold_and_the
-/// face`, 4a's half; §12.3.3 item 3): only the face moves — land to landed
-/// with no work, under the 30 s floor, so no end is told and no `•` marks
-/// the tab — and the strip is stamped again: the hover pushed reads `(land,
-/// landed)`; someone else's turn (theirs) stamps `(land, quiet)`.
 #[test]
 fn the_hover_follows_the_face() {
     let (mut app, sid, _host) = desk("land");
@@ -425,9 +368,6 @@ fn the_hover_follows_the_face() {
     );
 }
 
-/// THE HOVER FOLLOWS THE TIMER (§12.4.1's `(cruise, lands at 18:00)`): a
-/// `meta set autopilot cruise until=…` stamps the strip with the timer's
-/// words, and its cancel stamps `(cruise)` again.
 #[test]
 fn the_hover_follows_the_timer() {
     let (mut app, _, _host) = desk("cruise");
@@ -451,10 +391,6 @@ fn the_hover_follows_the_timer() {
     );
 }
 
-/// THE MENU BAR FOLLOWS THE FACE (§12.4.3, item 1): a plain Land tab that
-/// lands, under the floor (no end, no `•`), is counted `1 landed` on This Mac
-/// at once — the face's move dirties the glance — and someone else's turn
-/// takes it off again.
 #[test]
 fn this_mac_counts_a_landed_tab_that_is_no_worker() {
     let (mut app, sid, _host) = desk("land");
@@ -468,11 +404,6 @@ fn this_mac_counts_a_landed_tab_that_is_no_worker() {
     assert_eq!(app.status_glance().here.landed, 0);
 }
 
-/// A LANDING TOLD UNDER CRUISE IS NO LANDED TAB (§12.4.9: `landed` is the
-/// chip's own fold): a Land tab that landed counts `1 landed` and its hover
-/// says `(land, landed)`; set to Cruise, its glass still holds the landed
-/// face (`status task=landed`), but the chip wears `∞`, so This Mac counts no
-/// landing and the hover says `(cruise)`.
 #[test]
 fn a_landing_under_cruise_is_not_counted_landed() {
     let (mut app, sid, _host) = desk("land");
@@ -495,10 +426,6 @@ fn a_landing_under_cruise_is_not_counted_landed() {
     assert_eq!(app.status_glance().here.landed, 1, "back under Land");
 }
 
-/// A TIMER ON ANOTHER DAY NAMES ITS DAY (§12.4.1, the SESSIONS state line's
-/// form): a timed Cruise that lands today reads `cruise, lands at 18:00`; one
-/// that lands on another day `cruise, lands Sat 18:00`, never a bare
-/// `18:00` that would read as today's.
 #[test]
 fn a_timer_on_another_day_names_its_day() {
     use crate::claude_lights::{ChipFace, ChipGlass, Clock, LandAtGlass, Weekday};
@@ -519,14 +446,8 @@ fn a_timer_on_another_day_names_its_day() {
     );
 }
 
-/// 2026-10-16T19:00:00Z in unix milliseconds: the timer tests' wall.
 const WALL_MS: i64 = 1_792_177_200_000;
 
-/// THE HOVER FOLLOWS A COMMIT'S REBUILD (§9.3.6 item 3, §12.4.1): a
-/// seamless update's successor drops the `MetaChanged` of a timer stored
-/// before its Commit, so the hover reads `(cruise)` until the Commit's
-/// rebuild indexes it, which stamps the strip with `(cruise, lands …)`; a
-/// session that both had an entry and stores one is stamped once.
 #[test]
 fn the_hover_follows_a_commits_rebuild() {
     crate::autopilot_timers::set_fake_clocks(Some((std::time::Instant::now(), WALL_MS)));
@@ -576,10 +497,6 @@ fn the_hover_follows_a_commits_rebuild() {
     crate::autopilot_timers::set_fake_clocks(None);
 }
 
-/// THE HOVER FOLLOWS A FIRE THAT FOUND THE TIMER MOVED (§9.3.6, §12.4.1):
-/// a timer re-armed over the wire, its wake not yet applied, is found moved
-/// at the old instant's fire and indexed again at the new one; the strip is
-/// stamped with the new time.
 #[test]
 fn the_hover_follows_a_fire_that_found_the_timer_moved() {
     let (mut app, _, _host) = desk("cruise");
@@ -629,11 +546,6 @@ fn the_hover_follows_a_fire_that_found_the_timer_moved() {
     crate::autopilot_timers::set_fake_clocks(None);
 }
 
-/// A TIMED WRITE STAMPS EACH STRIP ONCE (§12.4.3's cost: the hover at the
-/// strip's push): a `meta set autopilot cruise until=…` over the wire, and the
-/// same write from the window's menu, each stamp the strip that shows the
-/// session as many times as a write of no timer does (`cruise` to `land`),
-/// with the timer's words in it.
 #[test]
 fn a_timed_write_stamps_each_strip_once() {
     let (mut app, _, _host) = desk("cruise");
@@ -675,10 +587,6 @@ fn a_timed_write_stamps_each_strip_once() {
     );
 }
 
-/// THE HOVER ASKS NO REDRAW WHERE THE STRIP DID NOT MOVE (§12.4.4: per frame,
-/// nothing): a hover is the toolbar's tooltip, drawn by no frame, so a face
-/// move that restamps it (land to landed under the floor) asks the window
-/// for no frame while the strip's fingerprint is the one last presented.
 #[test]
 fn the_hover_asks_no_redraw_where_the_strip_did_not_move() {
     let (mut app, sid, _host) = desk("land");

@@ -3,6 +3,9 @@
 
 //! Tier-1 conformance for BudgetedWalk (`aterm_models_misc::budgeted_walk_model`): the real
 //! [`Walker`] over a scratch tree, every step projected and admitted by the model's `Next`.
+//! Unix only: off Unix every walk is `Refusal::Unsupported`, so no step is taken.
+
+#![cfg(unix)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

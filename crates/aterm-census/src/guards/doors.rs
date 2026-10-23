@@ -766,7 +766,7 @@ mod tests {
         );
     }
 
-    /// The boot id is read by name only in astream: the two shapes that came back, a
+    /// The boot id is read by name only in astream: an inline call, a `const` name, a
     /// `sysctlnametomib` lookup and a test's own read are found.
     #[test]
     fn the_boot_id_is_read_by_astream_alone() {

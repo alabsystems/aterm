@@ -50,9 +50,9 @@ fn a_burst_of_50_moves_ends_on_its_newest_state_coalesced() {
         for i in 0..49 {
             let state = [W::Working, W::Blocked][i % 2];
             let kind = (state == W::Blocked).then_some(ProgramBlockedKind::Permission);
-            let _ = g.note_program_state(report(state, kind));
+            g.note_program_state(report(state, kind));
         }
-        let _ = g.note_program_state(report(W::Done, None));
+        g.note_program_state(report(W::Done, None));
     }
     assert_eq!(
         program_lines(&tl).len(),
@@ -80,7 +80,11 @@ fn a_burst_of_50_moves_ends_on_its_newest_state_coalesced() {
         .since(None)
         .filter(|e| e.kind == crate::session_timeline::PROGRAM_STATE)
         .count();
-    assert_eq!(rows, 50, "the ring keeps every row");
+    assert_eq!(
+        rows,
+        PROGRAM_BURST as usize + 1,
+        "the rows are the marks: the burst and the coalesced newest state"
+    );
     assert!(
         g.slog()
             .log()
@@ -110,7 +114,7 @@ fn a_program_flapping_at_4_hz_for_an_hour_stays_within_its_bucket_and_share() {
         hand.set(10_000 + 250 * i);
         tick(&tl);
         let state = if i % 2 == 0 { W::Working } else { W::Idle };
-        let _ = tl.lock().unwrap().note_program_state(report(state, None));
+        tl.lock().unwrap().note_program_state(report(state, None));
     }
     let g = tl.lock().unwrap();
     let log = g.slog().log();
@@ -202,9 +206,9 @@ fn presence_counts_a_program_done_once_beside_its_mark() {
 fn burst(tl: &std::sync::Mutex<SessionTimeline>, n: usize, last: W) {
     let mut g = tl.lock().unwrap();
     for i in 0..n - 1 {
-        let _ = g.note_program_state(report([W::Working, W::Idle][i % 2], None));
+        g.note_program_state(report([W::Working, W::Idle][i % 2], None));
     }
-    let _ = g.note_program_state(report(last, None));
+    g.note_program_state(report(last, None));
 }
 
 /// The node word of a host-tier record line (`<seq> <op> <node> <kind> …`).
@@ -300,7 +304,7 @@ fn a_run_change_writes_the_last_runs_pending_state_first() {
     burst(&tl, 30, W::Working);
     with_agent(&tl, "codex");
     let run = codex_run(&tl);
-    let _ = tl.lock().unwrap().note_program_state(report(W::Done, None));
+    tl.lock().unwrap().note_program_state(report(W::Done, None));
     let lines = program_lines(&tl);
     let n = lines.len();
     assert_eq!(n, PROGRAM_BURST as usize + 2, "{lines:#?}");
@@ -348,7 +352,7 @@ fn a_runs_pending_state_is_written_on_it_before_it_closes() {
     {
         let mut g = tl.lock().unwrap();
         let _ = g.sweep_slog(&crate::session_log::BlockRead::default(), false, 100, 100);
-        let _ = g.note_program_state(None);
+        g.note_program_state(None);
     }
     let lines = lines_of(&tl);
     let done = lines

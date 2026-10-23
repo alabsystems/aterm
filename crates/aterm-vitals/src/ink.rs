@@ -121,17 +121,12 @@ pub fn is_dark(ground: Rgb) -> bool {
     to_lab(ground).l < 0.6
 }
 
-/// `c` moved `dl` in OkLab lightness away from a dark ground (lighter) or a
-/// light one (darker), keeping its hue and chroma.
 fn away(c: Rgb, dl: f32, dark: bool) -> Rgb {
     let mut x = to_lab(c);
     x.l = (x.l + if dark { dl } else { -dl }).clamp(0.0, 1.0);
     from_lab(x)
 }
 
-/// `away(ground, dl)` with `dl` grown from its first value until the result
-/// stands at least `floor` : 1 from the ground (the floors of design §12.1
-/// are solved, not assumed: the rules stay, the values move).
 fn away_floored(ground: Rgb, dl: f32, floor: f32, dark: bool) -> Rgb {
     let mut d = dl;
     let mut c = away(ground, d, dark);
@@ -142,10 +137,6 @@ fn away_floored(ground: Rgb, dl: f32, floor: f32, dark: bool) -> Rgb {
     c
 }
 
-/// `fg` mixed `t` of the way toward `ground`, with `t` eased back toward the
-/// foreground until the mix reads at least `floor` : 1 on the ground; a
-/// theme whose own foreground falls short (Solarized Light's is 4.1:1 on its
-/// background) is then moved further from the ground in lightness.
 fn words_floored(fg: Rgb, ground: Rgb, t: f32, floor: f32) -> Rgb {
     let mut k = t;
     let mut c = mix(fg, ground, k);
@@ -162,9 +153,6 @@ fn words_floored(fg: Rgb, ground: Rgb, t: f32, floor: f32) -> Rgb {
     c
 }
 
-/// Walks `x` from `start` by `step` until `done(x)`, and returns that `x`;
-/// where no `x` in `0..=1` is done, the end of the range (the best it
-/// allows).
 fn walk(start: f32, step: f32, done: impl Fn(f32) -> bool) -> f32 {
     let mut i = 0.0;
     loop {
@@ -176,9 +164,6 @@ fn walk(start: f32, step: f32, done: impl Fn(f32) -> bool) -> f32 {
     }
 }
 
-/// `c` itself when `ok(c)`; else `c`'s hue and chroma at the first
-/// lightness, stepped by `step` away from a dark ground (lighter) or a light
-/// one (darker), at which `ok` holds, or at the end of the range.
 fn pushed(c: Rgb, step: f32, dark: bool, ok: impl Fn(Rgb) -> bool) -> Rgb {
     if ok(c) {
         return c;
@@ -188,10 +173,6 @@ fn pushed(c: Rgb, step: f32, dark: bool, ok: impl Fn(Rgb) -> bool) -> Rgb {
     at(walk(x.l, if dark { step } else { -step }, |l| ok(at(l))))
 }
 
-/// `c` stepped `dl` in lightness at a time away from a dark ground (lighter)
-/// or a light one (darker) until `ok` holds, each step taken from the 8-bit
-/// colour the one before drew, with the chroma `tint` gives it; where the
-/// range runs out first, the last step.
 fn stepped(
     c: Rgb,
     dl: f32,
@@ -213,15 +194,10 @@ fn stepped(
     c
 }
 
-/// `c` pushed away from `ground` in lightness, hue kept, until it reads at
-/// least `floor` : 1 on it.
 fn floored(c: Rgb, ground: Rgb, floor: f32, dark: bool) -> Rgb {
     pushed(c, 0.004, dark, |x| contrast(x, ground) >= floor)
 }
 
-/// The point of the OkLab polyline through `stops` whose lightness is `l`;
-/// before the first stop or past the last, that stop's hue and chroma at
-/// `l`.
 fn polyline_at(stops: &[Lab], l: f32) -> Lab {
     for pair in stops.windows(2) {
         let (a, b) = (pair[0], pair[1]);
@@ -247,8 +223,6 @@ fn polyline_at(stops: &[Lab], l: f32) -> Lab {
     Lab { l, ..end }
 }
 
-/// The least lightness step between adjacent inks of `ramp`, counted away
-/// from the ground (a step back toward it is negative).
 fn min_rise(ramp: &[Rgb], dark: bool) -> f32 {
     let away = if dark { 1.0 } else { -1.0 };
     ramp.windows(2)
@@ -256,9 +230,6 @@ fn min_rise(ramp: &[Rgb], dark: bool) -> f32 {
         .fold(f32::INFINITY, f32::min)
 }
 
-/// The seven-step ramps the heat solver weighs on `ground` with step 0 at
-/// `floor` (Stats Deck v2 §9.1), in the order it weighs them, every floor
-/// judged on the 8-bit colour drawn.
 fn heat_ramps(
     ground: Rgb,
     floor: f32,
@@ -283,10 +254,6 @@ fn heat_ramps(
     })
 }
 
-/// The heat ramp on `ground` with step 0 at `floor`: the first of
-/// [`heat_ramps`] whose adjacent steps all stand [`HEAT_DL`] apart or,
-/// where none does, the one whose closest steps stand furthest apart (the
-/// first of equals), the best the range allows.
 fn heat_ramp(ground: Rgb, floor: f32, stops: &[Rgb], dark: bool) -> [Rgb; 7] {
     let mut best = ([[0; 3]; 7], f32::NEG_INFINITY);
     for ramp in heat_ramps(ground, floor, stops, dark) {
@@ -336,10 +303,6 @@ const LOAD_LIGHT: [Rgb; 5] = [
     [0x8C, 0x29, 0x01],
 ];
 
-/// The light heat polyline: the light load ramp with a near-neutral stop
-/// (`#857069`) where it turns from blue to rust, so the middle step reads
-/// "middle" rather than "hot", and a darker hot end (`#751A00`), so seven
-/// steps clear [`HEAT_DL`].
 const HEAT_LIGHT: [Rgb; 7] = [
     [0xBF, 0xD4, 0xE7],
     [0x99, 0xB2, 0xCF],
@@ -357,9 +320,6 @@ pub const fn heat_stops(dark: bool) -> &'static [Rgb] {
     if dark { &LOAD_DARK } else { &HEAT_LIGHT }
 }
 
-/// The light Increase Contrast polyline: step 0 at 3:1 on a light ground
-/// sits just above the light polyline's turn to rust, so there step 1 would
-/// already read hot.
 const HEAT_IC_LIGHT: [Rgb; 7] = [
     [0xBF, 0xD4, 0xE7],
     [0x99, 0xB2, 0xCF],
@@ -509,7 +469,6 @@ pub struct VitalsInks {
     pub critical_text: Rgb,
 }
 
-/// The over mark's orange (never red) before it is floored on the ground.
 const fn over_orange(dark: bool) -> Rgb {
     if dark {
         [0xFF, 0x9A, 0x2E]
@@ -897,9 +856,6 @@ mod tests {
         }
     }
 
-    /// On a light ground the Increase Contrast ramp warms step by step: its
-    /// first two steps stay muted (OkLab chroma under 0.06), so a low load
-    /// does not read as hot, and it reaches rust (over 0.12) by step 5.
     #[test]
     fn the_light_ic_ramp_warms_step_by_step() {
         let chroma = |c: Rgb| {
@@ -943,10 +899,6 @@ mod tests {
         }
     }
 
-    /// Every word on a stats surface meets AA and every rim F1, on the
-    /// grounds the Deck, the sill and the lens paint on: the band grounds of
-    /// Default and Default Light, the terminal backgrounds the sill sits on,
-    /// and the extremes, pure black and pure white.
     #[test]
     fn words_meet_aa_and_rims_meet_f1_on_every_ground() {
         let cases = [
@@ -980,8 +932,6 @@ mod tests {
         }
     }
 
-    /// The warn and critical inks read at 3:1 on both band grounds (they mark
-    /// a state, beside words that carry it too).
     #[test]
     fn the_state_inks_read_on_both_grounds() {
         for (ground, fg, acc) in [
@@ -1009,7 +959,6 @@ mod tests {
         }
     }
 
-    /// The heat bins of design v2 §6.0, edges included in the step above.
     #[test]
     fn heat_steps_follow_the_bins() {
         for (v, step) in [
@@ -1034,8 +983,6 @@ mod tests {
         }
     }
 
-    /// T-V3: an unknown value never becomes the filled 0 % cell. A NaN that
-    /// reaches the bins, or the held bins, stops a debug build.
     #[test]
     #[should_panic(expected = "not a reading")]
     fn a_nan_is_never_a_heat_step() {
@@ -1048,9 +995,6 @@ mod tests {
         let _ = heat_step_held(f32::NAN, 3);
     }
 
-    /// Differentiate Without Color's heights, design v2 §9.5's table, and
-    /// the rule's promise: in every cell of 7 px or more the height rises
-    /// strictly with the step and is never under 1 px.
     #[test]
     fn dwc_heights_follow_the_table() {
         for (cell, want) in [
@@ -1075,8 +1019,6 @@ mod tests {
         }
     }
 
-    /// The live ink changes step only a point past an edge, either way, and
-    /// a value that leaps several bins lands on the step it cleared.
     #[test]
     fn a_held_step_moves_only_a_point_past_an_edge() {
         for v in [0.395, 0.40, 0.405] {
@@ -1113,8 +1055,6 @@ mod tests {
         }
     }
 
-    /// T-V9 on the reference grounds: the solver reproduces the design v2
-    /// §9.1 table within one unit per channel, and every floor holds.
     #[test]
     fn the_deck_inks_reproduce_the_reference_table() {
         struct Row {
@@ -1208,10 +1148,6 @@ mod tests {
         assert_eq!(heat_stops(true), ramp_stops(true));
     }
 
-    /// T-V9 on a spread of grounds, black to the default dark band and white
-    /// to greys darker than the default light band (on #C0C0C0 the Increase
-    /// Contrast aterm ink once stalled short of its floor), with accents of
-    /// every kind: every floor holds.
     #[test]
     fn the_deck_inks_hold_on_every_ground() {
         let accents = [
@@ -1244,9 +1180,6 @@ mod tests {
         }
     }
 
-    /// A ground lighter than a dark band usually is leaves the Increase
-    /// Contrast ramp too little lightness above its 3:1 step 0 for seven
-    /// steps 0.05 apart once its yellow hot end clips.
     #[test]
     fn a_floor_out_of_reach_is_said_and_the_solver_still_answers() {
         let inks = vitals_inks(NORD_BAND, [0xEC, 0xEF, 0xF4], [0x88, 0xC0, 0xD0]);
@@ -1285,8 +1218,6 @@ mod tests {
         }
     }
 
-    /// NEGATIVE CONTROL: the check sees a broken ink, and never calls a
-    /// solver's fault the ground's.
     #[test]
     fn the_floor_check_catches_a_broken_ink() {
         let good = vitals_inks(DEFAULT_DARK_BAND, DEFAULT_FG, DEFAULT_ACCENT);
@@ -1318,11 +1249,6 @@ mod tests {
         }
     }
 
-    /// A mid-tone ground lies beyond the heat polyline's first stop, which
-    /// can read step 0's floor on the ground's near side already; step 0
-    /// stands on the far side still, so the ramp never passes back through
-    /// the ground (on #686868 to #9C9C9C step 0 once sat under the ground,
-    /// and middle steps read 1.0:1 on it).
     #[test]
     fn the_heat_ramp_never_crosses_a_mid_tone_ground() {
         for v in 0x60..=0xA0 {

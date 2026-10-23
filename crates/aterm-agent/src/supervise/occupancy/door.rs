@@ -18,7 +18,7 @@ pub const INTENT_RULE: &str = "fact-intent@v1";
 pub struct StatusSeen {
     /// Server's person stamp (`human_ms=`; [`HumanInput::of_status`]).
     pub human: HumanInput,
-    /// Another driver's hand is on the session (`hand=lease:…`).
+    /// Another driver's hand is on the session (`hand=lease:…` not this harness's, or a turn's).
     pub driver: bool,
     /// The session is halted (`hold=1`).
     pub halted: bool,

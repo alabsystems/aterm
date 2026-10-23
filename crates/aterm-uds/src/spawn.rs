@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows console creation flags (`dwCreationFlags`) for child processes ([`Console`], [`set_flags`], [`set_gui_image_flags`]).
+//! Windows console creation flags (`dwCreationFlags`) for child processes ([`Console`](crate::spawn::Console), [`set_flags`](crate::spawn::set_flags), [`set_gui_image_flags`](crate::spawn::set_gui_image_flags)).
 use crate::spawnfd::StdCommand;
 
 /// `DETACHED_PROCESS` (`WinBase.h`): spawns the child without a console ([`Console::Detached`]).

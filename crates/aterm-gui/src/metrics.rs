@@ -105,7 +105,9 @@ window_ledger! {
 }
 
 window_ledger! {
-    /// What input measures: the keystroke slices, the input legs the typing audit named as unmeasured, and the refusals of the input contract.
+    /// What input measures: the keystroke slices, the input legs the typing audit named as
+    /// unmeasured, and the refusals of the input contract; and the costs printed beside them
+    /// (menu-bar glance, need publication, transcript holds).
     pub(crate) struct InputLedger {
         pub(crate) input: Dist,
         /// When the worst `input` slice was booked (`now_ns`).

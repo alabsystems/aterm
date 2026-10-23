@@ -3,13 +3,8 @@
 
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! aterm-agent: the agent interface layer — the window harness's supervisor
-//! ([`supervise`]), its readings and the live upgrade ([`harness`]), the
-//! `aterm drive` CLI over them ([`drive_cli`]), the `aterm fleet` CLI
-//! ([`fleet_cli`]), the AI connections ([`ai`]), and the two control clients
-//! they drive a host through: [`CtlClient`] (this build's own `ctl` verb, one
-//! process per request) and [`RelayClient`] (one persistent, authenticated
-//! connection).
+//! Agent interface layer ([`supervise`], [`harness`], [`drive_cli`], [`fleet_cli`], [`ai`]).
+//! Control clients: [`CtlClient`] and [`RelayClient`].
 #![cfg_attr(
     test,
     allow(
@@ -35,24 +30,23 @@ pub mod fleet_cli;
 /// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a fleet.
 #[cfg(unix)]
 mod fleet_member;
-/// `aterm ctl survey --fleet | --host`: the fleet's peers, read over its port (`aterm_ctl::LocalVerbs::fleet_survey`); `aterm ctl --host <h> …`: another Mac driven over it (`aterm_ctl::LocalVerbs::fleet_drive`).
+/// `aterm ctl survey --fleet | --host`: the fleet's peers; `aterm ctl --host <h> …`: another Mac
+/// driven over it.
 #[cfg(unix)]
 pub use fleet_member::{drive_fleet, survey_fleet};
-/// The harness core: the pure readings behind the aterm wrapper (the usage view, the disk report, the footer) and the live upgrade and relaunch.
+/// The harness core.
 pub mod harness;
-/// The launcher's half of `aterm --headless --ready-fd <n>`: wait on the instance's own word that its control socket listens.
+/// The launcher's half of `aterm --headless --ready-fd <n>`.
 #[cfg(unix)]
 pub mod ready;
-/// The supervisor: read-only classification, prompt parsing, the worker's phase, and the loop the window's own host runs on every agent session.
+/// The supervisor: read-only classification and the loop the window's own host runs on every
+/// agent session.
 pub mod supervise;
 
 /// The verb the one binary answers a control request on: `aterm ctl …`.
 pub const CTL_VERB: &str = "ctl";
 
-/// This process's own executable, resolved through any argv0 alias link
-/// (`aterm-drive` -> `aterm`), for a control client run as `<it> ctl …`
-/// ([`CtlClient::own_at`]): the one binary answers `aterm ctl`.
-///
+/// This process's own executable ([`CtlClient::own_at`]).
 /// # Errors
 /// The executable could not be read.
 pub fn own_exe() -> Result<std::path::PathBuf, String> {
@@ -71,9 +65,7 @@ fn resolved_exe(exe: std::path::PathBuf) -> std::path::PathBuf {
     }
 }
 
-/// A client that drives a target aterm by shelling out to a control client —
-/// this program's own `ctl` verb ([`CtlClient::own_at`]) — one process per
-/// request, reusing the verbs a human would type.
+/// A client that drives a target aterm by shelling out to a control client ([`CtlClient::own_at`]).
 pub struct CtlClient {
     ctl: std::path::PathBuf,
     /// The arguments before `--sock` (the `ctl` verb, for [`Self::own_at`]).
@@ -91,8 +83,7 @@ impl CtlClient {
         }
     }
 
-    /// A client run as `<exe> ctl …`: `exe` is [`own_exe`], this build's own
-    /// binary, which answers the `ctl` verb.
+    /// A client run as `<exe> ctl …` ([`own_exe`]).
     pub fn own_at(exe: impl Into<std::path::PathBuf>, socket: Option<String>) -> Self {
         Self {
             lead: vec![CTL_VERB.to_string()],
@@ -111,9 +102,7 @@ impl CtlClient {
         }
     }
 
-    /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both
-    /// streams, so the supervisor can tell a `124` timeout and an `ERR usage`
-    /// from a failure.
+    /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both streams.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
         let mut cmd = aterm_uds::spawnfd::command(&self.ctl);
         cmd.args(&self.lead);
@@ -136,8 +125,6 @@ impl CtlClient {
     }
 }
 
-/// Why a failed `aterm-ctl` run failed, in one string: its stderr, else (a
-/// run that exited non-zero in silence) its stdout line and exit code.
 fn failure_words(reply: &supervise::CtlReply) -> String {
     let err = reply.stderr.trim();
     if !err.is_empty() {
@@ -149,12 +136,8 @@ fn failure_words(reply: &supervise::CtlReply) -> String {
     }
 }
 
-/// Max body lines a single `text` reply may contain: a bound on an untrusted
-/// `OK <n>` count from a possibly compromised relay peer.
 const MAX_TEXT_LINES: usize = 200_000;
-/// Max bytes before a control-protocol line's LF, including an optional CR.
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
-/// Max retained bytes in one counted reply.
 const MAX_REPLY_BYTES: usize = 256 << 20; // 256 MiB
 
 #[inline]
@@ -162,9 +145,6 @@ fn is_ok_reply(header: &str) -> bool {
     header == "OK" || header.starts_with("OK ")
 }
 
-/// A numeric reply count that does not fit `usize` is an invalid count,
-/// never an uncounted status: otherwise its unread body becomes the next
-/// request's reply on this persistent connection.
 fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     let Some(token) = header
         .strip_prefix("OK ")
@@ -189,33 +169,24 @@ fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     }
 }
 
-/// One persistent, authenticated control connection, the in-process twin of
-/// [`CtlClient`]: it speaks the raw control verbs directly, with the same verbs
-/// and framing `CtlClient` drives through `aterm-ctl`.
+/// One persistent, authenticated control connection, the in-process twin of [`CtlClient`].
 pub struct RelayClient<S: Read + Write> {
     io: S,
-    /// Sends only [`READ_VERBS`] ([`Self::reads_only`]): anything else is
-    /// refused before a byte is written.
+    /// Sends only [`READ_VERBS`] ([`Self::reads_only`]).
     reads_only: bool,
     /// Bytes read past the last consumed line boundary (the next reply's prefix).
     buf: Vec<u8>,
-    /// The `OK` replies to `help <verb>` this connection has had
-    /// ([`Self::help_counted`]): a verb's help is its server build's, fixed
-    /// for the connection's life.
+    /// The `OK` replies to `help <verb>` this connection has had ([`Self::help_counted`]).
     help: Vec<(String, (String, String))>,
 }
 
-/// The verbs a read-only connection may send ([`RelayClient::reads_only`]):
-/// each observes, and none changes the session, its screen, its leases or its
-/// processes.
+/// The verbs a read-only connection may send ([`RelayClient::reads_only`]).
 pub const READ_VERBS: &[&str] = &[
     "text", "screen", "line", "cell", "cursor", "modes", "blocks", "history", "status", "timeline",
     "metrics", "await", "who", "sessions", "help", "meta", "ls", "doc",
 ];
 
-/// Whether the control request `line` (an optional `@<sid>` selector, then the
-/// verb) is one [`READ_VERBS`] names, and a bare `meta` when it is `meta`
-/// (a read form of `metrics` and `doc` when it is one of those).
+/// Whether the control request `line` is one [`READ_VERBS`] names, in its read form.
 fn is_read_request(line: &str) -> bool {
     let mut words = line.split_whitespace().skip_while(|w| w.starts_with('@'));
     match words.next() {
@@ -230,8 +201,7 @@ fn is_read_request(line: &str) -> bool {
     }
 }
 
-/// How many verbs' help one [`RelayClient`] remembers; past it, a verb's help
-/// is asked each time.
+/// How many verbs' help one [`RelayClient`] remembers.
 const HELP_MEMO_MAX: usize = 16;
 
 impl<S: Read + Write> RelayClient<S> {
@@ -245,10 +215,8 @@ impl<S: Read + Write> RelayClient<S> {
         }
     }
 
-    /// This connection, able to send the read verbs alone ([`READ_VERBS`]):
-    /// every other request — an input verb, a signal, a lease, a `meta set`, a
-    /// length-framed write — is refused before a byte is written
-    /// (`PermissionDenied`).
+    /// This connection, able to send the read verbs alone ([`READ_VERBS`]): every other request
+    /// is refused before a byte is written (`PermissionDenied`).
     #[inline]
     #[must_use]
     pub const fn reads_only(mut self) -> Self {
@@ -268,9 +236,8 @@ impl<S: Read + Write> RelayClient<S> {
         ))
     }
 
-    /// `help <verb>` as [`Self::request_counted`] reads it, asked once per
-    /// connection: a connection speaks to one server build for its life.
-    ///
+    /// `help <verb>` as [`Self::request_counted`] reads it, asked once per connection. Only an
+    /// `OK` reply is kept, for up to `HELP_MEMO_MAX` verbs; anything else is asked again.
     /// # Errors
     /// As [`Self::request_counted`].
     pub fn help_counted(&mut self, verb: &str) -> std::io::Result<(String, String)> {
@@ -284,7 +251,6 @@ impl<S: Read + Write> RelayClient<S> {
         Ok(reply)
     }
 
-    /// Read the first line of a reply.
     fn read_reply(&mut self) -> std::io::Result<String> {
         let line = self.read_line()?;
         match aterm_types::control_verbs::host_gone(&line) {
@@ -299,7 +265,6 @@ impl<S: Read + Write> RelayClient<S> {
         }
     }
 
-    /// Read one `\n`-terminated line, returned without its trailing `\r?\n`.
     fn read_line(&mut self) -> std::io::Result<String> {
         loop {
             let end = self.buf.iter().position(|&b| b == b'\n');
@@ -331,7 +296,6 @@ impl<S: Read + Write> RelayClient<S> {
         }
     }
 
-    /// Write one request line (`line` + `\n`) and flush.
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
         self.may_send(line)?;
         if line.contains(['\n', '\r']) {
@@ -345,26 +309,20 @@ impl<S: Read + Write> RelayClient<S> {
         self.io.flush()
     }
 
-    /// The underlying transport, so a caller can take a second handle on the
-    /// connection (`try_clone` on a `CtlStream`).
+    /// The underlying transport.
     pub const fn transport(&self) -> &S {
         &self.io
     }
 
-    /// Send one control line and read one reply line (`OK …` or `ERR …`),
-    /// returned verbatim.
-    ///
+    /// Send one control line and read one reply line (`OK …` or `ERR …`), returned verbatim.
     /// # Errors
-    /// I/O errors writing the request or reading the reply, and a request
-    /// carrying an embedded line terminator.
+    /// I/O errors writing the request or reading the reply, or an embedded line terminator.
     pub fn request_line(&mut self, line: &str) -> std::io::Result<String> {
         self.write_line(line)?;
         self.read_reply()
     }
 
-    /// Send one control line and read a counted reply: the header, then the
-    /// `n` body lines when the header is `OK <n>` with a numeric `<n>`.
-    ///
+    /// Send one control line and read a counted reply.
     /// # Errors
     /// I/O errors, or a count/body past the client's own reply bounds.
     pub fn request_counted(&mut self, line: &str) -> std::io::Result<(String, String)> {
@@ -376,7 +334,6 @@ impl<S: Read + Write> RelayClient<S> {
         Ok((header, self.read_body_lines(count, MAX_REPLY_BYTES)?))
     }
 
-    /// The shared collector for text and generic counted replies.
     fn read_body_lines(&mut self, count: usize, max_bytes: usize) -> std::io::Result<String> {
         if count > MAX_TEXT_LINES {
             return Err(std::io::Error::new(
@@ -399,13 +356,9 @@ impl<S: Read + Write> RelayClient<S> {
         Ok(body)
     }
 
-    /// Send one control line and read a byte-framed reply: the header, then
-    /// exactly `n` raw bytes when the header is `OK <n>` and `<n>` is a
-    /// number (`inbox get`, `cast`).
-    ///
+    /// Send one control line and read a byte-framed reply.
     /// # Errors
-    /// I/O errors, a body past the line bound, or a stream that ends inside
-    /// the body.
+    /// I/O errors, a body past the line bound, or a stream that ends inside the body.
     pub fn request_bytes(&mut self, line: &str) -> std::io::Result<(String, Vec<u8>)> {
         let header = self.request_line(line)?;
         let count = reply_count(&header)?;
@@ -433,9 +386,7 @@ impl<S: Read + Write> RelayClient<S> {
         Ok((header, body))
     }
 
-    /// Send one length-framed request — `<head> <len>\n` and then `payload` —
-    /// and read its one reply line, returned verbatim.
-    ///
+    /// Send one length-framed request.
     /// # Errors
     /// I/O errors, and a `head` carrying a line terminator.
     pub fn request_frame(&mut self, head: &str, payload: &[u8]) -> std::io::Result<String> {
@@ -459,9 +410,7 @@ impl<S: Read + Write> RelayClient<S> {
         self.read_reply()
     }
 
-    /// Read one line a server pushed on a connection that is already parked
-    /// on a stream (`subscribe`).
-    ///
+    /// Read one line a server pushed on a connection that is already parked on a stream.
     /// # Errors
     /// I/O errors, and `UnexpectedEof` when the stream ends.
     pub fn next_pushed(&mut self) -> std::io::Result<String> {
@@ -470,31 +419,22 @@ impl<S: Read + Write> RelayClient<S> {
 }
 
 impl RelayClient<aterm_uds::CtlStream> {
-    /// Connect to a local control socket and authenticate: `connect(sock)`, then
-    /// a bare `AUTH <token>\n` (acknowledged silently).
-    ///
+    /// Connect to a local control socket and authenticate.
     /// # Errors
     /// I/O errors connecting to `sock_path` or writing the auth line.
     pub fn connect_local(sock_path: &str, token: &str) -> std::io::Result<Self> {
         Self::authenticated(aterm_uds::CtlStream::connect(sock_path)?, token)
     }
 
-    /// [`connect_local`](RelayClient::connect_local) with the instance token
-    /// beside the socket, read only after the connect succeeds
-    /// ([`aterm_ctl::connect_then_read_token`]): a token read earlier can belong
-    /// to a listener an update's successor has since replaced.
-    ///
+    /// [`connect_local`](RelayClient::connect_local) with [`aterm_ctl::connect_then_read_token`].
     /// # Errors
-    /// I/O errors connecting to `sock_path` or writing the auth line; a token
-    /// that cannot be read, prefixed `token: ` and naming the file.
+    /// I/O errors connecting to `sock_path`, writing the auth line, or reading the token file.
     pub fn connect_local_beside(sock_path: &str) -> std::io::Result<Self> {
         let (stream, token) = aterm_ctl::connect_then_read_token(sock_path)?;
         let token = token.map_err(|e| std::io::Error::new(e.kind(), format!("token: {e}")))?;
         Self::authenticated(stream, &token)
     }
 
-    /// Present `token` on a connection just made: the bare `AUTH` line the
-    /// server acknowledges silently.
     fn authenticated(stream: aterm_uds::CtlStream, token: &str) -> std::io::Result<Self> {
         let mut client = Self::new(stream);
         client.write_line(&format!("AUTH {token}"))?;
@@ -502,9 +442,7 @@ impl RelayClient<aterm_uds::CtlStream> {
     }
 }
 
-/// The help for the `aterm drive` tool, written so a model reading `--help` in
-/// a tool result knows what each command reads and prints, and where driving
-/// went (`aterm ctl`), without external docs.
+/// The help for the `aterm drive` tool.
 pub const DRIVE_HELP: &str = "\
 aterm drive — the window harness's readers, run by hand.
 

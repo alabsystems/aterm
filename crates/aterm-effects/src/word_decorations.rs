@@ -4277,36 +4277,38 @@ impl WordDecorations {
         }
         self.frame = self.frame.wrapping_add(1);
         self.begin_baker_frame(geom, true);
-        self.episode_prepass(now, cfg, geom);
+        let prepass = self.episode_prepass(now, cfg, geom);
         let anim = Duration::from_millis(cfg.anim_ms);
         let mut fp = FNV64_OFFSET;
         let mut active_until: Option<Instant> = None;
         let mut nuke_pending: Option<(u64, i32, i32)> = None;
-        if let Some(until) = self.super_prepass(now, cfg, geom, sel) {
+        if let Some(until) = self.super_prepass(now, cfg, geom, sel, prepass.has_super) {
             arm_until(&mut active_until, until);
         }
-        if let Some(until) = self.nova_prepass(now, cfg, geom, sel) {
+        if let Some(until) = self.nova_prepass(now, cfg, geom, sel, prepass.has_nova) {
             arm_until(&mut active_until, until);
         }
-        for occ in &self.occ {
-            if occ.class != Class::Profanity || occ.inert {
-                continue;
+        if prepass.has_bonk {
+            for occ in &self.occ {
+                if occ.class != Class::Profanity || occ.inert {
+                    continue;
+                }
+                let Some(ep) = self.persist.get_mut(&occ.ident) else {
+                    continue;
+                };
+                if !ep.bonk_pending {
+                    continue;
+                }
+                if self.curse_cues.len() >= MAX_CURSE_CUES {
+                    break;
+                }
+                ep.bonk_pending = false;
+                self.curse_cues.push(CurseCue {
+                    kind: CurseCueKind::Typed,
+                    row: occ.row,
+                    col: occ.start_col,
+                });
             }
-            let Some(ep) = self.persist.get_mut(&occ.ident) else {
-                continue;
-            };
-            if !ep.bonk_pending {
-                continue;
-            }
-            if self.curse_cues.len() >= MAX_CURSE_CUES {
-                break;
-            }
-            ep.bonk_pending = false;
-            self.curse_cues.push(CurseCue {
-                kind: CurseCueKind::Typed,
-                row: occ.row,
-                col: occ.start_col,
-            });
         }
         let frame = self.frame;
         let claim = self.companion_claim;
@@ -4687,7 +4689,13 @@ impl WordDecorations {
         fp
     }
 
-    fn episode_prepass(&mut self, now: Instant, cfg: &DecoConfig, geom: EffectGeom) {
+    fn episode_prepass(
+        &mut self,
+        now: Instant,
+        cfg: &DecoConfig,
+        geom: EffectGeom,
+    ) -> PrepassFlags {
+        let mut flags = PrepassFlags::default();
         let (mut cat_slots, mut animal_slots) =
             self.occ.iter().fold((0usize, 0usize), |(c, a), occ| {
                 let Some(g) = occ.spec.graphic else {
@@ -4706,12 +4714,18 @@ impl WordDecorations {
                 }
             });
         for occ in &self.occ {
+            match occ.spec.burst.map(|b| b.kind) {
+                Some(BurstKind::SuperNova) => flags.has_super = true,
+                Some(BurstKind::Nova) => flags.has_nova = true,
+                _ => {}
+            }
             if occ.inert {
                 continue;
             }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
                 continue;
             };
+            flags.has_bonk |= ep.bonk_pending;
             if ep.inert() {
                 continue;
             }
@@ -4840,6 +4854,7 @@ impl WordDecorations {
             }
         }
         self.stamp_spent_marks(now, cfg.reduced_motion);
+        flags
     }
 
     fn stamp_spent_marks(&mut self, now: Instant, reduced_motion: bool) {
@@ -4870,6 +4885,9 @@ impl WordDecorations {
     }
 
     fn prune_ignitions(&mut self, now: Instant) {
+        if self.ignitions.is_empty() {
+            return;
+        }
         let persist = &self.persist;
         let scope = self.scan_scope();
         self.ignitions.retain(|reservation| {
@@ -4897,6 +4915,7 @@ impl WordDecorations {
         cfg: &DecoConfig,
         geom: EffectGeom,
         sel: Option<SelView<'_>>,
+        has_super: bool,
     ) -> Option<Instant> {
         self.supers.clear();
         self.super_until = None;
@@ -4941,6 +4960,9 @@ impl WordDecorations {
             if let Some(e) = p.super_end_max.filter(|e| now < *e) {
                 self.super_until = Some(self.super_until.map_or(e, |u: Instant| u.max(e)));
             }
+        }
+        if !has_super {
+            return until;
         }
         let scope = self.scan_scope();
         for (i, occ) in self.occ.iter().enumerate() {
@@ -5011,10 +5033,11 @@ impl WordDecorations {
         cfg: &DecoConfig,
         geom: EffectGeom,
         sel: Option<SelView<'_>>,
+        has_nova: bool,
     ) -> Option<Instant> {
         self.novas.clear();
         self.coupling.clear();
-        if cfg.reduced_motion {
+        if cfg.reduced_motion || !has_nova {
             return None;
         }
         let super_busy = self.super_until.is_some_and(|t| now < t);
@@ -5118,6 +5141,13 @@ impl WordDecorations {
                 .values()
                 .any(|p| p.active_until.is_some_and(|d| now < d))
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PrepassFlags {
+    has_super: bool,
+    has_nova: bool,
+    has_bonk: bool,
 }
 
 #[inline]

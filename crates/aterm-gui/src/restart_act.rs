@@ -16,21 +16,19 @@ use aterm_agent::harness::restart_stamp::{self, Stamp};
 
 use crate::SessionCtx;
 
-/// How long after its `SIGTERM` a deaf program (its stall still published, nothing read since the drop) is given before the act's `SIGKILL`: the grace after which the stall's attention already names `signal kill` ([`crate::input_stall::RESTART_GRACE`]).
+/// How long after its `SIGTERM` a deaf program is given before the act's `SIGKILL`
+/// ([`crate::input_stall::RESTART_GRACE`]).
 pub(crate) const GRACE: Duration = crate::input_stall::RESTART_GRACE;
 
-/// Minimum test value of [`GRACE`]. The grace decides which signal ends a
-/// program only when the stall marks it deaf ([`escalate`]); one with no stall
-/// published is given [`DEADLINE`].
+/// Minimum test value of [`GRACE`] ([`escalate`], [`DEADLINE`]).
 const GRACE_TEST_FLOOR: Duration = Duration::from_secs(1);
 
-/// The grace the act waits: [`GRACE`] in a shipped build, or its floored test
-/// value on `aterm_gui_timing`.
+/// The grace the act waits ([`GRACE`]).
 fn grace() -> Duration {
     aterm_gui_timing::current().of_at_least(GRACE, GRACE_TEST_FLOOR)
 }
 
-/// The act's deadline in any case: a program that still leads its tab this long after `SIGTERM` is ended with `SIGKILL` so a later manual `/exit` cannot be mistaken for the act's exit and relaunched.
+/// The act's deadline in any case.
 pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The verb's arguments.
@@ -70,7 +68,7 @@ pub(crate) fn parse(rest: &str) -> Result<Ask, String> {
     Ok(ask)
 }
 
-/// Whether a running stall is published in `tl` for the foreground group `pgrp`: one over that leader, or — when its leader was not read — over a running program (never a stopped job, whose remedy is `signal cont`).
+/// Whether a running stall is published in `tl` for the foreground group `pgrp`.
 pub(crate) fn stalled_for(tl: &crate::session_timeline::SessionTimeline, pgrp: i32) -> bool {
     tl.agent().input.as_ref().is_some_and(|fact| {
         fact.restart
@@ -79,7 +77,7 @@ pub(crate) fn stalled_for(tl: &crate::session_timeline::SessionTimeline, pgrp: i
     })
 }
 
-/// Why the act cannot be made in `ctx`'s session for the leader `pgrp` started at `start` (`None` if it can): no host snapshot names that process (`not-the-hosts-agent`), its relaunch would not bring it back (`not-relaunchable`), or the host does not hold supervision ([`crate::input_stall::host_hand_refusal`]: `not-supervised`, `halted`, `driver-lease`, `driver-turn`).
+/// Why the act cannot run for `pgrp` at `start` ([`crate::input_stall::host_hand_refusal`]).
 pub(crate) fn unavailable(
     ctx: &SessionCtx,
     pgrp: i32,
@@ -95,8 +93,7 @@ pub(crate) fn unavailable(
     )
 }
 
-/// [`unavailable`] for the tab's shell's home `home`, which a test names so the
-/// relaunch's predicate never reads the person's own (its hook files).
+/// [`unavailable`] for the tab's shell's home `home`.
 fn unavailable_for(
     ctx: &SessionCtx,
     pgrp: i32,
@@ -109,25 +106,44 @@ fn unavailable_for(
     let Some(snap) = snap else {
         return Some("not-the-hosts-agent");
     };
-    let relaunchable = match crate::self_claim::copy_of_tab(ctx.self_id.as_str())
-        .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
-    {
-        Some(copy) => copy.resume.is_ok(),
-        None => {
-            lane_relaunches(&snap)
-                && home.is_some_and(|home| {
-                    aterm_agent::harness::relaunch::carries_restart(home, &snap)
-                })
-        }
-    };
-    if !relaunchable {
+    if !relaunchable(ctx.self_id.as_str(), &snap, home) {
         return Some("not-relaunchable");
     }
     crate::input_stall::host_hand_refusal(ctx, now_us)
 }
 
-/// Whether `snap`'s agent can be relaunched by its lane without a self-claim
-/// copy.
+/// Whether the act's relaunch would bring back the agent the host's snapshot `snap` of tab
+/// `sid` names: a validated self-claim resume line, or a lane that relaunches it and carries
+/// the restart for the tab's shell's home `home` ([`unavailable_for`]'s `not-relaunchable`).
+fn relaunchable(
+    sid: &str,
+    snap: &aterm_agent::harness::relaunch::Snapshot,
+    home: Option<&std::path::Path>,
+) -> bool {
+    match crate::self_claim::copy_of_tab(sid)
+        .filter(|copy| copy.pid == snap.pid && copy.start == snap.start)
+    {
+        Some(copy) => copy.resume.is_ok(),
+        None => {
+            lane_relaunches(snap)
+                && home
+                    .is_some_and(|home| aterm_agent::harness::relaunch::carries_restart(home, snap))
+        }
+    }
+}
+
+/// WHETHER THE ACT IS OFFERED FOR PROCESS `pid` IN TAB `sid` as far as a word outside the
+/// session can tell (the Claude Code footer's `weekly ? · restart tab`): the host's published
+/// snapshot names that process (else `not-the-hosts-agent`: an Autopilot-off tab has none) and
+/// its relaunch would bring it back (else `not-relaunchable`, a program with no shell under it
+/// among them). The host's hand (`not-supervised`, `halted`, a driver's lease or turn) is the
+/// act's to judge when it is asked: a hold or a lease passes, and the word stands after it.
+pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
+    crate::harness_host::published_snapshot(sid)
+        .filter(|snap| snap.pid == pid)
+        .is_some_and(|snap| relaunchable(sid, &snap, aterm_primer::home_dir().as_deref()))
+}
+
 const fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
     match &snap.run {
         aterm_agent::harness::relaunch::AgentRun::Claude
@@ -138,21 +154,21 @@ const fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> boo
     }
 }
 
-/// Where the explicit restart would be carried ([`offered`]): the process it names, and whether its exit is relaunched on the agent's own conversation.
+/// Where the explicit restart would be carried ([`offered`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Offer {
     /// The process the act names (`restart pid=<n> if-stalled`): the host's snapshot's, the stall's leader where the watch read one.
     pub(crate) pid: u32,
-    /// Whether the offer promises relaunch on the conversation: a validated self-claim resume line with a shell, or a lane plan satisfying [`aterm_agent::harness::relaunch::resumes_on_exit`].
+    /// Whether the offer promises relaunch ([`aterm_agent::harness::relaunch::resumes_on_exit`]).
     pub(crate) promised: bool,
 }
 
-/// The shared restart offer for stall refusals, attention entries, menus, bands and supervisor mail.
+/// The shared restart offer for stall refusals.
 pub(crate) fn offered(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> Option<Offer> {
     offered_unless(ctx, leader, now_us, None)
 }
 
-/// Whether the act would be offered but for a hold: every fence of [`offered`] holds except the host's hand, which a hold alone refuses (`halted`, [`crate::input_stall::host_hand_refusal`]).
+/// Offer check ignoring holds ([`offered`], [`crate::input_stall::host_hand_refusal`]).
 pub(crate) fn offered_but_for_hold(ctx: &SessionCtx, leader: Option<i32>, now_us: u64) -> bool {
     offered_unless(ctx, leader, now_us, Some("halted")).is_some()
 }
@@ -194,7 +210,7 @@ fn offered_unless(
     })
 }
 
-/// The `restart` verb as control dispatch runs it: [`restart_in`] on the host's harness state directory ([`crate::harness_host::harness_state`]).
+/// The `restart` verb as dispatch runs it ([`restart_in`], [`crate::harness_host::harness_state`]).
 #[cfg(unix)]
 pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String {
     restart_in(
@@ -205,7 +221,7 @@ pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String 
     )
 }
 
-/// Runs [`begin`] (reads, fences, stamp) followed by [`Stamped::signal`] (re-read, discard, `SIGTERM`) against `state`.
+/// Runs [`begin`] ([`Stamped::signal`]).
 #[cfg(unix)]
 pub(crate) fn restart_in(
     master: i32,
@@ -314,8 +330,6 @@ pub(crate) fn begin<'a>(
     })
 }
 
-/// Serializes acts in this instance from first read to signal so two concurrent
-/// acts on one tab cannot both write stamps and have one take back the other's.
 static ACTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// An act stamped by [`begin`] and not yet signalled, holding [`ACTING`].
@@ -334,7 +348,7 @@ pub(crate) struct Stamped<'a> {
 
 #[cfg(unix)]
 impl Stamped<'_> {
-    /// Second half of the act (steps 4–6): re-reads the leader, discards unread input, sends `SIGTERM`, and starts the escalation watch — or takes back a newly written stamp if the leader moved or `killpg` failed ([`take_back`]).
+    /// Second half of the act ([`take_back`]).
     pub(crate) fn signal(self) -> String {
         let Self {
             master,
@@ -378,9 +392,7 @@ impl Stamped<'_> {
     }
 }
 
-/// Renews a joined stamp with the current timestamp once `SIGTERM` has been
-/// sent, preserving its process identity and cause so the escalation watch has a
-/// full window beyond [`KILL_READ_MARGIN`].
+/// Renews a joined stamp once `SIGTERM` has been sent ([`KILL_READ_MARGIN`]).
 #[cfg(unix)]
 fn renew(state: &std::path::Path, sid: &str, joined: Stamp) -> Stamp {
     let at = aterm_time::unix_secs().unwrap_or(joined.at).max(joined.at);
@@ -400,7 +412,7 @@ fn renew(state: &std::path::Path, sid: &str, joined: Stamp) -> Stamp {
     }
 }
 
-/// Windows: no process groups to signal; the verb answers so.
+/// Windows: no process groups to signal.
 #[cfg(not(unix))]
 pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String {
     let _ = (master, rest, ctx);
@@ -439,7 +451,7 @@ enum Signalled {
     Failed,
 }
 
-/// Whether the process `pgrp` started at `start` still leads `master`'s foreground group (step 4): the same group in front, its leader the same process.
+/// Whether the process `pgrp` started at `start` still leads `master`'s foreground group.
 #[cfg(unix)]
 pub(crate) fn leads(master: i32, pgrp: i32, start: &str) -> bool {
     // SAFETY: `tcgetpgrp` only reads the master's foreground group.
@@ -481,9 +493,7 @@ fn term(master: i32, sink: &aterm_session::sink::SinkWriter, pgrp: i32, start: &
     }
 }
 
-/// Active escalation and carrier watches, at most one per process (group and
-/// kernel start; [`watch`]), each recording the latest instant its stamp stands
-/// until.
+/// Active escalation and carrier watches ([`watch`]).
 static ESCALATING: std::sync::Mutex<Vec<Watched>> = std::sync::Mutex::new(Vec::new());
 
 /// One running watch in [`ESCALATING`].
@@ -497,18 +507,18 @@ struct Watched {
     stands_until: Instant,
 }
 
-/// A watch on one process (`pgrp` started at `start`), listed in [`ESCALATING`] from [`watch`] until it lets its program go ([`Watch::left`]) or is dropped.
+/// A watch on one process ([`ESCALATING`], [`watch`], [`Watch::left`]).
 pub(crate) struct Watch {
     id: u64,
     pgrp: i32,
     pid: u32,
     start: String,
-    /// Harness state directory holding the tab's stamp, re-read on every look
-    /// ([`Watch::named`]).
+    /// Harness state directory holding the tab's stamp, re-read on every look ([`Watch::named`]).
     state: std::path::PathBuf,
 }
 
-/// Registers a watch for `pgrp` at `stamp`, or raises the `stands_until` time of an existing watch for the same process (`pgrp` and `stamp.start`) and returns `None`.
+/// Registers a watch for `pgrp` at `stamp`, or raises the `stands_until` time of an existing watch
+/// for the same process and returns `None`.
 pub(crate) fn watch(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Option<Watch> {
     let until = stands_until(stamp);
     with_watches(|listed| {
@@ -523,7 +533,7 @@ pub(crate) fn watch(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Option
     })
 }
 
-/// Lists a watch beside any already running on the same process (for tests that run a watch with custom clocks alongside an act's).
+/// Lists a watch beside any already running on the same process.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn watch_beside(state: &std::path::Path, pgrp: i32, stamp: &Stamp) -> Watch {
     let until = stands_until(stamp);
@@ -542,25 +552,19 @@ pub(crate) fn escalating(pgrp: i32) -> bool {
     watches(pgrp) > 0
 }
 
-/// Locks [`ESCALATING`] for `f` (which takes no other lock, though it may read a
-/// tab's stamp file in [`Watch::left`]).
+/// Locks [`ESCALATING`] for `f` ([`Watch::left`]).
 fn with_watches<R>(f: impl FnOnce(&mut Vec<Watched>) -> R) -> R {
     f(&mut ESCALATING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
-/// The instant `stamp` stands until on this instance's clock, or `Instant::now()`
-/// on overflow (a corrupt future timestamp in the state directory, so its watch
-/// sends nothing).
 fn stands_until(stamp: &Stamp) -> Instant {
     let now = Instant::now();
     now.checked_add(stamp.stands_for(aterm_time::unix_secs().unwrap_or(0)))
         .unwrap_or(now)
 }
 
-/// The last instant a `SIGKILL` leaves its reader a stamp standing until
-/// `stands_until` (`None` if the clock cannot represent it).
 fn kill_until_of(stands_until: Instant) -> Option<Instant> {
     stands_until.checked_sub(KILL_READ_MARGIN)
 }
@@ -568,8 +572,8 @@ fn kill_until_of(stands_until: Instant) -> Option<Instant> {
 /// Why a watch lets its program go ([`Watch::left`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LetGo {
-    /// The latest stamp it watches by no longer stands past [`KILL_READ_MARGIN`],
-    /// or the watch is no longer listed.
+    /// The latest stamp it watches by no longer stands past [`KILL_READ_MARGIN`], or the watch is
+    /// no longer listed.
     Lapsed,
     /// The tab's stamp on disk no longer names its program (replaced by another
     /// act or taken).
@@ -601,15 +605,13 @@ impl Watch {
         }
     }
 
-    /// Whether the tab's on-disk stamp still names this watch's program and has
-    /// not expired.
     fn named(&self, tab: &str) -> bool {
         let now = aterm_time::unix_secs().unwrap_or(0);
         restart_stamp::standing(&self.state, tab, self.pid, &self.start, now).is_some()
     }
 
-    /// Whether the last instant to send `SIGKILL` ([`kill_until_of`]) has passed
-    /// or the watch is no longer listed.
+    /// Whether the last instant to send `SIGKILL` ([`kill_until_of`]) has passed or the watch is
+    /// no longer listed.
     fn lapsed(&self) -> bool {
         with_watches(|listed| {
             listed
@@ -620,10 +622,7 @@ impl Watch {
         })
     }
 
-    /// Remaining wait duration for `tab`, or why the watch lets go. Unlists the
-    /// watch under [`ESCALATING`]'s lock in the same check that decides to let go
-    /// so a concurrent [`watch`] call either raises this watch before the check
-    /// or starts a new watch after it.
+    /// Remaining wait duration for `tab`, or why the watch lets go ([`ESCALATING`], [`watch`]).
     fn left(&self, tab: &str) -> Result<Duration, LetGo> {
         with_watches(|listed| {
             let at = listed
@@ -659,13 +658,10 @@ impl Drop for Watch {
     }
 }
 
-/// The processes whose watch holds its `SIGKILL` back right now for someone
-/// else ([`kill`]): another hand holds their tab ([`another_hand`]), or the
-/// host holds no snapshot of the program its exit's reader would read it by
-/// yet ([`read_by_host`]), by pid: what a test reads to see a watch wait.
+/// Processes whose watch holds `SIGKILL` back ([`kill`], [`another_hand`], [`read_by_host`]).
 static HELD_OFF: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
-/// Whether the watch on `pgrp` is waiting out another hand on its tab, or its host's read of it, now.
+/// Whether the watch on `pgrp` is waiting out another hand on its tab, or its host's read of it.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn held_off(pgrp: i32) -> bool {
     HELD_OFF
@@ -701,7 +697,7 @@ impl Drop for Listed {
     }
 }
 
-/// Whether another hand on `ctx`'s session at `now_us` must be waited out before sending `SIGKILL`: a live non-host, non-self-proven supervisor claim ([`aterm_agent::harness::upgrade_drive::is_host_holder`]), a hold, a turn run by a named driver, or another holder's live drive lease.
+/// Whether another hand delays `SIGKILL` ([`aterm_agent::harness::upgrade_drive::is_host_holder`]).
 pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
     let claimed = ctx
         .meta
@@ -726,32 +722,28 @@ pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
     }
 }
 
-/// How often a watch looks again at a stamped program that does not lead its tab ([`kill`]: a job stopped from elsewhere, its shell in front).
+/// How often a watch looks again at a stamped program that does not lead its tab ([`kill`]).
 pub(crate) const LOOK_AGAIN: Duration = Duration::from_secs(1);
 
-/// The least a test value of [`LOOK_AGAIN`] may be: each look reads the
-/// tab's stamp from disk and the pty's foreground group.
+/// Minimum test value of [`LOOK_AGAIN`].
 const LOOK_AGAIN_TEST_FLOOR: Duration = Duration::from_millis(20);
 
-/// The cadence a watch looks again at: [`LOOK_AGAIN`] in a shipped build, its floored test value on the test timing value (`aterm_gui_timing`).
+/// The cadence a watch looks again at: [`LOOK_AGAIN`] in a shipped build.
 pub(crate) fn look_again() -> Duration {
     aterm_gui_timing::current().of_at_least(LOOK_AGAIN, LOOK_AGAIN_TEST_FLOOR)
 }
 
-/// Whether the host's published snapshot for `tab` names `pid` started at
-/// `start` ([`crate::harness_host::published_snapshot`]).
+/// Whether `tab`'s snapshot names `pid` at `start` ([`crate::harness_host::published_snapshot`]).
 fn read_by_host(tab: &str, pid: u32, start: &str) -> bool {
     crate::harness_host::published_snapshot(tab)
         .is_some_and(|snap| snap.pid == pid && snap.start == start)
 }
 
-/// Minimum remaining stamp lifetime required before [`kill`] or [`carry`] sends `SIGKILL`, leaving the exit reader time to look up the stamp before it goes stale (`relaunch::STALE_S`).
+/// Minimum remaining stamp lifetime required before [`kill`] or [`carry`] sends `SIGKILL`.
 pub(crate) const KILL_READ_MARGIN: Duration = Duration::from_secs(30);
 
-/// Start the act's escalation thread for the leader `pgrp` its `stamp` (in the
-/// harness state directory `state`) names (step 6) — unless a watch already
-/// ends that very process ([`watch`]):
-/// then that watch is given `stamp`'s time and nothing starts.
+/// Start the act's escalation thread for the leader `pgrp` its `stamp` names, unless a watch
+/// already ends that very process ([`watch`]).
 #[cfg(unix)]
 fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, stamp: &Stamp) {
     let cause = stamp.cause;
@@ -774,7 +766,7 @@ fn spawn_escalation(ctx: Weak<SessionCtx>, state: &std::path::Path, pgrp: i32, s
     }
 }
 
-/// Escalation wait (step 6): waits for `watch.pid` to exit; if still running after `grace` while deaf (stall still published and nothing read since the drop) or after `deadline` in any case, escalates to [`kill`].
+/// Escalation wait (step 6): waits for `watch.pid` to exit ([`kill`]).
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -819,16 +811,14 @@ enum Withheld {
     Away,
     /// Another hand holds the session ([`another_hand`]).
     Hand,
-    /// Its stamp no longer stands past [`KILL_READ_MARGIN`], or the tab's
-    /// on-disk stamp no longer names it.
+    /// Its stamp no longer stands past [`KILL_READ_MARGIN`], or the tab's on-disk stamp no longer
+    /// names it.
     Lapsed,
     /// The host holds no snapshot of it yet ([`read_by_host`]).
     Unread,
 }
 
 impl Withheld {
-    /// The watch's word when the stamp stops standing with this the last
-    /// thing it saw.
     const fn gave_up(self) -> &'static str {
         match self {
             Self::Away => "never led its tab again while its stamp stood; nothing sent",
@@ -838,8 +828,6 @@ impl Withheld {
         }
     }
 
-    /// The watch's word when the program ended by itself with this the last
-    /// thing it saw.
     const fn ended(self) -> &'static str {
         match self {
             Self::Hand => "ended while another hand held its tab; nothing sent",
@@ -936,7 +924,7 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
     }
 }
 
-/// Finishes an in-flight restart across an instance handoff: if `state` holds a stamp for `ctx` with more than [`KILL_READ_MARGIN`] remaining at `now_s` (unix seconds), watches the process on a background thread until the stamp reaches [`DEADLINE`] and calls [`kill`].
+/// Finishes an in-flight restart across handoff ([`KILL_READ_MARGIN`], [`DEADLINE`], [`kill`]).
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1003,8 +991,6 @@ impl crate::App {
 mod tests {
     use super::*;
 
-    /// The verb's arguments, in any order, each once; everything else is
-    /// refused naming the word.
     #[test]
     fn the_restart_verb_parses_its_three_arguments() {
         assert_eq!(parse(""), Ok(Ask::default()));
@@ -1040,10 +1026,6 @@ mod tests {
         }
     }
 
-    /// [`another_hand`] returns `true` for another supervisor's live claim, a
-    /// hold, a named driver's turn, or another holder's live drive lease, and
-    /// `false` for no claim, this host's or a predecessor host's claim, an
-    /// owner-class turn, a lapsed lease, or this host's own lease.
     #[test]
     fn another_hand_is_what_the_acts_kill_waits_out() {
         let now = crate::metrics::now_us();
@@ -1148,10 +1130,6 @@ mod tests {
         );
     }
 
-    /// The act is offered only where its relaunch would carry it: an agent whose
-    /// records are in a directory no relaunch line can name is `not-relaunchable`,
-    /// whereas the same snapshot under the user's own home or under another `HOME`'s
-    /// `.claude` is offered the act.
     #[test]
     fn the_act_is_not_offered_for_an_agent_its_relaunch_refuses() {
         let now = crate::metrics::now_us();
@@ -1192,9 +1170,23 @@ mod tests {
                 tab: ctx.self_id.as_str().to_string(),
                 ..snap(claude_dir)
             };
-            crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), Some(&snap));
+            let sid = ctx.self_id.as_str();
+            crate::harness_host::publish_snapshot_for_test(sid, Some(&snap));
             let why = unavailable(&ctx, 0x3fff_ff01, "t", now);
-            crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), None);
+            assert_eq!(
+                super::offered_for(sid, 0x3fff_ff01),
+                why.is_none(),
+                "the word outside the session agrees with the act"
+            );
+            assert!(
+                !super::offered_for(sid, 0x3fff_ff02),
+                "another process: not-the-hosts-agent"
+            );
+            crate::harness_host::publish_snapshot_for_test(sid, None);
+            assert!(
+                !super::offered_for(sid, 0x3fff_ff01),
+                "no snapshot published, as in an Autopilot-off tab: not-the-hosts-agent"
+            );
             why
         };
         assert_eq!(
@@ -1210,11 +1202,6 @@ mod tests {
         );
     }
 
-    /// An agy is offered the act when it has a witnessed conversation and a
-    /// relaunchable launch line under the host's claim, and refused when no
-    /// conversation is witnessed, `--remote-control` was passed, its `HOME` or
-    /// zsh working directory cannot be represented in the relaunch line, or the
-    /// agent is Muse Code.
     #[test]
     fn an_agy_is_offered_the_act_where_its_relaunch_resumes_it() {
         use aterm_agent::harness::relaunch::{AgentRun, AgyRun, MuseRun};
@@ -1344,9 +1331,6 @@ mod tests {
         }
     }
 
-    /// A Codex is restarted only when a validated self-claim copy names that
-    /// exact process; without one (or with a copy for another pid) the act is
-    /// `not-relaunchable`.
     #[test]
     fn a_codex_with_no_validated_copy_is_not_offered_the_act() {
         let now = crate::metrics::now_us();
@@ -1415,16 +1399,12 @@ mod tests {
         );
     }
 
-    /// Tab key for the watch registry tests.
     const TAB: &str = "s-watch";
 
     fn stamped(state: &aterm_tempfile::TempDir, stamp: &Stamp) {
         restart_stamp::write(state.path(), TAB, stamp).expect("the stamp");
     }
 
-    /// A watch that lets go is unlisted in the same [`Watch::left`] check, while
-    /// a joining [`watch`] call before the check raises its deadline and keeps it
-    /// active.
     #[test]
     fn a_watch_that_lets_go_is_unlisted_in_that_look_and_a_raise_before_it_keeps_it() {
         let pid = 0x3fff_fff1_i32;
@@ -1469,8 +1449,6 @@ mod tests {
         assert_eq!(watches(pid), 0);
     }
 
-    /// A watch whose tab's on-disk stamp is replaced by another process's stamp
-    /// or taken lets go and unlists itself on the next [`Watch::left`] check.
     #[test]
     fn a_watch_whose_tabs_stamp_names_another_lets_go_in_that_look() {
         let pid = 0x3fff_fff3_i32;
@@ -1503,8 +1481,6 @@ mod tests {
         drop((w, join));
     }
 
-    /// A watch remains listed and active when a concurrent [`restart_stamp::take_if`]
-    /// for another process inspects and rejects the tab's stamp in place.
     #[test]
     fn a_watch_waits_on_while_another_take_judges_its_tabs_stamp() {
         let pid = 0x3fff_fff4_i32;
@@ -1534,8 +1510,6 @@ mod tests {
         assert_eq!(watches(pid), 0);
     }
 
-    /// A corrupt stamp dated at `u64::MAX` saturates to an immediate deadline
-    /// rather than panicking on `Instant` addition and lets go on its first look.
     #[test]
     fn a_stamp_dated_past_any_instant_gives_its_watch_no_time() {
         let pid = 0x3fff_fff2_i32;

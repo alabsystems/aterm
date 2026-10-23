@@ -82,8 +82,7 @@ impl<'a> LookupSubtables<'a> {
         self.offsets.is_empty()
     }
 
-    /// Parses a subtable at index ([`PositioningSubtable`](crate::gpos::PositioningSubtable),
-    /// [`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable)).
+    /// Parses a subtable at index ([`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable)).
     #[inline]
     pub fn get<T: LookupSubtable<'a>>(&self, index: u16) -> Option<T> {
         let offset = self.offsets.get(index)?.to_usize();

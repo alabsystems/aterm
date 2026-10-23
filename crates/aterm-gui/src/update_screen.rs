@@ -34,15 +34,16 @@ pub(crate) struct UpdateState {
     outcome: String,
     /// The health ledger says this machine's updates are failing persistently.
     failing_persistent: bool,
-    /// The failing class ([`Self::apply_is_failing`]).
+    /// The most recent failing class (`apply`, `pipeline`, …).
     failing_kind: String,
     /// Consecutive apply failures.
     failing_applies: u32,
     /// Why those applies failed.
     apply_failure: String,
-    /// Which artifact [`Self::apply_failure`] is about.
+    /// Which artifact [`Self::apply_failure`] is about, and how many consecutive
+    /// attempts on that artifact are behind it.
     apply_failure_build: u64,
-    /// See [`Self::apply_failure_build`].
+    /// Consecutive failed attempts on the [`Self::apply_failure_build`] artifact.
     apply_attempts_for_stage: u32,
     /// Whether the automatic lane retries this artifact by itself or needs a person.
     apply_retry: ApplyRetry,
@@ -50,7 +51,7 @@ pub(crate) struct UpdateState {
     staged_on_hold: bool,
     /// Whether this launch has a bundle the updater could replace at all.
     installable: UpdateInstallability,
-    /// The stranded verdict.
+    /// The stranded verdict: checks complete but the release channel cannot be read.
     channel_unreadable: bool,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
@@ -456,7 +457,8 @@ impl UpdateState {
         }
     }
 
-    /// The primary status headline: a short statement ("Update ready") ([`Self::detail`]).
+    /// The primary status headline: a short statement ("Update ready"); the version
+    /// specifics live in [`Self::detail`].
     fn headline(&self) -> String {
         if self.checking {
             "Checking for updates\u{2026}".to_string()
@@ -671,7 +673,7 @@ impl UpdateState {
 /// Where a trouble line sends the reader for the rest.
 const LOG_POINTER: &str = " Details in Settings \u{25b8} Messages.";
 
-/// A failing check class.
+/// A failing check class in a person's words.
 fn check_trouble_words(kind: &str) -> &'static str {
     match kind {
         "network" => "the update server can\u{2019}t be reached",

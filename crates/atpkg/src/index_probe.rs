@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lightweight HEAD probe for the next published index ([`successor_reporting_near_with`],
-//! [`is_release_asset_host`], [`classify`]).
+//! Lightweight HEAD probe for the next published index ([`successor_reporting_near_with`](crate::index_probe::successor_reporting_near_with),
+//! [`is_release_asset_host`](crate::index_probe::is_release_asset_host), [`classify`](crate::index_probe::classify)).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};

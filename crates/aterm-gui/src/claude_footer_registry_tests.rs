@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{Asks, Command, FOLLOW_UPS, Job, LogWake, REGISTRY_READ, Resolver, WATCH_FOR};
+use super::{Asks, Command, FOLLOW_UPS, Job, LogWake, NO_TAP, REGISTRY_READ, Resolver, WATCH_FOR};
 use crate::claude_registry::{RegistryWatch, Sink, row_of};
 use crate::session_timeline::SessionTimeline;
 
@@ -69,6 +69,7 @@ fn no_roster() -> Option<aterm_agent::harness::accounts::Roster> {
 
 /// What a read asks outside Claude Code's files, answered here.
 const ASKS: Asks = Asks {
+    tap: NO_TAP,
     args: args_of,
     roster: no_roster,
     home: super::rig::scratch_home,

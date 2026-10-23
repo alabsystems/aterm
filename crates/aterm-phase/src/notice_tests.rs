@@ -8,23 +8,16 @@ use crate::anchors::anchor_text;
 use crate::prompt::fixtures::{rows, screen};
 use crate::turn::{launch_card_place, launch_card_scan, launch_card_scrolled, launch_card_words};
 
-/// The width the built screens here are read at: wider than any of their
-/// rows, as the captures they copy were.
 const WIDE: usize = 120;
 
-/// The notice's summary for a build of `changes` (`Updated to latest. Got
-/// …`), as 2.1.304's `ty` composes it.
 fn summary(changes: &str) -> String {
     format!("{}{changes}", anchor_text("notice.updated"))
 }
 
-/// A notice row at the Box's column.
 fn boxed(text: &str) -> String {
     format!("{INDENT}{text}")
 }
 
-/// A card's three rows, as the 2.1.283 captures draw it at row 1 (a blank
-/// row over it), then `under` row for row.
 fn card_over(under: &[String]) -> Vec<String> {
     let mut r = rows(&[
         "",
@@ -36,8 +29,6 @@ fn card_over(under: &[String]) -> Vec<String> {
     r
 }
 
-/// The measured notice's two rows (the 2.1.283 captures'), at the Box's
-/// column.
 fn measured_notice() -> [String; 2] {
     [
         boxed(&summary(
@@ -47,20 +38,15 @@ fn measured_notice() -> [String; 2] {
     ]
 }
 
-/// The notice on `screen`, under its placed card, the pane [`WIDE`].
 fn notice_on(screen: &[String]) -> Option<NoticePlace> {
     notice_at(screen, WIDE)
 }
 
-/// The notice on `screen`, under its placed card, the pane `cols` wide.
 fn notice_at(screen: &[String], cols: usize) -> Option<NoticePlace> {
     let card = launch_card_place(screen).expect("a placed card");
     update_notice_scan(screen, &card, cols).place
 }
 
-/// The pane's width a capture's header names (`… headless aterm (50x40,
-/// …`), `0` where it names none: no row of such a screen is read as filled
-/// to the pane's edge, so none takes a hard break.
 fn header_cols(text: &str) -> usize {
     let head = text.lines().next().unwrap_or_default();
     head.split('(')
@@ -75,9 +61,6 @@ fn header_cols(text: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Every screen the reader is held to, as `(its name, its rows, its pane's
-/// width)`: this crate's fixtures, and the supervisor's 2.1.282 captures
-/// that draw the notice (`aterm-agent`'s `cap-decline-*`).
 fn corpus() -> Vec<(String, Vec<String>, usize)> {
     let mut screens: Vec<(String, Vec<String>, usize)> = crate::text::fixture_files()
         .into_iter()
@@ -106,20 +89,6 @@ fn corpus() -> Vec<(String, Vec<String>, usize)> {
     screens
 }
 
-/// Where each recorded notice sits, `(its screen's name, top, rows, end)`:
-/// the three 2.1.283 screens that draw it, the supervisor's four 2.1.282
-/// `cap-decline-*` screens, the MEASURED 2.1.304 lab captures — the five
-/// notice captures (fullscreen at 120, 50 and 44 columns: the summary at row
-/// 5 under a row of top air, wrapped onto two rows at 50 and 44, the details
-/// row wrapped too at 44; inline under the workspace card at 120 and the
-/// plain one at 50: the summary at row 4), four later screens of the same
-/// launch (the notice stays under the card over the conversation) and the
-/// seven under the NARROW four-row card (`*-narrow-*`: the summary a row
-/// lower, at 6 fullscreen and 5 inline; at 34, 33 and 31 columns the summary
-/// on three rows and the details row's link broken inside itself, filling
-/// the row to the pane's edge) — and the one SYNTHETIC screen no capture
-/// covers (its provenance line says what was measured): a one-shot notice
-/// between the card and the summary.
 const PLACED: [(&str, usize, usize, usize); 24] = [
     ("claude-2.1.283-effort-switch.txt", 5, 2, 74),
     ("claude-2.1.283-model-switch.txt", 5, 2, 74),
@@ -207,15 +176,6 @@ const PLACED: [(&str, usize, usize, usize); 24] = [
     ("claude-2.1.304-update-notice-oneshot-120col.txt", 7, 2, 71),
 ];
 
-/// The recorded screens that show the notice's summary with no card placed
-/// over it: the conversation has scrolled the card's top row off the screen
-/// (the lab's shell-mode capture, the notice at rows 0 and 1, the card gone
-/// whole; the `*-scrolled-*` captures, its model and working-directory rows
-/// still at the screen's top at 29 rows, the working directory's alone at
-/// 28, none at 27 — the notice there is anchored only on a card a caller
-/// kept, [`a_scrolled_card_anchors_its_notice`]), or the pane is so narrow
-/// the vendor wraps the banner itself (`Claude Code` / `v2.1.304`, at 32
-/// columns with the wand and 30 without it), a card nothing places.
 const UNPLACED: [&str; 6] = [
     "claude-2.1.304-top-shell-mode-120col.txt",
     "claude-2.1.304-update-notice-narrow-workspace-fullscreen-32col.txt",
@@ -225,11 +185,6 @@ const UNPLACED: [&str; 6] = [
     "claude-2.1.304-update-notice-scrolled-29rows-fullscreen-120col.txt",
 ];
 
-/// THE NOTICE'S PLACE, over the whole corpus, each screen read at its
-/// pane's width: each of [`PLACED`] where it was recorded, its text at
-/// column 2 — the 44-column capture's wrapped details row and the narrow
-/// card's hard-broken link among them — and every other screen with a
-/// placed card has none.
 #[test]
 fn every_recorded_update_notice_is_placed_under_its_card() {
     let updated = format!("{INDENT}{}", anchor_text("notice.updated"));
@@ -273,11 +228,6 @@ fn every_recorded_update_notice_is_placed_under_its_card() {
     );
 }
 
-/// THE HARD BREAK, MEASURED. On the narrow card's captures at 34, 33 and 31
-/// columns the details row's link (33 cells) is longer than the Box (the
-/// pane less its padding), and the vendor breaks it inside itself on a row
-/// filled to the pane's edge: read at the pane's own width, the notice is
-/// the vendor's whole.
 #[test]
 fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
     for (name, cols) in [
@@ -321,16 +271,6 @@ fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
     assert_eq!(broken(link.len() - 1, 0), None);
 }
 
-/// THE VENDOR'S SHAPE, OR NOTHING. A bare `Updated to latest.`, a summary
-/// wrapped onto two rows and a details row word-wrapped onto two (`…changelog
-/// for` / `details`, as a narrow pane wraps it) are read; NEGATIVE CONTROLS,
-/// each of which leaves the vendor's notice bare: the details row reworded,
-/// the details row broken inside a word, its wrapped tail reworded or off
-/// the Box's column, the details row spread over three rows, a wrap cut by
-/// the screen's bottom edge, the summary quoted in a person's message (`❯`),
-/// the notice under something said (`⏺`: the walk stops there), the notice
-/// past the reach, a notice cut by the screen's bottom edge, the summary off
-/// the Box's column, and a summary with no details row under it.
 #[test]
 fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     let details = anchor_text("notice.updated_details");
@@ -527,12 +467,6 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     assert_eq!(update_notice_scan(&measured, &far, WIDE).place, None);
 }
 
-/// A READING KEPT WITHOUT A SCAN IS THE SCAN'S (`update_notice_unmoved`):
-/// over every recorded screen with a placed card, each row in turn
-/// rewritten — blanked, a summary's head, the details row, a person's
-/// words, a streamed `⏺` row, a wrapped continuation — whenever the check
-/// keeps the old reading, scanning the new rows under the same card gives
-/// exactly it.
 #[test]
 fn a_kept_notice_scan_is_the_scans() {
     let [head, tail] = measured_notice();
@@ -589,7 +523,6 @@ fn a_kept_notice_scan_is_the_scans() {
     let _ = update_notice_unmoved(&[], &edge, &[usize::MAX]);
 }
 
-/// One recorded screen of the corpus: its rows and its pane's width.
 fn recorded(name: &str) -> (Vec<String>, usize) {
     corpus()
         .into_iter()
@@ -598,19 +531,12 @@ fn recorded(name: &str) -> (Vec<String>, usize) {
         .unwrap_or_else(|| panic!("{name}: no such capture"))
 }
 
-/// The `*-scrolled-*` captures: the conversation scrolled the card's top
-/// off, at 29, 28 and 27 rows (the card's last two rows left, its last one,
-/// none).
 fn scrolled(rows: usize) -> (Vec<String>, usize) {
     recorded(&format!(
         "claude-2.1.304-update-notice-scrolled-{rows}rows-fullscreen-120col.txt"
     ))
 }
 
-/// The card the 29-row capture cut, WHOLE — DERIVED: its banner row put back
-/// over its model row, as the pane one row taller drew it (the fullscreen
-/// renderer keeps the transcript's foot on the composer, so a row more
-/// shows one more at the top) — placed, with its words.
 fn whole_scrolled_card() -> (Vec<String>, CardPlace, Vec<String>) {
     let (cut, _) = scrolled(29);
     let banner = format!(
@@ -629,13 +555,6 @@ fn whole_scrolled_card() -> (Vec<String>, CardPlace, Vec<String>) {
     (whole, place, words)
 }
 
-/// THE NOTICE UNDER A SCROLLED CARD: on the captures where the conversation
-/// scrolled the card's top off the screen, the card a caller kept — placed
-/// whole a row before — is known again by its last rows at the screen's top
-/// (`launch_card_scrolled`): its model and working-directory rows at 29
-/// rows, its working directory's alone at 28 (from the whole card, and from
-/// the scrolled one kept in turn), and the notice is read under them,
-/// whole.
 #[test]
 fn a_scrolled_card_anchors_its_notice() {
     let (whole, kept, words) = whole_scrolled_card();
@@ -716,11 +635,6 @@ fn a_scrolled_card_anchors_its_notice() {
     );
 }
 
-/// A SCROLLED CARD KEPT WITHOUT A READ IS THE READ'S
-/// (`launch_card_scrolled_unmoved`): on the 29-row capture, each row in
-/// turn rewritten — blanked, a banner row, a person's words, another card
-/// row — whenever the check keeps the scrolled card, reading the rows again
-/// finds exactly it.
 #[test]
 fn a_kept_scrolled_card_is_the_reads() {
     let (_, kept, words) = whole_scrolled_card();

@@ -342,7 +342,11 @@ pub(crate) enum NativeTabInstallError {
     DuplicateTab,
 }
 
-/// THE INSTANT A TASK'S END WAS TOLD AT, unix ms, for the menu bar's Done for you row (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.3, item 1): `told`, the time the timeline holds for the end's face (the face, or the one held across the host's "unknown" between loop runs; `SessionTimeline::task_face_at`).
+/// THE INSTANT A TASK'S END WAS TOLD AT, unix ms, for the menu bar's Done for you row
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4.3, item 1): `told`, the time the timeline
+/// holds for the end's face (the face, or the one held across the host's "unknown" between loop
+/// runs; `SessionTimeline::task_face_at`), else the end's own minute (`Stamp::unix_ms`); `0` where
+/// neither is known.
 pub(crate) fn end_wall_ms(end: crate::harness_glass::EndGlass, told: Option<i64>) -> u64 {
     told.or_else(|| end.at.and_then(crate::harness_glass::Stamp::unix_ms))
         .and_then(|ms| u64::try_from(ms).ok())
@@ -2079,7 +2083,7 @@ impl App {
         sid
     }
 
-    /// Test-only heterogeneous counterpart.
+    /// Test-only heterogeneous counterpart of [`Self::split_active_stub_tab`].
     #[cfg(test)]
     pub(crate) fn split_active_with_stub_terminal(
         &mut self,
@@ -3161,7 +3165,7 @@ impl App {
         true
     }
 
-    /// TAKE ME THERE: the ❯ menu's Go, and a click on a notice about `session` (`Wake::NoticeClicked`: aterm's own macOS notice, a Windows balloon, a Linux notification through [`Self::notice_clicked`]).
+    /// TAKE ME THERE: the ❯ menu's Go, and a click on a notice about `session` (`Wake::NoticeClicked`: aterm's own macOS notice, a Windows balloon, a Linux notification through `Self::notice_clicked`).
     #[cfg_attr(
         all(
             not(target_os = "macos"),
@@ -3497,7 +3501,7 @@ impl App {
             .map(|s| s.ctx.self_id.clone())
     }
 
-    /// [`Self::install_new_tab`] for a session whose id is already reserved (a tab spawned off the event loop, [`crate::tab_spawn`]).
+    /// `Self::install_new_tab` for a session whose id is already reserved (a tab spawned off the event loop, [`crate::tab_spawn`]).
     pub(crate) fn install_tab_session(
         &mut self,
         owner: WindowId,
@@ -8913,11 +8917,13 @@ mod exit_attribution_tests {
     use crate::app_window::CloseConfirm;
     use crate::session_store::{ExitReason, RosterChange};
 
+    /// The newest close's reason and closer, from the closed index (6G-9).
     fn sole_exit(app: &App) -> (ExitReason, String) {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let rec = g
-            .roster_since(0)
-            .rfind(|r| r.change == RosterChange::Exited)
+            .closed_logs()
+            .exits_since(0)
+            .next_back()
             .expect("one exit record after the close");
         (rec.reason, rec.actor.as_wire().to_string())
     }
@@ -9401,8 +9407,9 @@ mod exit_attribution_tests {
     fn exit_of(app: &App, session: u64) -> (ExitReason, String) {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let rec = g
-            .roster_since(0)
-            .rfind(|r| r.change == RosterChange::Exited && r.local_id == session)
+            .closed_logs()
+            .exits_since(0)
+            .rfind(|e| e.local_id == session)
             .expect("an exit record for the session");
         (rec.reason, rec.actor.as_wire().to_string())
     }

@@ -6,8 +6,6 @@ use crate::supervise::policy::turn_end::{
     DONE_CHECK, LAND, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT,
 };
 
-/// A turn that ended after 3 minutes of work (the done row's measure), the
-/// worker's last words `said`, at an empty composer in bypass mode.
 fn worked(said: &str) -> Vec<String> {
     let mut r = rows(&[
         &format!("⏺ {said}"),
@@ -19,16 +17,10 @@ fn worked(said: &str) -> Vec<String> {
     r
 }
 
-/// `policy` as the in-GUI host runs it.
 fn under(policy: SupervisorConfig) -> SuperviseOpts {
     SuperviseOpts { policy, ..auto(30) }
 }
 
-/// The session's word `land`: the point is decided at Cruise first, the word
-/// read (one bare `meta`, before the `status` an act reads) where Cruise
-/// would act, and the land instruction typed where `keep going` would be;
-/// the worker's clean defense (`Nothing left: …`) lands the task, said once
-/// (`DONE … rule=land@v1`).
 #[test]
 fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands() {
     let (dir, journal) = journal_file("autopilot-land");
@@ -110,10 +102,6 @@ fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands()
     );
 }
 
-/// A PERSON'S OWN EXCHANGE UNDER THE SESSION'S LAND WORD: a greeting the
-/// person's keystroke opened, answered in seconds, gets no land instruction
-/// — the turn is theirs under Land as under Cruise — and the journal says
-/// once why (`LEFT … rule=left-to-person@v1`), never Land's `DONE`.
 #[test]
 fn a_persons_greeting_under_land_is_left_to_them() {
     let greeting = "Hi! What would you like me to work on?";
@@ -191,9 +179,6 @@ impl IdleHost for Lifted {
     }
 }
 
-/// A screen whose last turn the message `head` (its rows as drawn) opened
-/// and the agent answered `said`, its done row `done` (none: `None`), at an
-/// empty composer in bypass mode.
 fn answered(head: &[&str], said: &str, done: Option<&str>) -> Vec<String> {
     let mut r = rows(head);
     r.extend(rows(&["", &format!("⏺ {said}"), ""]));
@@ -204,8 +189,6 @@ fn answered(head: &[&str], said: &str, done: Option<&str>) -> Vec<String> {
     r
 }
 
-/// Acted on, never left to the person: a turn typed under `rule`, and no
-/// `LEFT` journaled.
 fn acted_on(case: &str, rule: &str, (turns, said, lines): &(usize, Vec<String>, Vec<String>)) {
     assert!(*turns >= 1, "{case}: {lines:#?}");
     assert!(
@@ -218,8 +201,6 @@ fn acted_on(case: &str, rule: &str, (turns, said, lines): &(usize, Vec<String>, 
     );
 }
 
-/// OFF BACK TO CRUISE: THE POINT THE NEW LOOP FINDS IS ACTED ON, NEVER LEFT
-/// ON A GESTURE (over the loop).
 #[test]
 fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
     let wrapped = |text: &str| {
@@ -322,12 +303,6 @@ fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
     }
 }
 
-/// THE SAME UNDER THE ENGINE'S OWN PARK (no host stops it: the table's `off`
-/// under a loop with no host, a word read before the host acts): the loop parks
-/// at a point Cruise would continue, the person says hi under Off and the
-/// agent answers at once, the word turns back — and the point read afresh,
-/// never seen busy, is acted on whether or not the person's keystroke is in
-/// it ([`TurnEndState::park_off`] ends the carry, and judges nothing).
 #[test]
 fn an_off_park_then_cruise_acts_on_the_point_it_never_saw_run() {
     let greeting = "Hi! What would you like me to work on?";
@@ -382,10 +357,6 @@ fn an_off_park_then_cruise_acts_on_the_point_it_never_saw_run() {
     }
 }
 
-/// A loop's run over `screens` under Cruise with every read's person stamp
-/// `human` (none: `None`), the host `lifted` (`None`: no host), and an act
-/// the stopped loop typed — its rule, its text, how long before (none: no
-/// ledger) — at test speed: what was typed, journaled and said.
 fn run_lifted(
     screens: Vec<Vec<String>>,
     human: Option<&'static str>,
@@ -435,8 +406,6 @@ fn run_lifted(
     (count(&m, "turn"), said, lines)
 }
 
-/// Continued, never left to the person: a `keep going` typed under the
-/// continue rule, and no `LEFT` journaled.
 fn continued(case: &str, (turns, said, lines): &(usize, Vec<String>, Vec<String>)) {
     assert!(*turns >= 1, "{case}: {lines:#?}");
     assert!(
@@ -451,10 +420,6 @@ fn continued(case: &str, (turns, said, lines): &(usize, Vec<String>, Vec<String>
     );
 }
 
-/// A SCROLL OVER A LONG TURN NOBODY SAW RUN IS NO EXCHANGE OF THE PERSON'S
-/// (over the loop): the loop attaches to
-/// a point the screen draws as 23 minutes of work (`✻ Worked for 23m 2s`),
-/// and the person's last gesture is a wheel scroll 10 s ago.
 #[test]
 fn a_scroll_over_a_long_turn_nobody_saw_run_is_no_exchange_of_the_persons() {
     let long = |head: bool| {
@@ -494,11 +459,6 @@ fn a_scroll_over_a_long_turn_nobody_saw_run_is_no_exchange_of_the_persons() {
     }
 }
 
-/// A SCROLL OVER A DAY-LONG TURN NOBODY SAW RUN IS CONTINUED (over the loop):
-/// a fresh loop with no act in
-/// the window (a hand-over, a fault restart) or one started as Off lifted
-/// attaches to `❯ run the soak test` drawn above a 26-hour soak's report,
-/// its done row `✻ Sautéed for 1d 2h 3m`, the person's scroll 10 s back.
 #[test]
 fn a_scroll_over_a_day_long_turn_nobody_saw_run_is_continued() {
     let soak = |span: &str| {
@@ -536,11 +496,6 @@ fn a_scroll_over_a_day_long_turn_nobody_saw_run_is_continued() {
     }
 }
 
-/// THE POINT OFF STOOD ON, READ AGAIN AS THE WORD TURNS BACK, IS CONTINUED
-/// AS BEFORE THE PARK (over the loop):
-/// a turn seen busy ends at a point the decision there reads Off at; the
-/// person scrolls under Off, and the word turns back to Cruise with the
-/// same point on the screen.
 #[test]
 fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
     let said = "Step 3 landed; step 4 is next.";
@@ -579,12 +534,6 @@ fn the_point_off_stood_on_read_again_is_continued_as_before_the_park() {
     }
 }
 
-/// A LOOP STARTED AS OFF LIFTED, ATTACHED MID-TURN, CONTINUES THE HARNESS'S
-/// RUN (over the loop): the stopped
-/// loop typed `keep going` 4 minutes ago and the agent is still on it as the
-/// host starts the new loop (the chip's Land → Off → Cruise); its first read
-/// is the turn live, its end draws no done row, and the person's last
-/// gesture is a scroll 10 s before it.
 #[test]
 fn a_loop_started_as_off_lifted_mid_turn_continues_the_harness_run() {
     let mut tail = rows(&["⏺ Committed step 4; step 5 is next.", ""]);
@@ -599,13 +548,8 @@ fn a_loop_started_as_off_lifted_mid_turn_continues_the_harness_run() {
     continued("lifted mid-turn", &run);
 }
 
-/// A minute, for the ledger's ages.
 const MIN_LOOP: Duration = Duration::from_secs(60);
 
-/// The table's default decides a session with no word: `autopilot = "land"`
-/// lands it with no word read (the host keeps none); a session's `cruise`
-/// under the table's `off` is the owner opting that session in, and is
-/// continued.
 #[test]
 fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() {
     let land = SupervisorConfig {
@@ -648,12 +592,6 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
     assert!(!lines.iter().any(|l| l.starts_with("PARKED")), "{lines:#?}");
 }
 
-/// WHO SET IT IS READ PAST (aterm-gui's `meta` since 2026-10-19, design
-/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.2): a bare `meta`
-/// whose tail names who set the word and when after `land_at=`
-/// (`autopilot_by=human:menu autopilot_since=1792177200`) gives the loop the
-/// same word as a reply without them, set or unset — the reader keys by
-/// name, and `autopilot_by=` is not `autopilot=`.
 #[test]
 fn the_autopilot_word_is_read_past_who_set_it() {
     let land = SupervisorConfig {
@@ -694,7 +632,6 @@ fn the_autopilot_word_is_read_past_who_set_it() {
     );
 }
 
-/// The journal's lines of the run that wrote `journal`.
 fn journaled(journal: &Path) -> Vec<String> {
     journal_records(journal)
         .0
@@ -703,10 +640,6 @@ fn journaled(journal: &Path) -> Vec<String> {
         .collect()
 }
 
-/// OFF: the loop parks — nothing typed, pressed, escalated or reported —
-/// reading the word again at each step (`PARKED …` in the journal, as a hold
-/// is `HALTED …`), and once the word is `cruise` it says so and decides the
-/// point afresh: the continuation goes.
 #[test]
 fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     let script = || {
@@ -803,9 +736,6 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
 }
 
-/// OFF is hands off for the approval policy too: a box the word turned off
-/// at — read by the bare `meta` its decision makes — is neither pressed nor
-/// escalated, and the loop parks.
 #[test]
 fn an_autopilot_off_presses_no_box() {
     let (dir, journal) = journal_file("autopilot-box");
@@ -842,12 +772,6 @@ fn an_autopilot_off_presses_no_box() {
     );
 }
 
-/// OFF TOUCHES NO RATING CARD, not on the wait's busy reads either:
-/// under `dismiss_surveys` a card over a worker that
-/// reads busy is dismissed at the first busy read that shows it — a key
-/// pressed before the look reaches its park — so an Off loop is lent no such
-/// duty: no `0`, no `DISMISSED` line, and the loop parks at the turn's
-/// point.
 #[test]
 fn an_autopilot_off_dismisses_no_card_over_a_busy_worker() {
     let run = |word: &'static str| {
@@ -892,8 +816,6 @@ fn an_autopilot_off_dismisses_no_card_over_a_busy_worker() {
     );
 }
 
-/// The session starts in Cruise, then its owner changes the word as the
-/// first busy screen is read.
 #[test]
 fn a_busy_wait_reads_a_new_off_word_before_dismissing_a_card() {
     let run = |word| {
@@ -930,8 +852,6 @@ fn a_busy_wait_reads_a_new_off_word_before_dismissing_a_card() {
     );
 }
 
-/// A refusal to read the current word proves no permission for a busy-read
-/// action.
 #[test]
 fn a_busy_wait_with_an_unanswered_autopilot_read_touches_no_card() {
     let mut m = Mock::new(vec![
@@ -955,17 +875,10 @@ fn a_busy_wait_with_an_unanswered_autopilot_read_touches_no_card() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// The requests `m` served, in arrival order, the claim's included.
 fn order(m: &Mock) -> Vec<&str> {
     m.order.iter().map(|(r, _)| r.as_str()).collect()
 }
 
-/// OFF LOOKS UNSUPERVISED. As the loop parks it gives the session's claim
-/// back — `meta unset supervisor holder=<it>`, the loop's own release — and
-/// nothing renews or retries it while parked, though every request would (a
-/// renewal step of zero), so the server raises the session's boxes to the
-/// menu bar again; as the word turns, the claim is taken again before
-/// anything is typed.
 #[test]
 fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
     let script = || {
@@ -1033,10 +946,6 @@ fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
 }
 
-/// AN OFF PARK ENDS THE LAND EPISODE: Land types its instruction, the word
-/// turns `off` at the next point (the loop parks there), and `land` again
-/// — and the point, read afresh, gets the instruction again: a new episode,
-/// never a nudge of the old one.
 #[test]
 fn land_then_off_then_land_types_the_land_instruction_again() {
     let script = || {
@@ -1093,9 +1002,6 @@ fn land_then_off_then_land_types_the_land_instruction_again() {
     assert_eq!(typed(&lines, RULE_LAND_NUDGE), 1, "{lines:#?}");
 }
 
-/// A REFUSED READ OF THE WORD KEEPS THE WORD LAST READ: a session the owner
-/// turned `off` stays parked through a `meta` the server refuses — never
-/// handed to the table's Cruise by the refusal — and nothing is typed.
 #[test]
 fn a_refused_read_of_the_word_keeps_the_word_last_read() {
     let script = || {
@@ -1150,9 +1056,6 @@ fn a_refused_read_of_the_word_keeps_the_word_last_read() {
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
 }
 
-/// A MANAGER'S ONE LOOK (`supervise`) IS THE MANAGER'S: the session's word
-/// `off` decides nothing there — no park, the read-only box pressed, the
-/// write box handed over — and no claim is taken or given back.
 #[test]
 fn a_managers_one_look_ignores_the_autopilot_word() {
     let (dir, journal) = journal_file("autopilot-one-look");
@@ -1195,9 +1098,6 @@ fn a_managers_one_look_ignores_the_autopilot_word() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE RETIRED TOKEN LANDS NOTHING: a reply to the land instruction that
-/// ends on `ATERM-TASK-DONE` beside work left is no clean defense, so Land
-/// nudges it (`land-nudge@v1`) and journals no `DONE`.
 #[test]
 fn a_token_reply_to_the_land_instruction_is_nudged_never_landed() {
     let done_lines = |word: &'static str, tag: &str, reply: &str| {
@@ -1276,8 +1176,6 @@ impl Review for Notes {
     }
 }
 
-/// The loop's own badge for the box `rows` shows, as its escalation writes
-/// it.
 fn badge_of(rows: &[String]) -> String {
     let turn = Turn {
         phase: worker_phase(rows),
@@ -1290,10 +1188,6 @@ fn badge_of(rows: &[String]) -> String {
     super::super::escalate::attention_text(&aterm_phase::ClaudeReader, &turn, "a restart")
 }
 
-/// OFF TAKES THE LOOP'S BADGES DOWN AS IT PARKS:
-/// the menu bar raises the session's boxes itself while the loop is parked,
-/// so a badge of the loop's left standing would tell the person twice, and
-/// the harness's stats would count the whole park as a person's wait.
 #[test]
 fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
     let rm = write_prompt();
@@ -1377,10 +1271,6 @@ fn an_off_park_takes_the_loops_badges_down_and_the_rejudge_raises_them_again() {
     assert_eq!(m.attention.as_deref(), Some(ours.as_str()));
 }
 
-/// EACH BADGE AN OFF PARK TAKES DOWN IS JOURNALED (`Session::lower_badges`,
-/// the claim untouched): the turn-end policy's (`CLEARED seq=<n> turn-end
-/// attention=OK`), a limit episode's and a limit's adopted before its
-/// episode opened (`CLEARED seq=<n> attention=OK <why>`).
 #[test]
 fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
     let lowered = |setup: fn(&mut Session<'_, Mock>), entry: &str| {
@@ -1438,12 +1328,6 @@ fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
     assert!(m.requests.is_empty(), "{:#?}", m.requests);
 }
 
-/// THE LOOP'S LAST CLEAR OF THE TURN-END POLICY'S BADGE IS JOURNALED
-/// (`Session::release_attention`): `CLEARED
-/// seq=<n> turn-end attention=OK`, so the harness's stats close the
-/// person's wait on it rather than dropping it at the loop's end — the line
-/// the fold reads back (`harness::stats`, a wait from its escalation to this
-/// line).
 #[test]
 fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
     use crate::harness::stats::{HarnessStats, fold_journal};
@@ -1494,11 +1378,6 @@ fn the_loops_last_clear_of_the_turn_end_badge_is_journaled() {
     assert_eq!(wait(&notes.noted), 0, "the loop's end counts nothing");
 }
 
-/// A PARK'S RETAKE BEHIND THE SAME HOLDER SAYS NOTHING NEW:
-/// the holder the loop watched behind as it parked is kept with
-/// the claim given back, so `WATCHING another supervisor holds this
-/// session: <holder>` is said once a holder, not once a park; and a claim
-/// won at the retake is news (`CLAIMED … (after <holder>)`).
 #[test]
 fn a_parks_retake_behind_the_same_holder_says_it_once() {
     let busy = |holder: &str| err(&format!("busy supervisor={holder}"));
@@ -1551,7 +1430,6 @@ fn a_parks_retake_behind_the_same_holder_says_it_once() {
     );
 }
 
-/// AN OFF PARK'S END SETS THE TURN-END POLICY'S BADGE AGAIN.
 #[test]
 fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
     let entry = "claude idle: finish sign-in in the browser (the turn-end policy)";
@@ -1620,11 +1498,6 @@ fn an_off_parks_end_sets_the_turn_end_badge_again_unless_the_worker_worked() {
     assert!(!badge);
 }
 
-/// A LIMIT'S BADGE SAYS WHETHER IT IS WAITED OUT
-/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.4): under `resume_limits`,
-/// a notice naming a reset the loop read is `kind=wait` — the turn-end policy
-/// continues it — and a notice naming no reset it can read is `kind=ask`: a
-/// reset is never guessed, so nothing here ends it.
 #[test]
 fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
     let weekly = "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
@@ -1667,7 +1540,6 @@ fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
     }
 }
 
-/// A LIMIT SPANNING AN OFF PARK IS ONE EPISODE.
 #[test]
 fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
     use crate::harness::stats::{HarnessStats, fold_journal};
@@ -1763,10 +1635,6 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
     assert_eq!(folded(&noted).0, 2, "{noted:#?}");
 }
 
-/// WHAT A PARK KEEPS OF A LIMIT ENDS WHERE THE WORKER ANSWERED PAST IT:
-/// the retry a park keeps of a raised episode, and the
-/// marker of a limit's badge adopted from a previous loop, last only while
-/// the notice stands.
 #[test]
 fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
     let notice = "You've hit your session limit · resets 2am";
@@ -1821,12 +1689,6 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
     }
 }
 
-/// A LIMIT'S BADGE ADOPTED FROM A PREVIOUS LOOP IS OVER AT THE FIRST POINT
-/// THAT IS NOT ITS NOTICE: a loop that adopts the
-/// badge over the notice, then reads the worker answered past it, takes the
-/// badge down (`CLEARED … the worker answered past the adopted limit's
-/// notice`) and forgets the adoption, so the next limit is escalated as its
-/// own ask.
 #[test]
 fn a_limit_after_the_worker_answered_an_adopted_one_is_a_new_ask() {
     let notice = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
@@ -1883,11 +1745,6 @@ fn a_limit_after_the_worker_answered_an_adopted_one_is_a_new_ask() {
     );
 }
 
-/// A LOOP BEHIND ANOTHER SUPERVISOR'S CLAIM READS THE SESSION'S WORD AT ITS
-/// START: its start-up reconcile settles nothing
-/// behind the holder, but the word its `meta` read names is noted — so a
-/// park on the table's `off` knows the host keeps the word, reads it again
-/// at each step, and ends when the owner turns this session `cruise`.
 #[test]
 fn a_loop_behind_another_holder_reads_the_word_and_its_park_ends_on_it() {
     let run = |word: Option<&'static str>, tag: &str| {

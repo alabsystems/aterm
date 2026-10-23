@@ -5,6 +5,10 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Utilities for working with `CFRunLoop`.
+//!
+//! LOCAL PATCH (aterm): the run-loop declarations are `aterm_objc::cf`'s (not the `core-foundation`
+//! crate's), the handlers take `aterm_objc::MainThread`, and the queued-closure block is
+//! `aterm_objc::RcBlock` (not `block2`'s).
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, UnwindSafe};
@@ -26,6 +30,9 @@ use super::app_state::ApplicationDelegate;
 use super::event_loop::{stop_app_on_panic, PanicInfo};
 use super::ffi;
 
+// LOCAL PATCH (aterm): the observer callbacks are `extern "C-unwind"` and contain an NSException
+// from the handlers' AppKit sends inside `stop_app_on_panic`'s `catch_unwind`, where it used to
+// abort as a foreign exception.
 unsafe fn control_flow_handler<F>(panic_info: *mut c_void, site: &'static str, f: F)
 where
     F: FnOnce(Weak<PanicInfo>) + UnwindSafe,
@@ -117,6 +124,9 @@ impl RunLoop {
             fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFTypeRef, block: *mut c_void);
         }
 
+        // LOCAL PATCH (aterm): `RcBlock`'s invoke runs under the declared-method guards (a panic
+        // aborts named, an NSException is contained); upstream's block had a `nounwind` invoke,
+        // below which a raise aborted the process.
         let closure = Cell::new(Some(closure));
         // SAFETY: the prototype `CFRunLoopPerformBlock` invokes is `void (^)(void)`, which is exactly what `new0` over a `Fn() -> ()` builds; nothing unwinds out of its `invoke`.
         let block = unsafe {
@@ -162,6 +172,9 @@ pub fn setup_control_flow_observers(mtm: MainThread, panic_info: Weak<PanicInfo>
     }
 }
 
+// LOCAL PATCH (aterm): wraps `aterm_objc::WakeTimer`, not a `CFRunLoopTimer` repeating every 0.1
+// µs, which CoreFoundation advanced one interval at a time under the run-loop lock after the
+// process had been stopped.
 #[derive(Debug)]
 pub struct EventLoopWaker {
     timer: WakeTimer,

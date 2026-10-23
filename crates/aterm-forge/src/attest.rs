@@ -507,8 +507,8 @@ pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)
     Ok(out)
 }
 
-/// One `- <name> <version>, <SPDX> (`<dir>/`)` line of `NOTICE`; `dir` is repo-relative, under
-/// `vendor/` for a fork or `crates/` for an absorbed crate.
+/// One `` - <name> <version>, <SPDX> (`<dir>/`) `` line of `NOTICE`; `dir` is repo-relative,
+/// under `vendor/` for a fork or `crates/` for an absorbed crate.
 #[derive(Debug, Clone)]
 struct NoticeEntry {
     name: String,

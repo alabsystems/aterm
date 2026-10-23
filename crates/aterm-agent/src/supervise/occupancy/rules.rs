@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUILT-IN RULES AND THEIR DECIDER (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.2,
-//! §5; the red-team's F1, F9 and F15): whether `wait-nudge@v1` or `hold-room@v1` is due at a
-//! break, and if so what holds it. Pure and clockless: every instant is the caller's milliseconds
-//! (the loop's hold clock), and every input is a value the caller already holds — the hold, the
-//! board's [`OccupancyReading`], the [`Books`] of what was told, and the [`Guards`] it judged
-//! from its own state, and the nudge's wait (the session's setup holds it, from
-//! [`wait_nudge_after_ms`], so a tape replays under the wait it was recorded under). [`decide`]
-//! reads nothing and types nothing.
-//!
-//! Each rule's verdict, checked in this order:
-//!
-//! 1. [`Verdict::Quiet`]: its condition does not hold, or its own cadence has it wait (once a
-//!    hold for the nudge; [`HOLD_ROOM_APART_MS`] between `hold-room`'s).
-//! 2. [`Verdict::Spent`]: its cap is spent ([`NUDGES_PER_DAY`] nudges a rolling day;
-//!    [`HOLD_ROOM_PER_HOLD`] a hold), judged before the machine's terms, which a spent rule
-//!    never needs read. Past it §3.2 raises an Entry.
-//! 3. [`Verdict::Quiet`] again where the machine's terms do not hold on the board.
-//! 4. [`Verdict::Held`]: a guard holds it — a brake of the break's, a person's hand or grace,
-//!    the halt, a draft in the composer, a session with no task yet, the person's own exchange,
-//!    the memory wall, the API's route down, then the session's autopilot (both rules are
-//!    Cruise's).
-//! 5. [`Verdict::Paced`]: the session's own pace, one line per [`SESSION_PACE_MS`].
-//! 6. [`Verdict::Due`], with the line it would type. At most one rule is due at a break: a
-//!    second is paced behind the first.
+//! Built-in occupancy rules (`wait-nudge@v1` and `hold-room@v1`) and their pure decider [`decide`].
 
 use super::reading::OccupancyReading;
 use super::templates::{self, FactLine};
@@ -57,8 +34,6 @@ pub fn wait_nudge_after_ms() -> i64 {
     *AFTER.get_or_init(|| nudge_after_ms_of(aterm_types::dev_seam!(NUDGE_SEAM).as_deref()))
 }
 
-/// [`wait_nudge_after_ms`] of the seam's value `seam`: a whole count of seconds from 1 to the
-/// shipped wait's, so the seam only shortens it; anything else is the shipped wait.
 fn nudge_after_ms_of(seam: Option<&std::ffi::OsStr>) -> i64 {
     seam.and_then(|v| v.to_str()?.trim().parse::<i64>().ok())
         .filter(|s| (1..=WAIT_NUDGE_AFTER_MS / 1000).contains(s))
@@ -94,8 +69,11 @@ pub enum RuleId {
 }
 
 impl RuleId {
+    /// How many rules there are: the length of every per-rule array ([`Self::index`]).
+    pub const COUNT: usize = 2;
+
     /// Every rule, in the order a break decides them (the first due is the one due).
-    pub const ALL: [RuleId; 2] = [RuleId::WaitNudge, RuleId::HoldRoom];
+    pub const ALL: [RuleId; Self::COUNT] = [RuleId::WaitNudge, RuleId::HoldRoom];
 
     /// Its name and revision, as rows and journal lines spell it. Stable: a successor loop books
     /// by it ([`would_rows_in`]).
@@ -118,6 +96,15 @@ impl RuleId {
     pub const fn kind(self) -> crate::supervise::facts::FactKind {
         match self {
             RuleId::WaitNudge | RuleId::HoldRoom => crate::supervise::facts::FactKind::Hold,
+        }
+    }
+
+    /// Whether slice 1's builds had it: a told word replayed from such a build's tape carries
+    /// these alone ([`super::said::told_rules`]).
+    #[must_use]
+    pub const fn slice1(self) -> bool {
+        match self {
+            RuleId::WaitNudge | RuleId::HoldRoom => true,
         }
     }
 
@@ -301,7 +288,6 @@ impl Books {
         }
     }
 
-    /// The nudges within the day before `now_ms`.
     fn nudges_today(&self, now_ms: i64) -> usize {
         self.nudges
             .iter()
@@ -310,7 +296,7 @@ impl Books {
     }
 }
 
-/// A rule's verdict at a break ([module docs](self)).
+/// A rule's verdict at a break.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Not due.
@@ -350,8 +336,6 @@ pub fn ready(r: &OccupancyReading, hold: Option<HoldSeen>, now_ms: i64) -> bool 
     })
 }
 
-/// `rule`'s terms but the machine's, with its own cadence: for `wait-nudge` the hold
-/// `nudge_after_ms` old, undeclared and not nudged yet; for `hold-room` [`room_holds`].
 fn holds_but_machine(
     rule: RuleId,
     hold: HoldSeen,
@@ -369,8 +353,6 @@ fn holds_but_machine(
     }
 }
 
-/// `hold-room`'s terms but the machine's: the hold [`HOLD_ROOM_AFTER_MS`] old and its last line
-/// [`HOLD_ROOM_APART_MS`] back ([`room_due_ms`]).
 fn room_holds(hold: HoldSeen, books: &Books, now_ms: i64) -> bool {
     now_ms >= room_due_ms(hold.since_ms, books.rooms.last().copied())
 }
@@ -388,13 +370,7 @@ pub fn room_due_ms(since_ms: i64, last_ms: Option<i64>) -> i64 {
     })
 }
 
-/// THE DECISION AT A BREAK at `now_ms` ([module docs](self)): each rule's verdict, in
-/// [`RuleId::ALL`]'s order, `wait-nudge` holding from a hold `nudge_after_ms` old (the
-/// session's setup's; [`wait_nudge_after_ms`]). `books` must be of `hold` ([`Books::hold`]). A
-/// cap is judged before the machine: a spent `hold-room` needs no reading to be said spent.
-/// `OccupancyDoor`'s `Intend` is enabled where this says [`Verdict::Due`] (the anchor binds that
-/// verdict; the intent row itself is the typing path's), and its `Lapse` is a due rule whose
-/// condition no longer holds ([`Verdict::Quiet`]: dropped, never told late).
+/// Decide each rule's verdict at a break at `now_ms`.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -419,7 +395,7 @@ pub fn decide(
     g: &Guards,
     nudge_after_ms: i64,
     now_ms: i64,
-) -> [(RuleId, Verdict); 2] {
+) -> [(RuleId, Verdict); RuleId::COUNT] {
     let mut due_seen = false;
     RuleId::ALL.map(|rule| {
         let verdict = match hold
@@ -468,7 +444,6 @@ pub fn line(rule: RuleId, r: &OccupancyReading, hold: HoldSeen, now_ms: i64) -> 
     }
 }
 
-/// Whether `rule`'s cap is spent at `now_ms`.
 fn spent(rule: RuleId, books: &Books, now_ms: i64) -> bool {
     match rule {
         RuleId::WaitNudge => books.nudges_today(now_ms) >= NUDGES_PER_DAY,
@@ -476,8 +451,6 @@ fn spent(rule: RuleId, books: &Books, now_ms: i64) -> bool {
     }
 }
 
-/// When the session's pace lets the next line go, while it is ahead of `now_ms`; a rule due
-/// behind another at the same break (`due_seen`) waits a whole pace.
 fn paced(books: &Books, now_ms: i64, due_seen: bool) -> Option<i64> {
     if due_seen {
         return Some(now_ms.saturating_add(SESSION_PACE_MS));

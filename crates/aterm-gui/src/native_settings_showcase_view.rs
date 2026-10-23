@@ -5,7 +5,7 @@
 
 use super::customize::{
     caption_height, colour_rows_least_column, colour_rows_on_one_line, sheet_blocks,
-    sheet_list_least,
+    sheet_list_least, sheet_sized_by_room,
 };
 use super::*;
 use crate::settings_preview::theme_card::{
@@ -33,6 +33,25 @@ fn aa_width() -> f32 {
 fn low_width() -> f32 {
     14.0_f32.max(text_width("\u{26a0}", SemanticRole::Text, StyleRef::Quiet).ceil())
 }
+
+/// The widths of a row's tags at the live text size, measured once for the rows a list builds.
+#[derive(Clone, Copy)]
+struct TagWidths {
+    aa: f32,
+    low: f32,
+    check: f32,
+}
+
+impl TagWidths {
+    fn now() -> Self {
+        Self {
+            aa: aa_width(),
+            low: low_width(),
+            check: check_width(),
+        }
+    }
+}
+
 const ICON_BUTTON: f32 = 20.0;
 const ROW_END: f32 = 4.0;
 
@@ -242,11 +261,18 @@ pub(crate) fn themes_page(
                 head: true,
                 footer: matches!(shape, Shape::Beside { .. }),
             };
+            let body = room;
             let room = whole_rows_height(state, room, pins);
             let chooser = panel_width(chooser, page_width);
             let demo_width = (page_width - chooser - COLUMN_GAP).max(0.0);
             let (strip_box, strip) = strip_node(state, demo_width);
-            let demo_height = (room - DEMO_STRIP_GAP - strip).max(0.0);
+            // THE STRIP STANDS OVER A STATUS'S BAR: the demo gives up what
+            // the bar covers of the column, and the bar shortens for a
+            // control of the strip it would still cover. Laid out under the
+            // bar, the sheet's Done at 640x480 at 2× text was 8pt of 48.
+            let cover = (state.status_extra.get() - (body - room)).max(0.0);
+            let demo_height = (room - cover - DEMO_STRIP_GAP - strip).max(0.0);
+            state.note_pinned_status_room(&strip_box, body - DEMO_STRIP_GAP - strip);
             let left = if state.showcase.sheet_open {
                 sheet_panel(state, chooser, room, Vec::new())
             } else {
@@ -330,7 +356,6 @@ pub(crate) fn themes_page(
                     if let Some(spec) = spec {
                         out.push(demo_node(spec, demo_height));
                     }
-                    out.push(strip_box);
                     let pins = ChooserPins {
                         head: true,
                         footer: false,
@@ -338,6 +363,8 @@ pub(crate) fn themes_page(
                     let panel_height = whole_rows_height(state, panel_height, pins)
                         .max(least)
                         .min(panel_height);
+                    state.note_pinned_status_room(&strip_box, panel_height);
+                    out.push(strip_box);
                     out.push(if state.showcase.sheet_open {
                         sheet_panel(state, page_width, panel_height, Vec::new())
                     } else {
@@ -426,8 +453,12 @@ fn chooser_pinned_height(state: &SettingsViewState, pins: ChooserPins) -> f32 {
 }
 
 fn chooser_rows_tallest(state: &SettingsViewState, inner: f32, narrow: bool) -> f32 {
-    let blocks = list_blocks_for(state, inner, narrow, "");
-    scroll::tallest_span(&section_items(blocks, inner, false), 0.0, f32::INFINITY)
+    with_blocks(state, (inner, narrow, ""), |entry| {
+        *entry.tallest.get_or_insert_with(|| {
+            let items = section_items(entry.blocks.clone(), inner, false);
+            scroll::tallest_span(&items, 0.0, f32::INFINITY)
+        })
+    })
 }
 
 fn chooser_tallest_stop(state: &SettingsViewState, pins: ChooserPins, rows: f32) -> f32 {
@@ -1178,14 +1209,23 @@ fn chooser_panel(
     if pins.footer {
         list.layout.height = Length::Fixed(room);
     }
-    let mut children: Vec<UiNode> = if pins.head {
+    let head = if pins.head {
         chooser_head(state, inner)
-            .into_iter()
-            .map(|(node, _)| node)
-            .collect()
     } else {
         Vec::new()
     };
+    let under_head = head
+        .iter()
+        .fold(height - PANEL_INSET + PANEL_GAP, |under, (_, tall)| {
+            under - tall - PANEL_GAP
+        });
+    let mut children: Vec<UiNode> = head
+        .into_iter()
+        .map(|(node, _)| {
+            state.note_pinned_status_room(&node, under_head);
+            node
+        })
+        .collect();
     children.push(list);
     if pins.footer {
         children.push(rule_node("settings/showcase/footer/rule"));
@@ -1326,12 +1366,12 @@ fn sheet_panel(
         .sum::<f32>()
         + if pin_title { 0.0 } else { title_height + gap };
     let one_line = colour_rows_on_one_line((inner - THUMB_GUTTER).max(0.0));
-    let probe = sheet_blocks(state, inner, room, one_line);
+    let probe = shared_sheet_blocks(state, inner, room, one_line);
     let span: f32 = head_span + probe.iter().map(|(_, height)| height + gap).sum::<f32>() - gap;
     let scrolls = span > room + 0.01;
     let (width, blocks) = if scrolls {
         let width = inner - THUMB_GUTTER;
-        (width, sheet_blocks(state, width, room, one_line))
+        (width, shared_sheet_blocks(state, width, room, one_line))
     } else {
         (inner, probe)
     };
@@ -1666,7 +1706,102 @@ pub(in crate::native_settings) fn list_blocks(
     list_blocks_for(state, width, narrow, &state.showcase.query())
 }
 
+/// The chooser's rows at a width, narrow or not, under a query, and the tallest of them.
+pub(in crate::native_settings) struct SharedBlocks {
+    at: (u32, bool, String),
+    blocks: Vec<(UiNode, f32, Option<String>)>,
+    tallest: Option<f32>,
+}
+
+/// THE PAGE'S SEATS SHARE THE CHOOSER'S ROWS: while open, each width's rows are built once a render.
+pub(in crate::native_settings) struct BlocksShared<'a>(&'a SettingsViewState);
+
+impl<'a> BlocksShared<'a> {
+    pub(in crate::native_settings) fn open(state: &'a SettingsViewState) -> Self {
+        state.showcase_blocks.replace(Some(Vec::new()));
+        state.showcase_sheet.replace(Some(Vec::new()));
+        Self(state)
+    }
+}
+
+impl Drop for BlocksShared<'_> {
+    fn drop(&mut self) {
+        self.0.showcase_blocks.replace(None);
+        self.0.showcase_sheet.replace(None);
+    }
+}
+
+/// The Customize sheet's rows at a width, in a room, colour rows on one line or not.
+pub(in crate::native_settings) type SharedSheet = (SheetAt, Vec<(UiNode, f32)>);
+
+/// What the sheet's rows are built at: the width, the room where an open picker reads it, colour
+/// rows on one line or not, and what the seat lays setting rows out by.
+type SheetAt = (u32, Option<u32>, bool, (Option<u32>, usize));
+
+/// [`sheet_blocks`], built once a render for each width and room while [`BlocksShared`] is open.
+fn shared_sheet_blocks(
+    state: &SettingsViewState,
+    width: f32,
+    room: f32,
+    one_line: bool,
+) -> Vec<(UiNode, f32)> {
+    let at = (
+        width.to_bits(),
+        sheet_sized_by_room(state).then_some(room.to_bits()),
+        one_line,
+        crate::native_settings::seat_row_rooms(),
+    );
+    let built = state
+        .showcase_sheet
+        .borrow()
+        .as_ref()
+        .and_then(|shared| shared.iter().find(|(seen, _)| *seen == at))
+        .map(|(_, blocks)| blocks.clone());
+    built.unwrap_or_else(|| {
+        let blocks = sheet_blocks(state, width, room, one_line);
+        if let Some(shared) = state.showcase_sheet.borrow_mut().as_mut() {
+            shared.push((at, blocks.clone()));
+        }
+        blocks
+    })
+}
+
+/// `read` of the rows [`list_blocks_for`] builds, shared while [`BlocksShared`] is open.
+fn with_blocks<R>(
+    state: &SettingsViewState,
+    (width, narrow, query): (f32, bool, &str),
+    read: impl FnOnce(&mut SharedBlocks) -> R,
+) -> R {
+    let at = (width.to_bits(), narrow, query.to_string());
+    let build = |at| SharedBlocks {
+        blocks: build_list_blocks(state, width, narrow, query),
+        at,
+        tallest: None,
+    };
+    let mut shared = state.showcase_blocks.borrow_mut();
+    let Some(shared) = shared.as_mut() else {
+        return read(&mut build(at));
+    };
+    let index = match shared.iter().position(|entry| entry.at == at) {
+        Some(index) => index,
+        None => {
+            shared.push(build(at));
+            shared.len() - 1
+        }
+    };
+    read(&mut shared[index])
+}
+
 fn list_blocks_for(
+    state: &SettingsViewState,
+    width: f32,
+    narrow: bool,
+    query: &str,
+) -> Vec<(UiNode, f32, Option<String>)> {
+    with_blocks(state, (width, narrow, query), |entry| entry.blocks.clone())
+}
+
+fn build_list_blocks(
     state: &SettingsViewState,
     width: f32,
     narrow: bool,
@@ -1674,6 +1809,7 @@ fn list_blocks_for(
 ) -> Vec<(UiNode, f32, Option<String>)> {
     let showcase = &state.showcase;
     let slab = slab_column(state, width, narrow);
+    let tags = TagWidths::now();
     let mut blocks: Vec<(UiNode, f32, Option<String>)> = Vec::new();
     let reach = showcase.reach_for(query);
     let attention: Vec<&AttentionRow> = showcase
@@ -1717,7 +1853,7 @@ fn list_blocks_for(
         }
         let in_use = configured.eq_ignore_ascii_case(&card.id);
         let selected = highlighted.as_deref() == Some(card.slug.as_str());
-        let (row, height) = row_node(state, card, width, narrow, slab, in_use, selected);
+        let (row, height) = row_node(state, card, (width, narrow, slab, tags), in_use, selected);
         blocks.push((row, height, Some(card.slug.clone())));
         rows_before = true;
     }
@@ -1842,9 +1978,7 @@ fn pack_row(
 fn row_node(
     state: &SettingsViewState,
     card: &ShowcaseCard,
-    width: f32,
-    narrow: bool,
-    slab: Option<f32>,
+    (width, narrow, slab, tags): (f32, bool, Option<f32>, TagWidths),
     in_use: bool,
     selected: bool,
 ) -> (UiNode, f32) {
@@ -1887,9 +2021,11 @@ fn row_node(
         )
     };
     let mut trailing: Vec<UiNode> = Vec::new();
-    let aa_width = aa_width();
-    let low_width = low_width();
-    let check_width = check_width();
+    let TagWidths {
+        aa: aa_width,
+        low: low_width,
+        check: check_width,
+    } = tags;
     let others = [
         low.then_some(low_width),
         yours.then_some(2.0 * ICON_BUTTON + 4.0),
@@ -1901,13 +2037,15 @@ fn row_node(
     .map(|width| width + 6.0)
     .sum::<f32>();
     let name_room = width - TEXT_INSET - ROW_END - others;
-    let name_fits_beside_tag = fit_text(
-        &card.label,
-        SemanticRole::Text,
-        StyleRef::Primary,
-        name_room - aa_width - 6.0,
-    ) == card.label;
-    if typed && (!yours || name_fits_beside_tag) {
+    let name_fits_beside_tag = || {
+        fit_text(
+            &card.label,
+            SemanticRole::Text,
+            StyleRef::Primary,
+            name_room - aa_width - 6.0,
+        ) == card.label
+    };
+    if typed && (!yours || name_fits_beside_tag()) {
         trailing.push(tag("aa", "Aa", StyleRef::Quiet, aa_width));
     }
     if low {

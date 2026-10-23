@@ -87,7 +87,7 @@ impl CapSource {
     }
 }
 
-/// What this machine's readers can say, measured on it ([`crate::caps`]).
+/// What this machine's readers can say, measured on it ([`fn@crate::caps`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caps {
     /// The OS the readers were built for: `macos`, `linux`, `windows`, `other`.

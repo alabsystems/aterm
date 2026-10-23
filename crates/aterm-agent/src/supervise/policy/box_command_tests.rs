@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`blanks_read_as_drawn`], and the barred Bash boxes Claude Code 2.1.307
-//! and 2.1.308 really drew (MEASURED 2026-10-22 in the real-Claude lab,
-//! `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): each box
-//! capture `claude-2.1.30[78]-box-bash-*`, which the approval policy's tests
-//! decide on the screen's readings alone
-//! (`approval::tests::every_measured_barred_box_is_judged_by_its_screen_alone`).
+//! Tests for [`blanks_read_as_drawn`] and barred Bash approval boxes.
 
 use aterm_phase::PromptV2;
 
@@ -58,7 +53,8 @@ pub(crate) const TWIN_SCREEN: &str =
 pub(crate) const TABS: &str = include_str!("fixtures/claude-2.1.307-box-bash-wrap-tabs.txt");
 
 /// Each 2.1.308 capture's name and screen: `Probe <name>`'s box, under its
-/// call's row (MEASURED 2026-10-22, the measured note's §H and §W): the
+/// call's row (MEASURED 2026-10-22,
+/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md` §H and §W): the
 /// call's row's width, cut and trim (`h-…`), tabs, CJK, kana, Hangul and
 /// fullwidth forms, and both ends of every wide block, in the box
 /// (`w-ranges`) and in the call's row (`w-ranges` for the two CJK blocks,
@@ -219,9 +215,6 @@ pub(crate) const SHORT_BACKTICKS: &str =
 /// row of an older call S and N's own `Waiting…` row: breaker-4's stale call.
 pub(crate) const STALE_SCREEN: &str = include_str!("fixtures/claude-2.1.308-box-bash-stale-n.txt");
 
-/// The rows Claude Code draws `text` in where no line wraps: each line with
-/// its tabs expanded to the next stop of eight and its trailing blanks
-/// dropped (MEASURED on 2.1.308, the measured note's §W; ASCII only).
 fn drawn(text: &str) -> Vec<String> {
     text.split('\n')
         .map(|line| {
@@ -239,35 +232,11 @@ fn drawn(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The measured too-many box with its barred rows drawn for `text`
-/// ([`drawn`]), read.
 fn boxed(text: &str) -> PromptV2 {
     let rows = super::super::approval::tests::too_many_box(&drawn(text), false);
     aterm_phase::prompt::parse_prompt_v2(&rows).expect("the box")
 }
 
-/// A READING OF THE ROWS PROVES NOTHING WHERE ITS WORDS TURN ON A BLANK THE
-/// SCREEN CANNOT SHOW ([`blanks_read_as_drawn`]; MEASURED 2026-10-22 under
-/// `/bin/bash` 3.2, the measured note's §B). Each command below draws as the
-/// same rows as its twin ([`drawn`]: a tab to its stop, no blank at a row's
-/// end), the text the screen shows typed as a command; the classifier reads
-/// the twin a read and the command
-/// not, since bash runs the command's `tee x` where the twin holds it as
-/// here-document text or as a word: `<<-` over a tab-led `EOF`, and over
-/// the blanks the tab draws as; a backslash before a blank that ends a line,
-/// and one ending it; a backslash before a tab and `#`, and one before the
-/// blanks the tab draws as. The screen's newline reading of each box is
-/// refused, the form named. Where the screen's reading is the twin (both
-/// backslashes) it would otherwise be proven a read; the rows of the
-/// here-document lose their leading blanks, so there the screen's own
-/// reading ends the body and runs `tee x`.
-///
-/// NEGATIVE CONTROLS: blanks and a tab that only separate words, a backslash
-/// before one blank and a word (`My\ File`, read alike whether the blank is
-/// a tab drawn as one), a here-string and the measured lines of `echo` are
-/// read as drawn; a backslash at the text's end, one before a tab, one
-/// before a blank that ends a line, and an arithmetic `<<` are refused by
-/// name (stricter than the shell there).
 #[test]
 fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing() {
     use crate::supervise::classify::classify_command;

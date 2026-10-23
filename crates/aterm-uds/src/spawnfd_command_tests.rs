@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`Command`]'s tests: every stdio mode, `std`'s rules for programs, arguments, environments and directories (table-driven against `std::process::Command` itself), the inheritance guarantee, signals, the child handle and `exec`.
+//! Tests for [`Command`]: stdio modes, argument/env/cwd rules, inheritance, signals, and `exec`.
 
 #[cfg(target_vendor = "apple")]
 use super::tests::flags;
@@ -83,7 +83,6 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
     );
 }
 
-/// A private scratch directory, removed on drop.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -108,7 +107,6 @@ impl Drop for Scratch {
     }
 }
 
-/// Write `body` to `path` with permission bits `mode`.
 fn write_mode(path: &Path, body: &str, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = path.parent() {
@@ -118,11 +116,6 @@ fn write_mode(path: &Path, body: &str, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// **EVERY STDIO MODE ROUND-TRIPS.** A piped stdin into a piped stdout;
-/// `output()`'s defaults (stdin `/dev/null`, both outputs captured); a null
-/// stdout; descriptors handed as stdin (an `io::pipe` end), stdout and stderr
-/// (files); `status()` carrying the exit code; and two floods at once, which
-/// stall unless both pipes are read together.
 #[test]
 fn every_stdio_mode_round_trips() {
     let mut child = command("/bin/cat")
@@ -200,8 +193,6 @@ fn every_stdio_mode_round_trips() {
     );
 }
 
-/// A descriptor handed at a number a file action may not name (Darwin's libc
-/// refuses 10 240 and up) still reaches its slot: the spawn places a copy.
 #[test]
 fn a_descriptor_at_any_number_reaches_its_slot() {
     let floor: RawFd = 10_300;
@@ -283,7 +274,8 @@ fn staged_closed_stdio() {
     let err = std::fs::File::create(&err_path).expect("err file");
     let stdout = std::io::stdout().as_fd().try_clone_to_owned();
     let saved = park(stdout.expect("dup stdout"), 64);
-    // SAFETY: closes this staged process's own stdin and stdout, which nothing else uses until `dup2` puts stdout back below.
+    // SAFETY: closes this staged process's own stdin and stdout, which nothing else uses until
+    // `dup2` puts stdout back below.
     assert_eq!(unsafe { close(0) }, 0, "close stdin");
     assert_eq!(unsafe { close(1) }, 0, "close stdout");
 
@@ -326,7 +318,8 @@ fn staged_closed_stdio() {
         .output()
         .expect("output");
 
-    // SAFETY: puts this process's stdout back on 1 (nothing holds 1 now: every end above was moved off it, closed or dropped).
+    // SAFETY: puts this process's stdout back on 1 (nothing holds 1 now: every end above was moved
+    // off it, closed or dropped).
     assert_eq!(unsafe { dup2(saved.as_raw_fd(), 1) }, 1, "restore stdout");
     let said = std::fs::read_to_string(&err_path).expect("read err");
     println!("STAGED closed-stdio our-end={mine} status={status:?} err={said:?} out={out:?}");
@@ -360,14 +353,12 @@ fn a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio() {
     assert!(out.contains("STAGED closed-stdio ok"), "{out}");
 }
 
-/// One environment edit.
 enum Env {
     Set(&'static str, String),
     Remove(&'static str),
     Clear,
 }
 
-/// One row of the parity table.
 struct Case {
     what: &'static str,
     program: String,
@@ -398,7 +389,6 @@ impl Case {
     }
 }
 
-/// `$new(program)` configured as `case` says — one spelling for both types, so the table drives them identically.
 macro_rules! configured {
     ($new:expr, $case:expr) => {{
         let case: &Case = $case;
@@ -424,8 +414,6 @@ macro_rules! configured {
     }};
 }
 
-/// What a run came to: its code and both outputs, or the error's kind and
-/// errno.
 type Outcome = Result<(Option<i32>, String, String), (io::ErrorKind, Option<i32>)>;
 
 fn outcome(run: io::Result<std::process::Output>) -> Outcome {
@@ -439,11 +427,6 @@ fn outcome(run: io::Result<std::process::Output>) -> Outcome {
     .map_err(|e| (e.kind(), e.raw_os_error()))
 }
 
-/// **`std`'S RULES, ROW FOR ROW.** Every row runs through
-/// `std::process::Command` and through [`command`] with the same program,
-/// arguments, environment edits and working directory, and must come to the
-/// same thing: the same exit code and output, or the same error — kind and
-/// errno.
 #[test]
 fn programs_arguments_environments_and_directories_match_std() {
     let scratch = Scratch::new("parity");
@@ -687,7 +670,6 @@ fn programs_arguments_environments_and_directories_match_std() {
     }
 }
 
-/// The command's own accessors answer what it was given, as `std`'s do.
 #[test]
 fn the_accessors_answer_what_the_command_was_given() {
     let mut ours = command("prog");
@@ -708,10 +690,6 @@ fn the_accessors_answer_what_the_command_was_given() {
     assert_eq!(format!("{ours:?}"), format!("{theirs:?}"));
 }
 
-/// **`arg0` IS THE CHILD'S `argv[0]`, AND ONLY THAT.** The program named is
-/// still what is searched for and run (a bare `sh` on the `PATH`), the child
-/// reads the `arg0` given (`sh -c` with no operand sets `$0` from it), and
-/// the accessors and `Debug` answer as `std`'s do.
 #[test]
 fn arg0_is_the_childs_argv_zero_and_only_that() {
     use std::os::unix::process::CommandExt as _;
@@ -744,9 +722,6 @@ fn arg0_is_the_childs_argv_zero_and_only_that() {
     assert_eq!(format!("{same:?}"), format!("{theirs_same:?}"));
 }
 
-/// The shell a test runs: `held` or `clear` for `fd`, then ` out` on stdout,
-/// `err` on stderr, exit 3 — so one run shows the inheritance, the stdout
-/// pipe, the stderr pipe and the status at once.
 fn held_out_err(fd: RawFd) -> [String; 2] {
     [
         "-c".to_string(),
@@ -757,13 +732,6 @@ fn held_out_err(fd: RawFd) -> [String; 2] {
     ]
 }
 
-/// **A CHILD HOLDS ITS STDIO AND NOTHING ELSE, AND ITS PIPES STILL WORK.** An
-/// unflagged descriptor reaches a deliberately leaky raw spawn (the control,
-/// [`test_support::leaky_output`]: not `std`'s `Command`, whose child Trust's
-/// std hands nothing above stdio) and none of the three paths through
-/// [`command`] — `spawn` with a piped stdout, `output`
-/// (both pipes captured, the status kept) and `status` — nor a `std` command
-/// given [`InheritNothing::inherit_nothing`].
 #[test]
 fn a_command_child_holds_its_stdio_and_its_pipes_and_nothing_else() {
     let held = unflagged_at_or_above(64);
@@ -933,11 +901,8 @@ fn sigset_of(signals: &[i32]) -> SigSet {
     }
 }
 
-/// The stage a mask probe runs as: this test binary, printing the signal mask
-/// it was started with ([`signal_mask_probe_stage`]).
 const MASK_PROBE: &str = "mask-probe";
 
-/// `MASK=` and the mask a probe printed, from `out`'s stdout.
 fn probed_mask(out: &std::process::Output) -> String {
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
@@ -946,7 +911,6 @@ fn probed_mask(out: &std::process::Output) -> String {
         .to_string()
 }
 
-/// The mask probe, as a command of either type.
 macro_rules! mask_probe {
     ($new:expr) => {{
         let mut probe = $new(std::env::current_exe().expect("the test binary"));
@@ -962,8 +926,6 @@ macro_rules! mask_probe {
     }};
 }
 
-/// THE MASK PROBE, when [`STAGE_ENV`] names it (nothing otherwise): print the
-/// signal mask this process was started with.
 #[test]
 fn signal_mask_probe_stage() {
     if std::env::var(STAGE_ENV).as_deref() != Ok(MASK_PROBE) {
@@ -978,7 +940,6 @@ fn signal_mask_probe_stage() {
     println!("\nMASK={}", sigset_bits(&mask));
 }
 
-/// The signal numbers a set holds, comma-separated.
 fn sigset_bits(set: &SigSet) -> String {
     const SIGNALS: i32 = if cfg!(target_vendor = "apple") {
         32
@@ -1002,9 +963,9 @@ fn sigset_bits(set: &SigSet) -> String {
         .join(",")
 }
 
-/// The staged half of [`a_child_starts_with_no_signal_blocked_and_std_s_dispositions`].
 fn staged_signals() {
-    // SAFETY: `signal` with `SIG_IGN`, and a mask change for this thread; both take plain integers or a live local.
+    // SAFETY: `signal` with `SIG_IGN`, and a mask change for this thread; both take plain integers
+    // or a live local.
     unsafe {
         signal(SIGUSR2, SIG_IGN);
         let block = sigset_of(&[SIGUSR1, SIGTERM]);
@@ -1068,11 +1029,6 @@ fn staged_signals() {
     println!("STAGED signals ok");
 }
 
-/// **NO SIGNAL STARTS BLOCKED; THE DISPOSITIONS ARE `std`'S.** In a process
-/// that ignores SIGUSR2 and a thread that blocks SIGUSR1 and SIGTERM, a
-/// [`command`] child starts with an empty mask (`ps` reads it; a `std` child,
-/// the control, copies the thread's) and dies of SIGTERM, has SIGPIPE at its
-/// default and SIGUSR2 still ignored — what `std` gives.
 #[test]
 fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
     const NAME: &str =
@@ -1086,11 +1042,6 @@ fn a_child_starts_with_no_signal_blocked_and_std_s_dispositions() {
     print!("{out}");
 }
 
-/// **THE HANDLE REAPS ONCE AND KILLS ONLY ITS OWN.** A second `wait` answers
-/// from the first, `try_wait` after it too, and `kill` after the reap signals
-/// nobody and answers `Ok`; a running child is running for `try_wait`, `kill`
-/// ends it and `wait` reports the signal; `wait` closes a piped stdin first,
-/// so a child reading it to its end is not left waiting.
 #[test]
 fn the_child_handle_reaps_once_and_kills_only_its_own() {
     let mut done = command("/bin/sh")
@@ -1132,7 +1083,6 @@ fn the_child_handle_reaps_once_and_kills_only_its_own() {
     );
 }
 
-/// `ps`'s state letter for `pid` (`Z` for a zombie), or empty once it is gone.
 fn state_of(pid: u32) -> String {
     let out = std::process::Command::new("/bin/ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -1141,7 +1091,6 @@ fn state_of(pid: u32) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Wait (a hang detector, not a budget) until `pid` is a zombie.
 fn until_zombie(pid: u32) {
     let until = Instant::now() + Duration::from_secs(60);
     while !state_of(pid).starts_with('Z') {
@@ -1150,9 +1099,6 @@ fn until_zombie(pid: u32) {
     }
 }
 
-/// **A DROPPED HANDLE LEAVES NO ZOMBIE.** A child that has exited when its
-/// handle is dropped is collected by the drop; the control — a `std` child
-/// dropped the same way — stays a zombie until someone waits for it.
 #[test]
 fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
     let ours = command("/usr/bin/true").spawn().expect("spawn");
@@ -1265,10 +1211,6 @@ fn a_held_child_dies_unrun_with_its_holder_even_one_ignoring_hangups() {
     assert!(!marker.exists(), "a held child ran when its holder died");
 }
 
-/// **A SUSPENDED START IT CANNOT KEEP STARTS NOTHING.** Beside `exec` it answers
-/// `Unsupported` before trying (the program does not exist, which a tried `exec`
-/// answers `NotFound`, this process untouched either way); off Darwin every spawn
-/// does, and the child never runs.
 #[test]
 fn a_suspended_start_it_cannot_keep_starts_nothing() {
     let err = command("/nonexistent/spawnfd-suspended-exec")
@@ -1294,9 +1236,6 @@ fn a_suspended_start_it_cannot_keep_starts_nothing() {
     }
 }
 
-/// [`Command::process_group`] and [`Command::setsid`] are the spawn's own:
-/// the child leads a group of its own, or a session (and its group) of its
-/// own, read back with `getpgid` and `getsid`.
 #[test]
 fn a_child_leads_the_group_or_the_session_it_was_given() {
     unsafe extern "C" {
@@ -1376,11 +1315,10 @@ fn responsible_for(pid: u32) -> i32 {
     unsafe extern "C" {
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }
-    /// `pid_t f(pid_t)`.
     type Responsible = unsafe extern "C" fn(i32) -> i32;
-    /// `RTLD_DEFAULT`, as `<dlfcn.h>` defines it on Darwin.
     const RTLD_DEFAULT: *mut c_void = (-2_isize) as *mut c_void;
-    // SAFETY: a NUL-terminated C string literal; `RTLD_DEFAULT` is dlfcn.h's pseudo-handle for a global search.
+    // SAFETY: a NUL-terminated C string literal; `RTLD_DEFAULT` is dlfcn.h's pseudo-handle for a
+    // global search.
     let found = unsafe {
         dlsym(
             RTLD_DEFAULT,
@@ -1391,7 +1329,8 @@ fn responsible_for(pid: u32) -> i32 {
         !found.is_null(),
         "libSystem exports responsibility_get_pid_responsible_for_pid"
     );
-    // SAFETY: dyld resolved the name to the libquarantine function whose C prototype is `pid_t f(pid_t)`, exactly `Responsible`.
+    // SAFETY: dyld resolved the name to the libquarantine function whose C prototype is
+    // `pid_t f(pid_t)`, exactly `Responsible`.
     let responsible = unsafe { std::mem::transmute::<*mut c_void, Responsible>(found) };
     // SAFETY: one plain integer argument.
     unsafe { responsible(i32::try_from(pid).expect("pid")) }
@@ -1466,11 +1405,6 @@ fn a_disclaimed_child_is_its_own_responsible_process() {
     );
 }
 
-/// **A DISCLAIM THE OS CANNOT HONOUR STARTS NOTHING.** Asked to disclaim
-/// through an SPI no image exports (the stand-in for a macOS without it, and
-/// for every other OS), `spawn`, `output` and `status` each answer
-/// `Unsupported` and the child — a shell that would leave a marker — never
-/// runs.
 #[test]
 fn a_disclaim_the_os_cannot_honour_starts_nothing() {
     const ABSENT: &core::ffi::CStr = c"responsibility_spawnattrs_setdisclaim_absent";
@@ -1522,9 +1456,6 @@ fn a_disclaim_is_unsupported_off_darwin() {
     }
 }
 
-/// The staged half of [`a_command_exec_replaces_this_process_holding_nothing`]:
-/// hold an unflagged descriptor; fail one `exec` (Darwin: the table is left as
-/// it was); then BECOME `/bin/sh` through [`command`].
 fn staged_exec() {
     let held = unflagged_at_or_above(64);
     let fd = held.as_raw_fd();
@@ -1548,10 +1479,6 @@ fn staged_exec() {
     panic!("exec /bin/sh: {err}");
 }
 
-/// **`exec` HANDS THE NEW IMAGE NOTHING ABOVE STDIO.** A process that replaces
-/// itself with [`command`]'s program hands that program nothing of its own
-/// above stdio — and, on Darwin, a failed `exec` leaves its own table as it
-/// was (`POSIX_SPAWN_SETEXEC`: no strip ran in it).
 #[test]
 fn a_command_exec_replaces_this_process_holding_nothing() {
     const NAME: &str =
@@ -1564,10 +1491,6 @@ fn a_command_exec_replaces_this_process_holding_nothing() {
     assert!(out.contains("STAGED exec ok"), "{out}");
 }
 
-/// **AN `exec` THAT MUST DISCLAIM IS REFUSED.** `POSIX_SPAWN_SETEXEC` with the
-/// disclaim attribute is unmeasured, so [`Command::exec`] beside
-/// [`Command::disclaim_responsibility`] answers `Unsupported` before trying —
-/// on every OS.
 #[test]
 fn an_exec_that_must_disclaim_is_refused() {
     const NAME: &str = "spawnfd::command_tests::an_exec_that_must_disclaim_is_refused";

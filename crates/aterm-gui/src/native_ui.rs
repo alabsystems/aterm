@@ -2728,6 +2728,41 @@ fn cuts_own_words(key: &UiKey, content: &UiContent, rect: LogicalRect, edges: Cu
     dropped.iter().any(|dropped| *dropped)
 }
 
+/// The band, from its top, that the words and icons of control `content` laid out `height` tall paint in: an edge of a list that crosses it draws the control as a picture only ([`cuts_own_words`]).
+pub(crate) fn words_band(key: &UiKey, content: &UiContent, height: f32) -> Option<(f32, f32)> {
+    let theme = aterm_render::Theme::default();
+    let roles = crate::settings::Roles::from_theme(theme);
+    let rect = LogicalRect::new(0.0, 0.0, 4096.0, height);
+    let node = PaintNode {
+        key: key.clone(),
+        rect,
+        clip: rect,
+        content: content.clone(),
+        peek: false,
+        fade: None,
+        cut_edges: CutEdges::default(),
+        joins: Joins::default(),
+    };
+    let mut prims = Vec::new();
+    let icons = painted_icons(|| paint_compiled_node(&mut prims, &node, roles, theme, 14.0));
+    let words = prims.iter().filter_map(|prim| match prim {
+        crate::widget::DrawPrim::Text { baseline, px, .. } => Some(word_line_band(*baseline, *px)),
+        _ => None,
+    });
+    let inks = icons.iter().filter_map(|span| {
+        prims
+            .get(span.clone())
+            .into_iter()
+            .flatten()
+            .filter_map(prim_ink)
+            .reduce(|one, other| one.union(other))
+            .map(|ink| (ink.y, ink.bottom()))
+    });
+    words
+        .chain(inks)
+        .reduce(|(top, bottom), (from, to)| (top.min(from), bottom.max(to)))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HitRegion {
     pub(crate) key: UiKey,
@@ -3366,7 +3401,7 @@ impl CompiledUi {
         self.tray_with_chrome(theme, theme, base_px)
     }
 
-    /// [`Self::tray`] with the CHROME palette and the TERMINAL theme split.
+    /// `Self::tray` with the CHROME palette and the TERMINAL theme split.
     pub(crate) fn tray_with_chrome(
         &self,
         chrome: impl Into<crate::chrome_band::ChromePalette>,
@@ -5592,14 +5627,15 @@ fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32
 /// How far a text may measure past the width it is fitted to and still be drawn whole.
 pub(crate) const TEXT_FIT_SLACK: f32 = 0.01;
 
+/// The most graphemes the painter draws of one line; it elides a longer one.
+pub(crate) const MAX_VISUAL_GRAPHEMES: usize = 256;
+
 pub(crate) fn elide_text_label(
     value: &str,
     max_width: f32,
     px: f32,
     face: crate::widget::TextFace,
 ) -> String {
-    const MAX_VISUAL_GRAPHEMES: usize = 256;
-
     if max_width <= 0.0 {
         return String::new();
     }

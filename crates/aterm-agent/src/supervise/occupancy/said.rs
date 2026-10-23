@@ -100,8 +100,10 @@ pub struct OccupancySaid {
     /// The guards the last break judged (§2.1's set, [`rules::Guards`]), whether or not a rule
     /// was due: why nothing fired. `None` before a break was judged.
     pub guards: Option<Guards>,
-    /// Each rule's last word, in [`RuleId::ALL`]'s order.
-    pub rules: [SaidRule; 2],
+    /// Each rule's last word, in [`RuleId::ALL`]'s order: the rules the recording's doors carry
+    /// ([`told_rules`]). A list, whose `Debug` is an array's, so the word a tape compares holds
+    /// the bytes an older build's two-rule array printed.
+    pub rules: Vec<SaidRule>,
     /// When this was told, unix ms. Not part of the change.
     pub at_ms: i64,
     /// The reading the break's decider judged (the empty reading where none was asked). Not
@@ -155,6 +157,18 @@ impl OccupancySaid {
             .map(|r| r.rule)
             .collect()
     }
+}
+
+/// THE RULES A TOLD WORD CARRIES ([`OccupancySaid::rules`]), in [`RuleId::ALL`]'s order: every
+/// rule, for a recording whose host had slice 2's doors (`slice2`, `Fx::slice2_recorded`), and of
+/// an older recording only the rules its build had ([`RuleId::slice1`]), so its told words replay
+/// byte for byte. Every rule is slice 1's so far: both lists are [`RuleId::ALL`].
+#[must_use]
+pub fn told_rules(slice2: bool) -> Vec<RuleId> {
+    RuleId::ALL
+        .into_iter()
+        .filter(|rule| slice2 || rule.slice1())
+        .collect()
 }
 
 /// A rule's cap, as an Entry says it: `3 nudges today` or `4 hold-room asks this hold`.

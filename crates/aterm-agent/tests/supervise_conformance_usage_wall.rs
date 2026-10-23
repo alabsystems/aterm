@@ -226,9 +226,7 @@ impl Screen {
         }
     }
 
-    /// The screen's rows and the REAL reader's read of them, each made once:
-    /// both are pure, and a walk asks for them at every state and at every
-    /// transition (the read was half of a walk's time).
+    /// Cached screen rows and `aterm_phase::read` result for `self`.
     fn read(self) -> &'static (Vec<String>, aterm_phase::Reading) {
         static READ: std::sync::OnceLock<Vec<(Vec<String>, aterm_phase::Reading)>> =
             std::sync::OnceLock::new();
@@ -250,9 +248,7 @@ fn rows(st: &State) -> Vec<String> {
     Screen::of(st).rows()
 }
 
-/// The REAL [`TurnEndReading::of`] of `read` over `screen`'s rows, made once
-/// per thread for each set of inputs: it is pure, and a walk hands it the same
-/// ones again and again (it was two thirds of a walk's time).
+/// Thread-local cached [`TurnEndReading::of`] over `screen`'s rows.
 fn turn_end_reading(
     screen: Screen,
     read: &aterm_phase::Reading,
@@ -276,9 +272,7 @@ fn turn_end_reading(
     })
 }
 
-/// A RUNNING TURN CARRIED BY USAGE CREDITS: the worker at work, and Claude
-/// Code's `Now using usage credits` right-aligned on the mode row (as the
-/// 2.1.300 lab drew it, `claude-2.1.300-credits-in-use.txt`).
+/// Running turn screen with `Now using usage credits` on the mode row.
 fn on_credits() -> Vec<String> {
     let mut rows = screen(LIVE);
     let mode = rows
@@ -289,10 +283,7 @@ fn on_credits() -> Vec<String> {
     rows
 }
 
-/// THE WALL'S NOTICE CANCELLED BEFORE ANY READ: the measured wall on a tab
-/// with no shell, the vendor's cancel drawn under its notice (and the notice's
-/// `/goal` echo) as Esc on the countdown leaves it — the last thing said, no
-/// wall for the reader.
+/// Measured wall with automatic continue cancelled under its notice.
 fn cancelled() -> Vec<String> {
     with_rows_before_the_done_row(
         walled(false),
@@ -303,20 +294,14 @@ fn cancelled() -> Vec<String> {
     )
 }
 
-/// ANOTHER CONVERSATION'S HISTORY, `/resume`d at the left wall: the measured
-/// 2.1.299 screen of its own five-hour limit (`resets 10:38am`, lifted long
-/// ago, Esc on its countdown) and a person's turn served under it.
+/// Resumed conversation history with an older cancelled five-hour limit and a person's turn under it.
 fn resumed() -> Vec<String> {
     screen(include_str!(
         "../../aterm-phase/src/fixtures/claude-2.1.299-wall-session-cancelled-then-person-turn.txt"
     ))
 }
 
-/// ANOTHER CONVERSATION'S HISTORY, `/resume`d while the wall SHOWED, its
-/// countdown armed: the measured 2.1.300 screen (W1 of ) —
-/// its own older five-hour limit (`resets 8:48am`) and the vendor's
-/// continuation of it (`⏺ Usage limit reset · continuing automatically`, the
-/// reply under it), the countdown dropped.
+/// Resumed conversation history with an older five-hour limit and its automatic continuation under an armed limit.
 fn resumed_continued() -> Vec<String> {
     screen(include_str!(
         "../../aterm-phase/src/fixtures/claude-2.1.300-resumed-older-limit-continued-at-armed-limit.txt"
@@ -1085,12 +1070,7 @@ fn the_buggy_model_and_every_past_loop_disagree_with_the_real_code() {
     });
 }
 
-/// USAGE CREDITS, WALKED: every reachable state of the model with credits
-/// carrying a turn agrees with the real reader and decider — at a credits
-/// state the reader reads credits in use and no wall, and nothing is
-/// decided — and NEGATIVE CONTROL: a reader that takes the notice for a spend
-/// wall disagrees at every credits state, and nowhere else — the model's
-/// `CreditsReadAsWall`, caught by `NoWallOnCredits`.
+/// Every reachable state of [`credits_model`] agrees with the real reader and decider, and `credits_as_wall` disagrees at every credits state.
 #[test]
 fn tier1_usage_credits_are_no_wall_where_the_model_says() {
     let m = credits_model();
@@ -1132,11 +1112,7 @@ fn tier1_usage_credits_are_no_wall_where_the_model_says() {
     assert!(!buggy.check_invariant("NoWallOnCredits", &st), "{st:?}");
 }
 
-/// THE USAGE TAP TIMES A CUT WALL, WALKED (accounts v2 S10a): every reachable
-/// state of the model with the tap timing a wall whose notice is cut agrees
-/// with the real reader, the real tap clock and the real decider — the
-/// back-off until the tap reads, then the tap's reset and its grace, through
-/// the window's rollover at that reset.
+/// Every reachable state of [`tapped_model`] agrees with the real reader, tap clock, and decider.
 #[test]
 fn tier1_the_tap_times_a_cut_wall_exactly_where_the_model_acts() {
     let m = tapped_model();
@@ -1154,9 +1130,7 @@ fn tier1_the_tap_times_a_cut_wall_exactly_where_the_model_acts() {
     }
 }
 
-/// THE LOOP WITHOUT THE TAP SOURCE is not the model: at a wall whose notice is
-/// cut it waits on the policy's back-off and types there — before the reset
-/// the tap read — the model's `TapResetIgnored`, caught by `NoBlindAct`.
+/// Without the tap source (`no_tap`), the loop waits on the back-off and types into a cut wall before the tap's reset.
 #[test]
 fn the_loop_without_the_tap_types_into_a_cut_wall_on_its_back_off() {
     let m = tapped_model();

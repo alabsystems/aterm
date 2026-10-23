@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `SinkWriter::input_backlog` against a real pty: the one place the kernel's own count meets the ledger's dates.
+//! `SinkWriter::input_backlog` against a real pty.
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,8 +13,6 @@ use aterm_session::input_backlog::InputBacklog;
 use aterm_session::sink::{BulkMeter, Discard, ImmediateWrite, Seam, SinkWriter};
 use aterm_spec::wait::MUST_HAPPEN;
 
-/// A pty pair with the slave raw (`VMIN = 1`, `VTIME = 0`, a key-at-a-time
-/// reader like every agent TUI) or canonical without echo.
 fn pty_pair(raw: bool) -> (i32, i32) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: `libc::termios` is plain integer fields and a byte array; all zeros is a valid value, overwritten by `tcgetattr` below.
@@ -35,7 +33,6 @@ fn pty_pair(raw: bool) -> (i32, i32) {
     (master, slave)
 }
 
-/// Read exactly `n` bytes from the slave — the program reading its input.
 fn read_exactly(fd: i32, n: usize) -> Vec<u8> {
     let mut out = vec![0u8; n];
     let mut got = 0;
@@ -56,8 +53,6 @@ fn close_pair(master: i32, slave: i32) {
     }
 }
 
-/// Make `master`'s file description non-blocking and tell the sink — the
-/// production shape (spawn.rs `note_master_nonblocking`).
 fn nonblocking_sink(master: i32) -> SinkWriter {
     // SAFETY: `master` is this test's live fd; F_GETFL/F_SETFL take ints.
     let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
@@ -72,9 +67,6 @@ fn nonblocking_sink(master: i32) -> SinkWriter {
     sink
 }
 
-/// Probe until `done` holds (the drainer runs on its own thread, so the
-/// kernel's count moves under the test), panicking with the last reading
-/// after a minute — a hang detector, never a latency budget.
 fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBacklog {
     let mut last = None;
     let hit = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
@@ -85,19 +77,10 @@ fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBackl
     hit.unwrap_or_else(|| panic!("never settled: {:?}", last.expect("probed")))
 }
 
-/// Wait until a parked paste's first bytes are queued and dated. The ledger stamps a
-/// write after `write(2)` returns, and until then the probe reads the bytes as in
-/// flight (`wait` zero); a nonzero `wait` means the stamp predates this return, so an
-/// age slept from here counts from an event this thread saw, never from the paster's
-/// `spawn`, which a loaded scheduler can start late.
 fn first_write_dated(sink: &SinkWriter) -> InputBacklog {
     settle(sink, |b| b.queued > 0 && !b.wait.is_zero())
 }
 
-/// RAW UNREAD INPUT IS COUNTED AND DATED — the incident's shape. `abc` goes in
-/// and reads `queued == 3`, dated no earlier than its write; the program
-/// reading ONE byte leaves 2; a NEW write behind them (a driver's key) adds to
-/// the count; and reading everything clears the reading to zero.
 #[test]
 fn raw_unread_input_is_counted_and_dated() {
     let (master, slave) = pty_pair(true);
@@ -129,9 +112,6 @@ fn raw_unread_input_is_counted_and_dated() {
     close_pair(master, slave);
 }
 
-/// Canonical mode counts complete lines only: a partial `ab` is invisible to FIONREAD
-/// and reads 0, and `canonical` says so, which keeps a shell's type-ahead from reading
-/// as a stall.
 #[test]
 fn canonical_partial_line_reads_zero() {
     let (master, slave) = pty_pair(false);
@@ -144,10 +124,6 @@ fn canonical_partial_line_reads_zero() {
     close_pair(master, slave);
 }
 
-/// A WRITER PARKED ON A FULL QUEUE DOES NOT BLIND THE PROBE. A paste into a
-/// program that has stopped reading fills the raw queue, and the sink's
-/// blocking write then waits in `poll(POLLOUT)` HOLDING the fd lock for as
-/// long as the program stays frozen.
 #[test]
 fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     let (master, slave) = pty_pair(true);
@@ -192,9 +168,6 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     close_pair(master, slave);
 }
 
-/// A drainer parked partway through a chunk counts each unread byte once. A
-/// 4000-byte frame into a raw reader that stopped reading fills the queue with its
-/// head; the tail spills, and the drainer takes it as one chunk and parks.
 #[test]
 fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     const FRAME: usize = 4000;
@@ -245,12 +218,6 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     close_pair(master, slave);
 }
 
-/// A METERED PASTE IS DATED BY ITS OWN WRITE. A paste write loop
-/// (`SinkWriter::write_frame_metered_with_receipt`) that bypasses the ledger
-/// leaves bytes it never saw, which read as older than the sink itself
-/// (`InputLedger::oldest_unread_at` dates them from its birth): a paste into
-/// a frozen program would be dated by when the SESSION started, not by the
-/// paste.
 #[test]
 fn a_metered_paste_is_dated_by_its_own_write() {
     const AGE: Duration = Duration::from_millis(100);
@@ -290,8 +257,6 @@ fn a_metered_paste_is_dated_by_its_own_write() {
     close_pair(master, slave);
 }
 
-/// Wait up to a minute for the slave to have input, then read what is
-/// there — so a wedged sink fails the test instead of hanging it.
 fn read_within(fd: i32, max: usize) -> Vec<u8> {
     let mut p = libc::pollfd {
         fd,
@@ -309,7 +274,6 @@ fn read_within(fd: i32, max: usize) -> Vec<u8> {
     out
 }
 
-/// A discard drops the spill with the queue, and the sink still reaches the program.
 #[test]
 fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     let (master, slave) = pty_pair(true);
@@ -345,10 +309,6 @@ fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     close_pair(master, slave);
 }
 
-/// A discard ends a writer parked mid-frame: a blocking `write_frame` that filled the
-/// queue and parked holding the fd lock neither sleeps for good on the flushed queue
-/// nor hands the kernel the rest of its frame (meant for the program the discard was
-/// for).
 #[test]
 fn a_discard_ends_a_writer_parked_mid_frame() {
     const PASTE: usize = 64 * 1024;
@@ -381,11 +341,6 @@ fn a_discard_ends_a_writer_parked_mid_frame() {
     close_pair(master, slave);
 }
 
-/// A flush is not a restart: `reset flush` and the drop before `signal term` empty the
-/// same queue and both move the discard epoch (a frame in flight belongs to the input
-/// that went), but only the restart moves `restart_discards`, the count aterm-gui's
-/// input watch starts a published stall's restart grace on; a flush counted there
-/// would name a program as surviving a signal never sent.
 #[test]
 fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     let (master, slave) = pty_pair(true);
@@ -419,9 +374,6 @@ fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     drop((a, b));
 }
 
-/// A read after a discard is told from the discard. The discard's empty queue is what
-/// a reader leaves too, so aterm-gui holds a stall through it; this is the evidence
-/// that lets the hold go.
 #[test]
 fn a_read_after_a_discard_is_told_from_the_discard() {
     let (master, slave) = pty_pair(true);
@@ -467,10 +419,6 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     drop((a, b));
 }
 
-/// A cbreak program's control key is not a read. With ICANON off but ISIG, IEXTEN and
-/// IXON on (Python's `tty.setcbreak`, ncurses `cbreak()`) the line discipline consumes
-/// `^C`, `^O` and `^S` as they are written: the ledger counts the byte and the queue
-/// never holds it.
 #[test]
 fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
     let (master, slave) = pty_pair(true);
@@ -499,8 +447,6 @@ fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
     close_pair(master, slave);
 }
 
-/// What the program has been given, read off a NON-BLOCKING slave for at most
-/// a minute (a hang detector), until `n` bytes came.
 fn read_all_within(slave: i32, n: usize) -> Vec<u8> {
     let mut got = Vec::new();
     let done = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
@@ -516,7 +462,6 @@ fn read_all_within(slave: i32, n: usize) -> Vec<u8> {
     got
 }
 
-/// Whether the non-blocking slave holds nothing more to read.
 fn nothing_more(slave: i32) -> bool {
     let mut one = [0_u8; 1];
     // SAFETY: a one-byte read into a live stack buffer from the live slave.
@@ -524,12 +469,6 @@ fn nothing_more(slave: i32) -> bool {
     r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
 }
 
-/// THE GUARDED WRITE ON A REAL PTY: a text longer than a raw slave's input
-/// queue (1022 bytes on Darwin) — the harness's 1.1 KB instruction to save the
-/// work, written to a program that has not read yet — is begun and finished:
-/// the guarded write (`try_write_frame_whole_with_receipt`, what `send if=`
-/// writes with) answers `Queued { accepted: 1022 }` with the rest behind it in
-/// the spill, and the program reads all 1118 bytes in order as it reads.
 #[test]
 fn a_guarded_text_longer_than_the_input_queue_is_delivered_whole_and_in_order() {
     let mut text = b"[aterm harness] save your work: ".to_vec();
@@ -583,18 +522,12 @@ fn a_guarded_text_longer_than_the_input_queue_is_delivered_whole_and_in_order() 
     close_pair(master, slave);
 }
 
-/// A 1118-byte text: 1022 `H`s, all a raw slave's input queue takes at once,
-/// then 96 `T`s, so a read shows at a glance which part of it came.
 fn head_and_tail() -> Vec<u8> {
     let mut text = vec![b'H'; 1022];
     text.extend_from_slice(&[b'T'; 96]);
     text
 }
 
-/// Press a guarded Enter until the sink takes it (a drainer that abandoned
-/// a discarded chunk lets go of the fd lock at its next recheck), for at most
-/// a minute (a hang detector), and read what the program then holds: only
-/// what came after the discard.
 fn the_next_key_alone(sink: &SinkWriter, slave: i32) -> Vec<u8> {
     let pressed = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(5), || {
         match sink.try_write_frame_whole_with_receipt(b"\r").0 {
@@ -609,10 +542,6 @@ fn the_next_key_alone(sink: &SinkWriter, slave: i32) -> Vec<u8> {
     got
 }
 
-/// A DISCARD NEVER SPLITS A GUARDED FRAME: the discard (`reset flush`, the
-/// restart signals) empties the spill and flushes the kernel's queue in ONE
-/// hold of the spill mutex, and the guarded write holds that mutex from its
-/// look at the empty spill until the rest of a short write is queued.
 #[test]
 fn a_discard_drops_a_guarded_frame_whole_or_lets_it_through_whole() {
     let text = Arc::new(head_and_tail());
@@ -686,9 +615,6 @@ fn a_discard_drops_a_guarded_frame_whole_or_lets_it_through_whole() {
     close_pair(master, slave);
 }
 
-/// THE DRAINER NEVER SPLITS ONE EITHER: it looks at the discard epoch and
-/// writes the spilled bytes it peeked in ONE hold of the spill mutex, the
-/// mutex the discard flushes under (`Shared::drain_write`).
 #[test]
 fn a_discard_racing_the_drainers_write_drops_the_frame_whole() {
     let text = head_and_tail();
@@ -743,7 +669,6 @@ fn a_discard_racing_the_drainers_write_drops_the_frame_whole() {
     close_pair(master, slave);
 }
 
-/// A DISCARD BEHIND A GUARDED WRITE MARKS WHAT THE KERNEL TOOK.
 #[test]
 fn a_discard_behind_a_guarded_write_marks_what_the_kernel_took() {
     let text = head_and_tail();

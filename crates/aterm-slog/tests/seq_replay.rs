@@ -23,13 +23,11 @@ use crate::support::{self, WALL0, agent_session, at, time_order_holds};
 /// Path to the `.seq` replay corpus directory.
 pub const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/sequences");
 
-/// The transcript rig's file (`transcript_replays`' path and identity).
 const FP: u64 = 0xc1a0_de00_0000_0001;
 const DEV: u64 = 16_777_220;
 const INO: u64 = 4_242;
 /// Simulated Claude Code process start timestamp (`WALL0 - 60_000`).
 pub const PROCESS_START: u64 = WALL0 - 60_000;
-/// A row's offset past the last, by default.
 const ROW_BYTES: u64 = 200;
 
 /// Replay rig selector for a `.seq` file.
@@ -235,7 +233,6 @@ fn id(s: &str) -> Result<ShortId, String> {
     ShortId::new(s).ok_or_else(|| format!("`{s}` is not an id"))
 }
 
-/// The `k=v` options of `toks`, and the bare words.
 fn split_opts<'a>(toks: &[&'a str]) -> (BTreeMap<&'a str, &'a str>, Vec<&'a str>) {
     let mut opts = BTreeMap::new();
     let mut bare = Vec::new();
@@ -557,8 +554,6 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
     }
 }
 
-/// The `mail dir=in` mark of a delivered mail, as aterm-gui's fabric
-/// observer writes it (its sender's text aside).
 fn mail_mark(kind: &str, off: u64) -> Result<Mark, aterm_slog::FieldError> {
     let f = Fields::new()
         .word(Key::Dir, "in")?
@@ -570,8 +565,6 @@ fn mail_mark(kind: &str, off: u64) -> Result<Mark, aterm_slog::FieldError> {
         .fields(f))
 }
 
-/// The program's own report at `node`, as aterm-gui's sweep writes it
-/// (`SessionLog::observe_program`, under its bucket's rate).
 fn program_mark(
     state: &str,
     ask: Option<&str>,
@@ -586,8 +579,6 @@ fn program_mark(
         .fields(f))
 }
 
-/// A step that writes into the log alone (`mail`, `human`, `turn-mail`,
-/// `program`): `true` when `ev` is one, written at `stamp`.
 fn log_only(log: &mut Log, ev: &Ev, stamp: aterm_slog::Stamp) -> Result<bool, String> {
     let mark = match ev {
         Ev::Program { state, ask } => {
@@ -757,8 +748,6 @@ impl TxRig {
         }
     }
 
-    /// Note one host call on the path, while the twins record: named as
-    /// `transcript_replays`' rig names it.
     fn took(&mut self, step: String, seq0: u64) {
         if seq_twins::on() {
             let state = (self.state != TxState::Off).then(|| {
@@ -917,7 +906,6 @@ impl TxRig {
     }
 }
 
-/// The rig a file replays on.
 enum Live {
     Screen(Box<Rig>),
     Tx(Box<TxRig>),
@@ -945,9 +933,6 @@ impl Live {
         }
     }
 
-    /// The model states this rig is at: the turn model's (screen) or the
-    /// join's (transcript, a measured or partial build; an off source is
-    /// no state of the join's).
     fn state(&self) -> Option<State> {
         match self {
             Live::Screen(r) => Some(conformance_turn::project(r, None)),
@@ -990,8 +975,6 @@ fn enc(r: &Rec) -> String {
     encode(r, Tier::Content).expect("a record encodes")
 }
 
-/// The records appended after `seq0`: an evicted one is a step that wrote
-/// past the ring (a hole, an update's overlap, is none).
 fn appended(log: &Log, seq0: u64) -> Result<Vec<Rec>, String> {
     let read = log.read(Cursor::new(log.ep(), seq0), usize::MAX);
     match read.gap {
@@ -1000,7 +983,6 @@ fn appended(log: &Log, seq0: u64) -> Result<Vec<Rec>, String> {
     }
 }
 
-/// Whether `line` is the record `e` expects.
 fn matches(line: &str, op: Op, node: &str, kind: Kind, toks: &[String]) -> bool {
     let w: Vec<&str> = line.split(' ').collect();
     w.len() >= 4
@@ -1016,12 +998,10 @@ fn matches(line: &str, op: Op, node: &str, kind: Kind, toks: &[String]) -> bool 
         })
 }
 
-/// The `(op, level)` pair of a record.
 fn pair(r: &Rec) -> (Op, Lvl) {
     (r.op, r.node.lvl)
 }
 
-/// A checkpoint against what the rig holds now.
 fn check(
     live: &Live,
     all: &[Rec],
@@ -1132,10 +1112,6 @@ fn check(
     }
 }
 
-/// WELL-NESTING over the records in order: a node opens once, under an open
-/// parent; it closes once, while open, after every node beneath it; a mark
-/// or amend is of an open node or one that has closed (an amend refines a
-/// closed turn).
 fn well_nested(trace: &[(bool, Vec<Rec>)]) -> Result<(), String> {
     let mut open: BTreeMap<Node, Option<Node>> = BTreeMap::new();
     let mut ever: BTreeSet<Node> = BTreeSet::new();
@@ -1260,9 +1236,6 @@ pub fn cursor_contract(log: &Log, chunk: usize, drop_gap: bool) -> Result<(), St
     Ok(())
 }
 
-/// The laws of every replay's records, each step's batch in order (`true`:
-/// an uncarried update started it): the runs' time order, well-nesting, and
-/// every join law at each transcript state.
 fn laws(nested: &[(bool, Vec<Rec>)], join_states: &[State]) -> Result<(), String> {
     let every: Vec<String> = nested.iter().flat_map(|(_, r)| r.iter().map(enc)).collect();
     time_order_holds(&every).map_err(|e| format!("time order: {e}"))?;
@@ -1432,7 +1405,6 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
     })
 }
 
-/// A mutant's hand-built successor: the broken real call's state.
 type Hand = fn(&State) -> State;
 
 /// Single `Buggy` model mutant descriptor.
@@ -1674,7 +1646,6 @@ pub const TURN_MUTANTS: &[Mutant] = &[
     },
 ];
 
-/// `lv` of a turn closing or superseded: whether it held no `vref`.
 fn lv(s: &State) -> i64 {
     i64::from(s["lt"] == 1)
 }
@@ -1849,8 +1820,6 @@ pub const JOIN_MUTANTS: &[Mutant] = &[
     },
 ];
 
-/// Whether the corpus state `s` catches `mu`: its hand-built successor is
-/// the Buggy model's, no honest action's, and breaks its law.
 fn catches(m: &Model, buggy: &Model, mu: &Mutant, s: &State) -> bool {
     if !buggy.action_enabled(mu.name, s) {
         return false;
@@ -1904,7 +1873,6 @@ pub fn measure(
     out
 }
 
-/// Replay every corpus file, or the first failure.
 fn replay_all(seqs: &[Seq]) -> Vec<(String, Replay)> {
     let mut errs = Vec::new();
     let mut out = Vec::new();
@@ -1924,9 +1892,6 @@ fn replay_all(seqs: &[Seq]) -> Vec<(String, Replay)> {
     out
 }
 
-/// Every corpus file replays and meets its expects and laws; each checks
-/// a record, names a program the tracker reads (a transcript only Claude
-/// Code's) and a build, and the corpus holds both rigs.
 #[test]
 fn every_corpus_file_replays_and_meets_its_expects() {
     let seqs = corpus();
@@ -1975,8 +1940,6 @@ fn every_corpus_file_replays_and_meets_its_expects() {
     }
 }
 
-/// MUTANT POWER (T5): every `Buggy` mutant of the turn model and of the
-/// join is caught by some corpus file's state of the real tracker.
 #[test]
 fn the_corpus_catches_every_mutant() {
     let replays = replay_all(&corpus());
@@ -1993,9 +1956,6 @@ fn the_corpus_catches_every_mutant() {
     }
 }
 
-/// NEGATIVE CONTROL (T5): a corpus of one busy-only file misses exactly the
-/// mutants whose guard it never reaches, the settle's `EarlyRest` and every
-/// join mutant among them, and so fails the measure.
 #[test]
 fn a_busy_only_corpus_misses_the_mutants_it_never_reaches() {
     let busy = parse(
@@ -2034,7 +1994,6 @@ fn a_busy_only_corpus_misses_the_mutants_it_never_reaches() {
     );
 }
 
-/// The corpus file of `name`.
 fn file(name: &str) -> Seq {
     corpus()
         .into_iter()
@@ -2042,8 +2001,6 @@ fn file(name: &str) -> Seq {
         .unwrap_or_else(|| panic!("no corpus file {name}"))
 }
 
-/// NEGATIVE CONTROL (T3): on a file whose ring evicts, a reader that drops
-/// one gap breaks the cursor contract the shipping reader keeps.
 #[test]
 fn a_reader_that_drops_a_gap_breaks_the_cursor_contract() {
     for s in corpus().iter().filter(|s| s.ring.is_some()) {
@@ -2054,9 +2011,6 @@ fn a_reader_that_drops_a_gap_breaks_the_cursor_contract() {
     }
 }
 
-/// NEGATIVE CONTROL (T4): a transcript file replayed through a tracker that
-/// opens a second turn on a repeated busy fails its exact turn lists (this
-/// rig runs no model drive: the lists are what catch it).
 #[test]
 fn a_tracker_that_opens_a_second_turn_fails_the_exact_lists() {
     let s = file("tx-repeat-busy-one-turn.seq");
@@ -2068,10 +2022,6 @@ fn a_tracker_that_opens_a_second_turn_fails_the_exact_lists() {
     );
 }
 
-/// A RECORD'S OWN `at=` FIELD AND THE LINE'S INSTANT ARE APART (6F-2's
-/// appended wire key `at`): `@<ms>` is the instant (`t=<WALL0+ms>`) and
-/// `at=<n>` a field token like any other, so a file can expect a record
-/// that carries `at=` (6F-7's render row).
 #[test]
 fn an_expect_names_a_records_at_field_apart_from_its_instant() {
     let mut log = Log::new(1);
@@ -2127,9 +2077,6 @@ fn an_expect_names_a_records_at_field_apart_from_its_instant() {
     }
 }
 
-/// NEGATIVE CONTROL (T4, T5): a wrong `expect` of each kind, planted in a
-/// file that passes, fails it: the matcher reads every check, a record's
-/// tokens as much as its place, and a pair's list is exact.
 #[test]
 fn a_planted_wrong_expect_of_each_kind_fails() {
     let path = format!("{CORPUS}/tx-tool-call-and-result.seq");
@@ -2172,9 +2119,6 @@ fn a_planted_wrong_expect_of_each_kind_fails() {
     fails("an early expect", &early);
 }
 
-/// NEGATIVE CONTROL for `expect link=` (T10): each mail-link file with its
-/// link turned the other way (a link expected none, none expected a link,
-/// another mail named) fails.
 #[test]
 fn a_planted_wrong_link_fails() {
     let mut flipped = 0;
@@ -2201,10 +2145,6 @@ fn a_planted_wrong_link_fails() {
     assert!(flipped >= 5, "every mail-link file planted: {flipped}");
 }
 
-/// NEGATIVE CONTROLS for the laws every replay meets: the records of a
-/// file that passes, with a close moved before its child's, an open
-/// repeated, a close of a node never opened, a step opened under a closed
-/// turn, or a close dated before its open; and a join state with a ghost.
 #[test]
 fn the_laws_refuse_what_a_log_never_writes() {
     let r = replay(&file("gone-closes-the-box-and-the-turn.seq"), Broken::No).expect("passes");
@@ -2269,7 +2209,6 @@ fn the_laws_refuse_what_a_log_never_writes() {
     assert_ne!(ring.lines, ring.every);
 }
 
-/// The parser refuses what the format does not say.
 #[test]
 fn the_parser_refuses_what_the_format_does_not_say() {
     let head = "seq v=1 rig=screen program=claude build=2.1.0\n";
@@ -2323,10 +2262,6 @@ fn the_parser_refuses_what_the_format_does_not_say() {
     assert!(replay(&back, Broken::No).unwrap_err().contains("backward"));
 }
 
-/// `at <ms>` on an `expect` line waits to that instant before the check, as
-/// on any other line: five seconds after the idle the settle has closed the
-/// turn, so `at 5000 expect turn=open` fails and `turn=none` passes, the
-/// same as with the `at` on a line of its own.
 #[test]
 fn an_expect_at_an_instant_is_checked_at_it() {
     let head = "seq v=1 rig=screen program=claude build=2.1.0\n\
@@ -2349,9 +2284,6 @@ fn an_expect_at_an_instant_is_checked_at_it() {
     );
 }
 
-/// `seq` with a `program` step before each of its steps (the program's own
-/// report: `working`, `blocked ask=permission`, `done`, in turn), and its
-/// record and `lost=` checks left out: what the program marks add.
 fn interleaved(seq: &Seq) -> Seq {
     const REPORTS: [(&str, Option<&str>); 3] = [
         ("working", None),
@@ -2383,8 +2315,6 @@ fn interleaved(seq: &Seq) -> Seq {
     out
 }
 
-/// A record line without its seq (its first token), and `None` for a
-/// program mark.
 fn unnumbered(line: &str) -> Option<String> {
     let (_, rest) = line.split_once(' ')?;
     let toks: Vec<&str> = rest.split(' ').collect();
@@ -2401,11 +2331,8 @@ fn unnumbered(line: &str) -> Option<String> {
     }
 }
 
-/// One host call as [`folded`] compares it: its name, the model state after
-/// it, and the records it appended ([`unnumbered`]).
 type FoldedCall = (String, Option<State>, Vec<String>);
 
-/// A path's host calls and final window, seqs aside and program marks out.
 fn folded(p: &seq_twins::Path) -> (Vec<FoldedCall>, Vec<String>) {
     let steps = p
         .steps
@@ -2424,7 +2351,6 @@ fn folded(p: &seq_twins::Path) -> (Vec<FoldedCall>, Vec<String>) {
     )
 }
 
-/// A `.seq` WITH PROGRAM MARKS INTERLEAVED FOLDS TO THE SAME LINES (the fold never reads a program mark).
 #[test]
 fn program_marks_interleaved_fold_to_the_same_lines() {
     let mut ran = 0;

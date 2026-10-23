@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Correctness gate for the GPU renderer: render the same terminal on the CPU
-// (`aterm_render::Renderer`, whose own tests prove what it draws) and the GPU
-// (`aterm_gpu::GpuRenderer`) at the same px/theme and check that the frames
-// have identical dimensions and a per-channel delta within a small tolerance
-// (only rounding differs), exactly where both paint hard coverage. Random
-// mixed content is `parity_fuzz.rs`; these pin specific features.
-//
-// A host without a GPU could not run it (`common::gpu`).
 
 use crate::common;
 use aterm_core::{grid::LineSize, render::LineSizeSpan, terminal::Terminal};
@@ -36,8 +27,6 @@ fn non_bg_count(px: &[u32]) -> usize {
     px.iter().filter(|&&p| dist(p, BG) > 24).count()
 }
 
-/// Feed `bytes` to a fresh `rows`×`cols` terminal and render that one frame on
-/// both backends (the GPU through `win`): `(cpu_frame, gpu_frame)`.
 fn render_both(
     cpu: &mut Renderer,
     gpu: &mut aterm_gpu::GpuRenderer,
@@ -54,7 +43,6 @@ fn render_both(
     )
 }
 
-/// The visual-regression demo grid (same as aterm-render's visual_regression test).
 fn demo_term() -> (Terminal, usize, usize) {
     let (rows, cols) = (6usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -68,10 +56,6 @@ ab\r\n",
     (term, rows, cols)
 }
 
-/// A composed split row carries one DEC line-size span per pane, resolved per
-/// cell: a double-width pane beside a single-width one (and the inverse on the
-/// next row), with the clipped-away logical half of each double-width pane
-/// never reappearing in the neighbour.
 #[test]
 fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
     let theme = Theme::default();
@@ -149,9 +133,6 @@ fn gpu_matches_cpu_with_pane_local_mixed_dec_widths() {
     );
 }
 
-/// Glyph enlargement per pane: a real glyph in each pane of a composed row,
-/// with a span only for the DEC pane and `line_sizes[row]` set to that pane's
-/// size (as the compositor writes it).
 #[test]
 fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
     let theme = Theme::default();
@@ -211,8 +192,6 @@ fn gpu_matches_cpu_for_glyph_enlargement_inside_its_own_dec_run() {
     }
 }
 
-/// An odd-width pane can expose only half of its last DEC double-width cell;
-/// the curly underline paints that visible part and stays out of the divider.
 #[test]
 fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
     let theme = Theme::default();
@@ -253,8 +232,6 @@ fn gpu_matches_cpu_for_partial_double_width_pane_undercurl() {
     }
 }
 
-/// Italic ink may overhang its cell but not its pane: the pane clip removes
-/// the synthetic-italic `f` bearing at a one-column divider on both backends.
 #[test]
 fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
     let theme = Theme::default();
@@ -312,8 +289,6 @@ fn gpu_matches_cpu_and_clips_italic_ink_at_pane_edge() {
     );
 }
 
-/// Mixed DPI: two sizes through one renderer pair via `activate_px`, which
-/// switches size without dropping the atlas.
 #[test]
 fn gpu_matches_cpu_mixed_dpi_activate_px() {
     let theme = Theme::default();
@@ -377,9 +352,6 @@ fn gpu_matches_cpu_mixed_dpi_activate_px() {
     assert_eq!(dims_b1, dims_b, "B stable across interleave");
 }
 
-/// Escape-sequence fixtures render the same on both backends, at an odd
-/// interior pad that flips the ░▒▓ dither's absolute-pixel phase in every
-/// cell.
 #[test]
 fn escape_fixtures_match_cpu() {
     const PAD: usize = 3;
@@ -523,8 +495,6 @@ fn escape_fixtures_match_cpu() {
     }
 }
 
-/// Parity in the `linear` text-blending mode as well as the default: the demo
-/// grid within tolerance and procedural cells exactly.
 #[test]
 fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     let theme = Theme::default();
@@ -570,9 +540,6 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     );
 }
 
-/// A subscript cell (`Script::Sub`, chrome-only) draws its glyph smaller and
-/// lower, with no ink above `SUB_CEILING` (a parenthesis taller than the letters
-/// included), while the rule glyph beside it stays full size.
 #[test]
 fn sub_script_gpu_matches_cpu() {
     use aterm_core::terminal::Script;
@@ -651,10 +618,6 @@ fn sub_script_gpu_matches_cpu() {
     }
 }
 
-/// Last-resort fontless symbols (`font_chain::Tier::Synthetic`) draw the same
-/// pixels on both backends: the narrow `⏵⏵` family, ⭘ and the procedural `⎿`,
-/// and the wide emoji-presentation symbols (⏩ ⏪ ⏫ ⚪ ⚫) rasterized as one
-/// `2 * cell_w` bitmap across both cells.
 #[test]
 fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
@@ -710,8 +673,6 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     );
 }
 
-/// Combining diacritics (é = e + U+0301, …) are overlaid as extra mono-glyph
-/// instances on the base cell, pulled by the GPU from the same atlas.
 #[test]
 fn sparse_combining_columns_and_duplicates_match_cpu() {
     let (mut cpu, mut gpu) = backends(18.0, Theme::default());
@@ -749,8 +710,6 @@ fn sparse_combining_columns_and_duplicates_match_cpu() {
     }
 }
 
-/// Small footer marks use the base's script raster and horizontal nudge in
-/// both passes: atlas collection and emission.
 #[test]
 fn small_script_combining_marks_and_nudges_match_cpu() {
     use aterm_core::terminal::Script;
@@ -794,9 +753,6 @@ fn small_script_combining_marks_and_nudges_match_cpu() {
     }
 }
 
-/// A renderer reused across changing dimensions produces frames identical to a
-/// fresh renderer: grow, shrink, grow and a repeated size, each compared pixel
-/// for pixel, so stale resident resources are caught.
 #[test]
 fn reused_renderer_across_dims_matches_fresh_render() {
     let theme = Theme::default();
@@ -836,9 +792,6 @@ fn reused_renderer_across_dims_matches_fresh_render() {
     }
 }
 
-/// Cursor trail parity: trail quads are opaque, pre-blended with
-/// `aterm_render::blend_rgb` over the pane's default background, brightest at
-/// the head.
 #[test]
 fn cursor_trail_gpu_matches_cpu() {
     let theme = Theme::default();
@@ -921,11 +874,6 @@ fn cursor_trail_gpu_matches_cpu() {
     }
 }
 
-/// Word decorations match the CPU: the paw and the nova's ring stamped Over,
-/// sparkles Add (some offset off their cell), and the eclipse veil Over text,
-/// including on a DEC double-width row (both backends stretch the sprite) and
-/// an additive sparkle over a selected cell (both freeze it with the same
-/// predicate).
 #[test]
 fn word_decorations_gpu_match_cpu() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -982,10 +930,6 @@ fn word_decorations_gpu_match_cpu() {
     );
 }
 
-/// Minimum-contrast floor parity: floored cells (bright white on near-white)
-/// and concealed SGR 8 text match the CPU with the floor off and on, and a
-/// sparse cursor in a composed pane is floored against the pane's default,
-/// not the frame scalar.
 #[test]
 fn minimum_contrast_floored_cells_gpu_match_cpu() {
     let theme = Theme::default();
@@ -1044,8 +988,6 @@ fn minimum_contrast_floored_cells_gpu_match_cpu() {
     );
 }
 
-/// Background and cursor opacity parity at 0.5, including alpha (the CPU's
-/// top-byte transmittance).
 #[test]
 fn background_and_cursor_opacity_gpu_match_cpu() {
     let theme = Theme::default();
@@ -1188,9 +1130,6 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
     );
 }
 
-/// Animated ink parity: (1) on the GPU, ink equals the same SGR truecolour
-/// recolour (glyph, combining, wide lead, underline, strike, curl); (2) inked
-/// frames match the CPU within tolerance; (3) cleared ink changes nothing.
 #[test]
 fn ink_gpu_matches_cpu() {
     use aterm_core::render::InkCell;
@@ -1277,9 +1216,6 @@ fn ink_gpu_matches_cpu() {
     assert_ne!(gpu_ink.pixels, gpu_plain.pixels);
 }
 
-/// Ink under selection and on a DEC double-width row stays CPU==GPU: ink first,
-/// then the selection fg floor (an ink near the band colour, so the floor must
-/// move it), and the inked glyph stretched over the doubled advance.
 #[test]
 fn ink_selection_and_decdwl_gpu_match_cpu() {
     use aterm_core::render::InkCell;
@@ -1343,8 +1279,6 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
     );
 }
 
-/// Two panes selected on the same rows, each with its own OSC 17/19 colours and
-/// focus.
 #[test]
 fn per_pane_selection_colours_gpu_match_cpu() {
     use aterm_core::render::{PaneSelection, SelectionClip};
@@ -1412,8 +1346,6 @@ fn per_pane_selection_colours_gpu_match_cpu() {
     );
 }
 
-/// A scrollback-seeded grid with distinct per-row colour and text, scrolled
-/// into history (mirrors aterm-render's `scroll_frac_translate` seed).
 fn scroll_seeded_term(rows: usize, cols: usize) -> Terminal {
     let mut t = Terminal::new(rows as u16, cols as u16);
     for i in 0..40 {
@@ -1428,9 +1360,6 @@ fn scroll_seeded_term(rows: usize, cols: usize) -> Terminal {
     t
 }
 
-/// Sub-row scroll parity at an asymmetric grid origin with chrome rows: CPU and
-/// GPU translated frames match within tolerance, the GPU's chrome rows are
-/// identical to its frac-0 frame, and grid pixels moved both ways.
 #[test]
 fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
     let theme = Theme::default();
@@ -1523,10 +1452,6 @@ fn sub_row_scroll_translate_gpu_matches_cpu_at_asymmetric_origin() {
     );
 }
 
-/// Incoming-row apron parity: on a positive-frac frame the exposed bottom
-/// strip (the incoming row's top `frac` px, which aterm-render's
-/// `incoming_row_apron` proves on the CPU) is byte-identical on the GPU, is not
-/// the placeholder, and the GPU's chrome rows stay pinned to the frac-0 frame.
 #[test]
 fn incoming_row_apron_gpu_matches_cpu() {
     let theme = Theme::default();
@@ -1584,14 +1509,11 @@ fn incoming_row_apron_gpu_matches_cpu() {
     }
 }
 
-/// One cell's top pixel row, where `overline_rect` anchors its band.
 fn top_row(f: &Frame, cw: usize, col: usize) -> Vec<u32> {
     let x0 = col * cw;
     f.pixels[x0..(x0 + cw).min(f.width)].to_vec()
 }
 
-/// How deep `ink` runs down from a cell's top edge, measured from the frame
-/// since overline thickness varies by face and size.
 fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
     let x0 = col * cw;
     let x1 = (x0 + cw).min(f.width);
@@ -1604,8 +1526,6 @@ fn band_depth(f: &Frame, cw: usize, ch: usize, col: usize, ink: u32) -> usize {
         .count()
 }
 
-/// The overline's own colour channel on the GPU (aterm-render's
-/// `overline_color` is the CPU oracle).
 #[test]
 fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
     let theme = Theme::default();
@@ -1667,8 +1587,6 @@ fn the_overline_colour_channel_paints_the_same_seam_on_both_backends() {
     );
 }
 
-/// The RGB of every pixel outside the `grid_w`x`grid_h` grid at interior pad
-/// `pad`, asserted identical across the backends.
 fn padding_rgb(cpu: &Frame, gpu: &Frame, pad: usize, grid_w: usize, grid_h: usize) -> Vec<u32> {
     assert_eq!((gpu.width, gpu.height), (cpu.width, cpu.height));
     let mut out = Vec::new();
@@ -1690,8 +1608,6 @@ fn padding_rgb(cpu: &Frame, gpu: &Frame, pad: usize, grid_w: usize, grid_h: usiz
     out
 }
 
-/// Chrome bleed with per-row tones: two chrome rows over a padded frame, the
-/// second metered (`row_edges`), with the seam.
 #[test]
 fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     let theme = Theme::default();
@@ -1738,9 +1654,6 @@ fn gpu_matches_cpu_with_a_metered_chrome_bleed() {
     );
 }
 
-/// A seamed chrome bleed whose last row carries an edge-to-edge rail: the rail
-/// covers the gutters (`chrome_rail_covers_gutters`), so neither backend draws
-/// the bleed's own seam segment there.
 #[test]
 fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     let theme = Theme::default();
@@ -1798,12 +1711,6 @@ fn gpu_matches_cpu_with_a_seamed_bleed_under_an_edge_to_edge_rail() {
     }
 }
 
-/// A chrome row carrying a `ChromeRaster` (a per-pixel ground over its band and
-/// gutters, a rail in its lowest pixels, a cell left to its own background, an
-/// ink split through one glyph) paints the same ground and rail pixels on both
-/// backends, which place the runs of one shared builder
-/// (`aterm_render::visit_chrome_raster_runs`); glyphs, the split one included,
-/// stay within the glyph tolerance.
 #[test]
 fn gpu_matches_cpu_with_a_chrome_raster() {
     let theme = Theme::default();
@@ -1889,10 +1796,6 @@ fn gpu_matches_cpu_with_a_chrome_raster() {
     );
 }
 
-/// A chrome row that lifts its words clear of its rail
-/// (`aterm_render::chrome_fit` / `chrome_lifted`): rail rows and the clear row
-/// above match exactly and carry only the rail; lifted glyphs within
-/// tolerance.
 #[test]
 fn gpu_matches_cpu_with_a_clear_rail_row() {
     let theme = Theme::default();
@@ -1958,7 +1861,6 @@ fn gpu_matches_cpu_with_a_clear_rail_row() {
     );
 }
 
-/// The band's drawn icons (every icon, regular and bold, between blank neighbours, and side by side).
 #[test]
 fn gpu_matches_cpu_with_band_icons_and_an_outlined_capsule() {
     let theme = Theme::default();

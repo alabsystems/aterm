@@ -132,7 +132,7 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
     }
 }
 
-/// The predicate behind that fact, against a real `Command`: removing something the launcher lacks is a no-op (the common case), and removing something it has cannot be expressed.
+/// The predicate behind `environment_is_a_merge`, against a real `Command`: removing something the launcher lacks is a no-op (the common case), and removing something it has cannot be expressed.
 #[test]
 fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     let mut command = std::process::Command::new("/bin/echo");
@@ -159,7 +159,7 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     );
 }
 
-/// the successor's control directory is the launcher's by construction.
+/// The successor's control directory is the launcher's by construction.
 #[test]
 fn a_launched_successor_is_handed_the_launchers_control_directory() {
     let launcher = |key: &std::ffi::OsStr| match key.to_str() {
@@ -195,7 +195,7 @@ fn a_launched_successor_is_handed_the_launchers_control_directory() {
     );
 }
 
-/// The bundle root is `<bundle>.app/Contents/MacOS/<bin>`, and the `.app` suffix is checked: a dev binary also sits three levels below something.
+/// The bundle root of `<bundle>.app/Contents/MacOS/<bin>` is `<bundle>.app`, and the `.app` suffix is checked: a dev binary also sits three levels below something.
 #[test]
 fn only_a_dot_app_three_levels_up_is_a_bundle_root() {
     let temp = std::env::temp_dir().join(format!("aterm-lane-{}", std::process::id()));

@@ -146,9 +146,54 @@ pub trait EventLoopBuilderExtWindows {
     fn with_any_thread(&mut self, any_thread: bool) -> &mut Self;
 
     /// Whether to enable process-wide DPI awareness.
+    ///
+    /// # Example
+    ///
+    /// Disable process-wide DPI awareness.
+    ///
+    /// ```
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "windows")]
+    /// builder.with_dpi_aware(false);
+    /// # if false { // We can't test this part
+    /// let event_loop = builder.build();
+    /// # }
+    /// ```
     fn with_dpi_aware(&mut self, dpi_aware: bool) -> &mut Self;
 
+    // The example is compiled code: the win32 oracle (`verify cells`) reads the
+    // `windows_sys` names it uses, and aterm-win32 carries the two accelerator
+    // functions for it.
     /// A callback to be executed before dispatching a win32 message to the window procedure.
+    /// Return true to disable winit's internal message dispatching.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use windows_sys::Win32::UI::WindowsAndMessaging::{ACCEL, CreateAcceleratorTableW, TranslateAcceleratorW, DispatchMessageW, TranslateMessage, MSG};
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "windows")]
+    /// builder.with_msg_hook(|msg|{
+    ///     let msg = msg as *const MSG;
+    /// #   let accels: Vec<ACCEL> = Vec::new();
+    ///     let translated = unsafe {
+    ///         TranslateAcceleratorW(
+    ///             (*msg).hwnd,
+    ///             CreateAcceleratorTableW(accels.as_ptr() as _, 1),
+    ///             msg,
+    ///         ) == 1
+    ///     };
+    ///     translated
+    /// });
+    /// ```
     fn with_msg_hook<F>(&mut self, callback: F) -> &mut Self
     where
         F: FnMut(*const c_void) -> bool + 'static;
@@ -207,6 +252,38 @@ pub trait WindowExtWindows {
     fn set_corner_preference(&self, preference: CornerPreference);
 
     /// Get the raw window handle for this [`Window`] without checking for thread affinity.
+    /// # Safety
+    ///
+    /// It is the responsibility of the user to only pass the window handle into thread-safe
+    /// Win32 APIs.
+    ///
+    /// [`SetWindowSubclass`]: https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-setwindowsubclass
+    /// [`GetDC`]: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdc
+    /// [`Window`]: crate::window::Window
+    /// [`window_handle`]: https://docs.rs/raw-window-handle/latest/raw_window_handle/trait.HasWindowHandle.html#tymethod.window_handle
+    /// [`Unavailable`]: https://docs.rs/raw-window-handle/latest/raw_window_handle/enum.HandleError.html#variant.Unavailable
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// # use aterm_window::window::Window;
+    /// # fn scope(window: Window) {
+    /// use std::thread;
+    /// use aterm_window::platform::windows::WindowExtWindows;
+    /// use aterm_window::raw_window_handle::HasWindowHandle;
+    ///
+    /// // We can get the window handle on the current thread.
+    /// let handle = window.window_handle().unwrap();
+    ///
+    /// // However, on another thread, we can't!
+    /// thread::spawn(move || {
+    ///     assert!(window.window_handle().is_err());
+    ///
+    ///     // We can use this function as an escape hatch.
+    ///     let handle = unsafe { window.window_handle_any_thread().unwrap() };
+    /// });
+    /// # }
+    /// ```
     #[cfg(feature = "rwh_06")]
     unsafe fn window_handle_any_thread(
         &self,
@@ -467,6 +544,35 @@ pub trait IconExtWindows: Sized {
     fn from_resource(ordinal: u16, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 
     /// Create an icon from a resource embedded in this executable or library by its name.
+    ///
+    /// # Notes
+    ///
+    /// Due to some internal implementation details of the resource embedding/loading process on
+    /// Windows platform, strings that can be interpreted as 16-bit unsigned integers (`"1"`,
+    /// `"002"`, etc.) cannot be used as valid resource names, and instead should be passed into
+    /// [`from_resource`]:
+    ///
+    /// [`from_resource`]: IconExtWindows::from_resource
+    ///
+    /// ```rust,no_run
+    /// use aterm_window::platform::windows::IconExtWindows;
+    /// use aterm_window::window::Icon;
+    ///
+    /// assert!(Icon::from_resource_name("app", None).is_ok());
+    /// assert!(Icon::from_resource(1, None).is_ok());
+    /// assert!(Icon::from_resource(27, None).is_ok());
+    /// assert!(Icon::from_resource_name("27", None).is_err());
+    /// assert!(Icon::from_resource_name("0027", None).is_err());
+    /// ```
+    ///
+    /// While `0` cannot be used as an ordinal id, it can be used as a name:
+    ///
+    /// ```rust,no_run
+    /// # use aterm_window::platform::windows::IconExtWindows;
+    /// # use aterm_window::window::Icon;
+    /// assert!(Icon::from_resource_name("0", None).is_ok());
+    /// assert!(Icon::from_resource(0, None).is_err());
+    /// ```
     fn from_resource_name(name: &str, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 }
 

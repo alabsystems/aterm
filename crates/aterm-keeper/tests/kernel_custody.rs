@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real-kernel PTY custody, orphan recovery, and shared-memory journal integration tests for `aterm-keeper`.
+//! Real-kernel PTY custody, orphan recovery, and shared-memory journal tests for `aterm-keeper`.
 
 #![cfg(target_vendor = "apple")]
 #![allow(
@@ -25,10 +25,7 @@ const ROLE: &str = "ATERM_KEEPER_TEST_ROLE";
 const SOCK: &str = "ATERM_KEEPER_TEST_SOCK";
 const MARK: &str = "ATERM_KEEPER_TEST_MARK";
 const DROP: &str = "ATERM_KEEPER_TEST_DROP_CUSTODY";
-/// The files a role reports through and is told to go on by: `<dir>/out-<n>`
-/// and `<dir>/go-<n>` (libtest's child stdout is not a channel to rely on).
 const TALK: &str = "ATERM_KEEPER_TEST_TALK";
-/// The directory a marked window arms its crash marker in.
 const LOGS: &str = "ATERM_KEEPER_TEST_LOGS";
 const HANG: Duration = MUST_HAPPEN;
 
@@ -43,7 +40,6 @@ const F_DUPFD: i32 = 0;
 const F_SETFD: i32 = 2;
 const TIOCSCTTY: u64 = 0x2000_7461;
 
-/// Which role this process plays, when re-run by a test.
 fn role() -> Option<String> {
     std::env::var(ROLE).ok()
 }
@@ -69,7 +65,6 @@ fn keeper_config() -> ServeConfig {
     }
 }
 
-/// The keeper: serve until killed.
 fn keeper_role() -> ! {
     let mut server = Server::bind(keeper_config()).expect("bind");
     report("ready");
@@ -77,10 +72,6 @@ fn keeper_role() -> ! {
     std::process::exit(1)
 }
 
-/// The keeper, turn by turn: between two turns it parks when the test asks
-/// (`<talk>.pause`), says so (`<talk>.paused`), runs no turn until told to go
-/// on (`<talk>.resume`), and says when its first turn after that is done
-/// (`<talk>.turned`).
 fn stepped_keeper_role() -> ! {
     let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
     let note = |ext: &str| talk.with_extension(ext);
@@ -106,8 +97,6 @@ fn stepped_keeper_role() -> ! {
     }
 }
 
-/// A real PTY: the master, and a `sleep` session leader whose controlling
-/// terminal is the slave.
 fn pty_with_leader() -> (OwnedFd, Child) {
     use aterm_uds::spawnfd::InheritNothing as _;
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -143,8 +132,6 @@ fn rdev_of(fd: &OwnedFd) -> u64 {
     std::fs::File::from(dup).metadata().expect("fstat").rdev()
 }
 
-/// A window: open a PTY with a leader, REGISTER a duplicate of the master
-/// with the keeper, keep the primary, report, then wait.
 fn window_role(holder: bool) -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let (master, leader) = pty_with_leader();
@@ -204,11 +191,6 @@ fn window_role(holder: bool) -> ! {
     std::process::exit(0)
 }
 
-/// A MARKED window: arm a crash marker the way `aterm-gui`'s `crash_signal`
-/// does (created under a pending name, locked, renamed into place, the lock
-/// held for life), name it at HELLO when `named`, open a PTY with a leader and
-/// REGISTER it; on "go", end through the exit path — unlink the marker, then
-/// `exit(0)` — WITHOUT a BYE: a quit whose BYE was lost.
 fn marked_window_role(named: bool) -> ! {
     use std::os::unix::fs::OpenOptionsExt as _;
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -266,8 +248,6 @@ fn marked_window_role(named: bool) -> ! {
     std::process::exit(0)
 }
 
-/// The next window: HELLO, report the offers, wait for "go", then claim them
-/// all, say BYE (unless `bye` is false: a lost BYE) and exit 0 (a quit).
 fn next_window_role(bye: bool, adopt: bool) -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
@@ -301,9 +281,6 @@ fn next_window_role(bye: bool, adopt: bool) -> ! {
     std::process::exit(0)
 }
 
-/// Legacy window role (`HELLO` without `CAP_JOURNAL`): reads raw frames to
-/// verify `OFFER`s omit journal fields and no `COMPANION_OFFER` is sent,
-/// then claims every master on cue so the keeper closes the journal region.
 fn old_window_role() -> ! {
     use aterm_keeper::wire::{CAP_SENDS_BYE, PROTO, PeerClass};
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -380,8 +357,6 @@ fn old_window_role() -> ! {
     std::process::exit(0)
 }
 
-/// Wait until the test says exactly `what` (a role told several things in turn; a hang detector
-/// bounds it).
 fn await_said(what: &str) {
     let go = PathBuf::from(std::env::var(TALK).expect("talk")).with_extension("go");
     within(HANG, Duration::from_millis(5), || {
@@ -390,10 +365,6 @@ fn await_said(what: &str) {
     .unwrap_or_else(|| panic!("never told {what:?}"));
 }
 
-/// A recovering window that could not place what it was offered: HELLO, drop
-/// every offered master, start its link on the boot connection, RELEASE each
-/// offer through the link (`aterm-gui`'s `keeper_link::Claim`, dropped
-/// undischarged), say BYE and exit 0 (a quit).
 fn unplaced_window_role() -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let client = KeeperClient::connect(&socket, &Identity::same_uid(), HANG).expect("connect");
@@ -410,9 +381,6 @@ fn unplaced_window_role() -> ! {
     std::process::exit(0)
 }
 
-/// Outgoing update window role whose `quiet-successor` holds a master
-/// duplicate without dialing the keeper: registers a PTY, names the
-/// successor in `PENDING`, and exits 0 without `BYE` on cue.
 fn outgoing_window_role() -> ! {
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
     let talk = std::env::var(TALK).expect("talk");
@@ -483,14 +451,11 @@ fn outgoing_window_role() -> ! {
     std::process::exit(0)
 }
 
-/// The successor of [`outgoing_window_role`]: it never dials the keeper; on
-/// "go" it quits, `exit(0)`.
 fn quiet_successor_role() -> ! {
     await_go();
     std::process::exit(0)
 }
 
-/// A role's one-line report to the test.
 fn report(line: &str) {
     let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
     let tmp = talk.with_extension("tmp");
@@ -498,15 +463,11 @@ fn report(line: &str) {
     std::fs::rename(&tmp, talk.with_extension("out")).expect("publish the report");
 }
 
-/// A role's note to the test that something happened (`<talk>.<what>`).
 fn note(what: &str) {
     let talk = PathBuf::from(std::env::var(TALK).expect("talk"));
     std::fs::write(talk.with_extension(what), what).expect("note");
 }
 
-/// Wait for the test's "go" and return what it said (a hang detector bounds
-/// it; a window waiting to be killed waits the whole minute and is killed long
-/// before).
 fn await_go() -> String {
     let go = PathBuf::from(std::env::var(TALK).expect("talk")).with_extension("go");
     within(HANG * 5, Duration::from_millis(5), || {
@@ -592,7 +553,6 @@ impl Scratch {
     fn mark(&self) -> PathBuf {
         self.dir.join("relaunches")
     }
-    /// Re-run this test binary as `role`, its stdio `/dev/null`.
     fn spawn(&mut self, test: &str, role: &str, extra: &[(&str, &str)]) -> usize {
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
         cmd.arg(test)
@@ -613,7 +573,6 @@ impl Scratch {
         self.kids.push(cmd.spawn().expect("spawn a role"));
         self.kids.len() - 1
     }
-    /// A child's report, once it has made one (a hang detector bounds it).
     fn line(&mut self, kid: usize, prefix: &str) -> String {
         let out = self.dir.join(format!("kid-{kid}.out"));
         let text = within(HANG, Duration::from_millis(5), || {
@@ -621,7 +580,6 @@ impl Scratch {
                 return Some(text);
             }
             if let Ok(Some(status)) = self.kids[kid].try_wait() {
-                // Role may report and exit between the read above and `try_wait`.
                 return Some(std::fs::read_to_string(&out).unwrap_or_else(|_| {
                     panic!("the child ended ({status}) before reporting {prefix:?}")
                 }));
@@ -636,26 +594,18 @@ impl Scratch {
         );
         line
     }
-    /// Tell the role `kid` to go on; `what` is what it is told (published
-    /// whole, by a rename).
     fn say(&mut self, kid: usize, what: &str) {
         self.tell(&format!("kid-{kid}"), what);
     }
-    /// [`Self::say`] to the role whose talk file is `<dir>/<talk>`.
     fn tell(&self, talk: &str, what: &str) {
         let tmp = self.dir.join(format!("{talk}.say"));
         std::fs::write(&tmp, what).expect("say");
         std::fs::rename(&tmp, self.dir.join(format!("{talk}.go"))).expect("go");
     }
-    /// Park the stepped keeper `kid` between two of its turns: returns once it
-    /// has finished its turn and runs none until [`Self::resume`].
     fn pause(&mut self, kid: usize) {
         std::fs::write(self.dir.join(format!("kid-{kid}.pause")), b"pause").expect("pause");
         self.await_note(kid, "paused");
     }
-    /// Let the parked keeper `kid` go on; returns once it has run one turn,
-    /// with no connection of this test open during it, so the turn's holder
-    /// scans meet only the roles as peers.
     fn resume(&mut self, kid: usize) {
         std::fs::write(self.dir.join(format!("kid-{kid}.resume")), b"resume").expect("resume");
         self.await_note(kid, "turned");
@@ -685,7 +635,6 @@ impl Scratch {
             .and_then(|c| c.status("test"))
             .expect("status")
     }
-    /// Poll the keeper's status until `pred` holds (a hang detector bounds it).
     fn await_status(&self, what: &str, pred: impl Fn(&str) -> bool) -> String {
         let mut last = String::new();
         let hit = within(HANG, Duration::ZERO, || {
@@ -696,15 +645,11 @@ impl Scratch {
     }
 }
 
-/// The crash-restore regions the keeper process really holds: the sizes of its POSIX shared
-/// memory descriptors, read from the kernel's table of the keeper (named by its status's `pid=`),
-/// never from what its status says it holds.
 fn keeper_regions(s: &Scratch) -> Vec<u64> {
     let pid = u32::try_from(field(&s.status(), "pid")).expect("a pid");
     aterm_uds::holders::pshm_sizes_of(pid).expect("the keeper's descriptor table")
 }
 
-/// A journal region's size, as [`keeper_regions`] lists it.
 const REGION: u64 = aterm_restore::REGION_LEN as u64;
 
 fn field(line: &str, key: &str) -> u64 {
@@ -714,7 +659,6 @@ fn field(line: &str, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("{key} in {line:?}"))
 }
 
-/// Wait for a watched process's kernel status (a hang detector bounds it).
 fn await_exit(watch: &ExitWatch) -> i32 {
     within(HANG, Duration::ZERO, || watch.exit_status())
         .unwrap_or_else(|| panic!("pid {} never exited", watch.pid()))
@@ -797,8 +741,6 @@ fn a_killed_window_s_shell_lives_and_is_offered_once() {
 
 const T_CONTROL: &str = "without_the_custody_copy_a_killed_window_hangs_its_shell_up";
 
-/// NEGATIVE CONTROL: the keeper runs, the window registers, but the custody
-/// copy is closed at once (the test seam): the SIGKILL hangs the leader up.
 #[test]
 fn without_the_custody_copy_a_killed_window_hangs_its_shell_up() {
     dispatch_role();
@@ -822,9 +764,6 @@ fn without_the_custody_copy_a_killed_window_hangs_its_shell_up() {
 
 const T_HOLDER: &str = "a_master_another_process_holds_is_never_offered";
 
-/// THE HOLDER SCAN: the killed window's master is still held by a live
-/// process (the shape of an update successor), so it is held, not offered;
-/// once that process is gone, it is offered.
 #[test]
 fn a_master_another_process_holds_is_never_offered() {
     dispatch_role();
@@ -873,8 +812,6 @@ fn a_master_another_process_holds_is_never_offered() {
 
 const T_UNPLACED: &str = "an_offer_the_window_could_not_place_is_released_through_its_link";
 
-/// When a recovering window `RELEASE`s an offered master it could not place
-/// and quits, the keeper closes its custody copy and hangs up the shell.
 #[test]
 fn an_offer_the_window_could_not_place_is_released_through_its_link() {
     dispatch_role();
@@ -907,8 +844,6 @@ fn an_offer_the_window_could_not_place_is_released_through_its_link() {
 
 const T_QUIET: &str = "a_successor_that_never_registered_hangs_its_shells_up_when_it_quits";
 
-/// When an outgoing window names a `PENDING` successor that never dials the
-/// keeper and later exits 0, the keeper treats the clean exit as a quit.
 #[test]
 fn a_successor_that_never_registered_hangs_its_shells_up_when_it_quits() {
     dispatch_role();
@@ -944,9 +879,6 @@ fn a_successor_that_never_registered_hangs_its_shells_up_when_it_quits() {
 
 const T_LOST_BYE: &str = "a_quit_whose_bye_was_lost_hangs_its_shell_up";
 
-/// ROW 3's CROSS-CHECK on a real kernel: a window names its locked marker,
-/// then quits through its exit path — the marker unlinked, `exit(0)` — with
-/// no BYE.
 #[test]
 fn a_quit_whose_bye_was_lost_hangs_its_shell_up() {
     dispatch_role();
@@ -974,9 +906,6 @@ fn a_quit_whose_bye_was_lost_hangs_its_shell_up() {
 
 const T_LOST_BYE_CONTROL: &str = "without_its_marker_a_lost_bye_is_kept_as_an_orphan";
 
-/// NEGATIVE CONTROL: the same end — `exit(0)`, no BYE — from a window that
-/// named no marker is P3's lost BYE: the keeper cannot tell it from a crash,
-/// and keeps the shell as an orphan.
 #[test]
 fn without_its_marker_a_lost_bye_is_kept_as_an_orphan() {
     dispatch_role();
@@ -998,8 +927,6 @@ fn without_its_marker_a_lost_bye_is_kept_as_an_orphan() {
 
 const T_MARKED_KILL: &str = "a_marked_window_killed_is_an_orphan_and_its_dead_shell_is_pruned";
 
-/// A marked window SIGKILLed leaves its marker with the lock free: a crash,
-/// and the shell an orphan.
 #[test]
 fn a_marked_window_killed_is_an_orphan_and_its_dead_shell_is_pruned() {
     dispatch_role();
@@ -1032,7 +959,6 @@ fn a_marked_window_killed_is_an_orphan_and_its_dead_shell_is_pruned() {
     );
 }
 
-/// What [`an_exit_that_overtakes_its_frames`] leaves.
 struct Overtaken {
     /// The keeper's status once the next window's end is judged.
     status: String,
@@ -1046,9 +972,6 @@ struct Overtaken {
     keeper_pid: u32,
 }
 
-/// Park the keeper between turns while the next window claims two offered
-/// masters, optionally sends `ADOPT` and `BYE`, and exits 0, verifying
-/// queued frames behind the first claim are processed before process death.
 fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) -> Overtaken {
     let keeper = s.spawn(test, "keeper-stepped", &[]);
     s.line(keeper, "ready");
@@ -1102,8 +1025,6 @@ fn an_exit_that_overtakes_its_frames(s: &mut Scratch, test: &str, role: &str) ->
     }
 }
 
-/// Every process of this uid that holds each master, by the kernel's
-/// descriptor tables (a failure message's evidence).
 fn holders(rdevs: &[u64]) -> String {
     rdevs
         .iter()
@@ -1115,7 +1036,6 @@ fn holders(rdevs: &[u64]) -> String {
         .join(", ")
 }
 
-/// One count of the status's `ends` line.
 fn ends(status: &str, key: &str) -> u64 {
     let line = status
         .lines()
@@ -1155,9 +1075,6 @@ fn a_quit_whose_exit_overtakes_its_claims_hangs_both_shells_up() {
 
 const T_OVERTAKE_CONTROL: &str = "without_a_bye_an_overtaken_claim_keeps_both_shells";
 
-/// NEGATIVE CONTROL: the same overtaken end without the BYE is a lost BYE —
-/// both claims are read and judged a crash, and both shells are kept as
-/// orphans: the hang-up above is the quit's, not the window's exit's.
 #[test]
 fn without_a_bye_an_overtaken_claim_keeps_both_shells() {
     dispatch_role();
@@ -1176,7 +1093,6 @@ fn without_a_bye_an_overtaken_claim_keeps_both_shells() {
     }
 }
 
-/// One `key=value` line of the status.
 fn status_count(status: &str, key: &str) -> u64 {
     status
         .lines()
@@ -1187,8 +1103,6 @@ fn status_count(status: &str, key: &str) -> u64 {
 
 const T_REPLY: &str = "a_reply_the_dead_window_cannot_read_loses_none_of_its_frames";
 
-/// A REPLY TO THE DEAD: the overtaken end again, with an ADOPT after the first
-/// claim.
 #[test]
 fn a_reply_the_dead_window_cannot_read_loses_none_of_its_frames() {
     dispatch_role();
@@ -1210,9 +1124,6 @@ fn a_reply_the_dead_window_cannot_read_loses_none_of_its_frames() {
 
 const T_REPLY_CONTROL: &str = "without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells";
 
-/// NEGATIVE CONTROL: the same unwritable reply with no BYE behind it — both
-/// claims are still read (both judged a crash, not one), and both shells are
-/// kept: the hang-up above is the BYE's, read behind the reply.
 #[test]
 fn without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells() {
     dispatch_role();
@@ -1230,9 +1141,6 @@ fn without_a_bye_a_reply_lost_to_the_dead_keeps_both_shells() {
 
 const T_DEAD_PEER: &str = "a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up";
 
-/// When one window is `SIGKILL`ed (unreaped zombie) and another sends `BYE`
-/// and exits 0 in the same parked turn, the holder scan treats the dead
-/// peer's descriptor table as empty so the quitting window's shell hangs up.
 #[test]
 fn a_quit_beside_a_dead_unjudged_peer_hangs_its_shell_up() {
     dispatch_role();
@@ -1309,18 +1217,11 @@ fn a_status_client_reads_the_keeper() {
     }
 }
 
-/// The journaled session's screen: small, so the oracle's text is readable in a failure.
 const JOURNAL_ROWS: u16 = 12;
 const JOURNAL_COLS: u16 = 48;
-/// The engine config fingerprint both the writer and the restorer run under.
 const JOURNAL_CONFIG: u64 = 0x0a7e_c0de;
-/// The slice of [`journal_output`] at which the window takes its second keyframe: what comes
-/// after it lives only in the region's tail, so an exact restore must replay it, and a restore
-/// of the keyframe alone shows the screen as of here.
 const KEYFRAMED: usize = 20;
 
-/// What the dead window's session printed, slice by slice: colour, wide UTF-8, and more lines
-/// than the screen holds.
 fn journal_output() -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = (0..40)
         .map(|i| format!("\x1b[3{}mline {i:03} of the dead window\x1b[0m\r\n", i % 8).into_bytes())
@@ -1329,7 +1230,6 @@ fn journal_output() -> Vec<Vec<u8>> {
     out
 }
 
-/// The oracle: the screen text an engine shows after `slices`.
 fn journal_screen(slices: &[Vec<u8>]) -> String {
     let mut term = aterm_core::terminal::Terminal::new(JOURNAL_ROWS, JOURNAL_COLS);
     for slice in slices {
@@ -1350,7 +1250,6 @@ enum Journaled {
     Writable,
 }
 
-/// Write a keyframe of `term` through `writer`.
 fn journal_keyframe(
     writer: &mut aterm_restore::JournalWriter<aterm_uds::shm::Region>,
     term: &aterm_core::terminal::Terminal,
@@ -1370,8 +1269,6 @@ fn journal_keyframe(
         .expect("the keyframe");
 }
 
-/// A window that JOURNALS: its HELLO states CAP_JOURNAL, it registers a PTY's master with a
-/// leader, then (per `journaled`) the region it journaled the session into.
 fn journal_window_role(journaled: Journaled) -> ! {
     use aterm_keeper::wire::RefuseCode;
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -1487,9 +1384,6 @@ fn journal_window_role(journaled: Journaled) -> ! {
     std::process::exit(0)
 }
 
-/// The next window that JOURNALS: HELLO stating CAP_JOURNAL, then for each offer report whether
-/// a region came, the brake, and what the region restores (`restore=exact|screen|meta`), the
-/// restored screen written to `<talk>.screen`.
 fn journal_next_window_role() -> ! {
     use std::os::fd::AsFd as _;
     let socket = PathBuf::from(std::env::var(SOCK).expect("socket"));
@@ -1554,13 +1448,11 @@ fn journal_next_window_role() -> ! {
     std::process::exit(0)
 }
 
-/// Whether a role's end was its own SIGKILL.
 fn killed(status: std::process::ExitStatus) -> bool {
     use std::os::unix::process::ExitStatusExt as _;
     status.signal() == Some(9)
 }
 
-/// The journaling window `w` is told to die, dies by SIGKILL, and its master is orphaned.
 fn journal_window_dies(s: &mut Scratch, w: usize) {
     s.say(w, "die");
     let ended = s.kids[w].wait().expect("its status");
@@ -1570,8 +1462,6 @@ fn journal_window_dies(s: &mut Scratch, w: usize) {
     });
 }
 
-/// A journaling window starts and registers, its custody shown in the status as `journals`:
-/// the role's index, its leader and its rdev.
 fn journal_window(s: &mut Scratch, test: &str, role: &str, journals: &str) -> (usize, u32, u64) {
     let w = s.spawn(test, role, &[]);
     let reg = s.line(w, "leader=");
@@ -1585,9 +1475,6 @@ fn journal_window(s: &mut Scratch, test: &str, role: &str, journals: &str) -> (u
 
 const T_JOURNAL: &str = "a_killed_window_s_region_restores_its_exact_screen";
 
-/// THE LANE: the region a SIGKILLed window journaled into is offered with its master, and the
-/// next window restores exactly the screen the dead one showed, its tail replayed; the region
-/// closes with the master when that window quits.
 #[test]
 fn a_killed_window_s_region_restores_its_exact_screen() {
     dispatch_role();
@@ -1634,9 +1521,6 @@ fn a_killed_window_s_region_restores_its_exact_screen() {
 
 const T_JOURNAL_BARE: &str = "a_window_that_registered_no_region_is_offered_none";
 
-/// NEGATIVE CONTROL: a window that journals but registered no region dies; the next window is
-/// offered the master with no region, the META rung (and the unsettled claim's death counts an
-/// attempt, as the model's `ReaderDies` does).
 #[test]
 fn a_window_that_registered_no_region_is_offered_none() {
     dispatch_role();
@@ -1657,9 +1541,6 @@ fn a_window_that_registered_no_region_is_offered_none() {
 
 const T_JOURNAL_POISON: &str = "a_restorer_that_dies_before_its_companion_costs_an_attempt";
 
-/// NEGATIVE CONTROL: the first restorer claims the master and dies before its COMPANION (as a
-/// window whose replay killed it would); the keeper's next offer says `attempts=1`, and the
-/// region then restores its keyframe alone: the screen as of the keyframe, never called exact.
 #[test]
 fn a_restorer_that_dies_before_its_companion_costs_an_attempt() {
     dispatch_role();
@@ -1701,9 +1582,6 @@ fn a_restorer_that_dies_before_its_companion_costs_an_attempt() {
 
 const T_JOURNAL_OLD: &str = "a_window_that_does_not_journal_is_offered_the_master_alone";
 
-/// NEGATIVE CONTROL (§3.2 J2, N5): a client without `CAP_JOURNAL` receives
-/// plain `OFFER`s with no `COMPANION_OFFER`, and its `CLAIM` closes the
-/// keeper's journal descriptor.
 #[test]
 fn a_window_that_does_not_journal_is_offered_the_master_alone() {
     dispatch_role();
@@ -1733,9 +1611,6 @@ fn a_window_that_does_not_journal_is_offered_the_master_alone() {
 
 const T_JOURNAL_WRITABLE: &str = "a_writable_custody_descriptor_is_refused";
 
-/// NEGATIVE CONTROL (§3.2 N8): a custody descriptor open for writing is refused as no journal
-/// (any window offered it could map the dead window's words writable); the read-only one the
-/// same window sends next is held, and only it, as the keeper's descriptor table shows.
 #[test]
 fn a_writable_custody_descriptor_is_refused() {
     dispatch_role();

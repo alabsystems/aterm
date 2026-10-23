@@ -67,12 +67,14 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// A new directory of this run's own: never one an earlier run kept, which may hold a
+    /// copy that never showed it ran.
     fn new(prefix: &str) -> Self {
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .expect("temp dir")
-            .join(format!("{prefix}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("{prefix}-"))
+            .tempdir_in(std::env::temp_dir().canonicalize().expect("temp dir"))
+            .expect("scratch")
+            .keep();
         private_dir(&dir.join("run"));
         private_dir(&dir.join("home"));
         Self {
@@ -371,7 +373,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         )
     });
     assert!(before.starts_with("keeper=running"), "{before}");
-    s.dir.ran();
     let inner = s.runs_from_its_copy(s.kids[0].id());
     assert_eq!(
         inner,
@@ -399,6 +400,7 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         refused.starts_with("keeper=refused"),
         "a bundle sealing another Info.plist admitted the keeper: {refused}"
     );
+    s.dir.ran();
 }
 
 #[test]

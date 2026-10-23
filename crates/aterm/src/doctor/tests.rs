@@ -195,6 +195,7 @@ fn run_as(
             packages: &|| scratch.packages(),
             state: journaled.then_some(state.as_path()),
             not_own_account: not_own,
+            develop: None,
         },
     );
     (ran, gathers.into_inner())
@@ -479,6 +480,7 @@ fn readiness_distinguishes_confirmed_state_from_plans_manual_steps_and_unknowns(
             packages: &Vec::new,
             state: None,
             not_own_account: None,
+            develop: None,
         },
     );
     assert_eq!(note.code, 0, "{}", note.text);
@@ -494,6 +496,7 @@ fn injected(shell: Mark, words: &[&str], rows: &[ItemReport]) -> Ran {
             packages: &|| rows.to_vec(),
             state: None,
             not_own_account: None,
+            develop: None,
         },
     )
 }
@@ -880,4 +883,357 @@ fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
         super::clt_found(&CcVerdict::NotProbed),
         Found::NotHere(_)
     ));
+}
+
+/// A develop layer stand-in (macOS's is `aterm_machines::init::Doctor`): the rows its items
+/// read, whether its profile could not be read, and what doctor asked of it.
+#[derive(Default)]
+struct Stand {
+    rows: Vec<ItemReport>,
+    unreadable: bool,
+    /// Each composition's `asked`.
+    composed: std::cell::RefCell<Vec<bool>>,
+    /// Each read's `--only` words.
+    read: std::cell::RefCell<Vec<Vec<String>>>,
+}
+
+impl Stand {
+    /// A Mac whose `init.toml` records `~/aterm`: its four rows, the checkout one commit
+    /// behind origin as last fetched.
+    fn recorded() -> Self {
+        let mut checkout = develop_row("develop.checkout@~/aterm", "checkout", Outcome::Planned);
+        checkout.from = Some("1 commit behind origin/main, as last fetched".into());
+        checkout.to = Some("fast-forwarded to origin/main at 0123456789ab".into());
+        checkout.explain = Some(aterm_converge::Explain {
+            why: "behind".into(),
+            remedy: aterm_converge::Remedy::Develop,
+        });
+        let mut tools = develop_row(
+            "develop.workspace-tools@~/aterm",
+            "tooling",
+            Outcome::NotApplicable,
+        );
+        tools.why = Some("none of the rows asked for is pinned for this host".into());
+        Self {
+            rows: vec![
+                develop_row("develop.record", "profile", Outcome::Ok),
+                checkout,
+                develop_row("develop.submodules@~/aterm", "checkout", Outcome::Ok),
+                tools,
+            ],
+            ..Self::default()
+        }
+    }
+
+    /// A Mac whose `init.toml` cannot be read: one record row saying why.
+    fn broken() -> Self {
+        let mut record = develop_row("develop.record", "profile", Outcome::Unknown);
+        record.why = Some("invalid ~/.config/aterm/init.toml".into());
+        Self {
+            rows: vec![record],
+            unreadable: true,
+            ..Self::default()
+        }
+    }
+}
+
+fn develop_row(id: &str, family: &str, outcome: Outcome) -> ItemReport {
+    let mut row = super::unmeasured(
+        id,
+        family,
+        Some(aterm_converge::Layer::Develop),
+        String::new(),
+    );
+    row.title = id.to_owned();
+    row.outcome = outcome;
+    row.why = None;
+    if outcome == Outcome::Ok {
+        row.to = Some(format!("{id} as read"));
+    }
+    row
+}
+
+/// `aterm_machines::init_develop::names` for the stand-in (that crate is macOS's alone).
+fn develop_word(word: &str) -> bool {
+    word == "develop"
+        || word.starts_with("develop.")
+        || ["profile", "checkout", "tooling"].contains(&word)
+}
+
+/// [`run_as`] with `stand` as the develop layer.
+fn run_developing(
+    scratch: &Scratch,
+    words: &[&str],
+    stand: &Stand,
+    not_own: Option<&'static str>,
+) -> (Ran, Vec<bool>) {
+    let ground = scratch.ground();
+    let gathers = std::cell::RefCell::new(Vec::new());
+    let compose = |asked| {
+        stand.composed.borrow_mut().push(asked);
+        super::DevelopLayer {
+            items: stand
+                .rows
+                .iter()
+                .map(|row| (row.id.clone(), row.family.clone()))
+                .collect(),
+            unreadable: stand.unreadable,
+            rows: Box::new(move |only: &[String]| {
+                stand.read.borrow_mut().push(only.to_vec());
+                Ok(stand
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        only.is_empty()
+                            || stand.unreadable
+                            || only.iter().any(|word| super::named_by(word, row))
+                    })
+                    .cloned()
+                    .collect())
+            }),
+        }
+    };
+    let ran = super::run(
+        &args(words),
+        &Ports {
+            gather: &|fix| {
+                gathers.borrow_mut().push(fix);
+                facts(Mark::Ok)
+            },
+            ground: Some(&ground),
+            packages: &|| scratch.packages(),
+            state: None,
+            not_own_account: not_own,
+            develop: Some(super::Develop {
+                names: &develop_word,
+                compose: &compose,
+            }),
+        },
+    );
+    (ran, gathers.into_inner())
+}
+
+fn develop_ids(json: &Report) -> Vec<&str> {
+    json.items
+        .iter()
+        .filter(|row| row.layer == Some(aterm_converge::Layer::Develop))
+        .map(|row| row.id.as_str())
+        .collect()
+}
+
+/// A DEVELOP MACHINE'S DOCTOR READS ITS DEVELOP ROWS beside every other (design §5, S9): the
+/// record, the checkout, its submodule and its tools are rows of the report, bare and
+/// `--read-only` alike, under a `develop:` section whose behind checkout names `aterm init
+/// --develop`, and a planned one is unresolved. The layer is composed once from what the Mac
+/// records (nothing asked of it) and read once, after the repair. Negative control: the same
+/// machine with no develop layer reports none of them.
+#[test]
+fn a_develop_machine_s_doctor_reads_its_develop_rows_beside_the_others() {
+    let scratch = Scratch::new("develop-rows");
+    for words in [&["--read-only", "--json"][..], &["--json"][..]] {
+        let stand = Stand::recorded();
+        let (ran, _) = run_developing(&scratch, words, &stand, None);
+        assert_eq!(ran.code, 1, "{}", ran.text);
+        let json = report(&ran);
+        assert_eq!(
+            develop_ids(&json),
+            [
+                "develop.record",
+                "develop.checkout@~/aterm",
+                "develop.submodules@~/aterm",
+                "develop.workspace-tools@~/aterm"
+            ],
+            "{words:?}"
+        );
+        assert!(
+            json.items
+                .iter()
+                .any(|row| row.id == aterm_cli::doctor::SHELL)
+        );
+        assert!(
+            json.readiness
+                .unwrap()
+                .unresolved
+                .contains(&"develop.checkout@~/aterm".to_owned())
+        );
+        assert_eq!(*stand.composed.borrow(), [false]);
+        assert_eq!(*stand.read.borrow(), [Vec::<String>::new()]);
+    }
+    let stand = Stand::recorded();
+    let (ran, _) = run_developing(&scratch, &["--read-only"], &stand, None);
+    let develop = section(&ran.text, "develop:");
+    assert_eq!(mark(&develop), "warn", "{develop}");
+    assert!(
+        develop.contains(
+            "develop.checkout@~/aterm: 1 commit behind origin/main, as last fetched → \
+             fast-forwarded to origin/main at 0123456789ab — `aterm init --develop`"
+        ),
+        "{develop}"
+    );
+    assert!(
+        develop.contains("develop.workspace-tools@~/aterm: not applicable: none of the rows"),
+        "{develop}"
+    );
+    assert!(ran.text.contains("shell:"), "{}", ran.text);
+
+    let ran = run(&scratch, Mark::Ok, &["--read-only", "--json"], false);
+    assert_eq!(develop_ids(&report(&ran)), Vec::<&str>::new());
+    assert!(
+        !run(&scratch, Mark::Ok, &["--read-only"], false)
+            .text
+            .contains("develop:")
+    );
+}
+
+/// A MAC THAT RECORDS NO `[develop]` TABLE HAS NO DEVELOP ROW: its layer composes nothing,
+/// so the report has no develop row and no `develop:` section, and `--only develop` reads its
+/// record row (the stand-in's: none) without refusing.
+#[test]
+fn a_mac_without_a_develop_record_has_no_develop_row() {
+    let scratch = Scratch::new("develop-none");
+    let stand = Stand::default();
+    let (ran, _) = run_developing(&scratch, &["--read-only", "--json"], &stand, None);
+    assert_eq!(develop_ids(&report(&ran)), Vec::<&str>::new());
+    let (ran, _) = run_developing(&scratch, &["--read-only"], &stand, None);
+    assert!(!ran.text.contains("develop:"), "{}", ran.text);
+    assert_eq!(*stand.composed.borrow(), [false, false]);
+}
+
+/// A BROKEN `init.toml` IS ONE ROW AND NEVER STOPS DOCTOR'S OTHER ROWS: the develop layer
+/// that cannot be read is its one `develop.record` row (unknown, saying why, under a warning
+/// `develop:` section), and the shell, the facts, the repair items and the packages are read
+/// and reported as ever; an `--only` word naming a checkout is not refused (the record row
+/// answers it). `--only shell` names no develop word, so no profile is read at all.
+#[test]
+fn a_broken_init_toml_is_one_develop_row_and_never_stops_the_others() {
+    let scratch = broken("develop-broken");
+    let stand = Stand::broken();
+    let (ran, _) = run_developing(&scratch, &["--read-only", "--json"], &stand, None);
+    let json = report(&ran);
+    assert_eq!(develop_ids(&json), ["develop.record"]);
+    let record = json
+        .items
+        .iter()
+        .find(|row| row.id == "develop.record")
+        .unwrap();
+    assert_eq!(record.outcome, Outcome::Unknown);
+    for id in [
+        aterm_cli::doctor::SHELL,
+        "base.privacy.fda",
+        repair::SHIMS,
+        repair::LINKS,
+    ] {
+        assert!(
+            json.items.iter().any(|row| row.id == id),
+            "{id}: {:?}",
+            json.items
+        );
+    }
+    assert!(
+        json.items
+            .iter()
+            .any(|row| row.layer == Some(aterm_converge::Layer::Base) && row.family == "pkg"),
+        "the packages are read"
+    );
+    let (ran, _) = run_developing(&scratch, &["--read-only"], &stand, None);
+    let develop = section(&ran.text, "develop:");
+    assert_eq!(mark(&develop), "warn", "{develop}");
+    assert!(
+        develop.contains("invalid ~/.config/aterm/init.toml"),
+        "{develop}"
+    );
+    assert!(section(&ran.text, "repair:").contains("bare `aterm doctor` restores it"));
+
+    let (ran, _) = run_developing(
+        &scratch,
+        &[
+            "--read-only",
+            "--json",
+            "--only",
+            "develop.checkout@~/aterm",
+        ],
+        &stand,
+        None,
+    );
+    assert_eq!(ran.code, 1, "{}", ran.text);
+    assert_eq!(develop_ids(&report(&ran)), ["develop.record"]);
+
+    let stand = Stand::broken();
+    let (ran, _) = run_developing(
+        &scratch,
+        &["--read-only", "--json", "--only", "shell"],
+        &stand,
+        None,
+    );
+    assert_eq!(develop_ids(&report(&ran)), Vec::<&str>::new());
+    assert!(stand.composed.borrow().is_empty(), "no profile is read");
+}
+
+/// A DEVELOP WORD THAT NAMES NO ITEM OF THIS MAC IS THE USAGE REFUSAL, said before the facts
+/// are gathered (nothing handed over) and before any develop item is read, naming the
+/// checkouts it records. Negative control: the word for a recorded checkout narrows the
+/// develop rows to that one, composed as asked.
+#[test]
+fn a_develop_word_naming_no_item_of_this_mac_is_refused_before_anything_is_read() {
+    let scratch = Scratch::new("develop-only");
+    let stand = Stand::recorded();
+    let (ran, gathers) = run_developing(
+        &scratch,
+        &["--only", "develop.checkout@~/elsewhere"],
+        &stand,
+        None,
+    );
+    assert_eq!(ran.code, 2, "{}", ran.text);
+    assert!(
+        ran.text.contains(
+            "names no develop item of this Mac (its checkouts: develop.checkout@~/aterm)"
+        ),
+        "{}",
+        ran.text
+    );
+    assert!(gathers.is_empty(), "nothing gathered or handed over");
+    assert!(stand.read.borrow().is_empty(), "no develop item read");
+
+    let stand = Stand::recorded();
+    let (ran, _) = run_developing(
+        &scratch,
+        &[
+            "--read-only",
+            "--json",
+            "--only",
+            "develop.checkout@~/aterm",
+        ],
+        &stand,
+        None,
+    );
+    assert_eq!(develop_ids(&report(&ran)), ["develop.checkout@~/aterm"]);
+    assert_eq!(*stand.composed.borrow(), [true]);
+    assert_eq!(
+        *stand.read.borrow(),
+        [vec!["develop.checkout@~/aterm".to_owned()]]
+    );
+}
+
+/// OUTSIDE THE ACCOUNT'S OWN SHELL NO DEVELOP LAYER IS READ (root, another `$HOME`, a private
+/// state root: the checkouts and their code are the account's): no profile is read, no row is
+/// reported, and `--only develop` is an unmeasured selection, never green.
+#[test]
+fn outside_the_account_s_own_shell_no_develop_layer_is_read() {
+    let scratch = Scratch::new("develop-not-own");
+    let stand = Stand::recorded();
+    let not_own = Some("$HOME is not this account's home");
+    let (ran, _) = run_developing(&scratch, &["--read-only", "--json"], &stand, not_own);
+    assert_eq!(develop_ids(&report(&ran)), Vec::<&str>::new());
+    let (ran, _) = run_developing(
+        &scratch,
+        &["--read-only", "--json", "--only", "develop"],
+        &stand,
+        not_own,
+    );
+    assert_eq!(ran.code, 1, "{}", ran.text);
+    assert_eq!(
+        report(&ran).readiness.unwrap().unresolved,
+        ["doctor.selection.develop"]
+    );
+    assert!(stand.composed.borrow().is_empty());
 }

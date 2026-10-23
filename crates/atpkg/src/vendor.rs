@@ -1,10 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendor-direct HTTPS row admission ([`check_row`], [`crate::dispatch::ApplyStrategy::Shim`],
-//! [`crate::dispatch::ApplyStrategy::VendorApp`]), system-satisfaction probes
-//! ([`system_satisfied`]), and `PATH`-shadow detection ([`shadowing_binary_on_path`],
-//! [`windows_lookup_names`]).
+//! Vendor-direct HTTPS row admission ([`check_row`](crate::vendor::check_row),
+//! [`crate::dispatch::ApplyStrategy::Shim`], [`crate::dispatch::ApplyStrategy::VendorApp`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -29,7 +27,6 @@ pub fn vendor_direct_url_allowed(program: &str, url: &str) -> bool {
     crate::vendor_direct::spec(program).is_some_and(|spec| pinned_by(spec, url))
 }
 
-/// [`vendor_direct_url_allowed`] under one table row.
 fn pinned_by(spec: &crate::vendor_direct::VendorSpec, url: &str) -> bool {
     https_host(url).is_some()
         && spec.url_prefixes.iter().any(|prefix| {
@@ -41,8 +38,6 @@ fn pinned_by(spec: &crate::vendor_direct::VendorSpec, url: &str) -> bool {
         })
 }
 
-/// Whether `query` is exactly `keys`, in order, each `<key>=<plain value>` — so an empty
-/// `keys` admits no query at all.
 fn query_is(keys: &[&str], query: &str) -> bool {
     let mut pairs = query.split('&');
     keys.iter().all(|key| {
@@ -53,7 +48,6 @@ fn query_is(keys: &[&str], query: &str) -> bool {
     }) && pairs.next().is_none()
 }
 
-/// One path segment or query value: non-empty `[A-Za-z0-9._-]`, never `.` or `..`.
 fn plain_component(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -80,13 +74,8 @@ pub const PAYLOADS: &[&str] = &[
     "dmg",
 ];
 
-/// The single-binary payloads, the only ones an `entry` applies to: the download is the
-/// executable (`raw-binary`), or a gzip tar of exactly one regular file at its root
-/// (`tar-gz-binary`); either way it is laid at `bin/<entry>`, mode `0755`.
 const BINARY_PAYLOADS: &[&str] = &["raw-binary", "tar-gz-binary"];
 
-/// The archive payloads — the only ones `strip_components` applies to. A `tar-gz-binary`
-/// is a gzip tar too, but of one file the stage names itself: there is no tree to strip.
 const ARCHIVE_PAYLOADS: &[&str] = &["tar-gz", "tar-zst", "zip"];
 
 /// Whether `payload` names a single-binary lane (see [`BINARY_PAYLOADS`]).
@@ -131,9 +120,6 @@ pub(crate) fn bare_file_name(s: &str) -> bool {
         && !s.bytes().any(|b| b < b' ' || b == 0x7f)
 }
 
-/// Whether a `links` target is admissible: a relative path inside the staged tree (non-empty,
-/// no leading `/`, no `..`, no `.`/empty components, no NUL, no `\`, which would let `..\`
-/// dodge the component check).
 fn link_target_ok(target: &str) -> bool {
     if target.is_empty()
         || target.starts_with('/')
@@ -151,18 +137,15 @@ fn link_target_ok(target: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
-/// Refuse `msg` as a [`FlowError::VendorRefused`].
 fn refuse(msg: &str) -> FlowError {
     FlowError::VendorRefused(msg.to_string())
 }
 
-/// Refuse with a `<head><detail>` message.
 fn refuse2(head: &str, detail: &str) -> FlowError {
     FlowError::VendorRefused(format!("{head}{detail}"))
 }
 
 /// Admit an artifact row before any byte moves, by its `protocol`.
-///
 /// # Errors
 /// The first field that fails admission.
 pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
@@ -176,10 +159,6 @@ pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowErro
     }
 }
 
-/// The `github-release` half of [`check_row`]: the `asset` is joined onto the program's
-/// staging directory as the download's local name, so it must be one bare file name, or an
-/// absolute or `..` asset would name a file outside staging that install unlinks (sweeping
-/// that directory's `*.part` files) before any download.
 fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
     if !artifact.asset.is_empty() && !bare_file_name(&artifact.asset) {
         return Err(refuse2(
@@ -198,15 +177,10 @@ fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
     Ok(())
 }
 
-/// Why a row naming the `dmg` lane is refused, whatever its protocol: until a disk image can
-/// be read without attaching it, the attach and the read inside it draw macOS's
-/// removable-volume dialog where aterm lacks Full Disk Access, and a TCC dialog has no
-/// timeout (`install::stage_dmg`).
 const DMG_REFUSED: &str = "payload = dmg is refused until a disk image can be read without \
      attaching it (attaching one raises macOS's removable-volume dialog, which waits for an \
      answer)";
 
-/// The `https` half of [`check_row`].
 fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
     match artifact.kind.as_str() {
         "binary" | "app-bundle" => {}
@@ -303,7 +277,6 @@ fn check_https_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowEr
     Ok(())
 }
 
-/// The `links` half of the https check, split so the map rules read on their own.
 fn check_links(links: &BTreeMap<String, String>, exposes: &[String]) -> Result<(), FlowError> {
     for (name, target) in links {
         if ToolName::new(name).is_none() {
@@ -322,15 +295,10 @@ fn check_links(links: &BTreeMap<String, String>, exposes: &[String]) -> Result<(
     Ok(())
 }
 
-/// Whether `path` lies under the managed `prefix`, spelled as given or as the filesystem
-/// resolves it (`prefix_real`: on macOS a temp prefix under `/var/folders` resolves to
-/// `/private/var/folders`, and a symlinked prefix elsewhere entirely).
 fn under_prefix(prefix: &Path, prefix_real: &Path, path: &Path) -> bool {
     path.starts_with(prefix) || path.starts_with(prefix_real)
 }
 
-/// Whether `path` is a runnable regular file (following symlinks — a Homebrew `gh` is a
-/// symlink into the Cellar).
 fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -391,8 +359,6 @@ pub fn windows_lookup_names(name: &str, pathext: &str) -> Vec<String> {
         .collect()
 }
 
-/// The paths a lookup of `bin` tries under `dir`: on Windows the `PATHEXT` spellings
-/// ([`windows_lookup_names`] over the process's `PATHEXT`), elsewhere `dir/bin` alone.
 fn lookup_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -408,9 +374,6 @@ fn lookup_candidates(dir: &Path, bin: &str) -> Vec<PathBuf> {
     }
 }
 
-/// The shared `PATH` walk behind [`system_binary_on_path`] and [`shadowing_binary_on_path`]:
-/// the first executable named `bin` in an absolute `PATH` entry outside the managed `prefix`,
-/// whose resolved path is also outside it.
 fn first_foreign_on_path(
     prefix: &Path,
     bin: &str,
@@ -423,10 +386,7 @@ fn first_foreign_on_path(
     let path_var = path_var?;
     let prefix_real = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
     for dir in std::env::split_paths(path_var) {
-        // A relative entry (`.`, `bin`, the empty string) resolves against the current
-        // directory: a `gh` dropped into a project checkout must never read as a system
-        // install, nor retire the managed copy. Absolute directories only (on Windows,
-        // drive-rooted).
+        // Absolute directories only: a relative entry resolves against the current directory.
         if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;
         }
@@ -466,8 +426,6 @@ fn first_foreign_on_path(
     None
 }
 
-/// Whether `dir` (as spelled, or as it resolves) is the managed `<prefix>/bin`: the one
-/// prefix-owned `PATH` entry that ends a shadow walk unconditionally.
 fn is_managed_bin_dir(prefix: &Path, prefix_real: &Path, dir: &Path) -> bool {
     let bin = prefix.join("bin");
     let bin_real = prefix_real.join("bin");
@@ -650,9 +608,6 @@ mod tests {
         }
     }
 
-    /// A `github-release` row with a bare `asset` and a signed root is admitted whatever its
-    /// other keys hold: the release lane has no vendor checks beyond the asset name and, on a
-    /// release bundle, the root.
     #[test]
     fn a_github_release_row_is_admitted_on_its_asset_and_root_alone() {
         let mut a = row();
@@ -675,8 +630,6 @@ mod tests {
         check_row(&a, &[]).expect("only the bundle lane must sign a root");
     }
 
-    /// A `github-release` row's `asset` is the download's local name in the staging
-    /// directory, so admission holds it to the `https` lane's bare-name rule.
     #[test]
     fn a_github_release_row_with_a_path_asset_is_refused() {
         let mut a = row();
@@ -730,9 +683,6 @@ mod tests {
         check_row(&a, &["gh".to_string()]).expect("archive row admits");
     }
 
-    /// A `dmg` row is refused before any download until an image can be read without
-    /// attaching it (`install::stage_dmg`): one whose every other field is admitted is
-    /// refused for its lane alone, with the reason.
     #[test]
     fn a_well_formed_dmg_row_is_refused_for_its_lane_alone() {
         let mut d = row();
@@ -759,8 +709,6 @@ mod tests {
         check_row(&r, &[]).expect("the same release row on the bundle lane");
     }
 
-    /// The kind ⇔ payload pairing over https: an app-bundle arrives only as a dmg, a binary
-    /// never does, and no other kind rides this protocol.
     #[test]
     fn https_kind_and_payload_must_agree() {
         let mut app_as_zip = row();
@@ -902,9 +850,6 @@ mod tests {
         assert!(refused(&unexposed, &["codex".to_string()]).contains("not in exposes"));
     }
 
-    /// `tar-gz-binary` is a single-binary lane: a `binary` row with an exposed shimmable
-    /// entry admits; no entry, an unexposed one, the app-bundle kind, a strip or a link
-    /// is refused.
     #[test]
     fn a_tar_gz_binary_row_is_one_exposed_entry_and_nothing_else() {
         let exposes = ["agy".to_string(), "agy-alias".to_string()];
@@ -1030,7 +975,6 @@ mod tests {
         assert!(refused(&root, &exposes()).contains("tree_root is required"));
     }
 
-    /// `cmd.exe`'s PATHEXT rule, on every platform.
     #[test]
     fn windows_lookup_names_follow_pathext() {
         assert_eq!(
@@ -1063,7 +1007,6 @@ mod tests {
         );
     }
 
-    /// The documents and payloads the vendor-direct lane fetches, by program.
     const VENDOR_DIRECT_URLS: &[(&str, &str)] = &[
         (
             "claude",
@@ -1134,9 +1077,6 @@ mod tests {
         }
     }
 
-    /// The pin is per vendor's lane: a URL is admitted for another program only when the
-    /// two rows are one vendor's lane (one head: `codex-old` beside `codex`), and rows that
-    /// share a head share every pin, so one vendor's word is read under one set of rules.
     #[test]
     fn a_vendor_direct_url_is_admitted_only_for_its_own_vendors_lane() {
         use crate::vendor_direct::VENDORS;
@@ -1184,8 +1124,6 @@ mod tests {
         );
     }
 
-    /// Lookalike hosts, other schemes, userinfo, ports, case and trailing-dot spellings,
-    /// traversal and escapes, queries and fragments, and anything off the pinned prefixes.
     #[test]
     fn the_vendor_direct_pins_refuse_everything_else() {
         for bad in [
@@ -1241,8 +1179,6 @@ mod tests {
         }
     }
 
-    /// A row that declares a query grammar admits exactly that query right after a prefix
-    /// (Meta's lookaside URLs) and nothing near it; the same row with no grammar admits none.
     #[test]
     fn a_declared_query_is_admitted_exactly() {
         const DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/download/";
@@ -1303,9 +1239,6 @@ mod tests {
         }
     }
 
-    /// OpenAI's release JSON and Anthropic's documents are taken only unredirected (the
-    /// compiled table's rule); a GitHub release download may end on GitHub's release-asset
-    /// storage and nowhere else; and the request must be pinned for the program it serves.
     #[test]
     fn a_digest_document_lands_only_where_its_host_allows() {
         const CLAUDE: &str =
@@ -1480,8 +1413,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A hit before the managed `bin/` (or with it absent) is a shadow; a hit after it is
-    /// not; the managed dirs and links into the store never are; relative entries never count.
+    /// A hit before the managed `bin/` (or with it absent) is a shadow.
     #[cfg(unix)]
     #[test]
     fn the_shadow_probe_reports_only_what_precedes_the_managed_bin() {
@@ -1616,7 +1548,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `agents/` on PATH or not, as spelled or as it resolves, absolute entries only.
     #[test]
     fn agents_dir_on_path_sees_the_dir_as_spelled_or_resolved_and_absolute_only() {
         let prefix = crate::testdir::dir("atpkg-vendor-agents-");

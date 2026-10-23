@@ -1,38 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CARRIED END (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3,
-//! item 8): what a seamless update carries of a supervised
-//! session's task, so the successor shows what the outgoing process did.
-//!
-//! * THE END standing on the session's glass (`EndGlass`, the tab's `•`
-//!   while nobody has looked): under Autopilot Land the one end, Land's
-//!   landing; the wall time its face moved there, and whether it was seen.
-//!   Without the carry the successor knew none of it — the loop restates the
-//!   face from "unknown", which is no end (`harness_task::is_a_task_end`) —
-//!   so a landing nobody had looked at lost its `•` across the update, and
-//!   the restated face's clock read the update's time (`landed 17:42` became
-//!   `landed 18:05`, §9.4.8's wart).
-//! * THE WORK since the task opened (`AbBook::worked`, the end's 30 s floor):
-//!   the book is the process's, so a task 25 s into its work would have
-//!   started again from nothing (the review's R12).
-//!
-//! One row per session on its manifest record (`SessionRecord::autopilot_end`,
-//! [`EndCarry::row`]): `end=landed@<unix ms> seen=<0|1> worked=<ms>`, or
-//! `end=- worked=<ms>` where no end stands. The park stamps it
-//! (`App::end_carry_rows`, beside the status item's row); the successor puts
-//! the face's time on the timeline before the session is registered
-//! (`spawn::seed_adopted_end`, through `SessionTimeline::seed_task_face_held`)
-//! and spends the rest at the session's first publication
-//! (`App::adopt_end_carry`, beside `App::adopt_status_carry`): the end onto
-//! the glass as it stood, the work into the book.
+//! Seamless-update carry for a supervised session's task end and worked time ([`EndCarry::row`]).
 
 use aterm_agent::harness::acts::TaskFace;
 
 use crate::harness_glass::EndFace;
 
-/// One session's end and work as a seamless update carries them
-/// ([`Self::row`], [`Self::parse`]).
+/// One session's end and work as a seamless update carries them ([`Self::row`], [`Self::parse`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EndCarry {
     /// The end standing on the glass at the park, if one did.
@@ -42,9 +17,7 @@ pub(crate) struct EndCarry {
     pub(crate) worked_ms: u64,
 }
 
-/// A CARRIED END: its kind, the wall time (unix ms) the task's face moved
-/// there — the timeline's own, which the chip's, title's and page's clock
-/// read — and whether anyone had looked at it.
+/// A CARRIED END: its kind, the wall time (unix ms) the task's face moved there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedEnd {
     /// Landed.
@@ -56,12 +29,7 @@ pub(crate) struct CarriedEnd {
 }
 
 impl CarriedEnd {
-    /// THE FACE THE SUCCESSOR'S TIMELINE HOLDS for the loop to restate
-    /// (`spawn::seed_adopted_end`) and its wall time: the end's own. The
-    /// spend holds a face the loop restated first to exactly this
-    /// (`App::adopt_end_carry`): a restate of the held face takes this very
-    /// time back, so another face, or the same face at another time
-    /// (withdrawn and read again), is not this end's.
+    /// THE FACE THE SUCCESSOR'S TIMELINE HOLDS for the loop to restate.
     #[must_use]
     pub(crate) const fn told(self) -> (TaskFace, i64) {
         (self.face.task_face(), self.at_ms)
@@ -77,10 +45,7 @@ const fn word(face: EndFace) -> &'static str {
 }
 
 impl EndCarry {
-    /// THE ROW the park stamps (`SessionRecord::autopilot_end`): `None`
-    /// where there is nothing to carry (no end and no work), so a session
-    /// with neither — every shell, every agent at rest since its last end —
-    /// writes no key, and an older reader sees the wire it always saw.
+    /// THE ROW the park stamps (`SessionRecord::autopilot_end`).
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn row(&self) -> Option<String> {
@@ -97,13 +62,7 @@ impl EndCarry {
         }
     }
 
-    /// READ A CARRIED ROW ([`Self::row`]), or `None` where it does not
-    /// read: `end=` missing or no kind (`landed`; Autopilot Land has no other
-    /// end), an end with no wall time after the epoch or no `seen=0|1`, a
-    /// value that is no count, a key twice. A key this build does not
-    /// know is skipped (a later build may add one); a row that does not read
-    /// carries nothing — the end is lost and the work starts again, as before
-    /// the carry — never the manifest.
+    /// READ A CARRIED ROW ([`Self::row`]), or `None` where it does not read.
     #[must_use]
     pub(crate) fn parse(row: &str) -> Option<Self> {
         let (mut end, mut seen, mut worked) = (None, None, None);
@@ -143,8 +102,6 @@ impl EndCarry {
     }
 }
 
-/// An end's kind and the wall time (unix ms, after the epoch) a row says it
-/// moved there: `landed@<ms>`.
 fn face_at(value: &str) -> Option<(EndFace, i64)> {
     let (kind, at) = value.split_once('@')?;
     let face = match kind {

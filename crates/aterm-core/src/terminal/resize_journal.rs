@@ -350,7 +350,7 @@ impl Terminal {
         self.grid.resize_law()
     }
 
-    /// How many resizes this engine has applied ([`resize_lifetime`]).
+    /// How many resizes this engine has applied ([`resize_lifetime`](Self::resize_lifetime)).
     #[inline]
     #[must_use]
     pub const fn resize_ordinal(&self) -> u64 {

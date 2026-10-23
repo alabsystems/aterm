@@ -460,7 +460,7 @@ impl App {
         }
     }
 
-    /// Update the live ready row's wording when `build`'s [`ApplyPosture`] changes,
+    /// Update the live ready row's wording when `build`'s [`ApplyPosture`](crate::update_words::ApplyPosture) changes,
     /// withdrawing a log-only row or raising the ready decision once if the lane stopped.
     pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
         let posture = self.apply_posture_for(build);

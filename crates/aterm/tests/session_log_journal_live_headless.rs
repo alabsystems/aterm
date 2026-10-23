@@ -187,7 +187,8 @@ fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
     (sid, header, lines, b)
 }
 
-/// The module doc, end to end.
+/// B answers `log @<A's sid>` from A's journal; a plain headless instance and
+/// `[session_log] journal = false` keep no journal.
 #[test]
 fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
     use std::os::unix::fs::PermissionsExt as _;

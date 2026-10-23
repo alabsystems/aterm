@@ -42,7 +42,7 @@ pub fn compressor_in(path: Option<&OsStr>) -> std::result::Result<PathBuf, Strin
     })
 }
 
-/// What [`write`] produced.
+/// What [`write`](fn@write) produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packed {
     /// The `.tar.zst` written.
@@ -195,12 +195,12 @@ pub fn write(root: &Path, asset: &Path) -> Result<Packed> {
     write_with(root, asset, &ZstdCli::default())
 }
 
-/// [`write`], compressing with `compressor`: a pack's [`super::tools::Tools::compressor`],
-/// a zstd CLI at another path, or a stand-in that shows how the pack refuses a compressor
-/// that fails or writes another stream.
+/// [`write`](fn@write), compressing with `compressor`: a pack's
+/// [`super::tools::Tools::compressor`], a zstd CLI at another path, or a stand-in that shows
+/// how the pack refuses a compressor that fails or writes another stream.
 ///
 /// # Errors
-/// As [`write`].
+/// As [`write`](fn@write).
 pub fn write_with(root: &Path, asset: &Path, compressor: &dyn Compressor) -> Result<Packed> {
     let members = plan(root)?;
     if !members.iter().any(|m| matches!(m, Member::File { .. })) {

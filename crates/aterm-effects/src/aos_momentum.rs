@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typing-momentum glow as an Aos task, and the live wrapper every host calls (design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §2 and §4.3).
+//! The typing-momentum glow as an Aos task.
 
 use core::fmt;
 use std::time::Duration;
@@ -63,10 +63,11 @@ pub const NUMERIC_PROFILE: &str = "f32-ieee754/system-libm/single-thread";
 /// How many keys and resets may wait during a pause.
 pub const MOMENTUM_QUEUE_CAP: usize = 1024;
 
-/// The most events a reader of a momentum log accepts (`EventLog::decode`'s limit), and the largest log epoch a hand-built attach may ask for.
+/// The most events a reader of a momentum log accepts (`EventLog::decode`'s limit).
 pub const MOMENTUM_MAX_EVENTS: usize = 1 << 16;
 
-/// How many inputs one log epoch of [`MomentumHost::aos_attach`] holds before the recorder re-anchors (a fresh checkpoint and an empty log of the next epoch; design §2 item 9).
+/// How many inputs one log epoch of [`MomentumHost::aos_attach`] holds before the recorder
+/// re-anchors.
 pub const MOMENTUM_HOST_MAX_EVENTS: usize = 1 << 12;
 
 /// The contract's settle margin.
@@ -74,18 +75,16 @@ pub const SETTLE_MARGIN: Duration = Duration::from_millis(1);
 
 /// The law: at every schedule query, a hot glow (`is_active || settling`) names a wake.
 pub const HOT_HAS_WAKE: &str = "HotHasWake";
-/// The law: while settling, the wake is no sooner than a frame out and no later than `max(cold_at + SETTLE_MARGIN, at + frame_interval)`.
+/// The law.
 pub const WAKE_NO_LATER_THAN_CLEAR: &str = "WakeNoLaterThanClear";
-/// The law: a tick at or after the latest cold forecast plus [`SETTLE_MARGIN`], under the config of the tick that latched it and with no key or reset since, is inert.
+/// The law.
 pub const COLD_TICK_CLEARS: &str = "ColdTickClears";
 /// The law: the run observed each recorded input once, with the observation its kind makes.
 pub const RUN_MATCHES_INPUTS: &str = "RunMatchesInputs";
 /// The entry law: the state is one the engine can reach (its snapshot validates).
 pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
 
-/// `t − epoch` in signed nanoseconds. Exact for every pair of instants a host can hold (an
-/// `i128` holds every `Duration`'s nanoseconds); the saturating fallbacks are unreachable,
-/// and admission refuses them as outside the horizon.
+/// `t − epoch` in signed nanoseconds.
 #[inline]
 fn offset_of(epoch: Instant, t: Instant) -> i128 {
     if let Some(after) = t.checked_duration_since(epoch) {
@@ -140,7 +139,6 @@ impl MomentumState {
         self.clock
     }
 
-    /// The latest time the task has seen: its clock, the last key and the last hot tick.
     fn last_time(&self, epoch: Instant) -> Option<i128> {
         let seen = self
             .glow
@@ -321,7 +319,7 @@ pub enum MomentumObservation {
     Refused(AdmitRefusal),
 }
 
-/// What [`MomentumCode::apply`] did, with the host's own instants (the observation maps them to offsets).
+/// What [`MomentumCode::apply`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
     /// A key was credited.
@@ -341,7 +339,6 @@ pub enum Applied {
     Refused(AdmitRefusal),
 }
 
-/// The observation of an applied input, from the quads it appended.
 fn observe(
     applied: &Applied,
     epoch: Instant,
@@ -373,7 +370,7 @@ fn observe(
     }
 }
 
-/// The task ABI: [`MomentumState`], [`MomentumEvent`] and [`MomentumObservation`], their canonical encodings, and the recording epoch every offset is taken from.
+/// The task ABI.
 #[derive(Clone, Debug)]
 pub struct MomentumSchema {
     id: ArtifactId,
@@ -399,7 +396,6 @@ impl MomentumSchema {
     }
 }
 
-/// A snapshot refusal as the wire fault a state decoder reports.
 const fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
     match r {
         SnapshotRefusal::Length { expected, found } => WireFault::Truncated {
@@ -456,16 +452,10 @@ const fn usize_u64(v: usize) -> u64 {
     v as u64
 }
 
-/// The length of one encoded quad: `row`, `x`, `y`, `w`, `h` as `u16`, then `color` (`u32`),
-/// `alpha` (`u8`), `color2` (`u32`) and `alpha2` (`u8`).
 const QUAD_LEN: usize = 20;
 
-/// The most a frame observation's encoding takes besides its quads: the tag, the optional
-/// fill (a tag and a `u32`), `hot`, `fp` and the two stream counts.
 const FRAME_HEAD_LEN: usize = 1 + 5 + 1 + 8 + 8 + 8;
 
-/// One quad's encoding: its nine fields in order, each little-endian, which is exactly what
-/// the nine field writes `e.u16(q.row)`, `e.u16(q.x)`, … `e.u8(q.alpha2)` append.
 const fn quad_bytes(q: &GlowQuad) -> [u8; QUAD_LEN] {
     let [r0, r1] = q.row.to_le_bytes();
     let [x0, x1] = q.x.to_le_bytes();
@@ -486,9 +476,6 @@ fn encode_quads(e: &mut Enc, quads: &[GlowQuad]) {
     }
 }
 
-/// A frame observation's encoding from the frame and the quads it appended: the one encoder
-/// of [`MomentumObservation::Frame`], which the live host also calls on the quads in its own
-/// vectors, so its chain links the bytes a replay links without building the observation.
 fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under: &[GlowQuad]) {
     e.u8(2);
     e.opt(frame.fill, |e, f| e.u32(f));
@@ -498,8 +485,6 @@ fn encode_frame(e: &mut Enc, frame: &MomentumGlowFrame, out: &[GlowQuad], under:
     encode_quads(e, under);
 }
 
-/// Room for a frame observation's encoding over `quads` quads: [`FRAME_HEAD_LEN`] and
-/// [`QUAD_LEN`] each.
 const fn frame_room(quads: usize) -> usize {
     FRAME_HEAD_LEN.saturating_add(QUAD_LEN.saturating_mul(quads))
 }
@@ -769,7 +754,7 @@ pub fn task_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Task, TASK_NAME, 1, e.as_bytes())
 }
 
-/// The schema artifact `momentum-glow.state+events` v1: binds the snapshot schema and the event encoding version.
+/// The schema artifact `momentum-glow.state+events` v1.
 #[must_use]
 pub fn schema_artifact() -> ArtifactId {
     let mut e = Enc::new();
@@ -779,7 +764,7 @@ pub fn schema_artifact() -> ArtifactId {
     ArtifactId::new(ArtifactKind::Schema, SCHEMA_NAME, 1, e.as_bytes())
 }
 
-/// The profile artifact: the target, the numerical host profile ([`NUMERIC_PROFILE`]) and [`MOMENTUM_PROFILE`]'s limits.
+/// The profile artifact.
 #[must_use]
 pub fn profile_artifact() -> ArtifactId {
     let target = target_name();
@@ -875,7 +860,7 @@ impl MomentumCode {
         }
     }
 
-    /// Its artifact: version 1, the descriptor its name, version, the build id the host supplies and its note.
+    /// Its artifact.
     #[must_use]
     pub fn artifact(self, build: &str) -> ArtifactId {
         let mut e = Enc::new();
@@ -930,7 +915,7 @@ impl MomentumCode {
         }
     }
 
-    /// One input, admitted then applied: the one function both the live wrapper and [`Code::step`] run.
+    /// One input.
     pub fn apply(
         self,
         s: &mut MomentumState,
@@ -993,7 +978,7 @@ impl MomentumCode {
     }
 }
 
-/// A prebuilt implementation bound to its artifact (which names the build it was compiled into): what a [`Boundary`] holds as code.
+/// A prebuilt implementation bound to its artifact (which names the build it was compiled into).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrebuiltMomentum {
     code: MomentumCode,
@@ -1035,8 +1020,6 @@ impl Code<MomentumSchema> for PrebuiltMomentum {
             })
     }
 
-    /// Total: an admission refusal is the observation [`MomentumObservation::Refused`], never
-    /// a [`StepRefusal`].
     fn step(
         &self,
         schema: &MomentumSchema,
@@ -1247,8 +1230,7 @@ impl Contract<MomentumSchema> for NoStrandedLight {
     }
 }
 
-/// The live observation chain since the current ancestor checkpoint: what a replay of the
-/// log from that checkpoint must reproduce.
+/// The live observation chain since the current ancestor checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LiveChain {
     /// The log epoch and first cursor it folds from.
@@ -1257,8 +1239,7 @@ struct LiveChain {
     len: u64,
 }
 
-/// The last delivered tick's frame and the quads it appended: the held overlay, with the
-/// caret it was drawn for.
+/// The last delivered tick's frame and the quads it appended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     frame: MomentumGlowFrame,
@@ -1272,9 +1253,7 @@ struct Held {
 }
 
 impl Held {
-    /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay: only while the
-    /// tick's own gates allow the glow (the engine's inert arms: off, no positive intensity,
-    /// no cursor, a degenerate geometry) and only for the caret it was drawn for.
+    /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay.
     #[inline]
     fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
         cfg.enabled
@@ -1290,14 +1269,12 @@ impl Held {
     }
 }
 
-/// Whether the glow is at rest: what `MomentumGlow::reset` leaves (its snapshot is the
-/// default's; `light_ink_memo` is a cache, design §2 item 7).
+/// Whether the glow is at rest.
 #[inline]
 fn at_rest(s: &MomentumState, epoch: Instant) -> bool {
     s.glow.snapshot(epoch) == MomentumGlow::default().snapshot(epoch)
 }
 
-/// An attached task: the boundary owning the pair, and what the wrapper keeps beside it.
 struct Hosted {
     boundary: Boundary<MomentumSchema, PrebuiltMomentum, NoStrandedLight>,
     build: String,
@@ -1305,19 +1282,14 @@ struct Hosted {
     held: Option<Held>,
     /// The latest recorded query's time and the wake it was answered with.
     last_query: Option<(i128, Option<i128>)>,
-    /// How many live inputs were recorded at the logical time instead of their own, earlier
-    /// one (`Hosted::logical`).
+    /// How many live inputs were recorded at the logical time instead of their own.
     clamped: u64,
     /// The latest time among the keys queued in the current pause (within the horizon).
     queued_at: Option<i128>,
-    /// The one encoder every live observation is encoded into before its chain link, cleared
-    /// for each: it keeps the room the largest recent frame took, and gives it back with the
-    /// held overlay's when a tick draws nothing (see [`Hosted::deliver`]).
+    /// The one encoder every live observation is encoded into before its chain link.
     scratch: Enc,
 }
 
-/// Makes `v` hold exactly the quads of `from`, in the room it already has when that is
-/// enough: an overlay redrawn every frame is copied without an allocation per frame.
 fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
     if from.is_empty() {
         *v = Vec::new();
@@ -1336,7 +1308,6 @@ fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
 /// The hosted horizon in signed nanoseconds.
 #[inline]
 const fn horizon_ns() -> i128 {
-    // Every `Duration` is below 2^94 ns, so its nanoseconds fit in `i128`.
     nanos(MOMENTUM_PROFILE.horizon)
 }
 
@@ -1402,8 +1373,7 @@ impl Hosted {
         self.boundary.pair().head.input_cursor
     }
 
-    /// The logical time of a live call the host stamped `now`: `max(floor, now − epoch)`
-    /// and whether that moved it.
+    /// The logical time of a live call the host stamped `now`.
     #[inline]
     fn logical(&self, now: Instant) -> (i128, bool) {
         let at = offset_of(self.epoch(), now);
@@ -1420,15 +1390,10 @@ impl Hosted {
         }
     }
 
-    /// Folds one recorded input's observation into the live chain, restarting it when the
-    /// boundary has re-anchored (a new log epoch or first cursor).
     fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
         self.link(cursor, |schema, e| schema.encode_observation(obs, e));
     }
 
-    /// [`Hosted::fold`] of the observation `encode` writes: the chain links the bytes it
-    /// appends to the host's one encoder, cleared first, so they are exactly what a fresh
-    /// encoder would hold.
     fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
         let Some(log) = self.boundary.log() else {
             return;
@@ -1450,8 +1415,6 @@ impl Hosted {
         self.chain.len = self.chain.len.saturating_add(1);
     }
 
-    /// The live observation chain since the current log's anchor: the empty chain until the
-    /// first input of a fresh log (an attach, a commit, a restore or a re-anchor) is folded.
     fn live_chain(&self) -> Digest {
         match self.boundary.log() {
             Some(log)
@@ -1463,8 +1426,6 @@ impl Hosted {
         }
     }
 
-    /// Folds what the boundary delivered itself (a queue, an overflowing input), whose
-    /// accepted inputs took consecutive cursors from `first`.
     fn fold_delivered(
         &mut self,
         first: u64,
@@ -1477,8 +1438,6 @@ impl Hosted {
         }
     }
 
-    /// One host call as one input: recorded and applied through the live code while running,
-    /// queued or skipped while paused.
     fn deliver(
         &mut self,
         ev: &MomentumEvent,
@@ -1527,7 +1486,6 @@ impl Hosted {
             refill(&mut held_out, drawn);
             refill(&mut held_under, drawn_under);
             if drawn.is_empty() && drawn_under.is_empty() {
-                // Nothing drawn, nothing kept: the encoder's room goes with the overlay's.
                 self.scratch = Enc::new();
             }
             self.held = Some(Held {
@@ -1565,9 +1523,6 @@ impl Hosted {
         Some(applied)
     }
 
-    /// Whether a reset now changes nothing: running, the glow is at rest; paused, it is at
-    /// rest once the queue is delivered (the queue ends in a reset, or holds nothing and the
-    /// paused state is at rest).
     fn reset_changes_nothing(&self) -> bool {
         if self.boundary.is_paused() {
             match self.boundary.last_queued() {
@@ -1597,10 +1552,7 @@ impl Hosted {
 
 impl MomentumHost {
     /// A running attach whose live time at `now` is past the hosted horizon can admit no timed
-    /// input again (logical time never goes back, and every such input is refused `Horizon`),
-    /// so a hot glow would stay hot and undrawn for good: the attach ends here and the shipped
-    /// engine takes the state back whole, so the call that crossed the horizon already runs
-    /// on it.
+    /// input again (logical time never goes back, and every such input is refused `Horizon`).
     #[inline]
     fn expire_past_horizon(&mut self, now: Instant) {
         if let HostMode::Hosted(h) = &self.mode
@@ -1705,7 +1657,7 @@ impl MomentumHost {
         }
     }
 
-    /// The analytic cold instant (`MomentumGlow::cold_at`), read from the state (paused too: it is a fact about the state, not a schedule answer).
+    /// The analytic cold instant (`MomentumGlow::cold_at`).
     #[inline]
     #[must_use]
     pub fn cold_at(&self) -> Option<Instant> {
@@ -1739,7 +1691,7 @@ impl MomentumHost {
         }
     }
 
-    /// Starts hosting: checkpoint C0 of the current state and an empty log of `log_epoch`, with `code` running it from here on and `build` (the host's build id) in its descriptor.
+    /// Starts hosting.
     pub fn aos_attach(&mut self, epoch: Instant, code: MomentumCode, build: &str, log_epoch: u64) {
         self.attach_with(
             epoch,
@@ -1806,8 +1758,6 @@ impl MomentumHost {
         }));
     }
 
-    /// Detaches and returns the engine (a pending update is rejected first: the queue goes to
-    /// the old pair once).
     fn take_glow(&mut self) -> MomentumGlow {
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
             HostMode::Direct(g) => g,
@@ -1818,16 +1768,16 @@ impl MomentumHost {
         }
     }
 
-    /// Stops hosting: the live state moves back as a whole and the shipped engine runs it directly again.
+    /// Stops hosting.
     pub fn aos_detach(&mut self) {
         let glow = self.take_glow();
         self.mode = HostMode::Direct(glow);
     }
 
     /// Pauses at this step boundary.
-    ///
     /// # Errors
-    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is recorded then.
+    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is recorded
+    /// then.
     pub fn aos_pause(
         &mut self,
         now: Instant,
@@ -1844,10 +1794,11 @@ impl MomentumHost {
         h.boundary.pause()
     }
 
-    /// Prepares `candidate` against the paused head (shadow replay of the live code and the candidate from the ancestor checkpoint, judged by [`NoStrandedLight`]) and commits it.
-    ///
+    /// Prepares `candidate` against the paused head (shadow replay of the live code and the
+    /// candidate from the ancestor checkpoint, judged by [`NoStrandedLight`]) and commits it.
     /// # Errors
-    /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`, `CandidateFailed`, …).
+    /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`,
+    /// `CandidateFailed`, …).
     pub fn aos_repair(
         &mut self,
         candidate: MomentumCode,
@@ -1863,7 +1814,7 @@ impl MomentumHost {
         Ok(commit)
     }
 
-    /// Rejects the pending update: the old pair resumes and receives each queued input once, in order (returned).
+    /// Rejects the pending update.
     pub fn aos_resume(&mut self) -> Vec<Result<MomentumObservation, StepRefusal>> {
         let HostMode::Hosted(h) = &mut self.mode else {
             return Vec::new();
@@ -1957,8 +1908,7 @@ impl MomentumHost {
         }
     }
 
-    /// The ancestor checkpoint and the log since it, encoded, with the identity they were recorded under and the head the live run reached (the state digest and the observation chain since the checkpoint).
-    ///
+    /// The ancestor checkpoint and the log since it.
     /// # Errors
     /// [`TraceRefusal::NotAttached`], or an encoder's `TooLarge`.
     pub fn aos_trace(&self) -> Result<MomentumTrace, TraceRefusal> {
@@ -2027,7 +1977,8 @@ pub struct MomentumAosStatus {
     pub next_deadline: Option<i128>,
     pub last_frame: Option<FrameSummary>,
     pub stats: Stats,
-    /// How many live inputs were recorded at the task's logical time instead of their own earlier one (two host clocks interleaved, or a call before the epoch).
+    /// How many live inputs were recorded at the task's logical time instead of their own earlier
+    /// one.
     pub clamped: u64,
 }
 

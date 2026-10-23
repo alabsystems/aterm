@@ -2399,6 +2399,9 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
             span(idle),
             span(after)
         ),
+        Unused::GivenUp => "a scratch a failed provisioning run left, past macOS's \
+                            first-exec assessment of what ran from it"
+            .to_owned(),
         Unused::Stale {
             incremental,
             units,
@@ -2422,6 +2425,7 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
         Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
         Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
+        Unused::GivenUp => "a failed provisioning run's scratch".to_owned(),
         Unused::Stale {
             incremental,
             units,
@@ -2466,6 +2470,7 @@ pub fn sweep_row(
     let what = match why {
         atpkg::build_cache::Unused::Stale { .. } => "part of a build cache",
         atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
+        atpkg::build_cache::Unused::GivenUp => "a tooling scratch, whole",
         _ => "a build cache, whole",
     };
     o.insert(

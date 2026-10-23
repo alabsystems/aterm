@@ -217,12 +217,9 @@ pub struct Stub {
     started: f64,
     state: Mutex<State>,
     log_lock: Mutex<()>,
-    /// The 200 answers to `/v1/messages` served so far that carried on200
-    /// headers: the `k` of a `@SEQ@` header value.
+    /// The 200 answers to `/v1/messages` served so far that carried on200 headers.
     served_200: AtomicU32,
-    /// The request bodies dumped so far ([`Stub::dump`]): each dump takes
-    /// its index from here as it is written, so requests in flight together
-    /// (a reply's delay and pace hold `record` back) never share one.
+    /// The request bodies dumped so far ([`Stub::dump`]).
     dumped: AtomicU64,
 }
 
@@ -273,7 +270,6 @@ pub fn rate_headers(spec: &J, served: u32) -> RateHeaders {
     }
 }
 
-/// A header value's text, as Python's `str()` spelled the JSON value.
 fn value_text(v: &J) -> String {
     match v {
         J::Str(s) => s.clone(),
@@ -286,7 +282,6 @@ fn value_text(v: &J) -> String {
     }
 }
 
-/// `v`, or the figure a `@SEQ:BASE:STEP@` value reaches after `served` answers.
 fn seq_value(v: &str, served: u32) -> String {
     let num = |t: &str| {
         let digits = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.');
@@ -303,7 +298,6 @@ fn seq_value(v: &str, served: u32) -> String {
     }
 }
 
-/// The built-in modes' names: never a custom mode.
 const BUILTIN: &[&str] = &[
     "ok",
     "long",
@@ -321,8 +315,6 @@ const BUILTIN: &[&str] = &[
     "bad-key",
 ];
 
-/// The file in `<modes-dir>` that answers Codex's token refresh (`POST
-/// /oauth/token`), never a mode of the APIs.
 const REFRESH_FILE: &str = "refresh.json";
 
 /// Why `<modes-dir>/<name>.json` would never be served as the custom mode `name`.
@@ -341,7 +333,6 @@ pub fn not_custom(name: &str) -> Option<&'static str> {
     }
 }
 
-/// A random 64-bit id in the API's `…_lab%016x` shape.
 fn rand_hex() -> String {
     let mut b = [0u8; 8];
     let _ = aterm_uds::rand::fill(&mut b);
@@ -494,8 +485,7 @@ pub fn message_users(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The facts of one `/v1/messages` request every answer logs: its request
-/// line, its body's length, the mode it is answered in, and what it asked.
+/// The facts of one `/v1/messages` request every answer logs.
 #[derive(Clone, Copy)]
 struct Turn<'a> {
     method: &'a str,
@@ -506,7 +496,6 @@ struct Turn<'a> {
 }
 
 impl<'a> Turn<'a> {
-    /// The same request, answered in `mode` (the mode a used-up custom mode or a lifted limit falls back to).
     const fn in_mode<'b>(self, mode: &'b str) -> Turn<'b>
     where
         'a: 'b,
@@ -609,17 +598,16 @@ pub fn analyse(body: &[u8]) -> Info {
 /// What the `tool` mode answers a request.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToolTurn {
-    /// Call this tool with this input (its `@SID:<k>@` filled); the step it is.
+    /// Call this tool with this input (its `@SID:<k>@` filled).
     Call(String, J, usize),
-    /// Reply with this text and end the turn; the step it is.
+    /// Reply with this text and end the turn.
     Say(String, usize),
-    /// Call these tools, in this order, in ONE assistant message; the step it is.
+    /// Call these tools.
     Calls(Vec<(String, J)>, usize),
     /// Every step is answered.
     Done,
 }
 
-/// Whether `m` is an assistant reply with no tool use: a scripted text step answered.
 fn is_said(m: &J) -> bool {
     m.get("role").and_then(J::as_str) == Some("assistant")
         && match m.get("content") {
@@ -631,8 +619,6 @@ fn is_said(m: &J) -> bool {
         }
 }
 
-/// The text of every tool result in `msgs`, in order: a result's string, or
-/// its text blocks joined by newlines.
 fn tool_results(msgs: &[J]) -> Vec<String> {
     msgs.iter()
         .filter(|m| m.get("role").and_then(J::as_str) == Some("user"))
@@ -656,9 +642,8 @@ pub fn first_sid(text: &str) -> Option<&str> {
         })
 }
 
-/// `input` with every `@SID:<k>@` in its strings replaced by the first session
-/// id of `results[k-1]`; one with no such result, or none in it, is left as
-/// written, so the call that names it fails where it can be seen.
+/// `input` with every `@SID:<k>@` in its strings replaced by the first session id of
+/// `results[k-1]`.
 #[must_use]
 pub fn fill_sids(input: &J, results: &[String]) -> J {
     match input {
@@ -681,7 +666,6 @@ pub fn fill_sids(input: &J, results: &[String]) -> J {
     }
 }
 
-/// The calls of a `tool` script (one call or a list): each an object with a name.
 fn script_calls(script: &J) -> Vec<&J> {
     match script {
         J::Arr(a) => a.iter().collect(),
@@ -692,7 +676,6 @@ fn script_calls(script: &J) -> Vec<&J> {
     .collect()
 }
 
-/// A scripted call's tool name.
 fn call_name(c: &J) -> String {
     match c.get("name") {
         Some(J::Str(s)) => s.clone(),
@@ -701,7 +684,6 @@ fn call_name(c: &J) -> String {
     }
 }
 
-/// A scripted call's input (`{}` when it has none).
 fn call_input(c: &J) -> J {
     c.get("input")
         .filter(|v| v.truthy())
@@ -794,8 +776,7 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
-/// `limit:CLAIM:RESET[:PLAN]` → `(claim, reset unix seconds, plan)`; PLAN is Codex's
-/// `plan_type`, and Claude Code's answer has none.
+/// `limit:CLAIM:RESET[:PLAN]` → `(claim, reset unix seconds, plan)`.
 #[must_use]
 pub fn limit_params(mode: &str) -> Option<(String, i64, Option<String>)> {
     let parts: Vec<&str> = mode.split(':').collect();
@@ -1172,7 +1153,6 @@ pub fn flat_headers(spec: &J, now: i64) -> Vec<(String, String)> {
     out
 }
 
-/// `extra` over `base`, names lowercased: a name already there takes the new value where it stands.
 fn merged(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String, String)> {
     let mut out = base.to_vec();
     for (k, v) in extra {
@@ -1185,8 +1165,6 @@ fn merged(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String,
     out
 }
 
-/// A custom mode's `headers` (`{name: value}`, a value that is no string as its
-/// JSON text), on its answer of either API, streamed or not.
 fn spec_headers(spec: &J) -> Vec<(String, String)> {
     match spec.get("headers") {
         Some(J::Obj(m)) => m
@@ -1243,7 +1221,7 @@ const COMPACT_SUMMARY: &str = "<analysis>lab stub: nothing to analyse.</analysis
 /// One HTTP request as the server read it.
 #[derive(Debug)]
 pub struct Request {
-    /// `GET`, `POST`, …
+    /// `GET`, `POST`, ….
     pub method: String,
     /// The path and query.
     pub target: String,
@@ -1263,7 +1241,6 @@ impl Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Whether the connection stays open after the reply.
     fn keep_alive(&self) -> bool {
         let conn = self.header("connection").unwrap_or("").to_ascii_lowercase();
         if conn.contains("close") {
@@ -1393,7 +1370,6 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The reason phrase Python's server writes for a status (empty for one it does not know).
 const fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -1415,7 +1391,6 @@ const fn reason(status: u16) -> &'static str {
     }
 }
 
-/// The reply side of one connection.
 struct Out<'a> {
     w: &'a mut TcpStream,
     /// The `--headers-file`'s flat headers, on every answer ([`flat_headers`]).
@@ -1485,10 +1460,6 @@ impl Out<'_> {
         self.head(200, &h)
     }
 
-    /// The extra headers a `status` answer carries; a 200 that carries on200
-    /// headers counts toward `@SEQ@`, and no other answer does: a ramp starts
-    /// at its BASE on the first answer that carries it, however many were
-    /// served before the file named it.
     fn rate_for(&self, status: u16) -> Vec<(String, String)> {
         let Some(rate) = &self.rate else {
             return Vec::new();
@@ -1614,7 +1585,6 @@ impl Stub {
         ));
     }
 
-    /// The `--headers-file` as it reads now.
     fn headers_spec(&self) -> Option<J> {
         self.args
             .headers_file
@@ -1623,7 +1593,6 @@ impl Stub {
             .and_then(|t| J::parse(&t).ok())
     }
 
-    /// This request's extra answer headers: `--headers-file` as it reads now.
     fn answer_headers(&self) -> RateHeaders {
         self.headers_spec()
             .map_or_else(RateHeaders::default, |spec| {
@@ -1631,9 +1600,6 @@ impl Stub {
             })
     }
 
-    /// The custom spec this request gets, or `None` (then it is answered as
-    /// `ok`): a spec with `auth` applies only to a request that carried that
-    /// lab credential, and a spec with `times` only to its first N requests.
     fn take_custom(&self, mode: &str, label: Option<&str>) -> Option<J> {
         let spec = self.custom_spec(mode)?;
         if let Some(want) = spec.get("auth").filter(|a| a.truthy())
@@ -1693,11 +1659,6 @@ impl Stub {
         }
     }
 
-    /// The request `body` of `kind` (the log's `kind=`) kept in the dump
-    /// directory: a turn as `req-<index>.json`, a side call ([`is_side`]) as
-    /// `side-<index>.json`, its index the next of [`Stub::dumped`] (one count
-    /// over both, so the two read in the order they came); only the newest
-    /// [`DUMPS_KEPT`] stay.
     fn dump(&self, body: &[u8], kind: &str) {
         let Some(dir) = &self.args.dump_dir else {
             return;
@@ -1716,7 +1677,6 @@ impl Stub {
         }
     }
 
-    /// Answer one request on `w`. `Err` only when the client went away.
     fn handle(&self, req: &Request, w: &mut TcpStream) -> io::Result<()> {
         let (path, query) = req.target.split_once('?').unwrap_or((&req.target, ""));
         let q = parse_query(query);
@@ -1796,7 +1756,6 @@ impl Stub {
         result
     }
 
-    /// The control endpoints; `false` for a path that is none of them.
     fn control(&self, path: &str, q: &[(String, String)], out: &mut Out<'_>) -> io::Result<bool> {
         let arg = |k: &str| q.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         match path {
@@ -1851,7 +1810,6 @@ impl Stub {
                 out.json(200, &J::obj([("lines", J::Arr(tail))]), &[])?;
             }
             "/__note" => {
-                // a marker in the request log (a scenario's step: "auth.json now holds B")
                 self.log(&format!(
                     "NOTE {}",
                     one_line(&arg("t").unwrap_or_default(), 160)
@@ -2081,9 +2039,7 @@ impl Stub {
         Ok(())
     }
 
-    /// A Responses API turn: Codex's `/v1/responses`, or Muse Code's
-    /// `/responses` main turn (`dialect` says which stream answers it, and
-    /// only Muse Code's calls the `tool` mode's script).
+    /// A Responses API turn.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn responses(
         &self,
@@ -2283,8 +2239,7 @@ impl Stub {
         )
     }
 
-    /// A plain text reply as the Responses API's SSE: the event types
-    /// codex-api reads, or Muse Code's own stream ([`Stub::muse_text`]).
+    /// A plain text reply as the Responses API's SSE.
     #[allow(clippy::too_many_arguments)]
     fn responses_stream(
         &self,
@@ -2462,7 +2417,6 @@ impl Stub {
         Ok(())
     }
 
-    /// A `response.failed` event with `code` (the turn fails as a stream, as the real API fails it).
     fn responses_failed(
         &self,
         (method, path, blen, mode): (&str, &str, usize, &str),
@@ -2519,9 +2473,6 @@ impl Stub {
         Ok(())
     }
 
-    /// Codex's workspace discovery under a ChatGPT login (`chatgpt_base_url` is
-    /// the stub under `codex --chatgpt`): the TUI will not start without an
-    /// answer. One personal account, the lab token's own.
     fn accounts_check(
         &self,
         method: &str,
@@ -2574,9 +2525,6 @@ impl Stub {
         Ok(())
     }
 
-    /// The account usage a ChatGPT login's TUI polls (its `/status` card's
-    /// limits and credits): the windows and credits the `--headers-file` sends
-    /// on answers, in the backend's payload, and the plan the lab token names.
     fn wham_usage(
         &self,
         method: &str,
@@ -2723,10 +2671,6 @@ impl Stub {
         Ok(())
     }
 
-    /// Codex's token refresh, pointed here by `CODEX_REFRESH_TOKEN_URL_OVERRIDE`.
-    /// The body holds the lab's fake refresh token: never logged or dumped.
-    /// `<modes-dir>/refresh.json` (`{"status", "json"}`) answers it, else a 401
-    /// `refresh_token_expired` (what the token authority says of a login that has lapsed).
     fn oauth_token(
         &self,
         method: &str,
@@ -2805,7 +2749,6 @@ impl Stub {
         ])
     }
 
-    /// A streamed Messages answer, `extra` (a custom mode's `headers`) on its head.
     fn stream(
         &self,
         t: &Turn<'_>,
@@ -2883,7 +2826,6 @@ impl Stub {
         Ok(())
     }
 
-    /// One tool use as SSE, its input split across two `input_json_delta`s.
     fn stream_tool(
         &self,
         t: &Turn<'_>,
@@ -2895,8 +2837,6 @@ impl Stub {
         self.stream_tools(t, summary, &[(name.to_string(), input.clone())], out)
     }
 
-    /// Tool uses in ONE assistant message as SSE, one content block each in
-    /// order, each input split across two `input_json_delta`s.
     fn stream_tools(
         &self,
         t: &Turn<'_>,
@@ -2981,8 +2921,6 @@ impl Stub {
         Ok(())
     }
 
-    /// The `bg` mode: `bgstart` → a background `sleep`; a tool result → a
-    /// one-line end_turn; anything else (the wake) → a slow reply.
     fn bg(&self, t: &Turn<'_>, body: &[u8], summary: &str, out: &mut Out<'_>) -> io::Result<()> {
         let j = J::parse_bytes(body).unwrap_or(J::Obj(Vec::new()));
         let msgs = j.get("messages").and_then(J::as_arr).unwrap_or_default();
@@ -3015,7 +2953,6 @@ impl Stub {
         self.stream(t, &s, &deltas, 1.0, &[], out)
     }
 
-    /// A `custom` mode's answer: its status, headers and body or stream, as its spec says.
     fn custom(&self, t: &Turn<'_>, spec: &J, summary: &str, out: &mut Out<'_>) -> io::Result<()> {
         let mode = t.mode;
         if let Some(ms) = spec
@@ -3063,7 +3000,6 @@ impl Stub {
         Ok(())
     }
 
-    /// Serve one connection until it closes.
     fn connection(&self, stream: TcpStream) {
         let Ok(read_half) = stream.try_clone() else {
             return;
@@ -3077,7 +3013,6 @@ impl Stub {
         }
     }
 
-    /// The black-hole proxy: read a request line, log it, answer 502, close.
     fn black_hole(&self, mut s: TcpStream) {
         let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
         let mut data = Vec::new();
@@ -3238,9 +3173,7 @@ pub fn main(argv: &[String]) -> i32 {
     }
 }
 
-/// The stub's log once it holds every one of `wants`, or as it stands when
-/// `limit` is spent: the stub records a request after its answer is sent
-/// (`Stub::record`), so a reader that got the answer may be ahead of the line.
+/// The stub's log once it holds every one of `wants`.
 #[cfg(test)]
 fn logged_with(log: &Path, wants: &[&str], limit: Duration) -> String {
     let deadline = std::time::Instant::now() + limit;

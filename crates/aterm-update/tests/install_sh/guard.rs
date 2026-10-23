@@ -258,6 +258,25 @@ fn a_dry_run_s_toolset_line_follows_the_console_owner() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_dry_run_over_a_home_that_cannot_be_read_still_plans() {
+    let scratch = Scratch::new();
+    let fresh = scratch.home("gone");
+    let missing = s(&fresh.home.join("not-yet")).to_string();
+    for home in [missing.as_str(), ""] {
+        let dry = dry_run_with(
+            &scratch,
+            &fresh,
+            &["--dry-run", "--no-toolchain"],
+            &[("HOME", home)],
+        );
+        let plan = dry.run.all();
+        assert_eq!(dry.run.code(), 0, "HOME={home:?}: {plan}");
+        assert!(plan.contains("DRY RUN"), "HOME={home:?}: {plan}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn a_dry_run_prints_the_plan_and_changes_nothing() {
     let scratch = Scratch::new();
     let fresh = scratch.home("dry");

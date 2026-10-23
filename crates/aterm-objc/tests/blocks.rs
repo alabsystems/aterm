@@ -94,7 +94,8 @@ fn foundation_invokes_an_arity_two_block() {
     .expect("_Block_copy produced a heap block");
 
     let text = ns_string("alpha\nbeta\ngamma").expect("NSString");
-    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument.
+    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument; `text` is a
+    // live NSString.
     unsafe {
         let enumerate: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
         enumerate(text.id(), sel!(enumerateLinesUsingBlock:), block.as_ptr());
@@ -119,7 +120,8 @@ fn a_returning_block_hands_its_value_back() {
         reserved: i32,
         invoke: unsafe extern "C" fn(*mut c_void, Id) -> Id,
     }
-    // SAFETY: the first four fields of every block are fixed ABI.
+    // SAFETY: the first four fields of every block are fixed ABI, and `block` is a live heap
+    // block built with an `id (^)(id)` invoke.
     let out = unsafe {
         let hdr = &*block.as_ptr().cast::<HeaderPrefix>();
         (hdr.invoke)(block.as_ptr(), expect)

@@ -5015,7 +5015,7 @@ impl App {
         self.on_mouse_wheel_phased(wid, delta, TouchPhase::Moved);
     }
 
-    /// [`Self::on_mouse_wheel`] with winit's gesture phase, which changes nothing about routing or bytes.
+    /// `Self::on_mouse_wheel` with winit's gesture phase, which changes nothing about routing or bytes.
     pub(crate) fn on_mouse_wheel_phased(
         &mut self,
         wid: WindowId,
@@ -6959,6 +6959,11 @@ mod tests {
         let mut found = None;
         for (width, height) in [(760, 520), (1_100, 740), (760, 460)] {
             let mut app = App::headless_for_test();
+            // Top Settings as it lists with a trail drawn (Windows draws none by default).
+            app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+                crate::app_config::trail_drawn(""),
+            )
+            .unwrap();
             app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(width, height));
             assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
             let (_, view) = app.active_native_view(wid).expect("Settings active");

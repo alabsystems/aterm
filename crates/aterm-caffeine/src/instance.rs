@@ -351,6 +351,10 @@ pub fn boot_id() -> Option<u128> {
     None
 }
 
+/// A test that reads or writes a held lock's bytes through a second handle is
+/// `cfg(unix)`: there the lock is flock's advisory one, while Windows'
+/// `LockFileEx` bars every other handle from the locked bytes (os error 33), and
+/// `aterm caffeine` runs only on macOS.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_running_pid_is_the_holders_while_it_holds() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");
@@ -393,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_release_is_awaited_only_of_the_pids_named() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");
@@ -416,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_named_job_is_written_beside_the_pid_and_read_back() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");
@@ -455,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_held_lock_with_garbage_inside_names_no_pid() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");
@@ -471,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_stale_pid_in_a_free_lock_is_not_a_running_mug() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");
@@ -487,6 +496,7 @@ mod tests {
     /// when the process it now names is not one: here it is this test process, live but no
     /// `caffeine serve`.
     #[test]
+    #[cfg(unix)]
     fn a_stale_pid_under_a_held_lock_is_not_a_running_mug() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.lock");

@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::app_config::trail_drawn;
 use crate::native_app::{AppEffect, AppViewState, NativeApp, NativeRuntime};
 use crate::native_config_service::{
     ConfigKeyEdit, ConfigPatchRequest, ConfigPatchResult, ConfigSnapshot, ExpectedValue,
@@ -1628,6 +1629,18 @@ fn setup_with_update(
     crate::native_app::AppInstanceId,
     crate::native_app::ViewId,
 ) {
+    setup_with(update, SettingsViewState::new(&Config::default()))
+}
+
+/// A Settings app on `update`, its one view on `state`.
+fn setup_with(
+    update: UpdateState,
+    state: SettingsViewState,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
     let app = SettingsApp::new(update);
     let mut runtime = NativeRuntime::new();
     let instance = runtime
@@ -1636,11 +1649,7 @@ fn setup_with_update(
     let mut core_views = ViewStore::default();
     let view = core_views.insert_native(instance).unwrap();
     runtime
-        .attach_view(
-            view,
-            instance,
-            AppViewState::Settings(Box::new(SettingsViewState::new(&Config::default()))),
-        )
+        .attach_view(view, instance, AppViewState::Settings(Box::new(state)))
         .unwrap();
     (runtime, instance, view)
 }
@@ -1780,6 +1789,8 @@ fn the_update_button_never_starts_a_build_on_hold() {
 }
 
 #[test]
+// The in-app updater's page: Windows has none (`native_updater_here`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn an_unread_copy_claims_nothing_about_updating_itself() {
     let press = |update: UpdateState| {
         let (mut runtime, instance, view) = setup_with_update(update);
@@ -5220,11 +5231,20 @@ fn at_each_text_scale(rungs: &[f32], what: &str, rung: impl Fn(f32) + Sync) {
 const SWEEP_WORKERS: usize = 3;
 
 fn on_workers<T: Sync + std::fmt::Debug>(items: &[T], what: &str, job: impl Fn(&T) + Sync) {
+    on_n_workers(SWEEP_WORKERS, items, what, job);
+}
+
+fn on_n_workers<T: Sync + std::fmt::Debug>(
+    workers: usize,
+    items: &[T],
+    what: &str,
+    job: impl Fn(&T) + Sync,
+) {
     let preferences = crate::native_appearance::current_preferences();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
-        for worker in 0..SWEEP_WORKERS.min(items.len()) {
+        for worker in 0..workers.min(items.len()) {
             let (next, failed, job) = (&next, &failed, &job);
             std::thread::Builder::new()
                 .name(format!("{what} worker {worker}"))
@@ -6989,10 +7009,6 @@ fn legacy_trail_master_and_empty_style_read_as_the_saved_cursor_style() {
             prefs::DEFAULT_CURSOR_TRAIL_STYLE,
         ),
         (
-            trail_drawn("cursor_trail_style = \"\"\n"),
-            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-        ),
-        (
             "cursor_trail = false\ncursor_trail_style = \"fire\"\n".to_string(),
             "off",
         ),
@@ -7175,23 +7191,6 @@ fn cursor_styles_runtime(
         )
         .unwrap();
     (runtime, instance, view)
-}
-
-fn trail_drawn(toml: &str) -> String {
-    if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
-        return toml.to_string();
-    }
-    let mut out = String::new();
-    if !toml.contains("cursor_trail_style =") {
-        out.push_str(&format!(
-            "cursor_trail_style = \"{}\"\n",
-            prefs::DEFAULT_CURSOR_TRAIL_STYLE
-        ));
-    }
-    if !toml.contains("cursor_momentum_glow =") {
-        out.push_str("cursor_momentum_glow = true\n");
-    }
-    out + toml
 }
 
 fn config_patches(outcome: &crate::native_app::DispatchOutcome) -> Vec<ConfigPatch> {
@@ -10807,6 +10806,8 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
 }
 
 #[test]
+// The in-app updater's page: Windows has none (`native_updater_here`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_compact_update_page_shows_its_status_and_both_switches_on_its_first_screen() {
     let checks = UiKey::new(format!("settings/control/{}", prefs::EDIT_UPDATE_ENABLED));
     let install = UiKey::new("settings/control/update.auto_apply");
@@ -10902,6 +10903,8 @@ fn a_compact_update_page_shows_its_status_and_both_switches_on_its_first_screen(
 }
 
 #[test]
+// The in-app updater's page: Windows has none (`native_updater_here`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn short_landscape_update_paints_the_detail_it_summarises() {
     at_each_text_scale(&[1.0, 2.0], "compact update detail", |scale| {
         let mut cannot = update_status(false);
@@ -11865,7 +11868,13 @@ fn one_cause_paints_one_note() {
     );
     assert!(runtime.replace_settings_packages(missing_tool_packages_state(), 2));
     let tool = NoEffectCause::PackageToolMissing.disclosure().visual;
-    let copy = NoEffectCause::CopyCantUpdate.disclosure().visual;
+    let copy = if native_updater_here(SettingsAvailability::runtime(true)) {
+        NoEffectCause::CopyCantUpdate
+    } else {
+        NoEffectCause::NoUpdater
+    }
+    .disclosure()
+    .visual;
     let universal = if row_available_here(
         prefs::EDIT_MACHINE_UNIVERSAL_CONTROL,
         SettingsAvailability::runtime(true),
@@ -14979,7 +14988,14 @@ fn bounded_native_float_non_finite_values_keep_sliders_and_disclose() {
         (prefs::EDIT_CURSOR_TRAIL_INTENSITY, 0.0),
         (prefs::EDIT_CURSOR_TRAIL_RADIUS, 0.0),
         (prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, 0.0),
-        (prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS, 1.8),
+        (
+            prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+            f32_as_shown(Config::bloom_radius_style_default(
+                crate::app_config::resolve_trail_style(
+                    crate::app_config::default_cursor_trail_style(),
+                ),
+            )),
+        ),
         (prefs::EDIT_CURSOR_GLOW_SDR_BOOST, 0.0),
         (prefs::EDIT_TRAIL_SOUND_VOLUME, 0.0),
         (prefs::EDIT_FONT_WEIGHT_DARK_NUDGE, 0.0),
@@ -19473,7 +19489,9 @@ fn aterm_toml_card_heading_is_the_same_whatever_else_matched() {
     );
     let mut captions = BTreeSet::new();
     each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
-        captions.extend(caption(compiled));
+        // A caption the screen's top cuts is hidden, not said
+        // (`hide_cut_caption`), as Windows' face seats one screen.
+        captions.extend(caption(compiled).filter(|label| !label.is_empty()));
     });
     assert_eq!(
         captions.into_iter().collect::<Vec<_>>(),
@@ -21888,7 +21906,7 @@ fn top_keyword_toys_and_cursor_trail_emit_complete_runtime_patches() {
     assert!(!top_projected_toy_value(&legacy, SPARKLE_WORDS_KEY));
     assert!(!top_projected_toy_value(&legacy, KEYWORD_KITTIES_KEY));
 
-    let (mut runtime, instance, view) = setup();
+    let (mut runtime, instance, view) = cursor_styles_runtime(&trail_drawn(""));
     let trail = runtime
         .dispatch(
             instance,
@@ -21913,7 +21931,11 @@ fn top_keyword_toys_and_cursor_trail_emit_complete_runtime_patches() {
             .iter()
             .map(|edit| (edit.key.as_str(), edit.value.as_deref()))
             .collect::<Vec<_>>(),
-        [(prefs::EDIT_CURSOR_TRAIL_STYLE, Some("off"))],
+        // Off, Windows' default, is written as the key's removal.
+        [(
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            crate::app_config::DEFAULT_DECORATIVE_EFFECTS.then_some("off")
+        )],
         "Off is the style alone: the effects switch keeps the momentum glow"
     );
 }
@@ -22303,10 +22325,7 @@ fn leaving_serious_mode_by_another_effect_keeps_the_saved_cursor_style() {
     );
     let (forgot, _) = apply(&mut service, forget);
     assert_eq!(forgot.raw_value(before_off), None);
-    assert_eq!(
-        forgot.raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
-        Some("off")
-    );
+    assert_eq!(saved_cursor_style(&forgot), "off");
 
     let mut service = VersionedConfigService::new(
         "cursor_trail_style = \"off\"\ncursor_trail_style_before_off = \"water\"\n".to_string(),
@@ -36942,7 +36961,7 @@ fn trail_intensity_zero_silences_only_the_voices_that_ride_the_trail() {
     let motion = crate::native_app::ViewMotionCx::default();
     let project = |intensity: &str, key: &str| {
         projected_effect(
-            "trail_sounds = true\n",
+            &trail_drawn("trail_sounds = true\n"),
             &[
                 (prefs::EDIT_CURSOR_TRAIL_INTENSITY, intensity),
                 (key, sample_for(key)),
@@ -37488,7 +37507,7 @@ fn an_outside_change_takes_the_preview_from_the_chosen_style() {
         runtime
             .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
             .unwrap();
-        let snapshot = service.replace_external(String::new()).unwrap();
+        let snapshot = service.replace_external(trail_drawn("")).unwrap();
         runtime
             .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
             .unwrap();
@@ -38685,7 +38704,9 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
             state.search = key.to_string();
         }
         let cx = view_cx_at(1080.0, 900.0);
-        if key == prefs::EDIT_SESSION_LOG_CLAUSE || cfg!(unix) {
+        // The keeper and the journal run only on Unix; elsewhere neither has a row.
+        let shown = key == prefs::EDIT_SESSION_LOG_CLAUSE || cfg!(unix);
+        if shown {
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             assert!(
                 compiled
@@ -38763,7 +38784,7 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
                 compiled
                     .semantic(&UiKey::new(format!("settings/reset/{key}")))
                     .is_some(),
-                authored.is_some(),
+                shown && authored.is_some(),
                 "Modified offers Reset exactly while {key} is authored"
             );
         }
@@ -38924,11 +38945,17 @@ fn hdr_glow_and_sdr_glow_boost_are_rows_that_say_which_is_in_use() {
         ..crate::native_app::ViewMotionCx::default()
     };
     let project = |source: &str, key: &str, motion| {
-        projected_effect(source, &[(key, "true")], key, availability, motion)
+        projected_effect(
+            &trail_drawn(source),
+            &[(key, "true")],
+            key,
+            availability,
+            motion,
+        )
     };
     let sdr = |source: &str, motion| {
         projected_effect(
-            source,
+            &trail_drawn(source),
             &[(prefs::EDIT_CURSOR_GLOW_SDR_BOOST, "0.5")],
             prefs::EDIT_CURSOR_GLOW_SDR_BOOST,
             availability,

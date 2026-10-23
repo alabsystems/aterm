@@ -20,22 +20,12 @@ pub(super) fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     }
 }
 
-/// The group the fixture's shell leads in front of its PTY. No process leads
-/// it, so no OS cwd stands in front of the OSC 7; it is also never a real fd
-/// (the fixture's master carries it, below).
 const SHELL: i32 = i32::MAX - 1;
 
-/// Put `program` in front of `wid`'s front session as group `pgid`: the PTY's
-/// foreground group as a fresh read finds it (the factory's probe answers the
-/// master's own number, which the fixture sets to `pgid`) and the status
-/// sweep's name for it (`status program=`).
 fn in_front(app: &mut App, wid: WindowId, pgid: i32, program: &str) {
     named_front(app, wid, pgid, pgid, program);
 }
 
-/// [`in_front`] with the fresh read and the sweep's name apart: `fresh` is
-/// in front now, the sweep last named `named` (a group it has not caught up
-/// with).
 fn named_front(app: &mut App, wid: WindowId, fresh: i32, named: i32, program: &str) {
     let session = app.front_terminal(wid).expect("terminal").session;
     app.session_factory.fg_probe = |master| master;
@@ -63,9 +53,6 @@ fn sweep_sees_cwd(app: &App, wid: WindowId, pgid: i32) {
         .witness_cwd_report(seq, pgid);
 }
 
-/// `dir` as the path of an OSC 7 `file://` URI, as a shell reports it: the
-/// path itself, or on Windows `/C:/Users/…` (forward slashes, a leading `/`,
-/// no `\\?\` prefix).
 fn uri_path(dir: &std::path::Path) -> String {
     let text = dir.display().to_string();
     if cfg!(windows) {
@@ -76,9 +63,6 @@ fn uri_path(dir: &std::path::Path) -> String {
     }
 }
 
-/// A scratch project (`src/foo.rs`, `src/sub/`) and a headless App whose
-/// session's shell reported it as its directory (OSC 7), with `row` printed
-/// and the shell (`zsh`) in front.
 fn app_with(row: &str) -> (App, WindowId, aterm_tempfile::TempDir, std::path::PathBuf) {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let root = std::fs::canonicalize(dir.path()).expect("canonical");
@@ -107,8 +91,6 @@ pub(super) fn hover(app: &mut App, wid: WindowId, row: u16, col: u16) -> bool {
     app.windows[&wid].hover_pointer
 }
 
-/// Compose the fill, strip, and caption, then model an accepted present for
-/// these App routing fixtures.
 fn band(app: &mut App, wid: WindowId) -> String {
     assert!(
         app.prepare_terminal_capture_grid_with_cursor_fx(
@@ -205,9 +187,6 @@ fn cmd_click_on_a_citation_opens_aterms_editor_at_its_line() {
     assert_eq!(editor.status.as_deref(), Some("Line 3"));
 }
 
-/// On a DEC double-width line grid column `c` is painted at cells `2c` and
-/// `2c + 1`: the press reads the citation painted under the pointer, as the
-/// hand does, not the grid column the painted cell's number names.
 #[test]
 fn a_citation_on_a_double_width_line_opens_from_where_it_is_painted() {
     let (mut app, wid, _dir, root) = app_with("\x1b#6src/foo.rs:3 x");
@@ -224,7 +203,6 @@ fn a_citation_on_a_double_width_line_opens_from_where_it_is_painted() {
     );
 }
 
-/// The canonical file the standing caption names, if it names a citation.
 fn captioned(app: &App, wid: WindowId) -> Option<std::path::PathBuf> {
     app.windows[&wid]
         .hover_memo
@@ -233,18 +211,11 @@ fn captioned(app: &App, wid: WindowId) -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
-/// Feed `bytes` to the front session's engine, with no frame after it: what
-/// the caption drew is still what stands.
 fn feed(app: &App, wid: WindowId, bytes: &[u8]) {
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     term_lock(&term).process(bytes);
 }
 
-/// The press opens only what the DRAWN caption named. The session's
-/// directory moves under a still pointer (an OSC 7, no output, no frame): the
-/// caption drawn still names the first project's `src/foo.rs`, a fresh
-/// resolution names the second's, and that press opens nothing; the caption
-/// is asked again.
 #[test]
 fn a_press_opens_only_the_file_the_drawn_caption_named() {
     let (mut app, wid, _dir, root) = app_with("error: src/foo.rs:3:2 here");
@@ -305,9 +276,6 @@ fn a_press_opens_only_the_file_the_drawn_caption_named() {
     );
 }
 
-/// A citation never opens unseen: a press with no caption drawn for the cell
-/// (the look came back after the frame, no frame yet) opens nothing and asks
-/// the caption.
 #[test]
 fn a_citation_never_opens_before_its_caption_is_drawn() {
     let (mut app, wid, _dir, _root) = app_with("error: src/foo.rs:3:2 here");
@@ -319,10 +287,6 @@ fn a_citation_never_opens_before_its_caption_is_drawn() {
     assert!(app.open_link_under_pointer(wid), "drawn, it opens");
 }
 
-/// The rule the press is held to, arm by arm ([`crate::app_mouse::caption_admits`]):
-/// a citation only under a caption that named its file, line and column; a
-/// URL under a caption only when it is the URL the caption named, and under
-/// no caption only a plain-text one.
 #[test]
 fn a_press_opens_only_what_the_caption_named() {
     use crate::app_mouse::{CaptionNames, PressedUrl, caption_admits};
@@ -397,9 +361,6 @@ fn a_press_opens_only_what_the_caption_named() {
     assert!(caption_admits(None, None, None), "nothing to open");
 }
 
-/// A URL press under a drawn caption opens only the URL the caption named:
-/// the program re-points the cell's OSC 8 link between the frame and the
-/// press, and the press opens nothing.
 #[test]
 fn a_url_press_opens_only_the_url_the_drawn_caption_named() {
     let (mut app, wid, _dir, _root) =
@@ -616,9 +577,6 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     app.pool.sessions.get_mut(&session).unwrap().session.master = -1;
 }
 
-/// Where no foreground group can be read (a ConPTY), the shell's own
-/// integration is the reading: at its prompt, or running a bare shell or an
-/// agent by its command's word.
 #[test]
 fn with_no_foreground_group_the_shells_own_reading_stands_in() {
     use crate::app_mouse::shell_reads_local;
@@ -682,10 +640,6 @@ fn a_url_over_a_citation_still_wins_and_a_refused_scheme_opens_nothing() {
     assert!(app.active_native_view(wid).is_none());
 }
 
-/// A driver's `pointer mods` holds its Cmd only until the person's own input:
-/// their next key or click reads the modifiers they really hold, so a scripted
-/// link modifier never turns a typed `v` into Cmd-V or a plain click into a
-/// Cmd-click.
 #[test]
 fn a_scripted_modifier_ends_at_the_persons_next_input() {
     use crate::app_mouse::PointerAction;
@@ -710,9 +664,6 @@ fn a_scripted_modifier_ends_at_the_persons_next_input() {
     assert_eq!(app.windows[&wid].mods, M::ALT);
 }
 
-/// A composed or captured caption is not a present receipt. The helper is
-/// the one the shipping present wrapper uses; these are captured outcomes,
-/// with no App, render target, capture, or display involved.
 #[test]
 fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     use crate::app_mouse::{CaptionNames, ShownCaption, commit_presented_caption};
@@ -765,10 +716,6 @@ fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     assert!(held, "LINK_CAPTION_COMMITTED_WITHOUT_AN_ACCEPTED_PRESENT");
 }
 
-/// A citation's hover refused while a build held the front comes back under a
-/// still pointer once the sweep names the shell again
-/// (`App::reask_renamed_hovers`, which the status sweep calls), with no output
-/// and no motion, and the first press under the caption opens.
 #[test]
 fn a_citation_refused_under_a_build_comes_back_when_the_shell_is_named() {
     let (mut app, wid, _dir, _root) = app_with("error: src/foo.rs:3:2 here");

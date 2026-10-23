@@ -100,16 +100,16 @@ fn guard_of(word: &str) -> Option<Guard> {
 #[must_use]
 pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> Vec<Replayed> {
     let mut books = Books::default();
-    let mut said: [Option<SaidVerdict>; 2] = [None; 2];
+    let mut said: [Option<SaidVerdict>; RuleId::COUNT] = [None; RuleId::COUNT];
     let mut out = Vec::new();
     for row in rows.iter().filter(|row| row.at >= from_ms) {
         let at = row.at;
         let Some(span) = spans.iter().find(|span| span.stands_at(at)) else {
-            said = [None; 2];
+            said = [None; RuleId::COUNT];
             continue;
         };
         if books.hold_since_ms() != Some(span.since_ms) {
-            said = [None; 2];
+            said = [None; RuleId::COUNT];
         }
         books.hold(span.since_ms);
         let hold = HoldSeen {

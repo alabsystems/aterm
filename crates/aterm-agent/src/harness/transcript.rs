@@ -46,8 +46,6 @@ const USAGE: Shape = Shape::Object(&[
     ),
 ]);
 
-/// A message's `usage` as the spend fold reads it ([`USAGE`]) and the step
-/// fold counts a vendor turn's tokens from it ([`STEPS`]).
 const MESSAGE_USAGE: Shape = Shape::Object(&[
     ("input_tokens", Shape::Scalar),
     ("output_tokens", Shape::Scalar),
@@ -93,13 +91,7 @@ const COMMAND_FIELDS: [Field; 7] = {
 };
 const COMMAND: Shape = Shape::Object(&COMMAND_FIELDS);
 const CONTENT_PART: Shape = Shape::Object(&[("type", Shape::Scalar), ("text", Shape::Scalar)]);
-/// A message's content: its parts' type and text, or the plain string.
 const CONTENT: Shape = Shape::Seq(&CONTENT_PART);
-/// A tool call or a tool's result as the approval loop reads it
-/// (`supervise::policy::box_call::pending_calls`): its kind, the call's id,
-/// its tool, the file it names and a Bash call's `command` (the rm breaker's
-/// too-many box is judged by it, `supervise::policy::box_command`), and the
-/// id of the call a result answers.
 const CALL_PART: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -114,11 +106,6 @@ const CALL_PART: Shape = Shape::Object(&[
         ]),
     ),
 ]);
-/// A row as the approval loop reads it for the calls still waiting on a
-/// result: its type, its own `uuid` and its `parentUuid` (the conversation's
-/// order, which a first turn's file does not keep), whether it is a
-/// subagent's, and its content's calls and results (a prompt's plain string
-/// kept as it is).
 const CALLS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("uuid", Shape::Scalar),
@@ -129,11 +116,6 @@ const CALLS: Shape = Shape::Object(&[
         Shape::Object(&[("content", Shape::Seq(&CALL_PART))]),
     ),
 ]);
-/// A call or a result as the flight fold reads it (`super::flight`): its
-/// kind, the call's id and tool, the id of the call a result answers and
-/// whether it answers with an error, and of the call's arguments only the
-/// two that bound how long it may run — its declared `timeout` and whether
-/// it went to the background.
 const FLIGHT_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -148,9 +130,6 @@ const FLIGHT_PART: Shape = Shape::Record(&[
         ]),
     ),
 ]);
-/// A row as the flight fold reads it: its type and time, its message's id and
-/// stop reason, and its content's [`FLIGHT_PART`]s (a prompt's plain string
-/// validated and read as null, never copied).
 const FLIGHT: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -163,12 +142,6 @@ const FLIGHT: Shape = Shape::Object(&[
         ]),
     ),
 ]);
-/// What is kept of a limit row's `quotaLimits`: whether the request was
-/// rejected, the reset it names, which of the account's limits it was, and
-/// what it says of the account's usage credits — whether they are on
-/// (`overageStatus`), why not (`overageDisabledReason`), when they come back
-/// (`overageResetsAt`) and whether they were in use (`isUsingOverage`), what
-/// the accounts recorder keeps of them (`upgrade::CreditsWord`).
 const QUOTA_LIMITS: Shape = Shape::Object(&[
     ("status", Shape::Scalar),
     ("resetsAt", Shape::Scalar),
@@ -222,9 +195,6 @@ const CONVERSATION: Shape = Shape::Object(&[
     ),
 ]);
 
-/// A tool call or a tool's result as the session log's step fold reads it
-/// (`harness::steps`): its kind, the call's id and tool, the id of the call
-/// a result answers and whether it failed.
 const STEP_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -232,16 +202,7 @@ const STEP_PART: Shape = Shape::Record(&[
     ("tool_use_id", Shape::Scalar),
     ("is_error", Shape::Scalar),
 ]);
-/// A message's content as the step fold keeps it: its parts, and nothing
-/// of a plain-string content (a prompt) or of a bare string among the
-/// parts, each read as null.
 const STEP_PARTS: Shape = Shape::Parts(&STEP_PART);
-/// What the step fold reads of every row (addendum A8): [`USAGE`]'s keys,
-/// the row's own id, its parent's, the vendor turn's (`promptId`), its
-/// meta and compaction flags, who asked (`origin.kind`), whether Claude Code
-/// began the turn of its own on a row with no `promptId` (`turnOrigin`,
-/// `scheduledTaskId`: `upgrade::begins_unnumbered_by`), and the build and
-/// effort that wrote it.
 const STEPS_BARE_FIELDS: [Field; 18] = [
     ("type", Shape::Scalar),
     ("subtype", Shape::Scalar),
@@ -270,8 +231,6 @@ const STEPS_BARE_FIELDS: [Field; 18] = [
     ),
 ];
 const STEPS_BARE: Shape = Shape::Object(&STEPS_BARE_FIELDS);
-/// [`STEPS_BARE`] and the content's parts ([`STEP_PARTS`]): for a row
-/// whose raw bytes hold a call's or a result's key (`steps::wants_parts`).
 const STEPS_FIELDS: [Field; 18] = {
     let mut fields = STEPS_BARE_FIELDS;
     fields[17] = (
@@ -287,8 +246,6 @@ const STEPS_FIELDS: [Field; 18] = {
 };
 const STEPS: Shape = Shape::Object(&STEPS_FIELDS);
 
-/// What the survey's excerpts read of a part ([`excerpt`]): its kind, a text
-/// part's text, a tool call's name and id, a tool result's call id.
 const EXCERPT_PART: [Field; 5] = [
     ("type", Shape::Scalar),
     ("text", Shape::Scalar),
@@ -313,12 +270,6 @@ const EXCERPT: Shape = Shape::Object(&[
     ),
 ]);
 
-/// What the worker's result reader keeps of a row (`super::result`): whose
-/// row it is and which message it belongs to (`uuid`, `sessionId`,
-/// `message.id` — Claude Code writes one row per content block, all under
-/// the message's one id), when it was written (`timestamp`: a turn begun
-/// after the done point is no turn of that done's), the flags that make it
-/// no one's words, and the text blocks.
 const EXCHANGE: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("uuid", Shape::Scalar),
@@ -339,9 +290,6 @@ const EXCHANGE: Shape = Shape::Object(&[
     ),
 ]);
 
-/// One token count of a Codex turn, in OpenAI's classes: `input_tokens`
-/// holds `cached_input_tokens`, and `output_tokens` holds
-/// `reasoning_output_tokens`.
 const CODEX_TOKENS: Shape = Shape::Object(&[
     ("input_tokens", Shape::Scalar),
     ("cached_input_tokens", Shape::Scalar),
@@ -351,11 +299,6 @@ const CODEX_TOKENS: Shape = Shape::Object(&[
     ("total_tokens", Shape::Scalar),
 ]);
 
-/// What the Codex spend fold reads of a rollout line
-/// (`harness::codex_rollout::TurnReader`): its stamp, a `session_meta`'s
-/// thread, fork parent and history mode, a `thread_settings_applied`'s
-/// thread, a `turn_context`'s model and service tier, and a `token_count`'s
-/// running total and last turn.
 const CODEX_SPEND: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -392,11 +335,6 @@ pub(crate) fn codex_spend(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexSpend>(line).map(|v| v.0)
 }
 
-/// What the Codex limits reader reads of a rollout's first line
-/// (`ai::codex_limits::opening_account`): its stamp, and of its
-/// `session_meta` the thread, its conversation, its fork parent, its history
-/// mode and the two ids the account key is made from (hashed by the reader,
-/// never kept).
 const CODEX_META: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -425,17 +363,12 @@ pub(crate) fn codex_meta(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexMeta>(line).map(|v| v.0)
 }
 
-/// One window of a `token_count`'s `rate_limits` slot.
 const CODEX_WINDOW: Shape = Shape::Object(&[
     ("used_percent", Shape::Scalar),
     ("window_minutes", Shape::Scalar),
     ("resets_at", Shape::Scalar),
 ]);
 
-/// What the Codex limits reader reads of a `token_count`
-/// (`ai::codex_limits::rollout_rate_limits`): its stamp and its
-/// `rate_limits`, every key Codex 0.163.0 writes there but
-/// `normal_model_slug` (design F10).
 const CODEX_LIMITS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -480,13 +413,6 @@ pub(crate) fn codex_limits(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<CodexLimits>(line).map(|v| v.0)
 }
 
-/// What the session log's Codex step fold reads of a rollout line
-/// (`harness::codex_steps`): its kind and stamp, and of its payload the
-/// kind, the thread a `session_meta` is (`id`), its fork parent and build,
-/// a `thread_settings_applied`'s thread, a turn's id, a call's id, tool and
-/// namespace, a `turn_context`'s model and effort, a turn's duration, the
-/// closed word of a turn's error (never its message), and a `token_count`'s
-/// running total and last turn.
 const CODEX_STEPS: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
     ("timestamp", Shape::Scalar),
@@ -639,7 +565,7 @@ pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<false>>(line).map(|v| v.0)
 }
 
-/// EVERY METADATA READ THE HARNESS MAKES OF ONE CLAUDE CODE TRANSCRIPT ROW: the row as each reader's shape above keeps it, in a fixed order (`None` where the line is no row that shape reads).
+/// Read all harness metadata projections from one Claude Code transcript row.
 #[must_use]
 pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
     [
@@ -658,7 +584,7 @@ pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
     .collect()
 }
 
-/// [`claude_reads`] for a Codex rollout's line: the spend fold's, the limits reader's (its first line and its `token_count`s) and the step fold's shapes.
+/// Read all harness metadata projections from one Codex rollout line ([`claude_reads`]).
 #[must_use]
 pub fn codex_reads(line: &str) -> Vec<Option<Value>> {
     [codex_spend, codex_meta, codex_limits, codex_steps]
@@ -743,9 +669,6 @@ impl<'de> Visitor<'de> for Shape {
 }
 
 impl Shape {
-    /// A scalar as this shape keeps it: as it is, but under
-    /// [`Shape::Parts`] and [`Shape::Record`], which keep only a list and
-    /// only an object.
     fn scalar(self, v: Value) -> Value {
         match self {
             Shape::Parts(_) | Shape::Record(_) => Value::Null,
@@ -754,7 +677,6 @@ impl Shape {
     }
 }
 
-/// Resolve a key without allocating a String for every discarded field.
 struct FieldName(&'static [Field]);
 
 impl<'de> DeserializeSeed<'de> for FieldName {

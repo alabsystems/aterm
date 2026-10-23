@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! HTTP client for routed, rate-recorded, and retried GitHub API calls.
 
@@ -59,7 +58,6 @@ impl Accept {
     }
 }
 
-/// A call's default body limit: 32 MiB.
 const CALL_LIMIT: u64 = 32 << 20;
 
 /// One request before routing.
@@ -254,9 +252,7 @@ pub struct Answered {
 
 impl Answered {
     /// The body as JSON.
-    ///
     /// # Errors
-    ///
     /// CouldNotRun, `Sub::Protocol`, why `GitHub's answer is not JSON: {e}`.
     pub fn json(&self) -> Result<aterm_json::Value> {
         aterm_json::from_slice(&self.body)
@@ -333,7 +329,6 @@ impl Meter {
     }
 }
 
-/// What a client shares between its clones.
 struct Inner {
     router: Router,
     transport: Arc<dyn Transport>,
@@ -484,15 +479,13 @@ impl GithubBuilder {
 
 impl Github {
     /// Execute a call and read its body whole.
-    ///
     /// # Errors
-    ///
     /// The routed, classified error. In M1, a `call.method` other than GET and HEAD is Refused
     /// `policy.method_not_read` before anything is routed, loaded or sent (plan §8, step 0). A call
-    /// with `hop` set is CouldNotRun `Protocol`, why `a hop is followed only by a streamed
-    /// call`, also before anything is routed: `Fx::gh` rewrites a CDN `Location`, so the hop
-    /// could only fail. The rate book is read and written for api-origin calls only (step
-    /// 2): the web and CDN origins do not spend the API budget.
+    /// with `hop` set is CouldNotRun `Protocol`, why `a hop is followed only by a streamed call`,
+    /// also before anything is routed: `Fx::gh` rewrites a CDN `Location`, so the hop could only
+    /// fail. The rate book is read and written for api-origin calls only (step 2): the web and CDN
+    /// origins do not spend the API budget.
     pub fn call(&self, call: &Call) -> Result<Answered> {
         method_gate(call)?;
         if call.hop {
@@ -508,9 +501,7 @@ impl Github {
     }
 
     /// Execute a call and stream its 2xx body.
-    ///
     /// # Errors
-    ///
     /// As `call`.
     pub fn call_stream(&self, call: &Call) -> Result<Streamed> {
         method_gate(call)?;
@@ -629,9 +620,7 @@ impl Github {
     }
 
     /// Return the repository's numeric ID from the memo or via `GET /repos/{o}/{r}`.
-    ///
     /// # Errors
-    ///
     /// That request's error; CouldNotRun `Protocol` when its answer holds no numeric `id`.
     pub fn repo_id(&self, slug: &Slug, route: &RouteRequest) -> Result<u64> {
         self.repo_id_counted(slug, route).map(|(id, _)| id)
@@ -704,26 +693,20 @@ impl std::fmt::Debug for Github {
     }
 }
 
-/// The most bytes of a failed answer's body read to classify it.
 const HEAD_MAX: u64 = 64 * 1024;
 
-/// Whether the body is read whole inside the door (`call`) or handed back unread
-/// (`call_stream`).
+/// Whether the body is read whole inside the door (`call`) or handed back unread (`call_stream`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reading {
     Whole,
     Stream,
 }
 
-/// A successful answer's body, in the form its pipeline reads it.
 enum Body {
     Whole(Vec<u8>),
     Stream(Box<dyn Read + Send>),
 }
 
-/// A streamed 2xx body held to the call's limit (plan §8 step 9). Byte `limit + 1` is an io error
-/// whose inner error is aterm-http's `TooLarge`, the error aterm-http's own limit gives, so
-/// `wire_kind_of` reads both alike.
 struct Bounded {
     inner: Box<dyn Read + Send>,
     limit: u64,
@@ -759,7 +742,6 @@ impl Read for Bounded {
     }
 }
 
-/// A successful answer, before it becomes an `Answered` or a `Streamed`.
 struct Got {
     status: u16,
     headers: Vec<(String, String)>,
@@ -774,8 +756,6 @@ struct Got {
 }
 
 impl Got {
-    /// The answer: `whole` is a `Reading::Whole` body, already read and held to the call's
-    /// limit (`Prepared::held`), and taken as it is; with none, the body streams.
     fn of(
         response: WireResponse,
         whole: Option<Vec<u8>>,
@@ -811,8 +791,6 @@ impl Got {
         }
     }
 
-    /// `call`'s answer. A streamed body is read whole here, and a read failure is the
-    /// call's error, as in `Prepared::held`, never a truncated answer.
     fn into_answered(self) -> Result<Answered> {
         let body = match self.body {
             Body::Whole(bytes) => bytes,
@@ -838,7 +816,6 @@ impl Got {
         })
     }
 
-    /// `call_stream`'s answer.
     fn into_streamed(self) -> Streamed {
         let body: Box<dyn Read + Send> = match self.body {
             Body::Whole(bytes) => Box::new(std::io::Cursor::new(bytes)),
@@ -855,21 +832,18 @@ impl Got {
     }
 }
 
-/// What the router decided, ready to send.
 struct Decided {
     identity: IdentityRef,
     cred: Option<Arc<Credential>>,
     covers_all_repos: bool,
 }
 
-/// One request, built once and sent on each attempt.
 struct Prepared {
     method: Method,
     url: String,
     headers: Vec<(String, String)>,
     auth: Option<AuthHeader>,
-    /// Who the request is sent as: the decided identity when the door gave it a
-    /// credential, else anonymous (the web and CDN origins, whatever was routed).
+    /// Who the request is sent as: the decided identity when the door gave it a credential.
     as_: IdentityRef,
     /// The call's limit.
     limit: u64,
@@ -878,9 +852,6 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// The wire request this attempt sends. Its wire limit is at least `HEAD_MAX`, whole or
-    /// streamed, so a failed answer's body is read to classify it even under a small call
-    /// limit (a file or an asset shorter than GitHub's error JSON).
     fn request(&self) -> WireRequest<'_> {
         WireRequest {
             method: self.method,
@@ -893,9 +864,6 @@ impl Prepared {
         }
     }
 
-    /// An answer the call takes, held to the call's limit: a whole body longer than `limit`
-    /// is the wire's `TooLarge` at `Answered`, exactly as a wire read under that limit would
-    /// have answered it; a stream is held as it is read (`Got::of`).
     fn held(&self, response: &mut WireResponse) -> std::result::Result<Option<Vec<u8>>, WireError> {
         match self.reading {
             Reading::Whole => response.read_body(self.limit).map(Some),
@@ -904,29 +872,23 @@ impl Prepared {
     }
 }
 
-/// What a failed answer leaves to the send loop.
 enum Flow {
     /// A later step (a move, a hop) produced the answer.
     Done(Box<Got>),
-    /// The error, for `should_retry`, and the requests a later step (the hop) sent beyond
-    /// the attempt's own.
+    /// The error.
     Retry(Error, u32),
 }
 
-/// The exchange a classified error came from.
 struct Exchange<'a> {
     status: u16,
     headers: &'a [(String, String)],
     rate: Option<RateSnapshot>,
 }
 
-/// The statuses that are the answer: 2xx and 304 for `call` (plan §8 step 4), 2xx only for
-/// `call_stream` (a `Streamed` is a 2xx, plan §4.6.17).
 fn is_success(status: u16, reading: Reading) -> bool {
     (200..300).contains(&status) || (status == 304 && reading == Reading::Whole)
 }
 
-/// The repository a route is about.
 const fn repo_of(route: &RouteRequest) -> Option<&Slug> {
     match &route.target {
         RouteTarget::Repo(slug) => Some(slug),
@@ -934,8 +896,6 @@ const fn repo_of(route: &RouteRequest) -> Option<&Slug> {
     }
 }
 
-/// A redirect agh does not follow: `error` (the 3xx's, its status, request id and rate kept)
-/// recast as CouldNotRun `Sub::Protocol` with `why` and the kind's next.
 fn protocol_error(error: Error, why: String) -> Error {
     error
         .recast(Kind::CouldNotRun, why)
@@ -943,8 +903,6 @@ fn protocol_error(error: Error, why: String) -> Error {
         .with_next(Kind::CouldNotRun.next_action())
 }
 
-/// What follows `prefix` in `path`, matched ASCII case-insensitively, when the prefix ends at
-/// a segment boundary.
 fn after_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     crate::wire::strip_prefix_ci(path, prefix)
         .filter(|rest| rest.is_empty() || rest.starts_with(['/', '?']))
@@ -974,7 +932,6 @@ pub(crate) fn method_refusal(method: Method, repo: Option<&Slug>) -> Error {
     .into_error(repo)
 }
 
-/// Step 0: in M1 only GET and HEAD are routed, loaded or sent.
 fn method_gate(call: &Call) -> Result<()> {
     if call.method.is_read() {
         Ok(())
@@ -983,9 +940,6 @@ fn method_gate(call: &Call) -> Result<()> {
     }
 }
 
-/// A failed answer's kept headers and the first 64 KiB of its body. A read that fails part
-/// way (a body cut short) is classified on the bytes it read: `read_to_end` keeps them, and
-/// the status and headers alone still classify the answer.
 fn head_of(response: WireResponse) -> (Vec<(String, String)>, Vec<u8>) {
     let WireResponse { headers, body, .. } = response;
     let mut head = Vec::new();
@@ -995,7 +949,6 @@ fn head_of(response: WireResponse) -> (Vec<(String, String)>, Vec<u8>) {
     (headers, head)
 }
 
-/// The id of a `Location` on the api origin of the form `/repositories/{digits}…`.
 fn moved_id(location: &str, endpoints: &Endpoints) -> Option<u64> {
     let (origin, path_and_query) = Origin::parse(location)?;
     if &origin != endpoints.api() {
@@ -1007,7 +960,6 @@ fn moved_id(location: &str, endpoints: &Endpoints) -> Option<u64> {
 }
 
 impl Github {
-    /// The decided profile's cached credential.
     fn credential(&self, profile: &str) -> Option<Arc<Credential>> {
         match self
             .inner
@@ -1021,7 +973,6 @@ impl Github {
         }
     }
 
-    /// Step 1: the route.
     fn route(&self, route: &RouteRequest) -> Result<Decided> {
         match self.decide(route) {
             Decision::Send { profile, .. } => {
@@ -1059,7 +1010,6 @@ impl Github {
         }
     }
 
-    /// The meter, locked.
     fn lock_meter(&self) -> std::sync::MutexGuard<'_, Meter> {
         self.inner
             .meter
@@ -1067,7 +1017,6 @@ impl Github {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Step 3: the headers, the credential, the URL and the deadlines.
     fn prepare(&self, call: &Call, decided: &Decided, reading: Reading) -> Prepared {
         let endpoints = &self.inner.endpoints;
         let mut headers = vec![
@@ -1109,7 +1058,6 @@ impl Github {
         }
     }
 
-    /// One round trip through the seam, counted in the meter.
     fn send(&self, prepared: &Prepared) -> Result<std::result::Result<WireResponse, WireError>> {
         {
             let mut meter = self.lock_meter();
@@ -1127,8 +1075,6 @@ impl Github {
         }
     }
 
-    /// Step 8: the exchange, the identity (who the request was sent as) and the repository on
-    /// an error.
     fn finish_error(
         &self,
         error: Error,
@@ -1156,15 +1102,11 @@ impl Github {
         error
     }
 
-    /// Steps 2 to 7 for one routed call: the rate book, the send loop, the classification,
-    /// moves, the hop and the 404 rules.
     fn run(&self, call: &Call, decided: &Decided, reading: Reading) -> Result<Got> {
         let mut sent = 0;
         self.run_counted(call, decided, reading, &mut sent)
     }
 
-    /// `run`, leaving in `sent` the requests it sent, whatever it answers: the 404 probe's
-    /// failure is retried as the call's own (step 4), with its request counted.
     fn run_counted(
         &self,
         call: &Call,
@@ -1284,7 +1226,6 @@ impl Github {
     }
 }
 
-/// A failed answer, classified, for steps 5 to 7.
 struct Failed<'a> {
     status: u16,
     headers: &'a [(String, String)],
@@ -1294,7 +1235,6 @@ struct Failed<'a> {
 }
 
 impl Github {
-    /// Steps 5 to 7: a move, the hop, the 404 rules; any other error goes to the retry rule.
     fn judge(
         &self,
         call: &Call,
@@ -1336,9 +1276,6 @@ impl Github {
         }
     }
 
-    /// Step 5: follow a 301 to `/repositories/{id}` once. The id is looked up anonymously,
-    /// the original access is routed again for the new slug, and the request is issued once
-    /// more under `/repos/{new}` with `follow_moved` off.
     fn follow_move(
         &self,
         call: &Call,
@@ -1407,8 +1344,6 @@ impl Github {
         Ok(got)
     }
 
-    /// Step 6: the one hop, sent with no credential (`hop::rebuild`). Its 2xx is the answer;
-    /// another redirect is CouldNotRun `Protocol`; any other status is classified.
     fn hop(
         &self,
         call: &Call,
@@ -1488,7 +1423,6 @@ impl Github {
         Ok(Flow::Retry(error, 1))
     }
 
-    /// Step 7: a 404 on a `Repo(slug)` target (design §7.3).
     fn judge_404(
         &self,
         call: &Call,

@@ -23,11 +23,9 @@ pub const FIRST_POLICY_FOLLOWING_BUILD: u64 = 1_790_585_188;
 /// `[[ranges]]`: the rescues, one table each ([`Rescue`]).
 const RANGES_KEY: &str = "ranges";
 
-/// `[[retired]]`: the cutter's record of the rescues retired ([`Retired`]); a
-/// producer ignores it like any key it does not know.
+/// `[[retired]]`: the cutter's record of the rescues retired ([`Retired`]).
 const RETIRED_KEY: &str = "retired";
 
-/// Every top-level key schema v1 defines.
 const KNOWN_KEYS: [&str; 6] = [
     "schema",
     "applies_to_producers",
@@ -37,17 +35,13 @@ const KNOWN_KEYS: [&str; 6] = [
     RETIRED_KEY,
 ];
 
-/// Every key a `[[ranges]]` table defines.
 const RESCUE_KEYS: [&str; 4] = ["producers", "carry", "park_quiet_gate_at_land", "reason"];
 
-/// Every key a `[[retired]]` table holds, all of them required.
 const RETIRED_KEYS: [&str; 3] = ["producers", "reason", "date"];
 
-/// Keys no reader implements, refused by the cutter by name.
 const RESERVED_KEYS: [&str; 1] = ["seamless"];
 
-/// The `retire = { producers, reason }` spelling `[[retired]]` replaced, refused by
-/// the cutter with the spelling that replaced it.
+/// Legacy `retire` key refused by the cutter in favor of `[[retired]]`.
 const RETIRE_KEY: &str = "retire";
 
 /// Maximum screen-carry fidelity rung allowed for a producer (`Full < Visible < Repaint`).
@@ -145,8 +139,6 @@ impl HandoffPolicy {
         Self::of_table(&table_of(text)?, false)
     }
 
-    /// The top-level keys of `table`; `strict` is the cutter's read, which also
-    /// refuses a reserved key and any key schema v1 does not define.
     fn of_table(table: &aterm_toml::Table, strict: bool) -> Result<Self, String> {
         if strict {
             if let Some(key) = table
@@ -218,9 +210,6 @@ impl HandoffPolicy {
         self.park_quiet_gate_at_land == Some(LandQuietGate::Relaxed)
     }
 
-    /// What a producer follows when several policies name it, over `range`: the
-    /// most conservative of each knob — the highest carry ceiling, the `Land` gate
-    /// relaxed when any relaxes it.
     fn combined<'a>(policies: impl IntoIterator<Item = &'a Self>, range: ProducerRange) -> Self {
         let mut out = Self {
             applies_to_producers: Some(range),
@@ -244,7 +233,6 @@ impl HandoffPolicy {
     }
 
     /// Verify that a non-empty policy covers at least one build in `handing_over`.
-    ///
     /// # Errors
     /// Returns a refusal message if the policy range misses builds or exceeds the newest build.
     pub fn names_producers(&self, handing_over: &[u64]) -> Result<(), String> {
@@ -281,8 +269,6 @@ impl HandoffPolicy {
         Ok(())
     }
 
-    /// This policy as the top-level lines a file writes for it, for a refusal that
-    /// says what to write: the range, and each knob that asks anything.
     fn as_lines(&self) -> String {
         let mut lines = Vec::new();
         if let Some(range) = self.applies_to_producers {
@@ -334,9 +320,6 @@ pub struct Rescue {
 }
 
 impl Rescue {
-    /// The `ranges` key's value read as a list of rescues. `strict` is the
-    /// cutter's read: no key a table does not define, a reason, and a knob that
-    /// asks something.
     fn list_of(value: &aterm_toml::Value, strict: bool) -> Result<Vec<Self>, String> {
         let tables = value
             .as_array()
@@ -432,9 +415,8 @@ impl PolicyFile {
     }
 
     /// Strictly parse and validate a checked-in policy file for release cutting.
-    ///
     /// # Errors
-    /// Returns a refusal string on unknown keys, invalid `[[ranges]]`/`[[retired]]`, hull mismatch, or overlap.
+    /// Returns a refusal string on unknown keys, invalid entries, hull mismatch, or overlap.
     pub fn parse_for_cut(text: &str) -> Result<Self, String> {
         let table = table_of(text)?;
         let legacy = HandoffPolicy::of_table(&table, true)?;
@@ -533,7 +515,6 @@ impl PolicyFile {
     }
 
     /// Return the active [`Rescue`] entries in the file.
-    ///
     /// # Errors
     /// Returns an error if `[[ranges]]` is [`Ranges::Unreadable`].
     pub fn rescues(&self) -> Result<Vec<Rescue>, String> {
@@ -552,7 +533,6 @@ impl PolicyFile {
     }
 
     /// Validate [`HandoffPolicy::names_producers`] across every rescue in the file.
-    ///
     /// # Errors
     /// Returns the first rescue whose producer range fails validation.
     pub fn names_producers(&self, handing_over: &[u64]) -> Result<(), String> {
@@ -574,7 +554,6 @@ impl PolicyFile {
     }
 
     /// Verify that every build and constraint in an earlier `sealed` rescue is still covered.
-    ///
     /// # Errors
     /// Returns a refusal naming the first build in `sealed` whose coverage was dropped or weakened.
     pub fn keeps(&self, sealed: &HandoffPolicy) -> Result<(), String> {
@@ -669,12 +648,10 @@ pub struct Retired {
 }
 
 impl Retired {
-    /// The one shape a `[[retired]]` table takes, for a refusal.
     const SHAPE: &str = "`producers = [min_build, max_build]`, `reason = \"why no build in \
                          that range needs the rescue\"`, `date = \"YYYY-MM-DD\"`";
 
     /// Strictly parse the `[[retired]]` table list for release cutting.
-    ///
     /// # Errors
     /// Returns an error if the TOML or any `[[retired]]` entry is invalid.
     pub fn parse_for_cut(text: &str) -> Result<Vec<Self>, String> {
@@ -732,8 +709,6 @@ impl Retired {
     }
 }
 
-/// Whether `text` is a `YYYY-MM-DD` date with a month from 1 to 12 and a day
-/// from 1 to 31.
 fn is_calendar_date(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
@@ -750,7 +725,6 @@ fn is_calendar_date(text: &str) -> bool {
         && digits(8..10).is_some_and(|day| (1..=31).contains(&day))
 }
 
-/// `text` parsed as TOML whose root is a table.
 fn table_of(text: &str) -> Result<aterm_toml::Table, String> {
     match aterm_toml::from_str(text).map_err(|error| format!("not TOML: {error}"))? {
         aterm_toml::Value::Table(table) => Ok(table),
@@ -758,7 +732,6 @@ fn table_of(text: &str) -> Result<aterm_toml::Table, String> {
     }
 }
 
-/// The two knobs of a table — the top level, or one `[[ranges]]` table.
 fn knobs_of(
     table: &aterm_toml::Table,
 ) -> Result<(Option<CarryCeiling>, Option<LandQuietGate>), String> {
@@ -783,7 +756,6 @@ fn knobs_of(
     Ok((carry, park_quiet_gate_at_land))
 }
 
-/// `key`'s `[min_build, max_build]`.
 fn parse_range(key: &str, value: &aterm_toml::Value) -> Result<ProducerRange, String> {
     let wrong = || format!("`{key}` is {value}, not [min_build, max_build]");
     let array = value.as_array().ok_or_else(wrong)?;
@@ -847,14 +819,10 @@ enum ReadFailure {
     /// A fact about the file: not a regular file, too large, not UTF-8, or an error the same
     /// file would give again.
     File(String),
-    /// A fact about this moment ([`is_momentary`]): the bytes were never reached.
+    /// A fact about this moment ([`is_momentary`]).
     Moment(String),
 }
 
-/// Whether an I/O error says the system could not serve the read just then, not
-/// that the file is unreadable: out of descriptors (`EMFILE`, `ENFILE`), out of
-/// memory or buffers (`ENOMEM`, `ENOBUFS`), a device error (`EIO`), an interrupted
-/// or would-block call (`EINTR`, `EAGAIN`).
 fn is_momentary(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     if matches!(
@@ -892,8 +860,6 @@ fn unreadable(error: &std::io::Error) -> ReadFailure {
     }
 }
 
-/// `Ok(None)` when there is no file at all; `Err` for one that cannot be read as a small
-/// regular UTF-8 file.
 fn read_bounded(path: &Path) -> Result<Option<String>, ReadFailure> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -1054,7 +1020,6 @@ mod tests {
         );
     }
 
-    /// Only `Full` carries scrollback, and a greater ceiling asks for less.
     #[test]
     fn only_a_full_ceiling_carries_scrollback_and_greater_is_more_conservative() {
         assert!(CarryCeiling::Full.carries_scrollback());
@@ -1069,8 +1034,6 @@ mod tests {
         );
     }
 
-    /// A producer ignores unknown keys (a reserved `seamless`, an unknown key in a
-    /// `[[ranges]]` table); the cutter refuses all of them.
     #[test]
     fn unknown_keys_are_ignored_by_a_producer_and_refused_by_the_cutter() {
         let text = "schema = 1\ncarry = \"visible\"\nsome_future_knob = 3\n[future]\nx = 1\n";
@@ -1103,8 +1066,6 @@ mod tests {
         );
     }
 
-    /// The cutter refuses a knob outside `[[ranges]]` and a table with no range, no reason or
-    /// nothing asked; a producer still reads an unranged top-level knob as every build.
     #[test]
     fn the_cutter_refuses_a_knob_that_is_not_a_rescue_with_its_builds_and_reason() {
         for loose in [
@@ -1162,8 +1123,6 @@ mod tests {
         }
     }
 
-    /// Builds 100-199 panic in their capture (repaint), builds 250-299 never open their `Land`
-    /// gate (relaxed): two rescues under their hull.
     const RESCUE_A: &str =
         "[[ranges]]\nproducers = [100, 199]\ncarry = \"repaint\"\nreason = \"capture panics\"\n";
     const RESCUE_B: &str = "[[ranges]]\nproducers = [250, 299]\npark_quiet_gate_at_land = \
@@ -1179,8 +1138,6 @@ mod tests {
         PolicyFile::parse(text).unwrap_or_else(|why| panic!("{text:?}: {why}"))
     }
 
-    /// The hull: lowest `min` to highest `max`, highest ceiling, the gate relaxed if any
-    /// rescue relaxes it.
     #[test]
     fn the_top_level_keys_beside_ranges_are_the_hull_of_the_rescues() {
         let Ranges::Listed(rescues) = file(&two_rescues()).ranges else {
@@ -1226,9 +1183,6 @@ mod tests {
         }
     }
 
-    /// A `[[ranges]]` reader follows only the rescues naming its build: one range's knobs
-    /// alone, the more conservative of each knob under an overlap, and nothing in a gap or
-    /// outside them all.
     #[test]
     fn a_producer_that_reads_ranges_follows_only_the_rescues_naming_its_build() {
         let overlap = "[[ranges]]\nproducers = [180, 260]\ncarry = \"visible\"\nreason = \"x\"\n";
@@ -1275,9 +1229,6 @@ mod tests {
         );
     }
 
-    /// Producers from v0.97.0 to v0.100.0 read the file with [`HandoffPolicy::parse`] (this
-    /// code) and ignore `ranges` and `retired`, so each in a rescued range carries at least
-    /// what its rescue asks, and one in a gap carries less: a degrade, never a refusal.
     #[test]
     fn a_producer_before_ranges_reads_the_hull_and_is_never_refused() {
         let text = format!(
@@ -1314,7 +1265,6 @@ mod tests {
         ));
     }
 
-    /// A list this build cannot read leaves it on the hull, never the whole file ignored.
     #[test]
     fn a_ranges_list_this_build_cannot_read_leaves_it_on_the_hull() {
         for unreadable in [
@@ -1335,8 +1285,6 @@ mod tests {
         }
     }
 
-    /// The cutter reads `[[retired]]` strictly (a range, a reason and a date, nothing else); a
-    /// producer ignores it.
     #[test]
     fn a_retirement_is_read_strictly_by_the_cutter_and_ignored_by_a_producer() {
         let entry = "[[retired]]\nproducers = [10, 20]\nreason = \"all past EOL\"\ndate = \
@@ -1398,7 +1346,6 @@ mod tests {
         );
     }
 
-    /// Anything a v1 reader cannot interpret ignores the whole file, saying why.
     #[test]
     fn a_malformed_policy_is_refused_whole_and_says_why() {
         for (text, why) in [
@@ -1438,9 +1385,6 @@ mod tests {
         }
     }
 
-    /// A later policy keeps what an earlier one sealed (the same or a wider range, a ceiling
-    /// no less conservative, the gate still relaxed); each drop is refused by name, and a
-    /// sealed policy that asks nothing binds nothing.
     #[test]
     fn a_later_policy_keeps_every_knob_an_earlier_one_sealed() {
         let sealed = policy("schema = 1\napplies_to_producers = [10, 20]\ncarry = \"visible\"\n");
@@ -1498,8 +1442,6 @@ mod tests {
         }
     }
 
-    /// A sealed rescue is kept build by build by the ranges a producer reads: split, inside a
-    /// wider one, or under an overlap asking more.
     #[test]
     fn a_sealed_rescue_is_kept_build_by_build_through_any_ranges_that_cover_it() {
         let sealed = policy(
@@ -1627,7 +1569,6 @@ mod tests {
         );
     }
 
-    /// A scratch `.app` root with the policy file written as `write` says.
     fn scratch_bundle(label: &str, write: impl FnOnce(&Path)) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "aterm-handoff-policy-{label}-{}",

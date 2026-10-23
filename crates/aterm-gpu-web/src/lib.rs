@@ -49,14 +49,10 @@ use aterm_render::{RenderInput, Renderer, SpillBand, Theme};
 /// aterm-gui and aterm-wasm.
 const INLINE_REFLOW_MAX_LINES: usize = 20_000;
 
-/// Safety net for a host that never pumps: after this many `render` /
-/// `render_offscreen` calls with a stashed rewrap (~2 s at 60 fps), each frame
-/// runs one budgeted step.
+/// `render` / `render_offscreen` calls with a stashed rewrap before each frame runs one budgeted step.
 const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 
-/// Safety net for a host that never renders or pumps: past this lazy-buffer
-/// backlog, every `process` call pumps one budgeted step, so the rewrap
-/// converges in short tasks.
+/// Lazy-buffer backlog past which every `process` call pumps one budgeted step.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget in input history lines (tunable via
@@ -100,7 +96,7 @@ fn registered_font(handle: u32) -> Result<std::sync::Arc<Vec<u8>>, String> {
     })
 }
 
-/// Construction is split to match the browser lifecycle: 1.
+/// WebGL2 terminal engine.
 #[cfg_attr(target_arch = "wasm32", export)]
 pub struct AtermGpuTerminal {
     term: Terminal,
@@ -212,9 +208,6 @@ impl AtermGpuTerminal {
             cpu.add_fallback_bytes(bytes)?;
         }
         if let Some(arc) = self.emoji_font.as_ref() {
-            // Already an interned Arc: install the shared blob rather than
-            // deep-copying the ~180 MB colour face per pane (wasm memory never
-            // shrinks).
             cpu.set_color_font_arc(std::sync::Arc::clone(arc))?;
         }
         if let Some(bytes) = self.bold_font.as_deref() {
@@ -264,9 +257,7 @@ impl AtermGpuTerminal {
         Some(key)
     }
 
-    /// Record the frame `build_frame` just produced as the one on glass. The
-    /// epoch in `key` was latched before `take_damage`, which re-arms but never
-    /// changes the epoch value, so an idle successor matches.
+    /// Record the frame `build_frame` just produced as the one on glass.
     #[inline]
     const fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
@@ -912,8 +903,7 @@ impl AtermGpuTerminal {
             || self.last_frame_key != Some(key)
     }
 
-    /// Render-tick safety net (see `REFLOW_PUMP_GRACE_RENDERS`): after the grace
-    /// window, one budgeted step per frame.
+    /// Pump one budgeted rewrap step per frame after [`REFLOW_PUMP_GRACE_RENDERS`].
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
@@ -927,8 +917,7 @@ impl AtermGpuTerminal {
         self.pump_reflow();
     }
 
-    /// Output safety net (see `REFLOW_BACKLOG_MAX_LINES`), called by `process`:
-    /// one budgeted step per call while staged output is past the cap.
+    /// Pump one budgeted rewrap step when staged output exceeds [`REFLOW_BACKLOG_MAX_LINES`].
     #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
@@ -1279,8 +1268,6 @@ impl AtermGpuTerminal {
             None,
         ));
         if presented.is_err() {
-            // The canvas did not receive this frame; drop the key so the
-            // host's retry draws.
             self.last_frame_key = None;
         }
         presented
@@ -1427,8 +1414,7 @@ mod tests {
 
     use super::*;
 
-    /// The bundled face, injected as a JS host would. Paste tests use it so a
-    /// security property is never skipped on a box with no system font.
+    /// The bundled face, injected as a JS host would.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// A link's columns and text come from the cells it is drawn in, whatever
@@ -2031,8 +2017,7 @@ mod tests {
         assert_eq!((bad.incomplete(), bad.match_count()), (false, 0));
     }
 
-    /// Reject an oversized frame before constructing or changing a grid. Existing
-    /// text, presentation state and pixels survive refused resize, chrome and zoom.
+    /// Reject an oversized frame before constructing or changing a grid.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {

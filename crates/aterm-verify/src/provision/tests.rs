@@ -595,7 +595,15 @@ fn an_unstamped_or_stale_copy_is_replaced() {
         State::Placed(dir.join("pwsh"))
     );
     assert!(!dir.join("stray").exists(), "the hand-laid copy went");
-    assert_eq!(names(&m.tooling), ["pwsh-7.6.7"]);
+    let aside: Vec<String> = names(&m.tooling)
+        .into_iter()
+        .filter(|n| n != "pwsh-7.6.7")
+        .collect();
+    assert!(
+        matches!(aside.as_slice(), [one] if one.starts_with(".replaced-pwsh-7.6.7-")),
+        "the hand-laid copy, which may be running, is kept aside: {aside:?}"
+    );
+    assert!(m.tooling.join(&aside[0]).join("tree/stray").exists());
     assert!(matches!(check(&row, &m, &Fake::new()), State::Present(_)));
 
     let mut stale = place::read_stamp(&dir).expect("the run's stamp");
@@ -1084,7 +1092,11 @@ fn a_browser_is_placed_where_the_lane_looks() {
         zip.len() as u64,
         "the fetch is capped at the pin's size"
     );
-    assert_eq!(names(&m.tooling), Vec::<String>::new(), "the scratch went");
+    let kept = names(&m.tooling);
+    assert!(
+        matches!(kept.as_slice(), [one] if one.starts_with(".replaced-chrome-headless-shell-")),
+        "the scratch went; the hand-laid copy, which may be running, is kept aside: {kept:?}"
+    );
     assert_eq!(names(&m.browser), ["chrome-headless-shell-0.0.1-mac-arm64"]);
 }
 

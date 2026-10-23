@@ -9,6 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{
     alloc, send_bool, send_bool_cls, send_bool_id, send_f64, send_id, send_id_id,
     send_id_idptr_usize, send_id_usize, send_id_usize_point_usize_f64_isize_id_id_id_bool_u16,
@@ -36,6 +39,8 @@ use crate::event::{
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use crate::platform::macos::OptionAsAlt;
 
+// LOCAL PATCH (aterm): the cursor is always visible; `set_cursor_visible`, its flag and the
+// invisible cursor it swapped in are gone.
 #[derive(Debug)]
 struct CursorState {
     cursor: Obj,
@@ -131,6 +136,9 @@ pub struct ViewState {
     forward_key_to_app: Cell<bool>,
 
     /// Option-as-Alt mapping configuration.
+    ///
+    /// LOCAL PATCH (aterm): upstream's option-as-alt (`WindowExtMacOS::set_option_as_alt`; read by
+    /// `replace_event`).
     option_as_alt: Cell<OptionAsAlt>,
 
     marked_text: RefCell<Obj>,
@@ -138,6 +146,7 @@ pub struct ViewState {
     _ns_window: WeakObj,
 }
 
+// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`, where upstream used objc2's.
 aterm_objc::declare_class! {
     /// The `NSView` this backend installs as every window's content view.
     pub(super) struct WinitView: NSView {
@@ -191,7 +200,9 @@ aterm_objc::declare_class! {
         @sel(resetCursorRects)
         fn reset_cursor_rects(&self) {
             trace_scope!("resetCursorRects");
-            // SAFETY: `self` is a live `WinitView`, hence a live `NSView`.
+            // SAFETY: `self` is a live `WinitView`, hence a live `NSView`. `-bounds` is
+            // `{CGRect=…}16@0:8` and `-addCursorRect:cursor:` is `v56@0:8{CGRect=…}16@48`; the
+            // cursor is borrowed for the call.
             unsafe {
                 let bounds = send_rect(self.as_id(), sel!(bounds));
                 let cursor_state = self.ivars().cursor_state.borrow();
@@ -283,7 +294,9 @@ aterm_objc::declare_class! {
                     .location
                     .saturating_add(selected_range.length)
                     .min(len);
-                // SAFETY: `-substringToIndex:` is `@24@0:8Q16`.
+                // SAFETY: `-substringToIndex:` is `@24@0:8Q16`; both indices are clamped to
+                // `-length` above, so neither raises `NSRangeException`, and the +0 results are
+                // measured before the pool pops.
                 autoreleasepool(|_| unsafe {
                     let sub_a = send_id_usize(string.id(), sel!(substringToIndex:), location);
                     let sub_b = send_id_usize(string.id(), sel!(substringToIndex:), end);
@@ -301,6 +314,8 @@ aterm_objc::declare_class! {
             trace_scope!("unmarkText");
             *self.ivars().marked_text.borrow_mut() = new_marked_text();
 
+            // LOCAL PATCH (aterm): the application hears the composition end before the send, so a
+            // contained raise in `-discardMarkedText` cannot leave a phantom preedit.
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
                 self.ivars().ime_state.set(ImeState::Ground);
@@ -308,7 +323,8 @@ aterm_objc::declare_class! {
                 tracing::warn!("Expected to have IME enabled when receiving unmarkText");
             }
 
-            // SAFETY: `-inputContext` `@16@0:8` (+0 borrowed).
+            // SAFETY: `-inputContext` `@16@0:8` (+0 borrowed);
+            // `-discardMarkedText` `v16@0:8` on `NSTextInputContext`.
             unsafe {
                 let input_context = send_id(self.as_id(), sel!(inputContext));
                 assert!(!input_context.is_null(), "input context");
@@ -352,7 +368,8 @@ aterm_objc::declare_class! {
                 origin: self.ivars().ime_position.get(),
                 size: self.ivars().ime_size.get(),
             };
-            // SAFETY: `-convertRect:toView:` is `{CGRect=…}56@0:8{CGRect=…}16@48` (`toView:` nil).
+            // SAFETY: `-convertRect:toView:` is `{CGRect=…}56@0:8{CGRect=…}16@48` (`toView:` nil);
+            // `-convertRectToScreen:` is `{CGRect=…}48@0:8{CGRect=…}16`.
             unsafe {
                 let in_window =
                     send_rect_rect_id(self.as_id(), sel!(convertRect:toView:), rect, Id::NIL);
@@ -364,7 +381,8 @@ aterm_objc::declare_class! {
         fn insert_text(&self, string: Id, _replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
 
-            // SAFETY: AppKit passes an `NSString` or `NSAttributedString` to this method.
+            // SAFETY: AppKit passes an `NSString` or `NSAttributedString` to this method; `-string`
+            // is `@16@0:8`, +0 autoreleased, and its bytes are copied before the pool pops.
             let string = autoreleasepool(|_| unsafe {
                 if send_bool_cls(string, sel!(isKindOfClass:), class(c"NSAttributedString")) {
                     seam::nsstring_to_rust(send_id(string, sel!(string)))
@@ -416,7 +434,9 @@ aterm_objc::declare_class! {
             let event = replace_event(event, self.ivars().option_as_alt.get());
 
             if self.ivars().ime_allowed.get() {
-                // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`.
+                // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24` (+0 autoreleased) and
+                // reads exactly the one live object pointer here; `-interpretKeyEvents:` is
+                // `v24@0:8@16`.
                 autoreleasepool(|_| unsafe {
                     let one = [event.id()];
                     let events_for_nsview = send_id_idptr_usize(
@@ -500,7 +520,11 @@ aterm_objc::declare_class! {
             let _mtm = self.mtm();
             trace_scope!("cancelOperation:");
 
-            // SAFETY: `+sharedApplication` `@16@0:8` (process-lifetime singleton).
+            // LOCAL PATCH (aterm): `-currentEvent` need not be a key event (the action can come
+            // from a menu or code), and the key getters raise on any other, so a nil or non-key
+            // event returns quietly where upstream asserted.
+            // SAFETY: `+sharedApplication` `@16@0:8` (process-lifetime singleton); `-currentEvent`
+            // `@16@0:8`, +0 and valid for this callback.
             let event = unsafe {
                 let app = send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
                 let event = send_id(app, sel!(currentEvent));
@@ -526,6 +550,8 @@ aterm_objc::declare_class! {
             });
         }
 
+        // LOCAL PATCH (aterm): no magnify, smart-magnify, rotate or pressure rows; AppKit passes
+        // those gestures up the responder chain.
         @sel(mouseDown:)
         fn mouse_down(&self, event: Id) {
             trace_scope!("mouseDown:");
@@ -610,7 +636,8 @@ aterm_objc::declare_class! {
             trace_scope!("scrollWheel:");
             self.mouse_motion(event);
 
-            // SAFETY: `-scrollingDeltaX`/`-scrollingDeltaY` are `d16@0:8`.
+            // SAFETY: `-scrollingDeltaX`/`-scrollingDeltaY` are `d16@0:8` and
+            // `-hasPreciseScrollingDeltas` is `B16@0:8`, all on `NSEvent`.
             let delta = {
                 let (x, y) = unsafe {
                     (
@@ -663,6 +690,7 @@ aterm_objc::declare_class! {
         @sel(acceptsFirstMouse:) @abort_on_exception
         fn accepts_first_mouse(&self, _event: Id) -> Bool {
             trace_scope!("acceptsFirstMouse:");
+            // LOCAL PATCH (aterm): always YES; `with_accepts_first_mouse` is gone.
             Bool::YES
         }
     }
@@ -694,7 +722,10 @@ impl WinitView {
         })
         .expect("couldn't create `WinitView`");
 
-        // SAFETY: `-setPostsFrameChangedNotifications:` is `v20@0:8B16`.
+        // SAFETY: `-setPostsFrameChangedNotifications:` is `v20@0:8B16`; `+defaultCenter` `@16@0:8`
+        // (process-lifetime singleton); `-addObserver:selector:name:object:` `v48@0:8@16:24@32@40`
+        // registers the observer unretained (the center holds it zeroing-weak);
+        // `NS_VIEW_FRAME_DID_CHANGE_NOTIFICATION` is a live global.
         unsafe {
             send_v_bool(this.as_id(), sel!(setPostsFrameChangedNotifications:), true);
             let notification_center =
@@ -722,8 +753,13 @@ impl WinitView {
     }
 
     /// `-firstResponder` is this view, so move the key view on.
+    ///
+    /// LOCAL PATCH (aterm): one body for upstream's `insertTab:`/`insertBackTab:`; the identity
+    /// test is `-isEqual:`, as objc2's `==` was.
     fn select_key_view(&self, which: Sel) {
-        // SAFETY: `-firstResponder` is `@16@0:8` on `NSWindow` and +0 borrowed.
+        // SAFETY: `-firstResponder` is `@16@0:8` on `NSWindow` and +0 borrowed; `-isEqual:` is
+        // `B24@0:8@16`; `which` is `-selectNextKeyView:` or `-selectPreviousKeyView:`, both
+        // `v24@0:8@16` on `NSWindow`.
         unsafe {
             let window = self.window();
             let first_responder = send_id(window.id(), sel!(firstResponder));
@@ -737,13 +773,20 @@ impl WinitView {
 
     /// Marked text length in UTF-16 code units.
     fn marked_text_length(&self) -> usize {
-        // SAFETY: the ivar holds a live `NSMutableAttributedString`.
+        // SAFETY: the ivar holds a live `NSMutableAttributedString`; `-length`
+        // is `Q16@0:8` on `NSAttributedString`.
         unsafe { send_usize(self.ivars().marked_text.borrow().id(), sel!(length)) }
     }
 
     /// Replace the tracking rect over the current frame and return that frame.
+    ///
+    /// LOCAL PATCH (aterm): one body for upstream's copies in `viewDidMoveToWindow` and
+    /// `frameDidChange:`.
     fn reset_tracking_rect(&self) -> CGRect {
-        // SAFETY: `-removeTrackingRect:` is `v24@0:8q16`.
+        // SAFETY: `-removeTrackingRect:` is `v24@0:8q16`, `-frame` `{CGRect=…}16@0:8`,
+        // `-addTrackingRect:owner:userData:assumeInside:` `q68@0:8{CGRect=…}16@48^v56B64`; the
+        // unretained owner is this view, which outlives the rect because it removes it, and
+        // `userData:` is null.
         unsafe {
             if let Some(tracking_rect) = self.ivars().tracking_rect.take() {
                 send_v_isize(self.as_id(), sel!(removeTrackingRect:), tracking_rect);
@@ -793,7 +836,7 @@ impl WinitView {
         })
     }
 
-    /// Current cursor icon as a retained `Obj`.
+    /// LOCAL PATCH (aterm): `Retained<NSCursor>` -> `Obj` both ways.
     pub(super) fn cursor_icon(&self) -> Obj {
         self.ivars().cursor_state.borrow().cursor.clone_retained()
     }
@@ -848,6 +891,9 @@ impl WinitView {
     }
 
     /// Last modifier state derived from an event.
+    ///
+    /// LOCAL PATCH (aterm): written before `ModifiersChanged` is queued; never a WindowServer probe
+    /// (the aterm-census guard `input-probe` bans the class-level flags query).
     pub(super) fn cached_modifiers(&self) -> ModifiersState {
         self.ivars().modifiers.get().state()
     }
@@ -861,7 +907,11 @@ impl WinitView {
         self.ivars().modifiers.set(current_modifiers);
 
         'send_event: {
-            // SAFETY: `-keyCode` is `S16@0:8` on `NSEvent` — an UNSIGNED short.
+            // LOCAL PATCH (aterm): `-keyCode` is read only for a flags-changed event. Upstream read
+            // it unconditionally, and AppKit raises on it for the mouse events `mouse_motion`
+            // passes here.
+            // SAFETY: `-keyCode` is `S16@0:8` on `NSEvent` — an UNSIGNED short; see `send_u16` —
+            // and it is only ever sent to the flags-changed event, which is a key event.
             let scancode = if is_flags_changed_event {
                 unsafe { send_u16(ns_event, sel!(keyCode)) }
             } else {
@@ -963,7 +1013,9 @@ impl WinitView {
     }
 
     fn mouse_motion(&self, event: Id) {
-        // SAFETY: `-locationInWindow` is `{CGPoint=dd}16@0:8`.
+        // SAFETY: `-locationInWindow` is `{CGPoint=dd}16@0:8`; `-convertPoint:fromView:`
+        // `{CGPoint=dd}40@0:8{CGPoint=dd}16@32`; `-frame` `{CGRect=…}16@0:8`. A nil `fromView:`
+        // means the window's base coordinates.
         let (window_point, view_point, frame) = unsafe {
             let window_point = send_point(event, sel!(locationInWindow));
             (
@@ -1007,7 +1059,8 @@ impl WinitView {
 /// # Safety
 /// `s` must be a live `NSString`.
 unsafe fn utf8_len(s: Id) -> usize {
-    // SAFETY: The caller pins `s` as a live `NSString`.
+    // SAFETY: The caller pins `s` as a live `NSString`; `-lengthOfBytesUsingEncoding:` is
+    // `Q24@0:8Q16`.
     unsafe {
         send_usize_usize(s, sel!(lengthOfBytesUsingEncoding:), consts::NS_UTF8_STRING_ENCODING)
     }
@@ -1023,7 +1076,7 @@ unsafe fn utf16_len(s: Id) -> usize {
 
 /// Creates an empty `+1` `NSMutableAttributedString`.
 fn new_marked_text() -> Obj {
-    // SAFETY: `+new` is `@16@0:8` and is in the `new` family.
+    // SAFETY: `+new` is `@16@0:8` and is in the `new` family, so the result is +1.
     unsafe { Obj::from_owned(send_id(class(c"NSMutableAttributedString").as_id(), sel!(new))) }
         .expect("+[NSMutableAttributedString new] to answer a string")
 }
@@ -1042,21 +1095,30 @@ fn mouse_button(event: Id) -> MouseButton {
 }
 
 /// Returns a `+1` key event, stripping Option characters when [`option_is_alt`] holds.
+///
+/// LOCAL PATCH (aterm): upstream's `replace_event`, which rebuilt any event; this one rebuilds only
+/// a key-down or key-up with non-empty `-charactersIgnoringModifiers` (the getters raise on
+/// anything else).
 fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
-    // SAFETY: `event` is the live `NSEvent` AppKit delivered.
+    // SAFETY: `event` is the live `NSEvent` AppKit delivered; `-type` and `-modifierFlags` are
+    // `Q16@0:8` and answer for every event type.
     let (kind, flags) =
         unsafe { (send_usize(event, sel!(type)), send_usize(event, sel!(modifierFlags))) };
     if !(10..=11).contains(&kind) || !option_is_alt(option_as_alt, flags) {
         return copy_event(event);
     }
     autoreleasepool(|_| {
-        // SAFETY: `event` is a key event, so `-charactersIgnoringModifiers` is `@16@0:8`.
+        // SAFETY: a key event (checked above) answers `-charactersIgnoringModifiers` (`@16@0:8`, +0
+        // autoreleased into this pool).
         let chars = unsafe { send_id(event, sel!(charactersIgnoringModifiers)) };
         // SAFETY: `chars` is nil or the live `NSString` just read.
         if chars.is_null() || unsafe { seam::nsstring_to_rust(chars) }.is_empty() {
             return copy_event(event);
         }
-        // SAFETY: the receiver is the `NSEvent` class.
+        // SAFETY: the receiver is the `NSEvent` class and the arguments match the selector's
+        // prototype: `context:` is nil, which AppKit allows, and the rest are read off the live
+        // key event through helpers matching each getter's prototype; the result is +0
+        // autoreleased into this pool.
         let rebuilt = unsafe {
             send_id_usize_point_usize_f64_isize_id_id_id_bool_u16(
                 class(c"NSEvent").as_id(),
@@ -1082,7 +1144,7 @@ fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
 
 /// A +1 copy of a key event (`replace_event` with nothing to rebuild).
 fn copy_event(event: Id) -> Obj {
-    // SAFETY: `-copy` is `@16@0:8` and is in the `copy` family.
+    // SAFETY: `-copy` is `@16@0:8` and is in the `copy` family, so the result is +1.
     unsafe { Obj::from_owned(send_id(event, sel!(copy))) }
         .expect("-[NSEvent copy] to answer an event")
 }

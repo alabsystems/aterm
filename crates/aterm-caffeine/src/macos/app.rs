@@ -340,7 +340,8 @@ struct TargetIvars {
 }
 
 aterm_objc::declare_class! {
-    /// What the mug's button.
+    /// What the mug's button, menu items, ticks, wake and state-file notifications and, as the
+    /// app's delegate, `-terminate:` send to.
     struct CaffeineTarget: NSObject {
         const NAME: &str = "ATermCaffeineTarget";
         type Ivars = TargetIvars;
@@ -537,7 +538,8 @@ fn quit_by_sigterm(sender: libc::pid_t) {
 
 /// The running application, which [`run`] made before any of this can be sent.
 fn shared_app() -> Id {
-    // SAFETY: `+sharedApplication` is `@16@0:8`.
+    // SAFETY: `+sharedApplication` is `@16@0:8`; every caller is on the main thread, and the app
+    // it answers (+0) lives as long as the process.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }
 
@@ -547,7 +549,8 @@ fn current_event() -> Option<EventKey> {
     if app.is_null() {
         return None;
     }
-    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or nil.
+    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or nil;
+    // on it `-type` and `-modifierFlags` are `Q16@0:8` and `-timestamp` `d16@0:8`.
     unsafe {
         let event = send_id(app, sel!(currentEvent));
         (!event.is_null()).then(|| EventKey {
@@ -564,6 +567,8 @@ type AttributeFn = unsafe extern "C-unwind" fn(Id, Sel, u32) -> Id;
 /// Whether the `-terminate:` AppKit asks about is the system's ([`SYSTEM_REASONS`]).
 fn terminate_is_the_systems() -> bool {
     // SAFETY: main-thread Foundation sends, inside `applicationShouldTerminate:`.
+    // `+sharedAppleEventManager` and `-currentAppleEvent` are `@16@0:8` and answer borrowed objects
+    // or nil; `AttributeFn` answers a borrowed descriptor or nil; `-enumCodeValue` is `I16@0:8`.
     let reason = autoreleasepool(|_| unsafe {
         let manager = send_id(
             class(c"NSAppleEventManager").as_id(),
@@ -600,7 +605,8 @@ type PerformInModesFn = unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id);
 fn common_modes() -> Option<Obj> {
     let mode = aterm_objc::ns_string(COMMON_MODES)?;
     let modes = [mode.id()];
-    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`.
+    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`; it reads `count` live, non-nil
+    // objects and answers the array at +0, which `Obj::retain` retains.
     unsafe {
         Obj::retain(send_id_idptr_usize(
             class(c"NSArray").as_id(),
@@ -616,7 +622,9 @@ fn arm_tick(target: Id, secs: u64) {
     autoreleasepool(|_| {
         let modes = common_modes();
         cancel_performs_of(target, sel!(tick:));
-        // SAFETY: main-thread sends on the live target.
+        // SAFETY: main-thread sends on the live target: `PerformInModesFn`'s prototype, its modes
+        // array live across the send, or `-performSelector:withObject:afterDelay:`,
+        // `v40@0:8:16@24d32`; `tick:` is a method the target declares.
         unsafe {
             if let Some(modes) = &modes {
                 let perform: PerformInModesFn = aterm_objc::checked_msg();
@@ -688,7 +696,8 @@ fn stop_app() {
     if app.is_null() {
         return;
     }
-    // SAFETY: main-thread sends on the live app.
+    // SAFETY: main-thread sends on the live app: `-stop:` is `v24@0:8@16`; the event (+0) the
+    // helper's prototype answers is retained across `-postEvent:atStart:` (`v28@0:8@16B24`).
     unsafe {
         send_v_id(app, sel!(stop:), Id::NIL);
         let raw = send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
@@ -722,7 +731,8 @@ fn workspace_center() -> Id {
     }
 }
 
-/// Send `target` `workspaceDidWake:` when the Mac wakes ([`stop_observing_wake`]).
+/// Send `target` `workspaceDidWake:` when the Mac wakes; whether it was registered. The center
+/// holds `target` unretained: [`stop_observing_wake`] removes it before it goes.
 fn observe_wake(target: Id) -> bool {
     let center = workspace_center();
     let Some(name) = aterm_objc::ns_string(DID_WAKE) else {
@@ -731,7 +741,8 @@ fn observe_wake(target: Id) -> bool {
     if center.is_null() {
         return false;
     }
-    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`.
+    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`; the selector is one
+    // the target declares.
     unsafe {
         send_v_id_sel_id_id(
             center,
@@ -867,7 +878,8 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     };
     let woke = observe_wake(target.as_id());
     arm_tick(target.as_id(), first_tick);
-    // SAFETY: `-setDelegate:` is `v24@0:8@16`.
+    // SAFETY: `-setDelegate:` is `v24@0:8@16`; the app holds its delegate unretained, and the
+    // target outlives `-run`, after which it is taken back.
     unsafe { send_v_id(app, sel!(setDelegate:), target.as_id()) };
     SIGTERMED.set(Some(target.clone_retained()));
     let sigterm = term::watch(quit_by_sigterm);

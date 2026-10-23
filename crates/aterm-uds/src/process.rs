@@ -8,6 +8,9 @@
 pub enum ProcessPresence {
     /// The pid exists, including when access to it is refused.
     Present,
+    /// The pid is held by a process that has exited and is not yet reaped (a zombie): it runs
+    /// nothing and holds nothing but its number.
+    Exited,
     /// The kernel positively reported that no process has this pid.
     Absent,
     /// The query failed or this platform has no reader.
@@ -27,18 +30,43 @@ pub fn process_presence(pid: i32) -> ProcessPresence {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         // SAFETY: a positive pid addresses one process; signal zero only queries existence.
-        if unsafe { kill(pid, 0) } == 0 {
-            return ProcessPresence::Present;
+        let answers = unsafe { kill(pid, 0) } == 0;
+        if !answers {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EPERM) => {}
+                Some(libc::ESRCH) => return ProcessPresence::Absent,
+                _ => return ProcessPresence::Unknown,
+            }
         }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EPERM) => ProcessPresence::Present,
-            Some(libc::ESRCH) => ProcessPresence::Absent,
-            _ => ProcessPresence::Unknown,
+        if exited_unreaped(pid) {
+            ProcessPresence::Exited
+        } else {
+            ProcessPresence::Present
         }
     }
     #[cfg(not(unix))]
     {
         ProcessPresence::Unknown
+    }
+}
+
+/// Whether `pid` reads as a zombie: XNU's `SZOMB`; on Linux a `Z` or `X` row with no other
+/// thread ([`procfs::exited_row`]). A read that fails says no.
+#[cfg(unix)]
+fn exited_unreaped(pid: i32) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        short_info(pid, true).is_some_and(|info| info.pbsi_status == BsdShortInfo::SZOMB)
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+            .is_ok_and(|stat| procfs::exited_row(&stat, pid))
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -94,27 +122,47 @@ pub struct ProcessBirth {
     pub microseconds: u64,
 }
 
-/// Process identity token (`<pid>@<birth_us>:<idversion>`) re-read before each pid signal.
+/// A process's start, compared for equality and order only (system awareness §4.4's `Birth`):
+/// whole microseconds of the kernel's wall start record on Apple and Windows, and clock ticks
+/// after boot (`/proc/<pid>/stat` field 22) on Linux. Every record that holds one is kept for
+/// one boot on one machine, so one unit per platform is enough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Birth(pub u64);
+
+impl From<ProcessBirth> for Birth {
+    /// The wall record as whole microseconds, saturating.
+    fn from(birth: ProcessBirth) -> Self {
+        Self(
+            birth
+                .seconds
+                .saturating_mul(1_000_000)
+                .saturating_add(birth.microseconds),
+        )
+    }
+}
+
+/// Process identity token (`<pid>@<birth>:<idversion>`, or `<pid>@<birth>` where the kernel
+/// keeps no pid version) re-read before each pid signal. On Linux the signal goes through a
+/// pidfd opened before the last read ([`signal_by_handle`]), so a pid reused after it is never
+/// signalled; elsewhere a reuse after that read, and an exec anywhere, is not excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The pid.
     pub pid: i32,
     /// Its birth, which tells it from the next process given the same number.
-    pub birth: ProcessBirth,
-    /// Its pid version, incremented on exec (`0` on platforms without pid versions).
-    pub idversion: i32,
+    pub birth: Birth,
+    /// Its pid version, incremented on exec (`None` where the kernel keeps none: Linux).
+    pub idversion: Option<i32>,
 }
 
 impl Identity {
-    /// Formats the wire token `<pid>@<birth_us>:<idversion>`.
+    /// Formats the wire token `<pid>@<birth>:<idversion>`, or `<pid>@<birth>` with no version.
     #[must_use]
     pub fn token(&self) -> String {
-        let micros = self
-            .birth
-            .seconds
-            .saturating_mul(1_000_000)
-            .saturating_add(self.birth.microseconds);
-        format!("{}@{micros}:{}", self.pid, self.idversion)
+        match self.idversion {
+            Some(version) => format!("{}@{}:{version}", self.pid, self.birth.0),
+            None => format!("{}@{}", self.pid, self.birth.0),
+        }
     }
 }
 
@@ -144,8 +192,9 @@ pub struct Ended {
 pub trait EndControl {
     /// `pid`'s identity now, or `None` when gone, unreadable, or not of this uid.
     fn identity(&mut self, pid: i32) -> Option<Identity>;
-    /// Sends `sig` to `pid`.
-    fn signal(&mut self, pid: i32, sig: i32) -> std::io::Result<()>;
+    /// Sends `sig` to the one process `token` names, the identity just re-read (an arm with a
+    /// process handle holds the signal to it: [`signal_by_handle`]).
+    fn signal(&mut self, token: &Identity, sig: i32) -> std::io::Result<()>;
     /// Sleeps `pause` before the next poll for the process to exit.
     fn nap(&mut self, pause: std::time::Duration);
 }
@@ -192,7 +241,7 @@ pub fn end_proven(
         Judged::Lost => return Err(EndRefusal::NotProven),
     }
     let mut ended = Ended::default();
-    if control.signal(pid, SIGTERM).is_err() {
+    if control.signal(&token, SIGTERM).is_err() {
         ended.gone = gone(control.identity(pid));
         return if ended.gone {
             Ok(ended)
@@ -213,7 +262,7 @@ pub fn end_proven(
         }
         Judged::Lost => return Ok(ended),
     }
-    if control.signal(pid, SIGKILL).is_err() {
+    if control.signal(&token, SIGKILL).is_err() {
         ended.gone = gone(control.identity(pid));
         return Ok(ended);
     }
@@ -246,7 +295,8 @@ fn moved_within(
     }
 }
 
-/// Live [`EndControl`] backed by [`read_identity`], `kill(2)`, and [`std::thread::sleep`].
+/// Live [`EndControl`] backed by [`read_identity`], a pidfd on Linux ([`signal_by_handle`]) or
+/// `kill(2)` elsewhere, and [`std::thread::sleep`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EndControlLive;
 
@@ -255,23 +305,25 @@ impl EndControl for EndControlLive {
         read_identity(pid)
     }
     #[cfg_attr(trust_verify, trust::skip)]
-    fn signal(&mut self, pid: i32, sig: i32) -> std::io::Result<()> {
-        #[cfg(unix)]
+    fn signal(&mut self, token: &Identity, sig: i32) -> std::io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            unsafe extern "C" {
-                fn kill(pid: i32, sig: i32) -> i32;
-            }
-            // SAFETY: two integer arguments; `end_proven` re-read `pid`'s identity just before
-            // this and signals one pid, never a group.
-            if unsafe { kill(pid, sig) } == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            signal_by_handle(
+                token,
+                sig,
+                pidfd::open,
+                read_identity,
+                pidfd::send,
+                kill_pid,
+            )
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        {
+            kill_pid(token.pid, sig)
         }
         #[cfg(not(unix))]
         {
-            let _ = (pid, sig);
+            let _ = (token, sig);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "end_proven signals are unix-only",
@@ -283,6 +335,114 @@ impl EndControl for EndControlLive {
     }
 }
 
+/// Signal the process `token` names through a handle opened on its pid before a last identity
+/// read: `open(pid)`, then `identity(pid)` must still equal `token`, then `send(&handle, sig)`.
+/// A handle names the process it was opened on, so a pid reused after the open cannot be
+/// reached, and a reuse before it shows in the read. An open the kernel will not make takes the
+/// same read and then `kill(pid, sig)`, as a kernel with no handles does: `ENOSYS`
+/// ([`std::io::ErrorKind::Unsupported`], a kernel before 5.3 or a seccomp filter that says so)
+/// or `EPERM` ([`std::io::ErrorKind::PermissionDenied`], a seccomp filter's usual answer;
+/// `pidfd_open` itself never refuses a permission). Every other open error is returned unread
+/// (`ESRCH`: the process is gone). Never a group.
+///
+/// # Errors
+/// The open's or the signal's, or [`std::io::ErrorKind::NotFound`] when the read no longer
+/// names `token` (nothing was sent).
+pub fn signal_by_handle<H>(
+    token: &Identity,
+    sig: i32,
+    open: impl FnOnce(i32) -> std::io::Result<H>,
+    identity: impl FnOnce(i32) -> Option<Identity>,
+    send: impl FnOnce(&H, i32) -> std::io::Result<()>,
+    kill: impl FnOnce(i32, i32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let handle = match open(token.pid) {
+        Ok(handle) => Some(handle),
+        Err(why)
+            if matches!(
+                why.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            None
+        }
+        Err(why) => return Err(why),
+    };
+    if identity(token.pid) != Some(*token) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the pid no longer names the token's process",
+        ));
+    }
+    match handle {
+        Some(handle) => send(&handle, sig),
+        None => kill(token.pid, sig),
+    }
+}
+
+/// `kill(pid, sig)`: one pid, never a group.
+#[cfg(unix)]
+// Skip: bottoms out at the `kill` FFI call.
+#[cfg_attr(trust_verify, trust::skip)]
+fn kill_pid(pid: i32, sig: i32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SAFETY: two integer arguments; `end_proven` re-read the identity just before this and
+    // signals one pid, never a group.
+    if unsafe { kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Linux's process handles (`pidfd_open(2)`, `pidfd_send_signal(2)`), for [`signal_by_handle`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod pidfd {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    /// A pidfd for `pid` (close-on-exec, as every pidfd is).
+    // Skip: bottoms out at the `syscall` FFI call.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(super) fn open(pid: i32) -> std::io::Result<OwnedFd> {
+        let no_flags: libc::c_long = 0;
+        // SAFETY: `pidfd_open` reads a pid and a flags word, each passed as the `long` the
+        // kernel reads, and returns a new descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::c_long::from(pid), no_flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = i32::try_from(fd).map_err(|_| std::io::Error::other("a pidfd past i32"))?;
+        // SAFETY: the kernel just returned `fd`, which nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Send `sig` to the process `fd` was opened on.
+    // Skip: bottoms out at the `syscall` FFI call.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(super) fn send(fd: &OwnedFd, sig: i32) -> std::io::Result<()> {
+        let none: libc::c_long = 0;
+        // SAFETY: `pidfd_send_signal` reads a live descriptor, a signal number, a null
+        // `siginfo_t` pointer (the kernel fills it as `kill` would) and a zero flags word, each
+        // passed as the `long` the kernel reads.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                libc::c_long::from(fd.as_raw_fd()),
+                libc::c_long::from(sig),
+                none,
+                none,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
 #[path = "process_kin.rs"]
 mod kin;
 #[cfg(any(unix, windows))]
@@ -290,11 +450,26 @@ pub use kin::held_among;
 pub use kin::{
     GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, VERIFY_RUN_VAR,
     at_program_check, boot_id, group_members, held_programs, launchd_idversion, launched_before,
-    read_identity, read_lineage, read_process_markers, thread_ran,
+    pid_namespace, read_identity, read_lineage, read_process_markers, thread_ran,
 };
 
 #[cfg(target_vendor = "apple")]
 pub use kin::{BsdInfoWithUniqId, UniqIdentifierInfo, bsdinfo_uniq, uniq_identifier};
+
+/// `pid`'s [`Birth`]: its wall start record as whole microseconds where the kernel keeps one
+/// ([`read_process_birth`], Apple and Windows), its start in clock ticks on Linux
+/// ([`read_identity`]), on those readers' terms; `None` elsewhere.
+#[must_use]
+pub fn read_birth(pid: i32) -> Option<Birth> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        read_identity(pid).map(|identity| identity.birth)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        read_process_birth(pid).map(Birth::from)
+    }
+}
 
 /// Reads the kernel's start-time record for `pid`, or `None` if unavailable.
 #[cfg(target_vendor = "apple")]
@@ -315,7 +490,7 @@ pub fn read_process_parent(pid: i32) -> Option<u32> {
 #[must_use]
 pub fn read_process_parent(pid: i32) -> Option<u32> {
     let start = read_process_start(pid)?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let status = read_proc_text(std::path::Path::new(&format!("/proc/{pid}/status"))).ok()?;
     let parent = procfs::parent(&status)?;
     (read_process_start(pid)? == start).then_some(parent)
 }
@@ -397,8 +572,15 @@ impl BsdShortInfo {
 /// `pid`'s short BSD record ([`BsdShortInfo`]).
 #[cfg(target_vendor = "apple")]
 #[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
 pub fn read_short_info(pid: i32) -> Option<BsdShortInfo> {
+    short_info(pid, false)
+}
+
+/// [`read_short_info`], and of a zombie too when `zombies` (XNU's `proc_pidinfo` finds one
+/// only when its argument is 1).
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn short_info(pid: i32, zombies: bool) -> Option<BsdShortInfo> {
     const PROC_PIDT_SHORTBSDINFO: i32 = 13;
     const SIZE: i32 = std::mem::size_of::<BsdShortInfo>() as i32;
     if pid <= 0 {
@@ -411,7 +593,7 @@ pub fn read_short_info(pid: i32) -> Option<BsdShortInfo> {
         libc::proc_pidinfo(
             pid,
             PROC_PIDT_SHORTBSDINFO,
-            0,
+            u64::from(zombies),
             info.as_mut_ptr().cast(),
             SIZE,
         )
@@ -1040,9 +1222,7 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
     if pid <= 1 {
         return None;
     }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let again = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let [stat, status, again] = proc_stat_status_stat(pid)?;
     let (euid, per_second) = linux_reader()?;
     let boot = procfs::start(&stat, &status, &again, pid, euid, per_second)?;
     Some(ProcessStart { boot, wall: None })
@@ -1068,6 +1248,39 @@ fn linux_reader() -> Option<(u32, u64)> {
     (ticks > 0).then_some((euid, u64::from(ticks)))
 }
 
+/// A `/proc` text file, its bytes decoded lossily. The kernel writes a command name as raw
+/// bytes cut at 15 (a UTF-8 letter may be cut, and `prctl(PR_SET_NAME)` sets any bytes), so
+/// `stat` and `status` need hold no UTF-8; a command name is words only, and every field a
+/// reader here parses is ASCII.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+pub(crate) fn read_proc_text(path: &std::path::Path) -> std::io::Result<String> {
+    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `pid`'s `stat`, `status` and `stat` again, the reads [`procfs::start`] and
+/// [`procfs::lineage`] judge.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_stat_status_stat(pid: i32) -> Option<[String; 3]> {
+    let read = |name: &str| read_proc_text(std::path::Path::new(&format!("/proc/{pid}/{name}")));
+    Some([read("stat").ok()?, read("status").ok()?, read("stat").ok()?])
+}
+
+/// One `/proc/<pid>/stat` read of a group listing: its text, gone (`ENOENT`, `ESRCH`), or
+/// unreadable.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn stat_row(path: &std::path::Path) -> procfs::StatRead {
+    match read_proc_text(path) {
+        Ok(text) => procfs::StatRead::Text(text),
+        Err(why)
+            if why.kind() == std::io::ErrorKind::NotFound
+                || why.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            procfs::StatRead::Gone
+        }
+        Err(_) => procfs::StatRead::Unreadable,
+    }
+}
+
 /// See the Apple twin.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
@@ -1075,7 +1288,9 @@ pub fn read_process_start(_pid: i32) -> Option<ProcessStart> {
     None
 }
 
-/// Linux's record of a process's start, judged from the text of its `/proc` files.
+/// Linux's records of a process, judged from the text of its `/proc` files: each reader here is
+/// pure, so every platform's tests hold it to fixture text, and the Linux reads that feed it
+/// are thin.
 pub mod procfs {
     use super::BootClock;
 
@@ -1134,7 +1349,146 @@ pub mod procfs {
         u64::try_from(nanos).ok().map(BootClock)
     }
 
-    /// Reads the start of `pid` from `stat`, `status`, and a second `stat` read.
+    /// `pid`'s `/proc/<pid>/stat` line, whole, when it names `pid` itself
+    /// ([`aterm_sysprobe::jobs::linux::parse_stat`], whose command name runs to the last `)`).
+    #[cfg(any(unix, windows))]
+    fn stat_line(stat: &str, pid: i32) -> Option<aterm_sysprobe::jobs::linux::StatLine> {
+        let open = stat.find(" (")?;
+        if stat[..open].trim().parse::<i32>().ok()? != pid {
+            return None;
+        }
+        aterm_sysprobe::jobs::linux::parse_stat(stat)
+    }
+
+    /// A zombie (`Z`) or a dead task (`X`, and the older `x`): the row's own task has exited.
+    #[cfg(any(unix, windows))]
+    const fn task_exited(state: u8) -> bool {
+        matches!(state, b'Z' | b'X' | b'x')
+    }
+
+    /// A process that has exited and holds nothing: its row's task has exited
+    /// ([`task_exited`]) and no other thread runs. A main thread that exited while its other
+    /// threads run reads `Z` too (`ps` shows `Zl`) with more than one thread, and that process
+    /// still runs.
+    #[cfg(any(unix, windows))]
+    fn exited(line: &aterm_sysprobe::jobs::linux::StatLine) -> bool {
+        task_exited(line.state) && line.threads <= 1
+    }
+
+    /// Whether `stat`, `pid`'s `/proc/<pid>/stat`, names `pid` as a process that has exited
+    /// and holds nothing ([`exited`]): a zombie its parent has not reaped.
+    #[cfg(any(unix, windows))]
+    #[must_use]
+    pub fn exited_row(stat: &str, pid: i32) -> bool {
+        stat_line(stat, pid).is_some_and(|line| exited(&line))
+    }
+
+    /// The thread-group id in a `/proc/<pid>/status` text: its `Tgid:` line.
+    #[must_use]
+    pub fn thread_group(status: &str) -> Option<i32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Tgid:"))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// `pid`'s [`super::Lineage`] from its `stat`, its `status` and `stat` read again after
+    /// `status`, for a reader whose effective uid is `euid`: both `stat` reads name `pid` with
+    /// one start (a pid reused between them reads another), neither is a zombie or dead, the
+    /// `status` is this uid's and names `pid` as its thread group (a thread's id is no
+    /// process), and the fields are the second read's. Linux keeps no pid version, so the
+    /// identity has none ([`super::Identity::idversion`]), and its birth and unique id are both
+    /// its start in clock ticks after boot. A terminal is kept as the kernel numbers it
+    /// (`tty_nr`), `None` for none.
+    #[cfg(any(unix, windows))]
+    #[must_use]
+    pub fn lineage(
+        stat: &str,
+        status: &str,
+        again: &str,
+        pid: i32,
+        euid: u32,
+    ) -> Option<super::Lineage> {
+        let first = stat_line(stat, pid)?;
+        let now = stat_line(again, pid)?;
+        if now.start != first.start || task_exited(first.state) || task_exited(now.state) {
+            return None;
+        }
+        if effective_uid(status)? != euid || thread_group(status)? != pid {
+            return None;
+        }
+        Some(super::Lineage {
+            identity: super::Identity {
+                pid,
+                birth: super::Birth(now.start),
+                idversion: None,
+            },
+            uniqueid: now.start,
+            parent: now.ppid,
+            pgid: now.pgrp,
+            launcher_version: None,
+            tty: (now.tty_nr != 0).then_some(now.tty_nr),
+        })
+    }
+
+    /// One `/proc/<pid>/stat` read of a group listing ([`group_of`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum StatRead {
+        /// The file's text.
+        Text(String),
+        /// The process was gone by the read (`ENOENT`, `ESRCH`).
+        Gone,
+        /// The read failed another way, or the directory entry did not read.
+        Unreadable,
+    }
+
+    /// The members of process group `pgid` among `rows` (each a pid and the read of its
+    /// `/proc/<pid>/stat`): a row whose text names its own pid in `pgid`, unless it has exited
+    /// ([`exited`]: an exited stage leader is a zombie in its group until it is reaped, and
+    /// holds nothing; a process whose main thread alone exited is still listed). A gone row is
+    /// skipped. The listing is complete only when every other row read and parsed and at most
+    /// [`super::MAX_GROUP_PIDS`] members were found (the first that many are kept).
+    #[cfg(any(unix, windows))]
+    #[must_use]
+    pub fn group_of(
+        rows: impl IntoIterator<Item = (i32, StatRead)>,
+        pgid: u32,
+    ) -> super::GroupMembers {
+        let mut members = super::GroupMembers {
+            pids: Vec::new(),
+            complete: true,
+        };
+        for (pid, read) in rows {
+            let text = match read {
+                StatRead::Text(text) => text,
+                StatRead::Gone => continue,
+                StatRead::Unreadable => {
+                    members.complete = false;
+                    continue;
+                }
+            };
+            let Some(line) = stat_line(&text, pid) else {
+                members.complete = false;
+                continue;
+            };
+            if line.pgrp != pgid || exited(&line) {
+                continue;
+            }
+            if members.pids.len() < super::MAX_GROUP_PIDS {
+                members.pids.push(pid);
+            } else {
+                members.complete = false;
+            }
+        }
+        members
+    }
+
+    /// The start of `pid` from its `stat`, its `status` and `stat` read again after `status`,
+    /// for a reader whose effective uid is `euid`, on [`lineage`]'s terms: one start in both
+    /// reads, neither a zombie or dead, and a `status` of this uid naming `pid` as its thread
+    /// group.
     #[must_use]
     pub fn start(
         stat: &str,
@@ -1144,11 +1498,13 @@ pub mod procfs {
         euid: u32,
         per_second: u64,
     ) -> Option<BootClock> {
+        let dead = |state: char| matches!(state, 'Z' | 'X' | 'x');
         let (state, ticks) = stat_start(stat, pid)?;
-        if stat_start(again, pid)?.1 != ticks || matches!(state, 'Z' | 'X' | 'x') {
+        let (state_again, ticks_again) = stat_start(again, pid)?;
+        if ticks_again != ticks || dead(state) || dead(state_again) {
             return None;
         }
-        if effective_uid(status)? != euid {
+        if effective_uid(status)? != euid || thread_group(status)? != pid {
             return None;
         }
         tick_start(ticks, per_second)
@@ -1236,6 +1592,14 @@ pub fn read_exec_path(pid: u32) -> Option<std::path::PathBuf> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
+    let bytes = read_proc_bounded(pid, c"cmdline")?;
+    cmdline_from_read(bytes, PROCESS_ARGV_MAX, || shared_interpreter(pid))
+}
+
+/// `/proc/<pid>/<name>`, opened under the pid's own directory, read to at most one byte past
+/// [`PROCESS_ARGV_MAX`], so a reader can tell a whole file from one past its bound.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_proc_bounded(pid: u32, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     use std::io::Read as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     let dir = std::fs::File::open(format!("/proc/{pid}")).ok()?;
@@ -1243,7 +1607,7 @@ fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
-            c"cmdline".as_ptr(),
+            name.as_ptr(),
             libc::O_RDONLY | libc::O_CLOEXEC,
         )
     };
@@ -1256,7 +1620,7 @@ fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     file.take((PROCESS_ARGV_MAX + 1) as u64)
         .read_to_end(&mut bytes)
         .ok()?;
-    cmdline_from_read(bytes, PROCESS_ARGV_MAX, || shared_interpreter(pid))
+    Some(bytes)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
@@ -1748,6 +2112,11 @@ mod start_tests {
     const STATUS_501: &str = "Name:\tcat\nState:\tR (running)\nTgid:\t13\nPid:\t13\n\
          Uid:\t501\t502\t501\t502\nGid:\t20\t20\t20\t20\n";
 
+    /// Field 22 counted from the command name's last `)`, the effective uid as the second
+    /// `Uid:` id, a tick as its first instant; another pid's line, a zombie (in either read),
+    /// another euid, two disagreeing `stat` reads, a thread's id, a short line and a zero tick
+    /// rate answer `None`. NEGATIVE CONTROL: judge the first read's state alone, and the process
+    /// that died between the reads has a start.
     #[test]
     fn a_linux_start_is_read_off_proc_as_linux_writes_it() {
         assert_eq!(procfs::stat_start(TRICKY, 7), Some(('S', 51_832_760)));
@@ -1767,14 +2136,21 @@ mod start_tests {
             at(51_831_871),
             "518318.71 s after boot"
         );
-        let tricky_status = STATUS_501.replace("Pid:\t13", "Pid:\t7");
+        let tricky_status = STATUS_501.replace("Tgid:\t13\nPid:\t13", "Tgid:\t7\nPid:\t7");
         assert_eq!(
             procfs::start(TRICKY, &tricky_status, TRICKY, 7, 502, 100),
             at(51_832_760)
         );
+        let thread_status = STATUS_501.replace("Tgid:\t13\nPid:\t13", "Tgid:\t6\nPid:\t7");
+        assert_eq!(
+            procfs::start(TRICKY, &thread_status, TRICKY, 7, 502, 100),
+            None,
+            "a thread's id"
+        );
         for (case, stat, again, euid, per_second) in [
             ("a zombie", ZOMBIE, ZOMBIE, 502, 100),
             ("dead", &*TRICKY.replace(") S ", ") X "), TRICKY, 502, 100),
+            ("died between the reads", TRICKY, ZOMBIE, 502, 100),
             ("another effective uid", TRICKY, TRICKY, 501, 100),
             (
                 "reused between the reads",
@@ -1796,6 +2172,190 @@ mod start_tests {
             Some(BootClock(518_318_710_000_000))
         );
         assert_eq!(procfs::tick_start(7, 3), Some(BootClock(2_333_333_333)));
+    }
+
+    /// A status whose thread group is `pid`, with effective uid 502.
+    #[cfg(any(unix, windows))]
+    fn status_of(pid: i32) -> String {
+        STATUS_501.replace("Tgid:\t13\nPid:\t13", &format!("Tgid:\t{pid}\nPid:\t{pid}"))
+    }
+
+    /// A lineage off `/proc` as Linux writes it: the fields counted from the command name's
+    /// last `)`, the start tick as both birth and unique id, no pid version, and the group and
+    /// terminal of the second read. A zombie, a dead process, one that died between the reads,
+    /// another euid, a pid reused between the reads, a thread's id, a cut line and another pid's
+    /// line read nothing. NEGATIVE CONTROLS: drop the second read's start check, and the reused
+    /// pid reads; drop the second read's state check, and the process that died between the
+    /// reads reads live; map the terminal to `None`, and a member with one would be proven free
+    /// of it.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_linux_lineage_is_read_off_proc_as_linux_writes_it() {
+        use super::{Birth, Identity, Lineage};
+        let status = status_of(7);
+        assert_eq!(
+            procfs::lineage(TRICKY, &status, TRICKY, 7, 502),
+            Some(Lineage {
+                identity: Identity {
+                    pid: 7,
+                    birth: Birth(51_832_760),
+                    idversion: None,
+                },
+                uniqueid: 51_832_760,
+                parent: 1,
+                pgid: 1,
+                launcher_version: None,
+                tty: None,
+            })
+        );
+        let grouped = TRICKY.replacen(") S 1 1 1 0 -1 ", ") S 1 500 500 34817 -1 ", 1);
+        let read = procfs::lineage(&grouped, &status, &grouped, 7, 502).expect("a member");
+        assert_eq!((read.pgid, read.tty), (500, Some(34817)), "{read:?}");
+        let cut = &TRICKY[..40];
+        for (case, stat, again, status, euid) in [
+            ("a zombie", ZOMBIE, ZOMBIE, status.clone(), 502),
+            (
+                "dead",
+                &*TRICKY.replace(") S ", ") X "),
+                TRICKY,
+                status.clone(),
+                502,
+            ),
+            (
+                "died between the reads",
+                TRICKY,
+                ZOMBIE,
+                status.clone(),
+                502,
+            ),
+            ("another effective uid", TRICKY, TRICKY, status.clone(), 501),
+            (
+                "reused between the reads",
+                TRICKY,
+                &*CAT.replacen("13 ", "7 ", 1),
+                status.clone(),
+                502,
+            ),
+            ("a thread's id", TRICKY, TRICKY, status_of(6), 502),
+            ("cut short", cut, cut, status.clone(), 502),
+            ("another pid's line", CAT, CAT, status.clone(), 502),
+        ] {
+            assert_eq!(
+                procfs::lineage(stat, &status, again, 7, euid),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    /// A group is listed from every `/proc/<pid>/stat`: its live members by `pgrp` (a command
+    /// name of `x) (y` among them, and a process whose main thread alone exited, `Z` with three
+    /// threads), never its zombie leader or a dead row, a gone row skipped; an unreadable or
+    /// garbled row, or more members than the bound, leave it incomplete. NEGATIVE CONTROLS:
+    /// stop skipping zombies, and the exited leader is listed; skip every `Z` row whatever its
+    /// threads, and the running process is left out of a listing that reads complete; read an
+    /// unreadable row as gone, and a listing with a hole reads complete.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_linux_group_is_listed_from_proc_without_its_zombies() {
+        use procfs::StatRead;
+        let row = |pid: i32, state: char, pgrp: u32| {
+            let stat = format!(
+                "{pid} (sh) {state} 1 {pgrp} {pgrp} 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0                  51832760 7032832 463 18446744073709551615 0 0 0 0 0 0 0 128 0 1 0 0 17 0 0 0
+"
+            );
+            (pid, StatRead::Text(stat))
+        };
+        let odd = TRICKY.replacen("7 (a) b (c) S 1 1 1 ", "502 (x) (y) S 1 500 500 ", 1);
+        let main_thread_gone = match row(506, 'Z', 500) {
+            (pid, StatRead::Text(stat)) => (
+                pid,
+                StatRead::Text(stat.replacen(" 20 0 1 0 ", " 20 0 3 0 ", 1)),
+            ),
+            other => other,
+        };
+        let rows = || {
+            vec![
+                row(500, 'Z', 500),
+                row(501, 'S', 500),
+                (502, StatRead::Text(odd.clone())),
+                row(503, 'S', 600),
+                (504, StatRead::Gone),
+                row(505, 'X', 500),
+                main_thread_gone.clone(),
+            ]
+        };
+        let listed = procfs::group_of(rows(), 500);
+        assert_eq!(listed.pids, [501, 502, 506], "{listed:?}");
+        assert!(listed.complete, "{listed:?}");
+        let mut holed = rows();
+        holed.push((506, StatRead::Unreadable));
+        assert!(
+            !procfs::group_of(holed, 500).complete,
+            "a row that did not read"
+        );
+        let mut garbled = rows();
+        garbled.push((507, StatRead::Text("507 (sh) S 1 500".to_owned())));
+        assert!(
+            !procfs::group_of(garbled, 500).complete,
+            "a row that did not parse"
+        );
+        let many = (1000..1257).map(|pid| row(pid, 'S', 500));
+        let full = procfs::group_of(many, 500);
+        assert_eq!(full.pids.len(), super::MAX_GROUP_PIDS);
+        assert!(!full.complete, "past the bound");
+    }
+
+    /// A `/proc` file whose command name holds no UTF-8 still reads: the kernel cuts a name at
+    /// 15 bytes, in the middle of a letter if it falls there, and `prctl(PR_SET_NAME)` sets any
+    /// bytes. Its lineage and start are judged, its group row is text, and an exited row reads
+    /// so; a file gone by its read is gone. NEGATIVE CONTROL: read the files with
+    /// `read_to_string`, and the lineage reads nothing and the row is unreadable.
+    #[cfg(unix)]
+    #[test]
+    fn a_proc_file_whose_command_name_is_not_utf8_still_reads() {
+        use super::{read_proc_text, stat_row};
+        let dir = aterm_tempfile::TempDir::new().expect("tempdir");
+        let cut_name = |text: &str| {
+            let mut bytes = text.as_bytes().to_vec();
+            let at = bytes
+                .windows(3)
+                .position(|w| w == b"(a)")
+                .expect("the name")
+                + 1;
+            bytes.splice(at..=at, [0xe3, 0x83]);
+            bytes
+        };
+        let stat = dir.path().join("stat");
+        let status = dir.path().join("status");
+        std::fs::write(&stat, cut_name(TRICKY)).expect("stat");
+        let mut raw_status = status_of(7).into_bytes();
+        raw_status.splice(6..9, [0xe3, 0x83]);
+        std::fs::write(&status, raw_status).expect("status");
+        assert!(
+            std::fs::read_to_string(&stat).is_err() && std::fs::read_to_string(&status).is_err(),
+            "the fixture's names hold no UTF-8"
+        );
+        let read = |path: &std::path::Path| read_proc_text(path).expect("a file that reads");
+        let lineage = procfs::lineage(&read(&stat), &read(&status), &read(&stat), 7, 502);
+        assert_eq!(lineage.map(|l| l.uniqueid), Some(51_832_760), "{lineage:?}");
+        assert!(
+            procfs::start(&read(&stat), &read(&status), &read(&stat), 7, 502, 100).is_some(),
+            "its start"
+        );
+        assert!(
+            matches!(stat_row(&stat), procfs::StatRead::Text(_)),
+            "a group row that reads"
+        );
+        let zombie = dir.path().join("zombie");
+        std::fs::write(&zombie, cut_name(ZOMBIE)).expect("zombie");
+        assert!(procfs::exited_row(&read(&zombie), 7), "an exited row");
+        assert!(!procfs::exited_row(&read(&stat), 7), "a live row");
+        assert_eq!(
+            stat_row(&dir.path().join("gone")),
+            procfs::StatRead::Gone,
+            "a file gone by its read"
+        );
     }
 
     #[cfg(unix)]
@@ -1910,19 +2470,67 @@ mod kill_self_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod presence_tests {
+    use super::{ProcessPresence, process_presence, read_birth};
+    use std::time::{Duration, Instant};
+
+    /// A child that has exited and is not yet reaped (a zombie) holds its pid and nothing else:
+    /// its presence reads `Exited`, a live one's `Present`, and the zombie reads no birth.
+    /// NEGATIVE CONTROL: answer `Present` whenever the pid answers signal zero, and the zombie
+    /// reads `Present`.
+    #[test]
+    fn an_exited_unreaped_child_reads_exited() {
+        let mut child = crate::spawnfd::command("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let live = process_presence(pid);
+        let _ = child.kill();
+        // The exit is waited for without reaping it, under the one-minute hang detector.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let exited = loop {
+            // SAFETY: every field of `siginfo_t` is an integer or a pointer, so all-zero is valid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: a non-blocking `WNOWAIT` `waitid` of this test's own child into `info`.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::try_from(pid).expect("pid"),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            // SAFETY: `info` was zeroed and then filled by `waitid`.
+            if rc == 0 && unsafe { info.si_pid() } == pid {
+                break true;
+            }
+            if rc != 0 || Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let zombie = process_presence(pid);
+        let birth = read_birth(pid);
+        let _ = child.wait();
+        assert_eq!(live, ProcessPresence::Present, "a live child");
+        assert!(exited, "the killed child exited within its hang detector");
+        assert_eq!(zombie, ProcessPresence::Exited, "an unreaped zombie");
+        assert_eq!(birth, None, "a zombie reads no birth");
+    }
+}
+
 #[cfg(test)]
 mod end_proven_tests {
-    use super::{EndControl, EndRefusal, Ended, Identity, ProcessBirth, end_proven};
+    use super::{Birth, EndControl, EndRefusal, Ended, Identity, end_proven, signal_by_handle};
     use std::time::Duration;
 
     fn ident(pid: i32, idversion: i32) -> Identity {
         Identity {
             pid,
-            birth: ProcessBirth {
-                seconds: 1_792_000_000,
-                microseconds: 42,
-            },
-            idversion,
+            birth: Birth(1_792_000_000_000_042),
+            idversion: Some(idversion),
         }
     }
 
@@ -1946,11 +2554,11 @@ mod end_proven_tests {
         fn identity(&mut self, _pid: i32) -> Option<Identity> {
             self.reads.borrow_mut().next().flatten()
         }
-        fn signal(&mut self, pid: i32, sig: i32) -> std::io::Result<()> {
+        fn signal(&mut self, token: &Identity, sig: i32) -> std::io::Result<()> {
             if self.refuses == Some(sig) {
                 return Err(std::io::Error::from_raw_os_error(3));
             }
-            self.signals.push((pid, sig));
+            self.signals.push((token.pid, sig));
             Ok(())
         }
         fn nap(&mut self, _pause: Duration) {
@@ -2079,7 +2687,7 @@ mod end_proven_tests {
         );
         assert_eq!(c.signals, [(4242, SIGTERM)]);
         let mut reborn = ident(4242, 8);
-        reborn.birth.microseconds += 1;
+        reborn.birth.0 += 1;
         let mut c = Fake::new(vec![Some(t), Some(t), Some(reborn)]);
         let out = end_proven(t, Duration::from_secs(60), &mut c, |_| true).expect("termed");
         assert!(out.gone, "{out:?}");
@@ -2139,6 +2747,115 @@ mod end_proven_tests {
             ident(63452, 331207).token(),
             "63452@1792000000000042:331207"
         );
+    }
+
+    /// Q5's two forms: Apple's `<pid>@<birth_us>:<idversion>`, Linux's `<pid>@<start_ticks>`
+    /// with no version. NEGATIVE CONTROL: print `idversion.unwrap_or(0)` always, and the
+    /// versionless token reads `…:0`, a version Linux never had.
+    #[test]
+    fn a_token_prints_its_version_only_where_the_kernel_keeps_one() {
+        let apple = Identity {
+            pid: 4242,
+            birth: Birth(1_792_000_000_000_042),
+            idversion: Some(7),
+        };
+        assert_eq!(apple.token(), "4242@1792000000000042:7");
+        let linux = Identity {
+            pid: 4242,
+            birth: Birth(51_832_760),
+            idversion: None,
+        };
+        assert_eq!(linux.token(), "4242@51832760");
+    }
+
+    /// What [`signal_by_handle`] did, in order, with what it passed: the pid opened and read,
+    /// the handle and signal sent, the pid and signal killed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Step {
+        Open(i32),
+        Read(i32),
+        Send(u8, i32),
+        Kill(i32, i32),
+    }
+
+    /// The pid opened, read and signalled, over a handle that is a plain number: `open` answers
+    /// `opened`, and the read answers `reads`.
+    fn by_handle(
+        token: Identity,
+        opened: std::io::Result<u8>,
+        reads: Option<Identity>,
+    ) -> (std::io::Result<()>, Vec<Step>) {
+        let log = std::cell::RefCell::new(Vec::new());
+        let result = signal_by_handle(
+            &token,
+            15,
+            |pid| {
+                log.borrow_mut().push(Step::Open(pid));
+                opened
+            },
+            |pid| {
+                log.borrow_mut().push(Step::Read(pid));
+                reads
+            },
+            |handle: &u8, sig| {
+                log.borrow_mut().push(Step::Send(*handle, sig));
+                Ok(())
+            },
+            |pid, sig| {
+                log.borrow_mut().push(Step::Kill(pid, sig));
+                Ok(())
+            },
+        );
+        (result, log.into_inner())
+    }
+
+    /// The handle is opened on the token's pid first, the identity of that pid re-read after
+    /// it, and the signal goes through that handle only while the read still names the token.
+    /// An open the kernel will not make (`ENOSYS`, or the `EPERM` a seccomp filter answers)
+    /// takes the same read before a `kill` of that pid; an open that finds the process gone
+    /// sends nothing and reads nothing. NEGATIVE CONTROLS: make the re-read and ignore its
+    /// answer, and the pid reused after the open is sent the signal; open, read or kill any pid
+    /// but the token's, and its step names that pid; fall back on `ENOSYS` alone, and the
+    /// filtered open sends nothing.
+    #[test]
+    fn a_handle_signal_reaches_only_the_process_the_handle_was_opened_on() {
+        let token = Identity {
+            pid: 4242,
+            birth: Birth(51_832_760),
+            idversion: None,
+        };
+        let reused = Identity {
+            birth: Birth(51_900_000),
+            ..token
+        };
+        let (opened, read) = (Step::Open(4242), Step::Read(4242));
+        let (sent, log) = by_handle(token, Ok(3), Some(token));
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(log, [opened, read, Step::Send(3, 15)]);
+        let (sent, log) = by_handle(token, Ok(3), Some(reused));
+        assert!(sent.is_err(), "a reused pid is refused");
+        assert_eq!(log, [opened, read], "nothing sent to a reused pid");
+        let (sent, log) = by_handle(token, Ok(3), None);
+        assert!(sent.is_err());
+        assert_eq!(log, [opened, read], "nothing sent to a gone pid");
+        for kind in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let (sent, log) = by_handle(token, Err(kind.into()), Some(token));
+            assert!(sent.is_ok(), "{kind:?}: {sent:?}");
+            assert_eq!(log, [opened, read, Step::Kill(4242, 15)], "{kind:?}");
+            let (sent, log) = by_handle(token, Err(kind.into()), Some(reused));
+            assert!(sent.is_err(), "{kind:?}");
+            assert_eq!(log, [opened, read], "{kind:?}: no kill of a reused pid");
+        }
+        let (sent, log) = by_handle(
+            token,
+            Err(std::io::Error::from_raw_os_error(3)),
+            Some(token),
+        );
+        assert_eq!(sent.map_err(|e| e.raw_os_error()), Err(Some(3)));
+        assert_eq!(log, [opened], "a gone process is neither read nor sent");
     }
 }
 

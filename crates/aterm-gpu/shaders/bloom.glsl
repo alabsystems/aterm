@@ -15,8 +15,8 @@ layout(std140) uniform aterm_b2 {
     float bu_strength;
     float bu_radius;        // the white part's radius, half-res texels
     float bu_chroma_radius; // the coloured part's, the shorter of the two
-    float bu_pad0;
-    float bu_pad1;
+    float bu_extent_x;      // the share of the half texture's storage in use: 1 unless roomy
+    float bu_extent_y;
 };
 uniform highp sampler2D aterm_t0;
 
@@ -43,6 +43,15 @@ float white_part(vec3 c) {
 }
 
 #if defined(ATERM_FRAGMENT) && defined(ATERM_FS_fs_bloom)
+// The half texture at `uv` over its texels in use, held to their outer
+// centres as the sampler's edge clamp holds an exact texture, then placed in
+// its storage (the GL arm keeps that storage roomy across resizes; an exact
+// texture's extent is 1, so this is the edge clamp alone).
+vec3 half_rgb(vec2 uv) {
+    vec2 held = clamp(uv, 0.5 * bu_texel, vec2(1.0) - 0.5 * bu_texel);
+    return texture(aterm_t0, held * vec2(bu_extent_x, bu_extent_y)).rgb;
+}
+
 // One 25-tap kernel, two radii: the white part spreads at `radius`, the chroma
 // at the shorter `chroma_radius`, summed back into one halo.
 void fs_bloom() {
@@ -54,9 +63,9 @@ void fs_bloom() {
             vec2 tap = vec2(float(i), float(j)) * bu_texel;
             float d2 = float(i * i + j * j);
             float w = exp(-d2 / 4.0);
-            vec3 sw = texture(aterm_t0, v_uv + tap * bu_radius).rgb;
+            vec3 sw = half_rgb(v_uv + tap * bu_radius);
             white = white + white_part(sw) * w;
-            vec3 sc = texture(aterm_t0, v_uv + tap * bu_chroma_radius).rgb;
+            vec3 sc = half_rgb(v_uv + tap * bu_chroma_radius);
             chroma = chroma + (sc - vec3(white_part(sc))) * w;
             wsum = wsum + w;
         }

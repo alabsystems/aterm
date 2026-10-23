@@ -159,11 +159,17 @@ pub fn get_instance_handle() -> HMODULE {
 }
 
 pub(crate) fn to_windows_cursor(cursor: CursorIcon) -> PCWSTR {
+    // LOCAL PATCH (aterm): `CursorIcon` is the crate's own type, so the arms for the icons it does
+    // not have are gone; each kept arm maps as upstream's did.
     match cursor {
         CursorIcon::Default => IDC_ARROW,
         CursorIcon::Pointer => IDC_HAND,
         CursorIcon::Text => IDC_IBEAM,
         CursorIcon::Grabbing => IDC_SIZEALL,
+        // LOCAL PATCH (aterm): the edge-resize icons, which aterm sets only on its own Wayland
+        // frame (Windows draws its own). The edges map as upstream's did; the corners would need
+        // `IDC_SIZENESW`/`IDC_SIZENWSE`, which the generated windows-sys facade does not declare
+        // while nothing on Windows sets them, so they are the arrow.
         CursorIcon::ColResize | CursorIcon::EResize | CursorIcon::WResize => IDC_SIZEWE,
         CursorIcon::RowResize | CursorIcon::NResize | CursorIcon::SResize => IDC_SIZENS,
         CursorIcon::NeResize

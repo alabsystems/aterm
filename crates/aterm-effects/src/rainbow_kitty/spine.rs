@@ -114,7 +114,7 @@ pub struct EraseMark {
     pub count: u8,
 }
 
-/// The one momentum integrator and its display follower (see the module doc).
+/// The one momentum integrator and its display follower.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Spine {
     /// The canonical metric (`crate::typing_momentum`), the raw 0..1 leaky
@@ -293,6 +293,13 @@ impl Spine {
             return;
         }
         let target = self.target(now);
+        if target == 0.0 && self.disp == 0.0 && self.disp_peak == 0.0 {
+            self.slamming = false;
+            self.run = 0;
+            self.prev_birth = 0.0;
+            self.key_rise = 0.0;
+            return;
+        }
         let rise = target - self.disp;
         if rise > DISP_SLAM_RISE {
             self.slamming = true;
@@ -321,7 +328,9 @@ impl Spine {
             self.prev_birth = 0.0;
             self.key_rise = 0.0;
         }
-        self.phase = (self.phase + dt * PHASE_RATE * self.disp).rem_euclid(PHASE_RING);
+        if self.disp > 0.0 {
+            self.phase = (self.phase + dt * PHASE_RATE * self.disp).rem_euclid(PHASE_RING);
+        }
     }
 
     /// Eased unit display spine.

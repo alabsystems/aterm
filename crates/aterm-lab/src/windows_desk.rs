@@ -15,7 +15,7 @@ pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 
 /// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C#
 /// compiled by `Add-Type`, per-monitor-v2 aware so every rectangle is in
-/// physical pixels:
+/// physical pixels.
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
 if ($verb -eq 'launch') {
@@ -421,7 +421,6 @@ impl Rect {
     }
 }
 
-/// The word `key=…` of a helper line.
 fn word<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))

@@ -44,7 +44,7 @@ fn reported_here(host: Option<&str>, names: impl Fn(&str) -> bool, netbios: Opti
 }
 
 /// This machine's NetBIOS name, read from the OS
-/// ([`aterm_uds::process::netbios_host_name`]: the name
+/// (`aterm_uds::process::netbios_host_name`: the name
 /// `[Environment]::MachineName` answers, whatever this process's environment
 /// holds — a window started with an environment of its own may have no
 /// `%COMPUTERNAME%`), read once: it changes only at a restart.

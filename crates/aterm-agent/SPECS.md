@@ -107,8 +107,9 @@ Result: **635 specs**, retiring **2359 tests** as their primary spec. **80 chunk
 - **Disk**: `Survey`, `Report = report(survey,cfg)`, rows with class, removable flag and witness;
   `Applied = apply(…)`; the journal callback is write-ahead (`Removing` before the remover runs).
 - **Power order ≤ on `SupervisorConfig`**: `a ≤ b` iff `a.limits(b) ∨ a = b`, per key; text keys are
-  incomparable "own" values; opt-in keys (`stall_term`, `limit_reset`, `usage_tap`, `usage_notes`,
-  `usage_credits`) default false = bottom; `limit_reset_kinds` moves only with `limit_reset` off.
+  incomparable "own" values; opt-in keys (`stall_term`, `limit_reset`, `usage_notes`,
+  `usage_credits`) default false = bottom (`usage_tap` ships `true` since 2026-10-22, and its off is
+  a limit); `limit_reset_kinds` moves only with `limit_reset` off.
 - **ShellSem**: a reference model, to be written in Clean, of zsh 5.9 (`-f`) and bash for the fragment the
   classifier judges; **ReadSet** is the (program, argv-form) pairs the classifier's tables call reads.
 - **Refinement** rows bind the real functions to the named `ty_model!` machine in `aterm_spec::derive` under the
@@ -534,7 +535,7 @@ prelex	contract	prelex	Removes word-opening comments (a `#` at the text's start,
 sed-script-and-alarm-idiom	contract	sed_script_writes, sed_args_write, is_alarm_body, strip_alarm_idiom	sed_script_writes = None ⇔ the script parses fully with no w/W/e command or flag, the regex sections (address and s pattern) read a [...] bracket expression's delimiter literally and a label to a command end; sed_args_write reads the script from -e/-f spelled whole, attached, clustered or abbreviated, and -l takes no value; is_alarm_body ⇔ `alarm N; exec @ARGV`; strip_alarm_idiom removes exactly that wrapper.	1,3,5,7	1/4
 numeric-format	contract	numeric_format	⇔ the \u/\U-decoded format has a numeric conversion or * width/precision; malformed escapes are conservatively numeric.	1,3,5,7	0/0
 zsh-hazard-tables	table-property	assignment_hazard, ZSH_RUNS_A_VALUE, ZSH_TIED, ZSH_ARITHMETIC_VARS, HAZARD_VARS	Every listed name assigned a path is a hazard; tied arrays are judged as their scalar (table membership against real zsh is a bench measurement).	1,3,5	0/0
-config-power-lattice	invariant	SupervisorConfig::{default,limit,limits,set,default_shown}, KEYS	≤ is a partial order with default on top (except the opt-in keys, `stall_term`, `limit_reset`, `usage_tap`, `usage_notes` and `usage_credits`, whose default false is the bottom, and `occupancy`, whose default `observe` sits under `prompt`); a changed `limit_reset_kinds` is ≤ only with limit_reset off (neither the lone-offer default nor a list is less power), and limit leaves it as it is; limit(default,k) ≤ default and changes only k; enabling is visible; default_shown is None only for rules_file and non-keys.	1,2,3,5	3/3
+config-power-lattice	invariant	SupervisorConfig::{default,limit,limits,set,default_shown}, KEYS	≤ is a partial order with default on top (except the opt-in keys, `stall_term`, `limit_reset`, `usage_notes` and `usage_credits`, whose default false is the bottom, and `occupancy`, whose default `observe` sits under `prompt`); a changed `limit_reset_kinds` is ≤ only with limit_reset off (neither the lone-offer default nor a list is less power), and limit leaves it as it is; limit(default,k) ≤ default and changes only k; enabling is visible; default_shown is None only for rules_file and non-keys.	1,2,3,5	3/3
 config-reader-never-grants	contract	SupervisorConfig::{from_aterm_toml,set}	from_aterm_toml(text) ≤ default except the root-table opt-ins (each ships false, and `occupancy` ships `observe`; only the root [harness] table's true — `occupancy`'s `"prompt"`, never an on spelling — turns it on, a misplaced table's grants nothing and its false or off still limits); an unreadable value keeps the default with one note; any off spelling is the limit; unknown keys change nothing; answer_questions=false wins in either order.	1,2,3,5,7,12	13/13
 config-misplaced-only-limits	contract	SupervisorConfig::from_aterm_toml (misplaced pass)	Result = root reading ⊓ the limits of every misplaced harness.<k> (grants contribute ⊤), independent of order, each noted with its path.	1,2,3,5,7,12	2/2
 config-line-reader-agrees	refinement	SupervisorConfig::from_aterm_toml (fallback line reader)	For text TOML refuses, the meet of the one-line [harness] settings outside multi-line values and comments, BOM-tolerant, first note `not valid TOML`.	1,3,5,7	3/3
@@ -1941,7 +1942,7 @@ src/supervise/config.rs	the_default_is_every_power_and_every_key_limits_it	confi
 src/supervise/config.rs	the_memory_ceiling_reads_auto_off_or_gibibytes_and_limits_to_off	config-reader-never-grants	
 src/supervise/config.rs	usage_credits_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
 src/supervise/config.rs	usage_notes_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
-src/supervise/config.rs	usage_tap_ships_off_and_only_the_root_table_turns_it_on	config-reader-never-grants	
+src/supervise/config.rs	usage_tap_ships_on_and_the_root_tables_off_limits_it	config-reader-never-grants	
 src/supervise/escalate.rs	a_long_subject_and_reason_are_clipped_and_the_whole_fits_256_bytes	escalate-attention-text	
 src/supervise/escalate.rs	a_question_dialogs_badge_names_its_question	escalate-kind-and-subject	
 src/supervise/escalate.rs	a_question_read_whole_is_badged_by_its_question	escalate-kind-and-subject	

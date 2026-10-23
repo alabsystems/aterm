@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fleet glance's tests (`docs/DESIGN-owner-surfaces-2026-10-16.md` §10): the read's fixtures, the poll table, the single-flight runner and its kill, and no thread on a headless App.
+//! Tests for the menu-bar fleet glance.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// One fleet peer's JSON entry: its header and session rows, each row a
-/// list of `key=value` pairs.
 fn peer(label: &str, header: &[(&str, &str)], rows: &[&[(&str, &str)]]) -> String {
     let object = |pairs: &[(&str, &str)]| {
         let members: Vec<String> = pairs
@@ -24,12 +22,10 @@ fn peer(label: &str, header: &[(&str, &str)], rows: &[&[(&str, &str)]]) -> Strin
     )
 }
 
-/// A fleet peer that did not answer.
 fn unanswered(label: &str, why: &str) -> String {
     format!("{{\"label\":\"{label}\",\"fleet\":true,\"error\":\"{why}\"}}")
 }
 
-/// A current peer's header.
 fn header(node: &str) -> Vec<(&'static str, String)> {
     vec![
         ("pid", "77".to_string()),
@@ -45,7 +41,6 @@ fn pairs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
     v.iter().map(|(k, s)| (*k, s.as_str())).collect()
 }
 
-/// A quiet current row.
 const QUIET: &[(&str, &str)] = &[
     ("sid", "s-q"),
     ("state", "alive"),
@@ -55,11 +50,6 @@ const QUIET: &[(&str, &str)] = &[
     ("needs", "-"),
 ];
 
-/// THE FLEET READ, PARSED (§10's fixtures): 31 peers with 3 timeouts; this
-/// machine's own instance and a sibling (no `fleet:true`) and this machine
-/// answering through its own book (its node) dropped; a stalled worker's
-/// need with its manager; 2 older peers, whose rows carry no `needs=`, kept
-/// but needing nothing; a `cut=` reply's rows left out counted.
 #[test]
 fn a_fleet_read_parses_to_its_peers() {
     let mut hosts = vec![
@@ -162,18 +152,10 @@ fn a_fleet_read_parses_to_its_peers() {
     assert!(parse("not json", false, None, 0).is_err());
 }
 
-/// `entry`, a fleet peer's, as the survey marks one that proved no node key
-/// this machine binds (`"fleet":true,"unproven":true`).
 fn unproven(entry: &str) -> String {
     entry.replacen("\"fleet\":true", "\"fleet\":true,\"unproven\":true", 1)
 }
 
-/// A PEER THAT PROVED NO NODE KEY IS ITS WORD ALONE (`"unproven":true`, the
-/// survey's `node unproven`): listed, marked and its needs read, but what it
-/// says of itself is not taken — its `node=` neither passes it off as this
-/// Mac nor keys its notices, its `host=` sends Screen Sharing and ssh nowhere
-/// but the name the book knows it by, and its `drive=1` lets this Mac drive
-/// nothing — and none of its needs counts.
 #[test]
 fn an_unproven_peer_is_listed_on_its_word_alone() {
     let stalled: &[(&str, &str)] = &[
@@ -228,11 +210,6 @@ fn an_unproven_peer_is_listed_on_its_word_alone() {
     }
 }
 
-/// A FLEET NEED NAMES ITS TAB AS A LOCAL ONE DOES (`status_item::tab_name`):
-/// its role first, then, where the peer serves content, the title its person
-/// gave, then its OSC title without the spinner or idle glyph an agent leads
-/// it with — so a spinner frame moves neither the row nor its notice — and
-/// its program where none is set.
 #[test]
 fn a_fleet_need_names_its_tab_as_a_local_one_does() {
     let need_of = |level: &str, needs: &str, extra: &[(&str, &str)]| {
@@ -275,9 +252,6 @@ fn a_fleet_need_names_its_tab_as_a_local_one_does() {
     assert_eq!(need_of("facts", "stalled", &[]).1, Some(5000));
 }
 
-/// A CONTENT PEER SAYS WHAT ITS NEED IS: an ask's row carries the ask's
-/// own words, a box its kind, a wall its kind and reset, as a local row
-/// does.
 #[test]
 fn a_content_peer_says_what_its_need_is_and_a_freeze_dates_only_an_agent() {
     let need_of = |level: &str, needs: &str, row: &[(&str, &str)]| {
@@ -430,11 +404,6 @@ fn the_book_says_whether_this_mac_knows_only_its_issuer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PEER IS DIALLED BY THE NAME THE BOOK KNOWS IT BY: the fleet client
-/// labels an answer from an address the book does not name `<name> at
-/// <address>`, which `survey --host` cannot resolve, so its reads are given
-/// the name, its rows show the name's first label, and its notices are keyed
-/// by its node, which a new address does not move.
 #[test]
 fn a_peer_known_by_name_is_dialled_by_it() {
     let exited: &[(&str, &str)] = &[("sid", "s-x"), ("state", "exited"), ("needs", "-")];
@@ -497,8 +466,6 @@ fn a_peer_known_by_name_is_dialled_by_it() {
     );
 }
 
-/// `chrome`'s fleet word tells a Mac in no fleet (`off`) from one in a fleet
-/// not read yet (`unread`), and a read from either.
 #[test]
 fn the_fleet_word_tells_no_fleet_from_not_read_yet() {
     let mut slot = FleetSlot::default();
@@ -515,8 +482,6 @@ fn the_fleet_word_tells_no_fleet_from_not_read_yet() {
     assert_eq!(slot.word(), "as_of:42");
 }
 
-/// EVERY PEER REFUSED WITH NO ROUTE: the snapshot says so (the read's
-/// stderr's note) and the digest's one entry is the level family's.
 #[test]
 fn all_no_route_is_one_line_and_one_entry() {
     let hosts: Vec<String> = (0..4)
@@ -538,9 +503,6 @@ fn all_no_route_is_one_line_and_one_entry() {
     );
 }
 
-/// WHEN TO READ (§9 S10): never in no fleet; on menu open when the last read
-/// is older than 15 s or there is none; on the minute on the issuer or with
-/// `[fleet] watch`; a member without watch only at the menu.
 #[test]
 fn should_poll_reads_on_the_minute_or_at_the_menu() {
     let member = BookFacts {
@@ -577,7 +539,6 @@ fn should_poll_reads_on_the_minute_or_at_the_menu() {
     }
 }
 
-/// A runner that counts its reads and blocks on a gate until told to answer.
 struct Gated {
     runs: Arc<AtomicUsize>,
     gate: Receiver<()>,
@@ -593,7 +554,6 @@ impl FleetRunner for Gated {
     }
 }
 
-/// The seams of a reader in a fleet, its posts counted on `posts`.
 fn seams(issuer: bool, posts: Sender<()>) -> ReaderSeams {
     ReaderSeams {
         book: Box::new(move || BookFacts {
@@ -610,9 +570,6 @@ fn seams(issuer: bool, posts: Sender<()>) -> ReaderSeams {
     }
 }
 
-/// THE RUNNER IS SINGLE-FLIGHT: an issuer reads at once; kicks that arrive
-/// while that read is in flight are answered by it — one read for all of
-/// them — and a Read Now after it is a read of its own.
 #[test]
 fn the_reader_is_single_flight() {
     let hang = aterm_spec::wait::MUST_HAPPEN;
@@ -661,7 +618,6 @@ fn the_reader_is_single_flight() {
     assert!(glance.copy().snapshot_at(0).is_none());
 }
 
-/// A runner that answers an empty fleet at once.
 struct Empty;
 
 impl FleetRunner for Empty {
@@ -670,9 +626,6 @@ impl FleetRunner for Empty {
     }
 }
 
-/// THE APP IS TOLD WHEN THE LAST READ STOPS COUNTING, with no read: a member
-/// (no issuer, no watch) reads only when asked, so nothing else would drop a
-/// fleet need from the badge past [`COUNT_FRESH`].
 #[test]
 fn the_app_is_told_when_the_last_read_stops_counting() {
     use std::sync::atomic::AtomicU64;
@@ -719,10 +672,6 @@ fn the_app_is_told_when_the_last_read_stops_counting() {
     assert!(!slot.reading, "the lapse is no read");
 }
 
-/// A LAPSE THAT PASSES WHILE THE READ'S END IS TOLD IS TOLD TOO: the next
-/// lapse is reckoned from the instant the App was told, not from a later
-/// look at the clock, so one that passes in between (the reader descheduled
-/// after its post, a Mac asleep) is still news.
 #[test]
 fn a_lapse_that_passes_while_the_read_is_told_is_told() {
     use std::sync::atomic::AtomicU64;
@@ -799,8 +748,6 @@ fn a_child_that_never_answers_is_killed_and_posts_its_failure() {
     assert!(glance.copy().word().starts_with("as_of:"));
 }
 
-/// Seams that touch nothing of this machine's: in no fleet, never posting
-/// to an event loop.
 fn inert_seams() -> ReaderSeams {
     ReaderSeams {
         book: Box::new(BookFacts::default),
@@ -812,9 +759,6 @@ fn inert_seams() -> ReaderSeams {
     }
 }
 
-/// NO THREAD ON A HEADLESS APP: the gate refuses it whatever runner and
-/// seams it is handed, and `chrome` says `fleet=off`; the real start refuses
-/// it there too.
 #[test]
 fn a_headless_app_starts_no_fleet_glance() {
     let mut app = crate::App::headless_for_test();
@@ -836,8 +780,6 @@ fn a_headless_app_starts_no_fleet_glance() {
     }
 }
 
-/// A fleet glance handle over `slot`, with no reader thread (its kicks go
-/// nowhere): the App reads it as it reads a live one.
 fn glance_over(slot: FleetSlot) -> FleetGlance {
     let (kick, _) = std::sync::mpsc::channel();
     FleetGlance {
@@ -847,8 +789,6 @@ fn glance_over(slot: FleetSlot) -> FleetGlance {
     }
 }
 
-/// A slot in a fleet whose last good read, at `read_at_ms`, holds one Mac
-/// with one stalled worker, and refused with no route when `dark`.
 fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
     let need = FleetNeed {
         sid: "s-w".to_string(),
@@ -885,10 +825,6 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
     }
 }
 
-/// THE APP'S FLEET READ (`Wake::FleetRead`): every peer refusing with no
-/// route is ONE `FleetUnreadable` digest entry, and a read that reaches a peer
-/// again sweeps it (a level family); a fresh read's need posts ONE desktop
-/// notice, the same need re-read posts none, and the badge counts it.
 #[test]
 fn a_fleet_read_states_its_digest_entry_and_heralds_its_needs() {
     let take_posts =
@@ -1007,8 +943,6 @@ fn a_successors_first_fleet_read_tells_no_standing_need_again() {
     assert!(refused.fleet_told_rows().is_empty(), "owed is not told");
 }
 
-/// The park's told rows read back by herald key; a row that names no fleet
-/// key or no word this build knows, or is no row, is dropped.
 #[test]
 fn told_fleet_rows_read_back_and_drop_what_does_not_read() {
     let key = herald_key("mac-17", "s-w");
@@ -1023,8 +957,6 @@ fn told_fleet_rows_read_back_and_drop_what_does_not_read() {
     assert_eq!(told.get(&key), Some(&NeedWord::Ask));
 }
 
-/// A host word is what a `vnc://` URL and an `ssh` line may carry; anything
-/// else is no host.
 #[test]
 fn host_words_and_herald_keys() {
     for ok in ["mac-17", "mac-17.local", "10.0.0.5", "a_b"] {
@@ -1095,7 +1027,6 @@ fn a_fleet_act_goes_through_the_seams_and_no_host_gets_nothing() {
     );
 }
 
-/// mac-17 as read at `read_at_ms`, with its stalled worker when `need`.
 fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
     FleetMac {
         name: "mac-17".to_string(),
@@ -1117,7 +1048,6 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
     }
 }
 
-/// A peer that did not answer, by its book name.
 fn silent(dial: &str) -> Unanswered {
     Unanswered {
         name: short_name(dial),
@@ -1126,8 +1056,6 @@ fn silent(dial: &str) -> Unanswered {
     }
 }
 
-/// An issuer's slot whose last good read, at `read_at_ms`, holds `macs` and
-/// did not hear from `unanswered`.
 fn slot_of(read_at_ms: u64, macs: Vec<FleetMac>, unanswered: Vec<Unanswered>) -> FleetSlot {
     FleetSlot {
         generation: 1,
@@ -1147,10 +1075,6 @@ fn slot_of(read_at_ms: u64, macs: Vec<FleetMac>, unanswered: Vec<Unanswered>) ->
     }
 }
 
-/// A READ CARRIES A SILENT MAC'S LAST ROWS WHILE THEY COUNT: a Mac that
-/// missed a read is kept, carried, with its own read time — through a
-/// further miss too — and is still listed as not answering; past
-/// `COUNT_FRESH` of its own read it is only not answering.
 #[test]
 fn a_read_carries_a_silent_mac_while_its_rows_count() {
     let t0 = 1_000_000;
@@ -1185,12 +1109,10 @@ fn a_read_carries_a_silent_mac_while_its_rows_count() {
     assert_eq!(carry(None, next(t0), t0).macs.len(), 1);
 }
 
-/// The notices the App posted since the last take.
 fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
     crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
-/// A windowed App, its desktop notices on, its notice tap empty.
 fn windowed_app() -> crate::App {
     let mut app = crate::App::headless_for_test();
     app.headless = false;
@@ -1200,10 +1122,6 @@ fn windowed_app() -> crate::App {
     app
 }
 
-/// A STANDING FLEET NEED IS ONE NOTICE (§3: one per transition): a read gone
-/// stale, then a read in which its Mac did not answer (its rows too old to
-/// carry), then the Mac answering again with the same need, post nothing
-/// more and keep its slot, and the badge counts it again.
 #[test]
 fn a_standing_fleet_need_posts_once_across_a_stale_read_and_a_silent_mac() {
     let now = aterm_time::unix_millis().unwrap_or(0);
@@ -1255,8 +1173,6 @@ fn a_standing_fleet_need_posts_once_across_a_stale_read_and_a_silent_mac() {
     );
 }
 
-/// AN UNPROVEN MAC'S NEED IS NEVER TOLD: what it says is its word alone, so
-/// a fresh read of it posts no notice, keeps no slot and counts nothing.
 #[test]
 fn an_unproven_macs_need_is_never_told() {
     let now = aterm_time::unix_millis().unwrap_or(0);
@@ -1274,11 +1190,6 @@ fn an_unproven_macs_need_is_never_told() {
     }
 }
 
-/// A FLEET NEED THAT CANNOT BE TOLD NOW OWES NOTHING: a notice the queue
-/// refused is owed (the herald's timer re-asks for it), and once the read
-/// goes stale, or its Mac stops answering, the debt is dropped — no read
-/// could pay it, and an owed key the App cannot note would wake the timer at
-/// once forever.
 #[test]
 fn a_fleet_need_that_cannot_be_told_owes_nothing() {
     let now = aterm_time::unix_millis().unwrap_or(0);
@@ -1309,9 +1220,6 @@ fn a_fleet_need_that_cannot_be_told_owes_nothing() {
     let _ = take_posts();
 }
 
-/// A HOLD THIS MAC PLACED IS READ BACK WHATEVER ITS NEED: a peer's row whose
-/// `held_from=` is this Mac's node is a session this Mac holds there — its
-/// Hand Back's row — though it needs nothing, since a hold is never a need.
 #[test]
 fn a_hold_this_mac_placed_is_read_back_whatever_its_need() {
     let mine = "0123456789abcdef0123456789abcdef";
@@ -1350,9 +1258,6 @@ fn a_hold_this_mac_placed_is_read_back_whatever_its_need() {
     assert!(blind.macs[0].held_here.is_empty(), "{:?}", blind.macs[0]);
 }
 
-/// THE STEP-IN FROM THE MENU BAR: a peer whose header says `drive=1` lets
-/// this Mac drive it, and its need's Take Over or Hand Back is `aterm ctl
-/// --host <the name the book knows it by> hold <sid> on|off`.
 #[test]
 fn a_peer_that_says_drive_is_held_and_handed_back_over_the_fleet() {
     let mut head = header("n4");

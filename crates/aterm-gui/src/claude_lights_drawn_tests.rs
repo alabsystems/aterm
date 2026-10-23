@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE CHIP AS DRAWN (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.3 and §12.5.6): `chrome`'s `autopilot` line says the chip's face now and its cells only as the last frame drew them — never a stale face for a pane that frame did not draw, never a chip a later band covers, never a face for a program with no footer.
+//! Tests for the drawn Autopilot chip line and glass state.
 
 use std::time::Instant;
 
@@ -14,8 +14,6 @@ use super::{Drawn, WindowLights};
 use crate::autopilot::AutopilotView;
 use crate::{App, WindowId};
 
-/// Session `session` runs `program` (its published foreground name), as the
-/// status sweep publishes it.
 fn set_program(app: &App, session: u64, program: &str) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -23,16 +21,12 @@ fn set_program(app: &App, session: u64, program: &str) {
     timeline.set_program(PGID, Some(program.into()));
 }
 
-/// Session `session` runs Claude Code with its facts published and its
-/// composer drawn: what the footer, and so the chip, is painted for.
 fn claude(app: &App, session: u64) {
     publish_facts(app, session);
     set_program(app, session, "claude");
     draw_claude(app, session, BYPASS);
 }
 
-/// Session `session`'s own Autopilot word, written as `meta set autopilot`
-/// stores it — with no frame painted after it.
 fn set_word(app: &App, session: u64, word: Autopilot) {
     app.pool
         .get(session)
@@ -44,7 +38,6 @@ fn set_word(app: &App, session: u64, word: Autopilot) {
         .set("autopilot", Some(word.word().into()));
 }
 
-/// A hosted window: one Claude Code pane, drawn, one frame painted.
 fn desk() -> (App, WindowId, u64, std::os::unix::net::UnixStream, Hosted) {
     let (mut app, wid, session, reader) = app();
     let hosted = host(&mut app);
@@ -53,7 +46,6 @@ fn desk() -> (App, WindowId, u64, std::os::unix::net::UnixStream, Hosted) {
     (app, wid, session, reader, hosted)
 }
 
-/// Session `session`'s `autopilot` lines, in the order `chrome` prints them.
 fn lines_of(app: &App, session: u64) -> Vec<String> {
     let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
     let head = format!("autopilot sid={} ", sid.as_str());
@@ -63,14 +55,12 @@ fn lines_of(app: &App, session: u64) -> Vec<String> {
         .collect()
 }
 
-/// Session `session`'s `autopilot` line, exactly one.
 fn line_of(app: &App, session: u64) -> String {
     let lines = lines_of(app, session);
     assert_eq!(lines.len(), 1, "one line for the pane: {lines:?}");
     lines[0].clone()
 }
 
-/// The line's bare `key=` token.
 fn token<'a>(line: &'a str, key: &str) -> &'a str {
     let at = line
         .find(&format!(" {key}="))
@@ -79,7 +69,6 @@ fn token<'a>(line: &'a str, key: &str) -> &'a str {
     rest.split(' ').next().unwrap_or_default()
 }
 
-/// The line's quoted `key="…"`, `None` for `key=-`.
 fn quoted(line: &str, key: &str) -> Option<String> {
     let at = line
         .find(&format!(" {key}="))
@@ -92,14 +81,10 @@ fn quoted(line: &str, key: &str) -> Option<String> {
     Some(quoted[..end].to_string())
 }
 
-/// The line's `drawn=`: the quoted cells, or `None` for `drawn=-`.
 fn drawn(line: &str) -> Option<String> {
     quoted(line, "drawn")
 }
 
-/// The Autopilot chip of `session` as the last frame put it on the glass of
-/// window `wid`: the frame's own cells at the chip's hits, in column order,
-/// a wide glyph's right half left out.
 fn on_glass(app: &App, wid: WindowId, session: u64) -> Option<String> {
     let ws = &app.windows[&wid];
     let mut hits: Vec<(usize, usize)> = ws
@@ -130,11 +115,6 @@ fn node_label(app: &App, wid: WindowId, session: u64) -> Option<String> {
         .map(|c| c.label)
 }
 
-/// THE FACE MOVES, THE GLASS DOES NOT UNTIL A FRAME: with no frame since
-/// the session's word moved, `face=` says the new face, `drawn=` the face
-/// the frame drew, cell for cell what the frame's glass holds, and
-/// `spoken=` what the chip's accessibility node says of it; after a frame
-/// all three say the new one.
 #[test]
 fn chrome_reads_the_chip_the_frame_drew() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -203,11 +183,6 @@ fn chrome_reads_the_chip_the_frame_drew() {
     );
 }
 
-/// A PANE BEHIND NAMES NO DRAWN CHIP: two tabs, each a Claude Code; with the
-/// second in front its line's `drawn=` is the frame's cells, while the first
-/// — its chip's face moved behind — says `drawn=- why=not-drawn spoken=-`
-/// and the new `face=`, before a frame (the frame that drew it is the last
-/// one) and after one.
 #[test]
 fn a_background_pane_names_no_drawn_chip() {
     let (mut app, wid, a, _reader, _host) = desk();
@@ -263,11 +238,6 @@ fn a_background_pane_names_no_drawn_chip() {
     assert_eq!(drawn(&line), on_glass(&app, wid, a), "{line}");
 }
 
-/// A CHIP A LATER BAND COVERS IS NOT DRAWN: a band the frame splices after
-/// the footer (the link caption, the paste question) claims the rule's row
-/// in the window's chrome register; the pointer's, the keyboard's and the
-/// accessibility tree's readers of the hits drop the chip there, and
-/// `chrome` says `drawn=- why=not-drawn spoken=-` too.
 #[test]
 fn a_chip_a_band_covers_names_no_cells() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -303,11 +273,6 @@ fn a_chip_a_band_covers_names_no_cells() {
     assert_eq!(token(&line, "face"), "cruise", "the face stands: {line}");
 }
 
-/// A RULE WITH NO RUN TO WRITE INTO HAS NO ROOM: Claude Code's bottom rule
-/// on the glass with a mark on every glyph, so no cell of it is plain rule
-/// for the footer to take — the frame finds the rule (the keyboard's
-/// register, `footers`) and fits no block — says `drawn=- why=no-room`
-/// under a live host, whatever no frame has noted of the session's view.
 #[test]
 fn a_rule_with_no_run_names_no_room() {
     let (mut app, wid, session, _reader) = app();
@@ -345,9 +310,6 @@ fn a_rule_with_no_run_names_no_room() {
     );
 }
 
-/// A SESSION CO-VIEWED IN TWO WINDOWS PRINTS A LINE IN EACH, TOLD APART BY
-/// `window=`: each window's line says the cells that window's last frame
-/// drew.
 #[test]
 fn a_co_viewed_session_names_each_window() {
     let (mut app, wid, session, _reader, _host) = desk();
@@ -374,8 +336,6 @@ fn a_co_viewed_session_names_each_window() {
     }
 }
 
-/// GEMINI CLI HAS NO FOOTER, SO NO CHIP: its line says `face=- drawn=-
-/// why=no-footer spoken=- description=-`, its mode notwithstanding.
 #[test]
 fn the_chip_line_names_no_chip_for_gemini() {
     let (mut app, wid, session, _reader) = app();
@@ -398,9 +358,6 @@ fn the_chip_line_names_no_chip_for_gemini() {
     assert_eq!(token(&line, "face"), "cruise", "{line}");
 }
 
-/// Session `session`'s harness need, as the loop's request lands it: the
-/// needs owner's entry (`None`: its `unset`) and its `MetaChanged` wake,
-/// which publishes the need.
 fn need(app: &mut App, session: u64, entry: Option<&str>) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     ctx.meta
@@ -425,13 +382,6 @@ fn node_description(app: &App, wid: WindowId, session: u64) -> Option<String> {
         .and_then(|c| c.description)
 }
 
-/// CHROME SAYS THE CHIP'S DESCRIPTION AS ITS NODE DOES (the W4 title
-/// slice, §12.2.1 and §12.3.1): a Cruise chip with nothing to say beside
-/// its face prints `description=-`; with a harness's need published,
-/// `description="Needs you: <the need>. Carrying on."`; under `⤓ land` with
-/// a read hold, `spoken="Autopilot: land."` still (the painted word, WCAG
-/// 2.5.3) and a description that leads `Not landed yet.` and names the
-/// need in the hold, once; each the accessibility node's own.
 #[test]
 fn chrome_says_the_chips_description_as_its_node_does() {
     use crate::harness_glass::hold_tests::held;
@@ -509,14 +459,6 @@ fn chrome_says_the_chips_description_as_its_node_does() {
     );
 }
 
-/// THE HOVERED TITLE ON THE GLASS SAYS THE NEED AND THE HOLD (§12.2.3
-/// item 5, §12.3.3 item 4; the W4 title slice's review): pointed at on a
-/// rule with room for the whole title, a Cruise chip's title as the frame
-/// drew it carries the session's published need as `need_title` makes it,
-/// and under `⤓ land` with a read hold, the hold's title form right after
-/// the mode phrase — what the block read off the session's own glass and
-/// timeline, where the face tests hand `autopilot_title` its words
-/// themselves.
 #[test]
 fn the_hovered_title_on_the_glass_says_the_need_and_the_hold() {
     use super::super::gesture_tests::{footer_row, row_text};
@@ -571,8 +513,6 @@ fn the_hovered_title_on_the_glass_says_the_need_and_the_hold() {
     );
 }
 
-/// A PANE NO SUPERVISOR ADMITS PRINTS NO LINE: a shell's pane, beside a
-/// Claude Code's, which does.
 #[test]
 fn a_shell_pane_prints_no_chip_line() {
     let (mut app, wid, session, _reader) = app();
@@ -589,10 +529,6 @@ fn a_shell_pane_prints_no_chip_line() {
     );
 }
 
-/// CELLS ONLY WHERE THE CHIP REACHED THE GLASS: a block the frame fitted
-/// and lent, and that came back, but whose chips the rule's write never took
-/// (no hit of them), says `no-room`; once the painter notes its hits, the
-/// cells.
 #[test]
 fn a_chip_the_rule_did_not_take_names_no_cells() {
     let blank = aterm_core::terminal::RenderCell {

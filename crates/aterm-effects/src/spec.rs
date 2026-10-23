@@ -255,6 +255,14 @@ impl SpecTable {
 }
 
 /// One raw `[[sparkle_words.custom]]` entry, serde-shaped so the native `Config` deserializer embeds it directly:
+///
+/// ```toml
+/// [[sparkle_words.custom]]
+/// words   = ["ultrathink", "gg", "猫神"]
+/// ink     = { colorway = "rainbow" }        # or "twotone:#RRGGBB,#RRGGBB"
+/// burst   = { kind = "starburst", chance = 10 }
+/// graphic = { collection = "cats" }
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub struct RawCustomEntry {

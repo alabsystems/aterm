@@ -1491,6 +1491,118 @@ fn a_tape_from_a_build_with_no_tell_replays_without_the_tells() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Slice 2's host doors, every one a build before them lacked.
+const SLICE2_DOORS: [&str; 5] = [
+    "host.wakes",
+    "host.wake_claim",
+    "host.wake_release",
+    "host.wake_told",
+    "host.task_fact",
+];
+
+/// A SLICE-1 TAPE REPLAYS UNCHANGED (the slice-2 plan's 2.0 and D7): an observed break's tape
+/// whose header names none of slice 2's doors, as slice 1's build wrote it, reproduces on this
+/// build, every told word compared byte for byte at `host.occupancy_said`, as does the same tape
+/// under the header this build writes; the loop asked none of slice 2's doors. NEGATIVE
+/// CONTROL: the tape's first told word with a rule left out of its list, what a build telling
+/// another set of rules prints, diverges at `host.occupancy_said`.
+#[test]
+fn a_slice_one_tape_replays_unchanged() {
+    use crate::supervise::tape::codec::Item;
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+    use astream_effects::EffectRecord;
+
+    let (dir, ledger) = ledger_at("door-slice-one-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(35 * 60)
+    };
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let door_of = |i: &Item| match i.record() {
+        Some(EffectRecord::Exchange { door, .. } | EffectRecord::Emit { door, .. }) => {
+            Some(door.clone())
+        }
+        _ => None,
+    };
+    let crossed: Vec<String> = items.iter().filter_map(door_of).collect();
+    assert!(
+        crossed.iter().any(|d| d == "host.occupancy_said"),
+        "the door told its host: {crossed:?}"
+    );
+    assert!(
+        !crossed.iter().any(|d| SLICE2_DOORS.contains(&d.as_str())),
+        "{crossed:?}"
+    );
+    let older: String = header
+        .lines()
+        .map(|line| match line.strip_prefix("host_doors=") {
+            Some(doors) => {
+                let named: Vec<&str> = doors.split(' ').collect();
+                assert!(
+                    SLICE2_DOORS.iter().all(|d| named.contains(d)),
+                    "this build names them: {named:?}"
+                );
+                let kept: Vec<&str> = named
+                    .into_iter()
+                    .filter(|d| !SLICE2_DOORS.contains(d))
+                    .collect();
+                format!("host_doors={}\n", kept.join(" "))
+            }
+            None => format!("{line}\n"),
+        })
+        .collect();
+    assert_ne!(older, header, "the header named the doors");
+    for header in [&older, &header] {
+        let report = replay(&written(header, &items), &Options::default()).expect("replayed");
+        assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    }
+
+    let mut cut = false;
+    let edited: Vec<Item> = items
+        .iter()
+        .map(|item| match item {
+            Item::Effect {
+                record: EffectRecord::Emit { door, bytes },
+                stamp,
+            } if door == "host.occupancy_said" && !cut => {
+                let text = String::from_utf8(bytes.clone()).expect("the told word is UTF-8");
+                let from = text
+                    .find(", SaidRule { rule: HoldRoom")
+                    .expect("the word lists hold-room after wait-nudge");
+                let to = from + text[from..].find(']').expect("the list ends");
+                cut = true;
+                Item::Effect {
+                    record: EffectRecord::Emit {
+                        door: door.clone(),
+                        bytes: format!("{}{}", &text[..from], &text[to..]).into_bytes(),
+                    },
+                    stamp: *stamp,
+                }
+            }
+            other => other.clone(),
+        })
+        .collect();
+    assert!(cut, "a told word to cut");
+    let report = replay(&written(&older, &edited), &Options::default()).expect("replayed");
+    let Verdict::Diverged(d) = &report.verdict else {
+        panic!("{}", report.render());
+    };
+    assert_eq!(d.door.as_deref(), Some("host.occupancy_said"), "{d:?}");
+}
+
 #[test]
 fn a_closed_hold_is_told_to_the_host() {
     let (dir, path) = ledger_at("door-close-told");
@@ -1540,6 +1652,8 @@ fn a_closed_hold_is_told_to_the_host() {
 
 #[test]
 fn a_loop_that_ends_tells_its_host_no_hold() {
+    use crate::supervise::occupancy::SaidRule;
+    use crate::supervise::occupancy::said::told_rules;
     use crate::supervise::tape::testing::assert_replays;
 
     let (dir, ledger) = ledger_at("door-end-told");
@@ -1562,6 +1676,22 @@ fn a_loop_that_ends_tells_its_host_no_hold() {
     assert!(
         before.last().and_then(|s| s.hold).is_some(),
         "the open hold was told: {said:#?}"
+    );
+    let open: Vec<RuleId> = before
+        .last()
+        .map_or_else(Vec::new, |s| s.rules.iter().map(|r| r.rule).collect());
+    assert_eq!(open, told_rules(true), "the open word told every rule");
+    let quiet: Vec<SaidRule> = open
+        .into_iter()
+        .map(|rule| SaidRule {
+            rule,
+            verdict: SaidVerdict::Quiet,
+            at_ms: 0,
+        })
+        .collect();
+    assert_eq!(
+        last.rules, quiet,
+        "the end tells each rule, quiet: {last:#?}"
     );
     assert_eq!(
         said.iter().filter(|s| s.hold.is_none()).count(),

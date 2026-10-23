@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The signed releases install.sh's Linux verifiers are held to, and the tests both run.
-//!
-//! Each case is a synthetic release signed with Rust keys ([`Case`], [`corpus`]), judged by
-//! the updater's own chain ([`updater_verdict`]). [`Verifier`] is how a suite reaches its
-//! verifier, so each test body below runs in both suites: crates/aterm-update/tests/install_sh
-//! holds the embedded Python verifier to them, and crates/aterm-bootstrap-verify/tests/install_sh
-//! (which includes this file by path) holds the static Rust one.
+//! Signed release test corpus and differential harness for install.sh Linux verifiers.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -41,20 +35,12 @@ pub type PolicyAnswer = Result<PolicyView, Answer>;
 
 /// One of install.sh's Linux verifiers, as a suite reaches it.
 pub trait Verifier: Sync {
-    /// The command line over each laid case, with its candidate, trusting the case's pins.
     fn mains(&self, scratch: &Scratch, runs: &[(&Case, &Laid)]) -> Vec<Answer>;
-    /// The durable policy beside each store (`read_install_policy`).
     fn policies(&self, scratch: &Scratch, stores: &[&Path]) -> Vec<PolicyAnswer>;
-    /// The pre-flight (`--store-path`) over each store: `ok\t`, or `refused\t<why>`.
     fn preflights(&self, scratch: &Scratch, stores: &[&Path]) -> Vec<Answer>;
-    /// `verify_manifest` over each laid case at its Unix second, under no durable policy.
     fn manifests_at(&self, scratch: &Scratch, asks: &[(&Case, &Laid, i64)]) -> Vec<Answer>;
-    /// The install-path walk (`check_install_path`) over each directory.
     fn walks(&self, scratch: &Scratch, dirs: &[&Path]) -> Vec<Answer>;
-    /// Whether each group is this user's private one, as the walk reads it.
     fn private_groups(&self, scratch: &Scratch, gids: &[u32]) -> Vec<bool>;
-    /// A batch over install.sh in which `linux_release_verify` reaches this verifier,
-    /// trusting `pins`.
     fn lib(&self, pins: &[String]) -> Lib;
 }
 
@@ -1006,8 +992,6 @@ pub const MUTATIONS: &[Mutation] = &[
         Rule::Shared,
         |c, _| c.machines[0].extra = "added_at = 1\n".into(),
     ),
-    // What TOML 1.0 (the updater's reader) admits and tomllib, the embedded verifier's,
-    // does not: the installer reads a document as tomllib does.
     (
         "a roster after a byte order mark",
         Rule::Installer,
@@ -1100,7 +1084,6 @@ impl Tally {
 
 static LAID: AtomicU32 = AtomicU32::new(0);
 
-/// A directory under `scratch` no other call in this process names.
 fn fresh(scratch: &Scratch, what: &str) -> PathBuf {
     scratch.mkdir(&format!("{what}.{}", LAID.fetch_add(1, Ordering::Relaxed)))
 }
@@ -1936,9 +1919,6 @@ enum Pair {
     SignatureOnly,
 }
 
-/// A row of [`an_older_release_is_judged_under_the_current_signed_policy`]: its edit of the
-/// candidate's case and of the head's, how the head is published, and the build installed
-/// or a word of the refusal.
 type HeadRow = (
     &'static str,
     fn(&mut Case, &mut Case, &Keys),
@@ -1946,7 +1926,6 @@ type HeadRow = (
     Result<u64, &'static str>,
 );
 
-/// A stolen machine's floor in the durable policy, which the roster revokes.
 fn stolen_floor(c: &mut Case) {
     c.revoked = vec!["thief".into()];
     c.policy.min_build = 9_999_999_999;

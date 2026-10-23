@@ -407,7 +407,7 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(mode))
 }
 
-/// Set an open file's permission bits to `mode` (`fchmod(2)`) for [`crate::extract::write_capped`].
+/// Set an open file's permission bits to `mode` (`fchmod(2)`) for `crate::extract::write_capped`.
 pub fn set_mode_on(f: &File, mode: u32) -> io::Result<()> {
     f.set_permissions(Permissions::from_mode(mode))
 }

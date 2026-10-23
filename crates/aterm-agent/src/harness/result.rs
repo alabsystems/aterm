@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A WORKER'S RESULT (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.3).
+//! Worker result extraction from conversation transcripts.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -12,16 +12,14 @@ use aterm_json::Value;
 use super::upgrade::{ANNOUNCE_HEAD, is_land_act};
 use crate::supervise::policy::turn_end::{is_done_check, says_done, without_finished_lines};
 
-/// The most of a result one `result` reply prints, in characters; the rest is in the file its last line names.
+/// The most of a result one `result` reply prints, in characters.
 pub const RESULT_MAX_CHARS: usize = 24_000;
 
 /// The most of a transcript the result is read from, from its end.
 pub const TRANSCRIPT_READ_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most of a snapshot `result` reads.
 const RESULT_READ_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most of a sidecar `result` reads: one line.
 const SIDECAR_READ_BYTES: u64 = 8 * 1024;
 
 /// The longest the done edge waits for its turn's end row ([`settled`]): a DEADLINE, not a latency.
@@ -30,15 +28,8 @@ pub const SETTLE_WITHIN: Duration = Duration::from_secs(5);
 /// How often the done edge reads the transcript's end again while it waits.
 pub const SETTLE_EVERY: Duration = Duration::from_millis(150);
 
-/// How much of the transcript's end each read again takes while it waits:
-/// the newest turn's end row, and its prompt where the turn is short.
 const END_READ_BYTES: u64 = 256 * 1024;
 
-/// The misses a reply Claude Code had not written yet explains: either rule
-/// found the newest turn's reply missing or unfinished ([`reread`]) —
-/// `no-reply`, the one this build writes, and `no-marker`, an older build's
-/// (its marker rule wanted the retired token), whose turn is read again by
-/// today's rules.
 const LAG_MISSES: [&str; 2] = ["no-reply", "no-marker"];
 
 /// A worker's report, as its transcript holds it ([`report`]).
@@ -75,7 +66,6 @@ impl Item {
         matches!(self, Item::Prompt(_))
     }
 
-    /// The message's text, when it has any: its blocks, a blank line apart.
     fn said(&self) -> Option<Report> {
         let Item::Said {
             texts,
@@ -95,8 +85,6 @@ impl Item {
     }
 }
 
-/// Whether a `message.content`'s last block is a tool's call (`tool_use`);
-/// `None` for a row that holds no block (the message's `calls` kept).
 fn last_block_calls(content: Option<&Value>) -> Option<bool> {
     match content {
         Some(Value::String(_)) => Some(false),
@@ -107,12 +95,6 @@ fn last_block_calls(content: Option<&Value>) -> Option<bool> {
     }
 }
 
-/// Whether the last assistant message of `items` ends in a tool's call
-/// ([`Item::Said`]'s `calls`): its turn's reply is not written yet — the
-/// call's result and the words after it are still to come (Claude Code
-/// writes a turn's last rows a moment after its screen shows the turn
-/// over), so a preamble before the call (`Task is done; trying the result
-/// again`) is never taken for the turn's last word.
 fn ends_in_call(items: &[Item]) -> bool {
     items.iter().rev().find_map(|i| match i {
         Item::Said { calls, .. } => Some(*calls),
@@ -120,8 +102,6 @@ fn ends_in_call(items: &[Item]) -> bool {
     }) == Some(Some(true))
 }
 
-/// The text parts of a `message.content`: the whole content when it is a
-/// string, else every `text` block's text.
 fn texts_of(content: Option<&Value>) -> Vec<String> {
     match content {
         Some(Value::String(t)) => vec![t.clone()],
@@ -135,10 +115,6 @@ fn texts_of(content: Option<&Value>) -> Vec<String> {
     }
 }
 
-/// One transcript `line` as this reader parses it; `None` for a row that is
-/// no one's words — a subagent's (`isSidechain`), an `isMeta` row, a
-/// compaction summary, Claude Code's own API error — and for a line that is
-/// not JSON (a tail's cut first line, a half-written last one).
 fn row_of(line: &str) -> Option<Value> {
     let v = super::transcript::exchange(line).ok()?;
     let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
@@ -153,18 +129,12 @@ fn row_of(line: &str) -> Option<Value> {
     Some(v)
 }
 
-/// A user row's words: its text (a paste read as what was pasted), Claude
-/// Code's tagged rows (`<task-notification>`, `<command-name>`, …) as they
-/// stand; `None` for a row with none (a tool's result).
 fn words_of(message: &Value) -> Option<String> {
     let typed = texts_of(message.get("content")).join("\n");
     let words = super::upgrade::typed_words(&typed);
     (!words.is_empty()).then(|| words.to_owned())
 }
 
-/// What one transcript `line` is to this reader; `None` for every row that
-/// is no one's words or opens no turn, and for a line that is not JSON (a
-/// tail's cut first line, a half-written last one).
 fn item_of(line: &str) -> Option<Item> {
     if !line.contains("\"user\"") && !line.contains("assistant") {
         return None;
@@ -203,8 +173,6 @@ fn item_of(line: &str) -> Option<Item> {
     }
 }
 
-/// The conversation `jsonl` holds, in order: its prompts, and its assistant
-/// messages with each message's later rows merged into its first.
 fn items(jsonl: &str) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::new();
     for line in jsonl.lines() {
@@ -249,40 +217,29 @@ fn items(jsonl: &str) -> Vec<Item> {
     out
 }
 
-/// The last message of `items` that has text.
 fn final_said(items: &[Item]) -> Option<Report> {
     items.iter().rev().find_map(Item::said)
 }
 
-/// One turn of a conversation: the words that opened it (`None` for the rows
-/// before a tail's first prompt) and what was said in it.
 struct TurnRows<'a> {
     prompt: Option<&'a str>,
     said: &'a [Item],
 }
 
 impl TurnRows<'_> {
-    /// Whether a harness check opened this turn: a land act ([`Self::is_land`])
-    /// or an older build's done check.
     fn is_check(&self) -> bool {
         self.is_land() || self.prompt.is_some_and(is_done_check)
     }
 
-    /// Whether one of Land's acts opened this turn ([`is_land_act`]).
     fn is_land(&self) -> bool {
         self.prompt.is_some_and(is_land_act)
     }
 
-    /// Whether what this turn said is a done ([`says_done`]: a defense, a
-    /// done phrase, `DONE`, the retired token — what the policy reads a done
-    /// claim by), or nothing.
     fn answered_done(&self) -> bool {
         final_said(self.said).is_none_or(|r| says_done(Some(&r.text)))
     }
 }
 
-/// `items` cut into turns, in order, the ones the live upgrade's
-/// announcement opened ([`ANNOUNCE_HEAD`]) left out: the worker's turns.
 fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     let mut out = Vec::new();
     let mut prompt = None;
@@ -307,9 +264,7 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     out
 }
 
-/// The rule a result is read by ([the module's](self)): a check's — the
-/// newest turn a land act opened, or an older build's done check — or a
-/// plain turn's.
+/// The rule a result is read by: a check's or a plain turn's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DoneBy {
     /// The newest turn is a harness check's: the report before it, then what its reply adds.
@@ -339,15 +294,13 @@ impl DoneBy {
     }
 }
 
-/// THE WORKER'S REPORT in the transcript tail `jsonl`, read at the done edge by [the module's](self) rule `by`.
-///
+/// THE WORKER'S REPORT in the transcript tail `jsonl`, read at the done edge by rule `by`.
 /// # Errors
-/// The shape's word, as above.
+/// Why there is none, as a word: `no-reply`, `no-check`, `no-report` or `empty`.
 pub fn report(jsonl: &str, by: DoneBy) -> Result<Report, &'static str> {
     read(jsonl, by).report
 }
 
-/// What [`read`] read.
 struct Reading {
     /// The rule it read by: `by`, or [`DoneBy::Check`] where the newest turn
     /// is a check.
@@ -363,8 +316,6 @@ struct Reading {
     turn: Option<String>,
 }
 
-/// [`report`], the rule it read by and the turn a lag miss names
-/// ([`Reading`]).
 fn read(jsonl: &str, by: DoneBy) -> Reading {
     let items = items(jsonl);
     let turns = worker_turns(&items);
@@ -391,13 +342,6 @@ fn read(jsonl: &str, by: DoneBy) -> Reading {
     }
 }
 
-/// THE LANDING, `newest` the turn a harness check opened and `before` the
-/// turns before it ([the module's](self) rule): the REPORT — the final
-/// message of the turn before the check, the land acts of the episode
-/// passed over where `newest` is one (their replies are the landing's
-/// progress), and an older build's done checks answered with a done passed
-/// over — then what each passed-over done check's reply and `newest`'s say
-/// beyond the done ([`check_words`]), oldest first, a blank line apart.
 fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'static str> {
     if !newest.is_check() {
         return Err("no-check");
@@ -434,12 +378,6 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
     })
 }
 
-/// What a check turn's reply says beyond the done it answered with, as a
-/// plain turn is read ([`by_turn`]): its last message with words once lines
-/// that are the retired token alone are dropped ([`without_finished_lines`])
-/// and a bare `DONE` is read as none — its final message, or where that is a
-/// bare done, the last earlier one with words (a report, then a commit, then
-/// the token alone).
 fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
     turn.said
         .iter()
@@ -452,7 +390,6 @@ fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
         })
 }
 
-/// What one transcript line is to a turn's end ([`end_of`]).
 enum Mark {
     /// A main-chain user row with words — any of which can start Claude
     /// Code on a turn: a prompt [`report`] reads (`prompt`), or one it
@@ -475,8 +412,6 @@ enum Mark {
 }
 
 impl Mark {
-    /// Whether this row, read after a turn's own row, ENDS that turn —
-    /// `said`: an assistant row of the turn came before it.
     const fn ends_turn(&self, said: bool) -> bool {
         match self {
             Mark::End => true,
@@ -487,8 +422,6 @@ impl Mark {
     }
 }
 
-/// What `line` is to a turn's end; `None` for every other row, a
-/// subagent's rows and a row still half written among them.
 fn mark_of(line: &str) -> Option<Mark> {
     if line.contains("turn_duration") && is_turn_end(line) {
         return Some(Mark::End);
@@ -520,8 +453,6 @@ fn mark_of(line: &str) -> Option<Mark> {
     }
 }
 
-/// A row's `timestamp` as Claude Code writes it (`2026-10-15T17:28:25.422Z`,
-/// UTC to the millisecond) in unix milliseconds; `None` for any other shape.
 fn stamp_ms(stamp: &str) -> Option<i64> {
     let secs = aterm_types::rfc3339::parse_utc_fractional(stamp)?;
     let digits = stamp.get(20..stamp.len() - 1).unwrap_or("");
@@ -533,14 +464,10 @@ fn stamp_ms(stamp: &str) -> Option<i64> {
     secs.checked_mul(1000)?.checked_add(ms)
 }
 
-/// Whether `line` can be a [`Mark::Opens`] or a [`Mark::End`] — a user row
-/// or an end row — read cheaply: once a turn has said something, its other
-/// assistant rows tell nothing more, and are not parsed.
 fn may_open_or_end(line: &str) -> bool {
     line.contains("\"user\"") || line.contains("turn_duration")
 }
 
-/// Whether `line` is a main-chain `turn_duration` row.
 fn is_turn_end(line: &str) -> bool {
     let Ok(v) = super::transcript::usage(line) else {
         return false;
@@ -564,10 +491,6 @@ enum Opener {
 }
 
 impl Opener {
-    /// The done edge's turn in its first read, `jsonl`: THE NEWEST TURN
-    /// THE DONE WAS READ ON — begun by a row stamped no later than `shown`,
-    /// the harness's read that decided the done (unix milliseconds; `None`,
-    /// or a row with no stamp: no row is later).
     fn of(jsonl: &str, shown: Option<i64>) -> Self {
         let mut newest = Opener::Before;
         let mut ended = false;
@@ -612,9 +535,6 @@ struct End {
     upto: Option<usize>,
 }
 
-/// Where THE TURN `opener` started ends in the transcript read `jsonl`:
-/// after its row, the first `turn_duration` row or next turn's start
-/// decides ([`End`], [`Mark::ends_turn`]).
 fn end_of(jsonl: &str, opener: &Opener) -> End {
     let mut at = 0;
     let mut from = None;
@@ -669,8 +589,6 @@ fn end_of(jsonl: &str, opener: &Opener) -> End {
     }
 }
 
-/// `jsonl` up to `end` ([`End::upto`]): the read with every row after the
-/// turn's end left out; whole where the read does not place the turn.
 fn upto(jsonl: String, end: End) -> String {
     match end.upto {
         Some(at) if at < jsonl.len() => jsonl[..at].to_string(),
@@ -681,7 +599,7 @@ fn upto(jsonl: String, end: End) -> String {
 /// The done edge's transcript once it settled ([`settled`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settled {
-    /// The tail to snapshot from, up to the done edge's turn's end (a turn begun after it left out).
+    /// The tail to snapshot from, up to the done edge's turn's end.
     pub tail: String,
     /// The pauses waited before that ([`SETTLE_EVERY`] each).
     pub waits: u32,
@@ -750,7 +668,7 @@ pub fn settle_with(
     Settled { tail, waits, ended }
 }
 
-/// THE DONE EDGE'S TRANSCRIPT, SETTLED: `first`, the tail of the transcript at `path` the host read at the screen's done point.
+/// THE DONE EDGE'S TRANSCRIPT, SETTLED.
 pub fn settled(
     path: &Path,
     first: String,
@@ -773,10 +691,6 @@ pub fn settled(
     )
 }
 
-/// A PLAIN TURN's rule on the newest turn ([`report`]): its final message
-/// with words, no token required — the lines that are the retired token
-/// alone dropped ([`without_finished_lines`]), and where nothing is left of
-/// the final message, the turn's last earlier message with words.
 fn by_turn(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
     if ends_in_call(newest.said) {
         return Err("no-reply");
@@ -838,7 +752,7 @@ pub enum Source {
         transcript: Option<PathBuf>,
         turn: Option<String>,
     },
-    /// THE SCREEN of a harness whose reader alone reads its turns (agy, Muse Code, Gemini CLI: no transcript aterm reads).
+    /// THE SCREEN of a harness whose reader alone reads its turns.
     Screen { program: String },
 }
 
@@ -912,7 +826,6 @@ impl Source {
     }
 }
 
-/// A why word: `[a-z0-9-]`, 1 to 32 bytes.
 fn is_word(w: &str) -> bool {
     (1..=32).contains(&w.len())
         && w.bytes()
@@ -934,7 +847,7 @@ pub struct Snapshot {
     pub bytes: u64,
     /// Why there is no result ([`report`]'s word, or `no-transcript`).
     pub unavailable: Option<&'static str>,
-    /// The rule the result was read by: the one asked for, or the check's where the newest turn is a check ([`report`]).
+    /// The rule the result was read by: the one asked for, or the check's where the newest turn is a check.
     pub by: DoneBy,
 }
 
@@ -971,7 +884,6 @@ pub fn prune_results(tasks: &Path, stem: &str) -> usize {
 }
 
 /// SNAPSHOT THE RESULT, at the done edge.
-///
 /// # Errors
 /// A `stem` that is no such stem, or the directory or a file could not be written.
 pub fn snapshot(
@@ -1020,8 +932,7 @@ pub fn snapshot(
     write_snapshot(tasks, stem, &text, &source, unavailable, by)
 }
 
-/// SNAPSHOT A SCREEN'S RESULT, at the done edge of a harness aterm reads no transcript of (agy, Muse Code, Gemini CLI).
-///
+/// SNAPSHOT A SCREEN'S RESULT, at the done edge of a harness aterm reads no transcript of.
 /// # Errors
 /// As [`snapshot`].
 pub fn snapshot_screen(
@@ -1069,7 +980,6 @@ pub fn with_report(report: Option<&str>, said: &str) -> String {
     }
 }
 
-/// A `stem` that is one file name's stem (`[A-Za-z0-9_-]`, not empty).
 fn check_stem(stem: &str) -> std::io::Result<()> {
     if stem.is_empty()
         || !stem
@@ -1084,9 +994,6 @@ fn check_stem(stem: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The result's `text` and its `source` written under `tasks` (0700, made
-/// where missing) as `<stem>.result.md` and its sidecar, each 0600 through a
-/// rename, the text first.
 fn write_snapshot(
     tasks: &Path,
     stem: &str,
@@ -1116,12 +1023,10 @@ fn write_snapshot(
     })
 }
 
-/// `ERR result unavailable why=<why>`.
 fn unavailable(why: &str) -> String {
     format!("ERR result unavailable why={why}\n")
 }
 
-/// The reply: `OK <n> <stamp> bytes=<bytes><extra>` and the `n` lines.
 fn framed(stamp: &str, bytes: usize, extra: &str, lines: &[String]) -> String {
     let mut out = format!("OK {} {stamp} bytes={bytes}{extra}\n", lines.len());
     for line in lines {
@@ -1131,8 +1036,6 @@ fn framed(stamp: &str, bytes: usize, extra: &str, lines: &[String]) -> String {
     out
 }
 
-/// `text` as reply lines, at most `max` characters of it, then — where it
-/// was cut — `… truncated; full: <path>`.
 fn head_lines(text: &str, max: usize, path: &Path) -> Vec<String> {
     let cut = text.char_indices().nth(max).map(|(at, _)| at);
     let shown = cut.map_or(text, |at| &text[..at]);
@@ -1150,9 +1053,6 @@ fn head_lines(text: &str, max: usize, path: &Path) -> Vec<String> {
     lines
 }
 
-/// `text` as reply lines, its last `max` characters, led — where anything
-/// before them was cut, or the read did not reach the file's start — by
-/// `… earlier turns cut; the transcript: <path>`.
 fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<String> {
     let skip = text.chars().count().saturating_sub(max);
     let at = text
@@ -1175,8 +1075,6 @@ fn tail_lines(text: &str, max: usize, transcript: &Path, whole: bool) -> Vec<Str
     lines
 }
 
-/// At most the last `bytes` of the regular file at `path`, and whether that
-/// is the whole file.
 fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
     let mut f = super::footer::open_regular(path)?;
     let len = f.metadata().ok()?.len();
@@ -1218,15 +1116,11 @@ pub fn answer(path: &Path, full: bool) -> String {
     }
 }
 
-/// The sidecar beside the snapshot at `path`, read.
 fn source_of(path: &Path) -> Option<Source> {
     super::footer::read_small(&sidecar_of(path), SIDECAR_READ_BYTES)
         .and_then(|t| Source::parse(t.lines().next()?))
 }
 
-/// [`answer`] over a result read from `transcript` (`session`, row `uuid`):
-/// its `text()` (`None`: unreadable) for `result`, the thread read now for
-/// `result full`.
 fn reply(
     session: &str,
     uuid: &str,
@@ -1286,7 +1180,6 @@ impl Reread {
         self.report.text.len() as u64
     }
 
-    /// The sidecar's source for it.
     fn source(&self) -> Source {
         Source::Transcript {
             session: self.report.session.clone(),
@@ -1296,7 +1189,6 @@ impl Reread {
     }
 
     /// The snapshot at `path` and its sidecar written over with it, each through a rename and the text first, as [`snapshot`] writes them.
-    ///
     /// # Errors
     /// A file could not be written.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {

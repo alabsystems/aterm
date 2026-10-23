@@ -20,8 +20,6 @@ mod sealed {
 /// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
 /// # let _ = pty;
 /// ```
-/// use aterm_provenance::{Provenance, Pty};
-/// // Control: the one origin, constructed the one way.
 ///
 /// ```compile_fail,E0277
 /// use aterm_provenance::Origin;

@@ -532,9 +532,10 @@ mod tests {
         let huge = t.huge_dirs();
         assert_eq!(huge.len(), 2);
         assert!(huge[0].warning && huge[0].executables);
-        assert!(huge[0].sentence().starts_with(
-            "warning: /w/deps has 104,211 entries (line 100,000): a binary launched from it"
-        ));
+        assert!(huge[0].sentence().starts_with(&format!(
+            "warning: {} has 104,211 entries (line 100,000): a binary launched from it",
+            Path::new("/w").join("deps").display()
+        )));
         assert!(!huge[1].warning);
         assert!(
             huge[1]

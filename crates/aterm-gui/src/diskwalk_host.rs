@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DISK WALKER HOST (design `docs/DESIGN-system-awareness-2026-10-16.md` §10.4–§10.8, phase P2d): one walker thread at Housekeeping QoS that sizes the folders a scope uses and every subtree in them, counts the build folders' entries for the §10.8 hazard, and hands what it found to readers by message.
+//! Background disk walker host thread for sizing workspace roots and build folder hazards.
 
 #![cfg_attr(
     not(all(test, unix)),
@@ -32,13 +32,13 @@ use aterm_diskwalk::{
 
 /// How long one read keeps its scope's roots demanded.
 pub(crate) const DEMAND_TTL: Duration = Duration::from_secs(60);
-/// A root no discovery has named for this long is retired (design §10.4 "lifetime"); the walker counts only discoveries it ran, so roots stay put while nothing is demanded.
+/// A root no discovery has named for this long is retired (design §10.4 "lifetime").
 pub(crate) const RETIRE_AFTER: Duration = Duration::from_secs(60);
 /// Consecutive discoveries that must name a root before it is walked.
 pub(crate) const PROMOTE_AFTER: u32 = 2;
-/// The shortest age at which a complete walk is walked again while demanded: P2d has no change feed, so freshness is a re-walk.
+/// The shortest age at which a complete walk is walked again while demanded.
 pub(crate) const REWALK_AFTER: Duration = Duration::from_secs(30);
-/// A walk is walked again no sooner than this many times its own duration after it ended: at most a 5 % duty on its root (design §10.6's re-list rate).
+/// A walk is walked again no sooner than this many times its own duration after it ended.
 pub(crate) const REWALK_COST_FACTOR: u32 = 20;
 /// How often the thread derives each demanded pane's roots again.
 pub(crate) const DISCOVER_EVERY: Duration = Duration::from_secs(5);
@@ -46,25 +46,14 @@ pub(crate) const DISCOVER_EVERY: Duration = Duration::from_secs(5);
 pub(crate) const GROWTH_WINDOW: Duration = Duration::from_secs(600);
 /// Subtree rows kept per root, per view ("biggest", "most entries").
 pub(crate) const TOP_DIRS: usize = 8;
-/// Folders inside a root that were not measured, named per root at most.
 const NOT_MEASURED_ROWS: usize = 16;
-/// A walk in progress publishes its partial figure at most this often, and
-/// reads its inbox between.
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
-/// The most descendants of one shell whose cwd is read in one discovery.
 const MAX_DESCENDANTS: usize = 256;
-/// The most write-open files of one process anchored in one discovery (a
-/// database or a build holds dozens; the anchors repeat).
 const MAX_WRITES_PER_PROCESS: usize = 64;
-/// How often the slow tier counts the entries of the build profiles outside every root (design §10.8): one `ATTR_DIR_ENTRYCOUNT` read each.
+/// How often the slow tier counts the entries of the build profiles outside every root.
 pub(crate) const PROFILES_EVERY: Duration = Duration::from_secs(600);
-/// The home folder's children the slow tier looks in for a build folder.
 const MAX_CHECKOUTS: usize = 512;
-/// A profile's `deps/` at the note line is walked this long at most, to learn
-/// whether it holds executables (the tccd hazard's sentence)…
 const PROFILE_WALK_BUDGET: Duration = Duration::from_secs(5);
-/// …and a known answer is kept this long (a walk the budget cut before it met
-/// one knows nothing, so it is asked again at the next tier).
 const EXEC_KNOWN_FOR: Duration = Duration::from_secs(3600);
 /// How often the loop looks at the panes' facts while a scope is demanded…
 pub(crate) const FACTS_EVERY: Duration = Duration::from_secs(1);
@@ -86,7 +75,7 @@ pub(crate) enum Detail {
     /// Allocated and logical sizes, entry counts, the biggest subtrees.
     #[default]
     Sizes,
-    /// Also each file's private (unshared-clone) size and the hard-link totals: what deleting a root frees at least (`sums.private`) and at most (`links.frees_at_most`).
+    /// Also each file's private (unshared-clone) size and the hard-link totals.
     Frees,
 }
 
@@ -103,7 +92,7 @@ pub(crate) enum RootKind {
     Writes,
     /// The git worktree above a cwd.
     Repo,
-    /// A worktree's build output: `target` (a link resolved explicitly), atpkg's build cache for it, and a descendant's `CARGO_TARGET_DIR`.
+    /// A worktree's build output.
     Build,
     /// An agent session's temp folder.
     Scratch,
@@ -147,9 +136,9 @@ pub(crate) struct Facts {
     pub(crate) tabs: Vec<TabFacts>,
     /// `$HOME`.
     pub(crate) home: Option<PathBuf>,
-    /// `[privacy] protected_roots`, as written (the walker's deny set adds them to `consent::tcc_prompting_roots`).
+    /// `[privacy] protected_roots`, as written.
     pub(crate) overrides: Vec<String>,
-    /// `[sys] disk_roots`, absolute: folders the person lets the walker size in `~/Library` or a protected folder (design O20).
+    /// `[sys] disk_roots`, absolute.
     pub(crate) opt_in: Vec<PathBuf>,
     /// aterm's own folders (`state_dir()`, and on macOS `~/Library/Caches/aterm`).
     pub(crate) own: Vec<PathBuf>,
@@ -162,7 +151,7 @@ pub(crate) struct Claim {
     pub(crate) path: PathBuf,
     /// Why it is a root.
     pub(crate) kinds: BTreeSet<RootKind>,
-    /// A linked git worktree (its `.git` is a file): its object store is the main checkout's, counted there.
+    /// A linked git worktree (its `.git` is a file).
     pub(crate) linked_worktree: bool,
 }
 
@@ -182,7 +171,7 @@ pub(crate) enum RootState {
 }
 
 impl RootState {
-    /// The word `sys disk` prints: a refusal's own word, so one fact has one spelling (`too-broad` here and as a nested row's reason).
+    /// The word `sys disk` prints: a refusal's own word, so one fact has one spelling.
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -246,7 +235,7 @@ pub(crate) struct Complete {
 }
 
 impl Complete {
-    /// When it is owed another walk: [`REWALK_AFTER`] after it ended, or [`REWALK_COST_FACTOR`] times its own duration, whichever is later.
+    /// When it is owed another walk.
     pub(crate) fn rewalk_at(&self) -> Instant {
         self.at + REWALK_AFTER.max(self.took.saturating_mul(REWALK_COST_FACTOR))
     }
@@ -419,7 +408,6 @@ pub(crate) struct Published {
 
 type Proxy = aterm_window::event_loop::EventLoopProxy<crate::Wake>;
 
-/// The monotonic origin of [`Shared::demanded_until_ms`].
 static ANCHOR: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn anchor_ms(at: Instant) -> u64 {
@@ -475,7 +463,6 @@ impl Shared {
         self.state.store(s.to_u8(), Ordering::Relaxed);
     }
 
-    /// Send the walker `msg`; nothing when it is not running.
     fn send(&self, msg: ToWalker) {
         if let Some(tx) = self.inbox.get() {
             let _ = tx.send(msg);
@@ -503,7 +490,6 @@ impl Shared {
             self.facts_wanted.store(true, Ordering::Relaxed);
             let proxy = self.proxy.lock_or_recover().clone();
             if let Some(proxy) = proxy {
-                // The loop answers with the panes' facts; a closed loop has none.
                 let _ = proxy.send_event(crate::Wake::DiskWalk);
             }
         }
@@ -515,7 +501,7 @@ impl Shared {
         build_report(scope, &published, self.walker_state())
     }
 
-    /// The loop's (or a test's) take of what the walker sent: the newest publication goes on the board and is returned.
+    /// The loop's (or a test's) take of what the walker sent.
     pub(crate) fn absorb(&self, from: &Receiver<Arc<Published>>) -> Option<Arc<Published>> {
         let newest = from.try_iter().last()?;
         *self.board.lock_or_recover() = Some(Arc::clone(&newest));
@@ -523,7 +509,7 @@ impl Shared {
     }
 }
 
-/// The board's answer for `scope` now, demanding it: `sys disk`, `sys tab` and the System panel read this, from any thread (a control worker or the loop).
+/// The board's answer for `scope` now, demanding it.
 pub(crate) fn disk_report(scope: DiskScope, detail: Detail, now: Instant) -> DiskReport {
     DISKWALK.demand(scope, detail, now);
     DISKWALK.report(scope)
@@ -536,18 +522,11 @@ struct WalkerClass {
     disk: aterm_diskwalk::DiskIo,
 }
 
-/// The walker's class in the product: [`crate::qos::Role::Housekeeping`],
-/// work with no deadline that the scheduler may hold back for as long as
-/// the machine is busy, its disk reads throttled behind other I/O (a reply
-/// never waits on a walk: it reads the board).
 const WALKER_CLASS: WalkerClass = WalkerClass {
     role: crate::qos::Role::Housekeeping,
     disk: aterm_diskwalk::DiskIo::Throttled,
 };
 
-/// Start the walker thread for `shared` in `class` ([`WALKER_CLASS`] in the
-/// product): the receiver is the loop's end of its publications, and `proxy`
-/// wakes the loop after each.
 fn spawn_walker(
     shared: &'static Shared,
     proxy: Option<Proxy>,
@@ -572,8 +551,6 @@ fn spawn_walker(
     }
 }
 
-/// The bytes of `path` (a claimed folder) that two or more panes claim, given
-/// `above`, the panes that claim it whole (it or a folder above it).
 fn shared_in(
     path: &Path,
     above: &BTreeSet<u64>,
@@ -811,7 +788,6 @@ fn build_report(scope: DiskScope, p: &Published, walker: WalkerState) -> DiskRep
     }
 }
 
-/// Add `kind` to the claim on `path` (canonical), creating it.
 fn claim(out: &mut Vec<Claim>, path: &Path, kind: RootKind, linked: bool) {
     let Some(path) = canonical(path) else {
         return;
@@ -828,8 +804,6 @@ fn claim(out: &mut Vec<Claim>, path: &Path, kind: RootKind, linked: bool) {
     });
 }
 
-/// The processes below `root`, breadth first: `(pid, ppid)`, at most
-/// [`MAX_DESCENDANTS`].
 fn descendants(procs: &[(u32, u32)], root: u32) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     let mut frontier = VecDeque::from([root]);
@@ -847,8 +821,6 @@ fn descendants(procs: &[(u32, u32)], root: u32) -> Vec<(u32, u32)> {
     out
 }
 
-/// The agent session folder a cwd under `base` (`/private/tmp/claude-<uid>`)
-/// sits in: `base/<project>/<session>`.
 fn scratch_anchor(cwd: &Path, base: &Path) -> Option<PathBuf> {
     let rest = cwd.strip_prefix(base).ok()?;
     let mut parts = rest.components();
@@ -857,7 +829,6 @@ fn scratch_anchor(cwd: &Path, base: &Path) -> Option<PathBuf> {
     Some(base.join(project).join(session))
 }
 
-/// Where agent sessions keep their temp folders on this machine.
 fn scratch_base() -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -880,15 +851,12 @@ fn scratch_base() -> Option<PathBuf> {
 pub(crate) struct ProcReads<'a> {
     /// Its working directory.
     pub(crate) cwd: &'a dyn Fn(u32) -> Option<PathBuf>,
-    /// `CARGO_TARGET_DIR` as its environment held it at exec, where set and readable (`targo`, `cargo`, `claude`; a platform binary hides it).
+    /// `CARGO_TARGET_DIR` as its environment held it at exec, where set and readable.
     pub(crate) target_dir: &'a dyn Fn(u32) -> Option<PathBuf>,
     /// The regular files it holds open for writing, as the kernel names them.
     pub(crate) writes: &'a dyn Fn(u32) -> Vec<PathBuf>,
 }
 
-/// The firmlinked spelling of a kernel path on macOS's data volume
-/// (`/System/Volumes/Data/Users//a/x` is `/Users//a/x`), so one folder is one
-/// root whichever spelling the kernel gave; any other path as it is.
 fn firmlinked(path: &Path) -> PathBuf {
     const FIRMLINKED: [&str; 8] = [
         "Users",
@@ -906,9 +874,6 @@ fn firmlinked(path: &Path) -> PathBuf {
     }
 }
 
-/// Where a write lands, as a root (design §10.4 `writes`): the build folder
-/// above the written file, else its git worktree, else its agent session
-/// temp folder, else its folder.
 fn write_anchor(
     file: &Path,
     policy: &Policy,
@@ -927,8 +892,6 @@ fn write_anchor(
     Some(anchor)
 }
 
-/// A `CARGO_TARGET_DIR` as an absolute folder: a relative one is cargo's
-/// reading of it, against the process's cwd.
 fn target_dir_path(dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     if dir.is_absolute() {
         canonical(dir)
@@ -937,8 +900,6 @@ fn target_dir_path(dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// Claim `path` as `kind` when it is a directory, or the directory a link
-/// there names (read, never followed); nothing when it is absent or refused.
 fn claim_dir(out: &mut Vec<Claim>, path: &Path, kind: RootKind, policy: &Policy) {
     let (Some(parent), Some(leaf)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
@@ -955,9 +916,6 @@ fn claim_dir(out: &mut Vec<Claim>, path: &Path, kind: RootKind, policy: &Policy)
     }
 }
 
-/// One pane's roots (design §10.4): its cwd, its processes' cwds, where they
-/// write, the git worktree above each cwd, the worktree's build output and
-/// the processes' `CARGO_TARGET_DIR`, and agent session temp folders.
 fn discover_tab(
     tab: &TabFacts,
     procs: &[(u32, u32)],
@@ -1023,9 +981,6 @@ fn discover_tab(
     out
 }
 
-/// A worktree's build output: `W/target` (a `target → target.noindex` link
-/// resolved by reading it, since the walker follows no link) and atpkg's
-/// build cache for `W`.
 fn build_roots(out: &mut Vec<Claim>, w: &Path, policy: &Policy, home: Option<&Path>) {
     claim_dir(out, &w.join("target"), RootKind::Build, policy);
     let Some(home) = home else {
@@ -1039,8 +994,6 @@ fn build_roots(out: &mut Vec<Claim>, w: &Path, policy: &Policy, home: Option<&Pa
     }
 }
 
-/// aterm's own folders and the `[sys] disk_roots` opt-ins, claimed for the
-/// aterm scope.
 fn own_claims(own: &[PathBuf], opt_in: &[PathBuf]) -> Vec<Claim> {
     let mut out = Vec::new();
     for p in own.iter().chain(opt_in) {
@@ -1062,7 +1015,7 @@ pub(crate) struct Life {
     pub(crate) promoted: bool,
 }
 
-/// The lifetime law, pure: `life` after discovery `n`, at `now`, named `claimed`, of which `at_once` are the claims of a scope demanded anew (promoted at once).
+/// The lifetime law, pure.
 pub(crate) fn age_roots(
     life: &mut BTreeMap<PathBuf, Life>,
     claimed: &BTreeSet<PathBuf>,
@@ -1108,7 +1061,6 @@ struct Ask {
     frees_at: Option<Instant>,
 }
 
-/// The walk in flight.
 struct Active {
     path: PathBuf,
     ticket: Ticket,
@@ -1118,7 +1070,6 @@ struct Active {
     walked: u64,
 }
 
-/// The walker thread's whole state: it owns everything it derives.
 struct Engine {
     inbox: Receiver<ToWalker>,
     out: Sender<Arc<Published>>,
@@ -1212,7 +1163,6 @@ impl Engine {
         }
     }
 
-    /// Take what is in the inbox. False: stop.
     fn drain(&mut self) -> bool {
         loop {
             match self.inbox.try_recv() {
@@ -1227,7 +1177,6 @@ impl Engine {
         }
     }
 
-    /// One message. False: stop.
     fn apply(&mut self, msg: ToWalker) -> bool {
         match msg {
             ToWalker::Facts(facts) => {
@@ -1258,7 +1207,6 @@ impl Engine {
         true
     }
 
-    /// Sleep until a message, or until the next thing owed is due. False: stop.
     fn sleep(&mut self, now: Instant) -> bool {
         let live = !self.live(now).is_empty();
         let mut until = self
@@ -1281,7 +1229,6 @@ impl Engine {
         }
     }
 
-    /// The scopes demanded at `now`.
     fn live(&self, now: Instant) -> BTreeSet<DiskScope> {
         self.demand
             .iter()
@@ -1290,8 +1237,6 @@ impl Engine {
             .collect()
     }
 
-    /// The paths a live scope asked [`Detail::Frees`] for, with every promoted
-    /// root above each (a nested root's figures are its parent's walk's).
     fn frees_wanted(&self, now: Instant) -> BTreeSet<PathBuf> {
         let mut out = BTreeSet::new();
         for (scope, ask) in &self.demand {
@@ -1322,7 +1267,6 @@ impl Engine {
         out
     }
 
-    /// The roots walked: promoted, outermost first.
     fn plan(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self
             .life
@@ -1342,8 +1286,6 @@ impl Engine {
     fn discover_if_due(&mut self, now: Instant) {
         let live = self.live(now);
         if live.is_empty() {
-            // Nothing demanded: walk nothing, age nothing. The last figures
-            // stay for the next read, which derives the roots again first.
             return;
         }
         let before = self.discovered.as_ref();
@@ -1399,7 +1341,6 @@ impl Engine {
         self.dirty = true;
     }
 
-    /// Every demanded pane's claims and aterm's own, derived now.
     fn discover(
         &mut self,
         live: &BTreeSet<DiskScope>,
@@ -1475,8 +1416,6 @@ impl Engine {
         (tabs, own)
     }
 
-    /// Read every promoted root inside another walked root from that root's
-    /// tree; drop a derived record whose parent's tree no longer holds it.
     fn rederive_nested(&mut self) {
         let plan = self.plan();
         let derived: Vec<(PathBuf, Option<RootRecord>)> = plan
@@ -1497,7 +1436,6 @@ impl Engine {
         }
     }
 
-    /// The paths claimed as `writes` roots now.
     fn writes_roots(&self) -> BTreeSet<PathBuf> {
         self.tab_claims
             .values()
@@ -1507,10 +1445,6 @@ impl Engine {
             .collect()
     }
 
-    /// The next root owed a walk (design §10.4, §10.6): one never walked,
-    /// those holding a `writes` root first, then outermost first; else the
-    /// stalest walk past its [`Complete::rewalk_at`], or one a live scope
-    /// wants [`Detail::Frees`] for that has only sizes.
     fn next_root(&self, now: Instant) -> Option<PathBuf> {
         if self.live(now).is_empty() || self.policy.is_none() {
             return None;
@@ -1521,7 +1455,6 @@ impl Engine {
         pick_root(&plan, &self.records, &writes, &frees, now)
     }
 
-    /// When the next walk falls due (for the sleep).
     fn next_due(&self, now: Instant) -> Option<Instant> {
         self.plan()
             .iter()
@@ -1588,7 +1521,6 @@ impl Engine {
         }
     }
 
-    /// The walk in flight's record, as it stands.
     fn put_walking(&mut self) {
         let (Some(a), Some(walk)) = (self.active.as_ref(), self.walker.walk()) else {
             return;
@@ -1607,9 +1539,6 @@ impl Engine {
         self.put(rec);
     }
 
-    /// Slices of the walk in flight for up to [`PUBLISH_EVERY`], then its
-    /// partial figure; a walk no live scope's plan holds any more is
-    /// cancelled.
     fn step_walk(&mut self) {
         let Some(ticket) = self.active.as_ref().map(|a| a.ticket) else {
             return;
@@ -1649,8 +1578,6 @@ impl Engine {
         self.put_walking();
     }
 
-    /// A walk that stopped before its end leaves what was there before it:
-    /// the last complete figures, or nothing (the root is queued again).
     fn abandon_walk(&mut self) {
         let Some(a) = self.active.take() else {
             return;
@@ -1667,8 +1594,6 @@ impl Engine {
         self.dirty = true;
     }
 
-    /// A walk reached its end: its record, its tree for the roots inside it,
-    /// its history for growth, and its §10.8 rows folded into the raised set.
     fn finish_walk(&mut self) {
         let Some(a) = self.active.take() else {
             return;
@@ -1722,7 +1647,6 @@ impl Engine {
         self.set_huge(next, self.outside.clone());
     }
 
-    /// Replace the raised set; a move is a new `huge_seq`.
     fn set_huge(&mut self, huge: BTreeMap<PathBuf, HugeDir>, outside: BTreeSet<PathBuf>) {
         if huge != self.huge {
             self.huge_seq += 1;
@@ -1735,9 +1659,6 @@ impl Engine {
         self.outside = outside;
     }
 
-    /// The slow tier (§10.8), with no demand: every [`PROFILES_EVERY`], one
-    /// entry count per build profile of the home folder's checkouts outside
-    /// every walked root, folded into the raised set.
     fn slow_tier_if_due(&mut self, now: Instant) {
         let (Some(policy), Some(home)) = (self.policy.clone(), self.facts.home.clone()) else {
             return;
@@ -1774,8 +1695,6 @@ impl Engine {
         self.set_huge(next, outside);
     }
 
-    /// Whether a profile's `deps/` holds executables: a bounded walk of it,
-    /// kept [`EXEC_KNOWN_FOR`] when it knows.
     fn executables_of(&mut self, deps: &Path, policy: &Policy, now: Instant) -> bool {
         if let Some(&(at, known)) = self.exec_known.get(deps)
             && now.saturating_duration_since(at) < EXEC_KNOWN_FOR
@@ -1877,8 +1796,6 @@ pub(crate) fn pick_root(
     stalest.map(|(_, p)| p.clone())
 }
 
-/// The record of `path` read from the walk of a promoted root it lies
-/// inside, when that walk holds it.
 fn derive_nested(path: &Path, paths: &[PathBuf], kept: &Kept) -> Option<RootRecord> {
     let parent = paths
         .iter()
@@ -1909,7 +1826,6 @@ fn derive_nested(path: &Path, paths: &[PathBuf], kept: &Kept) -> Option<RootReco
     })
 }
 
-/// The figures of `within` in `tree`.
 fn complete_of(
     tree: &Tree,
     within: DirId,
@@ -1972,8 +1888,6 @@ fn complete_of(
     }
 }
 
-/// The allocation's move over [`GROWTH_WINDOW`]: against the newest walk at
-/// least a window old, else the oldest walk kept (a shorter span, said).
 fn growth_of(history: &VecDeque<(Instant, u64)>, now: Instant) -> Option<Growth> {
     let &(_, latest) = history.back()?;
     let base = history
@@ -1990,9 +1904,6 @@ fn growth_of(history: &VecDeque<(Instant, u64)>, now: Instant) -> Option<Growth>
     Some(Growth { bytes, over })
 }
 
-/// The build folders of the home folder's checkouts (its direct children):
-/// `C/target` (a link to `target.noindex` read, never followed) and atpkg's
-/// build cache for `C`, each looked for with the path test first.
 fn outside_build_dirs(home: &Path, policy: &Policy) -> Vec<PathBuf> {
     let Ok(rows) = list_one_level(&RootSpec::new(home), policy) else {
         return Vec::new();
@@ -2011,10 +1922,6 @@ fn outside_build_dirs(home: &Path, policy: &Policy) -> Vec<PathBuf> {
     out
 }
 
-/// Each build profile's `deps/` in the build folder `target` and its direct
-/// entry count: `target/<profile>/deps`, or for a cross build
-/// `target/<triple>/<profile>/deps` (a triple's name has a `-`; `doc`,
-/// `tmp` and `package` are not looked into).
 fn profile_deps(target: &Path, policy: &Policy) -> Vec<(PathBuf, u32)> {
     let dirs_of = |dir: &Path| -> Vec<PathBuf> {
         list_one_level(&RootSpec::new(dir), policy)
@@ -2050,10 +1957,6 @@ fn profile_deps(target: &Path, policy: &Policy) -> Vec<(PathBuf, u32)> {
     out
 }
 
-/// Whether a profile's `deps/` holds executables, from a walk of it bounded by
-/// `budget`: yes at the first one met (the walk stops there), no once the
-/// whole folder was listed without one, and `None` (not known) when the
-/// budget ran out first or the path test refused the folder.
 fn profile_executables(deps: &Path, policy: &Policy, budget: Duration) -> Option<bool> {
     let mut walker = Walker::new();
     let ticket = walker.start(&RootSpec::new(deps), policy).ok()?;
@@ -2118,11 +2021,6 @@ pub(crate) fn huge_entry(h: &HugeDir) -> aterm_messages::exceptions::Entry {
     ))
 }
 
-/// The slow tier's hysteresis, pure: each counted profile is raised at
-/// [`HUGE_WARN`], kept at or above [`HUGE_NOTE`] and lowered under it, as a
-/// walk's are; one the slow tier raised and no longer counts is lowered (its
-/// checkout gone), unless a walked root now holds it (that walk's fold owns it
-/// from now on).
 fn fold_outside(
     raised: &BTreeMap<PathBuf, HugeDir>,
     outside: &BTreeSet<PathBuf>,
@@ -2148,8 +2046,6 @@ fn fold_outside(
     (next, mine)
 }
 
-/// The hysteresis, pure: `raised` after a complete walk of `root` found
-/// `found` (its folders at [`HUGE_NOTE`] or more).
 fn fold_raised(
     raised: &BTreeMap<PathBuf, HugeDir>,
     root: &Path,
@@ -2169,7 +2065,6 @@ fn fold_raised(
     out
 }
 
-/// `104211` → `104,211`.
 fn group(n: u32) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -2182,7 +2077,8 @@ fn group(n: u32) -> String {
     out
 }
 
-/// What the loop keeps: the walker's publications, when it next looks at the panes' facts and what it last sent, and the §10.8 set it last stated.
+/// What the loop keeps: the walker's publications, when it next looks at the panes' facts and
+/// what it last sent, and the §10.8 set it last stated.
 #[derive(Default)]
 pub(crate) struct DiskwalkHost {
     from_walker: Option<Receiver<Arc<Published>>>,
@@ -2205,7 +2101,7 @@ impl crate::App {
         disk_report(scope, detail, Instant::now())
     }
 
-    /// A level judged every wake: start the walker once the loop has a proxy (the shipped loop; a test's `App` has none), take what it published, state a moved §10.8 set to the digest, and send the panes' facts when they changed (looked at every [`FACTS_EVERY`] while a scope is demanded, every [`FACTS_IDLE_EVERY`] otherwise, and at once when a reader asked a scope anew).
+    /// A level judged every wake.
     pub(crate) fn service_diskwalk(&mut self, now: Instant) {
         if !self.diskwalk.started
             && let Some(proxy) = self.proxy.clone()
@@ -2248,7 +2144,6 @@ impl crate::App {
         self.service_diskwalk(Instant::now());
     }
 
-    /// Every pane with a live shell, and what the path test needs.
     fn diskwalk_facts(&self) -> Facts {
         let mut tabs = Vec::new();
         for ws in self.windows.values() {

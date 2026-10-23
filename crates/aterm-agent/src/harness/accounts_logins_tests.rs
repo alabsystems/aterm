@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the login lifecycle's core (`docs/DESIGN-claude-accounts-v2-2026-10-15.md` §4.5, §5).
+//! Tests for the Claude account login lifecycle core.
 
 use super::*;
 use crate::harness::host_path::abs;
@@ -17,8 +17,6 @@ fn tmp(tag: &str) -> aterm_tempfile::TempDir {
         .expect("temp dir")
 }
 
-/// This machine's own login, renewable, and a second account with a login
-/// directory of its own and no email.
 fn roster_text() -> String {
     format!(
         r#"
@@ -52,7 +50,6 @@ fn state() -> State {
     }
 }
 
-/// `main` renewed at `at` into `/s/main.1`, from the default login.
 fn renewed(at: i64) -> (State, Logins) {
     let mut state = state();
     let mut logins = Logins::default();
@@ -321,8 +318,6 @@ fn a_renewal_supersedes_the_login_it_replaces_and_wakes_the_waiting() {
     assert!(store.claim_staging_dir("Not A Label").is_err());
 }
 
-/// Binding bytes carry the only recorded identity of the renewed home.
-/// Damaged identity data cannot authorize an edit over an empty fallback.
 #[test]
 fn uncertain_binding_bytes_refuse_mutation_instead_of_erasing_identities() {
     for (case, bytes) in [
@@ -391,9 +386,6 @@ fn only_an_absent_binding_file_means_legacy_identities() {
     assert_eq!(store.bound(&original, NOW).unwrap(), original);
 }
 
-/// THE FORECAST: three weeks from a renewal, a notice's end sooner, every
-/// end and notice LOWERING the lifetime learned (within a week and thirty
-/// days), and nothing lengthened by a notice that never came.
 #[test]
 fn the_forecast_learns_from_notices_and_ends_and_never_lengthens() {
     let r = roster();
@@ -503,10 +495,6 @@ fn the_states_in_their_order() {
     }
 }
 
-/// AN ENDED RENEWABLE LOGIN IS THE DUE LINE'S, NEVER THE SIGNED-OUT LINE'S:
-/// that line's step is `accounts login`, which refuses a row with an email,
-/// and the due line's (`accounts renew --due`) restores it. NEGATIVE
-/// CONTROL: a row with no email, signed out, is the signed-out line's.
 #[test]
 fn an_ended_renewable_login_is_due_and_never_signed_out() {
     let r = roster();
@@ -522,12 +510,6 @@ fn an_ended_renewable_login_is_due_and_never_signed_out() {
     assert_eq!(signed_out(&r, &state, &enrolled, NOW + HOUR), ["work-2"]);
 }
 
-/// [`note_signed_back`] (the review's acct-6): a renewable login ended,
-/// then signed in again in its tab, is `ok` again — out of the due list, a
-/// candidate's word — its forecast started over from that sign-in (the old
-/// notice gone); a struck row with no email leaves the signed-out list.
-/// NEGATIVE CONTROLS: a row not recorded signed out, and a word older than
-/// the one on record, change nothing.
 #[test]
 fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
     let r = roster();
@@ -637,9 +619,6 @@ fn due_logins_and_none_working_are_the_renewable_rows() {
     assert_eq!(wrong_accounts(&r, &logins), ["main"]);
 }
 
-/// THE BINDING, BYTE FOR BYTE: the renewed login is the row's, the one it
-/// replaced is the row's account on a SUPERSEDED login, and a trailing slash
-/// is a third login, which is neither.
 #[test]
 fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte() {
     let (main_1, work_2, w_1) = (abs("/s/main.1"), abs("/logins/work-2"), abs("/s/w.1"));
@@ -698,14 +677,6 @@ fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte()
     assert!(store.bound(&roster(), NOW).is_err(), "unknown identities");
 }
 
-/// A SUPERSEDED LOGIN'S USAGE IS ITS ROW'S ACCOUNT'S ([`record_usage`], as
-/// [`record_wall`]): through a bound roster, a Claude Code still on the login
-/// a renewal replaced is that row's account on a superseded login
-/// ([`Me::left`]), and what its screen says of credits and its weekly
-/// warning are recorded for that account, as its walls are; the renewed
-/// login's sessions are recorded for it too. NEGATIVE CONTROLS: a login no
-/// row has held is recorded for nobody, and the file as written, which knows
-/// no renewal, does not attribute the renewed login.
 #[test]
 fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
     let (work_2, w_1) = (abs("/logins/work-2"), abs("/s/w.1"));
@@ -786,12 +757,6 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
     );
 }
 
-/// THE LOGIN OF THE MACHINE'S ONE ACCOUNT ([`Roster::lone_login`],
-/// [`lone_login_at`]: the login the usage tap follows): the `adopt-default`
-/// row is the default login until a renewal binds it to a login of its own,
-/// and then it is that login — read through the store's `logins.json`
-/// beside the roster file. NEGATIVE CONTROLS: two rows name no one account's
-/// login, and neither does a roster file that is refused, or no path.
 #[test]
 fn the_one_accounts_login_follows_its_renewal() {
     const ONE: &str =
@@ -821,12 +786,6 @@ fn the_one_accounts_login_follows_its_renewal() {
     assert_eq!(lone_login_at(None, &store, NOW), None, "no path");
 }
 
-/// THE DEFAULT LOGIN IS EVER THE OWN ROW'S: renewed more often than a
-/// binding remembers ([`MAX_LEFT`]), this machine's own row (no `dir`) still
-/// names the default login — the one every `claude` started by hand runs
-/// on — as its superseded login, so such a session follows the renewed one
-/// and is never a login no row names. NEGATIVE CONTROL: a row with a `dir`
-/// of its own forgets its first login past the bound.
 #[test]
 fn the_default_login_stays_the_own_rows_past_every_renewal() {
     let work_2 = abs("/logins/work-2");
@@ -872,8 +831,6 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
     );
 }
 
-/// AT A LOGIN'S END THE ADVICE NAMES ONLY THE SESSION'S OWN LABEL, renewed,
-/// whatever the rotation's mode — never another account.
 #[test]
 fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
     let r = Roster::parse(&format!(
@@ -988,16 +945,6 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
     ));
 }
 
-/// RENEWED WHILE A WALL STANDS ON THE ACCOUNT, a session still on the login
-/// the renewal replaced FOLLOWS THE RENEWED ONE AT ONCE — at its lost login
-/// and ahead at an idle turn end, under every mode — whichever wall it is: a
-/// limit is the account's, the same under both logins, so it never holds the
-/// follow. A model's own bucket (`seven_day_opus`) included, which holds
-/// nothing of a session on another model: waited for, such a session sat at
-/// its lost login for days with nothing raised, while its renewed login
-/// could serve it. NEGATIVE CONTROLS: the same wall over the row's own ended
-/// login (no renewal yet) is no follow — only a renewal ends that; and a
-/// renewed login that has itself ended is none either.
 #[test]
 fn a_renewal_made_under_a_wall_is_followed_at_once() {
     let r = roster();

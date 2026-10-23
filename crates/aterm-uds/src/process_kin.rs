@@ -124,35 +124,63 @@ pub const fn launched_before(launcher: i32, shell: i32) -> bool {
     shell.wrapping_sub(launcher) > 0
 }
 
-/// Lineage of a live same-uid process (flavor 18).
+/// Lineage of a live same-uid process (flavor 18; `/proc/<pid>/stat` and `status` on Linux).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lineage {
     /// Who it is: what the end protocol re-reads before each signal ([`super::end_proven`]).
     pub identity: super::Identity,
-    /// Its unique id: a later fork reads a larger one.
+    /// Its unique id, which a later fork never reads below: `p_uniqueid` on Apple (strictly
+    /// larger), the start in clock ticks on Linux (equal to `identity.birth`; two forks may
+    /// share a tick).
     pub uniqueid: u64,
-    /// Its parent now: `1` once launchd adopted it.
+    /// Its parent now: `1` once launchd or init adopted it.
     pub parent: u32,
     /// Its process group.
     pub pgid: u32,
-    /// Its launcher's pid version (`p_orig_ppidversion`).
-    pub launcher_version: i32,
-    /// Its session's controlling terminal (`e_tdev`).
+    /// Its launcher's pid version (`p_orig_ppidversion`, kept through adoption), `None` where
+    /// the kernel keeps no versions (Linux).
+    pub launcher_version: Option<i32>,
+    /// Its session's controlling terminal (`e_tdev`; Linux `tty_nr`).
     pub tty: Option<u32>,
 }
 
 impl Lineage {
-    /// Whether launchd adopted the process without having started it ([`launchd_idversion`]).
+    /// Whether `launcher` started it, by the launcher's pid version: `None` where either
+    /// version is not kept (Linux), so two missing versions never prove a launch.
     #[must_use]
-    pub fn orphaned(&self, launchd: Option<i32>) -> bool {
-        self.parent == 1 && launchd.is_some_and(|v| v != self.launcher_version)
+    pub fn launched_by(&self, launcher: &super::Identity) -> Option<bool> {
+        Some(self.launcher_version? == launcher.idversion?)
+    }
+
+    /// Orphaned. With a launcher version (Apple): launchd adopted it, and launchd did not
+    /// start it (`launchd`, [`launchd_idversion`]); `parent_uniqueid` is never called. Without
+    /// one (Linux, which keeps no original parent): init adopted it, or its parent is older
+    /// than `floor`, the unique id of the run it is judged for. No process a run started is
+    /// older than the run, so a parent born before it adopted the process (a subreaper, as
+    /// `systemd --user` is on desktop Linux), and the run's own launcher (born at `floor`) never
+    /// counts. `parent_uniqueid` reads the parent's unique id; `None` (unreadable, another uid)
+    /// is not orphaned.
+    #[must_use]
+    pub fn orphaned(
+        &self,
+        launchd: Option<i32>,
+        floor: u64,
+        parent_uniqueid: impl FnOnce() -> Option<u64>,
+    ) -> bool {
+        match self.launcher_version {
+            Some(version) => self.parent == 1 && launchd.is_some_and(|v| v != version),
+            None => {
+                self.parent == 1
+                    || (self.parent > 1 && parent_uniqueid().is_some_and(|parent| parent < floor))
+            }
+        }
     }
 
     /// Started by launchd itself: launchd is its parent, and its launcher's pid version is
     /// launchd's ([`launchd_idversion`]). Such a process is never an orphan.
     #[must_use]
     pub fn launchd_started(&self, launchd: Option<i32>) -> bool {
-        self.parent == 1 && launchd == Some(self.launcher_version)
+        self.parent == 1 && launchd.is_some_and(|v| self.launcher_version == Some(v))
     }
 }
 
@@ -181,22 +209,36 @@ pub fn read_lineage(pid: i32) -> Option<Lineage> {
     Some(Lineage {
         identity: super::Identity {
             pid,
-            birth: ProcessBirth {
+            birth: super::Birth::from(ProcessBirth {
                 seconds: info.pbsd.pbi_start_tvsec,
                 microseconds: info.pbsd.pbi_start_tvusec,
-            },
-            idversion: info.p_idversion,
+            }),
+            idversion: Some(info.p_idversion),
         },
         uniqueid: info.p_uniqueid,
         parent: info.pbsd.pbi_ppid,
         pgid: info.pbsd.pbi_pgid,
-        launcher_version: info.p_orig_ppidversion,
+        launcher_version: Some(info.p_orig_ppidversion),
         tty: (info.pbsd.e_tdev != NODEV).then_some(info.pbsd.e_tdev),
     })
 }
 
-/// See the Apple twin.
-#[cfg(not(target_vendor = "apple"))]
+/// See the Apple twin: `/proc/<pid>/stat`, `status` and `stat` again, judged by
+/// [`super::procfs::lineage`]. The identity has no version and the token reads
+/// `<pid>@<start_ticks>`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_lineage(pid: i32) -> Option<Lineage> {
+    if pid <= 1 {
+        return None;
+    }
+    let [stat, status, again] = super::proc_stat_status_stat(pid)?;
+    let (euid, _) = super::linux_reader()?;
+    super::procfs::lineage(&stat, &status, &again, pid, euid)
+}
+
+/// See the Apple twin: no lineage reader is wired here.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_lineage(_pid: i32) -> Option<Lineage> {
     None
@@ -214,7 +256,8 @@ pub const MAX_GROUP_PIDS: usize = 256;
 /// Process group members returned by [`group_members`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupMembers {
-    /// The members, a zombie among them while it is unreaped (an exited stage leader is).
+    /// The members. Apple lists a zombie while it is unreaped (an exited stage leader is);
+    /// Linux skips zombies ([`super::procfs::group_of`]).
     pub pids: Vec<i32>,
     /// Whether the listing is whole.
     pub complete: bool,
@@ -244,8 +287,28 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
     })
 }
 
-/// See the Apple twin.
-#[cfg(not(target_vendor = "apple"))]
+/// See the Apple twin: every `/proc/<pid>/stat` ([`super::stat_row`]), judged by
+/// [`super::procfs::group_of`]. A process gone by its read is skipped; any other failed read
+/// leaves the listing incomplete.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn group_members(pgid: u32) -> Option<GroupMembers> {
+    use super::procfs::StatRead;
+    if pgid <= 1 {
+        return None;
+    }
+    let rows = std::fs::read_dir("/proc").ok()?.filter_map(|entry| {
+        let Ok(entry) = entry else {
+            return Some((0, StatRead::Unreadable));
+        };
+        let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+        Some((pid, super::stat_row(&entry.path().join("stat"))))
+    });
+    Some(super::procfs::group_of(rows, pgid))
+}
+
+/// See the Apple twin: no group lister is wired here.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn group_members(_pgid: u32) -> Option<GroupMembers> {
     None
@@ -270,7 +333,8 @@ pub struct Markers {
     pub verify_run: Option<String>,
 }
 
-/// `pid`'s [`Markers`], read between two identity reads that must agree ([`bracketed`]).
+/// `pid`'s [`Markers`], read between two identity reads that must agree ([`bracketed`]): from
+/// `KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux.
 #[must_use]
 pub fn read_process_markers(pid: i32) -> Option<Markers> {
     #[cfg(target_os = "macos")]
@@ -282,14 +346,31 @@ pub fn read_process_markers(pid: i32) -> Option<Markers> {
             markers_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?)?)
         })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if pid <= 1 {
+            return None;
+        }
+        bracketed(pid, read_identity, || {
+            markers_from_environ(&super::read_proc_bounded(
+                u32::try_from(pid).ok()?,
+                c"environ",
+            )?)
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     {
         let _ = pid;
         None
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(test, unix)
+))]
 fn bracketed<T>(
     pid: i32,
     mut identity: impl FnMut(i32) -> Option<super::Identity>,
@@ -309,12 +390,37 @@ fn markers_from_procargs2(bytes: &[u8]) -> Option<Markers> {
     if !p.whole() || p.exec_path.is_empty() {
         return None;
     }
+    Some(markers_from_words(p.env()))
+}
+
+/// Extract [`Markers`] from a `/proc/<pid>/environ` read: NUL-separated words, the last one
+/// NUL-terminated. An empty file (a zombie's, or one whose environment the kernel no longer
+/// maps) is withheld, never proof either way; a read past the bound is unknown.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn markers_from_environ(bytes: &[u8]) -> Option<Markers> {
+    if bytes.len() > super::PROCESS_ARGV_MAX {
+        return None;
+    }
+    Some(markers_from_words(
+        bytes.split(|&b| b == 0).filter(|word| !word.is_empty()),
+    ))
+}
+
+/// The three markers of an environment's `NAME=value` words, as `getenv` reads them: the first
+/// word naming each wins, a word with no `=` is skipped, and no word at all is withheld.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    all(test, unix)
+))]
+fn markers_from_words<'a>(words: impl Iterator<Item = &'a [u8]>) -> Markers {
     let mut markers = Markers {
         withheld: true,
         ..Markers::default()
     };
     let mut seen = [false; MARKER_VARS.len()];
-    for word in p.env() {
+    for word in words {
         markers.withheld = false;
         let Some(eq) = word.iter().position(|&b| b == b'=') else {
             continue;
@@ -332,7 +438,7 @@ fn markers_from_procargs2(bytes: &[u8]) -> Option<Markers> {
             _ => markers.verify_run = value,
         }
     }
-    Some(markers)
+    markers
 }
 
 /// This boot's id, which a record kept for one boot names  ([`astream_sys::boot_session`]).
@@ -355,6 +461,28 @@ pub fn boot_id() -> Option<String> {
     None
 }
 
+/// This process's pid namespace, the one every pid it reads is read in: the inode Linux names
+/// in `/proc/self/ns/pid` ([`namespace_inode`]). Namespaces share a boot, so a record of pids
+/// is kept per namespace as well as per boot. `None` where there are none, or it does not read.
+#[must_use]
+pub fn pid_namespace() -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        namespace_inode(std::fs::read_link("/proc/self/ns/pid").ok()?.to_str()?)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+/// The inode of a `/proc/<pid>/ns/pid` link's text, `pid:[<inode>]`.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn namespace_inode(link: &str) -> Option<String> {
+    let inode = link.strip_prefix("pid:[")?.strip_suffix(']')?;
+    (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| inode.to_owned())
+}
+
 /// Whether macOS's program check holds `pid` now: `Some(true)` is the whole held predicate (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), one thread that never ran, 20 s or more since the fork, neither stopped nor traced, native, its executable on a local volume, as aterm-sysprobe's one reader judges it ([`aterm_sysprobe::jobs::at_start`]). `None` when unread (gone, another user's, a pid that is no process).
 #[cfg(target_vendor = "apple")]
 #[must_use]
@@ -364,15 +492,16 @@ pub fn at_program_check(pid: i32) -> Option<bool> {
     aterm_sysprobe::jobs::at_start(pid).map(|at| at == aterm_sysprobe::jobs::AtStart::Held)
 }
 
-/// See the Apple twin: Linux has no program check, so no process waits at one, and every positive pid answers `Some(false)` with nothing read (whether it lives is the birth readers' to say).
-#[cfg(target_os = "linux")]
+/// See the Apple twin: Linux has no program check, so a live process of this uid is never
+/// held there; another uid's, or a gone pid, reads `None` as on Apple.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn at_program_check(pid: i32) -> Option<bool> {
-    (pid > 0).then_some(false)
+    read_identity(pid).map(|_| false)
 }
 
 /// See the Apple twin: nothing is read here.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn at_program_check(_pid: i32) -> Option<bool> {
     None
@@ -498,11 +627,8 @@ mod tests {
     fn markers_read_across_an_exec_are_refused() {
         let id = |idversion| super::super::Identity {
             pid: 71,
-            birth: super::super::ProcessBirth {
-                seconds: 1,
-                microseconds: 2,
-            },
-            idversion,
+            birth: super::super::Birth(1_000_002),
+            idversion: Some(idversion),
         };
         let script = |reads: Vec<Option<super::super::Identity>>| {
             let mut reads = reads.into_iter();
@@ -526,40 +652,48 @@ mod tests {
         assert_eq!(read.child.as_deref(), Some("1"));
     }
 
+    /// A pid namespace is the inode its link names, digits only; another kind of namespace, or
+    /// a link with no inode, names none. Linux reads this process's; macOS has none.
+    #[test]
+    fn a_pid_namespace_is_the_inode_its_link_names() {
+        assert_eq!(
+            namespace_inode("pid:[4026531836]").as_deref(),
+            Some("4026531836")
+        );
+        assert_eq!(namespace_inode("pid:[]"), None);
+        assert_eq!(namespace_inode("net:[4026531840]"), None, "another kind");
+        assert_eq!(namespace_inode("pid:[40265x]"), None);
+        assert_eq!(pid_namespace().is_some(), cfg!(target_os = "linux"));
+    }
+
     /// launchd's children split three ways by their launcher's pid version: launchd's own is
     /// launchd-started, another is an orphan launchd adopted, and with launchd's version unread
-    /// neither is claimed. A process whose parent is not launchd is neither.
+    /// neither is claimed. A process whose parent is not launchd is neither, and one with no
+    /// launcher version (Linux) is never launchd-started.
     #[test]
     fn launchd_started_and_orphaned_split_launchds_children() {
         const LAUNCHD: i32 = 7;
-        let lineage = |parent, launcher_version| Lineage {
-            identity: super::super::Identity {
-                pid: 4242,
-                birth: super::super::ProcessBirth {
-                    seconds: 1,
-                    microseconds: 2,
-                },
-                idversion: 90,
-            },
-            uniqueid: 900,
-            parent,
-            pgid: 4242,
-            launcher_version,
-            tty: None,
-        };
-        let started = lineage(1, LAUNCHD);
+        let unread = || -> Option<u64> { panic!("a versioned lineage reads no parent") };
+        let started = lineage(1, Some(LAUNCHD));
         assert!(started.launchd_started(Some(LAUNCHD)), "{started:?}");
-        assert!(!started.orphaned(Some(LAUNCHD)), "{started:?}");
-        let adopted = lineage(1, 31);
+        assert!(!started.orphaned(Some(LAUNCHD), 100, unread), "{started:?}");
+        let adopted = lineage(1, Some(31));
         assert!(!adopted.launchd_started(Some(LAUNCHD)), "{adopted:?}");
-        assert!(adopted.orphaned(Some(LAUNCHD)), "{adopted:?}");
-        let l7 = lineage(LAUNCHD.unsigned_abs(), LAUNCHD);
+        assert!(adopted.orphaned(Some(LAUNCHD), 100, unread), "{adopted:?}");
+        let l7 = lineage(LAUNCHD.unsigned_abs(), Some(LAUNCHD));
         assert!(!l7.launchd_started(Some(LAUNCHD)), "{l7:?}");
-        assert!(!l7.orphaned(Some(LAUNCHD)), "{l7:?}");
-        for unread in [started, adopted] {
-            assert!(!unread.launchd_started(None), "{unread:?}");
-            assert!(!unread.orphaned(None), "{unread:?}");
+        assert!(!l7.orphaned(Some(LAUNCHD), 100, unread), "{l7:?}");
+        for launchd_unread in [started, adopted] {
+            assert!(!launchd_unread.launchd_started(None), "{launchd_unread:?}");
+            assert!(
+                !launchd_unread.orphaned(None, 100, unread),
+                "{launchd_unread:?}"
+            );
         }
+        assert!(
+            !lineage(1, None).launchd_started(None),
+            "no versions prove no launch"
+        );
     }
 
     /// Only a row the judge calls held counts, and the oldest is the oldest held row's fork age:
@@ -599,15 +733,114 @@ mod tests {
         assert!(launched_before(i32::MAX, i32::MIN));
     }
 
+    /// The Linux environment's words go through the same selection as macOS's: only the three
+    /// markers, the first of each, a word with no `=` skipped; an empty file is withheld and a
+    /// read past the bound is unknown. NEGATIVE CONTROL: start `markers_from_words` with
+    /// `withheld` false, and the empty file reads as an environment that names no run.
+    #[test]
+    fn linux_markers_are_read_off_environ_and_an_empty_one_is_withheld() {
+        let environ = b"HOME=/h\0NO_EQUALS\0ATERM_VERIFY_RUN=71-1\0ATERM_CHILD=1\0\
+                        ATERM_VERIFY_RUN=72-2\0ATERM_PARENT_SESSION_ID=s7\0";
+        assert_eq!(
+            markers_from_environ(environ),
+            Some(Markers {
+                withheld: false,
+                parent_session: Some("s7".into()),
+                child: Some("1".into()),
+                verify_run: Some("71-1".into()),
+            })
+        );
+        let empty = markers_from_environ(b"").expect("an empty file reads");
+        assert!(
+            empty.withheld,
+            "an empty environment is withheld: {empty:?}"
+        );
+        assert_eq!(empty.verify_run, None);
+        let unterminated = markers_from_environ(b"ATERM_CHILD=1").expect("a last word");
+        assert_eq!(unterminated.child.as_deref(), Some("1"));
+        let past = vec![b'A'; super::super::PROCESS_ARGV_MAX + 1];
+        assert_eq!(markers_from_environ(&past), None, "past the bound");
+    }
+
+    fn identity(idversion: Option<i32>) -> super::super::Identity {
+        super::super::Identity {
+            pid: 4242,
+            birth: super::super::Birth(51_832_760),
+            idversion,
+        }
+    }
+
+    fn lineage(parent: u32, launcher_version: Option<i32>) -> Lineage {
+        Lineage {
+            identity: identity(launcher_version.map(|_| 9)),
+            uniqueid: 51_832_760,
+            parent,
+            pgid: 4242,
+            launcher_version,
+            tty: None,
+        }
+    }
+
+    /// A launcher is proven by two pid versions that agree, and by nothing where the kernel
+    /// keeps none. NEGATIVE CONTROL: compare the two `Option`s directly, and the Linux row's two
+    /// missing versions read as a launch.
+    #[test]
+    fn a_launcher_is_proven_only_by_two_versions() {
+        assert_eq!(
+            lineage(1, Some(7)).launched_by(&identity(Some(7))),
+            Some(true)
+        );
+        assert_eq!(
+            lineage(1, Some(7)).launched_by(&identity(Some(8))),
+            Some(false)
+        );
+        assert_eq!(lineage(1, None).launched_by(&identity(None)), None);
+        assert_eq!(lineage(1, Some(7)).launched_by(&identity(None)), None);
+    }
+
+    /// With a launcher version, orphaned is launchd's rule and the parent is never read; without
+    /// one, init adopted it or a parent older than the run did. NEGATIVE CONTROLS: `<=` for `<`
+    /// makes the run's own launcher (born at the floor) an adopter; dropping the older-parent
+    /// clause misses the subreaper.
+    #[test]
+    fn orphaned_is_launchds_rule_with_a_version_and_an_older_adopter_without_one() {
+        let unread = || -> Option<u64> { panic!("a versioned lineage reads no parent") };
+        assert!(lineage(1, Some(7)).orphaned(Some(1026), 100, unread));
+        assert!(
+            !lineage(1, Some(1026)).orphaned(Some(1026), 100, unread),
+            "launchd's own"
+        );
+        assert!(
+            !lineage(1, Some(7)).orphaned(None, 100, unread),
+            "launchd unread"
+        );
+        assert!(
+            !lineage(7, Some(7)).orphaned(Some(1026), 100, unread),
+            "a live parent"
+        );
+
+        assert!(
+            lineage(1, None).orphaned(None, 100, || None),
+            "init adopted it"
+        );
+        for (parent, want, case) in [
+            (Some(10), true, "a subreaper older than the run"),
+            (Some(100), false, "the run's own launcher"),
+            (Some(150), false, "a parent the run started"),
+            (None, false, "a parent that does not read"),
+        ] {
+            assert_eq!(
+                lineage(4243, None).orphaned(None, 100, || parent),
+                want,
+                "{case}"
+            );
+        }
+    }
+
     #[test]
     fn this_process_reads_its_lineage_and_its_group() {
         let me = i32::try_from(std::process::id()).expect("pid");
-        if !cfg!(target_vendor = "apple") {
-            assert_eq!(
-                at_program_check(me),
-                cfg!(target_os = "linux").then_some(false),
-                "Linux has no program check to wait at"
-            );
+        if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
             assert_eq!(read_lineage(me), None);
             return;
         }
@@ -615,13 +848,17 @@ mod tests {
         assert_eq!(mine.identity.pid, me);
         assert_eq!(
             Some(mine.identity.birth),
-            super::super::read_process_birth(me),
-            "the birth read_process_birth reads"
+            super::super::read_birth(me),
+            "the birth read_birth reads"
         );
         let members = group_members(mine.pgid).expect("the group lists");
         assert!(members.pids.contains(&me), "{members:?}");
-        assert!(!mine.orphaned(launchd_idversion()));
-        assert!(launchd_idversion().is_some(), "launchd's version reads");
+        assert!(!mine.orphaned(launchd_idversion(), 0, || None));
+        if cfg!(target_vendor = "apple") {
+            assert!(launchd_idversion().is_some(), "launchd's version reads");
+        } else {
+            assert_eq!(mine.identity.idversion, None, "Linux keeps no pid version");
+        }
         assert_eq!(at_program_check(me), Some(false), "this process runs");
         let mut child = crate::spawnfd::command("/bin/sleep")
             .arg("30")
@@ -635,10 +872,17 @@ mod tests {
         let read = read.expect("the child reads");
         assert_eq!(read.parent, me.unsigned_abs());
         assert_eq!(read.pgid, mine.pgid, "spawned into this group");
-        assert!(
-            read.uniqueid > mine.uniqueid,
-            "a later fork reads a larger unique id"
-        );
+        if cfg!(target_vendor = "apple") {
+            assert!(
+                read.uniqueid > mine.uniqueid,
+                "a later fork reads a larger unique id"
+            );
+        } else {
+            assert!(
+                read.uniqueid >= mine.uniqueid,
+                "a later fork never reads an earlier tick"
+            );
+        }
         assert!(listed, "a child in the group is listed");
         assert_eq!(read_lineage(pid), None, "a reaped child reads nothing");
         assert!(boot_id().is_some(), "this boot's id reads");

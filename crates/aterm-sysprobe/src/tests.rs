@@ -37,8 +37,6 @@ fn vmstat_sums_swap_in_and_out() {
     assert_eq!(linux::swap_pages("pswpin 3\n"), None);
 }
 
-/// A `stat` line's group is its fifth field, counted from the command
-/// name's LAST `)`, so a name holding spaces and parentheses cannot move it.
 #[test]
 fn a_stat_line_gives_its_group_past_any_command_name() {
     assert_eq!(
@@ -58,8 +56,6 @@ fn a_stat_line_gives_its_group_past_any_command_name() {
     assert_eq!(linux::stat_pgrp("77 sh S 1 76"), None, "no name");
 }
 
-/// A `children` text names each pid its space closes, so a text cut at the
-/// cap drops its torn last pid instead of naming a shorter one.
 #[test]
 fn a_children_text_names_only_the_pids_its_spaces_close() {
     assert_eq!(linux::children("812 9001 7 "), vec![812, 9001, 7]);
@@ -115,7 +111,6 @@ fn kernel_pressure_levels_map_to_memory_levels() {
     assert_eq!(pressure_of(3), None);
 }
 
-/// Memory in use matches Activity Monitor's `Memory Used`: `(internal - purgeable) + wired + compressed`.
 #[test]
 fn memory_in_use_is_counted_from_the_vm_pages() {
     let page = 16_384;
@@ -130,8 +125,6 @@ fn memory_in_use_is_counted_from_the_vm_pages() {
     );
 }
 
-/// Memory AVAILABLE is free + inactive + purgeable pages (what the memory
-/// ceiling moves with), never more than the machine where that is known.
 #[test]
 fn memory_available_is_free_inactive_and_purgeable_pages() {
     let page = 16_384;
@@ -251,9 +244,6 @@ fn only_a_complete_group_census_admits_its_leader() {
 #[test]
 fn a_leaders_input_is_shared_only_by_members_on_that_very_device() {
     use aterm_uds::spawnfd::{Child, Stdio, command};
-    /// A `sleep` killed (`SIGKILL`) and reaped by its own pid when the test
-    /// lets go of it, on a panic too: it is never left running, and its pid,
-    /// unreaped until then, cannot have been recycled.
     struct Reaped(Child);
     impl Drop for Reaped {
         fn drop(&mut self) {
@@ -334,10 +324,6 @@ fn the_swap_counter_reads_on_this_host_and_never_runs_backwards() {
     );
 }
 
-/// `SwapMeter` computes MB/s over readings separated by at least
-/// `SWAP_SPAN_MIN`, reuses the prior rate for sub-span reads, resets across
-/// gaps exceeding `SWAP_SPAN_MAX` or `None` readings, and returns `None` on
-/// the first sample.
 #[test]
 fn the_swap_meter_reads_a_rate_over_a_span_of_its_readings() {
     let t0 = Instant::now();
@@ -551,7 +537,6 @@ fn a_volume_reads_its_size_free_space_and_inodes() {
     assert!(t.points().iter().any(|p| p == &r.mount));
 }
 
-/// Busy is user + system + nice, total adds idle, and neither wraps.
 #[test]
 fn a_cores_busy_and_total_ticks_add_up_and_saturate() {
     let t = CoreTicks {
@@ -574,8 +559,6 @@ fn a_cores_busy_and_total_ticks_add_up_and_saturate() {
     assert_eq!((full.busy(), full.total()), (u64::MAX, u64::MAX));
 }
 
-/// `/proc/stat` of a 4-core Linux 6.8 box, trimmed: the aggregate line, the
-/// four cores (ten columns), then the kernel's next lines.
 const PROC_STAT: &str = "\
 cpu  4705 150 1120 1644379 1200 0 52 0 0 0
 cpu0 1393 30 290 410203 300 0 40 0 0 0
@@ -587,8 +570,6 @@ ctxt 3022891
 btime 1729339200
 ";
 
-/// Each `cpuN` line is core N: system takes irq + softirq, idle takes
-/// iowait, steal and guest are left out.
 #[test]
 fn proc_stat_gives_every_cores_ticks_by_id() {
     let cores = linux::proc_stat_cores(PROC_STAT, false).expect("four cores");
@@ -630,9 +611,6 @@ fn proc_stat_gives_every_cores_ticks_by_id() {
     assert_eq!(linux::proc_stat_cores("intr 1 2\n", false), None, "no core");
 }
 
-/// A read cut at its cap is whole only when the core lines are known to
-/// have ended: a whole line that is not a core's was read, or the torn tail
-/// begins one (`intr`, whose line is the long one).
 #[test]
 fn a_cut_proc_stat_is_read_only_past_its_core_lines() {
     let intr = PROC_STAT.find("intr").unwrap();
@@ -667,8 +645,6 @@ fn a_cut_proc_stat_is_read_only_past_its_core_lines() {
     );
 }
 
-/// The Linux reader on a fixture root: `<root>/proc/stat` read into its own
-/// buffer and padded to the present count.
 #[test]
 fn the_stat_reader_reads_a_fixture_root_and_refuses_a_cut_core_list() {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -692,7 +668,6 @@ fn the_stat_reader_reads_a_fixture_root_and_refuses_a_cut_core_list() {
     assert_eq!(linux::StatReader::new(empty.path(), 4).sample(), None);
 }
 
-/// `read_into` reads at most its buffer and says whether there was more.
 #[test]
 fn a_buffered_read_stops_at_its_buffer_and_says_whether_it_was_cut() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
@@ -718,7 +693,6 @@ fn a_buffered_read_stops_at_its_buffer_and_says_whether_it_was_cut() {
     assert_eq!(utf8_prefix(b"ab\xffcd"), "ab", "text ends where UTF-8 does");
 }
 
-/// A kernel CPU list: ranges and singles, ascending and distinct.
 #[test]
 fn a_cpu_list_reads_its_ranges() {
     assert_eq!(
@@ -732,9 +706,6 @@ fn a_cpu_list_reads_its_ranges() {
     }
 }
 
-/// `/proc/meminfo` page classes: anonymous app pages, `Shmem` shared memory,
-/// wired kernel slab/stacks/pagetables, `Cached - Shmem + Buffers` cache,
-/// zswap compressed/stored, and `Committed_AS`/`CommitLimit`.
 #[test]
 fn meminfo_gives_the_classes_of_section_9_6() {
     const FULL: &str = "\
@@ -819,7 +790,6 @@ Committed_AS:   19000000 kB
     assert_eq!(linux::memory_detail("MemTotal: 10 kB\n"), None);
 }
 
-/// One `hw.perflevelN` level.
 fn level(name: &str, logical: u16, l2_mib: u64) -> machine::Level {
     machine::Level {
         name: name.to_owned(),
@@ -828,7 +798,6 @@ fn level(name: &str, logical: u16, l2_mib: u64) -> machine::Level {
     }
 }
 
-/// One device-tree CPU node.
 fn node(id: u16, kind: u8, l2_mib: u64) -> machine::DtCpu {
     machine::DtCpu {
         id,
@@ -837,7 +806,6 @@ fn node(id: u16, kind: u8, l2_mib: u64) -> machine::DtCpu {
     }
 }
 
-/// M5 fixture: perflevel0 "Super" (4 cores, 16 MiB L2, `P`), perflevel1 "Efficiency" (6 cores, 6 MiB L2, `E`).
 fn m5() -> (Vec<machine::Level>, Vec<machine::DtCpu>) {
     let levels = vec![level("Super", 4, 16), level("Efficiency", 6, 6)];
     let cpus = (0..10)
@@ -852,7 +820,6 @@ fn m5() -> (Vec<machine::Level>, Vec<machine::DtCpu>) {
     (levels, cpus)
 }
 
-/// Every logical id in `0..n` is in exactly one cluster.
 fn partitions(layout: &CpuLayout, n: u16) -> bool {
     let mut ids: Vec<u16> = layout
         .clusters
@@ -863,9 +830,6 @@ fn partitions(layout: &CpuLayout, n: u16) -> bool {
     ids == (0..n).collect::<Vec<_>>()
 }
 
-/// The clusters come from the levels, fastest first, and their cores from
-/// the device tree: the M5's Super cores are 6–9 and its Efficiency cores
-/// 0–5.
 #[test]
 fn the_cluster_layout_is_read_from_the_device_tree() {
     let (levels, cpus) = m5();
@@ -915,9 +879,6 @@ fn the_cluster_layout_is_read_from_the_device_tree() {
     );
 }
 
-/// Where the device tree cannot be read or does not add up, the convention
-/// places the slowest level at the lowest ids; with no levels (or levels
-/// that do not sum to the core count) there is one `"CPU"` cluster.
 #[test]
 fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     let (levels, cpus) = m5();
@@ -976,8 +937,6 @@ fn a_device_tree_that_does_not_add_up_falls_back_to_the_convention() {
     assert_eq!(four.clusters.len(), 1, "a level with no cores is left out");
 }
 
-/// `memory_detail_of` computes free (`free - speculative`), app (`internal - purgeable`),
-/// wired, compressed, and unclamped swap stored from 16 KiB page counts.
 #[test]
 fn memory_by_page_class_is_counted_from_one_read() {
     let page = 16_384;
@@ -1052,8 +1011,6 @@ fn memory_by_page_class_is_counted_from_one_read() {
     assert_eq!((m.swap_used, m.swap_total), (0, 0), "no swap reading");
 }
 
-/// A driver's utilization is a whole percent: past 100 reads 100, negative
-/// reads unknown.
 #[test]
 fn a_utilization_figure_is_held_to_a_percent() {
     for (v, want) in [
@@ -1069,8 +1026,6 @@ fn a_utilization_figure_is_held_to_a_percent() {
     }
 }
 
-/// A volume's figures are its block counts times its block size, free held
-/// to the size and available to free, every product saturating.
 #[test]
 fn a_volumes_figures_are_held_in_order() {
     let r = machine::volume_of(1000, 400, 300, 4096, "/".into(), "apfs".into());
@@ -1326,25 +1281,18 @@ fn the_root_volume_reads_on_this_host() {
     assert_eq!(crate::volume(Path::new("/\0")), None);
 }
 
-/// Compile-time check that [`QuietErrors`] implements neither `Send` nor
-/// `Sync` (since the thread error mode it sets and restores is thread-local).
 #[test]
 fn a_quiet_guard_cannot_leave_its_thread() {
-    /// Answered through `()` by every type, and through a marker by a type
-    /// that is `Send` or `Sync`.
     trait OnItsThread<A> {}
     impl<T> OnItsThread<()> for T {}
-    /// The answer of a `Send` type.
     struct IsSend;
     impl<T: Send> OnItsThread<IsSend> for T {}
-    /// The answer of a `Sync` type.
     struct IsSync;
     impl<T: Sync> OnItsThread<IsSync> for T {}
     fn on_its_thread<T: OnItsThread<A>, A>() {}
     on_its_thread::<QuietErrors, _>();
 }
 
-/// A link that is up and running, named `name`, with `physical` as given.
 fn link(name: &str, physical: Option<bool>) -> LinkReading {
     LinkReading {
         name: name.to_owned(),
@@ -1354,9 +1302,6 @@ fn link(name: &str, physical: Option<bool>) -> LinkReading {
     }
 }
 
-/// The machine's own links: on macOS (no device fact) the up, running
-/// `en*` and `pdp_ip*` links; on Linux (a device fact) the up, running
-/// links a device backs.
 #[test]
 fn only_the_machines_own_links_count_toward_its_traffic() {
     for name in ["en0", "en7", "pdp_ip0", "pdp_ip3"] {
@@ -1387,7 +1332,6 @@ fn only_the_machines_own_links_count_toward_its_traffic() {
     assert!(!counts_toward_machine(&down));
 }
 
-/// A link's kind by name, where the OS does not class it.
 #[test]
 fn a_links_name_gives_its_kind_where_the_os_classes_none() {
     for (name, kind) in [
@@ -1420,8 +1364,6 @@ wlan0:7 8 9 10 0 0 0 0 11 12 13 14 0 0 0 0
   ../x: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
   torn: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16";
 
-/// `/proc/net/dev`: each interface's received and sent counters, the header
-/// lines skipped, a name with no space after its colon read.
 #[test]
 fn proc_net_dev_gives_each_interfaces_counters() {
     let rows = linux::net_dev(NET_DEV);
@@ -1450,9 +1392,6 @@ fn proc_net_dev_gives_each_interfaces_counters() {
     assert!(linux::net_dev("").is_empty());
 }
 
-/// sysfs's link facts: hex flags, up only with `IFF_UP` and an `operstate`
-/// of `up` or `unknown`, a speed in Mb/s as bits per second, and the kind
-/// from `wireless`, the name and `device`.
 #[test]
 fn sysfs_link_facts_read_flags_state_speed_and_kind() {
     assert_eq!(linux::hex_flags("0x1003\n"), Some(0x1003));
@@ -1476,9 +1415,6 @@ fn sysfs_link_facts_read_flags_state_speed_and_kind() {
     assert_eq!(linux::sys_kind("bridge0", false, true), LinkKind::Other);
 }
 
-/// The Linux link reader on a fixture root: each `/proc/net/dev` row joined
-/// to its sysfs facts, a link with no sysfs directory read as not up with
-/// no device.
 #[test]
 fn the_link_reader_reads_a_fixture_root() {
     let root = aterm_tempfile::tempdir().expect("scratch root");
@@ -1580,10 +1516,6 @@ fn the_link_reader_reads_a_fixture_root() {
     assert_eq!(linux::links_under_into(empty.path(), &mut Vec::new()), None);
 }
 
-/// The link reader's scratch: made [`linux::NET_DEV_CAP`] long where it is
-/// shorter and read again in place by the next reading, whose answer is
-/// what it read now, not what an earlier, longer file left in it; a longer
-/// scratch is kept whole.
 #[test]
 fn the_link_readers_scratch_is_read_again_in_place() {
     let fixture = |dev: &str| {
@@ -1639,8 +1571,6 @@ fn the_link_readers_scratch_is_read_again_in_place() {
     assert_eq!(linux::links_under_into(empty.path(), &mut scratch), None);
 }
 
-/// `/proc/loadavg`'s total: the count after the `/` of its fourth field,
-/// from a whole first line.
 #[test]
 fn the_load_average_file_gives_every_thread_on_the_machine() {
     assert_eq!(
@@ -1671,10 +1601,6 @@ fn the_load_average_file_gives_every_thread_on_the_machine() {
     assert_eq!(linux::Root::new(empty.path()).tasks(), None);
 }
 
-/// The macOS pid listing: offered the size ask's room and a quarter more,
-/// never past [`machine::MAX_PIDS`], and counted only when it listed some
-/// pids and did not fill its room; one uid's listing of none counts zero
-/// where `errno` stayed clear.
 #[test]
 fn a_pid_listing_counts_only_what_it_listed_within_its_room() {
     assert_eq!(machine::pid_room(920), Some(1150));
@@ -1692,8 +1618,6 @@ fn a_pid_listing_counts_only_what_it_listed_within_its_room() {
     assert_eq!(machine::owned_count(1150, 0, 1150), None, "a full room");
 }
 
-/// Two ceilings: the smaller of the known; an unlimited soft limit is no
-/// ceiling.
 #[test]
 fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
     assert_eq!(machine::smaller(Some(10_666), Some(4_000)), Some(4_000));
@@ -1756,8 +1680,6 @@ fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {
     }
 }
 
-/// The capability words agents read (`aterm ctl sys caps`): one word per
-/// answer, and the reason when unavailable.
 #[test]
 fn capability_words_are_one_word_each() {
     use crate::{Cap, CapSource, Caps, Why};
@@ -1790,7 +1712,6 @@ fn capability_words_are_one_word_each() {
     }
 }
 
-/// This host's own report names its OS and answers every row.
 #[test]
 fn this_hosts_capability_report_names_its_os() {
     let rows = crate::caps().rows();
@@ -1809,7 +1730,6 @@ fn this_hosts_capability_report_names_its_os() {
     }
 }
 
-/// Level names by count, and clusters by rank, fastest first.
 #[test]
 fn levels_are_named_by_count_and_ranked_fastest_first() {
     assert!(crate::level_names(0).is_empty());

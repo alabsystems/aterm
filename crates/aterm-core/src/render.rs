@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine-owned render snapshot: [`RenderInput`] is the plain-owned, `Terminal`-free value a renderer reads to paint one frame.
+//! The engine-owned render snapshot: [`RenderInput`](crate::render::RenderInput) is the plain-owned, `Terminal`-free value a renderer reads to paint one frame.
 
 use crate::grid::LineSize;
 use crate::selection::TextSelection;
@@ -1172,7 +1172,7 @@ pub struct RenderInput {
     pub absolute_row_revision: u64,
     /// `Grid::history_renumber_epoch()` at extraction.
     pub history_renumber_epoch: u64,
-    /// The holder fence at extraction ([`Terminal::holder_view`]), resolved to absolute rows under the same lock as [`base_y`](Self::base_y).
+    /// The holder fence at extraction ([`Terminal::holder_view`](crate::terminal::Terminal::holder_view)), resolved to absolute rows under the same lock as [`base_y`](Self::base_y).
     pub holder: crate::terminal::HolderView,
     /// Sub-row scroll translate (display only).
     pub scroll_frac_px: i32,

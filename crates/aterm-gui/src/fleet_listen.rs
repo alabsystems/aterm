@@ -15,16 +15,12 @@ use aterm_types::MutexExt as _;
 
 use crate::app_config::FleetConfig;
 
-/// How often a bind refused `EADDRINUSE` or `EADDRNOTAVAIL`, or a key that cannot be used, is tried again, and how often a served key is read again.
+/// How often a bind refused `EADDRINUSE` or `EADDRNOTAVAIL`, or a key that cannot be used, is
+/// tried again, and how often a served key is read again.
 pub(crate) const RETRY: Duration = Duration::from_secs(2);
 
-/// The development seam that sets [`retry`] in milliseconds.
 const RETRY_SEAM: &str = "ATERM_DEBUG_FLEET_RETRY_MS";
 
-/// [`RETRY`] as this process runs it, read once: the constant, unless a
-/// development build (`aterm_types::dev_seam!`, which a shipped binary never
-/// compiles) starts with [`RETRY_SEAM`] set to a positive whole number of
-/// milliseconds.
 fn retry() -> Duration {
     static EVERY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
@@ -43,8 +39,6 @@ pub(crate) fn fleet_slots() -> usize {
     )
 }
 
-/// [`fleet_slots`] for a soft descriptor limit and the control server's cap:
-/// never fewer than one, so a configured listener always serves.
 fn slots_for(soft_limit: Option<u64>, control_cap: usize) -> usize {
     let by_descriptors = soft_limit.map_or(usize::MAX, |soft| {
         usize::try_from(soft / 32).unwrap_or(usize::MAX)
@@ -55,20 +49,13 @@ fn slots_for(soft_limit: Option<u64>, control_cap: usize) -> usize {
         .max(1)
 }
 
-/// Whether this process was launched INSIDE another aterm.
 fn launched_inside_aterm() -> bool {
     std::env::var_os(aterm_types::domain::ENV_PARENT_SESSION_ID).is_some()
         || std::env::var_os("ATERM_CHILD").is_some()
 }
 
-/// The ops this listener serves: the read; `book`, a member's read of this
-/// machine's book of peers when it is the issuer ([`share_book`]); and
-/// `join`, the registration `aterm fleet join` makes with its issuer
-/// ([`register_member`]).
 const SERVES: &[FleetOp] = &[FleetOp::Survey, FleetOp::Book, FleetOp::Join];
 
-/// [`SERVES`] at `allow = "drive"`, and `drive`: another Mac's node driving
-/// this one's sessions ([`admit_driver`]).
 const SERVES_DRIVE: &[FleetOp] = &[
     FleetOp::Survey,
     FleetOp::Book,
@@ -83,8 +70,7 @@ enum Standing {
     Off,
     /// Bound and serving.
     Listening,
-    /// The port is held by another process, or the address is not this
-    /// machine's yet; tried again every [`RETRY`].
+    /// The port is held by another process, or the address is not this machine's yet.
     Retrying,
     /// Not listening, for the named reason (`status`'s help lists them).
     Refused(&'static str),
@@ -101,15 +87,12 @@ impl Standing {
     }
 }
 
-/// The `[fleet]` table as the listener reads it: absent, or a blank `listen`,
-/// is no listener.
+/// The `[fleet]` table as the listener reads it: absent, or a blank `listen`, is no listener.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Wanted {
     listen: String,
     allow: Option<String>,
-    /// `[fleet] drive_from`'s grants, each a node and the key it was bound
-    /// to when its person let it drive ([`aterm_net::fleet::DriveGrant`]);
-    /// any other word in it — a bare node id among them — grants no one.
+    /// `[fleet] drive_from`'s grants.
     drive_from: Vec<aterm_net::fleet::DriveGrant>,
 }
 
@@ -131,8 +114,6 @@ fn fleet_wanted(fleet: Option<&FleetConfig>) -> Option<Wanted> {
     })
 }
 
-/// The level `[fleet] allow` names: the scope the listener proves, and
-/// whether it serves `drive` (`"drive"`, whose reads are content's).
 fn level_of(allow: Option<&str>) -> Option<(FleetScope, bool)> {
     match allow.map(str::to_ascii_lowercase).as_deref() {
         None => Some((FleetScope::Facts, false)),
@@ -141,13 +122,11 @@ fn level_of(allow: Option<&str>) -> Option<(FleetScope, bool)> {
     }
 }
 
-/// The listener's one desk: what the config asks for, which generation serves
-/// it, and where that generation stands.
 struct FleetDesk {
     wanted: Option<Wanted>,
-    /// Moved by every change of `wanted`; a generation serves while it is its.
+    /// Moved by every change of `wanted`.
     generation: u64,
-    /// A reload has set `wanted`, so [`start`]'s launch-time table is older.
+    /// A reload has set `wanted`, so [`start_fleet_listener`]'s launch-time table is older.
     configured: bool,
     started: bool,
     standing: Standing,
@@ -164,10 +143,9 @@ static FLEET_DESK: Mutex<FleetDesk> = Mutex::new(FleetDesk {
     stop: None,
 });
 
-/// Signalled whenever `generation` moves.
 static FLEET_CHANGED: Condvar = Condvar::new();
 
-/// Start the listener's supervisor, once per process, with the launch's `[fleet]` table (unless a reload has already given a newer one).
+/// Start the listener's supervisor.
 pub(crate) fn start_fleet_listener(fleet: Option<&FleetConfig>) {
     {
         let mut desk = FLEET_DESK.lock_or_recover();
@@ -192,7 +170,7 @@ pub(crate) fn start_fleet_listener(fleet: Option<&FleetConfig>) {
     }
 }
 
-/// Follow a reloaded config's `[fleet]` table: a changed one stops the generation serving and starts the next.
+/// Follow a reloaded config's `[fleet]` table.
 pub(crate) fn configure_fleet_listener(fleet: Option<&FleetConfig>) {
     let wanted = fleet_wanted(fleet);
     let mut desk = FLEET_DESK.lock_or_recover();
@@ -214,8 +192,6 @@ pub(crate) fn fleet_status_word() -> String {
     FLEET_DESK.lock_or_recover().standing.word()
 }
 
-/// The supervisor: runs each generation in turn, the next only once the one
-/// before has closed its port.
 fn supervise_fleet_listener() {
     crate::qos::set_self(crate::qos::Role::Background);
     let mut ran = 0;
@@ -234,8 +210,6 @@ fn supervise_fleet_listener() {
     }
 }
 
-/// One generation: judge the table, then bind and serve until it is not the
-/// current one, trying a held port or an unusable key again every [`RETRY`].
 fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
     let Some(wanted) = wanted else {
         stand_fleet(generation, Standing::Off, "fleet listener off");
@@ -283,10 +257,7 @@ fn run_fleet_generation(generation: u64, wanted: Option<Wanted>) {
     }
 }
 
-/// Bind `addr` and serve it at `scope` until `generation` is no longer
-/// current: the key and the bind tried again every [`RETRY`] while the key is
-/// unusable, the port held or the address not up, and the key read again
-/// every [`RETRY`] while it is served.
+/// Bind `addr` and serve it at `scope` until `generation` is no longer current.
 #[cfg(unix)]
 fn serve_fleet_port(
     generation: u64,
@@ -349,7 +320,6 @@ fn serve_fleet_port(
             }
         };
         let Some(running) = arm_generation(generation) else {
-            // a newer table arrived while this one bound
             return;
         };
         let node = read_node_key();
@@ -448,7 +418,6 @@ fn serve_fleet_port(
         );
         let stopped_itself = running.swap(false, Ordering::AcqRel);
         if rekeyed.load(Ordering::Acquire) {
-            // the key changed: read it again, and bind with it
             continue;
         }
         if stopped_itself {
@@ -462,22 +431,10 @@ fn serve_fleet_port(
     }
 }
 
-/// THE DRIVE GRANT (the step-in, `docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-/// §5.1): the node that may drive this Mac on `served` — the one its peer
-/// proved under the key this Mac's book binds it to, read fresh, so a `peers
-/// rm` counts at once, when a `[fleet] drive_from` grant (`drivers`) names it
-/// with that same key ([`aterm_net::fleet_member::proven_driver`]) — named
-/// as a person reads it ([`driver_name`]). The fleet secret alone never
-/// drives, and neither does a node id bound afresh to another key since the
-/// grant. On a member, a node only its copy of the issuer's book binds is
-/// admitted against a copy under a minute old
-/// ([`aterm_net::fleet_member::COPY_DRIVES_FOR`]); an older one is checked
-/// by reading the issuer's book again, proving `recheck` (this listener's
-/// secret and node), and refused while that book cannot be read.
+/// THE DRIVE GRANT (the step-in, `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1).
 /// # Errors
-/// Why the dialer may not drive: it proved no node bound here, a node no
-/// grant names, one whose grant holds another key, or one an old copy alone
-/// binds while the issuer's book cannot be read.
+/// Why the dialer may not drive: it proved no node bound here, a node no grant names, one whose
+/// grant holds another key, or one an old copy alone binds while the issuer's book cannot be read.
 #[cfg(unix)]
 fn admit_driver(
     served: &aterm_net::fleet::Served,
@@ -497,11 +454,7 @@ fn admit_driver(
     Ok(crate::fabric::Driver { node, host })
 }
 
-/// Whether this Mac lets the peer of `served` drive it, as its book and its
-/// copy of its issuer's book stand now
-/// ([`aterm_net::fleet_member::listed_driver`]): what its survey header
-/// tells that reader (`drive=1`), never what admits a drive
-/// ([`admit_driver`]).
+/// Whether this Mac lets the peer of `served` drive it.
 #[cfg(unix)]
 fn lists_driver(
     served: &aterm_net::fleet::Served,
@@ -512,12 +465,7 @@ fn lists_driver(
     })
 }
 
-/// The proven `node` of a drive as its credit, its hold and its records name
-/// it: the `host` this Mac's book names it by, with the node's short id —
-/// the host is the node's own word (its join registration, which a join
-/// again under its key replaces, and which no book holds unique), so only
-/// the id tells a Mac from one that named itself the same — else the id
-/// alone.
+/// The proven `node` of a drive as its credit, its hold and its records name it.
 #[cfg(unix)]
 fn driver_name(node: &str, host: Option<&str>) -> String {
     let short = node.get(..8).unwrap_or(node);
@@ -527,9 +475,7 @@ fn driver_name(node: &str, host: Option<&str>) -> String {
     }
 }
 
-/// A drive this Mac refuses ([`admit_driver`]): one `ERR denied:` line on
-/// the proved stream, then its end, and the refusal in the audit trail under
-/// the dialer's address, thinned as the fleet gate's are.
+/// A drive this Mac refuses ([`admit_driver`]).
 #[cfg(unix)]
 fn refuse_driver(
     served: aterm_net::fleet::Served,
@@ -552,12 +498,7 @@ fn refuse_driver(
     })
 }
 
-/// A member's `join` (`aterm fleet join` on another machine), on its proved
-/// `stream` (its reads bounded by [`aterm_net::fleet::HANDSHAKE_WITHIN`]): its
-/// one registration record recorded in this machine's book of peers with the
-/// address `peer` it came from and the node key its connection proved
-/// (`proof`), and answered naming this machine — its node id, host, fleet
-/// `port` and version ([`aterm_net::fleet_member::serve_join`]).
+/// A member's `join` (`aterm fleet join` on another machine).
 #[cfg(unix)]
 fn register_member<S: std::io::Read + std::io::Write>(
     stream: &mut S,
@@ -610,10 +551,7 @@ fn no_node_id() -> String {
     )
 }
 
-/// A member's read of this machine's book of peers, on its proved `stream`
-/// (its writes bounded by [`aterm_net::fleet::HANDSHAKE_WITHIN`]): answered
-/// with the book's first-hand entries when this machine is the issuer, else
-/// `ERR no-book` ([`aterm_net::fleet_member::serve_book`]).
+/// A member's read of this machine's book of peers.
 #[cfg(unix)]
 fn share_book<S: std::io::Write>(stream: &mut S, peer: Option<SocketAddr>) -> std::io::Result<()> {
     use aterm_net::fleet_member::{read_node_id, serve_book};
@@ -636,11 +574,7 @@ fn share_book<S: std::io::Write>(stream: &mut S, peer: Option<SocketAddr>) -> st
     Ok(())
 }
 
-/// The audit line of a member's recorded join ([`register_member`]): the
-/// member as the book now holds it — its node and its FLEET address (the
-/// address it registered from with the fleet port it named, what `aterm
-/// fleet peers` lists), its host beside them — never the connection's
-/// ephemeral source port, which names nothing the book or a person can find.
+/// The audit line of a member's recorded join ([`register_member`]).
 #[cfg(unix)]
 fn registration_note(
     recorded: aterm_net::fleet_member::Recorded,
@@ -675,12 +609,7 @@ fn read_fleet_key() -> Result<aterm_net::fleet::FleetSecret, aterm_net::fleet::K
     }
 }
 
-/// This machine's node and its node key, which the listener proves to each
-/// dialer ([`aterm_net::fleet_member::read_node_identity`]), never minted
-/// here (`aterm fleet init|join` mint it): `None` — the listener then proves
-/// no node, as an older aterm, and each reader reads its node as a claim, or
-/// refuses it where it binds a key — when there is none, or one that cannot
-/// be used, which the audit trail says.
+/// This machine's node and its node key.
 #[cfg(unix)]
 fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
     use aterm_net::fleet_member::{NODE_KEY_FILE, read_node_identity};
@@ -696,11 +625,8 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
     }
 }
 
-/// While `generation` serves `secret` and proves the node `proved` (its id
-/// and key), read them again every [`RETRY`]: a fleet key that changed, went
-/// or is no longer private, or a node id or key that came, changed or went,
-/// sets `rekeyed` and clears `running`, which stops the serving and cuts its
-/// connections.
+/// While `generation` serves `secret` and proves the node `proved` (its id and key), read them
+/// again every [`RETRY`].
 #[cfg(unix)]
 fn watch_fleet_key(
     generation: u64,
@@ -735,7 +661,6 @@ fn watch_fleet_key(
     }
 }
 
-/// Wait out one [`retry`]; `true` when `generation` is still the current one.
 fn wait_fleet_unchanged(generation: u64) -> bool {
     let desk = FLEET_DESK.lock_or_recover();
     let (desk, _) = FLEET_CHANGED
@@ -744,9 +669,6 @@ fn wait_fleet_unchanged(generation: u64) -> bool {
     desk.generation == generation
 }
 
-/// The flag that stops `generation`'s serving, installed where
-/// [`configure_fleet_listener`]
-/// clears it — `None` when a newer table has already arrived.
 fn arm_generation(generation: u64) -> Option<Arc<AtomicBool>> {
     let mut desk = FLEET_DESK.lock_or_recover();
     if desk.generation != generation {
@@ -757,8 +679,6 @@ fn arm_generation(generation: u64) -> Option<Arc<AtomicBool>> {
     Some(running)
 }
 
-/// Record where `generation` stands, if it is still current, and write `line`
-/// once when that changed.
 fn stand_fleet(generation: u64, standing: Standing, line: &str) {
     let moved = {
         let mut desk = FLEET_DESK.lock_or_recover();
@@ -777,10 +697,6 @@ fn stand_fleet(generation: u64, standing: Standing, line: &str) {
     }
 }
 
-/// One listener event, for the audit trail: refusals thinned in a run of
-/// their own ([`crate::control::control_denials::FLEET_REFUSALS`]) — a peer
-/// reaches the listener before any proof — and a member's own connections
-/// written at debug, since a fleet's readers come and go all day.
 fn fleet_event(event: FleetEvent) {
     use aterm_log::sanitize_record;
     match event {
@@ -813,8 +729,6 @@ fn fleet_event(event: FleetEvent) {
     }
 }
 
-/// A listener line to stderr and aterm.log (a Dock-launched app's stderr goes
-/// nowhere), as a warning when it is a refusal.
 fn note_fleet(line: &str, refusal: bool) {
     crate::logging::stderr_line!("aterm-gui: {line}");
     if refusal {
@@ -828,10 +742,7 @@ fn note_fleet(line: &str, refusal: bool) {
 mod tests {
     use super::*;
 
-    /// A DRIVE IS NAMED BY ITS PROVEN NODE, NOT ONLY ITS CHOSEN HOST: two
-    /// nodes whose registrations name the same host read apart, by the id
-    /// each proved; a host that is no host (a space, a word aterm credits
-    /// by) is never shown.
+    /// A DRIVE IS NAMED BY ITS PROVEN NODE.
     #[cfg(unix)]
     #[test]
     fn a_drive_is_named_by_the_node_it_proved() {
@@ -854,10 +765,7 @@ mod tests {
         }
     }
 
-    /// THE JOIN'S AUDIT LINE NAMES THE MEMBER AS THE BOOK DOES: its node and
-    /// its fleet address (`127.0.0.1:58054`, what `aterm fleet peers` lists),
-    /// never the connection's source port (the 2026-10-16 real-login run's
-    /// issuer logged `127.0.0.1:58055`, a port nothing listens on).
+    /// THE JOIN'S AUDIT LINE NAMES THE MEMBER AS THE BOOK DOES.
     #[cfg(unix)]
     #[test]
     fn a_registration_names_the_member_by_its_fleet_address_and_node() {
@@ -884,8 +792,6 @@ mod tests {
         );
     }
 
-    /// The table the listener follows: absent or a blank `listen` is no
-    /// listener, and any change of either key is a change.
     #[test]
     fn the_listener_follows_listen_and_allow() {
         let table = |listen: Option<&str>, allow: Option<&str>| FleetConfig {
@@ -913,10 +819,6 @@ mod tests {
         assert_ne!(on, fleet_wanted(Some(&table(Some("0.0.0.0:7101"), None))));
     }
 
-    /// THE DRIVE LEVEL IS OFF BY DEFAULT: `drive` reads as content and serves
-    /// the drive op, and it drives for no one until `drive_from` grants a
-    /// node — a node and the key it held when its person let it drive; a
-    /// bare node id, like any other word that is no grant, grants nobody.
     #[test]
     fn the_drive_level_serves_only_the_nodes_its_list_names() {
         let node = "ab".repeat(16);
@@ -953,8 +855,6 @@ mod tests {
         );
     }
 
-    /// The fleet's slots are a 32nd of the soft descriptor limit, within the
-    /// fleet's most and the control server's cap, and never none.
     #[test]
     fn the_slots_are_a_share_of_the_descriptor_limit() {
         let most = aterm_net::fleet::MAX_SLOTS;

@@ -1367,14 +1367,19 @@ struct BloomUniform {
     strength: f32,
     radius: f32,
     chroma_radius: f32,
-    _pad: [f32; 3],
+    /// The share of the half texture's storage that its texels in use fill, per axis: 1 for an
+    /// exact texture. Only the GL arm's present keeps roomy storage, and only `bloom.glsl` reads
+    /// it; the other arms' shaders take it as padding.
+    extent: [f32; 2],
+    _pad: f32,
 }
 impl_pod_zeroable!(BloomUniform {
     texel: [f32; 2],
     strength: f32,
     radius: f32,
     chroma_radius: f32,
-    _pad: [f32; 3]
+    extent: [f32; 2],
+    _pad: f32
 });
 
 #[cfg(wgpu_arm)]
@@ -4684,14 +4689,10 @@ pub struct WindowGpu {
     gl_apron_gen: u64,
     #[cfg(gl_arm)]
     gl_virtual_off: Option<crate::gl::resources::GlTexture>,
-    // What a readback post sends: the offscreen written since the last post
-    // and what it composed (`gl_present::post_damage`).
     #[cfg(gl_arm)]
     offscreen_dirty_since_post: Option<[u32; 4]>,
     #[cfg(gl_arm)]
     gl_posted: Option<gl_present::GlPosted>,
-    // The bloom's inputs at this compose and at the last post: a post whose
-    // bloom drew from the same as the last's sends only what changed under it.
     #[cfg(gl_arm)]
     gl_bloom_inputs: Vec<u8>,
     #[cfg(gl_arm)]
@@ -4811,8 +4812,6 @@ impl WindowGpu {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // Reports `false`: the armed arm's resident `metal_bloom_half` is
-            // not consulted.
             false
         }
     }
@@ -5035,7 +5034,6 @@ impl WindowGpu {
     #[inline]
     pub fn invalidate_present(&mut self) {
         self.present_prev = None;
-        // The window system may hold none of the last post: the next is whole.
         #[cfg(gl_arm)]
         {
             self.gl_posted = None;
@@ -5370,7 +5368,7 @@ pub(crate) struct MetalOffscreen {
     pub(crate) h: u32,
 }
 
-/// The armed arm's resident settings card ([`TrayOverlay`] twin).
+/// The armed arm's resident settings card (`TrayOverlay` twin).
 #[cfg(target_os = "macos")]
 pub(crate) struct MetalTrayCard {
     texes: Vec<crate::device_layer::LayerTexture>,
@@ -6952,11 +6950,10 @@ impl GpuRenderer {
         self.cpu.take_missing_font_classes()
     }
 
-    /// Forward of the inner CPU rasterizer's [`set_runtime_font_discovery`].
+    /// Forward of the inner CPU rasterizer's
+    /// [`set_runtime_font_discovery`](Renderer::set_runtime_font_discovery).
     #[inline]
     pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
-        // Widening the chain drops the CPU's rasterized glyphs (a `.notdef` from
-        // the narrower chain must not survive), so the atlas copy goes too.
         self.raster_changed(|cpu| cpu.set_runtime_font_discovery(enabled));
     }
 
@@ -7046,8 +7043,6 @@ impl GpuRenderer {
 
     /// Record the Linux subpixel-RGB mode (`font_subpixel`) on the wrapped CPU face.
     pub fn set_font_subpixel(&mut self, mode: &str) {
-        // No `invalidate_atlas()`: the CPU drops only its LCD overlay cache,
-        // which never reaches this atlas.
         let _ = self.cpu.set_font_subpixel(mode);
     }
 
@@ -7364,7 +7359,6 @@ impl GpuRenderer {
     pub fn allocator_reserved(&self) -> Option<(u64, u64, Vec<u64>)> {
         #[cfg(not(wgpu_arm))]
         {
-            // Metal reports no suballocator; armed resources are exact-size mints.
             None
         }
         #[cfg(wgpu_arm)]
@@ -8510,7 +8504,7 @@ impl GpuRenderer {
         }
     }
 
-    /// Start recording a glass-less window's presents through a persistent [`VirtualTarget`].
+    /// Start recording a glass-less window's presents through a persistent `VirtualTarget`.
     pub fn virtual_begin(
         &mut self,
         win: &mut WindowGpu,
@@ -9053,8 +9047,6 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // Disarmed with no wgpu arm: nothing was drawn; the caller's
-            // degrade owns the blank/error shape.
             (None, w, h)
         }
     }
@@ -9311,7 +9303,8 @@ impl GpuRenderer {
                 strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                 radius: self.bloom_radius,
                 chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                _pad: [0.0; 3],
+                extent: [1.0; 2],
+                _pad: 0.0,
             }),
         )?;
         let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
@@ -10474,7 +10467,8 @@ impl GpuRenderer {
                     strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                     radius: self.bloom_radius,
                     chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                    _pad: [0.0; 3],
+                    extent: [1.0; 2],
+                    _pad: 0.0,
                 }),
             )?;
             let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
@@ -11276,10 +11270,7 @@ impl GpuRenderer {
         }
     }
 
-    /// [`Self::create_window_surface`], with `sink`, the frontend's presenter
-    /// for the window, which the GL arm posts the window's frames through where
-    /// a window surface would stall the window system ([`FrameSink`]); every
-    /// other window and arm leaves it unused.
+    /// [`Self::create_window_surface`], with `sink`, the frontend's presenter for the window, which the GL arm posts the window's frames through where a window surface would stall the window system ([`FrameSink`]).
     #[cfg(target_os = "linux")]
     pub fn create_window_surface_with_sink<W: WindowTarget>(
         &mut self,
@@ -12004,8 +11995,6 @@ impl GpuRenderer {
         surf.config.format = wgpu::TextureFormat::Rgba16Float;
         self.configure_surface_retagging_scrgb(win, surf, "live HDR-state upgrade");
         if surf.is_hdr() {
-            // This path crossed from SDR, so publish the new encoding only after
-            // configure and tag succeeded.
             win.apply_hdr_surface_upgrade();
         }
     }
@@ -12775,7 +12764,7 @@ impl GpuRenderer {
         }
     }
 
-    /// Present `input` into this window's persistent [`VirtualTarget`].
+    /// Present `input` into this window's persistent `VirtualTarget`.
     #[inline]
     pub fn present_virtual(
         &mut self,
@@ -12984,8 +12973,6 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
-            // The armed arm's PSOs are demand-built per table row
-            // (`MetalArmLive::psos`); this wgpu ledger reports none resident.
             [false; EFFECT_PIPELINE_COUNT]
         }
     }
@@ -13345,7 +13332,8 @@ impl GpuRenderer {
             strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
             radius: self.bloom_radius,
             chroma_radius: bloom_chroma_radius(self.bloom_radius),
-            _pad: [0.0; 3],
+            extent: [1.0; 2],
+            _pad: 0.0,
         };
         self.ctx
             .queue
@@ -13408,7 +13396,6 @@ impl GpuRenderer {
                 let sy1 = y1.saturating_add(d).min(h);
                 Some([sx0, sy0, sx1, sy1])
             } else {
-                // No bbox: a pane clip still bounds the composite.
                 clip.map(|_| [0, 0, w, h])
             };
             let scissor = match (scissor, clip) {
@@ -15382,7 +15369,6 @@ impl GpuRenderer {
         let (cut_lo, cut_hi) = if cut_out_on {
             aterm_render::cursor_cutout_cols(row_plans.get(cr).map_or(&[][..], Vec::as_slice), cc)
         } else {
-            // Sentinel empty range (lo > hi): no column contributes a slice.
             (1, 0)
         };
         let (cut_x0, cut_x1) = if cut_out_on {
@@ -15782,7 +15768,6 @@ impl GpuRenderer {
                     continue;
                 }
                 let color = if selected {
-                    // The active/inactive selection band colour captured above.
                     rgb4_u32(theme_selection)
                 } else {
                     let mut c = rgb4(cell.bg);
@@ -15842,8 +15827,6 @@ impl GpuRenderer {
                     let color = if selected {
                         rgb4_u32(theme_selection)
                     } else if wallpaper_on {
-                        // A tail cell is its pane's default bg, so under a
-                        // wallpaper it shows the backdrop.
                         continue;
                     } else if default_bg != frame_bg {
                         let mut color = rgb4_u32(default_bg);
@@ -16277,8 +16260,6 @@ impl GpuRenderer {
                     let fp_h = image.image.rows as usize * ch + lift;
                     let key = (std::sync::Arc::as_ptr(&image.image) as usize, fp_w, fp_h);
                     let Some(&(img_y0, dw, dh)) = plane.placements.get(&key) else {
-                        // Failed decode (no texture rows): nothing to draw, the
-                        // cell bg shows through — exactly the CPU negative-cache.
                         continue;
                     };
                     let (fw, fh) = (fp_w as u32, fp_h as u32);
@@ -18460,7 +18441,8 @@ impl GpuRenderer {
                         strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                         radius: self.bloom_radius,
                         chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                        _pad: [0.0; 3],
+                        extent: [1.0; 2],
+                        _pad: 0.0,
                     }),
                 );
             }
@@ -20176,6 +20158,54 @@ mod tests {
             "every frame after the first must keep the scissored path, not force Full \
              (full_repaints={})",
             gpu.full_repaints(),
+        );
+    }
+
+    /// A window that shrinks keeps its GL bloom half texture (the storage still holds the smaller
+    /// frame), and the halo drawn through that roomy storage is the one a window that never resized
+    /// draws, out to the frame's edge.
+    #[cfg(gl_arm)]
+    #[test]
+    fn a_bloom_through_kept_storage_matches_one_never_resized() {
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        assert!(gpu.bloom_enabled(), "precondition: bloom defaults ON");
+        let pad = gpu.pad();
+        let (cw, ch) = gpu.cell_size();
+        let frame = |rows: usize, cols: usize| {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(b"\x1b[?25lAAAA\r\nbbbb");
+            let mut input = term.cell_frame(rows, cols);
+            // In the last column, so the halo reaches the half texture's last texels in use.
+            input.cursor_glow_add = vec![GlowQuad {
+                row: 1,
+                x: (pad + (cols - 1) * cw) as u16,
+                y: (pad + ch + 2) as u16,
+                w: cw as u16,
+                h: (ch - 4) as u16,
+                color: 0x0030_50A0,
+                alpha: 0,
+                color2: 0x0030_50A0,
+                alpha2: 0,
+            }];
+            input
+        };
+        let (large, small) = (frame(14, 20), frame(12, 18));
+        let mut shrunk = WindowGpu::new();
+        let _ = gpu.present_input_readback(&mut shrunk, &large);
+        let got = gpu.present_input_readback(&mut shrunk, &small);
+        let half = shrunk
+            .gl_bloom_half
+            .as_ref()
+            .expect("a bloom frame on the GL arm draws its half texture");
+        assert!(
+            half.roomy(),
+            "the shrink kept the larger frame's storage: {half:?}"
+        );
+        let want = gpu.present_input_readback(&mut WindowGpu::new(), &small);
+        assert_eq!((got.width, got.height), (want.width, want.height));
+        assert_eq!(
+            got.pixels, want.pixels,
+            "the halo through kept storage must be the never-resized window's"
         );
     }
 

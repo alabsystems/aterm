@@ -883,7 +883,8 @@ impl GpuRenderer {
                 strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                 radius: self.bloom_radius,
                 chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                _pad: [0.0; 3],
+                extent: [1.0; 2],
+                _pad: 0.0,
             }),
         )?;
         let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {

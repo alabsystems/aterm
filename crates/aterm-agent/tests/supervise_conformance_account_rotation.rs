@@ -182,6 +182,7 @@ fn sample(w: &World, account: i64, low: bool, window_end: i64, at: i64) -> Sampl
         week_reset: w.weeks.map(|days| NOW + days[k] * DAY),
         at,
         by: String::new(),
+        ..Sample::default()
     }
 }
 

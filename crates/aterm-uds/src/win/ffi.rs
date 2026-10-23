@@ -160,6 +160,9 @@ unsafe extern "system" {
         lpUserTime: *mut FileTime,
     ) -> i32;
     pub(crate) fn CloseHandle(hObject: RawHandle) -> i32;
+    /// Cancels every request this process has pending on `hFile` (a socket's `recv` waiting
+    /// in another thread included) when `lpOverlapped` is null (`crate::hangup`).
+    pub(crate) fn CancelIoEx(hFile: RawHandle, lpOverlapped: *mut core::ffi::c_void) -> i32;
     /// The pids attached to this process's console; 0 when it has none
     /// (`crate::spawn::have_console`).
     pub(crate) fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;

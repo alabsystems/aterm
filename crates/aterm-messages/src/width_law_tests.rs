@@ -37,7 +37,6 @@ fn band(msgs: Vec<Message>, cols: usize) -> Presentation {
     c.presentation(cols, &char_width, None, Links::Painted)
 }
 
-/// The painted capsule texts of each row, the implicit link included.
 fn labels(p: &Presentation) -> Vec<Vec<String>> {
     p.rows
         .iter()
@@ -45,9 +44,6 @@ fn labels(p: &Presentation) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The row body opens Details at every width, so where dropping `Details ›`
-/// alone fits the row, the authored capsule keeps its words (`Open
-/// aterm.toml`, never `Edit` beside a sibling row that kept it).
 #[test]
 fn the_link_goes_before_an_authored_label_shortens() {
     let row = |title: &str| {
@@ -71,8 +67,6 @@ fn the_link_goes_before_an_authored_label_shortens() {
     assert_eq!(labels(&p), vec![vec!["Edit".to_string()]]);
 }
 
-/// A label one row at this width had to paint short is painted short on every
-/// row carrying it.
 #[test]
 fn one_intent_reads_one_way_across_the_band() {
     let waits = || {
@@ -139,9 +133,6 @@ fn one_intent_reads_one_way_across_the_band() {
     );
 }
 
-/// Forced short, a row that had room for `10 s left` paints `10s left`, and
-/// the cells it saves buy nothing (its excerpt and stats are the ones it had)
-/// at every width where it took the long form.
 #[test]
 fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
     let spec = RowSpec {
@@ -201,8 +192,6 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
     );
 }
 
-/// The clause before the excerpt's first `: ` is a whole statement: it stands,
-/// with no ellipsis, where the floor would drop the excerpt.
 #[test]
 fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
     let row = |why: &str| {
@@ -266,8 +255,6 @@ fn a_whole_lead_clause_stands_where_the_floor_would_drop_the_excerpt() {
     );
 }
 
-/// Narrowing from 200 to 8 columns never shows more of an excerpt's words,
-/// nor brings it back once it went; `excerpt` is the row's excerpt at a width.
 fn narrowing_holds(excerpt: &dyn Fn(usize) -> Option<String>) {
     let bare = |s: &str| s.trim_end_matches('\u{2026}').to_string();
     let mut prev: Option<Option<String>> = None;
@@ -287,9 +274,6 @@ fn narrowing_holds(excerpt: &dyn Fn(usize) -> Option<String>) {
     }
 }
 
-/// A row whose excerpt names each tab and how long (`tab 1 for 7 h · tab 3 for
-/// 2 h`) has no `: `; its first ` · ` piece is a whole statement too and
-/// stands where the floor would drop the excerpt.
 #[test]
 fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
     let row = |why: &str| {
@@ -329,9 +313,6 @@ fn a_first_piece_stands_where_the_floor_would_drop_the_excerpt() {
     narrowing_holds(&|cols| excerpt(why, cols));
 }
 
-/// A cut that says no word past the lead clause (`behind for 26 h:…`, the
-/// joint dangling) paints the clause whole instead; one column wider the cut
-/// adds `its` and stands.
 #[test]
 fn a_cut_that_adds_no_word_to_the_lead_is_the_lead() {
     let one = |why: &str, cols: usize| {
@@ -375,11 +356,8 @@ fn a_cut_that_adds_no_word_to_the_lead_is_the_lead() {
     narrowing_holds(&|cols| two(why, cols));
 }
 
-/// What a tab's login notice says happened (its reason, the second line).
 const LOST: &str = "Claude Code's login expired, so it cannot answer prompts.";
 
-/// A tab's notice as its host raises it: a now ask whose row leads with its
-/// one step, then its reason, `Show tab 1` its button.
 fn step_first(title: &str, step: &str) -> Message {
     Message::new(tags::HARNESS, Severity::Warn, title)
         .line(step)
@@ -392,8 +370,6 @@ fn step_first(title: &str, step: &str) -> Message {
         .key("harness.resume-ask.s-1.nr")
 }
 
-/// The same ask with no lines of its own: [`Message::now`] leads with the
-/// reason, so its excerpt is no step.
 fn reason_first(title: &str, step: &str) -> Message {
     Message::new(tags::HARNESS, Severity::Warn, title)
         .action(Intent::ShowTab { tab: 1, window: 1 })
@@ -404,12 +380,10 @@ fn reason_first(title: &str, step: &str) -> Message {
         .key("harness.resume-ask.s-1.nr")
 }
 
-/// `msg` alone on the band at `cols`, once its reveal's grace is over.
 fn revealed(msg: Message, cols: usize) -> RowLayout {
     revealed_with(msg, cols, &char_width)
 }
 
-/// [`revealed`], its cells measured by `width`.
 fn revealed_with(msg: Message, cols: usize, width: &dyn Fn(&str) -> usize) -> RowLayout {
     let now = Instant::now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
@@ -426,9 +400,6 @@ fn excerpt_of(row: &RowLayout) -> Option<String> {
     row.detail.as_ref().map(|(_, d)| d.clone())
 }
 
-/// The cells `words` cut after one more whole word than `shown` keeps would
-/// take ([`crate::glass`]'s whole-word cut): `None` where `shown` is not a
-/// cut of `words` or keeps its last word already.
 fn next_cut_cells(shown: &str, words: &str) -> Option<usize> {
     let stem = shown.strip_suffix('\u{2026}')?;
     let rest = words
@@ -440,19 +411,12 @@ fn next_cut_cells(shown: &str, words: &str) -> Option<usize> {
     Some(char_width(&next) + usize::from(!more.trim().is_empty()))
 }
 
-/// Whether `shown` is the title `words` at its floor: cut only after a whole
-/// word ([`crate::glass::tests::whole_words_of`]), in at most
-/// [`crate::TITLE_MIN`] cells, and one word more would not fit them.
 fn at_floor(shown: &str, words: &str) -> bool {
     crate::glass::tests::whole_words_of(shown, words)
         && char_width(shown) <= crate::TITLE_MIN
         && next_cut_cells(shown, words).is_none_or(|next| next > crate::TITLE_MIN)
 }
 
-/// AN ASK'S ONE STEP WINS OVER ITS TITLE (the review of the owner's notices,
-/// 2026-10-20: at 864 px the band cut `Type /login in the tab and sign in
-/// with main's own…`, and at 514 px it showed the title and `Show tab 1` and
-/// dropped the step).
 #[test]
 fn an_asks_step_stands_whole_where_the_title_can_pay_for_it() {
     let title = "Claude's login expired in tab 1";
@@ -482,10 +446,6 @@ fn an_asks_step_stands_whole_where_the_title_can_pay_for_it() {
     assert_eq!(excerpt_of(&plain), None, "{plain:?}");
 }
 
-/// A step longer than the band can hold beside the shortest title is cut, the
-/// title at its floor ([`crate::TITLE_MIN`]), and never dropped while the
-/// excerpt's floor fits; narrowing never shows more of it, nor brings it
-/// back once it went.
 #[test]
 fn an_asks_step_too_long_for_any_title_is_cut_not_dropped() {
     let title = "Claude usage limit reached in tab 1";
@@ -506,12 +466,8 @@ fn an_asks_step_too_long_for_any_title_is_cut_not_dropped() {
     );
 }
 
-/// The band's words in the place of a command it cannot show whole (the
-/// harness's `COMMAND_UNDER_DETAILS`).
 const SHORT: &str = "Run the command under Details.";
 
-/// A tab's notice led by its `step`, with its band `short` form where it has
-/// one, `Show tab 1` its button.
 fn step_or_short(title: &str, step: &str, short: Option<&str>) -> Message {
     let then = Then::step(step);
     let then = match short {
@@ -526,9 +482,6 @@ fn step_or_short(title: &str, step: &str, short: Option<&str>) -> Message {
         .key("harness.resume-ask.s-1.lr")
 }
 
-/// A STEP THAT MUST NOT BE CUT GIVES WAY TO ITS SHORT FORM (the review of
-/// the band, 2026-10-20: at 514 px the band read `Run aterm harness accounts
-/// renew…`, a command with the account it names cut off).
 #[test]
 fn a_step_with_a_short_form_is_whole_or_replaced_never_cut() {
     let title = "Claude usage limit reached in tab 1";
@@ -568,11 +521,6 @@ fn a_step_with_a_short_form_is_whole_or_replaced_never_cut() {
     );
 }
 
-/// A STEP'S SHORT FORM GIVES BACK THE CELLS THE WHOLE STEP WOULD HAVE TAKEN
-/// (the review of the band, ox4-3: with a 24-character label, at 80 and 70
-/// columns the band read `Claude usag… · Run the command under Details.`,
-/// then some 25 blank cells before `Tab 1`, and no `Details ›`, the capsule
-/// the short form sends the reader to).
 #[test]
 fn a_steps_short_form_gives_back_the_cells_the_step_took() {
     let title = "Claude usage limit reached in tab 1";
@@ -617,11 +565,6 @@ fn a_steps_short_form_gives_back_the_cells_the_step_took() {
     );
 }
 
-/// A STEP CUT SHORT OF ITS FIRST ACTION SAYS IT IS CUT (the review of the
-/// band, ox4-8: at 70 columns `Sign in to client-acme-research-024: clear the
-/// draft, then type /login.` read `Sign in to client-acme-research-024`, a
-/// complete-looking instruction to sign in, the draft and `/login` gone with
-/// no mark).
 #[test]
 fn a_step_cut_short_of_its_first_action_ends_in_an_ellipsis() {
     let title = "Claude's login expired in tab 1";
@@ -667,8 +610,6 @@ fn a_step_cut_short_of_its_first_action_ends_in_an_ellipsis() {
     );
 }
 
-/// What the title of `row` reads as, against its whole `title` and its
-/// `short` form: 2 whole, 1 the short form whole, 0 the short form cut.
 fn title_tier(row: &RowLayout, title: &str, short: &str) -> Option<u8> {
     let shown = row.title.1.as_str();
     let said = shown.trim_end_matches('\u{2026}');
@@ -683,15 +624,10 @@ fn title_tier(row: &RowLayout, title: &str, short: &str) -> Option<u8> {
     }
 }
 
-/// `step_or_short`'s ask with its title's short form.
 fn titled(title: &str, short_title: &str, step: &str, short: Option<&str>) -> Message {
     step_or_short(title, step, short).short_title(short_title)
 }
 
-/// A TITLE READS WHOLE, AS ITS SHORT FORM WHOLE, OR AS ITS SHORT FORM CUT
-/// (the review of the band, 2026-10-20: at the default window the band read
-/// `Claude's lo…` and `Claude usag…`, stubs that said nothing of what
-/// happened).
 #[test]
 fn a_title_reads_whole_short_or_short_cut_never_as_a_stub_of_itself() {
     let title = "Claude's login expired in tab 1";
@@ -777,11 +713,6 @@ fn a_title_reads_whole_short_or_short_cut_never_as_a_stub_of_itself() {
     assert_eq!(title_tier(&plain, title, short), None, "{plain:?}");
 }
 
-/// BESIDE A STEP'S SHORT FORM THE SHORT TITLE BUYS `Details ›` (the review
-/// of the band, ox4-3, at the default window with a 24-character label):
-/// `Run the command under Details.` sends the reader to a capsule, so the
-/// short title stands in the whole one's place before that capsule goes,
-/// and at 70 and 80 columns `Show tab 1` keeps its long words.
 #[test]
 fn beside_a_steps_short_form_the_short_title_keeps_details() {
     let title = "Claude usage limit reached in tab 1";
@@ -811,9 +742,6 @@ fn beside_a_steps_short_form_the_short_title_keeps_details() {
     );
 }
 
-/// A short title wider than the whole one, or one on a row that has room for
-/// the whole title, never shows: the whole title is what a row reads where
-/// it fits.
 #[test]
 fn a_short_title_stands_only_where_the_whole_one_does_not_fit() {
     let step = "Type /login in the tab and sign in again.";
@@ -837,12 +765,6 @@ fn a_short_title_stands_only_where_the_whole_one_does_not_fit() {
     assert_eq!(narrow.title.1, "Login expired", "{narrow:?}");
 }
 
-/// A SHORT TITLE GIVES BACK THE CELLS THE WHOLE TITLE TOOK (the review of
-/// the band, 2026-10-20: at the default window `Login expired · Finish
-/// signing in in your browser.` stood beside 17 blank cells and `Tab 1`):
-/// where the whole title gives way, the head is fitted again around the
-/// short one from the top, so `Show tab 1` keeps its words and `Details ›`
-/// stands where it fits, as beside a step's short form (ox4-3).
 #[test]
 fn a_short_title_gives_back_the_cells_the_whole_title_took() {
     let title = "Claude's login expired in tab 1";
@@ -863,9 +785,6 @@ fn a_short_title_gives_back_the_cells_the_whole_title_took() {
     assert_eq!(caps(&plain), ["Tab 1"], "{plain:?}");
 }
 
-/// A TITLE IS CUT ONLY AFTER A WHOLE WORD (the review of the band over
-/// Settings: at 22 columns `Keybinding skipped` read `⚠ Keybindin…` beside
-/// `Edit`, a word cut mid-way and nothing to say the rest was a press away).
 #[test]
 fn a_title_is_cut_only_after_a_whole_word() {
     use crate::glass::tests::{fixtures, motion_fixtures, whole_words_of};
@@ -949,12 +868,6 @@ fn a_title_is_cut_only_after_a_whole_word() {
     );
 }
 
-/// AN ALL-CJK TITLE STANDS ON THE BAND AT EVERY NARROW WIDTH: a config
-/// row and a notice whose titles have no space (Japanese, Chinese) or few
-/// (Korean), at every width from 22 to 42 columns (the band's columns at 1×
-/// and 2× text), measured in cells (a CJK character is two) and by chars:
-/// the title is whole or cut between its characters with `…`, never empty,
-/// never cut before a closer, and spoken whole.
 #[test]
 fn an_all_cjk_title_stands_on_the_band_at_every_narrow_width() {
     use crate::glass::tests::whole_words_of;

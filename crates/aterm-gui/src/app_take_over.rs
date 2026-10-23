@@ -11,11 +11,6 @@ use std::time::{Duration, Instant};
 /// How long the person's hold stands before the digest says so once ([`App::hand_long_holds`]): long enough that a hold is no longer the person at the keyboard, short enough that a forgotten one is found while its harness and manager still matter.
 pub(crate) const LONG_HOLD: Duration = Duration::from_secs(30 * 60);
 
-/// How often a standing long hold's entry is composed again
-/// ([`App::hand_long_holds`]): its refusal count, its manager and another
-/// hold beside it move with no hold taken or handed back, so a walk a minute
-/// keeps its words at most a minute behind (the digest itself restates
-/// moved words at its own quiet pace, `aterm_messages::need::RESTATE_QUIET`).
 const LONG_HOLD_RESTATE: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
@@ -25,10 +20,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// THE LONG HOLD'S CLOCK, in unix seconds: the WALL clock, because
-/// `Instant` does not advance while a Mac sleeps, and a tab taken over and
-/// forgotten overnight with the lid closed is the case the entry exists for
-/// (the rule the unsupervised limit's recheck follows).
 fn hold_unix_now() -> u64 {
     #[cfg(test)]
     if let Some(now) = HOLD_UNIX_CLOCK_FOR_TEST.with(std::cell::Cell::get) {
@@ -38,9 +29,6 @@ fn hold_unix_now() -> u64 {
 }
 
 #[cfg(any(target_os = "macos", test))]
-/// How long the Agents menu's published live bits stand on a turn that
-/// rebuilt no glance ([`App::publish_agents_live`]): the `claude` look's own
-/// bound, so an install or a fleet join greys a row in or out within it.
 const AGENTS_LIVE_TTL: Duration = Duration::from_secs(2);
 
 /// The window side of the Agents rows, one field on the App.
@@ -112,8 +100,6 @@ pub(crate) fn pick_next_need(stops: &[NeedStop], cursor: Option<(u64, u64)>) -> 
     }
 }
 
-/// Claude Code's idle mark, the glyph its OSC title leads with between turns
-/// (`✳ <title>`; while it works, `◐`/`◑` alternate there).
 const CLAUDE_IDLE_MARK: char = '\u{2733}';
 
 /// A program's OSC title as a label names it: trimmed, and without the status glyph an agent leads it with — a spinner frame (any braille frame, Claude Code's `◐`/`◑`, the circle and corner spinners: the one frame classifier, [`crate::chrome_label::is_spinner_frame`]) or Claude Code's idle [`CLAUDE_IDLE_MARK`], followed by a blank — so a turn's start and end name the tab alike, and a label read once never keeps one frame of an animation.
@@ -158,7 +144,6 @@ pub(crate) struct LongHoldWords {
 }
 
 impl LongHoldWords {
-    /// The entry these words make.
     fn entry(&self) -> aterm_messages::exceptions::Entry {
         if let Some(reason) = &self.client {
             return crate::message_reporters::client_long_hold_entry(
@@ -270,11 +255,6 @@ impl CliVerb {
         }
     }
 
-    /// How long its child may run before it is killed
-    /// (`bounded_child::run_bounded`): a read is bounded — `survey` ends
-    /// itself first (3 s a fleet peer), so this is a hang bound, never a
-    /// budget — while the bus's commands install and stop a broker and are
-    /// never cut off midway.
     const fn cap(self) -> Option<Duration> {
         match self {
             Self::ReadThisMac
@@ -286,8 +266,6 @@ impl CliVerb {
         }
     }
 
-    /// The confirmation `on`/`off` ask before running: title, body, and the
-    /// proceed button's label.
     const fn confirmation(self) -> Option<(&'static str, &'static str, &'static str)> {
         match self {
             Self::ReadThisMac
@@ -370,15 +348,11 @@ impl CliPlan {
         }
     }
 
-    /// The command as a human types it.
     fn words(&self) -> String {
         format!("aterm {}", self.argv.join(" "))
     }
 }
 
-/// A command's document: [`menu_document_path`] with this process's count of
-/// them, so two reads in one second (two fleet rows' Read This Session) are
-/// two files, never one rewritten under an open tab.
 fn cli_document_path(kind: &str) -> PathBuf {
     static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -423,9 +397,6 @@ pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
-/// A command's tab text: the command, how it ended, what a Take Over on
-/// another Mac that took its session leaves to do ([`driven_next`]), then its
-/// stdout and stderr in fenced blocks.
 fn cli_markdown(
     plan: &CliPlan,
     status: &Result<Option<i32>, String>,
@@ -451,10 +422,6 @@ fn cli_markdown(
     s
 }
 
-/// What to do once a Take Over on another Mac took its session (`plan` a
-/// [`CliPlan::driven`] whose argv is `fleet_glance::fleet_hold_args`'s, its
-/// way `on`): type into it over the fleet, and hand it back — the hold
-/// stands until then, whatever the session's need.
 fn driven_next(plan: &CliPlan) -> Option<String> {
     let [_, _, host, _, sid, way] = plan.argv.as_slice() else {
         return None;
@@ -470,8 +437,6 @@ fn driven_next(plan: &CliPlan) -> Option<String> {
     })
 }
 
-/// Why a command did not end cleanly, in a few words — the record's reason:
-/// `exited 2`, `killed by a signal`, or the spawn's own error.
 fn cli_failure_reason(status: &Result<Option<i32>, String>) -> String {
     match status {
         Ok(Some(code)) => format!("exited {code}"),
@@ -480,8 +445,6 @@ fn cli_failure_reason(status: &Result<Option<i32>, String>) -> String {
     }
 }
 
-/// The output tab's line under its heading (the command): how it ended, and
-/// nothing the heading or the page itself already says.
 fn cli_status_words(status: &Result<Option<i32>, String>) -> String {
     match status {
         Ok(Some(0)) => "Done.".to_string(),
@@ -703,11 +666,6 @@ impl App {
         out
     }
 
-    /// [`Self::take_over_session`] / [`Self::hand_back_session`]'s body. The
-    /// fabric leaf moves under the same guard and records the same timeline
-    /// event a wire `hold` does; the need verdict, the menu rows and the
-    /// palette are refreshed at once (the fabric wake also arrives; each
-    /// refresh is change-gated).
     fn person_hold_session(&mut self, session: u64, on: bool) -> Result<(), String> {
         use crate::fabric::PersonHoldOutcome;
         if self.person_gesture_refused() {
@@ -918,7 +876,7 @@ impl App {
         Some(Instant::now() + Duration::from_secs(wait))
     }
 
-    /// A SESSION'S TAB LABEL AS EVERY AGENTS ROW NAMES IT (the Overview's chips and manages lines, a manager's Workers rows, Go to <manager>, the long-hold entry): the words the person can find on the strip (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6).
+    /// A SESSION'S TAB LABEL AS EVERY AGENTS ROW NAMES IT (the Overview's chips and manages lines, a manager's Workers rows, `Go to <manager>`, the long-hold entry): the words the person can find on the strip (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6).
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
         let whole = |t: &str| {
             Some(crate::session_timeline::sanitize_presentation_line(t, 40))
@@ -977,8 +935,6 @@ impl App {
         }
     }
 
-    /// The one-based position of the tab showing `session` (any pane) in its
-    /// window, the lowest window id first; `None` when no window shows it.
     fn tab_position_of_session(&self, session: u64) -> Option<usize> {
         self.windows
             .values()
@@ -1094,8 +1050,6 @@ impl App {
         true
     }
 
-    /// An Agents menu or palette row that could not do its thing: a terse
-    /// failure and its cause (then the path), keyed by `verb`.
     fn menu_failure(&mut self, verb: &str, title: &str, lines: &[&str]) {
         self.post_message(crate::message_reporters::fabric_failure(verb, title, lines));
     }
@@ -1191,8 +1145,6 @@ impl App {
             && self.open_menu_document(wid, outcome.plan.out)
             && outcome.plan.raise
         {
-            // A menu bar click never makes aterm the active app: without
-            // the raise the owner, in another app or Space, sees nothing.
             self.raise_window(wid);
         }
     }
@@ -1240,15 +1192,6 @@ mod tests {
             .unwrap_or_else(|| panic!("{a:?} has a row"))
     }
 
-    /// TAKE OVER SETS THE PERSON'S SLOT AND HAND BACK LIFTS IT FIRST. The
-    /// window's act fills `origin=person`; the rows swap (palette mirror and
-    /// the published front bit); the published verdict says `hold_by=person`;
-    /// the held agent's own wire `hold off` answers `OK hold=1` and lifts
-    /// nothing; refusals are counted on the You hold row's read; Hand Back
-    /// lifts the person's slot and leaves an Owner's beside it — which a
-    /// second Hand Back lifts, as that client's own `hold off` would: a
-    /// client's hold, which halts the instance's app verbs, has a way out at
-    /// the window.
     #[test]
     fn take_over_sets_the_person_slot_and_hand_back_lifts_it_then_a_clients() {
         let (mut app, wid, sid, ctx) = app_with_stub();
@@ -1312,10 +1255,6 @@ mod tests {
         assert_eq!(ctx.fabric.holds().origins(), "fleet");
     }
 
-    /// NO CONTROL CLIENT PRESSES THE PERSON'S PAIR. A control client's key
-    /// into an open palette (`Source::Controller`, the `key` verb's road) on
-    /// the Hand Back row lifts nothing, and its mark is gone after the
-    /// gesture.
     #[test]
     fn a_controller_key_into_the_palette_cannot_hand_back_and_a_persons_can() {
         use crate::input::{InputEvent, Source};
@@ -1365,9 +1304,6 @@ mod tests {
         assert!(ctx.fabric.holds().person().is_some());
     }
 
-    /// THE TAB MENU'S TAKE OVER RUNS IN THE GESTURE'S TURN: chosen under a
-    /// control client's mark it takes nothing over; chosen by the person it
-    /// takes the CLICKED tab over (the menu's AGENT row, its session).
     #[test]
     fn the_tab_menus_take_over_refuses_a_controller_and_takes_the_persons() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -1402,8 +1338,6 @@ mod tests {
         }
     }
 
-    /// TAKE OVER NEVER WAITS ON A COMMITTING UPDATE: the press is answered at
-    /// once, nothing moved, and the refusal is a row.
     #[test]
     fn a_take_over_under_a_committing_update_answers_at_once() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -1423,14 +1357,10 @@ mod tests {
         assert!(ctx.fabric.holds().person().is_some());
     }
 
-    /// Set this thread's long-hold wall clock ([`HOLD_UNIX_CLOCK_FOR_TEST`]).
     fn set_hold_clock(unix_s: Option<u64>) {
         HOLD_UNIX_CLOCK_FOR_TEST.with(|c| c.set(unix_s));
     }
 
-    /// A HOLD THAT STANDS 30 MINUTES IS ONE DIGEST ENTRY, swept by Hand Back:
-    /// the level family's whole answer names the held tab once, past the mark
-    /// and never before it.
     #[test]
     fn a_long_hold_is_one_entry_and_hand_back_sweeps_it() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -1466,11 +1396,6 @@ mod tests {
         assert_eq!(named(&app), 0, "Hand Back sweeps it");
     }
 
-    /// A CLIENT'S HOLD THAT STANDS 30 MINUTES IS NAMED TOO: an Owner
-    /// client's `hold … on`, set over the wire with no hold of the person's,
-    /// halts the instance's app verbs as the person's does, so past the mark
-    /// it is one entry of its own (`client-held`), and Hand Back — which lifts
-    /// it — sweeps it.
     #[test]
     fn a_clients_long_hold_is_named_and_hand_back_sweeps_it() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -1521,11 +1446,6 @@ mod tests {
         set_hold_clock(None);
     }
 
-    /// A STANDING LONG HOLD'S WORDS ARE SAID AS THEY MOVE: an act refused
-    /// under the hold after its entry stood is in the entry once the next
-    /// restatement minute has passed, where the same set of long holds used
-    /// to keep the words it first had; a look inside the minute walks
-    /// nothing.
     #[test]
     fn a_standing_long_hold_says_its_refusals_as_they_move() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
@@ -1565,9 +1485,6 @@ mod tests {
         set_hold_clock(None);
     }
 
-    /// A LOOK WHERE NOTHING CAN HAVE MOVED WALKS NO HOLDS: the exceptions
-    /// look runs on every park, so before the next mark, with no hold taken
-    /// or handed back and no session come or gone, it costs compares only.
     #[test]
     fn a_look_where_no_hold_moved_walks_none() {
         let (mut app, wid, sid, _ctx) = app_with_stub();
@@ -1599,10 +1516,6 @@ mod tests {
         set_hold_clock(None);
     }
 
-    /// THE AGENTS MENU'S LIVE BITS ARE PUBLISHED WHERE THEY CAN MOVE: a turn
-    /// that rebuilt the glance publishes them at once; a turn that rebuilt
-    /// nothing publishes nothing new within the looks' bound, and does past
-    /// it.
     #[test]
     fn the_agents_live_bits_are_published_where_they_can_move() {
         use aterm_types::needs::NeedWord;
@@ -1651,11 +1564,6 @@ mod tests {
         crate::menu::set_agents_live(before);
     }
 
-    /// A LONG-HOLD ENTRY AN EARLIER PROCESS LEFT ENDS where no hold here is
-    /// long: the family is told only where a hold moves, so this process
-    /// states its whole answer at its first look — an empty one too, which
-    /// starts the earlier entry's end — and again at the resume settle, after
-    /// which a seamless successor has adopted its predecessor's entries.
     #[test]
     fn a_long_hold_entry_an_earlier_process_left_ends_where_no_hold_here_is_long() {
         use aterm_messages::exceptions::Family;
@@ -1721,9 +1629,6 @@ mod tests {
         assert_eq!(keys(&app), [mine], "this tab's entry, the earlier one gone");
     }
 
-    /// Set Role…: the pin's editor, one field over — the commit writes `meta
-    /// role`, the pill and the hovers name the tab by it, and the title pin
-    /// is untouched.
     #[test]
     fn set_role_writes_the_role_through_the_pins_editor() {
         let (mut app, wid, sid, ctx) = app_with_stub();
@@ -1754,12 +1659,6 @@ mod tests {
         );
     }
 
-    /// SHOW NEEDS IN WINDOWS (persisted as `[presence] rim`): off, the window
-    /// draws no border and no pill while the session's need, its tab mark and
-    /// the wire stay; each click flips the live bit, publishes it for the
-    /// checkmark and queues exactly one durable write (headless has no lane,
-    /// which is said); a config with `[presence] rim = false` is adopted on
-    /// reload.
     #[test]
     fn show_needs_in_windows_gates_the_border_and_persists() {
         let (mut app, wid, sid, ctx) = app_with_stub();
@@ -1797,8 +1696,6 @@ mod tests {
         assert!(!app.config.presence_rim_enabled());
     }
 
-    /// The CLI rows compose their argv and, headless, run nothing: no child,
-    /// no sheet, no file.
     #[test]
     fn the_cli_rows_compose_their_argv_and_run_nothing_headless() {
         let (mut app, wid, _sid, _ctx) = app_with_stub();
@@ -1839,10 +1736,6 @@ mod tests {
         assert!(app.last_menu_document.is_none());
     }
 
-    /// A COMMAND'S TAB FENCES ITS OUTPUT with more backticks than it holds,
-    /// one block per stream that wrote anything, under the command as typed
-    /// (a fleet Mac's read names its own argv); a command that did not run
-    /// has no block.
     #[test]
     fn the_cli_tab_fences_its_output() {
         let plan = CliPlan::peer(
@@ -1867,9 +1760,6 @@ mod tests {
         assert!(!cli_markdown(&plan, &Err("x".to_string()), "", "").contains("```"));
     }
 
-    /// A TAKE OVER ON ANOTHER MAC SAYS WHAT IS LEFT TO DO: a hold it placed
-    /// names how to type into the session over the fleet and how to hand it
-    /// back.
     #[test]
     fn a_take_over_on_another_mac_says_how_to_hand_it_back() {
         let plan = |way: &str| {
@@ -1892,12 +1782,6 @@ mod tests {
         assert!(!back.contains("hold s-ab12 off`"), "{back}");
     }
 
-    /// THE MENU BAR'S READS RAISE THEIR WINDOW (§3): a read the status item
-    /// asked for (`CliPlan::raised`) opens its tab in the asking window and
-    /// raises that window — a status item click never activates aterm — and
-    /// Read Result does too, marking its done seen only once its tab is asked
-    /// for, and so does a "To look at" line, which opens Settings ▸ Messages
-    /// at its entry.
     #[test]
     fn the_menu_bars_reads_raise_their_window_and_nothing_else_does() {
         use crate::native_app::AppKind;
@@ -1960,9 +1844,6 @@ mod tests {
         assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
     }
 
-    /// NEXT THAT NEEDS YOU walks the needs stuck first, then oldest first;
-    /// pressed again it moves on and wraps; a cursor whose need resolved
-    /// starts over at the most pressing.
     #[test]
     fn next_need_walks_the_needs_stuck_first_and_drops_a_resolved_one() {
         use aterm_types::needs::{NeedWord, Severity};
@@ -2019,9 +1900,6 @@ mod tests {
         let _ = wid;
     }
 
-    /// ⇧⌘J's FIRST STOP IS ❯'S FIRST ROW (§4: "in the status item's order"):
-    /// two decide needs, the older one in the later tab, and both lists
-    /// start at the older one.
     #[test]
     fn next_need_starts_where_the_status_items_needs_start() {
         use aterm_types::needs::NeedWord;
@@ -2068,9 +1946,6 @@ mod tests {
         assert_eq!(app.agents.next_need.map(|(s, _)| s), Some(listed[1]));
     }
 
-    /// THE AGENT SECTION'S FACTS: a worker's task names its manager here
-    /// (`Go to <manager>`) and is live (Stop Worker…); the manager lists the
-    /// worker; the person's hold is read off the slot.
     #[test]
     fn the_agent_facts_name_the_manager_and_its_workers() {
         use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -2107,12 +1982,6 @@ mod tests {
         assert!(app.agent_menu_facts(manager).person_hold);
     }
 
-    /// A BACKGROUND WORKER IS NAMED AS THE STRIP NAMES IT. A worker started
-    /// in a background tab has no role, no title pin and no registry title
-    /// (only the active tab's title is published there); its OSC title, its
-    /// agent's spinner glyph dropped, is what names it in its manager's
-    /// Workers rows, and the manager's OSC title names it in the worker's Go
-    /// to row.
     #[test]
     fn a_background_worker_is_named_by_its_osc_title() {
         use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -2185,10 +2054,6 @@ mod tests {
         assert_eq!(app.tab_label_of_session(worker), "fmt");
     }
 
-    /// `hwkey` CANNOT PRESS THE PERSON'S ACTS THROUGH AN OPEN CARD. Its keys
-    /// are real NSEvents on the person's unmarked key path, so its hop
-    /// refuses while the palette, Overview or a tab menu is open on the
-    /// front window.
     #[test]
     fn hwkey_is_refused_while_a_gateway_card_is_open() {
         let (mut app, wid, sid, _ctx) = app_with_stub();
@@ -2214,9 +2079,6 @@ mod tests {
         );
     }
 
-    /// THE IN-GRID CARD'S AGENT ROWS ACT: on a worker's tab menu, `Go to
-    /// <manager>` (a session-argument row) raises the manager's tab through
-    /// the dispatcher the macOS relay reaches.
     #[test]
     fn the_cards_go_to_manager_row_raises_the_manager() {
         use crate::session_chrome::{ConnVerb, TabMenuEntry};

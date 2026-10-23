@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The colour picker: one wheel, Brightness and hex row for every colour key, on the picker's own hue, saturation and brightness; the automatic selected-tab colour as a colour; and the Window page's way to Tab Color.
+//! The colour picker.
 
 use super::modified::{Lab, rect_of};
 use super::*;
 
-/// Every key Settings edits as a colour, from the registry.
 fn color_keys() -> Vec<&'static str> {
     SettingsViewState::new(&Config::default())
         .legacy
@@ -17,7 +16,6 @@ fn color_keys() -> Vec<&'static str> {
         .collect()
 }
 
-/// `view_cx_at` with the window's automatic selected-tab colour.
 fn cx_with_tab_color(width: f32, height: f32, automatic: [u8; 3]) -> ViewCx<'static> {
     let mut cx = view_cx_at(width, height);
     cx.motion.automatic_tab_color = automatic;
@@ -40,9 +38,6 @@ fn wheel_of(
     control.spec.clone()
 }
 
-/// ONE PICKER FOR EVERY COLOUR KEY: each colour row offers Choose…, and
-/// Choose… opens the wheel (its own pick action), Brightness and Done under
-/// the row, with the row's hex field, all on one screen and fitted.
 #[test]
 fn every_colour_row_opens_the_one_picker() {
     let mut cases: Vec<(&'static str, Option<SettingsRoute>)> = [
@@ -128,8 +123,6 @@ fn every_colour_row_opens_the_one_picker() {
     }
 }
 
-/// A pick on Foreground's wheel writes Foreground, at the brightness the
-/// picker keeps; Brightness keeps the hue.
 #[test]
 fn the_foreground_wheel_and_brightness_write_foreground() {
     let mut lab = Lab::new("foreground = \"#FFAA00\"\n");
@@ -180,8 +173,6 @@ fn color_picker_noun_for_test(label: &str) -> String {
     }
 }
 
-/// Escape and Done (Choose… while open) close the picker, the keyboard
-/// back on Choose…, and the page stays.
 #[test]
 fn escape_and_done_close_the_picker_back_on_choose() {
     for close in [
@@ -206,9 +197,6 @@ fn escape_and_done_close_the_picker_back_on_choose() {
     }
 }
 
-/// BLACK KEEPS ITS HUE: brightness 0 writes black, and raising it again
-/// gives the hue it had, not a grey; the wheel marks that hue on its black
-/// disk.
 #[test]
 fn brightness_zero_keeps_the_picked_hue() {
     let set = |lab: &mut Lab, brightness: f64| {
@@ -257,9 +245,6 @@ fn brightness_zero_keeps_the_picked_hue() {
     assert_eq!(set(&mut lab, 1.0), "#80FF00");
 }
 
-/// A PICK KEEPS THE WHEEL IN VIEW: on a short stacked Tab Color page the
-/// wheel and the hex row are different stops, and a pick used to reveal the
-/// hex row and scroll the wheel out from under the pointer.
 #[test]
 fn a_wheel_pick_keeps_the_wheel_in_view_on_a_stacked_page() {
     let wheel_key = "settings/color/active_tab_color/wheel";
@@ -302,9 +287,6 @@ fn a_wheel_pick_keeps_the_wheel_in_view_on_a_stacked_page() {
     }
 }
 
-/// THE AUTOMATIC SELECTED-TAB COLOUR IS A COLOUR: unset, Tab Color's hex
-/// field, the wheel and the Window page's way to Tab Color all show the
-/// colour the window paints, and follow it; a set colour shows itself.
 #[test]
 fn the_automatic_tab_color_is_shown_where_it_is_named() {
     let automatic = [0x3A, 0x3A, 0x3E];
@@ -364,10 +346,6 @@ fn the_automatic_tab_color_is_shown_where_it_is_named() {
     assert_eq!(button.spec.chip, Some([0x33, 0x66, 0xCC]));
 }
 
-/// A REFUSED DRAFT IS CORRECTABLE WHEREVER IT SHOWS: the Window page's row
-/// for the selected tab colour keeps its field (with Choose… and Reset)
-/// while a draft is held, so its tag, its reason and the bar's "Correct it"
-/// are true there; a saved value turns it back into the way to Tab Color.
 #[test]
 fn the_window_tab_color_row_keeps_a_refused_draft_correctable() {
     let key = "settings/control/active_tab_color";
@@ -436,8 +414,6 @@ fn the_window_tab_color_row_keeps_a_refused_draft_correctable() {
     }
 }
 
-/// The arrow keys work the wheel: Left and Right turn its hue, Up and Down
-/// change its saturation, the brightness kept.
 #[test]
 fn the_arrow_keys_turn_the_wheel() {
     let mut lab = Lab::new("foreground = \"#FF0000\"\n");
@@ -454,16 +430,11 @@ fn the_arrow_keys_turn_the_wheel() {
     );
 }
 
-/// `#RRGGBB` of what the picker makes from `hsv`.
 fn hex_of_hsv([hue, saturation, value]: [f32; 3]) -> String {
     let [r, g, b] = crate::widget::hsv_to_rgb(hue, saturation, value);
     format!("#{r:02X}{g:02X}{b:02X}")
 }
 
-/// THEMES' CUSTOMIZE SHEET OPENS THE SAME PICKER: each colour row wears the
-/// colour in force on a well beside its field, and the well opens the wheel
-/// and Brightness under the row (Done while open), fitted in the sheet's
-/// column; a pick writes that key and no other.
 #[test]
 fn the_customize_sheet_opens_the_one_picker() {
     for (width, height) in [
@@ -605,11 +576,6 @@ fn the_customize_sheet_opens_the_one_picker() {
     assert!(chip.is_some() && icon.is_none());
 }
 
-/// AN OPEN CUSTOMIZE PICKER IS WHOLE ON ITS SCREEN: opened from any colour
-/// row of Themes' Customize sheet, its wheel and Brightness are drawn whole
-/// (no edge of the list cuts them) on the screen the list shows, and the
-/// wheel takes a pick, from 80x24 (where COLOURS repeated over the picker
-/// would leave it a sliver the list's edge cuts) to a wide window.
 #[test]
 fn an_open_customize_picker_is_whole_on_its_screen() {
     let open_at = |key: &str, width: f32, height: f32| {
@@ -654,10 +620,6 @@ fn an_open_customize_picker_is_whole_on_its_screen() {
     }
 }
 
-/// THE CUSTOMIZE SHEET KEEPS ITS LEAST under the demo: in the chooser's
-/// place, its list holds COLOURS over one whole colour row, on a window whose
-/// compact toolbar names the page (no heading over the demo) as on any
-/// other.
 #[test]
 fn the_customize_sheet_keeps_its_caption_over_a_whole_row() {
     let whole = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -697,10 +659,6 @@ fn the_customize_sheet_keeps_its_caption_over_a_whole_row() {
     }
 }
 
-/// THE PALETTE SLOT'S EDITOR CARRIES THE PICKER: the open slot's wheel and
-/// Brightness set its draft (the demo draws it), on the picker's own model
-/// (brightness 0 and back keeps the hue), and closing the editor saves the
-/// slot.
 #[test]
 fn the_palette_slot_editor_carries_the_picker() {
     let mut lab = Lab::new("theme = \"Dracula\"\n");
@@ -775,9 +733,6 @@ fn the_palette_slot_editor_carries_the_picker() {
     );
 }
 
-/// THE CURSOR STYLES PAGE'S TRAIL COLOURS OPEN THE PICKER: the saved style's
-/// Adjust card lists Trail color with Choose…, which opens the wheel under
-/// the row; a pick writes the trail colour.
 #[test]
 fn the_cursor_styles_trail_colour_opens_the_picker() {
     let key = prefs::EDIT_CURSOR_TRAIL_COLOR;
@@ -804,9 +759,6 @@ fn the_cursor_styles_trail_colour_opens_the_picker() {
     assert_eq!(pick.edits[0].value.as_deref(), Some("#3366CC"));
 }
 
-/// THE ADJUST CARD'S PICKER FITS ITS LIST: the trail colour's row and its
-/// open picker are one stop of the Adjust card, under the card's caption and
-/// padding, so the picker is sized against the list less that chrome.
 #[test]
 fn the_adjust_cards_picker_fits_its_list() {
     let key = prefs::EDIT_CURSOR_TRAIL_COLOR;
@@ -834,10 +786,6 @@ fn the_adjust_cards_picker_fits_its_list() {
     }
 }
 
-/// THE OPEN PICKER FITS AT EVERY WIDTH AND TEXT SIZE: a colour row's open
-/// picker (the wheel, Brightness and its label, Done) and the Tab Color page
-/// are never cut and never overflow, from a phone's width to a window's, at
-/// 1× and 2× text.
 #[test]
 fn the_open_picker_fits_at_every_width_and_text_size() {
     at_each_text_scale(&[1.0, 2.0], "colour picker fit", |scale| {
@@ -882,10 +830,6 @@ fn the_open_picker_fits_at_every_width_and_text_size() {
     });
 }
 
-/// MODIFIED NAMES A COLOUR ROW'S DEFAULT WITH ITS COLOUR: "Default:
-/// Automatic" wears the automatic selected-tab colour the window paints,
-/// right after the words, and the row's name says it in words; a theme
-/// colour's default wears the theme's.
 #[test]
 fn modified_names_a_colour_default_with_its_colour() {
     let chip_of = |compiled: &crate::native_ui::CompiledUi, key: &str| {
@@ -964,10 +908,6 @@ fn modified_names_a_colour_default_with_its_colour() {
     }
 }
 
-/// MODIFIED'S COLOUR ROWS OPEN THE PICKER TOO: a changed colour, the
-/// selected tab's among them, offers Choose… beside its field and ahead of
-/// its Reset, and opens the wheel under the row, at the regular and compact
-/// widths, fitted.
 #[test]
 fn modifieds_colour_rows_open_the_picker() {
     for key in [prefs::EDIT_FOREGROUND, prefs::EDIT_ACTIVE_TAB_COLOR] {
@@ -1015,7 +955,6 @@ fn modifieds_colour_rows_open_the_picker() {
     }
 }
 
-/// THE TRAIL COLOUR'S PICKER CHOOSES THE CURSOR'S COLOUR.
 #[test]
 fn the_trail_colour_picker_chooses_the_cursor_colour() {
     let key = prefs::EDIT_CURSOR_TRAIL_COLOR;

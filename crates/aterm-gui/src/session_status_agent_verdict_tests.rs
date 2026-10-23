@@ -22,8 +22,7 @@ fn retiring_a_session_retires_its_footer_state() {
     );
 }
 
-/// A resolver answer after the ordinary follow-up went quiet owns one observation wake at the
-/// floor, even on a static screen.
+/// A resolver answer after the ordinary follow-up went quiet arms one observation wake at the floor.
 #[test]
 fn a_late_program_answer_owns_one_observation_wake() {
     let t0 = Instant::now();
@@ -117,8 +116,7 @@ const RM_BOX: &[&str] = &[
     " Esc to cancel \u{00b7} Tab to amend",
 ];
 
-/// A busy Claude screen: a transcript row, the spinner, the composer
-/// between its two rules, the footer (the shape `aterm_phase` reads).
+/// Busy Claude screen with a transcript row, spinner, composer, and footer.
 fn busy_screen(secs: u32) -> Vec<String> {
     let rule = "\u{2500}".repeat(120);
     let mut rows = vec![String::new(); 24];
@@ -171,8 +169,7 @@ fn app_with_stub() -> (App, u64) {
     (app, sid)
 }
 
-/// A box raised while a row keeps ticking reaches `agent=` at the next sweep, though the status
-/// FSM's revision never moves (the negative control).
+/// A box raised while a row keeps ticking reaches `agent=` at the next sweep even if the status revision is unchanged.
 #[test]
 fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves() {
     let (mut app, sid) = app_with_stub();
@@ -260,9 +257,7 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
     );
 }
 
-/// `agent_gen=`/`agent_fp=` equal the `status gen=`/`hash=` of the screen the verdict was read
-/// from, and stay put when the screen moves without a sweep (the negative control: a press
-/// fences on `agent_gen`).
+/// `agent_gen=` and `agent_fp=` match the screen the verdict was read from.
 #[test]
 fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     let field = |record: &str, key: &str| {
@@ -323,8 +318,7 @@ fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {
     assert_eq!(published(&app, sid).rev, rev, "same verdict, same rev");
 }
 
-/// A zone re-read inside [`super::AGENT_MIN_INTERVAL`] is deferred, and
-/// the deferral arms a follow-up wake instead of being lost.
+/// A zone re-read inside [`super::AGENT_MIN_INTERVAL`] is deferred and arms a follow-up wake.
 #[test]
 fn the_rate_floor_defers_a_read_and_arms_a_followup() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -376,8 +370,7 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
     );
 }
 
-/// A redraw that advances the generation but not the zone still charges the read floor; the
-/// changed ready frame is deferred, then published at the next due read.
+/// Unchanged zone reads still charge the rate floor and defer subsequent reads until due.
 #[test]
 fn unchanged_zone_reads_charge_the_agent_rate_floor() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
@@ -505,8 +498,7 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
     assert_eq!(obs.agents[&1].program_seen, Some(new));
 }
 
-/// The foreground group is read after the screen-read decision: when an unchanged read just
-/// charged the floor, the shell handback gets one immediate follow-up.
+/// A foreground group change after an unchanged zone read schedules an immediate follow-up.
 #[test]
 fn group_change_after_unchanged_read_gets_immediate_followup() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -592,10 +584,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
     assert_eq!(handback.publish.map(|p| p.0), Some("-"));
 }
 
-/// A BLOCK READ CUT AT ITS CAP OWES ONE MORE LOOK WITHOUT DELAYING A
-/// HANDBACK'S: the session log's block read stopped at its cap in the same
-/// sweep that saw the foreground group hand an exited agent back to the
-/// shell.
+/// A block read capped at its limit schedules another look without delaying a shell handback.
 #[test]
 fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
     let interval = Duration::from_millis(50);
@@ -666,11 +655,7 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
     );
 }
 
-/// A BURST PAST THE BLOCK READ'S CAP IS READ AT THE NEXT OWED LOOK, THROUGH
-/// THE REAL SWEEP: fifty commands finished between two sweeps; the first
-/// logs the oldest [`super::BLOCK_READ_MAX`] and owes the session a look no
-/// later than one observation interval on, at which the second logs the
-/// rest.
+/// A burst exceeding [`super::BLOCK_READ_MAX`] logs the cap on the first sweep and the remainder on the next owed look.
 #[test]
 fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
     let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
@@ -713,10 +698,7 @@ fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
     assert_eq!(runs(&app), 50, "every command is a run");
 }
 
-/// THE SWEEP'S CAPPED BLOCK READ OWES ITS LOOK WITHOUT DELAYING A GROUP
-/// MOVE'S, THROUGH THE REAL SWEEP, with no process and no PTY: the group in
-/// front is the injected probe's (`SessionFactory::fg_probe`), asked about a
-/// master no file holds.
+/// A capped block read schedules its follow-up without delaying an immediate foreground-group look.
 #[test]
 fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     thread_local! {
@@ -782,9 +764,7 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     );
 }
 
-/// Output between looks is owed a look one interval after it (never before the next due
-/// instant), through [`super::StatusObserver::note_output`], and so is a look the lock refused
-/// ([`super::StatusObserver::note_skipped`]).
+/// Output between looks (`note_output`) and skipped looks (`note_skipped`) schedule a look within one interval.
 #[test]
 fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -845,9 +825,7 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
 }
 
-/// Output that keeps arriving (a spinner repainting ~6x/s without moving the grid) owes no
-/// timer look before it pauses: each burst pushes the owed look one interval on, and the last
-/// burst is still read within one interval of it.
+/// Continuous output pushes the owed look forward until output pauses.
 #[test]
 fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -915,8 +893,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     assert_eq!(obs.next_wake(), Some(last + interval));
 }
 
-/// The change gate hashes the live zone (`presence::live_zone`), not the grid's last 40 rows: an
-/// inline REPL's turn ending above them is classified `idle`.
+/// The change gate hashes `presence::live_zone` rather than only the last 40 rows.
 #[test]
 fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
@@ -956,8 +933,7 @@ fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     assert_eq!(look(3, &ready, 2), None, "the control: nothing moved");
 }
 
-/// The cursor moving alone (into the prompt box, with the content seq unchanged) is read, and
-/// publishes `idle` once in the box; the same generation and cursor again read nothing.
+/// Cursor movement into the prompt box triggers a zone read and publishes `idle`.
 #[test]
 fn a_cursor_that_steps_into_the_box_is_read() {
     use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, cursor, screen};
@@ -994,10 +970,7 @@ fn a_cursor_that_steps_into_the_box_is_read() {
     assert_eq!(look(in_box, 2), None, "the control: nothing moved");
 }
 
-/// Conformance with the `ClaudeIdleAtComposer` model: in every reachable state, one
-/// `agent_observe` of each captured frame of the state's screen (under `program=claude`, with
-/// its measured cursor; `stale` is a relaunch under the previous run's box) publishes what the
-/// model's `Look` does, so `await agent idle` answers exactly where `Type` is enabled.
+/// Conformance test of `agent_observe` against the `ClaudeIdleAtComposer` model.
 #[test]
 fn claude_is_published_idle_exactly_where_the_model_types() {
     use aterm_phase::prompt::fixtures::{
@@ -1121,8 +1094,7 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
     );
 }
 
-/// The first look at a new foreground group judges the zone under no name, never the departed
-/// group's (`agent=-`); the same rows in the same group are still the agent's.
+/// A new foreground group is first classified without the departed group's program name.
 #[test]
 fn a_group_that_left_is_never_judged_under_its_name() {
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
@@ -1180,9 +1152,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
     }
 }
 
-/// A trust dialog drawn at the top of a pane whose last 40 rows stay blank passes the gate,
-/// which hashes the live zone ([`crate::presence::live_zone`]), and publishes a trust prompt;
-/// read again unchanged, it is not re-classified.
+/// A trust dialog above a blank lower pane passes the [`crate::presence::live_zone`] gate.
 #[test]
 fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     use aterm_phase::prompt::fixtures::{TRUST_FRESH_PANE, composer, rows, screen};
@@ -1221,8 +1191,7 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     assert_eq!(word(&step), None, "the zone did not move");
 }
 
-/// `history_lost=` sums the history lines this session's update handoffs could not carry, and
-/// the loss posts a band row; an update that carried every line posts none.
+/// `history_lost=` sums uncarried scrollback lines and posts a message row when non-zero.
 #[cfg(unix)]
 #[test]
 fn the_status_record_counts_the_history_an_update_could_not_carry() {
@@ -1284,8 +1253,7 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     assert!(app.has_live_message("Couldn't carry all scrollback"));
 }
 
-/// A live PATH reading lowers the carried frozen mark; frozen readings never raise it (one job
-/// reads `unconfirmed`, two read `frozen` as measured).
+/// A live PATH reading clears the carried frozen mark while frozen readings do not raise it.
 #[test]
 fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     use crate::session_status::program::PathVerdict;
@@ -1340,8 +1308,7 @@ fn a_measured_path_lowers_the_carried_frozen_mark_and_never_raises_it() {
     assert!(record.contains(" path_evidence=measured:"), "{record}");
 }
 
-/// Conformance with `ProgramResolutionRetry`: a failed lookup on a motionless Claude screen
-/// still owns a wake and another resolution; the model's `Buggy=1` mutant is the control.
+/// Conformance test of unnamed static group retry against `ProgramResolutionRetry`.
 #[test]
 fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     let model = aterm_models_harness::program_resolution_retry_model();
@@ -1558,9 +1525,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     assert_eq!(observer.next_wake(), None);
 }
 
-/// Conformance with the named-shell side of `ProgramResolutionRetry`: a first lookup can catch
-/// `sh` before its same-pgid exec into Claude, so a later single Claude frame arms one more
-/// bounded lookup though it then stays still.
+/// Conformance test of named-shell recheck against `ProgramResolutionRetry`.
 #[test]
 fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     let model = aterm_models_harness::program_resolution_retry_model();
@@ -1757,8 +1722,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None);
 }
-/// A shell whose last line ends in `?` is no agent (`agent=-`, no attention); the same screen
-/// under `program=claude` is a question.
+/// A shell line ending in `?` is not classified as an agent unless `program=claude` is set.
 #[test]
 fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     let (mut app, sid) = app_with_stub();
@@ -1805,9 +1769,7 @@ fn a_shell_ending_in_a_question_mark_is_not_an_agent() {
     assert!(record.contains(" why=question "), "{record}");
 }
 
-/// An adopted session whose handoff carried its shell-integration nonce takes its shell's marks
-/// (`detail=claude`); without it, `integration=degraded` and the marks drop (the requirement
-/// is never cleared as a fallback).
+/// An adopted session with a carried shell-integration nonce reads command marks while an uncarried one degrades.
 #[test]
 fn an_adopted_session_with_its_carried_nonce_reads_its_command() {
     use aterm_core::terminal::{ShellIntegrationPosture, Terminal};
@@ -1865,9 +1827,7 @@ fn looking_at(app: &App, sessions: &[u64]) {
     set.extend(sessions.iter().copied());
 }
 
-/// A trust dialog whose title sits above the live zone is read whole (`trust`, not `other`),
-/// and a session the host supervises raises no verdict row: its box is the host's to answer or
-/// escalate.
+/// A trust dialog extending above the live zone is read in full, and supervised sessions raise no need.
 #[test]
 fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     let (mut app, sid) = app_with_stub();
@@ -1913,10 +1873,7 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     assert!(crate::needs::of(&bare).need.is_some());
 }
 
-/// ANOTHER HOLDER'S LIVE CLAIM IS NAMED APART FROM THIS HOST'S
-/// (`NeedFacts::other_supervisor`, the walls another holder's `meta set
-/// supervisor` claim retries, a manager session's or codex-alab's own):
-/// its claim makes the session supervised and names the loop.
+/// `NeedFacts::other_supervisor` distinguishes another holder's live supervisor claim from this host's.
 #[test]
 fn another_holders_claim_is_named_apart_from_this_hosts() {
     let (app, sid) = app_with_stub();
@@ -1954,8 +1911,7 @@ fn another_holders_claim_is_named_apart_from_this_hosts() {
     assert_eq!(read(&app), (true, true, true), "another holder's claim");
 }
 
-/// On the rm box, the sweep publishes `agent=prompt` and the presence fan-out raises one menu
-/// row (tab, kind, command) and one notification.
+/// A prompt box raises one menu row and one notification per transition when not focused or headless.
 #[test]
 fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     let (mut app, sid) = app_with_stub();
@@ -2056,8 +2012,7 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
     assert!(take_posts().is_empty(), "headless never notifies");
 }
 
-/// A SUPERVISOR THAT DIES (review major): its `ttl=` claim lapses with a
-/// box up and nothing writes — yet the human must hear.
+/// A lapsed `ttl=` supervisor claim notifies the user of a standing prompt box.
 #[test]
 fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     use crate::app_presence::set_presence_clock_for_test;
@@ -2136,14 +2091,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     assert!(take_posts().is_empty(), "announced once");
 }
 
-/// A RE-GRID IS NO MOVE OF THE PROGRAM'S (`AgentPublication::text_moves` and
-/// `verdict_moves`, the held deadline's screen evidence; the reviews of its
-/// third cut): a worker's held stall raises the supervisor's attention, the
-/// presence row it bears is born and re-grids the tab one row shorter, and
-/// Claude Code repaints for the new size — the screen's text changes at the
-/// sweep's read of the resized grid and again at its read of the repaint,
-/// and the program did nothing, so neither change is counted, nor the row's
-/// fold back after it.
+/// Grid resizes and the program's subsequent repaint do not advance `text_moves` or `verdict_moves`.
 #[test]
 fn a_regrid_and_the_programs_repaint_are_no_text_move() {
     let (mut app, sid) = app_with_stub();
@@ -2278,8 +2226,7 @@ fn a_regrid_and_the_programs_repaint_are_no_text_move() {
     );
 }
 
-/// Claude Code 2.1.308's MEASURED split frame (the lab's cast, three tabs at once: aterm-core's
-/// `tests/fixtures/half-drawn/claude-2.1.308`, `docs/measured/half-drawn-frame-2026-10-22.md`).
+/// Split synchronized-output frame fixtures captured from Claude Code 2.1.308.
 mod half_drawn {
     pub(super) const BEFORE: &[u8] =
         include_bytes!("../../aterm-core/tests/fixtures/half-drawn/claude-2.1.308/before.bin");
@@ -2300,8 +2247,7 @@ fn feed(app: &App, sid: u64, bytes: &[u8]) {
     t.process(bytes);
 }
 
-/// THE AGENT VERDICT READS WHOLE FRAMES: the sweep never classifies the rows of a DEC 2026
-/// frame the program has not finished.
+/// Unfinished DEC 2026 synchronized frames are not classified until the frame closes.
 #[test]
 fn the_verdict_never_reads_an_unfinished_frame() {
     let (mut app, sid) = app_with_stub();
@@ -2371,9 +2317,7 @@ fn the_verdict_never_reads_an_unfinished_frame() {
     );
 }
 
-/// The verdict's hold on an unfinished frame is bounded by the frame's hang detector: the same
-/// measured half frame, its run of reads ending inside unfinished frames begun FRAME_HANG
-/// before the sweep, is read as it stands.
+/// An unfinished synchronized frame older than `FRAME_HANG` is classified despite not closing.
 #[test]
 fn the_verdict_reads_a_frame_past_its_hang_detector() {
     let (mut app, sid) = app_with_stub();

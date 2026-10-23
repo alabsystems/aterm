@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Process-wide [`MessageCenter`]: active rows, hysteresis, completion echoes, and log.
-//!
-//! * [`MessageCenter::eligible`] and [`MessageCenter::wanted_rows`] gate delayed reveals and hold
-//!   row counts steady across [`crate::animate::echo_span`] and [`crate::SHRINK_QUIET`].
-//! * [`MessageCenter::motion`] and [`MessageCenter::motion_deadline`] drive meter animation.
 
 use crate::animate::{
     Anim, BandMotion, Look, Pace, ROW, RowMotion, Surface, anim_ms, bar, bar_at, bar_glints, comet,
@@ -71,7 +67,7 @@ enum Ending {
     Stopped,
     /// A live row withdrawn with no outcome to claim.
     Ended,
-    /// A standing warning or error its reporter resolved Ok, with the words it declared for the fix
+    /// A standing warning or error its reporter resolved Ok.
     Fixed,
     /// Anything else keeps its words and its mark.
     Kept,
@@ -238,7 +234,7 @@ pub struct Live {
     pub stamp: WallStamp,
     /// When it was posted.
     pub posted_at: Instant,
-    /// When the work began: the post.
+    /// When the work began.
     pub started_at: Instant,
     /// Bumped by every restate.
     pub revision: u32,
@@ -267,20 +263,16 @@ pub struct Live {
     pub reveal_at: Option<Instant>,
     /// The latest a held-back reveal may wait.
     reveal_cap: Option<Instant>,
-    /// The motion epoch: set when the row reaches the glass, reset when its activity changes.
+    /// The motion epoch.
     pub motion_since: Option<Instant>,
     /// The eta estimator, fed while the meter carries an amount.
     pub track: ProgressTrack,
     /// The declared heavy load, and when it began.
     pub load: Option<(Load, Instant)>,
-    /// The load words are up: at once for a load the row was posted with (such
-    /// a row is on the glass because it is heavy), and [`LOAD_AFTER`] after it
-    /// began for a load a later restate declared; flipped by `settle`, so the
-    /// layout stays time-free.
+    /// The load words are up: at once for a load the row was posted with, and [`LOAD_AFTER`]
+    /// after it began for a load a later restate declared.
     pub load_shown: bool,
-    /// The loads the row's slot is reserved for: empty until it declares a
-    /// load, then its reporter's declared kinds ([`Message::loads`], every load
-    /// when undeclared) plus each load it shows.
+    /// The loads the row's slot is reserved for ([`Message::loads`]).
     pub load_slot: Loads,
     /// The fill the bar glides from, and when the glide began.
     pub glide: Option<(u16, Instant)>,
@@ -288,9 +280,7 @@ pub struct Live {
     carried_pending: bool,
     /// The mark (severity, glyph) the record's Posted line carries.
     logged_mark: (Severity, Glyph),
-    /// The wall clock at `posted_at`, the anchor [`Live::wall_at`] adds the
-    /// monotonic life to: the stamp for a post, the host's wall at the seed for
-    /// a carried row (whose stamp is the parent's ingress).
+    /// The wall clock at `posted_at` ([`Live::wall_at`]).
     wall_anchor: u64,
 }
 
@@ -376,8 +366,8 @@ impl Live {
         self.is_animated()
     }
 
-    /// The activity byte the fingerprint folds and the motion epoch keys
-    /// on: 0 no indicator, 1 a fill, 2 busy.
+    /// The activity byte the fingerprint folds and the motion epoch keys on: 0 no indicator,
+    /// 1 a fill, 2 busy.
     #[must_use]
     pub const fn activity(&self) -> u8 {
         match &self.msg.meter {
@@ -425,15 +415,13 @@ impl Live {
         (now < end).then_some(end)
     }
 
-    /// The hold's span: the severity's for `Default`, the named one for `For` / `Live` / `Ask`.
+    /// The hold's span.
     #[must_use]
     pub(crate) fn hold_span(&self) -> Duration {
         hold_span(self.msg.hold, self.msg.severity)
     }
 
-    /// The wall clock now: the wall at `posted_at` (the ingress stamp, or
-    /// the seed's wall for a carried row) plus the monotonic elapsed — the
-    /// engine reads no clock of its own.
+    /// The wall clock now: the wall at `posted_at` plus the monotonic elapsed.
     #[must_use]
     pub(crate) fn wall_at(&self, now: Instant) -> u64 {
         let elapsed = now.saturating_duration_since(self.posted_at).as_millis();
@@ -925,8 +913,7 @@ impl MessageCenter {
         });
     }
 
-    /// Close as fixed every problem under a key starting with `prefix` that
-    /// left the glass unfixed in this process.
+    /// Close as fixed every problem under `prefix` that left the glass unfixed in this process.
     pub fn fix_closed(&mut self, prefix: &str, now: Instant) -> usize {
         self.fix_closed_as(prefix, None, now)
     }
@@ -1209,9 +1196,7 @@ impl MessageCenter {
         true
     }
 
-    /// Resolve every live row — and every exception in the digest — whose key
-    /// starts with `prefix` (`config.` on a clean reload, `privacy.` on
-    /// policy-off).
+    /// Resolve every live row and every digest exception whose key starts with `prefix`.
     pub fn resolve_key_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
         let ids: Vec<MessageId> = self
             .live
@@ -1250,7 +1235,7 @@ impl MessageCenter {
         true
     }
 
-    /// Aterm is quitting: every open row (live work, a held row, one still queued) retires.
+    /// Aterm is quitting.
     pub fn quit(&mut self, now: Instant) -> usize {
         let mut closed = 0;
         while !self.live.is_empty() {
@@ -1334,7 +1319,7 @@ impl MessageCenter {
         true
     }
 
-    /// A capsule press: logs `Acted { label }` and returns the intent for the host to perform.
+    /// A capsule press.
     pub fn act(&mut self, id: MessageId, action: ActionIndex, now: Instant) -> Option<Intent> {
         let i = self.index(id)?;
         if action.is_details() {
@@ -1360,8 +1345,7 @@ impl MessageCenter {
         Some(intent)
     }
 
-    /// Perform an action only while the id and action-list revision captured
-    /// by its publisher still stand.
+    /// Perform an action only while the id and action-list revision captured by its caller stand.
     pub fn act_at_revision(
         &mut self,
         id: MessageId,
@@ -1896,10 +1880,7 @@ impl MessageCenter {
         self.revision
     }
 
-    /// A center that replaces another (the web's `messages_restore`, a fresh
-    /// center over the kept log) moves its revision past the one it replaces,
-    /// or a reader gating on the revision (the page's `rev=`) would read the
-    /// same number over a log that went from nothing to N records.
+    /// A center that replaces another moves its revision past the one it replaces.
     pub fn follow_revision(&mut self, replaced: u64) {
         self.revision = self.revision.max(replaced.saturating_add(1));
     }
@@ -1916,7 +1897,7 @@ impl MessageCenter {
         self.motion_input_epoch
     }
 
-    /// The repaint-key term: `0` when `committed_rows() == 0`.
+    /// The repaint-key term.
     #[must_use]
     pub fn fingerprint(&self, cols: usize) -> u64 {
         if self.committed_rows == 0 {
@@ -2278,13 +2259,12 @@ impl MessageCenter {
         closed
     }
 
-    /// Never mint an id below `raw` from now on (ids only rise; a `raw` at or
-    /// past the id ceiling is ignored).
+    /// Never mint an id below `raw` from now on.
     pub fn raise_next_id(&mut self, raw: u64) {
         self.log.raise_to(raw);
     }
 
-    /// Re-seed the carry: each row keeps its id, words.
+    /// Re-seed the carry.
     pub fn seed_carried(&mut self, carry: &Carry, wall: WallStamp, now: Instant) {
         self.log.raise_to(carry.next_id);
         for c in &carry.live {
@@ -2737,7 +2717,7 @@ impl MessageCenter {
         Some(intent)
     }
 
-    /// The cause ended: retire every exception whose key starts with `prefix` `Resolved`.
+    /// The cause ended.
     pub fn resolve_digest_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
         let mut n = 0;
         loop {
@@ -2886,7 +2866,6 @@ impl MessageCenter {
         let changed =
             self.digest.find_key(key).is_none() && self.log.resolve_filing(key, wall.unix_ms, now);
         if changed {
-            // The filed record's outcome changed, even though no digest entry moved.
             self.revision += 1;
         }
         changed
@@ -3191,9 +3170,6 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
     };
     let mut layout = layout_row_with(&spec, cols, width, forms.short_time);
     if matches!(kind, RowKind::Echo(_)) {
-        // An echo is the indicator ending, not a reading: the stats were
-        // frozen at the last read before the resolve, so they go, laid out as
-        // the row was, so nothing on it moves at the resolve.
         layout.stats = None;
     }
     layout
@@ -3205,8 +3181,6 @@ fn text_ticks(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> [Option
         .elapsed
         .map(|_| row.started_at + e + elapsed_word_change(e));
     if layout.eta.is_some() {
-        // A hidden estimate leaves the slot blank: nothing ticks there until
-        // the estimate latches.
         [elapsed, row.track.next_change(q), None]
     } else {
         let stall = (look.graded && layout.meter.is_some())

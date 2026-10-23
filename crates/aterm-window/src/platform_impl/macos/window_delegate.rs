@@ -11,6 +11,9 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::*;
 use aterm_objc::{
     class, sel, Bool, CGPoint as Point, CGRect as Rect, CGSize as Size2D, Id, MainThread,
@@ -32,6 +35,8 @@ use crate::keyboard::ModifiersState;
 use crate::platform::macos::{OptionAsAlt, WindowExtMacOS};
 use crate::window::{Cursor, ImePurpose, Theme, UserAttentionType, WindowAttributes};
 
+// LOCAL PATCH (aterm): empty. Upstream's twelve `WindowAttributesExtMacOS` settings are gone, and
+// `new_window` builds every window at their defaults.
 #[derive(Clone, Debug, Default)]
 pub struct PlatformSpecificWindowAttributes;
 
@@ -39,11 +44,16 @@ pub struct PlatformSpecificWindowAttributes;
 pub(crate) struct State {
     app_delegate: aterm_objc::Retained<ApplicationDelegate>,
     window: aterm_objc::Retained<WinitWindow>,
+    // LOCAL PATCH (aterm): this delegate, borrowed (retaining it would keep it alive forever); nil
+    // until `WindowDelegate::new` registers the KVO observer that `Drop for State` removes.
     this: Cell<Id>,
     previous_position: Cell<Point>,
     previous_scale_factor: Cell<f64>,
     resize_increments: Cell<Size2D>,
+    // LOCAL PATCH (aterm): no `decorations`/`resizable` ivars: every window is decorated and
+    // resizable.
     maximized: Cell<bool>,
+    // LOCAL PATCH (aterm): no saved presentation options; exclusive fullscreen is gone.
     fullscreen: RefCell<Option<Fullscreen>>,
     target_fullscreen: RefCell<Option<Option<Fullscreen>>>,
     in_fullscreen_transition: Cell<bool>,
@@ -51,6 +61,9 @@ pub(crate) struct State {
     saved_style: Cell<Option<usize>>,
 }
 
+// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`. The Rust state is the ivars,
+// dropped by `-dealloc` before `[super dealloc]`, so the KVO de-registration upstream did in `Drop
+// for WindowDelegate` is `Drop for State`.
 aterm_objc::declare_class! {
     /// The `NSWindowDelegate` + `NSDraggingDestination` installed on every `WinitWindow`.
     pub(crate) struct WindowDelegate: NSObject {
@@ -131,7 +144,8 @@ aterm_objc::declare_class! {
             self.queue_event(WindowEvent::Focused(false));
         }
 
-        /// Records the fullscreen transition before any Objective-C send.
+        /// LOCAL PATCH (aterm): the transition flag and `fullscreen` are written before any send,
+        /// so a contained raise cannot leave a fullscreen window recorded as windowed.
         @sel(windowWillEnterFullScreen:)
         fn window_will_enter_fullscreen(&self, _sender: Id) {
             trace_scope!("windowWillEnterFullScreen:");
@@ -160,6 +174,8 @@ aterm_objc::declare_class! {
             self.ivars().in_fullscreen_transition.set(true);
         }
 
+        // LOCAL PATCH (aterm): no `window:willUseFullScreenPresentationOptions:` row (exclusive
+        // fullscreen is gone); AppKit then uses the proposed options.
         @sel(windowDidEnterFullScreen:)
         fn window_did_enter_fullscreen(&self, _sender: Id) {
             trace_scope!("windowDidEnterFullScreen:");
@@ -167,10 +183,14 @@ aterm_objc::declare_class! {
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
                 self.set_fullscreen(target_fullscreen);
             }
+            // LOCAL PATCH (aterm): AppKit re-hosts the titlebar after the transition's last frame
+            // change, so one Resized at the settled size lets chrome geometry be derived again.
             self.queue_event(WindowEvent::Resized(self.inner_size()));
         }
 
-        /// Clears the fullscreen transition and restores windowed state.
+        /// LOCAL PATCH (aterm): the transition flag is cleared and the parked request taken before
+        /// `restore_state_from_fullscreen`'s sends, so a contained raise cannot leave the window in
+        /// transition for good.
         @sel(windowDidExitFullScreen:)
         fn window_did_exit_fullscreen(&self, _sender: Id) {
             trace_scope!("windowDidExitFullScreen:");
@@ -181,10 +201,12 @@ aterm_objc::declare_class! {
             if let Some(target_fullscreen) = target_fullscreen {
                 self.set_fullscreen(target_fullscreen);
             }
+            // LOCAL PATCH (aterm): as in `windowDidEnterFullScreen:`, for the restored chrome.
             self.queue_event(WindowEvent::Resized(self.inner_size()));
         }
 
-        /// Clears transition state when entering fullscreen fails.
+        /// LOCAL PATCH (aterm): no retry. Upstream retried only a window built fullscreen, and
+        /// `with_fullscreen` is gone.
         @sel(windowDidFailToEnterFullScreen:)
         fn window_did_fail_to_enter_fullscreen(&self, _sender: Id) {
             trace_scope!("windowDidFailToEnterFullScreen:");
@@ -202,7 +224,8 @@ aterm_objc::declare_class! {
             self.queue_event(WindowEvent::Occluded(!visible));
         }
 
-        /// Emits `HoveredFile` events for each dragged path.
+        /// LOCAL PATCH (aterm): returns `NSDragOperation` (`Q24@0:8@16`, as the protocol declares)
+        /// where upstream returned `bool`.
         @sel(draggingEntered:)
         fn dragging_entered(&self, sender: Id) -> usize {
             trace_scope!("draggingEntered:");
@@ -261,7 +284,9 @@ aterm_objc::declare_class! {
             _context: *mut c_void,
         ) {
             trace_scope!("observeValueForKeyPath:ofObject:change:context:");
-            // SAFETY: KVO passes the key path it was registered with.
+            // SAFETY: KVO passes the key path it was registered with (an `NSString`) and, as
+            // `addObserver:` asks for New|Old, the change dictionary; both are null-checked before
+            // any send.
             let want = seam::nsstring("effectiveAppearance").expect("literal key path");
             let matches = !key_path.is_null()
                 && unsafe { send_bool_id(key_path, sel!(isEqualToString:), want.id()) };
@@ -298,7 +323,7 @@ aterm_objc::declare_class! {
 
                 self.queue_event(WindowEvent::ThemeChanged(new));
             } else {
-                // SAFETY: nil answers `String::new()`.
+                // SAFETY: `key_path` is nil or the `NSString` key path KVO delivered.
                 panic!("unknown observed keypath {:?}", unsafe { seam::nsstring_to_rust(key_path) });
             }
         }
@@ -306,16 +331,24 @@ aterm_objc::declare_class! {
 }
 
 /// The file paths on a dragging-info object's pasteboard.
+///
+/// LOCAL PATCH (aterm): one read for upstream's two copies in `draggingEntered:` and
+/// `performDragOperation:`.
+///
 /// # Safety
 /// `sender` must be a live object conforming to `NSDraggingInfo`.
 unsafe fn dragged_paths(sender: Id) -> Option<Vec<std::path::PathBuf>> {
-    // SAFETY: `-draggingPasteboard` is `@@:` on `NSDraggingInfo`.
+    // SAFETY: `-draggingPasteboard` is `@@:` on `NSDraggingInfo` and answers a borrowed
+    // `NSPasteboard`; `-propertyListForType:` is `@@:@` and answers nil when empty.
     unsafe {
         let pb = send_id(sender, sel!(draggingPasteboard));
         let list = send_id_id(pb, sel!(propertyListForType:), seam::NS_FILENAMES_PBOARD_TYPE);
         if list.is_null() {
             return None;
         }
+        // LOCAL PATCH (aterm): the dragging source writes this list, so it is checked to be an
+        // `NSArray` of `NSString` first; any other root or entry refuses the whole drop, where
+        // upstream's reads would raise.
         let is_a = |obj: Id, cls: &'static std::ffi::CStr| -> bool {
             send_bool_id(obj, sel!(isKindOfClass:), class(cls).as_id())
         };
@@ -333,13 +366,16 @@ unsafe fn dragged_paths(sender: Id) -> Option<Vec<std::path::PathBuf>> {
     }
 }
 
+// LOCAL PATCH (aterm): upstream's `Drop for WindowDelegate`; the instance is still live here (see
+// the class).
 impl Drop for State {
     fn drop(&mut self) {
         let this = self.this.get();
         if this.is_null() {
             return;
         }
-        // SAFETY: `this` is live during `-dealloc` and is the registered KVO observer.
+        // SAFETY: `this` is live during `-dealloc` before `[super dealloc]` and is the registered
+        // KVO observer for this window and key path.
         let key = seam::nsstring("effectiveAppearance").expect("literal key path");
         // SAFETY: `-removeObserver:forKeyPath:` is `v@:@@` on every `NSObject`.
         unsafe {
@@ -354,6 +390,8 @@ fn new_window(
     mtm: MainThread,
 ) -> Option<aterm_objc::Retained<WinitWindow>> {
     aterm_objc::autoreleasepool(|_| {
+        // LOCAL PATCH (aterm): a window is built windowed with the default style mask; the builders
+        // that changed either are gone, and `set_fullscreen` leaves that state.
         // SAFETY: `-backingScaleFactor` is `d@:` on `NSScreen`.
         let scale_factor = main_screen()
             .map(|screen| unsafe { send_f64(screen.id(), sel!(backingScaleFactor)) })
@@ -405,7 +443,9 @@ fn new_window(
 
         let ns = window.as_id();
 
-        // SAFETY: `ns` is the live `WinitWindow` just created, as `set_title` requires.
+        // SAFETY: `ns` is the live `WinitWindow` just created, as `set_title` requires;
+        // `-setReleasedWhenClosed:` and `-setAcceptsMouseMovedEvents:` are `v@:B` and `-center`
+        // is `v@:` on `NSWindow`.
         unsafe {
             send_v_bool(ns, sel!(setReleasedWhenClosed:), false);
 
@@ -420,7 +460,10 @@ fn new_window(
         let view = WinitView::new(app_delegate, &window);
 
         let v = view.as_id();
-        // SAFETY: `v` is the live `WinitView` just created and `ns` the window it goes into.
+        // SAFETY: `v` is the live `WinitView` just created and `ns` the window it goes into;
+        // `-setWantsBestResolutionOpenGLSurface:` and `-setWantsLayer:` are `v@:B` on `NSView`;
+        // `-setContentView:`, `-setInitialFirstResponder:` and `-registerForDraggedTypes:` are
+        // `v@:@` on `NSWindow`; `+arrayWithObjects:count:` reads one live global and answers +0.
         unsafe {
             send_v_bool(v, sel!(setWantsBestResolutionOpenGLSurface:), true);
 
@@ -457,6 +500,8 @@ impl WindowDelegate {
         // SAFETY: `-backingScaleFactor` is `d@:` on `NSWindow`.
         let scale_factor: f64 = unsafe { send_f64(window.as_id(), sel!(backingScaleFactor)) };
 
+        // LOCAL PATCH (aterm): no parent, unit increments and the inherited appearance:
+        // `with_parent_window`, `with_resize_increments` and `with_theme` are gone.
         let resize_increments = Size2D { width: 1., height: 1. };
 
         let delegate = WindowDelegate::alloc_init(mtm, State {
@@ -486,10 +531,12 @@ impl WindowDelegate {
                 delegate.handle_scale_factor_changed(scale_factor);
             });
         }
-        // SAFETY: `-setDelegate:` is `v@:@` on `NSWindow`.
+        // SAFETY: `-setDelegate:` is `v@:@` on `NSWindow`, and `delegate` is a live
+        // `WinitWindowDelegate`. The window does not retain it; `window.rs` keeps its own handle.
         unsafe { send_v_id(window.as_id(), sel!(setDelegate:), delegate.as_id()) };
 
-        // SAFETY: `-addObserver:forKeyPath:options:context:` is `v@:@@Q^v` on every `NSObject`.
+        // SAFETY: `-addObserver:forKeyPath:options:context:` is `v@:@@Q^v` on every `NSObject`; KVO
+        // does not retain the observer, and `Drop for State` removes it.
         unsafe {
             let key = seam::nsstring("effectiveAppearance").expect("literal key path");
             send_v_id_id_usize_ptr(
@@ -502,12 +549,18 @@ impl WindowDelegate {
                 ptr::null_mut(),
             );
         };
+        // LOCAL PATCH (aterm): recorded only now that the observer is registered (see
+        // `State::this`).
         delegate.ivars().this.set(delegate.as_id());
 
         if let Some(dim) = attrs.min_inner_size {
             delegate.set_min_inner_size(Some(dim));
         }
 
+        // LOCAL PATCH (aterm): upstream applied blur, a maximum size, the window level, the cursor,
+        // fullscreen and maximized state here, and focus when shown. Their builders are gone, and
+        // each default was a no-op on a fresh window (normal level, arrow cursor, windowed), so a
+        // window is built unblurred, unbounded, windowed and active.
         delegate.queue_event(WindowEvent::Focused(false));
 
         if attrs.visible {
@@ -518,6 +571,8 @@ impl WindowDelegate {
         Ok(delegate)
     }
 
+    // LOCAL PATCH (aterm): a runtime check, where objc2 derived the marker from the receiver's
+    // type.
     #[track_caller]
     fn mtm(&self) -> MainThread {
         MainThread::new()
@@ -544,7 +599,8 @@ impl WindowDelegate {
         &self.ivars().window
     }
 
-    /// Replaces upstream's `ns_window() -> &NSWindow`.
+    /// LOCAL PATCH (aterm): replaces upstream's `ns_window() -> &NSWindow`; the sends take the raw
+    /// `id`.
     #[track_caller]
     pub(super) fn win(&self) -> Id {
         self.window().as_id()
@@ -561,7 +617,8 @@ impl WindowDelegate {
     }
 
     fn content_rect(&self) -> Rect {
-        // SAFETY: `-frame` is `{CGRect}@:`.
+        // SAFETY: `-frame` is `{CGRect}@:` and `-contentRectForFrameRect:` is `{CGRect}@:{CGRect}`
+        // on `NSWindow`.
         unsafe {
             let frame = send_rect(self.win(), sel!(frame));
             send_rect_rect(self.win(), sel!(contentRectForFrameRect:), frame)
@@ -577,7 +634,8 @@ impl WindowDelegate {
         let window = self.window();
         let ns = window.as_id();
 
-        // SAFETY: `-frame` is `{CGRect}@:`.
+        // SAFETY: `-frame` is `{CGRect}@:` and `-contentRectForFrameRect:` is `{CGRect}@:{CGRect}`
+        // on `NSWindow`.
         let content_size = unsafe {
             send_rect_rect(ns, sel!(contentRectForFrameRect:), send_rect(ns, sel!(frame)))
         }
@@ -630,7 +688,8 @@ impl WindowDelegate {
     }
 
     pub fn set_visible(&self, visible: bool) {
-        // SAFETY: `-makeKeyAndOrderFront:` and `-orderOut:` are both `v@:@` on `NSWindow`.
+        // SAFETY: `-makeKeyAndOrderFront:` and `-orderOut:` are both `v@:@` on `NSWindow` and both
+        // accept a nil sender.
         unsafe {
             let sel = if visible { sel!(makeKeyAndOrderFront:) } else { sel!(orderOut:) };
             send_v_id(self.win(), sel, Id::NIL);
@@ -739,6 +798,8 @@ impl WindowDelegate {
     pub fn set_cursor(&self, cursor: Cursor) {
         let view = self.view();
 
+        // LOCAL PATCH (aterm): cursors compare with `same_cursor` (`-isEqual:`), as upstream's
+        // `Retained` `==` did.
         let Cursor::Icon(icon) = cursor;
         let cursor = cursor_from_icon(icon);
 
@@ -761,7 +822,9 @@ impl WindowDelegate {
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         let mtm = self.mtm();
         let _ = mtm;
-        // SAFETY: `-currentEvent` is `@@:` on `NSApplication`.
+        // SAFETY: `-currentEvent` is `@@:` on `NSApplication` and answers nil
+        // outside event delivery; `-performWindowDragWithEvent:` is `v@:@` on
+        // `NSWindow`.
         unsafe {
             let event = send_id(app(), sel!(currentEvent));
             if event.is_null() {
@@ -809,7 +872,8 @@ impl WindowDelegate {
 
     #[inline]
     pub fn set_minimized(&self, minimized: bool) {
-        // SAFETY: `-isMiniaturized` is `B@:`.
+        // SAFETY: `-isMiniaturized` is `B@:`, and `-miniaturize:` and `-deminiaturize:` are `v@:@`,
+        // on `NSWindow`. The sender is this delegate, a live `NSObject`.
         unsafe {
             let is_minimized = send_bool(self.win(), sel!(isMiniaturized));
             if is_minimized == minimized {
@@ -847,7 +911,9 @@ impl WindowDelegate {
         }
 
         let _ = mtm;
-        // SAFETY: `-zoom:` is `v@:@` and accepts a nil sender.
+        // SAFETY: `-zoom:` is `v@:@` and accepts a nil sender;
+        // `-visibleFrame` is `{CGRect}@:` on `NSScreen`; `-setFrame:display:`
+        // is `v@:{CGRect}B` on `NSWindow`.
         unsafe {
             if self.style_mask() & consts::NS_WINDOW_STYLE_MASK_RESIZABLE != 0 {
                 send_v_id(self.win(), sel!(zoom:), Id::NIL);
@@ -897,11 +963,16 @@ impl WindowDelegate {
                     }
                 },
             };
+            // LOCAL PATCH (aterm): upstream unwraps the target screen and asserts the window is on
+            // one. While a display leaves either can be nil, so the request is dropped instead of
+            // panicking inside an AppKit callback.
             let Some(new_screen) = monitor.ns_screen(mtm) else {
                 return;
             };
 
-            // SAFETY: `-screen` is `@@:` on `NSWindow`.
+            // SAFETY: `-screen` is `@@:` on `NSWindow` and is non-nil for a window that is on
+            // screen; `-frame` is `{CGRect}@:` on `NSScreen`; `-setFrameOrigin:` is `v@:{CGPoint}`
+            // on `NSWindow`.
             unsafe {
                 let old_screen = send_id(self.win(), sel!(screen));
                 if old_screen.is_null() {
@@ -916,6 +987,9 @@ impl WindowDelegate {
 
         self.ivars().fullscreen.replace(fullscreen.clone());
 
+        // LOCAL PATCH (aterm): `Fullscreen::Exclusive` is gone on macOS, with the display capture,
+        // video-mode switch and presentation options; every transition is a borderless
+        // `toggleFullScreen:`.
         let toggle_fullscreen = || {
             // SAFETY: `-toggleFullScreen:` is `v@:@` on `NSWindow` and accepts a nil sender.
             unsafe { send_v_id(self.win(), sel!(toggleFullScreen:), Id::NIL) };
@@ -968,7 +1042,9 @@ impl WindowDelegate {
     #[inline]
     pub fn focus_window(&self) {
         let _ = self.mtm();
-        // SAFETY: `-isMiniaturized` and `-isVisible` are `B@:` on `NSWindow`.
+        // SAFETY: `-isMiniaturized` and `-isVisible` are `B@:` on `NSWindow`;
+        // `-activateIgnoringOtherApps:` is `v@:B` on `NSApplication`; `-makeKeyAndOrderFront:` is
+        // `v@:@` and accepts a nil sender.
         unsafe {
             let is_minimized = send_bool(self.win(), sel!(isMiniaturized));
             let is_visible = send_bool(self.win(), sel!(isVisible));
@@ -1024,7 +1100,8 @@ impl WindowDelegate {
         monitor::primary_monitor()
     }
 
-    /// The content view as a borrowed `id`.
+    /// LOCAL PATCH (aterm): the content view as a borrowed `id`, what `aterm_objc::HasNsView`
+    /// hands out (`platform/macos.rs`); the `rwh_06` handle below wraps the same pointer.
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {
         self.view().as_id()
@@ -1047,7 +1124,9 @@ impl WindowDelegate {
     }
 
     pub fn theme(&self) -> Option<Theme> {
-        // SAFETY: `-appearance` is `@@:` on `NSWindow`.
+        // SAFETY: `-appearance` is `@@:` on `NSWindow` and answers nil unless
+        // the window was given one; `-respondsToSelector:` is `B@::` and
+        // `-effectiveAppearance` is `@@:` on `NSApplication`.
         unsafe {
             let own = send_id(self.win(), sel!(appearance));
             if !own.is_null() {
@@ -1081,10 +1160,12 @@ impl WindowDelegate {
 }
 
 impl WindowExtMacOS for WindowDelegate {
+    // LOCAL PATCH (aterm): see `WinitView::cached_modifiers`.
     fn cached_modifiers(&self) -> ModifiersState {
         self.view().cached_modifiers()
     }
 
+    // LOCAL PATCH (aterm): upstream's option-as-alt; the view keeps it.
     fn set_option_as_alt(&self, option_as_alt: OptionAsAlt) {
         self.view().set_option_as_alt(option_as_alt);
     }
@@ -1106,7 +1187,9 @@ fn dark_appearance_name() -> aterm_objc::Obj {
 /// `appearance` must be a live `NSAppearance`.
 pub unsafe fn appearance_to_theme(appearance: Id) -> Theme {
     let dark = dark_appearance_name();
-    // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` on `NSArray`.
+    // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` on `NSArray`,
+    // `-bestMatchFromAppearancesWithNames:` `@@:@` on `NSAppearance` and `-isEqualToString:`
+    // `B@:@` on `NSString`; both names are live for the whole call.
     unsafe {
         let names = [seam::NS_APPEARANCE_NAME_AQUA, dark.id()];
         let arr = send_id_idptr_usize(
@@ -1138,7 +1221,8 @@ fn theme_to_appearance(theme: Option<Theme>) -> Option<aterm_objc::Obj> {
             dark.id()
         },
     };
-    // SAFETY: `+appearanceNamed:` is `@@:@` on `NSAppearance`.
+    // SAFETY: `+appearanceNamed:` is `@@:@` on `NSAppearance`. `name` is live for this send —
+    // either an AppKit global or `dark`, which outlives the statement.
     let appearance =
         unsafe { send_id_id(class(c"NSAppearance").as_id(), sel!(appearanceNamed:), name) };
     // SAFETY: non-nil here is a live +0 `NSAppearance`.
@@ -1151,12 +1235,13 @@ fn theme_to_appearance(theme: Option<Theme>) -> Option<aterm_objc::Obj> {
 }
 
 fn app() -> Id {
-    // SAFETY: `+sharedApplication` is `@@:` on `NSApplication`.
+    // SAFETY: `+sharedApplication` is `@@:` on `NSApplication` (process-lifetime singleton).
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }
 
 fn main_screen() -> Option<aterm_objc::Obj> {
-    // SAFETY: `+mainScreen` is `@@:` on `NSScreen` and answers nil in a session with no display.
+    // SAFETY: `+mainScreen` is `@@:` on `NSScreen` and answers nil in a session
+    // with no display; the result is +0 autoreleased, so it is retained.
     unsafe { aterm_objc::Obj::retain(send_id(class(c"NSScreen").as_id(), sel!(mainScreen))) }
 }
 

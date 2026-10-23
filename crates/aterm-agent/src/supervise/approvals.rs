@@ -184,7 +184,7 @@ impl Row<'_> {
         self.to_json_scoped_by(ts, sid, count, captured_boot, conversation, None)
     }
 
-    /// [`Self::to_json_scoped`], and where `program` is given, the program the wall was met under ([`PROGRAM`]), whatever the conversation: a hostless wall names it too.
+    /// `Self::to_json_scoped`, and where `program` is given, the program the wall was met under ([`PROGRAM`]), whatever the conversation: a hostless wall names it too.
     pub(crate) fn to_json_scoped_by(
         &self,
         ts: i64,

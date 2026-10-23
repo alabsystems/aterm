@@ -10,17 +10,17 @@ use std::sync::OnceLock;
 /// The facts every verb shares, resolved once.
 #[derive(Debug)]
 pub struct Paths {
-    /// `$LAB_STATE`, else [`default_state`] (`/private/tmp/at.lab-<uid>/<checkout>`, outside every home).
+    /// `$LAB_STATE`, else [`default_state`].
     pub state: PathBuf,
-    /// Whether [`Self::state`] is the default ([`default_state`]: `$LAB_STATE` unset or empty), which [`Paths::make_default_state`] makes private.
+    /// Whether [`Self::state`] is the default ([`default_state`]: `$LAB_STATE` unset or empty).
     pub state_default: bool,
     /// `$LAB_STATE` as given, when it is relative.
     pub state_relative: Option<String>,
-    /// The aterm a NEW lab tests, when one was found (a lab that is up runs the one its `env.sh` recorded at `up`, which its jail pins).
+    /// The aterm a NEW lab tests.
     pub aterm: Option<PathBuf>,
     /// Why `$LAB_ATERM` was not taken, when it was not.
     pub aterm_note: Option<String>,
-    /// The UID account's physical home, independently of `HOME` (the account database's: [`aterm_uds::account::home`]).
+    /// The UID account's physical home.
     pub real_home: String,
     /// The calling shell's physical `HOME`, when it names a directory.
     pub caller_home: String,
@@ -118,8 +118,7 @@ impl Paths {
         guarded(&self.real_home, &self.caller_home)
     }
 
-    /// The guarded homes, or the refusal when neither the account database nor `HOME` names a directory.
-    ///
+    /// The guarded homes.
     /// # Errors
     /// No home to guard.
     pub fn need_guarded_homes(&self) -> Result<Vec<String>, String> {
@@ -145,7 +144,6 @@ impl Paths {
     }
 
     /// [`Paths::store_home`], or the refusal when there is none.
-    ///
     /// # Errors
     /// Neither the account database nor `HOME` names a directory.
     pub fn need_store_home(&self) -> Result<&str, String> {
@@ -162,7 +160,6 @@ impl Paths {
     }
 
     /// The state dir to make things in.
-    ///
     /// # Errors
     /// `$LAB_STATE` is relative, or the default is not this user's own private directory.
     pub fn need_state(&self) -> Result<&Path, String> {
@@ -171,8 +168,6 @@ impl Paths {
         Ok(state)
     }
 
-    /// The state dir, or the refusal of a relative `$LAB_STATE`: a check that
-    /// makes nothing.
     fn state_named(&self) -> Result<&Path, String> {
         match &self.state_relative {
             Some(s) => Err(format!(
@@ -183,8 +178,7 @@ impl Paths {
         }
     }
 
-    /// The state dir, or the refusal of one inside a home the jail fences (`homes`, [`Self::guarded_homes`]).
-    ///
+    /// The state dir.
     /// # Errors
     /// `$LAB_STATE` is the home or lies under it.
     pub fn need_state_outside(&self, homes: &[String]) -> Result<&Path, String> {
@@ -210,7 +204,6 @@ impl Paths {
     }
 
     /// Ensure the default state directory is private when [`Self::state_default`] is true.
-    ///
     /// # Errors
     /// Either directory cannot be made, or is not this user's own private directory.
     pub fn make_default_state(&self) -> Result<(), String> {
@@ -247,7 +240,6 @@ impl Paths {
     }
 
     /// The aterm under test, or the refusal that says how to get one.
-    ///
     /// # Errors
     /// None was found, or `$LAB_ATERM` is not executable.
     pub fn need_aterm(&self) -> Result<&Path, String> {
@@ -272,7 +264,6 @@ impl Paths {
     }
 
     /// The owner's home (the jail protects what is under it), or the refusal.
-    ///
     /// # Errors
     /// The UID account's home is unavailable, root, relative or not UTF-8.
     pub fn need_home(&self) -> Result<&str, String> {
@@ -291,9 +282,6 @@ impl Paths {
     }
 }
 
-/// The aterm a new lab tests, and why `$LAB_ATERM` was not taken: `$LAB_ATERM`,
-/// else the `aterm` beside this program, else this checkout's debug build,
-/// else its release build.
 fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
     if let Some(a) = std::env::var_os("LAB_ATERM").filter(|a| !a.is_empty()) {
         let a = PathBuf::from(a);
@@ -332,7 +320,8 @@ fn find_aterm(exe: &Path, repo: &Path) -> (Option<PathBuf>, Option<String>) {
     (found.map(|c| std::fs::canonicalize(&c).unwrap_or(c)), None)
 }
 
-/// A path the CALLER gave (`LAB_CLAUDE`, `LAB_CODEX`, `twin`'s build), made absolute against the caller's directory.
+/// A path the CALLER gave (`LAB_CLAUDE`, `LAB_CODEX`, `twin`'s build), made absolute against
+/// the caller's directory.
 #[must_use]
 pub fn from_caller(p: &str) -> String {
     if p.is_empty() || p.starts_with('/') {
@@ -342,7 +331,7 @@ pub fn from_caller(p: &str) -> String {
     format!("{}/{p}", cwd.trim_end_matches('/'))
 }
 
-/// The directory the lab was started from (its physical path), read once before the lab moves to `/`.
+/// The directory the lab was started from (its physical path).
 pub fn caller_dir() -> String {
     static D: OnceLock<String> = OnceLock::new();
     D.get_or_init(|| {
@@ -354,7 +343,7 @@ pub fn caller_dir() -> String {
     .clone()
 }
 
-/// `path` with its longest existing prefix resolved through links and `..`, the rest as written (nothing is made).
+/// `path` with its longest existing prefix resolved through links and `..`.
 #[must_use]
 pub fn physical(path: &Path) -> PathBuf {
     let mut head = path.to_path_buf();
@@ -425,10 +414,10 @@ pub fn checkout_key(repo: &Path) -> String {
     format!("{name}-{hash:08x}")
 }
 
-/// `dir` made (mode 0700) when missing, then required to be what a private directory of `uid` is.
-///
+/// `dir` made (mode 0700) when missing.
 /// # Errors
-/// It cannot be made, or it is a link, not a directory, another user's, or its mode cannot be narrowed.
+/// It cannot be made, or it is a link, not a directory, another user's, or its mode cannot be
+/// narrowed.
 pub fn private_dir(dir: &Path, uid: u32) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -471,7 +460,7 @@ pub fn valid_tag(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// The homes a lab guards, from the account's home (`account`, the account database's) and the caller's `HOME` (`caller`).
+/// The homes a lab guards.
 #[must_use]
 pub fn guarded(account: &str, caller: &str) -> Vec<String> {
     let mut homes: Vec<String> = Vec::new();
@@ -483,8 +472,6 @@ pub fn guarded(account: &str, caller: &str) -> Vec<String> {
     homes
 }
 
-/// A home fence must name an existing physical directory exactly, never a
-/// lossy replacement of its name or the whole filesystem.
 fn home_path(path: Option<&Path>) -> String {
     path.filter(|p| p.is_absolute() && *p != Path::new("/") && p.to_str().is_some())
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -576,9 +563,6 @@ mod tests {
         );
     }
 
-    /// The homes a lab guards are a superset, never a narrowing: the
-    /// account's first, then the caller's `HOME` when it names another, each
-    /// once, an unknown one left out.
     #[test]
     fn the_guarded_homes_are_the_account_s_and_home_s_each_once() {
         assert_eq!(guarded("/Users//o", "/tmp/s"), ["/Users//o", "/tmp/s"]);
@@ -588,10 +572,6 @@ mod tests {
         assert!(guarded("", "").is_empty());
     }
 
-    /// THE ACCOUNT'S HOME IS RESOLVED FROM THE ACCOUNT DATABASE, NOT `HOME`: a
-    /// fake account home handed in through the seam ([`Paths::resolve_with`])
-    /// is guarded beside a scratch `HOME`, by its physical path, and is the
-    /// package store's home.
     #[test]
     fn a_fake_account_home_is_guarded_beside_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -636,11 +616,6 @@ mod tests {
         assert!(none.need_guarded_homes().is_err() && none.need_store_home().is_err());
     }
 
-    /// THE LAB'S OWN FACTS ([`paths`]) TAKE THE ACCOUNT'S HOME FROM THE
-    /// ACCOUNT DATABASE: whatever `HOME` the test runs under (a scratch one,
-    /// by this repository's rule, or the account's own), `real_home` is the
-    /// home `getpwuid_r` names, by its physical path; it is guarded, holds the
-    /// store, and `caller_home` is `HOME`'s.
     #[test]
     fn the_lab_s_own_paths_take_the_account_home_from_the_account_database() {
         let want = home_path(aterm_uds::account::home().as_deref());
@@ -664,10 +639,6 @@ mod tests {
         assert!(env_only.real_home.is_empty() && env_only.need_home().is_err());
     }
 
-    /// THE DEFAULT STATE DIR SITS OUTSIDE EVERY HOME, SHORT AND PER CHECKOUT:
-    /// `/private/tmp/at.lab-<uid>/<name>-<hash>`, the name the checkout's own
-    /// in safe letters (at most 16), the hash its whole path's, so two
-    /// worktrees of one name differ; the longest is 56 bytes.
     #[test]
     fn the_default_state_sits_outside_every_home_short_and_per_checkout() {
         let a = default_state(501, Path::new("/Users//o/Developer/aterm"));
@@ -706,7 +677,6 @@ mod tests {
         }
     }
 
-    /// A scratch tree under the temp dir, removed when it drops.
     struct Tree(PathBuf);
 
     impl Drop for Tree {
@@ -729,9 +699,6 @@ mod tests {
         std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    /// THE DEFAULT STATE DIR IS MADE THIS USER'S PRIVATE DIRECTORY: its root
-    /// and its own directory are made 0700, and a looser root of this user's
-    /// is narrowed.
     #[test]
     fn the_default_state_is_made_private_and_a_squatted_root_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -775,12 +742,6 @@ mod tests {
         );
     }
 
-    /// THE STATE DIR A VERB MAKES THINGS IN IS MADE PRIVATE FIRST, whichever
-    /// verb asks ([`Paths::need_state`]): `fleet-sim` skips the lab's
-    /// up-front check and writes its record under `need_state()`, so a link
-    /// planted at the default's root in the shared `/private/tmp` is refused
-    /// there and nothing is made through it, and a fresh default comes back
-    /// made, mode 0700.
     #[test]
     fn the_state_a_verb_makes_things_in_is_made_private_first() {
         let t = tree("need");
@@ -813,9 +774,6 @@ mod tests {
         assert!(p.need_state().unwrap_err().contains("is relative"));
     }
 
-    /// A STATE DIR INSIDE A FENCED HOME IS REFUSED: in the account's home,
-    /// in a scratch `HOME`, the home itself, and a path outside that leads in
-    /// by a link, each naming the home and the default.
     #[test]
     fn a_state_dir_inside_a_home_is_refused_and_one_outside_goes_through() {
         let t = tree("inside");

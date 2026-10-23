@@ -716,7 +716,7 @@ fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
 }
 
-/// Mint the attempt nonce an outgoing handoff is named by, before anything is written: the successor is launched with the manifest's path in its environment before the manifest exists, so the writer ([`write_outgoing`]) and the launch environment derive the same name from the same nonce ([`outgoing_manifest_path`]).
+/// Mint the attempt nonce an outgoing handoff is named by, before anything is written: the successor is launched with the manifest's path in its environment before the manifest exists, so the writer (`write_outgoing`) and the launch environment derive the same name from the same nonce ([`outgoing_manifest_path`]).
 #[cfg(unix)]
 pub(crate) fn mint_outgoing_nonce() -> String {
     random_nonce()
@@ -727,7 +727,7 @@ fn outgoing_manifest_name(nonce: &str) -> String {
     format!("seamless-{}-{nonce}.toml", std::process::id())
 }
 
-/// Where [`write_outgoing`] will put the manifest for `nonce` — `None` when there is no private control dir (then no seamless handoff is possible at all).
+/// Where `write_outgoing` will put the manifest for `nonce` — `None` when there is no private control dir (then no seamless handoff is possible at all).
 #[cfg(unix)]
 pub(crate) fn outgoing_manifest_path(nonce: &str) -> Option<std::path::PathBuf> {
     Some(crate::control_auth::socket_dir()?.join(outgoing_manifest_name(nonce)))
@@ -746,7 +746,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|mut f| f.write_all(bytes))
 }
 
-/// Why [`write_outgoing`] wrote nothing.
+/// Why `write_outgoing` wrote nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(unix)]
 pub(crate) enum WriteOutgoingFailure {
@@ -3073,7 +3073,7 @@ pub(crate) fn write_outgoing(
     )
 }
 
-/// [`write_outgoing`] with the held panes' final screens: `held` names each pane kept open after its command exited, by pool id, with its visible screen, and `held_history` their scrollback's exports, each joined and named beside its screen.
+/// `write_outgoing` with the held panes' final screens: `held` names each pane kept open after its command exited, by pool id, with its visible screen, and `held_history` their scrollback's exports, each joined and named beside its screen.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_outgoing_with_held(
@@ -3517,7 +3517,7 @@ impl Drop for IncomingPtyGuard {
     }
 }
 
-/// Overlap-handoff rollback: delete every artifact a [`write_outgoing`] with this `nonce` produced (all named `seamless-<pid>-<nonce>…` in our 0700 control dir, `.ctl` sidecars included).
+/// Overlap-handoff rollback: delete every artifact a `write_outgoing` with this `nonce` produced (all named `seamless-<pid>-<nonce>…` in our 0700 control dir, `.ctl` sidecars included).
 #[cfg(any(unix, test))]
 pub(crate) fn discard_outgoing(nonce: &str) {
     let Some(dir) = crate::control_auth::socket_dir() else {

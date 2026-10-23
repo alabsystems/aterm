@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The vocabulary every surface shares: what a read learned, what a probe decided, what
-//! happened, where an item belongs, and the row one item contributes to a report.
+//! Shared convergence vocabulary: host reads, probe verdicts, outcomes, layers, and report rows.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// What one read of the host learned.
-///
-/// ABSENT AND UNUSABLE ARE NOT THE SAME ANSWER. `Absent` is a measurement: the tool said,
-/// in its documented way, that nothing is set, which is the OS default. `Unusable` is the
-/// absence of one: the tool did not run, ran out of time, or answered something the reader
-/// does not understand. Nothing may report an `Unusable` read as the default. (atpkg's
-/// Universal Control read and the machines families both keep this rule through this one
-/// type.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Read<T> {
     /// The host holds this value.
@@ -52,23 +44,19 @@ pub enum Probe {
         /// Which precondition, in one line.
         why: String,
     },
-    /// Blocked on what another item, one of [`crate::Item::after`], puts in place (git's
-    /// settings before the Command Line Tools exist). A plan that changes that item first
-    /// reports this one planned; any other block is [`Probe::Blocked`].
+    /// Blocked on another item in [`crate::Item::after`].
     Waits {
         /// The id of the item whose change lifts the block.
         on: String,
         /// Which precondition, in one line.
         why: String,
     },
-    /// The setting does not exist on this host (an Intel Mac, a desktop, an older macOS):
-    /// nothing to do, and nothing wrong.
+    /// The setting does not exist on this host.
     NotApplicable {
         /// Why it does not apply, in one line.
         why: String,
     },
-    /// The change would disrupt someone using the Mac (relaunching their Dock, swapping an
-    /// app they have open); left for a run when the Mac is idle, or `--now`.
+    /// Deferred until the Mac is idle or `--now` is passed.
     Deferred {
         /// What it waits for, in one line.
         why: String,
@@ -115,8 +103,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether this outcome makes a run's exit status nonzero: a change that did not land,
-    /// or a state nobody could measure.
+    /// Whether this outcome makes a run's exit status nonzero.
     #[inline]
     #[must_use]
     pub const fn is_failure(self) -> bool {
@@ -156,18 +143,15 @@ pub enum Layer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Class {
-    /// Lay again what a pass lays and owns. No network, no prompt, nothing a person made
-    /// is moved: the one class an unattended lane applies.
+    /// Re-lay what a pass owns without network, prompts, or moving user files.
     Relay,
-    /// An act the code allows only when a person asked for it (stale copies to the Trash,
-    /// copied commands moved aside).
+    /// An action allowed only when a person explicitly asked for it.
     Asked,
     /// The network: a signed index, a vendor host, a git remote, a pinned download.
     Install,
     /// Root, once.
     Elevate,
-    /// A person in System Settings, or in what is theirs (PATH, an rc line, a settings key),
-    /// or nothing on this machine (free disk): probed and explained, applied by nobody.
+    /// Probed and explained only; applied by a person or nobody.
     Person,
     /// A change to the person's own UI (keyboard, Dock, accounts).
     Preference,
@@ -177,8 +161,7 @@ pub enum Class {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Requires {
-    /// Any shell of the user's own account: HOME is the passwd home, not root, not under
-    /// a private state root.
+    /// Any shell of the user's own account (`HOME` is the passwd home, not root or a scratch root).
     #[default]
     Account,
     /// That, and the user owns `/dev/console`.
@@ -205,15 +188,9 @@ pub enum Remedy {
         /// The item id or layer name.
         only: String,
     },
-    /// `aterm init --develop`: the remedy of every `develop.*` item (the profile record,
-    /// a checkout's alignment, its submodule and its test tools), which that flag runs.
-    /// It crosses builds (the machines agent reads the person's `aterm pkg doctor
-    /// --json`, whatever aterm that is), so an older agent still reads a report that
-    /// carries one.
+    /// `aterm init --develop`: remedy for `develop.*` items.
     Develop,
-    /// `targo --unverified verify provision <args>` (`--linux`, `--record`, or nothing),
-    /// the verb of a checkout's tools (S7): `ship provision`'s `develop` item answers
-    /// with it.
+    /// `targo --unverified verify provision <args>`, the remedy for checkout tools.
     Provision {
         /// The verb's arguments.
         args: String,
@@ -241,8 +218,7 @@ pub enum StoodAside {
     Lock(String),
     /// A network the change needs is down (atpkg's exit 69).
     Offline(String),
-    /// The change waits on someone else's act (an admin approving this Mac's join to the
-    /// secrets vault); the line says whose and what.
+    /// The change waits on another person's action (such as admin approval).
     Waiting(String),
     /// The account has not granted permission the change needs (exit 77).
     Permission(String),
@@ -260,9 +236,7 @@ impl StoodAside {
         }
     }
 
-    /// The exit status a run whose only incomplete rows stood aside this way ends with:
-    /// 75 (`EX_TEMPFAIL`) for a lock or a wait on someone else, 69 (`EX_UNAVAILABLE`)
-    /// offline, or 77 (`EX_NOPERM`) when a required permission has not been granted.
+    /// Exit status for a run whose only incomplete rows stood aside (`75`, `69`, or `77`).
     #[inline]
     #[must_use]
     pub const fn exit_status(&self) -> u8 {
@@ -297,8 +271,7 @@ pub struct ItemReport {
     /// The value wanted or now held (rendered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    /// Why it failed, is blocked or unknown; for a person step, what to do. A machines
-    /// `exec` row carries its program's standard error here even when it succeeded.
+    /// Failure/block/unknown detail, or what a person step requires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     /// The command that undoes a change.
@@ -309,35 +282,25 @@ pub struct ItemReport {
     /// Family-specific output a caller acts on (a GitHub public key line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    /// The item's layer. `None` on a row no item made (a machines agent's own rows) and
-    /// on a report written before the engine moved here.
+    /// The item's layer (`None` on rows not produced by an item).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<Layer>,
     /// The item's class; `None` as for `layer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<Class>,
-    /// Why the row reads as it does and the one remedy, on every row the run did not
-    /// leave `Ok` or `Changed`.
+    /// Finding and remedy for any row not left `Ok` or `Changed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain: Option<Explain>,
-    /// Set when the apply stood aside (a held lock, no network, missing permission);
-    /// the row is `Blocked`.
+    /// Set when the apply stood aside (`Blocked` on lock, network, or permission).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stood_aside: Option<StoodAside>,
-    /// The item's [`crate::Item::essential`]: whether this row left wrong fails a surface
-    /// using [`ItemReport::fails_surface`]. A surface using [`Readiness`] has a stricter
-    /// rule. A structural fault and an advisory both
-    /// plan a change, so `outcome` alone cannot tell a reader which one decided the exit.
-    /// Written only when true.
+    /// Whether leaving this row wrong fails a surface under [`ItemReport::fails_surface`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub essential: bool,
 }
 
 impl ItemReport {
-    /// Whether this row fails a surface using the essential-item policy: a change that did not land, or an
-    /// essential item the run left other than done (`Ok`, `Changed`), not applicable or
-    /// waiting for an idle Mac. One rule for the surface's exit and for a reader of its
-    /// `--json` (the machines toolset probe) naming the rows that decided it.
+    /// Whether this row fails a surface under the essential-item policy.
     #[inline]
     #[must_use]
     pub const fn fails_surface(&self) -> bool {
@@ -362,19 +325,14 @@ pub enum ReportMode {
     Apply,
     /// Probed and planned; nothing changed (`aterm init --plan`).
     Plan,
-    /// Probed against a surface's rule; nothing changed (`aterm init --check`,
-    /// `aterm pkg doctor`).
+    /// Probed against a surface's rule without changing anything (`--check`, `doctor`).
     Check,
 }
 
-/// Whether the checks in a report are satisfied, independently of a surface's
-/// failure policy. A plan, a manual step or an unreadable state is not green.
-/// Changes explicitly requiring login/restart await activation. This describes the
-/// reported checks, not unmeasured configuration or unobserved running processes.
+/// Readiness summary of reported checks, independent of a surface's failure policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readiness {
-    /// Every reported check is satisfied or explicitly not applicable. An empty
-    /// report is not evidence of readiness.
+    /// Every reported check is satisfied or explicitly not applicable (false if empty).
     pub all_green: bool,
     /// The requested selectors; empty means the surface's full default scope.
     pub scope: Vec<String>,
@@ -382,17 +340,14 @@ pub struct Readiness {
     pub satisfied: usize,
     /// Checks explicitly inapplicable to this host or accepted configuration.
     pub not_applicable: usize,
-    /// Changed configuration awaiting login or restart, according to the row's
-    /// effect. A configured value is not evidence that it is already active.
+    /// Changed configuration awaiting login or restart according to the row's effect.
     pub pending_activation: Vec<String>,
-    /// Stable ids of checks still planned, manual, blocked, deferred, unknown or
-    /// failed. Their report rows carry the evidence and remedies.
+    /// Stable ids of checks still planned, manual, blocked, deferred, unknown, or failed.
     pub unresolved: Vec<String>,
 }
 
 impl Readiness {
-    /// Summarize the evidence in `items`, without changing any outcome or the
-    /// failure policy used by other surfaces.
+    /// Summarize the evidence in `items` without changing outcomes or failure policy.
     #[must_use]
     pub fn of(items: &[ItemReport], scope: &[String]) -> Self {
         let mut readiness = Self {
@@ -425,21 +380,18 @@ impl Readiness {
     }
 }
 
-/// The report of one run, in the one schema `--json` prints on every surface (design
-/// §3.3): `aterm init` and `aterm pkg doctor` today.
+/// Report of one run in the shared `--json` schema ([`SCHEMA`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     /// [`SCHEMA`].
     pub schema: u32,
     /// What was asked.
     pub mode: ReportMode,
-    /// Whether the surface's exit rule held: its exit status is 0 exactly when this is
-    /// true (a stood-aside init exits 75, 69 or 77, never 0).
+    /// Whether the surface's exit rule held (exit status `0` iff `true`).
     pub complete: bool,
     /// One row per item, in run order.
     pub items: Vec<ItemReport>,
-    /// Optional stricter readiness assessment. `aterm doctor` uses this for its
-    /// exit rule; older reports and other surfaces may omit it.
+    /// Optional stricter readiness assessment used by `aterm doctor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<Readiness>,
 }
@@ -597,13 +549,11 @@ mod tests {
 
     #[test]
     fn a_row_written_before_the_new_fields_still_reads() {
-        // A machines agent older than this crate reports rows without them.
         let old = r#"{"id":"power.sleep","family":"power","title":"sleep","outcome":"changed","effect":"now"}"#;
         let r: ItemReport = aterm_json::from_str(old).unwrap();
         assert_eq!(r.outcome, Outcome::Changed);
         assert_eq!((r.layer, r.class), (None, None));
         assert!(r.explain.is_none() && r.stood_aside.is_none() && !r.essential);
-        // And a row without them writes none of their keys, as before.
         let text = aterm_json::to_string(&r).unwrap();
         assert!(
             !text.contains("layer") && !text.contains("explain") && !text.contains("essential"),
@@ -611,10 +561,6 @@ mod tests {
         );
     }
 
-    /// A structural fault and an advisory both plan a change, so `outcome` alone cannot say
-    /// which row made a surface exit 1: only an essential row left wrong does, and a change
-    /// that did not land fails any surface. Done, does not apply and waits for an idle Mac
-    /// never fail it.
     #[test]
     fn only_an_essential_row_left_wrong_fails_its_surface() {
         let mut r = row();
@@ -641,8 +587,6 @@ mod tests {
         }
     }
 
-    /// The one envelope every `--json` surface prints: the schema, the mode, whether the
-    /// surface's exit rule held, and the rows.
     #[test]
     fn a_report_round_trips_in_the_one_schema() {
         let mut advisory = row();

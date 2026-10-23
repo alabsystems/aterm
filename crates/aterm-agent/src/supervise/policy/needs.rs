@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TWO REPORT LINES THE TURN-END POLICY READS BY THEIR HEAD (Autopilot Cruise / Autopilot Land, owner direction 2026-10-19).
+//! Parser for `NEEDS YOU:` and `Nothing left:` report lines read by the turn-end policy.
 
 use std::borrow::Cow;
 
@@ -11,8 +11,7 @@ pub const NEEDS_YOU: &str = "NEEDS YOU:";
 /// The head of the worker's defense that nothing is left to do.
 pub const NOTHING_LEFT: &str = "Nothing left:";
 
-/// [`NEEDS_HINT`] as a literal, for the texts `concat!` builds on it (a
-/// restart's carry-on, `crate::harness::upgrade::CARRY_ON`).
+/// [`NEEDS_HINT`] as a literal, for the texts `concat!` builds on it.
 macro_rules! needs_hint {
     () => {
         "Put what only a person can give on a line starting NEEDS YOU: and carry on."
@@ -23,29 +22,20 @@ pub(crate) use needs_hint;
 /// Appended after the answers aterm types to a question (`super::turn_end::prose_answer`, `super::turn_end::reversible_answer`), and the last sentence of a restart's carry-on.
 pub const NEEDS_HINT: &str = needs_hint!();
 
-/// Appended to the act a point types when a NEW set of needs stands, once a set (`TurnEndState::needs_ack_owed`).
+/// Appended to the act a point types when a NEW set of needs stands, once a set.
 pub const NEEDS_ACK: &str = "Your NEEDS YOU line is on the person's screen now. Do not wait for \
                              it: carry on with everything else.";
 
-/// THE NEED A BARE HEAD NAMES WITH NO WORDS UNDER IT (`NEEDS YOU:` and then another head, a fence or the report's end).
+/// THE NEED A BARE HEAD NAMES WITH NO WORDS UNDER IT.
 pub const UNREAD_NEED: &str = "see the NEEDS YOU line in its report";
 
 /// The most characters one need keeps ([`needs_you`]); a longer one is cut with `…`.
 pub const NEED_CHARS: usize = 160;
 
-/// THE WORDS A NONE OPENS WITH ([`none_clause`]): what a NEEDS YOU line says
-/// first where none stands (`none`, `nothing`, `n/a`, `zero`), lowercased,
-/// and `not` before one of [`NOT_NEEDED`] (`not applicable`, `not needed`).
 const NONE_HEADS: &[&str] = &["none", "nothing", "no", "nope", "nil", "zero", "n/a", "na"];
 
-/// What `not` opens a none with ([`NONE_HEADS`]): `not applicable`, `not
-/// needed`.
 const NOT_NEEDED: &[&str] = &["applicable", "needed", "required", "necessary"];
 
-/// WHAT MAY FOLLOW A NONE WORD IN ITS OWN CLAUSE AND STILL SAY NONE STANDS
-/// ([`none_clause`]): every word after it one of these (`nothing from your
-/// side`, `none at the moment`, `nothing is blocked on you`, `no blockers`,
-/// `nothing for you to do`).
 const NONE_MODS: &[&str] = &[
     "need",
     "needs",
@@ -127,26 +117,12 @@ const NONE_MODS: &[&str] = &[
     "today",
 ];
 
-/// WHAT A NONE MAY SAY IT IS SO FAR ONLY WHERE IT NAMES NOTHING ELSE
-/// ([`none_clause`], [`none_said`]): `none yet`, `nothing so far`, `none
-/// (yet)`. After a word naming what is asked (`no review yet`, `no decision
-/// so far`, `nothing from you yet`) it says that is still awaited: a need.
 const NONE_STILL: &[&str] = &["yet", "so", "far"];
 
-/// What says a thing is no need where a few words name it first (`no review
-/// needed`, `no key or approval needed`): [`none_clause`] passes over at most
-/// [`NONE_OBJECT_WORDS`] words before one of these, none of them
-/// [`NONE_KEEPS`].
 const NONE_NEEDED: &[&str] = &["needed", "required", "necessary"];
 
-/// The most words [`none_clause`] passes over before [`NONE_NEEDED`].
 const NONE_OBJECT_WORDS: usize = 4;
 
-/// The words that bring a need back among the words a none passes over
-/// before [`NONE_NEEDED`] (`no tag but a signature needed`, `no input
-/// besides the key needed`, `no more than a signature needed`, `no tag
-/// only the key needed`, `no tag unless the key needed`, `no tag pending
-/// and the key needed`).
 const NONE_KEEPS: &[&str] = &[
     "but",
     "except",
@@ -171,27 +147,12 @@ const NONE_KEEPS: &[&str] = &[
     "outside",
 ];
 
-/// The none words that may name what is not needed in a few words of
-/// their own before [`NONE_NEEDED`] ([`none_clause`]: `no key or approval
-/// needed`): after any other none (`nothing`, `none`) every word before it
-/// is one of [`NONE_MODS`] (`nothing further needed`), so `nothing only
-/// the key is needed` and `none unless the key is needed` keep the need.
 const NONE_OBJECTS: &[&str] = &["no"];
 
-/// The words that join a new clause to a none's own ([`none_clause`]) where
-/// one of [`NONE_ASKED`] follows: `nothing on my end and I need your input`,
-/// `no blockers or we need your review`, `nothing as I need you to sign` —
-/// each a need, whatever the words after it are.
 const NONE_JOINS: &[&str] = &["and", "or", "as"];
 
-/// What opens a clause of its own after one of [`NONE_JOINS`]: a person who
-/// needs or is asked (`and I need`, `and you sign`, `and your part is to
-/// approve`), or the need itself (`and needs your review`).
 const NONE_ASKED: &[&str] = &["i", "we", "you", "your", "our", "my", "need", "needs"];
 
-/// WHAT A RESTATEMENT AFTER A NONE SAYS LANDED ([`restated`]): `all of it`,
-/// `the fix and the tag`, `#45`, `tests`, `every branch` — a number, one of
-/// these, or after [`RESTATE_THE`] one of [`RESTATE_NAMED`].
 const RESTATE_SUBJECTS: &[&str] = &[
     "all",
     "every",
@@ -214,21 +175,10 @@ const RESTATE_SUBJECTS: &[&str] = &[
     "worktrees",
 ];
 
-/// What a restatement names landed only after [`RESTATE_THE`] (`the release
-/// was already published`, `every branch is merged`): each also reads as
-/// what a person is asked to do where it opens a clause or follows `and`
-/// (`tag all on main`, `merged and release it`), so there it is no
-/// restatement.
 const RESTATE_NAMED: &[&str] = &["change", "fix", "commit", "release", "tag", "branch"];
 
-/// What makes one of [`RESTATE_NAMED`] a thing that landed (`the tag`,
-/// `every branch`).
 const RESTATE_THE: &[&str] = &["the", "every"];
 
-/// What says a restatement's [`LANDED_SAYS`] of what it names (`is merged`,
-/// `has been pushed`, `already merged`), and what ties it to where it is
-/// (`is on origin/main`, `all on origin/main`, `everything in main`): never
-/// what opens a question (`is it merged`).
 const RESTATE_LINKS: &[&str] = &[
     "it's",
     "it’s",
@@ -244,8 +194,6 @@ const RESTATE_LINKS: &[&str] = &[
     "everything",
 ];
 
-/// What a restatement after a none says of the work ([`restated`]): that
-/// it landed, its checks pass, its leftovers are gone, or it is published.
 const LANDED_SAYS: &[&str] = &[
     "landed",
     "merged",
@@ -266,12 +214,8 @@ const LANDED_SAYS: &[&str] = &[
     "gone",
 ];
 
-/// What says where the work is (`on origin/main`, `pushed to origin`,
-/// `merged into main`): one of these before [`RESTATE_PLACES`].
 const RESTATE_AT: &[&str] = &["on", "in", "into", "to"];
 
-/// Where a restatement says the work is, after [`RESTATE_AT`] (`on the
-/// remote main branch`, `to origin/main`, `into master`).
 const RESTATE_PLACES: &[&str] = &[
     "the",
     "remote",
@@ -282,10 +226,6 @@ const RESTATE_PLACES: &[&str] = &[
     "branch",
 ];
 
-/// WHEN A NONE IS SAID FOR, in a clause of its own after it ([`none_said`]):
-/// every word one of these (`nothing — for now`, `none — at the moment`,
-/// `none — at this stage`, `none (today)`), or of [`NONE_STILL`] after a
-/// bare none (`none (yet)`).
 const NONE_TIMES: &[&str] = &[
     "for",
     "now",
@@ -302,9 +242,6 @@ const NONE_TIMES: &[&str] = &[
     "today",
 ];
 
-/// WHAT A CLAUSE AFTER A NONE MAY SAY OF THE PERSON AND STILL ASK NOTHING
-/// ([`you_set`]): `you're` or `you are`, then only these (`nothing, you're
-/// all set`, `none — you are good to go`, `nothing; you're done`).
 const YOU_SET: &[&str] = &[
     "all", "set", "good", "to", "go", "done", "ready", "covered", "fine",
 ];
@@ -352,7 +289,6 @@ struct NoneWords<'a> {
     set: &'a [&'a str],
 }
 
-/// The none reader's word lists.
 const NONE_WORDS: NoneWords<'static> = NoneWords {
     heads: NONE_HEADS,
     not_needed: NOT_NEEDED,
@@ -374,21 +310,12 @@ const NONE_WORDS: NoneWords<'static> = NoneWords {
     set: YOU_SET,
 };
 
-/// The marks that end a clause of a none line ([`none_said`]): `nothing —
-/// everything is on main`, `none; all of it is merged`, `nothing (all
-/// landed)`, `none. Everything is on main.`
 const NONE_CLAUSE_MARKS: &[char] = &[
     '—', '–', ';', ':', ',', '(', ')', '[', ']', '.', '!', '?', '{', '}',
 ];
 
-/// The marks that open a quoted line: a Markdown quote (`>`, a GitHub alert's
-/// `> [!IMPORTANT]`) and the gutter Claude Code draws one in.
 const QUOTE_MARKS: [char; 4] = ['>', '▎', '│', '┃'];
 
-/// `t` past every quote gutter it opens with (`> `, `>> `, `▎ `): a worker
-/// sets its own call-outs as quotes (`> **NEEDS YOU:** sign the release`),
-/// so a NEEDS YOU head in one is a need ([`need_rest`], [`mid_head`]) and
-/// the rows under it are its items or its paragraph.
 fn unquoted(t: &str) -> &str {
     let mut t = t.trim_start();
     while let Some(r) = t.strip_prefix(QUOTE_MARKS) {
@@ -397,26 +324,13 @@ fn unquoted(t: &str) -> &str {
     t
 }
 
-/// What names the head as a thing right after it (`a NEEDS YOU: line`,
-/// `` `NEEDS YOU:` lines ``, `“NEEDS YOU:” heads`): a mention, read only where
-/// an article or a tick or quotation mark opens the token ([`head_from`]).
 const MENTION_NOUNS: &[&str] = &[
     "line", "lines", "head", "heads", "row", "rows", "block", "blocks", "label", "labels", "token",
     "tokens", "prefix", "marker", "markers",
 ];
 
-/// The words that make the NEEDS YOU token right after them a thing named
-/// (`a NEEDS YOU: line`), with a [`MENTION_NOUNS`] word after its separator.
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
 
-/// THE WORDS THAT NAME THE NEEDS YOU TOKEN RIGHT AFTER THEM AS A LINE'S HEAD,
-/// after a word naming a line ([`MENTION_NOUNS`]), never say it, whatever
-/// follows (`put what only a person can give on a line starting NEEDS YOU:
-/// and carry on`, `` a line starting `NEEDS YOU:` reaches the person ``,
-/// `lines beginning with NEEDS YOU:`): aterm's own instruction in every act
-/// it types and in a worker's first prompt, which a screen reads back where
-/// it cannot bound the message (agy, a reply cut above the rows read) and a
-/// worker may quote.
 const HEAD_NAMING: &[&str] = &[
     "starting",
     "starts",
@@ -426,14 +340,8 @@ const HEAD_NAMING: &[&str] = &[
     "headed",
 ];
 
-/// The words that may stand between a [`HEAD_NAMING`] word and the token
-/// (`starting with NEEDS YOU:`, `headed by NEEDS YOU:`).
 const HEAD_NAMING_LINKS: &[&str] = &["with", "by"];
 
-/// Whether `lead`, the words before a NEEDS YOU token past its opening
-/// marks (a row, or the row above one the token opens), ends naming the
-/// token as a line's head: a [`MENTION_NOUNS`] word, a [`HEAD_NAMING`] word,
-/// and a [`HEAD_NAMING_LINKS`] word or none.
 fn names_a_head(lead: &str) -> bool {
     let said: Vec<&str> = lead
         .rsplit(|c: char| !c.is_alphanumeric())
@@ -456,8 +364,6 @@ fn names_a_head(lead: &str) -> bool {
     }
 }
 
-/// `t` past its list marker (`- `, `* `, `+ `, `• `, `1. `, `1) `), if it
-/// has one.
 fn past_marker(t: &str) -> Option<&str> {
     for m in ["- ", "* ", "+ ", "• ", "◦ ", "‣ "] {
         if let Some(rest) = t.strip_prefix(m) {
@@ -471,7 +377,6 @@ fn past_marker(t: &str) -> Option<&str> {
         .map(str::trim_start)
 }
 
-/// `t` past a task list's checkbox (`[ ] `, `[x] `), if it has one.
 fn past_checkbox(t: &str) -> Option<&str> {
     ["[ ]", "[x]", "[X]", "[]"]
         .into_iter()
@@ -480,11 +385,6 @@ fn past_checkbox(t: &str) -> Option<&str> {
         .map(str::trim_start)
 }
 
-/// Whether `c` is a symbol a NEEDS YOU head may be led by ([`need_rest`]): an
-/// emoji or a sign outside ASCII (`🚨`, `⚠️` with its variation selector,
-/// `❗`, `👉`) — never a letter or digit, a quote's gutter ([`QUOTE_MARKS`]),
-/// a quotation mark (the head named in quotes is not said), a tool output's
-/// gutter (`⎿`) or a box's rule: those are someone else's words.
 fn leads_need(c: char) -> bool {
     !c.is_ascii()
         && !c.is_alphanumeric()
@@ -510,9 +410,6 @@ fn leads_need(c: char) -> bool {
         && !('\u{2500}'..='\u{257F}').contains(&c)
 }
 
-/// `t` past every mark a NEEDS YOU head may be led by ([`need_rest`]), in any
-/// order: a Markdown heading's marks, a list marker, a checkbox, emphasis and
-/// leading emoji.
 fn past_need_lead(t: &str) -> &str {
     let mut t = t.trim_start();
     loop {
@@ -538,11 +435,6 @@ fn past_need_lead(t: &str) -> &str {
     }
 }
 
-/// THE NEEDS YOU TOKEN AT THE START OF `t` ([`need_rest`], [`mid_head`]),
-/// however its two words are joined (`NEEDS YOU`, `NEEDS-YOU`, `NEEDS_YOU`,
-/// two spaces, a no-break space) and with `NEED` for `NEEDS` (`NEED YOU:
-/// sign the release`), any case: how far it runs, and whether it is in
-/// capitals as the convention spells it.
 fn needs_token(t: &str) -> Option<(usize, bool)> {
     let need = t.get(..4).filter(|w| w.eq_ignore_ascii_case("need"))?;
     let s = usize::from(t[4..].starts_with(['s', 'S']));
@@ -559,9 +451,6 @@ fn needs_token(t: &str) -> Option<(usize, bool)> {
     Some((word + 3 + gap, capitals))
 }
 
-/// `NEEDS YOUR INPUT: …` past `t`'s `YOUR` (`rest`, just after the token):
-/// one to three words naming what is asked of the person (letters, `-`,
-/// `'`), then a separator ([`past_separator`]), closing emphasis dropped.
 fn your_head(rest: &str) -> Option<&str> {
     let words = rest
         .get(1..)
@@ -579,9 +468,6 @@ fn your_head(rest: &str) -> Option<&str> {
     past_separator(words[end..].trim_start()).map(str::trim)
 }
 
-/// What a NEEDS YOU head's token runs into ([`head_from`]): a separator
-/// (`:`, `—`, `–`, `--`, `...`, `…`, `-` before a space, an arrow `→`, `->`
-/// or `=>`), and in capitals a `!`, `;` or `?` too (`NEEDS YOU? Yes: renew the cert`).
 fn need_separator(rest: &str, capitals: bool) -> Option<&str> {
     rest.strip_prefix("--")
         .or_else(|| rest.strip_prefix("..."))
@@ -595,21 +481,10 @@ fn need_separator(rest: &str, capitals: bool) -> Option<&str> {
         .or_else(|| rest.strip_prefix(['!', ';', '?']).filter(|_| capitals))
 }
 
-/// What follows the [`NEEDS_YOU`] head where it is the first text of `line`
-/// past its quote gutters and the marks [`past_need_lead`] passes over,
-/// trimmed: the need's words, `""` for a head with none on its line (what it
-/// heads is under it), or the qualifier in parentheses where that is all it
-/// says and it says none stands (`NEEDS YOU (none)`).
 fn need_rest(line: &str) -> Option<&str> {
     head_from(past_need_lead(unquoted(line)), false)
 }
 
-/// THE NEEDS YOU HEAD THAT `t` OPENS WITH, past its lead ([`need_rest`],
-/// [`mid_head`]): the emphasis that closes it, a qualifier in parentheses or
-/// brackets (`(blocking)`, `[owner]`) or after a comma before its separator
-/// (`NEEDS YOU, owner:` — a few words, letters only; in capitals any other
-/// comma is a separator) and one separator ([`need_separator`]) are dropped;
-/// what follows.
 fn head_from(t: &str, named: bool) -> Option<&str> {
     let wrap = t.chars().next().filter(|c| matches!(c, '[' | '|' | '`'));
     let t = match wrap {
@@ -732,8 +607,6 @@ fn head_from(t: &str, named: bool) -> Option<&str> {
     }
 }
 
-/// `t` past the marks of a Markdown heading (`## `), and whether it had
-/// them.
 fn past_heading(t: &str) -> (&str, bool) {
     let hashes = t.bytes().take_while(|b| *b == b'#').count();
     match t.get(hashes..) {
@@ -744,8 +617,6 @@ fn past_heading(t: &str) -> (&str, bool) {
     }
 }
 
-/// What a head's words may carry before their separator: [`NOTHING_LEFT`]'s
-/// `to do` and `to land` (`Nothing left to do:`).
 fn head_words(head: &str) -> &'static [&'static str] {
     if head == NOTHING_LEFT {
         &[" to do", " to land"]
@@ -754,8 +625,6 @@ fn head_words(head: &str) -> &'static [&'static str] {
     }
 }
 
-/// `rest` past the separator that closes a head: its colon, or a dash
-/// (`—`, `–`, or `-` before a space).
 fn past_separator(rest: &str) -> Option<&str> {
     rest.strip_prefix(':')
         .or_else(|| rest.strip_prefix('—'))
@@ -766,11 +635,6 @@ fn past_separator(rest: &str) -> Option<&str> {
         })
 }
 
-/// What follows `head` (the defense's [`NOTHING_LEFT`]; a NEEDS YOU head is
-/// [`need_rest`]'s) where it is the first text of `line` past any Markdown
-/// heading's marks, list marker and emphasis, matched case-insensitively: the
-/// rest after its separator (a colon, or a dash: `Nothing left — all of it is
-/// merged`), trimmed, the emphasis that closes the head dropped.
 fn head_rest<'a>(line: &'a str, head: &str) -> Option<&'a str> {
     let t = line.trim_start();
     if t.starts_with(QUOTE_MARKS) {
@@ -832,7 +696,6 @@ pub(super) fn code_fence(line: &str) -> Option<(u8, usize, &str)> {
     (width >= 3).then(|| (mark, width, &line[width..]))
 }
 
-/// Whether `line` is a fence run (its role depends on the open block).
 fn fence(line: &str) -> bool {
     code_fence(line).is_some()
 }
@@ -854,10 +717,6 @@ pub(super) fn fenced_line(line: &str, open: &mut Option<(u8, usize)>) -> bool {
     false
 }
 
-/// The words of one clause of a none line ([`none_said`]), lowercased: runs
-/// of letters, digits, `/` (`n/a`, `origin/main`), `'` and a joining `-`
-/// (`sign-off`), their outer marks dropped; emphasis, backticks and `#` are
-/// no word.
 fn clause_words(clause: &str) -> Vec<&str> {
     clause
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '\'' | '’' | '-')))
@@ -866,14 +725,6 @@ fn clause_words(clause: &str) -> Vec<&str> {
         .collect()
 }
 
-/// WHETHER A CLAUSE OF A NONE LINE SAYS NONE STANDS, by its words
-/// ([`clause_words`]): a none word first ([`NONE_HEADS`], `not` before
-/// [`NOT_NEEDED`]), then only words it negates ([`NONE_MODS`]: `nothing
-/// from your side`, `none at the moment`), where at most
-/// [`NONE_OBJECT_WORDS`] words before [`NONE_NEEDED`] may name what is not
-/// needed after `no` ([`NONE_OBJECTS`]: `no key or approval needed`) unless
-/// one brings a need back ([`NONE_KEEPS`]), or only [`NONE_STILL`] (`none
-/// yet`, `nothing so far`).
 fn none_clause(words: &[&str], by: &NoneWords<'_>) -> bool {
     let (head, rest) = match words {
         ["not", w, rest @ ..] if by.not_needed.contains(w) => ("not", rest),
@@ -903,9 +754,6 @@ fn none_clause(words: &[&str], by: &NoneWords<'_>) -> bool {
     rest.iter().all(|w| by.mods.contains(w))
 }
 
-/// WHETHER A CLAUSE AFTER A NONE SAYS ONLY THAT THE PERSON IS SET
-/// ([`none_said`]), by its words ([`clause_words`]): `you're` (or `you are`),
-/// then only [`YOU_SET`] (`you're all set`, `you are good to go`).
 fn you_set(words: &[&str], by: &NoneWords<'_>) -> bool {
     let rest = match words {
         ["you're" | "you’re", rest @ ..] | ["you", "are", rest @ ..] => rest,
@@ -914,14 +762,6 @@ fn you_set(words: &[&str], by: &NoneWords<'_>) -> bool {
     !rest.is_empty() && rest.iter().all(|w| by.set.contains(w))
 }
 
-/// WHETHER A CLAUSE AFTER A NONE ONLY RESTATES THE LANDING ([`none_said`]),
-/// by its words in order: what landed ([`RESTATE_SUBJECTS`], a number, or
-/// [`RESTATE_NAMED`] after [`RESTATE_THE`]: `all of it`, `the fix`, `#45`),
-/// then how it is said ([`RESTATE_LINKS`]: `is`, `has been`, `already`),
-/// then what it says ([`LANDED_SAYS`]: `merged`, `clean`) or, tied by a link,
-/// where it is ([`RESTATE_AT`] before [`RESTATE_PLACES`]: `is on
-/// origin/main`, `all on main`), then only more of the same (`and pushed`,
-/// `to origin/main`) or a time ([`NONE_TIMES`]: `now`).
 fn restated(words: &[&str], by: &NoneWords<'_>) -> bool {
     let mut k = 0;
     while let Some(w) = words.get(k) {
@@ -969,15 +809,10 @@ fn restated(words: &[&str], by: &NoneWords<'_>) -> bool {
     true
 }
 
-/// Whether what a NEEDS YOU line says is that none stands ([`none_said`]).
 fn says_none(rest: &str) -> bool {
     none_said(rest, &NONE_WORDS).is_some()
 }
 
-/// WHAT A NEEDS YOU LINE SAYS WHERE IT SAYS NONE STANDS: `Some(clause)` —
-/// the words after its none, if any (`""` for none), which no need names
-/// and which the readers of open work still read ([`without_needs`]) —
-/// else `None`, a need.
 fn none_said(rest: &str, by: &NoneWords<'_>) -> Option<String> {
     let cleaned: String = rest.chars().filter(|c| *c != '`').collect();
     let cleaned = cleaned.trim().to_string();
@@ -1066,8 +901,6 @@ struct NeedLines {
 }
 
 impl NeedLines {
-    /// The line at `at` said none stands, `clause` after its none (empty
-    /// for none).
     fn none_at(&mut self, at: usize, clause: String) {
         self.cleared = true;
         if !clause.is_empty() {
@@ -1075,8 +908,6 @@ impl NeedLines {
         }
     }
 
-    /// What the line at `at` says in `words`: none ([`none_said`] by the
-    /// word lists `by`), or a need.
     fn said(&mut self, at: usize, words: &str, by: &NoneWords<'_>) {
         match none_said(words, by) {
             Some(clause) => self.none_at(at, clause),
@@ -1085,23 +916,15 @@ impl NeedLines {
     }
 }
 
-/// Whether `line` opens a head of its own: a NEEDS YOU head ([`need_rest`])
-/// or a defense ([`defense_rest`]).
 fn a_head(line: &str) -> bool {
     need_rest(line).is_some() || defense_rest(line).is_some()
 }
 
-/// Whether row `under` is a paragraph a bare head names its need by: not
-/// blank, no fence, and no head of its own, past any quote gutter
-/// ([`unquoted`]).
 fn paragraph(under: &str) -> bool {
     let t = unquoted(under).trim_end();
     !t.is_empty() && !fence(t) && !a_head(under)
 }
 
-/// Whether row `next` continues the need above it as its wrap: not blank, no
-/// list item, no head of its own, and opening with a small letter or a digit
-/// after a need that ends with no full stop, past any quote gutter.
 fn wraps(need: &str, next: &str) -> bool {
     let t = unquoted(next).trim_end();
     !t.is_empty()
@@ -1114,23 +937,10 @@ fn wraps(need: &str, next: &str) -> bool {
         && !need.trim_end().ends_with(['.', '!', '?', ':'])
 }
 
-/// The marks that may open a NEEDS YOU token past a line's start
-/// ([`mid_head`]): emphasis, a tick, a bracket.
 const MID_OPENS: &[char] = &['*', '_', '`', '['];
 
-/// The quotation marks that may open a NEEDS YOU token past a line's start
-/// ([`mid_head`]): they make it a thing named (`“NEEDS YOU:” lines`).
 const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
 
-/// A NEEDS YOU HEAD PAST THE START OF `row` (FAIL TOWARD A KEPT NEED): the
-/// token in capitals ([`needs_token`]: `NEEDS YOU`, `NEED YOU`) as a whole
-/// word anywhere on the row — after a sentence of its own (`Nothing left:
-/// all on origin/main. NEEDS YOU: publish the crate`), inside one (`One
-/// thing NEEDS YOU: the promote`, `- release: NEEDS YOU: sign 3.4.0`,
-/// `Nothing left (NEEDS YOU: the grant)`), in ticks or quotation marks, in a
-/// quoted line — where a separator, a qualifier or a comma follows it, past
-/// its closing marks; [`head_from`] reads the rest, and drops the one
-/// mention (`the primer says a NEEDS YOU: line reaches the person`).
 fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
     if unquoted(row).starts_with('⎿') {
         return None;
@@ -1182,11 +992,6 @@ fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
     })
 }
 
-/// THE LIST RIGHT UNDER A HEAD WITH WORDS ON ITS LINE THAT NAME NO NEED OF
-/// THEIR OWN (the head at row `head`, its list from row `i`): words that end in
-/// a colon (`NEEDS YOU: two things:`), whose items are the needs, or words that
-/// say none, whose items are read too: `NEEDS YOU: none` over `- the signing
-/// key` names the key (FAIL TOWARD A KEPT NEED).
 fn items_under(
     rows: &[&str],
     (head, mut i): (usize, usize),
@@ -1223,12 +1028,10 @@ fn items_under(
     (i, items)
 }
 
-/// The NEEDS YOU lines of `tail`, outside its fenced code blocks.
 fn needs_lines(tail: &str) -> NeedLines {
     needs_lines_by(tail, &NONE_WORDS)
 }
 
-/// [`needs_lines`], a none read by the word lists `by` ([`NoneWords`]).
 fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
     let rows: Vec<&str> = tail.lines().collect();
     let mut out = NeedLines::default();
@@ -1348,9 +1151,6 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
     out
 }
 
-/// One need as aterm shows it: control characters dropped, whitespace
-/// collapsed, emphasis marks at its ends dropped, at most [`NEED_CHARS`]
-/// characters (`…` after a cut).
 fn sanitized(need: &str) -> String {
     let clean: String = need
         .chars()
@@ -1380,7 +1180,7 @@ pub fn needs_you(tail: &str) -> Vec<String> {
     out
 }
 
-/// Whether `tail` says no need stands: a `NEEDS YOU: nothing` (or `none`) line, and no need named beside it.
+/// Whether `tail` says no need stands.
 #[must_use]
 pub fn says_no_needs(tail: &str) -> bool {
     let read = needs_lines(tail);
@@ -1420,7 +1220,6 @@ pub fn without_needs(tail: &str) -> Cow<'_, str> {
     Cow::Owned(kept.join("\n"))
 }
 
-/// `text` with its first letter a capital.
 fn capitalized(text: &str) -> String {
     let mut cs = text.chars();
     match cs.next() {
@@ -1429,9 +1228,6 @@ fn capitalized(text: &str) -> String {
     }
 }
 
-/// The words that make an exception to a defense where they open what
-/// follows its head ([`excepted`]): `Nothing left but the changelog`,
-/// `Nothing left: besides tagging`.
 const DEFENSE_EXCEPTIONS: &[&str] = &[
     "except for",
     "except",
@@ -1453,9 +1249,6 @@ const DEFENSE_EXCEPTIONS: &[&str] = &[
     "minus",
 ];
 
-/// What `rest` (a defense's words after its head) leaves where it opens with
-/// an exception ([`DEFENSE_EXCEPTIONS`]): `but the changelog` leaves `the
-/// changelog`. `None` where it opens with none, or none is named after it.
 fn excepted(rest: &str) -> Option<&str> {
     let rest = rest.trim_start_matches(['*', '_', ',']).trim_start();
     DEFENSE_EXCEPTIONS.iter().find_map(|w| {
@@ -1473,14 +1266,6 @@ fn excepted(rest: &str) -> Option<&str> {
     })
 }
 
-/// What `line` says after its [`NOTHING_LEFT`] head: its
-/// rest after the separator ([`head_rest`]: `Nothing left: all on
-/// origin/main`), or — where the head runs straight into an exception, with
-/// no separator (`Nothing left but the changelog`, `Nothing left besides
-/// tagging`, `Nothing left to do, except the docs`), or its rest opens with
-/// one (`Nothing left: but the changelog`) — that exception said as one
-/// (`except the changelog`, [`excepted`]): a defense that names its own
-/// leftover, which Land's strict reading reads open and its nudge names.
 fn defense_rest(line: &str) -> Option<Cow<'_, str>> {
     let except = |left: &str| Cow::Owned(format!("except {left}"));
     if let Some(rest) = head_rest(line, NOTHING_LEFT) {
@@ -1570,7 +1355,7 @@ pub(super) enum NeedsRow {
     Headless(String),
 }
 
-/// The rows of the needs table: each whole report with what it must read as, a literal `\n` in a row a line break.
+/// The rows of the needs table.
 #[cfg(test)]
 pub(super) fn needs_table() -> Vec<(NeedsRow, String)> {
     include_str!("fixtures/needs-table.txt")

@@ -29,7 +29,9 @@ pub use walk::{
     Walker, diskwalk_size_full, entry_count_of, list_one_level,
 };
 
-#[cfg(test)]
+// Both read Unix spellings (`/Users//a`, which Windows reads as relative); off Unix every
+// walk is `Refusal::Unsupported`.
+#[cfg(all(test, unix))]
 #[path = "lib_tests.rs"]
 mod tests;
 #[cfg(all(test, unix))]

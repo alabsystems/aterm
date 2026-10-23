@@ -336,7 +336,7 @@ where
     guarded_waking(ctx, scope, verb, key, &|| {}, attempt)
 }
 
-/// [`guarded`], calling `wake` (the control worker's, for this session's watchers) once the session log's readers are owed one: an `in-doubt` mark was written, after its timeline hold was released.
+/// `guarded`, calling `wake` (the control worker's, for this session's watchers) once the session log's readers are owed one: an `in-doubt` mark was written, after its timeline hold was released.
 pub(crate) fn guarded_waking<F>(
     ctx: &SessionCtx,
     scope: crate::control::Scope,
@@ -388,18 +388,10 @@ pub(crate) fn record_in_doubt(ctx: &SessionCtx, verb: &str, key: Key, reply: &st
         .map(|t| t.as_str().to_string())
         .unwrap_or_default();
     let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    tl.record(
-        "in-doubt",
-        format!(
-            "producer={} seq={} reply={}",
-            key.producer,
-            key.seq,
-            aterm_control::wire::pct_encode(&why)
-        ),
-    );
     let at = tl.slog().now();
     tl.slog_mut()
         .observe_in_doubt(verb, key.producer, key.seq, &why, at);
+    tl.record("in-doubt");
     tl.slog_take_wake()
 }
 

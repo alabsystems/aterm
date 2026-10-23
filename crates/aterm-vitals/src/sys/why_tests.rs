@@ -8,8 +8,8 @@ use crate::events::{Event, EventKind};
 use crate::explain::fixtures::{
     Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, build_start_1032, calm_1510,
     delegated_1032, delegated_in_aterm_1032, finished_1032, lane_off_1032, liar_1032, reaped_1032,
-    spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032, tab2_build_1048, two_coalitions_1421,
-    wrapped_1218,
+    reaped_1510, spotlight_1032, spotlight_late_1032, tab, tab_ahead_1032, tab2_build_1048,
+    two_coalitions_1421, wrapped_1218,
 };
 use crate::explain::{CoalLane, LeadIdentity, Voucher};
 use crate::model::{MemCounters, MemSample, Pressure, Thermal, Vitals};
@@ -700,6 +700,30 @@ fn each_cause_says_its_own_words() {
     assert!(
         unexplained.ends_with(" part=aterm sure=held src=derived"),
         "{t}"
+    );
+
+    let t = why_of(&reaped_1510(), "why");
+    assert!(
+        t.contains("; no cause aterm can name: unaccounted; "),
+        "{t}"
+    );
+    let lost = cause(&t, "unexplained");
+    assert!(
+        lost.starts_with("cause id=unexplained covers_mc=1500 "),
+        "{t}"
+    );
+    assert!(
+        lost.ends_with(" part=unaccounted sure=held src=derived"),
+        "{t}"
+    );
+    assert!(
+        t.contains("\ncannot what=remedy why=unsupported\n") && !t.contains("\ndo "),
+        "a core no coalition held is never nothing needed: {t}"
+    );
+    let calm = why_of(&calm_1510(), "why cpu");
+    assert!(
+        calm.contains("\ndo class=none may=agent destructive=0\n"),
+        "{calm}"
     );
 
     let mut busy = calm_1510();

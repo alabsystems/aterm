@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl privacy` and `await consent` (design §5.1, §5.3): the verbs' grammar, their one main-thread hop each, and the wait.
+//! `aterm ctl privacy` and `await consent` (design §5.1, §5.3).
 
 use std::time::{Duration, Instant};
 
@@ -19,19 +19,12 @@ use crate::privacy_report::{PrivacyAppFacts, PrivacyForm, cmd_privacy_json};
 use crate::signing_identity::signing_identity;
 use crate::{App, Wake};
 
-/// `await consent`'s default deadline. Finite on purpose: the system dialog it
-/// waits behind never expires (§1.4), so an autonomous agent must not park on
-/// an absent human forever.
 const AWAIT_CONSENT_DEFAULT_MS: u64 = 300_000;
 
-/// The ceiling every wait verb in this file shares with `await`/`ready`.
 const AWAIT_MAX_MS: u64 = 600_000;
 
-/// The longest `await consent` parks between two reads of the store's exit
-/// probe.
 const CONSENT_EXIT_POLL: Duration = crate::control::HANGUP_POLL;
 
-/// Refusal for a selector on an instance-wide verb.
 const NO_SELECTOR: &str = "ERR privacy is instance-wide and takes no selector\n";
 
 /// `privacy [--json]`: the macOS consent posture, instance-wide.
@@ -50,8 +43,6 @@ pub(crate) fn cmd_privacy(
     })
 }
 
-/// `privacy` past its grammar. `hop` is the one main-thread hop, taken once
-/// (it is `FnOnce`), and its error is the reply.
 fn privacy(
     form: PrivacyForm,
     hop: impl FnOnce() -> Result<PrivacyAppFacts, MainHopError>,
@@ -76,8 +67,6 @@ fn privacy(
     }
 }
 
-/// The verb's grammar: the `--json` flag (read off the request by the dispatch,
-/// `json`) and nothing else; anything else is `ERR usage`.
 fn parse_privacy_form(json: bool, rest: &str) -> Result<PrivacyForm, String> {
     let unknown: Vec<&str> = rest.split_whitespace().collect();
     if !unknown.is_empty() {
@@ -107,7 +96,7 @@ pub(crate) enum ConsentTuple {
         fda: FdaState,
         attribution: Attribution,
     },
-    /// The debugger rule's tuple, `kind=debugger`: `debugger_mode=` alone in this build (`debugger_pending=` joins when aterm watches for a waiting password request, design §4.4).
+    /// The debugger rule's tuple.
     Debugger { mode: DebuggerMode },
 }
 
@@ -192,8 +181,6 @@ impl ConsentWait {
     }
 }
 
-/// What a Full Disk Access reading says about one session's tuple under
-/// `policy`: a probe still out has no tuple yet.
 fn fda_observation(
     policy: &ConsentPolicy,
     observed: Attribution,
@@ -210,9 +197,6 @@ fn fda_observation(
     })
 }
 
-/// What a debugger reading says. One that observed no mode (a probe still
-/// out, a closed gate, a refused or failed run, an inert instance) is not an
-/// observation, so it can neither arm the baseline nor latch.
 const fn debugger_observation(probe: DebuggerProbe) -> ConsentObservation {
     match probe.mode {
         DebuggerMode::Unknown => ConsentObservation::Pending,
@@ -220,7 +204,7 @@ const fn debugger_observation(probe: DebuggerProbe) -> ConsentObservation {
     }
 }
 
-/// Read one session's Full Disk Access tuple off the event loop, under the published `[privacy]` policy, with the next instant a read could see something new (the slot's refresh schedule; `None` under a closed gate or on an inert instance).
+/// Read one session's Full Disk Access tuple off the event loop.
 pub(crate) fn observe_fda(
     consent: &ConsentState,
     observed: Attribution,
@@ -236,7 +220,7 @@ pub(crate) fn observe_fda(
     (fda_observation(&policy, observed, probe), due)
 }
 
-/// Read the debugger rule's tuple off the event loop: the cached answer, and one bounded worker only when it is older than its TTL or was retired, never a probe per read.
+/// Read the debugger rule's tuple off the event loop.
 pub(crate) fn observe_debugger(
     consent: &ConsentState,
     now: Instant,
@@ -251,26 +235,17 @@ pub(crate) fn observe_debugger(
     (debugger_observation(row.probe()), due)
 }
 
-/// What a consent wait reads besides the consent state. A control worker
-/// passes the real ones ([`cmd_await_consent`]); the tests drive a fake clock
-/// through the same loop.
 struct WaitEnv<'a> {
     /// The clock the deadline and `elapsed_ms=` are read on.
     now: &'a dyn Fn() -> Instant,
     /// Whether the addressed session ended (the store's exit probe).
     exited: &'a dyn Fn() -> bool,
-    /// Whether the caller closed its connection
-    /// ([`crate::control::caller_hung_up`]).
+    /// Whether the caller closed its connection ([`crate::control::caller_hung_up`]).
     hung_up: &'a dyn Fn() -> bool,
-    /// How long a requested park may block ([`crate::control::hangup_park`]),
-    /// so a hang-up is noticed within `HANGUP_POLL`.
+    /// How long a requested park may block ([`crate::control::hangup_park`]).
     park: &'a dyn Fn(Duration) -> Duration,
 }
 
-/// The wait, with no main-thread hop in it: read, decide, then park on the
-/// consent state's publications until a kind in `watch` changes, the read's
-/// refresh falls due, [`CONSENT_EXIT_POLL`] passes (the next exit check), or
-/// the deadline passes.
 fn run_consent_wait(
     mut wait: ConsentWait,
     watch: &[ChangeKind],
@@ -313,15 +288,14 @@ fn run_consent_wait(
 /// What `await consent`'s one main-thread hop brings back ([`App::arm_consent_wait`]).
 #[derive(Debug)]
 pub(crate) struct ConsentArm {
-    /// The instance's consent state, observed from the control worker from
-    /// then on.
+    /// The instance's consent state, observed from the control worker from then on.
     consent: ConsentState,
     /// The target's adoption record; `None` when it is not in the pool.
     adoption: Option<Attribution>,
 }
 
 impl App {
-    /// `await consent`'s one main-thread hop (`Wake::ArmConsentWait`): a handle on the consent state and the target's adoption record, read from the pool.
+    /// `await consent`'s one main-thread hop (`Wake::ArmConsentWait`).
     pub(crate) fn arm_consent_wait(&self, session: u64) -> ConsentArm {
         ConsentArm {
             consent: self.consent.clone(),
@@ -330,8 +304,6 @@ impl App {
     }
 }
 
-/// `await consent` past its grammar: one hop at arm (`arm`), then the wait
-/// off the event loop.
 fn await_consent(
     args: ConsentArgs,
     authorized: bool,
@@ -417,9 +389,6 @@ struct ConsentArgs {
     timeout_ms: u64,
 }
 
-/// `[kind=debugger] [timeout=<ms> | timeout <ms>]` in any order. The timeout
-/// defaults to [`AWAIT_CONSENT_DEFAULT_MS`] for both kinds and is capped at
-/// [`AWAIT_MAX_MS`], the ceiling the rest of the wait family shares.
 fn parse_consent_args(rest: &str) -> Result<ConsentArgs, String> {
     const USAGE: &str = "ERR usage: await consent [kind=debugger] [timeout=<ms>]\n";
     let toks: Vec<&str> = rest.split_whitespace().collect();
@@ -457,7 +426,6 @@ mod tests {
 
     use super::*;
 
-    /// A headless instance's consent state with its inert arms flagged live.
     fn synthetic_state() -> ConsentState {
         let mut state = ConsentState::inert();
         state.probes_for_test().live = true;
@@ -468,10 +436,6 @@ mod tests {
         consent::classify_probe(consent::ProbeOutcome::Ok)
     }
 
-    /// `privacy` past its grammar takes its one hop: a failed hop is the reply,
-    /// as it was before any slot is read; a served one is rendered in the form
-    /// asked, `OK <n>` counting the lines, the JSON form carrying its own
-    /// `OK 1`.
     #[test]
     fn a_failed_privacy_hop_is_the_reply() {
         assert_eq!(
@@ -494,9 +458,6 @@ mod tests {
         assert_eq!(json.lines().count(), 2, "{json}");
     }
 
-    /// The verb's grammar: the flag the dispatch read (`control::json_ask` takes
-    /// both spellings off the request), and a usage error for anything left, with
-    /// the flag or without.
     #[test]
     fn the_verb_takes_only_the_json_flag() {
         assert_eq!(parse_privacy_form(false, ""), Ok(PrivacyForm::Lines));
@@ -510,10 +471,6 @@ mod tests {
         }
     }
 
-    /// `await consent`'s deadline: finite by default (the dialog it waits
-    /// behind never expires) and capped with the rest of the wait family, for
-    /// either kind and in either order; an unknown kind is the usage line,
-    /// never a silent fall back to the FDA tuple.
     #[test]
     fn await_consent_has_a_finite_default_and_a_shared_ceiling() {
         let args = |kind, timeout_ms| Ok(ConsentArgs { kind, timeout_ms });
@@ -548,8 +505,6 @@ mod tests {
         }
     }
 
-    /// A debugger reading that observed no mode is pending, which the waiter
-    /// treats as neither a baseline nor a change.
     #[test]
     fn a_debugger_reading_with_no_mode_is_pending_to_the_waiter() {
         for label in [
@@ -566,9 +521,6 @@ mod tests {
         }
     }
 
-    /// The tuple `await consent` arms on is the three values the contract
-    /// names, rendered as the reply spells them, and a change in ANY of them
-    /// is a change.
     #[test]
     fn the_await_baseline_is_the_whole_consent_tuple() {
         let tuple = |fs_consent, fda, attribution| ConsentTuple::Fda {
@@ -770,10 +722,6 @@ mod tests {
         }
     }
 
-    /// The fake environment the wait tests drive: a clock that moves only
-    /// when the loop parks, by what `park` grants of the request; every
-    /// requested park recorded, and every read counted (the exit check runs
-    /// once per read).
     struct FakeWait {
         clock: std::cell::Cell<Instant>,
         reads: std::cell::Cell<usize>,
@@ -789,8 +737,6 @@ mod tests {
             }
         }
 
-        /// Run `wait` with `grant` deciding how far a requested park moves
-        /// the clock; the real park then blocks for nothing.
         fn run(
             &self,
             exited: &dyn Fn(usize) -> bool,
@@ -814,9 +760,6 @@ mod tests {
         }
     }
 
-    /// `await consent` takes one main-thread hop, at arm, however long it
-    /// waits: the loop after it reads the handed state on the worker and
-    /// parks until the slot's refresh falls due or the next exit check.
     #[test]
     fn await_consent_takes_one_hop_however_long_it_waits() {
         let state = synthetic_state();
@@ -889,11 +832,6 @@ mod tests {
         );
     }
 
-    /// How a consent wait ends besides a latch or its deadline: a caller that
-    /// may not read the session gets `ERR exited` and no hop; a failed hop is
-    /// its reason; a session not in the pool, or one the store's exit probe
-    /// reports ended mid-wait, is `ERR exited`; a caller that hung up gets the
-    /// hang-up reply.
     #[test]
     fn a_consent_wait_ends_with_its_session_its_caller_or_its_hop() {
         let state = ConsentState::inert();
@@ -939,8 +877,6 @@ mod tests {
         assert_eq!(wait(&|_| false, false, true, &live), "OK timeout\n");
     }
 
-    /// End to end on real threads: a waiter parked on its baseline latches
-    /// when focus retires the grant and the next probe answers differently.
     #[test]
     fn await_consent_latches_on_a_focus_retire_and_regrant() {
         use std::sync::atomic::AtomicBool;

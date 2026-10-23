@@ -1515,14 +1515,14 @@ impl App {
         self.tell_story_by(session, verb, aterm_slog::Actor::Ctl)
     }
 
-    /// [`Self::tell_story`] told by `by` (the wire's `log_actor`, carried in `Wake::Story`).
+    /// `Self::tell_story` told by `by` (the wire's `log_actor`, carried in `Wake::Story`).
     pub(crate) fn tell_story_by(
         &mut self,
         session: u64,
         verb: StoryVerb,
         by: aterm_slog::Actor,
     ) -> Result<u64, &'static str> {
-        let seq = drive::tell(self, session, verb).ok_or("no such session")?;
+        let seq = drive::tell(self, session).ok_or("no such session")?;
         let word = StoryVerb::TOLD_WORDS
             .into_iter()
             .find(|w| StoryVerb::parse_told(w) == Some(verb))

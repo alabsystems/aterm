@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REST transport tests against `agh-fake`'s loopback GitHub via `/usr/bin/curl`.
+//! REST transport tests against `agh-fake`'s loopback GitHub via the platform's curl
+//! ([`crate::http::CURL_BIN`]).
 
 use super::*;
 use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec, token};
@@ -9,6 +10,8 @@ use std::sync::Mutex;
 
 const SLUG: &str = "fixture-dev/app";
 const LOGIN: &str = "fixture-dev-bot";
+/// Where a control curl writes the answer it discards.
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 /// One curl a client started.
 #[derive(Clone, Debug)]
@@ -110,6 +113,8 @@ fn the_token_rides_stdin_and_never_argv_or_the_environment() {
     let spawned = recorder.spawned();
     assert_eq!(spawned.len(), 1);
     let curl = &spawned[0];
+    assert_eq!(curl.program, crate::http::CURL_BIN);
+    #[cfg(unix)]
     assert_eq!(curl.program, "/usr/bin/curl", "never a PATH lookup");
     assert_eq!(
         curl.args.first().map(String::as_str),
@@ -169,8 +174,8 @@ fn a_hostile_curlrc_is_never_read() {
         .unwrap();
     let planted = |seen: &[agh_fake::Seen]| seen.iter().any(|s| s.header("x-planted").is_some());
     assert!(!planted(&fake.seen()), "-q kept the curlrc out");
-    let mut bare = aterm_uds::spawnfd::command("/usr/bin/curl");
-    bare.args(["-sS", "-o", "/dev/null", "-H", "User-Agent: control"])
+    let mut bare = aterm_uds::spawnfd::command(crate::http::CURL_BIN);
+    bare.args(["-sS", "-o", NULL_DEVICE, "-H", "User-Agent: control"])
         .arg(format!("http://127.0.0.1:{}/rate_limit", fake.ports().api))
         .env("CURL_HOME", home.path())
         .env("HOME", home.path());
@@ -462,11 +467,12 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
     let url = rest.uploads(&format!(
         "/repos/fixture-dev/app/releases/{id}/assets?name=a.bin"
     ));
+    let dot = |rest: &str| format!(".{}{rest}", std::path::MAIN_SEPARATOR);
     for (given, spelled) in [
-        ("-", "./-"),
-        (".", "./."),
-        ("dist/a.bin", "./dist/a.bin"),
-        ("/abs/a[1-2].bin", "/abs/a[1-2].bin"),
+        ("-", dot("-")),
+        (".", dot(".")),
+        ("dist/a.bin", dot("dist/a.bin")),
+        ("/abs/a[1-2].bin", "/abs/a[1-2].bin".to_owned()),
     ] {
         let argv = rest
             .prepare(&Request {
@@ -479,7 +485,8 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
             .unwrap()
             .argv();
         assert!(
-            argv.windows(2).any(|w| w == ["--upload-file", spelled]),
+            argv.windows(2)
+                .any(|w| w == ["--upload-file", spelled.as_str()]),
             "{given}: {argv:?}"
         );
         assert!(argv.iter().any(|a| a == "--globoff"), "{argv:?}");
@@ -493,12 +500,12 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
         [("a.bin".to_string(), b"the file's own bytes".to_vec())]
     );
     let before = fake.seen().len();
-    let bare = aterm_uds::spawnfd::command("/usr/bin/curl")
+    let bare = aterm_uds::spawnfd::command(crate::http::CURL_BIN)
         .args([
             "-q",
             "-sS",
             "-o",
-            "/dev/null",
+            NULL_DEVICE,
             "-X",
             "POST",
             "-H",

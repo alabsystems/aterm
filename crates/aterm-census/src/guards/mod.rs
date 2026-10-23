@@ -22,6 +22,7 @@ mod eager_drop;
 mod export_content;
 mod generated;
 mod github;
+mod grants;
 mod graph;
 mod installer;
 mod keys;
@@ -88,6 +89,7 @@ pub const GUARDS: &[Rule] = &[
     doors::HANDOFF_NAME,
     doors::CORE_SIGNAL,
     mint::LAUNCHER_MINT,
+    grants::PROMPT_GRANT,
     mktemp::CHECKED_MKTEMP,
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,

@@ -222,6 +222,8 @@ pub enum Unused {
     Unfinished,
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
+    /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
+    GivenUp,
     /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
     Stale {
         incremental: usize,

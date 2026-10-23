@@ -18,7 +18,6 @@ use crate::supervise::policy::turn_end::{
     RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
 };
 
-/// One approval ledger row as the loop writes it ([`Row::to_json`]).
 fn row(ts: i64, sid: &str, rule_id: &str, outcome: Outcome, command: &str, reason: &str) -> String {
     Row {
         rule_id,
@@ -30,7 +29,6 @@ fn row(ts: i64, sid: &str, rule_id: &str, outcome: Outcome, command: &str, reaso
     .to_json(ts, Some(sid))
 }
 
-/// A `typed` row of `s-1`'s at `ts`: `command` under `rule`.
 fn typed(ts: i64, rule: &str, command: &str) -> String {
     row(
         ts,
@@ -42,14 +40,10 @@ fn typed(ts: i64, rule: &str, command: &str) -> String {
     )
 }
 
-/// A row of `s-1`'s at `ts` with no command: `outcome` under `rule`, for
-/// `reason`.
 fn said(ts: i64, rule: &str, outcome: Outcome, reason: &str) -> String {
     row(ts, "s-1", rule, outcome, "", reason)
 }
 
-/// A journal as the loop writes it ([`JournalRecord::of_line`]), from a
-/// fixture of `<t> <sid> <line>` rows (`#` starts a comment row).
 fn journal(fixture: &str) -> Vec<JournalRecord> {
     fixture
         .lines()
@@ -63,9 +57,6 @@ fn journal(fixture: &str) -> Vec<JournalRecord> {
         .collect()
 }
 
-/// Set the file at `path`'s mtime to `at`, through a handle opened for
-/// writing: Windows sets a time only through one that may write the file's
-/// attributes.
 fn set_modified(path: &Path, at: std::time::SystemTime) {
     std::fs::OpenOptions::new()
         .write(true)
@@ -74,7 +65,6 @@ fn set_modified(path: &Path, at: std::time::SystemTime) {
         .expect("set mtime");
 }
 
-/// `lines` folded as one session ledger.
 fn fold_ledger(lines: &[String], since_ms: i64) -> HarnessStats {
     let mut acc = HarnessStats::new(since_ms);
     for line in lines {
@@ -83,14 +73,10 @@ fn fold_ledger(lines: &[String], since_ms: i64) -> HarnessStats {
     acc
 }
 
-/// How often `rule` acted, by [`HarnessStats::by_rule`].
 fn by(acc: &HarnessStats, rule: &str) -> u64 {
     acc.by_rule.get(rule).copied().unwrap_or(0)
 }
 
-/// Every counter but the waits, the breakdown and the bookkeeping, in the
-/// struct's order: `(approved, unproven, declined, answered, continued,
-/// land_prompts, resumed, escalated, relaunched, upgraded)`.
 fn counts(acc: &HarnessStats) -> [u64; 10] {
     [
         acc.approved,
@@ -106,11 +92,6 @@ fn counts(acc: &HarnessStats) -> [u64; 10] {
     ]
 }
 
-/// EACH LEDGER ROW COUNTS WHERE THE MODULE'S TABLE SAYS: a box's press is
-/// `approved` (and `unproven` where full power pressed what the safe rules
-/// could not prove), a dialog's keys are no box, a refusal is `declined`,
-/// and a typed act is a continuation, an answer, Land's, a resume or only
-/// its rule's.
 #[test]
 fn a_ledger_row_counts_where_the_table_says() {
     let forged = ",\"decision\":\"approved\",\"rule_id\":\"continue@v1\",";
@@ -174,9 +155,6 @@ fn a_ledger_row_counts_where_the_table_says() {
     assert!(!acc.is_empty());
 }
 
-/// A LIMIT'S WAIT is its `wall-wait@v1` row to its end — the
-/// `wall-wait-end@v1` row, or any act typed since, as `open_wall` reads it —
-/// per session, and only its part inside the window counts.
 #[test]
 fn a_limits_wait_runs_from_its_wall_to_its_end_inside_the_window() {
     let wall = |ts, sid| row(ts, sid, RULE_WALL_WAIT, Outcome::Waiting, "", "(wall: …)");
@@ -210,9 +188,6 @@ fn a_limits_wait_runs_from_its_wall_to_its_end_inside_the_window() {
     assert_eq!(fold_ledger(&lines, 0).limit_wait_ms, 300 + 600);
 }
 
-/// The journal of [`journal_escalations_wait_on_a_person_until_their_badge_clears`]:
-/// the loop's own lines, as `escalate.rs`, `run.rs` and `turn_end_loop.rs`
-/// write them.
 const JOURNAL: &str = "
     1000 s-1 ESCALATED seq=10 attention=OK mail=OK 7 off=91
     # Ends of points that raised no badge.
@@ -239,9 +214,6 @@ const JOURNAL: &str = "
     9600 s-1 UNPROVEN seq=41 rule=allow-once@v1 unproven: not read-only: touch
 ";
 
-/// THE JOURNAL: an `ESCALATED` line is an escalation and opens a person's
-/// wait, the next `CLEARED` of a badge closes it, and a `CHOSE` line is a
-/// dialog answered.
 #[test]
 fn journal_escalations_wait_on_a_person_until_their_badge_clears() {
     let recs = journal(JOURNAL);
@@ -265,7 +237,6 @@ fn journal_escalations_wait_on_a_person_until_their_badge_clears() {
     assert_eq!((acc.escalated, acc.human_wait_ms), (2, 1_000 + 1_000));
 }
 
-/// A refused badge write never raised a badge and opened no person's wait.
 #[test]
 fn a_failed_badge_set_opens_no_person_wait() {
     let recs = journal(
@@ -281,8 +252,6 @@ fn a_failed_badge_set_opens_no_person_wait() {
     assert_eq!((acc.escalated, acc.human_wait_ms), (1, 2_000), "{acc:#?}");
 }
 
-/// A refused clear says nothing changed on the server. Unknown result
-/// words are no success either; only the confirmed retry ends this wait.
 #[test]
 fn a_failed_badge_clear_keeps_the_wait_open_until_a_confirmed_clear() {
     for reply in ["ERR denied", "ERR timeout", "OKAY", ""] {
@@ -300,8 +269,6 @@ fn a_failed_badge_clear_keeps_the_wait_open_until_a_confirmed_clear() {
     }
 }
 
-/// A stall's clear is journaled on FROZEN rather than CLEARED, and needs
-/// the same successful reply before it can end a standing badge's wait.
 #[test]
 fn a_failed_frozen_clear_keeps_the_wait_open_until_a_confirmed_clear() {
     for reply in ["ERR denied", "ERR timeout", "OKAY", ""] {
@@ -319,9 +286,6 @@ fn a_failed_frozen_clear_keeps_the_wait_open_until_a_confirmed_clear() {
     }
 }
 
-/// The journals of [`a_persons_wait_runs_while_a_badge_of_the_loops_stands`]:
-/// the loop's own lines, as `escalate.rs`, `stall.rs`, `lifecycle.rs`,
-/// `run.rs` and the watch's end write them, a session each.
 const WAITS: &str = "
     # The loop's end ends a wait no clear closed: counted nothing, and the
     # next escalation opens its own (not the whole gap).
@@ -366,14 +330,6 @@ const WAITS: &str = "
     65000 s-7 CLEARED seq=90 goal attention=OK
 ";
 
-/// A PERSON'S WAIT RUNS WHILE A BADGE OF THE LOOP'S STANDS ([`WAITS`]): a
-/// loop's end (`EXIT`, `TIMEOUT`) ends a wait no clear closed, counting
-/// nothing, so the next escalation does not count the whole gap; a badge
-/// handed over is `ADOPTED` by the next loop and its wait counts from there;
-/// the hidden clear (`seq=-`) takes a badge down; a withheld ask is no
-/// escalation and opens nothing; a limit episode's badge set again (its
-/// retry, or adopted) is no second escalation and keeps its wait; and a
-/// clear that leaves the loop's entry standing (`kept`) closes nothing.
 #[test]
 fn a_persons_wait_runs_while_a_badge_of_the_loops_stands() {
     let recs = journal(WAITS);
@@ -433,9 +389,6 @@ fn a_persons_wait_runs_while_a_badge_of_the_loops_stands() {
     assert_eq!(fold(&down, 0).human_wait_ms, 2_000);
 }
 
-/// THE WORDS THE FOLD MATCHES ARE THE WRITERS': each line of [`WAITS`] that
-/// carries one is built here from the journal module's consts, as its
-/// writer builds it, and read back the same.
 #[test]
 fn the_folds_words_are_the_writers_consts() {
     use crate::supervise::journal::{
@@ -505,9 +458,6 @@ fn the_folds_words_are_the_writers_consts() {
     assert!(!is_adopted(&other));
 }
 
-/// The journals of [`a_stalls_hold_a_parks_start_and_a_loops_end_close_a_wait`]:
-/// the loop's own lines, as `stall.rs`'s `hold_for_stall`, `lifecycle.rs`'s
-/// `release_attention` and `park_while_off` write them, a session each.
 const ENDS: &str = "
     # A stall's hold takes the point's badge down on its FROZEN line alone.
     1000 s-1 ESCALATED seq=10 attention=OK mail=OK 7 off=91
@@ -538,14 +488,6 @@ const ENDS: &str = "
     52000 s-5 CLEARED seq=52 box attention=OK
 ";
 
-/// A STALL'S HOLD, AN OFF PARK'S START AND A LOOP'S LAST CLEAR END A
-/// PERSON'S WAIT ([`ENDS`]): a `FROZEN` line whose
-/// `attention=` reply took the loop's entry down closes the wait the badge
-/// opened, with no `CLEARED` line after it; one whose reply is `kept` (a
-/// limit's badge stands) or `skipped: …` (behind another supervisor) closes
-/// nothing; the turn-end policy's `CLEARED` at the loop's end closes its
-/// wait before the end line; and an Off park's `CLEARED` closes the wait
-/// as the park starts, so the park is never a person's wait.
 #[test]
 fn a_stalls_hold_a_parks_start_and_a_loops_end_close_a_wait() {
     let recs = journal(ENDS);
@@ -595,10 +537,6 @@ fn a_stalls_hold_a_parks_start_and_a_loops_end_close_a_wait() {
     assert_eq!(fold(&reworded).human_wait_ms, 8_000);
 }
 
-/// THE FROZEN LINE THE FOLD READS IS THE WRITER'S: built here from the
-/// journal module's consts as `hold_for_stall` builds it — the reply of the
-/// unset, [`ATTENTION_KEPT`], or [`ATTENTION_SKIPPED`] behind another
-/// supervisor — and read back the same.
 #[test]
 fn the_frozen_line_is_read_with_the_writers_consts() {
     use crate::supervise::journal::ESCALATED_BEHIND;
@@ -631,9 +569,6 @@ fn the_frozen_line_is_read_with_the_writers_consts() {
     assert!(!frozen_takes_badge_down(&bare));
 }
 
-/// THE UPGRADE LEDGER: a `relaunched` row onto another build is an upgrade,
-/// one on the build it ran (a crash relaunched, a restart in place) a
-/// relaunch; the row's time is unix SECONDS.
 #[test]
 fn an_upgrade_row_tells_an_upgrade_from_a_relaunch() {
     let up = |t: i64, tab: &str, from: &str, to: &str, step: &str| {
@@ -668,8 +603,6 @@ fn an_upgrade_row_tells_an_upgrade_from_a_relaunch() {
     assert_eq!(fold(200_000).rows, 0);
 }
 
-/// A LINE THAT IS NO ROW is counted `bad`, in every fold, and never panics:
-/// empty, cut short, not an object, no time, a time that is no integer.
 #[test]
 fn a_bad_line_is_counted_and_never_panics() {
     let good = typed(1_000, RULE_CONTINUE, "keep going");
@@ -703,8 +636,6 @@ fn a_bad_line_is_counted_and_never_panics() {
     assert!(HarnessStats::new(0).is_empty());
 }
 
-/// [`window_cut`]: a file long enough to have been cut whose oldest row is
-/// newer than the window's start may have lost it.
 #[test]
 fn a_window_is_cut_only_where_a_long_file_begins_inside_it() {
     let keep = approvals::KEEP_ROWS;
@@ -718,8 +649,6 @@ fn a_window_is_cut_only_where_a_long_file_begins_inside_it() {
     assert!(!window_cut(keep, keep, None, 1_000));
 }
 
-/// Every file and directory under `root`, recursively, sorted: what a reader
-/// must leave as it found it.
 fn listing(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut todo = vec![root.to_path_buf()];
@@ -739,8 +668,6 @@ fn listing(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A sweep's options over `harness_state`, in `upgrade_status_tests.rs`'
-/// shape: the real writer of the upgrade ledger takes nothing else from them.
 fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
     Opts {
         home: home.to_path_buf(),
@@ -763,7 +690,6 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
     }
 }
 
-/// One upgrade ledger row's report: `tab` moved `from` → `to`, `step` taken.
 fn report(tab: &str, from: &str, to: &str, step: &str) -> Report {
     Report {
         pid: 42,
@@ -775,11 +701,6 @@ fn report(tab: &str, from: &str, to: &str, step: &str) -> Report {
     }
 }
 
-/// THE READER over a real state tree: two sessions' ledgers, one's journal,
-/// and the upgrade ledger written by its own writer, each counted once; a
-/// file that is no ledger (a goal-hold record, a cut's `.tmp`, a directory
-/// named like a ledger) is passed over even where its text reads as rows; a
-/// journal line that is no record is `bad`.
 #[test]
 fn stats_under_reads_every_sessions_files_and_creates_nothing() {
     const NOW_S: u64 = 1_790_311_076;
@@ -854,8 +775,6 @@ fn stats_under_reads_every_sessions_files_and_creates_nothing() {
     assert_eq!(listing(&root), before);
 }
 
-/// A MISSING STATE TREE is an empty result, and stays missing: the reader
-/// makes no `drive` directory and no `upgrade` one.
 #[test]
 fn a_missing_state_dir_is_empty_and_stays_missing() {
     let root = ScratchDir::new("stats", "missing");
@@ -871,8 +790,6 @@ fn a_missing_state_dir_is_empty_and_stays_missing() {
     assert!(!harness.exists());
 }
 
-/// A LEDGER CUT BACK TO ITS KEPT ROWS whose oldest row is newer than the
-/// window's start says the window is partial.
 #[test]
 fn a_ledger_cut_inside_the_window_says_so() {
     let root = ScratchDir::new("stats", "cut");
@@ -898,10 +815,6 @@ fn a_ledger_cut_inside_the_window_says_so() {
     assert!(!stats_under(&state, &harness, 5_000).cut);
 }
 
-/// A LEDGER NO ROW WAS APPENDED TO SINCE THE WINDOW OPENED is not read: a
-/// row's time is taken as it is appended, so none of its rows can be in the
-/// window (the row planted here, newer than the file, is what shows it was
-/// not read).
 #[test]
 fn a_ledger_untouched_since_the_window_is_not_read() {
     let root = ScratchDir::new("stats", "mtime");
@@ -920,12 +833,6 @@ fn a_ledger_untouched_since_the_window_is_not_read() {
     assert_eq!(stats_under(&state, &harness, since_ms).continued, 1);
 }
 
-/// A session's ledger as the loop's writer serializes it, with a journal
-/// beside it: a box approved (one full-power press the safe rules could not
-/// prove), a three-key question dialog the loop answered (its tab, its
-/// toggle, its submit: one `CHOSE` in the journal), a prose answer, a
-/// continuation, a full context's `/compact` and the continuation it typed
-/// after it, Land's instruction and its nudge, and a decline.
 type Recorded = Vec<(String, &'static str, Outcome, &'static str, &'static str)>;
 
 fn the_recorded_session() -> (Recorded, &'static str) {
@@ -988,8 +895,6 @@ fn the_recorded_session() -> (Recorded, &'static str) {
     (rows, journal)
 }
 
-/// The recorded ledger and journal count a question dialog once by its
-/// journal entry, never by its three keys.
 #[test]
 fn the_sort_counts_the_recorded_acts_without_counting_dialog_keys() {
     let (rows, fixture) = the_recorded_session();
@@ -1046,9 +951,6 @@ fn the_sort_counts_the_recorded_acts_without_counting_dialog_keys() {
     );
 }
 
-/// The unix ms now, the clock a file's last write is on: the windows the
-/// one-pass fixtures read are placed against it, so a file "untouched
-/// today" is one whose time is set before today's start.
 fn now_ms() -> i64 {
     let since = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1056,9 +958,6 @@ fn now_ms() -> i64 {
     i64::try_from(since.as_millis()).expect("ms")
 }
 
-/// A state tree as the page reads one, placed around today's start
-/// `today` and the week's `week` (unix ms): what the one pass must read as
-/// the two windows' readers do.
 fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<PathBuf>) {
     let root = ScratchDir::new("stats", "one-pass");
     let state = root.join("state");
@@ -1215,8 +1114,6 @@ fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<Pa
     (root, state, harness, files)
 }
 
-/// `acc` without its per-session shares and its decisions: what
-/// [`stats_under`] builds.
 fn without_shares(acc: &HarnessStats) -> HarnessStats {
     HarnessStats {
         by_session: None,
@@ -1225,13 +1122,6 @@ fn without_shares(acc: &HarnessStats) -> HarnessStats {
     }
 }
 
-/// ONE PASS EQUALS TWO (design §10.3.3, item 1; §10.8's guard): over a
-/// recorded state tree — ledgers, journals, the upgrade ledger, a ledger and
-/// a journal untouched today (each with a line that is no record), a cut
-/// file, one older than the week, and lines that are no rows —
-/// `stats_windows` builds, for each window, exactly what a
-/// `stats_under` call for that window builds: every counter, wait, rule,
-/// session, row, `bad` line and `cut`, and the folds' open memory.
 #[test]
 fn one_pass_folds_both_windows_as_two_readings_do() {
     let now = now_ms();
@@ -1285,10 +1175,6 @@ fn one_pass_folds_both_windows_as_two_readings_do() {
     );
 }
 
-/// ONE READ PER FILE PER READING (§10.0's "one reading"): the one pass
-/// reads every file a window can hold a row of exactly once — the counting
-/// seam on its reader — and a file last written before both windows not at
-/// all.
 #[test]
 fn a_reading_reads_each_file_once() {
     let now = now_ms();
@@ -1336,11 +1222,6 @@ fn a_reading_reads_each_file_once() {
     assert_eq!(twice[&files[0]], 2, "CONTROL: two passes read s-1 twice");
 }
 
-/// A TALLY PER SESSION (§10.3.3, item 2): today's shares sum, over every
-/// session, to today's totals — each counter and both waits — and each
-/// session's share is its own rows': `s-1`'s escalation time is its newest
-/// today's, the upgrade ledger's tab-less row holds its own share, and the
-/// cut file marks only its own session.
 #[test]
 fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
     let now = now_ms();
@@ -1406,8 +1287,6 @@ fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
     assert!(HarnessStats::new(today).by_session.is_none());
 }
 
-/// One session's journal and ledger files under a fresh state tree, each a
-/// list of lines; `(root, state, harness)`.
 fn decided_tree(files: &[(&str, Vec<String>)]) -> (ScratchDir, PathBuf, PathBuf) {
     let root = ScratchDir::new("stats", "decided");
     let state = root.join("state");
@@ -1422,7 +1301,6 @@ fn decided_tree(files: &[(&str, Vec<String>)]) -> (ScratchDir, PathBuf, PathBuf)
     (root, state, harness)
 }
 
-/// A ledger row of `sid`'s at `ts` with its `box_seq`.
 fn seq_row(
     ts: i64,
     sid: &str,
@@ -1441,7 +1319,6 @@ fn seq_row(
     .to_json(ts, Some(sid))
 }
 
-/// `fixture`'s journal lines (`<t> <sid> <line>`) as the file holds them.
 fn journal_lines(fixture: &str) -> Vec<String> {
     journal(fixture)
         .iter()
@@ -1449,11 +1326,6 @@ fn journal_lines(fixture: &str) -> Vec<String> {
         .collect()
 }
 
-/// A recorded session's day: a three-key question dialog (two tabs, then
-/// the review's submit, told as one `CHOSE` at the worker's next busy read,
-/// whose `seq` is that read's and no key's), a question asked in prose and
-/// answered under Land, a burst of unproven presses of one heredoc, and a
-/// decline.
 fn decided_day(t: i64) -> (Vec<String>, Vec<String>) {
     let journal = journal_lines(&format!(
         "{} s-1 CHOSE seq=57 rule=answer-recommended@v1 policy=recommended Which colour? \u{2192} Blue (Recommended) | Which size? \u{2192} Large
@@ -1526,9 +1398,6 @@ fn decided_day(t: i64) -> (Vec<String>, Vec<String>) {
     (journal, ledger)
 }
 
-/// A decision as a test reads it: its kind, its time after the fixture's
-/// start, what was asked, whether it was said, what was done, why, and how
-/// many presses it holds.
 type Seen<'a> = (
     DecisionKind,
     i64,
@@ -1539,18 +1408,6 @@ type Seen<'a> = (
     u32,
 );
 
-/// DECIDED FOR YOU, THE JOIN (§10.4.2, §10.4.3): over a recorded journal and
-/// ledger, one reading lists each choice the harness made in the person's
-/// name, oldest first — the three-key dialog once, worded from its `CHOSE`
-/// (both tabs' questions and choices, `(Recommended)` dropped) with the why
-/// both tabs' keys give (one took the option marked Recommended, the other
-/// the first: the lab's dialog) and the newer key's time; the prose
-/// question with the words of the newest review point at or before its
-/// answer's `box_seq` (the point is read again a seq later before the
-/// answer goes, as the lab's was: `EVENT question seq=6697`, the answer's
-/// `box_seq` 6698; the next point's `EVENT`, after it, is not taken), less
-/// the reply's `⏺` marker the screen drew, and the land answer's words; the burst of unproven presses as one row `×3`
-/// naming the switch; the decline with its reason.
 #[test]
 fn the_join_lists_each_choice_made_in_the_persons_name() {
     let t = now_ms() - 3_600_000;
@@ -1646,15 +1503,10 @@ fn the_join_lists_each_choice_made_in_the_persons_name() {
     assert!(plain.decided.is_none());
 }
 
-/// `answers` (each `<question> → <choice>`) as a `CHOSE` tells them: joined
-/// ` | `, cut at [`LINE_CHARS`] (`run.rs`'s `tell_answered`, its `clip`).
 fn chose_words(answers: &[String]) -> String {
     answers.join(" | ").chars().take(LINE_CHARS).collect()
 }
 
-/// A LONG DIALOG IS WORDED FROM ITS KEYS (§10.4.4): the `CHOSE` line is cut
-/// at 160 characters, and each answer key holds its tab's whole `<question>
-/// → <choice>`, so every tab is worded from its key.
 #[test]
 fn a_long_dialog_is_worded_from_its_keys() {
     let t = now_ms() - 3_600_000;
@@ -1796,11 +1648,6 @@ fn a_long_dialog_is_worded_from_its_keys() {
     assert!("Short? \u{2192} Yes".chars().count() < LINE_CHARS);
 }
 
-/// A RUN OF UNPROVEN PRESSES IS ONE ROW BY ITS HEAD (§10.4.1): presses of
-/// one command head in one session, each within a minute of the last, are
-/// one row `×3`; the same head 61 s after the run's last press starts a row
-/// of its own, and so does another head inside the run, and the same head in
-/// another session inside the other's run.
 #[test]
 fn a_run_of_unproven_presses_is_one_row_by_its_head() {
     let t = now_ms() - 3_600_000;
@@ -1920,9 +1767,6 @@ fn a_run_of_unproven_presses_is_one_row_by_its_head() {
     );
 }
 
-/// THE CAP KEEPS THE NEWEST 64 (§10.4.2, item 1): 70 declines over three
-/// sessions, written out of time order across the files, keep the newest
-/// [`DECIDED_KEEP`], oldest first, and count all 70.
 #[test]
 fn the_cap_keeps_the_newest_decisions() {
     let t = now_ms() - 3_600_000;
@@ -1954,11 +1798,6 @@ fn the_cap_keeps_the_newest_decisions() {
     assert!(!kept.iter().any(|k| *k < 6));
 }
 
-/// THE AGENT'S WORDS, SANITIZED (§10.4.2, item 1; §10.8 "Agent text on a
-/// Settings page"): a line break and a tab are one space, CSI and OSC escape
-/// sequences and a bidirectional override are dropped, every other control
-/// too; a text longer than [`DECIDED_CHARS`] is cut at a char boundary (a
-/// two-byte letter's) with `…`.
 #[test]
 fn the_agents_words_are_one_line_without_escapes_and_cut() {
     let raw = "\u{1b}[31mred\u{1b}[0m\nline\ttwo \u{202e}evil\u{1b}]0;title\u{7} end\u{7f}";
@@ -1976,8 +1815,6 @@ fn the_agents_words_are_one_line_without_escapes_and_cut() {
     );
 }
 
-/// NO DECISION, NO ROWS: a day with only continuations and proven presses
-/// has no decision (the page then draws no card).
 #[test]
 fn a_day_without_a_choice_has_no_decision() {
     let t = now_ms() - 3_600_000;
@@ -2017,12 +1854,6 @@ fn a_day_without_a_choice_has_no_decision() {
     assert_eq!(today.decided.expect("decisions").total, 1, "CONTROL");
 }
 
-/// A PROSE ANSWER JOINS ITS OWN RUN'S POINT (§10.4.4): the screen's `seq`
-/// begins again when a loop, a server or a program restarts (this machine's
-/// journals do so once or twice a day a session, most often at a live
-/// upgrade, with no `EXIT`), so an answer takes the newest review point
-/// journaled at or before it and read at or before its `box_seq`, in the
-/// loop run it was typed in.
 #[test]
 fn a_prose_answer_joins_the_point_of_its_own_run() {
     let t = now_ms() - 3_600_000;
@@ -2090,12 +1921,6 @@ fn a_prose_answer_joins_the_point_of_its_own_run() {
     );
 }
 
-/// AN UNPROVEN PRESS SAYS WHICH OPTION (§10.4.4): full power writes an
-/// `approved` row for every option it picks — a setup dialog's `No, keep
-/// default`, the limit dialog's `Stop and wait for limit to reset` — with
-/// the option after ` => ` in its command, so the row names that option
-/// whole however long the box's words are, and its head is the box's words
-/// alone, its drawing dropped (a title read from a border row is none).
 #[test]
 fn an_unproven_press_names_the_option_it_chose() {
     use crate::supervise::policy::approval::{RULE_DECLINE, RULE_NO_SPEND, RULE_TRUST_ANY};
@@ -2156,11 +1981,6 @@ fn an_unproven_press_names_the_option_it_chose() {
     }
 }
 
-/// A RUN IS PRESSES OF ONE COMMAND UNDER ONE SWITCH (§10.4.4): two commands
-/// whose first 96 characters are the same (one long `S=…` prefix, as this
-/// machine's agents write them) are two rows though their shown heads are
-/// one; one command pressed under All and again under the rm warning is two
-/// rows; one command pressed twice under one switch is one row `×2`.
 #[test]
 fn a_run_is_presses_of_one_command_under_one_switch() {
     let t = now_ms() - 3_600_000;
@@ -2213,11 +2033,6 @@ fn a_run_is_presses_of_one_command_under_one_switch() {
     assert_eq!(command_head(&first).1, command_head(&second).1);
 }
 
-/// A DECISION'S ID STAYS (§10.4.4): the page keys a row by its decision's
-/// id, which is the same at every reading while the decision's rows stand:
-/// a later reading that holds a newer decision and a dialog told late (its
-/// `CHOSE` after the newer rows, its keys before them, so it sorts among
-/// the older rows) gives each first-reading decision the same id.
 #[test]
 fn a_decisions_id_stays_while_newer_rows_arrive() {
     let t = now_ms() - 3_600_000;
@@ -2283,11 +2098,6 @@ fn a_decisions_id_stays_while_newer_rows_arrive() {
     assert_eq!((place(&first, &b), place(&second, &b)), (Some(1), Some(2)));
 }
 
-/// A KEPT RESET SAYS WHY IN WORDS, AND A CUT ANSWER CLOSES ITS QUOTE
-/// (§10.4.4): the reset policy's `declined` row (its command a title, its
-/// reason a word of its own, `check-timeout`) is a reset kept unspent, its
-/// why that word in a person's words, and none where the word is no word
-/// this build writes.
 #[test]
 fn a_kept_reset_says_why_in_words_and_a_cut_answer_closes_its_quote() {
     let t = now_ms() - 3_600_000;
@@ -2351,8 +2161,6 @@ fn a_kept_reset_says_why_in_words_and_a_cut_answer_closes_its_quote() {
     assert!(text.chars().count() > DECIDED_CHARS);
 }
 
-/// The public fold accepts i64 timestamps. A whole-domain gap starts a
-/// new burst while adjacent early timestamps still share their actual row.
 #[test]
 fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
     let mut acc = HarnessStats::per_session(i64::MIN);
@@ -2376,11 +2184,6 @@ fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
     assert_eq!(rows, [(i64::MIN, 2), (i64::MAX, 1)]);
 }
 
-/// THE WORKER'S NEEDS ON THE PERSON'S SCREEN ARE COUNTED APART (FOREVER
-/// CRUISE / Autopilot Land): a `NEEDS` line whose entry went up
-/// (`attention=OK`) is a need told ([`HarnessStats::needs_told`]) — never an
-/// escalation, never a person's wait — and its `CLEARED … needs` closes no
-/// badge's wait.
 #[test]
 fn a_need_told_is_counted_apart_from_escalations_and_waits() {
     let recs = journal(
@@ -2405,9 +2208,6 @@ fn a_need_told_is_counted_apart_from_escalations_and_waits() {
     );
 }
 
-/// A landing's note as the loop writes it (`turn_end_loop.rs`,
-/// `task_edge_with`), at `t` for `sid`, restating the landing first noted at
-/// `ended` where there is one.
 fn land_note(t: i64, sid: &str, why: &str, ended: Option<i64>) -> JournalRecord {
     let mut r = JournalRecord::of_line(
         t,
@@ -2422,14 +2222,8 @@ fn land_note(t: i64, sid: &str, why: &str, ended: Option<i64>) -> JournalRecord 
     r
 }
 
-/// The words of a clean defense's note.
 const DEFENDED: &str = "the worker defended that everything is landed on the remote main branch";
 
-/// A LANDING COUNTS ONCE THROUGH A RESTATEMENT AND A WAKE (design §12.4.3,
-/// item 2; §12.4.6): Land's instruction, its landing's note, the note the
-/// task's own wake restates it in ([`WAKE_KEPT`], its `ended`), the loop's
-/// end and a successor's restatement (its `ended`) are ONE landing, at its own note's
-/// time, in the window's total and the session's share.
 #[test]
 fn a_landing_counts_once_through_a_restatement_and_a_wake() {
     let mut recs = journal(&format!(
@@ -2490,11 +2284,6 @@ fn a_landing_counts_once_through_a_restatement_and_a_wake() {
     assert_eq!(at.landed, 1, "a note at the window's start is inside it");
 }
 
-/// EACH LANDING COUNTS, AND AN OLDER BUILD'S NOTES READ AS THE LANDINGS THEY
-/// WERE (§12.4.3, item 2, as built): a landing comes only at a land act's
-/// yield, so a session's landing note counts where it is the first in its
-/// file or a land act (`land@v1`, `land-nudge@v1`, `land-answer@v1`) was
-/// journaled since its last one.
 #[test]
 fn each_landing_counts_and_an_older_builds_notes_read_as_the_landings_they_were() {
     let older = "the worker said it is done after the land instruction";
@@ -2580,17 +2369,10 @@ fn each_landing_counts_and_an_older_builds_notes_read_as_the_landings_they_were(
     assert_eq!(acc.landed, 6);
 }
 
-/// The words a loop's line journals of `text` (`turn_end_loop.rs`'s
-/// `clip`): its first [`LINE_CHARS`] characters.
 fn clipped(text: &str) -> String {
     text.chars().take(LINE_CHARS).collect()
 }
 
-/// A WALL'S CONTINUATION IN LAND'S OWN WORDS IS THE LAND ACT A LANDING COMES
-/// AT (THE LANDINGS; the engine's `land_text`): under Land a wall's
-/// continuation types [`LAND`] or [`LAND_NUDGE`] under the WALL's rule
-/// (`continue_as`: a limit's resume, a credits consent, a `/compact`'s
-/// continuation), and its clean defense lands the task.
 #[test]
 fn a_walls_continuation_in_lands_words_is_the_land_act_a_landing_comes_at() {
     let rec = |t: i64, sid: &str, line: String| JournalRecord::of_line(t, Some(sid), &line, None);
@@ -2682,10 +2464,6 @@ fn a_walls_continuation_in_lands_words_is_the_land_act_a_landing_comes_at() {
     assert_eq!(got, (vec![2; 6], 1, 1, 2 * 6 + 2, 3), "{shares:#?}");
 }
 
-/// A FACT LINE IS NO ACT (the occupancy red-team's F13): a `fact-hold@v1` row typed at a break
-/// counts under no rule and ends no limit wait, while a policy act at the same instant does
-/// both. The negative control reads the fact row as an act
-/// ([`approvals::with_facts_counted`]): it then counts, and the wait ends at it.
 #[test]
 fn a_fact_line_typed_counts_as_no_act_and_ends_no_wait() {
     let fact_rule = crate::supervise::facts::FactKind::Hold.rule();
@@ -2714,11 +2492,6 @@ fn a_fact_line_typed_counts_as_no_act_and_ends_no_wait() {
     );
 }
 
-/// THE FACT LINES, BY KIND (occupancy 1e, "What the harness did"): a `fact-hold@v1` row typed
-/// counts toward `facts_told`'s `hold`, a `fact-would@v1` row naming a built-in rule toward
-/// `facts_would`'s; the door's intent and skip rows, a held verdict's `fact-held@v1` row and the
-/// hold's own `waiting` rows count toward neither, nor does a row before the window. NEGATIVE
-/// CONTROL: a would-be row naming no rule this build knows counts nowhere.
 #[test]
 fn the_fact_lines_count_by_kind() {
     use crate::supervise::occupancy::door::INTENT_RULE;

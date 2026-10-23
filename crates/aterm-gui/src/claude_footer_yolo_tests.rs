@@ -15,26 +15,18 @@ use aterm_window::event::{ElementState, MouseButton};
 
 use crate::term_lock;
 
-/// Claude Code's foreground process group, as the resolver names it.
 const PGID: i32 = 4242;
 const COLS: usize = 120;
-/// The owner's footer row: the bypass pill, the shells, the agents.
 const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
 const MANUAL: &str = "  \u{23F8} manual mode on \u{B7} ? for shortcuts \u{B7} \u{2190} for agents";
 const AUTO: &str = "  \u{23F5}\u{23F5} auto mode on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
-/// Vim `INSERT` indicator and its trailing cell before the pill.
 const VIM_LEAD: &str = "  -- INSERT -- ";
-/// The owner's footer row under vim INSERT: the indicator, then [`BYPASS`]'s pill and items.
 const VIM_BYPASS: &str = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
-/// The same row in auto mode, the measured screen's.
 const VIM_AUTO: &str = "  -- INSERT -- \u{23F5}\u{23F5} auto mode on \u{B7} 14 shells \u{B7} \u{2190} for agents \u{B7} \u{2193} to manage";
-/// The pill's ink and the rest of the row's, as `draw` paints them.
 const PILL_FG: [u8; 3] = [255, 110, 90];
 const DIM_FG: [u8; 3] = [130, 130, 130];
-/// Claude's right-hand notice, at the row's end.
 const NOTICE: &str = "/rc active";
 
-/// A headless App, `COLS` wide, whose one session writes its PTY input to a private socket.
 fn bare() -> (App, WindowId, u64, UnixStream) {
     let (reader, writer) = UnixStream::pair().expect("private PTY observer");
     reader.set_nonblocking(true).expect("nonblocking observer");
@@ -46,7 +38,6 @@ fn bare() -> (App, WindowId, u64, UnixStream) {
     (app, wid, session, reader)
 }
 
-/// This window's harness host, holding the session; dropped, it shuts down.
 struct Held(crate::harness_host::HostHandle);
 
 impl Drop for Held {
@@ -55,7 +46,6 @@ impl Drop for Held {
     }
 }
 
-/// [`bare`] with a harness host holding its session (Cruise, the table's default).
 fn app() -> (App, WindowId, u64, UnixStream, Held) {
     let (mut app, wid, session, reader) = bare();
     let host = crate::harness_host::HostHandle::for_supervised_test(
@@ -80,7 +70,6 @@ fn feed(app: &App, session: u64, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The session is Claude Code's, with its facts published.
 fn claude(app: &App, session: u64) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -99,7 +88,6 @@ fn claude(app: &App, session: u64) {
     ));
 }
 
-/// Claude Code's bottom block on the 24-row engine.
 fn draw(app: &App, session: u64, mode: &str) {
     let rule = "\u{2500}".repeat(COLS);
     let lead = if mode.starts_with(VIM_LEAD) {
@@ -122,7 +110,6 @@ fn draw(app: &App, session: u64, mode: &str) {
     feed(app, session, screen.as_bytes());
 }
 
-/// One frame through the capture route's splices: extract, the strip, the footer.
 fn frame(app: &mut App, wid: WindowId) {
     let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
         wid,
@@ -145,7 +132,6 @@ fn strip(app: &App, wid: WindowId) -> usize {
     app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows)
 }
 
-/// Claude's mode row, as a frame row.
 fn mode_row(app: &App, wid: WindowId) -> usize {
     strip(app, wid) + 23
 }
@@ -154,13 +140,11 @@ fn glass_of(app: &App, wid: WindowId, row: usize) -> String {
     read_glass(&app.windows[&wid].input_scratch.cells[row])
 }
 
-/// The engine's own text of terminal row `row`: what `text`/`screen` read.
 fn grid_text(app: &App, session: u64, row: usize) -> String {
     let term = app.pool.get(session).expect("session").term.clone();
     term_lock(&term).row_text(row).expect("the row")
 }
 
-/// The window pixel at the centre of frame cell `(row, col)`.
 fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy) = app.frame_origin(wid);
@@ -174,7 +158,6 @@ fn px_of(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     (x, y)
 }
 
-/// What the session's PTY received.
 fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     let mut buf = [0u8; 256];
@@ -195,7 +178,6 @@ fn pty(reader: &mut UnixStream, want: usize) -> Vec<u8> {
     got
 }
 
-/// The column `needle` starts at in `row`, counted in chars (= cells here).
 fn col_of(row: &str, needle: &str) -> usize {
     row[..row
         .find(needle)
@@ -204,12 +186,6 @@ fn col_of(row: &str, needle: &str) -> usize {
         .count()
 }
 
-/// THE BYPASS PILL READS `YOLO on` ON THE GLASS: in the pill's own ink, the
-/// row's left items packed left behind it, the right-hand notice where
-/// Claude drew it — while the GRID keeps Claude's row (`text`/`screen` and
-/// the supervisor read it), and the undo puts every cell back. The gate's
-/// witness: the composer border aterm draws on the same pane. Manual mode
-/// reads `YOLO off` the same way.
 #[test]
 fn the_bypass_pill_reads_yolo_on_on_the_glass_and_the_grid_keeps_claudes_row() {
     for (mode, label) in [(BYPASS, "YOLO on"), (MANUAL, "YOLO off")] {
@@ -264,12 +240,6 @@ fn the_bypass_pill_reads_yolo_on_on_the_glass_and_the_grid_keeps_claudes_row() {
     }
 }
 
-/// CLAUDE'S HIGHLIGHT MOVES WITH ITS ITEM (the cross-track review of
-/// 2026-10-19): Claude draws the item under the pointer — or the one `↓`
-/// selected — in inverse (SGR 7); the relabel holds, and the highlighted
-/// cells keep their own style where the packed run moves them, so the row
-/// never snaps back to Claude's under the pointer. NEGATIVE CONTROL: a pill
-/// cell of a ground of its own is no plain pill, and the row stays Claude's.
 #[test]
 fn claudes_inverse_highlight_moves_with_its_item() {
     let shells = "14 shells";
@@ -328,10 +298,6 @@ fn claudes_inverse_highlight_moves_with_its_item() {
     }
 }
 
-/// Negative controls: the other modes keep Claude's pill whole; the
-/// harness's master switch off (no border drawn) relabels nothing, and nor
-/// does a window with no harness host; the cursor on the row, or a
-/// selection in the window, leaves the row as drawn.
 #[test]
 fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
     let vendor_after = |mode: &str, setup: &dyn Fn(&mut App, WindowId, u64)| {
@@ -391,11 +357,6 @@ fn no_relabel_where_the_row_is_not_plainly_claudes_or_the_harness_is_off() {
     );
 }
 
-/// A CLICK ON THE GLASS'S `14 shells` IS A CLICK ON CLAUDE'S: with the
-/// mouse tracked (SGR 1000/1006) the press reports the GRID column of
-/// Claude's own `14 shells`, not the glass column it shows at — and the
-/// notice past the run, as drawn. CONTROL: with nothing relabelled (auto
-/// mode) every column reports itself.
 #[test]
 fn a_press_on_the_relabelled_row_reports_claudes_column() {
     for (mode, relabelled) in [(BYPASS, true), (AUTO, false)] {
@@ -434,14 +395,6 @@ fn a_press_on_the_relabelled_row_reports_claudes_column() {
     }
 }
 
-/// AFTER VIM INSERT'S INDICATOR (`  -- INSERT -- ⏵⏵ bypass permissions on
-/// …`, MEASURED on 2.1.304) the bypass pill reads `YOLO on` at column 15,
-/// in the pill's own ink, the indicator's cells as Claude drew them before
-/// it and the row's items packed behind it; with the mouse tracked, a press
-/// on the glass's `14 shells` reports the GRID column of Claude's own, and
-/// one on the indicator its own column. The grid keeps Claude's row.
-/// NEGATIVE CONTROL: the auto pill after the indicator keeps Claude's
-/// words, every column reporting itself.
 #[test]
 fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
     for (mode, relabelled) in [(VIM_BYPASS, true), (VIM_AUTO, false)] {
@@ -498,9 +451,6 @@ fn the_pill_after_vim_inserts_indicator_relabels_at_its_own_column() {
     }
 }
 
-/// THE RELABEL ALLOCATES NOTHING once the splice's buffers are grown: the
-/// finder, the collector into the reused lists, and the map's push and
-/// lookup.
 #[test]
 fn the_relabel_allocates_nothing_once_its_buffers_are_grown() {
     let (mut app, wid, session, _reader, _host) = app();
@@ -554,10 +504,6 @@ fn the_relabel_allocates_nothing_once_its_buffers_are_grown() {
     let _ = session;
 }
 
-/// A WINDOW RELABELS NO MORE PILLS THAN IT KEEPS SHIFTS FOR (the glass
-/// review of 2026-10-23): past [`GLASS_SHIFTS`] panes the collector leaves
-/// the pill Claude's, so no pill reads `YOLO on` whose clicks and selection
-/// still land on the unshifted columns.
 #[test]
 fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
     let (mut app, wid, session, _reader, _host) = app();
@@ -607,11 +553,6 @@ fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
     let _ = session;
 }
 
-/// THE PILL IS READ WITH THE RULE, NOT EVERY FRAME (the cross-track review
-/// of 2026-10-19): frames at rest — the screen unchanged, or a keystroke's
-/// echo in the composer — read Claude's mode row for its relabel no more:
-/// the reading kept with the rule's says where the pill is. CONTROL: a
-/// change to the mode row reads it once, and the relabel follows it.
 #[test]
 fn the_pill_is_read_with_the_rule_not_every_frame() {
     let (mut app, wid, session, _reader, _host) = app();
@@ -641,11 +582,6 @@ fn the_pill_is_read_with_the_rule_not_every_frame() {
     assert!(glass_of(&app, wid, mode_row(&app, wid)).starts_with("  YOLO off"));
 }
 
-/// THE PILL FOLLOWS THE BORDER, OFF'S WHITE INCLUDED: a pane this window's
-/// host supervised and the owner set Off still wears aterm's composer border
-/// (Off's moonbow, `autopilot::harness_theme`), so its bypass pill reads
-/// `YOLO on` as a Cruise pane's does. NEGATIVE CONTROL: the master switch
-/// off, the border is gone and the row is Claude's.
 #[test]
 fn a_hosted_off_pane_wears_the_border_and_relabels_with_it() {
     for (what, enabled, relabelled) in [("hosted off", true, true), ("master off", false, false)] {

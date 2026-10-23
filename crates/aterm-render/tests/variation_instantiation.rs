@@ -2,16 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for variable-font instantiation: the shipping `aterm_render::variation` policies are total, clamped, and consistently applied — and the system SF Mono rescues to Regular.
+//! Tier-1 conformance tests for variable-font instantiation and SF Mono Regular rescue.
 
 use aterm_render::variation::{self, VfAxis, WGHT_TAG, clamp_axis};
 
-/// A deliberate lattice of axis-bound magnitudes (design-space units),
-/// including the SF Mono Light default (294.67) and the OpenType extremes.
 const BOUNDS: &[f32] = &[-100.0, 0.0, 1.0, 294.67, 400.0, 700.0, 1000.0];
 
-/// Requests: every lattice bound, off-by-epsilon probes, and the non-finite
-/// values a config typo / failed measurement could produce.
 const REQUESTS: &[f32] = &[
     f32::NAN,
     f32::NEG_INFINITY,
@@ -32,11 +28,6 @@ const REQUESTS: &[f32] = &[
     1e30,
 ];
 
-/// Named-instance/axis resolution is total: for every axis on
-/// the bounds lattice (min <= def <= max, aterm-font's normalization) and
-/// every request including NaN/±∞, `clamp_axis` yields a finite value inside
-/// `[min, max]`, exactly the request whenever the request is already
-/// in-bounds.
 #[test]
 fn clamp_axis_total_and_exact() {
     let mut clamped_low = 0usize;
@@ -45,7 +36,6 @@ fn clamp_axis_total_and_exact() {
         for &def in BOUNDS {
             for &max in BOUNDS {
                 if !(min <= def && def <= max) {
-                    // fvar axes are normalized at parse
                     continue;
                 }
                 let axis = VfAxis {
@@ -84,9 +74,6 @@ fn clamp_axis_total_and_exact() {
     assert!(clamped_low > 0 && clamped_high > 0, "vacuous lattice");
 }
 
-/// Degenerate-axis totality: a hand-built axis with non-finite
-/// bounds (unreachable from aterm-font, reachable for a caller constructing
-/// `VfAxis` directly) still never panics and never returns NaN.
 #[test]
 fn clamp_axis_never_panics_on_degenerate_axes() {
     for &bad in &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -111,10 +98,6 @@ fn clamp_axis_never_panics_on_degenerate_axes() {
     }
 }
 
-/// Default resolution: no `Regular` instance ⇒ `wght` pulls to 400 (clamped),
-/// every other axis stays at its default; a `Regular` instance wins and is
-/// clamped per-axis; a length-mismatched instance list is IGNORED (falls back
-/// to the wght rule) — the malformed-fvar degradation path.
 #[test]
 fn resolve_default_coords_regular_else_wght400() {
     let axes = [
@@ -157,8 +140,6 @@ fn resolve_default_coords_regular_else_wght400() {
     assert_eq!(variation::resolve_default_coords(&thin, None), vec![300.0]);
 }
 
-/// Config overlay: known tags clamp onto their axis, unknown tags are
-/// ignored, later requests win (so `font_weight` overrides a `wght=` entry).
 #[test]
 fn apply_requests_clamps_and_ignores_unknown() {
     let axes = [VfAxis {
@@ -190,7 +171,6 @@ fn apply_requests_clamps_and_ignores_unknown() {
     );
 }
 
-/// `font_variation` spec parsing: accepted forms and every malformed shape.
 #[test]
 fn parse_variation_spec_grammar() {
     assert_eq!(
@@ -224,8 +204,6 @@ fn parse_variation_spec_grammar() {
     }
 }
 
-/// The dark-nudge safety gate: permitted iff both advances are
-/// finite and agree within 0.25px.
 #[test]
 fn dark_nudge_gate_is_a_checked_precondition() {
     let advs = [
@@ -262,8 +240,6 @@ fn sf_mono() -> Vec<u8> {
     std::fs::read("/System/Library/Fonts/SFNSMono.ttf").expect("macOS ships SFNSMono.ttf")
 }
 
-/// The checked-in variable face (`assets/game/Cinzel-var.ttf`, OFL): a `wght`
-/// axis 400..900 whose default is Regular, the same on every host.
 fn variable_face() -> Vec<u8> {
     include_bytes!("../assets/game/Cinzel-var.ttf").to_vec()
 }
@@ -416,9 +392,6 @@ fn sf_mono_ct_raster_ink_tracks_the_instance() {
     );
 }
 
-/// `font_variation`/`font_weight` requests reach the renderer, clamped; a
-/// non-variable primary (the embedded DejaVu) stays `None` forever — the
-/// byte-identical default path.
 #[test]
 fn config_requests_apply_and_nonvariable_stays_default() {
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
@@ -446,12 +419,6 @@ fn config_requests_apply_and_nonvariable_stays_default() {
     assert!(!r.set_font_variations(&[(WGHT_TAG, 510.0)], 0.0));
 }
 
-/// The resident shaping-variation cache (borrowed by
-/// the per-row-per-frame shaping path, not reallocated each row) stays in
-/// lock-step with `variation_coords()` across every coord transition —
-/// including the variable→non-variable primary swap where
-/// `refresh_variations` early-outs (`None == None`) and must not leave the old
-/// instance's variations lingering.
 #[test]
 fn shaping_variation_cache_tracks_coords() {
     let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");

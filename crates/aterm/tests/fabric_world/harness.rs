@@ -385,14 +385,62 @@ pub fn spawn_broker(
     BrokerChild { child, lifeline }
 }
 
-#[must_use]
-pub fn identity_of(pid: u32) -> Option<aterm_uds::process::Identity> {
-    aterm_uds::process::read_identity(i32::try_from(pid).ok()?)
+/// Who started a bridge, read while its aterm lives ([`launcher_of`]), for [`end_bridge`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Launcher {
+    /// The aterm's identity: where the kernel keeps pid versions (Apple), a bridge whose
+    /// launcher version is this aterm's was started by it.
+    pub identity: Option<aterm_uds::process::Identity>,
+    /// The process `state/pid` named, read as that aterm's own child while the aterm lived: the
+    /// proof where the kernel keeps no pid versions (Linux).
+    pub child: Option<aterm_uds::process::Identity>,
 }
 
-/// Ends the bridge `state/pid` names through [`aterm_uds::process::end_proven`] only if `launcher`
-/// started it and it runs the [`aterm`] under test; otherwise leaves it alone.
-pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) {
+/// `pid`'s [`Launcher`], read while it lives (a process this test spawned and has not reaped,
+/// so the number names it): its identity, and the identity of the process `state/pid` names,
+/// kept only when that process's parent is `pid` and `pid` reads the same identity after it, so
+/// the read named this aterm's own live child.
+#[must_use]
+pub fn launcher_of(pid: u32, state: &Path) -> Launcher {
+    use aterm_uds::process::{read_identity, read_lineage};
+    let Ok(pid) = i32::try_from(pid) else {
+        return Launcher::default();
+    };
+    let identity = read_identity(pid);
+    let child = std::fs::read_to_string(state.join("pid"))
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .and_then(read_lineage)
+        .filter(|lineage| lineage.parent == pid.unsigned_abs())
+        .map(|lineage| lineage.identity);
+    let still = identity.is_some() && read_identity(pid) == identity;
+    Launcher {
+        identity,
+        child: child.filter(|_| still),
+    }
+}
+
+/// Whether `lineage`, a process that runs the [`aterm`] under test (`runs_ours`), is the bridge
+/// `launcher`'s aterm started: its launcher's pid version is that aterm's (Apple; this also
+/// proves a bridge the aterm restarted after `launcher` was read), or it is the very child read
+/// while that aterm lived (where the kernel keeps no versions, two missing versions prove
+/// nothing).
+#[must_use]
+pub fn bridge_proven(
+    lineage: &aterm_uds::process::Lineage,
+    runs_ours: bool,
+    launcher: &Launcher,
+) -> bool {
+    let started = launcher
+        .identity
+        .is_some_and(|aterm| lineage.launched_by(&aterm) == Some(true));
+    runs_ours && (started || launcher.child == Some(lineage.identity))
+}
+
+/// Ends the bridge `state/pid` names through [`aterm_uds::process::end_proven`] only if it proves
+/// to be the one `launcher`'s aterm started ([`bridge_proven`]) and runs the [`aterm`] under test;
+/// otherwise leaves it alone.
+pub fn end_bridge(state: &Path, launcher: Launcher) {
     use aterm_uds::process::{END_GRACE, EndControlLive, Identity, end_proven, pid_alive};
     let Some(pid) = std::fs::read_to_string(state.join("pid"))
         .ok()
@@ -405,8 +453,8 @@ pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) 
         let lineage = aterm_uds::process::read_lineage(pid)?;
         let runs = aterm_uds::process::read_process_path(pid)
             .and_then(|path| std::fs::canonicalize(path).ok());
-        let started = launcher.is_some_and(|l| l.idversion == lineage.launcher_version);
-        (started && ours.is_some() && runs == ours).then_some(lineage.identity)
+        let runs_ours = ours.is_some() && runs == ours;
+        bridge_proven(&lineage, runs_ours, &launcher).then_some(lineage.identity)
     };
     let Some(token) = proven(pid) else {
         if u32::try_from(pid).is_ok_and(pid_alive) {
@@ -461,7 +509,7 @@ impl Drop for Scratch {
 }
 
 fn child_exit(pid: i32, parent: u32) -> Result<std::os::fd::OwnedFd, String> {
-    let birth = aterm_uds::process::read_process_birth(pid)
+    let birth = aterm_uds::process::read_birth(pid)
         .ok_or_else(|| format!("cannot read child {pid}'s birth"))?;
     if aterm_uds::process::read_process_parent(pid) != Some(parent) {
         return Err(format!(
@@ -472,7 +520,7 @@ fn child_exit(pid: i32, parent: u32) -> Result<std::os::fd::OwnedFd, String> {
         .ok()
         .and_then(aterm_uds::exitwatch::exit_fd)
         .ok_or_else(|| format!("cannot watch child {pid}'s exit"))?;
-    if aterm_uds::process::read_process_birth(pid) != Some(birth)
+    if aterm_uds::process::read_birth(pid) != Some(birth)
         || aterm_uds::process::read_process_parent(pid) != Some(parent)
     {
         return Err(format!(
@@ -1863,7 +1911,11 @@ pub struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let launcher = self.gui.as_ref().and_then(|gui| identity_of(gui.id()));
+        let launcher = self
+            .gui
+            .as_ref()
+            .map(|gui| launcher_of(gui.id(), &self.state))
+            .unwrap_or_default();
         if let Some(mut gui) = self.gui.take() {
             let _ = gui.kill();
             let _ = gui.wait();

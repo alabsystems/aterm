@@ -7,9 +7,9 @@
 //! through [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
 //!
 //! It is [`crate::pet_baker`]'s path with no coat/iris key axes (every animal layer
-//! is `Recolor::Fixed`, so only [`CatColorKey`] can change a texel) and no eye-dot
+//! is `Recolor::Fixed`, so only [`CatColorKey`](crate::cat_baker::CatColorKey) can change a texel) and no eye-dot
 //! LOD: heads are authored bold enough for a 16 px bake (`art/animal/README.md`),
-//! so below [`FINE_DETAIL_MIN_H`] only the sub-pixel charm roles are culled.
+//! so below [`FINE_DETAIL_MIN_H`](crate::animal_baker::FINE_DETAIL_MIN_H) only the sub-pixel charm roles are culled.
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 

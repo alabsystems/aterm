@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Muse Code live upgrade's quiet flow, driven: a stand-in aterm instance on a real socket (every request recorded) whose screen is Muse Code 1.4.10's until the `signal`, the shell's prompt after it, and the relaunched Muse once the relaunch line is typed; a scripted kernel whose Muse lives until the signal and whose relaunch appears under the shell when its line is, writing the session's lock as Muse does; a store with the running build and a newer one the twin execs, each with its record; and the session's own log on disk.
+//! Tests for the Muse Code live upgrade's quiet flow over a stand-in instance and scripted kernel.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -590,13 +590,7 @@ impl Drop for LiveRig {
     }
 }
 
-/// AN IDLE MUSE BEHIND A NEWER BUILD IS RESTARTED ONTO IT, ITS SESSION KEPT,
-/// AND NOTHING IS TYPED AFTER: one SIGTERM to that very process; the claim
-/// on disk before it (in flight, the upgrade's cause, the process, the twin,
-/// quiet), which makes its exit the harness's own restart; one line typed —
-/// the managed twin `resume <uuid>` with the launch's flags — and no
-/// continuation; the record done once the session's lock names the new
-/// process (`done:resumed`).
+/// An idle Muse behind a newer build is restarted onto it with its session kept and nothing typed after.
 #[test]
 fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     let rig = LiveRig::new("idle", Knobs::default());
@@ -689,10 +683,7 @@ fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     );
 }
 
-/// THE HOST'S STEP hands the relaunched Muse back to its loop (`adopted`),
-/// whose next idle point owes its carry (`relaunch::owed_of`, its agent's
-/// alone) and carries it on QUIETLY: the lock names the new process, nothing
-/// is typed (`done:resumed`).
+/// The host's step hands the relaunched Muse back to its loop, and its carry types nothing.
 #[test]
 fn the_hosts_step_adopts_and_its_carry_types_nothing() {
     let rig = LiveRig::new(
@@ -782,10 +773,7 @@ fn holds(name: &str, knobs: Knobs, want: &str) {
     assert!(rig.record().is_none(), "{name}: no claim left");
 }
 
-/// G-M1 and G-M2 OVER THE SESSION'S LOG: a turn still running, a
-/// backgrounded shell running, its end queued and not drained, a subagent's
-/// open task, a subagent log that cannot be read, a log with no start of
-/// this process, each hold the restart with its own word.
+/// A turn, backgrounded shell, queued end, subagent task, unreadable log, or unproved log holds the restart.
 #[test]
 fn the_sessions_log_holds_running_work() {
     let open_turn = format!(
@@ -847,9 +835,7 @@ fn the_sessions_log_holds_running_work() {
     );
 }
 
-/// The positive half of G-M2: a backgrounded shell that ended, its item
-/// drained by Muse's own run and that run over, holds nothing; nor does a
-/// subagent whose work all ended.
+/// Ended and drained background or subagent work holds nothing.
 #[test]
 fn work_that_ended_and_was_drained_holds_nothing() {
     let drained = finished_turn(ROUTE_US + 100)
@@ -880,11 +866,7 @@ fn work_that_ended_and_was_drained_holds_nothing() {
     assert_eq!(rig.visit().step, "done:resumed");
 }
 
-/// THE READER, THE PERSON AND THE PROCESS RULE (G-M3): a running turn, the
-/// agent's own background panel (its reader reads it busy), a draft, a hold,
-/// a child process of any name (a bare `sleep` a shell `exec`'d, which
-/// Claude Code's shell-name list misses) and an unreadable process table each
-/// hold the restart.
+/// A busy screen, background panel, draft, hold, child process, or unreadable process table holds the restart.
 #[test]
 fn the_screen_the_person_and_any_child_hold_the_restart() {
     for (name, knobs, want) in [
@@ -941,11 +923,7 @@ fn the_screen_the_person_and_any_child_hold_the_restart() {
     }
 }
 
-/// THE BUILD AND THE ORDER: a probe of the new build out of time (Muse's
-/// auth lock held elsewhere) or exiting is no proof (`wait:build-fails`); a
-/// twin naming the running build or an older revision moves nothing
-/// (`current`); a launch no relaunch can carry is never restarted
-/// (`skip:…`); and at a background break nothing acts (`wait:break`).
+/// A failed probe, a same or older twin, an unknown flag, or a background break holds the restart.
 #[test]
 fn the_build_the_order_and_the_launch_hold_the_restart() {
     for (name, probe) in [("timeout", Probe::TimedOut), ("exits", Probe::Exited)] {
@@ -986,9 +964,7 @@ fn the_build_the_order_and_the_launch_hold_the_restart() {
     );
 }
 
-/// THE LAST LOOK AND THE SIGNAL put the claim back: a hold landing between
-/// the claim and the signal (`wait:changed-before-signal`) and a signal the
-/// server refuses (`wait:signal-held`) leave no record, nothing typed.
+/// A hold before the signal or a refused signal takes the claim back and types nothing.
 #[test]
 fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
     holds(
@@ -1012,8 +988,7 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
     assert!(rig.asked("turn").is_empty());
 }
 
-/// G-M1'S SCREEN HALF IS THE READER'S AUTHORITATIVE IDLE AND NO WALL
-/// ([`live::screen_idle`]).
+/// A fault or a wall on an idle screen holds the restart ([`live::screen_idle`]).
 #[test]
 fn a_fault_or_a_wall_on_an_idle_screen_holds_the_restart() {
     use aterm_phase::Phase;
@@ -1090,11 +1065,7 @@ fn a_fault_or_a_wall_on_an_idle_screen_holds_the_restart() {
     assert_eq!(rig.visit().step, "done:resumed");
 }
 
-/// THE LAST LOOK READS THE SESSION'S LOCK AGAIN: a lock that names another
-/// process by the time the claim is on disk (another Muse took the session
-/// between the looks) puts the record back AS IT STOOD — here an earlier
-/// restart's, done — and nothing is signalled or typed
-/// (`wait:changed-before-signal`).
+/// A lock naming another process at the last look puts the record back as it stood.
 #[test]
 fn a_lock_naming_another_process_at_the_last_look_takes_the_claim_back() {
     let rig = LiveRig::new(
@@ -1131,12 +1102,7 @@ fn a_lock_naming_another_process_at_the_last_look_takes_the_claim_back() {
     assert_eq!(kept.visit().step, "done:resumed");
 }
 
-/// A RESTART IN FLIGHT WHILE THE SHELL LEADS THE TAB (what a successor
-/// carrying it across a hand-off of aterm's own meets: `in_flight` lists the
-/// record, and its step reaches this lane with the shell in the foreground)
-/// is CARRIED by the lane's own rules — the relaunch line typed once the
-/// prompt is back, done once the lock names the new process — never left
-/// `current` with the Muse at its shell.
+/// A restart in flight is carried by the lane's own rules while the shell leads the tab.
 #[test]
 fn a_restart_in_flight_is_carried_while_the_shell_leads_the_tab() {
     let ready = Arc::new(AtomicBool::new(false));
@@ -1171,10 +1137,7 @@ fn a_restart_in_flight_is_carried_while_the_shell_leads_the_tab() {
     );
 }
 
-/// A MUSE RESTART THE STEP FINISHED BEFORE THE HOST'S CARRY OF ITS EXIT
-/// (`relaunch::carry_restart`'s Muse Code half, `muse_landed`): the host read
-/// the exit as the restart's while it was in flight, and the step's own
-/// relaunch closed the record `done` before the carry's try.
+/// A Muse restart finished by the step before the host's carry of its exit reports `landed`.
 #[test]
 fn a_muse_restart_finished_before_its_carry_has_landed() {
     use crate::harness::relaunch::{CAUSE_EXIT, STOPPED_OWN_S, carry_restart};
@@ -1333,13 +1296,7 @@ fn state_rows(s: &State) -> Vec<String> {
     fixture_rows(fixture)
 }
 
-/// THE REAL DECISION AT STATE `s`: the order of its builds
-/// ([`pure::moves_onto`]) and the gate ([`pure::gate`]) over the look the
-/// real readers make of its world, composed by the drive's own
-/// [`live::look_of`] — the person by the `status` line's own rule
-/// (`held_by_status`), the screen by the drive's guard over Muse's reader
-/// (`live::screen_idle`) and its composer, the log by [`pure::quiet_log`],
-/// the children by the process rule (`descendants_in`).
+/// Whether the real quiet flow restarts at state `s` ([`pure::moves_onto`] and [`pure::gate`]).
 fn real_restarts(s: &State) -> bool {
     let (running, target) = versions(s["landed"]);
     let rows = state_rows(s);
@@ -1363,10 +1320,7 @@ fn real_restarts(s: &State) -> bool {
     pure::moves_onto(running, target) && pure::gate(&look).is_ok()
 }
 
-/// THE REAL CLAIM: the record the step writes before its signal, from a
-/// snapshot of the Muse it ends, read by the one rule the host's exit watch
-/// reads a leaving agent by (`relaunch::ended_by_restart`): `true` is its
-/// exit relaunched as the harness's own restart.
+/// Whether the record written before the signal is read by `ended_by_restart` as a harness restart.
 fn real_claim_relaunches() -> bool {
     let rig = LiveRig::new("tier1-claim", Knobs::default());
     let mut snap = rig.snap_of(S1);
@@ -1401,11 +1355,7 @@ impl LiveRig {
     }
 }
 
-/// Tier-1 of `HarnessMuseQuietUpgrade` (aterm-models-harness
-/// `harness_muse_quiet_upgrade_model`): every state the model reaches before
-/// the move is replayed through the real order, log reader, screen reader,
-/// person rule, process rule and gate, and the model's `Restart` is enabled
-/// EXACTLY where the real quiet flow restarts.
+/// Tier-1 conformance test for `HarnessMuseQuietUpgrade`.
 #[test]
 fn tier1_the_real_muse_quiet_upgrade_conforms_to_the_model() {
     let model = aterm_models_harness::harness_muse_quiet_upgrade_model();

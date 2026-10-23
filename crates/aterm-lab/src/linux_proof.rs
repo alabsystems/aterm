@@ -149,8 +149,6 @@ pub fn parse_a11y(args: &[String]) -> Result<ProofArgs, Fail> {
     Ok(p)
 }
 
-/// The words `proof`, `gone`, `cpu` and `a11y` share; `displays` stays empty
-/// when none is named.
 fn parse_args(args: &[String], verb: &str) -> Result<ProofArgs, Fail> {
     let mut p = ProofArgs {
         arches: Vec::new(),
@@ -313,7 +311,6 @@ pub struct Tally {
     pub error: Option<String>,
 }
 
-/// The test binary a cargo `Running` line names (`aterm_pty`, `roundtrip`).
 fn binary_of(running: &str) -> String {
     let path = running
         .rsplit_once('(')
@@ -427,7 +424,7 @@ pub fn test_verdict(name: &str, out: &Out) -> Row {
 /// How the x86_64 cell's uds, pty and libc tests run: one at a time.
 pub const ROSETTA_ONE_AT_A_TIME: &str = "--test-threads=1";
 
-/// The uds, pty and libc row's hang detector.
+/// A test row's hang detector; it times the tests alone ([`test_run`] builds them first).
 pub const TEST_ROW_HANG_SECS: u32 = 1800;
 
 /// `timeout` for a guest command: TERM at `secs`, KILL ten seconds later.
@@ -436,23 +433,46 @@ pub fn hang_detector(secs: u32) -> Vec<String> {
     vec!["timeout".into(), "--kill-after=10".into(), secs.to_string()]
 }
 
+/// A test row's `cargo test` (or `bench`) arguments with `--no-run` in place
+/// of what follows `--` (the test binaries' own arguments).
+#[must_use]
+pub fn no_run<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut built: Vec<&str> = args.iter().copied().take_while(|a| *a != "--").collect();
+    built.push("--no-run");
+    built
+}
+
+/// A test row's run, `cargo(args)` being its cargo argv: built first ([`no_run`]) with no hang
+/// detector, since a cold build on a loaded host is slow, not hung, then run under
+/// [`TEST_ROW_HANG_SECS`]. A failed build is the row's output; the seconds are both steps'.
+#[must_use]
+pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) -> Out {
+    let built = up
+        .lima
+        .shell_streamed(&up.home, &cargo(&no_run(args)), "  | ");
+    if !built.ok() {
+        return built;
+    }
+    let mut argv = hang_detector(TEST_ROW_HANG_SECS);
+    argv.extend(cargo(args));
+    let mut out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+    out.secs += built.secs;
+    out
+}
+
 /// The packages whose Linux tests the proof runs.
 pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 
 /// The static bootstrap verifier's package and executable (install.sh's Linux verifier).
 pub const VERIFIER: &str = "aterm-bootstrap-verify";
 
-/// The two static builds of [`VERIFIER`] the lane makes, as `(shape, target dir under the
-/// lane, debug assertions)`: the shipped one, and one with the test anchor compiled in.
+/// Static builds of [`VERIFIER`] made by the lane as `(shape, target_dir, debug_assertions)`.
 pub const VERIFIER_SHAPES: [(&str, &str, bool); 2] = [
     ("shipped", "verifier-target", false),
     ("test", "verifier-test-target", true),
 ];
 
-/// The cargo arguments of one static build of [`VERIFIER`] for `triple`, as the release
-/// producer builds it: `--release --target <triple>` with the C library linked in
-/// (`aterm_bootstrap_verify::pin::static_build_config`), and with debug assertions on for
-/// the test shape.
+/// Cargo arguments for a static build of [`VERIFIER`] for `triple`.
 #[must_use]
 pub fn verifier_build_args(manifest: &str, triple: &str, assertions: bool) -> Vec<String> {
     let mut argv: Vec<String> = [
@@ -481,11 +501,6 @@ pub fn verifier_build_args(manifest: &str, triple: &str, assertions: bool) -> Ve
     argv
 }
 
-/// install.sh's bootstrap verifier on one architecture: [`VERIFIER_SHAPES`] built
-/// ([`verifier_build_args`]); its install_sh suite run through install.sh over the test
-/// shape, the shipped shape's own test (`--include-ignored`) holding it to a static ELF
-/// that trusts the paper master alone; then install.sh's embedded verifier's tests, which
-/// need the Python 3.11+ and OpenSSL 3 this guest provides.
 fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<Row> {
     let manifest = format!("{repo}/Cargo.toml");
     let mut rows = Vec::new();
@@ -590,8 +605,6 @@ pub fn seat_env(runtime: &str, mutter_pid: &str, bin: &str) -> Vec<(String, Stri
     ]
 }
 
-/// Whether Xvfb's display lists no MIT-SHM (`xdpyinfo -queryExtensions`),
-/// so a CPU row on it can only have taken the presenter's PutImage path.
 fn no_shm(up: &Up) -> Result<(), String> {
     let out = up.sh(&guest::with_env(
         &[Display::Xvfb.client_env(&up.runtime)],
@@ -840,7 +853,6 @@ impl Gui<'_> {
         Ok(())
     }
 
-    /// Start it, drive it, stop it: the row's verdict and detail.
     fn drive(&self, display: Option<Display>, results: &Path) -> (Verdict, String) {
         if let Err(e) = self.prepare() {
             return (Verdict::NotRun, format!("scratch world: {e}"));
@@ -995,8 +1007,6 @@ impl Gui<'_> {
         self.start_unit(client.as_ref().map(|c| &c[..]), extra, stderr, false)
     }
 
-    /// `client`: what aterm-gui is told to reach its display by; `None` runs
-    /// it `--headless`.
     fn start_unit(
         &self,
         client: Option<&[(String, String)]>,
@@ -1033,7 +1043,6 @@ impl Gui<'_> {
                 "\"$0\" \"$@\" 2>\"$ATERM_LANE_STDERR\"; echo $? >\"$ATERM_LANE_STATUS.part\" \
                  && mv \"$ATERM_LANE_STATUS.part\" \"$ATERM_LANE_STATUS\""
             } else {
-                // `exec`, so the unit's main process is aterm-gui itself.
                 "exec \"$0\" \"$@\" 2>\"$ATERM_LANE_STDERR\""
             };
             let mut wrapped = vec!["sh".to_string(), "-c".into(), script.into()];
@@ -1115,9 +1124,6 @@ impl Gui<'_> {
         }
     }
 
-    /// The CPU presenter's row (LW.6): typed, echoed, resized (new buffers),
-    /// `render=ok`, and the frame aterm presented (`image`), held to the
-    /// display server's own pixels ([`Gui::held_to_server`]).
     fn judge_cpu(&self, display: Display, results: &Path) -> Result<String, String> {
         if !self.up.sh(&guest::wait_socket(&self.sock(), 60)).ok() {
             return Err("the control socket never listened (60 s)".into());
@@ -1362,9 +1368,6 @@ impl Gui<'_> {
         }
     }
 
-    /// The whole primary monitor of the lane's Mutter, as `lane-bus cast`
-    /// writes it (a ScreenCast frame read through PipeWire), copied out as
-    /// `<name><suffix>-monitor.png`.
     fn mutter_cast(&self, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let pid = unit_pid(self.up, &format!("{}mutter", guest::UNIT_PREFIX))
             .ok_or_else(|| "Mutter's unit has no main pid".to_string())?;
@@ -1396,8 +1399,6 @@ impl Gui<'_> {
         Ok(local)
     }
 
-    /// The X window's pixels (`lane-bus xgrab` of the window aterm-gui's
-    /// unit owns), copied out as `<name><suffix>.ppm`.
     fn x_grab(&self, display: Display, results: &Path, suffix: &str) -> Result<PathBuf, String> {
         let x = vec![display.client_env(&self.up.runtime)];
         let pid = unit_pid(self.up, &Self::unit_name())
@@ -1447,9 +1448,6 @@ impl Gui<'_> {
         Ok(ppm)
     }
 
-    /// aterm-gui's window in the scene graph of the weston that is `display`
-    /// (`weston-debug scene-graph`, which weston's `--debug` allows): where
-    /// weston shows it.
     fn weston_view(&self, display: Display) -> Result<WestonView, String> {
         let pid = unit_pid(self.up, &Self::unit_name())
             .ok_or_else(|| "aterm-gui's unit has no main pid".to_string())?;
@@ -1465,10 +1463,6 @@ impl Gui<'_> {
         read_weston_view(&dump, &pid)
     }
 
-    /// The whole output of the weston that is `display`, as
-    /// `weston-screenshooter` writes it (a PNG in its working directory,
-    /// through `weston_capture_v1`), copied out as
-    /// `<name><suffix>-output.png`.
     fn weston_shot(
         &self,
         display: Display,
@@ -1511,8 +1505,6 @@ impl Gui<'_> {
         Ok(local)
     }
 
-    /// A GPU row's drive: its detail, and the `backend=` `metrics` names once
-    /// the frame is taken, which [`drew_on_gpu`] judges with the journal.
     fn judge(
         &self,
         display: Option<Display>,
@@ -1717,7 +1709,6 @@ pub(crate) fn weston_view(dump: &str, pid: &str) -> Option<WestonView> {
     })
 }
 
-/// The scene-graph observation used by the live CPU row, including its command status.
 fn read_weston_view(dump: &Out, pid: &str) -> Result<WestonView, String> {
     if !dump.ok() {
         return Err(format!("weston-debug scene-graph failed: {}", dump.tail(5)));
@@ -2018,9 +2009,9 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 tests.push(ROSETTA_ONE_AT_A_TIME);
             }
             println!("\n=== {tag}: aterm-uds, aterm-pty, aterm-libc tests ===");
-            let mut argv = hang_detector(TEST_ROW_HANG_SECS);
-            argv.extend(cargo(&env, &format!("{repo}/Cargo.toml"), "test", &tests));
-            let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+            let manifest = format!("{repo}/Cargo.toml");
+            let workspace = |args: &[&str]| cargo(&env, &manifest, "test", args);
+            let out = test_run(&up, workspace, &tests);
             rows.push(translator_not_runs(
                 test_verdict(&format!("{tag} tests: uds pty libc"), &out),
                 &out.text,
@@ -2053,14 +2044,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 break 'arches;
             }
             println!("\n=== {tag}: {SHELLS} tests (bash, zsh, fish, pwsh) ===");
-            let mut argv = hang_detector(TEST_ROW_HANG_SECS);
-            argv.extend(cargo(
-                &env,
-                &format!("{repo}/Cargo.toml"),
-                "test",
-                &["--no-fail-fast", "--tests", "-p", SHELLS],
-            ));
-            let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+            let out = test_run(&up, workspace, &["--no-fail-fast", "--tests", "-p", SHELLS]);
             rows.push(test_verdict(
                 &format!("{tag} tests: shell integration (bash, zsh, fish, pwsh)"),
                 &out,
@@ -2579,8 +2563,45 @@ mod tests {
         }
     }
 
-    /// The lane builds the verifier as a release does, static for an explicit target, and
-    /// only its test shape with debug assertions, in a target directory of its own.
+    /// A row's build takes its cargo arguments and none of the test
+    /// binaries' (a `--nocapture` or a filter would be cargo's error there).
+    #[test]
+    fn a_rows_build_is_its_cargo_arguments_with_no_run() {
+        let filtered = [
+            "--no-fail-fast",
+            "-p",
+            "aterm-gui",
+            "--lib",
+            "--",
+            "a11y",
+            "--nocapture",
+        ];
+        assert_eq!(
+            no_run(&filtered),
+            ["--no-fail-fast", "-p", "aterm-gui", "--lib", "--no-run"]
+        );
+        let bench = [
+            "-p",
+            "aterm-a11y",
+            "--bench",
+            "live_atspi",
+            "--profile",
+            "test",
+        ];
+        assert_eq!(
+            no_run(&bench),
+            [
+                "-p",
+                "aterm-a11y",
+                "--bench",
+                "live_atspi",
+                "--profile",
+                "test",
+                "--no-run"
+            ]
+        );
+    }
+
     #[test]
     fn the_lane_builds_the_verifier_as_a_release_does() {
         for arch in [Arch::Aarch64, Arch::X86_64] {
@@ -2622,9 +2643,6 @@ mod tests {
         assert!(!lists_extension(&without, "MIT-SHM"), "{without}");
     }
 
-    /// A refused verb says how it ended, so the stats Deck's empty reply
-    /// would tell a guest-side signal (a silent exit 255) from this Mac's
-    /// `limactl` ended on one (no exit status).
     #[test]
     fn a_refused_verb_says_how_it_ended() {
         let out = |code: Option<i32>, text: &str| Out {
@@ -2690,8 +2708,6 @@ mod tests {
         );
     }
 
-    /// `gone` kills Xvfb and weston unless told otherwise, and only `gone`
-    /// builds the wgpu oracle.
     #[test]
     fn gone_runs_its_displays_and_alone_takes_the_oracle() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2712,8 +2728,6 @@ mod tests {
         );
     }
 
-    /// `a11y` runs its own rows on every arch unless named; its aterm-gui rows
-    /// are Xvfb's, so it takes no display.
     #[test]
     fn a11y_runs_its_rows_alone_on_every_arch_unless_named() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2737,9 +2751,6 @@ mod tests {
         assert!(!parse_proof(&[]).expect("parses").a11y_only);
     }
 
-    /// `--weston-renderer` is taken where it chooses a weston's renderer
-    /// (proof, gone, cpu, deck), and refused by `edges`, whose one weston row
-    /// is pixman's whatever a run names.
     #[test]
     fn the_weston_renderer_is_taken_where_it_starts_a_weston() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
@@ -2756,8 +2767,6 @@ mod tests {
         );
     }
 
-    /// The shape of a `text` reply measured under Xvfb on 2026-10-16: only the
-    /// output row is the echo alone; the typed line carries the arithmetic.
     #[test]
     fn the_echo_row_is_the_output_never_the_typed_line() {
         let screen = "user@lima:/w$ echo LANE-$((6*7))\nLANE-42\nuser@lima:/w$ \n\n";
@@ -2773,8 +2782,6 @@ mod tests {
         assert_eq!(echo_row(reply("\n\n$ echo x\nLANE-42\n$ \n\n")), Some(3));
     }
 
-    /// The shape measured in the guest on 2026-10-16: a staged child's own
-    /// `test result:` and `FAILED` lines inside a failing test's section.
     const STAGED: &str = "\
      Running unittests src/lib.rs (lane/target/debug/deps/aterm_uds-04e96a6b8de7de57)
 
@@ -2951,7 +2958,6 @@ error: 1 target failed:
         assert_eq!(parse_ppm(b"P3\n1 1\n255\n1 2 3"), None, "not binary");
     }
 
-    /// A `w` x `h` RGBA image whose pixel at (x, y) is `paint(x, y)`.
     fn rgba(
         w: usize,
         h: usize,
@@ -3008,9 +3014,6 @@ error: 1 target failed:
         assert!(held_at(&output, &frame, -1, 3, 0..0).is_err());
     }
 
-    /// The frame found where it shows whole; negative controls: one pixel
-    /// off (nowhere), a live row's pixel off (still there), shown twice (not
-    /// placed), larger than the screen.
     #[test]
     fn a_frame_is_found_where_it_shows_whole() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];
@@ -3043,8 +3046,6 @@ error: 1 target failed:
         assert_eq!(frame_places(&small, &frame, 0..0), []);
     }
 
-    /// A window's buffer wider and taller than its frame: the frame at its
-    /// offset, the bands around it each the frame's nearest pixel.
     #[test]
     fn a_buffer_s_bands_continue_the_frame_s_edge() {
         let pixel = |x: usize, y: usize| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7];

@@ -33,6 +33,23 @@ pub use shim::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 /// Define the two browser clocks this crate reads on `wasm32-unknown-unknown`,
 /// from the wasm module's own bindings of `performance.now()` and
 /// `Date.now()`, each a `fn() -> f64`.
+///
+/// Invoke it once, in the crate that builds the `.wasm` (the cdylib). It
+/// expands to two `#[unsafe(no_mangle)] extern "C"` functions named
+/// `aterm_wasm_performance_now` and `aterm_wasm_date_now`. Each is gated to
+/// `wasm32-unknown-unknown`, so the invocation compiles to nothing on every
+/// other target, natively included. Being `no_mangle` in a cdylib, both are
+/// also exports of the module.
+///
+/// ```
+/// fn performance_now() -> f64 {
+///     0.0
+/// }
+/// fn date_now() -> f64 {
+///     0.0
+/// }
+/// aterm_time::wasm_clock_host!(performance_now, date_now);
+/// ```
 #[macro_export]
 macro_rules! wasm_clock_host {
     ($performance_now:path, $date_now:path $(,)?) => {

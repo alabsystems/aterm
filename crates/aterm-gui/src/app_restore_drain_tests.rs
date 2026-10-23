@@ -1,16 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE COLD DRAIN ([`super::RestoreDrain`]): a cold launch's layout rebuild, a slice per park.
+//! Cold-launch layout rebuild tests ([`super::RestoreDrain`]).
 
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 use crate::{App, WindowId, restore};
 
-/// A one-pane terminal leaf named `title` by its operator title, which rides
-/// onto whichever shell fills it (a fresh one or the grafted bootstrap) and
-/// back into a capture — what these tests tell tabs apart by.
 fn leaf(title: &str) -> restore::RestoredSplitTree {
     restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
         restore::TerminalLeafRestore {
@@ -40,8 +37,6 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
     ))
 }
 
-/// A window of one-pane tabs titled `titles`, `front` in front, as a quit
-/// writes it.
 fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
     restore::WindowLayout {
         rows: 24,
@@ -68,8 +63,6 @@ fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
     }
 }
 
-/// One slice of a desk whose windows after the first are logical windows
-/// over a stub shell (a unit test has no event loop to create glass with).
 fn slice(app: &mut App) -> bool {
     app.drain_restore_slice(Duration::ZERO, |app, first, wl, placed, filling| {
         if first {
@@ -94,8 +87,6 @@ fn drain(app: &mut App) {
     }
 }
 
-/// The operator title of the shell a tab shows (empty for one a person
-/// opened).
 fn named(app: &App, tab: &crate::tab_model::Tab) -> String {
     let session = app
         .view_store
@@ -143,7 +134,6 @@ fn layout_titles(wl: &restore::WindowLayout) -> Vec<String> {
         .collect()
 }
 
-/// A person opens a tab in `wid`, as the tests of a live window do.
 fn open_tab(app: &mut App, wid: WindowId) -> u64 {
     let id = app.next_session_id;
     let session = crate::stub_session(id);
@@ -161,9 +151,6 @@ fn open_tab(app: &mut App, wid: WindowId) -> u64 {
     id
 }
 
-/// The window that has painted gets its bootstrap tab back at once, then the
-/// tab it had in front, each in its place; one tab per slice after that, and
-/// the desk ends exactly as it was written, with the rebuild owed until then.
 #[test]
 fn a_cold_drain_lands_the_front_tab_second_and_ends_as_recorded() {
     let mut app = App::headless_for_test();
@@ -196,9 +183,6 @@ fn a_cold_drain_lands_the_front_tab_second_and_ends_as_recorded() {
     );
 }
 
-/// A tab the person closes while the drain runs stays closed, and one they
-/// open is kept, after the restored tabs it was opened beside; their choice
-/// of front tab stands.
 #[test]
 fn a_person_s_tabs_outlive_the_drain_and_a_closed_tab_stays_closed() {
     let mut app = App::headless_for_test();
@@ -233,9 +217,6 @@ fn a_person_s_tabs_outlive_the_drain_and_a_closed_tab_stays_closed() {
     );
 }
 
-/// Each window lands in turn, its own tabs a slice at a time; a window the
-/// person closes while its tabs land owes nothing more, and is not made
-/// again.
 #[test]
 fn the_drain_takes_windows_in_turn_and_a_closed_window_owes_nothing() {
     let mut app = App::headless_for_test();
@@ -307,9 +288,6 @@ fn the_crash_journal_captures_nothing_until_the_drain_is_done() {
     crate::crash_journal::tests::await_released(&journal_dir.path().join(journal.lock_name()));
 }
 
-/// A quit in the drain's first instants keeps every tab and window it still
-/// owed: the quit's layout is the rebuilt part with the owed part after it,
-/// and it parses back.
 #[test]
 fn a_quit_inside_the_drain_keeps_every_tab_and_window_it_owed() {
     let mut app = App::headless_for_test();
@@ -332,10 +310,6 @@ fn a_quit_inside_the_drain_keeps_every_tab_and_window_it_owed() {
     assert_eq!(layout_titles(&parsed.windows[0]), ["A", "B", "C", "D"]);
 }
 
-/// A mid-drain quit has the same tab order as finishing the drain: the
-/// restored tabs retain their manifest positions around the live tabs, a
-/// closed restored tab stays closed, and the person's selected tab stays
-/// selected after owed tabs are inserted before it.
 #[test]
 fn a_mid_drain_quit_preserves_live_tabs_and_the_persons_selection() {
     let mut app = App::headless_for_test();
@@ -368,9 +342,6 @@ fn a_mid_drain_quit_preserves_live_tabs_and_the_persons_selection() {
     assert!(app.pool.get(mine).is_some(), "the person's shell lives");
 }
 
-/// A tab that lands behind the one in front leaves that tab as the person
-/// has it: a find bar they open while the drain runs stays open as the rest
-/// of the desk lands.
 #[test]
 fn tabs_landing_behind_the_front_one_leave_its_find_bar_open() {
     let mut app = App::headless_for_test();
@@ -393,8 +364,6 @@ fn tabs_landing_behind_the_front_one_leave_its_find_bar_open() {
     );
 }
 
-/// An agent a leaf carries, as an earlier crash's or restart's layout names
-/// it: its conversation `session`.
 fn carried_agent(session: &str) -> Box<restore::AgentRestore> {
     Box::new(restore::AgentRestore {
         pid: 4242,
@@ -413,8 +382,6 @@ fn carried_agent(session: &str) -> Box<restore::AgentRestore> {
     })
 }
 
-/// Tab `at` of `wl` as the previous launch's layout wrote it: its pool id
-/// then, the owner's hold and the agent it carries.
 fn written_as(
     wl: &mut restore::WindowLayout,
     at: usize,
@@ -433,8 +400,6 @@ fn written_as(
     leaf.agent = agent;
 }
 
-/// Each tab of `wl`: its title, pool id, its holds (`,`-joined, none: `None`)
-/// and its agent's conversation.
 type Carried = (String, Option<u64>, Option<String>, Option<String>);
 
 fn carried(wl: &restore::WindowLayout) -> Vec<Carried> {
@@ -454,8 +419,6 @@ fn carried(wl: &restore::WindowLayout) -> Vec<Carried> {
         .collect()
 }
 
-/// A TAB THE DRAIN STILL OWES KEEPS ITS OWN AGENT AND THE OWNER'S HOLD
-/// THROUGH A RESTART'S QUIT, AND TAKES NO LIVE TAB'S (RV-SURV-1).
 #[test]
 fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
@@ -550,11 +513,6 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     );
 }
 
-/// A PERSON'S OWN QUIT INSIDE THE DRAIN KEEPS NO AGENT AND NO HOLD
-/// (RV-SURV-1): an owed tab carried the agent and the owner's hold its
-/// earlier layout — a crash's, a restart's — named, and the quit wrote them
-/// on, so the next launch relaunched an agent the person's own quit had
-/// ended.
 #[test]
 fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
     const C_AGENT: &str = "0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c";
@@ -595,9 +553,6 @@ fn a_persons_own_quit_inside_the_drain_keeps_no_agent_and_no_hold() {
     );
 }
 
-/// A LANDED HELD TAB KEEPS ITS AGENT DOWN THROUGH A RESTART INSIDE THE
-/// DRAIN, WHATEVER PUT ITS HOLD BACK (the merge review's GUI-M7-1; ruling 23
-/// (ii)).
 #[test]
 fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     use crate::fabric::apply_hold_for_test;
@@ -756,13 +711,6 @@ fn a_restart_inside_the_drain_keeps_a_landed_held_tabs_agent_down() {
     }
 }
 
-/// THE TABS THE DRAIN HAS LANDED KEEP THEIR AGENTS THROUGH A RESTART'S QUIT
-/// TOO (F1): each one's agent waits in the restore's own list
-/// (`App::restored_agents`) until the drain's last slice hands it to the
-/// host, so neither the host's queue nor an agent it publishes names it
-/// yet, and the quit's fill (`App::fill_desk_agents`) wrote no agent on
-/// any landed tab — a restart in a cold drain's first instants relaunched
-/// none of the desk's agents at the next launch.
 #[test]
 fn a_system_quit_inside_the_drain_keeps_the_landed_tabs_agents_not_yet_handed() {
     let agents = [

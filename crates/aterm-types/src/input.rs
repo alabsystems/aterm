@@ -12,11 +12,6 @@
 //! let back: KeyCode = key.try_into().expect("Enter round-trips");
 //! assert_eq!(back, KeyCode::Enter);
 //! ```
-//! use aterm_types::input::KeyCode;
-//! use aterm_types::keyboard::Key;
-//! let key: Key = KeyCode::Enter.try_into().expect("Enter is bridgeable");
-//! let back: KeyCode = key.try_into().expect("Enter round-trips");
-//! assert_eq!(back, KeyCode::Enter);
 
 /// Key codes for key events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

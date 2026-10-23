@@ -85,6 +85,15 @@ impl GlTexture {
         self.stored != (self.width, self.height)
     }
 
+    /// The share of the storage the texels in use fill, per axis: `[1.0, 1.0]` unless roomy.
+    pub(crate) fn extent(&self) -> [f32; 2] {
+        let (sw, sh) = self.stored;
+        [
+            self.width as f32 / sw as f32,
+            self.height as f32 / sh as f32,
+        ]
+    }
+
     /// Let this texture go once the frame is out ([`GlDevice::free_retired`]) instead of now.
     pub(crate) fn retire(mut self) {
         let names = [
@@ -106,7 +115,8 @@ impl GlTexture {
         }
         let gl = cur.gl();
         let mut fbo = 0;
-        // SAFETY: the context is current.
+        // SAFETY: the context is current; out-pointer live; the texture name belongs to this
+        // context and has storage.
         let status = unsafe {
             (gl.gen_framebuffers)(1, &raw mut fbo);
             (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
@@ -347,7 +357,8 @@ impl GlDevice {
         let cur = self.enter()?;
         let gl = cur.gl();
         let mut name = 0;
-        // SAFETY: the context is current.
+        // SAFETY: the context is current; dimensions checked against the device's maximum; one
+        // level of a sized internal format.
         unsafe {
             (gl.gen_textures)(1, &raw mut name);
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, name);
@@ -425,7 +436,8 @@ impl GlDevice {
         }
         let cur = self.enter()?;
         let gl = cur.gl();
-        // SAFETY: the context is current.
+        // SAFETY: the context is current; the region is inside the texture and `bytes` covers it
+        // at the stated row length (checked above).
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);
@@ -553,7 +565,8 @@ impl GlDevice {
         let cur = self.enter()?;
         let fbo = tex.fbo(&cur)?;
         let gl = cur.gl();
-        // SAFETY: the context is current.
+        // SAFETY: the context is current; `out` holds `height` rows of `padded` bytes at a pack
+        // row length of `padded / 4` texels, so the copy stays inside it.
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
             (gl.pixel_storei)(ffi::GL_PACK_ALIGNMENT, 4);

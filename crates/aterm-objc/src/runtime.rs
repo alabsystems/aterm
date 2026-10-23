@@ -111,8 +111,7 @@ unsafe impl Send for Sel {}
 unsafe impl Sync for Sel {}
 
 impl std::fmt::Debug for Sel {
-    /// Prints the selector's name via `sel_getName`; that a `SEL` points at its
-    /// own name is an objc4 implementation detail, not ABI.
+    /// Prints the selector's name via `sel_getName`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.is_null() {
             return f.write_str("Sel(null)");
@@ -266,9 +265,7 @@ unsafe extern "C" {
     fn objc_release(obj: Id);
     fn objc_autoreleasePoolPush() -> *mut c_void;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
-    /// Hand a +1 reference to the innermost pool, for [`autorelease`]: a
-    /// declared method returning an object not named
-    /// `new*`/`alloc`/`copy*`/`mutableCopy*` owes its caller +0.
+    /// Hand a +1 reference to the innermost pool, for [`autorelease`].
     fn objc_autorelease(obj: Id) -> Id;
 
     pub(crate) fn objc_allocateClassPair(
@@ -365,9 +362,7 @@ unsafe extern "C" {}
 /// ) -> i64 = unsafe { msg() };
 /// ```
 ///
-/// There is no impl for `unsafe extern "C" fn(..)`: a `"C"` send is
-/// `nounwind`, so an `NSException` raised inside it skips the calling frame's
-/// `Drop`s or aborts (see the note on `objc_msgSend`):
+/// There is no impl for `unsafe extern "C" fn(..)`:
 ///
 /// ```compile_fail
 /// # use aterm_objc::{Id, Sel, msg};
@@ -840,9 +835,6 @@ impl Obj {
 }
 
 impl Drop for Obj {
-    /// Releasing may run `dealloc`, which can autorelease into the current
-    /// frame; holding an [`AutoreleasePool`] across the scope is the caller's
-    /// obligation, not a hidden push/pop per release.
     fn drop(&mut self) {
         // SAFETY: `self.0` is non-null by construction and holds exactly one +1 reference, released once here.
         unsafe { objc_release(self.0) }
@@ -860,6 +852,26 @@ pub unsafe fn autorelease(obj: Id) -> Id {
 }
 
 /// An `@autoreleasepool` scope.
+///
+/// Popping an outer pool before an inner one frees what the inner pool holds
+/// and then aborts in the runtime, so the token constructor is `unsafe` and
+/// [`autoreleasepool`]'s nested scopes are the safe API. This does not compile:
+///
+/// ```compile_fail
+/// # use aterm_objc::AutoreleasePool;
+/// let outer = AutoreleasePool::new();
+/// let inner = AutoreleasePool::new();
+/// drop(outer);
+/// drop(inner);
+/// ```
+///
+/// The same intent, as scopes:
+///
+/// ```
+/// # use aterm_objc::autoreleasepool;
+/// let n = autoreleasepool(|_outer| autoreleasepool(|_inner| 7));
+/// assert_eq!(n, 7);
+/// ```
 pub struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {

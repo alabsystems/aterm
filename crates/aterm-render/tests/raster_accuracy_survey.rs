@@ -610,6 +610,14 @@ fn guard_chars(bytes: &'static [u8], name: &str, stride: usize) -> Vec<char> {
 
 /// The accuracy bound on `raster::draw_quad` / `raster::draw_cubic`, in three
 /// limbs:
+///
+/// * `MEAN_LIMIT`: the pooled corpus mean.
+/// * `ROW_MEAN_LIMIT`: the mean of each (face, size) row on its own. The pooled
+///   mean is texel-weighted; the Nerd face is 76.8% of the scored texels and
+///   DejaVu at 12 and 16 px, what a terminal draws, only 1.9% and 2.5%, so a
+///   regression there alone moves the pooled mean by under its printed
+///   precision.
+/// * `MAX_LIMIT`: the worst single cell of any one glyph.
 #[test]
 fn flattening_accuracy_is_bounded() {
     /// Corpus mean |coverage error|, in 0..255 units, pooled over every raster.

@@ -1441,7 +1441,8 @@ impl<'a> Face<'a> {
         self.tables.head.global_bbox
     }
 
-    /// Returns the glyph's raster image closest to `pixels_per_em`.
+    /// Returns the glyph's raster image from the smallest strike at or above `pixels_per_em`, else
+    /// the largest.
     #[inline]
     pub fn glyph_raster_image(
         &self,

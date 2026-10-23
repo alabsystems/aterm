@@ -25,6 +25,27 @@ pub(crate) const fn default_cursor_trail_style() -> &'static str {
     }
 }
 
+/// `toml` with the cursor trail drawn on every platform: where decorative
+/// effects are off by default (Windows), the default style and its momentum
+/// glow go ahead of it unless it names them.
+#[cfg(test)]
+pub(crate) fn trail_drawn(toml: &str) -> String {
+    if DEFAULT_DECORATIVE_EFFECTS {
+        return toml.to_string();
+    }
+    let mut out = String::new();
+    if !toml.contains("cursor_trail_style =") {
+        out.push_str(&format!(
+            "cursor_trail_style = \"{}\"\n",
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        ));
+    }
+    if !toml.contains("cursor_momentum_glow =") {
+        out.push_str("cursor_momentum_glow = true\n");
+    }
+    out + toml
+}
+
 /// The cursor style an aterm.toml draws from its `cursor_trail_style` (`style`) and the retired `cursor_trail` master (`master`), trimmed.
 pub(crate) fn drawn_cursor_trail_style(master: Option<bool>, style: Option<&str>) -> &str {
     if master == Some(false) {
@@ -6463,7 +6484,7 @@ impl App {
         }
     }
 
-    /// Rebuild the [`Backend`] from the current `font_px` and `theme`, re-grid and repaint (font zoom, [`Self::set_font_px`]; config reload runs the same body with worker-prepared fonts).
+    /// Rebuild the [`Backend`] from the current `font_px` and `theme`, re-grid and repaint (font zoom, [`Self::set_font_size`]; config reload runs the same body with worker-prepared fonts).
     #[must_use = "a failed rebuild leaves the prior renderer live and requires caller policy"]
     pub(crate) fn rebuild_backend(&mut self) -> bool {
         self.rebuild_backend_with_prepared(None)
@@ -7686,7 +7707,7 @@ impl App {
         )
     }
 
-    /// Re-resolve every window's [`MetricsView`] from the live font size.
+    /// Re-resolve every window's [`MetricsView`](crate::MetricsView) from the live font size.
     pub(crate) fn refresh_all_window_metrics(&mut self) {
         let forced = resolve_force_scale();
         let size = self.font_size;
@@ -9947,7 +9968,6 @@ mod output_streak_cfg_tests {
             "[harness]\nlimit_reset = true\n",
             "[harness]\nlimit_reset = false\n",
             "[harness]\nusage_tap = true\n",
-            "[harness]\nusage_tap = false\n",
             "[harness]\nusage_notes = true\n",
             "[harness]\nusage_notes = false\n",
             "[harness]\nusage_credits = true\n",
@@ -9955,6 +9975,11 @@ mod output_streak_cfg_tests {
         ] {
             assert_eq!(words(neutral), automatic, "{neutral}");
         }
+        assert_eq!(
+            words("[harness]\nusage_tap = false\n"),
+            "Automatic, limited by 1 setting in aterm.toml",
+            "the tap ships on, so turning it off is a limit"
+        );
         let safe = words("[harness]\napprove = \"safe\"\n");
         assert_ne!(safe, automatic);
         for own_roots in [
@@ -11845,7 +11870,10 @@ mod trail_style_resolution_tests {
         let kitty = radius(Some("rainbow kitty"), None);
         assert!(kitty < radius(Some("laser"), None));
         assert_eq!(radius(Some("rainbow kitty pet"), None), kitty);
-        assert_eq!(radius(None, None), kitty);
+        assert_eq!(
+            radius(None, None),
+            radius(Some(default_cursor_trail_style()), None)
+        );
         assert_eq!(radius(Some("rainbow kitty"), Some(3.0)), 3.0);
         assert_eq!(radius(Some("laser"), Some(3.0)), 3.0);
     }

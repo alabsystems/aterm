@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Autopilot's timer (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8): the `until=` parser and its DST rules, the reply, the index, and the App's writer, wire, fire and close.
+//! Autopilot's timer (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8).
 
 use super::*;
 use crate::session_timeline::{AUTOPILOT_USAGE, Fired, fire_land_at};
 
-/// 2026-10-16T19:00:00Z — a Friday — in unix seconds.
 const FRI_19Z: i64 = 1_792_177_200;
 
-/// A zone at a fixed offset from UTC.
 fn fixed(offset_s: i64) -> impl Fn(i64) -> Option<i64> {
     move |_| Some(offset_s)
 }
 
-/// A European-style zone: UTC+1 in winter, UTC+2 in summer, the clocks going
-/// forward at 2027-03-28T01:00Z (02:00 local becomes 03:00) and back at
-/// 2026-10-25T01:00Z (03:00 local becomes 02:00).
 fn europe(unix: i64) -> Option<i64> {
     const BACK: i64 = 1_792_890_000;
     const FORWARD: i64 = 1_806_195_600;
@@ -27,13 +22,10 @@ fn europe(unix: i64) -> Option<i64> {
     })
 }
 
-/// Unix seconds of a local reading under `offset_s`.
 fn at(date_days: i64, hh: i64, mm: i64, offset_s: i64) -> i64 {
     date_days * 86_400 + hh * 3_600 + mm * 60 - offset_s
 }
 
-/// Days since the epoch of a civil date (Hinnant's `days_from_civil`), the
-/// test's own inverse of `Date::of_days`.
 fn days(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
@@ -44,8 +36,6 @@ fn days(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// `<when>`: `HH:MM`, and `+<n>h`, `+<n>m`, `+<n>h<n>m` from 1 minute to 24
-/// hours.
 #[test]
 fn until_takes_a_clock_time_or_a_duration_from_a_minute_to_a_day() {
     for (text, want) in [
@@ -71,9 +61,6 @@ fn until_takes_a_clock_time_or_a_duration_from_a_minute_to_a_day() {
     }
 }
 
-/// `HH:MM` is the earliest instant STRICTLY after now that reads it: today's
-/// while it is ahead, else tomorrow's (the midnight wrap), and now itself is
-/// not after now.
 #[test]
 fn a_clock_time_is_todays_while_ahead_else_tomorrows() {
     let plus1 = fixed(3_600);
@@ -111,9 +98,6 @@ fn a_clock_time_is_todays_while_ahead_else_tomorrows() {
     assert_eq!(r.reply(), format!("land_at={} local=-", FRI_19Z + 3_600));
 }
 
-/// DST, §9.3.5: a time a spring-forward skips is refused WITH THE DATE on the
-/// day it would fall — and only there: one already behind now takes
-/// tomorrow's.
 #[test]
 fn dst_skipped_times_are_refused_and_repeated_ones_take_the_earlier_reading_ahead() {
     let mar27 = days(2027, 3, 27);
@@ -173,8 +157,6 @@ fn dst_skipped_times_are_refused_and_repeated_ones_take_the_earlier_reading_ahea
     }
 }
 
-/// The reply's `local=` reading at any offset, a negative one and one with
-/// minutes included, and the civil dates under it.
 #[test]
 fn the_reply_names_the_local_date_and_offset() {
     assert_eq!(
@@ -200,8 +182,6 @@ fn the_reply_names_the_local_date_and_offset() {
     }
 }
 
-/// The face's time and the OTHER-DAY bit (§9.3.2): the local `HH:MM`, and the
-/// instant's weekday only where it falls on another local date than now's.
 #[test]
 fn the_face_names_the_weekday_only_on_another_day() {
     let utc = fixed(0);
@@ -218,9 +198,6 @@ fn the_face_names_the_weekday_only_on_another_day() {
     assert_eq!(glass_of(now, now, &|_| None), None);
 }
 
-/// THE OFFER NAMES THE DAY IT WOULD ARM (§9.3.3, §9.3.4; the Together run's
-/// D6: `land_at = "18:36"` chosen at 18:49 armed Saturday's 18:36 while the
-/// menu row and the Settings button read `18:36`).
 #[test]
 fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
     use aterm_agent::supervise::LandAt;
@@ -275,11 +252,6 @@ fn the_land_at_offer_names_the_day_once_todays_time_has_passed() {
     assert_eq!(read(skipped, night, &europe), ("02:30".to_owned(), None));
 }
 
-/// THE OFFER'S WORDS TURN AT ITS INSTANT AND AT MIDNIGHT, AND NOWHERE ELSE
-/// (§9.3.3: a menu or a page held open across the minute is built again
-/// then): before 18:36 the next turn is 18:36 itself (from there it arms
-/// tomorrow and names the day); after it, the next local midnight (from there
-/// tomorrow is today, and the day goes).
 #[test]
 fn the_land_at_offer_turns_at_its_instant_and_at_midnight_only() {
     use aterm_agent::supervise::LandAt;
@@ -331,9 +303,6 @@ fn the_land_at_offer_turns_at_its_instant_and_at_midnight_only() {
     assert_eq!(offer_turns_at(six, FRI_19Z * 1000, &|_| None), None);
 }
 
-/// THE INDEX says when to look: a passed instant is due at once; the earliest
-/// due is the one deadline; a due entry is taken OUT; a moved wall derives
-/// every due again; an entry goes with its session.
 #[test]
 fn the_index_derives_its_dues_from_the_wall_and_takes_each_out_once() {
     let mut timers = AutopilotTimers::default();
@@ -386,10 +355,6 @@ fn the_index_derives_its_dues_from_the_wall_and_takes_each_out_once() {
     assert_eq!(timers.earliest(), None);
 }
 
-/// THE SAME INSTANT INDEXED AGAIN IS NO MOVE: a meta write that touched
-/// neither half of the pair (a title, an attention, a claim) re-reads the
-/// store, and the index derives the same instant's `due` from two clocks read
-/// later, a few microseconds off every time.
 #[test]
 fn the_same_instant_indexed_again_is_no_move() {
     let mut timers = AutopilotTimers::default();
@@ -423,8 +388,6 @@ fn the_same_instant_indexed_again_is_no_move() {
     );
 }
 
-/// DISPLAY DAY WORDS follow the date's first instant, even where clocks
-/// skip 00:00.
 #[test]
 fn day_words_refresh_where_the_date_starts_when_midnight_is_skipped() {
     use aterm_agent::supervise::LandAt;
@@ -473,7 +436,6 @@ fn day_words_refresh_where_the_date_starts_when_midnight_is_skipped() {
     );
 }
 
-/// A test App with a host, so the harness carries a mode here.
 fn hosted() -> (App, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let host = crate::harness_host::HostHandle::for_supervised_test(
@@ -484,13 +446,11 @@ fn hosted() -> (App, crate::harness_host::HostHandle) {
     (app, host)
 }
 
-/// Session 0's stored pair.
 fn stored(app: &App) -> (Option<String>, Option<i64>) {
     let meta = app.pool.get(0).unwrap().ctx.meta.lock().unwrap().clone();
     (meta.autopilot, meta.land_at)
 }
 
-/// Session 0's `meta-change` payloads, oldest first.
 fn meta_changes(app: &App) -> Vec<String> {
     app.pool
         .get(0)
@@ -505,8 +465,6 @@ fn meta_changes(app: &App) -> Vec<String> {
         .collect()
 }
 
-/// The wire's `meta` on session 0, as the dispatch arm runs it: the reply, and
-/// whether the stored value moved (its `Wake::MetaChanged`, applied here).
 fn wire(app: &mut App, rest: &str) -> (String, bool) {
     let session = app.pool.get(0).unwrap();
     let (term, ctx) = (session.term.clone(), session.ctx.clone());
@@ -517,10 +475,6 @@ fn wire(app: &mut App, rest: &str) -> (String, bool) {
     (reply, changed)
 }
 
-/// THE WIRE (§9.3.5): `meta set autopilot cruise until=+DURATION` stores the
-/// word and its instant as one write, answers `OK land_at=… local=…` with the
-/// `OK` leading, records the `meta-change` with the instant, and its wake
-/// indexes the timer; the bare `meta` prints `land_at=`.
 #[test]
 fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     let (mut app, host) = hosted();
@@ -609,9 +563,6 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     host.shutdown_and_join();
 }
 
-/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5). Due, with the pair still
-/// stored, it writes `land` with no timer, marks the driver bit, records the
-/// change, rings the host and leaves the record.
 #[test]
 fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     let (mut app, host) = hosted();
@@ -747,9 +698,6 @@ fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     host.shutdown_and_join();
 }
 
-/// A SESSION CLOSED WITH A TIMER ARMED leaves no entry, so nothing wakes
-/// after it (§9.3.7): its entry goes with its registration, and no deadline
-/// is folded.
 #[test]
 fn closing_the_session_drops_its_timer() {
     let (mut app, host) = hosted();
@@ -772,7 +720,6 @@ fn closing_the_session_drops_its_timer() {
     host.shutdown_and_join();
 }
 
-/// Session 0's newest Autopilot record: its title and its lines.
 fn last_record(app: &App) -> (String, Vec<String>) {
     let key = format!(
         "harness.autopilot.{}",
@@ -786,7 +733,6 @@ fn last_record(app: &App) -> (String, Vec<String>) {
         .expect("a record")
 }
 
-/// Session 0 runs Claude Code.
 fn run_claude(app: &App) {
     let ctx = app.pool.get(0).unwrap().ctx.clone();
     let mut tl = ctx.timeline.lock().unwrap();
@@ -794,14 +740,6 @@ fn run_claude(app: &App) {
     tl.set_program(7, Some("claude".into()));
 }
 
-/// THE FIRE SAYS WHAT IT FOUND (§10.2.3 item 8; the lifecycle hunt: main's
-/// line said "the harness wraps the work up at its next point" over every
-/// session): `Autopilot switched to land`, and at 18:00-style time Autopilot
-/// switched to land, then — over a hosted agent's work, whatever face a loop
-/// told before (Cruise takes nothing as the end, so the turn to Land starts
-/// the landing) — that the harness lands all of it on the remote main branch;
-/// with the harness switched off, or Claude Code's own switch off, that
-/// nothing is landed; in a tab with no agent, that there is nothing to land.
 #[test]
 fn the_fire_says_what_it_found() {
     use aterm_agent::harness::acts::TaskFace;
@@ -896,12 +834,6 @@ fn the_fire_says_what_it_found() {
     }
 }
 
-/// A FIRE OVER A PANE NO AGENT RUNS IN SAYS SO OF THE PANE (Claude Code 2.1.302):
-/// in
-/// a tab split Claude Code | shell, a timer set on the shell's pane — or on
-/// Claude Code's before it exited there — fires with its place naming that
-/// pane, `Tab 1, right pane: …`, and says `no agent runs in this pane`,
-/// never `in the tab`, where Claude Code still runs in the left pane.
 #[test]
 fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     let wall = FRI_19Z * 1000;
@@ -972,10 +904,6 @@ fn a_fire_over_a_pane_with_no_agent_says_so_of_the_pane() {
     host.shutdown_and_join();
 }
 
-/// A HAND CHANGE NAMES THE TIMER IT DROPPED (§10.2.3 item 8): a timed Cruise
-/// set from the window is recorded `Autopilot cruises until HH:MM`; a hand
-/// change to Land over it is recorded `Autopilot set to land` with a last
-/// line `the HH:MM landing time is cancelled`.
 #[test]
 fn a_hand_change_names_the_timer_it_dropped() {
     let (mut app, host) = hosted();
@@ -1018,8 +946,6 @@ fn a_hand_change_names_the_timer_it_dropped() {
     host.shutdown_and_join();
 }
 
-/// THE WINDOW'S CHOICES (the menu, Settings): `In(minutes)` arms from now, `At`
-/// takes `[harness] land_at`'s next reading, `Cancel` is Cruise with no timer.
 #[test]
 fn the_windows_timer_choices_arm_and_cancel() {
     let (mut app, host) = hosted();
@@ -1063,10 +989,6 @@ fn the_windows_timer_choices_arm_and_cancel() {
     host.shutdown_and_join();
 }
 
-/// ...AND BY THE SESSION'S OWN POSTURE, as its mode buttons are: a Claude
-/// Code session under `[harness.claude] enabled = false` is steered by
-/// nothing, so no timer choice arms or cancels there, though the window's
-/// harness runs (for Codex).
 #[test]
 fn a_timer_for_a_switched_off_agent_is_refused() {
     let wall = FRI_19Z * 1000;
@@ -1106,9 +1028,6 @@ fn a_timer_for_a_switched_off_agent_is_refused() {
     );
 }
 
-/// THE WALL MOVED (§9.3.6, item 6): asleep through the time, the monotonic
-/// due lies in the future still; `Wake::WallMoved` derives it again from the
-/// wall and the fire lands it.
 #[test]
 fn a_moved_wall_derives_the_due_again() {
     let (mut app, host) = hosted();
@@ -1139,10 +1058,6 @@ fn a_moved_wall_derives_the_due_again() {
     host.shutdown_and_join();
 }
 
-/// BEFORE A SUCCESSOR'S COMMIT nothing is folded and nothing fires (it is a
-/// candidate); the first park after the Commit rebuilds the index from every
-/// stored timer before it fires anything, a time that came meanwhile due at
-/// once — owed once.
 #[test]
 fn a_successor_fires_nothing_before_its_commit_and_rebuilds_at_it() {
     let (mut app, host) = hosted();

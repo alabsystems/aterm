@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Verify run records, stage survivor checks, and dead-run process sweeps
-//! ([`end_proven`], [`Kernel`], [`LiveKernel`]).
+//! ([`end_proven`](aterm_uds::process::end_proven), [`Kernel`](crate::runs::Kernel), [`LiveKernel`](crate::runs::LiveKernel)).
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -11,9 +11,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aterm_uds::process::{
-    END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, Identity, Lineage, Markers,
-    ProcessBirth, ProcessPresence, boot_id, end_proven, group_members, launchd_idversion,
-    process_presence, read_lineage, read_process_birth, read_process_markers, thread_ran,
+    Birth, END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, Identity, Lineage, Markers,
+    ProcessPresence, boot_id, end_proven, group_members, launchd_idversion, process_presence,
+    read_birth, read_lineage, read_process_markers, read_process_path, thread_ran,
 };
 
 use crate::Ctx;
@@ -24,17 +24,18 @@ pub const VERIFY_RUN_ENV: &str = aterm_uds::process::VERIFY_RUN_VAR;
 
 /// The kernel reads the passes take, injected so the classification is a unit test over a fake.
 pub trait Kernel {
-    /// `pid`'s birth now, or `None` when gone, unreadable, or not of this uid.
-    fn birth(&self, pid: i32) -> Option<ProcessBirth>;
+    /// `pid`'s birth now ([`Birth`]: microseconds on Apple, start ticks on Linux), or `None`
+    /// when gone, unreadable, or not of this uid.
+    fn birth(&self, pid: i32) -> Option<Birth>;
     /// Whether the pid exists when identity cannot be read. Unsupported readers stay unknown.
     fn presence(&self, _pid: i32) -> ProcessPresence {
         ProcessPresence::Unknown
     }
-    /// `pid`'s lineage (flavor 18), or `None` when gone or not ours.
+    /// `pid`'s lineage (flavor 18; Linux `/proc`), or `None` when gone or not ours.
     fn lineage(&self, pid: i32) -> Option<Lineage>;
     /// `pgid`'s members, or `None` when the table cannot answer.
     fn members(&self, pgid: u32) -> Option<GroupMembers>;
-    /// `pid`'s executable path, or `None` (gone, deleted, or no reader).
+    /// `pid`'s executable path, or `None` (gone, deleted, not ours, or no reader).
     fn exe(&self, pid: i32) -> Option<PathBuf>;
     /// `pid`'s marker variables, or `None` when unreadable.
     fn markers(&self, pid: i32) -> Option<Markers>;
@@ -60,8 +61,8 @@ pub trait Kernel {
 pub struct LiveKernel;
 
 impl Kernel for LiveKernel {
-    fn birth(&self, pid: i32) -> Option<ProcessBirth> {
-        read_process_birth(pid)
+    fn birth(&self, pid: i32) -> Option<Birth> {
+        read_birth(pid)
     }
     fn presence(&self, pid: i32) -> ProcessPresence {
         process_presence(pid)
@@ -72,11 +73,13 @@ impl Kernel for LiveKernel {
     fn members(&self, pgid: u32) -> Option<GroupMembers> {
         group_members(pgid)
     }
+    // A deleted executable reads `None` (Linux marks its link ` (deleted)`), so it is under
+    // no root: C-tree never matches a file that is gone. Under a binary translator on Linux
+    // (Rosetta in an aarch64 VM) the kernel names the translator as every translated process's
+    // executable (`docs/measured/linux-rosetta-2026-10-17.md`), which is under no root either,
+    // so there a translated member is named, never ended.
     fn exe(&self, pid: i32) -> Option<PathBuf> {
-        match aterm_uds::holders::exe_of(u32::try_from(pid).ok()?) {
-            aterm_uds::holders::Exe::At(path) => Some(path),
-            aterm_uds::holders::Exe::Unnamed | aterm_uds::holders::Exe::Exited => None,
-        }
+        read_process_path(pid)
     }
     fn markers(&self, pid: i32) -> Option<Markers> {
         read_process_markers(pid)
@@ -112,39 +115,31 @@ impl Kernel for LiveKernel {
     }
 }
 
-/// A run's launcher identity, the record's `id`: `<pid>-<birth_us>`.
+/// A run's launcher identity, the record's `id`: `<pid>-<birth>`, the birth in [`Birth`]'s unit
+/// (microseconds on Apple, start ticks on Linux).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunId {
     /// The launcher's pid.
     pub pid: i32,
-    /// Its birth as whole microseconds.
-    pub birth_us: u64,
+    /// Its birth.
+    pub birth: Birth,
 }
 
 impl RunId {
-    /// The id as `<pid>-<birth_us>`.
+    /// The id as `<pid>-<birth>`.
     #[must_use]
     pub fn text(&self) -> String {
-        format!("{}-{}", self.pid, self.birth_us)
+        format!("{}-{}", self.pid, self.birth.0)
     }
 
-    /// Parse `<pid>-<birth_us>`; `None` for anything else.
+    /// Parse `<pid>-<birth>`; `None` for anything else.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let (pid, birth) = text.split_once('-')?;
         Some(Self {
             pid: pid.parse().ok()?,
-            birth_us: birth.parse().ok()?,
+            birth: Birth(birth.parse().ok()?),
         })
-    }
-
-    /// The birth as whole microseconds.
-    #[must_use]
-    pub const fn birth_us(birth: ProcessBirth) -> u64 {
-        birth
-            .seconds
-            .saturating_mul(1_000_000)
-            .saturating_add(birth.microseconds)
     }
 }
 
@@ -153,8 +148,8 @@ impl RunId {
 pub struct GroupLine {
     /// The leader's pid and process group (one, since every stage child is `process_group(0)`).
     pub pgid: u32,
-    /// The leader's birth, so a reused pgid led by another process is told apart.
-    pub leader_birth_us: u64,
+    /// The leader's birth, so a reused pgid led by another process is told apart (`0`: unread).
+    pub leader_birth: Birth,
     /// The leader's unique id: a member's must lie in `[leader_uniqueid, dead_seen]`.
     pub leader_uniqueid: u64,
     /// The stage's label (the child's argv), pct-encoded on the wire so a space survives.
@@ -215,7 +210,7 @@ impl Record {
                 Some("group") => {
                     let mut g = GroupLine {
                         pgid: 0,
-                        leader_birth_us: 0,
+                        leader_birth: Birth(0),
                         leader_uniqueid: 0,
                         stage: String::new(),
                         closed: false,
@@ -226,7 +221,7 @@ impl Record {
                         };
                         match k {
                             "pgid" => g.pgid = v.parse().unwrap_or(0),
-                            "leader_birth" => g.leader_birth_us = v.parse().unwrap_or(0),
+                            "leader_birth" => g.leader_birth = Birth(v.parse().unwrap_or(0)),
                             "leader_uniqueid" => g.leader_uniqueid = v.parse().unwrap_or(0),
                             "stage" => g.stage = pct_decode(v),
                             _ => {}
@@ -420,15 +415,15 @@ enum Fate {
     Left,
 }
 
-/// A failed birth read preserves the process unless a separate query confirms absence.
-fn may_match_birth(
-    kernel: &impl Kernel,
-    pid: i32,
-    matches: impl FnOnce(ProcessBirth) -> bool,
-) -> bool {
+/// A failed birth read preserves the process unless a separate query confirms it holds
+/// nothing: no process has the pid, or the one that has it exited and waits to be reaped.
+fn may_match_birth(kernel: &impl Kernel, pid: i32, matches: impl FnOnce(Birth) -> bool) -> bool {
     match kernel.birth(pid) {
         Some(birth) => matches(birth),
-        None => kernel.presence(pid) != ProcessPresence::Absent,
+        None => !matches!(
+            kernel.presence(pid),
+            ProcessPresence::Absent | ProcessPresence::Exited
+        ),
     }
 }
 
@@ -474,10 +469,9 @@ impl Runs {
     ) -> Option<Self> {
         let boot = boot_id()?;
         let pid = i32::try_from(std::process::id()).ok()?;
-        let birth = read_process_birth(pid)?;
         let id = RunId {
             pid,
-            birth_us: RunId::birth_us(birth),
+            birth: read_birth(pid)?,
         };
         let uniqueid = read_lineage(pid).map_or(0, |l| l.uniqueid);
         let roots = run_roots(
@@ -596,11 +590,11 @@ impl Runs {
 
 impl crate::exec::StageGroupEnd for Runs {
     fn group_made(&self, pgid: u32, label: &str) {
-        let (birth_us, uniqueid) = read_lineage(i32::try_from(pgid).unwrap_or(0))
-            .map(|l| (RunId::birth_us(l.identity.birth), l.uniqueid))
+        let (birth, uniqueid) = read_lineage(i32::try_from(pgid).unwrap_or(0))
+            .map(|l| (l.identity.birth.0, l.uniqueid))
             .unwrap_or((0, 0));
         self.line(&format!(
-            "group pgid={pgid} leader_birth={birth_us} leader_uniqueid={uniqueid} stage={}",
+            "group pgid={pgid} leader_birth={birth} leader_uniqueid={uniqueid} stage={}",
             pct_encode(label)
         ));
     }
@@ -644,9 +638,9 @@ pub fn sweep_group(kernel: &impl Kernel, pgid: u32, label: &str, roots: &[PathBu
 /// What the live runs claim: each run's launcher, its open stage groups, and its id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Claims {
-    /// The launchers, `(pid, birth_us)`: a verify started inside another run's stage carries
+    /// The launchers, `(pid, birth)`: a verify started inside another run's stage carries
     /// that run's id in its own environment, and is its own run's all the same.
-    launchers: BTreeSet<(i32, u64)>,
+    launchers: BTreeSet<(i32, Birth)>,
     groups: BTreeSet<u32>,
     ids: BTreeSet<String>,
 }
@@ -657,7 +651,7 @@ impl Claims {
         for rec in live {
             claims.groups.extend(rec.open_groups().map(|g| g.pgid));
             if let Some(id) = rec.id {
-                claims.launchers.insert((id.pid, id.birth_us));
+                claims.launchers.insert((id.pid, id.birth));
                 claims.ids.insert(id.text());
             }
         }
@@ -666,7 +660,7 @@ impl Claims {
 
     /// Whether a live run claims `lin` with `markers`.
     fn claims(&self, lin: &Lineage, markers: Option<&Markers>) -> bool {
-        let identity = (lin.identity.pid, RunId::birth_us(lin.identity.birth));
+        let identity = (lin.identity.pid, lin.identity.birth);
         if self.launchers.contains(&identity) || self.groups.contains(&lin.pgid) {
             return true;
         }
@@ -690,7 +684,8 @@ struct Judge<'a, K> {
     roots: &'a [PathBuf],
     /// The run's id, which W-run reads in a member's `ATERM_VERIFY_RUN`.
     id: Option<String>,
-    /// The run's launcher's unique id: W-run's window opens there.
+    /// The run's launcher's unique id: W-run's window opens there, and where no launcher
+    /// version is kept (Linux) a parent born before it adopted the member ([`Lineage::orphaned`]).
     run_uniqueid: u64,
     /// The open groups whose leader check passed, each with its leader's unique id, where its
     /// W-group window opens.
@@ -738,8 +733,15 @@ impl<K: Kernel> Judge<'_, K> {
         if !w_group && !w_run {
             return Verdict::NotOurs;
         }
+        // Without a launcher version (Linux), a parent older than the run adopted it.
+        let parent_uniqueid = || {
+            i32::try_from(lin.parent)
+                .ok()
+                .and_then(|parent| self.kernel.lineage(parent))
+                .map(|parent| parent.uniqueid)
+        };
         let proven = under_roots()
-            && lin.orphaned(self.launchd)
+            && lin.orphaned(self.launchd, self.run_uniqueid, parent_uniqueid)
             && !self.claims.claims(&lin, markers.as_ref())
             && lin
                 .tty
@@ -781,7 +783,9 @@ impl<K: Kernel> Judge<'_, K> {
     }
 }
 
-/// Live pids of this uid (excluding `me` and its ancestors) and the high-water unique id.
+/// Live pids of this uid (excluding `me` and its ancestors), oldest first, and the high-water
+/// unique id. No process is older than its parent, so a pass judges a parent before its
+/// children: the end of an orphaned stage leader orphans its children before they are judged.
 fn table(kernel: &impl Kernel, me: i32) -> Option<(Vec<i32>, u64)> {
     let mine = kernel.lineage(me)?;
     let mut spared = vec![me];
@@ -797,17 +801,18 @@ fn table(kernel: &impl Kernel, me: i32) -> Option<(Vec<i32>, u64)> {
         }
     }
     let mut high = mine.uniqueid;
-    let mut pids = Vec::new();
+    let mut rows = Vec::new();
     for pid in kernel.uid_pids()? {
         if spared.contains(&pid) {
             continue;
         }
         if let Some(l) = kernel.lineage(pid) {
             high = high.max(l.uniqueid);
-            pids.push(pid);
+            rows.push((l.uniqueid, pid));
         }
     }
-    Some((pids, high))
+    rows.sort_unstable();
+    Some((rows.into_iter().map(|(_, pid)| pid).collect(), high))
 }
 
 /// Bound the text read even if a record grows after its size was checked.
@@ -910,7 +915,7 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
                 if *version != "1"
                     || boot.is_empty()
                     || parsed.pid <= 1
-                    || parsed.birth_us == 0
+                    || parsed.birth.0 == 0
                     || parsed.text() != *id
                     || path.file_name()?.to_str()? != format!("{}.run", parsed.text())
                     || !cleanup_number(uniqueid)
@@ -1038,7 +1043,7 @@ pub fn end_dead_runs(
             .filter(|g| {
                 kernel
                     .birth(i32::try_from(g.pgid).unwrap_or(0))
-                    .is_some_and(|b| RunId::birth_us(b) == g.leader_birth_us)
+                    .is_some_and(|b| b == g.leader_birth)
             })
             .map(|g| (g.pgid, g.leader_uniqueid))
             .collect();
@@ -1074,9 +1079,7 @@ fn launcher_alive(rec: &Record, kernel: &impl Kernel) -> bool {
     let Some(id) = rec.id else {
         return false;
     };
-    may_match_birth(kernel, id.pid, |birth| {
-        RunId::birth_us(birth) == id.birth_us
-    })
+    may_match_birth(kernel, id.pid, |birth| birth == id.birth)
 }
 
 /// Format the summary line for a dead run at the next run's start.
@@ -1090,6 +1093,20 @@ fn dead_run_line(rec: &Record, left: &Left) -> String {
     let head = format!("the verify run of pid {pid} ({root})");
     left.line(&head)
         .unwrap_or_else(|| format!("{head} left no live processes"))
+}
+
+/// The directory under `rendezvous` that run records live in: `verify-runs`, and beneath it one
+/// directory per pid namespace where there are namespaces (`pid-<inode>`, Linux). A record
+/// names pids, which read only in the namespace that wrote them, and namespaces share a boot,
+/// so a verify in a container that shares the rendezvous never judges the host's runs as dead
+/// (nor the host a container's).
+#[must_use]
+pub fn records_dir(rendezvous: &Path, pid_namespace: Option<&str>) -> PathBuf {
+    let dir = rendezvous.join("verify-runs");
+    match pid_namespace {
+        Some(namespace) => dir.join(format!("pid-{namespace}")),
+        None => dir,
+    }
 }
 
 /// Canonical roots a survivor's exe must sit under to be ended ([`build_dirs`]).

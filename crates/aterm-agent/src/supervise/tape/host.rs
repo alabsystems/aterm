@@ -21,7 +21,10 @@ use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
-use crate::supervise::occupancy::{OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen};
+use crate::supervise::occupancy::{
+    FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen,
+    WakeClaim, WakeDoor, WakesSeen,
+};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
@@ -146,6 +149,7 @@ tape_arg_debug!(
     str,
     String,
     bool,
+    u16,
     u32,
     u64,
     i64,
@@ -169,6 +173,8 @@ tape_arg_debug!(
     UsageWindow,
     RuleId,
     OccupancySaid,
+    WakeDoor,
+    FactWord,
 );
 
 /// A call's request as a tape holds it: `name=<Debug>` for each argument, a line each, in the signature's order; nothing for a call with none.
@@ -801,6 +807,59 @@ impl TapeValue for PaceGrant {
         Ok(PaceGrant::Room(reading_of(
             of_json::<RoomWire>(bytes)?.room,
         )?))
+    }
+}
+
+/// `wakes`' answer as a tape holds it ([`WakesSeen`]): its counts.
+#[derive(Serialize, Deserialize)]
+struct WakesWire {
+    pending: u16,
+    ready: u16,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.wakes` kept no book of wakes, so
+/// its replay reads the empty one ([`TapeValue::absent`]) — where the tape's header says that
+/// build lacked the door, and only there.
+impl TapeValue for WakesSeen {
+    fn to_tape(&self) -> Vec<u8> {
+        let WakesSeen { pending, ready } = *self;
+        json(&WakesWire { pending, ready })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        let WakesWire { pending, ready } = of_json(bytes)?;
+        Ok(WakesSeen { pending, ready })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(WakesSeen::default())
+    }
+}
+
+/// `wake_claim`'s answer on a tape: its word ([`WakeClaim::word`]), as a JSON string. A word this
+/// build does not know is refused. No absent form: a build without the door claimed nothing, so a
+/// replay that reaches the door diverges there.
+impl TapeValue for WakeClaim {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.word())
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        WakeClaim::of_word(&of_json::<String>(bytes)?)
+            .ok_or(bad("a wake claim's answer this build does not know"))
+    }
+}
+
+/// `task_fact`'s answer on a tape: its word ([`NoteOutcome::word`]), as a JSON string. No absent
+/// form, as [`WakeClaim`]'s.
+impl TapeValue for NoteOutcome {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.word())
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        NoteOutcome::of_word(&of_json::<String>(bytes)?)
+            .ok_or(bad("a task fact's answer this build does not know"))
     }
 }
 

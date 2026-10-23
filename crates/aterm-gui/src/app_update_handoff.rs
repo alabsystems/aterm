@@ -1814,8 +1814,6 @@ fn worker_pre_park_check(
             return Err(PreParkRefusal::Policy(refusal));
         }
     } else if let Some(error) = skipped_verification_floor_refusal(job, floor) {
-        // A fresh cached pass skipped the full check; the floor and the stage are what the
-        // cache cannot vouch for, refused as the full check would refuse them.
         return Err(refused(error));
     }
     Ok(())
@@ -1965,8 +1963,7 @@ fn run_handoff_worker(
     child_inherit.push(commit_rd.as_raw_fd());
     let handed = child_inherit.clone();
     let strip = aterm_uds::spawnfd::InheritStrip::prepare();
-    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`,
-    // `InheritStrip::apply`) on captured integers.
+    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`, `InheritStrip::apply`) on captured integers.
     unsafe {
         job.command
             .pre_exec(move || fork_lane_child_holds(strip, &child_inherit));
@@ -4173,7 +4170,6 @@ impl App {
                     crate::native_update_admission::ApplyLane::Cold,
                 ) if live_ptys == 0 => {}
                 crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                    // Refusal, not failure — the unix arm's law.
                     return Err(crate::UpdateHandoffStartError::refused(
                         reason.message(facts),
                     ));
@@ -4342,10 +4338,6 @@ impl App {
             && !(self.launch_image_kept && handoff_unavailable.is_some())
             && !self.handoff_exited_session_ids().is_empty()
         {
-            // A process that keeps its image has no cold lane to take once the held panes
-            // close (`KeptImageNeedsTerminal`): only a new tab's live session lets it hand over.
-            // With no overlap handoff either, nothing does, and the admission's own
-            // refusal below says so (`update_admission_refusal`).
             return Err(crate::UpdateHandoffStartError::refused(
                 if self.launch_image_kept {
                     "every open terminal pane's command has exited (panes kept open by \
@@ -4379,9 +4371,6 @@ impl App {
         }
         match decision {
             crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                // A Block is a refusal to attempt, never a failed attempt (see
-                // [`crate::UpdateHandoffStartError::Refused`]); counting it as a
-                // failure would inflate the failed-apply count.
                 return Err(update_admission_refusal(reason, facts, handoff_unavailable));
             }
             crate::native_update_admission::AdmissionDecision::Apply(
@@ -5982,8 +5971,6 @@ impl App {
             return;
         };
         if prelaunch.dialled.is_none() {
-            // The worker has not reported the dial yet: nothing has been
-            // launched-and-held to park for.
             return;
         }
         if prelaunch.stood_down || prelaunch.park_retry_at.is_some_and(|at| now < at) {
@@ -6104,8 +6091,6 @@ impl App {
             stand_down.detail
         );
         if prelaunch.stand_down.try_send(stand_down).is_err() {
-            // The worker is past its hold (or gone): the cancel poke reaches every
-            // later wait it might be in.
             let _ = prelaunch.cancel.try_send(());
         }
     }
@@ -6690,7 +6675,7 @@ impl App {
             .fold(0, u64::wrapping_add)
     }
 
-    /// Return whether every handed session's [`crate::session_store::CarriedClaim`] still holds.
+    /// Return whether every handed session's [`crate::session_store::CarriedClaims`] still holds.
     #[cfg(unix)]
     pub(crate) fn carried_claims_held(
         &self,
@@ -7008,8 +6993,6 @@ impl App {
         let Some((completion, input_dispatch_fenced, egress_settled)) =
             self.handoff_drain_gate(completion)
         else {
-            // Re-posted for another drain spin (or the event loop is
-            // closing and the drop rejects the attempt).
             return;
         };
         let held = self
@@ -9886,7 +9869,6 @@ fn wait_handoff_ready(
         // SAFETY: a stable initialized pollfd slice; 10 ms bounds death abort.
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 10) };
         if n <= 0 {
-            // Distinct branch.
             continue; // timeout slice or EINTR — re-check the candidate + deadline (poll already blocked)
         }
         match classify_ready_poll(&pollfds) {

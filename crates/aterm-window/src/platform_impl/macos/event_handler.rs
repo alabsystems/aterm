@@ -26,6 +26,8 @@ impl fmt::Debug for EventHandlerData {
 pub(crate) struct EventHandler {
     /// This can be in the following states:
     /// - Not registered by the event loop (None).
+    /// - Present (Some(handler)).
+    /// - Currently executing the handler / in use (RefCell borrowed).
     inner: RefCell<Option<EventHandlerData>>,
 }
 

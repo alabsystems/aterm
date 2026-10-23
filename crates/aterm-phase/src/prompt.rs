@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Parser for Claude Code approval boxes and modal dialogs ([`Prompt`], [`PromptV2`]).
-//!
-//! Identifies tool permission boxes (`Bash`, `Edit`, `Write`, `Read`, `Tool`, etc.),
-//! usage-limit menus, autocompact offers, question dialogs, and workspace trust prompts
-//! by their header grammar ([`Header`]), extracts command readings, notes, and
-//! [`RmBreaker`] warnings, and classifies selectable options by [`Role`] and [`CancelEffect`].
 
 use crate::question::{QShape, QuestionDialog, QuestionForm};
 
@@ -647,12 +642,7 @@ pub enum RmBreakerKind {
     TooManySubstitutions,
     /// Command contains nested commands or function substitutions that could not be analyzed.
     NestedUnanalyzed,
-    /// Any other `not ruled out — <why>`: the vendor could not rule a removal out, for a reason
-    /// this reader has no kind of its own for. The note's template (`Dangerous ${rm|rmdir}
-    /// operation ${r}`) is the breaker's whatever the why, so a new why is still the breaker:
-    /// 2.1.309 added `the shell may read this command differently than it was parsed`, drawn
-    /// over a command whose parse tree is an error at its root, rm or no rm (`echo $(`,
-    /// MEASURED). [`RmBreaker::target`] holds the why as drawn.
+    /// Any other `not ruled out — <why>` reason not covered by a dedicated variant.
     NotRuledOut,
 }
 
@@ -729,7 +719,6 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
             let why = qualified.unwrap_or(rest).strip_prefix("— ")?;
             let too_many = const { anchor_text("box.rm_breaker.too_many") };
             if why.starts_with(too_many.trim_end_matches('(').trim_end()) {
-                // The too-many why names its count; one that does not is no note of the vendor's.
                 return why
                     .strip_prefix(too_many)
                     .and_then(|n| n.strip_suffix(')'))
@@ -738,12 +727,8 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
             }
             let nested = const { anchor_text("box.rm_breaker.nested_unanalyzed") };
             if why.starts_with(nested) {
-                // The nested why is drawn whole; more after it is no note of the vendor's.
                 return (why == nested).then_some((RmBreakerKind::NestedUnanalyzed, why));
             }
-            // Any other why, after the vendor's own `not ruled out` (2.1.307 on): the
-            // breaker's template whatever it names. The bare `— <why>` form (2.1.306 and
-            // older) only ever named too many substitutions.
             qualified.map(|_| (RmBreakerKind::NotRuledOut, why))
         })?;
     let target = crate::text::trim(target);
@@ -1229,22 +1214,7 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
         .then_some((text, 0..end))
 }
 
-/// THE COUNTDOWN CLAUDE CODE DREW in a box's body rows ([`PromptV2::
-/// auto_deny`]), and the body rows it spans — read only where the vendor
-/// draws it: the body's LAST rows, nothing but blank rows under them down to
-/// the box's question, and below the content's closing dashed rule when the
-/// box draws its content between rules (nothing the model writes reaches
-/// below that rule, and none of it can draw one: its rows start at column
-/// one or deeper, [`is_dashed_rule`]); its first row led by `⚠` at the box's
-/// own column (one at most — a box drawn without the rules sets the model's
-/// command and description deeper, at the command's column), and the rows
-/// Ink wrapped it onto at that same column ([`auto_deny_block`]). Text the
-/// model wrote that spells a countdown — a Bash call's description, a line
-/// of its command — is read as the description or command it is, never as
-/// the box's countdown (2026-10-15: a description reading `… deny this
-/// request in 0:14, …` would have ended a person's hold on the box at
-/// once). A question dialog's countdown is read on its review tab instead
-/// (`question.rs`, `QShape::countdown`).
+/// Extracts the vendor auto-deny countdown and the body rows it spans.
 fn vendor_countdown(body: &[String]) -> Option<(String, std::ops::Range<usize>)> {
     use crate::phase::leading_spaces;
     let from = body
@@ -1810,7 +1780,6 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
             }
     };
     let Some(nearest) = (1..first_option).rev().find(|&i| titled(i)) else {
-        // No titled row: the box's head may be off the screen.
         return footerless_head_cut(rows, block_top, first_option, end, last);
     };
     let plan_above = || {
@@ -1903,8 +1872,6 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
             last = i;
             own_end = i;
         } else if hint.is_none() && leading_spaces(r) > leading_spaces(&rows[last]) + 2 {
-            // The option's own row (its label's Ink wrap, or a description
-            // under it).
             own_end = i;
         } else if hint.is_none() && is_key_hint_row(r) {
             hint = Some(i);
@@ -2352,8 +2319,6 @@ fn cursors(title: &str) -> &'static [char] {
 }
 
 fn strip_cursor<'a>(t: &'a str, cur: &[char]) -> Option<&'a str> {
-    // `t.strip_prefix(cur)`: one char stripped when it is any of `cur`, each
-    // tried as a single char rather than through a char-set searcher.
     cur.iter().find_map(|&c| t.strip_prefix(c))
 }
 
@@ -2819,8 +2784,6 @@ struct Options {
 
 fn role_of(label: &str, kind: PromptKind) -> Role {
     if kind == PromptKind::McpServer {
-        // Every answer of it is saved for good, the checkbox rows and the
-        // submit of the dialog for several included.
         return Role::Persist;
     }
     if kind == PromptKind::UsageLimit {
@@ -2857,10 +2820,6 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     } else if kind == PromptKind::ModelSwitch
         && l.starts_with(&const { crate::anchors::anchor_text("model_switch.yes") }.to_lowercase())
     {
-        // `Yes, switch to Sonnet 5` confirms the one change the person typed:
-        // no permission mode and no tool grant — not the mode switch its
-        // `switch to` would read as below. (What `/model` persists, the
-        // person's default, is what their own command asked for.)
         Role::Once
     } else if l.starts_with("allow") {
         if l.contains("for this session") {
@@ -5276,18 +5235,7 @@ mod tests {
         }
     }
 
-    /// A COUNTDOWN WRAPPED THROUGH ITS VERY WORDS IS THE COUNTDOWN (its words
-    /// were once looked for whole on its `⚠` row,
-    /// so in a pane narrower than ~55 cells no countdown was read, and no
-    /// hold on the box ended before the vendor's deny). The measured 2.1.301
-    /// rm box with only its countdown wrapped as Ink wraps it at 48 columns
-    /// (` ⚠ Claude Code will automatically deny this` / ` request in 1:50, to
-    /// avoid blocking progress on` / ` an unattended session`) and at 52
-    /// (`… deny this request` / ` in 1:50, …`): its 1:50 read, the countdown
-    /// whole, one note — the breaker's — and that note read whole over it
-    /// ([`PromptV2::foot_note`]). NEGATIVE CONTROLS: another `⚠` warning
-    /// wrapped the same way is no countdown, its rows the note's; the
-    /// countdown's words wrapped with no `⚠` before them are none.
+    /// A countdown wrapped across multiple rows is still recognized as the box countdown.
     #[test]
     fn a_countdown_wrapped_through_its_words_is_the_countdown() {
         let r = screen(BOX_RM_AUTO_DENY_2_1_301);
@@ -5519,8 +5467,6 @@ mod tests {
                 NestedUnanalyzed,
                 "some nested commands or function substitutions could not be analyzed",
             ),
-            // 2.1.309's new why (MEASURED, `claude-2.1.309-box-bash-rm-parse-diverged`), and
-            // any why a later build adds after the vendor's `not ruled out`.
             (
                 "Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed",
                 RmCommand::Rm,
@@ -5562,8 +5508,6 @@ mod tests {
             "Dangerous rm operation not ruled out — too many command substitutions to analyze (lots)",
             "Dangerous rm operation not ruled out — too many command substitutions to analyze",
             "Dangerous rm operation not ruled out — some nested commands or function substitutions could not be analyzed (2)",
-            // A why with no `not ruled out` before it is the old form, which named only
-            // the too-many count.
             "Dangerous rm operation — something new",
             "Dangerous rm operation — the shell may read this command differently than it was parsed",
             "Dangerous rm operation not ruled out — ",

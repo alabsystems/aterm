@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm init --develop` layer ([`layer`]) and [`crate::checkout`] alignment.
+//! `aterm init --develop` layer ([`layer`]) and [`crate::checkout`] alignment, and the same
+//! items as `aterm doctor` reads them on a develop machine ([`doctor`], [`read`]).
 
 use crate::checkout::{self, Origin, Remote};
 use crate::engine::Place;
 use crate::items::{Ctx, Item};
-use crate::model::{Probe, User};
-use crate::port::{Cmd, System};
-use aterm_converge::{Class, Layer, Remedy, Requires, StoodAside};
+use crate::model::{ItemReport, Mode, Probe, User};
+use crate::port::{Cmd, RunFailed, System};
+use aterm_converge::{Class, Layer, Remedy, Requires, Scope, StoodAside};
 use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -38,9 +39,30 @@ const MANIFEST_MAX: usize = 1024 * 1024;
 const SUBMODULE: &str = "vendor/astream";
 /// A submodule clone, or the checkout's provision run.
 const LONG_BUDGET: Duration = Duration::from_secs(1800);
+/// Doctor's wait for a checkout's tools `--check`, which prints nothing until it is done: two
+/// minutes, so a cargo that waits on another build's lock on the checkout's build directory, or
+/// builds aterm-verify afresh after a pull, holds doctor's report no longer than that (the run
+/// is stopped, and cargo keeps what it finished for the next).
+const DOCTOR_BUDGET: Duration = Duration::from_secs(120);
 
 /// The command that finds the toolset's `targo`.
 pub type Targo = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
+
+/// Who runs a develop item, which decides what its probe may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reader {
+    /// `aterm init`: a probe asks origin (`git ls-remote`), an apply fetches and fast-forwards,
+    /// and cargo may download what the checkout's lock names.
+    Init,
+    /// `aterm doctor` (design §5, S9): this Mac alone, never the network (aterm goes online by
+    /// default only for its update check and the package pass, README): the checkout against
+    /// origin as last fetched, cargo `--offline`, and no apply.
+    Doctor,
+}
+
+/// Why a develop item doctor reads is never applied, should an engine ask.
+const DOCTOR_CHANGES_NOTHING: &str = "aterm doctor reads the develop items and changes none of \
+                                      them: `aterm init --develop` does";
 
 /// One develop item and where it sits in the run.
 pub type Placed = (Box<dyn Item>, Place);
@@ -306,6 +328,7 @@ fn describe(table: Option<&[String]>) -> String {
 struct Record {
     user: User,
     want: Option<Vec<String>>,
+    reader: Reader,
 }
 
 impl Item for Record {
@@ -324,6 +347,14 @@ impl Item for Record {
             Err(why) => return Probe::Unusable { why },
         };
         let now = profile.table.map(|table| table.checkouts);
+        // Doctor wants what is recorded, read now: it has nothing of its own to lay.
+        if self.reader == Reader::Doctor {
+            let mut said = describe(now.as_deref());
+            if now.is_none() {
+                said.push_str(" (`aterm init --develop` records one)");
+            }
+            return Probe::Ok { now: said };
+        }
         if now == self.want {
             let mut now = describe(now.as_deref());
             if self.want.is_none() {
@@ -337,6 +368,9 @@ impl Item for Record {
         }
     }
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        if self.reader == Reader::Doctor {
+            return Err(DOCTOR_CHANGES_NOTHING.into());
+        }
         let profile = read_profile(sys, &self.user)?;
         let text = profile.text.clone().unwrap_or_default();
         let out = edited(&text, self.want.as_deref())?;
@@ -526,6 +560,25 @@ struct Checkout {
     unread: Aside,
     /// Origin's host could not be reached by the last apply ([`Item::stood_aside`]).
     stood: Aside,
+    reader: Reader,
+}
+
+/// `spelled` as one shell word that still expands a leading `~/`: as it is when every byte is
+/// one a shell takes literally, else single-quoted after that `~/`.
+fn shell_word(spelled: &str) -> String {
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-+@%=:,".contains(&b))
+    };
+    let (tilde, rest) = spelled
+        .strip_prefix("~/")
+        .map_or(("", spelled), |rest| ("~/", rest));
+    if plain(rest) {
+        format!("{tilde}{rest}")
+    } else {
+        format!("{tilde}'{}'", rest.replace('\'', "'\\''"))
+    }
 }
 
 /// What an item met that it stands aside on (the network down), kept for the engine to ask.
@@ -574,6 +627,18 @@ impl Item for Checkout {
             Ok(origin) => origin,
             Err(probe) => return probe,
         };
+        if self.reader == Reader::Doctor {
+            return match checkout::read_fetched(sys, &self.user, &self.path, &origin) {
+                Ok(stands) => stands.probe_as_fetched(),
+                Err(checkout::NotFetched::Unread(unread)) => Probe::Unusable { why: unread.why },
+                Err(checkout::NotFetched::Unrecorded { why, act }) => Probe::Blocked {
+                    why: format!(
+                        "{why}: `git -C {} {act}` records it (it asks origin once)",
+                        shell_word(&self.spelled)
+                    ),
+                },
+            };
+        }
         match checkout::read(sys, &self.user, &self.path, &origin) {
             Ok(stands) => stands.probe(),
             Err(unread) => {
@@ -584,6 +649,9 @@ impl Item for Checkout {
     }
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.stood.set(None);
+        if self.reader == Reader::Doctor {
+            return Err(DOCTOR_CHANGES_NOTHING.into());
+        }
         let origin =
             admitted(sys, &self.user, &self.path, &self.spelled).map_err(|probe| match probe {
                 Probe::Blocked { why } | Probe::Unusable { why } => why,
@@ -624,6 +692,7 @@ struct Submodules {
     spelled: String,
     /// The submodule's remote could not be reached by the last apply.
     stood: Aside,
+    reader: Reader,
 }
 
 /// What [`Submodules`] would change, and what it leaves as it is.
@@ -817,6 +886,9 @@ impl Item for Submodules {
     }
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.stood.set(None);
+        if self.reader == Reader::Doctor {
+            return Err(DOCTOR_CHANGES_NOTHING.into());
+        }
         let needs = self
             .needs(sys)?
             .ok_or("vendor/astream is gone from the checkout")?;
@@ -874,13 +946,16 @@ struct WorkspaceTools {
     path: PathBuf,
     spelled: String,
     targo: Option<Targo>,
+    reader: Reader,
 }
 
 /// The base items the tools wait for: the C toolchain, and the toolset.
 const TOOLS_AFTER: [&str; 2] = [crate::init_clt::ID, "base.pkg.toolset"];
 
 impl WorkspaceTools {
-    /// The checkout's own verb.
+    /// The checkout's own verb: under `--locked`, and for doctor `--offline` too, so cargo
+    /// downloads nothing the lock names that this Mac does not hold, and with doctor's shorter
+    /// wait ([`DOCTOR_BUDGET`]).
     fn command(&self, targo: &Path, check: bool) -> Cmd {
         let bin = targo.parent().unwrap_or_else(|| Path::new("/"));
         let mut cmd = Cmd::new(targo)
@@ -890,8 +965,15 @@ impl WorkspaceTools {
                 "PATH",
                 format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
             )
-            .budget(LONG_BUDGET)
-            .args(["--unverified", "--locked", "verify", "provision"]);
+            .budget(match self.reader {
+                Reader::Init => LONG_BUDGET,
+                Reader::Doctor => DOCTOR_BUDGET,
+            })
+            .args(["--unverified", "--locked"]);
+        if self.reader == Reader::Doctor {
+            cmd = cmd.arg("--offline");
+        }
+        cmd = cmd.args(["verify", "provision"]);
         if check {
             cmd = cmd.arg("--check");
         }
@@ -929,6 +1011,16 @@ fn lock_refused(stderr: &[u8]) -> bool {
 
 const STALE_LOCK: &str = "the checkout's Cargo.lock does not match its manifests, and init \
                           never rewrites it (cargo refused under --locked)";
+
+/// Whether a cargo run under `--offline` stopped on a download it would have needed.
+fn offline_refused(stderr: &[u8]) -> bool {
+    let said = String::from_utf8_lossy(stderr);
+    said.contains("--offline was specified") || said.contains("offline mode (--offline)")
+}
+
+const NOT_DOWNLOADED: &str = "the checkout's lock names crates this Mac has not downloaded, and \
+                              aterm doctor reads no network (cargo --offline): `aterm init \
+                              --develop` fetches them";
 
 /// What a `verify provision` run said.
 fn said(stderr: &[u8]) -> String {
@@ -982,6 +1074,18 @@ impl Item for WorkspaceTools {
         };
         let ran = match sys.run(&self.command(&targo, true)) {
             Ok(ran) => ran,
+            Err(RunFailed::TimedOut(budget)) if self.reader == Reader::Doctor => {
+                return Probe::Blocked {
+                    why: format!(
+                        "the checkout's verify provision --check gave no answer within {}s, so \
+                         doctor stopped it (cargo may be waiting while another build holds the \
+                         checkout's build directory, or building aterm-verify after a pull): \
+                         the next doctor reads it again, and `aterm init --check --develop` \
+                         waits for it",
+                        budget.as_secs()
+                    ),
+                };
+            }
             Err(e) => {
                 return Probe::Unusable {
                     why: format!("cannot run the checkout's verify provision --check: {e}"),
@@ -1005,6 +1109,9 @@ impl Item for WorkspaceTools {
             _ if lock_refused(&ran.stderr) => Probe::Unusable {
                 why: STALE_LOCK.into(),
             },
+            _ if self.reader == Reader::Doctor && offline_refused(&ran.stderr) => Probe::Blocked {
+                why: NOT_DOWNLOADED.into(),
+            },
             _ => Probe::Unusable {
                 why: format!(
                     "the checkout's verify provision --check did not finish ({})",
@@ -1014,6 +1121,9 @@ impl Item for WorkspaceTools {
         }
     }
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        if self.reader == Reader::Doctor {
+            return Err(DOCTOR_CHANGES_NOTHING.into());
+        }
         self.runnable(sys).map_err(|probe| match probe {
             Probe::NotApplicable { why } | Probe::Blocked { why } | Probe::Unusable { why } => why,
             _ => format!("{} cannot be read", self.spelled),
@@ -1075,23 +1185,114 @@ pub struct Composed {
     pub unreadable: bool,
 }
 
+impl Composed {
+    /// The layer that could not be composed: one `develop.record` row saying why.
+    #[must_use]
+    pub fn unreadable(why: String) -> Self {
+        let mut place = place(Class::Relay);
+        place.remedy = Remedy::None;
+        Self {
+            items: vec![(Box::new(Unreadable { why }), place)],
+            unreadable: true,
+        }
+    }
+
+    fn of(composed: Result<Vec<Placed>, String>) -> Self {
+        match composed {
+            Ok(items) => Self {
+                items,
+                unreadable: false,
+            },
+            Err(why) => Self::unreadable(why),
+        }
+    }
+}
+
 /// [`compose`] for a run.
 #[must_use]
 pub fn layer(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Composed {
-    match compose(sys, ctx, inputs) {
-        Ok(items) => Composed {
-            items,
-            unreadable: false,
-        },
-        Err(why) => {
-            let mut place = place(Class::Relay);
-            place.remedy = Remedy::None;
-            Composed {
-                items: vec![(Box::new(Unreadable { why }), place)],
-                unreadable: true,
-            }
+    Composed::of(compose(sys, ctx, inputs))
+}
+
+/// The develop layer as `aterm doctor` reads it for `ctx`'s one user (design §5, S9): on a
+/// develop machine the items of the checkouts `init.toml` records, nothing on a Mac that records
+/// none unless `asked` (an `--only` word named a develop item: its record row), and a profile
+/// that cannot be read is one `develop.record` row saying why. Each item reads this Mac alone:
+/// the record as it is, the checkout against origin as last fetched (no `ls-remote`, no fetch),
+/// the submodule, and the tools' `--check` under `--locked --offline` only where init runs them
+/// ([`checkout::kept_here`]: origin admitted, HEAD on a branch, which may be another than
+/// origin's default, and nothing uncommitted or untracked). None of them applies anything: the
+/// record is what doctor wants, and the other three are `install` (§3.2).
+#[must_use]
+pub fn doctor(sys: &dyn System, ctx: &Ctx, asked: bool, targo: Option<Targo>) -> Composed {
+    let composed = (|| {
+        let [user] = ctx.users.as_slice() else {
+            return Err("aterm doctor reads the develop layer of exactly one local user".into());
+        };
+        let recorded = read_profile(sys, user)?.table.map(|table| table.checkouts);
+        if recorded.is_none() && !asked {
+            return Ok(Vec::new());
         }
-    }
+        items(user, recorded, Reader::Doctor, targo)
+    })();
+    Composed::of(composed)
+}
+
+/// Whether the account whose uid is `uid` and whose home is `home` may have a develop layer for
+/// doctor to read, read before the account's context is built ([`crate::init::Doctor`]): false
+/// only when its `init.toml` is absent or is read with no `[develop]` table, so a Mac that
+/// records none spawns nothing for the layer; a profile that cannot be read is true, so the
+/// layer's composition says why.
+#[must_use]
+pub fn may_record(sys: &dyn System, uid: u32, home: &Path) -> bool {
+    let account = User {
+        name: String::new(),
+        uid,
+        gid: 0,
+        home: home.to_string_lossy().into_owned(),
+        shell: String::new(),
+        admin: false,
+    };
+    read_profile(sys, &account).map_or(true, |profile| profile.table.is_some())
+}
+
+/// The rows of `composed` ([`doctor`]) narrowed to `only` (the record kept whatever it says
+/// when the layer could not be read), each item probed and none applied: a plan, journaling
+/// nothing.
+///
+/// # Errors
+/// The composition cannot be ordered ([`aterm_converge::Refusal`]); nothing was read.
+pub fn read(
+    sys: &dyn System,
+    ctx: &Ctx,
+    composed: &Composed,
+    only: &[String],
+) -> Result<Vec<ItemReport>, String> {
+    let bound = crate::engine::bind(
+        composed
+            .items
+            .iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        sys,
+        ctx,
+    );
+    let bound = if only.is_empty() {
+        bound
+    } else {
+        let mut words = only.to_vec();
+        if composed.unreadable {
+            words.push(RECORD.to_owned());
+        }
+        aterm_converge::select(bound, &words).0
+    };
+    aterm_converge::run_scoped(
+        &bound,
+        Mode::Plan,
+        Scope::REPAIR,
+        &mut aterm_converge::ReadOnly,
+        &mut |_| {},
+    )
+    .map_err(|refused| refused.to_string())
 }
 
 /// What the develop layer is asked for.
@@ -1163,12 +1364,27 @@ pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<P
             Some(want)
         }
     };
+    items(user, want, Reader::Init, inputs.targo.clone())
+}
+
+/// The record wanting `want`, then each checkout's three items, for `reader`.
+fn items(
+    user: &User,
+    want: Option<Vec<String>>,
+    reader: Reader,
+    targo: Option<Targo>,
+) -> Result<Vec<Placed>, String> {
+    let record = match reader {
+        Reader::Init => record_place(want.as_deref()),
+        Reader::Doctor => place(Class::Relay),
+    };
     let mut items: Vec<Placed> = vec![(
         Box::new(Record {
             user: user.clone(),
             want: want.clone(),
+            reader,
         }),
-        record_place(want.as_deref()),
+        record,
     )];
     for spelled in want.unwrap_or_default() {
         let path = expand(user, &spelled)?;
@@ -1179,6 +1395,7 @@ pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<P
                 spelled: spelled.clone(),
                 unread: Aside::default(),
                 stood: Aside::default(),
+                reader,
             }),
             place(Class::Install),
         ));
@@ -1188,6 +1405,7 @@ pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<P
                 path: path.clone(),
                 spelled: spelled.clone(),
                 stood: Aside::default(),
+                reader,
             }),
             place(Class::Install),
         ));
@@ -1196,7 +1414,8 @@ pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<P
                 user: user.clone(),
                 path,
                 spelled,
-                targo: inputs.targo.clone(),
+                targo: targo.clone(),
+                reader,
             }),
             place(Class::Install),
         ));

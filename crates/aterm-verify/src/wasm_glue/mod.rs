@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify glue <in.wasm> <out-dir>`: the JS glue for a module built with
-//! aterm-wasm-abi's `#[export]`, in place of the wasm-bindgen CLI
-//! (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.6): an ES module
-//! with `init`/`initSync`, wasm-bindgen's `--target web`. Its CommonJS
-//! `nodejs` flavor is gone (docs/DESIGN-init-system-2026-10-20.md, S10):
-//! every driver of the glue runs in the browser the site ships to.
-//!
-//! It reads the `aterm_abi` descriptor from the module cargo wrote, checks
-//! every record against the module's real export and import signatures,
-//! and writes, for `<stem>.wasm`:
-//!
-//! * `<stem>_bg.wasm`: the module less the descriptor section, the DWARF
-//!   `.debug_*` sections (wasm-bindgen drops them too unless asked to keep
-//!   them) and the linker's `__data_end`/`__heap_base` exports (run
-//!   `wasm-opt` on this one, never before binding);
-//! * `<stem>.js`: an ES module with `init`/`initSync`;
-//! * `<stem>.d.ts` (with the docs as JSDoc) and `<stem>_bg.wasm.d.ts`.
-//!
-//! A module without the section, with records of another version, or whose
-//! exports disagree with its records is refused: nothing is written.
-//!
-//! [`glue`] is also a library entry: `ship site` (aterm-release) binds the
-//! `/terminal` engine with it in process.
+//! `verify glue`: the ES module and TypeScript glue generator for `aterm_abi` wasm modules.
 
 use std::path::{Path, PathBuf};
 
@@ -35,14 +13,10 @@ pub(crate) mod toy;
 mod wasm;
 mod webgl;
 
-/// What `verify provision --record` lays for the `wasm-glue` check's oracle row: the
-/// pinned CLI, into the machine-wide tooling the row reads.
+/// What `verify provision --record` lays for the `wasm-glue` check's oracle row.
 pub use oracle::{BINDGEN, BINDGEN_INSTALL, bindgen_root, reports_pin, tooling};
 
-/// The pass the shipping pipeline applies to a bound `<stem>_bg.wasm`, never
-/// before binding: `-O3` (speed, matching the cargo opt-3 build) with the
-/// shipping feature flags. The `wasm` perf lane and `ship site`'s `/terminal`
-/// engine both run it.
+/// The pass the shipping pipeline applies to a bound `<stem>_bg.wasm`, never before binding.
 pub const WASM_OPT_FLAGS: [&str; 7] = [
     "-O3",
     "--enable-bulk-memory",
@@ -56,9 +30,7 @@ pub const WASM_OPT_FLAGS: [&str; 7] = [
 /// The files for `bytes`, a module named `stem`: (name, contents) pairs.
 ///
 /// # Errors
-/// A stem that is not one filename component, or a module the generator
-/// refuses (no `aterm_abi` section, records of another version, exports that
-/// disagree with the records).
+/// A stem that is not one filename component, or a module the generator refuses.
 pub fn glue(bytes: &[u8], stem: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
     if stem.is_empty() || Path::new(stem).file_name().and_then(|s| s.to_str()) != Some(stem) {
         return Err("the module stem must be one filename component".to_string());
@@ -105,9 +77,7 @@ const USAGE: &str = "usage: targo --unverified verify glue <in.wasm> <out-dir> [
        targo --unverified verify glue --record-toy      (re-record the toy's goldens and fixture)\n\
        targo --unverified verify glue --record-replay   (re-record the CPU module's boundary answers)";
 
-/// `verify glue …`, answering its exit code: the generator over one module;
-/// `--record-toy`, the `wasm-glue` check's goldens and fixture rewritten; or
-/// `--record-replay`, the `wasm-smoke` check's CPU replay answers rewritten.
+/// `verify glue …`, answering its exit code.
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -163,9 +133,7 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// The generator's own arguments: the input and the output dir. `--flavor
-/// web` names the one flavor; any other is refused, by name for the
-/// CommonJS one that is gone.
+/// The generator's own arguments: the input and the output dir.
 fn parse(args: &[String]) -> Result<(&String, &String), Option<String>> {
     let mut positional = Vec::new();
     let mut it = args.iter();
@@ -196,10 +164,6 @@ mod tests {
     use super::*;
     use crate::perf::workspace_root;
 
-    /// The committed toy module, bound, is its goldens byte for byte: the
-    /// generator's output on a real module, natively. The `wasm-glue` check
-    /// holds a fresh build of the toy to the same goldens and runs the glue
-    /// in a browser.
     #[test]
     fn the_toy_module_binds_to_its_goldens() {
         let root = workspace_root();
@@ -223,8 +187,6 @@ mod tests {
         assert!(!m.exports.iter().any(|e| e.name == "__heap_base"));
     }
 
-    /// The generator's CLI takes the one flavor's name, and refuses the
-    /// CommonJS one by name.
     #[test]
     fn the_cli_takes_web_and_refuses_the_nodejs_flavor() {
         let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -247,8 +209,6 @@ mod tests {
         assert_eq!(parse(&args(&["m.wasm"])), Err(None));
     }
 
-    /// The bound module carries no DWARF, as wasm-bindgen's does not; the
-    /// other custom sections stay (the control: `producers` survives).
     #[test]
     fn the_bound_module_drops_dwarf_and_keeps_other_custom_sections() {
         let mut bytes = std::fs::read(toy::fixture(&workspace_root())).unwrap();
@@ -275,8 +235,6 @@ mod tests {
         glue(bytes, "m").expect_err("refused")
     }
 
-    /// NEGATIVE CONTROLS on the real module: what the generator must refuse,
-    /// it refuses, and says why.
     #[test]
     fn a_module_the_descriptor_does_not_describe_is_refused() {
         let bytes = std::fs::read(toy::fixture(&workspace_root())).unwrap();
@@ -302,8 +260,6 @@ mod tests {
         assert!(refusal(&no_alloc).contains("does not export `aterm_alloc`"));
     }
 
-    /// The fixture with its descriptor section rebuilt from the records
-    /// `keep` accepts.
     fn with_records(keep: impl Fn(&aterm_wasm_abi::descriptor::Record) -> bool) -> Vec<u8> {
         use aterm_wasm_abi::descriptor::{self as d, HEADER_LEN};
         let bytes = std::fs::read(toy::fixture(&workspace_root())).unwrap();
@@ -331,9 +287,6 @@ mod tests {
         out
     }
 
-    /// Change a length-prefixed name in one real descriptor without changing
-    /// its export's signature or code. Everything outside that record stays
-    /// byte-for-byte the fixture's.
     fn with_renamed_record(symbol: &str, renames: &[(&str, &str)]) -> Vec<u8> {
         use aterm_wasm_abi::descriptor::{self as d, HEADER_LEN};
         let bytes = std::fs::read(toy::fixture(&workspace_root())).unwrap();
@@ -361,8 +314,6 @@ mod tests {
                             for i in hits.into_iter().rev() {
                                 body.splice(i..i + before.len(), after.iter().copied());
                             }
-                            // A class reference in a type has a one-byte
-                            // name length, unlike the record's string fields.
                             let mut before = vec![u8::try_from(old.len()).unwrap()];
                             before.extend(old.as_bytes());
                             let mut after = vec![u8::try_from(new.len()).unwrap()];
@@ -400,9 +351,6 @@ mod tests {
         out
     }
 
-    /// Metadata is not JavaScript source: malformed identifiers must fail
-    /// before the output directory is created, even when the wasm signature
-    /// is genuine and unchanged.
     #[test]
     fn descriptor_names_cannot_inject_javascript_or_shadow_its_runtime() {
         use aterm_tempfile::TempDir;
@@ -546,9 +494,6 @@ mod tests {
         run_bound(&[(bytes, "control", "assert.equal(m.echo_u8(7), 8);")]);
     }
 
-    /// An export no record describes would vanish from the glue: refused.
-    /// The same surgery keeping every record binds, so the refusal is the
-    /// missing record's.
     #[test]
     fn an_export_without_a_record_is_refused() {
         assert!(glue(&with_records(|_| true), toy::STEM).is_ok());
@@ -559,8 +504,6 @@ mod tests {
         );
     }
 
-    /// A record whose lowering is not the export's signature, and an import
-    /// the glue does not know, on a module built by hand.
     #[test]
     fn signatures_and_imports_are_checked_against_the_module() {
         use aterm_wasm_abi::descriptor::{MAGIC, VERSION, kind, receiver, tag};
@@ -577,14 +520,12 @@ mod tests {
             r.extend(body);
             r
         }
-        // `g` is (i32, i64) -> f64; describe it as `fn g() -> u32`.
         let wrong = wasm::tests::sample(&[("aterm_abi", &record("g", tag::U32))]);
         let e = refusal(&wrong);
         assert!(
             e.contains("export `g` has signature (i32, i64) -> (f64)"),
             "{e}"
         );
-        // `h` is () -> (): right, so the next check speaks: the import.
         let foreign = wasm::tests::sample(&[("aterm_abi", &record("h", tag::UNIT))]);
         let e = refusal(&foreign);
         assert!(e.contains("imports `env.f`"), "{e}");

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive answer @<worker> [--box TOKEN] <answer>`: a controlling session types its own choice into a worker's question — Claude Code's question dialog (AskUserQuestion), or agy's and Muse Code's.
+//! `aterm drive answer @<worker> [--box TOKEN] <answer>`.
 
 use std::io::Write;
 
@@ -21,7 +21,7 @@ pub const EXIT_REFUSED: u8 = 2;
 /// A key the host or the dialog did not take as decided.
 pub const EXIT_NOT_SERVED: u8 = 3;
 
-/// The dialog's TOKEN: eight hex digits over its form, its tab headers and the question on display (the review: its headers) — the same on every read of that screen, another for another question.
+/// The dialog's TOKEN.
 #[must_use]
 pub fn question_box_token(dialog: &QuestionDialog) -> String {
     let mut name = String::new();
@@ -42,10 +42,6 @@ pub fn question_box_token(dialog: &QuestionDialog) -> String {
     token_of(&name)
 }
 
-/// The TOKEN of a question read by its answers' roles (agy's, Muse Code's: no dialog
-/// read whole): eight hex digits over its title, its question and its
-/// options' labels — the same on every read of that screen, another for
-/// another question.
 fn role_box_token(prompt: &aterm_phase::PromptV2) -> String {
     let mut name = format!("roles\u{1f}{}\u{1e}{}", prompt.title, prompt.description);
     for o in &prompt.options {
@@ -55,7 +51,7 @@ fn role_box_token(prompt: &aterm_phase::PromptV2) -> String {
     token_of(&name)
 }
 
-/// The token `phase` prints as `box` and `--box` names: a dialog's ([`question_box_token`]), else, for a question read by its answers' roles, [`role_box_token`]; `None` for any other box (a question with no answer read has nothing to answer).
+/// The token `phase` prints as `box` and `--box` names.
 #[must_use]
 pub fn prompt_box_token(prompt: &aterm_phase::PromptV2) -> Option<String> {
     match &prompt.question_dialog {
@@ -66,7 +62,6 @@ pub fn prompt_box_token(prompt: &aterm_phase::PromptV2) -> Option<String> {
     }
 }
 
-/// Eight hex digits over `name`.
 fn token_of(name: &str) -> String {
     let h = aterm_hash::fnv1a_64(name.as_bytes());
     format!("{:08x}", (h ^ (h >> 32)) & 0xffff_ffff)
@@ -77,23 +72,19 @@ fn token_of(name: &str) -> String {
 enum Plan {
     /// Nothing typed: the person answers.
     Human,
-    /// Enter on each target in turn (a multi-select's toggles, then its
-    /// button), re-read and re-planned between them; `said` names it.
+    /// Enter on each target in turn (a multi-select's toggles, then its button).
     Keys {
         targets: Vec<AnswerTarget>,
         said: String,
     },
     /// The digit of a question read by its answers' roles.
     Digit(Digit),
-    /// The focus moved to an answer of a question read by its answers'
-    /// roles that is chosen by the cursor and Enter (Muse Code's), then
-    /// Enter on it.
+    /// The focus moved to an answer of a question read by its answers' roles that is chosen by the
+    /// cursor and Enter (Muse Code's).
     Focus(Focus),
 }
 
-/// An answer's digit on a question read by its answers' roles (agy's),
-/// which chooses at once: `n`, guarded on the question's title row
-/// (`guard`); `said` names it.
+/// An answer's digit on a question read by its answers' roles (agy's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Digit {
     n: u8,
@@ -101,10 +92,7 @@ struct Digit {
     said: String,
 }
 
-/// An answer of a question read by its answers' roles that is chosen by the
-/// cursor and Enter (Muse Code's): the focus moved `steps` options to the one
-/// labelled `label`, the moves guarded on the question's own row (`guard`),
-/// then Enter on it; `said` names it.
+/// An answer of a question read by its answers' roles that is chosen by the cursor and Enter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Focus {
     steps: i32,
@@ -113,8 +101,6 @@ struct Focus {
     said: String,
 }
 
-/// The option an answer word names on `options`: its number, or its label
-/// (trimmed, case folded).
 fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a QuestionOption> {
     let word = word.trim();
     if let Ok(n) = word.parse::<u8>() {
@@ -125,8 +111,6 @@ fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a Que
         .find(|o| o.label.trim().eq_ignore_ascii_case(word))
 }
 
-/// Why `answer` is refused as the text priority `p`: the window's policy, never an answer
-/// typed from here.
 fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
     format!(
         "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
@@ -136,8 +120,6 @@ fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
     )
 }
 
-/// Why `answer`, which names no option, is refused: a text priority's
-/// [`policy_refusal`], else free text, a person's to type.
 fn names_no_option(answer: &str, who: &str) -> String {
     match QuestionPriority::parse(answer).filter(|p| p.text().is_some()) {
         Some(p) => policy_refusal(answer, who, p),
@@ -145,8 +127,6 @@ fn names_no_option(answer: &str, who: &str) -> String {
     }
 }
 
-/// Plan `answer` on the question on display, for the worker `who`: a dialog read whole, else
-/// by its answers' roles ([`plan_by_role`]).
 fn plan(
     prompt: &aterm_phase::PromptV2,
     rows: &[String],
@@ -277,9 +257,6 @@ fn plan(
     }
 }
 
-/// Plan `answer` on a question read by its ANSWERS' ROLES (agy's and Muse
-/// Code's, which no dialog reader reads whole), as the window answers one: by
-/// the answer's digit, guarded on the question's title row.
 fn plan_by_role(
     prompt: &aterm_phase::PromptV2,
     rows: &[String],
@@ -382,8 +359,6 @@ fn plan_by_role(
     }))
 }
 
-/// The question on display, read by `reader`, for `next=`: its text,
-/// `review`, or `none`.
 fn next_of(reader: &dyn ScreenReader, rows: &[String]) -> String {
     let Some(p) = reader.prompt(rows) else {
         return "none".to_string();
@@ -403,12 +378,11 @@ fn next_of(reader: &dyn ScreenReader, rows: &[String]) -> String {
 /// `aterm drive answer`'s options.
 #[derive(Debug, Clone)]
 pub struct AnswerOpts {
-    /// The controller's answer: an option's number or label (`,`-joined on a multi-select),
-    /// `submit`, `recommended` or `human`.
+    /// The controller's answer.
     pub answer: String,
     /// `--box`: the question's token the answer was decided on.
     pub box_token: Option<String>,
-    /// A person's quiet before a key goes (`[harness] human_grace_s`): one who keyed within it gets the question (`LEFT`).
+    /// A person's quiet before a key goes (`[harness] human_grace_s`).
     pub grace: Duration,
 }
 
@@ -542,12 +516,6 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
-    /// Press `digit` on the question read by its answers' roles on `screen`:
-    /// the window's own key for it
-    /// ([`Self::press_one_guarded`]), guarded on the question's title row and
-    /// fenced on the screen generation and person count (never pressed
-    /// without them), and only while a person has been quiet for `grace` by
-    /// the read's stamp.
     fn answer_digit(
         &mut self,
         who: &str,
@@ -618,19 +586,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// Maximum focus-answer attempts when a generation change skips a key, as
-/// Muse Code's ticking question header can do.
 const FOCUS_TRIES: u32 = 3;
 
 impl<C: Ctl> Session<'_, C> {
-    /// Answer the question read by its answers' roles on `screen` that is
-    /// chosen by the cursor and Enter (Muse Code's): the focus
-    /// moved `focus.steps` options, each move fenced on the generation and
-    /// guarded on the question's own row and seen landing, then Enter on the
-    /// answer's own row once a fresh read shows the focus on it
-    /// ([`Self::press_focused`]) — every key also fenced on the read's person
-    /// count, and only while a person has been quiet for the grace by the
-    /// read's stamp.
     fn answer_focus(
         &mut self,
         who: &str,
@@ -726,7 +684,6 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// A [`Fail`] as the one-shot verb reports it.
 fn fail_text(f: Fail) -> String {
     match f {
         Fail::Lost(why) | Fail::Hard(why) => why,
@@ -749,8 +706,6 @@ mod tests {
         plan(&p, &rows, answer, "@s-w")
     }
 
-    /// Single-select: a number or label (case folded) names one option; a word or number
-    /// naming none is refused as free text.
     #[test]
     fn a_single_select_answer_names_one_option_or_is_refused() {
         let one = |n| {
@@ -773,8 +728,6 @@ mod tests {
         }
     }
 
-    /// A priority word that labels an option answers that option, single- and multi-select
-    /// alike; it is refused as a policy only where it names no option.
     #[test]
     fn a_priority_word_that_labels_an_option_answers_that_option() {
         let single = f::QUESTION_ONE.replace("  2. Light", "  2. Long-term");
@@ -802,8 +755,6 @@ mod tests {
         planned(&multi, "long-term").expect_err("no such option");
     }
 
-    /// `recommended` on a multi-select toggles each unchecked recommended option, then the
-    /// button; a person's check outside the recommended set refuses it.
     #[test]
     fn recommended_on_a_multi_select_plans_the_whole_tab() {
         let said = "Which glyph sets should be bundled? → Next (Box drawing (Recommended), \
@@ -841,8 +792,6 @@ mod tests {
         planned(&person, "recommended").expect_err("a person's check");
     }
 
-    /// Multi-select: each option whose check differs is toggled, then the button. The review
-    /// tab takes `submit` only.
     #[test]
     fn a_multi_select_toggles_what_differs_then_presses_the_button() {
         assert_eq!(
@@ -868,8 +817,6 @@ mod tests {
         planned(f::QUESTION_REVIEW, "1").expect_err("not submit");
     }
 
-    /// The token is the same on every read of one screen and differs across
-    /// questions and tabs.
     #[test]
     fn the_box_token_names_one_screen() {
         let token = |t: &str| question_box_token(&read(t).0.question_dialog.expect("read whole"));
@@ -891,13 +838,6 @@ mod tests {
         }
     }
 
-    /// Muse Code's question (1.4.10), read by its answers' roles, is chosen
-    /// by the cursor and Enter — no digit was measured on it — so an answer
-    /// is planned as the focus moved to it: `recommended` stays on `Red
-    /// (Recommended)`, `2` and `blue` move one down, and from `Blue` focused
-    /// `1` moves one up; each guarded on the question's own row, never its
-    /// head (whose clock ticks); and in a 60-column tab, where each
-    /// description is drawn under its label, `blue` names `Blue` alone.
     #[test]
     fn a_muse_question_is_planned_as_the_focus_moved_to_its_answer() {
         use aterm_phase::muse::fixtures as u;
@@ -956,9 +896,6 @@ mod tests {
         );
     }
 
-    /// A question read by its answers' roles has a token of its own, over its
-    /// title, its question and its labels: the same on every read, another
-    /// for another question.
     #[test]
     fn a_roles_question_has_a_box_token_and_another_box_none() {
         use aterm_phase::muse::fixtures as u;

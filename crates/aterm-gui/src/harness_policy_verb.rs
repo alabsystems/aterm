@@ -213,7 +213,7 @@ pub(crate) fn record_policy_move(
     let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
     let at = tl.slog().now();
     tl.slog_mut().observe_policy(generation, at);
-    tl.record(HARNESS_POLICY_EVENT, format!("gen={generation}"));
+    tl.record(HARNESS_POLICY_EVENT);
     let _ = tl.slog_take_wake();
 }
 

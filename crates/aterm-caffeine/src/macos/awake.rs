@@ -7,7 +7,7 @@ use aterm_objc::send::{send_id, send_id_usize_id, send_v_id};
 use aterm_objc::{Id, Obj, autoreleasepool, class, sel};
 
 /// What `pmset -g assertions` names the activity: the mug's, and a bridge's across an update
-/// restart ([`super::bridge`]).
+/// restart ([`mod@super::bridge`]).
 pub(super) const AWAKE_REASON: &str = "aterm Caffeine is keeping this Mac awake";
 const IDLE_DISPLAY_SLEEP_DISABLED: usize = 1 << 40;
 const USER_INITIATED: usize = 0x00FF_FFFF;

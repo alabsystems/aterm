@@ -2,7 +2,29 @@
 // Copyright 2026 Andrew Yates
 
 //! `verify perf` — aterm's performance lanes, each runnable alone or in any
-//! combination:
+//! combination.
+//!
+//! ```text
+//! targo --unverified verify perf [LANE...] [--record LANE...] [OPTIONS]
+//! targo --unverified verify perf --list
+//! ```
+//!
+//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`]) measure the
+//! engine headless and judge each metric against its committed baseline in
+//! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
+//! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
+//! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
+//! windows and take minutes; they run only when named, and what they measure
+//! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
+//! ([`fabric`], [`aos`]) are headless but just as unjudgeable — their numbers
+//! are a disk's fsync, or a shared desk's scheduler, before they are aterm's —
+//! so they too run only when named and report MEASURED (fabric writing a
+//! ledger entry under `docs/measured/`, aos a summary and its JSON).
+//!
+//! `--no-windows` (the house switch for an agent sharing the owner's desktop)
+//! turns every lane that opens a window into a named skip and runs the rest.
+//!
+//! Nothing runs this automatically: it measures when someone asks it to.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -297,6 +297,26 @@ unsafe impl Send for Claim {}
 unsafe impl Sync for Claim {}
 
 /// One swizzle: the row patched, and the implementation it displaced.
+///
+/// A process-lifetime object (a swizzle is permanent), so it is a `static`:
+///
+/// ```no_run
+/// # use aterm_objc::{Id, Sel, class, sel};
+/// # use aterm_objc::swizzle::SwizzleSite;
+/// type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
+///
+/// static SEND_EVENT: SwizzleSite<SendEvent> = SwizzleSite::new();
+///
+/// unsafe extern "C-unwind" fn send_event(this: Id, cmd: Sel, event: Id) {
+///     // …the fork's behaviour…
+///     if let Some(original) = SEND_EVENT.original() {
+///         // SAFETY: the install verified this prototype against the encoding
+///         // the runtime holds, and an IMP is called with the receiver and the
+///         // selector in the argument positions the runtime uses.
+///         unsafe { original(this, cmd, event) }
+///     }
+/// }
+/// ```
 pub struct SwizzleSite<F: MethodFn> {
     /// The [`Claim`] this site published, or null when nothing is installed.
     claim: AtomicPtr<Claim>,
@@ -354,6 +374,38 @@ impl<F: MethodFn> SwizzleSite<F> {
     }
 
     /// Replace `cls`'s implementation of `sel` with `new`, publishing the displaced one into this site.
+    ///
+    /// `&'static self` because the trampoline reads this site for the rest of
+    /// the process. A stack site does not compile:
+    ///
+    /// ```compile_fail
+    /// # use aterm_objc::{Id, Sel, class, sel};
+    /// # use aterm_objc::swizzle::SwizzleSite;
+    /// type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
+    /// unsafe extern "C-unwind" fn patched(_: Id, _: Sel, _: Id) {}
+    ///
+    /// // A site on the STACK. AppKit would keep dispatching into `patched`
+    /// // long after this frame returned, and `patched` would read a freed
+    /// // slot from safe code.
+    /// let site: SwizzleSite<SendEvent> = SwizzleSite::new();
+    /// let _ = unsafe {
+    ///     site.install(class(c"NSApplication"), sel!(sendEvent:), patched)
+    /// };
+    /// ```
+    ///
+    /// A leaked site is accepted:
+    ///
+    /// ```no_run
+    /// # use aterm_objc::{Id, Sel, class, sel};
+    /// # use aterm_objc::swizzle::SwizzleSite;
+    /// # type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
+    /// # unsafe extern "C-unwind" fn patched(_: Id, _: Sel, _: Id) {}
+    /// let site: &'static SwizzleSite<SendEvent> =
+    ///     Box::leak(Box::new(SwizzleSite::new()));
+    /// let _ = unsafe {
+    ///     site.install(class(c"NSApplication"), sel!(sendEvent:), patched)
+    /// };
+    /// ```
     ///
     /// # Safety
     /// `new` must be entered exactly as the runtime enters the implementation it replaces and must not unwind (catch and [`crate::abort_on_unwind`], as [`crate::declare_class!`]'s trampolines do).

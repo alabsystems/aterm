@@ -354,7 +354,7 @@ pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'s
         .collect()
 }
 
-/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order.
+/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order; a `release` run is `wanted` alone.
 #[must_use]
 pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool) -> Vec<Check> {
     if release {

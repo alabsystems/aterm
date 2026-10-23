@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure terminal input decoder for keys, mouse reports, pastes, focus, resizes, and probe replies
-//! ([`Decoder::feed`], [`Decoder::flush`], [`Decoder::deadline`], [`String::from_utf8_lossy`],
-//! [`NamedKey`], [`NamedKey::Space`], [`NamedKey::Escape`], [`Key::main_block_twin`],
-//! [`Event::Unknown`], [`MAX_PASTE_BYTES`], [`Reply`], [`ESC_TIMEOUT`], [`PASTE_TIMEOUT`]).
+//! Pure terminal input decoder for keys, mouse reports, pastes, focus, resizes, and probe replies.
 
 use std::time::{Duration, Instant};
 
@@ -20,17 +17,12 @@ pub const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most of one bracketed paste kept.
 pub const MAX_PASTE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most of one control sequence or string kept. A reply is far shorter; one that
-/// is not is read to its end and reported [`Event::Unknown`] with this much of it.
 const MAX_SEQUENCE_BYTES: usize = 4096;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
-/// The bracketed paste's closing sequence, matched raw.
 const PASTE_END: &[u8] = b"\x1b[201~";
-/// The mouse report's motion bit (xterm `Cb` + 32).
 const MOTION_MASK: u8 = 32;
-/// The lock bits kitty reports among a chord's modifiers.
 const LOCKS: Modifiers = Modifiers::CAPS_LOCK.union(Modifiers::NUM_LOCK);
 
 /// One thing the terminal said.
@@ -129,9 +121,9 @@ enum State {
     /// `ESC P` with nothing after it.
     DcsStart,
     Dcs,
-    /// `ESC ]` with nothing after it.
+    /// OSC introducer with nothing after it.
     OscStart,
-    /// `ESC ]` and the digits of an OSC number, before its `;`.
+    /// OSC introducer and the digits of an OSC number, before its `;`.
     OscNumber,
     Osc,
     /// An ESC inside a DCS or OSC string.
@@ -232,8 +224,6 @@ impl Decoder {
         self.deadline
     }
 
-    /// How long what the decoder holds waits for more bytes: `None` when it holds
-    /// nothing.
     const fn wait(&self) -> Option<Duration> {
         match self.state {
             State::Ground => None,
@@ -262,9 +252,6 @@ impl Decoder {
         }
     }
 
-    /// End the unit being read without completing it: what was held is delivered as
-    /// typed keys, or as `Unknown` when it cannot be (an overlong unit, a cut X10
-    /// report).
     fn abort(&mut self, out: &mut Vec<Event>) {
         match self.state {
             State::Ground | State::Paste { .. } => return,
@@ -408,8 +395,6 @@ impl Decoder {
         }
     }
 
-    /// Take `b`, which fits, into the UTF-8 character being read: `need` bytes were
-    /// still to come.
     fn utf8_byte(&mut self, need: u8, b: u8, out: &mut Vec<Event>) {
         self.seq.push(b);
         if need > 1 {
@@ -438,7 +423,6 @@ impl Decoder {
         }
     }
 
-    /// Deliver a complete non-key unit: an ESC prefix on it was a press of Escape.
     fn emit(&mut self, event: Option<Event>, out: &mut Vec<Event>) {
         match event {
             Some(event) => {
@@ -519,8 +503,6 @@ impl Decoder {
         self.reset();
     }
 
-    /// A key read from a sequence, with Alt when it was ESC-prefixed (a chord then,
-    /// typing no text).
     fn key(&self, key: Key, mods: Modifiers, text: Option<char>) -> Event {
         if self.alt {
             Event::Key {
@@ -551,7 +533,6 @@ impl Decoder {
         }
     }
 
-    /// Deliver the paste read so far and go back to reading keys.
     fn finish_paste(&mut self, out: &mut Vec<Event>) {
         let mut body = std::mem::take(&mut self.paste);
         if self.paste_overflow {
@@ -573,7 +554,6 @@ impl Decoder {
     }
 }
 
-/// Decode an invalid paste without letting replacement characters exceed its byte cap.
 fn lossy_paste(bytes: &[u8]) -> String {
     let mut text = String::new();
     for chunk in bytes.utf8_chunks() {
@@ -594,8 +574,6 @@ fn lossy_paste(bytes: &[u8]) -> String {
     text
 }
 
-/// The key, modifiers and text a lone character spells, in the one reading the decoder
-/// picks where legacy bytes are ambiguous (BS and DEL are both Backspace, `A` is Shift+a).
 fn plain(c: char) -> (Key, Modifiers, Option<char>) {
     let none = Modifiers::empty();
     let ctrl = |c: char| (Key::Character(c), Modifiers::CTRL, None);
@@ -620,13 +598,11 @@ fn plain(c: char) -> (Key, Modifiers, Option<char>) {
     }
 }
 
-/// [`plain`] as an event.
 fn plain_key(c: char) -> Event {
     let (key, mods, text) = plain(c);
     Event::Key { key, mods, text }
 }
 
-/// [`plain_key`] ESC-prefixed: the same key with Alt, typing nothing.
 fn alt_key(c: char) -> Event {
     let (key, mods, _) = plain(c);
     Event::Key {
@@ -644,9 +620,6 @@ const fn named(key: NamedKey, mods: Modifiers) -> Event {
     }
 }
 
-/// Deliver held bytes as the keys they spell when they made no sequence: an ESC and
-/// the key after it are that key with Alt (a lone or trailing ESC is Escape), and
-/// the rest decodes as legacy keys.
 fn typed_keys(bytes: &[u8], out: &mut Vec<Event>) {
     let mut rest = bytes;
     while let Some((&b, after)) = rest.split_first() {
@@ -676,7 +649,6 @@ fn typed_keys(bytes: &[u8], out: &mut Vec<Event>) {
     }
 }
 
-/// The complete, valid UTF-8 character `bytes` starts with, and its length.
 fn first_char(bytes: &[u8]) -> Option<(char, usize)> {
     let len = usize::from(utf8_len(*bytes.first()?));
     let c = std::str::from_utf8(bytes.get(..len)?)
@@ -687,9 +659,6 @@ fn first_char(bytes: &[u8]) -> Option<(char, usize)> {
 }
 
 trust_contract_fn! {
-    /// The length of the UTF-8 character a byte leads (1 for a byte that leads none):
-    /// Table 3-7's first column, which leaves out C0 and C1 (they could only lead
-    /// overlong forms) and F5-FF (they could only lead code points past U+10FFFF).
     fn utf8_len(lead: u8) -> u8
     clauses [ensures result == utf8_len_spec(lead) by utf8_len_is_table_3_7]
     {
@@ -703,9 +672,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// The least byte that may follow a multi-byte lead (Table 3-7's second column):
-    /// above 0x80 only after E0 and F0, whose smaller second bytes spell overlong
-    /// forms.
     fn utf8_second_min(lead: u8) -> u8
     clauses [ensures result == utf8_second_min_spec(lead) by utf8_second_min_is_table_3_7]
     {
@@ -718,9 +684,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// The greatest byte that may follow a multi-byte lead (Table 3-7's second column):
-    /// below 0xBF only after ED, whose larger second bytes spell the surrogates, and
-    /// F4, whose larger ones spell code points past U+10FFFF.
     fn utf8_second_max(lead: u8) -> u8
     clauses [ensures result == utf8_second_max_spec(lead) by utf8_second_max_is_table_3_7]
     {
@@ -733,7 +696,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// A byte that continues a UTF-8 character: Table 3-7's trailing bytes, 80-BF.
     fn is_utf8_continuation(b: u8) -> bool
     clauses [ensures result == (0x80 <= b && b <= 0xBF) by utf8_continuation_is_table_3_7]
     {
@@ -742,8 +704,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// A byte that continues a control sequence's body (ECMA-48 §5.4): a parameter
-    /// byte (03/00-03/15) or an intermediate byte (02/00-02/15).
     fn is_csi_body(b: u8) -> bool
     clauses [ensures result == (0x20 <= b && b <= 0x3F) by csi_body_is_ecma_48]
     {
@@ -752,8 +712,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// A byte of a parameter string's sub-strings (ECMA-48 §5.4.1: 03/00-03/11, the
-    /// digits, `:` and `;`).
     fn is_csi_parameter(b: u8) -> bool
     clauses [ensures result == (0x30 <= b && b <= 0x3B) by csi_parameter_is_ecma_48]
     {
@@ -762,8 +720,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// A byte that opens a private parameter string (ECMA-48 §5.4.1: 03/12-03/15,
-    /// `<`, `=`, `>` and `?`).
     fn is_csi_private_marker(b: u8) -> bool
     clauses [ensures result == (0x3C <= b && b <= 0x3F) by csi_private_marker_is_ecma_48]
     {
@@ -772,7 +728,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// An intermediate byte (ECMA-48 §5.4: 02/00-02/15).
     fn is_csi_intermediate(b: u8) -> bool
     clauses [ensures result == (0x20 <= b && b <= 0x2F) by csi_intermediate_is_ecma_48]
     {
@@ -781,7 +736,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// The byte that ends a control sequence (ECMA-48 §5.4: 04/00-07/14).
     fn is_csi_final(b: u8) -> bool
     clauses [ensures result == (0x40 <= b && b <= 0x7E) by csi_final_is_ecma_48]
     {
@@ -790,9 +744,6 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// A C0 control or DEL: inside a DCS or OSC string it means the string was typed
-    /// keys (ECMA-48 §5.6 admits only 00/08-00/13 and 02/00-07/14 there; BEL ends an
-    /// OSC and ESC may start ST, and both are read before this).
     fn is_string_control(b: u8) -> bool
     clauses [ensures result == (b <= 0x1F || b == 0x7F) by string_control_is_c0_or_del]
     {
@@ -917,9 +868,6 @@ verify_island! {
     }
 }
 
-/// For a multi-byte UTF-8 lead: the bytes still to come and the range the next one
-/// must fall in (which rules out overlong forms, surrogates and code points past
-/// U+10FFFF, as the standard decoder does).
 fn utf8_lead(b: u8) -> Option<(u8, u8, u8)> {
     let need = match utf8_len(b) {
         2 => 1,
@@ -930,7 +878,6 @@ fn utf8_lead(b: u8) -> Option<(u8, u8, u8)> {
     Some((need, utf8_second_min(b), utf8_second_max(b)))
 }
 
-/// Drop a character the paste cap cut in two.
 fn trim_partial_char(bytes: &mut Vec<u8>) {
     let len = bytes.len();
     let lead = (1..=len.min(4))
@@ -945,7 +892,6 @@ fn trim_partial_char(bytes: &mut Vec<u8>) {
     }
 }
 
-/// What a complete `CSI body final` means.
 enum Csi {
     Key(Key, Modifiers, Option<char>),
     /// A non-key event, or `None` for a malformed one (delivered `Unknown`).
@@ -956,7 +902,6 @@ enum Csi {
     Unknown,
 }
 
-/// One `;`-separated parameter and its `:`-separated sub-parameters (`None` empty).
 type Field = Vec<Option<u32>>;
 
 fn csi(body: &[u8], fin: u8) -> Csi {
@@ -1030,7 +975,6 @@ fn fields(params: &[u8]) -> Vec<Field> {
         .collect()
 }
 
-/// A run of ASCII digits, saturating; `None` when empty.
 fn number(digits: &[u8]) -> Option<u32> {
     if digits.is_empty() {
         return None;
@@ -1045,9 +989,6 @@ fn value(field: &Field) -> Option<u32> {
     field.first().copied().flatten()
 }
 
-/// The modifiers of a `1 + bits` parameter, which xterm and kitty agree on (Shift 1,
-/// Alt 2, Ctrl 4, Super 8; kitty adds Hyper and Meta above, and the Caps Lock and
-/// Num Lock bits, which are dropped).
 fn modifiers(field: &Field) -> Option<Modifiers> {
     if !matches!(field.get(1).copied().flatten(), None | Some(1 | 2)) {
         return None;
@@ -1058,7 +999,6 @@ fn modifiers(field: &Field) -> Option<Modifiers> {
         .map(|bits| Modifiers::from_bits_retain(bits) - LOCKS)
 }
 
-/// The modifiers of a letter key's `1 ; m` (or bare `1`) parameters.
 fn letter_mods(fields: &[Field]) -> Option<Modifiers> {
     match fields {
         [] => Some(Modifiers::empty()),
@@ -1113,10 +1053,6 @@ fn kitty_key(fields: &[Field]) -> Csi {
     }
 }
 
-/// The canonical reading of a key a sequence names by its code: a keypad
-/// key is its main-block twin, its glyph typing itself unless a chord modifier is held;
-/// a Shift chord with its `shifted` key is that glyph as legacy bytes spell it; and a
-/// character or space with no modifier types itself.
 fn reading(
     key: Key,
     mods: Modifiers,
@@ -1153,8 +1089,6 @@ fn resize(fields: &[Field]) -> Option<Event> {
     }
 }
 
-/// A mouse report's event from xterm's `Cb` and 1-based cell. `legacy` reads `Cb` 3
-/// as a release of an unnamed button, as X10 sends one.
 fn mouse(cb: u32, col: u32, row: u32, release: bool, legacy: bool) -> Option<Event> {
     let cb = u8::try_from(cb).ok()?;
     let mut mods = Modifiers::empty();
@@ -1200,8 +1134,6 @@ fn mouse(cb: u32, col: u32, row: u32, release: bool, legacy: bool) -> Option<Eve
     })
 }
 
-/// The key a kitty or modifyOtherKeys code names: a [`NamedKey`] by its kitty code,
-/// otherwise the character with that code point.
 fn code_key(code: u32) -> Option<Key> {
     let named = match code {
         9 => Some(NamedKey::Tab),
@@ -1220,8 +1152,6 @@ fn code_key(code: u32) -> Option<Key> {
     }
 }
 
-/// The letter-final CSI keys: the cursor keys, Home, End and keypad Begin, and F1-F4
-/// (xterm's modified forms; kitty's unmodified F1, F2 and F4 too).
 const fn csi_letter_key(fin: u8) -> Option<NamedKey> {
     Some(match fin {
         b'A' => NamedKey::ArrowUp,
@@ -1239,8 +1169,6 @@ const fn csi_letter_key(fin: u8) -> Option<NamedKey> {
     })
 }
 
-/// The `CSI n ~` keys: xterm's numbers as aterm's legacy encoder writes them (F13-F24
-/// on from 25), with the rxvt and VT220 Home and End (1, 4, 7, 8) and F1-F4 (11-14).
 const fn tilde_key(n: u32) -> Option<NamedKey> {
     use NamedKey::*;
     Some(match n {
@@ -1278,8 +1206,6 @@ const fn tilde_key(n: u32) -> Option<NamedKey> {
     })
 }
 
-/// The SS3 keys: F1-F4, the application-mode cursor keys, Home and End, and the
-/// application keypad.
 const fn ss3_key(fin: u8) -> Option<NamedKey> {
     use NamedKey::*;
     Some(match fin {
@@ -1316,11 +1242,8 @@ const fn ss3_key(fin: u8) -> Option<NamedKey> {
     })
 }
 
-/// The kitty code of `FUNCTIONAL_KEYS[0]`; each next key's code is one more
-/// ([`NamedKey::kitty_code`]).
 const FIRST_FUNCTIONAL_CODE: u32 = 57348;
 
-/// Every [`NamedKey`] with a code in kitty's private-use block, in code order.
 const FUNCTIONAL_KEYS: [NamedKey; 105] = {
     use NamedKey::*;
     [

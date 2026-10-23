@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Memory-only GUI facts for updater control requests, and the reducer's staged
-//! installed-bundle activation ([`published_activation`]). Durable stage reads
-//! and network work remain on the control worker; no ready marker is trusted
-//! here.
+//! Memory-only GUI facts for updater control requests and staged installed-bundle activation.
 
 use crate::native_update_auto_intent::ApplyPhase;
 use crate::native_updater_service::{StagedUpdate, UpdaterPhase};
@@ -65,9 +62,7 @@ impl Snapshot {
         self.staged.as_ref()
     }
 
-    /// The automatic lane's ladder phase for the staged build (`apply_phase=` on
-    /// the wire), while that lane will apply it (`automatic` /
-    /// `automatic-idle`); `None` for every other posture.
+    /// Automatic lane ladder phase for the staged build (`apply_phase=` on the wire).
     pub(crate) fn apply_phase(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
         match self.apply_posture(status) {
             "automatic" | "automatic-idle" => self.phase.map(ApplyPhase::as_str),
@@ -75,16 +70,13 @@ impl Snapshot {
         }
     }
 
-    /// What holds the automatic lane past its ladder (`apply_held=` on the wire)
-    /// while that lane will apply the staged build: only the restored agents'
-    /// hold (`restored-agents`), which also refuses the `land` phase.
+    /// What holds the automatic lane past its ladder (`apply_held=` on the wire).
     pub(crate) fn apply_held(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
         (matches!(self.apply_posture(status), "automatic" | "automatic-idle") && self.restored_hold)
             .then_some("restored-agents")
     }
 
-    /// The ledger and the GUI can observe different generations. Never attach a
-    /// previous artifact's retry/permission to a replacement with the same build.
+    /// The ledger and the GUI can observe different generations.
     pub(crate) fn apply_posture(&self, status: &aterm_update::UpdateStatus) -> &'static str {
         if !status.enabled {
             return "disabled";
@@ -133,8 +125,6 @@ impl Snapshot {
             Some(ApplyPosture::ManualByConfig) => "manual-config",
             Some(ApplyPosture::VetoedByEnv { .. }) => "disabled-env",
             Some(ApplyPosture::ManualOnlyLatched { lapses: true }) => "retry-wait",
-            // A spent boot trial is still the manual-only latch; `apply_refusal=`
-            // says a start would roll it back.
             Some(ApplyPosture::ManualOnlyLatched { lapses: false } | ApplyPosture::TrialSpent) => {
                 "manual-only"
             }
@@ -162,8 +152,7 @@ impl Snapshot {
     }
 }
 
-/// The worker reads source and policy together; this also serves the final pre-replacement
-/// recheck after a long download or probe.
+/// The worker reads source and policy together.
 pub(crate) fn check_settings_provider(
     proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) -> aterm_update::CheckSettingsProvider {
@@ -203,9 +192,7 @@ fn admit_check_settings(
     Some(live)
 }
 
-/// Every completion refreshes the GUI, including errors, retirement and an installed-only
-/// activation. The reducer re-reads and validates durable facts before arming anything; these
-/// wakes carry no apply authority.
+/// Every completion refreshes the GUI, including errors, retirement, and installed activation.
 pub(crate) fn announce_stage(status: &aterm_update::UpdateStatus, send: impl FnOnce(Wake)) {
     if status.enabled
         && let Some(build) = status.staged_build.filter(|b| *b > status.current_build)
@@ -222,25 +209,13 @@ pub(crate) fn announce_stage(status: &aterm_update::UpdateStatus, send: impl FnO
     }
 }
 
-/// The installed-bundle activation the updater reducer holds staged, as
-/// [`App::publish_native_update_state`] last published it. The ledger cannot see
-/// an activation (it has no `ready.toml`), so `update status` folds it in
-/// (`control::fold_installed_activation`): from the event loop's [`Snapshot`]
-/// when the loop answers, and from here when it cannot (a dialog stands, the
-/// thread stalled) and for `update apply`. The reducer's verdict, never a probe
-/// of the bundle: codesign and spctl run only on the updater facts worker, and a
-/// check of theirs that did not finish leaves the reducer's stage in place. A
-/// leaf lock, held for a clone or a store.
 static STAGED_ACTIVATION: std::sync::Mutex<Option<StagedUpdate>> = std::sync::Mutex::new(None);
 
-/// Publish the reducer's stage when it is an installed-bundle activation, and
-/// clear the record when it is a download or there is none.
+/// Publish the reducer's stage for an installed-bundle activation, or clear the record.
 pub(crate) fn publish_staged_activation(staged: Option<&StagedUpdate>) {
     *STAGED_ACTIVATION.lock_or_recover() = activation_to_publish(staged);
 }
 
-/// What [`publish_staged_activation`] records for the reducer's stage: an
-/// installed-bundle activation, and nothing for a download or no stage.
 fn activation_to_publish(staged: Option<&StagedUpdate>) -> Option<StagedUpdate> {
     staged
         .filter(|stage| stage.is_installed_activation())
@@ -252,9 +227,7 @@ pub(crate) fn published_activation() -> Option<StagedUpdate> {
     STAGED_ACTIVATION.lock_or_recover().clone()
 }
 
-/// The reducer's stage `update status` folds: the event loop's own when it
-/// answered (`live`), even when that is no stage, and the `published`
-/// activation only when it did not.
+/// The reducer's stage `update status` folds.
 pub(crate) fn status_activation<'a>(
     live: Option<&'a Snapshot>,
     published: Option<&'a StagedUpdate>,
@@ -267,7 +240,6 @@ mod tests {
     use super::*;
 
     fn status() -> aterm_update::UpdateStatus {
-        // The updater's wire input; no filesystem or environment mutation.
         aterm_update::UpdateStatus {
             enabled: true,
             installable: true,
@@ -361,7 +333,6 @@ mod tests {
             retry_scheduled: false,
         };
         assert_eq!(snapshot.apply_posture(&status), "automatic-idle");
-        // The ladder phase rides beside an automatic posture and nowhere else.
         assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
         snapshot.retry_scheduled = true;
         assert_eq!(snapshot.apply_posture(&status), "automatic");
@@ -395,8 +366,6 @@ mod tests {
         assert_eq!(snapshot.apply_posture(&status), "unreconciled");
     }
 
-    /// The restored agents' hold is named on the status line beside an
-    /// automatic posture only, and its start and end are logged once each.
     #[test]
     fn the_restored_agents_hold_is_named_while_it_holds() {
         let status = status();
@@ -462,9 +431,6 @@ mod tests {
         }
     }
 
-    /// Only an installed-bundle activation is published; a download stage and no
-    /// stage clear the record, so a status read with the event loop away never
-    /// folds a download the ledger already names.
     #[test]
     fn only_an_activation_is_published() {
         let activation = installed_activation(12);
@@ -477,10 +443,6 @@ mod tests {
         assert_eq!(activation_to_publish(None), None);
     }
 
-    /// The event loop's stage outranks the published one whenever the loop
-    /// answers, even with no stage: a published activation the reducer has
-    /// since retired is not folded. Only when the loop cannot answer does the
-    /// published activation fold (the negative control).
     #[test]
     fn the_live_stage_outranks_the_published_one() {
         let live = |staged| Snapshot {

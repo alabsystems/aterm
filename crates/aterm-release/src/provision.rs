@@ -878,7 +878,7 @@ fn install_pair(
     write_pair(lock, roster_path, &c.bytes, &c.sig)
 }
 
-/// The write itself ([`keep_roster_pair`]).
+/// The write itself, over bytes a caller has already proven.
 #[cfg(unix)]
 fn write_pair(
     lock: &atpkg_keys::provision::RosterLock,
@@ -1287,6 +1287,9 @@ fn front_door_verdict(
 }
 
 /// The x86_64 compat slice of the universal binary rides upstream stable.
+/// STOCK EXCEPTION (Trust lacks an x86_64-apple-darwin std: `targo --unverified check
+/// --target x86_64-apple-darwin -p aterm` fails E0463, can't find crate for `std`); this
+/// row audits that stock lane, nothing else.
 #[cfg(unix)]
 fn x86_slice_check() -> Check {
     if !cfg!(target_os = "macos") {
@@ -1542,7 +1545,8 @@ pub fn audit(_repo: &std::path::Path, _id: &str) -> Vec<Finding> {
     }]
 }
 
-/// Convert [`Check`] to [`Audited`] ([`Check::Todo`], [`Check::Fail`], [`Audited::CouldNotRun`]).
+/// Convert [`Check`] to [`Audited`] by its cause: an owner gap or a [`Check::Todo`] is the
+/// owner's, a [`Check::Fail`] the machine's, an unanswered check [`Audited::CouldNotRun`].
 #[cfg(unix)]
 fn audited(check: Check) -> Audited {
     match check {
@@ -1891,7 +1895,8 @@ fn channel_token_check(slug: &str, may_change: bool) -> Check {
     )
 }
 
-/// The channel token's verdict ([`Check::Owner`], [`Check::Fail`]).
+/// The channel token's verdict: a missing token is the owner's to mint ([`Check::Owner`]); a
+/// file open to group or others is this machine's to `chmod` ([`Check::Fail`]).
 #[cfg(unix)]
 fn channel_token_verdict(
     where_it_lives: &str,

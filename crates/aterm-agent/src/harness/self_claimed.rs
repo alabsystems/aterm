@@ -365,7 +365,7 @@ fn managed_alab_twin() -> Option<PathBuf> {
     codex_alab::alab_bytes(&exe).then_some(twin)
 }
 
-/// Build a [`Copy`] from raw record file text `raw` and `live` process facts.
+/// Build a [`struct@Copy`] from raw record file text `raw` and `live` process facts.
 #[must_use]
 pub fn copy_of(
     pid: u32,
@@ -496,7 +496,7 @@ pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> 
     Some(copy_seen(pid, start, home, seen, &live, typed))
 }
 
-/// Exit classification derived from the last live [`Copy`] ([`verdict`]).
+/// Exit classification derived from the last live [`struct@Copy`] ([`verdict`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Orderly exit that should not be relaunched.

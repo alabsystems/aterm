@@ -200,7 +200,7 @@ impl Container {
     }
 }
 
-/// The one exact release asset this check will download and stage from: its container kind.
+/// The one exact release asset this check will download and stage from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StageArtifact {
     container: Container,
@@ -242,7 +242,8 @@ fn authoritative_zip_artifact(
     }))
 }
 
-/// Choose the container to stage from: the zip when the manifest carries a resolvable one.
+/// Choose the container to stage from: the zip when the manifest carries a resolvable one,
+/// else the DMG.
 fn select_stage_artifact(
     release: &Release,
     manifest: &Manifest,
@@ -599,7 +600,7 @@ fn revocation_withdraws_stage(revocations: &[String], staged_machine: Option<&st
     staged_machine.is_some_and(|machine| revocations.iter().any(|id| id == machine))
 }
 
-/// Whether the durable floor.
+/// Whether the durable floor (`floor_now`) has superseded the roster generation `observed`.
 fn roster_authority_superseded(observed: Option<u64>, floor_now: u64) -> bool {
     observed.is_some_and(|seq| seq < floor_now)
 }
@@ -846,7 +847,7 @@ type StaleReading = (std::path::PathBuf, std::time::SystemTime, u64);
 /// [`StaleStageStamps`]' table.
 static STALE_STAGE_STAMPS: std::sync::Mutex<Vec<StaleReading>> = std::sync::Mutex::new(Vec::new());
 
-/// Per lock path.
+/// Per lock path, the run of consecutive stage-lock checks a reading belongs to.
 static STAGE_LOCK_RUNS: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -1140,7 +1141,7 @@ enum WebHead {
     Ended,
 }
 
-/// The names of every asset a check may fetch for release `tag` ([`web_release`]).
+/// The names of every asset a check may fetch for release `version` ([`web_release`]).
 fn web_asset_names(version: &str) -> [String; 6] {
     [
         APPCAST_ASSET.to_string(),
@@ -1220,7 +1221,7 @@ fn unconfirmable_stage_note(
     ))
 }
 
-/// A source-only head ([`app_build_in_flight`]).
+/// Record a source-only head ([`app_build_in_flight`]).
 fn record_source_only_head(staging: &Staging, current_build: u64, source: &Source, tag: &str) {
     let known = crate::status::authorized_tag(staging, source);
     if app_build_in_flight(tag, known.as_deref()) {
@@ -1453,7 +1454,8 @@ fn acquire(
     }
 }
 
-/// Whether the build staged here ([`Ready::needs_roster_reconfirmation`]).
+/// Whether the newer publishable stage here needs its roster authorization reconfirmed at `now`
+/// ([`Ready::needs_roster_reconfirmation`]).
 fn stage_owes_roster_reconfirmation(
     staging: &Staging,
     current_build: u64,

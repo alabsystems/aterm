@@ -26,8 +26,6 @@ fn tall_reply(lines: usize) -> String {
     s
 }
 
-/// What the host's probe finds (`RepoWork`): the forever lab's repository
-/// legs (`forever::Repo`), one count each.
 fn found(
     changed: usize,
     untracked: usize,
@@ -47,10 +45,8 @@ fn found(
     }
 }
 
-/// The stamp the loop ledgers Land's instruction at, in these tests.
 const SINCE_MS: i64 = 1_771_000_000_000;
 
-/// A hold begun at a row ledgered at `since_ms`, no nudges before it.
 fn begun(since_ms: Option<i64>) -> HoldStart {
     HoldStart {
         since_ms,
@@ -58,8 +54,6 @@ fn begun(since_ms: Option<i64>) -> HoldStart {
     }
 }
 
-/// A Land episode with its instruction typed and ledgered at [`SINCE_MS`]:
-/// the state, and the time of the instruction.
 fn instructed() -> (TurnEndState, Instant) {
     let now = t0();
     let mut st = TurnEndState::default();
@@ -72,8 +66,6 @@ fn instructed() -> (TurnEndState, Instant) {
     (st, now)
 }
 
-/// The yield of a land act: `said`, the reply read cut where `cut`, over
-/// the repository's work `repo`.
 fn yield_of(said: &str, cut: bool, repo: Option<RepoWork>) -> TurnEndReading {
     land(TurnEndReading {
         said_cut: cut,
@@ -82,9 +74,6 @@ fn yield_of(said: &str, cut: bool, repo: Option<RepoWork>) -> TurnEndReading {
     })
 }
 
-/// The act owed at the point `r` was read at (`now`), past the short
-/// streak's back-off where one stands (a done claim lengthens it): decided
-/// and recorded as typed.
 fn owed(st: &mut TurnEndState, r: &TurnEndReading, now: Instant) -> TurnEndAction {
     let later = now + st.short_wait().unwrap_or_default();
     let a = decide_turn_end(st, r, &cfg(), later);
@@ -92,7 +81,6 @@ fn owed(st: &mut TurnEndState, r: &TurnEndReading, now: Instant) -> TurnEndActio
     a
 }
 
-/// A hold read at a yield, its counts and words as given.
 fn held(legs: &[HoldLeg], open: &[&str], nudges: u32, counts: [u16; 5]) -> LandHeld {
     let mut words = [None; 4];
     for (slot, w) in words.iter_mut().zip(open) {
@@ -112,9 +100,6 @@ fn held(legs: &[HoldLeg], open: &[&str], nudges: u32, counts: [u16; 5]) -> LandH
     }
 }
 
-/// The verdict's own short circuit, as [`clean_defense`] and `observe`'s
-/// `clean` read a yield: the FIRST leg that fails, and no other — the
-/// builder the hold must not be.
 fn first_leg_only(r: &TurnEndReading) -> u8 {
     let tail = r.said_tail.as_deref().unwrap_or_default();
     let leg = if needs::defense_line(tail).is_none() {
@@ -139,15 +124,6 @@ fn first_leg_only(r: &TurnEndReading) -> u8 {
     leg.map_or(0, HoldLeg::bit)
 }
 
-/// THE FOREVER STUB TABLE (§12.3.6, §12.3.7): each of the lab's land
-/// chains, its reply to the land instruction and then to the nudge that
-/// follows, over its repository, names every leg that held it and no other
-/// — L1 no defense, L2 the open word, L3 the need, L4 one untracked file,
-/// L6 the need and a reply too tall, L8 one changed file, L9 one stash, L10
-/// one unpushed commit that is not on the remote main either, L11 one
-/// commit not on the remote main — with the episode's `since` and the
-/// nudges typed; each nudge's own row, ledgered later, leaves `since` at
-/// the instruction's.
 #[test]
 fn a_land_yield_that_does_not_land_names_every_leg_that_held_it() {
     use HoldLeg::{Cut, Defense, Needs, Open, Repo};
@@ -277,9 +253,6 @@ fn a_land_yield_that_does_not_land_names_every_leg_that_held_it() {
     assert_ne!(legs, Some(first_leg_only(&both)));
 }
 
-/// THE HOLD ENDS where the episode does or the landing is no longer Land's
-/// to push: at a landing, at a person's own exchange (the face
-/// [`TaskFace::Theirs`]), under Cruise, under Off and at a park.
 #[test]
 fn the_hold_ends_at_a_landing_theirs_another_mode_and_off() {
     let open = || {
@@ -344,8 +317,6 @@ fn the_hold_ends_at_a_landing_theirs_another_mode_and_off() {
     assert_eq!(st.land_held(), Some(dropped), "until Land's next yield");
 }
 
-/// A WORKER ON ITS FIRST TASK, spawned under Land, holds none through its
-/// first working turn: no instruction typed, no episode begun.
 #[test]
 fn a_worker_holds_none_before_its_instruction() {
     let mut st = TurnEndState::default();
@@ -378,10 +349,6 @@ fn a_worker_holds_none_before_its_instruction() {
     );
 }
 
-/// A NEED SAID EARLIER IN THE TURN IS A LEG: a turn whose earlier message
-/// names a need and whose last words are a clean defense does not land
-/// (the verdict reads the turn's earlier words), and its hold says `needs`
-/// — the reply's own words, said this turn.
 #[test]
 fn a_need_said_earlier_in_the_turn_is_a_leg() {
     let (mut st, now) = instructed();
@@ -411,11 +378,6 @@ fn a_need_said_earlier_in_the_turn_is_a_leg() {
     assert!(!st.standing_needs().is_empty() && !second.holds(HoldLeg::Needs));
 }
 
-/// THE HOLD IS ASKED ONCE PER MOVE ([`TurnEndState::held_moved`]): the first
-/// ask reports what stands (none, outside an episode), the same state asked
-/// again reports nothing, and each move reports once — the instruction
-/// typed, its row's stamp, the yield's legs, the nudge's count, someone
-/// else's turn, the landing.
 #[test]
 fn the_hold_moves_once_per_change_and_is_asked_once() {
     let now = t0();
@@ -444,11 +406,6 @@ fn the_hold_moves_once_per_change_and_is_asked_once() {
     assert_eq!(st.held_moved(true), Some(None), "landed");
 }
 
-/// A HOLD NOT THE LOOP'S TO TELL IS TOLD NONE, AND THE LOOP'S END ONCE
-/// ([`TurnEndState::held_moved`]'s `here`, [`TurnEndState::held_ended`]):
-/// a hold told, then asked where it is not this loop's (the word read in
-/// another mode, a claim not its own) is told none once, the episode kept;
-/// asked here again it is told again.
 #[test]
 fn a_hold_not_here_is_told_none_and_the_loops_end_once() {
     let now = t0();
@@ -473,10 +430,6 @@ fn a_hold_not_here_is_told_none_and_the_loops_end_once() {
     assert_eq!(st.held_moved(false), None, "told none already");
 }
 
-/// `since` IS THE EPISODE'S, seeded by a loop that follows
-/// ([`TurnEndState::seed_land_hold`], after [`TurnEndState::seed_land`]):
-/// it survives a restart and a seamless update, with the nudges, and the
-/// legs come back at the next yield.
 #[test]
 fn a_seeded_episode_holds_its_since_and_nudges_until_its_next_yield() {
     let mut st = TurnEndState::default();
@@ -509,10 +462,6 @@ fn a_seeded_episode_holds_its_since_and_nudges_until_its_next_yield() {
     );
 }
 
-/// THE HOLD IS `Copy` AND SMALL: no `Instant`, no `String`, no path; its
-/// open words two bytes each (an [`OpenWord`] is an index), so the whole
-/// fact is at most 40 bytes, and its `Debug` names the words, never an
-/// index.
 #[test]
 fn a_land_hold_is_copy_and_small() {
     fn copy<T: Copy>(t: T) -> (T, T) {
@@ -534,10 +483,6 @@ fn a_land_hold_is_copy_and_small() {
     );
 }
 
-/// EVERY WORD LAND'S STRICT READING NAMES HAS AN INDEX that gives it back
-/// ([`open_word_index`], [`open_word_at`]): over the labelled defense table,
-/// the needs table and the open-work corpus, each word [`land_open_words`]
-/// and [`open_work_strict`] name.
 #[test]
 fn every_word_the_strict_reading_names_has_an_index() {
     let mut replies: Vec<String> = Vec::new();
@@ -593,11 +538,6 @@ fn every_word_the_strict_reading_names_has_an_index() {
     assert_eq!(OpenWord::of("a word no table holds"), None);
 }
 
-/// A LANDING ENDS THE HOLD, AND WORK GIVEN AFTER IT IS HELD FROM LAND'S NEXT
-/// ACT ([`HoldStart`]): the task lands, someone else's turn opens it again
-/// (a person's job, hours later), and through that turn and its end no hold
-/// stands — the finished landing's `since` and nudges are not the new
-/// work's.
 #[test]
 fn work_after_a_landing_is_held_from_lands_next_act() {
     let (mut st, now) = instructed();
@@ -684,8 +624,6 @@ fn work_after_a_landing_is_held_from_lands_next_act() {
     assert_eq!(recorded.land_held(), None, "a recorded landing's hold");
 }
 
-/// WHICH YIELDS ARE JUDGED (§12.3.9): a land act's yield names its legs only
-/// where the act was taken and nobody else's turn ended there.
 #[test]
 fn a_land_acts_yield_names_legs_only_where_the_act_was_taken() {
     let seeded = || {
@@ -746,14 +684,6 @@ fn a_land_acts_yield_names_legs_only_where_the_act_was_taken() {
     assert_eq!(st.land_held().map(|h| h.changed), Some(u16::MAX));
 }
 
-/// SOMEONE ELSE'S TURN SEEN ONLY AT ITS END DROPS THE LEGS, as its live read
-/// does (the model's `TheHostIsToldWhatHoldsTheLanding` holds the
-/// told legs to the state, and a turn no read saw run is as much someone
-/// else's — the legs were the last land act's yield's, and that turn may
-/// have changed every one of them): the instruction's yield names open
-/// work, read; a job of theirs ends with no live read before it, and the
-/// hold reads `since` and the nudges with no legs; Land's nudge typed, its
-/// own yield (no live read either) is judged again.
 #[test]
 fn someone_elses_turn_seen_only_at_its_end_drops_the_legs() {
     let (mut st, now) = instructed();

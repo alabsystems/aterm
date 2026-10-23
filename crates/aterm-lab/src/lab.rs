@@ -94,7 +94,8 @@ impl UpOpts {
     }
 }
 
-/// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]).
+/// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]), or
+/// `$LAB_CLAUDE`.
 /// # Errors
 /// Neither names an executable.
 pub fn find_claude() -> Result<String, String> {
@@ -180,7 +181,7 @@ fn executable_by(c: String, runs: impl Fn(&str) -> bool) -> Option<String> {
     Some(fs::canonicalize(&c).map_or(c, |p| p.to_string_lossy().into_owned()))
 }
 
-/// The managed Codex, the same way.
+/// The managed Codex, the same way as [`find_claude`].
 #[must_use]
 pub fn find_codex() -> Option<String> {
     let c = match std::env::var("LAB_CODEX") {
@@ -260,7 +261,8 @@ pub fn gemini_version(run: &Run, bin: &str) -> String {
     }
 }
 
-/// agy's version: the `version = "…"` of the record atpkg keeps beside its store build.
+/// agy's version: the `version = "…"` of the record atpkg keeps beside its store build, else
+/// `--version`'s last word ([`seeded_version`]).
 #[must_use]
 pub fn agy_version(run: &Run, bin: &str) -> String {
     let vendor = Path::new(bin)
@@ -343,7 +345,7 @@ fn jailed_version_in(run: &Run, bin: &str, home: &Path, pick: fn(&str) -> Option
     clean_ver(out.lines().next().and_then(pick).unwrap_or(""))
 }
 
-/// The Codex version atpkg's package file beside the build names.
+/// The Codex version atpkg's package file beside the build names, else `--version`'s last word.
 #[must_use]
 pub fn codex_version(run: &Run, bin: &str) -> String {
     let pkg = Path::new(bin)
@@ -401,7 +403,8 @@ fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
     )
 }
 
-/// Remove the directories of copies of the lab's program in `run_dir` ([`copies_may_go`]).
+/// Remove the directories of copies of the lab's program in `run_dir` that may go at `now`
+/// ([`copies_may_go`]); the ones kept.
 fn sweep_copies(run_dir: &Path, relay_ran: bool, now: std::time::SystemTime) -> Vec<PathBuf> {
     let mut kept = Vec::new();
     for (d, ran) in [
@@ -445,7 +448,8 @@ fn clear_run_dir(run_dir: &Path, relay_ran: bool, tag: &str, now: std::time::Sys
     let _ = fs::remove_dir(run_dir);
 }
 
-/// Whether `up` started a program from the lab's copy of its own program ([`BIN`], [`BIN_RAN`]).
+/// Whether `up` started a program from the lab's copy of its own program ([`BIN`]) that has not
+/// shown it ran ([`BIN_RAN`]).
 fn bin_unproven(run: &Run) -> bool {
     (run.sampler_pid > 0 || run.stub_pid > 0) && !run.run.join(BIN_RAN).exists()
 }
@@ -600,8 +604,8 @@ pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
 
 /// `sandbox-exec -f <jail> env -i <vars> <program…>` ([`procs::keep_forked`]).
 /// # Errors
-/// The launch failed, or the child closed its signal with nothing said (it exited, or it has
-/// nothing to offer), said nothing within `hang` (the hang detector: [`READY_HANG`], or the
+/// The launch failed, or the child closed its ready signal with nothing said (it exited, or it
+/// has nothing to offer), said nothing within `hang` (the hang detector: [`READY_HANG`], or the
 /// first-exec hang for a fresh copy), or the run was interrupted (`interrupted`).
 pub(crate) fn launch_ready(
     run: &Run,
@@ -1188,7 +1192,9 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     Ok(run)
 }
 
-/// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML` ([`crate::instance::bell_off`]).
+/// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML`, the update and package lanes off,
+/// `LAB_HARNESS_KEYS` under `[harness]`, and the audible bell off unless `LAB_ATERM_TOML` sets
+/// `bell_sound` ([`crate::instance::bell_off`]).
 pub(crate) fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
     crate::instance::bell_off(&format!(
         "{aterm_toml}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{harness_keys}\n"

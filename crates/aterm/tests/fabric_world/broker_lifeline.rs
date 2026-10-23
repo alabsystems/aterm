@@ -112,21 +112,31 @@ fn a_broker_ends_itself_once_its_socket_path_is_gone() {
     drop(broker.lifeline);
 }
 
-#[cfg(target_vendor = "apple")]
+/// A drop ends only the bridge its own aterm started ([`harness::end_bridge`]): read with this
+/// process as its launcher, it ends the broker the file names; under a binary translator no drop
+/// proves the aterm under test, and the test says it is not run. NEGATIVE CONTROL: read with the
+/// other broker as its launcher, the drop leaves it alone.
 #[test]
 fn a_drop_ends_only_a_process_its_launcher_started() {
+    if let Some(translator) = aterm_uds::process::translator() {
+        println!(
+            "NOT RUN under {translator}: a_drop_ends_only_a_process_its_launcher_started: the \
+             kernel names the translator as the broker's executable, so the drop proves none"
+        );
+        return;
+    }
     let (first, second) = (scratch(), scratch());
     let mut other = serve(first.path());
     let mut target = serve(second.path());
     let state = second.path().join("state");
     std::fs::create_dir(&state).expect("state dir");
     std::fs::write(state.join("pid"), target.child.id().to_string()).expect("pid file");
-    harness::end_bridge(&state, harness::identity_of(other.child.id()));
+    harness::end_bridge(&state, harness::launcher_of(other.child.id(), &state));
     assert!(
         target.child.try_wait().expect("try_wait").is_none(),
         "a process another launcher did not start is left alone"
     );
-    harness::end_bridge(&state, harness::identity_of(std::process::id()));
+    harness::end_bridge(&state, harness::launcher_of(std::process::id(), &state));
     // `end_proven` returns once the pid stops naming the broker, which can be
     // before its exit has finished and it can be reaped.
     let ended = harness::until("the proven broker to be reaped", || {
@@ -140,4 +150,62 @@ fn a_drop_ends_only_a_process_its_launcher_started() {
     );
     let _ = other.child.kill();
     let _ = other.child.wait();
+}
+
+/// **WITH NO PID VERSIONS, ONLY THE CHILD READ WHILE ITS ATERM LIVED PROVES A BRIDGE**
+/// ([`harness::bridge_proven`]): Linux keeps neither a pid version nor a launcher's, so two
+/// missing versions must never read as a launch. A Linux-shaped bridge is proven by the child
+/// read while its aterm lived, and by nothing else; an Apple-shaped one by the versions alone.
+/// NEGATIVE CONTROL: compare the two versions' `Option`s directly, and a bridge with no
+/// child read is proven by `None == None`.
+#[test]
+fn a_versionless_bridge_is_proven_only_by_the_child_read_while_its_aterm_lived() {
+    use aterm_uds::process::{Birth, Identity, Lineage};
+    let identity = |pid, birth, idversion| Identity {
+        pid,
+        birth: Birth(birth),
+        idversion,
+    };
+    let bridge = |launcher_version, idversion| Lineage {
+        identity: identity(4243, 51_832_760, idversion),
+        uniqueid: 51_832_760,
+        parent: 1,
+        pgid: 4243,
+        launcher_version,
+        tty: None,
+    };
+    let linux = bridge(None, None);
+    let aterm = Some(identity(4242, 51_832_700, None));
+    let read = |child| harness::Launcher {
+        identity: aterm,
+        child,
+    };
+    assert!(harness::bridge_proven(
+        &linux,
+        true,
+        &read(Some(linux.identity))
+    ));
+    assert!(
+        !harness::bridge_proven(&linux, true, &read(None)),
+        "no child read: two missing versions prove nothing"
+    );
+    assert!(
+        !harness::bridge_proven(&linux, true, &read(Some(identity(4243, 51_900_000, None)))),
+        "the pid read as another process's child"
+    );
+    assert!(
+        !harness::bridge_proven(&linux, false, &read(Some(linux.identity))),
+        "not the aterm under test"
+    );
+    let apple = bridge(Some(77), Some(9));
+    let launched = harness::Launcher {
+        identity: Some(identity(4242, 1_792_000_000_000_042, Some(77))),
+        child: None,
+    };
+    assert!(harness::bridge_proven(&apple, true, &launched));
+    let another = harness::Launcher {
+        identity: Some(identity(4242, 1_792_000_000_000_042, Some(78))),
+        child: None,
+    };
+    assert!(!harness::bridge_proven(&apple, true, &another));
 }

@@ -100,7 +100,8 @@ impl LineCells {
         self.truncated = true;
     }
 
-    /// Whether the text read with these cells stops short of the line's end ([`mark_truncated`]).
+    /// Whether the text read with these cells stops short of the line's end
+    /// ([`Self::mark_truncated`]).
     #[inline]
     #[must_use]
     pub const fn is_truncated(&self) -> bool {

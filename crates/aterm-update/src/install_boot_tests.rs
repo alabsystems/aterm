@@ -24,9 +24,6 @@ fn read_id(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("id")).unwrap()
 }
 
-/// A crash-loop revert — the previous build swapped back over the install, the
-/// new one quarantined, a re-exec — is booked in `health.toml`, so `update
-/// status`, the pull-down row and the persistent-failure notice can see it.
 #[test]
 fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
     use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
@@ -108,9 +105,6 @@ fn a_crash_loop_revert_is_booked_in_the_failure_ledger() {
     }
 }
 
-/// A crash-loop revert's inverse swap and the quarantine it records before the
-/// rollback goes take `install_flush`'s tier (aterm-durable's counting seam), on this
-/// volume and as if the install root were on another device.
 #[test]
 fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
     use aterm_durable::Flush::{Durable, Ordered};
@@ -163,8 +157,6 @@ fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
     assert_eq!(elsewhere, [Durable; 5], "another device");
 }
 
-/// The pure law behind `check_boot_health`'s count. The arm's first launch always counts,
-/// and an unreadable age counts the launch (fail toward counting, never toward silence).
 #[test]
 fn a_launch_inside_the_burst_window_of_a_counted_one_is_not_counted_again() {
     use std::time::Duration;
@@ -254,8 +246,6 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A stopped sibling holding the apply lock cannot park the GUI's updater facts worker:
-/// the confirmation answers "retry later", and the launch stays counted.
 #[test]
 fn confirming_or_forgiving_a_trial_never_waits_forever_on_a_held_apply_lock() {
     use std::sync::mpsc;
@@ -313,8 +303,6 @@ fn confirming_or_forgiving_a_trial_never_waits_forever_on_a_held_apply_lock() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// Dropped give-backs add up to a revert of a build that never failed, so one that meets
-/// a held lock is owed, and the lock's next holder pays it before reading the count.
 #[test]
 fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
     use std::time::Duration;
@@ -364,8 +352,6 @@ fn a_forgive_that_meets_a_held_apply_lock_is_given_back_once_it_frees() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A third boot's count pays two owed give-backs first, so a healthy build is not
-/// reverted.
 #[test]
 fn owed_give_backs_are_paid_before_a_later_boot_counts() {
     use std::time::Duration;
@@ -417,9 +403,6 @@ fn owed_give_backs_are_paid_before_a_later_boot_counts() {
     }
 }
 
-/// The `NativeUpdateTrialGiveBack` variables the real ledger answers for: the
-/// sentinel's count, and whether the candidate's launch and the sibling's are on
-/// it by name.
 fn trial_give_back_projection(
     s: &Staging,
     build: u64,
@@ -446,8 +429,6 @@ fn trial_give_back_projection(
     ]
 }
 
-/// Tier-1 of `NativeUpdateTrialGiveBack`: overlapping launches of one trial are given back
-/// by name.
 #[test]
 fn overlapping_launches_of_one_trial_are_given_back_by_name() {
     use aterm_uds::spawnfd::{Child, Command};
@@ -827,10 +808,6 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
     }
 }
 
-/// An earlier launcher of the trial that stays alive and
-/// unconfirmed (its recovery proof failing on every retry) must not shield later
-/// launches that are not the handoff target — a new window, a sibling, a candidate
-/// booting the installed image for a newer target.
 #[test]
 fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
     use aterm_uds::spawnfd::{Child, Command};
@@ -909,8 +886,6 @@ fn a_live_unconfirmed_launcher_does_not_shield_non_target_launches() {
     }
 }
 
-/// A healthy headless boot must not confirm a build whose windows crash before their
-/// first frame.
 #[test]
 fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     use crate::TrialWitness::{Headless, Window};
@@ -1020,10 +995,6 @@ fn a_headless_launch_neither_counts_nor_settles_a_trial_a_window_launched() {
     let _ = std::fs::remove_dir_all(&lane.root);
 }
 
-/// A window's confirmation that the trial's recovery proof refuses answers only
-/// "retry", and the GUI retries it on its backoff for as long as it runs: the
-/// reason is said once per distinct reason, not once per try, and `update status`
-/// reports it instead of asking for a window that is already open.
 #[test]
 fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window() {
     use crate::TrialWitness::Window;
@@ -1071,7 +1042,6 @@ fn a_window_confirmation_the_proof_refuses_is_said_once_and_asks_for_no_window()
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// The installed receipt a swap records for `build`'s artifact `digest`.
 fn receipt_for(s: &Staging, build: u64, digest: &str) {
     crate::manifest::InstalledReceipt::record(
         &s.installed_receipt(),
@@ -1083,7 +1053,6 @@ fn receipt_for(s: &Staging, build: u64, digest: &str) {
     .unwrap();
 }
 
-/// The other order: a harness's instance confirms the trial before any window launches it.
 #[test]
 fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     use crate::TrialWitness::{Headless, Window};
@@ -1213,9 +1182,6 @@ fn a_headless_launch_that_comes_first_leaves_the_predecessor_for_the_windows() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// The unproven-windows record re-arms nothing out of scope (another install or build, a
-/// ready publication, a held apply lock), is dropped once it lapses or its predecessor or
-/// receipt is gone, and goes with a fresh swap's trial.
 #[test]
 fn a_window_re_trial_is_bounded() {
     use crate::TrialWitness::Window;
@@ -1363,9 +1329,6 @@ fn a_window_re_trial_is_bounded() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A live HEADLESS launch of the trial does not exempt a WINDOW's overlapping
-/// handoff target from the count: a long-lived harness must not shield window
-/// candidates that crash before their first frame.
 #[test]
 fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
     use crate::TrialWitness::{Headless, Window};
@@ -1431,9 +1394,6 @@ fn a_live_headless_launch_does_not_shield_a_windows_candidate() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A trial of `build` armed over `installed` for `digest`, as `prepare_trial`
-/// arms one — the identity marker, then the sentinel — with NEW installed and OLD
-/// at the fixed rollback path, which is returned.
 fn arm_window_trial(s: &Staging, installed: &Path, build: u64, digest: &str) -> PathBuf {
     make_app(installed, "NEW");
     let rollback = rollback_path(installed);
@@ -1443,7 +1403,6 @@ fn arm_window_trial(s: &Staging, installed: &Path, build: u64, digest: &str) -> 
     rollback
 }
 
-/// The sentinel's last count moved out of the launch-burst window.
 fn backdate(s: &Staging) {
     std::fs::File::options()
         .write(true)
@@ -1463,9 +1422,6 @@ fn bundle_at(installed: &Path) -> impl FnOnce() -> Option<bundle::Bundle> + use<
     }
 }
 
-/// The window-launch record answers for the armed trial, never a build number: a
-/// re-publish of build 11 under a new digest, armed by an image that leaves the record, is
-/// a trial no window launched, and a trial that ends leaves no record that answers for it.
 #[test]
 fn a_window_launch_record_answers_only_for_the_armed_trial() {
     use crate::TrialWitness::{Headless, Window};
@@ -1515,8 +1471,6 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// The wait for a window has a deadline (law L5): past [`WINDOW_TRIAL_HEADLESS_WAIT`]
-/// headless launches count and confirm; a window launch renews the wait.
 #[test]
 fn the_wait_for_a_window_ends() {
     use crate::TrialWitness::{Headless, Window};
@@ -1569,9 +1523,6 @@ fn the_wait_for_a_window_ends() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// Another trial holding the install (build 12's, which this build 10 can neither recover
-/// nor call the just-swapped shape) ends by itself, so its refusal is a passing moment and
-/// never a structural verdict on the staged bytes.
 #[test]
 fn another_trial_holding_the_install_refuses_the_swap_as_a_passing_moment() {
     let s = scratch("boot-foreign-trial-passing");
@@ -1600,17 +1551,12 @@ fn another_trial_holding_the_install_refuses_the_swap_as_a_passing_moment() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A predecessor no revert could restore is no revert, not unproven health: a
-/// Team-ID-pinned build swapped in over an ad hoc one, whose
-/// retained bundle this build's verifier refuses for ever.
 #[test]
 fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     use crate::TrialWitness::Window;
     use std::time::Duration;
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     type Identity = Result<(u64, String), String>;
-    /// This build's verifier: the installed trial is sealed build 11 at `COMMIT`,
-    /// and anything else (the fixed path) reads `fixed`.
     fn verifier(installed: &Path, fixed: Identity) -> impl Fn(&Path) -> Identity + use<> {
         let installed = installed.to_path_buf();
         move |path: &Path| {
@@ -1705,8 +1651,6 @@ fn a_predecessor_this_build_cannot_verify_does_not_hold_its_trial() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// Whether the predecessor at `rollback` is kept for this process, the window that
-/// confirmed its trial ([`keep_settled_predecessor`]).
 fn kept_for_this_window(s: &Staging, rollback: &Path) -> bool {
     rollback.exists()
         && KeptPredecessor::read(s).is_some_and(|kept| {
@@ -1714,9 +1658,6 @@ fn kept_for_this_window(s: &Staging, rollback: &Path) -> bool {
         })
 }
 
-/// What a boot sentinel reads as when its file holds bytes no writer wrote: the
-/// zeros of an unwritten inode, the case `Sentinel::write_record`'s fsyncs are
-/// for.
 fn corrupt_sentinel(s: &Staging) {
     std::fs::write(s.root.join("boot.sentinel"), [0u8; 16]).unwrap();
     assert_eq!(
@@ -1726,7 +1667,6 @@ fn corrupt_sentinel(s: &Staging) {
     );
 }
 
-/// A trial whose sentinel cannot be read is never answered "confirmed" unsettled.
 #[test]
 fn a_window_confirmation_over_an_unreadable_sentinel_settles_the_trial() {
     use crate::TrialWitness::Window;
@@ -1757,12 +1697,6 @@ fn a_window_confirmation_over_an_unreadable_sentinel_settles_the_trial() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// Negative controls for an unreadable sentinel: beside another build's trial
-/// identity it is nothing of this build's (answered `true`, nothing touched); a
-/// recovery proof that refuses leaves everything as it was and answers `false`, to
-/// be retried, and `update status` says its reason ([`window_trial_wait_at`]); and a
-/// headless start of a trial a window launched leaves it for a window, as it does
-/// over a sentinel that reads.
 #[test]
 fn an_unreadable_sentinel_is_settled_only_for_its_own_trial_after_its_proof() {
     use crate::TrialWitness::{Headless, Window};
@@ -1811,10 +1745,6 @@ fn an_unreadable_sentinel_is_settled_only_for_its_own_trial_after_its_proof() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// A corrupt sentinel never counts toward a revert: however many launches of the
-/// trialed build find it, the boot lane counts none and reverts nothing, so no
-/// corrupt file can quarantine the build that runs (a launch is counted only into a
-/// sentinel that reads).
 #[test]
 fn an_unreadable_sentinel_counts_no_launch_toward_a_revert() {
     use crate::TrialWitness::Window;
@@ -1849,9 +1779,6 @@ fn an_unreadable_sentinel_counts_no_launch_toward_a_revert() {
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
-/// Only a regular file that does not parse is an unreadable sentinel marker; anything
-/// else (such as a directory at the sentinel path) is no trial, answered at once with
-/// no recovery proof run.
 #[test]
 fn a_sentinel_path_that_holds_no_file_runs_no_proof() {
     use crate::TrialWitness::Window;

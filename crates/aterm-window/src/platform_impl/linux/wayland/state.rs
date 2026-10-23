@@ -4,6 +4,15 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): the globals are bound through first-party `aterm-wayland`'s registry, at
+// the versions smithay-client-toolkit 0.19.2 bound them, and the state applies what the loop's
+// dispatch heard in the order it heard it (`WinitState::drain`): one `Inbox` holds the backend's
+// own objects' events and, through sinks, the seats', the drags', the selection sources' and the
+// outputs' `done`s. sctk's `CompositorHandler`, `WindowHandler`, `SeatHandler`, device handlers
+// and output scale watchers are the `Wire` arms here; the per-surface scale is the backend's own
+// `SurfaceScale`, as sctk's `SurfaceData` kept it, and an output's scale is the one its last
+// applied `done` gave, as sctk's `OutputData` kept it.
+
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -176,6 +185,9 @@ impl WinitState {
             // destructor (or `Proxy::destroy` for one with none).
             proxy.map(|proxy| unsafe { Owned::new(proxy, destroy) })
         };
+        // LOCAL PATCH (aterm): `wl_subcompositor` is bound for the shadow margin's border parts,
+        // where upstream bound it for sctk-adwaita's frame; a compositor without one shows windows
+        // with no shadow.
         let subcompositor = owned(
             bind(c"wl_subcompositor", &wl_subcompositor::INTERFACE, 1),
             wl_subcompositor::destroy,

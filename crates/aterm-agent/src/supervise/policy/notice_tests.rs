@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every notice holds the owner's four-part shape (`NoticeText::parts`: what happened, what aterm
-//! already did, the one thing to do now, what to expect): checked by structure — sentences,
-//! placeholders, the message engine's own word rules, the band's title rule — never by the words
-//! themselves.
+//! Structural checks for `NoticeText::parts`.
 
 use std::collections::BTreeSet;
 
@@ -12,22 +9,16 @@ use aterm_messages::need::{REASON_CAP, Reason, STEP_CAP, Step};
 
 use super::*;
 
-/// The longest label the roster admits, so a filled part is measured at its
-/// longest (`crate::harness::accounts::admissible_label`).
 fn longest_label() -> String {
     let label = "a".repeat(crate::harness::accounts::LABEL_MAX);
     assert!(crate::harness::accounts::admissible_label(&label));
     label
 }
 
-/// The longest clause the policy fills `n`'s `{why}` with
-/// ([`NoticeText::whys`]), if it names one.
 fn longest_why(n: &NoticeText) -> Option<&'static str> {
     n.whys.iter().copied().max_by_key(|w| w.chars().count())
 }
 
-/// `n` filled at its longest: the longest label the roster admits, and each
-/// clause the policy fills its `{why}` with.
 fn filled_every(n: &NoticeText) -> Vec<Filled> {
     let whys: Vec<Option<&str>> = if n.whys.is_empty() {
         vec![None]
@@ -51,17 +42,12 @@ fn filled(n: &NoticeText) -> Filled {
     n.fill(Some(&longest_label()), longest_why(n))
 }
 
-/// The longest words a usage limit's reset is said in
-/// (`crate::supervise::limit::ResetClock::words`): a two-digit day and a
-/// clock with minutes past noon.
 fn longest_reset() -> String {
     crate::supervise::limit::ResetClock::of(Some("Sep 30 at 12:30pm"))
         .expect("a clock")
         .words()
 }
 
-/// The usage limit's notices raised where aterm continues the tab past the
-/// limit's reset: each says when the limit resets, where that is known.
 const LIMITS: [NoticeText; 14] = [
     LIMIT_SIGN_IN,
     LIMIT_RENEW,
@@ -79,10 +65,6 @@ const LIMITS: [NoticeText; 14] = [
     LIMIT_UNREAD,
 ];
 
-/// [`stay_why`] NAMES EVERY SETTING THAT HOLDS THE TAB, and only those (the
-/// review of the login carry, r4h-2): each of the seven combinations of
-/// `accounts`, `relaunch` and `resume_limits` off is a clause of
-/// [`STAY_WHYS`] that names exactly their lines, each its own.
 #[test]
 fn the_stay_clause_names_every_setting_that_holds_the_tab() {
     let lines = [
@@ -104,10 +86,6 @@ fn the_stay_clause_names_every_setting_that_holds_the_tab() {
     assert_eq!(stay_why(false, false, false), None, "the control");
 }
 
-/// A notice's clauses are exactly those of a `{why}` it names: each one it
-/// is raised with is measured, and a dev build fills it with one of its own
-/// (the review of the login carry, 2026-10-20: every `{why}` was filled with
-/// any notice's, and a renewal held by hand read as held by a draft).
 #[test]
 fn a_notice_names_a_why_exactly_where_it_has_clauses_for_it() {
     for n in ALL {
@@ -116,8 +94,6 @@ fn a_notice_names_a_why_exactly_where_it_has_clauses_for_it() {
     }
 }
 
-/// One sentence: no line break, no sentence break inside it, opened by a
-/// capital, a slash command or `aterm`.
 fn one_sentence(part: &str) -> bool {
     let body = part.strip_suffix('.').unwrap_or(part);
     !part.contains('\n')
@@ -129,9 +105,6 @@ fn one_sentence(part: &str) -> bool {
             || part.starts_with("aterm "))
 }
 
-/// The shape check itself: a `did` (opened by `aterm`) with a sentence break
-/// or a line break inside is no one sentence — the control the check's
-/// grouping needs, since every `did` opens with `aterm`.
 #[test]
 fn one_sentence_refuses_two_sentences_whatever_opens_them() {
     assert!(one_sentence("aterm ran /login in the tab."));
@@ -168,8 +141,6 @@ fn every_notice_is_one_the_message_engine_admits() {
     }
 }
 
-/// `f`, a filling of `n`, is what the message engine admits: each part
-/// within its cap and free of the words it refuses, the did one sentence.
 fn admitted(n: &NoticeText, f: &Filled) {
     let reason = Reason::new(&f.happened);
     assert_eq!(reason.fault(), None, "{}: {:?}", n.id, f.happened);
@@ -208,8 +179,6 @@ fn admitted(n: &NoticeText, f: &Filled) {
     }
 }
 
-/// A command the owner runs is the end of its step, so what they copy runs
-/// as written (no period stuck to the label); a step names at most one.
 #[test]
 fn a_step_that_names_a_command_ends_with_it() {
     for n in ALL {
@@ -280,8 +249,6 @@ fn placeholders_are_known_and_every_one_is_filled() {
     }
 }
 
-/// What happened is the engine's reason, and a label is the owner's own word:
-/// an adversarial label (`retry-soon`) never reaches it.
 #[test]
 fn what_happened_holds_no_placeholder() {
     for n in ALL {
@@ -311,8 +278,6 @@ fn ids_are_unique_words_and_codes_unique_letter_pairs() {
     }
 }
 
-/// What aterm did names aterm, and what to expect never asks for anything
-/// more: the one step is the step's.
 #[test]
 fn what_aterm_did_is_aterms_and_the_expectation_asks_nothing() {
     for n in ALL {
@@ -328,12 +293,6 @@ fn what_aterm_did_is_aterms_and_the_expectation_asks_nothing() {
     }
 }
 
-/// A label the room holds is named whole, and the renewal's step runs it; one
-/// past the room is clipped in the sentences, never in a command: a command
-/// the cap cannot hold with its label whole is a line of Details, whole, and
-/// the step says so — never a command with words in its label's place, never
-/// another command (`--due` renewed nothing of a row a renewal signed in
-/// another account for — the review of the login carry, 2026-10-20).
 #[test]
 fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
     let short = RENEWAL_WRONG_ACCOUNT.fill(Some("main"), None);
@@ -378,9 +337,6 @@ fn a_label_is_named_whole_where_it_fits_and_never_cut_in_a_command() {
     }
 }
 
-/// A ROSTER ROW IS NAMED AS A NAME, never as a possessor (the review of the
-/// owner's notices, 2026-10-20: `sign in with main's own account` read as if
-/// `main` were a person): no filled part says `<label>'s`.
 #[test]
 fn a_label_is_never_a_possessor() {
     let possessive = |part: &str, label: &str| part.contains(&format!("{label}'s"));
@@ -395,12 +351,6 @@ fn a_label_is_never_a_possessor() {
     assert!(possessive(&old, "pool-7"), "the control");
 }
 
-/// A SIGN-IN BY HAND OF A LOST ROSTER LOGIN NAMES THE ROW (the review of the
-/// login carry, 2026-10-20): every notice whose step has the owner sign the
-/// lost login in again themselves says, where the session's login is a
-/// roster row, whose own account to sign in with — nothing at the hand-off of
-/// their own `/login` does, and another account makes two rows of the roster
-/// one.
 #[test]
 fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
     let lost = [
@@ -430,10 +380,6 @@ fn a_sign_in_by_hand_on_a_roster_login_names_the_row() {
     );
 }
 
-/// A USAGE LIMIT'S NOTICE SAYS WHEN THE TAB GOES ON BY ITSELF (the review
-/// of the band, 2026-10-20: none named the reset, nor that aterm continues
-/// the tab after it, which happens whatever the owner does): filled with
-/// the reset, each limit notice's expectation names it.
 #[test]
 fn a_limit_notice_names_its_reset_where_it_is_known() {
     let reset = "on Oct 23 at 9am";
@@ -462,9 +408,6 @@ fn a_limit_notice_names_its_reset_where_it_is_known() {
     }
 }
 
-/// THE BAND IS THE WINDOW'S (the review of the band, 2026-10-20): it shows
-/// whichever tab is in front, so no step says `this tab` — read on tab 2,
-/// `Press Esc in this tab` would interrupt whatever runs there.
 #[test]
 fn no_step_says_this_tab() {
     let says = |step: &str| step.to_lowercase().contains("this tab");
@@ -479,10 +422,6 @@ fn no_step_says_this_tab() {
     );
 }
 
-/// A STEP THAT RUNS A COMMAND HAS ITS SHORT FORM, a sentence none: the band
-/// shows a command whole or puts [`COMMAND_UNDER_DETAILS`] in its place,
-/// never a cut of it (the review of the band, 2026-10-20: `Run aterm harness
-/// accounts renew…` at 514 px).
 #[test]
 fn a_command_step_has_its_short_form() {
     assert_eq!(Step::new(COMMAND_UNDER_DETAILS).fault(), None);
@@ -500,11 +439,6 @@ fn a_command_step_has_its_short_form() {
     assert_eq!(LOGIN_CANCELLED.fill(Some("main"), None).short, None);
 }
 
-/// A STEP THAT OUTLASTS ITS NOTICE SAYS HOW IT ENDS (the review of the login
-/// carry, r3h-3): `accounts use <label>` pins the account for every session
-/// until the pin is ended, so the notice that asks for it names, on a line
-/// of Details ([`NoticeText::undo`]), the one command that ends the pin —
-/// another command than the step's.
 #[test]
 fn a_pin_names_how_it_ends() {
     let pins = |n: &NoticeText| n.todo.contains("accounts use ");
@@ -521,9 +455,6 @@ fn a_pin_names_how_it_ends() {
     assert_eq!(LIMIT_RENEW.undo, None, "the control");
 }
 
-/// Why `short` may not be the band's short form of `title`, or `None`: two
-/// or three words, narrower than the title, no tab and no number in it (the
-/// band's `Tab N` names the tab), and a title the engine admits.
 fn short_title_fault(short: &str, title: &str) -> Option<&'static str> {
     let words = aterm_messages::text::title_words(short);
     if !(2..=3).contains(&words) {
@@ -537,12 +468,6 @@ fn short_title_fault(short: &str, title: &str) -> Option<&'static str> {
     }
 }
 
-/// A TITLE'S SHORT FORM SAYS WHAT HAPPENED IN TWO OR THREE WORDS (the review
-/// of the band, 2026-10-20: at the default window every notice's title read
-/// as a stub, `Claude's lo…`): the band paints it where the whole title does
-/// not fit, so it holds [`short_title_fault`]'s shape, and it is one per
-/// title — two notices share a short form exactly where they share their
-/// title, so the band never says less of a difference the title makes.
 #[test]
 fn a_short_title_says_what_happened_in_two_or_three_words() {
     for n in ALL {
@@ -569,9 +494,6 @@ fn a_short_title_says_what_happened_in_two_or_three_words() {
     assert!(short_title_fault("Limit", title).is_some());
 }
 
-/// The arguments after `aterm harness` of the command `f`'s step runs, whole
-/// (its line of Details where the step points there); `None` for a step that
-/// runs none.
 fn step_args(f: &Filled) -> Option<Vec<String>> {
     let step = f.command.as_deref().unwrap_or(&f.todo);
     let at = step.find(COMMAND)?;
@@ -583,9 +505,6 @@ fn step_args(f: &Filled) -> Option<Vec<String>> {
     )
 }
 
-/// EVERY COMMAND A STEP RUNS IS ONE `aterm harness` TAKES: the owner copies
-/// it from the band or from Details, so it parses as the verb's own grammar
-/// does (`crate::harness::cli::parse`), at a label of every length.
 #[test]
 fn every_command_a_step_runs_is_one_aterm_harness_takes() {
     use crate::harness::cli::parse;
@@ -605,10 +524,6 @@ fn every_command_a_step_runs_is_one_aterm_harness_takes() {
     assert!(parse(&unknown).is_err(), "the control");
 }
 
-/// A NOTICE'S RECORD CLOSES IN WORDS TRUE OF HOW IT ENDED (the review of the
-/// login carry, r8c-7): a usage limit, where no login was lost, closes as the
-/// switch to another account that ends it, never as a login back; a lost or
-/// renewed login closes as its login back.
 #[test]
 fn a_notice_closes_in_words_true_of_how_it_ended() {
     let limits: Vec<&str> = LIMITS

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Activation (§10): the atomic `store/<program>/current` flip that makes a staged store build live, and the `bin/` shims that forward into it.
+//! Atomic `store/<program>/current` activation and `bin/` shims.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ impl Aliases {
         }
     }
 
-    /// The policy already in force for `program` on disk: `Alab` when any alias shim resolves into its store tree, else `Off`.
+    /// The policy already in force for `program` on disk.
     #[must_use]
     pub fn laid_for(layout: &Layout, program: &str) -> Self {
         let prog_store = layout.prefix.join("store").join(program);
@@ -52,7 +52,7 @@ impl Aliases {
     }
 }
 
-/// Atomically point `link` at `target` ([`crate::platform::atomic_symlink`]: temp symlink + `rename(2)` on POSIX, a directory junction on Windows).
+/// Atomically point `link` at `target` ([`crate::platform::atomic_symlink`]).
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     platform::atomic_symlink(target, link)
 }
@@ -68,7 +68,7 @@ pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
     atomic_symlink(build_dir, &layout.program_current(&program))
 }
 
-/// Install `bin/` shims for the manifest's raw `exposes` list, each forwarding to the tool's executable in `<build_dir>/bin/`.
+/// Install `bin/` shims for the manifest's raw `exposes` list.
 pub fn install_shims(
     layout: &Layout,
     build_dir: &Path,
@@ -93,7 +93,7 @@ pub fn install_shims_env(
     })
 }
 
-/// [`install_shims_env`] that hands what it says (an exec root it laid) to `say` instead of stdout.
+/// [`install_shims_env`] that hands what it says to `say` instead of stdout.
 pub(crate) fn install_shims_env_saying(
     layout: &Layout,
     build_dir: &Path,
@@ -199,7 +199,7 @@ pub fn reconcile_agents(layout: &Layout) {
         let Some((target, primary_is)) = platform::resolve_shim(&primary)
             .and_then(|t| agent_primary(layout, name, &t).map(|is| (t, is)))
         else {
-            // not installed here (a pending stub, a tombstone): the sweep answers
+            // not installed here (a pending stub, a tombstone): the sweep answers it
             continue;
         };
         let dev_link = primary_is == AgentPrimary::DevLink;
@@ -295,18 +295,14 @@ fn primary_executable(
     platform::twin_executable_to_env(shim, target, env, prelude)
 }
 
-/// `store/<program>/exec/`: the directory holding the stable path an ALab build's primary and twin exec ([`twin_exec`]).
+/// `store/<program>/exec/` ([`twin_exec`]).
 #[must_use]
 pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
     layout.prefix.join("store").join(program).join("exec")
 }
 
-/// The stable launch path for an ALab primary and its agent twin. For a non-ALab build,
-/// it is `target` itself, byte for byte as before.
 struct AgentExec {
     path: PathBuf,
-    // Admission survives failure to lay the symlink: a raw fallback still belongs to
-    // this logical route, which a later reconcile can repair.
     managed: Option<PathBuf>,
 }
 
@@ -356,8 +352,7 @@ pub fn twin_target(layout: &Layout, program: &str) -> Option<PathBuf> {
     Some(unstable_spelling(layout, program, raw))
 }
 
-/// [`twin_target`]'s mapping of one exec target: an [`exec_dir`] entry reads back as the
-/// file it names.
+/// [`twin_target`]'s mapping of one exec target ([`exec_dir`]).
 fn unstable_spelling(layout: &Layout, program: &str, raw: PathBuf) -> PathBuf {
     if raw.parent() == Some(exec_dir(layout, program).as_path())
         && let Ok(named) = std::fs::read_link(&raw)
@@ -367,8 +362,7 @@ fn unstable_spelling(layout: &Layout, program: &str, raw: PathBuf) -> PathBuf {
     raw
 }
 
-/// What an agent program's `bin/` shim forwards to, as `agents/` may name it
-/// ([`agent_primary`]).
+/// What an agent program's `bin/` shim forwards to, as `agents/` may name it ([`agent_primary`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentPrimary {
     /// A build in an agent program's store tree.
@@ -379,8 +373,7 @@ enum AgentPrimary {
 
 /// What `target`, the forward of `program`'s `bin/` shim, is when an `agents/` twin may name
 /// it: a build in an agent program's store tree, or a file inside the program's recorded
-/// dev-link checkout ([`crate::linkmode::linked_checkout`]), so a dev link also wins at the
-/// front of `PATH`.
+/// dev-link checkout ([`crate::linkmode::linked_checkout`]).
 fn agent_primary(layout: &Layout, program: &str, target: &Path) -> Option<AgentPrimary> {
     if crate::ops::store_build_of(&layout.prefix, target)
         .is_some_and(|(owner, _)| crate::stub::is_agent_program(&owner))
@@ -465,9 +458,6 @@ pub(crate) mod agents_checkpoint {
     }
 }
 
-/// Whether `shim` holds, byte for byte, what the one shim renderer
-/// (`platform::shim_executable_to_env`) lays for `target` and `env` now: the half of the
-/// reconciles' "already right" that target and environment cannot see.
 fn shim_is_rendered(shim: &Path, target: &Path, env: &crate::shim_env::ShimEnv) -> bool {
     if cfg!(not(unix)) {
         return true;
@@ -563,7 +553,7 @@ pub(crate) fn reconcile_aliases(
     Ok(())
 }
 
-/// The primary shims of one build whose exported environment is not the one that build declares ([`crate::shim_env::read_sidecar`], design S7).
+/// Primary shims whose exported environment differs ([`crate::shim_env::read_sidecar`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnvDrift {
     /// What the build's sidecar declares — never empty.
@@ -593,7 +583,7 @@ pub(crate) fn shim_env_drift(
     (!shims.is_empty()).then_some(EnvDrift { declared, shims })
 }
 
-/// Re-lay every primary shim of `builds` (build dir, active tools) that [`shim_env_drift`] finds exporting other than its build declares, with exactly the declared environment.
+/// Re-lay every primary shim of `builds` ([`shim_env_drift`]).
 pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]) {
     let publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -643,7 +633,7 @@ pub(crate) fn reassert_shim_env(layout: &Layout, builds: &[(&Path, &[ToolName])]
     }
 }
 
-/// Store build that a `bin/` entry `name` at `shim` forwards into when [`ToolName::from_shim_file`] refuses `name` ([`crate::ops::store_build_of`]).
+/// Store build when [`ToolName::from_shim_file`] refuses `name` ([`crate::ops::store_build_of`]).
 pub(crate) fn refused_name_shim(layout: &Layout, name: &str, shim: &Path) -> Option<(String, u64)> {
     if ToolName::from_shim_file(name).is_some() {
         return None;
@@ -652,8 +642,7 @@ pub(crate) fn refused_name_shim(layout: &Layout, name: &str, shim: &Path) -> Opt
         .and_then(|target| crate::ops::store_build_of(&layout.prefix, &target))
 }
 
-/// The `bin/` shims [`refused_name_shim`] names (`program`: only those into that program's
-/// store), as (file name, path), by name.
+/// The `bin/` shims [`refused_name_shim`] names.
 fn refused_name_entries(layout: &Layout, program: Option<&str>) -> Vec<(String, PathBuf)> {
     let Ok(entries) = crate::ops::read_bin_dir(layout) else {
         return Vec::new();
@@ -673,7 +662,7 @@ fn refused_name_entries(layout: &Layout, program: Option<&str>) -> Vec<(String, 
     found
 }
 
-/// The file names of the `bin/` shims [`refused_name_shim`] names, by name: what [`remove_refused_name_shims`] would remove.
+/// The file names of the `bin/` shims [`refused_name_shim`] names ([`remove_refused_name_shims`]).
 pub(crate) fn refused_name_shims(layout: &Layout) -> Vec<String> {
     refused_name_entries(layout, None)
         .into_iter()
@@ -681,7 +670,7 @@ pub(crate) fn refused_name_shims(layout: &Layout) -> Vec<String> {
         .collect()
 }
 
-/// Remove every `bin/` shim [`refused_name_shim`] names (`program`: only those into that program's store), and return the file names removed.
+/// Remove every `bin/` shim [`refused_name_shim`] names.
 pub(crate) fn remove_refused_name_shims(layout: &Layout, program: Option<&str>) -> Vec<String> {
     let _publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -693,10 +682,9 @@ pub(crate) fn remove_refused_name_shims(layout: &Layout, program: Option<&str>) 
         .collect()
 }
 
-/// Remove `bin/` shims this program owns that point at a different build (tools a newer
-/// build dropped from `exposes`), and every alias of this program's no longer wanted
-/// (`aliases` is [`Aliases::Off`], or its base is neither in `installed` nor another tool of
-/// this build).
+/// Remove `bin/` shims this program owns that point at a different build, and every alias of
+/// this program's no longer wanted (`aliases` is [`Aliases::Off`], or its base is neither in
+/// `installed` nor another tool of this build).
 fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], aliases: Aliases) {
     let _publication = crate::lay::PUBLICATION_TURN
         .lock()
@@ -735,7 +723,7 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
             continue;
         }
         let Some(target) = crate::platform::resolve_shim(&entry.path()) else {
-            // not a shim we can resolve (tombstone, real file, dangling)
+            // not a shim we can resolve (tombstone, real file)
             continue;
         };
         if crate::ops::store_build_of(&layout.prefix, &target)
@@ -746,7 +734,7 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     }
 }
 
-/// Best-effort undo of [`activate_build`] and a partial [`install_tools`] pass, for a build about to be discarded after activation (`flow::abort_activated_install`).
+/// Best-effort undo of [`activate_build`] and a partial [`install_tools`] pass.
 pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
     if let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) {
         let own = layout.program_current(&program);
@@ -818,13 +806,10 @@ mod tests {
         ToolName::new(name).unwrap()
     }
 
-    /// `bin/<name>` for a name the test knows is admissible.
     fn shim_of(layout: &Layout, name: &str) -> PathBuf {
         layout.shim(&tool(name))
     }
 
-    /// The `bin/` path a shim for `name` would occupy, for the refusal tests, where
-    /// `ToolName::new` is `None` and `Layout::shim` cannot name it.
     fn refused_shim_path(layout: &Layout, name: &str) -> PathBuf {
         layout
             .bin_dir()
@@ -986,8 +971,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// Two programs activated in turn each keep their own `current`, the per-program
-    /// witness `gc::live_builds` reads.
     #[test]
     fn two_programs_on_one_channel_each_keep_their_own_current() {
         let layout = temp_prefix("two-progs");
@@ -1210,8 +1193,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// `undo_activation` removes exactly the doomed build's `current` link and shims; a
-    /// bystander program activated afterwards keeps both.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {
         let layout = temp_prefix("undo");
@@ -1244,9 +1225,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The shim environment (design S7) rides on every shim `install_tools_env` lays,
-    /// primary and alias, and an env-carrying shim resolves, prunes, sweeps, undoes and
-    /// uninstalls like a plain one; a re-lay without env leaves no exports.
     #[test]
     fn env_shims_resolve_prune_undo_and_uninstall_like_plain_ones() {
         let layout = temp_prefix("env-shims");
@@ -1324,9 +1302,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// A partial lay keeps the aliases of the tools it did not name: `atpkg unlink`'s
-    /// restore (`cli::restore_installed_shims`) lays only the names the dev link owned — one,
-    /// by `cli::default_link_bins` — at the build the other tools are live at.
     #[test]
     fn a_partial_lay_keeps_the_aliases_of_this_builds_other_tools() {
         let layout = temp_prefix("partial-lay-aliases");
@@ -1371,8 +1346,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// `reconcile_aliases` mirrors the primary's environment onto the alias it lays,
-    /// rewrites an alias whose env drifted from its primary's, and leaves an agreeing one.
     #[test]
     fn reconcile_aliases_mirrors_the_primary_env() {
         let layout = temp_prefix("env-alias-reconcile");
@@ -1857,8 +1830,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The alias policy is read off the signed index entry: ALab's own (no `system`)
-    /// aliases; an agent program, a system-satisfiable member and an unlisted name do not.
     #[test]
     fn the_alias_policy_follows_the_index_entry() {
         let program = |system: Option<&str>| crate::manifest::Program {
@@ -1887,9 +1858,6 @@ mod tests {
         assert_eq!(Aliases::for_program("x", None), Aliases::Off, "unlisted");
     }
 
-    /// `alab-<tool>` is laid beside every `<tool>` shim of an ALab program, forwarding to
-    /// the same executable (`active_builds` still sees one build, `active_tools` lists the
-    /// primaries and `active_aliases` the aliases); a program under `Aliases::Off` gets none.
     #[test]
     fn an_alab_program_gets_an_alias_beside_every_shim_forwarding_to_the_same_target() {
         let layout = temp_prefix("alias-lay");
@@ -1959,10 +1927,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// Aliases follow their primaries through every sweep: a dropped tool's alias is pruned
-    /// with it, a re-shim moves the alias to the new build, a policy flip to `Off` sweeps
-    /// the aliases of that program and nothing else, `undo_activation` and `uninstall`
-    /// take them with the build.
     #[test]
     fn aliases_are_pruned_swept_undone_and_uninstalled_with_their_primary() {
         let layout = temp_prefix("alias-sweep");
@@ -2023,9 +1987,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// An up-to-date program (the pipeline short-circuits, so `install_tools` never runs)
-    /// gets its aliases from the pass's reconcile: laid when missing, left alone when right,
-    /// swept under `Off`, and never written over a file this manager did not lay.
     #[test]
     fn reconcile_lays_the_aliases_of_an_already_installed_program() {
         let layout = temp_prefix("alias-reconcile");
@@ -2066,8 +2027,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The Windows `.cmd` alias: the resume-proof frame, then a forward to the primary's
-    /// `.exe` that ends the batch on that line.
     #[test]
     fn the_cmd_alias_forwards_to_the_primary_exe() {
         let target = Path::new(r"C:\Users\me\.aterm\pkg\store\ay\18\bin\ay.exe");

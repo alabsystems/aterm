@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TOP RULE'S KEY, CLICKED (design §10.6.14): Claude Code's own top-effort tag on its composer's top rule, and aterm's greyed ghost of it while the key is off — drawn only on evidence the key exists for the process, never over Claude's ink — each a target whose left click types Claude's own `/effort <key> on|off` through the facts' one typing path (`crate::claude_slash`), read back from the engine.
+//! Tests for clicking the Claude Code top-rule effort key and ghost target.
 
 use aterm_core::terminal::{RenderCell, Script, UnderlineStyle};
 use aterm_window::event::{ElementState, MouseButton};
@@ -12,13 +12,10 @@ use crate::claude_lights::FactHit;
 use crate::claude_lights::Target;
 use crate::claude_slash::KeyLatch;
 
-/// The ghost's text: ` KEY off `.
 fn ghost_text() -> String {
     format!(" {KEY} off ")
 }
 
-/// [`claude_on`] with the build `version` and the key as the transcript
-/// last stated it (`top`: the resolver's `FooterFacts::top_effort`).
 fn claude_with(app: &App, session: u64, model: &str, version: &str, top: Option<bool>) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -39,22 +36,18 @@ fn claude_with(app: &App, session: u64, model: &str, version: &str, top: Option<
     timeline.set_agent_reader_for_test(true);
 }
 
-/// The frame row of the composer's top rule [`draw_claude`] draws.
 fn top_row(app: &App, wid: WindowId) -> usize {
     footer_row(app, wid) - 2
 }
 
-/// The top rule's cells as this frame's glass holds them.
 fn top_cells(app: &App, wid: WindowId) -> Vec<RenderCell> {
     app.windows[&wid].input_scratch.cells[top_row(app, wid)].clone()
 }
 
-/// The top rule as this frame's glass shows it, char by char.
 fn top_text(app: &App, wid: WindowId) -> String {
     top_cells(app, wid).iter().map(|c| c.ch).collect()
 }
 
-/// The key's target this frame, where the glass shows it.
 fn key_hit(app: &App, wid: WindowId) -> Option<FactHit> {
     app.windows[&wid]
         .claude_lights
@@ -64,7 +57,6 @@ fn key_hit(app: &App, wid: WindowId) -> Option<FactHit> {
         .copied()
 }
 
-/// A left click on frame cell `cell`, the pointer moved there first.
 fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
     let (x, y) = px_of(app, wid, cell);
     app.on_cursor_moved(wid, x, y);
@@ -72,8 +64,6 @@ fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
 }
 
-/// Whether this frame's footer write touched any of frame row `row`'s
-/// columns `cols`.
 fn wrote(app: &App, wid: WindowId, row: usize, cols: (usize, usize)) -> bool {
     app.windows[&wid]
         .claude_footer_undo
@@ -81,8 +71,6 @@ fn wrote(app: &App, wid: WindowId, row: usize, cols: (usize, usize)) -> bool {
         .any(|(at, col, len)| at == row && col < cols.1 && col + len > cols.0)
 }
 
-/// The rest of a press of `slash` once its probe is on the PTY: the probe's
-/// echo, the rest, its echo, the quiet window and the Enter.
 fn through_enter_after_probe(
     app: &mut App,
     session: u64,
@@ -100,12 +88,6 @@ fn through_enter_after_probe(
     at
 }
 
-/// THE GHOST IS DRAWN ONLY ON EVIDENCE THE KEY IS OFF (design §10.6.14): Claude
-/// Code 2.1.304 with no word of the key draws nothing of aterm's on its top
-/// rule's right end and offers no target; the transcript's statement of the
-/// key makes ` KEY off ` stand in Claude's slot — its glyphs a target, the
-/// `─` after it Claude's — and so does Claude's own tag seen earlier for the
-/// process.
 #[test]
 fn the_ghost_is_drawn_only_on_evidence_of_off() {
     let (mut app, wid, session, _reader) = idle();
@@ -191,12 +173,6 @@ fn the_ghost_is_drawn_only_on_evidence_of_off() {
     );
 }
 
-/// A CLICK ON THE GHOST TYPES THE KEY ON AND READS IT BACK: the left click
-/// writes the probe `/` alone as the person's, the ghost marked `◐` in the
-/// `─` before it while the press runs; the rest and aterm's Enter follow
-/// the echo; Claude's tag on the top rule ends it — the ghost gone, Claude's
-/// tag the target, its notice in the title slot, the process noted as
-/// having shown the key.
 #[test]
 fn a_click_on_the_ghost_types_key_on_and_reads_it_back() {
     let (mut app, wid, session, mut reader) = idle();
@@ -250,11 +226,6 @@ fn a_click_on_the_ghost_types_key_on_and_reads_it_back() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing after the answer");
 }
 
-/// A BAND OVER THE BOTTOM RULE LEAVES THE TOP RULE'S KEY (the cross-track
-/// review of 2026-10-19): a find bar floated to the pane's bottom claims the
-/// composer's caret row, its bottom rule and the mode row — no bottom rule
-/// is on the glass to write — while the top rule stands clear of it: its
-/// ghost and its target stay, and nothing under the band is written.
 #[test]
 fn a_band_over_the_bottom_rule_leaves_the_top_rules_key() {
     let (mut app, wid, session, _reader) = idle();
@@ -299,10 +270,6 @@ fn a_band_over_the_bottom_rule_leaves_the_top_rules_key() {
     assert_eq!(under(&app), before, "nothing under the band is written");
 }
 
-/// A DOUBLE-CLICK ON THE KEY, NO BLOCK OF CHIPS SHOWN (no harness host):
-/// the first click begins the press; the second, refused as one already in
-/// flight, opens no menu over the pane while aterm types, and types nothing
-/// more.
 #[test]
 fn a_double_click_on_the_key_opens_no_menu_while_aterm_types() {
     for draft in [false, true] {
@@ -423,10 +390,6 @@ fn a_click_on_claudes_tag_types_key_off_and_never_writes_its_cells() {
     );
 }
 
-/// A REFUSED KEY LATCHES THE GHOST FOR THAT MODEL: Claude's measured
-/// `isn't available on <model>` answer to a click on the ghost stops the
-/// press naming the model, and the ghost is drawn no more — no target —
-/// for the process and its model.
 #[test]
 fn a_refused_key_latches_the_ghost_for_that_model() {
     let (mut app, wid, session, mut reader) = idle();
@@ -464,8 +427,6 @@ fn a_refused_key_latches_the_ghost_for_that_model() {
     assert!(key_hit(&app, wid).is_some());
 }
 
-/// This window's harness host holding `session`: its top rule wears the
-/// harness's border and its switch.
 fn held(app: &mut App, session: u64) -> Hosted {
     let hosted = host(app);
     let ctx = app.pool.get(session).expect("session").ctx.clone();
@@ -480,12 +441,6 @@ fn held(app: &mut App, session: u64) -> Hosted {
     hosted
 }
 
-/// THE GHOST SHOWS WITH THE HARNESS OFF AND WRITES ONLY ITS CELLS: the
-/// session's Autopilot Off in a window with no host leaves the top rule
-/// Claude's — no tint, no switch — but for the lockup two cells in (it shows
-/// in every harness state) and the ghost, whose cells end the write: the
-/// rule between them is Claude's own `─`, copied as it stands, its lead and
-/// its last `─` never written.
 #[test]
 fn the_ghost_shows_with_the_harness_off_and_writes_only_its_cells() {
     use aterm_agent::supervise::Autopilot;
@@ -656,12 +611,6 @@ fn a_readers_press_on_the_key_is_its_click() {
     assert_eq!(pty(&mut reader, 1), b"/", "the click's probe");
 }
 
-/// THE KEY'S MARK READS ON A TAB'S OWN THEME (design §8; `session_theme`):
-/// the `◐` a press of the key stands under, in the `─` left of Claude's tag,
-/// is the instance theme's accent, and a tab drawn in a theme of its own
-/// keeps the instance's (the window's chrome follows the instance) — so on
-/// an instance in Dracula a Claude Code tab in Default Light drew Dracula's
-/// light accent on Default Light's paper at 1.0:1.
 #[test]
 fn the_keys_mark_reads_on_a_tab_theme_the_instance_did_not_choose() {
     use aterm_effects::color_math::contrast_ratio;

@@ -676,6 +676,74 @@ pub(crate) mod tests {
         }
     }
 
+    /// A listener on `[::]:0` that takes IPv4 too. A Unix IPv6 socket does by
+    /// default (`IPV6_V6ONLY` off).
+    #[cfg(not(windows))]
+    fn bind_dual_stack() -> io::Result<TcpListener> {
+        TcpListener::bind("[::]:0")
+    }
+
+    /// A listener on `[::]:0` that takes IPv4 too. A Windows IPv6 socket has
+    /// `IPV6_V6ONLY` on by default, and the option only counts before `bind`,
+    /// which `TcpListener::bind` does at once: so the socket is made, cleared
+    /// and bound here.
+    #[cfg(windows)]
+    fn bind_dual_stack() -> io::Result<TcpListener> {
+        use aterm_win32::Win32::Networking::WinSock::{
+            AF_INET6, INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SOCK_STREAM,
+            SOCKADDR, SOCKADDR_IN6, SOCKET_ERROR, WSAGetLastError, bind, listen, setsockopt,
+            socket,
+        };
+        use std::os::windows::io::{AsRawSocket as _, FromRawSocket as _};
+
+        // SAFETY: WSAGetLastError takes no arguments and only reads that slot.
+        let failed = || io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        // std's first socket starts Winsock (WSAStartup), which a raw `socket` needs.
+        drop(std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?);
+        // SAFETY: plain values; Winsock is started.
+        let raw = unsafe { socket(i32::from(AF_INET6), SOCK_STREAM, IPPROTO_TCP) };
+        if raw == INVALID_SOCKET {
+            return Err(failed());
+        }
+        // SAFETY: a socket just made, owned by nothing else: the listener closes it.
+        let listener = unsafe { TcpListener::from_raw_socket(raw as u64) };
+        let handle = listener.as_raw_socket() as usize;
+        let off: u32 = 0;
+        // SAFETY: `off` is a live 4-byte value for the call, the size IPV6_V6ONLY reads.
+        let cleared = unsafe {
+            setsockopt(
+                handle,
+                IPPROTO_IPV6,
+                IPV6_V6ONLY,
+                std::ptr::from_ref(&off).cast(),
+                size_of::<u32>() as i32,
+            )
+        };
+        if cleared == SOCKET_ERROR {
+            return Err(failed());
+        }
+        let any = SOCKADDR_IN6 {
+            sin6_family: AF_INET6,
+            ..SOCKADDR_IN6::default()
+        };
+        // SAFETY: `any` is a live SOCKADDR_IN6 of the size passed, for the call.
+        let bound = unsafe {
+            bind(
+                handle,
+                std::ptr::from_ref(&any).cast::<SOCKADDR>(),
+                size_of::<SOCKADDR_IN6>() as i32,
+            )
+        };
+        if bound == SOCKET_ERROR {
+            return Err(failed());
+        }
+        // SAFETY: a bound socket of this listener's.
+        if unsafe { listen(handle, 128) } == SOCKET_ERROR {
+            return Err(failed());
+        }
+        Ok(listener)
+    }
+
     /// A listener on `[::]` that also takes IPv4, and the port it took. It
     /// sees a 127.0.0.1 peer as `::ffff:127.0.0.1` ([`source_of`]: 127.0.0.1)
     /// and a ::1 peer as `::/64`: two addresses on loopback with no second
@@ -685,7 +753,7 @@ pub(crate) mod tests {
         fn not_run(test: &str, why: &str) -> ! {
             aterm_spec::host::could_not_run(format!("{test}: no dual-stack loopback here ({why})"))
         }
-        let listener = match TcpListener::bind("[::]:0") {
+        let listener = match bind_dual_stack() {
             Ok(listener) => listener,
             Err(e) => not_run(test, &format!("binding [::]: {e}")),
         };

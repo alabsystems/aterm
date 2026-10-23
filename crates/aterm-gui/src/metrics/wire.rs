@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `metrics` verb's request grammar, the instant one reply reads, and the
-//! units its fields are written in. The sinks themselves are
-//! `aterm_codec::fields` (re-exported by `aterm_control::wire`): every field is
-//! emitted once, by [`super::emit_summary`] or [`super::emit_percentiles`] and
-//! the fragments they splice, and the text line and the `--json` object are two
-//! sinks driven by that one call.
+//! The `metrics` verb's request grammar.
 
 pub(crate) use aterm_control::wire::fields::{
     Cell, Decimal, FieldSink, FlagWords, JsonSink, TextSink,
@@ -39,8 +34,7 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    /// `""`, `reset` or `percentiles`; `None` for anything else, which the verb
-    /// refuses without resetting: a mistyped `reset` must not read as one.
+    /// `""`, `reset` or `percentiles`.
     #[must_use]
     pub(crate) fn parse(rest: &str) -> Option<Self> {
         let (form, reset) = match rest.trim() {
@@ -56,14 +50,9 @@ impl Request {
 /// What a reply reads beside its metrics root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fragments {
-    /// The process's other ledgers: the startup facts, the wake table, the
-    /// echo ring, the turn census, the claim timeline, the control listener,
-    /// the crash-restore journal's resident bytes, the PTY masters and the
-    /// spawn-kit pool.
+    /// The process's other ledgers.
     Process,
-    /// None of them: the reply depends on its root and its instant alone, so
-    /// a test reads back exactly what it wrote. Each skipped fragment is left
-    /// out, and each skipped field reads as empty.
+    /// None of them.
     #[cfg(test)]
     Inert,
 }
@@ -73,9 +62,7 @@ pub(crate) enum Fragments {
 pub(crate) struct ReadCtx<'a> {
     /// The ledgers the reply publishes: the process's [`super::METRICS`].
     pub(crate) metrics: &'a super::Metrics,
-    /// The process clock ([`super::now_ns`]) at this reply: `metrics_now_ms`,
-    /// `deadline_in_ms`, `main_busy_ms_per_s` and `control_last_accept_age_ms`
-    /// are all read at this one instant.
+    /// The process clock ([`super::now_ns`]) at this reply.
     pub(crate) now_ns: u64,
     pub(crate) fragments: Fragments,
 }
@@ -104,32 +91,26 @@ impl<'a> ReadCtx<'a> {
         }
     }
 
-    /// Whether the reply splices the process's other ledgers
-    /// ([`Fragments::Process`]).
+    /// Whether the reply splices the process's other ledgers ([`Fragments::Process`]).
     #[must_use]
     pub(crate) const fn reads_process(&self) -> bool {
         matches!(self.fragments, Fragments::Process)
     }
 }
 
-/// Nanoseconds as milliseconds to two places: the unit of every `_ms` field
-/// but the two thresholds.
+/// Nanoseconds as milliseconds to two places: the unit of every `_ms` field but the two thresholds.
 #[must_use]
 pub(crate) fn ms(ns: u64) -> Decimal {
     Decimal::new(ns as f64 / 1e6, 2)
 }
 
-/// Nanoseconds as milliseconds to three places: the sub-millisecond
-/// main-thread costs of `metrics percentiles` (the menu-bar glance, a need
-/// publication, the transcript apply's holds) and the summary's card-engine
-/// times (`proc_drain_ms`, `parse_lock_wait_ms`, `status_sweep_ms`).
+/// Nanoseconds as milliseconds to three places.
 #[must_use]
 pub(crate) fn ms3(ns: u64) -> Decimal {
     Decimal::new(ns as f64 / 1e6, 3)
 }
 
-/// Nanoseconds as milliseconds to one place: `slow_threshold_ms` and
-/// `long_turn_threshold_ms`.
+/// Nanoseconds as milliseconds to one place: `slow_threshold_ms` and `long_turn_threshold_ms`.
 #[must_use]
 pub(crate) fn ms1(ns: u64) -> Decimal {
     Decimal::new(ns as f64 / 1e6, 1)
@@ -141,9 +122,7 @@ pub(crate) fn us_ms(us: u64) -> Decimal {
     Decimal::new(us as f64 / 1e3, 2)
 }
 
-/// Signed microseconds as milliseconds to two places: a boundary of the claim
-/// timeline that came before the claim is negative, and one under 5 µs before
-/// it is `-0.00`.
+/// Signed microseconds as milliseconds to two places.
 #[must_use]
 pub(crate) fn signed_us_ms(us: i64) -> Decimal {
     Decimal::new(us as f64 / 1e3, 2)
@@ -175,8 +154,6 @@ pub(crate) fn render_json(emit: impl FnOnce(&mut dyn FieldSink)) -> String {
 mod tests {
     use super::{Form, Request, signed_us_ms};
 
-    /// The grammar is the three bodies and nothing else; the reset is a flag
-    /// of the summary only.
     #[test]
     fn the_grammar_is_three_bodies() {
         let summary = |reset| {
@@ -206,9 +183,6 @@ mod tests {
         }
     }
 
-    /// The claim timeline's signed unit writes what the log's `signed_ms`
-    /// writes at two places: the sign from the integer, so a boundary 4 µs
-    /// before the claim is `-0.00` and never `0.00`.
     #[test]
     fn a_signed_boundary_keeps_its_sign_at_two_places() {
         for us in [
@@ -237,18 +211,12 @@ mod tests {
     }
 }
 
-/// The laws every `metrics` body keeps, checked on the real emitters over this
-/// process's live state: both sinks say the same thing about the same keys,
-/// no key repeats (readers disagree on first versus last occurrence), and
-/// every text value is one non-empty token. The verb's own tests read its
-/// replies with the same body, token and member readers.
+/// The laws every `metrics` body keeps.
 #[cfg(test)]
 pub(crate) mod law_tests {
     use super::{Cell, Decimal, FieldSink, FlagWords, JsonSink, ReadCtx, TextSink};
     use std::collections::HashSet;
 
-    /// One emit call into the text sink, the JSON sink and a key log at once,
-    /// so all three see the same values.
     struct Tee {
         text: TextSink,
         json: JsonSink,
@@ -317,8 +285,6 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// The summary with the grid read and with the terminal busy, and the
-    /// percentiles.
     fn bodies() -> [Body; 3] {
         let ctx = ReadCtx::now();
         [
@@ -336,7 +302,6 @@ pub(crate) mod law_tests {
             .collect()
     }
 
-    /// The index just past the JSON string starting at `start`.
     fn string_end(b: &[u8], start: usize) -> usize {
         let mut i = start + 1;
         while b[i] != b'"' {
@@ -348,7 +313,6 @@ pub(crate) mod law_tests {
         i + 1
     }
 
-    /// The index of the `,` or `}` that ends the JSON value starting at `start`.
     fn value_end(b: &[u8], start: usize) -> usize {
         let mut depth = 0usize;
         let mut i = start;
@@ -367,9 +331,7 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// The members of one JSON object, in order, each value as its raw text:
-    /// enough of RFC 8259 for what the sinks write, and order-preserving where
-    /// `aterm_json`'s map is not.
+    /// The members of one JSON object.
     pub(crate) fn members(json: &str) -> Vec<(String, &str)> {
         let b = json.as_bytes();
         assert_eq!(b.first(), Some(&b'{'), "{json}");
@@ -392,8 +354,6 @@ pub(crate) mod law_tests {
         out
     }
 
-    /// A JSON value as the text sink writes it inside pairs: a record's values
-    /// joined by `/`, anything else as its digits.
     fn flatten(json: &str) -> String {
         if json.starts_with('{') {
             members(json)
@@ -406,11 +366,6 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// Whether a text value and a JSON value say the same thing under the
-    /// sinks' spellings: an absent word is `null`, `1`/`0` a boolean, a label
-    /// its string percent-escaped, `k:v,...` an object (`k:a/b` an object of
-    /// records; each `k` percent-escaped with `,` and `:` too), and a number
-    /// the same digits.
     fn agree(text: &str, json: &str) -> bool {
         match json.as_bytes().first() {
             Some(b'n') => json == "null" && ["none", "busy", "-"].contains(&text),
@@ -441,9 +396,6 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// Each body's text tokens and JSON members carry the emitted keys in
-    /// emitted order, and each value agrees across the two. The control: the
-    /// checker refuses a flag, a ledger, a record and a decimal that disagree.
     #[test]
     fn text_and_json_agree_key_for_key_and_value_for_value() {
         assert!(!agree("1", "false"));
@@ -468,8 +420,6 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// What breaks a reader of the text line: a repeated key, or a value that
-    /// is empty or not one token.
     fn law_violations(body: &Body) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -498,8 +448,6 @@ pub(crate) mod law_tests {
         out
     }
 
-    /// No key repeats in a body, and every text value is one non-empty token.
-    /// The control: a body with a repeated key and an empty label breaks both.
     #[test]
     fn every_key_is_unique_and_every_text_value_is_one_nonempty_token() {
         let bad = body(|s| {
@@ -513,9 +461,6 @@ pub(crate) mod law_tests {
         }
     }
 
-    /// The JSON members `verify perf start` reads strictly: every `*_schema` is
-    /// the integer 1, and every `*_valid` and `last_present_drop_parked` a
-    /// boolean. Returns how many it checked and what broke.
     fn startup_contract_violations(json: &str) -> (usize, Vec<String>) {
         let mut checked = 0;
         let mut out = Vec::new();
@@ -535,9 +480,6 @@ pub(crate) mod law_tests {
         (checked, out)
     }
 
-    /// The summary's schema markers are the integer 1 and its validity flags
-    /// are booleans. The control: a decimal schema and a counted flag are both
-    /// refused.
     #[test]
     fn schema_markers_are_integers_and_valid_flags_are_bools() {
         let bad = body(|s| {

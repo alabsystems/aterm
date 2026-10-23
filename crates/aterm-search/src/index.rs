@@ -26,17 +26,17 @@ use crate::grapheme::{
 };
 use crate::literal::AsciiCaseInsensitiveMatches;
 
-/// Default maximum number of lines kept in the search index cache; once it is exceeded the oldest quarter is evicted.
+/// Default maximum number of lines kept in the search index cache before oldest-quarter eviction.
 pub const DEFAULT_MAX_CACHED_LINES: usize = 100_000;
 
-/// Upper bound on the matches one batch query ([`SearchIndex::search_with_positions`], `search_case_insensitive`, `search_regex`) collects before it stops scanning.
+/// Upper bound on the matches collected by one batch search query.
 pub const MAX_SEARCH_MATCHES: usize = 100_000;
 
 /// Eviction low-water mark as a fraction `NUM/DEN` of `max_cached_lines`: once over capacity, [`SearchIndex::index_line`] drops the cache to `NUM/DEN · max`, keeping the newest lines (hysteresis, so eviction does not re-trigger every line).
 pub(crate) const EVICTION_RETAIN_NUM: usize = 3;
 pub(crate) const EVICTION_RETAIN_DEN: usize = 4;
 
-/// The smallest `max_cached_lines` that keeps the newest `retained` lines safe from eviction: eviction drops to the 3/4 low-water mark, so this is the smallest `max` with `floor(3·max/4) >= retained`.
+/// Smallest `max_cached_lines` that keeps the newest `retained` lines safe from eviction.
 #[inline]
 #[must_use]
 pub const fn max_cached_for_retained(retained: usize) -> usize {
@@ -68,7 +68,7 @@ fn count_case_insensitive_lowered_line() {
     CASE_INSENSITIVE_LOWERED_LINES.with(|c| c.set(c.get().saturating_add(1)));
 }
 
-/// Search index using trigrams with bloom filter acceleration: a bloom filter for negative lookups, trigram posting lists for candidate lines, and a line cache (with capacity-based eviction) for match verification.
+/// Trigram search index with a bloom filter, posting lists, and a bounded line cache.
 #[derive(Clone, Debug)]
 pub struct SearchIndex {
     /// Bloom filter for fast negative lookups.
@@ -108,13 +108,8 @@ pub struct SearchIndex {
     pub(super) ambiguous_width: AmbiguousWidth,
 }
 
-/// The largest posting key. Keys run `0..=MAX_KEY`, one short of `u32::MAX`,
-/// so `u32::MAX` stays free to be the exclusive end of every candidate range:
-/// no cached line can sit on the bound that is meant to include it.
 const MAX_KEY: u32 = u32::MAX - 1;
 
-/// [`MAX_KEY`] as a distance in lines: the widest span of line numbers one
-/// index holds at once (a window of `MAX_KEY_SPAN + 1` lines).
 const MAX_KEY_SPAN: usize = MAX_KEY as usize;
 
 /// The bloom filter represents the posting dictionary, not each occurrence in
@@ -347,7 +342,7 @@ impl SearchIndex {
         }
     }
 
-    /// Create a new search index with expected capacity and the default cache cap ([`DEFAULT_MAX_CACHED_LINES`]); see [`with_capacity_and_max`](Self::with_capacity_and_max).
+    /// Create a search index with expected capacity and the default cache cap.
     #[must_use]
     pub fn with_capacity(expected_lines: usize) -> Self {
         Self::with_capacity_and_max(expected_lines, DEFAULT_MAX_CACHED_LINES)
@@ -391,7 +386,7 @@ impl SearchIndex {
         }
     }
 
-    /// Measure columns under the terminal's `ambiguous_width` policy: with [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`, `°`) takes two columns, as the grid draws it.
+    /// Set the `ambiguous_width` policy used to measure column positions.
     pub fn set_ambiguous_width(&mut self, ambiguous: AmbiguousWidth) {
         if ambiguous == self.ambiguous_width {
             return;
@@ -516,7 +511,6 @@ impl SearchIndex {
         line_num
     }
 
-    /// Record whether cached line `line`'s text stops short of the line's end.
     fn set_truncated(&mut self, line: usize, truncated: bool) {
         if truncated {
             self.truncated_lines.insert(line);
@@ -525,17 +519,12 @@ impl SearchIndex {
         }
     }
 
-    /// Forget the truncated lines below `floor`, every one of which has just left
-    /// the cache.
     fn drop_truncated_below(&mut self, floor: usize) {
         if !self.truncated_lines.is_empty() {
             self.truncated_lines = self.truncated_lines.split_off(&floor);
         }
     }
 
-    /// `results` counting every cached line whose text stops short of its end in
-    /// [`SearchResults::cut_short_lines`]: the query did not search it to its end
-    /// either.
     fn with_truncated_lines(&self, results: SearchResults) -> SearchResults {
         if self.truncated_lines.is_empty() {
             return results;
@@ -553,7 +542,6 @@ impl SearchIndex {
         u32::try_from(line.saturating_sub(self.key_base)).unwrap_or(u32::MAX)
     }
 
-    /// Candidate lines `first..end`, ascending.
     fn line_range(&self, first: usize, end: usize) -> CandidateSource {
         CandidateSource::range(
             self.key_base,
@@ -561,7 +549,6 @@ impl SearchIndex {
         )
     }
 
-    /// Candidate lines `first..end`, descending.
     fn line_range_rev(&self, first: usize, end: usize) -> CandidateSource {
         CandidateSource::range_rev(
             self.key_base,
@@ -569,12 +556,10 @@ impl SearchIndex {
         )
     }
 
-    /// Lines in every list of `postings`, ascending from line `from_line`.
     fn postings_forward(&self, postings: Vec<&SparseBitmap>, from_line: usize) -> CandidateSource {
         CandidateSource::from_postings_forward(self.key_base, postings, self.posting_key(from_line))
     }
 
-    /// Lines in every list of `postings`, descending from below `before_line`.
     fn postings_backward(
         &self,
         postings: Vec<&SparseBitmap>,
@@ -587,8 +572,6 @@ impl SearchIndex {
         )
     }
 
-    /// Make `line` keyable before it is indexed: every cached line, and `line`, inside
-    /// one window of `MAX_KEY_SPAN + 1` lines from [`key_base`](Self::key_base).
     fn make_room_for(&mut self, line: usize) -> bool {
         if line
             .checked_sub(self.key_base)
@@ -608,7 +591,6 @@ impl SearchIndex {
             return false;
         }
         let new_base = if line < self.key_base {
-            // Every cached line is at or above the old base, so above `floor`.
             floor
         } else {
             self.evict_below_window(floor).unwrap_or(line).min(line)
@@ -617,8 +599,6 @@ impl SearchIndex {
         true
     }
 
-    /// Re-key every posting list from `key_base` to `new_base`. The caller
-    /// has made sure every cached line is in `new_base..=new_base + MAX_KEY`.
     fn rekey(&mut self, new_base: usize) {
         let up = new_base < self.key_base;
         let by = if up {
@@ -636,8 +616,6 @@ impl SearchIndex {
         self.key_base = new_base;
     }
 
-    /// Evict every cached line below `floor` (the moving window's oldest
-    /// line), reporting it as an eviction.
     fn evict_below_window(&mut self, floor: usize) -> Option<usize> {
         let before = self.lines.len();
         let mut oldest: Option<usize> = None;
@@ -661,8 +639,6 @@ impl SearchIndex {
         oldest
     }
 
-    /// Record that lines below `floor` are not in the index because they
-    /// fell outside the key window: results are incomplete below it.
     fn note_window_eviction(&mut self, floor: usize) {
         self.first_cached_line = self.first_cached_line.max(floor);
         self.lowest_retained_line = self.lowest_retained_line.max(floor);
@@ -677,9 +653,6 @@ impl SearchIndex {
         }
     }
 
-    /// The full trigram set `text` contributes to the posting maps: the original-case
-    /// windows plus the lowered pass exactly when [`lower_need`] says the insert path
-    /// ran it, which keeps insert, remove and rebuild symmetric.
     fn posting_trigram_set(&mut self, text: &str) -> FxHashSet<[u8; 3]> {
         let bytes = text.as_bytes();
         let mut set: FxHashSet<[u8; 3]> =
@@ -708,8 +681,6 @@ impl SearchIndex {
         set
     }
 
-    /// Posting and bloom maintenance for a row whose text changed: touch only the
-    /// trigrams whose membership changes.
     fn reindex_changed_row_postings(&mut self, key: u32, old_text: &str, text: &str) {
         let old_set = self.posting_trigram_set(old_text);
         let bytes = text.as_bytes();
@@ -759,9 +730,6 @@ impl SearchIndex {
         }
     }
 
-    /// Evict the oldest quarter of cached lines once capacity is exceeded. Sorts the
-    /// cached line numbers (O(n log n)), so gaps in sparse numbering (visible content
-    /// at line 50000 after scrollback 0-99) cost nothing.
     fn evict_oldest_lines(&mut self) {
         let target =
             self.max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
@@ -809,9 +777,6 @@ impl SearchIndex {
         self.rebuild_bloom();
     }
 
-    /// Rebuild from distinct live trigram keys. Walking cached rows would count
-    /// every repeated window and inflate both work and allocation by retained
-    /// history length, even when a whole build log repeats the same vocabulary.
     fn rebuild_bloom(&mut self) {
         let capacity = self.trigrams.len().max(1000);
         self.bloom = if capacity > BloomFilter::MAX_EFFECTIVE_CAPACITY {
@@ -854,7 +819,6 @@ impl SearchIndex {
         Some(intersect_posting_lists(&posting_lists))
     }
 
-    /// Borrow the posting list for each trigram in `query`.
     fn posting_lists(&self, query: &str) -> Option<Vec<&SparseBitmap>> {
         let mut posting_lists = Vec::new();
         for window in query.as_bytes().windows(3) {
@@ -868,7 +832,6 @@ impl SearchIndex {
         Some(posting_lists)
     }
 
-    /// Build a lazy ascending candidate source for a literal query.
     fn literal_candidates_forward(&self, lower_query: &str, from_line: usize) -> CandidateSource {
         if lower_query.is_empty() || self.lines.is_empty() {
             return CandidateSource::empty();
@@ -887,7 +850,6 @@ impl SearchIndex {
         self.postings_forward(postings, first)
     }
 
-    /// Build a lazy descending candidate source for a folded literal query.
     fn literal_candidates_backward(
         &self,
         lower_query: &str,
@@ -936,7 +898,6 @@ impl SearchIndex {
 
     /// Verified matches of `query` with column positions, at most [`MAX_SEARCH_MATCHES`].
     pub fn search_with_positions(&self, query: &str) -> Vec<SearchMatch> {
-        // Empty query returns no matches (prevents infinite loop in find)
         if query.is_empty() {
             return Vec::new();
         }
@@ -1045,7 +1006,7 @@ impl SearchIndex {
         self.eviction_occurred = true;
     }
 
-    /// Drop cached absolute rows below `first_retained_line` without recording an eviction: the complete-retention twin of `retain_history_from`.
+    /// Drop cached absolute rows below `first_retained_line` without recording an eviction.
     pub fn drop_history_below(&mut self, first_retained_line: usize) {
         let old_first = self.first_cached_line.min(first_retained_line);
         if first_retained_line <= old_first {
@@ -1081,14 +1042,14 @@ impl SearchIndex {
         self.max_cached_lines
     }
 
-    /// The oldest line number still retained: 0 until eviction, then the lowest line that can still match.
+    /// Oldest line number still retained (`0` until eviction).
     #[inline]
     #[must_use]
     pub const fn lowest_retained_line(&self) -> usize {
         self.lowest_retained_line
     }
 
-    /// Whether search results may be incomplete due to eviction: once the oldest lines were dropped, matches below [`lowest_retained_line`](Self::lowest_retained_line) are absent.
+    /// Whether search results may be incomplete because older lines were evicted.
     #[inline]
     #[must_use]
     pub const fn results_may_be_incomplete(&self) -> bool {
@@ -1168,8 +1129,6 @@ impl SearchIndex {
     }
 }
 
-/// Maximum regex pattern length in bytes; longer patterns are refused before
-/// compiling, to bound CPU cost.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`: 128 KiB, 2,048 instructions at `aterm-regex`'s 64 bytes per instruction, well below the engine's 10 MiB default.
@@ -1205,12 +1164,12 @@ pub(crate) fn scan_line<'r, 't>(
     re.find_iter_with_limit(text, regex_line_budget(text.len()))
 }
 
-/// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward batch results plus the occurrence-line frame that seeds the next narrowing step.
+/// Result of one [`SearchIndex::search_literal_narrowed`] step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarrowedSearch {
-    /// Batch results, ascending — identical to the forward batch path over the same candidate universe (see the method docs).
+    /// Forward batch results over the candidate set.
     pub results: SearchResults,
-    /// Ascending retained lines whose text contains the query at the fold level: a superset of the match lines (zero-width occurrences count).
+    /// Ascending retained lines containing the query at the fold level.
     pub occurrence_lines: Option<LineFrame>,
 }
 
@@ -1222,7 +1181,7 @@ pub enum SearchOptionsError {
     InvalidRegex(String),
     /// The regex pattern exceeds the maximum allowed length.
     PatternTooLong,
-    /// A point search (find next / previous) found no match, but its regex scan could not finish some line within the line's scan budget, so "no match" is not established: the rest of that line may hold one.
+    /// A point search found no match before a line exhausted its regex scan budget.
     ScanCutShort,
 }
 
@@ -1282,8 +1241,6 @@ impl SearchIndex {
         Ok(matches)
     }
 
-    /// One batch query's matches, in ascending coordinate order, and how many
-    /// lines its regex scan could not finish (always 0 for a literal query).
     fn search_matches(
         &self,
         query: &str,
@@ -1319,7 +1276,7 @@ impl SearchIndex {
         Ok((self.search_case_insensitive(query, direction), 0))
     }
 
-    /// Forward search with options, returning the matches with the eviction signal ([`results_may_be_incomplete`], [`lowest_retained_line`]) so a truncated result is never read as exhaustive.
+    /// Forward search with options, including eviction completeness metadata.
     pub fn search_results_opts(
         &self,
         query: &str,
@@ -1355,9 +1312,6 @@ impl SearchIndex {
         ))
     }
 
-    /// Regex search across all cached lines: the matches, and how many lines
-    /// the scan could not finish within their budget ([`scan_line`]), a line
-    /// whose text stops short of its end left out (it is counted as such).
     fn search_regex(
         &self,
         query: &str,
@@ -1436,7 +1390,6 @@ impl SearchIndex {
         Ok((matches, cut_short))
     }
 
-    /// Case-insensitive literal search across all cached lines.
     fn search_case_insensitive(&self, query: &str, direction: SearchDirection) -> Vec<SearchMatch> {
         let mut matcher = CaseInsensitiveMatcher::new(query);
         if matcher.is_empty() {
@@ -1510,7 +1463,7 @@ impl SearchIndex {
         matches
     }
 
-    /// Cheap upper bound on how many candidate lines this index's own machinery would visit for a literal `query`: the number a narrowing frame has to beat.
+    /// Upper bound on candidate lines this index would visit for a literal `query`.
     #[must_use]
     pub fn literal_candidate_bound(&self, query: &str, case_sensitive: bool) -> Option<u64> {
         let folded;
@@ -1521,7 +1474,6 @@ impl SearchIndex {
             folded.as_str()
         };
         if effective.len() < 3 {
-            // Range scan over every retained line: no selectivity to offer.
             return None;
         }
         if self.lines.is_empty() || !self.might_contain(effective) {
@@ -1539,7 +1491,7 @@ impl SearchIndex {
         )
     }
 
-    /// One incremental-search narrowing step: the forward literal batch walk over an optional explicit candidate-line list, returning the batch results plus the fold-level occurrence lines that seed the next step.
+    /// Run one incremental-search narrowing step over an optional candidate-line list.
     pub fn search_literal_narrowed(
         &self,
         query: &str,
@@ -1557,8 +1509,6 @@ impl SearchIndex {
             };
         }
 
-        /// Either the engine's candidate machinery or an explicit frame —
-        /// both yield ascending, deduplicated retained line numbers.
         enum Candidates<I: Iterator<Item = usize>> {
             Engine(CandidateSource),
             Frame(I),
@@ -1673,10 +1623,6 @@ impl SearchIndex {
         Self::point_answer(found, cut_short)
     }
 
-    /// A point walk's answer. A match it found stands: it is the nearest one
-    /// in the parts of lines the scan could read, and the batch results have
-    /// already reported the rest of any line it could not finish
-    /// ([`SearchResults::cut_short_lines`]).
     fn point_answer(
         found: Option<SearchMatch>,
         cut_short: bool,
@@ -1725,9 +1671,6 @@ impl SearchIndex {
         Self::point_answer(wrapped, cut_short || wrap_cut_short)
     }
 
-    /// The nearest regex match from the anchor in `direction`, and whether the
-    /// walk passed a line its scan could not finish ([`scan_line`]) — whose
-    /// unread rest it treats as unsearched, as the batch results do.
     fn find_compiled_regex_from(
         &self,
         re: &aterm_regex::Regex,
@@ -1927,8 +1870,6 @@ impl SearchIndex {
                     found = Some(candidate);
                     true
                 } else {
-                    // Matches are ascending within the line. Once the boundary
-                    // is reached, no later match on this line can qualify.
                     false
                 }
             });
@@ -1956,8 +1897,6 @@ mod index_bloom_tests;
 mod regex_scan_budget_tests {
     use super::*;
 
-    /// 13 bytes, 2,042 instructions (inside the 128 KiB ceiling), ~16.7M work units to
-    /// cross one 4,096-column line.
     const EXPENSIVE: &str = "(?:x?){1020}z";
 
     fn index_with_a_wide_line() -> SearchIndex {
@@ -1968,10 +1907,6 @@ mod regex_scan_budget_tests {
         index
     }
 
-    /// A pattern too expensive to finish a line is never answered with a list that
-    /// reads as complete: the batch result counts the lines it could not finish and
-    /// keeps every other line's matches, the matches-only API refuses, and point
-    /// navigation that found nothing refuses rather than report "no match".
     #[test]
     fn a_pattern_that_cannot_finish_a_line_is_reported_never_passed_off() {
         let mut index = index_with_a_wide_line();
@@ -2020,9 +1955,6 @@ mod regex_scan_budget_tests {
         );
     }
 
-    /// A line whose text stops short of its end (its reader stopped at a byte bound) is
-    /// counted cut short by every batch query, literal or regex, narrowed or not, and
-    /// once when its regex scan stops too.
     #[test]
     fn a_line_read_short_of_its_end_is_counted_cut_short() {
         let wide = "x".repeat(4096);
@@ -2092,8 +2024,6 @@ mod regex_scan_budget_tests {
         assert_eq!(got.cut_short_lines, 0, "{got:?}");
     }
 
-    /// The per-line budget: a row up to full width keeps `REGEX_STEP_LIMIT`, a longer
-    /// line gets the same rate per byte, and no line gets more than the ceiling.
     #[test]
     fn the_line_budget_scales_with_the_line_under_a_ceiling() {
         assert_eq!(regex_line_budget(0), REGEX_STEP_LIMIT);
@@ -2118,9 +2048,6 @@ mod regex_scan_budget_tests {
         }
     }
 
-    /// Find joins a soft-wrapped run into one line (a minified bundle, a single-line
-    /// JSON reply): an ordinary pattern over it finds every match there and in the
-    /// short lines around it.
     #[test]
     fn ordinary_patterns_over_a_long_joined_line_find_their_matches() {
         let unit = "function a(b){return b+1};var needle_x=[1,2,3];";
@@ -2157,8 +2084,6 @@ mod regex_scan_budget_tests {
         }
     }
 
-    /// The pathological pattern over a line far longer than a row stops at the
-    /// ceiling: the line is counted cut short and the rows after it are still searched.
     #[test]
     fn the_pathological_pattern_over_a_long_line_stops_at_the_ceiling() {
         let long = "x".repeat(4_300_000);

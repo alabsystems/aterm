@@ -2523,6 +2523,57 @@ fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
     assert!(err.contains("`[harness] enabled` reads off"), "{err}");
 }
 
+/// A HAND-RUN `upgrade` ARMS THE TAP BY THE ONE BLOCK (`tap::Armed::arm`): on by default, for
+/// the aterm named and the lone login the store binds the roster's one row to; not where
+/// `usage_tap = false`, nor where the harness is off for Claude Code.
+#[test]
+fn a_hand_run_upgrade_arms_the_tap_by_the_shared_block() {
+    let tmp = tmp_dir("upgrade-tap");
+    let env = env_at(&tmp);
+    let config = env.config.clone().expect("config path");
+    std::fs::write(
+        env.accounts_roster().expect("a roster path"),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+    )
+    .expect("roster");
+    let login = "/s/main.1";
+    let mut logins = accounts::Logins::default();
+    accounts::note_renewed(
+        &mut accounts::State::default(),
+        &mut logins,
+        "main",
+        None,
+        login,
+        None,
+        env.now,
+    );
+    env.accounts_store().save_logins(&logins).expect("logins");
+    let exe = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let armed = |toml: &str| {
+        std::fs::write(&config, toml).expect("write config");
+        let (policy, _) = SupervisorConfig::from_path(Some(config.as_path()));
+        upgrade_opts(&env, "", &policy, || Some(exe.clone()))
+            .expect("opts")
+            .usage_tap
+    };
+    assert_eq!(
+        armed(""),
+        Some(super::super::tap::Armed {
+            exe: exe.clone(),
+            lone_login: Some(login.to_owned()),
+            listed: Vec::new(),
+        }),
+        "the default"
+    );
+    for toml in [
+        "[harness]\nusage_tap = false\n",
+        "[harness]\nenabled = false\n",
+        "[harness.claude]\nenabled = false\n",
+    ] {
+        assert_eq!(armed(toml), None, "{toml}");
+    }
+}
+
 #[test]
 fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
     let tmp = tmp_dir("upgrade-busy");
@@ -5254,16 +5305,17 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     );
     assert_eq!(
         main["windows"][1]["missing"]["reason"],
-        Value::from("usage-tap-off")
+        Value::from("no-reading"),
+        "the tap ships on"
     );
     std::fs::write(
         env.config.as_ref().expect("a config"),
-        "[harness]\nusage_tap = true\n",
+        "[harness]\nusage_tap = false\n",
     )
     .expect("config");
     assert_eq!(
         row(&env)["windows"][1]["missing"]["reason"],
-        Value::from("no-reading")
+        Value::from("usage-tap-off")
     );
     let mut after = env.clone();
     after.now = reset + 60;
@@ -5730,6 +5782,11 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     std::fs::create_dir_all(&qhome).expect("home");
     std::fs::write(qhome.join(".claude.json"), stats_profile()).expect("profile");
     let off = stats_env(&quiet, qhome.join(".claude"), qhome.join(".claude.json"));
+    std::fs::write(
+        off.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = false\n",
+    )
+    .expect("config");
     let doc = stats(&off);
     let windows = &doc["accounts"][0]["windows"];
     for (i, reason) in [
@@ -5741,6 +5798,25 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
             windows[i]["missing"]["reason"],
             Value::from(reason),
             "{windows}"
+        );
+    }
+    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &off);
+    assert!(text.contains("usage_tap = true turns it on"), "{text}");
+    for config in [
+        "[harness]\nenabled = false\n",
+        "[harness.claude]\nenabled = false\n",
+    ] {
+        std::fs::write(off.config.as_ref().expect("a config"), config).expect("config");
+        assert_eq!(
+            stats(&off)["accounts"][0]["windows"][0]["missing"]["reason"],
+            Value::from("usage-tap-off"),
+            "{config}"
+        );
+        let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &off);
+        assert!(
+            text.contains("usage_tap off (the harness is off for Claude Code)")
+                && !text.contains("usage_tap = true turns it on"),
+            "{config}: the key is already on, {text}"
         );
     }
 }
@@ -6100,7 +6176,8 @@ fn a_window_the_tap_never_records_says_so() {
     std::fs::write(&roster, one).expect("roster");
     assert_eq!(reason(&env), Value::from("no-reading"), "one row");
     let two = format!(
-        "{one}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = \"/logins/work\"\n"
+        "{one}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = '{}'\n",
+        tmp.path().join("elsewhere").display()
     );
     std::fs::write(&roster, &two).expect("roster");
     assert_eq!(reason(&env), Value::from("no-reading"), "two rows");
@@ -6202,7 +6279,8 @@ fn under_several_accounts_the_default_homes_profile_keys_no_row() {
     std::fs::write(
         &roster,
         format!(
-            "{own}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = \"/logins/work\"\n"
+            "{own}\n[[account]]\nlabel = \"work\"\nclass = \"shared\"\ndir = '{}'\n",
+            tmp.path().join("elsewhere").display()
         ),
     )
     .expect("roster");
@@ -6486,7 +6564,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases: [(Unused, &[&str]); 5] = [
+    let cases: [(Unused, &[&str]); 6] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
@@ -6516,6 +6594,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
             },
             &["40d", "30d", "verify provision"],
         ),
+        (Unused::GivenUp, &["first-exec"]),
     ];
     for (why, _) in cases {
         assert!(disk_sweep_journal(&state, path, 7, why, false, 1));

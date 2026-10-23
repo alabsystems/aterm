@@ -1172,6 +1172,14 @@ fn reverified_root(
 }
 
 fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
+    if crate::store::held_unproven(build_dir) {
+        let mut msg = build_dir.display().to_string();
+        msg.push_str(
+            " stays in place: a resolve check's child in it never exited on its own, and \
+             macOS may still be assessing that first exec",
+        );
+        return Err(std::io::Error::other(msg));
+    }
     let was_complete = crate::store::build_is_complete(build_dir);
     crate::store::clear_build_ready(build_dir)?;
     if let Some(parent) = build_dir.parent() {
@@ -1199,6 +1207,10 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     }
     if retired && let Some(ref old) = superseded {
         let _ = crate::store::remove_tree(old);
+    }
+    // A spent hold on the tree this swap replaced.
+    if let Some(mark) = crate::store::sidecar_path(build_dir, crate::store::UNPROVEN_SUFFIX) {
+        let _ = std::fs::remove_file(mark);
     }
     Ok(())
 }

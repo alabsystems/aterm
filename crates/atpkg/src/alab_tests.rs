@@ -14,30 +14,27 @@ use crate::sig::testkit;
 const ARM_MAC: &str = "aarch64-apple-darwin";
 pub(crate) const BUILD: u64 = 2_026_101_601;
 
-/// Write `root` as a Codex package.
+/// Write `root` as a Codex package whose entrypoint is `bin/codex`.
 fn package(root: &Path, version: &str, exe: &[u8], alab: bool) {
+    package_at(root, version, exe, alab, "bin/codex");
+}
+
+/// [`package`] with `entry` its entrypoint ([`host_entry`]: what a shim of codex runs here).
+fn package_at(root: &Path, version: &str, exe: &[u8], alab: bool, entry: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
-    std::fs::write(root.join("bin/codex"), exe).unwrap();
+    std::fs::write(root.join(entry), exe).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(
-            root.join("bin/codex"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(root.join(entry), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::fs::write(root.join(PACKAGE_JSON), package_json(version)).unwrap();
+    std::fs::write(root.join(PACKAGE_JSON), package_json_naming(version, entry)).unwrap();
     if alab {
         std::fs::write(root.join(ALAB_BUILD_JSON), br#"{"source":"0"}"#).unwrap();
     }
 }
 
-fn package_json(version: &str) -> String {
-    package_json_naming(version, "bin/codex")
-}
-
-/// [`package_json`] with `entry` its entrypoint.
+/// A Codex package's manifest, `entry` its entrypoint.
 fn package_json_naming(version: &str, entry: &str) -> String {
     format!(
         r#"{{"layoutVersion":1,"version":"{version}","target":"aarch64-apple-darwin","entrypoint":"{entry}"}}"#
@@ -56,7 +53,13 @@ fn store_build(l: &Layout, build: u64, alab: bool) -> PathBuf {
 
 fn store_build_with(l: &Layout, build: u64, alab: bool, exe: &[u8]) -> PathBuf {
     let dir = l.build_dir("codex", build);
-    package(&dir, &format!("0.164.0-dev.{build}+gabc"), exe, alab);
+    package_at(
+        &dir,
+        &format!("0.164.0-dev.{build}+gabc"),
+        exe,
+        alab,
+        &host_entry(),
+    );
     crate::store::mark_build_ready(&dir).unwrap();
     crate::activate::activate_build(l, &dir).unwrap();
     crate::activate::install_shims(l, &dir, &["codex".to_string()], crate::Aliases::Off).unwrap();
@@ -1402,7 +1405,13 @@ fn the_producer_refuses_a_pairing_no_client_reads() {
         ),
     ] {
         let root = d.join(label.replace(' ', "-"));
-        package(&root, "0.164.0-dev.1+gabc", &signed_exe(), true);
+        package_at(
+            &root,
+            "0.164.0-dev.1+gabc",
+            &signed_exe(),
+            true,
+            &host_entry(),
+        );
         std::fs::write(root.join(ALAB_BUILD_JSON), &record).unwrap();
         match crate::install::check_alab_pack(&root, &exposes) {
             Ok(()) => assert!(!refused, "{label}: the producer passed {record}"),

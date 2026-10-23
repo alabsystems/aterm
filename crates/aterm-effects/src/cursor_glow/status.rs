@@ -641,10 +641,17 @@ impl CursorGlow {
     }
 
     /// Probed text spans for the cursor's row and its flanking rows.
-    pub(super) fn probed_text_spans(&self) -> TextSpans {
+    #[inline]
+    pub(super) const fn probed_text_spans(&self) -> TextSpans {
+        self.probed_spans
+    }
+
+    /// Recompute [`Self::probed_spans`] after rotating or lifting the previous row probe.
+    pub(super) fn refresh_probed_text_spans(&mut self) {
         let mut spans = TextSpans::default();
         let Some(m) = self.row_prev_meta.as_ref() else {
-            return spans;
+            self.probed_spans = spans;
+            return;
         };
         let row = i32::from(m.row);
         let rows: [(i32, Option<&[char]>); 3] = [
@@ -667,7 +674,7 @@ impl CursorGlow {
                 *slot = Some((r, first as i32, (first + rel_last) as i32 + 1));
             }
         }
-        spans
+        self.probed_spans = spans;
     }
 
     /// This frame's radial light halos.

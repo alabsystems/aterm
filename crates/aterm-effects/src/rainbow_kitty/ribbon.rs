@@ -834,6 +834,9 @@ impl FieldIndex {
 
     #[inline]
     fn lane_mut(&mut self, row: u16) -> &mut FieldLane {
+        if self.lanes.last().is_some_and(|l| l.row == row) {
+            return self.lanes.last_mut().expect("just checked");
+        }
         if let Some(i) = self.lanes.iter().position(|l| l.row == row) {
             return &mut self.lanes[i];
         }
@@ -1205,17 +1208,25 @@ fn dark_bed_max_lut() -> &'static [u32; BED_INK_LUT_LEN] {
 
 #[inline]
 fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]> {
-    static DARK_SEEN_COMMON_LUT: std::sync::OnceLock<[(u32, [f32; BED_INK_LUT_LEN]); 3]> =
+    static DARK_SEEN_COMMON_LUT: std::sync::OnceLock<[(u32, [f32; BED_INK_LUT_LEN]); 5]> =
         std::sync::OnceLock::new();
     let bg = bg & 0x00FF_FFFF;
-    if !matches!(bg, 0x0000_0000 | 0x0016_161C | 0x001A_1B26) {
+    if !matches!(
+        bg,
+        0x0000_0000 | 0x0010_1016 | 0x0011_1318 | 0x0016_161C | 0x001A_1B26
+    ) {
         return None;
     }
     let table = DARK_SEEN_COMMON_LUT.get_or_init(|| {
-        let beds: [u32; BED_INK_LUT_LEN] =
-            std::array::from_fn(|i| bed_ink(walk_arc_at(i), BED_LUMA_MAX));
-        [0x0000_0000, 0x0016_161C, 0x001A_1B26]
-            .map(|g| (g, std::array::from_fn(|i| seen_floor(beds[i], g))))
+        let beds = dark_bed_max_lut();
+        [
+            0x0000_0000,
+            0x0010_1016,
+            0x0011_1318,
+            0x0016_161C,
+            0x001A_1B26,
+        ]
+        .map(|g| (g, std::array::from_fn(|i| seen_floor(beds[i], g))))
     });
     table.iter().find(|&&(g, _)| g == bg).map(|(_, lut)| lut)
 }
@@ -1926,7 +1937,7 @@ impl Ribbon {
         }
         match *ev {
             Event::Typed { cells, class, .. } => {
-                // Distinct branch.
+                // A key typed while the focus ember burns clears it, as a focus regain does.
                 if self.ember_at.is_some() {
                     self.regain_focus(at);
                 }
@@ -2267,10 +2278,12 @@ impl Ribbon {
         let held_by = |i: usize, c: &Cohort| {
             !c.abandoned && c.phrase == open && (c.row == hand_row || laid_into == Some(i))
         };
-        let mut any_held = false;
+        let mut held_count = 0usize;
+        let mut single_held_id = 0u32;
         for (i, coh) in self.cohorts.iter_mut().enumerate() {
             if held_by(i, coh) {
-                any_held = true;
+                held_count += 1;
+                single_held_id = coh.id;
                 coh.alive_at = coh.alive_at.max(at);
                 coh.phase = Phase::Laying;
                 coh.retract_col = None;
@@ -2280,17 +2293,35 @@ impl Ribbon {
                 }
             }
         }
-        if !any_held {
+        if held_count == 0 {
+            return;
+        }
+        if held_count == 1 {
+            for cell in &mut self.cells {
+                if cell.cohort == single_held_id && cell.life_s < floor {
+                    cell.life_s = floor;
+                }
+            }
             return;
         }
         let cohorts = &self.cohorts;
+        let mut cached_coh: Option<(u32, bool)> = None;
         for cell in &mut self.cells {
-            if cell.life_s < floor
-                && cohorts
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| c.id == cell.cohort && held_by(i, c))
-            {
+            if cell.life_s >= floor {
+                continue;
+            }
+            let held = match cached_coh {
+                Some((id, h)) if id == cell.cohort => h,
+                _ => {
+                    let h = cohorts
+                        .iter()
+                        .enumerate()
+                        .any(|(i, c)| c.id == cell.cohort && held_by(i, c));
+                    cached_coh = Some((cell.cohort, h));
+                    h
+                }
+            };
+            if held {
                 cell.life_s = floor;
             }
         }
@@ -3984,19 +4015,22 @@ impl Ribbon {
     }
 
     fn heal_seams(&mut self) {
+        if self.cohorts.len() < 2 {
+            return;
+        }
         let mut i = 0;
         while i < self.cohorts.len() {
             let a = self.cohorts[i];
             let hot =
                 |c: &Cohort| !c.wake && !c.abandoned && c.retract_col.is_none() && c.flow.is_none();
-            if !hot(&a) || !self.stands(&a) {
+            if !hot(&a) {
                 i += 1;
                 continue;
             }
             let next = self.cohorts.iter().position(|b| {
                 b.id != a.id && b.row == a.row && b.col0 == a.col1 && hot(b) && self.stands(b)
             });
-            let Some(j) = next else {
+            let Some(j) = next.filter(|_| self.stands(&a)) else {
                 i += 1;
                 continue;
             };
@@ -4076,6 +4110,9 @@ impl Ribbon {
     }
 
     fn advance_swoosh(&mut self, ctx: &Ctx<'_>) {
+        if self.cohorts.is_empty() {
+            return;
+        }
         let now = ctx.now;
         let mut reach = [(0u16, 0u16, 0u32); REACH_STAGE];
         let mut n_reach = 0usize;
@@ -4169,6 +4206,13 @@ impl Ribbon {
     }
 
     fn retire(&mut self, ctx: &Ctx<'_>) {
+        if self.cells.is_empty()
+            && self.cohorts.is_empty()
+            && self.ember_at.is_none()
+            && self.curtain.is_none()
+        {
+            return;
+        }
         let now = ctx.now;
         let ember_done = self
             .ember_at
@@ -4184,9 +4228,18 @@ impl Ribbon {
             return;
         }
         let cohorts = &self.cohorts;
+        let mut cached_coh: Option<(Cohort, bool)> = None;
         self.cells.retain(|cell| {
-            let Some(coh) = cohorts.iter().find(|c| c.id == cell.cohort) else {
-                return false;
+            let (coh, phase_live) = match cached_coh {
+                Some((c, live)) if c.id == cell.cohort => (c, live),
+                _ => {
+                    let Some(&c) = cohorts.iter().find(|c| c.id == cell.cohort) else {
+                        return false;
+                    };
+                    let live = c.phase_at(c.idle_s(now)).is_some();
+                    cached_coh = Some((c, live));
+                    (c, live)
+                }
             };
             if coh.flow.is_none()
                 && now
@@ -4209,44 +4262,53 @@ impl Ribbon {
             {
                 return false;
             }
-            coh.phase_at(coh.idle_s(now)).is_some()
+            phase_live
         });
         let cells = &self.cells;
-        if let Some(gone) = freshest(
-            self.cohorts
-                .iter()
-                .filter(|coh| !cells.iter().any(|c| c.cohort == coh.id)),
-        ) {
+        let mut gone_freshest: Option<Cohort> = None;
+        self.cohorts.retain_mut(|coh| {
+            let resident = if coh.flow.is_none() {
+                cells.iter().any(|cell| cell.cohort == coh.id)
+            } else {
+                let (resident, lo, hi) = cells.iter().filter(|cell| cell.cohort == coh.id).fold(
+                    (false, u16::MAX, 0u16),
+                    |(_, lo, hi), cell| {
+                        if cell.leaving() {
+                            (true, lo, hi)
+                        } else {
+                            (true, lo.min(cell.col), hi.max(cell.col))
+                        }
+                    },
+                );
+                if lo <= hi
+                    && let Some(edge) = &mut coh.retract_col
+                {
+                    *edge = (*edge).clamp(lo, hi);
+                    coh.flow_drift = coh
+                        .flow_drift
+                        .min(FLOW_DRIFT_MAX_SHARE * (f32::from(hi - lo) + 1.0));
+                }
+                resident
+            };
+            if !resident {
+                let fresher = gone_freshest.is_none_or(|a| {
+                    coh.alive_at
+                        .cmp(&a.alive_at)
+                        .then_with(|| coh.walk_d(coh.col1).total_cmp(&a.walk_d(a.col1)))
+                        .is_ge()
+                });
+                if fresher {
+                    gone_freshest = Some(*coh);
+                }
+            }
+            resident
+        });
+        if let Some(gone) = gone_freshest {
             self.last_walk = Some(LastWalk {
                 end: gone.walk_at(gone.col1),
                 alive_at: gone.alive_at,
             });
         }
-        self.cohorts.retain_mut(|coh| {
-            if coh.flow.is_none() {
-                return cells.iter().any(|cell| cell.cohort == coh.id);
-            }
-            let (resident, lo, hi) = cells.iter().filter(|cell| cell.cohort == coh.id).fold(
-                (false, u16::MAX, 0u16),
-                |(_, lo, hi), cell| {
-                    if cell.leaving() {
-                        (true, lo, hi)
-                    } else {
-                        (true, lo.min(cell.col), hi.max(cell.col))
-                    }
-                },
-            );
-            if lo > hi {
-                return resident;
-            }
-            if let Some(edge) = &mut coh.retract_col {
-                *edge = (*edge).clamp(lo, hi);
-                coh.flow_drift = coh
-                    .flow_drift
-                    .min(FLOW_DRIFT_MAX_SHARE * (f32::from(hi - lo) + 1.0));
-            }
-            true
-        });
     }
 
     fn build(&mut self, ctx: &Ctx<'_>) {
@@ -4302,13 +4364,13 @@ impl Ribbon {
                 .then(rank(a.2).cmp(&rank(b.2)))
                 .then(b.2.cmp(&a.2))
         });
+        sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         for &(row, col, idx) in &sorted {
             let Some(cell) = self.cells.get(idx as usize) else {
                 continue;
             };
             self.index.set(row, col, cell.t);
         }
-        sorted.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         self.slabs = Self::slabs_for(ctx, sorted.len());
         self.build_runs(ctx, &sorted);
         self.sorted = sorted;
@@ -5143,6 +5205,9 @@ impl Ribbon {
     }
 
     fn emit_hot_edge(&self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
+        if !ctx.cfg.dark_theme || ctx.cfg.reduced_motion {
+            return;
+        }
         let Some(run) = self.runs.first() else {
             return;
         };
@@ -5161,8 +5226,11 @@ impl Ribbon {
         else {
             return;
         };
-        let gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp, head_cell.typing)
-            * self.env_of(ctx, head_cell);
+        let base_gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp, head_cell.typing);
+        if base_gain <= 0.0 {
+            return;
+        }
+        let gain = base_gain * self.env_of(ctx, head_cell);
         if gain <= 0.0 {
             return;
         }
@@ -5242,6 +5310,9 @@ impl Ribbon {
     #[inline]
     #[must_use]
     pub fn field_at_caret(&self) -> f32 {
+        if self.cells.is_empty() {
+            return 0.0;
+        }
         if let Some(t) = self.caret.and_then(|(row, col)| self.field_at(row, col)) {
             return t;
         }
@@ -5367,6 +5438,13 @@ impl Ribbon {
     /// The cadence law.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.cells.is_empty()
+            && self.cohorts.is_empty()
+            && self.ember_at.is_none()
+            && self.curtain.is_none()
+        {
+            return None;
+        }
         let mut cad = Cadence::at(now);
         if self.brisk(now) {
             cad.brisk();
@@ -5378,8 +5456,16 @@ impl Ribbon {
         let ember_left = self.ember_at.map(|at| FOCUS_EMBER_S - since(at));
         let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
         let ember_spend = ember_u.map(spend);
+        let mut cached_coh: Option<(u32, Option<Cohort>)> = None;
         for cell in &self.cells {
-            let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
+            let coh = match cached_coh {
+                Some((id, c)) if id == cell.cohort => c,
+                _ => {
+                    let c = self.cohorts.iter().find(|c| c.id == cell.cohort).copied();
+                    cached_coh = Some((cell.cohort, c));
+                    c
+                }
+            };
             let age = since(coh.map_or(cell.born, |c| cell.born.max(c.alive_at)));
             let life = cell.life_s.max(1e-3);
             let flowing = coh.is_some_and(|c| c.flow.is_some());

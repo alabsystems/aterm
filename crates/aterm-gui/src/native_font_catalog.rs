@@ -11,13 +11,13 @@ use crate::app_config::{Config, ConfigAssetCatalog, FontConfig};
 use crate::native_config_service::ConfigDiskObservation;
 use crate::{Wake, effective_font_family};
 
-/// How the worker's refusal of the configured `font_family` opens — its warning under `config.fonts`.
+/// How the worker's refusal of the configured `font_family` opens.
 pub(crate) const FAMILY_REFUSED: &str = "config font_family:";
 
 /// How the worker's refusal of a font a THEME names opens.
 pub(crate) const THEME_FAMILY_REFUSED: &str = "theme font:";
 
-/// The face the terminal draws now: its file and collection index when it came from one, and its bytes.
+/// The face the terminal draws now.
 #[derive(Clone)]
 pub(crate) struct PrimarySeed {
     pub(crate) face: Option<aterm_render::FaceRef>,
@@ -41,7 +41,7 @@ pub(crate) struct Request {
     pub(crate) reason: crate::app_colorscheme::ThemeChange,
 }
 
-/// One font row whose authored name the terminal could not honour: the setting's key, the name as written, and why.
+/// One font row whose authored name the terminal could not honour.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FontRefusal {
     pub(crate) key: &'static str,
@@ -146,8 +146,6 @@ impl Lane {
             "aterm-font-catalog",
             crate::qos::Role::Background,
             move || {
-                // QoS: a font-picker catalogue scan; the picker shows a spinner meanwhile,
-                // and the terminal is unaffected.
                 worker(rx, proxy);
             },
         )
@@ -670,8 +668,6 @@ mod tests {
         }
     }
 
-    /// A name no resolver finds is refused on its own row: the family row,
-    /// and the emoji row, which used to fail without a word.
     #[test]
     fn an_unknown_font_name_is_refused_on_its_own_row() {
         let completion = prepare(request_with_text(
@@ -712,11 +708,6 @@ mod tests {
         );
     }
 
-    /// A DISPLAY FACE IS A LAYER OVER THE PERSON'S FONT. The prepared
-    /// generation's primary — what sets the grid and what the chrome (Settings
-    /// code text, the palette, the Manual editor) draws in — is the
-    /// `font_family` face with display faces on exactly as with them off, and
-    /// the faces are drawn over it.
     #[test]
     fn a_display_face_is_drawn_over_the_font_family_never_in_its_place() {
         let dir = aterm_tempfile::Builder::new()
@@ -780,9 +771,6 @@ mod tests {
         );
     }
 
-    /// A style row loads the face its name names inside a collection, the
-    /// face nearest the row's style for a whole file, and says when that
-    /// face is of another style.
     #[test]
     fn a_style_row_loads_its_own_face_of_a_collection_and_names_a_wrong_style() {
         let dir = aterm_tempfile::Builder::new()
@@ -863,13 +851,10 @@ mod tests {
         );
     }
 
-    /// A theme file's text: `bg` its background, `extra` more lines.
     fn theme_text(bg: &str, extra: &str) -> String {
         format!("foreground = #e0e0e0\nbackground = {bg}\n{extra}\n")
     }
 
-    /// The `Work` / `Work Day` catalog of one trace generation: colours and
-    /// typography per side.
     fn work_catalog(
         dark: (&str, &str),
         light: (&str, &str),
@@ -885,11 +870,6 @@ mod tests {
 
     const SPLIT: &str = "theme = \"dark:Work,light:Work Day\"\n";
 
-    /// What the `FontThemeGeneration` trace reads back out of a real App: the
-    /// generation bases its setup left behind, the catalogs whose colours name
-    /// a theme generation, and every completion the worker prepared (its
-    /// sequence, assets and side), so the one the config service holds can be
-    /// named.
     struct ThemeTrace {
         /// `themes[1]` is the catalog a theme change admits (its colours are
         /// theme generation 1's).
@@ -957,8 +937,6 @@ mod tests {
             ]))
         }
 
-        /// The worker's half: prepare one request for real, remembering the
-        /// assets and side it carries so a later publication can be named.
         fn complete(&mut self, request: Request) -> Completion {
             let completion = prepare(request);
             self.completed_theme =
@@ -981,9 +959,6 @@ mod tests {
         app.finish_font_catalog_generation(completion);
     }
 
-    /// The guard from before theme generations existed: a completion naming the
-    /// CURRENT config request is current, whatever catalog or side it was
-    /// prepared for — the model's `Buggy = 1` publication of a stale face.
     fn sequence_only_finish(app: &mut crate::App, completion: Completion) {
         if completion.sequence == app.requested_font_catalog_sequence {
             app.finished_font_catalog_sequence = completion.sequence;
@@ -991,8 +966,6 @@ mod tests {
         }
     }
 
-    /// Colours first: the held swap is released and the colours installed
-    /// before the face is re-prepared — the old face drawn in the new colours.
     fn colour_first_finish(app: &mut crate::App, completion: Completion) {
         if let Some(reason) = app.held_theme_change.take() {
             app.install_resolved_colors(reason);
@@ -1000,8 +973,6 @@ mod tests {
         app.finish_font_catalog_generation(completion);
     }
 
-    /// A headless App with the test lane, `catalog` admitted and the split
-    /// config applied through one real font generation.
     fn split_app(
         catalog: &Arc<crate::app_config::ThemeCatalog>,
     ) -> (crate::App, std::sync::mpsc::Receiver<Request>) {
@@ -1019,8 +990,6 @@ mod tests {
         (app, requests)
     }
 
-    /// One checked step: the real state after `action` must be the model's
-    /// one successor; a refusal names the laws the real state breaks.
     fn check_step(
         model: &aterm_spec::derive::Model,
         action: &str,
@@ -1046,9 +1015,6 @@ mod tests {
         Ok(())
     }
 
-    /// Drive the theme-and-flip-during-a-prepare trace on a REAL headless App
-    /// and its real font-catalog worker function, checking every step against
-    /// `model`.
     fn font_theme_trace(
         model: &aterm_spec::derive::Model,
         finish: FinishFn,
@@ -1117,9 +1083,6 @@ mod tests {
         Ok(visited)
     }
 
-    /// The refused-worker branch: a flip that moves the face, on an App whose
-    /// font worker refuses, installs the flip's colours at once and holds
-    /// nothing (a flip is never lost).
     fn refused_worker_trace(
         model: &aterm_spec::derive::Model,
     ) -> Result<std::collections::BTreeSet<aterm_spec::interp::State>, String> {
@@ -1150,14 +1113,6 @@ mod tests {
         Ok(visited)
     }
 
-    /// Tier-1 conformance for `FontThemeGeneration`
-    /// (`aterm_models_misc::font_theme_generation_model`): a theme catalog
-    /// whose typography changes and an OS flip that moves the face, both
-    /// during an in-flight font prepare, driven on a REAL headless App —
-    /// `reload_prepared_config_observation`, `reload_theme_catalog`,
-    /// `sync_app_theme_to_appearance` and `finish_font_catalog_generation` —
-    /// with the worker's real `prepare` between them; and a flip on an App
-    /// whose worker refuses.
     #[test]
     fn overtaking_theme_catalog_conforms_to_font_theme_generation_model() {
         let model = aterm_models_misc::font_theme_generation_model();
@@ -1191,7 +1146,6 @@ mod tests {
         refused_worker_trace(&lost).expect_err("the shipped App never loses a flip");
     }
 
-    /// [`request_with_text`] prepared against `themes`.
     fn request_with_themes(
         sequence: u64,
         text: &str,
@@ -1204,17 +1158,12 @@ mod tests {
         request
     }
 
-    /// One theme file `Studio` with `extra` lines.
     fn studio(extra: &str) -> Arc<crate::app_config::ThemeCatalog> {
         let parsed = aterm_types::scheme::parse_theme_str(&theme_text("#101418", extra))
             .expect("theme parses");
         crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
     }
 
-    /// A theme's `font_family` is the face the worker prepares when the
-    /// config names none (a compiled-in face: no system font involved), and
-    /// a theme's `display:` family is the display LAYER over the default
-    /// font, never the font.
     #[test]
     fn worker_applies_theme_family() {
         let iosevka = aterm_render::bundled::IOSEVKA_ID;
@@ -1247,9 +1196,6 @@ mod tests {
         assert_eq!(fonts.config.display_faces, ["pixel"]);
     }
 
-    /// A theme's family that is not installed takes the default rung — never
-    /// the face loaded before — warns in the theme's words, and is marked as
-    /// the theme's on the row.
     #[test]
     fn theme_refusal_takes_next_rung() {
         let themes = studio("font_family = Zz No Such Font Aterm");
@@ -1301,8 +1247,6 @@ mod tests {
         assert_eq!(mine.font_refusals[0].from_theme, None);
     }
 
-    /// DTP §9.4: a failed slot holds back the whole generation only when the
-    /// person named it and something is loaded in it now.
     #[test]
     fn preserve_cliff_matrix() {
         let symbol = aterm_render::bundled::IOSEVKA_ITALIC_ID;
@@ -1338,8 +1282,6 @@ mod tests {
         }
     }
 
-    /// A completion prepared for the other side re-prepares, as one for an
-    /// older theme catalog does; the same side and catalog publishes.
     #[test]
     fn disposition_appearance() {
         use aterm_types::Appearance::{Dark, Light};
@@ -1357,8 +1299,6 @@ mod tests {
         );
     }
 
-    /// An App on the test lane whose config `text` was applied against
-    /// `themes` through one real generation.
     fn app_with(
         themes: &Arc<crate::app_config::ThemeCatalog>,
         text: &str,
@@ -1373,8 +1313,6 @@ mod tests {
         (app, requests)
     }
 
-    /// A theme's line height reaches the renderer knobs through the config
-    /// apply; a config line height wins.
     #[test]
     fn reload_applies_theme_typography() {
         let (app, _requests) = app_with(&studio("line_height = 1.2"), "theme = \"Studio\"\n");
@@ -1404,9 +1342,6 @@ mod tests {
         );
     }
 
-    /// A catalog reload that moves the face prepares it and HOLDS the colour
-    /// swap until the generation publishes; a standing Settings trial
-    /// survives.
     #[test]
     fn catalog_reload_with_face_change_holds_colours() {
         let (mut app, requests) = app_with(&studio(""), "theme = \"Studio\"\n");
@@ -1464,9 +1399,6 @@ mod tests {
         assert!(app.held_theme_change.is_none());
     }
 
-    /// A flip to a side whose theme names another face prepares it for that
-    /// side and holds the colours; a refused worker installs the colours at
-    /// once (the flip is never lost); equal faces on both sides cost nothing.
     #[test]
     fn os_flip_with_split_typography() {
         let split = |dark: &str, light: &str| work_catalog(("#101418", dark), ("#f4f4f0", light));
@@ -1495,8 +1427,6 @@ mod tests {
         assert_eq!(app.installed_colors.side, aterm_types::Appearance::Light);
     }
 
-    /// A real disconnected work channel cannot leave a phantom pending
-    /// config ticket that holds a later OS-side colour swap indefinitely.
     #[test]
     fn a_refused_font_request_does_not_hold_a_later_theme_swap() {
         let themes = work_catalog(("#101418", "line_height = 1.2"), ("#f4f4f0", ""));
@@ -1542,8 +1472,6 @@ mod tests {
         );
     }
 
-    /// `font_size_scale` multiplies the size the apply derives: a configured
-    /// `font_px` 20 at 1.1 is 22; 1.0 is the identity.
     #[test]
     fn font_size_scale_scales_the_derived_size() {
         let (app, _requests) = app_with(&studio(""), "font_px = 20.0\nfont_size_scale = 1.1\n");
@@ -1558,11 +1486,6 @@ mod tests {
         assert_eq!(app.default_font_size, 20.0);
     }
 
-    /// One font-size unit: on a 2× window the config's `font_px` is px at 1×
-    /// like Settings' slider and the default, so 13 draws at 26 device px, one
-    /// step above the default draws one step above the default's own (macOS:
-    /// 13 at 26 over 12 at 24), and the default named draws exactly what the
-    /// default draws.
     #[test]
     fn a_configured_size_draws_at_the_window_scale() {
         let at_2x = |text: &str| {

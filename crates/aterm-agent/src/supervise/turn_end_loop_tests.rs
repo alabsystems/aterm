@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// Turn-end policy tests over the scripted supervisor loop.
-
 use super::*;
 use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::RepoWork;
@@ -28,10 +26,6 @@ mod seed_matrix;
 #[path = "tap_clock_loop_tests.rs"]
 mod tap_clock_loop;
 
-/// The host's policy, every switch on (`SupervisorConfig::default()`) but
-/// the answers: these scripts end on a request for a decision ([`STOP`]),
-/// which `answer_questions = false` hands to a person, so each shows what the
-/// loop typed before it, and the escalation after.
 fn hosted(max_s: u64) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
@@ -42,8 +36,6 @@ fn hosted(max_s: u64) -> SuperviseOpts {
     }
 }
 
-/// A turn that ended after 12 minutes of work (past `EXCHANGE_WORK`, so a job even where a
-/// person opened it), the worker's last words `said`, at an empty composer in bypass mode.
 fn ended(said: &str) -> Vec<String> {
     let mut r = rows(&[
         &format!("⏺ {said}"),
@@ -55,8 +47,6 @@ fn ended(said: &str) -> Vec<String> {
     r
 }
 
-/// [`ended`] with Claude Code's dim suggestion `keep going` in the composer (the cursor left at
-/// column 2).
 fn suggesting(said: &str) -> Vec<String> {
     let mut r = ended(said);
     let caret = r.iter().position(|row| row == "❯").expect("caret row");
@@ -64,7 +54,6 @@ fn suggesting(said: &str) -> Vec<String> {
     r
 }
 
-/// The worker asks for a decision: the point is escalated, never typed.
 const STOP: &str = "I need your decision on the schema before I go on.";
 
 fn ledger_at(tag: &str) -> (PathBuf, PathBuf) {
@@ -75,8 +64,6 @@ fn ledger_at(tag: &str) -> (PathBuf, PathBuf) {
     (dir, path)
 }
 
-/// A turn ended after work is continued once (guarded `turn`, a `continue@v1` ledger row); the
-/// next, asking for a decision, is escalated.
 #[test]
 fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     let (dir, ledger) = ledger_at("continue");
@@ -142,13 +129,6 @@ fn a_turn_end_after_work_is_continued_once_and_a_stop_phrase_escalates() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// A worker that says it is done gets the done check where `keep going`
-/// would be, and its answer `DONE` is a done claim again: the check is typed
-/// again (Autopilot Cruise), the task never ends, and the journal holds no
-/// `DONE` — nor does Claude Code compacting the idle conversation under the
-/// claim, its own housekeeping and no turn
-/// ([`claude_codes_idle_compaction_is_no_turn`]), the back-off short so that
-/// nothing but the reading holds an act.
 #[test]
 fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
     let (dir, journal) = journal_file("done-check");
@@ -212,11 +192,6 @@ fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A DONE CHECK ANSWERED FASTER THAN ANY READ IS JUDGED AT ITS ANSWER (the
-/// lab's done-check scenario `d1l` on Claude Code 2.1.303): the worker's
-/// every report is the idle line alone, and the check's answer — the same
-/// line, in 41 ms — is drawn under the check's own `❯` row with no busy
-/// screen between.
 #[test]
 fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
     const IDLE: &str = "Both branches have landed and no lander is running.";
@@ -335,14 +310,6 @@ impl IdleHost for TypedRecordHost {
     }
 }
 
-/// THE RECORD TELLS A FAST ANSWER THE SCREEN DOES NOT: the check answered
-/// at once with the idle line again, the screen drawing no prompt row over
-/// it, and the conversation's record ending on the check's own prompt,
-/// recorded since the act and closed in 41 ms — read while the check stands
-/// untaken (`TurnEndState::reads_record`), handed to the policy as the turn
-/// the record ends on (`TurnEndReading::record_turn`): the answer is judged
-/// at that read, with no wait for the act to be taken — a done claim, which
-/// ends nothing (Autopilot Cruise).
 #[test]
 fn the_record_tells_a_check_answered_faster_than_any_read() {
     const IDLE: &str = "Both branches have landed and no lander is running.";
@@ -408,8 +375,6 @@ fn the_record_tells_a_check_answered_faster_than_any_read() {
     }
 }
 
-/// Asserts the request after `write` awaits the worker's reaction for
-/// [`turn_end_loop::REACTION_WAIT`], not a fixed settle.
 fn assert_reaction_awaited(m: &Mock, write: &str) {
     let next = m
         .requests
@@ -424,8 +389,6 @@ fn assert_reaction_awaited(m: &Mock, write: &str) {
     );
 }
 
-/// Accepting the suggestion: `right`, a fresh read, then Enter, each fenced on its read's
-/// generation and guarded on the composer row (`continue-suggestion@v1`, no `turn`).
 #[test]
 fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
     let mut m = Mock::new(vec![
@@ -479,9 +442,6 @@ fn the_workers_suggestion_is_accepted_with_the_accept_key_and_a_fenced_enter() {
     assert!(m.requests.contains(&continue_request("keep going")));
 }
 
-/// The read after the accept key landed between the worker's clear and its redraw
-/// (no caret row) and the loop returned with the suggestion filled: nothing pressed,
-/// nothing journaled, nothing escalated.
 #[test]
 fn a_torn_read_after_the_accept_key_is_read_again() {
     let torn = {
@@ -590,9 +550,6 @@ fn a_torn_read_after_the_accept_key_is_read_again() {
     );
 }
 
-/// A PERSON'S DRAFT OVER A SELECTION DRAWN IN COLOUR ONLY (the review of 's
-/// "no pointer" item): `/config` standing over 2.1.268's slash menu at a turn end, the
-/// text the same whichever entry is selected.
 #[test]
 fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry() {
     use aterm_phase::prompt::fixtures::{
@@ -669,9 +626,6 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry
     }
 }
 
-/// A DRAFT OVER THE `@` MENU'S SELECTION DRAWN IN COLOUR ONLY (dialogs:
-/// no pointer): `read @no` standing over 2.1.268's `@` menu of four files at a turn end, the
-/// text the same whichever entry is selected.
 #[test]
 fn a_draft_over_an_at_menu_is_sent_only_with_no_entry_selected() {
     use aterm_phase::prompt::fixtures::{
@@ -742,9 +696,6 @@ fn a_draft_over_an_at_menu_is_sent_only_with_no_entry_selected() {
     }
 }
 
-/// A DRAFT OVER AN `@` MENU OF ONE ENTRY ON A BUILD WITH NO POINTER (the
-/// item held for the owner, DECIDED: told, never pressed): `see @nort` standing over
-/// 2.1.268's `@` menu of one file (`+ north.rs`) at a turn end.
 #[test]
 fn a_draft_over_an_at_menu_of_one_entry_is_told_not_pressed() {
     use aterm_phase::prompt::fixtures::{
@@ -811,9 +762,6 @@ fn a_draft_over_an_at_menu_of_one_entry_is_told_not_pressed() {
     }
 }
 
-/// THE DRAFT THAT HELD THE POINT, ANSWERED (screens-2, LIVE on Claude Code
-/// 2.1.289 in the real-Claude lab): the `MENU_DIVERTS` badge says "send or clear it and the
-/// session goes on".
 #[test]
 fn a_draft_that_held_the_point_answered_lets_the_session_go_on() {
     use aterm_phase::prompt::fixtures::{AT_MENU_ONE_2_1_268, screen};
@@ -884,9 +832,6 @@ fn a_draft_that_held_the_point_answered_lets_the_session_go_on() {
     }
 }
 
-/// The rows of `fixture` (a composer frame over Claude Code's completion menu) with a turn's
-/// end, the worker's last words `said`, in the two blank rows over the frame (every row index
-/// kept), and the caret row that holds `draft`.
 fn ended_over_menu(fixture: &str, said: &str, draft: &str) -> (Vec<String>, usize) {
     let mut rows = aterm_phase::prompt::fixtures::screen(fixture);
     assert!(rows[3].is_empty() && rows[4].is_empty());
@@ -899,8 +844,6 @@ fn ended_over_menu(fixture: &str, said: &str, draft: &str) -> (Vec<String>, usiz
     (rows, caret)
 }
 
-/// [`ended`] with aterm's own words left part-typed in the composer (a press stopped
-/// part-way: `[aterm harn`), and the caret row.
 fn ended_on_own_words(said: &str) -> (Vec<String>, usize, usize) {
     let mut rows = ended(said);
     let caret = rows.iter().position(|r| r == "❯").expect("the caret row");
@@ -909,7 +852,6 @@ fn ended_on_own_words(said: &str) -> (Vec<String>, usize, usize) {
     (rows, caret, 2 + words.chars().count())
 }
 
-/// The badges the loop raised whose reason holds `reason`.
 fn badges(m: &Mock, reason: &str) -> usize {
     m.requests
         .iter()
@@ -917,7 +859,6 @@ fn badges(m: &Mock, reason: &str) -> usize {
         .count()
 }
 
-/// The `keep going` the loop typed.
 fn kept_going(m: &Mock) -> usize {
     m.requests
         .iter()
@@ -925,11 +866,6 @@ fn kept_going(m: &Mock) -> usize {
         .count()
 }
 
-/// AN OWN-WORDS POINT, ANSWERED: aterm's own words left in the prompt (`OWN_WORDS_STAND`,
-/// "clear them and the session goes on") hold the point as a draft over the completion menu
-/// does ([`a_draft_that_held_the_point_answered_lets_the_session_go_on`]), and are waited on
-/// the same way: the person clears them, the badge comes down and `keep going` is typed
-/// once.
 #[test]
 fn own_words_that_held_the_point_cleared_let_the_session_go_on() {
     let (at_end, caret, col) = ended_on_own_words("Stage 1 is in.");
@@ -972,9 +908,6 @@ fn own_words_that_held_the_point_cleared_let_the_session_go_on() {
     }
 }
 
-/// A QUESTION TOLD OVER A DRAFT is the question's point, not the draft's: the turn ends on a
-/// question the table hands to a person (`answer_questions` off) while a draft stands over
-/// 2.1.268's one-entry `@` menu, or aterm's own words stand.
 #[test]
 fn a_question_told_over_a_draft_is_told_once_when_the_draft_goes() {
     use aterm_phase::prompt::fixtures::AT_MENU_ONE_2_1_268;
@@ -1031,10 +964,6 @@ fn a_question_told_over_a_draft_is_told_once_when_the_draft_goes() {
     }
 }
 
-/// A DRAFT WHOSE CELLS WERE NOT READ, ANSWERED: `and @RE` over 2.1.268's two-entry `@` menu,
-/// drawn in colour only, with the cells the selection is read by unanswered, is neither sent
-/// nor told (`Composer::Unknown`: nothing is done until a read decides it) and holds the
-/// point.
 #[test]
 fn a_draft_whose_cells_were_not_read_cleared_lets_the_session_go_on() {
     use aterm_phase::prompt::fixtures::AT_MENU_PARTIAL_2_1_268;
@@ -1057,9 +986,6 @@ fn a_draft_whose_cells_were_not_read_cleared_lets_the_session_go_on() {
     assert_eq!(kept_going(&m), 1, "{lines:#?}\n{:#?}", m.requests);
 }
 
-/// A MENU DRAFT WHOSE NEXT READ IS UNDECIDED keeps its badge: `see @nort` over the one-entry
-/// `@` menu is told once (`MENU_DIVERTS`); the next read draws a second entry in colour only
-/// with its cells unanswered (`Composer::Unknown`).
 #[test]
 fn a_menu_draft_whose_cells_go_unread_keeps_its_badge() {
     use aterm_phase::prompt::fixtures::AT_MENU_ONE_2_1_268;
@@ -1097,8 +1023,6 @@ fn a_menu_draft_whose_cells_go_unread_keeps_its_badge() {
     );
 }
 
-/// A person's draft whose caret was moved home (←, Home, ctrl-a) sits at
-/// column 2 of the caret row, where the placeholder does too.
 #[test]
 fn an_unknown_composer_is_never_typed_over_or_submitted() {
     let screen = suggesting("Stage 1 is in.");
@@ -1236,10 +1160,6 @@ fn an_unknown_composer_is_never_typed_over_or_submitted() {
     assert!(wrong.is_empty(), "unknown composer caused input: {wrong:?}");
 }
 
-/// A 529 END OF TURN (`API Error: 529 Overloaded` under the last message:
-/// idle to the eye) is waited out — the backoff (50 ms here) journaled as
-/// `WAITING` and waited as the deadline of the loop's own wait, no sleep —
-/// then continued EXACTLY ONCE under `api-retry@v1`; it raises no badge.
 #[test]
 fn a_529_waits_its_backoff_then_continues_exactly_once() {
     let (dir, path) = journal_file("te-529");
@@ -1288,10 +1208,6 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
     assert_eq!(count(&m, "meta set attention"), 1, "{:#?}", m.requests);
 }
 
-/// Owner decision 3, in a loop with no host to relaunch the agent (`drive
-/// watch`, D7): a Fable limit is waited out to its reset, never Claude's own
-/// `/model` (which also saves the person's default), and raises no badge:
-/// the wall is handled, journaled `LIMITED … handled`.
 #[test]
 fn a_fable_limit_with_no_host_to_relaunch_is_waited_out_never_by_model() {
     let (dir, path) = journal_file("te-fable");
@@ -1339,10 +1255,6 @@ fn a_fable_limit_with_no_host_to_relaunch_is_waited_out_never_by_model() {
     assert_eq!(count(&m, "meta set attention"), 0, "{:#?}", m.requests);
 }
 
-/// A context no `/compact` lowers is one `EXCEPTION kind=context` from the third failure, told
-/// to the host once: each later `/compact` reads busy (its spinner), which ends an exception over
-/// a working worker, yet neither ends nor repeats it; `CLEARED` only when a compaction works
-/// (Claude Code 2.1.286's screens).
 #[test]
 fn a_context_no_compact_lowers_is_one_exception_across_the_rungs_until_it_is_lowered() {
     use aterm_phase::prompt::fixtures as fx;
@@ -1422,11 +1334,6 @@ fn a_context_no_compact_lowers_is_one_exception_across_the_rungs_until_it_is_low
     );
 }
 
-/// A LOST LOGIN: `/login` typed under `auth-login@v1`, and no badge beside
-/// it: the owner hears of a lost login only through its notice, which a
-/// point raises where the sign-in stands ([`super::policy::notice`]); a
-/// dialog the person finished before any point read it raises none, and
-/// gets nothing typed.
 #[test]
 fn a_lost_login_types_login_and_raises_no_badge() {
     let (dir, path) = journal_file("te-login");
@@ -1480,8 +1387,6 @@ fn a_lost_login_types_login_and_raises_no_badge() {
     );
 }
 
-/// Claude Code 2.1.281's `/login` method picker under the typed command, no composer
-/// (hand-built from the binary's strings).
 fn login_picker() -> Vec<String> {
     let mut r = login_expired();
     r.truncate(r.len() - 4);
@@ -1502,21 +1407,14 @@ fn login_picker() -> Vec<String> {
     r
 }
 
-/// The `/login` hand-off Claude Code 2.1.303 draws once the browser was
-/// asked to open ([`aterm_phase::prompt::fixtures::LOGIN_HANDOFF`]): the
-/// sign-in is the owner's to finish there.
 fn handoff() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_HANDOFF)
 }
 
-/// The supervisor's `continue` answered by `⏺ Login expired · Please run
-/// /login` ([`aterm_phase::prompt::fixtures::LOGIN_EXPIRED`]).
 fn login_expired() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED)
 }
 
-/// [`login_expired`] once the person's `/login` is done: its command and
-/// Claude Code's `Login successful` under the wall's row.
 fn login_back() -> Vec<String> {
     let mut r = login_expired();
     let at = r
@@ -1530,8 +1428,6 @@ fn login_back() -> Vec<String> {
     r
 }
 
-/// The login wall in the loop: the supervisor's own `continue` answered by
-/// `⏺ Login expired · Please run /login`.
 #[test]
 fn the_login_expired_row_gets_login_once_and_the_login_back_is_continued() {
     let (dir, path) = journal_file("te-login-expired");
@@ -1594,13 +1490,6 @@ fn the_login_expired_row_gets_login_once_and_the_login_back_is_continued() {
     );
 }
 
-/// Never over a person: a session whose program is a shell is never typed
-/// into (the program read fresh before the act, `SKIPPED` journaled); on a
-/// host without the send fence every `turn` carries `yield=0.2`, and a
-/// person typing past the yield (`ERR yield timeout`) is no act and raises
-/// nothing; a guarded submit whose guard missed (`skipped`) is no act (no
-/// `CONTINUED`, no ledger row) and, the text left typed, is escalated, never
-/// left for the next look to read as a person's draft.
 #[test]
 fn a_shell_a_yield_and_a_missed_guard_type_nothing() {
     let (dir, path) = journal_file("te-shell");
@@ -1681,9 +1570,6 @@ fn a_shell_a_yield_and_a_missed_guard_type_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A continuation whose Enter was written but not seen to land (`submitted=0 … pressed=<n>`,
-/// n ≥ 1: a screen that never holds still keeps the `turn`'s echo settle open to its deadline)
-/// is an act typed, journaled unverified: typing it again would double it.
 #[test]
 fn an_enter_written_and_not_seen_is_a_continuation_typed() {
     let timed_out = |pressed: u32| CtlReply {
@@ -1720,10 +1606,6 @@ fn an_enter_written_and_not_seen_is_a_continuation_typed() {
     }
 }
 
-/// Scenario 19: the question in prose follows the session's priority word,
-/// in the loop, over the owner's `answer_questions = false` ([`hosted`])
-/// ("global, and then session"; contract decision 7): the prose path and the
-/// dialog path resolve the same word, so they cannot disagree.
 #[test]
 fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     use crate::supervise::policy::question::{LONG_TERM_TEXT, SHORT_TERM_TEXT};
@@ -1832,15 +1714,11 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     }
 }
 
-/// A question asked in prose.
 const PROSE_ASK: &str = "Should I rewrite the parser or patch the lexer?";
 
-/// The `help` a host with both fences answers (`key` and `send` each name
-/// `if-gen=`), as the Mock serves it for any `help <verb>`.
 const FENCED_HELP: &str = "key [id=<key>] [if=<re>] [if-gen=<e.s>] <name>: send a named key\n\
                            send [id=<key>] [if=<re>] [if-gen=<e.s>] <text>: write text\n";
 
-/// [`ended`] with `text` typed into its composer (the cursor after it).
 fn typed_in(said: &str, text: &str) -> Vec<String> {
     let mut r = ended(said);
     let caret = r.iter().position(|row| row == "❯").expect("caret row");
@@ -1848,11 +1726,6 @@ fn typed_in(said: &str, text: &str) -> Vec<String> {
     r
 }
 
-/// The continuation is never spliced into a draft a person started between
-/// the read and the paste: where the host fences `send`, the text is written
-/// only while the screen is the judged read's (`send if-gen=<g> if=<the
-/// composer row> -- <text>`), and Enter goes, fenced on the read that shows
-/// the composer holding exactly that text, under `continue@v1`, no `turn`.
 #[test]
 fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     for human_seq in [Some(0), Some(3)] {
@@ -1961,34 +1834,11 @@ fn a_fenced_host_writes_the_continuation_only_on_the_judged_screen() {
     );
 }
 
-/// `status` input fields of a worker that has not read the 293 bytes written to it 2.4 s ago (the
-/// live measurement of [`Session::input_unread`]).
 const INPUT_PENDING: &str = "input=pending input_bytes=293 input_wait_ms=2473 fg_rss_mb=-";
-/// The same bytes queued while the worker is busy (`input=typeahead`).
 const INPUT_TYPEAHEAD: &str = "input=typeahead input_bytes=293 input_wait_ms=2473 fg_rss_mb=-";
 
-/// NOTHING IS TYPED BEHIND INPUT THE WORKER HAS NOT READ, OR READ AND NOT DRAWN
-/// ([`Session::input_unread`]). A loop before this one wrote its continuation and was replaced
-/// before the starved worker read it: the `status` read fresh for the act says `input=pending`
-/// (or `typeahead`) for its first reads and then `clear`, the worker having read the bytes.
-///
-/// - THE SCREEN SITS at the seq the queue was unread at (the worker read the bytes and has not
-///   painted them; the composer still empty, so the send's `if-gen=`/`if=` fences would pass)
-///   until something is written: journaled `SKIPPED … (input=pending)`, then `SKIPPED … has
-///   not drawn the input it read`, and nothing is written until
-///   [`turn_end_loop::UNDRAWN_INPUT_HANG`] after the queue was last seen unread, on the run's
-///   clock (the hang detector's end). Before, the first `clear` typed the continuation a second
-///   time on that very screen.
-/// - THE SCREEN MOVES at every read (the worker drew): one continuation once the queue is clear,
-///   and no `not drawn` skip.
-///
-/// NEGATIVE CONTROLS, in both worlds: a worker whose input is clear from the first read is
-/// continued at once, and so is one on a host that does not measure the queue (`input=-`, or no
-/// field at all).
 #[test]
 fn nothing_is_typed_behind_input_the_worker_has_not_read() {
-    // The `status` reads the queue stays unread for: the loop's first, the act's fresh one and
-    // the one deciding it again.
     let held_for = 3;
     struct Ran {
         notes: Vec<String>,
@@ -2013,7 +1863,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             m.input_after = vec![(n, INPUT_CLEAR)];
         }
         if sits {
-            // The turn end sits at its seq until something is written to it.
             m.key_releases = Some(1);
         }
         m.stall_sleep = Some(Duration::from_millis(20));
@@ -2027,7 +1876,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
         let (records, _) = journal_records(&journal);
         let notes = records.into_iter().map(|r| r.line).collect();
         let _ = std::fs::remove_dir_all(&jdir);
-        // The `status` reads served before the continuation's `send`.
         let reads_before_send = m
             .requests
             .iter()
@@ -2075,7 +1923,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     let lines = |r: &Ran| format!("{:#?}\n{:#?}", r.notes, r.requests);
     let held = [(INPUT_PENDING, "pending"), (INPUT_TYPEAHEAD, "typeahead")];
     let controls = [INPUT_CLEAR, "input=- input_bytes=-", ""];
-    // Each run is a mock and a journal of its own: all ten run at once, judged in order below.
     let mut cases = Vec::new();
     for (input, _) in held {
         cases.extend([
@@ -2091,7 +1938,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     })
     .into_iter();
     for (_, word) in held {
-        // THE SCREEN SITS: read, not drawn — held to the hang detector's end.
         let r = ran.next().expect("the run whose screen sits");
         assert!(skipped(&r, &unread(word)), "{word}: {}", lines(&r));
         assert!(
@@ -2104,8 +1950,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             "{word}: one continuation: {}",
             lines(&r)
         );
-        // The loop counts the hang from the decision that found the queue unread, which can
-        // come a step before the last `status` the worker answered unread: a second's slack.
         assert!(
             r.sent_after_unread
                 .is_some_and(|d| d + Duration::from_secs(1) >= turn_end_loop::UNDRAWN_INPUT_HANG),
@@ -2113,7 +1957,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             r.sent_after_unread,
             lines(&r)
         );
-        // THE SCREEN MOVES: continued once the queue is clear, with no `not drawn` hold.
         let r = ran.next().expect("the run whose screen moves");
         assert!(skipped(&r, &unread(word)), "{word}: {}", lines(&r));
         assert!(!skipped(&r, &undrawn), "{word}: {}", lines(&r));
@@ -2136,8 +1979,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             lines(&r)
         );
     }
-    // NEGATIVE CONTROLS: nothing unread, or nothing measured — continued at once, whether the
-    // screen sits or moves.
     for input in controls {
         for sits in [true, false] {
             let r = ran.next().expect("a control's run");
@@ -2161,7 +2002,6 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     }
 }
 
-/// agy 1.4.0's end of turn with `text` in its composer (the cursor after it).
 fn agy_typed(text: &str) -> Vec<String> {
     use aterm_phase::agy::fixtures as a;
     let mut rows = aterm_phase::prompt::fixtures::screen(a::END_OF_TURN);
@@ -2170,9 +2010,6 @@ fn agy_typed(text: &str) -> Vec<String> {
     rows
 }
 
-/// What one fenced write of the continuation came to: the requests, the
-/// supervisor's attention, and the run's clock at the write, at each read
-/// and key, and at the escalation.
 struct Typed {
     m: Mock,
     lines: Vec<String>,
@@ -2195,8 +2032,6 @@ impl Typed {
             .collect()
     }
 
-    /// The requests from the write on, up to the first Enter or the
-    /// escalation, whichever came first.
     fn after_send(&self) -> Vec<&String> {
         self.m
             .requests
@@ -2210,8 +2045,6 @@ impl Typed {
             .collect()
     }
 
-    /// The supervisor's attention that left the text typed, as it was set
-    /// (the run unsets its attention when it stops).
     fn left_typed(&self) -> Option<&str> {
         self.m
             .requests
@@ -2220,7 +2053,6 @@ impl Typed {
             .find(|a| a.contains("(typed, not submitted ("))
     }
 
-    /// When the script's screen `index` was first read, on the run's clock.
     fn first_read_of(&self, index: usize) -> Option<Instant> {
         self.m
             .read_times
@@ -2245,10 +2077,6 @@ impl Typed {
     }
 }
 
-/// One turn end continued by a fenced write over `screens`: the script's third
-/// screen (index 2) is the first read after the write. `hold` keeps that
-/// screen up until a key is pressed (the echo sits); `program` names the
-/// reader; `unsettled` is the `await idle <ms>` that never latches.
 fn fenced_echo(
     screens: Vec<Vec<String>>,
     program: &'static str,
@@ -2265,8 +2093,6 @@ fn fenced_echo(
     })
 }
 
-/// [`fenced_echo`] with the mock as `shape` leaves it (its holds, its
-/// settles, the person, the grids its reads report).
 fn fenced_echo_with(
     screens: Vec<Vec<String>>,
     program: &'static str,
@@ -2281,8 +2107,6 @@ fn fenced_echo_with(
     m.sends_gen = true;
     m.human_seq = Some(0);
     m.help = FENCED_HELP.to_string();
-    // The cursor stands after a typed composer's text (at column 2 it is a
-    // placeholder's, [`aterm_phase::ScreenReader::placeholder`]).
     let cols: Vec<(usize, usize)> = m
         .screens
         .iter()
@@ -2310,23 +2134,6 @@ fn fenced_echo_with(
     Typed { m, lines }
 }
 
-/// THE ECHO OF A FENCED WRITE IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY
-/// A BUDGET ([`Session::await_echo`]). agy 1.4.0 (no paste guard), as `lab
-/// forever` measured it under load (`ie-fb`): the read after the settle shows
-/// the start of the continuation.
-///
-/// - THE ECHO COMES LATE: the first read shows `> keep`, the screen moves on,
-///   the next read shows `> keep going`. One write and one Enter, fenced on
-///   the whole read, and nothing escalated. Before, the first read was
-///   escalated `typed, not submitted (the composer does not show it as
-///   written)`, and the Enter waited for the next point.
-/// - THE ECHO NEVER FINISHES: the composer sits on `> keep`. Nothing is
-///   pressed, and the text is escalated as a hang, no sooner than
-///   [`turn_end_loop::ECHO_HANG`] after the write on the run's clock.
-///
-/// NEGATIVE CONTROLS, escalated at once (the write's reaction wait the only
-/// `await seq` before the escalation): a composer that shows another text
-/// (`> wkeep going`), and a person who keyed since the write.
 #[test]
 fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
     use aterm_phase::agy::fixtures as a;
@@ -2343,7 +2150,6 @@ fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
             .count()
     };
 
-    // THE ECHO COMES LATE.
     let t = fenced_echo(
         vec![
             screen(a::BUSY),
@@ -2377,7 +2183,6 @@ fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
         t.evidence()
     );
 
-    // THE ECHO NEVER FINISHES.
     let t = fenced_echo(
         vec![screen(a::BUSY), screen(a::END_OF_TURN), agy_typed("keep")],
         "agy",
@@ -2405,7 +2210,6 @@ fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
         t.evidence()
     );
 
-    // NEGATIVE CONTROLS: another text; a person's key.
     for (tag, shown, person) in [("other", "wkeep going", 0), ("person", "keep going", 1)] {
         let t = fenced_echo(
             vec![
@@ -2432,19 +2236,6 @@ fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
     }
 }
 
-/// A PASTE-GUARDED ENTER WAITS OUT THE GUARD SINCE THE ECHO WAS WHOLE
-/// ([`Session::await_echo`]). Muse Code 1.4.10 takes an Enter in the same burst
-/// as the text as a newline, as `lab forever` measured it under load
-/// (`ie-fm2` land-h): its `await idle 600` ran out with the nudge just drawn
-/// whole, the Enter went at once and became a newline in the composer.
-///
-/// With the screen never still 600 ms, the Enter goes no sooner than
-/// [`turn_end_loop::PASTE_GUARD_HOLD`] after the first read that showed the text
-/// whole, on the run's clock, and once. Before, it went at that read.
-///
-/// NEGATIVE CONTROLS: a settle that latches (the screen held still 600 ms) lets
-/// the Enter go at the first whole read; agy, which has no paste guard, is
-/// pressed at its first whole read whether or not its settle latched.
 #[test]
 fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
     use aterm_phase::muse::fixtures as u;
@@ -2475,7 +2266,6 @@ fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
             .count()
     };
 
-    // The screen never holds still 600 ms.
     let t = fenced_echo(muse(), "muse", true, Some("600"), 0);
     assert_eq!(
         (t.sends().len(), t.enters().len()),
@@ -2491,7 +2281,6 @@ fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
         t.evidence()
     );
 
-    // NEGATIVE CONTROL: the settle latches.
     let t = fenced_echo(muse(), "muse", true, None, 0);
     assert_eq!(t.enters().len(), 1, "{}", t.evidence());
     assert_eq!(
@@ -2501,7 +2290,6 @@ fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
         t.evidence()
     );
 
-    // NEGATIVE CONTROL: no paste guard.
     use aterm_phase::agy::fixtures as a;
     let t = fenced_echo(
         vec![
@@ -2529,19 +2317,6 @@ fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
     );
 }
 
-/// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A BUDGET
-/// ([`Session::await_accept`]). The worker's suggestion `keep going`, accepted
-/// with `right`, as `supervise_turn_end_live_headless` measured it under load:
-/// the worker takes the key seconds late.
-///
-/// - THE KEY IS TAKEN LATE: two reads after the press still show the
-///   suggestion as a placeholder, the third shows it filled. Nothing is
-///   written: `right`, then Enter fenced on the filled read. Before, the first
-///   read had the words typed behind the key, and the worker took both (`keep
-///   goingkeep going` submitted).
-/// - THE KEY IS NEVER TAKEN (a build without the accept key): the placeholder
-///   stands, and its words are typed once, no sooner than
-///   [`turn_end_loop::ECHO_HANG`] after the press, on the run's clock.
 #[test]
 fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
     let said = "Stage 1 is in.";
@@ -2555,7 +2330,6 @@ fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
             m.screen_cols.insert(at, 12);
         }
         if sits {
-            // The placeholder stands past the accept key.
             m.key_gates = vec![(2, 1)];
         }
         m.vanish_after = Some(2);
@@ -2566,7 +2340,6 @@ fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
         (m, lines, sends, evidence)
     };
 
-    // THE KEY IS TAKEN LATE.
     let (m, lines, sends, evidence) = world(
         vec![
             busy_screen(),
@@ -2596,7 +2369,6 @@ fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
         "{evidence}"
     );
 
-    // THE KEY IS NEVER TAKEN.
     let (m, _, sends, evidence) = world(
         vec![busy_screen(), suggesting(said), suggesting(said)],
         None,
@@ -2618,22 +2390,6 @@ fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
     );
 }
 
-/// A SCREEN THAT HAS NOT MOVED SINCE THE WRITE SAYS NOTHING OF ITS ECHO
-/// ([`Session::await_echo`]). The live suite measured it at load 303: at a
-/// weekly wall's reset the loop wrote `keep going` over the wall's dim
-/// suggestion on a grid whose cursor stood a row below the composer. Claude had
-/// not drawn when the write's reaction wait ran out, and the read showed the
-/// screen as the write found it, the suggestion under a displaced cursor, which
-/// reads as another text.
-///
-/// - THE SCREEN SITS PAST THE REACTION WAIT (15 s after the write, at the
-///   write's seq), then shows the text whole: one write, one Enter fenced on
-///   the read that showed it, nothing escalated. Before, the first read was
-///   escalated `typed, not submitted (the composer does not show it as
-///   written)`.
-/// - NEGATIVE CONTROL: the program draws a new frame that still shows the
-///   suggestion (the screen moved, to another text): escalated at once, the
-///   write's reaction wait the only `await seq` before the escalation.
 #[test]
 fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_text() {
     let world = |unmoved: bool| {
@@ -2679,7 +2435,6 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
             .count()
     };
 
-    // THE SCREEN SITS PAST THE REACTION WAIT.
     let t = world(true);
     assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
     assert!(t.sends()[0].ends_with(" -- keep going"), "{}", t.evidence());
@@ -2700,7 +2455,6 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
         t.evidence()
     );
 
-    // NEGATIVE CONTROL: the screen moved, to another text.
     let t = world(false);
     assert!(t.enters().is_empty(), "{}", t.evidence());
     assert!(
@@ -2712,7 +2466,6 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
     assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
 }
 
-/// Muse Code 1.4.10's end of turn with `text` in its composer.
 fn muse_typed(text: &str) -> Vec<String> {
     use aterm_phase::muse::fixtures as u;
     let mut rows = aterm_phase::prompt::fixtures::screen(u::END_OF_TURN_1_4_10);
@@ -2721,10 +2474,6 @@ fn muse_typed(text: &str) -> Vec<String> {
     rows
 }
 
-/// One turn end of Claude Code continued by a fenced write over `screens`
-/// (the third, index 2, the first read after the write), the cursor after
-/// the typed text on each screen `typed` names, the mock as `shape` leaves
-/// it.
 fn claude_echo(
     screens: Vec<Vec<String>>,
     typed: &[(usize, usize)],
@@ -2748,22 +2497,6 @@ fn claude_echo(
     Typed { m, lines }
 }
 
-/// A FRAME CAUGHT MID-REDRAW, AN EMPTY COMPOSER OR ITS PLACEHOLDER IS AN ECHO
-/// STILL ARRIVING, ON A SCREEN THAT HAS MOVED SINCE THE WRITE ([`echo_of`],
-/// [`Session::await_echo`]). A starved worker clears its composer and draws
-/// it again, and a read can land between. Each read here comes after the
-/// screen moved past the write (its seq later than the write's), so only
-/// what it shows keeps the wait going; the read after it shows the text
-/// whole, and the text is entered once, fenced on that read.
-///
-/// - A TORN FRAME: Muse Code's composer drawn down to its bottom rule, its
-///   footer not yet: no composer reads on it, and its frame reads torn.
-/// - AN EMPTY COMPOSER: Claude Code's composer cleared, the text not drawn.
-/// - ITS PLACEHOLDER: Claude Code's dim suggestion in the composer, the
-///   cursor at its start.
-///
-/// NEGATIVE CONTROL: the moved screen showing another text, typed, is
-/// escalated at once (the write's reaction wait the only `await seq`).
 #[test]
 fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving() {
     use aterm_phase::muse::fixtures as u;
@@ -2785,7 +2518,6 @@ fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving()
         );
     };
 
-    // A TORN FRAME.
     let mut torn = muse_typed("");
     let caret = aterm_phase::muse::composer(&torn).expect("the composer");
     torn.truncate(caret + 2);
@@ -2807,7 +2539,6 @@ fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving()
     );
     entered_once("torn", &t);
 
-    // AN EMPTY COMPOSER; ITS PLACEHOLDER.
     let said = "Fixed the parser; the suite is green.";
     let mut placeholder = ended(said);
     let caret = placeholder
@@ -2830,7 +2561,6 @@ fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving()
         entered_once(tag, &t);
     }
 
-    // NEGATIVE CONTROL: another text, typed, on the moved screen.
     let t = claude_echo(
         vec![
             busy_screen(),
@@ -2860,16 +2590,6 @@ fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving()
     );
 }
 
-/// THE GUARD'S CLOCK STARTS AGAIN AT A WHOLE READ AFTER ONE THAT WAS NOT
-/// ([`Session::await_echo`]). Muse Code draws its composer again while the
-/// screen never holds still 600 ms: a read shows the text whole, the next
-/// only its start, the next whole again. The Enter goes no sooner than
-/// [`turn_end_loop::PASTE_GUARD_HOLD`] after the second whole read, and
-/// once: the first whole read's clock says nothing of a text drawn again
-/// since.
-///
-/// NEGATIVE CONTROL: the text whole at every read, the Enter is fenced on
-/// the read the hold after the first, the next screen.
 #[test]
 fn a_paste_guarded_enter_times_its_hold_from_the_last_whole_read_after_a_redraw() {
     use aterm_phase::muse::fixtures as u;
@@ -2916,7 +2636,6 @@ fn a_paste_guarded_enter_times_its_hold_from_the_last_whole_read_after_a_redraw(
         t.evidence()
     );
 
-    // NEGATIVE CONTROL: whole at every read.
     let t = world(false);
     assert_eq!(t.enters().len(), 1, "{}", t.evidence());
     assert!(
@@ -2927,16 +2646,6 @@ fn a_paste_guarded_enter_times_its_hold_from_the_last_whole_read_after_a_redraw(
     );
 }
 
-/// A SETTLE THAT LATCHED BEFORE THE ECHO'S LAST DRAW IS NO HOLD
-/// ([`Session::await_echo`]). Muse Code's `await idle 600` latched, and the
-/// last of the text was drawn between the latch and the read: the host's
-/// `OK idle <seq>` names a seq before the read's. The Enter goes no sooner
-/// than [`turn_end_loop::PASTE_GUARD_HOLD`] after that read, as after a
-/// settle that ran out. Before, a latched settle let the Enter go at that
-/// read, close behind the keys the program had just drawn.
-///
-/// NEGATIVE CONTROL: a latch on the read's own seq (the screen held still
-/// through the settle and the read) lets the Enter go at that read.
 #[test]
 fn a_settle_that_latched_before_the_echos_last_draw_holds_nothing() {
     use aterm_phase::muse::fixtures as u;
@@ -2982,21 +2691,11 @@ fn a_settle_that_latched_before_the_echos_last_draw_holds_nothing() {
         t.evidence()
     );
 
-    // NEGATIVE CONTROL: the latch is the read's own seq.
     let t = world(false);
     assert_eq!(t.enters().len(), 1, "{}", t.evidence());
     assert_eq!(settles(&t), 1, "entered at that read: {}", t.evidence());
 }
 
-/// ANOTHER GRID IS NO SCREEN UNMOVED SINCE THE WRITE ([`unmoved_since`]). The
-/// worker left for another grid after the write (an alternate screen
-/// entered or left, the program gone back to its shell), and that grid's
-/// content seq restarted below the write's. A read there showing another
-/// text is escalated at once, as the composer showing something else, never
-/// waited on for a minute as the screen the write found.
-///
-/// NEGATIVE CONTROL: the same read on the write's grid, at the write's seq,
-/// is the screen the write found: waited past, and escalated only as a hang.
 #[test]
 fn a_read_on_another_grid_is_never_the_screen_the_write_found() {
     use aterm_phase::agy::fixtures as a;
@@ -3022,8 +2721,6 @@ fn a_read_on_another_grid_is_never_the_screen_the_write_found() {
             .count()
     };
 
-    // Nothing entered before the escalation (the draft left standing is the
-    // loop's to judge again later).
     let entered_first = |t: &Typed| {
         t.after_send()
             .len()
@@ -3047,7 +2744,6 @@ fn a_read_on_another_grid_is_never_the_screen_the_write_found() {
     );
     assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
 
-    // NEGATIVE CONTROL: the write's grid, at the write's seq.
     let t = world((1, 102));
     assert!(!entered_first(&t), "{}", t.evidence());
     assert!(
@@ -3058,18 +2754,6 @@ fn a_read_on_another_grid_is_never_the_screen_the_write_found() {
     );
 }
 
-/// THE HAND OUTLASTS AN ECHO WAITED FOR PAST ITS LEASE ([`Session::keep_hand`]).
-/// The window's host types the continuation under its hard hand, a lease of
-/// [`HAND_TTL_MS`], and the worker draws nothing for 50 s after the write.
-/// The hand is renewed while the echo is waited for: no stretch between two
-/// takes of it, or between the last take and the Enter, is longer than two
-/// renewal periods, so it never lapses before the Enter. Before, it was
-/// taken once, and an echo drawn near the minute had its Enter typed after
-/// the lease ran out, when another connection's keys were no longer refused.
-///
-/// NEGATIVE CONTROL: an echo drawn at once takes the hand once
-/// (`the_windows_host_types_the_fenced_continuation_under_its_hand`), and
-/// with no hand asked for nothing is renewed.
 #[test]
 fn a_hand_held_through_a_slow_echo_is_renewed_before_it_lapses() {
     use crate::harness::upgrade_drive::{HAND_RENEW, HAND_TTL_MS};
@@ -3144,25 +2828,10 @@ fn a_hand_held_through_a_slow_echo_is_renewed_before_it_lapses() {
         "the hand went {longest:?} without a renewal: {evidence}"
     );
 
-    // NEGATIVE CONTROL: no hand asked for, none taken or renewed.
     let (m, evidence) = run(false);
     assert!(m.lease_times.is_empty(), "{evidence}");
 }
 
-/// A TEXT LEFT TYPED ON A SCREEN THAT NEVER MOVED IS NEVER TYPED AGAIN ON IT
-/// ([`Session::type_fenced`], [`Session::input_unread`]). The worker draws
-/// nothing for two minutes after the continuation is written: the echo's
-/// hang detector runs out and the text is escalated `typed, not submitted`.
-/// An act decided again on that same screen (the seq the write found, on
-/// which the write's fences pass again) writes nothing: the text is input the
-/// worker has not drawn, held as unread input is, until the screen moves or
-/// [`turn_end_loop::UNDRAWN_INPUT_HANG`] has passed. Measured (`t4-attr-r1`,
-/// `t4-diag-r3`, the loop before [`Session::await_echo`]): decided again
-/// 0.5 s after the escalation on the same seq, the continuation was typed a
-/// second time, and the worker submitted both as one prompt.
-///
-/// NEGATIVE CONTROL: the echo drawn whole 5 s after the write is entered,
-/// and holds nothing back.
 #[test]
 fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
     let said = "Fixed the parser; the suite is green.";
@@ -3212,28 +2881,14 @@ fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
         "{evidence}"
     );
 
-    // NEGATIVE CONTROL: the echo drawn 5 s on.
     let (typed, held, _, attention, evidence) = act(Duration::from_secs(5));
     assert!(typed, "entered: {evidence}");
     assert!(attention.is_none(), "{evidence}");
     assert!(!held, "nothing held back: {evidence}");
 }
 
-/// A WINDOW HOST'S HOLDER, AS ITS LOOPS ARE NAMED (`aterm-gui`'s
-/// `harness_host::holder`, its hand name), and no pid of this test process:
-/// a loop takes its hand under its own setup's holder, never this process's
-/// pid read again, so a replay of its tape in another process asks as the
-/// recorded run did.
 const HAND_HOLDER: &str = "aterm-harness@1";
 
-/// THE WINDOW'S HOST TYPES THE CONTINUATION UNDER ITS OWN HAND
-/// ([`Session::type_under_hand`]): the hand taken under the loop's holder
-/// ([`HAND_HOLDER`]) with an acquire kept to the loop's connection
-/// (`upgrade_drive::hand_take_here_request_as`: the upgrade's hand request,
-/// `here`), the fenced `send` and its `key enter`
-/// exactly as without it, and the hand given back the same way — so the
-/// server records the text as the harness's turn (`history … by=harness`),
-/// and no other connection types between the text and its Enter.
 #[test]
 fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
     let take = crate::harness::upgrade_drive::hand_take_here_request_as(HAND_HOLDER);
@@ -3306,13 +2961,6 @@ fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
     assert_eq!(run(false, acquired()), fenced, "no hand asked for");
 }
 
-/// THE WORKER'S OWN SUGGESTION, IN THE WINDOW'S HOST, IS TYPED AS WORDS
-/// UNDER THE HAND ([`Session::type_under_hand`]): the fenced `send` of the
-/// suggestion and its `key enter`, never the accept key, so the server's
-/// ledger has the text to book as the harness's turn (`history …
-/// by=harness`) — `right` and an Enter would leave it none, and the
-/// submitted suggestion would read as a person's prompt in the worker's
-/// transcript.
 #[test]
 fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
     let run = |hand: bool| {
@@ -3378,10 +3026,6 @@ fn the_windows_host_types_the_workers_suggestion_under_its_hand() {
     );
 }
 
-/// A continuation the server refused for now (`ERR halted` from a `hold`, `ERR busy …`; `ERR
-/// rate` takes the same branch) is typed once it can be: the loop parks on the hold (`HALTED`,
-/// then `UNHALTED` once `status` reads `hold=0`) or backs off, decides the point again and
-/// types, though the screen never moves — on the guarded `turn` and the fenced `send`.
 #[test]
 fn a_continuation_a_refusal_turned_away_is_typed_once_it_can_be() {
     for refusal in ["halted reason=owner origin=local", "busy lease=s-9"] {
@@ -3457,11 +3101,6 @@ fn a_continuation_a_refusal_turned_away_is_typed_once_it_can_be() {
     );
 }
 
-/// A KEEP-GOING CONTINUATION WAITS OUT AN EDIT HOLD (amacs design §6.7):
-/// while the session's program waits on an `edit` ticket (`status
-/// editing=1`, the editor open in aterm's own view), the server answers
-/// every write that would type into it `ERR busy editing ticket=<t>
-/// view=<v>` and writes nothing.
 #[test]
 fn a_keep_going_continuation_waits_out_an_edit_hold() {
     let editing = "busy editing ticket=41 view=7";
@@ -3543,9 +3182,6 @@ fn a_keep_going_continuation_waits_out_an_edit_hold() {
     }
 }
 
-/// A refusal's episode ([`Session::refusal_news`]): met again within [`REFUSAL_QUIET`] it is no
-/// news whatever its measures say (`human_ms=`, `bytes=`, a `…_ms=` wait); met after that long
-/// unmet it is a new appearance; a new holder (lease, turn, supervisor, hold reason) is news.
 #[test]
 fn a_refusals_episode_is_its_holder_and_ends_after_a_quiet_spell() {
     assert_eq!(
@@ -3583,9 +3219,6 @@ fn a_refusals_episode_is_its_holder_and_ends_after_a_quiet_spell() {
     }
 }
 
-/// A refusal's episode ends at a write the server takes and at a hold seen lifted: the same
-/// lease refusing after a taken write is said again (a refused write in between ends nothing),
-/// and the same hold met after `UNHALTED` is said again.
 #[test]
 fn a_refusals_episode_ends_at_a_taken_write_and_at_a_lifted_hold() {
     let refused_lines = |heard: &Heard| -> Vec<String> {
@@ -3657,8 +3290,6 @@ fn a_refusals_episode_ends_at_a_taken_write_and_at_a_lifted_hold() {
     );
 }
 
-/// A fenced press a hold turned away (`press_fenced`: the suggestion's accept key, a standing
-/// draft's Enter) is pressed again once `status` reads `hold=0`, though the screen never moved.
 #[test]
 fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
     let held = |screen: Vec<String>, key: &'static str| {
@@ -3715,10 +3346,6 @@ fn a_fenced_press_a_hold_turned_away_is_pressed_once_it_lifts() {
     );
 }
 
-/// A long text's guard sits on a row the composer draws (its caret row, or a
-/// continuation indented two), never an unanchored tail that could match a
-/// shell's cursor row, so an agent that exited between the read and the
-/// write never has its answer run as a command.
 #[test]
 fn a_long_texts_guard_never_matches_a_shells_row() {
     let answer = owners_policy().answer_text;
@@ -3761,13 +3388,6 @@ fn a_long_texts_guard_never_matches_a_shells_row() {
     );
 }
 
-/// GEMINI CLI'S CARET IS ONE COLUMN IN (` > text`, [`aterm_phase::ScreenReader::caret_column`]),
-/// and its guard is anchored there: the short form matches its caret row
-/// holding the text as measured (the lab's `a draft the lab never sends`)
-/// and with the inverse cursor cell and padding after it, the long form the
-/// last row of every word wrap of the band (` > ` first, three blanks after)
-/// from 30 to 160 columns; neither matches a shell's row nor its own
-/// placeholder.
 #[test]
 fn gemini_clis_guard_is_anchored_one_column_in() {
     use crate::supervise::run::turn_end_loop::{composer_guard, composer_guard_at};
@@ -3817,10 +3437,6 @@ fn gemini_clis_guard_is_anchored_one_column_in() {
     }
 }
 
-/// GEMINI CLI'S YOLO CARET IS `*` ([`aterm_phase::gemini::caret_on`],
-/// measured on its YOLO fixtures): the guard on text typed under it escapes
-/// the caret and anchors it one column in, so it matches the composer's row
-/// holding the text and the wrapped band's last row, and nothing else.
 #[test]
 fn a_yolo_caret_is_escaped_in_its_guard() {
     use crate::supervise::run::turn_end_loop::{composer_guard, composer_guard_at};
@@ -3864,11 +3480,6 @@ fn a_yolo_caret_is_escaped_in_its_guard() {
     );
 }
 
-/// MUSE CODE'S COMPOSER takes the guard under its own caret, `❯` in column
-/// 0, on its measured drafts (1.4.10): a short text's guard matches its caret
-/// row whole (`❯ keep going`), and a 301-character one's matches the row the
-/// draft wrapped onto last, indented two — the row the cursor ends on, which
-/// the guarded submit checks.
 #[test]
 fn muse_codes_measured_drafts_take_the_composer_guard() {
     use crate::supervise::run::turn_end_loop::composer_guard;
@@ -3899,9 +3510,6 @@ fn muse_codes_measured_drafts_take_the_composer_guard() {
     }
 }
 
-/// The row a composer's text ends on, word-wrapped at `width` columns as
-/// Claude Code wraps it: between words, a word longer than a row broken
-/// inside it, continuation rows indented two.
 fn gemini_wrapped_last_row(text: &str, width: usize) -> String {
     let room = width - 4;
     let chars: Vec<char> = text.chars().collect();
@@ -3954,8 +3562,6 @@ fn word_wrapped_last_row(text: &str, width: usize) -> String {
     row
 }
 
-/// Six `typed` rows of this session's in the ledger, each `age_min` minutes
-/// old plus its index (the acts of an earlier loop on it), under `sid`.
 fn seed_ledger(path: &std::path::Path, age_min: i64, sid: Option<&str>) {
     let now = crate::supervise::journal::unix_ms();
     let rows: Vec<String> = (0..6)
@@ -3973,8 +3579,6 @@ fn seed_ledger(path: &std::path::Path, age_min: i64, sid: Option<&str>) {
     std::fs::write(path, rows.join("\n") + "\n").expect("the ledger");
 }
 
-/// The typing budget is seeded from the session's `typed` ledger rows, so a re-spawned loop does
-/// not start fresh.
 #[test]
 fn the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger() {
     for (tag, age, sid, cap, spent) in [
@@ -4012,9 +3616,6 @@ fn the_typing_budget_counts_an_earlier_loops_acts_from_the_ledger() {
     }
 }
 
-/// THE HOUR'S BUDGET, SPENT, ESCALATES LOUDLY AND BLOCKS NOTHING: an earlier
-/// loop's six acts spend `continue_per_hour = 6`, the oldest a minute from
-/// leaving the hour.
 #[test]
 fn a_spent_budget_escalates_and_types_once_the_hour_frees() {
     for (tag, age, turns) in [("frees", 54, 1), ("held", 1, 0)] {
@@ -4044,8 +3645,6 @@ fn a_spent_budget_escalates_and_types_once_the_hour_frees() {
     }
 }
 
-/// `rows` as Claude Code 2.1.281 draws its composer, the caret then a no-break space
-/// (`❯\u{a0}`): the row the server's `if=` tests, which `text` trims to `❯`.
 fn drawn_nbsp(mut r: Vec<String>) -> Vec<String> {
     for row in &mut r {
         if row == "❯" {
@@ -4057,8 +3656,6 @@ fn drawn_nbsp(mut r: Vec<String>) -> Vec<String> {
     r
 }
 
-/// The composer guard matches Claude Code 2.1.281's NBSP composer (`\s` after the caret, any
-/// trailing whitespace).
 #[test]
 fn the_no_break_space_composer_takes_the_fenced_continuation() {
     let mut m = Mock::new(vec![
@@ -4119,9 +3716,6 @@ fn the_no_break_space_composer_takes_the_fenced_continuation() {
     );
 }
 
-/// Runs `run_hosted` over `m` until its host stops it once the loop watches past the last screen
-/// ([`host_stops`]: a fixed delay is outrun on a loaded machine), raising the hand-over flag
-/// first when `hand_over`; returns the printed lines.
 fn hosted_until_stopped(m: &mut Mock, ledger: &Path, hand_over: bool) -> Vec<String> {
     let (r, lines) = host_stops(
         m,
@@ -4134,8 +3728,6 @@ fn hosted_until_stopped(m: &mut Mock, ledger: &Path, hand_over: bool) -> Vec<Str
     lines
 }
 
-/// A worker restarted by its host (a policy edit, an update) keeps the idle point's escalation:
-/// a hand-over stop leaves the badge and the next loop adopts it, one `meta set` in all.
 #[test]
 fn a_handed_over_idle_escalation_survives_the_restart() {
     let (dir, ledger) = ledger_at("hand-over");
@@ -4240,13 +3832,6 @@ pub(super) fn seed_switch(
     }
 }
 
-/// Owner decision 3's switch back at the bucket's reset survives a host
-/// restart: the switch's ledger row says how to undo it (`relaunch --model
-/// opus`, or `/model opus` in an older ledger), and a loop that starts after
-/// it reads it back as the open switch; the switch back is a relaunch its
-/// host makes (`run_engine_tests`' `a_model_bucket_is_relaunched_…`), never
-/// `/model` (the policy's
-/// `a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model`).
 #[test]
 fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
     use crate::supervise::approvals::{OpenSwitch, open_model_switch};
@@ -4274,8 +3859,6 @@ fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
     }
 }
 
-/// Within `human_grace_s` of a person's keystroke (`status human_ms=`) a continuation waits
-/// (`WAITING … a person is typing`) and a box is held.
 #[test]
 fn a_persons_keystroke_holds_the_loop_for_the_grace() {
     let full = SuperviseOpts {
@@ -4311,8 +3894,6 @@ fn a_persons_keystroke_holds_the_loop_for_the_grace() {
     }
 }
 
-/// Another driver's hand (`hand=lease:<holder>`, `hand=turn:<id>:<holder>`) holds the loop as a
-/// keystroke does, so the host never fights a manager.
 #[test]
 fn another_drivers_hand_holds_the_loop() {
     let opts = || SuperviseOpts {
@@ -4346,10 +3927,6 @@ fn another_drivers_hand_holds_the_loop() {
     assert!(!m.presses().is_empty(), "{:#?}", m.requests);
 }
 
-/// A box held for a person is answered once their grace has passed: the
-/// first status says they typed half a second ago (`HELD`, nothing pressed
-/// or raised); when the grace runs out the box is judged again, on a fresh
-/// status that says they have stopped, and pressed, never before the grace.
 #[test]
 fn a_held_box_is_answered_once_the_persons_grace_has_passed() {
     let opts = |budget: u64| SuperviseOpts {
@@ -4389,9 +3966,6 @@ fn a_held_box_is_answered_once_the_persons_grace_has_passed() {
     );
 }
 
-/// A draft still changing is a person typing (every read shows new text, for
-/// longer than the grace and to the end of the budget, the loop's own clock
-/// since this server says nothing of a person): nothing is pressed.
 #[test]
 fn a_draft_still_changing_is_never_submitted() {
     let drafted = |text: &str| {
@@ -4437,8 +4011,6 @@ fn a_draft_still_changing_is_never_submitted() {
     );
 }
 
-/// agy's screens served `program=agy`, the cursor where agy parks it: on the
-/// caret row of each composer agy draws (a box draws none, and hides it).
 fn agy_mock(screens: Vec<Vec<String>>) -> Mock {
     let carets: Vec<Option<usize>> = screens
         .iter()
@@ -4454,11 +4026,6 @@ fn agy_mock(screens: Vec<Vec<String>>) -> Mock {
     m
 }
 
-/// agy end to end over the scripted server (agy 1.4.0's screens, `program=agy`): busy while its
-/// spinner row runs over the open composer, a turn ended at its reply with the footer back to
-/// `? for shortcuts`; its command box answered with the digit for the one-shot allow (`1`, `Yes,
-/// run command`), guarded on the command's row; at full power the turn continued under agy's
-/// own caret (`submit=guarded:^>\skeep\x20going…`).
 #[test]
 fn an_agy_session_is_supervised_end_to_end() {
     use aterm_phase::agy::fixtures as a;
@@ -4525,11 +4092,6 @@ fn an_agy_session_is_supervised_end_to_end() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// Muse Code's caret row at column 2 holds either its PROMPT HINT — one
-/// contextual tip in the idle composer, drawn in its dim grey with no `dim`
-/// attribute (measured on 1.4.10: `/export saves the conversation to a text
-/// file` in `676c74`, the cursor at column 2) — or a person's draft whose
-/// cursor was moved home; the `cell` there says which.
 #[test]
 fn a_muses_prompt_hint_is_no_draft_and_a_homed_draft_is_never_typed_over() {
     use aterm_phase::muse::fixtures as u;
@@ -4575,9 +4137,6 @@ fn a_muses_prompt_hint_is_no_draft_and_a_homed_draft_is_never_typed_over() {
     }
 }
 
-/// agy draws no placeholder: every word on its caret row was typed, so a person's draft whose
-/// cursor was moved home (column 2, where an empty composer parks it too) is never typed over,
-/// and no `cell` is asked to tell them apart, even where the server answers none.
 #[test]
 fn an_agy_draft_homed_to_its_caret_is_never_typed_over() {
     use aterm_phase::agy::fixtures as a;
@@ -4615,8 +4174,6 @@ fn an_agy_draft_homed_to_its_caret_is_never_typed_over() {
     }
 }
 
-/// AN ACT OF THE OWNER'S WORDS IN TWO PARAGRAPHS IS TYPED AS ONE LINE
-/// (`one_turn`), into agy and into Claude Code alike.
 #[test]
 fn an_owners_act_in_two_paragraphs_is_typed_as_one_line() {
     use aterm_phase::agy::fixtures as a;
@@ -4681,8 +4238,6 @@ fn an_owners_act_in_two_paragraphs_is_typed_as_one_line() {
     assert!(turn.ends_with(&format!(" {ONE}")), "Claude Code: {turn:?}");
 }
 
-/// agy's `/` command menu is no idle composer: its footer reads `esc to cancel` with no turn
-/// running and its rows sit under the bottom rule, so nothing is typed into the menu's filter.
 #[test]
 fn agys_command_menu_is_never_typed_into() {
     use aterm_phase::agy::fixtures as a;
@@ -4709,9 +4264,6 @@ fn agys_command_menu_is_never_typed_into() {
     }
 }
 
-/// Signed out, agy draws its sign-in menu instead of a composer (1.4.0): the loop hands the
-/// session to its owner with how agy signs in (quit it and run it again) and types and presses
-/// nothing, so no option of the menu (`Google OAuth` opens a browser) is ever chosen.
 #[test]
 fn agys_sign_in_menu_is_handed_to_its_owner() {
     use aterm_phase::agy::fixtures as a;
@@ -4747,8 +4299,6 @@ fn agys_sign_in_menu_is_handed_to_its_owner() {
     }
 }
 
-/// Muse Code's screens served `program=muse`, the cursor where Muse Code
-/// parks it: on the caret row of each composer it draws (a box draws none).
 fn muse_mock(screens: Vec<Vec<String>>) -> Mock {
     let carets: Vec<Option<usize>> = screens
         .iter()
@@ -4764,19 +4314,6 @@ fn muse_mock(screens: Vec<Vec<String>>) -> Mock {
     m
 }
 
-/// Muse Code, end to end over the scripted server (Muse Code 1.4.10's
-/// screens, `program=muse`): the loop reads Muse Code's own grammar — busy
-/// while its status row runs over the open composer, an ended turn at its
-/// reply — answers its shell box with Enter on the focused one-shot allow
-/// (`Yes, proceed`, guarded on that row and fenced on the generation; never
-/// a digit, none measured), and at full power continues the turn in its
-/// composer: on a host that fences only `key`, through the guarded `turn`
-/// under its own caret (`submit=guarded:^❯\skeep\x20going…`), whose server
-/// types, waits for the echo to settle and only then presses Enter; on one
-/// that fences `send` too, through the fenced write and a fenced Enter held
-/// until the echo has been still 600 ms — Muse Code takes an Enter in the
-/// same burst as the text as a NEWLINE (measured on 1.4.10:
-/// `DRAFT_BURST_ENTER`), so the text and its Enter never go in one write.
 #[test]
 fn a_muse_code_session_is_supervised_end_to_end() {
     use aterm_phase::muse::fixtures as u;
@@ -4961,10 +4498,6 @@ fn a_muse_code_session_is_supervised_end_to_end() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// Muse Code's QUESTION (1.4.10) through the loop: answered with its
-/// `(Recommended)` answer by Enter on the focused row — fenced on the
-/// generation and guarded on `⟩ 1. Red (Recommended) …`, never a digit — and
-/// said as approved, as Codex's and agy's are.
 #[test]
 fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
     use aterm_phase::muse::fixtures as u;
@@ -5015,12 +4548,6 @@ fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
     }
 }
 
-/// A QUESTION READ BY ITS ANSWERS' ROLES, answered by the loop's own key, is
-/// told once as the policy's choice, as Claude Code's dialog is: `CHOSE
-/// seq=<n> rule=answer-recommended@v1 policy=recommended <question> →
-/// <answer>`, naming the question asked (not the dialog's title) — agy's
-/// and Gemini CLI's each by its own key, Muse
-/// Code's by the cursor and Enter.
 #[test]
 fn a_question_read_by_its_roles_is_told_once_as_the_policys_choice() {
     use aterm_phase::muse::fixtures as u;
@@ -5085,10 +4612,6 @@ fn a_question_read_by_its_roles_is_told_once_as_the_policys_choice() {
     }
 }
 
-/// Muse Code's reply is read as Claude Code's: a report whose last row is
-/// the retired `ATERM-TASK-DONE` (measured on 1.4.10, under an away recap
-/// drawn above its message) is a done claim like any other — the done check
-/// is typed, and no `DONE` is journaled (Autopilot Cruise).
 #[test]
 fn a_muse_code_report_ending_with_the_token_gets_the_done_check() {
     use aterm_phase::muse::fixtures as u;
@@ -5130,9 +4653,6 @@ fn a_muse_code_report_ending_with_the_token_gets_the_done_check() {
     }
 }
 
-/// Gemini CLI's screens served `program=node` — the name its process
-/// carries, so the screen alone names it — the cursor on each composer's
-/// caret row (a box draws none).
 fn gemini_mock(screens: Vec<Vec<String>>) -> Mock {
     let carets: Vec<Option<usize>> = screens
         .iter()
@@ -5148,7 +4668,6 @@ fn gemini_mock(screens: Vec<Vec<String>>) -> Mock {
     m
 }
 
-/// Gemini CLI's turn's end with its reply's row reading `words`.
 fn gemini_ended(words: &str) -> Vec<String> {
     let mut rows =
         aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::END_OF_TURN);
@@ -5160,12 +4679,6 @@ fn gemini_ended(words: &str) -> Vec<String> {
     rows
 }
 
-/// GEMINI CLI, end to end over the scripted server at full power, under
-/// `program=node` — the name its process runs as, so the loop names it by
-/// its screen: its spinner busy, its shell box answered with the digit it
-/// draws for `Allow once` (`1`), guarded on the command's own row in the box
-/// drawn inside the box, and its turn's end continued in its composer under
-/// its own caret, one column in (`submit=guarded:^\s>\skeep\x20going…`).
 #[test]
 fn a_gemini_session_is_supervised_end_to_end() {
     use aterm_phase::gemini::fixtures as g;
@@ -5232,10 +4745,6 @@ fn a_gemini_session_is_supervised_end_to_end() {
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
 }
 
-/// AN OWNER'S CONTINUATION PAST GEMINI CLI'S PASTE FOLD is typed under the
-/// guard on the chip the composer draws for it (`[Pasted Text: <n> chars]`,
-/// [`aterm_phase::ScreenReader::folded_paste`]): the row the cursor ends on,
-/// measured ([`aterm_phase::gemini::fixtures::FOLDED_PASTE`]).
 #[test]
 fn a_gemini_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
     use crate::supervise::run::turn_end_loop::composer_guard_at;
@@ -5302,10 +4811,6 @@ fn a_gemini_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
     }
 }
 
-/// Gemini CLI's DONE CHECK: a reply that says the work is done gets the
-/// done check, typed under Gemini CLI's caret (its long form: the end of its
-/// last word on a row the band draws), and a `DONE` after it ends the task —
-/// nothing more is typed.
 #[test]
 fn a_gemini_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
     use aterm_phase::gemini::fixtures as g;
@@ -5363,12 +4868,6 @@ fn a_gemini_done_report_is_checked_once_and_a_done_reply_ends_the_task() {
     );
 }
 
-/// A PERSON'S DRAFT IN GEMINI CLI'S COMPOSER IS NEVER TYPED OVER: its draft
-/// (`a draft the lab never sends`, the status row blank) is every word on
-/// the caret row, and no `cell` is asked to tell it from the placeholder —
-/// even where the server answers none — while its placeholder (`Type your
-/// message or @path/to/file`, grey and not dim, the cursor in column 3) is an
-/// empty composer by its text.
 #[test]
 fn a_gemini_draft_is_never_typed_over_and_its_placeholder_is_continued() {
     use aterm_phase::gemini::fixtures as g;
@@ -5423,9 +4922,6 @@ fn a_gemini_draft_is_never_typed_over_and_its_placeholder_is_continued() {
     }
 }
 
-/// Gemini CLI's `/` COMMAND MENU IS NO IDLE COMPOSER: its rows stand under
-/// the band, over the footer, so the turn's end it follows is not acted on
-/// while it is open — nothing is typed into the menu's filter.
 #[test]
 fn gemini_clis_command_menu_is_never_typed_into() {
     use aterm_phase::gemini::fixtures as g;
@@ -5452,28 +4948,6 @@ fn gemini_clis_command_menu_is_never_typed_into() {
     }
 }
 
-/// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` IS KEPT TRYING WHILE A
-/// PERSON IS TOLD (FOREVER, the owner's direction of 2026-10-21: NEEDS YOU
-/// is loud and never blocks), end to end under `program=node` at full power.
-/// The dialog that names no reset (a key's per-day quota, `1. Keep trying` /
-/// `2. Stop`) is badged with its own words at its first read (`names no
-/// reset`) and held for its ladder's first rung, no key pressed; a person's
-/// `2. Stop` leaves `✕ [API Error: An unknown error occurred.]`, which is
-/// read as that limit: waited on to the rung the dialog's next `Keep trying`
-/// was due (`WAITING … until=<first read + 30 min> … usage-session resets`),
-/// the badge carried there — never lowered, never raised again, nothing
-/// escalated about the error — and `usage-resume@v1` typed at that rung, a
-/// try of the episode. The dialog drawn again on it climbs the ladder (`…
-/// (drawn again after its typed resume, try 1)`, 2 h from the resume), and
-/// the `Keep trying` that gets through takes the badge down (`CLEARED …
-/// box`). Measured before (walls-2,
-/// `gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person`): the
-/// Stop's error was escalated as an API error not retried, the badge up and
-/// nothing typed, for good. NEGATIVE CONTROLS: the same error with no
-/// dialog read before it, and after a point that was neither (the dialog's
-/// read forgotten there), is still a person's — escalated with the error's
-/// words, nothing typed: nothing names a limit; and the shell box in the
-/// dialog's place is pressed.
 #[test]
 fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_is_told() {
     use aterm_phase::gemini::fixtures as g;
@@ -5494,14 +4968,10 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         screen(g::BUSY_THINKING),
         gemini_ended("Carried on."),
     ]);
-    // The dialog sits till its badge is up (then a person's Stop); the error
-    // till the resume; the dialog drawn again on it till its `Keep trying`.
     m.attention_gates = vec![(1, 0)];
     m.turn_gates = vec![2];
     m.key_gates = vec![(4, 0)];
     m.stall_sleep = Some(Duration::from_secs(3600));
-    // Ends once the badge came down after the press: a badge taken down
-    // sooner leaves the run going, to be counted.
     m.exit_when = Some(|m| {
         let unset = m
             .requests
@@ -5541,7 +5011,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
             .map(|(i, _)| i)
             .collect()
     };
-    // One resume typed, `usage-resume@v1`, and one `Keep trying` after it.
     let turns = verb_at("turn");
     let keys = verb_at("key");
     assert_eq!(turns.len(), 1, "{lines:#?}\n{:#?}", all());
@@ -5558,8 +5027,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         "{:#?}",
         all()
     );
-    // The badge: raised once, at the dialog, before the resume, and taken
-    // down once, after the `Keep trying` that got through.
     let raised = at("meta set attention owner=supervisor");
     let lowered = at("meta unset attention owner=supervisor");
     assert_eq!(raised.len(), 1, "raised once: {:#?}", m.requests);
@@ -5578,8 +5045,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         "the error is no person's: {:#?}",
         m.requests
     );
-    // The error waited on to the ladder's first rung from the dialog's
-    // first read; the resume typed there, not before.
     let until = |l: &str| -> i64 {
         let stamp = l
             .split_whitespace()
@@ -5597,8 +5062,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         "the first rung: {:#?}",
         all()
     );
-    // What the run's clock spent on the error before the resume (each wait
-    // on a screen that sits skips the whole time it asks).
     let waited_ms: u64 = m.requests[..turns[0]]
         .iter()
         .filter(|r| r.starts_with("await seq "))
@@ -5609,8 +5072,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         "typed at the rung, not into the quota: {waited_ms} ms {:#?}",
         all()
     );
-    // The dialog drawn again on that resume: the ladder's next rung from it,
-    // said as the return of a typed resume, not of a `Keep trying`.
     let again = records
         .iter()
         .find(|r| {
@@ -5639,8 +5100,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
         all()
     );
 
-    // NEGATIVE CONTROLS: the error alone; the error after the dialog and a
-    // point that was neither, which forgets the dialog's read.
     for (tag, screens, gates) in [
         (
             "the error alone",
@@ -5703,9 +5162,6 @@ fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_i
     );
 }
 
-/// `rows` (a Gemini CLI usage-limit dialog drawn with `Access resets at
-/// 5:06 AM`) with its reset drawn as `reset`, its right border kept where
-/// Gemini's renderer keeps it.
 fn gemini_reset_redrawn(rows: &[String], reset: &str) -> Vec<String> {
     rows.iter()
         .map(|r| {
@@ -5720,20 +5176,6 @@ fn gemini_reset_redrawn(rows: &[String], reset: &str) -> Vec<String> {
         .collect()
 }
 
-/// GEMINI CLI'S BUCKET DIALOG IS WAITED ON, THEN TRIED BY ITS `Stop` AND A
-/// TYPED RESUME (the model's own bucket, `Usage limit reached for all Pro
-/// models.` over `Switch to gemini-3.5-flash` and `Stop`), end to end under
-/// `program=node` at full power: held to the end of its reset's minute and
-/// the grace (`WAITING … until=<9:07 AM PDT> rule=limit-retry@v1 … Stop is
-/// pressed and the turn resumed past it`, the same wait as the account's
-/// dialog), its `2` (`Stop`) pressed then — never the switch, never before —
-/// and the error that `Stop` leaves read as that limit, its reset passed, so
-/// `usage-resume@v1` is typed at once: the try, whose turn goes on to its
-/// end. Never handed to a person. The Google login's dialog (`Upgrade for
-/// higher limits` between them) gets its `3`. Measured before: escalated as
-/// `only Keep trying over Stop is pressed`, nothing pressed or typed, for
-/// good. NEGATIVE CONTROL: the account's dialog at the same reset gets its
-/// `1` (`Keep trying`), never its `Stop`, and no resume is typed.
 #[test]
 fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() {
     use aterm_phase::gemini::fixtures as g;
@@ -5778,8 +5220,6 @@ fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() 
             m.turn_gates = vec![2];
         }
         m.stall_sleep = Some(Duration::from_secs(3600));
-        // Ends at the first turn typed: the resume at the error, or the
-        // control's act at its turn's end.
         m.exit_when = Some(|m| m.requests.iter().any(|r| verb_of(r) == "turn"));
         let opts = SuperviseOpts {
             policy: owners_policy(),
@@ -5806,8 +5246,6 @@ fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() 
             "{tag}: never handed over: {:#?}",
             m.requests
         );
-        // Held to the end of 9:05's minute and a minute of grace, then
-        // pressed: not before.
         let due_s = TEST_NOW + 10 * 60 + 60 + 60;
         let wait = records
             .iter()
@@ -5876,21 +5314,6 @@ fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() 
     }
 }
 
-/// THE ERROR A `Stop` LEAVES WHERE NO POINT DECIDED THE DIALOG IS THE LIMIT
-/// A READ DREW (`Session::limit_stopped_adopt`):
-/// Gemini CLI's dialog read on a busy wait's read or inside a settle, then
-/// answered `2. Stop` before any point held it, leaves
-/// `✕ [API Error: An unknown error occurred.]` with no episode standing.
-/// That read names the limit: the per-day dialog's error is read as its
-/// limit with no reset, due the ladder's first rung from the dialog's first
-/// read (half an hour, less the grace the turn-end policy adds back); the
-/// account's dialog's (`Access resets at 9:05 AM PDT.`) is due at its reset's
-/// minute's end. Measured before: such an error escalated, nothing typed.
-/// NEGATIVE CONTROLS: the error with no dialog read, after a read of
-/// another box (the no-access dialog's `Stop` leaves the same words: the
-/// shell box stands in for it here), and with `limit_wait` off is none of a
-/// limit's; and a read of the dialog with its head off the rows read keeps
-/// no reset it cannot see.
 #[test]
 fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() {
     use aterm_phase::gemini::fixtures as g;
@@ -5922,9 +5345,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
     )
     .expect("a grace");
     let gemini = aterm_phase::Program::Gemini;
-    // `reads`: the screens read before the error, none a point, each at its
-    // second from the first (the reader's phase says which are busy), the
-    // loop's own `Keep trying` pressed after them where `pressed`; `opts`.
     let adopted_as = |reads: &[(Vec<String>, i64)], pressed: bool, opts: &SuperviseOpts| {
         let mut m = gemini_mock(vec![stopped.clone()]);
         let mut s = session(&mut m, None);
@@ -5944,7 +5364,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         s.limit_stopped(&reading, &stopped)
             .map(|l| (l.wall.kind, l.wall.reset, l.reset_unix))
     };
-    // Each read 20 s after the one before it.
     let adopted = |reads: &[Vec<String>], opts: &SuperviseOpts| {
         let timed: Vec<(Vec<String>, i64)> = (0..)
             .zip(reads)
@@ -5962,7 +5381,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         )),
         "the per-day dialog: its ladder's first rung from its first read"
     );
-    // The same dialog read again later keeps its first read.
     assert_eq!(
         adopted(&[day.clone(), day.clone()], &opts),
         Some((
@@ -5971,7 +5389,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
             TEST_NOW + 1800 - grace
         ))
     );
-    // 9:05 AM PDT, ten minutes after the clock: its minute's end.
     assert_eq!(
         adopted(&[gemini_reset_dialog("9:05 AM PDT")], &opts),
         Some((
@@ -5981,8 +5398,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         )),
         "the account's dialog: its reset placed"
     );
-    // A frame between the dialog and the error that is neither keeps it —
-    // a spinner within `LIMIT_DIALOG_FRAME_S` of the dialog included.
     assert!(
         adopted_as(
             &[(day.clone(), 0), (screen(g::BUSY_THINKING), 3)],
@@ -5992,11 +5407,7 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         .is_some(),
         "a frame between"
     );
-    // CONTROLS.
     assert_eq!(adopted(&[], &opts), None, "no dialog read");
-    // The worker working past the dialog: an hour of a turn's spinner after
-    // it, then an error that ends the turn — no dialog this read drew is
-    // what it answered.
     assert_eq!(
         adopted_as(
             &[
@@ -6010,7 +5421,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         None,
         "the worker working past the dialog"
     );
-    // The loop's own `Keep trying` answered the dialog read.
     assert_eq!(
         adopted_as(&[(day.clone(), 0)], true, &opts),
         None,
@@ -6026,12 +5436,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         None,
         "limit_wait off"
     );
-    // The dialog with its head off the rows: scrolled so its first rows
-    // read are its options, every row above them (its top border, its head)
-    // off the screen, so the reader reads a box whose head it cannot see
-    // (`head_off_screen`), which it names no usage-limit dialog — alone it
-    // names no limit, and after the dialog's read it forgets that read, as
-    // another box does.
     let head_end = day
         .iter()
         .position(|r| r.contains("/model to switch models."))
@@ -6056,17 +5460,6 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
     );
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES ITS RESET IS KEPT TRYING PAST
-/// IT, end to end under `program=node` at full power (a Google account's
-/// spent quota, `Access resets at 9:05 AM PDT.` ten minutes after the
-/// clock): the dialog is waited on — `WAITING … until=<the end of the
-/// reset's minute and a minute of grace> rule=limit-retry@v1`, never handed
-/// over — and its `1` (`Keep trying`) is pressed only once they have passed;
-/// the dialog drawn again on that press (the quota still standing) is pressed
-/// again after the back-off, not at once, through two capped 30-minute
-/// pauses more than an hour past the reset, each return on the record
-/// (`WAITING … (drawn again after its Keep trying, try <n>)`, a `waiting`
-/// ledger row).
 #[test]
 fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
     use aterm_phase::gemini::fixtures as g;
@@ -6266,10 +5659,6 @@ fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
     }
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG ANSWERED `Stop` BY ANOTHER HAND IS THE
-/// LIMIT STILL, end to end under `program=node` at full power: the dialog
-/// naming `9:05 AM PDT` (ten minutes after the clock) is waited on, and a
-/// person's `2. Stop` leaves `✕ [API Error: An unknown error occurred.]`.
 #[test]
 fn gemini_clis_usage_limit_answered_stop_is_waited_out_and_resumed() {
     use aterm_phase::gemini::fixtures as g;
@@ -6406,9 +5795,6 @@ fn gemini_clis_usage_limit_answered_stop_is_waited_out_and_resumed() {
     );
 }
 
-/// Gemini CLI's account dialog ([`aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT`])
-/// with its reset row respelled `Access resets at <reset>.`, the box's right
-/// border where the measured box draws it.
 fn gemini_reset_dialog(reset: &str) -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT)
         .into_iter()
@@ -6424,9 +5810,6 @@ fn gemini_reset_dialog(reset: &str) -> Vec<String> {
         .collect()
 }
 
-/// GEMINI CLI'S RESET IS PLACED IN THE ZONE ITS DIALOG NAMES: the CLI draws
-/// `Access resets at <time> <zone>.` in its own process's zone, which need
-/// not be this machine's (`TZ` in its shell, an `ssh`).
 #[test]
 fn gemini_clis_usage_limit_reset_is_placed_in_the_zone_it_names() {
     use super::super::approval_loop::{LIMIT_RETRY_RELOOK_S, RetryDue};
@@ -6498,10 +5881,6 @@ fn gemini_clis_usage_limit_reset_is_placed_in_the_zone_it_names() {
     );
 }
 
-/// Where Gemini CLI's dialog drawn as `reset` is first read at [`TEST_NOW`]
-/// (8:55 PDT) on a machine in PDT, each `Keep trying` pressed when due and
-/// drawn again (the quota standing) until the quota's REAL reset `real`
-/// (unix), then once more: the minutes past [`TEST_NOW`] of every press.
 fn presses_till(reset: &str, real: i64) -> Vec<i64> {
     use super::super::approval_loop::RetryDue;
     let opts = SuperviseOpts {
@@ -6536,10 +5915,6 @@ fn presses_till(reset: &str, real: i64) -> Vec<i64> {
     presses
 }
 
-/// A RESET WHOSE ZONE THE LOOP CANNOT READ IS LOOKED AT EVERY RE-LOOK BOUND
-/// AND TRIED AT ITS RESET (C3 of the review of `b9/walls-2`): the clock is
-/// placed in the machine's zone, and every `Keep trying` before that reset
-/// is a look a bound apart, which climbs no back-off.
 #[test]
 fn a_reset_whose_zone_is_unread_is_looked_at_a_bound_apart_and_tried_at_its_reset() {
     use super::super::approval_loop::LIMIT_RETRY_RELOOK_S;
@@ -6569,13 +5944,6 @@ fn a_reset_whose_zone_is_unread_is_looked_at_a_bound_apart_and_tried_at_its_rese
     );
 }
 
-/// A RESET FIRST READ LONG AFTER IT PASSED IS TRIED WITHIN THE RE-LOOK BOUND
-/// (C4 of the review of `b9/walls-2`): `Access resets at 1:30 AM PDT.` first
-/// read at 8:55 PDT names its last occurrence as well as its next — a loop
-/// started on the tab meets a dialog that stood overnight — so its first
-/// `Keep trying` is a look half an hour on, not tomorrow's 1:32; drawn again
-/// on that look (the quota still spent, its reset tomorrow's after all), the
-/// placed reset is waited for, with no look more.
 #[test]
 fn a_reset_first_read_long_past_is_tried_within_the_bound() {
     use super::super::approval_loop::{LIMIT_RETRY_RELOOK_S, RetryDue};
@@ -6611,12 +5979,6 @@ fn a_reset_first_read_long_past_is_tried_within_the_bound() {
     );
 }
 
-/// A CLOCK THE LOOP CANNOT READ IS NO RESET IT CAN PLACE, AND IS KEPT TRYING
-/// ON THE LADDER (T4 of the review of `b9/walls-2`; FOREVER: never handed
-/// over and left): `Access resets at soon.` waits the entitlement ladder's
-/// first rung from its read, then its second from the press it came back
-/// on, said as a reset the loop cannot place — the badge's words and the
-/// policy's escalation alike.
 #[test]
 fn a_reset_the_loop_cannot_place_is_kept_trying_on_the_ladder() {
     use super::super::approval_loop::RetryDue;
@@ -6663,11 +6025,6 @@ fn a_reset_the_loop_cannot_place_is_kept_trying_on_the_ladder() {
     assert!(said.chars().count() <= 120, "{said}");
 }
 
-/// A TRY THAT GOT THROUGH ENDS GEMINI CLI'S USAGE-LIMIT EPISODE (C2 of the
-/// review of `b9/walls-2`): a `Keep trying` pressed past `9:05 AM PDT`, and
-/// the worker read busy three hours on — the try got through, the turn
-/// works — so the per-day quota's dialog met then is a new limit, waited the
-/// ladder's FIRST rung from its read.
 #[test]
 fn a_try_that_got_through_ends_the_usage_limit_episode() {
     use super::super::approval_loop::{LIMIT_RETRY_ANSWER_S, RetryDue};
@@ -6713,20 +6070,6 @@ fn a_try_that_got_through_ends_the_usage_limit_episode() {
     }
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES NO RESET (a key's per-day
-/// quota, [`aterm_phase::gemini::fixtures::LIMIT_DIALOG`]) IS KEPT TRYING
-/// WHILE A PERSON IS TOLD, end to end under `program=node` at full power
-/// (FOREVER: NEEDS YOU is loud and never blocking): its badge goes up at
-/// once (`meta set attention owner=supervisor`, `names no reset`) and stands
-/// while its `Keep trying` (`1`) is pressed on the turn-end policy's
-/// entitlement ladder — 30 minutes from its first read, then 2 h and 6 h
-/// after each press it comes back on, and 6 h for ever after — each return
-/// said (`WAITING … rule=limit-retry@v1 … (drawn again after its Keep
-/// trying, try <n>)`) and ledgered (`waiting`); each try's spinner, read
-/// twice before the dialog comes back on it (the CLI's busy row while it
-/// sends the turn again), is that try in flight and leaves the badge up; the
-/// press that gets through (the turn ends on its reply) takes the badge down
-/// (`meta unset attention owner=supervisor`, `CLEARED … box`).
 #[test]
 fn gemini_clis_usage_limit_with_no_reset_is_kept_trying_while_a_person_is_told() {
     use aterm_phase::gemini::fixtures as g;
@@ -6915,14 +6258,10 @@ impl IdleHost for ReachHost {
     }
 }
 
-/// The outage's screen: Claude Code 2.1.283's `⏺ API Error: Can't reach
-/// the API server … (ENOTFOUND)` after the vendor's 3 minutes of retries.
 fn enotfound() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::API_ERROR_ENOTFOUND)
 }
 
-/// Clocks that keep every rung and the hold an hour off: at the network
-/// wall only the host's measure can move the loop.
 fn far_rungs() -> TurnEndTiming {
     let hour = Duration::from_secs(3600);
     TurnEndTiming {
@@ -6932,14 +6271,10 @@ fn far_rungs() -> TurnEndTiming {
     }
 }
 
-/// One run of the outage's point under a host scripted `script`: the lines,
-/// the host, the server's record of the run, and the journal's `WAITING`
-/// rows' summaries.
 fn outage_under(script: &[Reach], max_s: u64) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
     outage_timed(script, max_s, far_rungs())
 }
 
-/// [`outage_under`] with the policy's clocks `timing`.
 fn outage_timed(
     script: &[Reach],
     max_s: u64,
@@ -6968,8 +6303,6 @@ fn outage_timed(
     (lines, host, m, waiting)
 }
 
-/// One outage run with short clocks (50 ms rungs, a 300 ms act check) under a [`ReachHost`]:
-/// lines, host, server record, `WAITING` summaries.
 fn short_outage(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -7005,10 +6338,6 @@ fn short_outage(
     (lines, host, m, waiting)
 }
 
-/// The loop tells the host its next try, and clears the plan when the try is
-/// typed, not at the next point: after a try the loop sits in the worker's
-/// whole busy turn (`await_turn_from`), so a plan the try ended must not
-/// stand on the tab through it.
 #[test]
 fn the_plan_is_cleared_when_the_try_is_typed_not_at_the_next_point() {
     let (lines, host, m, _) = short_outage(
@@ -7030,8 +6359,6 @@ fn the_plan_is_cleared_when_the_try_is_typed_not_at_the_next_point() {
     );
 }
 
-/// The check that the try was taken (`the worker to take the api-retry@v1 act`) is journaled but
-/// never told to the host as a plan: `Session::tell_wait` filters it (`Due::retry`).
 #[test]
 fn the_act_check_is_told_to_the_host_as_no_plan() {
     let tick = |n: u32| -> Vec<String> {
@@ -7059,10 +6386,6 @@ fn the_act_check_is_told_to_the_host_as_no_plan() {
     );
 }
 
-/// A short turn's run, watched under Cruise by a recording host
-/// ([`ReachHost`]): the worker's quick reply (no done row: a short turn,
-/// the first point seen) backs the loop off `backoff`, the wait stepping
-/// every 5 ms, then `keep going` is typed.
 fn backed_off(tag: &str, every_step: bool) -> (Vec<Option<WaitPlan>>, Vec<String>, Vec<String>) {
     let mut quick = rows(&["⏺ Renamed the helper.", ""]);
     quick.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
@@ -7100,9 +6423,6 @@ fn backed_off(tag: &str, every_step: bool) -> (Vec<Option<WaitPlan>>, Vec<String
     (host.told(), lines, waiting)
 }
 
-/// Whether `told` holds the back-off exactly as the window is owed it: ONE
-/// `Some` of kind [`WaitKind::BackOff`] where it starts, the next thing told
-/// `None` where it ends, and no other back-off told — nothing in between.
 fn told_once(told: &[Option<WaitPlan>]) -> bool {
     let backoff = |p: &Option<WaitPlan>| {
         p.as_ref()
@@ -7112,14 +6432,6 @@ fn told_once(told: &[Option<WaitPlan>]) -> bool {
     matches!(starts.as_slice(), [i] if told.get(i + 1) == Some(&None))
 }
 
-/// THE SHORT STREAK'S BACK-OFF IS TOLD AS A PAUSE, ONCE AT ITS START AND
-/// ONCE AT ITS END (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.3,
-/// part A; §10.5.5): the recording host sees one `waiting(Some(..))` of
-/// kind `BackOff { short: 1 }` (the first point seen is a short turn) at the
-/// instant the journal says `WAITING … 1 short turn(s) in a row`, and one
-/// `None` as the loop decides again at its end and types `keep going` —
-/// nothing in between, however many steps the wait takes (here dozens: it
-/// steps every 5 ms over a 200 ms back-off).
 #[test]
 fn a_back_off_is_told_once_at_its_start_and_cleared_once_at_its_end() {
     let (told, lines, waiting) = backed_off("te-backoff-told", false);
@@ -7152,9 +6464,6 @@ fn a_back_off_is_told_once_at_its_start_and_cleared_once_at_its_end() {
     assert!(!told_once(&every), "{every:#?}");
 }
 
-/// A wall's retry wait still reaches the host as [`WaitKind::Retry`], and
-/// a back-off as [`WaitKind::BackOff`] with its streak, through
-/// [`Session::tell_wait`]; any other wait is never told.
 #[test]
 fn a_retry_is_told_as_a_retry_and_a_back_off_as_a_back_off() {
     let host = ReachHost::scripted(&[]);
@@ -7192,9 +6501,6 @@ fn a_retry_is_told_as_a_retry_and_a_back_off_as_a_back_off() {
     );
 }
 
-/// A wait is told at its wall second ([`Due::unix_ms`]), once, and a sleep does not move it; the
-/// same `Instant` set again after a sleep (the policy's pauses are `Instant`s, which stop while
-/// the Mac sleeps) names a later second and is told again.
 #[test]
 fn a_wait_is_told_at_its_wall_second_and_again_only_when_that_second_moves() {
     let host = ReachHost::scripted(&[]);
@@ -7234,9 +6540,6 @@ fn a_wait_is_told_at_its_wall_second_and_again_only_when_that_second_moves() {
     assert_eq!(host.told().len(), 2, "{:#?}", host.told());
 }
 
-/// A tall pane's short transcript (2.1.284 fullscreen, 144x50) leaves a gap in the `tail=40` read
-/// ([`gap_above_tail`]; the tail ends on the footer, so neither [`tail_misses_the_live_rows`] nor
-/// [`drawn_above_tail`] fires), so the screen is read again whole and the outage seen.
 #[test]
 fn the_loop_reads_the_wall_of_a_tall_panes_short_transcript() {
     use aterm_phase::prompt::fixtures::{API_ERROR_TALL_PANE_MEASURED, screen};
@@ -7293,7 +6596,6 @@ fn the_loop_reads_the_wall_of_a_tall_panes_short_transcript() {
     assert_eq!(whole, 0, "the whole pane fits the tail: {requests:#?}");
 }
 
-/// The `await`s the loop made before its first `turn` (none: every one).
 fn awaits_before_turn(m: &Mock) -> usize {
     let end = m
         .requests
@@ -7306,9 +6608,6 @@ fn awaits_before_turn(m: &Mock) -> usize {
         .count()
 }
 
-/// An Up measure while the loop waits at an outage the host measured Down decides the point at
-/// the next step: continued once under `api-back@v1`, no rung or hold waited out; each further
-/// Down costs one step.
 #[test]
 fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
     let t = Instant::now();
@@ -7353,9 +6652,6 @@ fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
     assert!(host.asks() > 2, "asked at each step while it waited");
 }
 
-/// Only a wait at a network wall asks the host for the API's reach, so its probe runs only then;
-/// a wall the policy escalates is asked once, at the point, and a measure turning up cannot post
-/// its ask again (`escalate_point` dedupes only by point).
 #[test]
 fn an_ordinary_or_escalated_point_never_asks_for_the_reach_again() {
     let host = ReachHost::scripted(&[Reach::Up {
@@ -7433,9 +6729,6 @@ impl IdleHost for BackgroundHost {
     }
 }
 
-/// Claude Code's screen while it waits on a dynamic workflow the agent
-/// started, under a bypass footer that has no pill for it (2.1.300's `Rhe`
-/// drops `local_workflow`): `rows` above the composer.
 fn waiting_on(rows_above: &[&str]) -> Vec<String> {
     let mut r = rows(rows_above);
     r.extend(composer(
@@ -7444,10 +6737,6 @@ fn waiting_on(rows_above: &[&str]) -> Vec<String> {
     r
 }
 
-/// The turn the agent's monitor woke, as Claude Code draws it (BG-1): its
-/// event and its words under the waiting row the earlier turn left, then
-/// `end` — nothing (the work still pending: Claude Code draws no done row)
-/// or the done row of work that finished.
 fn woken(end: &[&str]) -> Vec<String> {
     let mut above = vec![
         "⏺ Second-pass reviewers are out and the build is running.",
@@ -7499,10 +6788,6 @@ impl IdleHost for CarriedHost {
     }
 }
 
-/// BG-1 in the loop, the screen's half: the agent waits on a workflow (the
-/// waiting row drawn), its monitor wakes it (a spinner), and the woken turn
-/// ends with the workflow still pending, which Claude Code draws no done row
-/// for.
 #[test]
 fn a_turn_its_own_wake_ended_still_waiting_is_not_continued() {
     for done in [false, true] {
@@ -7550,12 +6835,6 @@ fn a_turn_its_own_wake_ended_still_waiting_is_not_continued() {
     }
 }
 
-/// AGY'S AND MUSE CODE'S OWN BACKGROUND WORK IS CLAUDE CODE'S, IN THE LOOP
-/// (agy 1.4.0's and Muse Code 1.4.10's lab screens, 2026-10-17): a turn ends
-/// with work the agent started still running under its composer — agy's
-/// command task in its panel (`  ● [17:50:42] sleep 150; echo LAB-BG-DONE
-/// running`, `· 1 task(s)`), Muse Code's backgrounded shell (`└ ◈ Q3
-/// background wait  running  2s`).
 #[test]
 fn an_agy_or_muse_turn_ended_over_its_own_background_work_is_not_continued() {
     use aterm_phase::agy::fixtures::lab as a;
@@ -7609,10 +6888,6 @@ fn an_agy_or_muse_turn_ended_over_its_own_background_work_is_not_continued() {
     }
 }
 
-/// A QUESTION AGY OR MUSE CODE ENDED A TURN ON IS HELD BY ITS OWN SHELL, AS
-/// CLAUDE CODE'S IS (`aterm_phase::worker_phase`'s hard rule: a shell, a
-/// workflow or a background agent left running reads busy over the question
-/// the turn ended on, a monitor does not).
 #[test]
 fn a_question_over_agy_or_muse_background_work_is_held_as_over_claude_codes_shell() {
     use crate::supervise::policy::turn_end::RULE_ANSWER;
@@ -7738,11 +7013,6 @@ fn a_question_over_agy_or_muse_background_work_is_held_as_over_claude_codes_shel
     }
 }
 
-/// BG-1 in the loop, the transcript's half: a turn ends with no glyph row on
-/// the screen at all (the waiting row scrolled off, or `showTurnDuration:
-/// false`), and the session's transcript says it ended waiting on a workflow
-/// — its newest `turn_duration` closes the model's reply with
-/// `pendingWorkflowCount: 1`, written by the process in the tab.
 #[test]
 fn a_turn_its_transcript_says_ended_waiting_is_not_continued() {
     let end = waiting_on(&[
@@ -7813,16 +7083,12 @@ fn a_turn_its_transcript_says_ended_waiting_is_not_continued() {
     }
 }
 
-/// A unix time on 2026-10-07, `t` its `HH:MM:SS` (UTC).
 fn transcript_at(t: &str) -> i64 {
     crate::harness::upgrade_models::parse_utc(&format!("2026-10-07T{t}Z"))
         .and_then(|s| i64::try_from(s).ok())
         .expect("a time")
 }
 
-/// A transcript's tail for the turn a task notification started: its prompt,
-/// the model's reply, and the `turn_duration` row that closes it at
-/// 22:53:32, `pending` workflows still running.
 fn transcript_closed(pending: u32) -> String {
     let notification = r#"{"parentUuid":"p0","isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"},"uuid":"u1","timestamp":"2026-10-07T22:53:28.100Z","origin":{"kind":"task-notification"},"turnOrigin":"task_notification"}"#;
     let reply = r#"{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"I restarted the lander watch."}]},"uuid":"a1","timestamp":"2026-10-07T22:53:30.500Z"}"#;
@@ -7832,12 +7098,6 @@ fn transcript_closed(pending: u32) -> String {
     format!("{notification}\n{reply}\n{closed}")
 }
 
-/// BG-1, the transcript's word against the wait the screen carries (the
-/// verifier's correction 3): the woken turn ends with the waiting row still
-/// over it and no status row drawn — what a Claude Code that hid the done
-/// row of a finished wait would leave for good — while the session's
-/// transcript says that turn closed with NOTHING pending, written by the
-/// process in the tab.
 #[test]
 fn a_carried_wait_its_transcript_says_is_over_is_continued() {
     let lagging = format!(
@@ -7941,10 +7201,6 @@ impl IdleHost for PointHost {
     }
 }
 
-/// One loop over a busy read and `end`, under `host`, the short back-off on
-/// (a fresh loop's first point is short: a wait, its act at the due), ended
-/// by the first `turn` typed; `vanish` stalls of 100 ms bound it (a hang
-/// detector where something must be typed).
 fn point_run(
     host: &Arc<PointHost>,
     end: Vec<String>,
@@ -7971,12 +7227,6 @@ fn point_run(
     (lines, why)
 }
 
-/// BG-1 correction 3 holds at EVERY read of its point, not only the look that
-/// decided it (the cross-lane review's F1 and XT-1): a carried wait the
-/// transcript says is over is decided a wait (the short back-off), and at the
-/// wait's due the point read again is the same idle point — `keep going` is
-/// typed, where the raw read (busy) dropped the act and left the session
-/// stranded for good.
 #[test]
 fn a_carried_wait_over_is_one_point_at_every_read() {
     let drawn = || woken(&["✻ Worked for 3m 2s · done 4:24 PM", ""]);
@@ -8001,10 +7251,6 @@ fn a_carried_wait_over_is_one_point_at_every_read() {
     }
 }
 
-/// The host's step at a carried wait the transcript says is over is vouched
-/// for by the terminal's cursor as any idle point's is (Claude Code's `idle`
-/// only at the prompt box holding it): with the cursor off the box the step
-/// is withheld.
 #[test]
 fn a_carried_wait_over_is_vouched_for_by_the_cursor() {
     let drawn = || woken(&["✻ Worked for 3m 2s · done 4:24 PM", ""]);
@@ -8015,11 +7261,6 @@ fn a_carried_wait_over_is_vouched_for_by_the_cursor() {
     }
 }
 
-/// A POINT DECIDED AGAIN ASKS THE TRANSCRIPT AGAIN (the cross-lane review's
-/// F1): an idle point no row says the end of, its transcript then counting
-/// nothing pending, read again at its due once a `turn_duration` row counts
-/// a workflow pending — the turn ended waiting on it, and Claude Code will
-/// wake it: nothing is typed.
 #[test]
 fn a_point_decided_again_asks_the_transcript_again() {
     let end = waiting_on(&[
@@ -8062,8 +7303,6 @@ fn a_point_decided_again_asks_the_transcript_again() {
     }
 }
 
-/// A bare clock reset is placed for its wall's kind and on its print: `9am` at 8 pm is tomorrow's
-/// for a weekly wall, today's (passed) for a session window.
 #[test]
 fn a_bare_clock_reset_is_placed_for_the_wall_it_belongs_to() {
     let at = |h: i64, m: i64| TEST_NOW + (h - 8) * 3600 + (m - 55) * 60;
@@ -8180,8 +7419,6 @@ fn a_bare_clock_reset_is_placed_for_the_wall_it_belongs_to() {
     }
 }
 
-/// A wall's bare clock, placed IN THE LOOP: the gate of the
-/// first fix.
 #[test]
 fn a_weekly_wall_hit_in_the_evening_that_resets_in_the_morning_is_waited_for() {
     let evening = TEST_NOW + 11 * 3600 + 5 * 60;
@@ -8241,14 +7478,8 @@ fn a_weekly_wall_hit_in_the_evening_that_resets_in_the_morning_is_waited_for() {
     assert_eq!(count(&m, "turn"), 1, "{lines:#?}");
 }
 
-/// 17:26 PDT on the watch tests' day.
 const TAB_EVENING: i64 = TEST_NOW + 8 * 3600 + 31 * 60;
 
-/// The owner's tab of 2026-10-01 17:26 PDT (Claude Code 2.1.287 at a weekly
-/// limit whose reset is the next morning at 5am): the vendor's footer banner
-/// under the composer, a bare clock and no window named (`⚠ Usage limit
-/// reached · limit resets 5am`, the journal's `EVENT limited` word for word),
-/// under the worker's last short answer and no done row.
 fn limit_resets_5am(typed: bool) -> Vec<String> {
     let mut r = rows(&["⏺ Still done, and I'm not starting new work.", ""]);
     if typed {
@@ -8259,9 +7490,6 @@ fn limit_resets_5am(typed: bool) -> Vec<String> {
     r
 }
 
-/// A run over `screens` at `clock` (`sits`: the screen that sits until a turn), the act's take
-/// window 50 ms so the point after an act is judged in the run: requests, lines, `WAITING`
-/// summaries.
 fn tab_run(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -8294,9 +7522,6 @@ fn tab_run(
     (m, lines, waits)
 }
 
-/// THE LIVE DEFECT OF 2026-10-01: the loop's hourly `keep going` met the
-/// weekly limit, and Claude Code answered it with the banner alone — no turn
-/// ran, so no read saw the worker busy.
 #[test]
 fn a_weekly_wall_still_standing_after_a_typed_line_is_never_typed_into_again_before_its_reset() {
     for (case, screens, sits, typed) in [
@@ -8342,9 +7567,6 @@ fn a_weekly_wall_still_standing_after_a_typed_line_is_never_typed_into_again_bef
     }
 }
 
-/// Negative control: a session limit whose reset has passed (`resets 3pm`, its five-hour window
-/// named, read at 17:26) is continued at once; a wall answering an act never makes a session
-/// window's clock tomorrow's.
 #[test]
 fn a_session_limit_whose_reset_has_passed_is_continued() {
     let session_wall = |typed: bool| {
@@ -8391,9 +7613,6 @@ fn a_session_limit_whose_reset_has_passed_is_continued() {
     );
 }
 
-/// The composer is read where it is drawn: a window re-gridded twice in a millisecond leaves the
-/// rows one higher and the cursor below the prompt, so the cursor's column and, at column 2, the
-/// caret row's `cell` decide suggestion or draft.
 #[test]
 fn a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall() {
     let suggesting = || {
@@ -8451,12 +7670,10 @@ fn a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall() {
     }
 }
 
-/// The measured weekly wall with its reset a span away (`resets in 2s`) so a test can cross it.
 fn memory_wall() -> Vec<String> {
     memory_wall_in("2s")
 }
 
-/// [`memory_wall`] with the reset `span` away.
 fn memory_wall_in(span: &str) -> Vec<String> {
     const WALL: &str = include_str!(
         "../../../aterm-phase/src/fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"
@@ -8472,8 +7689,6 @@ fn memory_wall_in(span: &str) -> Vec<String> {
         .collect()
 }
 
-/// A person's turn served under the remembered wall's notice means the limit lifted; a screen
-/// showing only background work still stands for the wall.
 #[test]
 fn a_turn_served_under_the_remembered_walls_notice_is_no_background_work() {
     let walled = memory_wall_in("2s")
@@ -8515,14 +7730,10 @@ fn a_turn_served_under_the_remembered_walls_notice_is_no_background_work() {
     assert!(s.remembered_wall(reader, &elsewhere).is_some());
 }
 
-/// The same screen with the wall's rows gone: the owner scrolled back up the
-/// transcript (Claude Code's fullscreen view keeps the status row, the
-/// composer and the footer where they are).
 fn memory_scrolled() -> Vec<String> {
     memory_scrolled_in("2s")
 }
 
-/// [`memory_scrolled`] for a wall whose reset was `span` away.
 fn memory_scrolled_in(span: &str) -> Vec<String> {
     let mut rows = memory_wall_in(span);
     let from = rows
@@ -8537,12 +7748,10 @@ fn memory_scrolled_in(span: &str) -> Vec<String> {
     rows
 }
 
-/// The wall with the agent's spinner drawn under it: a live turn.
 fn memory_with_a_live_turn() -> Vec<String> {
     memory_with_a_live_turn_in("2s")
 }
 
-/// [`memory_with_a_live_turn`] for a wall whose reset is `span` away.
 fn memory_with_a_live_turn_in(span: &str) -> Vec<String> {
     let mut rows = memory_wall_in(span);
     let foot = rows
@@ -8553,15 +7762,8 @@ fn memory_with_a_live_turn_in(span: &str) -> Vec<String> {
     rows
 }
 
-/// The stop of a run that must type, on the run's clock: past every timer
-/// such a run sets, so its turn ends it first (a minute of real time stays
-/// [`memory_run_at`]'s hang detector).
 const HANG_S: u64 = 60;
 
-/// Runs the loop over `screens` (the sat one last, released by the first
-/// `turn`), the reset's grace one second, stopped `stop_s` seconds in on a
-/// clock of its own ([`memory_run_clock`]), and hands back the mock, the
-/// printed lines and the journal's waiting lines.
 fn memory_run_for(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -8572,7 +7774,6 @@ fn memory_run_for(
     memory_run_on(tag, screens, stop_s, sid, |_| {}, setup)
 }
 
-/// [`memory_run_for`] on a server `server` makes more of (a pushed verdict).
 fn memory_run_on(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -8592,9 +7793,6 @@ fn memory_run_on(
     )
 }
 
-/// The clock a run of [`memory_run_at`] waits on: its own, moving only by what the run
-/// skips ([`crate::supervise::fx::ScriptedClock::run_virtual`]: the sat screen's waits, the
-/// loop's own sleeps), the wall clock on a whole second of the system's and running with it.
 fn memory_run_clock() -> Arc<crate::supervise::fx::ScriptedClock> {
     let clock = Arc::new(crate::supervise::fx::ScriptedClock::default());
     clock.run_virtual();
@@ -8604,9 +7802,6 @@ fn memory_run_clock() -> Arc<crate::supervise::fx::ScriptedClock> {
     clock
 }
 
-/// [`memory_run_on`] on `clock` ([`memory_run_clock`]): `stop_s` is read on it, after every
-/// request the loop makes, so a run waits out a reset in no real time and stops at the same
-/// step however loaded the machine (a minute of real time stays its hang detector).
 fn memory_run_at(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -8675,11 +7870,6 @@ fn memory_run_at(
     (m, lines, waits, dir)
 }
 
-/// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW. The loop
-/// that waited on the wall wrote it down (a `wall-wait@v1` ledger row: the
-/// notice and the reset as it PLACED it); a loop that starts after it — a GUI
-/// replacement, a fault — finds a screen with none of its rows and takes the
-/// wall up from that row: remembered, and waited on to the same reset.
 #[test]
 fn a_hidden_wall_its_predecessor_waited_on_is_seeded_only_while_it_stands() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -8751,8 +7941,6 @@ fn a_hidden_wall_its_predecessor_waited_on_is_seeded_only_while_it_stands() {
     }
 }
 
-/// Claude Code 2.1.296's five-hour limit with its own auto-continue armed (a lab capture), its
-/// reset `span` away so a test can cross it.
 fn auto_continue_wall_in(span: &str) -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
@@ -8768,17 +7956,12 @@ fn auto_continue_wall_in(span: &str) -> Vec<String> {
     .collect()
 }
 
-/// The same kind of limit after Esc on the countdown (the lab's capture):
-/// `⏺ Automatic continue cancelled · /rate-limit-options to re-arm`, an idle
-/// screen with no wall.
 fn auto_continue_cancelled() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_CANCELLED_MEASURED,
     )
 }
 
-/// A LIMIT WHOSE NOTICE LEFT IS WAITED ON ACROSS A LOOP'S RESTART (the review
-/// of 2026-10-14).
 #[test]
 fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
     let dir = crate::supervise::test_scratch_path("wm-ledger", "left-restart");
@@ -8841,8 +8024,6 @@ fn a_limit_whose_notice_left_is_waited_on_across_a_loop_restart() {
     );
 }
 
-/// The measured armed wall ([`auto_continue_wall_in`]'s) naming the bare
-/// clock `clock` for its reset and its countdown.
 fn auto_continue_wall_at(clock: &str) -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::WALL_SESSION_AUTO_CONTINUE_ARMED_MEASURED,
@@ -8852,18 +8033,12 @@ fn auto_continue_wall_at(clock: &str) -> Vec<String> {
     .collect()
 }
 
-/// The same kind of limit after Esc on the countdown, then — the limit
-/// lifted before its reset — a person's short turn under the cancel (Claude
-/// Code 2.1.299, the lab's capture): the limit's notice names `10:38am`.
 fn cancelled_then_a_persons_turn() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::WALL_SESSION_CANCELLED_THEN_PERSON_TURN_MEASURED,
     )
 }
 
-/// The wait on a limit whose notice left wakes on the screen too: the pushed agent verdict
-/// (`await agent busy,prompt,…`) is a sweep's and never publishes a turn shorter than the sweep,
-/// while the policy's own deadline is the reset, hours off.
 #[test]
 fn the_wait_on_a_left_limit_wakes_on_a_persons_short_turn() {
     let (m, lines, waits, jdir) = memory_run_on(
@@ -8922,37 +8097,24 @@ fn the_wait_on_a_left_limit_wakes_on_a_persons_short_turn() {
     );
 }
 
-/// Claude Code 2.1.300 after a `/clear`: conversation B at its own five-hour
-/// limit (`resets 9:19am`, 24 minutes past the watch tests' 08:55 PDT), its
-/// countdown armed (the lab's capture).
 fn armed_conversation_b() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::WALL_SESSION_ARMED_CONVERSATION_B_2_1_300,
     )
 }
 
-/// A `/resume` of conversation A at [`armed_conversation_b`]'s limit (the
-/// lab's capture, 2.1.300): A's history redrawn — its own older limit
-/// (`resets 8:48am`) and the vendor's continuation of it — B's countdown
-/// dropped.
 fn resumed_older_limit_continued() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::RESUMED_OLDER_LIMIT_CONTINUED_AT_ARMED_LIMIT_2_1_300,
     )
 }
 
-/// A `/clear` at an armed five-hour limit (the lab's capture, 2.1.300): the
-/// launch card and `❯ /clear`, nothing else.
 fn cleared_at_an_armed_limit() -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(
         aterm_phase::prompt::fixtures::CLEARED_AT_ARMED_LIMIT_2_1_300,
     )
 }
 
-/// A `/resume` at an armed limit types nothing into it (Claude Code 2.1.300). Conversation B's
-/// five-hour limit stands, its countdown armed; a person `/resume`s conversation A, whose
-/// history is redrawn: A's own older limit and the vendor's continuation of it (`⏺ Usage limit
-/// reset · continuing automatically`), no `❯` row under it.
 #[test]
 fn a_resume_at_an_armed_limit_types_nothing_into_it() {
     let (m, lines, waits, jdir) = memory_run_for(
@@ -8988,8 +8150,6 @@ fn a_resume_at_an_armed_limit_types_nothing_into_it() {
     );
 }
 
-/// A `/resume` at an armed limit drops the vendor's countdown, so the limit is waited on as a
-/// cancelled one (Claude Code 2.1.300).
 #[test]
 fn a_resume_at_an_armed_limit_waits_on_it_as_a_cancelled_one() {
     let resumed = aterm_phase::prompt::fixtures::screen(
@@ -9012,10 +8172,6 @@ fn a_resume_at_an_armed_limit_waits_on_it_as_a_cancelled_one() {
     );
 }
 
-/// A `/resume` at an armed model bucket types nothing into it. The lab's Sonnet bucket on Claude
-/// Code 2.1.300 (`resets Oct 17 at 4:20pm`, a month past the watch tests' clock), its countdown
-/// armed under the generic banner, is read as the bucket it is; no host here relaunches it on
-/// the fallback.
 #[test]
 fn a_resume_at_an_armed_bucket_types_nothing_into_it() {
     let armed = aterm_phase::prompt::fixtures::screen(
@@ -9041,10 +8197,6 @@ fn a_resume_at_an_armed_bucket_types_nothing_into_it() {
     );
 }
 
-/// A bucket whose countdown ended is waited on across a loop's restart. The same `/resume` at
-/// the armed Sonnet bucket: the first loop waits on the bucket's reset and keeps its wall open
-/// in the ledger (no `wall-wait-end@v1`), and the loop that follows on the `/resume`d screen
-/// takes it up (the bucket's reset and its grace, `model-bucket resets`) and types nothing.
 #[test]
 fn a_bucket_whose_countdown_ended_is_waited_on_across_a_loop_restart() {
     let (ldir, ledger) = ledger_at("bucket-restart");
@@ -9095,7 +8247,6 @@ fn a_bucket_whose_countdown_ended_is_waited_on_across_a_loop_restart() {
     );
 }
 
-/// A `/clear` at an armed limit closes the ledger's wall and says why (Claude Code 2.1.300).
 #[test]
 fn a_clear_at_an_armed_limit_closes_the_ledgers_wall_and_says_why() {
     let (ldir, ledger) = ledger_at("w4-clear");
@@ -9135,9 +8286,6 @@ fn a_clear_at_an_armed_limit_closes_the_ledgers_wall_and_says_why() {
     );
 }
 
-/// The measured armed limit ([`auto_continue_wall_at`]'s, `clock` its reset)
-/// drawn under the loop's own `keep going`: the stub answered the line with
-/// its 429 at once, so no read saw the worker busy since it was typed.
 fn own_act_met_a_limit(clock: &str) -> Vec<String> {
     auto_continue_wall_at(clock)
         .into_iter()
@@ -9145,9 +8293,6 @@ fn own_act_met_a_limit(clock: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`own_act_met_a_limit`] after Esc on the vendor's countdown: the measured
-/// cancel (`⏺ Automatic continue cancelled`), an idle screen with no wall, its
-/// newest notice naming `clock`.
 fn own_act_limit_cancelled(clock: &str) -> Vec<String> {
     auto_continue_cancelled()
         .into_iter()
@@ -9158,12 +8303,6 @@ fn own_act_limit_cancelled(clock: &str) -> Vec<String> {
         .collect()
 }
 
-/// A LIMIT MET AT ONCE WHOSE NOTICE LEFT BEFORE THE LOOP JUDGED IT IS WAITED
-/// ON TO THE RESET IT NAMED (Claude Code 2.1.300, the lab, 2026-10-14: the
-/// stub answers a line with a five-hour limit at once, `resets 10:38am`, an
-/// hour and 43 minutes past the test's 08:55, no busy read, and a person's
-/// Esc on the vendor's countdown takes the notice off the screen, leaving
-/// `⏺ Automatic continue cancelled`):
 #[test]
 fn a_limit_whose_notice_left_before_it_was_judged_is_waited_on_to_its_reset() {
     let act = || {
@@ -9255,9 +8394,6 @@ fn a_limit_whose_notice_left_before_it_was_judged_is_waited_on_to_its_reset() {
     }
 }
 
-/// A resume the limit answers inside its own take window (a new notice an hour out, Esc'd off
-/// the screen) is met, not taken: the new limit is waited on to its reset (16:55Z and its
-/// grace), the wall open in the ledger, nothing more typed.
 #[test]
 fn a_resume_the_limit_answers_inside_its_window_is_waited_on_to_the_new_reset() {
     let (dir, journal) = journal_file("te-takewin-retry");
@@ -9347,9 +8483,6 @@ fn a_resume_the_limit_answers_inside_its_window_is_waited_on_to_the_new_reset() 
     );
 }
 
-/// The measured cancel ([`auto_continue_cancelled`]) under a person's prompt: their turn met a
-/// five-hour limit (naming `clock`) and they cancelled before the loop's next read; no wall, and
-/// no act of the loop's under it.
 fn person_limit_cancelled(clock: &str) -> Vec<String> {
     auto_continue_cancelled()
         .into_iter()
@@ -9357,8 +8490,6 @@ fn person_limit_cancelled(clock: &str) -> Vec<String> {
         .collect()
 }
 
-/// The journal's waits, the `CONTINUED` lines and the ledger rows of one hostless `watch` over
-/// `screens` with short clocks, the first `held` screens sitting until a turn is sent.
 fn left_run(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -9402,9 +8533,6 @@ fn left_run(
     (lines, waits, typed, rows, m)
 }
 
-/// Another conversation's older cancelled limit, `/resume`d inside the act's window, cannot be
-/// told from the act's answer; nothing dates its print, so it is placed as a wall found sitting,
-/// never more than a session window out: `7:30am` at 08:55 is passed, not tomorrow's.
 #[test]
 fn an_older_cancelled_limit_resumed_inside_the_acts_window_is_no_days_wait() {
     let (lines, waits, typed, _, _) = left_run(
@@ -9428,9 +8556,6 @@ fn an_older_cancelled_limit_resumed_inside_the_acts_window_is_no_days_wait() {
     );
 }
 
-/// The measured armed limit as a weekly limit with bare clock reset `clock` (the vendor prints a
-/// bare clock for a reset within a day), under the loop's own `keep going`: the 429 came at
-/// once, so the done row above (`done 3:11 PM`) is an older turn's.
 fn weekly_met_by_own_act(clock: &str) -> Vec<String> {
     auto_continue_wall_at(clock)
         .into_iter()
@@ -9441,9 +8566,6 @@ fn weekly_met_by_own_act(clock: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`weekly_met_by_own_act`] after Esc on the vendor's countdown: the
-/// measured cancel, an idle screen with no wall, the newest notice naming
-/// `clock`.
 fn weekly_met_by_own_act_cancelled(clock: &str) -> Vec<String> {
     auto_continue_cancelled()
         .into_iter()
@@ -9456,12 +8578,6 @@ fn weekly_met_by_own_act_cancelled(clock: &str) -> Vec<String> {
         .collect()
 }
 
-/// A WALL READ INSIDE THE LOOP'S OWN ACT'S TAKE WINDOW ANSWERED THAT ACT, AND
-/// IS PLACED ON ITS PRINT (the prior review, residual (b)): the loop's `keep
-/// going` met a weekly limit, `resets 6am` read at 08:55 under an older
-/// turn's `done 3:11 PM` — no turn ran for the line, so nothing on the screen
-/// dates the notice — and Esc on the countdown took it off the screen inside
-/// the act's window.
 #[test]
 fn a_wall_read_inside_the_own_acts_window_is_placed_on_its_print() {
     let (dir, journal) = journal_file("te-takewin-placed");
@@ -9512,9 +8628,6 @@ fn a_wall_read_inside_the_own_acts_window_is_placed_on_its_print() {
     );
 }
 
-/// [`login_expired`] with a person's local command said under its row
-/// (`/model`, kept): the row is no longer the last thing said, and the
-/// screen reads idle with no wall — the login not back.
 fn login_left() -> Vec<String> {
     let mut r = login_expired();
     let at = r
@@ -9528,11 +8641,6 @@ fn login_left() -> Vec<String> {
     r
 }
 
-/// A LOST LOGIN THAT ANSWERED THE LOOP'S OWN ACT AND LEFT THE SCREEN INSIDE
-/// THE ACT'S TAKE WINDOW IS SIGNED IN (the prior review, 2026-10-14): the
-/// loop's `keep going` was answered at once by `⏺ Login expired · Please run
-/// /login`, and a person's `/model` under it took the row off the screen
-/// before the window's end.
 #[test]
 fn a_lost_login_left_inside_the_own_acts_window_types_login() {
     let (dir, journal) = journal_file("te-takewin-login");
@@ -9587,9 +8695,6 @@ fn a_lost_login_left_inside_the_own_acts_window_types_login() {
     );
 }
 
-/// A reprinted weekly wall (`resets 4pm`, met again at 16:13 after tries at 16:02 and 16:12) is
-/// not sent to tomorrow at once: a jump past the ladder's last rung on the same words is held
-/// four reprints, then believed (a bare clock means a reset within a day).
 #[test]
 fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
     let at = |h: i64, m: i64| TEST_NOW + (h - 8) * 3600 + (m - 55) * 60;
@@ -9651,8 +8756,6 @@ fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
     );
 }
 
-/// A wall's placed reset is cached under its words, and the cache is dropped once the worker has
-/// worked with no wall on the screen: the next wall of the same words is placed afresh.
 #[test]
 fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -9693,10 +8796,6 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
     assert_eq!(s.reprint_jumps, 0);
 }
 
-/// THE WAKE'S SETTLE IS SPREAD BY THE SESSION'S OWN SHARE, so the sessions
-/// of one account do not all type in the same second when the Mac wakes: a
-/// wait three hours ahead that the sleep carried past is decided again a
-/// settle later, and 20 sessions land on several distinct seconds.
 #[test]
 fn the_wakes_settle_is_spread_by_the_sessions_share() {
     let past = TEST_NOW + 8 * 3600;
@@ -9719,13 +8818,10 @@ fn the_wakes_settle_is_spread_by_the_sessions_share() {
     assert!(seconds.len() >= 8, "{seconds:?}");
 }
 
-/// Every line a step of the loop said or noted ([`Heard`]).
 fn heard_lines(heard: &Heard) -> Vec<String> {
     heard.said.iter().chain(&heard.noted).cloned().collect()
 }
 
-/// [`Session::wait_for_next`] sees a sleep between two of its steps (the wall clock jumps 4
-/// hours, the monotonic stands) and puts the wait it carried past a settle later.
 #[test]
 fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
     use super::super::turn_end_loop::{WAKE_SETTLE, WAKE_SPREAD};
@@ -9786,10 +8882,6 @@ fn a_sleep_between_two_steps_of_the_wait_is_seen_by_the_wait_itself() {
     assert!(lines.is_empty() && due.is_none(), "{lines:#?} {due:?}");
 }
 
-/// A WALL CLOCK STEPPED FORWARD IS NO SLEEP WHERE THE MACHINE COUNTS ITS
-/// SLEEP ([`Session::watch_sleep`]): the wait of the test above, on a
-/// machine that counts (`aterm_uds::process::asleep_since_boot`), its clock
-/// jumping four hours between two steps.
 #[test]
 fn a_clock_stepped_forward_is_no_sleep_where_the_machine_counts() {
     let run = |counts: bool, slept: bool| {
@@ -9833,13 +8925,6 @@ fn a_clock_stepped_forward_is_no_sleep_where_the_machine_counts() {
     assert_eq!(run(false, false), (true, vec![four]), "CONTROL: no count");
 }
 
-/// THE SLEEP UNDER A RECORDER: the staged sleep of the test above, its wait
-/// run once unrecorded and once with the door recording, says the same lines
-/// and leaves the same due — four hours in one read is the Mac's sleep
-/// either way, an ordinary tick or a step back is none either way (the
-/// recorder's stamps are peeks that never make the read a staged jump lands
-/// at: pinned by `tape::core`'s
-/// `a_stamp_never_makes_the_read_a_staged_jump_lands_at`).
 #[test]
 fn a_recorded_wait_sees_the_sleep_an_unrecorded_one_sees() {
     let run = |step: i64, recorded: bool| {
@@ -9902,14 +8987,10 @@ fn a_recorded_wait_sees_the_sleep_an_unrecorded_one_sees() {
     }
 }
 
-/// A door recording into memory over a fixed clock not yet fixed — the
-/// session's [`Session::set_clock`] fixes it through the door.
 fn memory_tape_clock() -> MemoryTape {
     MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())))
 }
 
-/// A due the sleep fell short of stands at its wall time ([`Session::due_at`]): three hours
-/// ahead, two slept, it falls an hour after the wake, not three ([`Session::woke`] leaves it).
 #[test]
 fn a_due_the_sleep_fell_short_of_falls_at_its_wall_time() {
     let seen = |seq: u64| Turn {
@@ -9955,15 +9036,11 @@ fn a_due_the_sleep_fell_short_of_falls_at_its_wall_time() {
     assert!(left > Duration::from_secs(3 * 3600 - 60), "{left:?}");
 }
 
-/// What one wait of the loop's ([`Session::wait_for_next`]) said and left: the
-/// lines heard, and the due standing after it (its reason).
 struct Waited {
     lines: Vec<String>,
     due: Option<String>,
 }
 
-/// One wait on `point` (a 600 ms budget on the session's clock), into `heard`: what it said
-/// new, and the due it left.
 fn wait_once(
     s: &mut Session<'_, Mock>,
     point: &Turn,
@@ -9984,7 +9061,6 @@ fn wait_once(
     }
 }
 
-/// `rows` at `seq` as the session's own reader takes the point.
 fn point_at(s: &Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
     s.turn_of(Screen {
         rows,
@@ -9993,16 +9069,12 @@ fn point_at(s: &Session<'_, Mock>, rows: Vec<String>, seq: u64) -> Turn {
     })
 }
 
-/// Whether `lines` hold a continuation under `rule`.
 fn continued(lines: &[String], rule: &str) -> bool {
     lines
         .iter()
         .any(|l| l.starts_with("CONTINUED seq=") && l.contains(&format!("rule={rule}")))
 }
 
-/// A reset the sleep carried past waits for the wake's settle though a repaint wakes the loop
-/// first (typed into an API the network cannot reach yet, a continuation is a wall of its own):
-/// `WAITING … the Mac woke`, then continued once.
 #[test]
 fn a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_the_loop() {
     use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
@@ -10071,8 +9143,6 @@ fn a_reset_the_sleep_carried_past_waits_for_the_settle_though_a_repaint_wakes_th
     assert_eq!(typed, 0);
 }
 
-/// A 529 back-off the Mac slept through is over once the wake settles (the rung counts on the
-/// wall clock, as every pause of the policy's): the retry is typed.
 #[test]
 fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
     use crate::supervise::policy::turn_end::RULE_API_RETRY;
@@ -10126,8 +9196,6 @@ fn a_back_off_the_mac_slept_through_is_over_once_the_wake_settles() {
     assert_eq!(typed, 0, "{:#?}", settled.lines);
 }
 
-/// An `Up` edge at the wake, which would decide the point at once, waits for the settle like the
-/// due it overtook, then goes once (`api-back@v1`).
 #[test]
 fn an_edge_at_the_wake_types_nothing_before_the_settle() {
     use crate::supervise::policy::turn_end::RULE_API_BACK;
@@ -10223,9 +9291,6 @@ impl IdleHost for WakeHost {
     }
 }
 
-/// The host's step at an idle point (the upgrade's notice, a relaunched agent's continuation)
-/// also types into the agent, so at the wake it is withheld until the settle
-/// (`guard=wake-settle`).
 #[test]
 fn the_hosts_step_at_the_wake_waits_for_the_settle() {
     let run = |slept: bool| {
@@ -10267,8 +9332,6 @@ fn the_hosts_step_at_the_wake_waits_for_the_settle() {
     assert!(withheld.is_empty(), "{withheld:?}");
 }
 
-/// What the wake's settle withholds is offered at the top of the following step: the wait's step
-/// is capped at the settle's fall ([`Session::wait_for_next`], as for [`IdleHost::wants_at`]).
 #[test]
 fn a_wait_inside_the_wakes_settle_steps_to_its_fall() {
     use super::super::turn_end_loop::WAKE_SETTLE;
@@ -10308,21 +9371,12 @@ fn a_wait_inside_the_wakes_settle_steps_to_its_fall() {
     assert!(asked > 300, "the budget's step: {asked} ms");
 }
 
-/// THE CARET DRAWN AFTER THE ROWS: a point read between Claude Code's frame and its caret (the
-/// cursor still under the composer) is withheld from the host as `not-authoritative`, and the
-/// caret's move bumps no content seq, so no wait on the content wakes for it. The wait reads the
-/// cursor again at each wake while the caret alone withholds the point
-/// ([`Session::caret_withholds`]), and the host steps once the caret stands in the composer —
-/// a relaunched agent's owed carry-on, withheld for good under load before (host_live's
-/// `an_agent_that_exits_unasked_is_relaunched_on_its_conversation`). Negative control: a caret
-/// never drawn, never a step.
 #[test]
 fn a_point_withheld_on_its_caret_alone_is_offered_once_the_caret_lands() {
     let run = |lands: bool| {
         let host = Arc::new(WakeHost::default());
         host.wanting.store(true, Ordering::SeqCst);
         let mut m = Mock::new(vec![idle_screen()]);
-        // The screen sits: every read after the point's is its content at its seq.
         m.turn_releases = Some(0);
         if lands {
             m.caret_after_reads = Some(1);
@@ -10354,20 +9408,12 @@ fn a_point_withheld_on_its_caret_alone_is_offered_once_the_caret_lands() {
         lines.iter().any(|l| l.contains("upgrade step=carry-on")),
         "{lines:#?}"
     );
-    // Negative control.
     let (steps, withheld, at_seq, lines) = run(false);
     assert!(at_seq, "{lines:#?}");
     assert_eq!(withheld, ["not-authoritative"], "{lines:#?}");
     assert_eq!(steps, 0, "{lines:#?}");
 }
 
-/// THE CARET READ AGAIN OVER CONTENT THAT MOVED ([`Screen::take_cursor_of`]): the point was
-/// read between Claude Code's frame and its caret (withheld `not-authoritative`), and the wait's
-/// re-read at its wake finds another frame drawn since (another seq, other rows) with the cursor
-/// in its composer. The wait ends there, for the loop to look again, and the host is offered
-/// nothing on the rows read before: the fresh cursor laid over them would vouch for a frame
-/// nobody drew. Negative control: the same content, its caret landed, is offered
-/// ([`a_point_withheld_on_its_caret_alone_is_offered_once_the_caret_lands`]).
 #[test]
 fn a_caret_read_again_over_content_that_moved_offers_the_old_point_nothing() {
     let host = Arc::new(WakeHost::default());
@@ -10375,7 +9421,6 @@ fn a_caret_read_again_over_content_that_moved_offers_the_old_point_nothing() {
     let mut moved = idle_screen();
     moved[0] = "⏺ Done, and the docs are updated too.".to_string();
     let mut m = Mock::new(vec![idle_screen(), moved]);
-    // The point sits for every wait; its re-read finds the next frame.
     m.turn_releases = Some(0);
     m.caret_after_reads = Some(1);
     m.redrawn_after_reads = Some(1);
@@ -10407,9 +9452,6 @@ fn a_caret_read_again_over_content_that_moved_offers_the_old_point_nothing() {
     );
 }
 
-/// A background break offered to the host on a busy read
-/// ([`Session::host_steps_in_background`]) is withheld in the wake's settle; on a busy turn only
-/// a request ([`Session::call`]) can see the sleep.
 #[test]
 fn the_hosts_background_step_at_the_wake_waits_for_the_settle() {
     let bg = || {
@@ -10460,9 +9502,6 @@ fn the_hosts_background_step_at_the_wake_waits_for_the_settle() {
     assert!(withheld.is_empty(), "{withheld:?}");
 }
 
-/// A point after a sleep a request saw is held only until the wake's settle, counted from the
-/// wake, not from the first act after it: decided inside the settle it waits (`WAITING … the Mac
-/// woke`); after a busy turn that outlasted the settle it is typed at once.
 #[test]
 fn a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle() {
     use crate::supervise::policy::turn_end::RULE_CONTINUE;
@@ -10511,7 +9550,6 @@ fn a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle() {
     assert_eq!(typed, 1, "{lines:#?}");
 }
 
-/// A screen as the loop reads one.
 fn read_screen(rows: Vec<String>) -> Screen {
     Screen {
         rows,
@@ -10532,8 +9570,6 @@ fn read_screen(rows: Vec<String>) -> Screen {
     }
 }
 
-/// THE HERD SPREAD (the accounts' sessions all reach the reset in the same
-/// second and all type in it).
 #[test]
 fn a_sessions_jitter_is_stable_bounded_and_spread() {
     use super::super::turn_end_loop::resume_jitter;
@@ -10579,9 +9615,6 @@ fn a_sessions_jitter_is_stable_bounded_and_spread() {
     );
 }
 
-/// An undated cancelled limit (only the screen read it) is placed on the act's print and kept
-/// within a session window: at 08:55, `7:30am` and `11:50pm` are passed, `10:38am` stands, a
-/// date or a span is what it names.
 #[test]
 fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -10626,11 +9659,6 @@ fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
     assert_eq!(placed("11:50pm", false), 14 * hour + 55 * min);
 }
 
-/// EVERY UNIX SECOND IS ITSELF, AT EVERY PHASE OF THE CLOCK. One placement
-/// is one stamp, whatever part of a second each read fell in: a conversion
-/// that carries its read's sub-second phase puts a reading made before a
-/// second turns and a stamp made after it a second apart (`until=…:19Z`,
-/// then `until=…:20Z`, for one wait).
 #[test]
 fn a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -10666,8 +9694,6 @@ fn a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock() {
     );
 }
 
-/// The loop that waits on a wall writes a `wall-wait@v1` row (the placed reset), and a live turn
-/// under the wall ends it with `wall-wait-end@v1`.
 #[test]
 fn the_wall_waited_on_is_written_to_the_ledger_and_its_end_too() {
     use crate::supervise::approvals;
@@ -10739,8 +9765,6 @@ fn the_wall_waited_on_is_written_to_the_ledger_and_its_end_too() {
     assert!(open.is_none(), "{rows}");
 }
 
-/// An idle screen or a question, folded in ([`Session::observe_point`]) after work, ends the
-/// wall memory, so a later background-only screen is not read as the old wall.
 #[test]
 fn an_idle_screen_or_a_question_ends_the_wall_memory() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -10791,10 +9815,6 @@ fn an_idle_screen_or_a_question_ends_the_wall_memory() {
     assert!(r.wall.is_some(), "the scrolled screen is the wall still");
 }
 
-/// AGY'S AND MUSE CODE'S OWN BACKGROUND WORK KEEPS THE REMEMBERED WALL, AS
-/// CLAUDE CODE'S DOES (the verifier of the background reading: a busy read
-/// of that work ended the memory as a live turn would, where Claude Code's
-/// scrolled screen over its shell keeps it and reads limited).
 #[test]
 fn agy_and_muse_background_work_keeps_the_remembered_wall() {
     use aterm_phase::agy::fixtures::lab as a;
@@ -10845,11 +9865,6 @@ fn agy_and_muse_background_work_keeps_the_remembered_wall() {
     }
 }
 
-/// TIER-1 FOR THE HIDING HALF OF `SupervisorUsageWall`
-/// (`aterm_models_harness::supervisor_usage_wall_model`, dial `Hidden = 1`): the
-/// wall's rows leave the screen while the agent's shell keeps the tab reading
-/// busy (`WallHides`), and come back (`WallShows`); the loop's memory
-/// ([`wall_memory`]) is what keeps the wall a wall meanwhile (`mem`).
 #[test]
 fn tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does() {
     use aterm_models_harness::supervisor_usage_wall_model;
@@ -10945,9 +9960,6 @@ fn tier1_the_real_loop_remembers_a_hidden_wall_exactly_where_the_model_does() {
     );
 }
 
-/// The wait and the budget stretched past it (`EXTEND`) read the one reset the loop placed
-/// (`place_reset`): an evening `resets 9am` weekly wall is tomorrow's 9am for both, never the
-/// session rule's past.
 #[test]
 fn the_budget_is_stretched_to_the_reset_the_wait_holds_for() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -10981,11 +9993,6 @@ fn the_budget_is_stretched_to_the_reset_the_wait_holds_for() {
     );
 }
 
-/// THE WAIT PLACES A RESET ACROSS A DAYLIGHT-SAVING CHANGE with the offset its
-/// zone has where it falls ([`limit::place_reset_with`]), not the one it has
-/// when the notice is read: the placement the continuation's wait is built on
-/// (`reset_unix_for`), for a bare clock with and without a print to go by,
-/// and a dated one.
 #[test]
 fn the_wait_places_a_reset_across_a_dst_change_with_the_offset_there() {
     fn la(zone: &str, unix: i64) -> Option<i64> {
@@ -11060,9 +10067,6 @@ impl IdleHost for LadderHost {
     }
 }
 
-/// The stall's end keeps the point under it: the host has one exception slot per tab, so when
-/// the raised stall ends while a point's exception still stands, the host is told that point
-/// again, not `None`.
 #[test]
 fn a_stall_that_ends_tells_the_host_the_point_that_stood_under_it() {
     use crate::supervise::policy::outlook::ExceptionKind;
@@ -11089,9 +10093,6 @@ fn a_stall_that_ends_tells_the_host_the_point_that_stood_under_it() {
     assert_eq!(end(false), ["unread:none", "exception:none"]);
 }
 
-/// A screen busy on background work alone while the agent's title rests on the idle glyph (`✳`)
-/// is unread: `STUCK` after the unit (`stuck_after`), `STALLED` and the host's record at three
-/// units, `EXCEPTION kind=stalled` at six, each once, withdrawn at the loop's end; nothing typed.
 #[test]
 fn a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraws_both() {
     let scrolled = memory_scrolled();
@@ -11177,8 +10178,6 @@ fn a_stall_kept_up_climbs_to_a_record_and_then_an_exception_and_its_end_withdraw
     }
 }
 
-/// THE CANARY NAMES A BACKGROUND CALL THAT MAKES NO PROGRESS (the hung-call
-/// design's R1; system awareness §14.5).
 #[test]
 fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_exception() {
     use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
@@ -11319,11 +10318,6 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
     );
 }
 
-/// THE CANARY ON AGY'S AND MUSE CODE'S OWN BACKGROUND WORK THAT NEVER ENDS
-/// (the review of the hard rule: their readers hold an ended turn, and a
-/// question it ended on over a task or a shell, busy while that work runs,
-/// and the canary climbed on Claude Code's screen alone, so a backgrounded
-/// server held the question for ever with nothing typed and nothing said).
 #[test]
 fn agy_or_muse_background_work_that_never_ends_climbs_the_canary() {
     use aterm_phase::agy::fixtures::lab as a;
@@ -11481,10 +10475,6 @@ fn agy_or_muse_background_work_that_never_ends_climbs_the_canary() {
     }
 }
 
-/// THE CANARY'S WORDS ON AGY AND MUSE CODE MUST STAND STILL: their title is
-/// unmeasured, so what vouches that the agent does not work through the
-/// unit is that the work named, the words above the composer and the draft
-/// have not moved.
 #[test]
 fn the_canarys_words_on_agy_or_muse_must_stand_still() {
     use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
@@ -11600,7 +10590,6 @@ fn the_canarys_words_on_agy_or_muse_must_stand_still() {
     assert_eq!(s.stuck_still, None);
 }
 
-/// THE CANARY'S WORDS MOVING AFTER ITS EXCEPTION END IT (nothing tested a move once a rung was reached).
 #[test]
 fn the_canarys_words_moving_after_its_exception_clear_it() {
     use super::super::wall_memory::StuckRung;
@@ -11715,10 +10704,6 @@ fn the_canarys_words_moving_after_its_exception_clear_it() {
     assert_eq!(s.stuck_rung, StuckRung::Said);
 }
 
-/// A dialog no reader names (Claude Code 2.1.292's classifier-billing notice), idle with its
-/// words still and the title resting, climbs the same ladder (`EXCEPTION kind=dialog`) on a third
-/// of the busy flavour's clock, nothing typed, on a screen that holds still and on one that never
-/// does (`idle_never`).
 #[test]
 fn a_dialog_no_reader_names_climbs_to_a_record_and_a_line_and_its_end_withdraws_both() {
     let notice = crate::supervise::prompt::fixtures::screen(
@@ -11914,11 +10899,6 @@ impl IdleHost for RepoHost {
     }
 }
 
-/// A DONE CLAIM OVER WORK NO REMOTE MAIN HAS through the real supervisor and
-/// its host (Autopilot Cruise, the repository's suffix): a done report while
-/// the host's probe of the session's repository finds an uncommitted file
-/// gets the done check with [`repo_work_suffix`] after it — naming the
-/// repository, its counts and the path — and no `DONE`.
 #[test]
 fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
     let report = |lines: &[&str]| {
@@ -12008,11 +10988,6 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         "{lines:#?}"
     );
 }
-/// A PERSON'S GREETING LEFT TO THEM STAYS THEIRS IN THE NEXT LOOP (the
-/// review's RR3-TE-2): the loop that left it ledgers the turn it left (a
-/// `skipped` row under `left-to-person@v1`, keyed by the screen's last words
-/// where no host reads the transcript), and a new loop on the same ledger
-/// and the same screen, with no person's stamp of its own, types nothing.
 #[test]
 fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let greeting = "Hi! What would you like me to work on?";
@@ -12121,10 +11096,6 @@ impl IdleHost for LagHost {
     }
 }
 
-/// A PERSON'S EXCHANGE IS LEFT UNDER ITS PROMPT'S KEY, HOWEVER LATE THE
-/// TRANSCRIPT (the review's RR4-TE-3): the loop decides the
-/// moment the busy row leaves, and the reply's rows reach the transcript a
-/// flush or more later.
 #[test]
 fn a_persons_exchange_is_left_under_its_prompts_key() {
     let greeting = "Hi! What would you like me to work on?";
@@ -12247,11 +11218,6 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PERSON'S EXCHANGE AN OLDER BUILD NOTED LEFT STAYS THEIRS IN THE NEXT
-/// LOOP (done-5): a build through 0.105.0 journals `LEFT
-/// seq=<n> rule=left-to-person@v1 …` and writes no row naming the turn it
-/// left, so the first loop after the update typed the done check into the
-/// person's greeting.
 #[test]
 fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() {
     use crate::supervise::journal::JournalRecord;
@@ -12366,11 +11332,6 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PERSON'S OWN EXCHANGE AT A WALL STAYS THEIRS IN THE NEXT LOOP (the
-/// review's RR4-TE-2): a person's quick message met a 529 (Claude Code
-/// 2.1.294's measured transcript: the prompt `lag-e5`, the overload's
-/// notice, its `turn_duration`), and the loop that saw it was gone before
-/// its retry.
 #[test]
 fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
     use crate::supervise::policy::turn_end::{RULE_ANSWER, RULE_API_RETRY};
@@ -12472,11 +11433,6 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A PERSON'S EXCHANGE RETRIED AT A WALL STAYS THEIRS IN THE NEXT LOOP
-/// : a person's quick message met a 529 (Claude Code
-/// 2.1.294's measured transcript), the loop that saw it ledgered the
-/// exchange at the wall, typed the retry, and was gone before the retry's
-/// answer.
 #[test]
 fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
     use crate::supervise::policy::turn_end::RULE_API_RETRY;
@@ -12598,9 +11554,6 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A person's question is theirs though its answer takes minutes, through the real supervisor:
-/// their question, then a three-minute answer that looked things up, gets nothing typed, and the
-/// journal says once why.
 #[test]
 fn a_persons_question_answered_at_length_is_left_to_them() {
     let answered = |worked: &str| {
@@ -12658,10 +11611,6 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
     }
 }
 
-/// CLAUDE CODE'S OWN HOUSEKEEPING IS NO TURN (2026-10-15, two of the owner's
-/// tabs typed `keep going` an hour after their finished reports): a spinner,
-/// then a screen whose last thing said is `⏺ Compacted while idle, before the
-/// prompt cache expired`.
 #[test]
 fn claude_codes_idle_compaction_is_no_turn() {
     use aterm_phase::prompt::fixtures::{
@@ -12821,11 +11770,6 @@ impl IdleHost for RecordHost {
     }
 }
 
-/// A PERSON'S EXCHANGE LEFT TO THEM STAYS THEIRS UNDER AN IDLE COMPACTION
-/// (the merge review's XR-1, against main's a4a25f634): the greeting left to
-/// its person (`left-to-person@v1`, keyed `answer:a-1`), then Claude Code
-/// compacted the idle conversation by itself, and a new loop (a seamless
-/// update, a fault) attaches there.
 #[test]
 fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
     let greeting = "Hi! What would you like me to work on?";
@@ -13012,8 +11956,6 @@ impl AccountHost {
         })
     }
 
-    /// The host advises a move to `to` at every point, and its relaunch
-    /// answers `answer`.
     fn moving(to: &str, answer: &'static str) -> Arc<Self> {
         Self::scripted(
             &[Some(AccountAdvice::Move { to: to.to_string() })],
@@ -13021,7 +11963,6 @@ impl AccountHost {
         )
     }
 
-    /// Everything said to it that starts with `prefix`, in order.
     fn said(&self, prefix: &str) -> Vec<String> {
         self.said
             .lock()
@@ -13036,7 +11977,6 @@ impl AccountHost {
         self.said.lock().unwrap().clone()
     }
 
-    /// What the loop told of its exceptions, in order, without the counts.
     fn told(&self) -> Vec<String> {
         self.told
             .lock()
@@ -13191,12 +12131,8 @@ impl IdleHost for AccountHost {
     }
 }
 
-/// 2026-09-17T17:05:00-07:00: three minutes after [`limited_screen`]'s done
-/// row, its `7:30pm` reset still ahead.
 const ACCOUNT_NOW: i64 = TEST_NOW + 8 * 3600 + 10 * 60;
 
-/// One watch over `screens` under `host`, its approval ledger at `ledger`:
-/// the lines, the server's record and the journal's lines.
 fn account_run(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -13206,7 +12142,6 @@ fn account_run(
     account_run_with(tag, screens, host, ledger, |_| {})
 }
 
-/// [`account_run`] over a server `setup` changes further.
 fn account_run_with(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -13233,11 +12168,6 @@ fn account_run_with(
     (lines, m, records.into_iter().map(|r| r.line).collect())
 }
 
-/// AT A WALL the host's advice to move is ITS RELAUNCH: asked once, the label
-/// its only name — `RESTARTED seq=<n> rule=account-rotate@v1 relaunch under
-/// account work-2 (…)`, a `typed` ledger row a later loop reads back as a
-/// move made and still to be answered — and nothing is typed into the agent
-/// at the wall.
 #[test]
 fn a_wall_with_an_account_to_move_to_is_the_hosts_relaunch() {
     use crate::supervise::approvals::{account_moves, open_account_move, open_wall};
@@ -13332,9 +12262,6 @@ fn a_wall_with_an_account_to_move_to_is_the_hosts_relaunch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A move ahead of a wall the host cannot make yet (`wait:changed`) never holds the point: the
-/// continuation is typed and the move deferred (`DEFERRED … restart:account-ahead`), or a tab
-/// with a job always running would never be continued.
 #[test]
 fn a_move_ahead_the_host_defers_never_holds_the_continuation() {
     let end = || vec![busy_screen(), ended("Stage 3 done; the suite is green.")];
@@ -13381,9 +12308,6 @@ fn a_move_ahead_the_host_defers_never_holds_the_continuation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An account move's relaunch answers `done:resumed` at the relaunched agent's first idle point,
-/// typing nothing, so the loop decides that point and types exactly what it would with no
-/// roster.
 #[test]
 fn a_move_ahead_of_a_wall_types_nothing_and_its_point_is_decided_as_with_no_move() {
     let done = "Stage 3 done; the suite is green.";
@@ -13445,7 +12369,6 @@ fn a_move_ahead_of_a_wall_types_nothing_and_its_point_is_decided_as_with_no_move
     assert_ne!(carried, unmoved, "{log}");
 }
 
-/// The point at `rows` in `phase` (seq 102, the cursor at column 2).
 fn account_point_of(rows: Vec<String>, phase: Phase) -> Turn {
     Turn {
         phase,
@@ -13466,8 +12389,6 @@ fn account_opts(host: &Arc<AccountHost>) -> SuperviseOpts {
     }
 }
 
-/// The host is asked for its advice once per decision, however often the point's reading is
-/// rebuilt; a point decided again asks again.
 #[test]
 fn the_host_is_asked_for_its_advice_once_a_decision() {
     let host = AccountHost::scripted(
@@ -13516,10 +12437,6 @@ fn the_host_is_asked_for_its_advice_once_a_decision() {
     );
 }
 
-/// A WAIT THAT STANDS ON THE HOST'S ADVICE IS DECIDED AGAIN WHEN THE HOST'S
-/// STAMP MOVES ([`IdleHost::account_stamp`], [`Session::account_edge`]; the
-/// accounts design §6: the owner's `accounts use`, an account proven or
-/// struck by another session — none of which moves this session's screen).
 #[test]
 fn a_wait_on_the_hosts_advice_is_decided_again_when_its_stamp_moves() {
     let host = AccountHost::scripted(
@@ -13580,8 +12497,6 @@ fn a_wait_on_the_hosts_advice_is_decided_again_when_its_stamp_moves() {
     assert!(!s.account_edge(&opts), "nothing is waited on");
 }
 
-/// That edge is seen inside the loop's wait ([`Session::wait_for_next`]): the stamp moving while
-/// a session waits at its limit asks the host again and makes its relaunch.
 #[test]
 fn news_of_the_accounts_ends_a_sessions_wait_at_its_limit() {
     let wall = || vec![busy_screen(), limited_screen()];
@@ -13626,14 +12541,6 @@ fn news_of_the_accounts_ends_a_sessions_wait_at_its_limit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LOST LOGIN WITH NO ACCOUNT LEFT IS SIGNED IN WHERE IT STANDS (the
-/// owner's , after v0.106.0 waited at it and told
-/// nobody): the session's own move to `pool-a` met a lost login, the host
-/// struck it and advises nothing at all, so no move will come — the loop
-/// types `/login` ONCE and, where its hand-off to the browser stands, tells
-/// its host the owner is needed NOW (the notice, with no badge beside it),
-/// so the window asks for the sign-in on the glass; the ask ends when the
-/// agent works again.
 #[test]
 fn a_lost_login_with_no_account_left_types_login_and_asks_its_sign_in_now() {
     use crate::supervise::approvals::{ACCOUNT_MOVE_COMMAND, Outcome, Row, account_switch_reason};
@@ -13758,13 +12665,6 @@ fn a_lost_login_with_no_account_left_types_login_and_asks_its_sign_in_now() {
     );
 }
 
-/// A ONE-LOGIN MACHINE'S LOGIN ENDS (accounts v2 S7, REVERSED BY THE
-/// OWNER'S — v0.106.0's very configuration: one roster
-/// row with an email, `accounts = "off"`, `logins` on): there is no move
-/// behind it and the host advises none, so the loop types `/login` ONCE and,
-/// where its hand-off to the browser stands, tells its host the owner is
-/// needed NOW (no badge beside it) to finish the sign-in in the browser —
-/// never a renewal.
 #[test]
 fn a_one_login_machine_types_login_once_and_asks_its_sign_in_now() {
     let mut login = rows(&[
@@ -13872,11 +12772,6 @@ fn a_one_login_machine_types_login_once_and_asks_its_sign_in_now() {
     assert!(host.said("account").is_empty(), "nothing asked: {log}");
 }
 
-/// THE SIGN-IN'S NOTICE OUTLASTS ITS DIALOG'S BUSY READS (the review's F6,
-/// `run.rs`'s busy read, [`crate::supervise::policy::login::dialog_stands`]):
-/// once `/login`'s hand-off stands and its notice is told, a read of the
-/// dialog's own spinner (`Opening browser to sign in…`, which reads busy) is
-/// no agent working: the notice stands, and ends only with the loop.
 #[test]
 fn the_sign_ins_notice_outlasts_its_dialogs_busy_reads() {
     let mut login = rows(&[
@@ -13940,11 +12835,6 @@ fn the_sign_ins_notice_outlasts_its_dialogs_busy_reads() {
     assert!(working(&journal), "{log}");
 }
 
-/// `/login`'s SUCCESS GETS ITS ENTER ONCE, AT SESSION LEVEL (the review's F8,
-/// [`Session::confirm_dialog`]): the loop's own `/login` signed in, Claude
-/// Code's `Login successful. Press Enter to continue…` is pressed once —
-/// fenced on the read's generation and person count and on the success row
-/// — booked `TYPED … rule=login-done@v1`.
 #[test]
 fn the_login_success_gets_one_fenced_enter() {
     let mut login = rows(&[
@@ -14070,12 +12960,6 @@ fn the_login_success_gets_one_fenced_enter() {
     }
 }
 
-/// THE PICKER OF THE LOOP'S OWN `/login` IS ANSWERED WITH THE METHOD THE
-/// LOGIN ALREADY IS, AT SESSION LEVEL (the review's F8, the approval loop's
-/// [`crate::supervise::policy::login::RULE_LOGIN_METHOD`]): the host says the
-/// session's login is a subscription ([`IdleHost::login_method`]), so the
-/// picker its `/login` opened gets that row — its keys fenced on the read's
-/// person count.
 #[test]
 fn the_picker_of_its_own_login_gets_the_method_the_login_is() {
     let mut login = rows(&[
@@ -14143,10 +13027,6 @@ fn the_picker_of_its_own_login_gets_the_method_the_login_is() {
     assert!(keys(&m).is_empty(), "no key without its fence: {log}");
 }
 
-/// A RENEWED LOGIN THAT NOTHING RELAUNCHES THE TAB ONTO (accounts v2 S7,
-/// `relaunch = false`): the session's process is still on the login the
-/// renewal replaced, as its host says at the lost login
-/// ([`IdleHost::login_superseded`]), so no renewal reaches it.
 #[test]
 fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
     let mut login = rows(&[
@@ -14244,12 +13124,6 @@ fn a_renewed_login_nothing_relaunches_the_tab_onto_is_never_renewed_again() {
     );
 }
 
-/// The renewal's edge keeps what the decision read (accounts v2 S7): the host's stamp is read
-/// before it answers whether the process holds a login a renewal replaced, so a renewal that
-/// lands right after that answer, before the loop reads anything else, is news to the point
-/// decided on it; and a read for the loop's books after the decision (its own answer the
-/// renewal's) leaves the decision's mark alone, so the wait's edge still decides the point
-/// again, once.
 #[test]
 fn the_renewal_edge_keeps_what_the_decision_read() {
     let mut login = rows(&[
@@ -14294,10 +13168,6 @@ fn the_renewal_edge_keeps_what_the_decision_read() {
     assert!(!s.account_edge(&opts), "once");
 }
 
-/// The host is told once what answered the move, before the same point asks its advice, so a
-/// host that strikes the account advises the next in that answer: served at the first turn after
-/// the relaunch that ends with no wall; a limit or a lost login only once a turn was asked under
-/// the new login.
 #[test]
 fn the_rosters_word_is_asked_at_a_weekly_limit_alone() {
     use crate::supervise::policy::turn_end::{RosterWord, TurnEndReading};
@@ -14345,12 +13215,6 @@ fn the_rosters_word_is_asked_at_a_weekly_limit_alone() {
     assert_eq!(host.roster_asked.load(Ordering::SeqCst), 1);
 }
 
-/// A `/login` LEFT AT A WEEKLY LIMIT ASKS THE ROSTER'S WORD TOO (the review
-/// of the login carry, acct3-1): `❯ /login` / `⎿  Login interrupted` draws
-/// over the limit's row, the reader gives no wall there, and asked at the
-/// row alone the loop handed the notice no word — the owner was told to type
-/// `/login` in the tab, which writes whatever account the browser signs in
-/// into the roster row's own login.
 #[test]
 fn a_login_left_at_a_weekly_limit_asks_the_rosters_word() {
     use crate::supervise::policy::exception::exception_for;
@@ -14428,10 +13292,6 @@ fn a_login_left_at_a_weekly_limit_asks_the_rosters_word() {
     }
 }
 
-/// THE OWNER'S `relaunch = false` IS READ AT A WEEKLY LIMIT WITHOUT RAISING A
-/// STANDING ALERT BANNER: a window's host masks the key out of the loop's
-/// config, so the loop asks the host for it where the roster's word is read,
-/// while weekly usage limits stay silent on the glass.
 #[test]
 fn a_relaunch_the_host_switched_off_is_named_at_a_weekly_limit() {
     use crate::supervise::policy::exception::exception_for;
@@ -14494,13 +13354,6 @@ fn a_relaunch_the_host_switched_off_is_named_at_a_weekly_limit() {
     }
 }
 
-/// A RELAUNCH THE OWNER SWITCHES ON REACHES A TAB WAITING AT ITS WEEKLY LIMIT
-/// (the review of the login carry, r5h-1): with the host's `relaunch` off no
-/// advice is asked there — no move could follow — so the decision kept none,
-/// and the stamp the host moves at the owner's edit (`relaunch` is masked
-/// out of the loop's config and hands no worker over) was news to nothing:
-/// the tab waited the week out under a notice naming `relaunch = true`, a
-/// line already set.
 #[test]
 fn a_relaunch_switched_on_reaches_a_tab_waiting_at_its_weekly_limit() {
     use crate::supervise::policy::turn_end::{Ready, RosterWord};
@@ -14588,8 +13441,6 @@ fn a_relaunch_switched_on_reaches_a_tab_waiting_at_its_weekly_limit() {
     }
 }
 
-/// An idle screen after a weekly limit (`message`): the limit's row, then
-/// `tail` (a `/login` and its outcome, a turn served), then the composer.
 fn after_weekly_limit(message: &str, tail: &[&str]) -> Vec<String> {
     let mut body = vec![
         "⏺ Running the suite again.".to_string(),
@@ -14604,10 +13455,6 @@ fn after_weekly_limit(message: &str, tail: &[&str]) -> Vec<String> {
     r
 }
 
-/// AN ACCOUNT ADDED AT A `/login` LEFT AT A WEEKLY LIMIT REACHES THE TAB
-/// THOUGH NOTHING WAITS THERE (the review of the login carry, r9h-1): under
-/// `resume_limits = false` the point does nothing (no wait: nothing goes on
-/// past the reset), and its notice asks for another account (`lp`).
 #[test]
 fn an_account_added_at_a_login_left_at_a_weekly_limit_reaches_the_tab() {
     use crate::supervise::policy::turn_end::{Ready, RosterWord};
@@ -14690,7 +13537,6 @@ fn an_account_added_at_a_login_left_at_a_weekly_limit_reaches_the_tab() {
         assert_eq!(s.account_edge(&opts), news, "the accounts' news");
         assert!(!s.account_edge(&opts), "{news}: once");
         if !news {
-            // NEGATIVE CONTROL: no news, nothing decided again.
             assert_eq!(told(&s), None);
             continue;
         }
@@ -14701,12 +13547,6 @@ fn an_account_added_at_a_login_left_at_a_weekly_limit_reaches_the_tab() {
     }
 }
 
-/// A LIMIT'S END TELLS THE HOST HOW IT ENDED (the review of the login carry,
-/// r9h-2, r9h-3): a weekly limit the worker works past at its reset, no
-/// sign-in there, is over unfixed (`limit_over`), never a login back; a
-/// person's `/login` there tells nothing at its `Login successful` (the
-/// same account may have signed in), and the worker's work past the limit
-/// after it is the login back, once.
 #[test]
 fn a_limits_end_tells_the_host_how_it_ended() {
     let weekly = "You've hit your weekly limit · resets Sep 23 at 8am (America/Los_Angeles)";
@@ -14778,10 +13618,6 @@ fn a_limits_end_tells_the_host_how_it_ended() {
     }
 }
 
-/// A DRAFT CLEARED AT A WEEKLY LIMIT LETS THE MOVE BE ASKED (the review of
-/// the login carry, r7h-3): beside a ready row nothing holds the tab off, a
-/// draft alone holds the switch, and the owner is told so (`ld`, whose step
-/// is the draft's going).
 #[test]
 fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
     use crate::supervise::policy::turn_end::{Ready, RosterWord};
@@ -14869,11 +13705,6 @@ fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
     assert_eq!(told, None);
 }
 
-/// A MOVE ANSWERED BY A LOST LOGIN IS NOT SERVED BY ITS `/login` DIALOG (the
-/// review of the login carry, acct3-2): the dialog's spinner reads busy, and
-/// at its `Login interrupted` the told move was said served — the host proved
-/// the dead login and marked it `ok`, a rotation candidate other sessions
-/// were moved onto.
 #[test]
 fn a_moves_lost_login_is_not_served_by_its_login_dialog() {
     use crate::supervise::policy::turn_end::{TurnEndReading, decide_turn_end};
@@ -15076,9 +13907,6 @@ fn the_host_is_told_once_what_answered_the_move() {
     );
 }
 
-/// R10/R5: A LOST LOGIN AFTER A TURN ASKED UNDER THE LOGIN THE MOVE CHOSE IS
-/// TOLD — STRUCK ON THAT LOGIN — BEFORE ANY ADVICE FOR THAT POINT IS ASKED,
-/// though no read saw that turn busy.
 #[test]
 fn a_lost_login_no_read_saw_busy_is_struck_before_the_host_is_asked() {
     use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
@@ -15198,10 +14026,6 @@ fn a_lost_login_no_read_saw_busy_is_struck_before_the_host_is_asked() {
     );
 }
 
-/// T1/T6: A LOOP STARTED ON A TOLD MOVE AN HOUR AND MORE OLD HOLDS IT: the
-/// session was moved to `pool-a`, whose lost login was told (its row says
-/// `until=served`), and ninety minutes on its agent is relaunched under that
-/// login.
 #[test]
 fn a_loop_started_on_an_old_told_move_waits_at_its_lost_login() {
     use crate::supervise::approvals::{
@@ -15283,9 +14107,6 @@ fn a_loop_started_on_an_old_told_move_waits_at_its_lost_login() {
     );
 }
 
-/// The point read again once an account relaunch is made tells nothing: the screen is the old
-/// process's, but the host now judges the new one (told, `work-2`'s limit would be charged to
-/// `pool-a`).
 #[test]
 fn the_point_read_again_after_an_account_relaunch_tells_nothing() {
     let wall = limited_screen();
@@ -15343,9 +14164,6 @@ fn the_point_read_again_after_an_account_relaunch_tells_nothing() {
     );
 }
 
-/// A loop starting at a wall keeps what the one before left in the ledger: four moves within the
-/// hour spend the bound (no relaunch, a breaker said), and a move refused at the wall is not
-/// asked again.
 #[test]
 fn a_loop_that_starts_after_another_keeps_its_bound_and_its_latch() {
     use crate::supervise::approvals::{
@@ -15413,11 +14231,6 @@ fn a_loop_that_starts_after_another_keeps_its_bound_and_its_latch() {
     assert_eq!(asked, ["restart:account:work-2"], "{lines:#?}");
 }
 
-/// A REFUSAL OF THIS LAUNCH IS THAT LAUNCH'S (the review of the login
-/// carry, r7h-1): a new loop runs for each agent process, and the Claude Code
-/// the limit's notice asks the owner to resume in a shell tab (or the host's
-/// relaunch on exit, or a cold restore) repaints the limit the loop before
-/// was refused a move at.
 #[test]
 fn a_launch_refused_before_the_agent_started_holds_no_move_off() {
     use crate::supervise::approvals::{ACCOUNT_MOVE_COMMAND, Outcome, Row, account_unmade_reason};
@@ -15457,9 +14270,6 @@ fn a_launch_refused_before_the_agent_started_holds_no_move_off() {
     assert!(asked.is_empty(), "{asked:?}\n{lines:#?}");
 }
 
-/// THE LATCH A LOOP LEAVES IN THE LEDGER IS ITS WALL'S: a move that could
-/// not be made AT A WALL latches (a loop that starts after it does not ask it
-/// again there) until the end of that wall is written (`wall-wait-end@v1`).
 #[test]
 fn the_ledger_reads_a_sessions_account_moves_back() {
     use crate::supervise::approvals::{
@@ -15537,8 +14347,6 @@ fn the_ledger_reads_a_sessions_account_moves_back() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A made account move closes the model switch in the ledger as the policy forgets it
-/// (`TurnEndState::restarted`), or a later loop would relaunch onto the model it already runs.
 #[test]
 fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
     use crate::supervise::approvals::{
@@ -15616,8 +14424,6 @@ fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TASK THAT LANDED, OPENED AGAIN BY SOMEONE'S TURN THAT ENDS ON A USAGE
-/// LIMIT, IS ASKED ABOUT AT THAT LIMIT.
 #[test]
 fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     let limited = || Phase::Limited {
@@ -15658,7 +14464,6 @@ fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     assert!(asked.is_empty(), "{asked:?}");
 }
 
-/// A session at its session limit on the account tests' clock, and the point its screen shows.
 fn account_session<'m>(m: &'m mut Mock) -> (Session<'m, Mock>, Turn) {
     let mut s = session(m, Some("@s-1".to_string()));
     s.set_clock(ACCOUNT_NOW, PDT);
@@ -15673,8 +14478,6 @@ fn account_session<'m>(m: &'m mut Mock) -> (Session<'m, Mock>, Turn) {
     (s, wall)
 }
 
-/// The host is asked after the point is folded in, so a refused move's latch ends at the first
-/// turn end with no wall after work.
 #[test]
 fn the_host_is_asked_on_the_folded_point_where_a_latch_has_ended() {
     let host = AccountHost::moving("work-2", "refused:line");
@@ -15713,12 +14516,6 @@ fn the_host_is_asked_on_the_folded_point_where_a_latch_has_ended() {
     );
 }
 
-/// THE HOST'S WORD STAYS WITH A REFUSED MOVE'S LATCH (the review of the
-/// login carry, r6h-2): the owner's notice promises a move after `accounts
-/// use` only where a second ask can pass, so the latch keeps what the host's
-/// answer says of asking again — a tab whose own program is Claude Code, any
-/// other refusal or failure of this launch, or a host merely busy — and the
-/// ledger's row carries the same word to a loop that follows.
 #[test]
 fn a_refused_moves_latch_keeps_the_hosts_word() {
     use crate::supervise::approvals::{
@@ -15763,8 +14560,6 @@ fn a_refused_moves_latch_keeps_the_hosts_word() {
     );
 }
 
-/// A refused move's latch is cleared when the host's stamp moves (a sign-in, `accounts use`),
-/// and the host asked.
 #[test]
 fn news_of_the_accounts_clears_a_latch_and_no_news_asks_nothing() {
     let host = AccountHost::moving("work-2", "refused:line");
@@ -15804,9 +14599,6 @@ fn news_of_the_accounts_clears_a_latch_and_no_news_asks_nothing() {
     assert!(s.account_edge(&opts), "the minute is out");
 }
 
-/// `[harness] accounts = "off"` with `logins = "off"` stops the tells too: a session whose
-/// policy remembers a move (from its ledger) tells its host nothing of what answered it, asks
-/// nothing, and its wait hears no news.
 #[test]
 fn under_accounts_off_nothing_is_told_or_asked() {
     let run = |mode: crate::harness::accounts::Mode| {
@@ -15853,10 +14645,6 @@ fn under_accounts_off_nothing_is_told_or_asked() {
     assert!(edge);
 }
 
-/// A MOVE MADE AT A WALL LEAVES THE LIMIT EPISODE BEHIND WITH THE ACCOUNT:
-/// the episode the loop opened was the OLD account's, and kept open it
-/// withheld every step of the host's until that account's reset plus an
-/// hour — the move resumed LATER than no roster would have.
 #[test]
 fn a_move_made_at_a_wall_is_carried_on_past_the_limit_it_left() {
     let moved = |carry: bool| {
@@ -15909,8 +14697,6 @@ fn a_move_made_at_a_wall_is_carried_on_past_the_limit_it_left() {
     );
 }
 
-/// A LIMIT ONLY THE TRANSCRIPT SHOWS IS THE WALL, AND HOLDS THE RELAUNCH'S
-/// CARRY-ON (LIM-1; KI-1015-1 LC-10, measured on 2.1.300).
 #[test]
 fn a_limit_only_the_transcript_shows_is_the_wall_and_holds_the_carry_on() {
     let rows = {
@@ -16077,13 +14863,6 @@ fn a_limit_only_the_transcript_shows_is_the_wall_and_holds_the_carry_on() {
     );
 }
 
-/// THE SCREEN AHEAD OF ITS TRANSCRIPT (the lab's W1 on Claude Code 2.1.306,
-/// 2026-10-21, a subscriber's session limit under Land): at the reset Claude
-/// Code's own continuation fired under the limit's notice and answered with
-/// the clean defense, and the loop's first read of that turn's end asked the
-/// host for the standing limit while the transcript's tail held the
-/// continuation's prompt but not yet its reply — Claude Code draws a reply
-/// before it writes the reply's row.
 #[test]
 fn a_limit_the_screen_shows_ended_under_its_notice_is_no_standing_limit() {
     let screen = |reset: &str| {
@@ -16161,14 +14940,6 @@ fn a_limit_the_screen_shows_ended_under_its_notice_is_no_standing_limit() {
     );
 }
 
-/// THE CONTINUATION WITH ITS NOTICE SCROLLED OFF (the review of the fix
-/// above): on a short pane, or under a longer reply, the screen at the
-/// continuation's turn end draws neither the limit's notice nor its countdown
-/// row — only Claude Code's `⏺ Usage limit reset · continuing automatically`,
-/// the reply under it and the composer — so it shows nothing the row's limit
-/// ended under, and the transcript lags as in the lab (W1 on 2.1.306, run
-/// sw4): the tail ends on the continuation's prompt, the reply's row not yet
-/// written.
 #[test]
 fn a_continuation_the_transcript_holds_ends_the_limit_with_its_notice_scrolled_off() {
     let tail = include_str!("fixtures/claude-2.1.306-transcript-session-limit-continued.jsonl");
@@ -16233,16 +15004,6 @@ fn a_continuation_the_transcript_holds_ends_the_limit_with_its_notice_scrolled_o
     );
 }
 
-/// A ROW FOUND RIGHT AFTER A TURN IS ASKED ABOUT AGAIN at the next open
-/// decision (the review of the fix above: the row was held, and nothing
-/// asked again until a turn was seen running): the loop decides the moment
-/// the busy row leaves, and Claude Code writes a reply's row a flush or more
-/// after it drew the reply (RR4-TE-3), so the ask after a turn seen running
-/// can find a limit row that turn already served — here the harness's own
-/// act typed past the reset (Claude Code's countdown cancelled), its reply
-/// drawn, the limit's notice scrolled off the pane, the tail ending on the
-/// act's prompt (the measured transcript of the lab's W1 on 2.1.306, its
-/// continuation replaced by that act).
 #[test]
 fn a_row_found_right_after_a_turn_is_asked_about_again_at_the_next_decision() {
     const CONVERSATION: &str = "d3fd9c69-e561-4a64-a7fd-c1302af4e2d1";
@@ -16349,12 +15110,6 @@ fn a_row_found_right_after_a_turn_is_asked_about_again_at_the_next_decision() {
     assert!(limited(&seen[1].0) && seen[1].1 == 1, "{:?}", seen[1]);
 }
 
-/// A RELAUNCH'S FIRST DECISION ON A SNAPSHOT KEPT FROM BEFORE IT
-/// : the host still names the process it last read, the one
-/// already asked about, so keyed on whom alone the decision asked nothing,
-/// read no wall, and typed the continue policy's `keep going` into the weekly
-/// limit the resumed screen no longer draws — the host's own step, asked
-/// after it, read the row afresh and held only its carry-on.
 #[test]
 fn a_relaunchs_first_decision_on_a_kept_snapshot_reads_the_standing_limit() {
     let rows = {
@@ -16448,9 +15203,6 @@ fn a_relaunchs_first_decision_on_a_kept_snapshot_reads_the_standing_limit() {
     );
 }
 
-/// THE LOOP READS WHOSE COUNTDOWN A NOTICE IS (KI-1015-1 W4, the relaunch
-/// variant): the host's snapshot names the agent's process start, read at
-/// each decision.
 #[test]
 fn a_relaunched_agents_redrawn_countdown_is_waited_as_nobodys() {
     let rows = {
@@ -16523,8 +15275,6 @@ fn a_relaunched_agents_redrawn_countdown_is_waited_as_nobodys() {
     );
 }
 
-/// A made account move's ledger row is `typed` (so a later loop reads the move back) but is no
-/// typed act of the hourly budget's.
 #[test]
 fn an_account_move_made_is_no_typed_act_of_the_budgets() {
     use crate::supervise::approvals::{
@@ -16556,10 +15306,6 @@ fn an_account_move_made_is_no_typed_act_of_the_budgets() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LOOP RESTARTED AT A WALL TAKES UP THE USAGE-RESUME THE LOOP BEFORE IT
-/// TYPED — unless the session has moved to another account since: that
-/// continuation was typed into the account it LEFT, and seeded, the new
-/// account's first limit was worked as the retry of a wall it never met.
 #[test]
 fn a_usage_resume_typed_into_the_account_a_session_left_is_not_taken_up() {
     use crate::supervise::approvals::{
@@ -16761,12 +15507,6 @@ fn a_usage_resume_typed_into_the_account_a_session_left_is_not_taken_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TRY MET AGAIN IS READ FROM THE LEDGER'S WALL ROW AFTER IT
-/// (`approvals::UsageAttempt::met_ms`, the verifier of e9e6f65e9, B-1): a
-/// `wall-wait@v1` row of the try's limit — a bucket's for a try at one, a
-/// usage window's or a spend limit's otherwise — after the try's row, open
-/// still or closed since (a live turn's busy read ends the remembered wall,
-/// and its end row closes it).
 #[test]
 fn a_try_met_again_is_read_from_the_walls_row_after_it() {
     use crate::supervise::approvals::{
@@ -16964,15 +15704,6 @@ fn a_try_met_again_is_read_from_the_walls_row_after_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A TRY MET AGAIN IS SEEDED FROM THE WALL THAT MET IT
-/// (`approvals::UsageAttempt`): WHEN — the first wall row of the try's limit
-/// after it, the track's appearance as the first loop moved it where it read
-/// the try's answer (the verifier of 5b72b1613, R5-2: counted from the try,
-/// a successor typed as much sooner as the try's own short turn ran) — and
-/// ON WHICH LADDER — the one that wall puts the track on, read after read
-/// (M7-3: a five-hour try met by the monthly spend limit kept the short
-/// ladder's mark, and a successor between 30 minutes and two hours after it
-/// took up nothing and typed up to an hour before the first loop).
 #[test]
 fn a_try_met_again_is_seeded_from_the_wall_that_met_it() {
     use crate::supervise::approvals::{
@@ -17145,13 +15876,6 @@ fn a_try_met_again_is_seeded_from_the_wall_that_met_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// THE DONE CHECK THE LEDGER SAYS IS OWED ITS ANSWER
-/// (`approvals::done_check_owed`, the verifier of 5b72b1613, M7-5): the last
-/// act is the check (when, and in a limit's place or not), or a wall's retry
-/// typed while a check a wall cut stood; a wall's row after either cuts it,
-/// a take row after that wall undoes the cut (that wall was the screen it
-/// was typed at), and any other end row of the cut wall (the worker's work,
-/// a person's turn) ends it.
 #[test]
 fn the_done_check_the_ledger_says_is_owed_its_answer() {
     use crate::supervise::approvals::{
@@ -17417,8 +16141,6 @@ fn the_done_check_the_ledger_says_is_owed_its_answer() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A BUCKET ITS RATE LIMIT TYPE NAMED IS THAT BUCKET IN THE LEDGER'S WALL
-/// (the verifier of e09018898, B5-3).
 #[test]
 fn a_bucket_its_rate_limit_type_named_is_that_bucket_in_the_ledgers_wall() {
     use crate::supervise::approvals::OpenWall;
@@ -17529,17 +16251,10 @@ fn a_bucket_its_rate_limit_type_named_is_that_bucket_in_the_ledgers_wall() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// `d` to the nearest whole second: a wait [`past_take_window`] measured
-/// counts from the instant its first read was decided, a millisecond or so
-/// after the test's own.
 fn whole_secs(d: Duration) -> Duration {
     Duration::from_secs(u64::try_from((d.as_millis() + 500) / 1000).unwrap_or(u64::MAX))
 }
 
-/// A SUCCESSOR'S FIRST POINT, PAST THE TAKE WINDOW ITS FIRST READ OPENED:
-/// where the act the loop before typed is unread still, this loop's first
-/// read is the act's first, however long ago it was typed, and opens its
-/// take window ([`TurnEndState::seed_awaited`], follow-2).
 fn past_take_window(
     s: &mut Session<'_, Mock>,
     first: TurnEndAction,
@@ -17567,10 +16282,6 @@ fn past_take_window(
     }
 }
 
-/// AN ACT TYPED IN A LIMIT'S PLACE IS THE LIMIT'S TRY ACROSS A LOOP'S RESTART
-/// (the limit's-end refix's left-open item 1; D2's
-/// `a_done_check_in_a_limits_place_that_meets_the_limit_is_its_retry`, in the
-/// loop).
 #[test]
 fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     use crate::supervise::approvals::{
@@ -17842,8 +16553,6 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A DONE CHECK AT AN ORDINARY TURN END IS NO LIMIT'S TRY, WHATEVER A LOOP
-/// SEEDED (the verifier of the successor's seed, D4).
 #[test]
 fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
     use crate::supervise::approvals::{
@@ -17961,10 +16670,6 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
     );
 }
 
-/// A LAND ACT TYPED IN A LIMIT'S PLACE IS THE LIMIT'S TRY ACROSS A LOOP'S
-/// RESTART, AS THE DONE CHECK IS (the merge of the successor's seed with
-/// Autopilot: one rule, the mark follows the act's place, whichever act it
-/// is).
 #[test]
 fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     use crate::supervise::approvals::{
@@ -18241,9 +16946,6 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A LOOP THAT STARTS AT A MODEL BUCKET'S OPEN WALL WAITS ON ITS RESET,
-/// WHATEVER USAGE ACT IT TAKES UP BESIDE IT (the verifier of the successor's
-/// seed, D1).
 #[test]
 fn a_loop_at_a_buckets_open_wall_waits_on_its_reset_beside_the_act_it_takes_up() {
     use crate::supervise::approvals::{
@@ -18378,8 +17080,6 @@ fn a_loop_at_a_buckets_open_wall_waits_on_its_reset_beside_the_act_it_takes_up()
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A LIMIT ITS OWN TRY MET AGAIN STAYS OPEN FOR A LOOP THAT FOLLOWS (the
-/// verifier of the successor's seed's refix, V2-1).
 #[test]
 fn a_limit_its_own_try_met_again_stays_open_for_a_loop_that_follows() {
     use crate::supervise::approvals::{Ledger, Outcome, act_reason, open_wall, usage_attempt};
@@ -18562,9 +17262,6 @@ fn a_limit_its_own_try_met_again_stays_open_for_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A BUCKET'S NOTICE THE LOOP'S OWN TRY MET, CANCELLED BEFORE THE LOOP'S
-/// FIRST READ, IS THAT TRY'S ANSWER (the verifier of the successor's seed's
-/// refix, V21-1).
 #[test]
 fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     use crate::supervise::approvals::{Ledger, Outcome, act_reason, open_wall, usage_attempt};
@@ -18768,8 +17465,6 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// THE END OF A WALL AN ACT CLOSED IS WRITTEN STILL (the verifier of
-/// 49f07f50e, V21-3).
 #[test]
 fn the_end_of_a_wall_its_try_closed_is_written_for_the_refused_moves_latch() {
     use crate::supervise::approvals::{
@@ -18870,8 +17565,6 @@ fn the_end_of_a_wall_its_try_closed_is_written_for_the_refused_moves_latch() {
     }
 }
 
-/// A LIMIT'S TRY THE WORKER'S WORK ANSWERED IS NO SEED OF A LOOP THAT
-/// FOLLOWS (the verifier of ed6efadb0, V22-A).
 #[test]
 fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
     use crate::supervise::approvals::{
@@ -19105,8 +17798,6 @@ fn a_limits_try_the_workers_work_answered_is_no_seed_of_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A LIMIT'S TRACK DROPPED WITH NO WORK ROW ENDS ITS TRY FOR A LOOP THAT
-/// FOLLOWS (the verifier of e09018898, B5-1).
 #[test]
 fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
     use crate::supervise::approvals::{Ledger, open_wall, usage_attempt};
@@ -19311,8 +18002,6 @@ fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A WALL READ INSIDE A TRY'S TAKE WINDOW IS NO TRY MET AGAIN WHERE THE TRY
-/// IS TAKEN (the verifier of e09018898, B5-2).
 #[test]
 fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken() {
     use crate::supervise::approvals::{Ledger, WALL_TAKEN, open_wall, usage_attempt};
@@ -19508,8 +18197,6 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A BUCKET THE FALLBACK'S RELAUNCH LEFT IS NO WALL OF THE RELAUNCHED SESSION
-/// (the verifier of 49f07f50e, V21-2).
 #[test]
 fn a_bucket_the_fallbacks_relaunch_left_is_no_wall_of_the_relaunched_session() {
     use crate::supervise::approvals::{Ledger, Outcome, model_switch_reason, open_wall};
@@ -19686,8 +18373,6 @@ fn a_bucket_the_fallbacks_relaunch_left_is_no_wall_of_the_relaunched_session() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A constructed Sonnet-bucket notice retaining the measured transcript's row shape
-/// and conversation identity, with only its prompt, limit and clock changed.
 fn bucket_notice_transcript(prompt: &str, notice: &str, at: i64) -> String {
     let stamp = crate::harness::usage::rfc3339_utc(at);
     include_str!("fixtures/claude-2.1.294-transcript-session-limit.jsonl")
@@ -19715,8 +18400,6 @@ fn bucket_notice_transcript(prompt: &str, notice: &str, at: i64) -> String {
         + "\n"
 }
 
-/// A TURN ASKED ON THE FALLBACK IS WRITTEN FOR A LOOP THAT FOLLOWS (the
-/// verifier of fde9e066a, A1).
 #[test]
 fn a_turn_asked_on_the_fallback_is_written_for_a_loop_that_follows() {
     use crate::supervise::approvals::{Ledger, open_wall};
@@ -19929,8 +18612,6 @@ fn a_turn_asked_on_the_fallback_is_written_for_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A BUCKET'S NOTICE THE TRANSCRIPT WROTE AFTER THE FALLBACK'S RELAUNCH IS
-/// THE WALL (the verifier of fde9e066a, A2).
 #[test]
 fn a_buckets_notice_the_transcript_wrote_after_the_relaunch_is_the_wall() {
     use crate::supervise::approvals::{Ledger, open_model_switch, open_wall};
@@ -20155,9 +18836,6 @@ fn a_buckets_notice_the_transcript_wrote_after_the_relaunch_is_the_wall() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A LIMIT'S TRY AT A MODEL BUCKET IS THE TRY A SUCCESSOR BACKS OFF FROM (the
-/// verifier of the successor's seed, D2; the bucket's
-/// [`an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from`]).
 #[test]
 fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     use crate::supervise::approvals::{Ledger, OpenWall, Outcome, Row};
@@ -20318,9 +18996,6 @@ fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// What answered a move is written down: a loop starting on an unanswered move with a turn under
-/// it tells `served` at the first wall-free turn end and writes it, so the next loop tells
-/// nothing; a lost login told before is not told again.
 #[test]
 fn a_move_seeded_from_the_ledger_is_answered_once_across_loops() {
     use crate::supervise::approvals::{
@@ -20435,9 +19110,6 @@ fn a_move_seeded_from_the_ledger_is_answered_once_across_loops() {
     );
 }
 
-/// The owner's clearing (`accounts use` on the session's own account: advice `Resume`) types the
-/// wall's continuation once (`usage-resume@v1`, counted as the wall's attempt); the limit met
-/// again is waited out by the wall's ladder, no relaunch.
 #[test]
 fn the_owners_clearing_continues_a_session_at_its_wall_once() {
     use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
@@ -20498,8 +19170,6 @@ fn the_owners_clearing_continues_a_session_at_its_wall_once() {
     assert_eq!((attempts, turns), (Some(0), 0));
 }
 
-/// The stamp a loop first reads is no news (it counts the host's news since the host started),
-/// so the latch the loop before left stands.
 #[test]
 fn the_stamp_a_loop_first_reads_is_no_news_to_its_latch() {
     let host = AccountHost::moving("work-2", "refused:line");
@@ -20530,9 +19200,6 @@ fn the_stamp_a_loop_first_reads_is_no_news_to_its_latch() {
     assert_eq!(host.said("account"), ["account:wall:usage-session"]);
 }
 
-/// A move made at a wall that a later loop takes up (started right after the relaunch, or where
-/// the host's carry landed) is carried on past the notice it left: the host's last relaunch step
-/// is taken there, typing nothing, and the wall's resume follows at once.
 #[test]
 fn a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice() {
     use crate::supervise::approvals::{ACCOUNT_MOVE_COMMAND, Outcome, Row, account_switch_reason};
@@ -20586,9 +19253,6 @@ fn a_loop_that_takes_up_a_move_made_at_a_wall_carries_it_on_past_the_notice() {
     assert_eq!(typed, 0, "{log}");
 }
 
-/// A host whose evidence lags the screen (its limit row not in the transcript yet) answers a
-/// short wait: the wall's wait is cut to it (never under a minute), nothing latched, and the
-/// point decided then asks again and gets the move.
 #[test]
 fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
     let decided = |first: Option<AccountAdvice>| {
@@ -20634,10 +19298,6 @@ fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
     assert!(waits > Duration::from_secs(3600), "{waits:?}");
 }
 
-/// ONE CONTINUATION A CLEARING, ACROSS LOOPS. Which clearing was answered is
-/// the policy's memory, and a loop's restart loses it: a loop that started at
-/// the same notice — the continuation not taken, or the account's answer not
-/// in the transcript yet — typed that clearing's continuation a second time.
 #[test]
 fn a_clearing_the_loop_before_answered_is_not_answered_again() {
     use crate::supervise::approvals::{Outcome, Row, act_reason};
@@ -20733,17 +19393,10 @@ fn a_clearing_the_loop_before_answered_is_not_answered_again() {
 
 use aterm_phase::prompt::fixtures as panel_fx;
 
-/// 2026-10-01T21:20:00-07:00, minutes after the measured screens were
-/// taken: their `Resets 2am` is 4 h 40 min ahead and their `Resets Oct 8 at
-/// 9am` six and a half days, both inside what a sample believes.
 const PROBE_NOW: i64 = 1_790_914_800;
 
-/// The turn whose end is probed: real work behind it, nothing asked.
 const PROBE_SAID: &str = "Stage 3 done; the suite is green.";
 
-/// The world a probe test starts from: a live turn, its end at an empty
-/// composer, and — once the loop has taken its own act there — a turn that
-/// ends on a request for a decision, which is escalated and ends the run.
 fn probe_world(frames: &[&str], host: &ProbeHost) -> Mock {
     let mut m = probe_mock(vec![busy_screen(), ended(PROBE_SAID)], frames, host);
     world(&mut m)
@@ -20752,16 +19405,11 @@ fn probe_world(frames: &[&str], host: &ProbeHost) -> Mock {
     m
 }
 
-/// The probe's waits at a scripted server's scale: 60 ms for a panel that never comes, 100 ms
-/// for one that does not leave, reads 10 ms apart, and half a minute to read settled (a hang
-/// detector).
 fn probe_waits<C: Ctl>(s: &mut Session<'_, C>) {
     let ms = Duration::from_millis;
     s.set_probe_waits(ms(60), Duration::from_secs(30), ms(10), ms(100));
 }
 
-/// One watch over `m` under `host`, the session's ledger at `ledger`, with
-/// [`probe_waits`]: the lines printed and the journal's.
 fn probe_run(
     tag: &str,
     m: &mut Mock,
@@ -20788,15 +19436,8 @@ fn probe_run(
     (lines, records.into_iter().map(|r| r.line).collect())
 }
 
-/// How many requests of the loop's [`probe_run_for`] lets a world that never
-/// moves on by itself see, counted instead of timed.
 const PROBE_STEPS: usize = 100;
 
-/// [`probe_run`] for a world that never moves on by itself — a panel that
-/// stands, text left typed — whose waits count nothing toward the script's
-/// end: the session goes after [`PROBE_STEPS`] more requests of the loop's
-/// own, so the run shows what the loop does for as long as it runs, on any
-/// machine.
 fn probe_run_for(
     tag: &str,
     m: &mut Mock,
@@ -20817,8 +19458,6 @@ fn probe_run_for(
     (lines, journal)
 }
 
-/// The owner's policy as these tests run it ([`hosted`]'s), with the
-/// person's grace as given.
 fn probe_policy(human_grace_s: u32) -> SupervisorConfig {
     SupervisorConfig {
         human_grace_s,
@@ -20826,7 +19465,6 @@ fn probe_policy(human_grace_s: u32) -> SupervisorConfig {
     }
 }
 
-/// The probe's rows of the session ledger at `path`, as `decision reason`.
 fn probe_rows(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -20850,8 +19488,6 @@ fn probe_rows(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The loop's lines about a due probe it did not run (`SKIPPED seq=<n> rule=usage-probe@v1
-/// gate=<word>[ host=<word>]`: [`Session::probe_shut`]), as `<seq> <word>[ host=<word>]`.
 fn gates_said(lines: &[String]) -> Vec<String> {
     lines
         .iter()
@@ -20864,8 +19500,6 @@ fn gates_said(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// [`gates_said`] without the seq — which counts the reads of a run, and so
-/// moves with its timing at every point but the first.
 fn gate_words(lines: &[String]) -> Vec<String> {
     gates_said(lines)
         .iter()
@@ -20874,7 +19508,6 @@ fn gate_words(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Every other `SKIPPED` line: a step that was begun and not carried out.
 fn other_skips(lines: &[String]) -> Vec<&String> {
     lines
         .iter()
@@ -20882,14 +19515,6 @@ fn other_skips(lines: &[String]) -> Vec<&String> {
         .collect()
 }
 
-/// THE PROBE, SETTLED. At a turn end read live, where the host's advice is
-/// the probe and it grants the claim, the loop writes `/usage` and its Enter
-/// — each fenced on the person count, the judged read's generation and the
-/// composer's caret row — reads the panel until two reads in a row say
-/// SETTLED with the same windows (the first read here is the measured
-/// `Refreshing…` frame: no sample from it), hands the host the sample with
-/// its resets placed on the loop's clock, and only THEN presses one Escape,
-/// fenced on the person count and the panel's own header row.
 #[test]
 fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
     let (dir, ledger) = ledger_at("probe-settled");
@@ -21050,13 +19675,6 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
     assert_eq!(with_host, run(None, "probe-no-host"));
 }
 
-/// THE PROBE'S `/usage` GOES UNDER THE WINDOW HOST'S HAND
-/// ([`Session::type_under_hand`]), as every other text the loop types: the
-/// hand taken (`upgrade_drive::hand_take_here_request`) before the fenced
-/// `/usage` and its Enter and given back after them, before the panel's
-/// Escape — so the server's ledger books `/usage` as the harness's turn
-/// (`history … by=harness`) and the panel's close is no write under it —
-/// then taken again for the point's own act.
 #[test]
 fn the_windows_host_types_the_probes_usage_under_its_hand() {
     use crate::harness::upgrade_drive::{
@@ -21156,12 +19774,8 @@ impl Review for Heard {
     }
 }
 
-/// One thing that shuts a gate, done to the session at its point (after the
-/// decision that got the roster's advice), to its host, or to the decision.
 type Shut = fn(&mut Session<'_, Mock>, &Turn, &ProbeHost, &mut TurnEndAction);
 
-/// A session at a turn end where the probe is due and every gate open but what `shut` closes;
-/// the probe's step runs twice there and the point is decided again.
 fn due_probe_at_a_gate(
     tag: &str,
     shut: Option<Shut>,
@@ -21218,18 +19832,11 @@ fn due_probe_at_a_gate(
     (first, heard.said, probe_writes(&m), host.said("probe"))
 }
 
-/// The Mac slept eight hours after the point was decided, and a request
-/// saw it ([`Session::call`]): the wake's settle stands.
 fn a_night_slept(s: &mut Session<'_, Mock>, _: &Turn, _: &ProbeHost, _: &mut TurnEndAction) {
     s.set_clock(PROBE_NOW + 8 * 3600, PDT);
     let _ = s.call(&["status"]).expect("a read at the wake");
 }
 
-/// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT. One row a gate of
-/// the loop's — each the same world with ONE thing changed — and for each:
-/// nothing is written, and ONE line is said,
-/// `SKIPPED seq=<n> rule=usage-probe@v1 gate=<word>`, the claim's with the
-/// host's own word after it.
 #[test]
 fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
     let gates: [(&str, Shut); 16] = [
@@ -21295,9 +19902,6 @@ fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
     assert_eq!(claims, ["probe:claimed", "probed:ok"]);
 }
 
-/// The loop says once, printed and journaled, why a due probe was not run: `gate=not-live` at a
-/// turn end never read live, `gate=host-wants` where the host takes or a guard withholds the
-/// point.
 #[test]
 fn the_loop_says_once_why_a_due_probe_was_not_run() {
     let idle_policy = || SupervisorConfig {
@@ -21383,8 +19987,6 @@ fn the_loop_says_once_why_a_due_probe_was_not_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A probe goes only at the look that first takes a point: first called due where the point is
-/// decided again, it says `gate=not-new` once.
 #[test]
 fn a_point_decided_again_says_not_new() {
     let (dir, ledger) = ledger_at("probe-gate-not-new");
@@ -21440,11 +20042,6 @@ fn a_point_decided_again_says_not_new() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PROBE MOVES NONE OF THE POLICY'S MEMORY: the turn-end policy's state
-/// after the step — the hourly budget, the short-turn streak, the point it
-/// counts from, the done reports, the act awaited, everything it holds — is
-/// EQUAL to its state before, though `/usage` and an Escape were written
-/// and a sample handed over.
 #[test]
 fn a_probe_books_no_act_and_moves_none_of_the_policys_memory() {
     use crate::supervise::policy::turn_end::{RULE_COMPACT, Then};
@@ -21512,8 +20109,6 @@ fn a_probe_books_no_act_and_moves_none_of_the_policys_memory() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A panel that never opens gets no Escape (nothing says one is there): the host told
-/// `not-opened`, the point's act goes on.
 #[test]
 fn a_panel_that_never_opens_gets_no_escape() {
     let (dir, ledger) = ledger_at("probe-not-opened");
@@ -21573,8 +20168,6 @@ fn a_panel_that_never_opens_gets_no_escape() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Unsettled: a panel that says `Refreshing…` for the whole bound is never sampled (the host is
-/// told `unsettled`) and gets its one Escape.
 #[test]
 fn a_panel_that_never_settles_is_closed_with_no_sample() {
     let (dir, ledger) = ledger_at("probe-unsettled");
@@ -21609,9 +20202,6 @@ fn a_panel_that_never_settles_is_closed_with_no_sample() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// One watch over two turn ends — the second on a screen `taller` rows
-/// taller than the first — under a host that grants every claim, the panel
-/// showing `frames`: what the probe wrote, and what the host was told.
 fn two_turn_ends(tag: &str, frames: &[&str], taller: usize) -> (Vec<&'static str>, Vec<String>) {
     let (dir, ledger) = ledger_at(tag);
     let host = ProbeHost::probing(true);
@@ -21639,8 +20229,6 @@ fn two_turn_ends(tag: &str, frames: &[&str], taller: usize) -> (Vec<&'static str
     (probe_writes(&m), host.said("probe"))
 }
 
-/// A panel whose tail is under the fold from the first read (110x32) is no sample (`fold`), gets
-/// one Escape, and that grid size is not probed again; after a resize it is.
 #[test]
 fn a_folded_panel_is_no_sample_and_its_grid_size_is_not_probed_again() {
     let (wrote, told) = two_turn_ends("probe-fold", &[panel_fx::USAGE_SHORT], 0);
@@ -21682,9 +20270,6 @@ fn a_folded_panel_is_no_sample_and_its_grid_size_is_not_probed_again() {
     );
 }
 
-/// A PERSON whose key lands between the judged read and the write skips it
-/// under the person fence (`OK skipped reason=person`): the host is told
-/// `person`, nothing is in the composer and no Enter follows.
 #[test]
 fn a_person_at_the_session_is_never_typed_under() {
     let (dir, ledger) = ledger_at("probe-person-at-send");
@@ -21716,9 +20301,6 @@ fn a_person_at_the_session_is_never_typed_under() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// REFUSALS. An Escape the server turns away — `ERR halted`, then `ERR
-/// busy` — is parked on or backed off from, spends no try, and is SENT
-/// AGAIN: three Escapes asked, the third written.
 #[test]
 fn a_refused_escape_is_sent_again_and_never_a_second_usage() {
     let (dir, ledger) = ledger_at("probe-refused");
@@ -21762,8 +20344,6 @@ fn a_refused_escape_is_sent_again_and_never_a_second_usage() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A world that starts with the panel `frame` on the screen over the composer screen it returns
-/// to: what a loop meets that starts after the one that typed `/usage` died.
 fn panel_standing(frame: &str, host: &ProbeHost) -> Mock {
     let mut m = probe_mock(vec![panel_fx::screen(frame)], &[frame], host);
     let w = world(&mut m);
@@ -21772,8 +20352,6 @@ fn panel_standing(frame: &str, host: &ProbeHost) -> Mock {
     m
 }
 
-/// The session ledger of a loop that wrote `/usage` and never saw the panel
-/// gone.
 fn owed_ledger(path: &Path) {
     let row = crate::supervise::approvals::Row {
         rule_id: "usage-probe@v1",
@@ -21785,10 +20363,6 @@ fn owed_ledger(path: &Path) {
     std::fs::write(path, format!("{}\n", row.to_json(1_000, None))).expect("the ledger");
 }
 
-/// THE LOOP DIED MID-PROBE. Its successor finds the ledger's `typed` row
-/// with no `waiting` row after it and a Settings panel on the screen: it
-/// lets the panel stand ONE PERSON'S GRACE in its own sight (a second here)
-/// before its one guarded Escape.
 #[test]
 fn a_successor_closes_only_a_panel_the_ledger_says_the_harness_opened() {
     let (dir, ledger) = ledger_at("probe-successor");
@@ -21850,8 +20424,6 @@ fn a_successor_closes_only_a_panel_the_ledger_says_the_harness_opened() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A loop behind another supervisor's claim (`ERR busy supervisor=gui%3A1`) leaves an owed panel
-/// to its holder: no Escape, no `REFUSED`; once the panel is gone it writes `waiting`.
 #[test]
 fn a_loop_watching_behind_another_claim_asks_no_escape_of_an_owed_panel() {
     let run = |tag: &str, behind: bool| {
@@ -21905,9 +20477,6 @@ fn a_loop_watching_behind_another_claim_asks_no_escape_of_an_owed_panel() {
     );
 }
 
-/// An outage mid-probe: the answer to a read of the open panel never comes, the step ends (the
-/// host told `lost`, nothing sampled), the outage is ridden out, and the same loop, which
-/// remembers the panel it owes, closes it at its next look with one guarded Escape.
 #[test]
 fn an_outage_in_the_read_leaves_the_panel_owed_and_the_same_loop_closes_it() {
     let (dir, ledger) = ledger_at("probe-outage");
@@ -21941,8 +20510,6 @@ fn an_outage_in_the_read_leaves_the_panel_owed_and_the_same_loop_closes_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An owed panel's endless repaint is not the worker working: no turn reported, nothing printed,
-/// the panel closed.
 #[test]
 fn an_owed_panels_repaint_is_never_the_worker_working() {
     let grace = || probe_policy(0);
@@ -21974,9 +20541,6 @@ fn an_owed_panels_repaint_is_never_the_worker_working() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Probe, then move: with the read due and nothing behind it (`Probe { otherwise: None }`), the
-/// sample makes the host advise the move, asked at the same point ahead of any wall, with no
-/// continuation typed.
 #[test]
 fn a_sample_that_shows_the_account_low_moves_the_session_at_the_same_point() {
     let (dir, ledger) = ledger_at("probe-then-move");
@@ -22024,9 +20588,6 @@ fn a_sample_that_shows_the_account_low_moves_the_session_at_the_same_point() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The panel half erased, as a read right after the Escape catches it (2.1.287, 150x80): the
-/// transcript redrawn at the top, the panel's upper rows gone, its lower rows to the cancel hint
-/// still there, no composer yet.
 fn panel_torn() -> Vec<String> {
     let settled = panel_fx::screen(panel_fx::USAGE_SETTLED);
     let from = settled
@@ -22043,9 +20604,6 @@ fn panel_torn() -> Vec<String> {
     torn
 }
 
-/// A half-erased panel after the Escape ([`panel_torn`]) is neither a panel that refused it (no
-/// second Escape) nor a changed point: owed one more look, closed when the composer returns, the
-/// act typed.
 #[test]
 fn a_half_erased_panel_after_the_escape_gets_no_second_escape() {
     let torn = panel_torn();
@@ -22122,9 +20680,6 @@ fn a_half_erased_panel_after_the_escape_gets_no_second_escape() {
     assert_eq!(bad, Vec::<String>::new());
 }
 
-/// A panel that closes under the read with no Escape of the loop's, then reads half erased, is a
-/// close not yet painted, not a changed point: the composer's return closes it, the act is typed
-/// once, and the probes go on (a person's key: the act waits out their grace).
 #[test]
 fn a_panel_closed_under_the_read_is_no_new_point_and_the_probes_go_on() {
     let run = |tag: &str, edit: &dyn Fn(&mut Mock)| {
@@ -22203,8 +20758,6 @@ fn a_panel_closed_under_the_read_is_no_new_point_and_the_probes_go_on() {
     assert_eq!(bad, Vec::<String>::new());
 }
 
-/// A panel with a turn running under it ([`panel_under_a_turn`], composed) gets no Escape while
-/// the turn runs (Escape would stop the turn), no sample (`unsettled`), and no second `/usage`.
 #[test]
 fn a_panel_with_a_turn_running_under_it_gets_no_escape_and_no_sample() {
     let busy = panel_under_a_turn();
@@ -22258,9 +20811,6 @@ fn a_panel_with_a_turn_running_under_it_gets_no_escape_and_no_sample() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `/usage` the server turns away (`ERR busy`, `ERR halted`) is not written (`not-written`),
-/// the loop backs off or parks, and the point's act is decided again; one skipped on the judged
-/// screen (`OK skipped`) lets the act go on at once.
 #[test]
 fn a_usage_the_server_turns_away_or_skips_is_not_written_and_the_act_goes_on() {
     for (refusal, word) in [
@@ -22330,12 +20880,6 @@ fn a_usage_the_server_turns_away_or_skips_is_not_written_and_the_act_goes_on() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `/usage` WRITTEN AND NOT SUBMITTED (the screen moved before its Enter:
-/// `OK skipped reason=changed`) IS A RECORD AND RAISES NOTHING (alerts have
-/// a class, and this is none): the host is told
-/// `not-written` and informed ONCE
-/// ([`IdleHost::inform`], no badge), the journal holds its one `SKIPPED`
-/// line — and no attention is set, no ask posted, nothing escalated.
 #[test]
 fn usage_left_typed_is_a_record_that_raises_nothing_and_the_panel_stays_owed() {
     let raised = |m: &Mock| -> Vec<String> {
@@ -22427,10 +20971,6 @@ fn usage_left_typed_is_a_record_that_raises_nothing_and_the_panel_stays_owed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `/usage` left typed with nobody there is sent past the grace as the probe's own Enter (fenced
-/// as the probe's, journaled under its rule, booked nowhere in the policy); its panel is closed
-/// with one Escape, nothing sampled, and the point's act follows within the re-decision's two
-/// seconds (booked as an act, `/usage` would hold it for the take window).
 #[test]
 fn usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed() {
     let (dir, ledger) = ledger_at("probe-left-sent");
@@ -22563,13 +21103,6 @@ fn usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN ENTER OF THE TEXT LEFT TYPED THAT DOES NOT TAKE IS NOT THE LAST LOOK
-/// AT IT, whether the server wrote it and the composer holds `/usage` still,
-/// the screen as it was, or turned it away ([`Session::probe_left_enter`]'s
-/// refusal arms, the review of 2026-10-14: `ERR halted`, an owner's hold
-/// parked on until `status` reads `hold=0`, or `ERR busy lease=…`, another
-/// driver's, backed off from) and wrote nothing: the screen never moves, so
-/// no look would come.
 #[test]
 fn usage_left_typed_over_its_own_menu_entry_is_still_the_probes_to_send() {
     let (dir, ledger) = ledger_at("probe-left-menu");
@@ -22622,8 +21155,6 @@ fn usage_left_typed_over_its_own_menu_entry_is_still_the_probes_to_send() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// more, the text stood unsent until something else moved the screen, and
-/// the act behind it with it.
 #[test]
 fn an_enter_of_the_text_left_typed_that_does_not_take_is_written_again() {
     for (case, reply, written) in [
@@ -22699,7 +21230,6 @@ fn an_enter_of_the_text_left_typed_that_does_not_take_is_written_again() {
     }
 }
 
-/// `rows` with `text` typed into its composer (the caret row).
 fn with_draft(rows: &[String], text: &str) -> Vec<String> {
     let mut rows = rows.to_vec();
     let caret = rows.iter().rposition(|r| r == "❯").expect("a composer");
@@ -22707,8 +21237,6 @@ fn with_draft(rows: &[String], text: &str) -> Vec<String> {
     rows
 }
 
-/// THE PROBE IS NEVER TYPED A SECOND TIME OVER ITS OWN TEXT (no
-/// `/usage/usage`).
 #[test]
 fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
     let second_turn_end = |tag: &str, cleared: bool| {
@@ -22774,11 +21302,6 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
     );
 }
 
-/// WHAT CAME UP IS NOT THE USAGE TAB UNDER THE FULLSCREEN RENDERER'S RULE —
-/// the inline renderer's panel (its `─` rule, two columns in), or another
-/// tab of the Settings panel: no sample, the host is told `renderer`, the
-/// panel gets its one Escape under its own header row, and THIS LOOP PROBES
-/// NO MORE — not even on another grid size (so it is not the fold's latch).
 #[test]
 fn another_panel_ends_the_loops_probes() {
     let (wrote, told) = two_turn_ends("probe-inline-panel", &[panel_fx::USAGE_INLINE], 3);
@@ -22801,9 +21324,6 @@ fn another_panel_ends_the_loops_probes() {
     assert_eq!(told, ["probe:claimed", "probed:renderer"]);
 }
 
-/// A loop stopped mid-probe (its host's stop lands while the panel is read) writes nothing: no
-/// Escape, the host told `lost`, and the ledger keeps the `typed` row with no `waiting` row
-/// after it, which the loop that follows reads, closing the panel.
 #[test]
 fn a_loop_stopped_mid_probe_presses_nothing_and_the_next_loop_closes_the_panel() {
     let (dir, ledger) = ledger_at("probe-stopped");
@@ -22853,9 +21373,6 @@ fn a_loop_stopped_mid_probe_presses_nothing_and_the_next_loop_closes_the_panel()
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// One transcript row as Claude Code 2.1.299 writes it, cut to the keys the
-/// result reader reads: a typed prompt (`user`), or an assistant message
-/// `id` holding one text block.
 fn task_row(kind: &str, uuid: &str, id: &str, text: &str) -> String {
     let text = aterm_json::to_string(&aterm_json::Value::String(text.to_string())).expect("json");
     if kind == "user" {
@@ -22954,8 +21471,6 @@ impl IdleHost for TaskHost {
     }
 }
 
-/// One `watch` of `m` as session `@s-1` under the owner's policy, `host`
-/// its idle host, results snapshotted under `tasks`: the lines printed.
 fn tasked_watch(
     m: &mut Mock,
     host: &Arc<TaskHost>,
@@ -22981,7 +21496,6 @@ fn tasked_watch(
         .collect()
 }
 
-/// A worker's record as its starter leaves it: `working`, rev 1.
 fn working_task() -> Option<(u64, String)> {
     Some((
         1,
@@ -22989,7 +21503,6 @@ fn working_task() -> Option<(u64, String)> {
     ))
 }
 
-/// The `task mark …` requests the loop sent.
 fn task_marks(m: &Mock) -> Vec<String> {
     m.task_requests
         .iter()
@@ -22998,7 +21511,6 @@ fn task_marks(m: &Mock) -> Vec<String> {
         .collect()
 }
 
-/// `task mark done why=<why>` for the snapshot at `path` of `bytes`.
 fn done_mark(why: &str, bytes: usize, path: &Path) -> String {
     format!(
         "task mark done why={why} result_bytes={bytes} result_path={}",
@@ -23006,29 +21518,19 @@ fn done_mark(why: &str, bytes: usize, path: &Path) -> String {
     )
 }
 
-/// What a tasked worker reports at the end of its turn of work: no done.
 const WORK: &str = "Fixed the parser; pushing it next.";
 
-/// THE LANDING'S CLEAN DEFENSE (Autopilot Land: only Land's landed ends a task
-/// the harness publishes), the worker's result: what the snapshot holds.
 const LANDED: &str = "Fixed the parser and pushed it.\nNothing left: all of it is merged into \
                       the remote main branch.";
 
-/// [`LANDED`] as the worker answers Land's instruction with it: no token
-/// (Autopilot Land: the defense is ordinary language).
 fn landed_reply() -> String {
     LANDED.to_string()
 }
 
-/// The landing's result as the task record's snapshot holds it
-/// (`crate::harness::result`'s landing rule): the worker's report before
-/// Land's instruction ([`WORK`]), then the defense that landed it.
 fn landed_result() -> String {
     format!("{WORK}\n\n{LANDED}")
 }
 
-/// A landing's transcript rows: the task, the worker's turn of work, Land's
-/// instruction and `reply` answering it.
 fn landing_rows(reply: &str) -> Vec<String> {
     vec![
         task_row("user", "u-task", "", "Fix the parser."),
@@ -23038,26 +21540,16 @@ fn landing_rows(reply: &str) -> Vec<String> {
     ]
 }
 
-/// A landing's screens: a turn of work, then `reply` answering Land's
-/// instruction typed at its end.
 fn landing_screens(reply: &str) -> Vec<Vec<String>> {
     vec![busy_screen(), ended(WORK), busy_screen(), ended(reply)]
 }
 
-/// `m` under Land, its turn of work's end sitting until Land's instruction
-/// is typed there ([`landing_screens`]).
 fn landing(m: &mut Mock) {
     m.autopilot = Some("land");
     m.turn_releases = Some(1);
     m.history_served();
 }
 
-/// LANDED, PUBLISHED ONCE: the worker's turn of work gets Land's
-/// instruction, and its clean defense at that instruction's yield lands the
-/// task — at that point, and only there, its record is read and marked
-/// `done` with the landing's result (the report before Land's instruction,
-/// then the defense) snapshotted under
-/// `<tasks>/<gsid>-<rev>.result.md`, and the journal says so (`TASK …`).
 #[test]
 fn a_landed_workers_task_is_marked_once_with_its_defense() {
     let root = crate::supervise::ScratchDir::new("task", "landed");
@@ -23130,15 +21622,6 @@ fn a_landed_workers_task_is_marked_once_with_its_defense() {
     assert!(!untasked.exists(), "nothing written");
 }
 
-/// A SCREEN-READ HARNESS'S LANDING IS ITS RESULT, ITS REPORT FIRST (`spawn
-/// agent=gemini`'s worker; `task_mark`'s `publish_done`,
-/// `result::snapshot_screen`, `result::with_report`): a Gemini CLI worker,
-/// whose host reads no transcript, lands under Land, and its record is
-/// marked `done why=landed` once, its result the report Gemini CLI's reader
-/// read at the point the Land instruction was typed (the work turn's
-/// words), a blank line, then the defense read at the landing's point —
-/// as a transcript's result holds the report before the land act and the
-/// defense — `result` answering it under `source=screen program=gemini`.
 #[test]
 fn a_screen_read_workers_landing_is_its_result() {
     use aterm_phase::gemini::fixtures as g;
@@ -23212,10 +21695,6 @@ fn a_screen_read_workers_landing_is_its_result() {
     );
 }
 
-/// A DEFENSE TALLER THAN THE SCREEN IS READ WHOLE BEFORE IT LANDS
-/// (`Session::said_read_whole`): the land act's yield is a message whose
-/// `⏺` head scrolled into the history above the screen, its rows on the
-/// screen a clean defense.
 #[test]
 fn a_defense_taller_than_the_screen_is_read_whole_before_it_lands() {
     let root = crate::supervise::ScratchDir::new("task", "tall");
@@ -23279,10 +21758,6 @@ fn a_defense_taller_than_the_screen_is_read_whole_before_it_lands() {
     assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
 }
 
-/// A tall Land report as `program`'s screen draws it: its rows `said` (the
-/// first its head, under `reply_at` of `end`, the program's turn's end
-/// whose reply row is replaced), and the rows of the reply drawn above
-/// the screen — `(screen, history)`, the screen as tall as `end`.
 fn tall_on(
     end: &[String],
     reply_at: usize,
@@ -23304,8 +21779,6 @@ fn tall_on(
     (screen, drawn)
 }
 
-/// The words of a tall Land report: a NEEDS YOU line near its head when
-/// `need`, 55 merged items, and a clean defense at its foot.
 fn tall_said(need: bool) -> Vec<String> {
     let mut said = vec!["Merged the parser, the lexer and their suites.".to_string()];
     if need {
@@ -23317,10 +21790,6 @@ fn tall_said(need: bool) -> Vec<String> {
     said
 }
 
-/// A Land run on `program`'s screens (its mock `mock`): `busy`, its turn
-/// of work's end `work` sitting until Land's instruction is typed there,
-/// `busy` again, and that instruction's yield `tall` — `(screen,
-/// history)`, the history served only where `history`.
 fn tall_landing(
     mock: fn(Vec<Vec<String>>) -> Mock,
     busy: &[String],
@@ -23362,11 +21831,6 @@ fn tall_landing(
     (lines, m.needs_calls.clone())
 }
 
-/// A TALL LAND REPORT ON EVERY HARNESS IS READ WHOLE BEFORE IT LANDS
-/// (`Session::said_read_whole` by the program's own reader,
-/// [`aterm_phase::ScreenReader::said_whole`]): Gemini CLI's, agy's and Muse
-/// Code's yield of Land's instruction a 60-row report whose head is in the
-/// history above the screen, its rows on the screen a clean defense.
 #[test]
 fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
     use aterm_phase::prompt::fixtures::screen;
@@ -23483,12 +21947,6 @@ fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
     }
 }
 
-/// A NEED SAID EARLIER IN A TURN WHOSE START IS ABOVE THE SCREEN IS READ
-/// BEFORE IT LANDS (`Session::said_read_whole` on Claude Code's whole turn,
-/// [`aterm_phase::turn_whole`]): the land act's yield a turn whose last
-/// message, a clean defense, fits on the screen, but whose earlier message —
-/// a NEEDS YOU said before a tool call — and the `❯` row that opened it are
-/// in the history above.
 #[test]
 fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
     let turn_of = |need: bool, calls: usize| -> (Vec<String>, Vec<String>) {
@@ -23574,11 +22032,6 @@ fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
     }
 }
 
-/// A NEED SAID BEFORE A TOOL CALL ON EVERY HARNESS IS READ BEFORE IT LANDS
-/// (`TurnEndReading::of` and `Session::said_read_whole` by the program's
-/// own reader, [`aterm_phase::ScreenReader::turn_said_before`]): Gemini
-/// CLI's, agy's and Muse Code's yield of Land's instruction a turn whose
-/// first reply says NEEDS YOU, then a tool call, then a clean defense.
 #[test]
 fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
     use aterm_phase::prompt::fixtures::screen;
@@ -23752,14 +22205,11 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
     }
 }
 
-/// The reader the loop reads `program`'s screen `rows` with.
 fn program_reader(program: &str, rows: &[String]) -> &'static dyn aterm_phase::ScreenReader {
     let name = if program == "gemini" { "node" } else { program };
     aterm_phase::identify(Some(name), rows)
 }
 
-/// A LANDING, AND A LOOP RESTARTED ON IT: the landed task is marked `done
-/// why=landed` once, with the defense.
 #[test]
 fn a_landing_is_published_once_and_a_restarted_loop_marks_nothing() {
     let root = crate::supervise::ScratchDir::new("task", "marker");
@@ -23858,11 +22308,6 @@ fn a_landing_is_published_once_and_a_restarted_loop_marks_nothing() {
     assert_eq!(m.task, working_task());
 }
 
-/// THE LANDING READ BEFORE CLAUDE CODE WROTE ITS REPLY (F1, 2.1.301 on a
-/// real login): the host's read at the landing point holds Land's
-/// instruction and no reply, and the transcript on disk has the defense and
-/// the turn's `turn_duration` row by the time it is read again — the record
-/// is marked with that defense (`crate::harness::result::settled`).
 #[test]
 fn a_landing_read_before_the_reply_was_written_waits_for_the_turns_end() {
     let root = crate::supervise::ScratchDir::new("task", "lag");
@@ -23900,14 +22345,11 @@ fn a_landing_read_before_the_reply_was_written_waits_for_the_turns_end() {
     assert_eq!(std::fs::read_to_string(&path).expect("snapshot"), "");
 }
 
-/// `row` (a transcript row, [`task_row`]) stamped `at` (unix seconds), as
-/// Claude Code stamps each row it writes.
 fn stamped(row: String, at: i64) -> String {
     let at = aterm_types::rfc3339::format_rfc3339(u64::try_from(at).expect("a stamp"));
     row.replacen('{', &format!(r#"{{"timestamp":"{at}","#), 1)
 }
 
-/// A turn's `system turn_duration` end row, stamped `at` (unix seconds).
 fn end_row_at(at: i64) -> String {
     stamped(
         r#"{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":9000,"uuid":"td","sessionId":"0b2299fa","version":"2.1.301"}"#
@@ -23916,8 +22358,6 @@ fn end_row_at(at: i64) -> String {
     )
 }
 
-/// A background command's `<task-notification>` row (the user row Claude
-/// Code wakes the worker on), stamped `at` (unix seconds).
 fn notification_at(at: i64) -> String {
     stamped(
         task_row(
@@ -23931,13 +22371,6 @@ fn notification_at(at: i64) -> String {
     )
 }
 
-/// THE TURN THE LANDING WAS READ ON IS THE ONE SNAPSHOTTED — the loop hands
-/// the read that decided the landing to the result reader: the worker
-/// answered Land's instruction (the retired token under it, which the
-/// result drops), a background command's `<task-notification>` woke it and
-/// the woken turn ran a tool, all in the landing's read; the woken turn's
-/// reply (the token under it too) and end row
-/// are on disk by the next read.
 #[test]
 fn the_landing_points_showing_places_the_turn_snapshotted() {
     let root = crate::supervise::ScratchDir::new("task", "shown");
@@ -24004,10 +22437,6 @@ fn the_landing_points_showing_places_the_turn_snapshotted() {
     assert_eq!(marks, [done_mark("landed", report.len(), &path)]);
 }
 
-/// NEVER A PERSON'S OWN EXCHANGE: their greeting, answered in seconds, is a
-/// `done` of theirs (`LEFT … rule=left-to-person@v1`) — even with the
-/// retired marker under it — and a tasked session's record is not read or
-/// marked for it.
 #[test]
 fn a_persons_own_exchange_marks_no_task() {
     let root = crate::supervise::ScratchDir::new("task", "left");
@@ -24080,9 +22509,6 @@ fn a_persons_own_exchange_marks_no_task() {
     assert_eq!(task_marks(&m).len(), 1, "{:?}", m.task_requests);
 }
 
-/// OPEN AGAIN, AND LANDED AGAIN: after the landing is published, someone
-/// else's turn (a manager's follow-up) that ends with no defense opens the
-/// task again — the record is marked `working why=turn`.
 #[test]
 fn someone_elses_turn_opens_the_task_again_and_its_landing_is_published_again() {
     const HALF: &str = "Half of the README is in.";
@@ -24181,11 +22607,6 @@ fn someone_elses_turn_opens_the_task_again_and_its_landing_is_published_again() 
     );
 }
 
-/// THE SNAPSHOT IS THE LANDING'S: the live upgrade's READY notice, typed by
-/// the host into the landed worker, and its answer change nothing — the
-/// record is not read again, nothing is marked (its answer is not someone
-/// else's turn), and the result file stands — though the
-/// transcript has grown by that exchange.
 #[test]
 fn the_upgrades_ready_after_the_landing_leaves_the_snapshot_and_the_record() {
     let root = crate::supervise::ScratchDir::new("task", "ready");
@@ -24265,13 +22686,6 @@ fn the_upgrades_ready_after_the_landing_leaves_the_snapshot_and_the_record() {
     );
 }
 
-/// THE LANDING IS PUBLISHED BEFORE THE HOST'S STEP TAKES ITS POINT: a host
-/// that wants the very point the defense lands (a Claude Code update
-/// installed while the task ran, a relaunched agent's continuation) types
-/// its turn there — and the landing was read and marked as the point was
-/// folded in, before the step: the transcript read once, with no step
-/// taken, and the snapshot is the defense, never the exchange the step typed
-/// after it.
 #[test]
 fn the_landing_is_published_before_the_hosts_step_takes_its_point() {
     let root = crate::supervise::ScratchDir::new("task", "first");
@@ -24333,10 +22747,6 @@ fn the_landing_is_published_before_the_hosts_step_takes_its_point() {
     );
 }
 
-/// A SLEEP AFTER THE LANDING PUBLISHES NOTHING MORE: the landing is
-/// published, the live upgrade's READY notice is typed by the host into the
-/// landed worker, and the Mac sleeps before its answer — the point's first
-/// showing moves back by the night ([`TurnEndState::slept`]).
 #[test]
 fn a_sleep_after_the_landing_marks_nothing_more_at_the_hosts_short_turn() {
     let root = crate::supervise::ScratchDir::new("task", "sleep");
@@ -24403,11 +22813,6 @@ fn a_sleep_after_the_landing_marks_nothing_more_at_the_hosts_short_turn() {
     );
 }
 
-/// AN OLDER BUILD'S `done` IS NO LANDING: a loop that starts on a record an
-/// older build marked done by its marker or its done check (`why=marker`,
-/// `why=done-check`) takes nothing on — the task goes on to Land's landing,
-/// and the record is opened again and marked done with the landing's
-/// result (`why=landed`).
 #[test]
 fn an_older_builds_done_record_is_opened_again_and_the_landing_published() {
     let root = crate::supervise::ScratchDir::new("task", "older-done");
@@ -24452,10 +22857,6 @@ fn an_older_builds_done_record_is_opened_again_and_the_landing_published() {
     );
 }
 
-/// A LOOP STARTED ON A PUBLISHED LANDING TAKES IT ON: a loop that starts at
-/// the point a loop before it landed and published (the record reads
-/// `done`) meets the defense with no Land act of its own before it, which
-/// its policy alone would answer with Land's instruction.
 #[test]
 fn a_loop_started_at_a_published_landing_types_nothing() {
     let root = crate::supervise::ScratchDir::new("task", "held-check");
@@ -24552,10 +22953,6 @@ fn a_loop_started_at_a_published_landing_types_nothing() {
     );
 }
 
-/// A RETRY'S WALL WHOSE NOTICE LEFT WITHHOLDS THE HOST'S STEP as it holds the
-/// policy's rung (the decision review's RR-DEC-3): a 529 met at a point, then
-/// its notice gone from the screen with no work since (a person's `/status`,
-/// a scroll).
 #[test]
 fn a_retrys_wall_whose_notice_left_withholds_the_hosts_step() {
     use aterm_phase::prompt::fixtures::{END_529, screen};
@@ -24627,11 +23024,6 @@ fn a_retrys_wall_whose_notice_left_withholds_the_hosts_step() {
     }
 }
 
-/// Claude Code's own retry of a usage limit under a hand-set
-/// `CLAUDE_CODE_RETRY_WATCHDOG` (the lab's capture `fixture`), the prompt it
-/// retries the supervisor's own `keep going`, its ticking span `tick`, and no
-/// `esc to interrupt` in the footer (as with a statusLine configured: the
-/// retry row is then the screen's only word that the turn is not over).
 fn watchdog_after_keep_going(fixture: &str, tick: &str) -> Vec<String> {
     aterm_phase::prompt::fixtures::screen(fixture)
         .into_iter()
@@ -24651,17 +23043,12 @@ fn watchdog_after_keep_going(fixture: &str, tick: &str) -> Vec<String> {
         .collect()
 }
 
-/// `rows` with the retry row's attempt count spelled so the reader cannot count it (`attempt
-/// one of 300`): the row reads as a done row, the misreading the controls stage.
 fn retry_read_as_done(rows: &[String]) -> Vec<String> {
     rows.iter()
         .map(|r| r.replace("attempt 1/300", "attempt one of 300"))
         .collect()
 }
 
-/// A loop over `screens` (the first continuation's turn, then whatever follows), its acts'
-/// window a millisecond and no back-off, `grace` the person's
-/// ([`SupervisorConfig::human_grace_s`]): the Mock, the lines and what each wait was for.
 fn watchdog_run(
     tag: &str,
     screens: Vec<Vec<String>>,
@@ -24699,7 +23086,6 @@ fn watchdog_run(
     (m, lines, waits)
 }
 
-/// The acts a run typed (`CONTINUED`, `TYPED`), as `rule text`.
 fn typed_acts(lines: &[String]) -> Vec<String> {
     lines
         .iter()
@@ -24708,8 +23094,6 @@ fn typed_acts(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Claude Code's own retry of a usage limit is a turn in progress, and nothing is typed into it
-/// (accounts v2 S5).
 #[test]
 fn the_watchdogs_retry_row_is_a_turn_in_progress_and_nothing_is_typed_into_it() {
     use aterm_phase::prompt::fixtures::{
@@ -24757,12 +23141,6 @@ fn the_watchdogs_retry_row_is_a_turn_in_progress_and_nothing_is_typed_into_it() 
     }
 }
 
-/// THE LOOP TELLS THE POLICY OF EVERY BOX IT READS ([`TurnEndState::box_up`]),
-/// so a person's Esc read after a box — their refusal of it — is a new one,
-/// held for their grace from that read, though no busy read came before the
-/// box (the refusal the Gemini CLI review of 2026-10-16 saw continued 0.6 s
-/// after the Esc; the policy's half is
-/// `a_persons_esc_is_held_from_its_own_read_not_from_an_old_point`).
 #[test]
 fn a_box_the_loop_reads_makes_the_next_esc_a_new_one() {
     use aterm_phase::prompt::fixtures::{BOX_BASH_TOUCH, screen};
@@ -24794,10 +23172,6 @@ fn a_box_the_loop_reads_makes_the_next_esc_a_new_one() {
     assert_eq!(read, None, "the box read since: {out}");
 }
 
-/// Esc on the vendor's retry is a person ending the turn, as anywhere (accounts v2 S5). On
-/// 2.1.301, Esc on the row of a limit met mid-turn leaves `⎿  Interrupted · What should Claude
-/// do instead?` under the turn's Bash call; Esc on it at a turn's first request (the fullscreen
-/// renderer) puts the prompt back in the composer, as Esc before any answer does.
 #[test]
 fn esc_on_the_vendors_retry_is_an_ordinary_turn_a_person_ended() {
     use aterm_phase::prompt::fixtures::{
@@ -24881,11 +23255,6 @@ fn esc_on_the_vendors_retry_is_an_ordinary_turn_a_person_ended() {
     }
 }
 
-/// THE STALLED STREAM'S RETRY IN A NARROW PANE IS TYPED NOTHING: after the
-/// one continuation, Claude Code's retry of a stalled stream (2.1.301's
-/// `aSn`) ticks at 36 columns, its glyph on a row of its own and its uncut
-/// head `Waiting for API response` filling its column to the tail's ` · `,
-/// with no `esc to interrupt` in the cut footer.
 #[test]
 fn the_stalled_streams_retry_in_a_narrow_pane_is_typed_nothing() {
     let rule = "─".repeat(36);
@@ -24952,9 +23321,6 @@ impl IdleHost for UsageHost {
     }
 }
 
-/// What the screen says of the account's usage is told to the host once per change (accounts
-/// v2 S5), busy reads included (credits start mid-turn), and the turn ends as an ordinary idle
-/// point, no wall and no limit episode: credits are work going on.
 #[test]
 fn what_the_screen_says_of_usage_is_told_to_the_host_once_per_change() {
     use aterm_phase::prompt::fixtures::{CREDITS_IN_USE_2_1_300, CREDITS_STARTED_2_1_300};
@@ -25009,11 +23375,6 @@ fn what_the_screen_says_of_usage_is_told_to_the_host_once_per_change() {
     assert_eq!(told, [UsageSeen::default()], "{told:#?}");
 }
 
-/// An off session is left with no `/usage` panel of the harness's: the loop that takes up the
-/// panel a stopped loop left owed, on a session whose Autopilot word is `off`, lets it stand the
-/// person's grace in its own sight (a second here; the grace starts as the panel is taken up, so
-/// the first look is always inside it), closes it with its one Escape past that grace before it
-/// parks, and while parked writes nothing more: no continuation, no probe, no second Escape.
 #[test]
 fn an_off_session_has_the_harnesss_usage_panel_closed_before_the_park() {
     let (dir, ledger) = ledger_at("probe-off");
@@ -25067,10 +23428,6 @@ fn an_off_session_has_the_harnesss_usage_panel_closed_before_the_park() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The world an Off test of the panel starts from: a loop stopped mid-probe
-/// (its host's stop lands while the panel is read) has left its `/usage`
-/// panel standing, owed its close in the ledger at `ledger`, which the next
-/// loop takes up.
 fn panel_left_owed(ledger: &Path) -> Mock {
     let host = ProbeHost::probing(true);
     let mut m = probe_world(&[panel_fx::USAGE_REFRESHING], &host);
@@ -25097,7 +23454,6 @@ fn panel_left_owed(ledger: &Path) -> Mock {
     m
 }
 
-/// What the next loop over [`panel_left_owed`] did ([`off_panel_run`]).
 struct OffPanelRun {
     m: Mock,
     /// The next loop's requests.
@@ -25109,13 +23465,6 @@ struct OffPanelRun {
     owed: bool,
 }
 
-/// The next loop over [`panel_left_owed`], under the session's word `word`,
-/// with a stall suspected or not (`suspect`: as after a press of the loop's
-/// refused `ERR busy input-unread`), the worker's input as `input` (`status
-/// input=…`), and the panel's Escapes as `esc` makes them ([`esc_takes`],
-/// [`esc_refused_unread`], …) — the host's relaunch and the restart's bound
-/// in place, so a stall held at the panel journals `FROZEN` and restarts the
-/// worker.
 fn off_panel_run(
     tag: &str,
     word: &'static str,
@@ -25160,11 +23509,8 @@ fn off_panel_run(
     }
 }
 
-/// An [`off_panel_run`] whose panel's Escape takes, as the world's does.
 fn esc_takes(_: &mut PanelWorld) {}
 
-/// An [`off_panel_run`] whose panel's first Escape is refused `ERR busy
-/// input-unread` (which suspects a stall).
 fn esc_refused_unread(w: &mut PanelWorld) {
     w.esc_replies = [err(
         "busy input-unread bytes=1 wait_ms=1500 input=pending (the program has not read input \
@@ -25173,24 +23519,18 @@ fn esc_refused_unread(w: &mut PanelWorld) {
     .into();
 }
 
-/// An [`off_panel_run`] whose panel's first Escape is refused by a hold
-/// (`ERR halted`).
 fn esc_halted(w: &mut PanelWorld) {
     w.esc_replies = [err("halted by the owner")].into();
 }
 
-/// An [`off_panel_run`] whose panel's first Escape is written and does not
-/// take: the panel stands.
 fn esc_fails_once(w: &mut PanelWorld) {
     w.esc_fails = 1;
 }
 
-/// Whether `requests` hold one whose verb is `verb`.
 fn sent(requests: &[String], verb: &str) -> bool {
     requests.iter().any(|r| verb_of(r) == verb)
 }
 
-/// AN OFF SESSION'S PANEL GETS ONE PLAIN CLOSE, NEVER A STALL'S HOLD.
 #[test]
 fn an_off_session_with_a_stall_suspected_parks_and_leaves_the_panel_owed() {
     let off = off_panel_run(
@@ -25238,9 +23578,6 @@ fn an_off_session_with_a_stall_suspected_parks_and_leaves_the_panel_owed() {
     );
 }
 
-/// UNDER OFF A REFUSED ESCAPE IS NOT TRIED AGAIN: the panel's one guarded
-/// Escape, refused `ERR busy input-unread` (which suspects a stall), and the
-/// loop parks — no second Escape, no stall's hold, the panel owed.
 #[test]
 fn an_off_sessions_refused_escape_is_its_one_close() {
     let off = off_panel_run(
@@ -25287,9 +23624,6 @@ fn an_off_sessions_refused_escape_is_its_one_close() {
     assert!(!cruise.owed);
 }
 
-/// Under Off the one close promises nothing more and waits on no hold. An Escape that does not
-/// take is journaled `WAITING … owed until the word turns` (never `Escape again in 5 s`: no
-/// Escape follows under Off) and the loop parks.
 #[test]
 fn an_off_sessions_one_close_promises_no_second_escape_and_waits_on_no_hold() {
     let parked = |run: &OffPanelRun| run.journal.iter().any(|l| l.starts_with("PARKED seq="));
@@ -25386,9 +23720,6 @@ fn an_off_sessions_one_close_promises_no_second_escape_and_waits_on_no_hold() {
     assert!(!cruise.owed);
 }
 
-/// A LANDING WHOSE MARK WAS TURNED AWAY IS ASKED FOR AGAIN (a seamless
-/// update committing answered `ERR busy`): the point decided again asks
-/// again, the record ends `done`, and the landing is said once (`DONE`).
 #[test]
 fn a_landings_mark_turned_away_is_asked_for_again() {
     let root = crate::supervise::ScratchDir::new("task", "busy");
@@ -25434,9 +23765,6 @@ fn a_landings_mark_turned_away_is_asked_for_again() {
     assert_eq!(task_marks(&m), [mark], "{:?}", m.task_requests);
 }
 
-/// A LOOP STARTED ON A `done` RECORD AT A WALL STILL ACTS ON THE WALL: a done
-/// point never shows one, so the 529 its first screen shows ended someone
-/// else's turn after the done (a follow-up the server did not reopen on).
 #[test]
 fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
     let root = crate::supervise::ScratchDir::new("task", "seed-wall");
@@ -25509,11 +23837,6 @@ fn a_loop_started_on_a_done_record_at_a_wall_still_types_the_retry() {
     assert!(task_marks(&m).is_empty(), "{:?}", m.task_requests);
 }
 
-/// A SEED READ SERVED ONLY AFTER THE LOOP ACTED READS NOTHING INTO THE POINT
-/// (a8's third fix): the loop starts on a `done` record at a 529 wall, but
-/// every read of the record is turned away until it has typed the wall's
-/// retry; the point is then decided again — the retry not taken yet — with
-/// the read served.
 #[test]
 fn a_seed_read_served_after_the_loop_acted_reads_nothing_into_the_point() {
     let root = crate::supervise::ScratchDir::new("task", "seed-owed");
@@ -25574,10 +23897,6 @@ fn a_seed_read_served_after_the_loop_acted_reads_nothing_into_the_point() {
     );
 }
 
-/// A WORKER'S DONE CHECK GOES WITHOUT THE BACK-OFF (design §2.4): the loop
-/// meets a worker's done report at its first point — a short turn, whose
-/// back-off an idle person's tokens are saved by — and, its task record read,
-/// types the check at once: its manager waits.
 #[test]
 fn a_workers_done_check_goes_without_the_back_off() {
     let root = crate::supervise::ScratchDir::new("task", "backoff");
@@ -25614,11 +23933,6 @@ fn a_workers_done_check_goes_without_the_back_off() {
     assert_eq!(m.turns, 0, "{lines:#?}");
 }
 
-/// THE OWNER'S OFF IS READ BEFORE A CARRIED WAIT'S BREAK GOES TO THE HOST
-/// (the merge review): a break of the agent's background work is offered to
-/// the host only on the session's word read fresh (main's c67772c33), and a
-/// wait the session's transcript carries (BG-1: the screen draws no waiting
-/// row) is such a break.
 #[test]
 fn a_carried_waits_break_reads_the_owners_off_before_the_host_step() {
     let carried = waiting_on(&[
@@ -25670,10 +23984,6 @@ fn a_carried_waits_break_reads_the_owners_off_before_the_host_step() {
     }
 }
 
-/// The rows `ledger` gained past the first `seen`, stamped `now_ms` (the
-/// test's fixed clock: the ledger stamps its rows on the real one, which the
-/// test's does not move) and kept in `books`: the ledger as a loop that
-/// follows reads it, each row at the instant it was written.
 fn stamp_rows(ledger: &Path, seen: &mut usize, books: &mut Vec<String>, now_ms: i64) {
     let body = std::fs::read_to_string(ledger).unwrap_or_default();
     for (i, line) in body.lines().enumerate().skip(*seen) {
@@ -25690,9 +24000,6 @@ fn stamp_rows(ledger: &Path, seen: &mut usize, books: &mut Vec<String>, now_ms: 
     *seen = body.lines().count();
 }
 
-/// A TRY'S OWN SHORT TURN THAT ENDS ON ITS LIMIT IS WHERE ITS NEXT RUNG
-/// COUNTS FROM, FOR A LOOP THAT FOLLOWS TOO (the verifier of 5b72b1613,
-/// R5-2).
 #[test]
 fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from() {
     use crate::supervise::approvals::{Ledger, open_wall, usage_attempt};
@@ -25850,7 +24157,6 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
         let ok = if restarted {
             seed.is_none() && theirs >= mine
         } else {
-            // The try's rung, two hours from its own turn's end.
             mine == end_at + 120 * 60 && theirs == mine
         };
         if !ok {
@@ -25864,8 +24170,6 @@ fn a_tries_own_short_turn_ending_on_its_limit_is_where_its_next_rung_counts_from
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A TRY INSIDE ITS TAKE WINDOW IS AWAITED BY A LOOP THAT FOLLOWS (the
-/// verifier of 5b72b1613, M7-1).
 #[test]
 fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
     use crate::supervise::approvals::{Ledger, open_wall};
@@ -26092,12 +24396,8 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
             continue;
         };
         let ok = if work.is_some() {
-            // Thirty minutes from the wall the try's own turn ended on; the
-            // successor's busy read wrote the take.
             mine == end_at + 30 * 60 && theirs == mine && taken == 1
         } else {
-            // The try's rung, two hours from its answer (the window's end for
-            // the first loop, the wall's row for the successor).
             mine == try_at + 40 + 120 * 60 && theirs + 40 >= mine && theirs <= mine
         };
         if !ok {
@@ -26111,8 +24411,6 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A RESTART OF ANOTHER KIND BEGINS A RUN OF ITS OWN (the verifier of
-/// 5b72b1613, R5-3).
 #[test]
 fn a_restart_of_another_kind_begins_a_run_of_its_own() {
     use crate::supervise::approvals::{Ledger, open_model_switch};
@@ -26312,8 +24610,6 @@ fn a_restart_of_another_kind_begins_a_run_of_its_own() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A FALLBACK'S RELAUNCH IN FLIGHT WHEN ITS LOOP ENDS IS MADE AT THAT RUN'S
-/// FIRST ASK FOR A LOOP THAT FOLLOWS (the verifier of 5b72b1613, M7-4).
 #[test]
 fn a_fallbacks_relaunch_in_flight_when_its_loop_ends_is_made_at_its_first_ask() {
     use crate::supervise::approvals::{Ledger, open_model_switch, open_wall, relaunch_waiting};
@@ -26526,9 +24822,6 @@ impl IdleHost for Withholds {
     }
 }
 
-/// A HOST THAT WITHHOLDS THE CONTINUATIONS (a full disk) types nothing at a
-/// turn end that would be continued, and is no upgrade: the loop's point is
-/// held for it, not escalated.
 #[test]
 fn a_host_that_withholds_the_continuations_types_nothing() {
     let run = |on: bool| {
@@ -26557,9 +24850,6 @@ fn a_host_that_withholds_the_continuations_types_nothing() {
     assert_eq!(typed, 1, "{lines:#?}");
 }
 
-/// The count is the actual scripted host's count at its initial screen,
-/// not a default for an omitted wire field: a Claude Code session whose turn
-/// ended, then the composer showing `shown` as the read-back.
 fn paste_person_run(text: &str, shown: &str, setup: impl FnOnce(&mut Mock)) -> (Mock, Vec<String>) {
     const SAID: &str = "Fixed the parser; the suite is green.";
     let mut m = Mock::new(vec![busy_screen(), ended(SAID), typed_in(SAID, shown)]);
@@ -26594,8 +24884,6 @@ fn paste_person_run(text: &str, shown: &str, setup: impl FnOnce(&mut Mock)) -> (
     (m, lines)
 }
 
-/// The host's original person count must survive the send, the read-back
-/// and Enter.
 #[test]
 fn a_fenced_paste_cannot_submit_after_its_original_person_count_is_lost() {
     let long = "carry on";
@@ -26714,8 +25002,6 @@ fn a_fenced_paste_cannot_submit_after_its_original_person_count_is_lost() {
     );
 }
 
-/// Post-fix wire custody: both writes name the original known count,
-/// including a genuine zero.
 #[test]
 fn a_fenced_paste_names_its_original_person_in_both_writes() {
     for human in [0, 7] {
@@ -26740,7 +25026,6 @@ fn a_fenced_paste_names_its_original_person_in_both_writes() {
     }
 }
 
-/// A host that advertises generation fences may still refuse if-human.
 #[test]
 fn a_refused_paste_person_fence_never_becomes_a_legacy_turn() {
     let said = "Fixed the parser; the suite is green.";
@@ -26784,7 +25069,6 @@ fn a_refused_paste_person_fence_never_becomes_a_legacy_turn() {
     );
 }
 
-/// The login every [`LatchHost`] signs in with: the default stored login.
 const LATCH_KEY: &str = "default";
 
 /// A host whose tabs share one login ([`LoginLatches`]), as a window's tabs
@@ -26863,9 +25147,6 @@ impl IdleHost for LatchHost {
     }
 }
 
-/// ONE SIGN-IN PER LOGIN, HOWEVER MANY TABS SHARE IT (the review's F7: each
-/// tab on a shared login typed its own `/login`, and the owner met as many
-/// browser sign-ins).
 #[test]
 fn one_sign_in_per_login_however_many_tabs_share_it() {
     let mut lost = rows(&[
@@ -27060,10 +25341,6 @@ fn one_sign_in_per_login_however_many_tabs_share_it() {
     }
 }
 
-/// THE CARRIER'S TURN IS DELIVERED AGAIN WHERE THE LOGIN CAME BACK ELSEWHERE
-/// (the review of the login carry, 2026-10-20: the tab whose `/login` was
-/// the login's one sign-in never read the login back once the owner signed
-/// in in another tab, and its turn stayed stopped under the owner's notice).
 #[test]
 fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
     let wall_row = |r: &String| r.trim_end() == "❯ /login";
@@ -27147,8 +25424,6 @@ fn the_carrier_delivers_its_turn_again_where_the_login_came_back_elsewhere() {
     assert_eq!(notices, ["login-sign-in", "login-cancelled"], "{log}");
 }
 
-/// `rows` up to its `❯ /login` row, then `⎿  Login interrupted` under it and
-/// the composer back: Esc out of that `/login`'s dialog.
 fn login_left_from(dialog: &[String]) -> Vec<String> {
     let typed = dialog
         .iter()
@@ -27161,9 +25436,6 @@ fn login_left_from(dialog: &[String]) -> Vec<String> {
     r
 }
 
-/// `rows` with the lost login's row above its `/login` made a person's own
-/// Esc (`Interrupted · What should Claude do instead?`): the same dialog,
-/// typed at no lost login.
 fn at_no_wall(rows: &[String]) -> Vec<String> {
     rows.iter()
         .map(|r| {
@@ -27176,12 +25448,6 @@ fn at_no_wall(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A LOOP THAT STARTS WHILE A `/login` A LOOP BEFORE IT TYPED STILL STANDS
-/// (the login-carry review, 2026-10-20: Off and back over the browser
-/// hand-off withdrew the owner's notice, and at `Login interrupted` the new
-/// loop typed `keep going` and a second `/login` into the same loss; its
-/// first read, before any `status`, took the dialog for no program's, as no
-/// composer frame names Claude Code while it stands).
 #[test]
 fn a_loop_started_inside_the_login_a_loop_before_typed_carries_it_on() {
     use crate::supervise::approvals::{Outcome, Row};
@@ -27300,13 +25566,6 @@ fn a_loop_started_inside_the_login_a_loop_before_typed_carries_it_on() {
     }
 }
 
-/// THE CREDITS HOLD IN THE LOOP (the owner, 2026-10-19: *"for continuing on
-/// credits, that's an optional additional feature that's off by default. use
-/// subscriptions."*): the notice credits started on (2.1.300, measured:
-/// `You're now using usage credits · Your session limit resets 9:43am (…)`),
-/// read by the loop's own read before the point, gives the point that shows
-/// only the lasting `Now using usage credits` its reset: nothing is typed,
-/// and the point waits for 9:43 and the grace.
 #[test]
 fn the_loop_holds_its_own_turns_on_usage_credits_until_the_notices_reset() {
     use crate::supervise::policy::turn_end::{CREDITS_HOLD_TOLD, RULE_CREDITS_HOLD};
@@ -27363,11 +25622,6 @@ fn the_loop_holds_its_own_turns_on_usage_credits_until_the_notices_reset() {
     assert_eq!(typed, 1, "{lines:#?}");
 }
 
-/// THE LOOP KEEPS WHAT THE SCREEN NO LONGER DRAWS (the review of 2026-10-19,
-/// P3 and P1): a reset still ahead — the notice credits started on read,
-/// then a screen with no notice (a Team account draws no lasting one) — and a
-/// model's credits (`Fable 5.1 is drawing from usage credits`, drawn once a
-/// process).
 #[test]
 fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none() {
     use crate::supervise::policy::turn_end::{
@@ -27479,10 +25733,6 @@ fn the_loop_keeps_a_reset_ahead_and_a_models_credits_where_the_screen_draws_none
     assert_eq!(s.credits_kept, None);
 }
 
-/// THE HOST'S TURN ON USAGE CREDITS: a break in the agent's own background
-/// work, the screen saying credits carry the session, is withheld from the
-/// host (`guard=credits`) under the key off — its notice would be billed to
-/// them.
 #[test]
 fn the_hosts_background_step_is_withheld_on_usage_credits() {
     let bg = |credits: bool| {
@@ -27529,10 +25779,6 @@ fn the_hosts_background_step_is_withheld_on_usage_credits() {
     assert_eq!(run(false, false), (1, vec![]));
 }
 
-/// A NEED SAID EARLY IN A TALL TURN WHOSE LAST WORDS CLAIM NO DONE IS RAISED
-/// (`TurnEndState::reads_turn_whole`), on every harness: the turn's start —
-/// a `NEEDS YOU:` said there — is above the screen, in the history, and the
-/// last words say the worker goes on.
 #[test]
 fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
     let fit = |mut drawn: Vec<String>, rows: usize| {
@@ -27678,9 +25924,6 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
     }
 }
 
-/// Claude Code at the end of the turn the `❯` row of `prompt` opened, the
-/// worker's last words `said` under it and the done row `done`, at an empty
-/// composer in bypass mode.
 fn answered_turn(prompt: &str, said: &str, done: &str) -> Vec<String> {
     let mut r = rows(&[
         &format!("❯ {prompt}"),
@@ -27694,8 +25937,6 @@ fn answered_turn(prompt: &str, said: &str, done: &str) -> Vec<String> {
     r
 }
 
-/// P4 OF THE FOREVER LAB, THE LOOP: A TURN OVER BEFORE THE SERVER'S VERDICT
-/// SAW THE WORKER BUSY IS READ WITHIN A RECHECK ([`super::AGENT_RECHECK`]).
 #[test]
 fn a_turn_the_verdict_never_saw_busy_is_read_and_judged_within_a_recheck() {
     const PROMPT: &str = "write the parser for this repository";
@@ -27782,9 +26023,6 @@ fn a_turn_the_verdict_never_saw_busy_is_read_and_judged_within_a_recheck() {
     assert!(dirty_checks(&m) >= 1, "{:#?}", m.requests);
 }
 
-/// P4'S STILL-OPEN CASE, THE LOOP: A TURN THE POINT'S KEY CANNOT TELL FROM
-/// THE POINT IS READ AND JUDGED BY ITS SUBMISSION ([`super::submitted_over`],
-/// `text --json`'s `"submits"`).
 #[test]
 fn a_turn_the_points_key_cannot_tell_is_judged_by_its_submission() {
     const PROMPT: &str = "write the parser for this repository";
@@ -27891,13 +26129,8 @@ impl IdleHost for LaunchHost {
     }
 }
 
-/// The instant [`LaunchHost`] reports a launch at (unix ms).
 const LAUNCHED_MS: i64 = 1_792_520_389_950;
 
-/// One hosted loop over `m` beside `host`, its ledger at `tag` holding
-/// `books` beforehand (the rows a loop before it wrote; empty: none; `None`:
-/// the loop keeps no ledger), its journal beside it: the journal's lines and
-/// the ledger's rows after it.
 fn launched_run(
     tag: &str,
     m: &mut Mock,
@@ -27932,8 +26165,6 @@ fn launched_run(
     (lines, rows)
 }
 
-/// The ledger's point records (`point@v1`), each as `(box_seq, short
-/// streak)`.
 fn point_rows(rows: &[String]) -> Vec<(u64, u32)> {
     rows.iter()
         .filter(|r| r.contains(&format!("\"rule_id\":\"{}\"", approvals::RULE_POINT)))
@@ -27953,7 +26184,6 @@ fn point_rows(rows: &[String]) -> Vec<(u64, u32)> {
         .collect()
 }
 
-/// The back-offs the journal waited, as their `WAITING` lines' tails.
 fn back_offs(lines: &[String]) -> Vec<String> {
     lines
         .iter()
@@ -27962,20 +26192,10 @@ fn back_offs(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The reply the lab's work chain answers with.
 const LAB_REPLY: &str = "Implemented the parser module and its unit tests in this turn.";
 
-/// A harness's launch for [`launches`]: its name, its scripted screens, and
-/// the content seq of its first frame and of its reply.
 type LaunchCase = (&'static str, fn() -> Mock, u64, u64);
 
-/// A launch's first frames before any prompt, then the prompt's turn and its
-/// reply, per harness, with the content seq of the first frame and of the
-/// reply: GEMINI CLI's frame drawn before its banner (measured in the forever
-/// lab: `aterm_phase::gemini::fixtures::PRE_BANNER`), and MUSE CODE's blank
-/// first screen, held through the server's idle verdict (the forever lab's
-/// `fl2-muse` tabs `land-b` and `land-d`: `point@v1 … short turns in a row:
-/// 1` at `box_seq` 29 and 30, every row of the screen blank).
 fn launches() -> Vec<LaunchCase> {
     use aterm_phase::prompt::fixtures::screen;
     fn gemini() -> Mock {
@@ -28001,8 +26221,6 @@ fn launches() -> Vec<LaunchCase> {
     vec![("gemini", gemini, 101, 103), ("muse", muse, 104, 106)]
 }
 
-/// P3 OF `docs/measured/forever-lab-2026-10-20.md`: A POINT BEFORE ANY
-/// PROMPT, SINCE A LAUNCH WITH NOTHING KEYED, IS NO SHORT TURN.
 #[test]
 fn a_launchs_frame_before_any_prompt_is_no_short_turn() {
     for (agent, mock, first, reply) in launches() {
@@ -28042,12 +26260,6 @@ fn a_launchs_frame_before_any_prompt_is_no_short_turn() {
     }
 }
 
-/// A LAUNCH WITH A TASK STILL COUNTS ITS FIRST REPLY: the task its launch
-/// carried (its argv, a spawn's task file) is the conversation's first
-/// message on the screen, so wherever the session's first loop first reads
-/// it — at the frame before the task is drawn, in the task's turn running,
-/// or at the task's reply — the reply is the first short turn, `1 short
-/// turn(s) in a row: 2 min back-off`, never read away.
 #[test]
 fn a_launch_with_a_task_counts_its_first_reply() {
     use aterm_phase::gemini::fixtures as g;
@@ -28088,12 +26300,6 @@ fn a_launch_with_a_task_counts_its_first_reply() {
     assert_eq!(point_rows(&rows), [(101, 1), (103, 2)], "{rows:#?}");
 }
 
-/// A SUCCESSOR'S FIRST POINT IS ITS SEEDS' TO JUDGE, a launch seen or not:
-/// a loop the host started as the session's Off lifted, and one that finds
-/// an earlier loop's rows in the session's ledger (a relaunch's, a fault
-/// restart's, a seamless update's, a reopened tab's), read the frame before
-/// any prompt as before — a point that lengthens the streak the books left
-/// — never as a launch's.
 #[test]
 fn a_successors_first_point_keeps_its_seeds() {
     use aterm_phase::gemini::fixtures as g;
@@ -28158,9 +26364,6 @@ fn a_successors_first_point_keeps_its_seeds() {
     assert!(!lines.iter().any(|l| l.starts_with("DONE ")), "{lines:#?}");
 }
 
-/// P3'S STILL-OPEN CASE: AN AGENT STARTED AGAIN SINCE THE BOOKS' LAST ROW
-/// IS A LAUNCH'S, BOOKS OR NOT (`Session::unasked_launch`,
-/// [`approvals::last_row_ms`]).
 #[test]
 fn an_agent_started_again_since_its_books_is_a_launchs() {
     use aterm_phase::gemini::fixtures as g;
@@ -28220,11 +26423,6 @@ fn an_agent_started_again_since_its_books_is_a_launchs() {
     }
 }
 
-/// ONLY THE FIRST POINT IS A LAUNCH'S: once a point was judged, a screen
-/// that holds nothing of a conversation (a redraw that cleared it, a
-/// `/clear`, a blank flash) is no launch's, though no person keyed since — the
-/// back-off the first reply decided stands, and its act is still owed, so
-/// the host is asked once, at the frame before any prompt.
 #[test]
 fn a_screen_cleared_after_the_first_point_still_owes_its_act() {
     use aterm_phase::gemini::fixtures as g;
@@ -28265,9 +26463,6 @@ fn a_screen_cleared_after_the_first_point_still_owes_its_act() {
     );
 }
 
-/// Gemini CLI's screen with a turn that ended on its tool's box and no words
-/// after it: `YOLO_TOOL_RAN` without its `✦ Tool call done.` row (a blank row
-/// in its place).
 fn gemini_tool_only_end() -> Vec<String> {
     let mut rows =
         aterm_phase::prompt::fixtures::screen(aterm_phase::gemini::fixtures::YOLO_TOOL_RAN);
@@ -28279,8 +26474,6 @@ fn gemini_tool_only_end() -> Vec<String> {
     rows
 }
 
-/// The policy's reading of `rows` by `program`'s reader, as the hostless
-/// lane reads one (an empty composer).
 fn policy_reading(program: &str, rows: &[String]) -> TurnEndReading {
     let reading = aterm_phase::read(Some(program), rows, None);
     TurnEndReading::of(
@@ -28296,8 +26489,6 @@ fn policy_reading(program: &str, rows: &[String]) -> TurnEndReading {
     )
 }
 
-/// THE REVIEW OF `b9/forever-gaps`, RV-2: A TURN THAT ENDED WITH NO WORDS
-/// STILL HOLDS A CONVERSATION ([`TurnEndReading::holds_no_conversation`]).
 #[test]
 fn a_turn_ended_with_no_words_still_holds_a_conversation() {
     use aterm_phase::prompt::fixtures::screen;
@@ -28323,9 +26514,6 @@ fn a_turn_ended_with_no_words_still_holds_a_conversation() {
     assert!(!muse.message_drawn, "{muse:?}");
 }
 
-/// RV-2 THROUGH THE LOOP: a session's first loop that saw the launch reads
-/// the frame before the banner, then a turn it never saw run that ended on
-/// its tool's box.
 #[test]
 fn a_first_turn_ended_with_no_words_after_a_launch_is_judged() {
     use aterm_phase::gemini::fixtures as g;
@@ -28353,10 +26541,6 @@ fn a_first_turn_ended_with_no_words_after_a_launch_is_judged() {
     assert_eq!(point_rows(&rows_attach), [(101, 1)], "{rows_attach:#?}");
 }
 
-/// F3 ON MUSE CODE, THROUGH THE LOOP (measured live 2026-10-21, the lab's
-/// `forever --mode resid` chain `tool-end`): a launch's first screen, then
-/// the first turn ended on Muse Code's own read row (`  Read README.md`, no
-/// `◆`) with no words after it.
 #[test]
 fn a_first_turn_ended_on_muses_read_row_after_a_launch_is_judged() {
     use aterm_phase::muse::fixtures as u;
@@ -28390,9 +26574,6 @@ fn a_first_turn_ended_on_muses_read_row_after_a_launch_is_judged() {
     assert!(back_offs(&lines).is_empty(), "{lines:#?}");
 }
 
-/// RV-1, THE SCREEN SIDE: Claude Code's tall report whose act's `❯` row is
-/// above the screen, and the same screen after the tab grew and aterm's
-/// resize revealed three history rows at the top.
 #[test]
 fn a_top_reveal_keeps_the_point_key_and_brings_the_opener_into_sight() {
     const ACT: &str = "keep going";
@@ -28441,10 +26622,6 @@ fn a_top_reveal_keeps_the_point_key_and_brings_the_opener_into_sight() {
     assert_eq!((a.phase, a.said_tail), (b.phase, b.said_tail));
 }
 
-/// RV-1b, THE SCREEN SIDE: one `❯` prompt holding a token longer than the
-/// line, hard-split where Ink splits it at two widths (40 and 60 columns),
-/// is two openers by their hash (the rows are joined with a space, so a
-/// split inside a word is another word), over the same last words.
 #[test]
 fn a_rewrapped_long_token_hashes_as_another_opener_over_the_same_words() {
     const URL: &str = "https://example.com/org/repository/pull/12345/files#diff-0123456789abcdef";
@@ -28477,7 +26654,6 @@ fn a_rewrapped_long_token_hashes_as_another_opener_over_the_same_words() {
     assert_eq!(said_narrow, said_wide, "the same words");
 }
 
-/// THE REVIEW OF `b9/forever-gaps`: P4'S RECHECK RUNS UNDER A SHORT SETTLE.
 #[test]
 fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
     const PROMPT: &str = "write the parser for this repository";
@@ -28560,18 +26736,6 @@ fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
     );
 }
 
-/// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` BEFORE ANY POINT DECIDED
-/// ITS DIALOG IS READ AS THAT LIMIT, end to end under `program=node` at full power:
-/// the dialog is read once, too young to judge (the box settle), and the next read is
-/// already the error its `Stop` left — no episode stands. The read that drew the
-/// dialog names the limit (`Session::limit_stopped_adopt`): the error is waited on to
-/// the ladder's first rung from that read (`WAITING … usage-session resets`), NEEDS
-/// YOU is raised at it (`… after Stop, resumed on a back-off ladder`, its reason the
-/// limit's, not the error's), and `usage-resume@v1` is typed there; the try that gets
-/// through takes the badge down. Measured before: escalated as an API error not
-/// retried, nothing typed. NEGATIVE CONTROL: another box read before the error in the
-/// dialog's place (the shell box) names no limit, and the error is still a person's,
-/// nothing typed.
 #[test]
 fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_limit() {
     use aterm_phase::gemini::fixtures as g;
@@ -28673,7 +26837,6 @@ fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_li
         m.requests
     );
 
-    // NEGATIVE CONTROL: the shell box in the dialog's place.
     let (m, lines) = run(screen(g::BOX_SHELL));
     assert!(
         !m.requests
@@ -28725,9 +26888,6 @@ impl IdleHost for RelaunchHost {
     }
 }
 
-/// THE REVIEW OF `b9/resid3`, THE LOOP: A HOST STEP THAT MOVED THE SESSION
-/// TELLS THE POLICY ITS KEYS ARE THE HARNESS'S
-/// ([`super::super::policy::turn_end::TurnEndState::host_moved`]).
 #[test]
 fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
     let run = |moved: bool| {
@@ -28771,9 +26931,6 @@ fn a_host_step_that_moved_the_session_spends_the_count_on_the_harness() {
     assert_eq!(run(false), (true, true, true), "a step that moved nothing");
 }
 
-/// THE SECOND RESIDUAL OF TURNS TOLD BY SUBMISSION, THE LOOP: A RESTART
-/// WHOSE NEW PROCESS WAS TAKEN READS THE COUNT AGAIN
-/// ([`super::super::policy::turn_end::TurnEndState::counted_after_harness`]).
 #[test]
 fn a_restart_whose_process_was_taken_reads_the_count_again() {
     let run = |answer: &'static str, counts: bool| {
@@ -28829,9 +26986,6 @@ fn a_restart_whose_process_was_taken_reads_the_count_again() {
     );
 }
 
-/// THE REVIEW OF `b9/resid4`, E2'S MARK: THE BASELINE A RESTART WHOSE PROCESS
-/// WAS TAKEN SETS IS MARKED AS A READING MARKS ITS CONVERSATION
-/// ([`super::super::policy::turn_end::conversation_mark`]).
 #[test]
 fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
     let answered = answered_turn(
@@ -28892,11 +27046,6 @@ fn a_restarts_count_baseline_is_marked_as_a_reading_marks_its_conversation() {
     );
 }
 
-/// THE REVIEW OF `b9/resid3`, F1/F2 ON GEMINI CLI, THE LOOP: A SCREEN ITS
-/// READER TAKES FOR A LAUNCH CARD, NOTHING SUBMITTED SINCE A POINT THAT HELD
-/// A TASK, IS READ AS THAT CONVERSATION
-/// ([`super::super::policy::turn_end::TurnEndState::redrawn_fresh`], the
-/// loop's `taskless`).
 #[test]
 fn a_rewrapped_band_read_as_a_launch_card_keeps_the_points_back_off() {
     let msg = " > FOREVERLAB-SAME-WORDS. write the parser for this repository under \

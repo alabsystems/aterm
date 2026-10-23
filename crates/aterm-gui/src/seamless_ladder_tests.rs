@@ -7,15 +7,13 @@ use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use super::*;
 
-/// The shared generator (`aterm_spec::rng`) as a draw closure, so a failing
-/// step names a reproducible state.
+/// Shared generator (`aterm_spec::rng`) wrapped as a draw closure.
 pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
     let mut rng = aterm_spec::rng::XorShift::new(seed);
     move || rng.next_u64()
 }
 
-/// One step of the hostile walk: each arm is a byte class or geometry change that once
-/// made a producer refuse, or that a cursor-and-mode walk never emits.
+/// Apply one hostile walk step to `t`.
 pub(super) fn hostile_walk_step(t: &mut Terminal, next: &mut impl FnMut() -> u64) {
     let roll = next();
     let a = u16::try_from((roll >> 8) % 120).expect("< 120") + 1;
@@ -127,9 +125,7 @@ pub(super) fn hostile_walk_step(t: &mut Terminal, next: &mut impl FnMut() -> u64
     }
 }
 
-/// What this build's consumer makes of `checkpoint` as a producer publishes it: the
-/// meta through the frozen required-key parse, the grids through
-/// `admit_incoming_screen`.
+/// Decode `checkpoint` through [`parse_checkpoint_meta`] and [`admit_incoming_screen`].
 fn consumer_decodes(checkpoint: &TerminalCheckpoint) -> Result<TerminalCheckpoint, String> {
     let carry = ScreenCarry {
         schema: ScreenCarry::SCHEMA,
@@ -149,8 +145,7 @@ fn consumer_decodes(checkpoint: &TerminalCheckpoint) -> Result<TerminalCheckpoin
     }
 }
 
-/// Everything a carry the producer emits must satisfy: this build's own full predicate
-/// commits it, and this build's consumer adopts it exactly, not degraded.
+/// Assert `screen_digest` commits `checkpoint` and [`consumer_decodes`] adopts it without degradation.
 fn assert_wire_admits(at: &str, checkpoint: &TerminalCheckpoint) {
     screen_digest(&[(0, checkpoint.clone())])
         .unwrap_or_else(|refusal| panic!("{at}: this build's own predicate refused it: {refusal}"));
@@ -175,8 +170,7 @@ fn assert_wire_admits_all(carried: &[(String, TerminalCheckpoint)]) {
     });
 }
 
-/// `n` one-cell OSC 8 links, each with a URL of exactly `url_len` bytes (at most the
-/// engine's 8 KiB `MAX_HYPERLINK_URL_BYTES`, past which it drops the link).
+/// Generate `n` one-cell OSC 8 links each with a URL of `url_len` bytes.
 pub(crate) fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for link in 0..n {
@@ -188,10 +182,7 @@ pub(crate) fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
     bytes
 }
 
-/// What the StrippedLinks rung must be: `carried` is `exact` (the engine's own carry at
-/// the same scrollback depth) with the hyperlinks of the line records over the record
-/// cap dropped and nothing else changed: every scalar, every other line byte for byte,
-/// and on the stripped lines the text, attributes, underline colours and wrap flag.
+/// Assert `carried` equals `exact` except for dropping hyperlinks on lines exceeding the record cap.
 pub(super) fn assert_only_over_cap_links_dropped(
     at: &str,
     exact: &TerminalCheckpoint,
@@ -241,9 +232,7 @@ pub(super) fn assert_only_over_cap_links_dropped(
     stripped
 }
 
-/// Every reachable engine state is admitted by the wire: 3000 steps of the hostile
-/// grammar, mid-sequence states included, each carried by [`carry_for_wire`], committed
-/// by `screen_digest` and adopted exactly.
+/// Every state reached by 3,000 hostile walk steps is admitted by the wire.
 #[test]
 fn every_reachable_engine_state_is_admitted_by_the_wire() {
     const BATCH: usize = 64;
@@ -329,10 +318,7 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
     );
 }
 
-/// The producer is total over the desks (labelled below) that refused the in-session
-/// update: each is carried at its named rung, committed by `screen_digest` and adopted
-/// exactly, and the pool settles; the link-dense desk keeps its screen and loses only
-/// that line's links.
+/// Hostile and large desks each carry at their expected rung and settle as a pool.
 #[test]
 fn producer_is_total_over_hostile_and_large_desks() {
     use CarryRung::{Full, Repaint, Sanitized, StrippedLinks};
@@ -488,10 +474,7 @@ fn producer_is_total_over_hostile_and_large_desks() {
     assert_eq!(screen_digest(&screens), Ok(digest));
 }
 
-/// The strip decodes no more scrollback than the capture priced. The capture prices a
-/// carried scrollback by its dimensions, not its bytes; here every line is one-cell links
-/// with 8 KiB URLs, so a 40-line depth is megabytes past that price and is dropped
-/// undecoded, while the visible screen's links are stripped.
+/// Scrollback exceeding the capture byte budget is dropped without decoding to strip links.
 #[test]
 fn a_scrollback_past_what_the_capture_priced_is_never_decoded_to_strip_its_links() {
     const DEPTH: u32 = 40;
@@ -533,9 +516,7 @@ fn a_scrollback_past_what_the_capture_priced_is_never_decoded_to_strip_its_links
     assert_eq!(probe, exact, "and changes nothing");
 }
 
-/// A visible grid past the absolute strip-work bound (`MAX_LINK_STRIP_BYTES`) takes
-/// Repaint without its links being decoded; the dense 24x80 grid above, under the bound,
-/// keeps its text at StrippedLinks.
+/// A visible grid exceeding `MAX_LINK_STRIP_BYTES` falls back to `Repaint` without decoding links.
 #[test]
 fn a_visible_grid_past_the_strip_work_bound_repaints_without_decoding_links() {
     let mut dense = Terminal::new(24, 80);
@@ -568,9 +549,7 @@ fn a_visible_grid_past_the_strip_work_bound_repaints_without_decoding_links() {
     assert_wire_admits("large visible grid", &checkpoint);
 }
 
-/// A link-dense line costs its links, not the screen or the scrollback. A row of one-cell
-/// links carries each URL once per span, so eight 8 KiB links in an 80-column pane make a
-/// 65 KiB line record against the 56 KiB cap.
+/// A link-dense line over the record cap loses only its links while preserving screen and scrollback.
 #[test]
 fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
     use super::tests::v0_91_consumer_decodes;
@@ -681,9 +660,7 @@ fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
     );
 }
 
-/// The self-check, the net for a producer bug the ladder missed, lowers along the
-/// ladder's own rungs: a carry exact but non-canonical because of a link-dense line loses
-/// that line's links, the other carries are untouched, and the pool commits.
+/// The pool self-check strips links on a blamed link-dense carry rather than blanking it.
 #[test]
 fn the_self_check_strips_a_blamed_link_dense_carry_rather_than_blank_it() {
     let mut links = Terminal::new(24, 80);
@@ -729,9 +706,7 @@ fn the_self_check_strips_a_blamed_link_dense_carry_rather_than_blank_it() {
     assert_eq!(pool[0].rung, CarryRung::Repaint);
 }
 
-/// A rollback's older consumer caps a grid at the frozen 32 Ki cells, so a full-screen
-/// 5K window reaches it as a 24x80-at-most Repaint it admits, never a grid it refuses
-/// (which would cost the whole rollback).
+/// A downgrade target (`WireCaps::legacy`) carries an over-cap window as a 24x80 `Repaint`.
 #[test]
 fn a_downgrade_target_carries_an_over_cap_window_as_a_repaint() {
     for (rows, cols) in [(99_u16, 338_u16), (116, 397)] {
@@ -765,9 +740,7 @@ fn a_downgrade_target_carries_an_over_cap_window_as_a_repaint() {
     }
 }
 
-/// The Sanitized rung clamps exactly the fields that broke a bound, in the consumer's
-/// order, and never touches the grids; a bound with no clamp (a geometry the protocol
-/// does not have) sends the carry on to Repaint.
+/// `sanitize_checkpoint_for_wire` clamps out-of-bounds scalar fields without touching the grids.
 #[test]
 fn sanitizing_clamps_exactly_the_fields_that_broke_a_bound() {
     let mut t = Terminal::new(6, 40);
@@ -821,11 +794,7 @@ fn sanitizing_clamps_exactly_the_fields_that_broke_a_bound() {
     assert!(why.contains("has no sanitizer"), "{why}");
 }
 
-/// The Repaint rung is admitted by this build's own predicates for every geometry, both
-/// caps and any aggregate, so the one screen-related capture `Err` (a Repaint carry
-/// refused by its own build) is unreachable: the engine's extreme shapes, the alternate
-/// screen, a pool whose aggregate is spent (the carry falls to an uncharged 1x1 blank
-/// the self-check makes room for), and a rollback's legacy cap.
+/// The `Repaint` rung is admitted for every geometry, cap, and aggregate cell spend.
 #[test]
 fn the_repaint_rung_is_admitted_for_every_geometry_cap_and_aggregate() {
     let full = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
@@ -864,10 +833,7 @@ fn the_repaint_rung_is_admitted_for_every_geometry_cap_and_aggregate() {
     }
 }
 
-/// The self-check lowers the session `screen_digest` blames to Repaint instead of
-/// refusing the update, leaving the others untouched, and what it cannot lower comes
-/// back typed: a refusal of its own Repaint carry names the session, and too many
-/// sessions is a pool fact no rung can change.
+/// `settle_wire_carries` lowers a blamed session to `Repaint` and returns typed errors for unrecoverable pools.
 #[test]
 fn the_self_check_lowers_the_blamed_session_and_types_what_it_cannot() {
     let carried = |local_id: u64, text: &[u8]| {
@@ -920,8 +886,7 @@ fn the_self_check_lowers_the_blamed_session_and_types_what_it_cannot() {
     ));
 }
 
-/// A pool over the aggregate cell budget lowers its largest session: two screens at the
-/// per-grid ceiling fill the 4 Mi-cell aggregate exactly, so a third tips it over.
+/// A pool exceeding the aggregate cell budget lowers its largest session to `Repaint`.
 #[test]
 fn a_pool_over_the_aggregate_lowers_its_largest_session() {
     let (rows, cols) = (512_u16, 4096_u16);
@@ -966,10 +931,7 @@ fn a_pool_over_the_aggregate_lowers_its_largest_session() {
     assert_eq!(screen_digest(&screens), Ok(digest));
 }
 
-/// Lowering a carry's scrollback needs no engine lock: the visible records of its own
-/// strict decode, re-encoded, are byte-identical to the engine's visible-only carry,
-/// so the self-check's first step for a pool over the real-byte aggregate costs
-/// history, never fidelity.
+/// Dropping carried scrollback produces a carry identical to the engine's visible-only carry.
 #[test]
 fn dropping_carried_history_equals_the_engines_visible_only_carry() {
     let mut t = Terminal::new(10, 40);
@@ -1010,11 +972,7 @@ fn dropping_carried_history_equals_the_engines_visible_only_carry() {
     assert_wire_admits("lowered twice", &pool[0].checkpoint);
 }
 
-/// The producer's Repaint reaches the successor: only the session the capture carried
-/// blank is marked `ScreenCarry::repaint` in the manifest; the successor adopts it
-/// flagged for a redraw and without a control carry, adopts every other session
-/// exactly, and the adoption proof still equals the parent's, because the flag rides
-/// no digest.
+/// A producer `Repaint` carry marks `ScreenCarry::repaint` and preserves the adoption proof.
 #[test]
 #[cfg(unix)]
 fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
@@ -1166,14 +1124,11 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     staged.teardown();
 }
 
-/// The producer is total over arbitrary input: whatever bytes a program wrote, however
-/// the pane was resized, and whichever successor it hands to, the carry
-/// [`carry_for_wire`] returns is committed by `screen_digest`, fits the successor's caps,
-/// and is adopted exactly.
+/// Property tests verifying [`carry_for_wire`] over arbitrary terminal inputs and resizes.
 mod arbitrary {
     use super::*;
 
-    /// xorshift64 with a fixed seed, so a failure reproduces from its case.
+    /// Seeded xorshift64 generator.
     struct Rng(u64);
 
     impl Rng {
@@ -1196,9 +1151,7 @@ mod arbitrary {
         }
     }
 
-    /// Fragments that open and close control strings, switch screens, save
-    /// cursors and draw multi-codepoint clusters, so short samples still reach
-    /// those states.
+    /// Control sequence fragments exercising screen switches, saved cursors, OSC strings, and clusters.
     const FRAGMENTS: &[&[u8]] = &[
         b"\x1b",
         b"\x1b[",
@@ -1229,8 +1182,7 @@ mod arbitrary {
         b"\x1bc",
     ];
 
-    /// A pane geometry: ordinary panes mostly, and the engine's extreme thin
-    /// shapes out to its protocol ceiling.
+    /// Sample a pane geometry including extreme thin shapes.
     fn geometry(rng: &mut Rng) -> (u16, u16) {
         match rng.below(6) {
             0..4 => (rng.within(1, 120), rng.within(1, 400)),
@@ -1245,8 +1197,7 @@ mod arbitrary {
         }
     }
 
-    /// Bytes a program might write: any byte at all, printable runs, digit
-    /// runs, and the [`FRAGMENTS`].
+    /// Sample arbitrary terminal input bytes and [`FRAGMENTS`].
     fn bytes(rng: &mut Rng) -> Vec<u8> {
         let mut out = Vec::new();
         for _ in 0..rng.below(48) {
@@ -1301,10 +1252,7 @@ mod arbitrary {
     }
 }
 
-/// Every blank fallback keeps the shell's mark authority: the carries of last resort (the
-/// producer's Repaint rung and the consumer's degrade past a spent aggregate, a 1x1
-/// blank) keep the nonce requirement and the shell's nonce, or any program's output
-/// could forge command marks and exit codes.
+/// Blank fallback carries preserve `require_shell_integration_nonce` and the shell's nonce.
 #[test]
 fn every_blank_fallback_keeps_the_shells_mark_authority() {
     use aterm_core::terminal::ShellIntegrationPosture;
@@ -1369,10 +1317,7 @@ fn every_blank_fallback_keeps_the_shells_mark_authority() {
     );
 }
 
-/// A successor's carry ceiling only ever lowers the rung: `full` is [`carry_for_wire`]
-/// exactly, `visible` the ladder at depth 0 (no higher than VisibleOnly), and `repaint`
-/// [`repaint_carry_for_wire`]'s blank screen, each committed by `screen_digest` and
-/// adopted exactly.
+/// `CarryCeiling` (`Full`, `Visible`, `Repaint`) only lowers the carry rung.
 #[test]
 fn a_policy_ceiling_only_ever_lowers_the_carry() {
     use aterm_update_core::handoff_policy::CarryCeiling;
@@ -1455,8 +1400,7 @@ fn a_policy_ceiling_only_ever_lowers_the_carry() {
     );
 }
 
-/// A `carry = "repaint"` policy never projects a session's grids: it is the escape hatch
-/// for a capture path that is slow or panics, and projection is that path.
+/// `CarryCeiling::Repaint` never projects a session's grids.
 #[test]
 fn a_repaint_ceiling_never_projects_a_grid() {
     use aterm_update_core::handoff_policy::CarryCeiling;

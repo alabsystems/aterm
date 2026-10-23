@@ -9,8 +9,8 @@ use aterm_agent::harness::footer::{FactKind, FactMask};
 use aterm_agent::harness::session_usage::TrafficView;
 
 use super::{
-    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, account_menu_rows_from, band_glyphs,
-    band_level, rows, traffic_rows, weekly_meter_bar,
+    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, SessionWeek, account_menu_rows_from,
+    band_glyphs, band_level, rows, traffic_rows, weekly_facts, weekly_gap_why, weekly_meter_bar,
 };
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
@@ -34,6 +34,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         context: Some("ctx 84% left".into()),
         subscription: None,
         weekly_meter: None,
+        weekly_gap: None,
         accounts: Vec::new(),
         auto_rotate: true,
         off,
@@ -349,6 +350,450 @@ fn busy_columns_take_the_shaded_ground() {
     assert_eq!(row[lead].bg, c.card_bg);
 }
 
+/// THE ACCOUNT MENU GIVES THE FULL WHY of a weekly figure the footer has not got, under the
+/// footer's own short word, in lines the card's widest content holds; a meter, where there is
+/// one, says it instead.
+#[test]
+fn the_account_menu_says_why_the_week_is_missing() {
+    use aterm_agent::harness::profile::WeeklyGap;
+    use aterm_agent::harness::tap::Refusal;
+    for gap in [
+        WeeklyGap::TapOff,
+        WeeklyGap::Unoffered(Refusal::Exe),
+        WeeklyGap::Unoffered(Refusal::Home),
+        WeeklyGap::Unoffered(Refusal::Login),
+        WeeklyGap::Unoffered(Refusal::Line),
+        WeeklyGap::Unoffered(Refusal::Argv),
+        WeeklyGap::Unoffered(Refusal::Settings),
+        WeeklyGap::Untapped,
+        WeeklyGap::Unrestarted,
+        WeeklyGap::NoReply,
+        WeeklyGap::Stale,
+    ] {
+        let facts = FactMenuFacts {
+            title: "Accounts \u{b7} tab 1".into(),
+            weekly_gap: Some(gap),
+            ..menu_facts(FactMask::default(), true)
+        };
+        let menu = shown(&rows(Fact::Account, &facts));
+        let head = format!("note \u{25f7}  {}", gap.words());
+        let at = menu
+            .iter()
+            .position(|row| *row == head)
+            .expect("the footer's word");
+        let why: Vec<String> = weekly_gap_why(gap)
+            .iter()
+            .map(|line| format!("note {line}"))
+            .collect();
+        assert_eq!(menu[at + 1..at + 1 + why.len()], why[..], "{gap:?}");
+        for line in weekly_gap_why(gap) {
+            assert!(
+                crate::tab_menu::display_cells(line) <= crate::autopilot_menu::MAX_CONTENT,
+                "{line:?}"
+            );
+        }
+        let metered = FactMenuFacts {
+            weekly_meter: Some(weekly_meter_bar("weekly 62% left")),
+            ..facts
+        };
+        assert!(
+            !shown(&rows(Fact::Account, &metered)).contains(&head),
+            "a meter says the week instead"
+        );
+    }
+}
+
+/// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (tenths
+/// too) give the meter and the session's row its whole percent, an aged figure its age as a
+/// store row's, a 7d wall gives `weekly 0% left`, and with neither the footer's reason goes
+/// to the menu's why.
+#[test]
+fn the_account_menu_takes_the_footers_week_or_its_reason() {
+    use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyFigure, WeeklyGap};
+    const NOW: i64 = 1_790_000_000;
+    let sub = |weekly: Option<&str>, gap: Option<WeeklyGap>| SubscriptionDisplay {
+        weekly: weekly.map(str::to_owned),
+        weekly_gap: gap,
+        ..SubscriptionDisplay::default()
+    };
+    let left = |pct: u32, age: &str| Some((pct, age.to_owned()));
+    assert_eq!(
+        weekly_facts(&sub(Some("weekly 61.5% left"), None), false, NOW),
+        (
+            left(61, ""),
+            Some("\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 61.5% left".into()),
+            None
+        ),
+        "tenths keep the meter and the row's percent"
+    );
+    assert_eq!(
+        weekly_facts(
+            &sub(Some("weekly 62% left \u{b7} 16m ago"), None),
+            false,
+            NOW
+        )
+        .0,
+        left(62, ""),
+        "an aged figure's words with no figure behind them"
+    );
+    let aged = SubscriptionDisplay {
+        weekly_figure: Some(WeeklyFigure {
+            used_x10: 380,
+            resets_at: NOW + 86_400,
+            at: NOW - 40 * 60,
+        }),
+        ..sub(Some("weekly 62% left \u{b7} 40m ago"), None)
+    };
+    assert_eq!(
+        weekly_facts(&aged, false, NOW).0,
+        left(62, " \u{b7} 40m ago"),
+        "the session's own aged figure keeps its age in its row"
+    );
+    assert_eq!(
+        weekly_facts(&aged, false, NOW - 30 * 60).0,
+        left(62, ""),
+        "the control: the same figure while current"
+    );
+    assert_eq!(
+        weekly_facts(&aged, false, NOW + 86_400),
+        (None, None, None),
+        "its week reset since the footer's read: no row figure and no meter of the expired week"
+    );
+    assert_eq!(
+        weekly_facts(&aged, true, NOW + 86_400).0,
+        left(0, ""),
+        "a 7d wall still says its own"
+    );
+    assert_eq!(
+        weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), false, NOW),
+        (None, None, Some(WeeklyGap::NoReply)),
+        "the footer's reason"
+    );
+    assert_eq!(
+        weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), true, NOW).0,
+        left(0, ""),
+        "a 7d wall over every reason"
+    );
+    assert_eq!(
+        weekly_meter_bar("weekly 61.5% left"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 61.5% left"
+    );
+}
+
+/// AN ACCOUNT ROW SAYS HOW OLD ITS STORE FIGURE IS (the footer's one age rule): current for
+/// fifteen minutes, then with its age, however old, while its week runs; never an old
+/// figure read as current, nor dropped to the `100% left` of an account nobody read.
+#[test]
+fn an_account_rows_store_figure_carries_its_age() {
+    use aterm_agent::harness::accounts;
+    const NOW: i64 = 1_790_000_000;
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "main".into(),
+            class: accounts::Class::Dedicated,
+            dir: None,
+            ..accounts::Row::default()
+        }],
+    };
+    let enrolled = std::iter::once("main".to_string()).collect();
+    let label_with = |at: i64, sample: Option<accounts::Sample>| {
+        let mut state = accounts::State::default();
+        let mut acct = accounts::Account {
+            sample,
+            ..accounts::Account::default()
+        };
+        acct.windows.insert(
+            "seven_day".into(),
+            accounts::WindowFig {
+                pct_x10: 385,
+                reset: NOW + 86_400,
+                at,
+                by: "m22".into(),
+                source: accounts::SOURCE_TAP.into(),
+                epoch_at: None,
+            },
+        );
+        state.accounts.insert("main".into(), acct);
+        let (rows, _) = account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            None,
+            None,
+            SessionWeek::default(),
+            NOW,
+        );
+        rows[0].label.clone()
+    };
+    let label = |at: i64| label_with(at, None);
+    assert_eq!(label(NOW - 60), "main \u{b7} dedicated \u{b7} 61% left");
+    assert_eq!(
+        label(NOW - 20 * 60),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 20m ago"
+    );
+    assert_eq!(
+        label(NOW - 3 * 3600),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 3h ago"
+    );
+    assert_eq!(
+        label(NOW - 2 * 86_400),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "a two-day-old reading whose week still runs"
+    );
+    let restamped = accounts::Sample {
+        week_pct: Some(39),
+        week_reset: Some(NOW + 86_400),
+        week_read_at: Some(NOW - 3 * 3600),
+        at: NOW - 60,
+        ..accounts::Sample::default()
+    };
+    assert_eq!(
+        label_with(NOW - 3 * 3600, Some(restamped)),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 3h ago",
+        "a tap's note re-stamps the week it holds: as old as the window's reading"
+    );
+    let (rows, _) = account_menu_rows_from(
+        &roster,
+        &accounts::State::default(),
+        &enrolled,
+        Some("main"),
+        None,
+        SessionWeek {
+            label: None,
+            figure: None,
+            left: Some((62, " \u{b7} 40m ago".into())),
+        },
+        NOW,
+    );
+    assert_eq!(
+        rows[0].label, "main \u{b7} dedicated \u{b7} 62% left \u{b7} 40m ago",
+        "no store figure: the session's own, with its age"
+    );
+    let beside = |session: Option<&str>, at: i64| {
+        let mut state = accounts::State::default();
+        let mut acct = accounts::Account::default();
+        acct.windows.insert(
+            "seven_day".into(),
+            accounts::WindowFig {
+                pct_x10: 385,
+                reset: NOW + 86_400,
+                at: NOW - 2 * 86_400,
+                by: "m22".into(),
+                source: accounts::SOURCE_TAP.into(),
+                epoch_at: None,
+            },
+        );
+        state.accounts.insert("main".into(), acct);
+        let figure = aterm_agent::harness::profile::WeeklyFigure {
+            used_x10: 600,
+            resets_at: NOW + 86_400,
+            at,
+        };
+        let (rows, _) = account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            session,
+            None,
+            SessionWeek {
+                label: None,
+                figure: Some(figure),
+                left: Some((40, String::new())),
+            },
+            NOW,
+        );
+        rows[0].label.clone()
+    };
+    assert_eq!(
+        beside(Some("main"), NOW - 60),
+        "main \u{b7} dedicated \u{b7} 40% left",
+        "the session's own figure, read since the store's, on its own account's row"
+    );
+    assert_eq!(
+        beside(Some("main"), NOW - 3 * 86_400),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "the store's, read since the session's"
+    );
+    assert_eq!(
+        beside(Some("other"), NOW - 60),
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "the control: another account's session figure never reaches this row"
+    );
+
+    let roster = accounts::Roster {
+        rows: vec![
+            accounts::Row {
+                label: "main".into(),
+                email: Some("main@example.test".into()),
+                dir: Some("/logins/main".into()),
+                ..accounts::Row::default()
+            },
+            accounts::Row {
+                label: "work".into(),
+                email: Some("work@example.test".into()),
+                dir: Some("/logins/work".into()),
+                ..accounts::Row::default()
+            },
+        ],
+    };
+    let enrolled = roster.rows.iter().map(|row| row.label.clone()).collect();
+    let menu = |label, email, with_store| {
+        let mut state = accounts::State {
+            active: Some("work".into()),
+            ..accounts::State::default()
+        };
+        if with_store {
+            for (label, used) in [("main", 385), ("work", 200)] {
+                let mut acct = accounts::Account::default();
+                acct.windows.insert(
+                    accounts::WEEK_LIMIT.into(),
+                    accounts::WindowFig {
+                        pct_x10: used,
+                        reset: NOW + 86_400,
+                        at: NOW - 40 * 60,
+                        by: "m22".into(),
+                        source: accounts::SOURCE_TAP.into(),
+                        epoch_at: None,
+                    },
+                );
+                state.accounts.insert(label.into(), acct);
+            }
+        }
+        account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            label,
+            email,
+            SessionWeek {
+                label: None,
+                figure: Some(aterm_agent::harness::profile::WeeklyFigure {
+                    used_x10: 600,
+                    resets_at: NOW + 86_400,
+                    at: NOW - 60,
+                }),
+                left: Some((40, String::new())),
+            },
+            NOW,
+        )
+        .0
+    };
+    let rows = menu(None, Some("main@example.test"), true);
+    assert!(rows[0].active && !rows[1].active);
+    assert!(rows[0].label.ends_with("40% left"));
+    assert!(
+        rows[1].label.ends_with("80% left \u{b7} 40m ago"),
+        "a custom-home session identified only by email cannot replace machine-active work's figure"
+    );
+    for (label, email) in [
+        (None, None),
+        (None, Some("unlisted@example.test")),
+        (Some("work"), Some("main@example.test")),
+    ] {
+        let rows = menu(label, email, true);
+        assert!(
+            !rows[0].active && rows[1].active,
+            "the machine's UI fallback"
+        );
+        assert!(rows[0].label.ends_with("61% left \u{b7} 40m ago"));
+        assert!(
+            rows[1].label.ends_with("80% left \u{b7} 40m ago"),
+            "an unknown or contradictory session identity lends no figure to the active row"
+        );
+        let rows = menu(label, email, false);
+        assert!(
+            rows.iter().all(|row| row.label.ends_with("100% left")),
+            "nor can its weekly words fill an unobserved active row"
+        );
+    }
+    let rows = menu(Some("main"), None, true);
+    assert!(
+        rows[0].label.ends_with("40% left"),
+        "its own explicit label"
+    );
+    let rows = menu(None, Some("main@example.test"), false);
+    assert!(rows[0].label.ends_with("40% left"));
+    assert!(
+        rows[1].label.ends_with("100% left"),
+        "only the email's own row takes its words"
+    );
+}
+
+/// THE SESSION'S WEEK REACHES THE ROW ITS LOGIN IS JUDGED TO (`SubscriptionDisplay::label`),
+/// on a one-row roster too, where the footer names no account; never one whose email
+/// contradicts the session's profile, nor the store's active fallback.
+#[test]
+fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
+    use aterm_agent::harness::accounts;
+    const NOW: i64 = 1_790_000_000;
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "main".into(),
+            class: accounts::Class::Dedicated,
+            dir: None,
+            email: Some("main@example.test".into()),
+            ..accounts::Row::default()
+        }],
+    };
+    let enrolled = std::iter::once("main".to_string()).collect();
+    let mut state = accounts::State {
+        active: Some("main".into()),
+        ..accounts::State::default()
+    };
+    let mut acct = accounts::Account::default();
+    acct.windows.insert(
+        accounts::WEEK_LIMIT.into(),
+        accounts::WindowFig {
+            pct_x10: 385,
+            reset: NOW + 86_400,
+            at: NOW - 30 * 60,
+            by: "m22".into(),
+            source: accounts::SOURCE_TAP.into(),
+            epoch_at: None,
+        },
+    );
+    state.accounts.insert("main".into(), acct);
+    let row = |label: Option<&str>, email: Option<&str>| {
+        let (rows, _) = account_menu_rows_from(
+            &roster,
+            &state,
+            &enrolled,
+            None,
+            email,
+            SessionWeek {
+                label: label.map(str::to_owned),
+                figure: Some(aterm_agent::harness::profile::WeeklyFigure {
+                    used_x10: 900,
+                    resets_at: NOW + 86_400,
+                    at: NOW - 60,
+                }),
+                left: Some((10, String::new())),
+            },
+            NOW,
+        );
+        (rows[0].label.clone(), rows[0].active)
+    };
+    assert_eq!(
+        row(Some("main"), None),
+        ("main \u{b7} dedicated \u{b7} 10% left".into(), true),
+        "the row its login is judged to takes its newer figure, with no email to match"
+    );
+    let kept = (
+        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 30m ago".to_string(),
+        true,
+    );
+    assert_eq!(
+        row(Some("main"), Some("other@example.test")),
+        kept,
+        "a judged row whose email contradicts the session's profile keeps its own week"
+    );
+    assert_eq!(
+        row(None, Some("other@example.test")),
+        kept,
+        "another account's session, the store's active row: the row keeps its own week"
+    );
+}
+
 #[test]
 fn account_menu_shows_weekly_meter_and_rotation_accounts() {
     assert_eq!(
@@ -537,7 +982,11 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         &enrolled,
         Some("m15-2"),
         Some("m15-2@example.test"),
-        Some(0),
+        SessionWeek {
+            label: None,
+            figure: None,
+            left: Some((0, String::new())),
+        },
         NOW,
     );
     assert!(auto_rotate);

@@ -8,8 +8,6 @@ use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 use aterm_window::event::ElementState;
 use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
-/// A real winit key event, so the tests below drive the shipping `on_key`
-/// routing (where the press-path snap lives) rather than the seam alone.
 fn character_event(ch: char, state: ElementState) -> aterm_window::event::KeyEvent {
     let text = aterm_window::keyboard::SmolStr::new(ch.to_string());
     aterm_window::event::KeyEvent::synthetic_for_test(
@@ -295,7 +293,6 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         /// The menu's Paste: its fence, then the clipboard's delivery.
         MenuPaste,
     }
-    /// Who owns the line an Enter submits.
     enum Line {
         Shell,
         AltScreen,
@@ -710,7 +707,6 @@ fn mapped_press_keeps_caps_when_kitty_arrives_between_hid_and_egress() {
     assert_eq!(drain(pipe), b"\x1b[1;65A");
 }
 
-/// A bare modifier or lock key as winit really delivers it.
 fn modifier_event(
     named: aterm_window::keyboard::NamedKey,
     code: KeyCode,
@@ -726,8 +722,6 @@ fn modifier_event(
     )
 }
 
-/// A terminal scrolled into history with a completed selection on screen —
-/// the state the user is in the instant before they reach for ⌘-C.
 fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Terminal>> {
     let term = app.front_terminal(wid).expect("terminal").term.clone();
     let mut t = term_lock(&term);
@@ -748,10 +742,6 @@ fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Ter
     term
 }
 
-/// Selection custody: ⌘-A selects what you are looking at. The visible rows
-/// are mapped through the live `display_offset` (as the mouse path maps a
-/// click), so Select All while reading history neither snaps to live nor
-/// loses your place.
 #[test]
 fn select_all_selects_the_visible_screen_without_snapping() {
     let mut app = App::headless_for_test();
@@ -789,9 +779,6 @@ fn select_all_selects_the_visible_screen_without_snapping() {
     );
 }
 
-/// Selection custody: ⌘↓ / ⌘↑ are the deliberate return to live. Routed as
-/// a `ScrollIntent`, which moves the viewport without snapping and without
-/// clearing, so you return to live with your selection intact.
 #[test]
 fn cmd_arrows_are_the_deliberate_return_to_live() {
     use crate::input::ScrollIntent;
@@ -893,9 +880,6 @@ fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
     unsafe { libc::close(pipe) };
 }
 
-/// The slot is keyed on the session: a sample published for one session
-/// never answers for another (a legacy shell's "releases are byte-silent"
-/// verdict must not swallow a Kitty app's release reports next door).
 #[test]
 fn a_sample_answers_only_for_the_session_it_was_taken_on() {
     publish_release_relevance(41, false);
@@ -911,9 +895,6 @@ fn a_sample_answers_only_for_the_session_it_was_taken_on() {
     assert_eq!(sampled_release_relevance(0), Some(false));
 }
 
-/// Selection custody for the two byte-producing press payloads with no event
-/// type: a `[key_sequences]` chord's `InputEvent::KeySequence` and the
-/// `option_as_meta = false` / IME-commit fallback's `InputEvent::Text`.
 #[test]
 fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     for (code, payload) in [
@@ -958,14 +939,6 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     }
 }
 
-/// Selection custody: a bare modifier or lock key is inert. No snap, no clear
-/// (Shift's keydown clearing the selection would make shift-click-extend
-/// impossible on macOS), no glide cancel, no blink reset, and no revoked move
-/// licence: Option+Left/Right have no key-time cue, so a word move's sound is
-/// minted when its echo's caret delta is licensed by the press's `nav_hint`,
-/// and macOS delivers `flags_changed` as a synthesized Pressed for
-/// `Named(Alt|Shift|…)`, then `ModifiersChanged` edges as Option is released,
-/// while that echo is in flight.
 #[test]
 fn a_bare_modifier_or_lock_key_is_inert() {
     use aterm_window::keyboard::NamedKey as WNamed;
@@ -1169,9 +1142,6 @@ fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
     assert!(!t.text_selection().has_selection(), "…and still deselects");
 }
 
-/// A pinned control request (`Wake::Input { session: Some(..) }`) for a session
-/// that fronts no window is dropped when view-bound: neither handed to the
-/// keyboard-only hidden seam (which would snap and deselect) nor retargeted.
 #[test]
 fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
     use crate::input::{InputOutcome, ScrollIntent};
@@ -1208,10 +1178,6 @@ fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
     assert!(t.text_selection().has_selection(), "selection left alone");
 }
 
-/// Selection custody: ⌘↓ through the shipping `App::on_key` returns to live
-/// with the selection intact where the hardcoded ⌘ suite is compiled in (on
-/// Linux Super is the desktop's: `cmd_arrows_are_the_deliberate_return_to_live`
-/// and `a_swallowed_cmd_chord_no_longer_snaps_the_viewport`).
 #[test]
 fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
     use aterm_window::keyboard::NamedKey as WNamed;

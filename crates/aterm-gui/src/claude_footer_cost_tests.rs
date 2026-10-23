@@ -7,7 +7,6 @@ use super::*;
 
 use super::probe::*;
 
-/// Plan: the mode light deviates and is drawn, `⏸ plan`.
 const PLAN: &str = "  \u{23F8} plan mode on (shift+tab to cycle)";
 
 /// What one pass cost the footer, counter by counter.
@@ -38,8 +37,6 @@ struct Cost {
     titles: usize,
 }
 
-/// Run one pass on `wid` and say what it cost: the counters are taken
-/// before it, so a cost is this pass's alone.
 fn cost(app: &mut App, wid: WindowId) -> Cost {
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     let _ = (
@@ -70,16 +67,12 @@ fn cost(app: &mut App, wid: WindowId) -> Cost {
     }
 }
 
-/// The pane's row `row` as it reads on `wid`'s glass (`read_glass`: the set
-/// facts in the order they are drawn).
 fn glass_row(app: &App, wid: WindowId, row: usize) -> String {
     let ws = &app.windows[&wid];
     let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
     read_glass(&ws.input_scratch.cells[strip + row])
 }
 
-/// Account changes invalidate the real splice's cache, paint the new subscription in one
-/// row, and leave the vendor mode row untouched.
 #[test]
 fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     let (mut app, wid, session) = probe_glass();
@@ -90,7 +83,7 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
             email: Some(email.into()),
             plan: Some(plan.into()),
             weekly: weekly.map(str::to_owned),
-            weekly_reset: None,
+            ..Default::default()
         }),
         ..facts()
     };
@@ -133,7 +126,7 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
                 email: Some(email.into()),
                 plan: Some("Pro".into()),
                 weekly: Some("weekly 29% left".into()),
-                weekly_reset: None,
+                ..Default::default()
             }),
             ..FooterFacts::default()
         };
@@ -228,11 +221,6 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
     }
 }
 
-/// THE FOOTER AT REST COSTS NOTHING: a frame on a Claude Code pane whose
-/// screen and facts did not move — model, effort, path, branch and usage
-/// shown — allocates nothing in the footer's pass, frame after frame: no
-/// copy of the facts, no reading of the pane, no read of its rule, no fit,
-/// no composition, no band tone derived; the glass the same.
 #[test]
 fn a_frame_at_rest_costs_the_footer_nothing() {
     let (mut app, wid, session) = probe_glass();
@@ -309,13 +297,6 @@ fn a_frame_at_rest_costs_the_footer_nothing() {
     );
 }
 
-/// A HOVERED CHIP COSTS A FRAME NOTHING (design §9.2.1: the title is built
-/// when a hover starts, never per frame): with the pointer resting on a
-/// harness chip, a frame whose screen and facts did not move lays the
-/// chip's title from what the reading built — Autopilot's, whole and short,
-/// built once when the hover began (`App::claude_lights_block`) — and does
-/// nothing else the footer counts: no allocation, no
-/// reading, no fit, no composition (the rule's cells are the last frame's).
 #[test]
 fn a_hovered_chip_costs_its_title_alone() {
     use crate::claude_lights::Chip;
@@ -374,10 +355,6 @@ fn a_hovered_chip_costs_its_title_alone() {
     );
 }
 
-/// THE FACTS AS TARGETS COST NOTHING AT REST: every frame records where
-/// each fact landed (`claude_lights::FactHit`, in a list that keeps its
-/// buffer), and a frame at rest still allocates, reads and composes
-/// nothing — the targets the same frame after frame.
 #[test]
 fn a_frame_at_rest_with_fact_targets_costs_nothing() {
     use crate::claude_lights::Fact;
@@ -422,9 +399,6 @@ fn a_frame_at_rest_with_fact_targets_costs_nothing() {
     }
 }
 
-/// `screen(&AT_REST)` with Claude Code's context indicator, `<left>% until
-/// auto-compact`, parked right-aligned above the composer, two columns
-/// short of its rules (`aterm_phase::phase::context_left_shown`).
 fn context_screen(left: u8) -> Vec<String> {
     let mut rows = screen(&AT_REST);
     let top = rows
@@ -436,12 +410,6 @@ fn context_screen(left: u8) -> Vec<String> {
     rows
 }
 
-/// THE CONTEXT FACT AT REST COSTS NOTHING (main's `◐ ctx` fact, a reading
-/// or nothing, read off the glass once per rebuild of the rows): a Claude
-/// Code pane published with no context fact whose indicator reads `12%
-/// until auto-compact` shows `◐ ctx 12% left` on its rule, and a frame
-/// whose screen did not move compares that reading with the fact shown and
-/// allocates nothing, composes nothing, frame after frame.
 #[test]
 fn a_context_reading_at_rest_costs_nothing() {
     let mut app = App::headless_for_test();
@@ -488,10 +456,6 @@ fn a_context_reading_at_rest_costs_nothing() {
     }
 }
 
-/// THE HOVER OF A FACT COMPOSES ONCE, THEN RESTS: the frame a fact is first
-/// hovered composes the rule with it lit; every frame under the pointer
-/// after it costs nothing; the pointer leaving composes it once more, and
-/// it rests again.
 #[test]
 fn a_hover_change_composes_once_then_rests() {
     use crate::claude_lights::Fact;
@@ -539,14 +503,11 @@ fn a_hover_change_composes_once_then_rests() {
     }
 }
 
-/// The footer's repaint key for `wid`'s visible plan, the pass not run.
 fn pass_key(app: &App, wid: WindowId) -> u64 {
     let (plan, _) = app.active_visible_frame_layout(wid).expect("a layout");
     app.claude_footer_fp(wid, &plan)
 }
 
-/// Session `session`'s own Autopilot word, written as `meta set autopilot`
-/// writes it, its `MetaChanged` wake taken.
 fn set_word(app: &mut App, session: u64, word: &str) {
     app.pool
         .get(session)
@@ -559,9 +520,6 @@ fn set_word(app: &mut App, session: u64, word: &str) {
     app.on_meta_changed(session);
 }
 
-/// The `i`th harness need on session `session`, as the loop's request
-/// lands it: the needs owner's entry and its `MetaChanged` wake, which
-/// publishes it (`App::publish_need`).
 fn need(app: &mut App, session: u64, i: usize) {
     let entry =
         format!("claude needs you: approve the release notes of 0.4{i}.0 \u{2014} carrying on");
@@ -581,9 +539,6 @@ fn need(app: &mut App, session: u64, i: usize) {
     app.on_meta_changed(session);
 }
 
-/// Land's `i`th hold on session `session`, as the loop tells it: stored on
-/// the timeline by the live hook, then the wake that carries nothing
-/// (`HarnessFact::LandHeld`).
 fn hold(app: &mut App, session: u64, i: usize) {
     use aterm_agent::harness::acts::HoldLeg;
     let held = aterm_agent::harness::acts::LandHeld {
@@ -610,9 +565,6 @@ fn hold(app: &mut App, session: u64, i: usize) {
     app.apply_harness_fact(&sid, crate::HarnessFact::LandHeld);
 }
 
-/// What the title says beside the glass, moved while nobody reads it and
-/// while it is read (the W4 title slice): under the session's word `word`,
-/// each `change` moves the trail's generation (CONTROL).
 fn read_only_while_read(word: &str, what: &str, change: fn(&mut App, u64, usize)) {
     use crate::claude_lights::Chip;
     let asked = || crate::claude_lights::TITLE_READERS_ASKED.with(|a| a.replace(0));
@@ -674,27 +626,16 @@ fn read_only_while_read(word: &str, what: &str, change: fn(&mut App, u64, usize)
     }
 }
 
-/// A NEED THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.2.4, §12.2.6):
-/// a harness's need published anew under Cruise, three times
-/// with the pointer elsewhere and three with it on the chip
-/// ([`read_only_while_read`]).
 #[test]
 fn a_need_that_moves_while_nobody_reads_costs_no_frame() {
     read_only_while_read("cruise", "a need", need);
 }
 
-/// A HOLD THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.3.4, §12.3.6):
-/// Land's hold told anew under Land, a nudge at a time, three
-/// times with the pointer elsewhere and three with it on the chip
-/// ([`read_only_while_read`]).
 #[test]
 fn a_hold_that_moves_while_nobody_reads_costs_no_frame() {
     read_only_while_read("land", "a hold", hold);
 }
 
-/// The costs of `passes` frames that each rebuild the pane's text, `change`
-/// before each refill — after a warm cycle of each change (the streamed
-/// rows', the draft's), which grows the rows' text buffers it writes.
 fn rebuilt(change: Change, passes: usize) -> Vec<Cost> {
     const WARM: usize = 48;
     let (mut app, wid, session) = probe_glass();
@@ -712,10 +653,6 @@ fn rebuilt(change: Change, passes: usize) -> Vec<Cost> {
         .collect()
 }
 
-/// UNCHANGED ROWS COST NO READ: a rebuild of the pane's text whose changed
-/// rows cannot move what the footer and the lights read — every reading is
-/// of the composer's frame and the rows under its bottom rule
-/// (`aterm_phase::phase::FrameReach`) — keeps the last reading.
 #[test]
 fn unchanged_rows_cost_no_read() {
     let kept = Cost {
@@ -735,9 +672,6 @@ fn unchanged_rows_cost_no_read() {
     }
 }
 
-/// EACH READING FOLLOWS ITS ROWS: every reader of the pane's rows reads anew
-/// the frame its source rows change, and the glass shows it — one change
-/// per reader:
 #[test]
 fn each_reading_follows_its_rows() {
     let (mut app, wid, session) = probe_glass();
@@ -855,14 +789,6 @@ fn each_reading_follows_its_rows() {
     }
 }
 
-/// A CARD THE GATE REFUSES COSTS A SETTLED FRAME NOTHING (card engine §3.8,
-/// §3.12): while the facts leave the model open, a launch card on the pane
-/// that is not the drawer's — on a Claude Code with no drawer image (one run
-/// by `node`, an npm install), or there before the drawer's cut — is judged
-/// before anything is copied or locked: each settled pass takes the
-/// splice's one timeline lock and allocates nothing, and the footer names no
-/// model from that card (a Claude Code that is no drawer names its model once
-/// its transcript does).
 #[test]
 fn a_refused_card_costs_a_settled_frame_nothing() {
     let rule = AT_REST.bottom();
@@ -918,8 +844,6 @@ fn a_refused_card_costs_a_settled_frame_nothing() {
     }
 }
 
-/// `same_text` reads a row exactly as its chars: one byte or four, a wide
-/// char, an empty row, a text a char longer or shorter, a char a byte off.
 #[test]
 fn a_row_compares_as_its_chars() {
     let cells = |text: &str| -> Vec<RenderCell> {
@@ -960,8 +884,6 @@ fn a_row_compares_as_its_chars() {
     }
 }
 
-/// The pane's rows as the frame the pass is about to read holds them: the
-/// vendor's, the text every rebuild must read.
 fn vendor_rows(app: &App, wid: WindowId) -> Vec<String> {
     let ws = &app.windows[&wid];
     let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
@@ -971,7 +893,6 @@ fn vendor_rows(app: &App, wid: WindowId) -> Vec<String> {
         .collect()
 }
 
-/// The pane's rows as the footer's cache read them.
 fn read_rows(app: &App, wid: WindowId) -> Vec<String> {
     let texts = app.windows[&wid].claude_footer_texts.borrow();
     let cached = texts.panes.iter().flatten().next().expect("a pane read");
@@ -1002,12 +923,6 @@ pub(super) fn image() -> aterm_core::grid::extra::ImageRef {
     }
 }
 
-/// THE KEPT READS AND FITS FOLLOW THEIR INPUTS (the engine's row revisions,
-/// `RowStamps`; the runs kept past a rebuild, `KeptRun`; the block's fit
-/// key, `claude_lights::FitKey`): a keystroke's rebuild compares only the
-/// row the revisions do not vouch — the caret's — reads no mask and fits no
-/// block; and each way a kept read could go stale is read anew the frame it
-/// lands, the rows read always the vendor's:
 #[test]
 fn the_kept_reads_and_fits_follow_their_inputs() {
     let (mut app, wid, session) = probe_glass();
@@ -1274,13 +1189,6 @@ fn the_kept_reads_and_fits_follow_their_inputs() {
     assert_eq!(settled.compared, 1, "one row again ({settled:?})");
 }
 
-/// THE STAMP LANE VOUCHES FOR ROWS EXACTLY WHERE THE RENDERER DOES
-/// (`StampLane`, mirroring `aterm_render::row_revisions_comparable` — the
-/// clauses the renderer skips an unchanged row's cells by — and the cells'
-/// own length, its row-skipping copy's guard): for every field those
-/// clauses read, moved alone on either side of a pair of stamped frames,
-/// or on both, the lane vouches for the pair (`Some` and equal on both
-/// sides) exactly where the renderer would — never where it would not.
 #[test]
 fn the_stamp_lane_vouches_for_rows_exactly_where_the_renderer_does() {
     let (mut app, wid, _) = probe_glass();

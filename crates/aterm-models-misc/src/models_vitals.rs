@@ -117,7 +117,7 @@ pub fn stuck_verdict_model() -> Model {
     }
 }
 
-/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4) ([`stuck_verdict_model`]).
+/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn end_by_proof_model() -> Model {
@@ -311,7 +311,11 @@ pub fn scope_balance_model() -> Model {
     }
 }
 
-/// THE EXPLANATION'S HONESTY.
+/// THE EXPLANATION'S HONESTY. `lost`: the split's unaccounted residual
+/// (work no coalition held) is at least a core and over the floor;
+/// `settled`: pressure and the thermal state are read, neither holds, and no
+/// covering cause but a named activity holds, the residual aside; `none`:
+/// the reply prints `do class=none`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn explain_honesty_model() -> Model {
@@ -345,6 +349,9 @@ pub fn explain_honesty_model() -> Model {
             var fail = 0;
             var clause = 0;
             var was = 0;
+            var lost = 0;
+            var settled = 1;
+            var none = 0;
 
             action Claims when (n <= Work - 1) {
                 n = n + 1;
@@ -421,6 +428,16 @@ pub fn explain_honesty_model() -> Model {
                 other = 1 - other;
                 fresh = 0;
             }
+            action Lost when (n <= Work - 1) {
+                n = n + 1;
+                lost = 1 - lost;
+                fresh = 0;
+            }
+            action Settled when (n <= Work - 1) {
+                n = n + 1;
+                settled = 1 - settled;
+                fresh = 0;
+            }
 
             action Detect when (fresh == 0) {
                 shown = if (claims == 1
@@ -443,6 +460,7 @@ pub fn explain_honesty_model() -> Model {
                 } else {
                     if (Buggy == 3 || lowpid <= other) { lowpid } else { other }
                 };
+                none = if (settled == 1 && (lost == 0 || Buggy == 10)) { 1 } else { 0 };
                 fresh = 1;
             }
             action Attach when (fresh == 1) {
@@ -498,6 +516,7 @@ pub fn explain_honesty_model() -> Model {
             invariant UnknownNeverZero: fresh == 0 || swept == 1 || (role == 4 && start == 2);
             invariant ClauseNeverFlickers:
                 (was == 1 || clause == 0 || held == 2) && (was == 0 || clause == 1 || fail == 6);
+            invariant LostWorkNeverNothingNeeded: fresh == 0 || lost == 0 || none == 0;
             bound Box: n <= Work;
         }
     }

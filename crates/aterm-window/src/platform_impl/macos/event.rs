@@ -10,6 +10,9 @@ use aterm_objc::send::{
     send_id, send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_u16, send_usize,
 };
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use crate::keyboard::SmolStr;
 use aterm_objc::cf::{CFDataGetBytePtr, CFDataRef, CFRelease};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, CGPoint, Id, Obj};
@@ -83,6 +86,7 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     Key::Character(SmolStr::new(chars))
 }
 
+/// LOCAL PATCH (aterm), 2026-10-20.
 pub(crate) trait LayoutKeys {
     /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte.
     fn typed(&self, scancode: u16, mods: u32) -> Option<char>;
@@ -383,7 +387,7 @@ const NX_DEVICELALTKEYMASK: usize = 0x0000_0020;
 const NX_DEVICERALTKEYMASK: usize = 0x0000_0040;
 const NX_DEVICERCTLKEYMASK: usize = 0x0000_2000;
 
-/// `NSEventModifierFlags::contains`, spelled out.
+/// LOCAL PATCH (aterm): `NSEventModifierFlags::contains`, spelled out.
 #[inline]
 const fn has_flag(flags: usize, mask: usize) -> bool {
     flags & mask == mask

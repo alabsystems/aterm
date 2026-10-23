@@ -59,18 +59,13 @@ impl PairFloor {
     }
 }
 
-/// Whether `ch` is a shape drawn edge to edge rather than a letter: box
-/// drawing and block elements (U+2500–U+259F) and the powerline separators
-/// (U+E0A0–U+E0D7, private use).
+/// Whether `ch` is a shape drawn edge to edge rather than a letter.
 #[must_use]
 #[inline]
 pub(crate) const fn is_shape_glyph(ch: char) -> bool {
     matches!(ch, '\u{2500}'..='\u{259F}' | '\u{E0A0}'..='\u{E0D7}')
 }
 
-/// WCAG contrast floor for a cell when both colors come from the theme
-/// (default fg/bg or palette slots 0–15, excluding default-on-default,
-/// same-slot fills, shapes [`is_shape_glyph`], and hidden text).
 fn theme_pair_floor(
     cell: Cell,
     colors: PackedColors,
@@ -228,15 +223,8 @@ fn first_clearing_tenth(fg: Rgb, pole: u8, lb: f32, min: f32) -> Option<(u8, Rgb
     })
 }
 
-/// The tenths of the way to the pole from which [`floor_contrast`]'s nudge
-/// keeps less of the text's own lightness than it takes from the pole
-/// (`#D0D0D0` five and six tenths toward black is `#686868` and `#535353`).
 const HALFWAY_TENTHS: u8 = 5;
 
-/// The `OkLab` chroma under which a nudged colour has no hue left to show:
-/// the greys a grey or grey-tinted text is nudged to (`#535353` 0, Gruvbox's
-/// cream text `#5E5847` 0.028), where a coloured text nudged as far keeps
-/// 0.044 (cyan's `#385D65`) to 0.106 (bright green's `#206431`).
 const MUD_CHROMA: f64 = 0.035;
 
 /// [`floor_contrast`] for text on a colored cell (`inks` = theme default `[fg, bg]`).
@@ -569,9 +557,7 @@ pub fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
 /// Whether light faint ink starts from the sRGB blend before the contrast floor.
 pub const FAINT_SRGB_BLEND: bool = cfg!(windows);
 
-/// [`dim_toward_bg`] with the light-ink start chosen by `srgb_blend` (the
-/// platform's is [`FAINT_SRGB_BLEND`]), so tests check both shapes on every
-/// host.
+/// [`dim_toward_bg`] with the light-ink start chosen by `srgb_blend`.
 pub(crate) fn dim_toward_bg_with(fg: Rgb, bg: Rgb, opacity: f32, srgb_blend: bool) -> Rgb {
     let t = if opacity.is_finite() {
         opacity.clamp(0.0, 1.0)
@@ -631,19 +617,10 @@ fn srgb_blend_mix(tables: &TransferTables, fg: Rgb, bg: Rgb, ends: (f32, f32), t
     (ls - lb) / (lf - lb)
 }
 
-/// SGR 2's readable floor is `FAINT_FLOOR_BASE^opacity`: 3:1 at the
-/// default 0.5 (WCAG's non-text and large-text bar), 1:1 at 0.
 const FAINT_FLOOR_BASE: f32 = 9.0;
 
-/// Below this undimmed contrast the pair is not legible text, normal or
-/// faint; only the log-share floor applies.
 const FAINT_FLOOR_MIN_CONTRAST: f32 = 1.25;
 
-/// The contrast SGR 2 aims for when the undimmed pair has contrast `full`
-/// (>= 1) at opacity `t` (in `0..1`): the larger of the log-share floor
-/// `full^t` and the readable floor `FAINT_FLOOR_BASE^t`, the latter capped
-/// at `full^((1+t)/2)` so faint keeps at most `(1+t)/2` of the contrast in
-/// log space and always stays fainter than the colour itself.
 fn faint_target(full: f32, t: f32) -> f32 {
     let half = t.to_bits() == 0.5f32.to_bits();
     let root = if half { full.sqrt() } else { 0.0 };
@@ -659,13 +636,6 @@ fn faint_target(full: f32, t: f32) -> f32 {
     share.max(readable.min(ceiling))
 }
 
-/// The linear-light mix SGR 2 uses for an fg of relative luminance `lf` on
-/// a bg of `lb` at `opacity` (already in `0..=1`): `start` (the mix
-/// [`dim_toward_bg`] begins at: `opacity`, or for light ink the sRGB
-/// blend's, [`srgb_blend_mix`]) clamped to `0..=opacity`, raised to the
-/// smallest mix whose WCAG contrast reaches [`faint_target`] — the larger
-/// of the log-share floor `contrast^opacity` and the readable floor
-/// `9^opacity` capped at `contrast^((1+opacity)/2)`.
 fn faint_mix(lf: f32, lb: f32, opacity: f32, start: f32) -> f32 {
     if opacity <= 0.0 || opacity >= 1.0 {
         return opacity;
@@ -713,7 +683,6 @@ fn raw_resolve(
     } else if colors.fg_is_indexed() {
         palette.get(colors.fg_index())
     } else {
-        // RGB — use pre-resolved value from unified lookup
         fg_rgb.map_or(default_fg, |[r, g, b]| Rgb { r, g, b })
     };
 
@@ -734,16 +703,10 @@ mod dim_contrast_law {
     use super::{dim_toward_bg_with, faint_target, srgb_to_linear};
     use aterm_types::Rgb;
 
-    /// The law is checked on the sRGB-blend shape on every host (Windows
-    /// draws it); [`the_platform_picks_its_faint_shape`] covers the lerp
-    /// shape macOS and Linux draw.
     fn dim_toward_bg(fg: Rgb, bg: Rgb, opacity: f32) -> Rgb {
         dim_toward_bg_with(fg, bg, opacity, true)
     }
 
-    /// `dim_toward_bg` is the sRGB blend on Windows and the lerp elsewhere,
-    /// and the lerp shape keeps the law too: never more contrast than the
-    /// colour, never less mix than `t`, and the floors on both polarities.
     #[test]
     fn the_platform_picks_its_faint_shape() {
         let (white, page) = (Rgb::new(255, 255, 255), Rgb::new(0x11, 0x13, 0x18));
@@ -794,10 +757,8 @@ mod dim_contrast_law {
 
     const OPACITIES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 
-    /// The interior opacities the lattice tests sweep.
     const INTERIOR: [f32; 3] = [0.25, 0.5, 0.75];
 
-    /// The 8-values-per-channel lattice: 512 colours, 262k ordered pairs.
     fn lattice() -> Vec<Rgb> {
         let vals: Vec<u8> = (0..8u16).map(|i| (i * 255 / 7) as u8).collect();
         let mut colors = Vec::with_capacity(512);
@@ -811,7 +772,6 @@ mod dim_contrast_law {
         colors
     }
 
-    /// The plain linear-light lerp at mix `m`, quantized like the engine.
     fn blend(fg: Rgb, bg: Rgb, m: f32) -> Rgb {
         let channel = |f: u8, b: u8| {
             let (lf, lb) = (srgb_to_linear(f), srgb_to_linear(b));
@@ -824,8 +784,6 @@ mod dim_contrast_law {
         }
     }
 
-    /// The mix faint starts from: `t`, or for light ink the sRGB blend's
-    /// ([`super::srgb_blend_mix`]) when that recedes further.
     fn start_mix(fg: Rgb, bg: Rgb, t: f32) -> f32 {
         let (lf, lb) = (luminance(fg), luminance(bg));
         if lf > lb && t > 0.0 && t < 1.0 {
@@ -835,8 +793,6 @@ mod dim_contrast_law {
         }
     }
 
-    /// The sRGB-space blend's relative luminance, from the exact transfer
-    /// function (`powf`), per channel before quantization.
     fn srgb_blend_luminance(fg: Rgb, bg: Rgb, t: f32) -> f32 {
         let channel = |f: u8, b: u8| {
             let (f, b) = (f32::from(f), f32::from(b));
@@ -845,9 +801,6 @@ mod dim_contrast_law {
         0.2126 * channel(fg.r, bg.r) + 0.7152 * channel(fg.g, bg.g) + 0.0722 * channel(fg.b, bg.b)
     }
 
-    /// A reference faint ink: the engine's shape (the starting mix is kept
-    /// when it already reaches the target, else the exact solve), with the
-    /// target supplied by the caller so a control can swap one term out.
     fn faint_with(fg: Rgb, bg: Rgb, t: f32, target: impl Fn(f32, f32) -> f32) -> Rgb {
         let (lf, lb) = (luminance(fg), luminance(bg));
         let (hi, lo) = (lf.max(lb), lf.min(lb));
@@ -877,23 +830,19 @@ mod dim_contrast_law {
         )
     }
 
-    /// The faint target without the `C >= 1.25` gate (a control).
     fn ungated_target(full: f32, t: f32) -> f32 {
         full.powf(t)
             .max(9f32.powf(t).min(full.powf(f32::midpoint(1.0, t))))
     }
 
-    /// The pre-floor target: the log share alone (a control).
     fn share_target(full: f32, t: f32) -> f32 {
         full.powf(t)
     }
 
-    /// A readable floor with no recession ceiling: `min(C, 3)` (a control).
     fn naive_target(full: f32, t: f32) -> f32 {
         full.powf(t).max(full.min(3.0))
     }
 
-    /// Grayscale: exhaustive over all 256×256 pairs × 5 opacities, exact.
     #[test]
     fn dim_never_increases_contrast_grayscale_exhaustive() {
         let mut reduced = 0u32;
@@ -917,10 +866,6 @@ mod dim_contrast_law {
         assert!(reduced > 100_000, "non-vacuity: dim must actually reduce");
     }
 
-    /// Full-color lattice (8 values/channel = 512 colors, 262k pairs): exact
-    /// wherever the pair carries real contrast (>= 1.05), and within one u8
-    /// quantization step of luminance (0.005 ratio) even for near-iso-luminant
-    /// cross-hue pairs.
     #[test]
     fn dim_reduces_contrast_both_polarities_rgb_lattice() {
         let colors = lattice();
@@ -963,7 +908,6 @@ mod dim_contrast_law {
         );
     }
 
-    /// Verify faint ink reaches its target contrast floor on light themes while staying fainter than the undimmed color.
     #[test]
     fn faint_keeps_its_share_of_contrast_on_light_themes() {
         use super::faint_mix;
@@ -1019,7 +963,6 @@ mod dim_contrast_law {
         assert!((faint_mix(0.02, 0.9, 1.0, 1.0) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// Verify light faint ink on dark backgrounds recedes to the sRGB-blend target.
     #[test]
     fn faint_light_ink_recedes_as_an_alpha_blend() {
         let t = aterm_types::DIM_FACTOR;
@@ -1050,9 +993,6 @@ mod dim_contrast_law {
         }
     }
 
-    /// Faint is strictly fainter than its colour wherever the pair is text
-    /// (`C >= 1.25`), and the readable floor never lifts it past the
-    /// recession ceiling `C^((1+t)/2)`.
     #[test]
     fn faint_stays_fainter_than_its_colour() {
         let colors = lattice();
@@ -1087,11 +1027,6 @@ mod dim_contrast_law {
         );
     }
 
-    /// The faint mix is never below the mix it starts from, so the luminance
-    /// distance it keeps (within one u8 step) is at least `t` of the colour's
-    /// for dark ink, and at least the sRGB blend's for light ink — which is
-    /// never more than `t` of it (the transfer curve is convex), and often
-    /// well under.
     #[test]
     fn faint_mix_never_drops_below_its_start() {
         let colors = lattice();
@@ -1126,10 +1061,6 @@ mod dim_contrast_law {
         assert!(receded > 10_000, "non-vacuity: the alpha blend recedes");
     }
 
-    /// The engine keeps its reference bytes: any pair whose starting mix
-    /// already reaches the target keeps that mix (the lerp for dark ink, the
-    /// sRGB blend's for light ink); every other pair gets the exact floor
-    /// solve.
     #[test]
     fn faint_keeps_its_reference_bytes() {
         let colors = lattice();
@@ -1197,9 +1128,6 @@ mod dim_contrast_law {
         assert!(light_floored > 0, "non-vacuity: light ink is floored");
     }
 
-    /// The default opacity's square roots are the powers they stand for:
-    /// [`faint_target`] at 0.5 agrees with `full^0.5`, `9^0.5` and
-    /// `full^0.75` to f32 rounding, over the whole contrast range.
     #[test]
     fn faint_target_square_roots_are_its_powers() {
         let rule = |full: f32, t: f32| {
@@ -1217,9 +1145,6 @@ mod dim_contrast_law {
         }
     }
 
-    /// Negative control: a gamma-space multiply toward black raises contrast
-    /// for dark text on a light background, so the law above distinguishes the
-    /// linear-light blend from it.
     #[test]
     fn old_gamma_multiply_violates_the_law() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1289,8 +1214,6 @@ mod tests {
         }
     }
 
-    /// A cell with `flags` and a foreground that is the default (`None`), an
-    /// indexed color or an RGB triple, resolved through the shipping wrapper.
     fn resolve(
         fg: Option<Result<u8, [u8; 3]>>,
         flags: CellFlags,
@@ -1318,8 +1241,6 @@ mod tests {
         )
     }
 
-    /// Style attributes apply in order: raw lookup, bold-to-bright, dim (a blend
-    /// toward the cell's bg), inverse, hidden; DECSCNM reverses the pair.
     #[test]
     fn style_attributes_resolve_in_order() {
         let pal = palette();
@@ -1363,8 +1284,6 @@ mod tests {
         );
     }
 
-    /// `bold_is_bright = false` keeps SGR 1 a pure weight change: indexed 0–7
-    /// fg is not promoted to its bright sibling.
     #[test]
     fn test_bold_is_bright_off_keeps_base_color() {
         let mut cell = Cell::default();
@@ -1391,9 +1310,6 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
-    /// Law: the floor reaches `min` whenever the background admits it, and
-    /// otherwise the best either pole can (black or white); a colour that
-    /// already clears `min` comes back unchanged.
     #[test]
     fn floor_contrast_reaches_the_ratio_or_the_best_pole() {
         let vals = [0u8, 51, 102, 153, 204, 255];
@@ -1433,7 +1349,6 @@ mod tests {
         }
     }
 
-    /// Verify colored-cell contrast flooring uses the theme's far-side ink on polarity flips and small nudges for same-polarity pairs.
     #[test]
     fn a_flip_on_a_coloured_cell_takes_the_theme_ink() {
         let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
@@ -1497,7 +1412,6 @@ mod tests {
         }
     }
 
-    /// Verify light text on a lighter colored cell takes the theme's dark ink when a nudge would desaturate to grey, while preserving saturated hues.
     #[test]
     fn a_halfway_nudge_on_a_coloured_cell_takes_the_theme_ink() {
         let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
@@ -1559,11 +1473,6 @@ mod tests {
         }
     }
 
-    /// aterm's own chromatic colours (slots 1–6 at their defaults) are held
-    /// to 4.5:1 as text on Default's page by the theme-pair floor, and stay
-    /// in their hue: on Windows blue `#2973D0` (3.9:1) draws `#3E81D5`, and
-    /// faint blue 3:1 or more, while pwsh's directory names keep `#2973D0`
-    /// as their ground with near-white text.
     #[test]
     fn aterm_own_colours_are_held_to_body_text_on_the_page() {
         let (ink, page) = (Rgb::new(0xD0, 0xD0, 0xD0), Rgb::new(0x11, 0x13, 0x18));
@@ -1612,8 +1521,6 @@ mod tests {
         assert_eq!(fg, theirs, "a theme's 3.9:1 slot keeps its tone");
     }
 
-    /// The theme-pair floor, on Default's dark colours with the palette blue
-    /// macOS keeps (`#3B8EEA`).
     #[test]
     fn theme_pairs_are_floored_and_a_programs_own_colours_are_not() {
         let page = Rgb::new(0x11, 0x13, 0x18);
@@ -1719,8 +1626,6 @@ mod tests {
         assert_eq!(fg, dim_default, "the theme's own body text is its business");
     }
 
-    /// A built-in theme as the engine holds it: its 16 slots on a palette,
-    /// its text colour and its page colour.
     fn builtin_palette(name: &str) -> (ColorPalette, Rgb, Rgb) {
         let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
         let mut pal = ColorPalette::new();
@@ -1730,7 +1635,6 @@ mod tests {
         (pal, scheme.foreground, scheme.background)
     }
 
-    /// Verify Default Light's dark white slots (7, 15) resolve to the page color on colored backgrounds when the theme-pair floor is active.
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -1867,12 +1771,6 @@ mod tests {
         }
     }
 
-    /// The rule moves nothing but a light theme's dark white on a colour, and
-    /// only under the floor: over every built-in theme, the default colours,
-    /// the 16 slots and a 24-bit cell, plain, bold, inverse, faint and hidden,
-    /// with and without DECSCNM, a dark theme, Solarized Light (whose whites
-    /// are light colours, 1.9:1 on its page) and the floor off resolve
-    /// exactly as without it.
     #[test]
     fn only_a_light_themes_dark_white_on_a_colour_moves() {
         let flag_sets = [

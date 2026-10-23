@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Worker phase classification from a single terminal screen snapshot.
-//!
-//! * [`busy_signal`] and [`status_row`]: detect active turns, background work, and soft monitors
-//!   ([`Busy::soft`]) or carried waits ([`carried_wait_alone`]) across wrapped lines
-//!   ([`status_block`], [`crate::wrap`]).
-//! * [`context_left`]: reads remaining context percentage before auto-compaction from the live
-//!   zone.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -245,8 +239,7 @@ const CARRIED: Busy = Busy {
     soft: true,
 };
 
-/// The WAIT claude code carries: a `Waiting for N … to finish` row, met as the first glyph row
-/// above the composer's top rule `top`.
+/// The wait claude code carries.
 fn carried_wait(rows: &[String], top: usize) -> bool {
     carried_row(rows, top).is_some()
 }
@@ -266,15 +259,14 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
         .then_some(i)
 }
 
-/// The screen reads busy by nothing but the WAIT claude code carries.
+/// The screen reads busy by nothing but the wait claude code carries.
 #[must_use]
 pub fn carried_wait_alone(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| status_block(rows, f.top).status.is_none())
         && busy_signal(rows) == Some(CARRIED)
 }
 
-/// Walking up from the top rule `top` over every row, the first glyph row
-/// ([`is_glyph_row`]) met.
+/// Walking up from the top rule `top` over every row, the first glyph row ([`is_glyph_row`]) met.
 fn glyph_above(rows: &[String], top: usize) -> Option<usize> {
     let parked = crate::survey::parked_span(rows);
     for i in (0..top).rev() {
@@ -329,10 +321,7 @@ fn counts_work(row: &str) -> bool {
         })
 }
 
-/// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a
-/// dynamic workflow, a background agent or other task it waits for, a shell or a monitor it
-/// left running, a workflow's progress line), never a live turn's (a spinner, `esc to
-/// interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
+/// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a dynamic workflow, a background agent or other task it waits for, a shell or a monitor it left running, a workflow's progress line), never a live turn's (a spinner, `esc to interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
 const BACKGROUND_RULES: &[&str] = &[
     "waiting for a dynamic workflow",
     "waiting for a background agent",
@@ -375,10 +364,7 @@ fn turn_just_begun(rows: &[String]) -> bool {
     })
 }
 
-/// Whether the agent's own background work (a shell, a monitor, a workflow, a background
-/// agent, hard or soft), and nothing else, keeps this screen busy: the composer frame is drawn,
-/// no live turn is drawn anywhere ([`no_live_turn`]) and none has just begun
-/// ([`turn_just_begun`]), whatever the last thing said.
+/// Whether the agent's own background work (a shell, a monitor, a workflow, a background agent, hard or soft), and nothing else, keeps this screen busy.
 #[must_use]
 pub fn background_only(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
@@ -458,7 +444,7 @@ const LEFT_RUNNING_RULES: &[&str] = &[
     "a monitor running",
 ];
 
-/// The turn is over, and what runs on is A SHELL or a monitor it left.
+/// The turn is over, and what runs on is a SHELL or a monitor it left.
 #[must_use]
 pub fn turn_over_background(rows: &[String]) -> bool {
     turn_over(rows) && background_wait(rows).is_some_and(|rule| LEFT_RUNNING_RULES.contains(&rule))
@@ -724,11 +710,7 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
     Some(Frame { top, bottom })
 }
 
-/// The composer's frame on a screen ([`composer_rules`]) and how much of the
-/// screen the search for it READ — for a caller that keeps a reading of the
-/// frame and the rows under its bottom rule from one rebuild of a pane's rows
-/// to the next, and knows which rows changed between them (aterm's footer
-/// and lights: `footer::mode_row_under`, `footer::pill_row_under`).
+/// The composer's frame on a screen ([`composer_rules`]) and how much of the screen the search for it read — for a caller that keeps a reading of the frame and the rows under its bottom rule from one rebuild of a pane's rows to the next, and knows which rows changed between them (aterm's footer and lights: `footer::mode_row_under`, `footer::pill_row_under`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameReach {
     frame: Option<Frame>,
@@ -914,11 +896,7 @@ pub(crate) struct StatusBlock {
 }
 
 impl StatusBlock {
-    /// The status row's text, its line read across the rows Ink wrapped it
-    /// onto, joined with one space ([`crate::wrap::rejoined`]): `✻ Choreogr
-    /// aphing…` (a word wider than the row broken where the row ends, read in
-    /// two halves), `✻ Baked for 0s · done 7:06 AM` — a glyph alone on its
-    /// row read over the text columns Ink laid out under it ([`status_text`]).
+    /// The status row's text, its line read across the rows Ink wrapped it onto, joined with one space ([`crate::wrap::rejoined`]).
     pub(crate) fn line<'a>(&self, rows: &'a [String]) -> Option<Cow<'a, str>> {
         let status = self.status?;
         Some(if self.end > status {
@@ -1119,9 +1097,7 @@ pub fn is_glyph_row(row: &str) -> bool {
         || is_spinner_shape(row)
 }
 
-/// A row only the transcript has: the worker's message or tool call in column
-/// 0 (`⏺`; `●` where the platform draws that — never the session survey), or
-/// output under the `⎿` gutter that is not a tip or a todo item.
+/// A row only the transcript has.
 pub(crate) fn is_transcript_row(row: &str) -> bool {
     if is_survey(row) {
         return false;
@@ -1350,8 +1326,7 @@ pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
     })
 }
 
-/// The column a build that draws the completion menu's pointer starts every entry at:
-/// `  ❯ ` before the pointed one, four spaces before the rest (2.1.290 and later).
+/// The column a build that draws the completion menu's pointer starts every entry at.
 pub const POINTER_ROOM: usize = 4;
 
 /// One thing Enter may do over Claude Code's completion menu ([`CompletionMenu::runs`]).
@@ -1377,7 +1352,7 @@ pub struct CompletionMenu {
 }
 
 impl CompletionMenu {
-    /// Whether the selected entry is drawn IN colour.
+    /// Whether the selected entry is drawn only in colour.
     #[must_use]
     pub const fn colour_only(&self) -> bool {
         self.pointed.is_none() && self.entries.len() > 1
@@ -1920,7 +1895,7 @@ pub struct SaidNotice {
     pub hook_words: bool,
 }
 
-/// The last thing said, WHERE claude code draws its own notices.
+/// The last thing said, where claude code draws its own notices.
 #[must_use]
 pub fn last_said_notice(rows: &[String]) -> Option<SaidNotice> {
     let last = last_said_index(rows)?;
@@ -1986,7 +1961,7 @@ enum Block {
     Unowned,
 }
 
-/// Whether the `⎿` block opening at `open` is READ as Claude Code's own row.
+/// Whether the `⎿` block opening at `open` is read as Claude Code's own row.
 fn block_is_vendors(rows: &[String], open: usize) -> Block {
     if leading_spaces(&rows[open]) != VENDOR_GUTTER_COLUMN {
         return Block::Output;
@@ -2032,12 +2007,7 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
     Block::Unowned
 }
 
-/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i`
-/// stands in reaches THE FIRST OF `rows` with no owner found — no row in
-/// column 0, no blank row over a row that opens an item — so whatever owns
-/// the block, if anything does, is above the rows: a call row scrolled off
-/// the screen over its long output (2.1.304, measured: the history right
-/// above the screen holds it, `claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`).
+/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i` stands in reaches the first of `rows` with no owner found — no row in column 0, no blank row over a row that opens an item — so whatever owns the block, if anything does, is above the rows.
 #[must_use]
 pub fn owner_above_rows(rows: &[String], i: usize) -> bool {
     gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Unowned)
@@ -2129,8 +2099,7 @@ enum Walk {
     Top,
 }
 
-/// The `⏺` or `●` row whose message row `i` is a later row of: up from `i`
-/// over the message's own rows ([`in_message`]) to that bullet row.
+/// The `⏺` or `●` row whose message row `i` is a later row of.
 fn message_open(rows: &[String], i: usize) -> Walk {
     let mut j = i;
     while in_message(&rows[j]) {
@@ -2263,10 +2232,7 @@ fn footer_notice(
         })
 }
 
-/// What of footer row `i` Claude Code itself drew a notice in, measured on
-/// 2.1.304 (`claude-2.1.304-footer-*`, `…-statusline-login-words-*`,
-/// `…-wall-session-auto-continue-*`) and on 2.1.299 and 2.1.300 at 26, 34,
-/// 50 and 80 columns: the footer is two columns.
+/// What of footer row `i` Claude Code itself drew a notice in, measured on 2.1.304 (`claude-2.1.304-footer-*`, `…-statusline-login-words-*`, `…-wall-session-auto-continue-*`) and on 2.1.299 and 2.1.300 at 26, 34, 50 and 80 columns.
 fn footer_text(
     rows: &[String],
     from: usize,
@@ -2342,9 +2308,7 @@ pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
     })
 }
 
-/// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
-/// the row its continuation rows (indented to the gutter's text,
-/// [`GUTTER_TEXT_COLUMN`] or more) hang from.
+/// The `⎿` row that opens the gutter block row `i` belongs to.
 pub(crate) fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     loop {
         let t = crate::text::trim_start(&rows[i]);

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::store::Layout;
 
-/// A held advisory lock on an open file, released by `LOCK_UN` on drop rather than by the close: a child another thread is spawning holds a copy of every descriptor until it execs, and a lock released only by the close stays held that long (`a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives`).
+/// A held advisory lock on an open file, released by `LOCK_UN` on drop rather than by the close.
 pub(crate) struct Flock(File);
 
 impl Flock {
@@ -25,7 +25,7 @@ impl Flock {
         Ok(Self(file))
     }
 
-    /// Take `file`'s shared lock without blocking: granted beside other shared holders, refused while an exclusive one holds it (the vendor head watch's host claim, `vendor_direct::watch::host`).
+    /// Take `file`'s shared lock without blocking.
     pub(crate) fn try_lock_shared(file: File) -> Result<Self, std::fs::TryLockError> {
         let file: std::fs::File = file;
         #[expect(
@@ -36,7 +36,7 @@ impl Flock {
         Ok(Self(file))
     }
 
-    /// Take `file`'s exclusive lock, re-trying every [`LOCK_POLL`] for up to `limit`: `TimedOut` naming `what` once it was not granted in time.
+    /// Take `file`'s exclusive lock, re-trying every [`LOCK_POLL`] for up to `limit`.
     pub(crate) fn lock_within(file: File, limit: Duration, what: &Path) -> io::Result<Self> {
         let file: std::fs::File = file;
         let deadline = Instant::now() + limit;
@@ -66,7 +66,7 @@ impl Flock {
         }
     }
 
-    /// Take `file`'s exclusive lock, waiting for a holder to let go: for a queue whose waiters must each have their turn (the `[machine]` apply queue).
+    /// Take `file`'s exclusive lock, waiting for a holder to let go.
     pub(crate) fn lock(file: File) -> io::Result<Self> {
         let file: std::fs::File = file;
         #[expect(
@@ -78,8 +78,7 @@ impl Flock {
     }
 }
 
-/// How often [`Flock::lock_within`] re-tries a held lock: a holder's millisecond critical
-/// section costs one tick.
+/// How often [`Flock::lock_within`] re-tries a held lock.
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
 impl std::ops::Deref for Flock {
@@ -101,22 +100,19 @@ impl Drop for Flock {
     }
 }
 
-/// A holder's exclusive lock on a file that carries a record other processes read while the holder lives — the head watch seat's pid ([`crate::vendor_direct::watch`]); the lease core takes the same lock for its "who" line.
+/// Exclusive lock on a file carrying a holder record ([`crate::vendor_direct::watch`]).
 pub(crate) use aterm_toolchain::record_lock::RecordLock;
 
 /// The store-wide writer lock, held while the value lives.
 pub struct StoreLock {
     _file: Flock,
-    /// The holder record this lock announced ([`StoreLock::announce_holder`]), removed on
-    /// release.
+    /// The holder record this lock announced ([`StoreLock::announce_holder`]).
     holder: Option<PathBuf>,
-    /// The store this lock serializes — what [`held_by_this_process`] answers for.
+    /// The store this lock serializes ([`held_by_this_process`]).
     prefix: PathBuf,
 }
 
-/// The prefixes whose store lock a live [`StoreLock`] in this process holds, one entry per
-/// lock, so a writer can ask whether it is the store's one writer without the guard (the
-/// package log rotates only then, `crate::packages_log`).
+/// The prefixes whose store lock a live [`StoreLock`] in this process holds.
 static HELD: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether a [`StoreLock`] on `layout`'s store is alive in this process.
@@ -127,7 +123,7 @@ pub fn held_by_this_process(layout: &Layout) -> bool {
         .contains(&layout.prefix)
 }
 
-/// `<prefix>/store.lock.holder` — who holds the store: `pid=<n>` and `person=<0|1>`.
+/// `<prefix>/store.lock.holder`.
 #[must_use]
 pub fn holder_path(layout: &Layout) -> PathBuf {
     layout.prefix.join("store.lock.holder")
@@ -141,7 +137,8 @@ impl StoreLock {
         }
     }
 
-    /// Say who holds the store ([`holder_path`]): this pid, and whether it is a person's typed verb (stdin a terminal, which no machine lane's is), for a Settings Check deciding whether to queue behind the holder ([`person_holder`]).
+    /// Say who holds the store ([`holder_path`]): this pid, and whether it is a person's
+    /// typed verb ([`person_holder`]).
     pub fn announce_holder(&mut self, layout: &Layout, person: bool) {
         let path = holder_path(layout);
         let body = format!("pid={}\nperson={}\n", std::process::id(), u8::from(person));
@@ -174,7 +171,6 @@ impl Drop for StoreLock {
     }
 }
 
-/// `(pid, person)` from a holder record, `None` when absent or malformed.
 fn read_holder(path: &Path) -> Option<(u32, bool)> {
     let text = crate::metadata_io::read_bounded_regular_utf8(path, 256).ok()?;
     let mut pid = None;
@@ -189,14 +185,14 @@ fn read_holder(path: &Path) -> Option<(u32, bool)> {
     Some((pid?, person?))
 }
 
-/// Whether the holder record names a person's typed verb in a live process: words for a waiting person, never a decision, since the record can be stale and nothing here tries the lock ([`person_holder`] is the checked form).
+/// Whether the holder record names a person's typed verb in a live process ([`person_holder`]).
 #[must_use]
 pub fn holder_is_person(layout: &Layout) -> bool {
     read_holder(&holder_path(layout))
         .is_some_and(|(pid, person)| person && crate::progress::pid_alive(pid))
 }
 
-/// The pid of a person's typed verb holding `layout`'s store right now, else `None`: the holder record says so, names a live process other than this one, and the lock is actually held.
+/// The pid of a person's typed verb holding `layout`'s store right now, else `None`.
 #[must_use]
 pub fn person_holder(layout: &Layout) -> Option<u32> {
     let (pid, person) = read_holder(&holder_path(layout))?;
@@ -272,27 +268,21 @@ impl std::fmt::Display for StoreLockError {
 
 impl std::error::Error for StoreLockError {}
 
-/// The exit code a CLI-edge contention refusal carries: sysexits `EX_TEMPFAIL` (75), the one code atpkg reserves for "try again later", so a machine caller (the window's launch lanes, `install.sh`) classifies by code, never by the sentence.
+/// The exit code a CLI-edge contention refusal carries.
 pub const CONTENDED_EXIT: u8 = 75;
 
-/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]). A poll is
-/// write-free and never re-hardens the prefix: a same-value `setxattr` bumps ctime on APFS,
-/// so hardening every poll would make a half-hour wait tens of thousands of journaled
-/// metadata writes, each an FSEvents change for the backup watchers the attribute keeps
-/// away.
+/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]).
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// How long a waiter stays silent before it announces the wait (`on_first_contention`).
 pub const WAIT_ANNOUNCE_GRACE: Duration = Duration::from_secs(2);
 
-/// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it): the grace in milliseconds, so a test that needs only the announcement does not wait it out.
+/// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it).
 pub const WAIT_ANNOUNCE_GRACE_SEAM: &str = "ATPKG_WAIT_ANNOUNCE_GRACE_MS";
 
-/// The longest wait a caller can ask for. A `--wait-lock` value is parsed from argv,
-/// and `u64::MAX` seconds must not overflow the deadline arithmetic.
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Acquire the store lock, waiting up to `timeout` for a holder to release it: one [`try_lock_store`], then write-free re-opens ([`repoll_store_lock`]) every [`WAIT_POLL`] until it succeeds, the deadline passes, or `still_wanted` says the caller has gone (both `Err(Contended)`, so a waiter whose window quit stands down instead of racing a successor's waiter).
+/// Acquire the store lock ([`try_lock_store`], [`repoll_store_lock`], [`WAIT_POLL`]).
 pub fn lock_store_waiting(
     layout: &Layout,
     timeout: Duration,
@@ -314,13 +304,11 @@ pub fn lock_store_waiting(
 
 /// The clock a waiting acquisition reads and sleeps on ([`lock_store_waiting_on`]).
 pub(crate) trait WaitClock {
-    /// Now, on the clock the wait's grace and bound are measured on.
     fn now(&self) -> Instant;
-    /// Wait `pause` on it.
     fn sleep(&self, pause: Duration);
 }
 
-/// The monotonic clock and a real sleep: every caller's wait ([`lock_store_waiting`]).
+/// The monotonic clock and a real sleep ([`lock_store_waiting`]).
 struct MonotonicClock;
 
 impl WaitClock for MonotonicClock {
@@ -333,7 +321,7 @@ impl WaitClock for MonotonicClock {
     }
 }
 
-/// [`lock_store_waiting`] on `clock`, announcing after `grace`: the grace, the bound and every poll's pause are read and waited on it — a test drives one whose sleep moves its time, so a wait of seconds runs its every poll with none of them spent.
+/// [`lock_store_waiting`] on `clock`.
 pub(crate) fn lock_store_waiting_on(
     clock: &impl WaitClock,
     layout: &Layout,
@@ -372,9 +360,7 @@ pub(crate) fn lock_store_waiting_on(
     }
 }
 
-/// One poll of the wait: the lock file re-opened by path (an fd held across the wait would
-/// "acquire" an orphan inode once the prefix was removed and re-created), under a prefix
-/// that is still a real directory ([`prefix_is_a_real_dir`]).
+/// One poll of the wait ([`prefix_is_a_real_dir`]).
 fn repoll_store_lock(layout: &Layout, path: &Path) -> Result<StoreLock, StoreLockError> {
     if !prefix_is_a_real_dir(&layout.prefix) {
         return try_lock_store(layout);
@@ -392,7 +378,7 @@ fn repoll_store_lock(layout: &Layout, path: &Path) -> Result<StoreLock, StoreLoc
     }
 }
 
-/// Try-acquire the store lock for `layout`'s store; a held lock is [`StoreLockError::Contended`] at once.
+/// Try-acquire the store lock for `layout`'s store ([`StoreLockError::Contended`]).
 pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
     let path = layout.store_lock();
     if let Err(e) = layout.ensure_dir(&layout.prefix) {
@@ -401,8 +387,6 @@ pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
     open_store_lock(&path)
 }
 
-/// Whether `prefix` is still a real directory, the one shape a poll may re-open the lock
-/// under without vetting again.
 fn prefix_is_a_real_dir(prefix: &Path) -> bool {
     std::fs::symlink_metadata(prefix)
         .is_ok_and(|md| md.file_type().is_dir() && !crate::platform::is_reparse(&md))
@@ -424,9 +408,7 @@ pub fn store_writer_released(layout: &Layout) -> bool {
     prefix_is_a_real_dir(&layout.prefix)
 }
 
-/// The open-and-try-lock half of [`try_lock_store`], over a vetted prefix: creates the lock
-/// file `0600` if missing and takes the flock without blocking; what each
-/// [`lock_store_waiting`] poll repeats.
+/// The open-and-try-lock half of [`try_lock_store`] ([`lock_store_waiting`]).
 fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
     let file = match open_lock_file(path) {
         Ok(f) => f,
@@ -475,7 +457,8 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
             dir
         })?;
     let name = std::ffi::CString::new(name.as_bytes())?;
-    // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode is the variadic argument `O_CREAT` reads.
+    // SAFETY: `dir` is open for the call and `name` is NUL-terminated; the mode
+    // is the variadic argument `O_CREAT` reads.
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -509,8 +492,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     thread_local! {
-        /// What runs in this thread's next waiting poll, after its vet of the prefix
-        /// and before its open ([`between_vet_and_open`]).
         static BETWEEN_VET_AND_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
     }
@@ -526,9 +507,6 @@ mod tests {
         crate::testdir::absent_layout(&format!("atpkg-lock-{label}-"))
     }
 
-    /// A waiter's clock whose sleep moves its time and returns at once
-    /// ([`lock_store_waiting_on`]): a wait of seconds runs its every poll with none of them
-    /// spent.
     struct ManualClock<'a> {
         origin: Instant,
         elapsed: std::cell::Cell<Duration>,
@@ -550,7 +528,6 @@ mod tests {
             }
         }
 
-        /// The time the wait has spent on this clock.
         fn elapsed(&self) -> Duration {
             self.elapsed.get()
         }
@@ -569,8 +546,6 @@ mod tests {
         }
     }
 
-    /// The release probe never creates, writes or claims the writer lock, and answers once
-    /// the writer drops.
     #[test]
     fn release_probe_is_read_only_and_never_claims_the_writer_lock() {
         let layout = temp_layout("release-probe");
@@ -689,9 +664,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// With the lock held, a second `Layout` over the same prefix (a separate open file
-    /// description, as a second process presents) is refused at once, naming the lock path;
-    /// a drop frees it.
     #[test]
     fn contended_store_lock_refuses_loudly_and_releases_on_drop() {
         let a = temp_layout("contend");
@@ -713,7 +685,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// A record stays readable while whole-file probes and another holder are refused.
     #[test]
     fn a_record_lock_leaves_its_record_readable_and_refuses_a_whole_file_probe() {
         use std::io::{Read as _, Write as _};
@@ -784,8 +755,6 @@ mod tests {
         drop((again, copy));
     }
 
-    /// A dropped lock is free at once while a copy of its descriptor lives: a child mid-spawn
-    /// holds one until it execs, and `try_clone` (`dup`) is that copy.
     #[test]
     fn a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         let a = temp_layout("dup");
@@ -822,8 +791,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// First contact: with no prefix yet the lock is still takeable (the first `install` needs
-    /// it), and the created prefix and the lock file carry the hardened modes.
     #[test]
     fn store_lock_creates_the_prefix_and_hardens_the_lock_file() {
         let l = temp_layout("fresh");
@@ -877,8 +844,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// An unusable prefix (a plain file where the directory should be) is a fail-closed `Io`
-    /// refusal, never a lock-free pass.
     #[test]
     fn unusable_prefix_refuses_instead_of_passing_lock_free() {
         let l = temp_layout("badprefix");
@@ -919,8 +884,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target.prefix);
     }
 
-    /// A holder that releases inside the grace is waited out silently. It lets go at the
-    /// waiter's first poll, so the wait is one poll long whatever the load.
     #[test]
     fn lock_store_waiting_acquires_when_the_holder_drops_and_stays_silent_inside_the_grace() {
         let a = temp_layout("wait-drop");
@@ -958,9 +921,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// Past the grace the wait is ANNOUNCED — exactly once, naming the lock path, at the
-    /// first poll the grace has passed by — and the waiter still proceeds when the holder
-    /// finally lets go (here, as it is told the wait was announced).
     #[test]
     fn lock_store_waiting_announces_once_after_the_grace_then_acquires() {
         let a = temp_layout("wait-announce");
@@ -993,8 +953,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// A holder that never lets go: the waiter announces once, then times out with the same
-    /// `Contended` refusal a typed verb gets.
     #[test]
     fn lock_store_waiting_times_out_with_contended() {
         let a = temp_layout("wait-timeout");
@@ -1079,8 +1037,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn lock_store_waiting_refuses_a_prefix_swapped_for_a_symlink_under_it() {
-        /// Exchange the two names in one step (`renamex_np(RENAME_SWAP)` /
-        /// `renameat2(RENAME_EXCHANGE)`).
         fn exchange(a: &Path, b: &Path) -> io::Result<()> {
             use std::os::unix::ffi::OsStrExt as _;
             let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
@@ -1175,8 +1131,6 @@ mod tests {
         }
     }
 
-    /// An unusable prefix is not something to wait on: the `Io` refusal comes back
-    /// at once, with no announcement.
     #[test]
     fn lock_store_waiting_never_waits_on_io() {
         let l = temp_layout("wait-badprefix");
@@ -1205,11 +1159,6 @@ mod tests {
         let _ = std::fs::remove_file(&l.prefix);
     }
 
-    /// A waiter whose caller has gone (`still_wanted` says no — the window that
-    /// spawned it quit) stands down with `Contended` instead of polling out its
-    /// whole bound and then racing a successor's waiter for the freed lock: at
-    /// the very poll that found it gone, one poll into a bound of two minutes, with
-    /// nothing announced inside the grace.
     #[test]
     fn lock_store_waiting_stands_down_when_no_longer_wanted() {
         let a = temp_layout("wait-orphan");
@@ -1245,8 +1194,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
 
-    /// A caller gone past the grace is never announced to: the orphan check precedes the
-    /// announcement on every poll (announcing to a dead window's pipe is EPIPE).
     #[test]
     fn lock_store_waiting_never_announces_to_a_caller_that_has_gone() {
         let a = temp_layout("wait-orphan-late");

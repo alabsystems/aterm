@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Connected Unix-domain socket peer credentials ([`peer_uid`] and [`peer_audit_token`]).
+//! Connected Unix-domain socket peer credentials ([`peer_uid`](crate::peer::peer_uid) and [`peer_audit_token`](crate::peer::peer_audit_token)).
 
 use crate::CtlStream;
 

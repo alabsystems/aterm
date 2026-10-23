@@ -47,7 +47,8 @@ pub fn home_of(uid: u32) -> Option<PathBuf> {
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn user_name(uid: u32) -> Option<String> {
-    // SAFETY: same contract as `home`: stack buffers handed to the reentrant call, `pw_name` read
+    // SAFETY: same contract as `home_of`: stack buffers handed to the reentrant call, `pw_name`
+    // read
     // only on success while `buf` lives.
     unsafe {
         let mut pw: libc::passwd = std::mem::zeroed();

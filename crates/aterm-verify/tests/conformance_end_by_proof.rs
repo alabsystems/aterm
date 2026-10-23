@@ -15,7 +15,7 @@ use std::time::Duration;
 use aterm_models_misc::end_by_proof_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
-use aterm_uds::process::{EndControl, EndRefusal, Ended, Identity, ProcessBirth, end_proven};
+use aterm_uds::process::{Birth, EndControl, EndRefusal, Ended, Identity, end_proven};
 
 type S = BTreeMap<&'static str, i64>;
 
@@ -25,11 +25,8 @@ const SIGKILL: i32 = 9;
 fn ident(idversion: i32) -> Identity {
     Identity {
         pid: 4242,
-        birth: ProcessBirth {
-            seconds: 1_792_000_000,
-            microseconds: 7,
-        },
-        idversion,
+        birth: Birth(1_792_000_000_000_007),
+        idversion: Some(idversion),
     }
 }
 
@@ -59,7 +56,7 @@ impl EndControl for Scripted<'_> {
             .push(Event::Read(read != Some(self.token)));
         read
     }
-    fn signal(&mut self, _pid: i32, sig: i32) -> std::io::Result<()> {
+    fn signal(&mut self, _token: &Identity, sig: i32) -> std::io::Result<()> {
         self.log.borrow_mut().push(Event::Signal(sig));
         Ok(())
     }

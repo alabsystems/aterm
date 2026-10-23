@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ForegroundHandback` (`aterm_models_gui::foreground_handback_model`) — the 2026-09-25 "crashed" tab, where a Claude Code killed while it held the terminal left the alt screen, kitty flags, modifyOtherKeys, mouse tracking, focus reports, 2026 and a hidden cursor armed under the zsh that reclaimed it.
+//! Conformance tests for `ForegroundHandback` (`aterm_models_gui::foreground_handback_model`).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -20,30 +20,20 @@ use crate::{App, Session, Wake, WindowId};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Fake process-group ids: the shell and the job (and, for the `gdb -tui`
-/// shape, the job's own child).
 const SHELL: i32 = 4100;
 const JOB: i32 = 4200;
 const CHILD: i32 = 4300;
 
-/// The model variables the real pipeline projects onto.
 const PROJECTED: [&str; 6] = ["fg", "life", "leak", "paste", "prompt", "tail"];
 
-/// A hang detector, never a latency budget: a loaded machine only slows the
-/// reader down.
 const PATIENCE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// What zle writes before it hands a command the terminal.
 const ZLE_PROMPT: &[u8] = b"\x1b[?2004h% ";
 const ZLE_EXEC: &[u8] = b"\x1b[?2004l\r\n";
-/// What a killed Claude Code had armed.
 const INCIDENT: &[u8] = b"\x1b[?1049h\x1b[>5u\x1b[?1003h\x1b[?1006h\x1b[>4;2m\x1b[?2004h\
 \x1b[?1004h\x1b[?25l\x1b[?2026hFRAME";
-/// What zsh writes after it reaped the job and took the terminal back.
 const RECLAIM: &[u8] = b"zsh: killed     claude\r\n% \x1b[?2004h";
-/// What zsh writes after Ctrl-Z stopped the job and it took the terminal back.
 const SUSPENDED: &[u8] = b"\r\nzsh: suspended  claude\r\n% \x1b[?2004h";
-/// What the job draws when `fg` resumes it (a full repaint, as on SIGCONT).
 const REPAINT: &[u8] = b"\x1b[?2004h\x1b[2J\x1b[HFRAME2";
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -52,8 +42,6 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
-/// The model's `leak`: the evidence gate without bracketed paste, which `paste` projects
-/// (zle's own `2004h` is evidence too: PG1, docs/AUDIT-side-effects-2026-10-07.md).
 fn leak(t: &Terminal) -> bool {
     t.program_evidence() & !program_evidence::BRACKETED_PASTE != 0
 }
@@ -62,7 +50,6 @@ fn screen_has(t: &Terminal, needle: &str) -> bool {
     (0..usize::from(t.rows())).any(|r| t.row_text(r).is_some_and(|l| l.contains(needle)))
 }
 
-/// The scripted liveness probe's backing set: the fake groups "killed" so far.
 type Dead = Mutex<Vec<i32>>;
 
 fn is_dead(dead: &Dead, pgid: i32) -> bool {
@@ -71,8 +58,6 @@ fn is_dead(dead: &Dead, pgid: i32) -> bool {
         .contains(&pgid)
 }
 
-/// A PTY pair with both ends close-on-exec from birth (`aterm_pty::open_pty_pair`) and the
-/// slave in raw mode, so byte counts are exact.
 fn open_raw_pty() -> (i32, i32) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     // SAFETY: a zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr on the test-owned slave fd.
@@ -85,8 +70,6 @@ fn open_raw_pty() -> (i32, i32) {
     (master, slave)
 }
 
-/// A real session on a real pseudo-terminal (raw slave, so byte counts are
-/// exact), with the real reader attached through a scripted probe.
 struct Rig {
     session: Session,
     slave: i32,
@@ -101,8 +84,6 @@ struct Rig {
 }
 
 impl Rig {
-    /// Attach with `probe` and `gone`; `pre` is fed to the engine first (an
-    /// adopted session's screen); `fg` and `dead` back the two probes.
     fn attach(
         id: u64,
         probe: (fn(i32) -> i32, &'static AtomicI32),
@@ -112,8 +93,6 @@ impl Rig {
         Self::attach_with(id, probe, gone, pre, false)
     }
 
-    /// [`Self::attach`] with the temporal spine recording
-    /// (`temporal_recording`), seeded from the engine as a spawn seeds it.
     fn attach_recording(
         id: u64,
         probe: (fn(i32) -> i32, &'static AtomicI32),
@@ -159,7 +138,6 @@ impl Rig {
         rig
     }
 
-    /// Attach the real reader and wait for its gather to start.
     fn start_reader(&mut self) {
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let post = Arc::new(move |wake: Wake| {
@@ -181,7 +159,6 @@ impl Rig {
             .expect("the reader's gather started");
     }
 
-    /// Park the reader exactly as the overlap handoff does (`park_reader`).
     fn park(&mut self) {
         assert!(
             park_reader(&mut self.session, Instant::now() + PATIENCE),
@@ -189,12 +166,10 @@ impl Rig {
         );
     }
 
-    /// Attach a new reader to the parked session (the handoff's resume).
     fn reattach(&mut self) {
         self.start_reader();
     }
 
-    /// The group's leader is gone (the scripted `ESRCH`).
     fn kill(&self, pgid: i32) {
         self.dead
             .lock()
@@ -206,8 +181,6 @@ impl Rig {
         self.session.term.clone()
     }
 
-    /// The program (or shell) writes `bytes`; `done` says when the engine has
-    /// parsed them.
     fn write(&self, bytes: &[u8], what: &str, done: impl Fn(&Terminal) -> bool) {
         // SAFETY: a bounded write of a live slice to the test-owned slave.
         let wrote = unsafe { libc::write(self.slave, bytes.as_ptr().cast(), bytes.len()) };
@@ -216,7 +189,6 @@ impl Rig {
         wait_for(what, || done(&term.lock().expect("terminal lock")));
     }
 
-    /// `tcsetpgrp`: move the scripted foreground.
     fn set_fg(&self, pgid: i32) {
         self.fg.store(pgid, Ordering::SeqCst);
     }
@@ -243,9 +215,6 @@ impl Rig {
         .collect()
     }
 
-    /// Every `modes-restored` payload once at least `n` are recorded. The reader records the event
-    /// just after it releases the term lock, so a screen a `write` saw finished can precede its
-    /// event.
     fn restored_n(&self, n: usize) -> Vec<String> {
         wait_for("the reader's modes-restored event", || {
             self.restored().len() >= n
@@ -253,8 +222,6 @@ impl Rig {
         self.restored()
     }
 
-    /// The session log's `modes` marks (phase 3B), written in the same
-    /// timeline hold as each `modes-restored` event.
     fn modes_marks(&self) -> Vec<String> {
         let g = self
             .session
@@ -270,7 +237,6 @@ impl Rig {
             .collect()
     }
 
-    /// Every `modes-restored` payload the reader recorded.
     fn restored(&self) -> Vec<String> {
         self.session
             .ctx
@@ -293,7 +259,6 @@ impl Drop for Rig {
     }
 }
 
-/// Fire `actions` on `model` from `state`, each one enabled.
 fn fire(model: &Model, state: &mut State, actions: &[&str]) {
     for action in actions {
         assert!(model.fire(action, state), "{action} from {state:?}");
@@ -304,12 +269,10 @@ fn projected(state: &State) -> State {
     PROJECTED.iter().map(|k| (*k, state[k])).collect()
 }
 
-/// The real projection must be the model's state after the same prefix.
 fn check(rig: &Rig, model_state: &State, at: &str) {
     assert_eq!(rig.project(), projected(model_state), "{at}");
 }
 
-/// Exactly one handback, from `from` to `to`.
 fn assert_one_handback(rig: &Rig, from: i32, to: i32) {
     let events = rig.restored_n(1);
     assert_eq!(events.len(), 1, "{events:?}");
@@ -319,9 +282,6 @@ fn assert_one_handback(rig: &Rig, from: i32, to: i32) {
     );
 }
 
-/// From the model's initial state: the prompt, zle's exec, and the job takes
-/// the terminal and arms the incident's modes — `Launch` and the job's write,
-/// parsed and checked.
 fn launch_the_job(rig: &mut Rig, model: &Model) -> State {
     let mut s = model.init_state();
     rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
@@ -341,8 +301,6 @@ fn launch_the_job(rig: &mut Rig, model: &Model) -> State {
     s
 }
 
-/// Ctrl-Z: the job stops alive and zsh takes the terminal and says so (`Stop`, `Reclaim`, the
-/// shell's write).
 fn stop_the_job(rig: &mut Rig, model: &Model, s: &mut State) {
     rig.life = 4;
     fire(model, s, &["Stop"]);
@@ -360,10 +318,6 @@ fn stop_the_job(rig: &mut Rig, model: &Model, s: &mut State) {
     );
 }
 
-/// `fg`: zle turns 2004 off, the job takes the terminal back and repaints —
-/// `Resume` and the job's write, checked at `at` — and runs with its modes:
-/// every mode it armed (`evidence`, where the caller read it), its alt screen
-/// and mouse, and the committed `JobKeepsItsModesWhileAlive`.
 fn resume_with_its_modes(
     rig: &mut Rig,
     model: &Model,
@@ -397,9 +351,6 @@ fn resume_with_its_modes(
     assert!(model.check_invariant("JobKeepsItsModesWhileAlive", s));
 }
 
-/// The job dies holding the terminal and zsh takes it back and writes —
-/// `Die`, `Reclaim` and the shell's write, checked — and the job's modes are
-/// handed back once, from the job to the shell.
 fn die_and_hand_back(rig: &mut Rig, model: &Model, s: &mut State) {
     rig.life = 2;
     fire(model, s, &["Die"]);
@@ -419,8 +370,6 @@ fn die_and_hand_back(rig: &mut Rig, model: &Model, s: &mut State) {
     assert_one_handback(rig, JOB, SHELL);
 }
 
-/// The incident, step by step, on the real reader. Returns the rig at its
-/// end state and the model's state after the whole schedule.
 fn run_incident(rig: &mut Rig, model: &Model) -> State {
     let mut s = model.init_state();
     rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
@@ -543,8 +492,6 @@ fn gone_adopted(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_ADOPTED, pgid)
 }
 
-/// An adopted session: the reader attached while the job held the terminal with its modes
-/// in force.
 #[test]
 fn foreground_handback_an_adopted_session_is_handed_back_when_its_job_dies() {
     let model = foreground_handback_model();
@@ -588,9 +535,6 @@ fn gone_mixed(_master: i32, pgid: i32, _role: FgRole) -> bool {
 }
 static SLAVE_MIXED: AtomicI32 = AtomicI32::new(-1);
 static ARMED_MIXED: AtomicBool = AtomicBool::new(false);
-/// The first sample after arming stands in for K2 inside one gather: it still sees the job,
-/// and the shell (having reaped it and taken the terminal) writes its prompt before the
-/// drain's next read.
 fn probe_mixed(_master: i32) -> i32 {
     if ARMED_MIXED.swap(false, Ordering::SeqCst) {
         let slave = SLAVE_MIXED.load(Ordering::SeqCst);
@@ -603,9 +547,6 @@ fn probe_mixed(_master: i32) -> i32 {
     FG_MIXED.load(Ordering::SeqCst)
 }
 
-/// A job frame and the shell's prompt in one gathered batch: the park sample cuts it at the
-/// frame's end, and the handback lands there, after the job's last byte and before the
-/// shell's first; the byte tap carries it at the same offset.
 #[test]
 fn foreground_handback_a_mixed_batch_is_cut_at_the_park() {
     const FRAME_LEN: usize = 1024;
@@ -674,7 +615,6 @@ fn foreground_handback_a_mixed_batch_is_cut_at_the_park() {
     );
 }
 
-/// A probe that never answers: no cut, no handback.
 fn probe_none(_master: i32) -> i32 {
     -1
 }
@@ -754,8 +694,6 @@ fn gone_stop(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_STOP, pgid)
 }
 
-/// Ctrl-Z then `fg`: the stop edge hands nothing back (the leader lives), `fg` finds the
-/// job's modes in force, and only its death hands back.
 #[test]
 fn foreground_handback_a_stopped_job_keeps_its_modes_until_it_dies() {
     let model = foreground_handback_model();
@@ -808,9 +746,6 @@ fn foreground_handback_a_stopped_job_keeps_its_modes_until_it_dies() {
     assert!(!model.check_invariant("JobKeepsItsModesWhileAlive", &b));
 }
 
-/// The scripted process table for the pipeline shape (`sleep 0 | sh -c 'printf
-/// "\e[?1049h\e[?1003h"; sleep 30'`, whose leader exits at once): `leaders` answer `ESRCH`,
-/// `stopped` groups have a stopped member.
 struct Table {
     leaders: &'static Dead,
     stopped: &'static Dead,
@@ -833,7 +768,6 @@ fn probe_pipe(_master: i32) -> i32 {
 static LEADERS_PIPE: Dead = Mutex::new(Vec::new());
 static STOPPED_PIPE: Dead = Mutex::new(Vec::new());
 static EMPTY_PIPE: Dead = Mutex::new(Vec::new());
-/// The shipping rule (`foreground_handback::owner_gone`) over the scripted table.
 fn gone_pipe(_master: i32, pgid: i32, role: FgRole) -> bool {
     crate::foreground_handback::owner_gone(
         role,
@@ -849,14 +783,10 @@ fn probe_pipe_leader(_master: i32) -> i32 {
 }
 static LEADERS_PIPE_LEADER: Dead = Mutex::new(Vec::new());
 static STOPPED_PIPE_LEADER: Dead = Mutex::new(Vec::new());
-/// The negative control's probe: the leader alone (`leader_gone`).
 fn gone_pipe_leader_only(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&LEADERS_PIPE_LEADER, pgid)
 }
 
-/// The pipeline schedule up to its stop edge: the job arms its modes, its first stage (the
-/// leader) exits while the TUI runs on (no model action), then Ctrl-Z stops it and zsh takes
-/// the terminal.
 fn run_pipeline_to_the_stop(rig: &mut Rig, model: &Model, table: &Table) -> State {
     Table::set(table.stopped, JOB, false);
     let mut s = launch_the_job(rig, model);
@@ -869,8 +799,6 @@ fn run_pipeline_to_the_stop(rig: &mut Rig, model: &Model, table: &Table) -> Stat
     s
 }
 
-/// A stopped pipeline whose first stage already exited keeps its modes, and `fg` finds them
-/// in force.
 #[test]
 fn foreground_handback_a_stopped_pipeline_whose_leader_exited_keeps_its_modes() {
     let model = foreground_handback_model();
@@ -902,8 +830,6 @@ fn foreground_handback_a_stopped_pipeline_whose_leader_exited_keeps_its_modes() 
     die_and_hand_back(&mut rig, &model, &mut s);
 }
 
-/// Negative control: under the leader-only probe the same pipeline is handed back at the stop
-/// edge (the `Alive = 0` replay), and `fg` resumes it without its alt screen and mouse.
 #[test]
 fn foreground_handback_negative_control_the_leader_alone_strips_a_stopped_pipeline() {
     let committed = foreground_handback_model();
@@ -954,7 +880,6 @@ fn foreground_handback_negative_control_the_leader_alone_strips_a_stopped_pipeli
     );
 }
 
-/// A command the shell runs while the job sits in the background (`ls`).
 const LS: i32 = 4400;
 
 static FG_BG: AtomicI32 = AtomicI32::new(SHELL);
@@ -964,7 +889,6 @@ fn probe_bg(_master: i32) -> i32 {
 static LEADERS_BG: Dead = Mutex::new(Vec::new());
 static STOPPED_BG: Dead = Mutex::new(Vec::new());
 static EMPTY_BG: Dead = Mutex::new(Vec::new());
-/// The shipping rule (`foreground_handback::owner_gone`) over the scripted table.
 fn gone_bg(_master: i32, pgid: i32, role: FgRole) -> bool {
     crate::foreground_handback::owner_gone(
         role,
@@ -980,16 +904,12 @@ fn probe_bg_holder(_master: i32) -> i32 {
 }
 static LEADERS_BG_HOLDER: Dead = Mutex::new(Vec::new());
 static STOPPED_BG_HOLDER: Dead = Mutex::new(Vec::new());
-/// The negative control's probe: the holder rule (`group_orphaned`) for every group.
 fn gone_bg_holder_rule(_master: i32, pgid: i32, _role: FgRole) -> bool {
     crate::foreground_handback::group_orphaned(is_dead(&LEADERS_BG_HOLDER, pgid), || {
         is_dead(&STOPPED_BG_HOLDER, pgid)
     })
 }
 
-/// The stopped pipeline of [`run_pipeline_to_the_stop`] is `bg`'d (it runs on leaderless, no
-/// member stopped; no model action), and the shell runs `ls`: two edges at which the job is
-/// neither `from` nor `to` but still owns its input bits.
 fn run_ls_behind_a_background_pipeline(rig: &mut Rig, table: &Table) {
     Table::set(table.stopped, JOB, false);
     rig.write(b"[1]  + continued  claude\r\n", "bg", |t| {
@@ -1006,9 +926,6 @@ fn run_ls_behind_a_background_pipeline(rig: &mut Rig, table: &Table) {
     });
 }
 
-/// A leaderless pipeline stopped, `bg`'d, and running while the shell runs `ls`: at both `ls`
-/// edges the job is a bystander, gone only when its whole group is, so its modes stay and
-/// `fg` finds them.
 #[test]
 fn foreground_handback_a_backgrounded_leaderless_pipeline_keeps_its_modes() {
     let model = foreground_handback_model();
@@ -1051,9 +968,6 @@ fn foreground_handback_a_backgrounded_leaderless_pipeline_keeps_its_modes() {
     die_and_hand_back(&mut rig, &model, &mut s);
 }
 
-/// Negative control: the holder rule for every suspect hands the running background job's
-/// modes back at the shell → `ls` edge, which `JobKeepsItsModesWhileAlive` rejects once `fg`
-/// resumes it.
 #[test]
 fn foreground_handback_negative_control_the_holder_rule_strips_a_backgrounded_pipeline() {
     let model = foreground_handback_model();
@@ -1108,9 +1022,6 @@ fn gone_parked_fresh(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_PARKED_FRESH, pgid)
 }
 
-/// The incident across a reader restart: the reader is parked (`park_reader`) while the job
-/// holds the terminal; the job dies and zsh writes its prompt into the kernel queue; a new
-/// reader attaches.
 fn run_parked(carry: bool) -> (Rig, State) {
     let committed = foreground_handback_model();
     let model = interp::with_consts(&committed, &[("Carry", i64::from(carry))]);
@@ -1208,8 +1119,6 @@ fn gone_child(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_CHILD, pgid)
 }
 
-/// The `gdb -tui` shape: the holder arms the alt screen, mouse and a hidden cursor and hands
-/// the terminal to its child.
 #[test]
 fn foreground_handback_a_live_holder_handing_the_terminal_to_its_child_keeps_its_modes() {
     FG_CHILD.store(SHELL, Ordering::SeqCst);
@@ -1275,8 +1184,6 @@ fn probe_unlocked(_master: i32) -> i32 {
     FG_UNLOCKED.load(Ordering::SeqCst)
 }
 static DEAD_UNLOCKED: Dead = Mutex::new(Vec::new());
-/// Every liveness question the reader asked, with whether the asking thread
-/// held the term lock at that moment.
 static ASKED_UNLOCKED: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
 fn gone_unlocked(_master: i32, pgid: i32, _role: FgRole) -> bool {
     ASKED_UNLOCKED
@@ -1286,8 +1193,6 @@ fn gone_unlocked(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_UNLOCKED, pgid)
 }
 
-/// The incident with a probe that records whether the asking thread holds the term lock:
-/// every liveness question is asked with the lock free, each group once per edge.
 #[test]
 fn foreground_handback_liveness_is_probed_outside_the_term_lock() {
     {
@@ -1333,7 +1238,6 @@ fn foreground_handback_liveness_is_probed_outside_the_term_lock() {
     );
 }
 
-/// The shell's prompt after a one-shot's clean exit: no `zsh:` notice.
 const ONE_SHOT_PROMPT: &[u8] = b"\r\n~/src % \x1b[?2004h";
 
 static FG_ONE_SHOT: AtomicI32 = AtomicI32::new(SHELL);
@@ -1345,8 +1249,6 @@ fn gone_one_shot(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_ONE_SHOT, pgid)
 }
 
-/// The one-shot schedule: zle hands the terminal to a one-shot (`JOB`) that writes `arm` and
-/// exits; the terminal goes to the wrapper's next command (`CHILD`), then back to the shell.
 fn run_one_shot(
     rig: &mut Rig,
     model: &Model,
@@ -1397,9 +1299,6 @@ fn run_one_shot(
     s
 }
 
-/// `tput smcup; sh -c 'echo inside; sleep 3'` and `tput civis`: a gone group that armed only
-/// display modes orphans nothing, so the alt screen holds for the wrapped command and after
-/// it, the cursor stays hidden, and nothing is restored.
 #[test]
 fn foreground_handback_a_one_shot_display_mode_outlives_the_one_shot() {
     let model = foreground_handback_model();
@@ -1482,9 +1381,6 @@ fn gone_one_shot_input(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_ONE_SHOT_INPUT, pgid)
 }
 
-/// The display-only row's non-vacuity control (and a residual): the same schedule with the
-/// one-shot arming an input mode (`/usr/bin/printf '\e[?1000h'`) is handed back at the
-/// one-shot's own exit, the edge where that row records nothing.
 #[test]
 fn foreground_handback_a_one_shot_input_mode_is_handed_back_at_its_exit() {
     let model = foreground_handback_model();
@@ -1529,8 +1425,6 @@ fn foreground_handback_a_one_shot_input_mode_is_handed_back_at_its_exit() {
     );
 }
 
-/// The incident's modes in force under a zsh prompt, armed by the one holder the reader has
-/// seen: the shell, which never goes away.
 const STUCK_UNDER_THE_SHELL: &[u8] =
     b"\x1b[?1049h\x1b[>5u\x1b[?1003h\x1b[?1006h\x1b[>4;2m\x1b[?25lpublication % ";
 
@@ -1543,10 +1437,6 @@ fn gone_reset(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_RESET, pgid)
 }
 
-/// `reset` hands back what the automatic handback never will, on the reader's parse stage:
-/// the reply names what moved, the timeline records `reason=manual source=ctl`, the `bytes`
-/// tap carries the synthesized bytes, the main screen is shown again rather than cleared, and
-/// the reader keeps reading.
 #[test]
 fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
     let mut rig = Rig::attach(
@@ -1644,8 +1534,6 @@ fn manual_reset_hands_back_what_the_shell_armed_and_the_handback_never_will() {
     );
 }
 
-/// What a replay must reproduce of `t`: every visible row, the screen in
-/// front, and the modes the handback and the reset move.
 fn seen(t: &Terminal) -> (Vec<String>, bool, bool, bool, bool) {
     let rows = (0..usize::from(t.rows()))
         .map(|r| t.row_text(r).unwrap_or_default())
@@ -1659,7 +1547,6 @@ fn seen(t: &Terminal) -> (Vec<String>, bool, bool, bool, bool) {
     )
 }
 
-/// `chunks` fed in order through a fresh engine of `like`'s geometry.
 fn folded(like: &Terminal, chunks: &[&[u8]]) -> Terminal {
     let mut t = Terminal::new(like.rows(), like.cols());
     for chunk in chunks {
@@ -1668,8 +1555,6 @@ fn folded(like: &Terminal, chunks: &[&[u8]]) -> Terminal {
     t
 }
 
-/// The rig's spine replayed to its end, read with the reader parked (which
-/// drains its writer), nothing dropped on the way.
 fn spine_replay(rig: &Rig) -> Terminal {
     let rec = rig
         .session
@@ -1681,8 +1566,6 @@ fn spine_replay(rig: &Rig) -> Terminal {
     rec.replay_at(None).expect("the spine's end replays")
 }
 
-/// The ranges of the spine's retained `RawIn` slices whose batch is `burst`'s
-/// allocation (`Arc::ptr_eq`), oldest first.
 fn sharing(retained: &[(Arc<[u8]>, Range<usize>)], burst: &Arc<[u8]>) -> Vec<Range<usize>> {
     retained
         .iter()
@@ -1700,11 +1583,6 @@ fn gone_spine(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_SPINE, pgid)
 }
 
-/// A recorded session's spine and byte taps hold the bytes a foreground
-/// handback and a manual reset synthesize where the engine processed them,
-/// between slices of the batches the reader copied once: a replay of the spine
-/// and a fold of the `bytes` tap each reach the live terminal, after the
-/// incident's handback and again after a reset on a reattached reader.
 #[test]
 fn a_recording_holds_the_handback_and_reset_bytes_at_their_offsets() {
     let model = foreground_handback_model();
@@ -1848,9 +1726,6 @@ fn a_recording_holds_the_handback_and_reset_bytes_at_their_offsets() {
 
 const OWNERSHIP_PROJECTED: [&str; 4] = ["life", "n", "bit", "backs"];
 
-/// The real reader's ownership projection once `backs` events are recorded (an event follows
-/// the term lock's release), or after the patience runs out, so the comparison says what
-/// differs.
 fn project_ownership(rig: &Rig, n: i64, backs: i64) -> State {
     let deadline = Instant::now() + PATIENCE;
     while (rig.restored().len() as i64) < backs && Instant::now() < deadline {
@@ -1885,8 +1760,6 @@ fn check_ownership(rig: &Rig, s: &State, at: &str) {
     );
 }
 
-/// After the prompt (and whatever `before` did at it), a job that arms mouse
-/// tracking in its own bytes, is killed and is reclaimed by the shell.
 fn run_ownership_job(rig: &mut Rig, model: &Model, s: &mut State, job: i32) {
     rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
     rig.set_fg(job);
@@ -1910,7 +1783,6 @@ fn run_ownership_job(rig: &mut Rig, model: &Model, s: &mut State, job: i32) {
     check_ownership(rig, s, "Reclaim: the job's death");
 }
 
-/// The schedule's end state must not be where the replaced rule (`Buggy = 1`) lands.
 fn assert_not_the_replaced_rule(rig: &Rig, model: &Model, schedule: &[&str]) {
     let buggy = interp::with_buggy(model, 1);
     let mut b = buggy.init_state();
@@ -1937,9 +1809,6 @@ fn gone_own_missed(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_OWN_MISSED, pgid)
 }
 
-/// A one-shot `/usr/bin/printf '\e[?1000h'` the reader never saw holding the terminal, then a
-/// job that re-arms mouse tracking and is killed: the one-shot's own handback is lost (a
-/// residual), the job's is not.
 #[test]
 fn foreground_handback_ownership_a_missed_one_shot_loses_only_its_own_handback() {
     const ONE_SHOT: i32 = 4500;
@@ -2004,8 +1873,6 @@ fn gone_own_shell(_master: i32, pgid: i32, _role: FgRole) -> bool {
     is_dead(&DEAD_OWN_SHELL, pgid)
 }
 
-/// zsh's builtin `printf '\e[?1000h'` arms mouse tracking in the shell's own bytes; the next
-/// job that re-arms it and is killed is still handed back.
 #[test]
 fn foreground_handback_ownership_the_shells_own_mouse_does_not_hide_a_jobs_death() {
     let model = foreground_handback_ownership_model();

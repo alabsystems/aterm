@@ -6,8 +6,6 @@
 use super::*;
 use crate::supervise::tape::header::{Entry, Header};
 
-/// A transport no setup test may use: building a session and reading its
-/// setup sends nothing.
 struct NoCtl;
 
 impl Ctl for NoCtl {
@@ -16,12 +14,6 @@ impl Ctl for NoCtl {
     }
 }
 
-/// Every field away from [`SessionSetup::new`]'s value, each duration odd to
-/// the nanosecond (none is a shipped value, and each takes the header's
-/// finest unit), the worker read from the session (a stand-in's environment
-/// is never written, so it does not come back), and the ledger under a root.
-/// A whole literal: a field added to the setup does not build here until it
-/// is given a value of its own.
 fn every_field_moved(dir: &Path) -> SessionSetup {
     let d = |n: u64| Duration::new(n, 7);
     SessionSetup {
@@ -95,7 +87,6 @@ fn every_field_moved(dir: &Path) -> SessionSetup {
     }
 }
 
-/// The `[setup]` and `[env]` lines of a header's text.
 fn setup_lines(text: &str) -> Vec<&str> {
     text.lines()
         .skip_while(|l| *l != "[setup]")
@@ -103,11 +94,6 @@ fn setup_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// THE SETUP ROUND TRIP: a setup with every field moved comes back from a
-/// tape's header field for field — and every one of its lines differs from
-/// the shipped setup's (sections aside), so no field rides through on a
-/// default the two share. A raised hand-over flag comes back as a flag
-/// present and not raised: its value is the host's to raise, never setup.
 #[test]
 fn every_field_of_the_setup_comes_back_from_the_header() {
     let dir = Path::new(if cfg!(windows) {
@@ -140,11 +126,6 @@ fn every_field_of_the_setup_comes_back_from_the_header() {
     }
 }
 
-/// [`Session::new`] is [`Session::from_setup`] over the shipped setup, and
-/// each setter writes the setup a header then reads: the holder is resolved
-/// as it is set (`aterm-supervise:<pid>` unnamed), the turn-end timings are
-/// both the setup's and the policy's fresh memory, a self-claim moved
-/// forgets the remedy's window.
 #[test]
 fn the_setters_write_the_setup() {
     let mut ctl = NoCtl;
@@ -194,15 +175,6 @@ fn the_setters_write_the_setup() {
     assert_eq!(rebuilt.setup(), &setup);
 }
 
-/// A stand-in worker environment is written as its kind and the digest the
-/// tape names it by (seeded with the tape's own id), never its variables, and
-/// comes back as a worker known only by that digest: a planted secret is
-/// nowhere in the header (and the negative control — the variable itself,
-/// which a careless encoder would write — holds it, so the check can fail).
-/// The environment's own `Debug` names no variable either (it counts them),
-/// so not even a `Debug` of a setup can carry one. A stand-in that is an
-/// error comes back with its words; a bare `fixed` (a header from before the
-/// digest) as one that says it was never written.
 #[test]
 fn a_stand_in_workers_environment_is_never_written() {
     let planted = "sk-ant-planted-0123456789";
@@ -250,13 +222,6 @@ fn a_stand_in_workers_environment_is_never_written() {
     );
 }
 
-/// AN OLDER TAPE'S STEP: before the setup held the step of the loop's waits
-/// (`wait_step`), the loop read it live, from the same settle the header's
-/// `background_settle` was read from once. Read back without its key, the
-/// step is this build's rule ([`next_wait_step`]: [`WAIT_STEP`], never longer
-/// than the settle) applied to the settle the TAPE recorded — a run under a
-/// 2 s settle seam waited in 2 s steps — never this process's, and it is
-/// named as supplied. A tape that carries the key is read at its own word.
 #[test]
 fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
     let mut setup = SessionSetup::new(None);
@@ -278,16 +243,6 @@ fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
     assert_eq!(back.supplied, ["[setup] wait_step"]);
 }
 
-/// THE LADDER'S DEVELOPMENT SEAM (`ATERM_DEV_LADDER_SCALE`,
-/// [`TurnEndTiming::for_build`]): its factor scales
-/// the short back-off ladder's first step and its cap, so the steps a lab
-/// waits out still double up to the cap (2, 4, 8, 16, 32, 60, 60 min at an
-/// eighth: 15, 30, 60, 120, 240, 450, 450 s), and moves nothing else. A
-/// value is a factor only in `(0, 1]`: none, `0`, a negative, one above `1`,
-/// one not finite and one that is no number leave the shipped ladder.
-/// NEGATIVE CONTROL: the shipped timing, unscaled, is every step's shipped
-/// value. And a tape's header holds the scaled ladder, so a replay of a run
-/// under the seam waits as it did.
 #[test]
 fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
     use std::ffi::OsStr;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Gemini CLI's screen grammar — Google's Gemini CLI — MEASURED on 0.46.0 (2026-10-16: the real-Claude lab's private headless aterm at 144×50, the Homebrew build launched by path against the lab's stub of the Gemini API, under a scratch `HOME` with a fake API key and no account; fixtures in [`fixtures`], each naming its provenance on line 1) and READ in that build's bundle (`bundle/interactiveCli-*.js`, `bundle/chunk-*.js`) where a capture cannot show it.
+//! Gemini CLI screen grammar, measured on 0.46.0 and read from its bundle.
 
 use crate::anchors::anchor_text;
 use crate::phase::{Phase, leading_spaces, plain_rule_width};
@@ -12,8 +12,6 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 /// Version of the Gemini CLI (`gemini`) harness, tracked independently per harness starting at `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
 
-/// The spinner's frames: braille patterns (`⠧`, `⠴`, `⠼`, `⠏` measured), the
-/// blank one aside.
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
 /// The spinner row (`is_spinner_row`) as the wire's regex: a frame in column 1 (column 0 with the UI details hidden), a blank, a word — what [`crate::reader::GeminiReader`]'s busy guard waits on to leave.
@@ -21,10 +19,6 @@ pub(crate) fn busy_guard() -> String {
     format!("^\\s?[{}-{}]\\s\\S", SPINNER.start(), SPINNER.end())
 }
 
-/// The status row while a turn runs: ` ⠧ Thinking... (esc to cancel, 3s)` —
-/// a blank, a braille frame in column 1, a blank, then the words; with the UI
-/// details hidden the frame stands in column 0 (`⠋ Lab stub thinking (esc to
-/// cancel, 1s)`, measured).
 fn is_spinner_row(row: &str) -> bool {
     let mut c = row.chars().peekable();
     if c.peek() == Some(&' ') {
@@ -35,26 +29,20 @@ fn is_spinner_row(row: &str) -> bool {
         && c.next().is_some_and(|w| !w.is_whitespace())
 }
 
-/// The band's top row and its bottom row.
 const BAND_TOP: &str = "▄";
 const BAND_BOTTOM: &str = "▀";
 
-/// `row` as a run of `glyph` alone, ten or more: its width.
 fn run_of(row: &str, glyph: &str) -> Option<usize> {
     let t = crate::text::trim_end(row).as_bytes();
     let g = glyph.as_bytes();
     (t.len() >= 10 * g.len() && t.chunks(g.len()).all(|c| c == g)).then_some(t.len() / g.len())
 }
 
-/// The composer's caret: `>`, `*` while YOLO is on, `!` in shell mode.
 const CARET: u8 = b'>';
 const CARET_YOLO: u8 = b'*';
 const CARET_SHELL: u8 = b'!';
-/// The caret of a command sent from shell mode, in the transcript's band.
 const CARET_SENT_SHELL: u8 = b'$';
 
-/// The glyph in column 1 of a band's first row (` > text`, ` * text`, ` !
-/// text`, ` $ text`), alone or before a blank.
 fn caret_glyph(row: &str) -> Option<u8> {
     let b = row.as_bytes();
     if b.first() != Some(&b' ') || !b.get(2).is_none_or(|&c| c == b' ') {
@@ -63,19 +51,14 @@ fn caret_glyph(row: &str) -> Option<u8> {
     b.get(1).copied().filter(u8::is_ascii_graphic)
 }
 
-/// The composer's first row: its caret in column 1 ([`CARET`],
-/// [`CARET_YOLO`], [`CARET_SHELL`]).
 fn is_caret_row(row: &str) -> bool {
     caret_glyph(row).is_some_and(|g| [CARET, CARET_YOLO, CARET_SHELL].contains(&g))
 }
 
-/// A sent message's first row in the transcript: `>`, or `$` for a command
-/// sent from shell mode.
 fn is_sent_row(row: &str) -> bool {
     caret_glyph(row).is_some_and(|g| [CARET, CARET_SENT_SHELL].contains(&g))
 }
 
-/// A row a band's text wrapped onto: column 3 or blank.
 fn is_band_text(row: &str) -> bool {
     blank(row) || leading_spaces(row) >= 3
 }
@@ -102,18 +85,8 @@ struct Frame {
     menu: bool,
 }
 
-/// How many rows may stand between the rule and the band: the approval
-/// mode's, with the context summary (`1 GEMINI.md file`) on its right in a
-/// wide pane; in a narrow one (under 80 columns, bundle: `isNarrowWidth`)
-/// the mode, a blank and the summary
-/// on rows of its own, which wraps (measured at 72 columns: three rows,
-/// one summary row).
 const UNDER_RULE_ROWS: usize = 4;
 
-/// The composer ([`Frame`]): the last band of the pane's width — `▄`, a
-/// caret row and the rows its draft wrapped onto, `▀` — whose `─` rule of the
-/// same width stands at most [`UNDER_RULE_ROWS`] rows above it, with no band
-/// row between them.
 fn frame(rows: &[String]) -> Option<Frame> {
     (1..rows.len())
         .rev()
@@ -122,10 +95,6 @@ fn frame(rows: &[String]) -> Option<Frame> {
         .or_else(|| details_hidden_frame(rows))
 }
 
-/// The composer with the UI details hidden: the band that
-/// is the LAST thing drawn — every row under its `▀` blank, so no box and no
-/// menu stands there — with a status row right above its `▄`: the spinner, a
-/// shortcut hint ([`status_words`]), a mode alone, or a blank row.
 fn details_hidden_frame(rows: &[String]) -> Option<Frame> {
     let bottom = rows.iter().rposition(|r| !blank(r))?;
     let width = run_of(&rows[bottom], BAND_BOTTOM)?;
@@ -190,9 +159,6 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
     })
 }
 
-/// The text a caret row holds: what follows ` > `, and NOTHING when that is
-/// the placeholder — a person who typed two blanks and then
-/// its words is the one draft read as empty.
 fn caret_text(row: &str) -> &str {
     let text = crate::text::trim_end(row).get(3..).unwrap_or("");
     if text.strip_prefix("  ") == Some(const { anchor_text("gemini.composer.placeholder") }) {
@@ -272,17 +238,12 @@ enum Status {
     Other,
 }
 
-/// The approval modes the status row names at its left with the UI details
-/// hidden (`● YOLO`, bundle: `modeContentObj`).
 const MODES: [&str; 3] = [
     anchor_text("gemini.mode.yolo"),
     anchor_text("gemini.mode.auto_edit"),
     anchor_text("gemini.mode.plan"),
 ];
 
-/// A status row's words, a mode at its left (`● YOLO`, with the UI details
-/// hidden) taken off: `press tab twice for more` from `● YOLO … press tab
-/// twice for more`, nothing from `● YOLO` alone.
 fn status_words(row: &str) -> &str {
     let t = crate::text::trim(row);
     t.strip_prefix("● ")
@@ -311,8 +272,6 @@ fn status_kind(row: &str) -> Status {
     }
 }
 
-/// A row that may be the status row of the composer with the UI details
-/// hidden: anything but words this grammar has not measured.
 fn is_status_row(row: &str) -> bool {
     status_kind(row) != Status::Other
 }
@@ -321,9 +280,6 @@ fn status_of(rows: &[String], f: Frame) -> Status {
     f.status.map_or(Status::Other, |s| status_kind(&rows[s]))
 }
 
-/// The end of the last message a person sent above row `end`: a `▀` row
-/// under a band whose first row is a sent message's ([`is_sent_row`]: a
-/// command sent from shell mode is the person's too).
 fn last_user(rows: &[String], end: usize) -> Option<usize> {
     (1..end.min(rows.len())).rev().find(|&i| {
         run_of(&rows[i], BAND_BOTTOM).is_some() && {
@@ -336,8 +292,6 @@ fn last_user(rows: &[String], end: usize) -> Option<usize> {
     })
 }
 
-/// The transcript's rows under the last message a person sent and above the
-/// status row, while no turn runs: what the last turn ended on.
 fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
     let f = frame(rows)?;
     let end = f.status?;
@@ -348,20 +302,12 @@ fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
     Some((from, trust_notices_above(rows, from, end)))
 }
 
-/// The first words of Gemini CLI's notices about the folder's trust (bundle:
-/// the trust level's `Note: This folder is still trusted because …` warning,
-/// the startup's untrusted-folder info, the agent loader's feedback).
 const TRUST_NOTICES: [&str; 3] = [
     anchor_text("gemini.notice.still_trusted"),
     anchor_text("gemini.notice.untrusted"),
     anchor_text("gemini.notice.agents_skipped"),
 ];
 
-/// THE END OF WHAT A TURN ENDED ON, above Gemini CLI's trust notices (module
-/// header): walking up from row `end` (the status row) to row `from`, each
-/// block of rows that is one notice — a `⚠ ` or `ℹ ` head in column 0 whose
-/// words, with the rows it wrapped onto two columns in, begin with one of
-/// [`TRUST_NOTICES`] — and the blank rows around it are left out.
 fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
     let mut end = end;
     loop {
@@ -393,7 +339,6 @@ fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
     }
 }
 
-/// Gemini CLI's logo row naming its build: `Gemini CLI v0.46.0`.
 fn is_banner_row(row: &str) -> bool {
     let name = const { anchor_text("gemini.banner") };
     crate::text::find(row, name).is_some_and(|at| {
@@ -403,10 +348,7 @@ fn is_banner_row(row: &str) -> bool {
     })
 }
 
-/// The phase, and whether it is evidence: a box is a prompt; the spinner on the status row is busy;
-/// the composer empty with `? for shortcuts` (`press tab twice for more`) or a blank status row (no
-/// hint is drawn in a narrow pane, nor under `ui.showShortcutsHint = false`), or holding a draft
-/// with the row blank, is idle — a question when the reply's last words end in `?`.
+/// The phase on `rows`, and whether it is evidence.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some(f) = frame(rows) else {
@@ -448,8 +390,6 @@ pub fn message_drawn(rows: &[String]) -> bool {
     last_user(rows, end).is_some()
 }
 
-/// A compact tool row (`  ✓  WriteFile  lab-write.txt → Accepted (+2, -0)`):
-/// a tool's status glyph two columns in and two blanks after it.
 fn is_tool_row(row: &str) -> bool {
     leading_spaces(row) == 2
         && ["✓  ", "✕  ", "⊷  ", "?  "]
@@ -503,9 +443,6 @@ pub fn turn_opened_by(rows: &[String]) -> Option<String> {
     Some(text.join(" "))
 }
 
-/// The turn [`turn_said_before`] reads: whether the band of the message that
-/// opened it is on `rows` ([`turn_whole`]), and the words of its other
-/// replies, oldest first.
 fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
     let (from, end) = ended_on(rows)?;
     let head = said_reply(rows)?.0?;
@@ -529,8 +466,6 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
     Some((last_user(rows, end).is_some(), said))
 }
 
-/// The reply [`said_tail`] reads, as `(its head's row where it is on the
-/// rows, its words)`.
 fn said_reply(rows: &[String]) -> Option<(Option<usize>, String)> {
     let (from, end) = ended_on(rows)?;
     if from == 0 && rows[..end].iter().any(|r| is_banner_row(r)) {
@@ -570,16 +505,8 @@ pub fn interrupted(rows: &[String]) -> bool {
     })
 }
 
-/// The reason Google gives a key that is no key (`400 INVALID_ARGUMENT`,
-/// `ErrorInfo.reason`, measured from the lab's stub of its answer): the
-/// server's word, not the CLI's, so no anchor.
 const KEY_INVALID: &str = "API_KEY_INVALID";
 
-/// The wall an API error row names, read off its text with every blank
-/// taken out (the JSON it quotes wraps mid-token): a 401, or a key Google
-/// says is invalid, is the login; anything else is an API error by its
-/// status — retried by the CLI on a 429 and a 5xx, so never ending a turn
-/// there unless a person stopped it.
 fn error_kind(message: &str) -> WallKind {
     let squeezed: String = message.chars().filter(|c| !c.is_whitespace()).collect();
     let code = squeezed.find("\"code\":").and_then(|at| {
@@ -599,9 +526,7 @@ fn error_kind(message: &str) -> WallKind {
     }
 }
 
-/// The wall the last turn ended on: its `✕ [API Error: …]` row and the rows it wrapped onto, with
-/// nothing under them but blank rows and Gemini CLI's own `ℹ` notices (`ℹ This request failed. …`)
-/// with theirs.
+/// The wall the last turn ended on.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     let (from, end) = ended_on(rows)?;
@@ -674,7 +599,6 @@ pub(crate) struct GeminiBox {
     bottom: usize,
 }
 
-/// A border row (`╭───╮`, `╰───╯`) at column `col`: its width.
 fn border(row: &str, col: usize, open: char, close: char) -> Option<usize> {
     if leading_spaces(row) != col {
         return None;
@@ -684,8 +608,6 @@ fn border(row: &str, col: usize, open: char, close: char) -> Option<usize> {
     (!inner.is_empty() && inner.chars().all(|c| c == '─')).then(|| inner.chars().count() + 2)
 }
 
-/// A row inside a box of `width` at column `col`: the text between its two
-/// `│`, the blank after the left one stripped, the padding at its right.
 fn inside(row: &str, col: usize, width: usize) -> Option<&str> {
     if leading_spaces(row) != col {
         return None;
@@ -726,12 +648,10 @@ pub(crate) fn gemini_box(rows: &[String]) -> Option<GeminiBox> {
     })
 }
 
-/// `● 1. Allow once` / `  2. …` → `(1, "Allow once", focused)`.
 fn numbered(text: &str) -> Option<(u8, &str, bool)> {
     crate::prompt::numbered_option(text, "● ", ". ")
 }
 
-/// What choosing an approval box's `label` does.
 fn approval_role(label: &str) -> Role {
     if label == const { anchor_text("gemini.box.once") } {
         Role::Once
@@ -743,7 +663,6 @@ fn approval_role(label: &str) -> Role {
     } else if label == const { anchor_text("gemini.box.deny") } {
         Role::Deny
     } else {
-        // `Modify with external editor`, and every label not measured.
         Role::Other
     }
 }
@@ -768,15 +687,10 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
     }
 }
 
-/// The question dialog's tab row, drawn under its title when it asks more
-/// than one question: `← □ Colour │ □ Size │ ≡ Review →`.
 fn is_tab_row(text: &str) -> bool {
     text.starts_with("← ") && text.ends_with(" →") && text.contains(" │ ")
 }
 
-/// The first row of the model-fallback dialog (bundle:
-/// `ProQuotaDialog`) other than the usage limit's: a model the key cannot
-/// reach, a model it does not know, or the service's demand.
 fn is_fallback_head(text: &str) -> bool {
     text.starts_with(const { anchor_text("gemini.fallback.no_access") })
         || (text.starts_with("Model \"")
@@ -784,26 +698,16 @@ fn is_fallback_head(text: &str) -> bool {
         || text == const { anchor_text("gemini.fallback.demand") }
 }
 
-/// The sandbox-expansion box's question: `To run [Shell], allow access to
-/// the following?`.
 fn is_expansion_ask(text: &str) -> bool {
     text.strip_prefix(const { anchor_text("gemini.box.expansion.head") })
         .is_some_and(|rest| rest.starts_with(" ["))
         && text.ends_with(const { anchor_text("gemini.box.expansion.ask") })
 }
 
-/// A row the sandbox-expansion box draws under its question: `• Network: All
-/// Urls`, `• Write: <paths>`, `• Read: <paths>`.
 fn is_expansion_row(text: &str) -> bool {
     text.starts_with("• ")
 }
 
-/// The box's kind and the row of its question: the
-/// question dialog and the usage-limit dialog by their title, the trust
-/// dialog by its question, an approval box by the question over its options
-/// and the tool its title names; the model-fallback dialog by its first row,
-/// the MCP, fetch and sandbox-expansion boxes by their questions (kind
-/// [`PromptKind::Other`], their question row kept).
 fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind, Option<usize>) {
     let over = |r: usize| first_option.is_none_or(|f| r < f);
     let title = texts.iter().find(|(_, t)| !t.is_empty());
@@ -878,9 +782,6 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
     (kind, Some(row))
 }
 
-/// The Esc a box offers: the option marked ` (esc)` (an approval box's
-/// refusal: it refuses the call), else its hint row's `Esc to cancel` (the
-/// question dialog: it leaves the question unanswered).
 fn cancel_of(options: &[Opt], hint: Option<&str>) -> Option<Cancel> {
     if let Some(o) = options.iter().find(|o| o.label.ends_with(" (esc)")) {
         return Some(Cancel {
@@ -932,7 +833,6 @@ impl LimitReset {
 }
 
 impl std::fmt::Display for LimitReset {
-    /// As the dialog says it: `5:06 AM PDT`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.zone {
             Some(zone) => write!(f, "{} {zone}", self.clock),
@@ -944,7 +844,6 @@ impl std::fmt::Display for LimitReset {
 /// THE OFFSET OF THE ZONE THE USAGE-LIMIT DIALOG NAMES ([`LimitReset::zone`]), seconds east of UTC.
 #[must_use]
 pub fn zone_offset_s(zone: &str) -> Option<i32> {
-    /// The en-US short names of the measure, with their offsets in hours.
     const NAMED: [(&str, i32); 17] = [
         ("UTC", 0),
         ("GMT", 0),
@@ -982,15 +881,7 @@ pub fn zone_offset_s(zone: &str) -> Option<i32> {
     (h <= 14 && m < 60).then_some(sign * (h * 3600 + m * 60))
 }
 
-/// THE MODEL THE FOOTER NAMES: the value under its `/model` column head,
-/// the footer's last (`Auto`, measured on 0.46.0 —
-/// [`fixtures::IDLE`]; the bundle's `getDisplayString` of the model the
-/// person chose with `/model` otherwise, UNMEASURED), its last cell right
-/// under the head's row (the row naming `workspace (/directory)`), the
-/// newest such footer on the rows. A usage limit is a model's (`Usage limit
-/// reached for <model>.`): a later read naming another model says the
-/// session left the model the limit was read under. `None` with no footer
-/// drawn, its `/model` column hidden, or its value row blank.
+/// The model named under the newest footer's `/model` column, or `None`.
 #[must_use]
 pub fn footer_model(rows: &[String]) -> Option<String> {
     let head = rows.iter().rposition(|r| {
@@ -1007,12 +898,7 @@ pub fn footer_model(rows: &[String]) -> Option<String> {
     (!cell.is_empty()).then(|| cell.to_string())
 }
 
-/// THE LOGIN THE BANNER NAMES (the bundle's `UserIdentity`, beside the
-/// logo): `Authenticated with gemini-api-key` (measured on 0.46.0,
-/// [`fixtures::IDLE`]) or `Signed in with Google: <email>` (READ in the
-/// bundle), its ` /auth` hint cut. Drawn once at the session's start: a
-/// relaunch draws the login it runs on. `None` where the banner has
-/// scrolled off, or names neither.
+/// The login identity named beside the startup banner logo, or `None`.
 #[must_use]
 pub fn banner_login(rows: &[String]) -> Option<String> {
     rows.iter().find_map(|r| {
@@ -1027,9 +913,7 @@ pub fn banner_login(rows: &[String]) -> Option<String> {
     })
 }
 
-/// THE RESET THE USAGE-LIMIT DIALOG NAMES: what its `Access resets at <time>.` row says, under the
-/// title of the dialog [`prompt`] reads whole and over its options — `5:06 AM` in `PDT` of
-/// `Access resets at 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]).
+/// The reset time named by a usage-limit dialog on `rows`.
 #[must_use]
 pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
     let p = prompt(rows)?;
@@ -1079,25 +963,12 @@ pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
     })
 }
 
-/// The box on `rows`, read whole ([`PromptV2`]): its title (an approval box's tool row less its
-/// `?`; under `Action Required`, the tool's row below it), kind, question row and options with
-/// their roles — every role [`Role::Other`] unless the options run `1.`, `2.`, … with the cursor on
-/// exactly one and the box is named (its kind, the first row of its model-fallback dialog, or a box
-/// whose head is off the rows read that offers `Allow once`), and every role [`Role::Other`] on a
-/// question dialog of several questions — the command (the rows of the box drawn inside a shell or
-/// sandbox-expansion box), a file box's path (from its title), the question's text (an MCP, fetch
-/// or expansion box's too, the fallback dialog's message whole), its notes (the tab row of several
-/// questions, the review's answers, the expansion's `• …` rows), chosen by digit, and the Esc
-/// offered.
+/// Read the active prompt or dialog box on `rows` ([`PromptV2`]).
 #[must_use]
 pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     read_box(rows).or_else(|| frame(rows).and_then(|f| kept_box(rows, f)))
 }
 
-/// The rows over the live zone that starts at row `live`, less the queue of
-/// messages the composer draws at its top (`Queued (press ↑ to edit):` two
-/// columns in, each message four in): what a box kept over
-/// the composer is the last thing of.
 fn over_the_queue(rows: &[String], live: usize) -> &[String] {
     let over = &rows[..live.min(rows.len())];
     let queued = over.iter().rposition(|r| {
@@ -1115,13 +986,6 @@ fn over_the_queue(rows: &[String], live: usize) -> &[String] {
     }
 }
 
-/// The box drawn over the composer `f` with `ui.collapseDrawerDuringApproval
-/// = false`: the last thing over its live zone, a queue of
-/// messages under it aside, read whole as [`read_box`] reads a box, with an
-/// option under the cursor (a box still pending, never a finished tool's
-/// box in the transcript) — and every option [`Role::Other`]: the composer
-/// under it has the keys (measured: a digit is typed into it, Enter queues
-/// its text), so no option is chosen by any key this harness sends.
 fn kept_box(rows: &[String], f: Frame) -> Option<PromptV2> {
     let mut p = read_box(over_the_queue(rows, f.live))?;
     if !p.options.iter().any(|o| o.focused) {
@@ -1133,7 +997,6 @@ fn kept_box(rows: &[String], f: Frame) -> Option<PromptV2> {
     Some(p)
 }
 
-/// [`prompt`] of the box that is the last thing drawn on `rows`.
 fn read_box(rows: &[String]) -> Option<PromptV2> {
     let b = gemini_box(rows)?;
     let width = border(&rows[b.bottom], b.col, '╰', '╯')?;
@@ -1379,16 +1242,10 @@ pub mod fixtures {
     /// A Google account's spent quota (`QUOTA_EXHAUSTED`, its reset in `RetryInfo`): the same dialog with `Access resets at <time>.` under its title, before any key.
     pub const LIMIT_DIALOG_ACCOUNT: &str =
         include_str!("fixtures/gemini-0.46.0-wall-429-account.txt");
-    /// THE PER-MODEL BUCKET'S DIALOG (HAND-BUILT from
-    /// [`LIMIT_DIALOG_ACCOUNT`] by the bundle's `ProQuotaDialog`): a terminal
-    /// quota on a Pro model whose fallback is another model, under the API
-    /// key — `Usage limit reached for all Pro models.`, its reset, and `1.
-    /// Switch to gemini-3.5-flash` over `2. Stop`: no `Keep trying`.
+    /// Hand-built per-model bucket quota dialog under an API key.
     pub const LIMIT_DIALOG_BUCKET: &str =
         include_str!("fixtures/gemini-0.46.0-wall-429-bucket-hand-built.txt");
-    /// The same under the Google login (HAND-BUILT): `/auth to switch to API
-    /// key.` in the message and `2. Upgrade for higher limits` (it opens a
-    /// browser) between the switch and `3. Stop`.
+    /// Hand-built per-model bucket quota dialog under a Google login.
     pub const LIMIT_DIALOG_BUCKET_UPGRADE: &str =
         include_str!("fixtures/gemini-0.46.0-wall-429-bucket-upgrade-hand-built.txt");
     /// The same dialog answered `2. Stop`.

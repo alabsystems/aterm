@@ -72,7 +72,7 @@ pub fn print(args: fmt::Arguments<'_>) {
     let _ = out.write_fmt(args).and_then(|()| out.flush());
 }
 
-/// `println!` as a verb's library spells it: [`print`] with the newline.
+/// `println!` as a verb's library spells it: [`fn@print`] with the newline.
 pub fn println(args: fmt::Arguments<'_>) {
     let mut out = io::stdout().lock();
     let _ = out

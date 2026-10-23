@@ -12,7 +12,8 @@
 //! fence, at the line before a heading (`# Errors`): markdown lets a heading interrupt a
 //! paragraph, so a paragraph cut above one runs straight into it. A last line ending on
 //! `e.g.` or `i.e.` was cut at the abbreviation's period. A heading names a section, not a
-//! sentence.
+//! sentence. A doc's last line ending on a colon introduced a list or an example that a prune
+//! deleted (33 on 2026-10-23); a plain `//` comment may end on one to introduce the code below.
 //!
 //! A cut at a period inside parentheses, a code span or a quote (`(its journal.`) leaves
 //! what it opened open, and a cut that adds its own period leaves an article or conjunction
@@ -30,7 +31,8 @@ use super::{Finding, Rule, Tree};
 pub(super) const DOC_SENTENCE: Rule = Rule {
     id: "doc-sentence",
     why: "a comment that ends on a joining word or a comma, or leaves a parenthesis, code span \
-          or quote open, was cut mid-sentence; finish the sentence (code it shows goes in a span)",
+          or quote open, was cut mid-sentence, and a doc that ends on a colon lost what it \
+          introduced; finish the sentence or put the list back (code it shows goes in a span)",
     scope: &[],
     check: doc_sentence,
 };
@@ -96,7 +98,8 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             if paragraph_ends {
                 paragraph.clear();
             }
-            if (ends && cut(body)) || left_open || bare {
+            let colon = ends && own != "//" && !heading(body) && body.ends_with(':');
+            if (ends && cut(body)) || colon || left_open || bare {
                 let tail = &body[body.char_indices().rev().nth(47).map_or(0, |(at, _)| at)..];
                 let what = match own {
                     "//" if safety => "a SAFETY note",
@@ -105,6 +108,8 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 };
                 let says = if bare {
                     "names only code"
+                } else if colon {
+                    "ends on a colon with nothing after it"
                 } else {
                     "ends mid-sentence"
                 };
@@ -294,7 +299,21 @@ mod tests {
                     fn spelled() {}\n\
                     /// Reads the ledger and\n\
                     #[inline]\n\
-                    fn attributed() {}\n";
+                    fn attributed() {}\n\
+                    /// Each lane, checked by:\n\
+                    fn listless() {}\n\
+                    /// Each lane, checked by:\n\
+                    ///\n\
+                    /// * its own baseline.\n\
+                    fn listed() {}\n\
+                    /// The steps:\n\
+                    /// # Errors\n\
+                    /// When it cannot.\n\
+                    fn above_heading() {}\n\
+                    // The layout:\n\
+                    fn plain_colon() {}\n\
+                    /// # Example:\n\
+                    fn heading_colon() {}\n";
         let found = run(&DOC_SENTENCE, &[("crates/aterm-x/src/lib.rs", rust)]);
         assert_eq!(
             spots(&found),
@@ -306,11 +325,17 @@ mod tests {
                 "crates/aterm-x/src/lib.rs:29",
                 "crates/aterm-x/src/lib.rs:43",
                 "crates/aterm-x/src/lib.rs:54",
+                "crates/aterm-x/src/lib.rs:57",
+                "crates/aterm-x/src/lib.rs:63",
             ]
         );
         assert_eq!(
             found[0].detail,
             "a doc comment ends mid-sentence: `…Reads the vault and`"
+        );
+        assert_eq!(
+            found[7].detail,
+            "a doc comment ends on a colon with nothing after it: `…Each lane, checked by:`"
         );
     }
 

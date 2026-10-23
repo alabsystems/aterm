@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`]: price table loading, home-wide transcript folding, dollar spend, and Codex rollout aggregation.
+//! Tests for [`super`].
 use std::fs;
 use std::io::Write as _;
 
 use super::*;
 use crate::harness::usage::TranscriptUsage;
 
-/// A scratch Claude Code home under the system temp dir, removed on drop.
 struct Home(aterm_tempfile::TempDir);
 
 impl Home {
@@ -25,7 +24,6 @@ impl Home {
         self.0.path()
     }
 
-    /// `<home>/projects/<rel>`, its directories made.
     fn transcript(&self, rel: &str) -> PathBuf {
         let path = self.path().join("projects").join(rel);
         fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
@@ -42,14 +40,10 @@ fn append(path: &Path, text: &str) {
     f.write_all(text.as_bytes()).expect("append");
 }
 
-/// The test's clock: real time, so the files this test writes are inside
-/// the horizon by their mtime.
 fn now() -> i64 {
     i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("seconds")
 }
 
-/// Round prices for easy sums: opus $1 in, $10 out, $2 five-minute writes,
-/// $4 one-hour writes, $0.10 reads; fable twice that.
 const TABLE: &str = r#"
 format = 1
 as_of = "2026-10-15"
@@ -77,8 +71,6 @@ fn table() -> PriceTable {
     PriceTable::from_toml(TABLE).expect("the test table loads")
 }
 
-/// One assistant row as Claude Code writes it (key names as on 2.1.30x),
-/// with `extra` spliced into its usage, and its newline.
 fn row(id: &str, model: &str, at: i64, t: TokenUsage, extra: &str) -> String {
     let id = if id.is_empty() {
         String::new()
@@ -97,7 +89,6 @@ fn row(id: &str, model: &str, at: i64, t: TokenUsage, extra: &str) -> String {
     )
 }
 
-/// A million input tokens: $1 on opus.
 fn mtok_in() -> TokenUsage {
     TokenUsage {
         input: 1_000_000,
@@ -189,7 +180,6 @@ fn price_table_prices_only_what_the_caller_supplied() {
     );
 }
 
-/// Every cache class priced at nothing, so a row's validity alone decides.
 fn free_cache() -> Rates {
     Rates {
         cache_write: Some(0.0),
@@ -199,7 +189,6 @@ fn free_cache() -> Rates {
     }
 }
 
-/// $3 / $15 / $3.75 (five-minute writes) / $6 (one-hour writes) / $0.30.
 fn sonnet_like() -> ModelPrice {
     ModelPrice::flat(Rates {
         input: 3.0,
@@ -210,13 +199,8 @@ fn sonnet_like() -> ModelPrice {
     })
 }
 
-/// One row's usage with a cache-write split, as Claude Code 2.1.30x
-/// writes it (the key names MEASURED on this machine's transcripts).
 const SPLIT_ROW: &str = r#"{"type":"assistant","message":{"id":"msg_s","model":"m","usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":800},"output_tokens":0}}}"#;
 
-/// THE ONE-HOUR WRITES ARE PRICED AT THEIR OWN RATE: 800 of the row's
-/// 1000 writes are one-hour ones, so it lists 200 × $3.75 + 800 × $6 (+
-/// the input), not 1000 × $3.75.
 #[test]
 fn one_hour_cache_writes_are_priced_at_their_rate() {
     let mut t = TranscriptUsage::new();
@@ -236,8 +220,6 @@ fn one_hour_cache_writes_are_priced_at_their_rate() {
     assert!(flat < one);
 }
 
-/// NEVER A GUESS: tokens in a class the row has no rate for make the
-/// request unpriced, and a model with no row is unpriced.
 #[test]
 fn a_class_without_a_rate_leaves_the_request_unpriced() {
     let no_writes = PriceTable::new().with(
@@ -265,8 +247,6 @@ fn a_class_without_a_rate_leaves_the_request_unpriced() {
     assert!((usd - (100.0 * 5.0 + 1000.0 * 0.5) / 1e6).abs() < 1e-12);
 }
 
-/// A final streamed row may reveal the cache-write lifetime without adding
-/// another token.
 #[test]
 fn a_late_unpriced_one_hour_split_suppresses_capacity() {
     let home = Home::new("late-unpriced-hour");
@@ -342,9 +322,6 @@ fn a_late_unpriced_one_hour_split_suppresses_capacity() {
     assert!(super::figure(&priced, &reading).capacity.is_ok());
 }
 
-/// THE LONG-PROMPT TIER is decided per request on its whole prompt
-/// (input, cache writes and reads): one token over prices every class at
-/// the long rates; at the threshold, the base ones.
 #[test]
 fn a_prompt_over_the_tier_pays_the_long_rates_request_by_request() {
     let base = Rates {
@@ -384,9 +361,6 @@ fn a_prompt_over_the_tier_pays_the_long_rates_request_by_request() {
     assert!((long_usd - (10_000.0 * 0.5 + 90_001.0 * 0.05 + 1000.0 * 2.5) / 1e6).abs() < 1e-12);
 }
 
-/// THE SHIPPED TABLE (`prices.toml`) loads, is dated, and every row names
-/// the public page it was read from; ids are exact (an alias or a
-/// `[1m]` spelling is unpriced).
 #[test]
 fn the_shipped_table_loads_dated_and_sourced_and_the_loader_is_strict() {
     let shipped = PRICES_TOML;
@@ -452,9 +426,6 @@ fn the_shipped_table_loads_dated_and_sourced_and_the_loader_is_strict() {
     }
 }
 
-/// THE HOME-WIDE FOLD COUNTS SUBAGENTS (the design's F15): the main
-/// transcript, a subagent's beside it and a workflow's nested deeper are all
-/// summed.
 #[test]
 fn the_home_fold_counts_every_transcript_subagents_included() {
     let home = Home::new("subagents");
@@ -488,10 +459,6 @@ fn the_home_fold_counts_every_transcript_subagents_included() {
     assert!(close(everything(&main_only, now).usd, 1.0));
 }
 
-/// THE FOLD'S DEADLINE BOUNDS THE WALK TOO (design §4.1: `accounts stats`
-/// folds for at most [`super::super::cli::STATS_FOLD_S`]): a fold whose
-/// deadline has passed lists nothing more and says its walk was cut, so the
-/// discovery of a large home cannot run past the budget.
 #[test]
 fn the_folds_deadline_stops_its_walk() {
     let home = Home::new("walk-deadline");
@@ -514,9 +481,6 @@ fn the_folds_deadline_stops_its_walk() {
     assert_eq!((report.files, report.messages), (1, 1));
 }
 
-/// ONE MESSAGE, ONE COUNT, AT ITS LARGEST: a streamed message's rows repeat
-/// its id with growing output, within one fold and across two (the id is
-/// kept in the cursor between them).
 #[test]
 fn a_message_counts_once_at_its_largest_even_across_folds() {
     let home = Home::new("dedupe");
@@ -557,9 +521,6 @@ fn a_message_counts_once_at_its_largest_even_across_folds() {
     assert_eq!((all.messages, all.tokens.output), (3, 140));
 }
 
-/// THE COST RULE: a second fold of the same spend reads only what was
-/// appended (plus the one boundary byte), and an unchanged home reads
-/// nothing.
 #[test]
 fn a_second_fold_reads_only_the_appended_bytes() {
     let home = Home::new("appended");
@@ -594,8 +555,6 @@ fn a_second_fold_reads_only_the_appended_bytes() {
     assert_eq!(whole.read, (first_rows.len() + more.len()) as u64);
 }
 
-/// A failed directory read is not a complete empty home. In particular it
-/// cannot discard the per-file streaming state which a later append needs.
 #[test]
 fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
     let home = Home::new("walk-refused");
@@ -682,8 +641,6 @@ fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
     );
 }
 
-/// A TORN LAST LINE is not folded until its newline is written, and then
-/// only once.
 #[test]
 fn a_torn_last_line_waits_for_its_newline() {
     let home = Home::new("torn");
@@ -707,9 +664,6 @@ fn a_torn_last_line_waits_for_its_newline() {
     assert!(close(everything(&spend, now).usd, 1.0));
 }
 
-/// A BUDGET only spreads the fold: many small folds reach the sums one
-/// unbounded fold does, and say they are behind until then — a budget
-/// smaller than one line included (a line begun is read to its end).
 #[test]
 fn a_budgeted_fold_reaches_the_same_sums_as_one_unbounded() {
     let home = Home::new("budget");
@@ -759,9 +713,6 @@ fn a_budgeted_fold_reaches_the_same_sums_as_one_unbounded() {
     assert_eq!(everything(&bit, now), everything(&whole, now));
 }
 
-/// A TRANSCRIPT REWRITTEN IN PLACE is folded again from its start: what it
-/// had counted is known by its ids and not counted again, and a message new
-/// to it is.
 #[test]
 fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
     let rewrite = |label: &str, forget: bool| {
@@ -805,8 +756,6 @@ fn a_rewritten_transcript_is_folded_again_never_counted_twice() {
     assert!(close(everything(&control, now).usd, 3.1));
 }
 
-/// A MESSAGE STREAMING WHEN ITS FILE IS FOLDED AGAIN is still raised by its
-/// later rows: the ids the transcript held stand through the refold.
 #[test]
 fn a_message_streaming_through_a_refold_is_still_raised() {
     let refold = |label: &str, forget: bool| {
@@ -839,10 +788,6 @@ fn a_message_streaming_through_a_refold_is_still_raised() {
     assert!(close(all.usd, 2.0), "{}", all.usd);
 }
 
-/// ONE MESSAGE, ONE COUNT IN THE HOME: a transcript that repeats messages
-/// another one counted (a copy a fork or a resume could write) adds only
-/// its own, across two folds of one spend and in one fold that reads the
-/// copy first.
 #[test]
 fn a_message_another_transcript_repeats_counts_once_in_the_home() {
     let home = Home::new("copies");
@@ -878,9 +823,6 @@ fn a_message_another_transcript_repeats_counts_once_in_the_home() {
     assert!(close(everything(&control, now).usd, 5.0));
 }
 
-/// BUCKETS are five minutes wide back to the horizon, and nothing past it
-/// is kept: time passing drops what leaves the horizon and merges nothing,
-/// so a sum over old spend is as fine as one over new.
 #[test]
 fn buckets_are_five_minutes_wide_back_to_the_horizon() {
     let home = Home::new("buckets");
@@ -931,8 +873,6 @@ fn buckets_are_five_minutes_wide_back_to_the_horizon() {
     assert!(spend.seen.is_empty(), "and their ids");
 }
 
-/// NEVER A GUESS: a model with no row is counted and named, its dollars
-/// unknown, and more than 1% of a class unpriced says so.
 #[test]
 fn an_unknown_model_is_unpriced_never_guessed() {
     let home = Home::new("unpriced");
@@ -964,9 +904,6 @@ fn an_unknown_model_is_unpriced_never_guessed() {
     assert!(all.unpriced.is_empty() && !all.unpriced_over());
 }
 
-/// WHAT THE TABLE DOES NOT PRICE is counted approximate: fast mode, US-only
-/// inference, a web search, a tier other than the standard one, an
-/// advisor's iterations.
 #[test]
 fn fast_mode_us_inference_web_search_tiers_and_advisors_are_approximate() {
     let home = Home::new("approx");
@@ -1005,8 +942,6 @@ fn fast_mode_us_inference_web_search_tiers_and_advisors_are_approximate() {
     assert!(close(all.usd, 10.0), "the advisor's own tokens not counted");
 }
 
-/// The rows that are not a served message's spend: an API-error row, a row
-/// with no timestamp (counted), a zero usage, a row of another type.
 #[test]
 fn only_served_timed_assistant_rows_count() {
     let home = Home::new("served");
@@ -1049,8 +984,6 @@ fn only_served_timed_assistant_rows_count() {
     assert_eq!(report.rows_unparsed, 1);
 }
 
-/// A NEWER TABLE folds everything again under its prices: nothing priced by
-/// the old one is kept beside the new.
 #[test]
 fn a_spend_priced_by_another_table_is_folded_again() {
     let home = Home::new("retable");
@@ -1074,7 +1007,6 @@ fn a_spend_priced_by_another_table_is_folded_again() {
     assert_eq!(spend.prices_as_of(), "2026-11-01");
 }
 
-/// A spend with `usd` of opus spend placed at each `(at, usd)`.
 fn spend_at(rows: &[(i64, f64)], now: i64) -> Spend {
     let home = Home::new("figures");
     let mut spend = spend_of(&home);
@@ -1129,9 +1061,6 @@ fn ask<'a>(now: i64, reading: Option<Reading>) -> Ask<'a> {
     }
 }
 
-/// `C = $(window start, t_r] ÷ u(t_r)` and `left = C × (1 − u_now)`: spend
-/// after the reading never enters `C`, even in the bucket the reading falls
-/// in (only buckets that end by it count).
 #[test]
 fn capacity_divides_the_spend_to_the_reading_by_its_use() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1169,10 +1098,6 @@ fn capacity_divides_the_spend_to_the_reading_by_its_use() {
     assert!(close(to_bucket.usd / 0.25, 60.0), "{}", to_bucket.usd);
 }
 
-/// A WEEK'S CAPACITY IS SUMMED FROM ITS FIVE-MINUTE BUCKETS, days after the
-/// spend: a reading 35 minutes into an hour three days back holds the $6
-/// served at :25 and not the $4 at :50, once time has passed and the spend
-/// file has been through `expire`.
 #[test]
 fn a_weeks_capacity_is_summed_from_its_five_minute_buckets() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1193,8 +1118,6 @@ fn a_weeks_capacity_is_summed_from_its_five_minute_buckets() {
     assert_eq!(week(hour + 26 * 60).capacity, Err(Why::Low));
 }
 
-/// A RESET USED INSIDE THE WINDOW starts the numerator (and the spent figure)
-/// at its epoch: the vendor refilled the window there.
 #[test]
 fn a_reset_used_inside_the_window_starts_at_its_epoch() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1215,8 +1138,6 @@ fn a_reset_used_inside_the_window_starts_at_its_epoch() {
     ));
 }
 
-/// USAGE CREDITS SERVED IN THE WINDOW: `C` and `left` print `on-credits`,
-/// whenever in the window they served; what was spent still shows.
 #[test]
 fn credits_served_in_the_window_suppress_the_capacity() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1240,8 +1161,6 @@ fn credits_served_in_the_window_suppress_the_capacity() {
     assert!(close(plain.capacity.expect("a capacity").usd, 40.0));
 }
 
-/// EVERY EMPTY FIGURE SAYS WHY, with one closed word; and a figure that
-/// means something says nothing (the negative control).
 #[test]
 fn each_empty_figure_says_why() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1332,9 +1251,6 @@ fn each_empty_figure_says_why() {
     }
 }
 
-/// THE ERROR BAR is the reading's resolution: whole percents until a tenth
-/// is seen, a painted panel's floor read as the middle of its percent, a
-/// wall exact.
 #[test]
 fn the_error_bar_is_the_readings_resolution() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1365,8 +1281,6 @@ fn the_error_bar_is_the_readings_resolution() {
     assert!(close(wall.usd, 10.0) && close(wall.pm_pct, 0.0));
 }
 
-/// THE FABLE BUCKET's dollars are its models' only. Negative control: the
-/// whole window holds both.
 #[test]
 fn the_fable_bucket_sums_only_fable_models() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;
@@ -1390,19 +1304,11 @@ fn the_fable_bucket_sums_only_fable_models() {
     assert!(close(figure(&spend, &ask(now, None)).used.usd, 6.0));
 }
 
-/// A message's first row as Claude Code 2.1.300 writes it while the message
-/// streams: no `speed` (nor `server_tool_use` or `iterations`, which [`row`]
-/// writes only as `extra`).
 fn first_streamed(row: &str) -> String {
     assert!(row.contains(r#","speed":"standard""#));
     row.replacen(r#","speed":"standard""#, "", 1)
 }
 
-/// A MESSAGE IS APPROXIMATE WHEN ANY ROW OF IT SAYS SO, and is counted so
-/// once: fast mode said on its last row only, both rows read in one fold; a
-/// web search said on the last row a fold later; a last row that adds
-/// nothing but `speed`; an advisor's iterations on the last row only, after
-/// a first row with Claude Code's empty `iterations`.
 #[test]
 fn a_message_is_approximate_when_any_row_of_it_says_so() {
     let home = Home::new("approx-late");
@@ -1465,9 +1371,6 @@ fn a_message_is_approximate_when_any_row_of_it_says_so() {
     assert_eq!(counts(&spend), (7, 6));
 }
 
-/// EACH MESSAGE IS PRICED ON ITS OWN, a model priced by prompt length too:
-/// two requests under the tier, a session's and its subagent's in one
-/// bucket, price at the base rates however large their sum.
 #[test]
 fn each_message_is_priced_on_its_own() {
     let tiered = format!(
@@ -1501,8 +1404,6 @@ fn each_message_is_priced_on_its_own() {
     assert!(close(as_one, 0.6), "{as_one}");
 }
 
-/// A retained cache-read token is priced below the prompt tier but has no
-/// rate above it.
 fn repricing_table(price_long_cache: bool) -> PriceTable {
     let cache = if price_long_cache {
         "cache_read = 2.0"
@@ -1686,7 +1587,6 @@ fn a_later_fully_priced_tier_resolves_unknown_tokens_without_backdating_dollars(
     assert_eq!(all.messages, 1);
 }
 
-/// Set `path`'s mtime to `at`, unix seconds: a transcript last written then.
 fn written_at(path: &Path, at: i64) {
     let when = UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(at).expect("after 1970"));
     fs::OpenOptions::new()
@@ -1697,9 +1597,6 @@ fn written_at(path: &Path, at: i64) {
         .expect("set the mtime");
 }
 
-/// A TRANSCRIPT PAST THE HORIZON keeps no cursor, though another transcript
-/// of its session is live; written again, it is read from its start, and a
-/// message the home already counted is not counted again.
 #[test]
 fn a_transcript_past_the_horizon_lets_its_cursor_go() {
     let run = |label: &str, forget: bool| {
@@ -1736,13 +1633,9 @@ fn a_transcript_past_the_horizon_lets_its_cursor_go() {
 
 use crate::harness::codex_rollout::fixtures::{context, count, meta};
 
-/// Thread ids in UUIDv7 form: a conversation's own thread and a subagent
-/// forked from it.
 const ROOT: &str = "01900000-0000-7000-8000-000000000001";
 const SUB: &str = "01900000-0000-7000-8000-000000000002";
 
-/// Round prices for easy sums: sol $1 in, $0.10 cached, $10 out; luna twice
-/// that, with cache writes, and its long rates over 1,000 prompt tokens.
 const CODEX_TABLE: &str = r#"
 format = 1
 as_of = "2026-10-15"
@@ -1774,17 +1667,12 @@ fn codex_table() -> PriceTable {
     PriceTable::from_toml(CODEX_TABLE).expect("the Codex test table loads")
 }
 
-/// `<home>/sessions/2026/10/15/rollout-…-<thread>.jsonl`, its folder made.
 fn rollout(home: &Home, thread: &str) -> PathBuf {
     let day = home.path().join("sessions/2026/10/15");
     fs::create_dir_all(&day).expect("mkdir");
     day.join(format!("rollout-2026-10-15T10-00-00-{thread}.jsonl"))
 }
 
-/// A CODEX TURN AS A MESSAGE: its cached input is a cache read and out of
-/// its input, so no cached token is priced twice, and the prompt a long row
-/// is decided on is OpenAI's `input_tokens`; a cache write, a service tier,
-/// or parts past the input make it approximate.
 #[test]
 fn a_codex_turn_maps_into_one_message() {
     use crate::harness::codex_rollout::{Turn, TurnTokens};
@@ -1844,9 +1732,6 @@ fn a_codex_turn_maps_into_one_message() {
     assert_eq!(codex_message(&unnamed).model, UNKNOWN_MODEL);
 }
 
-/// TWO THREADS SERVED THE SAME COUNTS are two turns (one prompt run twice,
-/// as a script runs `codex exec`, or the lab's stub): their fingerprints
-/// match, and the conversation does not deduplicate across rollouts by it.
 #[test]
 fn two_threads_served_the_same_counts_each_count() {
     use crate::harness::codex_rollout::{Row, TurnReader};

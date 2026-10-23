@@ -319,10 +319,7 @@ fn in_fresh_pane(rows: &[String], pane: usize) -> Vec<String> {
     out
 }
 
-/// (measured on Claude Code 2.1.302 at 41x67 in the real-Claude lab,
-/// its local stub; built here by [`in_fresh_pane`] from the 41x60 captures drawn from row 7):
-/// a fresh multi-select drawn from row 7 of a pane `7 + 11 + N + 40` rows tall, the long-term
-/// text `N` rows once the focus leaves it.
+/// A fresh multi-select whose 40-row tail begins at the focused `Submit` button is read whole and submitted.
 #[test]
 fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
     use aterm_phase::prompt::fixtures as f;
@@ -383,9 +380,7 @@ fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
     );
 }
 
-/// 's F2 residual, at the loop: a fresh 2.1.302 multi-select at 41 columns drawn
-/// from row 7 of a pane whose 40-row tail begins AT `5. Chat about this`, where a person's keys
-/// moved the focus (the loop never puts it there).
+/// A fresh 2.1.302 multi-select at 41 columns whose 40-row tail begins at a focused `5. Chat about this` row is read whole and answered.
 #[test]
 fn a_tail_cut_at_a_chat_row_a_person_focused_is_read_whole_and_answered() {
     use aterm_phase::prompt::fixtures as f;
@@ -448,9 +443,8 @@ fn a_tail_cut_at_a_chat_row_a_person_focused_is_read_whole_and_answered() {
 }
 
 /// `frame`, a multi-select with its free-text row ticked and the focus on
-/// `❯    Submit`, as 2.1.300 draws a text that overflows its row once the
-/// focus left it (F2): the checkbox without its space
-/// (`[✔]Decide`) and every wrap row one cell left, at column 8.
+/// `❯    Submit`, with the checkbox drawn without its space (`[✔]Decide`) and
+/// every wrap row one cell left at column 8.
 fn against_its_checkbox(frame: &[String], wraps_too: bool) -> Vec<String> {
     let free = frame
         .iter()
@@ -475,10 +469,7 @@ fn against_its_checkbox(frame: &[String], wraps_too: bool) -> Vec<String> {
         .collect()
 }
 
-/// F2, the move across the column change: the decision read
-/// has the focus in the field, its text at column 9 (`❯ 4. [✔] Decide`); the
-/// `↓` lands on a frame whose text 2.1.300 drew against its checkbox, at
-/// column 8 (`  4. [✔]Decide`).
+/// Moving from the focused field at column 9 (`❯ 4. [✔] Decide`) onto `Submit` with the text drawn against its checkbox at column 8 (`  4. [✔]Decide`) still submits.
 #[test]
 fn a_multi_select_text_that_moves_against_its_checkbox_is_still_submitted_by_its_button() {
     let screens = multi_screens(LONG_TERM_TEXT);
@@ -598,8 +589,7 @@ fn two_questions_and_their_review_are_answered_by_text_then_submitted() {
     );
 }
 
-/// The session's word `short-term` answers over the window's `recommended`. Negative control:
-/// with the word unset, the recommended option is pressed and nothing written.
+/// The session's word `short-term` answers over the window's `recommended`, and with the word unset the recommended option is pressed.
 #[test]
 fn the_sessions_short_term_word_answers_over_a_global_recommended() {
     for word in [Some("short-term"), None] {
@@ -750,9 +740,7 @@ fn a_question_asked_again_after_its_dialog_went_is_written_afresh() {
     assert_eq!(sends(&m).len(), 2, "{:#?}", m.requests);
 }
 
-/// (Questions): the loop answered a question by its own text and its Enter
-/// went, and the worker asked the same question again in a new dialog with no read between
-/// them (no busy read, no composer: the gap the reads did not sample).
+/// When the loop answered a question with its own text and the worker asks the same question again in a new dialog with no read between them, it is written afresh.
 #[test]
 fn a_question_asked_again_with_no_read_between_after_the_loops_enter_is_written_afresh() {
     let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -859,9 +847,7 @@ fn a_look_took_a_missed_frame(lines: &[String]) {
     );
 }
 
-/// F4's forget, held to its evidence: a dialog ends at a look
-/// that reads the worker at its COMPOSER with no dialog up, never at one that
-/// reads no dialog only.
+/// A dialog ends at a look that reads the worker at its composer with no dialog up, never at one that reads no dialog only.
 #[test]
 fn a_dialog_the_reader_misses_for_one_look_keeps_the_loops_text() {
     let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1076,8 +1062,7 @@ fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     );
 }
 
-/// A word changed after the loop's first key on a dialog hands it over, no Enter. Negative
-/// control: a change before the first key simply applies.
+/// A word changed after the loop's first key on a dialog hands it over with no Enter, while a change before the first key applies.
 #[test]
 fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
@@ -1372,8 +1357,6 @@ fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not(
         m.send_replies.push_back(reply);
         m.vanish_after = Some(1);
         if tag == "partial" {
-            // The first wait after the hand-over (the reconcile's `meta`
-            // uncounted): its connection drops.
             m.by_index.insert(11, closed());
         }
         let _ = hosted_run(&mut m, &hosted_by(LONG), None);
@@ -1839,15 +1822,7 @@ fn chose_lines(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// MUSE CODE'S QUESTION UNDER `long-term` THROUGH THE WINDOW'S LOOP (the
-/// screens measured on 1.4.10): two arrows from `Red (Recommended)` onto
-/// `None of the above`, Tab, the long-term text written into the empty note
-/// with one fenced `send`, Enter only on the next read, the note holding
-/// exactly that text — then, on the REVIEW the note draws, Enter on `⟩ Submit
-/// answers`: `[down, down, tab, text, enter, enter]`, every key `key
-/// if-human=0 if-gen=…`. Told once as the latched word's choice: `CHOSE …
-/// policy=long-term <question> → None of the above (the long-term policy
-/// text as its note)`.
+/// Muse Code's question under `long-term` selects `None of the above`, writes the long-term text into the note, and submits the review.
 #[test]
 fn a_muse_question_is_answered_by_a_note_and_its_review_sent() {
     use aterm_phase::muse::fixtures as u;

@@ -256,6 +256,7 @@ impl CursorGlow {
             probe.above = NbrProbe::Unprobed;
             probe.below = NbrProbe::Unprobed;
         }
+        self.refresh_probed_text_spans();
         self.hand_row = self.hand_row.map(|hand| {
             if hand.row == from {
                 HandRow::at(to)

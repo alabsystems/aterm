@@ -35,7 +35,8 @@ fn shared_write(path: &std::path::Path, meta: &std::fs::Metadata, me: u32) -> bo
 
 /// Refuse a store another account could replace.
 /// # Errors
-/// The first component not owned by root or this user, or writable unshielded by another account.
+/// The first component that is not a directory of root's or this user's, or writable unshielded by
+/// another account.
 pub fn check_install_path(store: &OsStr) -> Verdict<()> {
     let store = PyPath::new(store).absolute()?;
     let me = crate::host::uid();
@@ -114,7 +115,12 @@ fn sha256_of(mut file: std::fs::File) -> Verdict<String> {
     Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
 }
 
-/// The durable policy beside `store` ([`Policy`]), read only while it binds the installed file.
+/// The durable policy beside `store` ([`Policy`]), read only while it binds the installed
+/// file: the record must be the updater's own private file of the schema it writes, its
+/// target this store's `aterm`, every number in it a u64, and the target either absent while
+/// updates are off and no trial is recorded, or a file no other account can write whose digest
+/// is the identity recorded or one a trial's phase and identities explain. A store with no
+/// record has a clean slate.
 /// # Errors
 /// [`check_install_path`]'s, then the first rule the record breaks.
 pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {

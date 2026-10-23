@@ -17,12 +17,7 @@ fn spelled(list: &[&str]) -> Vec<String> {
     list.iter().map(|&s| s.to_owned()).collect()
 }
 
-/// THE RECORD'S EDIT: `--develop` appends the `[develop]` table after a blank line and
-/// every byte before it is the file's; `--no-develop` gives the file back byte for byte; a
-/// second checkout rewrites only the array's own bytes; a table in the middle of the file,
-/// with comments of its own, is edited and removed with every line outside it as it was.
-/// Negative control: a whole-file rewrite through the decoder, run on the same file, is not
-/// byte-identical (the comparison sees the comments go).
+/// `--develop` and `--no-develop` preserve every line outside the `[develop]` table byte for byte.
 #[test]
 fn the_profile_s_other_lines_are_byte_identical_after_develop_and_no_develop() {
     let one = spelled(&["~/aterm"]);
@@ -141,9 +136,7 @@ fn record_of(sys: &Fake, alice: &User, want: Option<bool>) -> Vec<ItemReport> {
     .unwrap()
 }
 
-/// THE RECORD ITEM: run inside a checkout (from a directory below its root), `--develop`
-/// records `~/aterm`, writing only the appended table with the file's own mode; a second
-/// `--develop` changes nothing; `--no-develop` leaves the file exactly as she wrote it.
+/// `--develop` records the checkout it runs in, and `--no-develop` restores the file.
 #[test]
 fn develop_records_the_workspace_it_runs_in_and_no_develop_gives_the_file_back() {
     let (sys, alice) = alice_with(Some(WRITTEN));
@@ -175,9 +168,7 @@ fn develop_records_the_workspace_it_runs_in_and_no_develop_gives_the_file_back()
     );
 }
 
-/// A Mac with no `[develop]` table, asked for nothing of the develop layer, composes no
-/// develop item (the user profile); one whose table records a checkout composes its four.
-/// `--develop` with nowhere to find a checkout is refused before anything is changed.
+/// The develop layer composes items only when `[develop]` records a checkout, and refuses `--develop` outside one.
 #[test]
 fn the_develop_layer_follows_the_record_and_never_guesses() {
     let compose_for = |sys: &Fake, alice: &User, cwd: Option<&Path>, want| {
@@ -282,6 +273,7 @@ fn tools(targo: Option<Targo>) -> WorkspaceTools {
         path: PathBuf::from("/Users//alice/aterm"),
         spelled: "~/aterm".into(),
         targo,
+        reader: Reader::Init,
     }
 }
 
@@ -289,12 +281,7 @@ fn found_targo() -> Targo {
     Arc::new(|| Ok(PathBuf::from("/Users//alice/.atpkg/bin/targo")))
 }
 
-/// THE TOOLS ITEM runs the checkout's own `targo --unverified --locked verify provision`
-/// from inside the checkout (so its `.cargo/config.toml` alias applies, and cargo refuses to
-/// rewrite its lock), as alice, with the toolset's `bin` first on `PATH` and nothing else
-/// added to the environment: `--check` to read, the verb to apply, `--check` again to read
-/// back. A tree that pins nothing for this host is not applicable; with no targo it is
-/// blocked on what installs one.
+/// [`WorkspaceTools`] runs the checkout's own `targo --unverified --locked verify provision` with the toolset's `bin` first on `PATH`.
 #[test]
 fn workspace_tools_run_the_checkouts_own_verify_provision_from_inside_it() {
     let provide = CHECK.strip_suffix(" --check").unwrap();
@@ -374,12 +361,7 @@ fn workspace_tools_run_the_checkouts_own_verify_provision_from_inside_it() {
     assert!(sys.calls().iter().all(|call| !call.contains("targo")));
 }
 
-/// INIT RUNS NO CODE FROM A TREE IT LEAVES AS IT IS: a checkout with uncommitted changes or
-/// untracked files, a detached HEAD, or an origin that is not admitted reads not applicable,
-/// saying why, in a read and in an apply, and its own `targo` is never run (no build, no
-/// lock rewrite, nothing of the tree executed). A tree whose `Cargo.lock` cargo would have
-/// to rewrite reads unusable, naming the lock: `--locked` refused it. Negative control: the
-/// same checkout clean, on its branch, with its admitted origin, runs `--check`.
+/// [`WorkspaceTools`] runs no code from a dirty, detached, or foreign-origin tree and refuses a stale `Cargo.lock`.
 #[test]
 fn workspace_tools_run_no_code_from_a_tree_init_leaves_as_it_is_and_never_rewrite_its_lock() {
     for (case, url, branch, status, why) in [
@@ -484,10 +466,7 @@ impl Item for Standing {
     }
 }
 
-/// THE TOOLS WAIT FOR THE SUBMODULE: the workspace does not load without `vendor/astream`,
-/// so when `develop.submodules@~/aterm` did not land, `develop.workspace-tools@~/aterm` waits
-/// for it and runs nothing. Negative control: with the submodule in place, the tools are
-/// read with `--check`.
+/// `develop.workspace-tools` waits for `develop.submodules` when the submodule has not landed.
 #[test]
 fn workspace_tools_wait_for_the_submodule() {
     for landed in [false, true] {
@@ -545,10 +524,7 @@ fn workspace_tools_wait_for_the_submodule() {
     }
 }
 
-/// THE DEVELOP ITEMS, END TO END on real git: `--develop` run from below a checkout's root
-/// records it as `~/work`, fast-forwards it (it was clean and behind), finds no submodule
-/// to check out, and blocks the tools on a missing targo; no run rewrites anything. A second
-/// pass changes nothing.
+/// End-to-end `--develop` records and fast-forwards a real git checkout without rewriting history.
 #[test]
 fn develop_records_and_fast_forwards_a_real_checkout_without_a_rewrite() {
     let live = Live::new();
@@ -723,6 +699,7 @@ impl<'a> Bus<'a> {
             path: self.work.clone(),
             spelled: "~/fresh".into(),
             stood: Aside::default(),
+            reader: Reader::Init,
         }
     }
 
@@ -756,11 +733,7 @@ fn updated(record: &[(Cmd, Option<Vec<u8>>)]) -> bool {
         .any(|(cmd, _)| cmd.args.iter().any(|arg| arg == "update"))
 }
 
-/// THE SUBMODULE ITEM on real git: a fresh clone's uninitialized `vendor/astream` is checked
-/// out and `submodule.recurse` set; after a fast-forward that bumped the gitlink, the
-/// submodule, detached and clean at the commit the tree recorded before, is checked out at
-/// the new one (`--checkout`); the same one with an untracked file in it stays where it
-/// is, saying why. No run rewrites anything (`submodule update` is the one writer).
+/// [`Submodules`] checks out an uninitialized or clean lagging `vendor/astream` with `--checkout` and leaves a dirty one untouched.
 #[test]
 fn the_submodule_is_checked_out_only_where_that_loses_nothing() {
     let live = Live::new();
@@ -817,10 +790,7 @@ fn the_submodule_is_checked_out_only_where_that_loses_nothing() {
     );
 }
 
-/// A SUBMODULE HEAD GIT CANNOT READ IS NEVER UPDATED: when `git symbolic-ref` fails with
-/// anything but "not on a branch" (exit 1), whether the submodule is on a branch of the
-/// person's is unknown, so the read fails, naming it, and nothing reaches the update.
-/// Negative control: the same script with exit 1 (detached) goes on to read the commit.
+/// A submodule whose `HEAD` git cannot read fails closed before any update.
 #[test]
 fn a_submodule_head_git_cannot_read_is_never_updated() {
     for (code, want) in [
@@ -839,20 +809,13 @@ fn a_submodule_head_git_cannot_read_is_never_updated() {
             path: path.to_path_buf(),
             spelled: "~/aterm".into(),
             stood: Aside::default(),
+            reader: Reader::Init,
         };
         assert_eq!(item.moved_safely(&sys), Err(want.to_owned()), "exit {code}");
     }
 }
 
-/// A PERSON'S ASTREAM WORK IS LEFT AS IT IS: astream committed and pushed on its branch
-/// before the checkout's bump is committed (AGENTS.md: bus changes land in astream first),
-/// the same commit on a detached HEAD, and a topic branch that diverges from the recorded
-/// commit under a configured `update = rebase`: each reads `Ok` saying why, and an apply
-/// runs no `git submodule update`, so the submodule's HEAD and branch and the checkout's
-/// uncommitted bump stay exactly as they were. Negative controls: the update 1299c27cbd ran
-/// (`git submodule update --init`, no `--checkout`) on the same states puts the old commit
-/// back on a detached HEAD, dropping the bump, and rebases the topic branch into a commit
-/// no remote holds.
+/// [`Submodules`] leaves a person's `astream` branch and uncommitted gitlink bump untouched.
 #[test]
 fn a_person_s_astream_branch_and_uncommitted_bump_are_left_as_they_are() {
     let live = Live::new();
@@ -938,11 +901,7 @@ fn a_person_s_astream_branch_and_uncommitted_bump_are_left_as_they_are() {
     }
 }
 
-/// `--checkout` WHATEVER THE CONFIGURED MODE: a lagging submodule (detached, clean, at a
-/// commit the tree recorded before) whose recorded commit does not contain it is checked
-/// out at that commit even under `submodule.vendor/astream.update = merge`, making no
-/// commit. Negative control: the same update without `--checkout` merges, leaving a commit
-/// no remote holds.
+/// [`Submodules`] passes `--checkout` regardless of `submodule.vendor/astream.update`, never creating a merge commit.
 #[test]
 fn a_configured_update_mode_never_makes_a_commit_in_the_submodule() {
     let live = Live::new();
@@ -995,11 +954,7 @@ fn a_configured_update_mode_never_makes_a_commit_in_the_submodule() {
     assert_ne!(heads[0], heads[1]);
 }
 
-/// A CONFLICTED SUBMODULE IS NEVER UPDATED: a merge in the checkout that left
-/// `vendor/astream` conflicted (`U`) reads saying so; an apply sets only
-/// `submodule.recurse`, runs no `git submodule update`, and the conflict is as it was.
-/// Negative control: before the conflict, the same item on the same checkout would update
-/// (its uninitialized submodule reads as a change to check out).
+/// A conflicted `vendor/astream` submodule is never updated by `git submodule update`.
 #[test]
 fn a_conflicted_submodule_is_never_updated() {
     let live = Live::new();
@@ -1074,10 +1029,7 @@ fn a_conflicted_submodule_is_never_updated() {
     );
 }
 
-/// A LINKED WORKTREE IS NEVER RECORDED: `--develop` run inside a `git worktree add` of a
-/// checkout (removed once its work lands) is refused, naming the checkout it belongs to,
-/// and nothing is written; the layer is then one `develop.record` row saying so. Negative
-/// control: run in that checkout itself, it records it.
+/// `--develop` refuses a linked worktree (`git worktree add`) and names the checkout it belongs to.
 #[test]
 fn develop_never_records_a_linked_worktree() {
     let live = Live::new();
@@ -1119,9 +1071,7 @@ fn develop_never_records_a_linked_worktree() {
     assert_eq!(ids[1], "develop.checkout@~/work");
 }
 
-/// `--no-develop`'s RECORD ROW NAMES `--no-develop`: removing the table is remedied by the
-/// flag that removes it, never by `--develop`, which would record the checkout again.
-/// Negative control: `--develop`'s record row names `--develop`.
+/// `--no-develop`'s record row names `aterm init --no-develop` as its remedy.
 #[test]
 fn no_develop_names_its_own_remedy() {
     for (want, profile, remedy) in [
@@ -1189,4 +1139,832 @@ fn only_names_develop_items_by_id_family_and_layer() {
     ] {
         assert!(!names(word), "{word}");
     }
+}
+
+/// `targo --unverified --locked --offline verify provision --check`: doctor's read of the
+/// tools, run as alice in `~/aterm` with the toolset's `bin` first on `PATH`.
+const DOCTOR_CHECK: &str = "cd /Users//alice/aterm && alice$ \
+                            PATH=/Users//alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+                            /Users//alice/.atpkg/bin/targo --unverified --locked --offline verify \
+                            provision --check";
+
+/// The runs among `calls` that reach past this Mac, or run a checkout's code other than
+/// doctor's own offline `--check`: a git `fetch`, `pull`, `clone` or `push`, an `ls-remote`
+/// that asks origin (`--get-url` reads only the configuration), a `submodule update`, and any
+/// `targo` run but `--offline … --check`.
+fn reaches(calls: &[String]) -> Vec<String> {
+    calls
+        .iter()
+        .filter(|call| {
+            let words: Vec<&str> = call.split_whitespace().collect();
+            if words.iter().any(|word| word.ends_with("/targo")) {
+                return !(words.contains(&"--offline") && words.contains(&"--check"));
+            }
+            let Some(at) = words.iter().position(|word| word.ends_with("/git")) else {
+                return false;
+            };
+            let mut rest = words[at + 1..].iter();
+            let sub = loop {
+                match rest.next() {
+                    Some(&("-C" | "-c")) => {
+                        rest.next();
+                    }
+                    other => break other.copied(),
+                }
+            };
+            match sub {
+                Some("fetch" | "pull" | "clone" | "push") => true,
+                Some("ls-remote") => !words.contains(&"--get-url"),
+                Some("submodule") => words.contains(&"update"),
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Scripts what doctor reads of `~/aterm` past [`script_local`]: origin's default branch as
+/// last fetched (`main`, at `tip`), and a submodule at the commit the tree records with
+/// `submodule.recurse` true.
+fn script_fetched(sys: &Fake, alice: &User, tip: &str) {
+    let path = Path::new("/Users//alice/aterm");
+    for (args, ran) in [
+        (
+            vec!["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            Ran::ok("refs/remotes/origin/main\n"),
+        ),
+        (
+            vec![
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/main^{commit}",
+            ],
+            Ran::ok(&format!("{tip}\n")),
+        ),
+        (
+            vec!["config", "--get", "submodule.recurse"],
+            Ran::ok("true\n"),
+        ),
+        (
+            vec!["submodule", "status", "--", SUBMODULE],
+            Ran::ok(" 2222222222222222222222222222222222222222 vendor/astream (heads/main)\n"),
+        ),
+    ] {
+        sys.on(&checkout::git(alice, Some(path)).args(args).display(), ran);
+    }
+}
+
+/// The commit [`script_local`]'s `~/aterm` is at.
+const HEAD: &str = "1111111111111111111111111111111111111111";
+
+/// DOCTOR READS THE FOUR DEVELOP ROWS FROM THIS MAC ALONE (design §5, S9): on a Mac whose
+/// `init.toml` records `~/aterm`, doctor's layer is the record, the checkout, the submodule and
+/// the tools, each read: the checkout against origin as last fetched, the tools by the
+/// checkout's own `--check` under `--locked --offline`. No run reaches origin (no fetch, no
+/// `ls-remote` to it), none updates the submodule, nothing is written, and no item is applied.
+/// Negative control: init's reader of the same Mac (what `aterm init --check` runs) asks origin
+/// with `ls-remote` and runs the tools without `--offline`, and the same predicate catches both.
+#[test]
+fn doctor_reads_the_four_develop_rows_from_this_mac_alone() {
+    let recorded = "[develop]\ncheckouts = [\"~/aterm\"]\n";
+    let scripted = || {
+        let (sys, alice) = alice_with(Some(recorded));
+        script_local(&sys, &alice, ORIGIN, true, "");
+        script_fetched(&sys, &alice, HEAD);
+        sys.on(
+            DOCTOR_CHECK,
+            Ran::exit(0, "verify provision: PASS — 7 rows in place\n"),
+        );
+        (sys, alice)
+    };
+    let (sys, alice) = scripted();
+    let ctx = ctx(std::slice::from_ref(&alice));
+    let setup = sys.calls().len();
+    let composed = doctor(&sys, &ctx, false, Some(found_targo()));
+    assert!(!composed.unreadable);
+    let rows = read(&sys, &ctx, &composed, &[]).unwrap();
+    let read_as: Vec<(&str, Outcome, Option<&str>)> = rows
+        .iter()
+        .map(|row| (row.id.as_str(), row.outcome, row.to.as_deref()))
+        .collect();
+    assert_eq!(
+        read_as,
+        [
+            (
+                "develop.record",
+                Outcome::Ok,
+                Some("the develop profile, for ~/aterm")
+            ),
+            (
+                "develop.checkout@~/aterm",
+                Outcome::Ok,
+                Some("up to date with origin/main at 111111111111, as last fetched")
+            ),
+            (
+                "develop.submodules@~/aterm",
+                Outcome::Ok,
+                Some("vendor/astream at the commit the tree records; submodule.recurse true")
+            ),
+            (
+                "develop.workspace-tools@~/aterm",
+                Outcome::Ok,
+                Some("PASS — 7 rows in place")
+            ),
+        ],
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|row| row.layer == Some(Layer::Develop)));
+    let calls = sys.calls().split_off(setup);
+    assert_eq!(reaches(&calls), Vec::<String>::new(), "{calls:#?}");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.as_str() == DOCTOR_CHECK)
+            .count(),
+        1,
+        "{calls:#?}"
+    );
+    assert!(
+        calls.iter().all(|call| !call.contains("$ write")),
+        "{calls:#?}"
+    );
+
+    let (sys, alice) = scripted();
+    let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&alice));
+    let init = compose(
+        &sys,
+        &ctx,
+        &Inputs {
+            want: None,
+            asked: false,
+            cwd: None,
+            targo: Some(found_targo()),
+        },
+    )
+    .unwrap();
+    let bound = crate::engine::bind(
+        init.iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        &sys,
+        &ctx,
+    );
+    aterm_converge::run_scoped(
+        &bound,
+        Mode::Plan,
+        Scope::EVERY,
+        &mut NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    let caught = reaches(&sys.calls());
+    assert!(
+        caught
+            .iter()
+            .any(|call| call.ends_with("ls-remote --symref origin HEAD")),
+        "{caught:#?}"
+    );
+}
+
+/// DOCTOR APPLIES NO DEVELOP ITEM, even under an engine that would: each of doctor's items
+/// refuses its apply, so a real checkout behind its origin is never fetched or merged (the
+/// submodule's and the tools' refusals are pinned by
+/// `every_doctor_develop_item_refuses_its_apply_and_runs_nothing`).
+/// Negative control: a plan of the same items (what doctor runs) reads them as planned and runs
+/// nothing more.
+#[test]
+fn doctor_s_develop_items_apply_nothing_whatever_the_engine_asks() {
+    let live = Live::new();
+    let repos = Repos::new(&live, "doctor-no-apply");
+    repos.advance("two.txt", "two\n");
+    repos.g(&repos.work, &["fetch", "--quiet", "origin"]);
+    let before = repos.head(&repos.work);
+    let profile = Path::new(&repos.who.home).join(PROFILE);
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    std::fs::write(&profile, "[develop]\ncheckouts = [\"~/work\"]\n").unwrap();
+    let ctx = ctx(std::slice::from_ref(&repos.who));
+    for mode in [Mode::Apply, Mode::Plan] {
+        let sys = Spawns::new(&live);
+        let composed = doctor(&sys, &ctx, false, None);
+        let bound = crate::engine::bind(
+            composed
+                .items
+                .iter()
+                .map(|(item, place)| (item.as_ref(), place.clone())),
+            &sys,
+            &ctx,
+        );
+        let rows =
+            aterm_converge::run_scoped(&bound, mode, Scope::EVERY, &mut NoJournal, &mut |_| {})
+                .unwrap();
+        let checkout = &rows[1];
+        assert_eq!(checkout.id, "develop.checkout@~/work");
+        if mode == Mode::Apply {
+            assert_eq!(checkout.outcome, Outcome::Failed, "{rows:?}");
+            assert_eq!(checkout.why.as_deref(), Some(DOCTOR_CHANGES_NOTHING));
+        } else {
+            assert_eq!(checkout.outcome, Outcome::Planned, "{rows:?}");
+        }
+        let record = sys.record();
+        let calls: Vec<String> = record.iter().map(|(cmd, _)| cmd.display()).collect();
+        assert_eq!(
+            reaches(&calls),
+            Vec::<String>::new(),
+            "{mode:?}: {calls:#?}"
+        );
+        assert_eq!(rewrites(&record), Vec::<String>::new());
+        assert_eq!(repos.head(&repos.work), before, "{mode:?}");
+    }
+}
+
+/// DOCTOR READS A REAL CHECKOUT WITHOUT ITS ORIGIN: a clean checkout behind origin's tip that
+/// it has not fetched reads up to date as last fetched; once fetched, one commit behind as last
+/// fetched (planned, `aterm init --develop` the remedy); and with origin's repository gone
+/// altogether doctor reads it exactly so, while the tools' `--check` runs (a stand-in `targo`)
+/// under `--offline`. On another branch, clean, the checkout is left as it is and the tools'
+/// `--check` still runs, as init's does there (`checkout::kept_here` admits any branch). In a
+/// checkout init leaves as it is (an untracked file, a detached HEAD) the tools are not
+/// applicable and nothing of the checkout runs. No run fetches, asks origin or rewrites, and the
+/// checkout's HEAD never moves. Negative controls: with origin gone, init's own read of the same
+/// checkout cannot answer (its `ls-remote` reaches for origin), and init's apply, a mutant
+/// doctor that fetched, is caught by the same predicate over the spawn record.
+#[test]
+fn doctor_reads_a_real_checkout_as_last_fetched_without_its_origin() {
+    let live = Live::new();
+    let repos = Repos::new(&live, "doctor-develop");
+    let tip = repos.advance("two.txt", "two\n");
+    let start = repos.head(&repos.work);
+    let profile = Path::new(&repos.who.home).join(PROFILE);
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    std::fs::write(&profile, "[develop]\ncheckouts = [\"~/work\"]\n").unwrap();
+    let ctx = ctx(std::slice::from_ref(&repos.who));
+    let true_targo: Targo = Arc::new(|| Ok(PathBuf::from("/usr/bin/true")));
+    let doctor_rows = |sys: &Spawns<'_>| {
+        let composed = doctor(sys, &ctx, false, Some(true_targo.clone()));
+        read(sys, &ctx, &composed, &[]).unwrap()
+    };
+    let outcome = |rows: &[ItemReport], id: &str| {
+        rows.iter()
+            .find(|row| row.id == id)
+            .map(|row| (row.outcome, row.from.clone(), row.to.clone()))
+            .unwrap_or_else(|| panic!("no {id} in {rows:?}"))
+    };
+    let sys = Spawns::new(&live);
+    let rows = doctor_rows(&sys);
+    assert_eq!(
+        outcome(&rows, "develop.checkout@~/work"),
+        (
+            Outcome::Ok,
+            None,
+            Some(format!(
+                "up to date with origin/main at {}, as last fetched",
+                &start[..12]
+            ))
+        ),
+        "{rows:?}"
+    );
+
+    repos.g(&repos.work, &["fetch", "--quiet", "origin"]);
+    let behind = (
+        Outcome::Planned,
+        Some("1 commit behind origin/main, as last fetched".to_owned()),
+        Some(format!("fast-forwarded to origin/main at {}", &tip[..12])),
+    );
+    let rows = doctor_rows(&sys);
+    assert_eq!(
+        outcome(&rows, "develop.checkout@~/work"),
+        behind,
+        "{rows:?}"
+    );
+    let checkout = rows.iter().find(|row| row.id == "develop.checkout@~/work");
+    assert_eq!(
+        checkout
+            .and_then(|row| row.explain.as_ref())
+            .map(|e| &e.remedy),
+        Some(&Remedy::Develop)
+    );
+
+    std::fs::remove_dir_all(&repos.origin).unwrap();
+    let rows = doctor_rows(&sys);
+    assert_eq!(
+        outcome(&rows, "develop.checkout@~/work"),
+        behind,
+        "{rows:?}"
+    );
+    assert_eq!(
+        outcome(&rows, "develop.workspace-tools@~/work").0,
+        Outcome::Ok,
+        "{rows:?}"
+    );
+    let ran_tools = |record: &[(Cmd, Option<Vec<u8>>)]| -> Vec<String> {
+        record
+            .iter()
+            .map(|(cmd, _)| cmd.display())
+            .filter(|call| call.contains("/usr/bin/true"))
+            .collect()
+    };
+    let tools = ran_tools(&sys.record());
+    assert!(
+        !tools.is_empty()
+            && tools
+                .iter()
+                .all(|call| call
+                    .ends_with("--unverified --locked --offline verify provision --check")),
+        "{tools:#?}"
+    );
+
+    std::fs::write(repos.work.join("mine.txt"), "mine\n").unwrap();
+    let kept = Spawns::new(&live);
+    let rows = doctor_rows(&kept);
+    let (tools_read, ..) = outcome(&rows, "develop.workspace-tools@~/work");
+    assert_eq!(tools_read, Outcome::NotApplicable, "{rows:?}");
+    assert_eq!(ran_tools(&kept.record()), Vec::<String>::new());
+    std::fs::remove_file(repos.work.join("mine.txt")).unwrap();
+
+    repos.g(&repos.work, &["checkout", "--quiet", "-b", "topic"]);
+    let topic = Spawns::new(&live);
+    let rows = doctor_rows(&topic);
+    assert_eq!(
+        outcome(&rows, "develop.checkout@~/work"),
+        (
+            Outcome::Ok,
+            None,
+            Some("left as it is: it is on topic, not origin's default branch main".to_owned())
+        ),
+        "{rows:?}"
+    );
+    assert_eq!(
+        outcome(&rows, "develop.workspace-tools@~/work").0,
+        Outcome::Ok,
+        "{rows:?}"
+    );
+    assert_eq!(ran_tools(&topic.record()).len(), 1, "{:#?}", topic.record());
+    repos.g(&repos.work, &["checkout", "--quiet", "--detach"]);
+    let detached = Spawns::new(&live);
+    let rows = doctor_rows(&detached);
+    assert_eq!(
+        outcome(&rows, "develop.workspace-tools@~/work").0,
+        Outcome::NotApplicable,
+        "{rows:?}"
+    );
+    assert_eq!(ran_tools(&detached.record()), Vec::<String>::new());
+    repos.g(&repos.work, &["checkout", "--quiet", "main"]);
+    for record in [topic.record(), detached.record()] {
+        let calls: Vec<String> = record.iter().map(|(cmd, _)| cmd.display()).collect();
+        assert_eq!(reaches(&calls), Vec::<String>::new(), "{calls:#?}");
+        assert_eq!(rewrites(&record), Vec::<String>::new());
+    }
+
+    let calls: Vec<String> = sys.record().iter().map(|(cmd, _)| cmd.display()).collect();
+    assert_eq!(reaches(&calls), Vec::<String>::new(), "{calls:#?}");
+    assert_eq!(rewrites(&sys.record()), Vec::<String>::new());
+    assert_eq!(repos.head(&repos.work), start);
+
+    let init_sys = Spawns::new(&live);
+    let init_inputs = Inputs {
+        want: None,
+        asked: false,
+        cwd: None,
+        targo: None,
+    };
+    let init = compose(&init_sys, &ctx, &init_inputs).unwrap();
+    let bound = crate::engine::bind(
+        init.iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        &init_sys,
+        &ctx,
+    );
+    let rows = aterm_converge::run_scoped(
+        &bound,
+        Mode::Plan,
+        Scope::EVERY,
+        &mut NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        outcome(&rows, "develop.checkout@~/work").0,
+        Outcome::Unknown,
+        "{rows:?}"
+    );
+
+    repos.init(&repos.origin, true);
+    repos.g(&repos.seed, &["push", "--quiet", "origin", "main"]);
+    let mutant = Spawns::new(&live);
+    let init = compose(&mutant, &ctx, &init_inputs).unwrap();
+    let bound = crate::engine::bind(
+        init.iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        &mutant,
+        &ctx,
+    );
+    aterm_converge::run_scoped(
+        &bound,
+        Mode::Apply,
+        Scope::EVERY,
+        &mut NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    let calls: Vec<String> = mutant
+        .record()
+        .iter()
+        .map(|(cmd, _)| cmd.display())
+        .collect();
+    let caught = reaches(&calls);
+    assert!(
+        caught.iter().any(|call| call.contains(" fetch ")),
+        "{caught:#?}"
+    );
+    assert_eq!(repos.head(&repos.work), tip);
+}
+
+/// A MAC WITH NO `[develop]` RECORD HAS NO DEVELOP ROW in doctor's read, and asked for one
+/// (`--only develop`) its record row says what makes one. A profile that cannot be read is
+/// one `develop.record` row saying why, kept whatever `--only` narrows the read to, and no
+/// other develop item is composed.
+#[test]
+fn doctor_reads_no_develop_row_unrecorded_and_one_row_for_a_profile_it_cannot_read() {
+    let (sys, alice) = alice_with(Some(WRITTEN));
+    let ctx = ctx(std::slice::from_ref(&alice));
+    let composed = doctor(&sys, &ctx, false, Some(found_targo()));
+    assert!(composed.items.is_empty() && !composed.unreadable);
+    assert_eq!(read(&sys, &ctx, &composed, &[]).unwrap(), Vec::new());
+    let (sys, _) = alice_with(None);
+    let composed = doctor(&sys, &ctx, false, None);
+    assert!(composed.items.is_empty() && !composed.unreadable);
+    let asked = doctor(&sys, &ctx, true, None);
+    let rows = read(&sys, &ctx, &asked, &["develop".to_owned()]).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, Outcome::Ok);
+    assert_eq!(
+        rows[0].to.as_deref(),
+        Some("no [develop] table: the user profile (`aterm init --develop` records one)")
+    );
+    assert!(
+        sys.calls().iter().all(|call| !call.contains("git")),
+        "{:?}",
+        sys.calls()
+    );
+
+    for (profile, mode, why) in [
+        ("[develop\n", 0o600, "invalid ~/.config/aterm/init.toml"),
+        (
+            "[develop]\ncheckouts = [\"~/aterm\"]\n",
+            0o664,
+            "cannot safely read ~/.config/aterm/init.toml",
+        ),
+        (
+            "[develop]\ncheckouts = [\"aterm\"]\n",
+            0o600,
+            "must be ~/<path> or absolute",
+        ),
+    ] {
+        let (sys, alice) = alice_with(None);
+        sys.write_user_file(&alice, &profile_path(&alice), profile.as_bytes(), mode)
+            .unwrap();
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&alice));
+        let composed = doctor(&sys, &ctx, false, Some(found_targo()));
+        assert!(composed.unreadable, "{profile}");
+        for only in [Vec::new(), vec!["shell".to_owned()]] {
+            let rows = read(&sys, &ctx, &composed, &only).unwrap();
+            assert_eq!(rows.len(), 1, "{profile}: {rows:?}");
+            assert_eq!(rows[0].id, RECORD);
+            assert_eq!(rows[0].outcome, Outcome::Unknown);
+            assert!(
+                rows[0]
+                    .why
+                    .as_deref()
+                    .is_some_and(|said| said.contains(why)),
+                "{profile}: {rows:?}"
+            );
+        }
+        assert!(sys.calls().iter().all(|call| !call.contains("git")));
+    }
+}
+
+/// EACH OF DOCTOR'S DEVELOP ITEMS REFUSES ITS APPLY AND RUNS NOTHING, called straight as an
+/// engine that applied install items would call it: the record, the checkout (no fetch, no
+/// merge), the submodule (no `submodule update`) and the tools (no `verify provision`) each
+/// answer [`DOCTOR_CHANGES_NOTHING`], and no command runs and no file is written. Negative
+/// control: init's items of the same Mac, applied the same way, each run something (the
+/// record writes the `init.toml` it wants, the others read the checkout with git), so a refusal
+/// removed from any of doctor's four would show.
+#[test]
+fn every_doctor_develop_item_refuses_its_apply_and_runs_nothing() {
+    for reader in [Reader::Doctor, Reader::Init] {
+        let (sys, alice) = alice_with(None);
+        script_local(&sys, &alice, ORIGIN, true, "");
+        script_fetched(&sys, &alice, HEAD);
+        let ctx = ctx(std::slice::from_ref(&alice));
+        let placed = items(
+            &alice,
+            Some(spelled(&["~/aterm"])),
+            reader,
+            Some(found_targo()),
+        )
+        .unwrap();
+        let ids: Vec<String> = placed.iter().map(|(item, _)| item.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                RECORD,
+                "develop.checkout@~/aterm",
+                "develop.submodules@~/aterm",
+                "develop.workspace-tools@~/aterm"
+            ]
+        );
+        for (item, _) in &placed {
+            let before = sys.calls().len();
+            let applied = item.apply(&sys, &ctx);
+            let ran = sys.calls().split_off(before);
+            if reader == Reader::Doctor {
+                assert_eq!(
+                    applied,
+                    Err(DOCTOR_CHANGES_NOTHING.to_owned()),
+                    "{}",
+                    item.id()
+                );
+                assert_eq!(ran, Vec::<String>::new(), "{}", item.id());
+            } else {
+                assert_ne!(
+                    applied,
+                    Err(DOCTOR_CHANGES_NOTHING.to_owned()),
+                    "{}",
+                    item.id()
+                );
+                assert!(!ran.is_empty(), "{}: init's apply ran nothing", item.id());
+            }
+        }
+    }
+}
+
+/// A relay item that wants a change, recording whether it was applied.
+struct WantsChange(Arc<std::sync::atomic::AtomicBool>);
+
+impl Item for WantsChange {
+    fn id(&self) -> String {
+        RECORD.to_owned()
+    }
+    fn family(&self) -> &'static str {
+        "profile"
+    }
+    fn title(&self) -> String {
+        "a develop item whose probe wants a change".to_owned()
+    }
+    fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
+        Probe::Change {
+            from: "as it is".into(),
+            to: "as wanted".into(),
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// DOCTOR'S READ IS A PLAN, whatever its items would do: a relay item, which doctor's repair
+/// scope applies, that wants a change reads planned through [`read`] and is never applied.
+/// Negative control: the same item run in that scope as an apply is applied, so a read that
+/// applied would show even though doctor's own items never plan a relay change today.
+#[test]
+fn doctor_s_develop_read_plans_and_applies_nothing_even_in_its_repair_scope() {
+    let (sys, alice) = alice_with(None);
+    let ctx = ctx(std::slice::from_ref(&alice));
+    let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let composed = Composed {
+        items: vec![(Box::new(WantsChange(applied.clone())), place(Class::Relay))],
+        unreadable: false,
+    };
+    let rows = read(&sys, &ctx, &composed, &[]).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].outcome, Outcome::Planned, "{rows:?}");
+    assert!(!applied.load(std::sync::atomic::Ordering::SeqCst));
+
+    let bound = crate::engine::bind(
+        composed
+            .items
+            .iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        &sys,
+        &ctx,
+    );
+    aterm_converge::run_scoped(
+        &bound,
+        Mode::Apply,
+        Scope::REPAIR,
+        &mut NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(applied.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// The tools item as doctor reads it ([`tools`], [`Reader::Doctor`]).
+fn doctor_tools(targo: Option<Targo>) -> WorkspaceTools {
+    WorkspaceTools {
+        reader: Reader::Doctor,
+        ..tools(targo)
+    }
+}
+
+/// DOCTOR'S TOOLS READ OF A LOCK NAMING CRATES THIS MAC HAS NOT DOWNLOADED IS BLOCKED, naming
+/// what fetches them: cargo under `--offline` refuses the download, in either of the two ways
+/// it says so, and doctor reads [`NOT_DOWNLOADED`]. Negative control: init's read of the same
+/// answer (it runs without `--offline`, so such a refusal is not its own) is the plain "did not
+/// finish".
+#[test]
+fn doctor_reads_an_offline_refusal_of_the_checkout_s_lock_as_blocked() {
+    for said in [
+        "error: failed to download `aterm-fixture v1.0.0`\n\nCaused by:\n  attempting to make \
+         an HTTP request, but --offline was specified\n",
+        "error: no matching package named `aterm-fixture` found\nnote: offline mode \
+         (--offline) can sometimes cause surprising resolution failures\n",
+    ] {
+        let (sys, alice) = alice_with(None);
+        script_local(&sys, &alice, ORIGIN, true, "");
+        sys.on(DOCTOR_CHECK, Ran::exit(101, said));
+        sys.on(CHECK, Ran::exit(101, said));
+        let ctx = ctx(std::slice::from_ref(&alice));
+        assert_eq!(
+            doctor_tools(Some(found_targo())).probe(&sys, &ctx),
+            Probe::Blocked {
+                why: NOT_DOWNLOADED.into()
+            },
+            "{said}"
+        );
+        let init = tools(Some(found_targo())).probe(&sys, &ctx);
+        assert!(
+            matches!(&init, Probe::Unusable { why } if why.contains("did not finish")),
+            "{init:?}"
+        );
+    }
+}
+
+/// DOCTOR WAITS AT MOST TWO MINUTES FOR A CHECKOUT'S TOOLS: its `--check` runs under
+/// [`DOCTOR_BUDGET`], so a cargo waiting on another build's lock on the checkout's build
+/// directory holds doctor's report no longer, and a run that gives no answer in time reads
+/// blocked, saying so and what reads it with no such limit. Negative control: init's own run
+/// keeps [`LONG_BUDGET`], and its read of a run that gave no answer is unusable, as before.
+#[test]
+fn doctor_stops_waiting_for_a_checkout_s_tools_after_its_budget() {
+    let targo = Path::new("/Users//alice/.atpkg/bin/targo");
+    assert_eq!(
+        doctor_tools(Some(found_targo()))
+            .command(targo, true)
+            .budget,
+        DOCTOR_BUDGET
+    );
+    assert_eq!(
+        tools(Some(found_targo())).command(targo, true).budget,
+        LONG_BUDGET
+    );
+    assert!(DOCTOR_BUDGET < LONG_BUDGET);
+
+    let (sys, alice) = alice_with(None);
+    script_local(&sys, &alice, ORIGIN, true, "");
+    sys.time_out(DOCTOR_CHECK).time_out(CHECK);
+    let ctx = ctx(std::slice::from_ref(&alice));
+    let probe = doctor_tools(Some(found_targo())).probe(&sys, &ctx);
+    assert!(
+        matches!(&probe, Probe::Blocked { why }
+            if why.contains("no answer within 120s")
+                && why.contains("`aterm init --check --develop` waits for it")),
+        "{probe:?}"
+    );
+    let init = tools(Some(found_targo())).probe(&sys, &ctx);
+    assert!(
+        matches!(&init, Probe::Unusable { why } if why.contains("no answer within 1800s")),
+        "{init:?}"
+    );
+}
+
+/// A CHECKOUT THAT RECORDS NO DEFAULT BRANCH OF ORIGIN'S IS BLOCKED IN DOCTOR'S READ, NAMING THE
+/// GIT ACT THAT RECORDS IT, and that act clears it: with `refs/remotes/origin/HEAD` deleted the
+/// row names `git -C ~/work remote set-head origin --auto` (no remedy of aterm's), and once it
+/// has run the row reads up to date as last fetched; with origin's branch itself deleted the row
+/// names `git -C ~/work fetch origin`, and once that has run it reads up to date again. Doctor
+/// itself never fetches or asks origin. Negative control: `aterm init --develop`'s own apply of
+/// the same checkout (current with origin) fetches nothing and leaves `refs/remotes/origin/HEAD`
+/// missing, so naming it would change nothing.
+#[test]
+fn a_checkout_without_origin_s_head_names_the_git_act_that_records_it() {
+    let live = Live::new();
+    let repos = Repos::new(&live, "doctor-origin-head");
+    let profile = Path::new(&repos.who.home).join(PROFILE);
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    std::fs::write(&profile, "[develop]\ncheckouts = [\"~/work\"]\n").unwrap();
+    let ctx = ctx(std::slice::from_ref(&repos.who));
+    let checkout_row = |sys: &Spawns<'_>| {
+        let composed = doctor(sys, &ctx, false, None);
+        let rows = read(sys, &ctx, &composed, &[]).unwrap();
+        let row = rows
+            .into_iter()
+            .find(|row| row.id == "develop.checkout@~/work")
+            .unwrap_or_else(|| panic!("no checkout row"));
+        let calls: Vec<String> = sys.record().iter().map(|(cmd, _)| cmd.display()).collect();
+        assert_eq!(reaches(&calls), Vec::<String>::new(), "{calls:#?}");
+        row
+    };
+    let head = repos.head(&repos.work);
+    let current = Some(format!(
+        "up to date with origin/main at {}, as last fetched",
+        &head[..12]
+    ));
+
+    repos.g(&repos.work, &["remote", "set-head", "origin", "--delete"]);
+    let row = checkout_row(&Spawns::new(&live));
+    assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+    assert!(
+        row.why
+            .as_deref()
+            .is_some_and(|why| why.contains("records no default branch of origin's")
+                && why.ends_with(
+                    "`git -C ~/work remote set-head origin --auto` records it (it asks origin once)"
+                )),
+        "{row:?}"
+    );
+    assert_eq!(
+        row.explain.as_ref().map(|explain| &explain.remedy),
+        Some(&Remedy::None)
+    );
+
+    let init_sys = Spawns::new(&live);
+    let init = compose(
+        &init_sys,
+        &ctx,
+        &Inputs {
+            want: None,
+            asked: false,
+            cwd: None,
+            targo: None,
+        },
+    )
+    .unwrap();
+    let bound = crate::engine::bind(
+        init.iter()
+            .map(|(item, place)| (item.as_ref(), place.clone())),
+        &init_sys,
+        &ctx,
+    );
+    let rows = aterm_converge::run_scoped(
+        &bound,
+        Mode::Apply,
+        Scope::EVERY,
+        &mut NoJournal,
+        &mut |_| {},
+    )
+    .unwrap();
+    let init_row = rows
+        .iter()
+        .find(|row| row.id == "develop.checkout@~/work")
+        .unwrap();
+    assert_eq!(init_row.outcome, Outcome::Ok, "{rows:?}");
+    assert!(
+        !subcommands(&init_sys.record()).contains(&"fetch".to_owned()),
+        "{:#?}",
+        init_sys.record()
+    );
+    assert_eq!(checkout_row(&Spawns::new(&live)).outcome, Outcome::Blocked);
+
+    repos.g(&repos.work, &["remote", "set-head", "origin", "--auto"]);
+    let row = checkout_row(&Spawns::new(&live));
+    assert_eq!(
+        (row.outcome, row.to.clone()),
+        (Outcome::Ok, current.clone()),
+        "{row:?}"
+    );
+
+    repos.g(
+        &repos.work,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let row = checkout_row(&Spawns::new(&live));
+    assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+    assert!(
+        row.why.as_deref().is_some_and(|why| why
+            .starts_with("refs/remotes/origin/HEAD names origin/main, which this checkout")
+            && why.ends_with("`git -C ~/work fetch origin` records it (it asks origin once)")),
+        "{row:?}"
+    );
+    repos.g(&repos.work, &["fetch", "--quiet", "origin"]);
+    let row = checkout_row(&Spawns::new(&live));
+    assert_eq!(
+        (row.outcome, row.to.clone()),
+        (Outcome::Ok, current),
+        "{row:?}"
+    );
+    assert_eq!(repos.head(&repos.work), head);
+}
+
+/// A checkout's spelling as one shell word: plain as it is, else single-quoted after a `~/`
+/// that still expands, a quote inside closed and reopened.
+#[test]
+fn a_spelled_checkout_is_one_shell_word() {
+    assert_eq!(shell_word("~/aterm"), "~/aterm");
+    assert_eq!(shell_word("/Volumes/w/aterm-2"), "/Volumes/w/aterm-2");
+    assert_eq!(shell_word("~/my work"), "~/'my work'");
+    assert_eq!(shell_word("/Volumes/at \"x\""), "'/Volumes/at \"x\"'");
+    assert_eq!(shell_word("~/it's"), "~/'it'\\''s'");
 }

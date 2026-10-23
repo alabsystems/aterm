@@ -5529,7 +5529,9 @@ mod tests {
         assert!(prefix.is_disabled());
     }
 
+    /// Unix only: a pin is a symlink, which abrew refuses to make elsewhere.
     #[test]
+    #[cfg(unix)]
     fn cleanup_preserves_an_older_pin_foreign_versions_and_other_packages() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(temp.path());
@@ -5762,7 +5764,16 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(got, ["README", "bin/tool", "binlink"]);
         #[cfg(not(unix))]
-        assert_eq!(got, ["README", "bin/tool"]);
+        assert_eq!(
+            got,
+            [
+                "README".to_owned(),
+                std::path::Path::new("bin")
+                    .join("tool")
+                    .display()
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

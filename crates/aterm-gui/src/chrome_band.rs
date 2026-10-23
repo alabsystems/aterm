@@ -284,7 +284,7 @@ pub(crate) fn authored_of(c: &aterm_types::scheme::ChromeColors) -> AuthoredChro
 
 /// The base this thread's bands are derived on: the platform's
 /// ([`PLATFORM_BAR_BASE`]), or in a test the one
-/// [`lay_bands_on_the_theme_blend_for_test`] chose.
+/// `lay_bands_on_the_theme_blend_for_test` chose.
 fn bar_base() -> BarBase {
     #[cfg(test)]
     if let Some(base) = BAR_BASE_FOR_TEST.get() {

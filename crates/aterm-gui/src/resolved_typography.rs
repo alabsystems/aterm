@@ -67,7 +67,8 @@ pub(crate) struct ResolvedTypography {
 }
 
 /// Whether `cfg` sets the typography key `key` itself (a whole value: an
-/// empty list or a blank family counts).
+/// empty list or a blank family counts). A non-finite `line_height` or
+/// `font_size_scale` sets nothing.
 pub(crate) fn config_sets(cfg: &Config, key: ThemeKey) -> bool {
     match key {
         ThemeKey::FontFamily => cfg.font_family.is_some(),

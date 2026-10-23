@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Autonomous text-plane kitty companion ([`PetBrain`], [`PetFrame`]).
+//! Autonomous text-plane kitty companion ([`PetBrain`](crate::kitty_pet::PetBrain), [`PetFrame`](crate::kitty_pet::PetFrame)).
 
 use core::f32::consts::TAU;
 use core::time::Duration;
@@ -2434,7 +2434,8 @@ impl PetBrain {
         false
     }
 
-    /// A ghost stands ([`Self::displace_resight`]).
+    /// A ghost stands, is carried to stand, or is about to stand on own glass `glass`
+    /// ([`Self::displace_resight`]).
     #[must_use]
     #[inline]
     pub const fn has_ghost_on_glass(&self, glass: u32) -> bool {
@@ -2910,7 +2911,7 @@ impl PetBrain {
                 self.pending_vigil_pounce = vigil;
             }
             _ => {
-                // Under two seconds (or no timestamps at all): the ledger
+                // Under two seconds (or no timestamps at all): the ledger only.
                 self.content = (self.content + CHEER_FAST_CONTENT).min(1.0);
             }
         }
@@ -3029,6 +3030,15 @@ impl PetBrain {
     }
 
     /// Receive the rainbow kitty v2 per-frame offer (`rainbow_kitty::companion`).
+    ///
+    /// ```
+    /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
+    /// # use aterm_time::Instant;
+    /// # fn offer_after_tick(v2: &mut Engine, pet: &mut PetBrain, pet_frame: &PetFrame, geom: Geom, now: Instant) {
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(pet_frame, geom));
+    /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// # }
+    /// ```
     pub fn note_v2_offer(&mut self, offer: &PetOffer) -> Option<StarCatch> {
         self.mote_rgb = offer.mote_rgb;
         if let Some(at) = offer.perk_at
@@ -5636,6 +5646,7 @@ impl PetBrain {
             PetAction::Loaf
         } else if self.trick_settle == Some(Trick::Sit) {
             // Commanded seats are checked above the ladder's sleep, so a cat
+            // already past [`SLEEP_AFTER`] still wears the seat for the hold.
             PetAction::Sit
         } else if self.quiet >= SLEEP_AFTER
             && (!self.waiting_up() || self.trick_settle == Some(Trick::Sleep))
@@ -5664,7 +5675,7 @@ impl PetBrain {
                 PetAction::Sit
             }
         } else if self.action == PetAction::Waking {
-            // The wake's stretch ends in the seat it is drawn in: stood up
+            // The wake's stretch ends in the seat it is drawn in.
             PetAction::Sit
         } else {
             PetAction::Stand
@@ -7018,7 +7029,7 @@ impl PetBrain {
             return false;
         };
         if asleep || !(self.action.settled() || self.arriving()) {
-            // Kept, not dropped: the TTL above is the only thing that retires
+            // Kept, not dropped: the TTL above retires it.
             return false;
         }
         self.pending_catch = None;
@@ -7113,7 +7124,7 @@ impl PetBrain {
             return false;
         }
         if matches!(self.action, PetAction::Sleep | PetAction::Waking) {
-            // A sleeper ignores the peek — the TTL retires it; waking a cat
+            // A sleeper ignores the peek — the TTL retires it.
             return false;
         }
         self.pending_bat = None;
@@ -7975,36 +7986,30 @@ impl PetBrain {
             self.still_since = None;
             return;
         }
-        let stand = [PetGlyphId::PetStand, PetGlyphId::PetStandEar]
-            .map(|p| self.species.skin(p))
-            .contains(&frame.pose);
+        let mut stand = self.is_stand_pose(frame.pose);
         let travelling = !stand
             && matches!(
                 frame.action,
                 PetAction::Walk | PetAction::Run | PetAction::Leap | PetAction::Land
             );
-        let held_kind = self.still_held_kind();
-        let fresh = self.still_hold_fresh();
         if let Some((_, pose)) = self.still_since
             && pose != frame.pose
-            && fresh
+            && self.still_hold_fresh()
             && (matches!(
                 frame.action,
                 PetAction::Crouch | PetAction::Perk | PetAction::Startle
-            ) || (held_kind && !travelling))
+            ) || (!travelling && self.still_held_kind()))
         {
             frame.pose = pose;
             frame.scale_x = 1.0;
             frame.scale_y = 1.0;
+            stand = self.is_stand_pose(pose);
         } else if travelling || frame.action == PetAction::Crouch {
             self.still_since = None;
         } else if self.still_since.is_none_or(|(_, pose)| pose != frame.pose) {
             self.still_since = Some((self.clock, frame.pose));
             self.still_console = self.console_posed;
         }
-        let stand = [PetGlyphId::PetStand, PetGlyphId::PetStandEar]
-            .map(|p| self.species.skin(p))
-            .contains(&frame.pose);
         if stand {
             if self.stand_from.is_none() {
                 self.stand_from = Some(self.clock);
@@ -8028,13 +8033,14 @@ impl PetBrain {
             self.veil_gather = false;
             return;
         }
+        let body_rect = frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows);
         let travelling = matches!(
             frame.action,
             PetAction::Walk | PetAction::Run | PetAction::Startle | PetAction::Frolic
         );
         let cover = if travelling
             && !self.ink_spans.is_empty()
-            && let Some(rect) = frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+            && let Some(rect) = body_rect
         {
             let path = Self::path_box(rect, sense.cell_h);
             self.letter_cover(path, sense.cell_w, sense.cell_h)
@@ -8066,13 +8072,12 @@ impl PetBrain {
         let mut keep = false;
         let on_letters = match sense.caret {
             _ if self.console_executing() => Some(false),
-            Some((caret_row, _)) if frame.action.settled() => frame
-                .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row)),
+            Some((caret_row, _)) if frame.action.settled() => {
+                body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row))
+            }
             Some((caret_row, _)) if travelling && level < 1.0 => {
-                let here = frame
-                    .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                    .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                let here =
+                    body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
                 if here == Some(false) {
                     here
                 } else {
@@ -8081,9 +8086,8 @@ impl PetBrain {
                 }
             }
             Some((caret_row, _)) if in_place => {
-                let here = frame
-                    .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                    .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                let here =
+                    body_rect.map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
                 if here == Some(true) {
                     here
                 } else if veiled {
@@ -8096,9 +8100,7 @@ impl PetBrain {
             Some(caret) if flight => {
                 gather_on_letters = frame.action == PetAction::Crouch
                     && !self.hand_writing()
-                    && frame
-                        .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-                        .and_then(|rect| self.on_letters(rect, cell, caret.0))
+                    && body_rect.and_then(|rect| self.on_letters(rect, cell, caret.0))
                         == Some(true)
                     && self.landing_on_letters(sense, caret) == Some(true);
                 if gather_on_letters {
@@ -8201,7 +8203,8 @@ impl PetBrain {
         self.on_letters(rect, (sense.cell_w, sense.cell_h), caret.0)
     }
 
-    /// Whether a drawn body's box ([`INK_PAD`], [`Self::veil_over_letters`]).
+    /// Whether a drawn body's box lays its head on letterforms the console observation
+    /// certifies ([`INK_PAD`], [`Self::veil_over_letters`]).
     fn on_letters(
         &self,
         (x0, x1, y0, y1): (i32, i32, i32, i32),
@@ -8230,7 +8233,8 @@ impl PetBrain {
         (!unknown).then_some(false)
     }
 
-    /// The part of a drawn body's box ([`Self::veil_over_letters`]).
+    /// The part of a drawn body's box that travels over letters: the row its feet are on
+    /// ([`Self::veil_over_letters`]).
     #[inline]
     const fn path_box((x0, x1, y0, y1): (i32, i32, i32, i32), cell_h: u16) -> (i32, i32, i32, i32) {
         if cell_h == 0 || y1 <= y0 {
@@ -8362,27 +8366,32 @@ impl PetBrain {
     }
 
     #[inline]
+    const fn is_stand_pose(&self, pose: PetGlyphId) -> bool {
+        let p = pose as u8;
+        p == self.species.skin(PetGlyphId::PetStand) as u8
+            || p == self.species.skin(PetGlyphId::PetStandEar) as u8
+    }
+
+    #[inline]
     const fn still_held_kind(&self) -> bool {
         match self.still_since {
-            Some((_, p)) => {
-                self.still_console
-                    || p as u8 == self.species.skin(PetGlyphId::PetStand) as u8
-                    || p as u8 == self.species.skin(PetGlyphId::PetStandEar) as u8
-            }
+            Some((_, p)) => self.still_console || self.is_stand_pose(p),
             None => false,
         }
     }
 
     #[inline]
     const fn still_hold_fresh(&self) -> bool {
+        if self.still_fresh() {
+            return true;
+        }
         let flinch =
             self.console_posed && matches!(self.console_attention(), PetAttention::Contact);
-        self.still_fresh()
-            || (self.still_held_kind()
-                && !self.still_console
-                && !flinch
-                && self.stand_ends_leg
-                && self.stand_held())
+        self.still_held_kind()
+            && !self.still_console
+            && !flinch
+            && self.stand_ends_leg
+            && self.stand_held()
     }
 
     #[inline]
@@ -8558,6 +8567,7 @@ impl PetBrain {
         }
         if self.last_caret.is_none() {
             // Opaque with the caret gone: the fade-out's first tick had zero
+            // `dt`; the next one is owed.
             return true;
         }
         if self.flight.is_some()
@@ -8737,7 +8747,7 @@ impl PetBrain {
             return soon.0;
         }
         if self.action == PetAction::Sleep && q >= SLEEP_AFTER + BREATH_WINDOW {
-            // Deep sleep: byte-stable until an input, by law — the last z
+            // Deep sleep: byte-stable until an input, by law.
             return soon.0;
         }
         let h = (ART_ROWS * f32::from(self.last_cell_h.max(1))).round();

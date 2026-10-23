@@ -1,7 +1,13 @@
 // Copyright 2026 Andrew Yates
 // Copyright (c) 2018-2025 David Tolnay
 // SPDX-License-Identifier: Apache-2.0
-// Derived from inventory 0.3.24 src/lib.rs.
+//
+// Derived from inventory 0.3.24 (src/lib.rs), offered under MIT OR Apache-2.0
+// and taken here under Apache-2.0. Modified by the aterm project in 2026: the
+// nodes are typed (no `dyn` erasure and no cast back on the way out, with a
+// `T: Sync` bound on the types in place of `ErasedNode: Sync`), the link
+// pointers are atomics, a node links at most once, and a target with no
+// constructor section is a compile error rather than an empty registry.
 
 //! Link-time collection: the distributed slice behind [`crate::xref`] and `aterm_spec::xref`.
 
@@ -16,6 +22,26 @@ pub trait Collect: Sync + Sized + 'static {
 }
 
 /// The head of one type's list.
+///
+/// # Examples
+///
+/// ```
+/// use aterm_spec_anchor::registry::{Node, Registry};
+/// use std::sync::atomic::AtomicU32;
+/// static R: Registry<AtomicU32> = Registry::new();
+/// R.submit(Box::leak(Box::new(Node::new(AtomicU32::new(0)))));
+/// assert_eq!(R.iter().count(), 1);
+/// ```
+///
+/// `T: Sync` is part of the type, so a `static` registry of a `Cell` does not compile:
+///
+/// ```compile_fail,E0277
+/// use aterm_spec_anchor::registry::{Node, Registry};
+/// use std::cell::Cell;
+/// static R: Registry<Cell<u32>> = Registry::new();
+/// R.submit(Box::leak(Box::new(Node::new(Cell::new(0)))));
+/// assert_eq!(R.iter().count(), 1);
+/// ```
 pub struct Registry<T: Sync + 'static> {
     head: AtomicPtr<Node<T>>,
 }
@@ -120,7 +146,7 @@ macro_rules! __registry_collect {
     };
 }
 
-/// `submit!(T => value)`.
+/// `submit!(T => value)`: collect `value` into `T`'s list when the image loads.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __registry_submit {

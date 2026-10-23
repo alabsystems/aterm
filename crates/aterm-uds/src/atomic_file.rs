@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FILES, WRITTEN THE CAREFUL WAY: the one writer of a whole file ([`write`], [`write_checked`]) and aterm.toml's writer ([`ConfigFile`]), which the config service's protocol binds `aterm fabric on|off` and `aterm fleet init|join|leave` to, so each of them and the window are two writers of one file rather than two files.
+//! FILES, WRITTEN THE CAREFUL WAY.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 
 /// Write `bytes` to `path` with `mode`, whole ([`write_checked`] with no check).
 /// # Errors
-/// No entropy for the temporary name, a clash on every name tried, or a write's own error; `path` is left as it was.
+/// No entropy for the temporary name, a clash on every name tried, or a write's own error; `path`
+/// is left as it was.
 pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_checked(path, bytes, mode, || Ok(()))
 }
 
-/// Write `bytes` to `path` with `mode`: its directory made, a temp beside it ([`create_temp_beside`]) written, its mode set on the descriptor, synced, then `check` run, then renamed over `path`, and the directory synced (best effort: the file is in place either way).
+/// Write `bytes` to `path` with `mode`.
 /// # Errors
-/// As [`write`], and `check`'s error.
+/// As [`fn@write`], and `check`'s error.
 pub fn write_checked(
     path: &Path,
     bytes: &[u8],
@@ -30,8 +31,6 @@ pub fn write_checked(
     let result = (|| {
         f.write_all(bytes)?;
         f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-        // The full flush (`F_FULLFSYNC` on Apple), which only a test's process tree that asked
-        // takes as a plain `fsync(2)`; whether this writer needs less is the Ordered tier's to say.
         astream_sys::full_sync(&f)?;
         drop(f);
         check()?;
@@ -53,14 +52,13 @@ pub fn write_checked(
     }
 }
 
-/// A NEW file beside `path` to write it through: `.<name>.tmp.<pid>.<8 hex>`, opened `O_CREAT|O_EXCL` (`create_new`) with `mode`.
+/// A NEW file beside `path` to write it through.
 /// # Errors
 /// No entropy for the name, a clash on every try, or the create's own error.
 pub fn create_temp_beside(path: &Path, mode: u32) -> io::Result<(PathBuf, std::fs::File)> {
     create_temp_salted(path, mode, crate::rand::hex_token::<4>)
 }
 
-/// [`create_temp_beside`] with each try's salt from `salt`, which the tests script.
 fn create_temp_salted(
     path: &Path,
     mode: u32,
@@ -93,7 +91,7 @@ fn create_temp_salted(
     ))
 }
 
-/// `O_NOFOLLOW | O_NONBLOCK` (std adds `O_CLOEXEC`), the flags the config service opens its lock with: a link planted at the lock's name is refused, not followed, and a FIFO is not waited on.
+/// `O_NOFOLLOW | O_NONBLOCK` (std adds `O_CLOEXEC`).
 #[cfg(target_vendor = "apple")]
 pub const LOCK_OPEN_FLAGS: i32 = 0x0100 | 0x0004;
 /// arm and arm64 Linux spell `O_NOFOLLOW` 0o100000 ([`crate::ownerlock`]).
@@ -104,37 +102,14 @@ pub const LOCK_OPEN_FLAGS: i32 = 0o100_000 | 0o4000;
     not(any(target_arch = "aarch64", target_arch = "arm"))
 ))]
 pub const LOCK_OPEN_FLAGS: i32 = 0o400_000 | 0o4000;
-/// No audited values: the pre-open check and the descriptor check of the config write lock still refuse anything at the lock's name that is not a regular file.
+/// No audited values.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub const LOCK_OPEN_FLAGS: i32 = 0;
 
 /// How long an edit waits for the config service's write lock.
 pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
 
-/// aterm.toml, read for one edit and written the way the config service
-/// writes a Settings save (`aterm-gui`'s `native_document_host`: read by
-/// `read_config_atomic_file` with no lock, then `commit_atomic_bytes` under
-/// it):
-///
-/// - A FINAL-FILE LINK IS FOLLOWED, NOT REPLACED. aterm.toml may be a link into
-///   a dotfiles checkout, a layout the service binds and keeps. The text, the
-///   `.bak` and the rename all land at the file the link names; a rename over
-///   the link itself (what [`write`] does to a cap or key file, on purpose)
-///   would turn it into a local copy every later save went to.
-/// - THE SERVICE'S WRITE LOCK IS TAKEN FOR A WRITE, NEVER A READ
-///   ([`Self::lock`]): `.<target name>.aterm-write.lock` beside the target,
-///   opened no-follow, `flock` exclusive. A run that changes nothing creates
-///   and holds nothing, so a no-op through a link into a directory nobody may
-///   write (home-manager's into `/nix/store`) still reads `already`. A
-///   Settings save that meets the lock retries for about half a second — its
-///   25 ms lock budget inside a 500 ms preflight retry — and then fails as
-///   busy, so the hold is the write alone: the `.bak` and the text, never the
-///   parse or a line printed to a pipe nobody drains.
-/// - NOTHING IS WRITTEN OVER BYTES THAT CHANGED since they were read: checked
-///   under the lock before the `.bak` (an older `.bak` is not replaced for an
-///   edit that never lands) and again just before the rename, so a writer
-///   that ignores the lock (an editor) makes the edit refuse rather than have
-///   its change reverted.
+/// aterm.toml, read for one edit and written the way the config service writes a Settings save.
 pub struct ConfigFile {
     /// The file the text lives in: the config path, or what a link there names.
     target: PathBuf,
@@ -142,26 +117,19 @@ pub struct ConfigFile {
     before: Option<(Vec<u8>, u32)>,
 }
 
-/// A [`ConfigFile`] under the config service's write lock, for one [`Self::replace`]; the lock is let go when that returns.
+/// A [`ConfigFile`] under the config service's write lock.
 pub struct ConfigEdit<'a> {
     file: &'a ConfigFile,
     _lock: ConfigWriteLock,
 }
 
-/// The config service's write lock on one config file, let go by `LOCK_UN`
-/// before the close (`clippy.toml`'s flock release rule): a child forked
-/// while it is held keeps a copy of the descriptor until it execs, and a lock
-/// released by the close alone would stay taken on that copy.
 struct ConfigWriteLock(std::fs::File);
 
 impl ConfigWriteLock {
-    /// Take the lock beside `target`, waiting up to [`CONFIG_LOCK_WAIT`].
     fn take(target: &Path) -> io::Result<Self> {
         Self::take_within(target, CONFIG_LOCK_WAIT, || {})
     }
 
-    /// [`Self::take`], waiting up to `wait` and calling `busy` each time the lock is found
-    /// held before waiting again (the tests let go of their holder there).
     fn take_within(target: &Path, wait: Duration, mut busy: impl FnMut()) -> io::Result<Self> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let name = target
@@ -233,7 +201,8 @@ impl Drop for ConfigWriteLock {
 impl ConfigFile {
     /// Read `config` for an edit.
     /// # Errors
-    /// A link at `config` that names no file (it is not written through to a file nobody made), or the read's own error.
+    /// A link at `config` that names no file (it is not written through to a file nobody made), or
+    /// the read's own error.
     pub fn open(config: &Path) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt as _;
         let target = match std::fs::symlink_metadata(config) {
@@ -273,7 +242,7 @@ impl ConfigFile {
             .transpose()
     }
 
-    /// Take the config service's write lock for a write, waiting up to [`CONFIG_LOCK_WAIT`]; the target's directory is made first (a first edit writes a file nobody made).
+    /// Take the config service's write lock for a write.
     /// # Errors
     /// The lock held past the wait or not takeable, or the directory's own error.
     pub fn lock(&self) -> io::Result<ConfigEdit<'_>> {
@@ -288,7 +257,6 @@ impl ConfigFile {
 
     /// `Ok` while the target holds the bytes [`Self::open`] read.
     /// # Errors
-    ///
     /// It changed — or appeared, or went — since; or the read's own error.
     fn unchanged(&self) -> io::Result<()> {
         let now = match std::fs::read(&self.target) {
@@ -307,9 +275,11 @@ impl ConfigFile {
 }
 
 impl ConfigEdit<'_> {
-    /// Replace the text, keeping what was read as `<target>.bak` (only when something was there), and answer the `.bak`.
+    /// Replace the text.
     /// # Errors
-    /// The target's bytes changed since [`ConfigFile::open`] read them — found before the `.bak` is written, or before the rename — or a write's own error; in every case the target is left as it is.
+    /// The target's bytes changed since [`ConfigFile::open`] read them — found before the `.bak` is
+    /// written, or before the rename — or a write's own error; in every case the target is left as
+    /// it is.
     pub fn replace(self, text: &str) -> io::Result<Option<PathBuf>> {
         let file = self.file;
         file.unchanged()?;

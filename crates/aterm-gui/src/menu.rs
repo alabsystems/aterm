@@ -226,7 +226,9 @@ pub(crate) enum MenuAction {
     SplitVertical,
     /// Split the focused pane top/bottom (`split_focused_pane(Horizontal)`).
     SplitHorizontal,
-    /// Toggle matrix rain for the front session of the frontmost window (`App::toggle_matrix_rain`)
+    /// Toggle matrix rain for the front session of the frontmost window
+    /// (`App::toggle_matrix_rain`): a per-session override of `[matrix_rain]`, either way, until
+    /// the session ends.
     ToggleMatrixRain,
     /// Promote the front window's promotable kitty.
     FavouriteKitty,

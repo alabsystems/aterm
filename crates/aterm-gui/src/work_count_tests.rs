@@ -187,15 +187,13 @@ fn a_steady_title_gate_walks_no_tab() {
 fn an_idle_events_wake_touches_no_retained_record() {
     use crate::subscribe::digest_fixture::DigestFixture;
     const TARGETS: usize = 4;
+    let floor = aterm_slog::row_floor(crate::session_log::ring_limits()).records;
     let mut f = DigestFixture::build(TARGETS, 2 * 1000, 2 * crate::turn_ledger::LEDGER_CAP, {
-        aterm_slog::MAX_RECORDS + crate::session_timeline::TIMELINE_CAP
+        aterm_slog::MAX_RECORDS + floor
     });
     let (blocks, turns, rows, lost) = f.retained();
     assert!(
-        blocks >= 1000
-            && turns == crate::turn_ledger::LEDGER_CAP
-            && rows >= crate::session_timeline::TIMELINE_CAP
-            && lost > 0,
+        blocks >= 1000 && turns == crate::turn_ledger::LEDGER_CAP && rows >= floor && lost > 0,
         "the fixture must saturate every ledger and the view: {blocks}/{turns}/{rows}/{lost}"
     );
     let _ = work_counts::take_retained_records_touched();

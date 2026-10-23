@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`FakeHost`]: in-memory [`ReleaseHost`] for producer tests.
+//! [`FakeHost`](crate::host::fake::FakeHost): in-memory [`ReleaseHost`] for producer tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

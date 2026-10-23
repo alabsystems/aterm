@@ -1,23 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Linux's descriptor tables, read from a procfs: the kernel's (`/proc`) in production, a
-//! scratch tree in a test, so these reads run on any Unix. They answer the file holder scan
-//! ([`super::scan_file_holders`]) and a process's open files ([`super::open_files`]).
+//! Linux's descriptor tables (`<proc>/<pid>/fd`), answering [`super::scan_file_holders`] and
+//! [`super::open_files`] from `/proc` in production or a scratch tree in tests.
 //!
-//! A table is `<proc>/<pid>/fd`, each entry a link the kernel follows to what the
-//! descriptor holds. A `stat` through it names the file's device and inode, and its text
-//! names a path, or `pipe:[…]`, `socket:[…]` or `anon_inode:…` for what is no file.
-//!
-//! Two kinds of process keep their table from this process although `<proc>/<pid>` is this
-//! uid's, and the kernel marks both by making the table root's (`task_dump_owner` in
-//! `fs/proc/base.c`):
-//! * a zombie, which holds nothing: its descriptors closed at its exit ([`Table::Exited`]);
-//! * a live process no same-uid reader may inspect, a non-dumpable one: `ssh-agent`, which
-//!   makes itself so (`PR_SET_DUMPABLE`), or one exec'd from a set-id program
-//!   ([`Table::Sealed`]). Only root learns its descriptors, `lsof` run as this uid included.
-//!
-//! Any other refusal leaves the table unknown ([`Table::Unreadable`]).
+//! Two kinds of same-uid process have root-owned tables (`task_dump_owner` in `fs/proc/base.c`):
+//! zombies holding nothing ([`Table::Exited`]), and non-dumpable live processes such as
+//! `ssh-agent` ([`Table::Sealed`]); any other refusal is [`Table::Unreadable`].
 
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
@@ -30,9 +19,7 @@ use super::HolderScan;
 #[cfg(target_os = "linux")]
 pub(super) const PROC: &str = "/proc";
 
-/// How long a scan may take before its answer is unknown: a `stat` through a descriptor's
-/// link waits on that file's filesystem, which on a hung network or FUSE mount never answers.
-/// `lsof`, which the harness ran before this scan, ran under the same deadline.
+/// How long a scan may take before a hung mount makes its answer unknown.
 #[cfg(target_os = "linux")]
 pub(super) const SCAN_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -49,29 +36,32 @@ pub(super) enum Table {
     Unreadable(io::Error),
 }
 
-/// How a process that is no longer running reads in `<proc>/<pid>/stat` and `status`.
+/// What `<proc>/<pid>/stat` and `status` establish about a process's life.
 #[derive(Debug, PartialEq, Eq)]
-enum Ended {
+enum ProcessState {
     /// No `stat`: the process has been reaped since it was listed.
     Reaped,
-    /// A zombie (`Z`) or dead (`X`) task that is its process's only thread.
+    /// A zombie (`Z`) or dead (`X`/`x`) task that is its process's only thread.
     Zombie,
     /// A zombie thread-group leader whose other threads still run and share its table.
     LeaderOnly,
+    /// A task in a known live state.
+    Live,
 }
 
-/// Whether the process at `dir` has ended, by its state in `stat` (the letter after the
-/// command's closing parenthesis) and its thread count in `status`; `None` when it runs or
-/// its `stat` cannot be read.
-fn ended(dir: &Path) -> Option<Ended> {
+/// The process's state (the letter after `stat`'s closing parenthesis) and, for a zombie or
+/// dead task, its thread count in `status`; `None` when either required read is unknown.
+fn process_state(dir: &Path) -> Option<ProcessState> {
     let stat = match std::fs::read_to_string(dir.join("stat")) {
         Ok(stat) => stat,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Ended::Reaped),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(ProcessState::Reaped),
         Err(_) => return None,
     };
     let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
-    if !matches!(state, 'Z' | 'X') {
-        return None;
+    match state {
+        'Z' | 'X' | 'x' => {}
+        'R' | 'S' | 'D' | 'T' | 't' | 'W' | 'K' | 'P' | 'I' => return Some(ProcessState::Live),
+        _ => return None,
     }
     let threads = std::fs::read_to_string(dir.join("status"))
         .ok()
@@ -81,10 +71,11 @@ fn ended(dir: &Path) -> Option<Ended> {
                 .find_map(|l| l.strip_prefix("Threads:"))
                 .and_then(|n| n.trim().parse::<u32>().ok())
         });
-    Some(match threads {
-        Some(n) if n > 1 => Ended::LeaderOnly,
-        _ => Ended::Zombie,
-    })
+    match threads {
+        Some(1) => Some(ProcessState::Zombie),
+        Some(n) if n > 1 => Some(ProcessState::LeaderOnly),
+        _ => None,
+    }
 }
 
 /// `<proc>/<pid>`'s descriptor table.
@@ -92,13 +83,12 @@ pub(super) fn table(proc: &Path, pid: u32) -> Table {
     let dir = proc.join(pid.to_string());
     let refused = match std::fs::read_dir(dir.join("fd")) {
         Ok(fds) => return Table::Listed(fds),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Table::Exited,
         Err(e) => e,
     };
-    match ended(&dir) {
-        Some(Ended::Reaped | Ended::Zombie) => return Table::Exited,
-        Some(Ended::LeaderOnly) => return Table::Unreadable(refused),
-        None => {}
+    match process_state(&dir) {
+        Some(ProcessState::Reaped | ProcessState::Zombie) => return Table::Exited,
+        Some(ProcessState::LeaderOnly) | None => return Table::Unreadable(refused),
+        Some(ProcessState::Live) => {}
     }
     let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid());
     match (owner(&dir.join("fd")), owner(&dir)) {
@@ -111,7 +101,8 @@ pub(super) fn table(proc: &Path, pid: u32) -> Table {
     }
 }
 
-/// Every pid under `proc` whose directory `me` owns.
+/// Every pid under `proc` that runs as effective uid `me`, judged by its directory's owner
+/// and, for a directory `me` does not own, its status ([`super::ours_by_owner`]).
 ///
 /// # Errors
 ///
@@ -121,7 +112,13 @@ pub(super) fn uid_pids_in(proc: &Path, me: u32) -> io::Result<Vec<u32>> {
         .flatten()
         .filter_map(|entry| {
             let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            (std::fs::metadata(entry.path()).ok()?.uid() == me).then_some(pid)
+            let owner = std::fs::metadata(entry.path()).ok()?.uid();
+            let effective = || {
+                crate::process::read_proc_text(&entry.path().join("status"))
+                    .ok()
+                    .and_then(|status| crate::process::procfs::effective_uid(&status))
+            };
+            super::ours_by_owner(owner, me, effective).then_some(pid)
         })
         .collect())
 }
@@ -135,9 +132,8 @@ enum Read {
     Unreadable,
 }
 
-/// Whether `table` holds the file `key`: an entry whose link names a path (what is no file
-/// names none, and is skipped unread) and whose `stat` is that device and inode. An entry
-/// closed since the listing holds nothing; any other failure leaves it unknown.
+/// Whether `table` holds the file `key` by device and inode (`NotFound` on a closed entry is
+/// clear; any other failure is unknown).
 fn holds(table: Table, key: (u64, u64)) -> Read {
     let fds = match table {
         Table::Listed(fds) => fds,
@@ -343,13 +339,9 @@ mod tests {
         crate::peer::our_uid()
     }
 
-    /// THE HOLDERS ARE READ FROM EACH TABLE BY THE FILE'S DEVICE AND INODE: a process with a
-    /// descriptor on the file (beside a pipe and a device) holds it, through another link
-    /// too; one on another file, one closed since the listing and a zombie hold nothing; a
-    /// live process whose table the kernel keeps from this uid (non-dumpable: `ssh-agent`)
-    /// is sealed, which `lsof` run as this uid could not read either. NEGATIVE CONTROLS: a
-    /// table refused for any other reason, and a zombie leader whose threads still run, are
-    /// unknown, never clear.
+    /// Holders are read from each table by device and inode; non-dumpable live processes are
+    /// sealed, zombies and reaped processes are clear, and other refused or missing tables are
+    /// unknown.
     #[test]
     fn a_tables_holders_are_its_descriptors_on_the_file() {
         let sealed = roots_own();
@@ -395,6 +387,14 @@ mod tests {
         );
         process(&proc, 108, 'S', 1, Some(&[(5, &alias_s)]), &sealed);
         process(&proc, 109, 'S', 1, Some(&[(5, &lock_s)]), &sealed);
+        for (pid, state, threads) in [(110, 'Z', 3), (111, 'S', 1), (112, 'Z', 1), (113, 'Z', 3)] {
+            process(&proc, pid, state, threads, Some(&[]), &sealed);
+            std::fs::remove_dir(proc.join(pid.to_string()).join("fd")).unwrap();
+        }
+        std::fs::remove_file(proc.join("113/status")).unwrap();
+        process(&proc, 114, 'Z', 3, None, &sealed);
+        std::fs::remove_file(proc.join("114/status")).unwrap();
+        process(&proc, 115, '?', 1, None, &sealed);
         std::fs::create_dir(proc.join("self")).unwrap();
 
         let mut scan = scan_file_holders_in(&proc, me(), &lock, &[109]).expect("scan");
@@ -405,8 +405,14 @@ mod tests {
         }
         assert_eq!(scan.holders, [101, 108], "{scan:?}");
         assert_eq!(scan.sealed, [104], "{scan:?}");
-        assert_eq!(scan.unreadable, [105, 106], "{scan:?}");
-        assert_eq!(scan.scanned, 8, "109 skipped, `self` no pid");
+        assert_eq!(
+            scan.unreadable,
+            [105, 106, 110, 111, 113, 114, 115],
+            "{scan:?}"
+        );
+        assert_eq!(scan.scanned, 14, "109 skipped, `self` no pid");
+        assert!(matches!(table(&proc, 112), Table::Exited), "a lone zombie");
+        assert!(matches!(table(&proc, 299), Table::Exited), "reaped");
         let by_other = scan_file_holders_in(&proc, me(), &other, &[]).expect("scan");
         assert!(by_other.holders.contains(&102) && !by_other.holders.contains(&101));
         assert!(scan_file_holders_in(&proc, me(), &files.join("absent"), &[]).is_err());
@@ -416,11 +422,9 @@ mod tests {
         );
     }
 
-    /// A PROCESS'S OPEN FILES ARE THE PATHS ITS TABLE'S LINKS NAME, in descriptor order and
-    /// with no `stat` (so no mount is waited on): what is no file names none, and one closed
-    /// since the listing names nothing. A zombie has exited (`NotFound`, as macOS answers),
-    /// and a sealed table is refused (`PermissionDenied`). NEGATIVE CONTROL: a table refused
-    /// for another reason is that refusal, never an empty list.
+    /// Open files are the paths a table's links name in descriptor order without `stat`;
+    /// zombies return `NotFound`, sealed tables `PermissionDenied`, and other refusals their
+    /// own error.
     #[test]
     fn a_processs_open_files_are_the_paths_its_links_name() {
         let sealed = roots_own();
@@ -466,8 +470,8 @@ mod tests {
         );
     }
 
-    /// A READ THAT DOES NOT ANSWER IN TIME IS UNKNOWN, NOT A WAIT WITHOUT END: a read held
-    /// past the deadline answers `TimedOut`, and the same read let go answers its own answer.
+    /// A read held past the deadline returns `TimedOut`, and one that finishes returns its
+    /// result.
     #[test]
     fn a_scan_that_does_not_answer_in_time_is_unknown() {
         let (go, wait) = std::sync::mpsc::channel::<()>();

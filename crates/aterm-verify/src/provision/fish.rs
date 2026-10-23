@@ -123,7 +123,8 @@ pub(super) fn build(
         "building fish {version}: targo --unverified build --release --locked \
          --no-default-features (FISH_BUILD_DOCS=0 PCRE2_SYS_STATIC=1), a few minutes"
     ));
-    host.run(&spawn)
+    let scratch = scratch
+        .run_build(host, &spawn)
         .map_err(|e| format!("the fish {version} build failed: {e}"))?;
     let built = target.join("release/fish");
     if !built.is_file() {

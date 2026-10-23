@@ -1,7 +1,15 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Derived from skrifa 0.46.2 and read-fonts 0.43.2 (see ../../LICENSE-FONTATIONS).
+//
+// Derived from skrifa 0.46.2 src/outline/glyf/mod.rs, src/outline/glyf/outline.rs
+// and src/outline/glyf/memory.rs, and from read-fonts 0.43.2
+// src/tables/glyf.rs, src/tables/loca.rs, src/tables/hmtx.rs and
+// generated/generated_glyf.rs, and modified by the aterm project in 2026:
+// FreeType's unscaled `glyf` loader (the path skrifa's autohinter loads its
+// outlines through), without the TrueType interpreter, the scaled paths or the
+// metrics it does not reach, every read checked.
+// See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Unscaled TrueType `glyf` outline loader for the autohinter.
 
@@ -578,7 +586,8 @@ pub(crate) struct Tables<'a> {
 }
 
 impl<'a> Outlines<'a> {
-    /// Returns `None` if `loca`, `glyf`, `hhea`, or `hmtx` is missing or invalid.
+    /// Returns `None` if `head` is short, or `loca`, `glyf`, `hhea`, or `hmtx` is missing or
+    /// invalid.
     pub(crate) fn new(tables: &Tables<'a>) -> Option<Self> {
         if tables.head.len() < 54 {
             return None;

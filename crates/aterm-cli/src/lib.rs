@@ -526,7 +526,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned), past crashes and the packages (`aterm pkg doctor`'s view), and fix what aterm can (the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link, exec roots and stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; --json prints every row in the one report schema; --only <id,...> narrows to those items, families or layers; exits 0 only when all selected checks are satisfied or not applicable; unresolved plans, manual steps, blocked or deferred work, unknown state and failed changes exit 1; the shell is always checked. On macOS the fleet settings profile is settings-only: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
+        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned), past crashes and the packages (`aterm pkg doctor`'s view), on a develop machine the develop items `aterm init --develop` converges (read only and offline: each recorded checkout against origin as last fetched, its submodule and its tools), and fix what aterm can (the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link, exec roots and stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; --json prints every row in the one report schema; --only <id,...> narrows to those items, families or layers; exits 0 only when all selected checks are satisfied or not applicable; unresolved plans, manual steps, blocked or deferred work, unknown state and failed changes exit 1; the shell is always checked. On macOS the fleet settings profile is settings-only: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
     ),
     ("list-fonts", "List available font families, one per line."),
     (
@@ -1047,7 +1047,7 @@ struct DoctorRow {
 }
 
 /// The macOS consent facts behind the `privacy:` row, gathered by [`privacy_facts`] and
-/// passed into the pure [`doctor_checks_with_origin`] like the shell check.
+/// passed into the pure [`doctor_rows`] like the shell check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrivacyFacts {
     /// The instance's Full Disk Access state, from one prompt-free probe.

@@ -1,6 +1,13 @@
 // Copyright (c) Erick Tryzelaar, David Tolnay et al. (the serde authors)
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Derived from serde_derive 1.0.228 src/de.rs (see ../LICENSE-MIT and ../LICENSE-APACHE).
+//
+// Derived from serde_derive 1.0.228 src/de.rs and modified by the aterm
+// project in 2026: templates over std proc_macro instead of quote, and only
+// the paths aterm's attribute set reaches (no remote, getter, from/try_from,
+// identifier enums, `borrow`, `bound`, `expecting`, adjacent tagging, or
+// variant-level skip/with/untagged; `deserialize_in_place` is off upstream by
+// default and absent here).
+// See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -555,7 +562,7 @@ fn effective_style(variant: &Variant) -> Style {
     }
 }
 
-/// True if there is any field with a `#[serde(flatten)]` attribute.
+/// True if any field not skipped in deserializing has a `#[serde(flatten)]` attribute.
 fn has_flatten(fields: &[Field]) -> bool {
     fields
         .iter()

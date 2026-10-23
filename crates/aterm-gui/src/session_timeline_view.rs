@@ -133,14 +133,6 @@ impl ViewCopy {
     /// walked from the newest down to the reader's id only: a read costs
     /// the rows it is shown, never the log's whole ring.
     pub(crate) fn of(log: &Log, after: Option<u64>, keep: usize) -> ViewCopy {
-        Self::walk(log, after, keep, true)
-    }
-
-    /// [`Self::of`], counted as a reader's walk (`counted`: a test's work
-    /// count, `crate::work_counts`) or not (the debug cross-check's).
-    fn walk(log: &Log, after: Option<u64>, keep: usize, counted: bool) -> ViewCopy {
-        #[cfg(not(test))]
-        let _ = counted;
         let head = log.row_head();
         let after = after.filter(|&a| a <= head);
         let from = after.unwrap_or(0);
@@ -155,9 +147,7 @@ impl ViewCopy {
                 break;
             }
             #[cfg(test)]
-            if counted {
-                crate::work_counts::retained_record_touched();
-            }
+            crate::work_counts::retained_record_touched();
             let (a, b) = (row.id.max(lo + 1), last.min(head));
             if b >= a {
                 held += b - a + 1;
@@ -181,7 +171,7 @@ impl ViewCopy {
     }
 
     /// The rows, oldest first, formatted by the grammar ([`rows_of`]) and
-    /// cut by the ring's rule ([`clamp_payload`]).
+    /// cut by the timeline payload rule ([`clamp_payload`]).
     pub(crate) fn rows(&self) -> Vec<TimelineEvent> {
         let mut out = Vec::new();
         for (first, mono, rec) in &self.recs {
@@ -203,6 +193,19 @@ impl ViewCopy {
     }
 }
 
+/// `text` without a trailing `%` escape its field's cap cut (`%` or `%h`):
+/// a row's text is its writer's pct-encoded payload, held to the field's
+/// encoded length ([`aterm_slog::Key::RowText`]), which knows no `%XX`, so
+/// the row keeps [`clamp_payload`]'s rule that no escape is bisected.
+fn whole_escapes(text: &str) -> &str {
+    let b = text.as_bytes();
+    match b {
+        [.., b'%'] => &text[..b.len() - 1],
+        [.., b'%', h] if h.is_ascii_hexdigit() => &text[..b.len() - 2],
+        _ => text,
+    }
+}
+
 /// The view's rows newest first, as `(kind, process-clock ms)`: the tab
 /// chrome's tail (`session_chrome::timeline_tail`), which stops at the rows
 /// it keeps, so the walk goes no further than that.
@@ -213,86 +216,6 @@ pub(crate) fn newest_first(log: &Log) -> impl Iterator<Item = (&'static str, u64
             .rev()
             .map(move |(kind, _)| (kind, row.mono))
     })
-}
-
-/// THE RING HELD TO THE VIEW (a debug build's check, not a gate), by each
-/// kind's rule, over what both hold:
-///
-/// - **Exact** (every kind but `program-state`): the view's rows from its
-///   newest hole up (ids the log issued and no longer holds,
-///   [`aterm_slog::Log::rows_lost_between`]) are the ring's newest rows of
-///   those kinds, whole payload, in order, newest aligned: the ring keeps
-///   its newest 512, the log its own floor, so the shorter of the two is
-///   held. The `human` rows the log's burst marks still owe the ring
-///   (`owed`, paid at the ring's next row) stand at the ring's end, and a
-///   ring row after the session close (one the closed log refused) is no
-///   row of the view.
-/// - **Retention** (`program-state`): the view's newest row is the
-///   ring's newest, unless a coalesced state is `pending` in its run's
-///   bucket (written later).
-///
-/// A view whose newest rows the log no longer holds has nothing to align,
-/// and passes. `Err` names the first disagreement.
-#[cfg(debug_assertions)]
-pub(crate) fn ring_against_view<'r>(
-    ring: impl Iterator<Item = &'r TimelineEvent>,
-    owed: u32,
-    log: &Log,
-    pending: bool,
-) -> Result<(), String> {
-    use crate::session_timeline::{HUMAN, PROGRAM_STATE};
-    let whole = ViewCopy::walk(log, None, 0, false).rows();
-    if log.rows_lost_between(whole.last().map_or(0, |e| e.id), log.row_head()) > 0 {
-        return Ok(());
-    }
-    let start = (1..whole.len())
-        .rev()
-        .find(|&i| log.rows_lost_between(whole[i - 1].id, whole[i].id - 1) > 0)
-        .unwrap_or(0);
-    let view: Vec<(&str, &str)> = whole[start..]
-        .iter()
-        .map(|e| (e.kind, &*e.payload))
-        .collect();
-    let mut ring: Vec<(&str, &str)> = ring.map(|e| (e.kind, &*e.payload)).collect();
-    if let Some(end) = ring
-        .iter()
-        .rposition(|r| *r == ("state-change", "state=closed"))
-    {
-        ring.truncate(end + 1);
-    }
-    ring.extend((0..owed).map(|_| (HUMAN, "")));
-    let ve: Vec<(&str, &str)> = view
-        .iter()
-        .copied()
-        .filter(|r| r.0 != PROGRAM_STATE)
-        .collect();
-    let re: Vec<(&str, &str)> = ring
-        .iter()
-        .copied()
-        .filter(|r| r.0 != PROGRAM_STATE)
-        .collect();
-    let k = ve.len().min(re.len());
-    let (ve, re) = (&ve[ve.len() - k..], &re[re.len() - k..]);
-    if let Some(i) = (0..k).rev().find(|&i| ve[i] != re[i]) {
-        return Err(format!(
-            "the view's row {} from its newest {:?} is not the ring's {:?}",
-            k - i,
-            ve[i],
-            re[i]
-        ));
-    }
-    if !pending {
-        let v = view.iter().rev().find(|r| r.0 == PROGRAM_STATE);
-        let r = ring.iter().rev().find(|r| r.0 == PROGRAM_STATE);
-        if let (Some(v), Some(r)) = (v, r)
-            && v != r
-        {
-            return Err(format!(
-                "the view's newest program row {v:?} is not the ring's {r:?}"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// A field of a record, as text (`-` when it is not set).
@@ -382,7 +305,7 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
             )
         }
         Kind::Human if f.get_word(Key::Why) == Some("mail") => return None,
-        Kind::Human => ("human", String::new()),
+        Kind::Human => (crate::session_timeline::HUMAN, String::new()),
         Kind::Title => (
             crate::session_timeline::TITLE_CHANGE,
             format!(
@@ -544,7 +467,7 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
         // A row the log holds as its row alone; a token no kind spells is no row.
         Kind::Row => (
             row_kind(f.get_str(Key::RowKind)?)?,
-            f.get_str(Key::RowText).unwrap_or("").to_string(),
+            whole_escapes(f.get_str(Key::RowText).unwrap_or("")).to_string(),
         ),
         Kind::Handoff => ("handoff", handoff_row(f)),
         Kind::Render => ("render", render_row(f)),

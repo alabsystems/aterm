@@ -74,6 +74,45 @@ impl Toolchain {
         cmd
     }
 
+    /// The `--remap-path-prefix` that names this toolchain's own library sources (rustup's
+    /// `rust-src` component, where it is installed) by the path its standard library was built
+    /// at, `/rustc/<commit>`: with `rust-src` present, rustc otherwise writes those sources' host
+    /// path into what it builds from them.
+    /// # Errors
+    /// This toolchain's `rustc` could not say its sysroot or its commit.
+    pub fn std_source_remap(&self) -> Result<String, String> {
+        let ask = |args: &[&str]| -> Result<String, String> {
+            let mut cmd = command(&self.rustc);
+            if let Some((var, value)) = self.loader_env() {
+                cmd.env(var, value);
+            }
+            let out = cmd
+                .args(args)
+                .output_owned()
+                .map_err(|e| format!("could not run {} ({e})", self.rustc.display()))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "`{} {}` exited {:?}",
+                    self.rustc.display(),
+                    args.join(" "),
+                    out.status.code()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let sysroot = ask(&["--print", "sysroot"])?;
+        let version = ask(&["-vV"])?;
+        let commit = version
+            .lines()
+            .find_map(|line| line.strip_prefix("commit-hash: "))
+            .ok_or_else(|| format!("`{} -vV` names no commit-hash", self.rustc.display()))?;
+        Ok(format!(
+            "--remap-path-prefix={}/lib/rustlib/src/rust=/rustc/{}",
+            sysroot.trim(),
+            commit.trim()
+        ))
+    }
+
     /// The library search variable a rustup proxy hands the drivers it runs.
     #[must_use]
     pub fn loader_env(&self) -> Option<(&'static str, OsString)> {

@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Anonymous `curl` transport for GitHub release assets and vendor-direct endpoints.
-//!
-//! * [`head_no_redirect`] probes unmetered `github.com/…/releases/…` redirects.
-//! * [`vendor_get`], [`vendor_content_length`], and [`vendor_download_to`] fetch byte-capped HTTPS
-//!   vendor artifacts with conditional ETag support.
+//! Outbound HTTP requests for updater checks and downloads.
 
 use aterm_uds::spawnfd::Command;
 use std::path::Path;
@@ -17,8 +13,7 @@ pub enum HttpError {
     Transport(String),
     /// The `-w`-appended status trailer was not a number.
     Malformed(String),
-    /// A status the vendor lane ([`vendor_get`], [`vendor_content_length`],
-    /// [`vendor_download_to`]) does not accept.
+    /// An HTTP status the vendor lane does not accept.
     VendorStatus { code: u16, url: String },
     /// A vendor-lane verdict about the request or the document, returned on the first attempt.
     VendorRefused(String),
@@ -39,10 +34,10 @@ impl std::fmt::Display for HttpError {
 
 /// The `curl` binary: the absolute `/usr/bin/curl` on unix, so a `PATH` shim cannot stand in.
 #[cfg(not(windows))]
-const CURL_BIN: &str = "/usr/bin/curl";
+pub(crate) const CURL_BIN: &str = "/usr/bin/curl";
 
 #[cfg(windows)]
-const CURL_BIN: &str = "curl.exe";
+pub(crate) const CURL_BIN: &str = "curl.exe";
 
 /// `ATERM_DEV_CURL`.
 pub const CURL_SEAM: &str = "ATERM_DEV_CURL";
@@ -54,8 +49,7 @@ fn curl_bin() -> std::ffi::OsString {
         .unwrap_or_else(|| CURL_BIN.into())
 }
 
-/// Build curl's full parameter list (everything after the binary name): `-q` first, the
-/// caller's options, the fixed User-Agent, and last `--` and the URL.
+/// Builds curl's parameter list with `-q`, caller options, User-Agent, and `--` before `url`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_argv(args: &[&str], url: &str) -> Vec<String> {
     let mut v = Vec::with_capacity(args.len().min(32) + 7);
@@ -71,8 +65,7 @@ fn curl_argv(args: &[&str], url: &str) -> Vec<String> {
     v
 }
 
-/// Build the argv-and-env part of the curl process for every lane; [`curl_fetch`] adds the
-/// stdio.
+/// Builds the argv and environment of the curl process for `url`.
 pub(crate) fn curl_command(args: &[&str], url: &str) -> Command {
     let mut command = aterm_uds::spawnfd::command(curl_bin());
     command
@@ -82,8 +75,7 @@ pub(crate) fn curl_command(args: &[&str], url: &str) -> Command {
     command
 }
 
-/// Run curl against `url` with extra `args`, anonymously, with `/dev/null` for stdin. Callers
-/// never put `--` in `args`: [`curl_argv`] places it before the URL, after every option.
+/// Runs curl anonymously against `url` with `args` and `/dev/null` for stdin.
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
     use aterm_uds::spawnfd::Stdio;
@@ -95,20 +87,13 @@ fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> 
         .map_err(|e| format!("spawn curl: {e}"))
 }
 
-/// How many times a request whose body is captured from curl's stdout is attempted (one try
-/// plus two retries, as `--retry 2` would spend).
+/// Number of attempts for requests whose body is captured from curl's stdout.
 const CURL_ATTEMPTS: u32 = 3;
 
-/// How long this process holds a link down once a request spent every attempt reaching no
-/// host ([`attempt_again`]): a pass's lanes ask within seconds of one another, and a verdict
-/// older than this is asked afresh, retries and all.
+/// Duration for which the process holds a link down after exhausting attempts reaching no host.
 const LINK_DOWN_HOLDS: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// When a request in this process last spent its attempts on a link that reached no host,
-/// until a request reaches one: ONE offline verdict for every lane of the process, so a
-/// second request on a dead link — the set completion's resolve after the pass's own, on an
-/// offline first launch — is answered by its first attempt instead of paying the same backoff
-/// again ([`attempt_again`]).
+/// Timestamp when a request in this process last spent its attempts on an unreachable link.
 static LINK_DOWN_SINCE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// What an attempt says of the link ([`link_after`]).
@@ -122,10 +107,7 @@ enum Link {
     Unknown,
 }
 
-/// How far an attempt's connection got, as its `-w` trailer's `%{time_appconnect}` says
-/// ([`handshake_in`]): every lane is https, so a TLS handshake that finished is a host that
-/// answered, and none is a connection that never got past the name, the route or a proxy's
-/// tunnel.
+/// TLS handshake progress reported by a `-w` trailer's `%{time_appconnect}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Handshake {
     /// The TLS handshake finished.
@@ -136,9 +118,7 @@ enum Handshake {
     Unknown,
 }
 
-/// What the LAST token of a `-w` trailer — `%{time_appconnect}`, seconds — says of the
-/// handshake: zero is none, a positive time one that finished, anything else unknown (a
-/// trailer that ends on another field).
+/// Parses handshake progress from the last token (`%{time_appconnect}`) of `trailer`.
 fn handshake_in(trailer: &str) -> Handshake {
     match trailer
         .split_whitespace()
@@ -151,17 +131,12 @@ fn handshake_in(trailer: &str) -> Handshake {
     }
 }
 
-/// Whether curl's `exit` says it reached no host at all: the proxy or the host name did not
-/// resolve (5, 6), or no route led to it, or nothing answered the connect (7) — or the
-/// connect bound expired before any TLS handshake finished (28, [`Handshake::NotDone`]): a
-/// name that never resolves, a dropped SYN, a proxy that never opens the tunnel.
+/// Returns whether curl's `exit` and `handshake` indicate that no host was reached.
 fn reached_no_host(exit: Option<i32>, handshake: Handshake) -> bool {
     matches!(exit, Some(5..=7)) || (exit == Some(28) && handshake == Handshake::NotDone)
 }
 
-/// What attempt `attempt` of a request's `attempts`, ended with curl's `exit` after
-/// `handshake`, says of the link, and whether another attempt is worth its backoff —
-/// `known_down` when this process already holds the link down.
+/// Classifies link reachability and whether another attempt should run.
 fn link_after(
     exit: Option<i32>,
     handshake: Handshake,
@@ -183,9 +158,7 @@ fn link_after(
     }
 }
 
-/// [`link_after`] over this process's verdict ([`LINK_DOWN_SINCE`]), which it updates: whether
-/// a request makes another attempt after attempt `attempt` of its `attempts` ended with
-/// `exit` after `handshake`.
+/// Updates [`LINK_DOWN_SINCE`] and returns whether the request should make another attempt.
 #[cfg_attr(trust_verify, trust::skip)]
 fn attempt_again(exit: Option<i32>, handshake: Handshake, attempt: u32, attempts: u32) -> bool {
     let mut since = LINK_DOWN_SINCE
@@ -209,9 +182,7 @@ pub fn note_link_down() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
 }
 
-/// The pause before attempt `attempt` of a request: curl's own `--retry` backoff, kept
-/// by every lane that retries in-process — nothing before the first attempt, 1 s before
-/// the second, 2 s before the third.
+/// Returns the backoff duration before `attempt`.
 fn backoff_before(attempt: u32) -> std::time::Duration {
     let production = match attempt {
         0 | 1 => return std::time::Duration::ZERO,
@@ -232,15 +203,12 @@ fn back_off_before(attempt: u32) {
     }
 }
 
-/// Whether an HTTP status is worth another in-process attempt: the transient server-side set
-/// curl calls retryable (`--retry`), minus 429, where a retry without honouring `Retry-After`
-/// only hits a throttle already refusing; every caller backs off to its next cycle instead.
+/// Returns whether HTTP status `code` is a transient server-side error worth retrying.
 fn transient_status(code: &str) -> bool {
     matches!(code, "408" | "500" | "502" | "503" | "504")
 }
 
-/// What a redirect-refusing HEAD came back with: the status and the `Location` header, if
-/// any.
+/// HTTP status and optional `Location` header from a redirect-refusing HEAD request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadAnswer {
     /// The HTTP status of the first hop (no redirect is followed).
@@ -249,9 +217,7 @@ pub struct HeadAnswer {
     pub location: Option<String>,
 }
 
-/// The option list for [`head_no_redirect`]. `-I` asks for headers only; `--max-redirs 0`
-/// stops at the first hop (pinning the intent against a later `-L`); headers and the `-w`
-/// status trailer land on stdout.
+/// Option list for [`head_no_redirect`].
 const fn head_args() -> [&'static str; 10] {
     head_args_with_timeout("30")
 }
@@ -292,9 +258,7 @@ fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<Head
     head_attempts(url, args, 1, attempts)
 }
 
-/// What the first attempt of a [`head_no_redirect`] came to, apart from its retries
-/// ([`head_no_redirect_again`]), so a caller asking several HEADs at once reads the link
-/// from every first attempt before any of them backs off.
+/// Outcome of the first attempt of [`head_no_redirect`], separated from its retries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstHead {
     /// Settled on that attempt.
@@ -342,8 +306,7 @@ fn head_attempts(
     }
 }
 
-/// Attempt `attempt` of a HEAD's `attempts`: settled, or worth another. Never
-/// [`FirstHead::Again`] on the last.
+/// Runs attempt `attempt` of `attempts` for a HEAD request.
 #[cfg_attr(trust_verify, trust::skip)]
 fn head_attempt(url: &str, args: &[&str], attempt: u32, attempts: u32) -> FirstHead {
     let last = attempt >= attempts;
@@ -414,8 +377,7 @@ fn location_header(headers: &str) -> Option<String> {
     found
 }
 
-/// Reject any asset URL that is not plain `https://…`: a `file://` or `ftp://` value would
-/// turn the downloader into a local-file or SSRF read.
+/// Rejects any asset URL that does not use the `https://` scheme.
 fn require_https_url(url: &str) -> Result<(), String> {
     if url.starts_with("https://") {
         Ok(())
@@ -424,8 +386,7 @@ fn require_https_url(url: &str) -> Result<(), String> {
     }
 }
 
-/// The option list for [`download_bytes`], extracted so the flag set is assertable in
-/// a unit test.
+/// Option list for [`download_bytes`].
 const fn download_bytes_args(cap: &str) -> [&str; 11] {
     [
         "-fsSL",
@@ -484,8 +445,7 @@ pub fn download_error_is_rate_limit(error: &str) -> bool {
     error.contains(RATE_LIMIT_ERROR_PREFIX)
 }
 
-/// The prefix of a web-host 404 error (`classify_asset_failure`), so a caller holding only the
-/// string can tell a missing asset from a broken download.
+/// Prefix of a web-host 404 error (`classify_asset_failure`).
 const NOT_FOUND_ERROR_PREFIX: &str = "HTTP 404";
 
 /// Whether a [`download_bytes`] / [`download_to`] error is the web host's 404 verdict.
@@ -506,14 +466,12 @@ pub fn download_error_is_local_write(error: &str) -> bool {
     .any(|words| error.contains(words))
 }
 
-/// Whether an HTTP status on `url` is GitHub telling this client to slow down, per host: 429
-/// anywhere, 403 only on `api.github.com`.
+/// Returns whether HTTP status `code` on `url` indicates a GitHub rate limit.
 fn rate_limit_shaped(url: &str, code: u16) -> bool {
     code == 429 || (code == 403 && crate::cdn::is_api_host(url))
 }
 
-/// The verdict a `-f` failure carries, if any: a rate limit on either host, or a web-host
-/// 403/404.
+/// Classifies a `-f` curl failure into a rate-limit or web-host 403/404 verdict.
 fn classify_asset_failure(url: &str, stderr: &str) -> Option<String> {
     let code = curl_http_error_code(stderr)?;
     if rate_limit_shaped(url, code) {
@@ -535,8 +493,7 @@ fn classify_asset_failure(url: &str, stderr: &str) -> Option<String> {
     }
 }
 
-/// The HTTP status curl reports for a `-f` failure ("The requested URL returned
-/// error: 429" — the exit is 22 for every 4xx/5xx, so the code lives in the text).
+/// Extracts the HTTP status code curl reports for a `-f` failure.
 #[must_use]
 fn curl_http_error_code(stderr: &str) -> Option<u16> {
     let idx = stderr.find("returned error: ")?;
@@ -551,9 +508,6 @@ pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
 #[cfg(test)]
 const _: () = assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000);
 
-/// The wall-clock backstop for a file-sink download, derived from the size cap: a fixed
-/// 600 s would demand ~10 Mbit/s for a 775 MB container and fail a slower machine at the same
-/// wall every cycle.
 fn download_max_time_secs(max_filesize: u64) -> u64 {
     (max_filesize / 65_536).clamp(600, 21_600)
 }
@@ -571,9 +525,6 @@ pub fn download_to(asset_url: &str, dest: &Path, max_filesize: u64) -> Result<()
     .map_err(|e| e.to_string())
 }
 
-/// The `.part` sibling a resumable download writes into: the destination file name with
-/// `.part` appended, never `Path::with_extension` (which would turn `trust-5520.tar.zst` into
-/// `trust-5520.tar.part`), so it still names the asset and its build.
 fn part_path(dest: &Path) -> Option<std::path::PathBuf> {
     let name = dest.file_name()?;
     let mut part = name.to_os_string();
@@ -610,14 +561,10 @@ const fn resume_plan(existing: u64, max_filesize: u64) -> ResumePlan {
     }
 }
 
-/// Whether a failed attempt's prefix is worth keeping: only if the attempt moved the file
-/// forward.
 const fn keep_partial(before: u64, after: u64) -> bool {
     after > before
 }
 
-/// Whether a failed attempt's prefix survives: [`keep_partial`]'s anti-wedge rule, except
-/// after a web-host 403/404.
 fn keep_partial_after_failure(url: &str, stderr: &str, before: u64, after: u64) -> bool {
     if keep_partial(before, after) {
         return true;
@@ -625,9 +572,6 @@ fn keep_partial_after_failure(url: &str, stderr: &str, before: u64, after: u64) 
     !crate::cdn::is_api_host(url) && matches!(curl_http_error_code(stderr), Some(403 | 404))
 }
 
-/// Whether a failed attempt died on the range itself: curl exit 33 (`CURLE_RANGE_ERROR`, the
-/// server will not resume) or an HTTP 416 through `--fail` (the upstream object shrank or was
-/// clobbered).
 fn range_refused(exit_code: Option<i32>, stderr: &str) -> bool {
     exit_code == Some(33) || curl_http_error_code(stderr) == Some(416)
 }
@@ -644,7 +588,6 @@ enum StallBound {
 }
 
 impl StallBound {
-    /// The `--speed-time` value.
     const fn secs(self) -> &'static str {
         match self {
             Self::Quick => "8",
@@ -652,10 +595,6 @@ impl StallBound {
         }
     }
 
-    /// The bound for the attempt after one that moved `moved` bytes in `took`: quick while
-    /// the attempt beat curl's 4 KiB/s floor on average, stalled minutes included; patient
-    /// once it did not — a body held back by a scanning proxy, a trickle, or a link that
-    /// moved nothing.
     fn after(moved: u64, took: std::time::Duration) -> Self {
         if u128::from(moved) * 1000 >= 4096 * took.as_millis() {
             Self::Quick
@@ -665,12 +604,8 @@ impl StallBound {
     }
 }
 
-/// curl's TCP keepalive for a resumable attempt (`--keepalive-time`, seconds idle before the
-/// first probe and between probes).
 const RESUME_KEEPALIVE_SECS: &str = "2";
 
-/// The option list for one attempt of a FILE download ([`download_to_resumable`],
-/// [`download_to`]), extracted so the flag set is assertable in a unit test.
 fn download_resume_args<'a>(
     cap: &'a str,
     max_time: &'a str,
@@ -706,10 +641,8 @@ fn download_resume_args<'a>(
     args
 }
 
-/// The `https`-only pin for the VENDOR lane, prepended to [`download_resume_args`].
 const HTTPS_ONLY_ARGS: [&str; 2] = ["--proto", "=https"];
 
-/// [`download_resume_args`] with the initial-request scheme pinned to `https` as well.
 fn download_resume_args_https_only<'a>(
     cap: &'a str,
     max_time: &'a str,
@@ -734,8 +667,6 @@ enum NextAttempt {
     Stop,
 }
 
-/// [`NextAttempt`] for an attempt that ended with curl's `exit` and `stderr`, having moved
-/// the `.part` or not ([`keep_partial`]).
 fn next_attempt(exit: Option<i32>, stderr: &str, moved: bool) -> NextAttempt {
     if filesize_exceeded(exit, stderr) || download_error_is_local_write(stderr) {
         NextAttempt::Stop
@@ -750,27 +681,15 @@ fn next_attempt(exit: Option<i32>, stderr: &str, moved: bool) -> NextAttempt {
     }
 }
 
-/// How many times one download continues its file after an attempt that moved less than
-/// [`RESUME_EARNED_AT`] ([`resume_allowed`]): a host that cuts every attempt after a few
-/// bytes is never asked in a loop.
 const SHORT_RESUMES_PER_CALL: u32 = 16;
 
-/// What an attempt must move for the resume after it to spend none of
-/// [`SHORT_RESUMES_PER_CALL`] ([`resume_allowed`]).
 const RESUME_EARNED_AT: u64 = 1 << 20;
 
-/// Whether a download continues its file once more ([`NextAttempt::Resume`]) after an
-/// attempt that moved `moved` bytes, having resumed `short` times after attempts that moved
-/// less than [`RESUME_EARNED_AT`] and `all` times in all, toward a cap of `cap` bytes.
 fn resume_allowed(moved: u64, short: u32, all: u32, cap: u64) -> bool {
     let budget = u64::from(SHORT_RESUMES_PER_CALL).saturating_add(cap / RESUME_EARNED_AT);
     u64::from(all) < budget && (moved >= RESUME_EARNED_AT || short < SHORT_RESUMES_PER_CALL)
 }
 
-/// Empty the file a download's attempts write, so the next attempt begins at byte 0: the
-/// `.part` is removed, and `dest` ([`Sink::Dest`]) — its caller's file, made with the caller's
-/// mode and flags (the Linux updater creates it `0600` with `O_NOFOLLOW`) — is cut to nothing
-/// in place.
 fn clear_sink(file: &Path, sink: Sink) {
     match sink {
         Sink::Part => {
@@ -987,32 +906,20 @@ pub(crate) const VENDOR_ENV_SCRUB: [&str; 6] = [
     "CURL_SSL_BACKEND",
 ];
 
-/// How many redirects a vendor request may follow (real chains are one hop or none; curl's
-/// default is 50).
 const VENDOR_MAX_REDIRS: &str = "5";
 
-/// The longest ETag this lane stores or sends back.
 const ETAG_MAX: usize = 256;
 
-/// The smallest `--max-filesize` a vendor GET hands curl. curl applies it to every hop's
-/// Content-Length, redirects included (a 150-byte 302 body under a 64-byte cap is exit 63),
-/// so curl's cap is a backstop and the exact bound is [`read_capped`]'s, on the final body.
 const VENDOR_CURL_CAP_FLOOR: u64 = 16 * 1024;
 
-/// The `--max-filesize` for a vendor GET whose document cap is `cap`.
 fn vendor_curl_cap(cap: u64) -> u64 {
     cap.max(VENDOR_CURL_CAP_FLOOR)
 }
 
-/// Whether a failed curl run hit `--max-filesize`: exit 63 when the size is known up front,
-/// exit 56 with this message when crossed mid-transfer (curl 8.7.1).
 fn filesize_exceeded(exit: Option<i32>, stderr: &str) -> bool {
     exit == Some(63) || stderr.contains("Maximum file size exceeded")
 }
 
-/// The curl exits that recur on every attempt and are about the host, not the network: 1 (a
-/// hop that is not https), 47 (too many redirects), 51/60 (a certificate that does not
-/// verify).
 fn vendor_curl_refusal(exit: Option<i32>, stderr: &str, url: &str) -> Option<HttpError> {
     let why = match exit? {
         1 => "a hop that is not https",
@@ -1026,16 +933,10 @@ fn vendor_curl_refusal(exit: Option<i32>, stderr: &str, url: &str) -> Option<Htt
     )))
 }
 
-/// Whether `etag` may ride an `If-None-Match` header: 1..=[`ETAG_MAX`] bytes of visible
-/// ASCII (RFC 9110 `entity-tag` has no space or control byte), so a stored value can
-/// never inject a header line.
 fn etag_ok(etag: &str) -> bool {
     !etag.is_empty() && etag.len() <= ETAG_MAX && etag.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// The value of header `name` in the last block of a header capture (a redirect chain writes
-/// one block per hop), trimmed; `None` when absent, empty, or given twice with different
-/// values in that block.
 fn last_block_header(headers: &str, name: &str) -> Option<String> {
     let mut found: Option<String> = None;
     let mut conflict = false;
@@ -1060,13 +961,10 @@ fn last_block_header(headers: &str, name: &str) -> Option<String> {
     if conflict { None } else { found }
 }
 
-/// The response ETag from a vendor header capture, only when [`etag_ok`] admits it.
 fn etag_header(headers: &str) -> Option<String> {
     last_block_header(headers, "etag").filter(|e| etag_ok(e))
 }
 
-/// The final hop's `Content-Length`: all ASCII digits, and never zero — the value is used
-/// as a `--max-filesize` cap, where curl reads `0` as "no limit".
 fn content_length_header(headers: &str) -> Option<u64> {
     let value = last_block_header(headers, "content-length")?;
     if !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -1075,8 +973,6 @@ fn content_length_header(headers: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
-/// Split the vendor GET's `-w` trailer (`<http_code> <url_effective> <time_appconnect>`, the
-/// last read by [`handshake_in`]).
 fn vendor_trailer(stdout: &str) -> Option<(u16, String)> {
     let (code, rest) = stdout.trim().split_once(' ')?;
     let url = match rest.rsplit_once(' ') {
@@ -1090,8 +986,6 @@ fn vendor_trailer(stdout: &str) -> Option<(u16, String)> {
     Some((code, url.to_string()))
 }
 
-/// One finished vendor-lane curl run: its exit code (`None` when a signal ended it),
-/// stdout and stderr.
 struct CurlRun<'a> {
     exit: Option<i32>,
     stdout: &'a str,
@@ -1099,7 +993,6 @@ struct CurlRun<'a> {
 }
 
 impl CurlRun<'_> {
-    /// The transport failure a run that exhausted its attempts reports.
     fn failure(&self, verb: &str, url: &str) -> HttpError {
         let exit = self
             .exit
@@ -1120,8 +1013,6 @@ enum Step<T> {
     Done(Result<T, HttpError>),
 }
 
-/// One vendor GET attempt's decision, from its curl run and this attempt's header dump;
-/// `body` reads the capped body, called only for a 200.
 fn vendor_get_step(
     run: &CurlRun<'_>,
     headers: &str,
@@ -1172,9 +1063,6 @@ fn vendor_get_step(
     })
 }
 
-/// One vendor HEAD attempt's decision. stdout is every hop's headers, then a newline and
-/// the final status and handshake time (the `-w` trailer); only the last hop's
-/// `Content-Length` counts.
 fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
     if run.exit != Some(0) {
         if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
@@ -1212,9 +1100,6 @@ fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
     }))
 }
 
-/// The verdict a failed vendor-direct payload run carries, when it is one: over the cap,
-/// a [`vendor_curl_refusal`], or a `-f` status (exit 22) that no retry changes — anything
-/// but 408, 429 and 5xx.
 fn vendor_download_verdict(
     exit: Option<i32>,
     stderr: &str,
@@ -1245,29 +1130,18 @@ struct VendorBounds {
     attempts: u32,
 }
 
-/// A document the lane needs: its whole transfer patient, and retried. Its connect is bounded
-/// as the web lane's small requests are ([`SMALL_CONNECT_SECS`]): a vendor host that answers
-/// connects in well under a second, and a name that never resolved held each of a pass's
-/// document reads for 93 s (three 30 s connects and the sleeps between them) — on a first
-/// run, the whole announcement behind one of them.
 const LANE_BOUNDS: VendorBounds = VendorBounds {
     connect_secs: SMALL_CONNECT_SECS,
     max_secs: "60",
     attempts: CURL_ATTEMPTS,
 };
 
-/// A head read as a hint ([`vendor_get_hint`]): one short attempt, because the caller asks
-/// again on its own cadence.
 const HINT_BOUNDS: VendorBounds = VendorBounds {
     connect_secs: "5",
     max_secs: "15",
     attempts: 1,
 };
 
-/// The option list for [`vendor_get`]. https on the first hop and every redirect, a bounded
-/// redirect count, `bounds`' connect and wall-clock limits, curl's own size cap, the body
-/// and the header dump into the caller's private scratch files, and the status, effective
-/// URL and handshake time on stdout.
 fn vendor_get_args<'a>(
     bounds: VendorBounds,
     cap: &'a str,
@@ -1304,9 +1178,6 @@ fn vendor_get_args<'a>(
     args
 }
 
-/// The option list for [`vendor_content_length`]: a HEAD that follows redirects under the
-/// same https pins and bounds as [`vendor_get_args`]; every hop's headers land on stdout,
-/// followed by the final status.
 const fn vendor_head_args() -> [&'static str; 15] {
     [
         "-sS",
@@ -1327,8 +1198,6 @@ const fn vendor_head_args() -> [&'static str; 15] {
     ]
 }
 
-/// The vendor-lane curl process: the anonymous argv (`-q` first, `--` before the URL,
-/// never a credential channel) with [`VENDOR_ENV_SCRUB`] removed from its environment.
 fn vendor_command(args: &[&str], url: &str) -> Command {
     let mut command = curl_command(args, url);
     for var in VENDOR_ENV_SCRUB {
@@ -1360,7 +1229,6 @@ impl VendorScratch {
     }
 
     /// [`Self::new`] named `aterm-{label}-…` (the REST lane's is `github`).
-    // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn labelled(label: &str) -> Result<Self, String> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1397,8 +1265,6 @@ impl Drop for VendorScratch {
     }
 }
 
-/// Read at most `cap` bytes of `path`, the body fetched from `url`; more is a verdict
-/// about the document.
 fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
     use std::io::Read;
     let file = match std::fs::File::open(path) {
@@ -1424,7 +1290,8 @@ fn read_capped(path: &Path, cap: u64, url: &str) -> Result<Vec<u8>, HttpError> {
 /// that is not a visible-ASCII ETag (before any spawn), a document over its cap, or a
 /// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for any status but 200 and a
 /// conditional 304; [`HttpError::Malformed`] for an unreadable trailer; and
-/// [`HttpError::Transport`] only when the network failed all three attempts.
+/// [`HttpError::Transport`] for everything else, a network that failed every attempt
+/// included.
 pub fn vendor_get(
     url: &str,
     cap: u64,
@@ -1512,9 +1379,9 @@ fn vendor_get_within(
 /// # Errors
 /// [`HttpError::VendorRefused`] for a non-https URL (before any spawn) or a
 /// [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a final status other than
-/// 200; [`HttpError::Malformed`] for a final hop with no single positive numeric
-/// `Content-Length`; [`HttpError::Transport`] only when the network failed all three
-/// attempts.
+/// 200; [`HttpError::Malformed`] for an unreadable status or a final hop with no single
+/// positive numeric `Content-Length`; [`HttpError::Transport`] for everything else, a
+/// network that failed every attempt included.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
     require_https_url(url).map_err(HttpError::VendorRefused)?;
@@ -1567,8 +1434,6 @@ mod tests {
         format!("curl: (22) The requested URL returned error: {code}")
     }
 
-    /// Per host: on the API host a 403 is the rate limit; on the web host a 403 is a blocked
-    /// host, a 404 a missing asset, and only 429 a throttle.
     #[test]
     fn a_rate_limited_asset_fetch_is_named_and_a_broken_one_is_not() {
         assert_eq!(super::curl_http_error_code(&curl_err(429)), Some(429));
@@ -1637,7 +1502,6 @@ mod tests {
     };
     use aterm_uds::spawnfd::Command;
 
-    /// `-q` leads, and `--` comes after every option and immediately before the URL.
     #[test]
     fn argv_puts_q_first_and_end_of_options_right_before_the_url() {
         const URL: &str = "https://github.com/o/r/releases/download/v1.0.0/a.toml";
@@ -1673,7 +1537,6 @@ mod tests {
         );
     }
 
-    /// The spawned program + argv, as owned strings.
     fn argv_of(command: &Command) -> Vec<String> {
         command
             .get_args()
@@ -1681,7 +1544,6 @@ mod tests {
             .collect()
     }
 
-    /// The download ceiling scales with the size cap (64 KiB/s floor), clamped to 600 s..6 h.
     #[test]
     fn the_download_ceiling_is_derived_from_the_size_cap() {
         assert_eq!(download_max_time_secs(775_000_000), 11_825);
@@ -1691,7 +1553,6 @@ mod tests {
         assert_eq!(download_max_time_secs(0), 600);
     }
 
-    /// The asset download bounds the connect and the stall, with a derived wall clock.
     #[test]
     fn the_asset_download_bounds_the_stall_not_the_transfer() {
         let cap = RELEASE_ASSET_DOWNLOAD_BOUND.to_string();
@@ -1723,10 +1584,6 @@ mod tests {
         assert!(!args.contains(&"--"), "no caller-side `--`: {args:?}");
     }
 
-    /// NO lane lets curl retry. On a pipe curl cannot truncate what a failed attempt already
-    /// wrote, so a retried capture returns the failed attempt's bytes CONCATENATED in front
-    /// of the good ones under a single `-w` status trailer — a blip curl had recovered from,
-    /// read as a malformed answer.
     #[test]
     fn no_lane_lets_curl_retry() {
         assert!(
@@ -1749,7 +1606,6 @@ mod tests {
         }
     }
 
-    /// Only the transient server-side set is retried in process; 429 is excluded.
     #[test]
     fn only_transient_server_statuses_are_retried_in_process() {
         for code in ["408", "500", "502", "503", "504"] {
@@ -1762,11 +1618,6 @@ mod tests {
             );
         }
     }
-    /// ONE OFFLINE VERDICT, NOT ONE PER REQUEST. A request that reaches no host (the name or
-    /// the proxy does not resolve, nothing answers the connect) retries with its backoff while
-    /// the link is not known down, and holds it down once its last attempt fails the same way
-    /// (a one-attempt hint never holds it down on its own word); a request after it on the
-    /// dead link stops at its first such failure.
     #[test]
     fn a_link_known_down_is_not_paid_for_twice() {
         for no_host in [5, 6, 7] {
@@ -1818,9 +1669,6 @@ mod tests {
         }
     }
 
-    /// A connect bound that expired before any TLS handshake finished reached no host, as a
-    /// name that does not resolve does: its request retries only while the link is not known
-    /// down, and holds it down once it spent its retries.
     #[test]
     fn a_connect_that_never_finished_reached_no_host() {
         use super::handshake_in;
@@ -1855,7 +1703,6 @@ mod tests {
         }
     }
 
-    /// Only the vendor lane carries an `If-None-Match`.
     #[test]
     fn only_the_vendor_lane_asks_conditionally() {
         let cap = "1024";
@@ -1896,8 +1743,6 @@ mod tests {
         assert_eq!(conditional.len(), plain.len() + 2, "exactly one `-H` pair");
     }
 
-    /// The vendor GET pins https on every hop, bounds redirects and time, caps the size, and
-    /// carries no credential channel, `-f` or `--retry`; `--` comes last before the URL.
     #[test]
     fn the_vendor_get_argv_pins_https_bounds_and_carries_no_credential() {
         const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
@@ -1950,8 +1795,6 @@ mod tests {
         );
     }
 
-    /// The vendor HEAD follows redirects under the same pins and bounds, reads headers
-    /// only, and ends on the status trailer.
     #[test]
     fn the_vendor_head_argv_follows_redirects_under_the_same_pins() {
         let args = super::vendor_head_args();
@@ -1974,8 +1817,6 @@ mod tests {
         }
     }
 
-    /// The vendor child drops the CA-trust overrides and the TLS backend switch beside the
-    /// curlrc redirections; the GitHub lanes keep theirs.
     #[test]
     fn the_vendor_child_env_drops_the_ca_overrides() {
         let removed = |command: &Command| -> Vec<String> {
@@ -2006,9 +1847,6 @@ mod tests {
         assert!(!github.iter().any(|k| k == "SSL_CERT_FILE"), "{github:?}");
     }
 
-    /// An ETag is sendable only as visible ASCII, so a stored value can never inject a
-    /// header line; the reader takes the last hop's, case-insensitively, and drops one it
-    /// could not send back.
     #[test]
     fn etags_are_read_from_the_last_hop_and_only_well_formed_ones_survive() {
         for good in [
@@ -2044,8 +1882,6 @@ mod tests {
         );
     }
 
-    /// The final hop's Content-Length, only as one positive decimal: a zero would reach
-    /// curl as an unlimited `--max-filesize`, and two different values are ambiguous.
     #[test]
     fn the_content_length_is_the_final_hops_single_positive_decimal() {
         let chain = "HTTP/2 302\r\ncontent-length: 0\r\nlocation: https://x/\r\n\r\n\
@@ -2072,7 +1908,6 @@ mod tests {
         );
     }
 
-    /// The `-w` trailer: a numeric code and an https effective URL, or nothing.
     #[test]
     fn the_vendor_trailer_yields_a_code_and_an_https_effective_url() {
         assert_eq!(
@@ -2103,7 +1938,6 @@ mod tests {
         }
     }
 
-    /// A finished run for the step tests: exit 0 unless given, empty stderr.
     fn run<'a>(exit: Option<i32>, stdout: &'a str, stderr: &'a str) -> super::CurlRun<'a> {
         super::CurlRun {
             exit,
@@ -2112,14 +1946,10 @@ mod tests {
         }
     }
 
-    /// The body reader a step must not call.
     fn no_body() -> Result<Vec<u8>, HttpError> {
         panic!("the body is read only for a 200")
     }
 
-    /// 200 keeps the body with the last hop's ETag and the effective URL; a conditional 304
-    /// keeps a validator (its own ETag, else the one sent); an unconditional 304 and every
-    /// other status are the host's refusal.
     #[test]
     fn a_vendor_get_attempt_answers_body_not_modified_or_the_status() {
         use super::{Step, VendorResponse, vendor_get_step};
@@ -2228,9 +2058,6 @@ mod tests {
         );
     }
 
-    /// Only the network is retried, and only while attempts remain: a transient status or
-    /// a transport exit retries, the last attempt reports it as `Transport`, and a size
-    /// verdict or a curl refusal is final on the first attempt and never `Transport`.
     #[test]
     fn a_vendor_get_attempt_retries_only_the_network() {
         use super::{Step, vendor_get_step};
@@ -2280,9 +2107,6 @@ mod tests {
         }
     }
 
-    /// One HEAD attempt: the trailer is split off the last line, only the final hop's
-    /// Content-Length counts, the network is retried while attempts remain, and a curl
-    /// refusal is final.
     #[test]
     fn a_vendor_head_attempt_reads_the_final_hop_under_the_trailer() {
         use super::{Step, vendor_head_step};
@@ -2335,8 +2159,6 @@ mod tests {
         ));
     }
 
-    /// A payload failure is a verdict when no retry changes it — over the cap, a curl
-    /// refusal, a `-f` status other than 408/429/5xx — and a transport failure otherwise.
     #[test]
     fn a_vendor_payload_failure_is_a_verdict_only_when_it_recurs() {
         use super::vendor_download_verdict as verdict;
@@ -2370,8 +2192,6 @@ mod tests {
         assert_eq!(verdict(None, "", URL, 9), None);
     }
 
-    /// A non-https URL, a zero cap and an injecting If-None-Match are refused before spawning
-    /// as verdicts, never `Transport` (which callers read as offline).
     #[test]
     fn the_vendor_lane_refuses_before_spawning() {
         const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
@@ -2398,7 +2218,6 @@ mod tests {
         assert!(!dest.exists(), "a refusal writes nothing");
     }
 
-    /// Both of curl's spellings of "over the cap" are a verdict, and nothing else is.
     #[test]
     fn only_the_size_cap_is_read_as_a_size_verdict() {
         assert!(super::filesize_exceeded(Some(63), ""));
@@ -2417,8 +2236,6 @@ mod tests {
         assert!(!super::filesize_exceeded(None, ""));
     }
 
-    /// The body bound is exact: `cap` bytes are kept, `cap + 1` refused, and a missing
-    /// file (curl writes none for an empty body) is an empty document.
     #[test]
     fn the_vendor_body_read_is_capped_exactly() {
         let scratch = super::VendorScratch::new().expect("scratch dir");
@@ -2445,8 +2262,6 @@ mod tests {
         assert!(!dir.exists(), "the scratch dir is removed on drop");
     }
 
-    /// The web-lane steady-state request: headers only, one hop, no `-f`, `-L` or credential
-    /// channel, and `--` last before the URL.
     #[test]
     fn the_head_argv_stops_at_the_first_hop_and_carries_no_credential() {
         let args = head_args();
@@ -2481,8 +2296,6 @@ mod tests {
         assert!(err.to_string().contains("non-https"), "{err}");
     }
 
-    /// The HEAD lanes and the small-document GET bound the connect apart from the wall clock,
-    /// as an option ahead of the `--` that guards the URL.
     #[test]
     fn the_small_lanes_bound_the_connect_ahead_of_the_url_guard() {
         let small = super::download_bytes_args("5000000");
@@ -2500,8 +2313,6 @@ mod tests {
         }
     }
 
-    /// The `Location` reader takes the last block's value, case-insensitively and trimmed,
-    /// and nothing for an absent or empty header.
     #[test]
     fn the_location_header_is_read_from_the_kept_hop() {
         assert_eq!(
@@ -2524,7 +2335,6 @@ mod tests {
         assert_eq!(location_header(""), None);
     }
 
-    /// The part sibling appends `.part`, keeping the build-bearing name.
     #[test]
     fn the_part_sibling_appends_and_keeps_the_build_bearing_name() {
         let p = part_path(std::path::Path::new("/s/trust-5520.tar.zst")).unwrap();
@@ -2536,8 +2346,6 @@ mod tests {
         assert_eq!(part_path(std::path::Path::new("/")), None);
     }
 
-    /// `offset + remaining_cap` always equals the caller's total bound, the anti-disk-fill
-    /// guard.
     #[test]
     fn the_total_byte_bound_survives_every_resume_offset() {
         const TOTAL: u64 = 8 << 30;
@@ -2559,8 +2367,6 @@ mod tests {
         }
     }
 
-    /// A FRESH transfer carries no `--continue-at` — no `Range` for a server to mishandle —
-    /// and a resumed one adds exactly the offset.
     #[test]
     fn only_a_resumed_attempt_carries_a_range() {
         let quick = StallBound::Quick;
@@ -2591,11 +2397,6 @@ mod tests {
         );
     }
 
-    /// THE FILE LANES' FLAG SET (the resumable lanes and the app container's). A silent drop
-    /// ends at curl's stall bound and keepalive, and every later ALab download waits behind
-    /// it: an attempt is held to 4 KiB/s for 8 s (patient 120 s only after one that never beat
-    /// 4 KiB/s), probes an idle connection every 2 s, and never lets curl retry — curl's
-    /// retry truncates the file back to where the attempt began.
     #[test]
     fn a_resumable_attempt_is_held_to_a_quick_stall_and_never_lets_curl_retry() {
         let value_of = |args: &[&str], flag: &str| -> String {
@@ -2629,9 +2430,6 @@ mod tests {
         }
     }
 
-    /// The quick bound is earned by a transfer that beat 4 KiB/s, stalled time included; one
-    /// that never did — a body a scanning proxy holds back, a trickle, nothing at all — gets
-    /// the historical 120 s next.
     #[test]
     fn only_an_attempt_that_beat_the_speed_floor_keeps_the_quick_stall_bound() {
         let secs = std::time::Duration::from_secs;
@@ -2646,10 +2444,6 @@ mod tests {
         assert_eq!(StallBound::after(1024 * 14, secs(14)), StallBound::Patient);
     }
 
-    /// WHAT A FAILED ATTEMPT LEADS TO. One that moved the `.part` resumes from it at once,
-    /// whatever ended it, but for the cap and a full disk; one that moved nothing retries only
-    /// the failures curl's own `--retry` retried (a timeout, an unresolved name, a transient
-    /// status), and everything else is returned.
     #[test]
     fn a_failed_attempt_resumes_if_it_moved_and_retries_only_curls_set_if_not() {
         use NextAttempt::{Resume, Retry, Stop};
@@ -2689,9 +2483,6 @@ mod tests {
         );
     }
 
-    /// THE RESUME BUDGET'S BOUNDS. Sixteen resumes after attempts that moved under 1 MiB, not
-    /// seventeen; an attempt that moved 1 MiB or more resumes past them; and every resume
-    /// counts toward `16 + cap / 1 MiB`, so the call ends however the bytes fall.
     #[test]
     fn a_resume_is_free_of_the_short_budget_only_after_an_attempt_that_moved_a_mebibyte() {
         let mib: u64 = 1 << 20;
@@ -2813,8 +2604,6 @@ mod tests {
 
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     impl Transfer {
-        /// End the owned group before the one reap. No numeric signal follows a
-        /// reap.
         fn reap_probe(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             if self.child.is_none() {
                 return Ok(None);
@@ -3145,9 +2934,6 @@ mod tests {
         assert!(std::fs::read(run.dir.path().join("a-1.bin")).unwrap() == payload(SIZE));
     }
 
-    /// The VENDOR lane pins the scheme on BOTH hops: `--proto =https` for the initial
-    /// request and `--proto-redir =https` for every redirect — and is otherwise the
-    /// plain resumable argv, byte for byte (the release lanes keep theirs unchanged).
     #[test]
     fn the_vendor_lane_pins_https_on_the_first_hop_and_every_redirect() {
         let quick = StallBound::Quick;
@@ -3179,7 +2965,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed attempt keeps its prefix only if it moved.
     #[test]
     fn a_failed_attempt_that_made_no_progress_discards_its_prefix() {
         assert!(keep_partial(0, 1));
@@ -3192,7 +2977,6 @@ mod tests {
         );
     }
 
-    /// …except after a web-host 403/404, a verdict about the URL, which spares the prefix.
     #[test]
     fn a_web_host_url_verdict_spares_the_prefix_the_other_lane_resumes() {
         const STALLED: u64 = 500_000_000;
@@ -3238,8 +3022,6 @@ mod tests {
         }
     }
 
-    /// Only a failure naming the range (curl 33; a 416 through `--fail`) earns the in-call
-    /// fresh retry; anything else would fail from offset 0 too.
     #[test]
     fn only_a_range_refusal_earns_the_in_call_fresh_retry() {
         assert!(

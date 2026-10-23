@@ -4,7 +4,7 @@
 //! Authoritative focused-content identity and optional terminal handles.
 //!
 //! A native tab must never inherit the terminal handles that were active before it.
-//! [`FrontContent`] names the focused leaf; a [`TerminalMirror`] exists if and only if that
+//! [`FrontContent`](crate::front_content::FrontContent) names the focused leaf; a [`TerminalMirror`](crate::front_content::TerminalMirror) exists if and only if that
 //! leaf is a terminal. Native content owns no placeholder terminal, fd, sink or session.
 
 use std::sync::{Arc, Mutex};

@@ -5,8 +5,6 @@
 
 use super::*;
 
-/// Bounded model for the occupied-cell rainbow body budget. `Raise` explores
-/// every integer request through and beyond the 236 ceiling.
 fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -29,8 +27,6 @@ fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// Bounded lifecycle for a rainbow cell reclaimed while retracting. Visibility
-/// is quantized for exhaustive exploration; `Buggy=1` snaps back to full.
 fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -58,8 +54,6 @@ fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// "rainbow kitty" is the style's user-facing name; "rainbow" maps to it too,
-/// and the laser sweep is "phaser".
 #[test]
 fn rainbow_kitty_parse_and_beam() {
     assert_eq!(GlowStyle::parse("rainbow kitty"), GlowStyle::RainbowKitty);
@@ -83,9 +77,6 @@ fn rainbow_kitty_parse_and_beam() {
     assert!(style_has_beam("phaser"), "phaser keeps the shared beam");
 }
 
-/// Tier 0: exhaust the 0..=270 request lattice. The body clamp proves the
-/// occupied-cell budget; the pass-through mutant fails once a request past the
-/// 236 cap is reachable.
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     assert_eq!(
@@ -97,16 +88,12 @@ fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier 0 proves every bounded fade depth can reverse without changing
-/// visibility; the buggy snap-to-full twin must yield a counterexample.
 #[test]
 fn rainbow_retract_rearm_model_proves_and_catches_brightness_snap() {
     let model = rainbow_retract_rearm_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// A live frame of the effect through the public `tick` seam, so every stream
-/// is present (ribbon bed, starfield, wake, crown, fresh-ink pops).
 fn typed_burst(
     c: &GlowConfig,
     g: Geom,
@@ -117,9 +104,6 @@ fn typed_burst(
     typed_burst_from_phase(c, g, row, cols, gap, 0.0)
 }
 
-/// [`typed_burst`] from a chosen point on the rolling hue. A mark shorter than
-/// `1 / RAINBOW_LAID_SWEEP_PER_CELL` cells covers only part of the arc (see
-/// [`RAINBOW_KITTY_HUE_STEP`]), so callers can sweep the start.
 fn typed_burst_from_phase(
     c: &GlowConfig,
     g: Geom,
@@ -320,10 +304,6 @@ fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
     );
 }
 
-/// Every kitty-named spelling selects the full-body resident pet; the flying
-/// head keeps its own explicit spellings and aliases, and the two lists are
-/// disjoint (an overlap would make one string mean both animals, and the pet
-/// would silently win).
 #[test]
 fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
     for s in [
@@ -412,8 +392,6 @@ fn every_kitty_spelling_draws_the_resident_and_flying_stays_reachable() {
     }
 }
 
-/// Momentum: a sustained fast run makes the ribbon brighter than a lone slow move
-/// (typing heat rides through to the band coverage).
 #[test]
 fn rainbow_ribbon_brightens_with_typing_momentum() {
     let g = geom();
@@ -453,9 +431,6 @@ fn rainbow_ribbon_brightens_with_typing_momentum() {
     );
 }
 
-/// Four-letter guarantee: at a thoughtful ~2.5 cps and at hunt-and-peck
-/// ~0.55 cps alike, the ribbon spans at least the last four typed cells when a
-/// key lands; spark life chains to the observed cadence, not the clock.
 #[test]
 fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
     let g = geom();
@@ -483,8 +458,6 @@ fn rainbow_ribbon_spans_four_letters_at_any_rhythm() {
     }
 }
 
-/// Continuity: a typed echo that hops several columns in one observed move (PTY
-/// batching, key repeat) sweeps every skipped cell as a typing spark.
 #[test]
 fn rainbow_coalesced_typing_sweeps_every_skipped_cell() {
     let g = geom();
@@ -517,9 +490,6 @@ fn rainbow_coalesced_typing_sweeps_every_skipped_cell() {
     );
 }
 
-/// A hand at human speed into an app that repaints late: seven presses at 10
-/// keys/s, one repaint ~700 ms later, one observed move of seven columns (and
-/// one of ten).
 #[test]
 fn a_late_repaint_lays_every_cell_the_hand_typed() {
     let g = geom();
@@ -552,8 +522,6 @@ fn a_late_repaint_lays_every_cell_the_hand_typed() {
     }
 }
 
-/// Refutation control for the gate above: with every press's glyph already on
-/// glass, a caret that advances on its own is program output and is refused.
 #[test]
 fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
     let g = geom();
@@ -589,9 +557,6 @@ fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
     );
 }
 
-/// Refutation control for [`a_late_repaint_lays_every_cell_the_hand_typed`]:
-/// vim's `w` is one press that hops a word, and one key must not paint a ribbon
-/// over it.
 #[test]
 fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     let g = geom();
@@ -654,9 +619,6 @@ fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
     );
 }
 
-/// One batched echo lays the same spatial hue sequence as the same glyphs
-/// observed one frame at a time: coalescing may change birth time and
-/// thermals, never which colour each typed cell owns.
 #[test]
 fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
     let g = geom();
@@ -701,9 +663,6 @@ fn rainbow_sequential_and_coalesced_typing_lay_equivalent_hues() {
     }
 }
 
-/// Width-credit pricing: one press of a wide glyph advances two columns, so its
-/// echo coalesces on that press's 2-cell credit and sweeps the continuation
-/// cell.
 #[test]
 fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
     let g = geom();
@@ -744,10 +703,6 @@ fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
     );
 }
 
-/// A program that echoes wide glyphs for narrow keys (a terminal-side input
-/// method, a TUI in full-width forms): the host banks one cell per press but
-/// the caret advances two, so a raw-column share rule (`credits * 4 >=
-/// dc_abs * 3`) could never pass.
 #[test]
 fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
     let g = geom();
@@ -851,8 +806,6 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
     }
 }
 
-/// Continuity law: whatever mix of single advances and batched hops typing
-/// arrives as, the live sparks on the row form one contiguous run.
 #[test]
 fn rainbow_typed_row_has_no_interior_gaps() {
     let g = geom();
@@ -882,9 +835,6 @@ fn rainbow_typed_row_has_no_interior_gaps() {
     }
 }
 
-/// Continuity: a typing wrap folds the ribbon around the line end (the old row
-/// finished, the new row from its left edge), never disjoint rows or a diagonal
-/// sweep.
 #[test]
 fn rainbow_typing_wrap_folds_around_the_line_end() {
     let g = geom();
@@ -927,9 +877,6 @@ fn rainbow_typing_wrap_folds_around_the_line_end() {
     );
 }
 
-/// Continuity through the typed hide-bridge: a keystroke whose echo hides the
-/// cursor and reappears several columns on (ConPTY, batched echoes) still lays
-/// its swept wake; with no typed candidate the choreography stays inert.
 #[test]
 fn rainbow_typed_hide_bridge_spans_the_batch() {
     let g = geom();
@@ -970,8 +917,6 @@ fn rainbow_typed_hide_bridge_spans_the_batch() {
     );
 }
 
-/// First-key orphan: the first key after a multi-second pause takes a long
-/// chained life.
 #[test]
 fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     let g = geom();
@@ -1031,7 +976,6 @@ fn rainbow_first_key_orphan_does_not_outlive_the_ribbon() {
     );
 }
 
-/// The ribbon decays to exactly empty when the cursor rests: 0% idle, fingerprint 0.
 #[test]
 fn rainbow_decays_to_empty_when_idle() {
     let g = geom();

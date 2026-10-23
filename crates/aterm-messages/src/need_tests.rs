@@ -832,7 +832,10 @@ fn the_digest_is_readable_over_the_wire() {
     assert_eq!(later.len(), 2, "{later:#?}");
     for row in &later {
         assert!(row.contains(" state=review glass=- "), "{row}");
-        assert!(row.ends_with(" need=later"), "{row}");
+        assert!(
+            row.split_whitespace().any(|field| field == "need=later"),
+            "{row}"
+        );
     }
     let live = wire_rows(&c, "live");
     assert!(

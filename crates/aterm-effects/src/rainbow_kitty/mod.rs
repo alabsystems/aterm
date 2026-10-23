@@ -838,6 +838,13 @@ impl Engine {
         self.ribbon.set_pane(self.pane);
         self.ribbon.set_pane_rows(self.pane_rows);
         let pre_move = self.pre_move.take();
+        if self.events.is_empty() {
+            self.soft_wrap = None;
+            self.lift = None;
+            self.reflow = None;
+            self.revive = None;
+            return;
+        }
         let tail_start = self.events.len() - self.unechoed_tail().len();
         let soft = self.soft_wrap.take().and_then(|(sw, key_at)| {
             let at_move = self.events.iter().position(|(e, _)| {
@@ -1647,7 +1654,16 @@ impl Engine {
             ..*cfg
         };
         self.grid_rows = u16::try_from(geom.rows).unwrap_or(u16::MAX);
-        if self.events.iter().any(|(ev, _)| matches!(ev, Event::Erase)) {
+        let mut keys = 0usize;
+        let mut saw_erase = false;
+        for (ev, _) in &self.events {
+            match ev {
+                Event::Erase => saw_erase = true,
+                Event::Typed { .. } => keys += 1,
+                _ => {}
+            }
+        }
+        if saw_erase {
             self.erased = self.caret;
         }
         let mend = self.mend.take().map(|m| Mend {
@@ -1657,11 +1673,6 @@ impl Engine {
             col: self.erased.1,
             deletes: m.count,
         });
-        let keys = self
-            .events
-            .iter()
-            .filter(|(ev, _)| matches!(ev, Event::Typed { .. }))
-            .count();
         let price = self.spine.birth_disp();
         self.spine
             .note_keys(now, u32::try_from(keys).unwrap_or(u32::MAX), price);
@@ -1689,41 +1700,47 @@ impl Engine {
 
         self.meteor.set_hand_floor(self.ribbon.hand_floor_cell());
 
-        for i in 0..self.events.len() {
-            let (ev, at) = self.events[i];
-            let Event::Move {
-                from,
-                to,
-                licence,
-                dir,
-            } = ev
-            else {
-                self.meteor.on_event(&ev, at, &ctx);
-                continue;
-            };
-            let mut move_ctx = ctx;
-            move_ctx.caret_t = self.ribbon.field_at(to.0, to.1).unwrap_or(ctx.caret_t);
-            move_ctx.caret_walk = self.ribbon.walk_origin_at(to.0, to.1);
-            if let Some(spawn) = self.meteor.on_event(&ev, at, &move_ctx) {
-                self.on_spawn(&spawn, licence, &move_ctx);
+        if !self.events.is_empty() {
+            for i in 0..self.events.len() {
+                let (ev, at) = self.events[i];
+                let Event::Move {
+                    from,
+                    to,
+                    licence,
+                    dir,
+                } = ev
+                else {
+                    self.meteor.on_event(&ev, at, &ctx);
+                    continue;
+                };
+                let mut move_ctx = ctx;
+                move_ctx.caret_t = self.ribbon.field_at(to.0, to.1).unwrap_or(ctx.caret_t);
+                move_ctx.caret_walk = self.ribbon.walk_origin_at(to.0, to.1);
+                if let Some(spawn) = self.meteor.on_event(&ev, at, &move_ctx) {
+                    self.on_spawn(&spawn, licence, &move_ctx);
+                }
+                if sub_floor_hop(from, to, licence) {
+                    self.pending_cues.push(SoundCue {
+                        kind: SoundKind::Navigation,
+                        col: to.1,
+                        heat: move_ctx.disp,
+                        hue: move_ctx.caret_t,
+                        dir: dir.sign(),
+                        shifted: false,
+                    });
+                }
             }
-            if sub_floor_hop(from, to, licence) {
-                self.pending_cues.push(SoundCue {
-                    kind: SoundKind::Navigation,
-                    col: to.1,
-                    heat: move_ctx.disp,
-                    hue: move_ctx.caret_t,
-                    dir: dir.sign(),
-                    shifted: false,
-                });
-            }
-        }
 
-        for &(ev, at) in &self.events {
-            self.stardust.on_event(&ev, at, &ctx, &self.ribbon);
+            for &(ev, at) in &self.events {
+                self.stardust.on_event(&ev, at, &ctx, &self.ribbon);
+            }
+            self.events.clear();
         }
-        for &(cell, at) in &self.earned {
-            self.stardust.earn_hero(at, cell, &ctx, &self.ribbon);
+        if !self.earned.is_empty() {
+            for &(cell, at) in &self.earned {
+                self.stardust.earn_hero(at, cell, &ctx, &self.ribbon);
+            }
+            self.earned.clear();
         }
         if let Some((at, n, ring)) = self.party.take()
             && self.caret_known
@@ -1737,8 +1754,6 @@ impl Engine {
         {
             self.caret_seam.flare_at = Some(now);
         }
-        self.events.clear();
-        self.earned.clear();
         if let Some(seen) = self.caret_seen.take() {
             self.caret = seen;
             self.echo.forget(now);
@@ -2025,28 +2040,35 @@ impl Engine {
         let mote_t = u16::try_from(mote_cell)
             .ok()
             .and_then(|col| self.ribbon.field_at(pet.row, col));
-        let catch = pet.contented().then(|| {
-            self.stardust
-                .live_iter()
-                .filter(|s| {
-                    s.gold
-                        && s.class == stardust::StarClass::M1
-                        && s.lane.is_sky()
-                        && s.finish.is_none()
-                        && s.in_sky_of(pet.row, geom)
-                        && pet.columns_to(s.grid_col(geom)) <= companion::CATCH_REACH_CELLS
-                })
-                .max_by_key(|s| s.born)
-                .map(|s| companion::StarCatch {
-                    x: s.x,
-                    y: s.y,
-                    born: s.born,
-                    col: s.grid_col(geom),
-                })
-        });
+        let catch = (pet.contented() && self.stardust.live() > 0)
+            .then(|| {
+                self.stardust
+                    .live_iter()
+                    .filter_map(|s| {
+                        if !(s.gold
+                            && s.class == stardust::StarClass::M1
+                            && s.lane.is_sky()
+                            && s.finish.is_none()
+                            && s.in_sky_of(pet.row, geom))
+                        {
+                            return None;
+                        }
+                        let col = s.grid_col(geom);
+                        (pet.columns_to(col) <= companion::CATCH_REACH_CELLS).then_some(
+                            companion::StarCatch {
+                                x: s.x,
+                                y: s.y,
+                                born: s.born,
+                                col,
+                            },
+                        )
+                    })
+                    .max_by_key(|c| c.born)
+            })
+            .flatten();
         companion::PetOffer {
             perk_at,
-            catch: catch.flatten(),
+            catch,
             mote_t,
             mote_rgb: mote_t.map(spectrum_snap),
         }

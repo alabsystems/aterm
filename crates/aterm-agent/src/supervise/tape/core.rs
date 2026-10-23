@@ -753,7 +753,10 @@ pub(crate) fn holds_instant(text: &str) -> bool {
 
 /// How this build's std writes an `Instant` in `Debug`
 /// ([`instants_as_offsets`]): `head`, the seconds, `mid`, the nanoseconds,
-/// `tail` — `Instant { tv_sec: `, `, tv_nsec: `, ` }` on unix today.
+/// `tail` — `Instant { tv_sec: `, `, tv_nsec: `, ` }` on unix today. On
+/// Windows the instant is a `Duration` (`Instant { t: 12.5s }`): `mid` is the
+/// decimal point and the nanoseconds a fraction whose trailing zeros are
+/// trimmed, with no point at all on a whole second.
 struct InstantForm {
     head: String,
     mid: String,
@@ -767,7 +770,24 @@ impl InstantForm {
     /// that shape and an instant a known span on reads as that span.
     fn learn(origin: Instant) -> Option<Self> {
         const SPAN: Duration = Duration::new(1, 500_000_001);
-        let written = format!("{origin:?}");
+        // The shape is read off the origin, or off the nanosecond after it
+        // when the origin is a whole second, which a fraction form writes as
+        // one number.
+        let mut form = [Duration::ZERO, Duration::from_nanos(1)]
+            .into_iter()
+            .find_map(|nudge| Self::shape(&format!("{:?}", origin.checked_add(nudge)?)))?;
+        let (_, origin_ns) = form.read(&format!("{origin:?}"))?;
+        form.origin_ns = origin_ns;
+        let later = format!("{:?}", origin.checked_add(SPAN)?);
+        let (len, later_ns) = form.read(&later)?;
+        (len == later.len()
+            && later_ns.checked_sub(origin_ns) == Some(i128::try_from(SPAN.as_nanos()).ok()?))
+        .then_some(form)
+    }
+
+    /// The form `written` (an instant's `Debug`) has: exactly two numbers,
+    /// with text before each.
+    fn shape(written: &str) -> Option<Self> {
         let mut runs = Vec::new();
         let bytes = written.as_bytes();
         let mut at = 0;
@@ -785,22 +805,13 @@ impl InstantForm {
         let [(s0, e0), (s1, e1)] = runs[..] else {
             return None;
         };
-        let mut form = Self {
+        let form = Self {
             head: written[..s0].to_string(),
             mid: written[e0..s1].to_string(),
             tail: written[e1..].to_string(),
             origin_ns: 0,
         };
-        if form.head.is_empty() || form.mid.is_empty() {
-            return None;
-        }
-        let (_, origin_ns) = form.read(&written)?;
-        form.origin_ns = origin_ns;
-        let later = format!("{:?}", origin.checked_add(SPAN)?);
-        let (len, later_ns) = form.read(&later)?;
-        (len == later.len()
-            && later_ns.checked_sub(origin_ns) == Some(i128::try_from(SPAN.as_nanos()).ok()?))
-        .then_some(form)
+        (!form.head.is_empty() && !form.mid.is_empty()).then_some(form)
     }
 
     /// The instant `text` begins with in this form: its length in `text`
@@ -808,8 +819,22 @@ impl InstantForm {
     fn read(&self, text: &str) -> Option<(usize, i128)> {
         let rest = text.strip_prefix(&self.head)?;
         let (secs, rest) = number(rest)?;
-        let rest = rest.strip_prefix(&self.mid)?;
-        let (nanos, rest) = number(rest)?;
+        let (nanos, rest) = if self.mid == "." {
+            match rest.strip_prefix('.') {
+                Some(fraction) => {
+                    let len = fraction.bytes().take_while(u8::is_ascii_digit).count();
+                    if len == 0 || len > 9 {
+                        return None;
+                    }
+                    let digits: i128 = fraction[..len].parse().ok()?;
+                    let scale = 10_i128.pow(9 - u32::try_from(len).ok()?);
+                    (digits * scale, &fraction[len..])
+                }
+                None => (0, rest),
+            }
+        } else {
+            number(rest.strip_prefix(&self.mid)?)?
+        };
         let rest = rest.strip_prefix(&self.tail)?;
         if !(0..1_000_000_000).contains(&nanos) {
             return None;

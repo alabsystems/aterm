@@ -310,6 +310,16 @@ mod tests {
     fn table(l: &Layout) -> Vec<Row> {
         let p = std::fs::canonicalize(&l.prefix).expect("the scratch prefix resolves");
         let store = |program: &str, id: u64| p.join(format!("store/{program}/{id}/bin/{program}"));
+        // `rest` under `p` with its `..` kept: a join onto a verbatim prefix (`p` canonical
+        // on Windows) resolves each `..` as it pushes.
+        let dotted = |rest: &str| {
+            let mut path = p.clone().into_os_string();
+            for name in rest.split('/') {
+                path.push(std::path::MAIN_SEPARATOR_STR);
+                path.push(name);
+            }
+            PathBuf::from(path)
+        };
         let row = |exe: PathBuf, argv1: Option<PathBuf>, want, why| Row {
             exe,
             argv1,
@@ -408,13 +418,13 @@ mod tests {
                 "CONTROL: a dev checkout's store-shaped path is not the store",
             ),
             row(
-                p.join("store/claude/1000002000001000304/../../../x/bin/claude"),
+                dotted("store/claude/1000002000001000304/../../../x/bin/claude"),
                 None,
                 unknown("claude"),
                 "CONTROL: a .. escape out of the store",
             ),
             row(
-                p.join("store/../store/claude/1000002000001000304/bin/claude"),
+                dotted("store/../store/claude/1000002000001000304/bin/claude"),
                 None,
                 unknown("claude"),
                 "CONTROL: a .. at the anchor",

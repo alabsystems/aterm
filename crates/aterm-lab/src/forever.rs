@@ -1911,7 +1911,9 @@ pub struct Unread {
 /// F1 BY A SCROLL, AS DRIVEN ([`scroll_step`]): the wheel turned up over `tall-scroll`'s tab, a row a notch, until its opener was in sight.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scrolled {
-    /// When the first notch was turned: F1's law holds from there ([`crate::forever_cover`]'s `judge_scrolled`), the harness's reads during the notches (the screen the opener first came into sight on among them) included.
+    /// When the first notch was turned: F1's law holds from there ([`crate::forever::cover`]'s
+    /// `judge_scrolled`), the harness's reads during the notches (the screen the opener first
+    /// came into sight on among them) included.
     pub from: i64,
     /// When the last notch was turned.
     pub at: i64,

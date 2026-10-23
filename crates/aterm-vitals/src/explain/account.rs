@@ -294,8 +294,7 @@ fn cpu_you(
         return (Some(parts), unread("truncated"));
     }
     let whole = split.global_mc;
-    let live = split.own_mc + split.tabs.iter().map(|t| t.1).sum::<i64>();
-    let unattributed = (split.aterm_mc + split.delegated_mc - live).max(0);
+    let unattributed = split.unattributed_mc;
     let role_at = |extra: i64| {
         let fig = parts.tab + extra;
         let others = [

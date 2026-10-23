@@ -8,7 +8,6 @@ use crate::harness::footer::agents_panel_under;
 use aterm_phase::agents_panel::{one_cell, parse_row};
 use std::path::Path;
 
-/// A measured screen of `aterm-phase`'s fixtures, row by row.
 fn fixture(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../aterm-phase/src/fixtures")
@@ -20,13 +19,11 @@ fn fixture(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The panel under a screen's composer, by the one locator.
 fn panel_of(rows: &[String]) -> AgentsPanel {
     let bottom = aterm_phase::phase::composer_bottom(rows).expect("a composer");
     agents_panel_under(rows, bottom).expect("a panel")
 }
 
-/// A panel of `rows`, each read as one (a test's panel, placed at rows 0…).
 fn panel(rows: &[String]) -> AgentsPanel {
     let mut p = AgentsPanel::EMPTY;
     for (i, row) in rows.iter().enumerate() {
@@ -36,7 +33,6 @@ fn panel(rows: &[String]) -> AgentsPanel {
     p
 }
 
-/// `formatDuration` of `s` seconds, as 2.1.304 draws it.
 fn duration(s: u64) -> String {
     match s {
         0..60 => format!("{s}s"),
@@ -45,7 +41,6 @@ fn duration(s: u64) -> String {
     }
 }
 
-/// A 2.1.304 agent row: `name`, `activity`, `elapsed_s`, `tokens` as drawn.
 fn agent(name: &str, activity: &str, elapsed_s: u64, tokens: &str) -> String {
     format!(
         "  ◯ {name}  {activity}            {} · ↓ {tokens} tokens",
@@ -53,7 +48,6 @@ fn agent(name: &str, activity: &str, elapsed_s: u64, tokens: &str) -> String {
     )
 }
 
-/// The one dot of a one-row fold.
 fn only(track: &PanelTrack) -> Dot {
     let [dot] = track.dots() else {
         panic!("one dot: {:?}", track.dots());
@@ -63,7 +57,6 @@ fn only(track: &PanelTrack) -> Dot {
 
 const T0: u64 = 1_000_000_000;
 
-/// The row is one track across the two (its clock agrees), Running.
 #[test]
 fn the_wait_bg_pair_reads_116_tokens_a_second() {
     let (a, b) = (
@@ -90,10 +83,6 @@ fn the_wait_bg_pair_reads_116_tokens_a_second() {
     assert_eq!(only(&still).rate, 0.0);
 }
 
-/// MEASURED on 2.1.304: the background agent at `7s · ↓ 6.2k tokens`, and
-/// 45 s later at `52s`, its tokens where they were (its Bash sleeps). One
-/// track across the two (its clock agrees), no work in the window: Quiet,
-/// rate 0, saturation already falling — what a sleeping agent looks like.
 #[test]
 fn the_measured_sleeping_agent_reads_quiet() {
     let (a, b) = (
@@ -118,11 +107,6 @@ fn the_measured_sleeping_agent_reads_quiet() {
     assert!(!dot.blind);
 }
 
-/// A row whose clock ticks on while its tokens and activity stand still:
-/// Running under 20 s, Quiet to 150 s (its saturation falling), Stuck from
-/// there. Negative controls: the same row with its tokens moving stays
-/// Running; a row whose tokens step by 100 000 (`1.2m`) is blind and never
-/// Stuck.
 #[test]
 fn a_row_that_does_nothing_goes_quiet_then_stuck() {
     let run = |tokens: &dyn Fn(u64) -> String, until: u64| {
@@ -160,9 +144,6 @@ fn a_row_that_does_nothing_goes_quiet_then_stuck() {
     assert_eq!(blind[200].state, DotState::Quiet);
 }
 
-/// A FROZEN row — clock and all, Claude no longer repainting it — is Halted
-/// once its clock has stood twice its resolution plus a second, reached by
-/// [`PanelTrack::retime`] at [`PanelTrack::due`] with no new reading.
 #[test]
 fn a_frozen_row_halts_at_its_due_time() {
     let mut track = PanelTrack::default();
@@ -180,9 +161,6 @@ fn a_frozen_row_halts_at_its_due_time() {
     assert_eq!(only(&track).state, DotState::Running);
 }
 
-/// A fall in the count (Claude compacted the agent's context) restarts the
-/// samples and is evidence: no negative or inherited rate, and a quiet row
-/// is Running again.
 #[test]
 fn a_compaction_drop_restarts_the_rate_and_counts_as_work() {
     let mut track = PanelTrack::default();
@@ -202,12 +180,6 @@ fn a_compaction_drop_restarts_the_rate_and_counts_as_work() {
     assert!(fold(&mut track, 45, "21.0k").rate > 0.0);
 }
 
-/// Two `general-purpose` agents: A (10 min old, busy) and B (2 min old,
-/// quiet). A leaves the window, so B is the FIRST of its name; B keeps its
-/// own history (Quiet, 30 s), and when A comes back it picks up its own
-/// samples (250 tok/s over the 40 s). NEGATIVE CONTROL: matched by ordinal
-/// alone B would have taken A's track — its count falling from A's 300k to
-/// its 5k, read as a compaction, would have made it Running.
 #[test]
 fn rows_of_one_name_keep_their_own_history_as_the_window_scrolls() {
     let a = |s: u64, tokens: &str| agent("general-purpose", "Sweeping the crates", 600 + s, tokens);
@@ -248,8 +220,6 @@ fn rows_of_one_name_keep_their_own_history_as_the_window_scrolls() {
     assert_eq!(w.fit(&word, 1, T0 + 1_000), None);
 }
 
-/// A track gone ten minutes is dropped; more than sixteen names keep
-/// sixteen tracks, the least recently seen evicted.
 #[test]
 fn absent_tracks_drop_and_the_table_stays_bounded() {
     let mut track = PanelTrack::default();
@@ -273,7 +243,6 @@ fn absent_tracks_drop_and_the_table_stays_bounded() {
     assert_eq!(track.dots().len(), 1);
 }
 
-/// Negative control: the same row in plain ink is Running.
 #[test]
 fn claude_coloured_rows_are_settled_and_words_say_their_state() {
     let row = [agent("general-purpose", "Done reviewing", 95, "40.1k")];
@@ -314,8 +283,6 @@ fn claude_coloured_rows_are_settled_and_words_say_their_state() {
     }
 }
 
-/// The main row, the idle summary and `↓ N more` are no dots; the
-/// fingerprint moves with a state, not with a level inside one 1/32 step.
 #[test]
 fn only_task_rows_are_dots_and_the_fingerprint_moves_with_the_looks() {
     let rows = vec![
@@ -341,14 +308,6 @@ fn only_task_rows_are_dots_and_the_fingerprint_moves_with_the_looks() {
     assert_eq!(level(1e9), 1.0);
 }
 
-/// AGENTS OF ONE NAME LAUNCHED TOGETHER (Claude's parallel `Agent` calls,
-/// 400 ms apart here) imply starts within one clock step of each other, and
-/// Claude repaints between its one-second ticks (on token updates), which
-/// moves a row's implied start by up to a step from one fold to the next.
-/// Each row keeps its own track on every fold: A's 300 tok/s, B's 20.
-/// NEGATIVE CONTROL: on some of these folds the start's error alone prefers
-/// the OTHER track — the trade the matching made before (9 folds of 200
-/// read the other agent's history, its count "compacted" or leapt).
 #[test]
 fn agents_of_one_name_launched_together_keep_their_own_tracks() {
     let k = |n: u64| format!("{}.{}k", n / 1000, n % 1000 / 100);
@@ -400,13 +359,6 @@ fn agents_of_one_name_launched_together_keep_their_own_tracks() {
     assert_eq!(track.tracked(), 2);
 }
 
-/// Rows back after [`ABSENT_MS`] (a tab left in the background ten
-/// minutes) are new tracks, each its own: the long absent are dropped
-/// BEFORE the rows are matched. Before, a row matched to a track the same
-/// fold then dropped was placed in the first free slot — the slot a later
-/// row had matched — and both rows showed that one track (the later row's
-/// dot drawn twice, the first row's nowhere). The precondition: the slots
-/// hold the two names in the other order than the rows show them.
 #[test]
 fn rows_back_after_a_long_absence_each_get_their_own_track() {
     let mut track = PanelTrack::default();
@@ -435,12 +387,6 @@ fn rows_back_after_a_long_absence_each_get_their_own_track() {
     assert_ne!(track.dot_track[0], track.dot_track[1]);
 }
 
-/// A row with NO STATUS (a `subagentStatusLine` decorates it, or a narrow
-/// pane cut it) shows work only by its text: Quiet once that stands
-/// [`QUIET_MS`], never Stuck (blind). Before, every fold of it was read as
-/// a first sighting and it was Running forever. NEGATIVE CONTROL: the same
-/// row whose text moves stays Running; a `waiting` agent that resumes is
-/// Running, not quiet from before.
 #[test]
 fn a_row_with_no_status_goes_quiet_by_its_text() {
     let fold_for = |text: &dyn Fn(u64) -> String, until: u64| {
@@ -477,8 +423,6 @@ use crate::harness::flight::{
     FileFlight, Flight, FlightFold, FlightTable, Flyer, RowKey, ToolName, combine, place,
 };
 
-/// Call 7, in Bash, written at `T0` with a 400 s budget, as the host tells
-/// it at `now`.
 fn bash_at(now: u64) -> Flight {
     let until = T0 + 430_000;
     Flight::Tool {
@@ -489,8 +433,6 @@ fn bash_at(now: u64) -> Flight {
     }
 }
 
-/// One row read at `now` (its clock `now − T0 + 2 s`), its tokens still,
-/// what the host says of its calls `flight`.
 fn quiet_row(track: &mut PanelTrack, now: u64, flight: Flight) {
     let row = agent(
         "general-purpose",
@@ -501,9 +443,6 @@ fn quiet_row(track: &mut PanelTrack, now: u64, flight: Flight) {
     track.fold_flown(&panel(&[row]), &[], &[flight], now);
 }
 
-/// A row quiet past 150 s whose own call is in flight is in its tool, not
-/// stuck: fresh, its light its rate's, naming the tool and how long. Control:
-/// the same rows with no call in flight are stuck at 150 s, as before.
 #[test]
 fn a_long_call_in_flight_reads_tool_not_stuck() {
     let mut track = PanelTrack::default();
@@ -531,13 +470,6 @@ fn a_long_call_in_flight_reads_tool_not_stuck() {
     }
 }
 
-/// A CALL OLDER THAN THE PANEL'S CLOCK says its own age: the window's first
-/// panel came 5 s ago (the track's clock at 5 s) while the call has been in
-/// flight for 200 s — aterm started, or the panel first showed, mid-call
-/// (measured in the lab: a title read `in Bash 4m10s` over a row at `4m 31s`
-/// when its age was taken from the panel's clock). At 30 s it is in its tool
-/// for 225 s. Control: a call written as the clock began reads the clock's
-/// own time.
 #[test]
 fn a_call_older_than_the_panels_clock_says_its_own_age() {
     let flown = |age_ms: u64| Flight::Tool {
@@ -570,9 +502,6 @@ fn a_call_older_than_the_panels_clock_says_its_own_age() {
     }
 }
 
-/// A call past its own budget (its 400 s timeout and 30 s) reads stuck; just
-/// inside it, in its tool. Control: its budget's end is when the host is due
-/// back, and no fade tick wakes it inside the budget.
 #[test]
 fn a_call_past_its_own_budget_reads_stuck() {
     let at = |s: u64| {
@@ -597,9 +526,6 @@ fn a_call_past_its_own_budget_reads_stuck() {
     assert_eq!(near.due(), Some(T0 + 430_000), "the budget's end");
 }
 
-/// A row no file is certainly its keeps today's states exactly, at every
-/// time: the dots of [`Flight::Unknown`] are the screen's alone. So does a
-/// file with nothing in flight.
 #[test]
 fn an_unknown_flight_keeps_todays_states() {
     for flight in [Flight::Unknown, Flight::Model] {
@@ -616,9 +542,6 @@ fn an_unknown_flight_keeps_todays_states() {
     }
 }
 
-/// A call answered (or a new one written) is evidence: the row is running
-/// again, and turns stuck only 150 s later. Control: no change of call, no
-/// evidence. A row the host is unsure of in between does not count.
 #[test]
 fn an_answered_call_is_evidence() {
     let mut track = PanelTrack::default();
@@ -637,9 +560,6 @@ fn an_answered_call_is_evidence() {
     assert_eq!(only(&control).quiet_ms, 100_000, "the same call");
 }
 
-/// The files moving with the screen still: [`PanelTrack::fly`] takes what
-/// the host now knows of the last reading's rows (control: without it the
-/// answered call is not seen).
 #[test]
 fn the_files_can_move_while_the_screen_does_not() {
     let mut track = PanelTrack::default();
@@ -653,7 +573,6 @@ fn the_files_can_move_while_the_screen_does_not() {
     assert_eq!(only(&control).state, DotState::Tool);
 }
 
-/// A measured transcript of `testdata/flight/`, folded.
 fn flight_file(name: &str) -> FlightFold {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/harness/testdata/flight")
@@ -665,8 +584,6 @@ fn flight_file(name: &str) -> FlightFold {
     fold
 }
 
-/// Fold `screen` at `t`, its rows' flights placed from `table` at wall `wall`
-/// (`None`: no flights at all, today's fold).
 fn fold_screen(
     track: &mut PanelTrack,
     screen: &[String],
@@ -685,9 +602,6 @@ fn fold_screen(
     }
 }
 
-/// MEASURED: `long probe`'s row at `8s` and at `4m 57s`, its tokens unmoved
-/// between (its 300 s Bash call): stuck by the screen alone, in Bash by its
-/// own file, 297 s into a 430 s budget.
 #[test]
 fn the_measured_long_call_reads_tool_not_stuck() {
     let (early, late) = (
@@ -733,7 +647,6 @@ fn the_measured_long_call_reads_tool_not_stuck() {
     );
 }
 
-/// Control: the screen alone reads it stuck.
 #[test]
 fn the_measured_workflow_reads_tool_not_stuck() {
     let (early, late) = (

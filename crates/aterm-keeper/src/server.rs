@@ -49,8 +49,6 @@ pub struct ServeConfig {
     pub test_drop_custody: bool,
 }
 
-/// A dial accepted whose identity check has not answered: admitted when it passes, turned away
-/// when it is refused or still unanswered at `until`.
 struct Dialing {
     stream: CtlStream,
     check: PeerCheck,
@@ -60,8 +58,7 @@ struct Dialing {
 struct Conn {
     stream: CtlStream,
     pid: u32,
-    /// A frame to this peer could not be written ([`Server::send`]): nothing
-    /// more is written to it, and its frames are still read through its EOF.
+    /// A frame to this peer could not be written ([`Server::send`]).
     unwritable: bool,
 }
 
@@ -71,16 +68,14 @@ pub struct Server {
     socket: PathBuf,
     core: KeeperCore,
     conns: BTreeMap<ConnId, Conn>,
-    /// Dials whose identity checks are running, each on its own helper while the loop serves
-    /// every other connection.
+    /// Dials whose identity checks are running.
     dialing: Vec<Dialing>,
     /// The most checks running at once; later dials wait in the listen backlog.
     dial_checks_max: usize,
     /// How long one dial's check may run before the dial is turned away as unanswered.
     check_hang: Duration,
     custody: BTreeMap<Rdev, OwnedFd>,
-    /// Every crash-restore companion held, by the number given at its arrival, with the master
-    /// it rides beside.
+    /// Every crash-restore companion held.
     companions: BTreeMap<CompanionId, (Rdev, OwnedFd)>,
     next_companion: CompanionId,
     watches: BTreeMap<u32, ExitWatch>,
@@ -93,22 +88,18 @@ pub struct Server {
     started: Instant,
     own_pid: u32,
     refused_dials: u64,
-    /// COMPANIONs this keeper accepted since it started (`status companions_taken=`): each one
-    /// a region it now holds in place of whatever its claim held before.
+    /// COMPANIONs this keeper accepted since it started (`status companions_taken=`).
     companions_taken: u64,
-    /// Why the last dial was refused unchecked, as last printed: printed once per reason, and
-    /// forgotten at the next admitted dial.
+    /// Why the last dial was refused unchecked.
     unchecked_said: Option<String>,
-    /// Frames read after their writer's exit had already arrived, before the
-    /// exit was recorded ([`Server::drain_pid`]).
+    /// Frames read after their writer's exit had already arrived.
     frames_behind_exit: u64,
     /// Frames the keeper could not write to their peer ([`Server::send`]).
     replies_lost: u64,
     /// A test seam (unit tests only): the next OFFER's duplicate fails as `EMFILE` would.
     #[cfg(test)]
     test_fail_next_dup: bool,
-    /// A test seam: every reason a dial was turned away unchecked, never cleared
-    /// ([`Server::test_unchecked_ever`]).
+    /// A test seam.
     #[cfg(test)]
     test_unchecked_ever: Vec<String>,
     /// A test seam: the check each dial gets in place of [`Identity::start_check_named`].
@@ -116,20 +107,10 @@ pub struct Server {
     test_check: Option<Box<dyn Fn() -> PeerCheck + Send>>,
 }
 
-/// A per-connection receive/send budget: once a frame's header has arrived,
-/// the rest must follow within this, or the connection is dropped; a frame the
-/// peer does not take within it is the last one written to it
-/// ([`Server::send`]).
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-/// The loop's clock tick when nothing is readable.
 const TICK_MS: i32 = 250;
-/// The loop's clock tick while a dial's check runs: how soon its answer is taken up.
 const CHECK_TICK_MS: i32 = 5;
-/// The most dials whose identity checks run at once ([`Server::dial_checks_max`]).
 const DIAL_CHECKS_MAX: usize = 16;
-/// The most frames [`Server::drain_pid`] reads from one connection of a dead
-/// peer: more than a socket buffer of the smallest frame (8 KiB of 8-byte
-/// headers).
 const DRAIN_MAX_FRAMES: usize = 1024;
 
 struct Env<'a> {
@@ -139,7 +120,6 @@ struct Env<'a> {
 }
 
 impl Env<'_> {
-    /// What one device's scan means to the core.
     fn verdict(&self, scan: aterm_uds::holders::HolderScan) -> Holders {
         if !scan.holders.is_empty() {
             Holders::Held(scan.holders)
@@ -155,7 +135,6 @@ impl KeeperEnv for Env<'_> {
     fn holders(&mut self, rdev: Rdev) -> Holders {
         self.holders_of(&[rdev]).pop().unwrap_or(Holders::Unknown)
     }
-    /// One walk of the uid's processes for the whole set, none for an empty one.
     fn holders_of(&mut self, rdevs: &[Rdev]) -> Vec<Holders> {
         match aterm_uds::holders::scan_holders_of(rdevs, &[self.own_pid]) {
             Ok(scans) => scans.into_iter().map(|scan| self.verdict(scan)).collect(),
@@ -196,7 +175,6 @@ pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Ok(m) if m.file_type().is_file() => {
                     if seen {
-                        // A later start read it as a death with no exit path.
                         return MarkerEvidence::Dead;
                     }
                     return match aterm_uds::ownerlock::probe(&path) {
@@ -254,7 +232,8 @@ pub fn born(pid: u32) -> Option<Birth> {
 impl Server {
     /// Binds the keeper listener socket according to `config`.
     /// # Errors
-    /// Returns an error if the directory is not private, a live keeper holds the socket, or binding fails.
+    /// Returns an error if the directory is not private, a live keeper holds the socket, or binding
+    /// fails.
     pub fn bind(config: ServeConfig) -> io::Result<Self> {
         let dir = config
             .socket
@@ -393,8 +372,6 @@ impl Server {
         Ok(())
     }
 
-    /// How long one turn asked to wait `timeout_ms` may wait in `poll`: no longer than
-    /// [`CHECK_TICK_MS`] while a dial's check runs, since its answer wakes no descriptor.
     fn poll_wait(&self, timeout_ms: i32) -> i32 {
         if self.dialing.is_empty() || (0..=CHECK_TICK_MS).contains(&timeout_ms) {
             timeout_ms
@@ -403,8 +380,6 @@ impl Server {
         }
     }
 
-    /// Accept every queued dial while fewer than [`Self::dial_checks_max`] checks run, and start
-    /// each one's identity check without waiting for it ([`Self::admit_checked`] takes the answer).
     fn accept_all(&mut self) {
         while self.dialing.len() < self.dial_checks_max {
             let stream = match self.listener.accept() {
@@ -424,7 +399,6 @@ impl Server {
         }
     }
 
-    /// The identity check of the peer on `stream`, started.
     fn start_check(&self, stream: &CtlStream) -> PeerCheck {
         #[cfg(test)]
         if let Some(start) = &self.test_check {
@@ -434,8 +408,6 @@ impl Server {
             .start_check_named(stream, aterm_uds::peer::peer_audit_token(stream))
     }
 
-    /// Admit each dial whose check passed, and turn away each one refused or unanswered at its
-    /// own deadline; the rest keep running.
     fn admit_checked(&mut self) {
         let now = Instant::now();
         for Dialing {
@@ -459,7 +431,6 @@ impl Server {
         }
     }
 
-    /// Count a dial whose check did not pass, and say once per reason why one went unchecked.
     fn turn_away(&mut self, e: CheckError) {
         self.refused_dials += 1;
         if let CheckError::Unchecked(why) | CheckError::Unanswered(why) = e {
@@ -474,7 +445,6 @@ impl Server {
         }
     }
 
-    /// Take a checked dial as a connection of the core's.
     fn admit(&mut self, stream: CtlStream) {
         self.unchecked_said = None;
         let Ok(pid) = aterm_uds::fdpass::peer_pid(&stream) else {
@@ -515,8 +485,6 @@ impl Server {
         self.apply(outs);
     }
 
-    /// Watch `pid`'s exit (a PENDING successor, an orphan's leader). A pid
-    /// already gone cannot be watched: whatever waited on it is judged now.
     fn watch_pid(&mut self, pid: u32) {
         if self.watches.contains_key(&pid) {
             return;
@@ -542,8 +510,6 @@ impl Server {
         self.apply(outs);
     }
 
-    /// Stream order (§5.3 step 4, "K reads BYE and then EOF"): every frame a peer wrote before it
-    /// died (a claim, its BYE) is read before its death is recorded.
     fn drain_pid(&mut self, pid: u32) {
         let ids: Vec<ConnId> = self
             .conns
@@ -574,8 +540,6 @@ impl Server {
         }
     }
 
-    /// Read one frame of `id` and handle it: `true` when a frame was read,
-    /// `false` when the connection is over (EOF, a malformed frame, a stall).
     fn read_conn(&mut self, id: ConnId) -> bool {
         let Some(conn) = self.conns.get(&id) else {
             return false;
@@ -643,8 +607,6 @@ impl Server {
         self.apply(outs);
     }
 
-    /// REGISTER: read the descriptor's rdev (`fstat`, the one call ever made
-    /// on a master) and let the core decide.
     fn register(
         &mut self,
         id: ConnId,
@@ -676,8 +638,6 @@ impl Server {
         outs
     }
 
-    /// COMPANION: check what the descriptor is ([`companion_fault`], which neither maps nor
-    /// reads it), number it, and let the core decide; it is held only when the core keeps it.
     fn companion(
         &mut self,
         id: ConnId,
@@ -746,8 +706,6 @@ impl Server {
         }
     }
 
-    /// Send the OFFER of `rdev` to `conn` with a duplicate of the custody copy, and to a window
-    /// that journals, with the brake and a COMPANION_OFFER of the region right after it.
     fn offer(&mut self, conn: ConnId, rdev: Rdev, journal: Option<crate::core::OfferJournal>) {
         let Some(rec) = self.core.records().get(&rdev).cloned() else {
             return;
@@ -798,9 +756,6 @@ impl Server {
         }
     }
 
-    /// Write one frame to `conn`. A failed write (the peer died or closed its end, or took nothing
-    /// for [`IO_TIMEOUT`]) ends the keeper's writing to that connection, never its reading: what
-    /// the peer wrote before is still read, in order, through its EOF (§5.3 step 4).
     fn send(&mut self, conn: ConnId, frame: &Frame, fd: Option<&OwnedFd>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
@@ -810,8 +765,6 @@ impl Server {
         }
     }
 
-    /// One frame for `conn` was not written: a write failed ([`Self::send`]), or an OFFER's
-    /// duplicate of the custody copy could not be made (`EMFILE`).
     fn end_writing(&mut self, conn: ConnId) {
         let Some(c) = self.conns.get_mut(&conn) else {
             return;
@@ -934,7 +887,6 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// After the bind: the node is a socket of ours inside our real directory.
 fn prove_socket_is_ours(dir: &Path, path: &Path) -> io::Result<()> {
     ensure_private_dir(dir)?;
     let meta = std::fs::symlink_metadata(path)?;
@@ -953,11 +905,6 @@ mod tests {
     use crate::core::RecordState;
     use crate::wire::{CAP_SENDS_BYE, PeerClass};
 
-    /// A LAB DESK'S MARKER IS READ AS ANY MARKER IS: `aterm-gui`'s
-    /// lab desk names its marker `crash-marker-<pid>-<nanos>-lab.log`, and the keeper reads it as
-    /// it reads an `app` or `other` one: missing, the exit path ran (Released); there with its
-    /// lock free, a death with no exit path (Dead), and so its consumed `.seen` name; held, a live
-    /// owner (Held).
     #[test]
     fn a_lab_desks_marker_is_read_as_any_marker_is() {
         use std::os::unix::ffi::OsStrExt as _;
@@ -1012,8 +959,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A peer wrote HELLO, a claim and BYE, then closed its end before the keeper read any: the
-    /// WELCOME is lost, the claim and the BYE are still read, and the EOF drops the connection.
     #[test]
     fn a_failed_write_ends_the_writing_never_the_reading() {
         let dir = std::env::temp_dir().join(format!("akk-unit-{}-unwritable", std::process::id()));
@@ -1100,9 +1045,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A fresh PTY master no other process holds, and its rdev (`aterm_pty::open_pty_pair`:
-    /// close-on-exec from the open, so a sibling test's child cannot hold it, and redriven when
-    /// XNU's `/dev/ptmx` race answers `-6`).
     fn a_pty_master() -> (OwnedFd, Rdev) {
         use std::os::fd::FromRawFd as _;
         let (master, slave) = aterm_pty::open_pty_pair().expect("a fresh PTY pair");
@@ -1138,9 +1080,6 @@ mod tests {
         }
     }
 
-    /// Turn until the one connection's EOF drops it. The peer's end is closed
-    /// only when every copy of it is: a child a sibling test thread has
-    /// forked and not yet exec'd holds one for a while.
     fn until_its_eof(server: &mut Server) {
         let started = Instant::now();
         while !server.conns.is_empty() {
@@ -1151,25 +1090,19 @@ mod tests {
 
     const HANG: Duration = Duration::from_secs(60);
 
-    /// What the second window of [`offer_to_a_second_window`] saw and left.
     struct OfferSeen {
-        /// The frames it read, in order, up to the keeper's EOF (or the second
-        /// frame after the WELCOME), with each OFFER's descriptor's rdev.
+        /// The frames it read.
         read: Vec<(Frame, Option<Rdev>)>,
         /// The master window A left orphaned.
         orphan_rdev: Rdev,
         bye_read: bool,
         claim_read: bool,
-        /// The orphan is Orphaned again after B's EOF: an offer is made to a
-        /// connection, and returns when that connection is gone.
+        /// The orphan is Orphaned again after B's EOF.
         returned_at_eof: bool,
         replies_lost: u64,
         dropped_at_eof: bool,
     }
 
-    /// Window A claims a master and crashes; window B says HELLO — offered
-    /// A's master — then claims its own and says BYE, all written before the
-    /// keeper reads any of it.
     fn offer_to_a_second_window(fail_dup: bool) -> OfferSeen {
         let me = std::process::id();
         let dir =
@@ -1274,8 +1207,6 @@ mod tests {
         seen
     }
 
-    /// The duplicate fails as `EMFILE` would: the recipient reads the WELCOME then EOF, its claim
-    /// and BYE are still read, and the offer returns to Orphaned at its EOF.
     #[test]
     fn an_offer_that_cannot_be_duplicated_ends_the_writing_never_the_reading() {
         let failed = offer_to_a_second_window(true);
@@ -1318,8 +1249,6 @@ mod tests {
         );
     }
 
-    /// The keeper takes in custody only a read-only POSIX shared-memory object of the kind and
-    /// length claimed, within the bounds; everything else is named, and nothing is mapped.
     #[test]
     fn a_companion_must_be_a_read_only_region_of_its_claimed_length() {
         use crate::wire::COMPANION_JOURNAL as JOURNAL;
@@ -1362,11 +1291,6 @@ mod tests {
         assert!(why.contains("not POSIX shared memory"), "{why}");
     }
 
-    /// The loop's descriptors follow the core's decisions exactly: after a COMPANION, a second
-    /// one that supersedes it (`Out::CloseCompanion`), and the RELEASE that removes the record
-    /// (`Out::Close`, which closes every companion beside the master), the regions the loop
-    /// holds are the core's, the status counts them from the descriptors (`fstat`), and the
-    /// kernel's own table of this process shows exactly that many of the region's size.
     #[test]
     fn the_loop_holds_exactly_the_regions_the_core_keeps() {
         use aterm_uds::shm::{PAGE, Region};
@@ -1431,7 +1355,8 @@ mod tests {
                 clippy::disallowed_methods,
                 reason = "a test playing the window makes the region the keeper is sent"
             )]
-            // SAFETY: the fixture server only queries, holds, and closes custody without mapping or resizing.
+            // SAFETY: the fixture server only queries, holds, and closes custody without mapping or
+            // resizing.
             let (region, custody) = unsafe { Region::create(len) }.expect("a region");
             send(&mut server, companion.clone(), Some(custody.as_fd()));
             drop((region, custody));
@@ -1472,8 +1397,6 @@ mod tests {
         unanswered: usize,
     }
 
-    /// `n` dials queued at once, each writing its HELLO, whose checks each answer only once all
-    /// `n` have started, served with at most `max` checks at a time, each under `hang`.
     fn dials_whose_checks_need_each_other(n: usize, max: usize, hang: Duration) -> DialsEnded {
         use std::sync::{Arc, Condvar, Mutex, PoisonError};
         static SCRIPTED: aterm_uds::deadline::Gate =
@@ -1564,10 +1487,6 @@ mod tests {
         ended
     }
 
-    /// A CONNECTION IS SERVED WHILE ANOTHER DIAL'S CHECK RUNS: a window's HELLO is answered
-    /// while a second dial's check waits for that answer, and each turn meanwhile waits no
-    /// longer than [`CHECK_TICK_MS`], since nothing readable marks a check's answer. Negative
-    /// control: the idle loop's turn waits as long as it was asked.
     #[test]
     fn a_connection_is_served_while_another_dials_check_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1585,7 +1504,6 @@ mod tests {
         })
         .expect("bind");
         assert_eq!(server.poll_wait(TICK_MS), TICK_MS, "idle");
-        // Past the test's own hang detector: a loop that waits on the check cannot outlast it.
         server.check_hang = 2 * HANG;
         let (answer, held) = mpsc::channel::<()>();
         let held = Mutex::new(Some(held));
@@ -1645,11 +1563,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// QUEUED DIALS ARE CHECKED AT ONCE, EACH UNDER ITS OWN DEADLINE: three dials whose checks
-    /// each answer only once all three have started are all welcomed, none turned away. Negative
-    /// control: one check at a time, the order the keeper used to check in, leaves at least the
-    /// first two dials unanswered at their deadline (the last one's answer races its own 200 ms
-    /// deadline, so whether it is welcomed is not asserted).
     #[test]
     fn queued_dials_are_checked_at_once_each_under_its_own_deadline() {
         assert_eq!(
@@ -1677,10 +1590,6 @@ mod tests {
         );
     }
 
-    /// A PASSED DIAL IS ADMITTED BEHIND A DIAL WHOSE CHECK STILL RUNS: a dial whose check
-    /// answers at once is admitted while an earlier dial's check has not answered, and the
-    /// earlier one is admitted once its own check answers. Negative control: while the second
-    /// is admitted, the first is still being checked, not admitted ahead of its answer.
     #[test]
     fn a_passed_dial_is_admitted_behind_a_dial_whose_check_still_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1697,7 +1606,6 @@ mod tests {
             test_drop_custody: false,
         })
         .expect("bind");
-        // Past the test's own hang detector: the slow check is never turned away mid-test.
         server.check_hang = 2 * HANG;
         let (release, held) = mpsc::channel::<()>();
         let held = Mutex::new(Some(held));

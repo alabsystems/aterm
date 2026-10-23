@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a surface lets one run do (design §3.2).
+//! Execution scope and `--only` item selection for convergence runs.
 
 use crate::Item;
 use crate::model::{Class, Effect, Explain, Layer, Probe, Requires, StoodAside};
 
-/// The surface's half of a run (design §3.2).
+/// Execution scope for a convergence run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scope {
     /// The classes an apply run applies.
@@ -69,9 +69,7 @@ pub const NOT_AT_CONSOLE: &str = "run at this Mac's console: this login does not
                                   (another user is logged in there, or this is a remote \
                                   shell)";
 
-/// The line an item's row carries where the change it would make is held back because the
-/// run's process is not a shell of its user's own account (design §3.2,
-/// [`Requires::Account`]): `why` names which.
+/// Format the blocked reason when not running in the user's own account shell.
 #[must_use]
 pub fn not_own_account(why: &str) -> String {
     format!(
@@ -94,9 +92,7 @@ impl Layer {
     }
 }
 
-/// Whether the `--only` word `token` names a row: its family, its layer, its id, or an id
-/// it is a prefix of up to a `.` or an `@`. A word holding an `@` names that id alone, so
-/// `develop.checkout@~/aterm` never names `develop.checkout@~/aterm.old` (CV-SELECTS).
+/// Whether `--only` token `token` matches an item by family, layer, id, or prefix.
 #[must_use]
 pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> bool {
     if token.is_empty() {
@@ -109,10 +105,7 @@ pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> boo
         })
 }
 
-/// The items `tokens` select ([`selects`]), in composition order, each with its `after` edges
-/// narrowed to the items kept (a run of `base.shell.rc` alone does not wait for the hooks item it
-/// left out, as machines' `--only <table>` never did), and the tokens that selected nothing, for
-/// the surface to refuse.
+/// Filter `items` by `tokens` in composition order and return unmatched tokens.
 #[must_use]
 pub fn select<'a>(
     items: Vec<Box<dyn Item + 'a>>,
@@ -166,7 +159,6 @@ pub fn standing_aside<'a>(
         .collect()
 }
 
-/// An item whose apply stands aside ([`standing_aside`]).
 struct Aside<'a> {
     inner: Box<dyn Item + 'a>,
     aside: StoodAside,
@@ -223,11 +215,7 @@ impl Item for Aside<'_> {
     }
 }
 
-/// `items` whose change cannot be made in this run for a reason no retry clears (a store lock that
-/// could not even be taken: an unwritable or symlinked prefix): each is probed as usual, one
-/// already as wanted reads `Ok`, and one that would change reads `Blocked` with what it would have
-/// changed and `why`, so its surface counts it as left undone (exit 1), never as standing aside
-/// (`standing_aside`, 75).
+/// Wrap `items` so pending changes report `Blocked` with `why` instead of applying.
 #[must_use]
 pub fn held_back<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str) -> Vec<Box<dyn Item + 'a>> {
     hold(items, why, false)
@@ -252,7 +240,6 @@ fn hold<'a>(items: Vec<Box<dyn Item + 'a>>, why: &str, as_is: bool) -> Vec<Box<d
         .collect()
 }
 
-/// An item whose change is held back ([`held_back`]) or left as it is ([`left_as_is`]).
 struct HeldBack<'a> {
     inner: Box<dyn Item + 'a>,
     why: String,
@@ -313,7 +300,6 @@ impl Item for HeldBack<'_> {
     }
 }
 
-/// An item with its `after` edges narrowed to the run it is in ([`select`]).
 struct Narrowed<'a> {
     inner: Box<dyn Item + 'a>,
     after: Vec<String>,
@@ -392,8 +378,6 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// An item placed anywhere, whose probes answer from a list (the last repeats), and
-    /// which counts its probes and applies.
     struct Placed {
         id: &'static str,
         family: &'static str,
@@ -428,7 +412,6 @@ mod tests {
         }
     }
 
-    /// Counts the lines it is asked to keep, and how many refreshes had run at each.
     struct Counted {
         lines: Vec<(String, String, String)>,
         refreshed_at_line: Vec<u32>,
@@ -514,11 +497,6 @@ mod tests {
         }
     }
 
-    /// Design §3.2, `Requires::Account`: outside a shell of the account's own (here root),
-    /// every account item is still read, one already right reads `Ok`, and the change one
-    /// would make is named and `Blocked` with the reason, in a plan and an apply alike;
-    /// nothing is applied, refreshed or journaled, and a console item is not even read.
-    /// The negative control, the account's own shell, applies, refreshes and journals.
     #[test]
     fn outside_the_accounts_own_shell_every_item_is_read_and_no_change_is_made() {
         for (own, mode) in [
@@ -574,9 +552,6 @@ mod tests {
         }
     }
 
-    /// A refresh that changes the machine is journaled before it runs, with the reading it
-    /// re-lays as `from` and `to`; a journal that refuses the record leaves it unrun and the
-    /// row `Failed`. One that only activates a saved setting writes no line.
     #[test]
     fn a_refresh_that_changes_the_machine_is_journaled_before_it_runs() {
         for (changes, refuses) in [(true, false), (true, true), (false, false)] {
@@ -629,10 +604,6 @@ mod tests {
         }
     }
 
-    /// An item held back ([`held_back`]: a store lock that could not even be taken) is read:
-    /// one already right is `Ok`, one that would change is `Blocked` naming the change and
-    /// the reason, with no stood-aside kind (its surface counts it undone, exit 1), never
-    /// applied and never journaled.
     #[test]
     fn a_held_back_item_is_read_and_blocked_and_never_applied() {
         let would = Placed::new("base.pkg.shims", Class::Relay, Requires::Account);
@@ -660,11 +631,6 @@ mod tests {
         assert!(journal.lines.is_empty());
     }
 
-    /// An item left as it is ([`left_as_is`]: it made its change once and was changed since)
-    /// is read: one already right is `Ok`, one that would change is `NotApplicable` naming
-    /// what it reads now and the reason, so nothing is wrong, and it is never applied,
-    /// refreshed or journaled. Negative control: the arm reading `Blocked` (as
-    /// [`held_back`]) fails the run's surface for a change nobody is to make.
     #[test]
     fn an_item_left_as_is_is_read_and_not_applicable_and_never_applied() {
         let would = Placed::new("workstation.widgets", Class::Preference, Requires::Account);
@@ -694,8 +660,6 @@ mod tests {
         assert!(journal.lines.is_empty());
     }
 
-    /// Design §3.2: away from the console a base item applies and a workstation item is
-    /// `Blocked` without being probed; at the console both apply.
     #[test]
     fn away_from_the_console_an_account_item_applies_and_a_console_item_is_blocked() {
         for at_console in [false, true] {
@@ -732,8 +696,6 @@ mod tests {
         assert_eq!(probed.load(Ordering::SeqCst), 0);
     }
 
-    /// An apply run applies only the classes its surface applies: a preference item in a
-    /// repair run is planned, a relay one changed.
     #[test]
     fn an_apply_run_plans_the_classes_its_surface_does_not_apply() {
         let relay = Placed::new("base.relay", Class::Relay, Requires::Account);
@@ -764,7 +726,6 @@ mod tests {
         assert_eq!(asked_applied.load(Ordering::SeqCst), 0);
     }
 
-    /// A dependant of an item its surface only planned waits for it in an apply run.
     #[test]
     fn a_dependant_of_a_planned_item_waits_for_it() {
         let pref = Placed::new("workstation.pref", Class::Preference, Requires::Account);
@@ -799,9 +760,6 @@ mod tests {
         assert!(!selects("", "base.pkg.shims", "pkg", base));
         assert!(selects("develop", "develop.checkout@~/aterm", "git", None));
         assert!(!selects("workstation", "base.pkg.shims", "pkg", None));
-        // A word that names an instance names it alone (its path continuing with `.` or
-        // `@` is another instance). Control: the same id without its `@` still names every
-        // instance, by the prefix rule above.
         let develop = Some(Layer::Develop);
         let instance = "develop.checkout@~/aterm";
         assert!(selects(instance, instance, "checkout", develop));
@@ -825,8 +783,6 @@ mod tests {
         ));
     }
 
-    /// `--only` keeps what it names, narrows the kept items' edges to the run, and says
-    /// which words named nothing; no words keep everything as it is.
     #[test]
     fn select_keeps_what_it_names_and_narrows_edges_to_the_run() {
         let make = || -> Vec<Box<dyn Item>> {
@@ -877,9 +833,6 @@ mod tests {
         );
     }
 
-    /// An item standing aside is probed and never applied: one already as wanted is `Ok`,
-    /// one that would change is `Blocked` with the lock's line, and the run's exit is the
-    /// lock's 75.
     #[test]
     fn a_standing_aside_item_is_probed_never_applied_and_blocked_on_the_lock() {
         let would = Placed {

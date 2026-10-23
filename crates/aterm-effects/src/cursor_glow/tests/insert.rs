@@ -5,8 +5,6 @@
 
 use super::*;
 
-/// The hue walk's step from lit cell `a` to lit cell `b` of `row`: the
-/// continuity oracle.
 fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     let at = |col: u16| {
         glow.v2
@@ -16,10 +14,6 @@ fn walk_step(glow: &CursorGlow, row: u16, a: u16, b: u16) -> f32 {
     at(b) - at(a)
 }
 
-/// The delivered insert, visible caret: after every stamp has gone stale, an
-/// 11-cell insert echoed as one hop `5 → 16` is licensed under the insert class
-/// and laid as one sweep joining the cohort (the walk steps evenly across
-/// `4 → 5`).
 #[test]
 fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     let g = geom();
@@ -102,9 +96,6 @@ fn a_delivered_insert_lays_its_span_as_one_sweep_under_a_visible_caret() {
     );
 }
 
-/// The delivered insert, hidden caret (Claude Code's shape): the input
-/// row's print anchor advances 33 cells with the delivered stamp behind
-/// it, bounded by the insert's own width, not the typed coalesce cap.
 #[test]
 fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     let g = geom();
@@ -161,8 +152,6 @@ fn a_delivered_insert_lights_a_hidden_caret_tui_at_its_print_anchor() {
     );
 }
 
-/// The placeholder rewrite: after the hidden-caret insert the TUI swaps the
-/// path for `[Image #1] ` and the row's end pulls back 37 -> 15 with no key.
 #[test]
 fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     let g = geom();
@@ -302,9 +291,6 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     );
 }
 
-/// The rewrite re-witnesses its row. The content witness retires a
-/// resident cell whose recorded glyph changed, and `[Image #1] ` is
-/// different text over the insert's first eleven cells.
 #[test]
 fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     let g = geom();
@@ -399,8 +385,6 @@ fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     );
 }
 
-/// Control: the same two hops with no delivery stamp behind them (a
-/// program flood exactly the insert's width) decline.
 #[test]
 fn a_program_flood_of_the_inserts_width_with_no_delivery_stamp_still_declines() {
     let g = geom();
@@ -458,9 +442,6 @@ fn a_program_flood_of_the_inserts_width_with_no_delivery_stamp_still_declines() 
     );
 }
 
-/// A delivery stamp licenses only while fresh and only once: stale after
-/// `INSERT_HINT_FRESH` it declines as a stale typed stamp does; spent by
-/// one echo, it cannot license a second hop inside the window.
 #[test]
 fn a_stale_or_spent_delivery_stamp_licenses_nothing() {
     let g = geom();
@@ -489,10 +470,6 @@ fn a_stale_or_spent_delivery_stamp_licenses_nothing() {
     assert_eq!(last.reason, CursorGlow::DECLINE_NO_FRESH_HINT);
 }
 
-/// A drop as the first action on a never-typed input row (a fresh hidden
-/// engine, no established echo row): the insert echo is licensed and the
-/// row is not branded, so the keys typed after it anchor with zero
-/// program-row refusals.
 #[test]
 fn a_delivered_insert_brands_no_row() {
     let g = geom();
@@ -522,10 +499,6 @@ fn a_delivered_insert_brands_no_row() {
     assert_eq!(glow.spawns(), 4);
 }
 
-/// The insert licence is inert for a program row: with the input row
-/// established, a spinner row's first advance inside the delivery window
-/// is refused, spends nothing, and the licence survives for the input
-/// row's own echo.
 #[test]
 fn a_delivered_insert_is_inert_for_a_program_row() {
     let g = geom();
@@ -563,11 +536,6 @@ fn a_delivered_insert_is_inert_for_a_program_row() {
     );
 }
 
-/// The delivery stamp follows the typed bank's retirement law, not the
-/// one-shots': a completed hidden→visible boundary (a DECTCEM bracket
-/// mid-burst) spares it while fresh; a class-changing press
-/// (`clear_typed`) leaves it armed; and `revoke_input_hints_at` revokes it
-/// by its exact instant (a Tab queued behind a draining paste) and no other.
 #[test]
 fn a_delivered_insert_survives_a_hidden_boundary_while_fresh_and_is_revoked_at_its_own_instant() {
     let g = geom();
@@ -605,8 +573,6 @@ fn a_delivered_insert_survives_a_hidden_boundary_while_fresh_and_is_revoked_at_i
     );
 }
 
-/// An insert and a key delivered in one frame: the 12-cell hop is the
-/// 11-cell insert plus the key's own glyph.
 #[test]
 fn an_insert_and_a_key_in_one_frame_pay_the_surplus_from_the_press() {
     let g = geom();
@@ -653,9 +619,6 @@ fn an_insert_and_a_key_in_one_frame_pay_the_surplus_from_the_press() {
     );
 }
 
-/// An insert builds no momentum (the family metric is the hand's), pulses
-/// nothing to the cat, and cues nothing; extends
-/// `program_output_alone_builds_no_momentum` to the delivered class.
 #[test]
 fn a_delivered_insert_builds_no_momentum_and_cues_nothing() {
     let g = geom();
@@ -678,9 +641,6 @@ fn a_delivered_insert_builds_no_momentum_and_cues_nothing() {
     );
 }
 
-/// A delivered insert mints nothing in every other style: the licence is
-/// read only at the Rainbow Kitty seam; extends
-/// `an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style`.
 #[test]
 fn a_delivered_insert_mints_nothing_in_every_other_style() {
     let g = geom();
@@ -720,10 +680,6 @@ fn a_delivered_insert_mints_nothing_in_every_other_style() {
     }
 }
 
-/// A receipt that lands after the frame that observed the echo (a
-/// preempted writer thread) still lights the insert: the refused hop of
-/// exactly the insert's width is remembered for one delivery and laid
-/// when the stamp arrives — both lanes.
 #[test]
 fn a_receipt_that_lands_after_the_echoing_frame_still_lights_the_insert() {
     let g = geom();
@@ -794,9 +750,6 @@ fn a_receipt_that_lands_after_the_echoing_frame_still_lights_the_insert() {
     );
 }
 
-/// One line pasted with its line break after the three typed echoes (a link
-/// copied with its line ending), the insert priced `width`, its echo landing the
-/// caret at `to` in one frame: the glow, and the admission rows that frame drew.
 fn line_break_paste(width: InsertWidth, to: (u16, u16)) -> (CursorGlow, Vec<String>) {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
@@ -816,12 +769,6 @@ fn line_break_paste(width: InsertWidth, to: (u16, u16)) -> (CursorGlow, Vec<Stri
     (glow, rows)
 }
 
-/// A line pasted with its line break (`InsertWidth::Line`, a link copied with
-/// its line ending) echoes the line and the break's new line in one frame, the
-/// caret going from `(3, 5)` down to the next row's start `(4, 2)`: the line is
-/// laid as the insert's one sweep `5 → 16` on its own row, the rest of the move
-/// is judged from the line's end as any other (nothing licenses a row change
-/// here), and the keys typed on the new line lay there.
 #[test]
 fn a_line_pasted_with_its_line_break_lays_the_line_on_its_own_row() {
     let (mut glow, rows) = line_break_paste(InsertWidth::Line(11), (4, 2));

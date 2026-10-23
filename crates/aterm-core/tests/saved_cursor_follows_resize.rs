@@ -38,7 +38,6 @@ impl Path {
     }
 }
 
-/// A terminal as the window builds one (ring and tiered store), or a plain one.
 fn terminal(tiered: bool, rows: u16, cols: u16) -> Terminal {
     if tiered {
         Terminal::with_scrollback(rows, cols, 1000, Scrollback::with_defaults())
@@ -47,8 +46,6 @@ fn terminal(tiered: bool, rows: u16, cols: u16) -> Terminal {
     }
 }
 
-/// Narrowed while vim was up: the rewrap moves the command line down a row,
-/// and the prompt lands on the row after it.
 #[test]
 fn a_narrowing_under_the_alternate_screen_moves_the_saved_cursor_with_its_line() {
     for (tiered, path) in [
@@ -83,8 +80,6 @@ fn a_narrowing_under_the_alternate_screen_moves_the_saved_cursor_with_its_line()
     }
 }
 
-/// Grown taller while vim was up: the grow reveals history above the saved
-/// screen, and the prompt follows its line down instead of overwriting `out3`.
 #[test]
 fn a_grow_under_the_alternate_screen_moves_the_saved_cursor_with_the_reveal() {
     for tiered in [false, true] {
@@ -105,9 +100,6 @@ fn a_grow_under_the_alternate_screen_moves_the_saved_cursor_with_the_reveal() {
     }
 }
 
-/// No alternate screen: DECSC, a narrowing, DECRC. The slot follows the line
-/// it was saved on, so `X` is appended to `tail` instead of overwriting a
-/// rewrapped row.
 #[test]
 fn a_bare_decsc_follows_its_line_through_a_rewrap() {
     for (tiered, path) in [
@@ -128,8 +120,6 @@ fn a_bare_decsc_follows_its_line_through_a_rewrap() {
     }
 }
 
-/// The narrowing outgrows the screen and pushes its top row into history: the
-/// slot moves up with the rows that stay.
 #[test]
 fn a_bare_decsc_follows_its_line_when_the_rewrap_pushes_rows_into_history() {
     for (tiered, path) in [
@@ -149,8 +139,6 @@ fn a_bare_decsc_follows_its_line_when_the_rewrap_pushes_rows_into_history() {
     }
 }
 
-/// The round trip is exact: narrowed and widened back while vim was up, the
-/// prompt lands where it would have without the resizes.
 #[test]
 fn a_width_round_trip_under_the_alternate_screen_leaves_the_saved_cursor_in_place() {
     for (tiered, path) in [
@@ -177,8 +165,6 @@ fn a_width_round_trip_under_the_alternate_screen_leaves_the_saved_cursor_in_plac
     }
 }
 
-/// The alternate screen's own slot follows the alternate screen's rows: a
-/// shrink that demotes its top rows moves the saved cursor up with its row.
 #[test]
 fn the_alternate_screens_saved_cursor_follows_a_demoting_shrink() {
     let mut term = Terminal::new(10, 20);
@@ -192,11 +178,6 @@ fn the_alternate_screens_saved_cursor_follows_a_demoting_shrink() {
     assert_eq!(screen(&term)[3], "r5X", "{:?}", screen(&term));
 }
 
-/// A column a program saved past its output (`abc`, then a move to column 31) names no cell
-/// of the line, only a distance from its start. A width change keeps that distance where the
-/// new width has room and clamps it to the last column otherwise, as xterm, which never
-/// moves the slot, restores it; pulling it back to the content's end (the live cursor's rule)
-/// would put the next glyph right after `abc`.
 #[test]
 fn a_saved_column_past_the_lines_content_keeps_its_distance() {
     for (cols, expected) in [(100u16, 30usize), (60, 30), (20, 19)] {
@@ -228,16 +209,6 @@ fn a_saved_column_past_the_lines_content_keeps_its_distance() {
     }
 }
 
-/// A slot a shrink left past the grid (DECSC on the blank row below the
-/// cursor, which the shrink trimmed) is below the content it followed. A grow
-/// hands the trimmed row back before it reveals history (`aterm_grid`'s rows
-/// hand-back) and moves the slot down with the content it reveals over, so the
-/// slot is back on its own row, the blank under the output. With the trim
-/// forgotten (the law before the hand-back, which a replay of an older
-/// recording runs) the grow reveals history only and the slot rides it, still
-/// past the grid. Grown once more, the grid gains the blank row the slot
-/// names, and DECRC lands there, not on the last line of output, which a slot
-/// clamped into the grid at the reveal would overwrite.
 #[test]
 fn a_slot_past_the_grid_rides_a_reveal_below_the_content() {
     for path in [Path::Sync, Path::Offloaded] {
@@ -287,12 +258,6 @@ fn a_slot_past_the_grid_rides_a_reveal_below_the_content() {
     }
 }
 
-/// A narrowing that rewraps more rows than fit below a cursor too near the top
-/// pushes them off the bottom into history, as a rows-only shrink's bottom push
-/// does, and the grow back puts them back under the screen (
-/// it dropped them). A slot saved on one of them stays past the grid while its
-/// line is in history, not clamped onto the last row kept, and comes back
-/// with it: DECRC after the grow lands on its own cell.
 #[test]
 fn a_slot_on_a_line_the_narrowing_pushed_off_comes_back_with_it() {
     for path in [Path::Sync, Path::Offloaded] {
@@ -315,11 +280,6 @@ fn a_slot_on_a_line_the_narrowing_pushed_off_comes_back_with_it() {
     }
 }
 
-/// A slot past the grid (its blank row trimmed) stays past the grid through a
-/// widening, which puts that blank row back under the output (the rows
-/// hand-back lays the widened rows out as the screen held them): DECRC lands
-/// on the blank row under the output, and once grown by a row, which reveals
-/// history at the top, on the blank row again, not on the output's last line.
 #[test]
 fn a_slot_past_the_grid_stays_below_the_content_through_a_widening() {
     for path in [Path::Sync, Path::Offloaded] {
@@ -343,13 +303,6 @@ fn a_slot_past_the_grid_stays_below_the_content_through_a_widening() {
     }
 }
 
-/// A move that follows the content inside an offloaded width change's window
-/// keeps the history rows the re-attach owes (`FillDebt`): DECRC and the 1049
-/// exit's restore (the slot moves with the rows), VT52 `ESC A` and the reverse
-/// wrap (one row up from the cursor) land on the rows the synchronous resize
-/// moved down, and the re-attach pulls the history over the blanks under them
-/// as that resize did. A full screen widened in one step: every row ends where
-/// the synchronous resize leaves it.
 #[test]
 fn a_move_that_follows_the_content_in_the_offload_window_keeps_the_owed_rows() {
     let fixture = |term: &mut Terminal| {

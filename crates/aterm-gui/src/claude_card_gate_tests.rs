@@ -106,12 +106,7 @@ fn cat_card(app: &App, session: u64) {
     bytes(app, session, "\r\n$ claude\r\n");
 }
 
-/// THE GATE, AS A FUNCTION (§3.8): integer checks, cheapest first, each one
-/// failing closed — the token the frame's fence names, the reader, the
-/// fence (one span holding every card row on main; the alternate screen
-/// wholly the drawer's on alt) and the build policy (Exact: the banner names
-/// the image's build; Registry: its own row's; ProvenanceOnly: the fence
-/// alone; None: bare).
+/// The gate checks token, reader kind, fence, and build policy, failing closed.
 #[test]
 fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
     let rows = card_screen(24, 120, MODEL, VERSION);
@@ -233,8 +228,7 @@ fn the_gate_checks_token_kind_fence_and_build_and_fails_closed() {
     );
 }
 
-/// THE POLICY TABLE (§3.8): the image's source × its program's banner
-/// build, as `aterm_phase` declares it beside each reader.
+/// Build policy by image source and program banner build.
 #[test]
 fn the_build_policy_is_the_images_source_by_its_banner_build() {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -309,11 +303,7 @@ fn the_build_policy_is_the_images_source_by_its_banner_build() {
     );
 }
 
-/// THE FIRST FRAME (§3.8, §8): a Claude Code whose image is published and
-/// whose fence is cut is decorated on the first frame that shows its card,
-/// with no footer facts — no registry row is waited on — for ONE timeline
-/// lock a pane a frame; settled (held, its window out of focus: a focused
-/// card flows on), it costs no clock read and no allocation.
+/// A Claude Code with a published image and cut fence is decorated on its first frame with no footer facts.
 #[test]
 fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     let (mut app, wid, session, host) = bare_window();
@@ -386,12 +376,7 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     host.shutdown_and_join();
 }
 
-/// THE GATE'S CONTROLS ON THE GLASS (§7 "A, the gate"): the very screen that
-/// decorates under its own drawer stays bare, for the reason the probe's
-/// `card-bare` row names, under each of: a 2.1.303 image (Exact), a fence
-/// that names another token, an agy card (rows kind 4) under Claude Code, a
-/// mark tainted by what lay under the cursor at its cut, and a card the
-/// drawer did not write (above its span).
+/// The gate keeps every card bare unless its token, reader kind, build, untainted mark, and fence match the drawer.
 #[test]
 fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -501,10 +486,7 @@ fn agy_image(pgid: i32, version: &str) -> HolderImage {
     )
 }
 
-/// AGY IS JUDGED BY ITS FENCE ALONE (§3.8, ProvenanceOnly): an agy 1.4.2
-/// store image decorates the card it paints whatever build its banner
-/// prints (every 1.4.x fixture prints 1.4.0), and a predecessor's — or a
-/// quoted — agy card above its span stays bare, for the fence's reason only.
+/// An agy card is judged by its fence alone (`ProvenanceOnly`), keeping cards above its span bare.
 #[test]
 fn an_agy_card_is_judged_by_its_fence_alone() {
     let agy = agy_card_screen("1.4.0");
@@ -613,10 +595,7 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
     );
 }
 
-/// A SAME-BUILD INLINE RELAUNCH (§7; `/exit`, then `claude` again): the old
-/// card, the same build's, is still on the glass above the new process's
-/// span; the new process is a new snapshot token, and until it paints its
-/// own card the old one stays bare (the fence) and arms nothing.
+/// A same-build inline relaunch keeps the old card above the new process's span bare until it paints its own.
 #[test]
 fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     let (mut app, wid, session, host) = bare_window();
@@ -656,17 +635,11 @@ fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     host.shutdown_and_join();
 }
 
-/// Claude Code 2.1.304's first inline frame, byte for byte as it wrote it in
-/// the lab at 144 columns (`CLAUDE_CODE_NO_FLICKER=0`, 2026-10-20): its
-/// card, the composer between its rules and the mode row, one write of 871
-/// characters, ending with the cursor moved back up into the composer.
+/// Claude Code 2.1.304's first inline frame at 144 columns (`CLAUDE_CODE_NO_FLICKER=0`).
 const CLAUDE_2_1_304_INLINE: &str =
     include_str!("../tests/fixtures/claude-card/claude-2.1.304-inline-first-frame-144col.out");
 
-/// THE SAME-BUILD INLINE RELAUNCH ON 2.1.304's OWN BYTES (§7: the fixture
-/// re-captured for 2.1.304): its first frame, `/exit` (the shell's prompt
-/// under its frame), and the same build again, its first frame drawn under
-/// the old one.
+/// A same-build inline relaunch on Claude Code 2.1.304's captured first-frame bytes keeps the old card bare.
 #[test]
 fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
     const BUILD: &str = "2.1.304";
@@ -714,8 +687,7 @@ fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
     host.shutdown_and_join();
 }
 
-/// THE FULLSCREEN GAP (§7): Claude Code under `CLAUDE_CODE_NO_FLICKER=1`
-/// takes the alternate screen.
+/// The alternate screen is the drawer's only once cleared (`1049h` vs `47h`).
 #[test]
 fn the_alternate_screen_is_the_drawers_only_once_cleared() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -774,10 +746,7 @@ fn resume(app: &App, session: u64, token: u64) {
     cut(app, session, Some(token), CutKind::Group, false);
 }
 
-/// CTRL-Z, `clear`, `cat card`, `fg` (§7): the card the shell printed while
-/// Claude Code was stopped — the same build's, byte for byte, under the
-/// shell's command line — stays bare when Claude is back in front: the
-/// stopped drawer's sealed rows were rewritten.
+/// A card printed by the shell while Claude Code was stopped stays bare when Claude resumes (`fg`).
 #[test]
 fn a_card_catted_while_claude_was_stopped_stays_bare() {
     let run = |rewrite: bool, seal: bool| {
@@ -836,9 +805,7 @@ fn a_card_catted_while_claude_was_stopped_stays_bare() {
     assert_eq!(armed, 1, "CONTROL: unarmed");
 }
 
-/// CTRL-Z, `clear`, `cat card`, `fg` AS CLAUDE CODE 2.1.304 PLAYS IT (§8,
-/// live: on `SIGCONT` it repaints its card under the shell's `fg`, 2-3 ms
-/// after the cut).
+/// A card repainted by Claude Code after `fg` is decorated under the shell-printed card.
 #[test]
 fn a_card_claude_repaints_after_fg_is_decorated_under_the_catted_one() {
     let (mut app, wid, session, host) = bare_window();
@@ -907,9 +874,7 @@ fn a_card_claude_repaints_after_fg_is_decorated_under_the_catted_one() {
     host.shutdown_and_join();
 }
 
-/// A WIDTH RESIZE (§7): rows above Claude Code's span that unwrap at a wider
-/// width move its card up, and the fence's anchors move with them (the grid
-/// lends them to the reflow): the card stays decorated at its new place.
+/// A width resize moves fence anchors with reflowed rows so the card stays decorated.
 #[test]
 fn a_width_resize_keeps_the_card_decorated() {
     let run = |lend: bool| {
@@ -944,10 +909,7 @@ fn a_width_resize_keeps_the_card_decorated() {
     assert_eq!(after, None, "CONTROL: no lend, bare: {reasons:?}");
 }
 
-/// THE RE-SHOW BOUND (§3.9): Claude Code stopped and brought back within
-/// [`RESHOW_MS`] of its card's show is not shown again until that bound —
-/// the card's own wake asks for the frame at that instant, with no input —
-/// then shown, unarmed.
+/// The re-show bound holds a card stopped and resumed within [`RESHOW_MS`] until the bound expires.
 #[test]
 fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
     let (mut app, wid, session, host) = bare_window();
@@ -1017,9 +979,7 @@ fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
     host.shutdown_and_join();
 }
 
-/// THE BOUND HOLDS A SUSTAINED FLAP (§3.9, photosensitivity): Claude Code
-/// stopped and resumed every 40 ms for over a second — a hide while a show
-/// is held back among them — on a frame every 20 ms.
+/// The re-show bound spaces shows by at least [`RESHOW_MS`] under a sustained stop/resume flap.
 #[test]
 fn the_reshow_bound_holds_a_sustained_flap() {
     let (mut app, wid, session, host) = bare_window();
@@ -1080,9 +1040,7 @@ fn resume_quiet(app: &App, session: u64, token: u64) {
     cut(app, session, Some(token), CutKind::Group, false);
 }
 
-/// THE DEV ROWS' JUDGE (§8): `card-decorated bare_frames=` counts the frames
-/// composed after the drawer's card was on the glass and before it was
-/// decorated.
+/// `card-decorated` dev rows count frames composed between a card's appearance and its decoration.
 #[test]
 fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -1154,8 +1112,7 @@ fn the_dev_rows_count_the_frames_a_drawers_card_was_bare() {
     host.shutdown_and_join();
 }
 
-/// THE HOLDER AFTER A RESTORE (§3.8, `spawn::adopt_restored_holder`): the
-/// foreground leader is read from the kernel and its image published.
+/// `spawn::adopt_restored_holder` re-derives the foreground holder from the kernel after restore.
 #[cfg(unix)]
 #[test]
 fn a_restore_re_derives_the_holder_from_the_kernel() {
@@ -1378,11 +1335,7 @@ fn shell_in_front(app: &App, session: u64) {
     cut(app, session, None, CutKind::Group, true);
 }
 
-/// THE REGISTRY RUNG ACROSS CTRL-Z AND `fg` (§3.8, §3.13): a Claude Code of
-/// unknown build is bare until its own registry row lands, then decorated;
-/// stopped with Ctrl-Z (its facts left standing for its group) and resumed,
-/// its image published again on `fg`'s group edge, it repaints its card —
-/// decorated again, held to the same row, unarmed.
+/// The registry rung decorates an unknown-build Claude Code once its row lands and survives Ctrl-Z and `fg`.
 #[test]
 fn the_registry_rung_survives_ctrl_z_and_fg() {
     const BREW: &str = "/opt/homebrew/bin/claude";
@@ -1466,11 +1419,7 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
     }
 }
 
-/// THE REGISTRY RUNG HOLDS AN IMAGE TO ITS OWN ROW ALONE (§3.8): an image of
-/// unknown build is never held to a row of another group's that the facts
-/// slot still keeps, nor to the row that stood for its own group when it
-/// was published (the image its `exec` replaced wrote that one); only its
-/// own row, from a new owner, decides its build.
+/// The registry rung holds an unknown-build image to its own row alone, never another group's or a replaced image's.
 #[test]
 fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
     let (mut app, wid, session, host) = bare_window();

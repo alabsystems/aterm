@@ -72,11 +72,6 @@ impl Default for SelCache {
 /// // Interning is idempotent: the cached pointer IS the uncached one.
 /// assert_eq!(a, aterm_objc::sel_uncached(c"length"));
 /// ```
-/// # use aterm_objc::sel;
-/// let a = sel!(length);
-/// let b = sel!(initWithBytes:length:encoding:);
-/// assert!(!a.is_null() && !b.is_null());
-/// // Interning is idempotent: the cached pointer IS the uncached one.
 ///
 /// The name is assembled at compile time (`stringify!` per token, `concat!`,
 /// then a `const` `CStr::from_bytes_with_nul`), so an invalid C string cannot

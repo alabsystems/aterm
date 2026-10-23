@@ -1072,7 +1072,8 @@ mod acceptance {
     /// rows carry `new-window -d "<dir>"`, the directory as working directory
     /// and tooltip, the folder icon and the row's title in the link's property
     /// store (`PKEY_Title`); then the tasks, `new-tab` and `new-window`, with the
-    /// exe's icon, their tooltips and titles.
+    /// exe's icon, their tooltips and titles. With Windows' recent items off the
+    /// shell refuses the category and the store holds the tasks alone.
     ///
     /// # Errors
     /// Returns a setup failure when APPDATA or the current executable is unavailable.

@@ -253,8 +253,17 @@ fn a_part_is_rounded_once_not_per_coalition() {
             }));
         }
     });
-    assert_eq!(row(&f, 600).cpu_mc, 1, "a row is rounded on its own");
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2178, 0));
+    assert_eq!(
+        (600..610).map(|id| row(&f, id).cpu_mc).collect::<Vec<_>>(),
+        [1, 1, 1, 1, 1, 1, 1, 1, 0, 0],
+        "ten 0.80s rounded as a set, the lower ids up first"
+    );
+    assert_eq!(
+        f.split.rows.iter().map(|r| r.cpu_mc).sum::<i64>(),
+        3308,
+        "the rows add up to the parts, where one by one they would read 3310"
+    );
 
     let calm = Scene {
         busy_mc: 2,

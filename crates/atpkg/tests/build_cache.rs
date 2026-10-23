@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const HANG: Duration = Duration::from_secs(60);
+/// A wait for something that must happen, the first exec of the build script cargo just
+/// linked among it: the first-exec hang detector, not a budget.
+const HANG: Duration = aterm_uds::deadline::FIRST_EXEC_HANG;
 
 const BUILD_RS: &str = r#"
 fn main() {
@@ -45,10 +47,15 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
             targo.display()
         ));
     }
-    let tmp = aterm_tempfile::Builder::new()
-        .prefix("atpkg-build-cache-nested-")
-        .tempdir()
-        .unwrap();
+    // Cargo links and runs outer's build script under it: kept unless that script exited on
+    // its own.
+    let mut tmp = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("atpkg-build-cache-nested-")
+            .tempdir()
+            .unwrap()
+            .keep(),
+    );
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let home = root.join("home");
     std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
@@ -109,6 +116,8 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
         "{status}: {}",
         std::fs::read_to_string(&log).unwrap_or_default()
     );
+    // Cargo succeeds only once the build script exited 0 on its own.
+    tmp.ran();
 
     let cache: PathBuf = atpkg::build_cache::build_dir(&atpkg::build_cache::cache_root(&home), &ws);
     assert!(

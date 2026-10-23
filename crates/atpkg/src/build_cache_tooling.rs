@@ -44,8 +44,10 @@ fn last_used(path: &Path, depth: usize) -> Option<SystemTime> {
 }
 
 /// Why the root's child `entry` goes at `now`, if it does: a completed row's stage at
-/// once, or a row unused for [`RECLAIM_IDLE`]. Scratches and their stages stay, as does
-/// anything but a folder (a link, a file).
+/// once, a row unused for [`RECLAIM_IDLE`], or a scratch carrying both its give-up stamp
+/// and a run's proof. Both markers must be regular files, not links. Elapsed time or a
+/// reboot cannot prove an image ran. Current failed provisioning paths publish no run
+/// proof, so their scratches stay, as do live scratches, scratch stages and nonfolders.
 fn why(entry: &Path, now: SystemTime) -> Option<Unused> {
     let name = entry.file_name()?.to_str()?;
     if !std::fs::symlink_metadata(entry).is_ok_and(|m| m.is_dir()) {
@@ -56,7 +58,10 @@ fn why(entry: &Path, now: SystemTime) -> Option<Unused> {
             .then_some(Unused::Unfinished);
     }
     if name.starts_with(aterm_uds::host::TOOLING_SCRATCH) {
-        return None;
+        let given_up = [aterm_uds::deadline::EXEC_STAMP, aterm_uds::deadline::RAN]
+            .iter()
+            .all(|stamp| std::fs::symlink_metadata(entry.join(stamp)).is_ok_and(|m| m.is_file()));
+        return given_up.then_some(Unused::GivenUp);
     }
     let idle = now
         .duration_since(last_used(entry, DEPTH)?)
@@ -111,7 +116,7 @@ pub fn reclaim(
         if !record(&entry, why) {
             continue;
         }
-        let stage = if why == Unused::Unfinished {
+        let stage = if matches!(why, Unused::Unfinished | Unused::GivenUp) {
             entry.clone()
         } else {
             let Some(name) = entry.file_name() else {
@@ -169,8 +174,8 @@ mod tests {
 
     /// The idle rule over the tooling cache: a row unused a month goes, one a run used
     /// stays (an exec's access time is use), a completed row's stage is finished, and a
-    /// link is never followed. Scratches stay even when old or already staged: no age
-    /// proves their copied image finished running. NEGATIVE CONTROL: the same completed
+    /// link is never followed. Scratches with no exec stamp stay even when old or already
+    /// staged: no age proves their copied image finished running. NEGATIVE CONTROL: the same completed
     /// row with one file's access time set yesterday (as an exec sets it) stays.
     #[cfg(unix)]
     #[test]
@@ -269,6 +274,112 @@ mod tests {
             "a link is never followed"
         );
         assert!(root.join("linked-1.0").exists(), "nor removed");
+    }
+
+    /// Only an actual run proof admits a given-up scratch. Old, malformed and pre-reboot
+    /// exec stamps without proof stay; so do live scratches and non-file/link markers.
+    /// The private files are metadata stand-ins, never copied or executed programs.
+    #[cfg(unix)]
+    #[test]
+    fn a_given_up_scratch_goes_only_after_its_run_is_proven() {
+        use aterm_uds::deadline::{EXEC_STAMP, FIRST_EXEC_HANG, RAN};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().join("tooling.noindex");
+        let now = SystemTime::now();
+        let kept = [
+            (".provision-fish-spent", Some("")),
+            (".provision-fish-rebooted", Some("18446744073709551615")),
+            (".provision-fish-fresh", Some("0")),
+            (".provision-fish-live", None),
+            (".provision-fish-proof-live", None),
+            (".provision-fish-proof-dir", Some("0")),
+            (".provision-fish-proof-link", Some("0")),
+            (".provision-fish-stamp-link", None),
+            (".provision-fish-vetoed", Some("0")),
+        ];
+        let proven = ".provision-fish-proven";
+        for (name, stamp) in kept.into_iter().chain([(proven, Some("0"))]) {
+            file(
+                &root
+                    .join(name)
+                    .join("target.noindex/release/build/x/build-script-build"),
+            );
+            if let Some(at) = stamp {
+                std::fs::write(root.join(name).join(EXEC_STAMP), at).unwrap();
+            }
+            age_tree(&root.join(name), now - RECLAIM_IDLE - DAY);
+        }
+        std::fs::write(
+            root.join(".provision-fish-fresh").join(EXEC_STAMP),
+            aterm_uds::process::awake_ms()
+                .map(|ms| ms.to_string())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        for name in [
+            proven,
+            ".provision-fish-proof-live",
+            ".provision-fish-stamp-link",
+            ".provision-fish-vetoed",
+        ] {
+            std::fs::write(root.join(name).join(RAN), b"").unwrap();
+        }
+        std::fs::create_dir(root.join(".provision-fish-proof-dir").join(RAN)).unwrap();
+        let outside = dir.path().join("outside-proof");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".provision-fish-proof-link").join(RAN))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            root.join(".provision-fish-stamp-link").join(EXEC_STAMP),
+        )
+        .unwrap();
+
+        let names = |planned: Vec<Planned>| {
+            planned
+                .into_iter()
+                .map(|p| {
+                    assert_eq!(p.why, Unused::GivenUp);
+                    p.path.file_name().unwrap().to_string_lossy().into_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![proven, ".provision-fish-vetoed"];
+        assert_eq!(names(plan(&root, now)), expected);
+        assert_eq!(
+            names(plan(&root, now + RECLAIM_IDLE + FIRST_EXEC_HANG)),
+            expected,
+            "even another month and 600 seconds cannot replace a run proof"
+        );
+        let mut asked = Vec::new();
+        let removed = reclaim(&root, now, &mut |path, why| {
+            assert_eq!(why, Unused::GivenUp);
+            asked.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            !path.ends_with(".provision-fish-vetoed")
+        });
+        assert_eq!(asked, expected, "unproved images never reach the callback");
+        let gone: Vec<String> = removed
+            .iter()
+            .map(|(p, why)| {
+                assert_eq!(*why, Unused::GivenUp, "{}", p.display());
+                p.file_name().unwrap().to_string_lossy().into_owned()
+            })
+            .collect();
+        assert_eq!(gone, [proven], "{removed:#?}");
+        assert!(!root.join(proven).exists());
+        for (name, _) in kept {
+            assert_eq!(
+                std::fs::read(
+                    root.join(name)
+                        .join("target.noindex/release/build/x/build-script-build")
+                )
+                .unwrap(),
+                b"x",
+                "{name} stays at its original path"
+            );
+            assert!(!root.join(format!("{STAGE}{name}")).exists());
+        }
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside");
     }
 
     #[test]

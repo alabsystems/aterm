@@ -10,6 +10,9 @@ use std::rc::Weak;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{
     send_bool, send_bool_isize, send_id, send_id_usize, send_usize, send_v_bool, send_v_id,
 };
@@ -63,6 +66,9 @@ pub(super) struct AppState {
     wake_armed: wake_queue::Armed,
 }
 
+// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`, where upstream used objc2's. All
+// three rows are `@optional`, which AppKit reaches by `-respondsToSelector:`, so a row that failed
+// to register would fail silently; the live-class audit reads them back.
 aterm_objc::declare_class! {
     /// The `NSApplicationDelegate` installed on `NSApp` and owner of the event-loop state.
     #[derive(Debug)]
@@ -157,6 +163,8 @@ impl ApplicationDelegate {
             );
         }
 
+        // LOCAL PATCH (aterm): always; `with_default_menu` is gone. aterm replaces the main menu,
+        // but this one registers the Services menu.
         // SAFETY: `ns_app` is the live shared `NSApplication`.
         unsafe { menu::initialize(ns_app, mtm) };
 
@@ -373,6 +381,11 @@ impl ApplicationDelegate {
         self.handle_event(Event::Resumed);
     }
 
+    /// LOCAL PATCH (aterm): a NESTED run loop inside the handler (an
+    /// app-modal `NSAlert runModal`) turns the observers with the handler
+    /// borrowed, so nothing re-arms the waker, and a past-due `WaitUntil` left
+    /// it firing at its 0.1 µs interval in every common mode: 88 % CPU for as
+    /// long as the dialog stood.
     fn stop_waker_in_nested_loop(&self) {
         if self.ivars().event_handler.in_use() {
             self.ivars().waker.borrow_mut().stop();
@@ -422,6 +435,9 @@ impl ApplicationDelegate {
             return;
         }
 
+        // LOCAL PATCH (aterm): each dispatch below is contained on its own, so a raise in the
+        // application's handling of one still lets the rest of the turn run (redraws,
+        // `AboutToWait`, the exit checks, the waker re-arm).
         let _ = aterm_objc::contain("CFRunLoop observer: UserEvent", || {
             self.handle_event(Event::UserEvent(HandlePendingUserEvents));
         });
@@ -472,6 +488,9 @@ impl ApplicationDelegate {
         };
         self.ivars().waker.borrow_mut().start_at(min_timeout(wait_timeout, app_timeout));
 
+        // LOCAL PATCH (aterm): a send armed after this turn's drain signalled only once; if a
+        // nested run loop handled that signal, nothing would bring the drain it is owed, so wake
+        // once more (`wake_queue.rs`, COALESCED WAKES).
         if self.ivars().wake_armed.is_set() {
             self.ivars().run_loop.wakeup();
         }
@@ -485,7 +504,14 @@ fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
 
+/// A hack to make activation of multiple windows work when creating them before
+/// `applicationDidFinishLaunching:` / `Event::NewEvents(StartCause::Init)`.
+///
+/// # Safety
+/// `app` must be the live shared `NSApplication`.
 unsafe fn window_activation_hack(app: Id) {
+    // LOCAL PATCH (aterm): the array is walked by index, in an explicit pool (`-windows` is +0
+    // autoreleased).
     autoreleasepool(|_| {
         // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is `Q16@0:8` and
         // `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`, and no index below the count is out of

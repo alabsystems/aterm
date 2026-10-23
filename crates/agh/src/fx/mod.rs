@@ -43,19 +43,17 @@ pub enum Mode {
     Recording,
     /// `--replay`: every door answered from a tape; nothing sent, no time passes.
     Replaying,
-    /// `--replay OLD --record NEW`: exchanges and clocks from OLD, taped again, with this run's own stdout and exit, into NEW.
+    /// `--replay OLD --record NEW`.
     Rerecording,
 }
 
-/// The world behind an `Fx`.
 enum Seam {
     /// The OS clocks, behind a mutex held for one clock read.
     Live(Mutex<LiveSeam<OsEffects>>),
     /// A test's virtual clocks.
     #[cfg(any(test, debug_assertions))]
     Simulated(sim::SimClock),
-    /// The OS, every door taped through `sink`; the Fx keeps its own clone of the sink to
-    /// finish the file.
+    /// The OS.
     Recording {
         /// The recording seam, which owns one clone of the sink.
         seam: Mutex<RecordingSeam<OsEffects, tape::TapeSink>>,
@@ -71,8 +69,7 @@ enum Seam {
         /// The `next` of a divergence: `record it live: agh --record NEW {argv}` (`live_next`).
         live: String,
     },
-    /// A tape's exchanges and clocks, answered in order and taped again into `to`, with this
-    /// run's own emits.
+    /// A tape's exchanges and clocks.
     Rerecording {
         /// The replay seam over the old tape's records, less its emits.
         from: Mutex<ReplaySeam>,
@@ -80,8 +77,7 @@ enum Seam {
         len: usize,
         /// The new tape.
         to: tape::TapeSink,
-        /// The `next` of a divergence: `record it live: agh --record NEW {argv}`. Rerecording
-        /// again cannot help, because `from` holds no answer to the run's new question.
+        /// The `next` of a divergence.
         live: String,
     },
 }
@@ -93,13 +89,10 @@ pub struct Fx {
     latch: Mutex<Option<Error>>,
 }
 
-/// A lock, through a poisoned one: a panicking door leaves no state half-made that the next
-/// door could misread, because each door's record is written in one call.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// An infallible clock read, its value.
 fn infallible<T>(read: std::result::Result<T, std::convert::Infallible>) -> T {
     match read {
         Ok(value) => value,
@@ -107,8 +100,6 @@ fn infallible<T>(read: std::result::Result<T, std::convert::Infallible>) -> T {
     }
 }
 
-/// One round trip whose body is read whole under `req.limit`: the status, the headers cut by
-/// `cut`, and the body.
 fn read_whole(
     transport: &dyn Transport,
     mut req: WireRequest<'_>,
@@ -125,9 +116,6 @@ fn read_whole(
     })
 }
 
-/// A taped answer as the pipeline reads it, its headers `canon::keep`'s as in every mode: a
-/// tape this build did not write (edited by hand, or from a build that keeps more) delivers
-/// no header a live run would have dropped.
 fn kept_response(endpoints: &Endpoints, reply: canon::Reply) -> WireResponse {
     canon::Reply {
         headers: canon::keep(endpoints, reply.headers),
@@ -136,18 +124,14 @@ fn kept_response(endpoints: &Endpoints, reply: canon::Reply) -> WireResponse {
     .into_response()
 }
 
-/// The sleep exchange's request: the length in decimal nanoseconds.
 fn sleep_request(d: Duration) -> Vec<u8> {
     d.as_nanos().to_string().into_bytes()
 }
 
-/// A replay seam's divergence as agh's error: `Replay::of`, the text through
-/// `Redactor::shapes`.
 fn diverged(d: &ReplayDivergence) -> Error {
     Error::replay(Replay::of(d), Redactor::shapes(&d.to_string()))
 }
 
-/// The refusal a streamed round trip meets under any tape.
 fn stream_not_taped() -> Error {
     Error::replay(
         Replay::StreamNotTaped,
@@ -156,9 +140,6 @@ fn stream_not_taped() -> Error {
     .with_next("run it without --record or --replay: a tape never holds a streamed answer")
 }
 
-/// `ReplaySeam::finish`'s refusal of a tape of `len` records: its `Unreached { position, .. }`
-/// through `Replay::of` (→ `Unconsumed`), why `the tape holds {n} more records after the run's
-/// exit`.
 fn ended(d: &ReplayDivergence, len: usize) -> Error {
     match d {
         ReplayDivergence::Unreached { position, .. } => Error::replay(
@@ -172,8 +153,6 @@ fn ended(d: &ReplayDivergence, len: usize) -> Error {
     }
 }
 
-/// `Replay::StreamNotTaped` for a recorded request the shapes would change: its tape would
-/// hold another question than the one a replay asks.
 fn shaped_request() -> Error {
     Error::replay(
         Replay::StreamNotTaped,
@@ -182,8 +161,6 @@ fn shaped_request() -> Error {
     .with_next("run it without --record: a tape cannot hold this request")
 }
 
-/// `Replay::BodyNotTaped` for an answer the shapes would change: its replay would answer the
-/// redacted bytes, and render other stdout than this run.
 fn shaped_reply() -> Error {
     Error::replay(
         Replay::BodyNotTaped,
@@ -193,8 +170,6 @@ fn shaped_reply() -> Error {
     .with_next("run it without --record: a tape cannot hold this answer")
 }
 
-/// `arg` as one POSIX shell word: as it is when every byte is in `[A-Za-z0-9_./:=@%+,-]` and
-/// it is not empty, else in single quotes, each `'` written `'\''`.
 fn shell_word(arg: &str) -> String {
     let plain = |b: u8| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b);
     if !arg.is_empty() && arg.bytes().all(plain) {
@@ -203,8 +178,6 @@ fn shell_word(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
-/// The `next` of a seam divergence under a tape: `record it live: agh --record NEW {argv}`,
-/// each argument of `header.argv` one POSIX shell word.
 fn live_next(header: &tape::TapeHeader) -> String {
     let mut live = String::from("record it live: agh --record NEW");
     for arg in &header.argv {
@@ -214,7 +187,6 @@ fn live_next(header: &tape::TapeHeader) -> String {
     live
 }
 
-/// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
 fn not_read(path: &Path, e: &std::io::Error) -> Error {
     Error::could_not_run(format!(
         "the tape {} could not be read: {e}",
@@ -224,7 +196,6 @@ fn not_read(path: &Path, e: &std::io::Error) -> Error {
 }
 
 /// The tape at `path`, read whole (at most `tape::TAPE_MAX` bytes) and parsed.
-///
 /// # Errors
 /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
 pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectRecord>)> {
@@ -255,7 +226,6 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
 }
 
 impl Fx {
-    /// An Fx over `seam`, its latch empty.
     const fn over(seam: Seam) -> Fx {
         Fx {
             seam,
@@ -277,7 +247,6 @@ impl Fx {
     }
 
     /// Tape this run into `path`, which must not exist.
-    ///
     /// # Errors
     /// CouldNotRun, `Sub::Local`.
     pub(crate) fn record(path: &Path, header: &tape::TapeHeader) -> Result<Fx> {
@@ -288,8 +257,7 @@ impl Fx {
         }))
     }
 
-    /// Replay the tape at `path`, read whole (at most `tape::TAPE_MAX` bytes), and hand back its header.
-    ///
+    /// Replay the tape at `path`.
     /// # Errors
     /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
     #[cfg(any(test, debug_assertions))]
@@ -298,7 +266,7 @@ impl Fx {
         Ok((Fx::replay_from(&header, records), header))
     }
 
-    /// `replay` over a tape's header and records already read (`read_tape`), so `cli::taping` can read a tape once.
+    /// `replay` over a tape's header and records already read (`read_tape`).
     pub(crate) fn replay_from(header: &tape::TapeHeader, records: Vec<EffectRecord>) -> Fx {
         let len = records.len();
         Fx::over(Seam::Replaying {
@@ -308,8 +276,8 @@ impl Fx {
         })
     }
 
-    /// Answer every exchange, clock and sleep from `old`, and tape them again, with this run's stdout and exit, into `new`.
-    ///
+    /// Answer every exchange, clock and sleep from `old`, and tape them again, with this run's
+    /// stdout and exit, into `new`.
     /// # Errors
     /// `replay`'s for `old`, `record`'s for `new`.
     #[cfg(any(test, debug_assertions))]
@@ -319,8 +287,7 @@ impl Fx {
         Ok((fx, header))
     }
 
-    /// `rerecord` over `old`'s header and records already read (`read_tape`), so `cli::taping` reads a tape once for a command line that names its verb.
-    ///
+    /// `rerecord` over `old`'s header and records already read (`read_tape`).
     /// # Errors
     /// `record`'s for `new`.
     pub(crate) fn rerecord_from(
@@ -344,7 +311,6 @@ impl Fx {
     }
 
     /// `record`, for the integration tests (plan §1, rule 9): its body is that one call.
-    ///
     /// # Errors
     /// As `record`.
     #[cfg(any(test, debug_assertions))]
@@ -353,7 +319,6 @@ impl Fx {
     }
 
     /// `replay`, for the integration tests (plan §1, rule 9): its body is that one call.
-    ///
     /// # Errors
     /// As `replay`.
     #[cfg(any(test, debug_assertions))]
@@ -362,7 +327,6 @@ impl Fx {
     }
 
     /// `rerecord`, for the integration tests (plan §1, rule 9): its body is that one call.
-    ///
     /// # Errors
     /// As `rerecord`.
     #[cfg(any(test, debug_assertions))]
@@ -383,7 +347,6 @@ impl Fx {
         }
     }
 
-    /// The latched error, if a door under a tape has met one.
     fn latched(&self) -> Result<()> {
         match &*lock(&self.latch) {
             Some(e) => Err(e.clone()),
@@ -391,8 +354,6 @@ impl Fx {
         }
     }
 
-    /// Keep `e` as the latch's error when it is a replay's (`Sub::Replay`) and the latch is
-    /// empty; hand back the latch's error, so every door after the first answers that one.
     fn latch(&self, e: Error) -> Error {
         if !matches!(e.sub, Sub::Replay(_)) {
             return e;
@@ -418,13 +379,11 @@ impl Fx {
         latch.get_or_insert(e).clone()
     }
 
-    /// A replay seam's answer, its divergence latched.
     fn replayed<T>(&self, answer: std::result::Result<T, ReplayDivergence>) -> Result<T> {
         answer.map_err(|d| self.latch(diverged(&d)))
     }
 
     /// Time since this Fx was made.
-    ///
     /// # Errors
     /// A replay's divergence (`Sub::Replay`), which the Fx latches.
     pub fn mono(&self) -> Result<Duration> {
@@ -451,7 +410,6 @@ impl Fx {
     }
 
     /// Unix seconds: the wall clock's nanoseconds over 10^9, rounded down.
-    ///
     /// # Errors
     /// As `mono`.
     pub fn wall_secs(&self) -> Result<u64> {
@@ -478,7 +436,6 @@ impl Fx {
     }
 
     /// Sleep `d`.
-    ///
     /// # Errors
     /// As `mono`.
     pub fn sleep(&self, d: Duration) -> Result<()> {
@@ -513,7 +470,6 @@ impl Fx {
     }
 
     /// One GitHub round trip, its body read whole inside the door under `req.limit`.
-    ///
     /// # Errors
     /// The outer `Result`: a replay's divergence.
     pub(crate) fn gh(
@@ -576,7 +532,6 @@ impl Fx {
     }
 
     /// `gh`, for the integration tests (plan §1, rule 9): its body is that one call.
-    ///
     /// # Errors
     /// As `gh`.
     #[cfg(any(test, debug_assertions))]
@@ -590,7 +545,6 @@ impl Fx {
     }
 
     /// A streamed round trip (`Github::call_stream`: downloads).
-    ///
     /// # Errors
     /// Recording, replaying and rerecording: `Replay::StreamNotTaped`, before anything is sent.
     pub(crate) fn gh_stream(
@@ -614,7 +568,6 @@ impl Fx {
     }
 
     /// `gh_stream`, for the integration tests (plan §1, rule 9): its body is that one call.
-    ///
     /// # Errors
     /// As `gh_stream`.
     #[cfg(any(test, debug_assertions))]
@@ -627,7 +580,6 @@ impl Fx {
     }
 
     /// One stdout write, as rendered, before the terminal filter.
-    ///
     /// # Errors
     /// A replay's divergence, latched.
     pub fn emit_stdout(&self, bytes: &[u8]) -> Result<()> {
@@ -654,10 +606,11 @@ impl Fx {
         Ok(())
     }
 
-    /// The run's end. - Recording and rerecording: the exit is taped as an emit at `DOOR_EXIT` and the file flushed.
-    ///
+    /// The run's end.
     /// # Errors
-    /// As above.
+    /// Under a tape: the latched error, or `tape::TapeSink::finish`'s; replaying, a divergence
+    /// at the exit; replaying and rerecording, `Replay::Unconsumed`, why
+    /// `the tape holds {n} more records after the run's exit`.
     pub fn finish(&self, exit: u8) -> Result<()> {
         let code = exit.to_string();
         match &self.seam {
@@ -666,8 +619,6 @@ impl Fx {
             Seam::Simulated(_) => Ok(()),
             Seam::Recording { seam, sink } => {
                 if sink.discarded() {
-                    // A run that met an answer no tape can hold removed its tape: the
-                    // refusal it latched is the answer, not the file's absence.
                     return self.latched();
                 }
                 infallible(lock(seam).emit(DOOR_EXIT, code.as_bytes()));

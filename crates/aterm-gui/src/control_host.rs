@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-gui's [`SessionHost`]: a borrowed adapter over the `(term, proxy, watchers, …)` handles [`dispatch_session`](super::dispatch_session) has already resolved, so the verb bodies in `aterm-control` drive the real window with no extra ownership, allocation or lifetime.
-//! Its terminal accessors hand the verbs a whole frame ([`term_lock_whole`]); `blocks` and `wait` read the shell's marks as they stand.
+//! `aterm-gui`'s [`SessionHost`] adapter over a resolved session's handles.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +18,7 @@ use crate::session_store::Store;
 use crate::session_watch::{Subscription, Watchers};
 use crate::{SessionCtx, Wake, term_lock, term_lock_whole};
 
+/// Borrowed [`SessionHost`] adapter for a resolved GUI session.
 pub(crate) struct GuiHost<'a> {
     /// The one session this host serves. Every per-session method refuses any
     /// other sid, so a sid the fleet-wide `resolve` hands out fails closed.
@@ -56,7 +56,7 @@ impl<'a> GuiHost<'a> {
         }
     }
 
-    /// The shipped host: [`GuiHost::new`] plus the registry the roster/selector verbs read and the resolved target's context, whose watchers it parks on.
+    /// Construct a host backed by the process session store and target context.
     pub(crate) const fn with_fleet(
         sid: u64,
         term: &'a Arc<Mutex<Terminal>>,
@@ -74,23 +74,14 @@ impl<'a> GuiHost<'a> {
         }
     }
 
-    /// Whether this host serves `sid` at all — the fail-closed gate every
-    /// per-session method takes first.
     const fn serves(&self, sid: u64) -> bool {
         sid == self.sid
     }
 }
 
-/// A [`Subscription`] as a [`ChangeWait`]. Owning it in the box preserves the
-/// RAII deregistration: the slot on the session's list lives exactly as long
-/// as the handle.
 struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
-    /// Sliced while a socket connection is being served ([`crate::park`]): a
-    /// slice that ends with no wake asks only after the caller, so the waiting
-    /// verb re-reads its session on a wake or at `timeout`, and a hang-up ends
-    /// the wait early (`false`), for the verb to ask `caller_gone`.
     fn wait(&self, timeout: Duration) -> bool {
         let until = std::time::Instant::now() + timeout;
         let woke = crate::park::park(
@@ -117,8 +108,6 @@ impl SessionHost for GuiHost<'_> {
         }
     }
 
-    /// The registry snapshot, cloned out before formatting so the store lock is
-    /// never held across a `Terminal` lock.
     fn sessions(&self) -> Vec<SessionEntry> {
         let Some(store) = self.store else {
             return Vec::new();
@@ -149,9 +138,6 @@ impl SessionHost for GuiHost<'_> {
             .collect()
     }
 
-    /// The registry's one selector lookup (`SessionStore::by_selector`), the one
-    /// the dispatcher resolves a request's `@<selector>` through, so the trait
-    /// and the wire cannot read a selector two ways.
     fn resolve(&self, selector: Selector<'_>) -> Option<u64> {
         let g = self.store?.read().unwrap_or_else(|p| p.into_inner());
         g.by_selector(&selector.into()).map(|h| h.local_id)
@@ -177,8 +163,6 @@ impl SessionHost for GuiHost<'_> {
         self.serves(sid).then(|| f(&term_lock(self.term)))
     }
 
-    /// Ended once the registry reads the session `Exited` or its fabric
-    /// endpoint is closed.
     fn session_ended(&self, sid: u64) -> bool {
         let Some(ctx) = self.ctx.filter(|_| self.serves(sid)) else {
             return false;
@@ -202,8 +186,6 @@ impl SessionHost for GuiHost<'_> {
         }
     }
 
-    /// A sid this host does not serve registers on nothing, and its wait can
-    /// only time out.
     fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_> {
         Box::new(SubscriberWait(if self.serves(sid) {
             Subscription::single(self.watchers)
@@ -216,15 +198,11 @@ impl SessionHost for GuiHost<'_> {
         crate::control::pbcopy(text)
     }
 
-    /// The GUI's one conversion ([`crate::cwd_native::native_path`]), so a
-    /// block's `cwd=` names the directory exactly as `cwd`, `meta` and the tab
-    /// strip do.
     fn native_cwd<'p>(&self, reported: &'p str) -> std::borrow::Cow<'p, str> {
         crate::cwd_native::native_path(reported)
     }
 }
 
-/// Whether a verb acts on the hold [`term_lock_whole`] gave it: never on half a frame its caller hung up waiting for (`copy`, `select`, `mainscreen` act, and nobody reads the reply).
 fn still_wanted(t: &Terminal) -> bool {
     !(crate::control::caller_hung_up() && crate::frame_unfinished_now(t))
 }
@@ -241,9 +219,6 @@ mod tests {
 
     use crate::session_store::{self, SessionHandle};
 
-    /// What the shipped `GuiHost` claims, declared to the matrix so a host that
-    /// dropped a facility cannot pass on the easy arm of each capability-gated
-    /// check.
     const GUI_HOST_PROFILE: HostCapabilities = HostCapabilities {
         frame_source: true,
         event_loop: false,
@@ -251,8 +226,6 @@ mod tests {
         roster: true,
     };
 
-    /// A session registered in a fresh registry as the GUI registers a tab:
-    /// shared engine `Arc`, fabric identity, and a sink over the `-1` master stub.
     fn registered(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
@@ -306,8 +279,6 @@ mod tests {
         }
     }
 
-    /// The full matrix passes, run declared ([`GUI_HOST_PROFILE`]), against the shipped
-    /// `GuiHost` (registry and sink wired) over real OSC-133 blocks and a live selection.
     #[test]
     fn the_gui_host_passes_the_verb_matrix() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -336,7 +307,6 @@ mod tests {
         );
     }
 
-    /// The read-only subset (safe against a real window in use) writes nothing.
     #[test]
     fn the_read_only_subset_leaves_the_gui_host_untouched() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -356,9 +326,6 @@ mod tests {
         assert_eq!(cmd_selection(&host, 0), before);
     }
 
-    /// Every per-session method declines a sibling's sid (the roster answers
-    /// fleet-wide), so a sid `resolve` hands out cannot reach the wrong
-    /// terminal.
     #[test]
     fn a_sibling_sid_is_refused_by_the_session_scoped_host() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -390,10 +357,6 @@ mod tests {
         assert!(cmd_selection(&host, 0).starts_with("OK "));
     }
 
-    /// `blocks` names a block's directory the way `cwd` does: on Windows an OSC 7
-    /// path like `/C:/Users//x` becomes `C:\Users\x`; a native cmd path and a POSIX
-    /// path from WSL or SSH pass through; on Unix nothing is converted (`/C:/` is
-    /// a legal directory there).
     #[test]
     fn a_block_cwd_is_the_native_path_the_cwd_verb_prints() {
         let blocks_cwd = |osc: &[u8]| {
@@ -424,11 +387,6 @@ mod tests {
         assert!(listed.contains(" cwd=/home/user/proj "), "{listed}");
     }
 
-    /// A cmd block's cwd is the directory its command ran in. cmd reports its
-    /// cwd from the prompt (`633;P;Cwd=$P`) and the engine files it under the
-    /// block in progress, so the injection sends it after `133;A` opens the new
-    /// block (pinned by `aterm-shell-integration`'s
-    /// `test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd`).
     #[test]
     fn a_cmd_block_cwd_is_where_its_command_ran() {
         let cwds = |cwd_after_start: bool| {
@@ -461,8 +419,6 @@ mod tests {
         assert_eq!(cwds(false), [r"C:\Windows\Temp", r"C:\Windows\Temp"]);
     }
 
-    /// The roster is the registry's, ascending by sid, with each session's stable
-    /// id.
     #[test]
     fn the_roster_is_the_registry_and_an_absent_one_says_so() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -490,9 +446,6 @@ mod tests {
         assert!(cmd_selection(&scoped, 0).starts_with("OK "));
     }
 
-    /// Closing a tab answers `await inbox` and `wait` parked on it with `ERR exited` at the
-    /// close, after which the lanes hold no `SessionCtx` clone (whose sink owns the PTY
-    /// master).
     #[test]
     fn closing_a_tab_ends_its_parked_waits_with_err_exited() {
         let mut app = crate::App::headless_for_test();
@@ -551,11 +504,6 @@ mod tests {
         );
     }
 
-    /// The exit half: a shell that exits under `--hold` keeps its pane, so no
-    /// close ever comes, and the exit edge (`exit_session_logical`, the
-    /// logical core of `Wake::Exit` and of a deferred exit's replay) must end
-    /// what is parked on it by itself: `await inbox` from the fabric it closes,
-    /// `wait` from the registry's `Exited`, whose record rings it.
     #[test]
     fn a_held_shells_exit_ends_its_parked_waits_with_err_exited() {
         let mut app = crate::App::headless_for_test();
@@ -614,7 +562,6 @@ mod tests {
         assert!(app.pool.get(id).is_some(), "the held pane stays");
     }
 
-    /// THE EXIT'S RING ENDS A PARKED `wait` BY ITSELF.
     #[test]
     fn an_exited_state_alone_ends_a_parked_wait() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));

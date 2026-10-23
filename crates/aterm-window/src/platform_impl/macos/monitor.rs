@@ -12,12 +12,17 @@ use aterm_cg::{CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGDisplayCopyDispl
 use aterm_objc::cf::CFUUID;
 use tracing::warn;
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{send_f64, send_id, send_id_id, send_id_usize, send_u32, send_usize};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, Id, Obj};
 
 use super::ffi;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 
+// LOCAL PATCH (aterm): `VideoModeHandle` and `video_modes` are gone with exclusive fullscreen; this
+// only owns the current mode `refresh_rate_millihertz` reads.
 pub struct NativeDisplayMode(pub ffi::CGDisplayModeRef);
 
 impl Drop for NativeDisplayMode {
@@ -29,6 +34,9 @@ impl Drop for NativeDisplayMode {
 }
 
 /// CoreGraphics display handle backed by a `CFUUID`.
+///
+/// LOCAL PATCH (aterm): `aterm_objc::cf::CFUUID` is `Send + Sync` itself, so upstream's two `unsafe
+/// impl`s are gone.
 #[derive(Clone)]
 pub struct MonitorHandle(CFUUID);
 
@@ -80,7 +88,8 @@ impl std::hash::Hash for MonitorHandle {
     }
 }
 
-/// Returns all active monitors with valid display UUIDs.
+/// LOCAL PATCH (aterm): a display that leaves before its UUID is read is skipped, where upstream
+/// unwrapped (a panic inside whatever AppKit callback asked).
 pub fn available_monitors() -> VecDeque<MonitorHandle> {
     if let Ok(displays) = CGDisplay::active_displays() {
         let mut monitors = VecDeque::with_capacity(displays.len());
@@ -105,6 +114,9 @@ pub fn available_monitors() -> VecDeque<MonitorHandle> {
 }
 
 /// Returns the primary monitor, or `None` during display reconfiguration.
+///
+/// LOCAL PATCH (aterm): upstream unwraps the main display's UUID, which is `None` for an instant
+/// mid-reconfiguration; this falls back to the first active display, then `None`.
 pub fn primary_monitor() -> Option<MonitorHandle> {
     MonitorHandle::new(CGDisplay::main().id).or_else(|| {
         warn!("main display has no UUID right now; falling back to the first active display");

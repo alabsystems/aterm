@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Renders preview PNG panels of `aterm_effects::harness_card` across [`GROUNDS`] at [`HI_CW`] ×
-//! [`HI_CH`] and [`FLOW_AT`].
+//! Renders preview PNG panels of `aterm_effects::harness_card` across [`GROUNDS`].
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -18,25 +17,16 @@ use aterm_time::Instant;
 use aterm_types::scheme::{Appearance, builtin};
 use std::time::Duration;
 
-/// One panel's size in pixels, before the 2× scale: the grid's six rows (a
-/// blank row, the card's three, the line's, a blank row) and the origin's
-/// margin either side.
 const PANEL_W: usize = 620;
 const PANEL_H: usize = ORIGIN + 6 * CH + ORIGIN;
 
-/// The cell the panels are laid out on.
 const CW: usize = 9;
 const CH: usize = 18;
 
-/// The grid's origin inside a panel.
 const ORIGIN: usize = 8;
 
-/// The card's banner row: a blank row over it (the box's air) and, under the
-/// line, another.
 const TOP: usize = 1;
 
-/// Claude's mascot as the measured 2.1.303 card draws it (columns 0 to 8 of
-/// its three rows), and its orange.
 const MASCOT: [&str; 3] = [
     " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}",
     "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}",
@@ -44,32 +34,20 @@ const MASCOT: [&str; 3] = [
 ];
 const MASCOT_RGB: u32 = 0x00D7_7757;
 
-/// The generic sheets' grounds: a dark one, and white paper.
 const DARK_BG: u32 = 0x001A_1B26;
 const LIGHT_BG: u32 = 0x00FA_FAF8;
 
-/// The output scale: each pixel drawn as a `SCALE × SCALE` block.
 const SCALE: usize = 2;
 
-/// The kitty sheets' scale.
 const KITTY_SCALE: usize = 5;
 
-/// The episode's second blink and second tail flick, ms in
-/// (`harness_card`'s `BLINK_AT_MS + BLINK_PERIOD_MS` and
-/// `FLICK_AT_MS + FLICK_PERIOD_MS`, ten ms into each): the kitty seated, the
-/// burst long gone.
 const BLINK_2_MS: u64 = 1250 + 2500 + 10;
 const FLICK_2_MS: u64 = 400 + 2500 + 10;
 
-/// The ride sheet's moments, ms into the episode.
 const RIDE_AT: [u64; 3] = [300, 800, 1200];
 
-/// The re-arm sheet's moments, ms into the episode armed again.
 const REARM_AT: [u64; 3] = [0, 300, 1200];
 
-/// The built-in themes the ground sheets lay the card on: the dark
-/// reference, then every light built-in — the four the owner judges it on
-/// first, then the three spot-checked.
 const GROUNDS: [&str; 8] = [
     "Aterm Night",
     "Aterm Day",
@@ -81,22 +59,12 @@ const GROUNDS: [&str; 8] = [
     "GitHub Light",
 ];
 
-/// The mid-shimmer moment (ms in): the sheen's centre halfway along the
-/// trail (`harness_card`'s `SHIMMER_MS` sweep at half a pass), the ride
-/// and the burst over, the step wave still running.
 const MID_SHIMMER_MS: u64 = 1500 + 750;
 
-/// The burst's moment (ms in, on the card's first showing): the ride over,
-/// the ring a sixth of its way out.
 const BURST_AT_MS: u64 = RIDE_MS + 150;
 
-/// The zoom sheet's scale.
 const ZOOM_SCALE: usize = 2;
 
-/// The flow sheet's moments, ms after the card's first arm: the first ring
-/// born past the intro (the ripple's clock starts at the arm, a ring every
-/// [`GLINT_PERIOD_MS`]), then a quarter, a half and three quarters of its
-/// cycle on — six of Claude's 128 ms frames apart.
 const FLOW_AT: [u64; 4] = [
     2 * GLINT_PERIOD_MS,
     2 * GLINT_PERIOD_MS + 6 * FLOW_STEP_MS,
@@ -104,7 +72,6 @@ const FLOW_AT: [u64; 4] = [
     2 * GLINT_PERIOD_MS + 18 * FLOW_STEP_MS,
 ];
 
-/// The line's hero word (`aterm`): its cells in the line.
 const HERO: std::ops::Range<u16> = 12..17;
 
 /// When a panel shows the card.
@@ -117,7 +84,6 @@ enum At {
 }
 
 impl At {
-    /// The moment's ms after the arm and whether the tick may animate.
     fn ms(self) -> (u64, bool) {
         match self {
             Self::Settled => (EPISODE_MS + 1, false),
@@ -126,9 +92,6 @@ impl At {
     }
 }
 
-/// Draw `card`, armed at `t0`, at `at` on `s`: a moment past the intro
-/// plays the intro first (its first frame and its last), as the glass does,
-/// so the flow takes it over.
 fn tick_to(
     card: &mut HarnessCard,
     t0: Instant,
@@ -147,31 +110,19 @@ fn tick_to(
     (now, animate, frame)
 }
 
-/// The per-ground zoom's scale.
 const GROUND_ZOOM_SCALE: usize = 3;
 
-/// The hi-fi ground sheets' cell, in device pixels: a retina cell, as the
-/// glass draws the card (the emitter works in the stream's pixels).
 const HI_CW: usize = 18;
 const HI_CH: usize = 36;
 
-/// Their glyphs' size (px): JetBrains Mono's advance is 0.6 em, so 30 px
-/// fills an [`HI_CW`] cell.
 const HI_FONT_PX: f32 = 30.0;
 
-/// Their grid's origin inside a panel.
 const HI_ORIGIN: usize = 16;
 
-/// Their card's banner row: a blank row over it (the box's air, as the lab's
-/// pane has over Claude Code's card) and, under the line, another.
 const HI_TOP: usize = TOP;
 
-/// The card's text column (Claude Code's mascot sits left of it).
 const HI_TEXT_COL: usize = 11;
 
-/// The card's three rows as Claude Code 2.1.302 writes them, and the two-row
-/// kitty's third row: a working directory whose path runs on past the
-/// trail's start.
 const HI_ROWS: [&str; 3] = [
     "Claude Code v2.1.302",
     "Opus 5.5 \u{b7} API Usage Billing",
@@ -180,7 +131,6 @@ const HI_ROWS: [&str; 3] = [
 const HI_LONG_PATH: &str =
     "/private/tmp/at.dFeo/proj/a-working-directory-whose-name-runs-on-past-the-trail";
 
-/// The line as a dev build writes it (`claude_card.rs`'s `make_line_texts`).
 const LINE_CRUISE: &str =
     "enhanced by aterm harness v0.106.3866+gd243414 \u{b7} DEV \u{b7} autopilot \u{221e} cruise";
 const LINE_LAND: &str =
@@ -188,7 +138,6 @@ const LINE_LAND: &str =
 const LINE_OFF: &str =
     "enhanced by aterm harness v0.106.3866+gd243414 \u{b7} DEV \u{b7} autopilot \u{25cb} off";
 
-/// The line's words under `palette`.
 fn line_of(palette: CardPalette) -> &'static str {
     match palette {
         CardPalette::Cruise => LINE_CRUISE,
@@ -197,29 +146,17 @@ fn line_of(palette: CardPalette) -> &'static str {
     }
 }
 
-/// The ripple's origin on a panel whose banner row is `top`: the 2.1.303
-/// mascot's right edge (its last column on the banner row), as the host
-/// finds it.
 const fn wand_at(top: usize) -> Option<(u16, u16)> {
     Some((8, top as u16))
 }
 
-/// The `✦` and the space after it, ahead of the line's words
-/// (`claude_card.rs`'s `LINE_LEAD`).
 const LINE_LEAD: usize = 2;
 
-/// The `✦`'s opacity on a light ground (`claude_card.rs`'s `make_line`):
-/// opaque ink, as the line's letters are.
 const STAR_INK_ALPHA: u8 = 255;
 
-/// The trail's longest run and the kitty's right margin, in cells
-/// (`claude_card.rs`'s `TRAIL_MAX` and `KITTY_MARGIN`): the lab's 120-column
-/// pane has room for the longest trail.
 const TRAIL_MAX: usize = 20;
 const KITTY_MARGIN: usize = 4;
 
-/// The coats the kitty sheets show (`cat_baker::COAT_RAMP` stops): black,
-/// grey, and the launch kitty's orange.
 const COATS: [u8; 3] = [1, 4, 12];
 
 fn main() -> ExitCode {
@@ -294,10 +231,6 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// A launch card at a 9 × 18 cell on the panel's second row: text to column
-/// 31, the trail to the kitty at column 40, the box 62 columns wide, four
-/// boxed rows (the card's three and the line's), a blank row over and under
-/// them (its air).
 fn base() -> CardScene {
     CardScene {
         origin_x: ORIGIN as i32,
@@ -325,7 +258,6 @@ fn base() -> CardScene {
     }
 }
 
-/// The panels, `0x00RRGGBB` pixels, [`PANEL_W`] wide and stacked.
 fn sheet() -> Vec<u32> {
     let dark = base();
     let land = CardScene {
@@ -374,8 +306,6 @@ fn sheet() -> Vec<u32> {
     img
 }
 
-/// The ride's panels, [`PANEL_W`] wide and stacked: the tall kitty dark,
-/// light, and the two-row kitty dark, each at the [`RIDE_AT`] moments.
 fn ride_sheet() -> Vec<u32> {
     let dark = base();
     let scenes = [
@@ -401,8 +331,6 @@ fn ride_sheet() -> Vec<u32> {
     img
 }
 
-/// The re-arm's panels, [`PANEL_W`] wide and stacked: a card shown at rest
-/// and armed again, the tall kitty dark then light, each at [`REARM_AT`].
 fn rearm_sheet() -> Vec<u32> {
     let dark = base();
     let scenes = [
@@ -424,8 +352,6 @@ fn rearm_sheet() -> Vec<u32> {
     img
 }
 
-/// The flow's panels, [`PANEL_W`] wide and stacked: Cruise, Land and Off
-/// on dark, then Cruise on light, each at the [`FLOW_AT`] moments.
 fn flow_sheet() -> Vec<u32> {
     let dark = base();
     let scenes = [
@@ -455,22 +381,10 @@ fn flow_sheet() -> Vec<u32> {
     img
 }
 
-/// The glint sheet's moments, ms into an episode armed again on a card shown
-/// at rest: the trail's shimmer on its second pass (`harness_card`'s
-/// `SHIMMER_MS`), from before the trail's start to past the kitty, so each
-/// glint flares as the sheen reaches it and cools as it moves on.
 const GLINT_AT: [u64; 7] = [1500, 1700, 1900, 2100, 2300, 2500, 2700];
 
-/// The glint sheet's scale.
 const GLINT_SCALE: usize = 2;
 
-/// The rainbow's glints (§10.6.16) at a retina cell ([`HI_CW`] ×
-/// [`HI_CH`]) on the longest trail (20 cells, three glints), cropped to the
-/// trail and the kitty: four columns — the tall and the two-row kitty on
-/// Aterm Night, then on Aterm Day — and down them the settled frame, then
-/// the [`GLINT_AT`] moments of an episode armed again on a card shown at
-/// rest (the kitty seated, the shimmer sweeping): its width in pixels, and
-/// its pixels.
 fn glint_sheet(grounds: &[Ground]) -> (usize, Vec<u32>) {
     let (pw, ph) = hi_panel();
     let grounds: Vec<&Ground> = grounds
@@ -527,8 +441,6 @@ fn glint_sheet(grounds: &[Ground]) -> (usize, Vec<u32>) {
     (sheet_w, img)
 }
 
-/// The kitty sheet on a dark or a light ground ([`COATS`] × both heights
-/// down, open / blink / flick across): its width in pixels, and its pixels.
 fn kitty_sheet(dark: bool) -> (usize, Vec<u32>) {
     let s = CardScene { dark, ..base() };
     let col = |c: usize| ORIGIN + c * CW;
@@ -567,15 +479,11 @@ fn kitty_sheet(dark: bool) -> (usize, Vec<u32>) {
     (sheet_w, img)
 }
 
-/// A cat baker fill (`0..=1` a channel) as `0x00RRGGBB`, as the host packs
-/// it into the scene.
 fn pack_fill((r, g, b): (f32, f32, f32)) -> u32 {
     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     (channel(r) << 16) | (channel(g) << 8) | channel(b)
 }
 
-/// A built-in theme's ground: its background, its text, and whether it is
-/// dark (the scene's `dark`, as the host decides it from the appearance).
 struct Ground {
     slug: String,
     bg: u32,
@@ -584,7 +492,6 @@ struct Ground {
 }
 
 impl Ground {
-    /// The built-in theme `name`'s ground, read from the theme pack.
     fn of(name: &str) -> Option<Self> {
         let s = builtin(name)?;
         let px =
@@ -598,20 +505,11 @@ impl Ground {
     }
 }
 
-/// The hi-fi panels' size in device pixels: the widest card (the two-row
-/// kitty's, whose long path sets its box) and six rows — the air over the
-/// card, its three, the line's and the air under it.
 fn hi_panel() -> (usize, usize) {
     let widest = HI_TEXT_COL + HI_LONG_PATH.chars().count() + 2;
     (2 * HI_ORIGIN + widest * HI_CW, 2 * HI_ORIGIN + 6 * HI_CH)
 }
 
-/// The card's place on a hi-fi panel, as `claude_card.rs`'s `layout` lays
-/// it on the lab's 120-column pane: the line under the card at its text
-/// column, the trail from two cells past the first two rows' text at its
-/// longest, the kitty after it, the box out to the kitty's margin or the
-/// furthest text; the tall kitty where the third row is blank under it; the
-/// border in the blank rows over and under the box (`Layout::air`).
 fn hi_scene(g: &Ground, palette: CardPalette, tall: bool) -> CardScene {
     let cells = |s: &str| s.chars().count();
     let line = line_of(palette);
@@ -655,8 +553,6 @@ fn hi_scene(g: &Ground, palette: CardPalette, tall: bool) -> CardScene {
     }
 }
 
-/// The bundled faces the hi-fi panels set the card's words in: JetBrains
-/// Mono regular and bold, and the symbol faces for a glyph it lacks.
 struct Fonts {
     regular: aterm_render::font::Font,
     bold: aterm_render::font::Font,
@@ -681,9 +577,6 @@ impl Fonts {
         })
     }
 
-    /// The face that draws `ch` (`bold` asks for the bold face), and the
-    /// baseline offset from a cell's top that centres JetBrains Mono's line
-    /// in a [`HI_CH`] cell.
     fn face(&self, ch: char, bold: bool) -> &aterm_render::font::Font {
         let first = if bold { &self.bold } else { &self.regular };
         std::iter::once(first)
@@ -759,7 +652,6 @@ fn draw_text(
     }
 }
 
-/// `a` mixed toward `b` by `t`, per channel.
 fn mix_px(a: u32, b: u32, t: f32) -> u32 {
     let ch = |sh: u32| {
         let (x, y) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
@@ -768,10 +660,6 @@ fn mix_px(a: u32, b: u32, t: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
-/// The card's line, letter by letter, at `now` (moving where `animate`):
-/// each letter's ink as `HarnessCard::line_ink_into` gives it for this
-/// ground, the hero word ([`HERO`]) in its own run, the glints from the
-/// wand.
 fn line_colours(
     card: &HarnessCard,
     (now, animate): (Instant, bool),
@@ -794,13 +682,6 @@ fn line_colours(
         .collect()
 }
 
-/// One hi-fi panel: the ground, the card [`At`] a moment of its first
-/// episode or the flow after it (or held), stacked as the renderers stack
-/// it — its `under` layer (the border and the trail), then the glyphs (Claude's mascot, the card's words in
-/// the theme's foreground, the banner's name bold and the rest dimmed as
-/// Claude Code dims them, and the line: the drawn `✦` and its letters in
-/// their inks, the hero word bold), then its `over` layer (the kitty, its
-/// rim and its stars).
 fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, at: At) {
     img.fill(g.bg);
     let t0 = Instant::now();
@@ -858,8 +739,6 @@ fn draw_hi(img: &mut [u32], w: usize, fonts: &Fonts, s: &CardScene, g: &Ground, 
     paint(img, w, HI_CH, over);
 }
 
-/// Paint one of a card frame's layers onto a `w`-wide panel of `ch`-high
-/// cells by the renderers' own CPU path (`aterm_render::fx::paint_layers`).
 fn paint(img: &mut [u32], w: usize, ch: usize, layer: FxLayer) {
     let h = img.len() / w;
     let frame = aterm_render::FxFrame {
@@ -873,7 +752,6 @@ fn paint(img: &mut [u32], w: usize, ch: usize, layer: FxLayer) {
     aterm_render::fx::paint_layers(img, &frame, &[layer], &[]);
 }
 
-/// The hi-fi moments, top to bottom: `(palette, tall kitty, when)`.
 const HI_SHOTS: [(CardPalette, bool, At); 8] = [
     (CardPalette::Cruise, true, At::Settled),
     (CardPalette::Cruise, false, At::Settled),
@@ -885,9 +763,6 @@ const HI_SHOTS: [(CardPalette, bool, At); 8] = [
     (CardPalette::Off, true, At::Ms(MID_SHIMMER_MS)),
 ];
 
-/// The per-ground zoom's moments (of the card's first episode): settled,
-/// the ride with its sparkles shed, the burst opening and a third of its
-/// way out, and mid-shimmer.
 const ZOOM_AT: [At; 5] = [
     At::Settled,
     At::Ms(800),
@@ -916,9 +791,6 @@ fn blit(
     }
 }
 
-/// One ground's hi-fi panels, stacked ([`HI_SHOTS`]), and its zoom: the
-/// trail, the kitty and its stars settled, at the burst and mid-shimmer,
-/// then the line's first words: `(width, panels, zoom width, zoom)`.
 fn ground_sheet(g: &Ground, fonts: &Fonts) -> (usize, Vec<u32>, usize, Vec<u32>) {
     let (w, h) = hi_panel();
     let mut img = vec![0u32; w * h * HI_SHOTS.len()];
@@ -967,9 +839,6 @@ fn ground_sheet(g: &Ground, fonts: &Fonts) -> (usize, Vec<u32>, usize, Vec<u32>)
     (w, img, zw, zoom)
 }
 
-/// The zoom sheet: per ground (a row each), the trail's last cells and the
-/// kitty with its stars, Cruise settled, the burst, Land settled and Off
-/// settled across.
 fn zoom_sheet(grounds: &[Ground], fonts: &Fonts) -> (usize, Vec<u32>) {
     let (pw, ph) = hi_panel();
     let Some(first) = grounds.first() else {
@@ -1013,7 +882,6 @@ fn zoom_sheet(grounds: &[Ground], fonts: &Fonts) -> (usize, Vec<u32>) {
     (sheet_w, img)
 }
 
-/// WCAG 2 contrast of `a` against `b`.
 fn contrast(a: u32, b: u32) -> f32 {
     let (la, lb) = (
         aterm_effects::color_math::relative_luminance(a),
@@ -1022,12 +890,6 @@ fn contrast(a: u32, b: u32) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// The line's letters measured against each ground, every palette (the
-/// `✦` wears the first letter's ink): the least WCAG contrast any letter has
-/// on any frame of the card's first episode and one ripple cycle of the
-/// flow after it, a frame every [`FRAME_MS`], and when and which letter; the
-/// settled (held) line's least and greatest; then the settled line letter
-/// by letter (`char#ink:contrast`).
 fn line_report(grounds: &[Ground]) -> String {
     use std::fmt::Write as _;
     let mut out = String::from(
@@ -1079,22 +941,16 @@ fn line_report(grounds: &[Ground]) -> String {
     out
 }
 
-/// One panel: the ground, stand-in text bars, the card [`At`] a moment of
-/// its first episode or the flow after it (or held), and the line under the
-/// card.
 fn draw_panel(img: &mut [u32], s: &CardScene, at: At) {
     draw_card(img, s, at, false);
 }
 
-/// [`draw_panel`], at a moment of an episode armed on a card fresh or, with
-/// `shown`, one whose settled frame was on the glass first.
 fn draw_card(img: &mut [u32], s: &CardScene, at: At, shown: bool) {
     let bg = if s.dark { DARK_BG } else { LIGHT_BG };
     let fg = if s.dark { 0x00C0_C4D0 } else { 0x0030_3030 };
     draw_card_on(img, s, at, shown, (bg, fg));
 }
 
-/// [`draw_card`] on a given ground: `(background, text)`.
 fn draw_card_on(img: &mut [u32], s: &CardScene, at: At, shown: bool, (bg, fg): (u32, u32)) {
     let s = &CardScene { ground: bg, ..*s };
     img.fill(bg);
@@ -1144,10 +1000,6 @@ fn draw_card_on(img: &mut [u32], s: &CardScene, at: At, shown: bool, (bg, fg): (
     }
 }
 
-/// Claude's mascot ([`MASCOT`]) on the card's three rows, from row `top`
-/// of a `w`-wide panel whose grid is `(cw, ch)` cells from `origin`, each
-/// block element filling the quadrants of its cell the font fills (a cell's
-/// left and right halves split at `cw / 2`, its top and bottom at `ch / 2`).
 fn draw_mascot_on(img: &mut [u32], w: usize, (cw, ch): (usize, usize), origin: usize, top: usize) {
     for (r, row) in MASCOT.iter().enumerate() {
         for (c, glyph) in row.chars().enumerate() {
@@ -1176,7 +1028,6 @@ fn draw_mascot_on(img: &mut [u32], w: usize, (cw, ch): (usize, usize), origin: u
     }
 }
 
-/// Write `img`, `width` pixels a row, at `scale`× as an RGB PNG.
 fn write_png(path: &Path, img: &[u32], width: usize, scale: usize) -> std::io::Result<()> {
     let (w, h) = (width * scale, img.len() / width * scale);
     let mut rgb = Vec::with_capacity(w * h * 3);

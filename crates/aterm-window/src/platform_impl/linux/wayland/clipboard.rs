@@ -4,6 +4,8 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
+//! Added by the aterm project in 2026; see the repository NOTICE.
+//!
 //! Wayland `CLIPBOARD` and `PRIMARY` selections ([`WaylandClipboard`], [`SelectionPort::copy`],
 //! [`CLAIM_ORDER`], [`CopyOutcome`]).
 
@@ -340,7 +342,8 @@ pub(crate) trait SelectionPort {
     /// Offer a fresh source for `selection` and hand it to the seat with `serial`.
     fn claim(&mut self, selection: WaylandSelection, serial: u32) -> bool;
 
-    /// Place the selection at the seat, releasing any existing source first.
+    /// Place the selection at the seat, releasing any existing source first; without keyboard
+    /// focus, keep ours or refuse.
     fn copy(&mut self, selection: WaylandSelection, serial: u32) -> CopyOutcome {
         if !self.focused() {
             return if self.offers(selection) {

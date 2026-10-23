@@ -483,15 +483,7 @@ pub const fn pinned_version(name: &str) -> &'static str {
     panic!("no pinned row of aterm_uds::host::TOOLS has that name")
 }
 
-/// The absolute path every site spawns the operating system's own `name` by: the first
-/// place its [`TOOLS`] row lists ([`Tool::at`]), for a [`Provider::Os`] or [`Provider::Clt`]
-/// row. One table, so no site spells a program's path of its own and none runs whichever
-/// copy a `$PATH` names first (docs/DESIGN-init-system-2026-10-20.md §6.1 rows 1, 6, 10;
-/// §9 A41). Off Unix it is the bare name: Windows puts the few it ships (`curl.exe`, a
-/// `git.exe`) at no fixed place, and `Command` finds `<name>.exe` on `PATH`.
-///
-/// [`os_path!`](crate::os_path) evaluates it at compile time, so a name no row carries
-/// fails the build rather than a spawn.
+/// Return the fixed absolute path for OS/CLT tool `name`, or the bare name off Unix.
 ///
 /// # Panics
 ///
@@ -519,9 +511,7 @@ pub const fn os_path(name: &'static str) -> &'static str {
     panic!("no row of aterm_uds::host::TOOLS has that name")
 }
 
-/// [`host::os_path`](crate::host::os_path)`(name)` at compile time:
-/// `aterm_uds::os_path!("curl")` is `"/usr/bin/curl"` on Unix, and a name no Os or Clt row
-/// of [`TOOLS`](crate::host::TOOLS) carries is a compile error.
+/// Evaluate [`os_path`](crate::host::os_path)`(name)` at compile time.
 #[macro_export]
 macro_rules! os_path {
     ($name:literal) => {
@@ -529,7 +519,6 @@ macro_rules! os_path {
     };
 }
 
-/// `a == b`, in a `const fn`.
 const fn same_str(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {

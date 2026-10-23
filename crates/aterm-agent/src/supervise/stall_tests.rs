@@ -3,7 +3,6 @@
 
 use crate::harness::resume::AfterRestart;
 
-/// The requests that write into the worker: a key, text, a turn.
 fn writes(m: &Mock) -> Vec<&String> {
     m.requests
         .iter()
@@ -11,7 +10,6 @@ fn writes(m: &Mock) -> Vec<&String> {
         .collect()
 }
 
-/// The badge requests, in order.
 fn badge_acts(m: &Mock) -> Vec<String> {
     m.requests
         .iter()
@@ -20,7 +18,6 @@ fn badge_acts(m: &Mock) -> Vec<String> {
         .collect()
 }
 
-/// The journal's lines, as printed.
 fn journal_lines(path: &Path) -> Vec<String> {
     journal_records(path)
         .0
@@ -29,8 +26,6 @@ fn journal_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The loop's `watch` over `m` with a journal: the printed lines, the exit
-/// code and the journal's lines.
 fn watch_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, u8, Vec<String>) {
     let (dir, path) = journal_file(tag);
     let opts = SuperviseOpts {
@@ -43,16 +38,12 @@ fn watch_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, u8, Vec<String>) {
     (lines, code, journal)
 }
 
-/// A worker showing a box no rule approves (a Read of `~/.ssh/config`) that never leaves the
-/// screen.
 fn box_that_sits() -> Mock {
     let mut m = Mock::new(vec![busy_screen(), read_box()]);
     m.vanish_after = Some(4);
     m
 }
 
-/// The end each of these runs must reach: the session gone under the wait, never a refusal read
-/// as the loop's own fault.
 fn ended_with_the_session(lines: &[String], code: u8) {
     let last = lines.last().expect("an end line");
     assert!(
@@ -62,9 +53,6 @@ fn ended_with_the_session(lines: &[String], code: u8) {
     assert_eq!(code, 1);
 }
 
-/// A worker that stops reading under an escalated box: the first probe that reads
-/// `input=stalled` unsets the badge and journals `FROZEN …`; nothing is pressed, typed,
-/// posted or escalated while it stands.
 #[test]
 fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     let mut m = box_that_sits();
@@ -96,8 +84,6 @@ fn a_frozen_worker_is_held_and_its_badge_withdrawn() {
     ended_with_the_session(&lines, code);
 }
 
-/// The stall lifts (`input=clear`) while the box is still on screen: `THAWED …` is journaled and
-/// the box decided afresh, badged again.
 #[test]
 fn a_thawed_worker_has_its_point_decided_again() {
     let mut m = box_that_sits();
@@ -127,8 +113,6 @@ fn a_thawed_worker_has_its_point_decided_again() {
     ended_with_the_session(&lines, code);
 }
 
-/// The host is told when a stall is held and when it lifts ([`IdleHost::stalled`]); a worker
-/// that never stalls tells it nothing.
 #[test]
 fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
     #[derive(Debug, Default)]
@@ -162,10 +146,6 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
     }
 }
 
-/// A press refused `ERR busy input-unread …` (the gate fires at 1 s, the stall is published at
-/// 10 s), or written behind unread input (`OK seq=<n> warn=input-unread …`): the next look reads
-/// `status` before pressing again, and the stall published by then holds it: one press, never a
-/// second.
 #[test]
 fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again() {
     for (tag, reply, refused) in [
@@ -218,20 +198,14 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
     }
 }
 
-/// A reply exactly as a transport hands it to the loop ([`crate::supervise::transport::render`]:
-/// a `turn`'s verdict on stderr, its settled rows on stdout, as `aterm-ctl` prints them).
 fn rendered(verb: &str, header: &str, body: &str) -> CtlReply {
     let framing = aterm_types::control_verbs::framing_of(verb, verb);
     crate::supervise::transport::render(verb, framing, header, body.as_bytes())
 }
 
-/// A `turn` the gate warned, as the server answers it: the warning at the
-/// end of the verdict line (`input_stall::with_warning`), then the rows.
 const WARNED_TURN: &str = "OK 1 turn submitted=1 status=settled seq=9 id=2 dur_ms=5 hash=00 \
     warn=input-unread input_bytes=2 input_wait_ms=1100";
 
-/// `warned_input_unread` reads the gate's warning on the reply's first line as each transport
-/// hands it on (a `key`'s `OK` on stdout, a `turn`'s verdict on stderr), and nowhere else.
 #[test]
 fn a_warning_is_read_off_the_first_line_the_server_wrote() {
     let key = rendered(
@@ -264,8 +238,6 @@ fn a_warning_is_read_off_the_first_line_the_server_wrote() {
     }
 }
 
-/// A warned continuation: the `status` before typing saw the worker reading, so the `turn` is
-/// typed, and the server wrote it behind unread input (`warn=` on the verdict).
 #[test]
 fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
     let run = |warned: bool| {
@@ -337,9 +309,6 @@ fn a_continuation_warned_input_unread_reads_status_at_the_next_look() {
     ended_with_the_session(&lines, code);
 }
 
-/// Negative control: a host that publishes no `input=`, or `input=-` (not macOS, not a tty), gets
-/// no probe and no hold: `status` only where the box's program is read, once
-/// (the escalation's own read went with the manager's mail).
 #[test]
 fn a_host_that_does_not_measure_input_is_probed_on_no_step() {
     for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
@@ -367,9 +336,6 @@ fn a_host_that_does_not_measure_input_is_probed_on_no_step() {
     }
 }
 
-/// A loop that starts over a worker already frozen reads `input=stalled` in the `status` that
-/// named the box's program and holds before anything is pressed or badged, for a box a rule
-/// approves (a `git log`) and one none does.
 #[test]
 fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() {
     for (screen, tag) in [
@@ -403,8 +369,6 @@ fn a_worker_already_stalled_when_the_loop_looks_is_neither_pressed_nor_badged() 
     }
 }
 
-/// A continuation over a worker already frozen: the `status` read before typing reports the stall,
-/// so nothing is typed and the wait holds before its first step.
 #[test]
 fn a_continuation_over_a_worker_already_stalled_types_nothing() {
     let mut ended = rows(&[
@@ -444,9 +408,6 @@ fn a_continuation_over_a_worker_already_stalled_types_nothing() {
     ended_with_the_session(&lines, code);
 }
 
-/// The window's host over `m` ([`SuperviseOpts::hosted_with`]) with
-/// `answer_questions = false`, the one limit that makes it escalate a question: the printed lines,
-/// the loop's end and the journal's lines.
 fn hosted_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, Result<(), String>, Vec<String>) {
     let (dir, path) = journal_file(tag);
     let opts = SuperviseOpts {
@@ -475,8 +436,6 @@ fn hosted_journaled(m: &mut Mock, tag: &str) -> (Vec<String>, Result<(), String>
     (lines, end, journal)
 }
 
-/// A turn end after real work over an empty composer, asking for a decision: an idle point the
-/// turn-end policy escalates, never types into.
 fn idle_asking() -> Vec<String> {
     let mut r = rows(&[
         "⏺ I need your decision on the schema before I go on.",
@@ -488,7 +447,6 @@ fn idle_asking() -> Vec<String> {
     r
 }
 
-/// The requests before the first `meta set` (all of them if there is none).
 fn before_the_badge(m: &Mock) -> &[String] {
     let at = m
         .requests
@@ -498,9 +456,6 @@ fn before_the_badge(m: &Mock) -> &[String] {
     &m.requests[..at]
 }
 
-/// A point the window's host badges (a question, an idle point the turn-end policy escalates)
-/// reads `status` itself before the badge, and a stall that read reports raises none; the hold
-/// follows before the wait's first step.
 #[test]
 fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
     for (screen, tag) in [
@@ -559,9 +514,6 @@ fn the_windows_host_raises_no_badge_over_a_worker_frozen_under_its_point() {
     }
 }
 
-/// The same host, the worker freezing after its question is escalated: the escalation's read says
-/// `input=clear`, so the badge goes up and every wait step probes; the first probe reading the
-/// stall withdraws the badge.
 #[test]
 fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     let mut m = Mock::new(vec![busy_screen(), question_screen()]);
@@ -594,8 +546,6 @@ fn the_windows_host_withdraws_the_badge_of_a_worker_that_freezes_under_it() {
     );
 }
 
-/// A point that raises no badge and reads no `status` (an idle turn end `watch` hands over): not
-/// knowing whether input is measured, the first step that runs out probes, reads the stall, holds.
 #[test]
 fn a_wait_that_never_read_status_probes_and_holds() {
     let mut m = Mock::new(vec![busy_screen(), idle_screen()]);
@@ -622,8 +572,6 @@ fn a_wait_that_never_read_status_probes_and_holds() {
     ended_with_the_session(&lines, code);
 }
 
-/// Negative control for both: the window's host over a server that publishes no `input=`, or
-/// `input=-`, sees one `status` (the escalation's, which learns so), the badge, and no probe.
 #[test]
 fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
     for input in ["", "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-"] {
@@ -657,11 +605,8 @@ fn the_windows_host_asks_a_host_that_does_not_measure_input_once() {
     }
 }
 
-/// The explicit restart the remedy sends under `stall_term = true` for the
-/// host's agent (pid 4242), within the default grace.
 const RESTART: &str = "restart pid=4242 if-stalled quiet=120";
 
-/// A worker frozen past the remedy's bound: eleven minutes.
 const INPUT_STALLED_LONG: &str = "input=stalled input_bytes=1 input_wait_ms=660000 fg_rss_mb=39731";
 
 /// A host that relaunches an agent the stall's remedy ends, or not (field 0), keeps what it was
@@ -707,9 +652,6 @@ impl IdleHost for Relaunching {
     }
 }
 
-/// A frozen worker under a relaunching host with `stall_term = true` (the default warns:
-/// [`warn_run`]): `input` from the wait's first probe on, `term_after_s` the bound, `tweak` the
-/// rest.
 fn remedy_run(
     input: &'static str,
     relaunches: bool,
@@ -727,8 +669,6 @@ fn remedy_run(
     (signals, lines)
 }
 
-/// [`remedy_run`] under the default policy (`stall_term = false`): the signal requests, the lines
-/// said, and what the host was told for a person.
 fn warn_run(
     input: &'static str,
     relaunches: bool,
@@ -778,9 +718,6 @@ fn remedy_run_as(
     (signals, lines, informed)
 }
 
-/// The default is a warning, not an end: past the bound under a relaunching host, with no hand on
-/// it, no signal but one `STALL-WARNED … ended=no` line and one record for the person naming the
-/// command that ends it, once per episode.
 #[test]
 fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     assert!(!SupervisorConfig::default().stall_term, "the default warns");
@@ -829,9 +766,6 @@ fn a_worker_frozen_past_the_bound_is_warned_about_and_left_running() {
     }
 }
 
-/// With `stall_term`, a worker frozen past `[harness] stall_term_after_s` under a relaunching host
-/// with no hand on it gets `restart pid=<agent> if-stalled quiet=<grace>` (said `RESTARTED …`)
-/// once, and never a `signal kill` of the loop's.
 #[test]
 fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
     let default = SupervisorConfig::default().stall_term_after_s;
@@ -856,7 +790,6 @@ fn a_worker_frozen_past_the_bound_is_ended_for_its_relaunch() {
     assert!(signals.is_empty(), "{signals:?} {lines:#?}");
 }
 
-/// A stopped job's `status`, its input waiting `wait_ms`.
 fn input_stopped(aged: bool) -> &'static str {
     if aged {
         "input=stopped input_bytes=1 input_wait_ms=660000 fg_rss_mb=-"
@@ -865,9 +798,6 @@ fn input_stopped(aged: bool) -> &'static str {
     }
 }
 
-/// Under `stall_term = true` the remedy is the server's `restart … if-stalled`: `ERR not-stalled`
-/// is not counted (the next stalled read retries); `ERR restart unavailable` is counted and the
-/// warning said instead; a server without the verb gets the bare `signal term`.
 #[test]
 fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
     let default = SupervisorConfig::default().stall_term_after_s;
@@ -923,10 +853,6 @@ fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
     }
 }
 
-/// Tier-1 of `SupervisorStallRemedy` (aterm-spec `supervisor_stall_remedy_model`): in every
-/// configuration the model reaches with no term sent, the real loop sends the explicit restart
-/// exactly where `Term` is enabled, once per episode (`Thaw` starts a new one), and the default
-/// warning takes the same gate.
 #[test]
 fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1119,8 +1045,6 @@ impl IdleHost for Beside {
     }
 }
 
-/// [`remedy_run_as`] on a loop BESIDE A PROVEN SELF-CLAIM ([`Beside`]):
-/// `rest` whether the agent's own record names its idle point.
 fn beside_remedy_run(
     input: &'static str,
     relaunches: bool,
@@ -1159,15 +1083,6 @@ fn beside_remedy_run(
     (signals, lines, informed)
 }
 
-/// BESIDE A PROVEN SELF-CLAIM THE STALL'S REMEDY STANDS (the codex-alab
-/// self-claim contract, §4): a loop the host runs beside a proven self-claim
-/// ([`Session::set_beside`]) takes no claim, types and badges nothing — yet
-/// a worker frozen past the bound still gets aterm's explicit restart, which
-/// the agent cannot give itself, ON THE STALL ALONE, as for every agent: the
-/// agent's record is never read for an idle point (a TUI that stopped
-/// reading its input mid-turn keeps a record that says `busy` for ever; the
-/// review of 2026-10-16), so a record naming no idle point is
-/// restarted too.
 #[test]
 fn beside_a_proven_self_claim_the_stalls_remedy_stands_and_nothing_is_typed() {
     let default = SupervisorConfig::default().stall_term_after_s;
@@ -1234,9 +1149,6 @@ fn beside_a_proven_self_claim_the_stalls_remedy_stands_and_nothing_is_typed() {
     assert_eq!(idle_reads, 0, "the stall reads no record's rest");
 }
 
-/// A Mac in trouble with this agent holding the most: 200 GiB of 128 at
-/// critical pressure — the memory ceiling acted on
-/// ([`crate::supervise::memory::MemoryOver::acts`]).
 fn memory_in_trouble() -> crate::supervise::memory::AgentMemory {
     use crate::supervise::memory::{AgentMemory, Pressure};
     const GIB: u64 = 1024;
@@ -1251,17 +1163,8 @@ fn memory_in_trouble() -> crate::supervise::memory::AgentMemory {
     }
 }
 
-/// The memory ceiling's restart beside a proven self-claim: no stall, no
-/// `if-stalled`, within the default grace.
 const MEMORY_RESTART: &str = "restart pid=4242 quiet=120";
 
-/// BESIDE A PROVEN SELF-CLAIM THE MEMORY CEILING'S RESTART STANDS
-/// (`beside.rs`): the loop decides no point there, so the restart is made at
-/// the AGENT'S OWN IDLE POINT, read live from its session record
-/// ([`IdleHost::beside_idle`]), never the screen: a measure acted on (the
-/// Mac in trouble, this agent the largest) gets aterm's explicit restart
-/// once — the server stamps it and sends `SIGTERM`, and the host's crash
-/// rule relaunches the validated line — and nothing is typed or claimed.
 #[test]
 fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_point() {
     use crate::supervise::memory::AgentMemory;
@@ -1358,10 +1261,6 @@ fn beside_a_proven_self_claim_the_memory_restart_waits_for_the_records_idle_poin
     assert_eq!(idle_reads, 0, "no record read off a self-claim");
 }
 
-/// UNDER A PERSON'S HOLD BESIDE A PROVEN SELF-CLAIM (CONTRACT §2 as amended
-/// 2026-10-16: codex-alab KEEPS its claim under a hold and acts on nothing):
-/// the watch-only loop keeps running beside it — it claims nothing and types
-/// nothing — and aterm's remedies keep standing.
 #[test]
 fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typed() {
     let halted = || err("halted reason=owner origin=local");
@@ -1440,7 +1339,6 @@ fn under_a_hold_beside_a_proven_self_claim_the_remedies_stand_and_nothing_is_typ
     }
 }
 
-/// A review whose attendance can change between samples.
 struct IdleMemoryReview {
     unattended: bool,
 }
@@ -1461,7 +1359,6 @@ impl Review for IdleMemoryReview {
     }
 }
 
-/// A stable content sequence, unlike Mock's normal advancing text reads.
 fn memory_text_at(seq: u64) -> VecDeque<CtlReply> {
     (0..16)
         .map(|_| {

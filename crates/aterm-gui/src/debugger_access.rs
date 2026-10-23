@@ -191,7 +191,7 @@ fn read_debugger_marker(config_path: &Path, name: &str) -> Option<String> {
         .and_then(|path| crate::config_marker::read_marker(&path, MAX_MARKER_BYTES))
 }
 
-/// The held change lock, released by `LOCK_UN` when this drops ([`HeldAdvisoryLock`]), or by the kernel when its process dies.
+/// The held change lock, released by `LOCK_UN` when this drops ([`HeldAdvisoryLock`](crate::native_document_host::HeldAdvisoryLock)), or by the kernel when its process dies.
 #[derive(Debug)]
 pub(crate) struct ChangeLock {
     _held: crate::native_document_host::HeldAdvisoryLock,
@@ -251,7 +251,7 @@ impl Drop for PatienceForTest {
     }
 }
 
-/// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience` ([`acquire_advisory_lock_within`]).
+/// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience` ([`acquire_advisory_lock_within`](crate::native_document_host::acquire_advisory_lock_within)).
 pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTry {
     let Some(path) = marker_path(config_path, CHANGE_LOCK) else {
         return LockTry::Unavailable(std::io::Error::new(
@@ -1746,7 +1746,7 @@ pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> 
     }
 }
 
-/// Write `host` into the asked record, AHEAD of the alert it stands for ([`Flush::Durable`]: once the alert is up, a crash, quit or update must never ask again, and this record is all that remembers it).
+/// Write `host` into the asked record, AHEAD of the alert it stands for ([`Flush::Durable`](crate::durable::Flush::Durable): once the alert is up, a crash, quit or update must never ask again, and this record is all that remembers it).
 pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
     note_host_record(config_path, ASKED_RECORD, host, now)
 }
@@ -2506,7 +2506,7 @@ impl LaunchAskQueue {
     }
 }
 
-/// A change child in flight, for the row's "waiting" line (since <time>).
+/// A change child in flight, for the row's "waiting" line (since `<time>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InFlightFacts {
     pub(crate) change: DebuggerChange,
@@ -2529,7 +2529,7 @@ pub(crate) struct DebuggerFacts {
     pub(crate) in_flight: Option<InFlightFacts>,
     /// Anything under way (the alert, the re-read, the child, the re-probe) or the predecessor's records unread: no button is live.
     pub(crate) busy: bool,
-    /// The last recorded mode, when aterm first saw it, and who set it: "turned on from aterm on <date>" / "set outside aterm".
+    /// The last recorded mode, when aterm first saw it, and who set it: "turned on from aterm on `<date>`" / "set outside aterm".
     pub(crate) recorded: Option<ObservedMarker>,
     /// Drift: allowed since this time, off now (in this process).
     pub(crate) drift_since: Option<u64>,

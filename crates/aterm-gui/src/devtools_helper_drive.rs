@@ -282,6 +282,10 @@ fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
     }
 }
 
+/// Verifies the content view layout and subviews.
+///
+/// # Safety
+/// Must be called on the main thread while `preview`'s views are live.
 unsafe fn view_checks(
     preview: &Preview,
     blocks: usize,
@@ -352,6 +356,10 @@ unsafe fn view_checks(
     }
 }
 
+/// Renders `view` in light or dark appearance to PNG bytes `(width, height, png, flat)`.
+///
+/// # Safety
+/// Must be called on the main thread while `view` is a live `NSView`.
 unsafe fn capture(view: Id, dark: bool) -> Option<(usize, usize, Vec<u8>, bool)> {
     // SAFETY: Main thread. `+appearanceNamed:` is `+(NSAppearance *)(NSString *)`,
     // +0, given AppKit's own name global; `-setAppearance:` `-(void)(id)`; the

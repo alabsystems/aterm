@@ -3,8 +3,6 @@
 
 //! Caller shell detection and cross-platform process argv/environment inspection.
 
-/// The shell families this crate can name a remedy for, or hand a PATH line to; the
-/// parent's executable name is admitted only when it is one of these.
 const SHELLS: &[&str] = &[
     "zsh",
     "bash",
@@ -41,7 +39,6 @@ pub fn invoking_shell_from(parent: Option<&str>, login: Option<&str>) -> Option<
         .or_else(|| login.map(str::to_string))
 }
 
-/// `name` normalised to a family in [`SHELLS`], or `None`.
 fn known_shell(name: &str) -> Option<String> {
     let name = name.trim().trim_start_matches('-');
     let name = name.strip_suffix(".exe").unwrap_or(name);
@@ -144,10 +141,6 @@ impl ProcArgs {
     }
 }
 
-/// How a variable's name is compared ([`ProcArgs::env_var`]): on Windows each character
-/// folded as the system folds it (`aterm_sysprobe::paths::fold_case`,
-/// `RtlUpcaseUnicodeChar`'s one-unit-to-one simple uppercase, which
-/// `GetEnvironmentVariableW` compares by); elsewhere exactly.
 fn name_fold() -> fn(char) -> char {
     #[cfg(windows)]
     {
@@ -159,8 +152,6 @@ fn name_fold() -> fn(char) -> char {
     }
 }
 
-/// The value of `kv` (`KEY=value`) when its name is `key`, the two compared character by
-/// character through `fold`: `key` whole, then the `=` that ends the name.
 fn env_value<'a>(kv: &'a str, key: &str, fold: fn(char) -> char) -> Option<&'a str> {
     let mut chars = kv.char_indices();
     for want in key.chars() {
@@ -262,7 +253,6 @@ fn split_command_line(line: &[u16], image: &[u16]) -> Vec<String> {
                 // `& 1` is the odd test, side-stepping the toolchain's `% 2` lint.
                 if slashes & 1 == 0 {
                     if quoted && line.get(at + 1) == Some(&QUOTE) {
-                        // `""` inside quotes: the second is a literal `"`.
                         at += 1;
                     } else {
                         kept = false;
@@ -336,9 +326,6 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
 mod tests {
     use super::*;
 
-    /// The parent's shell wins over `$SHELL`; a non-shell parent falls back to it; a
-    /// login-shell `-` and a `.exe` are stripped; an unknown `$SHELL` still passes
-    /// through (the remedy's PATH-line arm names it).
     #[test]
     fn the_parent_shell_wins_and_the_login_shell_is_the_fallback() {
         assert_eq!(
@@ -491,8 +478,6 @@ mod tests {
         );
     }
 
-    /// The KERN_PROCARGS2 layout, built by hand: argc, the exec path, NUL padding, argv,
-    /// then the environment up to the first empty string.
     #[test]
     fn procargs2_parses_argv_and_env_and_refuses_a_short_buffer() {
         let mut buf = 3i32.to_ne_bytes().to_vec();
@@ -509,9 +494,6 @@ mod tests {
         assert_eq!(parse_procargs2(&[1, 0]), None);
     }
 
-    /// An argc past 65 535 is a real process (ARG_MAX admits more short words), so such a
-    /// buffer parses whole and names its executable; a count no buffer of its size can hold
-    /// is refused without reserving for it.
     #[test]
     fn procargs2_admits_an_argc_past_65535_and_bounds_it_by_the_buffer() {
         let n = 70_000_usize;
@@ -535,8 +517,6 @@ mod tests {
         );
     }
 
-    /// The exe name needs only the exec path: a buffer the whole-layout parser refuses
-    /// (cut inside its argument words) still names its executable.
     #[test]
     fn the_exe_name_reads_the_exec_path_alone() {
         let mut short = 5i32.to_ne_bytes().to_vec();
@@ -545,8 +525,6 @@ mod tests {
         assert_eq!(exe_name_of_procargs2(&short).as_deref(), Some("fish"));
     }
 
-    /// Linux's `/proc/<pid>/cmdline` keeps an empty argument, as the macOS parser does: only
-    /// the one trailing NUL is a terminator.
     #[test]
     fn a_nul_list_keeps_an_empty_word_and_drops_only_the_terminator() {
         let cmdline = b"claude\0--append-system-prompt\0\0--dangerously-skip-permissions\0";
@@ -627,17 +605,10 @@ mod tests {
         );
     }
 
-    /// The UTF-16 of `s`.
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().collect()
     }
 
-    /// A WINDOWS COMMAND LINE SPLITS AS THE C RUNTIME SPLITS IT (the UCRT's post-2008
-    /// rules): the table of Microsoft's "Parsing C command-line arguments", the three lines
-    /// `claude.exe` 2.1.304 was measured reading (2026-10-20), where `CommandLineToArgvW`
-    /// reads otherwise, the program name's own rule (quotes toggle, nothing escapes), empty
-    /// and unclosed words, blanks, backslashes before anything but a quote, the NUL that ends
-    /// the line, and an empty line, which reads as the program's own path.
     #[test]
     fn a_windows_command_line_splits_as_the_c_runtime_splits_it() {
         let split = |line: &str| split_command_line(&wide(line), &wide(r"C:\x\prog.exe"));
@@ -678,10 +649,6 @@ mod tests {
         );
     }
 
-    /// A WINDOWS ENVIRONMENT BLOCK READS AS ITS STRINGS UP TO THE EMPTY ONE: the drive
-    /// letters' working directories (`=C:=C:\x`) are entries, found by their own names, and
-    /// a value may hold `=`; what follows the empty string is not read; a block that ends
-    /// before it is refused whole; a block that is only its end holds none.
     #[test]
     fn a_windows_environment_block_reads_whole_or_not_at_all() {
         let block = wide("=C:=C:\\work\0=D:=D:\\\0Path=C:\\bin;C:\\x\0K=v=w\0\0junk\0");
@@ -703,9 +670,6 @@ mod tests {
         assert_eq!(split_environment(&wide("\0")), Some(Vec::new()));
     }
 
-    /// A VARIABLE IS FOUND BY ITS WHOLE NAME, AND ON WINDOWS BLIND TO CASE as the system
-    /// folds a name, one character to one (`ı` is `I`), the first such entry winning: a
-    /// prefix or a longer name is not the name.
     #[test]
     fn a_variable_is_found_by_its_whole_name_and_on_windows_blind_to_case() {
         let upper = |c: char| {

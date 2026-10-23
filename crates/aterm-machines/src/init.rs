@@ -309,6 +309,93 @@ pub fn main_entry(
     ExitCode::from(code)
 }
 
+/// The develop layer as `aterm doctor` reads it on this Mac (design §5, S9;
+/// [`crate::init_develop::doctor`]): for the user `aterm init --develop` would converge, whose
+/// context (refusing root) is the one init builds when it leaves the workstation out. It is built
+/// only once the account's own `init.toml` is read with a `[develop]` table, or cannot be read,
+/// or an `--only` word asks ([`crate::init_develop::may_record`]), so on a Mac that records no
+/// develop layer doctor runs nothing for it (no `id -un`, no `dscl`) and shows no row. The
+/// caller asks only in the account's own shell.
+pub struct Doctor<S: System = Live> {
+    sys: S,
+    /// The account's home as its account record names it (`getpwuid`), where its `init.toml`
+    /// is read first; `None` builds the context straight away.
+    home: Option<PathBuf>,
+    targo: Option<crate::init_develop::Targo>,
+    ctx: std::sync::OnceLock<Result<Ctx, String>>,
+}
+
+impl Doctor {
+    /// Nothing read yet; `targo` is the toolset's ([`crate::init_develop::Targo`]).
+    #[must_use]
+    pub fn new(targo: Option<crate::init_develop::Targo>) -> Self {
+        Self::over(Live::new(), aterm_uds::account::home(), targo)
+    }
+}
+
+impl<S: System> Doctor<S> {
+    /// [`Doctor::new`] over `sys`, the account's home `home`.
+    fn over(sys: S, home: Option<PathBuf>, targo: Option<crate::init_develop::Targo>) -> Self {
+        Self {
+            sys,
+            home,
+            targo,
+            ctx: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn ctx(&self) -> &Result<Ctx, String> {
+        self.ctx.get_or_init(|| {
+            context_for_selected(&self.sys, WorkstationGroup::All, Selection::none())
+        })
+    }
+
+    /// The layer for this run, reading the profile alone (`asked`: an `--only` word named a
+    /// develop item, so a Mac that records none reads its record row). A context that cannot
+    /// be built is one `develop.record` row saying why.
+    #[must_use]
+    pub fn compose(&self, asked: bool) -> crate::init_develop::Composed {
+        if !asked
+            && self.home.as_deref().is_some_and(|home| {
+                !crate::init_develop::may_record(&self.sys, self.sys.euid(), home)
+            })
+        {
+            return crate::init_develop::Composed::default();
+        }
+        match self.ctx() {
+            Ok(ctx) => crate::init_develop::doctor(&self.sys, ctx, asked, self.targo.clone()),
+            Err(why) => crate::init_develop::Composed::unreadable(format!(
+                "cannot tell whose develop layer this is: {why}"
+            )),
+        }
+    }
+
+    /// The rows of `composed`, narrowed to `only` ([`crate::init_develop::read`]); none, and
+    /// nothing run, when it holds no item.
+    ///
+    /// # Errors
+    /// As [`crate::init_develop::read`].
+    pub fn rows(
+        &self,
+        composed: &crate::init_develop::Composed,
+        only: &[String],
+    ) -> Result<Vec<ItemReport>, String> {
+        if composed.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nobody = Ctx {
+            facts: HostFacts::default(),
+            users: Vec::new(),
+            console: None,
+            host_name: String::new(),
+            cache_dir: PathBuf::new(),
+            disrupt: false,
+        };
+        let ctx = self.ctx().as_ref().unwrap_or(&nobody);
+        crate::init_develop::read(&self.sys, ctx, composed, only)
+    }
+}
+
 /// What `--only` takes, for its refusal.
 const ONLY_WORDS: &str = "a base id such as base.clt or base.shell.rc, a family such as shell \
                           or pkg, or base; workstation; a develop id such as \
@@ -3264,5 +3351,76 @@ mod tests {
             ids(None, Some("[develop]\ncheckouts = [\"~/aterm\"]\n")),
             ["develop.workspace-tools@~/aterm"]
         );
+    }
+
+    /// alice's Mac as doctor's develop layer sees it: euid 501, her home, and her `init.toml`
+    /// when given; the account's context cannot be built (no `id -un` answer is scripted, as
+    /// for an account the local directory node does not hold).
+    fn develop_doctor(profile: Option<&str>, home: bool) -> (Doctor<Fake>, usize) {
+        let mut sys = Fake::root();
+        let alice = user("alice", 501);
+        sys.euid = alice.uid;
+        if let Some(profile) = profile {
+            sys.write_user_file(
+                &alice,
+                &Path::new(&alice.home).join(".config/aterm/init.toml"),
+                profile.as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        }
+        let setup = sys.calls().len();
+        let home = home.then(|| PathBuf::from(&alice.home));
+        (Doctor::over(sys, home, None), setup)
+    }
+
+    /// DOCTOR RUNS NOTHING FOR THE DEVELOP LAYER OF A MAC THAT RECORDS NONE: with no
+    /// `init.toml`, or one with no `[develop]` table, doctor composes no develop item and reads
+    /// no develop row without building the account's context, so no `id -un` or `dscl` runs,
+    /// and a context that could not be built shows nothing either. Negative controls: a profile
+    /// that records a checkout, an `--only` develop word, or a home the account record does not
+    /// give build the context, and here its failure is the one `develop.record` row.
+    #[test]
+    fn doctor_runs_nothing_for_the_develop_layer_of_a_mac_that_records_none() {
+        let id = Cmd::new("/usr/bin/id").arg("-un").display();
+        for profile in [None, Some("[github]\naccount = \"alice\"\n")] {
+            let (doctor, setup) = develop_doctor(profile, true);
+            let composed = doctor.compose(false);
+            assert!(
+                composed.items.is_empty() && !composed.unreadable,
+                "{profile:?}"
+            );
+            assert_eq!(doctor.rows(&composed, &[]).unwrap(), Vec::new());
+            assert_eq!(
+                doctor.sys.calls().split_off(setup),
+                Vec::<String>::new(),
+                "{profile:?}"
+            );
+        }
+
+        for (profile, asked, home) in [
+            (Some("[develop]\ncheckouts = [\"~/aterm\"]\n"), false, true),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            let (doctor, setup) = develop_doctor(profile, home);
+            let composed = doctor.compose(asked);
+            assert!(composed.unreadable, "{profile:?} {asked} {home}");
+            let rows = doctor.rows(&composed, &[]).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].id, crate::init_develop::RECORD);
+            assert_eq!(rows[0].outcome, Outcome::Unknown);
+            assert!(
+                rows[0]
+                    .why
+                    .as_deref()
+                    .is_some_and(|why| why.starts_with("cannot tell whose develop layer this is")),
+                "{rows:?}"
+            );
+            assert!(
+                doctor.sys.calls().split_off(setup).contains(&id),
+                "{profile:?} {asked} {home}"
+            );
+        }
     }
 }

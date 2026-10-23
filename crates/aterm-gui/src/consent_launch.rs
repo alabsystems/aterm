@@ -1,40 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! FILE ACCESS ON A NEW MAC, BY DEFAULT (owner ask 2026-10-16: "on starting aterm … it
-//! needs to enable [file system access everywhere] by default", on macOS 26 Tahoe and 27).
-//!
-//! macOS lets no app grant itself file access (design §0): only the owner switches on Full
-//! Disk Access, and only the owner answers a folder dialog. What aterm does by default is
-//! put both in front of the owner when it starts, instead of waiting for an agent to hit a
-//! dialog first:
-//!
-//! 1. **Full Disk Access.** A launch whose probe reads the grant off, on a Mac where aterm
-//!    never verified it, brings the owner to System Settings ▸ Privacy & Security ▸ Full
-//!    Disk Access at the first quiet moment, with aterm's panel and its icon to drag into
-//!    the list (`App::hand_fda_to_owner`, `devtools_helper::admit_fda`): once per version,
-//!    never while the owner's Not now holds, never on a build whose grant would not survive
-//!    the next one. [`FdaLaunch`] is where that stands for this process.
-//! 2. **The folders, while Full Disk Access stays off.** Once that hand-over ended without
-//!    the owner acting on it (Not now, or the panel lapsed) or was not offered at all, the
-//!    warm-up walks the configured folders (Documents, Desktop and Downloads) at the next
-//!    quiet moment, so macOS asks there and not inside an agent's blocked syscall
-//!    ([`decide_warmup`]; `[privacy] warmup = "automatic"`, the default). Once a pass has
-//!    every folder answered, the bundle id is noted (`<state>/privacy-warmup-answered`)
-//!    and never walked again: macOS keeps each answer for a grant-stable build.
-//!
-//! The order on a new Mac is the Full Disk Access page, the Developer Tools page, aterm's
-//! once-per-Mac debugger-access question (`debugger_access`), then the
-//! folders: the warm-up waits while that question is still to come and while a
-//! debugger-access change is under way, so no folder dialog stacks on macOS's
-//! administrator dialog (one left unanswered holds the folders for that process).
-//!
-//! Nothing here answers a dialog, flips a switch or writes TCC.db, and no control verb,
-//! environment variable or session reaches it: the triggers are the window's own launch
-//! check and the owner's own presses. Held by construction: `App::tick_launch_warmup`,
-//! `App::hand_fda_to_owner`, `App::fda_page_opened_by_owner` and `Lane::queue_fda` are
-//! clippy.toml `disallowed-methods` rows, and only those callers carry the `#[expect]`. A headless instance and every unit test hold the
-//! inert arm ([`LaunchConsent::new`]), which reads and writes nothing.
+//! Default launch-time Full Disk Access hand-over and folder-access warm-up.
 
 use std::time::Instant;
 
@@ -122,7 +89,6 @@ pub(crate) struct WarmupFacts {
     /// A folder answer keyed to this build survives the next build.
     pub(crate) grant_stable: bool,
     /// Every folder was answered for this bundle id by an earlier pass.
-    /// `None`: the marker is unreadable or malformed, so no automatic pass is admitted.
     pub(crate) answered: Option<bool>,
     /// A warm-up pass walks already (the owner's own press on the Security page).
     pub(crate) walking: bool,
@@ -301,18 +267,12 @@ impl std::fmt::Debug for LaunchReach {
     }
 }
 
-/// `<state>/privacy-warmup-answered`: per machine, never beside `aterm.toml` (a config
-/// directory synced to another Mac must not say that Mac's folders were answered).
 fn answered_marker() -> Option<std::path::PathBuf> {
     aterm_types::dirs::state_dir().map(|dir| dir.join("privacy-warmup-answered"))
 }
 
-/// A small set of channel bundle ids, stored under the machine's state directory.
-/// Refuse an oversized record rather than dropping another bundle's answer.
 const MAX_ANSWERED_BYTES: usize = 4 * 1024;
 
-/// Whether a whole marker names this usable bundle id. Empty, truncated or
-/// malformed records are unknown, never a reason to start an automatic pass.
 fn names(text: &str, bundle_id: &str) -> Option<bool> {
     if text.is_empty()
         || !text.ends_with('\n')
@@ -336,8 +296,6 @@ fn live_answered(bundle_id: &str) -> Option<bool> {
     answered_marker().and_then(|path| answered_at(&path, bundle_id))
 }
 
-/// A genuine absence is known. Every other read must pass the existing
-/// bounded regular, no-final-symlink marker reader.
 fn read_answered_at(path: &std::path::Path) -> std::io::Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -365,8 +323,6 @@ pub(crate) fn answered_at(path: &std::path::Path, bundle_id: &str) -> Option<boo
     }
 }
 
-/// Best effort: a successful pass is answered in this process. A later
-/// launch judges only a known marker; unreadable state admits no new pass.
 fn live_note_answered(bundle_id: &str) {
     let Some(path) = answered_marker() else {
         return;
@@ -374,8 +330,6 @@ fn live_note_answered(bundle_id: &str) {
     note_answered_at(&path, bundle_id);
 }
 
-/// The live marker write at an explicit path; tests own that path. Never
-/// replace an unreadable or malformed occupant, and never follow its link.
 fn note_answered_at(path: &std::path::Path, bundle_id: &str) {
     if bundle_id.trim() != bundle_id || !aterm_containment::consent::bundle_id_is_usable(bundle_id)
     {
@@ -390,7 +344,6 @@ fn note_answered_at(path: &std::path::Path, bundle_id: &str) {
         },
         Err(_) => return,
     };
-    // Ordered: an absent marker reads as not answered, so the pass is asked again.
     let _ = crate::config_marker::write_marker(
         path,
         &format!("{text}{bundle_id}\n"),
@@ -619,9 +572,6 @@ mod tests {
         }
     }
 
-    /// The warm-up walks only after the Full Disk Access hand-over is decided and left
-    /// without the owner acting, only while the grant reads off on a build that keeps its
-    /// answers, once per bundle id; each refusal holds on its own.
     #[test]
     fn the_launch_warm_up_is_a_table_of_named_refusals_then_a_walk() {
         assert_eq!(decide_warmup(&facts()), WarmupStep::Start);
@@ -710,9 +660,6 @@ mod tests {
         }
     }
 
-    /// Everything but the probe's two rules is answered before any probe is read: a window
-    /// waiting for its quiet moment reads none, and a probe-free refusal holds whatever
-    /// the probe would say.
     #[test]
     fn the_probe_free_rules_are_judged_before_a_probe() {
         let unprobed = WarmupFacts {
@@ -750,9 +697,6 @@ mod tests {
         }
     }
 
-    /// A panel the owner said Not now to, or that lapsed with nothing dropped, is followed
-    /// by the folders; one they acted on (switched on, done, dropped, went off with System
-    /// Settings) is not.
     #[test]
     fn only_a_panel_left_alone_is_followed_by_the_folders() {
         let acted = |why, dropped| {
@@ -772,8 +716,6 @@ mod tests {
         }
     }
 
-    /// What each hand-over answer leaves: queued or opened with its panel waits; a page
-    /// with no panel is the owner's; a refusal or a failed open is no hand-over.
     #[test]
     fn each_hand_over_answer_moves_the_launch_state() {
         assert_eq!(
@@ -800,7 +742,6 @@ mod tests {
         }
     }
 
-    /// The launch pass never walks `app-data`, whatever `warmup_folders` names.
     #[test]
     fn the_launch_pass_never_walks_app_data() {
         let folders = vec![
@@ -814,8 +755,6 @@ mod tests {
         );
     }
 
-    /// A pass with a folder still unknown or asking was not answered whole; allowed,
-    /// denied and an error (a folder that is not there) are answers.
     #[test]
     fn a_pass_is_answered_only_when_every_folder_is() {
         use WarmupRow::{Allowed, Asking, Denied, Error, Unknown};
@@ -833,8 +772,6 @@ mod tests {
         }
     }
 
-    /// The marker names a bundle id on a line of its own; a dev bundle's answers are not
-    /// the release's.
     #[test]
     fn the_marker_names_whole_bundle_ids() {
         let text = "com.aterm.aterm.dev\n";
@@ -851,8 +788,6 @@ mod tests {
         NOTED.with(|noted| noted.borrow_mut().push(bundle_id.to_owned()));
     }
 
-    /// A pass that answered every folder notes its bundle id once and settles; one that
-    /// left a folder unanswered settles and notes nothing, so the next launch walks again.
     #[test]
     fn a_whole_pass_notes_its_bundle_id_and_a_partial_one_does_not() {
         let reach = LaunchReach {
@@ -878,9 +813,6 @@ mod tests {
         NOTED.with(|noted| assert_eq!(noted.borrow().len(), 1));
     }
 
-    /// Actual marker readers and writers use only these private paths. An
-    /// ordinary multi-bundle record round-trips first; neither a planted
-    /// link nor an oversized/malformed record authorizes a read or rewrite.
     #[test]
     #[cfg(unix)]
     fn the_launch_marker_is_bounded_and_never_follows_a_link() {
@@ -953,8 +885,6 @@ mod tests {
         );
     }
 
-    /// Only a known marker may admit the automatic pass. These are actual
-    /// private filesystem observations, not global environment or permission changes.
     #[test]
     fn an_unknown_launch_marker_never_admits_an_automatic_pass() {
         const ID: &str = "com.aterm.aterm";

@@ -23,8 +23,7 @@ pub(crate) enum Tier {
     Relaxed,
 }
 
-/// How the broker stops ([`Broker::stop`]): a clean stop, a crash and a Strict power loss keep
-/// the whole log; a power loss on Ordered or Relaxed keeps a prefix at or above the durable head.
+/// How the broker stops ([`Broker::stop`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     Clean,
@@ -53,9 +52,9 @@ pub(crate) struct Rec {
     /// `(producer id, producer seq)` for a deduped write.
     pub(crate) key: Option<(u64, u64)>,
     pub(crate) kind: Kind,
-    /// Whether the broker's own escalation table named it ([`Escalation::escalates`]): it was acked only once flushed in full.
+    /// Whether the broker's own escalation table named it ([`Escalation::escalates`]).
     pub(crate) escalated: bool,
-    /// The principal of the producer that wrote it, as the world named it ([`Broker::name_producer`]).
+    /// The principal of the producer that wrote it.
     pub(crate) principal: Option<String>,
 }
 
@@ -136,8 +135,7 @@ struct Will {
     seq: u64,
     subject: String,
     body: Vec<u8>,
-    /// The offset of its registration record: the log holds the will only
-    /// while it holds this.
+    /// The offset of its registration record.
     reg_off: u64,
     /// The connection it was registered on, while that connection lives.
     conn: Option<u64>,
@@ -153,8 +151,7 @@ struct ConnState {
     pid: u64,
     inbound: Vec<u8>,
     out: VecDeque<u8>,
-    /// Answers the broker has made and not yet SENT, oldest first: a write
-    /// whose batch is still in its flush ([`State::answer`]).
+    /// Answers the broker has made and not yet SENT.
     held: VecDeque<Held>,
     open: bool,
     /// `Some((cursor, filter))` once it is a subscription.
@@ -164,8 +161,7 @@ struct ConnState {
 /// One answer the broker holds ([`ConnState::held`]).
 #[derive(Debug)]
 struct Held {
-    /// The record a `PublishAck` names: what the reorder count reads
-    /// ([`State::seen_before_ack`]).
+    /// The record a `PublishAck` names: what the reorder count reads ([`State::seen_before_ack`]).
     ack_of: Option<u64>,
     /// The framed answer.
     frame: Vec<u8>,
@@ -192,24 +188,23 @@ pub(crate) struct State {
     index: BTreeMap<String, (u64, u64)>,
     /// producer -> its highest sequence below the ack half.
     max_seq: BTreeMap<u64, u64>,
-    /// producer -> the subjects its registered wills hold against its subject
-    /// budget until a record of its lands on them ([`State::reserve`]):
-    /// astream's `will_reserved`.
+    /// producer -> the subjects its registered wills hold against its subject budget until a record
+    /// of its lands on them ([`State::reserve`]).
     reserved: BTreeMap<u64, std::collections::BTreeSet<String>>,
     wills: Vec<Will>,
     conns: BTreeMap<u64, ConnState>,
     next_conn: u64,
     /// Producer id -> principal, for the principal rule.
     principals: BTreeMap<u64, String>,
-    /// Refuse the next this-many publishes by a NODE producer, and group commits, `ERR_REFUSED` (a batch rolled back), appending nothing.
+    /// Refuse the next this-many publishes by a NODE producer, and group commits.
     pub(crate) refuse_next: u32,
-    /// HELD ACKS (aterm-0): the seed's stream that decides which of a connection's acks the broker answers late.
+    /// HELD ACKS (aterm-0).
     pub(crate) holds: Option<Rng>,
-    /// How many answers were held, how many reads that must not wait found one not yet there, and how many records a subscription handed over while their publish's ack was still held.
+    /// How many answers were held.
     pub(crate) held_total: u64,
     pub(crate) tries_not_yet: u64,
     pub(crate) seen_before_ack: u64,
-    /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s): lose below the durable head; lose with no move.
+    /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s).
     pub(crate) mutant: ArmMutant,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
     pub(crate) race: Option<Race>,
@@ -234,7 +229,7 @@ pub(crate) struct Race {
     pub(crate) session_face: String,
     /// What the sibling's rows carry past the fields every row has, each token led by its space.
     pub(crate) extra: String,
-    /// Instead of a previously refused incarnation, take the attach's current incarnation after its Last read, before its will is registered.
+    /// Instead of a previously refused incarnation, take the attach's current one.
     pub(crate) alias: bool,
     /// The actual colliding first node publish and sibling record offset.
     pub(crate) collision: Option<(u64, u64)>,
@@ -253,16 +248,16 @@ pub(crate) enum ArmMutant {
     LineageAtHead,
     /// A resent `(producer, seq)` is appended again under a fresh offset, never deduped.
     FreshDedup,
-    /// A will fires whatever its producer published since: the differential test's other negative control.
+    /// A will fires whatever its producer published since.
     NoWillFence,
-    /// Corrupt each published payload byte: the differential must compare bytes, including distinct malformed UTF-8 sequences.
+    /// Corrupt each published payload byte.
     AlterPayload,
 }
 
 /// One visible record as the oracle reads it: `(offset, subject, body, producer key)`.
 pub(crate) type Visible = (u64, String, Vec<u8>, Option<(u64, u64)>);
 
-/// ONE THING THAT HAPPENED AT THE BROKER'S DOOR, as a world's broker that keeps a journal ([`State::journal`]) records it.
+/// ONE THING THAT HAPPENED AT THE BROKER'S DOOR.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     /// A connection opened ([`dial_stream`]).
@@ -366,7 +361,7 @@ impl Broker {
         std::mem::take(&mut lock(&self.state).notes)
     }
 
-    /// A WORLD PRODUCER's write (a peer node, a person): appended as a publish from no connection, deduped by its key.
+    /// A WORLD PRODUCER's write (a peer node, a person).
     pub(crate) fn publish_as(
         &self,
         producer: u64,
@@ -392,7 +387,7 @@ impl Broker {
         lock(&self.state).holds = Some(rng);
     }
 
-    /// THE BROKER ANSWERS WHAT IT HELD: every held answer on every connection is sent, as a batch's flush landing does.
+    /// THE BROKER ANSWERS WHAT IT HELD.
     pub(crate) fn answer_held(&self, and_stop: bool) -> usize {
         let mut s = lock(&self.state);
         if and_stop {
@@ -411,13 +406,13 @@ impl Broker {
         sent
     }
 
-    /// The held-ack counts ([`State::held_total`]): held, tries that found one not yet there, records handed over before their ack.
+    /// The held-ack counts ([`State::held_total`]).
     pub(crate) fn held_counts(&self) -> (u64, u64, u64) {
         let s = lock(&self.state);
         (s.held_total, s.tries_not_yet, s.seen_before_ack)
     }
 
-    /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open connections ([`ConnState::held`]).
+    /// THE RECORDS WHOSE ACKS THIS BROKER HOLDS for process `pid` on its open connections.
     pub(crate) fn held_for(&self, pid: u64) -> Vec<(u64, String, Vec<u8>)> {
         let s = lock(&self.state);
         s.conns
@@ -470,7 +465,7 @@ impl Broker {
         }
     }
 
-    /// STOP THE BROKER (`stop`), choosing what the restart keeps with `rng` among exactly the cuts the law allows ([`State::allowed_cuts`]).
+    /// STOP THE BROKER (`stop`).
     pub(crate) fn stop(&self, stop: Stop, rng: &mut Rng) -> Restart {
         self.stop_choosing(stop, rng, |cuts, rng| {
             let pick = usize::try_from(rng.below(cuts.len() as u64)).unwrap_or(0);
@@ -549,7 +544,7 @@ impl Broker {
         }
     }
 
-    /// OPEN AGAIN: rebuild every index from the log that survived, call it durable (the open's flush), and re-fire the wills it still holds as astream's open does.
+    /// OPEN AGAIN.
     pub(crate) fn start(&self) {
         let mut s = lock(&self.state);
         s.note_event(|| Event::Start);
@@ -565,7 +560,7 @@ impl Broker {
         s.notes.push(line);
     }
 
-    /// Where the inbox group `group` resumes: one past its committed offset, or 0 with no commit on the log.
+    /// Where the inbox group `group` resumes.
     pub(crate) fn group_start(&self, group: &str) -> u64 {
         lock(&self.state)
             .groups
@@ -586,7 +581,8 @@ impl Broker {
         lock(&self.state).max_incarnation(producer)
     }
 
-    /// The finite alias actually registered two wills at one incarnation, collided on the first node publish, and fired only the loser's will.
+    /// The finite alias actually registered two wills at one incarnation, collided on the first
+    /// node publish, and fired only the loser's will.
     pub(crate) fn alias_collision_completed(&self) -> bool {
         let s = lock(&self.state);
         let Some(race) = s
@@ -620,10 +616,7 @@ impl Broker {
 }
 
 impl State {
-    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep: the
-    /// whole log, or — a power loss on Ordered or Relaxed — any prefix at or
-    /// above the durable head (every escalated record is below it: its full
-    /// flush raised it).
+    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep.
     pub(crate) fn allowed_cuts(&self, stop: Stop) -> Vec<u64> {
         let head = self.log.len() as u64;
         match (stop, self.tier) {
@@ -632,9 +625,6 @@ impl State {
         }
     }
 
-    /// Rebuild the dedup map, the index, the group cursors and the fence
-    /// from the log, as an open does; forget the firing of a will whose
-    /// firing record the log no longer holds.
     fn rebuild(&mut self) {
         self.dedup.clear();
         self.index.clear();
@@ -686,8 +676,6 @@ impl State {
         }
     }
 
-    /// Hold `subject` against `producer`'s budget for its will, unless the
-    /// index holds it already (`reserve_will_subject`).
     fn reserve(&mut self, producer: u64, subject: String) {
         if !astream_broker::store::is_hidden_subject(&subject) && !self.index.contains_key(&subject)
         {
@@ -695,8 +683,6 @@ impl State {
         }
     }
 
-    /// Whether the log holds will `i`: its registration record is on it (a
-    /// power loss may have cut it, and a later record taken its offset).
     fn holds_will(&self, i: usize) -> bool {
         self.wills.get(i).is_some_and(|w| {
             usize::try_from(w.reg_off)
@@ -706,8 +692,6 @@ impl State {
         })
     }
 
-    /// Each producer's LATEST will on the log, by its registration
-    /// (`BrokerLog::latest_wills`): producer -> will.
     fn latest_wills(&self) -> BTreeMap<u64, usize> {
         let mut latest: BTreeMap<u64, usize> = BTreeMap::new();
         for i in (0..self.wills.len()).filter(|&i| self.holds_will(i)) {
@@ -722,8 +706,6 @@ impl State {
         latest
     }
 
-    /// Whether a record of will `i`'s producer ABOVE its registration says
-    /// its key or outranks it (astream's `settled_above`).
     fn settled_above(&self, i: usize) -> bool {
         let w = &self.wills[i];
         self.log
@@ -742,9 +724,6 @@ impl State {
             })
     }
 
-    /// Whether will `w` could still append: no record of its producer
-    /// outranks it, and its own key is not on the log
-    /// (`will_can_still_append`).
     fn can_still_append(&self, w: &Will) -> bool {
         !self
             .max_seq
@@ -753,9 +732,6 @@ impl State {
             && !self.dedup.contains_key(&(w.producer, w.seq))
     }
 
-    /// Whether a will that can still append targets `subject`: one a live
-    /// connection holds, or a producer's latest on the log
-    /// (`will_targets_subject`) — what refuses a retire of it.
     fn will_targets(&self, subject: &str) -> bool {
         let latest = self.latest_wills();
         self.wills.iter().enumerate().any(|(i, w)| {
@@ -765,14 +741,10 @@ impl State {
         })
     }
 
-    /// How many index entries `producer` is charged for.
     fn charged_to(&self, producer: u64) -> usize {
         self.index.values().filter(|(_, c)| *c == producer).count()
     }
 
-    /// Whether `producer`'s record on `subject` would open a subject past its
-    /// budget: the index entries charged to it and its wills' reservations
-    /// but this subject's (`subject_bound_exceeded`).
     fn past_the_budget(&self, producer: u64, subject: &str) -> bool {
         if self.index.contains_key(subject) {
             return false;
@@ -822,7 +794,6 @@ impl State {
         self.principals.get(&producer).map(String::as_str)
     }
 
-    /// [`Broker::max_incarnation`], under the lock already held.
     fn max_incarnation(&self, producer: u64) -> u64 {
         let records = self
             .log
@@ -842,10 +813,6 @@ impl State {
             .unwrap_or(0)
     }
 
-    /// THE RACE ([`Race`]) at one of a NODE producer's will requests: the
-    /// one it refuses, and the later one inside which the sibling attaches at
-    /// the refused incarnation — while nothing of that incarnation is on the
-    /// log, so the sibling takes it as a bridge takes `max(local, Last) + 1`.
     fn race_at_will(&mut self, producer: u64, seq: u64) -> Option<Vec<Response>> {
         if !self
             .principal(producer)
@@ -951,13 +918,6 @@ impl State {
         refusal
     }
 
-    /// QUEUE `responses` ON `conn`'S STREAM, in order: sent at once, or HELD
-    /// (aterm-0) — an ack the broker answers late, its batch still in its
-    /// flush, while the record it names is already readable, as a real
-    /// broker's writer wakes its tails and writes its acks in no fixed order
-    /// — when this broker holds acks ([`State::holds`]) and the seed says so;
-    /// and always behind an answer already held, because a connection is
-    /// answered in the order it wrote.
     fn answer(&mut self, conn: u64, responses: &[Response]) {
         let State {
             conns,
@@ -989,11 +949,6 @@ impl State {
         }
     }
 
-    /// One publish, as astream's `serve_publish` and the writer's
-    /// `stage_publish` take it: `/a/retire` is a retire ([`State::retire`]);
-    /// a malformed subject or one of the broker's own is refused; a resent
-    /// key dedups; a new subject past the producer's budget is refused; the
-    /// append.
     fn publish(
         &mut self,
         producer: u64,
@@ -1004,8 +959,6 @@ impl State {
         self.publish_bounded(producer, seq, subject, body, true)
     }
 
-    /// [`State::publish`], held to the subject budget or not: a will's
-    /// firing is exempt (its registration was held to it, and reserved it).
     fn publish_bounded(
         &mut self,
         producer: u64,
@@ -1075,12 +1028,6 @@ impl State {
         Ok((off, false))
     }
 
-    /// A SUBJECT RETIRE (`/a/retire`, its body the target), as astream's
-    /// `serve_publish` and `stage_retire` take one: a target that is not a
-    /// subject, or is the broker's own (`/a/...`), is refused; an absent one
-    /// is moot (the head, deduped); one charged to another producer is
-    /// refused `charged: `, one a will can still append to `will: `;
-    /// otherwise the index forgets it and a hidden record says so.
     fn retire(&mut self, producer: u64, body: &[u8]) -> Result<(u64, bool), Box<Response>> {
         use astream_broker::proto::{
             ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_CHARGED_PREFIX,
@@ -1137,8 +1084,6 @@ impl State {
         Ok((off, false))
     }
 
-    /// Will `i`'s connection ended: it fires, unless a later will on that
-    /// connection replaced it or it fired already.
     fn fire(&mut self, i: usize) {
         if self
             .wills
@@ -1149,10 +1094,6 @@ impl State {
         }
     }
 
-    /// FIRE will `i` (astream's `stage_will_fire`): FENCED — nothing appended —
-    /// when a record of its producer outranks it; otherwise an ordinary
-    /// publish under its key, so one already said dedups, exempt from the
-    /// subject budget.
     fn fire_will(&mut self, i: usize) {
         let Some(w) = self.wills.get(i).cloned() else {
             return;
@@ -1183,14 +1124,12 @@ impl State {
         }
     }
 
-    /// Record `event` in the journal, in a world that keeps one.
     fn note_event(&mut self, event: impl FnOnce() -> Event) {
         if let Some(journal) = self.journal.as_mut() {
             journal.push(event());
         }
     }
 
-    /// Connection `conn` ended: its will fires (while the broker is up).
     fn end(&mut self, conn: u64) {
         let was_open = self.conns.get(&conn).is_some_and(|c| c.open);
         if let Some(c) = self.conns.get_mut(&conn) {
@@ -1214,7 +1153,6 @@ impl State {
         }
     }
 
-    /// The next record at or above `from` a subscription with `filter` is owed.
     fn next_match(&self, from: u64, filter: &Filter) -> Option<u64> {
         let from = usize::try_from(from).ok()?;
         self.log
@@ -1266,7 +1204,6 @@ impl State {
         }
     }
 
-    /// Answer one request on `conn`: the frames it writes back.
     fn handle(&mut self, conn: u64, req: Request) -> Vec<Response> {
         let head = self.log.len() as u64;
         if let Some(msg) = oversized_name(&req) {
@@ -1302,9 +1239,7 @@ impl State {
                 body,
             } => self.register(conn, producer_id, producer_seq, subject, body),
             Request::Commit { group, upto } => {
-                // A BATCH ROLLED BACK refuses the group commit in it too: the
-                // bridge's commit rides the pipeline beside its publishes
-                // (aterm-0), and only a bridge's connection commits here.
+                // A batch rolled back refuses the group commit in it too.
                 if self.refuse_next > 0 {
                     self.refuse_next -= 1;
                     self.notes.push(format!(
@@ -1434,11 +1369,6 @@ impl State {
         }
     }
 
-    /// REGISTER A WILL on `conn`, as astream's `serve_will` and the writer's
-    /// `stage_will_register` take one: a subject a publish could not take is
-    /// refused; so is a second producer's on a connection that holds one; so
-    /// is a sequence in the ack half, which no later record could fence; and
-    /// a subject new to the index past its producer's budget.
     fn register(
         &mut self,
         conn: u64,
@@ -1528,8 +1458,6 @@ impl State {
     }
 }
 
-/// Why a publish (or a will) may not name `subject`, as astream's
-/// `publish_subject_error` says: not a subject, or one of the broker's own.
 fn subject_error(subject: &str) -> Option<Box<Response>> {
     if astream_wire::Subject::new(subject).is_err() {
         Some(refused(
@@ -1546,8 +1474,6 @@ fn subject_error(subject: &str) -> Option<Box<Response>> {
     }
 }
 
-/// A name in `req` past astream's bound (`MAX_NAME_LEN`), as its
-/// `oversized_name` refuses one before anything parses it.
 fn oversized_name(req: &Request) -> Option<String> {
     let names: Vec<(&str, &str)> = match req {
         Request::Publish { subject, .. } | Request::Will { subject, .. } => {
@@ -1568,12 +1494,10 @@ fn oversized_name(req: &Request) -> Option<String> {
         .map(|(what, name)| format!("{what} too long: {} bytes", name.len()))
 }
 
-/// A refusal, as the broker answers one.
 fn refused(code: u8, msg: String) -> Box<Response> {
     Box::new(Response::Error { code, msg })
 }
 
-/// Frame `resp` onto `out`.
 fn put(out: &mut VecDeque<u8>, resp: &Response) {
     let mut bytes = Vec::new();
     astream_broker::proto::write_frame(&mut bytes, &encode_response(resp))
@@ -1581,7 +1505,7 @@ fn put(out: &mut VecDeque<u8>, resp: &Response) {
     out.extend(bytes);
 }
 
-/// DIAL the world's broker for process `p`: a connection over a stream into the model, and its closer.
+/// DIAL the world's broker for process `p`.
 pub(crate) fn dial(p: &Arc<Process>) -> io::Result<(Conn, BusCloser)> {
     let stream = dial_stream(p)?;
     let conn = stream.conn;
@@ -1646,8 +1570,8 @@ impl Read for SimStream {
         if out_empty && open && up {
             if let Some((cursor, filter)) = sub {
                 if let Some(off) = s.next_match(cursor, &filter) {
-                    // THE REORDER aterm-0 must survive: a record handed to a
-                    // reader while its publisher's ack is still held.
+                    // THE REORDER aterm-0 must survive: a record handed to a reader while its
+                    // publisher's ack is still held.
                     if s.conns
                         .values()
                         .any(|c| c.held.iter().any(|h| h.ack_of == Some(off)))

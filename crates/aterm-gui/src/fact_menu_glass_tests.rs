@@ -18,14 +18,11 @@ use crate::fact_menu::NEW_TABS_ASKED;
 use crate::tab_menu::MenuRect;
 use crate::{App, WindowId};
 
-/// One frame through the capture route's splices, the menu's last.
 fn menu_frame(app: &mut App, wid: WindowId) {
     frame(app, wid);
     app.splice_autopilot_menu(wid);
 }
 
-/// Publish the absolute working directory and the repository's root beside
-/// the session's facts, as the resolver does.
 fn publish_side(app: &App, session: u64) {
     let entry = app.pool.get(session).expect("session");
     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -38,8 +35,6 @@ fn publish_side(app: &App, session: u64) {
     );
 }
 
-/// The rig at 160 columns, the facts published (with their side where
-/// `side`), Claude's block drawn and one frame painted.
 fn glass(side: bool) -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
     let (mut app, wid, session, reader) = wider_app();
     publish_facts(&app, session);
@@ -51,8 +46,6 @@ fn glass(side: bool) -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
     (app, wid, session, reader)
 }
 
-/// A press and release of `button` on the first cell of `fact` as the
-/// painter put it.
 fn press_fact(app: &mut App, wid: WindowId, session: u64, fact: Fact, button: MouseButton) {
     let cell = app.fact_anchor(wid, session, fact).expect("on the glass");
     let (x, y) = px_of(app, wid, cell);
@@ -61,7 +54,6 @@ fn press_fact(app: &mut App, wid: WindowId, session: u64, fact: Fact, button: Mo
     app.on_mouse_input(wid, ElementState::Released, button);
 }
 
-/// The open menu's row whose stable key is `key`.
 fn row_of(app: &App, key: &str) -> usize {
     app.autopilot_menu
         .as_ref()
@@ -72,16 +64,10 @@ fn row_of(app: &App, key: &str) -> usize {
         .unwrap_or_else(|| panic!("{key} is a row"))
 }
 
-/// The open menu's owner.
 fn owner(app: &App) -> Option<MenuOwner> {
     app.autopilot_menu.as_ref().map(|menu| menu.owner)
 }
 
-/// A RIGHT-CLICK ON A FACT OPENS ITS MENU HUNG FROM IT: the card above the
-/// fact's row, `controls fact-menu` naming the fact and its rows, the
-/// Autopilot menu's controls reading it as not theirs — and nothing typed,
-/// no person's gesture stamped, nothing hidden. CONTROL: a left click on the
-/// same fact opens no menu (it hides the fact).
 #[test]
 fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
     let (mut app, wid, session, mut reader) = glass(true);
@@ -127,10 +113,6 @@ fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
     );
 }
 
-/// COPY PATH PUTS THE ABSOLUTE WORKING DIRECTORY ON THE CLIPBOARD — never the
-/// rule's `~/aterm` — and says so in the lights' title slot for a moment
-/// (a block of chips drawn: a host here). NEGATIVE CONTROL: with no side
-/// published the row is off, and choosing it leaves the clipboard untouched.
 #[test]
 fn copy_path_writes_the_absolute_cwd() {
     crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
@@ -165,9 +147,6 @@ fn copy_path_writes_the_absolute_cwd() {
     );
 }
 
-/// NEW TAB HERE ASKS FOR A TAB IN THE WORKING DIRECTORY, and the branch's
-/// row for one at the repository's root — what a headless App can show of
-/// a tab it has no event loop to spawn. Neither types into the session.
 #[test]
 fn new_tab_here_asks_for_the_cwd() {
     NEW_TABS_ASKED.with(|asked| asked.borrow_mut().clear());
@@ -188,8 +167,6 @@ fn new_tab_here_asks_for_the_cwd() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
 }
 
-/// HIDE AND SHOW FROM A MENU: `Hide folder` hides it as a click does, and the
-/// branch's menu then offers `Show folder`, which shows it again.
 #[test]
 fn hide_and_show_from_a_menu_flip_the_sessions_mask() {
     let (mut app, wid, session, _reader) = glass(true);
@@ -205,10 +182,6 @@ fn hide_and_show_from_a_menu_flip_the_sessions_mask() {
     assert_eq!(app.fact_mask(session), FactMask::default());
 }
 
-/// THE MENU STAYS WHILE ITS FACT SLIDES ALONG ITS ROW (the folder before the
-/// model's place shrank, so the model moved) and closes at the first frame
-/// whose glass no longer shows it there (a box over the composer).
-/// NEGATIVE CONTROL: a focus change closes it too.
 #[test]
 fn a_fact_menu_stays_while_its_fact_slides_and_closes_when_it_leaves() {
     let (mut app, wid, session, _reader) = glass(true);
@@ -240,9 +213,6 @@ fn a_fact_menu_stays_while_its_fact_slides_and_closes_when_it_leaves() {
     assert!(app.autopilot_menu.is_none(), "the focus moved: closed");
 }
 
-/// ONE MENU AT A TIME: a fact's menu opened over the Autopilot menu closes
-/// it, and the Autopilot menu opened over a fact's closes that; each one's
-/// `controls` reads the other's as shut.
 #[test]
 fn one_menu_at_a_time() {
     let (mut app, wid, _session, _reader) = glass(true);
@@ -290,9 +260,6 @@ fn down_on_a_selected_fact_opens_its_menu() {
     );
 }
 
-/// Publish the owner's facts with the session's usage (`Σ 6m33s ↑20M ↓82k`)
-/// and, beside them, the side with four minutes of traffic ending now, as
-/// the resolver does.
 fn publish_usage(app: &App, session: u64) {
     let now = crate::autopilot_timers::wall_ms().div_euclid(1000);
     let start = now.div_euclid(60) * 60 - 180;
@@ -339,8 +306,6 @@ fn publish_usage(app: &App, session: u64) {
     );
 }
 
-/// The rig at 160 columns with [`publish_usage`]'s facts, Claude's block
-/// drawn and one frame painted.
 fn usage_glass() -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
     let (mut app, wid, session, reader) = wider_app();
     publish_usage(&app, session);
@@ -349,11 +314,6 @@ fn usage_glass() -> (App, WindowId, u64, std::os::unix::net::UnixStream) {
     (app, wid, session, reader)
 }
 
-/// A CLICK ON THE USAGE OPENS THE TRAFFIC CARD AND A SECOND CLICK CLOSES IT
-/// (owner: "the traffic shows a graph over time"): the card hung from `Σ`,
-/// its two bands and axis inert rows `controls fact-menu` reads as plots;
-/// the second click on `Σ` spent on the closing — nothing hidden, nothing
-/// typed, no person's gesture. CONTROL: a third click opens it again.
 #[test]
 fn a_click_on_usage_opens_the_card_and_a_second_click_closes_it() {
     let (mut app, wid, session, mut reader) = usage_glass();
@@ -403,11 +363,6 @@ fn a_click_on_usage_opens_the_card_and_a_second_click_closes_it() {
     assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Usage)));
 }
 
-/// A CLOSED CARD READS NO SIDE: frames, a hover over `Σ` (its title built)
-/// and a wake of the facts with the card closed never read the traffic
-/// published beside them — the card's read is an open's and an open card's
-/// wake's. NEGATIVE CONTROL: the open reads it, and so does a wake while it
-/// is open.
 #[test]
 fn a_closed_card_reads_no_side() {
     let (mut app, wid, session, _reader) = usage_glass();
@@ -430,8 +385,6 @@ fn a_closed_card_reads_no_side() {
     assert_eq!(crate::work_counts::take_traffic_side_reads(), 0, "a frame");
 }
 
-/// Every glass mark (`BandIcon::glass_mark`) the frame draws as the chrome's
-/// icon, as `(frame row, icon)`, in frame order.
 fn drawn_marks(app: &App, wid: WindowId) -> Vec<(usize, ChromeIcon)> {
     let mut marks: Vec<(usize, ChromeIcon)> = app.windows[&wid]
         .input_scratch
@@ -444,8 +397,6 @@ fn drawn_marks(app: &App, wid: WindowId) -> Vec<(usize, ChromeIcon)> {
     marks
 }
 
-/// The open card and the marks its cells print: each full-size, narrow cell
-/// on it whose character is a glass mark, as the icon the glass draws there.
 fn card_and_its_marks(app: &App, wid: WindowId) -> (MenuRect, Vec<(usize, ChromeIcon)>) {
     let rect = app
         .autopilot_menu
@@ -466,15 +417,6 @@ fn card_and_its_marks(app: &App, wid: WindowId) -> (MenuRect, Vec<(usize, Chrome
     (rect, printed)
 }
 
-/// THE CARD'S MARKS ARE THE GLASS'S (`BandIcon::glass_mark`, one map): the
-/// Autopilot card's `⤓ ○ ●` and the fact menus' `◉ ◈ ⌂ ○` (whose Arial
-/// Unicode glyphs drew 6 × 6 at 1× beside SF Mono's 8 × 9 `● ○`) are drawn as
-/// the chrome's icons over the cells that keep them, once however often the
-/// card is painted, standing through the card's own scrub (which takes every
-/// icon on the card it covers); and once it closes the frame draws the marks
-/// it drew before the card opened, none of the card's left. NEGATIVE
-/// CONTROL: the card's other marks (`∞ ⚙ ⋯ + ⧉`, the faces' or within a
-/// pixel of them) and its words draw nothing.
 #[test]
 fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
     use crate::fact_menu::FactMenuFacts;

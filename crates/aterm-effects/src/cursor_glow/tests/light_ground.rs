@@ -5,7 +5,6 @@
 
 use super::*;
 
-/// A light config for `style`.
 fn light(style: GlowStyle) -> GlowConfig {
     let mut c = cfg(style, true);
     c.dark_theme = false;
@@ -17,9 +16,6 @@ fn light(style: GlowStyle) -> GlowConfig {
     c
 }
 
-/// Type `keys` cells along row 2 from column 4 at a steady typing cadence,
-/// and return the glow, the last frame's additive stream and that frame's
-/// instant.
 fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>, Instant) {
     let g = geom();
     let mut glow = CursorGlow::default();
@@ -34,8 +30,6 @@ fn typed(c: &GlowConfig, keys: u16) -> (CursorGlow, Vec<GlowQuad>, Instant) {
     (glow, out, t)
 }
 
-/// The streak's body alone at `at` with the caret at `cur`, into fresh
-/// streams: its under-ink stream.
 fn body(
     glow: &mut CursorGlow,
     c: &GlowConfig,
@@ -48,10 +42,6 @@ fn body(
     under
 }
 
-/// Nonzero one-pixel cells are a valid effects canvas too: a beam's
-/// under-ink body (the light ground's ink, the dark ground's bed) may round
-/// away, but must not panic or grow outside its row to meet a half-pixel
-/// minimum.
 #[test]
 fn light_beams_fit_one_pixel_high_cells_without_panicking() {
     for (height, dark) in [
@@ -106,7 +96,6 @@ fn light_beams_fit_one_pixel_high_cells_without_panicking() {
     }
 }
 
-/// The rows of ink each pixel column of the under-ink stream holds.
 fn ink_heights(under: &[GlowQuad]) -> std::collections::BTreeMap<u16, u16> {
     let mut heights = std::collections::BTreeMap::new();
     for q in under {
@@ -117,10 +106,6 @@ fn ink_heights(under: &[GlowQuad]) -> std::collections::BTreeMap<u16, u16> {
     heights
 }
 
-/// The beam family's body on a light ground is source-over ink in the
-/// under-ink stream (letters draw over it at full contrast) and never leaves
-/// the row it swept, so the lines above and below stay clean; the comet and
-/// the beam ink nothing over the letters.
 #[test]
 fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
     let g = geom();
@@ -169,8 +154,6 @@ fn light_beam_bodies_are_ink_under_the_letters_inside_their_row() {
     }
 }
 
-/// Sparkle's stars and the fire's embers scatter on a light ground too, as
-/// ink marks, not additive light that white would swallow.
 #[test]
 fn light_sparkles_and_embers_are_ink() {
     for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
@@ -188,8 +171,6 @@ fn light_sparkles_and_embers_are_ink() {
     }
 }
 
-/// The comet and the beam no longer draw one shape in two colours on a light
-/// ground: the comet's ink swells toward the caret, the beam's tube is even.
 #[test]
 fn light_comet_tapers_and_light_beam_is_even() {
     let g = geom();
@@ -220,8 +201,6 @@ fn light_comet_tapers_and_light_beam_is_even() {
     assert_eq!(beam_far, beam_near, "the beam's tube is even");
 }
 
-/// How dark each pixel row of one column is once the under-ink stream is
-/// composited over the white ground in emission order: `255 - luma` per y.
 fn column_darkness(under: &[GlowQuad], x: u16) -> std::collections::BTreeMap<u16, f32> {
     let mut rgb = std::collections::BTreeMap::<u16, [f32; 3]>::new();
     for q in under.iter().filter(|q| (q.x..q.x + q.w).contains(&x)) {
@@ -243,11 +222,6 @@ fn column_darkness(under: &[GlowQuad], x: u16) -> std::collections::BTreeMap<u16
         .collect()
 }
 
-/// THE LIGHT BEAM NEVER STRIKES THROUGH THE LETTERS: behind the caret its
-/// darkest ink (within a quarter of its peak, above the dither) is a band at
-/// least a third of the row tall (a highlighter around the text), not a thin
-/// line along the row's middle, both while it is fresh and as it powers
-/// down.
 #[test]
 fn light_beam_is_a_band_around_the_letters_never_a_strike() {
     let g = geom();
@@ -282,9 +256,6 @@ fn light_beam_is_a_band_around_the_letters_never_a_strike() {
     assert!(peak > 4.0 && rows < third, "laser: {rows} px at its peak");
 }
 
-/// Lumen's look shows on a light ground as a tracer, not a lamp: soft ink
-/// under the letters behind the caret (the glow over the letters just typed
-/// and the tracer under the run), and nothing ahead of the caret's own cell.
 #[test]
 fn light_lumen_traces_behind_the_caret_and_not_ahead() {
     let g = geom();
@@ -316,14 +287,6 @@ fn light_lumen_traces_behind_the_caret_and_not_ahead() {
     );
 }
 
-/// The light comet's head stays in the caret's cell and wears a nucleus:
-/// after a typed burst on GitHub Light, no comet ink lies in the typed row
-/// past the caret cell's leading edge but its round coma (where a cap
-/// stood a few pixels past the block caret as a nub): nothing reaches past
-/// the coma's radius from the caret's centre, and the head behind the caret is
-/// a dense round nucleus: the comet's ink over the newest letter's cell is
-/// markedly deeper than over the tail two cells back, while the newest
-/// letter keeps the light body's bar over it.
 #[test]
 fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
     let g = tall_geom();
@@ -395,10 +358,6 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
     );
 }
 
-/// On a light ground no grain stands half under the block caret: a grain
-/// whose mark would reach into the caret's cell is not drawn (a half-disc
-/// standing off the caret's edge read as a nub stuck to it), while the same
-/// grain two cells out is.
 #[test]
 fn light_grains_keep_off_the_block_caret() {
     let g = tall_geom();
@@ -439,12 +398,6 @@ fn light_grains_keep_off_the_block_caret() {
     }
 }
 
-/// A light band is ink under the letters of the row it lies in, so a run
-/// that leaps rows (an Enter onto the next prompt, a jump) draws only its
-/// stretch on the landing row: for the beam, sparkle and comet, a
-/// jump from the end of row 2 down to the start of row 5 leaves every under
-/// quad of the body inside row 5's band, and the rows it crossed (the output
-/// an Enter just printed) take no ink.
 #[test]
 fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
     let g = geom();
@@ -494,9 +447,6 @@ fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
     );
 }
 
-/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER. A band
-/// fills a wide glyph's whole box (CJK, emoji), the gaps between its strokes
-/// included, where a Latin letter keeps paper above and below its x-height.
 #[test]
 fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
     let g = geom();
@@ -600,10 +550,6 @@ fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
     );
 }
 
-/// ON PAPER SPARKLE'S BAND STAYS GOLD AT THE HEAD: over a 24-key run on
-/// GitHub Light, every frame's band under the two newest letters is ink of
-/// the gold family (whatever hue its wheel has rolled to), so the bed behind
-/// the letter just typed never turns leaf-green or salmon.
 #[test]
 fn the_light_sparkle_band_stays_gold_at_the_head() {
     let g = geom();
@@ -647,12 +593,6 @@ fn the_light_sparkle_band_stays_gold_at_the_head() {
     );
 }
 
-/// A LIGHT BAND'S TAIL FADES OUT: after a leap back along its row on paper
-/// (the Settings preview's demo does this), the beam's and sparkle's band
-/// rises from the paper over its oldest cell and a half, so
-/// along its spine no pixel column steps by more than a fifth of the band's
-/// depth (a cut at the tail's end stepped from paper to the whole band in
-/// one column).
 #[test]
 fn a_light_bands_tail_fades_out() {
     let g = geom();
@@ -688,9 +628,6 @@ fn a_light_bands_tail_fades_out() {
     }
 }
 
-/// The ink a light body's source-over quads lay, alpha-weighted: each quad's
-/// premultiplied colour over its opacity, for the quads at least `min_alpha`
-/// opaque. `None` when no quad is.
 fn body_ink_of(under: &[GlowQuad], min_alpha: u8) -> Option<u32> {
     let (mut sum, mut weight) = ([0.0f64; 3], 0.0f64);
     for q in under.iter().filter(|q| q.alpha >= min_alpha) {
@@ -707,14 +644,6 @@ fn body_ink_of(under: &[GlowQuad], min_alpha: u8) -> Option<u32> {
     })
 }
 
-/// SPARKLE'S BODY ON PAPER IS GOLD: typed on GitHub Light in its automatic
-/// colour, the body under the letters lays a bright, saturated gold (hue
-/// 38°–50°, saturation and value at least 0.8), the gold its paper beads are
-/// cored with, and the theme's text keeps [`BODY_CONTRAST_BAR`] over it
-/// even opaque; with a pinned colour it keeps the pin's hue. Laid in its
-/// hue's one-weight vivid ink, the starlight gold came out a burnt
-/// orange-brown that read under the letters as a muddy caramel smear.
-/// Negative control: that ink's value is under 0.8.
 #[test]
 fn sparkles_paper_body_is_gold() {
     let mut c = light(GlowStyle::Sparkle);
@@ -740,7 +669,6 @@ fn sparkles_paper_body_is_gold() {
         contrast >= crate::cursor_glow::light_body::BODY_CONTRAST_BAR,
         "the text keeps only {contrast:.2}:1 over the opaque gold"
     );
-    // A pinned colour keeps its own hue.
     let mut pinned = c;
     pinned.color = 0x00D0_3A8C;
     let pin = ink(&pinned, false);
@@ -752,7 +680,6 @@ fn sparkles_paper_body_is_gold() {
         "a pinned {:06X} body came out {pin:06X}",
         0x00D0_3A8C
     );
-    // The control: the one-weight vivid ink.
     let bold = ink(&c, true);
     let (_, _, bv) = crate::color_math::rgb2hsv(bold);
     assert!(

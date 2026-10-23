@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Launchd job plist and `launchctl` lifecycle for `caffeine serve`
-//! ([`crate::paths::Paths::session_plist`], [`EXIT_RESTART`], [`bootout`]).
+//! Launchd job plist ([`crate::paths::Paths::session_plist`], [`EXIT_RESTART`], [`bootout`]).
 
 use std::io;
 use std::path::Path;
@@ -11,11 +10,11 @@ use crate::paths::Paths;
 
 /// The installed app's label.
 pub const INSTALLED_LABEL: &str = "com.aterm.aterm.caffeine";
-/// The prefix of any other build's label: `<prefix>.<hash of its executable's path>`.
+/// The prefix of any other build's label.
 pub const DEV_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine.dev";
 /// The installed app's executable.
 pub const INSTALLED_EXECUTABLE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
-/// What the job runs after its program: `caffeine serve`.
+/// What the job runs after its program.
 pub const SERVE_ARGS: [&str; 2] = ["caffeine", "serve"];
 /// The exit status `serve` ends with when the code it was started from changed (an update).
 pub const EXIT_RESTART: u8 = 75;
@@ -28,7 +27,7 @@ const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 #[cfg(unix)]
 const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The label of the job for executable `exe`: [`INSTALLED_LABEL`] for [`INSTALLED_EXECUTABLE`].
+/// The label of the job for executable `exe` ([`INSTALLED_LABEL`], [`INSTALLED_EXECUTABLE`]).
 #[must_use]
 pub fn label_for(exe: &Path) -> String {
     if exe == Path::new(INSTALLED_EXECUTABLE) {
@@ -41,7 +40,7 @@ pub fn label_for(exe: &Path) -> String {
     )
 }
 
-/// Whether `text` is a label [`label_for`] makes: [`INSTALLED_LABEL`].
+/// Whether `text` is a label [`label_for`] makes ([`INSTALLED_LABEL`]).
 #[must_use]
 pub fn is_label(text: &str) -> bool {
     text == INSTALLED_LABEL
@@ -56,7 +55,6 @@ pub fn is_label(text: &str) -> bool {
             })
 }
 
-/// `text` as XML character data.
 fn xml_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -124,8 +122,7 @@ fn bundle_id_of(program: &Path) -> Option<String> {
     crate::code::own_bundle(program).and_then(|b| crate::code::bundle_identifier(&b))
 }
 
-/// Whether Enable at Startup is on for `label`: its plist is in `~/Library/LaunchAgents`.
-/// Whether a login loads it is [`startup`]'s.
+/// Whether Enable at Startup is on for `label` ([`startup`]).
 #[must_use]
 pub fn startup_enabled(paths: &Paths, label: &str) -> bool {
     paths.startup_plist(label).is_file()
@@ -138,21 +135,15 @@ pub enum Startup {
     Off,
     /// The login plist is there, and every login starts the mug.
     On,
-    /// The login plist is there, but aterm's switch under Background App Activity (System
-    /// Settings ▸ General ▸ Login Items & Extensions) is off: no login starts the mug. Writing
-    /// the plist again, or removing and adding it, leaves that switch off; only the person
-    /// turns it on (no password), which starts the mug at once. Turning it off also ended a
-    /// running mug's job.
+    /// The login plist is there, but aterm's switch under Background App Activity is off: no
+    /// login starts the mug.
     Blocked,
-    /// The login plist is there, but launchd has its label disabled (`launchctl disable`,
-    /// which outlasts logout and restart): no login loads it, and launchd refuses every
-    /// bootstrap of it. Turning Enable at Startup on lifts that (`launchctl enable`).
+    /// The login plist is there, but launchd has its label disabled (`launchctl disable`): no
+    /// login loads it.
     Disabled,
 }
 
-/// The doors to what decides, besides the login plist, whether a login loads it: Login
-/// Items' switch and launchd's own disabled set, and the door that lifts the second. The app
-/// and the CLI pass the live ones; tests pass doors that ask nothing.
+/// The doors to what decides, besides the login plist, whether a login loads it.
 #[derive(Clone, Copy)]
 pub struct StartupDoors {
     /// Whether Login Items' switch keeps the plist from loading (macOS: `SMAppService`).
@@ -176,10 +167,7 @@ impl Startup {
     }
 }
 
-/// What Enable at Startup does for `label` at the next login: [`Startup::Off`] without its
-/// plist, else [`Startup::Disabled`] when launchd has the label disabled, else
-/// [`Startup::Blocked`] when Login Items' switch keeps the plist from loading, else
-/// [`Startup::On`]. Neither is asked without the plist.
+/// Startup state ([`Startup::Off`], [`Startup::Disabled`], [`Startup::Blocked`], [`Startup::On`]).
 #[must_use]
 pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
     let plist = paths.startup_plist(label);
@@ -195,7 +183,6 @@ pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
 }
 
 /// Toggle Enable at Startup for `label` and `program` ([`prune_orphans`]).
-///
 /// # Errors
 /// The plist cannot be written or removed, or `program` is not a UTF-8 path.
 #[cfg(unix)]
@@ -220,8 +207,7 @@ pub fn set_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::
     aterm_uds::atomic_file::write(&plist, text.as_bytes(), 0o644)
 }
 
-/// Enable at Startup: not wired off Unix.
-///
+/// Enable at Startup.
 /// # Errors
 /// Always: launchd is macOS.
 #[cfg(not(unix))]
@@ -301,7 +287,7 @@ pub fn prune_orphans(paths: &Paths) {
     }
 }
 
-/// Orphaned login plists: none off Unix.
+/// Orphaned login plists.
 #[cfg(not(unix))]
 pub fn prune_orphans(_paths: &Paths) {}
 
@@ -311,7 +297,7 @@ pub fn gui_domain(uid: u32) -> String {
     format!("gui/{uid}")
 }
 
-/// `launchctl print <domain>/<label>`: the job's state, read-only.
+/// `launchctl print <domain>/<label>`.
 #[must_use]
 pub fn print_argv(domain: &str, label: &str) -> Vec<String> {
     vec!["print".to_string(), format!("{domain}/{label}")]
@@ -339,22 +325,19 @@ pub fn bootout_argv(domain: &str, label: &str) -> Vec<String> {
     vec!["bootout".to_string(), format!("{domain}/{label}")]
 }
 
-/// `launchctl enable <domain>/<label>`: lift a `launchctl disable` of the label.
+/// `launchctl enable <domain>/<label>`.
 #[must_use]
 pub fn enable_argv(domain: &str, label: &str) -> Vec<String> {
     vec!["enable".to_string(), format!("{domain}/{label}")]
 }
 
-/// `launchctl print-disabled <domain>`: every label `launchctl disable` or `enable` named
-/// there, read-only.
+/// `launchctl print-disabled <domain>`.
 #[must_use]
 pub fn print_disabled_argv(domain: &str) -> Vec<String> {
     vec!["print-disabled".to_string(), domain.to_string()]
 }
 
-/// Whether `print-disabled`'s `text` lists `label` disabled: its row `"<label>" => disabled`
-/// (`=> true` on a macOS that spelled it so). launchd refuses every bootstrap of a disabled
-/// label, whichever plist names it, with `5: Input/output error`.
+/// Whether `print-disabled`'s `text` lists `label` disabled.
 #[must_use]
 pub fn print_disabled_lists(text: &str, label: &str) -> bool {
     text.lines().any(|line| {
@@ -379,7 +362,7 @@ pub enum JobState {
     },
 }
 
-/// The running pid `launchctl print`'s text names: the service's own `pid = <n>` line.
+/// The running pid `launchctl print`'s text names.
 #[must_use]
 pub fn print_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
@@ -400,9 +383,9 @@ pub enum Started {
         /// Its process.
         pid: u32,
     },
-    /// The job was loaded but not running; it was kickstarted.
+    /// The job was loaded but not running.
     Kicked,
-    /// The job was not loaded; it was bootstrapped (and launchd starts it).
+    /// The job was not loaded.
     Bootstrapped,
 }
 
@@ -442,7 +425,6 @@ fn own_domain() -> String {
 }
 
 /// Read the job `label`'s state with `launchctl print` (read-only).
-///
 /// # Errors
 /// `launchctl` cannot be run, or hangs.
 #[cfg(unix)]
@@ -457,7 +439,6 @@ pub fn job_state(label: &str) -> io::Result<JobState> {
 }
 
 /// Load (and, with `RunAtLoad`, start) the job `plist` defines in this user's GUI domain.
-///
 /// # Errors
 /// `launchctl` cannot be run, or refuses.
 #[cfg(unix)]
@@ -466,7 +447,6 @@ pub fn bootstrap(plist: &Path) -> io::Result<()> {
 }
 
 /// Start the loaded job `label` (a running one is left as it is).
-///
 /// # Errors
 /// `launchctl` cannot be run, or refuses.
 #[cfg(unix)]
@@ -474,11 +454,8 @@ pub fn kickstart(label: &str) -> io::Result<()> {
     launchctl_ok(&kickstart_argv(&own_domain(), label))
 }
 
-/// Lift launchd's disable of `label` in this user's GUI domain (`launchctl enable`; no
-/// password, and nothing when it is not disabled).
-///
+/// Lift launchd's disable of `label` in this user's GUI domain.
 /// # Errors
-///
 /// `launchctl` cannot be run, or refuses.
 #[cfg(unix)]
 pub fn enable(label: &str) -> io::Result<()> {
@@ -486,7 +463,6 @@ pub fn enable(label: &str) -> io::Result<()> {
 }
 
 /// End the job `label` and unload it for this login (launchd's SIGTERM; no restart).
-///
 /// # Errors
 /// `launchctl` cannot be run, or refuses (a label it does not know).
 #[cfg(unix)]
@@ -495,7 +471,6 @@ pub fn bootout(label: &str) -> io::Result<()> {
 }
 
 /// Ensure `label` is running `program`'s mug via kickstart or bootstrap ([`Paths::session_plist`]).
-///
 /// # Errors
 /// What failed, as one line: `launchctl`, or a plist that cannot be written.
 #[cfg(unix)]
@@ -532,7 +507,6 @@ pub fn ensure_running(paths: &Paths, label: &str, program: &Path) -> Result<Star
             Ok(JobState::Loaded { pid: None }) => kickstart(label)
                 .map(|()| Started::Kicked)
                 .map_err(|e| e.to_string()),
-            // launchctl's own advice (re-run as root) does not reach a disable of this user's.
             Ok(JobState::Absent) | Err(_) if disabled(label) => Err(format!(
                 "launchd refused to load {}: it has {label} disabled for this user, past \
                  logout and restart (`launchctl enable {}/{label}` lifts it)",
@@ -544,8 +518,7 @@ pub fn ensure_running(paths: &Paths, label: &str, program: &Path) -> Result<Star
     }
 }
 
-/// Whether launchd has `label` disabled in this user's GUI domain
-/// ([`print_disabled_lists`]); not knowing is not disabled.
+/// Whether launchd has `label` disabled in this user's GUI domain ([`print_disabled_lists`]).
 #[cfg(unix)]
 pub fn disabled(label: &str) -> bool {
     launchctl(&print_disabled_argv(&own_domain())).is_ok_and(|out| {
@@ -642,10 +615,8 @@ mod tests {
         }
     }
 
-    /// A login plist naming a program that is gone is an orphan; one naming a program that
-    /// is there (another build's, deliberately enabled), one on another volume, one that is
-    /// not the mug's job and one that is not this crate's are not.
     #[test]
+    #[cfg(unix)]
     fn an_orphan_is_a_mugs_login_plist_whose_program_is_gone() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let paths = Paths {
@@ -799,8 +770,6 @@ mod tests {
         assert_eq!(enable_argv(&domain, "l.x"), ["enable", "gui/501/l.x"]);
     }
 
-    /// `print-disabled` as macOS 27.0 prints it, after `launchctl disable` of one label and
-    /// `enable` of another.
     #[test]
     fn a_disabled_label_is_its_own_row() {
         let text = "\tdisabled services = {\n\

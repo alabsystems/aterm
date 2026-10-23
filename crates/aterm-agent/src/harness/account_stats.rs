@@ -43,8 +43,12 @@ fn week_family(id: &str) -> Option<&'static str> {
 /// Whether the usage tap can have read this home's windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tap {
-    /// `[harness] usage_tap = false`, the packaged value.
+    /// `[harness] usage_tap = false` (it ships `true`).
     Off,
+    /// `usage_tap` on, and the harness off for Claude Code (`[harness] enabled = false` or
+    /// `[harness.claude] enabled = false`), so no relaunch carries the tap: the windows' closed
+    /// word is still `usage-tap-off`, and the text names the harness, not the key.
+    HarnessOff,
     /// On.
     On,
     /// On, but no tap reading is recorded under the label.
@@ -339,7 +343,7 @@ pub fn view(look: &Look<'_>) -> View {
             Missing::StateUnread
         } else {
             match look.tap {
-                Tap::Off => Missing::UsageTapOff,
+                Tap::Off | Tap::HarnessOff => Missing::UsageTapOff,
                 Tap::OtherHome => Missing::TapOtherHome,
                 Tap::On => Missing::NoReading,
             }
@@ -646,6 +650,11 @@ fn missing_text(win: &Win, look: &Look<'_>) -> String {
             "reset used {}, no reading since",
             at(f.epoch_at.unwrap_or(f.at))
         ),
+        (Some(Missing::UsageTapOff), _)
+            if win.kind == "five_hour" && look.tap == Tap::HarnessOff =>
+        {
+            "usage_tap off (the harness is off for Claude Code)".to_owned()
+        }
         (Some(Missing::UsageTapOff), _) if win.kind == "five_hour" => {
             "usage_tap off ([harness] usage_tap = true turns it on)".to_owned()
         }

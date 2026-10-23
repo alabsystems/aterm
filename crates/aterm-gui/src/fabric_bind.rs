@@ -18,18 +18,11 @@ impl FabricSession for crate::SessionCtx {
         &self.fabric
     }
 
-    fn record(&self, kind: &'static str, payload: String) {
+    fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool {
         self.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record(kind, payload);
-    }
-
-    fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-        self.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record_fact(kind, payload, fact)
+            .record_fact(kind, fact)
     }
 
     fn fabric_changed(&self) {
@@ -89,15 +82,11 @@ impl Registry for crate::session_store::SessionStore {
 }
 
 impl Timeline for crate::session_timeline::SessionTimeline {
-    fn record(&mut self, kind: &'static str, payload: String) {
-        crate::session_timeline::SessionTimeline::record(self, kind, payload);
-    }
-
     /// THE ONE FABRIC HOOK ([`crate::session_timeline::SessionTimeline::slog_take_wake`]).
-    fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
+    fn record_fact(&mut self, kind: &'static str, fact: FabricFact<'_>) -> bool {
         let at = self.slog().now();
         self.slog_mut().observe_fabric(fact, at);
-        crate::session_timeline::SessionTimeline::record(self, kind, payload);
+        crate::session_timeline::SessionTimeline::record(self, kind);
         self.slog_take_wake()
     }
 

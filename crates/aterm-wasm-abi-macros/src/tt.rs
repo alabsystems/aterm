@@ -3,7 +3,7 @@
 
 //! A token tree of plain strings: what the parser reads and the expansion
 //! writes. `proc_macro`'s own types only work inside a macro invocation, so
-//! the parser works on these and the tests build them with [`lex`].
+//! the parser works on these and the tests build them with `lex`.
 
 use std::fmt::Write as _;
 

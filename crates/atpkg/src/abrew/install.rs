@@ -21,8 +21,6 @@ pub(super) fn keg_version(f: &Formula) -> String {
     }
 }
 
-/// One plan member's admission on `machine`: Ok(whether to link it), a
-/// PassThrough for a recipe that needs Homebrew, or a refusal.
 fn preflight(
     prefix: &Prefix,
     f: &Formula,
@@ -176,14 +174,12 @@ pub(super) fn fetch_plan(api: &Api, name: &str) -> Result<Vec<Formula>, InstallE
     )
 }
 
-/// One walk, with the caller deciding which non-root dependencies can be skipped.
 fn dependency_plan(
     name: &str,
     ignore_dependencies: bool,
     mut read: impl FnMut(&str) -> Result<Formula, InstallError>,
     mut skip: impl FnMut(&str) -> bool,
 ) -> Result<Vec<Formula>, InstallError> {
-    /// The recursion's mutable state, one argument.
     struct PlanState {
         out: Vec<Formula>,
         visiting: Vec<String>,
@@ -389,10 +385,6 @@ fn prior_requests<'a>(
         .collect()
 }
 
-/// Build-prefix references left in a staged keg: placeholders in text
-/// files and Mach-O load commands still naming the build prefix, read in house
-/// ([`crate::macho::load_names`]): `otool`'s `/usr/bin` shim raises Apple's
-/// install dialog on a Mac without the developer tools.
 fn linkage_leftovers(staged: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<String>) {
@@ -425,13 +417,6 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
     out
 }
 
-/// What [`linkage_leftovers`] lists for the file `path` holding `bytes`
-/// on macOS: each install name or loaded dylib of a Mach-O ([`is_mach_o`]:
-/// 32- or 64-bit, thin or universal) that names a Homebrew build prefix, and
-/// the file itself when it opens as one but its load commands cannot be read
-/// exactly (the scan fails closed: real Homebrew pours it). A Java class
-/// file, which shares the universal magic, and a universal static archive's
-/// slices load nothing.
 fn macos_leftovers(path: &Path, bytes: &[u8]) -> Vec<String> {
     if !is_mach_o(bytes) {
         return Vec::new();
@@ -458,9 +443,6 @@ fn macos_leftovers(path: &Path, bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Whether `bytes` open a Mach-O abrew reads the load commands of: thin
-/// 32- or 64-bit in either byte order, or universal with a 32- or 64-bit
-/// arch table, a Java class file (`CAFEBABE` too) excepted.
 fn is_mach_o(bytes: &[u8]) -> bool {
     matches!(
         bytes.get(..4),
@@ -473,12 +455,7 @@ fn is_mach_o(bytes: &[u8]) -> bool {
     ) && !crate::macho::is_java_class(bytes)
 }
 
-/// The `install_name_tool` arguments that move a Mach-O's placeholder
-/// names (`names`, its [`crate::macho::LoadNames`]) to this prefix: `-id`
-/// for its install name, `-change` per loaded dylib and `-rpath` per run
-/// path that `relocate` rewrites, each name once however many slices carry
-/// it. Empty when nothing names a placeholder.
-///
+/// The `install_name_tool` arguments that move a Mach-O's placeholder names to this prefix.
 /// # Errors
 /// The slices of a universal file name different install names, which one
 /// `-id` cannot move.
@@ -521,10 +498,6 @@ fn relocation_args(
 /// rpaths rewritten by `install_name_tool`, placeholders in NUL-free (text)
 /// files replaced as bytes, and every modified binary ad-hoc re-signed
 /// (`codesign`, metadata preserved) since the edits invalidate its signature.
-/// `install_name_tool` is the developer directory's own
-/// ([`super::machine::DeveloperDir::tool`]), never the `/usr/bin` shim, which
-/// raises Apple's install dialog on a Mac without the developer tools: with
-/// none, a Mach-O that needs relocating delegates before anything runs.
 #[cfg(target_os = "macos")]
 fn relocate_staged(
     prefix: &Prefix,
@@ -704,8 +677,6 @@ enum ReplaceMode {
     SameKeg,
 }
 
-/// Read the same six-directory payload plan that activation would use, without
-/// its independent opt pointer.
 fn keg_was_linked(prefix: &Prefix, name: &str, version: &str) -> Result<bool, InstallError> {
     let keg = prefix.keg(name, version);
     let links = keg_link_plan(prefix, &keg)?;
@@ -1119,7 +1090,6 @@ fn publish_payload_with(
             if std::fs::symlink_metadata(live)
                 .is_ok_and(|now| now.dev() == identity.dev() && now.ino() == identity.ino())
             {
-                // Failed rollback leaves an unreceipted orphan, never a false install.
                 let _ = super::prefix::publish_directory(live, staged, false);
             }
         }
@@ -1129,7 +1099,6 @@ fn publish_payload_with(
     result
 }
 
-/// Create a destination directory without traversing an existing symlink.
 fn ensure_directory(path: &Path) -> Result<(), InstallError> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_dir() => Ok(()),
@@ -1361,7 +1330,6 @@ fn prepare_opt(
     Ok((keg, opt))
 }
 
-/// Only an exactly spelled, receipt-admitted physical keg is link authority.
 fn admit_keg(prefix: &Prefix, keg: &Path) -> Result<(), InstallError> {
     let cellar = prefix.cellar();
     let relative = keg
@@ -1711,7 +1679,6 @@ pub fn remove_dangling_links(prefix: &Prefix, name: &str) -> Result<usize, Strin
     Ok(removed)
 }
 
-/// Download, verify and safely extract a bottle into private staging.
 fn pour_bottle(prefix: &Prefix, f: &Formula, staging: &Path) -> Result<PathBuf, InstallError> {
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Err(InstallError::PassThrough(format!(
@@ -1809,8 +1776,6 @@ pub fn uninstall_versions(prefix: &Prefix, inst: &Installed, force: bool) -> Vec
     vec![default]
 }
 
-/// Remove prefix links that point into one version's keg only, so
-/// removing the default keg never strips another version's links.
 fn unlink_keg_version(prefix: &Prefix, name: &str, version: &str) -> Result<(), String> {
     let keg = prefix.keg(name, version);
     for link in owned_keg_links(prefix, name, false)? {
@@ -2673,9 +2638,6 @@ mod tests {
     /// A placeholder dylib's install name, loads and run paths become the
     /// `install_name_tool` arguments that move them to this prefix, each name
     /// once however many slices carry it; `@loader_path` and libSystem stay.
-    /// NEGATIVE CONTROL: a file naming no placeholder needs no arguments, and
-    /// slices with different install names are refused (one `-id` cannot
-    /// move both).
     #[cfg(target_os = "macos")]
     #[test]
     fn relocation_moves_every_placeholder_name_the_load_commands_carry() {
@@ -2833,13 +2795,6 @@ mod tests {
         assert!(relocate_staged(&prefix, &f, &staged, None).is_ok());
     }
 
-    /// The leftover scan reads a Mach-O's install name and loads in house:
-    /// one naming a Homebrew build prefix is listed once however many slices
-    /// load it, a 32-bit one too, and one that opens as a Mach-O but cannot
-    /// be read is listed as unchecked (the scan fails closed). NEGATIVE
-    /// CONTROL: a libSystem-only program, placeholder-free text, a Java class
-    /// file (`CAFEBABE` with a class version) and a universal static archive
-    /// list nothing.
     #[test]
     fn the_leftover_scan_reads_load_commands_without_otool() {
         use crate::macho::fixtures::{

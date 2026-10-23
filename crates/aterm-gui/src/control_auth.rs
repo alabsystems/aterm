@@ -3688,9 +3688,7 @@ mod tests {
         );
     }
 
-    /// The teardown dial is close-on-exec and non-blocking: a post-condition pin, not a test
-    /// of atomicity (Linux flags the socket inside `socket(2)`; Darwin, with no
-    /// `SOCK_CLOEXEC`, keeps the `fcntl` pair and its microsecond window).
+    /// The teardown dial is close-on-exec and non-blocking.
     #[cfg(unix)]
     #[test]
     fn the_teardown_dial_is_close_on_exec_and_non_blocking() {
@@ -4729,9 +4727,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The launch sweep against a real directory. With the day margin only the dead pid's
-    /// zero-byte file goes; younger files (two real sockets among them) are not probed, and a
-    /// token, a file with bytes and the `latest` alias are never candidates.
+    /// The launch sweep removes only aged zero-byte socket files with no listener.
     #[test]
     fn launch_sweep_removes_only_aged_empty_socks_nobody_listens_on() {
         use std::time::{Duration, SystemTime};
@@ -5668,7 +5664,20 @@ mod tests {
             !oversized.exists(),
             "retention never reads an attacker-sized completed index"
         );
-        assert_eq!(completed_video_fixture_count(root), VIDEO_KEEP + 1);
+        // The hard-linked marker's recording is kept (its marker is refused
+        // when pruned). Unix's census counts it among the completed, so it
+        // holds a slot and one more old recording goes; Windows' census
+        // refuses a multiply-linked file at once, so it holds none.
+        assert_eq!(
+            completed_video_fixture_count(root),
+            VIDEO_KEEP + if cfg!(windows) { 2 } else { 1 },
+            "{:?}",
+            std::fs::read_dir(root)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()
+        );
         assert!(root.join(fresh).is_dir());
     }
 
@@ -5949,8 +5958,10 @@ mod tests {
             &pinned_tombstone,
             &mut budget
         ));
-        assert!(!tombstone.exists() && budget == 0);
+        assert_eq!(budget, 0);
+        // Windows deletes a directory once its last handle closes.
         drop((pinned_tombstone, pinned_root));
+        assert!(!tombstone.exists());
 
         let ours = format!("p{}-leased", std::process::id());
         drop(confine_video_dir_for_instance(&root, &ours).unwrap());

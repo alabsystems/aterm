@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What one run measures, read from [`ENV`].
+//! What one run measures, read from `ENV`.
 
 use std::path::PathBuf;
 

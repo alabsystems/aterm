@@ -29,10 +29,6 @@ fn enable_output_streak(app: &mut App) {
     });
 }
 
-/// SERIOUS MODE TAKES THE COMET: Prism wake is decoration, so the gate every
-/// streak seam reads (`App::output_streak_shows`, the composed path's config
-/// included) is closed while Serious Mode is on, whatever the switch says;
-/// NEGATIVE CONTROL: without Serious Mode the same switch opens it.
 #[test]
 fn serious_mode_takes_the_output_streak() {
     let now = Instant::now();
@@ -57,8 +53,6 @@ fn composed_output_streak_is_off_under_reduced_motion() {
     assert!(pure.windows[&pure_wid].fx.streak_panes().next().is_none());
 }
 
-/// The streak resolves on `cursor_fx_focus`, so an unfocused window streaks only while typed
-/// into (the typed wake) or recorded (the recording pin).
 #[test]
 fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
     #[derive(Clone, Copy, Debug)]
@@ -483,8 +477,6 @@ fn arm_synthetic_typed(app: &mut App, wid: WindowId, now: Instant) {
     window.fx.cursor_mut().trail.note_synthetic_typed(now);
 }
 
-/// Type one character through the input host's seam: the press stamps the typed license, then
-/// the byte reaches the terminal, so the next composed tick mints its cat pulse.
 fn type_one_licensed_echo(
     app: &mut App,
     wid: WindowId,
@@ -522,11 +514,6 @@ fn type_one_licensed_echo(
     term_lock(term).process(b"x");
 }
 
-/// What one route did with its frame's licensed cat pulse — `(classified,
-/// pending, delivered, replay_changed)`: classified off the engine's own
-/// admission ring, delivered when the cat moved in that frame, and then the
-/// pulse left behind (if any) replayed through the forwarding seam, which
-/// must change nothing. Every route consumes its pulse in its own frame.
 fn observe_cat_pulse_route(
     app: &mut App,
     wid: WindowId,
@@ -791,9 +778,6 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
     );
 }
 
-/// The `Retain` arm never ticks, so a hide armed over history (`rk::Engine::hide_next_frame`)
-/// would blank the band on the next live frame. Pinned: nothing is armed over history, the band
-/// is kept (`TornBand::Keep`), and the next live frame draws it.
 #[test]
 fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_take() {
     let (mut app, wid, session) = mixed_fixture("rainbow kitty");
@@ -980,11 +964,6 @@ fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
     assert!(!ok, "Retain may not resurrect a previous live cursor frame");
 }
 
-/// How many cells the comet's streak lights after a licensed alt-screen
-/// relocation of 17 columns (a sweep lights the cells it crossed; a
-/// re-anchor only the caret's), and the repaint-blink epoch the host
-/// consumed. The comet's tail is its streak (the cadence comet's cells are
-/// retired beside it), so the streak's live samples are the witness.
 fn run_alt_reanchor(with_repaint_blink: bool) -> (usize, Option<Instant>) {
     let (mut app, wid, session) = mixed_fixture("comet");
     let term = app.pool.get(session).expect("terminal leaf").term.clone();
@@ -1119,7 +1098,6 @@ fn exact_composed_sample_distinguishes_grid_edges_from_blank_neighbors() {
     assert!(bottom.row_below_probe.is_empty());
 }
 
-/// The focused terminal leaf's pane origin in the composed window.
 fn focused_pane_origin(app: &mut App, wid: WindowId) -> (usize, usize) {
     let plan = app.active_visible_leaf_plan(wid).expect("composed plan");
     let leaf = plan
@@ -1133,7 +1111,6 @@ fn focused_pane_origin(app: &mut App, wid: WindowId) -> (usize, usize) {
     )
 }
 
-/// Resident ribbon cells on one window row: `(col, leaving)`.
 fn composed_ribbon_row(app: &App, wid: WindowId, row: u16) -> Vec<(u16, bool)> {
     let mut v: Vec<(u16, bool)> = app
         .windows
@@ -1164,8 +1141,6 @@ fn composed_ribbon_retired(app: &App, wid: WindowId) -> u64 {
         .map_or(0, |s| s.retired)
 }
 
-/// `ribbon_followed=` on the composed window: the cells the follow pass
-/// carried to another row with their text.
 fn composed_ribbon_followed(app: &App, wid: WindowId) -> u64 {
     app.windows
         .get(&wid)
@@ -1177,9 +1152,6 @@ fn composed_ribbon_followed(app: &App, wid: WindowId) -> u64 {
         .map_or(0, |s| s.followed)
 }
 
-/// Type `text` into the composed fixture one licensed key at a time, at a
-/// 90 ms cadence, presenting a composed frame per key. Returns the clock of
-/// the last present.
 fn composed_type(
     app: &mut App,
     wid: WindowId,
@@ -1202,7 +1174,6 @@ fn composed_type(
     t
 }
 
-/// Idle composed frames at 16 ms until `ms` have passed.
 fn composed_idle(app: &mut App, wid: WindowId, mut t: Instant, ms: u64) -> Instant {
     let end = t + Duration::from_millis(ms);
     while t < end {
@@ -1212,22 +1183,17 @@ fn composed_idle(app: &mut App, wid: WindowId, mut t: Instant, ms: u64) -> Insta
     t
 }
 
-/// The composed shapes the witness is fed under. All route through
-/// `composed_cursor_frame_sampled`; they differ in where the focused pane sits.
+/// The composed shapes the witness is fed under.
 #[derive(Clone, Copy, Debug)]
 enum ComposedShape {
-    /// One split beside the native sibling: a column offset (Horizontal)
-    /// or a row offset (Vertical).
+    /// One split beside the native sibling.
     Split(crate::tab_model::SplitAxis),
     /// Two splits: the focused leaf carries both offsets at once.
     ThreePane,
-    /// A split, then the focused leaf zoomed — one visible leaf that still
-    /// routes as composed (`visible_content_route_from_plan`: `composed:
-    /// plan.zoomed`), so it must be fed here and not in the single-pane hold.
+    /// A split, then the focused leaf zoomed.
     Zoomed,
 }
 
-/// A ribbon laid on a composed frame, and the window row it sits on.
 fn composed_hello(
     shape: ComposedShape,
 ) -> (
@@ -1298,11 +1264,6 @@ fn composed_hello(
     (app, wid, term, t, win_row, win_col)
 }
 
-/// A program re-lays its input box two rows down with no key behind it: the move is declined
-/// and the band follows its text (`Engine::follow_rows`) with nothing retired;
-/// `ribbon_followed=11` proves the composed path feeds the witness. Single-pane twin:
-/// `a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing` in
-/// `abandoned_ribbon.rs`.
 #[test]
 fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
     for shape in [
@@ -1340,13 +1301,6 @@ fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
     }
 }
 
-/// A box redrawn in place under a scroll, as Claude Code's composer is when a tool result
-/// lands under a full transcript (the owner, 2026-10-20: "the rainbow cursor trail broke
-/// when I pasted in this link here"): one synchronized write scrolls the pane three rows,
-/// writes other text where the scroll put the line, and redraws the line on its own row.
-/// The scroll's own frame reads the witness's rows after the translation
-/// (`CursorEffectScrollChange::translated_only`), so on that frame the band already
-/// stands under its text, never on the row the scroll carried it to, and nothing melts.
 #[test]
 fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_on_the_scroll_s_own_frame() {
     for shape in [
@@ -1386,9 +1340,6 @@ fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_on_the_scroll_s_own_fram
     }
 }
 
-/// The witness reads the focused pane's own cells, with its row and column offsets, on every
-/// composed shape, for a band on a row the caret has left. Also the shape law: a lone glyph
-/// changed strictly inside the band is not evidence; the same change at its last cell retires.
 #[test]
 fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
     for axis in [
@@ -1456,13 +1407,6 @@ fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
     }
 }
 
-/// A FAR WITNESS ROW IS READ FROM THE FRAME'S OWN EXTRACTION, never from the
-/// live grid after it. A band row outside the caret's captured trio is either
-/// captured under the same extraction hold, when the sample asked for it, or
-/// deferred: only a matching second-lock generation may fill its slot. A PTY
-/// write after the extraction (a glyph at the band's last cell, which would
-/// retire it) must not be read against the old cells; the next extracted
-/// frame sees the real replacement and retires.
 #[test]
 fn composed_far_witness_never_reads_rows_changed_after_cell_extraction() {
     for (shape, asked) in [
@@ -1770,8 +1714,6 @@ fn visible_terminal_handles(
         .collect()
 }
 
-/// DEC 2026 close/reopen on every present route, one row per (route, script): each step is
-/// written to every visible terminal, then presented; the `(ms, present?)` sequence is the law.
 #[test]
 fn close_reopen_presents_once_and_a_dirty_reopen_never_presents_partial() {
     #[derive(Clone, Copy, Debug)]
@@ -2325,8 +2267,7 @@ fn coherence_observation(app: &App, wid: WindowId) -> CoherenceObservation {
     }
 }
 
-/// The composed routes that extract a focused terminal sample and tick its
-/// cursor effects.
+/// The composed routes that extract a focused terminal sample and tick its cursor effects.
 #[derive(Clone, Copy, Debug)]
 enum CoherenceRoute {
     /// The heterogeneous (terminal beside native) live compositor.
@@ -2348,8 +2289,6 @@ fn primed_route_fixture(
     }
 }
 
-/// Present one advancing frame on `route`, running `after_extract` between
-/// the focused terminal's extraction and the rest of the frame.
 fn present_after(
     route: CoherenceRoute,
     app: &mut App,
@@ -2388,11 +2327,6 @@ fn present_after(
     }
 }
 
-/// ONE FOCUSED SAMPLE PER FRAME, on every composed route: the cursor effects
-/// tick from the same terminal sample the cells were extracted from, so a PTY
-/// write that lands after extraction (the deterministic hook moves the live
-/// terminal from A to B) cannot put B's cursor plane over A's cells, nor A's
-/// effects over B's. The retired two-lock choreography tore exactly that way.
 #[test]
 fn every_composed_route_keeps_effects_and_cells_on_one_focused_sample() {
     let t0 = Instant::now();
@@ -2439,8 +2373,6 @@ fn every_composed_route_keeps_effects_and_cells_on_one_focused_sample() {
     }
 }
 
-/// `unfocused_pane_scratch` is pruned only inside the composed route; every other route clears
-/// it (rationale on `App::retire_unfocused_pane_snapshots`).
 #[test]
 fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
     let mut app = App::headless_for_test();

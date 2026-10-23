@@ -89,6 +89,124 @@ macro_rules! __aterm_objc_count {
 }
 
 /// Define an Objective-C class at runtime.
+///
+/// ```no_run
+/// # use aterm_objc::Id;
+/// # struct ReduceMotionIvars { relay: Box<dyn Fn()> }
+/// aterm_objc::declare_class! {
+///     /// The notification-observer target.
+///     pub(crate) struct ReduceMotionTarget: NSObject {
+///         const NAME: &str = "ATermDocReduceMotionTarget";
+///         type Ivars = ReduceMotionIvars;
+///
+///         @sel(reduceMotionDidChange:)
+///         fn reduce_motion_did_change(&self, _note: Id) {
+///             (self.ivars().relay)();
+///         }
+///     }
+/// }
+/// ```
+///
+/// # Shape
+///
+/// * `@sel(name:)`, not an attribute: in `macro_rules!`,
+///   `$(#[$m:meta])* #[sel(…)]` is ambiguous because `sel(bump)` is itself a
+///   valid `meta`, and a leading `@` cannot start an attribute.
+/// * `Send`/`Sync` are structural (the marker is `!Send`) and interior
+///   mutability lives in the ivar type (`Cell`, `RefCell`). Instantiating
+///   without a [`crate::MainThread`] witness does not compile:
+///
+///   ```compile_fail
+///   aterm_objc::declare_class! {
+///       struct DocNoWitness: NSObject {
+///           const NAME: &str = "ATermDocNoWitness";
+///           type Ivars = ();
+///
+///           @sel(ping)
+///           fn ping(&self) {}
+///       }
+///   }
+///   // `alloc_init` takes a `MainThread` witness first.
+///   let _ = DocNoWitness::alloc_init(());
+///   ```
+/// * One ivar, not a struct of them — see [`crate::declare`].
+/// * `&self` is captured as an `ident`: a `self` token emitted by the macro
+///   lives in the macro's hygiene context, so a call-site body could not name
+///   it (`E0424`).
+///
+/// # Safety
+/// What the macro cannot check and the caller owes:
+///
+/// * `$super` must be linked into the binary and a legal superclass to add
+///   ivars to (every non-fragile ObjC class is).
+/// * A method's argument types must be the ones the framework actually passes
+///   (the mirror of [`crate::msg`]'s obligation).
+/// * `NAME` must be unique in the process; registration panics otherwise.
+///
+/// Checked at compile time: the selector's colon count equals the argument
+/// count; `Ivars` is aligned to at most 16 bytes (`S4`, see
+/// [`crate::ClassBuilder::add_rust_ivar`]); a method has at most fourteen
+/// arguments ([`crate::MsgFn`]'s ceiling), so everything registered is
+/// sendable from Rust.
+///
+/// An arity mismatch:
+///
+/// ```compile_fail
+/// aterm_objc::declare_class! {
+///     struct DocArityMismatch: NSObject {
+///         const NAME: &str = "ATermDocArityMismatch";
+///         type Ivars = ();
+///
+///         // `noArgsAtAll` has no colon, so it takes no argument — but the
+///         // encoding written from the Rust signature says `"v@:q"`, and
+///         // AppKit reads arity from the encoding.
+///         @sel(noArgsAtAll)
+///         fn no_args_at_all(&self, _n: i64) {}
+///     }
+/// }
+/// ```
+///
+/// A method wider than the ceiling:
+///
+/// ```compile_fail
+/// aterm_objc::declare_class! {
+///     struct DocTooWide: NSObject {
+///         const NAME: &str = "ATermDocTooWide";
+///         type Ivars = ();
+///
+///         // Fifteen arguments — seventeen parameters.
+///         @sel(a:b:c:d:e:f:g:h:i:j:k:l:m:n:o:)
+///         fn too_wide(
+///             &self,
+///             _a: i64, _b: i64, _c: i64, _d: i64, _e: i64,
+///             _f: i64, _g: i64, _h: i64, _i: i64, _j: i64,
+///             _k: i64, _l: i64, _m: i64, _n: i64, _o: i64,
+///         ) {}
+///     }
+/// }
+/// ```
+///
+/// Fourteen arguments compile, register and send (`tests/declared_abi.rs`).
+/// Matched arities of one, two and three arguments:
+///
+/// ```
+/// # use aterm_objc::{Bool, Id, Sel};
+/// aterm_objc::declare_class! {
+///     struct DocArityMatched: NSObject {
+///         const NAME: &str = "ATermDocArityMatched";
+///         type Ivars = ();
+///
+///         @sel(oneArg:)
+///         fn one_arg(&self, _n: i64) {}
+///
+///         @sel(addFirst:second:)
+///         fn add_two(&self, a: i64, b: i64) -> i64 { a + b }
+///
+///         @sel(control:textView:doCommandBySelector:)
+///         fn control(&self, _c: Id, _tv: Id, _s: Sel) -> Bool { Bool::NO }
+///     }
+/// }
+/// ```
 #[macro_export]
 macro_rules! declare_class {
     (

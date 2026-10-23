@@ -294,7 +294,7 @@ struct Stamp {
     written_ns: Option<u64>,
     created_ns: Option<u64>,
     /// The file's volume and number ([`aterm_sysprobe::volumes::FileId`],
-    /// [`aterm_sysprobe::volumes::file_id_of_handle`]).
+    /// `aterm_sysprobe::volumes::file_id_of_handle`).
     id: Option<(u64, u128)>,
 }
 

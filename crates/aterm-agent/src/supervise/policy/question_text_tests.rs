@@ -18,15 +18,12 @@ use super::*;
 
 const LONG: QuestionPriority = QuestionPriority::LongTerm;
 const SHORT: QuestionPriority = QuestionPriority::ShortTerm;
-/// The width every 2.1.283 capture was taken at.
 const COLS: u16 = 120;
 
-/// The text a priority writes (a text priority's).
 fn text_of(p: QuestionPriority) -> &'static str {
     p.text().expect("a text priority")
 }
 
-/// The decision on `rows` under `p`, the loop remembering `own`.
 fn decided(rows: &[String], p: QuestionPriority, own: Option<QuestionPriority>) -> Decision {
     let prompt = parse_prompt_v2(rows).unwrap_or_else(|| panic!("no box: {rows:#?}"));
     answer_question(&prompt, rows, p, own, false, Pane::of(rows))
@@ -40,7 +37,6 @@ enum Did {
     Enter(i32, AnswerTarget),
 }
 
-/// The answer a decision chose, with its rule, subject and unproven.
 fn did(d: &Decision) -> (Did, &'static str, String, String) {
     match d {
         Decision::Approve {
@@ -73,7 +69,6 @@ fn reason(d: &Decision) -> &str {
     }
 }
 
-/// `rows` with the first row holding `from` edited to hold `to`.
 fn edited(rows: &[String], from: &str, to: &str) -> Vec<String> {
     let at = rows
         .iter()
@@ -84,14 +79,12 @@ fn edited(rows: &[String], from: &str, to: &str) -> Vec<String> {
     out
 }
 
-/// The dialog on `rows`.
 fn dialog_of(rows: &[String]) -> aterm_phase::QuestionDialog {
     parse_prompt_v2(rows)
         .and_then(|p| p.question_dialog)
         .unwrap_or_else(|| panic!("no dialog: {rows:#?}"))
 }
 
-/// The free-text row as read.
 fn free_text_of(rows: &[String]) -> aterm_phase::FreeText {
     match dialog_of(rows).form {
         QuestionForm::Single { free_text, .. } | QuestionForm::Multi { free_text, .. } => free_text,
@@ -99,7 +92,6 @@ fn free_text_of(rows: &[String]) -> aterm_phase::FreeText {
     }
 }
 
-/// A greedy wrap of `text` at single spaces into rows `room` cells wide.
 fn wrap(text: &str, room: usize) -> Vec<String> {
     let mut lines = vec![String::new()];
     for word in text.split(' ') {
@@ -116,11 +108,6 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
     lines
 }
 
-/// The texts' rules: ASCII only; no digit and none of `, ; " - \` (a digit
-/// could select an option, a comma draws CSV quotes around a multi-select
-/// answer, `send` reads `\n`); single spaces, none at an edge; no word over 16
-/// cells; at most 279 bytes (below the paste-placeholder size); no `key ` (a
-/// log reader could take it for a verb).
 #[test]
 fn the_policy_texts_keep_their_rules() {
     let broken = |t: &str| -> Vec<&'static str> {
@@ -192,8 +179,6 @@ fn the_policy_texts_keep_their_rules() {
     }
 }
 
-/// The fit estimate is never below what Claude Code draws (each measured
-/// capture's text took three rows at the label column).
 #[test]
 fn the_fit_estimate_is_at_or_above_the_measured_wraps() {
     let measured_rows = |rows: &[String]| -> usize {
@@ -329,10 +314,6 @@ fn the_fit_estimate_is_at_or_above_the_measured_wraps() {
     }
 }
 
-/// Single-select, every row of the table: a pristine field with no memory gets
-/// the text; the field holding exactly the remembered text gets Enter; one
-/// remembered but empty is handed over (a text is never written twice); every
-/// other text is a person's.
 #[test]
 fn a_single_select_is_typed_then_entered_and_anything_else_is_the_persons() {
     for p in [LONG, SHORT] {
@@ -407,10 +388,6 @@ fn a_single_select_is_typed_then_entered_and_anything_else_is_the_persons() {
     );
 }
 
-/// Multi-select, every row of the table: a pristine, unchecked field gets the
-/// text; the loop's own text, ticked, is submitted by its button with the
-/// focus moved off the field first (Enter in the field unticks it, c3c);
-/// everything else is handed over.
 #[test]
 fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
     for p in [LONG, SHORT] {
@@ -456,12 +433,8 @@ fn a_multi_select_is_typed_then_submitted_by_its_button_never_in_the_field() {
     }
 }
 
-/// Claude Code 2.1.300, measured: a multi-select question at 80 columns as
-/// the harness read it, the focus on option 1 and the free-text row pristine.
 const MULTI_80_2_1_300: &str = include_str!("fixtures/claude-2.1.300-question-multi-80col.txt");
 
-/// `rows` with its rules drawn `cols` cells wide: the same dialog in a pane of
-/// that width (its other rows fit any width this is used at).
 fn at_width(rows: &[String], cols: usize) -> Vec<String> {
     rows.iter()
         .map(|r| {
@@ -474,9 +447,6 @@ fn at_width(rows: &[String], cols: usize) -> Vec<String> {
         .collect()
 }
 
-/// Under `long-term`, a multi-select text its dialog would draw over once the
-/// focus leaves for `Submit` (Claude Code 2.1.300 at 80 columns, and at 26,
-/// 30, 34 and 40) is never typed: the tab takes its recommended option, said.
 #[test]
 fn a_multi_select_text_its_dialog_would_draw_over_is_never_typed() {
     let rows = screen(MULTI_80_2_1_300);
@@ -503,9 +473,6 @@ fn a_multi_select_text_its_dialog_would_draw_over_is_never_typed() {
     }
 }
 
-/// Claude Code 2.1.300, measured: a multi-select's free-text row holding the
-/// long-term text, typed by hand, after `down` to `Submit`, at 39, 47 and 57
-/// columns (the dialog's rows).
 const REFLOW_2_1_300: [(u16, &str); 3] = [
     (
         39,
@@ -527,10 +494,6 @@ const REFLOW_2_1_300: [(u16, &str); 3] = [
     ),
 ];
 
-/// Every frame measured on Claude Code 2.1.300 (the long-term text typed into
-/// a multi-select's free-text row, label column 9, then `down` to `Submit`):
-/// `(columns, the column its text was drawn from, whether `Submit` was drawn
-/// over the text's last row)`.
 const REFLOW_MEASURED: [(u16, usize, bool); 43] = [
     (38, 8, false),
     (39, 8, true),
@@ -577,9 +540,6 @@ const REFLOW_MEASURED: [(u16, usize, bool); 43] = [
     (150, 9, false),
 ];
 
-/// [`drawn_rows`]'s wrap, row by row as drawn: greedy at single spaces, a
-/// row filled to its last cell leaving the next one starting with the space
-/// between (counted, not drawn: each row is drawn trimmed).
 fn drawn_wrap(text: &str, width: usize) -> Vec<String> {
     let mut rows = vec![String::new()];
     let mut line = 0usize;
@@ -602,11 +562,6 @@ fn drawn_wrap(text: &str, width: usize) -> Vec<String> {
     rows.iter().map(|r| r.trim().to_string()).collect()
 }
 
-/// [`drawn_rows`] gives the measured 2.1.300 frames' text rows where a
-/// greedy wrap differs (57 columns), and [`unfocused_row`] gives back every
-/// one of the 43 frames measured on 2.1.300: the column the text was drawn
-/// from, its rows as drawn, and whether `Submit` was drawn over the text's
-/// last row, where the rule never types it — and it types everywhere else.
 #[test]
 fn a_multi_select_text_keeps_its_rows_only_where_the_reflow_cannot_drop_one() {
     for (cols, capture) in REFLOW_2_1_300 {
@@ -638,9 +593,6 @@ fn a_multi_select_text_keeps_its_rows_only_where_the_reflow_cannot_drop_one() {
     assert!(!text_keeps_its_rows("Decide yourselfx", 24, 9));
 }
 
-/// What a frame of a measured reflow shows of `text`, typed into a
-/// multi-select's free-text row (`  4. [✔]…` or `  4. [✔] …`) before the
-/// focus moved down to `Submit`.
 struct Reflowed {
     /// The column the text was drawn from.
     col: usize,
@@ -651,7 +603,6 @@ struct Reflowed {
     kept: bool,
 }
 
-/// [`Reflowed`] of a frame's `rows`.
 fn reflowed(rows: &[String], text: &str) -> Reflowed {
     let first = rows
         .iter()
@@ -678,17 +629,6 @@ fn reflowed(rows: &[String], text: &str) -> Reflowed {
     Reflowed { col, drawn, kept }
 }
 
-/// F2, on Claude Code 2.1.302 (measured in the real-Claude
-/// lab, both policy texts typed by hand into a multi-select's free-text row,
-/// then `down` to `Submit`, at every width from 26 to 160 columns, and from
-/// 270 to 300 (long-term) and 240 to 260 (short-term), across the width from
-/// which the row no longer overflows the pane):
-/// [`unfocused_row`], from the pane's width, the row's label column and the
-/// text alone, gives back every frame — the column the text was drawn from
-/// (8 or 9: the long-term text at 8 up to 51 columns, the short-term text up
-/// to 50) and its rows as drawn — so the text is typed at every width at
-/// which it kept every row, and at no width at which `Submit` was drawn over
-/// it.
 #[test]
 fn a_multi_select_text_is_typed_at_every_measured_width_it_keeps_its_rows() {
     let mut misjudged: Vec<(QuestionPriority, u16, bool)> = Vec::new();
@@ -792,8 +732,6 @@ fn a_multi_select_text_is_typed_at_every_measured_width_it_keeps_its_rows() {
     }
 }
 
-/// the read-back after `down` at every
-/// width the text is typed at, not the nine long-term widths above alone.
 #[test]
 fn a_multi_select_text_reads_back_as_submit_at_every_swept_width_it_is_typed_at() {
     let template = f::QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1].1;
@@ -865,9 +803,6 @@ fn a_multi_select_text_reads_back_as_submit_at_every_swept_width_it_is_typed_at(
     );
 }
 
-/// The fallbacks, told: a tab the text would not fit and the preview form take
-/// their recommended option under the priority's rule, saying why, and a
-/// multi-select's fallback survives the tab's second key.
 #[test]
 fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_so() {
     let p = LONG;
@@ -936,9 +871,6 @@ fn a_tab_the_text_cannot_go_to_is_answered_with_its_recommended_option_and_says_
     assert_r10_is_the_recommended_paths(&drop, p);
 }
 
-/// In a text mode an unmarked question naming a destructive act is never left
-/// to the worker but decided as the recommended path decides it: its one
-/// refusal, said as a fallback, or handed over where that path hands it over.
 fn assert_r10_is_the_recommended_paths(rows: &[String], p: QuestionPriority) {
     let recommended = decided(rows, QuestionPriority::Recommended, None);
     match (recommended, decided(rows, p, None)) {
@@ -969,9 +901,6 @@ fn assert_r10_is_the_recommended_paths(rows: &[String], p: QuestionPriority) {
     }
 }
 
-/// `decide` hands a question to the priority its context names, with the
-/// loop's memory and the pane's width — and `answer_questions = false`
-/// still hands it over whatever the priority.
 #[test]
 fn decide_answers_by_the_contexts_priority() {
     let rows = screen(f::QUESTION_283_FREE_TEXT_FOCUSED);
@@ -1021,10 +950,6 @@ fn decide_answers_by_the_contexts_priority() {
     reason(&decide(&reading, &rows, &ctx));
 }
 
-/// Every question fixture aterm-phase carries (2.1.282 and 2.1.283), each
-/// with its focus moved onto every row it can hold, and the decision under
-/// [`QuestionPriority::Recommended`] as one line: what the recommended
-/// path decides, whole.
 fn recommended_sweep(
     decide_one: &dyn Fn(&aterm_phase::PromptV2, &[String]) -> Decision,
 ) -> Vec<String> {
@@ -1178,9 +1103,6 @@ fn recommended_sweep(
     out
 }
 
-/// The recommended path reads neither the loop's memory nor the pane's
-/// width: the sweep over every question fixture and every focus it can hold
-/// decides the same under `Recommended` whatever they are.
 #[test]
 fn the_recommended_decisions_ignore_memory_and_pane_width() {
     let at = |own: Option<QuestionPriority>, cols: u16| {
@@ -1237,9 +1159,6 @@ fn verdict(d: &Decision) -> Verdict {
     }
 }
 
-/// What the model lets the loop do at `st`, the loop's own guards granted
-/// (a person quiet, its last key taken, the queue empty): the decision part,
-/// the pure decider's.
 fn decision_of(model: &aterm_spec::derive::Model, st: &ModelState) -> Verdict {
     let mut free = st.clone();
     for (var, v) in [
@@ -1268,17 +1187,12 @@ fn decision_of(model: &aterm_spec::derive::Model, st: &ModelState) -> Verdict {
     }
 }
 
-/// The captures a question tab is drawn from: pristine with the focus in
-/// the field, the text typed with the focus in the field, and (multi) the
-/// text typed with the focus on the button.
 struct Tab {
     pristine: &'static str,
     typed: &'static str,
     typed_button: Option<&'static str>,
 }
 
-/// Tab `tab`'s captures, single- or multi-select: c4's first tab and c1
-/// (single), c3 and c4's second tab (multi).
 fn tab_captures(tab: i64, multi: bool) -> Tab {
     match (multi, tab) {
         (false, 0) => Tab {
@@ -1304,7 +1218,6 @@ fn tab_captures(tab: i64, multi: bool) -> Tab {
     }
 }
 
-/// Every focusable row of `rows`' dialog.
 fn focusable(rows: &[String]) -> Vec<QuestionFocus> {
     match dialog_of(rows).form {
         QuestionForm::Single { options, .. } => options
@@ -1325,8 +1238,6 @@ fn focusable(rows: &[String]) -> Vec<QuestionFocus> {
     }
 }
 
-/// One drawing of a model read as the decider is given it: the rows, the
-/// loop's memory of its text, its fallback latch, and the pane.
 struct Drawing {
     rows: Vec<String>,
     own: Option<QuestionPriority>,
@@ -1335,7 +1246,6 @@ struct Drawing {
 }
 
 impl Drawing {
-    /// `rows` in a pane exactly their size, the loop remembering `own`.
     fn on(rows: Vec<String>, own: Option<QuestionPriority>) -> Self {
         let pane = Pane::of(&rows);
         Self {
@@ -1346,7 +1256,6 @@ impl Drawing {
         }
     }
 
-    /// The same drawing with the focus on `row`.
     fn focused(&self, row: usize) -> Self {
         Self {
             rows: with_focus(&self.rows, row),
@@ -1357,12 +1266,8 @@ impl Drawing {
     }
 }
 
-/// A model read at `Text = 1`: `seen_tab`, `seen_focus`, `seen_typed`,
-/// `seen_own`, `seen_exact`, `seen_fallback`.
 type TextRead = (i64, i64, i64, i64, i64, i64);
 
-/// The height of the dialog on `rows`, its top rule to the last row drawn:
-/// a pane no taller than that has no room for a text to grow.
 fn dialog_height(rows: &[String]) -> usize {
     let top = rows
         .iter()
@@ -1375,15 +1280,6 @@ fn dialog_height(rows: &[String]) -> usize {
     last - top + 1
 }
 
-/// Every drawing of a model read, with the loop's memory of its text: the
-/// read's tab (`tabs` the review), its focus (0 the chosen row: on a text tab
-/// the free-text row, or on a multi-select holding the loop's text its
-/// button; on a fallback tab its recommended option 1; and 1 every other row
-/// it can hold), and its field: pristine; the loop's own text (`own`,
-/// remembered); a person's exact copy of the policy text (`exact`, not
-/// remembered); or other text (`typed`): a person's `2`, and on a tab the loop
-/// may have written on, `2`, the text plus a person's words and the text with
-/// its head dropped, each with the loop remembering its text.
 fn drawn(read: TextRead, tabs: i64, multi: bool, p: QuestionPriority) -> Vec<Drawing> {
     let (tab, focus, typed, own, exact, fallback) = read;
     if tab == tabs {
@@ -1485,7 +1381,6 @@ fn drawn(read: TextRead, tabs: i64, multi: bool, p: QuestionPriority) -> Vec<Dra
     out
 }
 
-/// A decider under test: a drawing in, its decision out.
 type Decider<'a> = &'a dyn Fn(&Drawing) -> Decision;
 
 /// Where a verdict was seen: a tab the text goes to, a tab that falls back
@@ -1497,24 +1392,14 @@ enum Seen {
     Review,
 }
 
-/// A bind's outcome: the verdicts seen and where, or every disagreement as
-/// `(the model's, the decider's)`.
 type Bound = Result<BTreeSet<(Seen, Verdict)>, BTreeSet<(Verdict, Verdict)>>;
 
-/// The model's side of the bind, once per form: every read the model at
-/// `Text = 1`, `Multi = multi` reaches with a fresh read, and what it lets
-/// the loop do there ([`decision_of`]) — with its `Tabs`.
 struct ModelReads {
     multi: bool,
     tabs: i64,
     reads: Vec<(TextRead, Verdict)>,
 }
 
-/// [`ModelReads`] of the committed model at `Text = 1`, `Multi = multi`: its
-/// whole bounded space walked once, breadth first, resolved
-/// ([`aterm_spec::interp::Resolved::successors`]: the interpreter's own
-/// successors in the same order, without a string-keyed environment per
-/// state; walked by name it was 88% of the test's time).
 fn model_reads(multi: bool) -> ModelReads {
     let committed = aterm_models_harness::supervisor_question_text_model();
     let model = aterm_spec::interp::with_consts(&committed, &[("Multi", i64::from(multi))]);
@@ -1569,9 +1454,6 @@ fn model_reads(multi: bool) -> ModelReads {
     ModelReads { multi, tabs, reads }
 }
 
-/// Each of `model`'s reads drawn ([`drawn`]), decided by `decider` under
-/// `p` and compared with the model: the verdicts seen and where, or every
-/// disagreement as `(the model's, the decider's)`.
 fn bind(model: &ModelReads, p: QuestionPriority, decider: Decider<'_>) -> Bound {
     let mut verdicts = BTreeSet::new();
     let mut wrong = BTreeSet::new();
@@ -1599,8 +1481,6 @@ fn bind(model: &ModelReads, p: QuestionPriority, decider: Decider<'_>) -> Bound 
     }
 }
 
-/// `decision` with its answer rewritten to an Enter on `target`, the focus
-/// moved there from where `dialog` has it (a negative control's decider).
 fn entered_on(
     decision: Decision,
     dialog: &aterm_phase::QuestionDialog,
@@ -1631,12 +1511,6 @@ fn entered_on(
     }
 }
 
-/// Tier-1 for `SupervisorQuestionText` (`Text = 1`, aterm-spec
-/// `supervisor_question_text_model`): at every reachable state with a fresh
-/// read, single- and multi-select, the real [`answer_question`] under each
-/// text priority over [`drawn`] writes the text, presses Enter, moves, or
-/// hands over exactly where `HarnessType`, `HarnessEnter`, `HarnessMove` or
-/// nothing is enabled ([`decision_of`]).
 #[test]
 fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
     let single = model_reads(false);
@@ -1753,8 +1627,6 @@ fn tier1_text_mode_decider_chooses_only_what_the_model_enables() {
     }
 }
 
-/// THE TEXT DRAWN AGAINST ITS CHECKBOX (F2, the reader's
-/// half).
 #[test]
 fn a_multi_select_text_drawn_against_its_checkbox_is_submitted_by_its_button() {
     let (cols, capture) = REFLOW_2_1_300[1];
@@ -1786,9 +1658,6 @@ fn a_multi_select_text_drawn_against_its_checkbox_is_submitted_by_its_button() {
     );
 }
 
-/// (Questions): `Submit` drawn over the last row of the loop's own text, the
-/// rest of that row glued to it as one word (2.1.300 MEASURED at 57 columns, `❯
-/// Submitked.)`).
 #[test]
 fn a_text_overdrawn_by_its_button_is_one_aterm_could_not_read_whole() {
     let (cols, capture) = REFLOW_2_1_300[2];
@@ -1808,15 +1677,6 @@ fn a_text_overdrawn_by_its_button_is_one_aterm_could_not_read_whole() {
     }
 }
 
-/// MUSE CODE'S QUESTION TAKES THE WORD'S TEXT AS A NOTE, AND ITS REVIEW IS
-/// SENT (1.4.10, measured in the lab: the whole 276-byte long-term text
-/// reached the model as `note`): under `long-term` / `short-term` the
-/// decision is the note ([`Choice::Note`], the word's rule, guarded on the
-/// question's own row — its head's clock ticks), and each read's next
-/// keystroke is the one [`note_step`] names, as on Codex's: arrows onto `None
-/// of the above` (a digit only moves the cursor there, but arrows are what
-/// the step presses), Tab there, the text into the empty note, Enter only on
-/// the note holding exactly the text the loop remembers writing.
 #[test]
 fn muses_question_takes_the_text_as_a_note_and_its_review_is_sent() {
     use aterm_phase::muse::fixtures as u;

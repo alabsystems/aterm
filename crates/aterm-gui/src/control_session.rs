@@ -1769,7 +1769,7 @@ fn momentum_read_outcome(
     }
 }
 
-/// The yield: park until the target's typing momentum has decayed to `floor`, analytically: one reading, one crossing solved from the release law (`TypingMomentum::reading_low_crossing`), one kernel timer ([`WatcherSpec::MomentumBelow`]), no polling.
+/// The yield: park until the target's typing momentum has decayed to `floor`, analytically: one reading, one crossing solved from the release law (`TypingMomentum::reading_low_crossing`), one kernel timer ([`WatcherSpec::MomentumBelow`](aterm_core::terminal::WatcherSpec::MomentumBelow)), no polling.
 pub(crate) fn park_until_momentum_below(
     term: &Arc<Mutex<Terminal>>,
     exited: &dyn Fn() -> bool,
@@ -2917,7 +2917,7 @@ pub(crate) fn cmd_meta(
     cmd_meta_by(term, store, session, ctx, rest, aterm_slog::Actor::Ctl)
 }
 
-/// [`cmd_meta`], each write's session log mark by `by` (the wire's [`log_actor`]).
+/// `cmd_meta`, each write's session log mark by `by` (the wire's [`log_actor`]).
 pub(crate) fn cmd_meta_by(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -3615,7 +3615,7 @@ pub(crate) fn cmd_log_closed(log: &aterm_slog::Log, rest: &str) -> String {
     )
 }
 
-/// `brief` of a session that has closed in this process ([`cmd_brief`]'s reply over the closed-session index's copy of its log, as of the wall clock now); `brief all` is the instance's, as from a live session.
+/// `brief` of a session that has closed in this process (`cmd_brief`'s reply over the closed-session index's copy of its log, as of the wall clock now); `brief all` is the instance's, as from a live session.
 pub(crate) fn cmd_brief_closed(
     log: &aterm_slog::Log,
     sid: &str,
@@ -4541,7 +4541,6 @@ mod tests {
 
     #[test]
     fn history_and_timeline_limits_match_retained_wire_rows() {
-        use crate::session_timeline::TIMELINE_CAP;
         use crate::turn_ledger::{ArchMark, LEDGER_CAP, TurnRecord};
 
         let h = crate::session_store::test_handle(73);
@@ -4589,10 +4588,8 @@ mod tests {
                 })
                 .collect();
             if cap.is_none() {
-                assert!(
-                    rows.len() > TIMELINE_CAP,
-                    "the view holds more than the ring did"
-                );
+                let floor = aterm_slog::row_floor(crate::session_log::ring_limits()).records;
+                assert!(rows.len() > floor, "the view holds more than its row floor");
             }
             let cap = cap.unwrap_or(rows.len());
             assert_eq!(rows.len(), cap, "fixture must reach ring eviction");
@@ -6489,8 +6486,8 @@ mod exits_tests {
         let oracle = |since: u64, n: usize| -> String {
             let g = store.read().unwrap_or_else(|p| p.into_inner());
             let mut rows: Vec<String> = g
-                .roster_since(since)
-                .filter(|r| r.change == RosterChange::Exited)
+                .closed_logs()
+                .exits_since(since)
                 .map(|r| {
                     let exit_code = r
                         .exit_code
@@ -6499,7 +6496,7 @@ mod exits_tests {
                         "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={}",
                         r.seq,
                         r.t_ms,
-                        r.sid,
+                        r.sid.as_str(),
                         r.local_id,
                         r.reason.as_str(),
                         crate::control::pct_encode(r.actor.as_wire()),

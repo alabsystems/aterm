@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A width change keeps the text the program wrote, on the screen and in every history tier, through the synchronous resize and the GUI's offloaded one.
+//! Tests that width changes preserve screen and scrollback text across sync and async resizes.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
 
-/// Every logical line, oldest history first, then the screen: history lines
-/// joined on their wrapped flag, screen rows (their content, `row_text`) joined
-/// the same way.
 fn logical_lines(term: &Terminal) -> Vec<String> {
     let grid = term.grid();
     let mut out: Vec<String> = Vec::new();
@@ -36,7 +33,6 @@ fn logical_lines(term: &Terminal) -> Vec<String> {
     out
 }
 
-/// Every screen row's text, exactly.
 fn screen(term: &Terminal) -> Vec<String> {
     let grid = term.grid();
     (0..grid.rows())
@@ -44,7 +40,6 @@ fn screen(term: &Terminal) -> Vec<String> {
         .collect()
 }
 
-/// Drive the GUI's offloaded width change to completion.
 fn offloaded_resize(term: &mut Terminal, rows: u16, cols: u16) {
     let mut job = term.resize_offloading_scrollback(rows, cols);
     while let Some(pending) = job {
@@ -52,15 +47,10 @@ fn offloaded_resize(term: &mut Terminal, rows: u16, cols: u16) {
     }
 }
 
-/// A tiered terminal as the window builds one, with a small ring so history
-/// reaches the store.
 fn tiered(rows: u16, cols: u16, ring: usize) -> Terminal {
     Terminal::with_scrollback(rows, cols, ring, Scrollback::with_defaults())
 }
 
-/// On screen: a real space in the last column before a wide glyph survives a
-/// narrow-then-widen round trip, exactly (the finding's inputs, and its ZWJ
-/// family line, whose every space between the clusters survives).
 #[test]
 fn a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip() {
     for (text, narrow) in [
@@ -79,10 +69,6 @@ fn a_real_space_before_an_early_wrapped_glyph_survives_a_screen_round_trip() {
     }
 }
 
-/// A recorded hole is still dropped, and only it: a glyph that really
-/// early-wrapped rejoins its line with no phantom space, also when the hole was
-/// blanked with a coloured background (BCE), and the narrowing back restores
-/// the early wrap.
 #[test]
 fn a_real_early_wrap_hole_is_dropped_on_rejoin() {
     let hole_bg = |frame: &aterm_core::render::RenderInput| {
@@ -130,7 +116,6 @@ fn a_real_early_wrap_hole_is_dropped_on_rejoin() {
     }
 }
 
-/// A rectangle moves the provenance of its last cell as well as its pixels.
 #[test]
 fn margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct() {
     for (name, op, source, destination) in [
@@ -178,7 +163,6 @@ fn margined_vertical_moves_keep_printed_blanks_and_wrap_holes_distinct() {
     }
 }
 
-/// `text` written on a 3-row screen and scrolled into history by five line feeds.
 fn in_history(mut term: Terminal, text: &str) -> Terminal {
     term.process(text.as_bytes());
     term.process(b"\r\n\r\n\r\n\r\n\r\n");
@@ -186,9 +170,6 @@ fn in_history(mut term: Terminal, text: &str) -> Terminal {
     term
 }
 
-/// In history, every tier, both resize paths: a full row's last cell (a space
-/// or a glyph) before a wide glyph survives a widening, and a narrowing back
-/// restores the original rows.
 #[test]
 fn a_full_rows_last_cell_survives_widening_out_of_history() {
     let cases: [(&str, u16, &str); 4] = [
@@ -231,9 +212,6 @@ fn a_full_rows_last_cell_survives_widening_out_of_history() {
     }
 }
 
-/// A hole the rewrap itself makes (a chunk backed off a wide glyph) is
-/// recorded like one the write path makes, on the screen and on history rows
-/// rebuilt from rewrapped lines, so the next rewrap drops it and nothing else.
 #[test]
 fn a_hole_a_rewrap_made_is_dropped_by_the_next_rewrap() {
     const LINE: &str = "abcdefghi中xyz";
@@ -259,10 +237,6 @@ fn a_hole_a_rewrap_made_is_dropped_by_the_next_rewrap() {
     }
 }
 
-/// A recorded hole is dropped from history too, in every tier and on both
-/// paths, also when the wrap blanked it with a background colour: the row's
-/// length then covers the hole, and a line staged at that length would carry a
-/// phantom coloured space into the next rewrap.
 #[test]
 fn a_coloured_early_wrap_hole_stays_out_of_history() {
     type Make = fn(u16) -> Terminal;
@@ -287,9 +261,6 @@ fn a_coloured_early_wrap_hole_stays_out_of_history() {
     }
 }
 
-/// Read without a rewrap, the coloured hole is no text either, as its staged
-/// line already leaves it out: on screen (a copy and the row text) and in either
-/// history tier, the line reads the same as with the default background.
 #[test]
 fn a_coloured_early_wrap_hole_is_no_text_before_any_rewrap() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -325,8 +296,6 @@ fn a_coloured_early_wrap_hole_is_no_text_before_any_rewrap() {
     }
 }
 
-/// The background drawn in the last column of viewport row `row`, as a
-/// renderer resolves it.
 fn bg_in_last_column(term: &mut Terminal, row: usize) -> [u8; 3] {
     let (rows, cols) = (term.grid().rows(), term.grid().cols());
     let frame = term.cell_frame(usize::from(rows), usize::from(cols));
@@ -339,10 +308,6 @@ fn bg_in_last_column(term: &mut Terminal, row: usize) -> [u8; 3] {
     )
 }
 
-/// A coloured hole is painted as the print path painted it, in the background
-/// of the wide glyph that wrapped, when its row is drawn from history, in
-/// either tier, as the newest line (continued on the screen) and further back,
-/// and it stays no text.
 #[test]
 fn a_coloured_early_wrap_hole_keeps_its_paint_in_history() {
     for text in [
@@ -380,9 +345,6 @@ fn a_coloured_early_wrap_hole_keeps_its_paint_in_history() {
     }
 }
 
-/// So is a coloured hole on a row that comes back to the screen from history,
-/// either tier, every way one comes back: a rows grow reveals it, a Kitty
-/// `CSI + T` unscrolls it, a widening's bottom anchoring pulls it down.
 #[test]
 fn a_coloured_early_wrap_hole_keeps_its_paint_back_on_the_screen() {
     for colour in ["41", "48;2;17;34;51"] {
@@ -424,8 +386,6 @@ fn a_coloured_early_wrap_hole_keeps_its_paint_back_on_the_screen() {
     }
 }
 
-/// A product rule: a hole is no text, so a paint a later erase gives it lasts
-/// only while its row stays on the screen at its width.
 #[test]
 fn a_recoloured_hole_takes_the_print_paths_paint_off_the_screen() {
     let red = {
@@ -454,9 +414,6 @@ fn a_recoloured_hole_takes_the_print_paths_paint_off_the_screen() {
     assert_eq!(term.grid().row_text(0).as_deref(), Some("abcdefghi"));
 }
 
-/// A hole is a hole until something is written into it: a program that later
-/// prints a space in that last cell (a line editor redrawing its line) made
-/// the space content, and a rewrap keeps it.
 #[test]
 fn a_space_written_into_a_hole_later_is_kept() {
     let mut term = Terminal::new(6, 10);
@@ -466,12 +423,6 @@ fn a_space_written_into_a_hole_later_is_kept() {
     assert_eq!(logical_lines(&term), vec!["abcdefghi 中xyz".to_string()]);
 }
 
-/// An edit that rewrites the hole's column other than by erasing it ends the
-/// hole, and the blank it leaves there is a cell the screen shows inside its
-/// line: ICH shifts a printed space into the column, DCH shifts the hole left
-/// and fills the column, a wide glyph over the column (alone, or the end of a
-/// run) whose head a narrow glyph then overwrites leaves its spacer's blank,
-/// and a DECFRA glyph there that DECERA then erases leaves an erased blank.
 #[test]
 fn an_edit_over_the_holes_column_ends_the_hole() {
     for (text, edit, expected) in [
@@ -497,9 +448,6 @@ fn an_edit_over_the_holes_column_ends_the_hole() {
     }
 }
 
-/// A line whose head is in history and whose tail rows lead the screen (the
-/// boundary lift) keeps every full row's last cell: the lifted row before the
-/// wide-led row, and the history head before the lifted rows.
 #[test]
 fn a_line_straddling_the_history_boundary_keeps_its_full_rows_last_cells() {
     const LINE: &str = "0123456789abcdefghij中xyz";
@@ -525,8 +473,6 @@ fn a_line_straddling_the_history_boundary_keeps_its_full_rows_last_cells() {
     }
 }
 
-/// A line split where history meets the screen keeps its text when it is
-/// rejoined from the ring.
 #[test]
 fn a_line_split_at_the_screen_keeps_its_text_when_the_ring_rejoins_it() {
     let line: String = (0..170)
@@ -562,9 +508,6 @@ fn a_line_split_at_the_screen_keeps_its_text_when_the_ring_rejoins_it() {
     }
 }
 
-/// Tiered history keeps a printed space at a reflow chunk end: two width
-/// changes do not join the words around it (synchronous path: the narrowing
-/// pushes rewrapped rows straight into the store).
 #[test]
 fn tiered_history_keeps_spaces_at_reflow_chunk_ends() {
     let lines = [
@@ -582,8 +525,6 @@ fn tiered_history_keeps_spaces_at_reflow_chunk_ends() {
     assert_eq!(logical_lines(&term), lines.to_vec());
 }
 
-/// The same through the GUI's offloaded path, with the reflowed ring spilling
-/// into the tiered store before the second width change.
 #[test]
 fn offloaded_tiered_history_keeps_spaces_at_reflow_chunk_ends() {
     let lines = [
@@ -605,7 +546,6 @@ fn offloaded_tiered_history_keeps_spaces_at_reflow_chunk_ends() {
     }
 }
 
-/// A run of printed spaces wider than a chunk survives the ring spill.
 #[test]
 fn a_long_run_of_printed_spaces_survives_offloaded_width_changes() {
     let line = format!("ab{}cd", " ".repeat(60));
@@ -621,9 +561,6 @@ fn a_long_run_of_printed_spaces_survives_offloaded_width_changes() {
     assert!(got.contains(&line), "{got:?}");
 }
 
-/// A prompt ending in a printed space (`read -p`, nothing redraws it) keeps the
-/// cursor after the space through two width changes, so typed input does not
-/// overwrite it.
 #[test]
 fn a_cursor_after_a_printed_space_keeps_its_column() {
     for widths in [[10u16, 20], [30, 40]] {
@@ -641,9 +578,6 @@ fn a_cursor_after_a_printed_space_keeps_its_column() {
     }
 }
 
-/// A handoff checkpoint carries each screen row as history reads one, so an engine restored
-/// from it rewraps as the live one: an early-wrap hole after cells a tab, CUF or CHA skipped
-/// stays a hole, and a soft-wrapped row DCH left one short of the margin keeps its blank.
 #[test]
 fn a_restored_engine_rewraps_as_the_live_one() {
     for input in [
@@ -687,8 +621,6 @@ fn a_restored_engine_rewraps_as_the_live_one() {
     }
 }
 
-/// A history row rebuilt at a new width keeps an OSC 8 link or SGR 58 underline colour only
-/// on the cells the rebuild put a glyph back in.
 #[test]
 fn a_wide_glyph_one_column_cannot_hold_leaves_no_link_in_history() {
     let link_on = "\x1b]8;;https://example.com/\x1b\\";
@@ -742,10 +674,6 @@ fn a_wide_glyph_one_column_cannot_hold_leaves_no_link_in_history() {
     }
 }
 
-/// Every cell of the view, at every display offset, whose link or SGR 58
-/// underline colour disagrees with `styled` (whether the cell holds part of
-/// the glyph the program styled, read from the cell's own char and, for a
-/// wide continuation, its lead's).
 fn view_style_strays(
     term: &mut Terminal,
     styled: impl Fn(char) -> bool,
@@ -787,9 +715,6 @@ fn view_style_strays(
     strays
 }
 
-/// Scrolled back, a history row rebuilt where a wide glyph cannot fit shows no link or
-/// underline colour on its empty cell: the tiered view's walk (`materialize_from_line`)
-/// restores spans only on the cells it filled (`filled_span_cols`), as the ring fills do.
 #[test]
 fn a_one_column_history_row_scrolled_back_styles_no_blank() {
     let link_on = "\x1b]8;;https://example.com/\x1b\\";
@@ -823,9 +748,6 @@ fn a_one_column_history_row_scrolled_back_styles_no_blank() {
     }
 }
 
-/// A VS16 glyph the live grid kept narrow in mid row keeps the columns after it, in
-/// scrollback and through a history rewrap, so the link and underline colour of the glyph
-/// after it stay on that glyph.
 #[test]
 fn a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place() {
     let text = "abc\u{2764}\u{FE0F} \x1b[4:3m\x1b[58;5;1m\x1b]8;;https://e.x/\x1b\\\u{1F680}\x1b]8;;\x1b\\\x1b[m";
@@ -870,11 +792,6 @@ fn a_vs16_glyph_kept_narrow_in_mid_row_keeps_the_styles_after_it_in_place() {
     }
 }
 
-/// A VS16 glyph the writer kept narrow in the last column and the skin tone
-/// that wrapped after it stay two cells through a history rewrap, as the
-/// screen's own rewrap keeps them: the live writer folds a skin tone only into
-/// a wide cell, so `☝️` (narrow, its widening refused at the row edge) and
-/// `🏽` (wide, on the next row) were drawn apart.
 #[test]
 fn a_vs16_glyph_kept_narrow_at_the_edge_and_its_wrapped_skin_tone_stay_apart() {
     let text = "abcdefghi\u{261D}\u{FE0F}\u{1F3FD}z";

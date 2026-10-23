@@ -26,12 +26,6 @@ pub const PLUTIL: &str = aterm_uds::os_path!("plutil");
 pub const CONTAINED: [(&str, &str); 1] =
     [("com.apple.notificationcenterui", "Notification Center")];
 
-/// The app whose sandbox container `domain` is in: one of [`CONTAINED`] by name (in any
-/// case, as `defaults` finds the domain), or a path
-/// into any app's container or group container (`…/Library/Containers/<id>/…`,
-/// `…/Library/Group Containers/<id>/…`: the roots macOS guards as data from other apps,
-/// `aterm_containment::sbpl::APP_DATA_ROOTS`, matched without regard to case as the volume
-/// names them), by its [`CONTAINED`] name, else by its id.
 fn container_of(domain: &str) -> Option<&str> {
     if let Some((_, app)) = CONTAINED
         .iter()
@@ -81,11 +75,7 @@ pub fn withheld(domain: &str, full_disk_access: Option<bool>) -> Option<String> 
     })
 }
 
-/// `launchctl print gui/<uid>`'s exit when the user has no GUI session (27.0 VM: "Could
-/// not find domain for user gui: 599").
 const NO_SESSION: i32 = 112;
-/// The groups a directory above a system plist may be writable by: wheel, and admin (stock
-/// macOS's `/Library/Application Support/CrashReporter` is `root:admin 0775`).
 const WHEEL: u32 = 0;
 const ADMIN: u32 = 80;
 
@@ -168,7 +158,6 @@ impl Target {
         }
     }
 
-    /// `defaults [-currentHost]`, as the target's user.
     fn tool(&self) -> Cmd {
         let mut cmd = Cmd::new(DEFAULTS);
         if self.scope == Scope::Host {
@@ -322,9 +311,8 @@ pub fn system_file(sys: &dyn System, path: &Path) -> Result<Option<Stat>, String
     }
 }
 
-/// Accept an empty export of the system domain whose plist `path` exists only if `plutil`
-/// reads that file as an empty dictionary. `defaults export` prints the same `<dict/>`
-/// for a domain the reader may not read, and `plutil` says why it cannot.
+/// Confirm an empty export of `path` using `plutil`.
+///
 /// # Errors
 /// One line when the file is unreadable or not empty.
 fn confirm_empty(sys: &dyn System, path: &Path, export: &Cmd) -> Result<(), String> {
@@ -492,8 +480,6 @@ impl Pref {
         self
     }
 
-    /// Why a change must wait: it relaunches a process of the user at the console while
-    /// the Mac is in use (design §5.3).
     fn deferred(&self, ctx: &Ctx) -> Option<String> {
         disrupts(self.restart.as_deref()?, self.target.user.as_ref()?, ctx)
     }
@@ -575,8 +561,6 @@ impl Activation for Relaunch {
         )))
     }
 
-    /// Relaunch the process once and wait for it; each row it was to activate fails with
-    /// why when it is not up again.
     fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
         let owed = std::mem::take(&mut *self.owed.lock().unwrap_or_else(PoisonError::into_inner));
         let keys: Vec<Target> = owed.iter().map(|(_, target)| target.clone()).collect();
@@ -729,8 +713,6 @@ pub fn revert_line(
     }
 }
 
-/// Put a system preference file's owner and mode back as they were before `defaults`
-/// wrote it.
 fn keep_owner_and_mode(sys: &dyn System, path: &Path, was: Stat) -> Result<(), String> {
     let mode = was.mode & 0o777;
     match sys.set_owner_and_mode(path, was.uid, was.gid, mode) {
@@ -821,7 +803,7 @@ impl Item for Unmet {
     }
 }
 
-/// A TOML value as the property-list value `defaults` stores, with `{key}` placeholders in its strings filled from `vars`.
+/// Convert a TOML value to a property-list value with `{key}` placeholders filled from `vars`.
 ///
 /// # Errors
 /// One line for a date-time a plist `<date>` cannot hold (anything but UTC to the second).
@@ -856,7 +838,6 @@ pub fn to_pvalue(value: &aterm_toml::Value, vars: &[(&str, &str)]) -> Result<PVa
     })
 }
 
-/// Whether `name` can be handed to `killall` as a process name: no path, no option.
 fn plain_process_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
@@ -1022,8 +1003,6 @@ pub(crate) mod tests {
         export("<dict/>")
     }
 
-    /// `com.apple.AdLib` for the VM's admin, as `defaults export com.apple.AdLib -`
-    /// printed it.
     const VM_ADLIB: &str = "<dict>\n\t<key>CKDPIDSyncState</key>\n\t<integer>1</integer>\n\t<key>CKSubscribedAccountsScrubbed</key>\n\t<true/>\n\t<key>allowApplePersonalizedAdvertising</key>\n\t<false/>\n\t<key>allowIdentifierForAdvertising</key>\n\t<true/>\n\t<key>personalizedAdsMigrated</key>\n\t<true/>\n</dict>";
 
     fn run(
@@ -1705,10 +1684,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Rows whose writes one process reads share its relaunch: the engine writes every one,
-    /// relaunches the process once after the last, journaled as one line, and reads each
-    /// back only after it is up again. Negative control: each row with a relaunch of its
-    /// own relaunches the process once per row.
     #[test]
     fn rows_one_process_reads_relaunch_it_once_after_the_last() {
         let admin = user("admin", 501);
@@ -1778,7 +1753,6 @@ pub(crate) mod tests {
                     .iter()
                     .filter(|c| c.contains("export com.example.bar"))
                     .count();
-                // Two looks of the relaunched process, then one read-back per row.
                 assert_eq!(read_backs, 2 + keys.len(), "{calls:#?}");
             }
         }
@@ -2014,8 +1988,6 @@ scope = "user"
         assert!(matches!(read, Read::Unusable(_)), "{read:?}");
     }
 
-    /// Only a grant known to be held opens another app's container: refused and not
-    /// measured both leave it alone, and a domain outside a container is never withheld.
     #[test]
     fn a_container_domain_is_withheld_unless_full_disk_access_is_known_held() {
         for unknown in [None, Some(false)] {
@@ -2040,13 +2012,6 @@ scope = "user"
         }
     }
 
-    /// A raw `[[defaults]]` row on another app's container (the agent's baseline, `aterm
-    /// machines here`) is gated as the Widgets row is, whether it names the domain or spells
-    /// a path into the container (Notification Center's, or any app's, in any case) or into
-    /// a group container (in any case), or names Notification Center's domain in another
-    /// case: without a grant known held (not measured, or refused) its item is
-    /// a blocked row under its usual id that runs nothing, apply included; with it, the row
-    /// reads its domain.
     #[test]
     fn a_raw_row_on_another_apps_container_is_read_and_written_only_with_the_grant() {
         const NC_PATH: &str = "/Users//alice/Library/Containers/com.apple.notificationcenterui/Data/Library/Preferences/com.apple.notificationcenterui";
@@ -2144,10 +2109,6 @@ scope = "user"
         }
     }
 
-    /// A user row whose domain reaches a path through `..` is refused, whatever the grant,
-    /// as a system row's is: the gate reads a path as written, and a `..` through
-    /// another directory reaches another app's container by a spelling it does not see as
-    /// one (the kernel resolves the `..`, through a symbolic link as it is).
     #[test]
     fn a_user_domain_that_climbs_with_dotdot_is_refused_whatever_the_grant() {
         let alice = user("alice", 501);
@@ -2170,11 +2131,6 @@ scope = "user"
         }
     }
 
-    /// A system row is gated on the file it resolves to: one whose path is in an app's
-    /// container is, without a grant known held, a blocked row that runs nothing (no stat of
-    /// its directories, no export), and with the grant it reads its file; one that names
-    /// Notification Center's domain resolves under /Library/Preferences, no container, and
-    /// is never gated.
     #[test]
     fn a_system_row_is_gated_on_the_file_it_resolves_to() {
         let rows = row(r#"

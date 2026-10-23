@@ -19,7 +19,7 @@ mod words;
 
 pub use model::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Level, Link, MailFacts, MailLast,
-    NeedFact, NeedSeverity, Rim, Slot, StopCause, StoryPoint, StoryVerb, TurnFact, WallAnswer,
+    NeedFact, NeedSeverity, Rim, Slot, StopCause, StoryVerb, TurnFact, WallAnswer,
 };
 pub use paint::{PresenceTones, inks, tones};
 pub use pill::{Pill, PillAct, PillHit, PillKind, PillLayout, Span, pill_layout};
@@ -48,9 +48,6 @@ pub trait Host: Copy + Eq + Debug {
     /// Terminal grid cell width of `s` from column 0.
     fn columns(s: &str) -> usize;
 }
-
-/// The story ring's capacity.
-pub(crate) const STORY_CAP: usize = 256;
 
 /// Maximum byte length of text carried by `ctl story`.
 pub const TOLD_TEXT_MAX_BYTES: usize = 96;

@@ -14,7 +14,7 @@ pub const SCRATCH_PREFIX: &str = aterm_uds::host::TOOLING_SCRATCH;
 /// 193 MB), with room for upstream to grow.
 const UNPACKED_CAP: u64 = 2 << 30;
 
-/// A row's scratch, removed on drop unless an unproven copied program retains it.
+/// A row's scratch, removed on drop unless a program run from it, unproven, retains it.
 pub(super) struct Scratch {
     dir: aterm_tempfile::TempDir,
 }
@@ -69,16 +69,52 @@ impl Scratch {
         let scratch = retained.0.take().expect("the executing scratch is owned");
         Ok((scratch, stdout))
     }
+
+    /// Run a build that links programs into this scratch and execs them (cargo's build
+    /// scripts). Only its successful exit proves them, cargo waiting for each; an error
+    /// or an unwind keeps the scratch.
+    pub(super) fn run_build(self, host: &dyn Host, spawn: &Spawn) -> Result<Self, String> {
+        let path = self.path().to_path_buf();
+        let mut retained = RetainedScratch(Some(self));
+        host.run(spawn)
+            .map_err(|e| format!("{e}; keeping the build's scratch at {}", path.display()))?;
+        Ok(retained.0.take().expect("the building scratch is owned"))
+    }
+
+    /// Keep the scratch, where what ran from it has not shown it ran: its path. The
+    /// give-up exec stamp records this retention, not proof of execution; without a run
+    /// proof the tooling reclaim keeps the image regardless of elapsed time or reboot.
+    pub(super) fn keep(self) -> PathBuf {
+        aterm_uds::deadline::stamp_exec(self.path());
+        self.dir.keep()
+    }
+
+    /// A new, kept `.replaced-<dest's name>-*` folder beside the scratch for what [`place`]
+    /// moves aside: that may be running, so no run removes it; the tooling reclaim takes
+    /// it once idle.
+    fn kept_beside(&self, dest: &Path) -> Result<PathBuf, String> {
+        let root = self
+            .path()
+            .parent()
+            .ok_or_else(|| format!("{} has no parent", self.path().display()))?;
+        let name = dest.file_name().unwrap_or_default().to_string_lossy();
+        aterm_tempfile::Builder::new()
+            .prefix(&format!(".replaced-{name}-"))
+            .tempdir_in(root)
+            .map(aterm_tempfile::TempDir::keep)
+            .map_err(|e| format!("could not create a folder under {}: {e}", root.display()))
+    }
 }
 
-/// Retention is armed before execution. Only an observed stdout response takes the
-/// scratch back; every other return or unwind leaves the actual copied image in place.
+/// Retention is armed before execution. Only the run's proof (a copy's stdout, a build's
+/// successful exit) takes the scratch back; every other return or unwind leaves what ran
+/// in place.
 struct RetainedScratch(Option<Scratch>);
 
 impl Drop for RetainedScratch {
     fn drop(&mut self) {
         if let Some(scratch) = self.0.take() {
-            let _ = scratch.dir.keep();
+            let _ = scratch.keep();
         }
     }
 }
@@ -283,10 +319,12 @@ pub(super) fn touch_stamp(dir: &Path) {
     }
 }
 
-/// Put the finished `tree` at `dest` with one rename. Whatever stands at `dest` (a copy
-/// with no stamp, or a stamp of another pin) is renamed aside into the scratch first and
-/// goes with it. A rename that fails because another run placed the same pin meanwhile is
-/// no failure when `complete()` (of `dest`) holds.
+/// Put the finished `tree` at `dest` with one rename, unless `complete()` (of `dest`)
+/// holds already: another run placed the same pin, and its tree, which may be running,
+/// stays. Whatever else stands at `dest` (a copy with no stamp, or a stamp of another pin)
+/// may be running too: it is renamed aside into a kept `.replaced-*` folder beside the
+/// scratch, never removed with it. A rename that fails because another run placed the same
+/// pin meanwhile is no failure when `complete()` holds.
 pub(super) fn place(
     scratch: &Scratch,
     tree: &Path,
@@ -297,8 +335,11 @@ pub(super) fn place(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
+    if complete() {
+        return Ok(());
+    }
     if std::fs::symlink_metadata(dest).is_ok() {
-        let aside = scratch.path().join("replaced");
+        let aside = scratch.kept_beside(dest)?.join("tree");
         if let Err(e) = std::fs::rename(dest, &aside)
             && std::fs::symlink_metadata(dest).is_ok()
         {

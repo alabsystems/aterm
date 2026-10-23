@@ -67,7 +67,7 @@ fn check_failed(e: CheckError) -> io::Error {
     }
 }
 
-/// Maximum wait for a HELLO's answer from the keeper.
+/// Minimum wait for a HELLO's answer from the keeper.
 pub const WELCOME_WAIT: Duration = crate::identity::PEER_CHECK_HANG.saturating_add(FRAME_BUDGET);
 
 const FRAME_BUDGET: Duration = Duration::from_secs(2);

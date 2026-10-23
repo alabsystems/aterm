@@ -119,7 +119,7 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
 /// Run-length encoded byte-offset-to-column map for one line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnMap {
-    /// The graphemes, in byte order, as runs of a repeating shape.
+    /// The graphemes, in byte order, as runs of a repeating shape; empty for the identity map.
     runs: Box<[ClusterRun]>,
     /// Length of the source text in bytes: the identity map clamps lookups
     /// here, and a lookup at or past it answers `total`.

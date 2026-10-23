@@ -28,8 +28,7 @@ use compile::Program;
 use parse::Flags;
 use pikevm::Cache;
 
-/// Default ceiling on a compiled program, in bytes. Matches the `regex` crate's
-/// default so a call site that does not set one behaves the same.
+/// Default ceiling on a compiled program, in bytes.
 const DEFAULT_SIZE_LIMIT: usize = 10 * (1 << 20);
 
 /// Default ceiling on the work one search may do; see [`RegexBuilder::step_limit`].
@@ -88,16 +87,14 @@ impl std::error::Error for StepLimitExceeded {}
 pub struct Regex {
     prog: Arc<Program>,
     pattern: Arc<str>,
-    /// Work ceiling for one search. See [`RegexBuilder::step_limit`].
+    /// Work ceiling for one search.
     step_limit: u64,
-    /// Sticky: set the first time any search on this program (or on a clone of
-    /// it — the flag is shared, like the program) is cut short.
+    /// Sticky flag set the first time any search on this shared program is cut short.
     cut_short: Arc<AtomicBool>,
 }
 
 impl Regex {
     /// Compile `pattern` with default limits.
-    ///
     /// # Errors
     /// Returns [`Error::Syntax`] or [`Error::CompiledTooBig`] if compilation fails.
     pub fn new(pattern: &str) -> Result<Self, Error> {
@@ -115,18 +112,18 @@ impl Regex {
     /// Does `text` contain a match anywhere?
     #[inline]
     #[must_use]
-    /// Return `true` if `text` matches anywhere (fails closed to `false` on step-limit exhaustion).
+    /// Return `true` if `text` matches anywhere.
     pub fn is_match(&self, text: &str) -> bool {
         self.try_is_match(text).unwrap_or(false)
     }
 
     /// [`is_match`](Self::is_match), reporting exhaustion instead of hiding it.
+    ///
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
     /// decide.
     #[inline]
     /// Like [`is_match`](Self::is_match), but reports step-limit exhaustion.
-    ///
     /// # Errors
     /// Returns [`StepLimitExceeded`] if the search exhausts [`step_limit`](Self::step_limit).
     pub fn try_is_match(&self, text: &str) -> Result<bool, StepLimitExceeded> {
@@ -143,12 +140,12 @@ impl Regex {
     }
 
     /// [`find`](Self::find), reporting exhaustion instead of hiding it.
+    ///
     /// # Errors
     /// [`StepLimitExceeded`] if the search ran out of budget before it could
     /// decide; no partial span is returned.
     #[inline]
     /// Like [`find`](Self::find), but reports step-limit exhaustion.
-    ///
     /// # Errors
     /// Returns [`StepLimitExceeded`] if the search exhausts [`step_limit`](Self::step_limit).
     pub fn try_find<'t>(&self, text: &'t str) -> Result<Option<Match<'t>>, StepLimitExceeded> {
@@ -203,8 +200,7 @@ impl Regex {
         }
     }
 
-    /// The leftmost-first match starting at or after byte offset `start`,
-    /// charged against `budget` and leaving it holding what remains.
+    /// Leftmost-first match starting at or after `start`, charged against `budget`.
     fn search(
         &self,
         text: &str,
@@ -228,7 +224,6 @@ impl Regex {
                 pikevm::search(&self.prog, &mut Cache::new(), text, start, earliest, budget)
             });
         if outcome.is_err() {
-            // Every entry point funnels through here, so none can lose the fact.
             self.cut_short.store(true, Ordering::Relaxed);
         }
         outcome.map_err(|_| StepLimitExceeded::new(self.step_limit))
@@ -333,7 +328,7 @@ impl Matches<'_, '_> {
     /// [step budget](RegexBuilder::step_limit)?
     #[inline]
     #[must_use]
-    /// Whether iteration stopped early because a search exhausted the [step budget](RegexBuilder::step_limit).
+    /// Whether iteration stopped early because a search exhausted the step budget.
     pub const fn step_limit_exceeded(&self) -> bool {
         self.cut_short
     }
@@ -461,7 +456,6 @@ impl RegexBuilder {
     }
 
     /// Parse and compile the pattern.
-    ///
     /// # Errors
     /// Returns [`Error::Syntax`] or [`Error::CompiledTooBig`] if compilation fails.
     pub fn build(self) -> Result<Regex, Error> {
@@ -481,9 +475,7 @@ impl RegexBuilder {
 #[must_use]
 /// Escape all regex metacharacters in `pattern` so it matches literally.
 pub fn escape(pattern: &str) -> String {
-    /// The characters this engine reads as syntax. `<` and `>` are pointedly
-    /// absent: they are ordinary literals, and `\<` / `\>` are the word-boundary
-    /// assertions, so escaping them would change what the pattern means.
+    /// The characters this engine reads as syntax.
     const META: &str = r"\.+*?()|[]{}^$#&-~";
 
     let mut out = String::with_capacity(pattern.len());
@@ -510,7 +502,7 @@ impl StepLimitExceeded {
     /// Return `true` iff `used <= self.limit`.
     #[inline]
     #[must_use]
-    /// Return `true` iff `used <= self.limit`.
+    /// Return `true` if and only if `used <= self.limit`.
     pub const fn within_budget(self, used: u64) -> bool {
         used <= self.limit
     }
@@ -616,7 +608,7 @@ pub const fn disjoint_ordered_spans(
 /// Return `true` iff ASCII byte `b` is a regex syntax metacharacter escaped by [`escape`].
 #[inline]
 #[must_use]
-/// Return `true` iff ASCII byte `b` is a regex syntax metacharacter escaped by [`escape`].
+/// Whether ASCII byte `b` is a regex syntax metacharacter escaped by [`escape`].
 pub const fn is_ascii_meta_byte(b: u8) -> bool {
     matches!(
         b,
@@ -694,7 +686,6 @@ pub const fn decode_match_span_le(bytes: [u8; 16]) -> (u64, u64) {
 mod step_budget_tests {
     use super::*;
 
-    /// `pattern` under a 1 MiB `size_limit` and the default step budget.
     fn one_mib_gate(pattern: &str) -> Regex {
         RegexBuilder::new(pattern)
             .size_limit(1 << 20)
@@ -703,13 +694,10 @@ mod step_budget_tests {
             .expect("the amplifiers compile under a 1 MiB ceiling — that is the problem")
     }
 
-    /// Thirteen- and twenty-five-byte patterns that compile to thousands of instructions.
     const AMPLIFIERS: [&str; 2] = ["(?:x?){2000}z", "(?:x|x|x|x|x|x|x|x){400}z"];
 
-    /// The step limit `aterm-observe` and `aterm-search` pass; keep it equal to theirs.
     const CALL_SITE_STEP_LIMIT: u64 = 1 << 22;
 
-    /// One 4,096-column row and a 3 MB scrollback.
     fn row() -> String {
         "x".repeat(4096)
     }
@@ -717,7 +705,6 @@ mod step_budget_tests {
         "x".repeat(3 * 1024 * 1024)
     }
 
-    /// Does a whole `find_iter` over `haystack` finish inside `limit` units?
     fn completes_within(pattern: &str, haystack: &str, limit: u64) -> bool {
         let re = RegexBuilder::new(pattern)
             .step_limit(limit)
@@ -728,8 +715,6 @@ mod step_budget_tests {
         !it.step_limit_exceeded()
     }
 
-    /// The smallest budget that lets a whole `find_iter` finish, to within 2%: double,
-    /// then bisect.
     fn budget_needed(pattern: &str, haystack: &str) -> u64 {
         let mut hi = 1u64;
         while !completes_within(pattern, haystack, hi) {
@@ -747,8 +732,6 @@ mod step_budget_tests {
         hi
     }
 
-    /// At the call sites' budget both amplifiers stop at once, over a row and over 3 MB,
-    /// and report exhaustion.
     #[test]
     fn the_amplifiers_terminate_promptly_instead_of_hanging() {
         let row = row();
@@ -770,8 +753,6 @@ mod step_budget_tests {
         }
     }
 
-    /// The default budget refuses each amplifier's 3 MB scan. It still answers one row,
-    /// which is why the call sites pass a tighter budget.
     #[test]
     fn the_default_budget_stops_the_runaway_scan() {
         let scrollback = scrollback();
@@ -785,8 +766,6 @@ mod step_budget_tests {
         }
     }
 
-    /// Exhaustion is not "no match": a starved search refuses where a fed one finds a real
-    /// match.
     #[test]
     fn exhaustion_never_masquerades_as_no_match() {
         let haystack = format!("{}z", "x".repeat(4096));
@@ -824,7 +803,6 @@ mod step_budget_tests {
         assert!(!fed.step_limit_exceeded());
     }
 
-    /// A truncated `find_iter` reports it and stays fused.
     #[test]
     fn find_iter_reports_truncation_and_fuses() {
         let haystack = format!("ab ab ab {}", "x".repeat(4096));
@@ -853,9 +831,6 @@ mod step_budget_tests {
         );
     }
 
-    /// A `find_iter` is held to one budget, not one per match: `\w+=|\w` over a row of `n`
-    /// word characters walks `n²/2` positions in all, though no single search walks more
-    /// than `n`.
     #[test]
     fn a_find_iter_is_held_to_one_budget_not_one_per_match() {
         let row = row();
@@ -902,7 +877,6 @@ mod step_budget_tests {
         assert!(!it.step_limit_exceeded());
     }
 
-    /// The smallest budget one `try_find` over `haystack` needs, to within 2%.
     fn budget_needed_for_one_search(pattern: &str, haystack: &str) -> u64 {
         let fits = |limit: u64| {
             RegexBuilder::new(pattern)
@@ -926,9 +900,6 @@ mod step_budget_tests {
         hi
     }
 
-    /// Every built-in selection rule finds every match in a full row within an eighth of
-    /// the call sites' budget, and completes under the default: the evidence for the
-    /// numbers in [`RegexBuilder::step_limit`].
     #[test]
     fn every_builtin_selection_rule_stays_far_inside_the_default() {
         let rules: [(&str, &str); 11] = [
@@ -1002,8 +973,6 @@ mod step_budget_tests {
         }
     }
 
-    /// The heaviest program a 128 KiB `size_limit` admits finishes a full row under the
-    /// default budget.
     #[test]
     fn the_worst_admitted_program_still_fits_the_default_budget() {
         for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
@@ -1020,7 +989,6 @@ mod step_budget_tests {
         }
     }
 
-    /// The knob is real in both directions, and readable back.
     #[test]
     fn the_step_limit_is_the_thing_that_decides() {
         let pattern = AMPLIFIERS[0];
@@ -1053,7 +1021,6 @@ mod step_budget_tests {
         );
     }
 
-    /// Ordinary patterns give the same matches under any budget, without exhaustion.
     #[test]
     fn ordinary_patterns_are_unaffected() {
         let text = "commit 66390b5c8f is the release; see http://example.com/x?y=1 (v1.2.3)";
@@ -1082,7 +1049,6 @@ mod step_budget_tests {
         }
     }
 
-    /// Clones share the sticky cut-short flag.
     #[test]
     fn the_cut_short_flag_is_shared_with_clones() {
         let re = RegexBuilder::new(AMPLIFIERS[0])
@@ -1099,8 +1065,6 @@ mod step_budget_tests {
         );
     }
 
-    /// `find_iter_with_limit` spends the budget it is handed, not the pattern's own, and
-    /// reports truncation per haystack.
     #[test]
     fn find_iter_with_limit_spends_the_budget_it_is_handed() {
         let text = format!("{} needle", "x".repeat(10_000));

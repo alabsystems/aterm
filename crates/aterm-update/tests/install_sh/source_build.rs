@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Source-build cargo gate (`find_cargo_and_rustup`, `cargo_honours_pin`, `cargo_build_pinned`) tests.
+//! Source-build cargo gate and toolchain pin tests.
 
 use std::path::{Path, PathBuf};
 
@@ -10,19 +10,14 @@ use crate::support::{
     tree, write,
 };
 
-/// The toolchain the fake rustup resolves the pin to, and a second one.
 const PIN: &str = "trust-x86_64-apple-darwin";
 const FOREIGN: &str = "foreign-8.8.8-x86_64-apple-darwin";
 const PIN_VERSION: &str = "cargo 9.9.9 (fake00000 2026-01-01)";
 const FOREIGN_VERSION: &str = "cargo 8.8.8-dev (foreign00 2026-02-02)";
 const SHADOW_VERSION: &str = "cargo 1.95.0 (c1ab5a1c3 2026-04-02) (Homebrew)";
 const STORE_TARGO_VERSION: &str = "targo 9.9.9-dev (fake00000 2026-01-01) (targo 0.1.0)";
-/// The one `--config` that names rustup's lane unverified.
 const UNVERIFIED_LANE: &str = "target.'cfg(trust_verify)'.rustflags=[\"-Ztrust-verify=off\"]";
 
-/// rustup, faked: dispatched by its name; RUSTUP_TOOLCHAIN, then a directory
-/// override on the cwd (FAKE_DIR_OVERRIDE), then the cwd's rust-toolchain.toml
-/// named as getcwd() spells it.
 const RUSTUP: &str = r#"#!/bin/sh
 pin="${FAKE_TOOLCHAIN_NAME:?}"
 foreign="${FAKE_FOREIGN_NAME:?}"
@@ -89,7 +84,6 @@ rustc) no_download "$@"; need_toolchain; echo "rustc 9.9.9 (fake00000 2026-01-01
 esac
 "#;
 
-/// Homebrew's cargo: its own version, whatever RUSTUP_TOOLCHAIN says.
 const SHADOW_CARGO: &str = r#"#!/bin/sh
 case "${1:-}" in
 --version | -V) echo "cargo 1.95.0 (c1ab5a1c3 2026-04-02) (Homebrew)" ;;
@@ -99,8 +93,6 @@ esac
 
 const SHADOW_RUSTC: &str = "#!/bin/sh\necho \"rustc 1.95.0 (c1ab5a1c3 2026-04-02) (Homebrew)\"\n";
 
-/// A plain cargo built from the pin's commit: the pin's version line, and no
-/// idea what RUSTUP_TOOLCHAIN is.
 const TWIN_CARGO: &str = r#"#!/bin/sh
 case "${1:-}" in
 --version | -V) echo "cargo 9.9.9 (fake00000 2026-01-01)" ;;
@@ -108,9 +100,6 @@ case "${1:-}" in
 esac
 "#;
 
-/// The store's targo: `--unverified build …` is the one build shape it takes,
-/// recorded with the first PATH dir and any ambient compiler steer; a plain
-/// `build` is refused as targo refuses it.
 const STORE_TARGO: &str = r#"#!/bin/sh
 case "${1:-}" in
 --version | -V) echo "targo 9.9.9-dev (fake00000 2026-01-01) (targo 0.1.0)" ;;
@@ -128,10 +117,6 @@ case "${1:-}" in
 esac
 "#;
 
-/// `aterm pkg which` for the store at `$FAKE_ATPKG`, in atpkg's printed
-/// shapes: the managed line, or SHADOWED when another targo precedes the
-/// managed bin/ on PATH; `alab-targo` names the managed copy unless
-/// FAKE_NO_ALIAS says the alias is not laid.
 const FAKE_ATERM: &str = r#"#!/bin/sh
 managed_bin="${FAKE_ATPKG:?}/bin"
 store_bin="$FAKE_ATPKG/store/trust/9192/bin"
@@ -163,23 +148,16 @@ case "$*" in
 esac
 "#;
 
-/// curl and gh: no run here may reach the network; any call is recorded.
 const NO_NETWORK: &str =
     "#!/bin/sh\necho \"network: $(basename \"$0\") $*\" >>\"${SHIM_LOG:?}\"\nexit 1\n";
 
-/// `uname` for the OS whose remedies a run names (`-s` and bare), the
-/// machine's own for anything else: Trust is published for macOS only, so the
-/// remedies differ by OS, and every lab run names the OS it means rather than
-/// inheriting the host's.
 const DARWIN_UNAME: &str =
     "#!/bin/sh\ncase \"${1:--s}\" in -s) echo Darwin ;; *) exec /usr/bin/uname \"$@\" ;; esac\n";
 const LINUX_UNAME: &str =
     "#!/bin/sh\ncase \"${1:--s}\" in -s) echo Linux ;; *) exec /usr/bin/uname \"$@\" ;; esac\n";
 
-/// An `aterm` with no Trust store.
 const BARE_ATERM: &str = "#!/bin/sh\necho \"atpkg: ${3:-it} is not installed (fix: aterm pkg install ${3:-it})\" >&2\nexit 1\n";
 
-/// The remedy commands a refusal can name.
 const REMEDIES: &[&str] = &[
     "aterm pkg install trust",
     "aterm pkg doctor",
@@ -199,7 +177,6 @@ fn remedies(reason: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// Whether `reason` names each of `names`, in this order, and none of `lacks`.
 fn says(reason: &str, names: &[impl AsRef<str>], lacks: &[impl AsRef<str>]) -> bool {
     let mut from = 0;
     names.iter().all(|name| {
@@ -211,8 +188,6 @@ fn says(reason: &str, names: &[impl AsRef<str>], lacks: &[impl AsRef<str>]) -> b
     }) && !lacks.iter().any(|lack| reason.contains(lack.as_ref()))
 }
 
-/// The fixtures, laid under one scratch dir (spelled physically, as the gate
-/// reports every path).
 struct Lab {
     t: PathBuf,
     /// A checkout pinning `trust`.
@@ -298,14 +273,10 @@ impl Lab {
         Self { t, checkout, log }
     }
 
-    /// A fixture dir (or file) by its name under the lab.
     fn p(&self, rel: &str) -> String {
         s(&self.t.join(rel)).into()
     }
 
-    /// `dirs` (lab names), macOS's `uname` (a row names `linux` among its
-    /// dirs to be a Linux run), the network guard, then the system dirs, as a
-    /// PATH.
     fn path(&self, dirs: &[&str]) -> String {
         let mut parts: Vec<String> = dirs.iter().map(|d| self.p(d)).collect();
         parts.push(self.p("macos"));
@@ -318,7 +289,6 @@ impl Lab {
         self.p("atpkg/store/trust/9192/bin")
     }
 
-    /// What the stand-ins read.
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("SHIM_LOG", s(&self.log).into()),
@@ -330,7 +300,6 @@ impl Lab {
         ]
     }
 
-    /// A library batch with the stand-ins' environment exported.
     fn lib(&self) -> Lib {
         let mut lib = Lib::new();
         for (key, value) in self.env() {
@@ -339,7 +308,6 @@ impl Lab {
         lib
     }
 
-    /// The recorded builds, emptied.
     fn take_builds(&self) -> String {
         let builds = read(&self.log);
         write(&self.log, "");
@@ -414,9 +382,6 @@ impl From<&Rec> for Proved {
     }
 }
 
-/// One gate run in the batch: `setup` (shell, e.g. exports), then the lane
-/// search under `path`/`home` against `root` (empty: no root), then the proof
-/// when asked; `teardown` after.
 struct Gate {
     find: usize,
     proof: Option<usize>,
@@ -446,8 +411,6 @@ fn gate(
     Gate { find, proof }
 }
 
-/// `path` with every ASCII letter's case swapped, when that spelling reaches
-/// the same file (a case-insensitive volume, macOS's default); else `None`.
 fn case_changed(path: &Path) -> Option<PathBuf> {
     let flipped: String = s(path)
         .chars()
@@ -470,8 +433,6 @@ fn case_changed(path: &Path) -> Option<PathBuf> {
     (flipped != path && same(&flipped, path)).then_some(flipped)
 }
 
-/// rustup's dist channels — what one `rustup toolchain install` fetches —
-/// against the custom names only `rustup toolchain link` makes.
 #[test]
 fn rustup_dist_channels_follow_rustups_grammar() {
     let scratch = Scratch::new();
@@ -517,8 +478,6 @@ fn rustup_dist_channels_follow_rustups_grammar() {
     }
 }
 
-/// One rustup-lane layout: the PATH (lab dirs), `$CARGO_HOME`, the root the
-/// gate is given and any setup; and the cargo, rustup and rustc it must prove.
 struct Layout<'a> {
     dirs: &'a [&'a str],
     home: &'a str,
@@ -527,10 +486,6 @@ struct Layout<'a> {
     proved: [&'a str; 3],
 }
 
-/// The proxy wins over a Homebrew cargo first on PATH — at `$CARGO_HOME`, on
-/// PATH behind the shadow, beside a keg rustup, or split from its rustc — and
-/// the proof names the pin file, the pin's version and the rustc the build
-/// will take.
 #[test]
 fn the_rustup_lane_takes_the_proxy_and_proves_the_pin() {
     let scratch = Scratch::new();
@@ -633,9 +588,6 @@ fn the_rustup_lane_takes_the_proxy_and_proves_the_pin() {
     assert_eq!(lab.take_builds(), "", "the pre-flight never builds");
 }
 
-/// Each cargo that cannot honour the pin is refused, and the refusal names the
-/// remedy for its case: the dir beside rustup to put first, the Homebrew way
-/// out, rustup's own resolution, the pinned toolchain's own cargo or rustc.
 #[test]
 fn a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy() {
     let scratch = Scratch::new();
@@ -844,9 +796,6 @@ fn a_cargo_that_cannot_honour_the_pin_is_refused_naming_its_remedy() {
     assert_eq!(lab.take_builds(), "", "the pre-flight never builds");
 }
 
-/// The build runs under exactly what the proof chose: rustup's cargo from the
-/// checkout, the unverified lane named, RUSTUP_TOOLCHAIN scrubbed, and the
-/// proved rustc first on PATH for that one command.
 #[test]
 fn a_build_runs_under_exactly_what_the_proof_chose() {
     let scratch = Scratch::new();
@@ -941,12 +890,6 @@ fn a_build_runs_under_exactly_what_the_proof_chose() {
     }
 }
 
-/// The aterm-managed store comes first — answered by `aterm pkg which`, a
-/// shim on PATH, or a store bin dir reached through `current` — over a
-/// Homebrew cargo first on PATH and over rustup's proxies; it is proved by
-/// targo's own line and the trustc beside it, and builds on targo's explicit
-/// unverified lane with the store's bin dir first and no ambient compiler
-/// steer.
 #[test]
 fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
     let scratch = Scratch::new();
@@ -1051,9 +994,6 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
     );
 }
 
-/// atpkg's macOS `targo` shim runs aterm's build-dir block before its exec (the block is
-/// atpkg's own, `build_cache::shim_block`, so the shim writer and this reader answer to
-/// one contract): about a hundred and twenty lines of builtins, the exec last.
 #[test]
 fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
     let scratch = Scratch::new();
@@ -1160,10 +1100,6 @@ fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
     );
 }
 
-/// A targo that is not the store's never takes the lane: alone on PATH it is
-/// declined by name; ahead of the store's shim it does not hide it; and when
-/// atpkg answers SHADOWED, the alias names the managed copy (or, with no alias
-/// laid, the PATH scan finds the shim).
 #[test]
 fn the_store_is_found_past_a_stray_targo_and_a_damaged_one_is_refused() {
     let scratch = Scratch::new();
@@ -1263,9 +1199,6 @@ fn the_store_is_found_past_a_stray_targo_and_a_damaged_one_is_refused() {
     );
 }
 
-/// A stock pin is not the store's toolchain: with the store in reach the lane
-/// is declined by its pin and rustup's proof runs; with no rustup the refusal
-/// offers rustup and the Homebrew way out, never the store.
 #[test]
 fn a_stock_pin_never_takes_the_store_lane() {
     let scratch = Scratch::new();
@@ -1318,11 +1251,6 @@ fn a_stock_pin_never_takes_the_store_lane() {
     );
 }
 
-/// With no toolchain in reach at all, the refusal names ONE remedy: the
-/// product's where an `aterm` can run it, else rustup and the Trust tarballs
-/// (rustup alone cannot fetch the `trust` pin) — and on Linux, where neither is
-/// published, rustup and a Trust built from source, `aterm` or not; and a
-/// rustup with no proxy beside it says where the proxy should have been.
 #[test]
 fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
     let scratch = Scratch::new();
@@ -1466,8 +1394,6 @@ enum Plan {
     Skip(String),
 }
 
-/// A checkout copy for whole-script runs: install.sh, the workspace manifest
-/// (the channel it installs from) and `pin`.
 fn checkout(scratch: &Scratch, name: &str, pin: &str) -> PathBuf {
     let dir = scratch.mkdir(&format!("{name}/tools"));
     std::fs::copy(install_sh(), dir.join("install.sh")).expect("copy install.sh");
@@ -1480,8 +1406,6 @@ fn checkout(scratch: &Scratch, name: &str, pin: &str) -> PathBuf {
     dir
 }
 
-/// One whole-script run: the checkout it runs from, the PATH (lab dirs),
-/// `$CARGO_HOME`, extra environment, and the plan it must print.
 struct DryRun<'a> {
     label: &'a str,
     checkout: &'a Path,
@@ -1517,9 +1441,6 @@ impl Want {
     }
 }
 
-/// `install.sh --dry-run --no-toolchain --no-app` from the row's checkout: its
-/// plan for the source build, after checking it exited 0, wrote nothing, and
-/// never announced a build beside a skip.
 fn dry_run(scratch: &Scratch, lab: &Lab, n: usize, row: &DryRun) -> Plan {
     let fresh: Home = scratch.home(&format!("dry/{n}"));
     let path = lab.path(row.dirs);
@@ -1559,9 +1480,6 @@ fn dry_run(scratch: &Scratch, lab: &Lab, n: usize, row: &DryRun) -> Plan {
     }
 }
 
-/// The plan tells the truth about the cargo: every refusal is the skip it is,
-/// with its remedy, and a refused cargo is never announced as the build's;
-/// every proved toolchain is announced with its version and cargo.
 #[test]
 fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
     let scratch = Scratch::new();
@@ -1781,9 +1699,6 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
     );
 }
 
-/// A source build that fails ends the run with the installer's own line — what
-/// failed and that the command was not installed — and status 1, not with
-/// cargo's status and its error as the run's last words.
 #[test]
 fn a_failed_source_build_is_said_and_installs_nothing() {
     let scratch = Scratch::new();

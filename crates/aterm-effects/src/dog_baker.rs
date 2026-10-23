@@ -7,7 +7,7 @@
 //!
 //! The [`crate::pet_baker`] pattern (same rasterizer, fill resolution and budgets) without the
 //! patch strip or the eye and iris axes: a dog head is one static bake, so its `GlyphRole::Eye`
-//! layers take [`ResolvedFills::eye_ink`] (dark on pale coats, pale on dark) instead of the
+//! layers take [`ResolvedFills::eye_ink`](crate::cat_baker::ResolvedFills::eye_ink) (dark on pale coats, pale on dark) instead of the
 //! authored fill. Glints stay authored (`GlyphRole::Detail`).
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};

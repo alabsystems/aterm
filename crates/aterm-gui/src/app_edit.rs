@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Main-thread `edit` ticket lifecycle (`edit <file-uri>`, `await edit`, `finish-edit`, `abort-edit`).
+//! Main-thread `edit` ticket lifecycle.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::Sender;
@@ -90,8 +90,6 @@ struct OpenTicket {
 }
 
 impl OpenTicket {
-    /// Whether `uri` (canonical spelling) names this ticket's file, as
-    /// requested, resolved or admitted.
     fn names(&self, uri: &str) -> bool {
         self.uri == uri
             || self.real_uri.as_deref() == Some(uri)
@@ -105,21 +103,15 @@ impl OpenTicket {
         }
     }
 
-    /// Whether a program waits on this ticket's answer now: it was asked to
-    /// be waited on (or adopted), and its waiter has not been gone for
-    /// [`ORPHAN_AFTER`].
     const fn client_waits(&self) -> bool {
         self.awaited && !self.orphaned
     }
 
-    /// Whether its document holds unsaved text this edit did not type, the
-    /// durable checkpoint being `durable` (unknown: it may).
     fn holds_foreign_text(&self, durable: Option<Seq>) -> bool {
         self.foreign_at
             .is_some_and(|seq| durable.is_none_or(|durable| seq > durable))
     }
 
-    /// The header row its view shows.
     fn header(&self) -> crate::native_app::EditHeader {
         crate::native_app::EditHeader {
             for_word: self.for_word.clone(),
@@ -160,9 +152,6 @@ impl Ending {
         }
     }
 
-    /// The result an outcome reports for this ending, the document's durable
-    /// checkpoint being `durable`: `finished` only once it covers what the
-    /// person had when they pressed done.
     fn result(self, durable: Seq) -> EditResult {
         match self {
             Self::Abort { .. } => EditResult::Aborted,
@@ -175,27 +164,18 @@ impl Ending {
 /// Status message shown when `finish-edit` or `abort-edit` is invoked with no active waiter.
 pub(crate) const NO_EDIT_WAITING: &str = "nothing is waiting on this file; C-x C-s saves";
 
-/// What abort says on a ticket whose program has gone: nobody would hear it,
-/// so nothing is discarded.
 const ABORT_GONE: &str = "The program waiting on this edit has gone, so nothing was discarded; \
                           C-c C-c saves and closes";
 
-/// What abort says on a ticket nothing ever waited on (`wait=0`).
 const ABORT_UNWAITED: &str =
     "Nothing waits on this edit, so nothing was discarded; C-c C-c saves and closes";
 
-/// What abort says while a save of the file is still landing: the discard
-/// would race it.
 const ABORT_SAVING: &str =
     "A save of this file is still landing, so nothing was discarded; C-c C-k again once it lands";
 
-/// What abort says when the buffer holds unsaved text the edit did not type
-/// and no other view of the file would keep it.
 const ABORT_FOREIGN: &str = "This buffer holds unsaved changes made outside this edit, so nothing \
                              was discarded; C-c C-c saves and closes";
 
-/// What the person's own views of the file say once an abort closed the
-/// edit's view and kept their unsaved text.
 const ABORT_KEPT: &str = "The edit was aborted; this buffer keeps its unsaved changes";
 
 /// A ticket's one outcome, kept in the ring.
@@ -221,7 +201,6 @@ struct Waiter {
 }
 
 impl Waiter {
-    /// Whether this waiter waits on open ticket `ticket`.
     fn covers(&self, ticket: Ticket, entry: &OpenTicket) -> bool {
         match &self.key {
             AwaitKey::Ticket(t) => *t == ticket,
@@ -229,14 +208,12 @@ impl Waiter {
         }
     }
 
-    /// Whether some ticket in `open` covers this waiter.
     fn covered_by_any(&self, open: &BTreeMap<Ticket, OpenTicket>) -> bool {
         open.iter()
             .any(|(ticket, entry)| self.covers(*ticket, entry))
     }
 }
 
-/// What a waiter no open ticket covers is told.
 enum Uncovered {
     /// This line, now.
     Answer(String),
@@ -274,7 +251,6 @@ impl EditTickets {
         }
     }
 
-    /// Whether some parked waiter is waiting on `ticket`.
     fn waited(&self, ticket: Ticket) -> bool {
         let Some(entry) = self.open.get(&ticket) else {
             return false;
@@ -319,21 +295,16 @@ impl EditTickets {
     }
 }
 
-/// The codec's canonical spelling of `uri` (`%XX` upper case, `localhost`
-/// dropped), so two spellings of one file meet; `uri` itself when it names no
-/// local absolute path.
 fn canonical_spelling(uri: &str) -> String {
     amacs::protocol::uri::file_uri_to_path(uri)
         .and_then(|path| amacs::protocol::uri::path_to_file_uri(&path))
         .unwrap_or_else(|_| uri.to_string())
 }
 
-/// The outcome's reply line.
 fn outcome_line(outcome: EditOutcome) -> String {
     format!("{}\n", outcome.format())
 }
 
-/// `text` on one line, for an `ERR` reply.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -436,7 +407,6 @@ impl App {
         Some((window, key, admission))
     }
 
-    /// The tab of window `wid` one of whose leaves is session `session`.
     fn tab_hosting_session(&self, wid: WindowId, session: u64) -> Option<TabId> {
         self.windows
             .get(&wid)?
@@ -491,8 +461,6 @@ impl App {
             .get(&ticket)
             .is_some_and(|entry| matches!(entry.phase, Phase::Admitting { .. }));
         if !admitting {
-            // Cancelled (its `edit` timed out or hung up): a late admission
-            // opens nothing.
             return Err(format!(
                 "edit ticket {ticket} was cancelled; its admission of {} is dropped",
                 key.uri
@@ -786,8 +754,6 @@ impl App {
         self.sweep_orphaned_edits(now);
     }
 
-    /// Start `ticket`'s orphan clock at `now` when its view is open, nobody
-    /// waits on it and the clock is not already running.
     fn start_edit_orphan_clock_if_unwaited(&mut self, ticket: Ticket, now: Instant) {
         if self.native_documents.edits.waited(ticket) {
             return;
@@ -802,7 +768,7 @@ impl App {
         hold::set_expiry(entry.session, ticket, Some(now + ORPHAN_AFTER));
     }
 
-    /// Marks open tickets whose unwaited duration has reached [`ORPHAN_AFTER`] by `now` as orphaned.
+    /// Marks open tickets unwaited for [`ORPHAN_AFTER`] by `now` as orphaned.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -866,12 +832,6 @@ impl App {
         self.answer_view_waiters();
     }
 
-    /// The outcome of a view that retired with `ending`, read off its
-    /// document now: `finished` only once the checkpoint covers what the
-    /// person pressed done on, `aborted` with `saved=0`, and `saved=1` for a
-    /// save that landed since `start` (the ticket's view opening, or the done
-    /// press in a view no ticket owns) and covers the text the view last
-    /// showed (`SavedOnlyWhenAcked`).
     fn ending_outcome(&self, ending: Ending, start: Option<Seq>) -> EditOutcome {
         let document = ending.document();
         let start = start.unwrap_or(match ending {
@@ -881,8 +841,6 @@ impl App {
         self.edit_outcome(document, start, Some(ending))
     }
 
-    /// The outcome of an edit of `document` since checkpoint `start` that
-    /// ended as `ending` (`None`: a plain close).
     fn edit_outcome(
         &self,
         document: DocumentId,
@@ -906,9 +864,6 @@ impl App {
         }
     }
 
-    /// Record `ticket`'s one outcome, answer its waiters and clear its hold;
-    /// when its whole tab is gone, the caller's tab is selected again, unless
-    /// the tab was closed behind the person ([`Self::close_edit_view_in_place`]).
     fn resolve_edit(&mut self, ticket: Ticket, ending: Option<Ending>) {
         let Some(entry) = self.native_documents.edits.open.remove(&ticket) else {
             return;
@@ -946,11 +901,6 @@ impl App {
         }
     }
 
-    /// What `waiter`, which no open ticket covers, is told: a `ticket=` one
-    /// its ticket's outcome from the ring, else `ERR unknown ticket`; a `uri=`
-    /// one the file's latest outcome from the ring, else (no ticket for this
-    /// file in this process: a successor after a seamless update) it waits for
-    /// the file's Editor views, or is done at once when there are none.
     fn uncovered_edit_waiter(&self, waiter: &Waiter) -> Uncovered {
         let edits = &self.native_documents.edits;
         match &waiter.key {
@@ -999,7 +949,6 @@ impl App {
         }
     }
 
-    /// Answer each ticketless `uri=` waiter whose file has no Editor view left.
     fn answer_view_waiters(&mut self) {
         let done: Vec<(WaiterId, EditOutcome)> = self
             .native_documents
@@ -1016,7 +965,6 @@ impl App {
         }
     }
 
-    /// The documents some spelling in `spellings` names, each once.
     fn documents_named(&self, spellings: &[String]) -> Vec<DocumentId> {
         let mut documents: Vec<DocumentId> = Vec::new();
         for document in spellings
@@ -1030,7 +978,6 @@ impl App {
         documents
     }
 
-    /// How many Editor views of the file `spellings` name are open.
     fn editor_views_of(&self, spellings: &[String]) -> usize {
         self.documents_named(spellings)
             .into_iter()
@@ -1047,9 +994,6 @@ impl App {
             .sum()
     }
 
-    /// A ticketless `uri=` wait's outcome: `closed`, the durable checkpoint
-    /// when the document is known, and never `saved=1` (no save is known to
-    /// have landed during an edit this process did not see begin).
     fn view_wait_outcome(&self, spellings: &[String]) -> EditOutcome {
         let seq = self
             .documents_named(spellings)
@@ -1139,7 +1083,6 @@ impl App {
         self.request_native_redraw(window);
     }
 
-    /// The document Editor view `view` shows, when it is one.
     fn editor_view_document(&self, view: ViewId) -> Option<DocumentId> {
         let crate::tab_model::View::Native(native) = self.view_store.get(view).copied()? else {
             return None;
@@ -1151,7 +1094,6 @@ impl App {
             .flatten()
     }
 
-    /// The parked `uri=` waiters some spelling of whose file is `document`.
     fn uri_waiters_of(&self, document: DocumentId) -> Vec<WaiterId> {
         self.native_documents
             .edits
@@ -1165,8 +1107,6 @@ impl App {
             .collect()
     }
 
-    /// Answer every `uri=` waiter of `document` with `outcome`: done or abort
-    /// was pressed on a view of its file.
     fn answer_uri_waiters_of(&mut self, document: DocumentId, outcome: EditOutcome) {
         for id in self.uri_waiters_of(document) {
             if let Some(waiter) = self.native_documents.edits.waiters.remove(&id) {
@@ -1229,10 +1169,6 @@ impl App {
         }
     }
 
-    /// Close Editor view `view`, whose done the checkpoint now covers. A
-    /// close that does not happen at once (a whole tab whose newer edits are
-    /// being saved first) leaves the view finishing: the next save's landing
-    /// asks again.
     fn close_finished_edit_view(&mut self, view: ViewId) {
         if let Err(why) = self.close_edit_view_in_place(view)
             && self.view_store.get(view).is_some()
@@ -1242,8 +1178,6 @@ impl App {
         }
     }
 
-    /// Close `view`, an `edit` view that done or abort is closing, and leave
-    /// the person where they are.
     fn close_edit_view_in_place(&mut self, view: ViewId) -> Result<(), String> {
         let place = self.windows.iter().find_map(|(wid, ws)| {
             let tab = ws
@@ -1355,7 +1289,6 @@ impl App {
         }
     }
 
-    /// The Editor views of `document` other than `view`.
     fn other_editor_views(&self, document: DocumentId, view: ViewId) -> Vec<ViewId> {
         self.document_native_views(document)
             .into_iter()
@@ -2265,12 +2198,6 @@ mod tests {
         assert_eq!((outcome.result, outcome.saved), (EditResult::Closed, false));
     }
 
-    /// The slice's acceptance on the wire, headless (production refuses `edit`
-    /// without a window): `@<sid> edit <file-uri> line=3` through the `edit`
-    /// lane answers `OK edit ticket=… view=… doc=… uri=…` with a new tab right
-    /// of the caller's and the caret on line 3; `await edit ticket=<t>` on its
-    /// own lane answers `OK edit done result=closed saved=1 seq=<n>` once the
-    /// person saves and closes that view.
     #[test]
     fn edit_and_await_edit_answer_on_the_wire() {
         use crate::control::control_media::{Hops, MainPost, take_hop};
@@ -2355,8 +2282,6 @@ mod tests {
         assert!(app.native_documents.edits.waiters.is_empty());
     }
 
-    /// The person's keys `chord` (`C-c C-c`, `C-c C-k`) in window `wid`'s
-    /// focused view.
     fn press(app: &mut App, wid: WindowId, chord: &str) {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
         for key in chord.split(' ') {
@@ -2392,8 +2317,6 @@ mod tests {
             .to_string()
     }
 
-    /// The header row window `wid`'s active view shows: its words, and which
-    /// of its parts it has.
     fn header_row(app: &App, wid: WindowId) -> Option<(String, bool, bool)> {
         use crate::native_ui::UiKey;
         let compiled = app.compiled_native_ui(wid).expect("the view compiles");
@@ -2767,10 +2690,6 @@ mod tests {
         assert_eq!(std::fs::read(&f.path).unwrap(), b"zero\r\none\r\ntwo\r\n");
     }
 
-    /// Abort never throws away unsaved text the edit did not type. The
-    /// person's own view of the file holds unsaved text when the edit opens:
-    /// abort closes only the edit's view, nothing is discarded or written,
-    /// and the person's view keeps it all.
     #[test]
     fn abort_keeps_text_the_edit_did_not_type() {
         let wid = WindowId(0);
@@ -2821,10 +2740,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&g.path).unwrap(), "base\n");
     }
 
-    /// Done whose save does not land stops finishing and says the save's own
-    /// words, not the "Saving, then closing" its view showed: here done's
-    /// save queued behind one in flight, which found the file changed on
-    /// disk.
     #[test]
     fn done_whose_save_does_not_land_says_why_and_stays() {
         let wid = WindowId(0);
@@ -2862,8 +2777,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "changed\n");
     }
 
-    /// An abort refused while done's save is landing leaves the done as it
-    /// was: once the save lands, the view closes and answers `finished`.
     #[test]
     fn abort_refused_while_done_saves_keeps_the_done() {
         let wid = WindowId(0);
@@ -2888,9 +2801,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "kept base\n");
     }
 
-    /// Done pressed in front, then the person moves to another tab before
-    /// its save lands: the view closes where it is, the tab they are on stays
-    /// in front, and the caller's tab is not selected for them.
     #[test]
     fn done_behind_the_person_leaves_them_on_their_tab() {
         let wid = WindowId(0);
@@ -2941,8 +2851,6 @@ mod tests {
         assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, beside);
     }
 
-    /// An Undo back to a CRLF or BOM file's text reads clean: the buffer is
-    /// compared with the file as the bytes its save would write.
     #[test]
     fn undo_back_to_a_mapped_files_text_reads_clean() {
         use crate::native_editor::EditorCommand;

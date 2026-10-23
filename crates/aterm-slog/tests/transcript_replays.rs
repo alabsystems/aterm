@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Transcript join replay tests across [`TxEvent`], [`Log`], and [`TurnTracker`]
-//! ([`crate::support::time_order_holds`]).
+//! Transcript join replay tests across [`TxEvent`], [`Log`], and [`TurnTracker`].
 
 use aterm_slog::{
     ATTRIBUTION_MS, Actor, BoxWord, CARRY_MAX_LINE, Conf, Key, Kind, Log, Lvl, Mark, Node, Op, Rec,
@@ -14,7 +13,6 @@ use crate::conformance_transcript::project_parts;
 use crate::seq_twins::{self, Took};
 use crate::support::{WALL0, agent_session, at, lines, time_order_holds};
 
-/// The Claude Code process started a minute before aterm saw its run open.
 const PROCESS_START: u64 = WALL0 - 60_000;
 const FP: u64 = 0xc1a0_de00_0000_0001;
 const ID: Option<(u64, u64)> = Some((16_777_220, 4_242));
@@ -23,10 +21,12 @@ struct Rig {
     log: Log,
     run: Node,
     tr: TurnTracker,
+
     /// Test ms.
     now: u64,
     off: u64,
     state: TxState,
+
     /// Its birth order and the host calls it made, while the twins record
     /// (`seq_twins`, plan 5B-3).
     born: usize,
@@ -55,7 +55,6 @@ impl Rig {
         }
     }
 
-    /// Note one host call on the path, while the twins record.
     fn took(&mut self, step: String, seq0: u64) {
         if seq_twins::on() {
             let state = (self.state != TxState::Off).then(|| {
@@ -73,12 +72,10 @@ impl Rig {
         }
     }
 
-    /// A rig whose join bound an empty file at the run's open.
     fn bound() -> Rig {
         Rig::bound_at(TxState::On)
     }
 
-    /// [`Self::bound`], the source at `state`.
     fn bound_at(state: TxState) -> Rig {
         let mut r = Rig::new();
         r.state = state;
@@ -127,21 +124,17 @@ impl Rig {
         self.since(seq0)
     }
 
-    /// A row at the next offset, dated now.
     fn tx(&mut self, ev: TxEvent<'_>) -> Vec<Rec> {
         let wall = self.wall();
         self.tx_at(ev, wall)
     }
 
-    /// A row at the next offset, dated `wall_ms`.
     fn tx_at(&mut self, ev: TxEvent<'_>, wall_ms: u64) -> Vec<Rec> {
         self.off += 200;
         let pos = self.pos(self.off, wall_ms);
         self.call(ev, pos)
     }
 
-    /// The verdict `v`, with the detail the glue publishes with it (a
-    /// prompt's box; the tracker reads a wall's only).
     fn see(&mut self, v: Verdict) -> Vec<Rec> {
         let seq0 = self.log.last_seq();
         let stamp = at(self.now);
@@ -154,14 +147,12 @@ impl Rig {
         self.since(seq0)
     }
 
-    /// A successor adopts the carry line `line` now.
     fn adopt(&mut self, line: &str) {
         let seq0 = self.log.last_seq();
         self.tr = TurnTracker::from_carry_line(line, at(self.now)).expect("the carry line reads");
         self.took(seq_twins::adopt_step(line, self.now), seq0);
     }
 
-    /// Time passes by `ms`, the tracker woken when its deadline passed.
     fn wait(&mut self, ms: u64) {
         let (seq0, from) = (self.log.last_seq(), self.now);
         self.now += ms;
@@ -232,7 +223,6 @@ fn vref_of(r: &Rec) -> Option<&str> {
     }
 }
 
-/// The transcript's own record: `src=transcript by=vendor` at `conf`.
 fn vendor(r: &Rec, conf: Conf) {
     assert_eq!(
         (r.src, r.by, r.conf),
@@ -241,8 +231,6 @@ fn vendor(r: &Rec, conf: Conf) {
     );
 }
 
-/// §2.5 row 1, §2.6 row 1: the screen's turn, opened within 5 s before the
-/// prompt, is confirmed by an exact `vref=` amend; the join maps to it.
 #[test]
 pub(crate) fn a_prompt_confirms_the_screens_turn_in_its_window() {
     let mut r = Rig::bound();
@@ -266,10 +254,6 @@ pub(crate) fn a_prompt_confirms_the_screens_turn_in_its_window() {
     r.ordered();
 }
 
-/// NEGATIVE CONTROL of the window (S13): a prompt 6 s after the screen's
-/// turn opened is another vendor turn the screen merged in: the screen's
-/// turn closes `out=superseded` (S3), never takes its `vref=`, and the
-/// vendor turn opens its own.
 #[test]
 pub(crate) fn a_prompt_6s_after_the_turn_opened_does_not_attach() {
     let mut r = Rig::bound();
@@ -299,9 +283,6 @@ pub(crate) fn a_prompt_6s_after_the_turn_opened_does_not_attach() {
     r.ordered();
 }
 
-/// S3: a prompt while the open turn holds another vendor turn (its turn
-/// end held by a box) supersedes it, dated at that turn's end but never
-/// before the box's close (A21: `Log::close` clamps nothing).
 #[test]
 pub(crate) fn a_prompt_into_a_turn_holding_another_vendor_turn_supersedes_it() {
     let mut r = Rig::bound();
@@ -333,9 +314,6 @@ pub(crate) fn a_prompt_into_a_turn_holding_another_vendor_turn_supersedes_it() {
     r.ordered();
 }
 
-/// S4: the screen's approval box is open when V2's prompt comes: the join
-/// never closes the turn holding it; V2 shares the turn, its tool runs
-/// under it, and the screen's own settle closes it.
 #[test]
 pub(crate) fn an_approval_open_when_v2s_prompt_comes_keeps_its_turn() {
     let mut r = Rig::bound();
@@ -376,8 +354,6 @@ pub(crate) fn an_approval_open_when_v2s_prompt_comes_keeps_its_turn() {
     r.ordered();
 }
 
-/// §2.5 row 3: the screen's settle closed the turn before the prompt was
-/// read: the closed turn takes the prompt late.
 #[test]
 pub(crate) fn a_prompt_after_the_settle_confirms_the_closed_turn_late() {
     let mut r = Rig::bound();
@@ -416,10 +392,6 @@ pub(crate) fn a_prompt_after_the_settle_confirms_the_closed_turn_late() {
     r.ordered();
 }
 
-/// S13, BOTH SIDES: a prompt older than the open turn by more than the
-/// window is an earlier turn's, read late: it names neither the open turn
-/// nor a closed one past the window, and maps to nothing (its calls are
-/// counted, never opened).
 #[test]
 pub(crate) fn a_prompt_older_than_the_open_turn_does_not_name_it() {
     for state in [TxState::On, TxState::Partial] {
@@ -466,10 +438,6 @@ pub(crate) fn a_prompt_older_than_the_open_turn_does_not_name_it() {
     r.ordered();
 }
 
-/// THE PROMPT BEFORE THE SCREEN'S TURN: a partial build's prompt read while
-/// no screen turn is open (the footer's read beat the screen's busy word)
-/// is the turn the screen opens within the window: it takes `vref=` at its
-/// open, and its calls open under it.
 #[test]
 pub(crate) fn a_prompt_read_before_the_screens_turn_names_it() {
     for (gap, names) in [(2_000, true), (ATTRIBUTION_MS + 1_000, false)] {
@@ -494,9 +462,6 @@ pub(crate) fn a_prompt_read_before_the_screens_turn_names_it() {
     }
 }
 
-/// §2.5 row 4: the screen missed the turn (no busy seen): the vendor turn
-/// opens its own, attributed as the screen's would be; with no word at
-/// rest, no settle is armed, and its turn end closes it.
 #[test]
 pub(crate) fn a_prompt_the_screen_missed_opens_the_vendor_turn() {
     let mut r = Rig::bound();
@@ -525,9 +490,6 @@ pub(crate) fn a_prompt_the_screen_missed_opens_the_vendor_turn() {
     r.ordered();
 }
 
-/// §2.4: a `tool_use` opens a `tool` (a `Task` call a `subagent`) step under
-/// the mapped open turn, with its class, name and call id; its result
-/// closes it `out=ok|error`, `dur=wall`; a repeated call id opens nothing.
 #[test]
 pub(crate) fn tool_calls_open_under_the_mapped_turn_and_results_close_them() {
     let mut r = Rig::bound();
@@ -562,9 +524,6 @@ pub(crate) fn tool_calls_open_under_the_mapped_turn_and_results_close_them() {
     r.ordered();
 }
 
-/// NEGATIVE CONTROL (S13): a `tool_use` for a turn the screen already
-/// closed, or for a vendor turn mapped to nothing, never opens a step; it
-/// is counted.
 #[test]
 pub(crate) fn a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step() {
     let mut r = Rig::bound();
@@ -588,9 +547,6 @@ pub(crate) fn a_tool_use_for_a_closed_or_unmapped_turn_never_opens_a_step() {
     assert!(!r.records().iter().any(|x| x.k == Kind::Tool));
 }
 
-/// S2, A3: the vendor turn's end closes its turn when no screen step holds
-/// it, `out=done` with the close's own rollup, `tools=` kept however full
-/// the rollup; `vdur_ms tok_in tok_out` come by an amend after the close.
 #[test]
 pub(crate) fn a_turn_end_closes_the_turn_and_then_amends_its_numbers() {
     let mut r = Rig::bound();
@@ -663,8 +619,6 @@ pub(crate) fn a_turn_end_closes_the_turn_and_then_amends_its_numbers() {
     r.ordered();
 }
 
-/// S2: a turn end while a screen step is open under the turn only amends;
-/// the screen's settle closes the turn later.
 #[test]
 pub(crate) fn a_turn_end_with_a_screen_step_open_only_amends() {
     let mut r = Rig::bound();
@@ -693,8 +647,6 @@ pub(crate) fn a_turn_end_with_a_screen_step_open_only_amends() {
     r.ordered();
 }
 
-/// The turn end takes the screen's armed settle's outcome: a prose question
-/// closes `asked` at `heuristic` (the screen's reading).
 #[test]
 pub(crate) fn a_turn_end_takes_the_settles_outcome_and_the_interrupt() {
     let mut r = Rig::bound();
@@ -721,10 +673,6 @@ pub(crate) fn a_turn_end_takes_the_settles_outcome_and_the_interrupt() {
     r.ordered();
 }
 
-/// ESC ENDS THE VENDOR TURN, as Claude Code writes it (the interrupt row,
-/// the call's error result, no turn end): the screen's next turn, a new
-/// prompt's 30 s later, continues nothing (`cont=`), and the new prompt
-/// names it.
 #[test]
 pub(crate) fn an_interrupted_vendor_turn_is_continued_by_no_later_turn() {
     for state in [TxState::On, TxState::Partial] {
@@ -766,10 +714,6 @@ pub(crate) fn an_interrupted_vendor_turn_is_continued_by_no_later_turn() {
     }
 }
 
-/// A SETTLE'S CLOSE NEVER PREDATES A CHILD (A21 for the screen's close): a
-/// call's result and a new call the transcript dated after the screen
-/// rested, applied before the settle came due, are closed with the turn no
-/// earlier than they opened or closed.
 #[test]
 pub(crate) fn a_settles_close_is_never_dated_before_a_transcript_child() {
     for (state, late) in [
@@ -800,8 +744,6 @@ pub(crate) fn a_settles_close_is_never_dated_before_a_transcript_child() {
     }
 }
 
-/// A21: a transcript close is dated no earlier than the turn's newest
-/// child, which the host stamped after the vendor's row.
 #[test]
 pub(crate) fn a_transcript_close_is_never_dated_before_a_child() {
     let mut r = Rig::bound();
@@ -817,9 +759,6 @@ pub(crate) fn a_transcript_close_is_never_dated_before_a_child() {
     r.ordered();
 }
 
-/// §2.5 cont row: the screen's settle closed the turn while its vendor
-/// turn ran on; the screen's next turn continues it (`cont=`), and the
-/// vendor turn maps there.
 #[test]
 pub(crate) fn the_screen_busy_again_continues_a_running_vendor_turn() {
     let mut r = Rig::bound();
@@ -850,9 +789,6 @@ pub(crate) fn the_screen_busy_again_continues_a_running_vendor_turn() {
     r.ordered();
 }
 
-/// S23: a row at the watermark is applied once: the same row again (a
-/// lapsed watch's re-read, a successor's) writes nothing, and the next row
-/// past it is applied.
 #[test]
 pub(crate) fn a_row_at_the_watermark_is_never_applied_again() {
     let mut r = Rig::bound();
@@ -894,8 +830,6 @@ pub(crate) fn a_row_at_the_watermark_is_never_applied_again() {
     r.ordered();
 }
 
-/// §2.6: a confirmation amends the screen's wall `confirmed=1` at exact,
-/// once, and raises its need's confidence.
 #[test]
 pub(crate) fn the_judge_confirms_the_screens_wall_once() {
     let mut r = Rig::bound();
@@ -915,10 +849,6 @@ pub(crate) fn the_judge_confirms_the_screens_wall_once() {
     assert!(r.tx(judge).is_empty(), "once");
 }
 
-/// S2: a refutation closes the wall `out=retracted` at exact, its need with
-/// it, and disarms its settle: however long the screen still shows the
-/// wall, the turn stays open; it closes once the screen's word moves (a
-/// one-minute hang detector on the injected clock).
 #[test]
 pub(crate) fn a_refuted_wall_shuts_and_the_turn_closes_at_the_next_word() {
     let mut r = Rig::bound();
@@ -957,9 +887,6 @@ pub(crate) fn a_refuted_wall_shuts_and_the_turn_closes_at_the_next_word() {
     r.ordered();
 }
 
-/// §2.6: a wall the settle carried onto the run (its turn closed
-/// `out=wall:<kind>`) is refuted: the run's wall closes `retracted` and
-/// the turn's outcome is refined to `done` at exact, which the fold takes.
 #[test]
 pub(crate) fn a_refute_of_a_carried_wall_refines_its_turn_to_done() {
     let mut r = Rig::bound();
@@ -989,9 +916,6 @@ pub(crate) fn a_refute_of_a_carried_wall_refines_its_turn_to_done() {
     r.ordered();
 }
 
-/// NEGATIVE CONTROLS (§2.6, S9): the judge's answer for another wall than
-/// the screen's, or on an unmeasured build, writes nothing (the judge's
-/// `Wait` is no event at all).
 #[test]
 pub(crate) fn a_judge_for_another_wall_or_a_partial_build_writes_nothing() {
     let mut r = Rig::bound();
@@ -1016,9 +940,6 @@ pub(crate) fn a_judge_for_another_wall_or_a_partial_build_writes_nothing() {
     assert!(r.tr.view(r.now).step.is_some(), "the wall stands");
 }
 
-/// §2.6 row 3: the vendor turn mapped to a turn the screen closed `done`
-/// ended on the vendor's own notice: the turn's outcome is refined to the
-/// wall at exact.
 #[test]
 pub(crate) fn the_vendor_turns_own_notice_refines_the_closed_turn() {
     let mut r = Rig::bound();
@@ -1041,11 +962,6 @@ pub(crate) fn the_vendor_turns_own_notice_refines_the_closed_turn() {
     );
 }
 
-/// S1: nothing is read before a bind; the bind seeds the watermark at the
-/// file's end and says so once (`source field=transcript state=on
-/// skipped=<len>`, by aterm, on the run); no row at or below it, before the
-/// process's start, or after it but before the run opened in this log, is
-/// applied; a lapsed watch's re-bind of the same file keeps the watermark.
 #[test]
 pub(crate) fn a_bind_seeds_past_the_history_and_says_so_once() {
     let mut r = Rig::new();
@@ -1080,11 +996,6 @@ pub(crate) fn a_bind_seeds_past_the_history_and_says_so_once() {
     );
 }
 
-/// S1: a successor that adopted a carry with no `tx_` tokens (a 3A-shaped
-/// line) holds no watermark: nothing is applied until its bind, which
-/// seeds past the file; the adoption is the floor; and the transcript
-/// steps its predecessor opened are rebuilt from the log (A1), so their
-/// results close them.
 #[test]
 pub(crate) fn an_adoption_without_a_watermark_replays_nothing() {
     let mut r = Rig::bound();
@@ -1112,9 +1023,6 @@ pub(crate) fn an_adoption_without_a_watermark_replays_nothing() {
     assert_eq!((closed[0].op, closed[0].node), (Op::Close, c1));
 }
 
-/// S23: the glue's queue overflowed: the loss is counted on the run's
-/// `source` mark, and the join drops every row until the next prompt (no
-/// tool call is kept without its prompt).
 #[test]
 pub(crate) fn an_overflow_desyncs_the_join_until_the_next_prompt() {
     let mut r = Rig::bound();
@@ -1138,8 +1046,6 @@ pub(crate) fn an_overflow_desyncs_the_join_until_the_next_prompt() {
     r.ordered();
 }
 
-/// S23: a ninth parallel tool call is counted, never opened; a result makes
-/// room.
 #[test]
 pub(crate) fn a_ninth_parallel_tool_call_is_counted_never_opened() {
     let mut r = Rig::bound();
@@ -1154,9 +1060,6 @@ pub(crate) fn a_ninth_parallel_tool_call_is_counted_never_opened() {
     assert_eq!(r.tx(tool("c9")).len(), 1);
 }
 
-/// S27: rows the glue lost are counted on the `source` mark at the batch's
-/// end, the state unchanged, never as a ring loss (no `gap`), never bus
-/// class; said once.
 #[test]
 pub(crate) fn lost_rows_are_counted_on_the_source_mark_never_as_ring_loss() {
     let mut r = Rig::bound();
@@ -1179,11 +1082,6 @@ pub(crate) fn lost_rows_are_counted_on_the_source_mark_never_as_ring_loss() {
     assert_eq!(m[0].f.get_word(Key::State), Some("partial"));
 }
 
-/// S23, S27 IN A STEADY SESSION: a loss with no bind and no state change —
-/// a ninth parallel call, a result for a call never opened, rows the glue
-/// lost — is said by one `source … dropped=` mark at the batch's end, and
-/// an off source counts too; the count and whether it is said cross an
-/// update, so the successor says what its predecessor had not.
 #[test]
 pub(crate) fn a_loss_in_a_steady_session_is_said_once_at_the_batchs_end() {
     let mut r = Rig::bound();
@@ -1233,9 +1131,6 @@ pub(crate) fn a_loss_in_a_steady_session_is_said_once_at_the_batchs_end() {
     );
 }
 
-/// S23, A20: the watermark is the file's identity and offset: a row of a
-/// file that replaced the one bound (same path, another inode) is not
-/// applied until a bind of it, which seeds past its history.
 #[test]
 pub(crate) fn the_watermark_is_keyed_on_the_files_identity() {
     let mut r = Rig::bound();
@@ -1258,10 +1153,6 @@ pub(crate) fn the_watermark_is_keyed_on_the_files_identity() {
     assert_eq!(r.call(prompt("v1"), next)[0].op, Op::Amend);
 }
 
-/// S9: under `state=partial` the transcript adds and never overrules: a
-/// `vref=` amend, tool steps and their results, the turn end's numbers and
-/// the run's model at strong; never a turn's open or close, an `out=`
-/// amend, `confirmed=1` or a retraction.
 #[test]
 pub(crate) fn a_partial_build_adds_and_never_overrules() {
     let mut r = Rig::new();
@@ -1313,8 +1204,6 @@ pub(crate) fn a_partial_build_adds_and_never_overrules() {
     assert_eq!(ops(&r.tx(END), Op::Close, Lvl::Turn).len(), 1);
 }
 
-/// S21: the run's `model= effort= ver=` are amended when they move, and
-/// only what moved.
 #[test]
 pub(crate) fn the_runs_model_is_amended_only_when_it_moves() {
     let mut r = Rig::bound();
@@ -1337,8 +1226,6 @@ pub(crate) fn the_runs_model_is_amended_only_when_it_moves() {
     );
 }
 
-/// S24: a compaction is an instant `compact` step: under the open turn,
-/// else the run.
 #[test]
 pub(crate) fn a_compaction_is_an_instant_step() {
     let mut r = Rig::bound();
@@ -1356,10 +1243,6 @@ pub(crate) fn a_compaction_is_an_instant_step() {
     assert_eq!(r.tx(TxEvent::Compact)[0].par, Some(t1));
 }
 
-/// A1: the tracker's carry line holds the join's watermark, its vendor
-/// turn and its state, never a tool map; the successor rebuilds its steps
-/// from the log, applies no row at or below the watermark nor older than
-/// the adoption, and closes a step its predecessor opened.
 #[test]
 pub(crate) fn the_carry_keeps_the_join_and_the_successor_rebuilds_its_steps() {
     let mut r = Rig::bound();
@@ -1401,9 +1284,6 @@ pub(crate) fn the_carry_keeps_the_join_and_the_successor_rebuilds_its_steps() {
     assert_eq!((b.tx_view().through, b.tx_view().vref), (None, None));
 }
 
-/// S5: the worst tracker line, with every 2A, 3A, S2, S23 and S31 token at
-/// its longest, crosses within a carry line (`host ` and the line within
-/// `CARRY_MAX_LINE`), and reads back with each.
 #[test]
 fn the_worst_tracker_line_fits_a_carry_line() {
     let id40 = "a".repeat(ShortId::MAX);
@@ -1447,8 +1327,6 @@ fn the_worst_tracker_line_fits_a_carry_line() {
     }
 }
 
-/// The run closed: the join writes nothing more, and the transcript steps
-/// it had open closed with the run's cascade, `out=gone`.
 #[test]
 pub(crate) fn a_closed_run_takes_no_transcript_row() {
     let mut r = Rig::bound();

@@ -320,11 +320,7 @@ fn launched(now: Instant) -> App {
     app
 }
 
-/// THE FIRST LAUNCH ON A NEW MAC: the launch check reads Full Disk Access off and never
-/// verified, so the window's own hand-over waits for its quiet moment (and the folder
-/// warm-up waits behind it, with no timer); at the moment, System Settings opens at Full
-/// Disk Access — not Developer Tools — with aterm's panel; the owner's Not now notes that
-/// page's decline, and the folder warm-up then walks at its own quiet moment.
+/// On the first launch on a new Mac, Full Disk Access opens at the quiet moment and Not now lets the folder warm-up walk.
 #[test]
 fn a_new_mac_brings_the_owner_to_full_disk_access_then_to_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -828,9 +824,7 @@ fn a_dismissed_full_disk_access_question_holds_the_launch_page_back() {
     assert_eq!(app.consent_launch.fda(), FdaLaunch::NotAsked);
 }
 
-/// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 drew "aterm
-/// would like to access files in your Downloads folder" for an agent in a tab at 08:33
-/// (macOS 27.0.1; listed that evening, 2026-10-17, names only).
+/// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 prompted for Downloads access.
 const OWNER_CONFIG_0_105: &[&str] = &[
     "connections-first-use",
     "kitty-collectibles.toml",
@@ -867,9 +861,7 @@ const DEVELOPER_ID_DR: &str = "identifier \"com.aterm.aterm\" and anchor apple g
      leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \
      A66A9P66Z7";
 
-/// MAIN AS THE UPDATE SUCCESSOR OF 0.105.0, ON THE OWNER'S MAC. 0.105.0 never asked for
-/// Full Disk Access there (`access_card state=quiet asked_at=-`): it had no launch
-/// hand-over, and its probe read only the per-user `TCC.db`, which macOS 27 does not keep.
+/// Main as the update successor of 0.105.0 hands Full Disk Access over first.
 #[test]
 fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_over_first() {
     use crate::consent_card::{
@@ -1069,9 +1061,7 @@ fn devtools_opened_within(window_s: u64) -> Option<u64> {
         .filter(|ago| *ago < window_s)
 }
 
-/// THE 0.105.0 UPDATE IN THE WINDOW: the Developer Tools page the outgoing process opened
-/// two minutes before holds the launch's Full Disk Access page back until that page's ten
-/// minutes are up, walks no folder meanwhile, and then brings it up; it never drops it.
+/// A Developer Tools page opened two minutes before holds the launch's Full Disk Access page back until its ten minutes are up.
 #[test]
 fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_drops_it() {
     use crate::consent_launch::FdaLaunch;
@@ -1105,10 +1095,7 @@ fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_dr
     assert!(app.fda_panel_up());
 }
 
-/// AN UPDATE'S SUCCESSOR ON THE FORK LANE names its outgoing process responsible for the
-/// seconds its launch check runs in (TCC design §2.2): the hand-over is held all the same,
-/// and at its quiet moment, the outgoing process gone and the reading the window's own,
-/// the page comes up.
+/// An update's successor on the fork lane holds the hand-over and brings the page up once the reading is the window's own.
 #[test]
 fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     use crate::devtools_helper::{Origin, test_arms};
@@ -1171,13 +1158,13 @@ fn launch_alert(app: &mut App) -> Alert {
     launch
 }
 
-/// The stand-in alert, and the owner says no. Nothing is shown.
+/// The stand-in alert when the owner says no.
 fn owner_says_no(title: &str, body: &str, proceed: &str) -> Option<bool> {
     debugger_alert(title, body, proceed);
     Some(false)
 }
 
-/// The stand-in alert, and the owner says yes. Nothing is shown.
+/// The stand-in alert when the owner says yes.
 fn owner_says_yes(title: &str, body: &str, proceed: &str) -> Option<bool> {
     debugger_alert(title, body, proceed);
     Some(true)
@@ -1254,9 +1241,7 @@ fn later(at: &mut Instant) -> Instant {
     *at
 }
 
-/// THE FIRST LAUNCH ON A NEW MAC, WHOLE: the Full Disk Access page, then the Developer
-/// Tools page, then aterm's debugger-access alert (once, in its launch words, with this
-/// Mac recorded before it), then the folder warm-up.
+/// The first launch on a new Mac opens the Full Disk Access page, then the Developer Tools page, then the debugger-access alert, then the folder warm-up.
 #[test]
 fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -1496,12 +1481,7 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
     );
 }
 
-/// THE ALERT IS RAISED ONLY ON A FRESH READING OF THE RULE. While the ask waits for its
-/// moment it judges the answer already cached, however old, and starts no probe and
-/// retires nothing; at the moment, an answer older than
-/// [`crate::debugger_access::ASK_PROBE_FRESH`] is retired and the rule read again before
-/// any alert, so a rule switched on meanwhile (by the owner's own `sudo`, which retires
-/// no cached answer) is never asked about.
+/// An answer older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired at the quiet moment and read again before any alert.
 #[test]
 fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
@@ -1629,12 +1609,7 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
     HOST_READ.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// THE RECORD IS READ OFF THE EVENT LOOP: on a launch, a look that finds this Mac's
-/// line in the record unread starts its read on a thread of its own and waits, the
-/// ask still queued, instead of reading the home folder in the window's turn (a home
-/// on a network volume that stopped answering held the window there until the
-/// server came back); once that read has ended, the next look acts on it — here a
-/// record that names this Mac already, so the ask drops with no alert.
+/// On launch, an unread Mac line in the record starts its read on a background thread and acts on the result at the next look.
 #[test]
 fn the_launch_asks_record_is_read_off_the_event_loop() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -1763,10 +1738,7 @@ fn the_launch_asks_record_is_written_off_the_event_loop() {
     );
 }
 
-/// WHILE THE OFFER'S DISK HALF IS OUT, THE ASK ONLY WAITS: a look then ends nothing,
-/// even one that would drop the ask (here, no config folder), so no write lands after
-/// the ask is over; and once the answer is in, it is spent before anything is judged
-/// again, so the Mac it recorded is asked.
+/// While the offer's disk half is out, the ask waits and spends the recorded answer before judging again.
 #[test]
 fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
     use crate::debugger_access::OfferPrep;
@@ -1807,9 +1779,7 @@ fn the_launch_ask_waits_out_its_disk_half_and_spends_it_first() {
     );
 }
 
-/// FIRST-LAUNCH SETUP COMES FIRST: while it holds the macOS permissions back (its offer
-/// not yet answered, cancelled, or applied with its permissions choice unchecked) the
-/// ask does not look: no record, no alert, still queued.
+/// First-launch setup holds the debugger ask until its permissions choice is applied.
 #[test]
 fn a_held_first_launch_setup_holds_the_debugger_ask() {
     use crate::InitialSetupPermissionPolicy as Policy;
@@ -1863,10 +1833,7 @@ fn recorded_mid_offer(app: &mut App, t: &mut Instant) -> Instant {
     at
 }
 
-/// AN ANSWER GIVEN WHILE THE OFFER RECORDS SETTLES THE ASK: the owner answered a
-/// debugger-access alert after the offer was admitted (a Settings press, its change not
-/// started yet), so the Mac just recorded gets no second alert and the ask is over, as
-/// admission's settle for an answer says.
+/// An answer given while the offer records settles the ask without a second alert.
 #[test]
 fn an_answer_given_while_the_offer_records_settles_the_ask() {
     let mut t = Instant::now();
@@ -1886,10 +1853,7 @@ fn an_answer_given_while_the_offer_records_settles_the_ask() {
     assert_eq!(debugger_alerts().len(), before + 1, "unanswered: asked");
 }
 
-/// A DECLINE QUIET THAT BEGAN WHILE THE OFFER RECORDS DEFERS THE ALERT, NEVER DROPS IT:
-/// a recent decline of any Security alert quiets this one too, so the recorded answer is
-/// kept and the ask waits, still queued, for its time (not at the next wake); a look
-/// once the quiet has passed raises the alert, whatever the moment.
+/// A decline quiet that began while the offer records defers the alert until the quiet has passed.
 #[test]
 fn a_decline_quiet_while_the_offer_records_defers_its_alert() {
     use crate::debugger_access::AskWait;
@@ -1985,11 +1949,7 @@ fn rule_reads_unrecognized(
     rule_reads(aterm_containment::consent::DebuggerMode::Unrecognized)
 }
 
-/// An app whose recorded answer waited out a decline's quiet, its reading now
-/// older than [`crate::debugger_access::ASK_PROBE_FRESH`] — as a kept answer's
-/// is, past `OWNER_QUIET_FIRST` — but younger than the slot's own refresh age,
-/// so only the spend's retirement reads the rule again; the rule is read again
-/// by `read_again`.
+/// An app whose recorded answer waited out a decline's quiet on a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`].
 fn kept_on_an_aging_reading(
     app: &mut App,
     t: &mut Instant,
@@ -2035,11 +1995,7 @@ fn read_again_lands(app: &mut App) -> Instant {
     app.debugger_launch.next_deadline().expect("a later look")
 }
 
-/// A KEPT ANSWER'S ALERT STATES A FRESH READING OF THE RULE: once the decline quiet has
-/// passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired
-/// and the rule read again before any alert, as admission does, so a rule switched on
-/// meanwhile (by the owner's own `sudo`, which retires no cached answer) is a press the
-/// lane refuses: the ask ends with no alert, the record standing.
+/// Once the decline quiet has passed, a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`] is retired and read again before any alert.
 #[test]
 fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
@@ -2079,11 +2035,7 @@ fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     }
 }
 
-/// A FAILED READ OF THE RULE AT THE SPEND IS NO ANSWER: a `-status` that timed out, did
-/// not start or answered what the classifier does not claim reads nothing, and admission
-/// drops such a reading with nothing written; this Mac is recorded already, so the failed
-/// read is retired and the rule read again `RECHECK_EVERY` later, and a read that comes
-/// back off raises the alert.
+/// A failed read of the rule at the spend is retired and read again `RECHECK_EVERY` later.
 #[test]
 fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
     use crate::debugger_access::{REFUSED_FOR, UNREAD_READS};
@@ -2190,9 +2142,7 @@ fn a_failed_read_of_the_rule_at_the_spend_is_read_again() {
     );
 }
 
-/// FIRST-LAUNCH SETUP'S HOLD DOES NOT STRAND AN OFFER ADMITTED BEFORE IT ARMED: the
-/// hold holds back asks not yet admitted, but this Mac is recorded already, and an alert
-/// held behind a setup the owner cancels would never come.
+/// First-launch setup's hold does not strand an offer admitted before it armed.
 #[test]
 fn a_setup_hold_armed_while_the_offer_records_does_not_strand_it() {
     use crate::metrics::DeadlineOwner;

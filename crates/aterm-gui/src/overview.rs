@@ -1113,7 +1113,7 @@ fn fit_body(s: &str, room: f32, px: f32) -> String {
     }
 }
 
-/// Paint the Overview card into a [`SettingsTray`].
+/// Paint the Overview card into a [`TrayInput`].
 pub(crate) fn overview_tray(
     state: &OverviewState,
     g: &SettingsGeom,

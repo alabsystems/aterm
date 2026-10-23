@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! what a seamless update carries of a session's mailbox beside its topics and hold ([`FabricCarry`]), driven through the real manifest.
+//! Tests for session mailbox state ([`FabricCarry`]) carried across a seamless update.
 
 use super::*;
 use crate::SessionCtx;
@@ -9,8 +9,6 @@ use crate::session_store::{SessionHandoff, Store, new_store, test_handle};
 
 use super::with_link_reset as with_link;
 
-/// A registered session with process-local id `local_id`: the real
-/// `SessionHandle` the store builds.
 fn registered(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCtx>) {
     let h = test_handle(local_id);
     let sid = h.sid.as_str().to_string();
@@ -19,7 +17,6 @@ fn registered(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCt
     (sid, ctx)
 }
 
-/// An addressed delivery from the bridge.
 fn deliver(store: &Store, sid: &str, off: u64, from: &str, kind: &str, text: &str) -> String {
     cmd_deliver(
         store,
@@ -27,8 +24,6 @@ fn deliver(store: &Store, sid: &str, off: u64, from: &str, kind: &str, text: &st
     )
 }
 
-/// A broadcast delivery on `topic`, as the bridge sends one to a subscribed
-/// session.
 fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> String {
     cmd_deliver(
         store,
@@ -38,9 +33,6 @@ fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> Str
     )
 }
 
-/// The outgoing store drawn into a manifest and read back as the
-/// successor reads it, each record seeded onto a FRESH session through
-/// the spawn's seam and registered in a fresh store.
 fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>) {
     let manifest = SessionHandoff::from_store(&store.read().unwrap());
     let wire = manifest.to_toml().expect("serializes");
@@ -63,13 +55,6 @@ fn hand_over(store: &Store) -> (Store, Vec<(String, std::sync::Arc<SessionCtx>)>
     (successor, adopted)
 }
 
-/// **`dropped=` SURVIVES A SEAMLESS UPDATE, AND THE UNREAD BROADCASTS THE
-/// UPDATE DROPS ARE COUNTED IN IT AND LOGGED.** The ring is not carried,
-/// and under a bridge that does not refill broadcasts (no `hello`, as
-/// here) every broadcast a session held unhandled at the draw is gone from
-/// the successor's inbox; the counter is monotone so that a loss is
-/// visible to the next drain, and the successor used to start it at 0 —
-/// erasing the update's own loss and every drop counted before it.
 #[test]
 fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
     crate::test_log::install();
@@ -122,11 +107,6 @@ fn a_seamless_update_keeps_dropped_and_counts_the_unread_broadcasts_it_drops() {
     });
 }
 
-/// **A BROADCAST ITS BRIDGE OFFERS AGAIN IS NOT COUNTED LOST.** Under a
-/// bridge that said `refill=…say`, the successor's bridge rewinds each
-/// topic to its oldest unhandled broadcast and offers it again, so
-/// counting it in `dropped=` as well would report a loss that did not
-/// happen.
 #[test]
 fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
     crate::test_log::install();
@@ -187,16 +167,6 @@ fn a_seamless_update_does_not_count_the_broadcasts_its_bridge_offers_again() {
     });
 }
 
-/// **A BROADCAST ITS REFILLING BRIDGE HAS LET GO OF IS COUNTED LOST.** Two
-/// ways that bridge stops holding the refill floor of a row this ring
-/// still holds unhandled, and no successor is offered it: a `topic drop`
-/// takes the topic's floor with it (aterm-link's
-/// `Bridge::forget_unhandled_topic`) — and a `topic add` of the same name
-/// resumes from a new cursor, so the topic being held again at the draw
-/// says nothing about the old rows; and the bridge remembers a session's
-/// newest [`RING_CAP`] unhandled broadcasts only (`UNHANDLED_KEEP`), so a
-/// person's broadcast the ring keeps ahead of that many newer agent ones
-/// (evicting those instead) is gone from the floor.
 #[test]
 fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
     with_link(|| {
@@ -250,9 +220,6 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
     });
 }
 
-/// a post still queued and a receipt still owed at the park are
-/// on the SUCCESSOR's `outbox` peek — its bridge drains them — under the
-/// ids the old process gave them.
 #[test]
 fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
     with_link(|| {
@@ -330,8 +297,6 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
     });
 }
 
-/// **A RECEIPT FOR A ROW OF AN EARLIER LOG IS LISTED AS ONE, AND STAYS
-/// ONE ACROSS AN UPDATE** (r2-01's residual).
 #[test]
 fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
     with_link(|| {
@@ -740,9 +705,6 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
     });
 }
 
-/// an `await inbox since=` above every id this session has handed out
-/// names no row of this process's, and is refused at once — never parked
-/// over unread mail until `OK timeout`.
 #[test]
 fn an_inbox_anchor_this_process_never_minted_is_refused() {
     with_link(|| {
@@ -765,8 +727,6 @@ fn an_inbox_anchor_this_process_never_minted_is_refused() {
     });
 }
 
-/// THE MAIL BUDGET CHARGES WHAT TOML WRITES,
-/// AND IT HOLDS THE RECEIPTS TOO.
 #[test]
 fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
     with_link(|| {
@@ -839,9 +799,6 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
     });
 }
 
-/// SHEDDING THE CARRY keeps the counters and
-/// retires every post dead in the successor, `not-carried`, said; the
-/// receipts are counted.
 #[test]
 fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
     with_link(|| {

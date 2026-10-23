@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows runtime lane on this Mac: one QEMU VM (Hypervisor.framework, Windows 11 on arm64, Prism for x86_64) in which the lane builds and runs this checkout's Windows code with MSVC on both architectures.
+//! The Windows runtime lane on this Mac.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -32,19 +32,16 @@ pub const SNAPSHOT: &str = "provisioned";
 /// Exit status of a lane that could not run: never a pass.
 pub const NOT_RUN: i32 = 3;
 
-/// Where the lane looks for QEMU and swtpm: the prefixes a person's own install of
-/// them lives under. aterm provides neither (init design §6.1 row 26: no check set runs
-/// this lane), so a missing one is a NOT RUN that names it, never an install command.
 const PREFIXES: [&str; 2] = ["/opt/homebrew", "/usr/local"];
 
-/// Microsoft's download page for Windows 11 on Arm64: it names the edition, and publishes each language's ISO digest.
+/// Microsoft's download page for Windows 11 on Arm64.
 pub const ISO_PAGE: &str = "https://www.microsoft.com/en-us/software-download/windows11arm64";
 
-/// The language of the ISO the lane installs, as the page's SKU list names it, and the row of the page's digest table that is its ISO's.
+/// Language SKU and digest-table row for the ISO the lane installs.
 pub const ISO_LANGUAGE: &str = "English";
 pub const ISO_DIGEST_ROW: &str = "English 64-bit";
 
-/// virtio-win: its version and the SHA-256 of `virtio-win-<version>.iso`, measured when it was pinned (2026-10-20): Fedora publishes no digest for the ISO (the release's CHECKSUM names its RPMs alone).
+/// Pinned `virtio-win` version and `virtio-win-<version>.iso` SHA-256.
 pub const VIRTIO: (&str, &str) = (
     "0.1.302",
     "303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d",
@@ -53,20 +50,12 @@ pub const VIRTIO: (&str, &str) = (
 /// Where NetKVM's driver is on the virtio-win ISO, and so on the answer media.
 pub const NETKVM_DIR: &str = "NetKVM/w11/ARM64";
 
-/// Hang detectors, never budgets: Windows installed and first logged on (881 s
-/// measured here, 2026-10-20), a provisioned disk booted to its SSH (about
-/// 20 s), Windows shut down (about 10 s), a restarting Windows gone from SSH
-/// (seconds), the runner's desktop session up (0.7-13.6 s after SSH in three
-/// boots, 2026-10-20).
 const INSTALL_WITHIN: Duration = Duration::from_secs(2 * 3600);
 const BOOT_WITHIN: Duration = Duration::from_secs(15 * 60);
 const STOP_WITHIN: Duration = Duration::from_secs(5 * 60);
 const GONE_WITHIN: Duration = Duration::from_secs(5 * 60);
 const DESKTOP_WITHIN: Duration = Duration::from_secs(guest::DESKTOP_WITHIN_SECS);
 
-/// How long after QEMU starts the lane presses Enter: the ISO's boot loader
-/// asks for a key ("Press any key to boot from CD or DVD") a few seconds in,
-/// and boots the disk when none comes.
 const BOOT_KEYS_FOR: Duration = Duration::from_secs(12);
 
 /// The verbs, as `windows help` prints them.
@@ -263,13 +252,12 @@ pub struct Tools {
     /// edk2's aarch64 firmware (read-only) and its variable store template.
     pub code: PathBuf,
     pub vars: PathBuf,
-    /// QEMU's `tpm-tis-device` has a `ppi` switch: QEMU 11.1 added it, on by default, and its 1 KiB physical-presence RAM is smaller than the host's 16 KiB page, which hvf will not map ("HV_BAD_ARGUMENT", QEMU 11.1.2, 2026-10-21), so the lane turns it off; QEMU 11.0 has no such switch.
+    /// QEMU's `tpm-tis-device` has a `ppi` switch.
     pub tpm_ppi: bool,
 }
 
 impl Tools {
     /// QEMU and swtpm under the first of [`PREFIXES`] that has them.
-    ///
     /// # Errors
     /// Not Apple silicon, or a tool missing: the lane cannot run here, and the NOT RUN
     /// names what is missing and where it was looked for.
@@ -282,9 +270,7 @@ impl Tools {
         Tools::find_in(&PREFIXES.map(Path::new))
     }
 
-    /// [`Tools::find`] under `prefixes` (the first that has each tool), on any
-    /// architecture: what a test points at scratch folders.
-    ///
+    /// [`Tools::find`] under `prefixes` (the first that has each tool), on any architecture.
     /// # Errors
     /// As [`Tools::find`], past its architecture check.
     pub fn find_in(prefixes: &[&Path]) -> Result<Tools, Fail> {
@@ -328,8 +314,6 @@ impl Tools {
     }
 }
 
-/// Why the lane cannot run without `bin` (of `what`): where it looked (`prefixes`' `bin`),
-/// and that aterm provides none. No install command: the lane runs on a person's own QEMU.
 fn missing(bin: &str, what: &str, prefixes: &[&Path]) -> String {
     let looked: Vec<String> = prefixes
         .iter()
@@ -379,17 +363,12 @@ fn lossy(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// A browser's user agent: Microsoft's download service answers a client
-/// that names one.
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0";
 
-/// The download service's profile and the fingerprint service's customer id,
-/// as Microsoft's own page script (`sdsbase`) passes them.
 const SDS_PROFILE: &str = "606624d44113";
 const OV_DF_INSTANCE: &str = "560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175";
 
-/// `GET url` with `referer`, the body as text.
 fn curl_text(url: &str, referer: Option<&str>) -> Result<String, String> {
     let mut args = strings(&["-fsS", "--max-time", "60", "-A", USER_AGENT]);
     if let Some(r) = referer {
@@ -404,9 +383,6 @@ fn curl_text(url: &str, referer: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Download `url` to `dest` (through `dest.part`, renamed when whole), making
-/// `dest`'s folder first: on a Mac's first `up` the image cache is not there,
-/// and curl answered "(23) Failure writing output to destination" (2026-10-21).
 fn curl_file(url: &str, dest: &Path, browser: bool) -> Result<(), String> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -425,7 +401,7 @@ fn curl_file(url: &str, dest: &Path, browser: bool) -> Result<(), String> {
     std::fs::rename(&part, dest).map_err(|e| format!("{}: {e}", dest.display()))
 }
 
-/// The SHA-256 of the file at `path`, lowercase hex: macOS's own `openssl dgst` (LibreSSL, the CPU's SHA-256 instructions), about 1.2 GB/s here, where an unoptimized dev build of the lab hashed an 8.5 GB ISO for minutes.
+/// The SHA-256 of the file at `path`, lowercase hex.
 /// # Errors
 /// It does not read.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
@@ -457,7 +433,6 @@ pub fn edition_id(page: &str) -> Option<String> {
     })
 }
 
-/// The page's text, tags removed and whitespace runs made one space.
 fn page_text(page: &str) -> String {
     let mut text = String::with_capacity(page.len());
     let mut in_tag = false;
@@ -475,7 +450,7 @@ fn page_text(page: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The SHA-256 the page publishes in its digest table's `row` (for example `English 64-bit`), lowercase: the first 64-digit hex word after the row's name.
+/// Lowercase SHA-256 published in the page's digest table for `row`.
 #[must_use]
 pub fn published_sha256(page: &str, row: &str) -> Option<String> {
     let text = page_text(page);
@@ -486,7 +461,7 @@ pub fn published_sha256(page: &str, row: &str) -> Option<String> {
     })
 }
 
-/// The fingerprint request Microsoft's `mdt.js` makes (`i="…"`, then `&mdt=<now>` and `&rticks=<its number>`), without the time.
+/// Fingerprint request URL prefix from Microsoft's `mdt.js` without the timestamp suffix.
 #[must_use]
 pub fn fingerprint_request(mdt_js: &str) -> Option<(String, String)> {
     let start = mdt_js.find("i=\"https://ov-df.microsoft.com/?")? + 3;
@@ -509,7 +484,7 @@ pub fn sku_id(json: &str, language: &str) -> Option<String> {
 
 /// The ISO's link the download service answered, or the error it gave.
 /// # Errors
-/// The service's own error (`Sentinel marked this request as rejected.` when it judged the session a robot), or an answer with no link.
+/// An answer that is not JSON, the service's own error, or an answer with no link.
 pub fn download_link(json: &str) -> Result<String, String> {
     let v =
         aterm_json::from_str::<aterm_json::Value>(json).map_err(|e| format!("not JSON: {e}"))?;
@@ -546,7 +521,6 @@ pub fn iso_name(link: &str) -> Option<String> {
     .then(|| name.to_string())
 }
 
-/// A random version-4 UUID (the download service's session id).
 fn uuid4() -> Result<String, String> {
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")
@@ -565,8 +539,6 @@ fn uuid4() -> Result<String, String> {
     ))
 }
 
-/// The record of the cached ISO: its file name and the digest Microsoft
-/// published for it, which it was held to.
 fn iso_record(l: &Layout) -> PathBuf {
     l.cache.join("windows-iso")
 }
@@ -581,10 +553,6 @@ pub fn cached_iso(l: &Layout) -> Option<(PathBuf, String)> {
     path.is_file().then(|| (path, sha.to_string()))
 }
 
-/// Windows 11's arm64 ISO from Microsoft, the way its download page gets one:
-/// the edition from the page, a session the fingerprint service has seen,
-/// the language's SKU, the per-session link; then the file, held to the
-/// digest the page publishes.
 fn fetch_windows_iso(l: &Layout) -> Result<(PathBuf, String), String> {
     let page = curl_text(ISO_PAGE, None)?;
     let edition = edition_id(&page).ok_or("the download page names no edition")?;
@@ -647,8 +615,6 @@ fn fetch_windows_iso(l: &Layout) -> Result<(PathBuf, String), String> {
     Ok((dest, want))
 }
 
-/// The cached virtio-win ISO, downloaded and held to [`VIRTIO`]'s digest
-/// when it is not there.
 fn virtio_iso(l: &Layout) -> Result<PathBuf, String> {
     let (version, want) = VIRTIO;
     let dest = l.cache.join(format!("virtio-win-{version}.iso"));
@@ -685,11 +651,11 @@ pub struct Boot {
     pub vnc: Option<u16>,
 }
 
-/// The VM's second display adapter: a virtio-gpu (QMP device id [`GPU_ID`]) whose one 1920x1200 output Windows drives with virtio-win's display-only driver ([`guest::display_step`]) and offers display scaling on.
+/// The VM's second display adapter.
 pub const VIRTIO_GPU: &str = "virtio-gpu-pci,id=gpu1,xres=1920,yres=1200";
 pub const GPU_ID: &str = "gpu1";
 
-/// QEMU's arguments for `boot`: the virt machine under hvf with the host's CPU, edk2's firmware and the lane's variable store, a ramfb screen (the firmware's, and Windows' basic display, read only by QMP's screendump) and a virtio-gpu ([`VIRTIO_GPU`], read the same way), USB keyboard and tablet (the tablet's absolute position spans Windows' primary monitor), the qcow2 disk on NVMe (Windows drives it in-box), virtio-net (NetKVM) on user networking with SSH forwarded on 127.0.0.1, swtpm's TPM 2.0, QMP on a socket; no display, daemonized.
+/// QEMU's arguments for `boot`.
 #[must_use]
 pub fn qemu_args(l: &Layout, t: &Tools, boot: &Boot) -> Vec<String> {
     let mut a = strings(&["-name", VM, "-machine", "virt,accel=hvf", "-cpu", "host"]);
@@ -785,7 +751,7 @@ pub fn qemu_args(l: &Layout, t: &Tools, boot: &Boot) -> Vec<String> {
     a
 }
 
-/// swtpm's arguments: a TPM 2.0 whose state is the lane's, on the socket QEMU's emulator connects to, gone when QEMU disconnects.
+/// Arguments for `swtpm` backing the lane's TPM 2.0 emulator socket for QEMU.
 #[must_use]
 pub fn swtpm_args(l: &Layout) -> Vec<String> {
     vec![
@@ -885,7 +851,6 @@ fn captured_daemon(
         .then_some(DaemonProcess { pid, birth })
 }
 
-/// ESRCH is absence; unreadable identity or permission refusal is unknown.
 fn absent(pid: i32) -> bool {
     crate::sys::signal_probe(pid, 0).is_err_and(|e| e.raw_os_error() == Some(libc::ESRCH))
 }
@@ -934,8 +899,6 @@ impl DaemonProcess {
         Ok(observe_daemon(l, kind, self.pid)? == Some(self))
     }
 
-    /// Recheck immediately before signalling. This narrows the stale-pid
-    /// window; a read followed by kill is not a kernel-stable process handle.
     fn signal(self, l: &Layout, kind: Daemon, sig: i32) -> Result<(), String> {
         if self.still_here(l, kind)? {
             crate::sys::kill(self.pid, sig)
@@ -950,18 +913,15 @@ pub fn running(l: &Layout) -> Result<Option<i32>, String> {
     Ok(daemon(l, Daemon::Qemu)?.map(|p| p.pid))
 }
 
-/// A free TCP port on 127.0.0.1 for the guest's SSH.
 fn free_port() -> Result<u16, String> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no free port: {e}"))?;
     l.local_addr().map(|a| a.port()).map_err(|e| e.to_string())
 }
 
-/// The forwarded SSH port the running VM was given.
 fn read_port(l: &Layout) -> Option<u16> {
     std::fs::read_to_string(l.port()).ok()?.trim().parse().ok()
 }
 
-/// Start swtpm, then QEMU (daemonized); `boot.port` is recorded for later runs.
 fn start(l: &Layout, t: &Tools, boot: &Boot) -> Result<(), String> {
     if running(l)?.is_some() {
         return Err("this VM already has a running QEMU; preserved".into());
@@ -1057,7 +1017,6 @@ pub fn qmp(l: &Layout, commands: &[String]) -> Result<Vec<aterm_json::Value>, St
     Ok(answers)
 }
 
-/// The VM's screen as a PNG at [`Layout::screen`], for a person to look at.
 fn screendump(l: &Layout) {
     let cmd = format!(
         "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{},\"format\":\"png\"}}}}",
@@ -1066,8 +1025,6 @@ fn screendump(l: &Layout) {
     let _ = qmp(l, &[cmd]);
 }
 
-/// Press Enter every quarter second for [`BOOT_KEYS_FOR`]: the ISO's boot
-/// loader boots the CD only on a key.
 fn press_through_boot_prompt(l: &Layout) {
     let key = "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[{\"type\":\"qcode\",\"data\":\"ret\"}]}}";
     let t0 = Instant::now();
@@ -1077,13 +1034,13 @@ fn press_through_boot_prompt(l: &Layout) {
     }
 }
 
-/// The lane's SSH to the guest: its own key and known-hosts file, no configuration of this user's, never a password, as one of the guest's two accounts.
+/// The lane's SSH to the guest.
 #[derive(Clone, Debug)]
 pub struct Ssh {
     pub key: PathBuf,
     pub known_hosts: PathBuf,
     pub port: u16,
-    /// [`guest::USER`] (the administrator: install, provisioning, shutdown) or [`guest::RUNNER`] (the standard user every `exec` and `smoke` runs as).
+    /// [`guest::USER`] (the administrator: install, provisioning, shutdown) or [`guest::RUNNER`].
     pub user: &'static str,
 }
 
@@ -1152,7 +1109,7 @@ impl Ssh {
         run(Path::new("/usr/bin/ssh"), &self.argv(command), None)
     }
 
-    /// Run the PowerShell `script` in the guest, captured, with no progress records (PowerShell 5.1 writes a module's first load as CLIXML among the output it is redirected to).
+    /// Run the PowerShell `script` in the guest, captured, with no progress records.
     #[must_use]
     pub fn ps(&self, script: &str) -> Out {
         self.run(&guest::powershell_command(&format!(
@@ -1160,7 +1117,7 @@ impl Ssh {
         )))
     }
 
-    /// Run `command` in the guest, each line of its output shown here as it comes, prefixed, and kept.
+    /// Run `command` in the guest, streaming and retaining each output line.
     #[must_use]
     pub fn streamed(&self, command: &str, prefix: &str) -> Out {
         let t0 = Instant::now();
@@ -1246,14 +1203,11 @@ impl Ssh {
     }
 }
 
-/// Whether the guest answers on SSH with the lane's key.
 fn answers(ssh: &Ssh) -> bool {
     let out = ssh.run("echo lane-ok");
     out.ok() && out.text.contains("lane-ok")
 }
 
-/// Wait until the guest answers on SSH, QEMU alive, within `limit` (a hang
-/// detector), the screen taken each minute; `what` names the wait.
 fn wait_ssh(l: &Layout, ssh: &Ssh, limit: Duration, what: &str) -> Result<f64, String> {
     let t0 = Instant::now();
     let mut said = Duration::ZERO;
@@ -1286,9 +1240,6 @@ fn wait_ssh(l: &Layout, ssh: &Ssh, limit: Duration, what: &str) -> Result<f64, S
     }
 }
 
-/// Shut Windows down (from inside, else ACPI's power button), within
-/// [`STOP_WITHIN`] (a hang detector), then QEMU's `quit`, then SIGKILL; swtpm
-/// ends with QEMU's connection.
 fn stop(l: &Layout, ssh: Option<&Ssh>) -> Result<(), String> {
     let Some(process) = daemon(l, Daemon::Qemu)? else {
         return stop_swtpm(l);
@@ -1330,8 +1281,6 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Snapshot the stopped VM: the disk ([`SNAPSHOT`], replacing an older one),
-/// the firmware variables and the TPM's state, which `down` restores together.
 fn snapshot(l: &Layout, t: &Tools, fingerprint: &str) -> Result<(), String> {
     let disk = lossy(&l.disk());
     let _ = run(
@@ -1352,7 +1301,6 @@ fn snapshot(l: &Layout, t: &Tools, fingerprint: &str) -> Result<(), String> {
     std::fs::write(l.provisioned(), format!("{fingerprint}\n")).map_err(|e| e.to_string())
 }
 
-/// Put the stopped VM back to its snapshot (disk, firmware variables, TPM).
 fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
     let out = run(
         &t.qemu_img,
@@ -1367,7 +1315,6 @@ fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
     copy_dir(&l.tpm_saved(), &l.tpm())
 }
 
-/// The snapshot's plan fingerprint, when the VM has one.
 fn snapshot_plan(l: &Layout) -> Option<String> {
     std::fs::read_to_string(l.provisioned())
         .ok()
@@ -1381,8 +1328,6 @@ fn secret_file(path: &Path, text: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The lane's SSH key, made once (`ssh-keygen`, ed25519, no passphrase: it
-/// opens only this VM, on 127.0.0.1): its public half.
 fn lane_key(l: &Layout) -> Result<String, String> {
     if !l.key().is_file() {
         let out = run(
@@ -1408,7 +1353,6 @@ fn lane_key(l: &Layout) -> Result<String, String> {
         .map_err(|e| format!("the lane's public key: {e}"))
 }
 
-/// The guest account's password, made once: 32 random hex digits.
 fn lane_password(l: &Layout) -> Result<String, String> {
     if let Ok(p) = std::fs::read_to_string(l.password())
         && !p.trim().is_empty()
@@ -1424,9 +1368,6 @@ fn lane_password(l: &Layout) -> Result<String, String> {
     Ok(p)
 }
 
-/// Write the answer media: `autounattend.xml`, the first-logon script, the
-/// lane's public key and NetKVM's arm64 driver from `virtio`, as an ISO
-/// (`hdiutil makehybrid`, ISO 9660 with Joliet) named [`guest::MEDIA_LABEL`].
 fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> Result<(), String> {
     let dir = l.media_dir();
     let _ = std::fs::remove_dir_all(&dir);
@@ -1480,11 +1421,11 @@ fn write_media(l: &Layout, virtio: &Path, public_key: &str, password: &str) -> R
         .map_err(|e| e.to_string())
 }
 
-/// NetKVM's INF and catalog; the files the INF installs are the ones its `[SourceDisksFiles]` names ([`inf_sources`]), so `pnputil` finds each.
+/// NetKVM's INF and catalog.
 pub const NETKVM_INF: &str = "netkvm.inf";
 pub const NETKVM_CAT: &str = "netkvm.cat";
 
-/// The files an INF's `[SourceDisksFiles]` sections name (`name = disk,,`, the plain section and each `.arch` decoration's), which must sit beside it when it is installed.
+/// The files an INF's `[SourceDisksFiles]` sections name.
 #[must_use]
 pub fn inf_sources(inf: &str) -> Vec<String> {
     let mut inside = false;
@@ -1507,7 +1448,7 @@ pub fn inf_sources(inf: &str) -> Vec<String> {
     files
 }
 
-/// The hard link an ISO listing line (`tar -tv`) names, when it is one: virtio-win's ISO stores each file once and links its other copies (its `w11/ARM64` driver is a link to `2k25/ARM64`'s).
+/// The hard link an ISO listing line (`tar -tv`) names, when it is one.
 #[must_use]
 pub fn link_target(listing: &str) -> Option<&str> {
     listing
@@ -1517,8 +1458,6 @@ pub fn link_target(listing: &str) -> Option<&str> {
         .map(|(_, t)| t.trim())
 }
 
-/// The bytes of `member` of the ISO `iso` (bsdtar reads ISO 9660), through a
-/// hard link to the copy that holds them.
 fn iso_member(iso: &Path, member: &str) -> Result<Vec<u8>, String> {
     let listed = run(
         Path::new("/usr/bin/tar"),
@@ -1548,7 +1487,6 @@ fn iso_member(iso: &Path, member: &str) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
-/// A fresh disk, variable store and TPM.
 fn new_machine(l: &Layout, t: &Tools) -> Result<(), String> {
     for f in [
         l.disk(),
@@ -1583,8 +1521,6 @@ fn new_machine(l: &Layout, t: &Tools) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Install Windows: boot the ISO with the answer media and wait for the
-/// first logon's SSH; the guest is left running.
 fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ssh, Fail> {
     let (iso, _) = match cached_iso(l) {
         Some(found) => found,
@@ -1638,8 +1574,6 @@ fn install(l: &Layout, t: &Tools, timings: &mut Vec<(String, f64)>) -> Result<Ss
     Ok(ssh)
 }
 
-/// Restart Windows and wait for its SSH and then the runner's desktop
-/// session (each within its hang detector).
 fn reboot(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     if !ssh.run("shutdown /r /t 0 /f").ok() {
         return Err("`shutdown /r` failed".into());
@@ -1658,7 +1592,6 @@ fn reboot(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     wait_desktop(ssh)
 }
 
-/// Wait (a hang detector) until the runner's desktop session is up.
 fn wait_desktop(ssh: &Ssh) -> Result<(), String> {
     let t0 = Instant::now();
     loop {
@@ -1680,9 +1613,6 @@ fn wait_desktop(ssh: &Ssh) -> Result<(), String> {
     }
 }
 
-/// Copy virtio-win's display driver ([`guest::VIOGPUDO_FILES`]) off the
-/// cached virtio-win ISO, each file held to its digest here (and again in the
-/// guest), to [`guest::VIOGPUDO_GUEST`] for [`guest::display_step`].
 fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     let iso = virtio_iso(l)?;
     let made = ssh.run(&format!(
@@ -1716,8 +1646,6 @@ fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     Ok(())
 }
 
-/// Provision the guest when its stamp is not the plan's fingerprint: the
-/// seconds it took, or `None` when it was current.
 fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
@@ -1761,11 +1689,11 @@ fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     Ok(Some(t0.elapsed().as_secs_f64()))
 }
 
-/// The running VM, booted (and made, the first time) and provisioned, and whether this call booted it (then the caller stops it when it ends).
+/// The running VM, booted and provisioned, and whether this call booted it.
 pub struct Up {
     pub layout: Layout,
     pub tools: Tools,
-    /// As [`guest::RUNNER`], the standard user: what a caller runs commands as, so they run as a person's do (medium integrity, no `SeDebugPrivilege`), not elevated.
+    /// As [`guest::RUNNER`], the standard user.
     pub ssh: Ssh,
     /// As [`guest::USER`], the administrator, which shuts Windows down.
     pub admin: Ssh,
@@ -1793,7 +1721,6 @@ fn shut_and_revert(l: &Layout, t: &Tools, ssh: Option<&Ssh>) -> Result<(), Strin
     Ok(())
 }
 
-/// Boot the provisioned snapshot and wait for its SSH.
 fn boot(l: &Layout, t: &Tools, vnc: bool, timings: &mut Vec<(String, f64)>) -> Result<Ssh, Fail> {
     let port = free_port().map_err(not_run)?;
     let vnc = if vnc {
@@ -1826,10 +1753,6 @@ fn boot(l: &Layout, t: &Tools, vnc: bool, timings: &mut Vec<(String, f64)>) -> R
     Ok(ssh)
 }
 
-/// End what an earlier run left running in a VM that `up` holds
-/// ([`guest::end_leftovers`]): a `lab windows exec` stopped on this Mac while
-/// its test hung left that test and its cargo running in the guest
-/// (2026-10-21).
 fn end_leftovers(admin: &Ssh) {
     let out = admin.ps(&guest::end_leftovers());
     let ended = out
@@ -1918,7 +1841,7 @@ pub fn bring_up(vnc: bool) -> Result<Up, Fail> {
     })
 }
 
-/// The one lane run of this Mac: the lab's lane lock ([`crate::linux::LaneLock`]) on [`Layout::lock`], in the VM's directory, which only this user reads.
+/// The one lane run of this Mac.
 /// # Errors
 /// Another run holds it (NOT RUN), or the lock file cannot be made.
 pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
@@ -1928,7 +1851,7 @@ pub fn lane_lock(l: &Layout) -> Result<LaneLock, Fail> {
     LaneLock::at(&l.lock(), "windows")
 }
 
-/// One file of the working tree: its path (forward slashes), size and modification time (seconds.nanoseconds).
+/// One file of the working tree: its path (forward slashes), size and modification time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub path: String,
@@ -1936,7 +1859,7 @@ pub struct Entry {
     pub mtime: String,
 }
 
-/// The working tree's files: what git tracks and what it does not ignore, each submodule's likewise under its path; a file the tree no longer has is left out.
+/// The working tree's files.
 /// # Errors
 /// git failed.
 pub fn tree_files(repo: &Path, prefix: &str) -> Result<Vec<Entry>, String> {
@@ -2018,7 +1941,7 @@ pub fn parse_manifest(text: &str) -> BTreeMap<String, (u64, String)> {
         .collect()
 }
 
-/// What a copy sends (new or changed: a size or time the guest's manifest does not hold) and what it removes (in the guest's manifest, gone here).
+/// Files to send (new or changed against the guest manifest) and files to remove.
 #[must_use]
 pub fn plan_copy(
     here: &[Entry],
@@ -2038,10 +1961,9 @@ pub fn plan_copy(
     (send, remove)
 }
 
-/// Where the guest keeps the manifest of its copy (outside the copy).
 const GUEST_MANIFEST: &str = r"C:\lane\manifest";
 
-/// Bring the guest's copy of `repo` up to its working tree: a tar of what changed (no macOS metadata) copied over and unpacked in [`guest::SRC`], what went removed, and the new manifest written.
+/// Bring the guest's copy of `repo` up to its working tree.
 /// # Errors
 /// git, tar or a copy failed.
 pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), String> {
@@ -2124,7 +2046,7 @@ pub fn copy_tree(l: &Layout, ssh: &Ssh, repo: &Path) -> Result<(usize, usize), S
     Ok((send.len(), remove.len()))
 }
 
-/// The build facts `crates/aterm/build.rs` takes pinned instead of asking git (the guest's copy has no `.git`): this checkout's commit and its count since the newest release tag, `-dirty` when the tree has changes, and `SOURCE_DATE_EPOCH`, HEAD's committer time, the build number build.rs takes from git otherwise (so `aterm --version` prints the host build's `build:`).
+/// The build facts `crates/aterm/build.rs` takes pinned instead of asking git.
 #[must_use]
 pub fn build_facts(repo: &Path) -> Vec<(String, String)> {
     let git = |args: &[&str]| {
@@ -2235,7 +2157,6 @@ fn cmd_destroy() -> Res {
     Ok(0)
 }
 
-/// The bytes `path` holds on disk (a sparse file: what was written).
 fn allocated(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::metadata(path).ok().map(|m| m.blocks() * 512)
@@ -2364,7 +2285,7 @@ pub fn parse_exec(args: &[String]) -> Result<ExecArgs, Fail> {
     })
 }
 
-/// Run the cmd.exe `line` in the runner's desktop session ([`guest::desktop_runner`]) as `how` says, under the task name `name`: its batch file and controller copied to [`guest::TASKS`], the controller run as the administrator; its output streamed here when `stream`, else kept.
+/// Run `cmd.exe` `line` in the runner's desktop session under scheduled task `name`.
 pub fn run_on_desktop(up: &Up, name: &str, line: &str, how: guest::Desktop, stream: bool) -> Out {
     let failed = |text: String| {
         eprintln!("aterm-lab: windows: {text}");

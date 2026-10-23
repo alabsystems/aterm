@@ -5,14 +5,14 @@
 //! gives that instant, in seconds east of UTC. It replaces `date +%z`, a child per question
 //! (docs/DESIGN-init-system-2026-10-20.md §6.1 row 9).
 //!
-//! * The local clock's ([`local_offset_at`]) is `localtime_r`'s `tm_gmtoff`, after a `tzset`
-//!   so a replaced system zone is followed (glibc keeps its first zone otherwise). This
-//!   process's `TZ` wins, as it did for the `date` it inherited.
-//! * A named zone's ([`zone_offset_at`]) is read from its TZif file under
-//!   `/usr/share/zoneinfo` (RFC 8536), the file `TZ=<zone> date` read: the transition in
-//!   force at the instant, and past the last transition the file's footer rule (a POSIX
-//!   `TZ` string, [`posix_offset_at`]). No `TZ` is set: a process's `TZ` is shared by every
-//!   thread, and setting it beside a reader is undefined.
+//! * The local clock's ([`local_offset_at`](crate::zone::local_offset_at)) is `localtime_r`'s
+//!   `tm_gmtoff`, after a `tzset` so a replaced system zone is followed (glibc keeps its first
+//!   zone otherwise). This process's `TZ` wins, as it did for the `date` it inherited.
+//! * A named zone's ([`zone_offset_at`](crate::zone::zone_offset_at)) is read from its TZif file
+//!   under `/usr/share/zoneinfo` (RFC 8536), the file `TZ=<zone> date` read: the transition in
+//!   force at the instant, and past the last transition the file's footer rule (a POSIX `TZ`
+//!   string, [`posix_offset_at`](crate::zone::posix_offset_at)). No `TZ` is set: a process's
+//!   `TZ` is shared by every thread, and setting it beside a reader is undefined.
 
 use std::path::Path;
 
@@ -27,7 +27,7 @@ pub fn local_offset_at(unix: i64) -> Option<i64> {
     imp::local_offset_at(unix)
 }
 
-/// The local clock's offset from UTC now ([`local_offset_at`]).
+/// The local clock's offset from UTC now ([`local_offset_at`](crate::zone::local_offset_at)).
 #[must_use]
 pub fn local_offset_now() -> Option<i64> {
     let now = std::time::SystemTime::now()

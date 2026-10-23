@@ -404,9 +404,7 @@ fn incoming_stage(s: &Staging, build: u64, commit: &str) -> PathBuf {
     incoming
 }
 
-/// A STAGE WITHDRAWN WHILE IT DOWNLOADED IS NEVER PUBLISHED. The publish shares the
-/// revert's and the retirement's apply lock and re-reads, under it, what a sibling
-/// may have recorded meanwhile.
+/// A stage withdrawn while it downloaded is never published.
 #[test]
 fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
@@ -529,12 +527,7 @@ fn publish_confirmed_stage(
     ready
 }
 
-/// A COLD LAUNCH DOES NOT SWAP IN A STAGE NO CHECK HAS CONFIRMED FOR A DAY. Build
-/// 20, signed by machine m11, was staged and confirmed
-/// against roster generation 9 two days ago; the app was quit before the
-/// in-session lane applied it, and the owner may since have revoked m11 in a
-/// release no check on this Mac has read (gate 4c reads only revocations a check
-/// has seen, and the floor here has seen none).
+/// A cold launch does not swap in a stage no check has confirmed for a day.
 #[test]
 fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
     let (s, root) = temp_staging();
@@ -1042,10 +1035,7 @@ fn read_ready_classifies_all_states() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT ON THE BUILD. A sibling
-/// aterm that landed the same update first retires `ready.toml`; one that published a newer stage
-/// mid-attempt replaces it; a read the kernel refused for a moment (`EMFILE`
-/// in a Dock-launched window) reads as an unreadable marker.
+/// The shared stage's state is a moment, not a verdict on the build.
 #[test]
 fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
     let (s, root) = temp_staging();
@@ -1191,11 +1181,7 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A CODESIGN RUN THAT ENDED WITHOUT A VERDICT IS NOT ONE,
-/// driven through the REAL reader and the real `codesign`: an installed bundle
-/// whose main executable codesign cannot read just then exits 1 with "<bundle>:
-/// Permission denied" — a fact about this machine (`CodesignError::judged_nothing_at`), never
-/// the installed-source refusal that tells a person to reinstall a healthy app.
+/// A `codesign` run that ended without a verdict (`CodesignError::judged_nothing_at`) does not record an installed-source refusal.
 #[test]
 fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refusal() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1233,11 +1219,7 @@ fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refu
     assert!(crate::refusal_needs_person(&verdict), "{verdict}");
 }
 
-/// A bundle modified after signing is a verdict, through the real reader and
-/// `codesign`: only a run that knowably judged nothing is passing, so the seal's words
-/// ("a sealed resource is missing or invalid", "invalid Info.plist", "unsealed contents
-/// present in the bundle root") are a verdict on the stage and the installed-source
-/// refusal on the installed bundle.
+/// A bundle modified after signing produces a verdict through the real reader and `codesign`.
 #[test]
 fn a_bundle_modified_after_signing_is_a_verdict_not_a_moment() {
     let root = std::env::temp_dir().join(format!(
@@ -1620,9 +1602,7 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING. Build 20 crash-looped
-/// here and was quarantined; another build's stage failure then replaced
-/// `failed.toml`, so `quarantine.toml` alone names it.
+/// A quarantine record that could not be read admits nothing.
 #[test]
 fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
     use std::os::unix::fs::PermissionsExt;
@@ -2838,10 +2818,7 @@ fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A trial belongs to the install it swapped. A same-build process launched from
-/// another bundle (`~/Applications/aterm.app` beside `/Applications/aterm.app`)
-/// must not count launches against it, confirm it, or disarm it as dead
-/// authority.
+/// A trial belongs to the install it swapped.
 #[test]
 fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
     let (s, root) = temp_staging();
@@ -2944,9 +2921,7 @@ fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idl
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A live trial belonging to another installation is never disarmed. The staging
-/// root is per user, so another copy shares this sentinel, and disarming its
-/// trial would strip crash-loop protection from the build that is crash-looping.
+/// A live trial belonging to another installation is never disarmed.
 #[test]
 fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
     let (s, root) = temp_staging();
@@ -3639,12 +3614,7 @@ fn well_formed_zip(entries: &[(&str, u32)]) -> Vec<u8> {
     bytes
 }
 
-/// What the claim admits, read exactly — entry count and summed uncompressed bytes:
-/// a directory `ditto -c -k` could plausibly have written; one behind an archive
-/// comment (the scan minds the variable-length tail rather than assume the record
-/// sits at EOF - 22); and a container with the toolchain seed sealed into the
-/// signed `.app`, far past 1 GiB but inside the one bound the cutter validates every
-/// published asset against, which the extract cap must never sit below.
+/// [`checked_zip_extraction_claim`] admits valid archives, trailing comments, and toolchain-sized bundles within the extraction cap.
 #[test]
 fn zip_claim_reads_every_directory_a_publisher_could_write() {
     assert_eq!(
@@ -3695,15 +3665,7 @@ fn zip_claim_reads_every_directory_a_publisher_could_write() {
     }
 }
 
-/// What the claim refuses, each for its own reason. These build central directories
-/// by hand, since the shapes that matter are ones a real archiver will not produce:
-/// a size past the cap (`u32::MAX - 1`, the largest a classic entry states without
-/// the ZIP64 escape) and a count past it (zero bytes each: the inode cost bytes
-/// cannot see); a directory cut mid-header (a truncated upload) or one whose walk
-/// disagrees with its trailer; a saturated ZIP64 sentinel with no locator behind it,
-/// or an entry escaping to ZIP64 with no extra field (unresolved, not a literal
-/// ~4 GiB); two trailers that both run exactly to EOF (the bound might be measured
-/// off a record `ditto` does not follow); and a file with no end record at all.
+/// [`checked_zip_extraction_claim`] refuses oversized, truncated, mismatched, ambiguous, and trailer-less central directories.
 #[test]
 fn zip_claim_refuses_every_directory_it_cannot_bound() {
     let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;
@@ -3891,9 +3853,7 @@ fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A window's settled trial keeps its predecessor at the fixed path for that window:
-/// macOS judges the window by the bundle at the path its first consent check saw (design
-/// §2.2).
+/// A window's settled trial keeps its predecessor at the fixed path while that window runs.
 #[test]
 fn a_kept_predecessor_is_released_only_after_its_window_and_outside_a_trial() {
     let (staging, root) = temp_staging();
@@ -4171,8 +4131,7 @@ fn a_kept_predecessor_outlives_an_unreadable_holder() {
     );
 }
 
-/// ONE CHECK OF BOTH BUNDLES, BEFORE ANYTHING MOVES (steps 6–7,
-/// [`verify_stage_and_prepare`]).
+/// [`verify_stage_and_prepare`] checks both bundles once before anything moves.
 #[test]
 fn both_bundles_are_checked_at_once_before_anything_moves() {
     type Identity = Result<(u64, String), String>;
@@ -4380,8 +4339,7 @@ fn the_old_bundle_recheck_follows_the_operation_that_prepared_new() {
     );
 }
 
-/// A WINDOW LAUNCH LEAVES THE STAGE FOR ITS WINDOW, AND EXECS ONLY TO REVERT OR ESCAPE
-/// (Tier-1 of `NativeUpdateBootImage`, 2026-10-19).
+/// A window launch leaves the stage for its window and execs only to revert or escape (Tier-1 of `NativeUpdateBootImage`).
 #[test]
 fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_escape() {
     use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
@@ -4697,15 +4655,21 @@ fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_e
 }
 
 /// Which start-probe failures leave the candidate unproven: a probe killed at its
-/// ceiling (the helper timeout or the apply budget) and a wait that failed started it
-/// and never saw it exit.
+/// ceiling (the helper timeout or the apply budget), a wait that failed, and a signal
+/// that ended the candidate started it and never saw it exit.
 #[test]
 fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     let what = "candidate --version probe";
+    let signalled = format!(
+        "{} (signal: 6 (SIGABRT)); /x/aterm.app/Contents/MacOS/aterm stays where it ran",
+        crate::verify::START_PROBE_SIGNALLED
+    );
+    assert!(stage_failure_is_a_verdict(&signalled), "{signalled}");
     for unproven in [
         crate::verify::timed_out(what, false),
         crate::verify::timed_out(what, true),
         crate::verify::mark_passing(format!("wait for {what}: Interrupted system call")),
+        signalled,
     ] {
         assert!(probe_left_unproven(&unproven), "{unproven}");
     }
@@ -4719,7 +4683,7 @@ fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     }
 }
 
-/// A START PROBE KILLED BEFORE ITS CANDIDATE EXITED LEAVES IT WHERE IT RAN (r4g-2).
+/// A start probe killed before its candidate exited leaves it where it ran.
 #[test]
 fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
     let (running, build, commit, other_commit) = (

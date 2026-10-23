@@ -148,7 +148,11 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
                 if let Some(plan) = sub.plan.as_deref() {
                     parts.push(plan);
                 }
-                if let Some(weekly) = sub.weekly.as_deref() {
+                if let Some(weekly) = sub
+                    .weekly
+                    .as_deref()
+                    .or_else(|| sub.weekly_gap.map(|gap| gap.words()))
+                {
                     parts.push(weekly);
                 }
             }
@@ -308,6 +312,12 @@ pub(crate) fn fact_spoken_of(
         }
         Fact::Account => {
             let mut parts: Vec<&str> = Vec::new();
+            let weekly = facts.subscription.as_ref().and_then(|sub| {
+                sub.weekly
+                    .as_deref()
+                    .map(|words| words.replace(" \u{b7} ", ", "))
+                    .or_else(|| sub.weekly_gap.map(|gap| gap.spoken().to_owned()))
+            });
             if let Some(sub) = facts.subscription.as_ref() {
                 if let Some(email) = sub.email.as_deref() {
                     parts.push(email);
@@ -315,7 +325,7 @@ pub(crate) fn fact_spoken_of(
                 if let Some(plan) = sub.plan.as_deref() {
                     parts.push(plan);
                 }
-                if let Some(weekly) = sub.weekly.as_deref() {
+                if let Some(weekly) = weekly.as_deref() {
                     parts.push(weekly);
                 }
             }

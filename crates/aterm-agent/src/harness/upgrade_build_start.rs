@@ -117,7 +117,7 @@ impl Note {
 
     /// Whether a probe since the latest failure ran the build and it exited
     /// with a failure — the one finding of a crash's probe that holds the
-    /// upgrade's own moves off a build no move has failed on ([`starts_with`]):
+    /// upgrade's own moves off a build no move has failed on ([`gate`]):
     /// one that could not run it, or did not see it end in time, says
     /// nothing of the build.
     fn found_exiting(&self) -> bool {
@@ -393,7 +393,7 @@ pub fn starts_with(
     gate(opts, r, &Build::of(to), now, owner_now, require, true, run)
 }
 
-/// [`starts_with`], `moving` as [`starts`] takes it.
+/// `starts_with`, `moving` as [`starts`] takes it.
 #[allow(clippy::too_many_arguments)]
 fn gate(
     opts: &Opts,

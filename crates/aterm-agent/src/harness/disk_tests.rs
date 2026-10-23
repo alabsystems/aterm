@@ -6,7 +6,6 @@
 use super::*;
 use crate::harness::host_path::abs;
 
-/// A fixed instant; never `SystemTime::now()`.
 const NOW: i64 = 1_789_603_200;
 
 /// A fresh directory under the system temp dir, removed on drop.
@@ -122,8 +121,6 @@ fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     )
 }
 
-/// A remover that counts its calls and removes nothing, answering the row's
-/// own size as freed.
 fn counting(calls: &mut usize) -> impl FnMut(&Row) -> std::io::Result<Removed> + '_ {
     move |row: &Row| {
         *calls += 1;
@@ -140,7 +137,6 @@ pub(crate) fn no_pressure() -> Option<u64> {
     panic!("free space was measured again, but this pass has no pressure row")
 }
 
-/// A config with apply on, for the tests that mean to remove something.
 fn applying() -> Config {
     Config {
         apply: true,
@@ -341,10 +337,6 @@ fn an_unresolvable_live_symlink_blocks_every_version_row_rather_than_guessing() 
     assert!(done.removed.is_empty());
 }
 
-/// A superseded store build is a row only when atpkg's retention would take
-/// it: the live build and its rollback target (the newest below the live
-/// one) are kept by `aterm pkg gc`, so neither is a row; the older one and a
-/// staged-but-never-activated build above the live one are.
 #[test]
 fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
     let mut survey = Survey::new(NOW);
@@ -1015,11 +1007,6 @@ fn a_short_spelled_directory_reads_its_volume() {
     assert_eq!((&read.mount, &read.key), (&long.mount, &long.key));
 }
 
-/// A VOLUME IS PLACED WITH THE SYSTEM'S ERROR BOXES OFF, on whatever thread
-/// asks (its first finding: the control socket's
-/// `await sys` holds no guard of its own): [`volume_of`] resolves the path,
-/// and on Windows a query of an empty card reader or optical drive otherwise
-/// puts a box on the owner's desktop and parks the asker.
 #[test]
 fn a_volume_is_placed_with_the_error_boxes_off() {
     let tmp = Tmp::new("volume-quiet");
@@ -1385,11 +1372,6 @@ fn from_low_the_stale_target_goes_re_measured_and_nothing_else_does() {
     );
 }
 
-/// THE THRESHOLDS ARE THE LARGER OF THE KNOB AND A SHARE OF THE VOLUME, and
-/// the level is read against them at both edges: a 460 GiB volume's floor is
-/// 5% (23 GiB, above the 10 GiB knob), its warning 8% (37 GiB is below the
-/// 40 GiB knob, so 40), its emergency 4 GiB (1% is 4.6 GiB: that); a 40 GiB
-/// volume keeps the knobs and the 4 GiB emergency.
 #[test]
 fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
     let big = 460 * GIB;
@@ -1441,11 +1423,6 @@ fn thresholds_are_the_larger_of_the_knob_and_the_volumes_share() {
     assert_eq!(t.level(Some(0), None), Level::Emergency);
 }
 
-/// THE LINES ON FOUR VOLUMES, no room measured (design
-/// `docs/DESIGN-disk-awareness-2026-10-17.md` §2.4's table): a 128 GB disk
-/// warns at 20 % of itself, no longer at 40 GiB (34 %, `low` for good); a
-/// 256 GB one keeps today's lines; the owner's 1.81 TiB volume and a 4 TB
-/// one hold the capped shares.
 #[test]
 fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_share() {
     let owners_mac = 1_948_404_040 * 1024;
@@ -1476,12 +1453,6 @@ fn the_lines_on_four_volumes_hold_the_unwritten_defaults_to_a_small_volumes_shar
     assert_eq!(tiny.level(Some(GIB / 2), None), Level::Emergency);
 }
 
-/// THE VOLUME'S SHARE IS CAPPED AND NEVER RAISES A VALUE THE OWNER WROTE:
-/// on a 4 TB volume the unwritten floor is [`AUTO_FREE_SHARE_MAX_GIB`] (not
-/// 5%, 200 GiB), the warning [`WARN_FREE_SHARE_MAX_GIB`] and the emergency
-/// [`EMERGENCY_FREE_SHARE_MAX_GIB`]; a written floor of 10 GiB and warning of
-/// 20 GiB stay 10 and 20 on any volume, the emergency then no higher than
-/// that floor.
 #[test]
 fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
     let huge = 4096 * GIB;
@@ -1517,8 +1488,6 @@ fn the_volume_share_is_capped_and_a_written_knob_is_read_as_written() {
     );
 }
 
-/// CLAUDE CODE'S WINDOWS TEMP ROOT is `claude` under Node's `os.tmpdir()`:
-/// `%TEMP%`, else `%TMP%` — the user's own directory, so no uid.
 #[test]
 fn claude_codes_windows_temp_root_is_under_its_temp() {
     let (temp, tmp) = (abs("/Users//u/AppData/Local/Temp"), abs("/t"));
@@ -1542,11 +1511,6 @@ fn claude_codes_windows_temp_root_is_under_its_temp() {
     }
 }
 
-/// THE CLAUDE CENSUS PASSES OVER ITS OWN PROCESS, every OS
-/// ([`discover::census_of_running`]): this process (aterm's verb, or the window whose look
-/// asks) is never read, never counted a Claude Code however its path reads — on Windows one
-/// run from a Claude Code scratchpad has a `claude` component in its image — and never
-/// refuses the census unread.
 #[test]
 fn the_claude_census_passes_over_its_own_process() {
     use discover::{Exe, Exec, Process};
@@ -1597,10 +1561,6 @@ fn the_claude_census_passes_over_its_own_process() {
     );
 }
 
-/// A live checkout at `<tmp>/repo` (its git files, a source file) whose
-/// whole build directory `target/` (one profile) was last used at `now`,
-/// and its tier-3 row, eight days idle in a seven-day window: the canonical
-/// checkout, the canonical build directory, the row.
 fn idle_whole(tmp: &Tmp, now: i64) -> (PathBuf, PathBuf, Row) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git").join("logs")).expect("git");
@@ -1631,8 +1591,6 @@ fn idle_whole(tmp: &Tmp, now: i64) -> (PathBuf, PathBuf, Row) {
     (repo, target, row)
 }
 
-/// The real remover at `now` on a tier-3 `row`: no process runs, no Claude
-/// Code, the sessions `sessions` reads and the mount tables `tables` reads.
 fn remove_idle_whole(
     row: &Row,
     now: i64,
@@ -1653,10 +1611,6 @@ fn remove_idle_whole(
     )(row)
 }
 
-/// TIER 3'S CLAUSE 4A IS READ AGAIN AT THE REMOVAL, from the sessions as they
-/// stand then — never the survey's copy, a look old by the delete (on
-/// Windows the only witness of a PowerShell tab, whose `Set-Location` moves
-/// no process's working directory).
 #[test]
 fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
     let now = now_after_write(8);
@@ -1718,8 +1672,6 @@ fn a_session_that_moves_into_the_checkout_after_the_survey_keeps_it() {
     assert!(!rlib.exists(), "the profile was emptied");
 }
 
-/// TIER 3'S REMOVAL READS ITS SESSIONS ON A MOUNT TABLE READ WHOLE
-/// ([`remover`]).
 #[test]
 fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
     use aterm_sysprobe::volumes::{self, Table};
@@ -1780,11 +1732,6 @@ fn the_removal_reads_its_sessions_on_a_mount_table_read_whole() {
     assert!(!rlib.exists(), "the profile was emptied");
 }
 
-/// A SESSION'S WORKING DIRECTORY IS OPENED ONLY ON A LOCAL VOLUME
-/// ([`idle::SessionCwd::on`], the one reading of the survey and of the
-/// removal, which reads it again under cargo's locks): where the mount table
-/// calls the folder's volume remote (a share that may stall) or automounted,
-/// it is never opened and reads as written: `Unresolved`, though it exists.
 #[test]
 fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
     use aterm_sysprobe::paths::is_under;
@@ -1855,12 +1802,6 @@ fn a_session_cwd_on_a_share_or_an_automount_is_never_opened() {
     }
 }
 
-/// THE TEXT FORM SPELLS PATHS AS A PERSON READS THEM (Windows): a row's line
-/// and a hog's line show `C:\…` where the row holds the canonical `\\?\C:\…`
-/// — the row's own path, in its line, in its blocked reason, in its witness —
-/// a share `\\srv\share\…`, and a hog under `$HOME` `~\…` whichever spelling
-/// `$HOME` is in; the row keeps its verbatim path, the one that opens past
-/// `MAX_PATH` and the one the journal and `--json` carry.
 #[test]
 fn the_text_form_spells_paths_plain_and_the_row_keeps_its_own() {
     let verbatim = PathBuf::from(r"\\?\C:\Users\u\repo\target");

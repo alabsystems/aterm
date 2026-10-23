@@ -527,7 +527,7 @@ fn render_json(
     out
 }
 
-/// aterm fabric brief [@<sid>[@<node>]] [--window <n>] [--budget <tokens>] [--cap-file <path>].
+/// `aterm fabric brief [@<sid>[@<node>]] [--window <n>] [--budget <tokens>] [--cap-file <path>]`.
 #[must_use]
 pub fn brief_main(opts: &BriefOpts) -> ExitCode {
     let cfg = match crate::fabric::configured_for_reads() {

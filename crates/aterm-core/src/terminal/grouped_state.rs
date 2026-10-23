@@ -343,9 +343,9 @@ impl ShellIntegrationState {
 
 /// Grouped cursor save/restore state: one save slot per screen, like xterm's `screen->sc[whichBuf]`.
 pub(super) struct CursorSaveState {
-    /// Saved cursor state for main screen (xterm sc[0]).
+    /// Saved cursor state for main screen (xterm `sc[0]`).
     pub(super) main: Option<SavedCursorState>,
-    /// Saved cursor state for alt screen (xterm sc[1]).
+    /// Saved cursor state for alt screen (xterm `sc[1]`).
     pub(super) alt: Option<SavedCursorState>,
 }
 
@@ -460,7 +460,7 @@ pub(super) struct Iterm2State {
     pub(super) remote_host: Option<super::types::RemoteHost>,
     /// Cell pixel size `(width, height)` for converting pixel/auto image dimensions (OSC 1337 `File=`) into a cell footprint.
     pub(super) cell_px: (u16, u16),
-    /// Whether `cell_px` was measured by a host ([`Terminal::set_cell_pixel_size`]) rather than [`DEFAULT_CELL_PX`].
+    /// Whether `cell_px` was measured by a host ([`Terminal::set_cell_pixel_size`](super::Terminal::set_cell_pixel_size)) rather than [`DEFAULT_CELL_PX`].
     pub(super) cell_px_from_host: bool,
 }
 
@@ -481,7 +481,7 @@ impl Iterm2State {
         }
     }
 
-    /// The cell box a host measured, or `None` for the placeholder: the one predicate behind [`Terminal::host_cell_pixel_size`] and the XTWINOPS pixel reports.
+    /// The cell box a host measured, or `None` for the placeholder: the one predicate behind [`Terminal::host_cell_pixel_size`](super::Terminal::host_cell_pixel_size) and the XTWINOPS pixel reports.
     #[inline]
     pub(super) const fn host_cell_px(&self) -> Option<(u16, u16)> {
         let (w, h) = self.cell_px;

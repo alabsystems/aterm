@@ -221,8 +221,12 @@ const fn read_u32_le(b: &[u8]) -> u32 {
 }
 
 /// A wyhash-inspired, non-collision-resistant hash for byte slices, tuned for
-/// small strings and small code size.
-#[inline]
+/// small strings and small code size. Out of line in builds with debug
+/// assertions, so a caller at opt-level 0 calls this crate's optimised copy
+/// rather than inlining its own (dev and test builds keep the crate at
+/// opt-level 2).
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let mut s0 = SEED1;

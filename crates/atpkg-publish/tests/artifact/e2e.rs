@@ -90,8 +90,8 @@ impl Tools for HostButRaw {
 
 #[test]
 fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
-    let tmp = scratch("e2e-bundle");
-    let root = std::fs::canonicalize(tmp.path()).expect("root");
+    let mut kept = aterm_uds::deadline::KeptUntilRan::new(scratch("e2e-bundle").keep());
+    let root = std::fs::canonicalize(kept.path()).expect("root");
     let host = if std::env::consts::ARCH == "aarch64" {
         "aarch64-apple-darwin"
     } else {
@@ -242,6 +242,8 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
         .output()
         .expect("the shipped compiler runs");
     assert!(String::from_utf8_lossy(&ran.stdout).contains(COMMIT));
+    // Every copy run from the scratch showed it ran: the pack's -vV and smoke, this COMMIT.
+    kept.ran();
     let text = std::fs::read_to_string(&outcome.manifest).expect("pkg");
     let tree_root = text
         .lines()

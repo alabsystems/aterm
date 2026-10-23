@@ -262,7 +262,7 @@ fn canonical_in(
 
 /// [`canonical_folder`] without the time limit. On Windows it is spelled
 /// without the verbatim prefix `canonicalize` answers with
-/// ([`without_verbatim`]): the harness compares it with the folder Claude
+/// (`without_verbatim`): the harness compares it with the folder Claude
 /// Code's folder-trust dialog shows, `C:\…`, never `\\?\C:\…`.
 fn canonical_now(dir: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(dir).ok()?;

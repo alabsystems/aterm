@@ -306,7 +306,7 @@ impl SmartSelection {
         Self::basic_word_boundaries_with(None, text, byte_pos)
     }
 
-    /// [`basic_word_boundaries`](Self::basic_word_boundaries) against an
+    /// `basic_word_boundaries` against an
     /// optional word-SEPARATOR set: `Some(seps)` switches the char classifier
     /// to xterm.js `wordSeparators` semantics (see
     /// [`set_word_separators`](Self::set_word_separators)); `None` is the
@@ -352,7 +352,7 @@ pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
     column_to_byte_pos_with(text, column, AmbiguousWidth::Single)
 }
 
-/// [`column_to_byte_pos`] under the terminal's `ambiguous_width` policy.
+/// `column_to_byte_pos` under the terminal's `ambiguous_width` policy.
 fn column_to_byte_pos_with(text: &str, column: usize, ambiguous: AmbiguousWidth) -> usize {
     for g in aterm_grapheme::grid_graphemes_with(text, ambiguous) {
         if column < g.end_col {
@@ -372,7 +372,7 @@ pub(crate) fn byte_span_to_columns(
     byte_span_to_columns_with(text, start_byte, end_byte, AmbiguousWidth::Single)
 }
 
-/// [`byte_span_to_columns`] under the terminal's `ambiguous_width` policy.
+/// `byte_span_to_columns` under the terminal's `ambiguous_width` policy.
 fn byte_span_to_columns_with(
     text: &str,
     start_byte: usize,

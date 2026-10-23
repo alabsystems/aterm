@@ -216,7 +216,7 @@ pub(crate) fn export_for(
     })
 }
 
-/// [`export_for`] for a successor of `target_build`: its turn-status words ([`StatusWords::for_target`]) and, when it reads one ([`successor_reads_session_log`]), each handed session's log.
+/// `export_for` for a successor of `target_build`: its turn-status words ([`StatusWords::for_target`]) and, when it reads one ([`successor_reads_session_log`]), each handed session's log.
 #[cfg(any(unix, test))]
 pub(crate) fn export_for_target(
     sources: &[CarrySource],
@@ -317,7 +317,7 @@ fn read_mirror_member(raw: &str) -> Option<aterm_slog::Prior> {
     })
 }
 
-/// [`export_for`], each [`CarryLoss`] handed to `noted` with its session; `logs`: whether the successor reads the session log (each source's timeline is then taken in a pass of its own, after every ledger and terminal).
+/// `export_for`, each [`CarryLoss`] handed to `noted` with its session; `logs`: whether the successor reads the session log (each source's timeline is then taken in a pass of its own, after every ledger and terminal).
 #[cfg(any(unix, test))]
 pub(crate) fn export_noting(
     sources: &[CarrySource],

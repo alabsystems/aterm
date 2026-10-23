@@ -425,7 +425,8 @@ impl Decision {
 /// The window's decisions ([`HarnessStats::decided`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decided {
-    /// The newest [`DECIDED_KEEP`] the window held, oldest first.
+    /// The newest [`DECIDED_KEEP`] the window held, oldest first, once the reading has ended
+    /// ([`HarnessStats::end_reading`]).
     pub rows: Vec<Decision>,
     /// How many the window held, kept or not (a run of presses is one).
     pub total: u64,
@@ -1478,7 +1479,8 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
     acc
 }
 
-/// ONE READING, TWO WINDOWS.
+/// ONE READING, TWO WINDOWS: what the harness did since `today_ms` (each session's share kept)
+/// and since `week_ms`, reading each file at most once.
 #[must_use]
 pub fn stats_windows(
     state_dir: &Path,

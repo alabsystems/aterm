@@ -19,7 +19,6 @@ fn roles(p: &PromptV2) -> Vec<Role> {
     p.options.iter().map(|o| o.role).collect()
 }
 
-/// Replace the first row in `rows` starting with `head` with `with`.
 fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
     let at = rows
         .iter()
@@ -30,7 +29,6 @@ fn edited(rows: &[String], head: &str, with: &str) -> Vec<String> {
     out
 }
 
-/// Load all Muse Code fixture captures under `src/fixtures/`.
 fn captures() -> Vec<(String, String)> {
     crate::text::fixture_files()
         .into_iter()
@@ -38,7 +36,6 @@ fn captures() -> Vec<(String, String)> {
         .collect()
 }
 
-/// A fresh session at an empty composer is idle with evidence.
 #[test]
 fn a_fresh_session_is_idle_at_its_composer() {
     let r = muse(IDLE);
@@ -54,7 +51,6 @@ fn a_fresh_session_is_idle_at_its_composer() {
     assert_eq!(busy.composer.map(|(_, l)| l), Some(vec![String::new()]));
 }
 
-/// Status rows (`◇`/`◈`/`◆` Thinking/Working) over an open composer classify as busy.
 #[test]
 fn the_status_row_is_busy() {
     for text in [BUSY, BUSY_ALT_GLYPH] {
@@ -81,7 +77,6 @@ fn the_status_row_is_busy() {
     assert_eq!(phase(&ended), (Phase::Idle, true), "the control");
 }
 
-/// A turn ending on a `◆` reply classifies as idle with the reply as last words.
 #[test]
 fn a_turn_ends_on_its_reply() {
     let r = muse(END_OF_TURN);
@@ -101,7 +96,6 @@ fn a_turn_ends_on_its_reply() {
     assert_eq!(said_tail(&unknown), None);
 }
 
-/// Unsent text in the composer is read as the draft while remaining idle.
 #[test]
 fn an_unsent_draft_is_the_composers() {
     let r = muse(DRAFT);
@@ -116,7 +110,6 @@ fn an_unsent_draft_is_the_composers() {
     );
 }
 
-/// A retracted turn returning text to the composer reads as an ended turn with a draft.
 #[test]
 fn a_retracted_turn_is_a_draft_no_reader_can_tell_from_a_typed_one() {
     let r = muse(INTERRUPTED);
@@ -133,7 +126,6 @@ fn a_retracted_turn_is_a_draft_no_reader_can_tell_from_a_typed_one() {
     assert_eq!(typed, screen(INTERRUPTED), "the same screen");
 }
 
-/// The `/` command menu between the caret row and bottom rule is excluded from the draft.
 #[test]
 fn the_command_menu_is_not_the_draft() {
     let r = muse(SLASH_MENU);
@@ -156,7 +148,6 @@ fn the_command_menu_is_not_the_draft() {
     assert!(lines[2].starts_with("/bug"), "{lines:?}");
 }
 
-/// One `Ctrl-C` at an empty composer stays idle; after exit, no Muse screen is identified.
 #[test]
 fn one_ctrl_c_is_still_idle_and_an_exited_muse_is_read_as_nothing() {
     let r = muse(EXIT_CONFIRM);
@@ -172,7 +163,6 @@ fn one_ctrl_c_is_still_idle_and_an_exited_muse_is_read_as_nothing() {
     assert_eq!(phase(&footer), phase(&idle), "the control");
 }
 
-/// The folder trust box parses as a trust prompt selected with arrows and Enter.
 #[test]
 fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     let r = muse(BOX_TRUST);
@@ -193,7 +183,6 @@ fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     assert_eq!(ClaudeReader.prompt(&screen(BOX_TRUST)), None, "the control");
 }
 
-/// The signed-out login menu classifies as an auth wall, not an interactive box.
 #[test]
 fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     let rows = screen(SIGNED_OUT);
@@ -213,7 +202,6 @@ fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     assert_eq!(phase(&keyless), (Phase::Idle, false));
 }
 
-/// Other agent readers claim no box or question on Muse Code captures.
 #[test]
 fn the_other_readers_see_no_box_and_no_question_on_muse_screens() {
     let mut boxes = 0;
@@ -245,7 +233,6 @@ fn the_other_readers_see_no_box_and_no_question_on_muse_screens() {
     }
 }
 
-/// Foreground process name takes precedence when a shell or viewer displays Muse output.
 #[test]
 fn a_shell_quoting_muse_is_not_muse() {
     let r = screen(END_OF_TURN);
@@ -284,7 +271,6 @@ fn a_shell_quoting_muse_is_not_muse() {
     assert_eq!(identify(None, &quoted).program(), Program::Generic);
 }
 
-/// Muse layout detection and box/wall readers reject captures from other agents.
 #[test]
 fn the_muse_sniff_claims_no_other_programs_screen() {
     let mut swept = 0;
@@ -312,7 +298,6 @@ fn the_muse_sniff_claims_no_other_programs_screen() {
     assert!(swept > 150, "only {swept} other captures");
 }
 
-/// Summary tuple comparing screen phase, evidence, freshness, roles, composer rows, and last words.
 type Shape = (Phase, bool, bool, Option<Vec<Role>>, Option<usize>, bool);
 
 fn shape(text: &str) -> Shape {
@@ -327,7 +312,6 @@ fn shape(text: &str) -> Shape {
     )
 }
 
-/// Captures of equivalent shapes across Muse 1.4.9 and 1.4.10 produce identical [`Shape`]s.
 #[test]
 fn the_1_4_9_screens_read_the_same_on_1_4_10() {
     for (old, new) in [
@@ -356,7 +340,6 @@ fn the_1_4_9_screens_read_the_same_on_1_4_10() {
     assert_eq!(p.path.as_deref(), Some("/private/tmp/at.lab0/proj"));
 }
 
-/// The shell approval box parses as a Bash prompt with one-shot allow and refusal roles.
 #[test]
 fn the_shell_box_is_a_bash_prompt_chosen_by_the_cursor_and_enter() {
     let r = muse(BOX_SHELL);
@@ -420,7 +403,6 @@ fn the_shell_box_is_a_bash_prompt_chosen_by_the_cursor_and_enter() {
     assert_eq!(phase(&ruled), (Phase::Prompt, true));
 }
 
-/// The file-access approval box parses as a write prompt for its target path.
 #[test]
 fn the_file_access_box_is_a_write_of_its_path() {
     for text in [BOX_WRITE, BOX_EDIT] {
@@ -459,7 +441,6 @@ fn the_file_access_box_is_a_write_of_its_path() {
     }
 }
 
-/// Session-scoped and persistent `Yes` options map to [`Role::Session`] and [`Role::Persist`].
 #[test]
 fn any_other_yes_is_a_standing_grant() {
     let rows = screen(BOX_SHELL);
@@ -494,7 +475,6 @@ fn any_other_yes_is_a_standing_grant() {
     );
 }
 
-/// Answered shell and file boxes end the turn on the subsequent model reply.
 #[test]
 fn an_answered_box_ends_the_turn_on_the_reply() {
     for text in [
@@ -529,7 +509,6 @@ fn an_answered_box_ends_the_turn_on_the_reply() {
     assert_eq!(said_tail(&tool_row_last), None, "the control");
 }
 
-/// A turn ending on an indented `Read <path>` row with no reply classifies as idle with no words.
 #[test]
 fn a_turn_ended_on_its_read_row_is_over_with_no_words() {
     const READ: &str = "  Read README.md";
@@ -575,7 +554,6 @@ fn a_turn_ended_on_its_read_row_is_over_with_no_words() {
     assert_eq!(said_tail(&glued), None);
 }
 
-/// Turns ending on any measured Muse tool row with no reply classify as idle with no words.
 #[test]
 fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
     for (name, text, row) in [
@@ -669,9 +647,6 @@ fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
     bare.retain(|r| !r.starts_with("◆ Read memory"));
     assert!(bare.iter().any(|r| r == "└ memory file not found"));
     assert_eq!(phase(&bare), (Phase::Idle, false), "a branch alone");
-    // A shell call that ran (Muse Code's sandbox off) draws its row with no branch under it;
-    // the same place holding a reply is the agent's words, a reply that opens with `Ran `
-    // included, and so is a shell row cut before its duration.
     for text in [TOOL_ROW_BASH_RAN, TOOL_ROW_BASH_RAN_DESCRIBED] {
         for said in [
             "Counted the README's lines: one.",
@@ -687,7 +662,6 @@ fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
     }
 }
 
-/// The bare `◇ Thinking` first frame before timer text appears classifies as a running turn.
 #[test]
 fn the_status_rows_first_frame_is_a_turn_running() {
     let rows = screen(BUSY_FIRST_FRAME);
@@ -727,7 +701,6 @@ fn the_status_rows_first_frame_is_a_turn_running() {
     );
 }
 
-/// Model replies whose prose starts with a tool-head verb (`Wrote`, `Edited`) remain last words.
 #[test]
 fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -792,7 +765,6 @@ fn a_sentence_that_opens_like_a_tool_row_is_the_agents_words() {
     }
 }
 
-/// Model replies naming a file followed by prose after a tool verb remain agent words.
 #[test]
 fn a_reply_naming_a_file_after_a_tool_head_is_the_agents_words() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -859,7 +831,6 @@ fn a_reply_naming_a_file_after_a_tool_head_is_the_agents_words() {
     }
 }
 
-/// Muse tool rows over a column-0 `└ ` outcome branch carry no agent words.
 #[test]
 fn muse_codes_own_row_over_its_outcome_branch_is_no_words() {
     let measured = [
@@ -943,7 +914,6 @@ fn muse_codes_own_row_over_its_outcome_branch_is_no_words() {
     assert_eq!(said_tail(&stray), None);
 }
 
-/// Structured questions over an open composer parse option roles, recommendation suffix, and free-text row.
 #[test]
 fn the_question_is_a_prompt_answered_by_the_cursor_and_enter() {
     for (text, focus) in [(QUESTION, 1), (QUESTION_DOWN, 2), (QUESTION_NONE, 3)] {
@@ -1007,7 +977,6 @@ fn the_question_is_a_prompt_answered_by_the_cursor_and_enter() {
     assert!(roles(&p).iter().all(|&r| r == Role::Other));
 }
 
-/// Questions in narrow (60- and 72-column) tabs unwrap multi-line key rows and strip descriptions.
 #[test]
 fn the_question_in_a_narrow_tab_is_the_same_question() {
     let crimson = "Crimson red, the warm and loud one (Recommended)";
@@ -1072,7 +1041,6 @@ fn the_question_in_a_narrow_tab_is_the_same_question() {
     assert_eq!(prompt(&split), None, "the control");
 }
 
-/// Questions without a `(Recommended)` suffix mark no option as recommended.
 #[test]
 fn a_question_with_no_suffix_recommends_nothing() {
     let rows = screen(QUESTION);
@@ -1090,7 +1058,6 @@ fn a_question_with_no_suffix_recommends_nothing() {
     );
 }
 
-/// Answered structured questions leave no active box and end idle on the reply.
 #[test]
 fn an_answered_question_is_no_box() {
     for (text, answer) in [
@@ -1113,7 +1080,6 @@ fn an_answered_question_is_no_box() {
     assert_eq!(muse(QUESTION).phase, Phase::Prompt, "the control");
 }
 
-/// Rejected `META_API_KEY` notices classify as [`WallKind::Auth`].
 #[test]
 fn a_refused_key_is_an_auth_wall() {
     let r = muse(KEY_REJECTED);
@@ -1150,7 +1116,6 @@ fn a_refused_key_is_an_auth_wall() {
     assert!(said_tail(&quoted).is_some());
 }
 
-/// Model API 429 and 500 failure rows classify as retryable walls.
 #[test]
 fn a_failed_model_call_is_an_api_wall() {
     let api = |code, retryable| WallKind::ApiError {
@@ -1197,7 +1162,6 @@ fn a_failed_model_call_is_an_api_wall() {
     assert_eq!(phase(&quoted), (Phase::Idle, true));
 }
 
-/// Usage-limit notices parse [`WallKind::Limit`] and extract the wrapped reset time.
 #[test]
 fn the_usage_wall_is_limited_until_its_reset() {
     let r = muse(USAGE_WALL);
@@ -1242,7 +1206,6 @@ fn the_usage_wall_is_limited_until_its_reset() {
     );
 }
 
-/// Local `/rules` output blocks below a wall notice do not corrupt the wall message or reset time.
 #[test]
 fn a_local_commands_rows_under_a_wall_are_no_part_of_its_notice() {
     const NOTICE: &str = "Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for increased limits, or wait for usage to reset at 3:34 AM";
@@ -1330,7 +1293,6 @@ fn a_local_commands_rows_under_a_wall_are_no_part_of_its_notice() {
     );
 }
 
-/// In-progress retry rows under a status line classify as busy with [`retrying`] metadata.
 #[test]
 fn a_retried_request_is_a_running_turn_and_no_wall() {
     for (text, want) in [
@@ -1368,7 +1330,6 @@ fn a_retried_request_is_a_running_turn_and_no_wall() {
     assert_eq!(retrying(&screen(BUSY_1_4_10)), None, "the control");
 }
 
-/// Turns stopped with `Esc` on `◆ Interrupted` classify as interrupted with no last words.
 #[test]
 fn a_model_turn_stopped_with_esc_is_interrupted() {
     let r = muse(INTERRUPTED_1_4_10);
@@ -1396,7 +1357,6 @@ fn a_model_turn_stopped_with_esc_is_interrupted() {
     }
 }
 
-/// `/usage` and `/status` cards below an ended turn leave the reply as last words.
 #[test]
 fn a_card_under_a_turns_end_is_no_part_of_it() {
     for text in [USAGE_CARD, STATUS_CARD] {
@@ -1418,7 +1378,6 @@ fn a_card_under_a_turns_end_is_no_part_of_it() {
     assert_eq!(phase(&replyless), (Phase::Idle, false), "the control");
 }
 
-/// Signed-in `/status` and `/usage` cards extract the account, billing tier, and weekly quota.
 #[test]
 fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
     let rows = screen(USAGE_SIGNED_IN);
@@ -1487,7 +1446,6 @@ fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
     }
 }
 
-/// Only the resting `Voice input` top-rule label matches the idle voice label.
 #[test]
 fn the_top_rule_at_rest_is_the_idle_voice_label() {
     let rows = screen(IDLE);
@@ -1505,7 +1463,6 @@ fn the_top_rule_at_rest_is_the_idle_voice_label() {
     }
 }
 
-/// Narrow panes down to 26 columns still recognize the composer frame despite truncated top-rule labels.
 #[test]
 fn a_narrow_panes_composer_is_read_whatever_its_label_leaves() {
     let frames = crate::prompt::fixtures::reflow_frames(IDLE_NARROW);
@@ -1551,7 +1508,6 @@ fn a_narrow_panes_composer_is_read_whatever_its_label_leaves() {
     }
 }
 
-/// `/status` cards that scroll a prior turn out of sight still classify as an ended turn at rest.
 #[test]
 fn cards_alone_above_the_open_composer_are_a_session_at_rest() {
     let r = muse(USAGE_WALL_STATUS_CARDS);
@@ -1642,7 +1598,6 @@ fn cards_alone_above_the_open_composer_are_a_session_at_rest() {
     assert_eq!(phase(&bare), (Phase::Idle, false), "blank rows alone");
 }
 
-/// `/status` (`IDLE`) and `/usage` (`Turns 0`) cards on a fresh session preserve `fresh` state.
 #[test]
 fn a_fresh_sessions_cards_alone_are_no_turn_yet() {
     let rows = screen(FRESH_STATUS_CARDS);
@@ -1790,7 +1745,6 @@ fn a_fresh_sessions_cards_alone_are_no_turn_yet() {
     }
 }
 
-/// Every unanswered box or question capture classifies as a prompt rather than idle.
 #[test]
 fn no_screen_with_a_box_reads_idle() {
     let persons = [
@@ -1837,7 +1791,6 @@ fn no_screen_with_a_box_reads_idle() {
     assert_eq!((up, roleless, after), (58, 21, 18));
 }
 
-/// The trust box exposes no composer caret row for typed text.
 #[test]
 fn the_trust_box_has_no_composer_to_type_into() {
     for text in [BOX_TRUST, TRUST_1_4_10] {
@@ -1852,7 +1805,6 @@ fn the_trust_box_has_no_composer_to_type_into() {
     assert!(muse(IDLE_1_4_10).composer.is_some(), "the control");
 }
 
-/// Multi-stage pipeline shell boxes keep the full command and move `Stage` lines into notes.
 #[test]
 fn the_staged_shell_box_is_a_bash_prompt_of_its_whole_command() {
     let r = muse(BOX_SHELL_STAGE);
@@ -1900,7 +1852,6 @@ fn the_staged_shell_box_is_a_bash_prompt_of_its_whole_command() {
     assert_eq!(p.notes.len(), 2);
 }
 
-/// Wrapped file-access paths and shell commands in 60-column boxes are reconstructed whole.
 #[test]
 fn a_box_whose_body_wraps_is_read_whole() {
     let r = muse(BOX_WRITE_WRAPPED);
@@ -1960,7 +1911,6 @@ fn a_box_whose_body_wraps_is_read_whole() {
     assert_eq!(roles(&p), vec![Role::Once, Role::Deny]);
 }
 
-/// `◆ Recap:` and `◆ Worked for` rows neither become last words nor hide an earlier reply.
 #[test]
 fn an_away_recap_is_no_part_of_the_turn() {
     let worked = muse(END_OF_TURN_WORKED_RECAP);
@@ -2013,7 +1963,6 @@ fn an_away_recap_is_no_part_of_the_turn() {
     assert_eq!(said_tail(&alone), None);
 }
 
-/// Multi-line wrapped drafts and embedded newlines in the composer are read whole.
 #[test]
 fn a_long_draft_and_a_burst_enter_are_read_whole() {
     let typed = "keep going. Standing rules: never push to main without the merge contract \
@@ -2041,7 +1990,6 @@ fn a_long_draft_and_a_burst_enter_are_read_whole() {
     );
 }
 
-/// Auth key walls report Muse Code's specific remedy clause.
 #[test]
 fn each_key_wall_names_muse_codes_own_remedy() {
     let wall = |text: &str| muse(text).wall.expect("a wall").message;
@@ -2062,7 +2010,6 @@ fn each_key_wall_names_muse_codes_own_remedy() {
     }
 }
 
-/// Insert `with` before the first row in `rows` starting with `at`.
 fn inserted(rows: &[String], at: &str, with: &[&str]) -> Vec<String> {
     let k = rows
         .iter()
@@ -2074,7 +2021,6 @@ fn inserted(rows: &[String], at: &str, with: &[&str]) -> Vec<String> {
     out
 }
 
-/// Open drawers and pickers suppress composer detection and classify as a prompt with no box.
 #[test]
 fn a_drawer_holds_the_composer() {
     let rows = screen(END_OF_TURN);
@@ -2118,7 +2064,6 @@ fn a_drawer_holds_the_composer() {
     }
 }
 
-/// `Side Chat` frames expose no main conversation composer while still identifying Muse Code.
 #[test]
 fn the_side_chat_is_no_composer_and_every_label_names_muse() {
     let rows = screen(END_OF_TURN);
@@ -2155,7 +2100,6 @@ fn the_side_chat_is_no_composer_and_every_label_names_muse() {
     assert_eq!(composer(&rows), Some(top + 1), "the control");
 }
 
-/// Credentials and quota turn-failure strings classify as walls; configuration faults have no evidence.
 #[test]
 fn a_turn_failure_is_a_wall_or_no_evidence() {
     let rows = screen(END_OF_TURN);
@@ -2196,7 +2140,6 @@ fn a_turn_failure_is_a_wall_or_no_evidence() {
     );
 }
 
-/// Background completion and message notices below a reply are excluded from last words.
 #[test]
 fn background_notices_are_no_replys_words() {
     let rows = screen(END_OF_TURN);
@@ -2229,7 +2172,6 @@ fn background_notices_are_no_replys_words() {
     }
 }
 
-/// Replies taller than the viewport whose `◆` head scrolled off still read visible lines as last words.
 #[test]
 fn a_reply_taller_than_the_screen_is_read_by_its_rows_in_sight() {
     let rows = screen(END_OF_TURN);
@@ -2261,7 +2203,6 @@ fn a_reply_taller_than_the_screen_is_read_by_its_rows_in_sight() {
     );
 }
 
-/// Relaunched Muse sessions in an existing tab bound their live zone below the newest banner.
 #[test]
 fn a_relaunched_session_is_fresh_under_its_new_banner() {
     let rows = screen(IDLE_RELAUNCHED);
@@ -2395,7 +2336,6 @@ fn a_relaunched_session_is_fresh_under_its_new_banner() {
     );
 }
 
-/// A box caught mid-draw before its title row appears is not yet reported as a box.
 #[test]
 fn a_box_caught_mid_draw_is_no_box_yet() {
     let rows = screen(BOX_COMMAND);
@@ -2414,7 +2354,6 @@ fn a_box_caught_mid_draw_is_no_box_yet() {
     assert!(prompt(&rows[first - 1..]).is_some_and(|p| p.head_off_screen));
 }
 
-/// Multi-question flows (`1 of 2`) and their review screen assign no automated answer roles.
 #[test]
 fn several_questions_and_their_review_are_a_persons() {
     for text in [BOX_QUESTION_1_OF_2, BOX_QUESTION_REVIEW] {
@@ -2461,14 +2400,12 @@ fn several_questions_and_their_review_are_a_persons() {
     );
 }
 
-/// Long-term question policy prompt text injected into a question note.
 const LONG_TERM: &str = "Decide yourself: choose the option that best serves long term \
                          correctness and total value even at the cost of short term \
                          deliverables. Say which you chose and why in one line and continue \
                          without asking again. (Answered by the aterm harness by policy. The \
                          user was not asked.)";
 
-/// Network approval boxes extract the full URL or requesting command and map allow/refuse roles.
 #[test]
 fn the_network_box_is_a_network_request_of_its_url() {
     for (text, url) in [
@@ -2552,7 +2489,6 @@ fn the_network_box_is_a_network_request_of_its_url() {
     }
 }
 
-/// MCP tool-action approval boxes extract `tool action: <tool>` and map allow/refuse roles.
 #[test]
 fn the_tool_action_box_is_a_tool_call_of_its_tool() {
     for (text, tool, focus) in [
@@ -2639,7 +2575,6 @@ fn the_tool_action_box_is_a_tool_call_of_its_tool() {
     }
 }
 
-/// Unix-socket approval boxes assign no automated allow roles and map `Esc` to `Reject`.
 #[test]
 fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
     for (text, focus) in [
@@ -2719,7 +2654,6 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
     }
 }
 
-/// The background-work panel between the bottom rule and footer does not obscure the composer or boxes.
 #[test]
 fn the_work_panel_under_the_composer_is_no_part_of_it() {
     for (text, phase) in [
@@ -2757,7 +2691,6 @@ fn the_work_panel_under_the_composer_is_no_part_of_it() {
     }
 }
 
-/// Sample 144-column panel branch line for a finished background shell.
 fn finished_branch() -> String {
     format!(
         "└ ◆ Q3 background wait  ran 1s, exit 0{}1m 40s",
@@ -2765,7 +2698,6 @@ fn finished_branch() -> String {
     )
 }
 
-/// Running shells and watching monitors in the work panel keep an ended turn busy via [`background_wait`].
 #[test]
 fn the_panels_running_work_is_the_agents_own() {
     for text in [
@@ -2878,7 +2810,6 @@ fn the_panels_running_work_is_the_agents_own() {
     assert_eq!(muse(END_OF_TURN_1_4_10).phase, Phase::Idle);
 }
 
-/// API error and usage-limit walls take precedence over running background work in the panel.
 #[test]
 fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
     let splice = |text: &str| -> Vec<String> {
@@ -2921,7 +2852,6 @@ fn a_wall_the_turn_ended_on_stands_over_the_background_work() {
     );
 }
 
-/// A running shell branch above a monitor branch still holds a trailing question, while faults stay unvouched.
 #[test]
 fn a_shell_over_a_monitor_holds_the_question_and_a_fault_is_no_evidence_over_work() {
     let rows = screen(END_OF_TURN_BG_RUNNING);
@@ -2982,7 +2912,6 @@ fn a_shell_over_a_monitor_holds_the_question_and_a_fault_is_no_evidence_over_wor
     assert_eq!(phase(&plain), (Phase::Idle, false), "the control");
 }
 
-/// The `(↓ to view terminals)` pointer below a reply is excluded from the reply's last words.
 #[test]
 fn the_panels_pointer_under_a_reply_is_no_part_of_it() {
     let r = muse(END_OF_TURN_WORK_HINT);
@@ -3039,7 +2968,6 @@ fn the_panels_pointer_under_a_reply_is_no_part_of_it() {
     );
 }
 
-/// Digit and `y` keys immediately answer approval boxes but only move the cursor on questions.
 #[test]
 fn digits_and_y_answer_a_box_at_once_and_move_a_questions_cursor() {
     for (text, command, refused_above) in [
@@ -3099,7 +3027,6 @@ fn digits_and_y_answer_a_box_at_once_and_move_a_questions_cursor() {
     }
 }
 
-/// Multi-question (`1 of 2`) and multi-select (`[ ]`) screens parse as questions with no automated roles.
 #[test]
 fn several_questions_and_a_multi_select_are_questions_of_no_roles() {
     for (text, position) in [
@@ -3157,7 +3084,6 @@ fn several_questions_and_a_multi_select_are_questions_of_no_roles() {
     );
 }
 
-/// The `Review answers before submit` screen parses via [`is_review`] with no option roles.
 #[test]
 fn the_review_is_a_question_of_no_roles_whose_esc_goes_back() {
     for (text, answers, at) in [
@@ -3244,7 +3170,6 @@ fn the_review_is_a_question_of_no_roles_whose_esc_goes_back() {
     }
 }
 
-/// Question `Note (optional):` fields are read whole by [`question_notes`] without polluting option labels.
 #[test]
 fn the_note_is_read_whole_and_esc_or_tab_clears_it() {
     for (text, note) in [
@@ -3276,7 +3201,6 @@ fn the_note_is_read_whole_and_esc_or_tab_clears_it() {
     }
 }
 
-/// Meta account billing and setup walls classify as [`WallKind::Auth`] with remedies.
 #[test]
 fn a_meta_accounts_walls_are_sign_in_walls() {
     let rows = screen(KEY_REJECTED);
@@ -3307,7 +3231,6 @@ fn a_meta_accounts_walls_are_sign_in_walls() {
     }
 }
 
-/// Resumed sessions displaying an abnormal-end warning above the empty composer classify as idle.
 #[test]
 fn a_resumed_session_reads_idle_under_its_abnormal_end_warning() {
     let rows = screen(RESUMED_AFTER_CRASH);
@@ -3337,7 +3260,6 @@ fn a_resumed_session_reads_idle_under_its_abnormal_end_warning() {
     assert!(tail.ends_with("resumed\ncleanly."), "{tail}");
 }
 
-/// [`said_whole`] is false when a reply's `◆` head has scrolled above the visible rows.
 #[test]
 fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -3361,7 +3283,6 @@ fn a_reply_whose_head_scrolled_away_is_no_whole_reply() {
     assert!(said_tail(&drawn).is_some_and(|t| t.starts_with("NEEDS YOU: the signing")));
 }
 
-/// [`turn_said_before`] collects `◆` replies above a tool row within the current turn.
 #[test]
 fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -3412,7 +3333,6 @@ fn a_need_said_before_a_tool_call_is_read_with_the_turn() {
     assert!(turn_whole(&plain) && said_tail(&plain).is_some());
 }
 
-/// [`turn_opened_by`] reads the user message text from the turn's opening `❯` row.
 #[test]
 fn the_message_that_opened_the_turn_is_read_off_its_row() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -3440,16 +3360,6 @@ fn the_message_that_opened_the_turn_is_read_off_its_row() {
     assert_eq!(turn_opened_by(&cut), None);
 }
 
-/// Muse Code's `◆` tool rows that draw no outcome branch are no words of the agent's (I3 of
-/// `docs/measured/idle-no-evidence-2026-10-22.md`): every `◆ Fetched <url> — denied`, `◆
-/// Fetched <url> — 404` and `◆ Invalid work ID — rejected · ctrl+o` the captures measured is a
-/// tool row, and a turn ended on one said no words. NEGATIVE CONTROLS, the agent's words: a reply
-/// that opens with either head and goes on; `Fetched` and a word, not a URL (`Fetched both.`,
-/// a regression of the first grammar, which took any token); a `Fetched <url>` row with lines
-/// under it, its `NEEDS YOU:` and `Nothing left:` read; three characters not digits as a status;
-/// a status after `Invalid work ID` or `Wrote`. MUTANTS: without [`bare_tool_row`] the measured
-/// rows are words; any token for the URL, or a bare row with lines under it, drops the words;
-/// any three characters as a status; a status on `Invalid work ID` or on every head.
 #[test]
 fn muse_codes_unbranched_tool_rows_are_no_words_of_the_agents() {
     let rows = screen(END_OF_TURN_1_4_10);
@@ -3479,7 +3389,6 @@ fn muse_codes_unbranched_tool_rows_are_no_words_of_the_agents() {
             "measured: {measured:#?}"
         );
     }
-    // NEGATIVE CONTROLS: the agent's words.
     for said in [
         "Fetched the page; the parser is done.",
         "Fetched http://127.0.0.1:50581/lab-probe — denied, so I stopped there.",
@@ -3501,8 +3410,6 @@ fn muse_codes_unbranched_tool_rows_are_no_words_of_the_agents() {
             "{said}"
         );
     }
-    // A reply whose first line reads like the row, with its words under it (the review's live
-    // screen, `rv`: `◆ Fetched both.` over `NEEDS YOU:` and `Nothing left:`).
     for first in ["Fetched both.", "Fetched https://example.com/spec."] {
         let mut ended = edited(&rows, reply, &format!("◆ {first}"));
         let at = ended
@@ -3534,17 +3441,6 @@ fn muse_codes_unbranched_tool_rows_are_no_words_of_the_agents() {
     }
 }
 
-/// THE NEXT PROMPT QUEUED UNDER A REPLY IS NO PART OF THE TURN, AND THE RUN IT STEERS GOES ON
-/// (`docs/measured/idle-no-evidence-2026-10-22.md` I4). Measured live
-/// ([`fixtures::QUEUED_INPUT`]): the reply drawn whole, `◆ Queued input · ↑ to edit` over the
-/// prompt's branch under it, and the footer's right `steering the running turn`. The run has
-/// not ended (Muse Code drains the queue when it does), so the screen reads busy; and the reply
-/// is the turn's end once the footer rests, its last line named. Before, the queued block was
-/// the turn's last (a branched `◆` row: Muse Code's own) and the screen idle as evidence with
-/// no words: 26 of 33 harness points at such ends said `-`. NEGATIVE CONTROLS: the footer at
-/// rest, its words mid-row, or `no active run` is no run going on; a reply that opens `Queued
-/// input` and goes on is the agent's words. MUTANTS: without the queued literal in
-/// [`is_own_row_head`] the end names no words; without [`steering`] the screen reads idle.
 #[test]
 fn a_queued_prompt_is_no_part_of_the_turn_and_its_run_goes_on() {
     let rows = screen(QUEUED_INPUT);
@@ -3582,7 +3478,6 @@ fn a_queued_prompt_is_no_part_of_the_turn_and_its_run_goes_on() {
     ] {
         assert_eq!(phase(&at_rest(said)).0 == Phase::Busy, runs, "{said}");
     }
-    // NEGATIVE CONTROL: a reply that opens like the row is the agent's words.
     let mut reply = at_rest("");
     let q = reply
         .iter()
@@ -3596,13 +3491,6 @@ fn a_queued_prompt_is_no_part_of_the_turn_and_its_run_goes_on() {
     );
 }
 
-/// MUSE CODE'S TITLE SAYS WHETHER A RUN IS ACTIVE (`docs/measured/idle-no-evidence-2026-10-22.md`
-/// I2). MEASURED (the casts of that note: the lab's `ie-m1` and the half-drawn-frame lab's
-/// `mu3-*`): `⠙ proj` and the spinner's other frames every 0.1 s from the status row's first
-/// frame to the run's `terminal`, through its end-of-turn review; `proj` at rest. NEGATIVE
-/// CONTROLS: another braille glyph, the glyph with no blank, the glyph after the words, Claude
-/// Code's resting `✳`, an empty title. MUTANT: a spinner of any braille glyph reads `⠿ proj`
-/// as running.
 #[test]
 fn muse_codes_title_says_whether_its_run_is_active() {
     let spinner = anchor_text("muse.title.spinner");
@@ -3623,7 +3511,6 @@ fn muse_codes_title_says_whether_its_run_is_active() {
     }
     assert_eq!(MuseReader.title_runs("⠙ proj"), Some(true));
     assert_eq!(MuseReader.title_runs("proj"), Some(false));
-    // No other reader has a measured reading of its program's title.
     for p in Program::ALL {
         if p != Program::Muse {
             assert_eq!(p.reader().title_runs("⠙ proj"), None, "{}", p.name());
@@ -3631,11 +3518,6 @@ fn muse_codes_title_says_whether_its_run_is_active() {
     }
 }
 
-/// THE STATUS ROW STILL BARE AFTER ITS GLYPH CYCLED reads idle with NO evidence (measured under
-/// three tabs, [`fixtures::BUSY_FIRST_FRAME_CYCLED`], 0.022 s): the supervisor's general guard
-/// (`docs/measured/idle-no-evidence-2026-10-22.md` I1) holds such a read until the screen holds
-/// still, and this fixture is its measured case. NEGATIVE CONTROL: the same frame with the
-/// cycle's first glyph is the first frame's anchor, busy as evidence.
 #[test]
 fn the_bare_status_row_after_its_glyph_cycled_is_idle_with_no_evidence() {
     let rows = screen(BUSY_FIRST_FRAME_CYCLED);

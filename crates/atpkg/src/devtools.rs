@@ -922,7 +922,7 @@ fn prime() -> Result<(), String> {
         let token = aterm_uds::rand::hex_token::<8>().map_err(|e| format!("no name: {e}"))?;
         let dir = std::env::temp_dir().join(format!("aterm-devtools-prime-{token}"));
         crate::prereq::private_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let _remove = crate::prereq::RemoveOnDrop(&dir);
+        let remove = crate::prereq::RemoveOnDrop(&dir);
         let name = format!("aterm-devtools-{token}");
         let program = dir.join(&name);
         std::fs::copy("/usr/bin/true", &program).map_err(|e| format!("copy: {e}"))?;
@@ -933,8 +933,25 @@ fn prime() -> Result<(), String> {
             "/usr/bin/codesign",
             &["--force", "--sign", "-", "--identifier", &name, program],
         )?;
-        let out = aterm_uds::deadline::output_until(&mut aterm_uds::spawnfd::command(program), by)
-            .map_err(|e| format!("{name}: {e}"))?;
+        let out = match aterm_uds::deadline::output_until(
+            &mut aterm_uds::spawnfd::command(program),
+            by,
+        ) {
+            // Its own exit shows it ran, so its directory may go.
+            Ok(out) if out.status.code().is_some() => out,
+            other => {
+                // Killed, signalled or unstarted: macOS may still be assessing its first exec.
+                std::mem::forget(remove);
+                let why = match other {
+                    Ok(out) => format!("ended by {}", out.status),
+                    Err(e) => e.to_string(),
+                };
+                return Err(format!(
+                    "{name}: {why}; kept {} since it never showed it ran",
+                    dir.display()
+                ));
+            }
+        };
         if out.status.success() {
             Ok(())
         } else {

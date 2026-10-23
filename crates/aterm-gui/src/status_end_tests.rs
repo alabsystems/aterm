@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT CAME DOWN, IN DONE FOR YOU (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4; the App's
-//! half of §11.4.5): a background session's end after 45 s of its agent's busy time is a Done for
-//! you row read off the real App (`App::status_session_row`, `Glance::build`), the menu-bar title
-//! is `❯•` and `chrome`'s `statusitem` line counts it (`done=1`); an act and a trail move leave the
-//! row and the glance's fingerprint as they were; the menu bar's Go marks the end seen and the row
-//! goes, and so does a worker's Read Result, whose one row the end shares; the glance owes a
-//! rebuild where the end marks, where a look quiets it and at a rename.
+//! Tests for `Done for you` status rows and menu-bar badge counts.
 
 use std::sync::Arc;
 
@@ -18,7 +12,6 @@ use crate::status_item::{DoneAt, Glance};
 
 const SEC: u64 = 1_000;
 
-/// Shut the test's host down on success and assertion unwind alike.
 struct TestHost(crate::harness_host::HostHandle);
 
 impl Drop for TestHost {
@@ -27,10 +20,6 @@ impl Drop for TestHost {
     }
 }
 
-/// An App whose session 0 runs Claude Code under Land, claimed by this
-/// host, in window 0's first tab with a second tab in front, and window 0
-/// looked at (the frontmost, on screen). Its sid, and the host to shut
-/// down. (`harness_end_tests`' desk, the background case.)
 fn desk() -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = TestHost(crate::harness_host::HostHandle::for_supervised_test(
@@ -66,7 +55,6 @@ fn desk() -> (App, String, TestHost) {
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
-/// The agent word the status sweep publishes for session 0.
 fn publish(app: &App, word: &'static str) -> bool {
     app.pool
         .get(0)
@@ -87,9 +75,6 @@ fn publish(app: &App, word: &'static str) -> bool {
         )
 }
 
-/// Session 0's task opens, its agent works `ms` on the ledger clock (moved
-/// on, not waited), and its loop tells landed (Land's end; Cruise never
-/// ends): an end where `ms` is past the floor.
 fn end_after(app: &mut App, sid: &str, ms: u64) {
     tell(app, sid, Some(TaskFace::Open));
     assert!(publish(app, "busy"), "busy published");
@@ -100,13 +85,10 @@ fn end_after(app: &mut App, sid: &str, ms: u64) {
     tell(app, sid, Some(TaskFace::Landed));
 }
 
-/// Session `sid`'s loop tells `face` through the host's wake.
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
 
-/// Session 0's SESSIONS row's state line on Settings ▸ Harness: the words
-/// the row must never carry (`last: …` once the trail has an act).
 fn state_line(app: &App) -> Option<String> {
     app.harness_state()
         .projection()
@@ -116,12 +98,6 @@ fn state_line(app: &App) -> Option<String> {
         .and_then(crate::harness_screen::HarnessSessionRow::state_line)
 }
 
-/// A BACKGROUND END IS A DONE FOR YOU ROW, AND `chrome` COUNTS IT (§11.4.1;
-/// §11.4.5 "Lab", read off the real App): the tab's label, `landed`, a Go to
-/// the session; the title `❯•`; `statusitem title=❯• … done=1`; the glance
-/// owes its rebuild. NEGATIVE CONTROL: the same end in the tab looked at is
-/// seen as it lands — no row, `done=0`, title `❯` — and 8 s of work is no
-/// end at all.
 #[test]
 fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
     let (mut app, sid, host) = desk();
@@ -182,13 +158,6 @@ fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
     drop(host);
 }
 
-/// NOTHING ON THE ROW GOES STALE (§11.4.3, item 3; §11.4.5 "Nothing stale";
-/// the review's R1): a glance is built with the end's row standing, then
-/// acts arrive and the trail moves — the row and the fingerprint are as
-/// they were, so nothing is handed over and nothing is redrawn. NEGATIVE
-/// CONTROL, in-test: the row's state line on Settings ▸ Harness moved with
-/// the act (`last: …`), so a row carrying those words changes its
-/// fingerprint — the defect R1 names.
 #[test]
 fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
     let (mut app, sid, host) = desk();
@@ -228,15 +197,6 @@ fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
     drop(host);
 }
 
-/// GO MARKS THE END SEEN AND THE ROW GOES (§11.4.3, item 4; §11.4.5 "Go"):
-/// the menu's click on the row — made from another app, with aterm's window
-/// behind it (a status item click never activates aterm), so the tab switch
-/// it makes is no look — resolved against the glance it was drawn from,
-/// raises the session, marks its end seen, and the next glance has no row,
-/// `done=0` and title `❯`; it owed that rebuild. NEGATIVE CONTROL (as run):
-/// main's `note_session_done_seen` alone, which never marks the end, leaves
-/// the row and fails this test. (Where the window is looked at, the switch
-/// is the look by the one rule, whatever Go marks.)
 #[test]
 fn go_marks_the_end_seen_and_the_row_goes() {
     let (mut app, sid, host) = desk();
@@ -275,16 +235,6 @@ fn go_marks_the_end_seen_and_the_row_goes() {
     drop(host);
 }
 
-/// READING A WORKER'S RESULT IS A LOOK AT ITS END (§11.4.3, item 2; §11.2.4
-/// "one `•` and one Done for you row"): a `ctl` worker under Land whose
-/// task is done with a result and whose landing stands unseen is ONE row, the
-/// task's Read Result. The menu's click on it — made from another app, with
-/// aterm's window behind it — opens the result, and the session has nothing
-/// left to look at: the next glance has no row (no Go row comes back for the
-/// end), `done=0`, title `❯`, the tab's `•` down, and the glance owed that
-/// rebuild. NEGATIVE CONTROL (as run, `controls/run.sh` `read-without-the-end`):
-/// main's `read_status_result`, which marks the task's done alone, leaves
-/// the end's Go row (`done=1`, `❯•`) and fails this test.
 #[test]
 fn reading_a_workers_result_is_a_look_at_its_end() {
     let (mut app, sid, host) = desk();
@@ -391,8 +341,6 @@ fn reading_a_workers_result_is_a_look_at_its_end() {
     drop(host);
 }
 
-/// A RENAME RENAMES THE ROW (§11.4.3, item 3): the glance is built again
-/// when the tab's title moves, and the row says the new name.
 #[test]
 fn a_rename_renames_the_end_row() {
     let (mut app, sid, host) = desk();

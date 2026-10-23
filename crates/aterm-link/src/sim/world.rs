@@ -71,7 +71,7 @@ pub(crate) enum Mutant {
     CommitBeforeDelivery,
     /// A drain peeks the outbox with a post still in flight, its answer not read first.
     PeekPastOwedPost,
-    /// Every read of an owed ack waits for it, as before aterm-0 (`Bridge::try_settle_one`).
+    /// Every read of an owed ack waits for it (`Bridge::try_settle_one`).
     WaitForEveryAck,
     /// At an idle moment the loop reads an owed post's answer only once it has arrived.
     IdlePostLeftToBackstop,
@@ -91,39 +91,21 @@ pub(crate) enum Mutant {
     KeyInThePinAlone,
     /// The total is read off the pin alone, as before `logfloor`.
     TotalInThePinAlone,
-    /// A bridge tells aterm what its start moved into the quarantine in place
-    /// of what the quarantine holds (`Bridge::tell_quarantine`, sim item S6):
-    /// a later boot that moves fewer understates what an earlier one left
-    /// there, and at 0 would end the owner's entry over bytes still held.
+    /// A bridge tells aterm what its start moved into the quarantine in place of what the quarantine holds (`Bridge::tell_quarantine`).
     TellMovedNotHeld,
-    /// An offset of ours below the self-lane window's oldest is added to it, as before sim item S7.
+    /// An offset of ours below the self-lane window's oldest is added to it.
     RememberBelowTheWindow,
-    /// A recovery step a write error stopped — the torn files' sweep, the
-    /// earlier boot's in-flight retirement, the pin's reconcile — is said and
-    /// survived, and `run` written after it all the same, as before sim item
-    /// S7 (`Bridge::recover`).
+    /// A recovery step stopped by a write error still writes `run` after it (`Bridge::recover`).
     BeginRunPastAFailedRecovery,
-    /// The mirror judges its pin at the hello, the recovery that reconciles
-    /// it complete or not, as before sim item S7
-    /// (`Bridge::mirror_hello_answered`): a torn pin stops the mirror for the
-    /// bridge's life, a rolled-back one counts below its floor.
+    /// The mirror judges its pin at the hello before recovery completes (`Bridge::mirror_hello_answered`).
     JudgePinBeforeRecovery,
-    /// An own record whose `acked` write or in-flight entry's unlink failed is
-    /// delivered with its entry standing, as before sim item S7
-    /// (`Bridge::settled_before_delivery`): a move that takes the record has
-    /// the next attach publish the entry again, a second copy in the
-    /// recipient's ring.
+    /// An own record whose `acked` write or in-flight entry's unlink failed is delivered with its entry standing (`Bridge::settled_before_delivery`).
     DeliverPastAStandingEntry,
-    /// The mirror's floor is trusted as it reads, as before sim item S7.
+    /// The mirror's floor is trusted as it reads.
     TrustTheFloorThatReads,
-    /// An attach that could not write the state dir's witness of the log —
-    /// a re-base onto a moved or replaced log, or a first witness where none
-    /// reads — goes on and delivers on it, as before sim item S7: the next
-    /// attach tells the endpoint the move from the older witness (or, with
-    /// none, a bare identity), and the endpoint forgets rows it holds — a
-    /// second delivery.
+    /// An attach that could not write the state dir's witness of the log goes on and delivers on it.
     AttachPastAnUnwrittenWitness,
-    /// An in-flight entry the attach published again is cleared as it lands, as before sim item S7.
+    /// An in-flight entry the attach published again is cleared as it lands.
     DeliverBeforeTheDrain,
     /// A bridge whose recovery after an unclean stop is owed stops its run cleanly all the same.
     CleanStopOverAnOwedRecovery,
@@ -155,7 +137,7 @@ pub(crate) struct Opts {
     pub(crate) torn_device: bool,
     /// The bus mirror: `[fabric] log = "turns"`, the sessions' logs mirrored onto their `ev` faces.
     pub(crate) mirror: bool,
-    /// Held acks (aterm-0): the broker answers some acks late.
+    /// Held acks: the broker answers some acks late.
     pub(crate) hold_acks: bool,
     /// A sibling under this node's id.
     pub(crate) sibling: bool,
@@ -163,7 +145,7 @@ pub(crate) struct Opts {
     pub(crate) race: bool,
     /// The sibling takes the current attach's incarnation.
     pub(crate) alias: bool,
-    /// WRITE errors (sim item S7, [`Device::arm_write_errors`]).
+    /// Write errors ([`Device::arm_write_errors`]).
     pub(crate) write_errors: bool,
     /// Aterm quits and comes back, in the same boot ([`World::quit`]).
     pub(crate) quits: bool,
@@ -457,7 +439,6 @@ impl World {
             });
         }
         if opts.hold_acks {
-            // A stream of its own, so the holds shift no other draw.
             broker.hold_acks(Rng::new(opts.seed ^ 0x0a0c_4e1d_ac45));
         }
         for p in [NODE, PEER, PERSON] {
@@ -532,12 +513,7 @@ impl World {
         w
     }
 
-    /// THE SIBLING ATTACHES ([`Opts::sibling`]), at its step of the fault
-    /// phase, at the incarnation above every one the node put anything on the
-    /// bus under, as its bridge takes it: its node row `live` and its session's
-    /// row, under the node's own producer id — a copy of the state dir's — at
-    /// sequences of that incarnation, flushed (as a broker's flush lands what
-    /// it holds) so no restart of the log takes them.
+    /// Attaches the sibling ([`Opts::sibling`]) at the next incarnation above the node's highest published incarnation.
     fn sibling_attaches(&mut self) {
         if self.sibling_inc.is_some() {
             return;
@@ -587,12 +563,7 @@ impl World {
         self.note(format!("sibling attaches inc={inc} {SIBLING_SID}"));
     }
 
-    /// THE SIBLING DIES ([`Opts::sibling`]): its connection ends, and its will
-    /// — `away` at its incarnation, at that incarnation's will sequence — fires
-    /// as the broker fires one: unless the node has put anything on the log
-    /// under a higher incarnation since, whose higher sequences FENCE it, and
-    /// then the sibling is gone with its rows still `live` and nobody to say
-    /// so.
+    /// Ends the sibling's connection ([`Opts::sibling`]) and fires its will unless fenced by a higher incarnation.
     fn sibling_dies(&mut self) {
         if self.sibling_dead {
             return;
@@ -1009,14 +980,7 @@ impl World {
         self.open_sessions();
     }
 
-    /// ATERM QUITS AND COMES BACK, in the same boot ([`Opts::quits`]): its
-    /// last word on the push lane — `EVENT * bye quit`, latched as the event
-    /// reader latches it — and the bridge's loop until it acknowledged it
-    /// (`link bye quit`, which the quitting instance waits for), or a few
-    /// passes; then the lanes close, and the bridge withdraws the sessions it
-    /// carries and stops its run cleanly ([`crate::state::StateDir::end_run_clean`])
-    /// — unless a kill armed earlier lands inside it, or the disk refuses one
-    /// of its writes, and `run` stays open.
+    /// Quits and restarts aterm in the same boot ([`Opts::quits`]).
     fn quit(&mut self) {
         let Some(live) = &self.live else {
             return;
@@ -1093,8 +1057,6 @@ impl World {
             menu.push((1, 20));
         }
         if self.opts.write_errors {
-            // The disk fills, or has room again (a full disk empties sooner
-            // than one with room fills).
             menu.push((if self.core.device.is_full() { 4 } else { 1 }, 19));
         }
         let total: u64 = menu.iter().map(|(w, _)| w).sum();
@@ -1342,14 +1304,7 @@ impl World {
         out
     }
 
-    /// THE RUNNING BRIDGE, AS THE BUS SHOWS IT, and what it must be able to
-    /// retire, by the contract (`adoptable`'s doc) and read off the BUS, never
-    /// asked of the bridge, so a bridge that narrows its own rule or loses its
-    /// bookkeeping is judged by the rule it was meant to keep: `(me,
-    /// witnessed)`, its own incarnation — this state dir's newest node row,
-    /// `live`, since every attach takes a fresh one — and the incarnation whose
-    /// WILL was the newest node row when that attach read the face, the row
-    /// just before its first.
+    /// The running bridge's `(me, witnessed)` incarnation pair read from the bus.
     fn running_bridge(&self) -> Option<(u64, Option<(u64, u64)>)> {
         self.live.as_ref()?;
         let rows = self.node_rows();
@@ -1528,11 +1483,7 @@ impl World {
         bad
     }
 
-    /// THE MIRROR NEVER STOPS FOR ITS PIN. Every atomic batch pin or send
-    /// has its durable copies on the media first — the alias key in
-    /// `logkey`, a floor at or above its total and its batch in `logfloor` —
-    /// while the first version fence (and each open's admission) is durable
-    /// before those copies.
+    /// Checks that the mirror never stopped for its pin.
     fn mirror_stopped_for_its_pin(&self) -> Option<String> {
         let n = lock(&self.ep.state).pin_stops;
         (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
@@ -2006,10 +1957,7 @@ fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
     bad
 }
 
-/// Worlds that may run at once in this process, one per two cores. A world's work is real file
-/// and socket traffic, so more worlds contend in the kernel instead of running: the crate's
-/// tests took the same 30-33 s with one world per core and with one per two cores, and spent
-/// 227 s and 144 s in the kernel (35 s and 226 s with every sweep's 4 workers unbounded).
+/// Worlds that may run at once in this process, one per two cores.
 static WORLD_SLOTS: LazyLock<(Mutex<usize>, Condvar)> = LazyLock::new(|| {
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     (Mutex::new((cores / 2).max(1)), Condvar::new())
@@ -2043,8 +1991,6 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     let _slot = WorldSlot::take();
     let mut w = World::new(opts.clone());
     if opts.alias {
-        // exit_one preserves two sessions, so give the real first bridge a
-        // third to carry and then lose while it is down.
         w.open_one();
     }
     w.launch();

@@ -45,13 +45,10 @@ use aterm_render::{RenderInput, Renderer, SpillBand, Theme, WindowCpu};
 /// aterm-gui's `INLINE_REFLOW_MAX_LINES`.
 const INLINE_REFLOW_MAX_LINES: usize = 20_000;
 
-/// Never-pumped-host safety net #1: `render()` calls after a rewrap is stashed before
-/// `render` pumps it itself (~2 s at 60 fps): long enough for a host's idle-scheduled
-/// `pump_reflow()` to win, short enough to restore deep history promptly otherwise.
+/// `render()` calls after a rewrap is stashed before `render` pumps it itself.
 const REFLOW_PUMP_GRACE_RENDERS: u32 = 120;
 
-/// Never-pumped-host safety net #2: while a rewrap is stashed, output that scrolls off
-/// stages in the grid's lazy buffer.
+/// While a rewrap is stashed, output that scrolls off stages in the grid's lazy buffer.
 const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 
 /// Default per-pump rewrap budget in input history lines for
@@ -59,10 +56,7 @@ const REFLOW_BACKLOG_MAX_LINES: usize = 20_000;
 const REFLOW_STEP_BUDGET_LINES: usize = 2_000;
 
 std::thread_local! {
-    /// Host-registered font blobs, marshaled across the JS/wasm boundary once per
-    /// module and referenced by `u32` handle, so the ~100–400MB faces (Apple Color
-    /// Emoji, Noto CJK) are never re-copied per pane; per-call copies would ratchet the
-    /// linear memory, which never shrinks.
+    /// Host-registered font blobs referenced by `u32` handle across panes.
     static REGISTERED_FONTS: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -589,8 +583,7 @@ impl AtermTerminal {
         Ok(())
     }
 
-    /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`. After the
-    /// grace window, one budgeted step per frame, never the whole job at once.
+    /// Advances a pending scrollback reflow by one budgeted step per frame after [`REFLOW_PUMP_GRACE_RENDERS`].
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
@@ -603,9 +596,7 @@ impl AtermTerminal {
         self.pump_reflow();
     }
 
-    /// Safety net #2 (see `REFLOW_BACKLOG_MAX_LINES`): called by `process`/
-    /// `process_str` after feeding; one budgeted step per call while the staged
-    /// output is past the cap.
+    /// Advances a pending scrollback reflow by one budgeted step when the lazy backlog exceeds [`REFLOW_BACKLOG_MAX_LINES`].
     #[inline]
     fn pump_reflow_on_output(&mut self) {
         if self.pending_reflow.is_some() && self.term.lazy_backlog_len() > REFLOW_BACKLOG_MAX_LINES
@@ -1086,9 +1077,7 @@ pub(crate) fn system_font_terminal(rows: u16, cols: u16, px: f32) -> AtermTermin
 mod tests {
     use super::*;
 
-    /// The bundled face, injected the way a JS host injects a fetched one. A
-    /// security property must not be skipped on a box with no system font, so
-    /// those tests build from these bytes rather than `new_from_system`.
+    /// The bundled face, injected the way a JS host injects a fetched one.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// The theme the host hands the constructor seeds the engine's implicit
@@ -1403,8 +1392,7 @@ mod tests {
         );
     }
 
-    /// Reject an oversized frame before constructing or changing a grid. Existing
-    /// text, presentation state and pixels survive refused resize, chrome and zoom.
+    /// Reject an oversized frame before constructing or changing a grid.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {
@@ -1599,8 +1587,6 @@ mod tests {
     fn scrolled_cell_reads_are_display_relative_like_row_text() {
         let mut t = crate::system_font_terminal(5, 20, 16.0);
         for i in 0..30 {
-            // Box-drawing edges force the host's per-cell path; a wide emoji
-            // exercises complex-cluster pairing for materialized history rows.
             t.process(format!("│🦀line{i}│\r\n").as_bytes());
         }
         let per_cell_row = |t: &AtermTerminal, row: u16| -> String {
@@ -2224,11 +2210,7 @@ mod tests {
         );
     }
 
-    /// The pet defaults OFF. The pointer and the press are value-shadowed
-    /// doors on the WF-1 gate: a pointer sample that moved reopens it, the
-    /// same sample again does not; a leave reopens it once; a press outside
-    /// the body passes (`0`) and leaves the gate shut, a press inside pets
-    /// (`1`) and buys the frame that runs the purr.
+    /// Pointer motion, pointer leave, and pet presses reopen the frame gate only when they change state.
     #[test]
     fn pointer_and_pet_press_reopen_the_frame_gate() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2662,9 +2644,7 @@ mod tests {
         assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
-    /// WF-1 frame gate, two-sided. Side 1 (skip): a second `render()` with
-    /// nothing changed must take the gate (zero present bands, `rgba`
-    /// byte-identical).
+    /// A settled second `render()` takes the frame gate, which reopens on each change class.
     #[test]
     fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);

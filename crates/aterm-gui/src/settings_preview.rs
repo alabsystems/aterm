@@ -3069,9 +3069,9 @@ impl SettingsPreviewSpec {
         {
             crate::native_settings::cursor_style_name(raw)
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
-            // Distinct branch.
             crate::native_settings::setting_choice_label(key, raw)
         } else if key == crate::prefs::EDIT_MOTION {
+            // The words the Motion control shows, not the raw value.
             crate::native_settings::setting_choice_label(key, raw)
         } else if key == crate::prefs::EDIT_WINDOW_THEME {
             let raw = raw.strip_suffix(" (default)").unwrap_or(raw);
@@ -3862,7 +3862,10 @@ const CURSOR_SCENE_COMMAND: &str = if cfg!(windows) {
     "git add notes.md && git commit"
 };
 
-const CURSOR_SCENE_TAB: (usize, usize) = if cfg!(windows) { (8, 18) } else { (10, 16) };
+/// The typed cells and where the Tab lands: `no` completes `notes.md`, as `.\no` completes
+/// `.\notes.md` in PowerShell, so both scenes jump 6 cells and keep the same time. A longer
+/// jump lands later (a fire meteor rings on arrival), past the frame a pause holds.
+const CURSOR_SCENE_TAB: (usize, usize) = if cfg!(windows) { (12, 18) } else { (10, 16) };
 
 const CURSOR_SCENE_KEYS: u64 =
     (CURSOR_SCENE_TAB.0 + 1 + (CURSOR_SCENE_COMMAND.len() - CURSOR_SCENE_TAB.1)) as u64;
@@ -7901,14 +7904,18 @@ mod tests {
                 );
             }
         }
-        let warmest = warm.iter().map(|(temp, _)| *temp).max().unwrap_or(0);
-        let coldest_peak = cold.iter().map(|(temp, _)| *temp).max().unwrap_or(0);
+        // The typed keys' blaze, as the checks below read it: at the last key the cursor's
+        // lead cell can stand past the end of the line above, and a flame there rises into
+        // the air, whose floor is as hot from a cold start (the PowerShell line, a column
+        // shorter than the Mac's, burns 183 there both ways).
+        let keys = CURSOR_SCENE_KEYS as usize;
+        let hottest = |heat: &[(u8, u16)]| heat[1..keys].iter().map(|(temp, _)| *temp).max();
+        let (warmest, coldest_peak) = (hottest(&warm).unwrap_or(0), hottest(&cold).unwrap_or(0));
         assert!(warmest >= 120, "the blaze reaches orange metal: {warm:?}");
         assert!(
             warmest > coldest_peak + 10,
             "warmer than a cold start ever gets: {warm:?} against {cold:?}"
         );
-        let keys = CURSOR_SCENE_KEYS as usize;
         assert!(
             (1..keys).all(|key| warm[key].0 + 8 >= cold[key].0),
             "{warm:?} against {cold:?}"

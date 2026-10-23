@@ -519,6 +519,34 @@ fn a_notes_instants_are_written_as_offsets_from_the_origin() {
     assert_eq!(instants_as_offsets(&raw, origin), "+0ns");
 }
 
+/// Windows' `Instant` is a `Duration` and writes as one (`Instant { t: 12.5s }`):
+/// its fraction's trailing zeros trimmed, and no point on a whole second. The
+/// form reads every spelling at its nanosecond, on any build's clock.
+#[test]
+fn a_fraction_form_instant_reads_at_its_nanosecond() {
+    let form = InstantForm::shape("Instant { t: 4611707930.767866819s }").expect("two numbers");
+    assert_eq!(
+        (form.head.as_str(), form.mid.as_str(), form.tail.as_str()),
+        ("Instant { t: ", ".", "s }")
+    );
+    for (text, ns) in [
+        ("Instant { t: 12.767866819s }", 12_767_866_819),
+        ("Instant { t: 12.76786682s }", 12_767_866_820),
+        ("Instant { t: 12.5s }", 12_500_000_000),
+        ("Instant { t: 12.000000001s }", 12_000_000_001),
+        ("Instant { t: 12s }", 12_000_000_000),
+    ] {
+        assert_eq!(form.read(text), Some((text.len(), ns)), "{text}");
+    }
+    for inert in [
+        "Instant { t: 12.s }",
+        "Instant { t: 12.1234567890s }",
+        "Instant { t: 12.5 }",
+    ] {
+        assert_eq!(form.read(inert), None, "{inert}");
+    }
+}
+
 /// Malformed or overflowing `Instant`-shaped substrings in notes remain literal text without panicking.
 #[test]
 fn instant_shaped_note_text_cannot_overflow_the_recorder() {

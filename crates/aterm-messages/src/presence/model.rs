@@ -5,9 +5,8 @@
 //! window border/tab indicators ([`Rim`], [`ChipLevel`]).
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 
-use super::{Host, STORY_CAP};
+use super::Host;
 use crate::Instant;
 
 /// What the classifier read off one screen.
@@ -337,9 +336,12 @@ struct ToldEnd {
     starts: u64,
     /// When its turn began: a settle's, when the ledger turn opened ([`TurnFact::opened`]).
     began: Option<Instant>,
-    /// The story point it was told as, and whether that point was news.
+    /// The story point it was told as, whether that point was news, and
+    /// whether it was aterm's own (told under aterm's hand): the fold keeps
+    /// the point's bit here, since the story keeps no points (6G-6).
     seq: u64,
     news: bool,
+    aterm: bool,
 }
 
 /// Whether a program turn that began at `program` is the ledger turn that
@@ -351,25 +353,12 @@ fn began_in(program: Option<Instant>, ledger: Option<Instant>) -> bool {
     }
 }
 
-/// What a story point says happened.
+/// What a told story point says happened (`aterm ctl story <verb>`): the
+/// word of its session log `story` mark. The points presence notes itself
+/// (a turn, mail, a hold, a wall, a question, a resume) are counted, never
+/// kept, so they name no verb (6G-6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoryVerb {
-    /// A turn settled.
-    Turn,
-    /// The program in front reported its own turn ended (OSC 7501 `working` → `done`|`idle`).
-    ProgramDone,
-    /// A turn whose settle deadline passed (`status=timeout` on the ledger).
-    TurnTimedOut,
-    /// Mail arrived.
-    Mail,
-    /// A hold began.
-    Hold,
-    /// The agent hit a wall.
-    Limited,
-    /// The agent asked.
-    Question,
-    /// A stop (hold / limited) ended.
-    Resumed,
     /// `ctl story chose <policy>`.
     Chose,
 }
@@ -386,19 +375,6 @@ impl StoryVerb {
             _ => None,
         }
     }
-}
-
-/// One point of a session's story.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoryPoint {
-    /// Its sequence number (1 = the first).
-    pub seq: u64,
-    /// When it happened.
-    pub at: Instant,
-    /// What happened.
-    pub verb: StoryVerb,
-    /// The point happened under aterm's own harness's hand.
-    pub aterm: bool,
 }
 
 /// A session's presence, as the last refresh left it.
@@ -450,8 +426,9 @@ pub struct Slot<V: Host> {
     told_end: Option<ToldEnd>,
     /// Whether a refresh has been absorbed.
     baselined: bool,
-    story: VecDeque<StoryPoint>,
-    /// The seq of the newest story point.
+    /// The seq of the newest story point: the story is this fold (its
+    /// count, its news, its close and the one told end), and keeps no
+    /// points (the deque was deleted in phase 6, 6G-6).
     pub story_seq: u64,
     /// The seq of the newest point that is news.
     news_seq: u64,
@@ -489,7 +466,6 @@ impl<V: Host> Slot<V> {
             turn_end_news: 0,
             told_end: None,
             baselined: false,
-            story: VecDeque::new(),
             story_seq: 0,
             news_seq: 0,
             aterm_hand: false,
@@ -498,51 +474,39 @@ impl<V: Host> Slot<V> {
         }
     }
 
-    /// `aterm ctl story <verb> [<text>]` landed.
-    pub fn tell(&mut self, verb: StoryVerb, now: Instant) -> u64 {
-        self.note(verb, now);
+    /// `aterm ctl story <verb> [<text>]` landed: one point (the verb is its
+    /// log mark's word, which the host writes); its seq.
+    pub fn tell(&mut self) -> u64 {
+        self.note();
         self.story_seq
     }
 
-    fn note(&mut self, verb: StoryVerb, now: Instant) {
-        let _ = self.note_as(verb, now, true);
+    fn note(&mut self) {
+        let _ = self.note_as(true);
     }
 
     /// Note a point; `news` false keeps it out of the news a level reads (the
-    /// person saw it happen), as aterm's own points are.
-    fn note_as(&mut self, verb: StoryVerb, now: Instant, news: bool) -> bool {
+    /// person saw it happen), as aterm's own points are. Returns whether it
+    /// was news and whether it was aterm's own.
+    fn note_as(&mut self, news: bool) -> (bool, bool) {
         self.story_seq += 1;
         let aterm = self.noting_aterm || self.aterm_hand;
         let news = !aterm && news;
         if news {
             self.news_seq = self.story_seq;
         }
-        if self.story.len() >= STORY_CAP {
-            self.story.pop_front();
-        }
-        self.story.push_back(StoryPoint {
-            seq: self.story_seq,
-            at: now,
-            verb,
-            aterm,
-        });
-        news
+        (news, aterm)
     }
 
     /// The second end of a told turn, `news` the news it would have carried
     /// told alone: the turn is one story point either way, and news when
-    /// either end would have been, whichever was read first.
+    /// either end would have been, whichever was read first. A point told
+    /// under aterm's hand stays aterm's ([`ToldEnd::aterm`]), so its pair
+    /// never makes it news.
     fn pair_end(&mut self, told: ToldEnd, news: bool) -> bool {
         self.told_end = None;
         let aterm = self.noting_aterm || self.aterm_hand;
-        if news
-            && !aterm
-            && !told.news
-            && self
-                .story
-                .iter()
-                .any(|point| point.seq == told.seq && !point.aterm)
-        {
+        if news && !aterm && !told.news && !told.aterm {
             self.news_seq = self.news_seq.max(told.seq);
             return true;
         }
@@ -591,10 +555,11 @@ impl<V: Host> Slot<V> {
                 self.agent_since = now;
             }
             if word_moved {
-                match agent.as_ref().map(|a| &a.phase) {
-                    Some(AgentPhase::Question) => self.note(StoryVerb::Question, now),
-                    Some(AgentPhase::Wall { .. }) => self.note(StoryVerb::Limited, now),
-                    _ => {}
+                if matches!(
+                    agent.as_ref().map(|a| &a.phase),
+                    Some(AgentPhase::Question | AgentPhase::Wall { .. })
+                ) {
+                    self.note();
                 }
                 if matches!(
                     self.agent.as_ref().map(|a| &a.phase),
@@ -603,7 +568,7 @@ impl<V: Host> Slot<V> {
                     agent.as_ref().map(|a| &a.phase),
                     Some(AgentPhase::Wall { .. })
                 ) {
-                    self.note(StoryVerb::Resumed, now);
+                    self.note();
                 }
             }
             if self.agent != agent {
@@ -622,8 +587,8 @@ impl<V: Host> Slot<V> {
         self.lease_until = facts.lease_until;
         if self.hold != facts.hold {
             match (&self.hold, &facts.hold) {
-                (None, Some(_)) if self.baselined => self.note(StoryVerb::Hold, now),
-                (Some(_), None) => self.note(StoryVerb::Resumed, now),
+                (None, Some(_)) if self.baselined => self.note(),
+                (Some(_), None) => self.note(),
                 _ => {}
             }
             self.hold = facts.hold;
@@ -631,7 +596,7 @@ impl<V: Host> Slot<V> {
         }
         if self.mail != facts.mail {
             if facts.mail.head > self.mail.head {
-                self.note(StoryVerb::Mail, now);
+                self.note();
             }
             self.mail = facts.mail;
             changed = true;
@@ -667,18 +632,19 @@ impl<V: Host> Slot<V> {
                             let _ = self.pair_end(told, true);
                         }
                         _ => {
-                            let news = self.note_as(StoryVerb::Turn, now, true);
+                            let (news, aterm) = self.note_as(true);
                             self.told_end = Some(ToldEnd {
                                 end: TurnEnd::Settle,
                                 starts,
                                 began: opened,
                                 seq: self.story_seq,
                                 news,
+                                aterm,
                             });
                         }
                     }
                 } else {
-                    self.note(StoryVerb::TurnTimedOut, now);
+                    self.note();
                 }
                 self.noting_aterm = noting;
             }
@@ -699,13 +665,14 @@ impl<V: Host> Slot<V> {
                         news && turn_news
                     }
                     _ => {
-                        let news = self.note_as(StoryVerb::ProgramDone, now, news);
+                        let (news, aterm) = self.note_as(news);
                         self.told_end = Some(ToldEnd {
                             end: TurnEnd::Done,
                             starts,
                             began,
                             seq: self.story_seq,
                             news,
+                            aterm,
                         });
                         news
                     }
@@ -847,12 +814,6 @@ impl<V: Host> Slot<V> {
                 Some(AgentPhase::Prompt { .. } | AgentPhase::Question | AgentPhase::Wall { .. })
             )
             && !self.unread_wants_a_human()
-    }
-
-    /// The story points after `watermark` (and after a closed story), oldest first.
-    pub fn story_since(&self, watermark: u64) -> impl Iterator<Item = &StoryPoint> {
-        let seen = watermark.max(self.story_closed);
-        self.story.iter().filter(move |p| p.seq > seen && !p.aterm)
     }
 }
 

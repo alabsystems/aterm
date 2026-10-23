@@ -45,16 +45,10 @@ pub const KITTY_FLAGS: u8 = 1 | 4;
 pub const OSC52_LIMIT: usize = 64 * 1024;
 const _: () = assert!(OSC52_LIMIT == 65_536);
 
-/// How many lines one wheel notch scrolls.
 const WHEEL_LINES: i32 = 3;
 
-/// What the echo area says when a file opens.
 const HINT: &str = "C-x C-s saves · C-x C-c exits · C-g cancels";
 
-/// A development seam (`aterm_types::dev_seam!`, read in a debug or
-/// `dev-seams` build only, never in a shipped one): the key that types this
-/// character panics instead, so a test can watch the `amacs` binary put the
-/// terminal back on a panic (`crates/aterm/tests/amacs_pty.rs`).
 const INJECT_PANIC_SEAM: &str = "ATERM_AMACS_INJECT_PANIC";
 
 /// The settings the face runs with.
@@ -102,8 +96,6 @@ pub enum Close {
 }
 
 impl Close {
-    /// The `decide::WAIT_*` this ending is, so a run's status is the native
-    /// face's for the same ending ([`decide::wait_status`]).
     const fn wait_end(self) -> u8 {
         match self {
             Self::Closed => decide::WAIT_CLOSED,
@@ -177,9 +169,6 @@ verify_island! {
     }
 }
 
-/// The byte a key answers a question with: what it types, or DEL for
-/// Backspace, ESC for Escape and BEL for `C-g`; `None` for a key that types
-/// no ASCII.
 fn answer_byte(key: &Key, mods: Modifiers, text: Option<char>) -> Option<u8> {
     let chord = mods.difference(Modifiers::SHIFT);
     match key {
@@ -252,8 +241,6 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// The document's text now, with the line index and the syntax brought
-    /// up to it.
     fn text(&mut self) -> Arc<str> {
         let Some(snapshot) = self.store.snapshot(self.document) else {
             return Arc::clone(&self.lexed);
@@ -277,7 +264,6 @@ impl Buffer {
     }
 }
 
-/// The lines of `text`, through `starts` when it indexes them.
 const fn lines_of<'a>(text: &'a str, starts: Option<&'a [usize]>) -> EditorLines<'a> {
     match starts {
         Some(starts) => EditorLines::indexed(text, starts),
@@ -285,9 +271,6 @@ const fn lines_of<'a>(text: &'a str, starts: Option<&'a [usize]>) -> EditorLines
     }
 }
 
-/// Bring `cache`, the syntax of `old`, up to `new`: the lines between the
-/// texts' common start and common end are lexed again, and the lines after
-/// them only as far as their starting state changed ([`LexCache::splice`]).
 fn relex(cache: &mut LexCache, old: &str, new: &str) {
     let (old, new_bytes) = (old.as_bytes(), new.as_bytes());
     let prefix = old
@@ -317,9 +300,6 @@ fn relex(cache: &mut LexCache, old: &str, new: &str) {
     cache.splice(new, first, removed, inserted);
 }
 
-/// The byte `line` (1-based) and `column` (1-based, in characters) name in
-/// `text`, clamped to the line and to the text, as aterm's path links place
-/// a caret.
 fn line_column_offset(text: &str, line: u32, column: Option<u32>) -> usize {
     let lines = EditorLines::scanning(text);
     let index = usize::try_from(line)
@@ -343,12 +323,11 @@ fn line_column_offset(text: &str, line: u32, column: Option<u32>) -> usize {
     start.saturating_add(within)
 }
 
-/// Why the file host refused to read `path` to open it (or to load it from disk again), in the save words (`amacs_files::save_words`) aterm says too.
+/// Why the file host refused to read `path`, in `amacs_files::save_words` phrasing.
 pub(crate) fn host_error(path: &Path, error: &DocumentHostError) -> String {
     save_words::words(Speaker::Amacs, path, &Failure::Open(error))
 }
 
-/// Why the buffer's store refused a step on the buffer, in a person's words.
 const fn store_words(error: &DocumentError) -> &'static str {
     match error {
         DocumentError::UnknownDocument | DocumentError::UnknownView => "the buffer is gone",
@@ -360,7 +339,6 @@ const fn store_words(error: &DocumentError) -> &'static str {
     }
 }
 
-/// What an engine error says in the echo area.
 const fn error_text(error: &EditorError) -> &'static str {
     match error {
         EditorError::NothingToUndo => "No further undo information",
@@ -377,19 +355,17 @@ const fn error_text(error: &EditorError) -> &'static str {
     }
 }
 
-/// `text` with every line break LF: a terminal pastes CR (or CRLF) breaks.
 fn paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// The OSC 52 write that puts `text` on the terminal's clipboard.
 fn osc52(text: &str) -> Option<Vec<u8>> {
     let encoded = aterm_codec::base64::encode(text.as_bytes()).ok()?;
     Some(format!("\x1b]52;c;{encoded}\x07").into_bytes())
 }
 
 impl Tui {
-    /// A face that edits with `write`, the run's one buffer-write capability (minted by the launcher, `aterm_cli::amacs_launch`).
+    /// A face that edits with `write`, the run's one buffer-write capability.
     #[must_use]
     pub fn new(write: WriteCap, options: Options) -> Self {
         Self {
@@ -453,7 +429,6 @@ impl Tui {
     }
 
     /// Open `target` as amacs-files admits a document.
-    ///
     /// # Errors
     /// Why the file cannot be edited, worded for a person.
     pub fn open(&mut self, target: &Target) -> Result<Buffer, String> {
@@ -526,8 +501,7 @@ impl Tui {
         })
     }
 
-    /// Edit `buffer` until it is closed or the terminal hangs up, entering the screen first if this is the run's first file.
-    ///
+    /// Edit `buffer` until closed or the terminal hangs up, entering the screen first if needed.
     /// # Errors
     /// The terminal's OS error.
     pub fn run<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<Close> {
@@ -563,8 +537,6 @@ impl Tui {
         }
     }
 
-    /// Enter the screen: ask the terminal what it can do, then set the modes
-    /// the face uses, each put back however the run ends.
     fn start<T: Tty + ?Sized>(&mut self, tty: &mut T) -> io::Result<Signals> {
         self.size = tty.size()?;
         let probed = probe::probe(tty, &mut self.decoder)?;
@@ -590,8 +562,7 @@ impl Tui {
         Ok(probed.signals)
     }
 
-    /// Put back every mode the screen was entered with, in the one order every restore uses (the drawing state first, the alternate screen last).
-    ///
+    /// Put back every mode the screen was entered with, in the one order every restore uses.
     /// # Errors
     /// The terminal's OS error.
     pub fn finish<T: Tty + ?Sized>(&mut self, tty: &mut T) -> io::Result<()> {
@@ -613,8 +584,6 @@ impl Tui {
         Ok(())
     }
 
-    /// What the echo area shows now, most pressing first: the face's
-    /// question, a key sequence being typed, the minibuffer, a message.
     fn echo(&self, buffer: &Buffer) -> render::EchoLine {
         let echo = if let Some(question) = &self.asking {
             render::Echo::Question(question)
@@ -633,15 +602,12 @@ impl Tui {
         render::EchoLine::of(&echo)
     }
 
-    /// The next frame's layout, and its echo area.
     fn layout(&self, buffer: &Buffer) -> (render::Layout, render::EchoLine) {
         let echo = self.echo(buffer);
         let rows = render::echo_rows(self.size, self.options.ambiguous, &echo);
         (render::layout(self.size.rows, rows), echo)
     }
 
-    /// Fit `buffer`'s view to the rows the next frame gives it: a new count
-    /// reveals the caret; `reveal` reveals it anyway.
     fn fit(&mut self, buffer: &mut Buffer, reveal: bool) {
         let body = usize::from(self.layout(buffer).0.body);
         let text = buffer.text();
@@ -659,7 +625,6 @@ impl Tui {
         self.fit(buffer, false);
     }
 
-    /// Read the terminal's size again and draw the next frame whole at it.
     fn refit<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<()> {
         let size = tty.size()?;
         self.resize(buffer, size);
@@ -673,7 +638,6 @@ impl Tui {
         signals: Signals,
     ) -> io::Result<()> {
         if signals.contains(Signals::TSTP) {
-            // A stop asked from outside (`kill -TSTP`): stop as C-z does.
             return self.suspend(tty, buffer);
         }
         if signals.contains(Signals::WINCH) || signals.contains(Signals::CONT) {
@@ -682,9 +646,6 @@ impl Tui {
         Ok(())
     }
 
-    /// `suspend-frame` (`C-z`, or a SIGTSTP from outside): the shell gets the
-    /// terminal back until `fg`, then the whole frame is drawn again, once,
-    /// at the size the terminal has then.
     fn suspend<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<()> {
         loop {
             tty.suspend()?;
@@ -695,7 +656,6 @@ impl Tui {
         self.refit(tty, buffer)
     }
 
-    /// Handle one decoded event; `Some` when it closed the file.
     fn event<T: Tty + ?Sized>(
         &mut self,
         tty: &mut T,
@@ -793,7 +753,6 @@ impl Tui {
         }
     }
 
-    /// Hand one input to the engine and carry out what it asks.
     fn input<T: Tty + ?Sized>(
         &mut self,
         tty: &mut T,
@@ -878,8 +837,6 @@ impl Tui {
         Ok(None)
     }
 
-    /// Close the file the way `why` asks: a plain close of a changed file
-    /// asks first, a finish saves first.
     fn close(&mut self, buffer: &mut Buffer, why: CloseWhy) -> Option<Close> {
         match why {
             CloseWhy::Plain if buffer.dirty() => {
@@ -892,7 +849,6 @@ impl Tui {
         }
     }
 
-    /// Read the answer to `Save FILE? (y, n, q)`.
     fn answer<T: Tty + ?Sized>(
         &mut self,
         tty: &mut T,
@@ -922,8 +878,6 @@ impl Tui {
         Ok(None)
     }
 
-    /// Save `buffer` to its file, atomically, refusing when the disk changed
-    /// since it was read (unless this save takes up the offer to overwrite).
     fn save(&mut self, buffer: &mut Buffer) -> bool {
         let name = buffer.name.clone();
         let path = buffer.path.clone();
@@ -1021,9 +975,6 @@ impl Tui {
         false
     }
 
-    /// The disk changed since the read, or a save was written but its proof
-    /// failed (`unconfirmed`, why): say so, and let a save straight after this
-    /// one overwrite the disk's version.
     fn offer_overwrite(&mut self, buffer: &mut Buffer, unconfirmed: Option<&str>) {
         buffer.overwrite = true;
         let name = &buffer.name;
@@ -1038,7 +989,6 @@ impl Tui {
         });
     }
 
-    /// `revert-buffer`: the buffer becomes the file as it is on disk now.
     fn revert(&mut self, buffer: &mut Buffer) {
         match reload(buffer) {
             Ok(()) => {
@@ -1050,8 +1000,6 @@ impl Tui {
         self.fit(buffer, true);
     }
 
-    /// Draw the frame: the cells that changed, or the whole screen when it
-    /// must be.
     fn draw<T: Tty + ?Sized>(&mut self, tty: &mut T, buffer: &mut Buffer) -> io::Result<()> {
         let (layout, echo) = self.layout(buffer);
         let text = buffer.text();
@@ -1093,8 +1041,6 @@ impl Tui {
     }
 }
 
-/// Read `buffer`'s file again through its grant: a file that is gone reads
-/// as missing and empty.
 fn read_disk(buffer: &Buffer, saving: bool) -> Result<files::GrantedDocument, String> {
     let words = |failure: &Failure<'_>| save_words::words(Speaker::Amacs, &buffer.path, failure);
     let grant = buffer
@@ -1113,9 +1059,6 @@ fn read_disk(buffer: &Buffer, saving: bool) -> Result<files::GrantedDocument, St
         })
 }
 
-/// Take the disk's current version as the one a save replaces, keeping the
-/// buffer's text and the way it maps to bytes: the overwrite a person asked
-/// for with a second `C-x C-s`.
 fn take_disk_version(buffer: &mut Buffer) -> Result<(), String> {
     let fresh = read_disk(buffer, true)?;
     buffer
@@ -1124,9 +1067,6 @@ fn take_disk_version(buffer: &mut Buffer) -> Result<(), String> {
         .map_err(|error| save_words::words(Speaker::Amacs, &buffer.path, &Failure::Begin(&error)))
 }
 
-/// Make `buffer` the file as it is on disk now (its unsaved edits are gone,
-/// as the native view's discard drops them), and the disk's version the one
-/// the next save replaces.
 fn reload(buffer: &mut Buffer) -> Result<(), String> {
     let fresh = read_disk(buffer, false)?;
     let before = buffer
@@ -1215,8 +1155,6 @@ pub fn run_tui(
 mod tests {
     use super::*;
 
-    /// A caret placed by `+LINE:COL` lands on that line's character, clamped
-    /// to the line and to the text.
     #[test]
     fn a_position_names_a_line_and_a_character_on_it() {
         let text = "one\ntwo λx\nthree";
@@ -1229,8 +1167,6 @@ mod tests {
         assert_eq!(line_column_offset("", 3, Some(3)), 0);
     }
 
-    /// The syntax after an edit is the syntax of the edited text lexed from
-    /// scratch, whatever the edit joined, split or replaced.
     #[test]
     fn relexing_an_edit_matches_a_fresh_lex() {
         let texts = [
@@ -1257,8 +1193,6 @@ mod tests {
         }
     }
 
-    /// A question is answered by the byte a key types; Backspace, Escape and
-    /// C-g answer too, and a chord or a key that types nothing does not.
     #[test]
     fn a_key_answers_with_the_byte_it_types() {
         let none = Modifiers::empty();
@@ -1304,7 +1238,6 @@ mod tests {
         }
     }
 
-    /// A paste's CR and CRLF breaks are line feeds in the buffer.
     #[test]
     fn a_paste_breaks_lines_with_line_feeds() {
         assert_eq!(paste_text("a\rb\r\nc\nd"), "a\nb\nc\nd");

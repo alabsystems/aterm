@@ -2,13 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! App consent model: shared probe slots, `[privacy]` policy mirror, and session `status` fields.
-//!
-//! OS consent queries go through [`ConsentProbes`] function pointers (`live` for windowed
-//! instances, `inert` for headless instances and unit tests). Live reads are asynchronous:
-//! cold, invalidated, or expired observations report `pending` while a single per-slot
-//! worker refreshes the slot and wakes the GUI, bounded by a 500 ms retry floor.
-//!
-//! Protected paths come from `aterm_containment::consent` (`protected_roots`, `Folder::path`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,27 +48,22 @@ pub(crate) struct ConsentProbes {
     pub(crate) live: bool,
 }
 
-/// Inert census probe returning `Unavailable` without reading disk.
 fn inert_census(_bundle_id: &str) -> Claimants {
     Claimants::default()
 }
 
-/// Inert debugger probe returning `unknown` / `refused_disabled`.
 const fn inert_debugger(_gate: ProbeGate) -> DebuggerProbe {
     DebuggerProbe::refused(DebuggerProbeLabel::RefusedDisabled)
 }
 
-/// Inert hardening probe returning `Unknown`.
 const fn inert_hardening() -> SelfHardening {
     SelfHardening::Unknown
 }
 
-/// Inert Developer Tools log probe returning `unknown` / `refused_disabled`.
 const fn inert_devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
     DevToolProbe::refused(DevToolProbeLabel::RefusedDisabled)
 }
 
-/// Inert Developer Tools list probe.
 const fn inert_devtools_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(DevToolListLabel::RefusedDisabled)
 }
@@ -135,7 +123,6 @@ impl ConsentProbes {
         }
     }
 
-    /// Refusal result when the live FDA gate is closed or the instance is inert.
     fn inactive_fda(self, gate: ProbeGate) -> FdaProbe {
         if !gate.permits() {
             inert_fda_probe(gate)
@@ -154,7 +141,6 @@ const fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
     })
 }
 
-/// Unsupported debugger probe off macOS.
 const fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
     DebuggerProbe::refused(if gate.permits() {
         DebuggerProbeLabel::UnsupportedPlatform
@@ -163,7 +149,6 @@ const fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
     })
 }
 
-/// Unsupported Developer Tools log probe off macOS.
 const fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
     DevToolProbe::refused(if gate.permits() {
         DevToolProbeLabel::UnsupportedPlatform
@@ -172,7 +157,6 @@ const fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolP
     })
 }
 
-/// Unsupported Developer Tools list probe off macOS.
 const fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(if gate.permits() {
         DevToolListLabel::UnsupportedPlatform
@@ -181,17 +165,14 @@ const fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolLi
     })
 }
 
-/// Inert Full Disk Access probe returning `refused_disabled`.
 const fn inert_fda_probe(_gate: ProbeGate) -> FdaProbe {
     FdaProbe::refused(ProbeLabel::RefusedDisabled)
 }
 
-/// Inert responsibility probe.
 fn inert_responsible(pids: &[i32]) -> Vec<Result<i32, ResponsibleError>> {
     vec![Err(ResponsibleError::Unsupported); pids.len()]
 }
 
-/// Minimum freshness and retry spacing between probe runs.
 const PROBE_RETRY_FLOOR: Duration = Duration::from_millis(500);
 
 /// Probe slot identifier for publications and GUI wakes.
@@ -208,7 +189,6 @@ pub(crate) enum SlotKind {
 }
 
 impl SlotKind {
-    /// The change counter a publication of this slot bumps.
     const fn change(self) -> ChangeKind {
         match self {
             Self::Fda => ChangeKind::Fda,
@@ -229,7 +209,6 @@ impl SlotKind {
     }
 }
 
-/// The GUI's completion wake, told which slot published.
 type SlotWake = Arc<dyn Fn(SlotKind) + Send + Sync>;
 
 /// Policy for entries that have reached their TTL.
@@ -256,7 +235,6 @@ pub(crate) struct Ticket {
     epoch: u64,
 }
 
-/// Slot read result: optional `(entry, age)` and any newly claimed worker [`Ticket`].
 type SlotRead<E> = (Option<(E, Duration)>, Option<Ticket>);
 
 /// A published answer, the epoch it was published under, and when.
@@ -278,7 +256,6 @@ struct Slot<E> {
     retry_after: Option<Instant>,
 }
 
-/// Single-flight asynchronous probe slot with epoch invalidation and retry floor.
 struct SlotCell<E> {
     kind: SlotKind,
     stale: Stale,
@@ -309,7 +286,6 @@ impl<E> SlotCell<E> {
         }
     }
 
-    /// The lock if nobody holds it.
     fn try_hold(&self) -> Option<MutexGuard<'_, Slot<E>>> {
         match self.slot.try_lock() {
             Ok(slot) => Some(slot),
@@ -318,7 +294,6 @@ impl<E> SlotCell<E> {
         }
     }
 
-    /// Advance `ticket` to the current epoch before its worker is spawned.
     fn restamp(&self, ticket: Ticket, lock: SlotLock) -> Ticket {
         let slot = match lock {
             SlotLock::Try => self.try_hold(),
@@ -335,7 +310,6 @@ impl<E> SlotCell<E> {
         Ticket { epoch }
     }
 
-    /// Complete `ticket`'s worker, storing `value` if its epoch is still current.
     fn complete(&self, ticket: Ticket, value: Option<E>, now: Instant) -> bool {
         let mut slot = self.slot.lock_or_recover();
         if !slot.in_flight || slot.request_epoch != ticket.epoch {
@@ -354,14 +328,12 @@ impl<E> SlotCell<E> {
         true
     }
 
-    /// Bump the epoch and clear any uncontended cached entry, returning whether one was cleared.
     fn retire(&self) -> bool {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.try_hold()
             .is_some_and(|mut slot| slot.entry.take().is_some())
     }
 
-    /// Clear the retry floor so the next read dispatches immediately.
     fn clear_floor(&self) {
         self.slot.lock_or_recover().retry_after = None;
     }
@@ -373,13 +345,11 @@ impl<E> SlotCell<E> {
         self.slot.lock_or_recover().entry = Some(Entry { value, epoch, at });
     }
 
-    /// Record that spawning `ticket`'s worker thread failed.
     fn spawn_failed(&self, ticket: Ticket) {
         self.failed
             .store(ticket.epoch.wrapping_add(1), Ordering::Release);
     }
 
-    /// Next instant after `now` when a read could observe a new state.
     fn next_refresh_deadline(&self, now: Instant, ttl: Duration) -> Instant {
         let ttl = ttl.max(PROBE_RETRY_FLOOR);
         let retry = now + ttl;
@@ -404,14 +374,12 @@ impl<E> SlotCell<E> {
 }
 
 impl<E: Clone> SlotCell<E> {
-    /// Read the cached entry and optionally claim a refresh worker ticket.
     fn read(&self, now: Instant, ttl: Duration, admit: bool, lock: SlotLock) -> SlotRead<E> {
         loop {
             let (read, epoch) = self.read_once(now, ttl, admit, lock);
             if self.epoch.load(Ordering::Acquire) == epoch {
                 return read;
             }
-            // Re-read if a concurrent retirement raced the lock, or restamp a claimed ticket.
             match read {
                 (_, Some(ticket)) => return (None, Some(self.restamp(ticket, lock))),
                 (Some(_), None) => {}
@@ -420,7 +388,6 @@ impl<E: Clone> SlotCell<E> {
         }
     }
 
-    /// One pass of [`Self::read`] under the lock, and the epoch it read under.
     fn read_once(
         &self,
         now: Instant,
@@ -453,7 +420,6 @@ impl<E: Clone> SlotCell<E> {
         (read, epoch)
     }
 
-    /// The entry a read under `epoch` may serve, with its age.
     fn servable(
         &self,
         slot: &Slot<E>,
@@ -488,7 +454,6 @@ impl<E: Clone> SlotCell<E> {
     }
 }
 
-/// Spawn a worker thread for `ticket` that publishes its result via [`SharedProbe::finish`].
 fn spawn_slot_worker<E: 'static>(
     shared: &Arc<SharedProbe>,
     cell: fn(&SharedProbe) -> &SlotCell<E>,
@@ -508,7 +473,6 @@ fn spawn_slot_worker<E: 'static>(
     }
 }
 
-/// TTL for cached claimant census results.
 const CENSUS_TTL: Duration = Duration::from_secs(60);
 
 /// The debugger slot's answer: the probe and aterm's own hardening.
@@ -518,10 +482,8 @@ struct DebuggerEntry {
     self_hardened: SelfHardening,
 }
 
-/// TTL for cached debugger probe results.
 const DEBUGGER_TTL: Duration = Duration::from_secs(60);
 
-/// TTL for cached Developer Tools probe results.
 const DEVTOOLS_TTL: Duration = Duration::from_secs(120);
 
 /// Cached Developer Tools probe and resolved bundle identifier.
@@ -564,7 +526,6 @@ impl DevToolsRow {
         }
     }
 
-    /// Build a row from a completed probe, aging the probe monotonically and `tccd` by wall clock.
     fn from_probe(
         probe: DevToolProbe,
         list: DevToolList,
@@ -615,7 +576,6 @@ impl DevToolsRow {
     }
 }
 
-/// Current wall-clock time in unix milliseconds (clamped to `0`).
 fn unix_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -651,7 +611,6 @@ impl DebuggerRow {
         }
     }
 
-    /// Build a row from a cached [`DebuggerEntry`] and its age.
     fn from_entry(entry: DebuggerEntry, age: Duration) -> Self {
         Self {
             probe: entry.probe,
@@ -682,7 +641,6 @@ impl DebuggerRow {
     }
 }
 
-/// The debugger probe's age only when a probe actually completed.
 fn completed_debugger_age_ms(label: DebuggerProbeLabel, age: Duration) -> Option<u128> {
     (!label.refused() && label != DebuggerProbeLabel::Pending).then_some(age.as_millis())
 }
@@ -777,12 +735,10 @@ impl SharedProbe {
         }
     }
 
-    /// Clone the latest published [`ConsentPolicy`].
     fn published_policy(&self) -> Arc<ConsentPolicy> {
         Arc::clone(&self.policy.lock_or_recover())
     }
 
-    /// Complete `ticket` on `cell` and notify off-loop waiters and the GUI wake.
     fn finish<E>(&self, cell: &SlotCell<E>, ticket: Ticket, value: Option<E>, now: Instant) {
         if cell.complete(ticket, value, now) {
             self.publications.publish(cell.kind.change());
@@ -860,7 +816,6 @@ impl ConsentState {
         let _ = self.shared.wake.set(wake);
     }
 
-    /// Retire `cell` and notify waiters if a cached entry was cleared.
     fn retire<E>(&self, cell: &SlotCell<E>) {
         if cell.retire() {
             self.shared.publications.publish(cell.kind.change());
@@ -979,7 +934,6 @@ impl ConsentState {
             .map(|(entry, age)| DebuggerRow::from_entry(entry, age))
     }
 
-    /// Debugger row returned by inert or unsupported instances.
     fn inert_debugger_row(&self, gate: ProbeGate) -> DebuggerRow {
         DebuggerRow {
             probe: (self.probes.debugger)(gate),
@@ -1192,7 +1146,6 @@ impl ConsentState {
         })
     }
 
-    /// Read the FDA slot at `now`, optionally claiming a refresh worker ticket.
     fn fda_at(
         &self,
         gate: ProbeGate,
@@ -1231,7 +1184,6 @@ impl ConsentState {
         self.fda_at(gate, interval, now, false, SlotLock::Try).0
     }
 
-    /// Non-blocking GUI-thread FDA read ([`SlotLock::Try`]).
     fn fda(&self, gate: ProbeGate, interval: Duration) -> (FdaProbe, Duration) {
         self.fda_read(gate, interval, true, SlotLock::Try)
     }
@@ -1241,7 +1193,6 @@ impl ConsentState {
         self.fda_read(gate, interval, true, SlotLock::Wait)
     }
 
-    /// Passive FDA cache read that never dispatches a worker or mutates slot state.
     fn fda_cached(&self, gate: ProbeGate, interval: Duration) -> (FdaProbe, Duration) {
         self.fda_read(gate, interval, false, SlotLock::Try)
     }
@@ -1472,7 +1423,6 @@ pub(crate) struct SessionConsent {
 }
 
 impl SessionConsent {
-    /// Default unknown state for a session not in the pool.
     const fn unknown() -> Self {
         Self {
             attribution: Attribution::Unknown,
@@ -1505,7 +1455,6 @@ impl ConsentPolicy {
         Self::over_roots(config, config.privacy_protected_roots().into())
     }
 
-    /// Resolve `config`'s `[privacy]` flags over pre-resolved `protected_roots`.
     fn over_roots(config: &crate::app_config::Config, protected_roots: Arc<[PathBuf]>) -> Self {
         Self {
             gate: config.privacy_probe_gate(),
@@ -1629,7 +1578,6 @@ mod tests {
         observe_fda,
     };
     use crate::privacy_report::PrivacyForm;
-    /// Slot wake callback forwarding only `kind` completions to `tx`.
     fn wake_on(kind: SlotKind, tx: std::sync::mpsc::Sender<()>) -> SlotWake {
         Arc::new(move |published| {
             if published == kind {
@@ -1645,7 +1593,6 @@ mod tests {
         }
     }
 
-    /// Census runs off-thread, caches until [`CENSUS_TTL`], and is unaffected by `invalidate()`.
     #[test]
     fn the_census_runs_on_a_worker_and_survives_focus_and_config_invalidation() {
         use std::sync::atomic::AtomicUsize;
@@ -1691,7 +1638,6 @@ mod tests {
         assert_eq!(RUNS.load(Ordering::Acquire), 2);
     }
 
-    /// An in-flight census invalidated by `invalidate_census()` drops its result.
     #[test]
     fn a_census_out_when_the_disk_changes_publishes_nothing() {
         use std::sync::atomic::AtomicBool;
@@ -1721,7 +1667,6 @@ mod tests {
         assert!(state.claimants(Some("x"), true).0.is_some());
     }
 
-    /// Census is skipped when bundle id is missing, privacy is disabled, or the instance is inert.
     #[test]
     fn the_census_is_off_without_an_id_a_live_instance_or_the_master_switch() {
         static RAN: AtomicU64 = AtomicU64::new(0);
@@ -1740,7 +1685,6 @@ mod tests {
         assert_eq!(RAN.load(Ordering::Acquire), 0);
     }
 
-    /// `consent_at_risk` requires a non-covered verdict and a known cwd under a protected root.
     #[test]
     fn consent_at_risk_is_a_conjunction_and_is_silent_without_a_cwd() {
         let roots = vec![PathBuf::from("/u/me/Protected")];
@@ -1758,7 +1702,6 @@ mod tests {
         }
     }
 
-    /// Counting fake debugger probe returning disabled developer mode.
     fn fake_debugger(runs: &std::sync::atomic::AtomicUsize) -> DebuggerProbe {
         runs.fetch_add(1, Ordering::AcqRel);
         DebuggerProbe {
@@ -1768,7 +1711,6 @@ mod tests {
         }
     }
 
-    /// Debugger probe runs off-thread, caches for [`DEBUGGER_TTL`], and retires on invalidation.
     #[test]
     fn the_debugger_probe_runs_on_a_worker_and_focus_gain_retires_it() {
         use std::sync::atomic::AtomicUsize;
@@ -1820,7 +1762,6 @@ mod tests {
         );
     }
 
-    /// `invalidate_debugger()` preserves cached process hardening across re-probes.
     #[test]
     fn a_pending_debugger_row_keeps_the_hardening_already_read() {
         use std::sync::atomic::AtomicUsize;
@@ -1874,7 +1815,6 @@ mod tests {
         );
     }
 
-    /// Setting `[privacy] enabled = false` retires cached debugger results (`refused_disabled`).
     #[test]
     fn the_master_switch_makes_the_debugger_row_unknown() {
         use std::sync::atomic::AtomicUsize;
@@ -1933,7 +1873,6 @@ mod tests {
         assert_eq!(RUNS.load(Ordering::Acquire), 0);
     }
 
-    /// Polled FDA and `status` reads never dispatch the debugger worker, whereas full reports do.
     #[test]
     fn the_polled_consent_paths_never_dispatch_the_debugger_probe() {
         use std::sync::atomic::AtomicUsize;
@@ -1975,7 +1914,6 @@ mod tests {
         assert!(!slot_idle(&app), "the full report's answer is cached");
     }
 
-    /// `session_consent` reads the FDA cache passively without spawning a probe worker.
     #[test]
     fn status_reads_the_fda_cache_and_never_dispatches_the_probe() {
         use std::sync::atomic::AtomicUsize;
@@ -2029,7 +1967,6 @@ mod tests {
         );
     }
 
-    /// Counting fake Developer Tools probe.
     fn fake_devtools(runs: &std::sync::atomic::AtomicUsize, at_ms: i64) -> DevToolProbe {
         runs.fetch_add(1, Ordering::AcqRel);
         DevToolProbe {
@@ -2041,12 +1978,10 @@ mod tests {
         }
     }
 
-    /// Fake bundle identifier for Developer Tools slot tests.
     fn fake_subject() -> Option<&'static str> {
         Some("com.example.subject")
     }
 
-    /// Developer Tools probe runs off-thread, caches for [`DEVTOOLS_TTL`], and retires on focus.
     #[test]
     fn the_devtools_probe_runs_on_a_worker_and_focus_gain_retires_it() {
         use std::sync::atomic::AtomicUsize;
@@ -2117,7 +2052,6 @@ mod tests {
         assert_eq!(RUNS.load(Ordering::Acquire), 3, "one refresh per TTL");
     }
 
-    /// Closed gate, `observer = false`, or unusable bundle id refuse the probe and retire cache.
     #[test]
     fn the_master_switch_and_observer_off_make_the_devtools_row_unknown() {
         use std::sync::atomic::AtomicUsize;
@@ -2228,7 +2162,6 @@ mod tests {
         assert!(row(&app).contains(" probe=observed "), "{}", row(&app));
     }
 
-    /// Cold bundle identity is warmed on the Developer Tools worker thread, not the reader.
     #[test]
     fn a_cold_identity_is_read_on_the_devtools_worker() {
         use std::sync::atomic::AtomicUsize;
@@ -2278,7 +2211,6 @@ mod tests {
         assert_eq!(WARMS.load(Ordering::Acquire), 1);
     }
 
-    /// Polled `status`, `await consent`, and cached panel reads never dispatch Developer Tools.
     #[test]
     fn the_polled_consent_paths_never_dispatch_the_devtools_probe() {
         use std::sync::atomic::AtomicUsize;
@@ -2318,7 +2250,6 @@ mod tests {
         assert!(!slot_idle(&app), "the full report's answer is cached");
     }
 
-    /// `await consent kind=debugger` caches within [`DEBUGGER_TTL`] and latches on mode changes.
     #[test]
     fn await_consent_kind_debugger_latches_on_a_mode_change_without_a_probe_per_poll() {
         use std::sync::atomic::{AtomicU8, AtomicUsize};
@@ -2432,7 +2363,6 @@ mod tests {
         );
     }
 
-    /// `next_refresh_deadline` returns a future deadline even while an expired entry refreshes.
     #[test]
     fn a_slot_refresh_is_always_due_after_now() {
         let ttl = DEBUGGER_TTL;
@@ -2499,7 +2429,6 @@ mod tests {
         );
     }
 
-    /// `await consent kind=debugger` never arms a baseline or schedules refresh when disabled.
     #[test]
     fn await_consent_kind_debugger_never_latches_without_a_reading() {
         let app = crate::App::headless_for_test();
@@ -2530,7 +2459,6 @@ mod tests {
         );
     }
 
-    /// Disabling `[privacy] enabled` reports `unknown` across all session consent fields.
     #[test]
     fn the_master_switch_makes_every_consent_field_unknown() {
         let mut app = crate::App::headless_for_test();
@@ -2601,7 +2529,6 @@ mod tests {
         );
     }
 
-    /// Config reloads republish the `[privacy]` policy mirror only when the section changes.
     #[test]
     fn a_config_reload_republishes_the_privacy_mirror() {
         use crate::app_colorscheme::install_resolved_colors::apply_config_text;
@@ -2663,14 +2590,12 @@ mod asynchronous_probe_tests {
         consent::classify_probe(consent::ProbeOutcome::Ok)
     }
 
-    /// Complete the FDA worker `ticket` with `probe` at `at`.
     fn complete(state: &ConsentState, ticket: Ticket, probe: FdaProbe, at: Instant) {
         state
             .shared
             .finish(&state.shared.fda, ticket, Some(probe), at);
     }
 
-    /// Sample debugger entry for slot tests.
     fn debugger_entry() -> DebuggerEntry {
         DebuggerEntry {
             probe: DebuggerProbe::refused(DebuggerProbeLabel::TimedOut),
@@ -2678,7 +2603,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Sample Developer Tools entry for slot tests.
     fn devtools_entry() -> DevToolsEntry {
         DevToolsEntry {
             probe: DevToolProbe::refused(DevToolProbeLabel::TimedOut),
@@ -2687,7 +2611,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Spec model for a probe slot that drops (`Serve = 0`) or serves (`Serve = 1`) stale entries.
     fn probe_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AsyncConsentProbePublication {
@@ -2728,7 +2651,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Instantiate [`probe_model`] with `Serve` bound to `serve`.
     fn probe_model_serving(serve: bool) -> aterm_spec::derive::Model {
         aterm_spec::interp::with_consts(&probe_model(), &[("Serve", i64::from(serve))])
     }
@@ -2741,7 +2663,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Spec model for the probe admission retry floor and `Forget` (`invalidate_census`).
     fn admission_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AsyncConsentProbeAdmission {
@@ -2778,7 +2699,6 @@ mod asynchronous_probe_tests {
         aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
     }
 
-    /// Repeated invalidations across all four slots preserve the retry floor and single-flight.
     #[test]
     fn focus_churn_conforms_to_the_admission_floor() {
         fn churn<E: Clone>(cell: &SlotCell<E>, value: E, forget: Option<&dyn Fn()>) {
@@ -2835,7 +2755,6 @@ mod asynchronous_probe_tests {
         );
     }
 
-    /// Taking `publication()` before reading state catches publications racing `wait_for_change`.
     #[test]
     fn a_publication_between_read_and_park_is_not_lost() {
         let state = synthetic_state();
@@ -2878,7 +2797,6 @@ mod asynchronous_probe_tests {
         );
     }
 
-    /// Retiring an empty or locked slot does not publish a change notification.
     #[test]
     fn a_no_op_retire_publishes_nothing() {
         let seq = |state: &ConsentState, kind: ChangeKind| state.publication().0[kind as usize];
@@ -2968,7 +2886,6 @@ mod asynchronous_probe_tests {
         assert_eq!(seq(&state, ChangeKind::Policy), before + 1);
     }
 
-    /// Resolve `privacy` into a [`ConsentPolicy`].
     fn section(privacy: crate::app_config::PrivacyConfig) -> ConsentPolicy {
         ConsentPolicy::from_config(&crate::app_config::Config {
             privacy: Some(privacy),
@@ -2976,7 +2893,6 @@ mod asynchronous_probe_tests {
         })
     }
 
-    /// [`ConsentPolicy`] with `check = false`.
     fn checks_off() -> ConsentPolicy {
         section(crate::app_config::PrivacyConfig {
             check: Some(false),
@@ -2984,7 +2900,6 @@ mod asynchronous_probe_tests {
         })
     }
 
-    /// Slot workers re-check the published [`ConsentPolicy`] on start and skip disabled probes.
     #[test]
     fn a_worker_probes_only_under_the_published_gate() {
         use crate::app_config::PrivacyConfig;
@@ -3101,7 +3016,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Observe the FDA counter and policy gate right after `publish`'s first publication bump.
     fn at_the_first_bump(
         state: &ConsentState,
         publish: impl FnOnce() + Send + 'static,
@@ -3131,7 +3045,6 @@ mod asynchronous_probe_tests {
         (bumped.0[fda] != seen.0[fda], gate)
     }
 
-    /// `publish_policy` updates the published policy before notifying waiters of FDA retirement.
     #[test]
     fn a_new_gate_is_published_before_its_retirement_wakes_anyone() {
         let answered = || {
@@ -3180,7 +3093,6 @@ mod asynchronous_probe_tests {
         );
     }
 
-    /// Conformance check of dropping (FDA) and serving (debugger) slots vs [`probe_model_serving`].
     #[test]
     fn async_probe_real_publication_conforms_to_the_bounded_model() {
         fn replay<E: Clone + PartialEq + std::fmt::Debug>(kind: SlotKind, stale: Stale, value: E) {
@@ -3334,7 +3246,6 @@ mod asynchronous_probe_tests {
         }
     }
 
-    /// Contended `SlotLock::Try` reads and `retire()` calls do not block on a held slot lock.
     #[test]
     fn contended_retire_refuses_old_grants() {
         fn contend<E: Clone>(cell: &SlotCell<E>, value: E) {
@@ -3372,7 +3283,6 @@ mod asynchronous_probe_tests {
         );
     }
 
-    /// A read racing `retire()` re-reads or restamps its ticket instead of serving a retired entry.
     #[test]
     fn a_read_overtaken_by_a_retirement_reads_again() {
         fn overtake<E: Clone + Send + Sync + 'static>(kind: SlotKind, stale: Stale, value: E) {
@@ -3447,7 +3357,6 @@ mod asynchronous_probe_tests {
         overtake(SlotKind::Debugger, Stale::Serve, debugger_entry());
     }
 
-    /// `fda_off_loop` waits on a contended lock to serve cache, while `fda` returns `Pending`.
     #[test]
     fn an_off_loop_read_waits_out_a_held_slot_lock() {
         let state = synthetic_state();
@@ -3531,7 +3440,6 @@ mod asynchronous_probe_tests {
         assert!(refresh.is_some(), "minimum freshness still expires");
     }
 
-    /// Passive `read_cached_at` serves fresh entries without admitting workers or mutating state.
     #[test]
     fn fda_cached_never_admits_and_serves_only_a_fresh_entry() {
         let state = synthetic_state();
@@ -3596,7 +3504,6 @@ mod asynchronous_probe_tests {
         );
     }
 
-    /// `spawn_failed` frees the slot on the next admitting read and enforces TTL/floor backoff.
     #[test]
     fn failed_worker_creation_releases_its_slot_with_bounded_backoff() {
         fn refused<E: Clone>(cell: &SlotCell<E>, ttl: Duration) {
@@ -3626,7 +3533,6 @@ mod asynchronous_probe_tests {
         refused(&state.shared.debugger, DEBUGGER_TTL);
     }
 
-    /// Slot completions wake the GUI with their own [`SlotKind`].
     #[test]
     fn a_census_completion_never_ticks_the_fda_card() {
         let state = synthetic_state();

@@ -173,25 +173,6 @@ impl TaskRecord {
         }
     }
 
-    /// Formats the `task-change` timeline event payload.
-    #[must_use]
-    pub(crate) fn event_payload(&self) -> String {
-        let mut out = format!(
-            "rev={} state={} attention={}",
-            self.rev,
-            self.state.as_str(),
-            u8::from(self.attention)
-        );
-        if let Some(why) = self.why {
-            out.push_str(" why=");
-            out.push_str(why);
-        }
-        if let Some(exit) = self.exit {
-            out.push_str(&format!(" exit={exit}"));
-        }
-        out
-    }
-
     /// Formats the record for seamless-update handoff ([`crate::session_store::SessionRecord::task`]).
     #[must_use]
     #[cfg(any(unix, test))]

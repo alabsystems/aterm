@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Turn-end policy exceptions ([`exception_for`]) and tab-chip [`outlook`](super::outlook::outlook)
-//! projections, phrased per [`TurnEndReading::program`].
+//! Turn-end exceptions ([`exception_for`]) and [`outlook`](super::outlook::outlook) projections.
 
 use std::time::{Duration, Instant};
 
@@ -114,7 +113,7 @@ impl Exception {
         }
     }
 
-    /// A stall no reader names (the canary's third rung, `wall_memory::Session::stuck_busy_note`).
+    /// A stall no reader names.
     #[must_use]
     pub fn stalled() -> Self {
         Self {
@@ -239,12 +238,7 @@ impl Exception {
     }
 }
 
-/// What a person does about a REFUSED REQUEST ([`Exception::refused`]):
-/// `(typed kinds, needles, action)` — the first row one of whose typed kinds
-/// is the one Claude Code wrote with the notice (its `apiError`, else its
-/// `error`, read from the session's transcript:
-/// [`TurnEndState::notice_typed`]), else the first whose needle the notice's
-/// words hold; the last row is every other.
+/// Action for a refused request ([`Exception::refused`], [`TurnEndState::notice_typed`]).
 const REFUSED_ACTIONS: &[(&[&str], &[&str], &str)] = &[
     (
         &["tool_history_mismatch"],
@@ -321,9 +315,6 @@ pub const FUTILE_AFTER: Duration = Duration::from_secs(60 * 60);
 /// How long a bucket no reset ends stands, its fallback not made, before it is an exception.
 pub const BUCKET_STUCK_AFTER: Duration = Duration::from_secs(60 * 60);
 
-/// What a person does about a Claude Code spend-class wall, by its notice's
-/// words: `(needle, why, action)`, the first row whose needle the lowercased
-/// message holds; the last row's empty needle catches the rest.
 const ACCOUNT_LIMITS: &[(&str, &str, &str)] = &[
     (
         "seat type doesn't include",
@@ -388,15 +379,12 @@ pub fn account_limit_text(message: &str) -> (&'static str, &'static str) {
     (row.1, row.2)
 }
 
-/// `fable` → `Fable`.
 fn title(alias: &str) -> String {
     let mut c = alias.chars();
     c.next()
         .map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
-/// The `(why, action)` for a spend-class wall's message in a session of
-/// `program`.
 fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
     match program {
         Program::Claude => account_limit_text(message),
@@ -419,13 +407,6 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Where a person reads what holds a limit an hour past its reset, in a
-/// session of `program`: Claude Code's usage page; Muse Code's `/upgrade`,
-/// which its usage wall names `for increased limits` (measured on 1.4.10;
-/// its `/status` and `/usage` cards draw the session's tokens, no limit);
-/// Gemini CLI's own `/stats model`, which its usage-limit dialog names
-/// (measured on 0.46.0);
-/// any other program's account, in words that name no vendor.
 const fn futile_action(program: Program) -> &'static str {
     match program {
         Program::Claude => "Check claude.ai/settings/usage for what holds it.",
@@ -438,9 +419,7 @@ const fn futile_action(program: Program) -> &'static str {
     }
 }
 
-/// A lost login's `(why, action, clears)` in a session of `program` the
-/// harness does not carry ([`super::login::carried`]: Claude Code's is
-/// [`claude_login`]'s, every point of it), its wall reading `message`.
+/// Lost-login details for `program` ([`super::login::carried`], [`claude_login`]).
 fn login_text(program: Program, message: &str) -> (&'static str, String, &'static str) {
     match program {
         Program::Agy => (
@@ -467,10 +446,8 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
     }
 }
 
-/// What ends a lost login's notice: the login back, or the agent working.
 const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent working";
 
-/// A draft's notice asks for a step that can actually empty its prompt.
 const fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText {
     NoticeText {
         todo: match composer {
@@ -511,10 +488,7 @@ pub(crate) fn draft_holds_limit_switch(
     )
 }
 
-/// A PERSON'S `/login` AT A CLAUDE CODE USAGE LIMIT: while the owner is in
-/// `/login` at a usage limit, its failure is surfaced just like a lost
-/// login's ([`notice::LOGIN_STOPPED`]); weekly usage limits themselves never
-/// raise a standing nag alert on the glass.
+/// Exception when the owner is in `/login` at a usage limit ([`notice::LOGIN_STOPPED`]).
 fn claude_limit_login(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -546,19 +520,7 @@ fn claude_limit_login(
     }
 }
 
-/// WHETHER ANOTHER ACCOUNT CAN TAKE THIS TAB OVER AT ITS USAGE LIMIT, as
-/// [`limit_roster_step`] needs it (the review of the login carry, r3h-2):
-/// `Ok` where a switch can follow the owner's step — the rotation on, and a
-/// relaunch that reaches the tab (`relaunch` and `resume_limits` on, Claude
-/// Code, a host that relaunches it or an upgrade holding the point for now:
-/// what `super::turn_end::account_rotates` asks of a move, a draft and a
-/// refused relaunch aside, which pass); `Err(Some(lines))` where the owner's
-/// aterm.toml keeps aterm from switching it, with EVERY line of its
-/// `[harness]` table that does ([`notice::stay_why`]: `accounts` off,
-/// `relaunch` off, `resume_limits` off, named together — the review of the
-/// login carry, r4h-2: named one at a time, the line the notice named was
-/// set and the next notice named another); `Err(None)` where nothing here
-/// relaunches the tab whatever aterm.toml says.
+/// Whether another account can take over ([`limit_roster_step`], [`notice::stay_why`]).
 fn limit_switch(
     reading: &TurnEndReading,
     cfg: &SupervisorConfig,
@@ -576,14 +538,10 @@ fn limit_switch(
     }
 }
 
-/// A notice a usage limit's tab is told ([`limit_roster_step`]): the text,
-/// the label it names and its `{why}`.
+/// A notice a usage limit's tab is told ([`limit_roster_step`]).
 type LimitStep<'a> = (&'static NoticeText, Option<&'a str>, Option<&'static str>);
 
-/// The notice a usage limit's tab is told where its login is a roster row's,
-/// or whose it is is not known ([`claude_limit_login`]), with the label it
-/// names and its `{why}`; `None` where no row is the login's and a sign-in in
-/// the tab is the owner's way on ([`RosterWord::Unlisted`], or no word).
+/// Notice for a usage-limit tab on a roster row ([`claude_limit_login`], [`RosterWord::Unlisted`]).
 fn limit_roster_step<'a>(
     word: Option<&'a RosterWord>,
     switch: Result<(), Option<&'static str>>,
@@ -668,14 +626,7 @@ fn limit_roster_step<'a>(
     })
 }
 
-/// CLAUDE CODE'S LOST LOGIN, CARRIED BY THE HARNESS UP TO THE SIGN-IN
-/// ([`super::login`], the owner's ): `Some` at a point of
-/// such an episode — the wall's row, `/login`'s dialog over the lost login
-/// this loop tracks, `Login interrupted` under it, or the row off the screen
-/// while its track stands with `/login` typed — with the notice that stands
-/// there, `None` inside while aterm is still working on it; `None` for any
-/// other point, a `/login` a person opened on a working session included
-/// (nothing was lost).
+/// CLAUDE CODE'S LOST LOGIN ([`super::login`]).
 fn claude_login(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -765,8 +716,6 @@ fn claude_login(
         };
     }
     if !walled {
-        // The row off the screen with nothing typed (a person's `/status`):
-        // nothing has failed yet.
         return Some(None);
     }
     let label = reading.login_label.as_deref().filter(|_| cfg.logins);

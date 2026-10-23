@@ -202,7 +202,8 @@ pub(crate) struct LineSpan {
     pub(crate) end: usize,
 }
 
-/// A text's lines, by the rule in the module docs.
+/// A text's lines: split at `\n` (a `\r` before it is part of the end-of-line), starting past
+/// a leading byte-order mark, with no empty line after a final end-of-line.
 #[derive(Clone, Debug)]
 pub(crate) struct Lines<'t> {
     text: &'t str,

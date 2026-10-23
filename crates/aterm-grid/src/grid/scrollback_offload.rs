@@ -13,7 +13,7 @@ use super::scroll_convert::LazyBuffer;
 use super::state::{DetachedReaderAim, FillDebt, PendingScrollbackSettings};
 use crate::Damage;
 
-/// How many screens of cells.
+/// How many screens of cells an offloaded resize holds back from its job.
 pub(super) const HOLD_BACK_SCREENS: usize = 4;
 
 /// One reader-facing viewport gesture ([`Grid::note_detached_reader_motion`]).
@@ -27,7 +27,8 @@ pub(crate) enum ReaderMotion {
     Live,
 }
 
-/// A live-relative aim of `rows`.
+/// A live-relative aim of `rows` taken at `at_counter`, grown by the lines that scrolled into
+/// history since (`counter`); an aim of 0 (the live bottom) stays there.
 #[inline]
 fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
     if rows == 0 {
@@ -37,7 +38,7 @@ fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize {
 }
 
 impl DetachedReaderAim {
-    /// The `display_offset` this aim names once the whole history.
+    /// The `display_offset` this aim names once the whole history (`sb` lines) is back.
     #[inline]
     fn resolve(self, counter: u64, sb: usize, restored: usize) -> usize {
         match self {
@@ -114,7 +115,7 @@ trust_island! {
 pub struct PendingScrollbackReflow {
     store: ScrollbackStorage,
     lazy_lines: Vec<Line>,
-    /// The rows staged for the store at ([`LazyBuffer::take_staged`], [`ReflowStep`]).
+    /// The rows staged for the store at (re)detach, still raw ([`LazyBuffer::take_staged`]).
     lazy_staged: Box<LazyBuffer>,
     /// The ring's scrollback rows, materialized at detach ([`ReflowedScrollback::ring_out`]).
     ring_lines: Vec<Line>,

@@ -13,15 +13,12 @@ use crate::harness::upgrade::{Facts, Step};
 use crate::harness::upgrade_drive::watch::look_word;
 use crate::harness::upgrade_drive::{WATCH_GAP, at_point};
 
-/// The target the reducer is asked about.
 const TARGET: &str = "2.1.284";
 
-/// The committed machine at `Buggy = 0` with its gap latch clear.
 fn main_today() -> Model {
     interp::with_buggy(&harness_upgrade_progress_model(), 0)
 }
 
-/// The committed machine with the gap latch `name` (`keep`) set from the start: the gap open.
 fn latched(name: &str) -> Model {
     let mut m = main_today();
     for v in &mut m.vars {
@@ -32,7 +29,6 @@ fn latched(name: &str) -> Model {
     m
 }
 
-/// Every state `m` reaches, in breadth-first order.
 fn reach(m: &Model) -> Vec<State> {
     let mut seen: BTreeSet<State> = BTreeSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
@@ -55,14 +51,8 @@ fn with(s: &State, var: &'static str, value: i64) -> State {
     s
 }
 
-/// How long the session has been behind, the classifier's horizons between them: an hour, an
-/// hour past [`STALLED_AFTER_S`] (six hours: a word in `--status`, no alert), an hour past
-/// [`MOVE_BUDGET_S`] (the day the agent's own work becomes one digest line).
 const BEHIND: [u64; 3] = [3_600, STALLED_AFTER_S + 3_600, MOVE_BUDGET_S + 3_600];
 
-/// The record's phase at a state: an announced round at its last ask (the
-/// machine's one ask), its notice a minute old or past its window; a round
-/// that gave up; the move under way.
 fn phase_of(s: &State) -> Phase {
     let window = if s["clock"] == 1 {
         upgrade::REASK_S + 60
@@ -83,18 +73,12 @@ fn phase_of(s: &State) -> Phase {
 /// Where a look is taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Look {
-    /// At a point the loop offers: at a settled break, the break's step
-    /// (`background_point`).
+    /// At a point the loop offers: at a settled break, the break's step (`background_point`).
     Point,
     /// The watch's dry read, off any point: it never knows a break.
     Read,
 }
 
-/// The facts a look at state `s` reads, as `upgrade_drive`'s `look` builds
-/// them: a turn running (Claude busy, the busy footer, no idle read), a
-/// settled break (Claude busy under its background work), an idle point (idle
-/// and settled), a usage limit's wall, a box up; processes under the agent
-/// (`work`); the READY's age and the stop's rest as the round's clock says.
 fn facts(s: &State, look: Look) -> Facts {
     let clock = s["clock"] == 1;
     let mut f = Facts {
@@ -138,8 +122,6 @@ fn facts(s: &State, look: Look) -> Facts {
     f
 }
 
-/// The real step at state `s` for a look: `requested_step`, and at a
-/// settled break's point the one rule both drivers hold a break to.
 fn real_step(s: &State, look: Look) -> (Step, Facts) {
     let f = facts(s, look);
     let step = upgrade::requested_step(
@@ -158,10 +140,6 @@ fn real_step(s: &State, look: Look) -> (Step, Facts) {
     (step, f)
 }
 
-/// The dry run's word for the real `step` at a read with facts `f`, as the
-/// visit says it: the act's own word, and after it what holds the point it
-/// waits for ([`upgrade::held_point`], [`at_point`]) — the word the host's
-/// watch reads.
 fn dry_word(step: &Step, f: &Facts) -> String {
     let act = match step {
         Step::Wait(why) => return format!("wait:{why}"),
@@ -178,8 +156,6 @@ fn dry_word(step: &Step, f: &Facts) -> String {
     }
 }
 
-/// The machine's class of a recorded wait word ([`wait_class`], as
-/// [`progress_projection`] reads it).
 fn class(word: &str) -> i64 {
     match wait_class(word) {
         WaitClass::OwnWork => 0,
@@ -189,8 +165,6 @@ fn class(word: &str) -> i64 {
     }
 }
 
-/// The 0.94 break arm: at a break of the agent's own work every phase waited
-/// `background` before the phase was looked at (no notice, give-up or re-arm).
 fn break_arm_094(s: &State, look: Look) -> Step {
     let (step, f) = real_step(s, look);
     if f.background_point {
@@ -200,8 +174,6 @@ fn break_arm_094(s: &State, look: Look) -> Step {
     }
 }
 
-/// The terminal stop: a stopped round waited `failed` for good, never
-/// re-armed.
 fn terminal_stop(s: &State, look: Look) -> Step {
     let (step, _) = real_step(s, look);
     if matches!(phase_of(s), Phase::Failed(_)) {
@@ -211,7 +183,6 @@ fn terminal_stop(s: &State, look: Look) -> Step {
     }
 }
 
-/// The phase a real act lands the round in, in the machine's terms.
 fn lands(step: Step) -> Option<i64> {
     match step {
         Step::Announce => Some(1),
@@ -222,7 +193,6 @@ fn lands(step: Step) -> Option<i64> {
     }
 }
 
-/// T1-a, the reducer of the ask-and-drain flow.
 #[test]
 fn the_real_reducer_is_the_derived_machine() {
     use aterm_spec::xref;
@@ -369,10 +339,6 @@ fn the_real_reducer_is_the_derived_machine() {
     }
 }
 
-/// The facts the watch's dry read reads at state `s` under the quiet upgrade
-/// ([`Facts::quiet`]): T1-a's read ([`facts`], no break known) with the flow
-/// set, the owner told long since (every state here is an hour behind or
-/// more), and a limit's notice a grace past its named reset read as no limit.
 fn quiet_facts(s: &State) -> Facts {
     let mut f = facts(s, Look::Read);
     f.quiet = true;
@@ -383,8 +349,6 @@ fn quiet_facts(s: &State) -> Facts {
     f
 }
 
-/// The word the real watch records of the real reducer's read at `s` with
-/// facts `f` ([`dry_word`], [`look_word`]).
 fn read_word(s: &State, f: &Facts) -> String {
     let step = upgrade::requested_step(
         &Request::None,
@@ -397,8 +361,6 @@ fn read_word(s: &State, f: &Facts) -> String {
     look_word(&dry_word(&step, f), true, || f.status.clone())
 }
 
-/// What holds the quiet upgrade's restart at `s`, as classes of the machine's `cause`; `None`
-/// where nothing does (the neutral word's).
 fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
     if s["phase"] == 2 && s["clock"] == 0 {
         return Some(BTreeSet::from([0]));
@@ -418,8 +380,6 @@ fn quiet_truth(s: &State) -> Option<BTreeSet<i64>> {
     }
 }
 
-/// Whether `word`, recorded at `s`, says what holds the quiet restart there
-/// ([`quiet_truth`]).
 fn quiet_bound(s: &State, word: &str) -> bool {
     match quiet_truth(s) {
         None => word == upgrade::NEXT_POINT,
@@ -427,10 +387,6 @@ fn quiet_bound(s: &State, word: &str) -> bool {
     }
 }
 
-/// T1-a', the quiet upgrade's read. The quiet flow's one step is the
-/// restart at a genuinely idle point ([`upgrade::quiet_step`]); what it shares with the machine is
-/// the recorded word, bound over every reachable state read quietly ([`quiet_facts`],
-/// [`quiet_truth`]).
 #[test]
 fn the_quiet_upgrades_read_records_what_holds_its_restart() {
     let today = main_today();
@@ -499,11 +455,6 @@ fn the_quiet_upgrades_read_records_what_holds_its_restart() {
     );
 }
 
-/// The record a state stands for: its phase, the class of its recorded
-/// wait by a word of that class (its own work in the words each phase
-/// records; a person's box; a limit; an act's empty word), how long it has
-/// been `behind`, the round's clock through its stamps, a re-armed round's
-/// `last_stop`.
 fn row(s: &State, behind: u64, progress: u64) -> Row {
     let phase = match phase_of(s) {
         Phase::Announced { asks, .. } if progress != NOW - 60 => Phase::Announced {
@@ -558,8 +509,6 @@ fn row(s: &State, behind: u64, progress: u64) -> Row {
     }
 }
 
-/// Every instant in `(from, horizon]` the view names for `rows`, one
-/// [`next_change`] after another — when the host looks again by time alone.
 fn named(rows: &[Row], from: u64, horizon: u64) -> BTreeSet<u64> {
     let mut out = BTreeSet::new();
     let mut t = from;
@@ -573,10 +522,6 @@ fn named(rows: &[Row], from: u64, horizon: u64) -> BTreeSet<u64> {
     out
 }
 
-/// The instants in `(from, horizon]` at which `row`'s owner-facing class
-/// turns by time alone, among `candidates` (every stamp its deadlines are
-/// counted from, plus each deadline): where [`Row::attention`]'s level one
-/// second before differs from it at the instant.
 fn turns(row: &Row, from: u64, horizon: u64, candidates: &[u64]) -> BTreeSet<u64> {
     candidates
         .iter()
@@ -586,9 +531,6 @@ fn turns(row: &Row, from: u64, horizon: u64, candidates: &[u64]) -> BTreeSet<u64
         .collect()
 }
 
-/// A record's deadlines: the classifier's horizons counted from each stamp
-/// it keeps, the round's window and rest, a refused notice's tell, a limit's
-/// reset and grace.
 fn deadlines(row: &Row) -> Vec<u64> {
     let at_s = match row.phase {
         Phase::Announced { at_s, .. } => at_s,
@@ -625,7 +567,6 @@ fn deadlines(row: &Row) -> Vec<u64> {
     out
 }
 
-/// T1-f, the classifier over the machine's states.
 #[test]
 fn the_real_view_is_the_derived_machine() {
     use aterm_spec::xref;
@@ -711,10 +652,6 @@ fn the_real_view_is_the_derived_machine() {
     );
 }
 
-/// The record a state stands for under the quiet flow ([`Row::quiet`], `upgrade_ask = false`, the
-/// default): [`row`] read with the flow set, the world's `reset` passed where the quiet flow's tell
-/// has (a limit past the reset its row named, [`QUIET_MOVE_S`] after the instant the quiet move may
-/// first go, [`Row::limit_passed`]).
 fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
     let r = row(s, behind, progress);
     Row {
@@ -727,9 +664,6 @@ fn quiet_row(s: &State, behind: u64, progress: u64) -> Row {
     }
 }
 
-/// T1-f', the classifier under the quiet flow: it reads the flow its rows are read under (an
-/// announced round nothing asks again judged as pending, a limit past its named reset told only
-/// after the quiet move's chance).
 #[test]
 fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     let today = main_today();
@@ -806,10 +740,6 @@ fn the_real_quiet_view_is_the_derived_machine_read_quietly() {
     );
 }
 
-/// The refused notice's instant is named: a notice aterm's own fence refused is aterm's fault to
-/// fix [`TELL_S`] after the first refusal ([`Row::refused_notice`]), before the move is overdue,
-/// and [`next_change`] names `refused_at + TELL_S`, so the host looks then rather than at the next
-/// watch (up to [`WATCH_GAP`] later).
 #[test]
 fn the_refused_notices_tell_is_an_instant_the_view_names() {
     let refused = Row {

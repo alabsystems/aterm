@@ -1,32 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `wasm-glue` check (`verify wasm-glue`; `verify glue --record-toy`
-//! re-records): the generator on a real module.
-//!
-//! 1. Build the toy (`crates/aterm-wasm-abi/tests/toy`, one export per
-//!    boundary type) for `wasm32-unknown-unknown` on rustup's stable.
-//!    STOCK EXCEPTION: Trust has no wasm32 std. The toy and the crates it
-//!    builds from are copied into one scratch workspace ([`stage`]) and
-//!    built from a neutral cwd, so no repo config and no lock file in the
-//!    tree is involved, and cargo hands rustc paths relative to that
-//!    workspace: the module's panic locations read `crates/...`, never this
-//!    checkout's path. A module that still carries a host path fails the
-//!    gate ([`host_paths`]): the committed fixture ships with the source,
-//!    and the export guard refuses a home path in any file.
-//! 2. Bind it and compare the text files with the goldens under
-//!    `tests/toy/golden/`. `--record-toy` rewrites them, and the module
-//!    fixture the native golden test (`super::tests`) binds, after review.
-//! 3. Run `tests/toy/drive.mjs` on the fresh glue in a page of the pinned
-//!    chrome-headless-shell ([`crate::wasm_page`]).
-//! 4. NEGATIVE CONTROL: plant one wrong conversion (a `u32` return read as
-//!    signed) in a copy of the glue; the driver must fail on it, by name.
-//!
-//! A machine without the pinned browser or the stable wasm32 std is COULD
-//! NOT RUN naming the provider, found before anything builds.
-//! Progress goes to the caller's log, never the terminal. The check's second
-//! row, [`super::oracle`], holds the goldens and the driver to wasm-bindgen
-//! 0.2.108.
+//! The `wasm-glue` check (`verify wasm-glue`): STOCK EXCEPTION (`wasm32-unknown-unknown`).
+//! Builds the toy in a scratch workspace ([`stage`]), refuses a module carrying a host path
+//! ([`host_paths`]), compares its glue with the goldens and drives it in a page
+//! ([`crate::wasm_page`]); the check's second row is [`super::oracle`].
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -57,8 +35,7 @@ pub(crate) fn golden_dir(root: &Path) -> PathBuf {
 pub(crate) const GLUE: &str = "glue";
 const GLUE_URL: &str = "../glue/aterm_wasm_abi_toy.js";
 
-/// The glue's text files, which have goldens (the `_bg.wasm` is the
-/// module's own bytes, and differs with the compiler).
+/// The glue's text files.
 pub(crate) fn is_text(name: &str) -> bool {
     !name.ends_with(".wasm")
 }
@@ -77,8 +54,7 @@ pub(crate) fn first_difference(got: &str, want: &str) -> String {
     )
 }
 
-/// The check over the checkout at `root`, building in `work`; its progress
-/// lines are appended to `log`.
+/// The check over the checkout at `root`, building in `work`.
 pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> LaneRun {
     let browser = match crate::wasm_page::browser() {
         Ok(browser) => browser,
@@ -157,7 +133,6 @@ fn run(
         let _ = writeln!(log, "  recorded the goldens and {}", fixture.display());
     }
 
-    // NEGATIVE CONTROL's glue: the same with a u32 return read as signed.
     let planted = site.join("planted");
     std::fs::create_dir_all(&planted)
         .map_err(|e| failed(format!("could not create {}: {e}", planted.display())))?;
@@ -201,17 +176,12 @@ fn run(
     Ok(())
 }
 
-/// The workspace crates the toy's module is built from: aterm-wasm-abi and
-/// its closure. A crate that joins the closure fails the staged build, by
-/// name, until it is listed here.
 const STAGED: [&str; 3] = [
     "aterm-wasm-abi",
     "aterm-wasm-abi-macros",
     "aterm-macro-support",
 ];
 
-/// The tables of `manifest` whose header starts with `prefix`, each from its
-/// header to the next header, as written.
 fn tables(manifest: &str, prefix: &str) -> String {
     let mut out = String::new();
     let mut inside = false;
@@ -227,7 +197,6 @@ fn tables(manifest: &str, prefix: &str) -> String {
     out
 }
 
-/// Copy the files under `from` into `to`, recursively.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("could not create {}: {e}", to.display()))?;
     for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
@@ -243,11 +212,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Stage the toy at the root of a scratch workspace `dir`, with the crates
-/// it builds from ([`STAGED`]: each one's manifest and `src/`) under
-/// `crates/` as members. The root manifest is the toy's, with the
-/// workspace's own `[workspace.package]`, lints and dependency rows for the
-/// staged crates, so they build as they do in the tree.
+/// Stage the toy at the root of a scratch workspace `dir` ([`STAGED`]).
 pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)
@@ -302,8 +267,6 @@ pub(super) fn stage(root: &Path, dir: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The absolute host paths in `bytes`, with their context: this checkout's
-/// `root`, the home directory, and anything under `/Users/` or `/home/`.
 fn host_paths(bytes: &[u8], root: &Path) -> Vec<String> {
     let mut needles = vec![
         root.display().to_string(),
@@ -333,14 +296,15 @@ fn host_paths(bytes: &[u8], root: &Path) -> Vec<String> {
     found
 }
 
-/// Build the toy for wasm32 on stable; the module cargo wrote.
 fn build(root: &Path, rustup: &Path, work: &Path, log: &mut String) -> Result<PathBuf, String> {
     let manifest = stage(root, &work.join("stage"))?;
     build_staged(rustup, &manifest, &work.join("target"), "the toy", log)
 }
 
 /// Build the staged crate at `manifest` (`what`, for the log) for wasm32,
-/// release, on stable, into `target`; the module cargo wrote.
+/// release, on stable, into `target`, with stable's library sources at the path
+/// its standard library was built at ([`crate::rustup::Toolchain::std_source_remap`]),
+/// so no host path reaches the module; the module cargo wrote.
 pub(super) fn build_staged(
     rustup: &Path,
     manifest: &Path,
@@ -350,6 +314,7 @@ pub(super) fn build_staged(
 ) -> Result<PathBuf, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std (module doc).
     let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
+    let remap = stable.std_source_remap()?;
     let neutral = std::env::temp_dir().join(format!("aterm-wasm-glue-{}", std::process::id()));
     std::fs::create_dir_all(&neutral)
         .map_err(|e| format!("could not create {}: {e}", neutral.display()))?;
@@ -361,7 +326,7 @@ pub(super) fn build_staged(
     let built = stable
         .cargo()
         .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("CARGO_ENCODED_RUSTFLAGS", remap)
         .env("CARGO_TARGET_DIR", target)
         .current_dir(&neutral)
         .args([

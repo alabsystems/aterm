@@ -14,7 +14,7 @@ pub const HIDDEN_VERB: &str = "__selfupdate";
 /// Re-entry guard environment variable (`__ATPKG_SELFUPDATE_PID`).
 pub const REENTRY_VAR: &str = "__ATPKG_SELFUPDATE_PID";
 
-/// Child `--wait-lock` bound in seconds ([`aterm_update_core::pkg_check::PASS_TIMEOUT_SECS`]).
+/// Child `--wait-lock` bound in seconds ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]).
 pub const WAIT_LOCK_SECS: u64 = aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS;
 
 /// Returns `program`'s vendor row, or `None` for non-agent programs.
@@ -211,7 +211,8 @@ fn build_words(build: Option<u64>) -> String {
     )
 }
 
-/// Formats the stderr announcement line before spawning the update child ([`crate::vendor::build_words`]).
+/// Formats the stderr announcement line before spawning the update child
+/// ([`crate::vendor_direct::have_words`]).
 #[must_use]
 pub fn announce_line(row: &VendorSpec, have: &str) -> String {
     let p = row.program;

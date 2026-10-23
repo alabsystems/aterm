@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The split set's host side (`crate::vitals_host`, THE SPLIT SET): which readings are split ticks,
-//! the cold pair a `sys why` pull takes, and what is kept (known-start births and the timeline) or
-//! refreshed (lead identities), through a stand-in kernel ([`STAND_IN`]) that counts its reads on
-//! the test's thread.
+//! Tests for split-set sampling and `sys why` cold reads on [`crate::vitals_host`].
 
 use std::cell::{Cell, RefCell};
 
@@ -28,14 +25,15 @@ struct Reads {
 }
 
 thread_local! {
-    /// What the stand-in kernel holds on this thread: each pid's short name,
-    /// birth (unix ms), and whether Apple signed it.
     static KERNEL: RefCell<HashMap<u32, (String, i64, bool)>> = RefCell::new(HashMap::new());
-    /// Its `kern.waketime`.
     static WAKE: Cell<Option<i64>> = const { Cell::new(None) };
-    /// A pid whose next identity read misses (gone, or an exec mid-read).
     static MISSES: Cell<Option<u32>> = const { Cell::new(None) };
-    /// Its reads so far.
+    /// Execs so far, which every pid version reads moved by.
+    static EXECS: Cell<i32> = const { Cell::new(0) };
+    /// A pid that execs while its identity is read.
+    static RACES: Cell<Option<u32>> = const { Cell::new(None) };
+    /// A pid whose pid version reads nothing.
+    static UNVERSIONED: Cell<Option<u32>> = const { Cell::new(None) };
     static READS: Cell<Reads> = const {
         Cell::new(Reads {
             coalitions: 0,
@@ -48,18 +46,15 @@ thread_local! {
     };
 }
 
-/// Count one read.
 fn count(read: impl FnOnce(&mut Reads)) {
     let mut reads = READS.get();
     read(&mut reads);
     READS.set(reads);
 }
 
-/// The stand-in kernel's readers: the self-check passes; the sweep is the
-/// machine's, counted where it reads each process's coalition; the list holds
-/// one coalition whose counters do not move; a birth (or the whole table), an
-/// identity (Apple's, or a Developer ID; none once for [`MISSES`]) and the
-/// timeline are the thread's [`KERNEL`] and [`WAKE`].
+/// The stand-in kernel: a process's image and signature change only by an
+/// exec, which moves its pid version, so a pid's version here moves with its
+/// row's name and signature, and with each exec ([`EXECS`]).
 const STAND_IN: CoalProbe = CoalProbe {
     self_check: |_| Ok(1),
     sweep: |opts| {
@@ -100,6 +95,10 @@ const STAND_IN: CoalProbe = CoalProbe {
     },
     identity: |pid| {
         count(|r| r.identities += 1);
+        if RACES.get() == Some(pid) {
+            RACES.set(None);
+            EXECS.set(EXECS.get() + 1);
+        }
         if MISSES.get() == Some(pid) {
             MISSES.set(None);
             return None;
@@ -117,6 +116,18 @@ const STAND_IN: CoalProbe = CoalProbe {
             })
         })
     },
+    version: |pid| {
+        if UNVERSIONED.get() == Some(pid) {
+            return None;
+        }
+        KERNEL.with(|k| {
+            k.borrow().get(&pid).map(|(name, _, apple)| {
+                name.bytes().fold(EXECS.get() + i32::from(*apple), |v, b| {
+                    v.wrapping_mul(31).wrapping_add(i32::from(b))
+                })
+            })
+        })
+    },
     timeline: || {
         count(|r| r.timelines += 1);
         Some(Timeline {
@@ -128,7 +139,6 @@ const STAND_IN: CoalProbe = CoalProbe {
     waketime_ms: || WAKE.get(),
 };
 
-/// The stand-in kernel holds `rows`: pid, short name, birth, Apple's.
 fn kernel(rows: &[(u32, &str, i64, bool)]) {
     KERNEL.with(|k| {
         *k.borrow_mut() = rows
@@ -138,12 +148,10 @@ fn kernel(rows: &[(u32, &str, i64, bool)]) {
     });
 }
 
-/// A gauge of its own for one test: arming it arms no other test's split.
 fn gauge() -> &'static Arming {
     Box::leak(Box::new(Arming::new()))
 }
 
-/// A reader of this machine whose coalition lane is the stand-in's.
 fn stand_in_reader() -> (Reader, &'static Arming) {
     let armed = gauge();
     let mut reader = Reader::new(Arc::default());
@@ -151,8 +159,6 @@ fn stand_in_reader() -> (Reader, &'static Arming) {
     (reader, armed)
 }
 
-/// The bars' request at their focused cadence, a window in view drawing the
-/// Deck.
 fn bars() -> Request {
     Request {
         self_pid: std::process::id(),
@@ -162,22 +168,10 @@ fn bars() -> Request {
     }
 }
 
-/// When the split tick before the next reading read: now, as the reading
-/// just taken left it, however long that took.
 fn just_read(reader: &mut Reader) {
     reader.split.last = Some(Instant::now());
 }
 
-/// THE SPLIT TICKS (RD §3.1): the bars' readings read the split set once
-/// every five seconds at their 1 s cadence, once a second at a lens's 0.5 s,
-/// and at each of the background's 5 s readings, a reading a few ms early
-/// within half its cadence of the period; a pull only while a `sys why` arms
-/// it, at least the shortest window after the last. NEGATIVE CONTROLS: the
-/// engine's readings (an edge, the disk watch's look, its demand), a hidden
-/// deck's machine counters, the Fleet Monitor tab's readings with no bars in
-/// view and an unarmed pull (a plain `sys`, an `await sys` wait) read none
-/// however long it has been, and an armed pull inside the shortest window
-/// reads none.
 #[test]
 fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
     let t0 = Instant::now();
@@ -234,13 +228,6 @@ fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
     assert!(split_due(Some(t0), &pulled, true, t0 + MIN_WINDOW));
 }
 
-/// THE READINGS THAT READ THE COALITIONS (RD §6.3, Host), through
-/// a reader of this machine with the stand-in lane: the bars' first reading
-/// reads the list and each process's coalition in its sweep, once, and the
-/// next, taken at once, neither; a warm pull while a `sys why` arms the
-/// split reads them once. NEGATIVE CONTROLS: a hidden deck's machine
-/// counters, the jobs engine's reading, the Fleet Monitor tab's with no bars
-/// in view and an unarmed pull read neither.
 #[test]
 fn the_coalitions_are_read_on_split_ticks_only() {
     let (mut reader, armed) = stand_in_reader();
@@ -280,8 +267,6 @@ fn the_coalitions_are_read_on_split_ticks_only() {
     assert_eq!(reads(), (2, 2), "a warm pull while armed");
 }
 
-/// THE LOOP ASKS FOR SPLIT TICKS ONLY WHILE A WINDOW IN VIEW SHOWS THE BARS
-/// ([`Request::deck`]): the Deck, or the Sill (a close-up opens from either).
 #[test]
 fn the_loop_asks_for_split_ticks_only_while_a_window_in_view_shows_the_bars() {
     let mut app = crate::App::headless_for_test();
@@ -307,10 +292,6 @@ fn the_loop_asks_for_split_ticks_only_while_a_window_in_view_shows_the_bars() {
     assert!(!deck(&app), "every window occluded");
 }
 
-/// The split facts `snap` carries are its own reading's (none carried from
-/// an earlier one), by coalition, over a window at least the cold pair's
-/// spacing and at most the longest a window can be. Unix: the split counts
-/// this user's processes, whose uid Windows does not read.
 fn assert_window(snap: &Snapshot) {
     if cfg!(unix) {
         let why = snap.why.as_deref().expect("the split's facts");
@@ -324,12 +305,6 @@ fn assert_window(snap: &Snapshot) {
     }
 }
 
-/// AN ARMED PULL WITH NO FRESH SPLIT TICK READS A PAIR, SO ITS REPLY HAS A
-/// WINDOW: with none yet, the base and then the window's end, the cold
-/// pair's spacing apart; with the last one (on the host's clock and the
-/// model's) over a minute old while the last whole reading is fresh, the
-/// same. NEGATIVE CONTROL: unarmed, that pull is warm and reads no
-/// coalition.
 #[test]
 fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     let (mut reader, armed) = stand_in_reader();
@@ -360,8 +335,6 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     assert_eq!(READS.take().coalitions, 0);
 }
 
-/// A source whose pull is cold for the split (or not), noting when each of
-/// its readings was taken.
 struct Paced {
     vitals: aterm_vitals::Vitals,
     cold: bool,
@@ -383,9 +356,6 @@ impl Source for Paced {
     }
 }
 
-/// A PULL COLD FOR THE SPLIT ALONE STILL KEEPS THE FLOOR: the last whole
-/// reading just taken, its pair's first reading comes at least
-/// [`MIN_WINDOW`] after it, so no rate the model takes is over less.
 #[test]
 fn a_pull_cold_for_the_split_alone_keeps_the_floor() {
     for (cold, readings) in [(true, 2), (false, 1)] {
@@ -404,9 +374,6 @@ fn a_pull_cold_for_the_split_alone_keeps_the_floor() {
     }
 }
 
-/// A PULL IS COLD FOR THE SPLIT A MARGIN INSIDE THE LONGEST WINDOW: armed,
-/// with the last split tick a hair inside [`SPLIT_WINDOW_MAX`] when it looks
-/// (past it by the time its reading's stamp is taken), it reads a pair.
 #[test]
 fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
     let armed = gauge();
@@ -421,10 +388,6 @@ fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
     assert!(!split.cold(inside), "the margin and more inside");
 }
 
-/// A KERNEL RECORD'S NAME IS THE SWEPT ONE WHOLE, OR CUT BY ONE AT 16 BYTES
-/// (the short info holds 15), a letter the cut splits read as the sweep
-/// decodes it. NEGATIVE CONTROL: a shorter swept name that begins a longer
-/// record's is another process's.
 #[test]
 fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
     assert!(names_the_same("mds_stores", "mds_stores"));
@@ -440,7 +403,8 @@ fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
 /// THE KERNEL'S READERS READ THIS PROCESS AS A SPLIT TICK TAKES IT (macOS,
 /// live, [`CoalProbe::KERNEL`]): the self-check passes and launchd reads as
 /// Apple's, so the lane is on and vouches; the sweep asked for coalitions
-/// reads this process's, the one the self-check named; and its birth reads
+/// reads this process's, the one the self-check named; its pid version and
+/// launchd's read, its own the same twice; and its birth reads
 /// the same in unix ms through its record, through the table and through
 /// its BSD info (`aterm_uds::process::read_process_birth`), under a name
 /// that is the sweep's for it, which the sweep holds cut (the test binary,
@@ -478,9 +442,11 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
     );
     let (launchd, _) = (kernel.birth)(1).expect("launchd's record");
     assert!(!names_the_same(&launchd, &row.name), "{launchd:?}");
+    let version = (kernel.version)(me).expect("this process's pid version");
+    assert_eq!((kernel.version)(me), Some(version), "no exec between");
+    assert!((kernel.version)(1).is_some(), "launchd's, another user's");
 }
 
-/// A long gap refreshes births even when the sweep's start stayed known.
 #[test]
 fn after_a_long_gap_every_birth_and_identity_is_read_again() {
     let now = Cell::new(Instant::now());
@@ -493,7 +459,7 @@ fn after_a_long_gap_every_birth_and_identity_is_read_again() {
     READS.take();
     let s = tick(&mut split, procs.clone());
     assert_eq!(births(&s), [Some(2_000), Some(1_000)], "inside a window");
-    assert_eq!(sent(&s).len(), 2, "identities are refreshed");
+    assert_eq!(sent(&s).len(), 2, "every lead is sent");
     now.set(now.get() + SPLIT_WINDOW_MAX + Duration::from_secs(1));
     let s = tick(&mut split, procs.clone());
     assert_eq!(births(&s), [Some(9_000), Some(1_000)]);
@@ -505,7 +471,11 @@ fn after_a_long_gap_every_birth_and_identity_is_read_again() {
         ]
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (2, 4));
+    assert_eq!(
+        (r.births, r.identities),
+        (2, 2),
+        "kept inside the window, read again after the gap"
+    );
 
     for p in &mut procs {
         p.start = None;
@@ -516,14 +486,20 @@ fn after_a_long_gap_every_birth_and_identity_is_read_again() {
         assert_eq!(births(&s), [Some(born), Some(1_000)], "no start: {born}");
     }
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (4, 4));
+    assert_eq!(
+        (r.births, r.identities),
+        (4, 2),
+        "a lead born anew is read again; launchd's is kept"
+    );
 }
 
-/// A LEAD WHOSE IDENTITY READ MISSES (gone, or an exec mid-read) IS ASKED
-/// AGAIN AT THE NEXT TICK, and sent then. Each miss, even after a successful
-/// read, sends unknown so the model cannot keep a previous image or voucher.
+/// A lead's identity is read once and kept while its birth and pid version
+/// stay; an exec (its version moved) reads it again, a missed read is
+/// unknown and asked again at the next tick, a read an exec raced is unknown
+/// and asked again, and a lead whose version reads nothing is read at every
+/// tick. NEGATIVE CONTROL: with nothing moved, nothing is read again.
 #[test]
-fn a_lead_whose_identity_misses_is_asked_again_at_the_next_tick() {
+fn a_lead_identity_is_read_again_only_after_an_exec_or_a_miss() {
     let now = Instant::now();
     let tick = |split: &mut SplitReader, procs| tick_at(split, procs, now);
     kernel(&[(1, "launchd", 1_000, true), (387, "mds", 2_000, true)]);
@@ -540,25 +516,57 @@ fn a_lead_whose_identity_misses_is_asked_again_at_the_next_tick() {
         sent(&tick(&mut split, procs.clone())),
         [(387, 2_000, "mds", Voucher::Apple)]
     );
+    assert_eq!(READS.take().identities, 2, "a miss is asked again");
+    assert_eq!(
+        sent(&tick(&mut split, procs.clone())),
+        [(387, 2_000, "mds", Voucher::Apple)]
+    );
+    assert_eq!(READS.take().identities, 0, "kept: nothing moved");
+
+    EXECS.set(EXECS.get() + 1);
     MISSES.set(Some(387));
     let unknown = tick(&mut split, procs.clone());
-    assert_eq!(sent(&unknown), [(387, 2_000, "", Voucher::Unknown)]);
+    assert_eq!(
+        sent(&unknown),
+        [(387, 2_000, "", Voucher::Unknown)],
+        "after an exec, a miss is a current unknown"
+    );
     assert_eq!(unknown.leads[0].signing_id, None);
     assert_eq!(unknown.leads[0].team, None);
     kernel(&[(1, "launchd", 1_000, true), (387, "mds", 2_000, false)]);
     assert_eq!(
-        sent(&tick(&mut split, procs)),
+        sent(&tick(&mut split, procs.clone())),
         [(387, 2_000, "mds", Voucher::DeveloperId)],
-        "a current identity can be read again"
+        "an exec into another signature of the same name and birth"
     );
-    assert_eq!(READS.take().identities, 4);
+    assert_eq!(READS.take().identities, 2);
+
+    kernel(&[(1, "launchd", 1_000, true), (387, "mds", 2_000, true)]);
+    RACES.set(Some(387));
+    assert_eq!(
+        sent(&tick(&mut split, procs.clone())),
+        [(387, 2_000, "", Voucher::Unknown)],
+        "an exec raced the read"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            sent(&tick(&mut split, procs.clone())),
+            [(387, 2_000, "mds", Voucher::Apple)]
+        );
+    }
+    assert_eq!(READS.take().identities, 2, "read again once, then kept");
+
+    UNVERSIONED.set(Some(387));
+    for _ in 0..2 {
+        assert_eq!(
+            sent(&tick(&mut split, procs.clone())),
+            [(387, 2_000, "mds", Voucher::Apple)]
+        );
+    }
+    UNVERSIONED.set(None);
+    assert_eq!(READS.take().identities, 2, "no version: read at each tick");
 }
 
-/// A MISREAD TURNS THE HOST'S LANE OFF FOR GOOD: where the model finds the
-/// coalitions' footprints past any machine's memory (a record whose layout
-/// moved), the reading's lane is off and so is the reader's, and no reading
-/// after reads the coalitions, armed or not. Unix: the misread is judged
-/// against the machine's memory, which this reader reads there.
 #[test]
 fn a_misread_turns_the_hosts_lane_off_for_good() {
     const MISREAD: CoalProbe = CoalProbe {
@@ -598,9 +606,6 @@ fn a_misread_turns_the_hosts_lane_off_for_good() {
     assert_eq!(READS.take().coalitions, 0, "never again");
 }
 
-/// A SWEPT PROCESS'S COALITION REACHES THE MODEL ([`proc_sample`]), its
-/// birth left to the split tick ([`SplitReader::fill`]). NEGATIVE CONTROL: a
-/// sweep that read none gives none.
 #[test]
 fn a_swept_processs_coalition_reaches_the_model() {
     let epoch = Instant::now();
@@ -614,8 +619,6 @@ fn a_swept_processs_coalition_reaches_the_model() {
     assert_eq!(proc_sample(&read(None), epoch).coalition, None);
 }
 
-/// THE COALITIONS REACH THE MODEL FIELD FOR FIELD, a cut list's word
-/// with them.
 #[test]
 fn the_coalitions_reach_the_model_field_for_field() {
     let s = coal_sample(CoalitionRead {
@@ -647,9 +650,6 @@ fn the_coalitions_reach_the_model_field_for_field() {
     );
 }
 
-/// EACH KERNEL VOUCHER IS THE MODEL'S OF THE SAME NAME while the
-/// code-signing reads vouch. NEGATIVE CONTROL: while they do not, each is
-/// unknown.
 #[test]
 fn each_kernel_voucher_is_the_models_of_the_same_name() {
     for (status, category, voucher) in [
@@ -673,8 +673,6 @@ fn each_kernel_voucher_is_the_models_of_the_same_name() {
     }
 }
 
-/// One process of a sweep: user 501's, in `coalition`, named `name`, its
-/// kernel start `start`.
 fn swept(pid: u32, coalition: u64, name: &str, start: u64) -> ProcSample {
     ProcSample {
         pid,
@@ -686,12 +684,10 @@ fn swept(pid: u32, coalition: u64, name: &str, start: u64) -> ProcSample {
     }
 }
 
-/// A split tick of `procs` through `split`.
 fn tick(split: &mut SplitReader, procs: Vec<ProcSample>) -> Sample {
     tick_at(split, procs, Instant::now())
 }
 
-/// A split tick at an injected time, so cache histories do not depend on scheduling.
 fn tick_at(split: &mut SplitReader, procs: Vec<ProcSample>, now: Instant) -> Sample {
     let mut sample = Sample {
         procs: Some(procs),
@@ -702,7 +698,6 @@ fn tick_at(split: &mut SplitReader, procs: Vec<ProcSample>, now: Instant) -> Sam
     sample
 }
 
-/// Each lead sent, as pid, birth, image and voucher.
 fn sent(s: &Sample) -> Vec<(u32, i64, &str, Voucher)> {
     s.leads
         .iter()
@@ -710,18 +705,12 @@ fn sent(s: &Sample) -> Vec<(u32, i64, &str, Voucher)> {
         .collect()
 }
 
-/// Each swept process's birth.
 fn births(s: &Sample) -> Vec<Option<i64>> {
     s.procs.iter().flatten().map(|p| p.birth_ms).collect()
 }
 
-/// Known-start births are cached, and every selected lead's identity is
-/// current at each split tick. An exec can keep the pid, birth and short
-/// name while its signature changes. A changed name or start refreshes the
-/// birth; a pid that leaves is forgotten. A kernel record with another
-/// name than the sweep supplies no birth and is asked again next tick.
 #[test]
-fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
+fn known_start_births_and_lead_identities_are_kept_until_they_move() {
     let now = Instant::now();
     let tick = |split: &mut SplitReader, procs| tick_at(split, procs, now);
     kernel(&[
@@ -770,7 +759,7 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
         [Some(3_000), Some(2_100), Some(2_000), Some(1_000)]
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (0, 3), "only births are cached");
+    assert_eq!((r.births, r.identities), (0, 0), "both are kept");
 
     kernel(&[
         (1, "launchd", 1_000, true),
@@ -785,10 +774,11 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
             (1, 1_000, "launchd", Voucher::Apple),
             (387, 2_000, "mds", Voucher::DeveloperId),
             (900, 3_000, "zsh", Voucher::DeveloperId),
-        ]
+        ],
+        "an exec into another signature, the same name and birth"
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (0, 3));
+    assert_eq!((r.births, r.identities), (0, 1));
 
     kernel(&[
         (1, "launchd", 1_000, true),
@@ -807,7 +797,7 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
         ]
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (1, 3));
+    assert_eq!((r.births, r.identities), (1, 1));
 
     kernel(&[
         (1, "launchd", 1_000, true),
@@ -827,7 +817,7 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
         ]
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (1, 3));
+    assert_eq!((r.births, r.identities), (1, 1), "a lead born anew");
 
     let without: Vec<ProcSample> = procs.iter().filter(|p| p.pid != 387).cloned().collect();
     let s = tick(&mut split, without);
@@ -850,7 +840,11 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
         ]
     );
     let r = READS.take();
-    assert_eq!((r.births, r.identities), (1, 6));
+    assert_eq!(
+        (r.births, r.identities),
+        (1, 2),
+        "a lead that stopped leading is read again"
+    );
 
     kernel(&[
         (1, "launchd", 1_000, true),
@@ -866,10 +860,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     assert_eq!(READS.take().births, 2, "read at each tick");
 }
 
-/// MANY BIRTHS TO READ ARE READ IN ONE READ OF THE TABLE: past
-/// [`BIRTHS_AT_ONCE`] pids not yet read (the first tick, a build's storm),
-/// one read of every record gives each its birth; the next tick reads
-/// nothing. A 16-byte name the sweep holds cut to 15 is the same process's.
 #[test]
 fn many_births_are_read_in_one_read_of_the_table() {
     for (n, tables, records) in [
@@ -906,10 +896,6 @@ fn many_births_are_read_in_one_read_of_the_table() {
     }
 }
 
-/// NO VOUCHER WITHOUT THE CODE-SIGNING READS VOUCHING (RD §3.1's
-/// self-check): with launchd not reading as Apple's, an Apple-signed lead's
-/// voucher reads unknown, never Apple's, and the lane stays on. NEGATIVE
-/// CONTROL: launchd Apple's, the same lead reads Apple's.
 #[test]
 fn every_voucher_is_unknown_when_launchd_does_not_read_as_apples() {
     for (launchd, voucher) in [(false, Voucher::Unknown), (true, Voucher::Apple)] {
@@ -921,9 +907,6 @@ fn every_voucher_is_unknown_when_launchd_does_not_read_as_apples() {
     }
 }
 
-/// THE TIMELINE IS READ AGAIN ONLY WHEN THE MACHINE WOKE: three split ticks
-/// read it once, each carrying it; a wake reads it again. Its last wake rides
-/// each one.
 #[test]
 fn the_timeline_is_read_again_only_when_the_machine_woke() {
     WAKE.set(Some(5_000));
@@ -939,10 +922,6 @@ fn the_timeline_is_read_again_only_when_the_machine_woke() {
     assert_eq!(READS.take().timelines, 1);
 }
 
-/// THE LANE IS THE SELF-CHECK'S: passed, on; `unsupported` (Linux, Windows),
-/// unsupported; any other miss, off, and then no reading is a split tick,
-/// armed or not. The test reader's own lane is the inert arm: unsupported,
-/// and its reading is no split tick.
 #[test]
 fn the_lane_is_the_self_checks_and_the_test_readers_is_inert() {
     let armed = gauge();
@@ -1031,7 +1010,31 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
             Some(8 << 30),
             "the machine's"
         );
+        assert_eq!(
+            why.split.tabs,
+            [(1, 200)],
+            "{at:?}: no live tab, the scene's"
+        );
     }
+    let in_tab = Sample {
+        tabs: vec![aterm_vitals::TabRoot {
+            key: 7,
+            tab: 7,
+            shell_pid: 99_999,
+            label: "Tab 1".into(),
+            program: String::new(),
+        }],
+        ..live.clone()
+    };
+    let fixture = WhyFixture {
+        scene: spotlight_1032(),
+        t0: None,
+    };
+    let mut vitals = aterm_vitals::Vitals::new();
+    let snap = [(0, true), (4_000, false), (5_000, true)]
+        .map(|(at, split)| vitals.absorb(&fixture.at(&in_tab, split, at)));
+    let why = snap[2].why.as_deref().expect("the scene's split");
+    assert_eq!(why.split.tabs, [(7, 200)], "the live tab reads the scene's");
     let snap = read(calm_1510(), [0, 4_000, 5_000]);
     let why = snap.why.as_deref().expect("the calm scene's split");
     assert!(

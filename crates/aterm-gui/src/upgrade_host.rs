@@ -152,6 +152,9 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
             ask: crate::harness_host::upgrade_ask(),
             several_logins: crate::harness_host::several_logins(),
             usage_credits: crate::harness_host::usage_credits(),
+            // The word only records the request and wakes the host's lane
+            // (`upgrade_drive::ask_for`); the relaunch line that lane types
+            // arms the tap itself (`harness_host::usage_tap_armed`).
             usage_tap: None,
             instances: upgrade_drive::Instances::Machine,
             agents_off: Vec::new(),

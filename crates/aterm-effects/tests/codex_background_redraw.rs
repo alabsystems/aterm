@@ -159,8 +159,6 @@ impl Host {
     }
 }
 
-/// A background redraw of an unchanged composer (the row cleared and the same text laid back)
-/// keeps the typed band, in one batch or across two frames with the cursor hidden between.
 #[test]
 fn an_unchanged_composer_redrawn_in_one_batch_or_across_frames_keeps_its_typed_band() {
     let redraws: [(&str, &[&[u8]]); 2] = [
@@ -282,11 +280,6 @@ fn a_real_return_and_natural_wrap_keep_their_immediate_row_move() {
     assert_eq!(h.glow.in_flight_tally().park_returns, 0);
 }
 
-/// A shell fold is not a soft-wrapped caret (`CursorGlow::soft_wrapped_caret`) even when two
-/// keys cross it in one echo: `b` fills the pane's last column over a blank cell, as a
-/// soft-wrapped key does, but `c` stands on the landing row left of the caret. A frame falls
-/// between the presses and the echo, so both keys are held and their cells come from the seam's
-/// sweep. Both glyphs light (the classifier must read the landing row).
 #[test]
 fn a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs() {
     let mut h = Host::new();
@@ -324,12 +317,6 @@ fn a_park_and_its_real_echo_move_together_when_output_scrolls_the_grid() {
     assert_eq!(h.glow.in_flight_tally().park_returns, 1);
 }
 
-/// [`a_park_and_its_real_echo_move_together_when_output_scrolls_the_grid`] with the echo drawn
-/// in the scroll's own frame: the grid scrolls a row while the footer park is held, and the same
-/// update returns the caret to the composer, carried a row up, with the key's glyph. The park
-/// rode the scroll with its row, so its source is read where the scroll carried it on that frame
-/// and the return is paid. Negative control: deferring the park's source check past a scroll's
-/// frame (the `!scroll_frame` guard the check carried) leaves the echo dark, no park returned.
 #[test]
 fn a_park_s_echo_drawn_in_the_scroll_s_own_frame_is_paid() {
     let mut h = Host::new();
@@ -350,11 +337,6 @@ fn a_park_s_echo_drawn_in_the_scroll_s_own_frame_is_paid() {
     assert_eq!(h.glow.in_flight_tally().park_returns, 1);
 }
 
-/// A footer repainted two or three rows below the composer (Claude Code's and agy's footers sit
-/// under the box's border, not on the row under the input) parks the cursor there while a key's
-/// echo is late. The park is held up to three rows away, where the footer's print ended at the
-/// caret, and its return pays the echo, and the footer stays dark. With a cross-row park held one row away only (before 6a47b6b5dd, and again
-/// in 157b71169c), the three-rows-below take left `i` dark and lit the footer's cell 29.
 #[test]
 fn a_delayed_echo_survives_a_footer_repainted_rows_below_the_composer() {
     for footer in [23_u16, 24] {
@@ -388,11 +370,6 @@ fn a_delayed_echo_survives_a_footer_repainted_rows_below_the_composer() {
     }
 }
 
-/// A press in flight and a caret that went four or more rows away with the row it left intact
-/// (vim's `G` or `gg`, a printable press with no echo) is judged on its own frame: no park is held
-/// for a return that never comes. The negative control is the footer three rows below, which the
-/// same press holds as a park (no verdict on the frame). With the park held at any distance
-/// (6a47b6b5dd) the far jump waited with no verdict.
 #[test]
 fn a_far_jump_with_a_press_in_flight_is_judged_at_once() {
     for (to_row, held) in [(4_u16, false), (16, false), (23, true)] {
@@ -414,15 +391,6 @@ fn a_far_jump_with_a_press_in_flight_is_judged_at_once() {
     }
 }
 
-/// A bare jump of two or three rows, up or down, with a press in flight and the row it left
-/// intact (vim's `}` or `{` over a short paragraph, `2j`, `3k`, `L` in a small pane: a printable
-/// motion key that moves the caret and prints nothing where it lands) is judged on its own frame,
-/// on the normal and the alternate screen, as it was when a cross-row park stood on the adjacent
-/// row only. A footer park two or three rows away is held because the program's print ended
-/// where the caret stands ([`a_delayed_echo_survives_a_footer_repainted_rows_below_the_composer`]).
-/// Negative controls: the same jumps ending a print are held (no verdict on the frame), and a bare
-/// move to the adjacent row is held as before. Before the print gate the bare two- and three-row
-/// jumps were held for the press's whole ten-second patience.
 #[test]
 fn a_two_or_three_row_motion_with_a_press_in_flight_is_judged_at_once() {
     for alt in [false, true] {
@@ -549,13 +517,6 @@ fn replaced_text_and_an_expired_original_do_not_restore() {
     assert!(h.live(20).is_empty(), "a redraw cannot mint expired cells");
 }
 
-/// A key the hand's-row hold kept (`CursorGlow::hold_the_live_presses`: a footer tick beside the
-/// hand ended on a glyph no live press typed) still pays for its own echo when that echo comes
-/// back as a foreign-row park's return. The return is judged from the park's origin on the hand's
-/// row, so it is a move on the hand's row. `i`, a footer tick refused `program-row`, then `j`;
-/// Codex parks the caret on its status row and comes back 300 ms later with `ij`, the caret shown
-/// or hidden for the return. Control: with no footer tick nothing is held and both cells light
-/// either way.
 #[test]
 fn a_held_key_s_echo_returning_from_a_foreign_row_park_lights_at_the_return() {
     use aterm_effects::rainbow_kitty::TypedClass;
@@ -600,11 +561,6 @@ fn a_held_key_s_echo_returning_from_a_foreign_row_park_lights_at_the_return() {
     }
 }
 
-/// A foreign-row park's return is paid by every press in flight
-/// (`CursorGlow::park_return_paid`), outright or under the share rule: a key typed while the caret
-/// sits parked on the status row is echoed with the return and lit, and three keys whose return
-/// draws four cells (an auto-paired glyph, or a press the ring dropped) still return whole.
-/// CONTROL: one key cannot buy a two-cell return, which is left dark.
 #[test]
 fn a_foreign_row_park_s_return_is_paid_by_every_press_in_flight() {
     use aterm_effects::rainbow_kitty::TypedClass;

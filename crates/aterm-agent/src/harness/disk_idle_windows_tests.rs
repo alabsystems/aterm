@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows tier-3 disk-idle tests: `.cmd` shims, path canonicalization, 8.3 short paths, and per-drive volume walks.
+//! Windows tier-3 disk-idle tests for `.cmd` shims, short paths, and volume walks.
 use super::*;
 use crate::harness::disk::tests::{Tmp, lay_target, now_after_write};
 use aterm_sysprobe::volumes::{Mount, NETWORK};
 
 const DAY: i64 = 86_400;
 
-/// A checkout at `<tmp>\repo`: `.git\index`, `.git\logs\HEAD`, a manifest
-/// and a source file, and its build directory `target\` (one profile).
 fn checkout(tmp: &Tmp) -> (PathBuf, PathBuf) {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git").join("logs")).expect("git");
@@ -23,13 +21,11 @@ fn checkout(tmp: &Tmp) -> (PathBuf, PathBuf) {
     (canon(repo), canon(target))
 }
 
-/// `create_dir_all`, answering the path.
 fn mkdirs(p: PathBuf) -> PathBuf {
     std::fs::create_dir_all(&p).expect("mkdir");
     p
 }
 
-/// `p` as a person types it: plain (no `\\?\`), every letter in capitals.
 fn shouted(p: &Path) -> PathBuf {
     PathBuf::from(
         aterm_sysprobe::paths::plain(p)
@@ -38,8 +34,6 @@ fn shouted(p: &Path) -> PathBuf {
     )
 }
 
-/// `C:\` and `D:\`, two local volumes, and the network: a mount table no
-/// machine need have.
 fn two_drives() -> Table {
     let volume = |on: &str, n: u32, guid: &str| Mount {
         on: PathBuf::from(on),
@@ -71,10 +65,6 @@ fn two_drives() -> Table {
     }
 }
 
-/// A SESSION'S WORKING DIRECTORY IS PLACED BY THE ONE RULE: resolved, in
-/// any spelling against a candidate's verbatim one; not resolved (gone, or
-/// unreadable), on Windows it keeps every candidate of its volume — and of
-/// every volume when it names none (a share, no table).
 #[test]
 fn a_session_cwd_is_placed_by_the_one_rule_and_an_unresolved_one_by_its_volume() {
     let t = two_drives();
@@ -99,13 +89,6 @@ fn a_session_cwd_is_placed_by_the_one_rule_and_an_unresolved_one_by_its_volume()
     assert_eq!(SessionCwd::of(&gone).path(), gone.as_path());
 }
 
-/// TIER 3 ON A WINDOWS CHECKOUT, CLAUSE BY CLAUSE: every clause clear, the
-/// build directory is a candidate (the NEGATIVE CONTROL of each refusal
-/// below); then each unmet in a Windows spelling keeps it — a session
-/// whose working directory is UNKNOWN (the reason named), a session working
-/// in it spelled plain and in capitals, one whose folder is gone from its
-/// volume, an installed link resolving into it spelled so, and a build
-/// directory nested in it spelled so.
 #[test]
 fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
     let tmp = Tmp::new("idle-win-assess");
@@ -214,9 +197,6 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
     );
 }
 
-/// CLAUSE 4B PLACES THE KERNEL'S SPELLING: a process whose working directory
-/// the kernel writes plain, in capitals, with a trailing separator, uses the
-/// candidate canonical as `\\?\C:\…`, and keeps it.
 #[test]
 fn clause_4b_places_the_kernels_spelling_on_its_candidate() {
     use aterm_uds::holders::{PathScan, PathUse};
@@ -256,17 +236,11 @@ fn clause_4b_places_the_kernels_spelling_on_its_candidate() {
     assert_eq!(beside, [Ok(())]);
 }
 
-/// `path` as `cmd` and `CreateProcessW` take a working directory: the
-/// canonical spelling without its verbatim prefix (test input only, never an
-/// operation's path).
 fn for_cmd(path: &Path) -> PathBuf {
     let s = path.to_str().expect("a test path is UTF-8");
     PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s))
 }
 
-/// A `cmd.exe` of this test's started in `cwd` exactly as spelled, blocked
-/// reading its stdin until dropped: the drop closes the stdin, so it reads
-/// end-of-file and exits, and waits for that exit.
 struct Waiting(aterm_uds::spawnfd::Child);
 
 impl Waiting {
@@ -293,11 +267,6 @@ impl Drop for Waiting {
     }
 }
 
-/// CLAUSE 4B KEEPS ONLY THE CANDIDATE AN 8.3-SPELLED WORKING DIRECTORY IS IN:
-/// one scan of the running processes over two
-/// candidates, and a `cmd.exe` of this test's started in the first one's
-/// `target\debug` spelled with 8.3 short names (a process keeps the spelling
-/// it was started in as its working directory).
 #[test]
 fn clause_4b_keeps_only_the_candidate_a_short_spelled_working_directory_is_in() {
     let tmp = Tmp::new("idle-win-4b-short");
@@ -348,13 +317,6 @@ fn clause_4b_keeps_only_the_candidate_a_short_spelled_working_directory_is_in() 
     }
 }
 
-/// A SESSION'S 8.3-SPELLED WORKING DIRECTORY IS OPENED ONLY ON A LOCAL
-/// VOLUME ([`SessionCwd::on`]): a folder a session reported short
-/// (`APROJE~1`, as a short `%TEMP%` hands to every child) is spelled long,
-/// folder by folder, before the mount table places it — so on the table as
-/// read it resolves where its long spelling does, and where the table calls
-/// its volume remote it is never opened: `Unresolved`, as the long spelling
-/// is.
 #[test]
 fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
     let tmp = Tmp::new("idle-win-cwd-short");
@@ -400,10 +362,6 @@ fn a_short_spelled_session_cwd_is_opened_only_on_a_local_volume() {
     assert!(matches!(walked, Ok(None)), "{walked:?}");
 }
 
-/// A WALK ENDS ONLY ON A LOCAL FOLDER ([`resolve_local`]): a share's root,
-/// or the root of a drive the table calls remote, holds no component for a
-/// step to place, and resolves to nothing — as a link onto one does, which
-/// ends the walk there (the old walk answered the root it ended on).
 #[test]
 fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     let t = two_drives();
@@ -424,8 +382,6 @@ fn a_walk_that_ends_on_a_remote_root_resolves_to_nothing() {
     );
 }
 
-/// THE WALKS START AT THE PATH'S OWN DRIVE: a path resolves from its drive's
-/// root (never `/`), through a junction to the folder it names.
 #[test]
 fn the_walks_start_at_the_paths_own_drive() {
     let tmp = Tmp::new("idle-win-walks");
@@ -464,9 +420,6 @@ fn the_walks_start_at_the_paths_own_drive() {
     );
 }
 
-/// A WORKTREE'S GIT DIRECTORY IS PLACED ON ITS DRIVE AND READ: a `.git` file
-/// naming an absolute git directory (as `git worktree add` writes it) is
-/// placed through the mount table and its `index` dated.
 #[test]
 fn a_worktrees_git_directory_is_placed_on_its_drive_and_read() {
     let tmp = Tmp::new("idle-win-gitdir");
@@ -497,15 +450,10 @@ fn a_worktrees_git_directory_is_placed_on_its_drive_and_read() {
     );
 }
 
-/// The kind of the entry at `path`, as the clause's listing reads it.
 fn kind(path: &Path) -> std::fs::FileType {
     std::fs::symlink_metadata(path).expect("listed").file_type()
 }
 
-/// A SHIM IS A LINK TO WHAT IT RUNS: a forwarding shim atpkg laid reads back
-/// as its program, whatever the case of its `.cmd`; NEGATIVE CONTROLS: a
-/// tombstone, another batch file, a program that is not a `.cmd` and a folder
-/// named like one run nothing, so they say nothing.
 #[test]
 fn an_atpkg_shim_reads_back_as_the_program_it_runs() {
     let tmp = Tmp::new("idle-shim");
@@ -546,10 +494,6 @@ fn an_atpkg_shim_reads_back_as_the_program_it_runs() {
     assert_eq!(cmd_shim_target(&folder, kind(&folder)), Ok(None));
 }
 
-/// A SHIM'S PROGRAM IS RECORDED AS THE CANDIDATES ARE SPELLED: resolved,
-/// verbatim and in its case on disk, so a shim naming a program inside a
-/// build directory — through any case, or a junction — is a link into that
-/// candidate's canonical path.
 #[test]
 fn a_shims_program_is_recorded_as_the_candidates_are_spelled() {
     let tmp = Tmp::new("idle-shim-link");
@@ -594,9 +538,6 @@ fn a_shims_program_is_recorded_as_the_candidates_are_spelled() {
     assert!(shim_link(&shim, &gone).is_err(), "unknown, so held");
 }
 
-/// UNKNOWN MEANS HELD: a `.cmd` that is there but cannot be read through
-/// atpkg's bounded reader (here: past its bound) is an error, which keeps
-/// every candidate, never "no shim".
 #[test]
 fn a_shim_that_cannot_be_read_is_unknown_not_absent() {
     let tmp = Tmp::new("idle-shim-unread");

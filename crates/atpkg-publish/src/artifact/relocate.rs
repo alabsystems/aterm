@@ -345,6 +345,12 @@ fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
     )
 }
 
+/// Copy `src` into `to.dir` as `base`, make its id portable and re-sign it. Returns whether
+/// a new file was vendored.
+///
+/// # Errors
+/// A stock toolchain's library (checked on the path as named and as resolved), a copy that
+/// differs from its donor, or an I/O, rewrite or re-sign failure.
 fn vendor_file(
     src: &Path,
     to: &VendorTo<'_>,

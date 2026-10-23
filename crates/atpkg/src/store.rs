@@ -1264,7 +1264,7 @@ pub(crate) fn seal_bin(tree: &Path) -> std::io::Result<()> {
     crate::platform::set_mode(&tree.join("bin"), SEALED_BIN_MODE)
 }
 
-/// Give a sealed `<tree>/bin` ([`seal_bin`]).
+/// Give a sealed `<tree>/bin` ([`seal_bin`]) its owner's write bit back.
 pub(crate) fn unseal_bin(tree: &Path) {
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir());
     let bin = tree.join("bin");
@@ -1282,14 +1282,98 @@ pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(dir)
 }
 
-/// Discard a build entirely.
+/// `<build>.unproven`: the awake-clock reading at which a resolve check's child in that build
+/// ended with no exit of its own ([`hold_unproven`]), so no atpkg process removes or replaces
+/// the build within [`aterm_uds::deadline::FIRST_EXEC_HANG`] of it.
+pub(crate) const UNPROVEN_SUFFIX: &str = ".unproven";
+
+/// Executables a resolve check started that never exited on their own, each with when that was seen: this process's hold where the [`UNPROVEN_SUFFIX`] mark could not be written.
+static UNPROVEN: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Hold the build `exe` (`<build>/bin/<tool>`, as [`crate::flow::bundle_resolve_check`] names it) ships in place ([`held_unproven`]): macOS may still be assessing its first exec, and syspolicyd crashes when the file goes mid-assessment.
+pub(crate) fn hold_unproven(exe: &Path) {
+    UNPROVEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((exe.to_path_buf(), std::time::Instant::now()));
+    if let Some(build) = exe.parent().and_then(Path::parent) {
+        let stamp = aterm_uds::process::awake_ms()
+            .map(|ms| ms.to_string())
+            .unwrap_or_default();
+        let _ = write_sidecar_durably(build, UNPROVEN_SUFFIX, stamp.as_bytes());
+    }
+}
+
+/// Whether `tree` holds an executable [`hold_unproven`] took less than [`aterm_uds::deadline::FIRST_EXEC_HANG`] ago, in this process or (by its [`UNPROVEN_SUFFIX`] mark) in any.
+pub(crate) fn held_unproven(tree: &Path) -> bool {
+    let here = UNPROVEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(exe, at)| {
+            exe.starts_with(tree) && at.elapsed() < aterm_uds::deadline::FIRST_EXEC_HANG
+        });
+    here || sidecar_path(tree, UNPROVEN_SUFFIX).is_some_and(|mark| unproven_mark_holds(&mark))
+}
+
+/// Whether the [`UNPROVEN_SUFFIX`] mark at `mark` is younger than
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, as
+/// [`aterm_uds::deadline::copy_wait_left`] ages an exec stamp: an awake clock below the stamp
+/// means a restart, which ended the assessment; without a reading, the mark's modification
+/// time. A mark that is there but cannot be read holds.
+fn unproven_mark_holds(mark: &Path) -> bool {
+    let text = match std::fs::read_to_string(mark) {
+        Ok(text) => text,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    let age = match (
+        text.trim().parse::<u64>().ok(),
+        aterm_uds::process::awake_ms(),
+    ) {
+        (Some(at), Some(now)) => match now.checked_sub(at) {
+            Some(ms) => std::time::Duration::from_millis(ms),
+            None => return false,
+        },
+        _ => std::fs::symlink_metadata(mark)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .unwrap_or_default(),
+    };
+    age < aterm_uds::deadline::FIRST_EXEC_HANG
+}
+
+/// A build of the program store `prog_store` that [`held_unproven`] keeps in place, if any.
+pub(crate) fn held_build_in(prog_store: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(prog_store)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(parse_build_name)
+                .is_some()
+                && held_unproven(path)
+        })
+}
+
+/// Discard a build entirely; a held one ([`held_unproven`]) is only unmarked, and stays
+/// until a pass after its hold sweeps it as partial debris.
 pub(crate) fn discard_build(build_dir: &Path) {
     let _ = clear_build_ready(build_dir);
     if let Some(parent) = build_dir.parent() {
         sync_dir(parent);
     }
+    if held_unproven(build_dir) {
+        return;
+    }
     crate::compat::discard_root_of(build_dir);
     let _ = remove_tree(build_dir);
+    if let Some(mark) = sidecar_path(build_dir, UNPROVEN_SUFFIX) {
+        let _ = std::fs::remove_file(mark);
+    }
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
     }
@@ -2221,7 +2305,8 @@ mod tests {
             return;
         };
         let home = PathBuf::from(home);
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { libc::umask(0o002) };
         let mode = |rel: &str| {
             let meta = std::fs::symlink_metadata(home.join(rel)).unwrap();
@@ -2587,6 +2672,45 @@ mod tests {
         assert!(contents_still_stand(&build, "tree-root:deadbeef"));
         assert!(contents_still_stand(&build, "bin"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The mark a resolve check leaves holds its build for every process (a later `aterm pkg`
+    /// starts with nothing in memory) until FIRST_EXEC_HANG of awake time has passed or the Mac
+    /// restarted; the discard that then removes the build takes the mark with it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_unproven_mark_holds_its_build_in_every_process_until_it_is_spent() {
+        let home = temp_home("unproven");
+        let prog = home.join("store").join("trust");
+        let build = prog.join("8596");
+        let mark = |at: u64| {
+            std::fs::create_dir_all(build.join("bin")).unwrap();
+            std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
+            write_sidecar_durably(&build, UNPROVEN_SUFFIX, at.to_string().as_bytes()).unwrap();
+        };
+        let now = aterm_uds::process::awake_ms().expect("the awake clock");
+        mark(now);
+        assert_eq!(held_build_in(&prog), Some(build.clone()));
+        discard_build(&build);
+        assert!(
+            build.join("bin").join("trustc").is_file(),
+            "a fresh mark holds the build in place"
+        );
+
+        mark(now + 3_600_000);
+        assert_eq!(held_build_in(&prog), None, "a restart ended the assessment");
+        discard_build(&build);
+        assert!(!build.exists(), "a spent hold lets the discard go");
+        assert!(
+            !sidecar_path(&build, UNPROVEN_SUFFIX).unwrap().exists(),
+            "and the mark goes with the build"
+        );
+
+        let window = u64::try_from(aterm_uds::deadline::FIRST_EXEC_HANG.as_millis()).unwrap();
+        if let Some(aged) = now.checked_sub(window + 1_000) {
+            mark(aged);
+            assert_eq!(held_build_in(&prog), None, "an aged mark holds nothing");
+        }
     }
 
     #[cfg(unix)]

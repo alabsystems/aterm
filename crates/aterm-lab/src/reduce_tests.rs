@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab reduce` over every `supervise/fixtures` transcript: the reduction folds as its source and keeps no text.
+//! `lab reduce` over every `supervise/fixtures` transcript.
 
 use std::collections::HashSet;
 
@@ -14,7 +14,6 @@ const FIXTURES: &str = concat!(
     "/../aterm-agent/src/supervise/fixtures"
 );
 
-/// Every transcript fixture: its name and text.
 fn fixtures() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = std::fs::read_dir(FIXTURES)
         .expect("the fixtures directory")
@@ -31,11 +30,6 @@ fn fixtures() -> Vec<(String, String)> {
     out
 }
 
-/// THE FOLD CHECK (T7): the reduction folds as its source, as the reducer
-/// itself reads it ([`readings`], [`reads_as`]): the same steps at the same
-/// rows in the same states, closed words and numbers, ids one to one, times
-/// one shift apart, the same end after every row and at the last, the same
-/// walls, and every notice read as its source's.
 fn check_folds(name: &str, source: &str, r: &Reduction) -> Result<(), String> {
     reads_as(
         &readings(source, Program::Claude),
@@ -45,8 +39,6 @@ fn check_folds(name: &str, source: &str, r: &Reduction) -> Result<(), String> {
     .map_err(|e| format!("{name}: {e}"))
 }
 
-/// The words a reduction may hold that are no source's text: the markers,
-/// the canonical phrases and their tags, and the reset clause's frame.
 fn vocabulary() -> Vec<String> {
     let mut v: Vec<String> = USER_MARKERS.iter().map(|s| (*s).to_string()).collect();
     v.push(COMPACT.to_string());
@@ -70,7 +62,6 @@ fn vocabulary() -> Vec<String> {
     v
 }
 
-/// Every string a value holds (keys too).
 fn strings<'a>(v: &'a Node, out: &mut Vec<&'a str>) {
     match v {
         Node::Str(s) => out.push(s),
@@ -83,8 +74,6 @@ fn strings<'a>(v: &'a Node, out: &mut Vec<&'a str>) {
     }
 }
 
-/// An id the reducer wrote (a UUID of zeros and a count, or
-/// `<prefix>_r<n>` / `r<n>`, with `/` when the source's was no `StepId`).
 fn placeholder_id(s: &str) -> bool {
     let s = s.strip_suffix('/').unwrap_or(s);
     let count = |t: &str| t.len() >= 4 && t.bytes().all(|b| b.is_ascii_digit());
@@ -95,12 +84,6 @@ fn placeholder_id(s: &str) -> bool {
             .is_some_and(|(p, t)| p.bytes().all(|b| b.is_ascii_lowercase()) && count(t))
 }
 
-/// THE TEXT CHECK (T7, `a_reduction_keeps_no_text`): no 8-byte run of any
-/// source string (a key, a value, a `#` line) survives in the reduction but
-/// in the kept vocabulary: a closed word kept as written under its key, a
-/// call's tool name at its own place, a remapped id, a WHOLE rebased stamp,
-/// a marker, a canonical phrase, a reset clause's rebased numbers, and an
-/// identifier key outside a free subtree (the vendor's schema).
 fn check_no_text(name: &str, source: &str, r: &Reduction, program: Program) -> Result<(), String> {
     let src: Vec<Node> = source
         .lines()
@@ -175,13 +158,10 @@ fn check_no_text(name: &str, source: &str, r: &Reduction, program: Program) -> R
     check_ids(&src, &red).map_err(|e| format!("{name}: {e}"))
 }
 
-/// A key the reducer named (`k<n>`): it holds nothing of the key.
 fn renamed(k: &str) -> bool {
     is_key_name(k)
 }
 
-/// The ids of a file's calls, found by their SHAPE: the `id` of any object
-/// whose `type` ends in `tool_use`, wherever it sits.
 fn call_ids<'a>(v: &'a Node, out: &mut HashSet<&'a str>) {
     match v {
         Node::Obj(m) => {
@@ -199,8 +179,6 @@ fn call_ids<'a>(v: &'a Node, out: &mut HashSet<&'a str>) {
     }
 }
 
-/// What [`check_tool_arguments`] reads a file by: its calls' ids
-/// ([`call_ids`]) and the 8-byte rule.
 struct Args<'a> {
     calls: &'a HashSet<&'a str>,
     check: &'a dyn Fn(&str, &str) -> Result<(), String>,
@@ -225,17 +203,6 @@ impl Arg {
     };
 }
 
-/// THE ARGUMENT CHECK (T7), apart from where [`opens_free`] says a free
-/// subtree opens: a tool's arguments, found by their SHAPE in the source row
-/// `a` wherever they sit (the keys of a JSON schema's `properties`, an
-/// object whose `properties` is an object and whose `type` is `"object"` or
-/// absent, and of any `$defs` object, the definitions a schema names; every
-/// key under the `input` of any object whose `type` ends in
-/// `tool_use`; and every key under what a map keyed by a call's id holds,
-/// [`call_ids`], as Claude Code 2.1.303's `wireToolInputs` copies each
-/// call's input), never have their names kept as written in its reduction
-/// `b` (each is `k<n>`), and every string there is `""` or held to the
-/// 8-byte rule, a closed word under a closed key (`mode`) among them.
 fn check_tool_arguments(a: &Node, b: &Node, at: Arg, args: &Args<'_>) -> Result<(), String> {
     match (a, b) {
         (Node::Obj(x), Node::Obj(y)) => {
@@ -274,11 +241,6 @@ fn check_tool_arguments(a: &Node, b: &Node, at: Arg, args: &Args<'_>) -> Result<
     }
 }
 
-/// THE ID CHECK (T7: ids one to one across the file, its keys among them),
-/// read off the reduction and not the reducer's rule: a source string the
-/// reduction writes as a placeholder id ([`placeholder_id`]), where it is a
-/// value or a key, is that same id wherever it is one, no two share one,
-/// and none is kept as written as a key (a map keyed by a call's id).
 fn check_ids(src: &[Node], red: &[Node]) -> Result<(), String> {
     fn pairs<'a>(
         a: &'a Node,
@@ -344,7 +306,6 @@ impl Pos<'_> {
     };
 }
 
-/// What [`same_text`] reads one row by.
 struct Ctx<'a> {
     program: Program,
     words: &'a [&'a str],
@@ -431,8 +392,6 @@ fn same_text(
     }
 }
 
-/// Reduce every fixture by `rules` and run `check` on each: the names that
-/// failed it, with why.
 fn failures(
     rules: &dyn Rules,
     check: &dyn Fn(&str, &str, &Reduction) -> Result<(), String>,
@@ -454,12 +413,6 @@ fn no_text(n: &str, t: &str, r: &Reduction) -> Result<(), String> {
     check_no_text(n, t, r, Program::Claude)
 }
 
-/// T7, P11: over every `supervise/fixtures` transcript the reduction folds as
-/// its source — the same steps at the same rows in the same states, the same
-/// closed words and numbers, ids one to one, times one shift apart, the same
-/// end (its wall and the classes it confirms) and the same `EndWall` events
-/// — and every notice classes as its source's (`classify_wall(reduced) ==
-/// classify_wall(source)`, and the readings `notice_wall` adds).
 #[test]
 fn a_reduction_folds_as_its_source() {
     let bad = failures(&P11, &folds);
@@ -479,34 +432,12 @@ fn a_reduction_folds_as_its_source() {
     );
 }
 
-/// T7, P11: no 8-byte run of any source string survives, but the kept
-/// vocabulary (the anchor phrases among it).
 #[test]
 fn a_reduction_keeps_no_text() {
     let bad = failures(&P11, &no_text);
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
-/// A Claude Code transcript holding words where the T7 rule keeps none: a
-/// prompt, then a key an MCP tool named in its input (and one nested under
-/// it), a key a question's answer is filed under in a result's output,
-/// words after a stamp under a time key, and an attachment's key and its
-/// word under a closed key; a prompt typed while Claude Code worked, whose
-/// `origin` a reader reads; then the places the second review found (each
-/// a shape Claude Code 2.1.303 writes or carries): an MCP tool's argument
-/// name in an `api-request-shape` row's tool list, a question's answer in
-/// a row a `progress` row nests, an MCP result's `structuredContent` key
-/// in its row's `mcpMeta`, a server tool's input and its result's content,
-/// and a tracked file's name keying a file-history snapshot; then the
-/// places the land review found (2.1.303 writes each place): a deferred
-/// MCP tool's argument name in an `api-request-blob` row's `tool_addition`
-/// part (and a second tool's schema, as an MCP server may give one, whose
-/// top names a definition under `$defs` rather than holding `properties`,
-/// so only its key says it is a schema), and a call's id keying the row's
-/// `wireIngestContext` (before the call) and `wireToolInputs` (after it,
-/// the call's input again: an MCP argument name and a word under `mode`);
-/// and last a schema at a place no name says is one (a function's
-/// `parameters`, which 2.1.303 does not write), freed by its shape alone.
 const CLAUDE_PLANT: [&str; 14] = [
     r#"{"type":"user","timestamp":"2026-10-16T10:00:00.000Z","uuid":"11111111-1111-4111-8111-111111111111","message":{"role":"user","content":"hello"},"version":"2.1.303"}"#,
     r#"{"type":"assistant","timestamp":"2026-10-16T10:00:01.000Z","uuid":"21111111-1111-4111-8111-111111111111","message":{"id":"msg_01","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_01","name":"mcp__quokkadb__lookup","input":{"quokkaledgerInputKey":"x","customers":{"quokkaledgerCustomer":{"status":"open"}}}}]}}"#,
@@ -524,17 +455,6 @@ const CLAUDE_PLANT: [&str; 14] = [
     r#"{"type":"tool-list","timestamp":"2026-10-16T10:00:13.000Z","uuid":"e1111111-1111-4111-8111-111111111111","tools":[{"name":"x","parameters":{"type":"object","properties":{"quokkaledgerParamArg":{"type":"string"}}}}]}"#,
 ];
 
-/// What an earlier rule reduced planted row `n` to, beside the prompt
-/// (`lab reduce` of `[CLAUDE_PLANT[0], CLAUDE_PLANT[n]]`): at `cc1e1d84ea`,
-/// rows 1 to 4 (the input's, the result's and the attachment's keys as
-/// written, the stamp's tail, and the attachment's word); at `eac866795c`
-/// (`8dac84738f`'s rule), rows 6 to 10 (the `api-request-shape`'s tool
-/// argument, the nested result's key, the `mcpMeta` key, the server tool's
-/// input and result keys, and the tracked file's name, each as written);
-/// by `8b5f123bf1`'s rule, rows 11 to 13 (the `tool_addition`'s argument
-/// name and definition name, the call's real id keying both maps, its
-/// argument name and its `mode` word in `wireToolInputs`, and the
-/// `parameters` schema's argument name, each as written).
 const CLAUDE_PLANT_KEPT: [(usize, &str); 12] = [
     (
         1,
@@ -586,16 +506,6 @@ const CLAUDE_PLANT_KEPT: [(usize, &str); 12] = [
     ),
 ];
 
-/// T7: a key a tool or a person named inside a free subtree
-/// ([`opens_free`]: a tool's input, a result's output at any depth, an
-/// `api-request-shape`'s `shape`, a schema wherever it sits, an
-/// attachment's field, a tracked file's name, what a call's id keys) is
-/// renamed `k<n>` (a call's id remapped as that id), every string there is
-/// replaced,
-/// and a string under a time key that is no whole stamp is replaced whole,
-/// so the planted words survive nowhere and the text check passes; a whole
-/// stamp is still rebased, and an attachment's `type` and a queued prompt's
-/// `origin`, closed words the harness's readers read, are kept.
 #[test]
 fn a_reduction_keeps_no_key_or_stamp_tail_anyone_wrote() {
     let src: String = CLAUDE_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -700,21 +610,16 @@ fn a_reduction_keeps_no_key_or_stamp_tail_anyone_wrote() {
     }
 }
 
-/// The committed 2.1.303 reduction (5H-2b).
 const STEPS_2_1_303: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-agent/src/harness/testdata/steps/2.1.303.jsonl"
 );
 
-/// Where the committed reductions are.
 const STEPS_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-agent/src/harness/testdata/steps"
 );
 
-/// Every committed Codex reduction (`codex-*.jsonl`): the 0.163.0 ones (5G),
-/// reduced again the same way, and the codex-alab legs (6D-3a), each
-/// committed as the reducer's fixed point.
 fn steps_codex() -> Vec<std::path::PathBuf> {
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(STEPS_DIR)
         .expect("the step testdata")
@@ -737,7 +642,6 @@ fn steps_codex() -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// A file's rows.
 fn rows_of(text: &str) -> Vec<Node> {
     text.lines()
         .filter(|l| is_row(l))
@@ -745,12 +649,6 @@ fn rows_of(text: &str) -> Vec<Node> {
         .collect()
 }
 
-/// T7, THE ARGUMENT CHECK, which finds a tool's arguments by their shape
-/// and not by the reducer's rule, over the committed 2.1.303 reduction:
-/// no row keeps a tool's argument name as written
-/// (its `api-request-shape` row's tool list and Bash's input are renamed
-/// whole), and the file is the reducer's fixed point, reduced again it is
-/// itself, its `#` line too; so are the committed Codex reductions.
 #[test]
 fn a_tool_argument_name_is_never_kept_as_written() {
     let committed = std::fs::read_to_string(STEPS_2_1_303).expect("the committed reduction");
@@ -859,9 +757,6 @@ fn a_tool_argument_name_is_never_kept_as_written() {
     );
 }
 
-/// A Codex rollout as its readers would commit it: its meta, a command that
-/// read a file (`parsed_cmd`'s `read` names the file in `name`), a call by
-/// its namespace and name, and a turn's end.
 const CODEX_PLANT: [&str; 4] = [
     r#"{"timestamp":"2026-10-16T10:00:00.000Z","type":"session_meta","payload":{"id":"0199a0b1-0000-7000-8000-000000000abc","cwd":"/private/tmp/x/proj","cli_version":"0.163.0"}}"#,
     r#"{"timestamp":"2026-10-16T10:00:01.000Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call_abc","command":["bash","-lc","cat quokkaledger-plan.md"],"parsed_cmd":[{"type":"read","cmd":"cat quokkaledger-plan.md","name":"quokkaledger-plan.md","path":"/private/tmp/x/quokkaledger-plan.md"}]}}"#,
@@ -869,8 +764,6 @@ const CODEX_PLANT: [&str; 4] = [
     r#"{"timestamp":"2026-10-16T10:00:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","started_at_ms":1792144800123}}"#,
 ];
 
-/// A reducer that keeps any Codex `name` as a tool's (the provisional
-/// rule's): wherever it sits.
 struct CodexNamesAnywhere;
 
 impl Rules for CodexNamesAnywhere {
@@ -883,9 +776,6 @@ impl Rules for CodexNamesAnywhere {
     }
 }
 
-/// T7 over a Codex rollout: no 8-byte run of its text survives — a call's
-/// own name and namespace are kept, a file a command read is not, though
-/// Codex files it under `name`.
 #[test]
 fn a_codex_reduction_keeps_no_text() {
     let src: String = CODEX_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -909,7 +799,6 @@ fn a_codex_reduction_keeps_no_text() {
     assert!(e.contains("quokkale") || e.contains("okkaledg"), "{e}");
 }
 
-/// A reducer that keeps every `content` and `text` string as written.
 struct KeepsContent;
 
 impl Rules for KeepsContent {
@@ -922,9 +811,6 @@ impl Rules for KeepsContent {
     }
 }
 
-/// A reducer that replaces every `type`, past the reducer's own check that
-/// its reduction reads as its source (which refuses it): every candidate it
-/// leaves is kept.
 struct ReplacesType;
 
 impl Rules for ReplacesType {
@@ -941,8 +827,6 @@ impl Rules for ReplacesType {
     }
 }
 
-/// A reducer that blanks a notice's text, past the reducer's own check as
-/// [`ReplacesType`] is.
 struct BlanksNotices;
 
 impl Rules for BlanksNotices {
@@ -958,7 +842,6 @@ impl Rules for BlanksNotices {
     }
 }
 
-/// A reducer that keeps EVERY candidate closed word, read or not.
 struct KeepsEveryCandidate;
 
 impl Rules for KeepsEveryCandidate {
@@ -971,10 +854,6 @@ impl Rules for KeepsEveryCandidate {
     }
 }
 
-/// A reducer that blanks the words a reader reads under the keys it names
-/// (`subtype`: a turn's end, a compaction, a local command; a notice's
-/// `error`, its quota's `status` and `rateLimitType`), the readers' choice
-/// otherwise, past the reducer's own check.
 struct BlanksRead(&'static [&'static str]);
 
 impl Rules for BlanksRead {
@@ -991,8 +870,6 @@ impl Rules for BlanksRead {
     }
 }
 
-/// A rule that replaces a word a reader reads (every `subtype`), with the
-/// readers' choice and its check.
 struct ReplacesSubtype;
 
 impl Rules for ReplacesSubtype {
@@ -1005,7 +882,6 @@ impl Rules for ReplacesSubtype {
     }
 }
 
-/// NEGATIVE CONTROL: a reducer that keeps content fails the text check.
 #[test]
 fn a_reducer_that_keeps_content_fails_the_text_check() {
     let bad = failures(&KeepsContent, &no_text);
@@ -1016,15 +892,12 @@ fn a_reducer_that_keeps_content_fails_the_text_check() {
     );
 }
 
-/// NEGATIVE CONTROL: a reducer that replaces `type` fails the fold check.
 #[test]
 fn a_reducer_that_replaces_type_fails_the_fold_check() {
     let bad = failures(&ReplacesType, &folds);
     assert!(bad.len() >= 20, "{} of 24 failed: {bad:#?}", bad.len());
 }
 
-/// NEGATIVE CONTROL (T7): a reducer that blanks a notice's text fails the
-/// fold check on every fixture that holds a notice (its class, or its wall).
 #[test]
 fn a_reducer_that_blanks_notice_text_fails_the_wall_check() {
     let bad = failures(&BlanksNotices, &folds);
@@ -1039,10 +912,6 @@ fn a_reducer_that_blanks_notice_text_fails_the_wall_check() {
     );
 }
 
-/// A transcript holding a closed word no reader reads and one a reader
-/// reads: a prompt; a `mode` row, whose `type` and `mode` no
-/// reader opens, the mode a word someone wrote; the model's reply; and the
-/// turn's end, a `system` row whose `subtype` the step fold reads.
 const WORDS_PLANT: [&str; 4] = [
     r#"{"type":"user","timestamp":"2026-10-16T10:00:00.000Z","uuid":"11111111-1111-4111-8111-111111111111","promptId":"12111111-1111-4111-8111-111111111111","message":{"role":"user","content":"hello"},"version":"2.1.303"}"#,
     r#"{"type":"mode","mode":"quokkaledger","sessionId":"71111111-1111-4111-8111-111111111111"}"#,
@@ -1050,12 +919,6 @@ const WORDS_PLANT: [&str; 4] = [
     r#"{"type":"system","subtype":"turn_duration","durationMs":1200,"timestamp":"2026-10-16T10:00:02.000Z","uuid":"31111111-1111-4111-8111-111111111111","parentUuid":"21111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
 ];
 
-/// a closed word is kept only where a reader reads it. The
-/// planted `"mode":"quokkaledger"` (a word under a closed key, which the
-/// rule before U7 kept as written) is emptied, while its row's `type`, which
-/// the harness reads of every row, is kept; so is the turn end's `subtype`,
-/// which the step fold reads, and the reply's `stop_reason`; and every
-/// word kept is read (the output-side check, [`unread_words`]).
 #[test]
 fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
     let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -1094,9 +957,6 @@ fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
     assert!(e.contains("steps became"), "{e}");
 }
 
-/// THE OUTPUT-SIDE CHECK over every `supervise/fixtures`
-/// transcript and the planted Codex rollout: each closed word a reduction
-/// keeps, blanked alone, changes its readings.
 #[test]
 fn every_closed_word_a_reduction_keeps_is_read() {
     let mut kept = 0;
@@ -1125,10 +985,6 @@ fn every_closed_word_a_reduction_keeps_is_read() {
     );
 }
 
-/// NEGATIVE CONTROL: a reducer that blanks a word a reader
-/// reads (each `subtype` the readers keep: a turn's `turn_duration`, a
-/// compaction's `compact_boundary`) fails the fold check on every fixture
-/// whose reduction keeps one.
 #[test]
 fn a_reducer_that_blanks_a_read_word_fails_the_fold_check() {
     let with = fixtures()
@@ -1148,9 +1004,6 @@ fn a_reducer_that_blanks_a_read_word_fails_the_fold_check() {
     );
 }
 
-/// A file no choice of words can make read as its source is refused:
-/// a rule that empties every `subtype` loses the turn's end, which no
-/// word put back restores.
 #[test]
 fn a_reduction_nothing_restores_is_refused() {
     let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -1159,10 +1012,6 @@ fn a_reduction_nothing_restores_is_refused() {
     assert!(reduce(&src, Program::Claude).is_ok());
 }
 
-/// A reduction reduced again is itself: the readers keep the
-/// same words, each id and key keeps its name, the times move no further
-/// and the header says the source was a reduction, its day count the whole
-/// move from the first source.
 #[test]
 fn a_reduction_reduced_again_is_itself() {
     for (n, text) in fixtures() {
@@ -1198,8 +1047,6 @@ fn a_reduction_reduced_again_is_itself() {
     );
 }
 
-/// Every canonical phrase reads as a wall (or as the notice that is none, or
-/// as nothing) no earlier phrase reads as: the table holds no dead row.
 #[test]
 fn every_canonical_phrase_is_the_first_of_its_reading() {
     let ps = phrases();
@@ -1221,8 +1068,6 @@ fn every_canonical_phrase_is_the_first_of_its_reading() {
     );
 }
 
-/// A reset clause keeps its time of day, moves its date by whole days and
-/// drops its zone; a clause of another form is no clause.
 #[test]
 fn a_reset_clause_is_rebased_by_whole_days() {
     let shift = days_from_civil(2000, 1, 1) - days_from_civil(2026, 10, 8);
@@ -1257,9 +1102,6 @@ fn a_reset_clause_is_rebased_by_whole_days() {
     );
 }
 
-/// The ordered tree reads and writes JSON as written: key order, numbers as
-/// spelled, escapes as `JSON.stringify` writes them, a surrogate pair as one
-/// character; and refuses what is no JSON.
 #[test]
 fn the_tree_keeps_order_numbers_and_escapes() {
     let src = r#"{"z":1,"a":[1.50,-0,2e3,{"q":null,"b":true}],"s":"a\"b\\c\n\t\u0001😀é/"}"#;
@@ -1281,8 +1123,6 @@ fn the_tree_keeps_order_numbers_and_escapes() {
     }
 }
 
-/// Ids are remapped one to one, a valid `StepId` to a valid one and an
-/// invalid one to an invalid one, a UUID to a UUID, a prefix kept.
 #[test]
 fn ids_are_remapped_one_to_one_their_validity_kept() {
     let src = concat!(
@@ -1318,9 +1158,6 @@ fn ids_are_remapped_one_to_one_their_validity_kept() {
     );
 }
 
-/// A user row keeps the marker it opens with and nothing past it; a local
-/// command's output that reads as a full context keeps its canonical phrase
-/// in its tags; a key that is no identifier is renamed.
 #[test]
 fn a_user_row_keeps_its_marker_and_nothing_past_it() {
     let row = |content: &str| {
@@ -1362,9 +1199,6 @@ fn a_user_row_keeps_its_marker_and_nothing_past_it() {
     );
 }
 
-/// A Codex rollout keeps the closed words its readers read, ids one to one
-/// and numbers, its reset epoch rebased with its stamps, and none of its
-/// text.
 #[test]
 fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
     let src = concat!(
@@ -1403,14 +1237,6 @@ fn a_codex_rollout_keeps_words_ids_and_numbers_only() {
     }
 }
 
-/// THE LAB'S CODEX 0.163.0 ROLLOUTS (session log 5G): a call's `namespace`
-/// is a closed word kept, the step fold reading it (a `spawn_agent` in
-/// `collaboration` starts a subagent), and so is the `session_meta` that
-/// makes the call, 10 ms on, the thread's own, its build and an event's
-/// `type` the step fold reads; an abort's `reason` and an item's own `type`,
-/// which no reader reads, go; the millisecond stamps
-/// (`started_at_ms`) and an item's fractional `create_time` move with the
-/// stamps; a call's free-form `arguments` and a message's `content` go.
 #[test]
 fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
     let src = concat!(
@@ -1459,15 +1285,12 @@ fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
     }
 }
 
-/// A line that is no JSON refuses the file; nothing is written for it.
 #[test]
 fn a_line_that_is_no_json_refuses_the_file() {
     let e = reduce("{\"type\":\"user\"}\n{\"type\":", Program::Claude).expect_err("refused");
     assert!(e.starts_with("line 2: not one JSON value"), "{e}");
 }
 
-/// The verb never writes over a file: `--out` an existing path is refused
-/// and the file is left as it was.
 #[test]
 fn the_verb_never_writes_over_a_file() {
     let dir = aterm_tempfile::tempdir().expect("a scratch dir");
@@ -1501,13 +1324,6 @@ fn the_verb_never_writes_over_a_file() {
     assert_eq!(cmd_reduce(&["x".to_string()]).expect_err("usage").code, 2);
 }
 
-/// What the harness's whole-text readers make of `jsonl` (a file's first
-/// rows), its times moved back by `shift_s` so a reduction's reads as its
-/// source's: the login wall and when it lifted; the standing limit (when it
-/// holds until, the reset it names, whether it is money, the quota wall's
-/// time, reset, window and credits, the limit row's reset, window, time and
-/// words as their [`Reading`]); the model; the newest answer; the build's
-/// warning after a resume; and a task's finish and asking.
 fn harness_reads(jsonl: &str, build: &str, shift_s: i64) -> String {
     use aterm_agent::harness::upgrade as up;
     let back = |t: Option<u64>| t.map(|t| i64::try_from(t).unwrap_or(i64::MAX) - shift_s);
@@ -1535,11 +1351,6 @@ fn harness_reads(jsonl: &str, build: &str, shift_s: i64) -> String {
     )
 }
 
-/// THE HARNESS'S READERS READ THE REDUCTION `red` OF `source` AS THEY READ
-/// IT, apart from the reducer's own [`readings`]: every prefix of its rows
-/// to the whole-text readers ([`harness_reads`]), and each row to the wall
-/// check's read of a notice ([`notice_read`]: its typed fields, wall,
-/// confirmations and the limit it names; its words as their [`Reading`]).
 fn harness_reads_as(source: &str, red: &Reduction) -> Result<(), String> {
     let a: Vec<&str> = source.lines().filter(|l| is_row(l)).collect();
     let b: Vec<&str> = red.text.lines().filter(|l| is_row(l)).collect();
@@ -1571,12 +1382,6 @@ fn harness_reads_as(source: &str, red: &Reduction) -> Result<(), String> {
     Ok(())
 }
 
-/// THE HARNESS'S OWN READERS (the review of 6D-1: readings are
-/// the committed readers', and a notice's typed words, its quota's and the
-/// login's are theirs), held apart from the reducer's [`readings`]: over
-/// every `supervise/fixtures` transcript, each prefix of the reduction
-/// reads to the harness's whole-text readers as the source's does, and
-/// each notice row to the wall check as its source's ([`harness_reads_as`]).
 #[test]
 fn the_harness_reads_every_reduction_as_its_source() {
     let (mut login, mut walls, mut typed) = (0, 0, 0);
@@ -1619,9 +1424,6 @@ fn the_harness_reads_every_reduction_as_its_source() {
     assert_eq!(failures(&blanks, &folds).len(), with);
 }
 
-/// A FILE OF TWO TURNS, each a prompt, a call, its result and the model's
-/// words, closed: the end after the first turn's words is read nowhere but
-/// in the ends after its rows (the second turn's entries end the file).
 const ENDS_PLANT: [&str; 10] = [
     r#"{"type":"user","timestamp":"2026-10-16T10:00:00.000Z","uuid":"11111111-1111-4111-8111-111111111111","promptId":"12111111-1111-4111-8111-111111111111","message":{"role":"user","content":"hello"},"version":"2.1.303"}"#,
     r#"{"type":"assistant","timestamp":"2026-10-16T10:00:01.000Z","uuid":"21111111-1111-4111-8111-111111111111","parentUuid":"11111111-1111-4111-8111-111111111111","message":{"id":"msg_01","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use"},"version":"2.1.303"}"#,
@@ -1635,10 +1437,6 @@ const ENDS_PLANT: [&str; 10] = [
     r#"{"type":"system","subtype":"turn_duration","durationMs":4000,"timestamp":"2026-10-16T10:00:09.000Z","uuid":"a1111111-1111-4111-8111-111111111111","parentUuid":"91111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
 ];
 
-/// THE ENDS AFTER EVERY ROW ARE A READING (fold check): a
-/// reduction whose only fault is the time of the first turn's last words
-/// (an hour late) keeps every step, the losses, the last end and every
-/// notice, and fails the fold check by the end after that row.
 #[test]
 fn an_end_after_a_row_is_read() {
     let src: String = ENDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -1660,12 +1458,6 @@ fn an_end_after_a_row_is_read() {
     assert!(e.contains("the end after row 3"), "{e}");
 }
 
-/// THE CHOICE ([`choose`]) on readings made to need each of its
-/// legs: two pairs read redundantly (either restores the reading, so
-/// blanking each alone changes nothing) are put back the first-seen one
-/// first, until the choice reads as every pair kept; and a pair put back
-/// that makes a pair kept before it needless leaves that pair blanked
-/// again.
 #[test]
 fn the_choice_puts_back_and_then_drops_what_is_needless() {
     let redundant = |k: &[bool]| (k[0] || k[1], k[2]);
@@ -1688,8 +1480,6 @@ fn the_choice_puts_back_and_then_drops_what_is_needless() {
     }
 }
 
-/// THE VERB WRITES ONLY WHAT ITS CHECK PASSES ([`check_written`]): what
-/// reads as its source and keeps no word no reader reads.
 #[test]
 fn the_verb_writes_only_what_reads_as_its_source() {
     let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();
@@ -1731,11 +1521,6 @@ fn the_verb_writes_only_what_reads_as_its_source() {
     assert_eq!(std::fs::read_to_string(&out).expect("written"), r.text);
 }
 
-/// THE COMMITTED 2.1.303 REDUCTION READS ITS LIMIT AS THE HARNESS DOES (the
-/// review of 6D-2): cut at its usage limit's notice, the quota wall stands
-/// for the session window (`five_hour`) until its reset, the limit row
-/// names that window, and the notice keeps its typed words (`rate_limit`,
-/// `usage_limit_reached`, `five_hour`).
 #[test]
 fn the_committed_2_1_303_reduction_keeps_its_limit_words() {
     use aterm_agent::harness::upgrade as up;

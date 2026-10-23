@@ -1,20 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! SWAR byte scanning (`memchr`, `memchr2`) and Two-Way substring search (`Searcher`).
 
 use std::cell::Cell;
 
-/// Bytes in a machine word.
 const WORD: usize = core::mem::size_of::<usize>();
-/// Machine words tested per iteration of the scanning loops.
 const UNROLL: usize = 8;
-/// Bytes tested per iteration of the scanning loops.
 const BLOCK: usize = WORD * UNROLL;
-/// `0x0101…01` — the low bit of every byte.
 const LO: usize = usize::MAX / 0xFF;
-/// `0x8080…80` — the high bit of every byte.
 const HI: usize = LO << 7;
 
 /// `byte` repeated into every lane of a word.
@@ -23,9 +17,7 @@ const fn splat(byte: u8) -> usize {
     LO.wrapping_mul(byte as usize)
 }
 
-/// The SWAR zero test of `word`, as a mask so a block of them can be OR-ed into one
-/// branch. Exact only for the lowest set lane: every caller re-scans byte by byte
-/// once it is non-zero.
+/// The SWAR zero test of `word`.
 #[inline]
 const fn zero_mask(word: usize) -> usize {
     word.wrapping_sub(LO) & !word & HI
@@ -37,16 +29,13 @@ const fn has_zero(word: usize) -> bool {
     zero_mask(word) != 0
 }
 
-/// Read a chunk as a word with byte `i` in bits `8i..8i+8` on every target:
-/// `from_le_bytes` fixes the lane order, free on little-endian and one byte swap on
-/// big-endian.
+/// Read a chunk as a word with byte `i` in bits `8i..8i+8` on every target.
 #[inline]
 const fn word_at(chunk: &[u8; WORD]) -> usize {
     usize::from_le_bytes(*chunk)
 }
 
-/// The OR of the `UNROLL` SWAR tests over `block` against `splatted`. `as_chunks` on
-/// a fixed-size array leaves no bounds check or `Option` in the loop.
+/// The OR of the `UNROLL` SWAR tests over `block` against `splatted`.
 #[inline]
 fn block_mask(block: &[u8; BLOCK], splatted: usize) -> usize {
     let (words, _) = block.as_chunks::<WORD>();
@@ -129,8 +118,7 @@ pub(crate) fn memchr2(first: u8, second: u8, haystack: &[u8]) -> Option<usize> {
     None
 }
 
-/// The last index in `haystack` holding `needle`: [`memchr`]'s split walked from the
-/// far end.
+/// The last index in `haystack` holding `needle`: [`memchr`]'s split walked from the far end.
 #[inline]
 fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     let splatted = splat(needle);
@@ -169,13 +157,6 @@ fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     None
 }
 
-/// How common `byte` is in terminal text (higher is more common); the skip uses the
-/// needle byte scoring lowest.
-///
-/// An estimate: a bad choice costs scanning time, never an answer. The order suits
-/// build logs, source and shell transcripts: space and frequent English letters,
-/// structure and digits, rarer letters, capitals, code-only punctuation, non-ASCII,
-/// then control bytes.
 const fn commonness(byte: u8) -> u8 {
     match byte {
         b' ' => 255,
@@ -203,8 +184,6 @@ const fn commonness(byte: u8) -> u8 {
     }
 }
 
-/// [`commonness`] as a table, so choosing a skip byte is one load per needle
-/// byte rather than a chain of range compares.
 const COMMONNESS: [u8; 256] = {
     let mut table = [0u8; 256];
     let mut byte = 0usize;
@@ -215,8 +194,7 @@ const COMMONNESS: [u8; 256] = {
     table
 };
 
-/// The needle byte to skip on, as `(byte, offset)`, picking the rarest and the
-/// earliest among equals so the choice is a function of the needle alone.
+/// The needle byte to skip on.
 #[inline]
 fn rare_byte(needle: &[u8]) -> Option<(u8, usize)> {
     let mut best_at = 0usize;
@@ -231,14 +209,9 @@ fn rare_byte(needle: &[u8]) -> Option<(u8, usize)> {
     Some((needle.get(best_at).copied()?, best_at))
 }
 
-/// Skip calls made before the skip's usefulness is judged at all.
 const PROBE: u32 = 8;
-/// Bytes a skip call must be worth, on average, to stay switched on.
 const MIN_STRIDE: u32 = 4;
 
-/// `on` only ever falls: once the skip earns under [`MIN_STRIDE`] bytes per call it
-/// is off for the rest of the haystack and the loop uses Two-Way's own shift, which
-/// keeps the worst case `O(n + m)` instead of a prefilter's `O(n·m)`.
 struct Skip {
     /// The needle byte scanned for.
     byte: u8,
@@ -265,9 +238,7 @@ impl Skip {
         }
     }
 
-    /// The first position at or after `at` where the skip byte lines up; `None` means
-    /// the needle does not occur at or after `at`. Every position stepped over has
-    /// `needle[offset]` mismatched, so no occurrence is skipped.
+    /// The first position at or after `at` where the skip byte lines up.
     #[inline]
     fn advance<const REV: bool>(&mut self, haystack: &View<'_, REV>, at: usize) -> Option<usize> {
         if !self.on {
@@ -286,9 +257,6 @@ impl Skip {
     }
 }
 
-/// Reverse search is the forward algorithm over reversed views of haystack and
-/// needle, so there is one Two-Way here and the oracle's exhaustive sweep covers
-/// both directions.
 struct View<'a, const REV: bool> {
     /// The underlying bytes, in physical order.
     bytes: &'a [u8],
@@ -338,14 +306,10 @@ struct Factorization {
     cut: usize,
     /// The period of the needle's prefix at that position.
     period: usize,
-    /// Whether the prefix repeats at `period`, which is the form that may
-    /// carry `memory` across a shift.
+    /// Whether the prefix repeats at `period`.
     periodic: bool,
 }
 
-/// Indices are carried as one more than the real index, so the algorithm's `-1`
-/// sentinel is `0` and no signed arithmetic appears; the returned start (real index
-/// plus one) is the length of the prefix before the suffix.
 fn maximal_suffix<const REV: bool>(needle: &View<'_, REV>, reversed: bool) -> (usize, usize) {
     let n = needle.len();
     let mut suffix = 0usize; // real suffix start + 1
@@ -380,8 +344,6 @@ fn maximal_suffix<const REV: bool>(needle: &View<'_, REV>, reversed: bool) -> (u
     (suffix, period)
 }
 
-/// The critical factorization: the later of the two maximal suffixes, with its
-/// period, plus whether the needle's prefix repeats at that period.
 fn factorize<const REV: bool>(needle: &View<'_, REV>) -> Factorization {
     let (cut_less, period_less) = maximal_suffix(needle, false);
     let (cut_more, period_more) = maximal_suffix(needle, true);
@@ -403,8 +365,6 @@ fn factorize<const REV: bool>(needle: &View<'_, REV>) -> Factorization {
     }
 }
 
-/// Two-Way substring search over a view. `needle` is non-empty and no longer
-/// than `haystack`; the returned index is logical.
 fn two_way<const REV: bool>(
     haystack: &View<'_, REV>,
     needle: &View<'_, REV>,
@@ -479,15 +439,11 @@ fn two_way<const REV: bool>(
 pub(crate) struct Searcher<'n> {
     /// The bytes being searched for.
     needle: &'n [u8],
-    /// The factorization used reading forwards, computed on first use: most lines do
-    /// not contain the query, and the skip scan says so without one. Computing it
-    /// eagerly made a 90-byte line, the commonest size, 8x slower.
+    /// The factorization used reading forwards.
     forward: Cell<Option<Factorization>>,
     /// The factorization used reading backwards, computed on first use.
     backward: Cell<Option<Factorization>>,
-    /// The skip byte and its physical offset in the needle, chosen on first use. `None`
-    /// means not chosen yet (an empty needle is answered before this is read). Lazy so
-    /// a query the trigram index rejects never pays a pass over the needle.
+    /// The skip byte and its physical offset in the needle.
     rare: Cell<Option<(u8, usize)>>,
 }
 
@@ -595,18 +551,14 @@ impl<'n> Searcher<'n> {
 mod tests {
     use super::{Searcher, memchr};
 
-    /// One-shot forward search.
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).find_in(haystack)
     }
 
-    /// One-shot reverse search.
     fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).rfind_in(haystack)
     }
 
-    /// The `0x01`-after-`0x00` case: the borrow from the zero byte flags the `0x01`
-    /// lane too, so the SWAR test's higher lanes lie. Invisible in random data.
     #[test]
     fn a_one_byte_after_a_zero_byte_does_not_shift_the_answer() {
         let haystack = [0x00u8, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];
@@ -616,8 +568,6 @@ mod tests {
         assert_eq!(super::memrchr(0x01, &haystack), Some(8));
     }
 
-    /// A needle whose rarest byte is the only byte in the haystack makes every skip call
-    /// return where it started; the skip switches off and the answer is unchanged.
     #[test]
     fn a_useless_skip_switches_itself_off_and_the_answer_is_unchanged() {
         let haystack = vec![b'a'; 4096];
@@ -632,15 +582,11 @@ mod tests {
     }
 }
 
-/// Two-Way's critical factorization has cases only particular periodic needles
-/// reach, so the core is exhaustive: every haystack and needle up to a length bound
-/// over two- and three-letter alphabets, checked in both directions (which covers
-/// the reverse view).
+/// Two-Way's critical factorization has cases only particular periodic needles reach.
 #[cfg(test)]
 mod oracle {
     use super::{Searcher, memchr, memchr2, memrchr};
 
-    /// The reference: naive scans, correct by inspection.
     mod naive {
         pub(super) fn memchr(n: u8, h: &[u8]) -> Option<usize> {
             h.iter().position(|&b| b == n)
@@ -663,32 +609,23 @@ mod oracle {
         }
     }
 
-    /// One-shot forward search through a fresh [`Searcher`].
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).find_in(haystack)
     }
 
-    /// One-shot reverse search through a fresh [`Searcher`].
     fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         Searcher::new(needle).rfind_in(haystack)
     }
 
-    /// This module's entry points, so the assertions read as ours against the reference.
     mod ours {
         pub(super) use super::{find, memchr, memchr2, memrchr, rfind};
     }
 
-    /// The exhaustive sweeps are sized to take a few seconds in an unoptimized test
-    /// build; a release test build runs them two needle bytes deeper (~33M pairs).
     const BINARY_NEEDLE: usize = if cfg!(debug_assertions) { 8 } else { 10 };
-    /// Haystack bound for the binary sweep.
     const BINARY_HAYSTACK: usize = if cfg!(debug_assertions) { 11 } else { 13 };
-    /// Needle bound for the ternary sweep.
     const TERNARY_NEEDLE: usize = if cfg!(debug_assertions) { 5 } else { 6 };
-    /// Haystack bound for the ternary sweep.
     const TERNARY_HAYSTACK: usize = if cfg!(debug_assertions) { 7 } else { 8 };
 
-    /// Every string of length `len` over `alphabet`, as bytes.
     fn strings(alphabet: &[u8], len: usize) -> impl Iterator<Item = Vec<u8>> + '_ {
         let total = alphabet.len().checked_pow(len as u32).expect("small");
         (0..total).map(move |mut n| {
@@ -719,9 +656,6 @@ mod oracle {
         );
     }
 
-    /// The shipped path reuses one [`Searcher`] down a whole screen in either direction,
-    /// so the cached factorizations are checked cold and warm, warmed from either
-    /// direction first. The exhaustive sweeps build a fresh searcher per call.
     #[test]
     fn a_warm_searcher_matches_the_reference() {
         let mut state: u64 = 0x1234_5678_9ABC_DEF0;
@@ -763,9 +697,6 @@ mod oracle {
         }
     }
 
-    /// Exhaustive over a binary alphabet: every haystack up to [`BINARY_HAYSTACK`]
-    /// bytes against every needle up to [`BINARY_NEEDLE`], so `aaaa`, `abab`, `aabaab`
-    /// and the like appear in every alignment.
     #[test]
     fn exhaustive_binary_alphabet() {
         let mut pairs = 0u64;
@@ -783,8 +714,6 @@ mod oracle {
         assert!(pairs > 1_000_000, "corpus too small: {pairs}");
     }
 
-    /// Exhaustive over a ternary alphabet at a smaller bound, covering needles that are
-    /// not periodic in a binary world.
     #[test]
     fn exhaustive_ternary_alphabet() {
         let mut pairs = 0u64;
@@ -802,8 +731,6 @@ mod oracle {
         assert!(pairs > 1_000_000, "corpus too small: {pairs}");
     }
 
-    /// Randomized periodic needles longer than the exhaustive sweeps reach: a repeated
-    /// unit drives Two-Way's memory-carrying branch, the one the skip never jumps from.
     #[test]
     fn periodic_needles_match_the_reference() {
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
@@ -833,8 +760,6 @@ mod oracle {
         }
     }
 
-    /// Named edge cases, so a regression names itself rather than arriving as one of
-    /// millions.
     #[test]
     fn named_edges_match_the_reference() {
         let cases: &[(&[u8], &[u8])] = &[
@@ -858,8 +783,6 @@ mod oracle {
         }
     }
 
-    /// Single-byte scanning at every length and every offset across the word
-    /// stride, plus the two-needle form.
     #[test]
     fn byte_scanning_matches_the_reference() {
         for len in 0..=200usize {
@@ -909,8 +832,6 @@ mod oracle {
         }
     }
 
-    /// Every byte value, so no lane of the word test goes unexercised and the
-    /// zero byte is not special-cased by accident.
     #[test]
     fn every_byte_value_is_findable() {
         for needle in 0u16..=255 {
@@ -934,8 +855,6 @@ mod oracle {
         }
     }
 
-    /// Long, structured haystacks: the shapes a terminal actually produces, at
-    /// sizes past the word stride and past any prefilter's warm-up.
     #[test]
     fn realistic_haystacks_match_the_reference() {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;

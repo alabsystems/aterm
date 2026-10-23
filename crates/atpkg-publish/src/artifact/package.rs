@@ -674,7 +674,7 @@ fn fetch_asset(
     })
 }
 
-/// [`pack_package`] over explicit tools — the seam the tests drive.
+/// [`run`]'s pack over explicit tools — the seam the tests drive.
 /// # Errors
 /// Any gate's refusal; nothing is signed or uploaded after one.
 pub fn pack_package_with(

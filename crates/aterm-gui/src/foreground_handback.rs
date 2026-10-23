@@ -634,7 +634,6 @@ pub(crate) fn record_restored(
 ) -> String {
     let program = tl.program_of(edge.from).map(str::to_string);
     let payload = restored_payload(edge, program.as_deref(), reverted, bytes);
-    tl.record("modes-restored", payload.clone());
     let at = tl.slog().now();
     tl.slog_mut().observe_modes(
         crate::session_log::observed::ModesFrom::Handback {
@@ -647,6 +646,7 @@ pub(crate) fn record_restored(
         aterm_slog::Actor::Nobody,
         at,
     );
+    tl.record("modes-restored");
     payload
 }
 

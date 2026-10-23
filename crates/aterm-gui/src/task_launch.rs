@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A WORKER'S START: `spawn agent=<claude|gemini|agy|muse>` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.1), one mechanism for every harness (`aterm_agent::harness::worker`'s table).
+//! Worker launch (`spawn agent=<claude|gemini|agy|muse>`) across harnesses.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -23,11 +23,8 @@ pub(crate) const TASK_MAX: usize = aterm_types::control_verbs::MAX_TASK_BYTES;
 /// How long a worker's shell has to draw its first prompt before its task is `stalled why=shell`.
 pub(crate) const FIRST_PROMPT_WAIT: Duration = Duration::from_secs(20);
 
-/// The child deadline for `fish --version` ([`fish_says`]); complete-output
-/// capture also retains the helper's bounded drain/reap reserves.
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 
-/// The reply to a worker's spawn of `agent` that carried no task frame.
 fn no_frame(agent: &str) -> String {
     format!(
         "ERR spawn agent={agent}: the task follows the line as a frame (len=<n>, then n bytes); \
@@ -36,12 +33,10 @@ fn no_frame(agent: &str) -> String {
 }
 
 thread_local! {
-    /// The task frame the serve loop read for the request this thread is
-    /// serving ([`CarriedTask`]).
     static FRAME: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
 }
 
-/// The task a `spawn … len=<n>` frame carried, held for the ONE dispatch that serves its line (`control::serve_request_line`) and cleared when that dispatch ends, so no other request on the thread ever sees it.
+/// Task payload from a `spawn … len=<n>` frame, held only for its request dispatch.
 pub(crate) struct CarriedTask(());
 
 impl CarriedTask {
@@ -58,7 +53,7 @@ impl Drop for CarriedTask {
     }
 }
 
-/// The task frame the request being served carried, taken: the spawn handler reads it once ([`TaskOrder::of_frame`]).
+/// The task frame the request being served carried, taken: the spawn handler reads it once.
 pub(crate) fn take_frame() -> Option<Vec<u8>> {
     FRAME.with(|frame| frame.borrow_mut().take())
 }
@@ -72,12 +67,11 @@ pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
     }
 }
 
-/// The refusal of a task over [`TASK_MAX`].
 fn too_large(len: &str, agent: &str) -> String {
     format!("ERR spawn agent={agent}: the task is {len} bytes (max {TASK_MAX})\n")
 }
 
-/// The worker word a spawn line's `agent=` names, for a refusal made before the line is parsed whole ([`frame_len`]).
+/// The worker word a spawn line's `agent=` names.
 pub(crate) fn worker_word(agent: Option<&str>) -> &'static str {
     aterm_agent::harness::worker::WORKERS
         .iter()
@@ -85,22 +79,22 @@ pub(crate) fn worker_word(agent: Option<&str>) -> &'static str {
         .map_or("claude", |w| w.word)
 }
 
-/// What the control thread hands the main thread for a worker (`Wake::SpawnSession`'s `task`): checked, but not yet written.
+/// What the control thread hands the main thread for a worker (`Wake::SpawnSession`'s `task`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskOrder {
     /// The task as the frame carried it.
     pub(crate) task: Vec<u8>,
-    /// `agent=`: the harness the worker runs, one with a row in `aterm_agent::harness::worker::WORKERS`.
+    /// `agent=`: the harness the worker runs (`aterm_agent::harness::worker::WORKERS`).
     pub(crate) agent: aterm_phase::Program,
     /// `model=`: the worker's `--model`.
     pub(crate) model: Option<String>,
-    /// `from=`, the session that starts the worker (the client's own, which the spawn's `@<sid>` aim need not be).
+    /// `from=`, the session that starts the worker.
     pub(crate) caller: Option<SessionId>,
     /// The `cwd=` named, canonical.
     pub(crate) trusted_cwd: Option<String>,
-    /// Whether the task file ends with the [`fact_line`] naming its starter: a client's spawn's does.
+    /// Whether the task file ends with the [`fact_line`] naming its starter.
     pub(crate) fact_line: bool,
-    /// The newborn's own Autopilot word (`spawn … autopilot=<land|cruise>`), written beside its trusted folder before its agent runs ([`WORKER_AUTOPILOT`] where the spawn names none).
+    /// Autopilot word (`spawn … autopilot=<land|cruise>`) written before the worker starts.
     pub(crate) autopilot: Autopilot,
 }
 
@@ -172,9 +166,9 @@ pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: &str) -> String
     )
 }
 
-/// What a worker's task file holds: the task as given, its last line ended,
-/// then — with a starter `from` — a blank line and the [`fact_line`] naming
-/// it and its `autopilot`.
+/// What a worker's task file holds: the task as given (less its blank lines for a worker whose
+/// first prompt may hold none), its last line ended, then — with a starter `from` — the
+/// [`fact_line`] naming it and its `autopilot`.
 pub(crate) fn task_text(
     task: &[u8],
     from: Option<&str>,
@@ -201,11 +195,6 @@ pub(crate) fn task_text(
     text
 }
 
-/// `task` with every line that draws as a blank row left out (one of white
-/// space alone, Unicode's as agy's reader reads a blank row — `U+00A0`,
-/// `U+3000`, `U+2000`..`U+200A` and the rest — or of characters that draw
-/// nothing: controls and the zero-width ones, [`draws_nothing`]), each other
-/// line as given.
 fn without_blank_lines(task: &[u8]) -> Vec<u8> {
     task.split_inclusive(|&b| b == b'\n')
         .filter(|line| !String::from_utf8_lossy(line).chars().all(draws_nothing))
@@ -214,12 +203,6 @@ fn without_blank_lines(task: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Whether `c` draws nothing a reader of the row could tell from a blank
-/// cell: white space (Unicode's `White_Space`, what `aterm_phase`'s readers
-/// trim), a control character, or a zero-width format character (the soft
-/// hyphen, the zero-width space, joiners and marks `U+200B`..`U+200F`, the
-/// word joiner and invisible operators `U+2060`..`U+2064`, the byte-order
-/// mark).
 fn draws_nothing(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
@@ -229,7 +212,7 @@ fn draws_nothing(c: char) -> bool {
         )
 }
 
-/// A worker's task file, ready to be written once the newborn's sid is known (`spawn::spawn_session`, on the spawner thread a tab's shell starts on — `tab_spawn`).
+/// A worker's task file, ready to be written once the newborn's sid is known.
 #[derive(Clone)]
 pub(crate) struct TaskSeed {
     text: Arc<[u8]>,
@@ -255,7 +238,7 @@ impl TaskSeed {
         }
     }
 
-    /// Prepare the worker's optional private trust sidecar in the same spawner write and cancellation lifetime as its task, before the session can be registered and closed.
+    /// Prepare the worker's optional private trust sidecar alongside its task file.
     pub(crate) fn with_trust_file(mut self, folder: &str) -> Self {
         self.trust_text = Some(
             aterm_agent::harness::worker::trusted_folders_text(folder)
@@ -273,7 +256,7 @@ impl TaskSeed {
             .clone()
     }
 
-    /// Remove the task and optional trust file this seed wrote: its worker did not start, so nothing will read them.
+    /// Remove the task and optional trust file this seed wrote: its worker did not start.
     pub(crate) fn discard(&self) {
         let written = {
             let mut state = self.written.lock().unwrap_or_else(|p| p.into_inner());
@@ -307,8 +290,6 @@ impl TaskSeed {
         })
     }
 
-    /// The exclusive file write and its ownership handover. The filesystem
-    /// operation runs without the state lock, so discard never waits on it.
     fn write_in_using(
         &self,
         dir: &Path,
@@ -366,21 +347,14 @@ impl TaskSeed {
     }
 }
 
-/// The name of session `sid`'s task file in the tasks directory: a new
-/// record is rev 1.
 fn task_file_name(sid: &SessionId) -> String {
     format!("{}-1.txt", sid.as_str())
 }
 
-/// The name of a Gemini CLI worker `sid`'s own trusted-folders file in the
-/// tasks directory ([`TaskSeed::with_trust_file`]).
 fn trust_file_name(sid: &SessionId) -> String {
     format!("{}-1.trust.json", sid.as_str())
 }
 
-/// Whether `name` is one of session `sid`'s result files in the tasks
-/// directory: `<sid>-<rev>.result.md` or its sidecar `<sid>-<rev>.result.src`
-/// (`aterm_agent::harness::result::snapshot`, one pair per published done).
 fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
     let Some(stem) = name
         .strip_suffix(".result.md")
@@ -393,26 +367,23 @@ fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
         .is_some_and(|rev| !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The most names one retire reads of the tasks directory: far past what
-/// its own sweeps leave there (a task file per live worker, a result pair
-/// per done it published).
 const TASKS_DIR_SCAN: usize = 65_536;
 
-/// Remove session `sid`'s task files once the session is gone (`App::retire_session_registration`, the tail of every close; a quit's [`retire_task_files_at_quit`]).
+/// Remove session `sid`'s task files once the session is gone.
 pub(crate) fn retire_task_file(sid: &SessionId) {
     if let Some(dir) = crate::task_record::tasks_dir() {
         retire_task_file_in(&dir, sid);
     }
 }
 
-/// Remove the task files ([`retire_task_file`]) of every session `store` still holds with a task record, at a QUIT (Cmd-Q, `invoke Quit`, `aterm ctl quit`, a headless SIGTERM).
+/// Remove the task files ([`retire_task_file`]) of every session `store` still holds with a task
+/// record, except those in `parked`, at quit.
 pub(crate) fn retire_task_files_at_quit(store: &Store, parked: &[SessionId]) {
     if let Some(dir) = crate::task_record::tasks_dir() {
         retire_task_files_in(&dir, store, parked);
     }
 }
 
-/// [`retire_task_files_at_quit`] in the tasks directory `dir`.
 fn retire_task_files_in(dir: &Path, store: &Store, parked: &[SessionId]) {
     let tasked: Vec<SessionId> = store
         .read()
@@ -433,15 +404,10 @@ fn retire_task_files_in(dir: &Path, store: &Store, parked: &[SessionId]) {
     retire_files_in(dir, &tasked);
 }
 
-/// [`retire_task_file`] in the tasks directory `dir`: none there, or no
-/// directory, is no error.
 fn retire_task_file_in(dir: &Path, sid: &SessionId) {
     retire_files_in(dir, std::slice::from_ref(sid));
 }
 
-/// Remove each of `sids`' task file and result files from the tasks
-/// directory `dir`, the directory read once; none there, or no directory,
-/// is no error.
 fn retire_files_in(dir: &Path, sids: &[SessionId]) {
     if sids.is_empty() {
         return;
@@ -512,7 +478,7 @@ pub(crate) struct Launch {
     pub(crate) trusted_cwd: Option<String>,
     /// The optional sidecar already written with the task before the session was registered.
     pub(crate) trust_file: Option<PathBuf>,
-    /// The starter's session, whose agent of the worker's kind the line follows ([`worker_starter_of`]).
+    /// The starter's session, whose agent of the worker's kind the line follows.
     pub(crate) caller: Option<Arc<SessionCtx>>,
 }
 
@@ -527,7 +493,6 @@ pub(crate) fn launch_worker(work: Launch) {
     }
 }
 
-/// The launcher's body ([`launch_worker`]).
 fn run_worker_launch(work: &Launch) {
     if work.dialect == Dialect::Fish && !fish_answer(&work.shell) {
         stall(
@@ -624,10 +589,6 @@ fn run_worker_launch(work: &Launch) {
     }
 }
 
-/// Keep what the launcher did with the worker's line on its timeline
-/// (`SessionTimeline::worker_launch`): the startup deadline's stall says it
-/// (`harness_host::startup_mark_with`), so a worker that never started tells
-/// a line typed and lost from one never typed.
 fn note_launch(ctx: &SessionCtx, note: String) {
     ctx.timeline
         .lock()
@@ -635,9 +596,6 @@ fn note_launch(ctx: &SessionCtx, note: String) {
         .note_worker_launch(note);
 }
 
-/// Wait for the worker's shell to draw its first prompt — the newest command
-/// block one whose line editor reads (OSC 133 `B`: `blocks` says `entering`)
-/// — for at most [`FIRST_PROMPT_WAIT`], woken by its output.
 fn await_first_prompt(work: &Launch) -> Result<PromptFence, &'static str> {
     let deadline = Instant::now() + FIRST_PROMPT_WAIT;
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
@@ -727,7 +685,6 @@ pub(crate) fn type_launch_line(
             entering_command: true,
             ..InputFence::default()
         },
-        // Inert: a fence that reads no row never waits, whichever thread is named.
         crate::ReadOn::EventLoop,
         None,
     );
@@ -743,8 +700,6 @@ pub(crate) fn type_launch_line(
     }
 }
 
-/// Mark the worker's task `stalled why=shell`, nothing typed, and say why in
-/// the log and on its timeline ([`note_launch`]).
 fn stall(work: &Launch, why: &str) {
     note_launch(&work.ctx, format!("never typed ({why})"));
     stall_task(&work.ctx, work.local, why);
@@ -770,7 +725,7 @@ pub(crate) fn line_starter(
     found.unwrap_or_else(|| cli.plain())
 }
 
-/// WHETHER THE WORKER'S LINE TRUSTS ITS FOLDER FOR THIS RUN (`flag`: the agent has such a flag, `aterm_agent::harness::worker::WorkerCli::trust_flag`, Muse Code's alone).
+/// WHETHER THE WORKER'S LINE TRUSTS ITS FOLDER FOR THIS RUN.
 pub(crate) fn trusted_here(
     flag: bool,
     trusted: Option<&str>,
@@ -782,8 +737,6 @@ pub(crate) fn trusted_here(
     cwd().is_some_and(|cwd| cwd == Path::new(trusted))
 }
 
-/// The directory of the group in front of the worker's own terminal (its
-/// shell, at its first prompt), as the kernel tells it.
 fn shell_cwd(store: &Store, ctx: &SessionCtx) -> Option<PathBuf> {
     let pid = u32::try_from(starter_front(store, ctx)?).ok()?;
     aterm_sysprobe::process_cwd(pid)
@@ -798,7 +751,8 @@ pub(crate) enum StarterGroup {
     Front(i32),
 }
 
-/// THE STARTER'S GROUP a worker's line follows: the one the status sweep named, where its reader is the worker's `agent`.
+/// THE STARTER'S GROUP a worker's line follows: the one the status sweep named, where its reader
+/// is the worker's `agent`.
 pub(crate) fn starter_group(
     reader: Option<aterm_phase::Program>,
     named: i32,
@@ -825,8 +779,6 @@ enum Found {
 }
 
 impl Found {
-    /// The words the launch line's log names its program with, `agent` the
-    /// worker's.
     fn words(self, agent: aterm_phase::Program) -> String {
         let product = agent.product();
         match self {
@@ -840,10 +792,6 @@ impl Found {
     }
 }
 
-/// The program, homes and login a worker's line carries: the starter's own
-/// agent of `cli`'s kind where the starter's session runs one
-/// (`aterm_agent::harness::worker::starter`, of [`starter_group`]), else
-/// `cli`'s plain word under the shell's own — with where it was found.
 fn worker_starter_of(
     work: &Launch,
     cli: &aterm_agent::harness::worker::WorkerCli,
@@ -884,8 +832,7 @@ fn starter_front(store: &Store, ctx: &SessionCtx) -> Option<i32> {
         .by_sid(&ctx.self_id)
         .filter(|h| !matches!(h.state, SessionState::Exited))?
         .master;
-    // SAFETY: `tcgetpgrp` on the starter's own PTY master fd, which the registry holds open for the
-    // session's life (its guard is held); it takes no pointers.
+    // SAFETY: `tcgetpgrp` on the starter's own PTY master fd, which the registry holds open for the session's life (its guard is held); it takes no pointers.
     let pgrp = unsafe { libc::tcgetpgrp(master) };
     (pgrp > 0).then_some(pgrp)
 }
@@ -896,9 +843,6 @@ fn starter_front(_store: &Store, _ctx: &SessionCtx) -> Option<i32> {
     None
 }
 
-/// A fish program as a worker's spawn finds it: its path, and the file's
-/// length and modification time there, so a fish upgraded in place is asked
-/// again ([`fish_key`]).
 type FishKey = (PathBuf, u64, Option<std::time::SystemTime>);
 
 /// What a fish's `--version` came to ([`fish_answers`]).
@@ -913,16 +857,12 @@ enum FishSaid {
     Nothing,
 }
 
-/// What each fish said ([`FishKey`]).
 fn fish_answers() -> &'static Mutex<std::collections::HashMap<FishKey, FishSaid>> {
     static ANSWERS: std::sync::OnceLock<Mutex<std::collections::HashMap<FishKey, FishSaid>>> =
         std::sync::OnceLock::new();
     ANSWERS.get_or_init(Mutex::default)
 }
 
-/// `shell`'s [`FishKey`]; `None` for a path that names no file (a bare
-/// `fish`, which the shell's own search resolves): such a fish is asked by
-/// every launcher and remembered by none.
 fn fish_key(shell: &Path) -> Option<FishKey> {
     let meta = std::fs::metadata(shell)
         .ok()
@@ -983,9 +923,6 @@ pub(crate) fn fish_answered(shell: &Path) -> Option<Option<bool>> {
     }
 }
 
-/// Whether the fish at `shell` takes `$(…)`, for a worker's launcher: the
-/// version it named before ([`fish_known_old`]'s question, or another
-/// launcher's), else asked now on the launcher's own thread and remembered.
 fn fish_answer(shell: &Path) -> bool {
     let key = fish_key(shell);
     if let Some(key) = &key
@@ -1003,9 +940,6 @@ fn fish_answer(shell: &Path) -> bool {
     said == FishSaid::Version(true)
 }
 
-/// What the fish at `shell` says of its version (`--version`), with a
-/// child deadline of [`VERSION_WAIT`] and proven bounded stdout EOF through
-/// the existing complete-output helper; otherwise [`FishSaid::Nothing`].
 fn fish_says(shell: &Path) -> FishSaid {
     let mut cmd = aterm_uds::spawnfd::command(shell);
     cmd.arg("--version");
@@ -1023,8 +957,6 @@ fn fish_says(shell: &Path) -> FishSaid {
     fish_version_takes_dollar_paren(said).map_or(FishSaid::Nothing, FishSaid::Version)
 }
 
-/// Whether `fish --version`'s answer (`fish, version 3.7.1`) names 3.4 or
-/// later; `None` when it names no version.
 fn fish_version_takes_dollar_paren(said: &str) -> Option<bool> {
     let version = said.split_whitespace().last()?;
     let mut parts = version.split(|c: char| !c.is_ascii_digit());

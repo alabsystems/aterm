@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rainbow spectrum colour lookup ([`SPECTRUM_ANCHORS`], [`SPECTRUM_STRIDE`], [`SPECTRUM_LUT`],
-//! [`spectrum_with_min_saturation`]):
+//! Rainbow spectrum colour lookup ([`SPECTRUM_ANCHORS`](crate::spectrum::SPECTRUM_ANCHORS), [`SPECTRUM_STRIDE`](crate::spectrum::SPECTRUM_STRIDE), [`SPECTRUM_LUT`](crate::spectrum::SPECTRUM_LUT),
+//! [`spectrum_with_min_saturation`](crate::spectrum::spectrum_with_min_saturation)):
 //!
 //! ```text
 //! spectrum(t) -> rgb       t in [0, 1],  0 = red ... 1 = violet

@@ -19,12 +19,10 @@ fn themes_view(
     crate::native_app::ViewId,
 ) {
     let service = VersionedConfigService::new(source.to_string()).expect("valid fixture");
-    let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-        unreachable!()
-    };
-    **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
+    let mut state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
     state.navigate(SettingsRoute::Themes);
+    let (runtime, instance, view) =
+        setup_with(UpdateState::from_status(1, "0.1.0", None, false), state);
     (service, runtime, instance, view)
 }
 
@@ -2642,12 +2640,16 @@ fn a_reset_to_the_themes_type_is_named_by_its_words() {
 
 #[test]
 fn a_reset_to_the_themes_type_says_the_themes_value() {
+    let platform = format!(
+        "Line height reset to {:.1}\u{d7}",
+        crate::app_config::DEFAULT_LINE_HEIGHT
+    );
     for (source, words) in [
         (
             "theme = \"Studio\"\nline_height = 1.4\n",
             "Line height reset to Studio\u{2019}s 1.15\u{d7}",
         ),
-        ("line_height = 1.4\n", "Line height reset to 1.0\u{d7}"),
+        ("line_height = 1.4\n", platform.as_str()),
     ] {
         let (mut service, mut runtime, instance, view) =
             typography_view(source, studio_catalog(PINNABLE_TYPE));
@@ -3520,9 +3522,22 @@ fn rect_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> LogicalRect {
 
 fn whole_in_list(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
     let list = rect_of(compiled, "settings/showcase/list");
-    compiled.semantic(&UiKey::new(key)).is_some_and(|row| {
-        !row.offscreen && row.rect.y >= list.y - 0.5 && row.rect.bottom() <= list.bottom() + 0.5
+    laid_of(compiled, key).is_some_and(|(row, shown)| {
+        shown + 0.5 >= row.height && row.y >= list.y - 0.5 && row.bottom() <= list.bottom() + 0.5
     })
+}
+
+/// Where a screen lays `key` out, uncut (its paint rect, else the rect a list that holds every
+/// row gives it off its screen), and how much of it the screen paints, clipped.
+fn laid_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> Option<(LogicalRect, f32)> {
+    if let Some(node) = compiled.paint.iter().find(|node| node.key.as_str() == key) {
+        let top = node.rect.y.max(node.clip.y);
+        let shown = (node.rect.bottom().min(node.clip.bottom()) - top).max(0.0);
+        return Some((node.rect, shown));
+    }
+    compiled
+        .semantic(&UiKey::new(key))
+        .map(|node| (node.rect, 0.0))
 }
 
 fn drawn_rows(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
@@ -4070,17 +4085,10 @@ fn set_text_scale(scale: f32) {
     );
 }
 
+/// the screen cuts it, and how tall the control is laid out, uncut.
 fn shown_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> (f32, f32) {
-    let part = compiled
-        .paint
-        .iter()
-        .filter(|node| node.key.as_str() == key)
-        .map(|node| {
-            let top = node.rect.y.max(node.clip.y);
-            (node.rect.bottom().min(node.clip.bottom()) - top).max(0.0)
-        })
-        .fold(0.0_f32, f32::max);
-    (part, rect_of(compiled, key).height)
+    let (rect, shown) = laid_of(compiled, key).unwrap_or_else(|| panic!("{key} is in the tree"));
+    (shown, rect.height)
 }
 
 #[test]
@@ -5301,6 +5309,48 @@ fn failed_theme_files_list_under_needs_attention() {
     let harbour = card_action(&runtime, view, "Harbour");
     let _ = act(&mut runtime, instance, view, &harbour, None);
     assert_eq!(intent(&runtime, view), show("Harbour"));
+}
+
+#[test]
+fn a_theme_file_published_again_repaints_its_rows_slab() {
+    let dir = aterm_tempfile::tempdir().expect("a themes folder");
+    let (mut service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+    let mut slab = |background: &str| {
+        std::fs::write(
+            dir.path().join("Mine.conf"),
+            format!("foreground = #dddddd\nbackground = #{background}\n"),
+        )
+        .unwrap();
+        let published = service.replace_theme_catalog(std::sync::Arc::new(
+            crate::app_config::ThemeCatalog::discover_in(dir.path()),
+        ));
+        let _ = dispatch(
+            &mut runtime,
+            instance,
+            view,
+            AppEvent::ConfigChanged(published),
+        );
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.showcase.filter = crate::native_text_input::TextInputState::new("Mine".to_string());
+        state.invalidate_result_page_limit();
+        let slab = format!("{}/slab", card_action(&runtime, view, "Mine"));
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(864.0, 500.0));
+        compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == slab)
+            .and_then(|node| match &node.content {
+                crate::native_ui::UiContent::Custom(custom) => custom.value.clone(),
+                _ => None,
+            })
+            .expect("Mine's row paints its slab")
+    };
+    let first = slab("101218");
+    assert!(first.starts_with("101218 dddddd "), "{first}");
+    let again = slab("aa2233");
+    assert!(again.starts_with("aa2233 dddddd "), "{again}");
 }
 
 #[test]
@@ -6905,9 +6955,10 @@ fn widening_the_window_never_takes_rows_from_the_chooser() {
             }
             last = Some((top, rows.round()));
         }
+        // Windows' faces fit the demo beside a step (7pt) sooner.
         assert_eq!(
             beside_from,
-            Some(528.0),
+            Some(if cfg!(windows) { 521.0 } else { 528.0 }),
             "{height}: the demo beside from 72 columns"
         );
     }
@@ -7115,16 +7166,25 @@ fn no_stop_is_cut_on_any_screen() {
     let mut faults = Vec::new();
     let mut controls = Vec::new();
     let mut short_flagged = false;
-    for (width, height, stacked) in [
-        (584.0, 350.0, false),
-        (675.0, 448.0, false),
-        (766.0, 348.0, false),
-        (1_144.0, 448.0, false),
-        (514.0, 348.0, true),
-        (584.0, 516.0, true),
-        (584.0, 530.0, true),
-        (584.0, 558.0, true),
+    let mut shapes = [false; 2];
+    for (width, height) in [
+        (584.0, 350.0),
+        (675.0, 448.0),
+        (766.0, 348.0),
+        (1_144.0, 448.0),
+        (514.0, 348.0),
+        (584.0, 516.0),
+        (584.0, 530.0),
+        (584.0, 558.0),
     ] {
+        // Where the page stacks is the faces' (Windows' sets the demo beside
+        // the chooser at 584x516); the demo is over the list exactly there.
+        let stacked = {
+            let (_service, runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            let cx = view_cx_at(width, height);
+            page_shape(&compile_settings_view(&runtime, instance, view, &cx)) == "Stacked"
+        };
+        shapes[usize::from(stacked)] = true;
         let mut peek_cuts = false;
         for form in ["open", "community", "attention", "sheet"] {
             let (cut, [peek, short, last_palette]) = check(width, height, form, stacked);
@@ -7146,6 +7206,9 @@ fn no_stop_is_cut_on_any_screen() {
     }
     if !short_flagged {
         controls.push("some screen one stop short leaves out a stop that fits".to_string());
+    }
+    if shapes != [true; 2] {
+        controls.push("the sizes see the page stacked and beside".to_string());
     }
     assert!(faults.is_empty(), "{faults:#?}");
     assert!(controls.is_empty(), "the controls: {controls:#?}");
@@ -7320,11 +7383,13 @@ fn opening_customize_never_squeezes_or_moves_the_demo() {
     }
     let all =
         |size: (u32, u32), beside: bool| seen_forms[&size].iter().all(|(_, form)| *form == beside);
-    assert!(
-        all((584, 348), false),
-        "584x348: {:?}",
-        seen_forms[&(584, 348)]
-    );
+    // Windows' UI face sets the names narrower: at 584x348 they fit beside.
+    let over = if cfg!(windows) {
+        (528, 348)
+    } else {
+        (584, 348)
+    };
+    assert!(all(over, false), "{over:?}: {:?}", seen_forms[&over]);
     assert!(
         all((885, 348), true),
         "885x348: {:?}",

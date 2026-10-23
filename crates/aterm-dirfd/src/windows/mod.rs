@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows implementation of `aterm-dirfd`: NT handle-relative opens ([`openat`], [`pin`]),
-//! metadata ([`fstat`], [`file_id`], [`FileId`], [`volume_guid`]), directory iteration ([`Dir`],
-//! [`DirEntry`]), ownership ([`owner`], [`Sid`]), and identity-checked [`unlinkat`].
+//! Windows implementation of `aterm-dirfd`.
 
 mod ffi;
 
@@ -50,9 +48,11 @@ impl Errno {
     pub const LOOP: Self = Self(ffi::ERROR_REPARSE_POINT_ENCOUNTERED);
     /// This crate's own: the name is a reparse point that is not a link.
     pub const FOREIGN_REPARSE: Self = Self(CUSTOMER | 1);
-    /// This crate's own: the name no longer carries the identity the caller expected ([`unlinkat`]).
+    /// This crate's own: the name no longer carries the identity the caller expected
+    /// ([`unlinkat`]).
     pub const CHANGED: Self = Self(CUSTOMER | 2);
-    /// This crate's own: [`pin`] was handed a path that does not start at a local volume's own root.
+    /// This crate's own: [`pin`] was handed a path that does not start at a local volume's own
+    /// root.
     pub const NOT_VOLUME_ROOT: Self = Self(CUSTOMER | 3);
     /// This crate's own: the name is a folder a volume is mounted.
     pub const MOUNT_POINT: Self = Self(CUSTOMER | 4);
@@ -257,12 +257,11 @@ pub struct ExposedPlaceholders {
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Switch this thread to seeing cloud placeholders as reparse points until the returned guard drops.
-///
+/// Switch this thread to seeing cloud placeholders as reparse points until the returned guard
+/// drops.
 /// # Errors
-/// [`Errno::PLACEHOLDERS_HIDDEN`] when the system refused the mode (it
-/// answers so only for an invalid mode or a thread with no TEB): the caller
-/// then judges nothing a placeholder might be.
+/// [`Errno::PLACEHOLDERS_HIDDEN`] when the system refused the mode (it answers so only for an
+/// invalid mode or a thread with no TEB): the caller then judges nothing a placeholder might be.
 pub fn expose_placeholders() -> Result<ExposedPlaceholders> {
     #[cfg(any(test, debug_assertions))]
     if DISGUISED.with(std::cell::Cell::get) {
@@ -408,8 +407,8 @@ impl FileType {
 
 /// A by-handle information struct: its class, every field a plain integer.
 /// # Safety
-/// `CLASS` must be the `FILE_INFO_BY_HANDLE_CLASS` whose output layout is
-/// exactly `Self`, and every bit pattern must be a valid `Self`.
+/// `CLASS` must be the `FILE_INFO_BY_HANDLE_CLASS` whose output layout is exactly `Self`, and every
+/// bit pattern must be a valid `Self`.
 unsafe trait Info: Sized {
     const CLASS: i32;
 }
@@ -461,10 +460,9 @@ fn kind_of(fd: BorrowedHandle<'_>) -> Result<FileType> {
 }
 
 /// The identity of what `fd` is open on: one `FileIdInfo` query, the cheap half of [`fstat`].
-///
 /// # Errors
-/// The query's code — `ERROR_INVALID_PARAMETER` on a file system with no
-/// `FileIdInfo` (FAT, exFAT), which has no identity to give.
+/// The query's code — `ERROR_INVALID_PARAMETER` on a file system with no `FileIdInfo` (FAT, exFAT),
+/// which has no identity to give.
 pub fn file_id<Fd: AsHandle>(fd: Fd) -> Result<FileId> {
     let _exposed = expose_placeholders()?;
     let info = query(
@@ -482,8 +480,7 @@ pub fn file_id<Fd: AsHandle>(fd: Fd) -> Result<FileId> {
 
 /// Identity, kind, sizes, link count and times of an already-open handle.
 /// # Errors
-/// The first failed query's code; see [`file_id`] for a file system with no
-/// identity.
+/// The first failed query's code; see [`file_id`] for a file system with no identity.
 pub fn fstat<Fd: AsHandle>(fd: Fd) -> Result<Stat> {
     let _exposed = expose_placeholders()?;
     let fd = fd.as_handle();
@@ -532,8 +529,8 @@ pub fn fstat<Fd: AsHandle>(fd: Fd) -> Result<Stat> {
 
 /// The GUID of the volume the file `fd` is open on, as the mount manager names the volume.
 /// # Errors
-/// The query's code (a volume the mount manager does not name answers one);
-/// `ERROR_INVALID_DATA` for an answer that names no volume GUID.
+/// The query's code (a volume the mount manager does not name answers one); `ERROR_INVALID_DATA`
+/// for an answer that names no volume GUID.
 pub fn volume_guid<Fd: AsHandle>(fd: Fd) -> Result<String> {
     let raw = fd.as_handle().as_raw_handle();
     let mut buf = vec![0u16; 512];
@@ -596,8 +593,8 @@ impl Sid {
     /// The token could not be opened or read.
     pub fn current_user() -> Result<Self> {
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: the process pseudo-handle needs no closing; `raw` is a
-        // writable HANDLE that receives a token handle owned below.
+        // SAFETY: the process pseudo-handle needs no closing; `raw` is a writable HANDLE that
+        // receives a token handle owned below.
         if unsafe {
             ffi::OpenProcessToken(ffi::GetCurrentProcess(), ffi::TOKEN_QUERY, &raw mut raw)
         } == 0
@@ -623,8 +620,8 @@ impl Sid {
         if ok == 0 {
             return Err(Errno::last());
         }
-        // SAFETY: on success the buffer starts with a TOKEN_USER (aligned, as
-        // `buf` is u64s); its SID pointer points into `buf`, alive here.
+        // SAFETY: on success the buffer starts with a TOKEN_USER (aligned, as `buf` is u64s); its
+        // SID pointer points into `buf`, alive here.
         let sid = unsafe { (*buf.as_ptr().cast::<ffi::TOKEN_USER>()).User.Sid };
         // SAFETY: `sid` points at the token's SID, inside `buf`.
         unsafe { Self::copied(sid) }
@@ -638,8 +635,8 @@ impl Sid {
         if sid.is_null() || unsafe { ffi::IsValidSid(sid) } == 0 {
             return Err(Errno(ffi::ERROR_INVALID_DATA));
         }
-        // SAFETY: a valid SID's length is what GetLengthSid answers, and the
-        // caller's contract makes that many bytes readable.
+        // SAFETY: a valid SID's length is what GetLengthSid answers, and the caller's contract
+        // makes that many bytes readable.
         let len = unsafe { ffi::GetLengthSid(sid) } as usize;
         // SAFETY: As above: `len` readable bytes at `sid`, copied at once.
         Ok(Self(
@@ -684,11 +681,10 @@ impl std::fmt::Debug for Sid {
     }
 }
 
-/// The owner of the file or directory `fd` is open on, read through that handle (`GetSecurityInfo(OWNER_SECURITY_INFORMATION)`).
-///
+/// The owner of the file or directory `fd` is open on.
 /// # Errors
-/// The query's code (`ERROR_ACCESS_DENIED` without `READ_CONTROL`), or
-/// `ERROR_INVALID_DATA` for a descriptor with no owner.
+/// The query's code (`ERROR_ACCESS_DENIED` without `READ_CONTROL`), or `ERROR_INVALID_DATA` for a
+/// descriptor with no owner.
 pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     let _exposed = expose_placeholders()?;
     let mut owner: *mut c_void = std::ptr::null_mut();
@@ -710,11 +706,11 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     if code != 0 {
         return Err(Errno(code as i32));
     }
-    // SAFETY: on success `owner` is null or points into `descriptor`, which
-    // stays allocated until the LocalFree below.
+    // SAFETY: on success `owner` is null or points into `descriptor`, which stays allocated until
+    // the LocalFree below.
     let sid = unsafe { Sid::copied(owner) };
-    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller
-    // and is freed once, here.
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller and is freed once,
+    // here.
     unsafe { ffi::LocalFree(descriptor) };
     sid
 }
@@ -748,9 +744,9 @@ fn nt_open(
             Information: 0,
         };
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: every pointer is to a live local (`object_name` outlives the
-        // call, its buffer is `name`, valid for `bytes`), `dir` is a live
-        // handle, and no EA buffer or allocation size is passed.
+        // SAFETY: every pointer is to a live local (`object_name` outlives the call, its buffer is
+        // `name`, valid for `bytes`), `dir` is a live handle, and no EA buffer or allocation size
+        // is passed.
         let status = unsafe {
             ffi::NtCreateFile(
                 &raw mut raw,
@@ -803,11 +799,10 @@ const fn refuse_reparse(kind: FileType) -> Result<()> {
 
 /// `openat(2)`'s twin: open `name` relative to the directory `dirfd`, never following anything.
 /// # Errors
-/// The open's code; [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse
-/// point under [`OFlags::NOFOLLOW`]; [`Errno::ISDIR`] for a directory opened
-/// to write; [`Errno::INVAL`] for a refused name or flag combination
-/// ([`OFlags::CREATE`] with [`OFlags::DIRECTORY`] or [`OFlags::PATH`], a write
-/// mode with [`OFlags::PATH`]).
+/// The open's code; [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point under
+/// [`OFlags::NOFOLLOW`]; [`Errno::ISDIR`] for a directory opened to write; [`Errno::INVAL`] for a
+/// refused name or flag combination ([`OFlags::CREATE`] with [`OFlags::DIRECTORY`] or
+/// [`OFlags::PATH`], a write mode with [`OFlags::PATH`]).
 pub fn openat<Fd: AsHandle, P: Arg>(
     dirfd: Fd,
     name: P,
@@ -865,13 +860,12 @@ pub fn openat<Fd: AsHandle, P: Arg>(
 
 /// Open the directory at the absolute `path` from its local volume's root, component by component.
 /// # Errors
-/// [`Errno::NOT_VOLUME_ROOT`] for a UNC path, a network drive or a `subst`
-/// letter; [`Errno::PATH_NOT_FOUND`] for a letter or volume with no device
-/// (never [`Errno::NOENT`]: a drive that is not there says nothing about a
-/// directory on it); [`Errno::INVAL`] for a path of any other shape
-/// (relative or drive-relative, a `..` component, a verbatim path's `.`,
-/// `\\.\`); [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point;
-/// [`Errno::NOTDIR`] for a file; or the open's code.
+/// [`Errno::NOT_VOLUME_ROOT`] for a UNC path, a network drive or a `subst` letter;
+/// [`Errno::PATH_NOT_FOUND`] for a letter or volume with no device (never [`Errno::NOENT`]: a drive
+/// that is not there says nothing about a directory on it); [`Errno::INVAL`] for a path of any
+/// other shape (relative or drive-relative, a `..` component, a verbatim path's `.`, `\\.\`);
+/// [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point; [`Errno::NOTDIR`] for a file; or
+/// the open's code.
 pub fn pin(path: &Path) -> Result<OwnedHandle> {
     let _exposed = expose_placeholders()?;
     let mut parts = path.components();
@@ -929,8 +923,8 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
 fn volume_device(name: &OsStr) -> Result<()> {
     let wide: Vec<u16> = name.encode_wide().chain([0]).collect();
     let mut target = vec![0u16; 1024];
-    // SAFETY: `wide` is NUL-terminated and `target` writable for the length
-    // passed; both outlive the call.
+    // SAFETY: `wide` is NUL-terminated and `target` writable for the length passed; both outlive
+    // the call.
     let stored =
         unsafe { ffi::QueryDosDeviceW(wide.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
     if stored == 0 {
@@ -1097,9 +1091,8 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
 
 /// Whether the reparse point `fd` is open on is a folder a volume is mounted on.
 /// # Errors
-/// `FSCTL_GET_REPARSE_POINT`'s code, or `ERROR_INVALID_DATA` for data that
-/// does not hold the name it says it does: the caller keeps what it could
-/// not judge.
+/// `FSCTL_GET_REPARSE_POINT`'s code, or `ERROR_INVALID_DATA` for data that does not hold the name
+/// it says it does: the caller keeps what it could not judge.
 fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
     if !kind.is_link() || kind.reparse_tag != ffi::IO_REPARSE_TAG_MOUNT_POINT {
         return Ok(false);
@@ -1175,8 +1168,8 @@ fn is_volume_name(target: &[u16]) -> bool {
 
 fn dispose(handle: BorrowedHandle<'_>) -> Result<()> {
     let set = |class: i32, info: *const c_void, len: usize| -> Result<()> {
-        // SAFETY: `handle` is live and `info` points at `len` readable bytes
-        // of `class`'s input struct, alive for the call.
+        // SAFETY: `handle` is live and `info` points at `len` readable bytes of `class`'s input
+        // struct, alive for the call.
         let ok = unsafe {
             ffi::SetFileInformationByHandle(handle.as_raw_handle(), class, info, len as u32)
         };
@@ -1367,8 +1360,8 @@ impl Dir {
     }
 
     fn parse(&self, at: usize) -> Result<(DirEntry, Option<usize>)> {
-        // SAFETY: any `u64` buffer is a valid `u8` buffer of eight times the
-        // length, and the borrow of `self.buf` outlives `bytes`.
+        // SAFETY: any `u64` buffer is a valid `u8` buffer of eight times the length, and the borrow
+        // of `self.buf` outlives `bytes`.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
         };
@@ -1487,12 +1480,14 @@ pub mod seam {
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
 
-    /// Read listings with `FileIdBothDirectoryInfo` and delete with `FileDispositionInfo` on this thread.
+    /// Read listings with `FileIdBothDirectoryInfo` and delete with `FileDispositionInfo` on this
+    /// thread until turned off.
     pub fn legacy_classes(on: bool) {
         super::LEGACY.with(|legacy| legacy.set(on));
     }
 
-    /// Leave this thread's cloud-placeholder mode unchanged on [`super::ExposedPlaceholders`].
+    /// Leave this thread's cloud-placeholder mode unchanged on [`super::ExposedPlaceholders`]
+    /// until turned off.
     pub fn leave_placeholders_disguised(on: bool) {
         super::DISGUISED.with(|disguised| disguised.set(on));
     }
@@ -1519,8 +1514,7 @@ pub mod seam {
     impl SyncRoot {
         /// Register the existing folder `path` (absolute; on ntfs).
         /// # Errors
-        /// The `HRESULT` refusing it, as the Win32 code it carries (or the
-        /// raw `HRESULT`).
+        /// The `HRESULT` refusing it, as the Win32 code it carries (or the raw `HRESULT`).
         pub fn register(path: &Path) -> Result<SyncRoot> {
             let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
             let name: Vec<u16> = "aterm-dirfd test".encode_utf16().chain([0]).collect();
@@ -1545,9 +1539,9 @@ pub mod seam {
                 HardLink: 0,
                 PlaceholderManagement: 0,
             };
-            // SAFETY: `wide`, `name` and `version` are NUL-terminated and
-            // outlive the call; both structs are live locals of their SDK
-            // layout (pinned in `ffi`), their sizes in `StructSize`.
+            // SAFETY: `wide`, `name` and `version` are NUL-terminated and outlive the call; both
+            // structs are live locals of their SDK layout (pinned in `ffi`), their sizes in
+            // `StructSize`.
             let hr = unsafe {
                 ffi::CfRegisterSyncRoot(
                     wide.as_ptr(),
@@ -1574,9 +1568,9 @@ pub mod seam {
                 .map_err(|e| Errno(e.raw_os_error().unwrap_or(ffi::ERROR_INVALID_FUNCTION)))?;
             let identity = b"aterm-dirfd test";
             let mut usn = 0i64;
-            // SAFETY: `file` is open for writing and live for the call;
-            // `identity` is readable for its length; `usn` is a writable
-            // i64; no OVERLAPPED, so the call completes before returning.
+            // SAFETY: `file` is open for writing and live for the call; `identity` is readable for
+            // its length; `usn` is a writable i64; no OVERLAPPED, so the call completes before
+            // returning.
             let hr = unsafe {
                 ffi::CfConvertToPlaceholder(
                     file.as_raw_handle(),
@@ -1634,8 +1628,8 @@ pub mod seam {
 
     /// [`super::pin`]'s device check on the live dos device `name`.
     /// # Errors
-    /// [`Errno::NOT_VOLUME_ROOT`] for a device that is not a volume's,
-    /// [`Errno::PATH_NOT_FOUND`] for no such device.
+    /// [`Errno::NOT_VOLUME_ROOT`] for a device that is not a volume's, [`Errno::PATH_NOT_FOUND`]
+    /// for no such device.
     pub fn volume_device(name: &str) -> Result<()> {
         super::volume_device(std::ffi::OsStr::new(name))
     }
@@ -1677,8 +1671,7 @@ pub mod seam {
 
     /// Make the empty directory `fd` is open on an `IO_REPARSE_TAG_MOUNT_POINT` reparse point.
     /// # Errors
-    /// [`Errno::INVAL`] for a name too long for reparse data;
-    /// `FSCTL_SET_REPARSE_POINT`'s code.
+    /// [`Errno::INVAL`] for a name too long for reparse data; `FSCTL_SET_REPARSE_POINT`'s code.
     pub fn set_mount_point<Fd: AsHandle>(fd: Fd, substitute: &str) -> Result<()> {
         let target: Vec<u16> = substitute.encode_utf16().collect();
         let field = |bytes: usize| u16::try_from(bytes).map_err(|_| Errno::INVAL);

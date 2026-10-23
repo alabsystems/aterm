@@ -151,7 +151,7 @@ pub(crate) fn definitive(e: &RestError) -> bool {
 }
 
 /// Wait `seconds` between attempts, ending early once an interrupt is caught (no wait under a
-/// test's [`Fixture`]).
+/// test's `Fixture`).
 fn pause(seconds: u64) {
     #[cfg(test)]
     if FIXTURE.with(|f| f.borrow().is_some()) {

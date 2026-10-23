@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Light-rod bar and emitter-block cursor effects ([`BEAM_SPACE_HAZE`],
+//! Light-rod bar and emitter-block cursor effects ([`aterm_render::BEAM_SPACE_HAZE`],
 //! [`crate::color_math::light_body_fill`], [`crate::cursor_fx::floor_block_fill`], [`GlowQuad`]).
 
 use aterm_time::Instant;
@@ -105,6 +105,8 @@ pub struct CursorBeamRod {
     blaze: f32,
     /// Cached `((color, theme_fg, theme_bg), ink)` for [`Self::emit_rod_light`].
     light_ink_memo: Option<((u32, u32, u32), u32)>,
+    /// Cached `((color, theme_bg, e_bits), fill)` for the light-theme emitter block.
+    light_fill_memo: Option<((u32, u32, u32), u32)>,
 }
 
 impl CursorBeamRod {
@@ -163,11 +165,21 @@ impl CursorBeamRod {
                 };
                 (mix(16) << 16) | (mix(8) << 8) | mix(0)
             } else {
-                crate::color_math::floor_contrast_keeping_hue(
-                    crate::color_math::light_body_fill(cfg.color, e),
-                    cfg.theme_bg & 0x00FF_FFFF,
-                    LIGHT_EMITTER_CONTRAST,
-                )
+                let bg = cfg.theme_bg & 0x00FF_FFFF;
+                let key = (cfg.color, bg, e.to_bits());
+                if let Some((cached_key, cached_fill)) = self.light_fill_memo
+                    && cached_key == key
+                {
+                    cached_fill
+                } else {
+                    let solved = crate::color_math::floor_contrast_keeping_hue(
+                        crate::color_math::light_body_fill(cfg.color, e),
+                        bg,
+                        LIGHT_EMITTER_CONTRAST,
+                    );
+                    self.light_fill_memo = Some((key, solved));
+                    solved
+                }
             };
             if cfg.pinned {
                 crate::color_math::wear_pinned(cfg.color, styled, e, SETTLED_BLAZE)

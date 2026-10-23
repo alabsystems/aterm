@@ -1,7 +1,12 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Derived from skrifa 0.46.2 generated/generated_autohint_styles.rs (see ../../LICENSE-FONTATIONS).
+//
+// Derived from skrifa 0.46.2 generated/generated_autohint_styles.rs (written
+// by its scripts/gen_autohint_scripts.py from FreeType's autofit script and
+// style tables) and modified by the aterm project in 2026: tags spelled with
+// aterm-font's `Tag::from_bytes`. Included by `style.rs`.
+// See ../../LICENSE-FONTATIONS for the upstream license.
 
 #[rustfmt::skip]
 pub const SCRIPT_CLASSES: &[ScriptClass] = &[

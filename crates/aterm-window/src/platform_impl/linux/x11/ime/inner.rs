@@ -110,7 +110,8 @@ impl ImeInner {
         Ok(!self.server_side_gone())
     }
 
-    /// Emit `ImeEvent::Enabled` for active contexts and `ImeEvent::Disabled` when replaced or gone.
+    /// Emit `ImeEvent::Enabled` for each window whose context is allowed and `ImeEvent::Disabled`
+    /// for the rest, or for every window when `gone`.
     pub(crate) fn announce_contexts(&self, gone: bool) {
         for (&window, context) in &self.contexts {
             let allowed = !gone && context.as_ref().is_some_and(ImeContext::is_allowed);

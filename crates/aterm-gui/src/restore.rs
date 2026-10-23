@@ -2614,7 +2614,7 @@ pub(crate) fn unwrite_quit_to(path: &Path, run: Option<&str>) -> Result<(), Stri
     unwrite_quit_to_waiting(path, run, LockWait::Unbounded).map_err(String::from)
 }
 
-/// [`unwrite_quit_to`] for the cold update lane on the GUI main thread.
+/// `unwrite_quit_to` for the cold update lane on the GUI main thread.
 #[cfg(unix)]
 pub(crate) fn unwrite_quit_to_within(
     path: &Path,
@@ -2696,7 +2696,7 @@ pub(crate) fn write_once_to(path: &Path, manifest: &RestoreManifest) -> Result<(
     write_wire_once_to(path, &manifest.to_toml()?)
 }
 
-/// [`write_once_to`] of an already serialized layout, published byte for byte.
+/// `write_once_to` of an already serialized layout, published byte for byte.
 #[cfg(any(unix, test))]
 pub(crate) fn write_wire_once_to(path: &Path, wire: &str) -> Result<(), String> {
     let written = write_wire_to(path, wire);

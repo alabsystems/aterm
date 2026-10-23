@@ -1059,7 +1059,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let (_leases, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
-    let runs_dir = aterm_uds::control_socket_dir().map(|d| d.join("verify-runs"));
+    let runs_dir = aterm_uds::control_socket_dir()
+        .map(|d| runs::records_dir(&d, aterm_uds::process::pid_namespace().as_deref()));
     if let (Some(dir), Some(boot)) = (&runs_dir, aterm_uds::process::boot_id()) {
         let me = i32::try_from(std::process::id()).unwrap_or(0);
         runs::end_dead_runs(dir, &boot, me, &runs::LiveKernel, &mut |line| {

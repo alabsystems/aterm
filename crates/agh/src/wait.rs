@@ -301,6 +301,10 @@ fn asset_name(name: &str) -> bool {
 
 /// `path::refuse_bad_tag` for a wait on `tag` of `slug`, given before any request: no round
 /// could ever observe such a tag.
+///
+/// # Errors
+///
+/// That usage, with next `agh help release wait`.
 pub(crate) fn refuse_tag(tag: &str, slug: &Slug) -> Result<()> {
     crate::path::refuse_bad_tag(tag).map_err(|e| {
         e.with_next("agh help release wait")

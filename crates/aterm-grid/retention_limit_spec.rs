@@ -5,7 +5,7 @@ fn retention_limit_model() -> Model {
     ty_model! {
         UnifiedRetentionLimit {
             const RingCap = 2;   // fixed ring (fast tier) capacity
-            const Limit = 3;     // one total retention limit (>= RingCap here;
+            const Limit = 3;     // one total retention limit (>= RingCap here)
             const Buggy = 0;     // 0 = unified split; 1 = store capped at Limit
             var ring = 0;        // lines retained in the ring
             var store = 0;       // lines retained in the tiered store

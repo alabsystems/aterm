@@ -90,7 +90,6 @@ pub(crate) fn record(
     let payload = manual_payload(source, report);
     {
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
-        tl.record("modes-restored", payload.clone());
         let by = match source {
             ResetSource::Menu => aterm_slog::Actor::Human,
             ResetSource::Verb => aterm_slog::Actor::Nobody,
@@ -103,6 +102,7 @@ pub(crate) fn record(
             by,
             at,
         );
+        tl.record("modes-restored");
     }
     aterm_log::info!("session {sid}: manual reset: {payload}");
 }

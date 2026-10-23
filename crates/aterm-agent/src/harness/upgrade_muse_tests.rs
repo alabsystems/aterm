@@ -12,12 +12,6 @@ const S1: &str = "01a148f8-9301-7752-96db-fef456f88074";
 const STORE: &str =
     "/Users//u/Library/Application Support/aterm/pkg/store/muse/2001004010006427002/bin/muse";
 
-/// The relaunch carries how Muse reaches its provider and runs its tools,
-/// drops what the session keeps (permission mode, model, effort) and the
-/// first prompt, and resumes the witnessed session by its UUID — root
-/// options on either side of `resume` read alike. NEGATIVE CONTROLS: the
-/// launch's own ref (a name, `--last`) is never carried, and a dropped flag's
-/// value never stands as a positional.
 #[test]
 fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
     let launch = argv(&[
@@ -79,14 +73,6 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
     assert_eq!(rewrite_argv(&dashed, Some(S1)), Ok(argv(&["resume", S1])));
 }
 
-/// A WORKER FOLLOWS HOW ITS STARTER'S MUSE CODE REACHES ITS PROVIDER
-/// ([`provider_flags`]): `--provider`, `--preset`, `--base-url`, `-c` and
-/// `--config`, each with its value attached or apart, verbatim and in order,
-/// on either side of `resume`. NEGATIVE CONTROLS: every other option stays
-/// behind (the session's model, its permission mode, `--trust-workspace`),
-/// a session's ref and the words after `--` are no flags, and a flag the
-/// table does not know — or a value-taking one with no value — refuses
-/// rather than guess.
 #[test]
 fn a_worker_follows_how_its_starter_reaches_its_provider() {
     let launch = argv(&[
@@ -137,9 +123,6 @@ fn a_worker_follows_how_its_starter_reaches_its_provider() {
     );
 }
 
-/// A launch no relaunch brings back is refused with its word, and a flag
-/// the table does not know refuses (nothing guesses its arity). NEGATIVE
-/// CONTROL: a Session Name is never typed in place of the UUID.
 #[test]
 fn a_launch_no_resume_carries_is_refused() {
     for (words, why) in [
@@ -174,10 +157,6 @@ fn a_launch_no_resume_carries_is_refused() {
     ));
 }
 
-/// The TUI is a plain launch or `resume`; `exec`, the tools, `--help` and
-/// `--version` end as they were launched to. An unknown flag leaves it a
-/// TUI (its relaunch is refused at the exit, with its word). NEGATIVE
-/// CONTROL: `resume` itself is no tool.
 #[test]
 fn only_the_interactive_tui_is_snapshotted() {
     for words in [
@@ -204,12 +183,6 @@ fn only_the_interactive_tui_is_snapshotted() {
     }
 }
 
-/// Muse Code's measured exit table: its own exit and someone's SIGINT or
-/// SIGTERM are clean, SIGHUP and SIGKILL crashes, 1 and 2 refusals of its
-/// start. NEGATIVE CONTROLS: a table that knows only its own exit and the
-/// signals someone sends (`0`, `129`, `130`, `143`: the model's
-/// `RefusalAsCrash`) reads SIGHUP as someone's and 1 as a crash — neither is
-/// Muse Code's.
 #[test]
 fn the_exit_table_is_muse_codes_own() {
     for (status, kind) in [
@@ -244,9 +217,6 @@ fn the_exit_table_is_muse_codes_own() {
     assert_eq!(exit_kind(127), ExitKind::Crashed);
 }
 
-/// The lines of a session log, its lifecycle records in the shape 1.4.10
-/// writes them (the measured `session-main.jsonl`), the frame and other
-/// records between. Its workspaces are this host's absolute paths.
 fn log_of(events: &[&str]) -> String {
     let (proj, other) = (abs("/private/tmp/at.DKNx/proj"), abs("/w/other"));
     let mut out = vec![
@@ -278,11 +248,6 @@ fn log_of(events: &[&str]) -> String {
     out.join("\n")
 }
 
-/// The fallback witness: a clean `session.end` after the LAST start is a
-/// clean end, none a crash; the next run's `crash_inferred` (written before
-/// its own start) is never that run's end. NEGATIVE CONTROLS: an earlier
-/// run's clean end does not speak for a later run that recorded none, a log
-/// with no start says nothing, and the nested frame's words are not records.
 #[test]
 fn the_session_log_tells_a_clean_end_from_a_crash() {
     assert_eq!(
@@ -323,8 +288,6 @@ fn the_session_log_tells_a_clean_end_from_a_crash() {
     assert_eq!(log_verdict(""), None);
 }
 
-/// The session's workspace is the newest its log names. NEGATIVE CONTROL:
-/// a log naming none says none.
 #[test]
 fn the_workspace_is_the_newest_the_log_names() {
     assert_eq!(
@@ -338,8 +301,6 @@ fn the_workspace_is_the_newest_the_log_names() {
     assert_eq!(log_workspace(&log_of(&["started", "turn"])), None);
 }
 
-/// A lock names its pid until a clean exit truncates it. NEGATIVE
-/// CONTROLS: an empty lock, another body, a zero pid.
 #[test]
 fn a_lock_names_its_holders_pid() {
     assert_eq!(lock_pid("pid=16390\nhost=Mac.localdomain\n"), Some(16390));
@@ -349,9 +310,6 @@ fn a_lock_names_its_holders_pid() {
     assert_eq!(lock_pid("pid=abc\n"), None);
 }
 
-/// Only a lock at SESSION depth names a session. NEGATIVE CONTROLS: a
-/// subagent's lock, a view directory's, a date that is not one, a session
-/// that is no UUID, another root.
 #[test]
 fn only_a_session_depth_lock_names_a_session() {
     let root = Path::new("/h/.local/share/muse/sessions");
@@ -378,9 +336,6 @@ fn only_a_session_depth_lock_names_a_session() {
     );
 }
 
-/// The data home is the process's `XDG_DATA_HOME`, else its `HOME`'s
-/// `.local/share`, else the fallback's. NEGATIVE CONTROL: a relative
-/// `XDG_DATA_HOME` names none; an empty one is unset.
 #[test]
 fn the_data_home_is_the_processs_own() {
     let (data, h, fb) = (abs("/x/data"), abs("/h"), PathBuf::from(abs("/fallback")));
@@ -403,12 +358,6 @@ fn the_data_home_is_the_processs_own() {
     );
 }
 
-/// The relaunch carries exactly the data and config homes the process was
-/// started with, and its `HOME` where that is another than the user's (a
-/// Muse under another `HOME` keeps its sessions there: relaunched under the
-/// shell's, `resume` refuses), and a record keeps them. NEGATIVE CONTROLS:
-/// the user's own `HOME`, a relative one and any other variable are never
-/// carried or read back.
 #[test]
 fn the_relaunch_carries_the_homes_the_process_had() {
     let (h, data, scratch) = (abs("/h"), abs("/h/.local/share"), abs("/scratch/home"));
@@ -461,8 +410,6 @@ fn the_relaunch_carries_the_homes_the_process_had() {
     assert_eq!(relaunch_env(|_| None, user), Vec::new());
 }
 
-/// A store build is what a twin execs, never typed. NEGATIVE CONTROLS: the
-/// twin itself, another program, another store's agent.
 #[test]
 fn a_store_build_is_told_from_the_twin() {
     assert!(store_build(Path::new(STORE)));
@@ -473,8 +420,6 @@ fn a_store_build_is_told_from_the_twin() {
     assert!(!store_build(Path::new("/p/store/codex/1/bin/muse")));
 }
 
-/// The told line is Muse's own, behind the homes. NEGATIVE CONTROLS: a
-/// Session Name and a control character tell none.
 #[test]
 fn the_told_line_is_muses_own_resume_line() {
     assert_eq!(
@@ -496,8 +441,6 @@ fn the_told_line_is_muses_own_resume_line() {
     );
 }
 
-/// Muse's own ids are UUIDv7, their birth in their first 48 bits.
-/// NEGATIVE CONTROLS: a name, a v4 UUID's birth.
 #[test]
 fn a_session_id_is_a_uuid() {
     assert!(is_session_uuid(S1));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux runtime lane on this Mac: one lima VM (Apple's Virtualization framework, Ubuntu 24.04 LTS on aarch64, Rosetta for x86_64) in which the lane builds and runs this checkout's Linux tests on both architectures and drives a real aterm under Xvfb, headless weston, headless Mutter and Xwayland, with a session D-Bus and at-spi2-core up and Mesa's software GL and Vulkan (llvmpipe, lavapipe) as the GPU.
+//! Linux runtime lane on macOS via Lima VM (`limactl`).
 
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
@@ -192,8 +192,6 @@ pub struct Out {
     pub secs: f64,
 }
 
-/// A line saying `limactl` itself ended on a signal, for its output; empty
-/// when it exited.
 fn ended_on_signal(status: std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt as _;
     status.signal().map_or_else(String::new, |signal| {
@@ -341,7 +339,7 @@ pub fn create_args() -> Vec<String> {
     .into()
 }
 
-/// The `limactl` to run: `named` (`$LAB_LIMACTL`) alone when it is given, else `pinned` (the copy `verify provision --linux` places in the tooling cache), else the first of the `limactl` row's usual paths (`aterm_uds::host::TOOLS`) that `executable` accepts: the resolver's order.
+/// Select the `limactl` executable from `named`, `pinned`, or the host search path.
 /// # Errors
 /// A relative `named` (usage), or none that runs (NOT RUN).
 pub fn pick_limactl(
@@ -380,7 +378,7 @@ pub struct Lima {
 }
 
 impl Lima {
-    /// `$LAB_LIMACTL` (an absolute path), else the copy `verify provision --linux` placed (stamped) in the tooling cache, else the `limactl` row's usual paths.
+    /// Locate `limactl` on this Mac.
     /// # Errors
     /// No `limactl`: the lane cannot run here.
     pub fn find() -> Result<Lima, Fail> {
@@ -646,7 +644,7 @@ impl LaneLock {
         LaneLock::at(&path, "linux")
     }
 
-    /// Take the lane whose lock file is `path` (its directory made when missing); `lane` names the lab verb whose `status` says more.
+    /// Acquire the lane lock at `path` for `lane`.
     /// # Errors
     /// Another run holds it (NOT RUN), or the lock file cannot be made.
     pub fn at(path: &Path, lane: &str) -> Result<LaneLock, Fail> {
@@ -798,7 +796,7 @@ impl Up {
         Ok(())
     }
 
-    /// Remove the guest's build output, and hand the freed blocks back to this Mac (`fstrim`: the VM disk is a sparse file that otherwise keeps its high-water mark).
+    /// Remove the guest's build output and trim the VM disk.
     /// # Errors
     /// The removal failed.
     pub fn clean_build(&self) -> Result<(), String> {
@@ -826,8 +824,6 @@ impl Up {
     }
 }
 
-/// Remove `home`'s [`GUEST_DIR`] in the guest and trim its disk
-/// ([`Up::clean_build`]).
 fn clean_guest_build(lima: &Lima, home: &str) -> Result<(), String> {
     let dir = format!("{home}/{GUEST_DIR}");
     let out = lima.shell(home, &["rm".into(), "-rf".into(), dir], None);
@@ -838,7 +834,6 @@ fn clean_guest_build(lima: &Lima, home: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The guest user's `var`, when it is an absolute path.
 fn guest_path_var(lima: &Lima, var: &str) -> Option<String> {
     let out = lima.shell("/", &["printenv".into(), var.into()], None);
     out.ok()
@@ -846,7 +841,7 @@ fn guest_path_var(lima: &Lima, var: &str) -> Option<String> {
         .filter(|s| s.starts_with('/'))
 }
 
-/// Make the VM if there is none, mount this checkout, boot it, and provision it when its stamp is not the plan's.
+/// Create, mount, boot, and provision the lane VM as needed.
 /// # Errors
 /// NOT RUN: no lima, or the VM could not be made, booted or provisioned.
 pub fn bring_up() -> Result<Up, Fail> {
@@ -963,9 +958,7 @@ fn build_output(dir_exists: bool, built_from: Option<&str>, repo: &str) -> Build
     }
 }
 
-/// Make [`GUEST_DIR`] this checkout's before anything builds in it: remove
-/// another checkout's output ([`BUILT_FROM`] says why), then name `repo` in
-/// it. The removal as a step, or `None` when there was nothing to remove.
+/// Ensure [`GUEST_DIR`] belongs to `repo`, removing any foreign build output first.
 /// # Errors
 /// NOT RUN: the foreign output could not be removed, or the stamp written.
 fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
@@ -1011,9 +1004,6 @@ fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
     Ok(step)
 }
 
-/// Empty Rosetta's AOT cache when it was not emptied in this boot
-/// ([`guest::ROSETTA_CACHE`] says why): the step, or `None` when this boot's
-/// cache stands.
 fn reset_rosetta_cache(up: &Up) -> Option<Step> {
     let boot = up.sh(&["cat".into(), guest::BOOT_ID.into()]);
     let stamp = up.sh(&["cat".into(), guest::ROSETTA_CACHE_BOOT.into()]);
@@ -1042,8 +1032,6 @@ fn reset_rosetta_cache(up: &Up) -> Option<Step> {
     })
 }
 
-/// Provision the guest when its stamp is not the plan's fingerprint: the
-/// seconds it took, or `None` when it was current.
 fn provision(up: &Up) -> Result<Option<f64>, Fail> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
@@ -1057,8 +1045,6 @@ fn provision(up: &Up) -> Result<Option<f64>, Fail> {
         println!("linux:   {} …", s.label);
         let out = up.lima.shell(&up.home, &s.argv, s.stdin.as_deref());
         if !out.ok() {
-            // The guest could not be made ready (apt or rustup unreachable,
-            // most often): nothing was decided, so NOT RUN, never a finding.
             return Err(not_run(format!(
                 "provisioning step '{}' failed:\n{}",
                 s.label,
@@ -1100,8 +1086,6 @@ fn cmd_up() -> Res {
     Ok(0)
 }
 
-/// Stop the VM `up` held, removing the build output its `exec`s left (a
-/// session's output is kept between its `exec`s, never past its `down`).
 fn cmd_down() -> Res {
     let lima = Lima::find()?;
     let _lock = LaneLock::take()?;
@@ -1267,14 +1251,14 @@ fn cmd_exec(args: &[String]) -> Res {
     Ok(out.code.unwrap_or(1))
 }
 
-/// Start `display`'s servers in the guest, the accessibility bus answering: the bus address, or why it is not up (the journal's tail of the unit that failed).
+/// Start `display`'s servers in the guest and return the accessibility bus address.
 /// # Errors
 /// A server that did not come up within a minute, or no accessibility bus.
 pub fn start_display(up: &Up, display: Display) -> Result<String, String> {
     start_screen(up, guest::Screen::plain(display))
 }
 
-/// [`start_display`] for a [`guest::Screen`]: its files written first, its servers started, then what runs once they are up.
+/// Start `screen` in the guest: write its files, start its servers, then run its after-steps.
 /// # Errors
 /// As [`start_display`], or a file or an after-step that failed.
 pub fn start_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
@@ -1300,7 +1284,7 @@ pub fn start_pipewire(up: &Up) {
     ]);
 }
 
-/// [`start_screen`] as the baseline starts it: [`guest::Screen::baseline_files`] and [`guest::Screen::baseline_units`] (a Mutter's keymap with a dead key), and an X server's [`guest::Screen::baseline_keymap`] set as soon as that server listens.
+/// Start `screen` with baseline files, units, and keymap.
 /// # Errors
 /// As [`start_screen`], or a keymap that was not set.
 pub fn start_baseline_screen(up: &Up, screen: guest::Screen) -> Result<String, String> {
@@ -1314,7 +1298,6 @@ pub fn start_baseline_screen(up: &Up, screen: guest::Screen) -> Result<String, S
     )
 }
 
-/// Write `files`, start `units` in order, and run the screen's after-steps.
 fn start_servers(
     up: &Up,
     screen: guest::Screen,
@@ -1397,7 +1380,6 @@ pub(crate) fn start_units(
     Ok(())
 }
 
-/// The accessibility bus's address, the last sign a display is up.
 fn a11y_bus(up: &Up) -> Result<String, String> {
     let a11y = up.sh(&guest::a11y_address());
     guest::parse_a11y_address(&a11y.text)
@@ -1408,7 +1390,7 @@ fn a11y_bus(up: &Up) -> Result<String, String> {
         })
 }
 
-/// Xvfb with MIT-SHM turned off (`-extension MIT-SHM`), on Xvfb's display: the X11 CPU presenter's PutImage path (LW.6), which a server that cannot map a client's memory (a remote one) takes.
+/// Start Xvfb with MIT-SHM disabled (`-extension MIT-SHM`).
 /// # Errors
 /// As [`start_display`].
 pub fn start_xvfb_without_shm(up: &Up) -> Result<String, String> {
@@ -1421,7 +1403,7 @@ pub fn start_xvfb_without_shm(up: &Up) -> Result<String, String> {
     a11y_bus(up)
 }
 
-/// Headless weston with its debug protocols on (`--debug`), on weston's socket: `weston_capture_v1`, which `weston-screenshooter` reads the output's pixels through, so the Wayland CPU rows hold the `wl_shm` presenter (LW.6) to what the compositor shows.
+/// Start headless weston with debug capture protocols enabled (`--debug`).
 /// # Errors
 /// As [`start_display`].
 pub fn start_weston_capturing(up: &Up) -> Result<String, String> {
@@ -1493,8 +1475,6 @@ fn cmd_destroy() -> Res {
 mod tests {
     use super::*;
 
-    /// A process that dies of a signal says which; one that exits says
-    /// nothing more.
     #[test]
     fn a_signal_that_ended_limactl_is_named() {
         let run = |script: &str| {
@@ -1510,9 +1490,6 @@ mod tests {
         assert_eq!(ended_on_signal(run("exit 255")), "");
     }
 
-    /// An empty reply says how it ended: a silent exit 255 (a guest-side
-    /// signal looks so), `limactl` itself ended (no exit status), or a plain
-    /// exit.
     #[test]
     fn a_failure_names_how_it_ended() {
         let out = |code: Option<i32>, text: &str| Out {
@@ -1563,8 +1540,6 @@ mod tests {
         ));
     }
 
-    /// A run builds on the guest's output only when its stamp names this
-    /// checkout.
     #[test]
     fn a_run_builds_only_on_its_own_checkouts_output() {
         let me = "/Users//u/aterm-dv-a";
@@ -1585,9 +1560,6 @@ mod tests {
         );
     }
 
-    /// A linked worktree's `.git` file names its gitdir under the main checkout's
-    /// `.git`, whose `commondir` leads back to that `.git`: the guest mounts it
-    /// beside the worktree.
     #[test]
     fn a_linked_worktree_mounts_its_repositorys_git_directory() {
         let root = aterm_tempfile::tempdir().expect("scratch");

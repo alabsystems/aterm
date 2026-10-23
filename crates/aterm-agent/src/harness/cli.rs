@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm harness`: the read views of the Claude Code harness (`usage`, `limits`, `disk`, `ledger`; design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §5.2, §5.5, §5.8), the `accounts` roster and its report (`docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8), and `upgrade`, the one verb that acts on a live session ([`super::upgrade_drive`], [`super::upgrade_codex`]).
+//! `aterm harness`: the read views of the Claude Code harness (`usage`, `limits`, `disk`, `ledger`;
+//! design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §5.2, §5.5, §5.8), the `accounts` roster and
+//! its report (`docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8), and `upgrade`, the one verb
+//! that acts on a live session ([`super::upgrade_drive`]).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -182,14 +185,27 @@ WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item
 
 const HELP_TAP: &str = "\
 `tap` is the statusLine command aterm adds to Claude Code relaunch lines when
-`[harness] usage_tap = true` (default false). Claude Code pipes its usage JSON to
-`<aterm> harness tap` after each reply and every 10 s; `tap` writes
+`[harness] usage_tap = true` (the default; `false` turns it off). Claude Code pipes its
+usage JSON to `<aterm> harness tap` after each reply and every 10 s; `tap` writes
 `<state>/rl/<tab>-<pid>.json` (0600), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
-Added only on the machine's default login when no custom `CLAUDE_CONFIG_DIR`, credential,
-`statusLine`, `disableAllHooks`, `apiKeyHelper`, or `--settings` is present. At a usage
-limit its figures time the continuation (`usage-resume@v1`) to the reset they name, from a
-reading written since the limit was first read; more than six minutes from the notice's
-reset, the later, with a `tap-reset@v1` ledger row. Switched off, none times a wait.
+Added only on the machine's own login (the default one, the roster's lone one, or, where
+`accounts.toml` has no lone login, any login it lists) in the default Claude home, when no
+custom `CLAUDE_CONFIG_DIR`, credential, `statusLine`, `disableAllHooks`, `apiKeyHelper`, or
+`--settings` is present; a session started by hand carries it once aterm restarts it in
+place. The window's footer shows that tab's own week from it, or from `/usage`, whichever
+was read later: `weekly <p>% left` for 15 minutes, then with its age
+(`weekly <p>% left \u{b7} 40m ago`), and not past an hour. With none it says why:
+`weekly ? \u{b7} restart tab` (the process carries no tap, and a restart in place, offered
+for it now, would add it), `weekly ? \u{b7} /usage` (no restart would),
+`weekly ? \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
+`weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old), and
+`weekly unavailable` (the account's profile could not be read for this process, so no
+figure from either source is trusted). The account-stats recorder rides on the same
+switch. At a usage limit its figures time the continuation (`usage-resume@v1`) to the reset
+they name, from a reading written since the limit was first read; more than six minutes
+from the notice's reset, the later, with a `tap-reset@v1` ledger row. Switched off, none
+times a wait, and no new relaunch carries it; a session tapped before keeps its row and its
+readings until it is relaunched.
 ";
 
 const HELP_LEDGER: &str = "\
@@ -578,8 +594,7 @@ pub enum AccountsCmd {
     },
     /// `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`: serve the local/LAN account rotation dashboard and `fleet-accounts.toml`.
     Serve {
-        /// Optional path or URL of a CSV or a `fleet-accounts.toml`; else
-        /// the configured source.
+        /// Optional path or URL of a CSV or a `fleet-accounts.toml`; else the configured source.
         source: Option<String>,
         /// Optional bind address (`127.0.0.1:8741` or `0.0.0.0:8741`).
         bind: Option<String>,
@@ -3368,6 +3383,7 @@ fn ledger_path(env: &Env, file: &LedgerFile) -> Result<PathBuf, String> {
             env,
             "",
             &SupervisorConfig::default(),
+            super::tap::stable_exe,
         )?)),
         LedgerFile::Approvals(sid) => {
             let state = env
@@ -3617,7 +3633,7 @@ fn run_upgrade(
     err: &mut dyn Write,
 ) -> ExitCode {
     let (policy, notes) = SupervisorConfig::from_path(env.config.as_deref());
-    let opts = match upgrade_opts(env, sid, &policy) {
+    let opts = match upgrade_opts(env, sid, &policy, super::tap::stable_exe) {
         Ok(opts) => super::upgrade_drive::Opts { dry_run, ..opts },
         Err(e) => {
             let _ = writeln!(err, "aterm harness: {e}");
@@ -3629,10 +3645,14 @@ fn run_upgrade(
     code
 }
 
+/// The options of an `aterm harness upgrade` pass under `policy`, for session `sid` (every
+/// session where empty), its relaunch lines offered the usage tap for the aterm `exe` names
+/// ([`super::tap::Armed::arm`], the block the window's lane arms by too).
 fn upgrade_opts(
     env: &Env,
     sid: &str,
     policy: &SupervisorConfig,
+    exe: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<super::upgrade_drive::Opts, String> {
     let home = env
         .home
@@ -3651,17 +3671,13 @@ fn upgrade_opts(
         ask: policy.upgrade_ask,
         several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
         usage_credits: policy.usage_credits,
-        usage_tap: (policy.enabled && policy.usage_tap)
-            .then(super::tap::stable_exe)
-            .flatten()
-            .map(|exe| super::tap::Armed {
-                exe,
-                lone_login: accounts::lone_login_at(
-                    env.accounts_roster().as_deref(),
-                    &env.accounts_store(),
-                    env.now,
-                ),
-            }),
+        usage_tap: super::tap::Armed::arm(
+            policy.usage_tap_on(),
+            exe,
+            env.accounts_roster().as_deref(),
+            &env.accounts_store(),
+            Some(env.now),
+        ),
         instances: crate::harness::upgrade_drive::Instances::Machine,
         agents_off: policy.off.clone(),
         land: false,
@@ -3678,7 +3694,7 @@ fn run_upgrade_owner(
     err: &mut dyn Write,
 ) -> ExitCode {
     let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
-    let opts = match upgrade_opts(env, sid, &policy) {
+    let opts = match upgrade_opts(env, sid, &policy, super::tap::stable_exe) {
         Ok(opts) => opts,
         Err(e) => {
             let _ = writeln!(err, "aterm harness: {e}");
@@ -6337,19 +6353,18 @@ fn stats_default_home(env: &Env) -> bool {
 
 fn stats_tap(env: &Env, records: impl FnOnce(&Roster) -> bool) -> super::account_stats::Tap {
     use super::account_stats::Tap;
-    let on = SupervisorConfig::from_path(env.config.as_deref())
-        .0
-        .usage_tap;
+    let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
     let served = accounts::tap_roster(
         env.accounts_roster().as_deref(),
         &env.accounts_store(),
         env.now,
     )
     .is_some_and(|roster| records(&roster));
-    match (on, served) {
-        (false, _) => Tap::Off,
-        (true, true) => Tap::On,
-        (true, false) => Tap::OtherHome,
+    match (policy.usage_tap, policy.usage_tap_on(), served) {
+        (false, ..) => Tap::Off,
+        (true, false, _) => Tap::HarnessOff,
+        (true, true, true) => Tap::On,
+        (true, true, false) => Tap::OtherHome,
     }
 }
 
@@ -6477,9 +6492,6 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     }
     let stats = matches!(cmd, Cmd::Accounts(AccountsCmd::Stats { .. }));
     if matches!(cmd, Cmd::Disk { .. }) || stats {
-        // Whether a Claude Code session ended, and how many run on a home,
-        // is read from what runs now, and only `disk` and `accounts stats`
-        // ask it: no other verb reads the process table.
         env.claude_running = Some(disk::discover::running_claude_census(env.home.as_deref()));
     }
     if stats {

@@ -1,8 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendor-direct agent updates: vendor specs ([`VENDORS`]), version-to-build-id mapping,
-//! durable records, yanked-version policy, and the head watch ([`watch`]).
+//! Vendor-direct agent updates: vendor specs ([`VENDORS`](crate::vendor_direct::VENDORS)), version-to-build-id mapping,
+//! durable records, yanked-version policy, and the head watch ([`watch`](crate::vendor_direct::watch)).
 
 pub(crate) mod decide;
 pub(crate) mod digests;

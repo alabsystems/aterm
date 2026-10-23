@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host-side repaint nudge driver ([`Act::Hold`], [`Act::Release`], [`Facts`], [`NudgeWorld`],
-//! [`AppWorld`], [`PtyGuard`], [`PTY_HOLD_CAP_MS`], [`NudgeHost::pty_short`],
-//! [`NudgeHost::release_all`], [`Act::Forget`], [`end_line`], [`Dropped::Superseded`],
-//! [`NudgeWorld::superseded`]).
+//! Host-side repaint nudge driver.
 
 use std::collections::HashMap;
 
@@ -18,7 +15,6 @@ use crate::resize_epoch::NudgeView;
 /// The adoption arm's epoch id.
 pub(crate) const ADOPTION_EPOCH: u64 = u64::MAX;
 
-/// Retry interval for a held PTY past its hard deadline.
 const PTY_RETRY_MS: u64 = 250;
 
 /// Grace period for an adopted agent tab to repaint before arming the nudge.
@@ -27,7 +23,6 @@ pub(crate) const ADOPTION_WAIT_MS: u64 = 1_500;
 /// How long the class of a repaint-adopted tab is waited for.
 pub(crate) const ADOPTION_CLASS_MS: u64 = 5_000;
 
-/// Sessions adopted with a blank engine on purpose (`Adopted::repaint`).
 static REPAINT_ADOPTIONS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// `spawn_session` adopted `session` with a blank screen its program is expected to repaint.
@@ -39,12 +34,10 @@ pub(crate) fn note_repaint_adoption(session: u64) {
         .push(session);
 }
 
-/// The sessions noted since the last call (the host's tick drains them).
 fn take_repaint_adoptions() -> Vec<u64> {
     std::mem::take(&mut *REPAINT_ADOPTIONS.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
-/// Whether any adoption waits to be taken into the watch.
 fn repaint_adoptions_pending() -> bool {
     !REPAINT_ADOPTIONS
         .lock()
@@ -92,38 +85,24 @@ impl Drop for PtyGuard {
 
 /// Everything the host reads from and does to the world.
 pub(crate) trait NudgeWorld {
-    /// The timeline clock, in ms (monotonic).
     fn now_ms(&self) -> u64;
-    /// Whether the session is still hosted.
     fn alive(&self, session: u64) -> bool;
-    /// Whether the session's PTY reader is attached.
     fn attached(&self, session: u64) -> bool;
-    /// The facts of the session's world now.
     fn facts(&mut self, session: u64) -> Option<WorldFacts>;
-    /// The PTY's size as the kernel reports it, `None` when unreadable.
     fn pty_dims(&self, session: u64) -> Option<(u16, u16)>;
-    /// Set the PTY's size (`TIOCSWINSZ`).
     fn set_pty(&mut self, session: u64, rows: u16, cols: u16, cell_px: Option<(u16, u16)>);
-    /// A guard that sets the PTY to the engine's current size when dropped.
     fn restore_guard(
         &self,
         session: u64,
         fallback: (u16, u16),
         cell_px: Option<(u16, u16)>,
     ) -> PtyGuard;
-    /// One `aterm.log` line.
     fn log(&mut self, line: String);
-    /// The nudge held the PTY for epoch `epoch`: tried for good.
     fn mark_tried(&mut self, session: u64, epoch: u64);
-    /// The machine's phase and attempt count, for the `resizes` header.
     fn stamp(&mut self, session: u64, phase: &'static str, nudged: u32);
-    /// The attempt ended.
     fn publish(&mut self, session: u64);
-    /// The repair failed and the screen is probably still a row off.
     fn give_up(&mut self, session: u64, epoch: u64, why: GiveUp);
-    /// A real resize superseded the attempt for `epoch`.
     fn superseded(&mut self, session: u64, epoch: u64);
-    /// The epoch's numbers for the log line.
     fn epoch_view(&self, session: u64) -> Option<NudgeView>;
 }
 
@@ -144,7 +123,6 @@ struct NudgeDriver {
     last_answer_ms: Option<u64>,
 }
 
-/// A repaint-adopted session waiting to be told apart.
 struct Watch {
     /// When the reader was first seen attached and the session unfrozen.
     since_ms: Option<u64>,
@@ -247,7 +225,6 @@ impl NudgeHost {
         }
     }
 
-    /// Release `session`'s hold (`why`) and step [`RepaintNudge::let_go`].
     fn let_go<W: NudgeWorld>(&mut self, w: &mut W, session: u64, now: u64, why: &str) {
         let Some(driver) = self.drivers.get_mut(&session) else {
             return;
@@ -317,9 +294,6 @@ impl NudgeHost {
                 continue;
             }
             if driving {
-                // No step ended the hold (the loop did not tick, or the
-                // terminal lock answered nothing at every look): the deadline
-                // does, and the attempt is judged at the steps below.
                 self.let_go(w, session, now, &format!("hold past {PTY_HOLD_CAP_MS} ms"));
             }
             self.reconcile_one(w, session);
@@ -369,7 +343,6 @@ impl NudgeHost {
         }
     }
 
-    /// Settle every watched adoption.
     fn tick_watch<W: NudgeWorld>(&mut self, w: &mut W, now: u64) -> Option<u64> {
         let mut next: Option<u64> = None;
         let sessions: Vec<u64> = self.watch.keys().copied().collect();
@@ -525,8 +498,6 @@ impl NudgeHost {
             }
             Act::Healed { second_ms, .. } => driver.last_answer_ms = Some(second_ms),
             Act::Dropped(Dropped::Superseded) if reason == Reason::Debt => {
-                // The program was given a size of its own; if the resize comes
-                // back after the wait, the epoch judge owes this attempt's end.
                 w.superseded(sid, epoch);
             }
             Act::Dropped(_) => {}
@@ -576,7 +547,6 @@ impl NudgeHost {
     }
 }
 
-/// How the step's `act` ended the attempt, for its `aterm.log` line.
 fn end_line(act: Act, was: Phase, machine: &RepaintNudge) -> Option<String> {
     let ms = |at: Option<u64>| at.map_or_else(|| "-".to_string(), |ms| ms.to_string());
     let held = matches!(was, Phase::Short | Phase::Restoring);
@@ -823,7 +793,6 @@ impl NudgeWorld for AppWorld<'_> {
 }
 
 impl crate::App {
-    /// Arm the nudge for every untried agent-class epoch at `desync-risk`.
     fn arm_nudges(&mut self) {
         let generation = crate::resize_epoch::nudge_due_generation();
         if self.nudges.mode() == Mode::Off || generation == self.nudge_gen_seen {
@@ -861,7 +830,6 @@ impl crate::App {
         self.raise_render_give_ups(gave_up);
     }
 
-    /// The digest lines for the repairs a step gave up on.
     fn raise_render_give_ups(&mut self, gave_up: Vec<(u64, u64, GiveUp)>) {
         for (session, epoch, why) in gave_up {
             self.note_render_unrepaired(session, epoch, why);
@@ -950,7 +918,6 @@ mod tests {
         now: u64,
     }
 
-    /// A world of scripted sessions; the program answers when told.
     struct Fake {
         s: Rc<RefCell<Shared>>,
         /// A `set_pty` that does nothing (a kernel that refuses).
@@ -1063,8 +1030,6 @@ mod tests {
         }
     }
 
-    /// A host with session 1 armed and past every gate (the fake reports a
-    /// session no person ever touched, which waits from attach).
     fn armed(mode: Mode) -> (NudgeHost, Fake) {
         let mut w = Fake::new(&[1, 2]);
         let mut host = NudgeHost::new(mode);
@@ -1330,8 +1295,6 @@ mod tests {
         assert_ne!(w.pty(1), ENGINE);
     }
 
-    /// A blank agent tab with no full repaint within `ADOPTION_WAIT_MS` of attach is armed once,
-    /// then repaired through the same gates and bounds as a debt.
     #[test]
     fn a_blank_agent_tab_with_no_answer_in_1500ms_is_armed_once() {
         let mut w = Fake::new(&[1]);
@@ -1384,7 +1347,6 @@ mod tests {
         );
     }
 
-    /// Negative control: a blank tab whose program is not Claude Code is never held.
     #[test]
     fn a_blank_non_agent_tab_is_left_to_the_pulse() {
         let mut w = Fake::new(&[1]);
@@ -1399,7 +1361,6 @@ mod tests {
         assert!(host.is_idle(), "the watch gave up on it");
     }
 
-    /// Negative control: a program that answers the pulse (vim, less) is never nudged.
     #[test]
     fn an_adoption_the_pulse_repainted_is_never_nudged() {
         let mut w = Fake::new(&[1]);
@@ -1416,8 +1377,6 @@ mod tests {
         assert!(host.is_idle());
     }
 
-    /// The adoption wait counts from the reader's attach with no handoff freeze on, never from
-    /// the spawn: a deferred reader's program cannot have answered before it.
     #[test]
     fn a_deferred_reader_adoption_arms_at_ready() {
         let mut w = Fake::new(&[1]);
@@ -1456,8 +1415,6 @@ mod tests {
         );
     }
 
-    /// Mode `off` watches no adoption; mode `log` arms it and says what it
-    /// would do.
     #[test]
     fn an_adoption_follows_the_mode() {
         let mut w = Fake::new(&[1]);

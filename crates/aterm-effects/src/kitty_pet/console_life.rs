@@ -644,14 +644,15 @@ impl PetBrain {
             console.row_sig_prev.clear();
             return;
         };
-        let rows = pane.rows.min(input.cells.len().saturating_sub(pane.row));
+        let first = pane.row.min(input.cells.len());
+        let rows = pane.rows.min(input.cells.len() - first);
         let same_grid =
             prior.is_some_and(|p| p.surface == stamp.surface) && console.row_sig.len() == rows;
         if !same_grid {
             console.row_sig_prev.clear();
             console.row_sig.clear();
             console.row_sig.reserve(rows);
-            for row in &input.cells[pane.row..pane.row + rows] {
+            for row in &input.cells[first..first + rows] {
                 let end = (pane.col + pane.cols).min(row.len());
                 console
                     .row_sig
@@ -660,7 +661,7 @@ impl PetBrain {
             return;
         }
         let mut swapped = false;
-        for (i, row) in input.cells[pane.row..pane.row + rows].iter().enumerate() {
+        for (i, row) in input.cells[first..first + rows].iter().enumerate() {
             let end = (pane.col + pane.cols).min(row.len());
             let sig = row_signature(row.get(pane.col..end).unwrap_or(&[]));
             if !swapped {
@@ -3291,6 +3292,32 @@ mod tests {
             Some((2, 7)),
             "palette changes revalidate the painted caret"
         );
+
+        let pane = PetPane {
+            row: 2,
+            col: 0,
+            rows: 2,
+            cols: 12,
+        };
+        let mut pane_facts = PetWorldFacts::read(&term, 17);
+        pane_facts.stamp.surface.rows = pane.rows;
+        for (available, signatures) in [(4, 2), (3, 1), (1, 0), (2, 0), (0, 0), (4, 2)] {
+            let mut input = term.cell_frame(4, 12);
+            input.cells.truncate(available);
+            for _ in 0..2 {
+                pet.observe_console(&input, &pane_facts, pane);
+                assert_eq!(pet.console.row_sig.len(), signatures);
+                let world = pet.console_world().unwrap();
+                assert_eq!(world.stamp(), Some(pane_facts.stamp));
+                if available < 4 {
+                    assert_eq!(world.cell(1, 0), PetCell::Unknown);
+                }
+                if available < 3 {
+                    assert_eq!(world.cell(0, 0), PetCell::Unknown);
+                    assert!(pet.console.row_sig_prev.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

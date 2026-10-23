@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A root run over an account's home (macOS's sudo keeps HOME): the installer runs itself
-//! again as the account that typed sudo, and over anyone else's home, or piped, says how to
-//! run it instead. Nothing here runs as root or reaches the real sudo: euid 0 is an
-//! argument, and the one call that would exec sudo is replaced.
+//! A root run over an account's home (macOS's sudo keeps HOME).
 
 use std::os::unix::fs::MetadataExt as _;
 
 use crate::support::{Lib, Scratch, install_sh, s, system_path};
 
-/// (euid, $SUDO_UID, HOME's owner, whether HOME is in that account's own home) -> (the uid
-/// to run as, refused): only root over the home of the account that typed sudo runs as it;
-/// root over any other account's home, or a folder in it, is refused; anything else (not
-/// root, root's own home, an owner that cannot be read, one no account here has, or a HOME
-/// outside its owner's own home: a CI container's) is left alone.
-/// $SUDO_UID rides `-u "#<uid>"`, so only digits name an account.
 #[test]
 fn a_root_run_acts_on_a_home_only_as_its_account() {
     let scratch = Scratch::new();
     let vars = ["HOME_ACCOUNT", "HOME_REFUSED"];
-    // euid, $SUDO_UID, HOME's owner, that owner is an account -> HOME_ACCOUNT, HOME_REFUSED
     let rows = [
         ["501", "", "501", "1", "", "0"],
         ["501", "502", "501", "1", "", "0"],
@@ -56,12 +46,6 @@ fn a_root_run_acts_on_a_home_only_as_its_account() {
     }
 }
 
-/// The owner the decision reads is HOME's, as the kernel reports it. HOME is an account's
-/// only when it is that account's own home (getpwnam's) or a folder in it: the test user's
-/// real home is, and (a stand-in answering the lookup) a folder outside the owner's home is
-/// not, as a CI container's HOME owned by a uid some account of the image shares is not. A
-/// name with no home, or a home of `/`, counts as the account's, so the run refuses rather
-/// than writes as root.
 #[test]
 fn the_home_owner_is_homes_uid() {
     let scratch = Scratch::new();
@@ -72,26 +56,63 @@ fn the_home_owner_is_homes_uid() {
         &[],
     );
     let lookup = lib.call(
-        "[ \"$(account_home \"$(id -un)\")\" = \"$(eval echo \"~$(id -un)\")\" ] && \
-         ! account_home 'a b' && ! account_home 'x;y' && ! account_home -x && \
-         ! account_home no-such-account-zz9",
+        "account_homes \"$(id -u)\" | grep -xF \"$(eval echo \"~$(id -un)\")\" >/dev/null && \
+         [ -z \"$(account_homes 424242424)\" ] && [ \"$(account_homes 0 | wc -l)\" -ge 2 ]",
         &[],
     );
-    let named = |home: &str| format!("( account_home() {{ {home}; }}; home_owner_named )");
+    let records = lib.call(
+        "printf '%s\\n' 'name: alice' 'uid: 502' 'dir: /Users//alice' '' 'name: bob' 'uid: 502' \
+         'dir: /Users//b o b' '' '' 'name: c' 'uid: 5020' 'dir: /Users//c' | dscache_homes 502 && \
+         printf '%s\\n' 'name: nobody' 'uid: -2' 'dir: /var/empty' '' 'name: x' 'uid: 2' 'dir: /x' | \
+         dscache_homes 4294967294 && \
+         printf '%s\\n' 'ubuntu:x:1000:1000::/home/ubuntu:/bin/sh' 'dev:x:1000:1001::/home/d e v:/bin/sh' \
+         'x:x:10000:1::/home/x:/bin/sh' | passwd_homes 1000",
+        &[],
+    );
+    let named = |homes: &str| format!("( account_homes() {{ {homes}; }}; home_owner_named )");
     let its_own = lib.call(named("echo \"$HOME\""), &[]);
     let inside = lib.call(named("echo \"${HOME%/*}\""), &[]);
     let root = lib.call(named("echo /"), &[]);
-    let unknown = lib.call(named("return 1"), &[]);
+    let unknown = lib.call(named(":"), &[]);
     let elsewhere = lib.call(named("echo \"$TMPDIR\""), &[]);
     let prefix = lib.call(named("mkdir -p \"${HOME%e}\" && echo \"${HOME%e}\""), &[]);
     let gone = lib.call(named("echo \"$TMPDIR/gone\""), &[]);
+    let second = lib.call(named("echo \"$TMPDIR\"; echo \"$HOME\""), &[]);
+    let slashes = lib.call(
+        "( account_homes() { echo \"$HOME\"; }; HOME=\"/$HOME\"; home_owner_named )",
+        &[],
+    );
+    let alias = lib.call(
+        named("ln -s \"$HOME\" \"$TMPDIR/alias\" && echo \"$TMPDIR/alias\""),
+        &[],
+    );
+    let file = lib.call(
+        "( HOME=\"$TMPDIR/a-file\"; : >\"$HOME\"; account_homes() { echo \"$TMPDIR\"; }; \
+         home_owner_named )",
+        &[],
+    );
+    let nameless = lib.call(
+        "( awk() { echo 4242; }; account_homes() { echo \"$HOME\"; }; home_owner_named )",
+        &[],
+    );
     let recs = lib.run(&scratch);
     let owner = std::fs::metadata(scratch.join("home")).expect("HOME").uid();
     assert_eq!(recs[call].rc, 0, "{}", recs[call].err);
     assert_eq!(recs[call].out.trim(), owner.to_string());
+    assert_eq!(
+        recs[records].out.lines().collect::<Vec<_>>(),
+        [
+            "/Users//alice",
+            "/Users//b o b",
+            "/var/empty",
+            "/home/ubuntu",
+            "/home/d e v"
+        ]
+    );
     for (i, rc) in [
         (real_home, 0),
         (lookup, 0),
+        (records, 0),
         (its_own, 0),
         (inside, 0),
         (root, 0),
@@ -99,16 +120,16 @@ fn the_home_owner_is_homes_uid() {
         (elsewhere, 1),
         (prefix, 1),
         (gone, 1),
+        (second, 0),
+        (slashes, 0),
+        (alias, 0),
+        (file, 0),
+        (nameless, 1),
     ] {
         assert_eq!(recs[i].rc, rc, "call {i}: {}", recs[i].err);
     }
 }
 
-/// The run as the account is this file again, by its absolute path, with the same
-/// arguments verbatim, over the same HOME, with the root run's PATH. sudo keeps the
-/// settings it reads (ATERM_*, XDG_*, CARGO_HOME, RUSTUP_HOME, curl's proxy and CA
-/// variables) by name, so none of their values is in argv, and nothing else. A piped run
-/// (no file) or another account's home execs nothing and says to run it without sudo.
 #[test]
 fn a_root_run_execs_itself_as_the_account_or_says_why_not() {
     let scratch = Scratch::new();
@@ -194,10 +215,6 @@ fn a_root_run_execs_itself_as_the_account_or_says_why_not() {
     assert!(!log.exists(), "a refusal execs nothing");
 }
 
-/// Before anything runs as the account, the account itself is asked whether it can read
-/// the file and write each folder an ATERM_*_DIR names, at the folder `mkdir -p` would
-/// build on (the nearest that exists; the working directory for a relative path with
-/// none). A no is a refusal that execs nothing and names the way that works.
 #[test]
 fn a_root_run_asks_the_account_before_it_runs_as_it() {
     let scratch = Scratch::new();
@@ -265,20 +282,19 @@ fn a_root_run_asks_the_account_before_it_runs_as_it() {
     assert!(!tmp.join("as-account").exists(), "a refusal execs nothing");
 }
 
-/// What an earlier install under sudo left root's is named once per tree, at the outermost
-/// folder on each of aterm's paths below HOME that is not the account's, so one chown gives
-/// the tree back; a folder outside HOME is never named, a root run names none, and a skip
-/// into a named tree points at the NOTE instead of at the setting.
 #[test]
 fn folders_an_earlier_root_run_left_are_named_at_their_top() {
     let scratch = Scratch::new();
     let home = scratch.join("home");
+    let tmp = scratch.join("tmp");
     let mut lib = Lib::new();
     lib.step(
-        "mine() { case \"$1\" in \"$HOME/.local\" | \"$HOME/.local/\"* | \
-         \"$HOME/Library/Application Support/aterm\" | \"$TMPDIR/outside\"*) return 1 ;; esac; }\n\
+        "case \"$(uname -s)\" in Darwin) ST=\"$HOME/Library/Application Support/aterm\" ;; \
+         *) export XDG_STATE_HOME=\"$HOME/.state\"; ST=\"$XDG_STATE_HOME/aterm\" ;; esac\n\
+         mine() { case \"$1\" in \"$HOME/.local\" | \"$HOME/.local/\"* | \"$ST\" | \
+         \"$TMPDIR/outside\"*) return 1 ;; esac; }\n\
          mkdir -p \"$HOME/.local/bin\" \"$HOME/.local/lib/aterm/bin\" \"$HOME/.config/aterm\" \
-         \"$HOME/Library/Application Support/aterm/pkg\" \"$TMPDIR/outside/bin\"\n\
+         \"$ST/pkg\" \"$TMPDIR/outside/bin\"\n\
          BIN_DIR=\"$HOME/.local/bin\" STORE_DIR=\"$HOME/.local/lib/aterm/bin\"",
     );
     let named = lib.call(
@@ -287,9 +303,13 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
     );
     let note = lib.call("foreign_home_note 2>&1", &[]);
     let user = lib.call("id -un", &[]);
-    // A uid with no name here is named by its number.
     let nameless = lib.call(
         "( id() { [ \"$1\" != -un ] && command id \"$@\"; }; foreign_home_note ) 2>&1",
+        &[],
+    );
+    let spaced = lib.call(
+        "( id() { if [ \"$1\" = -un ]; then echo 'john smith'; else command id \"$@\"; fi; }; \
+         foreign_home_note ) 2>&1",
         &[],
     );
     let remedies = lib.call(
@@ -313,9 +333,14 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         &[],
     );
     let count = "foreign_home_folders && foreign_home_note && echo \"${#FOREIGN_FOLDERS[@]}\"";
-    // sudo -u keeps the invoker's HOME: its folders are its owner's.
-    let not_my_home = lib.call(format!("( mine() {{ return 1; }}; {count} ) 2>&1"), &[]);
-    // A `..` climbs out of HOME as written; HOME empty or `/` contains every path.
+    let list =
+        "foreign_home_folders && printf '%s\\n' ${FOREIGN_FOLDERS[@]+\"${FOREIGN_FOLDERS[@]}\"}";
+    let not_my_home = lib.call(
+        format!(
+            "( HOME=/usr; BIN_DIR=/usr/bin; mine() {{ [[ \"$1\" == \"$HOME\" ]]; }}; {count} ) 2>&1"
+        ),
+        &[],
+    );
     let dotdot = lib.call(
         "( BIN_DIR=\"$HOME/../tmp/outside/bin\"; mine() { [[ \"$1\" == \"$HOME\" ]]; }; \
          foreign_home_folders && printf '%s\\n' \"${FOREIGN_FOLDERS[@]}\" )",
@@ -328,7 +353,6 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         ),
         &[],
     );
-    // chown -R of a symlink changes the link: a link ends HOME's own folders.
     let linked = lib.call(
         format!(
             "( mkdir -p \"$TMPDIR/linked/completions\" && ln -s \"$TMPDIR/linked\" \"$HOME/.config/fish\" && \
@@ -337,12 +361,88 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         ),
         &[],
     );
+    let fresh = |name: &str, body: &str| {
+        format!(
+            "( HOME=\"$TMPDIR/{name}\"; mkdir -p \"$HOME\" \"$TMPDIR/{name}-target\"; \
+             BIN_DIR=\"$HOME/.local/bin\" STORE_DIR=\"$HOME/.local/lib/aterm/bin\"; {body} ) 2>&1"
+        )
+    };
+    let link_top = lib.call(
+        fresh(
+            "ltop",
+            &format!(
+                "ln -s \"$TMPDIR/ltop-target\" \"$HOME/.aterm\"; \
+                 mine() {{ case \"$1\" in \"$HOME/.aterm\"*) return 1 ;; esac; }}; {count}"
+            ),
+        ),
+        &[],
+    );
+    let above_link = lib.call(
+        fresh(
+            "above",
+            &format!(
+                "mkdir -p \"$HOME/.top\"; ln -s \"$TMPDIR/above-target\" \"$HOME/.top/lnk\"; \
+                 BIN_DIR=\"$HOME/.top/lnk/bin\"; mine() {{ [[ \"$1\" != \"$HOME/.top\" ]]; }}; {list}"
+            ),
+        ),
+        &[],
+    );
+    let man_page = lib.call(
+        fresh(
+            "man",
+            &format!(
+                "mkdir -p \"$HOME/.local/share/man/man1\"; : >\"$HOME/.local/share/man/man1/aterm.1\"; \
+                 mine() {{ [[ \"$1\" != *.1 ]]; }}; {list}"
+            ),
+        ),
+        &[],
+    );
+    let xdg_data = lib.call(
+        fresh(
+            "xdg",
+            &format!(
+                "XDG_DATA_HOME=\"$HOME/.xdg/data\"; mkdir -p \"$XDG_DATA_HOME/zsh/site-functions\" \
+                 \"$HOME/.local/share/zsh/site-functions\"; \
+                 mine() {{ case \"$1\" in */zsh) return 1 ;; esac; }}; {list}"
+            ),
+        ),
+        &[],
+    );
+    let inside = lib.call(
+        fresh(
+            "inside",
+            &format!(
+                "mkdir -p \"$STORE_DIR\" \"$HOME/.aterm\"; mine() {{ return 0; }}; \
+                 foreign_inside() {{ case \"$1\" in \"$STORE_DIR\") printf '%s\\n' \"$1/x/y\" \"$1/x\" \"$1/x\" ;; \
+                 \"$HOME/.aterm\") echo \"$1/shell.d\" ;; esac; }}; {list}"
+            ),
+        ),
+        &[],
+    );
+    let inside_linked = lib.call(
+        fresh(
+            "inlink",
+            &format!(
+                "ln -s \"$TMPDIR/inlink-target\" \"$HOME/.aterm\"; mine() {{ return 0; }}; \
+                 foreign_inside() {{ echo \"$1/planted\"; }}; {count}"
+            ),
+        ),
+        &[],
+    );
+    let real_inside = lib.call(
+        "mkdir -p \"$TMPDIR/tree/a/b\" \"$TMPDIR/tree/c\" \"$TMPDIR/tree/x\"$'\\n'\"/etc\" && \
+         : >\"$TMPDIR/tree/f\" && ln -s a \"$TMPDIR/tree/l\" && \
+         ( id() { echo 424242424; }; foreign_inside \"$TMPDIR/tree\" ) | sort && \
+         echo -- && foreign_inside \"$TMPDIR/tree\"",
+        &[],
+    );
     let recs = lib.run(&scratch);
     for i in [
         named,
         note,
         user,
         nameless,
+        spaced,
         remedies,
         all,
         none,
@@ -351,11 +451,27 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         dotdot,
         bare_homes,
         linked,
+        link_top,
+        above_link,
+        man_page,
+        xdg_data,
+        inside,
+        inside_linked,
+        real_inside,
     ] {
-        assert_eq!(recs[i].rc, 0, "{}", recs[i].err);
+        assert_eq!(recs[i].rc, 0, "call {i}: {}", recs[i].err);
     }
+    let macos = cfg!(target_os = "macos");
     let local = s(&home.join(".local")).to_string();
-    let state = s(&home.join("Library/Application Support/aterm")).to_string();
+    let (state, state_top) = if macos {
+        (
+            home.join("Library/Application Support/aterm"),
+            home.join("Library"),
+        )
+    } else {
+        (home.join(".state/aterm"), home.join(".state"))
+    };
+    let (state, state_top) = (s(&state).to_string(), s(&state_top).to_string());
     assert_eq!(
         recs[named].out.lines().collect::<Vec<_>>(),
         [&local, &state]
@@ -378,6 +494,13 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         "{}",
         recs[nameless].out
     );
+    assert!(
+        recs[spaced]
+            .out
+            .contains(&format!("sudo chown -R john\\ smith {local} ")),
+        "{}",
+        recs[spaced].out
+    );
     assert_eq!(
         recs[remedies].out.lines().collect::<Vec<_>>(),
         [
@@ -386,16 +509,19 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         ]
     );
     let config = s(&home.join(".config")).to_string();
-    let library = s(&home.join("Library")).to_string();
     assert_eq!(
         recs[all].out.lines().collect::<Vec<_>>(),
-        [&local, &config, &library]
+        [&local, &config, &state_top]
     );
     assert_eq!(recs[none].out.trim(), "0");
-    assert_eq!(recs[not_my_home].out.trim(), "0", "another account's HOME");
+    assert_eq!(
+        recs[not_my_home].out.trim(),
+        "0",
+        "a HOME this account does not own"
+    );
     assert_eq!(
         recs[dotdot].out.lines().collect::<Vec<_>>(),
-        [&local, &config, &library],
+        [&local, &config, &state_top],
         "a `..` path is never walked"
     );
     assert_eq!(
@@ -408,6 +534,37 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
         ["0", "set ATERM_X to a writable dir"],
         "a folder through a link"
     );
+    assert_eq!(recs[link_top].out.trim(), "0", "a link is no top");
+    let t = |rel: &str| s(&tmp.join(rel)).to_string();
+    assert_eq!(
+        recs[above_link].out.lines().collect::<Vec<_>>(),
+        [t("above/.top")],
+        "a folder above a link"
+    );
+    assert_eq!(
+        recs[man_page].out.lines().collect::<Vec<_>>(),
+        [t("man/.local/share/man/man1/aterm.1")],
+        "a page root wrote into the account's man1"
+    );
+    assert_eq!(
+        recs[xdg_data].out.lines().collect::<Vec<_>>(),
+        [t("xdg/.xdg/data/zsh")],
+        "XDG_DATA_HOME's completions, not ~/.local/share's"
+    );
+    assert_eq!(
+        recs[inside].out.lines().collect::<Vec<_>>(),
+        [
+            t("inside/.local/lib/aterm/bin/x"),
+            t("inside/.aterm/shell.d")
+        ],
+        "inside the trees, the outermost, once"
+    );
+    assert_eq!(recs[inside_linked].out.trim(), "0", "a tree through a link");
+    assert_eq!(
+        recs[real_inside].out.lines().collect::<Vec<_>>(),
+        [t("tree/a"), t("tree/c"), t("tree/f"), "--".to_string()],
+        "the real find"
+    );
     assert_eq!(
         recs[as_root].out.trim(),
         "0",
@@ -415,8 +572,6 @@ fn folders_an_earlier_root_run_left_are_named_at_their_top() {
     );
 }
 
-/// The real `mine`: a folder this account owns or can write (root's 1777 /tmp) is its own,
-/// so the NOTE never names one a run can already write; root's / is not.
 #[test]
 fn a_folder_the_account_can_write_is_its_own() {
     let scratch = Scratch::new();

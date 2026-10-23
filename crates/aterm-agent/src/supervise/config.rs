@@ -203,8 +203,10 @@ impl Occupancy {
     }
 
     /// THE ONE PREDICATE a typed fact line passes: a [`PromptGrant`] under `prompt`, and nothing under `observe` or `off`.
+    /// Crate-private, so no other crate (the GUI's host, a lab) can mint one: only this crate's
+    /// loop asks the owner's configured policy, and the census (`prompt-grant`) fences where.
     #[must_use]
-    pub const fn grant(self) -> Option<PromptGrant> {
+    pub(crate) const fn grant(self) -> Option<PromptGrant> {
         match self {
             Occupancy::Prompt => Some(PromptGrant { _sealed: () }),
             Occupancy::Off | Occupancy::Observe => None,
@@ -218,7 +220,7 @@ impl Occupancy {
     }
 }
 
-/// The proof a fact line may be typed: [`Occupancy::grant`] under `prompt` alone.
+/// The proof a fact line may be typed: `Occupancy::grant` under `prompt` alone.
 #[derive(Debug)]
 pub struct PromptGrant {
     _sealed: (),
@@ -285,7 +287,7 @@ pub struct SupervisorConfig {
     pub limit_reset: bool,
     /// WHICH KINDS OF LIMIT RESET [`Self::limit_reset`] MAY SPEND, AND IN WHAT ORDER (`[harness] limit_reset_kinds = ["full", "weekly", "5-hour"]`; [`reset_kind_word`] names each kind).
     pub limit_reset_kinds: Vec<ResetKind>,
-    /// The usage tap (`crate::harness::tap`); at a usage limit its readings time the continuation (`super::tap_clock`).
+    /// The usage tap (`crate::harness::tap`): the footer's live weekly figure and the account-stats recorder; at a usage limit its readings time the continuation (`super::tap_clock`). On by default since the owner's 2026-10-22 *"you also need to fix the weekly budget reporting for claude code harness"*; `false` is a limit.
     pub usage_tap: bool,
     /// On a machine with no listed Claude Code accounts, track the single account's usage from session screens and raise the digest's two lines from it.
     pub usage_notes: bool,
@@ -433,7 +435,7 @@ impl Default for SupervisorConfig {
             accounts: Mode::Early,
             limit_reset: false,
             limit_reset_kinds: Vec::new(),
-            usage_tap: false,
+            usage_tap: true,
             usage_notes: false,
             usage_credits: false,
             logins: true,
@@ -764,6 +766,12 @@ impl SupervisorConfig {
     #[must_use]
     pub fn on_for(&self, agent: Program) -> bool {
         self.enabled && !self.off.contains(&agent)
+    }
+
+    /// Whether the usage tap ([`Self::usage_tap`]) is on for Claude Code, the one reading every surface shares: the relaunch lines a pass arms it on (the window's lane, `aterm harness upgrade`), the footer's reason for a missing week, and `accounts stats`' tap.
+    #[must_use]
+    pub fn usage_tap_on(&self) -> bool {
+        self.on_for(Program::Claude) && self.usage_tap
     }
 
     fn switch_off(&mut self, agent: Program) {
@@ -1825,7 +1833,6 @@ mod tests {
                     | "stall_term"
                     | "limit_reset"
                     | "limit_reset_kinds"
-                    | "usage_tap"
                     | "usage_notes"
                     | "usage_credits"
                     | "hosts"
@@ -2494,54 +2501,73 @@ mod tests {
         }
     }
 
+    /// THE USAGE TAP SHIPS ON (owner, 2026-10-22: *"you also need to fix the weekly budget
+    /// reporting for claude code harness"*): no file, an empty table and every other key
+    /// leave it on, `false` in the root table is a limit like any other off, and a misplaced
+    /// off limits all the same.
     #[test]
-    fn usage_tap_ships_off_and_only_the_root_table_turns_it_on() {
+    fn usage_tap_ships_on_and_the_root_tables_off_limits_it() {
         let full = SupervisorConfig::default();
-        assert!(!full.usage_tap, "the default is off");
-        assert!(!read("").usage_tap && !read("[harness]\n").usage_tap);
+        assert!(full.usage_tap, "the default is on");
+        assert!(read("").usage_tap && read("[harness]\n").usage_tap);
         assert_eq!(
             SupervisorConfig::default_shown("usage_tap").as_deref(),
-            Some("false")
+            Some("true")
         );
         for key in KEYS.iter().filter(|k| **k != "usage_tap") {
             let mut c = full.clone();
             let _ = c.set(key, "true");
-            assert!(!c.usage_tap, "{key} = true");
+            assert!(c.usage_tap, "{key} = true");
             c.limit(key);
-            assert!(!c.usage_tap, "{key} at its limit");
+            assert!(c.usage_tap, "{key} at its limit");
         }
-        let on = SupervisorConfig {
-            usage_tap: true,
+        let off = SupervisorConfig {
+            usage_tap: false,
             ..full.clone()
         };
-        for text in ["true", "\"yes\"", "1"] {
+        for text in ["false", "\"no\"", "0"] {
             let (c, notes) =
                 SupervisorConfig::from_aterm_toml(&format!("[harness]\nusage_tap = {text}\n"));
-            assert_eq!(c, on, "{text}");
+            assert_eq!(c, off, "{text}");
             assert!(notes.is_empty(), "{text}: {notes:?}");
         }
-        for text in ["false", "\"no\"", "0"] {
+        for text in ["true", "\"yes\"", "1"] {
             assert_eq!(read(&format!("[harness]\nusage_tap = {text}\n")), full);
         }
-        let c = read("[harness]\nusage_tap = true\naccounts = \"off\"\n");
+        let c = read("[harness]\naccounts = \"off\"\n");
         assert!(c.usage_tap, "the accounts' switch does not silence the tap");
-        assert!(!on.limits(&full), "on is no limit of off");
-        assert!(full.limits(&on), "off limits on");
-        let mut c = on.clone();
+        assert!(full.usage_tap_on() && !off.usage_tap_on());
+        for text in [
+            "[harness]\nenabled = false\n",
+            "[harness.claude]\nenabled = false\n",
+        ] {
+            let c = read(text);
+            assert!(
+                c.usage_tap && !c.usage_tap_on(),
+                "{text}: no tap where no harness"
+            );
+        }
+        assert!(
+            read("[harness.codex]\nenabled = false\n").usage_tap_on(),
+            "another agent's off"
+        );
+        assert!(off.limits(&full), "off limits on");
+        assert!(!full.limits(&off), "on is no limit of off");
+        let mut c = full.clone();
         c.limit("usage_tap");
-        assert_eq!(c, full, "its limit is off");
+        assert_eq!(c, off, "its limit is off");
         assert_eq!(
-            on.against_default(),
+            off.against_default(),
             Written {
-                limits: Vec::new(),
-                own: vec!["usage_tap"],
+                limits: vec!["usage_tap: off".to_owned()],
+                own: Vec::new(),
             }
         );
         let (c, notes) = SupervisorConfig::from_aterm_toml("[theme]\nharness.usage_tap = true\n");
         assert_eq!(c, full, "a misplaced true grants nothing");
         assert!(notes[0].contains("`theme.harness.usage_tap`"), "{notes:?}");
         assert!(
-            !read("[harness]\nusage_tap = true\n[theme]\nharness.usage_tap = false\n").usage_tap,
+            !read("[theme]\nharness.usage_tap = false\n").usage_tap,
             "a misplaced off limits all the same"
         );
     }

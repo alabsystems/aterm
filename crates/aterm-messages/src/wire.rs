@@ -4,6 +4,7 @@
 //! Wire grammars for `messages`, the `appstatus` compatibility face, and the `notice` verb.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 
 use crate::center::{Live, MessageCenter, Outcome, PostOutcome};
 use crate::log::{LogRecord, MessageLog, Retired};
@@ -38,7 +39,7 @@ pub(crate) const DEFAULT_READ_N: usize = 64;
 /// `messages [<n>] [since=<id>] [tag=<tag>] [sev=<sev>] [live]`.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ReadQuery {
-    /// The page size as given (at most [`LOG_CAP`]); `None` is the default for the query's shape ([`ReadQuery::page`]).
+    /// The page size as given (at most [`LOG_CAP`]); `None` is the default for the query's shape.
     pub n: Option<usize>,
     /// Only ids strictly greater.
     pub since: Option<MessageId>,
@@ -85,7 +86,6 @@ impl ReadQuery {
 }
 
 /// Parse the words after `messages`; junk ⇒ `Err(READ_USAGE)`.
-///
 /// # Errors
 /// [`READ_USAGE`] for any token the grammar does not name, a zero count, a bad id, tag or severity.
 pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
@@ -114,8 +114,6 @@ pub fn parse_read_args(rest: &str) -> Result<ReadQuery, &'static str> {
     Ok(q)
 }
 
-/// The `appstatus` progress field for a fill: `<n>/100` rounded to the
-/// nearest percent, `-` for none.
 fn progress_word(fill: Option<u16>) -> String {
     fill.map_or_else(
         || "-".to_string(),
@@ -218,6 +216,7 @@ pub(crate) fn message_row(
 }
 
 /// Every `messages` row the query selects, ascending by id, in [`message_row`]'s grammar.
+/// Open digest rows also carry `rev=<digest_revision>` for conditional settlement.
 #[must_use]
 pub fn message_rows(
     center: &MessageCenter,
@@ -239,7 +238,9 @@ pub fn message_rows(
                 now_words.detail = e.detail;
                 now_words.actions = e.actions;
                 now_words.repeats = e.repeats;
-                return message_row(&now_words, None, None, now_unix_ms, enc);
+                let mut row = message_row(&now_words, None, None, now_unix_ms, enc);
+                let _ = write!(row, " rev={}", center.digest_revision());
+                return row;
             }
             let glass = live.and_then(|_| center.glass_position(rec.id));
             message_row(rec, live, glass, now_unix_ms, enc)
@@ -247,7 +248,7 @@ pub fn message_rows(
         .collect()
 }
 
-/// The `appstatus` body in the retired status bars' byte-identical grammar (field order, keys, percent-encoding, the phase and outcome words; a `phase=live` line carries the row's current words).
+/// The `appstatus` body in the retired status bars' byte-identical grammar.
 #[must_use]
 pub fn activity_rows_compat(
     center: &MessageCenter,
@@ -306,11 +307,13 @@ pub fn activity_rows_compat(
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
 pub(crate) const NOTICE_USAGE: &str =
-    "usage: notice <post|progress|done|ask|later|dismiss|act> \u{2026}";
+    "usage: notice <post|progress|done|settle|ask|later|dismiss|act> \u{2026}";
 /// The `notice progress` usage line.
 pub(crate) const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]";
 /// The `notice done` usage line.
 pub(crate) const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw] [<words>]";
+/// The `notice settle` usage line.
+pub(crate) const SETTLE_USAGE: &str = "usage: notice settle <key> <id> <revision>";
 /// The `notice ask` usage line.
 pub(crate) const ASK_USAGE: &str =
     "usage: notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>";
@@ -341,19 +344,13 @@ pub(crate) const KEY_REFUSAL: &str =
 /// A tag of aterm's own families.
 pub(crate) const OWN_TAG_REFUSAL: &str =
     "notice: that tag is aterm's own; post under script or a tag of your own";
-/// [`apply`] handed an `act`: a press is the host's to perform ([`press_target`], then its own press path).
+/// [`apply`] handed an `act`: a press is the host's to perform.
 pub(crate) const ACT_IS_THE_HOSTS: &str = "ERR notice: act is pressed by the host";
 
-/// Whether `notice` refuses `tag`: every family aterm reports under
-/// ([`tags::ALL`]) but `script`, the scripts' own.
 fn aterms_own(tag: &Tag) -> bool {
     *tag != tags::SCRIPT && tags::ALL.contains(&tag)
 }
 
-/// The refusal for a glass title fault: `notice: <fault>`, one static string
-/// per fault [`glass_title_fault`] names, in the script author's words: what
-/// is wrong with the title and where the rest goes (` -- `), never the band's
-/// internal name.
 fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     match (fault, tail) {
         ("a glass title over six words", true) => {
@@ -373,14 +370,10 @@ fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     }
 }
 
-/// `Err(refusal)` when `title` may not stand on the glass. `tail`: the verb
-/// takes ` -- <more>` after its title (`post`, `progress`), so the refusal
-/// says where the rest goes; `done`'s words take none.
 fn title_form(title: &str, tail: bool) -> Result<(), &'static str> {
     glass_title_fault(title).map_or(Ok(()), |f| Err(title_refusal(f, tail)))
 }
 
-/// The key rule: `[a-z0-9._-]{1,40}`, stored as `wire.<key>`.
 fn wire_key(word: &str) -> Result<String, &'static str> {
     let ok = !word.is_empty()
         && word.len() <= WIRE_KEY_MAX
@@ -394,7 +387,6 @@ fn wire_key(word: &str) -> Result<String, &'static str> {
     }
 }
 
-/// The tag rule: any [`Tag::try_new`] word but aterm's own families.
 fn wire_tag(word: &str, usage: &'static str) -> Result<Tag, &'static str> {
     let tag = Tag::try_new(word).map_err(|_| usage)?;
     if aterms_own(&tag) {
@@ -403,28 +395,21 @@ fn wire_tag(word: &str, usage: &'static str) -> Result<Tag, &'static str> {
     Ok(tag)
 }
 
-/// The first whitespace-separated word of `s` and the rest after it.
 fn first_word(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     s.split_once(char::is_whitespace).unwrap_or((s, ""))
 }
 
-/// A plain decimal number: digits only (no sign, no space), in range.
 fn digits<T: std::str::FromStr>(s: &str) -> Option<T> {
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .then(|| s.parse().ok())
         .flatten()
 }
 
-/// A message id on the wire: digits, not zero.
 fn wire_id(s: &str) -> Option<MessageId> {
     digits::<u64>(s).and_then(MessageId::from_raw)
 }
 
-/// `<title>[ -- <tail>]`, both trimmed; a line that opens with `--` has no
-/// title, and one that ends with its separator has no tail: `Deploy failed -- `
-/// (a script's `"$TITLE -- $DETAIL"` with nothing in `$DETAIL`) is the title
-/// `Deploy failed`.
 fn split_title(rest: &str) -> (&str, &str) {
     let rest = rest.trim_start();
     if rest.trim_end() == "--" {
@@ -440,15 +425,10 @@ fn split_title(rest: &str) -> (&str, &str) {
     (title.trim(), tail.trim())
 }
 
-/// A wire title, detail line, stats or `done`'s words: stripped, then trimmed,
-/// then capped.
 fn clip_words(s: &str, cap: usize) -> String {
     clip(clip(s, usize::MAX).trim(), cap)
 }
 
-/// Options come in any order after the fixed words until the first word
-/// that is none of them: `take` names the options it knows (`Ok(true)`),
-/// refuses a bad one (`Err`), or ends the run (`Ok(false)`).
 fn options(
     mut rest: &str,
     mut take: impl FnMut(&str) -> Result<bool, &'static str>,
@@ -474,7 +454,7 @@ pub struct PostRequest {
     pub key: Option<String>,
     /// Seconds, 1..=120 (a script cannot say why the owner is needed, so it cannot hold a row longer than a glance).
     pub hold_secs: Option<u32>,
-    /// ≤ [`TITLE_CAP`] chars; a `warn`/`error` title obeys the glass title form ([`glass_title_fault`]).
+    /// ≤ [`TITLE_CAP`] chars; a `warn`/`error` title obeys the glass title form.
     pub title: String,
     /// ≤ [`WIRE_DETAIL_BYTES`], split on a literal `\n`, each line clipped to [`DETAIL_LINE_CAP`], ≤ [`DETAIL_LINES_CAP`] lines.
     pub detail: Vec<String>,
@@ -482,7 +462,6 @@ pub struct PostRequest {
 
 impl PostRequest {
     /// Parse the words after `notice post`.
-    ///
     /// # Errors
     /// [`POST_USAGE`] for a missing or invalid tag, an unknown severity, a hold outside `1..=120`, or an empty title.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -544,7 +523,7 @@ impl PostRequest {
         self.severity <= Severity::Info
     }
 
-    /// The message: `Origin::Wire`, the severity's glyph, no actions ever (a socket client cannot mint an owner gesture).
+    /// The message: `Origin::Wire`, the severity's glyph, no actions ever.
     #[must_use]
     pub(crate) fn into_message(self) -> Message {
         let hold = if self.is_record() {
@@ -583,7 +562,6 @@ pub enum WireIndicator {
     Busy,
 }
 
-/// `pct=<0..100>`: an integer, or one decimal place (`42.5`), in permille.
 fn parse_pct(v: &str) -> Option<u16> {
     let (int, frac) = match v.split_once('.') {
         Some((int, frac)) if frac.len() == 1 => (int, frac),
@@ -597,7 +575,6 @@ fn parse_pct(v: &str) -> Option<u16> {
     (p <= 1000).then_some(p)
 }
 
-/// `done=<n>/<total>`, `total ≥ 1`.
 fn parse_done(v: &str) -> Option<(u64, u64)> {
     let (n, total) = v.split_once('/')?;
     let (n, total) = (digits::<u64>(n)?, digits::<u64>(total)?);
@@ -623,7 +600,6 @@ pub struct ProgressRequest {
 
 impl ProgressRequest {
     /// Parse the words after `notice progress`.
-    ///
     /// # Errors
     /// [`PROGRESS_USAGE`] for a missing key, a bad option, two indicators, `unit=` without `done=`, or an empty title.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -688,7 +664,7 @@ impl ProgressRequest {
         })
     }
 
-    /// The meter the line declares, normalized: a fill, an amount in the key's own series ([`Amount::series_of`] the full key), or busy.
+    /// The meter the line declares, normalized.
     #[must_use]
     pub fn meter(&self) -> Meter {
         let m = match self.indicator {
@@ -740,7 +716,7 @@ impl ProgressRequest {
             .meter(meter)
     }
 
-    /// The in-place change a later line makes: the title and the meter, nothing else — tag, severity, hold and actions never.
+    /// The in-place change a later line makes: the title and the meter, nothing else.
     #[must_use]
     pub(crate) fn restatement(&self) -> Restatement {
         Restatement {
@@ -787,7 +763,6 @@ pub struct DoneRequest {
 
 impl DoneRequest {
     /// Parse the words after `notice done`.
-    ///
     /// # Errors
     /// [`DONE_USAGE`] for a missing key or an unknown outcome word; [`KEY_REFUSAL`]; `notice: <fault>` for words out of the title form.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -832,7 +807,6 @@ pub struct AskRequest {
 
 impl AskRequest {
     /// Parse the words after `notice ask`.
-    ///
     /// # Errors
     /// [`ASK_USAGE`] for a missing key, title, reason or step, or a bad option.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -910,7 +884,6 @@ pub struct LaterRequest {
 
 impl LaterRequest {
     /// Parse the words after `notice later`.
-    ///
     /// # Errors
     /// [`LATER_USAGE`] for a missing key, title, reason or step, a bad option or a second `url=`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
@@ -974,8 +947,6 @@ impl LaterRequest {
         Ok(req)
     }
 
-    /// The ask: the owner only, the step (on the link's button when there is one), the
-    /// key kept whole, a week's quiet after a dismissal.
     fn ask(&self) -> LaterAsk {
         let then = match self.url.as_deref().and_then(Mover::open_link) {
             Some(mover) => Then::press(mover, &self.step),
@@ -1006,8 +977,6 @@ impl LaterRequest {
     }
 }
 
-/// The refusal for an ask the door would not stand (`need::Ask::fault`), in the
-/// script author's words; `usage` for a fault the parse already answered.
 fn ask_refusal(fault: &'static str, usage: &'static str) -> &'static str {
     match fault {
         "a reason that only says something is pending" => {
@@ -1034,7 +1003,7 @@ pub enum Press {
     Details,
 }
 
-/// `notice <post|progress|done|ask|later|dismiss|act> …`, parsed on the control thread.
+/// `notice <post|progress|done|settle|ask|later|dismiss|act> …`, parsed on the control thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoticeRequest {
     /// A record, or a failure row.
@@ -1043,6 +1012,15 @@ pub enum NoticeRequest {
     Progress(ProgressRequest),
     /// Its finish.
     Done(DoneRequest),
+    /// Resolve the exact open digest entry observed at `revision`, without forgetting a filing.
+    Settle {
+        /// The full key, `wire.<key>`.
+        key: String,
+        /// The observed open entry.
+        id: MessageId,
+        /// The digest revision from its `messages` row.
+        revision: u64,
+    },
     /// The owner is needed now: a standing ask.
     Ask(AskRequest),
     /// The owner is needed, but not now: one entry of the digest.
@@ -1062,9 +1040,10 @@ pub enum NoticeRequest {
 
 impl NoticeRequest {
     /// The words after `notice`; `Err` is the refusal text after `ERR `.
-    ///
     /// # Errors
-    /// [`NOTICE_USAGE`] for a missing or unknown sub-form.
+    /// [`NOTICE_USAGE`] for a missing or unknown sub-form; [`SETTLE_USAGE`] for an
+    /// incomplete settlement observation or invalid id/revision; [`KEY_REFUSAL`] for
+    /// an invalid settlement key. Other forms return their parser's refusal.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let spaced: String = rest
             .chars()
@@ -1081,6 +1060,16 @@ impl NoticeRequest {
             "post" => PostRequest::parse(rest).map(Self::Post),
             "progress" => ProgressRequest::parse(rest).map(Self::Progress),
             "done" => DoneRequest::parse(rest).map(Self::Done),
+            "settle" => {
+                let mut words = rest.split_whitespace();
+                let key = wire_key(words.next().ok_or(SETTLE_USAGE)?)?;
+                let id = words.next().and_then(wire_id).ok_or(SETTLE_USAGE)?;
+                let revision = words.next().and_then(digits::<u64>).ok_or(SETTLE_USAGE)?;
+                if words.next().is_some() {
+                    return Err(SETTLE_USAGE);
+                }
+                Ok(Self::Settle { key, id, revision })
+            }
             "ask" => AskRequest::parse(rest).map(Self::Ask),
             "later" => LaterRequest::parse(rest).map(Self::Later),
             "dismiss" if rest.trim() == "review" => Ok(Self::DismissReview),
@@ -1124,7 +1113,7 @@ pub enum Paint {
     None,
     /// Repaint now.
     Now,
-    /// A paint is armed at [`WireGate::due`]: the last wire paint is younger than [`WIRE_PAINT_GAP`].
+    /// A paint is armed at [`WireGate::due`].
     Paced,
 }
 
@@ -1181,8 +1170,6 @@ impl WireGate {
         }
     }
 
-    /// Spend one mint carrying `bytes` of title and detail, or say which
-    /// budget is spent and how long until the mint fits.
     fn try_mint(&mut self, now: Instant, bytes: usize) -> Result<(), Busy> {
         while let Some(&(t, _)) = self.mints.front() {
             if later(t, WIRE_MINT_WINDOW) <= now {
@@ -1211,7 +1198,6 @@ impl WireGate {
         Ok(())
     }
 
-    /// Spend one `notice act` press, or say how long until one is free.
     fn try_press(&mut self, now: Instant) -> Result<(), Busy> {
         while let Some(&t) = self.presses.front() {
             if later(t, WIRE_MINT_WINDOW) <= now {
@@ -1231,13 +1217,10 @@ impl WireGate {
         Ok(())
     }
 
-    /// Give back the last mint (the post was a duplicate: nothing minted).
     fn refund(&mut self) {
         self.mints.pop_back();
     }
 
-    /// A glass change: paint now if the last wire paint is a frame old, else
-    /// arm the one paced paint at the next frame.
     fn pace(&mut self, center: &MessageCenter, now: Instant) -> Paint {
         match self.last_paint {
             Some(last) if now < later(last, WIRE_PAINT_GAP) => {
@@ -1252,22 +1235,16 @@ impl WireGate {
         }
     }
 
-    /// A paint happened in the frame starting at `frame`: it covers any
-    /// paced one.
     const fn painted(&mut self, frame: Instant) {
         self.last_paint = Some(frame);
         self.paint_due = None;
     }
 }
 
-/// `t + d`, saturating at `t`.
 fn later(t: Instant, d: Duration) -> Instant {
     t.checked_add(d).unwrap_or(t)
 }
 
-/// A row the wire owns: minted by it, or keyed in its namespace (a carried
-/// keyed wire row's origin is `Carried`, its key still the wire's; a carried
-/// keyless one keeps `Wire`).
 fn is_wire(row: &Live) -> bool {
     row.msg.origin == Origin::Wire
         || row
@@ -1277,7 +1254,6 @@ fn is_wire(row: &Live) -> bool {
             .is_some_and(|k| k.starts_with(WIRE_KEY_PREFIX))
 }
 
-/// How many wire rows are live.
 fn live_wire(center: &MessageCenter) -> usize {
     center.live_rows().filter(|l| is_wire(l)).count()
 }
@@ -1300,8 +1276,6 @@ enum Busy {
 }
 
 impl Busy {
-    /// The whole `ERR busy notice: … retry_ms=<ms>` line (the transient
-    /// class drivers back off on; `retry_ms` rounds up).
     fn reply(self) -> String {
         let (what, retry) = match self {
             Self::Mints(d) => (format!("{WIRE_MINTS_PER_WINDOW} new messages a minute"), d),
@@ -1320,13 +1294,10 @@ fn busy_refusal(busy: Busy) -> Applied {
     Applied::quiet(busy.reply())
 }
 
-/// The bytes a mint carries against [`WIRE_BYTES_PER_WINDOW`]: its title
-/// and its detail lines, what `messages.log` writes twice.
 fn words_bytes(msg: &Message) -> usize {
     msg.title.len() + msg.detail.iter().map(String::len).sum::<usize>()
 }
 
-/// A reply that repaints now.
 fn shown(center: &MessageCenter, gate: &mut WireGate, now: Instant, reply: String) -> Applied {
     gate.painted(center.frame_instant(now));
     Applied {
@@ -1348,6 +1319,9 @@ pub fn apply(
         NoticeRequest::Post(p) => apply_post(center, gate, p, stamp, now),
         NoticeRequest::Progress(p) => apply_progress(center, gate, &p, stamp, now),
         NoticeRequest::Done(d) => apply_done(center, gate, d, stamp, now),
+        NoticeRequest::Settle { key, id, revision } => {
+            apply_settle(center, &key, id, revision, now)
+        }
         NoticeRequest::Ask(a) => post_row(center, gate, a.into_message().normalized(), stamp, now),
         NoticeRequest::Later(l) => apply_later(center, gate, l, stamp, now),
         NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, stamp, now),
@@ -1394,9 +1368,6 @@ fn apply_post(
     post_row(center, gate, msg, stamp, now)
 }
 
-/// Post a row from the wire (a `post` at warn or error, an `ask`): the
-/// duplicate, the live-row cap and the mint budget, then the post and its
-/// paint.
 fn post_row(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1446,9 +1417,6 @@ fn digest_full_refusal() -> Applied {
     ))
 }
 
-/// File a `notice later` entry: the wire's cap on open entries and the digest's room
-/// for one more, then the mint budget, for a post that opens an entry or changes one's
-/// words (a repeat and a dismissed key's quiet spend nothing), then the post.
 fn apply_later(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1488,7 +1456,6 @@ fn apply_later(
     }
     let reply = format!("OK later={} how={word}", posted.id);
     if posted.outcome == PostOutcome::New && under_key {
-        // The entry retired the live row that told the fact: the band moved.
         return shown(center, gate, now, reply);
     }
     Applied {
@@ -1541,6 +1508,31 @@ fn apply_progress(
         };
     }
     shown(center, gate, now, reply)
+}
+
+fn apply_settle(
+    center: &mut MessageCenter,
+    key: &str,
+    id: MessageId,
+    revision: u64,
+    now: Instant,
+) -> Applied {
+    if center.digest_revision() != revision
+        || center.digest_entry(id).is_none_or(|entry| entry.key != key)
+    {
+        return Applied::quiet("OK settled=- how=gone".to_string());
+    }
+    // The check and resolution share this exclusive center borrow. A dismissal,
+    // replacement or restatement cannot intervene, and no filing is forgotten.
+    let ended = center.end_digest_key(key, Retired::Resolved(Outcome::Ok), None, now);
+    Applied {
+        reply: ended.map_or_else(
+            || "OK settled=- how=gone".to_string(),
+            |ended| format!("OK settled={ended} how=resolved-ok"),
+        ),
+        paint: Paint::None,
+        note: ended.is_some(),
+    }
 }
 
 fn apply_done(
@@ -1647,7 +1639,7 @@ pub(crate) fn press_words(press: &Press) -> String {
     }
 }
 
-/// How long a script is told to wait while aterm hands itself to a new version ([`switching_reply`]).
+/// How long a script is told to wait while aterm hands itself to a new version.
 pub const SWITCHING_RETRY: Duration = Duration::from_secs(1);
 
 /// `ERR busy notice: aterm is switching to its new version retry_ms=<ms>`.
@@ -1659,14 +1651,13 @@ pub fn switching_reply() -> String {
     )
 }
 
-/// `ERR notice: no live message <id>`: `dismiss`, `act` and the host's press that found the row gone all answer with this one line.
+/// `ERR notice: no live message <id>`.
 #[must_use]
 pub fn no_live_reply(id: MessageId) -> String {
     format!("ERR notice: no live message {id}")
 }
 
 /// What `notice act` presses.
-///
 /// # Errors
 /// The reply line, when there is no live row, no such capsule, or no press left in the window.
 pub fn press_target(
@@ -1693,8 +1684,7 @@ pub fn press_target(
     Ok((index, label))
 }
 
-/// Spend one band press for a press that did not come through `notice act` (`pointer click` on a capsule).
-///
+/// Spend one band press for a press that did not come through `notice act`.
 /// # Errors
 /// The whole `ERR busy notice: … presses a minute retry_ms=<ms>` line when the window's presses are spent.
 pub fn spend_press(gate: &mut WireGate, now: Instant) -> Result<(), String> {
@@ -1724,8 +1714,6 @@ mod tests {
         WallStamp { unix_ms: ms }
     }
 
-    /// `appstatus` reads a meter's fill only: a busy row is `progress=-`, like
-    /// any row with no fraction.
     #[test]
     fn activity_rows_compat_ignores_busy_and_lists_the_harness() {
         let now = t0();
@@ -1762,10 +1750,6 @@ mod tests {
         );
     }
 
-    /// A live toolchain meter at 50 % and a retired Warn update row render the
-    /// exact strings the status bars did, and toolchain live rows precede
-    /// update ones whatever the glass order (the update row is posted first and
-    /// sits above).
     #[test]
     fn activity_rows_compat_is_byte_identical() {
         let now = t0();
@@ -1881,10 +1865,6 @@ mod tests {
         assert!(rows[0].ends_with(" outcome=-"));
     }
 
-    /// `since_ms` never runs ahead of `ago_ms`: both are read off the reply's
-    /// one wall `now`, so a record retired 300 ms into its life reads
-    /// `since_ms = ago_ms − 300` at every read, and a wall clock that moved
-    /// less than the monotonic one clamps to `since_ms <= ago_ms`.
     #[test]
     fn since_ms_never_runs_ahead_of_ago_ms() {
         let now = t0();
@@ -1913,10 +1893,6 @@ mod tests {
         }
     }
 
-    /// A carried row's `since_ms` counts from its retirement in this process,
-    /// never from the parent's ingress: a download row stamped 60 s before the
-    /// handoff and superseded 1 s after the seed reads `since_ms` = the read
-    /// delay, and its logged retirement is the seed's wall plus 1 s.
     #[test]
     fn a_carried_rows_since_ms_counts_from_its_retirement_here() {
         let now = t0();
@@ -2017,10 +1993,6 @@ mod tests {
         }
     }
 
-    /// Paging with the last id seen never skips a record. 100 records:
-    /// `since=10` under `n=64` is 11..=74, then `since=74` is 75..=100; a bare
-    /// read is still the newest 64, and `since=` with no count is everything
-    /// above the id.
     #[test]
     fn paging_since_the_last_id_loses_nothing() {
         let now = t0();
@@ -2124,14 +2096,11 @@ mod tests {
         )
     }
 
-    /// Parse and apply one `notice` line, as the host's two threads do.
     fn notice(c: &mut MessageCenter, g: &mut WireGate, line: &str, now: Instant) -> Applied {
         let req = NoticeRequest::parse(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
         apply(c, g, req, stamp(1_000), now)
     }
 
-    /// A wire post under `tag`, which `notice` itself may refuse: what an
-    /// older build's post, carried or logged, puts in front of the center.
     fn wire_row(
         c: &mut MessageCenter,
         g: &mut WireGate,
@@ -2144,7 +2113,6 @@ mod tests {
         apply(c, g, NoticeRequest::Post(req), stamp(1_000), now)
     }
 
-    /// The id an `OK message=<id>` reply names.
     fn id_of(a: &Applied) -> MessageId {
         let raw = a
             .reply
@@ -2155,16 +2123,11 @@ mod tests {
         MessageId::from_raw(raw).unwrap()
     }
 
-    /// Reveal every row past its grace and commit the band: what the host's
-    /// settle and grid pass do.
     fn onto_glass(c: &mut MessageCenter, now: Instant) {
         c.settle(now, true);
         c.commit_rows(now, 3);
     }
 
-    /// A script posts under `script` or a tag of its own, never under a family
-    /// aterm reports under: the page could not tell its `crash` row from
-    /// aterm's own.
     #[test]
     fn a_script_may_not_post_under_any_of_aterms_families() {
         for own in tags::ALL.iter().filter(|t| ***t != tags::SCRIPT) {
@@ -2433,9 +2396,6 @@ mod tests {
         );
     }
 
-    /// The owner's attention rule, for every message the wire can raise: a
-    /// record for news, a row only for a failure or for work with its
-    /// indicator, a glass title in form, and never a capsule.
     #[test]
     fn every_wire_row_earns_its_place_on_the_glass() {
         let now = t0();
@@ -2531,9 +2491,6 @@ mod tests {
         assert!(NoticeRequest::parse("post script Build: done. Next; step").is_ok());
     }
 
-    /// Sanitising: control and invisible format characters never reach a
-    /// title, a detail line, stats or a label; a title empty after the strip
-    /// is a usage error.
     #[test]
     fn the_wire_strips_what_could_forge_a_row() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
@@ -2574,8 +2531,6 @@ mod tests {
         assert_eq!(p.title, "Deploy failed");
     }
 
-    /// A whitespace control is a space before the strip: `Tab\there` is
-    /// never stored as `Tabhere`.
     #[test]
     fn a_tab_on_the_wire_is_a_space() {
         let Ok(NoticeRequest::Post(p)) = NoticeRequest::parse(
@@ -3303,9 +3258,6 @@ mod tests {
         assert!(c.live(id).is_some());
     }
 
-    /// A loop of `act <id> details` on a row that stays live gets the budget's
-    /// presses and then `ERR busy`, never a repaint, a window and a log line
-    /// per line.
     #[test]
     fn notice_act_presses_are_budgeted() {
         let now = t0();
@@ -3343,8 +3295,6 @@ mod tests {
         assert_eq!(no_live_reply(gone), "ERR notice: no live message 999");
     }
 
-    /// A wire post never folds into a host row, and a host post never into a
-    /// wire row, whatever their words: the wire never restates a host row.
     #[test]
     fn wire_and_host_rows_never_merge_as_duplicates() {
         let now = t0();
@@ -3397,8 +3347,6 @@ mod tests {
         assert_eq!(id_of(&again), planted);
     }
 
-    /// The mints' title and detail bytes are budgeted, so full-detail records
-    /// cannot rotate `messages.log` over aterm's own lines in minutes.
     #[test]
     fn the_wire_budgets_the_bytes_it_writes() {
         let now = t0();

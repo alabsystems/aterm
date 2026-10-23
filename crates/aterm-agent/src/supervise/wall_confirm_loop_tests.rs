@@ -3438,6 +3438,16 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
             )
     };
     let generic = format!("You've hit your limit · resets {reset}");
+    // Every clock is virtual and moves by the test's steps alone: under a fixed wall clock
+    // the monotonic clock and the books' stamps ran on the machine's, so the successor read
+    // the try back by however long the machine took between steps (try+580s and +594s
+    // under a loaded Windows guest, +650s here with 20 s slept after the try).
+    let to = |s: &mut Session<'_, Mock>, at: i64| {
+        let from = s.now_unix();
+        s.fx.sleep(Duration::from_secs(
+            u64::try_from(at - from).expect("forward"),
+        ));
+    };
     let mut wrong = Vec::new();
     for (n, (case, words, kind)) in [
         (
@@ -3486,14 +3496,15 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
         opts.policy.continue_policy = true;
         let mut m = Mock::new(vec![wall.clone()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_zone_lookup(test_zones);
         s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
         s.set_turn_end_timing(TurnEndTiming {
             take_within: Duration::from_millis(50),
             ..TurnEndTiming::default()
         });
-        s.set_clock(RESET - 3600, PDT);
+        virtual_clock(&mut s, RESET - 3600, PDT);
         let try_at = decided(&mut s, &opts, &wall, 100, Some(Duration::from_secs(180))).0;
-        s.set_clock(try_at, PDT);
+        to(&mut s, try_at);
         let p = point_at(&mut s, wall.clone(), 101);
         let a = s.turn_end_at_point(&p, None, &opts).expect("the try");
         assert_eq!(a.rule_id(), Some(RULE_LIMIT_RESUME), "{case}: {a:?}");
@@ -3505,14 +3516,13 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
             Some(1),
             "{case}: a bucket's try"
         );
-        s.set_clock(try_at + 5, PDT);
+        to(&mut s, try_at + 5);
         let _ = decided(&mut s, &opts, &wall, 102, None);
-        std::thread::sleep(Duration::from_millis(80));
-        s.set_clock(try_at + 35, PDT);
+        to(&mut s, try_at + 35);
         let mut mine = decided(&mut s, &opts, &resumed(), 103, None);
         let mut seq = 104;
         while mine.2.contains("to take") && seq < 110 {
-            s.set_clock(mine.0, PDT);
+            to(&mut s, mine.0);
             mine = decided(&mut s, &opts, &resumed(), seq, None);
             seq += 1;
         }
@@ -3526,14 +3536,16 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
         opts2.policy.continue_policy = true;
         let mut m2 = Mock::new(vec![resumed()]);
         let mut s2 = session(&mut m2, Some("@s-1".to_string()));
-        s2.set_clock(decide_at, PDT);
+        s2.set_zone_lookup(test_zones);
+        virtual_clock(&mut s2, decide_at, PDT);
         s2.ledger = Ledger::open(Some(&books), Some("@s-1"), &mut Vec::new());
+        let now = s2.fx.mono();
         seed_usage_act(
             &mut s2.turn_end,
             &books,
             s2.setup.sid.as_deref(),
             act_ms + (decide_at - try_at) * 1000,
-            Instant::now(),
+            now,
         );
         s2.seed_wall_memory(open_wall(&books, Some("@s-1")));
         let tracked = s2.turn_end.wall_attempts(bucket);

@@ -379,7 +379,7 @@ fn encode_kitty_legacy_functional(
     })
 }
 
-/// Build the modifier suffix ";{mod}[:event]" portion.
+/// Build the modifier suffix `;{mod}[:event]` portion.
 #[cfg_attr(trust_verify, trust::skip)]
 fn append_mod_event(buf: &mut Vec<u8>, mod_value: u8, event: Option<KeyEventType>) {
     if mod_value > 1 || event.is_some() {
@@ -392,8 +392,8 @@ fn append_mod_event(buf: &mut Vec<u8>, mod_value: u8, event: Option<KeyEventType
     }
 }
 
-/// Letter-final keys: CSI [1;{mod}[:event]] {letter}
-/// Without modifiers/event: CSI {letter}
+/// Letter-final keys: `CSI [1;{mod}[:event]] {letter}`
+/// Without modifiers/event: `CSI {letter}`
 #[cfg_attr(trust_verify, trust::skip)]
 fn letter_final(letter: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);
@@ -406,7 +406,7 @@ fn letter_final(letter: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u
     buf
 }
 
-/// Tilde-final keys: CSI {num} [;{mod}[:event]] ~
+/// Tilde-final keys: `CSI {num} [;{mod}[:event]] ~`
 #[cfg_attr(trust_verify, trust::skip)]
 fn tilde_final(num: u8, mod_value: u8, event: Option<KeyEventType>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);

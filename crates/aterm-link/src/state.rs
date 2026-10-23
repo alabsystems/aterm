@@ -234,7 +234,7 @@ fn safe_line(line: &str) -> String {
     line.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
-/// Whether a clean disk heals `e` (sim item S7).
+/// Whether a clean disk heals `e`.
 pub(crate) fn a_clean_disk_heals(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -426,7 +426,7 @@ fn on_boot_volume(dir: &Path) -> bool {
     std::fs::File::open(dir).is_ok_and(|opened| astream_broker::on_boot_volume(&opened))
 }
 
-/// The points of [`StateDir::take_incarnation`] a test can kill it at ([`IncSeam::kill_at`]).
+/// The points of [`StateDir::take_incarnation`] a test can kill it at (`IncSeam::kill_at`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IncStep {
     /// `inc`'s flushed write has renamed its temp over `inc` and not yet flushed the directory.
@@ -474,7 +474,8 @@ pub struct StateDir {
     copy_on_every_try: std::sync::atomic::AtomicBool,
 }
 
-/// The filesystem operations one [`StateDir`] made, by kind (counted only in a test build, [`StateDir::ops`]), so a test states what a post costs as a count.
+/// The filesystem operations one [`StateDir`] made, by kind (counted only in a test build,
+/// `StateDir::ops`), so a test states what a post costs as a count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileOps {
     /// Reservation and journal reads ([`StateDir::read_reservation`]), hits and misses alike.
@@ -2863,7 +2864,6 @@ impl StateDir {
             }
         }
         for (sid, off) in seen_clamped {
-            // Not `set_seen_off`, which only rises: the clamp moves it down.
             self.write(&format!("seen/{sid}"), &off.to_string())?;
         }
         for (sid, floors) in unhandled_kept {
@@ -3015,7 +3015,7 @@ impl StateDir {
         self.write_durable("halts", &lines.join("\n"))
     }
 
-    /// The tofu `sid → node` pins (§6.1).
+    /// The tofu `sid → node` pins.
     #[must_use]
     pub fn pins(&self) -> BTreeMap<String, String> {
         self.pin_lines()
@@ -3027,7 +3027,7 @@ impl StateDir {
             .collect()
     }
 
-    /// The tofu pins on the media before a route stands on one (sim item S7).
+    /// The tofu pins on the media before a route stands on one.
     pub(crate) fn settle_pins(&self) -> io::Result<()> {
         if self.on_the_media("pins") {
             return Ok(());

@@ -3338,7 +3338,7 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
             weekly: Some("weekly 29% left".into()),
-            weekly_reset: None,
+            ..Default::default()
         }),
         ..narrow_rule_facts()
     };
@@ -3380,6 +3380,114 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
     assert!(shown.iter().any(|s| s.text == "weekly unavailable"));
 }
 
+/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT SAYS WHY (owner, 2026-10-22: *"you also need to
+/// fix the weekly budget reporting for claude code harness"*): one word per reason where the
+/// read told one, `weekly unavailable` where none was told (a refused profile read), and a
+/// standing 7d wall over every reason. Each reason, like an aged figure, stays beside the
+/// account and the controls on an 80-column pane, in its narrow form (`weekly ?`, an aged
+/// figure's `61.5% left · 59m`) where the controls take the room; and on any rule the old
+/// widest pair (`weekly unavailable` beside the shortest account) fitted, the week stays.
+#[test]
+fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
+    use super::super::profile::{SubscriptionDisplay, WeeklyGap};
+    use super::super::tap::Refusal;
+    let with = |gap: Option<WeeklyGap>, weekly: Option<&str>| FooterFacts {
+        subscription: Some(SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 20x".into()),
+            weekly: weekly.map(str::to_owned),
+            weekly_gap: gap,
+            ..Default::default()
+        }),
+        ..narrow_rule_facts()
+    };
+    let weekly = |facts: &FooterFacts| {
+        segments(facts)
+            .into_iter()
+            .find(|s| s.mark == WEEKLY_MARK)
+            .map(|s| s.text)
+    };
+    for (gap, words) in [
+        (WeeklyGap::TapOff, "weekly ? \u{b7} /usage"),
+        (
+            WeeklyGap::Unoffered(Refusal::Home),
+            "weekly ? \u{b7} /usage",
+        ),
+        (WeeklyGap::Untapped, "weekly ? \u{b7} restart tab"),
+        (WeeklyGap::Unrestarted, "weekly ? \u{b7} /usage"),
+        (WeeklyGap::NoReply, "weekly ? \u{b7} no reply yet"),
+        (WeeklyGap::Stale, "weekly ? \u{b7} no reply 1h"),
+    ] {
+        assert_eq!(weekly(&with(Some(gap), None)).as_deref(), Some(words));
+    }
+    assert_eq!(
+        weekly(&with(None, None)).as_deref(),
+        Some("weekly unavailable"),
+        "no reason told"
+    );
+    let walled = FooterFacts {
+        subscription: with(Some(WeeklyGap::NoReply), None).subscription,
+        ..narrow_rule_walled()
+    };
+    assert_eq!(weekly(&walled).as_deref(), Some("weekly 0% left"));
+    let aged = "weekly 61.5% left \u{b7} 59m ago";
+    let room = rule_room(&(0..80));
+    for (facts, narrow) in [
+        (with(Some(WeeklyGap::NoReply), None), "weekly ?"),
+        (with(Some(WeeklyGap::Untapped), None), "weekly ?"),
+        (with(None, Some(aged)), "61.5% left \u{b7} 59m"),
+    ] {
+        let words = weekly(&facts).expect("a weekly segment");
+        let mut pair = [
+            Segment::plain(ACCOUNT_MARK, "owner@example.com"),
+            Segment::plain(WEEKLY_MARK, narrow),
+        ];
+        shorten_subscription_account(&mut pair, 8);
+        let reserved = rule_width(&pair, TitleFit::None, false, None);
+        assert_eq!(
+            chips_room(&facts, room),
+            room - (reserved + RULE_SEP + 2),
+            "{words}: the controls get the room its narrow form frees"
+        );
+        for chips in [1, 3, 6, chips_room(&facts, room)] {
+            let lights = Some(LightsWidth {
+                chips,
+                title: 50,
+                lean: [0; LEAN_FORMS],
+                short: 20,
+                reason: true,
+            });
+            let fit = fit_rule(&facts, room, lights);
+            assert!(fit.width(lights) <= room, "{chips}: {fit:?}");
+            assert!(fit.chips, "{chips}: controls stay available");
+            assert!(
+                fit.segments
+                    .iter()
+                    .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == narrow)),
+                "{chips}: {words} stays: {fit:?}"
+            );
+        }
+        let mut old_floor = [
+            Segment::plain(ACCOUNT_MARK, "owner@example.com"),
+            Segment::plain(WEEKLY_MARK, "weekly unavailable"),
+        ];
+        shorten_subscription_account(&mut old_floor, 8);
+        let floor = rule_width(&old_floor, TitleFit::None, false, None);
+        for room in 0..=180 {
+            let fit = fit_rule(&facts, room, None);
+            assert!(fit.width(None) <= room, "{room}: {fit:?}");
+            if room >= floor {
+                assert!(
+                    fit.segments
+                        .iter()
+                        .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == narrow)),
+                    "{room}: the old floor held the week, and still does: {fit:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
     for email in ["owner@example.com", "使用者與工作帳號在公司@example.com"] {
@@ -3388,7 +3496,7 @@ fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
                 email: Some(email.into()),
                 plan: Some("Max 5x".into()),
                 weekly: Some("weekly 29% left".into()),
-                weekly_reset: None,
+                ..Default::default()
             }),
             ..narrow_rule_facts()
         };
@@ -3439,7 +3547,7 @@ fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
             weekly: Some("weekly 0% left".into()),
-            weekly_reset: None,
+            ..Default::default()
         }),
         ..narrow_rule_walled()
     };
@@ -5090,7 +5198,7 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
             email: Some("person@example.com".into()),
             plan: Some("Max".into()),
             weekly: Some("weekly 29% left".into()),
-            weekly_reset: None,
+            ..Default::default()
         }),
         ..facts.clone()
     };

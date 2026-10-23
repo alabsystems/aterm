@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Self-contained X11 clipboard (`CLIPBOARD` + `PRIMARY`) over `aterm_x11` without external helper binaries.
+//! Self-contained X11 clipboard (`CLIPBOARD` + `PRIMARY`) over `aterm_x11`.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -21,32 +21,20 @@ pub(crate) enum Sel {
     Primary,
 }
 
-/// Result of one `ConvertSelection` round-trip, so `get` can distinguish "owner
-/// does not offer this target" (advance the ICCCM fallback chain) from "owner is
-/// unresponsive" or "the transfer failed" (stop, don't multiply the wait across
-/// targets).
 enum PasteOutcome {
     Text(String),
     Unsupported,
     Timeout,
 }
 
-/// How long a paste may go without moving before it is given up: no reply to
-/// the `ConvertSelection`, or no INCR chunk since the last.
 const PASTE_STALL: Duration = Duration::from_millis(1000);
 
-/// The most an INCR paste may bring, against hostile owners.
 const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Values longer than this are served by ICCCM INCR, in chunks of this size, not
-/// in one ChangeProperty.
 const INCR_CHUNK: usize = 256 * 1024;
 
-/// How long an INCR transfer we serve waits for its requestor to take the last
-/// chunk before it is dropped (a requestor that died or gave up).
 const SERVE_STALL: Duration = Duration::from_secs(30);
 
-/// The atoms the clipboard protocol needs, interned once at startup.
 struct Atoms {
     clipboard: Atom,
     primary: Atom,
@@ -65,8 +53,6 @@ struct Atoms {
     incr: Atom,
 }
 
-/// One foreign-owner read in flight: a `ConvertSelection` from a requestor
-/// window no other read uses, until the owner's whole answer is in.
 struct Read {
     key: PasteRequest,
     /// The map entry owns this round's server window until it ends.
@@ -79,16 +65,12 @@ struct Read {
     tx: Sender<PasteOutcome>,
 }
 
-/// An INCR transfer a read is in: the property its chunks come on, their type,
-/// and the bytes so far.
 struct Incr {
     property: Atom,
     type_: Atom,
     bytes: Vec<u8>,
 }
 
-/// A value we serve by INCR to one requestor's property: what is left to hand
-/// over.
 struct Outgoing {
     id: u64,
     /// The chunks' type: the answer's own (`UTF8_STRING`, `STRING`, ...).
@@ -139,8 +121,6 @@ impl OutgoingShared {
     }
 }
 
-/// One bounded chunk, detached from the large retained value before any XCB
-/// operation.
 struct OutgoingChunk {
     key: (Window, Atom),
     id: u64,
@@ -172,8 +152,6 @@ impl OutgoingSends {
         })
     }
 
-    /// Admit expiry custody before the caller publishes an INCR header. The
-    /// spawn capability also lets the existing aggregate exercise refusal.
     fn start_with(
         &mut self,
         key: (Window, Atom),
@@ -287,7 +265,6 @@ impl Drop for OutgoingSends {
     }
 }
 
-/// A panic in the timer must not leave a table claiming it has expiry custody.
 struct OutgoingTimerExit {
     shared: Arc<OutgoingShared>,
     armed: bool,
@@ -307,9 +284,6 @@ impl Drop for OutgoingTimerExit {
     }
 }
 
-/// Wait only for the earliest real expiry or a table change. The explicit
-/// clock/park observation lets the existing aggregate advance this same loop
-/// without a 30-second sleep or any X event; production supplies Instant::now.
 fn expire_outgoing(
     shared: Arc<OutgoingShared>,
     now: impl Fn() -> Instant,
@@ -338,8 +312,6 @@ fn expire_outgoing(
     }
 }
 
-/// One round's wire identity. A refusal has no property; every other reply
-/// must name the property the round requested as well as its window and target.
 struct PasteRequest {
     window: Window,
     selection: Atom,
@@ -356,8 +328,6 @@ impl PasteRequest {
     }
 }
 
-/// Every round owns a fresh server window on the retained connection. Never
-/// reusing its XID keeps a delayed reply separate even after a completed read.
 struct Requestor {
     conn: Arc<Connection>,
     window: Window,
@@ -394,10 +364,6 @@ impl Reads {
     }
 }
 
-/// Shared state between the event-serving thread and the `set`/`get` callers. libxcb
-/// is thread-safe: a caller thread may send requests (set owner, convert) and wait for
-/// a reply (`set`'s ownership check) while the event thread blocks in `wait_for_event`,
-/// which is exactly the access pattern here.
 struct Inner {
     conn: Arc<Connection>,
     /// The window our selections are owned by.
@@ -415,7 +381,6 @@ struct Inner {
 }
 
 impl Inner {
-    /// The stored-text slot for `sel`.
     fn slot(&self, sel: Atom) -> Option<&Mutex<Option<String>>> {
         if sel == self.atoms.clipboard {
             Some(&self.clipboard)
@@ -426,9 +391,6 @@ impl Inner {
         }
     }
 
-    /// A fresh unmapped requestor that reports its property changes. Advance
-    /// the identity fence before creation: even a failed send cannot admit it
-    /// as another round later.
     fn requestor(&self, reads: &mut Reads) -> Option<Requestor> {
         let win = self.conn.generate_id().ok()?;
         if !reads.admit_window(win) {
@@ -458,16 +420,12 @@ impl Inner {
         Some(requestor)
     }
 
-    /// The INCR chunk size, and the longest value served in one property:
-    /// [`INCR_CHUNK`], or less where the server's longest request is shorter
-    /// (room left for ChangeProperty's header).
     fn incr_chunk(&self) -> usize {
         INCR_CHUNK
             .min(self.conn.maximum_request_bytes().saturating_sub(64))
             .max(4096)
     }
 
-    /// Read and delete `property` on our requestor window `win`, whole.
     fn take_property(&self, win: Window, property: Atom) -> Option<GetPropertyReply> {
         self.conn
             .send(xproto::get_property(
@@ -484,8 +442,6 @@ impl Inner {
     }
 }
 
-/// Unregister the active round on every caller exit, including unwind. The
-/// removed entry owns its window, and is dropped after releasing the map lock.
 struct PendingRead<'a> {
     inner: &'a Inner,
     window: Window,
@@ -516,15 +472,10 @@ impl X11Clipboard {
         INSTANCE.get_or_init(X11Clipboard::connect).as_ref()
     }
 
-    /// Connect, intern atoms, create the owner window, and spawn the serving
-    /// thread.
     fn connect() -> Option<X11Clipboard> {
         Self::connect_with_selections(b"CLIPBOARD", None)
     }
 
-    /// Connect as [`connect`](Self::connect), but intern `clipboard_name` for the
-    /// CLIPBOARD-role selection and, when `primary_override` is `Some`, that name
-    /// for the PRIMARY-role selection.
     fn connect_with_selections(
         clipboard_name: &[u8],
         primary_override: Option<&[u8]>,
@@ -641,8 +592,6 @@ impl X11Clipboard {
             .and_then(|slot| slot.lock().unwrap().clone())
     }
 
-    /// One `ConvertSelection` round-trip for `target`, from a requestor window
-    /// of this read's own, given up once it goes [`PASTE_STALL`] without moving.
     fn convert_once(&self, selection: Atom, target: Atom) -> PasteOutcome {
         let inner = &*self.inner;
         let (tx, rx) = channel();
@@ -678,7 +627,6 @@ impl X11Clipboard {
             CURRENT_TIME,
         ));
         if req.is_err() || inner.conn.flush().is_err() {
-            // connection/write broken — do not retry
             return PasteOutcome::Timeout;
         }
         loop {
@@ -707,8 +655,6 @@ impl X11Clipboard {
     }
 }
 
-/// The serving thread: answer conversion requests for selections we own and fulfil
-/// our own reads in flight.
 fn serve(inner: &Inner) {
     let mut sends = OutgoingSends::default();
     loop {
@@ -739,8 +685,6 @@ fn serve(inner: &Inner) {
     }
 }
 
-/// Answer one `SelectionRequest`: place the requested data on the requestor's
-/// property and reply with a `SelectionNotify` (property = `NONE` on refusal).
 fn serve_request(inner: &Inner, sends: &mut OutgoingSends, req: &SelectionRequest) {
     let a = &inner.atoms;
     let property = if req.property == NONE {
@@ -809,11 +753,6 @@ fn serve_request(inner: &Inner, sends: &mut OutgoingSends, req: &SelectionReques
     let _ = inner.conn.flush();
 }
 
-/// Put `bytes` of type `type_` on the requestor's `property`: in one
-/// ChangeProperty when they fit in one chunk ([`Inner::incr_chunk`]), else by
-/// ICCCM INCR (2.7.2): an `INCR` property holding the size now, then a chunk
-/// each time the requestor deletes the property ([`send_chunk`]), then a
-/// zero-length one.
 fn serve_value(
     inner: &Inner,
     sends: &mut OutgoingSends,
@@ -840,7 +779,6 @@ fn serve_value(
         .start((requestor, property), type_, bytes, Instant::now())
         .is_none()
     {
-        // No expiry custody: refuse before publishing the INCR header.
         return false;
     }
     let started = conn
@@ -864,9 +802,6 @@ fn serve_value(
     started
 }
 
-/// The requestor deleted `property` on `window`. If we serve it by INCR, that
-/// is the cue for the next chunk, appended to the property, or, once every byte
-/// is out, for the zero-length chunk that ends the transfer.
 fn send_chunk(inner: &Inner, sends: &mut OutgoingSends, window: Window, property: Atom) {
     let limit = inner.incr_chunk();
     let Some(chunk) = sends.chunk((window, property), limit, Instant::now()) else {
@@ -887,9 +822,6 @@ fn send_chunk(inner: &Inner, sends: &mut OutgoingSends, window: Window, property
     sends.sent(&chunk, sent, Instant::now());
 }
 
-/// The owner's `SelectionNotify`: the answer to the read that asked from
-/// `ev.requestor`, if that read still waits for an answer for this selection
-/// and target.
 fn take_answer(inner: &Inner, ev: &SelectionNotify) {
     let mut reads = inner.reads.lock().unwrap();
     let Some(read) = reads.active.get_mut(&ev.requestor) else {
@@ -919,8 +851,6 @@ fn take_answer(inner: &Inner, ev: &SelectionNotify) {
     reads.end(ev.requestor, outcome);
 }
 
-/// Decode a paste by its property's type, per ICCCM: STRING is Latin-1,
-/// UTF8_STRING and text/plain;charset=utf-8 are UTF-8.
 fn decode(type_: Atom, bytes: Vec<u8>) -> PasteOutcome {
     if type_ == atom::STRING {
         PasteOutcome::Text(bytes.iter().map(|&b| b as char).collect())
@@ -929,8 +859,6 @@ fn decode(type_: Atom, bytes: Vec<u8>) -> PasteOutcome {
     }
 }
 
-/// A new value on one of our requestor windows: the next chunk of the ICCCM
-/// INCR transfer its read is in, if it is in one.
 fn take_chunk(inner: &Inner, win: Window, property: Atom) {
     let mut reads = inner.reads.lock().unwrap();
     let Some(read) = reads.active.get_mut(&win) else {
@@ -1009,8 +937,6 @@ mod tests {
         assert!(!reads.admit_window(100));
     }
 
-    /// Cross-client round trip: two handles (each its own connection and owner window); `a`
-    /// copies and `b` pastes through the full selection protocol, as another app would.
     #[test]
     fn cross_client_clipboard_round_trip() {
         let clip_name = format!("ATERM_TEST_CLIPBOARD_{}", std::process::id());
@@ -1037,9 +963,6 @@ mod tests {
         assert_eq!(b.get(Sel::Clipboard).as_deref(), Some(payload));
     }
 
-    /// A foreign owner: a second connection whose unmapped window owns the
-    /// selection `name` (a private one, so the display's real clipboard is
-    /// never touched), answering by hand as another app would.
     struct Owner {
         conn: Connection,
         utf8: Atom,
@@ -1047,8 +970,6 @@ mod tests {
         stop: Arc<AtomicBool>,
     }
 
-    /// Prearmed inside the scope: cancellation runs before its implicit joins
-    /// on every assertion/unwind, so an owner never waits on an abandoned read.
     struct CancelOwners(Arc<AtomicBool>);
 
     impl Drop for CancelOwners {
@@ -1057,7 +978,6 @@ mod tests {
         }
     }
 
-    /// Another app: a second connection with an unmapped window of its own.
     fn client() -> (Connection, Window) {
         let (conn, screen) = Connection::connect(None).expect("a second connection");
         let root = conn.setup().roots[screen].root;
@@ -1080,7 +1000,6 @@ mod tests {
         (conn, win)
     }
 
-    /// The next event on `conn`. A minute without one is a hang.
     fn next_event(conn: &Connection) -> Event {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -1149,7 +1068,6 @@ mod tests {
             }
         }
 
-        /// Hear the property changes on `window` (a requestor's).
         fn watch(&self, window: Window) {
             self.conn
                 .send_void(xproto::change_window_attributes(
@@ -1209,8 +1127,6 @@ mod tests {
             self.notify(req, req.property);
         }
 
-        /// Normal completion fences the last answer before disconnect, like
-        /// XCloseDisplay.
         fn finish(&self) {
             self.conn
                 .send(xproto::get_input_focus())
@@ -1219,10 +1135,6 @@ mod tests {
         }
     }
 
-    /// The owner side of an ICCCM INCR transfer, slow on purpose: answer one
-    /// `UTF8_STRING` request with an INCR property, then hand `payload` over in
-    /// `chunk`-byte pieces, waiting `gap` before each, and end with a
-    /// zero-length piece.
     fn serve_incr_slowly(
         owner: &Owner,
         payload: &[u8],
@@ -1281,11 +1193,6 @@ mod tests {
         true
     }
 
-    /// A paste that comes in INCR chunks is read whole however long the
-    /// transfer takes, as long as it keeps moving: 2 MB in 64 KiB pieces with
-    /// 40 ms before each (about 1.3 s), where the reader's fixed 900 ms budget
-    /// for the whole transfer pasted nothing (GTK3 streams anything over
-    /// 256 KiB this way).
     #[test]
     fn a_slow_incr_paste_is_read_whole() {
         let clip_name = format!("ATERM_TEST_INCR_CLIPBOARD_{}", std::process::id());
@@ -1322,8 +1229,6 @@ mod tests {
         });
     }
 
-    /// Reads that overlap each get their own answer: a middle-click (PRIMARY)
-    /// while a large Ctrl+Shift+V paste (CLIPBOARD) streams in INCR chunks.
     #[test]
     fn overlapping_pastes_each_get_their_own_answer() {
         let clip_name = format!("ATERM_TEST_OVERLAP_CLIPBOARD_{}", std::process::id());
@@ -1402,9 +1307,6 @@ mod tests {
         });
     }
 
-    /// An answer that comes after its read gave up reaches no later read: the
-    /// owner sits on the first request until the reader gives up and asks
-    /// again, then answers both.
     #[test]
     fn a_late_answer_is_not_taken_by_the_next_paste() {
         let clip_name = format!("ATERM_TEST_LATE_CLIPBOARD_{}", std::process::id());
@@ -1449,10 +1351,6 @@ mod tests {
         );
     }
 
-    /// The type of the property the owner of the selection `name` answers a
-    /// `UTF8_STRING` request with, asked by another app: the target's own type
-    /// for a value sent whole, INCR for one that follows in chunks, `NONE` for a
-    /// refusal.
     fn answer_type(name: &str) -> Atom {
         let (conn, win) = client();
         let [selection, utf8, property] = conn
@@ -1486,9 +1384,6 @@ mod tests {
             .type_
     }
 
-    /// A copy longer than the server's longest request (16 MiB here) reaches
-    /// another client by INCR, where its one ChangeProperty failed and every
-    /// other app, the desktop's clipboard manager too, got nothing.
     #[test]
     fn a_copy_over_the_request_limit_is_served_by_incr() {
         use std::fmt::Write as _;
@@ -1530,7 +1425,6 @@ mod tests {
         );
     }
 
-    /// Exercise the shipping table and timer with a controlled monotonic clock.
     fn outgoing_values_expire_without_an_x_event() {
         use std::sync::atomic::AtomicUsize;
 

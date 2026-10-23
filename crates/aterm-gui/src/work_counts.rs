@@ -200,10 +200,18 @@ thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Threads inside [`allocations_in`] now: while none is, an allocation
+/// skips the thread-local read (unoptimised test builds pay more for that
+/// read than for the allocation itself).
+static COUNTING_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct CountingAlloc;
 
 impl CountingAlloc {
     fn note() {
+        if COUNTING_THREADS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
         let _ = COUNTING.try_with(|on| {
             if on.get() {
                 let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
@@ -245,10 +253,19 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 /// Run `f` and say how many heap allocations (and reallocations) it made
 /// on this thread: the per-frame paths' allocation budget, asserted.
 pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    struct Counting;
+    impl Drop for Counting {
+        fn drop(&mut self) {
+            COUNTING.with(|on| on.set(false));
+            COUNTING_THREADS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     ALLOCATIONS.with(|n| n.set(0));
+    COUNTING_THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let counting = Counting;
     COUNTING.with(|on| on.set(true));
     let out = f();
-    COUNTING.with(|on| on.set(false));
+    drop(counting);
     (out, ALLOCATIONS.with(|n| n.replace(0)))
 }
 

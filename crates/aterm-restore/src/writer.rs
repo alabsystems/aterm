@@ -179,7 +179,7 @@ pub const MIN_HIST_CAP: usize = 256 * 1024;
 /// The least bytes per line the adaptive cap assumes (§2.6's `max(32, ewma)`).
 pub const MIN_BYTES_PER_LINE: u64 = 32;
 
-/// The history ring's logical cap (the plan's §2.6, judges 1 and 3: the 24 B/line cap the first design assumed rested on one corpus, and the designs measured 7.5 to 30.9 LZ4 bytes a line across theirs).
+/// The history ring's logical cap (§2.6).
 #[must_use]
 pub fn adaptive_hist_cap(line_limit: Option<usize>, bytes_per_line: u64, phys: usize) -> usize {
     let cap = match line_limit {
@@ -306,14 +306,10 @@ fn word(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// `pos mod cap` as a ring offset (`cap > 0`).
 fn ring_offset(pos: u64, cap: usize) -> usize {
     usize::try_from(pos % word(cap.max(1))).unwrap_or(0)
 }
 
-/// Zero `len` bytes of `store` at `at`, a page of zeros at a time: one primitive store
-/// (and one hold of a shared store's lock) per 4 KiB, so zeroing the whole history ring
-/// never holds the region from the parse thread for more than a page's copy.
 fn zero<S: RegionStore + ?Sized>(store: &S, at: usize, len: usize) -> Result<(), StoreError> {
     let mut done = 0;
     while done < len {
@@ -392,7 +388,6 @@ impl<S: RegionStore> JournalWriter<S> {
         self.fault = Some(fault);
     }
 
-    /// Whether `fault` was planted: always `false` outside a test build.
     fn planted(&self, fault: WriterFault) -> bool {
         #[cfg(test)]
         {
@@ -445,20 +440,16 @@ impl<S: RegionStore> JournalWriter<S> {
         self.pending.is_some()
     }
 
-    /// Zero `len` bytes at `at`, a page of zeros at a time.
     fn zero(&self, at: usize, len: usize) -> Result<(), StoreError> {
         zero(&self.store, at, len)
     }
 
-    /// The most payload one BYTES record carries in this ring: [`MAX_BYTES_PAYLOAD`],
-    /// or what fits beside a header in a small test ring.
     fn max_payload(&self) -> usize {
         let room = self.geometry.tail_cap.saturating_sub(TAIL_RECORD_HEADER) / 8 * 8;
         MAX_BYTES_PAYLOAD.min(room).max(1)
     }
 
-    /// Append PTY bytes the engine just processed (a slice, after `Terminal::process`):
-    /// split into records of at most [`MAX_BYTES_PAYLOAD`], each advancing the stream.
+    /// Append PTY bytes the engine just processed (a slice, after `Terminal::process`).
     ///
     /// # Errors
     ///
@@ -672,8 +663,6 @@ impl<S: RegionStore> JournalWriter<S> {
         Ok(())
     }
 
-    /// Move the floor onto the first record boundary at or past `need` (or onto `start`,
-    /// the record being written, when the window holds none) and store it.
     fn move_floor(&mut self, need: u64, start: u64) -> Result<(), StoreError> {
         while self.tail_starts.front().is_some_and(|&s| s < need) {
             self.tail_starts.pop_front();
@@ -1101,7 +1090,6 @@ impl ControlWriter {
         self.fault = Some(fault);
     }
 
-    /// Whether `fault` was planted: always `false` outside a test build.
     fn planted(&self, fault: WriterFault) -> bool {
         #[cfg(test)]
         {
@@ -1164,8 +1152,6 @@ impl ControlWriter {
         self.write_record(to, geometry, seq, &record)
     }
 
-    /// The slot's write protocol: commit word 0, copy, length, commit word,
-    /// then the stale bytes past a shorter record zeroed.
     fn write_record<S: RegionStore + ?Sized>(
         &mut self,
         store: &S,

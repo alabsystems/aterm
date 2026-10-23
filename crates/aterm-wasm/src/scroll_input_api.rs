@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Sub-row scroll input on [`WebTerminal`] ([`WebTerminal::scroll_lines`]).
+//! Sub-row scroll input on [`WebTerminal`].
 
 use crate::WebTerminal;
 use aterm_render::RenderInput;
@@ -78,7 +78,8 @@ macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
         impl $terminal {
-            /// Sub-row scroll input in device pixels ([`scroll_lines`](Self::scroll_lines)).
+            /// Sub-row scroll input in device pixels, positive revealing older lines as in
+            /// [`scroll_lines`](Self::scroll_lines).
             pub fn scroll_px(&mut self, delta_px: f64) {
                 let cell_h = self.cell_height();
                 if cell_h == 0 {

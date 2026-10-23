@@ -16,23 +16,13 @@ use std::time::{Duration, Instant};
 const COLS: usize = 140;
 const CW: usize = 8;
 const CH: usize = 16;
-/// The line up to the `!!!!` typed after the move: 108 cells, `INTO` at 99, `TO ` at 101..104,
-/// `MAIN` at 104..108.
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN";
 const TAIL: &str = "!!!!";
-/// 12 cps.
 const KEY_MS: u64 = 83;
-/// The scrub's cadence.
 const HOP_MS: u64 = 150;
-/// The frame train.
 const FRAME_MS: u64 = 16;
-/// The split between a redraw's head (caret hidden) and its tail.
 const INK_SPLIT_MS: u64 = 30;
-/// The spinner's cadence in the Claude-shaped composer.
 const SPINNER_MS: u64 = 100;
-/// Pauses that land the first ⌥→ inside the last ~20 ms of the band's
-/// 1.69 s swoosh (grace 0.90 s at 12 cps + 0.15 reach + 0.40 retract + 0.24
-/// fade), the replay frame 30 ms after the head.
 const FADE_END_PAUSES_MS: [u64; 6] = [1481, 1483, 1485, 1487, 1489, 1491];
 
 /// Which program echoes the keys.
@@ -40,8 +30,7 @@ const FADE_END_PAUSES_MS: [u64; 6] = [1481, 1483, 1485, 1487, 1489, 1491];
 enum Composer {
     /// `inkish.py`: 30 rows, the line on row 3, prefix-less.
     Ink,
-    /// Claude Code's shape: 60 rows, the composer bottom-pinned with a `> `
-    /// prompt, a spinner row three rows above it.
+    /// Claude Code's shape.
     Claude,
 }
 
@@ -52,14 +41,12 @@ impl Composer {
             Self::Claude => 60,
         }
     }
-    /// The 0-based row the line is drawn on.
     fn row(self) -> u16 {
         match self {
             Self::Ink => 2,
             Self::Claude => 57,
         }
     }
-    /// The column the line's first glyph is drawn at.
     fn col0(self) -> u16 {
         match self {
             Self::Ink => 0,
@@ -83,7 +70,6 @@ enum WordKeys {
     Readline,
 }
 
-/// One frame's census of the typed row.
 struct RowFrame {
     ms: u64,
     /// What the host was doing when this frame presented.
@@ -113,8 +99,7 @@ struct Host {
     spinner_n: u32,
     next_spinner: Instant,
     frames: Vec<RowFrame>,
-    /// Every same-row move's replay frame and span, `(frame, from, to)` in
-    /// line columns, with the columns of its span no `Over` cell covers.
+    /// Every same-row move's replay frame and span.
     moves: Vec<(usize, usize, usize, Vec<usize>)>,
 }
 
@@ -167,7 +152,6 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The frame hold, then the tick.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
@@ -179,8 +163,6 @@ impl Host {
         self.record();
     }
 
-    /// One frame of the train, 16 ms on, with the spinner repainting on its
-    /// own clock in the Claude-shaped composer.
     fn step(&mut self) {
         self.now += Duration::from_millis(FRAME_MS);
         if self.composer == Composer::Claude && self.now >= self.next_spinner {
@@ -214,8 +196,6 @@ impl Host {
         self.idle_to(t);
     }
 
-    /// The next event exactly `ms` after the last one, not quantized to the train: the move's
-    /// instant against the band's fade is the point.
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
@@ -223,10 +203,6 @@ impl Host {
         self.last_event = t;
     }
 
-    /// The composer's redraw of its line with the caret at `self.caret`: the
-    /// head (hide, the spinner row on the Claude shape, clear the row, the
-    /// line) on one present, the tail (place the caret, show it)
-    /// `INK_SPLIT_MS` later on the next.
     fn redraw(&mut self) {
         let r = self.composer.row() + 1;
         let c0 = usize::from(self.composer.col0());
@@ -267,9 +243,6 @@ impl Host {
         }
     }
 
-    /// One navigation key landing the caret at `col`, `ms` after the last
-    /// event. The move is replayed on the redraw's tail frame; the columns of
-    /// its span that no `Over` cell covers right then are recorded.
     fn nav_after(&mut self, what: &str, col: usize, ms: u64) {
         self.schedule(ms);
         self.label = format!("{what} -> {col}");
@@ -329,7 +302,6 @@ impl Host {
         self.nav_after("opt-right", col, HOP_MS);
     }
 
-    /// The census of the typed row on this frame.
     fn record(&mut self) {
         let row = self.composer.row();
         let c0 = usize::from(self.composer.col0());
@@ -346,8 +318,6 @@ impl Host {
         });
     }
 
-    /// The longest run of consecutive frames from `from` on that each carry
-    /// a hole.
     fn longest_hole_run(&self, from: usize) -> usize {
         let (mut run, mut best) = (0, 0);
         for f in self.frames.iter().skip(from) {
@@ -357,8 +327,6 @@ impl Host {
         best
     }
 
-    /// The first frame whose label names `what` — the instant a nav's own
-    /// corridor begins, as against the frame the idle before it began at.
     fn first_labelled(&self, what: &str) -> usize {
         self.frames
             .iter()
@@ -366,7 +334,6 @@ impl Host {
             .unwrap_or(0)
     }
 
-    /// The index of every frame from `from` on that carries a hole.
     fn hole_frames_from(&self, from: usize) -> Vec<usize> {
         self.frames
             .iter()
@@ -377,8 +344,6 @@ impl Host {
             .collect()
     }
 
-    /// Every frame from `from` on that carries a hole, as the evidence a
-    /// failure prints: the line's text over each such frame's map.
     fn holes_from(&self, from: usize) -> Vec<String> {
         let text: String = self.text.clone();
         self.frames
@@ -396,9 +361,6 @@ impl Host {
     }
 }
 
-/// Types the line to `…INTO MAIN`, Home (a 108-cell meteor to column 0)
-/// `settle_ms` after the last key, End 300 ms later, then `!!!!`. Returns
-/// the host and the Home's first frame.
 fn home_end(composer: Composer, settle_ms: u64) -> (Host, usize) {
     let mut h = Host::new(composer, WordKeys::Inkish);
     h.type_str(LINE);
@@ -411,9 +373,6 @@ fn home_end(composer: Composer, settle_ms: u64) -> (Host, usize) {
     (h, home)
 }
 
-/// Types the line, ⌥← ×2 (a scrub), a pause of exactly `pause_ms`, ⌥→ ×2
-/// (then End if short of the end), then `!!!!`. Returns the host and the
-/// first ⌥→'s first frame.
 fn scrub_pause_hop(composer: Composer, words: WordKeys, pause_ms: u64) -> (Host, usize) {
     let mut h = Host::new(composer, words);
     h.type_str(LINE);
@@ -435,15 +394,8 @@ fn scrub_pause_hop(composer: Composer, words: WordKeys, pause_ms: u64) -> (Host,
     (h, hop)
 }
 
-/// Frames a leaving band's own head may still sweep the row after a jump
-/// lands beside the caret (the band's clock, not the corridor's); well
-/// inside the band's 0.64 s exit.
 const BAND_EXIT_FRAMES: usize = 16;
 
-/// Home and End over a fading band, then typing, leave the line whole. Home at 0.9 s (the band in
-/// its grace: a scrub, the control), 1.5 s (inside the swoosh), 2.2 s and 4.0 s (the band gone),
-/// on both composers: no frame from the Home on carries a hole, except the leaving band's own
-/// head for up to [`BAND_EXIT_FRAMES`] frames.
 #[test]
 fn home_then_end_over_a_fading_band_then_typing_leaves_no_hole_in_the_line() {
     let mut takes = Vec::new();
@@ -492,11 +444,6 @@ fn home_then_end_over_a_fading_band_then_typing_leaves_no_hole_in_the_line() {
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// The cap binds at the far edge, and only there. The End back over dark
-/// ground, 300 ms after a Home the band already left, lays every column
-/// from its landing to the Home's island it re-owns: the whole 108-cell
-/// line, one interval. The Home itself, with nothing lit past the cap,
-/// lays exactly the cap.
 #[test]
 fn the_end_back_over_dark_ground_lays_one_corridor_out_to_the_island_it_re_owns() {
     for composer in [Composer::Ink, Composer::Claude] {
@@ -522,11 +469,6 @@ fn the_end_back_over_dark_ground_lays_one_corridor_out_to_the_island_it_re_owns(
     }
 }
 
-/// A word hop at the end of the swoosh: ⌥← ×2, then the first ⌥→ landing
-/// in the last ~20 ms of the band's fade, a second ⌥→, `!!!!`. The first
-/// hop's corridor carries an `Over` cell at every column of its span on
-/// its replay frame, and no frame from the hop to the end of the take
-/// carries a hole: both composers, both word-key semantics.
 #[test]
 fn a_word_hop_landing_in_the_last_twenty_ms_of_the_swoosh_lays_its_corridor_whole() {
     let mut takes = Vec::new();
@@ -568,8 +510,6 @@ fn a_word_hop_landing_in_the_last_twenty_ms_of_the_swoosh_lays_its_corridor_whol
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// The same hop over a band still retracting: the first ⌥→ at a 1.0–1.2 s pause lands before the
-/// band's drain reaches the corridor, and the hop covers the leaving band from its level.
 #[test]
 fn a_word_hop_over_a_retracting_band_leaves_nothing_to_the_band_s_clock() {
     let mut bad = Vec::new();
@@ -597,10 +537,6 @@ fn a_word_hop_over_a_retracting_band_leaves_nothing_to_the_band_s_clock() {
     assert!(bad.is_empty(), "{}", bad.join("\n\n"));
 }
 
-/// The control: a hop beside a live band lays nothing over it. With a
-/// 300 ms pause the band is in its grace, the ⌥→ is a scrub over it (no
-/// `Over` cell on the band), and the line stays whole. The hop's cover
-/// reaches only light that is leaving.
 #[test]
 fn a_word_hop_over_a_live_band_is_a_scrub_and_lays_nothing() {
     for composer in [Composer::Ink, Composer::Claude] {

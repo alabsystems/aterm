@@ -27,13 +27,13 @@ use crate::supervise::classify::{
     path_operands, plain_zsh_line, program, runs, unquoted_glob,
 };
 
-/// Rule identifier for the read-only Bash classifier approval rule. v7 (classifier audit 2, `docs/measured/classifier-audit-2-2026-10-22.md`) moves both ways from v6. It refuses `sed` scripts hidden behind an attached, clustered or GNU-abbreviated `-e`/`-f` or a bracket-expression delimiter, `sysctl -f FILE` / `-p` (sets the kernel from a file), a `git cat-file --t…` textconv abbreviation, `git remote show NAME` in any spelling (`-v` included: it contacts the remote), a bare INPUT redirection with no command (zsh runs `$READNULLCMD`), an assignment to `CDPATH`/`PYTHONHOME`/`FPATH`, a `/dev/tcp`·`/dev/udp` network read, a brace expansion that can reach a flag or path through its head-aware option-slot scan (`sort x {-o,y}`; an operand-only brace such as `echo {a,b}` stays a read), and, at the box, a read of a secret ([`secrets_free`], the Read box's matcher on the Bash path). It newly approves genuine reads v6 refused only because it could not parse them: a `sed` script after macOS's valueless `-l`, an attached `-e` script, a bracket expression that holds the delimiter (`sed -l 's/a/b/p' f`, `sed -e's/a/b/' f`, `sed 's/[^/]/x/p' f`), and `git remote show` or `git remote -v show` with no remote named, which only list the remotes (MEASURED: no contact) and which v6's box refused (a box with a description row still escalates them: the reading that joins that row names a remote). v6 added the argv-word flag scan (`docs/measured/classifier-quoted-flags-2026-10-22.md`); [`network_free`] still runs in the proof (stricter only, and names the reading in the box message), and [`brace_free`] adds a conservative box-level refusal of every brace expansion.
+/// Rule identifier for the read-only Bash classifier approval rule.
 pub const RULE_READ_ONLY: &str = "read-only@classify-v7";
-/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (anchor `box.note_no_rule`, `This command requires approval`), plus [`no_rule_clear`]: Claude Code 2.1.308 draws that note when no allow rule matched and its own checks did not clear the command, which over a line of reads also covers an assignment, an unquoted glob word for a program off its glob-safe list and `xargs` under a Read deny rule, none of which aterm's proof covers, so each stays with a person (`docs/measured/box-notes-2026-10-22.md`). v2 reads the classifier at v7, refusing and approving as [`RULE_READ_ONLY`] says, and refuses a secret read ([`secrets_free`]). Any other note, or a second one, stays with a person.
+/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (`This command requires approval`), plus [`no_rule_clear`].
 pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v2";
-/// The rm circuit-breaker rule's id. v6 reads the rest of the line with classify-v7 (`classify_except_rm`), refuses a secret read ([`secrets_free`]) and still refuses a network reach or a brace expansion ([`network_free`], [`brace_free`]); the id moves from v5 with the classifier, which refuses and approves as [`RULE_READ_ONLY`] says.
+/// The rm circuit-breaker rule's id.
 pub const RULE_RM_BREAKER: &str = "rm-breaker@v6";
-/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm. v6 judged by classify-v6 and read no transcript (v4's call decided nothing and cost each box its lag retries and a 1 s settle); v7 judges the screen's readings through classify-v7 (refusing and approving as [`RULE_READ_ONLY`] says) and the secret matcher (`docs/measured/classifier-audit-2-2026-10-22.md`).
+/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm.
 pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v7";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
@@ -65,10 +65,7 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
 /// Gemini CLI's usage-limit dialog ([`limit_retry`]).
 pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
-/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`],
-/// [`LimitTry::StopThenResume`]): its `Stop`, at the due `Keep trying` would
-/// have been pressed at, so the turn-end policy types the resume at the error
-/// it leaves. Never its switch nor its upgrade.
+/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`], [`LimitTry::StopThenResume`]).
 pub const RULE_LIMIT_STOP: &str = "limit-stop@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
@@ -310,6 +307,10 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
         .map(|g| SecretRule::Basename(g.to_string())),
     );
     if let Some(h) = home {
+        // Joined with `/`, as [`secret_hit`] reads a rule: `Path::join` puts
+        // Windows' `\` between the home and the rest, and no rule matched.
+        let h = h.to_string_lossy();
+        let h = h.trim_end_matches('/');
         for sub in [
             ".config/gh",
             ".claude.json",
@@ -318,7 +319,7 @@ pub fn default_secrets(home: Option<&Path>) -> Vec<SecretRule> {
             ".secrets",
             ".config/aterm/secrets",
         ] {
-            out.push(SecretRule::Under(h.join(sub)));
+            out.push(SecretRule::Under(PathBuf::from(format!("{h}/{sub}"))));
         }
     }
     out
@@ -1188,7 +1189,6 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
         .as_ref()
         .is_some_and(|b| b.kind == RmBreakerKind::NotRuledOut)
     {
-        // A why aterm has no reading of: no advice about substitutions.
         format!(
             "Split it into shorter, plainer commands, run one at a time, any removal among them \
              on its own, {TALL_RM_PATHS}"
@@ -1498,10 +1498,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
                 ));
             }
         }
-        // After the line's own proof: a refused line is refused on where it
-        // points, and a proven one still needs to read no socket and hold no
-        // brace expansion, the screen to show its blanks and the assumed
-        // shell startup.
         if let Err(why) = network_free(&readings).and_then(|()| brace_free(&readings)) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
@@ -1528,9 +1524,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
             Err(why) => Decision::escalate(why),
         };
     }
-    // The vendor's no-rule note alone is lifted by the same proof, under a
-    // rule of its own ([`RULE_NO_RULE_READ_ONLY`]); any other note stays
-    // with a person.
     let rule_id = match prompt.notes.as_slice() {
         [] => RULE_READ_ONLY,
         [note] if note == anchor("box.note_no_rule") => RULE_NO_RULE_READ_ONLY,
@@ -1568,11 +1561,6 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     }
 }
 
-/// The programs Claude Code 2.1.308 lets take an unquoted glob word without
-/// drawing its no-rule note: its `qGt` set (read in its bundle at byte
-/// 17745255), less `cd`, whose glob would move every later command of the
-/// line, git's reads included, into a folder no one named. Each reads
-/// whatever words a glob makes, an option of its own included.
 const GLOB_SAFE: &[&str] = &[
     "ls",
     "cat",
@@ -1606,29 +1594,6 @@ const GLOB_SAFE: &[&str] = &[
     "md5sum",
 ];
 
-/// `Ok` when no reading of a Bash box's command takes a form over which
-/// Claude Code 2.1.308 draws its no-rule note though its own read-only check
-/// passed (read in its bundle at byte 17777748: the allow wants no Read deny
-/// rule beside `xargs`, no unquoted glob for a program off its glob-safe
-/// list, no assignment outside its safe variables, then its read-only
-/// check), each a concern aterm's read-only proof does not settle, so under
-/// [`RULE_NO_RULE_READ_ONLY`] each stays with a person:
-///
-/// * an assignment anywhere the classifier's own walk to a segment's
-///   program passes ([`runs`]: past keywords, `time`, redirects and
-///   wrappers), or a `for`/`select` loop's variable: the classifier vets
-///   one only against its list of hazards, which no list can complete
-///   (since classify-v7 it names `CDPATH`, `PYTHONHOME` and `FPATH`, but no
-///   program's own configuration variable);
-/// * `env`, `export` or `xargs` on that walk or as the program: an
-///   assignment `env` makes, and the files `xargs` reads, which the
-///   owner's Read deny rules never see;
-/// * an unquoted glob character (`*`, `?`, `[`: [`unquoted_glob`]) in a
-///   line any of whose programs is off [`GLOB_SAFE`]: the glob may make
-///   an operand or an option of a word the classifier read as one file
-///   (stricter than Claude Code, which judges each command's own words).
-///
-/// The words are the classifier's ([`command_words`]).
 fn no_rule_clear(readings: &[String]) -> Result<(), String> {
     let assignment = |w: &str| {
         w.split_once('=').is_some_and(|(name, _)| {
@@ -1752,10 +1717,7 @@ fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String>
     Ok(())
 }
 
-/// `Ok` when every reading of a Bash box's command ([`command_readings`])
-/// classifies read-only, none may open a network connection
-/// ([`network_free`]) and none holds a brace expansion ([`brace_free`]);
-/// `Err` names the reading and the reason.
+/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, and holds no brace expansion.
 pub(crate) fn read_only_every_reading(
     readings: &[String],
     python_allow: &[String],
@@ -1763,11 +1725,6 @@ pub(crate) fn read_only_every_reading(
     if readings.is_empty() {
         return Err("a Bash box with no command".to_string());
     }
-    // network_free and brace_free first, so their reading-named messages win
-    // over the classifier's own (the classifier now refuses both forms too, so
-    // the CLI, the presence word and these rules agree; `approval` keeps these
-    // two for the reading name and for the rm-breaker arm, which calls them
-    // directly after `classify_except_rm`).
     network_free(readings).and_then(|()| brace_free(readings))?;
     for line in readings {
         let v = classify_command_with(line, python_allow);
@@ -1782,22 +1739,6 @@ pub(crate) fn read_only_every_reading(
     Ok(())
 }
 
-/// `Ok` unless a reading of a Bash box's command may open a network
-/// connection by reading a file: an input redirect (`<`, `N<`, `<&`) from a
-/// target bash takes for a socket (`/dev/tcp/HOST/PORT`, `/dev/udp/…`, a
-/// literal the classifier reads as a file; bash opens one after its
-/// expansions, so `/dev/"tcp"/h/80` is one too) or from a target an
-/// expansion computes (`< $F`, `< "$(…)"`, which may name one), or a word
-/// naming gawk's network special files (`/inet/…`, `/inet4/…`, `/inet6/…`,
-/// which its `getline <` opens). Claude Code 2.1.308 draws its own note over
-/// such a redirect (`Redirect involving /dev/tcp or /dev/udp opens a network
-/// connection`, `Shell expansion syntax in paths requires manual approval`),
-/// but after an awk read it drew only the no-rule note over one (MEASURED,
-/// `docs/measured/box-notes-2026-10-22.md`), and the too-many breaker's box
-/// draws no note of its parse.
-/// The words are the classifier's ([`command_words`], quotes resolved, an
-/// expansion marked with a `$`); a quoted `<` reads as one too, a tie broken
-/// toward refusal. A line the classifier cannot read is refused.
 fn network_free(readings: &[String]) -> Result<(), String> {
     let socket = |t: &str| ["/dev/tcp/", "/dev/udp/"].iter().any(|p| t.starts_with(p));
     let inet = |t: &str| {
@@ -1821,7 +1762,6 @@ fn network_free(readings: &[String]) -> Result<(), String> {
                     continue;
                 };
                 if rest.starts_with('<') {
-                    // A here-document or here-string: its text, not a file.
                     continue;
                 }
                 let rest = rest.strip_prefix('&').unwrap_or(rest);
@@ -1843,16 +1783,6 @@ fn network_free(readings: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `Ok` unless a reading of a Bash box's command holds a brace expansion,
-/// which bash performs before any other: an unquoted `{…}` in one word
-/// with an unquoted `,` or `..` at its own level ([`brace_expansion`]). Bash
-/// makes new words of it before any grammar applies, so the classifier
-/// judges words bash never runs: `sort x {-o,y}` is `sort x -o y` (MEASURED
-/// 2026-10-22, `echo sort x {-o,y}` under `/bin/bash` 3.2.57 and zsh 5.9),
-/// a write the classifier read as a sort of three files. Claude Code 2.1.308
-/// draws `Brace expansion` over such a box, but the too-many breaker's box
-/// draws no note of its parse, so `breaker-read-only@v4` approved it, in a
-/// bypass session too. Under zsh [`plain_zsh_line`] refuses a `{` already.
 fn brace_free(readings: &[String]) -> Result<(), String> {
     for line in readings {
         if let Some(braces) = brace_expansion(line) {
@@ -1866,21 +1796,7 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// THE READ-ONLY RULE'S VERDICT ON A BASH BOX'S COMMAND ALONE: `Ok` when
-/// every reading of it classifies read-only, reads no socket and holds no
-/// brace expansion ([`read_only_every_reading`]) and none turns on a blank the screen cannot
-/// show ([`blanks_shown`]), checked in that order, the first refusal
-/// returned. [`bash`]'s read-only rules need this before their vendor-note,
-/// mode, startup, zsh and git checks (which read the box and the session,
-/// not the command), and the advisory word for a Bash box (`aterm-gui`'s
-/// `presence::prompt_detail` and the supervisor's own event and prompt
-/// lines, `bash:read-only`) is this: the rule's verdict on the command
-/// alone, never read-only for a command this refuses. The word reads neither
-/// the box nor the session, so the rules still refuse some boxes it calls
-/// read-only (a vendor note other than the no-rule note alone, an assignment
-/// under that note, bypass, a breaker's options or a removal it names, the
-/// shell's startup, a line not plain under zsh, git configuration that runs
-/// a program).
+/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds no brace expansion, and turns on no blank the screen cannot show.
 ///
 /// # Errors
 ///
@@ -1999,7 +1915,6 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmBreakerKind::MountedDrivePath => "box.rm_breaker.mounted_drive",
         RmBreakerKind::TooManySubstitutions => "box.rm_breaker.too_many",
         RmBreakerKind::NestedUnanalyzed => "box.rm_breaker.nested_unanalyzed",
-        // A why with no kind of its own is named in the note's own words.
         RmBreakerKind::NotRuledOut => "",
     };
     let why = if id.is_empty() {
@@ -2319,11 +2234,6 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
     Ok(())
 }
 
-/// The first rule in `secrets` the absolute path components `comps` match (case
-/// folded), the one matcher the Read box ([`read_comps_allowed`]) and the Bash
-/// secret-operand check ([`secrets_free`]) share: a secret directory it lies
-/// under, a secret path component (`.ssh`), or a secret basename glob
-/// (`id_rsa*`, `*.pem`).
 fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
         SecretRule::Under(dir) => abs_components(&dir.to_string_lossy()).is_some_and(|d| {
@@ -2336,13 +2246,6 @@ fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a Sec
     })
 }
 
-/// The path components a Bash operand `op` may stand for, for [`secret_hit`]:
-/// `~` and `~/` resolved against `home`, an absolute path normalised (`..`
-/// folded), a relative or bare word split on `/` (so a basename or a secret
-/// component still matches without a cwd). A path this cannot make absolute
-/// still carries its own components, enough for the component and basename
-/// rules. A word that starts with an expansion (`$HOME/.secrets/t`, `$…/x`)
-/// also stands for that expansion read as `home`, so a rule under it matches.
 fn operand_comps(op: &str, home: Option<&Path>) -> Vec<Vec<String>> {
     let split = |s: &str| -> Vec<String> {
         s.split('/')
@@ -2372,20 +2275,6 @@ fn operand_comps(op: &str, home: Option<&Path>) -> Vec<Vec<String>> {
     out
 }
 
-/// `Ok` unless a reading of a Bash box's command reads a path any secret rule
-/// in `secrets` names ([`secret_hit`] over [`path_operands`]): `cat
-/// ~/.ssh/id_rsa`, `grep x id_rsa`, `cat < .env`, `awk 'NR<3' ~/.aws/credentials`,
-/// `git config --file ~/.ssh/config --list`, `echo "$(<~/.gnupg/secring.gpg)"`,
-/// `git show HEAD:.env`. The same matcher the Read box uses, on the Bash
-/// path. [`path_operands`] keeps to the words a command reads as paths: a
-/// pattern, a jq filter, echoed text, a name `which` looks up or a file `ls`,
-/// `stat`, `wc` or `du` only lists or measures is no read (`grep -rn
-/// credentials src/`, `jq .key f.json`, `ls -la ~/.ssh`), unless the line may
-/// turn that output into a path another command reads (`find ~/.ssh | xargs
-/// cat`). A secret reached by recursion or a glob the tool expands (`grep -r x
-/// ~`, `find . -name '*.pem' -exec cat {} +`'s files) is not named, as the
-/// Read box never sees one either. A line the classifier cannot read is
-/// refused.
 fn secrets_free(
     readings: &[String],
     secrets: &[SecretRule],
@@ -3299,9 +3188,7 @@ pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>, how: LimitTry) -> St
     }
 }
 
-/// HOW GEMINI CLI'S USAGE-LIMIT DIALOG IS TRIED past its due
-/// ([`limit_retry`]), by the options it offers (bundle 0.46.0's
-/// `ProQuotaDialog`). `None`: a dialog no rule here answers.
+/// How Gemini CLI's usage-limit dialog is tried past its due ([`limit_retry`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LimitTry {
     /// `1. Keep trying` over `2. Stop` (the account's quota, or a model with
@@ -3339,8 +3226,7 @@ impl LimitTry {
         }
     }
 
-    /// The try as a WAITING line or a badge says it is made (`Keep trying
-    /// is tried`).
+    /// The try as a WAITING line or a badge says it is made (`Keep trying is tried`).
     #[must_use]
     pub(crate) fn tried(self) -> String {
         match self {
@@ -3349,8 +3235,7 @@ impl LimitTry {
         }
     }
 
-    /// The try as a WAITING line says it is pressed (`Keep trying is
-    /// pressed`).
+    /// The try as a WAITING line says it is pressed (`Keep trying is pressed`).
     #[must_use]
     pub(crate) fn pressed(self) -> String {
         match self {
@@ -3360,11 +3245,7 @@ impl LimitTry {
     }
 }
 
-/// [`limit_no_reset_reason`] for that dialog answered `Stop`: the badge the
-/// loop raises at the error the `Stop` left, where no badge of the dialog's
-/// stands there, while the resume (`usage-resume@v1`) is typed on the same
-/// ladder (FOREVER: NEEDS YOU is loud and never blocks). `unplaced` as
-/// there. One line, short of an attention's 120-cell reason.
+/// Format the escalation reason for a Gemini CLI usage-limit dialog answered with `Stop`.
 #[must_use]
 pub(crate) fn limit_stopped_reason(unplaced: Option<&str>) -> String {
     let what = match unplaced {

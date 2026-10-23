@@ -8,38 +8,32 @@ use super::*;
 use crate::autopilot::{HarnessSwitch, SwitchOff};
 use aterm_effects::harness_card::CardPalette;
 
-/// The lit switch.
 const LIT: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::On,
     hover: false,
     version: None,
 };
 
-/// The session's own Off: `○ off ▐ on ▌`.
 const OFF: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::Off(SwitchOff::Session),
     hover: false,
     version: None,
 };
 
-/// The master switch off: the same face, over a bare rule.
 const MASTER_OFF: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::Off(SwitchOff::Master),
     hover: false,
     version: None,
 };
 
-/// A switch turning on.
 const TURNING: SwitchPaint = SwitchPaint {
     face: HarnessSwitch::Turning,
     hover: false,
     version: None,
 };
 
-/// The headless window's cell, 1x: 7 × 14 device pixels.
 const CELL: (u16, u16) = (7, 14);
 
-/// The programs whose top line wears a mark, every one the ladder serves.
 const MARKED: [aterm_phase::Program; 5] = [
     aterm_phase::Program::Claude,
     aterm_phase::Program::Agy,
@@ -48,8 +42,6 @@ const MARKED: [aterm_phase::Program; 5] = [
     aterm_phase::Program::Gemini,
 ];
 
-/// Every lockup a top line wears: each marked program's vendor build, and
-/// codex-alab's, whose name (`codex-alab`, 15 cells laid) is the longest.
 const LOCKUPS: [(aterm_phase::Program, Build); 6] = [
     (aterm_phase::Program::Claude, Build::Vendor),
     (aterm_phase::Program::Agy, Build::Vendor),
@@ -59,16 +51,6 @@ const LOCKUPS: [(aterm_phase::Program, Build); 6] = [
     (aterm_phase::Program::Gemini, Build::Vendor),
 ];
 
-/// THE SCAN THE CACHE REPLACED, its run alone (main's
-/// `collect_composer_border_brand_edits` of 2026-10-20): the rightmost plain
-/// run of `─` in the rule's own style — the style most of its `─` wear, its
-/// last one's on a tie — over a row wholly on the ground; none where a cell
-/// is off it; for Muse Code (`muse`), also the whole rule from its first
-/// `─` to its last where its idle voice label stands at its left, no cell of
-/// it a cluster, a combining mark or an image (main's of 2026-10-21), and
-/// in a pane under 34 columns, where the label's own `──` is the longest
-/// run and at 32 columns the label ends the row, the whole rule to the
-/// label's closing blank (the lab of 2026-10-22).
 fn scan_run(
     scratch: &RenderInput,
     region: PaneTextRegion,
@@ -149,10 +131,6 @@ fn scan_run(
     })
 }
 
-/// The rows of a Claude Code screen `cols` wide, 24 rows, its composer's top
-/// rule on row 20 written as `top` (escapes and all), the caret row, the
-/// bottom rule and the mode row under it — every row cut to the width, so
-/// none wraps and scrolls the rule off its row.
 fn screen_with(cols: usize, top: &str) -> String {
     let rule = "\u{2500}".repeat(cols);
     let fit = |s: &str| s.chars().take(cols).collect::<String>();
@@ -172,15 +150,6 @@ fn screen_with(cols: usize, top: &str) -> String {
     out
 }
 
-/// The top rules a test reads at `cols`: plain; with Claude's tag (` KEY `
-/// in its violet at the right, one `─` after it); in two styles, the left
-/// half's and the right's; with a cell off the ground (a highlight); with a
-/// combining mark mid-run; with Muse Code's idle voice label at the left
-/// (measured `4b4f55` rule, `8a9098` label), which Muse Code's lockup takes
-/// — down to 32 columns, where the label alone fills the row — and under
-/// 32 columns cut with `…` as Muse Code 1.4.11 cuts it (measured at 26, 28
-/// and 30 columns: the row's first `cols − 2` cells of the label, then
-/// `…`), which no lockup takes.
 fn top_rules(cols: usize) -> Vec<(&'static str, String)> {
     let gray = "\x1b[38;2;90;90;90m";
     let rule = |n: usize| "\u{2500}".repeat(n);
@@ -240,10 +209,6 @@ fn top_rules(cols: usize) -> Vec<(&'static str, String)> {
     rules
 }
 
-/// The switch and the theme a top rule is composed under, as the splice
-/// pairs them: no host; Cruise and Land held by this window's host; Off in
-/// white, plain and hovered; the master switch off and a claim this host
-/// does not hold, bare; a switch turning on.
 const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 8] = [
     (None, None),
     (Some(LIT), Some(CardPalette::Cruise)),
@@ -258,7 +223,6 @@ const CASES: [(Option<SwitchPaint>, Option<CardPalette>); 8] = [
     (Some(TURNING), None),
 ];
 
-/// A top key for `program`'s vendor build on `run` at frame row 30.
 fn key_for(
     program: aterm_phase::Program,
     run: TopRun,
@@ -286,17 +250,6 @@ fn key_for(
     }
 }
 
-/// THE SWITCH SITS WHERE THE SCAN PUT IT: on a real engine's frame (the
-/// capture route's extraction and strip, before the footer's splice), at
-/// every width from where Claude draws its tag (26 columns) to a wide pane,
-/// for each top rule [`top_rules`] draws, each program that wears a mark and
-/// each switch and theme the splice pairs ([`CASES`]), [`read_top_run`]
-/// reads the scan's run ([`scan_run`]), every cell [`compose_top`] writes
-/// lies in the run it is laid on ([`laid_run`]), a switch stands exactly
-/// where hb-int laid one ([`fitted_switch_face`] of that run),
-/// right-aligned two cells short of its end in the form the ladder chose,
-/// its text that form's, and the lockup stands two cells in: the pads, the
-/// icon's two blanks, the CLI's word.
 #[test]
 fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
     use aterm_phase::Program;
@@ -467,7 +420,6 @@ fn the_switch_sits_where_the_scan_put_it_with_no_ghost() {
     );
 }
 
-/// The pane's frame row `row` as the glass shows it, char by char.
 fn glass_chars(app: &App, wid: WindowId, row: usize) -> String {
     let ws = &app.windows[&wid];
     let strip = ws.input_scratch.cells.len() - usize::from(ws.rows);
@@ -477,8 +429,6 @@ fn glass_chars(app: &App, wid: WindowId, row: usize) -> String {
         .collect()
 }
 
-/// What one pass cost the top rule: allocations in the whole pass, its
-/// reads and its compositions.
 fn top_cost(app: &mut App, wid: WindowId) -> (usize, usize, usize) {
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     let _ = (
@@ -493,9 +443,6 @@ fn top_cost(app: &mut App, wid: WindowId) -> (usize, usize, usize) {
     )
 }
 
-/// This window's host holding `session`: a harness host, and its claim on
-/// the session, so its top rule wears the harness's theme and its lit
-/// switch.
 fn held(app: &mut App, session: u64) -> Hosted {
     let host = hosted(app);
     let ctx = app.pool.get(session).expect("session").ctx.clone();
@@ -510,8 +457,6 @@ fn held(app: &mut App, session: u64) -> Hosted {
     host
 }
 
-/// The probe's Claude Code pane read by its agent reader and held by this
-/// window's host, two frames drawn.
 fn held_glass() -> (App, WindowId, u64, Hosted) {
     let (mut app, wid, session) = probe_glass();
     {
@@ -527,13 +472,6 @@ fn held_glass() -> (App, WindowId, u64, Hosted) {
     (app, wid, session, host)
 }
 
-/// THE TOP RULE AT REST COSTS NOTHING, the harness's theme on it: a
-/// Claude Code pane this window's host holds whose screen and facts did not
-/// move — the lockup at its left, the spectrum tinting its top rule, the lit
-/// switch at its right — reads the rule off no frame, composes nothing and
-/// allocates nothing in the footer's pass, frame after frame, the glass the
-/// same; a keystroke's echo on the caret row keeps the run read and the
-/// composition.
 #[test]
 fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     let (mut app, wid, session, _host) = held_glass();
@@ -602,7 +540,6 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     );
 }
 
-/// The mark layers of `session`'s top rule on the window's frame.
 fn marks_on(app: &App, wid: WindowId, session: u64) -> Vec<aterm_core::render::FxLayer> {
     app.windows[&wid]
         .input_scratch
@@ -613,11 +550,6 @@ fn marks_on(app: &App, wid: WindowId, session: u64) -> Vec<aterm_core::render::F
         .collect()
 }
 
-/// A SETTLED MARK BUILDS NOTHING (design §6.5): over frames whose key holds,
-/// the footer's pass composes no top rule, seals no fx content and copies
-/// none (`fx_layer_builds`, `fx_payload_copies`, this thread's), and every
-/// frame's mark layer is the first frame's very content (`Arc::ptr_eq`) at
-/// the same place: the renderer's one pointer compare.
 #[test]
 fn a_settled_mark_builds_nothing() {
     let (mut app, wid, session, _host) = held_glass();
@@ -679,7 +611,6 @@ fn a_settled_mark_builds_nothing() {
     );
 }
 
-/// A plain top rule's run of `len` cells at frame column 2, Claude's gray.
 fn plain_run(len: usize) -> TopRun {
     TopRun {
         col: 2,
@@ -693,7 +624,6 @@ fn plain_run(len: usize) -> TopRun {
     }
 }
 
-/// The pane's blank in the pure tests: light ink on the default ground.
 fn blank() -> RenderCell {
     RenderCell {
         ch: ' ',
@@ -702,8 +632,6 @@ fn blank() -> RenderCell {
     }
 }
 
-/// [`compose_top`] of `run` for `program`'s vendor build, under the switch
-/// `switch` and the theme `palette`, the key's `face`.
 fn composed_for(
     program: aterm_phase::Program,
     run: TopRun,
@@ -714,7 +642,6 @@ fn composed_for(
     composed_as((program, Build::Vendor), run, switch, palette, face)
 }
 
-/// [`composed_for`] for a lockup's program and build ([`LOCKUPS`]).
 fn composed_as(
     (program, build): (aterm_phase::Program, Build),
     run: TopRun,
@@ -734,7 +661,6 @@ fn composed_as(
     top
 }
 
-/// [`composed_for`] Claude.
 fn composed(
     run: TopRun,
     switch: Option<SwitchPaint>,
@@ -744,15 +670,12 @@ fn composed(
     composed_for(aterm_phase::Program::Claude, run, switch, palette, face)
 }
 
-/// The ghost's face: drawn, not lit.
 const GHOST: KeyFace = KeyFace {
     ghost: Some(false),
     tag: None,
     mark: None,
 };
 
-/// The chars of a composition laid over a run of `len` `─` from the run's
-/// first cell: what the line reads with the cells written.
 fn line_of(top: &ComposedTop, run: TopRun) -> Vec<char> {
     let mut line = vec!['\u{2500}'; run.len];
     for (k, c) in top.cells.iter().enumerate() {
@@ -763,13 +686,6 @@ fn line_of(top: &ComposedTop, run: TopRun) -> Vec<char> {
     line
 }
 
-/// THE SWITCH YIELDS ITS CELLS TO THE GHOST (design §10.6.14): the ghost
-/// takes Claude's slot at the run's right end — ` KEY off ` then the one `─`
-/// left as Claude's — and the ladder lays the lockup and the switch in the
-/// span short of it, the switch's right edge two `─` left of the ghost, in
-/// the form the ladder chose for that span; no lockup or switch cell is
-/// under the ghost, and the ghost's ink is Claude's rule gray, not bold, at
-/// full size, never the palette's.
 #[test]
 fn the_switch_yields_its_cells_to_the_ghost() {
     let key = aterm_primer::CLAUDE_TOP_EFFORT_KEY;
@@ -876,18 +792,6 @@ fn the_switch_yields_its_cells_to_the_ghost() {
     );
 }
 
-/// THE LOCKUP (owner, 2026-10-21: "each CLI has an emoji-sized icon and
-/// color on the left side of the top line of CLI to standardize"): on every
-/// rung that lays it, for every lockup — each program that wears a mark,
-/// and codex-alab, whose name is the longest — and in every harness state —
-/// lit, Off's white, bare, turning on and with no host — the lockup stands
-/// its lead in from the run's left (two `─`, one on the compact rung): a
-/// pad, the icon's two cells and a pad, all blanks on the pane's ground with
-/// no underline (the sprite draws over the icon's), and on a full rung the
-/// build's name (`codex-alab` for ALab's Codex, the CLI's word for every
-/// other) bold in its brand ink floored to 4.5:1 (`cli_marks::name_fg`) and
-/// a trailing pad, with at least its lead of `─` after it before the switch
-/// (or the span's end).
 #[test]
 fn the_lockup_stands_two_rule_cells_in() {
     let ground = crate::claude_card::pack(blank().bg);
@@ -1003,14 +907,10 @@ fn the_lockup_stands_two_rule_cells_in() {
     );
 }
 
-/// Whether a lockup ending at `end` leaves at least `lead` cells of `─`
-/// before `limit` (the switch's first cell, or the span's end): the gap the
-/// ladder's rungs keep (two, one on the compact rung).
 fn gap_holds(end: usize, limit: usize, lead: usize) -> bool {
     limit >= end + lead
 }
 
-/// The rung's name as the spec's tables print it (§5.2, §5.5).
 fn rung_name(rung: Option<Rung>) -> String {
     let Some(r) = rung else {
         return "nothing".into();
@@ -1026,10 +926,6 @@ fn rung_name(rung: Option<Rung>) -> String {
     }
 }
 
-/// THE ORDER (§5.3), walked down spans 200 to 0 over `rungs` for a switch
-/// whose last form is `last`: the tier never widens; the name goes only once
-/// the switch is in its last form, the icon only once the name is gone, the
-/// switch only once the icon is; and nothing given up comes back.
 fn walk_order(rungs: &[Rung], last: Option<usize>) -> Result<(), String> {
     let mut before: Option<Rung> = first_fit(200, rungs);
     for span in (0..200).rev() {
@@ -1071,16 +967,12 @@ fn walk_order(rungs: &[Rung], last: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
-/// One row of §5.5's table: the CLI and its build, its switch's state
-/// (`none`: no switch), and the rung it shows at each span.
 type Shown = (
     (CliMark, Build),
     &'static str,
     &'static [(usize, &'static str)],
 );
 
-/// What §5.5 says each CLI shows, by rung and span (the parenthesised span
-/// of each cell of its table).
 const SHOWS: &[Shown] = &[
     (
         (CliMark::Claude, Build::Vendor),
@@ -1316,7 +1208,6 @@ const SHOWS: &[Shown] = &[
     ),
 ];
 
-/// The switch a §5.5 state word names.
 fn paint_of(state: &str) -> Option<SwitchPaint> {
     match state {
         "on" => Some(LIT),
@@ -1326,13 +1217,6 @@ fn paint_of(state: &str) -> Option<SwitchPaint> {
     }
 }
 
-/// THE LADDER GIVES UP WORDS, THEN THE NAME, THEN THE ICON (§5.3): for every
-/// mark and build — codex-alab's longer name among them — every switch face
-/// and none, the rung chosen walking down every span from 200 to 0 keeps the
-/// order ([`walk_order`]), and the rungs §5.5's table names are the ones laid
-/// at its spans (Claude with its KEY tag, the ghost or neither; agy; Muse
-/// after its label; Gemini; codex-alab, its name giving way a rung sooner
-/// than §5.5's `codex`; vendor `codex` and no switch).
 #[test]
 fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     let mut walked = 0;
@@ -1393,8 +1277,6 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     );
 }
 
-/// hb-int's switch faces, before the lockup, for a program named `word`:
-/// the forms its `fitted_switch_face` chose from, widest first.
 fn hb_int_faces(paint: SwitchPaint, word: &str) -> Vec<String> {
     match paint.face {
         HarnessSwitch::On => vec![
@@ -1417,12 +1299,6 @@ fn hb_int_faces(paint: SwitchPaint, word: &str) -> Vec<String> {
     }
 }
 
-/// A SWITCH STANDS WHEREVER IT STOOD (§5.6, invariants 2 and 3): for every
-/// span from 0 to 200, every lockup with a switch — Claude's, agy's, Muse's,
-/// Gemini's and codex-alab's, the longest name — and every switch face, a
-/// switch is laid exactly where hb-int's `fitted_switch_face` laid one (its
-/// widest form of the program's word that left two rule cells either side),
-/// and it stands at `span − 2 − len`, as [`compose_top`] lays it.
 #[test]
 fn a_switch_stands_wherever_it_stood() {
     for (program, build) in [
@@ -1487,21 +1363,10 @@ fn a_switch_stands_wherever_it_stood() {
     }
 }
 
-/// Whether the span's last cell of `line` (a composition laid over its run,
-/// [`line_of`]) is the rule's `─` — the key's mark takes it — and, where a
-/// switch is laid, the one before it too, which keeps the mark off the
-/// switch's trailing blank.
 fn mark_cell_free(line: &[char], span: usize, switch: bool) -> bool {
     span >= 2 && line[span - 1] == '\u{2500}' && (!switch || line[span - 2] == '\u{2500}')
 }
 
-/// THE MARK CELL SURVIVES EVERY RUNG (§5.6, invariant 5): on every rung of
-/// every lockup's ladder (codex-alab's included), in every switch state and
-/// none, at every span
-/// from 6 to 200, the span's last cell is the rule's `─`, and where a
-/// switch is laid the one before it too — so the key's mark (`◐`, `▸`: the
-/// span's last cell, `mark_at`) lands on a `─`, never on the lockup nor
-/// against the switch — and with the mark drawn it is there, in the accent.
 #[test]
 fn the_mark_cell_survives_every_rung() {
     let mut checked = 0;
@@ -1558,7 +1423,6 @@ fn the_mark_cell_survives_every_rung() {
     );
 }
 
-/// The tint's ink at `t` on the gray rule over [`blank`]: hb-int's formula.
 fn tint_at(palette: CardPalette, t: f32) -> [u8; 3] {
     let dark = crate::claude_card::dark_ground(blank());
     let lifted = mix(rgb_of(palette.art(t, dark)), blank().fg, 0.25);
@@ -1570,9 +1434,6 @@ fn tint_at(palette: CardPalette, t: f32) -> [u8; 3] {
     }
 }
 
-/// The seam check: the gap's last `─` and the switch's first glyph share
-/// `t = 0`, the switch's last glyph and the tail share `t = 1` — in the
-/// tint's and the letters' inks of `palette` for `face`.
 fn flows(
     cells: &[RenderCell],
     switch: &LaidSwitch,
@@ -1610,13 +1471,6 @@ fn flows(
     Ok(())
 }
 
-/// THE RULE FLOWS INTO THE SWITCH (§4.3, §1.1): at Claude's 80 columns with
-/// its KEY tag (a span of 68), the `─` before the lockup stand at `t = 1`,
-/// the gap walks from `t = 1` at the lockup down to `t = 0`, so its last `─`
-/// and the switch's first glyph share `t = 0`, and the switch's last glyph
-/// and its tail share `t = 1` ([`flows`]); Cruise's and Land's inks differ in
-/// every tinted and every glyph cell at the same layout; Off's are the
-/// moonbow (`CardPalette::Off`), regular weight, Cruise's bold.
 #[test]
 fn the_rule_flows_into_the_switch() {
     let run = plain_run(68);
@@ -1710,10 +1564,6 @@ fn the_rule_flows_into_the_switch() {
     );
 }
 
-/// THE KEY'S MARKS take the `─` left of the ghost's leading blank or of
-/// Claude's tag's — `◐` while a press runs, `▸` while selected — in the
-/// accent's ink; lit, the ghost's glyphs lift to the value ink and are
-/// underlined, its blanks not.
 #[test]
 fn the_keys_marks_take_the_rule_cell_before_it() {
     let run = plain_run(60);
@@ -1796,13 +1646,6 @@ fn the_keys_marks_take_the_rule_cell_before_it() {
     assert!(rest.cells.is_empty());
 }
 
-/// THE MARK STANDS ONLY WHERE ITS WRITE TOOK (§6.6): the sprite over the
-/// icon's cells goes on the glass after the footer's write, only where
-/// `FooterUndo::took` confirms the top line's — so a frame whose write is
-/// refused (a combining mark landed in the run on the frame the splice
-/// paints again, its rows and its run kept: `write_edits` skips the span)
-/// puts no layer on the frame and records none, though the composition
-/// stands, and the next clean frame lays it again.
 #[test]
 fn the_mark_stands_only_where_its_write_took() {
     let (mut app, wid, session, _host) = held_glass();
@@ -1921,14 +1764,6 @@ fn the_mark_stands_only_where_its_write_took() {
     }
 }
 
-/// THE MARK LEAVES WITH EVERY STRIP (§6.7): after the footer's splice the
-/// mark is on the frame (so the law is not vacuous), recorded in the card's
-/// own record, so the strips that take the card's light back take it too —
-/// the top of the splice (spliced again, it stands once), the capture's
-/// one-pane refill (which runs no footer undo: the refill alone takes it,
-/// and the tab strip's prepend moves nothing stranded), and the top of a
-/// frame on the live path (`redraw_window`, a scripted surface) — bare and
-/// under a tab strip, capture after capture.
 #[test]
 fn the_mark_leaves_with_every_strip() {
     let glass = |tab_strip: u16| {
@@ -2012,9 +1847,6 @@ fn the_mark_leaves_with_every_strip() {
     }
 }
 
-/// The composer's top rule of a measured screen (`aterm-phase`'s fixtures,
-/// `aterm ctl text` of the real CLI): the last `─` line over the caret's
-/// row (`❯`, or agy's `>`), comment lines (`# …`) aside.
 fn measured_top(fixture: &str) -> String {
     let lines: Vec<&str> = fixture.lines().filter(|l| !l.starts_with("# ")).collect();
     let caret = lines
@@ -2024,8 +1856,6 @@ fn measured_top(fixture: &str) -> String {
     lines[caret - 1].trim_end().to_owned()
 }
 
-/// Whether `top` written over `before` (a top rule's frame cells) touches
-/// only `run`'s cells: every other cell byte-identical after.
 fn writes_only_the_run(
     before: &[RenderCell],
     run: TopRun,
@@ -2049,21 +1879,6 @@ fn writes_only_the_run(
     Ok(())
 }
 
-/// MARKS WRITE ONLY THE RUN (§5.6, invariant 1): over the measured top lines
-/// — Claude Code 2.1.304's with its KEY tag at 26, 34, 61, 80, 120 and 144
-/// columns, the plain rule aterm's ghost stands on, agy 1.4.0's full-width
-/// rule, Muse Code 1.4.10's after its `── Voice input (⌥ + v to start) `
-/// label (and 1.4.11's label alone, and cut with `…`, in a pane under 32
-/// columns) and Gemini CLI 0.46.0's full-width live-zone rule (`idle`,
-/// `end-of-turn`, `narrow-end-of-turn`; Codex's slab is
-/// `codex_gets_a_switch_only_as_codex_alab`'s) — each laid out again at every
-/// width from 20 to 160 the CLI draws
-/// it at (and checked to be the fixture's line at the fixture's width), for
-/// every switch and theme the splice pairs ([`CASES`]): every cell
-/// [`compose_top`] writes lies in the run it is laid on ([`laid_run`] of
-/// the run [`read_top_run`] reads; the ghost's own cells aside), so
-/// Claude's tag, the ghost and the `─` after it are byte-identical before
-/// and after.
 #[test]
 fn marks_write_only_the_run() {
     use aterm_phase::Program;
@@ -2287,13 +2102,6 @@ fn marks_write_only_the_run() {
     );
 }
 
-/// THE BARE SWITCH READS ON EVERY GROUND IT IS LAID ON (design §8: every
-/// letter aterm draws reads at 4.5:1 or better): the switch no theme wears
-/// — the master switch off, a claim this host does not hold, a switch
-/// turning on — on every built-in's ground, under the accent of every
-/// built-in's band, since a tab's own theme draws its pane in one theme
-/// while the accent is the instance's (`session_theme`: the window's chrome
-/// follows the instance).
 #[test]
 fn the_bare_switch_reads_on_every_ground() {
     use aterm_effects::color_math::contrast_ratio;
@@ -2380,15 +2188,6 @@ fn the_bare_switch_reads_on_every_ground() {
     );
 }
 
-/// THE THEMED SWITCH READS ON EVERY GROUND IT IS LAID ON (design §8): the
-/// switch a harness theme wears walks its arc ([`SwitchInk::Arc`]) — on, off
-/// under either switch, turning — and each letter reads 4.5:1 on the pane's
-/// ground, not only on the near-black and paper grounds the built-ins ship:
-/// a grey every few steps from black to white under the ink a theme would
-/// give it, and the mid grounds imported themes bring (Silver Aerogel
-/// `#929292` under `#000000`, Unikitty `#ff8cd9` under `#0b0b0b`), which
-/// [`aterm_effects::harness_card::dark_ground`] calls dark though a letter
-/// lifted for the dark law can sit on their own luminance.
 #[test]
 fn the_themed_switch_reads_on_every_ground() {
     use aterm_effects::color_math::contrast_ratio;

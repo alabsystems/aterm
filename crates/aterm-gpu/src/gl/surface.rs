@@ -476,6 +476,20 @@ impl GlWindowSurface {
             }
             Post::Glx { window, xid } => {
                 let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
+                // Asked before the bind: binding has Mesa's drisw ask the size
+                // again unchecked, and a server dying mid-ask leaves llvmpipe an
+                // uninitialized size (SIGSEGV). This checked ask fails instead.
+                let asked = self.ask(glx, *xid);
+                if asked == (0, 0) {
+                    if let Some(why) = glx.hung_up_reason() {
+                        cur.shared().latch_lost(why);
+                        return Err(why.into());
+                    }
+                    return Err(GlPresentError {
+                        kind: SurfacePresentFailure::Unavailable,
+                        detail: "gl: the X server answered no size for the window".to_owned(),
+                    });
+                }
                 if let Err(e) = glx.bind_window(*window) {
                     self.bind_failures = self.bind_failures.saturating_add(1);
                     let context_binds = glx.make_current().is_ok();
@@ -507,7 +521,7 @@ impl GlWindowSurface {
                         .unwrap_or_else(note);
                     self.interval_set = true;
                 }
-                self.ask(glx, *xid)
+                asked
             }
             Post::Readback { .. } => unreachable!("posted by readback above"),
         };
@@ -533,8 +547,13 @@ impl GlWindowSurface {
                 Post::Readback { .. } => unreachable!("posted by readback above"),
             };
             let glx = cur.glx().ok_or("gl: a GLX window on an EGL device")?;
-            glx.swap(window);
-            if reposts == REPOSTS || self.ask(glx, xid) == asked {
+            if let Err(e) = glx.swap(window) {
+                cur.shared().latch_lost(&e);
+                return Err(e.into());
+            }
+            // An unanswered ask binds nothing: the next present's ask finds why.
+            let now = self.ask(glx, xid);
+            if reposts == REPOSTS || now == asked || now == (0, 0) {
                 return Ok(());
             }
             if glx

@@ -10991,7 +10991,13 @@ mod encode_worker_tests {
                 window_peak,
                 "the window estimate is its stitch's charge"
             );
+            // The AppKit chrome and outer shape cost more than a frame; a
+            // Windows stitch carries neither, so its client copy and row
+            // fit inside the encoder's own peak.
+            #[cfg(target_os = "macos")]
             assert!(window_peak > frame_capture_peak(width, height, None));
+            #[cfg(windows)]
+            assert_eq!(window_peak, frame_capture_peak(width, height, None));
             let (_, in_flight, _queued) = feed_a_blocked_encoder(
                 &mut app,
                 |app| app.admit_capture(Some(wid), CaptureCharge::Window),
@@ -14810,6 +14816,12 @@ mod headless_settings_preview_capture_tests {
         renderer.set_runtime_font_discovery(false);
         crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
         let mut app = App::headless_for_test();
+        // The cursor preview loops while a trail draws, which Windows keeps
+        // off until one is chosen.
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            crate::app_config::trail_drawn(""),
+        )
+        .unwrap();
         app.lat_epoch = Instant::now();
         {
             let window = app.windows.get_mut(&WID).unwrap();

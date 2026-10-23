@@ -974,6 +974,11 @@ pub(super) fn sheet_list_least(state: &SettingsViewState, column_width: f32) -> 
     captioned_row.max(colour_picker).max(slot_picker)
 }
 
+/// Whether [`sheet_blocks`] reads its room: only an open picker, a colour row's or the palette slot's, is sized by it.
+pub(super) fn sheet_sized_by_room(state: &SettingsViewState) -> bool {
+    state.open_color_picker().is_some() || state.showcase.slot.is_some()
+}
+
 /// The sheet's blocks, in order: the colour rows under COLORS (each on one line, or its name over its field, as `one_line` says), the palette under PALETTE, then Save as theme, for a list `room` tall: an open colour picker is sized so its block is one stop of it, with the row (or the palette slot) it sets.
 pub(super) fn sheet_blocks(
     state: &SettingsViewState,

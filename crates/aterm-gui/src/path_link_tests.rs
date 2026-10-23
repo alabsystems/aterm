@@ -10,7 +10,6 @@ fn chars(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
-/// The span under every column of the citation, and `None` off it.
 fn span_at(row: &str, col: usize) -> Option<(String, Option<u32>, Option<u32>)> {
     find_path_span(&chars(row), col).map(|s| (s.path, s.line, s.col))
 }
@@ -23,8 +22,6 @@ fn some(
     Some((path.to_string(), line, col))
 }
 
-/// A scratch directory with `src/foo.rs` (five lines), a directory and a
-/// symlink, canonicalized so `/tmp` and `/private/tmp` agree.
 struct Scratch {
     _dir: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -204,12 +201,6 @@ fn refusals_missing_directory_bundle_unreadable_control_and_no_base() {
     }
 }
 
-/// Every control (`Cc`), format (`Cf`) and default-ignorable character is
-/// refused, even where a file of that name exists on disk: one sample from
-/// each listed range, at both ends of each. NEGATIVE CONTROL: visible
-/// non-ASCII names (an accent, CJK, an emoji, Arabic and Hangul letters next
-/// to the refused marks and fillers) resolve, so the rule is not "anything
-/// outside ASCII".
 #[test]
 fn every_control_format_and_default_ignorable_character_is_refused() {
     let s = Scratch::new();
@@ -309,9 +300,6 @@ fn a_link_to_a_name_the_caption_could_not_show_is_refused() {
     );
 }
 
-/// The remote shells by their program word, as `status program=` (an argv[0]
-/// basename) and `detail=` (the running command) spell them. NEGATIVE
-/// CONTROL: local shells, agents and look-alike names are not remote.
 #[test]
 fn the_remote_shells_are_named_by_their_program_word() {
     for remote in [
@@ -373,9 +361,6 @@ fn a_symlink_is_resolved_to_its_target_and_a_link_to_a_directory_is_refused() {
     );
 }
 
-/// A Windows program's citation reads whole: the drive's colon is no line
-/// suffix, and the line and column after the path are. Where a backslash
-/// separates (Windows) a name with no extension reads as a path too.
 #[test]
 fn a_windows_citation_names_its_drive_path_line_and_column() {
     let row = r"error: C:\proj\src\main.rs:12:5 here";
@@ -392,7 +377,6 @@ fn a_windows_citation_names_its_drive_path_line_and_column() {
     );
 }
 
-/// `src/foo.rs` as this host writes it: `src\foo.rs` on Windows.
 fn src_foo() -> String {
     Path::new("src").join("foo.rs").display().to_string()
 }
@@ -414,11 +398,6 @@ fn the_caption_names_the_file_relative_to_the_session_or_home() {
     assert!(!whole.starts_with(r"\\?\"), "{whole}");
 }
 
-/// The caption writes a whole path as a shell prints it: on Windows without
-/// the `\\?\` prefix `canonicalize` gives every resolved file, a drive's
-/// path and a share's alike. CONTROL: a verbatim path that names no drive
-/// or share has no shorter spelling and is kept whole; elsewhere every path
-/// is kept as it is.
 #[test]
 fn the_caption_writes_a_path_without_the_verbatim_prefix() {
     let disk = Path::new(r"\\?\C:\proj\src\foo.rs");
@@ -435,11 +414,6 @@ fn the_caption_writes_a_path_without_the_verbatim_prefix() {
     assert_eq!(plain_text(Path::new("/tmp/x.rs")), "/tmp/x.rs");
 }
 
-/// The caption names a file where it really is, never relative to one of the
-/// session's directories (which the band does not show): the same printed
-/// citation found in two projects reads differently, so a caption that reads
-/// alike names one file. NEGATIVE CONTROL: under home the name is `~/…`, and
-/// an absolute citation under a directory of `/` is named in full.
 #[test]
 fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
     let s = Scratch::new();
@@ -467,11 +441,6 @@ fn the_caption_names_the_file_where_it_is_never_relative_to_a_directory() {
     assert_eq!(absolute.shown, printed);
 }
 
-/// An emoji presentation selector (U+FE0F) after a character it turns into
-/// an emoji changes what is drawn, so a name keeps it (`☁️`, `❤️`, `1️⃣`).
-/// NEGATIVE CONTROLS: the same selector after a letter or after an emoji
-/// already drawn as one changes nothing on screen, and a zero-width joiner
-/// can hide a character: all three are refused, on disk or not.
 #[test]
 fn an_emoji_selector_that_changes_the_glyph_is_kept_and_any_other_refused() {
     let s = Scratch::new();
@@ -525,11 +494,6 @@ fn a_link_to_a_name_that_is_not_utf8_is_refused() {
     );
 }
 
-/// A cwd report stands under the group in front when the sweep first saw
-/// it: an ssh's remote report says nothing once the shell is back in front.
-/// A report newer than the sweep's last look stands (it may be the
-/// remote's), and so does every report while no sweep has seen one.
-/// NEGATIVE CONTROL: a carried cwd (no report this engine saw) never stands.
 #[test]
 fn a_cwd_report_stands_only_under_the_group_it_was_seen_under() {
     let (shell, ssh) = (100, 200);
@@ -563,11 +527,6 @@ fn a_cwd_report_stands_only_under_the_group_it_was_seen_under() {
     }
 }
 
-/// The sweep names the group a report is held to only when the front held
-/// still: the same group at the sweep before and under the report's own read.
-/// A remote shell's report first seen after its ssh exited is held to no
-/// group. NEGATIVE CONTROLS: a report first seen under a front that held still
-/// is held to it, and a later look at the same report changes nothing.
 #[test]
 fn a_report_seen_as_the_front_moved_is_held_to_no_group() {
     let (shell, ssh) = (100, 200);
@@ -596,14 +555,6 @@ fn a_report_seen_as_the_front_moved_is_held_to_no_group() {
     assert_eq!(tl.cwd_witness(), Some((4, shell)), "control: held still");
 }
 
-/// The program in front runs here when aterm names it a shell the person
-/// types into or an identified agent: an
-/// allow-list, so a remote shell, a multiplexer, a wrapper with its own
-/// terminal and a name not resolved yet need no list to be refused. A shell
-/// counts only alone in the group it leads and still a shell by the kernel's
-/// name, and the root shell not while its integration runs a command.
-/// NEGATIVE CONTROLS: each of those refusals, Claude Code's screen read under
-/// `ssh` (a remote one), and an unidentified runtime.
 #[test]
 fn only_a_shell_alone_or_an_identified_agent_runs_here() {
     let front = |program: Option<&'static str>, agent: Option<aterm_phase::Program>| Front {
@@ -687,9 +638,6 @@ fn only_a_shell_alone_or_an_identified_agent_runs_here() {
     );
 }
 
-/// The UI's look ([`Looks`]): one not back within its wait is no link yet,
-/// and once back its answer is what the next ask reads. A zero wait is the
-/// slow mount: the asker never waits for the filesystem at all.
 #[test]
 fn a_look_not_back_in_time_is_no_link_yet_and_its_answer_is_kept() {
     let s = Scratch::new();
@@ -768,7 +716,6 @@ fn a_line_and_column_land_on_the_right_byte() {
     assert_eq!(line_col_offset("", 5, Some(5)), 0);
 }
 
-/// One xorshift64* step: deterministic, no dependency, no clock.
 fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
     move || {
         state ^= state >> 12;
@@ -778,13 +725,6 @@ fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
     }
 }
 
-/// THE PROPERTY: no path link ever reaches `open_url_external`. Over random
-/// rows mixing real citations (of files that exist), URLs of every scheme,
-/// `file:` URIs, `.app` bundles, directories, words and punctuation, the one
-/// decision a click takes ([`decide`]) returns [`LinkAction::External`] only
-/// for the URL the URL reader found, and only when `is_safe_url` admits it:
-/// whatever a row holds, a citation's only action is aterm's own editor. An
-/// OSC 8 link with a refused scheme over a citation opens nothing at all.
 #[test]
 fn no_path_link_ever_reaches_open_url_external() {
     let s = Scratch::new();

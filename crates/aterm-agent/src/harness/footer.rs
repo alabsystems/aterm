@@ -110,7 +110,7 @@ pub struct FooterFacts {
     pub model_open: bool,
     /// Nothing since the process started decided the effort.
     pub effort_open: bool,
-    /// While [`Self::effort_open`].
+    /// While [`Self::effort_open`]: the model a launch card must name for its effort to count.
     pub effort_for: Option<String>,
     /// Whose facts these are, when the registry named a session.
     pub owner: Option<FactsOwner>,
@@ -270,7 +270,7 @@ pub enum LaunchResume {
     Unnamed,
 }
 
-/// What `argv` (argv[0] included) says about the model.
+/// What `argv` (`argv[0]` included) says about the model.
 #[must_use]
 pub fn launch_facts(argv: &[String]) -> LaunchFacts {
     launch_facts_of(argv, &[])
@@ -3023,7 +3023,9 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
                     {
                         "weekly 0% left".into()
                     } else {
-                        "weekly unavailable".into()
+                        s.weekly_gap
+                            .map_or("weekly unavailable", super::profile::WeeklyGap::words)
+                            .into()
                     }
                 })
             }),
@@ -3681,6 +3683,11 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             out.push(short);
         }
     }
+    let mut narrow = rung.clone();
+    shorten_subscription_account(&mut narrow, 8);
+    if narrow_subscription_weekly(&mut narrow) && out.last() != Some(&narrow) {
+        out.push(narrow);
+    }
     if let Some(wall) = rung.iter().find(|s| s.mark == WALL_MARK).cloned() {
         out.push(vec![wall]);
         let mut without_wall = facts.clone();
@@ -3707,6 +3714,19 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
     true
 }
 
+/// Narrow the weekly segment to its narrow form ([`super::profile::narrow_weekly`]: an aged
+/// figure keeps its age, a reason its `weekly ?`), where it has one.
+fn narrow_subscription_weekly(segments: &mut [Segment]) -> bool {
+    let Some(weekly) = segments.iter_mut().find(|s| s.mark == WEEKLY_MARK) else {
+        return false;
+    };
+    let Some(text) = super::profile::narrow_weekly(&weekly.text) else {
+        return false;
+    };
+    weekly.text = text;
+    true
+}
+
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
     let segments = fact_segments(facts, false);
     let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();
@@ -3715,6 +3735,7 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
         .filter(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK))
         .collect();
     shorten_subscription_account(&mut essentials, 8);
+    narrow_subscription_weekly(&mut essentials);
     let with_wall: Vec<_> = wall.iter().cloned().chain(essentials.clone()).collect();
     [with_wall.as_slice(), wall.as_slice(), essentials.as_slice()]
         .into_iter()

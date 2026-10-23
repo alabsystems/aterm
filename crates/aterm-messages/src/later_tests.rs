@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for `notice later` digest entries, dismissal retention, `done`, caps, and browser actions.
+//! Tests for `notice later` digest entries, dismissal retention, conditional settlement, caps, and browser actions.
 
 use crate::center::MessageCenter;
 use crate::exceptions::{Entry, Family};
@@ -210,7 +210,7 @@ fn notice_later_parses_its_form_and_refuses_junk() {
     assert!(
         NoticeRequest::parse("frobnicate x")
             .unwrap_err()
-            .starts_with("usage: notice <post|progress|done|ask|later|")
+            .starts_with("usage: notice <")
     );
 }
 
@@ -439,6 +439,183 @@ fn notice_done_ends_a_later_entry() {
         let other_quiet = notice(&mut c, &mut g, &other_line, 4 * DAY_MS, now);
         assert_eq!(later_reply(&other_quiet), (other, "quiet".into()));
     }
+}
+
+fn settle_line(id: MessageId, revision: u64) -> String {
+    format!("settle codex.security-setup.0123abcd {id} {revision}")
+}
+
+#[test]
+fn notice_settle_requires_a_complete_observation() {
+    assert!(matches!(
+        NoticeRequest::parse("settle codex.security-setup.0123abcd 1 0"),
+        Ok(NoticeRequest::Settle { revision: 0, .. })
+    ));
+    for bad in [
+        "settle",
+        "settle k",
+        "settle k 1",
+        "settle k 0 1",
+        "settle k -1 1",
+        "settle k 1 -1",
+        "settle k 1 +1",
+        "settle k 1 18446744073709551616",
+        "settle k 1 1 extra",
+    ] {
+        assert!(NoticeRequest::parse(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn notice_settle_ends_only_the_observed_open_entry() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let revision = c.digest_revision();
+    let rows = crate::wire::message_rows(
+        &c,
+        &crate::wire::parse_read_args("live need=later tag=codex").unwrap(),
+        T0_MS,
+        &str::to_string,
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].ends_with(&format!(" rev={revision}")), "{rows:?}");
+    let done = notice(&mut c, &mut g, &settle_line(id, revision), DAY_MS, now);
+    assert_eq!(done.reply, format!("OK settled={id} how=resolved-ok"));
+    assert_eq!((done.paint, done.note), (Paint::None, true));
+    assert!(c.digest().is_empty());
+    let repeated = notice(&mut c, &mut g, &settle_line(id, revision), DAY_MS, now);
+    assert_eq!(repeated.reply, "OK settled=- how=gone");
+    assert!(!repeated.note);
+    assert_eq!(
+        later_reply(&notice(&mut c, &mut g, SETUP, 2 * DAY_MS, now)).1,
+        "new"
+    );
+}
+
+#[test]
+fn conditional_settlement_never_forgets_a_persons_filing() {
+    let now = Instant::now();
+    for press in [false, true] {
+        let (mut c, mut g) = fresh(now);
+        let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+        let observed_revision = c.digest_revision();
+        if press {
+            assert!(
+                c.act_digest(id, ActionIndex(0), wall(DAY_MS), now)
+                    .is_some()
+            );
+        } else {
+            notice(&mut c, &mut g, &format!("dismiss {id}"), DAY_MS, now);
+        }
+        let after_filing = c.projection_revision();
+        // Even a caller supplying the latest revision cannot turn a filed id
+        // back into an open entry or discard the person's retained dismissal.
+        for revision in [observed_revision, c.digest_revision()] {
+            let gone = notice(&mut c, &mut g, &settle_line(id, revision), 2 * DAY_MS, now);
+            assert_eq!(gone.reply, "OK settled=- how=gone");
+            assert_eq!((gone.paint, gone.note), (Paint::None, false));
+            assert_eq!(c.projection_revision(), after_filing);
+        }
+        assert_eq!(
+            later_reply(&notice(&mut c, &mut g, SETUP, 3 * DAY_MS, now)),
+            (id, "quiet".into())
+        );
+    }
+}
+
+#[test]
+fn conditional_settlement_rejects_reopened_or_restated_entries() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let observed_revision = c.digest_revision();
+    let changed = SETUP.replace(
+        "Finish the setup in your browser",
+        "Review the setup in your browser",
+    );
+    let (same_id, how) = later_reply(&notice(&mut c, &mut g, &changed, DAY_MS, now));
+    assert_eq!(same_id, id);
+    assert_eq!(how, "restated");
+    assert_ne!(c.digest_revision(), observed_revision);
+    let gone = notice(
+        &mut c,
+        &mut g,
+        &settle_line(id, observed_revision),
+        DAY_MS,
+        now,
+    );
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert!(c.digest_entry(id).is_some());
+
+    notice(
+        &mut c,
+        &mut g,
+        "done codex.security-setup.0123abcd",
+        2 * DAY_MS,
+        now,
+    );
+    let (new_id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 3 * DAY_MS, now));
+    assert_ne!(new_id, id);
+    let latest_revision = c.digest_revision();
+    let gone = notice(
+        &mut c,
+        &mut g,
+        &settle_line(id, latest_revision),
+        3 * DAY_MS,
+        now,
+    );
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert!(
+        c.digest_entry(new_id).is_some(),
+        "the newer occurrence stays open"
+    );
+    let wrong_key = format!("settle another {new_id} {latest_revision}");
+    assert_eq!(
+        notice(&mut c, &mut g, &wrong_key, 3 * DAY_MS, now).reply,
+        "OK settled=- how=gone"
+    );
+    assert!(c.digest_entry(new_id).is_some());
+}
+
+#[test]
+fn conditional_settlement_leaves_progress_and_unrelated_entries_alone() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let revision = c.digest_revision();
+    own_entry(&mut c, "other", DAY_MS, now);
+    let gone = notice(&mut c, &mut g, &settle_line(id, revision), DAY_MS, now);
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert_eq!(c.digest().len(), 2);
+    let revision = c.digest_revision();
+    notice(&mut c, &mut g, &settle_line(id, revision), DAY_MS, now);
+    assert_eq!(c.digest().len(), 1, "the unrelated owner entry remains");
+
+    notice(
+        &mut c,
+        &mut g,
+        "progress codex.security-setup.0123abcd busy Securing the account",
+        2 * DAY_MS,
+        now,
+    );
+    let progress = c
+        .live_by_key("wire.codex.security-setup.0123abcd")
+        .unwrap()
+        .id;
+    let revision = c.digest_revision();
+    let gone = notice(
+        &mut c,
+        &mut g,
+        &settle_line(progress, revision),
+        2 * DAY_MS,
+        now,
+    );
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert!(
+        c.live(progress).is_some(),
+        "only open digest entries can settle"
+    );
 }
 
 #[test]

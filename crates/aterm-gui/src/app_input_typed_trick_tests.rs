@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 use super::{TrickLineFire, classify_press};
 use crate::input::{InputEvent, PasteFraming, Source};
 use crate::{App, WindowId, term_lock};
@@ -44,9 +43,6 @@ fn type_word(app: &mut App, wid: WindowId, word: &str) {
     }
 }
 
-/// Fixture: the resident pet on glass, the sparkle master on, Full motion,
-/// and one capture so the word engine holds a caret for the front session
-/// (the flash stores nothing for a pane it has never scanned).
 fn pet_app() -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -66,14 +62,10 @@ fn pending(app: &App, wid: WindowId) -> Option<Trick> {
     app.windows[&wid].fx.companion().brain().pending_trick()
 }
 
-/// Where the trick flash stands, read at `t0`: an instant the test took
-/// before its first key.
 fn flash(app: &App, wid: WindowId, t0: Instant) -> TrickFlashPhase {
     app.windows[&wid].fx.decos().trick_flash_phase(t0)
 }
 
-/// Whether the pet grieves a failed command (12 ms long), judged at `typed`:
-/// an instant the test took before the line's keys.
 fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
     crate::app_render::pet_fails_a_command_for_test(
         app.windows.get_mut(&wid).expect("window"),
@@ -82,8 +74,6 @@ fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
     )
 }
 
-/// The line-abort set is exactly ⌃C ⌃Z ⌃\ ⌃J ⌃M with Ctrl and no Alt or
-/// Super; Shift does not disqualify (⌃⇧C is 0x03 too).
 #[test]
 fn classify_press_marks_the_ctrl_abort_chords_as_line_abort_and_nothing_else() {
     for c in ['c', 'z', '\\', 'j', 'm'] {
@@ -143,9 +133,6 @@ fn classify_press_marks_the_ctrl_abort_chords_as_line_abort_and_nothing_else() {
     assert!(!classify_press(&key('z')).job_chord);
 }
 
-/// `sit␣` through the real press path: the pet's latch holds `Sit` (a
-/// request, not yet performed) and the flash is pending, noted before the
-/// Space's echo could be scanned.
 #[test]
 fn typing_sit_and_a_space_latches_the_pet_and_notes_the_flash() {
     let t0 = Instant::now();
@@ -174,9 +161,6 @@ fn typing_sit_and_a_space_latches_the_pet_and_notes_the_flash() {
     );
 }
 
-/// A committed IME run is typed text: `sit ` as one commit fires at the
-/// space inside it, and a commit's end is not a boundary (`si` committed,
-/// then `t` and Space typed, is still `sit␣`).
 #[test]
 fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
     let t0 = Instant::now();
@@ -200,9 +184,6 @@ fn an_ime_commit_is_typed_text_and_its_end_is_not_a_boundary() {
     );
 }
 
-/// A name glued to its command, as an IME commits an unspaced script, is a
-/// guess: `猫咪坐下␣` latches and flashes nothing, and prose after it drops it
-/// unheard.
 #[test]
 fn a_name_glued_to_its_command_by_ime_commit_waits_for_a_name_or_enter() {
     let t0 = Instant::now();
@@ -238,8 +219,6 @@ fn a_name_glued_to_its_command_by_ime_commit_waits_for_a_name_or_enter() {
     }
 }
 
-/// ⇧⏎ is an Enter to the listener (`enter_like` is any Enter press): the
-/// line is judged and submitted exactly as the bare key does it.
 #[test]
 fn shift_enter_submits_the_line_like_enter() {
     let (mut app, wid, _) = pet_app();
@@ -263,10 +242,6 @@ fn shift_enter_submits_the_line_like_enter() {
     );
 }
 
-/// Typed provenance only: program output full of `sit`, a paste of `sit `,
-/// and a controller's raw `send` bytes reach the terminal, not the
-/// listener; raw bytes ending in a newline after a typed `sit` reset the
-/// line without judging it (the shell got `sitxyz`).
 #[test]
 fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
     let t0 = Instant::now();
@@ -322,8 +297,6 @@ fn program_output_a_paste_and_raw_controller_bytes_never_command_the_cat() {
     );
 }
 
-/// A controller `key` is a keypress: `aterm ctl key` types `sit␣` exactly
-/// like a hand (no `src` branch anywhere on this path).
 #[test]
 fn a_controller_key_commands_exactly_like_a_human_key() {
     let (mut app, wid, _) = pet_app();
@@ -335,9 +308,6 @@ fn a_controller_key_commands_exactly_like_a_human_key() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 }
 
-/// `sit⏎`: Enter judges the open token (one final fire) and reports a
-/// pet-only line, which the host turns into exit-127 forgiveness: the
-/// shell's fast `command not found` does not grieve the cat.
 #[test]
 fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
     let (mut app, wid, _) = pet_app();
@@ -370,12 +340,8 @@ fn enter_on_sit_submits_a_pet_only_line_the_cat_forgives() {
     );
 }
 
-/// One row of the gate table: the gate's name and the config edit that
-/// closes it.
 type GateCase = (&'static str, fn(&mut App));
 
-/// The four gates, each inert alone: the sparkle master off, the tricks
-/// sub-table off, Serious Mode, and a word on `ignore_words`.
 #[test]
 fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
     let t0 = Instant::now();
@@ -451,9 +417,6 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
     }
 }
 
-/// A withheld fire is never confirmed, by the pet's name either: `sit` on
-/// `ignore_words`, then `kitty␣`; the listener confirms, the host's memory
-/// says withheld, the pet stays deaf, and the memory is not upgraded.
 #[test]
 fn a_withheld_fire_is_not_confirmed_by_naming_the_pet() {
     let t0 = Instant::now();
@@ -486,9 +449,6 @@ fn a_withheld_fire_is_not_confirmed_by_naming_the_pet() {
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
 }
 
-/// The gate is read at every event: a fire admitted with tricks on, then a
-/// config generation turning them off mid-line; the confirming `kitty␣`
-/// reaches no pet.
 #[test]
 fn a_gate_closed_mid_line_blocks_the_confirmation_of_an_admitted_fire() {
     let (mut app, wid, session) = pet_app();
@@ -522,11 +482,6 @@ fn a_gate_closed_mid_line_blocks_the_confirmation_of_an_admitted_fire() {
     assert!(!app.windows[&wid].fx.companion().brain().trick_engaged());
 }
 
-/// An erased line forgets its fire. `kitty sit␣` withheld (an ignored word,
-/// addressed, so no tentative fire to revoke), then ten Backspaces (the
-/// listener reports the line empty), then `kitty⏎`: a pet-only line the cat
-/// forgives, because the remembered fire was on text that no longer
-/// exists.
 #[test]
 fn an_erased_line_forgets_its_withheld_fire() {
     let (mut app, wid, session) = pet_app();
@@ -567,9 +522,6 @@ fn an_erased_line_forgets_its_withheld_fire() {
     );
 }
 
-/// `ignore_words` reads a fire's word and its command. A name glued to its
-/// command fires the whole run, so listing `坐下` holds back `坐下`,
-/// `猫咪坐下` and `坐下猫咪` alike, and listing the run holds back the run.
 #[test]
 fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     let t0 = Instant::now();
@@ -605,9 +557,6 @@ fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     }
 }
 
-/// The memory of a fire is keyed to its session. `sit␣` withheld on tab A,
-/// then `kitty⏎` on tab B's first, pure line: B's pet-only submit is
-/// forgiven.
 #[test]
 fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
     let (mut app, wid, session_a) = pet_app();
@@ -659,8 +608,6 @@ fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
     assert_eq!(pending(&app, wid), None, "…so nothing fires there");
 }
 
-/// The gates do not need the pet: with only the flying kitty (or no trail)
-/// on glass, a typed command flashes and nothing is latched.
 #[test]
 fn with_no_pet_on_glass_a_typed_command_only_flashes() {
     let t0 = Instant::now();
@@ -682,9 +629,6 @@ fn with_no_pet_on_glass_a_typed_command_only_flashes() {
     }
 }
 
-/// Tentative, then prose: `sit␣` fires tentatively; `tight␣` makes the line
-/// impure, and the revoke reaches both consumers: the pet's latch and the
-/// unfound flash are dropped.
 #[test]
 fn a_tentative_command_followed_by_prose_is_revoked_on_both_consumers() {
     let t0 = Instant::now();
@@ -702,9 +646,6 @@ fn a_tentative_command_followed_by_prose_is_revoked_on_both_consumers() {
     assert_eq!(app.windows[&wid].trick_fire, TrickLineFire::None);
 }
 
-/// Addressed, then confirmed: `kitty sit␣` is final at once, and a
-/// tentative `sit␣` followed by the pet's name is confirmed, the host
-/// upgrading its memory so a later revoke spares the flash.
 #[test]
 fn naming_the_pet_makes_the_command_final() {
     let (mut app, wid, session) = pet_app();
@@ -747,8 +688,6 @@ fn naming_the_pet_makes_the_command_final() {
     );
 }
 
-/// Look never wins a phrase: `hey kitty sit` leaves the pet holding a
-/// confirmed sit, and `pspsps kitty jump` a confirmed jump.
 #[test]
 fn the_verb_after_a_greeting_is_the_request() {
     for (line, want) in [
@@ -779,9 +718,6 @@ fn the_verb_after_a_greeting_is_the_request() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit), "negative control");
 }
 
-/// A present the motion policy demotes ends a pending kitty flash: its tick
-/// is unpaintable, and an unpaintable tick drops the slot
-/// (`TrickFlash::emit`).
 #[test]
 fn a_demoted_present_ends_a_pending_kitty_flash() {
     for (label, motion, late, fate) in [
@@ -819,9 +755,6 @@ fn a_demoted_present_ends_a_pending_kitty_flash() {
     }
 }
 
-/// The flash of an addressed fire is never taken back by a revoke: the
-/// pet's `revoke_trick` is forwarded (a no-op on a confirmed latch), the
-/// flash finishes, and the memory ends.
 #[test]
 fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     let t0 = Instant::now();
@@ -856,8 +789,6 @@ fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     assert_eq!(ws.fx.companion_mut().brain().pending_trick(), None);
 }
 
-/// ⌃C and ⌃U reset the line (fresh and pure), so an abandoned typo does not
-/// block the next command; Esc and an arrow poison it until a reset.
 #[test]
 fn ctrl_c_and_ctrl_u_reset_the_line_where_esc_only_poisons_it() {
     let t0 = Instant::now();
@@ -905,8 +836,6 @@ fn ctrl_c_and_ctrl_u_reset_the_line_where_esc_only_poisons_it() {
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Idle);
 }
 
-/// A word-kill on the open token clears just the token (`sot` ⌃W `sit␣`
-/// fires); ⌃K and forward Delete do nothing to the line at all.
 #[test]
 fn a_word_kill_clears_the_token_and_forward_kills_are_no_ops() {
     let (mut app, wid, _) = pet_app();
@@ -933,10 +862,6 @@ fn a_word_kill_clears_the_token_and_forward_kills_are_no_ops() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 }
 
-/// ⌃Z and ⌃\ reset only a line the listener can prove is empty. At a prompt
-/// shells ignore them and keep the half-typed line, so `sot` ⌃Z `sit␣` is
-/// `sotsit ` and must not fire (the line is poisoned until ⌃C), and a
-/// tentative fire they interrupt is taken back.
 #[test]
 fn a_job_chord_resets_only_a_provably_empty_line_and_breaks_any_other() {
     let t0 = Instant::now();
@@ -1000,9 +925,6 @@ fn a_job_chord_resets_only_a_provably_empty_line_and_breaks_any_other() {
     }
 }
 
-/// ⌃L is nothing to the line: the screen clears and the line is redrawn, so
-/// an interrupted command still completes, a fire it follows is neither
-/// revoked nor confirmed, and the line after a clear is heard.
 #[test]
 fn a_screen_clear_keeps_the_line() {
     let t0 = Instant::now();
@@ -1036,9 +958,6 @@ fn a_screen_clear_keeps_the_line() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit), "cleared, then `sit␣`");
 }
 
-/// The pet obeys without the word engine: with every sparkle family off
-/// (the master on) nothing can flash, and `sit␣` still latches the pet, as
-/// `aterm help kitty` promises.
 #[test]
 fn with_every_sparkle_family_off_a_typed_command_moves_the_pet_and_cannot_flash() {
     let t0 = Instant::now();
@@ -1131,9 +1050,6 @@ fn a_no_echo_prompt_poisons_the_line_and_its_enter_resets_it() {
     }
 }
 
-/// Serious Mode's drain resets the pet and ends the memory of the fire, but
-/// leaves the line to the listener (fed on every press, it still knows the
-/// line).
 #[test]
 fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener() {
     let t0 = Instant::now();
@@ -1199,7 +1115,6 @@ fn the_serious_drain_drops_the_hosts_memory_and_leaves_the_line_to_the_listener(
     );
 }
 
-/// The introspection renderer declares the snapshot's row origin.
 #[test]
 fn a_headless_capture_declares_base_y_so_the_scrolled_flash_finds_the_typed_line() {
     let (mut app, wid, session) = pet_app();

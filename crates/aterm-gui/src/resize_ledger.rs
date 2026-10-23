@@ -307,7 +307,7 @@ pub(crate) struct LedgerRow {
     pub(crate) run: u64,
 }
 
-/// A maximal sequence of adjoining resizes (see the module note).
+/// A maximal sequence of adjoining resizes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Run {
     pub(crate) id: u64,
@@ -527,7 +527,8 @@ impl Transition {
         }
     }
 
-    /// The timeline payload, which is also the pushed EVENT's tail.
+    /// A test's reading of the transition in its `render` row's words, which are also the pushed EVENT's tail.
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> String {
         match *self {
             Self::Risk {
@@ -1062,7 +1063,7 @@ impl ResizeLedger {
     }
 }
 
-/// A resize joins `run`, which `prev` ended (see the module note, RUNS),
+/// A resize joins `run`, which `prev` ended,
 /// when it came at most [`RUN_GAP_MS`] after `prev` with nothing changed on
 /// the screen between them, or with `run` `silent` and this resize taking
 /// `prev` back (`to` is `prev`'s `from`: a flap's second half), whatever was

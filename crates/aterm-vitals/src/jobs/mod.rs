@@ -501,8 +501,7 @@ pub struct JobTick {
     pub self_uid: Option<u32>,
     /// The cheap sweep of every process.
     pub sweep: Vec<SweepProc>,
-    /// The detailed readings of what [`Jobs::plan`] asked for (a process gone
-    /// or refused meanwhile is simply absent).
+    /// The detailed readings of what [`Jobs::plan`] asked for (a process gone or refused meanwhile is simply absent).
     pub procs: Vec<JobProc>,
     /// Every tab.
     pub tabs: Vec<JobTab>,

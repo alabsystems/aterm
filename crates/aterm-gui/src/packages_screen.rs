@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings ▸ Packages read projection, the toolchain-package analogue of [`crate::update_screen`].
+//! The Settings ▸ Packages read projection.
 
 use crate::native_ui::FACT_SEPARATOR;
 
@@ -14,7 +14,7 @@ pub(crate) enum PackagesBusy {
     Install,
     /// `atpkg uninstall --all` — remove the whole managed toolset, reclaiming its disk.
     Uninstall,
-    /// `atpkg machine apply`: the `[machine]` host setting (Universal Control off), applied from the Security page's "Apply Now".
+    /// `atpkg machine apply`.
     MachineApply,
 }
 
@@ -43,7 +43,7 @@ impl PackagesBusy {
     }
 }
 
-/// The final result of the co-located `atpkg` process, distinct from the UI-thread admission result, so an old successful `status.toml` cannot pass for the outcome of a process that failed to launch or exited non-zero.
+/// The final result of the co-located `atpkg` process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PackagesCommandOutcome {
     Succeeded {
@@ -84,9 +84,11 @@ impl PackagesCommandOutcome {
 pub(crate) struct PackagesWorkerCompletion {
     pub(crate) report: PackagesStatusReport,
     pub(crate) command: Option<PackagesCommandOutcome>,
-    /// The `atpkg machine: …` verdict a [`PackagesBusy::MachineApply`] worker read off the child's stdout (`applied — …` / `nothing changed — …`), quoted by the status and the feedback line.
+    /// The `atpkg machine: …` verdict a [`PackagesBusy::MachineApply`] worker read off the child's
+    /// stdout (`applied — …` / `nothing changed — …`).
     pub(crate) machine_verdict: Option<String>,
-    /// The `machine-state:` record a [`PackagesBusy::MachineApply`] worker read off the child's stdout.
+    /// The `machine-state:` record a [`PackagesBusy::MachineApply`] worker read off the child's
+    /// stdout.
     pub(crate) machine_state: Option<atpkg::machine::MachineState>,
 }
 
@@ -138,11 +140,11 @@ pub(crate) struct PackagesProgramRow {
     pub(crate) state: String,
     /// The same line, parsed through `atpkg::state`'s own readers — never a second spelling.
     pub(crate) kind: ProgramStateKind,
-    /// Vendor / license / size for an agent program, from atpkg's authored roster line (`atpkg::stub::describe`).
+    /// Vendor / license / size for an agent program.
     pub(crate) facts: Option<VendorFacts>,
     /// Source annotation: `Some("dev-link → /path")` for a dev-linked checkout.
     pub(crate) annotation: Option<String>,
-    /// The upstream an ALab build is based on, in `which`'s words (`based on upstream rust-v0.163.0+g0123456789ab`, [`atpkg::alab::Upstream::words`]).
+    /// The upstream an ALab build is based on.
     pub(crate) upstream: Option<String>,
     /// Version, source, last updated and latest known.
     pub(crate) update: ProgramUpdate,
@@ -159,7 +161,7 @@ pub(crate) struct ProgramUpdate {
     pub(crate) source: String,
     /// A shadowed row's fix-line.
     pub(crate) fix: Option<String>,
-    /// When the active build went live (Unix seconds): a vendor build's verification, an ALab build's `current` flip.
+    /// When the active build went live (Unix seconds).
     pub(crate) updated_at: Option<i64>,
     /// The newest build known: a vendor's head, an ALab index pin.
     pub(crate) latest_known: Option<String>,
@@ -175,7 +177,6 @@ pub(crate) struct ProgramWords {
 }
 
 impl ProgramUpdate {
-    /// The latest known build when it is not the installed one.
     fn newer_known(&self) -> Option<&str> {
         let version = self.version.as_deref()?;
         self.latest_known
@@ -183,7 +184,8 @@ impl ProgramUpdate {
             .filter(|latest| *latest != version)
     }
 
-    /// Whether a row whose state says it is current (at its index's pin, at its vendor's head) knows a newer build than the one installed.
+    /// Whether a row whose state says it is current (at its index's pin, at its vendor's head)
+    /// knows a newer build than the one installed.
     pub(crate) fn behind(&self, kind: &ProgramStateKind) -> bool {
         matches!(
             kind,
@@ -191,7 +193,7 @@ impl ProgramUpdate {
         ) && self.newer_known().is_some()
     }
 
-    /// The words for a row whose state is `kind`/`state`, times relative to `now` on the local `clock`.
+    /// The words for a row whose state is `kind`/`state`.
     pub(crate) fn words(
         &self,
         kind: &ProgramStateKind,
@@ -263,9 +265,6 @@ pub(crate) fn plain_state(kind: &ProgramStateKind, state: &str) -> Option<String
     })
 }
 
-/// `held: [<owner>'s ]pinned build <N> is not published for <target>; staying on build
-/// <C>` ([`atpkg::state::held_unpublished`]) → `kept at build C — N isn't available for
-/// this Mac` (`— <owner>'s build N …` on a sibling's row).
 fn held_words(state: &str) -> Option<String> {
     let rest = state.strip_prefix(atpkg::state::HELD_PREFIX)?;
     let (owner, rest) = match rest.split_once("'s pinned build ") {
@@ -280,8 +279,6 @@ fn held_words(state: &str) -> Option<String> {
     ))
 }
 
-/// Whether a pass's recorded outcome is the plain healthy sentence — `up to date (index
-/// build 45)`, `up to date (ay build 8256)` — with nothing after it.
 fn outcome_is_plainly_current(outcome: &str) -> bool {
     let Some(rest) = outcome.strip_prefix("up to date") else {
         return false;
@@ -290,8 +287,6 @@ fn outcome_is_plainly_current(outcome: &str) -> bool {
     rest.is_empty() || (rest.starts_with('(') && rest.find(')') == Some(rest.len() - 1))
 }
 
-/// Where a build comes from, as a row says it when its state has no plain words:
-/// `Anthropic latest` → `from Anthropic`, `ALab index 44` → `from ALab`.
 fn source_plain(source: &str) -> Option<String> {
     let vendor = source
         .strip_suffix(" latest")
@@ -301,7 +296,7 @@ fn source_plain(source: &str) -> Option<String> {
     (!vendor.is_empty()).then(|| format!("from {vendor}"))
 }
 
-/// A time as a person reads it, in local time, never raw UTC: `just now`, `4 min ago`, `3 h ago` inside a day.
+/// A time as a person reads it.
 pub(crate) fn when_words(at: i64, now: i64, clock: LocalClock) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -345,15 +340,13 @@ pub(crate) fn when_words(at: i64, now: i64, clock: LocalClock) -> String {
     words
 }
 
-/// How far back the calendar shows a clock time (`yesterday 14:05`, `Mon 09:30`): a week.
 const CLOCK_WINDOW_S: i64 = 7 * 86_400;
 
 /// The local clock the Packages page reads its times on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LocalClock {
     offset_s: Option<i64>,
-    /// `(changed_at, offset_before)` — an instant before `changed_at` was on the offset
-    /// before.
+    /// `(changed_at, offset_before)` — an instant before `changed_at` was on the offset before.
     changed: Option<(i64, i64)>,
 }
 
@@ -383,7 +376,6 @@ impl LocalClock {
         Self::probe(now, crate::presence::local_offset_at)
     }
 
-    /// [`Self::read`] over an injected offset reader. Pure for the test.
     fn probe(now: i64, offset_at: impl Fn(i64) -> Option<i64>) -> Self {
         let Some(offset) = offset_at(now) else {
             return Self::UNKNOWN;
@@ -460,7 +452,7 @@ impl PackagesProgramRow {
     }
 }
 
-/// A `status.toml` state line read through `atpkg::state`'s parsers, the same readers `doctor` and `which` use.
+/// A `status.toml` state line read through `atpkg::state`'s parsers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramStateKind {
     Managed {
@@ -472,7 +464,7 @@ pub(crate) enum ProgramStateKind {
         version: String,
         vendor: String,
     },
-    /// A vendor-direct program kept on `version` while the head was not taken, and why (a hold, a yank, a rollback).
+    /// A vendor-direct program kept on `version` while the head was not taken.
     VendorKept {
         version: String,
         why: String,
@@ -485,7 +477,7 @@ pub(crate) enum ProgramStateKind {
         path: String,
         retired: Option<String>,
     },
-    /// An agent program the pass has not installed yet (`agent program — installing`, `atpkg::state::AGENT_INSTALLING`).
+    /// An agent program the pass has not installed yet.
     AgentInstalling,
     Unavailable,
     Other,
@@ -578,11 +570,8 @@ impl VendorFacts {
 /// How many lines one program's reason may take on the Packages page.
 pub(crate) const MAX_REASON_LINES: usize = 4;
 
-/// The narrowest row [`reason_lines`] wraps to: the bare `…(NNN more)` marker (11
-/// characters) must fit on a line of its own.
 const MIN_REASON_WIDTH: usize = 12;
 
-/// atpkg's remedy marker: every remedy its text names is spelled `fix: <what to do>`.
 const FIX_MARKER: &str = "fix:";
 
 /// A long recorded refusal with its fix last (~700 characters): the shape the wrap must handle.
@@ -602,7 +591,7 @@ pub(crate) const INCIDENT_2026_09_14_REASON: &str = "error: stage: this process 
     and every tagged shim), or clear what stopped launchd from running the helper — named \
     above — and retry";
 
-/// The lines a program's `state` line paints on the Packages page, each within `width` average glyphs. atpkg spells every remedy `fix: …`, and this reader relies on it.
+/// The lines a program's `state` line paints on the Packages page.
 pub(crate) fn reason_lines(state: &str, width: usize) -> Vec<String> {
     let width = width.max(MIN_REASON_WIDTH);
     if fits(state, width) {
@@ -643,8 +632,6 @@ fn more_marker(hidden: usize) -> String {
     format!("\u{2026}({hidden} more)")
 }
 
-/// The first `room` of `lines`, the last of them giving up trailing words to the
-/// `…(N more)` marker until it fits `width`.
 fn bound_with_marker(lines: Vec<String>, room: usize, width: usize) -> Vec<String> {
     debug_assert!(room >= 1 && lines.len() > room);
     let hidden = lines.len() - room;
@@ -667,9 +654,6 @@ fn bound_with_marker(lines: Vec<String>, room: usize, width: usize) -> Vec<Strin
     }
 }
 
-/// The byte offset of the `fix:` marker in `state`, when it carries one: the word
-/// `fix:` at a word boundary and followed by whitespace or the end — `prefix:` and
-/// `suffix:` are not remedies, and `fix:` glued to a path segment is not one either.
 fn fix_marker(state: &str) -> Option<usize> {
     state.match_indices(FIX_MARKER).find_map(|(at, _)| {
         let boundary_before = state[..at]
@@ -684,11 +668,6 @@ fn fix_marker(state: &str) -> Option<usize> {
     })
 }
 
-/// Greedy word wrap to `width` average glyphs ([`glyph_advance`]'s estimate, since this
-/// pure projection has no font), at the places the shared rule lets a line break
-/// ([`aterm_grapheme::pieces`]): white space of every kind but a no-break space (a recorded
-/// error may carry a newline), and between CJK characters, kinsoku kept, with nothing put
-/// between them.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -734,13 +713,8 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The wrap's unit: one average lowercase glyph, in the sub-unit [`glyph_advance`]
-/// counts in.
 const ADVANCE_UNIT: usize = 20;
 
-/// An approximate advance for `c` in a proportional UI face, in twentieths of an average
-/// lowercase glyph: capitals, `_`, `—` and `@#%&` 1.2, `m`/`w` 1.5, the narrow glyphs and
-/// most punctuation 0.65, a wide char 2, the rest 1.
 const fn glyph_advance(c: char) -> usize {
     match c {
         'A'..='Z' | '_' | '\u{2014}' | '\u{2013}' | '@' | '#' | '%' | '&' => 24,
@@ -752,18 +726,15 @@ const fn glyph_advance(c: char) -> usize {
     }
 }
 
-/// The advance of `word`, summed over its glyphs ([`glyph_advance`]).
 fn advance(word: &str) -> usize {
     word.chars().map(glyph_advance).sum()
 }
 
-/// Whether `text` fits a row of `width` units — the one predicate the short-state
-/// pass-through, the wrap and the marker's tail share.
 fn fits(text: &str, width: usize) -> bool {
     advance(text) <= width * ADVANCE_UNIT
 }
 
-/// Whether `text` fits one row line at `width`'s budget, measured as [`reason_lines`] measures, so a program row's detail rides inline exactly when it fits.
+/// Whether `text` fits one row line at `width`'s budget.
 pub(crate) fn fits_one_line(text: &str, width: usize) -> bool {
     fits(text, width.max(MIN_REASON_WIDTH))
 }
@@ -785,7 +756,7 @@ pub(crate) fn activity_text_lines(text: &str, width: usize) -> Vec<String> {
     }
 }
 
-/// atpkg's status ledger names its whole-toolset pseudo-program `*toolset*`, emphasis a native page would paint as literal asterisks.
+/// atpkg's status ledger names its whole-toolset pseudo-program `*toolset*`.
 pub(crate) fn package_program_display_name(name: &str) -> String {
     if name == "*toolset*" {
         return "ALab tools".to_string();
@@ -797,9 +768,6 @@ pub(crate) fn package_program_display_name(name: &str) -> String {
         .to_string()
 }
 
-/// The words of atpkg's row for a vendor build whose head check has not reached
-/// its vendor for a day: `managed <version> — <Vendor>'s release channel not
-/// reached since <date>` (`record_vendor_status` in `crates/atpkg/src/cli.rs`).
 const VENDOR_UNREACHED: &str = "'s release channel not reached since ";
 
 /// One recorded row the Packages badge counts, as the headline names it, or `None`.
@@ -841,7 +809,7 @@ pub(crate) fn attention_items(
         .collect()
 }
 
-/// The attention item for a C toolchain that blocks builds, short enough for the headline ([`PackagesStatusReport::cc_prereq`]).
+/// The attention item for a C toolchain that blocks builds.
 pub(crate) fn cc_prereq_item(verdict: &atpkg::prereq::CcVerdict) -> String {
     if matches!(verdict, atpkg::prereq::CcVerdict::Broken { .. }) {
         "the C compiler cannot build a program".to_string()
@@ -852,17 +820,16 @@ pub(crate) fn cc_prereq_item(verdict: &atpkg::prereq::CcVerdict) -> String {
     }
 }
 
-/// The detail under "Package tool missing": what is wrong with this copy, and how to get one that manages ALab tools.
+/// The detail under "Package tool missing".
 pub(crate) const PACKAGE_TOOL_MISSING_DETAIL: &str =
     "This copy of aterm has no package tool. Install aterm from alab.systems to manage ALab tools.";
 
-/// The longest cause a headline item quotes, in characters.
 const HEADLINE_CAUSE_CHARS: usize = 48;
 
 /// The prefix every attention headline opens with ([`attention_headline`]).
 pub(crate) const ATTENTION_PREFIX: &str = "Needs attention: ";
 
-/// The headline that names what failed (`Needs attention: codex failed · …`), at most [`ATTENTION_NAMED`] items and a count for the rest.
+/// The headline that names what failed (`Needs attention: codex failed · …`).
 pub(crate) fn attention_headline(items: &[String]) -> Option<String> {
     if items.is_empty() {
         return None;
@@ -883,18 +850,17 @@ pub(crate) fn attention_headline(items: &[String]) -> Option<String> {
     Some(format!("{ATTENTION_PREFIX}{named}"))
 }
 
-/// The headline for a machine the signed index serves nothing for ([`atpkg::state::is_unserved_toolset`]).
+/// The headline for a machine the signed index serves nothing for
+/// ([`atpkg::state::is_unserved_toolset`]).
 pub(crate) const UNSERVED_HEADLINE: &str = "ALab tools aren\u{2019}t available for this Mac yet";
 
-/// The headline while a `[packages] prefix` this build ignores stops unattended installs (`atpkg::config::PackagesConfig::installs_unattended`).
+/// The headline while a `[packages] prefix` this build ignores stops unattended installs.
 pub(crate) const IGNORED_PREFIX_HEADLINE: &str =
     "Automatic installs are paused — [packages] prefix is set";
 
-/// The card's detail while a verb runs: where its progress is. Work that ends inside the
-/// band's progress grace never shows a row, so the card promises none.
 const BUSY_DETAIL: &str = "If it takes a while, its progress shows at the top of the window.";
 
-/// Which command result a Packages headline presents, as the `NativePackagesWorker` model counts it (`presented_result`: 0 none, 1 success, 2 failure).
+/// Which command result a Packages headline presents.
 #[cfg(test)]
 pub(crate) fn presented_result_of(headline: &str) -> u8 {
     if headline.starts_with(ATTENTION_PREFIX) {
@@ -908,17 +874,16 @@ pub(crate) fn presented_result_of(headline: &str) -> u8 {
     }
 }
 
-/// What kind of trouble a background pass left the Packages badge ([`PackagesService::note_pass_trouble`]).
+/// What kind of trouble a background pass left the Packages badge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassTroubleKind {
     /// A failure marker, a refused whole pass, a child that died mid-pass.
     Failed,
-    /// The window stood down for this launch behind a pass that never finished, and will not retry; the cause names the command to run.
+    /// The window stood down for this launch behind a pass that never finished.
     StoodDown,
 }
 
 impl PassTroubleKind {
-    /// The badge's item for it ([`attention_items`]).
     const fn item(self) -> &'static str {
         match self {
             Self::Failed => "the last package check failed",
@@ -936,9 +901,6 @@ pub(crate) struct PassTrouble {
 }
 
 impl PassTrouble {
-    /// The badge's item, naming the cause: `the last package check failed: prefix is not
-    /// writable`, atpkg's own words without their `atpkg: ` prefix, the first clause only
-    /// and at most [`HEADLINE_CAUSE_CHARS`]; the whole cause leads the detail.
     fn item(&self) -> String {
         let cause = self.cause.trim();
         let cause = cause.strip_prefix("atpkg: ").unwrap_or(cause);
@@ -963,7 +925,6 @@ impl PassTrouble {
     }
 }
 
-/// How many failures the headline names before it counts the rest.
 const ATTENTION_NAMED: usize = 3;
 
 /// Facts about the co-located package manager, collected off the event loop by one worker pass.
@@ -982,27 +943,26 @@ pub(crate) struct PackagesStatusReport {
     pub(crate) outcome: String,
     pub(crate) index_source: String,
     pub(crate) programs: Vec<PackagesProgramRow>,
-    /// Bounded, operator-readable diagnostic when some private package metadata could not be admitted or parsed.
+    /// Bounded, operator-readable diagnostic when some private package metadata could not be
+    /// admitted or parsed.
     pub(crate) collection_error: Option<String>,
     /// The store carries atpkg's declined marker (`aterm pkg uninstall --all`).
     pub(crate) declined: bool,
     /// `status.toml`'s `last_success_at` (RFC 3339, empty when never).
     pub(crate) last_success_at: String,
-    /// The package log's newest events, newest first (at most [`atpkg::packages_log::ACTIVITY_EVENTS`]) — Settings ▸ Packages' Activity.
+    /// The package log's newest events.
     pub(crate) activity: Vec<atpkg::packages_log::Entry>,
-    /// Where the package log is (`<logs dir>/packages.log`), when a log directory resolves: what "Open Log" opens.
+    /// Where the package log is (`<logs dir>/packages.log`).
     pub(crate) log_path: Option<std::path::PathBuf>,
     /// The local clock, read on the worker at each collection ([`LocalClock::read`]).
     pub(crate) clock: LocalClock,
-    /// The sentence for a `[packages] prefix` this build does not use (`atpkg::config::PackagesConfig::ignored_prefix`, in `atpkg::config::ignored_prefix_note`'s words).
+    /// The sentence for a `[packages] prefix` this build does not use.
     pub(crate) ignored_prefix: Option<String>,
-    /// The C toolchain's verdict when it blocks builds (no compiler, or one that cannot build a program), probed only over an installed, undeclined toolset.
+    /// The C toolchain's verdict when it blocks builds.
     pub(crate) cc_prereq: Option<atpkg::prereq::CcVerdict>,
 }
 
 impl PackagesStatusReport {
-    /// The zero state before any worker observation: nothing is claimed available or
-    /// enabled until a collection pass has looked.
     const fn unobserved() -> Self {
         Self {
             activity: Vec::new(),
@@ -1024,7 +984,7 @@ impl PackagesStatusReport {
         }
     }
 
-    /// Pure assembly from atpkg's own record types — the testable core of [`collect_packages_status`].
+    /// Pure assembly from atpkg's own record types.
     pub(crate) fn from_parts(
         available: bool,
         manager_enabled: bool,
@@ -1188,10 +1148,6 @@ pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
     report
 }
 
-/// The C toolchain's verdict for the page ([`PackagesStatusReport::cc_prereq`]): `probe`
-/// runs only over a toolset it would stop building (an installed program, nothing removed
-/// on purpose: doctor's own gate), and the verdict is said only when it is an answer that
-/// blocks builds.
 fn cc_prereq_note(
     report: &PackagesStatusReport,
     probe: impl FnOnce() -> atpkg::prereq::CcVerdict,
@@ -1208,8 +1164,6 @@ fn cc_prereq_note(
     verdict.blocks_builds().then_some(verdict)
 }
 
-/// The page's report over `layout`, its shadowed rows computed for `path_var` (the login
-/// shell's PATH, what the user's terminals run with).
 fn collect_packages_status_from_layout(
     available: bool,
     layout: Option<&atpkg::Layout>,
@@ -1285,26 +1239,19 @@ fn collect_packages_status_from_layout(
 /// Host-owned reducer for the packages surface.
 pub(crate) struct PackagesService {
     revision: u64,
-    /// Worker generation: a completion must present the exact sequence its
-    /// `begin` minted, so a superseded worker cannot import stale facts.
+    /// Worker generation.
     sequence: u64,
     inflight: bool,
     busy: Option<PackagesBusy>,
     report: Option<PackagesStatusReport>,
     last_command: Option<PackagesCommandOutcome>,
-    /// What bare `atpkg machine` last measured, plus this launch's memory of what
-    /// changed.
+    /// What bare `atpkg machine` last measured, plus this launch's memory of what changed.
     machine: MachinePosture,
-    /// The last background toolchain pass's trouble (a failure marker, a whole pass
-    /// refused before it could write a record, a stand-down that will not retry), held
-    /// until a pass is known to have completed since ([`Self::note_pass_trouble`], cleared
-    /// by [`Self::note_pass_clean`] and [`Self::finish`]).
+    /// The last background toolchain pass's trouble.
     pass_trouble: Option<PassTrouble>,
-    /// How many programs the last check or install moved to a new build, so the card says
-    /// `2 programs updated` rather than a bare "completed".
+    /// How many programs the last check or install moved to a new build.
     updated: usize,
-    /// Whether this copy can manage packages at all — known before any status read
-    /// ([`Self::note_tool`]): the co-located `atpkg` stat and the compiled root key.
+    /// Whether this copy can manage packages at all.
     tool: Option<PackageTool>,
 }
 
@@ -1322,7 +1269,7 @@ pub(crate) struct MachinePosture {
     pub(crate) observed: bool,
     /// The parsed record, when the last read produced one.
     pub(crate) state: Option<atpkg::machine::MachineState>,
-    /// Why the last read produced no record (the child could not be spawned, or printed no `machine-state:` line — which is never "nothing to apply").
+    /// Why the last read produced no record.
     pub(crate) read_error: Option<String>,
     /// The last `machine-settings:` body this process saw and when it arrived.
     pub(crate) last_change: Option<(String, std::time::SystemTime)>,
@@ -1332,11 +1279,13 @@ pub(crate) struct MachinePosture {
     pub(crate) refreshing: bool,
     /// A read was asked for while one was running.
     pub(crate) rerun: bool,
-    /// A pass printed a `machine-settings:` change and its own `machine-state:` record is expected on the same stream.
+    /// A pass printed a `machine-settings:` change and its own `machine-state:` record is expected
+    /// on the same stream.
     pub(crate) awaiting_record: bool,
-    /// A worker read is running and a newer record (a pass's own, measured after its apply) landed meanwhile.
+    /// A worker read is running and a newer record (a pass's own, measured after its apply) landed
+    /// meanwhile.
     pub(crate) superseded: bool,
-    /// Reads started so far — bumped when one is spawned (a request admitted, or a queued rerun handed back to be spawned).
+    /// Reads started so far.
     pub(crate) reads_started: u64,
     /// `reads_started` when the open expectation was opened.
     pub(crate) expectation_read_gen: u64,
@@ -1435,7 +1384,6 @@ impl PackagesService {
             self.machine.awaiting_record = false;
         }
         if rerun {
-            // The caller spawns the queued read now: count it as started.
             self.machine.reads_started = self.machine.reads_started.saturating_add(1);
         }
         if std::mem::take(&mut self.machine.superseded) {
@@ -1448,8 +1396,6 @@ impl PackagesService {
                 self.machine.read_error = None;
             }
             Err(error) => {
-                // Keep the last good record beside the error: a transient read
-                // failure must not erase what was measured a moment ago.
                 self.machine.read_error = Some(error);
             }
         }
@@ -1457,7 +1403,8 @@ impl PackagesService {
         rerun
     }
 
-    /// Remember a `machine-settings:` change (the pull-down row's body) and when this process saw it.
+    /// Remember a `machine-settings:` change (the pull-down row's body) and when this process saw
+    /// it.
     pub(crate) fn note_machine_change(&mut self, body: String, at: std::time::SystemTime) {
         self.machine.last_change = Some((body, at));
         self.revision = self.revision.saturating_add(1);
@@ -1473,7 +1420,7 @@ impl PackagesService {
         self.revision = self.revision.saturating_add(1);
     }
 
-    /// Reduce a record a pass printed after its apply, the newest measurement there is.
+    /// Reduce a record a pass printed after its apply.
     pub(crate) fn note_machine_record(&mut self, state: atpkg::machine::MachineState) {
         self.machine.observed = true;
         self.machine.state = Some(state);
@@ -1523,7 +1470,7 @@ impl PackagesService {
         true
     }
 
-    /// A later whole pass ran clean: the condition the remembered trouble named is gone, and so is that half of the badge.
+    /// A later whole pass ran clean.
     pub(crate) fn note_pass_clean(&mut self) -> bool {
         if self.pass_trouble.take().is_none() {
             return false;
@@ -1532,10 +1479,6 @@ impl PackagesService {
         true
     }
 
-    /// Whether `completion` proves a pass completed after the remembered trouble: a
-    /// whole-pass verb from Settings (Check, Install) that succeeded, or a record whose
-    /// `last_success_at` (stamped by whoever ran the pass, a terminal's `aterm pkg update`
-    /// included) is later than the moment the trouble was noted.
     fn completion_clears_trouble(&self, completion: &PackagesWorkerCompletion) -> bool {
         let Some(trouble) = self.pass_trouble.as_ref() else {
             return false;
@@ -1552,7 +1495,8 @@ impl PackagesService {
             .is_some_and(|success| success > trouble.noted_unix)
     }
 
-    /// Record that a pass refused or failed to apply machine settings so the status does not show a stale success.
+    /// Record that a pass refused or failed to apply machine settings so the status does not show a
+    /// stale success.
     pub(crate) fn note_machine_verdict(&mut self, verdict: String) {
         self.machine.last_verdict = Some(verdict);
         self.revision = self.revision.saturating_add(1);
@@ -1650,8 +1594,6 @@ impl PackagesService {
             self.last_command = completion.command;
         }
         if let Some(state) = completion.machine_state {
-            // The apply's own record is the newest measurement, like a streamed pass's: it
-            // closes the expectation its change line opened.
             self.note_machine_record(state);
         }
         if let Some(verdict) = completion.machine_verdict {
@@ -1679,7 +1621,7 @@ impl PackagesService {
         true
     }
 
-    /// The state a Settings controller renders, resolved against the current config consent flags (the config is host-owned; the service holds only worker facts).
+    /// The state a Settings controller renders.
     pub(crate) fn state(
         &self,
         master_enabled: bool,
@@ -1714,9 +1656,6 @@ impl PackagesService {
     }
 }
 
-/// How many programs `after` holds at a different installed build than
-/// `before` did (a program new to the report with a build counts): what a
-/// check or an install changed.
 fn updated_programs(before: Option<&PackagesStatusReport>, after: &PackagesStatusReport) -> usize {
     after
         .programs
@@ -1730,53 +1669,41 @@ fn updated_programs(before: Option<&PackagesStatusReport>, after: &PackagesStatu
         .count()
 }
 
-/// The snapshot a [`crate::native_settings::SettingsApp`] holds (the [`crate::update_screen::UpdateState`] analogue).
+/// The snapshot a [`crate::native_settings::SettingsApp`] holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesState {
-    /// A worker pass has completed at least once (before that the page says
-    /// "Reading package status…" instead of claiming anything).
+    /// A worker pass has completed at least once.
     observed: bool,
-    /// What the package tool is — present, and built with its root key — is
-    /// known ([`PackagesService::note_tool`]), whether or not a status read has
-    /// landed: admission reads THIS, the status lines read [`Self::observed`].
+    /// What the package tool is — present, and built with its root key — is known.
     tool_observed: bool,
     report: PackagesStatusReport,
     busy: Option<PackagesBusy>,
-    /// Any worker is inflight, the silent status refresh (`busy` `None`) included. Actions
-    /// gate on this, not `busy`: the host's one-worker rule would drop a click admitted
-    /// during a silent refresh, so the buttons disable for that brief window.
+    /// Any worker is inflight, the silent status refresh (`busy` `None`) included.
     inflight: bool,
-    /// Final result of the most recent UI-initiated verb. Silent refreshes keep
-    /// it; starting a new verb clears it.
+    /// Final result of the most recent UI-initiated verb, preserved across silent refreshes.
     last_command: Option<PackagesCommandOutcome>,
-    /// Resolved `[packages]` flags (`enabled`, the retired `auto_update` folded in, and
-    /// `auto_install`), display only; the switches edit the config keys.
+    /// Resolved `[packages]` flags.
     master_enabled: bool,
     auto_install: bool,
-    /// The background updater thread started for this process. What it runs follows the
-    /// saved switches live, so only its absence needs saying.
+    /// Whether the background updater thread started for this process.
     loop_running: bool,
     /// The `[machine]` host settings as confirmed by the machine read worker.
     machine: MachinePosture,
-    /// The saved `[machine]` switch, from the host's config: display only, so the status can
-    /// say when a saved switch has not been read yet.
+    /// The saved `[machine]` switch.
     saved_universal_control: atpkg::config::UniversalControlPolicy,
-    /// The saved `[machine] rosetta` switch, from the host's config (default on), which the
-    /// apply child reads fresh, as it reads the Universal Control one.
+    /// The saved `[machine] rosetta` switch.
     saved_rosetta: bool,
-    /// The last background pass's trouble, until a pass completes since
-    /// ([`PackagesService::note_pass_trouble`]).
+    /// The last background pass's trouble.
     pass_trouble: Option<PassTrouble>,
-    /// atpkg's sentence for a retired `[packages] auto_update = false` that holds Keep ALab
-    /// tools up to date off (`atpkg::config::auto_update_note`): why
-    /// [`Self::master_enabled`] is off, never a second switch.
+    /// atpkg's sentence for a retired `[packages] auto_update = false` that holds Keep ALab tools
+    /// up to date off (`atpkg::config::auto_update_note`).
     retired_switch_note: Option<String>,
     /// Programs the last check or install moved ([`PackagesService`]'s count).
     updated: usize,
 }
 
 impl PackagesState {
-    /// Attach the host's saved `[machine]` switch (the config is host-owned; the service holds only worker facts).
+    /// Attach the host's saved `[machine]` switch.
     pub(crate) const fn with_machine_config(
         mut self,
         universal_control: atpkg::config::UniversalControlPolicy,
@@ -1791,12 +1718,14 @@ impl PackagesState {
         self
     }
 
-    /// Attach the host's note on a retired `[packages] auto_update = false` holding Keep ALab tools up to date off (`Config::packages_retired_switch_note`).
+    /// Attach the host's note on a retired `[packages] auto_update = false` holding Keep ALab tools
+    /// up to date off.
     pub(crate) fn with_retired_switch_note(mut self, note: Option<String>) -> Self {
         self.retired_switch_note = note;
         self
     }
-    /// The pre-observation default a freshly-created Settings controller holds until the host publishes a real snapshot.
+    /// The pre-observation default a freshly-created Settings controller holds until the host
+    /// publishes a real snapshot.
     pub(crate) fn unobserved() -> Self {
         Self {
             observed: false,
@@ -1822,7 +1751,7 @@ impl PackagesState {
         self.projection_at(std::time::SystemTime::now())
     }
 
-    /// [`Self::projection`] with the clock injected: every time on the page is said relative to it, on the local clock.
+    /// [`Self::projection`] with the clock injected.
     pub(crate) fn projection_at(&self, now: std::time::SystemTime) -> PackagesProjection {
         let report = &self.report;
         let actions_enabled = self.observed
@@ -1866,8 +1795,6 @@ impl PackagesState {
         } else if report.collection_error.is_some() {
             "Some package details couldn\u{2019}t be read".to_string()
         } else if report.declined {
-            // Removed on purpose (`aterm pkg uninstall --all`, Remove ALab Tools): what is
-            // left in the record is stale, and "up to date" would be about nothing.
             "ALab tools aren\u{2019}t installed".to_string()
         } else if report.recorded
             && report
@@ -1875,8 +1802,6 @@ impl PackagesState {
                 .iter()
                 .any(|row| row.update.behind(&row.kind))
         {
-            // Never "up to date" over a row that names a newer build (the row itself
-            // stops saying so too, [`ProgramUpdate::words`]).
             "Updates are available".to_string()
         } else if report.recorded {
             "ALab tools are up to date".to_string()
@@ -1926,9 +1851,6 @@ impl PackagesState {
         let mut detail = if !self.observed {
             None
         } else if let Some(busy) = self.busy {
-            // While the verb runs the card says where its progress is, never "Click Check &
-            // Update Now" under a disabled button. The machine apply (a local edit well
-            // under a second) has no band row: its headline says it all.
             (busy != PackagesBusy::MachineApply).then(|| BUSY_DETAIL.to_string())
         } else if let Some(PackagesCommandOutcome::Succeeded { operation }) =
             self.last_command.as_ref().filter(|c| {
@@ -1978,8 +1900,6 @@ impl PackagesState {
         } else if !report.available {
             Some(PACKAGE_TOOL_MISSING_DETAIL.to_string())
         } else if !report.manager_enabled {
-            // An inert manager's one cause is an unpinned build; `aterm pkg doctor` names
-            // the key.
             Some("This build can\u{2019}t install packages.".to_string())
         } else if report.recorded {
             recorded_detail(false).map(|recorded| crate::update_words::capitalize_first(&recorded))
@@ -2100,8 +2020,6 @@ impl PackagesState {
         }
     }
 
-    /// The "This Mac" status's words, derived here so pixels, accessibility and `aterm ctl`
-    /// read one truth.
     fn machine_projection(
         &self,
         idle: bool,
@@ -2266,7 +2184,6 @@ pub(crate) const MACHINE_APPLY_WOULD_ROSETTA: &str = "Apply Now installs Rosetta
 pub(crate) const MACHINE_APPLY_WOULD_BOTH: &str =
     "Apply Now turns Universal Control off and installs Rosetta 2 on this Mac.";
 
-/// The Apply Now sentence for what is left: Universal Control, Rosetta 2, or both.
 const fn machine_apply_would(universal_control: bool, rosetta: bool) -> &'static str {
     match (universal_control, rosetta) {
         (true, true) => MACHINE_APPLY_WOULD_BOTH,
@@ -2278,12 +2195,12 @@ const fn machine_apply_would(universal_control: bool, rosetta: bool) -> &'static
 pub(crate) const MACHINE_NOTHING_TO_APPLY: &str =
     "Nothing to apply: Universal Control is already as you chose.";
 
-/// Settings ▸ Security's "This Mac" status, as words (the [`PackagesProjection`] slice for the `[machine]` host settings).
+/// Settings ▸ Security's "This Mac" status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MachineProjection {
     /// These are macOS host settings; elsewhere the status is absent.
     pub(crate) supported: bool,
-    /// This copy has no package tool, so the Mac can't be read or changed from it: the status says so rather than show a failed read.
+    /// This copy has no package tool.
     pub(crate) tool_missing: bool,
     /// A machine read has completed at least once.
     pub(crate) observed: bool,
@@ -2297,26 +2214,27 @@ pub(crate) struct MachineProjection {
     pub(crate) last_change: Option<String>,
     /// The last `atpkg machine apply` verdict this launch, when there is one.
     pub(crate) last_verdict: Option<String>,
-    /// Why an apply would do nothing here (home mismatch/unresolved) or why the state could not be read.
+    /// Why an apply would do nothing here (home mismatch/unresolved) or why the state could not be
+    /// read.
     pub(crate) reason: Option<String>,
     /// A `[machine]` switch saved after the last read, and what will use it.
     pub(crate) saved: Option<String>,
     /// What Apply Now would do ([`MACHINE_APPLY_WOULD`]), or the "nothing to apply" sentence.
     pub(crate) next: String,
-    /// The Apply Now button: page idle, macOS, observed, not refreshing, and the verdict says something is left to do.
+    /// The Apply Now button.
     pub(crate) apply_enabled: bool,
-    /// Observed, readable, and the verdict is "nothing to apply": the status offers no button, and a press from the palette says so.
+    /// Observed, readable, and the verdict is "nothing to apply".
     pub(crate) nothing_to_apply: bool,
 }
 
-/// Owned, structured read projection shared with the native Settings `/packages` route (the [`crate::update_screen::UpdateProjection`] analogue).
+/// Owned, structured read projection shared with the native Settings `/packages` route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesProjection {
     /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" status).
     pub(crate) machine: MachineProjection,
     /// A status read has landed (the headline, Activity and program rows wait on it).
     pub(crate) observed: bool,
-    /// What the package tool is, is known: package admission reads this, never [`Self::observed`] ([`PackagesService::note_tool`]).
+    /// What the package tool is, is known.
     pub(crate) tool_observed: bool,
     pub(crate) available: bool,
     pub(crate) manager_enabled: bool,
@@ -2330,14 +2248,14 @@ pub(crate) struct PackagesProjection {
     pub(crate) busy: Option<PackagesBusy>,
     /// A silent status-refresh worker is inflight (no `busy` label).
     pub(crate) refreshing: bool,
-    /// `[packages] enabled` (Keep ALab tools up to date), resolved with the retired `auto_update` folded in.
+    /// `[packages] enabled` (Keep ALab tools up to date).
     pub(crate) master_enabled: bool,
     /// `[packages] auto_install` — the one install consent, resolved.
     pub(crate) auto_install: bool,
     pub(crate) loop_running: bool,
     /// What is actually running now, plus any saved-vs-live mismatch.
     pub(crate) loop_status: String,
-    /// Wrapped sentence for a retired `[packages] auto_update = false` (`atpkg::config::auto_update_note`).
+    /// Wrapped sentence for a retired `[packages] auto_update = false`.
     pub(crate) retired_switch_note: Option<String>,
     /// Both action buttons: observed, available, enabled, read without error, and idle.
     pub(crate) actions_enabled: bool,
@@ -2345,7 +2263,7 @@ pub(crate) struct PackagesProjection {
     pub(crate) detail: Option<String>,
     /// What failed, named ([`attention_items`]).
     pub(crate) attention: Vec<String>,
-    /// The package log's newest events as the Activity card reads them, newest first ([`activity_lines`]).
+    /// The package log's newest events as the Activity card reads them.
     pub(crate) activity: Vec<ActivityLine>,
     /// Whether the tail is full ([`atpkg::packages_log::ACTIVITY_EVENTS`] events).
     pub(crate) activity_capped: bool,
@@ -2360,11 +2278,11 @@ pub(crate) struct ActivityLine {
     pub(crate) when: String,
     /// What happened.
     pub(crate) text: String,
-    /// A failure or a refusal — the kind of line a person scans for.
+    /// A failure or a refusal.
     pub(crate) trouble: bool,
 }
 
-/// The Activity list: the package log's events ([`atpkg::packages_log`]), newest first, as sentences.
+/// The Activity list.
 pub(crate) fn activity_lines(
     entries: &[atpkg::packages_log::Entry],
     now: i64,
@@ -2460,7 +2378,6 @@ pub(crate) fn activity_sentences(
     out
 }
 
-/// A program transition as the Activity says it.
 fn program_activity(
     program: &str,
     from: Option<&str>,
@@ -2517,10 +2434,6 @@ fn program_activity(
     }
 }
 
-/// A rustup seam that replaced a stale link, as the Activity says it: the one change a pass
-/// makes to `~/.rustup` that nobody laid there for it (atpkg re-points rustup's `trust` away
-/// from an older live build tree), so the sentence names what it named, why, and the
-/// command that puts it back.
 fn seam_activity(seam: &str, from: &str, why: &str, undo: &str) -> String {
     let name = seam.strip_prefix("rustup:").unwrap_or(seam);
     let mut text = format!("rustup `{name}` re-pointed at the managed toolchain");
@@ -2539,7 +2452,6 @@ fn seam_activity(seam: &str, from: &str, why: &str, undo: &str) -> String {
     text
 }
 
-/// A pass's verb as the Activity names it.
 fn pass_words(verb: &str) -> String {
     let mut words = verb.split(' ');
     match (words.next().unwrap_or(""), words.next()) {
@@ -2560,8 +2472,6 @@ fn pass_words(verb: &str) -> String {
     }
 }
 
-/// Which lane ran a pass, as the Activity names it (atpkg's lane words: `window`,
-/// `session`, `head watch`, `agent update`, `typed`).
 fn lane_words(lane: &str) -> &str {
     match lane {
         "window" => "aterm window",
@@ -2620,10 +2530,6 @@ mod tests {
         }
     }
 
-    /// One worker at a time; a stale sequence is reducer-inert, and so is a
-    /// current one whose completion kind/operation does not match the
-    /// reservation; a matching completion clears busy, stores the report, and
-    /// bumps the revision.
     #[test]
     fn service_serializes_workers_and_rejects_stale_completions() {
         let mut service = PackagesService::new();
@@ -2663,9 +2569,6 @@ mod tests {
         assert!(projection.actions_enabled);
     }
 
-    /// A spawn-failure abort releases the reservation without importing facts: an
-    /// unobserved surface stays unobserved, an observed one keeps its report; a stale
-    /// abort is inert.
     #[test]
     fn abort_releases_the_reservation_without_fabricating_a_report() {
         let mut service = PackagesService::new();
@@ -2693,8 +2596,6 @@ mod tests {
         assert!(projection.actions_enabled);
     }
 
-    /// The posture ladder: unobserved → unavailable → recorded → busy, each with its own
-    /// action gating (the inert manager's gate is `machine_apply_ignores_the_manager_gate`).
     #[test]
     fn projection_headlines_track_the_honest_manager_posture() {
         let unobserved = PackagesState::unobserved().projection();
@@ -2742,7 +2643,6 @@ mod tests {
         assert!(!busy.actions_enabled);
     }
 
-    /// A report whose program rows are `rows` (name, state), as a pass wrote them.
     fn report_with(rows: &[(&str, String)]) -> PackagesStatusReport {
         let mut status = status("up to date (index build 44)");
         status.programs = rows
@@ -2763,7 +2663,6 @@ mod tests {
         PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status), &[])
     }
 
-    /// One silent refresh that observes `report`.
     fn observe(service: &mut PackagesService, report: PackagesStatusReport) {
         let sequence = service.begin(None).expect("idle");
         assert!(service.finish(sequence, refresh(report)));
@@ -2773,8 +2672,6 @@ mod tests {
         service.state(true, true, true).projection()
     }
 
-    /// What the badge counts, and nothing else: the faults `atpkg doctor` lists (its own
-    /// predicate) and a vendor build whose release channel has not been reached for a day.
     #[test]
     fn attention_is_the_doctors_faults_and_an_unreached_vendor() {
         let item = |name: &str, state: &str| attention_item(name, state);
@@ -2825,8 +2722,6 @@ mod tests {
         }
     }
 
-    /// The store removed on purpose wears no badge: a declined store's stale fault rows
-    /// count for nothing, while a remembered pass trouble still counts.
     #[test]
     fn a_declined_store_wears_no_badge() {
         let mut declined = report_with(&[
@@ -2857,22 +2752,16 @@ mod tests {
         );
     }
 
-    /// `secs` past the epoch, as the clock a trouble is noted at.
     fn at(secs: u64) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
     }
 
-    /// A report whose record says a pass completed at `stamp` (RFC 3339).
     fn completed_at(stamp: &str) -> PackagesStatusReport {
         let mut report = report_with(&[("ay", atpkg::state::managed(1971, 44))]);
         report.last_success_at = stamp.to_string();
         report
     }
 
-    /// A C toolchain that blocks builds is named on the page
-    /// (`DESIGN-clt-prerequisite-2026-08-31.md` §6): the badge counts it, the headline names
-    /// it with its one act, the detail carries doctor's whole sentence, and it is no program
-    /// row.
     #[test]
     fn a_missing_c_toolchain_is_the_badge_and_names_its_act() {
         let mut service = PackagesService::new();
@@ -2904,10 +2793,6 @@ mod tests {
         assert_eq!(shown.attention[1], item, "{:?}", shown.attention);
     }
 
-    /// The page probes where doctor does and says only an answer that blocks builds: a
-    /// blocking verdict is doctor's own sentence ending in the act; an unknown and a ready
-    /// compiler say nothing; no installed program, or a toolset removed on purpose, never
-    /// probes.
     #[test]
     fn the_c_toolchain_is_probed_where_doctor_probes_and_said_only_when_it_blocks() {
         let installed = report_with(&[("ay", atpkg::state::managed(1971, 44))]);
@@ -2932,9 +2817,6 @@ mod tests {
         );
     }
 
-    /// A pass trouble with no row of its own (a refusal at atpkg's dispatch edge, a child
-    /// that died after announcing) is the badge too: its cause leads the detail, the
-    /// headline names it, and a later clean whole pass clears it.
     #[test]
     fn a_failed_pass_is_the_badge_until_a_clean_pass_clears_it() {
         let mut service = PackagesService::new();
@@ -2978,11 +2860,6 @@ mod tests {
         );
     }
 
-    /// The trouble clears when a pass is known to have completed since, not only when the
-    /// window's own lane runs one clean: a Settings Check or Install that succeeds clears it
-    /// (a failed one, or a verb that is not a whole pass, does not), and so does a refresh
-    /// whose record's `last_success_at` is later than when the trouble was noted, a
-    /// terminal's `aterm pkg update` included; an earlier or unparseable stamp does not.
     #[test]
     fn a_pass_completed_since_the_trouble_clears_it() {
         let noted = at(1_790_000_000);
@@ -3040,9 +2917,6 @@ mod tests {
         }
     }
 
-    /// A status record carrying every canonical §17.2 state: the rows parse through
-    /// `atpkg::state`'s own readers, the text is kept verbatim, and the agent programs carry
-    /// their authored vendor / license / size.
     #[test]
     fn rows_parse_every_canonical_state() {
         let p = std::path::Path::new;
@@ -3175,9 +3049,6 @@ mod tests {
         assert_eq!(odd.size, None);
     }
 
-    /// Dev-linked programs surface annotated — merged into an existing status
-    /// row when atpkg recorded one, appended as `linked` when it never did —
-    /// and the row list stays name-sorted for stable paint.
     #[test]
     fn report_merges_dev_links_into_the_program_rows() {
         let links = vec![
@@ -3207,8 +3078,7 @@ mod tests {
         assert!(report.programs.windows(2).all(|w| w[0].name <= w[1].name));
     }
 
-    /// Shadowed is read, not recorded: atpkg records the managed row, and the page reads a
-    /// program as shadowed against the login shell's PATH it is handed.
+    /// Shadowed is read.
     #[cfg(unix)]
     #[test]
     fn the_collector_reads_shadowing_against_the_path_it_is_handed() {
@@ -3356,8 +3226,6 @@ mod tests {
         }
     }
 
-    /// A service that has observed a live, idle report: the gate every verb
-    /// (the machine card's included) shares.
     fn live_service() -> PackagesService {
         let mut service = PackagesService::new();
         observe(
@@ -3367,9 +3235,6 @@ mod tests {
         service
     }
 
-    /// The pass's own record answers the change: a `machine-settings:` line opens an
-    /// expectation (the status reads as refreshing, Apply disabled) and no read is spawned;
-    /// the `machine-state:` record the pass prints behind it closes it.
     #[test]
     fn a_passes_record_answers_its_change_without_a_read() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -3457,11 +3322,6 @@ mod tests {
         );
     }
 
-    /// The "This Mac" status reads the machine posture through the packages
-    /// projection: unobserved offers no button; a read bumps the revision and ends
-    /// the refresh (the verdict per posture is `machine_projection_covers_every_posture`);
-    /// a failed read after a good one keeps the last measurement but never
-    /// re-enables Apply on it.
     #[test]
     fn projection_carries_the_machine_posture() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -3542,8 +3402,6 @@ mod tests {
         );
     }
 
-    /// `atpkg machine apply` is a local verb: Apply Now does not inherit the package page's
-    /// manager gate.
     #[test]
     fn machine_apply_ignores_the_manager_gate() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -3569,9 +3427,6 @@ mod tests {
         }
     }
 
-    /// The apply child reads the saved `[machine]` switch, so the verdict and the button
-    /// follow measured posture × saved switch, never the record's stale `policy=`, in both
-    /// directions.
     #[test]
     fn flipped_machine_switch_drives_the_apply_verdict_not_the_stale_record() {
         use atpkg::config::UniversalControlPolicy;
@@ -3605,9 +3460,6 @@ mod tests {
         );
     }
 
-    /// A missing Rosetta 2 is something to apply on its own, with Universal Control already
-    /// off: the status says it is missing and Apply Now names the install, not Universal
-    /// Control.
     #[test]
     fn a_missing_rosetta_is_said_and_applied_on_its_own() {
         use atpkg::machine::{HomePosture, MachineState, RosettaPosture, UcPosture};
@@ -3661,8 +3513,6 @@ mod tests {
         assert_eq!(done.next, MACHINE_NOTHING_TO_APPLY);
     }
 
-    /// A read asked for while one is running is queued behind it, never joined: the running
-    /// read may have started before an apply and would land as a pre-apply record.
     #[test]
     fn a_read_in_flight_when_the_apply_finishes_is_rerun_not_joined() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -3710,8 +3560,6 @@ mod tests {
         assert!(!fresh.machine.apply_enabled);
     }
 
-    /// A change a pass reported reaches the status and asks for a fresh read: the wake arm
-    /// notes the change (the status's "Last change") and starts a re-read.
     #[test]
     fn a_reported_change_lands_on_the_status_and_asks_for_a_read() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -3740,9 +3588,6 @@ mod tests {
         );
     }
 
-    /// A config that does not parse is a refusal, not a measurement: the `[machine]` default
-    /// acts, so the status offers no Apply and says which file to fix when the record
-    /// reports that the switches could not be read.
     #[test]
     fn an_unreadable_config_is_said_in_the_status_and_disables_apply() {
         use atpkg::config::UniversalControlPolicy::Off;
@@ -3776,10 +3621,6 @@ mod tests {
         );
     }
 
-    /// Every posture the card can be in, from the record, with the verdict each
-    /// one yields: the half/unknown Universal Control states still apply, a posture
-    /// already where `[machine]` wants it has nothing to apply, and an unresolved
-    /// home refuses with a reason.
     #[test]
     fn machine_projection_covers_every_posture() {
         use atpkg::config::UniversalControlPolicy::{Leave, Off};
@@ -3871,14 +3712,10 @@ mod tests {
         }
     }
 
-    /// The long recorded refusal ([`INCIDENT_2026_09_14_REASON`]).
     fn incident_reason() -> String {
         INCIDENT_2026_09_14_REASON.to_string()
     }
 
-    /// The canonical `atpkg::state` spellings the page paints every day fit one row at
-    /// the narrowest budget and come back byte-for-byte: the layout of the common case
-    /// is unchanged by the wrap.
     #[test]
     fn reason_lines_keeps_a_short_state_unchanged() {
         for state in [
@@ -3897,8 +3734,6 @@ mod tests {
         assert_eq!(reason_lines(&format!("{edge} y"), 64).len(), 2);
     }
 
-    /// The long refusal: the fix leads, whole, at every budget the page uses — nothing of
-    /// it is cut, no line exceeds its budget, and the diagnosis is bounded after it.
     #[test]
     fn reason_lines_puts_the_fix_first_and_whole() {
         let incident = incident_reason();
@@ -3952,8 +3787,6 @@ mod tests {
         }
     }
 
-    /// No remedy to lead with: the reason wraps whole while it fits the bound, and past
-    /// it the marker replaces the last visible line's tail, counting the hidden lines.
     #[test]
     fn reason_lines_wraps_and_bounds_a_reason_without_a_fix() {
         let within = "error: stage: the signed index names build 1971 for ay but the store holds \
@@ -3998,10 +3831,6 @@ mod tests {
         assert_eq!(pieces.concat(), path);
     }
 
-    /// A CJK REASON WRAPS BETWEEN ITS CHARACTERS, each at two average glyphs: every line
-    /// is inside its budget at that charge, no line starts with a closer or a small kana,
-    /// nothing is put between the characters a break parted, and a Latin word beside them
-    /// keeps its space.
     #[test]
     fn a_cjk_reason_wraps_between_its_characters() {
         let reason = format!(
@@ -4042,8 +3871,6 @@ mod tests {
         );
     }
 
-    /// The marker is the word `fix:`: a `prefix:` in a path sentence is not a remedy, a
-    /// bundle line's parenthesised `fix:` is, and one glued to a path segment is not.
     #[test]
     fn reason_lines_marker_is_the_word_fix() {
         let prefix = format!(
@@ -4082,14 +3909,9 @@ mod tests {
         );
     }
 
-    /// 2026-09-21T14:13:20Z, a Monday.
     const NOW: i64 = 1_790_000_000;
-    /// UTC-7 (a Pacific summer clock).
     const PDT: i64 = -7 * 3600;
 
-    /// When, as a person reads it: relative inside a day, then the local calendar (the
-    /// offset moves the day and the clock, never a raw UTC stamp); a time ahead of now (a
-    /// clock set back) is never "ago".
     #[test]
     fn when_words_are_relative_then_the_local_calendar() {
         let w = |ago: i64, offset: i64| when_words(NOW - ago, NOW, LocalClock::fixed(offset));
@@ -4111,10 +3933,6 @@ mod tests {
         }
     }
 
-    /// Each instant reads on its own offset: a window that lives across a daylight-saving
-    /// switch reads it on its next collection, and a time from before it keeps the hour it
-    /// was stamped under (14:05 PDT the Saturday before `SWITCH` reads `14:05`, never
-    /// `13:05`).
     #[test]
     fn the_local_clock_reads_each_instant_on_its_own_offset() {
         const PST: i64 = -8 * 3600;
@@ -4166,7 +3984,6 @@ mod tests {
             .build_id()
     }
 
-    /// A report over `rows` (name, installed build, state), index build 44.
     fn report_of(rows: &[(&str, Option<u64>, String)]) -> PackagesStatusReport {
         let mut status = status("up to date (index build 44)");
         status.last_index_build = 44;
@@ -4186,8 +4003,6 @@ mod tests {
         PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status), &[])
     }
 
-    /// The headline says "up to date" only when every row that claims it is: a row at its
-    /// index's pin that knows a newer build stops saying it, and so does the headline.
     #[test]
     fn the_headline_says_up_to_date_only_when_every_current_row_is() {
         let headline = |ay_latest: &str| {
@@ -4217,9 +4032,6 @@ mod tests {
         );
     }
 
-    /// A pass's own sentence is dropped only when the headline says all of it: `up to date
-    /// (index build 45)` folds into "Checked 3 min ago"; one followed by any qualification
-    /// stays.
     #[test]
     fn a_qualified_up_to_date_outcome_is_shown_not_folded() {
         assert!(outcome_is_plainly_current("up to date"));
@@ -4246,10 +4058,7 @@ mod tests {
         );
     }
 
-    /// What the store says, read on the worker: a vendor build's `.vendor` record names its
-    /// version and when it was verified (its "updated"), its stamp the head last seen and
-    /// when; an ALab build's latest known is the verified index's pin, and its "updated"
-    /// is when its `current` link was flipped.
+    /// What the store says.
     #[cfg(unix)]
     #[test]
     fn the_store_supplies_when_a_build_went_live_and_the_latest_known() {
@@ -4349,9 +4158,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The worker reads the upstream an ALab codex is based on off the record of the store
-    /// build its shim runs, in `which`'s words: a record from before the field, a malformed
-    /// one and a program ALab does not build carry none.
+    /// The worker reads the upstream an ALab codex is based on off the record of the store build
+    /// its shim runs.
     #[cfg(unix)]
     #[test]
     fn the_worker_reads_the_upstream_an_alab_build_records() {
@@ -4449,10 +4257,6 @@ mod tests {
         }
     }
 
-    /// THE ACTIVITY READS PASSES, not lines: a log of idle passes, each a start, the
-    /// discovery's `index-resolved` line and an end, still shows the newest 25 passes, as it
-    /// did before every discovery wrote its line — the read counts only the kinds the
-    /// Activity says, where a read of the last 50 lines of any kind showed 16.
     #[test]
     fn the_activity_shows_as_many_passes_beside_each_discovery_line() {
         let dir = aterm_tempfile::tempdir().expect("scratch folder");
@@ -4493,10 +4297,6 @@ mod tests {
         assert_eq!(passes, 25, "{entries:?}");
     }
 
-    /// The Activity: the package log's events, newest first, with relative local times: a
-    /// refusal is trouble, a hold is not; a pass's end that was offline or "did not run" is
-    /// no trouble, a failure is; a start with no end after it is listed, a start whose end
-    /// is listed is left out.
     #[test]
     fn the_activity_reads_the_log_newest_first() {
         use atpkg::packages_log::kind;

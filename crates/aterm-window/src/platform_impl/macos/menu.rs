@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/menu.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{alloc, send_id, send_id_id, send_id_id_sel_id, send_v_id, send_v_usize};
 use aterm_objc::{autoreleasepool, class, sel, Id, MainThread, Obj, Sel};
 
@@ -11,7 +14,9 @@ use super::aterm_objc_seam::consts::{
     NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_MODIFIER_FLAG_OPTION,
 };
 
-/// Key equivalent and optional modifier mask for a menu item.
+/// LOCAL PATCH (aterm): the key is an `Id` borrowed from a live `NSString`
+/// rather than an `&NSString`, and the mask is the raw `NSUInteger` the setter
+/// takes rather than an `NSEventModifierFlags` bitflags value.
 struct KeyEquivalent {
     key: Id,
     masks: Option<usize>,
@@ -112,7 +117,10 @@ unsafe fn append(a: Id, b: Id) -> Id {
     unsafe { send_id_id(a, sel!(stringByAppendingString:), b) }
 }
 
-/// Autoreleased `NSString` for a menu title or key equivalent.
+/// LOCAL PATCH (aterm): objc2's `ns_string!` built a STATIC `NSString` at
+/// compile time. `aterm_objc::ns_string` answers a +1 [`Obj`]; this wrapper
+/// autoreleases it so the call sites read as they did, at the cost of one
+/// object per literal per launch that the enclosing pool reclaims.
 fn nsstr(s: &str) -> Id {
     aterm_objc::ns_string(s).expect("Foundation to accept a menu title").autorelease()
 }

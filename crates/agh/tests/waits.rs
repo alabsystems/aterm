@@ -710,7 +710,10 @@ fn a_rate_limit_past_the_blind_limit_is_blind_on_the_backoff() {
     let fake = fake();
     fake.add_release(REPO, ReleaseSpec::published("v1.0.0", CREATED));
     let reset = 1_760_000_120u64.to_string();
-    fake.fault(
+    // Standing, as GitHub refuses every request until the reset: Unix's rate
+    // book refuses the later rounds before they are sent, Windows (no book)
+    // sends them.
+    fake.fault_always(
         Match::api(TAGS),
         Fault::Status {
             status: 403,

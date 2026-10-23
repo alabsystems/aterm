@@ -5164,7 +5164,7 @@ mod tests {
     #[test]
     fn the_recovery_probe_observes_a_matching_owned_ancestor() {
         use std::os::unix::fs::MetadataExt as _;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         const CHILD: &str = "ATERM_TEST_PGREP_ANCESTOR";
         if let Some(path) = std::env::var_os(CHILD) {
@@ -5205,10 +5205,13 @@ mod tests {
             return;
         }
 
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("trustd-probe-ancestor-")
-            .tempdir()
-            .unwrap();
+        let mut scratch = aterm_uds::deadline::KeptUntilRan::new(
+            aterm_tempfile::Builder::new()
+                .prefix("trustd-probe-ancestor-")
+                .tempdir()
+                .unwrap()
+                .keep(),
+        );
         let named = scratch.path().join(format!("atpa{}", std::process::id()));
         std::fs::hard_link(std::env::current_exe().unwrap(), &named).unwrap();
         let test = "trust_facts::tests::the_recovery_probe_observes_a_matching_owned_ancestor";
@@ -5216,9 +5219,15 @@ mod tests {
         child
             .args(["--exact", test, "--nocapture"])
             .env(CHILD, &named);
-        let out =
-            aterm_uds::deadline::output_until(&mut child, Instant::now() + Duration::from_secs(60))
-                .expect("owned ancestor fixture finishes and is reaped");
+        let out = aterm_uds::deadline::output_until(
+            &mut child,
+            Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
+        )
+        .expect("owned ancestor fixture finishes and is reaped");
+        // An exit of its own shows the link ran; a timeout or a signal keeps it.
+        if out.status.code().is_some() {
+            scratch.ran();
+        }
         println!("{}", String::from_utf8_lossy(&out.stdout));
         assert!(out.status.success(), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("OWNED_ANCESTOR_PID="));

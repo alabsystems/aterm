@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LIVE PRESENCE VIEW.
+//! Live presence view over the fleet stream.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
@@ -29,31 +29,25 @@ pub enum Phase {
     Seeding,
     /// Caught up and following the tail: answers, with the offset it is exact up to.
     Live,
-    /// Its reader ended (a refusal, a transport error, a silent link): answers nothing until it is opened again.
+    /// Its reader ended (a refusal, a transport error, a silent link).
     Dead,
 }
 
-/// One `(node, sid)` presence subject's newest LIVE row: only its offset is kept.
+/// One `(node, sid)` presence subject's newest live row: only its offset is kept.
 type Rows = HashMap<String, BTreeMap<String, u64>>;
 
 #[derive(Default)]
 struct ViewState {
-    /// Which open this content belongs to. A reader from another open writes
-    /// nothing and is told to stop.
+    /// Which open this content belongs to.
     generation: u64,
     phase: Phase,
-    /// The offset the view is EXACT up to: just past every record applied —
-    /// seed rows and tail alike — or the tail's cursor at its last mark, or
-    /// where a confirmation proved there was nothing to apply, whichever is
-    /// highest.
+    /// The offset the view is EXACT up to.
     reached: u64,
-    /// The highest head the bus has told the view: each mark's, and each
-    /// confirmation's.
+    /// The highest head the bus has told the view: each mark's, and each confirmation's.
     head: u64,
     /// `sid -> node -> offset` of each live advertisement.
     rows: Rows,
-    /// The reader's socket, once it has dialled: what a close or a reopen ends
-    /// it by.
+    /// The reader's socket, once it has dialled: what a close or a reopen ends it by.
     closer: Option<Arc<Closer>>,
 }
 
@@ -94,8 +88,7 @@ impl PresenceView {
     #[cfg(not(test))]
     const fn notify(&self) {}
 
-    /// Forget everything held and start `phase` under a new generation,
-    /// hanging up the old reader's socket if it had one.
+    /// Clears held state, starts `phase` under a new generation, and closes the old socket.
     fn reset(&self, phase: Phase) -> u64 {
         let mut s = self.lock();
         let generation = s.generation.wrapping_add(1);
@@ -124,12 +117,12 @@ impl PresenceView {
         self.reset(Phase::Seeding)
     }
 
-    /// Close it: everything held is forgotten, the reader's socket is hung up, and whatever reader is still running belongs to a generation that no longer exists.
+    /// Close it: everything held is forgotten, the reader's socket is hung up.
     pub fn close(&self) {
         self.reset(Phase::Closed);
     }
 
-    /// The reader of `generation` has dialled: keep its socket's closer, so a close or a reopen hangs it up.
+    /// The reader of `generation` has dialled.
     pub fn hold(&self, generation: u64, closer: Arc<Closer>) -> bool {
         let mut s = self.lock();
         if s.generation != generation || !matches!(s.phase, Phase::Seeding | Phase::Live) {
@@ -148,7 +141,7 @@ impl PresenceView {
         }
     }
 
-    /// The reader of `generation` ended: the view is [`Phase::Dead`] if that is still the open it belongs to.
+    /// The reader of `generation` ended.
     pub fn end(&self, generation: u64) {
         let mut s = self.lock();
         if s.generation == generation && s.phase != Phase::Closed {
@@ -193,7 +186,7 @@ impl PresenceView {
         true
     }
 
-    /// The reader of `generation` read the tail's `Mark` resuming at `next`, with the broker's head at `head`.
+    /// The reader of `generation` read the tail's `Mark` resuming at `next`.
     pub fn mark(&self, generation: u64, next: u64, head: u64) -> bool {
         let mut s = self.lock();
         if s.generation != generation || !matches!(s.phase, Phase::Seeding | Phase::Live) {
@@ -221,7 +214,7 @@ impl PresenceView {
         self.notify();
     }
 
-    /// The nodes advertising `sid` live, the offset that answer is EXACT up to, and the highest head the view has heard.
+    /// The nodes advertising `sid` live, the offset that answer is EXACT up to.
     #[must_use]
     pub fn snapshot(&self, sid: &str) -> Option<Snapshot> {
         let s = self.lock();
@@ -241,7 +234,7 @@ impl PresenceView {
         })
     }
 
-    /// Block until `ready` holds for the view, or `within` passes: a test's hang detector, never a latency budget.
+    /// Block until `ready` holds for the view, or `within` passes.
     #[cfg(test)]
     pub(crate) fn wait_for(&self, within: Duration, ready: impl Fn(Phase, u64) -> bool) -> bool {
         let deadline = Instant::now() + within;
@@ -266,13 +259,13 @@ impl PresenceView {
 /// What one confirmation read proved, for the post it was asked for ([`confirmation`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmation {
-    /// The view's answer for the sid is the bus's at the read's head: the read reached the head and found no presence record of the sid.
+    /// The view's answer for the sid is the bus's at the read's head.
     pub routes: bool,
     /// The offset the view is now known to be exact up to.
     pub exact_to: u64,
 }
 
-/// Judge a confirmation: `found` is what `Fetch{from, presence_filter(fleet), max}` answered, and `(next, head)` its mark.
+/// Judge a confirmation.
 #[must_use]
 pub fn confirmation(
     fleet: &str,
@@ -289,8 +282,7 @@ pub fn confirmation(
     Confirmation { routes, exact_to }
 }
 
-/// Whether `subject` is a presence face of `sid` in `fleet` under any node:
-/// what the walk's `/f/<F>/pub/*/<sid>/presence` matches.
+/// Whether `subject` is a presence face of `sid` in `fleet` under any node.
 fn names_sid(fleet: &str, subject: &str, sid: &str) -> bool {
     let segs: Vec<&str> = subject.split('/').collect();
     matches!(
@@ -299,9 +291,7 @@ fn names_sid(fleet: &str, subject: &str, sid: &str) -> bool {
     )
 }
 
-/// `(node, sid)` of a SESSION's presence face in `fleet` —
-/// `["", "f", "<F>", "pub", "<node>", "<sid>", "presence"]`, the shape the
-/// walk's reader takes — or `None`.
+/// `(node, sid)` of a SESSION's presence face in `fleet`.
 fn session_presence<'a>(fleet: &str, subject: &'a str) -> Option<(&'a str, &'a str)> {
     let segs: Vec<&str> = subject.split('/').collect();
     match segs.as_slice() {
@@ -314,8 +304,7 @@ fn session_presence<'a>(fleet: &str, subject: &'a str) -> Option<(&'a str, &'a s
     }
 }
 
-/// Whether a presence row makes its node a routing candidate for its sid: the
-/// walk's rule, word for word.
+/// Whether a presence row makes its node a routing candidate for its sid.
 fn routable(raw: &[u8]) -> bool {
     let (body, _) = Body::decode(raw);
     body.unknown.get("observer").is_none_or(|v| v != "1")
@@ -329,7 +318,6 @@ enum Ended {
 }
 
 /// Feed `view` (open `generation`) on a thread of its own: DIAL with `dial`.
-///
 /// # Errors
 /// The thread could not be spawned; `dial` is dropped with the closure, never called.
 pub fn spawn_reader<D>(
@@ -352,7 +340,6 @@ where
                     let r = if view.hold(generation, Arc::clone(&closer)) {
                         follow(conn, &closer, &fleet, &view, generation).map_err(Ended::Follow)
                     } else {
-                        // Closed or reopened while this dialled.
                         Ok(())
                     };
                     closer.close();
@@ -377,9 +364,7 @@ where
         .map(drop)
 }
 
-/// [`spawn_reader`]'s body, once dialled. `Ok` for an end the view asked for
-/// (another generation took over) or the broker closing; `Err` for a refusal,
-/// a transport failure or a silent link.
+/// [`spawn_reader`]'s body, once dialled.
 fn follow(
     mut conn: Conn,
     closer: &Closer,
@@ -444,15 +429,11 @@ mod tests {
         view.snapshot(sid).map(|s| s.nodes.into_iter().collect())
     }
 
-    /// `(nodes, exact up to)` of a live view's answer for `sid`.
     fn answer(view: &PresenceView, sid: &str) -> Option<(Vec<String>, u64)> {
         view.snapshot(sid)
             .map(|s| (s.nodes.into_iter().collect(), s.exact_to))
     }
 
-    /// **NOTHING IS ANSWERED UNTIL THE TAIL HAS CAUGHT UP PAST THE SEED, AND
-    /// EVERY ANSWER SAYS WHAT IT IS EXACT UP TO.** A seeding view, a closed one
-    /// and a dead one answer `None` — ask the bus — never an empty set.
     #[test]
     fn the_view_answers_only_while_live() {
         let view = PresenceView::default();
@@ -482,9 +463,6 @@ mod tests {
         assert_eq!(view.snapshot("s-a"), None, "dead");
     }
 
-    /// **NEWEST WINS ON OFFSET, ACROSS THE SEED'S SEAM.** The seed reports
-    /// `n-a` withdrawn at 50 (a later page, past the splice point at 40) and
-    /// `n-b` live at 30.
     #[test]
     fn a_row_never_loses_to_an_older_one() {
         let view = PresenceView::default();
@@ -507,9 +485,6 @@ mod tests {
         );
     }
 
-    /// **THE WALK'S RULE, ROW FOR ROW.** An observer's row, a row with no
-    /// `state=`, a node's own presence row, a person's, another fleet's and a
-    /// sid that is not a principal are no advertisement.
     #[test]
     fn only_a_hosting_nodes_live_row_advertises() {
         let view = PresenceView::default();
@@ -533,9 +508,6 @@ mod tests {
         assert_eq!(nodes(&view, "s-x"), Some(vec!["n-f".to_string()]));
     }
 
-    /// **A READER FROM ANOTHER OPEN WRITES NOTHING, AND IS TOLD TO STOP.** A
-    /// closed view's old reader, and a reopened view's previous one, apply
-    /// nothing, mark nothing and kill nothing.
     #[test]
     fn a_stale_reader_cannot_touch_the_view() {
         let view = PresenceView::default();
@@ -602,8 +574,6 @@ mod tests {
         assert!(!alive(&mut held), "a reopen hangs up the previous reader");
     }
 
-    /// **A CONFIRMATION ROUTES ONLY THROUGH TO THE HEAD, AND IS A MARK EITHER
-    /// WAY.** Read from 100 with the head at 200:
     #[test]
     fn a_confirmation_routes_only_through_to_the_head_and_is_a_mark_either_way() {
         let rec = |off: u64, subject: &str| (off, subject.to_string(), LIVE.to_vec());

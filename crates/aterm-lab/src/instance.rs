@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A private aterm outside any lab's jail, for checking a change on a real instance (`instance`), and the instances `presence-flap` and `codex-alab-proof` drive.
+//! Isolated private `aterm` instance runner for `lab instance` and lab proof lanes.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,14 +13,14 @@ use crate::paths::{from_caller, paths};
 use crate::stop::{self, Stopped};
 use crate::{Fail, LAB, Res};
 
-/// The automatic lanes off: no update check, no package loop, no agent priming or supervision, the machine's own preferences left alone.
+/// The automatic lanes off.
 pub const CONFIG_OFF: &str = "agents_auto_prime = false\n\
                               [update]\nenabled = false\nauto_apply = false\n\
                               [packages]\nenabled = false\n\
                               [harness]\nenabled = false\n\
                               [machine]\nuniversal_control = \"leave\"\n";
 
-/// `config` with the audible bell off (`bell_sound = false` at its head) unless the document sets a root `bell_sound` itself (`--toml 'bell_sound = true'`, which then stands alone: a key twice is invalid TOML, and aterm reads none of such a file).
+/// `config` with the audible bell off (`bell_sound = false` at its head).
 #[must_use]
 pub fn bell_off(config: &str) -> String {
     match aterm_toml::from_str::<aterm_toml::Value>(config) {
@@ -29,7 +29,7 @@ pub fn bell_off(config: &str) -> String {
     }
 }
 
-/// How long an instance may take to listen: a hang detector, never a budget (a debug build on a loaded machine can take well past ten seconds).
+/// How long an instance may take to listen.
 pub const BOOT: Duration = Duration::from_secs(60);
 
 /// The scratch world an instance runs in.
@@ -45,7 +45,7 @@ pub struct World {
 }
 
 impl World {
-    /// Lay out a fresh world whose `aterm.toml` is `config` with the audible bell off ([`bell_off`]).
+    /// Lay out a fresh world whose `aterm.toml` is `config` with the audible bell off.
     /// # Errors
     /// A directory or file could not be made.
     pub fn new(config: &str) -> Result<World, String> {
@@ -87,7 +87,7 @@ impl World {
         self.keep = true;
     }
 
-    /// Put its `HOME` at a new `home` (made `0700`, with the world's shell profile): a scratch volume's folder, so what the instance measures and removes is that volume's (`disk-lane`, `instance --home`).
+    /// Put its `HOME` at a new `home` (made `0700`, with the world's shell profile).
     /// # Errors
     /// The folder already exists, or it or its profile could not be made.
     pub fn rehome(&mut self, home: &Path) -> Result<(), String> {
@@ -152,8 +152,7 @@ fn private_home_roots(home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keep the platform's existing state location explicit; disk and proof
-/// readers already name this same root under the private HOME.
+/// Keep the platform's existing state location explicit.
 fn private_state_home(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     return home.join("Library/Application Support/aterm");
@@ -185,8 +184,7 @@ pub struct Launch {
     pub sandbox: Option<String>,
 }
 
-/// An instance's process: this lab's child (the agent band), or its own
-/// launchd job (the app band).
+/// An instance's process.
 enum Proc {
     Child(Child),
     Job(Job),
@@ -242,8 +240,7 @@ impl Reply {
     }
 }
 
-/// A terminal's explicit selector from the instance-local roster. Native tabs
-/// can own the front while their underlying shell remains in this registry.
+/// A terminal's explicit selector from the instance-local roster.
 fn terminal_selector(roster: &str) -> Option<String> {
     roster
         .lines()
@@ -347,9 +344,10 @@ impl Instance {
         })
     }
 
-    /// [`Instance::start`] in `band`: [`Band::App`] starts the headless `l` as its own launchd job ([`Job::start`]), so it heads a coalition of its own at role `UI_FOCAL`, as aterm.app does; its lifeline is the job's FIFO, held here.
+    /// [`Instance::start`] in `band`.
     /// # Errors
-    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the job could not start.
+    /// As [`Instance::start`]; a windowed or sandboxed `l` in the app band; the job could not
+    /// start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
         if band == Band::Agent {
             return Instance::start(world, l);
@@ -409,7 +407,7 @@ impl Instance {
         }
     }
 
-    /// `aterm ctl --sock <its socket> --timeout 90 <args>`, its environment the world's, never the caller's.
+    /// Runs `aterm ctl --sock <socket> --timeout 90 <args>` in the world's environment.
     #[must_use]
     pub fn ctl(&self, args: &[&str]) -> Reply {
         let sock = self.sock.to_string_lossy();
@@ -472,7 +470,7 @@ impl Instance {
         }
     }
 
-    /// One held control connection to it, for a schedule whose requests are milliseconds apart (a client process per request costs more than that).
+    /// One held control connection to it, for a schedule whose requests are milliseconds apart.
     /// # Errors
     /// The socket did not answer.
     pub fn connect(&self) -> Result<aterm_agent::RelayClient<aterm_uds::CtlStream>, String> {
@@ -504,7 +502,7 @@ impl Instance {
         lines[lines.len().saturating_sub(n)..].join("\n")
     }
 
-    /// End it: cut its lifeline, then end an app-band job by its owned launchd label after a cooperative grace. launchd reaps that process, so its cached pid is only a liveness observation, never signal authority.
+    /// End it: cut its lifeline.
     pub fn stop(&mut self) {
         if let Some(l) = self.lifeline.take() {
             l.cut();
@@ -587,9 +585,9 @@ pub fn count(flag: &str, v: &str) -> Result<u32, Fail> {
         .ok_or_else(|| Fail::usage(format!("{flag} takes a positive count, not '{v}'")))
 }
 
-/// The aterm to drive: the `--aterm` value given, else the lab's own pick ([`crate::paths::Paths::need_aterm`]).
+/// The aterm to drive: the `--aterm` value given, else the lab's own pick.
 /// # Errors
-/// Why there is none to drive: nothing was found, or the one given is not executable (the verbs' NOT RUN, never a usage error).
+/// Why there is none to drive.
 pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     if let Some(a) = given {
         let a = from_caller(&a);
@@ -772,17 +770,11 @@ struct ColdCopy {
     root: PathBuf,
 }
 
-/// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
-/// executable), run once with `--version`, then every page of the copy dropped from the page
-/// cache ([`crate::sys::evict_pages`]) and checked gone, so the launch pays aterm's own page-ins
-/// and nothing else. The run is the proof the copy ran from its file: macOS scans a new file at
-/// its first exec (0.5 s for a 66 MB build, more for the universal app) and keeps the verdict,
-/// which no write or rename has voided by the launch. The dyld shared cache and the system's
-/// own files stay as warm as they were (r6 sweep #19, `docs/measured/cold-pages-2026-10-20.md`).
+/// Copies `aterm` into the world, runs the copy once with `--version`, and evicts the copy's
+/// pages (`--pages cold`).
 /// # Errors
-/// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
-/// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
-/// macOS may still be assessing strands every exec waiting on that assessment).
+/// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none).
+/// A copy whose run gave no proof keeps the world: macOS may still be assessing it.
 fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
     let aterm = std::fs::canonicalize(aterm)
         .map_err(|e| format!("instance: cannot resolve {}: {e}", aterm.display()))?;
@@ -857,7 +849,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// [`CONFIG_OFF`] headed by `top`: top-level keys must come before the first table, or TOML files them under it.
+/// [`CONFIG_OFF`] headed by `top`.
 #[must_use]
 pub fn config_with(top: &[String]) -> String {
     let mut config = String::new();
@@ -869,7 +861,7 @@ pub fn config_with(top: &[String]) -> String {
     config
 }
 
-/// `config` (a [`config_with`]) with the harness host ON when `harness` (its disk watch runs only while the host does; supervision still reaches no agent, none being primed) and each of `after` appended after its tables (`[disk]` lines, `instance --toml-after`).
+/// Enables the harness host when `harness` is set and appends `after` lines.
 #[must_use]
 pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
     let mut out = if harness {
@@ -887,9 +879,7 @@ pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
     out
 }
 
-/// `config` (a [`config_with`]) with each of `keys` under its root `[harness]` table, after its
-/// `enabled` line (`instance --harness-key 'occupancy = "prompt"'`: a scratch HOME's own key, which
-/// `--toml-after` cannot give, its lines landing under the last table).
+/// Inserts `keys` under the root `[harness]` table after its `enabled` line.
 #[must_use]
 pub fn with_harness_keys(config: &str, keys: &[String]) -> String {
     let Some(table) = config.find("[harness]\n") else {
@@ -908,19 +898,13 @@ pub fn with_harness_keys(config: &str, keys: &[String]) -> String {
     out
 }
 
-/// Whether a `messages live` reply names a row still in its reveal's grace
-/// (`reveal=pending`: a standing ask's two seconds), not yet on the band.
+/// Whether a `messages live` reply names a row with `reveal=pending`.
 fn reveal_pending(rows: &str) -> bool {
     rows.lines()
         .any(|row| row.starts_with("message ") && row.split(' ').any(|w| w == "reveal=pending"))
 }
 
-/// THE BAND SETTLED: no live row still in its reveal's grace, read through
-/// `messages live` (the review of the login carry, 2026-10-20: `--pre
-/// 'login-notice si' --image` waited half a second of quiet and imaged a
-/// band with no ask on it, the ask's two-second grace still running). A
-/// one-minute hang detector, never a budget; an instance whose `messages`
-/// does not answer has no band to wait for.
+/// The band settled: no live row still in its reveal's grace, read through `messages live`.
 /// # Errors
 /// A row still pending after a minute, or the run interrupted.
 fn await_band(inst: &Instance) -> Result<(), Fail> {
@@ -942,8 +926,7 @@ fn await_band(inst: &Instance) -> Result<(), Fail> {
     }
 }
 
-/// Run each control verb (split on whitespace: a quoted multi-word value is
-/// not one word) against `inst`, printing its reply.
+/// Runs each control verb against `inst` and prints its reply.
 fn run_verbs(inst: &Instance, verbs: &[String]) {
     for verb in verbs {
         let words: Vec<&str> = verb.split_whitespace().collect();
@@ -968,7 +951,7 @@ enum KeeperEnd {
     Signal(i32),
 }
 
-/// The keeper of a windowed instance (`aterm-lab keeper -- <aterm> ARGS…`): it starts the aterm and holds the lifeline on its stdin, which a windowed aterm cannot read itself.
+/// The keeper of a windowed instance (`aterm-lab keeper -- <aterm> ARGS…`).
 #[must_use]
 pub fn keeper_main(args: &[String]) -> i32 {
     let Some((prog, rest)) = args
@@ -1167,9 +1150,6 @@ mod cold_copy_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// `--pages cold` given a link (`~/.local/bin/aterm`) copies the file it names, which then
-    /// holds every page out of the cache; a copied link would launch the original warm and hold
-    /// no page of its own.
     #[test]
     fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {
         let world_source = World::new(CONFIG_OFF).expect("fixture world");
@@ -1267,8 +1247,6 @@ mod terminal_selection_tests {
 mod band_tests {
     use super::reveal_pending;
 
-    /// A row in its reveal's grace holds the frame; none, or only revealed
-    /// rows, let it go.
     #[test]
     fn a_row_in_its_grace_holds_the_frame_and_nothing_else_does() {
         let row = |tail: &str| {
@@ -1290,8 +1268,6 @@ mod band_tests {
 mod bell_off_tests {
     use super::*;
 
-    /// The root `bell_sound` of an `aterm.toml` text, as aterm's own TOML
-    /// parser reads it (`None`: no such key, or no document at all).
     fn root_bell(text: &str) -> Option<bool> {
         aterm_toml::from_str::<aterm_toml::Value>(text)
             .ok()?
@@ -1299,8 +1275,6 @@ mod bell_off_tests {
             .and_then(aterm_toml::Value::as_bool)
     }
 
-    /// Every lab world's `aterm.toml` starts with the audible bell off, and
-    /// keeps the lanes-off tables it was given.
     #[test]
     fn a_lab_world_starts_with_the_audible_bell_off() {
         assert_eq!(
@@ -1321,8 +1295,6 @@ mod bell_off_tests {
         );
     }
 
-    /// A `bell_sound` the caller sets at the root (`instance --toml`) is the
-    /// one the file holds, once.
     #[test]
     fn a_bell_the_caller_sets_stands_alone() {
         let asked = config_with(&["bell_sound = true".to_string()]);
@@ -1335,9 +1307,6 @@ mod bell_off_tests {
         assert_eq!(bell_off(&asked), asked, "the caller's file, unchanged");
     }
 
-    /// Only the root key is the caller's choice: a `bell_sound` inside a
-    /// table is some other key, and the root one still goes in, ahead of
-    /// every table, where TOML files it at the root.
     #[test]
     fn a_bell_sound_inside_a_table_is_not_the_root_key() {
         let text = bell_off("[x]\nbell_sound = true\n");
@@ -1354,14 +1323,10 @@ mod bell_off_tests {
 
 #[cfg(test)]
 mod harness_key_tests {
-    use aterm_agent::supervise::SupervisorConfig;
+    use aterm_agent::supervise::{Occupancy, SupervisorConfig};
 
     use super::*;
 
-    /// `instance --harness-key` writes its lines under the root `[harness]` table, where the
-    /// owner's `occupancy = "prompt"` reaches `prompt` (a scratch HOME's key; the only place an
-    /// agent writes it). NEGATIVE CONTROL: the same line given to `--toml-after` lands under the
-    /// last table and grants nothing, and no line keeps `observe`.
     #[test]
     fn a_harness_key_lands_under_the_root_harness_table() {
         let key = vec!["occupancy = \"prompt\"".to_string()];
@@ -1373,14 +1338,14 @@ mod harness_key_tests {
         );
         let (cfg, notes) = SupervisorConfig::from_aterm_toml(&keyed);
         assert!(notes.is_empty(), "{notes:?}");
-        assert!(cfg.occupancy.grant().is_some(), "{keyed}");
+        assert_eq!(cfg.occupancy, Occupancy::Prompt, "{keyed}");
         assert!(cfg.enabled);
         for unkeyed in [
             with_harness_keys(&config, &[]),
             config_after(&config_with(&[]), true, &key),
         ] {
             let (cfg, _) = SupervisorConfig::from_aterm_toml(&unkeyed);
-            assert!(cfg.occupancy.grant().is_none(), "{unkeyed}");
+            assert_ne!(cfg.occupancy, Occupancy::Prompt, "{unkeyed}");
         }
         assert_eq!(with_harness_keys("[update]\n", &key), "[update]\n");
     }

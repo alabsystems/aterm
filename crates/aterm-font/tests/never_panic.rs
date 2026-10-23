@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A font is untrusted input: a malformed face returns errors and `None`s, never a panic, a hang or an out-of-bounds read.
+//! A font is untrusted input.
 
 use aterm_font::colr::{ClipBox, CompositeMode, Paint, Painter};
 use aterm_font::{Face, GlyphId, OutlineSink, PointKind, PointSink, RgbaColor, Tag, Transform};
@@ -22,8 +22,7 @@ impl Lcg {
     }
 }
 
-/// Counts what it is sent, so the outline work is not optimized away and a
-/// runaway charstring is visible as a count.
+/// Counts what it is sent.
 #[derive(Default)]
 struct Count(u64);
 
@@ -54,7 +53,6 @@ impl PointSink for Count {
     }
 }
 
-/// Counts the COLR painter calls, and walks each gradient's colour stops.
 impl<'a> Painter<'a> for Count {
     fn outline_glyph(&mut self, _: GlyphId) {
         self.0 += 1;
@@ -92,9 +90,6 @@ impl<'a> Painter<'a> for Count {
     }
 }
 
-/// A minimal sfnt around a CFF2 table whose glyphs are `programs`: `head`,
-/// `hhea`, `maxp` and `CFF2` (a Top DICT naming the CharStrings and an empty
-/// item variation store, no subroutines).
 fn synthetic_cff2(programs: &[&[u8]]) -> Vec<u8> {
     let be16 = |v: usize| (v as u16).to_be_bytes();
     let be32 = |v: usize| (v as u32).to_be_bytes();
@@ -136,7 +131,7 @@ fn synthetic_cff2(programs: &[&[u8]]) -> Vec<u8> {
     sfnt(programs.len(), &[(b"CFF2", &cff)])
 }
 
-/// An sfnt of `glyphs` glyphs holding `extra` plus a minimal `head` (1000 units per em, short `loca` offsets), `hhea` (one metric) and `maxp` 0.5, its directory sorted by tag.
+/// An sfnt of `glyphs` glyphs holding `extra` plus a minimal `head`, `hhea` and `maxp`.
 pub(crate) fn sfnt(glyphs: usize, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     let be16 = |v: usize| (v as u16).to_be_bytes();
     let be32 = |v: usize| (v as u32).to_be_bytes();
@@ -171,10 +166,6 @@ pub(crate) fn sfnt(glyphs: usize, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     font
 }
 
-/// ttf-parser 0.25.1 never returns from a `GSUB` extension subtable (type 7)
-/// whose wrapped type is 7 again and whose offset points at itself: it
-/// follows the extension forever (measured 2026-10-15 against the registry
-/// crate: a release build spins at 100% CPU on this 8-byte subtable).
 #[test]
 fn a_gsub_extension_of_an_extension_is_malformed() {
     let mut gsub: Vec<u8> = vec![0, 1, 0, 0, 0, 10, 0, 12, 0, 14];
@@ -208,9 +199,6 @@ fn a_gsub_extension_of_an_extension_is_malformed() {
     );
 }
 
-/// A `COLR` v1 paint graph whose paint tables share children: glyph 1 is a
-/// `PaintColrLayers` of two layers that both name the next level's
-/// `PaintColrLayers`, `depth` levels down to a `PaintSolid`.
 fn shared_paint_graph(depth: u32) -> Vec<u8> {
     let be16 = |v: u32| (v as u16).to_be_bytes();
     let be32 = |v: u32| v.to_be_bytes();
@@ -253,9 +241,6 @@ fn shared_paint_graph(depth: u32) -> Vec<u8> {
     sfnt(2, &[(b"COLR", &colr), (b"CPAL", &cpal)])
 }
 
-/// A paint graph that shares children cannot multiply the work: at depth 8
-/// every one of the 256 paths is painted, and at depth 60 (2^60 paths) the
-/// walk stops at the budget instead of never returning.
 #[test]
 fn a_colr_graph_that_shares_children_is_walked_within_a_budget() {
     let fg = RgbaColor::new(0, 0, 0, 255);
@@ -303,9 +288,6 @@ impl<'a> Painter<'a> for Sweeps {
     fn pop_transform(&mut self) {}
 }
 
-/// A `COLR` variation index base within N of `u32::MAX` wraps to the low
-/// delta-set entries, as upstream's release build does (its debug build
-/// panics there).
 #[test]
 fn a_colr_delta_index_past_u32_max_wraps_as_upstream_release_does() {
     let path = format!(
@@ -344,14 +326,12 @@ fn a_colr_delta_index_past_u32_max_wraps_as_upstream_release_does() {
     );
 }
 
-/// A `cmap` of one Windows Unicode subtable, `subtable`.
 fn cmap(subtable: &[u8]) -> Vec<u8> {
     let mut c = vec![0, 0, 0, 1, 0, 3, 0, 10, 0, 0, 0, 12];
     c.extend_from_slice(subtable);
     c
 }
 
-/// How many code points face `bytes`'s first `cmap` subtable enumerates.
 fn enumerated(bytes: &[u8]) -> u64 {
     let face = Face::parse(bytes, 0).expect("the synthetic face parses");
     let sub = face
@@ -366,11 +346,6 @@ fn enumerated(bytes: &[u8]) -> u64 {
     n
 }
 
-/// Overlapping `cmap` groups cannot multiply enumeration: 1,000 format 12
-/// groups each naming all of Unicode (12 KB) and 8,000 format 4 segments
-/// each naming the whole BMP (64 KB) would call back 1.1 billion and 524
-/// million times; enumeration stops once it has made one call per code
-/// point the format can name.
 #[test]
 fn overlapping_cmap_groups_enumerate_once_per_code_point() {
     let groups = 1000u32;
@@ -399,15 +374,10 @@ fn overlapping_cmap_groups_enumerate_once_per_code_point() {
     assert_eq!(enumerated(&sfnt(1, &[(b"cmap", &cmap(&f4))])), 0x10000);
 }
 
-/// Type 2 numbers in their one-byte form.
 fn n(v: i32) -> u8 {
     u8::try_from(v + 139).expect("-107..=107")
 }
 
-/// ttf-parser 0.25.1 panics, in debug and release builds alike, on a CFF2
-/// charstring whose `blend` meets an empty stack: its argument stack pops
-/// unchecked (measured 2026-10-15 against the registry crate, on an SF India
-/// glyph whose first byte was made `blend`).
 #[test]
 fn cff2_blend_on_an_empty_stack_is_an_error() {
     let triangle: &[u8] = &[n(10), n(10), 21, n(50), n(0), 5, n(0), n(50), 5];
@@ -431,9 +401,6 @@ fn cff2_blend_on_an_empty_stack_is_an_error() {
     assert_eq!(face.outline_glyph(GlyphId(3), &mut sink), None);
 }
 
-/// An OpenType `kern` table of one format 2 subtable whose left-class,
-/// right-class and array offsets (from the subtable start, its 6-byte header
-/// included) are `offsets`.
 fn kern_format_2(offsets: [u16; 3]) -> Vec<u8> {
     let mut kern: Vec<u8> = vec![0, 0, 0, 1, 0, 0, 0, 30, 2, 1];
     kern.extend(2u16.to_be_bytes());
@@ -446,7 +413,6 @@ fn kern_format_2(offsets: [u16; 3]) -> Vec<u8> {
     sfnt(1, &[(b"kern", &kern)])
 }
 
-/// The first `kern` subtable's value for the pair `(left, right)`.
 fn kerning(bytes: &[u8], left: u16, right: u16) -> Option<i64> {
     let face = Face::parse(bytes, 0).expect("the synthetic face parses");
     let kern = face.tables().kern.expect("kern parses");
@@ -466,10 +432,6 @@ impl PointSink for Xs {
     fn end_contour(&mut self) {}
 }
 
-/// Crafted tables at the edges of their fields' ranges, where the arithmetic
-/// leaves its integer type, answer as ttf-parser 0.25.1's code at each site
-/// does (a refusal or the format's fallback), never with a panic: the test
-/// profile keeps overflow checks on.
 #[test]
 fn crafted_table_edges_answer_as_upstream() {
     type Answer = fn() -> Vec<Option<i64>>;
@@ -675,8 +637,6 @@ fn crafted_table_edges_answer_as_upstream() {
     }
 }
 
-/// The seed faces: one per outline format. The committed ones run on every
-/// host; a Mac adds its CFF2 (SF India) and CID-keyed CFF (Hiragino) faces.
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     let render = format!("{}/../aterm-render", env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
@@ -722,7 +682,6 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     out
 }
 
-/// The tables this crate reads: where a mutation tests something.
 const READ_TABLES: &[&[u8; 4]] = &[
     b"head", b"hhea", b"maxp", b"hmtx", b"vhea", b"vmtx", b"VORG", b"post", b"cmap", b"loca",
     b"glyf", b"gvar", b"fvar", b"avar", b"HVAR", b"VVAR", b"MVAR", b"CFF ", b"CFF2", b"GSUB",
@@ -730,8 +689,7 @@ const READ_TABLES: &[&[u8; 4]] = &[
     b"CBLC", b"CBDT", b"COLR", b"CPAL",
 ];
 
-/// A table of face `index`: its byte range, and whether it holds CFF
-/// charstrings.
+/// A table of face `index`: its byte range, and whether it holds CFF charstrings.
 #[derive(Clone, Copy)]
 struct Target {
     start: usize,
@@ -740,7 +698,6 @@ struct Target {
     cff2: bool,
 }
 
-/// The tables of face `index` this crate reads, from its directory.
 fn targets(bytes: &[u8], index: u32) -> Vec<Target> {
     let Ok(raw) = aterm_font::RawFace::parse(bytes, index) else {
         return Vec::new();
@@ -761,8 +718,6 @@ fn targets(bytes: &[u8], index: u32) -> Vec<Target> {
         .collect()
 }
 
-/// A CFF INDEX at `at` in `cff` (count width 2 for CFF, 4 for CFF2): each
-/// object's byte range within `cff`, and where the INDEX ends.
 fn index_ranges(cff: &[u8], at: usize, count_width: usize) -> Option<(Vec<(usize, usize)>, usize)> {
     let be = |at: usize, n: usize| -> Option<usize> {
         let b = cff.get(at..at.checked_add(n)?)?;
@@ -785,7 +740,6 @@ fn index_ranges(cff: &[u8], at: usize, count_width: usize) -> Option<(Vec<(usize
     Some((out, end))
 }
 
-/// The `CharStrings` offset (operator 17) in a Top DICT.
 fn char_strings_offset(dict: &[u8]) -> Option<usize> {
     let mut i = 0;
     let mut last = None;
@@ -835,8 +789,6 @@ fn char_strings_offset(dict: &[u8]) -> Option<usize> {
     None
 }
 
-/// Every glyph's charstring in a `CFF ` or `CFF2` table at `start` of the
-/// file, as file byte ranges: where a structure-aware mutation writes.
 fn charstrings(bytes: &[u8], t: Target, cff2: bool) -> Vec<(usize, usize)> {
     let Some(cff) = bytes.get(t.start..t.end) else {
         return Vec::new();
@@ -865,17 +817,11 @@ fn charstrings(bytes: &[u8], t: Target, cff2: bool) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// The Type 2 charstring operators, and the number prefixes: a byte a
-/// mutation writes into CFF data so it lands on the interpreter's paths
-/// (`blend` on an empty stack, a subroutine call at the nesting limit, a
-/// hint mask past the end).
 const CHARSTRING_OPS: &[u8] = &[
     1, 3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
     30, 31, 247, 251, 255,
 ];
 
-/// One mutation of `seed`. `glyph_programs` are the seed's charstrings (empty
-/// for a TrueType face).
 fn mutate(
     seed: &[u8],
     targets: &[Target],
@@ -927,9 +873,6 @@ fn mutate(
     b
 }
 
-/// Runs the shaper reaches: ligatures, fractions, Arabic and Hebrew (shaped
-/// right to left), marks, variation selectors, default ignorables, an emoji
-/// ZWJ sequence, and a long run.
 const SHAPED: &[&str] = &[
     "a => b != c === d <!-- --> ffi 0xFF",
     "1\u{2044}2 12\u{2044}345",
@@ -942,9 +885,6 @@ const SHAPED: &[&str] = &[
     "--------------------------------------------------------------------------------",
 ];
 
-/// Shapes [`SHAPED`] on `face` with no features and with the renderer's kind
-/// of list (base pair, user stylistic features, a random alternate), and
-/// counts the glyphs.
 fn shape_strings(face: Face<'_>) -> u64 {
     use aterm_font::shape::{Feature, ShapeFace, UnicodeBuffer, shape};
     let face = ShapeFace::new(face);
@@ -973,7 +913,6 @@ fn shape_strings(face: Face<'_>) -> u64 {
     n
 }
 
-/// Every query the crate answers, over every glyph (at most `glyph_cap`).
 fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
     let mut sink = Count::default();
     let _ = aterm_font::fonts_in_collection(bytes);
@@ -1134,11 +1073,7 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
     sink.0
 }
 
-/// The autohinter over the face: one target at one size (from a desktop
-/// size to an absurd one the scale bound still admits for a 1000-unit em,
-/// so the hinter runs at it: `hint_extremes` holds the sizes past the
-/// bound), at the face's own hostile instance spelled in user space, every
-/// glyph up to `glyph_cap / 8` and the glyphs past the end.
+/// The autohinter over the face.
 #[cfg(any(feature = "hint", debug_assertions))]
 fn hint(bytes: &[u8], index: u32, face: &Face<'_>, rng: &mut Lcg, glyph_cap: u16) -> u64 {
     use aterm_font::autohint::{HintingInstance, Target};
@@ -1170,7 +1105,6 @@ fn hint(bytes: &[u8], index: u32, face: &Face<'_>, rng: &mut Lcg, glyph_cap: u16
     sink.0
 }
 
-/// Every seed, unmutated: the queries answer and the outlines draw.
 #[test]
 fn seeds_answer() {
     let mut rng = Lcg(1);
@@ -1182,7 +1116,6 @@ fn seeds_answer() {
     }
 }
 
-/// Mutated seeds never panic.
 #[test]
 fn mutated_faces_never_panic() {
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2));
@@ -1250,7 +1183,6 @@ fn mutated_faces_never_panic() {
     );
 }
 
-/// Arbitrary bytes, and arbitrary bytes behind a valid sfnt header.
 #[test]
 fn arbitrary_bytes_never_panic() {
     let mut rng = Lcg(0xD1B5_4A32_D192_ED03);

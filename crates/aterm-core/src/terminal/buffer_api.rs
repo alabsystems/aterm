@@ -351,6 +351,15 @@ impl Terminal {
     }
 
     /// Formats `text` for pasting using the terminal's current bracketed-paste mode.
+    ///
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// assert_eq!(term.format_paste("hello"), b"hello");
+    /// term.process(b"\x1b[?2004h");
+    /// assert_eq!(term.format_paste("hello"), b"\x1b[200~hello\x1b[201~");
+    /// ```
     #[inline]
     #[must_use]
     pub fn format_paste(&self, text: &str) -> Vec<u8> {
@@ -370,6 +379,16 @@ impl Terminal {
     }
 
     /// Formats `text` for pasting with explicit `bracketed` framing, stripping unsafe control bytes.
+    ///
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// // The mode says nothing here: the caller's decision is what frames it.
+    /// assert_eq!(term.format_paste_framed("hello", true), b"\x1b[200~hello\x1b[201~");
+    /// term.process(b"\x1b[?2004h");
+    /// assert_eq!(term.format_paste_framed("hello", false), b"hello");
+    /// ```
     #[must_use]
     pub fn format_paste_framed(&self, text: &str, bracketed: bool) -> Vec<u8> {
         let text = bounded_paste_text(text);

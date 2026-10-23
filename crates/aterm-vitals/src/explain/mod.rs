@@ -321,7 +321,13 @@ pub struct CoalSplit {
     pub tabs: Vec<(u64, i64)>,
     /// The live work over the window of aterm's processes in no tab: itself, its helpers, and a delegated job's members whose tab closed (so it is of [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone).
     pub own_mc: i64,
-    /// Every listed coalition that answered, busiest first (none by subtraction), each rounded on its own: a part's rows may not sum to the part, which is rounded once.
+    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every live figure
+    /// ([`Self::own_mc`] and [`Self::tabs`]), never below 0: work in no
+    /// process alive at both ends of the window, so in no tab's figure.
+    /// Taken from the parts' nanoseconds and rounded once, so the parts'
+    /// own rounding never reads as a millicore of it.
+    pub unattributed_mc: i64,
+    /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still differ from the part, which is rounded once, by a millicore or two.
     pub rows: Vec<CoalRow>,
 }
 
@@ -408,6 +414,9 @@ pub enum Fault {
     MatchBySigningIdOnly,
     /// The Deck's clause shows and goes with its candidate, with no hold.
     NoHold,
+    /// `unexplained` reads only the three parts, so the split's unaccounted
+    /// residual goes uncovered however large (`tests/conformance_explain.rs`).
+    IgnoreUnaccounted,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -431,7 +440,7 @@ impl Fault {
                     .map(|t| (t.key, millicores(t.scope.cores.raw)))
                     .collect();
             }
-            Self::MatchBySigningIdOnly | Self::NoHold => {}
+            Self::MatchBySigningIdOnly | Self::NoHold | Self::IgnoreUnaccounted => {}
         }
         facts
     }
@@ -607,14 +616,17 @@ impl WhyState {
     /// open after it and the Deck's clause.
     fn explain(&mut self, mut facts: WhyFacts, s: &Sample, snap: &Snapshot) -> WhyFacts {
         #[cfg(any(test, debug_assertions))]
-        let vouched = self.fault != Some(Fault::MatchBySigningIdOnly);
+        let (vouched, residual) = (
+            self.fault != Some(Fault::MatchBySigningIdOnly),
+            self.fault != Some(Fault::IgnoreUnaccounted),
+        );
         #[cfg(any(test, debug_assertions))]
         {
             self.clause.no_hold = self.fault == Some(Fault::NoHold);
         }
         #[cfg(not(any(test, debug_assertions)))]
-        let vouched = true;
-        facts.causes = detect::detect_as(&facts, snap, vouched);
+        let (vouched, residual) = (true, true);
+        facts.causes = detect::detect_as(&facts, snap, vouched, residual);
         facts.open = self
             .episodes
             .step(s.mono_ms, s.at_unix_ms, &facts.causes, s.procs_truncated);

@@ -11,34 +11,23 @@ use crate::App;
 use crate::needs::{HarnessNeeds, ToldNeeds};
 use crate::session_timeline::MetaEdit;
 
-/// Need (a) of §12.2.1: 144 characters, longer than the entry's 64 cells.
 const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
                       & Security ▸ Screen Recording, so the windowed check can capture the \
                       menu";
-/// Need (b) of §12.2.1.
 const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
-/// A third need, standing in for (b) under the same entry.
 const NEED_C: &str = "approve the 0.48.0 release notes";
-/// The entry the loop raises for (a) and one more: its writer's form, the
-/// first need cut at 64 cells (`escalate::needs_attention_text`).
 const ENTRY_AB: &str = "claude needs you: grant Screen Recording to com.aterm.aterm in System \
                         Settings ▸ … (+1 more) \u{2014} carrying on";
-/// The entry for (b) alone.
 const ENTRY_B: &str = "claude needs you: the release credential \
                        (~/.aterm/release-credentials.toml) to sign 0.48.0 \u{2014} carrying on";
-/// The entry for (c) alone, as its writer first sends it.
 const ENTRY_C: &str = "claude needs you: approve the 0.48.0 release notes \u{2014} carrying on";
-/// [`ENTRY_C`] cut to the cap a server's refusal named (`fit_bytes`), sent
-/// again after the refusal.
 const ENTRY_C_CUT: &str = "claude needs you: approve the 0.48.0 rel\u{2026}";
-/// An entry of the needs owner the loop did not write: someone else's.
 const ENTRY_OTHER: &str = "claude needs you: something nobody told the window";
 
 fn set(needs: &[&str]) -> Vec<String> {
     needs.iter().map(|need| (*need).to_string()).collect()
 }
 
-/// What the worker's body does, one step at a time, at the test's word.
 enum Step {
     /// The loop tells the window's host the set and the entry's text
     /// (`IdleHost::needs_standing`).
@@ -48,10 +37,6 @@ enum Step {
     Land(Option<String>),
 }
 
-/// The real host supervising a headless App's session 0 (a Claude Code
-/// under Cruise), its `needs` hook the live [`store_needs`] over the App's
-/// store and its facts kept on a channel the test drains, never applied by
-/// themselves: a wake the window has not taken yet.
 struct Desk {
     app: App,
     host: HostHandle,
@@ -138,8 +123,6 @@ impl Desk {
         }
     }
 
-    /// Take `step` in the worker's body and wait for it (a hang
-    /// detector): what the timeline held as it was taken.
     fn step(&self, step: Step) -> ToldNeeds {
         self.steps.send(step).expect("the body listens");
         self.done
@@ -147,12 +130,10 @@ impl Desk {
             .expect("not within 60 s: the step taken")
     }
 
-    /// The needs facts the host has sent the window since the last call.
     fn woken(&self) -> usize {
         self.facts.try_iter().count()
     }
 
-    /// The session's need facts as the next publication reads them.
     fn facts(&self) -> crate::needs::NeedFacts {
         let handle = self.app.store.read().unwrap().by_local(0).cloned();
         let handle = handle.expect("session 0");
@@ -166,7 +147,6 @@ impl Desk {
     }
 }
 
-/// The needs owner's entry among `facts`' attention, if one stands.
 fn needs_entry(facts: &crate::needs::NeedFacts) -> Option<&str> {
     facts
         .attention
@@ -175,12 +155,6 @@ fn needs_entry(facts: &crate::needs::NeedFacts) -> Option<&str> {
         .map(|entry| entry.text.as_str())
 }
 
-/// THE WORDS ARE ON THE TIMELINE BEFORE THE ENTRY LANDS (§12.2.3 item 3,
-/// §12.2.6): the loop tells the set — need (a) whole, where the entry
-/// carries it cut at 64 cells — and only then sends the entry's `meta set`;
-/// by the time the server takes that request the session's timeline already
-/// holds the whole set with the entry's exact text, so the first need facts
-/// read after the entry lands hold both, with no wake applied.
 #[test]
 fn the_words_are_on_the_timeline_before_the_entry_lands() {
     let desk = Desk::new();
@@ -230,10 +204,6 @@ fn the_words_are_on_the_timeline_before_the_entry_lands() {
     assert_eq!(desk.woken(), 0, "the take-down's `unset` wakes the window");
 }
 
-/// THE ENTRY THAT STILL STANDS KEEPS ITS WORDS UNTIL IT GOES (§12.2.3 items
-/// 3-4, §12.2.11; the review of 2c): each tell comes just before its
-/// request, so between the tell and the server's write the entry standing
-/// is still the one the set it replaces was told with.
 #[test]
 fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
     let desk = Desk::new();
@@ -291,12 +261,6 @@ fn the_entry_that_still_stands_keeps_its_words_until_it_goes() {
     assert_eq!(desk.woken(), 0, "no tell here moved a reading in place");
 }
 
-/// A TOLD SET IS READ ONLY WHILE ITS ENTRY STANDS (§12.2.3 item 4; the 2b
-/// note's "What 2c adds"): a set told before a request the connection lost
-/// may never land, so the words are read beside the needs owner's entry
-/// they were told with and nowhere else — not beside the entry an earlier
-/// set left standing, nor another owner's entry of the same text, nor no
-/// entry.
 #[test]
 fn a_told_set_is_read_only_while_its_entry_stands() {
     let ab = set(&[NEED_A, NEED_B]);
@@ -348,10 +312,6 @@ fn a_told_set_is_read_only_while_its_entry_stands() {
     assert_eq!(crate::needs::NeedFacts::default().told_needs(), None);
 }
 
-/// THE STORE FOLLOWS THE TELLS AND WAKES ONLY WHERE A READING MOVED
-/// (§12.2.3 item 3, §12.2.11): the live hook over a real store writes the
-/// session's timeline and says whether what a reader reads beside the needs
-/// entry standing moved.
 #[test]
 fn the_store_follows_the_tells_and_wakes_only_where_a_reading_moved() {
     let app = App::headless_for_test();
@@ -421,10 +381,6 @@ fn the_store_follows_the_tells_and_wakes_only_where_a_reading_moved() {
     );
 }
 
-/// A NEEDS FACT PUBLISHES THE NEED, AND THE OPEN PAGE ONCE (§12.2.3 item 3,
-/// §12.2.11): applied, it publishes the session's need — the one place the
-/// words are read — and the herald republishes Settings ▸ Harness where the
-/// verdict moved, once; no face moves.
 #[test]
 fn a_needs_fact_publishes_the_need_and_the_open_page_once() {
     let mut app = App::headless_for_test();
@@ -476,12 +432,8 @@ fn a_needs_fact_publishes_the_need_and_the_open_page_once() {
     assert_eq!(app.harness_screen.revision, revision + 1);
 }
 
-/// THE FACT STAYS COPY, AND NO BIGGER THAN MAIN'S (§12.0: "the wake does not
-/// grow"): `HarnessFact::Needs` carries nothing, so the enum is `Copy` and
-/// its size is what it was at `0f685152bc` (24 bytes on a 64-bit target).
 #[test]
 fn a_harness_fact_stays_copy_and_mains_size() {
-    /// `size_of::<HarnessFact>()` at `0f685152bc`, before `Needs`.
     const MAIN_FACT_BYTES: usize = 24;
     fn copy<T: Copy>() {}
     copy::<crate::HarnessFact>();
@@ -492,13 +444,6 @@ fn a_harness_fact_stays_copy_and_mains_size() {
     );
 }
 
-/// `status needs_told=` READS THE STORE AS A LAB SEES IT (development
-/// builds; the seam a headless run reads the store through): `-` with none
-/// told, `stale` for a set told for an entry not standing, the count a
-/// reader reads beside the needs entry that stands — the set told last, or
-/// the outgoing one while its own entry still stands — `stale` again where
-/// someone else moved the entry, and `-` after the take-down; `needs=`,
-/// `needs_n=` and `hold_by=` read by key as before (a downgrade parse).
 #[test]
 fn status_prints_the_told_set_for_the_entry_that_stands() {
     let app = App::headless_for_test();

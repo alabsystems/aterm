@@ -57,7 +57,7 @@ const USAGE_TAP_DAY: &str = "usage-tap-day:";
 static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static ADOPTED_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Per-tab supervisor failure state after exceeding its restart budget ([`HostNote::SupervisorStopped`]).
+/// Per-tab supervisor failure state after exceeding its restart budget ([`HostNote::SupervisorFailing`]).
 #[derive(Debug)]
 pub(crate) struct SupervisorFail {
     /// Instant of the first failure in this episode.
@@ -309,7 +309,7 @@ impl App {
     pub(crate) fn note_occupancy_mode(&mut self, mode: aterm_agent::supervise::Occupancy) {
         use crate::message_reporters::{occupancy_prompt_entry, occupancy_prompt_key};
         crate::occupancy_host::set_mode(mode);
-        if mode.grant().is_some() {
+        if crate::occupancy_host::prompt_now() {
             self.except(&occupancy_prompt_entry());
         } else {
             self.except_clear(&occupancy_prompt_key());
@@ -856,7 +856,7 @@ impl App {
         }
     }
 
-    /// Publishes the current resume loop exceptions to the digest ([`Family::HarnessResume`]).
+    /// Publishes the current resume loop exceptions to the digest ([`Family::Resume`]).
     pub(crate) fn hand_resume_exceptions(&mut self) {
         let standing: Vec<_> = self
             .resume_standing
@@ -1293,7 +1293,8 @@ impl App {
         filed
     }
 
-    /// Validate `entry` against the message door rule, logging at most once per distinct fault.
+    /// Validate `entry` against the message door rule, logging a fault only when it differs from
+    /// the last one recorded for its key.
     fn checked_entry(&mut self, entry: &Entry) -> Option<Message> {
         let key = entry.key();
         match entry.message() {

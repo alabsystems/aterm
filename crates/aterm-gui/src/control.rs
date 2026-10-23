@@ -2257,7 +2257,7 @@ impl<T> BoundedDispatch<T> {
         Self::with_resume_room(max_capacity, 0)
     }
 
-    /// [`Self::new`], with inbox room for `resume_room` resumed items beyond the `max_capacity` fresh admissions.
+    /// `Self::new`, with inbox room for `resume_room` resumed items beyond the `max_capacity` fresh admissions.
     #[must_use]
     pub(crate) fn with_resume_room(max_capacity: usize, resume_room: usize) -> Self {
         Self {

@@ -206,7 +206,10 @@ fn paths(doomed: &[Doomed]) -> Vec<(Part, Vec<String>)> {
         .collect()
 }
 
+/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
+/// absolute, which a path with no drive is not on Windows.
 #[test]
+#[cfg(unix)]
 fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     let fs = world(now() - 2 * DAY, 4 * DAY);
     let s = surveyed(&fs);
@@ -274,7 +277,10 @@ fn nothing_goes_while_any_of_it_was_written_within_the_window() {
     }
 }
 
+/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
+/// absolute, which a path with no drive is not on Windows.
 #[test]
+#[cfg(unix)]
 fn units_stay_where_the_current_compiler_cannot_be_named() {
     let incremental_only = |fs: &Fake| {
         let s = surveyed(fs);
@@ -367,7 +373,9 @@ fn units_stay_where_the_current_compiler_cannot_be_named() {
     );
 }
 
-/// Sets the unit `hash`'s fingerprint folder, its files and its entries to `at`.
+/// Sets the unit `hash`'s fingerprint folder, its files and its entries to `at`
+/// (for the Unix-only rows below).
+#[cfg(unix)]
 fn date_unit(fs: &mut Fake, hash: &str, at: SystemTime) {
     let named: Vec<String> = fs
         .nodes
@@ -380,7 +388,10 @@ fn date_unit(fs: &mut Fake, hash: &str, at: SystemTime) {
     }
 }
 
+/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
+/// absolute, which a path with no drive is not on Windows.
 #[test]
+#[cfg(unix)]
 fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
     let mut fs = world(now() - DAY, 4 * DAY);
     for hash in [NEW, FRESH] {
@@ -413,7 +424,10 @@ fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
     assert_eq!(parts, vec![Part::Incremental]);
 }
 
+/// Unix only: the fixture's sysroot (`/store/trust/…`) is read only when it is
+/// absolute, which a path with no drive is not on Windows.
 #[test]
+#[cfg(unix)]
 fn what_was_written_since_the_survey_is_kept() {
     let mut fs = world(now() - 2 * DAY, 4 * DAY);
     let doomed = decide(&surveyed(&fs), now());

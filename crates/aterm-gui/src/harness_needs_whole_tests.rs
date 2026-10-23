@@ -1,36 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for rendering full `NEEDS YOU` sets in the status menu, tab hover, and session rows (`needs::attention_outcome`).
+//! Tests for rendering full `NEEDS YOU` sets (`needs::attention_outcome`).
 use aterm_types::needs::AttentionKind;
 
 use super::*;
 use crate::App;
 
-/// Need (a) of §12.2.1: 144 characters, longer than the entry's 64 cells.
 const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
                       & Security ▸ Screen Recording, so the windowed check can capture the \
                       menu";
-/// Need (b) of §12.2.1.
 const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
-/// A third need, standing in for (b) under the same entry.
 const NEED_C: &str = "approve the 0.48.0 release notes";
-/// The entry the loop raises for (a) and one more: its writer's form, the
-/// first need cut at 64 cells (`escalate::needs_attention_text`).
 const ENTRY_AB: &str = "claude needs you: grant Screen Recording to com.aterm.aterm in System \
                         Settings ▸ … (+1 more) \u{2014} carrying on";
-/// The entry for (b) alone.
 const ENTRY_B: &str = "claude needs you: the release credential \
                        (~/.aterm/release-credentials.toml) to sign 0.48.0 \u{2014} carrying on";
-/// (a) as its entry carries it, cut at 64 cells.
 const NEED_A_CUT: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ …";
 
 fn set(needs: &[&str]) -> Vec<String> {
     needs.iter().map(|need| (*need).to_string()).collect()
 }
 
-/// A headless App whose session 0 is a Claude Code: the App, its sid and
-/// its context.
 fn desk() -> (App, String, Arc<crate::SessionCtx>) {
     let mut app = App::headless_for_test();
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
@@ -44,16 +35,12 @@ fn desk() -> (App, String, Arc<crate::SessionCtx>) {
     (app, sid, ctx)
 }
 
-/// The loop's tell: the live hook over the App's store, then the window
-/// woken as the host wakes it where a reading moved (`HarnessFact::Needs`).
 fn tell(app: &mut App, sid: &str, needs: &[&str], entry: &str) {
     if store_needs(&app.store, sid, &set(needs), entry) {
         app.apply_harness_fact(sid, crate::HarnessFact::Needs);
     }
 }
 
-/// The loop's request landing: the needs owner's entry written (`None`: its
-/// `unset`), and its `MetaChanged` wake taken (`on_meta_changed`).
 fn land(app: &mut App, ctx: &crate::SessionCtx, text: Option<&str>) {
     ctx.meta
         .lock()
@@ -67,8 +54,6 @@ fn land(app: &mut App, ctx: &crate::SessionCtx, text: Option<&str>) {
     app.on_meta_changed(0);
 }
 
-/// The Needs you section's rows as `chrome` prints them, each without its
-/// path (` at=…`, always last).
 fn needs_lines(app: &App) -> Vec<String> {
     let lines = app.status_item_chrome_lines();
     let mut section = false;
@@ -95,8 +80,6 @@ fn needs_lines(app: &App) -> Vec<String> {
     out
 }
 
-/// Whether `line` (a `needs_lines` row) is `need`'s row one level in: the
-/// need whole, acting, its hover naming whose need it is, ` indent=1`.
 fn one_in(line: &str, need: &str) -> bool {
     line.strip_prefix(&format!(
         "{need:?} enabled=yes checked=no tip=\"Claude Code in "
@@ -104,17 +87,12 @@ fn one_in(line: &str, need: &str) -> bool {
     .is_some_and(|rest| rest.ends_with(" needs this too\" indent=1"))
 }
 
-/// The hover's lines for session 0.
 fn hover(app: &App) -> Vec<String> {
     app.presence_hover(0, None)
         .map(|h| h.lines().map(str::to_string).collect())
         .unwrap_or_default()
 }
 
-/// THE HOVER LISTS EVERY NEED WHOLE (§12.2.1, §12.2.6): with (a) and (b)
-/// told and their entry up, the tab's hover says `Needs you: <need>` for
-/// each, whole — (a) at its 144 characters, past the entry's 64 cells — then
-/// `Claude Code carries on meanwhile`, and never `Needs attention:`.
 #[test]
 fn the_hover_lists_every_need_whole() {
     let (mut app, sid, ctx) = desk();
@@ -153,10 +131,6 @@ fn the_hover_lists_every_need_whole() {
     );
 }
 
-/// THE ROW'S STATE LINE SAYS THE FIRST NEED WHOLE (§12.2.1's SESSIONS row):
-/// with (a) and (b) told and their entry up, session 0's state line on
-/// Settings ▸ Harness leads with `needs you: <(a) whole> (+1 more); carrying
-/// on` — the page draws no row for (b), so it counts it.
 #[test]
 fn the_rows_state_line_says_the_first_need_whole() {
     let (mut app, sid, ctx) = desk();
@@ -176,11 +150,6 @@ fn the_rows_state_line_says_the_first_need_whole() {
     );
 }
 
-/// A SET THAT MOVES UNDER THE SAME ENTRY MOVES WHAT IS DRAWN (§12.2.6):
-/// `[a, b]` up, then `[a, c]` told under the very same entry text — which
-/// no server write announces — moves the published verdict (its key
-/// unchanged: one need, one age, one notice), the menu's row one level in
-/// from (b) to (c), and the hover; `status needs_n=` counts the set.
 #[test]
 fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
     let (mut app, sid, ctx) = desk();
@@ -228,12 +197,6 @@ fn a_set_that_moves_under_the_same_entry_moves_what_is_drawn() {
     );
 }
 
-/// THE OUTGOING SET IS NEVER DRAWN CUT (§12.2.11, the review of 2c): from
-/// the tell of a new set until its request lands, the entry that stands is
-/// still the old set's, and every surface keeps saying the old set whole —
-/// at a change of the set (`[a, b]` to `[b]`) and at the take-down — then
-/// the new one whole the moment its request lands, never the old entry's
-/// 64 cells in between.
 #[test]
 fn the_outgoing_set_is_never_drawn_cut() {
     let (mut app, sid, ctx) = desk();
@@ -317,18 +280,12 @@ fn a_press_on_a_further_needs_row_brings_its_tab_in_front() {
     );
 }
 
-/// The hover AS THE STRIP WAS LAST STAMPED with it
-/// (`work_counts::last_tooltips_pushed`: the words the native tooltip
-/// shows), never as [`App::presence_hover`] composes it on the call.
 fn stamped_hover() -> String {
     crate::work_counts::last_tooltips_pushed(crate::WindowId(0))
         .and_then(|tips| tips.first().cloned().flatten())
         .unwrap_or_default()
 }
 
-/// The desk with a shell reading folded into session 0's presence slot, as
-/// every live session has: past the slot's first sight, a refresh that
-/// moves nothing stamps no strip (the bare [`desk`] stamps at every one).
 fn live_desk() -> (App, String, Arc<crate::SessionCtx>) {
     use crate::session_status::{ActivitySample, Evidence};
     let (mut app, sid, ctx) = desk();
@@ -360,9 +317,6 @@ fn live_desk() -> (App, String, Arc<crate::SessionCtx>) {
     (app, sid, ctx)
 }
 
-/// THE STAMPED HOVER FOLLOWS A SET THAT MOVES UNDER ONE ENTRY (§12.2.1; the
-/// review of 2d): the tab's hover is composed only where a strip is
-/// stamped, and a refresh stamps only where the pill's words moved.
 #[test]
 fn the_stamped_hover_follows_a_set_under_one_entry() {
     let (mut app, sid, ctx) = live_desk();
@@ -393,12 +347,6 @@ fn the_stamped_hover_follows_a_set_under_one_entry() {
     assert_eq!(stamps, 1, "one stamp where the pill moved too: {now}");
 }
 
-/// THE STAMPED HOVER FOLLOWS A FIRST TELL BESIDE A STANDING ENTRY (§12.2.1,
-/// §12.2.5; the review of 2d): a successor's first tell restates the entry
-/// it carried, which no server write announces, and the pill reads the same
-/// (the first need and one more); the Needs fact stamps the strip once, and
-/// the stamped hover moves from the parse's one line (`(+1 more)`) to a line
-/// each.
 #[test]
 fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
     const SHORT_A: &str = "sign the release";
@@ -421,11 +369,6 @@ fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
     assert_eq!(stamps, 1, "one stamp for the first tell: {now}");
 }
 
-/// THE CHIP'S TITLE FOLLOWS THE NEED'S WORDS AND NOTHING ELSE (§12.2.3
-/// item 5; the W4 title slice): the title says the first need whole and how
-/// many more (`harness_glass::need_title`), so the session's trail
-/// generation — which rebuilds a title being read — moves where those move:
-/// the need's first tell, a new first need, the take-down.
 #[test]
 fn the_title_follows_the_needs_words_and_nothing_else() {
     use crate::claude_lights::glass_bits;
@@ -465,12 +408,6 @@ fn the_title_follows_the_needs_words_and_nothing_else() {
     assert_eq!(at_rest(&app), rest, "at rest still nothing");
 }
 
-/// THE CHIP'S DESCRIPTION BORROWS THE NEED IT SAYS (§12.2.1; the W4 title
-/// slice's review): a screen reader is sent the accessibility tree with
-/// each present, and the Autopilot chip's description with it
-/// (`App::autopilot_spoken`), so the need it reads is lent under the
-/// session's lock, never copied: nine needs told cost the description what
-/// two do, though it reads the nine (CONTROL: `And 8 more`).
 #[test]
 fn the_chips_description_costs_no_more_for_nine_needs_than_for_two() {
     use crate::autopilot::AutopilotView;

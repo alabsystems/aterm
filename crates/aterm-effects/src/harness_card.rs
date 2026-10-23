@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure emitter for the Autopilot harness card decoration ([`CardPalette`]).
+//! Pure emitter for the Autopilot harness card decoration ([`CardPalette`](crate::harness_card::CardPalette)).
 
 use std::sync::Arc;
 

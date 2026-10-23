@@ -170,7 +170,6 @@ fn wire_read(e: &std::io::Error) -> Error {
 }
 
 /// The directory a rename into `dest` changes.
-#[cfg(unix)]
 fn parent_of(dest: &Path) -> &Path {
     dest.parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -267,11 +266,9 @@ impl Part {
         aterm_durable::durable(file).map_err(|e| local("cannot make durable", &self.path, &e))
     }
 
-    /// Rename into `dest`, then, on unix, `durable_dir` of its directory (Windows opens no
-    /// directory as a file, so there the rename is the last step, as `TapeSink::finish`'s
-    /// file flush is). A part file another download of `dest` replaced is left to that
-    /// download: CouldNotRun `Local`, nothing renamed. The file is closed just before the
-    /// rename; a failed rename removes it.
+    /// Rename into `dest`, then `durable_dir` of its directory. A part file another download
+    /// of `dest` replaced is left to that download: CouldNotRun `Local`, nothing renamed. The
+    /// file is closed just before the rename; a failed rename removes it.
     fn finish(mut self, dest: &Path) -> Result<()> {
         let ours = self
             .file
@@ -288,12 +285,8 @@ impl Part {
         self.file = None;
         std::fs::rename(&self.path, dest).map_err(|e| local("cannot rename into", dest, &e))?;
         self.kept = true;
-        #[cfg(unix)]
-        {
-            let dir = parent_of(dest);
-            aterm_durable::durable_dir(dir).map_err(|e| local("cannot make durable", dir, &e))?;
-        }
-        Ok(())
+        let dir = parent_of(dest);
+        aterm_durable::durable_dir(dir).map_err(|e| local("cannot make durable", dir, &e))
     }
 }
 

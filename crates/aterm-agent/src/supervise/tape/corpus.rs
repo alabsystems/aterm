@@ -196,7 +196,7 @@ impl Scrub {
             .ok_or_else(|| format!("{}: not UTF-8", from.display()))?;
         let text = text.trim_end_matches('/');
         let names: Vec<&str> = text.split('/').skip(1).collect();
-        if !from.is_absolute() || names.len() < 2 || names.iter().any(|n| n.is_empty()) {
+        if !text.starts_with('/') || names.len() < 2 || names.iter().any(|n| n.is_empty()) {
             return Err(format!(
                 "{text:?}: a scrub takes an absolute directory at least two names below the root"
             ));

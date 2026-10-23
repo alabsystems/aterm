@@ -3,14 +3,10 @@
 
 use super::*;
 
-/// THE TEXT FORM of `replies` within `budget`, the closing line naming it:
-/// [`render_within`] as the read fills what its data line leaves.
 fn render_text(replies: &[HostReply], budget: usize, own: Option<&str>) -> String {
     render_within(&blocks_of(replies, own), budget, budget).text
 }
 
-/// A `session` wire row of `fields`, values pct-encoded as the server writes
-/// them.
 fn wire_row(fields: &[(&str, &str)]) -> String {
     let mut row = String::from("session");
     for (k, v) in fields {
@@ -22,7 +18,6 @@ fn wire_row(fields: &[(&str, &str)]) -> String {
     row
 }
 
-/// A Claude Code worker at work, with full-size excerpts.
 fn busy_agent(host: usize, n: usize) -> String {
     let sid = format!("s-{host:04x}{n:016x}");
     let words = "word ".repeat(80);
@@ -45,12 +40,10 @@ fn busy_agent(host: usize, n: usize) -> String {
     ])
 }
 
-/// `text` cut to the server's 400-byte excerpt.
 fn excerpt400(text: &str) -> String {
     text.chars().take(400).collect()
 }
 
-/// An idle shell.
 fn shell(n: usize) -> String {
     wire_row(&[
         ("local", &n.to_string()),
@@ -81,13 +74,10 @@ fn chars(text: &str) -> usize {
     text.chars().count()
 }
 
-/// Whether `text` has the closing line of a read the budget cut.
 fn says_it_left_out(text: &str) -> bool {
     text.lines().any(|l| l.starts_with(LEFT_OUT_LEAD))
 }
 
-/// Every line within its cap: headers, unanswered lines, session lines,
-/// excerpt lines (at their widest, a whole record).
 fn assert_line_caps(text: &str) {
     for line in text.lines() {
         let cap = if line.starts_with("== ") && line.contains(" did not answer: ") {
@@ -158,14 +148,12 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
     assert!(!is_survey(&parts(&["sessions"])));
 }
 
-/// The excerpt lines of `text` that say what a session was asked.
 fn asked_rows(text: &str) -> usize {
     text.lines()
         .filter(|l| l.starts_with("    asked: "))
         .count()
 }
 
-/// The sessions every `+N` line of `text` counts.
 fn folded(text: &str) -> usize {
     text.lines()
         .filter_map(|l| l.strip_prefix("  +"))
@@ -173,14 +161,12 @@ fn folded(text: &str) -> usize {
         .sum()
 }
 
-/// The session lines of `text` marked as having lost excerpts.
 fn marked(text: &str) -> usize {
     text.lines()
         .filter(|l| l.starts_with("s-") && l.contains(EXCERPTS_CUT))
         .count()
 }
 
-/// The excerpt lines of `text` under the session `sid`.
 fn words_of<'a>(text: &'a str, sid: &str) -> Vec<&'a str> {
     text.lines()
         .skip_while(|l| !l.starts_with(sid))
@@ -189,8 +175,6 @@ fn words_of<'a>(text: &'a str, sid: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// 180 SESSIONS ON ONE INSTANCE are every one listed while the read fits —
-/// an instance has no cap of its own — the most pressing first.
 #[test]
 fn one_hundred_eighty_sessions_render_within_the_budget() {
     let mut rows: Vec<String> = (0..170).map(shell).collect();
@@ -235,9 +219,6 @@ fn one_hundred_eighty_sessions_render_within_the_budget() {
     );
 }
 
-/// Every read the budget's fill can make of `replies`: for each `n`, the
-/// first `n` units of its order ([`fill_order`]) at the floor, as
-/// [`render_within`] tries them.
 fn fill_reads(replies: &[HostReply]) -> Vec<String> {
     let blocks = blocks_of(replies, None);
     let order = fill_order(&blocks);
@@ -246,8 +227,6 @@ fn fill_reads(replies: &[HostReply]) -> Vec<String> {
         .collect()
 }
 
-/// THE BUDGET IS USED: `text` is one of the fill's reads (`reads`,
-/// [`fill_reads`]), and the next one, a unit more, is over `room`.
 fn used_to_the_unit(reads: &[String], room: usize, text: &str) -> bool {
     reads
         .iter()
@@ -256,12 +235,6 @@ fn used_to_the_unit(reads: &[String], room: usize, text: &str) -> bool {
         .is_some_and(|next| chars(next) > room)
 }
 
-/// 180 BUSY AGENTS OVER EIGHTEEN INSTANCES: every line does fit, and the
-/// budget left fills with excerpt lines ROUND ROBIN over the instances —
-/// each one's first agent's last words before any one's first agent's
-/// prompt, and those before any one's second agent's — to within one
-/// excerpt line of the budget; every agent that lost excerpts is marked so
-/// on its line and counted in the closing line.
 #[test]
 fn eighteen_instances_degrade_honestly_to_fit() {
     let replies: Vec<HostReply> = (0..18)
@@ -320,9 +293,6 @@ fn eighteen_instances_degrade_honestly_to_fit() {
     );
 }
 
-/// A Claude Code agent of a fleet peer, as a lab Mac has them: `agent` in
-/// one state for `agent_ms`, its words at the server's 400-byte cap, its
-/// place a real one.
 fn lab_agent(host: usize, n: usize, agent: &str, agent_ms: &str) -> String {
     let sid = format!("s-{host:04x}{n:016x}");
     wire_row(&[
@@ -343,7 +313,6 @@ fn lab_agent(host: usize, n: usize, agent: &str, agent_ms: &str) -> String {
     ])
 }
 
-/// A shell of a lab Mac: running a build, or idle at its prompt.
 fn lab_shell(host: usize, n: usize, running: bool) -> String {
     let sid = format!("s-{host:04x}{n:016x}");
     let mut fields = vec![
@@ -362,9 +331,6 @@ fn lab_shell(host: usize, n: usize, running: bool) -> String {
     wire_row(&fields)
 }
 
-/// THE END USE, THIRTY LAB MACS: each a busy agent, two agents resting for
-/// hours, a running build and an idle shell, every excerpt at the server's
-/// cap — and one Mac with two agents asking.
 #[test]
 fn thirty_lab_macs_keep_each_machines_most_pressing_words() {
     let replies: Vec<HostReply> = (0..30)
@@ -437,8 +403,6 @@ fn thirty_lab_macs_keep_each_machines_most_pressing_words() {
     );
 }
 
-/// AN OSC 52 / BIDI TITLE renders as text: no escape, no bell, no override
-/// reaches the terminal, and content cannot spell the label.
 #[test]
 fn a_hostile_title_and_excerpt_render_escaped() {
     let row = wire_row(&[
@@ -501,8 +465,6 @@ fn a_hostile_title_and_excerpt_render_escaped() {
     }
 }
 
-/// `--sid` gives one session's whole record: its excerpts at their full 400
-/// bytes, a shell's rows one line each.
 #[test]
 fn one_session_reads_in_full() {
     let mut rows = vec![busy_agent(2, 1), shell(5)];
@@ -540,8 +502,6 @@ fn one_session_reads_in_full() {
     assert_eq!(render_sid(&replies, "s-nope", None), None);
 }
 
-/// `--json` is every record, unbudgeted, an instance that did not answer
-/// with its reason.
 #[test]
 fn the_json_form_is_every_record() {
     let replies = vec![
@@ -572,7 +532,6 @@ fn the_json_form_is_every_record() {
     );
 }
 
-/// The classes the text orders by, and which of them carry excerpts.
 #[test]
 fn sessions_are_ordered_by_what_needs_reading() {
     let row = |fields: &[(&str, &str)]| Fields::of(&wire_row(fields));
@@ -639,11 +598,6 @@ fn sessions_are_ordered_by_what_needs_reading() {
     assert_eq!(age(200_000_000), "2d");
 }
 
-/// A RECORD THAT NAMES ITS NEED IS RANKED BY IT
-/// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S2): every stuck word is
-/// stalled and every decide word asking; with `needs=-` a box a harness
-/// presses is work, a wall it settles an agent's, and an attention entry (a
-/// wait) asks nothing; a word this build does not know is still a need.
 #[test]
 fn a_record_naming_its_need_is_ranked_by_it() {
     use aterm_types::needs::{NeedWord, Severity};
@@ -691,8 +645,6 @@ fn a_record_naming_its_need_is_ranked_by_it() {
     );
 }
 
-/// A machine of the fleet that answered at `level`: `busy` agents at work
-/// and `shells` idle shells.
 fn peer(host: usize, level: &str, busy: usize, shells: usize) -> HostReply {
     HostReply {
         label: format!("lab-{host:02}"),
@@ -702,8 +654,6 @@ fn peer(host: usize, level: &str, busy: usize, shells: usize) -> HostReply {
     }
 }
 
-/// [`peer`]'s reply as the fleet client hands it over: the lines after
-/// `OK <n>`.
 fn peer_lines(host: usize, level: &str, busy: usize, shells: usize) -> Vec<String> {
     let mut rows: Vec<String> = (0..busy).map(|n| busy_agent(host, n)).collect();
     rows.extend((0..shells).map(shell));
@@ -716,7 +666,6 @@ fn peer_lines(host: usize, level: &str, busy: usize, shells: usize) -> Vec<Strin
     lines
 }
 
-/// A machine of the fleet that did not answer, and why.
 fn unanswered(label: &str, why: &str) -> HostReply {
     HostReply {
         label: label.to_owned(),
@@ -726,9 +675,6 @@ fn unanswered(label: &str, why: &str) -> HostReply {
     }
 }
 
-/// THIRTY MACHINES fit the default budget: every one is exactly one header
-/// or one line with its reason, whatever their sessions, and every line
-/// keeps its cap.
 #[test]
 fn thirty_hosts_render_within_the_budget_one_row_each() {
     let mut replies: Vec<HostReply> = (0..26)
@@ -780,11 +726,6 @@ fn thirty_hosts_render_within_the_budget_one_row_each() {
     );
 }
 
-/// A PEER'S HEADER keeps what a reader acts on. Dialled by its address with
-/// its own long `host=` beside it, a LAN peer's header carries its name, pid,
-/// version, state counts and what its reply cap left out whole (a
-/// thirty-machine fleet read, `targo --unverified lab fleet-sim`, showed every
-/// peer's header cut at 100 characters to `· 3 sessions…`, its counts gone).
 #[test]
 fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
     let row = |sid: &str, agent: &str| {
@@ -849,10 +790,6 @@ fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
     assert!(cut_name.contains("… pid 77065 ·"), "{cut_name}");
 }
 
-/// A PEER CANNOT PASS FOR THIS MACHINE: its block is headed by the name
-/// dialled, its own `host=` only beside it, and a session of it whose sid is
-/// the caller's own is not marked `(you)` — in the text, in `--host`'s full
-/// form, in `--sid` — while the same reply from this machine is.
 #[test]
 fn a_peer_cannot_pass_for_this_machine() {
     let own = "s-00000000000000000001";
@@ -894,8 +831,6 @@ fn a_peer_cannot_pass_for_this_machine() {
     assert!(!render_json(&[from(false)]).contains("\"fleet\""));
 }
 
-/// A PEER'S REPLY CAP is never silent: the sessions it answered at facts
-/// and those it left out are on its header.
 #[test]
 fn a_cut_reply_says_what_it_left_out() {
     let header = |sessions: usize, cut: usize| {
@@ -935,10 +870,6 @@ fn a_cut_reply_says_what_it_left_out() {
     );
 }
 
-/// `--sid` AND THE REPLY CAP: a session no reply holds, where a peer's cap
-/// left sessions out, is answered naming that peer and how many it left out,
-/// since the session may be among them — and only that peer; with nothing
-/// left out the answer names none.
 #[test]
 fn a_sid_the_reply_cap_may_have_hidden_says_so() {
     let answered = |label: &str, header: &str, rows: Vec<String>| {
@@ -1002,9 +933,6 @@ fn a_sid_the_reply_cap_may_have_hidden_says_so() {
     );
 }
 
-/// AN IDLE SHELL NAMES ITS PLACE ONCE: a terminal title that is only its
-/// cwd — `user@host: ~/dir` as zsh and bash set it, the cwd itself, or its
-/// last step — is left out of its line, which the place already ends with.
 #[test]
 fn an_idle_shell_names_its_place_once() {
     let idle = |title: &str, cwd: &str| {
@@ -1042,8 +970,6 @@ fn an_idle_shell_names_its_place_once() {
     );
 }
 
-/// WHICH TAB RANG on the survey's line: a session that rang says how many
-/// bells and the newest's program, sound and age.
 #[test]
 fn a_session_that_rang_names_its_newest_bell() {
     let line = |bells: &str, last: &str, remote: bool| {
@@ -1069,11 +995,6 @@ fn a_session_that_rang_names_its_newest_bell() {
     assert!(hostile.contains(" bells=1 (? sounded 4s ago)"), "{hostile}");
 }
 
-/// A BELL IS NEWS ONLY WHILE IT IS NEW: the bells segment stands on the line
-/// while the newest bell is under [`NEWLY_DONE_MS`] old, as `human=` and
-/// `typed by` do, so a tab that rang hours ago (zsh's failed completion, one
-/// Claude Code ping) reads as it did before it rang, its title, place and
-/// model whole.
 #[test]
 fn an_old_bell_leaves_the_survey_line() {
     let line = |bells: Option<&str>| {
@@ -1122,8 +1043,6 @@ fn an_old_bell_leaves_the_survey_line() {
     );
 }
 
-/// An unanswered line too long for its cap is cut before its label, never
-/// through it, and a label cannot spell another.
 #[test]
 fn an_unanswered_line_keeps_its_label() {
     let long = "x".repeat(400);
@@ -1156,8 +1075,6 @@ fn an_unanswered_line_keeps_its_label() {
     );
 }
 
-/// NO BUDGET IS EVER PASSED, however small: the last resort's closing line
-/// is fitted to what is left, or left out.
 #[test]
 fn no_budget_is_ever_passed() {
     let replies: Vec<HostReply> = (0..18)
@@ -1174,11 +1091,6 @@ fn no_budget_is_ever_passed() {
     }
 }
 
-/// THE READ LEADS WITH ITS DATA LINE, ahead of anything a session wrote, and
-/// the whole keeps the budget however small, its closing notes included:
-/// past the line, the blocks fill what the line and the notes leave as
-/// [`render_within`] fills it, the notes follow, and a cut names the
-/// CALLER'S budget, not what the line and the notes left of it.
 #[test]
 fn the_read_leads_with_its_data_line_within_the_budget() {
     let replies: Vec<HostReply> = (0..18)
@@ -1277,11 +1189,6 @@ fn the_read_leads_with_its_data_line_within_the_budget() {
     assert!(!DATA_LINE.starts_with("== ") && !DATA_LINE.starts_with("s-"));
 }
 
-/// AN AGENT IDLE FOR HOURS still says what it was asked and what it last
-/// said under the default budget — on a real lab most Claude Code sessions
-/// rest for hours, and a reader summarising the fleet needs exactly that —
-/// and those are the first excerpts a tight budget cuts, ahead of a busy
-/// agent's, the closing line naming the cut.
 #[test]
 fn an_agent_idle_for_hours_keeps_its_excerpts_until_the_budget_is_tight() {
     let resting = wire_row(&[
@@ -1337,14 +1244,11 @@ fn an_agent_idle_for_hours_keeps_its_excerpts_until_the_budget_is_tight() {
     assert!(tight.ends_with(&left_out_line(0, 1, false)), "{tight}");
 }
 
-/// The narrowest read that shows every session and every agent's excerpts:
-/// each excerpt at [`EXCERPT_CHARS`].
 fn narrowest(replies: &[HostReply]) -> String {
     let blocks = blocks_of(replies, None);
     render(&blocks, &Shown::all(&blocks, Class::Agent, EXCERPT_CHARS))
 }
 
-/// A finished worker: its task done, its agent idle, its report whole.
 fn done_worker(n: usize, said: &str) -> String {
     wire_row(&[
         ("local", &n.to_string()),
@@ -1363,15 +1267,10 @@ fn done_worker(n: usize, said: &str) -> String {
     ])
 }
 
-/// The excerpt lines of `text`.
 fn excerpt_rows(text: &str) -> Vec<&str> {
     text.lines().filter(|l| l.starts_with("    ")).collect()
 }
 
-/// A READ THAT FITS SHOWS EVERY EXCERPT WHOLE (the 2026-10-16 real-login
-/// run's fleet read used 2,726 of its 24,000 characters and still cut each
-/// excerpt to 160, dropping the one fact a worker reported): no excerpt line
-/// is cut, and each carries its record's end.
 #[test]
 fn a_read_that_fits_shows_every_excerpt_whole() {
     let report = format!(
@@ -1406,8 +1305,6 @@ fn a_read_that_fits_shows_every_excerpt_whole() {
     assert!(!says_it_left_out(&text), "{text}");
 }
 
-/// Whether an excerpt row was cut: it ends in `…`, or its words start with one
-/// (a finished turn's `said:`, cut keeping its end).
 fn is_cut(row: &str) -> bool {
     row.ends_with('…')
         || row
@@ -1415,8 +1312,6 @@ fn is_cut(row: &str) -> bool {
             .is_some_and(|(_, words)| words.starts_with('…'))
 }
 
-/// PAST THE BUDGET THE EXCERPTS NARROW ALIKE, AS WIDE AS THE BUDGET LETS THEM,
-/// then go in the old order — never past the budget.
 #[test]
 fn excerpts_narrow_alike_then_go_least_needed_first() {
     let resting = wire_row(&[
@@ -1505,8 +1400,6 @@ fn excerpts_narrow_alike_then_go_least_needed_first() {
     assert!(tight.ends_with(&left_out_line(0, 1, false)), "{tight}");
 }
 
-/// A FINISHED TURN'S `said:`, CUT, KEEPS ITS END — where a report puts its
-/// result — when the server sent it whole.
 #[test]
 fn a_finished_turns_said_keeps_its_end_when_cut() {
     let report = format!(
@@ -1558,9 +1451,6 @@ fn a_finished_turns_said_keeps_its_end_when_cut() {
     );
 }
 
-/// AN ATTENTION LINE a session raised is shown, not only counted: the
-/// session line says it is raised and, at content, an excerpt line carries
-/// its words, escaped; at facts no word was sent, and none is invented.
 #[test]
 fn a_raised_attention_line_is_shown() {
     let row = |attention: &str| {
@@ -1606,10 +1496,6 @@ fn a_raised_attention_line_is_shown() {
     assert!(!quiet.contains("attention"), "{quiet}");
 }
 
-/// AN AGENT AT A BOX NOBODY PRESSES reads `asking`, as its header counts it
-/// — never `prompt`, which reads as an agent idle at its own prompt — with
-/// the tool it asks about, from a server that names no need and one whose
-/// need is the box (`needs=approval`).
 #[test]
 fn an_agent_at_a_box_nobody_presses_reads_asking() {
     let row = |agent: &str, needs: Option<&str>| {
@@ -1657,7 +1543,6 @@ fn an_agent_at_a_box_nobody_presses_reads_asking() {
     }
 }
 
-/// The context number is what is LEFT, and reads so.
 #[test]
 fn context_reads_as_what_is_left() {
     let row = wire_row(&[
@@ -1672,9 +1557,6 @@ fn context_reads_as_what_is_left() {
     assert!(text.contains(" ctx_left=5%"), "{text}");
 }
 
-/// `--host` prints its machine in full: every session, each with its excerpt
-/// lines whatever its class, and no `+N` line, unbudgeted — where a budget
-/// that cannot hold it all folds the idle shells and counts them.
 #[test]
 fn one_machine_reads_in_full() {
     let idle = wire_row(&[
@@ -1711,9 +1593,6 @@ fn one_machine_reads_in_full() {
     );
 }
 
-/// ONE CAUSE OF THIS MACHINE'S THAT REFUSED EVERY PEER is said once, with
-/// its remedy: no route to any host (local-network privacy), to any network
-/// (offline, a VPN), or this process's own refusal (a sandbox).
 #[test]
 fn one_cause_that_refused_every_peer_is_said_once() {
     let peer = |fault: PeerFault| PeerSurvey {
@@ -1748,9 +1627,6 @@ fn one_cause_that_refused_every_peer_is_said_once() {
     assert_eq!(fleet_note(&[peer(NoRoute), answered]), None);
 }
 
-/// THE PEERS THAT ALLOW FACTS ALONE are named in one closing line, so the
-/// reader knows why it has no words of theirs and where that changes; past
-/// six names the rest are counted.
 #[test]
 fn the_peers_that_allow_facts_alone_are_named() {
     let at = |host: usize, level: &str| peer(host, level, 1, 0);
@@ -1771,10 +1647,6 @@ fn the_peers_that_allow_facts_alone_are_named() {
     assert!(many.contains("3 more"), "{many}");
 }
 
-/// A PEER'S ROW CANNOT DRAW THE TEXT'S OWN STRUCTURE: its line starts with
-/// its sid, so a sid that is no `s-<hex>` shows `?` — one that spells a
-/// fleet header, and one that spells the `(you)` mark — and so does a
-/// program, agent word or task that is no word.
 #[test]
 fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
     let rows = vec![
@@ -1842,11 +1714,8 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
     );
 }
 
-/// The line [`stub_fleet`] ends its read with.
 const STUB_NOTE: &str = "stub-note-0d6b: the read's closing line";
 
-/// A fleet client that reads one busy machine and closes its read with
-/// [`STUB_NOTE`], as a member short of its issuer's book does.
 fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
     Ok(FleetRead {
         peers: vec![PeerSurvey {
@@ -1859,9 +1728,6 @@ fn stub_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, String> {
     })
 }
 
-/// THE FLEET CLIENT'S CLOSING LINE: the text read ends with it, inside the
-/// budget it was given room in, however tight; under `--json` and `--sid` it
-/// is on stderr alone, never in the records on stdout.
 #[test]
 fn the_fleet_clients_closing_line_ends_the_read_within_its_budget() {
     let parts = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
@@ -1907,8 +1773,6 @@ fn the_fleet_clients_closing_line_ends_the_read_within_its_budget() {
     assert_eq!((printed.code, printed.out), (2, None));
 }
 
-/// A PEER WITH MORE INSTANCES THAN THE ONE READ says so on its header: the
-/// fleet port is one instance's, and the others there are not read.
 #[test]
 fn a_peer_with_more_instances_than_one_read_says_so() {
     let header = |remote: bool, instances: &str| {
@@ -1933,9 +1797,6 @@ fn a_peer_with_more_instances_than_one_read_says_so() {
     assert!(!header(false, "2").contains("instances read"));
 }
 
-/// A PEER THAT PROVED NO BOUND NODE KEY SAYS SO on its header, which keeps
-/// it whole past the cap, and in `--json`: which machine it is is its word
-/// alone.
 #[test]
 fn a_peer_whose_node_is_unproven_says_so() {
     let reply = |remote: bool, unproven: bool, label: &str| HostReply {
@@ -1964,9 +1825,6 @@ fn a_peer_whose_node_is_unproven_says_so() {
     assert!(!render_json(&[reply(true, false, "lab")]).contains("unproven"));
 }
 
-/// A `--sid` FROM A FLEET READ needs the fleet: a read that asked no peer
-/// says a peer's session takes `--fleet` or `--host`; a fleet read that did
-/// not find it does not.
 #[test]
 fn a_sid_not_found_here_names_the_fleet() {
     let here = [reply(1, vec![shell(1)])];
@@ -1978,11 +1836,6 @@ fn a_sid_not_found_here_names_the_fleet() {
     assert!(!sid_not_found(&here, "s-77", true).contains("--fleet"));
 }
 
-/// THE LOCAL WALK DIALS ONE INSTANCE AT A TIME (plan 5F-6's end to end):
-/// every probe connects through one shared connector that admits a single
-/// connect and answers any other meanwhile with an immediate timeout, so a
-/// walk that asked every instance at once read all but one as `timed out
-/// after 2s` within milliseconds.
 #[test]
 fn the_local_walk_dials_one_instance_at_a_time_in_order() {
     let caller = std::thread::current().id();

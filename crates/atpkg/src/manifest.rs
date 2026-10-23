@@ -449,6 +449,10 @@ fn validate_shim_env(m: &PkgManifest) -> Result<(), Reject> {
 
 /// The row rules `serde` cannot express (`asset`/`sha256` are `serde`-optional, so a row of an
 /// unknown protocol can omit them and be refused by name at admission):
+///
+/// * the retired `kind = "vendor-fetch"` refuses the whole manifest ([`Reject::RetiredKind`]);
+/// * a `github-release` or `https` row requires `asset` and `sha256` and carries no `sha512`
+///   ([`Reject::Malformed`]).
 fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     for a in &m.artifacts {
         if a.kind == "vendor-fetch" {

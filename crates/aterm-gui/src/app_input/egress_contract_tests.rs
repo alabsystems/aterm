@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Fill `fd` (already `O_NONBLOCK`) until the kernel takes no more.
 fn fill(fd: i32) -> usize {
     let mut filled = 0usize;
     loop {
@@ -30,8 +29,6 @@ fn fill(fd: i32) -> usize {
     filled
 }
 
-/// Write 4097-byte frames into `sink`'s spill until its cap refuses one, each
-/// accepted whole; returns the accepted frames, in order.
 fn fill_spill(sink: &SinkWriter) -> Vec<Vec<u8>> {
     let mut accepted: Vec<Vec<u8>> = Vec::new();
     for i in 0usize.. {
@@ -51,8 +48,6 @@ fn fill_spill(sink: &SinkWriter) -> Vec<Vec<u8>> {
     accepted
 }
 
-/// A sink over one end of a socketpair in the production master's shape
-/// (`O_NONBLOCK`, declared), filled solid: a program that stopped reading.
 fn wedged_socket() -> (Arc<SinkWriter>, UnixStream, usize) {
     let (reader, writer) = UnixStream::pair().expect("socketpair");
     reader.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
@@ -64,14 +59,10 @@ fn wedged_socket() -> (Arc<SinkWriter>, UnixStream, usize) {
     (sink, reader, filled)
 }
 
-/// Poll `done` until it holds or `limit` passes.
 fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     aterm_spec::wait::within(limit, Duration::from_millis(2), || done().then_some(())).is_some()
 }
 
-/// The park witness for the never-parks tests: a thread that reads the
-/// program's input out only if `done` is not set within a minute, and returns
-/// whether it had to.
 fn park_witness(reader: i32, done: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -87,9 +78,6 @@ fn park_witness(reader: i32, done: Arc<AtomicBool>) -> std::thread::JoinHandle<b
     })
 }
 
-/// Enqueue `ev` for `sink` on the ordered writer, borrowing the terminal,
-/// mode mirror and echo tracker of `app`'s front session (the writer takes
-/// them as handles; the bytes go to `sink`).
 fn enqueue(
     app: &App,
     sink: &Arc<SinkWriter>,
@@ -111,8 +99,6 @@ fn enqueue(
     )
 }
 
-/// A left press at cell (row 2, col 3), in the shape the App's mouse arm
-/// dispatches — `ESC[<0;4;3M` under SGR tracking.
 fn left_press() -> InputEvent {
     InputEvent::MouseButton {
         button: aterm_types::mouse::MouseButton::Left,
@@ -128,8 +114,6 @@ fn left_press() -> InputEvent {
     }
 }
 
-/// Read the `O_NONBLOCK` read end `fd` until `want` bytes arrived, or
-/// [`MUST_HAPPEN`] passed (then whatever did).
 fn read_until(fd: i32, want: usize) -> Vec<u8> {
     let mut got = Vec::with_capacity(want);
     wait_until(MUST_HAPPEN, || {
@@ -143,11 +127,6 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
-/// Close a fixture's pipe, taking the test's last handle on its sink. The sink
-/// borrows `pipe[1]`, and each job its ordered writer admitted holds a clone
-/// that keeps its serializer registered under this fd number; closing under
-/// such a job hands the number to the next fixture's `pipe()`, whose jobs then
-/// reach this serializer.
 fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
     assert!(
         wait_until(MUST_HAPPEN, || Arc::strong_count(&sink) == 1),
@@ -160,10 +139,6 @@ fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
     }
 }
 
-/// A key typed into a full input queue (program stalled, spill at its cap) is
-/// refused (docs/AUDIT-typing-to-pixels-2026-08-26.md P0): dispatch returns at
-/// once, the outcome is a failure, and the refusal is counted and said once per
-/// session (one "Couldn't send your input" row, never a bell per key).
 #[test]
 fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -247,9 +222,6 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     close_pipe(sink, pipe);
 }
 
-/// Into a program that stopped reading, the first maximum paste parks and every
-/// later one is refused at submission: admission never holds more than a paste
-/// may use.
 #[test]
 fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -308,10 +280,6 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     close_pipe(app_sink, pipe);
 }
 
-/// Terminal replies stay wholly outside a paste's bracketed envelope: a reply
-/// answered before the paste reaches the program first; one answered while the
-/// paste is parked, and a key typed then, arrive after the closing bracket; the
-/// envelope is one contiguous run.
 #[test]
 fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -385,8 +353,6 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     close_pipe(app_sink, pipe);
 }
 
-/// The ConPTY route, on unix: ConPTY has no non-blocking write, so every key
-/// goes through the ordered writer and the UI thread only enqueues.
 #[test]
 fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -436,9 +402,6 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     close_pipe(sink, pipe);
 }
 
-/// A key that waited behind a paste arms the echo clock at its own write: the
-/// UI thread's bracket closes before the key is written, the writer arms once
-/// the key's receipt carries an accepted order, and the bracket arms nothing.
 #[test]
 fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     let _echo = crate::echo_rtt::fresh_for_test();
@@ -478,9 +441,6 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     close_pipe(sink, pipe);
 }
 
-/// Closing the tab is the teardown: `Session::drop` severs the session's input,
-/// so a paste parked on a program that stopped reading, and a key queued behind
-/// it, are released when the session goes.
 #[test]
 fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -523,9 +483,6 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     close_pipe(sink, pipe);
 }
 
-/// A reply flood into a stalled program plateaus at the reply lane's byte
-/// budget: once the writer is parked and the budget held, every further reply
-/// is dropped at submission and counted, never queued.
 #[test]
 fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     let (sink, _reader, _filled) = wedged_socket();
@@ -563,8 +520,6 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     drop(replies);
 }
 
-/// The ConPTY route for reports, on unix: a mouse, wheel or focus report written
-/// inline could park the UI thread on ConPTY, so there it takes the keys' route.
 #[test]
 fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -627,8 +582,6 @@ fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     close_pipe(sink, pipe);
 }
 
-/// A mouse report waits behind what was queued before it, as a key does: with
-/// paste A parked and paste B queued, a click reaches the program after B.
 #[test]
 fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -687,10 +640,6 @@ fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
     close_pipe(sink, pipe);
 }
 
-/// Set `app` up so its next [`App::recompute_focus_reports`] sends `ESC[I` to
-/// the front session: the window front and focused, DEC 1004 on, and the
-/// account saying nobody holds the keyboard yet (the delta a tab switch or a
-/// pane focus makes).
 fn arm_focus_in(app: &mut App) {
     let wid = WindowId(0);
     app.frontmost_window = Some(wid);
@@ -700,9 +649,6 @@ fn arm_focus_in(app: &mut App) {
     app.focus_reported = None;
 }
 
-/// A tab switch's focus report (`recompute_focus_reports`, which every tab
-/// switch, pane focus, split, close, detach and migrate converges on) waits
-/// behind the pastes queued before it: the program reads A, B, then `ESC[I`.
 #[test]
 fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -754,9 +700,6 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     close_pipe(sink, pipe);
 }
 
-/// On the ConPTY route (`force_conpty_route_for_test`) a tab switch's focus
-/// report goes through the ordered writer, so with the writer admitting nothing
-/// it is refused and nothing is written.
 #[test]
 fn a_tab_switch_focus_report_takes_the_conpty_route() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -785,9 +728,6 @@ fn a_tab_switch_focus_report_takes_the_conpty_route() {
     close_pipe(sink, pipe);
 }
 
-/// Under any-motion tracking (DEC 1003), a motion flood queued behind a parked
-/// paste is admitted as a paste is, never into the keys' reserve: it is refused
-/// once it uses a paste's room, and a key typed then still queues.
 #[test]
 fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -869,10 +809,6 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     close_pipe(sink, pipe);
 }
 
-/// An OS appearance change into a stalled program with DEC 2031 on never parks
-/// the UI thread: the colour-scheme report takes the reports' route, is refused
-/// at the full spill rather than queued without bound, and everything accepted
-/// before it arrives in order.
 #[test]
 fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();

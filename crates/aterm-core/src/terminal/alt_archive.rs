@@ -30,13 +30,9 @@ pub const ALT_ARCHIVE_ROW_OVERHEAD: usize = size_of::<ArchivedRow>() + 2 * size_
 pub const fn alt_archive_row_charge(len: usize) -> usize {
     len.next_multiple_of(16) + ALT_ARCHIVE_ROW_OVERHEAD
 }
-/// Minimum visible chars for a row to vote (after trimming both ends).
 const MIN_ANCHOR_CHARS: usize = 4;
-/// Votes a shift needs (fewer when the previous frame has fewer anchors).
 const NEED_VOTES: usize = 3;
-/// How many screens of archived rows a reanchor searches.
 const REANCHOR_SCREENS: usize = 8;
-/// Minimum spacing of epilogue (no-2026) commits, in `process_now` time.
 const FALLBACK_COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Cause of a discontinuity between archived rows.
@@ -262,8 +258,6 @@ pub enum AltArchiveImport {
     Refused,
 }
 
-/// No archive reaches an index this high (one row per commit); an imported index past it
-/// would overflow later arithmetic.
 const MAX_CARRIED_INDEX: u64 = 1 << 62;
 
 #[derive(Debug, Clone)]
@@ -299,14 +293,11 @@ impl Frame {
         self.text.len()
     }
 
-    /// The row hashes: all an unchanged frame (Rule 2) needs.
     fn derive(&mut self) {
         self.hash.clear();
         self.hash.extend(self.text.iter().map(|s| row_hash(s)));
     }
 
-    /// The anchor and content eligibility the differ votes with, after
-    /// [`Self::derive`].
     fn derive_votes(&mut self) {
         self.anchor.clear();
         self.content.clear();
@@ -736,8 +727,6 @@ impl AltArchive {
         self.evict();
     }
 
-    /// Count this archive among its pool's live archives exactly while it is enabled and holds
-    /// a row; called wherever `bytes` can cross zero.
     fn sync_share(&mut self) {
         let drawing = self.enabled && self.bytes > 0;
         if let Some(share) = &mut self.share {
@@ -778,7 +767,6 @@ impl AltArchive {
         self.commit_prepared(cols, None);
     }
 
-    /// Whether a frame keyed `key` at these dims is the one already committed.
     fn is_unchanged(&self, key: u64, rows: usize, cols: u16) -> bool {
         self.have_prev
             && self.prev_key == Some(key)
@@ -786,14 +774,11 @@ impl AltArchive {
             && self.prev.cols == cols
     }
 
-    /// The next frame's row buffers (`rows` of them, capacity reused), to be
-    /// filled with normalized row text and then committed.
     fn frame_buffers(&mut self, rows: usize) -> &mut [String] {
         self.cur.text.resize_with(rows, String::new);
         &mut self.cur.text
     }
 
-    /// Fill the next frame's row buffers with `grid`'s screen rows, normalized as `text` shows.
     fn fill_from_grid(&mut self, grid: &Grid) {
         let rows = grid.rows();
         let bufs = self.frame_buffers(usize::from(rows));
@@ -803,8 +788,6 @@ impl AltArchive {
         }
     }
 
-    /// Commit `grid`'s screen rows (the active alt grid) as the next frame, keyed by its
-    /// content generation so a redundant ESU does no work.
     fn commit_grid(&mut self, grid: &Grid) {
         let rows = grid.rows();
         let cols = grid.cols();
@@ -819,7 +802,6 @@ impl AltArchive {
         self.commit_prepared(cols, Some(key));
     }
 
-    /// Commit the frame in `cur` (filled through [`frame_buffers`](Self::frame_buffers)).
     fn commit_prepared(&mut self, cols: u16, key: Option<u64>) {
         self.evict();
         let rows = self.cur.rows();
@@ -878,16 +860,11 @@ impl AltArchive {
         self.below.clear();
     }
 
-    /// The scrolling region of the last committed frame: everything above the
-    /// chrome (the whole screen while no frame was diffed on this baseline).
     fn prev_region(&self) -> usize {
         let r = self.prev.rows();
         r - self.chrome.unwrap_or(0).min(r)
     }
 
-    /// What a resize flushes of the last frame (Rule 1): its scrolling region once a diff
-    /// measured the chrome; until then, everything above the bottom run the new frame still
-    /// shows ([`Self::same_across_resize`]).
     fn resize_region(&self) -> usize {
         if self.chrome.is_some() {
             return self.prev_region();
@@ -900,21 +877,15 @@ impl AltArchive {
         p - b
     }
 
-    /// Whether `prev` row `i` and `cur` row `j` show the same thing at two sizes:
-    /// equal hashes, or equal text once box/rule art and spaces are removed (a
-    /// `────` rule, or a `│ > text │` composer box, redrawn at a new width).
     fn same_across_resize(&self, i: usize, j: usize) -> bool {
         self.prev.hash[i] == self.cur.hash[j]
             || said_text(&self.prev.text[i]).eq(said_text(&self.cur.text[j]))
     }
 
-    /// A frame that did not shift: the chrome is at most what this one kept.
     fn narrow_chrome(&mut self, b: usize) {
         self.chrome = Some(self.chrome.map_or(b, |c| c.min(b)));
     }
 
-    /// Votes a shift over `[0, t)` needs: [`NEED_VOTES`], or fewer when the
-    /// previous frame has fewer rows eligible to vote (at least 1).
     fn need(&self, t: usize, weak: bool) -> usize {
         let eligible = if weak {
             &self.prev.content
@@ -928,7 +899,6 @@ impl AltArchive {
             .clamp(1, NEED_VOTES)
     }
 
-    /// Rules 4-8 over the region `[0, t)`; `b` is the fixed chrome height.
     fn diff(&mut self, t: usize, b: usize) {
         let rows = self.cur.rows();
         let (best, moved) = self.vote(t, false);
@@ -980,8 +950,6 @@ impl AltArchive {
         self.jump(t);
     }
 
-    /// Anchor voting (rule 4) over `[0, t)`: eligible rows (anchors, or with `weak` any row
-    /// with content) unique in both frames vote for the offset `d = pos_prev - pos_cur`.
     fn vote(&mut self, t: usize, weak: bool) -> (Vote, Vote) {
         let s = &mut self.scratch;
         let (prev_ok, cur_ok) = if weak {
@@ -1005,7 +973,6 @@ impl AltArchive {
                 continue;
             };
             if self.prev.text[p] != self.cur.text[i] {
-                // a hash collision never votes
                 continue;
             }
             let slot = &mut s.votes[p + t - 1 - i];
@@ -1037,7 +1004,6 @@ impl AltArchive {
         (best, moved)
     }
 
-    /// Whether cur row `row` voted for `offset` in the last (anchor) vote.
     fn votes_for(&self, row: usize, offset: isize) -> bool {
         if !self.cur.anchor[row] {
             return false;
@@ -1053,9 +1019,6 @@ impl AltArchive {
         pos.cast_signed() - row.cast_signed() == offset && self.prev.text[pos] == self.cur.text[row]
     }
 
-    /// Where fixed rows start under a block that moved: the first anchor below
-    /// `moved`'s voters that stayed put, when none sits among them (rows that
-    /// stayed put above the block are a pinned header, which a shift handles).
     fn fixed_floor(&self, t: usize, moved: Vote) -> Option<usize> {
         if moved.votes == 0 {
             return None;
@@ -1065,7 +1028,6 @@ impl AltArchive {
             .filter(|&i| i > moved.bot)
     }
 
-    /// Leading rows equal at the same position, stopping before `limit`.
     fn leading_equal(&self, limit: usize) -> usize {
         let mut s0 = 0;
         while s0 < limit && self.prev.hash[s0] == self.cur.hash[s0] {
@@ -1074,9 +1036,6 @@ impl AltArchive {
         s0
     }
 
-    /// Rows pinned above a block that moved up by `k`: at most the leading run equal at the
-    /// same position; a trailing row that also matches the shifted position (usually blank)
-    /// resolves toward last time's pin.
     fn pinned_rows_up(&self, top_cur: usize, k: usize) -> usize {
         let s_max = self.leading_equal(top_cur);
         let mut s_min = s_max;
@@ -1086,8 +1045,6 @@ impl AltArchive {
         self.pin.clamp(s_min, s_max)
     }
 
-    /// Rule 6: the content moved up by `k`; `top_cur` is where the topmost
-    /// voting anchor landed.
     fn shift_up(&mut self, k: usize, top_cur: usize) {
         let s0 = self.pinned_rows_up(top_cur, k);
         if (s0..s0 + k).all(|i| self.prev.blank(i)) && self.cur.blank(s0) {
@@ -1115,9 +1072,6 @@ impl AltArchive {
         self.archive_picks();
     }
 
-    /// Rule 7: the content moved down by `j` over `[0, t)`. Rows revealed at the top are the
-    /// archived rows just before the old top (the debt); rows pushed out at the bottom wait in
-    /// `below` until they re-enter or a flush archives them.
     fn shift_down(&mut self, v: Vote, t: usize) {
         let j = v.d.unsigned_abs();
         let (top_prev, bot_prev) = (v.top - j, v.bot - j);
@@ -1150,8 +1104,6 @@ impl AltArchive {
         }
     }
 
-    /// Rows waiting in `below` that are back on screen: the deepest one found
-    /// (an anchor, unique on screen) re-entered, and every row above it with it.
     fn settle_below(&mut self) {
         if self.below.is_empty() {
             return;
@@ -1168,7 +1120,6 @@ impl AltArchive {
         }
     }
 
-    /// `prev[i]` as an archived row.
     fn prev_row(&self, i: usize) -> ArchivedRow {
         ArchivedRow {
             text: Arc::from(self.prev.text[i].as_str()),
@@ -1177,7 +1128,6 @@ impl AltArchive {
         }
     }
 
-    /// Rule 8, the jump: flush what was displayed, record the gap, reanchor.
     fn jump(&mut self, t: usize) {
         let q = self.leading_equal(t);
         self.flush_prev_rows(q, t);
@@ -1189,8 +1139,6 @@ impl AltArchive {
         }
     }
 
-    /// Rule 8's reanchor: the archived row the new screen shows at row `pin`, by a vote of the
-    /// screen's anchors; `None` when it is nowhere in the recent archive.
     fn reanchor(&mut self, t: usize) -> Option<u64> {
         let len = self.rows.len();
         if len == 0 || t <= self.pin {
@@ -1205,7 +1153,6 @@ impl AltArchive {
         for pos in lo..len {
             let row = &self.rows[pos];
             if row.anchor {
-                // the most recent occurrence wins
                 s.tail_idx.insert(row.hash, pos);
             }
         }
@@ -1235,14 +1182,11 @@ impl AltArchive {
             .map(|(&j, _)| self.first + j as u64)
     }
 
-    /// Hash of the retained archived row with absolute index `index`.
     fn archived_hash(&self, index: u64) -> Option<u64> {
         let off = usize::try_from(index.checked_sub(self.first)?).ok()?;
         self.rows.get(off).map(|r| r.hash)
     }
 
-    /// Rule 9: re-measure the debt as the run of screen rows from `pin` that are consecutive
-    /// archived rows from `debt_at`; the first differing row cuts it.
     fn check_debt(&mut self, t: usize) {
         if self.debt == 0 {
             return;
@@ -1256,8 +1200,6 @@ impl AltArchive {
         self.debt = n;
     }
 
-    /// Archive the rows of `prev` in `[from, to)` outside the debt region (already archived),
-    /// then the rows waiting in `below`, trimming blank edges (a gap always follows a flush).
     fn flush_prev_rows(&mut self, from: usize, to: usize) {
         let to = to.min(self.prev.rows());
         let (dlo, dhi) = (self.pin, self.pin + self.debt);
@@ -1283,8 +1225,6 @@ impl AltArchive {
         self.evict();
     }
 
-    /// Append `prev[i]` for every `i` in `scratch.picks` (rows a shift scrolled off), dropping
-    /// leading blanks that would open the archive or follow a gap.
     fn archive_picks(&mut self) {
         let picks = std::mem::take(&mut self.scratch.picks);
         let mut lo = 0;
@@ -1303,8 +1243,6 @@ impl AltArchive {
         self.evict();
     }
 
-    /// Nothing precedes the next row on any screen: the archive never held a
-    /// row, or the last thing recorded is a gap.
     fn at_boundary(&self) -> bool {
         let last = self.last();
         last == 0 || self.gaps.back().is_some_and(|g| g.after == last)
@@ -1318,8 +1256,6 @@ impl AltArchive {
         self.gaps.push_back(AltArchiveGap { after, kind });
     }
 
-    /// Evict the oldest rows until inside the own budget and pool share; the share falls as
-    /// sessions open, so an archive can be over a budget it never set.
     fn evict(&mut self) {
         self.sync_share();
         let budget = self.effective_budget();
@@ -1336,7 +1272,6 @@ impl AltArchive {
             self.gaps.pop_front();
         }
         if self.debt > 0 && self.debt_at < self.first {
-            // the re-shown rows were evicted: nothing left to skip
             self.debt = 0;
         }
     }
@@ -1367,8 +1302,6 @@ impl AltArchive {
         self.end_run(false, AltArchiveGapKind::Restore);
     }
 
-    /// Flush the last committed frame — its scrolling region, or the `whole`
-    /// frame — record a `kind` gap, and start a new run.
     fn end_run(&mut self, whole: bool, kind: AltArchiveGapKind) {
         if !self.enabled {
             return;
@@ -1385,17 +1318,12 @@ impl AltArchive {
         self.new_run();
     }
 
-    /// A new run: a new epoch, no baseline, and nothing archived before it is
-    /// the next screen's to re-show.
     fn new_run(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.drop_prev();
         self.floor = self.last() + 1;
     }
 
-    /// Install the frame in the next-frame buffers (filled by
-    /// [`fill_from_grid`](Self::fill_from_grid)) as the baseline without diffing it: a restored
-    /// screen continues nothing this archive saw but is what the app's next frame changes.
     fn install_restored(&mut self, cols: u16, key: Option<u64>) {
         if !self.enabled || self.cur.rows() == 0 || self.cur.all_blank() {
             return;
@@ -1465,8 +1393,6 @@ impl AltArchive {
         (fence, carry)
     }
 
-    /// A fingerprint of exactly what [`differ_state`](Self::differ_state) takes, from hashes
-    /// the differ already keeps: no allocation, cheap enough for inside the freeze.
     fn differ_fingerprint(&self) -> u64 {
         let mut h = FxHasher::default();
         h.write_u8(u8::from(self.have_prev));
@@ -1496,8 +1422,6 @@ impl AltArchive {
         h.finish()
     }
 
-    /// The differ's state as [`AltArchiveDiffer`] (its `esu_seen` belongs to
-    /// the terminal hook, which fills it in).
     fn differ_state(&self) -> AltArchiveDiffer {
         AltArchiveDiffer {
             prev: self
@@ -1521,9 +1445,6 @@ impl AltArchive {
         true
     }
 
-    /// The oldest row the adopting differ may still point at (the last
-    /// [`REANCHOR_SCREENS`] screens and the re-shown run from `debt_at`, never
-    /// before this app run's `floor`), so a carry always reaches back to it.
     fn carry_reach(&self) -> u64 {
         let screen = self.prev.rows().max(self.cur.rows());
         let span = u64::try_from(REANCHOR_SCREENS * screen).unwrap_or(u64::MAX);
@@ -1641,7 +1562,6 @@ impl AltArchive {
         outcome
     }
 
-    /// Install a differ state [`differ_fits`] accepted.
     fn install_differ(&mut self, d: AltArchiveDiffer) {
         self.drop_prev();
         let Some((cols, rows)) = d.prev else {
@@ -1668,11 +1588,6 @@ impl AltArchive {
     }
 }
 
-/// Whether a carried differ state describes a frame the differ can go on
-/// from: a non-blank frame of normalized rows at a real width; chrome, pin
-/// and the re-shown run inside it; the re-shown rows inside the carried
-/// indices (rows left out of the carry only end the run, as eviction does);
-/// `below` normalized and within its bound.
 fn differ_fits(d: &AltArchiveDiffer, last: u64) -> bool {
     let Some((cols, rows)) = &d.prev else {
         return d.chrome.is_none() && d.pin == 0 && d.debt == 0 && d.below.is_empty();
@@ -1695,7 +1610,6 @@ fn differ_fits(d: &AltArchiveDiffer, last: u64) -> bool {
         && d.below.iter().all(|r| is_normalized(r))
 }
 
-/// Whether `s` is already what [`normalize_row`] makes of it.
 fn is_normalized(s: &str) -> bool {
     s.len() == s.trim_end().len() && !s.chars().any(|c| c == '\0' || c.is_control())
 }
@@ -1721,7 +1635,6 @@ impl Vote {
     }
 }
 
-/// Index the eligible rows of `[0, t)` by hash: (occurrences, first position).
 fn index_anchors(
     hash: &[u64],
     eligible: &[bool],
@@ -1801,9 +1714,6 @@ fn is_anchor_text(s: &str) -> bool {
     false
 }
 
-/// Normalize extracted row text to exactly what `text` shows: NUL/control chars become a
-/// space (aterm-control's `visible_char`, so the hash and archived bytes match the screen
-/// reply), then trailing whitespace is trimmed.
 fn normalize_row(s: &mut String) {
     // Fast screen: C0, DEL, and the UTF-8 lead byte of U+0080..=U+00BF (C1
     // controls live there, alongside common glyphs like `·`).
@@ -1820,9 +1730,6 @@ fn normalize_row(s: &mut String) {
     s.truncate(end);
 }
 
-/// The first index of `needle` in `hay`. The matcher sees every byte the terminal receives, so
-/// it compares 64-byte blocks (which the compiler vectorizes) and walks bytes only inside the
-/// block that holds a hit.
 fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     let (blocks, tail) = hay.as_chunks::<64>();
     for (n, block) in blocks.iter().enumerate() {
@@ -1838,9 +1745,6 @@ fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     tail.iter().position(|&b| b == needle).map(|i| base + i)
 }
 
-/// Whether `input` holds conhost's alt-screen enter, `ESC [ ? 1049 h`. It runs over every read
-/// while `TransientState::conhost_alt_screen_left_up` is set (for a cmd.exe session, possibly
-/// the rest of the session), so it hops ESC to ESC with [`find_byte`].
 fn has_alt_1049_enter(input: &[u8]) -> bool {
     const ENTER: &[u8] = b"\x1b[?1049h";
     let mut rest = input;
@@ -1862,7 +1766,6 @@ enum MatchState {
     Params,
 }
 
-/// Alt-screen mode bits a sequence's params named: 47, 1047, 1049.
 const ALT_47: u8 = 1;
 const ALT_1047: u8 = 2;
 const ALT_1049: u8 = 4;
@@ -1941,8 +1844,6 @@ impl DecModeMatcher {
         }
     }
 
-    /// Advance over `bytes`, returning at the first sequence the hook acts on (its final byte
-    /// consumed), or `None` with the state carried to the next call.
     fn scan(&mut self, bytes: &[u8], on_alt: bool) -> Option<DecModeHit> {
         let hit = self.scan_inner(bytes, on_alt);
         let seen = hit.map_or(bytes.len(), |h| h.final_at + 1);
@@ -1954,8 +1855,6 @@ impl DecModeMatcher {
         hit
     }
 
-    /// Whether `ESC [` precedes offset `i` (the previous read's last bytes
-    /// standing in for what `bytes` does not hold).
     fn csi_before(&self, bytes: &[u8], i: usize) -> bool {
         let at = |back: usize| -> u8 {
             if i >= back {
@@ -2130,7 +2029,6 @@ impl Terminal {
         }
     }
 
-    /// Start following from the terminal's current state (on enable).
     fn alt_archive_resync(&mut self) {
         let st = &mut self.alt_archive;
         st.matcher.reset();
@@ -2194,8 +2092,6 @@ impl Terminal {
         parser.advance_fast(bytes, &mut handler);
     }
 
-    /// Whether an XTRESTORE naming these alt-screen modes (`ALT_*` bits) turns the alternate
-    /// screen off: one of them was saved as "off".
     fn xtrestore_leaves_alt(&self, modes: u8) -> bool {
         [(ALT_47, 47u16), (ALT_1047, 1047), (ALT_1049, 1049)]
             .iter()
@@ -2204,8 +2100,6 @@ impl Terminal {
             })
     }
 
-    /// A commit point: a reset since the last one wipes; a screen switch leaves or enters; a
-    /// moved `sync_end_seq` (ESU, sync timeout, DECSTR) on the alt screen commits the frame.
     fn alt_archive_boundary(&mut self) {
         if !self.alt_archive.archive.enabled {
             return;
@@ -2241,8 +2135,6 @@ impl Terminal {
         }
     }
 
-    /// One byte before an alt-screen exit's final byte: settle any pending
-    /// commit point, then commit the alt grid while it still exists.
     fn alt_archive_before_exit(&mut self) {
         self.alt_archive_boundary();
         if self.modes.alternate_screen {
@@ -2291,8 +2183,6 @@ impl Terminal {
         self.alt_archive_install_screen();
     }
 
-    /// On the alternate screen and outside an open 2026 window: install the screen as the
-    /// archive's baseline without diffing it.
     fn alt_archive_install_screen(&mut self) {
         let st = &mut self.alt_archive;
         if !st.archive.enabled || !self.modes.alternate_screen || self.modes.synchronized_output {

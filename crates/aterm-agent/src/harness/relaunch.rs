@@ -221,7 +221,7 @@ fn tap_of(
     armed: &super::tap::Armed,
     cwd: &str,
 ) -> Option<String> {
-    let lone = armed.lone_login.as_deref();
+    let lone = armed.lone_for(launch.login);
     let own = launch.stored_login
         && launch.homedir.is_none()
         && super::tap::own_login(launch.login, launch.home, lone);
@@ -312,7 +312,6 @@ fn line_tapped_clear(
             detail: "the launch flags cannot be carried into a resume".to_string(),
         })?;
     if session.is_none() {
-        // `rewrite_argv` ends with `--resume <id>`, the one pair it adds.
         flags.truncate(flags.len().saturating_sub(2));
     }
     let flags = with_permission_mode(with_model(flags, model), mode);
@@ -761,8 +760,6 @@ fn relaunch_held(
 ) -> Report {
     let old = st.pid;
     if !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
-        // Never a harder signal: the agent finishes exiting on its own, and a
-        // later pass finds the phase and the process as they are.
         return said(r, "wait:exiting");
     }
     st.seen_gone(now_s());
@@ -895,7 +892,7 @@ impl<'a> PromptLook<'a> {
     }
 }
 
-/// The instant a person's keys must predate where a hand held the line ([`PromptLook::held_since_s`]; the review of lc-7 of the 2026-10-15 sweep).
+/// The instant a person's keys must predate where a hand held the line ([`PromptLook::held_since_s`]).
 pub(super) fn hand_held_since(st: &St) -> u64 {
     match st.phase {
         upgrade::Phase::Exiting { at_s } if st.hand_seen_s != 0 => at_s.max(1),
@@ -1429,7 +1426,7 @@ pub(super) enum Adopted {
     Quiet,
     /// Nothing owed by the conversation's own records ([`nothing_owed`], the why it names: nobody asked it anything, its worker finished, its last turn is a person's own exchange, its loop resumed it first).
     NothingOwed(&'static str),
-    /// Under autopilot land ([`Opts::land`], F2) no continuation of Cruise's is typed.
+    /// Under autopilot land ([`Opts::land`]) no continuation of Cruise's is typed.
     Land,
     /// Any other move owes the continuation, which the tab's supervisor types at the agent's first idle point.
     Owed,
@@ -2461,7 +2458,7 @@ pub fn runs_under(snap: &Snapshot, roster: &accounts::Roster, label: &str) -> bo
         .is_some_and(|row| row.label == label)
 }
 
-/// The login a relaunch with no process to read (a cold restore) carries, per the accounts design §6.
+/// The login a relaunch with no process to read (a cold restore) carries.
 #[must_use]
 pub fn cold_login(
     roster: &accounts::Roster,
@@ -2638,32 +2635,13 @@ pub(super) fn restart_as(
     if let Some(prior) = prior.as_ref() {
         prior.kept_by_restart(&tab, &mut st);
     }
-    let tap_opts;
-    let plan_opts = match (&opts.usage_tap, launch.login) {
-        (Some(armed), Some(dir))
-            if !dir.is_empty()
-                && armed.lone_login.is_none()
-                && (roster.row_for_login(Some(dir)).is_some()
-                    || roster.row_left(Some(dir)).is_some()) =>
-        {
-            tap_opts = Opts {
-                usage_tap: Some(super::tap::Armed {
-                    exe: armed.exe.clone(),
-                    lone_login: Some(dir.to_owned()),
-                }),
-                ..opts.clone()
-            };
-            &tap_opts
-        }
-        _ => opts,
-    };
     let planned =
         home_carried(&opts.home, snap.home.as_deref(), &sf.cwd, &records).and_then(|homedir| {
             let launch = Launch {
                 homedir: homedir.as_deref(),
                 ..launch
             };
-            plan(plan_opts, &launch, snap.shell, &t)
+            plan(opts, &launch, snap.shell, &t)
         });
     let Plan { shell, line, .. } = match planned {
         Ok(p) => p,
@@ -2921,7 +2899,7 @@ pub struct CodexRun {
     pub home: PathBuf,
     /// The `CODEX_HOME` its own exec environment set, verbatim.
     pub home_env: Option<String>,
-    /// The crash rule's validated line (the codex-alab self-claim contract, §4).
+    /// The crash rule's validated line.
     pub self_claimed: Option<super::self_claimed::Resume>,
 }
 
@@ -3097,7 +3075,7 @@ pub(super) fn snapshot_lane(image: Option<&Path>, argv: &[String]) -> SnapshotLa
     }
 }
 
-/// The snapshot of a crashed codex-alab no read reached while it ran (ad-5 and the second crash of ad-3, the codex-alab end-to-end run of 2026-10-16).
+/// The snapshot of a crashed codex-alab no read reached while it ran.
 pub fn self_claimed_snapshot(
     opts: &Opts,
     copy: &super::self_claimed::Copy,
@@ -3697,8 +3675,6 @@ fn after_exit_as(
         .or_else(|| snap.session.clone())
         .filter(|s| upgrade::is_session_id(s))
     else {
-        // No record names a conversation: none was registered, or the agent
-        // removed its record as it ended by itself.
         return said(r, "ended:no-conversation");
     };
     r.session.clone_from(&session);
@@ -3754,9 +3730,6 @@ fn after_exit_as(
             relaunched_before = st.relaunched_on_exit_of(snap.pid);
             if !opts.dry_run {
                 if overtook {
-                    // Never a day-long stall with `claude --resume` for a
-                    // relaunch that landed (a graceful `/exit` of the
-                    // relaunched agent reads so).
                     st.close_overtaken(why, now_s());
                 } else {
                     st.seen_gone(now_s());
@@ -4305,7 +4278,7 @@ pub(super) fn last_move_at(st: &St) -> u64 {
     }
 }
 
-/// Whether the agent a relaunch of conversation `session` in tab `tab` adopted is gone (the residual review's R5).
+/// Whether the agent a relaunch of conversation `session` in tab `tab` adopted is gone.
 #[must_use]
 pub fn adopted_gone(opts: &Opts, tab: &str, session: &str) -> Option<bool> {
     let st = load(opts, session).filter(|st| st.in_flight() && st.tab == tab)?;
@@ -4592,14 +4565,11 @@ pub fn outcome(step: &str) -> Outcome {
         .strip_prefix("refused:")
         .or_else(|| step.strip_prefix("told:"))
     {
-        // `told:` is a restart that can never land whose own row asks the
-        // owner ([`told_by_its_row`]): said there, as the host reads it.
         Outcome::Cannot(why.to_string())
     } else if matches!(step, "busy:another-sweep" | WAIT_ACT_ENDS | WAIT_HAND_LIFTS) {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {
-        // The state directory cannot hold the lock at all: no later try
-        // gets past that.
+        // State directory cannot hold the lock.
         Outcome::Cannot(why.to_string())
     } else {
         Outcome::NotYet(step.to_string())
@@ -4906,8 +4876,7 @@ impl Relaunches {
         }
     }
 
-    /// The session's standing word — its tab's mark — asks a person to
-    /// resume `conversation` (the command it names).
+    /// Records that the session's standing word asks a person to resume `conversation`.
     pub fn ask(&mut self, conversation: &str) {
         if self.badged {
             self.asks = Some(conversation.to_string());

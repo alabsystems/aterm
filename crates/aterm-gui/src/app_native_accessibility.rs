@@ -773,7 +773,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("unicode.txt");
         std::fs::write(&path, "alpha\naé\tz\nomega\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy());
+        let uri = crate::native_document_host::path_to_file_uri(&path).expect("a file uri");
         app.open_document_tab(AppKind::Editor, &uri).unwrap();
         set_a11y_active(&mut app, wid, true);
 

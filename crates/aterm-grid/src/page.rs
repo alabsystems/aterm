@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Page storage: 64 KB pages that [`PageStore`] bump-allocates typed [`PageSlice`]s from.
+//! Page storage: 64 KB pages that [`PageStore`] bump-allocates typed [`PageSlice`](crate::page::PageSlice)s from.
 #![allow(
     clippy::large_stack_arrays,
     reason = "64KB page buffers are intentional for memory-mapped scrollback"
@@ -57,6 +57,8 @@ impl Page {
     }
 
     /// Get a mutable pointer to the page data.
+    ///
+    /// Writing through it requires that no other reference to the bytes exists.
     #[inline]
     pub(crate) const fn data_ptr(&self) -> *mut u8 {
         self.data.get().cast()

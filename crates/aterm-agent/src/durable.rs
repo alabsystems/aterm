@@ -4,8 +4,8 @@
 //! The crate's flushes, in one place: the harness's atomic writes
 //! ([`crate::harness::upgrade_models::write_atomic_mode`]) and its ledger cut
 //! ([`crate::harness::cli::bound_ledger`]). Each finishes through aterm-durable:
-//! [`sync_all`] is its DURABLE arm; a site that needs only its order kept calls
-//! [`aterm_durable::ordered`] itself, or [`finish`] with [`Flush::Ordered`].
+//! [`sync_all`](crate::durable::sync_all) is its DURABLE arm; a site that needs only its order kept calls
+//! [`aterm_durable::ordered`] itself, or [`finish`](crate::durable::finish) with [`Flush::Ordered`](aterm_durable::Flush::Ordered).
 
 use aterm_durable::Flush;
 use std::fs::File;

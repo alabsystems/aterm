@@ -1330,7 +1330,7 @@ mod tests {
                 code: None,
                 spawn_error: None,
             });
-            if cfg!(target_vendor = "apple") {
+            if cfg!(any(target_vendor = "apple", target_os = "linux")) {
                 assert!(record.is_some(), "the stand-in keeps a record");
             }
             std::thread::scope(|scope| {
@@ -1399,7 +1399,7 @@ mod tests {
             gone_within(&grandchild, GONE),
             "the grandchild {grandchild} outlived the interrupted run"
         );
-        if cfg!(target_vendor = "apple") {
+        if cfg!(any(target_vendor = "apple", target_os = "linux")) {
             let kept = std::fs::read_dir(tmp.join("handled.records"))
                 .map(|d| d.flatten().count())
                 .unwrap_or(0);

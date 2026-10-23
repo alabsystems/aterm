@@ -746,6 +746,17 @@ pub fn calm_1510() -> Scene {
     }
 }
 
+/// The calm Mac with coalition 2000 reaped inside the window after 1.50
+/// cores of work (constructed): the work is in the busy figure and in no
+/// row, so it lands in `unaccounted`.
+#[must_use]
+pub fn reaped_1510() -> Scene {
+    let mut scene = calm_1510();
+    scene.busy_mc += 1500;
+    scene.coalitions.push(Coal::new(2000, 1500).gone());
+    scene
+}
+
 /// The calm Mac with Caffeine (coalition 896, the user's app, led from
 /// start-up) at 1.50 cores: app-work.
 #[must_use]

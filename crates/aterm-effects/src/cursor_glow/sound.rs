@@ -75,7 +75,7 @@ impl CursorGlow {
         self.cue_keystroke_kind(now, crate::trail_sound::SoundKind::Typed)
     }
 
-    /// [`Self::cue_keystroke`] with the gesture named by the host: the spacebar's comma ([`trail_sound::SoundKind::Space`]) rides here, since only the host knows the key.
+    /// [`Self::cue_keystroke`] with the gesture named by the host: the spacebar's comma ([`crate::trail_sound::SoundKind::Space`]) rides here, since only the host knows the key.
     #[inline]
     pub fn cue_keystroke_kind(
         &mut self,
@@ -114,7 +114,7 @@ impl CursorGlow {
         true
     }
 
-    /// The bare-Shift lift cue ([`trail_sound::SoundKind::Shift`]) for a press with no echo: it banks no echo-muting credit and stamps no typing-cadence clock ([`Self::key_cue_at`] is for keystrokes).
+    /// The bare-Shift lift cue ([`crate::trail_sound::SoundKind::Shift`]) for a press with no echo: it banks no echo-muting credit and stamps no typing-cadence clock ([`Self::key_cue_at`] is for keystrokes).
     pub fn cue_modifier(&mut self, now: Instant) -> bool {
         if !self.sound_live {
             return false;
@@ -135,7 +135,7 @@ impl CursorGlow {
         true
     }
 
-    /// Host paste seam (`docs/design/RAINBOW-KITTY-V2.md` §28): a paste landed, cue its one up-strum ([`trail_sound::SoundKind::Strum`]), for a human's Cmd-V and an agent's `paste` / `turn` alike.
+    /// Host paste seam (`docs/design/RAINBOW-KITTY-V2.md` §28): a paste landed, cue its one up-strum ([`crate::trail_sound::SoundKind::Strum`]), for a human's Cmd-V and an agent's `paste` / `turn` alike.
     #[inline]
     pub fn cue_paste(&mut self, now: Instant) -> bool {
         if !self.v2.engaged() {

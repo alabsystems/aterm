@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stale aterm bundle detection and Trash pruning ([`prune`], [`trash`]).
+//! Stale aterm bundle detection and Trash pruning ([`prune`](crate::copies::prune), [`trash`](crate::copies::trash)).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};

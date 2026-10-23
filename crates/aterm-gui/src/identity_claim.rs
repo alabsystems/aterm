@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_session::SessionId;
 
-/// Subdirectory of the per-user control directory holding claim files.
 const CLAIMS_DIR: &str = "claims";
 
 /// An exclusive hold on one session id, alive while this value is.
@@ -20,13 +19,10 @@ pub(crate) struct Claim {
         expect(dead_code, reason = "held for its close: the open handle is the claim")
     )]
     file: std::fs::File,
-    /// The id this claim holds — so [`settle_transferred`] can tell an id it already
-    /// holds from one it still has to take.
+    /// The id this claim holds ([`settle_transferred`]).
     sid: String,
 }
 
-/// The drop releases the claim at once with `LOCK_UN`, not the close: a child
-/// another thread is spawning holds a copy of every descriptor until it execs.
 impl Drop for Claim {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -44,8 +40,6 @@ pub(crate) enum ClaimOutcome {
     Unprovable(String),
 }
 
-/// Every claim this process holds, kept alive for its whole life. A `Vec`:
-/// claims are taken a handful of times per process and never looked up.
 static HELD: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
 
 /// Park a claim for the process's lifetime.
@@ -59,8 +53,6 @@ pub(crate) fn release_claims_for_test() {
     HELD.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
-/// The ids this process adopted (from the environment premint or a handoff)
-/// rather than minted: the only ids of ours another process can also hold.
 static ADOPTED: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Record that this process is answering to an id it did NOT mint.
@@ -71,20 +63,18 @@ pub(crate) fn note_adopted(sid: &SessionId) {
     }
 }
 
-/// Whether `sid` is one this process adopted; see [`ADOPTED`].
+/// Whether `sid` is one this process adopted ([`ADOPTED`]).
 fn adopted_here(sid: &SessionId) -> bool {
     let guard = ADOPTED.read();
     let adopted = guard.unwrap_or_else(|p| p.into_inner());
     adopted.iter().any(|s| s == sid.as_str())
 }
 
-/// The claim file for `sid` under `dir`, or `None` for an id not of the minted
-/// shape.
 fn claim_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     crate::spawn::is_valid_session_id(sid.as_str()).then(|| dir.join(CLAIMS_DIR).join(sid.as_str()))
 }
 
-/// Take the exclusive claim on `sid` under control directory `dir` (a parameter so tests can use a scratch directory).
+/// Take the exclusive claim on `sid` under control directory `dir`.
 pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     let Some(path) = claim_path(dir, sid) else {
         return ClaimOutcome::Unprovable(format!("{} is not a session id", sid.as_str()));
@@ -109,13 +99,10 @@ pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     })
 }
 
-/// The successor marker beside a claim file: `claims/<sid>.successor`.
 fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.successor", sid.as_str())))
 }
 
-/// The epoch record beside a claim file: `claims/<sid>.ep`, the largest epoch a holder of the
-/// id gave its log.
 fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.ep", sid.as_str())))
 }
@@ -169,8 +156,6 @@ fn read_claim_record(_: &Path) -> Option<String> {
     None
 }
 
-/// Publish through an exclusive directory of this write's own. No existing
-/// staging entry is opened or removed.
 fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().ok_or_else(|| {
@@ -194,7 +179,7 @@ fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&staged, path)
 }
 
-/// The largest epoch a holder of `sid` recorded for its log under control directory `dir`, or `None`.
+/// The largest epoch a holder of `sid` recorded for its log under control directory `dir`.
 pub(crate) fn recorded_epoch_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let text = read_claim_record(&epoch_record_path(dir, sid)?)?;
     text.trim()
@@ -224,7 +209,6 @@ pub(crate) fn record_epoch(sid: &SessionId, ep: u32, create: bool) {
     }
 }
 
-/// The pid a successor marker names for `sid`, whatever its liveness.
 fn marked_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let text = read_claim_record(&successor_marker_path(dir, sid)?)?;
     text.strip_prefix("pid ")?.trim().parse().ok()
@@ -258,7 +242,7 @@ pub(crate) fn mark_successor(sids: &[SessionId], successor: u32) {
     }
 }
 
-/// Predecessor, when a Commit failed and it keeps its sessions: withdraw the markers it wrote for `successor` (only those).
+/// Predecessor, when a Commit failed and it keeps its sessions.
 #[cfg(unix)]
 pub(crate) fn withdraw_successor_markers(sids: &[SessionId], successor: u32) {
     let Some(dir) = rendezvous_dir() else {
@@ -292,7 +276,7 @@ pub(crate) fn settle_transferred_in(dir: &Path, sids: &[SessionId], me: u32) {
     }
 }
 
-/// [`settle_transferred_in`] for every id this process adopted, on the rendezvous directory, as this process.
+/// [`settle_transferred_in`] for every id this process adopted.
 pub(crate) fn settle_transferred() {
     let Some(dir) = rendezvous_dir() else {
         return;
@@ -305,14 +289,12 @@ pub(crate) fn settle_transferred() {
     settle_transferred_in(&dir, &sids, std::process::id());
 }
 
-/// The pid of a live instance other than this one that serves `sid`, per its published discovery entry (`graph/<sid>`).
+/// The pid of a live instance other than this one that serves `sid`.
 pub(crate) fn live_holder_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let pid = crate::proxy::graph_entry_host_pid(dir, sid)?;
     (pid != std::process::id() && crate::control_auth::pid_alive(pid)).then_some(pid)
 }
 
-/// The per-user control directory, unmodified: the one place every instance
-/// contends, whatever `--control-sock` says.
 fn rendezvous_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -324,11 +306,11 @@ fn rendezvous_dir() -> Option<PathBuf> {
     aterm_uds::control_socket_dir()
 }
 
-/// Test-only stand-in for the per-user control directory; see [`rendezvous_dir`].
+/// Test-only stand-in for the per-user control directory ([`rendezvous_dir`]).
 #[cfg(test)]
 static DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-/// Test-only: point [`rendezvous_dir`] at `dir` until the guard drops, under [`rendezvous_test_guard`].
+/// Test-only: point [`rendezvous_dir`] at `dir` until the guard drops ([`rendezvous_test_guard`]).
 #[cfg(test)]
 pub(crate) fn rendezvous_override(dir: &Path) -> RendezvousOverride {
     let serial = rendezvous_test_guard();
@@ -336,7 +318,7 @@ pub(crate) fn rendezvous_override(dir: &Path) -> RendezvousOverride {
     RendezvousOverride { _serial: serial }
 }
 
-/// [`rendezvous_override`]'s guard: clears the override, then lets the next test in.
+/// [`rendezvous_override`]'s guard.
 #[cfg(test)]
 pub(crate) struct RendezvousOverride {
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -356,7 +338,7 @@ pub(crate) fn rendezvous_test_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The probe behind the `@<sid>` dispatch refusal: the pid of a live other instance that also answers to `sid`, if any.
+/// The probe behind the `@<sid>` dispatch refusal.
 pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
     if !adopted_here(sid) {
         return None;
@@ -365,11 +347,9 @@ pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
     (HANDOFF_CANDIDATE.load(Ordering::SeqCst) != pid).then_some(pid)
 }
 
-/// The pid of this process's own seamless-update candidate while a handoff
-/// decides, `0` for none (`pid_alive(0)` is false).
 static HANDOFF_CANDIDATE: AtomicU32 = AtomicU32::new(0);
 
-/// A handoff lane's registration of its candidate, held from the candidate's creation (dial or fork) to the lane's return.
+/// A handoff lane's registration of its candidate.
 #[cfg(unix)]
 #[must_use = "the registration holds only while the value lives"]
 pub(crate) struct CandidateRegistration {
@@ -415,7 +395,7 @@ impl Drop for CandidateRegistration {
     }
 }
 
-/// `HandoffAddressOwner`'s variables read off the real state for `sid` under `dir`, with `candidate` this process's update candidate (`0`: none).
+/// `HandoffAddressOwner`'s variables read off the real state for `sid` under `dir`.
 #[cfg(all(test, unix))]
 pub(crate) fn project_handoff_address_owner(
     dir: &Path,
@@ -554,8 +534,7 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     }
 }
 
-/// Windows has no `flock`; the exclusive share mode in [`open_claim`] already did
-/// the work, so a handle in hand IS the lock.
+/// Windows has no `flock` ([`open_claim`]).
 #[cfg(windows)]
 fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
     Ok(true)
@@ -565,7 +544,6 @@ fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
 /// sharing violation).
 #[cfg(windows)]
 fn is_sharing_violation(e: &std::io::Error) -> bool {
-    /// `ERROR_SHARING_VIOLATION`.
     const SHARING_VIOLATION: i32 = 32;
     e.raw_os_error() == Some(SHARING_VIOLATION)
 }
@@ -591,18 +569,12 @@ mod tests {
         aterm_tempfile::tempdir().expect("scratch control dir")
     }
 
-    /// A pid that is alive on every host and never this process: 1 (init/launchd)
-    /// on Unix; 4 (System) on Windows, where pid 1 does not exist and
-    /// `OpenProcess` on 4 fails with ERROR_ACCESS_DENIED, which `pid_alive`
-    /// counts as alive (as `kill(pid, 0)`'s `EPERM`).
     const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
-    /// A discovery entry a live foreign instance would have written.
     fn live_foreign_entry() -> String {
         format!("sock /nonexistent/aterm.sock\nnonce ab\npid {LIVE_FOREIGN_PID}\n")
     }
 
-    /// Two aterms reading the same `$ATERM_SESSION_ID` premint: only one may answer to it.
     #[test]
     fn a_second_claim_on_one_id_is_refused_while_the_first_lives() {
         let d = dir();
@@ -642,10 +614,6 @@ mod tests {
         drop(childs_copy);
     }
 
-    /// Tier-1 binding for `SessionIdClaim`: each model `Launch` is one real
-    /// `claim_for_adoption`, and `holders` must equal the callers told yes, with the id free,
-    /// locked by a live holder, and unlocked while a live foreign entry holds it (the handoff
-    /// shape, where only the entry gate refuses).
     #[test]
     fn session_id_claim_conformance_real_adoption_projects_onto_model() {
         let _guard = rendezvous_test_guard();
@@ -828,9 +796,6 @@ mod tests {
         let _ = successor.wait();
     }
 
-    /// Anything but the minted shape is refused before it becomes a filename,
-    /// so a hostile `$ATERM_SESSION_ID` cannot aim the claim at a path; being
-    /// `Unprovable`, it also does not adopt.
     #[test]
     fn a_malformed_injected_id_never_becomes_a_path() {
         let d = dir();
@@ -861,9 +826,6 @@ mod tests {
         );
     }
 
-    /// The second gate: an id whose discovery entry names a live foreign process
-    /// is held even when its claim file is free; an entry naming a dead process
-    /// or us is not.
     #[test]
     fn a_live_discovery_entry_holds_an_id_a_dead_one_does_not() {
         let d = dir();

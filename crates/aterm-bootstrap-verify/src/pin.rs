@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How install.sh finds the verifier: the release asset each architecture's static build
-//! is published as ([`asset_name`]), the pin install.sh holds it to ([`Pin`], four lines of
-//! the script), and the receipts of the release the pin names ([`Record`], committed at
-//! [`RECORD`]). The release cut writes the record; `ship pin-verifier` writes the record
-//! and the pin lines together, and [`check`] holds each to the other and to the ledger.
+//! How install.sh finds the verifier.
 
 use aterm_toml::{Table, Value};
 
@@ -18,21 +14,13 @@ pub fn asset_name(version: &str, arch: &str) -> String {
     format!("aterm-bootstrap-verify-{version}-linux-{arch}")
 }
 
-/// The largest verifier asset install.sh downloads (`release_asset_size`'s bound), and so
-/// the largest a release may publish.
+/// The largest verifier asset install.sh downloads (`release_asset_size`'s bound).
 pub const MAX_ASSET: u64 = 64 * 1024 * 1024;
 
-/// The command line install.sh calls the verifier with and the line it reads back (the
-/// crate root's two forms). A change to either bumps it, with install.sh's glue: a record
-/// of another interface is refused by [`check`], since install.sh would call the pinned
-/// build in words it does not speak.
+/// The command line install.sh calls the verifier with and the line it reads back.
 pub const INTERFACE: u32 = 1;
 
-/// The cargo `--config` a release builds `triple`'s verifier under: glibc linked in
-/// (`+crt-static`), so it runs with no dynamic loader on any glibc. The flags sit on
-/// `triple`'s own table, and the build names `--target triple`, so build scripts and
-/// proc macros (host units) stay dynamic. The release producer and the Linux guest lane
-/// both build with it.
+/// The cargo `--config` a release builds `triple`'s verifier under.
 #[must_use]
 pub fn static_build_config(triple: &str) -> String {
     format!("target.{triple}.rustflags=[\"-C\", \"target-feature=+crt-static\"]")
@@ -46,9 +34,8 @@ pub const KEYS: [&str; 4] = [
     "LINUX_VERIFIER_SHA256_AARCH64",
 ];
 
-/// The repository, the release whose verifier install.sh runs, and each architecture's
-/// SHA-256 of it. All empty until a release publishes it: install.sh then verifies with its
-/// embedded Python. An architecture whose digest is empty keeps the Python verifier too.
+/// The repository, the release whose verifier install.sh runs, and each architecture's SHA-256
+/// of it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pin {
     /// `owner/name`: where the release is, whatever repository the install reads.
@@ -59,7 +46,6 @@ pub struct Pin {
     pub aarch64: String,
 }
 
-/// Whether `repo` is `owner/name`, each part letters, digits, `.`, `_` or `-`.
 fn repository(repo: &str) -> bool {
     let part = |p: &str| {
         !p.is_empty()
@@ -72,7 +58,6 @@ fn repository(repo: &str) -> bool {
         .is_some_and(|(owner, name)| part(owner) && part(name))
 }
 
-/// Whether `tag` is `v<MAJOR>.<MINOR>.<PATCH>`, no part with a leading zero.
 fn canonical_tag(tag: &str) -> bool {
     tag.strip_prefix('v').is_some_and(|version| {
         let parts: Vec<&str> = version.split('.').collect();
@@ -86,9 +71,8 @@ fn canonical_tag(tag: &str) -> bool {
 }
 
 impl Pin {
-    /// The pin in `install_sh`, the script's text: each key on exactly one line of its
-    /// own, `KEY="value"`.
-    ///
+    /// The pin in `install_sh`, the script's text: each key on exactly one line of its own,
+    /// `KEY="value"`.
     /// # Errors
     /// A key missing, repeated, or not spelt so.
     pub fn read(install_sh: &str) -> Result<Self, String> {
@@ -136,7 +120,6 @@ impl Pin {
     }
 
     /// `install_sh` with its pin, whatever it is, replaced by this one.
-    ///
     /// # Errors
     /// The script carries no readable pin, or not as four lines together in order.
     pub fn rewrite(&self, install_sh: &str) -> Result<String, String> {
@@ -167,9 +150,8 @@ impl Pin {
         }
     }
 
-    /// Empty, or an `owner/name` repository and a canonical release tag with each digest
-    /// empty or 64 lowercase hex digits and at least one of them set.
-    ///
+    /// Empty, or an `owner/name` repository and a canonical release tag with each digest empty or
+    /// 64 lowercase hex digits and at least one of them set.
     /// # Errors
     /// Any other shape.
     pub fn validate(&self) -> Result<(), String> {
@@ -215,9 +197,7 @@ pub struct Receipt {
     pub size: u64,
 }
 
-/// The receipts of the release install.sh's pin names: where it was published, its claim
-/// in the ledger (build and commit), the interface its verifiers speak, and each one the
-/// cut froze. The release cut writes it; it is committed at [`RECORD`] with the pin.
+/// The receipts of the release install.sh's pin names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub repo: String,
@@ -228,10 +208,8 @@ pub struct Record {
     pub verifiers: Vec<Receipt>,
 }
 
-/// The record's one schema.
 const RECORD_SCHEMA: i64 = 1;
 
-/// `table`'s keys are exactly `keys`.
 fn exact_keys(table: &Table, keys: &[&str], what: &str) -> Result<(), String> {
     let mut found: Vec<&str> = table.keys().map(String::as_str).collect();
     found.sort_unstable();
@@ -306,10 +284,8 @@ impl Record {
     }
 
     /// The record in `text`, every key known and of its type, then [`Self::validate`]d.
-    ///
     /// # Errors
-    /// Not TOML, a key missing, unknown or mistyped, or a record [`Self::validate`]
-    /// refuses.
+    /// Not TOML, a key missing, unknown or mistyped, or a record [`Self::validate`] refuses.
     pub fn parse(text: &str) -> Result<Self, String> {
         let table = text.parse::<Table>().map_err(|e| {
             format!(
@@ -364,10 +340,9 @@ impl Record {
         Ok(record)
     }
 
-    /// A claimed release (a build number and a 40-digit commit) published at an
-    /// `owner/name` repository, with one receipt per architecture in [`ARCHES`] order, each
-    /// the release's own asset name, a lowercase SHA-256 and a size install.sh downloads.
-    ///
+    /// A claimed release (a build number and a 40-digit commit) published at an `owner/name`
+    /// repository, with receipts for one or more of [`ARCHES`], in that order, each the release's
+    /// own asset name, a lowercase SHA-256 and a size install.sh downloads.
     /// # Errors
     /// Any other record.
     pub fn validate(&self) -> Result<(), String> {
@@ -417,7 +392,6 @@ impl Record {
 
     /// Whether `ledger` (RELEASES.ledger's text) records this release's claim:
     /// `<build_number> <version>`.
-    ///
     /// # Errors
     /// No such line.
     pub fn claimed_in(&self, ledger: &str) -> Result<(), String> {
@@ -440,14 +414,11 @@ impl Record {
     }
 }
 
-/// install.sh's pin held to the record committed beside it ([`RECORD`], `record` its text
-/// when there is one) and to `ledger`: nothing pinned and no record, or a pin that is
-/// exactly the record's, of a release the ledger claims, whose verifiers speak this tree's
-/// [`INTERFACE`]. The pin it read.
-///
+/// install.sh's pin held to the record committed beside it ([`RECORD`], `record` its text when
+/// there is one) and to `ledger`.
 /// # Errors
-/// A pin with no record, a record with no pin, any difference between them, a record the
-/// ledger does not claim, or one of another interface.
+/// A pin with no record, a record with no pin, any difference between them, a record the ledger
+/// does not claim, or one of another interface.
 pub fn check(install_sh: &str, record: Option<&str>, ledger: &str) -> Result<Pin, String> {
     let pin = Pin::read(install_sh)?;
     let Some(text) = record else {
@@ -592,7 +563,6 @@ mod tests {
         assert!(good.rewrite(&apart).is_err(), "the four lines apart");
     }
 
-    /// The record reads back as written, and a record of another shape is no record.
     #[test]
     fn a_record_reads_back_and_another_shape_is_refused() {
         let good = record();
@@ -661,9 +631,6 @@ mod tests {
         assert!(Record::parse("not = [toml").is_err());
     }
 
-    /// install.sh's pin is held to the record and the ledger: what the release's receipts
-    /// say, of a release the ledger claims, speaking this tree's interface; nothing pinned
-    /// and no record passes, and any other pairing is refused.
     #[test]
     fn a_pin_is_held_to_its_record_and_the_ledger() {
         let good = record();

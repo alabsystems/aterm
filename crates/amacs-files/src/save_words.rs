@@ -83,8 +83,6 @@ pub fn words(speaker: Speaker, path: &Path, failure: &Failure<'_>) -> String {
     }
 }
 
-/// `path` with a leading `$HOME` component as `~` (`~` for home itself,
-/// `~/notes` below it, any other path as it is), `$HOME` read once.
 fn home_abbreviated(path: &Path) -> String {
     static HOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let shown = path.to_string_lossy();
@@ -99,7 +97,6 @@ fn home_abbreviated(path: &Path) -> String {
     }
 }
 
-/// Why the document's save record would not start a save of `file`.
 fn begin_words(file: &str, error: &PersistenceError) -> String {
     match error {
         PersistenceError::UnknownDocument
@@ -122,8 +119,6 @@ fn begin_words(file: &str, error: &PersistenceError) -> String {
     }
 }
 
-/// What the disk or the volume holding `folder` says, which reads the same
-/// at any step and whatever it was doing.
 fn medium_words(folder: &str, kind: Option<ErrorKind>) -> Option<String> {
     Some(match kind? {
         ErrorKind::ReadOnlyFilesystem => format!("the disk holding {folder} is read-only"),
@@ -147,8 +142,6 @@ fn medium_words(folder: &str, kind: Option<ErrorKind>) -> Option<String> {
     })
 }
 
-/// What a step that met an I/O error while doing `cause.touch` says of it,
-/// where its kind says more than the step does.
 fn caused_words(
     who: &str,
     path: &Path,
@@ -160,7 +153,6 @@ fn caused_words(
         (SaveTouch::Read, ErrorKind::PermissionDenied) => {
             format!("{file} isn\u{2019}t readable \u{b7} check its permissions")
         }
-        // A lock file left by another user (e.g. `sudo`) blocks every save until removed.
         (SaveTouch::Lock, ErrorKind::PermissionDenied) => {
             let lock =
                 save_lock_of(path).map_or_else(|| "it".to_string(), |lock| home_abbreviated(&lock));
@@ -191,7 +183,6 @@ fn caused_words(
     })
 }
 
-/// What a step that changed nothing says where nothing more is known of why.
 fn step_words(who: &str, file: &str, folder: &str, stage: AtomicSaveStage) -> String {
     match stage {
         AtomicSaveStage::Preflight => {
@@ -210,8 +201,6 @@ fn step_words(who: &str, file: &str, folder: &str, stage: AtomicSaveStage) -> St
     }
 }
 
-/// What a step after the file may have been replaced says: never worded as
-/// one that changed nothing.
 fn unconfirmed_words(who: &str, file: &str, stage: AtomicSaveStage) -> String {
     match stage {
         AtomicSaveStage::RenameTarget => {
@@ -225,8 +214,6 @@ fn unconfirmed_words(who: &str, file: &str, stage: AtomicSaveStage) -> String {
     }
 }
 
-/// Why reading `file` before writing it (or, `opening`, to open it) was
-/// refused: by its refusal, and for a refused read the I/O error's kind.
 fn read_words(
     who: &str,
     file: &str,
@@ -284,7 +271,6 @@ mod tests {
         SaveTouch::Replace,
     ];
 
-    /// Every kind a step of the writer can meet.
     const KINDS: [ErrorKind; 19] = [
         ErrorKind::PermissionDenied,
         ErrorKind::ReadOnlyFilesystem,
@@ -307,7 +293,6 @@ mod tests {
         ErrorKind::Other,
     ];
 
-    /// Every cause a step can report: none, and each kind at each touch.
     fn causes() -> Vec<Option<SaveCause>> {
         std::iter::once(None)
             .chain(KINDS.iter().flat_map(|&kind| {
@@ -333,17 +318,10 @@ mod tests {
         )
     }
 
-    /// What the system would have said for `kind`, as the old words put it
-    /// after the step's name ("save failed at CreateTemporary (Permission
-    /// denied (os error 13))").
     fn system_words(kind: ErrorKind) -> String {
         std::io::Error::from(kind).to_string()
     }
 
-    /// What is wrong with `said` as words for a person about a failed save
-    /// whose writer met `kind`: a step's name, an errno, the system's own
-    /// text for the kind, no word of the file, its folder, the disk or the
-    /// volume, or a capital where a lead comes before it.
     fn problems(said: &str, kind: Option<ErrorKind>) -> Vec<String> {
         let mut found = Vec::new();
         for stage in STAGES {
@@ -380,12 +358,6 @@ mod tests {
         found
     }
 
-    /// EVERY FAILURE SAYS WHAT WENT WRONG IN A PERSON'S WORDS: for each step,
-    /// each kind and each thing the step was doing, written or unconfirmed,
-    /// the words name no step and carry neither the system's error text nor
-    /// an errno, and they say something about the file, its folder, the disk
-    /// or the volume. Negative control: the old words (`{path} save failed at
-    /// {stage:?} ({error})`) fail for every step and kind.
     #[test]
     fn every_step_and_kind_is_worded_for_a_person() {
         let path = path();
@@ -412,13 +384,6 @@ mod tests {
         assert!(problems(&said, None).is_empty(), "{said:?}");
     }
 
-    /// WHAT THE PERSON CAN DO FOLLOWS WHAT WENT WRONG AND WHERE: a folder that
-    /// is not writable is named, a file that is not readable is named, a save
-    /// lock this user cannot open is named for deleting, a file that cannot
-    /// be replaced says so; a full disk and an exhausted quota say to free
-    /// space; a read-only disk and an unanswering volume name the folder
-    /// they hold; a lock another writer holds says to wait; and a step that
-    /// changed nothing is never worded as one that may have.
     #[test]
     fn each_kind_says_its_own_thing() {
         let denied = |stage, touch| write(stage, ErrorKind::PermissionDenied, touch);
@@ -444,8 +409,11 @@ mod tests {
             "{unreadable}"
         );
         let lock = denied(AtomicSaveStage::Preflight, SaveTouch::Lock);
+        // The lock beside the file, joined as the platform joins it.
+        let beside =
+            std::path::Path::new("/Volumes/Shared/aterm").join(".aterm.toml.aterm-write.lock");
         assert!(
-            lock.contains("delete /Volumes/Shared/aterm/.aterm.toml.aterm-write.lock"),
+            lock.contains(&format!("delete {}", beside.display())),
             "{lock}"
         );
         let replace = denied(AtomicSaveStage::RenameTarget, SaveTouch::Replace);
@@ -515,9 +483,6 @@ mod tests {
         }
     }
 
-    /// A REFUSED READ SAYS WHY IN THE FILE'S TERMS, never the reader's
-    /// account of it: a file this user cannot read says so, as the same
-    /// refusal met mid-save does, and an unanswering volume names its folder.
     #[test]
     fn a_refused_read_is_worded_by_its_refusal() {
         let path = path();
@@ -563,9 +528,6 @@ mod tests {
         );
     }
 
-    /// A REFUSED OPEN IS WORDED AS A SAVE'S REFUSED READ IS, but a folder
-    /// that is not there does not exist: it did not go missing while saving
-    /// (what an open of aterm.toml in a missing folder said).
     #[test]
     fn a_refused_open_says_a_missing_folder_does_not_exist() {
         let path = path();
@@ -596,9 +558,6 @@ mod tests {
         }
     }
 
-    /// A LINK TO NOTHING SAYS SO, AND A NAME THAT IS NOT UTF-8: neither is
-    /// a link that changed on the way (which a retry may pass) nor a file
-    /// that could not be read, and neither carries the host's own words.
     #[test]
     fn a_link_to_nothing_and_a_name_not_utf8_say_so() {
         let path = path();
@@ -630,12 +589,6 @@ mod tests {
         }
     }
 
-    /// A SAVE ITS RECORD WOULD NOT START SAYS WHY IN THE FILE'S TERMS, for
-    /// each refusal the record gives: a document no longer open, a save
-    /// still on its way, the disk changed or an earlier save unconfirmed,
-    /// a record out of generations. Each reads as itself and none carries
-    /// the reducer's own name for it (`Save(SaveInFlight)`, the words amacs's
-    /// terminal face and Manual printed, `{error:?}`).
     #[test]
     fn a_refused_start_is_worded_by_its_refusal() {
         let path = path();
@@ -671,9 +624,6 @@ mod tests {
         );
     }
 
-    /// THE WORDS NAME THE PROGRAM THE PERSON IS USING: where a sentence needs
-    /// a subject, amacs's terminal face says "amacs" and aterm says "aterm",
-    /// and otherwise both say the same thing.
     #[test]
     fn each_face_names_itself() {
         let path = std::path::PathBuf::from("/srv/notes/notes.md");

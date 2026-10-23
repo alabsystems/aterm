@@ -1,7 +1,13 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Derived from skrifa 0.46.2 src/outline/autohint/style.rs (see ../../LICENSE-FONTATIONS).
+//
+// Derived from skrifa 0.46.2 src/outline/autohint/style.rs and modified by the
+// aterm project in 2026: the generated script data included from
+// styles_generated.rs; the digit bit (it fed only the fitted advance) and the
+// precomputed-metrics style iterator dropped. Its tests need fontations' test
+// fonts and are not carried.
+// See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Styles, scripts and glyph style mapping.
 

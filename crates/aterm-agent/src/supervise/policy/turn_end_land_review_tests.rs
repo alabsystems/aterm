@@ -3,16 +3,8 @@
 
 use crate::harness::repo_work::RepoWork;
 
-/// A clean defense other than [`DEFENSE`].
 const OTHER_DEFENSE: &str = "Merged the docs and pushed main.\nNothing left: all of it is merged into the remote main branch.";
 
-/// AN ACT NEVER TAKEN LANDS NOTHING ([`Awaited::taken`]): Land's instruction
-/// typed at a first point whose reply is already a clean defense (said
-/// before Land was chosen), or its nudge typed at a defense the probe found
-/// work under, and no read since sees the act's turn run — the same words on
-/// the screen, no work, past [`TurnEndTiming::take_within`], the probe now
-/// finding nothing — is no landing: the defense predates the act, and the
-/// task stays open.
 #[test]
 fn an_untaken_land_act_lands_nothing_on_the_defense_it_was_typed_over() {
     let take = TurnEndTiming::default().take_within;
@@ -51,12 +43,6 @@ fn an_untaken_land_act_lands_nothing_on_the_defense_it_was_typed_over() {
     }
 }
 
-/// A LANDING OFF STOOD OVER ([`TurnEndState::park_off`]) holds when Land
-/// comes back only while the last words are still its own clean defense: a
-/// turn the person drove meanwhile, unseen (the park folds no reading in),
-/// left words of its own — a report that is no defense, or another defense
-/// they asked for — and the task is open again, Land's act owed after the
-/// back-off.
 #[test]
 fn a_landing_off_stood_over_holds_only_on_its_own_words() {
     for theirs in ["Renamed the lexer's tokens.", OTHER_DEFENSE] {
@@ -77,11 +63,6 @@ fn a_landing_off_stood_over_holds_only_on_its_own_words() {
     assert!(st.landed());
 }
 
-/// THE RECORD'S LANDING HOLDS ONLY AT A POINT THAT IS STILL A CLEAN DEFENSE
-/// ([`TurnEndState::record_landing_holds`], the loop's gate before it takes
-/// a `done` record on): a first point whose reply is no defense — a turn
-/// after the landing no loop watched, the retired token — or one a wall
-/// stands over, or a defense the probe finds work under, holds none.
 #[test]
 fn a_records_landing_holds_only_at_a_clean_defense() {
     let point = |r: TurnEndReading| {
@@ -111,11 +92,6 @@ fn a_records_landing_holds_only_at_a_clean_defense() {
     }
 }
 
-/// A LANDED TASK'S OWN WAKE KEEPS THE LANDING
-/// ([`TurnEndReading::finished_record`]): a turn the conversation's record
-/// says nobody asked — Claude Code's own wake for a background task — that
-/// ends on any reply, on a 529 or on a usage limit leaves the task landed,
-/// and nothing is typed, then or a day later past the reset.
 #[test]
 fn a_landed_tasks_own_wake_keeps_the_landing() {
     let wake_at = t0() + 30 * MIN;
@@ -173,12 +149,6 @@ fn a_landed_tasks_own_wake_keeps_the_landing() {
     }
 }
 
-/// A LANDED TASK'S OWN WAKE OVER OPEN WORK REOPENS IT (spec §9.6: under
-/// Land the repository check gates the landing, whoever's turn it was): the
-/// wake the record says nobody asked, ending over new uncommitted work in
-/// the repository, or naming open work or a need in its words, is no longer
-/// landed, and Land's nudge (`land-nudge@v1`) is typed; the face reads open
-/// at its point.
 #[test]
 fn a_landed_tasks_own_wake_over_open_work_gets_the_nudge() {
     let wake_at = t0() + 30 * MIN;
@@ -229,12 +199,6 @@ fn a_landed_tasks_own_wake_over_open_work_gets_the_nudge() {
     assert_eq!(st.face(), TaskFace::Landed);
 }
 
-/// A LANDED TASK'S OWN WAKE OVER SOMEONE ELSE'S EDITS KEEPS THE LANDING
-/// ([`TurnEndState::wake_began_over`]): the work the probe found as the wake
-/// began, found unchanged at its point, is none of the wake's — someone
-/// edited the checkout by hand after the landing — so the landing holds and
-/// nothing is typed, as a restart with no turn run holds it
-/// ([`TurnEndState::landing_words_read`]).
 #[test]
 fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
     let wake_at = t0() + 30 * MIN;
@@ -288,12 +252,6 @@ fn a_landed_tasks_own_wake_over_someone_elses_edits_keeps_the_landing() {
     assert!(!st.landed(), "{a:?}");
 }
 
-/// A WAKE THAT REOPENS A LANDING OVER SOMEONE ELSE'S EDITS NAMES NONE OF THEM
-/// (the merge of Autopilot Land's F1 with the wake's own probe): the wake began
-/// over the person's edit and ends over the same one, but its words leave
-/// work open, so the landing is over and Land's nudge is owed — for the
-/// wake's words, never for the edit: the nudge carries no repository ask, so
-/// the worker is not told to commit work it did not make.
 #[test]
 fn a_wake_that_reopens_a_landing_over_someone_elses_edit_names_none_of_it() {
     let theirs = uncommitted_repo();
@@ -320,14 +278,6 @@ fn a_wake_that_reopens_a_landing_over_someone_elses_edit_names_none_of_it() {
     }
 }
 
-/// AN OFF AND BACK RE-ARMS LAND OVER THE REPOSITORY AS IT IS (a person's act;
-/// the merge of Autopilot Land's F1/P6 with the restart's hold on a landing's
-/// own words): once Off stood over a landing ([`TurnEndState::park_off`]),
-/// its words read again are no reason to leave the repository unasked
-/// ([`TurnEndState::landing_words_read`]) — this loop's landing or one the
-/// journal seeded (a loop started as Off lifts) — and over the person's edit
-/// the landing is over: Land's instruction again (the Off ended the
-/// episode).
 #[test]
 fn an_off_and_back_re_arms_land_over_the_repository_as_it_is() {
     let mark = said_mark(Some(DEFENSE));
@@ -374,15 +324,6 @@ fn an_off_and_back_re_arms_land_over_the_repository_as_it_is() {
     assert!(st.landed());
 }
 
-/// A SUCCESSOR WHOSE FIRST READ IS THE LANDED TASK'S OWN WAKE KEEPS THE
-/// SEEDED LANDING (the recheck of ea564676a3): a loop restarted over a
-/// landing (the journal's seed, [`TurnEndState::seed_landed`]) whose first
-/// read is Claude Code's background-task wake, the record saying nobody
-/// asked since: the wake is read as the task's own
-/// ([`TurnEndState::wake_may_keep_landing`] holds for the armed seed too),
-/// the seed is kept through its frames, the face stays landed, and the
-/// wake's point — nothing open, the repository clean — takes the landing
-/// up: nothing typed.
 #[test]
 fn a_successors_first_read_of_the_landed_tasks_own_wake_keeps_the_seed() {
     let quiet = "The monitor fired: the deploy finished.";
@@ -436,13 +377,6 @@ fn a_successors_first_read_of_the_landed_tasks_own_wake_keeps_the_seed() {
     }
 }
 
-/// A HANDOFF AFTER AN UNTAKEN LAND ACT TYPES LAND'S ACT AGAIN
-/// ([`TurnEndState::seed_land_act`]): a loop typed Land's instruction and
-/// stopped before any read saw it taken; its successor's first point reads a
-/// clean defense with no turn seen run and no sign the act was taken — no `❯`
-/// row of the act over it, no record of its turn — so the defense predates
-/// the act (said before Land was chosen), lands nothing, and the claim gets
-/// Land's act again.
 #[test]
 fn a_handoff_after_an_untaken_land_act_types_it_again() {
     let said = crate::supervise::approvals::words_hash(LAND);
@@ -516,15 +450,6 @@ fn a_handoff_after_an_untaken_land_act_types_it_again() {
     }
 }
 
-/// A HANDOFF WHERE NOTHING CAN TELL WHETHER THE LAND ACT WAS TAKEN LANDS ITS
-/// CLEAN DEFENSE (the recheck of ea564676a3): on Gemini CLI, agy and Muse
-/// Code no reader reads the answered prompt over a reply and no transcript
-/// record is read ([`TurnEndReading::answered`], `record_turn`: Claude Code's
-/// alone) — and here no message that opened the turn was read either
-/// ([`TurnEndReading::opened_by`]: where it is, it tells,
-/// `an_untaken_land_act_is_told_by_the_message_that_opened_the_turn`) — and
-/// a ledger row with no act (`seed_land_act` never called) has nothing to
-/// compare.
 #[test]
 fn a_handoff_nothing_can_read_the_land_act_on_lands_its_defense() {
     let said = crate::supervise::approvals::words_hash(LAND);
@@ -559,13 +484,6 @@ fn a_handoff_nothing_can_read_the_land_act_on_lands_its_defense() {
     assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
 }
 
-/// A SEEDED LANDING HOLDS OVER SOMEONE ELSE'S EDITS UNTIL SOMEONE'S TURN
-/// ([`TurnEndState::landing_words_read`]): after a loop restart, the
-/// landing the journal seeded, its first point the landing's own words (the
-/// mark the journal kept) with no turn run since, holds — nothing typed, the
-/// record's landing standing — though the repository now holds work: no turn
-/// of the worker's made it, so it is someone else's, and the loop asks the
-/// repository nothing there.
 #[test]
 fn a_seeded_landing_holds_over_someone_elses_edits_until_a_turn() {
     let mark = said_mark(Some(DEFENSE));
@@ -607,12 +525,6 @@ fn a_seeded_landing_holds_over_someone_elses_edits_until_a_turn() {
     }
 }
 
-/// A REPORT READ IN PART LANDS NOTHING: a message taller than the rows read
-/// ([`TurnEndReading::said_cut`]: its head scrolled off, so a NEEDS YOU line
-/// or open work above them is unread), and a NEEDS YOU line said in an
-/// earlier message of the same turn ([`TurnEndReading::turn_said`]), are
-/// no clean defense, though the last rows are one; the need said earlier
-/// stands as the reply's own.
 #[test]
 fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     let after_instruction = |r: TurnEndReading| {
@@ -647,10 +559,6 @@ fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     assert!(st.landed(), "an earlier message with no need: {a:?}");
 }
 
-/// The rows the first Land reading kept as its own beside [`OPEN_STATUS`]
-/// (the review of 2026-10-20): Land's strict reading by word family
-/// ([`LAND_FAMILIES`]) reads each of them open too, wherever its family
-/// holds it.
 const FIRST_LAND_ROWS: &[&str] = &[
     "not landed",
     "unlanded",
@@ -692,10 +600,6 @@ const FIRST_LAND_ROWS: &[&str] = &[
     "next session",
 ];
 
-/// EVERY ROW OF [`LAND_STATUS`], AND OF THE FIRST LAND READING
-/// ([`FIRST_LAND_ROWS`]), IS OPEN WORK UNDER LAND: a defense whose body
-/// names it is no clean defense ([`open_work_strict`]), and the nudge names
-/// it.
 #[test]
 fn every_land_status_row_is_open_under_land_and_not_under_cruise() {
     let said = |row: &str| -> String {
@@ -747,12 +651,6 @@ fn every_land_status_row_is_open_under_land_and_not_under_cruise() {
     }
 }
 
-/// A STATED REASON EXCUSES NO UNLANDED WORK UNDER LAND: `not merged,
-/// because no reviewer…`, `there is no reviewer so … not merged`, `not
-/// pushed: no remote` — the negation governs the reason, not the merge —
-/// are open under Land's strict reading, as are the phrasings the review
-/// found missed (`blocked`, `pending`, `awaiting`, `still has to`, `did
-/// not get to`, `skipped`, `red`, `a separate task`, `left … for`).
 #[test]
 fn land_reads_a_reason_as_no_excuse_and_a_landed_thing_as_landed() {
     for body in [
@@ -796,11 +694,6 @@ fn land_reads_a_reason_as_no_excuse_and_a_landed_thing_as_landed() {
     assert!(!open_work_strict(Some("the WIP branch is not merged")).is_empty());
 }
 
-/// EVERY ACT FITS WHAT THE COMPOSER DRAWS AS TYPED ([`VERBATIM_UNITS`]) with
-/// all its suffixes at once — the open words (four named), the repository's
-/// finding (160 units), the reversible clause, the needs ack — and the
-/// standing rules: Cruise's check and Land's nudge, each with and without
-/// rules.
 #[test]
 fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
     let repo = RepoWork {
@@ -874,12 +767,6 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
     );
 }
 
-/// THE RETIRED DONE CHECKS ARE THE WORDS THEY WERE TYPED AS
-/// ([`RETIRED_DONE_CHECKS`]): one space between words — a continuation line
-/// that kept its indent inside the literal spelled a check no record holds
-/// — and each read as a check ([`is_done_check`]) alone, with its fixed
-/// reversible clause, and with the standing rules; main's check from
-/// `d92d817dc` among them.
 #[test]
 fn the_retired_done_checks_read_as_typed() {
     for check in RETIRED_DONE_CHECKS {
@@ -902,10 +789,6 @@ fn the_retired_done_checks_read_as_typed() {
     assert!(RETIRED_DONE_CHECKS.contains(&main));
 }
 
-/// LAND'S NUDGE NAMES THE OPEN WORDS OF A DONE CLAIM THAT IS NO DEFENSE
-/// ([`land_open_words`]: Land's strict reading over the claim, its NEEDS YOU
-/// lines left out): `All done … still open: the docs` at the land act's
-/// yield gets the nudge with the open-work suffix, and no landing.
 #[test]
 fn a_land_done_claim_gets_the_nudge_with_its_open_words() {
     let nudge_at = |reply: &str| {
@@ -939,9 +822,6 @@ fn a_land_done_claim_gets_the_nudge_with_its_open_words() {
     );
 }
 
-/// CRUISE READS NO OPEN WORK OUT OF A NEEDS YOU LINE: a done claim whose
-/// only open words stand on its NEEDS YOU line gets the check acked, with no
-/// open-work suffix — the need is the person's, not work the worker left.
 #[test]
 fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
     let check_at = |reply: &str| {
@@ -969,12 +849,6 @@ fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
     );
 }
 
-/// A SEEDED LANDING'S OWN WORDS HOLD OVER A TURN READ CUT
-/// ([`TurnEndState::landing_words_read`]): after a loop restart, the first
-/// point's words the landing's own (the journal's mark), no turn since, read
-/// with the turn's start out of reach ([`TurnEndReading::said_cut`]: no
-/// history to read, a turn taller than the history is looked through) —
-/// the landing holds, nothing typed.
 #[test]
 fn a_seeded_landings_own_words_hold_over_a_turn_read_cut() {
     let mut st = TurnEndState::default();
@@ -998,12 +872,6 @@ fn a_seeded_landings_own_words_hold_over_a_turn_read_cut() {
     assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
 }
 
-/// AN OFF AND BACK, THEN THE LANDED TASK'S OWN WAKE, KEEPS NO LANDING OVER
-/// THE PERSON'S EDIT (`TurnEndState::observe`'s `off_stood`): Off is a
-/// person's act, and the work the wake began over may be their own edit
-/// made under Off — so the wake's start forgives nothing, and the landing
-/// holds only over a clean repository, as an Off and back read idle holds
-/// it (P6).
 #[test]
 fn an_off_and_back_then_the_tasks_own_wake_keeps_no_landing_over_the_persons_edit() {
     let wake_at = t0() + 30 * MIN;
@@ -1047,10 +915,6 @@ fn an_off_and_back_then_the_tasks_own_wake_keeps_no_landing_over_the_persons_edi
     assert_eq!(a, TurnEndAction::Nothing, "no Off");
 }
 
-/// A SUCCESSOR THAT ATTACHES MID-WAKE TAKES NO PROBE AS THE WAKE'S START
-/// ([`TurnEndState::wake_start_owed`]): its first read is the wake running,
-/// no point of its own judged, so it never saw the wake begin — what the
-/// probe finds then may already be the wake's work.
 #[test]
 fn a_successor_attached_mid_wake_takes_no_probe_as_the_wakes_start() {
     let quiet = "The monitor fired: the deploy finished.";
@@ -1076,11 +940,6 @@ fn a_successor_attached_mid_wake_takes_no_probe_as_the_wakes_start() {
     assert!(st.landed(), "{a:?}");
 }
 
-/// A WAKE'S EDIT TO A PATH ALREADY CHANGED REOPENS THE LANDING
-/// ([`crate::harness::repo_work::RepoWork::same`]: the work's state, not its
-/// counts and first paths): someone else's edit stood when the wake began,
-/// and the wake edited the same file again — the counts and the paths read
-/// the same, the work's state does not.
 #[test]
 fn a_wakes_edit_to_a_path_already_changed_reopens_the_landing() {
     let quiet = "The monitor fired: the deploy finished.";
@@ -1115,11 +974,6 @@ fn a_wakes_edit_to_a_path_already_changed_reopens_the_landing() {
     assert!(!landed, "{a:?}");
 }
 
-/// A DEFENSE WITH A NONE LINE IN COMMON WORDS LANDS, NO NEED STANDING (the
-/// review of b8/residuals): `NEEDS YOU: no action needed from you.`,
-/// `nothing at this point.`, `nothing to do.`, `nothing from my side.`, a
-/// dash alone — each beside a clean defense at the land act's yield read as
-/// a need: the nudge typed, and a phantom need on the person's screen.
 #[test]
 fn a_defense_with_a_none_line_in_common_words_lands() {
     let yield_of = |none: &str| {
@@ -1157,13 +1011,6 @@ fn a_defense_with_a_none_line_in_common_words_lands() {
     assert_eq!(st.standing_needs().len(), 1, "{:?}", st.standing_needs());
 }
 
-/// AN UNTAKEN LAND ACT IS TOLD BY THE MESSAGE THAT OPENED THE TURN on Gemini
-/// CLI, agy and Muse Code ([`TurnEndReading::opened_by`],
-/// [`TurnEndState::seed_land_act`]): a loop typed Land's instruction and
-/// stopped before any read saw it taken; its successor's first point reads a
-/// clean defense with no turn seen run, under the message of the person's
-/// that opened that turn — the defense predates the act, lands nothing, and
-/// the claim gets Land's act again.
 #[test]
 fn an_untaken_land_act_is_told_by_the_message_that_opened_the_turn() {
     use crate::supervise::approvals::{LEAD_WORDS, words_hash, words_lead};
@@ -1199,13 +1046,6 @@ fn an_untaken_land_act_is_told_by_the_message_that_opened_the_turn() {
     }
 }
 
-/// THE LANDED TASK'S OWN WAKE READ UNDER OFF KEEPS THE LANDING FOR THE PARK
-/// (`TurnEndState::observe`'s `record_says`): the loop reads the session's
-/// word fresh at a wake's end over a landing (`Session::turn_end_at_point`),
-/// so an Off chosen on the landed screen is read there — and Off takes the
-/// landing to its park ([`TurnEndState::park_off`]), judged again as Off
-/// lifts, never drops it at the wake: dropped there, the lift typed Land's
-/// instruction into a clean landing.
 #[test]
 fn the_tasks_own_wake_read_under_off_keeps_the_landing_for_the_park() {
     let quiet = "The monitor fired: the deploy finished.";

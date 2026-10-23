@@ -210,6 +210,12 @@ struct CodecInfoVtbl {
     get_file_extensions: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
 }
 
+/// The vtable of the live interface `object`, viewed as `V`.
+///
+/// # Safety
+///
+/// `object` must be a live interface pointer whose vtable begins with `V`'s
+/// slots, in order.
 unsafe fn vtable<'a, V>(object: &'a Com) -> &'a V {
     // SAFETY: the caller vouches that the vtable starts with `V`'s slots.
     unsafe { object.vtable::<V>() }

@@ -31,7 +31,9 @@ pub(crate) fn config(style: GlowStyle) -> GlowConfig {
     }
 }
 
-/// The HOT ribbon gate the frozen-clock fixture above cannot reach: `saturated` re-ticks one Instant, so `dt == 0` never runs the momentum integrator, `rainbow.disp` stays 0, and only the cheaper resting path is measured.
+/// The HOT ribbon gate the bench's frozen-clock fixture cannot reach: `saturated_sweep`
+/// (`benches/cursor_bench.rs`) re-ticks one Instant, so `dt == 0` never runs the momentum
+/// integrator, `rainbow.disp` stays 0, and only the cheaper resting path is measured.
 #[test]
 fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
     use aterm_effects::cursor_glow::{CursorGlow, Geom};

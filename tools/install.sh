@@ -1045,33 +1045,78 @@ home_account() { # <euid> <sudo_uid> <home_uid> <home_account>
 # for BSD and GNU, where stat's flags differ), through a symlink, since the
 # files land in the folder it names.
 home_owner_uid() {
-	/bin/ls -ndL -- "$HOME" 2>/dev/null | awk '{print $3}'
+	/bin/ls -ndL -- "$HOME" 2>/dev/null | awk '{print $3}' || true
 }
 
-# The home of the account named <name> (getpwnam's, through ~name, which
-# Directory Services and NSS both answer); fails for a name it cannot vet or
-# look up (a test replaces it).
-account_home() { # <name>
-	local own
-	[[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
-	eval "own=~$1"
-	[[ "$own" != "~$1" ]] && echo "$own"
+# The homes of the accounts whose uid is <uid>, one per line: getpwuid's, and
+# every other record the account database lists with that uid (useradd -o; a
+# local and a directory account sharing one), by uid, never by the name `ls`
+# prints (BusyBox's cuts it to 8 characters) (a test replaces it). dscacheutil's
+# `-a uid` query is getpwuid's one record, and its bare `-q user` the listing.
+account_homes() { # <uid>
+	if [[ -x /usr/bin/dscacheutil ]]; then
+		{ /usr/bin/dscacheutil -q user -a uid "$1"; echo; /usr/bin/dscacheutil -q user; } 2>/dev/null |
+			dscache_homes "$1" || true
+	elif command -v getent >/dev/null 2>&1; then
+		{ getent passwd "$1"; getent passwd; } 2>/dev/null | passwd_homes "$1" || true
+	else
+		passwd_homes "$1" </etc/passwd 2>/dev/null || true
+	fi
+}
+
+# The home of each dscacheutil record on stdin (`name: …` lines, a blank line
+# after each record) whose uid is <uid>. dscacheutil prints a uid signed
+# (nobody's 4294967294 as -2), `ls -n` and `id -u` unsigned.
+dscache_homes() { # <uid>
+	awk -v u="$1" 'BEGIN { RS = "" } {
+		uid = dir = ""
+		n = split($0, l, "\n")
+		for (i = 1; i <= n; i++) {
+			if (l[i] ~ /^uid: /) uid = substr(l[i], 6)
+			else if (l[i] ~ /^dir: /) dir = substr(l[i], 6)
+		}
+		if (uid == "" || dir == "") next
+		if (uid + 0 < 0) uid += 4294967296
+		if (uid + 0 == u + 0) print dir
+	}'
+}
+
+# The home of each passwd(5) line on stdin whose uid is <uid>.
+passwd_homes() { # <uid>
+	awk -F: -v u="$1" '$3 == u { print $6 }'
+}
+
+# Whether folder <a> (a physical path) is folder <b> or inside it, by identity
+# (-ef) at each level up, so another spelling of the same folder (a case variant
+# on APFS, a leading //, a firmlink's /System/Volumes/Data path) is the same.
+in_folder() { # <a> <b>
+	local a="$1"
+	while [[ -n "$a" ]]; do
+		[[ "$a" -ef "$2" ]] && return 0
+		[[ "$a" == */* ]] || return 1
+		a="${a%/*}"
+	done
+	[[ / -ef "$2" ]]
 }
 
 # Whether HOME is in the home of an account here: `ls` prints its owner's name
 # (for a uid no account here has, the bare number `ls -n` prints), and HOME is
-# that account's own home or a folder in it. A uid an image's account happens
-# to share (a CI container's HOME, owned by the host runner's uid) is not one. A
-# name that cannot be looked up, or a HOME that cannot be entered, counts as
-# one, so the run refuses.
+# the own home of an account with that uid, or a folder in it. A uid an image's
+# account happens to share (a CI container's HOME, owned by the host runner's
+# uid) is not one. A named owner with no home found, or a HOME that cannot be
+# entered, counts as one, so the run refuses.
 home_owner_named() {
-	local name own here
-	name="$(/bin/ls -ldL -- "$HOME" 2>/dev/null | awk '{print $3}')"
-	[[ -n "$name" && "$name" != "$(home_owner_uid)" ]] || return 1
-	own="$(account_home "$name")" || return 0
+	local uid name here d found=0
+	uid="$(home_owner_uid)"
+	name="$(/bin/ls -ldL -- "$HOME" 2>/dev/null | awk '{print $3}')" || return 1
+	[[ -n "$name" && "$name" != "$uid" ]] || return 1
 	here="$(cd -P -- "$HOME" 2>/dev/null && pwd)" || return 0
-	own="$(cd -P -- "$own" 2>/dev/null && pwd)" || return 1
-	[[ "$here" == "$own" || "$here" == "${own%/}"/* ]]
+	while IFS= read -r d; do
+		[[ -n "$d" ]] || continue
+		found=1
+		in_folder "$here" "$d" && return 0
+	done <<<"$(account_homes "$uid")"
+	[[ "$found" -eq 0 ]]
 }
 
 # The one call that runs as another account (a test replaces it): never
@@ -1142,42 +1187,84 @@ run_as_home_account() { # <arg>...
 mine() { [[ -O "$1" || -w "$1" ]]; }
 
 # FOREIGN_FOLDERS: the folders aterm writes below HOME (the link and store, the
-# man page and completions, aterm.toml, atpkg's hooks, state and logs) that
-# exist and are not this account's, each the outermost such on its way down
-# from HOME, once. An install under sudo before a root run handed itself to
-# the account left them root's, and nothing this run does can change what is
-# in them. Read only. None for root, which changes anything (a root run
-# reaches here over its own home, or one no account here owns or that is
-# outside its owner's own home), nor over a HOME that is not this account's
-# (sudo -u keeps the invoker's): its folders are their owner's, not a sudo
-# install's. The walk stays inside HOME as written: an empty HOME, `/`, or a
-# path with a `..` component names nothing, and a symlink on the way ends
-# HOME's own folders on that path (chown -R would change only the link).
+# man page, which shell-setup rewrites in place, and the completions, aterm.toml,
+# atpkg's hooks, prefix, state and logs)
+# that exist and are not this account's, each the outermost such on its way
+# down from HOME, once, and inside aterm's own trees (where every entry is the
+# account's) each outermost entry another uid owns. An install under sudo
+# before a root run handed itself to the account left them root's, and nothing
+# this run does can change what is in them. Read only. None for root, which
+# changes anything (a root run reaches here over its own home, or one no
+# account here owns or that is outside its owner's own home), nor over a HOME
+# this account does not own (sudo -u keeps the invoker's; a shared /tmp; an
+# empty HOME or `/`): its folders are their owner's, not a sudo install's. The
+# walk stays inside HOME as written: a path with a `..` component names
+# nothing, and a symlink on the way ends HOME's own folders on that path
+# (chown -R would change only the link).
 foreign_home_folders() {
-	local p d top f cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+	local p f cfg="${XDG_CONFIG_HOME:-$HOME/.config}" data="${XDG_DATA_HOME:-$HOME/.local/share}"
+	local -a trees
 	FOREIGN_FOLDERS=()
-	[[ "$(id -u)" != 0 && "$HOME" == /*[!/]* ]] && mine "$HOME" || return 0
-	for p in "$BIN_DIR" "$STORE_DIR" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1" \
-		"$HOME/.local/share/zsh/site-functions" "$HOME/.local/share/bash-completion/completions" \
-		"$cfg/fish/completions" "$cfg/aterm" "$HOME/.aterm" \
-		"$HOME/Library/Application Support/aterm" "$HOME/Library/Logs/aterm"; do
-		case "$p/" in */../*) continue ;; esac
-		top=""
-		d="$p"
-		while [[ "$d" == "$HOME"/* ]]; do
-			if [[ -L "$d" ]]; then
-				top=""
-			elif [[ -e "$d" ]] && ! mine "$d"; then
-				top="$d"
-			fi
-			d="${d%/*}"
-		done
-		[[ -n "$top" ]] || continue
-		for f in ${FOREIGN_FOLDERS[@]+"${FOREIGN_FOLDERS[@]}"}; do
-			[[ "$f" == "$top" ]] && continue 2
-		done
-		FOREIGN_FOLDERS+=("$top")
+	[[ "$(id -u)" != 0 && -O "$HOME" ]] || return 0
+	if [[ "$(uname -s)" == Darwin ]]; then
+		trees=("$HOME/Library/Application Support/aterm" "$HOME/Library/Logs/aterm")
+	else
+		trees=("$data/aterm" "$HOME/.local/share/aterm/pkg" "${XDG_STATE_HOME:-$HOME/.local/state}/aterm")
+	fi
+	trees+=("$STORE_DIR" "$cfg/aterm" "$HOME/.aterm")
+	for p in "$BIN_DIR" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1/aterm.1" "$data/zsh/site-functions" \
+		"$data/bash-completion/completions" "$cfg/fish/completions" "${trees[@]}"; do
+		home_folder_top "$p" || continue
+		[[ -z "$FOLDER_TOP" ]] || foreign_add "$FOLDER_TOP"
 	done
+	for p in "${trees[@]}"; do
+		home_folder_top "$p" && [[ -z "$FOLDER_TOP" && "$FOLDER_LINKED" -eq 0 && -d "$p" ]] || continue
+		while IFS= read -r f; do
+			[[ -z "$f" ]] || foreign_add "$f"
+		done <<<"$(foreign_inside "$p")"
+	done
+}
+
+# FOLDER_TOP: the outermost folder on the way down from HOME to <path> that
+# exists and is not this account's, or empty; a symlink on the way ends HOME's
+# own folders below it, and FOLDER_LINKED=1 says one was there. Status 1 when
+# <path> is not below HOME as written or has a `..` component.
+home_folder_top() { # <path>
+	local d="$1"
+	FOLDER_TOP=""
+	FOLDER_LINKED=0
+	case "$1/" in */../*) return 1 ;; esac
+	while [[ "$d" == "$HOME"/* ]]; do
+		if [[ -L "$d" ]]; then
+			FOLDER_TOP=""
+			FOLDER_LINKED=1
+		elif [[ -e "$d" ]] && ! mine "$d"; then
+			FOLDER_TOP="$d"
+		fi
+		d="${d%/*}"
+	done
+	[[ "$1" == "$HOME"/* ]]
+}
+
+# The entries below <dir>, to atpkg's store/<pkg>/<build>, that another uid
+# owns, each the outermost such, one per line; links aside, since the account
+# can replace a link in a folder of its own, and nothing at or below a name
+# with a newline, which would read as two paths (a test replaces it).
+foreign_inside() { # <dir>
+	find "$1" -mindepth 1 -maxdepth 4 \( -name "*"$'\n'"*" -prune \) -o \
+		\( ! -type l ! -user "$(id -u)" -prune -print \) 2>/dev/null || true
+}
+
+# Add <path> to FOREIGN_FOLDERS unless one there holds it, and drop each one
+# it holds.
+foreign_add() { # <path>
+	local f
+	local -a kept=()
+	for f in ${FOREIGN_FOLDERS[@]+"${FOREIGN_FOLDERS[@]}"}; do
+		[[ "$1" != "$f" && "$1" != "$f"/* ]] || return 0
+		[[ "$f" == "$1"/* ]] || kept+=("$f")
+	done
+	FOREIGN_FOLDERS=(${kept[@]+"${kept[@]}"} "$1")
 }
 
 # The NOTE that names FOREIGN_FOLDERS and the one command that gives them back,
@@ -1190,7 +1277,7 @@ foreign_home_note() {
 		list+="${list:+, }$f"
 		args+=" $(printf '%q' "$f")"
 	done
-	echo "install.sh: NOTE: not yours, so aterm cannot change what is in $it: $list (an install under sudo makes such folders root's) — give $it back with: sudo chown -R $(id -un 2>/dev/null || id -u)$args" >&2
+	echo "install.sh: NOTE: not yours, so aterm cannot change what is in $it: $list (an install under sudo makes such folders root's) — give $it back with: sudo chown -R $(printf '%q' "$(id -un 2>/dev/null || id -u)")$args" >&2
 }
 
 # The way out for a folder ensure_dirs_writable refused: the NOTE's when one
@@ -3217,7 +3304,16 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
-home_account "$(id -u)" "${SUDO_UID:-}" "$(home_owner_uid)" "$(home_owner_named && echo 1 || echo 0)"
+# home_owner_named lists the account database, so it is asked only when
+# home_account reads its answer: root, over a home neither root's nor sudo's
+# invoker's.
+HOME_OWNER="$(home_owner_uid)"
+HOME_NAMED=0
+if [[ "$(id -u)" == 0 && -n "$HOME_OWNER" && "$HOME_OWNER" != 0 && "$HOME_OWNER" != "${SUDO_UID:-}" ]] &&
+	home_owner_named; then
+	HOME_NAMED=1
+fi
+home_account "$(id -u)" "${SUDO_UID:-}" "$HOME_OWNER" "$HOME_NAMED"
 if [[ -n "$HOME_ACCOUNT" || "$HOME_REFUSED" -eq 1 ]]; then
 	run_as_home_account ${ARGV[@]+"${ARGV[@]}"}
 fi

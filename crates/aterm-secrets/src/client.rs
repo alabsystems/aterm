@@ -2030,7 +2030,7 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
 
 /// Join only over the configuration the caller read.
 /// # Errors
-/// As [`join`], or the current configuration differs from `expected`.
+/// As [`fn@join`], or the current configuration differs from `expected`.
 pub fn join_if_unchanged(
     paths: &Paths,
     options: &JoinOptions<'_>,

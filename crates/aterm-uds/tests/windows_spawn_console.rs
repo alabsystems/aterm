@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_uds::spawn`'s console rule, and `aterm_uds::spawnfd::command` — the constructor every shipped child is built with, which applies that rule off Unix — against real Windows processes: what console a child actually gets, read from inside the child.
+//! `aterm_uds::spawn`'s console rule, and `aterm_uds::spawnfd::command` — the constructor every
+//! shipped child is built with, which applies that rule off Unix — against real Windows processes:
+//! what console a child actually gets, read from inside the child.
 
 #![cfg(windows)]
 #![allow(
@@ -17,14 +19,9 @@ use std::path::Path;
 
 use aterm_uds::spawn::{self, Console};
 
-/// Which role a re-run of this binary plays; unset in the suite itself.
 const ROLE_ENV: &str = "ATERM_UDS_SPAWN_CONSOLE_ROLE";
-/// Where a probe also writes its report, when set (the pseudoconsole control).
 const REPORT_FILE_ENV: &str = "ATERM_UDS_SPAWN_CONSOLE_REPORT_FILE";
-/// The prefix of every report line a role prints.
 const REPORT: &str = "aterm-uds-spawn-report";
-/// A hang detector, never a latency budget: a role answers in well under a
-/// second when the machine is idle.
 const HANG: Duration = Duration::from_secs(60);
 
 #[link(name = "kernel32")]
@@ -52,14 +49,13 @@ fn own_facts() -> Facts {
     Facts {
         // SAFETY: no arguments; returns a window handle or 0.
         window: unsafe { GetConsoleWindow() } != 0,
-        // SAFETY: a one-element out-buffer that outlives the call, its length passed as 1; the count returned may exceed it, which is what is read.
+        // SAFETY: a one-element out-buffer that outlives the call, its length passed as 1; the
+        // count returned may exceed it, which is what is read.
         attached: unsafe { GetConsoleProcessList(&mut first, 1) },
         have_console: spawn::have_console(),
     }
 }
 
-/// Refuse, before anything is started, a child built with `console` (and no
-/// extra flags, as every spawn here is) unless both hold:
 fn spawn_is_safe_here(console: Console) -> Result<(), String> {
     // SAFETY: no arguments; returns the console's input code page, 0 without one.
     let oracle = unsafe { GetConsoleCP() } != 0;
@@ -81,18 +77,11 @@ fn spawn_is_safe_here(console: Console) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a CONSOLE-subsystem child started with `word` by a process that
-/// `has_console` gets a console WINDOW: a new console always has one, and from a
-/// process with no console so does any word without `CREATE_NO_WINDOW` or
-/// `DETACHED_PROCESS` (Windows gives the child a new, visible console — the
-/// flash).
 fn shows_a_console_window(word: u32, has_console: bool) -> bool {
     word & spawn::CREATE_NEW_CONSOLE != 0
         || (!has_console && word & (spawn::CREATE_NO_WINDOW | spawn::DETACHED_PROCESS) == 0)
 }
 
-/// `exe` with `console` decided by the rule's setter alone, on a plain
-/// `Command`: what an allow-listed raw site (a transparent pass-through) does.
 fn with_console(exe: &Path, console: Console) -> Command {
     let mut command = Command::new(exe);
     match console {
@@ -102,8 +91,6 @@ fn with_console(exe: &Path, console: Console) -> Command {
     command
 }
 
-/// `exe` built as the windowed sibling is: the shipped constructor, then
-/// `set_gui_image_flags` REPLACING its quiet choice with `Console::Detached`.
 fn like_the_windowed_sibling(exe: &Path) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
     spawn::set_gui_image_flags(&mut command);
@@ -119,8 +106,6 @@ fn report_line(who: &str, facts: Facts) -> String {
     )
 }
 
-/// Run THIS binary as `role`, limited to the one test `test` (whose body hands
-/// the run to [`play_role`]), with `command`'s console choice; answer its stdout.
 fn run_as(mut command: Command, role: &str, test: &str) -> String {
     command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
@@ -169,9 +154,6 @@ fn run_as(mut command: Command, role: &str, test: &str) -> String {
     stdout
 }
 
-/// The report `who` printed, out of a role's stdout. Searched for, not matched
-/// at a line's start: libtest has already printed `test <name> ... ` on the line
-/// the role's report lands on.
 fn facts_of(stdout: &str, who: &str) -> Facts {
     let mark = format!("{REPORT} {who} ");
     let line = stdout
@@ -191,8 +173,6 @@ fn facts_of(stdout: &str, who: &str) -> Facts {
     }
 }
 
-/// When this run of the binary was started in a role, play it and answer
-/// `true`; the calling test then returns at once.
 fn play_role(test: &str) -> bool {
     let Ok(role) = std::env::var(ROLE_ENV) else {
         return false;
@@ -226,8 +206,6 @@ fn play_role(test: &str) -> bool {
     true
 }
 
-/// A parent with no console — the window's state — starts a quiet
-/// child, and the child has a console with no window (with one, the flash).
 #[test]
 fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
     const TEST: &str = "a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window";
@@ -254,11 +232,6 @@ fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
     );
 }
 
-/// A parent with no console, started
-/// as the windowed sibling is (`spawnfd::command`, then `set_gui_image_flags` replacing
-/// its choice with `Console::Detached`), starts `spawnfd::command(<this
-/// binary>)` — how every shipped child is built — and the child has a console
-/// with no window.
 #[test]
 fn spawnfd_command_from_a_parent_with_no_console_gives_a_console_with_no_window() {
     const TEST: &str =
@@ -286,9 +259,6 @@ fn spawnfd_command_from_a_parent_with_no_console_gives_a_console_with_no_window(
     );
 }
 
-/// Non-vacuity: a detached child reports no console, so
-/// the console the test above reads is one the quiet child was given, not one
-/// every child of this suite would report.
 #[test]
 fn a_detached_child_has_no_console_at_all() {
     const TEST: &str = "a_detached_child_has_no_console_at_all";
@@ -310,10 +280,6 @@ fn a_detached_child_has_no_console_at_all() {
     );
 }
 
-/// Non-vacuity: a parent that has a console — a quiet
-/// child of this suite, which shares the suite's console or, when the suite has
-/// none, gets a windowless one — starts a quiet child, and that child shares
-/// the parent's console (two or more attached) instead of getting its own.
 #[test]
 fn a_quiet_child_of_a_parent_with_a_console_shares_it() {
     const TEST: &str = "a_quiet_child_of_a_parent_with_a_console_shares_it";
@@ -335,8 +301,6 @@ fn a_quiet_child_of_a_parent_with_a_console_shares_it() {
     );
 }
 
-/// `have_console` answers what the code-page oracle answers in this process,
-/// whichever console state the suite was started in.
 #[test]
 fn have_console_agrees_with_the_code_page_oracle_here() {
     if play_role("have_console_agrees_with_the_code_page_oracle_here") {
@@ -347,11 +311,6 @@ fn have_console_agrees_with_the_code_page_oracle_here() {
     assert_eq!(facts.have_console, facts.attached > 0, "{facts:?}");
 }
 
-/// Non-vacuity of `window`, with nothing on screen: a probe started on a ConPTY
-/// pseudoconsole — the console of every aterm tab — reports a console whose
-/// `GetConsoleWindow` is NOT NULL (a pseudoconsole hands it an invisible
-/// stand-in window: a `PseudoConsoleWindow` created hidden and never shown,
-/// measured with a WinEvent hook on Windows 11 build 26200).
 #[test]
 fn a_probe_on_a_pseudoconsole_sees_its_console_window() {
     const TEST: &str = "a_probe_on_a_pseudoconsole_sees_its_console_window";
@@ -389,8 +348,6 @@ fn a_probe_on_a_pseudoconsole_sees_its_console_window() {
     );
 }
 
-/// The one raw spawn here: a child on a fresh ConPTY pseudoconsole, the way
-/// `aterm-pty` starts a tab (its `spawn` carries the reasons for each step).
 mod pseudoconsole {
     use std::ffi::{OsStr, OsString, c_void};
     use std::io::{self, Read as _};
@@ -502,10 +459,10 @@ mod pseudoconsole {
         fn TerminateProcess(process: RawHandle, code: u32) -> i32;
     }
 
-    /// An anonymous pipe, neither end inheritable: `(read, write)`.
     fn pipe() -> (OwnedHandle, OwnedHandle) {
         let (mut read, mut write) = (null_mut(), null_mut());
-        // SAFETY: two out-pointers that outlive the call; NULL attributes (so neither end is inheritable) and the default buffer size.
+        // SAFETY: two out-pointers that outlive the call; NULL attributes (so neither end is
+        // inheritable) and the default buffer size.
         let made = unsafe { CreatePipe(&mut read, &mut write, null_mut(), 0) };
         assert_ne!(made, 0, "CreatePipe: {}", io::Error::last_os_error());
         // SAFETY: both handles were just created, and nothing else owns them.
@@ -517,7 +474,6 @@ mod pseudoconsole {
         }
     }
 
-    /// `s`, UTF-16 and NUL-terminated.
     fn wide(s: &OsStr) -> Vec<u16> {
         s.encode_wide().chain(Some(0)).collect()
     }
@@ -527,7 +483,8 @@ mod pseudoconsole {
         let (console_in, our_in) = pipe();
         let (our_out, console_out) = pipe();
         let mut console: RawHandle = null_mut();
-        // SAFETY: two live pipe ends, which the pseudoconsole duplicates, and an out-pointer that outlives the call.
+        // SAFETY: two live pipe ends, which the pseudoconsole duplicates, and an out-pointer that
+        // outlives the call.
         let hr = unsafe {
             CreatePseudoConsole(
                 Coord { x: 120, y: 30 },
@@ -546,11 +503,13 @@ mod pseudoconsole {
         });
 
         let mut size = 0usize;
-        // SAFETY: the size query (a NULL list): it fails with ERROR_INSUFFICIENT_BUFFER and writes the size one attribute needs.
+        // SAFETY: the size query (a NULL list): it fails with ERROR_INSUFFICIENT_BUFFER and writes
+        // the size one attribute needs.
         unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
         let mut block = vec![0usize; size.div_ceil(size_of::<usize>())];
         let list = block.as_mut_ptr().cast::<c_void>();
-        // SAFETY: a pointer-aligned buffer of at least `size` bytes, alive (and never moved) until `DeleteProcThreadAttributeList` below.
+        // SAFETY: a pointer-aligned buffer of at least `size` bytes, alive (and never moved) until
+        // `DeleteProcThreadAttributeList` below.
         let made = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) };
         assert_ne!(
             made,
@@ -558,7 +517,8 @@ mod pseudoconsole {
             "InitializeProcThreadAttributeList: {}",
             io::Error::last_os_error()
         );
-        // SAFETY: the initialized list; the attribute's VALUE is the pseudoconsole handle itself, passed by value (the documented idiom, as `aterm-pty` passes it).
+        // SAFETY: the initialized list; the attribute's VALUE is the pseudoconsole handle itself,
+        // passed by value (the documented idiom, as `aterm-pty` passes it).
         let set = unsafe {
             UpdateProcThreadAttribute(
                 list,
@@ -601,14 +561,16 @@ mod pseudoconsole {
         }
         environment.push(0);
 
-        // SAFETY: an all-zero STARTUPINFOEXW is a valid empty one; `cb`, the flags and the attribute list are set below.
+        // SAFETY: an all-zero STARTUPINFOEXW is a valid empty one; `cb`, the flags and the
+        // attribute list are set below.
         let mut startup: StartupInfoExW = unsafe { std::mem::zeroed() };
         startup.startup_info.cb = u32::try_from(size_of::<StartupInfoExW>()).expect("small");
         startup.startup_info.flags = STARTF_USESTDHANDLES;
         startup.attribute_list = list;
         // SAFETY: an all-zero PROCESS_INFORMATION is plain out-memory.
         let mut information: ProcessInformation = unsafe { std::mem::zeroed() };
-        // SAFETY: every buffer is NUL-terminated (the environment block double-NUL) and alive across the call, the startup info's list is initialized, and no handle is inherited.
+        // SAFETY: every buffer is NUL-terminated (the environment block double-NUL) and alive
+        // across the call, the startup info's list is initialized, and no handle is inherited.
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -624,7 +586,8 @@ mod pseudoconsole {
             )
         };
         let why = io::Error::last_os_error();
-        // SAFETY: the list initialized above, deleted once; the child holds its own reference to the pseudoconsole.
+        // SAFETY: the list initialized above, deleted once; the child holds its own reference to
+        // the pseudoconsole.
         unsafe { DeleteProcThreadAttributeList(list) };
         assert_ne!(created, 0, "CreateProcessW on a pseudoconsole: {why}");
         // SAFETY: both handles were just returned to us, and nothing else owns them.
@@ -647,7 +610,9 @@ mod pseudoconsole {
             // SAFETY: a live process handle we own: this child, nothing else.
             unsafe { TerminateProcess(process.as_raw_handle(), 1) };
         }
-        // SAFETY: the pseudoconsole created above, closed once, with its output still drained so the close cannot stall on a last frame; its input end stays open until after (a broken input pipe ends the console early).
+        // SAFETY: the pseudoconsole created above, closed once, with its output still drained so
+        // the close cannot stall on a last frame; its input end stays open until after (a broken
+        // input pipe ends the console early).
         unsafe { ClosePseudoConsole(console) };
         drop(our_in);
         assert_eq!(

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The tray draw IR: renderer-agnostic drawing primitives ([`DrawPrim`]) and the
-//! [`TrayInput`] one-frame bundle that carries them. The GPU overlay pass and the
-//! CPU/softbuffer fallback consume the same `DrawPrim` list, so every overlay card lays out
-//! once and renders identically on both paths.
+//! Renderer-agnostic overlay drawing primitives ([`DrawPrim`]) and [`TrayInput`] frame bundle.
 
 use std::sync::Arc;
 
@@ -29,13 +26,6 @@ pub(crate) enum TextWeight {
 }
 
 /// The face a [`DrawPrim::Text`] rasterizes in ([`crate::tray_raster`] picks the font).
-/// `Mono` (the default) is the terminal face (the user's primary plus DejaVu coverage
-/// fallback), for code, hex readouts, the preview's terminal body and glyph art. `Ui` is
-/// the native proportional system face (Helvetica Neue on macOS, Segoe UI on Windows,
-/// Noto Sans or DejaVu Sans on Linux; the terminal stack is the last fallback) for panel
-/// chrome; `UiBold` is its installed semibold or bold cut, else the regular.
-/// `Display(index)` is the bundled `aterm_render::DISPLAY_FACES[index]`, measured like the
-/// UI face, so Settings can show each display face in its own letterforms.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TextFace {
     Mono,
@@ -183,7 +173,6 @@ impl SpecimenWallpaper {
     }
 }
 
-/// Equal where the pixels are: the asset's fingerprint stands for its bytes.
 impl PartialEq for SpecimenWallpaper {
     fn eq(&self, other: &Self) -> bool {
         self.identity() == other.identity()
@@ -264,7 +253,6 @@ pub(crate) fn text_prim(
 }
 
 /// One renderer-agnostic primitive, in frame pixel coordinates (origin top-left).
-/// Angles for arcs are clockwise fractions of a full turn starting at 12 o'clock.
 #[derive(Clone, Debug)]
 pub(crate) enum DrawPrim {
     /// The card: a flat translucent `fill` (the whole prim list is rasterized to

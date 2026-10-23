@@ -19,7 +19,6 @@ use rustls::{DigitallySignedStruct, SignatureScheme, StreamOwned};
 /// The exporter length: what every proof over a channel is taken over.
 pub const EXPORTER_LEN: usize = 32;
 
-/// The single place this crate names a rustls `CryptoProvider` implementation.
 fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
@@ -28,7 +27,6 @@ fn provider() -> rustls::crypto::CryptoProvider {
 pub fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        // Ignore the error: another caller may have already installed a provider.
         let _ = provider().install_default();
     });
 }
@@ -45,7 +43,7 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Verifies the server cert by SHA-256 FINGERPRINT pinning (no CA/PKI), and the handshake signature via the provider's algorithms (proving key possession).
+/// Verifies the server certificate by SHA-256 fingerprint pinning and provider signatures.
 #[derive(Debug)]
 pub(crate) struct PinnedServerVerifier {
     pin: [u8; 32],
@@ -53,7 +51,7 @@ pub(crate) struct PinnedServerVerifier {
 }
 
 impl PinnedServerVerifier {
-    /// A verifier that accepts exactly the certificate whose DER hashes to `pin`, and checks every handshake signature with the `ring` provider's algorithms.
+    /// Create a verifier accepting the certificate with SHA-256 fingerprint `pin`.
     pub(crate) fn new(pin: [u8; 32]) -> Self {
         Self {
             pin,
@@ -129,7 +127,7 @@ impl std::fmt::Display for PinMismatch {
 
 impl std::error::Error for PinMismatch {}
 
-/// A dialer's handshake error: a [`PinMismatch`] in its own words, every other error as rustls gave it.
+/// A dialer's handshake error.
 pub(crate) fn dial_handshake_error(e: io::Error) -> io::Error {
     let mismatch = e
         .get_ref()
@@ -146,7 +144,8 @@ pub(crate) fn dial_handshake_error(e: io::Error) -> io::Error {
     }
 }
 
-/// A listener's handshake error: a dialer's refusal of this listener's certificate — the alert an aterm dialer sends when its pinned fingerprint differs (`CertificateUnknown`, or `AccessDenied` from a dialer older than [`PinMismatch`]) — in its own words, every other error as rustls gave it.
+/// A listener's handshake error: a dialer's refusal of this listener's certificate in its own
+/// words, every other error as rustls gave it.
 pub(crate) fn listen_handshake_error(e: io::Error) -> io::Error {
     let refused = e
         .get_ref()
@@ -177,7 +176,7 @@ pub struct TlsTransport<C> {
 }
 
 impl<C> TlsTransport<C> {
-    /// A transport over `stream`, whose handshake is complete, carrying the keying material its caller exported under its own label (the fleet's, [`crate::fleet`]).
+    /// Wrap a completed TLS `stream` with its caller-exported keying material.
     #[inline]
     pub(crate) const fn from_parts(
         stream: StreamOwned<C, TcpStream>,
@@ -186,7 +185,7 @@ impl<C> TlsTransport<C> {
         Self { stream, exporter }
     }
 
-    /// The RFC 5705 keying material this connection's owner exported — 32 bytes unique to this TLS session and identical on both ends, under the owner's own label (the fleet's, [`crate::fleet`]).
+    /// The RFC 5705 keying material this connection's owner exported.
     #[inline]
     #[must_use]
     pub const fn exporter(&self) -> &[u8] {
@@ -212,13 +211,13 @@ impl<C> TlsTransport<C> {
     }
 }
 
-/// The stream an [`answer`] is written on: its reads and writes, their timeouts and its peer's address, and nothing that ends it — no `close_notify`, no shutdown, no socket to take — so an answered connection's only end is [`answer`]'s own, after its guard.
+/// Stream on which an [`answer`] is written, exposing I/O, timeouts, and peer address.
 pub struct Answering<'a, C> {
     stream: &'a mut StreamOwned<C, TcpStream>,
 }
 
 impl<C> Answering<'_, C> {
-    /// Bound each read of the request ([`TcpStream::set_read_timeout`]): nothing in [`answer`] waits on its own clock.
+    /// Bound each read of the request ([`TcpStream::set_read_timeout`]).
     /// # Errors
     /// The socket's own.
     #[inline]
@@ -226,7 +225,7 @@ impl<C> Answering<'_, C> {
         self.stream.sock.set_read_timeout(timeout)
     }
 
-    /// Bound each write of the answer ([`TcpStream::set_write_timeout`]), for an answer written unasked to a peer that may read none of it.
+    /// Bound each write of the answer ([`TcpStream::set_write_timeout`]).
     /// # Errors
     /// The socket's own.
     #[inline]
@@ -242,7 +241,7 @@ impl<C> Answering<'_, C> {
         self.stream.sock.peer_addr()
     }
 
-    /// The socket under the stream, for a test listener that writes raw records past TLS (a malformed one, dribbled).
+    /// The socket under the stream, for a test listener that writes raw records past TLS.
     #[cfg(all(unix, test))]
     pub(crate) fn sock(&self) -> &TcpStream {
         &self.stream.sock
@@ -273,7 +272,7 @@ where
     }
 }
 
-/// Answer `transport` HERE, in [`relay_answers`]' order: `write` reads the request and writes the answer on the stream, the answer is flushed, then `guard` is dropped, and only then does the peer hear the end — when the answer went cleanly a `close_notify` written only as far as the socket takes it at once, then the FIN.
+/// Answer `transport` HERE, in [`relay_answers`]' order.
 /// # Errors
 /// `write`'s own, or the flush's.
 pub fn answer<C, S, G, T>(
@@ -294,10 +293,6 @@ where
     answered
 }
 
-/// End `transport` once its owner has answered, never waiting on the peer,
-/// as [`relay_answers`] ends: when the answer went `clean`ly, a
-/// `close_notify` written only as far as the socket takes it at once; then
-/// the FIN.
 fn end_without_waiting<C, S>(transport: TlsTransport<C>, clean: bool)
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
@@ -318,13 +313,8 @@ where
     aterm_uds::hangup::hang_up(&stream.sock);
 }
 
-/// Upper bound on the uploader's final draining wait, so a stuck (TCP-connected
-/// but non-reading) peer cannot hang relay teardown — far longer than any healthy
-/// peer needs to drain a queued tail, short enough to bound the join.
 const RELAY_DRAIN_MAX: Duration = Duration::from_secs(5);
 
-/// The rustls connection plus relay coordination flags, guarded by one mutex and
-/// signaled through one [`Condvar`] (see [`RelayShared`]).
 struct RelayState<C> {
     conn: C,
     /// Teardown: the answer is over, or a fatal error on either side.
@@ -362,7 +352,6 @@ impl<C> RelayShared<C> {
     }
 }
 
-/// Move every plaintext byte rustls has already decrypted into `plain`.
 fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>, tmp: &mut [u8]) -> io::Result<bool>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
@@ -380,9 +369,10 @@ where
     }
 }
 
-/// Relay between an authenticated TLS stream and a local `CtlStream` whose end ANSWERS — the fleet listener's control server, which answers a peer's requests and then hangs up: the local end's end (its EOF, or an error) ends the exchange both ways, and `guard` is dropped before the peer is told.
+/// Relay between an authenticated TLS stream and a local `CtlStream` whose end ANSWERS.
 /// # Errors
-/// On setup failure (a socket clone, a thread that cannot start) or an unexpected mid-stream I/O error (a normal peer close — EOF, `close_notify`, a reset — is not an error).
+/// On setup failure (a socket clone, a thread that cannot start) or an unexpected mid-stream I/O
+/// error (a normal peer close — EOF, `close_notify`, a reset — is not an error).
 pub fn relay_answers<C, S, G>(
     transport: TlsTransport<C>,
     local: CtlStream,
@@ -482,9 +472,6 @@ where
                         let mut g = shared.lock();
                         while written < n {
                             if g.done {
-                                // Peer-side teardown already under way: to the
-                                // end below, which the guard leaves only once
-                                // neither socket can block.
                                 break 'up;
                             }
                             match g.conn.writer().write(&buf[written..n]) {
@@ -659,8 +646,6 @@ where
                 }
             }
             if g.conn.wants_write() {
-                // Post-handshake housekeeping (e.g. a KeyUpdate reply) queued
-                // outgoing TLS bytes: wake the writer thread.
                 shared.cv.notify_all();
             }
         }
@@ -727,11 +712,26 @@ fn send_without_waiting(tcp: &TcpStream, mut bytes: &[u8]) {
     }
 }
 
-/// No per-call non-blocking send here: the peer hears the FIN alone.
+/// Windows has no per-call `MSG_DONTWAIT`: the socket (every copy of it) is
+/// non-blocking for these sends and blocking again after, and each caller
+/// hangs it up next. Without them the peer heard a FIN with no
+/// `close_notify`, which rustls reads as a truncation (`UnexpectedEof`).
 #[cfg(not(unix))]
-fn send_without_waiting(_tcp: &TcpStream, _bytes: &[u8]) {}
+fn send_without_waiting(tcp: &TcpStream, mut bytes: &[u8]) {
+    if bytes.is_empty() || tcp.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut socket = tcp;
+    while !bytes.is_empty() {
+        match socket.write(bytes) {
+            Ok(n) if n > 0 => bytes = &bytes[n.min(bytes.len())..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            _ => break,
+        }
+    }
+    let _ = tcp.set_nonblocking(false);
+}
 
-/// A read with no data yet on a non-blocking/timeout socket (not a true block).
 fn is_would_block(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -739,7 +739,6 @@ fn is_would_block(e: &io::Error) -> bool {
     )
 }
 
-/// A peer closing the connection — expected during teardown, not a relay failure.
 fn is_normal_close(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -761,15 +760,12 @@ mod tests {
     const TEST_CERT_DER: &[u8] = include_bytes!("testdata/cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("testdata/key.pkcs8.der");
 
-    /// The tests' own exporter label: what the relay carries does not depend
-    /// on it, only the exporters' agreement does.
     const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-net-test";
 
     fn io_err(e: impl std::fmt::Display) -> io::Error {
         io::Error::other(e.to_string())
     }
 
-    /// A TLS 1.3 listener configuration for the fixture's certificate and key.
     fn server_config(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> io::Result<Arc<ServerConfig>> {
         init_crypto();
         let key = PrivateKeyDer::try_from(key_pkcs8_der).map_err(io_err)?;
@@ -780,8 +776,6 @@ mod tests {
         Ok(Arc::new(cfg))
     }
 
-    /// A TLS 1.3 dialer configuration pinning `fingerprint` through the
-    /// production [`PinnedServerVerifier`].
     fn client_config(fingerprint: [u8; 32]) -> Arc<ClientConfig> {
         init_crypto();
         let cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -791,8 +785,6 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// The listener's handshake on an accepted `tcp`, exporting under
-    /// [`EXPORTER_LABEL`].
     fn accept(
         tcp: TcpStream,
         config: Arc<ServerConfig>,
@@ -811,8 +803,6 @@ mod tests {
         ))
     }
 
-    /// The dialer's handshake on a connected `tcp`, exporting under
-    /// [`EXPORTER_LABEL`].
     fn connect(
         tcp: TcpStream,
         server_name: ServerName<'static>,
@@ -836,10 +826,8 @@ mod tests {
         ServerName::try_from("aterm-net-test").unwrap()
     }
 
-    /// Serializes the loopback TLS tests in this module against EACH OTHER.
     static LOOPBACK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Take [`LOOPBACK_TESTS`] for the rest of the calling test.
     fn serialize_loopback() -> std::sync::MutexGuard<'static, ()> {
         LOOPBACK_TESTS
             .lock()
@@ -1000,8 +988,6 @@ mod tests {
         ready > 0 && probe.revents & libc::POLLOUT != 0
     }
 
-    /// A guard whose drop says it has begun, then holds until the gate opens
-    /// (its sender dropped): the hang detector, never a latency budget.
     struct HeldGuard {
         entered: std::sync::mpsc::Sender<()>,
         gate: std::sync::mpsc::Receiver<()>,
@@ -1014,9 +1000,6 @@ mod tests {
         }
     }
 
-    /// [`answer`]'S ORDER, pinned as [`relay_answers`]' is: the answer is
-    /// written and flushed, and nothing of the connection's end reaches the
-    /// wire while the guard is held.
     #[test]
     fn an_answer_says_nothing_of_the_end_while_its_guard_is_held() {
         use std::sync::mpsc;
@@ -1073,8 +1056,6 @@ mod tests {
         assert!(matches!(srv.join().unwrap(), Ok(())));
     }
 
-    /// [`relay_answers`] ordering: nothing of the connection's end reaches the
-    /// wire while the guard is held.
     #[test]
     fn an_answering_relay_says_nothing_of_the_end_while_its_guard_is_held() {
         use std::sync::mpsc;
@@ -1613,12 +1594,8 @@ mod tests {
         );
     }
 
-    /// Upper bound on how long a socket read in these tests may block.
     const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
 
-    /// The download direction drains rustls' 16 KiB plaintext buffer after each
-    /// packet batch so a socket read carrying a full record's tail followed by
-    /// small records never overflows the buffer mid-feed.
     #[test]
     fn relay_ingests_a_full_record_followed_by_small_ones_without_tearing_down() {
         let _serial = serialize_loopback();

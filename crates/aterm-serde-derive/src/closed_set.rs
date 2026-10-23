@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile-fail controls for the closed attribute set
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.5).
-//!
-//! Each refused form below is a `compile_fail` doctest after an accepted twin
-//! that differs from it only in the attribute, so a refusal cannot pass
-//! because its snippet was broken some other way. Every refused form except
-//! the unknown keys and the union is one registry serde_derive 1.0.228
-//! compiles: the error is this derive's, by design.
-//!
-//! # Fields
-//!
-//! Accepted twin:
+//! Compile-fail controls for the closed attribute set.
 //!
 //! ```
 //! # extern crate aterm_serde as serde;
@@ -34,8 +23,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `with` (upstream's, outside the set):
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -55,8 +42,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `serialize_with` (upstream's, outside the set):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -78,8 +63,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `skip_serializing` (upstream's one-direction skip, outside the set):
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -99,8 +82,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `rename(...)`, the list form of a key in the set:
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -122,8 +103,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! An unknown key:
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -143,9 +122,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `::rename`, an unknown key that only looks like one in the set, after its
-//! own accepted twin:
 //!
 //! ```
 //! # extern crate aterm_serde as serde;
@@ -169,10 +145,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! # Containers
-//!
-//! Accepted twin:
-//!
 //! ```
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -185,8 +157,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `crate` (upstream's, outside the set):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -201,8 +171,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `rename` on a container (in the set only for fields and variants):
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -215,8 +183,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `default = "..."` on a container (only the bare form is in the set):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -231,8 +197,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `rename_all` with a rule outside the five aterm writes:
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -245,8 +209,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `expecting` (upstream's, outside the set):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -261,10 +223,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! # Variants
-//!
-//! Accepted twin:
-//!
 //! ```
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -276,8 +234,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `untagged` on a variant (in the set only on a container):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -291,8 +247,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `alias` on a variant (in the set only on a field):
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -304,8 +258,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! `skip` on a variant (in the set only on a field):
 //!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
@@ -319,8 +271,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! `rename_all` on a variant (in the set only on a container):
-//!
 //! ```compile_fail
 //! # extern crate aterm_serde as serde;
 //! # use aterm_serde_derive::{Deserialize, Serialize};
@@ -332,10 +282,6 @@
 //! }
 //! # fn main() {}
 //! ```
-//!
-//! # Items serde never derives for
-//!
-//! A union (refused upstream too), beside the struct it would be:
 //!
 //! ```
 //! # extern crate aterm_serde as serde;

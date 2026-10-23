@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Spawn-seam containment actuator turning [`Capabilities`](crate::Capabilities) into a logged [`SpawnDecision`].
+//! Spawn-seam actuator turning [`Capabilities`](crate::Capabilities) into a [`SpawnDecision`].
 
 use crate::audit::{log_denial, log_posture};
 use crate::capability::{NetworkCapability, ProcessCapability};
 use crate::mode::ContainmentMode;
 use crate::policy::ContainmentPolicy;
 
-/// Audit subsystem label for spawn-seam containment events.
 const SUBSYSTEM: &str = "spawn";
 
 /// Refusal reason returned by [`decide`] for `Containment` on platforms without an OS sandbox.
@@ -69,9 +68,7 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
     )
 }
 
-/// [`decide`] with the platform's sandbox capability and the `$HOME` the
-/// profile is scoped under as arguments, so the fail-closed arm is testable on
-/// the one platform that has a sandbox, and the unresolved-home arm anywhere.
+/// [`decide`] with the platform's sandbox capability and scoped `$HOME`.
 fn decide_on(mode: ContainmentMode, sandbox_available: bool, home: Option<&str>) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
     let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
@@ -215,7 +212,6 @@ mod tests {
             ContainmentMode::Containment,
         ] {
             if mode == ContainmentMode::Containment && !os_sandbox_actuated() {
-                // refused there — `containment_fails_closed_without_an_os_sandbox`
                 continue;
             }
             let expect_os = network_sandbox_actuated(mode);
@@ -249,9 +245,6 @@ mod tests {
         }
     }
 
-    /// `home_scoped` is decided by whether the home resolved, not by whether a
-    /// sandbox applies: a sandboxed spawn with no home carries neither the
-    /// credential denies nor the claim.
     #[test]
     fn home_scoped_follows_the_home_not_the_sandbox() {
         let secret = |profile: &str| {
@@ -846,7 +839,8 @@ mod tests {
         }
         let ask = |flavor: ForPid, pid: libc::pid_t| {
             let mut port: libc::mach_port_t = 0;
-            // SAFETY: `mach_task_self_` is libSystem's cached task send right, and `flavor` writes `port` only on success.
+            // SAFETY: `mach_task_self_` is libSystem's cached task send right, and
+            // `flavor` writes `port` only on success.
             unsafe { flavor(mach_task_self_, pid, &raw mut port) }
         };
         let flavors: [ForPid; 4] = [
@@ -1042,7 +1036,8 @@ mod tests {
             .map(|name| {
                 let name = std::ffi::CString::new(name).expect("a service name has no NUL");
                 let mut port: libc::mach_port_t = 0;
-                // SAFETY: `bootstrap_port` is initialized before `main`, `name` is NUL-terminated, and `port` is written only on success.
+                // SAFETY: `bootstrap_port` is initialized before `main`, `name` is
+                // NUL-terminated, and `port` is written only on success.
                 let kr = unsafe { bootstrap_look_up(bootstrap_port, name.as_ptr(), &raw mut port) };
                 if port != 0 {
                     // SAFETY: `port` is a valid send right just returned by `bootstrap_look_up`.
@@ -1174,7 +1169,6 @@ mod tests {
     /// allowed).
     #[cfg(target_os = "macos")]
     fn preference_write_probe_child() {
-        /// `SANDBOX_FILTER_PREFERENCE_DOMAIN` from `<sandbox/private.h>`.
         const SANDBOX_FILTER_PREFERENCE_DOMAIN: libc::c_int = 6;
         unsafe extern "C" {
             fn sandbox_check(
@@ -1184,7 +1178,8 @@ mod tests {
                 ...
             ) -> libc::c_int;
         }
-        // SAFETY: Both strings are NUL-terminated literals and `sandbox_check` only reads its arguments.
+        // SAFETY: Both strings are NUL-terminated literals and `sandbox_check` only reads
+        // its arguments.
         let rc = unsafe {
             sandbox_check(
                 std::process::id().cast_signed(),
@@ -1499,7 +1494,6 @@ mod tests {
             }
         }
         if !cut_short {
-            // Every case's shell ended on its own, and every program it started with it.
             work.ran();
         }
         let _ = std::fs::remove_dir_all(&home);

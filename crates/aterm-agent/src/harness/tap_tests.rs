@@ -471,6 +471,51 @@ fn a_re_report_keeps_the_first_reports_stamp() {
     }
 }
 
+/// A WINDOW THAT ONLY DROPPED OUT AT ITS RESET IS NO NEW REPORT: Claude Code hands a window
+/// only while it runs, so an idle tab's five-hour window leaves its re-report at its reset
+/// with nothing served and the week unchanged, and the file keeps the week's first stamp (a
+/// three-hour-old week never reads as current); a window that appears, or a week that moves,
+/// is one.
+#[test]
+fn a_window_that_only_reset_away_keeps_the_first_reports_stamp() {
+    let root = scratch("reset-away");
+    let dir = root.path().to_path_buf();
+    let (five, week) = (1_792_062_396, 1_792_500_000);
+    let report = |pct_5h: Option<u32>, pct_7d: u32, now: i64| {
+        let mut out = Vec::new();
+        let stdin = payload(18, pct_5h.map(|pct| (pct, five)), Some((pct_7d, week)));
+        let _ = run(
+            &mut stdin.as_bytes(),
+            false,
+            &vars(),
+            Some(&dir),
+            now,
+            &mut out,
+        );
+        Reading::read(&dir, SID, 68537, 0).expect("its own file").0
+    };
+    let first = report(Some(12), 38, 1000);
+    assert_eq!(first.at, 1000);
+    let idle = report(None, 38, 1000 + 3 * 3600);
+    assert_eq!(idle.five_hour, None, "the five-hour window reset away");
+    assert_eq!(idle.at, 1000, "the week's first report stands");
+    assert_eq!(
+        report(None, 38, 1000 + 3 * 3600 + 10).at,
+        1000,
+        "and its re-report"
+    );
+    assert_eq!(
+        report(Some(0), 38, 1000 + 3 * 3600 + 20).at,
+        1000 + 3 * 3600 + 20,
+        "a window that appears is a new report"
+    );
+    assert_eq!(
+        report(Some(0), 39, 1000 + 3 * 3600 + 30).at,
+        1000 + 3 * 3600 + 30,
+        "a week that moved"
+    );
+}
+
 /// A reading is read only from its own process's regular file: tab and pid in name and text,
 /// written since the process started.
 #[test]
@@ -1077,5 +1122,127 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
         let rows = aterm_phase::prompt::fixtures::screen(capture);
         let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
         assert_eq!(footer::mode_row(&rows), Some(bottom + 1));
+    }
+}
+
+/// THE ONE BLOCK THAT ARMS THE TAP ([`Armed::arm`]), for the window's background lane and
+/// `aterm harness upgrade` alike: on when the switch is and there is an aterm to name, with
+/// the lone login the store binds to a one-row roster, else every login a roster of several
+/// names (neither where the clock was not read), and off otherwise.
+#[test]
+fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
+    let root = scratch("armed");
+    let roster = root.path().join(accounts::ACCOUNTS_FILE);
+    std::fs::write(
+        &roster,
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+    )
+    .expect("roster");
+    let now = 1_792_050_000;
+    let login = "/s/main.1";
+    let mut logins = accounts::Logins::default();
+    accounts::note_renewed(
+        &mut accounts::State::default(),
+        &mut logins,
+        "main",
+        None,
+        login,
+        None,
+        now,
+    );
+    let store = accounts::Store::at(&root.path().join("state"));
+    store.save_logins(&logins).expect("logins");
+    let exe = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let arm = |on: bool, exe: Option<PathBuf>, now: Option<i64>| {
+        Armed::arm(on, || exe, Some(&roster), &store, now)
+    };
+    assert_eq!(
+        arm(true, Some(exe.clone()), Some(now)),
+        Some(Armed {
+            exe: exe.clone(),
+            lone_login: Some(login.to_owned()),
+            listed: Vec::new(),
+        }),
+        "the lone login the store binds"
+    );
+    assert_eq!(
+        arm(true, Some(exe.clone()), None),
+        Some(Armed {
+            exe: exe.clone(),
+            lone_login: None,
+            listed: Vec::new(),
+        }),
+        "no clock read: no login"
+    );
+    let work = if cfg!(windows) {
+        "C:/s/work"
+    } else {
+        "/s/work"
+    };
+    std::fs::write(
+        &roster,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{work}\"\n"
+        ),
+    )
+    .expect("two rows");
+    let several = arm(true, Some(exe.clone()), Some(now)).expect("armed");
+    assert_eq!(
+        (several.lone_login.as_deref(), several.listed.clone()),
+        (None, vec![login.to_owned(), work.to_owned()]),
+        "two rows: no lone login, and every login they name, the renewed one the store binds"
+    );
+    assert_eq!(several.lone_for(Some(work)), Some(work));
+    assert_eq!(
+        several.lone_for(Some("/s/elsewhere")),
+        None,
+        "a login no row names"
+    );
+    assert_eq!(several.lone_for(None), None, "the default login needs none");
+    assert_eq!(
+        Armed::arm(true, || Some(exe.clone()), None, &store, Some(now)).map(|a| a.lone_login),
+        Some(None),
+        "no roster: no login"
+    );
+    assert_eq!(
+        arm(false, Some(exe.clone()), Some(now)),
+        None,
+        "the switch off"
+    );
+    assert_eq!(arm(true, None, Some(now)), None, "no aterm to name");
+}
+
+/// WHY A LINE IS REFUSED THE TAP, BY ITS ARGV: options no relaunch line can repeat (a flag this
+/// build does not know, one that cannot resume) are `Argv`, never the `--settings` or `--bare`
+/// of its own (`Line`) the footer's menu would otherwise name; aterm's own tap is no
+/// `--settings` of its own.
+#[test]
+fn a_lines_refusal_names_its_argv_or_its_own_settings() {
+    let argv = |words: &[&str]| -> Vec<String> {
+        std::iter::once("claude")
+            .chain(words.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    let exe = if cfg!(windows) {
+        r"C:\Users\u\AppData\Local\Programs\aterm\aterm.exe"
+    } else {
+        "/Applications/aterm.app/Contents/MacOS/aterm"
+    };
+    let own = settings_value(Path::new(exe)).expect("an admissible path");
+    for (words, refusal) in [
+        (vec![], None),
+        (vec!["--verbose"], None),
+        (vec!["--settings", own.as_str()], None),
+        (vec!["--settings", "/work/own.json"], Some(Refusal::Line)),
+        (vec!["--bare"], Some(Refusal::Line)),
+        (vec!["--a-flag-of-a-newer-claude"], Some(Refusal::Argv)),
+        (vec!["--no-session-persistence"], Some(Refusal::Argv)),
+        (vec!["--print"], Some(Refusal::Argv)),
+    ] {
+        let line = argv(&words);
+        assert_eq!(line_refusal(&line), refusal, "{words:?}");
+        assert_eq!(line_admits(&line), refusal.is_none(), "{words:?}");
     }
 }

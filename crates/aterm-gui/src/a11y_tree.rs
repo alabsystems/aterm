@@ -11,48 +11,25 @@ use aterm_a11y::model::{
     TextPosition, TextSelection, Tree, TreeId, TreeUpdate,
 };
 
-/// The window's root accessibility node.
 const ROOT: NodeId = NodeId(0);
-/// Single-pane `Role::Terminal` node under [`ROOT`] (absent when split into [`PANE_BASE`] nodes).
 const GRID: NodeId = NodeId(1);
-/// In-grid tab strip `Role::TabList` node under [`ROOT`] when ≥ 2 tabs are shown.
 const TAB_LIST: NodeId = NodeId(2);
-/// Find panel `Role::SearchInput` node under [`ROOT`] while find mode is active.
 const FIND: NodeId = NodeId(3);
-/// Single `Role::TextRun` child of [`FIND`].
 const FIND_RUN: NodeId = NodeId(4);
-/// Base node id for [`ChromeMessage`] slots (`MESSAGE_BASE + slot`, below [`TAB_BASE`]).
 const MESSAGE_BASE: u64 = 1 << 20;
-/// Base node id for the Autopilot menu and its items ([`menu_item_node_id`], [`menu_item_for`]).
 const MENU_BASE: u64 = 1 << 29;
-/// The rows a menu may publish: the item's slot in its id.
 const MENU_ROWS: u64 = 64;
-/// Bit width of [`GridMenu::epoch`], keeping all menu item ids below [`CHIP_BASE`].
 const MENU_EPOCH_BITS: u32 = 22;
-/// Base node id for Claude Code rule chips (`CHIP_BASE + session * 16 + slot`, [`chip_for`]).
 const CHIP_BASE: u64 = 1 << 30;
-/// Base node id for the stats deck (`STATS_BASE`), open lens ([`STATS_LENS`]), and core meters.
 const STATS_BASE: u64 = 1 << 28;
-/// Maximum core meters published under a stats cores group.
 const STATS_CORES: usize = 1 << 20;
-/// Base node id for tab items (`TAB_BASE + tab_index`).
 const TAB_BASE: u64 = 1 << 40;
-/// Base node id for grid row `Role::TextRun` nodes (`ROW_BASE + row_index * RUNS_PER_ROW`).
 const ROW_BASE: u64 = 1 << 48;
-
-/// Per-pane id stride for row runs (`slot 0` is the whole-screen document).
 const PANE_STRIDE: u64 = 1 << 32;
-
-/// Base node id for split pane container nodes (`PANE_BASE + slot`).
 const PANE_BASE: u64 = 1 << 62;
-
-/// Maximum characters per `Role::TextRun` so word-start indices fit in `u8`.
 const RUN_CHARS: usize = 256;
-
-/// Run-id stride per grid row.
 const RUNS_PER_ROW: u64 = 256;
 
-/// Split `line` into chunks of at most [`RUN_CHARS`] characters.
 fn row_chunks(line: &str) -> Vec<String> {
     let count = line.chars().count();
     if count <= RUN_CHARS {
@@ -194,9 +171,7 @@ pub(crate) enum ChromeMessage {
 
 /// Capsule slot index for the implicit `Details ›` action.
 pub(crate) const CAPSULE_DETAILS: u8 = 2;
-/// Number of capsule slots reserved per band row.
 const CAPSULES_PER_ROW: u64 = 4;
-/// The first capsule slot.
 const CAPSULE_BASE: u64 = 16;
 
 /// Map an [`aterm_messages::ActionIndex`] to its band capsule slot index.
@@ -249,7 +224,6 @@ impl ChromeMessage {
         }
     }
 
-    /// Fixed id offset from [`MESSAGE_BASE`].
     const fn slot(self) -> u64 {
         match self {
             Self::PasteConfirm => 1,
@@ -265,7 +239,6 @@ impl ChromeMessage {
         }
     }
 
-    /// This message's node id in [`grid_tree`].
     const fn node_id(self) -> NodeId {
         NodeId(MESSAGE_BASE + self.slot())
     }
@@ -286,7 +259,6 @@ impl ChromeMessage {
         Self::ORDER.into_iter().find(|m| m.slot() == slot)
     }
 
-    /// Live-region politeness (assertive for confirmations, polite otherwise).
     const fn politeness(self) -> Live {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Live::Assertive,
@@ -299,7 +271,6 @@ impl ChromeMessage {
         }
     }
 
-    /// Accessible [`Role`] for this message.
     const fn role(self, metered: bool, alarm: bool) -> Role {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Role::AlertDialog,
@@ -391,10 +362,8 @@ pub(crate) enum HarnessChip {
 }
 
 impl HarnessChip {
-    /// The targets a session's ids have room for.
     const SLOTS: u64 = 16;
 
-    /// Its place in its session's ids.
     const fn index(self) -> u64 {
         match self {
             Self::Autopilot => 0,
@@ -414,7 +383,6 @@ impl HarnessChip {
         }
     }
 
-    /// Chip variant for slot `index`, if assigned.
     const fn at(index: u64) -> Option<Self> {
         Some(match index {
             0 => Self::Autopilot,
@@ -524,7 +492,6 @@ pub(crate) struct GridMenu {
     pub(crate) height: usize,
 }
 
-/// Node id for `session`'s `chip`.
 fn chip_node_id(session: u64, chip: HarnessChip) -> Option<NodeId> {
     let id = session
         .checked_mul(HarnessChip::SLOTS)
@@ -550,7 +517,6 @@ pub(crate) const fn menu_epoch_from(hash: u64) -> u32 {
     (hash & ((1 << MENU_EPOCH_BITS) - 1)) as u32
 }
 
-/// Node id for `item` in a menu at `epoch`.
 fn menu_item_node_id(epoch: u32, item: usize) -> Option<NodeId> {
     let item = u64::try_from(item).ok().filter(|item| *item < MENU_ROWS)?;
     let epoch = u64::from(epoch) & ((1 << MENU_EPOCH_BITS) - 1);
@@ -568,7 +534,6 @@ pub(crate) fn menu_item_for(node: NodeId) -> Option<(u32, usize)> {
     (menu_item_node_id(epoch, item) == Some(node)).then_some((epoch, item))
 }
 
-/// The rectangle of `width` cells at grid `row`, `col`, `height` rows tall.
 fn cells_rect(g: GridGeometry, row: usize, col: usize, width: usize, height: usize) -> Rect {
     Rect {
         x0: g.origin_x + col as f64 * g.cell_w,
@@ -578,7 +543,6 @@ fn cells_rect(g: GridGeometry, row: usize, col: usize, width: usize, height: usi
     }
 }
 
-/// Emit [`GridChip`] nodes and return their ids in painted order.
 fn push_chips(
     nodes: &mut Vec<(NodeId, Node)>,
     chips: &[GridChip],
@@ -621,7 +585,6 @@ fn push_chips(
     ids
 }
 
-/// Emit the open [`GridMenu`] and its items, returning `(menu_id, focused_item_id)`.
 fn push_menu(
     nodes: &mut Vec<(NodeId, Node)>,
     menu: &GridMenu,
@@ -720,15 +683,12 @@ pub(crate) struct StatsLens {
     pub(crate) bounds: Option<Rect>,
 }
 
-/// Node id for the stats lens group.
 const STATS_LENS: u64 = STATS_BASE + 48;
 
-/// Node id for the `k`th resource meter (`k < 15`).
 fn stats_meter_id(k: usize) -> Option<NodeId> {
     (k < 15).then(|| NodeId(STATS_BASE + 1 + k as u64))
 }
 
-/// Emit the stats deck group, resource meters, and core meters.
 fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
     let meter_node = |m: &StatsMeter| {
         let mut node = Node::new(Role::Meter);
@@ -775,7 +735,6 @@ fn push_stats(nodes: &mut Vec<(NodeId, Node)>, stats: &GridStats) -> NodeId {
     group_id
 }
 
-/// Emit the open stats lens, returning `(group_id, focus_target_id)`.
 fn push_stats_lens(nodes: &mut Vec<(NodeId, Node)>, lens: &StatsLens) -> (NodeId, NodeId) {
     let group_id = NodeId(STATS_LENS);
     let mut children = Vec::with_capacity(lens.wells.len());
@@ -831,7 +790,6 @@ pub(crate) struct GridFrame<'a> {
     pub(crate) window_title: &'a str,
 }
 
-/// The node id for tab `index`, and its inverse.
 const fn tab_node_id(index: usize) -> NodeId {
     NodeId(TAB_BASE + index as u64)
 }
@@ -859,7 +817,6 @@ pub(crate) fn tab_action_index(
     (request.context == Some(expected)).then_some(index)
 }
 
-/// Character indices of word starts in `line` (capped at [`RUN_CHARS`]).
 fn word_starts_of(line: &str) -> Vec<u8> {
     let mut starts = vec![0u8];
     let mut prev_ws = false;
@@ -873,12 +830,10 @@ fn word_starts_of(line: &str) -> Vec<u8> {
     starts
 }
 
-/// Node id for run `chunk` of `row` in pane `slot`.
 const fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
     NodeId(ROW_BASE + slot as u64 * PANE_STRIDE + row as u64 * RUNS_PER_ROW + chunk as u64)
 }
 
-/// [`TextPosition`] for `(row, col)` in pane `slot`, clamped to the row's trimmed text.
 fn text_position(slot: usize, lines: &[&str], row: usize, col: usize) -> Option<TextPosition> {
     let line = lines.get(row)?;
     let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
@@ -976,7 +931,6 @@ fn push_terminal_document(
     nodes.push((id, grid));
 }
 
-/// Emit the find panel's `Role::SearchInput` and `Role::TextRun` nodes.
 fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     let mut run = Node::new(Role::TextRun);
     run.set_value(find.query.clone());
@@ -1008,7 +962,6 @@ fn push_find_field(nodes: &mut Vec<(NodeId, Node)>, find: &GridFind) {
     nodes.push((FIND, field));
 }
 
-/// Emit a [`GridMessage`] live region (and any capsule button children) and return its node id.
 fn push_message(
     nodes: &mut Vec<(NodeId, Node)>,
     message: &GridMessage,
@@ -1231,7 +1184,6 @@ pub(crate) fn grid_tree(
 mod tests {
     use super::*;
 
-    /// A real engine's visible grid.
     fn live_grid(
         rows: u16,
         cols: u16,
@@ -1259,7 +1211,6 @@ mod tests {
         bar_h: 18.0,
     };
 
-    /// Band rows publish in painted order with reserved bounds and capsule button children.
     #[test]
     fn a_status_band_is_published_where_it_is_painted() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
@@ -1350,7 +1301,6 @@ mod tests {
         );
     }
 
-    /// Grid publishes as a read-only `Role::Terminal` under a `Role::Window` root.
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
         let snap = live_grid(2, 10, b"hello", Some((0, 5)));
@@ -1375,7 +1325,6 @@ mod tests {
         );
     }
 
-    /// Grid rows publish as `Role::TextRun` children whose text concatenates to the snapshot.
     #[test]
     fn terminal_node_publishes_one_text_run_per_row() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1419,7 +1368,6 @@ mod tests {
         assert!(rebuilt.starts_with("alpha\nbeta\n"), "sanity: {rebuilt:?}");
     }
 
-    /// Cursor position publishes as a degenerate selection on its row run.
     #[test]
     fn caret_is_a_degenerate_selection_at_the_cursor() {
         let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
@@ -1437,7 +1385,6 @@ mod tests {
         assert_eq!(selection.focus.character_index, 4);
     }
 
-    /// Caret in trailing blanks clamps to the row's hard line break.
     #[test]
     fn caret_in_trailing_blanks_clamps_onto_the_line_break() {
         let snap = live_grid(2, 20, b"hi", Some((0, 17)));
@@ -1450,7 +1397,6 @@ mod tests {
         );
     }
 
-    /// Hidden cursor (DECTCEM) publishes no text selection.
     #[test]
     fn hidden_cursor_publishes_no_caret() {
         let snap = live_grid(2, 10, b"hello", None);
@@ -1458,7 +1404,6 @@ mod tests {
         assert_eq!(node(&update, GRID).text_selection(), None);
     }
 
-    /// Rows wider than [`RUN_CHARS`] split into multiple runs so word-start indices do not wrap.
     #[test]
     fn a_row_wider_than_the_index_space_is_split_into_addressable_runs() {
         let cols: u16 = 300;
@@ -1494,7 +1439,6 @@ mod tests {
         assert_eq!(sel.focus.character_index, 281 - RUN_CHARS);
     }
 
-    /// Character positions and bounds match cell geometry, with a zero-width trailing newline.
     #[test]
     fn character_geometry_tracks_the_cell_grid() {
         let snap = live_grid(2, 10, b"abc", Some((0, 3)));
@@ -1529,7 +1473,6 @@ mod tests {
         );
     }
 
-    /// Omitting [`GridGeometry`] preserves the `Text` interface while leaving bounds unset.
     #[test]
     fn missing_geometry_degrades_only_the_geometry() {
         let snap = live_grid(2, 10, b"abc", Some((0, 3)));
@@ -1546,7 +1489,6 @@ mod tests {
         );
     }
 
-    /// [`word_starts_of`] marks index 0 and each non-whitespace character after whitespace.
     #[test]
     fn word_starts_follow_the_model_definition() {
         assert_eq!(word_starts_of("hello world"), [0, 6]);
@@ -1562,7 +1504,6 @@ mod tests {
         assert_eq!(node(&update, NodeId(ROW_BASE)).word_starts(), [0, 5]);
     }
 
-    /// Tab strip publishes `Role::TabList` and `Role::Tab` items with bounds and action routing.
     #[test]
     fn tab_strip_publishes_as_a_tab_list() {
         let snap = live_grid(2, 40, b"hi", Some((0, 2)));
@@ -1665,7 +1606,6 @@ mod tests {
         }
     }
 
-    /// Active text selection outranks the cursor position.
     #[test]
     fn a_painted_selection_is_published_and_outranks_the_caret() {
         let snap = live_grid(3, 20, b"alpha\r\nbeta gamma", Some((2, 0)));
@@ -1696,7 +1636,6 @@ mod tests {
         assert_eq!(caret.focus.node, NodeId(ROW_BASE + 2 * RUNS_PER_ROW));
     }
 
-    /// Split frames publish one `Role::Terminal` document per pane with disjoint row run ids.
     #[test]
     fn a_split_frame_publishes_one_terminal_document_per_pane() {
         let composed = live_grid(2, 21, b"left\x1b[12Gright", Some((0, 16)));
@@ -1779,7 +1718,6 @@ mod tests {
         );
     }
 
-    /// Find panel publishes a focused `Role::SearchInput` with query, caret, and description.
     #[test]
     fn the_find_field_is_a_text_input_that_owns_focus() {
         let snap = live_grid(2, 20, b"hello", Some((0, 5)));
@@ -1822,7 +1760,6 @@ mod tests {
         assert!(!closed.nodes.iter().any(|(id, _)| *id == FIND));
     }
 
-    /// Stats deck publishes resource and core meter groups, and a keyboard lens takes focus.
     #[test]
     fn the_stats_deck_is_a_group_of_meters_and_a_group_of_cores() {
         let snap = live_grid(2, 20, b"", None);
@@ -1927,7 +1864,6 @@ mod tests {
         }
     }
 
-    /// Live-region messages set both label and value.
     #[test]
     fn every_chrome_message_announces_the_same_sentence_by_name_and_by_value() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -1952,7 +1888,6 @@ mod tests {
         }
     }
 
-    /// Volatile details and progress use description/numeric value so only headline changes speak.
     #[test]
     fn a_status_band_keeps_its_volatile_figures_out_of_the_announcement() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -2013,7 +1948,6 @@ mod tests {
         );
     }
 
-    /// Busy messages without a fraction publish as indeterminate `ProgressIndicator` or `Alert`.
     #[test]
     fn an_indeterminate_row_is_a_busy_progress_indicator() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -2043,7 +1977,6 @@ mod tests {
         assert_eq!(node(&alarm, id).role(), Role::Alert);
     }
 
-    /// Multi-line paste confirmation publishes as an assertive `Role::AlertDialog` without focus.
     #[test]
     fn the_paste_confirmation_interrupts_without_stealing_the_keyboard() {
         let snap = live_grid(2, 20, b"hi", Some((0, 2)));
@@ -2078,7 +2011,6 @@ mod tests {
         assert_eq!(update.focus, GRID, "Enter still reaches the terminal");
     }
 
-    /// [`ChromeMessage`] node ids round-trip and are rejected by [`tab_index_for`].
     #[test]
     fn message_ids_round_trip_are_stable_and_are_never_read_as_a_tab() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -2163,7 +2095,6 @@ mod tests {
         assert_eq!(id_of(&first), id_of(&second), "one node, new words");
     }
 
-    /// Root window label uses `window_title` or falls back to `"aterm"`.
     #[test]
     fn the_window_is_named_what_its_titlebar_names_it() {
         let snap = live_grid(2, 20, b"hi", None);
@@ -2183,13 +2114,11 @@ mod tests {
         assert_eq!(node(&untitled, ROOT).label(), Some("aterm"));
     }
 
-    /// Whether `text` contains only ASCII alphanumerics, spaces, and `.:,`.
     fn spoken(text: &str) -> bool {
         text.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | ':' | ','))
     }
 
-    /// Harness chips publish as word-labeled `Role::Button`s whose ids round-trip via [`chip_for`].
     #[test]
     fn the_harness_chips_are_buttons_named_in_words() {
         let snap = live_grid(3, 40, b"hi", Some((0, 2)));
@@ -2270,7 +2199,6 @@ mod tests {
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
     }
 
-    /// [`HarnessChip`] variants round-trip per session (`Switch` as `Switch`, `Title` as `Status`).
     #[test]
     fn the_light_the_switch_and_the_title_slot_have_ids_of_their_own() {
         let all = [
@@ -2351,7 +2279,6 @@ mod tests {
         }
     }
 
-    /// Open Autopilot menu publishes `Role::Menu` and radio/action items, focusing the selection.
     #[test]
     fn the_open_autopilot_menu_is_a_menu_of_items_in_words() {
         let snap = live_grid(12, 40, b"hi", Some((0, 2)));

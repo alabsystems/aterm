@@ -5,7 +5,6 @@
 
 use super::*;
 
-/// One grain at rest at `(x, y)` with seed `hue`, born at `born`.
 fn grain(x: f32, y: f32, hue: f32, born: Instant) -> Particle {
     Particle {
         x0: x,
@@ -20,18 +19,15 @@ fn grain(x: f32, y: f32, hue: f32, born: Instant) -> Particle {
     }
 }
 
-/// The hue whose shape seed (`hue · 4096`, truncated) is `seed`.
 fn seed_hue(seed: u32) -> f32 {
     (seed as f32 + 0.5) / 4096.0
 }
 
-/// The age at which a grain with seed `hue` is at its twinkle peak.
 fn peak_age(hue: f32) -> f32 {
     let quarter = std::f32::consts::FRAC_PI_2 - hue * std::f32::consts::TAU;
     quarter.rem_euclid(std::f32::consts::PI) / crate::effect_util::TWINKLE_OMEGA
 }
 
-/// What one grain emits on its own, `age` seconds into its life.
 fn emit_one(c: &GlowConfig, g: Geom, p: Particle, age: f32) -> (Vec<GlowQuad>, Vec<RainHalo>) {
     let born = p.born;
     let mut glow = CursorGlow::default();
@@ -48,7 +44,6 @@ fn emit_one(c: &GlowConfig, g: Geom, p: Particle, age: f32) -> (Vec<GlowQuad>, V
     (out, halos)
 }
 
-/// The pixels a quad stream covers.
 fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(i32, i32)> {
     quads
         .iter()
@@ -58,11 +53,6 @@ fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(i32, i32)> {
         .collect()
 }
 
-/// Sparkle's moon is a crescent: a disc minus an offset shadow disc, so its
-/// limb is lit to the lower left, its centre and east are dark (not a plain
-/// disc), its horns reach up and round to the right, and its western edge
-/// curves (the limb's middle row starts further west than the rows above and
-/// below it), which a `[` (a straight bar with two serifs) does not.
 #[test]
 fn the_moon_is_a_crescent() {
     let g = retina_geom();
@@ -113,10 +103,6 @@ fn the_moon_is_a_crescent() {
     assert!(light.iter().all(|q| q.alpha > 0), "source-over on light");
 }
 
-/// The stardust rule on a dark ground, Sparkle and Comet: a grain's body is
-/// a round radial mote (halos, no quads), plain glitter is one soft round
-/// grain, the moon is the crescent (one-pixel rows, no halo), and only the
-/// dealt plus (and Sparkle's mini-comet dash) lays quads.
 #[test]
 fn stardust_is_the_body_the_plus_is_the_accent() {
     let g = geom();
@@ -168,9 +154,6 @@ fn stardust_is_the_body_the_plus_is_the_accent() {
     );
 }
 
-/// A glow whose row probe shows two words on the cursor's row 2 (glyphs at
-/// columns 5 and 10, a gap between) and a glyph at `(1, 20)` on the probed
-/// row above, blanks elsewhere.
 fn probed_glow(c: &GlowConfig, g: Geom, at: Instant) -> CursorGlow {
     let mut glow = CursorGlow::default();
     let mut row = [' '; 40];
@@ -187,12 +170,6 @@ fn probed_glow(c: &GlowConfig, g: Geom, at: Instant) -> CursorGlow {
     glow
 }
 
-/// The particle law, every lawful arm (Sparkle, Comet, Water, Laser). On a
-/// light ground a grain is source-over ink, never additive light (the comet's
-/// debris settles as motes under the letters, in the under-ink stream), and a
-/// grain over a probed line of text (a letter, or the gap between two words,
-/// on the cursor's row or a probed row beside it) is not drawn at all, while
-/// its twin past the end of the line is.
 #[test]
 fn light_grains_are_ink_and_keep_off_the_letters() {
     let g = geom();
@@ -313,10 +290,6 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
     }
 }
 
-/// A full particle pool overflows the shared halo budget on its own (round
-/// dust is two halos a grain), and the one cap sheds the oldest grains, never
-/// the newest, and never the head marks drawn before the particles (the
-/// crown and the landing ring): the stream stays within [`CursorGlow::MAX_HALOS`].
 #[test]
 fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
     let g = geom();
@@ -368,10 +341,6 @@ fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
     );
 }
 
-/// A dealt comet grain's glint is a highlight laid over its round body, never
-/// a swap for it: through its twinkle peak the grain keeps its body (so it
-/// never changes shape mid-flight) and lays more light than just past the
-/// peak, and its centre is never fainter there.
 #[test]
 fn a_dealt_comet_grain_glints_over_its_body() {
     let g = geom();
@@ -438,12 +407,6 @@ fn a_dealt_comet_grain_glints_over_its_body() {
     );
 }
 
-/// THE SPARKLE SHOWER KEEPS OFF THE CARET ON DARK TOO, AND ITS MOON IS GOLD: a
-/// Sparkle grain just past the block caret's right edge (where the block hid
-/// half of it and left a sliver of light standing on its edge) is not drawn
-/// on a dark ground, every bucket of the shower, while the same grain two
-/// cells clear of the caret is; and the crescent moon is a warm gold, not a
-/// grey silver.
 #[test]
 fn the_dark_sparkle_shower_keeps_off_the_caret_and_its_moon_is_gold() {
     let g = geom();
@@ -496,12 +459,6 @@ fn the_dark_sparkle_shower_keeps_off_the_caret_and_its_moon_is_gold() {
     );
 }
 
-/// ON PAPER THE SPARKLE SHOWER IS GOLD: every bucket's grain (dust,
-/// glitter, the plus, the moon, the mini-comet) on GitHub Light lays a mark
-/// whose ink is a saturated gold (HSV saturation 0.6 or more) and whose
-/// deepest pixel stands out of the white page (3:1 or more), where the
-/// wheel's white-cored pastels inked to grey specks and a may-touch-text
-/// gold to khaki dust.
 #[test]
 fn the_light_sparkle_shower_is_gold_and_registers_on_white() {
     use crate::color_math::{contrast_ratio, rgb2hsv};
@@ -574,10 +531,6 @@ fn the_light_sparkle_shower_is_gold_and_registers_on_white() {
     );
 }
 
-/// THE SHOWER AND THE STARDUST KEEP OFF THE LINES AN ENTER PRINTED: at the
-/// bottom of a full screen an Enter leaves two fresh lines above the caret,
-/// and the row probe (the caret's row and the row above it) reads only one
-/// of them; the frame's own cells read both.
 #[test]
 fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
     use aterm_core::terminal::RenderCell;
@@ -663,10 +616,6 @@ fn the_shower_and_the_stardust_keep_off_the_lines_an_enter_printed() {
     );
 }
 
-/// A WATER DROPLET ON A DARK GROUND IS A SOFT ROUND BEAD: every seed of the
-/// shower, at rest or falling, lays radial light (a halo, which falls off to
-/// nothing at its rim) and no flat quad, and a falling drop is drawn out
-/// along its fall, never wider than tall.
 #[test]
 fn a_dark_water_droplet_is_a_soft_round_bead() {
     let g = geom();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the account stats' view and its two renderings ([`super::view`], [`super::text`], [`super::json`]).
+//! Tests for the account stats view ([`super::view`], [`super::text`], [`super::json`]).
 
 use aterm_json::{Value, json};
 
@@ -10,23 +10,18 @@ use crate::harness::accounts::{self, CreditsUse, State, TapRead, Wall, WindowRea
 use crate::harness::spend::{Message, PRICES_TOML, PriceTable};
 use crate::harness::usage::TokenUsage;
 
-/// 2026-10-15T16:40:00Z, a Thursday.
 const NOW: i64 = 1_792_082_400;
 const MIN: i64 = 60;
 const HOUR: i64 = 3600;
 const DAY: i64 = 86_400;
 const MACHINE: &str = "3f9a1b2c4d5e6f70";
 
-/// The account id the composed profiles carry (invented).
 const UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
-/// A composed profile: Max 5x, credits on, Fable included; `usage` its
-/// cached `/usage` body, where one is given.
 fn profile(usage: Option<Value>) -> Result<Profile, NoProfile> {
     profile_of(UUID, usage)
 }
 
-/// [`profile`], of the account whose id is `uuid`.
 fn profile_of(uuid: &str, usage: Option<Value>) -> Result<Profile, NoProfile> {
     let mut doc = json!({
         "oauthAccount": {
@@ -54,10 +49,8 @@ fn profile_of(uuid: &str, usage: Option<Value>) -> Result<Profile, NoProfile> {
     profile::parse(aterm_json::to_string(&doc).expect("compose").as_bytes())
 }
 
-/// The week's reset the composed figures name: Sun Oct 18 20:50 UTC.
 const WEEK_END: i64 = 1_792_356_600;
 
-/// What a look at `account` says, with the tap `tap` and no spend.
 fn look<'a>(
     account: Option<&'a accounts::Account>,
     profile: &'a Result<Profile, NoProfile>,
@@ -81,8 +74,6 @@ fn look<'a>(
     }
 }
 
-/// A state with `main`'s figures as the tap recorded them: five hours at
-/// `five` tenths and the week at `week`, read at `at`.
 fn tapped(five: u32, week: u32, at: i64) -> State {
     let mut state = State {
         machine: MACHINE.to_string(),
@@ -119,12 +110,8 @@ fn doc(look: &Look<'_>) -> Value {
     aterm_json::from_str(&json(look, &view(look), "0.105.0")).expect("one JSON document")
 }
 
-/// DAY ONE, THE PACKAGED CONFIG (design "What you get"): the tap off and no
-/// `/usage` seen, every empty figure says why — `usage-tap-off` for the two
-/// windows, `no-usage-seen` for Fable, beside the plan's own Fable answer —
-/// in the text and in JSON.
 #[test]
-fn day_one_every_empty_figure_names_its_reason() {
+fn with_the_tap_off_every_empty_figure_names_its_reason() {
     let p = profile(None);
     let l = look(None, &p, Tap::Off);
     let shown = text(&l, &view(&l));
@@ -152,6 +139,18 @@ fn day_one_every_empty_figure_names_its_reason() {
             &Value::from("no-usage-seen")
         ]
     );
+    let harness_off = look(None, &p, Tap::HarnessOff);
+    let said = text(&harness_off, &view(&harness_off));
+    assert!(
+        said.contains("  5h     \u{2014}  usage_tap off (the harness is off for Claude Code)\n"),
+        "the key is on: the harness is what is off, {said}"
+    );
+    assert!(!said.contains("usage_tap = true turns it on"), "{said}");
+    assert_eq!(
+        doc(&harness_off)["accounts"][0]["windows"][0]["missing"]["reason"],
+        Value::from("usage-tap-off"),
+        "the same closed word"
+    );
     assert_eq!(
         windows[0]["used_pct"],
         Value::Null,
@@ -170,12 +169,6 @@ fn day_one_every_empty_figure_names_its_reason() {
     }
 }
 
-/// THE TAP'S FIGURE, TO A TENTH, WITH ITS OWN AS-OF (design §3.3, §7.2): a
-/// reading of 42.5% shows `used_pct_x10: 425`, `used_pct: 43`, the reset the
-/// vendor named, `source: tap`, this machine, `current`; the text reads
-/// `42.5% used · 57.5% left · resets 18:05 (in 1h25m)   as of 1m (tap,
-/// here)`. AFTER ITS RESET it is VOID — `window reset 18:05, no reading
-/// since`, `used_pct: null`, `missing: window-reset` — never 0%.
 #[test]
 fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     let state = tapped(425, 710, NOW - MIN);
@@ -230,9 +223,6 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     );
 }
 
-/// A LIMIT RESET USED INSIDE THE WINDOW, NO READING SINCE (design §3.5): the
-/// figure held is cut by the epoch — `reset used 16:30, no reading since`,
-/// `missing: reset-used`, `epoch_at` named.
 #[test]
 fn a_reset_used_with_no_reading_since_says_so() {
     let mut state = tapped(1000, 400, NOW - HOUR);
@@ -299,8 +289,6 @@ fn a_reset_used_with_no_reading_since_says_so() {
     );
 }
 
-/// `main`'s week as the state holds it: the tap's figure `pct_x10` read at
-/// `at` under [`WEEK_END`], and S5's word `said` on the week.
 fn week_said(pct_x10: u32, at: i64, said: accounts::WindowSaid) -> accounts::Account {
     accounts::Account {
         windows: [(
@@ -314,11 +302,6 @@ fn week_said(pct_x10: u32, at: i64, said: accounts::WindowSaid) -> accounts::Acc
     }
 }
 
-/// S5'S WORD THAT A LIMIT RESET WAS USED IS AN EPOCH OF EVERY SOURCE, taken
-/// before the merge (design §3.5): the `/usage` cache's week of 98%, fetched
-/// two days ago, the tap's 5% read a minute ago with no epoch kept beside
-/// it, and a reset used a day ago — the week is the tap's 5%, read after the
-/// reset, never `reset used, no reading since`.
 #[test]
 fn a_reset_used_cuts_each_source_before_the_merge() {
     let cached = profile(Some(
@@ -351,10 +334,6 @@ fn a_reset_used_cuts_each_source_before_the_merge() {
     );
 }
 
-/// A LIMIT THAT LIFTED BY ITSELF REFILLED NOTHING INSIDE ITS WINDOW
-/// ([`accounts::reset_outcome`]'s `Lifted`, design §3.5): its word names the
-/// reset that came, and the next window's 20%, read before the outcome was,
-/// stands.
 #[test]
 fn a_limit_that_lifted_by_itself_cuts_nothing() {
     let p = profile(None);
@@ -388,12 +367,6 @@ fn a_limit_that_lifted_by_itself_cuts_nothing() {
     );
 }
 
-/// THE SAMPLE IS ONE MORE SOURCE ([`accounts::sample_window`], design §3.2):
-/// an account that holds only the sample — the `/usage` probe's panel, or a
-/// state the tap of an older build wrote — shows its figures, `source:
-/// sample`, as of the sample; beside the tap's record, a sample that says
-/// another figure (the probe's 45% over the tap's 42.5%) merges by the one
-/// rule.
 #[test]
 fn a_figure_held_only_in_the_sample_is_shown() {
     let p = profile(None);
@@ -404,6 +377,7 @@ fn a_figure_held_only_in_the_sample_is_shown() {
         week_reset: Some(WEEK_END),
         at,
         by: MACHINE.to_owned(),
+        ..accounts::Sample::default()
     };
     let only = accounts::Account {
         sample: Some(sample(42, NOW - 5 * MIN)),
@@ -441,13 +415,67 @@ fn a_figure_held_only_in_the_sample_is_shown() {
         .cloned()
         .expect("current");
     assert_eq!((five.pct_x10, five.source.as_str()), (450, SOURCE_SAMPLE));
+
+    let old = NOW - 3 * HOUR;
+    let mut state = tapped(420, 610, old);
+    let reading = TapRead {
+        five_hour: Some(WindowRead {
+            pct_x10: 420,
+            reset: NOW + 85 * MIN,
+            refilled: None,
+        }),
+        seven_day: Some(WindowRead {
+            pct_x10: 610,
+            reset: WEEK_END,
+            refilled: None,
+        }),
+        at: old,
+        seen_before: true,
+        ..TapRead::default()
+    };
+    let reload = |state: &State, now| State::from_json(&state.to_json(), now).unwrap();
+    let observation = |state: &State, now| {
+        let l = Look {
+            now,
+            ..look(state.accounts.get("main"), &p, Tap::On)
+        };
+        let view = view(&l);
+        let week = win(&view, WEEK_LIMIT).current(now).expect("a running week");
+        (week.pct_x10, week.at, week.source.clone())
+    };
+    assert_eq!(
+        accounts::note_reading(&mut state, "main", &reading, NOW - MIN).len(),
+        1
+    );
+    state = reload(&state, NOW);
+    assert_eq!(
+        observation(&state, NOW),
+        (610, old, SOURCE_TAP_WORD.into()),
+        "a tap heartbeat does not make account stats' held figure newly observed"
+    );
+    assert_eq!(
+        accounts::note_sample(&mut state, "main", sample(42, NOW), NOW).len(),
+        1
+    );
+    state = reload(&state, NOW);
+    assert_eq!(
+        observation(&state, NOW),
+        (610, NOW, SOURCE_SAMPLE.into()),
+        "a real fresh panel with equal values reaches account stats after storage"
+    );
+    let beat = NOW + accounts::READING_HEARTBEAT_S;
+    assert_eq!(
+        accounts::note_reading(&mut state, "main", &reading, beat).len(),
+        1
+    );
+    state = reload(&state, beat);
+    assert_eq!(
+        observation(&state, beat),
+        (610, NOW, SOURCE_SAMPLE.into()),
+        "a later heartbeat preserves the actual panel's observation time"
+    );
 }
 
-/// EVERY SOURCE OF A WINDOW, ONE RULE (design §3.3, §3.5): the tap's 40% and
-/// the `/usage` cache's 60% under one reset give 60% from the cache (the
-/// largest), a wall gives 100% until its reset, and the Fable week comes
-/// from the cache's `limits[]` row under its own name — as last seen, two
-/// days old, `/usage`.
 #[test]
 fn every_source_of_a_window_merges_by_one_rule() {
     let state = tapped(400, 300, NOW - MIN);
@@ -499,13 +527,8 @@ fn every_source_of_a_window_merges_by_one_rule() {
     );
 }
 
-/// The tap's source word, as the record keeps it.
 const SOURCE_TAP_WORD: &str = accounts::SOURCE_TAP;
 
-/// THE DOLLARS (design §3.6, A5's figures wired in): with a current reading
-/// of the week at 50% and $20 of list-price spend before it, the week holds
-/// `≥$40` and `≈$20` is left; with no reading the figure is rolling and no
-/// capacity is claimed.
 #[test]
 fn the_dollars_come_from_the_spend_beside_the_windows_reading() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -583,8 +606,6 @@ fn the_dollars_come_from_the_spend_beside_the_windows_reading() {
     assert!(shown.contains("capacity \u{2014} no reading"), "{shown}");
 }
 
-/// What a look at `account` says beside `spend`, with the tap on: the JSON
-/// document and the text.
 fn shown_with(
     spend: &spend::Spend,
     profile: &Result<Profile, NoProfile>,
@@ -600,11 +621,6 @@ fn shown_with(
     (doc(&l), text(&l, &view(&l)))
 }
 
-/// A RECORD OF ANOTHER ACCOUNT IS NOT SHOWN under the one the profile names
-/// ([`Account::of_another`], the rule `note_reading` drops it by): `main`'s
-/// record holds account A's figures — the five hours at a wall, the week at
-/// 80% with S5's warning of it, credits in use — and the home's profile now
-/// names account B, of which no reading has come.
 #[test]
 fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -723,11 +739,8 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
     }
 }
 
-/// Account B's id, beside [`UUID`]'s A (invented).
 const OTHER: &str = "7d1e4a90-5b2c-4f3e-8a6d-0c9b8e7f6a5d";
 
-/// A composed profile of `uuid`'s account whose cached `/usage` body names
-/// `cached_by`'s, fetched at `fetched` (Unix seconds).
 fn profile_cached_by(uuid: &str, cached_by: &str, fetched: i64) -> Result<Profile, NoProfile> {
     let doc = json!({
         "oauthAccount": {"accountUuid": uuid, "organizationType": "claude_max"},
@@ -740,9 +753,6 @@ fn profile_cached_by(uuid: &str, cached_by: &str, fetched: i64) -> Result<Profil
     profile::parse(aterm_json::to_string(&doc).expect("compose").as_bytes())
 }
 
-/// SPEND SINCE ANOTHER ACCOUNT WAS SEEN ON THE HOME IS UNATTRIBUTED (design
-/// §3.6): the fold is home-wide, so its messages since a second account was
-/// seen there cannot be put on the one the profile names.
 #[test]
 fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -832,11 +842,6 @@ fn spend_since_another_account_was_seen_on_the_home_is_unattributed() {
     assert_eq!(attribution(&d), Value::from("assumed"));
 }
 
-/// `aterm harness accounts` READS THE KEY RULE TOO ([`held_windows`] with the
-/// key of the account the default home's profile names): A's record — a
-/// wall on the five hours, the week at 80% — under B's key shows nothing,
-/// each window empty and `no-reading`, as `accounts stats` says at the same
-/// moment.
 #[test]
 fn the_accounts_report_shows_no_record_of_another_account() {
     let mut state = tapped(400, 800, NOW - MIN);
@@ -883,9 +888,6 @@ fn the_accounts_report_shows_no_record_of_another_account() {
     }
 }
 
-/// WHO USES IT AND ITS LOGIN (design §3.3): the sessions on the home now and
-/// S7's word, in the text and JSON; a census that could not be read says
-/// so, never `0`.
 #[test]
 fn the_used_row_names_the_sessions_and_the_login() {
     let p = profile(None);
@@ -933,7 +935,6 @@ fn the_used_row_names_the_sessions_and_the_login() {
     );
 }
 
-/// The text's words for spans, instants and dollars.
 #[test]
 fn the_texts_spans_instants_and_dollars() {
     assert_eq!(span(40), "40s");
@@ -953,12 +954,6 @@ fn the_texts_spans_instants_and_dollars() {
     assert_eq!(usd(1_234_567.0), "$1,234,567");
 }
 
-/// A RESET USED CLEARS ITS WALL'S 100% (design §3.5;
-/// [`accounts::reset_outcome`]): the week walled at 100% (the tap's 90%
-/// from before it) and aterm's own limit reset claimed and used on it, the
-/// wall's slot keeps a cleared record — no wall — so the week says `reset
-/// used`, never 100%, and a reading after it (3% under the same reset) is
-/// the week.
 #[test]
 fn a_reset_used_clears_its_walls_hundred_percent() {
     let mut state = tapped(400, 900, NOW - HOUR);
@@ -1030,11 +1025,6 @@ fn a_reset_used_clears_its_walls_hundred_percent() {
     );
 }
 
-/// A PER-MODEL WEEK'S DOLLARS ARE ITS OWN MODELS' (design §3.6): an Opus
-/// message's dollars count in the week and in the Opus week, never in the
-/// Sonnet week, whose figure the cached `/usage` body holds; a week of a
-/// model no family names (`seven_day_other`, `Haiku`) has no dollars at
-/// all.
 #[test]
 fn a_per_model_weeks_dollars_are_its_own_models() {
     let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
@@ -1085,11 +1075,6 @@ fn a_per_model_weeks_dollars_are_its_own_models() {
     assert_eq!(spent("seven_day_other"), None, "no family named");
 }
 
-/// EACH WEEK OF A MODEL NO BUCKET NAMES IS ITS OWN WINDOW (design §7.2,
-/// `seven_day_other` with its name in `name`): the cached `/usage` body's
-/// `Sonnet` row at 10% and `Haiku` row at 85%, under one reset, are two
-/// windows, each with its own name and figure — never one window named
-/// `Sonnet` that holds Haiku's 85%.
 #[test]
 fn each_unknown_model_week_is_its_own_window() {
     let row = |name: &str, pct: f64| {
@@ -1113,11 +1098,6 @@ fn each_unknown_model_week_is_its_own_window() {
     );
 }
 
-/// A REFILL THE TAP SAW CUTS EVERY SOURCE FROM BEFORE IT (design §3.5): the
-/// week warned at 97% and walled at 100%, then a limit reset used in a tab
-/// (no outcome of aterm's recorded: S5's warning and the wall stay) and the
-/// same process's next reading at 2% — the view's week is the 2%, never the
-/// warning's 97% or the wall's 100%.
 #[test]
 fn a_refill_the_tap_saw_cuts_the_warning_and_the_wall() {
     let read = |pct_x10: u32, refilled: Option<u32>, at: i64| TapRead {

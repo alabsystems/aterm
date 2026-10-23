@@ -49,13 +49,13 @@ fn lineage(birth: ProcessBirth, launcher_version: i32) -> Lineage {
     Lineage {
         identity: Identity {
             pid: 42199,
-            birth,
-            idversion: 77_000,
+            birth: birth.into(),
+            idversion: Some(77_000),
         },
         uniqueid: 9_000,
         parent: 1,
         pgid: 42199,
-        launcher_version,
+        launcher_version: Some(launcher_version),
         tty: None,
     }
 }

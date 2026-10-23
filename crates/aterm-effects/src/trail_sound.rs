@@ -38,7 +38,7 @@ pub enum SoundKind {
     Jump,
     /// A single-cell arrow move, the character-scale motion: one soft in-key melody tone one lattice step in the travel direction ([`gesture_shape`]).
     Glide { dir: i8 },
-    /// A fast cursor run (a held arrow's coalesced echo or a multi-cell leap): the word-scale motion, a [`Glide`] repeated per character crossed and landing [`GESTURE_WORD_CHARS`] steps out ([`gesture_shape`]).
+    /// A fast cursor run (a held arrow's coalesced echo or a multi-cell leap): the word-scale motion, a [`SoundKind::Glide`] repeated per character crossed and landing [`GESTURE_WORD_CHARS`] steps out ([`gesture_shape`]).
     Sweep { dir: i8 },
     /// The cursor landed: a bright in-key star chime over a soft arrival body, designed before palette dispatch and pitched through `melody_hz`.
     Land,
@@ -308,7 +308,6 @@ const BLOCK_LEAD_MAX_S: f32 = 0.050;
 pub const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     let Some(c) = typed else { return 0 };
     if c.is_ascii_alphabetic() {
-        // Case folded: the capital has its own voice in `SoundEvent::shifted`.
         return 1 + (c.to_ascii_lowercase() as u8 - b'a');
     }
     if c.is_ascii_digit() {
@@ -339,11 +338,11 @@ pub mod glyph_class {
     pub const DIGIT: u8 = 3;
     /// `.`: the full stop.
     pub const STOP: u8 = 4;
-    /// `(` `[` `{` — the brackets that open (not a pluck: they open).
+    /// Opening brackets (`()`, `[]`, `{}`) — not a pluck: they open.
     pub const OPEN: u8 = 5;
-    /// `)` `]` `}` — the brackets that close.
+    /// Closing brackets (`()`, `[]`, `{}`).
     pub const CLOSE: u8 = 6;
-    /// `'` `"` `` ` `` — the quotes.
+    /// Single, double, and backtick quote marks.
     pub const QUOTE: u8 = 7;
     /// `_` `~` `\` `|`: a line drawn.
     pub const LINE: u8 = 8;
@@ -1061,6 +1060,10 @@ struct Bed {
     var_ph: [f32; 4],
     var_f: [f32; 4],
     hue_s: f32,
+    sky_glide_dt: f32,
+    sky_glide: f32,
+    sky_detune_arc: f32,
+    sky_detune: f32,
 }
 
 #[inline]
@@ -1082,8 +1085,7 @@ const fn bed_kick(kind: SoundKind) -> f32 {
     }
 }
 
-/// The procedural synthesizer: [`push`](Self::push) [`SoundEvent`]s in, and
-/// [`render`](Self::render) interleaved stereo `f32` frames out.
+/// Procedural synthesizer: [`push`](Self::push) [`SoundEvent`]s in, [`render`](Self::render) interleaved stereo `f32` frames out.
 #[derive(Clone, Debug)]
 pub struct TrailSynth {
     #[cfg(test)]
@@ -1416,11 +1418,6 @@ impl TrailSynth {
                         self.space_run_len.saturating_add(1)
                     };
                     if self.space_head {
-                        // The word boundary is the bar line: resetting the bar
-                        // here makes each word's first letter an accent, with
-                        // the space as the bass note under it. Typing speed
-                        // still sets the tempo. Only the run head does it, so
-                        // an indent re-bars once.
                         self.song_pulse = 0;
                     }
                 }
@@ -2445,7 +2442,6 @@ impl TrailSynth {
         for (i, &deg) in phrase.iter().enumerate() {
             // Distinct branch.
             if deg == REST {
-                // Distinct branch.
                 continue;
             }
             let span = celebration_span(phrase, i, sustain_limit);
@@ -2584,6 +2580,11 @@ impl TrailSynth {
             0.0
         };
         let bed_on = self.bed.level >= 1e-4;
+        let bed_palette = if bed_on {
+            Some(palette_for(self.bed_voice, self.bed_style))
+        } else {
+            None
+        };
         let lim_on = self.v2_latched;
         let (lim_att, lim_rel) = if lim_on {
             (
@@ -2593,19 +2594,24 @@ impl TrailSynth {
         } else {
             (0.0, 0.0)
         };
-        let active_voices_end = self.voices.iter().rposition(|v| v.on).map_or(0, |i| i + 1);
+        let mut active_voices = [0u8; MAX_VOICES];
+        let mut active_len = 0usize;
+        for (i, v) in self.voices.iter().enumerate() {
+            if v.on {
+                active_voices[active_len] = i as u8;
+                active_len += 1;
+            }
+        }
         for f in 0..frames {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             let (mut xl, mut xr) = (0.0f32, 0.0f32);
 
-            let mut next_vi = 0;
-            while next_vi < active_voices_end {
-                let vi = next_vi;
-                next_vi += 1;
+            let mut read_idx = 0;
+            let mut write_idx = 0;
+            while read_idx < active_len {
+                let vi = usize::from(active_voices[read_idx]);
+                read_idx += 1;
                 let v = &mut self.voices[vi];
-                if !v.on {
-                    continue;
-                }
                 v.t += dt;
                 if v.damp > 0.0 {
                     v.damp -= dt;
@@ -2625,7 +2631,8 @@ impl TrailSynth {
                     }
                 }
                 if v.t < 0.0 {
-                    // Distinct branch.
+                    active_voices[write_idx] = vi as u8;
+                    write_idx += 1;
                     continue;
                 }
                 if v.t >= v.dur {
@@ -2636,6 +2643,8 @@ impl TrailSynth {
                     self.voices[vi].on = false;
                     continue;
                 }
+                active_voices[write_idx] = vi as u8;
+                write_idx += 1;
                 let v = &mut self.voices[vi];
                 let seed = !v.env_run || v.env_n >= ENV_REANCHOR;
                 if seed {
@@ -2710,8 +2719,6 @@ impl TrailSynth {
                         let g = (core::f32::consts::PI * (fc * dt).min(0.45)).tan();
                         (g, 1.0 + g * (g + damp))
                     } else {
-                        // A constant cutoff: coefficient and divisor were
-                        // computed in `spawn` (see `Voice::svf_g`).
                         (v.svf_g, v.svf_den)
                     };
                     let hp = (white - v.n_lp - damp * v.n_bp) / den;
@@ -2762,9 +2769,10 @@ impl TrailSynth {
                     r += y * gr;
                 }
             }
+            active_len = write_idx;
 
-            if bed_on {
-                let (bl, br) = self.bed_sample(dt);
+            if let Some(palette) = bed_palette {
+                let (bl, br) = self.bed_sample_with(palette, dt);
                 l += bl;
                 r += br;
             }
@@ -2856,16 +2864,22 @@ impl TrailSynth {
         }
     }
 
+    #[cfg(test)]
     #[inline]
-    fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
+    pub(super) fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
+        let palette = palette_for(self.bed_voice, self.bed_style);
+        self.bed_sample_with(palette, dt)
+    }
+
+    #[inline]
+    fn bed_sample_with(&mut self, palette: &dyn Palette, dt: f32) -> (f32, f32) {
         let lvl = self.bed.level * self.bed.gain;
         self.bed.lfo1 = (self.bed.lfo1 + 0.23 * dt).fract();
         self.bed.lfo2 = (self.bed.lfo2 + 0.71 * dt).fract();
         let u1 = 0.5 * (1.0 + sin01(self.bed.lfo1));
         let u2 = 0.5 * (1.0 + sin01(self.bed.lfo2));
 
-        let (m, side) =
-            palette_for(self.bed_voice, self.bed_style).bed_sample(self, dt, lvl, u1, u2);
+        let (m, side) = palette.bed_sample(self, dt, lvl, u1, u2);
         (m + side, m - side)
     }
 }
@@ -2883,7 +2897,6 @@ trait Palette {
 
     #[inline]
     fn bed_grain(&self, s: &mut TrailSynth, _level: f32, _gain: f32) {
-        // Distinct branch.
         s.bed.timer = 0.25;
     }
 
@@ -4204,8 +4217,6 @@ impl Palette for TypewriterPalette {
                 Self::strike(s, ev.pan, g, bright, ring, body);
             }
             SoundKind::Navigation => {
-                // The escapement "tik": the clack alone, a shade duller, lifted
-                // ×2 so it still reads at tier 0 without ring or platen.
                 Self::strike(s, ev.pan, g * 2.0, 0.75, 0.0, 0.0);
             }
             SoundKind::Jump => {
@@ -4358,8 +4369,6 @@ impl Palette for MarimbaPalette {
                 Self::bar(s, deg, 0.0, 0.13, true, g, ev.pan);
             }
             SoundKind::Navigation => {
-                // The dead stroke: the note choked in 50 ms, no glint, lifted
-                // ×1.25 so it stays a tier-0 whisper.
                 Self::bar(s, deg, 0.0, 0.05, false, g * 1.25, ev.pan);
             }
             SoundKind::Jump => {
@@ -4451,8 +4460,6 @@ impl Palette for FeltPalette {
                 Self::note(s, deg, 0.0, 0.19, 1.0, g, ev.pan);
             }
             SoundKind::Navigation => {
-                // Una corda — the soft pedal's whisper: shorter, no hammer
-                // thud, a shade under the keystroke (the tier-0 whisper).
                 Self::note(s, deg, 0.0, 0.09, 0.0, g * 0.8, ev.pan);
             }
             SoundKind::Jump => {
@@ -5606,7 +5613,6 @@ mod tests {
             for _ in 0..6 {
                 s.push(ev(GlowStyle::Beam, SoundKind::Typed));
                 for _ in 0..4 {
-                    // Distinct branch.
                     s.render(&mut buf);
                 }
             }
@@ -5727,7 +5733,6 @@ mod tests {
         assert!(s.sing_hold > 0.0, "…and hold it for the bar");
         let mut buf = [0.0f32; 960];
         for block in 0..700 {
-            // ~7 s
             if block % 20 == 0 {
                 s.push(SoundEvent {
                     bed: false,
@@ -5912,7 +5917,6 @@ mod tests {
         s2.push(riff_sig(GlowStyle::RainbowKitty, 4, t));
         s2.push(riff_sig(GlowStyle::RainbowKitty, 5, e));
         for _ in 0..10 {
-            // Distinct branch.
             s2.render(&mut buf);
         }
         assert_eq!(

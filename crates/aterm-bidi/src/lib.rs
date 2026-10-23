@@ -494,7 +494,8 @@ pub fn reorder_cells(
     reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
 }
 
-/// Class-taking companion to [`reorder_cells`]: per-CELL classes and brackets (parallel to `is_wide_continuation`), so a caller that already computed them does not recompute.
+/// Class-taking companion to `reorder_cells`: per-CELL classes and brackets (parallel to
+/// `is_wide_continuation`), so a caller that already computed them does not recompute.
 #[must_use]
 pub fn reorder_cells_with_classes(
     cell_classes: &[BidiClass],

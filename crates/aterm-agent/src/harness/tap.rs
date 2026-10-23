@@ -521,27 +521,24 @@ fn write_reading(dir: &Path, name: &str, text: &str) -> io::Result<()> {
 
 /// WHEN `reading`'S FIGURES WERE FIRST REPORTED since its process was last
 /// served: the `at` of the reading already at `path` where that names the
-/// same tab and process with the same `api_ms` and the same figures — a
-/// re-report, which Claude Code makes every [`TAP_REFRESH_S`] seconds while
-/// idle — else the reading's own.
+/// same tab and process with the same `api_ms`, and every window `reading`
+/// carries is the held one's — a re-report, which Claude Code makes every
+/// [`TAP_REFRESH_S`] seconds while idle, or one a window only dropped out of
+/// at its reset (Claude Code hands a window only while it runs), which tells
+/// nothing new of the rest — else the reading's own. A window that newly
+/// appears or moves is a new report.
 fn first_reported(path: &Path, reading: &Reading) -> i64 {
     let figure = |w: Option<Window>| w.map(|w| (w.x10(), w.resets_at));
+    let kept = |held: Option<Window>, now: Option<Window>| {
+        figure(now).is_none_or(|now| figure(held) == Some(now))
+    };
     read_regular(path)
         .and_then(|text| Reading::of_json(&text))
         .filter(|held| {
-            (
-                held.sid.as_str(),
-                held.pid,
-                held.api_ms,
-                figure(held.five_hour),
-                figure(held.seven_day),
-            ) == (
-                reading.sid.as_str(),
-                reading.pid,
-                reading.api_ms,
-                figure(reading.five_hour),
-                figure(reading.seven_day),
-            )
+            (held.sid.as_str(), held.pid, held.api_ms)
+                == (reading.sid.as_str(), reading.pid, reading.api_ms)
+                && kept(held.five_hour, reading.five_hour)
+                && kept(held.seven_day, reading.seven_day)
         })
         .map_or(reading.at, |held| held.at.min(reading.at))
 }
@@ -639,6 +636,50 @@ pub struct Armed {
     pub exe: PathBuf,
     /// The login of the machine's one account where it has a directory of its own.
     pub lone_login: Option<String>,
+    /// Where the machine has no lone login, every login its roster names
+    /// ([`accounts::listed_logins_at`]): a line on one of them is tapped as the machine's own
+    /// ([`Self::lone_for`]), on a roster of two or more accounts each listed account's.
+    pub listed: Vec<String>,
+}
+
+impl Armed {
+    /// THE TAP ARMED for the relaunch lines one pass types, the one block every pass that
+    /// relaunches shares (the window's background lane, `aterm harness upgrade`): when `on`,
+    /// for the aterm `exe` names ([`stable_exe`]), with the lone login of the roster at
+    /// `roster` as `store` binds it at `now` ([`accounts::lone_login_at`]), else every login
+    /// that roster names ([`accounts::listed_logins_at`]); neither where `now` was not read.
+    #[must_use]
+    pub fn arm(
+        on: bool,
+        exe: impl FnOnce() -> Option<PathBuf>,
+        roster: Option<&Path>,
+        store: &accounts::Store,
+        now: Option<i64>,
+    ) -> Option<Self> {
+        on.then(exe).flatten().map(|exe| {
+            let lone_login = now.and_then(|now| accounts::lone_login_at(roster, store, now));
+            let listed = match (now, &lone_login) {
+                (Some(now), None) => accounts::listed_logins_at(roster, store, now),
+                _ => Vec::new(),
+            };
+            Self {
+                exe,
+                lone_login,
+                listed,
+            }
+        })
+    }
+
+    /// THE LOGIN [`gate`] JUDGES A LINE ON `login` BY ([`GateFacts::lone_login`]): the
+    /// machine's lone login, else `login` itself where the roster names it ([`Self::listed`]).
+    /// The one rule every relaunch line keeps (the restart in place, an account move, the
+    /// relaunch on exit, the live upgrade) and the Claude Code footer's reason judges by.
+    #[must_use]
+    pub fn lone_for<'a>(&'a self, login: Option<&'a str>) -> Option<&'a str> {
+        self.lone_login.as_deref().or_else(|| {
+            login.filter(|login| !login.is_empty() && self.listed.iter().any(|l| l == login))
+        })
+    }
 }
 
 /// Whether a line's login is the machine's own, for [`gate`].
@@ -656,7 +697,8 @@ pub struct GateFacts<'a> {
     pub stored_login: bool,
     /// The login variable's value the line carries ([`accounts::LOGIN_ENV`]).
     pub login: Option<&'a str>,
-    /// The login of the machine's one account ([`Armed::lone_login`]).
+    /// The login of the machine's one account, or the line's own where the roster names it
+    /// ([`Armed::lone_for`]).
     pub lone_login: Option<&'a str>,
     /// The Claude home the line carries ([`accounts::HOME_ENV`]).
     pub home: Option<&'a str>,
@@ -675,24 +717,88 @@ pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     if !(f.stored_login && own_login(f.login, f.home, f.lone_login)) || f.profile_store {
         return None;
     }
-    let flags = super::upgrade::carried_names(f.argv).ok()?;
-    if flags
-        .iter()
-        .any(|name| matches!(*name, "--settings" | "--bare"))
-    {
+    if !line_admits(f.argv) {
         return None;
     }
-    let stored = accounts::ProcessLogin::of_env([])
-        .with_settings(f.settings)
-        .stored_login;
-    let quiet = f.settings.iter().all(|(_, source)| match source {
+    settings_admit(f.settings).then_some(value)
+}
+
+/// [`gate`]'s argv half: the line (`argv[0]` first) parses, and carries no `--settings` or
+/// `--bare` of its own ([`line_refusal`]).
+#[must_use]
+pub fn line_admits(argv: &[String]) -> bool {
+    line_refusal(argv).is_none()
+}
+
+/// Why [`line_admits`] refuses `argv` (`argv[0]` first): an option no relaunch line can repeat
+/// ([`Refusal::Argv`]: one this build does not know, or one that cannot resume), or a
+/// `--settings` or `--bare` of its own ([`Refusal::Line`]); `None` where it admits it.
+#[must_use]
+pub fn line_refusal(argv: &[String]) -> Option<Refusal> {
+    match super::upgrade::carried_names(argv) {
+        Err(_) => Some(Refusal::Argv),
+        Ok(flags) => flags
+            .iter()
+            .any(|name| matches!(*name, "--settings" | "--bare"))
+            .then_some(Refusal::Line),
+    }
+}
+
+/// [`gate`]'s SETTINGS HALF, the one judgment the relaunch's gate and the Claude Code footer's
+/// reason for a missing week share (`upgrade_drive::tap_settings_admit`): the chain is quiet
+/// ([`settings_quiet`]), and no document of it moves the line off its stored login (an
+/// `apiKeyHelper`, or a credential, login or home variable in an `env` block:
+/// [`accounts::ProcessLogin::with_settings`]).
+#[must_use]
+pub fn settings_admit(settings: &[(String, Source)]) -> bool {
+    accounts::ProcessLogin::of_env([])
+        .with_settings(settings)
+        .stored_login
+        && settings_quiet(settings)
+}
+
+/// [`settings_admit`]'s quiet half: every document of the chain read, and none sets a
+/// statusLine of its own or turns hooks off.
+#[must_use]
+pub fn settings_quiet(settings: &[(String, Source)]) -> bool {
+    settings.iter().all(|(_, source)| match source {
         Source::Missing => true,
         Source::Unreadable => false,
         Source::Text(text) => {
             netwatch::settings_of(text).is_some_and(|read| !read.status_line && !read.hooks_off)
         }
-    });
-    (stored && quiet).then_some(value)
+    })
+}
+
+/// Whether a process whose records are in `dir` runs under the `HOME` of the user whose home
+/// is `user_home`: a relaunch line of any other carries a `HOME` of its own (or is refused),
+/// and no such line is tapped (`relaunch::tap_of`).
+#[must_use]
+pub fn own_records(user_home: &Path, dir: &Path) -> bool {
+    super::upgrade_drive::same_dir(dir, &user_home.join(".claude"))
+}
+
+/// WHY NO RELAUNCH LINE WOULD CARRY THE TAP for a process aterm would otherwise tap, as its
+/// footer tells it (`profile::WeeklyGap::Unoffered`): [`stable_exe`], then `relaunch::tap_of`'s
+/// and [`gate`]'s refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Refusal {
+    /// No lasting aterm whose path the tap's command can name ([`stable_exe`]).
+    Exe,
+    /// A Claude home ([`accounts::HOME_ENV`]) or `HOME` of its own ([`own_records`]).
+    Home,
+    /// A login no relaunch line taps as the machine's own: neither the default one, the
+    /// roster's lone one, nor, where it has none, one the roster names ([`own_login`],
+    /// [`Armed::lone_for`]).
+    Login,
+    /// Its own `--settings` or `--bare` ([`line_refusal`]).
+    Line,
+    /// An option no relaunch line can repeat: one this build does not know, or one that
+    /// cannot resume (`--print`, `--no-session-persistence`, …; [`line_refusal`]).
+    Argv,
+    /// A statusLine of its own, hooks turned off, a settings document unread, or an
+    /// `apiKeyHelper` or credential in one ([`settings_admit`]).
+    Settings,
 }
 
 /// The freshness rule, per tab.

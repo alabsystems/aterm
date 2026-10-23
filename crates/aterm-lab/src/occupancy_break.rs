@@ -55,7 +55,7 @@ const TYPED_PAST_S: f64 = 120.0;
 
 const DECLARED_WITHIN_S: f64 = 60.0;
 
-/// The stub's tool script ([module docs](self)).
+/// The stub's tool script.
 #[must_use]
 pub fn script() -> J {
     let step = |pairs: Vec<(&str, J)>| {
@@ -175,7 +175,7 @@ fn titles_keyed(messages: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// THE SCENARIO'S VERDICT on `r` ([module docs](self)).
+/// THE SCENARIO'S VERDICT on `r`: one line per shortfall found, none for a pass.
 #[must_use]
 pub fn judge(r: &Recording<'_>) -> Vec<String> {
     let mut fail = Vec::new();
@@ -299,7 +299,7 @@ pub fn judge(r: &Recording<'_>) -> Vec<String> {
     fail
 }
 
-/// THE RUN ([module docs](self)).
+/// THE RUN.
 ///
 /// # Errors
 /// Interrupted, or the lab refused the settings or the script.

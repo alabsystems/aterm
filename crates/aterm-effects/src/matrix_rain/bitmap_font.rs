@@ -22,7 +22,7 @@
 ///
 /// Each entry is `(code point, 8 rows)`; row 0 is the top scanline and bit 0
 /// of a row is its leftmost pixel, the orientation
-/// [`super::rom::author_material_glyph`] expands from.
+/// `super::rom::author_material_glyph` expands from.
 static GLYPHS: [(u32, [u8; 8]); 499] = [
     (0x0021, [0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00]),
     (0x0022, [0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),

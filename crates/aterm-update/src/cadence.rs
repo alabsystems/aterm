@@ -178,7 +178,7 @@ impl Cadence {
         Some(remaining.max(HOLD_FLOOR).min(self.cap()))
     }
 
-    /// The ceiling on [`Self::nominal`]: `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)`.
+    /// The ceiling on [`Self::nominal_at`]: `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)`.
     fn cap(&self) -> Duration {
         MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
     }
@@ -195,7 +195,7 @@ impl Cadence {
         self.nominal_at(Instant::now())
     }
 
-    /// Compute [`Self::nominal`] at an injected `now`.
+    /// Compute `Self::nominal` at an injected `now`.
     pub(crate) fn nominal_at(&self, now: Instant) -> Duration {
         if let Some(held) = self.hold_remaining(now) {
             return held;

@@ -259,7 +259,8 @@ impl KittySing {
         self.handover_from = None;
     }
 
-    /// Song signature of the held character, or [`NEUTRAL_SIGNATURE`] when nothing is held.
+    /// Song signature of the fired celebration, else of the held character, else
+    /// [`NEUTRAL_SIGNATURE`].
     #[inline]
     #[must_use]
     pub const fn signature(&self) -> u32 {

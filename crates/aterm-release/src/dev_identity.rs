@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-signed "aterm dev" code-signing identity `ship dev-app` signs with (`ship dev-app identity` makes it), so a dev bundle's macOS privacy grants survive a rebuild: tccd keys a grant to the code's designated requirement, an ad-hoc one is a bare `cdhash` (the exact bytes), and a certificate-backed one names `identifier "com.aterm.aterm.dev" and certificate leaf = H"<sha1>"`, no bytes (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.1 and S6 have the measurements).
+//! Self-signed `aterm dev` code-signing identity for `ship dev-app`.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -13,29 +13,22 @@ use aterm_uds::spawnfd::Command;
 
 use crate::dev_app::{DEV_BUNDLE_ID, DEV_DISPLAY_NAME};
 
-/// A tool argument: a word, a path, a secret held as a `String`.
 type Arg<'a> = &'a dyn AsRef<OsStr>;
 
 /// The identity's certificate common name, and the name codesign finds it by.
 pub const NAME: &str = "aterm dev";
 
-/// How long the certificate lasts; codesign refuses it after, and `--remove` then a
-/// fresh `identity` makes another.
 const DAYS: &str = "3650";
 
 /// The one hang detector every tool call runs under: an honest call answers in well under a second.
 pub const WAIT: Duration = Duration::from_secs(60);
 
-/// A begun keychain is deleted under this shorter bound once the service stopped
-/// answering: it will likely not answer this either.
 const CLEANUP_WAIT: Duration = Duration::from_secs(10);
 
 const OPENSSL: &str = aterm_uds::os_path!("openssl");
 const SECURITY: &str = aterm_uds::os_path!("security");
 pub const CODESIGN: &str = aterm_uds::os_path!("codesign");
 
-/// The basenames macOS gives the keychains this module never touches, compared
-/// case-folded (a Mac volume folds case unless made otherwise).
 const PROTECTED_BASENAMES: [&str; 3] = ["login.keychain-db", "login.keychain", "System.keychain"];
 
 /// Where the identity lives unless `--keychain` names another file.
@@ -44,7 +37,7 @@ pub fn default_keychain(home: &Path) -> PathBuf {
     home.join("Library/Keychains/aterm-dev.keychain-db")
 }
 
-/// How a tool child runs: [`Bounded`] in the product, a scripted stand-in in tests.
+/// How a tool child runs ([`Bounded`]).
 pub trait Run {
     /// `cmd`'s output, if it finishes within `wait`.
     /// # Errors
@@ -52,7 +45,7 @@ pub trait Run {
     fn run(&self, cmd: &mut Command, wait: Duration) -> Result<Output, RunError>;
 }
 
-/// [`aterm_uds::deadline::output_until`]: the child leads its own group, killed (`SIGKILL`) at the deadline.
+/// [`aterm_uds::deadline::output_until`].
 pub struct Bounded;
 
 impl Run for Bounded {
@@ -76,8 +69,7 @@ impl From<String> for Stop {
     }
 }
 
-/// The one line a service that did not answer is reported in; `state` says what the
-/// run left behind.
+/// One-line report for a service that did not answer.
 fn unanswered(state: &str) -> String {
     format!(
         "macOS's keychain service did not answer within {} s (trustd/securityd); {state} — \
@@ -86,7 +78,6 @@ fn unanswered(state: &str) -> String {
     )
 }
 
-/// Every quoted path in `security`'s keychain listings, one per line.
 fn unquote_paths(text: &str) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|line| {
@@ -98,8 +89,7 @@ fn unquote_paths(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Every SHA-1 of an identity named exactly [`NAME`] in `find-identity -p codesigning`
-/// output (`  1) <40 hex> "aterm dev"`), in order; "aterm dev 2" is another name.
+/// Every SHA-1 of an identity named exactly [`NAME`] in `find-identity -p codesigning` output.
 fn identity_hashes(listing: &str) -> Vec<String> {
     let quoted = format!("\"{NAME}\"");
     listing
@@ -119,8 +109,6 @@ fn identity_hashes(listing: &str) -> Vec<String> {
         .collect()
 }
 
-/// The search list to write so `keychain` is on it: `None` when it is already there,
-/// else every entry read back, in order, with `keychain` last.
 fn search_list_with(current: &[PathBuf], keychain: &Path) -> Result<Option<Vec<PathBuf>>, String> {
     if current.iter().any(|entry| entry == keychain) {
         return Ok(None);
@@ -137,8 +125,6 @@ fn search_list_with(current: &[PathBuf], keychain: &Path) -> Result<Option<Vec<P
     Ok(Some(list))
 }
 
-/// `path` with a symlink in its LAST component followed, link by link (a relative
-/// target read from the link's own directory).
 fn follow(path: &Path) -> Option<PathBuf> {
     let mut path = path.to_path_buf();
     for _ in 0..=32 {
@@ -157,8 +143,6 @@ fn follow(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `path` with its directory resolved (`.`, `..`, symlinked directories) when that
-/// directory exists, else as given.
 fn canon(path: &Path) -> PathBuf {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return path.to_path_buf();
@@ -171,8 +155,6 @@ fn canon(path: &Path) -> PathBuf {
     std::fs::canonicalize(dir).map_or_else(|_| path.to_path_buf(), |dir| dir.join(name))
 }
 
-/// The file `path` names, as (device, inode), a symlink followed: a hard link has no
-/// other tell.
 fn file_id(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
@@ -190,7 +172,7 @@ fn folded(path: &Path) -> String {
     path.to_string_lossy().to_ascii_lowercase()
 }
 
-/// Whether `path` is a login or default keychain, every compare case-folded: by its basename or the one a symlink in its last component names, by the path `named` (what `security` answers for the login and default keychains) holds, or as the same file as one of those.
+/// Whether `path` is a login or default keychain, every compare case-folded.
 #[must_use]
 pub fn protected(path: &Path, named: &[PathBuf]) -> bool {
     let Some(real) = follow(path) else {
@@ -215,14 +197,12 @@ pub fn protected(path: &Path, named: &[PathBuf]) -> bool {
     })
 }
 
-/// One keychain file and the way its tools are run.
 struct Keychain<'a> {
     path: &'a Path,
     run: &'a dyn Run,
 }
 
 impl Keychain<'_> {
-    /// `program args…` under `wait`; a status that failed is the caller's to judge.
     fn call(&self, program: &str, args: &[Arg<'_>], wait: Duration) -> Result<Output, Stop> {
         let mut cmd = aterm_uds::spawnfd::command(program);
         cmd.args(args.iter().map(|a| a.as_ref()));
@@ -237,7 +217,6 @@ impl Keychain<'_> {
         self.call(SECURITY, args, WAIT)
     }
 
-    /// `security args…`, which must succeed; `what` names it in the refusal.
     fn security_ok(&self, args: &[Arg<'_>], what: &str) -> Result<Output, Stop> {
         let out = self.security(args)?;
         if out.status.success() {
@@ -251,8 +230,6 @@ impl Keychain<'_> {
         }
     }
 
-    /// The login and default keychains, as `security` names them in the user domain and
-    /// the default one (one of the two can answer nothing).
     fn named_keychains(&self) -> Result<Vec<PathBuf>, Stop> {
         let mut named = Vec::new();
         for args in [
@@ -268,8 +245,7 @@ impl Keychain<'_> {
         Ok(named)
     }
 
-    /// Refused when this is a login or default keychain ([`protected`]), before any
-    /// lock, open, create or delete.
+    /// Refused when this is a login or default keychain ([`protected`]).
     fn refuse_protected(&self) -> Result<(), Stop> {
         if protected(self.path, &self.named_keychains()?) {
             return Err(Stop::Refused(format!(
@@ -287,8 +263,6 @@ impl Keychain<'_> {
         Ok(out.status.success())
     }
 
-    /// Lock, then open with the empty password: the ownership proof, and the cure for a
-    /// refused bare unlock.
     fn open_locked(&self) -> Result<(), Stop> {
         self.security(&[&"lock-keychain", &self.path])?;
         if self.unlocked_with_empty_password()? {
@@ -315,8 +289,7 @@ impl Keychain<'_> {
         Ok(unquote_paths(&String::from_utf8_lossy(&out.stdout)))
     }
 
-    /// Put this keychain on the user's search list, keeping every entry already there in
-    /// its order ([`search_list_with`]).
+    /// Put this keychain on the user's search list ([`search_list_with`]).
     fn ensure_on_search_list(&self) -> Result<(), Stop> {
         let Some(list) = search_list_with(&self.search_list()?, self.path)? else {
             return Ok(());
@@ -332,9 +305,10 @@ impl Keychain<'_> {
     }
 }
 
-/// Unlock the default identity's keychain for a build and return the identity's SHA-1 (what codesign signs with: unambiguous even if another keychain holds the name).
+/// Unlock the default identity's keychain for a build and return the identity's SHA-1.
 /// # Errors
-/// The keychain EXISTS and cannot be used now (foreign, protected, empty, off the search list, or its service did not answer), with the reason: a build stops on that rather than sign ad hoc and orphan the grants the identity keeps.
+/// The keychain exists and cannot be used now (foreign, protected, empty, off the search list, or
+/// its service did not answer), with the reason.
 pub fn arm(
     keychain: &Path,
     manage_search_list: bool,
@@ -378,9 +352,9 @@ pub fn arm(
     }
 }
 
-/// Make the "aterm dev" identity in `keychain` (idempotent), partition its key for codesign, put the keychain on the search list when `manage_search_list`, and prove it by signing a scratch bundle.
+/// Make the "aterm dev" identity in `keychain`.
 /// # Errors
-/// Any refusal ([`protected`], not ours, a tool that failed), or the service did not answer — said in one line.
+/// Refusal ([`protected`], not ours, a tool that failed), or the service did not answer.
 pub fn create(keychain: &Path, manage_search_list: bool, run: &dyn Run) -> Result<(), String> {
     let k = Keychain {
         path: keychain,
@@ -394,7 +368,6 @@ pub fn create(keychain: &Path, manage_search_list: bool, run: &dyn Run) -> Resul
     }
 }
 
-/// How far a create run got, for what a service that stopped answering leaves behind.
 enum Progress {
     Untouched,
     /// The keychain file was made by this run and holds no usable identity yet.
@@ -404,8 +377,6 @@ enum Progress {
 }
 
 impl Progress {
-    /// What the run left, after deleting a begun keychain (bounded shorter; by hand when
-    /// even that does not answer, which can leave a search-list entry).
     fn after_unanswered(&self, k: &Keychain<'_>) -> String {
         let shown = k.path.display();
         match self {
@@ -439,7 +410,6 @@ fn create_steps(
 ) -> Result<(), Stop> {
     k.refuse_protected()?;
     if k.path.is_file() {
-        // An existing keychain is ours only if it opens with the empty password.
         k.open_locked()?;
     } else {
         println!(
@@ -518,8 +488,7 @@ fn create_steps(
     self_check(k, &hash, scratch.path())
 }
 
-/// A certificate request config: RSA leaf, CN [`NAME`], code signing only, every
-/// extension critical; a config section works on LibreSSL and OpenSSL alike.
+/// A certificate request config: RSA leaf ([`NAME`]).
 fn request_config() -> String {
     format!(
         "[req]\ndistinguished_name = dn\nx509_extensions = codesign\nprompt = no\n\
@@ -530,8 +499,6 @@ fn request_config() -> String {
     )
 }
 
-/// Generate the key and self-signed certificate in `dir` (private) and wrap them in a
-/// PKCS#12 under a one-shot passphrase: `(p12 path, passphrase)`.
 fn generate(k: &Keychain<'_>, dir: &Path) -> Result<(PathBuf, String), Stop> {
     if !Path::new(OPENSSL).is_file() {
         return Err(Stop::Refused(format!(
@@ -607,8 +574,6 @@ fn generate(k: &Keychain<'_>, dir: &Path) -> Result<(PathBuf, String), Stop> {
     Ok((p12, password))
 }
 
-/// Sign a scratch bundle with the dev bundle id by hash, as `ship dev-app` signs, and
-/// read it back: it must verify `--strict` and its requirement must name THIS leaf.
 fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
     let app = dir.join("probe.app");
     let macos = app.join("Contents/MacOS");
@@ -667,8 +632,7 @@ fn self_check(k: &Keychain<'_>, hash: &str, dir: &Path) -> Result<(), Stop> {
     Ok(())
 }
 
-/// Whether `codesign -d -r-` output's designated requirement is identity-based and pins
-/// the leaf `hash` (`certificate leaf = H"<hash>"`).
+/// Whether `codesign -d -r-` output pins the leaf `hash`.
 fn names_leaf(codesign_output: &str, hash: &str) -> bool {
     let leaf = format!("h\"{}\"", hash.to_ascii_lowercase());
     crate::sign::classify_dr(codesign_output) == crate::sign::DrClass::Identity
@@ -679,7 +643,7 @@ fn names_leaf(codesign_output: &str, hash: &str) -> bool {
         })
 }
 
-/// Delete `keychain` and its identity, only when it opens with the empty password; no keychain is nothing to do.
+/// Delete `keychain` and its identity, only when it opens with the empty password.
 /// # Errors
 /// Refused ([`protected`], not ours), or the service did not answer.
 pub fn remove(keychain: &Path, run: &dyn Run) -> Result<(), String> {
@@ -720,12 +684,9 @@ pub fn remove(keychain: &Path, run: &dyn Run) -> Result<(), String> {
     }
 }
 
-/// A 0700 scratch directory, removed with everything in it on drop: it holds the
-/// private key and its PKCS#12 only until `security import` has them.
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
-    /// A fresh directory: a name a dead process of the same pid left is passed over.
     fn create() -> Result<Self, Stop> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut builder = std::fs::DirBuilder::new();
@@ -759,7 +720,7 @@ impl Drop for PrivateDir {
     }
 }
 
-/// A stand-in for the tools [`Run`] starts: a small model of macOS's keychains (files, passwords, lock state, identities, the user's search list) behind `security`, and scripted `openssl`, `codesign`, `lsregister` and `--version` answers.
+/// A stand-in for the tools [`Run`] starts.
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
@@ -1012,8 +973,6 @@ mod tests {
         (dir, path)
     }
 
-    /// The (un)lock calls a run made, in order: `unlock`/`lock` and the password an
-    /// unlock gave.
     fn lock_calls(fake: &Fake) -> Vec<String> {
         fake.0
             .borrow()
@@ -1051,9 +1010,6 @@ mod tests {
         assert!(fake.0.borrow().log.is_empty());
     }
 
-    /// Create makes one identity in a never-locking keychain whose key codesign may use
-    /// without a dialog; arming finds it, on the keychain as left and after each lock
-    /// (a bare unlock with the empty password opens it); a second create is a no-op.
     #[test]
     fn create_makes_one_identity_that_arming_finds_after_a_lock() {
         let (_dir, root) = scratch();
@@ -1123,8 +1079,6 @@ mod tests {
         );
     }
 
-    /// Our own keychain can refuse a bare unlock; arming locks and reopens it once with
-    /// the empty password and carries on.
     #[test]
     fn a_refused_bare_unlock_is_healed_by_lock_and_reopen() {
         let (_dir, root) = scratch();
@@ -1151,9 +1105,6 @@ mod tests {
         assert!(!fake.0.borrow().keychains[&k].locked, "left open");
     }
 
-    /// A keychain with a password is not ours: arming refuses it (present, unusable),
-    /// create imports nothing into it, and remove leaves it — each having locked it to
-    /// prove the password, and said so.
     #[test]
     fn a_keychain_that_is_not_ours_is_refused_by_every_mode() {
         let (_dir, root) = scratch();
@@ -1202,9 +1153,6 @@ mod tests {
         assert!(fake.calls("security", "delete-keychain").is_empty());
     }
 
-    /// A keychain wearing a protected name is refused by every mode BEFORE anything locks,
-    /// opens, creates or deletes it — as named, through a link, in another case — and a
-    /// login name is refused by create even where no file is yet.
     #[test]
     fn protected_keychains_are_refused_before_anything_touches_them() {
         let (_dir, root) = scratch();
@@ -1254,10 +1202,6 @@ mod tests {
         }
     }
 
-    /// The guard's other half: the file `security` names for the login or default
-    /// keychain, seen through a hard link, a symlink, a relative chain, `..` and another
-    /// case — and, with no file there, through another case and a dangling link — but
-    /// never in a sibling.
     #[test]
     fn the_guard_sees_one_keychain_through_every_spelling() {
         let (_dir, g) = scratch();
@@ -1291,8 +1235,6 @@ mod tests {
         assert!(!protected(&g.join("aterm-dev.keychain-db"), &named));
     }
 
-    /// The search list is re-issued in order with the keychain last, and an empty read
-    /// is refused rather than written back as a list of one (which would drop login).
     #[test]
     fn the_search_list_is_rewritten_in_order_and_never_from_an_empty_read() {
         let k = Path::new("/k/aterm-dev.keychain-db");
@@ -1337,8 +1279,6 @@ mod tests {
         assert_eq!(rewrites(&fake).len(), 1);
     }
 
-    /// On the default keychain create ends on the search list and proves the identity
-    /// by signing a scratch bundle; a requirement that does not name its leaf fails.
     #[test]
     fn create_on_the_search_list_signs_its_self_check_with_the_new_leaf() {
         let (_dir, root) = scratch();
@@ -1374,8 +1314,6 @@ mod tests {
         assert!(!names_leaf(&anchored("certificate root"), &leaf));
     }
 
-    /// A service that stops answering stops the run with one line: arming says nothing
-    /// was changed, and a create deletes the keychain it had begun.
     #[test]
     fn a_service_that_does_not_answer_stops_in_one_line() {
         let (_dir, root) = scratch();

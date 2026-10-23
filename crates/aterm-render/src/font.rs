@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! First-party [`Font`] face backed by `aterm-font` and
+//! First-party [`Font`](crate::font::Font) face backed by `aterm-font` and
 //! [`crate::variation::varied_glyph_raster_with_face`] ([`crate::variation`], [`crate::raster`]).
 //!
-//! Exposes [`Font::from_bytes`], [`Font::from_shared_slice`], [`Font::from_shared_vec`],
-//! [`Font::rasterize`], [`Font::rasterize_indexed`], [`Font::lookup_glyph_index`],
-//! [`Font::unicode_glyph_index`], [`Font::horizontal_line_metrics`], [`Font::horizontal_kern`],
-//! and [`Font::metrics`] alongside [`Metrics`], [`LineMetrics`], and [`FontSettings`].
+//! Exposes [`Font::from_bytes`](crate::font::Font::from_bytes), [`Font::from_shared_slice`](crate::font::Font::from_shared_slice), [`Font::from_shared_vec`](crate::font::Font::from_shared_vec),
+//! [`Font::rasterize`](crate::font::Font::rasterize), [`Font::rasterize_indexed`](crate::font::Font::rasterize_indexed), [`Font::lookup_glyph_index`](crate::font::Font::lookup_glyph_index),
+//! [`Font::unicode_glyph_index`](crate::font::Font::unicode_glyph_index), [`Font::horizontal_line_metrics`](crate::font::Font::horizontal_line_metrics), [`Font::horizontal_kern`](crate::font::Font::horizontal_kern),
+//! and [`Font::metrics`](crate::font::Font::metrics) alongside [`Metrics`](crate::font::Metrics), [`LineMetrics`](crate::font::LineMetrics), and [`FontSettings`](crate::font::FontSettings).
 
 use aterm_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;

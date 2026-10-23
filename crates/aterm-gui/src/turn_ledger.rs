@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The per-session TURN LEDGER: a bounded, drop-oldest ring of one record per completed [`crate::control_session::cmd_turn`] exchange (a `turn settle=submitted`, answered at its verified submit, is `status=pressed`), and per text the window harness typed with `send` and submitted with `key enter` ([`crate::control_session::ledger_typed_input`], `status=pressed`).
+//! The per-session TURN LEDGER: a bounded, drop-oldest ring of one record per completed `crate::control::control_session::cmd_turn` exchange (a `turn settle=submitted`, answered at its verified submit, is `status=pressed`), and per text the window harness typed with `send` and submitted with `key enter` (`crate::control::control_session::ledger_typed_input`, `status=pressed`).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub(crate) struct TurnRecord {
     pub carried: bool,
 }
 
-/// WHO TYPED A TURN, as `history` prints it (`by=<word>`): the connection's own identity, the one the exits ledger's `by=` names ([`crate::control_session::caller_actor`]), with one refinement only the turn can make — an owner-token turn typed under this process's window harness's hand is the harness's ([`crate::control_session::typed_by`]).
+/// WHO TYPED A TURN, as `history` prints it (`by=<word>`): the connection's own identity, the one the exits ledger's `by=` names (`crate::control::control_session::caller_actor`), with one refinement only the turn can make — an owner-token turn typed under this process's window harness's hand is the harness's (`crate::control::control_session::typed_by`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TurnBy {
     /// This process's window harness (`by=harness`): an owner-token turn typed under the drive lease its supervisor loops take a tab by ([`crate::harness_host::holder`]), held over the turn's own connection — the hand the presence band reads as aterm's own (ruling 313), and the one every line the upgrade and relaunch lanes type goes under.
@@ -114,7 +114,7 @@ impl std::fmt::Display for ArchMark {
 /// The [`TurnRecord::status`] of a text the window harness typed with `send` and submitted with `key enter` ([`TurnLedger::typed`]), and of a `turn settle=submitted` whose submit was verified: the Enter was written, and no settle was awaited after it.
 pub(crate) const STATUS_PRESSED: &str = "pressed";
 
-/// A TEXT THE WINDOW HARNESS TYPED AND HAS NOT SUBMITTED: its `send` under its hand, kept for the Enter its connection presses next ([`crate::control_session::ledger_typed_input`]).
+/// A TEXT THE WINDOW HARNESS TYPED AND HAS NOT SUBMITTED: its `send` under its hand, kept for the Enter its connection presses next (`crate::control::control_session::ledger_typed_input`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Typed {
     /// The control connection that typed it: only its Enter submits it.

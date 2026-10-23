@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Retired landing hand-over ([`HIDDEN_VERB`], [`HandOver`], [`shim_command`], [`sweep`]).
+//! Retired landing hand-over ([`HIDDEN_VERB`](crate::landing::HIDDEN_VERB), [`HandOver`](crate::landing::HandOver), [`shim_command`](crate::landing::shim_command), [`sweep`](crate::landing::sweep)).
 
 use std::path::PathBuf;
 

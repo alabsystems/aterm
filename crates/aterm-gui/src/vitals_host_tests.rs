@@ -13,8 +13,8 @@ use aterm_vitals::jobs::{Consumer, Demand, JobRow, JobsView};
 use aterm_vitals::model::Resource;
 use aterm_vitals::words::{self, Locale, Platform};
 
-/// The production admission uses the table without touching the tab's path.
 #[test]
+#[cfg(unix)]
 fn volume_reads_use_only_complete_local_mount_roots() {
     use aterm_sysprobe::volumes::{Mount, Table};
     let mount = |on: &str, local, automounted, fstype: &str| Mount {
@@ -79,9 +79,6 @@ fn volume_reads_use_only_complete_local_mount_roots() {
     );
 }
 
-/// Linux's and Windows' readings reach the model: shared memory counts
-/// as in use, a class the OS does not report adds nothing, and commit
-/// keeps whether its limit is enforced.
 #[test]
 fn readings_of_every_os_map_to_the_models_classes() {
     let linux = aterm_sysprobe::MemoryDetail {
@@ -140,8 +137,6 @@ fn readings_of_every_os_map_to_the_models_classes() {
     assert_eq!(gpu_sample(gpu(Some(37), None)).device_pct, Some(37));
 }
 
-/// The GPU's memory, resets and unit figures, every link's counters and
-/// kind, and the process limits reach the model as read.
 #[test]
 fn the_new_readings_reach_the_model() {
     let g = gpu_sample(aterm_sysprobe::GpuReading {
@@ -240,9 +235,6 @@ fn the_new_readings_reach_the_model() {
     );
 }
 
-/// Two full readings give this process a scope and the machine its cores,
-/// with the clocks, the load, the process counts and limits and the disk
-/// facts read.
 #[test]
 fn two_readings_give_this_process_a_scope_and_the_machine_its_cores() {
     let mut reader = Reader::new(Arc::default());
@@ -332,8 +324,6 @@ fn a_full_reading_attributes_the_slot_holders_and_a_hidden_one_does_not() {
     assert_eq!(hidden.slot_tabs, None);
 }
 
-/// The production producer retains its pending messages while a platform
-/// read is busy.
 #[test]
 fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -375,9 +365,6 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     assert!(host.tried, "no reader is restarted after disconnect");
 }
 
-/// v2 §5.3: a deck every window of which is hidden is read every ten
-/// seconds, machine counters only, lens or none; in view it is read at the
-/// focused, background or lens cadence; nothing draws it, nothing is read.
 #[test]
 fn hidden_decks_read_the_machine_every_ten_seconds() {
     assert_eq!(Audience::of(false, true, true), Audience::Hidden);
@@ -427,9 +414,6 @@ fn hidden_decks_read_the_machine_every_ten_seconds() {
     );
 }
 
-/// v2 §8.2: the peaks go to the JSON file and come back equal; they are
-/// written at most every ten minutes while they change, and at once when
-/// the thread stops.
 #[test]
 fn peaks_round_trip_through_the_json_file() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
@@ -480,7 +464,6 @@ fn peaks_round_trip_through_the_json_file() {
     assert_eq!(PeakFile::open(None, t0).1, Peaks::default());
 }
 
-/// A probe thread's stand-in: each reading moves the peaks to `peaks`.
 struct Moves {
     vitals: aterm_vitals::Vitals,
     peaks: Peaks,
@@ -506,9 +489,6 @@ impl Source for Moves {
     }
 }
 
-/// v2 §8.2: the quit stops the probe thread, which writes the peaks that
-/// moved since the file was read, though ten minutes have not passed (the
-/// App is never dropped, so the quit is the only stop it gets).
 #[test]
 fn the_quit_writes_the_peaks_that_moved() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
@@ -621,9 +601,6 @@ fn footer(session: Option<&str>, usage: Option<UsageFacts>) -> FooterFacts {
     }
 }
 
-/// v2 §8.3: each agent session's totals reach the model once, whichever tabs
-/// show it, summed over every model, with what its fold left unread and
-/// whether it was complete.
 #[test]
 fn token_rows_are_one_per_session() {
     let tabs = [
@@ -675,8 +652,6 @@ fn token_rows_are_one_per_session() {
     assert_eq!(mono_ms_of(read, epoch), -1_500);
 }
 
-/// Session `session`'s Claude Code footer: agent session `id` with
-/// `output` tokens and `plan`, read at `read`.
 fn publish(app: &crate::App, session: u64, id: &str, plan: Option<PlanUsage>, read: Instant) {
     let entry = app.pool.get(session).expect("session");
     let mut tl = entry
@@ -694,10 +669,6 @@ fn publish(app: &crate::App, session: u64, id: &str, plan: Option<PlanUsage>, re
     assert_eq!(tl.claude_footer_read_at(), Some(read));
 }
 
-/// v2 §8.1, §8.4: token rows come from every pane of every tab, a pane
-/// without the focus too, each keyed to the tab that holds it and carrying
-/// when its footer last read it; the plan is the front tab's, and the front
-/// tab is the frontmost window's whether or not aterm has the focus.
 #[test]
 fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     let mut app = crate::App::headless_for_test();
@@ -755,9 +726,6 @@ fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     assert_eq!((front.used_x10, front.account), (610, AccountIx(1)));
 }
 
-/// v2 §8.4: the front tab's plan is a dated fact naming its binding window,
-/// its share, when it was read (ms) and its account's number among the tabs'
-/// accounts, while the reading is current.
 #[test]
 fn the_front_tabs_plan_is_a_dated_fact_while_current() {
     let now = 1_792_050_000;
@@ -797,8 +765,6 @@ fn the_front_tabs_plan_is_a_dated_fact_while_current() {
 
 const GB: u64 = 1_000_000_000;
 
-/// A board whose watch judged the home volume low, with a stuck session,
-/// a freed tally and a pass's hog, and the home volume's key.
 fn watched_board() -> (Shelf, VolumeKey) {
     use aterm_agent::harness::disk::{Hog as PassHog, Thresholds};
     let key = VolumeKey::Container("disk3".to_owned());
@@ -855,9 +821,6 @@ fn watched_board() -> (Shelf, VolumeKey) {
     (shelf, key)
 }
 
-/// T-G13, the host's part: with the harness on (the board is watched), the
-/// board's facts reach the model in its own types (the level, the lines, the
-/// stuck count, today's tally, the pass's hogs under `~`, times in ms).
 #[test]
 fn the_disk_row_with_the_harness_off() {
     let (shelf, key) = watched_board();
@@ -938,9 +901,6 @@ fn the_disk_row_with_the_harness_off() {
     assert!(words::disk_wrong(&snap, &loc).is_none(), "no Wrong? off");
 }
 
-/// v2 §7.4: the survey's rows reach the disk facts with the harness on or
-/// off, and whether a survey runs; the last pass's own rows win unless the
-/// survey is newer and whole.
 #[test]
 fn the_newest_rows_win_and_the_survey_works_with_the_harness_off() {
     let (shelf, key) = watched_board();
@@ -1002,8 +962,6 @@ fn the_newest_rows_win_and_the_survey_works_with_the_harness_off() {
     );
 }
 
-/// A test App with a reader in hand instead of the probe thread (none
-/// starts: a test App has no loop), posting to `board`.
 fn with_reader(app: &mut crate::App, board: &'static JobsBoard) -> Receiver<Msg> {
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     app.vitals.tx = Some(tx);
@@ -1012,8 +970,6 @@ fn with_reader(app: &mut crate::App, board: &'static JobsBoard) -> Receiver<Msg>
     rx
 }
 
-/// The first reading asked since the last look (a layout sent alone, for
-/// `sys`, is no reading); `why` names the one expected.
 fn read_req(rx: &Receiver<Msg>, why: &str) -> Box<Request> {
     rx.try_iter()
         .find_map(|m| match m {
@@ -1023,14 +979,10 @@ fn read_req(rx: &Receiver<Msg>, why: &str) -> Box<Request> {
         .expect(why)
 }
 
-/// The readings asked since the last look (a layout sent alone, for `sys`,
-/// is no reading).
 fn asked(rx: &Receiver<Msg>) -> usize {
     rx.try_iter().filter(|m| matches!(m, Msg::Read(_))).count()
 }
 
-/// The probe thread's part: reading `seq` lands with a jobs view of
-/// `rows` whose engine asked `demand`.
 fn land(app: &crate::App, seq: u64, rows: Vec<JobRow>, demand: Demand) {
     let view = JobsView {
         rows,
@@ -1044,7 +996,6 @@ fn land(app: &crate::App, seq: u64, rows: Vec<JobRow>, demand: Demand) {
     }));
 }
 
-/// Tab 0's (the pool session's local id 0) session id.
 fn sid_of_tab0(app: &crate::App) -> String {
     let store = app.store.read().unwrap();
     store
@@ -1055,8 +1006,6 @@ fn sid_of_tab0(app: &crate::App) -> String {
         .to_owned()
 }
 
-/// I4's call: tab 0's agent's background call, suspect (capped: an
-/// unnamed wait) and at no progress for 31 minutes, waiting in pid 27098.
 fn hung_call() -> JobRow {
     JobRow {
         standing: Some(aterm_vitals::jobs::Standing::Capped),
@@ -1212,10 +1161,6 @@ fn a_late_machine_snapshot_does_not_duplicate_a_pending_engine_sweep() {
     assert_eq!(asked(&rx), 0, "the engine's full sweep is already pending");
 }
 
-/// READINGS WITH NO WINDOW (the hung-call design's D1): no window shows
-/// the bars, so nothing is read and nothing is due, until the disk
-/// watch's look, which asks for ONE reading and nothing more while it is
-/// read.
 #[test]
 fn with_no_window_the_disk_look_reads_once_and_the_board_names_the_hung_call() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1378,10 +1323,6 @@ fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
     assert_eq!(kinds(&rx), [false], "the engine's demand reads whole");
 }
 
-/// EDGES: with no window, output asks one whole reading at
-/// once and the next no sooner than the floor, whatever the held view says
-/// (a job may have started or ended); a window showing the bars clears the
-/// edge (its cadence reads).
 #[test]
 fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1409,11 +1350,6 @@ fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     assert_eq!(asked(&rx), 1, "output reads");
 }
 
-/// THE P2a PIECES WITH NO DECK AND NO PULL (§6.1 kind 3): output starts a
-/// job's first reading; while the view holds it live, the engine's cadence
-/// reads again with no output and no `sys` pull; the reading that sees it end
-/// hands its `exited` event to the session's timeline (`subscribe … events`
-/// pushes it as `EVENT … job exited`) and `status` says `job=none`.
 #[test]
 fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     use aterm_vitals::events::{Event, EventKind};
@@ -1478,7 +1414,6 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     let recorded: Vec<String> = {
         let tl = Arc::clone(&app.pool.get(0).expect("tab 0's session").ctx.timeline);
         let tl = tl.lock().unwrap();
-        // The view every reader reads: the writer's `row` mark.
         tl.view_since(None)
             .rows
             .iter()
@@ -1490,10 +1425,6 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
 }
 
-/// OUTPUT IS SERVED IN ITS OWN WAKE: with no window, the output wake's edge
-/// is asked right there, so it arms no deadline (left to the next turn, the
-/// loop's deadline at now fires a `system_vitals` timer wake for every write
-/// a program makes at rest).
 #[test]
 fn output_with_no_window_is_read_in_its_own_wake_and_arms_nothing() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1520,13 +1451,10 @@ fn drawn(seq: u64) -> crate::control::ScreenGen {
     crate::control::ScreenGen { epoch: 0, seq }
 }
 
-/// Session `0`'s program writes `bytes`, as its PTY reader feeds them.
 fn feed(app: &crate::App, bytes: &[u8]) {
     feed_tab(app, 0, bytes);
 }
 
-/// Session `tab`'s program writes `bytes`, as its PTY reader feeds them: the feed, then, under
-/// the same hold of the term lock, its count of a move ([`ScreenMoves::fed`]).
 fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
     let s = app.pool.get(tab).expect("the tab");
     let mut t = s.term.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1534,22 +1462,10 @@ fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
     s.ctx.screen_moves.fed(crate::control::screen_gen(&t));
 }
 
-/// Muse Code 0.10's write at rest, every ~9 s (`subscribe … bytes`,
-/// docs/measured/vitals-multi-tab-2026-10-22.md): colours reset and the
-/// cursor put back where it was.
 const MUSE_RESET: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[5;3H";
 
-/// Gemini CLI's write at rest, once a minute: an OSC 11 background-colour
-/// query.
 const GEMINI_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
-/// A WRITE THAT MOVES NO CELL IS NO EDGE (design §6.1, "What brings job
-/// demand back"; docs/measured/vitals-multi-tab-2026-10-22.md): with no
-/// window, an idle program's colour reset or colour query asks no reading
-/// and arms nothing, even inside the floor of another edge's reading, where
-/// main put it off to the floor on a `system_vitals` timer (with three Muse
-/// Code tabs at rest, one tab's reset landed inside another's floor 4 times
-/// in 40 s).
 #[test]
 fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1592,20 +1508,6 @@ fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
     );
 }
 
-/// A WRITE WHOSE WAKE MEETS THE TERM LOCK HELD IS JUDGED BY WHAT THE READER FED
-/// (`docs/measured/vitals-3-2026-10-22.md`, V1). The output wake reads the reader's count of
-/// moving feeds ([`ScreenMoves`]), never the term lock a control worker's `text` or `status`, or
-/// a watcher the same burst rang, may hold as the wake runs. Measured on main `166b5debe6` in the
-/// forever lab's 16 Muse Code tabs at rest with `text` read in a loop on each: the reads alone
-/// armed nothing (`v3b-muse`, the 42 s before a disk look's reading), because a parked tab's write
-/// goes to the park check. They lengthen a burst a disk look's reading began (the tty word lost,
-/// the tab unparked): on main that burst kept arming through the whole 99 s sample (`v3c-muse`,
-/// `system_vitals` 261 armed); with this rule it ended 19 s after its disk look, 52 armed, and the
-/// rest of the sample armed nothing (`v3a-muse`). Muse Code's colour reset and Gemini CLI's
-/// query, each met with the lock held inside
-/// another reading's floor, owe nothing and arm nothing. NEGATIVE CONTROL: a write that moved a
-/// cell, met with the lock held, is an edge owed at the floor. MUTANT caught: the wake reading
-/// the generation under `try_lock` and counting a held lock as moved.
 #[test]
 fn a_write_whose_wake_meets_the_term_lock_held_is_judged_by_what_the_reader_fed() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1643,10 +1545,6 @@ fn a_write_whose_wake_meets_the_term_lock_held_is_judged_by_what_the_reader_fed(
     assert!(app.vitals_deadline().is_some(), "armed for the floor");
 }
 
-/// IDLE WRITES OF TWO TABS INSIDE EACH OTHER'S FLOOR ASK NOTHING
-/// (docs/measured/vitals-multi-tab-2026-10-22.md, the r10 shape): each
-/// session's screen is judged against its own last output wake, so one tab's
-/// colour reset compares with that tab's screen, not with the other tab's.
 #[test]
 fn idle_writes_of_two_tabs_inside_each_others_floor_ask_nothing() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1695,10 +1593,6 @@ fn idle_writes_of_two_tabs_inside_each_others_floor_ask_nothing() {
     assert_eq!(app.vitals.edge_at(moved), Some(base + JOBS_FLOOR));
 }
 
-/// OUTPUT FED AS THE PASS STARTS IS JUDGED IN THAT PASS (review 2026-10-22):
-/// [`crate::App::on_output_wake`] clears the session's output latch before it
-/// reads the screen's generation, so a chunk the reader fed before the clear
-/// (which posted no wake, the latch still set) is in the screen it judges.
 #[test]
 fn a_prompt_fed_before_the_latch_clears_is_read_in_that_pass() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1728,12 +1622,6 @@ fn a_prompt_fed_before_the_latch_clears_is_read_in_that_pass() {
     assert_eq!(asked(&rx), 1, "the prompt fed as the pass began: read");
 }
 
-/// THE KERNEL EDGE ([`ProcEdge`]): with no window, the loop
-/// arms the latch; a session's process event (a fork, an `exec`, an exit)
-/// posts the loop one wake, and the loop takes it as an edge even with the
-/// held view parked: one whole reading the engine must look at (`jobs_now`),
-/// where output alone misses a job forked after its echo or started with no
-/// output.
 #[test]
 fn a_process_event_with_no_window_asks_one_reading_the_engine_looks_at() {
     use std::sync::atomic::AtomicUsize;
@@ -1776,8 +1664,6 @@ fn a_process_event_with_no_window_asks_one_reading_the_engine_looks_at() {
     assert!(!app.vitals.proc_edge.heard(), "the bars read: disarmed");
 }
 
-/// A whole reading with no window (here the disk watch's look) is one the
-/// engine looks at.
 #[test]
 fn only_a_windowless_whole_reading_makes_the_engine_look() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1811,8 +1697,6 @@ impl JobAtRest {
         Self::starting(raw, |_| {})
     }
 
-    /// The failure seam runs only after custody is armed, before the
-    /// constructor hands that custody to its caller.
     fn starting(raw: bool, before_ready: impl FnOnce(&mut Self)) -> Self {
         use std::os::fd::{FromRawFd as _, OwnedFd};
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -1876,8 +1760,6 @@ impl JobAtRest {
             .find_map(|line| line.strip_prefix(name)?.parse().ok())
     }
 
-    /// Drain only immediately readable bytes; `eof` means read returned 0,
-    /// never that the helper merely exited or its output was quiet.
     fn drain(&mut self) -> std::io::Result<()> {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
@@ -1954,8 +1836,6 @@ impl JobAtRest {
         self.ended
     }
 
-    /// A test App whose sink borrows the master. Its session's own master
-    /// stays the stub's -1, so App's drop signals nothing.
     fn app(&self, board: &'static JobsBoard) -> (crate::App, Receiver<Msg>) {
         let sink = Arc::new(aterm_session::sink::SinkWriter::new(self.master()));
         let mut app = crate::App::headless_for_test_with_sink(sink);
@@ -2356,8 +2236,6 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
-    /// The engine's step over this machine's process table, as the probe
-    /// thread's [`Source`].
     struct Engine {
         vitals: aterm_vitals::Vitals,
         pass: crate::vitals_jobs::JobsPass,
@@ -2472,9 +2350,6 @@ fn a_park_holds_only_while_the_terminal_says_the_program_still_waits() {
     );
 }
 
-/// A PARK IS NAMED FROM ITS OWN TAB'S WORD ([`Parked::of`]), whatever order
-/// the request carried the words in, and only for a parked tab whose live
-/// jobs share one group.
 #[test]
 fn a_park_is_named_from_its_own_tabs_word() {
     use aterm_vitals::jobs::Verdict;
@@ -2655,9 +2530,6 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
 /// named its wait `unnamed` and asked the next reading in 2 s (`Demand::Fast`). That kept
 /// `system_vitals` armed and firing for as long as the race kept being won: 52 arms and 6 fires in
 /// 20 s, nothing else moving, on this branch before the word followed the reader's moving feeds.
-/// The write moves `latest_output_activity_ns` as any read does, and the word stands.
-/// NEGATIVE CONTROL: a write that draws voids it. MUTANT caught: the word read against the output
-/// stamp again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_write_that_moves_no_cell_leaves_the_word_standing() {
@@ -2735,9 +2607,6 @@ fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
     assert!(word.current(9).is_some(), "output before the read: its own");
 }
 
-/// A cold pull's unpublished first reading keeps its events: they ride the
-/// published one, first (the live check lost a job's `exited` this way
-/// before).
 #[test]
 fn a_cold_pulls_first_reading_hands_its_events_to_the_published_one() {
     use aterm_vitals::events::{Event, EventKind};
@@ -2775,10 +2644,6 @@ fn a_cold_pulls_first_reading_hands_its_events_to_the_published_one() {
     );
 }
 
-/// The hand-over keeps every job event until the loop takes it (a later
-/// snapshot does not drop an earlier one's), says when a verdict moved (a
-/// pull's reading then wakes the loop), and the loop numbers each session's
-/// events from 1.
 #[test]
 fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
     use aterm_vitals::events::{Event, EventKind};
@@ -2826,16 +2691,10 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
     );
 }
 
-/// A worker's pull through the workers' copy reaches the thread, which
-/// takes a whole reading (a hidden deck's machine-only request
-/// notwithstanding) and publishes it there; the quit takes the copy's sender
-/// back, so the thread hears the hang-up and ends within the bound (a copy
-/// still holding a sender would keep it blocked on its channel for good).
 #[test]
 fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     static COPY: std::sync::LazyLock<crate::sys_host::Shared> =
         std::sync::LazyLock::new(crate::sys_host::Shared::new);
-    /// Records whether each reading was whole, and made the engine look.
     struct Whole {
         vitals: aterm_vitals::Vitals,
         seen: Arc<Mutex<Vec<(bool, bool)>>>,
@@ -2938,8 +2797,6 @@ fn the_thermal_state_maps_onto_the_portable_levels() {
     assert_eq!(thermal_of(2, Some(true)).low_power, Some(true));
 }
 
-/// The reader's thermal probe is the inert arm under test: no unit test asks
-/// AppKit.
 #[test]
 fn the_test_reader_never_reads_the_thermal_state() {
     let mut reader = Reader::new(Arc::default());

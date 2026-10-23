@@ -47,7 +47,6 @@ fn info(title: &str) -> Message {
     Message::new(tags::SYSTEM, Severity::Info, title)
 }
 
-/// A live indeterminate row (the comet).
 fn busy(title: &str) -> Message {
     Message::new(tags::PACKAGES, Severity::Info, title)
         .in_flight()
@@ -60,7 +59,6 @@ fn glass_ids(c: &MessageCenter) -> Vec<MessageId> {
     c.on_glass().map(|l| l.id).collect()
 }
 
-/// A file's Posted line for `id`.
 fn posted(id: u64, unix_ms: u64, tag: Tag, title: &str) -> LogLine {
     LogLine::Posted(LogRecord::from_posted(
         mid(id),
@@ -69,7 +67,6 @@ fn posted(id: u64, unix_ms: u64, tag: Tag, title: &str) -> LogLine {
     ))
 }
 
-/// A file's Retired line for `id`.
 fn retired(id: u64, how: Retired, unix_ms: u64, title: &str) -> LogLine {
     LogLine::Retired {
         id: mid(id),
@@ -89,8 +86,6 @@ fn drained(c: &mut MessageCenter) -> Vec<LogLine> {
         .collect()
 }
 
-/// A row that leaves the glass without retiring is demoted, and its patience
-/// re-bases so it re-anchors on its return.
 #[test]
 fn a_hold_restate_keeps_a_demoted_rows_patience() {
     let now = t0();
@@ -134,8 +129,6 @@ fn a_hold_restate_keeps_a_demoted_rows_patience() {
     assert_eq!(glass_ids(&c), vec![a], "A returns when W folds");
 }
 
-/// The quiet shrink never cuts a Complete echo that outlasts `SHRINK_QUIET`
-/// and hides the row that survives it, nor restarts that row's hold.
 #[test]
 fn the_quiet_shrink_never_hides_the_row_beside_a_complete_echo() {
     let start = t0();
@@ -175,9 +168,6 @@ fn the_quiet_shrink_never_hides_the_row_beside_a_complete_echo() {
     }
 }
 
-/// `revision()` bumps on every observable change: a reveal that moves rows
-/// on and off the glass changes every `on_glass` the page projects, so it
-/// moves the revision.
 #[test]
 fn a_reveal_that_moves_the_glass_bumps_the_revision() {
     let start = t0();
@@ -212,10 +202,6 @@ fn a_reveal_that_moves_the_glass_bumps_the_revision() {
     );
 }
 
-/// The host's contract (`messages_host.rs` `App::seed_carried_messages`,
-/// `PARKED_PARENT_ID_RESERVE`): the parked parent keeps minting in
-/// `[next_id, next_id + reserve)` until Commit and this process mints above
-/// it.
 #[test]
 fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
     const RESERVE: u64 = 1000;
@@ -272,10 +258,6 @@ fn a_squatter_moved_by_the_seed_lands_above_the_parents_band() {
     );
 }
 
-/// `ReadQuery::select` returns records ascending by id, with `since=` the
-/// oldest ones above it, so a reader paging with the last id it saw never
-/// skips one: after a replay collision mints a fresh id above the file's
-/// top, paging one at a time from `since=2` still delivers 3, 4 and 5.
 #[test]
 fn paging_after_a_replay_collision_skips_no_record() {
     let mut log = MessageLog::empty();
@@ -310,10 +292,6 @@ fn paging_after_a_replay_collision_skips_no_record() {
     );
 }
 
-/// `merge_reloaded`: a record the ring holds that the boot read as `Stale`
-/// takes the ending the file has, one post one record; a collision-remapped
-/// record whose title changed when it retired does not come back as a second
-/// entry.
 #[test]
 fn a_remapped_record_retired_after_the_boot_merges_into_one() {
     let boot_lines = || {
@@ -357,9 +335,6 @@ fn a_remapped_record_retired_after_the_boot_merges_into_one() {
     );
 }
 
-/// A line cut short by a crash mid-append fails to decode instead of reading
-/// as a shorter record: a torn Posted line with the next append glued on
-/// never decodes as a record mixing the two.
 #[test]
 fn a_torn_line_glued_to_the_next_never_decodes() {
     let a = LogLine::Posted(LogRecord::from_posted(
@@ -384,10 +359,6 @@ fn a_torn_line_glued_to_the_next_never_decodes() {
     );
 }
 
-/// `replay_all` raises past every id in the file first, so a collision's
-/// fresh id is above the file's own and never renumbers a later record; one
-/// ceiling id in the file (a corrupt or hand-edited line) must not switch
-/// that off.
 #[test]
 fn a_ceiling_id_never_brings_back_the_renumbering_cascade() {
     let mut log = MessageLog::empty();
@@ -408,9 +379,6 @@ fn a_ceiling_id_never_brings_back_the_renumbering_cascade() {
     );
 }
 
-/// `LogLine::decode` brings every word back under the model's caps, so a
-/// hand-edited or hostile line cannot put in the ring what `post` would never
-/// admit: at most `MAX_ACTIONS` intents.
 #[test]
 fn a_decoded_record_offers_at_most_max_actions() {
     let mut rec = LogRecord::from_posted(mid(4), stamp(1), &info("x"));
@@ -435,10 +403,6 @@ fn a_decoded_record_offers_at_most_max_actions() {
     );
 }
 
-/// A carried wire row stays the wire's (`Origin::wire_owned`): a keyless
-/// wire row (`notice post … sev=warn` with no `key=`) carried across the
-/// handoff files its Retired line on the wire's shelf, beside its Posted
-/// line.
 #[test]
 fn a_keyless_wire_row_stays_the_wires_after_the_carry() {
     let now = t0();
@@ -482,9 +446,6 @@ fn a_keyless_wire_row_stays_the_wires_after_the_carry() {
     );
 }
 
-/// A row's duplicate count (the Retired line's `rep=N`, the page's `×N`)
-/// crosses the handoff: `carried()` drops echoes, the estimator, load and
-/// the motion epoch, not the count.
 #[test]
 fn a_rows_repeats_cross_the_handoff() {
     let now = t0();
@@ -506,9 +467,6 @@ fn a_rows_repeats_cross_the_handoff() {
     );
 }
 
-/// `messages` reads a live row's current severity, as the glass and the page
-/// do: a live row restated to Warn prints `sev=warn`, and the `sev=` floor
-/// selects it.
 #[test]
 fn messages_reads_a_live_rows_restated_severity() {
     let now = t0();
@@ -543,8 +501,6 @@ fn messages_reads_a_live_rows_restated_severity() {
     );
 }
 
-/// The title form runs on the stripped title, so an invisible character
-/// cannot hide a trailing period, with or without a space before it.
 #[test]
 fn an_invisible_tail_after_a_space_hides_no_period() {
     for line in [
@@ -562,9 +518,6 @@ fn an_invisible_tail_after_a_space_hides_no_period() {
     }
 }
 
-/// Whitespace on the wire is a space before the strip (as
-/// `a_tab_on_the_wire_is_a_space` pins), or the strip glues words and ` -- `
-/// never splits the detail off; U+2028/U+2029 included.
 #[test]
 fn a_line_separator_on_the_wire_is_a_space() {
     let parsed = NoticeRequest::parse("post script sev=warn Deploy\u{2028}failed -- a\u{2029}b");
@@ -575,8 +528,6 @@ fn a_line_separator_on_the_wire_is_a_space() {
     assert_eq!(p.detail, vec!["a b"]);
 }
 
-/// The grammar `<title>[ -- <detail>]`: a separator with an empty tail is no
-/// detail, never part of the title.
 #[test]
 fn a_separator_with_an_empty_tail_leaves_the_title() {
     let parsed = NoticeRequest::parse("post script sev=warn Deploy failed -- ");
@@ -593,8 +544,6 @@ fn a_separator_with_an_empty_tail_leaves_the_title() {
     assert!(p.stats.is_empty(), "{:?}", p.stats);
 }
 
-/// The wire's numbers are plain digits and its grammar edges are refusals:
-/// `parse_read_args` refuses a signed number.
 #[test]
 fn messages_refuses_a_signed_number() {
     assert_eq!(parse_read_args("+5"), Err(crate::wire::READ_USAGE));
@@ -611,10 +560,6 @@ fn band(msgs: &[Message], cols: usize) -> Presentation {
     c.presentation(cols, &char_width, None, Links::Painted)
 }
 
-/// What is gone at one width is gone at every narrower one, and the cells a
-/// shorter capsule frees never re-buy an excerpt a wider row gave up
-/// (`fit_fixed`): a label forced short because a sibling row went short does
-/// not hand its saved cells to the excerpt.
 #[test]
 fn a_forced_short_label_never_brings_the_excerpt_back() {
     let a = Message::new(
@@ -657,10 +602,6 @@ fn a_forced_short_label_never_brings_the_excerpt_back() {
     assert!(seen_whole && gone_at.is_some(), "the sweep saw both");
 }
 
-/// A row forced to the short time words pays the long width's room and the
-/// cells it saves buy nothing (`allocate_extras`): a busy row's forced short
-/// elapsed slot leaves its excerpt, stats and load slot exactly as its own
-/// layout has them.
 #[test]
 fn a_forced_short_elapsed_slot_spends_nothing() {
     let spec = RowSpec {
@@ -709,9 +650,6 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
     );
 }
 
-/// `keep_command`: when a `` Run `…` `` sentence's command cannot survive the
-/// cut whole, as much of the command as fits is kept, never its first token
-/// alone.
 #[test]
 fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
     let detail = "Run `x --flag-long-option-value-here` please";
@@ -724,8 +662,6 @@ fn a_run_sentence_keeps_as_much_of_its_command_as_fits() {
     assert_eq!(shaped, "Run `x --flag-long-\u{2026}");
 }
 
-/// A row restated to another mark retires under the mark it shows, written on
-/// its Retired line when it differs from the Posted line's.
 #[test]
 fn a_restated_mark_still_rides_the_retired_line() {
     let now = t0();
@@ -767,10 +703,6 @@ fn a_restated_mark_still_rides_the_retired_line() {
     assert_eq!(file.get(id).map(|r| r.severity), Some(Severity::Info));
 }
 
-/// The same across a seed: the parent restated its row Warn → Info, the
-/// successor's boot load holds the parent's Posted line (Warn), and the row
-/// the seed re-opens takes that line's mark as the one it was logged under,
-/// so its Retired line says Info.
 #[test]
 fn a_seeded_rows_restated_mark_rides_its_retired_line() {
     let now = t0();
@@ -820,10 +752,6 @@ fn a_seeded_rows_restated_mark_rides_its_retired_line() {
     );
 }
 
-/// `commit_rows` moves the revision when its own rebalance moves the glass
-/// though the count stands: a restate raises a queued row's severity (a
-/// restate never re-ranks), and the following commit puts it on the one-row
-/// glass.
 #[test]
 fn a_commit_that_moves_the_glass_bumps_the_revision() {
     let now = t0();
@@ -855,9 +783,6 @@ fn a_commit_that_moves_the_glass_bumps_the_revision() {
     );
 }
 
-/// A record the seed moved off a carried number (another writer's, under the
-/// parent's row's id) keeps its file id, so Commit's reload merges its ending
-/// into it once its words have changed: one post, one record.
 #[test]
 fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
     let other = || posted(4, 100, tags::TOOLCHAIN, "Updating ALab tools");
@@ -940,8 +865,6 @@ fn a_squatter_the_seed_moved_merges_its_ending_on_reload() {
     }
 }
 
-/// The late park: the parent posted its row (Warn) after the successor's boot
-/// load, restated it to Info and parked.
 #[test]
 fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     let now = t0();
@@ -992,9 +915,6 @@ fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     );
 }
 
-/// A count's patience is max(STALL_AFTER, COUNT_STALL_GAPS × its own mean gap
-/// between advances) and restarts when a held phase ends; the plateau is no
-/// part of the count's pace.
 #[test]
 fn a_held_plateau_never_inflates_the_counts_pace() {
     let base = t0();
@@ -1024,8 +944,6 @@ fn a_held_plateau_never_inflates_the_counts_pace() {
     assert_eq!(t.eta(at(136_000)), Eta::Stalled);
 }
 
-/// A live row withdrawn by a Fault is logged `… stopped` (by a Vanish
-/// `… ended`), with its live title as the first detail line.
 #[test]
 fn a_failed_rewrap_is_logged_stopped() {
     let now = t0();
@@ -1049,8 +967,6 @@ fn a_failed_rewrap_is_logged_stopped() {
     );
 }
 
-/// A paste row withdrawn because its session went away (a Vanish) is logged
-/// `Pasting ended`, not in its in-flight words.
 #[test]
 fn a_paste_whose_session_went_away_is_logged_ended() {
     let now = t0();
@@ -1074,7 +990,6 @@ fn a_paste_whose_session_went_away_is_logged_ended() {
     );
 }
 
-/// A page entry at `at_unix_ms`.
 fn view_at(at_unix_ms: u64) -> MessageView {
     MessageView {
         id: 1,
@@ -1096,10 +1011,6 @@ fn view_at(at_unix_ms: u64) -> MessageView {
     }
 }
 
-/// The page is sectioned by the reader's local day, and what a screen reader
-/// hears for a row agrees with its header: at UTC−7 on Tuesday 08:00, an
-/// entry of Sunday 20:00 (36 h ago) sits under `Sunday` and one of Friday
-/// 20:00 local (Saturday 03:00 UTC) under `Friday`.
 #[test]
 fn the_spoken_when_agrees_with_the_local_day_header() {
     let off: i64 = -25_200;
@@ -1122,8 +1033,6 @@ fn the_spoken_when_agrees_with_the_local_day_header() {
     );
 }
 
-/// `lines_words`: a figure that would round to ten of the tenths unit reads
-/// as the whole unit, so 9,950–9,999 lines read `10K`, never `10.0K`.
 #[test]
 fn a_count_that_rounds_to_ten_thousand_reads_10k() {
     assert_eq!(lines_words(9_949), "9.9K");
@@ -1132,7 +1041,6 @@ fn a_count_that_rounds_to_ten_thousand_reads_10k() {
     assert_eq!(rewrap_stats(9_960, 10_000), "10K of 10K lines");
 }
 
-/// The ring's and the replayed file's mark for `id`.
 fn marks(c: &mut MessageCenter, id: MessageId) -> ((Severity, Glyph), Option<(Severity, Glyph)>) {
     let ring = c.log().get(id).map(|r| (r.severity, r.glyph)).unwrap();
     let mut file = MessageLog::empty();
@@ -1140,9 +1048,6 @@ fn marks(c: &mut MessageCenter, id: MessageId) -> ((Severity, Glyph), Option<(Se
     (ring, file.get(id).map(|r| (r.severity, r.glyph)))
 }
 
-/// A row retires under the mark it shows, and the ring and the file agree: a
-/// stall entry restated Warn, then kept as an Info record (`keep_as_record`),
-/// reads Info in the ring (the page, `messages sev=`) as in the file.
 #[test]
 fn a_record_kept_under_its_first_mark_reads_it_in_the_ring() {
     let now = t0();
@@ -1177,8 +1082,6 @@ fn a_record_kept_under_its_first_mark_reads_it_in_the_ring() {
     assert_eq!(ring, info_mark, "the ring reads the mark the file does");
 }
 
-/// A restate to Info that also folds the row (`hold: LogOnly`) retires it
-/// under Info; the ring does not keep the Warn an earlier restate showed.
 #[test]
 fn a_row_restated_back_to_info_and_folded_reads_info_in_the_ring() {
     let now = t0();
@@ -1219,11 +1122,6 @@ fn a_row_restated_back_to_info_and_folded_reads_info_in_the_ring() {
     assert_eq!(ring, info_mark, "the ring reads the mark the file does");
 }
 
-/// The reload merge gives a Stale record the ending the file has for that
-/// record: of two records with one stamp, tag and title (the first folded,
-/// the second still open when aterm stopped), the successor's own post
-/// evicts the first from its full ring before Commit, and the merge must not
-/// hand the first's ending to the second.
 #[test]
 fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
     let lines = || {
@@ -1274,12 +1172,6 @@ fn the_reload_merge_never_hands_one_records_ending_to_its_twin() {
     );
 }
 
-/// A determinate row's count and its fill agree: the band floors a fill to
-/// its percent and `count_span` rounds each count's permille, so a fill
-/// measured finer than its count is held one permille under the percent the
-/// next count paints: `3 of 10 programs` at 45 % paints `39%`, not `4 of
-/// 10`'s `40%`; `9 of 10` never fills the bar; `1 of 3` stops at `65%`
-/// because `2 of 3` paints `66%` (667).
 #[test]
 fn a_measured_fill_never_paints_the_next_counts_percent() {
     let fill = |fill: u16, stats: &str, amount: bool| {
@@ -1316,9 +1208,6 @@ fn a_measured_fill_never_paints_the_next_counts_percent() {
     assert!(reached.is_empty(), "{reached:#?}");
 }
 
-/// The band and the `messages` line share one load rule (`Live::said_load`):
-/// the work's own primary load is the title's, so a download row whose
-/// `network busy` the band does not paint prints no `load=network`.
 #[test]
 fn messages_prints_load_only_where_the_glass_says_it() {
     let now = t0();
@@ -1352,11 +1241,6 @@ fn messages_prints_load_only_where_the_glass_says_it() {
     );
 }
 
-/// A ROW IN ITS REVEAL'S GRACE SAYS SO ON THE WIRE (the review of the login
-/// carry, 2026-10-20: `lab instance --image` waited half a second of quiet
-/// and imaged a band with no standing ask on it, its two-second grace still
-/// running): `reveal=pending` until the row is eligible for the band, then
-/// never again.
 #[test]
 fn messages_says_a_row_in_its_grace_is_pending_until_it_is_revealed() {
     let now = t0();
@@ -1390,7 +1274,6 @@ fn messages_says_a_row_in_its_grace_is_pending_until_it_is_revealed() {
     assert_eq!(pending(&c), [false]);
 }
 
-/// A page host with nothing staged, no files and no upgrades.
 struct Plain;
 
 impl Host for Plain {
@@ -1426,8 +1309,6 @@ impl Host for Plain {
     }
 }
 
-/// `still open when aterm stopped` is for a record replayed open from a
-/// process that was killed or crashed.
 #[test]
 fn rows_the_carry_drops_are_not_read_as_a_crash_in_the_successor() {
     let now = t0();

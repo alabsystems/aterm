@@ -12,6 +12,19 @@ use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 use crate::types::{Grapheme, GraphemeInfo};
 
 /// Calculate grapheme information for a string.
+///
+/// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
+/// ENSURES: `result.byte_count == s.len()` and width/count fields are derived from grapheme iteration of `s`.
+///
+/// # Example
+///
+/// ```
+/// use aterm_grapheme::grapheme_width;
+///
+/// let info = grapheme_width("Hello 世界!");
+/// assert_eq!(info.grapheme_count, 9);
+/// assert_eq!(info.display_width, 11); // 7 ASCII + 2 wide chars
+/// ```
 #[inline]
 pub fn grapheme_width(s: &str) -> GraphemeInfo {
     grapheme_width_inner(s, false)
@@ -109,6 +122,18 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 
 /// [`grapheme_width`] with ambiguous-width characters sized by
 /// `config.ambiguous_width`.
+///
+/// # Example
+///
+/// ```
+/// use aterm_grapheme::grapheme_width_with_config;
+/// use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+///
+/// let cjk = TextShapingConfig { ambiguous_width: AmbiguousWidth::Double, ..Default::default() };
+/// // Degree sign is ambiguous-width: 1 in single mode, 2 in double (CJK) mode
+/// let info = grapheme_width_with_config("\u{00B0}test", &cjk);
+/// assert_eq!(info.display_width, 6); // degree(2) + t(1) + e(1) + s(1) + t(1)
+/// ```
 #[inline]
 pub fn grapheme_width_with_config(s: &str, config: &TextShapingConfig) -> GraphemeInfo {
     grapheme_width_inner(s, is_cjk(config))

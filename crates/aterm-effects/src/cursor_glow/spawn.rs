@@ -1003,6 +1003,10 @@ impl CursorGlow {
     }
 
     pub(super) fn poof_scan(&mut self, now: Instant, cfg: &GlowConfig, geom: Geom) {
+        if self.kill_hint.is_none() && self.bs_poof_hint.is_none() {
+            self.rotate_row_probe();
+            return;
+        }
         // Expire a stale hint: it keeps the animation timer armed
         // (`is_active`), so an unconsumed one must self-disarm.
         if self
@@ -1018,13 +1022,11 @@ impl CursorGlow {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
         }
-        let kill_chord = self.kill_hint.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
-        });
-        let fresh_kill = kill_chord
-            || self.bs_poof_hint.is_some_and(|t| {
-                now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
-            });
+        if self.kill_hint.is_none() && self.bs_poof_hint.is_none() {
+            self.rotate_row_probe();
+            return;
+        }
+        let fresh_kill = true;
         let gap_ok = self
             .last_poof
             .is_none_or(|t| now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_MIN_GAP);
@@ -1122,12 +1124,13 @@ impl CursorGlow {
 
     /// Make this frame's row probe the one the emitters read ([`Self::probed_text_spans`]).
     #[inline]
-    pub(super) const fn rotate_row_probe(&mut self) {
+    pub(super) fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);
             std::mem::swap(&mut self.row_above_prev, &mut self.row_above_cur);
             std::mem::swap(&mut self.row_below_prev, &mut self.row_below_cur);
             self.row_prev_meta = self.row_cur_meta.take();
+            self.refresh_probed_text_spans();
         }
     }
 

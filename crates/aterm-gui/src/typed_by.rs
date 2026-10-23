@@ -204,7 +204,7 @@ impl Caller {
         })
     }
 
-    /// Its name: the main thread's ([`App::typed_by`]), else its own words.
+    /// Its name: the main thread's ([`App::typed_by`](crate::App::typed_by)), else its own words.
     pub(crate) fn words(&self) -> String {
         self.named
             .get()

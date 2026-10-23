@@ -140,6 +140,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
 
     let (mut aterm_ns, mut delegated_ns, mut others_ns, mut services_ns) = (0, 0, 0, 0);
     let mut rows = Vec::with_capacity(i.now.coalitions.len());
+    let mut rows_ns = Vec::with_capacity(i.now.coalitions.len());
     for u in i.now.coalitions.values() {
         let before = match i.base.coalitions.get(&u.id) {
             Some(b) => Some(*b).filter(|b| b.cpu_ns <= u.cpu_ns),
@@ -164,6 +165,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             Part::Services => add(&mut services_ns, cpu_ns - delegated),
         }
         add(&mut delegated_ns, delegated);
+        rows_ns.push(cpu_ns);
         rows.push(CoalRow {
             id: u.id,
             part,
@@ -187,10 +189,19 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             lead: named.and_then(|n| n.lead.clone()),
         });
     }
-    rows.sort_by(|a, b| b.cpu_mc.cmp(&a.cpu_mc).then(a.id.cmp(&b.id)));
-
+    let live_ns = tabs.iter().fold(own_ns, |sum, ns| sum.saturating_add(*ns));
+    let unattributed_mc = mc(aterm_ns
+        .saturating_add(delegated_ns)
+        .saturating_sub(live_ns));
     let (aterm_mc, delegated_mc, others_mc) = (mc(aterm_ns), mc(delegated_ns), mc(others_ns));
     let services_mc = mc(services_ns);
+    as_a_set(
+        &mut rows,
+        &rows_ns,
+        window,
+        aterm_mc + delegated_mc + others_mc + services_mc,
+    );
+    rows.sort_by(|a, b| b.cpu_mc.cmp(&a.cpu_mc).then(a.id.cmp(&b.id)));
     let unaccounted_mc = global_mc - (aterm_mc + delegated_mc + others_mc + services_mc);
     CoalSplit {
         via: Via::Coalitions,
@@ -208,7 +219,50 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             .map(|(k, ns)| (k, mc(ns)))
             .collect(),
         own_mc: mc(own_ns),
+        unattributed_mc,
         rows,
+    }
+}
+
+/// `rows`' CPU (`ns` over `window`, in their order) rounded as a set, by the
+/// largest remainder, so the rows add up to `target`, the parts' total: a
+/// row's figure is its own rounded down or up, the larger remainders up
+/// first (ties to the lower id). Rounded one by one, hundreds of near-idle
+/// coalitions each round down, and the rows fall millicores short of the
+/// parts. Where `target` is out of the set's reach (no remainder enough, or
+/// past the floors), each row keeps its own rounding.
+fn as_a_set(rows: &mut [CoalRow], ns: &[u64], window: u64, target: i64) {
+    let window = u128::from(window.max(1));
+    let floors: Vec<i64> = ns
+        .iter()
+        .map(|n| i64::try_from(u128::from(*n) * 1000 / window).unwrap_or(i64::MAX))
+        .collect();
+    let mut up: Vec<(u128, u64, usize)> = ns
+        .iter()
+        .zip(rows.iter())
+        .enumerate()
+        .map(|(k, (n, row))| (u128::from(*n) * 1000 % window, row.id, k))
+        .filter(|(rem, _, _)| *rem > 0)
+        .collect();
+    let sum = floors.iter().fold(0, |sum: i64, f| sum.saturating_add(*f));
+    let Some(extra) = usize::try_from(target.saturating_sub(sum))
+        .ok()
+        .filter(|e| *e <= up.len())
+    else {
+        return;
+    };
+    let larger = |a: &(u128, u64, usize), b: &(u128, u64, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+    if extra < up.len() {
+        up.select_nth_unstable_by(extra, larger);
+    }
+    for (row, floor) in rows.iter_mut().zip(&floors) {
+        row.cpu_mc = *floor;
+    }
+    for &(_, _, k) in &up[..extra] {
+        rows[k].cpu_mc += 1;
+    }
+    for row in rows {
+        row.delegated_mc = row.delegated_mc.min(row.cpu_mc);
     }
 }
 
@@ -247,6 +301,7 @@ impl CoalSplit {
         let tab_of = |key: u64| roots.iter().find(|r| r.key == key).map_or(key, |r| r.tab);
         let tabs = by_tab(tabs.iter().map(|t| (tab_of(t.key), mc(t.scope.cores.raw))));
         let in_tabs: i64 = tabs.iter().map(|(_, mc)| mc).sum();
+        let own_mc = (aterm_mc - in_tabs).max(0);
         Self {
             via: Via::Subtraction,
             exact: false,
@@ -259,7 +314,8 @@ impl CoalSplit {
             services_mc,
             unaccounted_mc: global_mc - aterm_mc - others_mc - services_mc,
             tabs,
-            own_mc: (aterm_mc - in_tabs).max(0),
+            own_mc,
+            unattributed_mc: (aterm_mc - own_mc - in_tabs).max(0),
             rows: Vec::new(),
         }
     }

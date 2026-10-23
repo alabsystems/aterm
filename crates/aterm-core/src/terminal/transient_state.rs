@@ -80,7 +80,7 @@ pub(super) struct TransientState {
     pub(super) sync_end_seq: u64,
     /// Cursor cell at the latest ordered close, qualified by its count, screen and grid.
     pub(super) sync_end_caret: Option<SyncEndCaret>,
-    /// Monotonic count of full resets (RIS and [`Terminal::reset`], both via `reset_common_fields`), never zeroed.
+    /// Monotonic count of full resets (RIS and [`Terminal::reset`](super::Terminal::reset), both via `reset_common_fields`), never zeroed.
     pub(super) reset_generation: u64,
     /// Monotonic count of full clears: ED 2, and ED 0 with the cursor home (`resize_journal::is_full_clear`; ED 3 erases only history).
     pub(super) full_clears: u64,

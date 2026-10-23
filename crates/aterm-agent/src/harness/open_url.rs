@@ -443,18 +443,17 @@ fn is_non_auth_link(url: &str) -> bool {
         || path.ends_with(".js")
 }
 
-/// Extracts a verification or magic-link URL from an incoming email addressed to `target_email`.
+/// Extracts all candidate verification or magic-link URLs from `raw_email` addressed to
+/// `target_email` in priority order.
 #[must_use]
-pub fn extract_magic_link_from_email(
-    raw_email: &str,
-    target_email: Option<&str>,
-) -> Option<String> {
+pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str>) -> Vec<String> {
     if let Some(target) = target_email
         && !email_matches_target(raw_email, target)
     {
-        return None;
+        return Vec::new();
     }
     let mut extra_text = decode_mime_base64_parts(raw_email);
+    let mut explicit_urls = Vec::new();
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
         && let Some(obj) = doc.as_object()
     {
@@ -465,8 +464,9 @@ pub fn extract_magic_link_from_email(
             ) && let Some(u) = v.as_str()
                 && is_supported_auth_url(u)
                 && !is_non_auth_link(u)
+                && !explicit_urls.iter().any(|existing| existing == u)
             {
-                return Some(u.to_owned());
+                explicit_urls.push(u.to_owned());
             }
             if matches!(
                 k.to_ascii_lowercase().as_str(),
@@ -478,6 +478,9 @@ pub fn extract_magic_link_from_email(
                 extra_text.push_str(&decode_mime_base64_parts(s));
             }
         }
+    }
+    if !explicit_urls.is_empty() {
+        return explicit_urls;
     }
     let qp_decoded = decode_quoted_printable(raw_email);
     let combined = if extra_text.is_empty() {
@@ -517,12 +520,39 @@ pub fn extract_magic_link_from_email(
             || lower.contains("auth")
             || lower.contains("callback")
     };
-    urls.iter()
-        .find(|u| provider_url(u) && looks_like_auth(u))
-        .or_else(|| urls.iter().find(|u| looks_like_auth(u)))
-        .or_else(|| urls.iter().find(|u| provider_url(u)))
-        .or_else(|| urls.first())
-        .cloned()
+    let mut ranked = Vec::with_capacity(urls.len());
+    let mut push_unique = |u: &String| {
+        if !ranked.iter().any(|existing| existing == u) {
+            ranked.push(u.clone());
+        }
+    };
+    for u in urls
+        .iter()
+        .filter(|u| provider_url(u) && looks_like_auth(u))
+    {
+        push_unique(u);
+    }
+    for u in urls.iter().filter(|u| looks_like_auth(u)) {
+        push_unique(u);
+    }
+    for u in urls.iter().filter(|u| provider_url(u)) {
+        push_unique(u);
+    }
+    for u in &urls {
+        push_unique(u);
+    }
+    ranked
+}
+
+/// Extracts a verification or magic-link URL from an incoming email addressed to `target_email`.
+#[must_use]
+pub fn extract_magic_link_from_email(
+    raw_email: &str,
+    target_email: Option<&str>,
+) -> Option<String> {
+    extract_magic_links_from_email(raw_email, target_email)
+        .into_iter()
+        .next()
 }
 
 fn resolve_relative_url(base_url: &str, target: &str) -> String {
@@ -1075,7 +1105,12 @@ pub fn authorize_with_mailbox_config(
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
-    if !force_headless && !mailbox_cfg.is_webmail_only(resolved_email.as_deref()) {
+    let has_non_webmail = mailbox_cfg.dir.is_some()
+        || mailbox_cfg
+            .effective_imap_url(resolved_email.as_deref())
+            .is_some()
+        || mailbox_cfg.http_url.is_some();
+    if !force_headless && has_non_webmail {
         let mut pending_credential = None;
         let first_res = authorize_using_with_page(
             authorize_url,
@@ -1293,14 +1328,9 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             .map(str::to_owned)
             .or_else(|| extract_login_hint(url));
         let label = super::headless_oauth::infer_account_label_from_env();
-        let mailbox_cfg = (force_headless
-            || has_mailbox_env
-            || profile.as_deref().is_none_or(|p| p.trim().is_empty()))
-        .then(|| {
+        let mailbox_cfg =
             super::headless_oauth::discover_mailbox_config(home.as_deref(), store_dir.as_deref())
-        })
-        .flatten()
-        .filter(|cfg| has_mailbox_env || cfg.is_configured_for(resolved_email.as_deref()));
+                .filter(|cfg| has_mailbox_env || cfg.is_configured_for(resolved_email.as_deref()));
         if let Some(cfg) = mailbox_cfg {
             match authorize_with_mailbox_config(
                 url,

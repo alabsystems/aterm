@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SESSIONS' `Every session` row on the App (design §11.5.5): the press's rule over live sessions, the one instant a timer arms, the default handed back as a row's press hands it back, and the page published once.
+//! Tests for `Every session` in the Sessions menu.
 
 use super::*;
 use crate::autopilot_timers::{TimerChoice, set_fake_clocks};
 
-/// A test App with five live agent sessions under a default of Cruise (the
-/// design's case, §11.5.5): two following the default, one pinned Off, one
-/// under Land by its own word, and one under its agent's own switch off (an
-/// agy session, `[harness.agy] enabled = false`, the window's harness on).
 fn five_sessions(policy: &str) -> (App, crate::harness_host::HostHandle, [u64; 5]) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -58,7 +54,6 @@ fn five_sessions(policy: &str) -> (App, crate::harness_host::HostHandle, [u64; 5
     (app, host, ids)
 }
 
-/// Each session's own word and effective view.
 fn words(app: &App, ids: &[u64]) -> Vec<(Option<Autopilot>, AutopilotView)> {
     ids.iter()
         .map(|&s| {
@@ -68,7 +63,6 @@ fn words(app: &App, ids: &[u64]) -> Vec<(Option<Autopilot>, AutopilotView)> {
         .collect()
 }
 
-/// How many keyed Autopilot records session `s` has in the message log.
 fn records(app: &App, s: u64) -> usize {
     let key = format!(
         "harness.autopilot.{}",
@@ -81,18 +75,12 @@ fn records(app: &App, s: u64) -> usize {
         .count()
 }
 
-/// Each session's stored `land_at`.
 fn timers(app: &App, ids: &[u64]) -> Vec<Option<i64>> {
     ids.iter()
         .map(|&s| app.pool.get(s).unwrap().ctx.meta.lock().unwrap().land_at)
         .collect()
 }
 
-/// A PRESS FOR EVERY SESSION NEVER LIFTS AN OFF ONE (design §11.5.5): of
-/// five sessions under a default of Cruise, Land every session lands the two
-/// that cruise; the one pinned Off, the one already landing and the one under
-/// its agent's own switch off are untouched, and the keyed records go only to
-/// the two moved.
 #[test]
 fn a_press_for_every_session_never_lifts_an_off_one() {
     use crate::harness_screen::EveryPress;
@@ -151,9 +139,6 @@ fn a_press_for_every_session_never_lifts_an_off_one() {
     host.shutdown_and_join();
 }
 
-/// THE ROW UNDOES ITS OWN PRESSES (design §11.5.1): a bulk Land then a bulk
-/// Cruise gives back each session that was cruising; a bulk timer then a
-/// bulk Cruise leaves no timer stored and none indexed.
 #[test]
 fn a_bulk_cruise_reverses_a_bulk_land_and_a_bulk_timer() {
     use crate::harness_screen::EveryPress;
@@ -187,12 +172,6 @@ fn a_bulk_cruise_reverses_a_bulk_land_and_a_bulk_timer() {
     host.shutdown_and_join();
 }
 
-/// A TIMER FOR EVERY SESSION ARMS ONE INSTANT (design §11.5.3, item 4): the
-/// press resolves `2 h` ONCE — one wall read, counted where it is made
-/// (`resolve_timer_choice`) — however many sessions it arms, so every
-/// session under Cruise stores the same `land_at`, the index holds one
-/// instant, and the loop folds one `autopilot_timer` deadline for them all;
-/// the Off, the Land and the switched-off sessions are not armed.
 #[test]
 fn a_timer_for_every_session_arms_one_instant() {
     use crate::harness_screen::EveryPress;
@@ -255,10 +234,6 @@ fn a_timer_for_every_session_arms_one_instant() {
     host.shutdown_and_join();
 }
 
-/// A TIMER THAT NAMES NO INSTANT WRITES NOTHING (design §11.5.3, item 4):
-/// `at` pressed where `[harness] land_at` names no time (the line removed
-/// after the page was drawn, a zone that cannot be read) moves no session,
-/// and every timer stored stays as it was.
 #[test]
 fn a_timer_at_no_instant_moves_nothing() {
     use crate::harness_screen::EveryPress;
@@ -282,11 +257,6 @@ fn a_timer_at_no_instant_moves_nothing() {
     host.shutdown_and_join();
 }
 
-/// LAND AND FOLLOW SAY THE TIMERS THEY CANCEL (design §11.5.1): with two
-/// sessions timed, Land every session's words count the two timers it
-/// cancels (`Land 2 sessions and cancel 2 timers`, spoken `…, cancelling 2
-/// timers`), and Follow the default's too; after the Land, a Cruise gives
-/// Cruise back but not the timers.
 #[test]
 fn land_and_follow_say_the_timers_they_cancel() {
     use crate::harness_screen::EveryPress;
@@ -327,11 +297,6 @@ fn land_and_follow_say_the_timers_they_cancel() {
     host.shutdown_and_join();
 }
 
-/// UNDER A DEFAULT OF OFF, FOLLOW SAYS THE HARNESS LETS GO (design §11.5.4):
-/// three sessions on their own Cruise or Land, the default Off: Follow the
-/// default says they follow `[harness] autopilot`, which is Off, and the
-/// harness lets go of them (spoken `…, the default is Off`), and the press
-/// turns them off.
 #[test]
 fn follow_under_a_default_of_off_says_the_harness_lets_go() {
     use crate::harness_screen::EveryPress;
@@ -379,10 +344,6 @@ fn follow_under_a_default_of_off_says_the_harness_lets_go() {
     host.shutdown_and_join();
 }
 
-/// FOLLOW THE DEFAULT KEEPS A PINNED OFF (design §11.5.1): every session's
-/// own Cruise or Land is cleared, so each follows `[harness] autopilot`
-/// again; the session pinned Off keeps its word, and the one under its
-/// agent's own switch off is skipped, its word kept.
 #[test]
 fn follow_the_default_keeps_a_pinned_off() {
     use crate::harness_screen::EveryPress;
@@ -423,10 +384,6 @@ fn follow_the_default_keeps_a_pinned_off() {
     host.shutdown_and_join();
 }
 
-/// A BULK LAND HANDS BACK AS THE ROW'S LAND DOES (design §11.5.3, item 3):
-/// under a default of Land, Land every session leaves each session that
-/// cruised by its own word with no word of its own, Land in force — the
-/// very words the rows' own Land presses leave, one by one, on a twin App.
 #[test]
 fn a_bulk_land_hands_back_as_the_rows_land_does() {
     use crate::harness_screen::EveryPress;
@@ -465,11 +422,6 @@ fn a_bulk_land_hands_back_as_the_rows_land_does() {
     rows_host.shutdown_and_join();
 }
 
-/// A PRESS FOR EVERY SESSION PUBLISHES THE PAGE ONCE (design §11.5.3, item
-/// 6): with Settings ▸ Harness on screen, Land every session over five
-/// cruising sessions moves all five and publishes the page once (the
-/// publish's revision, counted at `publish_native_harness_state`), and the
-/// page then lists each one landing.
 #[test]
 fn a_press_for_every_session_publishes_the_page_once() {
     use crate::harness_screen::EveryPress;
@@ -520,11 +472,6 @@ fn a_press_for_every_session_publishes_the_page_once() {
     host.shutdown_and_join();
 }
 
-/// THE ROW'S KEYS ARE READ BACK, AND NOTHING ELSE IS (design §11.5.2): each
-/// press the row draws is minted under the session prefix and parsed back
-/// to itself; an Off (no bulk Off), a cancel (no bulk cancel), a duration
-/// the page does not offer, an alias of a mode, and a session's own key are
-/// no press of the row.
 #[test]
 fn the_every_rows_keys_read_back_and_nothing_else_does() {
     use crate::harness_screen::{
@@ -563,9 +510,6 @@ fn the_every_rows_keys_read_back_and_nothing_else_does() {
     );
 }
 
-/// THE ROW SAYS WHAT IS THERE AND WHAT EACH PRESS MOVES (design §11.5.1),
-/// from the five sessions' snapshot: `5 sessions: 2 cruising (1 timed), 1
-/// landing, 2 off`, and each press's count by the press's own rule.
 #[test]
 fn the_every_row_counts_by_the_presses_own_rule() {
     use crate::harness_screen::EveryPress;
@@ -633,9 +577,6 @@ fn the_every_row_counts_by_the_presses_own_rule() {
     one_host.shutdown_and_join();
 }
 
-/// WHERE IT STEERS NONE, THE ROW SAYS WHY IN THE ROWS' OWN WORDS: every
-/// session under its agent's own switch off reads that switch by name, as
-/// each row does (`3 sessions · Supervise Claude Code sessions is off`).
 #[test]
 fn the_inert_row_names_the_agents_own_switch() {
     let mut app = App::headless_for_test();
@@ -661,8 +602,6 @@ fn the_inert_row_names_the_agents_own_switch() {
     host.shutdown_and_join();
 }
 
-/// Settings ▸ Harness drawn as the window's next frame draws it, and that
-/// frame shown, so a pointer motion or press reads it.
 fn present_settings(app: &mut App, wid: WindowId) -> crate::tab_model::ViewId {
     let (_, view) = app.active_native_view(wid).expect("Settings in front");
     assert!(app.prepare_native_input_scratch(wid));
@@ -679,7 +618,6 @@ fn present_settings(app: &mut App, wid: WindowId) -> crate::tab_model::ViewId {
     view
 }
 
-/// The window pixel at the centre of control `key` in the shown frame.
 fn window_point(app: &App, wid: WindowId, view: crate::tab_model::ViewId, key: &str) -> (f64, f64) {
     let artifact = app
         .retained_native_leaf_artifact(wid, view, true)
@@ -697,7 +635,6 @@ fn window_point(app: &App, wid: WindowId, view: crate::tab_model::ViewId, key: &
     )
 }
 
-/// The control at window pixel `px` in the shown frame, by key.
 fn key_at(app: &App, wid: WindowId, (x, y): (f64, f64)) -> Option<String> {
     let (artifact, x, y) = app.retained_native_leaf_at_pointer(wid, x, y)?;
     artifact
@@ -706,9 +643,6 @@ fn key_at(app: &App, wid: WindowId, (x, y): (f64, f64)) -> Option<String> {
         .map(|hit| hit.key.as_str().to_string())
 }
 
-/// A person's click where the pointer is, as macOS delivers one: a motion
-/// event at the press point (no move) ahead of the press, and again ahead
-/// of the release.
 fn click_at(app: &mut App, wid: WindowId, (x, y): (f64, f64)) {
     use aterm_window::event::{ElementState, MouseButton};
     for state in [ElementState::Pressed, ElementState::Released] {
@@ -717,12 +651,6 @@ fn click_at(app: &mut App, wid: WindowId, (x, y): (f64, f64)) {
     }
 }
 
-/// A PRESS THE LAYOUT MOVED UNDER A STILL POINTER CHOOSES NOTHING (design
-/// §11.5.7, lifecycle-1): three Claude Code sessions cruising on Settings ▸
-/// Harness, the pointer resting one row's pitch above the bulk Land; the
-/// middle session closes, and the page, republished, lifts the last row
-/// into the middle one's place and the `Every session` row under it, so its
-/// bulk Land now stands under the still pointer.
 #[test]
 fn a_press_the_layout_moved_under_a_still_pointer_chooses_nothing() {
     let mut app = App::headless_for_test();
@@ -810,8 +738,6 @@ fn a_press_the_layout_moved_under_a_still_pointer_chooses_nothing() {
     host.shutdown_and_join();
 }
 
-/// The shown frame's controls whose keys start with `prefix`, by key, with
-/// their rects in window pixels.
 fn rects_of(
     app: &App,
     wid: WindowId,
@@ -846,7 +772,6 @@ fn rects_of(
         .collect()
 }
 
-/// Session `s` running Claude Code, or a plain shell.
 fn run_program(app: &App, s: u64, program: Option<&str>) {
     let ctx = app.pool.get(s).unwrap().ctx.clone();
     let mut tl = ctx.timeline.lock().unwrap();
@@ -854,14 +779,6 @@ fn run_program(app: &App, s: u64, program: Option<&str>) {
     tl.set_program(7, program.map(Into::into));
 }
 
-/// NOR A ROW'S PRESS ONE MEANT FOR THE BULK ROW (the lab, 2026-10-19: a row's
-/// Cruise that the page moved under a pointer resting on the bulk Cruise
-/// took the click, and a session its person had turned Off cruised): two
-/// Claude Code sessions cruising, the pointer resting on a bulk button; two
-/// more tabs' shells become Claude Code sessions, which their person turned
-/// Off, and the page, republished, puts their rows where the `Every session`
-/// row was, so one of their buttons stands under the still pointer (where,
-/// the frames say: the bulk row lies beside its words or under them).
 #[test]
 fn a_row_the_layout_moved_under_a_pointer_on_the_bulk_row_waits_for_a_look() {
     let mut app = App::headless_for_test();
@@ -964,10 +881,6 @@ fn a_row_the_layout_moved_under_a_pointer_on_the_bulk_row_waits_for_a_look() {
     host.shutdown_and_join();
 }
 
-/// A SESSIONS ROW'S OWN BUTTONS WAIT FOR A LOOK TOO (the post-landing check's
-/// owner-eye-4, design §11.5.7): three Claude Code sessions cruising on
-/// Settings ▸ Harness, the first under a timer, so its row says `lands at
-/// …`.
 #[test]
 fn a_rows_button_a_state_line_moved_under_a_still_pointer_waits_for_a_look() {
     use crate::native_app::HarnessTimerRequest;
@@ -1080,9 +993,6 @@ fn a_rows_button_a_state_line_moved_under_a_still_pointer_waits_for_a_look() {
     host.shutdown_and_join();
 }
 
-/// THE EVERY ROW READS EACH SESSION'S CHIP (design §12.4.3, item 3, slice
-/// 4c): on the App, a session under Land is counted by the face its chip
-/// wears, from the glass the loop's facts set.
 #[test]
 fn the_every_row_reads_each_sessions_chip_face() {
     use crate::claude_lights::ChipFace;

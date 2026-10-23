@@ -62,7 +62,7 @@ pub(crate) enum StatusAction {
     PeerRead(Pick),
     /// A fleet need's Screen Sharing to its Mac ([`Glance::peers`]).
     PeerScreen(Pick),
-    /// A fleet need's Copy "ssh <its Mac>" ([`Glance::peers`]).
+    /// A fleet need's Copy "`ssh <its Mac>`" ([`Glance::peers`]).
     PeerSsh(Pick),
     /// A fleet need's Take Over on its Mac — `aterm ctl --host <it> hold <sid> on`, the step-in — where that Mac lets this one drive it ([`PeerRef::drive`]).
     PeerTakeOver(Pick),
@@ -72,7 +72,7 @@ pub(crate) enum StatusAction {
     MacRead(Pick),
     /// A Fleet submenu Mac's Screen Sharing.
     MacScreen(Pick),
-    /// A Fleet submenu Mac's Copy "ssh <it>".
+    /// A Fleet submenu Mac's Copy "`ssh <it>`".
     MacSsh(Pick),
 }
 
@@ -1331,7 +1331,7 @@ pub(crate) enum NoticeFallback {
         /// Whether the running bundle's id was read.
         named: bool,
     },
-    /// `osascript`: Script Editor's banner, and a click opens Script Editor — a bare binary's, without terminal-notifier.
+    /// `osascript`: Script Editor's banner, and a click opens Script Editor — a bare binary's.
     ScriptEditor,
 }
 

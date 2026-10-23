@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's presents (Linux, docs/AUDIT-third-party-2026-10-15.md GW.4), the twin of the armed
-//! Metal present (`metal_encode_submit_b` and `metal/present.rs`): after the frame's encode,
-//! compose the present copy, the bloom halo, the heat shimmer, the sub-row band shift with its
-//! apron, the settings card, then the letterbox blit and the SDR crown into a destination texture,
-//! in the order and with the uniforms, gates and scissors the other arms use.
+//! OpenGL present composition, post damage tracking, and window surface attachment.
 
 use super::*;
 use crate::device_layer::TexelFormat;
@@ -86,7 +82,6 @@ pub(crate) struct GlPosted {
 /// one) carried through the blit, with both crowns. A bloom held (drawn from
 /// the same inputs at both posts, `bloom_held`) adds nothing: it blends the
 /// same glow over each texel, so only the texels written show anew under it.
-/// Nor does the same tray card at the same place, for the same reason.
 #[cfg_attr(
     all(wgpu_arm, not(test)),
     expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
@@ -161,11 +156,6 @@ fn blit_footprint(
     ]
 }
 
-/// What the crown's glow `quads` (frame pixels) cover on the destination:
-/// their bounding box at `content_off` (`vs_hdr_glow` draws each quad at its
-/// rect plus the placement), inside the pass's `(x, y, w, h)` scissor;
-/// `[0; 4]` where they cover nothing. A placement that is not a number
-/// covers the whole scissor.
 fn crown_footprint(
     quads: &[GlowInstance],
     [ox, oy]: [f32; 2],
@@ -206,7 +196,6 @@ fn crown_footprint(
     }
 }
 
-/// Write `bytes` into an instance stream, growing it geometrically.
 fn upload_glow(
     live: &GlArmLive,
     slot: &mut Option<(GlBuffer, usize)>,
@@ -220,8 +209,6 @@ fn upload_glow(
     live.dev.write_buffer(buf, bytes)
 }
 
-/// A resident window texture in the offscreen's format at `(w, h)` on the
-/// arm's device, re-minted when absent, resized, or from another device.
 fn ensure_offscreen_family(
     live: &GlArmLive,
     slot: &mut Option<GlTexture>,
@@ -379,7 +366,11 @@ impl GpuRenderer {
         }
         let (bw, bh) = ((fw / BLOOM_DOWNSCALE).max(1), (fh / BLOOM_DOWNSCALE).max(1));
         if bloom_state.is_some() {
-            ensure_offscreen_family(live, &mut win.gl_bloom_half, (bw, bh))?;
+            // Roomy, so a resize keeps its storage: minting and freeing one each step of a drag
+            // cost milliseconds before the window manager saw the frame (`bloom.glsl` reads the
+            // texels in use through `BloomUniform::extent`).
+            live.dev
+                .texture_2d_resizing(&mut win.gl_bloom_half, format, bw, bh, alias)?;
         }
         if shimmer_region.is_some() {
             ensure_offscreen_family(live, &mut win.gl_shimmer_scratch, (fw, fh))?;
@@ -446,7 +437,11 @@ impl GpuRenderer {
                     strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
                     radius: self.bloom_radius,
                     chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                    _pad: [0.0; 3],
+                    extent: win
+                        .gl_bloom_half
+                        .as_ref()
+                        .map_or([1.0; 2], crate::gl::resources::GlTexture::extent),
+                    _pad: 0.0,
                 },
             )
         });
@@ -1145,8 +1140,6 @@ impl GpuRenderer {
 mod tests {
     use super::*;
 
-    /// A post of an 800 x 600 frame onto a stand-in of `dest`, placed at
-    /// `content_off`, nothing drawn over it.
     fn posted(content_off: [f32; 2], dest: (u32, u32)) -> GlPosted {
         let mut blit = BlitUniform::bell(false);
         blit.dims = [800.0, 600.0];
@@ -1162,8 +1155,6 @@ mod tests {
         }
     }
 
-    /// The crown covers its glow quads' bounding box at the blit's placement,
-    /// inside its scissor, not the whole scissor.
     #[test]
     fn the_crown_covers_its_quads_not_its_scissor() {
         let quad = |x, y, w, h| GlowInstance {
@@ -1200,12 +1191,6 @@ mod tests {
         );
     }
 
-    /// A post sends what changed since the last one and no more: the
-    /// offscreen rows written, moved by the blit's placement, widened to the
-    /// whole width by host chrome (whose bands repeat the frame's edge), with
-    /// the effects and crowns of both posts; and everything where there was
-    /// no last post, the blit or a size moved, or the offscreen's change is
-    /// unknown.
     #[test]
     fn a_post_s_damage_is_what_changed_since_the_last() {
         let row = Some([0, 40, 800, 70]);

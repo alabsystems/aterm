@@ -39,7 +39,8 @@ pub(crate) fn title(plant: bool) -> &'static str {
 }
 
 /// One row of every timeline kind, on a session the store registered and,
-/// last, retired, each through its production writer but two (below).
+/// last, retired, each through its production writer but the three
+/// `record_hand_row` rows below.
 pub(crate) fn scripted(plant: bool) -> SessionHandle {
     let store = new_store();
     let h = test_handle(5);
@@ -89,13 +90,10 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
             reasons: Vec::new(),
             conflict: false,
         };
-        tl.record(
-            crate::session_status::STATUS_CHANGE,
-            crate::session_status::status_event_payload(&failed),
-        );
         let at = tl.slog().now();
         tl.slog_mut()
             .observe_status(crate::session_status::status_facts(&failed), at);
+        tl.record(crate::session_status::STATUS_CHANGE);
     }
     let _ = crate::app_input::note_person(&ctx, crate::human_input::Gesture::Other);
     let _ = ctx
@@ -133,7 +131,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let _ = tl.note_harness_act("approve", "codex-alab", aterm_slog::Actor::Ctl);
-        let _ = tl.note_program_state(None);
+        tl.note_program_state(None);
     }
     crate::harness_policy_verb::record_policy_move(&ctx.timeline, 2);
     let reply = crate::fabric::cmd_deliver_waking(

@@ -1023,7 +1023,8 @@ pub(crate) fn shell_escape_path(path: &str) -> String {
     return shell_escape_path_posix(path);
 }
 
-/// Windows drop quoting: wrap the path in double quotes, the one form PowerShell and cmd share, doubling any embedded `"`.
+/// Windows drop quoting: an inert path as is; else double quotes (embedded `"` doubled), or single
+/// quotes when something in it is live inside double quotes ([`live_in_double_quotes`]).
 #[cfg(any(windows, test))]
 pub(crate) fn shell_escape_path_windows(path: &str) -> String {
     let inert = |c: char| c.is_alphanumeric() || matches!(c, '\\' | '/' | ':' | '.' | '-' | '_');

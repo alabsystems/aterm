@@ -160,6 +160,50 @@ fn facts_sit_beside_their_names_until_a_word_cannot() {
     });
 }
 
+/// A FACT THAT WRAPS TALLER BESIDE ITS NAME THAN UNDER IT STACKS: a value
+/// column every word of the fact fits, but only a word or two to a line,
+/// gives way to the name over the fact at the card's full width.
+#[test]
+fn a_fact_that_wraps_taller_beside_its_name_stacks() {
+    at_each_text_scale(&[2.0], "a fact taller beside", |scale| {
+        let _ = view_cx();
+        let (name, fact) = (
+            "Background service",
+            "On \u{2014} updates arrive in the background, without interrupting",
+        );
+        let rows = vec![(name.to_string(), fact.to_string())];
+        let px = 13.0 * scale;
+        let widest = line_pieces(fact)
+            .iter()
+            .map(|(_, piece)| metadata_value_text_width(piece, px, false))
+            .fold(0.0_f32, f32::max);
+        let label = fact_name_width(name).ceil();
+        let inner = label + ABOUT_METADATA_ROW_GAP + widest.ceil() + 1.0;
+        let beside = FactColumns {
+            label,
+            value: inner - label - ABOUT_METADATA_ROW_GAP,
+            stacked: false,
+        };
+        let stacked = FactColumns {
+            label: inner,
+            value: inner,
+            stacked: true,
+        };
+        assert!(
+            beside.lines(&rows) > stacked.lines(&rows),
+            "every word fits beside, on more lines: {} beside, {} stacked in {inner}pt",
+            beside.lines(&rows),
+            stacked.lines(&rows)
+        );
+        assert_eq!(FactColumns::measure(&rows, inner, label), stacked);
+        let wide = inner + 400.0;
+        assert!(
+            !FactColumns::measure(&rows, wide, label).stacked,
+            "a card wide enough keeps the fact beside on a line"
+        );
+    });
+}
+
 #[test]
 fn a_stacked_switch_is_never_wider_than_its_line() {
     at_each_text_scale(&[1.0, 2.0], "switches at phone width", |scale| {
@@ -3075,7 +3119,14 @@ fn the_cursor_link_says_its_whole_label() {
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
-            assert_eq!(label, "Cursor style: Rainbow kitty (default)", "{context}");
+            assert_eq!(
+                label,
+                format!(
+                    "Cursor style: {} (default)",
+                    cursor_style_name(crate::app_config::default_cursor_trail_style())
+                ),
+                "{context}"
+            );
             let button = screens
                 .iter()
                 .flat_map(|screen| &screen.paint)
@@ -3206,7 +3257,12 @@ fn a_path_field_keeps_its_file_name() {
                         let value = screen.semantic(&key).map(|node| node.value.clone());
                         assert_eq!(
                             value,
-                            Some(SemanticValue::Text(format!("{folder}/ai-fleet.toml"))),
+                            Some(SemanticValue::Text(
+                                std::path::Path::new(folder)
+                                    .join("ai-fleet.toml")
+                                    .display()
+                                    .to_string()
+                            )),
                             "{context}"
                         );
                     },
@@ -3522,11 +3578,17 @@ fn a_theme_not_in_use_gives_its_name_the_check_slot() {
         (lines, check)
     };
     at_each_text_scale(&[2.0], "chooser check slot", |_| {
+        let (used, check) = row("theme = \"Dracula\"\n");
+        assert_eq!(check.as_deref(), Some("\u{2713}"), "{used:?}");
         let (lines, check) = row("theme = \"Default\"\n");
         assert_eq!(lines, ["Dracula"], "the name whole");
-        assert_eq!(check, None, "the empty slot is given up");
-        let (lines, check) = row("theme = \"Dracula\"\n");
-        assert_eq!(check.as_deref(), Some("\u{2713}"), "{lines:?}");
+        // Where the name beside a check is not whole (the face decides), the
+        // name not in use takes the check's room.
+        assert_eq!(
+            check.is_none(),
+            used != ["Dracula"],
+            "the empty slot is given up where the name needs it: {used:?} {check:?}"
+        );
     });
 }
 

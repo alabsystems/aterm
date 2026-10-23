@@ -535,7 +535,8 @@ pub fn output_echo_receipt_publication_model() -> Model {
     }
 }
 
-/// Phosphor rain lifecycle model (`{0 Idle, 1 Raining, 2 Draining}`), following [`nova_phase_model`].
+/// Phosphor rain lifecycle model (`{0 Idle, 1 Raining, 2 Draining}`), following
+/// [`nova_phase_model`](crate::nova_phase_model).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rain_lifecycle_model() -> Model {

@@ -45,10 +45,6 @@ impl Terminal {
         )
     }
 
-    /// [`Self::row_display_order`] through the reordering: the renderer's
-    /// scalars and continuation flags for `view` ([`render_scalars`]), its
-    /// permutation of the written cells with the columns past them in place up
-    /// to `cols`, then one text pass in visual order.
     fn row_display_order_full(&self, view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize>) {
         let (chars, continuation) = render_scalars(view);
         let mut levels = aterm_bidi::Scratch::default();
@@ -117,7 +113,7 @@ impl Terminal {
         (u16::try_from(logical).unwrap_or(col), rtl)
     }
 
-    /// Map a painted viewport cell `(row, col)` (accounting for DECDWL/DECDHL) to its logical column and RTL flag.
+    /// Map a painted viewport cell `(row, col)` to its logical column and RTL flag.
     #[inline]
     #[must_use]
     pub fn painted_cell_logical(&self, row: u16, col: u16) -> (u16, bool) {
@@ -131,7 +127,7 @@ impl Terminal {
         self.viewport_cell_logical(row, col)
     }
 
-    /// Reorder each row of a render snapshot into BiDi visual order in place, returning whether any row was permuted.
+    /// Reorder each row of a render snapshot into BiDi visual order in place.
     pub(crate) fn apply_bidi_reorder(
         &mut self,
         frame: &mut crate::render::RenderInput,
@@ -236,10 +232,6 @@ fn may_reorder(view: &VisibleRowView<'_>) -> bool {
     (0..view.len()).any(|c| view.cell(c).is_some_and(|cell| cell.char() >= '\u{0590}'))
 }
 
-/// The scalar and wide-continuation flag `render_row_into_impl` gives each
-/// cell of `view`, without building `RenderCell`s, so the class lookup sees
-/// what the renderer's permutation sees: a complex cell's base, a space for a
-/// blank or a continuation.
 fn render_scalars(view: &VisibleRowView<'_>) -> (Vec<char>, Vec<bool>) {
     let len = usize::from(view.len());
     let mut chars = Vec::with_capacity(len);
@@ -263,8 +255,6 @@ fn render_scalars(view: &VisibleRowView<'_>) -> (Vec<char>, Vec<bool>) {
     (chars, continuation)
 }
 
-/// [`Terminal::row_display_order`] of a row the renderer leaves in logical
-/// order: one text pass over `view`'s `cols` columns and the identity.
 fn row_logical_order(view: &VisibleRowView<'_>, cols: u16) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(usize::from(cols));
     for col in 0..cols {
@@ -286,7 +276,7 @@ fn push_text(view: &VisibleRowView<'_>, col: u16, out: &mut String) {
     }
 }
 
-/// Compute the visual-to-logical cell permutation from BiDi config, per-cell scalars, and wide flags.
+/// Compute the visual-to-logical cell permutation from BiDi config, scalars, and wide flags.
 #[inline]
 #[must_use]
 pub fn compute_visual_order_cells(
@@ -306,9 +296,6 @@ pub fn compute_visual_order_cells(
     )
 }
 
-/// [`compute_visual_order_cells`], resolving into `levels`, which then answers
-/// which logical cells are right to left (`Scratch::cell_is_rtl`; none, for the
-/// identity this returns without resolving).
 fn visual_order_cells_into(
     mode: BiDiMode,
     dir: ParagraphDirection,
@@ -414,11 +401,6 @@ mod tests {
         assert!(term.damage_epoch() > before);
     }
 
-    /// UAX #9 L4 (TF.6 of docs/AUDIT-third-party-2026-10-15.md): a cell that
-    /// resolved right to left is drawn with its Bidi_Mirroring_Glyph, so a
-    /// bracket inside Hebrew text faces the way the text reads, and the same
-    /// bracket around a Hebrew word in a left-to-right line, at the line's
-    /// level, stays as written.
     #[test]
     fn cell_frame_mirrors_right_to_left_brackets() {
         let mut term = Terminal::new(2, 8);
@@ -524,8 +506,6 @@ mod tests {
         );
     }
 
-    /// `row_display_order`'s map is the renderer's permutation and its text
-    /// follows it (Hebrew right to left, a wide glyph whole, LTR the identity).
     #[test]
     fn row_display_order_is_the_renderers_permutation() {
         let mut t = Terminal::new(2, 10);
@@ -563,9 +543,6 @@ mod tests {
         assert!(ltr.row_display_order(2).is_none(), "off the screen");
     }
 
-    /// A row the guard keeps out of the reordering reads the same through the
-    /// logical pass as through the full one, over a corpus of cell kinds; a row
-    /// it lets in holds a codepoint at or past U+0590 (a complex cell counts).
     #[test]
     fn ltr_fast_path_equals_the_full_pass() {
         const COLS: u16 = 12;
@@ -720,14 +697,9 @@ mod tests {
         }
     }
 
-    /// `abc שלום עולם def`: the frame paints the two Hebrew words reversed in
-    /// place, so visual cells 4..=7 show עולם (logical 9..=12) and 9..=12 show
-    /// שלום (logical 4..=7).
     const MIXED: &str = "abc \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD} def";
     const OLAM: &str = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}";
 
-    /// The visual columns of frame row 0 the renderer's predicate paints as
-    /// selected, with the frame's own wide flags.
     fn painted(frame: &crate::render::RenderInput) -> Vec<usize> {
         let row = &frame.cells[0];
         (0..frame.cols)
@@ -739,8 +711,6 @@ mod tests {
             .collect()
     }
 
-    /// The text the frame paints on `cols` of row 0, read back in logical
-    /// order (the order the copy reads).
     fn painted_text_logical(frame: &crate::render::RenderInput, cols: &[usize]) -> String {
         let mut logical: Vec<(usize, char)> = cols
             .iter()
@@ -750,8 +720,6 @@ mod tests {
         logical.into_iter().map(|(_, ch)| ch).collect()
     }
 
-    /// On a BiDi row the highlight lights the cells the copy reads: the
-    /// selection is a logical range and the frame's map places it.
     #[test]
     fn a_logical_selection_lights_the_cells_it_copies_on_a_reordered_row() {
         let mut term = Terminal::new(4, 30);
@@ -804,9 +772,6 @@ mod tests {
         assert_eq!(ltr.selection_to_string().as_deref(), Some("hello"));
     }
 
-    /// A reused scratch forgets a map with the order it described: once the
-    /// row is rewritten in LTR text, the next fill leaves it unmapped, so a
-    /// selection there lights its own columns again.
     #[test]
     fn a_refill_drops_the_map_of_a_row_that_no_longer_reorders() {
         let mut term = Terminal::new(4, 30);
@@ -820,9 +785,6 @@ mod tests {
         assert_eq!(scratch.logical_col(0, 5), 5);
     }
 
-    /// The pointer's side of the same contract: a viewport cell maps to the
-    /// logical cell the frame paints there, with the right-to-left flag that
-    /// swaps its halves, on the live screen and on a scrolled-back row alike.
     #[test]
     fn viewport_cell_logical_follows_the_painted_order() {
         let mut term = Terminal::new(4, 30);
@@ -871,10 +833,6 @@ mod tests {
         );
     }
 
-    /// The map's direction, on a row whose permutation is not its own inverse (a lone
-    /// reversed run is, so it cannot tell visual→logical from logical→visual): in
-    /// `abc אב 12 ג def` the number keeps its digit order inside the reversed run
-    /// (UAX #9 I2 lifts it to level 2), so the frame paints `abc ג 12 בא def`.
     #[test]
     fn a_number_inside_an_rtl_run_pins_the_maps_direction() {
         const ROW: &str = "abc \u{05D0}\u{05D1} 12 \u{05D2} def";
@@ -913,7 +871,6 @@ mod tests {
         assert_eq!(term.viewport_cell_logical(0, 10), (4, true), "א");
     }
 
-    /// Row 0 of a fresh render snapshot as a string, `n` columns wide.
     fn row0(term: &mut Terminal, rows: usize, cols: usize, n: usize) -> String {
         term.cell_frame(rows, cols).cells[0]
             .iter()
@@ -922,15 +879,9 @@ mod tests {
             .collect()
     }
 
-    /// An `ls`-shaped row whose first entry is Hebrew. The grid holds
-    /// "אב.txt  foo.txt  bar.txt"; under the default (SCP 0, DECSET 2501 reset)
-    /// the paragraph is LTR, so only the Hebrew run reverses and the LTR columns
-    /// keep their places instead of the whole row mirroring.
     const LS_ROW: &str = "\u{05D0}\u{05D1}.txt  foo.txt  bar.txt";
     const LS_ROW_LTR: &str = "\u{05D1}\u{05D0}.txt  foo.txt  bar.txt";
 
-    /// The same row as an RTL paragraph (what 2501 / SCP 2 produce): every
-    /// LTR word stays intact, the words swap end to end, the Hebrew reverses.
     fn assert_mirrored(row: &str) {
         assert!(
             row.starts_with("txt  foo.txt  bar.txt.\u{05D1}\u{05D0}"),
@@ -1008,10 +959,6 @@ mod tests {
         assert_eq!(row0(&mut term, 2, 32, 24), LS_ROW_LTR);
     }
 
-    /// A pure-RTL word padded with written blanks stays left-anchored under the
-    /// default LTR paragraph, and the cursor stays on its cell (an RTL
-    /// paragraph would move the word to the right edge and the cursor to
-    /// column 0).
     #[test]
     fn pure_rtl_row_stays_left_anchored() {
         let mut term = Terminal::new(2, 8);
@@ -1026,9 +973,6 @@ mod tests {
         );
     }
 
-    /// Under the default resolution (2501 reset), for a row
-    /// [ASCII word][blanks][Hebrew word][blanks][ASCII word] every ASCII cell is
-    /// a fixed point: an LTR paragraph never moves an L run.
     #[test]
     fn ltr_cells_are_fixed_points_under_the_default_paragraph() {
         let ascii = ["a", "foo.txt", "x1", "README", "end"];

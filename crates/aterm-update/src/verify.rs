@@ -1,30 +1,26 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Authenticity verification of a candidate `.app`, run both at stage time and again at apply time (TOCTOU defence — the staged copy sits on disk between the two).
+//! Authenticity verification of a candidate `.app` at stage time and apply time.
 
 use aterm_uds::deadline::RunError;
 use aterm_uds::spawnfd::Command;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Wall-clock ceiling for one verification helper.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a timed-out helper is given to be reaped after its SIGKILL.
 const HELPER_REAP: Duration = Duration::from_millis(250);
 
 /// The AGGREGATE ceiling on one apply's verification work — see [`ApplyBudget`].
 pub const APPLY_BUDGET: Duration = Duration::from_secs(8);
 
 thread_local! {
-    /// The wall-clock instant this thread's apply must be finished verifying by,
-    /// or `None` outside an apply.
     static APPLY_DEADLINE: std::cell::Cell<Option<Instant>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Opens an aggregate verification budget for the current thread, restoring the previous one on drop.
+/// Opens an aggregate verification budget for the current thread.
 pub struct ApplyBudget(Option<Instant>);
 
 impl ApplyBudget {
@@ -33,7 +29,7 @@ impl ApplyBudget {
         Self(APPLY_DEADLINE.with(|d| d.replace(Some(Instant::now() + limit))))
     }
 
-    /// Push the deadline out by `elapsed`, for work that is legitimately slow and separately bounded.
+    /// Push the deadline out by `elapsed`.
     pub fn extend(elapsed: Duration) {
         APPLY_DEADLINE.with(|d| {
             if let Some(deadline) = d.get() {
@@ -55,8 +51,6 @@ impl Drop for ApplyBudget {
     }
 }
 
-/// How much of a child's stderr [`status_bounded_with_stderr_observed`] keeps: the LAST
-/// bytes, because a diagnostic is the last thing a failing copy prints.
 const STDERR_KEEP: usize = 512;
 
 /// Failure of an owned helper, including whether its absence was actually observed.
@@ -214,10 +208,10 @@ pub(crate) fn probe_staged_bundle_starts(app: &Path, expected_build: u64) -> Res
 
 #[cfg(all(test, target_os = "macos"))]
 thread_local! {
-    /// The `errno` the next stage probe on this thread is refused its spawn with, instead of starting the candidate.
+    /// The `errno` the next stage probe on this thread is refused its spawn with.
     pub(crate) static STAGE_PROBE_SPAWN_REFUSAL: std::cell::Cell<Option<i32>> =
         const { std::cell::Cell::new(None) };
-    /// Whether the next stage probe on this thread reports a helper timeout ([`timed_out`]), standing in for a spawned candidate still waiting at `_dyld_start` when its ceiling expires.
+    /// Whether the next stage probe on this thread reports a helper timeout ([`timed_out`]).
     pub(crate) static STAGE_PROBE_TIMED_OUT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
@@ -225,6 +219,12 @@ thread_local! {
 /// What the start probe is called in its refusals.
 #[cfg(target_os = "macos")]
 const START_PROBE: &str = "candidate --version probe";
+
+/// How the refusal of a start probe whose candidate a signal ended begins: a verdict on the
+/// build whose candidate nonetheless stays where it ran, since no exit of its own showed
+/// macOS done assessing its first exec (`install::probe_left_unproven`).
+pub(crate) const START_PROBE_SIGNALLED: &str =
+    "the staged bundle was ended by a signal before it exited";
 
 /// Non-macOS: there is no bundle to start.
 #[cfg(not(target_os = "macos"))]
@@ -245,6 +245,18 @@ fn probe_starts(
         return Err(format!("no executable at {}", exe.display()));
     }
     let out = run(&exe)?;
+    // A signal is how a bundle that cannot start ends (a dyld abort, a code-signing kill),
+    // and it may land at `_dyld_start` while macOS still assesses the first exec: a verdict
+    // whose candidate the callers keep where it ran.
+    if out.status.code().is_none() {
+        return Err(format!(
+            "{START_PROBE_SIGNALLED} ({}); {} stays where it ran while macOS may still be \
+             assessing its first exec: {}",
+            out.status,
+            exe.display(),
+            crate::quote_tool_output(String::from_utf8_lossy(&out.stderr).trim())
+        ));
+    }
     if !out.status.success() {
         return Err(format!(
             "the staged bundle could not start ({}): {}",
@@ -270,8 +282,6 @@ pub fn probe_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// Whichever ceiling binds first: a helper's own [`HELPER_TIMEOUT`], or what is left of
-/// the apply's aggregate budget; `true` when the budget is the one that binds.
 fn helper_deadline() -> (Instant, bool) {
     let own = Instant::now() + HELPER_TIMEOUT;
     match APPLY_DEADLINE.with(|d| d.get()) {
@@ -299,7 +309,8 @@ pub(crate) fn mark_passing(message: String) -> String {
     format!("{message} ({})", crate::PASSING_REFUSAL_KEY)
 }
 
-/// Whether an I/O error from starting a helper, or from waiting on a lock, is a fact about this MOMENT rather than about the bundle or the machine's setup.
+/// Whether an I/O error from starting a helper, or from waiting on a lock, is a fact about this
+/// moment rather than about the bundle or the machine's setup.
 pub(crate) fn io_error_is_passing(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -312,7 +323,7 @@ pub(crate) fn io_error_is_passing(error: &std::io::Error) -> bool {
     )
 }
 
-/// The refusal for an I/O error while starting helper `what`, marked passing when the error is a moment ([`io_error_is_passing`]).
+/// The refusal for an I/O error while starting helper `what`.
 pub(crate) fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
     let message = format!("spawn {what}: {error}");
     if io_error_is_passing(error) {
@@ -322,7 +333,7 @@ pub(crate) fn spawn_refusal(what: &str, error: &std::io::Error) -> String {
     }
 }
 
-/// The refusal a bounded wait on the apply lock reports, under `what` (the lane's own prefix: "lock", "pre-verify lock", "health lock", "publish lock").
+/// The refusal a bounded wait on the apply lock reports, under `what`.
 pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
     let message = format!("{what}: {error}");
     if io_error_is_passing(error) {
@@ -332,7 +343,6 @@ pub(crate) fn lock_wait_refusal(what: &str, error: &std::io::Error) -> String {
     }
 }
 
-/// Run a verification helper with a bounded wall clock, killing it on timeout.
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
     output_until(cmd, what, || {
         let (deadline, bound_by_budget) = helper_deadline();
@@ -357,8 +367,6 @@ pub(crate) fn output_within(
     })
 }
 
-/// Run `cmd` to its output by the deadline `bound` names, killing it there and
-/// reaping it within [`HELPER_REAP`]; `bound` also gives the timeout's error text.
 fn output_until(
     cmd: &mut Command,
     what: &str,
@@ -371,15 +379,8 @@ fn output_until(
         .map_err(|error| run_refusal(what, error, timeout))
 }
 
-/// What one helper run gave: its output, or why there is none.
 type Run = Result<std::process::Output, RunError>;
 
-/// The refusal for helper `what` that gave no output: `timeout` for one past its
-/// deadline — killed, and a rejection ([`timed_out`]) whether or not its reap was
-/// seen within [`HELPER_REAP`]: a helper still wedged in the kernel past SIGKILL is
-/// left to exit on its own rather than parking this thread on it, which is the
-/// whole point of the bound, and nothing is swapped past a helper that may still
-/// hold a file.
 fn run_refusal(what: &str, error: RunError, timeout: String) -> String {
     match error {
         RunError::Spawn(e) => spawn_refusal(what, &e),
@@ -397,13 +398,13 @@ pub struct BundleChecks {
     pub build: Result<u64, String>,
     /// The sealed `ATermGitCommit` ([`git_commit_from`]).
     pub commit: Result<String, String>,
-    /// [`team_id`]'s answer when a Team ID is pinned (the gate reads it); `None` in the structural tier.
+    /// [`team_id`]'s answer when a Team ID is pinned (the gate reads it).
     pub team: Option<Result<String, String>>,
     /// [`bundle_short_version`]'s answer, when asked for.
     pub short_version: Option<Result<String, String>>,
 }
 
-/// [`BundleChecks`] of `app` under `expected_team` (the tier [`verify_bundle_policy`] takes), reading `CFBundleShortVersionString` too when `short_version`.
+/// [`BundleChecks`] of `app` under `expected_team` (the tier [`verify_bundle_policy`] takes).
 pub fn check_bundle(app: &Path, expected_team: &str, short_version: bool) -> BundleChecks {
     check_bundles(&[app], expected_team, short_version)
         .pop()
@@ -416,7 +417,7 @@ pub fn check_bundle(app: &Path, expected_team: &str, short_version: bool) -> Bun
         })
 }
 
-/// [`check_bundle`] of every one of `apps`, in order, with ALL their helpers started at once and reaped under one deadline.
+/// [`check_bundle`] of every one of `apps`, in order.
 pub fn check_bundles(
     apps: &[&Path],
     expected_team: &str,
@@ -451,13 +452,10 @@ pub fn check_bundles(
         .collect()
 }
 
-/// The answer for a check that never ran — never returned in practice: the gates
-/// answer every bundle they are given.
 fn not_run<T>() -> Result<T, String> {
     Err("the bundle check did not run".to_string())
 }
 
-/// One run of the policy gate beside `PlistBuddy` reads of `keys`.
 struct Gate {
     policy: Result<(), String>,
     team: Option<Result<String, String>>,
@@ -465,9 +463,6 @@ struct Gate {
     reads: Vec<Result<std::process::Output, String>>,
 }
 
-/// The helpers one bundle's [`Gate`] runs: the policy gate — `codesign -R`,
-/// `codesign -d` (the team) and `spctl` for a `pinned` Team ID, else the structural
-/// `codesign --verify` — and a `PlistBuddy` read of each key.
 struct GateHelpers {
     seal: Command,
     display: Option<Command>,
@@ -476,9 +471,6 @@ struct GateHelpers {
 }
 
 impl GateHelpers {
-    /// `app`'s helpers, or the gate's answer when a pin cannot make a requirement or
-    /// the bundle holds an entry no helper could read to an answer
-    /// ([`unanswerable_entry`], walked until `deadline`) — refused before anything runs.
     fn of(
         app: &Path,
         pinned: Option<&str>,
@@ -507,7 +499,6 @@ impl GateHelpers {
         })
     }
 
-    /// The helpers in the order [`compose_gate`] reads their runs.
     fn commands(&mut self) -> impl Iterator<Item = &mut Command> {
         std::iter::once(&mut self.seal)
             .chain(self.display.as_mut())
@@ -516,9 +507,6 @@ impl GateHelpers {
     }
 }
 
-/// Why no helper could read `app` to an answer, or `None` when nothing found stops
-/// one: an entry that is not a directory or a regular file (a FIFO, a socket, a
-/// device), a symlink to one, or a symlink to a directory outside the bundle.
 fn unanswerable_entry(app: &Path, deadline: Instant) -> Option<String> {
     const SPECIAL: &str = "not a directory, a file or a symlink to one";
     const OUTSIDE: &str = "a symlink to a directory outside the bundle";
@@ -581,8 +569,6 @@ fn unanswerable_entry(app: &Path, deadline: Instant) -> Option<String> {
     None
 }
 
-/// The policy gate and the reads of `keys` for each of `apps` ([`GateHelpers`]), every
-/// helper of every bundle started at once under one [`helper_deadline`].
 fn gates_and_reads(apps: &[&Path], pinned: Option<&str>, keys: &[&str]) -> Vec<Gate> {
     let (deadline, bound_by_budget) = helper_deadline();
     let mut plans: Vec<Result<GateHelpers, Gate>> = apps
@@ -608,8 +594,6 @@ fn gates_and_reads(apps: &[&Path], pinned: Option<&str>, keys: &[&str]) -> Vec<G
         .collect()
 }
 
-/// One bundle's (`app`'s) [`Gate`] from its helpers' runs, taken from `runs` in
-/// [`GateHelpers::commands`]' order.
 fn compose_gate(
     app: &Path,
     pinned: Option<&str>,
@@ -661,7 +645,6 @@ fn compose_gate(
     }
 }
 
-/// [`gates_and_reads`] of one bundle.
 fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
     gates_and_reads(&[app], pinned, keys)
         .pop()
@@ -672,7 +655,7 @@ fn gate_and_read(app: &Path, pinned: Option<&str>, keys: &[&str]) -> Gate {
         })
 }
 
-/// Full apply-/stage-time gate: structural codesign seal, Team-ID pin, and Gatekeeper/notarization acceptance.
+/// Full apply-/stage-time gate.
 pub fn verify_bundle(app: &Path, expected_team: &str) -> Result<(), String> {
     gate_and_read(app, Some(expected_team), &[]).policy
 }
@@ -686,12 +669,8 @@ pub fn verify_bundle_policy(app: &Path, expected_team: &str) -> Result<(), Strin
     }
 }
 
-/// The structural lane's name in its refusals.
 const STRUCTURAL: &str = "codesign --verify (structural)";
 
-/// `codesign --verify --deep --strict` with NO designated requirement: proves the
-/// signature seal is intact and nothing in the bundle changed since signing, but does
-/// not constrain the signer (an ad-hoc signature passes).
 fn structural_command(app: &Path) -> Command {
     let mut cmd = aterm_uds::spawnfd::command("/usr/bin/codesign");
     cmd.args(["--verify", "--deep", "--strict", "--verbose=2"])
@@ -699,7 +678,6 @@ fn structural_command(app: &Path) -> Command {
     cmd
 }
 
-/// What one ended [`structural_command`] run on `app` says.
 fn structural_from(app: &Path, out: &std::process::Output) -> Result<(), String> {
     if out.status.success() {
         Ok(())
@@ -715,7 +693,6 @@ fn structural_from(app: &Path, out: &std::process::Output) -> Result<(), String>
     }
 }
 
-/// `PlistBuddy -c "Print :<key>"` of `app`'s `Contents/Info.plist`.
 fn plist_command(app: &Path, key: &str) -> Command {
     let mut cmd = aterm_uds::spawnfd::command("/usr/libexec/PlistBuddy");
     cmd.arg("-c")
@@ -724,7 +701,7 @@ fn plist_command(app: &Path, key: &str) -> Command {
     cmd
 }
 
-/// Read `CFBundleVersion` (the monotonic build number) from a staged `.app`'s `Contents/Info.plist`.
+/// Read `CFBundleVersion` from a staged `.app`'s `Contents/Info.plist`.
 pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     build_number_from(output_bounded(
         &mut plist_command(app, "CFBundleVersion"),
@@ -732,8 +709,6 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
     )?)
 }
 
-/// The refusal for a `PlistBuddy` read of `key` that did not succeed: its words
-/// (quoted, [`crate::quote_tool_output`]), marked passing ([`mark_passing`]) when a signal ended the read.
 fn plist_read_refusal(key: &str, out: &std::process::Output) -> String {
     let refusal = format!(
         "read {key}: {}",
@@ -746,7 +721,6 @@ fn plist_read_refusal(key: &str, out: &std::process::Output) -> String {
     }
 }
 
-/// What one `PlistBuddy` read of `CFBundleVersion` says ([`bundle_build_number`]).
 fn build_number_from(out: std::process::Output) -> Result<u64, String> {
     if !out.status.success() {
         return Err(plist_read_refusal("CFBundleVersion", &out));
@@ -757,7 +731,7 @@ fn build_number_from(out: std::process::Output) -> Result<u64, String> {
         .map_err(|_| format!("CFBundleVersion {text:?} is not an integer"))
 }
 
-/// Read the marketing version (`CFBundleShortVersionString`) from a bundle's sealed `Contents/Info.plist`.
+/// Read `CFBundleShortVersionString` from a bundle's sealed `Contents/Info.plist`.
 pub fn bundle_short_version(app: &Path) -> Result<String, String> {
     short_version_from(output_bounded(
         &mut plist_command(app, "CFBundleShortVersionString"),
@@ -765,8 +739,6 @@ pub fn bundle_short_version(app: &Path) -> Result<String, String> {
     )?)
 }
 
-/// What one `PlistBuddy` read of `CFBundleShortVersionString` says
-/// ([`bundle_short_version`]).
 fn short_version_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
         return Err(plist_read_refusal("CFBundleShortVersionString", &out));
@@ -781,8 +753,6 @@ fn short_version_from(out: std::process::Output) -> Result<String, String> {
     Ok(version)
 }
 
-/// What one `PlistBuddy` read of `ATermGitCommit` says: the codesign-sealed source
-/// provenance in Info.plist ([`BundleChecks::commit`]).
 fn git_commit_from(out: std::process::Output) -> Result<String, String> {
     if !out.status.success() {
         return Err(plist_read_refusal("ATermGitCommit", &out));
@@ -821,10 +791,6 @@ pub(crate) fn codesign_refusal(
     }
 }
 
-/// The refusal for a codesign run on `app` that ENDED (`refused`, a
-/// [`CodesignError::Refused`]) under `what`: codesign's words, quoted
-/// ([`crate::quote_tool_output`]), marked passing ([`mark_passing`]) only when
-/// codesign knowably judged nothing.
 fn codesign_exit_refusal(
     what: &str,
     app: &Path,
@@ -849,30 +815,26 @@ fn codesign_exit_refusal(
     }
 }
 
-/// Extract the signing Team Identifier from a bundle (`codesign -dv` writes it to stderr, hence both streams).
+/// Extract the signing Team Identifier from a bundle.
 pub fn team_id(app: &Path) -> Result<String, String> {
     parse_team_id(&codesign_display(app, "codesign -d (team id)")?)
 }
 
-/// The code-signing identifier `app` is signed with (`codesign -d`'s `Identifier=`), which a requirement's `identifier "…"` clause tests.
+/// The code-signing identifier `app` is signed with (`codesign -d`'s `Identifier=`).
 pub fn signing_identifier(app: &Path) -> Result<String, String> {
     parse_signing_identifier(&codesign_display(app, "codesign -d (identifier)")?)
 }
 
-/// `codesign -d --verbose=4 <app>`'s text, both streams (it prints to stderr
-/// whether or not it succeeds), bounded like every helper here.
 fn codesign_display(app: &Path, what: &str) -> Result<String, String> {
     display_from(what, app, &output_bounded(&mut display_command(app), what)?)
 }
 
-/// `codesign -d --verbose=4 <app>`.
 fn display_command(app: &Path) -> Command {
     let mut cmd = aterm_uds::spawnfd::command("/usr/bin/codesign");
     cmd.args(["-d", "--verbose=4"]).arg(app);
     cmd
 }
 
-/// What one ended [`display_command`] run (`what`) on `app` printed, or its refusal.
 fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<String, String> {
     // A run that ended on a moment (a signal, or a file it could not read just then) reached
     // no verdict, and its output is no evidence of a missing TeamIdentifier.
@@ -892,8 +854,6 @@ fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<St
     ))
 }
 
-/// Pure parser for the `Identifier=` line of `codesign -dv` output. Fails closed
-/// on a missing or empty identifier.
 fn parse_signing_identifier(text: &str) -> Result<String, String> {
     let identifier = text
         .lines()
@@ -906,8 +866,6 @@ fn parse_signing_identifier(text: &str) -> Result<String, String> {
     Ok(identifier.to_string())
 }
 
-/// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output. Fails closed on a
-/// missing or `not set` (ad-hoc/unsigned) identifier.
 fn parse_team_id(text: &str) -> Result<String, String> {
     let team = text
         .lines()
@@ -920,21 +878,16 @@ fn parse_team_id(text: &str) -> Result<String, String> {
     Ok(team.to_string())
 }
 
-/// `spctl -a -t exec` — Gatekeeper/notarization acceptance for a *runnable app*
-/// (`-t exec`, not the DMG-install `-t install`).
 fn spctl_command(app: &Path) -> Command {
     let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/spctl");
     cmd.args(["-a", "-t", "exec", "-vvv"]).arg(app);
     cmd
 }
 
-/// What one ended [`spctl_command`] run says ([`spctl_verdict`]).
 fn spctl_from(out: &std::process::Output) -> Result<(), String> {
     spctl_verdict(out.status, &String::from_utf8_lossy(&out.stderr))
 }
 
-/// What one ended `spctl` run says: a pass, its rejection, or, when a signal ended it, no
-/// verdict, a passing refusal (`spctl` is as liable to jetsam on a loaded desk as `codesign`).
 fn spctl_verdict(status: std::process::ExitStatus, stderr: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
@@ -990,10 +943,6 @@ mod tests {
         assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
     }
 
-    /// Which I/O errors are a moment, by errno. The kernel refusing a helper for
-    /// the process table, memory or descriptors just then — and a lock held past
-    /// its wait — pass; a missing helper, a permission, a filesystem without locks
-    /// come back the same every time and keep their verdict.
     #[test]
     fn only_a_moment_s_io_errors_are_passing() {
         for passing in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
@@ -1095,9 +1044,6 @@ mod tests {
             }
         };
         aterm_spec::verify::prove_and_catch_scalar(&model, "bounded helper cleanup");
-        /// A child that never exits (`exit` 0) counts its looks after `deadline`. One is the
-        /// loop's own last; a second means the cleanup renewed its deadline, and the fake
-        /// answers it with an error so the cleanup ends and the test fails.
         struct FakeChild {
             exit: u8,
             kill_error: bool,
@@ -1250,9 +1196,6 @@ mod tests {
         assert!(status.success() && stderr.is_empty() && last_stderr_line(&stderr).is_none());
     }
 
-    /// The signing identifier is the `Identifier=` line, never the
-    /// `TeamIdentifier=` one that also ends in "Identifier=", and its absence
-    /// fails closed.
     #[test]
     fn signing_identifier_parsed_from_codesign_output() {
         let sample = "Executable=/x\nIdentifier=com.aterm.aterm\nTeamIdentifier=ABCDE12345\n";
@@ -1275,8 +1218,6 @@ mod tests {
         assert!(parse_team_id("TeamIdentifier=\n").is_err());
     }
 
-    /// A garbage pin (one that could escape the requirement string) is refused before
-    /// anything runs, and a bundle of another signer is a verdict.
     #[test]
     fn verify_bundle_refuses_a_garbage_pin_and_another_signer() {
         verify_bundle(Path::new("/nonexistent"), "AB\"CD").unwrap_err();
@@ -1285,9 +1226,6 @@ mod tests {
         assert!(!crate::is_passing_refusal(&refused), "{refused}");
     }
 
-    /// A codesign run that ended without a verdict — a signal, a
-    /// wait that failed, or exit 1 naming a fact about this machine (a file it could
-    /// not read, its own internal error) — is a passing refusal on both codesign lanes.
     #[test]
     fn only_a_codesign_moment_is_passing() {
         use aterm_update_core::codesign::CodesignError;
@@ -1390,9 +1328,6 @@ mod tests {
         }
     }
 
-    /// A tool cannot speak for the refusal that quotes it: a helper's output that
-    /// echoes a refusal key (a nested path or a file the bundle named after it) leaves
-    /// a verdict a verdict, and still reads the text it quoted.
     #[test]
     fn a_verdict_that_quotes_a_refusal_key_is_still_a_verdict() {
         use aterm_update_core::codesign::CodesignError;
@@ -1464,6 +1399,39 @@ mod tests {
             },
         );
         assert!(crate::is_passing_refusal(&moment), "{moment}");
+    }
+
+    /// A start probe whose candidate a signal ended never saw it exit: a verdict on the
+    /// build that names the signal ([`START_PROBE_SIGNALLED`]), so its candidate stays where
+    /// it ran (`install::probe_left_unproven`); one that exited with a failure is a plain
+    /// verdict.
+    #[test]
+    fn a_signal_ending_the_start_probe_is_a_verdict_that_says_so() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let bundle = aterm_tempfile::Builder::new()
+            .prefix("aterm-probe-signal-")
+            .tempdir()
+            .unwrap();
+        let app = bundle.path().join("aterm.app");
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/MacOS/aterm"), "").unwrap();
+        let output = |status| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let killed = probe_starts(&app, 1, |_| {
+            Ok(output(std::process::ExitStatus::from_raw(libc::SIGKILL)))
+        })
+        .unwrap_err();
+        assert!(!crate::is_passing_refusal(&killed), "{killed}");
+        assert!(killed.starts_with(START_PROBE_SIGNALLED), "{killed}");
+        let exited = probe_starts(&app, 1, |_| {
+            Ok(output(std::process::ExitStatus::from_raw(1 << 8)))
+        })
+        .unwrap_err();
+        assert!(!crate::is_passing_refusal(&exited), "{exited}");
+        assert!(!exited.starts_with(START_PROBE_SIGNALLED), "{exited}");
     }
 
     /// A tampered bundle named like a machine fault is a verdict, measured on the real

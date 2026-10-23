@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-frame GPU execution timing ([`FrameToken::complete_parts`]).
+//! Per-frame GPU execution timing ([`FrameToken::complete_parts`](crate::gpu_time::FrameToken::complete_parts)).
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 use std::sync::OnceLock;

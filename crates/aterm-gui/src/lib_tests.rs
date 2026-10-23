@@ -8,8 +8,6 @@ use super::{
 };
 use crate::app_config::Config;
 
-/// A headless launch runs the trial machinery but never presents, so it needs its own
-/// health checkpoint: the engine loop reached with the socket bound (or none configured).
 #[test]
 fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     use std::sync::atomic::Ordering;
@@ -67,8 +65,6 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     );
 }
 
-/// Boot health never folds a past deadline: a saturated dispatch moves the retry onto
-/// the backoff, and a retry the guard would refuse is not folded.
 #[test]
 fn boot_health_never_folds_a_past_deadline() {
     use std::time::{Duration, Instant};
@@ -313,10 +309,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     );
 }
 
-/// A resident under a load shed keeps its motion and leaves only the frame train: a moving pet
-/// is armed at its owner's coarse offer (`RESIDENT_SHED_CADENCE`) through the shed-free
-/// `pet_motion` gate, a settled one owes only its own next step no sooner than that cadence,
-/// and the latch clearing (on the envelope's recovery ramp) hands the train back.
 #[test]
 fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     use aterm_effects::companion::RESIDENT_SHED_CADENCE;
@@ -486,9 +478,6 @@ enum LaneGesture {
     Enter,
 }
 
-/// The capture's schedule, in ms from the first key: 35 keys at 70 ms, a 1.5 s pause, 9 keys
-/// at 35 ms, a 1 s pause, four Ctrl-A / Ctrl-E jumps 500 ms apart, four backspaces at 100 ms,
-/// Enter, then the tail the lane is judged on.
 fn lane_census_schedule() -> Vec<(u64, LaneGesture)> {
     let mut s = Vec::new();
     let mut t = 0u64;
@@ -526,9 +515,6 @@ struct LaneCensus {
     park_ms: Option<u64>,
 }
 
-/// Drive one window's real lane planner through [`lane_census_schedule`] as
-/// `about_to_wait` does: wake at each gesture and armed tick, service the due tick, plan
-/// (arm A), render the glow (the rainbow caret block off), plan again (arm B).
 fn lane_wake_census() -> LaneCensus {
     use crate::cursor_glow::Geom;
     use crate::cursor_rainbow::RainbowConfig;
@@ -658,8 +644,6 @@ fn lane_wake_census() -> LaneCensus {
     census
 }
 
-/// After the last key the glow's own lane parks within two seconds (the engine idles
-/// at ≤ 1.54 s).
 #[test]
 fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
     let v2 = lane_wake_census();
@@ -673,10 +657,6 @@ fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
     assert!(v2.tail_arms > 0, "the tail owed at least the swoosh");
 }
 
-/// The caret's colour release keeps the lane to its last step: with only the rainbow
-/// caret cooling, identical frames release the frame train, but the lane must stay
-/// armed until the caret releases, advance on every plan, and cost no more wakes than
-/// the frame train.
 #[test]
 fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
     use aterm_effects::cursor_glow::Geom;
@@ -807,11 +787,6 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
     );
 }
 
-/// The momentum glow's cool-down keeps the lane to its last frame: after a burst
-/// with a steady cursor (no blink clock to repaint the window), identical frames
-/// release the frame train while the halo is still on glass, but the lane must stay
-/// armed, advance on every plan, and park only after a frame that drew nothing: no
-/// halo, no tint, not hot.
 #[test]
 fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
     use aterm_effects::cursor_glow::Geom;
@@ -1031,10 +1006,6 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
     assert_eq!(app.pool.rain_override(0), Some(true));
 }
 
-/// The bell tests' positive control: a windowed instance with every gate open
-/// (`bell_sound` ships on, serious mode off, a fresh lane) asks the fixture's
-/// counting `alert_sound` for exactly one sound per [`BELL_BEEP_INTERVAL`], and
-/// that bell burns the lane.
 #[test]
 fn a_windowed_bell_plays_one_alert_sound_per_lane() {
     let mut app = App::headless_for_test();
@@ -1078,9 +1049,6 @@ fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
     );
 }
 
-/// `bell_sound = false` silences the audible BEL without consuming the
-/// [`BELL_BEEP_INTERVAL`] token (the `&&` order in `on_bell`), like the serious-mode
-/// twin.
 #[test]
 fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
@@ -1105,10 +1073,6 @@ fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     );
 }
 
-/// A headless instance has no window, so its BEL never asks the OS for the
-/// alert sound: every other gate is open (the switch ships on, serious mode is
-/// off, the lane is fresh), yet no sound is requested and the lane's token is
-/// still there after the bell.
 #[test]
 fn a_headless_bell_never_reaches_the_alert_sound() {
     let mut app = App::headless_for_test();
@@ -1137,16 +1101,12 @@ fn a_headless_bell_never_reaches_the_alert_sound() {
     );
 }
 
-/// One `key=` field of a `status` record, `None` when the record has none.
 fn status_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
     record
         .split(' ')
         .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// WHICH TAB RANG (2026-10-22): a BEL is kept on the session whose program
-/// rang it — the program in front, as `status program=` names it, and what
-/// the gates made of its sound, the newest first — and `status` says so.
 #[test]
 fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
     let mut app = App::headless_for_test();
@@ -1201,9 +1161,6 @@ fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
     );
 }
 
-/// A headless instance's bell is kept as `headless` (it never sounds), and
-/// a serious-mode one as `serious`: the word names the gate that kept it
-/// quiet.
 #[test]
 fn a_quiet_bell_is_kept_with_the_gate_that_quieted_it() {
     let mut app = App::headless_for_test();
@@ -1401,9 +1358,6 @@ fn paste_confirm_flags_any_line_end_only_when_unbracketed() {
     );
 }
 
-/// The `controls prefs` alias keeps its line prefixes while projecting the live native
-/// Settings tree: route identity, visible rows and `ui` records agree with paint, and
-/// compatibility-only config never appears as a visual control.
 #[test]
 fn controls_prefs_projects_current_native_top_settings_tree() {
     use crate::app_introspect::AuxTarget;
@@ -1494,9 +1448,6 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
     assert!(expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
 }
 
-/// A `[keybindings]` table parses into the chord → action map, and an absent
-/// table yields an empty (no-op) map — so the no-config path reaches the
-/// hardcoded `on_key` matches unchanged.
 #[test]
 fn keybindings_table_parses() {
     let kb = crate::keybinding::Keybindings::from_config(Config::default().keybindings.as_ref());
@@ -1522,9 +1473,6 @@ fn keybindings_table_parses() {
     );
 }
 
-/// A config colour flows config → engine → the rendered `RenderCell.fg/bg`: the default
-/// fg/bg, a `palette` slot (SGR 31 is ANSI index 1), and a `palette` entry layered over a
-/// named theme's slot (the theme seeds all 16 slots, then `palette[i]` overwrites slot `i`).
 #[test]
 fn theme_colors_reach_rendercell() {
     use aterm_core::terminal::Terminal;
@@ -1560,8 +1508,6 @@ fn theme_colors_reach_rendercell() {
     assert_ne!(cells[0].fg, [0xff, 0x55, 0x55], "not Dracula's red");
 }
 
-/// A named `theme` flows config → engine → rendered cells: it sets the default
-/// fg/bg and the full ANSI palette (incl. bold-to-bright), and the renderer Theme chrome.
 #[test]
 fn named_theme_reaches_rendercell_and_chrome() {
     use aterm_core::terminal::Terminal;
@@ -1595,8 +1541,6 @@ fn named_theme_reaches_rendercell_and_chrome() {
     assert_eq!(t2.render_row(0)[0].bg, [0x10, 0x20, 0x30]);
 }
 
-/// An unknown `theme` name falls back to Default (never panics), and the
-/// resolution says it fell back.
 #[test]
 fn unknown_theme_falls_back_to_default() {
     let c: Config = aterm_toml::from_str("theme = \"no-such-theme\"").unwrap();
@@ -1613,8 +1557,6 @@ fn unknown_theme_falls_back_to_default() {
     ));
 }
 
-/// Config hot-reload keeps startup's font-size precedence (`--font-px > config >
-/// default`), with the flag passed explicitly; the launch flag still wins after a reload.
 #[test]
 fn font_px_precedence_flag_beats_config_beats_default() {
     use super::{FONT_PX, FONT_PX_MAX, FONT_PX_MIN};
@@ -1636,9 +1578,6 @@ fn font_px_precedence_flag_beats_config_beats_default() {
     assert!(font_px_is_explicit_with(Some(24.0), Some(9999.0)));
 }
 
-/// The reload engine path re-themes a live terminal: applying a new `applied_terminal_config`
-/// recolours already-rendered default cells, and reverting the key reverts the colour, as
-/// `App::reload_config` does to every session via `apply_config`.
 #[test]
 fn reload_retheme_then_revert_live_terminal() {
     use aterm_core::terminal::Terminal;
@@ -1670,9 +1609,6 @@ fn reload_retheme_then_revert_live_terminal() {
     assert_ne!(t.render_row(0)[0].bg, [0x20, 0x30, 0x40]);
 }
 
-/// Cmd-F find over the real shared path: `search_full_history` finds every case-insensitive
-/// occurrence, `map_matches` maps the engine's absolute rows to selection rows, and a match
-/// applied as the selection (as `search_apply_current` does) round-trips to the matched text.
 #[test]
 fn find_matches_and_highlight() {
     use crate::app_search::map_matches;
@@ -1704,8 +1640,6 @@ fn find_matches_and_highlight() {
     assert_eq!(t.selection_to_string().as_deref(), Some("Hello"));
 }
 
-/// Wide-char (CJK) columns are cell columns, not char indices: a match after a
-/// double-width prefix reports the cell column it occupies.
 #[test]
 fn search_wide_char_columns_are_display_cells() {
     use crate::app_search::map_matches;
@@ -1733,9 +1667,6 @@ fn search_wide_char_columns_are_display_cells() {
     assert_eq!(t.selection_to_string().as_deref(), Some("hit"));
 }
 
-/// A soft-wrapped line is one line to find: a word spanning the wrap is one match, keyed
-/// at its start, whose end column runs past the grid width by the part on the next row,
-/// so selection and tint cover both halves.
 #[test]
 fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     use crate::app_search::map_matches;
@@ -1769,9 +1700,6 @@ fn a_hit_that_straddles_a_soft_wrap_is_found_once_at_the_row_it_starts_on() {
     assert_eq!(t.selection_to_string().as_deref(), Some("wrapmatch"));
 }
 
-/// A VS16 base in the last column of a soft-wrapped row stays one cell wide (the grid has no
-/// room to widen it), so the row keeps the grid's width: every hit on the run's later rows, on
-/// screen and in history, is reported in the cells it is drawn in.
 #[test]
 fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
     use crate::app_search::map_matches;
@@ -1846,8 +1774,6 @@ fn a_vs16_base_left_narrow_in_the_last_column_keeps_the_runs_stride() {
     );
 }
 
-/// The join pads a continued row back out to the grid's width before it appends the next
-/// one.
 #[test]
 fn a_soft_wrap_does_not_splice_a_match_across_the_blanks_at_a_row_end() {
     use crate::control::search_full_history;
@@ -1896,8 +1822,6 @@ fn url_detection_in_text() {
     assert_eq!(url_at("ftp://x.y not-a-link", 0), None);
 }
 
-/// A detected URL is as long as what the row paints, and says when any of it is painted
-/// faintly.
 #[test]
 fn a_plain_url_is_as_long_as_its_ink_and_says_when_the_ink_is_faint() {
     let row_of = |bytes: &str| {
@@ -1969,9 +1893,6 @@ fn safe_url_allowlist() {
 
 use super::{MetricsView, font_px_for_scale};
 
-/// `for_scale_padded` derives device px from the supplied logical pads with the same
-/// `round(·scale)` law, caps the top at the base, and equals `for_scale` at the built-in
-/// constants.
 #[test]
 fn metrics_view_for_scale_padded_honors_config_padding() {
     let v = MetricsView::for_scale_padded(super::FONT_PX, 2.0, 20.0, 5.0);
@@ -1993,10 +1914,6 @@ fn metrics_view_for_scale_padded_honors_config_padding() {
     }
 }
 
-/// Two windows on different-scale displays are both pixel-correct through one shared
-/// renderer: each resolves its own cell box independent of which size is active, and
-/// `apply_window_scale` switches the active size to the drawing window while per-window
-/// reads stay pinned.
 #[test]
 fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     use super::{App, MetricsView, WindowId};
@@ -2058,9 +1975,6 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     );
 }
 
-/// A config reload that changes the font size re-resolves every window's per-window
-/// metric authority, so hit-test / IME / grid-sizing never read a stale size after the
-/// backend is rebuilt.
 #[test]
 fn reload_refreshes_every_window_metric_to_the_new_font_size() {
     use super::{App, MetricsView, WindowId};
@@ -2102,9 +2016,6 @@ fn reload_refreshes_every_window_metric_to_the_new_font_size() {
     assert_eq!(app.windows[&w1].metrics, MetricsView::for_scale(2.0));
 }
 
-/// Live font zoom: `set_font_size` re-resolves every window's [`MetricsView`] at its
-/// own scale, so `on_resize` re-grids with the new cell box instead of drawing new glyphs
-/// into the old layout, and one step is one step of every window's text.
 #[test]
 fn live_font_zoom_refreshes_per_window_metrics() {
     use super::{App, MetricsView, WindowId};
@@ -2148,9 +2059,6 @@ fn live_font_zoom_refreshes_per_window_metrics() {
     );
 }
 
-/// A renderer rebuild is fallible. The zoom transaction must not publish
-/// new App/window geometry while the old renderer remains live, or hit
-/// testing, PTY reflow and painted glyph cells disagree after the failure.
 #[test]
 fn failed_live_font_zoom_rolls_back_font_authority_and_window_metrics() {
     use super::{App, WindowId};
@@ -2166,9 +2074,6 @@ fn failed_live_font_zoom_rolls_back_font_authority_and_window_metrics() {
     assert_eq!(app.win_cell_size(wid), old_cell);
 }
 
-/// A zoom survives the redraw-time scale re-tune and a metrics refresh (a reload that
-/// leaves the size alone), and when the size returns to the default the re-tune re-grids
-/// the window it re-tunes, so the frame never exceeds the glass.
 #[test]
 fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     use super::{App, MetricsView, WindowId};

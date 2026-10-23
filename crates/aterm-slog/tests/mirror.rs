@@ -13,13 +13,10 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::{agent_session, at};
 
-/// No alias: a sid is written `by=-`.
 fn no_alias(_: &ShortId) -> Option<ShortId> {
     None
 }
 
-/// The test's alias: a fixed function of the sid, `e` and eight hex digits,
-/// as the host's keyed hash shapes it.
 fn alias(sid: &ShortId) -> Option<ShortId> {
     let h = sid.as_str().bytes().fold(0x811c_9dc5u32, |h, b| {
         (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
@@ -27,12 +24,10 @@ fn alias(sid: &ShortId) -> Option<ShortId> {
     ShortId::new(&format!("e{h:08x}"))
 }
 
-/// The bus fold's own actors are already aliased.
 fn same(sid: &ShortId) -> Option<ShortId> {
     Some(*sid)
 }
 
-/// One take, encoded, offered to `view` and landed.
 fn take_into(log: &mut Log, view: &mut BusSpace, room: usize, ms: u64) -> usize {
     let take = log.bus_copy(room, at(ms)).encode(Tier::WireMeta, &alias);
     let n = take.slots.len();
@@ -46,7 +41,6 @@ fn take_into(log: &mut Log, view: &mut BusSpace, room: usize, ms: u64) -> usize 
     n
 }
 
-/// Take until nothing is left.
 fn drain(log: &mut Log, view: &mut BusSpace, ms: u64) {
     for _ in 0..10_000 {
         let before = log.mirror_landed();
@@ -89,9 +83,6 @@ fn session(log: &mut Log) {
     .expect("the session opens");
 }
 
-/// the bus class is its own predicate. The turn class is what it
-/// was; the bus class holds it, the need-bearing steps and `mark seen`, and
-/// nothing else.
 #[test]
 fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
     let ops = [Op::Open, Op::Close, Op::Amend, Op::Mark, Op::Gap, Op::Snap];
@@ -149,8 +140,6 @@ fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
     assert_eq!(bus_only, want, "the bus class past the turn class");
 }
 
-/// `ms` costs exactly its 8 bytes a record in heap, mirror on or
-/// off, and numbers the bus class densely; a local record has none.
 #[test]
 fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(
@@ -184,8 +173,6 @@ fn ms_costs_eight_bytes_a_record_and_numbers_the_bus_class_densely() {
     assert_eq!(log.mirror_landed(), None, "nothing mirrors until a take");
 }
 
-/// a log no bridge ever took from carries the
-/// bytes a build without phase 4 wrote, its `ms` included in nothing.
 #[test]
 fn an_unmirrored_carry_is_the_bytes_it_was() {
     let mut log = Log::new(1);
@@ -260,11 +247,6 @@ fn adopt(log: &Log, ms: u64) -> CarryAdopt {
     }
 }
 
-/// a phase-4 successor adopts the carry a 2A writer made and the
-/// carry a 2B writer made — no `ms=`, `r` lines only, an update's overlap
-/// hole, and (2B) the journal's host line: accepted, its bus class numbered
-/// densely from 1 in seq order over the carried records, `ms`'s head their
-/// count, and no cursor; its first take then covers nothing.
 #[test]
 fn a_phase4_successor_adopts_a_2a_carry_and_a_2b_carry() {
     let small = Limits::new(16, 1 << 20).expect("a small ring");
@@ -335,9 +317,6 @@ fn a_phase4_successor_adopts_a_2a_carry_and_a_2b_carry() {
     }
 }
 
-/// The cursor and the `ms` of a mirrored log cross the carry: the successor
-/// takes on from where the export's cursor stood, numbering on from the
-/// carried head, and the cut's shed bus-class records are one exact cover.
 #[test]
 fn the_landed_cursor_and_ms_cross_the_carry() {
     let mut log = Log::new(1);
@@ -369,9 +348,6 @@ fn the_landed_cursor_and_ms_cross_the_carry() {
     assert_eq!(view.dup, 0);
 }
 
-/// a take derives every loss from `ms` alone. One cover
-/// per hole, each exact, the covers' counts summing to the bus-class
-/// records evicted; a loss of local-class records only is no cover at all.
 #[test]
 fn a_take_says_each_hole_once_with_its_exact_count() {
     let small = Limits::new(12, 1 << 20).expect("a small ring");
@@ -418,9 +394,6 @@ fn a_take_says_each_hole_once_with_its_exact_count() {
     assert_eq!(view.max_ms(), log.ms_head());
 }
 
-/// under an update's fence a take stops at the fence's
-/// seq and its tail cover at the fence's `ms` head, and no landing moves the
-/// cursor the export drew; once the fence lifts, the take goes on.
 #[test]
 fn a_take_under_the_fence_stops_at_it_and_no_landing_passes_it() {
     let small = Limits::new(10, 1 << 20).expect("a small ring");
@@ -457,8 +430,6 @@ fn a_take_under_the_fence_stops_at_it_and_no_landing_passes_it() {
     assert_eq!(view.max_ms(), log.ms_head());
 }
 
-/// A landing is monotone, names its space, and never passes what the log
-/// numbered.
 #[test]
 fn a_landing_is_monotone_and_never_ahead() {
     let mut log = Log::new(1);
@@ -477,7 +448,6 @@ fn a_landing_is_monotone_and_never_ahead() {
     assert_eq!(log.mirror_landed(), Some(c));
 }
 
-/// a snapshot's `open=` and `needs=` carry only bus-class nodes.
 #[test]
 fn a_bus_fold_seeds_from_a_snap_taken_while_a_local_step_is_open() {
     let mut log = Log::new(1);
@@ -545,8 +515,6 @@ fn a_bus_fold_seeds_from_a_snap_taken_while_a_local_step_is_open() {
     assert!(late.state().needs.iter().all(Option::is_none));
 }
 
-/// an edge's actor crosses as its stable alias, never its sid,
-/// so two edges' needs and clears leave the same needs on the bus as here.
 #[test]
 fn two_edges_needs_and_clears_agree_locally_and_on_the_bus() {
     let mut log = Log::new(1);
@@ -600,8 +568,6 @@ fn two_edges_needs_and_clears_agree_locally_and_on_the_bus() {
     );
 }
 
-/// `mark seen` is bus class, so a remote fold lifts
-/// `need=failure` as the local one does.
 #[test]
 fn seen_lifts_failure_on_the_bus() {
     let mut log = Log::new(1);
@@ -624,8 +590,6 @@ fn seen_lifts_failure_on_the_bus() {
     assert_eq!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
 }
 
-/// [`drain`], every slot of kind `k` left out of what `view` is offered
-/// (the slots still land): the bus as it would be without them.
 fn drain_without(log: &mut Log, view: &mut BusSpace, ms: u64, k: Kind) {
     for _ in 0..10_000 {
         let before = log.mirror_landed();
@@ -646,8 +610,6 @@ fn drain_without(log: &mut Log, view: &mut BusSpace, ms: u64, k: Kind) {
     panic!("the take never settled");
 }
 
-/// THE HARNESS'S RELAUNCH LIFT IS THE BUS'S TOO: the old run failed, the relaunched run is open, and the harness's
-/// act is followed by `mark - seen by=harness src=aterm conf=strong`.
 #[test]
 fn a_harness_seen_lifts_failure_on_the_bus() {
     let build = || {
@@ -700,9 +662,6 @@ fn a_harness_seen_lifts_failure_on_the_bus() {
     assert_ne!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
 }
 
-/// The second wall: the mirror's encoder refuses a record of the local
-/// class, and no planted mail mark's party, kind, inbox or offset, nor any
-/// host or content key, reaches a body a take makes.
 #[test]
 fn encode_mirror_refuses_local_class_and_no_host_key_crosses() {
     let mut log = Log::new(1);
@@ -767,10 +726,6 @@ fn encode_mirror_refuses_local_class_and_no_host_key_crosses() {
     }
 }
 
-/// the successor's first take says the old
-/// space's tail as one exact `why=reset` cover in that space, then takes its
-/// own from its first record; a landing in the old space moves only the
-/// old space's owed tail.
 #[test]
 fn an_uncarried_update_says_the_old_spaces_tail_as_one_reset_cover() {
     let mut log = Log::after_handoff(
@@ -816,9 +771,6 @@ fn an_uncarried_update_says_the_old_spaces_tail_as_one_reset_cover() {
     );
 }
 
-/// engine half: a closed session's bus tail is its bus-class
-/// records past the cursor, its close among them, and a take of it settles
-/// once its close has landed.
 #[test]
 fn a_closed_sessions_bus_tail_holds_its_close() {
     let mut log = Log::new(1);
@@ -848,10 +800,6 @@ fn a_closed_sessions_bus_tail_holds_its_close() {
     assert!(view.holes().is_empty());
 }
 
-/// the reader's view is the law. A seeded session mirrored with
-/// planted duplicates, whole batches offered twice and a batch offered in
-/// reverse (a re-pinned slot landing late) shows each record once, `ms`
-/// dense, and folds to the local fold's bus facts and totals.
 #[test]
 fn bus_fold_equals_local_bus_view() {
     for seed in 1..=40u64 {
@@ -985,10 +933,6 @@ fn bus_fold_equals_local_bus_view() {
     }
 }
 
-/// a session that closes while an
-/// update's export holds its readers' fence is judged against its LIVE `ms`
-/// head, not the fence's: its tail is owed even when the cursor stands at
-/// the fence.
 #[test]
 fn a_session_closing_under_the_fence_owes_its_tail_past_the_fence() {
     let mut log = Log::new(1);
@@ -1022,9 +966,6 @@ fn a_session_closing_under_the_fence_owes_its_tail_past_the_fence() {
     assert!(view.holes().is_empty());
 }
 
-/// A LOG NO TAKE EVER REACHED (fixer F2): its bus tail is engaged from its
-/// first record, so its take says everything the ring no longer holds as one
-/// exact cover, then its live records and its close.
 #[test]
 fn an_unengaged_logs_bus_tail_is_whole_from_its_first_record() {
     let mut log = Log::with_limits(1, Limits::new(8, 1 << 20).expect("a ring"));
@@ -1056,10 +997,6 @@ fn an_unengaged_logs_bus_tail_is_whole_from_its_first_record() {
     assert_eq!(bus.bus_totals().closed, Some("shell-exit"));
 }
 
-/// A VIEW THAT LOST RECORDS SEEDS FROM A SNAPSHOT PAST THEM (fixer F5): a
-/// claim evicted before the first take is no record of the view, but the
-/// take's snapshot folds it (`upto=` past the cover); a view whose cover no
-/// snapshot it holds reaches is `lost`, never whole.
 #[test]
 fn a_view_holding_its_start_and_a_cover_seeds_from_the_snap_past_it() {
     let mut log = Log::with_limits(1, Limits::new(8, 1 << 20).expect("a ring"));
@@ -1110,10 +1047,6 @@ fn a_view_holding_its_start_and_a_cover_seeds_from_the_snap_past_it() {
     assert!(bare.fold().1, "partial");
 }
 
-/// THE READER TRUSTS NO BODY PAST THE BUS CLASS (fixer F17): a label with
-/// free text forged on a session's face is foreign, a key above the bus's
-/// tier is stripped from a record that is bus class, and a cover counting
-/// past any seq a log numbers is foreign (no overflow, no panic).
 #[test]
 fn a_hostile_body_is_foreign_or_stripped_never_folded_as_is() {
     let mut view = BusSpace::new(1);
@@ -1150,11 +1083,6 @@ fn a_hostile_body_is_foreign_or_stripped_never_folded_as_is() {
     assert_eq!(view.foreign, 2, "the forged label and the endless cover");
 }
 
-/// UNKNOWN IS NOT HOSTILE (fixer F17's reader, across builds): a fleet runs
-/// mixed builds, and a well-formed record a newer writer's bus class holds
-/// but this build calls local (a label here) is foreign and never folded —
-/// yet its `ms` is HELD, so the view stays dense and `holes()` names no loss
-/// nobody said.
 #[test]
 fn a_record_outside_this_builds_bus_class_holds_its_ms_and_is_never_folded() {
     let mut view = BusSpace::new(1);
@@ -1246,11 +1174,6 @@ fn a_record_outside_this_builds_bus_class_holds_its_ms_and_is_never_folded() {
     assert_eq!(view.max_ms(), 6, "an ms past any seq is never held");
 }
 
-/// A SNAPSHOT COUNTS ONCE IT LANDS (fixer F3's retake): a take the bridge
-/// dropped unlanded (its session's face refused by the subject budget) owed
-/// its snapshot, so the retake — after the ring evicted the claim — holds
-/// one again, and the view that lost the claim seeds from it with the need
-/// held.
 #[test]
 fn a_dropped_takes_snapshot_is_owed_again_and_a_landed_one_is_not() {
     let mut log = Log::with_limits(1, Limits::new(8, 1 << 20).expect("a ring"));
@@ -1317,10 +1240,6 @@ fn a_dropped_takes_snapshot_is_owed_again_and_a_landed_one_is_not() {
     );
 }
 
-/// A RETAKE WITHOUT ROOM FOR THE SNAPSHOT STILL OWES IT (fixer F3's retake,
-/// a thin bucket): a take the bridge dropped unlanded handed out a snapshot;
-/// the retake's room (the bridge's bucket) holds only the open and the
-/// cover of the evicted claim, so it hands out none.
 #[test]
 fn a_retake_with_no_room_for_the_snapshot_still_owes_it() {
     let mut log = Log::with_limits(1, Limits::new(8, 1 << 20).expect("a ring"));
@@ -1381,10 +1300,6 @@ fn a_retake_with_no_room_for_the_snapshot_still_owes_it() {
     );
 }
 
-/// A CARRY ACROSS A CHANGE OF THE BUS CLASS (fixer F9): a mirrored carry
-/// whose writer numbered a record this build calls local, and left one this
-/// build calls bus class unnumbered, is adopted, not refused: its numbers
-/// are the writer's.
 #[test]
 fn a_mirrored_carry_is_read_whatever_the_writers_bus_class() {
     let mut log = Log::new(1);
@@ -1424,9 +1339,6 @@ fn a_mirrored_carry_is_read_whatever_the_writers_bus_class() {
     assert!(view.holes().is_empty(), "{:?}", view.holes());
 }
 
-/// WHICH SIDS CROSS (D4): a restored session's open and its
-/// `amend - restore` carry `prev=` and `lineage=` as sids, unaliased; no
-/// other key of theirs carries one.
 #[test]
 fn a_restored_sessions_lineage_sids_reach_the_bus() {
     let a = "s-aaaaaaaaaaaaaaaaaaaa";
@@ -1468,7 +1380,6 @@ fn a_restored_sessions_lineage_sids_reach_the_bus() {
     assert_eq!(keys, want, "the sid-valued keys on the bus: {take:#?}");
 }
 
-/// Mirror counters read from a carry stay inside the log's sequence domain.
 #[test]
 fn a_mirrored_carry_refuses_counters_past_its_sequence_domain() {
     let mut log = Log::new(1);
@@ -1533,8 +1444,6 @@ fn a_mirrored_carry_refuses_counters_past_its_sequence_domain() {
     );
 }
 
-/// A real snapshot whose bounded need words omit live claims is partial,
-/// and restoring a mark's provenance never turns its claim into an observation.
 #[test]
 fn a_late_snapshot_reports_omitted_needs_and_keeps_mark_claims_as_claims() {
     let make = |n: usize| {
@@ -1617,11 +1526,6 @@ fn a_late_snapshot_reports_omitted_needs_and_keeps_mark_claims_as_claims() {
     );
 }
 
-/// PHASE 3B (A5, §6 items 5 and 6): an exact outcome refinement and an exact
-/// wall confirmation are bus class (a turn amend, a wall step's amend), so a
-/// bus fold holding the space from its first record re-buckets and raises
-/// the need's source exactly as the host fold does: their bus facts and bus
-/// totals agree after each.
 #[test]
 fn an_out_refining_amend_and_a_confirmation_agree_on_host_and_bus() {
     use aterm_slog::{Amend, TurnTracker, Verdict, WallKind};
@@ -1680,10 +1584,6 @@ fn an_out_refining_amend_and_a_confirmation_agree_on_host_and_bus() {
     agree(&log, &view, "after the confirmation");
 }
 
-/// AN EDGE'S RAW SID NEVER CROSSES BY `op_by=`: a turn an edge opened and `ctl` closed restates its opener on the
-/// close as the host id `op_by=<sid>`; at `Tier::Wire` the close carries
-/// none, and no body the mirror takes holds the raw sid (the open's own
-/// `by=` crosses as the edge's alias).
 #[test]
 fn an_edges_raw_sid_never_crosses_by_the_restated_opener() {
     let sid = ShortId::new("s-edge42").expect("a sid");
@@ -1728,12 +1628,6 @@ fn an_edges_raw_sid_never_crosses_by_the_restated_opener() {
     );
 }
 
-/// THE BUS NEVER GUESSES A MAIL LINK: the
-/// local log links a `ctl` turn to the one `kind=task` mail before it and
-/// its brief prints ` mail=@9~`; the mail mark is local class and its
-/// `off=` host tier, so a bus fold holds no link and the brief a peer folds
-/// from the bus (as `fabric brief` does, with that fold's links) prints no
-/// `mail=`.
 #[test]
 fn a_bus_brief_names_no_mail_link() {
     let mut log = Log::new(1);

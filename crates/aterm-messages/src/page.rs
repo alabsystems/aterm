@@ -690,7 +690,8 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
     }
 }
 
-/// The later record that superseded `rec` ([`Retired::Superseded`]), if any.
+/// The later record that superseded `rec` ([`Retired::Superseded`]), unless `rec` is an error and
+/// that record was not posted as one.
 fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId> {
     let Some(Retired::Superseded { by }) = rec.retired() else {
         return None;

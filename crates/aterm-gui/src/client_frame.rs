@@ -5,7 +5,7 @@
 
 use aterm_window::window::CursorIcon;
 
-/// One of the header's window buttons, laid out left to right as [`ClientFrame::buttons`] lists them.
+/// One of the header's window buttons, laid out left to right as `ClientFrame::buttons` lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CaptionButton {
     /// Minimize the window.
@@ -129,7 +129,7 @@ pub(crate) struct ClientFrame {
     pub(crate) edges: bool,
     /// The band is the window's header: in every state but fullscreen.
     pub(crate) header: bool,
-    /// Where the desktop puts the buttons ([`ButtonLayout::desktop`]).
+    /// Where the desktop puts the buttons (`ButtonLayout::desktop`).
     pub(crate) layout: ButtonLayout,
 }
 

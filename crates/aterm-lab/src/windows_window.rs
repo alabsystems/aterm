@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `windows window [--arch A]...`: WB.3's runtime smoke (docs/AUDIT-third- party-2026-10-15.md, section 7), a windowed `aterm-gui` in the runner's desktop session of the lane's VM ([`crate::windows`]), driven as a person drives it: by the VM's USB keyboard and tablet through QMP, so every key and click goes through Windows' own input stack, focus, IME and window manager.
+//! `windows window`: Windows VM desktop smoke test driven via QMP USB keyboard and tablet.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,20 +19,17 @@ use crate::windows_guest::{self as guest, Arch, Desktop};
 use crate::windows_smoke::{TYPED, WARP, bin_dir};
 use crate::{Fail, LAB, Res};
 
-/// How long something that must happen may take: a hang detector, never a
-/// latency budget.
+/// How long something that must happen may take.
 const WITHIN: Duration = Duration::from_secs(60);
 
-/// How many client rows [`Run::exposed`] lifts past the screen's top edge:
-/// PowerShell's first three lines at 150 %.
+/// How many client rows [`Run::exposed`] lifts past the screen's top edge.
 const LIFT: i32 = 120;
 
-/// What [`Run::exposed`] has PowerShell do while the window's top rows are past the screen's edge: clear the screen and print [`EXPOSED_ECHO`] on its first line, which no key typed shows.
+/// What [`Run::exposed`] has PowerShell do while the window's top rows are past the screen's edge.
 pub const EXPOSED_TYPED: &str = "Clear-Host; Write-Output ('ROWS-' + 6*7)";
 pub const EXPOSED_ECHO: &str = "ROWS-42";
 
-/// The `r` part of a `w`-pixel-wide image of `n`-byte pixels: its pixels, width
-/// and height.
+/// The `r` part of a `w`-pixel-wide image of `n`-byte pixels.
 fn crop(px: &[u8], w: usize, n: usize, r: desk::Rect) -> (Vec<u8>, usize, usize) {
     let col = |v: i32| usize::try_from(v).unwrap_or(0);
     let (l, t, rr, b) = (col(r.l), col(r.t), col(r.r), col(r.b));
@@ -43,31 +40,31 @@ fn crop(px: &[u8], w: usize, n: usize, r: desk::Rect) -> (Vec<u8>, usize, usize)
     (out, rr - l, b - t)
 }
 
-/// What the IME row types around the composition, and what PowerShell prints only when the IME's committed text (`日本`, from `nihon`) reached it.
+/// What the IME row types around the composition.
 pub const IME_BEFORE: &str = "Write-Output ('IME-' + '";
 pub const IME_READING: &str = "nihon";
 pub const IME_AFTER: &str = "')\n";
 pub const IME_ECHO: &str = "IME-日本";
 
-/// aterm's composition (`chrome`'s `ime` line) after each key of [`IME_READING`] (a romaji letter that waits for the next key shows full-width), and once Space converted it.
+/// Expected `chrome` `ime` composition after each key of [`IME_READING`] and after Space.
 pub const IME_STEPS: [&str; 5] = ["ｎ", "に", "にｈ", "にほ", "にほｎ"];
 pub const IME_COMPOSING: &str = IME_STEPS[4];
 pub const IME_CONVERTED: &str = "日本";
 
-/// The IME conversion mode bits the reading needs (`IME_CMODE_NATIVE`, `IME_CMODE_KATAKANA`, `IME_CMODE_FULLSHAPE`) and their hiragana values: native and full-width, not katakana.
+/// IME conversion mode mask and hiragana value required by the reading.
 pub const CMODE_MASK: u32 = 0x1 | 0x2 | 0x8;
 pub const CMODE_HIRAGANA: u32 = 0x1 | 0x8;
 
-/// What a row types to read the console width PowerShell sees, after `tag`: ConPTY's view of a re-grid, which is what the shell lays its lines out by, not aterm's own count.
+/// What a row types to read the console width PowerShell sees, after `tag`.
 #[must_use]
 pub fn width_typed(tag: &str) -> String {
     format!("Write-Output ('{tag}' + [Console]::WindowWidth)\n")
 }
 
-/// The tags the resize, DPI change and monitor rows read the width under, each its own, so no row's echo is an earlier row's.
+/// The tags the resize, DPI change and monitor rows read the width under, each its own.
 pub const WIDTH_TAGS: [&str; 4] = ["W=", "DPI-", "RIGHT-", "LEFT-"];
 
-/// How far the resize row drags the window's right edge left, in pixels, from inside Windows' invisible resize border (GetWindowRect's right edge minus [`EDGE_IN`]).
+/// How far the resize row drags the window's right edge left, in pixels.
 pub const DRAG: i32 = 180;
 pub const EDGE_IN: i32 = 4;
 
@@ -78,8 +75,7 @@ pub const SCALED: i32 = 2;
 pub const JAPANESE: &str = "0411";
 pub const ENGLISH: &str = "0409";
 
-/// The display a run drives: the virtio-gpu's monitor (primary, the
-/// tablet's) and ramfb's.
+/// The display a run drives.
 #[derive(Clone, Debug)]
 struct Display {
     primary: Monitor,
@@ -116,8 +112,7 @@ fn monitors(up: &Up) -> Result<Vec<Monitor>, String> {
     Ok(m)
 }
 
-/// Wait (a hang detector) until `probe` holds: its value, or what it last
-/// saw.
+/// Wait (a hang detector) until `probe` holds: its value, or what it last saw.
 fn within<T>(what: &str, mut probe: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     let t0 = Instant::now();
     loop {
@@ -134,8 +129,7 @@ fn within<T>(what: &str, mut probe: impl FnMut() -> Result<T, String>) -> Result
     }
 }
 
-/// Put the display as the run wants it: the virtio-gpu's monitor primary at
-/// (0,0) at its recommended scaling (100 %), ramfb's to its right.
+/// Put the display as the run wants it.
 fn set_display(up: &Up) -> Result<Display, String> {
     let all = monitors(up)?;
     let virtio = all
@@ -236,8 +230,7 @@ fn click(l: &Layout, d: &Display, (x, y): (i32, i32)) -> Result<(), String> {
     Ok(())
 }
 
-/// Drag with the tablet's left button from `from` to `to` on the primary
-/// monitor, in steps, as a hand does.
+/// Drag with the tablet's left button from `from` to `to` on the primary monitor, in steps.
 fn drag(l: &Layout, d: &Display, from: (i32, i32), to: (i32, i32)) -> Result<(), String> {
     let r = d.primary.rect;
     let at = |(x, y): (i32, i32)| desk::tablet_move(x - r.l, y - r.t, r.width(), r.height());
@@ -262,9 +255,7 @@ fn drag(l: &Layout, d: &Display, from: (i32, i32), to: (i32, i32)) -> Result<(),
     Ok(())
 }
 
-/// A screenshot of `device`'s screen (the virtio-gpu's by default; `None`
-/// is ramfb's) at `path`: the window as the monitor shows it, chrome, IME
-/// windows and all.
+/// A screenshot of `device`'s screen (the virtio-gpu's by default; `None` is ramfb's) at `path`.
 fn shot(l: &Layout, path: &Path, device: Option<&str>) -> String {
     let p = path.to_string_lossy();
     match qmp(l, desk::screendump_command(&p, device)) {
@@ -281,9 +272,7 @@ struct Session<'a> {
     pid: u32,
 }
 
-/// The config a `--cpu` run's instance takes: the cursor still (no blink,
-/// no trail) and the stats Deck off, so the frame `image` photographs is the
-/// one the window keeps showing, as the Linux lane's `--cpu` rows hold it.
+/// The config a `--cpu` run's instance takes.
 fn cpu_config() -> String {
     format!(
         "cursor_blink = false\ncursor_trail = false\n{}{}",
@@ -293,8 +282,7 @@ fn cpu_config() -> String {
 }
 
 impl<'a> Session<'a> {
-    /// Start instance `n` of `arch` in the runner's desktop (on the CPU
-    /// presenter with `cpu`) and wait until it answers `ready`.
+    /// Starts instance `n` of `arch` in the runner's desktop and waits for `ready`.
     fn launch(up: &'a Up, arch: Arch, n: u32, cpu: bool) -> Result<Session<'a>, String> {
         let dir = instance_dir(arch, n);
         let task = task_name(&format!("window-{}-{n}", arch.name()));
@@ -363,14 +351,12 @@ impl<'a> Session<'a> {
         Ok(s)
     }
 
-    /// `aterm-ctl` (over SSH, as the runner) to this instance: its reply
-    /// when it exited 0 and the reply is `OK …`.
+    /// `aterm-ctl` (over SSH, as the runner) to this instance.
     fn ctl(&self, words: &[&str]) -> Result<String, String> {
         self.ask(words, true)
     }
 
-    /// `aterm-ctl` to this instance: its reply when it exited 0 (and, when
-    /// `ok`, starts `OK`; `text` and `chrome` answer without it).
+    /// `aterm-ctl` to this instance.
     fn ask(&self, words: &[&str], ok: bool) -> Result<String, String> {
         let quoted: Vec<String> = words.iter().map(|w| guest::cmd_quote(w)).collect();
         let out = self.up.ssh.run(&format!(
@@ -429,9 +415,7 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Its task stopped and gone, and aterm-gui with it (the administrator
-    /// ends it: the runner may not end a process of its desktop session from
-    /// SSH).
+    /// Its task stopped and gone, and aterm-gui with it.
     fn end(&self) {
         let _ = self.up.admin.ps(&guest::desktop_stop(&self.task));
         if self.pid != 0 && self.exit().is_none() {
@@ -485,7 +469,7 @@ impl Dims {
     }
 }
 
-/// The machine `arch`'s process runs as (`ProcessMachineTypeInfo`'s `IMAGE_FILE_MACHINE_*`, as the desk helper prints it).
+/// The machine `arch`'s process runs as.
 #[must_use]
 pub const fn machine(arch: Arch) -> &'static str {
     match arch {
@@ -499,10 +483,7 @@ fn count(r: &str, key: &str) -> Option<u64> {
     field(r, key)?.parse().ok()
 }
 
-/// `frames` from `metrics` (every successful present; `n_present` counts
-/// only output-to-present samples), the presents it dropped and why the last
-/// one was, and the surface `dims` names, as the row's evidence: `?` for what
-/// aterm did not answer.
+/// Formats `frames`, dropped presents, and the `dims` surface for a row's evidence.
 fn presents(s: &Session<'_>) -> String {
     let metrics = s.ctl(&["metrics"]).ok();
     let read = |key: &str| {
@@ -535,10 +516,7 @@ fn presents(s: &Session<'_>) -> String {
 /// How long [`Watch`] watches: the IME row ends well within it.
 const WATCH_MS: u32 = 120_000;
 
-/// The session's input as a windowless watcher ([`desk::HELPER`]'s `watch`)
-/// logs it while a row runs: the foreground window and focus, aterm's
-/// keyboard layout, IME open status and conversion mode, the keys held, the
-/// windows that come and go.
+/// Session input watcher ([`desk::HELPER`]'s `watch`) running alongside a row.
 struct Watch<'a> {
     up: &'a Up,
     arch: Arch,
@@ -624,8 +602,7 @@ struct Run<'a> {
     results: PathBuf,
     /// Whether the IME row runs [`Watch`].
     watch: bool,
-    /// `--cpu`: the instances present on the CPU, and the rows hold the
-    /// window's pixels to the presented frame ([`Run::held`]).
+    /// `--cpu`: the instances present on the CPU.
     cpu: bool,
 }
 
@@ -650,8 +627,7 @@ impl Run<'_> {
         )
     }
 
-    /// With `--cpu`, `detail` and then what [`Run::held`] says of the
-    /// window's pixels now; `detail` alone without it.
+    /// With `--cpu`, `detail` and then what [`Run::held`] says of the window's pixels now.
     fn and_held(&self, s: &Session<'_>, what: &str, detail: String) -> Result<String, String> {
         if !self.cpu {
             return Ok(detail);
@@ -664,13 +640,7 @@ impl Run<'_> {
         Ok(format!("{detail}; {held}"))
     }
 
-    /// The frame aterm presented (`image`, kept as
-    /// `<arch>-window-cpu-<what>-frame.png`, apart from the row's screenshot)
-    /// held to the window's own pixels, read back from its DC by the desk
-    /// helper (`readback`, kept as `<arch>-window-cpu-<what>-window.ppm`):
-    /// equal exactly when the frame is the client area's size, else the frame
-    /// at `dims`' offset and each band pixel the frame's nearest, as the
-    /// Linux lane holds a window the window system sized.
+    /// Compares the frame `image` captured with the window DC pixels read back by the helper.
     fn held(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
         let stem = format!("{}-{}-{what}", self.arch.name(), self.tag());
         let image = s.ctl(&["image", &format!("{stem}-frame.png")])?;
@@ -788,9 +758,7 @@ impl Run<'_> {
         ))
     }
 
-    /// Where `s`'s window's client area is ([`desk::Place`]), after moving it
-    /// (`move`, so the client area's top is at screen row `n`) or widening it
-    /// (`grow`, by `n` pixels) when asked to.
+    /// Where `s`'s window's client area is ([`desk::Place`]).
     fn place(&self, s: &Session<'_>, change: Option<(&str, i32)>) -> Result<desk::Place, String> {
         let pid = s.pid.to_string();
         let n = change.map(|(_, n)| n.to_string());
@@ -803,8 +771,7 @@ impl Run<'_> {
             .ok_or_else(|| format!("desk.ps1 {} answered {}", args[0], text.trim()))
     }
 
-    /// What aterm presented while rows of its window were past the screen's
-    /// edge, painted once they come back.
+    /// Checks what `aterm` presented while rows of its window were off-screen.
     fn exposed(&self, s: &Session<'_>, what: &str) -> Result<String, String> {
         let at = self.place(s, None)?;
         let ch = i32::try_from(at.client.1).map_err(|_| format!("{at:?}: no height"))?;
@@ -946,8 +913,7 @@ impl Run<'_> {
         )
     }
 
-    /// aterm's composition as `chrome`'s `ime` line shows it (its text and
-    /// caret).
+    /// Aterm's composition as `chrome`'s `ime` line shows it (its text and caret).
     fn composition(s: &Session<'_>) -> Result<String, String> {
         let chrome = s.ask(&["chrome"], false)?;
         crate::linux_baseline::ime_line(&chrome)
@@ -955,8 +921,7 @@ impl Run<'_> {
             .ok_or_else(|| "`chrome` has no ime line".to_string())
     }
 
-    /// What aterm holds when a row fails: its last screen line and its
-    /// composition.
+    /// What aterm holds when a row fails: its last screen line and its composition.
     fn holds(s: &Session<'_>) -> String {
         let line = s.ask(&["text"], false).map_or_else(
             |e| e,
@@ -1009,9 +974,7 @@ impl Run<'_> {
         }
     }
 
-    /// The window's keyboard layout made `want` (`0411`, `0409`): Win+Space,
-    /// which steps through the session's two input languages, pressed only
-    /// when it is not `want` already.
+    /// The window's keyboard layout made `want` (`0411`, `0409`).
     fn to_layout(&self, s: &Session<'_>, want: &str) -> Result<bool, String> {
         if s.window()?.layout == want {
             return Ok(false);
@@ -1087,8 +1050,7 @@ impl Run<'_> {
         ))
     }
 
-    /// Type [`width_typed`]`(tag)` and await PowerShell's `<tag><cols>`:
-    /// the width the shell was told, after a re-grid to `cols` columns.
+    /// Type [`width_typed`]`(tag)` and await PowerShell's `<tag><cols>`.
     fn shell_width(&self, s: &Session<'_>, tag: &str, cols: u32) -> Result<String, String> {
         type_text(self.l(), &width_typed(tag))?;
         let echo = format!("{tag}{cols}");
@@ -1376,8 +1338,7 @@ struct Ask {
     arches: Vec<Arch>,
     /// `--watch`: the IME row's input watched ([`Watch`]), its log kept.
     watch: bool,
-    /// `--cpu`: the rows on aterm's CPU presenter, each holding the window's
-    /// pixels to the presented frame ([`Run::held`]).
+    /// `--cpu`: run on the CPU presenter and compare window pixels with the presented frame.
     cpu: bool,
 }
 
@@ -1418,7 +1379,7 @@ fn parse_args(args: &[String]) -> Result<Ask, Fail> {
 
 /// `windows window [--arch A]... [--watch] [--cpu]`.
 /// # Errors
-/// A usage error, or the lane could not be brought up (NOT RUN).
+/// A usage error, or the lane could not be brought up (not run).
 pub fn cmd_window(args: &[String]) -> Res {
     let ask = parse_args(args)?;
     let l = Layout::find()?;
@@ -1500,8 +1461,6 @@ pub fn cmd_window(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
-    /// The launch at 150 %'s readback, small: a frame whose last rows are
-    /// past the screen's edge, read back white there.
     #[test]
     fn a_hold_on_the_screens_part_ignores_the_rows_past_its_edge_and_no_others() {
         let (w, h) = (3, 4);

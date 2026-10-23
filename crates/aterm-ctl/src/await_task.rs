@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl await task`: a manager's ONE wait over its workers, wherever on this machine they run (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2).
+//! `aterm ctl await task`: a manager's wait over its workers.
 
 use std::io::{self, BufReader};
 use std::path::Path;
@@ -15,16 +15,15 @@ use super::{
     stdout_handle, stream_count,
 };
 
-/// The whole wait when neither the verb's `timeout=` nor `--timeout` names one: a worker's task is minutes to an hour, and the manager runs this as a background command whose exit wakes it.
+/// The whole wait when neither the verb's `timeout=` nor `--timeout` names one.
 pub(crate) const DEFAULT_TOTAL: Duration = Duration::from_secs(3600);
 
-/// The longest one leg asks for: the server's clamp on every `await` (`aterm_control::wire::WAIT_MAX_MS`).
+/// The longest one leg asks for: the server's clamp on every `await`.
 pub(crate) const LEG_MAX: Duration = Duration::from_secs(600);
 
-/// What a leg's socket may take beyond the wait it asked for: the reply's own write, and a loaded machine.
+/// What a leg's socket may take beyond the wait it asked for: the reply's own write.
 pub(crate) const LEG_SLACK: Duration = Duration::from_secs(30);
 
-/// The client's usage line for this form.
 const USAGE: &str = "ERR usage: aterm ctl [@<sel>] await task [@<sel>[:<rev>][,@<sel>...]] \
                      [any|all] [since=<rev>] [timeout=<ms>]";
 
@@ -74,9 +73,6 @@ fn usage() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, USAGE)
 }
 
-/// Parse `[@<sel>] await task <words…>`. A leading selector is the one target;
-/// otherwise the list names them; neither is the session the call resolves to
-/// (`@.`).
 fn parse(parts: &[String]) -> io::Result<Request> {
     let (leading, rest) = match parts.first() {
         Some(sel) if sel.starts_with('@') => (Some(sel.as_str()), &parts[1..]),
@@ -145,10 +141,7 @@ fn parse(parts: &[String]) -> io::Result<Request> {
     Ok(request)
 }
 
-/// One list element, `@<sel>` or `@<sel>:<rev>`. A selector that names
-/// nothing (`@`, `@:3`, an empty `@$W` in `@$W1,@$W2`) is refused
-/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]), never waited on as the
-/// session the call resolves to.
+/// One list element, `@<sel>` or `@<sel>:<rev>` ([`aterm_types::control_verbs::EMPTY_SELECTOR`]).
 fn target(element: &str) -> io::Result<Target> {
     let body = element.strip_prefix('@').ok_or_else(usage)?;
     let (selector, since) = match body.split_once(':') {
@@ -167,7 +160,6 @@ fn target(element: &str) -> io::Result<Target> {
     })
 }
 
-/// The global sid a selector body names, when it names one (`s-<hex>`).
 fn global_sid(selector: &str) -> Option<&str> {
     selector
         .strip_prefix("s-")
@@ -182,9 +174,6 @@ struct Group {
     targets: Vec<Target>,
 }
 
-/// Group `targets` by the instance hosting each: `pinned` (`--sock`/`--pid`)
-/// takes them all; else a global sid goes where its graph entry points, and
-/// anything else to `default`, the instance the call resolves to.
 fn group(
     targets: Vec<Target>,
     pinned: bool,
@@ -218,7 +207,6 @@ fn group(
     Ok(groups)
 }
 
-/// How one leg ended.
 enum Leg {
     /// `OK <n>`: the instance has the news the combine asked for.
     Answered(Vec<String>),
@@ -240,14 +228,9 @@ enum Leg {
     Code(ExitCode),
 }
 
-/// One leg's round trip: `(sock, request line, the wait it asks for)`.
 type LegFn = dyn Fn(&str, &str, Duration) -> Leg + Send + Sync;
 
-/// How a group's legs reach their instance: the longest wait one leg asks
-/// for, the round trip — the socket's ([`socket_leg`]), a drive's
-/// ([`driven_leg`]), or a test's script — and how a leg its peer did not
-/// serve is asked again ([`Leg::Again`]): after `again.0`, for at most
-/// `again.1` of such legs in a row.
+/// How a group's legs reach their instance ([`socket_leg`], [`driven_leg`], [`Leg::Again`]).
 #[derive(Clone)]
 struct Legs {
     max: Duration,
@@ -255,7 +238,6 @@ struct Legs {
     again: (Duration, Duration),
 }
 
-/// Send one `await task` leg to `sock` and read its rows.
 fn socket_leg(sock: &str, request: &str, wait: Duration) -> Leg {
     let stream = match connect_served(sock, TargetOrigin::Pinned, Some(wait + LEG_SLACK)) {
         Ok(Ok(stream)) => stream,
@@ -275,26 +257,17 @@ fn socket_leg(sock: &str, request: &str, wait: Duration) -> Leg {
     })
 }
 
-/// The longest one leg over a drive asks for (`aterm ctl --host`,
-/// [`crate::remote`]): the peer cuts a drive connection at 30 s, so each leg
-/// is a fresh connection well inside it.
+/// The longest one leg over a drive asks for (`aterm ctl --host`, [`crate::remote`]).
 const DRIVEN_LEG_MAX: Duration = Duration::from_secs(20);
 
-/// What a leg's drive connection may take beyond the wait it asks for: the
-/// dial, the proof and the reply, inside the peer's 30 s cut.
 const DRIVEN_SLACK: Duration = Duration::from_secs(8);
 
-/// How long a group waits before it asks again a leg the peer did not serve
-/// ([`Leg::Again`], [`Legs::again`]).
+/// Backoff before retrying an unserved leg ([`Leg::Again`], [`Legs::again`]).
 const AGAIN_AFTER: Duration = Duration::from_secs(1);
 
-/// The longest a group asks again, in a row, legs the peer does not serve
-/// ([`Leg::Again`], [`Legs::again`]): a peer that has served none for a
-/// minute is not busy or restarting, and the wait ends with its refusal.
+/// The longest a group asks again ([`Leg::Again`], [`Legs::again`]).
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
-/// Send one `await task` leg over a fresh drive connection to `host` and read
-/// its rows.
 fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Duration) -> Leg {
     let mut link = match drive(host, wait + DRIVEN_SLACK) {
         Ok(link) => link,
@@ -323,8 +296,6 @@ fn driven_leg(drive: crate::FleetDriveFn, host: &str, request: &str, wait: Durat
     )
 }
 
-/// One leg's answer off `reader`: `hung_up` is a connection that closed
-/// before the whole of it.
 fn read_leg<R: io::BufRead>(reader: &mut R, max_bytes: usize, hung_up: impl Fn() -> Leg) -> Leg {
     let mut status = String::new();
     match read_status_line(reader, &mut status) {
@@ -360,18 +331,15 @@ fn read_leg<R: io::BufRead>(reader: &mut R, max_bytes: usize, hung_up: impl Fn()
     }
 }
 
-/// The value of a row's `key=`.
 fn row_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
     row.split_whitespace()
         .find_map(|t| t.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
 }
 
-/// The `rev=` of a row.
 fn row_rev(row: &str) -> Option<u64> {
     row_field(row, "rev").and_then(|rev| rev.parse().ok())
 }
 
-/// The global sid a row names (`@<sid> …`).
 fn row_sid(row: &str) -> Option<&str> {
     row.split_whitespace()
         .next()
@@ -379,13 +347,10 @@ fn row_sid(row: &str) -> Option<&str> {
         .and_then(global_sid)
 }
 
-/// Whether a row says its session closed.
 fn row_closed(row: &str) -> bool {
     row_field(row, "state") == Some("closed")
 }
 
-/// The row a target that is gone stands as: its last row with `state=closed`,
-/// or, never having had one, its selector and its baseline.
 fn closed_row(last: Option<&str>, target: &Target) -> String {
     match last {
         Some(row) => row
@@ -407,8 +372,6 @@ fn closed_row(last: Option<&str>, target: &Target) -> String {
     }
 }
 
-/// Which of `live` a leg's refusal says is gone: `ERR no such session
-/// @<sid>` for a target this wait already read.
 fn gone_target(e: &io::Error, targets: &[Target], live: &[usize]) -> Option<usize> {
     let refusal = e.to_string();
     let selector = refusal.strip_prefix("ERR no such session @")?;
@@ -417,7 +380,6 @@ fn gone_target(e: &io::Error, targets: &[Target], live: &[usize]) -> Option<usiz
         .find(|&i| targets[i].selector == selector)
 }
 
-/// The request line for `targets` (each with its since) on one leg.
 fn leg_request<'a>(
     targets: impl Iterator<Item = &'a Target>,
     combine: Combine,
@@ -437,7 +399,6 @@ fn leg_request<'a>(
     )
 }
 
-/// What a group's thread tells the run.
 enum Report {
     /// The rows as last read (the baseline, or a re-arm's timeout).
     Rows(usize, Vec<String>),
@@ -445,7 +406,6 @@ enum Report {
     End(usize, End),
 }
 
-/// How a group's wait ended.
 enum End {
     Answered(Vec<String>),
     TimedOut(Vec<String>),
@@ -453,7 +413,6 @@ enum End {
     Code(ExitCode),
 }
 
-/// A reply this client cannot read.
 fn malformed(what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -461,9 +420,6 @@ fn malformed(what: &str) -> io::Error {
     )
 }
 
-/// Run one group to its end: the baseline leg, then legs until news, the
-/// deadline, or a failure; a hang-up follows the successor, and a target that
-/// is gone stands as its `closed` row ([the module](self), 5).
 fn run_group(
     index: usize,
     mut group: Group,
@@ -481,7 +437,6 @@ fn run_group(
     loop {
         let live: Vec<usize> = (0..n).filter(|&i| !gone[i]).collect();
         if live.is_empty() {
-            // Every target closed: each is news, so `all` has its answer too.
             return End::Answered(rows.into_iter().flatten().collect());
         }
         let wait = if !baseline_read || (combine == Combine::Any && gone.contains(&true)) {
@@ -598,15 +553,11 @@ fn run_group(
     }
 }
 
-/// How the whole wait ended: every target's rows, instance by instance, and
-/// whether the combine was answered; or an exit a connect phase or a gone
-/// instance already explained.
 enum Waited {
     Rows { rows: Vec<String>, answered: bool },
     Code(ExitCode),
 }
 
-/// Ask every group at once, one thread each, and combine their ends.
 fn wait_task_groups(
     groups: Vec<Group>,
     combine: Combine,
@@ -659,7 +610,7 @@ fn wait_task_groups(
     })
 }
 
-/// `[@<sel>] await task …`: the whole client wait ([the module](self)).
+/// `[@<sel>] await task …`.
 pub(crate) fn run_await_task(
     parts: &[String],
     pinned: bool,
@@ -698,7 +649,7 @@ pub(crate) fn run_await_task(
     )?)
 }
 
-/// `await task …` over the fleet (`aterm ctl --host <host>`, [`crate::remote`]): every target a worker of that Mac named by its sid, the one group asked in legs of at most [`DRIVEN_LEG_MAX`], each a fresh drive connection `drive` dials, up to the same deadline as on one Mac (the verb's `timeout=`, else `--timeout`, else [`DEFAULT_TOTAL`]), printed as on one Mac.
+/// `await task …` over the fleet ([`crate::remote`], [`DRIVEN_LEG_MAX`], [`DEFAULT_TOTAL`]).
 pub(crate) fn run_driven(
     parts: &[String],
     total: Option<Option<Duration>>,
@@ -755,8 +706,6 @@ pub(crate) fn run_driven(
     )?)
 }
 
-/// Print a wait's rows, and exit 0 when it was answered, 124 (`OK timeout`
-/// on stderr) at its deadline.
 fn print_waited(waited: Waited) -> io::Result<ExitCode> {
     let (rows, answered) = match waited {
         Waited::Rows { rows, answered } => (rows, answered),
@@ -907,8 +856,6 @@ mod tests {
         assert_eq!(gone_target(&other, &targets, &[0, 1]), None);
     }
 
-    /// A leg retains no more than its aggregate wire budget, on the exact
-    /// boundary too.
     #[test]
     fn a_legs_rows_share_one_byte_budget() {
         use std::io::Cursor;
@@ -950,13 +897,9 @@ mod tests {
         assert_eq!(error.to_string(), "ERR denied");
     }
 
-    /// What one scripted leg answers, run when the leg is sent.
     type Reply = Box<dyn FnOnce() -> Leg + Send>;
-    /// A scripted leg: the request it must be, and its answer.
     type Step = (String, Reply);
 
-    /// One scripted instance per socket: each leg must be the request the
-    /// script names next, and answers what its step returns.
     fn scripted(script: Vec<(&'static str, &'static str, Reply)>) -> Legs {
         let mut by_sock: std::collections::HashMap<String, std::collections::VecDeque<Step>> =
             std::collections::HashMap::new();
@@ -1037,11 +980,6 @@ mod tests {
         }
     }
 
-    /// THE RE-ARM, AND A WORKER GONE BETWEEN TWO LEGS (`all`): the baseline
-    /// leg names every target's sid and rev; a server timeout re-arms past
-    /// those same revs (not the newer rev a target has since shown); a target
-    /// the instance no longer hosts stands as its `closed` row and leaves the
-    /// next leg; and the wait answers once the rest have news.
     #[test]
     fn a_wait_rearms_past_its_baseline_and_keeps_a_worker_that_closed() {
         let x = "/x.sock";
@@ -1132,10 +1070,6 @@ mod tests {
         );
     }
 
-    /// A LEG THE PEER DID NOT SERVE IS ASKED AGAIN (a drive's `Leg::Again`:
-    /// its share for this address full, its listener restarting, a cut), the
-    /// baseline and a re-arm alike, and the wait goes on to the worker's
-    /// news.
     #[test]
     fn a_leg_the_peer_did_not_serve_is_asked_again() {
         let x = "lab-mini";
@@ -1188,10 +1122,6 @@ mod tests {
         );
     }
 
-    /// TWO INSTANCES: `all` answers once each has news, whichever leg each
-    /// took; `any` answers with the first instance's news and the other's rows
-    /// as last read, while that one is still parked; and a deadline that
-    /// passed answers every row unanswered.
     #[test]
     fn instances_combine_any_and_all() {
         let (x, y) = ("/x.sock", "/y.sock");
@@ -1302,9 +1232,6 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
     }
 
-    /// `--sock`/`--pid` take every target; a local id goes where the call
-    /// resolves; a global sid no instance hosts is refused before a byte is
-    /// sent.
     #[test]
     fn targets_group_by_the_instance_that_hosts_them() {
         let dir = std::env::temp_dir().join(format!("aterm-await-task-{}", std::process::id()));

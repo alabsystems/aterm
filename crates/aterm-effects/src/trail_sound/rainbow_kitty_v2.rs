@@ -48,7 +48,8 @@ const TAIL_DUR_PER_TAU: f32 = 2.7;
 const SAME_PITCH_HZ: f32 = 0.5;
 const SAME_PITCH_CENTS: f32 = 1.0;
 
-/// The age guard, seconds (§14): a voice younger than this has not delivered its attack and is never stolen.
+/// The age guard, seconds (§14): a voice younger than this has not delivered its attack;
+/// [`lane_drops_the_newcomer`] decides who loses.
 pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 
 /// §14's cap table.
@@ -3236,16 +3237,31 @@ impl Palette for RainbowKittyV2Palette {
 impl TrailSynth {
     /// One stereo sample `(mid, side)` of the sky pad, behind the music box's palette bed.
     pub(super) fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
+        const _: () = assert!(
+            BED_PARTIALS[0] == 1
+                && BED_PARTIALS[1] == 2
+                && BED_PARTIALS[2] == 3
+                && BED_PARTIALS[3] == 4
+        );
         let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) % SKY_BED_CHORDS];
         let b = &mut self.bed;
-        let glide = 1.0 - (-dt / BED_GLIDE_TAU_S).exp();
+        if b.sky_glide_dt != dt {
+            b.sky_glide_dt = dt;
+            b.sky_glide = 1.0 - (-dt / BED_GLIDE_TAU_S).exp();
+        }
+        let glide = b.sky_glide;
         let arc = b.hue_s.clamp(0.0, 1.0);
-        let detune = (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) / 1200.0);
+        if b.sky_detune <= 0.0 || b.sky_detune_arc != arc {
+            b.sky_detune_arc = arc;
+            b.sky_detune =
+                (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) / 1200.0);
+        }
+        let detune = b.sky_detune;
         let tone = |ph: f32| -> f32 {
-            let mut x = 0.0;
-            for n in BED_PARTIALS {
-                x += super::sin01((ph * n as f32).fract()) / n as f32;
-            }
+            let x = super::sin01(ph.fract())
+                + super::sin01((ph * 2.0).fract()) * 0.5
+                + super::sin01((ph * 3.0).fract()) / 3.0
+                + super::sin01((ph * 4.0).fract()) * 0.25;
             x * BED_PARTIAL_NORM
         };
         let mut m = 0.0;

@@ -5,10 +5,8 @@
 
 use crate::terminal::{BlockState, BlockText, Terminal, TerminalBuilder};
 
-/// What the zsh integration writes at a prompt: A, the prompt, B.
 const PROMPT: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07";
 
-/// An 8-row terminal whose history holds every row these tests write.
 fn term() -> Terminal {
     TerminalBuilder::new()
         .size(8, 40)
@@ -16,20 +14,16 @@ fn term() -> Terminal {
         .build()
 }
 
-/// `command` typed at the prompt, Enter, and the shell's C.
 fn start(t: &mut Terminal, command: &str) {
     t.process(command.as_bytes());
     t.process(b"\r\n\x1b]133;C\x07");
 }
 
-/// The precmd's D with `exit`, then the next prompt.
 fn finish(t: &mut Terminal, exit: i32) {
     t.process(format!("\x1b]133;D;{exit}\x07").as_bytes());
     t.process(PROMPT);
 }
 
-/// Twelve finished commands, a line of output each: the first ones are in
-/// the history (8 rows on screen), the last ones on the screen.
 fn with_history() -> Terminal {
     let mut t = term();
     t.process(PROMPT);
@@ -45,20 +39,14 @@ fn with_history() -> Terminal {
     t
 }
 
-/// The ids the terminal holds, oldest first.
 fn held(t: &Terminal) -> Vec<u64> {
     t.all_blocks().map(|b| b.id).collect()
 }
 
-/// How the probe's block stands: its state and exit code, `None` when the
-/// terminal no longer holds it.
 fn probe(t: &Terminal, id: u64) -> Option<(BlockState, Option<i32>)> {
     t.block_by_id(id).map(|b| (b.state, b.exit_code))
 }
 
-/// THE REVIEWER'S PROBES: `sh -c 'exit 6'`, then a command that writes ED 3
-/// and exits 5, `clear; sh -c 'exit 4'` (macOS `clear` writes ED 3), and a
-/// Cmd-K while a command runs.
 #[test]
 fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
     enum Erase {
@@ -152,8 +140,6 @@ fn a_running_command_keeps_its_block_through_a_scrollback_erase() {
     assert_eq!(t.completed_command_seq(), seq, "and its D was refused");
 }
 
-/// WHAT AN ERASE TAKES: the blocks, command marks, OSC 1337 marks and
-/// annotations wholly in the erased history, and nothing else.
 #[test]
 fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
     let mut t = term();
@@ -262,9 +248,6 @@ fn a_scrollback_erase_takes_only_what_lay_wholly_in_the_history() {
     assert_eq!(held(&t), [archived, archived + 1]);
 }
 
-/// AN ED 3 ON THE ALTERNATE SCREEN erases the alt grid's history only: the
-/// main grid's history, where every block and mark lives, is untouched, and
-/// so is every anchor.
 #[test]
 fn an_erase_on_the_alternate_screen_leaves_every_anchor() {
     let mut t = with_history();
@@ -301,11 +284,6 @@ fn an_erase_on_the_alternate_screen_leaves_every_anchor() {
     assert_eq!(t.terminal_marks().len(), 1);
 }
 
-/// THE LAST D'S COPY OUTLIVES ITS BLOCK: a command whose rows all went into
-/// the history before its prompt (it printed past the screen, then homed with
-/// ED 2), and a Cmd-K or an ED 3 at that prompt: the erase takes the block
-/// and the archive is empty, while `last_finished_block` still names it with
-/// its exit, the id before the prompt's own.
 #[test]
 fn the_last_finished_block_outlives_an_erase_of_its_rows() {
     for cmd_k in [true, false] {
@@ -342,8 +320,6 @@ fn the_last_finished_block_outlives_an_erase_of_its_rows() {
     }
 }
 
-/// A FULL CLEAR TAKES THE TEXT OF THE BLOCKS IT BLANKED, NOT THE BLOCKS: the
-/// reviewer's probe on a screen with no history to erase.
 #[test]
 fn a_full_clear_takes_the_text_of_the_blocks_it_blanked() {
     for (case, clear, blanks) in [
@@ -422,15 +398,12 @@ fn a_full_clear_takes_the_text_of_the_blocks_it_blanked() {
     }
 }
 
-/// `command` typed at the prompt, Enter, and what the zsh integration's
-/// preexec writes: OSC 633;E naming the command line, then C.
 fn start_named(t: &mut Terminal, command: &str) {
     t.process(command.as_bytes());
     let named = command.replace('\\', "\\\\").replace(';', "\\x3b");
     t.process(format!("\r\n\x1b]633;E;{named}\x07\x1b]133;C\x07").as_bytes());
 }
 
-/// The rows a block names, start to end.
 fn rows(block: &crate::terminal::OutputBlock) -> [Option<u64>; 4] {
     [
         Some(block.prompt_start_row),
@@ -440,19 +413,11 @@ fn rows(block: &crate::terminal::OutputBlock) -> [Option<u64>; 4] {
     ]
 }
 
-/// Whether the rows a block names never run backwards (prompt, command,
-/// output, end), so every range read from them is a forward one.
 fn forward(block: &crate::terminal::OutputBlock) -> bool {
     let named: Vec<u64> = rows(block).into_iter().flatten().collect();
     named.windows(2).all(|w| w[0] <= w[1])
 }
 
-/// The full clears a running command writes, each blanking the whole main
-/// screen: macOS `clear` (`ESC[H ESC[2J ESC[3J`, and `ESC[3J ESC[H ESC[2J` as
-/// the private-instance probe recorded it: the erase first), ncurses `clear`
-/// (`ESC[H ESC[2J`, what Ctrl-L writes too), ED 0 from home, and the `printf
-/// '\e[2J\e[H'` idiom (ED 2 with the cursor where the output left it, then
-/// home).
 const FULL_CLEARS: [(&str, &[u8]); 5] = [
     ("clear", b"\x1b[H\x1b[2J\x1b[3J"),
     ("clear, erase first", b"\x1b[3J\x1b[H\x1b[2J"),
@@ -461,15 +426,10 @@ const FULL_CLEARS: [(&str, &[u8]); 5] = [
     ("ED 2 then home", b"\x1b[2J\x1b[H"),
 ];
 
-/// Whether `clear` erases the scrollback too (ED 3).
 fn erases(clear: &[u8]) -> bool {
     clear.windows(4).any(|w| w == b"\x1b[3J")
 }
 
-/// A FULL CLEAR MOVES A RUNNING BLOCK ON THE SCREEN TO ITS HOME ROW: bytes in
-/// as a shell and a command write them (prompt, the command, two lines of
-/// output, a full clear, two more lines, D;4, the next prompt), on a terminal
-/// with and without history, for every full clear.
 #[test]
 fn a_full_clear_moves_a_running_block_on_the_screen_to_its_home_row() {
     for (case, clear) in FULL_CLEARS {
@@ -558,10 +518,6 @@ fn a_full_clear_moves_a_running_block_on_the_screen_to_its_home_row() {
     }
 }
 
-/// A FULL CLEAR KEEPS WHAT IS STILL IN THE HISTORY (the reviewer's probe,
-/// `seq 40; tput clear; echo done` on an 8-row screen): the command's prompt,
-/// its command line and its first 33 lines had scrolled into the history
-/// before the clear, which blanks only the screen.
 #[test]
 fn a_full_clear_keeps_the_running_blocks_rows_in_the_history() {
     for (case, clear) in FULL_CLEARS {
@@ -631,16 +587,8 @@ fn a_full_clear_keeps_the_running_blocks_rows_in_the_history() {
     }
 }
 
-/// What zsh writes at a prompt, as the private-instance probe recorded it: A,
-/// then `CR ESC[J` (an ED 0 from the prompt's first column, a full clear when
-/// the prompt is on the top row), the prompt, `ESC[K`, B.
 const ZSH_PROMPT: &[u8] = b"\x1b]133;A\x07\r\x1b[J$ \x1b[K\x1b]133;B\x07";
 
-/// THE AUTHOR'S PROBE, `clear; sh -c 'exit 4'` (macOS `clear` as the probe
-/// recorded it, `ESC[3J ESC[H ESC[2J`), with zsh's prompt after it: nothing is
-/// written after the clear, so the block's output is an empty range at the
-/// clear's home row (`blocktext` answers `OK 0`), its exit is 4 and its id
-/// unchanged.
 #[test]
 fn clear_then_exit_4_leaves_an_empty_output_range_not_a_backward_one() {
     for history in [false, true] {
@@ -693,12 +641,6 @@ fn clear_then_exit_4_leaves_an_empty_output_range_not_a_backward_one() {
     }
 }
 
-/// A FULL CLEAR AT THE PROMPT (Ctrl-L: zle's clear-screen homes, clears and
-/// redraws the prompt and what was typed so far, with no new A or B), for a
-/// one-line prompt and a two-line one (`~/dir on main` above `$ `, the B
-/// after the `$ `): the block being edited starts again at the screen's top
-/// row, where the shell redrew it, with its command row as far below as the
-/// shell's B was, and its command mark with it.
 #[test]
 fn a_full_clear_at_the_prompt_starts_it_where_the_shell_redraws_it() {
     for (case, prompt) in [("one line", "$ "), ("two lines", "~/dir on main\r\n$ ")] {
@@ -752,8 +694,6 @@ fn a_full_clear_at_the_prompt_starts_it_where_the_shell_redraws_it() {
     }
 }
 
-/// Whether the rows a command mark names never run backwards (prompt,
-/// command, output, the D's).
 fn mark_forward(mark: &crate::terminal::CommandMark) -> bool {
     let named: Vec<u64> = [
         Some(mark.prompt_start_row),
@@ -767,9 +707,6 @@ fn mark_forward(mark: &crate::terminal::CommandMark) -> bool {
     named.windows(2).all(|w| w[0] <= w[1])
 }
 
-/// A FULL CLEAR AT THE PROMPT WHOSE REDRAW IS NOT WHAT IT WAS: the shell's
-/// next mark keeps the block's rows and its command mark's in order, wherever
-/// the redraw went.
 #[test]
 fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
     for hook_lines in [1_u64, 2] {
@@ -912,10 +849,6 @@ fn a_full_clear_at_the_prompt_keeps_its_rows_in_order_however_it_is_redrawn() {
     }
 }
 
-/// CTRL-L AT A PROMPT TALLER THAN THE SCREEN (nine lines above `$ ` on an
-/// 8-row screen): the redraw from home scrolls, so the shell's B lands as far
-/// below the clear's top row as it was below the A, past the last row the
-/// screen had at the clear.
 #[test]
 fn ctrl_l_at_a_prompt_taller_than_the_screen_finds_its_command_row() {
     let prompt: String = (1..=9).map(|i| format!("p{i}\r\n")).collect::<String>() + "$ ";
@@ -948,11 +881,6 @@ fn ctrl_l_at_a_prompt_taller_than_the_screen_finds_its_command_row() {
     );
 }
 
-/// A COMMAND RANGE LEFT EMPTY (an integration that sends its C on the B's
-/// row, before the newline) has no command text to lose: neither a full clear
-/// that blanks its row while the command runs nor a scrollback erase that
-/// takes it marks the command line gone (`command_text_cleared`), and it
-/// reads empty, as it did.
 #[test]
 fn an_empty_command_range_loses_no_command_text() {
     for (case, lines, erase) in [
@@ -994,8 +922,6 @@ fn an_empty_command_range_loses_no_command_text() {
     }
 }
 
-/// AN ERASE AFTER THE D, BEFORE THE NEXT PROMPT, LEAVES THE FINISHED BLOCK AS
-/// IT WAS: `seq 20` on the 8-row screen, its D, then a Cmd-K.
 #[test]
 fn an_erase_after_the_d_leaves_the_finished_block_as_it_was() {
     for after_d in [true, false] {
@@ -1046,11 +972,6 @@ fn an_erase_after_the_d_leaves_the_finished_block_as_it_was() {
     }
 }
 
-/// A CARRY KEEPS THE BLOCK A FULL CLEAR PUT ABOVE THE ONE BEFORE IT, WHATEVER
-/// HISTORY IT HOLDS: `echo a` finishes on the screen, then `clear; seq 300`
-/// (the clear moves the running block's rows it blanked to the cleared
-/// screen's top row, above `echo a`'s prompt) or Ctrl-L at the next prompt
-/// and `seq 300` (the prompt starts again at the top row).
 #[test]
 fn a_carry_keeps_the_block_a_clear_moved_above_the_one_before_it() {
     for (case, ctrl_l) in [("clear; seq 300", false), ("Ctrl-L, seq 300", true)] {
@@ -1127,9 +1048,6 @@ fn a_carry_keeps_the_block_a_clear_moved_above_the_one_before_it() {
     }
 }
 
-/// A COMMAND THAT LEFT THE CURSOR ABOVE ITS OWN COMMAND LINE, WITH NO CLEAR
-/// (`tput cup 2 0; echo hello`, or a TUI on the main screen that exits with
-/// the cursor high): the next prompt's A comes above the block's rows.
 #[test]
 fn a_command_that_homes_the_cursor_keeps_its_rows() {
     let mut t = with_history();
@@ -1188,9 +1106,6 @@ fn a_command_that_homes_the_cursor_keeps_its_rows() {
     );
 }
 
-/// THE D'S ROW COMES FROM THE BLOCK'S OWN MARK: a full clear after the D
-/// reads where the finished output ended off the command mark that D
-/// completed, and off no other.
 #[test]
 fn a_clear_after_the_d_reads_the_end_off_the_blocks_own_mark() {
     use crate::terminal::{CommandMark, OutputBlock};
@@ -1224,9 +1139,6 @@ fn a_clear_after_the_d_reads_the_end_off_the_blocks_own_mark() {
     }
 }
 
-/// A FULL CLEAR AFTER THE COMMAND'S D, BEFORE THE NEXT PROMPT (a precmd that
-/// clears): the command has finished, so what is written after the clear is
-/// not its own.
 #[test]
 fn a_full_clear_after_the_d_takes_the_finished_commands_text() {
     let mut t = with_history();
@@ -1254,9 +1166,6 @@ fn a_full_clear_after_the_d_takes_the_finished_commands_text() {
     );
 }
 
-/// A FULL CLEAR AFTER THE D THAT NEVER REACHED THE COMMAND'S TEXT: `seq 3`,
-/// its D, then a hook that writes ten lines before the next prompt (enough to
-/// scroll the command into the history) and clears.
 #[test]
 fn a_full_clear_after_the_d_keeps_a_finished_output_it_never_reached() {
     for reached in [false, true] {
@@ -1317,9 +1226,6 @@ fn a_full_clear_after_the_d_keeps_a_finished_output_it_never_reached() {
     }
 }
 
-/// A PROGRAM THAT REDRAWS (a TUI on the main screen): it scrolls output into
-/// the history, clears with macOS `clear`, draws a frame, scrolls again and
-/// clears again.
 #[test]
 fn a_program_that_redraws_reads_only_its_last_frame() {
     for (case, erase) in [
@@ -1365,9 +1271,6 @@ fn a_program_that_redraws_reads_only_its_last_frame() {
     }
 }
 
-/// CONTROL: a full clear on the alternate screen (`vim`) blanks no main-screen
-/// row, so the running block keeps its rows and reads its own command and
-/// output.
 #[test]
 fn a_full_clear_on_the_alternate_screen_leaves_the_running_block() {
     let mut t = term();

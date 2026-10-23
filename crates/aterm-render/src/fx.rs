@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The art registry where effects turn pictures into [`FxArt`]s and CPU painting draws fx layers and glow quads.
+//! The art registry where effects turn pictures into [`FxArt`](aterm_core::render::FxArt)s and CPU painting draws fx layers and glow quads.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 

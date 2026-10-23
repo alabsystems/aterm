@@ -8,7 +8,7 @@ use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Seen};
 use aterm_time::Instant;
 
 /// The predictor's one clock read, for every export below: the real monotonic
-/// clock, or the instant a test pinned ([`pin_clock`]).
+/// clock, or the instant a test pinned (`pin_clock`).
 #[inline]
 fn clock() -> Instant {
     #[cfg(test)]

@@ -18,53 +18,35 @@ use crate::fleet_world::{self as world, Inst, Kind, Sess, World};
 use crate::paths::paths;
 use crate::{Fail, Res, stop};
 
-/// The wall the clean fleet read must keep: the product's stated deadline
-/// for a fleet read of thirty machines, 3.5 s (design §8), the measurement
-/// itself.
+/// Clean fleet-read wall deadline (3.5 s).
 const CLEAN_WALL: Duration = Duration::from_millis(3500);
 
-/// The wall the FAULT read must keep: the client's own per-peer deadline
-/// (`aterm_ctl::FLEET_WITHIN`, read from the client, never restated) plus the
-/// half second the design allows past it.
+/// Fault-read wall deadline: `aterm_ctl::FLEET_WITHIN` plus 500 ms.
 fn fault_wall() -> Duration {
     aterm_ctl::FLEET_WITHIN + Duration::from_millis(500)
 }
 
-/// The character budget the survey text keeps within: the client's own
-/// default.
+/// Survey character budget.
 const BUDGET: usize = aterm_ctl::DEFAULT_BUDGET;
 
-/// The fleet size up to which every machine's most pressing Claude session
-/// must keep its words — all of them when it asks, else its last words
-/// (design §8's end use: thirty Macs, each with an agent at work or at a box
-/// and two at rest).
+/// Fleet size up to which every machine's most pressing Claude session keeps its excerpt.
 const EVERY_TOP_UP_TO: usize = 30;
 
-/// The member whose `claude` session also says the hostile words, so they
-/// cross the fleet hop (machine 0's are this machine's own): the last, which
-/// the fault phase stops only after the clean reads, and whose content no
-/// security check reads (they read the members between).
+/// Peer index whose `claude` session emits hostile words across the fleet hop.
 const fn hostile_peer(n: usize) -> usize {
     n - 1
 }
 
-/// The state of the `claude` session that says the hostile words, on
-/// machine 0 and on [`hostile_peer`]: one at a box, which the client ranks
-/// most pressing, so its excerpts are the last a budget cuts and the
-/// escaping is judged at any fleet size the read keeps any excerpt at.
+/// Mode of the `claude` session emitting hostile words.
 const HOSTILE_MODE: Mode = Mode::Question;
 
-/// The descriptor ceiling every member and the reader must stay under: the
-/// limit each runs with.
+/// Descriptor ceiling every member and reader must stay under.
 const FD_CEILING: usize = world::NOFILE;
 
-/// The title a person typed on the member flipped to facts: content, which a
-/// facts answer must never carry.
+/// Title set on the member flipped to `allow=facts` (must not appear in a facts reply).
 const TYPED_TITLE: &str = "FACTSMARK typed by a person";
 
-/// The escaped forms of [`fixture::HOSTILE_SAID`] the survey text must carry
-/// (`tty::one_line`): the ESC of a colour sequence, the bell, the bidi
-/// override, the defused trust label and the doubled backslash.
+/// Escaped forms of [`fixture::HOSTILE_SAID`] expected in the survey text.
 const HOSTILE_ESCAPED: &[&str] = &[
     "\\x1b[31mred\\x1b[0m",
     "\\x07bell",
@@ -173,15 +155,12 @@ pub fn cmd(args: &[String]) -> Res {
     }
 }
 
-/// One measured fleet read: its text, its wall (spawn → exit), and the
-/// descriptors sampled while it ran.
+/// One measured fleet read: its text, its wall, and the descriptors sampled while it ran.
 #[derive(Clone, Debug, Default)]
 struct Measured {
     text: String,
     wall: Duration,
-    /// The reader's peak open descriptors; `None` when the read ended before
-    /// `lsof` caught it (it still ran under the 256 limit, where running out
-    /// fails the read).
+    /// Peak open descriptors of the reader (`None` when the read ended before `lsof` sampled it).
     reader_fd: Option<usize>,
     /// The peak open descriptors of any member while it ran.
     member_fd: usize,
@@ -200,9 +179,7 @@ struct RunStat {
     member_fd: usize,
 }
 
-/// How the reader runs: the environment a `claude` session on machine 0 was
-/// started with (its fixture wrote it, [`fixture::ENV_DIR`]) and that
-/// session's directory — what Claude Code's Bash tool in that tab runs with.
+/// Environment and working directory of machine 0's `claude` session.
 struct Reader {
     env: Vec<(OsString, OsString)>,
     cwd: PathBuf,
@@ -211,16 +188,14 @@ struct Reader {
 /// How the members' `fleet join` went over the one loopback address.
 #[derive(Clone, Copy, Debug, Default)]
 struct Joins {
-    /// Registrations the issuer recorded (each then taken out of its book
-    /// again, and the member added back by hand).
+    /// Registrations the issuer recorded before each was removed and re-added manually.
     registered: usize,
 }
 
 /// The simulation, its instances and what it measured.
 struct Sim {
     world: World,
-    /// The fleet secret machine 0 minted (its key file), as the role keys and
-    /// as the raw bytes the wire-level probes derive their own proof from.
+    /// Fleet secret minted by machine 0.
     secret: FleetSecret,
     secret_raw: Vec<u8>,
     /// The reader's (machine 0's) host name, as the survey heads its block.
@@ -231,18 +206,15 @@ struct Sim {
     want: Vec<WantInstance>,
     /// The clean survey runs' figures.
     runs: Vec<RunStat>,
-    /// Each instance's resident set and physical footprint (KiB) at idle,
-    /// once every session settled.
+    /// Idle resident set and physical footprint (KiB) per instance.
     rss_idle: BTreeMap<i32, u64>,
     foot_idle: BTreeMap<i32, u64>,
-    /// Each instance's peak resident set and footprint (KiB) sampled while a
-    /// fleet read ran.
+    /// Peak resident set and footprint (KiB) sampled during fleet reads.
     rss_peak: BTreeMap<i32, u64>,
     foot_peak: BTreeMap<i32, u64>,
     /// The fault read's figures.
     fault: Option<Measured>,
-    /// The instance with the largest idle footprint, its footprint (KiB) and
-    /// what `vmmap` called its freed-but-held large blocks then.
+    /// Instance with the largest idle footprint (KiB) and its `vmmap` large-empty blocks.
     biggest: Option<(usize, u64, Option<world::LargeEmpty>)>,
     /// The rotated member's refusal row in a real fleet read, for the record.
     rotated_row: String,
@@ -318,8 +290,7 @@ impl Sim {
         })
     }
 
-    /// Run every phase; the assertions, in the order they were checked. An
-    /// interrupt ends it between steps (the caller then records nothing).
+    /// Run every phase and return the checked assertions in order.
     fn run(&mut self, survey_runs: usize) -> Vec<Check> {
         let mut checks = Vec::new();
         for r in 0..survey_runs {
@@ -417,9 +388,7 @@ impl Sim {
         checks
     }
 
-    /// One clean fleet read from machine 0, measured: the text, the JSON, the
-    /// wall, the characters, and the peak descriptors of the reader and of
-    /// every member while it ran.
+    /// Run one clean fleet read from machine 0 and measure its wall, sizes, and peak descriptors.
     fn clean_run(&mut self, r: usize) -> Result<(RunStat, String, String), Fail> {
         let m = self.measured(&["survey", "--fleet"])?;
         let json = self.read_ok(&["survey", "--fleet", "--json"])?;
@@ -442,8 +411,7 @@ impl Sim {
         Ok((stat, m.text, json))
     }
 
-    /// `aterm ctl <args>` as the reader runs it (machine 0's `claude` session
-    /// environment and directory, `ulimit -n 256`), its stdio not yet set.
+    /// Build `aterm ctl <args>` in the reader's environment and directory under `ulimit -n 256`.
     fn reader_cmd(&self, args: &[&str]) -> aterm_uds::spawnfd::Command {
         let mut cmd = world::limited("fleet-sim-reader", self.world.bin.join("aterm"));
         cmd.env_clear()
@@ -475,11 +443,7 @@ impl Sim {
         }
     }
 
-    /// Run a reader call as a child, sampling `lsof` of it and of every live
-    /// member while it runs, and the members' RSS and footprint, on a thread
-    /// of their own: its stdout, its wall (spawn → exit, read by the one wait
-    /// on it, so no sampling pass delays it), its own peak descriptors, and
-    /// the members' peak.
+    /// Run a reader call while sampling `lsof`, RSS, and footprint of the reader and live members.
     fn measured(&mut self, args: &[&str]) -> Result<Measured, Fail> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -551,9 +515,7 @@ impl Sim {
         })
     }
 
-    /// Phase C: SIGSTOP one machine and kill one (after it joined), then read
-    /// the fleet: each a fault row with its reason, the whole within the
-    /// client's deadline plus a half second.
+    /// Phase C: `SIGSTOP` one machine and kill another, then read the fleet within `fault_wall()`.
     fn fault_run(&mut self) -> Result<Vec<Check>, Fail> {
         let stopped = self.world.insts.len() - 1;
         let killed = self.world.insts.len() - 2;
@@ -570,8 +532,7 @@ impl Sim {
         Ok(checks)
     }
 
-    /// [`Sim::fault_run`] with machine `stopped` stopped: kill machine
-    /// `killed` and read the fleet.
+    /// Kill machine `killed` while `stopped` is stopped and read the fleet.
     fn faulted(&mut self, stopped: usize, killed: usize) -> Result<Vec<Check>, Fail> {
         let stopped_port = self.world.insts[stopped].port;
         let killed_port = self.world.insts[killed].port;
@@ -618,10 +579,7 @@ impl Sim {
         Ok(checks)
     }
 
-    /// Phase D: the security refusals, against the still-healthy members. The
-    /// NON-DESTRUCTIVE checks run first, on distinct members where there are
-    /// enough; the destructive key rotation runs LAST, on a member none of the
-    /// others read, so a small fleet never has one check undo another.
+    /// Phase D: run non-destructive security refusal checks across healthy members, then key rotation.
     fn security(&mut self) -> Result<Vec<Check>, Fail> {
         let mut checks = Vec::new();
         let healthy: Vec<usize> = (1..self.world.insts.len() - 2).collect();
@@ -728,9 +686,7 @@ impl Sim {
         Ok(checks)
     }
 
-    /// A proved peer is refused every verb the table does not mark `fleet`,
-    /// and the connection is closed after each (a fresh dial per verb, as a
-    /// served connection takes at most four requests and a refusal closes it).
+    /// Verify that a proved peer is refused every non-fleet verb and its connection is closed.
     fn non_fleet_verbs_refused(&self, port: u16) -> Result<Check, Fail> {
         let non_fleet = self.verb_table()?;
         if non_fleet.len() < 10 {
@@ -784,9 +740,7 @@ impl Sim {
         ))
     }
 
-    /// The control server's NON-FLEET verbs of machine 0 (`help --json`,
-    /// whose rows carry `"fleet":bool`): every verb the table does not mark
-    /// `fleet`.
+    /// Non-fleet verbs reported by `help --json` on machine 0.
     fn verb_table(&self) -> Result<Vec<String>, Fail> {
         let json = self.read_ok(&["help", "--json"])?;
         let line = json
@@ -807,12 +761,7 @@ impl Sim {
             .collect())
     }
 
-    /// Member `i` at `allow=facts` answers facts only. A title a person typed
-    /// is set on its shell first, and the reader confirms (the CONTROL) that
-    /// at content its answer carries that title, every one of its Claude
-    /// sessions' prompts and words, and its sessions' directory; then its
-    /// `[fleet] allow` is flipped to facts (the listener follows config live)
-    /// and its answer must carry none of them, nor any content field.
+    /// Verify that member `i` flipped from `allow=content` to `allow=facts` omits all content fields.
     fn facts_only(&self, i: usize) -> Result<Check, Fail> {
         const NAME: &str = "a member at allow=facts answers facts only";
         let inst = &self.world.insts[i];
@@ -883,9 +832,7 @@ impl Sim {
         Ok(c)
     }
 
-    /// Write the record and return its path: under `docs/measured/` when
-    /// `to_docs` (a green run with `--record`), carrying forward the file's
-    /// earlier invocations; else under the lab's state (`results/`).
+    /// Write the simulation record under `docs/measured/` when `to_docs` is true, or `results/` otherwise.
     fn write_record(&self, checks: &[Check], to_docs: bool) -> Result<String, String> {
         let n = self.world.insts.len();
         let now = crate::util::now_secs();
@@ -948,8 +895,7 @@ impl Sim {
         )
     }
 
-    /// The record's Markdown: the machine, the commit, the command, the
-    /// figures, the refusals, a sample of the rendered survey.
+    /// Render the simulation record Markdown.
     fn record_body(
         &self,
         checks: &[Check],
@@ -1251,13 +1197,7 @@ fn json_text(text: &str) -> String {
     aterm_codec::json::escape(text)
 }
 
-/// The escaping assertion: the hostile excerpt reached the reader from this
-/// machine (`local`, machine 0's pid) and from a peer (`peer`'s, across the
-/// fleet hop), and what it carried arrives ESCAPED in each one's block — each
-/// injected control, the bidi override, the trust label and the backslash in
-/// `tty::one_line`'s spelling — and nothing raw anywhere: no character a
-/// terminal acts on, no raw `trust=human` that past a wrap could forge a
-/// header.
+/// Check that hostile excerpts from `local` and `peer` arrive escaped with no raw `trust=human`.
 fn escaping_check(text: &str, json: &str, local: i32, peer: i32) -> Check {
     let block = |pid: i32| judge::block_text(text, pid).unwrap_or_default();
     let (here, there) = (block(local), block(peer));
@@ -1285,8 +1225,7 @@ struct Machine {
     mem_gib: String,
     macos: String,
     macos_build: String,
-    /// `git rev-parse --short HEAD`, with `+dirty` when a tracked file
-    /// outside `docs/measured/` differs from it.
+    /// Short `HEAD` commit hash (`+dirty` if modified outside `docs/measured/`).
     commit: String,
 }
 
@@ -1365,8 +1304,7 @@ struct Kept {
     notes: Vec<String>,
 }
 
-/// The lines of `text` between its `<!-- <mark> -->` and `<!-- /<mark> -->`
-/// lines (none when it has no such pair).
+/// Lines of `text` between `<!-- <mark> -->` and `<!-- /<mark> -->`.
 fn between(text: &str, mark: &str) -> Vec<String> {
     let (open, close) = (format!("<!-- {mark} -->"), format!("<!-- /{mark} -->"));
     if !text.lines().any(|l| l == close) {
@@ -1402,9 +1340,7 @@ fn read_host(world: &World) -> Result<String, Fail> {
         .ok_or_else(|| Fail::die(format!("machine 0's host name: {text}")))
 }
 
-/// The reader: the environment a `claude` fixture on `inst` (machine 0) was
-/// started with, which it wrote under its `$HOME` ([`fixture::ENV_DIR`]), and
-/// its directory (the instance's home, where every session starts).
+/// Load the environment and directory recorded by machine 0's `claude` fixture.
 fn reader_of(inst: &Inst) -> Result<Reader, Fail> {
     use std::os::unix::ffi::OsStringExt as _;
     let dir = inst.home().join(fixture::ENV_DIR);
@@ -1440,15 +1376,7 @@ fn reader_of(inst: &Inst) -> Result<Reader, Fail> {
     })
 }
 
-/// Form the fleet: machine 0 `init`, every other `join` with its code, and —
-/// because every member registers from the one loopback address, which the
-/// issuer records at most `JOINED_PER_ADDRESS` (4) of (a secret holder
-/// cannot fill an issuer's book with made-up nodes), and a join the issuer
-/// does not record writes nothing of the fleet — machine 0 takes each
-/// registration out of its book once its member has joined (`aterm fleet
-/// peers rm 127.0.0.1:<port>`), so the next registers too, and then records
-/// every member BY HAND (`aterm fleet peers add 127.0.0.1:<port>`), the
-/// loopback override `aterm_net::fleet_member` provides (`Via::Manual`).
+/// Initialize machine 0 as fleet issuer, join all other instances, and register loopback peers manually.
 fn form_fleet(world: &World) -> Result<Joins, Fail> {
     let issuer = &world.insts[0];
     let out = world.aterm_in(
@@ -1544,12 +1472,7 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
     Ok(joins)
 }
 
-/// The sessions machine `idx` of `n` gets beyond its boot shell — a lab Mac's
-/// (the end use's: about five sessions, most agents at rest) — each with the
-/// `<n>` its fixture picks its words by: a build loop, a claude in one state
-/// (busy, at a question box, at an approval box, or idle, by turns), and two
-/// claude at rest; machine 0 and the hostile peer's first claude at
-/// [`HOSTILE_MODE`] saying the hostile words.
+/// Session plan beyond the boot shell for machine `idx` of `n`.
 fn session_plan(idx: usize, n: usize) -> Vec<(Kind, usize)> {
     let modes = [Mode::Busy, Mode::Question, Mode::Prompt, Mode::Idle];
     let hostile = idx == 0 || idx == hostile_peer(n);
@@ -1565,18 +1488,12 @@ fn session_plan(idx: usize, n: usize) -> Vec<(Kind, usize)> {
     ]
 }
 
-/// Where machine `idx`'s session `k` runs its program: a worktree's crate
-/// under its `$HOME`, as deep as a lab Mac's (`~/Developer/<repo>-wt-07-2/
-/// crates/aterm-net`), so its line's place is as long as a real one.
+/// Worktree crate directory for machine `idx`'s session `k`.
 fn workdir(idx: usize, k: usize) -> String {
     format!("$HOME/Developer/aterm-mesh-wt-{idx:02}-{k}/crates/aterm-net")
 }
 
-/// Give each instance the five sessions of a lab Mac ([`session_plan`]): the
-/// boot shell, a `build-loop` and three `claude` fixtures, one busy, at a
-/// box or idle by turns and two more idle, each in a deep worktree directory
-/// ([`workdir`]), so the survey has every class to read and is over its
-/// budget.
+/// Spawn the planned sessions ([`session_plan`]) on each instance.
 fn give_sessions(world: &mut World) -> Result<(), Fail> {
     for idx in 0..world.insts.len() {
         let hostile = idx == 0 || idx == hostile_peer(world.insts.len());
@@ -1625,10 +1542,7 @@ fn give_sessions(world: &mut World) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Wait (the hang detector) until every instance's own `survey --json` shows
-/// each session at the program and agent word it must, and each claude
-/// session with a prompt and said excerpt: then the fleet read is
-/// deterministic.
+/// Wait until every instance's `survey --json` shows all expected sessions and Claude excerpts.
 fn settle(world: &World) -> Result<(), Fail> {
     println!("  waiting for sessions to settle…");
     for inst in &world.insts {
@@ -1655,8 +1569,7 @@ fn settle(world: &World) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Whether `json` (one instance's `survey --json`) shows every `want` session
-/// at its program and agent, with an excerpt for each claude.
+/// Whether `json` shows every expected session with non-empty excerpts for `claude` sessions.
 fn sessions_ready(json: &str, want: &[WantSession]) -> bool {
     let Ok(value) = aterm_json::from_str::<aterm_json::Value>(json) else {
         return false;
@@ -1735,8 +1648,7 @@ mod tests {
         assert!(between("<!-- notes -->\n- a\n", NOTES).is_empty());
     }
 
-    /// The escaped forms the escaping check looks for are what
-    /// `tty::one_line` makes of the hostile words.
+    /// Verify that `tty::one_line` produces every expected substring in [`HOSTILE_ESCAPED`].
     #[test]
     fn the_hostile_words_escape_to_the_forms_the_check_looks_for() {
         let escaped = aterm_codec::tty::one_line(fixture::HOSTILE_SAID, 160);

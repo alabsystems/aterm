@@ -1903,7 +1903,8 @@ pub fn unused_under(dirs: &[PathBuf], processes: Processes<'_>) -> Result<(), St
     scan_says_unused(&processes(dirs, &[std::process::id()]), |_| true)
 }
 
-/// Evaluates a [`aterm_uds::holders::PathUseScan`] against `counts` to check whether `dirs` are unused.
+/// Evaluates a [`aterm_uds::holders::PathScan`] against `counts` to check whether `dirs` are
+/// unused.
 pub fn scan_says_unused(
     scan: &std::io::Result<aterm_uds::holders::PathScan>,
     counts: impl Fn(&aterm_uds::holders::PathUse) -> bool,

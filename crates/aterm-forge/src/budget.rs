@@ -205,8 +205,7 @@ fn u(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// The ratchet scope one cell's rows live under; a scope names exactly one cell
-/// ([`validate_metric`]).
+/// The ratchet scope one cell's rows live under; a scope names exactly one cell.
 pub(crate) fn scope_of(cell: &Cell, cells: &[Cell]) -> String {
     if cells.iter().filter(|c| c.triple == cell.triple).count() > 1 {
         format!("shipped.{}.{}", cell.triple, cell.name)
@@ -722,7 +721,7 @@ fn indent(body: &str) -> String {
     body.lines().map(|l| format!("      {l}\n")).collect()
 }
 
-/// Every measured fact that is not armed and has no row in the file ([`missing_armed`]).
+/// Every measured fact that is not armed and has no row in the file.
 fn unratcheted(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
     let armed = seed_shape(live);
     live.values

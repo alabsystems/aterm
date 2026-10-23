@@ -6225,6 +6225,9 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
             days(idle),
             days(after)
         ),
+        Unused::GivenUp => "goes whole: a scratch a failed provisioning run left, past \
+                            macOS's first-exec assessment of what ran from it"
+            .to_owned(),
         Unused::Stale {
             incremental,
             units,

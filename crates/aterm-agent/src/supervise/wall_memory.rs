@@ -133,7 +133,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Fold a turn-end reading into wall memory and return the effective [`Wall`].
+    /// Fold a turn-end reading into wall memory and leave the effective [`Wall`](aterm_phase::Wall)
+    /// in `reading`.
     pub(super) fn wall_memory_step(
         &mut self,
         reader: &dyn ScreenReader,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one colour resolver: [`Config::resolved_colors`] picks the theme for an appearance, applies every colour override in `aterm.toml` once (fg, bg, cursor, selection, selection foreground, `palette[]`, and the chrome keys `accent_color`, `active_tab_color`, `border_color`, `search_match_color`), and records where each slot came from.
+//! The one colour resolver.
 
 use aterm_core::terminal::{ColorPalette, Rgb};
 use aterm_render::Theme;
@@ -14,11 +14,11 @@ use crate::app_config::{Config, ThemeCatalog};
 /// Where the theme a resolution draws came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ThemeSource {
-    /// A built-in scheme; `Default` too, which is also what an unset `theme` draws on every appearance.
+    /// A built-in scheme.
     Builtin,
     /// A loaded custom theme file, by its catalog id (the file stem).
     File(String),
-    /// A community pack theme drawn from the pack embedded in aterm, by its id: a preview only ([`Config::resolved_colors_previewing`]), before Keep installs the file.
+    /// A community pack theme drawn from the pack embedded in aterm.
     Pack(String),
     /// The selected name does not resolve, so Default is drawn.
     DefaultFallback { reason: String },
@@ -31,7 +31,8 @@ pub(crate) enum ColorOrigin {
     Theme,
     /// A colour key in `aterm.toml`.
     Config,
-    /// Nobody: the Default scheme (no theme selected, or the selected one does not resolve), or for `selection_fg` / a missing cursor the renderer's own rule.
+    /// Nobody: the Default scheme (no theme selected, or the selected one does not resolve), or a
+    /// rule that derives a slot no theme or key sets (cursor, selection, `selection_fg`, chrome).
     Default,
 }
 
@@ -47,7 +48,7 @@ pub(crate) struct ColorProvenance {
     pub(crate) chrome: ChromeProvenance,
 }
 
-/// The origin of each chrome colour ([`aterm_types::scheme::ChromeColors`]): the theme's file, the config's key, or [`ColorOrigin::Default`] when nobody authored it and the chrome derives it.
+/// The origin of each chrome colour ([`aterm_types::scheme::ChromeColors`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChromeProvenance {
     pub(crate) accent: ColorOrigin,
@@ -111,46 +112,36 @@ impl std::fmt::Display for ColorIssue {
     }
 }
 
-/// The colours one appearance draws: the selected theme with every `aterm.toml` colour override applied, plus where each slot came from.
+/// The colours one appearance draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedColors {
-    /// The theme drawn: a built-in's canonical name, a file's catalog id, or `Default` on a fallback.
+    /// The theme drawn.
     pub(crate) id: String,
     /// The appearance this resolution is for; it picked the side of a `dark:…,light:…` selector.
     pub(crate) side: Appearance,
     pub(crate) source: ThemeSource,
-    /// The final colours, overrides included: `ansi` carries `palette[0..16]` and `selection_fg` the theme's or the config's selection foreground.
+    /// The final colours.
     pub(crate) scheme: ColorScheme,
-    /// The colour theme's own foreground, background, cursor and selection,
-    /// before the `foreground`, `background`, `cursor_color` and
-    /// `selection_color` keys: what native pages (Settings, documents) draw
-    /// their palette from, so a colour picked for the terminal never recolours
-    /// the app's own pages.
+    /// The colour theme's own foreground, background, cursor and selection, before the colour keys.
     theme_before_overrides: Theme,
-    /// The chrome colours the colour theme itself authors, before the
-    /// `accent_color`, `active_tab_color`, `border_color` and
-    /// `search_match_color` keys: what the strip paints while a key is unset,
-    /// so Settings can name the colour an unset key leaves in force
-    /// (`tab_bar::automatic_active_tab_color`).
+    /// The chrome colours the colour theme itself authors.
     theme_authored_chrome: aterm_messages::tokens::AuthoredChrome,
     /// `palette[]` entries past the 16 ANSI slots, as (index, colour).
     pub(crate) extended_palette: Vec<(u8, Rgb)>,
-    /// The `palette[i]` and `palette_overrides.i` keys that landed, as slot
-    /// indices, in key order: what [`Self::config_keys`] names.
+    /// The `palette[i]` and `palette_overrides.i` keys that landed.
     palette_keys: PaletteKeys,
     /// Whether bold text brightens ANSI 0-7 (`bold_is_bright`, else the engine default).
     pub(crate) bold_is_bright: bool,
     pub(crate) provenance: ColorProvenance,
-    /// The appearance of the configured palette: the scheme's appearance (declared or measured at admission) unless `background` is overridden, then the final background's polarity.
+    /// The appearance of the configured palette.
     pub(crate) reported: Appearance,
     /// Every colour value that did not parse, once each, in key order.
     pub(crate) issues: Vec<ColorIssue>,
-    /// Whether slots 16-255 derive from the final colours ([`aterm_types::scheme_palette256::generated_extended_palette`]): `scheme.palette_generate`, kept equal to it.
+    /// Whether slots 16-255 derive from the final colours.
     pub(crate) palette_generate: bool,
-    /// Who decided [`Self::palette_generate`]: the theme's own key, the config's `palette_generate = "always"|"never"`, or nobody (the unset default or a fallback, which derive nothing).
+    /// Who decided [`Self::palette_generate`].
     pub(crate) palette_generate_origin: ColorOrigin,
-    /// Whether the engine gets an explicit palette: a theme was selected, a
-    /// `palette[]` entry landed, or slots 16-255 are derived.
+    /// Whether the engine gets an explicit palette.
     custom_palette: bool,
 }
 
@@ -186,29 +177,29 @@ impl ResolvedColors {
         Theme::from(&self.scheme)
     }
 
-    /// The colour theme before the four colour keys that reach the renderer's theme: what native pages draw from.
+    /// The colour theme before the four colour keys that reach the renderer's theme.
     pub(crate) const fn theme_before_overrides(&self) -> Theme {
         self.theme_before_overrides
     }
 
-    /// The chrome colours the theme authors before any chrome key ([`Self::authored_chrome`] with the keys left out).
+    /// The chrome colours the theme authors before any chrome key.
     pub(crate) const fn theme_authored_chrome(&self) -> aterm_messages::tokens::AuthoredChrome {
         self.theme_authored_chrome
     }
 
-    /// Flip bits of the pre-override background and foreground: a colour-only change to the installed resolution, for tests that move paint and nothing else.
+    /// Flip bits of the pre-override background and foreground.
     #[cfg(test)]
     pub(crate) fn tint_theme_for_test(&mut self, bg: u32, fg: u32) {
         self.theme_before_overrides.bg ^= bg;
         self.theme_before_overrides.fg ^= fg;
     }
 
-    /// The selected-text foreground, when the theme or the config sets one; `None` keeps the renderer's contrast floor.
+    /// The selected-text foreground.
     pub(crate) const fn selection_fg(&self) -> Option<Rgb> {
         self.scheme.selection_fg
     }
 
-    /// Who set palette slot `index`: an ANSI slot's colour origin, else a config entry, a derived slot or xterm's own value.
+    /// Who set palette slot `index`.
     pub(crate) fn extended_origin(&self, index: u8) -> SlotOrigin {
         if let Some(origin) = self.provenance.ansi.get(usize::from(index)) {
             return SlotOrigin::Ansi(*origin);
@@ -222,7 +213,7 @@ impl ResolvedColors {
         }
     }
 
-    /// The engine's indexed palette: the scheme's 16 ANSI slots, slots 16-255 derived from them when [`Self::palette_generate`] is on, then the extended `palette[]` entries over those (a config slot wins over a derived one); `None` for the engine's own table.
+    /// The engine's indexed palette.
     pub(crate) fn custom_palette(&self) -> Option<ColorPalette> {
         self.custom_palette.then(|| {
             let mut palette = self.scheme.to_color_palette();
@@ -233,12 +224,12 @@ impl ResolvedColors {
         })
     }
 
-    /// The chrome colours the theme or the config authored (config over theme), for the chrome tokens.
+    /// The chrome colours the theme or the config authored (config over theme).
     pub(crate) fn authored_chrome(&self) -> aterm_messages::tokens::AuthoredChrome {
         crate::chrome_band::authored_of(&self.scheme.chrome)
     }
 
-    /// The `aterm.toml` keys that set a slot here, in slot order (`palette[i]` per index, then the chrome keys).
+    /// The `aterm.toml` keys that set a slot here.
     pub(crate) fn config_keys(&self) -> Vec<String> {
         let p = &self.provenance;
         let mut keys: Vec<String> = [
@@ -274,20 +265,19 @@ impl ResolvedColors {
     }
 }
 
-/// The palette keys that set a slot: the positional `palette` entries and
-/// the sparse `palette_overrides` slots, each by index.
+/// The palette keys that set a slot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PaletteKeys {
     list: Vec<u8>,
     overrides: Vec<u8>,
 }
 
-/// The `palette_overrides` key for slot `index`, as `aterm.toml` and the Settings patch lane address it.
+/// The `palette_overrides` key for slot `index`.
 pub(crate) fn palette_override_key(index: usize) -> String {
     format!("{}.{index}", crate::prefs::EDIT_PALETTE_OVERRIDES)
 }
 
-/// The slot a `palette_overrides` table key names: a decimal index 0–255 with no sign or leading zero, so each slot has one spelling.
+/// The slot a `palette_overrides` table key names.
 pub(crate) fn palette_override_index(key: &str) -> Option<usize> {
     let canonical = !key.is_empty()
         && key.bytes().all(|byte| byte.is_ascii_digit())
@@ -297,8 +287,6 @@ pub(crate) fn palette_override_index(key: &str) -> Option<usize> {
         .filter(|index| canonical && *index < 256)
 }
 
-/// Parse one colour value; a value that does not parse is recorded once in
-/// `issues` and yields `None`.
 fn override_color(key: &str, raw: Option<&str>, issues: &mut Vec<ColorIssue>) -> Option<Rgb> {
     let raw = raw?;
     let parsed = aterm_types::scheme::parse_hex(raw);
@@ -323,7 +311,7 @@ pub(crate) enum PaletteGenerateMode {
 }
 
 impl Config {
-    /// The config's `palette_generate`, read case-insensitively; an unknown value follows the theme (the config walk warns about it once).
+    /// The config's `palette_generate`.
     pub(crate) fn palette_generate_mode(&self) -> PaletteGenerateMode {
         match self
             .palette_generate
@@ -338,12 +326,10 @@ impl Config {
     }
 }
 
-/// The lowest text contrast a side of a `dark:…,light:…` split may be left at by the colour keys in `aterm.toml` before validation warns ([`Config::split_override_warnings`]).
+/// The lowest text contrast a side of a `dark:…,light:…` split may be left at by the colour keys in
+/// `aterm.toml` before validation warns.
 pub(crate) const SPLIT_OVERRIDE_MIN_CONTRAST: f64 = 3.0;
 
-/// The theme a selection draws for one appearance, before any `aterm.toml`
-/// colour key: its id, where it came from, its colours, and whether a theme
-/// was named at all.
 struct ThemeDraw {
     id: String,
     source: ThemeSource,
@@ -353,7 +339,7 @@ struct ThemeDraw {
     bold_is_bright: Option<bool>,
 }
 
-/// The one theme a selection picks for one appearance: its id, where it came from, the whole package (colours, identity, typography), and whether a theme was named at all.
+/// The one theme a selection picks for one appearance.
 pub(crate) struct ThemeSelection<'a> {
     pub(crate) id: String,
     pub(crate) source: ThemeSource,
@@ -361,8 +347,6 @@ pub(crate) struct ThemeSelection<'a> {
     pub(crate) named: bool,
 }
 
-/// A built-in's whole package (a built-in carries no typography), `Default`'s
-/// for a name that is not one.
 fn builtin_package(name: &str) -> aterm_types::scheme::ThemePackage {
     aterm_types::scheme::builtin_theme(name)
         .and_then(aterm_types::scheme::ThemePackage::of_builtin)
@@ -370,7 +354,7 @@ fn builtin_package(name: &str) -> aterm_types::scheme::ThemePackage {
 }
 
 impl Config {
-    /// The theme `appearance` selects (`candidate`, when given, standing in for the configured `theme`), as a whole package.
+    /// The theme `appearance` selects.
     pub(crate) fn theme_selection<'a>(
         &self,
         appearance: Appearance,
@@ -380,9 +364,6 @@ impl Config {
         self.theme_selection_with(appearance, themes, candidate, false)
     }
 
-    /// [`Self::theme_selection`]; `pack` lets the community pack answer a
-    /// name the catalog cannot ([`crate::app_config::pack_package`]): a
-    /// preview's candidate only.
     fn theme_selection_with<'a>(
         &self,
         appearance: Appearance,
@@ -432,7 +413,6 @@ impl Config {
         }
     }
 
-    /// The theme `appearance` draws, before the colour keys apply.
     fn theme_draw(
         &self,
         appearance: Appearance,
@@ -457,7 +437,7 @@ impl Config {
         }
     }
 
-    /// Resolve the colours `appearance` draws against `themes`, with every colour override applied once.
+    /// Resolve the colours `appearance` draws against `themes`.
     pub(crate) fn resolved_colors(
         &self,
         appearance: Appearance,
@@ -467,7 +447,7 @@ impl Config {
         self.resolved_colors_with(appearance, themes, candidate, false)
     }
 
-    /// [`Self::resolved_colors`] for a preview: a `preview` name no built-in or loaded file answers is drawn from the community pack embedded in aterm ([`ThemeSource::Pack`]), so trying a pack theme writes nothing.
+    /// [`Self::resolved_colors`] for a preview.
     pub(crate) fn resolved_colors_previewing(
         &self,
         appearance: Appearance,
@@ -731,7 +711,7 @@ impl Config {
             .issues
     }
 
-    /// The engine config to apply: the non-colour keys ([`Self::engine_behaviour_config`]) with every colour from `resolved`.
+    /// The engine config to apply.
     pub(crate) fn applied_terminal_config_from(
         &self,
         resolved: &ResolvedColors,
@@ -774,9 +754,6 @@ mod tests {
         config.resolved_colors(appearance, &ThemeCatalog::default(), None)
     }
 
-    /// A `TerminalConfig` with its palette as the 256 colours it resolves to:
-    /// the palette's sparse record keeps insertion order, which two equal
-    /// palettes built in a different order do not share.
     fn engine_view(mut tc: TerminalConfig) -> (TerminalConfig, Option<Vec<Rgb>>) {
         let palette = tc
             .custom_palette
@@ -785,11 +762,6 @@ mod tests {
         (tc, palette)
     }
 
-    /// Projection agreement: every built-in (and no theme, a missing name and
-    /// a split) × both appearances × each override set, the renderer's Theme
-    /// and the engine's TerminalConfig draw the same final colours, the ones
-    /// the one resolution carries, and every override that parses lands in
-    /// both (a projection that dropped one fails here).
     #[test]
     fn resolved_colors_projections_agree_on_every_case() {
         let mut selectors: Vec<Option<String>> = vec![
@@ -897,11 +869,6 @@ mod tests {
         assert!(cases > 100, "the matrix ran: {cases}");
     }
 
-    /// An unset `theme` (absent, blank, or naming no theme) is Default on
-    /// every appearance: on a light one it draws exactly what an explicit
-    /// `theme = "Default"` draws, reports Dark to DSR 996, and hands the
-    /// engine the very config a dark one gets (no custom palette: Default's
-    /// slots are the engine's own xterm table).
     #[test]
     fn resolved_colors_unset_theme_is_the_dark_default() {
         let themes = ThemeCatalog::default();
@@ -945,8 +912,6 @@ mod tests {
         assert_ne!(pair.scheme.background, default.scheme.background);
     }
 
-    /// Each value that is not a colour is one issue, under its own key; the
-    /// slot keeps the theme's colour and the rest still apply.
     #[test]
     fn resolved_colors_reports_a_bad_hex_once() {
         let config = cfg(
@@ -980,8 +945,6 @@ mod tests {
         );
     }
 
-    /// `#RGB` is a colour in aterm.toml as in theme files and OSC: each digit
-    /// widens to a byte.
     #[test]
     fn resolved_colors_accepts_short_hex() {
         let resolved = resolve(
@@ -998,9 +961,6 @@ mod tests {
         assert_eq!(bad.scheme.foreground, ColorScheme::default().foreground);
     }
 
-    /// THE CHROME KEYS: a theme file's chrome colour is drawn unless
-    /// `aterm.toml` sets the same key, which wins with provenance Config and
-    /// is named by `config_keys`.
     #[test]
     fn resolved_colors_chrome_keys_beat_the_theme() {
         let mut scheme = aterm_types::scheme::builtin("Dracula").unwrap();
@@ -1047,7 +1007,6 @@ mod tests {
         );
     }
 
-    /// Provenance names who set each slot: the theme, a config key, or nobody.
     #[test]
     fn resolved_colors_provenance_names_each_slot() {
         let none = resolve(&Config::default(), Appearance::Dark);
@@ -1097,8 +1056,6 @@ mod tests {
         assert_eq!(missing.scheme.background, ColorScheme::default().background);
     }
 
-    /// A custom theme file resolves to its catalog id; the theme file's own
-    /// selection foreground reaches the engine, and the config's beats it.
     #[test]
     fn resolved_colors_reads_a_file_theme_and_its_selection_foreground() {
         let scheme = ColorScheme {
@@ -1127,8 +1084,6 @@ mod tests {
         assert_eq!(over.provenance.selection_fg, ColorOrigin::Config);
     }
 
-    /// A candidate stands in for the configured theme (a preview), and the
-    /// config's colour keys still apply over it.
     #[test]
     fn resolved_colors_candidate_replaces_the_configured_theme() {
         let config = cfg("theme = \"Dracula\"\nforeground = \"#102030\"");
@@ -1147,8 +1102,6 @@ mod tests {
         assert_eq!(split.side, Appearance::Light);
     }
 
-    /// The reported appearance is the theme's own while the background is the
-    /// theme's, and the final background's polarity once config overrides it.
     #[test]
     fn resolved_colors_reported_follows_the_background_on_screen() {
         let light = "Solarized Light";
@@ -1178,9 +1131,6 @@ mod tests {
         assert_eq!(bad_bg.reported, Appearance::Dark);
     }
 
-    /// A light file theme with no `selection` paints a light band, derived
-    /// from the colours on screen: a `background` override moves it too, and
-    /// the renderer and the engine get the same band.
     #[test]
     fn resolved_colors_derives_an_unset_selection_from_the_final_colours() {
         let light = aterm_types::scheme::parse_scheme_str(
@@ -1216,8 +1166,6 @@ mod tests {
         );
     }
 
-    /// A split with a `background` chosen for its dark side leaves the light
-    /// side's text illegible, and validation says which side and why.
     #[test]
     fn split_override_warnings_name_the_side_an_override_breaks() {
         let themes = ThemeCatalog::default();
@@ -1250,9 +1198,6 @@ mod tests {
         }
     }
 
-    /// `palette_overrides` sets single slots over the theme (and over the
-    /// `palette` list): a slot it does not name follows whichever theme is
-    /// drawn, so one tuned slot never pins the others.
     #[test]
     fn palette_overrides_set_one_slot_and_leave_the_rest_to_the_theme() {
         let sparse = cfg("palette_overrides = { 12 = \"#123456\" }");
@@ -1283,9 +1228,6 @@ mod tests {
         );
     }
 
-    /// An override lands over the list's entry for the same slot, reaches
-    /// past the sixteen into the extended palette, sorts by slot, and a key
-    /// that is no slot or a value that is no colour is an issue, once.
     #[test]
     fn palette_overrides_land_over_the_list_and_report_bad_entries() {
         let resolved = resolve(
@@ -1331,11 +1273,6 @@ mod tests {
         );
     }
 
-    /// The page palette is a by-product of the one resolution: the theme as it
-    /// is before the four colour keys that reach the renderer's theme, equal to
-    /// resolving the same config with those keys left out, on both sides of a
-    /// split and under a preview candidate, with `palette[]`, the sparse slots
-    /// and `selection_foreground` set too (none of which reach a `Theme`).
     #[test]
     fn resolved_colors_keeps_the_theme_before_the_colour_overrides() {
         let palette: Vec<String> = (0..256)
@@ -1371,7 +1308,6 @@ mod tests {
         }
     }
 
-    /// The slot-100 value the derivation gives `theme`'s colours.
     fn generated_100(config: &Config, theme: Option<&str>) -> Rgb {
         let mut scheme = config
             .resolved_colors(Appearance::Dark, &ThemeCatalog::default(), theme)
@@ -1380,10 +1316,6 @@ mod tests {
         scheme.to_color_palette().get(100)
     }
 
-    /// Spec `resolved-colors-generate`: a signature theme derives slots
-    /// 16-255 from its own colours by its key; `palette_generate = "never"`
-    /// keeps xterm's (the negative control); `"always"` derives them even for
-    /// the unset theme, which otherwise hands the engine no palette.
     #[test]
     fn palette_generate_follows_the_theme_unless_the_config_says() {
         let themes = ThemeCatalog::default();
@@ -1429,10 +1361,6 @@ mod tests {
         );
     }
 
-    /// Spec `resolved-colors-generate`: a config slot past 15 wins over a
-    /// derived one and leaves its neighbours derived, and the cube follows
-    /// an ANSI override (slot 196 is `palette[9]`), so `theme palette` names
-    /// each slot's origin.
     #[test]
     fn config_slots_win_over_derived_ones_and_the_cube_follows_ansi_overrides() {
         let themes = ThemeCatalog::default();

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Lock-free reads of another program's live SQLite database ([`read`], [`immutable_uri`],
-//! [`Unread`]).
+//! Lock-free reads of another program's live SQLite database ([`read`](crate::foreign_db::read), [`immutable_uri`](crate::foreign_db::immutable_uri),
+//! [`Unread`](crate::foreign_db::Unread)).
 
 use std::path::{Path, PathBuf};
 

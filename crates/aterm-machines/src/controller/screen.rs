@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm machines person` and `screen`: the steps only a person can do, over Screen Sharing (design §6).
+//! `aterm machines person` and `screen` flows over Screen Sharing.
 
 use super::inventory::Paths;
 use super::ssh::{self, Target};
@@ -19,7 +19,6 @@ pub const PERSON_HANG: Duration = Duration::from_secs(15 * 60);
 /// The pause between two re-probes while a person works.
 pub const POLL: Duration = Duration::from_secs(2);
 
-/// How long the host may take to open a pane or answer a read.
 const EXEC_BUDGET_SECS: u64 = 30;
 
 /// One step the flow walks.
@@ -53,7 +52,7 @@ impl Step {
     }
 }
 
-/// The outstanding person steps in `report`, in the order a person does them (Remote Login and its FDA switch, Screen Sharing, every Full Disk Access, then every Developer Tools entry).
+/// The outstanding person steps in `report`, in the order a person does them.
 #[must_use]
 pub fn prepare_steps(report: &HostReport) -> Vec<Step> {
     let mut steps: Vec<Step> = report
@@ -79,7 +78,6 @@ pub fn prepare_steps(report: &HostReport) -> Vec<Step> {
 }
 
 /// `steps` narrowed to the one step `id` (`screen <host> <step>`).
-///
 /// # Errors
 /// One line when `id` is not a step id.
 pub fn only(steps: Vec<Step>, id: &str) -> Result<Vec<Step>, String> {
@@ -96,8 +94,7 @@ pub fn only(steps: Vec<Step>, id: &str) -> Result<Vec<Step>, String> {
     ])
 }
 
-/// The account `name` as the host reported it (its uid is what `launchctl asuser` and `gui/<uid>` take).
-///
+/// The account `name` as the host reported it.
 /// # Errors
 /// One line when the report's facts do not list it.
 pub fn account(report: &HostReport, name: &str) -> Result<User, String> {
@@ -114,8 +111,7 @@ pub fn account(report: &HostReport, name: &str) -> Result<User, String> {
         })
 }
 
-/// Refuse `verb` unless a person is there: standard input and standard error are terminals (design §10).
-///
+/// Refuse `verb` unless a person is there: standard input and standard error are terminals.
 /// # Errors
 /// The refusal, one line.
 pub fn require_terminals(verb: &str, stdin_tty: bool, stderr_tty: bool) -> Result<(), String> {
@@ -131,9 +127,7 @@ pub fn require_terminals(verb: &str, stdin_tty: bool, stderr_tty: bool) -> Resul
 
 /// The host, as the flow reaches it.
 pub trait Remote {
-    /// Run `exec` on the host as one signed request and return how it ended and what it
-    /// printed.
-    ///
+    /// Run `exec` on the host as one signed request and return how it ended and what it printed.
     /// # Errors
     /// One line when the request did not run (unreachable, refused, not signed).
     fn exec(&self, exec: &Exec) -> Result<Ran, String>;
@@ -204,7 +198,6 @@ impl Clock for WallClock {
 }
 
 /// `cmd` as an `exec` payload.
-///
 /// # Errors
 /// One line when `cmd` needs what `exec` cannot carry (a login session, a variable, input).
 pub fn exec_of(cmd: &Cmd) -> Result<Exec, String> {
@@ -233,9 +226,6 @@ pub fn reprobe(remote: &dyn Remote, step: &PersonStep) -> Probe {
     })
 }
 
-/// The request that runs `program` with `args` as `user` inside `user`'s login session on
-/// the host: root runs `launchctl asuser <uid>`, which runs the user primitive of design §3.5
-/// (`sudo -n -u <user> -H -- env -i …`) around it.
 fn in_session(user: &User, program: &str, args: &[&str]) -> Exec {
     let shell = if user.shell.is_empty() {
         "/bin/zsh"
@@ -269,7 +259,7 @@ fn in_session(user: &User, program: &str, args: &[&str]) -> Exec {
     }
 }
 
-/// The request that opens `url` in `user`'s login session on the host (design §1.9, VM: it opened System Settings at the pane on the console).
+/// The request that opens `url` in `user`'s login session on the host.
 #[must_use]
 pub fn open_pane_cmd(user: &User, url: &str) -> Exec {
     in_session(user, "/usr/bin/open", &[url])
@@ -341,7 +331,6 @@ pub fn disarm_cmd(id: &str) -> Exec {
     }
 }
 
-/// The first line a request printed that is not blank.
 fn first_line(ran: &Ran) -> String {
     ran.out()
         .lines()
@@ -353,8 +342,7 @@ fn first_line(ran: &Ran) -> String {
 
 /// Arm the host's screen watch for `admin` ([`arm_cmd`]); the arm's id.
 /// # Errors
-/// Why it is not armed: the agent's own `not armed: <why>`, how the run ended and what it
-/// printed (an agent from before the watch refuses the verb), or that the request did not run.
+/// Why the screen watch is not armed, how the run ended, or that the request did not run.
 fn arm_watch(remote: &dyn Remote, admin: &User) -> Result<String, String> {
     let ran = remote
         .exec(&arm_cmd(admin))
@@ -375,10 +363,6 @@ fn arm_watch(remote: &dyn Remote, admin: &User) -> Result<String, String> {
     })
 }
 
-/// Disarm the host's screen watch `id` ([`disarm_cmd`]). A watcher that had ended first (it
-/// locked during an outage, say) is one line saying what it did; a disarm that did not go
-/// through is one line too, and changes nothing else: the watcher then reads the session
-/// itself and locks it if it is there, which is harmless.
 fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str) {
     let failed = match remote.exec(&disarm_cmd(id)) {
         Ok(ran) if ran.success() => {
@@ -409,14 +393,9 @@ fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str)
     ));
 }
 
-/// How long a walk with the screen watch armed may go between two requests that ran before it arms the watch again.
+/// Interval between requests before a walk with the screen watch armed re-arms the watch.
 pub const REARM: Duration = Duration::from_secs(watch::QUIET.as_secs() / 2);
 
-/// `screen`'s requests to the host once its screen watch is armed. A watcher that locked
-/// while the walk still ran (an outage shorter than the walk, another command's run holding
-/// the host, a host a login keeps busy that long) has ended, and the person may unlock the
-/// session over the relay once the host answers again: a kill after that would leave the Mac
-/// unlocked.
 struct Watched<'a> {
     remote: &'a dyn Remote,
     clock: &'a dyn Clock,
@@ -430,12 +409,10 @@ struct Watched<'a> {
 }
 
 impl Watched<'_> {
-    /// The arm held now, if any.
     fn id(&self) -> Option<String> {
         self.id.borrow().clone()
     }
 
-    /// Acknowledge the replacement before retiring the arm held, if any.
     fn arm_again(&self) {
         let old = self.id.borrow().clone();
         let pending = self.ran.get().is_none();
@@ -488,7 +465,6 @@ impl Remote for Watched<'_> {
 }
 
 /// What each connection to `screen`'s relay runs.
-///
 /// # Errors
 /// One line for a target `ssh` could misread.
 pub fn relay_cmd(paths: &Paths, target: &Target) -> Result<Cmd, String> {
@@ -502,9 +478,8 @@ pub fn vnc_url(admin: &str, local_port: u16) -> String {
 }
 
 /// Whether something on the host answers `relay`'s request with an RFB greeting.
-///
 /// # Errors
-/// One line: the host's own `refused: …` (Screen Sharing off, or an agent too old for `screen`), `ssh`'s error, or what came back in place of the greeting.
+/// One line: the host's own `refused: …`, `ssh`'s error, or what replaced the greeting.
 pub fn screen_answers(sys: &dyn System, relay: &Cmd) -> Result<(), String> {
     let ran = sys
         .run(&relay.clone().budget(Duration::from_secs(EXEC_BUDGET_SECS)))
@@ -559,9 +534,8 @@ pub struct Flow<'a> {
 }
 
 /// Wait until `step` reads granted on the host, re-probing every [`POLL`].
-///
 /// # Errors
-/// The last reading, once [`Flow::hang`] passes without a grant; or the signal that stopped the walk ([`System::stopped`]).
+/// The last reading once [`Flow::hang`] passes, or the signal that stopped the walk.
 pub fn await_granted(flow: &Flow<'_>, step: &PersonStep) -> Result<String, String> {
     let start = flow.clock.elapsed();
     loop {
@@ -585,14 +559,9 @@ pub fn await_granted(flow: &Flow<'_>, step: &PersonStep) -> Result<String, Strin
     }
 }
 
-/// Open `url` in `admin`'s session ([`open_pane_cmd`]). A request that did not run is sent
-/// again every [`POLL`], as the walk's readings are: right after a login over the relay the
-/// host can be too busy to answer for a while (VM, 27.0: `Connection timed out during banner
-/// exchange` on the walk's first two requests after the login, and the walk ended with the
-/// step not granted). One that ran and failed is final.
+/// Open `url` in `admin`'s session ([`open_pane_cmd`]).
 /// # Errors
-/// How the open ran, when it failed; the last reason it did not run once [`Flow::hang`]
-/// passes; or the signal that stopped the walk ([`System::stopped`]).
+/// How the open ran when it failed, the last reason it did not run, or the stopping signal.
 fn open_pane(flow: &Flow<'_>, admin: &User, url: &str) -> Result<(), String> {
     let start = flow.clock.elapsed();
     loop {
@@ -611,7 +580,6 @@ fn open_pane(flow: &Flow<'_>, admin: &User, url: &str) -> Result<(), String> {
     }
 }
 
-/// The line a walk a signal stopped ends a step or a wait with.
 fn stopped_by(sig: i32) -> String {
     format!("stopped by {}", crate::port::stop_name(sig))
 }
@@ -626,7 +594,6 @@ pub enum Reading {
 }
 
 /// Read whether `admin` has a login session now.
-///
 /// # Errors
 /// Why the request did not run (the host unreachable, the envelope refused): it read nothing.
 pub fn read_session(flow: &Flow<'_>, admin: &User) -> Result<Reading, String> {
@@ -648,16 +615,15 @@ pub fn read_session(flow: &Flow<'_>, admin: &User) -> Result<Reading, String> {
 /// How the admin's session came to be there when [`await_session`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Found {
-    /// No reading said it was missing, the one before the wait included: it was there before the walk, locked or not.
+    /// No reading said it was missing, the one before the wait included.
     Existing,
-    /// A reading found no session and a later one found it: the admin logged in while the walk waited (over the relay, for `screen`).
+    /// A reading found no session and a later one found it.
     LoggedIn,
 }
 
 /// Wait until `admin` has a login session on the host, and say whether a reading found none first.
-///
 /// # Errors
-/// One line once [`Flow::hang`] passes without one, or when a signal stopped the walk ([`System::stopped`]).
+/// One line once [`Flow::hang`] passes without one, or when a signal stopped the walk.
 pub fn await_session(flow: &Flow<'_>, admin: &User, mut absent: bool) -> Result<Found, String> {
     await_session_observed(flow, admin, &mut absent)
 }
@@ -709,8 +675,6 @@ fn await_session_observed(
     }
 }
 
-/// Walk `steps` in order. A step that needs the Mac's keyboard is left as
-/// [`Done::AtConsole`] unless `at_console`.
 fn walk(flow: &Flow<'_>, admin: &User, steps: &[Step], at_console: bool) -> Vec<Walked> {
     let mut out = Vec::with_capacity(steps.len());
     let mut stopped: Option<String> = None;
@@ -778,7 +742,7 @@ pub struct Terminals {
     pub stderr: bool,
 }
 
-/// The Screen Sharing step `steps` lists measured outstanding: `screen` cannot work until a person turns it on at the Mac.
+/// The Screen Sharing step `steps` lists measured outstanding.
 #[must_use]
 pub fn screen_sharing_outstanding(steps: &[Step]) -> Option<&Step> {
     steps
@@ -807,9 +771,7 @@ pub enum Session {
     Unlocked {
         /// Why the lock failed.
         why: String,
-        /// Why the last reading did not run, when none saw the login: the wait for it ended
-        /// (a stop, the hang detector) and the reading after that did not run, so whether the
-        /// admin logged in at all is not known.
+        /// Why the last reading did not run, when none saw the login.
         unread: Option<String>,
         /// The host's screen watch stays armed, to try the lock itself.
         watched: bool,
@@ -817,7 +779,7 @@ pub enum Session {
 }
 
 impl Session {
-    /// The one line `screen` ends with when it left the Mac logged in and unlocked, or may have, after the walk's own lines and its closing plan.
+    /// The one line `screen` ends with when it left the Mac logged in and unlocked, or may have.
     #[must_use]
     pub fn unlocked_line(&self, host: &str, admin: &str) -> Option<String> {
         let Self::Unlocked {
@@ -861,10 +823,6 @@ pub struct Screened {
     pub stops: Box<dyn std::any::Any>,
 }
 
-/// Lock the session `admin` logged in to over the relay ([`lock_cmd`]). macOS leaves a login
-/// made over Screen Sharing unlocked at the Mac's display when the connection closes (VM,
-/// 27.0: 3 of 3 logins, watched for 5 minutes), so `screen` does what ScreensharingAgent does
-/// for a session it found locked.
 fn lock_session(flow: &Flow<'_>, admin: &User, unread: Option<String>, watched: bool) -> Session {
     let why = match flow.remote.exec(&lock_cmd(admin)) {
         Ok(ran) if ran.success() => {
@@ -890,7 +848,6 @@ fn lock_session(flow: &Flow<'_>, admin: &User, unread: Option<String>, watched: 
     }
 }
 
-/// The line once the admin logged in over the relay: what locks the session, and when.
 fn logged_in_line(admin: &User, watched: bool) -> String {
     let otherwise = if watched {
         format!(
@@ -907,9 +864,6 @@ fn logged_in_line(admin: &User, watched: bool) -> String {
     )
 }
 
-/// After the relay closed: the steps, and the session decided. A session there before the
-/// relay ([`Found::Existing`]) is kept; one the walk saw begin ([`Found::LoggedIn`]) is
-/// locked.
 fn decide(
     flow: &Flow<'_>,
     admin: &User,
@@ -946,7 +900,6 @@ fn decide(
 }
 
 /// `aterm machines screen <host>`.
-///
 /// # Errors
 /// One line when the flow could not start.
 pub fn screen(
@@ -1082,8 +1035,7 @@ pub fn screen(
     })
 }
 
-/// `aterm machines person <host> --here`: the same walk for a person at the Mac's keyboard, with no relay and no viewer.
-///
+/// `aterm machines person <host> --here`.
 /// # Errors
 /// One line when the flow could not start: no terminal, or the admin never logged in.
 pub fn here(
@@ -1186,10 +1138,8 @@ mod tests {
         opened_at_arm: Mutex<Option<(bool, bool)>>,
     }
 
-    /// The id the scripted host arms.
     const WATCH: &str = "1800000000-77";
 
-    /// The next answer of `script`, the last repeating; `None` when it is empty.
     fn next(script: &Mutex<Vec<Result<Ran, String>>>) -> Option<Result<Ran, String>> {
         let mut script = script.lock().unwrap();
         match script.len() {
@@ -1200,7 +1150,6 @@ mod tests {
     }
 
     impl Host<'_> {
-        /// The admin at the login window for `absent` readings, then logged in.
         fn logs_in_after(&self, absent: usize) {
             let mut script: Vec<Result<Ran, String>> = (0..absent)
                 .map(|_| {
@@ -1432,8 +1381,6 @@ mod tests {
         );
     }
 
-    /// Script `host` so Screen Sharing reads on with control: the service enabled, and the
-    /// agent's PostEvent and ScreenCapture rows granted.
     fn screen_sharing_on(host: &Host) {
         host.on(&person::print_disabled_cmd(), Ran::ok(
             "\n\tdisabled services = {\n\t\t\"com.apple.screensharing\" => enabled\n\t\t\"com.openssh.sshd\" => enabled\n\t}\n",
@@ -1444,7 +1391,6 @@ mod tests {
         );
     }
 
-    /// A port where the host greets as screensharingd and the relay listens on 55901.
     fn relaying() -> Fake {
         let mut sys = Fake::default();
         sys.on(
@@ -1455,8 +1401,6 @@ mod tests {
         sys
     }
 
-    /// What the fake port records for the check, then the stops caught, the relay's open and
-    /// close, and the stops restored once the lock is decided.
     fn relay_calls() -> [String; 5] {
         let cmd = relay_cmd(&paths(), &target()).unwrap().display();
         [
@@ -1497,7 +1441,6 @@ mod tests {
         assert!(relay_cmd(&paths(), &odd).is_err());
     }
 
-    /// A host whose `launchctl print gui/<uid>` answers from a script, in order.
     struct Sessions(Mutex<Vec<Ran>>);
 
     impl Remote for Sessions {
@@ -1700,7 +1643,6 @@ mod tests {
             .count()
     }
 
-    /// What the walk's first two requests after a login over the relay got (VM, 27.0).
     fn not_answered() -> Result<Ran, String> {
         Err(
             "the agent answered no report: exit 255: Connection timed out during banner exchange"
@@ -1919,7 +1861,6 @@ mod tests {
         assert_eq!(panes, 1, "the granted step opened no pane");
     }
 
-    /// A host every request fails on.
     struct Unreachable;
 
     impl Remote for Unreachable {
@@ -1961,8 +1902,6 @@ mod tests {
         assert!(host.seen().is_empty());
     }
 
-    /// Once a relay may have admitted a login, every failed wait still closes it
-    /// and decides the lock from the absence it actually observed.
     #[test]
     fn a_failed_login_wait_keeps_the_session_cleanup_obligation() {
         for newly_logged_in in [false, true] {
@@ -2080,8 +2019,6 @@ mod tests {
         );
     }
 
-    /// `screen` over a relay that greets, with Screen Sharing on and aterm's Full Disk Access
-    /// off, then granted at the first re-probe.
     fn screen_fda(host: &Host<'_>, sys: &Fake) -> (Screened, Vec<String>) {
         screen_sharing_on(host);
         host.on(&tcc_aterm(), Ran::ok(ATERM_ROWS_OFF));
@@ -2116,8 +2053,6 @@ mod tests {
         host.seen().iter().filter(|s| **s == lock).count()
     }
 
-    /// The host's requests that are the lock or the screen watch's, in order: `lock`, `arm`,
-    /// `disarm <id>`.
     fn lock_and_watch(host: &Host<'_>) -> Vec<String> {
         let lock = lock_cmd(&admin()).argv.join(" ");
         let arm = arm_cmd(&admin()).argv.join(" ");
@@ -2468,8 +2403,6 @@ mod tests {
         );
     }
 
-    /// `screen` of the FDA step with `host` and `sys` and the viewer `opener`: what it returned
-    /// and every line it said.
     fn screen_with(
         host: &Host<'_>,
         sys: &Fake,
@@ -2646,8 +2579,6 @@ mod tests {
         }
     }
 
-    /// `n` pane opens that do not run, then one that does: a gap of `2n` s between the
-    /// re-probe before them and the open that ran.
     fn opens_after(host: &Host<'_>, n: usize) {
         let mut script: Vec<Result<Ran, String>> = (0..n).map(|_| not_answered()).collect();
         script.push(Ok(Ran::ok("")));
@@ -2914,8 +2845,6 @@ mod tests {
         assert!(exec_of(&Cmd::new("/usr/bin/true").env("A", "b")).is_err());
     }
 
-    /// The actual request wrapper keeps a previously acknowledged arm through a failed
-    /// replacement, then retires it only after a later request acknowledges the new one.
     #[test]
     fn a_replacement_watch_is_acknowledged_before_the_previous_arm_is_retired() {
         let ordinary = Host::default();

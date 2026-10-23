@@ -135,7 +135,9 @@ fn system_pbcopy(text: &str) -> bool {
         use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread;
+        // `-clearContents` is `-(NSInteger)`, `-setString:forType:` is
+        // `-(BOOL)(NSString *, NSPasteboardType)`, and both arguments outlive the call.
         autoreleasepool(|_| unsafe {
             let Some(ns) = appkit::nsstring(text) else {
                 return false;
@@ -203,7 +205,9 @@ fn system_pbpaste() -> Option<String> {
         use aterm_objc::{autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread;
+        // `-stringForType:` is `-(NSString *)(NSPasteboardType)`, and its borrowed result is
+        // copied out inside this pool.
         let s = autoreleasepool(|_| unsafe {
             let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
             if pb.is_null() || pasteboard_type_string().is_null() {

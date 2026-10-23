@@ -6,7 +6,7 @@
     feature(macro_attr)
 )]
 
-//! Signature-pinned in-app self-update for macOS app bundles and enrolled [`linux`] binaries.
+//! Signature-pinned in-app self-update for macOS app bundles and enrolled `linux` binaries.
 #![cfg_attr(
     test,
     allow(
@@ -27,7 +27,8 @@ mod cadence_bounds;
 mod check_lane;
 #[cfg(target_os = "macos")]
 mod check_receipt;
-/// The background check loop's heartbeat and the pure judgement of it that the window's watchdog.
+/// The background check loop's heartbeat and the pure judgement of it that the window's watchdog,
+/// `aterm ctl update status` and the tests share.
 pub mod checker_watch;
 /// A dev build's standing against the public channel.
 pub mod dev_channel;
@@ -3779,7 +3780,7 @@ fn checker_skip_at(
     )
 }
 
-/// [`checker_skip`] for this build and source at an injected `now`.
+/// `checker_skip` for this build and source at an injected `now`.
 #[cfg(target_os = "macos")]
 fn checker_skip_for(
     staging: &paths::Staging,
@@ -3876,7 +3877,7 @@ pub fn delivery() -> Option<Delivery> {
     None
 }
 
-/// Why [`status`] answered `None` on macOS, in a person's words.
+/// Why [`fn@status`] answered `None` on macOS, in a person's words.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn ledger_unreadable_cause() -> String {

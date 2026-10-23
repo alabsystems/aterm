@@ -14,12 +14,6 @@ use aterm_verify::ladder::tally;
 use aterm_verify::plan::StageId;
 use aterm_verify::{Ctx, Scope, Show, exit, mktemp_dir, plan, stages};
 
-/// Every check a fixture can stand in for in one run: all but the ones that
-/// read the real tree in-process (`fmt`, `census`, `forge`, `cells`, each
-/// unit-tested where it lives), the node-driven `wasm-smoke` and `wasm-glue`,
-/// the Chromium-driven `browser`, the bundle's `measure`, the release's feature
-/// builds (`checkers`, `gpu-oracle`, each a stage unit-tested in `stages`), the
-/// machine-package `codex-alab` and the VM-driving `linux`.
 fn land() -> Vec<Check> {
     CHECKS
         .iter()
@@ -44,8 +38,6 @@ fn land() -> Vec<Check> {
         .collect()
 }
 
-/// A repo-shaped directory: stand-ins for the binaries the CLI drives, all
-/// passing.
 struct FakeRepo {
     root: PathBuf,
     stage2: PathBuf,
@@ -54,7 +46,6 @@ struct FakeRepo {
     home: PathBuf,
 }
 
-/// Where a fixture's driven binaries are built: the main target, `<root>/target`.
 const DRIVERS: &str = "target";
 
 impl FakeRepo {
@@ -80,26 +71,19 @@ impl FakeRepo {
         me
     }
 
-    /// A stand-in for a binary a stage builds in the main target and then
-    /// DRIVES — `rel` under its `debug/` — that exits `code`.
     fn driver_stub(&self, rel: &str, code: i32) -> &Self {
         self.driver_script(rel, &format!("echo '{rel}: stub'; exit {code}"))
     }
 
-    /// A stand-in driven binary with its own `body`, as data behind the one
-    /// shared stand-in text ([`Self::script_body`]).
     fn driver_script(&self, rel: &str, body: &str) -> &Self {
         self.script_body(&format!("{DRIVERS}/debug/{rel}"), body);
         self
     }
 
-    /// A stand-in at `rel` whose body is not shared: data beside the one
-    /// constant stand-in ([`common::standin_body`]).
     fn script_body(&self, rel: &str, body: &str) {
         common::standin_body(&self.root.join(rel), body);
     }
 
-    /// Install a stand-in Trust stage2 whose `targo` runs `targo_body`.
     fn with_stage2(&self, targo_body: &str) -> &Self {
         for (name, body) in [("targo", targo_body), ("trustdoc", "exit 0")] {
             common::standin(&self.stage2.join(name), body);
@@ -107,8 +91,6 @@ impl FakeRepo {
         self
     }
 
-    /// [`Self::with_stage2`] with `targo_body` as data behind the one shared
-    /// stand-in text, for a body that bakes in a path or an argv of its own.
     fn with_stage2_body(&self, targo_body: &str) -> &Self {
         common::standin_body(&self.stage2.join("targo"), targo_body);
         common::standin(&self.stage2.join("trustdoc"), "exit 0");
@@ -126,21 +108,15 @@ impl FakeRepo {
         )
     }
 
-    /// [`Self::ctx`] with the windowed stages RUNNING (`--no-windows` off,
-    /// which the fixture otherwise sets): this repo's stand-in drivers open
-    /// nothing.
     fn ctx_with_windows(&self, checks: &[Check], scope: Scope) -> Ctx {
         self.ctx(checks, scope).with_no_windows(false)
     }
 
-    /// Run `checks` over `scope`: the full ladder (the log) followed by the
-    /// check lines and the verdict (stdout), and the exit code.
     fn run(&self, checks: &[Check], scope: Scope) -> (String, i32) {
         run_ctx(&self.ctx(checks, scope))
     }
 }
 
-/// Run `ctx` as the CLI runs it: the log, then stdout, and the exit code.
 fn run_ctx(ctx: &Ctx) -> (String, i32) {
     let (mut out, mut log): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
     let code = aterm_verify::run(ctx, &mut out, &mut log, &Show::default()).expect("writable");
@@ -160,20 +136,16 @@ impl Drop for FakeRepo {
     }
 }
 
-/// Every driven binary's path under the main target's `debug/`: the redraw
-/// harness and the objc drivers' examples, named by the stages themselves.
 fn driven_stubs() -> Vec<String> {
     std::iter::once(stages::REDRAW_CONFORMANCE_BIN.to_string())
         .chain(stages::OBJC_DRIVES.iter().map(|d| objc_stub(d.example)))
         .collect()
 }
 
-/// An objc driver's built example, under the main target's `debug/`.
 fn objc_stub(example: &str) -> String {
     format!("examples/{example}")
 }
 
-/// Every ladder decision, as `("ok"|"skip"|"FAIL"|"NOT RUN", label)`.
 fn decisions(ladder: &str) -> Vec<(&str, &str)> {
     ladder
         .lines()
@@ -192,7 +164,6 @@ fn decisions(ladder: &str) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// Every ladder decision's tag, in order.
 fn tags(ladder: &str) -> Vec<&str> {
     decisions(ladder).into_iter().map(|(t, _)| t).collect()
 }
@@ -205,14 +176,10 @@ fn labels_with(ladder: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// `s` as one single-quoted shell word.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// `fmt` hands every file git tracks (and every untracked one cargo builds)
-/// to the stage2's `trustfmt`, makes each file it would change a finding, and
-/// under `--fix` rewrites exactly those files.
 #[test]
 fn fmt_reports_what_trustfmt_would_change_and_fix_rewrites_only_that() {
     let repo = FakeRepo::new();
@@ -265,8 +232,6 @@ fn fmt_reports_what_trustfmt_would_change_and_fix_rewrites_only_that() {
     assert_eq!(fs::read_to_string(&trace).expect("written"), "src/b.rs\n");
 }
 
-/// The checks that read the tree in-process refuse a root that is not an
-/// aterm checkout rather than pass over nothing.
 #[test]
 fn the_in_process_checks_refuse_a_root_that_is_not_an_aterm_checkout() {
     let repo = FakeRepo::new();
@@ -282,8 +247,6 @@ fn the_in_process_checks_refuse_a_root_that_is_not_an_aterm_checkout() {
         assert!(line.contains("is not an aterm checkout"), "{line}");
     }
 }
-/// A skip prints its reason and fix and fails nothing — except under
-/// `release`, where publication needs every check to have run: exit 3.
 #[test]
 fn a_skip_fails_nothing_except_under_release() {
     let repo = FakeRepo::new();
@@ -351,11 +314,6 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     );
 }
 
-/// THE DOCTESTS THROUGH THE REAL STAND-IN: the doctests stage hands cargo the
-/// test compile's own selection (`--workspace` here) and this binary as its
-/// doc driver, which skips the pass of the library whose docs hold no doctest,
-/// saying so, and becomes the stage2's trustdoc for the one whose docs hold
-/// one, with `RUSTDOC` back on trustdoc and its own variables gone.
 #[test]
 fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_selection() {
     let repo = FakeRepo::new();
@@ -427,12 +385,6 @@ fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_se
     assert!(ladder.contains("trustdoc ran documented"), "{ladder}");
 }
 
-/// Every driven stage looks at its driver's exit code — the regressions these
-/// drivers exist for (a dropped `EventLoopProxy`, a retyped objc argument)
-/// leave `cargo build` at 0 — and nothing that decided nothing is green: the
-/// redraw harness's `0` passes, `1` is a finding, `2` (no event loop) could not
-/// run; and on macOS the event drive's untrapped signal death is the finding it
-/// exists to make.
 #[test]
 fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let repo = FakeRepo::new();
@@ -465,9 +417,6 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     }
 }
 
-/// The objc drives stage runs every row, whatever one row did. A driver whose
-/// build failed and a driver that found a defect each leave their own rows,
-/// and every other driver still runs and says so.
 #[test]
 fn the_objc_drives_run_every_row_after_a_failure() {
     if !cfg!(target_os = "macos") {
@@ -503,18 +452,9 @@ fn the_objc_drives_run_every_row_after_a_failure() {
     }
 }
 
-/// A compile red, as a stub driver prints one: the build of whatever it names
-/// fails, every other invocation passes.
 const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this scope' >&2; \
      echo '  --> crates/aterm-gui/src/bin/rot.rs:3:13' >&2; exit 101";
 
-/// A stand-in `targo` that does what cargo does with a runner: for
-/// the compile it writes `bins` as test executables and reports each in a JSON
-/// `compiler-artifact` line; for `--tests` it prints each binary's `Running`
-/// header and, when the argv carries the recording runner, executes the runner
-/// with the binary's argv from the binary's package directory with
-/// `CARGO_PKG_NAME` set — or, with no runner (the serial child), runs the
-/// binary itself and prints cargo's re-run line after a failure.
 fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
     let deps = repo.root.join("target/debug/deps");
     fs::create_dir_all(&deps).expect("mkdir");
@@ -584,9 +524,6 @@ exit 0"#
     ));
 }
 
-/// The test binaries run several at a time, end to end, through the real recorder
-/// (`aterm-verify --record-test-binary`, the binary this package builds) and a
-/// stand-in cargo that runs it the way cargo runs a runner.
 #[test]
 fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let repo = FakeRepo::new();
@@ -706,11 +643,6 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     assert!(t.could_not_run.is_empty(), "{t:?}");
 }
 
-/// A recording that does not add up runs
-/// the serial `--tests` child instead, and says why — cargo announcing a
-/// binary the recorder never saw, or the recorder failing — and a pass in
-/// which the recorder never ran (a runner the caller's config names outranks
-/// ours) is judged as the serial run it was.
 #[test]
 fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
@@ -768,7 +700,6 @@ fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
     }
 }
 
-/// A runner that runs no test is no pass.
 #[test]
 fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let repo = FakeRepo::new();

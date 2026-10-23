@@ -72,7 +72,7 @@ pub fn visible_row(t: &aterm_core::terminal::Terminal, r: usize) -> String {
     out
 }
 
-/// [`visible_row`] appended to `out`, with no `String` of its own: the engine appends the row ([`Terminal::push_line_text`]) and [`push_visible`]'s rule collapses and trims it where it landed.
+/// [`visible_row`] appended to `out`, with no `String` of its own: the engine appends the row ([`Terminal::push_line_text`](aterm_core::terminal::Terminal::push_line_text)) and [`push_visible`]'s rule collapses and trims it where it landed.
 pub fn visible_row_into(t: &aterm_core::terminal::Terminal, r: usize, out: &mut String) {
     let start = out.len();
     t.push_line_text(r, out);

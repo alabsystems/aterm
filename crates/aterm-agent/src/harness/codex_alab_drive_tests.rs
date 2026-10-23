@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The codex-alab path over a stand-in aterm instance on a real socket (every request recorded, nothing typed anywhere) and a scripted kernel.
+//! Driven tests for the `codex-alab` path over a stand-in instance and scripted kernel.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,21 +16,16 @@ use crate::supervise::ScratchDir;
 
 const TAB: &str = "s-c0dec0dec0dec0dec0de";
 const TOKEN: &str = "0badf00d0badf00d";
-/// The conversation the record names; another one an older exit's hint names.
 const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
 const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
-/// Pids no real process of this test has: the kernel is scripted.
 const TUI: u32 = 4_000_001;
 const SHELL: u32 = 4_000_002;
 const NEW: u32 = 4_000_003;
 
-/// A fresh directory per call, removed when it drops.
 fn scratch(name: &str) -> ScratchDir {
     ScratchDir::new("cxa", name)
 }
 
-/// One `text --json` body: `rows`, the cursor at `(row, col)`, `seq` and a generation, and no
-/// person's input to the tab.
 fn screen_json(rows: &[&str], cursor: (usize, usize), seq: u64) -> String {
     let rows = aterm_json::to_string(&aterm_json::Value::Array(
         rows.iter().map(|r| aterm_json::Value::from(*r)).collect(),
@@ -42,8 +37,6 @@ fn screen_json(rows: &[&str], cursor: (usize, usize), seq: u64) -> String {
     )
 }
 
-/// An idle Codex with an empty composer, its dim placeholder under the cursor: the screen a
-/// continuation would be typed at, which this path never types at.
 fn codex_idle(seq: u64) -> String {
     screen_json(
         &[
@@ -61,8 +54,6 @@ fn codex_idle(seq: u64) -> String {
     )
 }
 
-/// The shell after the crash: `hint` under the command that ran the TUI, then the prompt with
-/// the cursor after it.
 fn shell_after(hint: &[&str]) -> String {
     let mut rows = vec!["% codex".to_string()];
     rows.extend(hint.iter().map(|r| (*r).to_string()));
@@ -72,8 +63,6 @@ fn shell_after(hint: &[&str]) -> String {
     screen_json(&refs, (at, 2), 900)
 }
 
-/// The shell integration's last two blocks for [`shell_after`] with `out_rows` output rows:
-/// the command that ran the TUI, killed (`exit 137`), then the prompt entering.
 fn blocks_after(out_rows: usize) -> (String, String) {
     let (cmd, out) = (0, 1);
     let end = out + out_rows;
@@ -89,7 +78,6 @@ fn blocks_after(out_rows: usize) -> (String, String) {
     )
 }
 
-/// What the stand-in serves: the shell after the crash, codex-alab once its line was typed.
 struct World {
     after_exit: String,
     after_relaunch: String,
@@ -100,8 +88,6 @@ struct World {
     relaunched: Arc<AtomicBool>,
 }
 
-/// A control socket at `<dir>/t.sock` standing in for the aterm instance of [`TAB`], and the
-/// requests it was asked, in order.
 fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     crate::harness::fake_instance(&dir.join("t.sock"), TOKEN, move |line| {
         let verb = line
@@ -148,10 +134,6 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
     })
 }
 
-/// The scripted kernel: [`TUI`] crashed out of [`SHELL`], whose group has the terminal back;
-/// the relaunch [`NEW`] appears under the shell, holding the thread's lock, once its line is
-/// typed, and is up at the `up_at`th look with the frame it names (never: `None`), or ends after
-/// `ends_at` looks; its kernel start reads `births` read by read, then [`NEW_BIRTH`].
 struct Crashed {
     relaunched: Arc<AtomicBool>,
     lock: PathBuf,
@@ -167,7 +149,6 @@ struct Crashed {
     owners: Mutex<VecDeque<aterm_uds::ownerlock::Owner>>,
 }
 
-/// [`NEW`]'s kernel start, as the record reader spells one.
 const NEW_BIRTH: &str = "Thu Oct 16 08:00:09 2026";
 
 impl Kernel for Crashed {
@@ -279,9 +260,6 @@ impl AlabKernel for Crashed {
     }
 }
 
-/// One rig: a Codex home with the thread's rollout, a state directory, the stand-in instance
-/// showing `hint` under the crashed command, and the kernel; the snapshot the host read while
-/// codex-alab ran, and the line its record validated.
 struct Rig {
     dir: ScratchDir,
     opts: Opts,
@@ -374,8 +352,6 @@ impl Rig {
         }
     }
 
-    /// The crashed codex-alab as the host's snapshot read it while it ran (embedded, its
-    /// thread [`T2`], its `CODEX_HOME` as `home_env`).
     fn snap(&self, home_env: Option<String>) -> crate::harness::relaunch::Snapshot {
         crate::harness::relaunch::Snapshot {
             stored_login: false,
@@ -401,7 +377,6 @@ impl Rig {
         }
     }
 
-    /// The line aterm's copy of the record validated: `<twin> resume <T2>`, under `codex_home`.
     fn resume(&self, codex_home: Option<String>) -> Resume {
         Resume {
             argv: vec![
@@ -430,7 +405,6 @@ impl Rig {
             .collect()
     }
 
-    /// What was asked of the tab after the relaunch line went in: the verbs only.
     fn after_the_line(&self) -> Vec<String> {
         let asked = self.asked();
         let at = asked
@@ -448,7 +422,6 @@ impl Rig {
     }
 }
 
-/// The verbs that type into a tab or read its screen.
 const TYPES_OR_READS: [&str; 7] = ["turn", "key", "send", "paste", "feed", "text", "cell"];
 
 /// A jail that refuses other processes' descriptor tables makes the all-process census
@@ -491,7 +464,6 @@ fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
     );
 }
 
-/// A free kernel lock admits exactly the resume line; a held or unknown answer does not.
 #[test]
 fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
     use aterm_uds::ownerlock::Owner::{Dead, Live, Unknown};
@@ -526,10 +498,6 @@ fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
     }
 }
 
-/// A crash relaunch held by a person at the prompt waits with nothing typed and no witness
-/// recorded; carried at the next decision, its line goes in under the captured `CODEX_HOME`
-/// alias, the witness is recorded once the line landed, and the relaunch is done once the new
-/// TUI leads the tab.
 #[test]
 fn a_self_claimed_relaunch_records_its_witness_after_a_deferred_carry() {
     let rig = Rig::new("self-claim-carry", &["zsh: killed     codex"]);
@@ -570,8 +538,6 @@ fn a_self_claimed_relaunch_records_its_witness_after_a_deferred_carry() {
     assert_eq!(rig.typed(), typed, "a second decision types nothing");
 }
 
-/// The line carries the `CODEX_HOME` the crashed process's own environment had, verbatim:
-/// unset, a path, or set empty.
 #[test]
 fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
     for case in ["unset", "path", "empty"] {
@@ -636,9 +602,6 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
     }
 }
 
-/// CODEX-ALAB CARRIES ON BY ITSELF (the contract §5): once its line is in and the new TUI leads
-/// the tab, the relaunch is done, though the tab shows an idle Codex at an empty composer: no
-/// continuation is typed, no key pressed, and the screen is not read again.
 #[test]
 fn the_crash_relaunch_types_nothing_after_the_new_tui_leads_the_tab() {
     for hand_back in [false, true] {
@@ -667,9 +630,6 @@ fn the_crash_relaunch_types_nothing_after_the_new_tui_leads_the_tab() {
     }
 }
 
-/// Whether `asked` (the stand-in's log, the kernel's looks marked in it) shows the harness's
-/// hand given back after the relaunch line and before the relaunched process was up: the
-/// 0.106.0 give-back that codex-alab's launch probe read as `hand=-`.
 fn released_before_up(asked: &[String]) -> bool {
     let line = asked
         .iter()
@@ -688,7 +648,6 @@ fn released_before_up(asked: &[String]) -> bool {
 }
 
 impl Rig {
-    /// The kernel's looks at the relaunched process during the hold.
     fn looks(&self) -> usize {
         self.asked()
             .iter()
@@ -696,7 +655,6 @@ impl Rig {
             .count()
     }
 
-    /// How the hold ended, as the ledger's `done:resumed` row says it after the outcome.
     fn held(&self) -> String {
         let ledger =
             std::fs::read_to_string(crate::harness::upgrade_drive::ledger_path(&self.opts))
@@ -720,8 +678,6 @@ impl Rig {
             .unwrap_or_default()
     }
 
-    /// The crash rule's relaunch, run to its end: `done:resumed`, the line alone typed, and
-    /// nothing typed or read after it.
     fn relaunch_resumed(&self) {
         let snap = self.snap(None);
         let resume = self.resume(None);
@@ -742,12 +698,6 @@ impl Rig {
     }
 }
 
-/// THE RELAUNCH HAND IS HELD TO THE RELAUNCHED PROCESS'S FIRST IDLE (the contract §5,
-/// carry-on): the lease taken before the line goes back only once the relaunched codex-alab
-/// reads at its first idle (here its third look), never as its TUI first leads the tab, so
-/// its launch probe — its first `status`, read as it starts — sees
-/// `hand=lease:aterm-harness@<aterm>`, and the ledger says so; still `done:resumed`, nothing
-/// typed and no screen read meanwhile.
 #[test]
 fn the_relaunch_hand_is_held_to_the_relaunched_processs_first_idle() {
     for (bound, held) in [(None, true), (Some(Duration::ZERO), false)] {
@@ -775,11 +725,6 @@ fn the_relaunch_hand_is_held_to_the_relaunched_processs_first_idle() {
     }
 }
 
-/// A TURN ALREADY UNDER WAY ENDS THE HOLD AT ONCE: the relaunched codex-alab's claim proven
-/// (its launch probe has read) and its frame in a turn or a box — a person's turn, or a carry-on
-/// that went before a later step took the hand — is past its first idle, and codex-alab's own
-/// acts in that turn wait for this very lease (the contract §5, `hand=-` before every act), so
-/// the hand goes back at that look.
 #[test]
 fn a_turn_already_under_way_ends_the_relaunch_hold_at_once() {
     for (up, looks_once, said) in [
@@ -798,10 +743,6 @@ fn a_turn_already_under_way_ends_the_relaunch_hold_at_once() {
     }
 }
 
-/// AN UNREAD KERNEL START IS UNKNOWN, NEVER THE RELAUNCHED PROCESS'S END: off Apple the start
-/// is a `ps`, which can fail once; read as an end, the hand went back while codex-alab still
-/// ran (or was never held at all, when the first read failed), and its launch probe could read
-/// `hand=-`.
 #[test]
 fn an_unread_kernel_start_never_ends_the_relaunch_hold() {
     let other = "Thu Oct 16 08:00:10 2026".to_string();
@@ -833,10 +774,6 @@ fn an_unread_kernel_start_never_ends_the_relaunch_hold() {
     }
 }
 
-/// The hold ends with the relaunched process: one that ends before its first idle (the proof's
-/// second crash, killed as soon as its claim is proven) has the hand given back at its end,
-/// looked at no more, and the relaunch is still `done:resumed` (its own exit is its own
-/// copy's to decide, `relaunch::outcome`).
 #[test]
 fn the_relaunch_hand_goes_back_when_the_relaunched_process_ends_before_its_first_idle() {
     for ends_at in [Some(2), None] {
@@ -870,9 +807,6 @@ fn the_relaunch_hand_goes_back_when_the_relaunched_process_ends_before_its_first
     }
 }
 
-/// THE COPY NAMES THE THREAD, NEVER THE SCREEN: the shell shows an exit hint naming another
-/// conversation (as an older Codex's exit in the same tab leaves it), and the relaunch resumes
-/// the record's own.
 #[test]
 fn an_exit_hint_naming_another_thread_is_not_read() {
     let hint = [
@@ -895,8 +829,6 @@ fn an_exit_hint_naming_another_thread_is_not_read() {
     assert!(!typed[0].contains(T1), "{typed:#?}");
 }
 
-/// A codex-alab's run read while it runs: the thread its writer lock names (embedded), else
-/// its launch's `resume <id>`, else none; never the vendor daemon's word.
 #[test]
 fn a_codex_alab_run_names_its_lock_or_its_resumed_thread() {
     let mut rig = Rig::new("alab-snapshot", &[]);
@@ -950,7 +882,6 @@ fn a_codex_alab_run_names_its_lock_or_its_resumed_thread() {
 }
 
 impl Crashed {
-    /// The same world, its files to be set.
     fn clone_world(&self) -> Crashed {
         Crashed {
             owners: Mutex::new(VecDeque::new()),
@@ -969,7 +900,6 @@ impl Crashed {
     }
 }
 
-/// Opts for a prune over `dir`'s state, nothing live about it.
 fn prune_opts(dir: &Path) -> Opts {
     Opts {
         home: dir.join("home"),
@@ -992,7 +922,6 @@ fn prune_opts(dir: &Path) -> Opts {
     }
 }
 
-/// `st` filed as `opts`'s record `name`, last written `ago` seconds before now.
 fn filed_as(opts: &Opts, name: &str, st: &St, ago: u64) -> PathBuf {
     save(opts, name, st);
     let path = state_dir(opts).join(format!("{name}.json"));
@@ -1005,8 +934,6 @@ fn filed_as(opts: &Opts, name: &str, st: &St, ago: u64) -> PathBuf {
     path
 }
 
-/// A Codex record of `tab` in `phase` (with the owner's `request`), filed as
-/// `codex-<tab>.json` and last written `ago` seconds before now.
 fn filed(opts: &Opts, tab: &str, phase: Phase, request: Request, ago: u64) -> PathBuf {
     let st = St {
         agent: Agent::Codex,
@@ -1020,8 +947,6 @@ fn filed(opts: &Opts, tab: &str, phase: Phase, request: Request, ago: u64) -> Pa
     filed_as(opts, &key(tab), &st, ago)
 }
 
-/// A rendezvous registry under `dir` naming `live` (`graph/<sid>`, the
-/// entries `aterm-gui`'s `proxy::write_graph_entry` writes).
 fn registry(dir: &Path, live: &[&str]) -> PathBuf {
     let graph = dir.join("run").join("aterm").join("graph");
     std::fs::create_dir_all(&graph).expect("graph");
@@ -1031,9 +956,6 @@ fn registry(dir: &Path, live: &[&str]) -> PathBuf {
     graph
 }
 
-/// A record's projection onto `HarnessUpgradeStateCollection`, from what the
-/// test set up (never from the code under test): its tab alive or proven
-/// gone, its round's stage, whether its week has passed.
 fn collection_state(
     model: &aterm_spec::derive::Model,
     tab_lives: bool,
@@ -1055,10 +977,6 @@ fn collection_state(
     s
 }
 
-/// One pass's decision on one record held to `Prune`'s guard, both ways: a
-/// removal the model does not allow breaks safety, and a record the model
-/// lets go that a pass with a clean reading kept breaks the prune's weak
-/// fairness (every such pass takes it).
 fn collection_conforms(
     model: &aterm_spec::derive::Model,
     before: &aterm_spec::interp::State,
@@ -1087,8 +1005,6 @@ fn collection_conforms(
     Ok(())
 }
 
-/// Tier-1: the real `prune`, reading the real registry over records on disk, bound to the
-/// derived `HarnessUpgradeStateCollection`.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
@@ -1246,9 +1162,6 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A registry speaks only for its own state root: the prune reads the
-/// rendezvous registry only when it and the state root are both the person's
-/// defaults or both private.
 #[test]
 fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
     for (private_registry, private_state, vouches) in [
@@ -1265,9 +1178,6 @@ fn a_registry_vouches_only_for_a_state_root_of_its_own_kind() {
     }
 }
 
-/// THE RETIRED LANE'S LEFTOVERS GO ONCE A WEEK OLD ([`prune_retired`]): a daemon's pin stamp
-/// (its directory too, once empty) and a tab's goal-pause record, neither of which anything
-/// writes any more.
 #[test]
 fn the_retired_lanes_pin_stamps_and_goal_records_go_once_a_week_old() {
     let dir = scratch("retired-leftovers");

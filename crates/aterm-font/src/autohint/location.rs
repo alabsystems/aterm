@@ -2,7 +2,11 @@
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Derived from read-fonts 0.43.2 (fvar, avar) and skrifa 0.46.2 (variation, instance).
+// Derived from read-fonts 0.43.2 src/tables/fvar.rs, src/tables/avar.rs,
+// generated/generated_fvar.rs and generated/generated_avar.rs, and from
+// skrifa 0.46.2 src/variation.rs and src/instance.rs, and modified by the
+// aterm project in 2026: user coordinates to a normalized 2.14 location in
+// 16.16 fixed point (`fvar`, then the `avar` segment maps), every read checked.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! A variation instance as the autohinter sees it.

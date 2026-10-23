@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fleet init|join|peers|allow|leave` against scratch state directories and config files, with the issuer a real fleet listener on loopback.
+//! Tests for [`super`].
 
 use super::*;
 use aterm_net::fleet::{FleetEvent, Listening, read_key_file, serve};
@@ -11,10 +11,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A wait for something that must happen: a hang detector, never a budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// One machine's scratch world: its state directory and aterm.toml.
 struct World {
     _tmp: aterm_tempfile::TempDir,
     places: Places,
@@ -54,7 +52,6 @@ fn usage_of(result: Result<Opts, Failure>) -> String {
     }
 }
 
-/// A real code, its check characters whole.
 fn a_code() -> String {
     JoinCode {
         secret: [7; member::SECRET_LEN],
@@ -64,10 +61,6 @@ fn a_code() -> String {
     .text()
 }
 
-/// THE CODE IS NEVER AN ARGUMENT: `join` refuses a code in any argument — a
-/// whole one, one pasted without its `atf1-`, part of one, one behind a
-/// made-up flag or as a flag's value — and says why, while its own flags
-/// pass; and the refusal comes before `--help` is read.
 #[test]
 fn a_join_code_is_never_an_argument() {
     let code = a_code();
@@ -115,9 +108,6 @@ fn a_join_code_is_never_an_argument() {
     ));
 }
 
-/// A code is read from its file's first line that has anything on it, and
-/// is known to have come from a file (whose copy the join then says to
-/// delete); a code typed at the terminal leaves nothing behind to name.
 #[test]
 fn a_code_file_gives_its_first_line() {
     let world = World::new("codefile");
@@ -143,11 +133,6 @@ fn a_code_file_gives_its_first_line() {
     }
 }
 
-/// `[fleet] listen` and `allow` are set and removed IN PLACE: every other
-/// line — a comment, another table, `[[fleet.peers]]` — is kept, a `[fleet]`
-/// already there is edited where it stands, the dotted and inline spellings
-/// are edited too, and a file that is not TOML or a `fleet` that is no table
-/// is left alone with the reason.
 #[test]
 fn fleet_keys_are_set_and_removed_in_place() {
     let set = |text: &str| {
@@ -213,9 +198,6 @@ fn fleet_keys_are_set_and_removed_in_place() {
     assert_eq!(without_fleet("theme = \"Nord\"\n"), Ok(None));
 }
 
-/// The issuer as a real fleet listener on `listener`, serving `join` into
-/// `state` with the key `init` wrote there, and its book from `state`;
-/// stopped on drop.
 struct Listener {
     running: Arc<AtomicBool>,
     serving: Option<std::thread::JoinHandle<()>>,
@@ -230,14 +212,10 @@ impl Listener {
         )
     }
 
-    /// [`Listener::serve`] serving only `serves`: without `book`, an older
-    /// aterm.
     fn serving(listener: TcpListener, state: &Path, serves: &'static [FleetOp]) -> Self {
         Self::naming(listener, state, serves, None)
     }
 
-    /// [`Listener::serve`], its survey's header naming `claim` in place of
-    /// its own node — what it proves is still its own.
     fn claiming(listener: TcpListener, state: &Path, claim: &str) -> Self {
         Self::naming(
             listener,
@@ -328,7 +306,6 @@ impl Drop for Listener {
     }
 }
 
-/// A loopback port nothing listens on.
 fn closed_port() -> u16 {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.local_addr().unwrap().port()
@@ -341,12 +318,6 @@ fn ok(result: Result<String, Failure>) -> String {
     }
 }
 
-/// INIT, JOIN, PEERS END TO END: `init` writes the key, the code (whose path
-/// it prints, never the code) and `[fleet]`; `join` with that code writes the
-/// same key and its own `[fleet]` and registers with the issuer — a real
-/// fleet listener on loopback — which records the member by node id; the
-/// member records the issuer; and each side's `peers` checks the other,
-/// giving the member, whose aterm is not running, its reason.
 #[test]
 fn init_then_join_registers_and_peers_checks_each_peer() {
     let issuer = World::new("issuer");
@@ -557,12 +528,6 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
     assert_eq!(key_of(&member.places), kept, "leave keeps the node key");
 }
 
-/// A MACHINE THAT TAKES A MEMBER'S NODE ID IS REFUSED, NOT RECORDED AS IT:
-/// one holding the member's node id under a key of its own (a copied
-/// `fleet-node`, or the member itself after it lost its node key) joins with
-/// the fleet's code, and the issuer refuses it, naming `aterm fleet peers rm
-/// <node>` on the issuer; nothing of the fleet is written there, and the
-/// member's entry stands, bound to its own key.
 #[test]
 fn a_machine_that_takes_a_members_node_id_is_refused() {
     let issuer = World::new("bind-issuer");
@@ -634,12 +599,6 @@ fn a_machine_that_takes_a_members_node_id_is_refused() {
     );
 }
 
-/// A JOIN AGAIN OF THE SAME FLEET REACHES ONLY THE ISSUER THIS MAC BINDS:
-/// another holder of the fleet's secret — an issuer of its own holding this
-/// fleet's key — answering at the host and port a code names, proving no
-/// node or a node of its own, is refused before anything is sent it, naming
-/// `aterm fleet leave` as the way to a new issuer; the member's key, book
-/// and `[fleet]` stay, its issuer the one it joined.
 #[test]
 fn a_join_again_of_the_same_fleet_reaches_only_the_issuer_it_binds() {
     let issuer = World::new("bound-issuer");
@@ -730,13 +689,6 @@ fn a_join_again_of_the_same_fleet_reaches_only_the_issuer_it_binds() {
     assert!(issuer_of(&other), "a new issuer, after leave");
 }
 
-/// AN ISSUER THAT LOST ITS NODE KEY IS BOUND AGAIN AS ITS REFUSAL SAYS: a join
-/// again of the same fleet reaching the bound issuer while it proves no node
-/// (its node key gone) is refused, nothing written here, and the refusal
-/// names that issuer's remedy — `aterm fleet init` there, then `peers rm` of
-/// it here — beside `leave`; once `init` there mints a key, the join is
-/// refused as the bound node under another key, and after the `peers rm`
-/// here it binds the new key.
 #[test]
 fn an_issuer_that_lost_its_node_key_is_bound_again_as_its_refusal_says() {
     let issuer = World::new("keyless-issuer");
@@ -809,13 +761,6 @@ fn an_issuer_that_lost_its_node_key_is_bound_again_as_its_refusal_says() {
     assert_eq!(issuer_here, [(Some(node), Some(minted))]);
 }
 
-/// A JOIN THE ISSUER RECORDED THAT CANNOT WRITE aterm.toml ([`unfinished`];
-/// the review of fleet.1-m2): a config the edit refuses is refused before
-/// the dial — the issuer's book holds no member and nothing of the fleet is
-/// written here — while one whose edit reads back but whose write then fails
-/// (the config service's write lock, `.aterm.toml.aterm-write.lock`, is no
-/// file) fails after the issuer recorded the machine: the issuer lists it and
-/// this machine holds the key and the issuer, but has no `[fleet] listen`.
 #[test]
 fn a_join_whose_config_write_fails_after_the_issuer_recorded_it_finishes_on_a_join_again() {
     let issuer = World::new("recorded");
@@ -885,11 +830,6 @@ fn a_join_whose_config_write_fails_after_the_issuer_recorded_it_finishes_on_a_jo
     assert_eq!(read_peers(&issuer.places.state).unwrap().len(), 1);
 }
 
-/// `--rotate` mints a new secret and keeps the host and port the fleet's
-/// code named, and THE ROSTER: every member it recorded stays in the book —
-/// each now holds the old secret until it joins again, which its check then
-/// says — and the report names each, so the person can work through them and
-/// take out the machine that was lost.
 #[test]
 fn rotate_mints_a_new_secret_and_keeps_the_roster() {
     let issuer = World::new("rotate");
@@ -987,10 +927,6 @@ fn rotate_mints_a_new_secret_and_keeps_the_roster() {
     assert!(!fresh.places.state.join(KEY_FILE).exists());
 }
 
-/// A `[[fleet.peers]]` ENTRY FOR A MACHINE IN THE BOOK IS ONE PEER: by the
-/// bare name a person types for the `.local` one it joined as, or by the
-/// address it registered from; another machine's name, or another port, is
-/// a peer of its own.
 #[test]
 fn a_machine_the_book_holds_is_read_once() {
     let world = World::new("once");
@@ -1064,13 +1000,6 @@ fn a_machine_the_book_holds_is_read_once() {
     assert_eq!(kept, [false, true, true, true, false, true, true]);
 }
 
-/// AN UNPROVEN CLAIM NEVER COLLAPSES INTO A PROVEN ANSWER: this Mac read
-/// through a place its book names by hand (proven, its own node: the row the
-/// menu bar's glance drops as this Mac) and a Mac at a later place that
-/// claims this Mac's node without its key are two blocks, so the claimant is
-/// listed under its mark and never vanishes with this Mac's row; and so are
-/// a member's checked answer and a claim of its node at a place a person
-/// named.
 #[test]
 fn an_unproven_claim_never_collapses_into_a_proven_answer() {
     let answered = |node: &str, proven: bool| {
@@ -1110,10 +1039,6 @@ fn an_unproven_claim_never_collapses_into_a_proven_answer() {
     assert_eq!(kept, [true, true, false, false, true, true]);
 }
 
-/// A MAC THAT DID NOT ANSWER IS ONE ROW AT ITS PLACE: a person's `lab-mini`
-/// (no node) and the copy of the `lab-mini.local` that joined there, read
-/// side by side and both failing the same way at the address both tried,
-/// are that node's failure once — what the menu bar's "not answering" lists.
 #[test]
 fn a_mac_that_did_not_answer_is_one_row_at_its_place() {
     let by_hand = |port: u16| manual_peer("lab-mini".to_owned(), port);
@@ -1207,12 +1132,6 @@ fn a_mac_that_did_not_answer_is_one_row_at_its_place() {
     );
 }
 
-/// A MEMBER'S `peers` READS ITS ISSUER'S BOOK: a peer the issuer's person
-/// named is listed on the member, which never named it, as a copy of the
-/// issuer's book, checked like the rest, and kept in a file of its own —
-/// never in the member's book, which keeps only the words an older aterm
-/// reads; `rm` of the copy on the member is refused and changes nothing;
-/// taken out on the issuer, the copy goes at the member's next read.
 #[test]
 fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
     let issuer = World::new("book-issuer");
@@ -1358,12 +1277,6 @@ fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
     );
 }
 
-/// A PROVEN MAC THAT NAMES THIS ONE IN ITS SURVEY IS LISTED AS REFUSED,
-/// never read as this Mac: an issuer that proves the key this member binds
-/// it to and whose survey's header names the member's own node — which the
-/// menu bar's glance would drop as this Mac answering through its book — is
-/// the read's row with a reason naming both nodes, and nothing it sent is
-/// passed on.
 #[test]
 fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
     let issuer = World::new("misnamed-issuer");
@@ -1420,11 +1333,6 @@ fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
     assert!(!read.unproven, "refused, not read as a claim");
 }
 
-/// WHAT A READ IS SHORT OF ITS ISSUER'S BOOK: an issuer that answered with
-/// no book leaves a read that asked its copy of the last book, or — holding
-/// none (a first read, or one after a refusal took it away) — only the peers
-/// this machine knows; an older issuer, or one that shares none, the same
-/// peers; a book that came, or an issuer not reached, nothing.
 #[test]
 fn a_read_short_of_its_issuers_book_says_whether_it_held_a_copy() {
     let issuer = Peer {
@@ -1463,11 +1371,6 @@ fn a_read_short_of_its_issuers_book_says_whether_it_held_a_copy() {
     assert_eq!(book_short(&[], &BookRead::NoIssuer), None);
 }
 
-/// A PEER A PERSON NAMED IN aterm.toml STANDS FOR A COPY AT ITS PLACE: the
-/// issuer's book holds the place the member's `[[fleet.peers]]` names, so
-/// the member reads it once, as its person's entry (VIA `config`) — never
-/// as the copy — and when the issuer's book drops it, the member's next read
-/// still has its row.
 #[test]
 fn a_configured_peer_stands_for_a_copy_at_its_place() {
     let issuer = World::new("cfg-issuer");
@@ -1525,9 +1428,6 @@ fn a_configured_peer_stands_for_a_copy_at_its_place() {
     );
 }
 
-/// `peers add` records a peer once and `rm` takes it out; `leave` removes the
-/// key, the code, the book and `[fleet]`'s keys — on the issuer, saying its
-/// fleet went with it — and says when there is nothing to leave.
 #[test]
 fn peers_add_rm_and_leave() {
     let world = World::new("leave");
@@ -1579,9 +1479,6 @@ fn peers_add_rm_and_leave() {
     );
 }
 
-/// A CODE WHOSE ISSUER IS PAST THE LAN is never dialled, and the join's
-/// failure says so by its kind — no aterm to start, no consent to give — and
-/// writes nothing of the fleet.
 #[test]
 fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
     let code = JoinCode {
@@ -1617,11 +1514,6 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
     assert!(!fresh.places.config.exists(), "no [fleet]");
 }
 
-/// EVERY REASON A FLEET READ GIVES FITS ITS ROW WHOLE: for a LAN peer at
-/// the longest IPv4 address, named by a Mac's usual `.local` name, with the
-/// longest deadline, each reason a peer's row carries is at most what the
-/// row keeps whole beside any name (`aterm_ctl::UNANSWERED_REASON_CHARS`),
-/// so its remedy — at its end — is never cut off.
 #[test]
 fn every_reason_a_fleet_read_gives_fits_its_row() {
     use aterm_ctl::PeerFault;
@@ -1829,16 +1721,6 @@ fn every_reason_a_fleet_read_gives_fits_its_row() {
     }
 }
 
-/// A FAILED JOIN IS ADVISED BY ITS KIND, the first that fits: a refusal
-/// from a machine that issues no fleet, an issuer past the LAN, a connect
-/// refused to this process (`EPERM`, `EACCES`: a sandbox, a firewall), no
-/// route to the host (on a Mac, local-network privacy), none to its network
-/// (offline, a VPN), a machine that claims a node this one binds to a key
-/// without proving that key, another node answering for the issuer a join
-/// again of the same fleet must reach, or a machine proving none there (which
-/// may be that issuer without its key), an issuer that binds this machine's
-/// node to another, an issuer that recorded this machine from another address
-/// before keys came (no key bound: not the advice of one bound to another).
 #[test]
 fn a_failed_join_is_advised_by_its_kind() {
     let at = std::net::SocketAddr::from(([192, 168, 1, 23], 7100));
@@ -1897,11 +1779,6 @@ fn a_failed_join_is_advised_by_its_kind() {
     }
 }
 
-/// A PERSON'S ENTRY AT A COPY'S PLACE IS READ BESIDE IT: a read dials
-/// `[[fleet.peers]] host = "m7"` and the copy of the issuer's book at
-/// `m7.local` that names a node, both — the place is what that node's
-/// registrant said — and what answers either as that node is held to the
-/// copy's key.
 #[test]
 fn a_persons_entry_at_a_copys_place_is_read_beside_it() {
     let world = World::new("placekey");
@@ -1940,8 +1817,6 @@ fn a_persons_entry_at_a_copys_place_is_read_beside_it() {
     assert_eq!(known.keys.bound(n.node()), Some(n.key()));
 }
 
-/// AN ANSWER THAT PROVED NO BOUND NODE KEY IS UNPROVEN in the survey: its
-/// node is its claim.
 #[test]
 fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
     let peer = manual_peer("m7".to_owned(), member::DEFAULT_PORT);
@@ -1961,8 +1836,6 @@ fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
     assert!(!peer_survey(&peer, Err(unreached)).unproven);
 }
 
-/// `peers --timeout` takes seconds, more than none and at most the survey's
-/// longest; anything else is a usage error, as `peers` with a stray word is.
 #[test]
 fn peers_takes_a_timeout_up_to_the_surveys_longest() {
     for secs in ["0.5", "10"] {
@@ -1981,11 +1854,6 @@ fn peers_takes_a_timeout_up_to_the_surveys_longest() {
     ));
 }
 
-/// `aterm fleet allow`: a level this machine's person sets here alone. `drive`
-/// names each node by a word the book resolves to one bound to a key — never
-/// a peer named by hand, nor a node bound to none, nor a word that names no
-/// peer — and keeps the list; `facts`/`content` empty it, and `leave` takes
-/// it with the rest.
 #[test]
 fn allow_drive_names_only_the_nodes_the_book_binds() {
     let world = World::new("allow");
@@ -2119,9 +1987,6 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
     );
 }
 
-/// A JOIN OF ANOTHER FLEET KEEPS NO DRIVE GRANT: the grants named the nodes
-/// of the fleet this machine held, so a join under another secret takes
-/// them out and a drive level reads as content.
 #[test]
 fn a_join_of_another_fleet_keeps_no_drive_grant() {
     let issuer_of = |tag: &str| {
@@ -2170,10 +2035,6 @@ fn a_join_of_another_fleet_keeps_no_drive_grant() {
     );
 }
 
-/// A JOIN OF ANOTHER FLEET THAT FAILS AFTER ITS ISSUER RECORDED IT FINISHES
-/// ON A JOIN AGAIN WITH THAT CODE ([`unfinished`]): a member whose book binds
-/// its issuer joins another fleet's code while its book cannot be read (a
-/// directory in its place).
 #[test]
 fn a_join_of_another_fleet_that_fails_after_its_issuer_recorded_it_finishes_on_a_join_again() {
     let issuer_of = |tag: &str| {
@@ -2239,10 +2100,6 @@ fn a_join_of_another_fleet_that_fails_after_its_issuer_recorded_it_finishes_on_a
     assert_eq!(read_peers(&other.places.state).unwrap().len(), 1);
 }
 
-/// A JOIN OF ANOTHER FLEET WHOSE KEY CANNOT BE WRITTEN LEAVES THE BOOK AS IT
-/// WAS ([`unfinished`]): a member whose book binds its issuer joins another
-/// fleet's code while its key cannot be replaced (a directory in its
-/// place).
 #[test]
 fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was() {
     let issuer_of = |tag: &str| {
@@ -2307,11 +2164,6 @@ fn a_join_of_another_fleet_whose_key_cannot_be_written_leaves_the_book_as_it_was
     );
 }
 
-/// A MEMBER'S DRIVE GRANT FOLLOWS ITS ISSUER'S BOOK (the step-in): a node the
-/// issuer takes out drives the member no more once the member reads that
-/// book — `peers`, or `survey --fleet` — and a join again under its old key
-/// does not bring the grant back; a node the issuer binds afresh to another
-/// key the same.
 #[test]
 fn a_members_drive_grant_follows_its_issuers_book() {
     let issuer = World::new("grant-book-issuer");
@@ -2419,17 +2271,6 @@ fn a_members_drive_grant_follows_its_issuers_book() {
     );
 }
 
-/// A PERSON'S ENTRY NEVER HIDES THE NODE A KEY BINDS AT ITS PLACE: on a
-/// member whose aterm.toml names a Mac by hand (`[[fleet.peers]]`) at the
-/// place its copy of the issuer's book holds that Mac's node — an entry a
-/// read dials beside the copy — `allow drive --from` grants that node,
-/// named by the place, the copy's host, the node id, or the `host:port` of an
-/// entry that spells the copy's host another way (`lab-mini.invalid:<port>`
-/// for the copy's `lab-mini`: the same machine, and a word only that entry
-/// answers to), with the key its copy binds, as the drive's admission reads
-/// it; `aterm ctl --host` dials it by its node id or that entry's
-/// `host:port`; and `aterm ctl survey --host` reads it by the place, the
-/// copy's host or the node id, which the person's entries answer to as well.
 #[test]
 fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
     let issuer = World::new("shadow-issuer");

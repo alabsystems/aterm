@@ -5,10 +5,8 @@
 
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
-/// The kinds that make it into the roster (in emit order: heads, then specials, then accessories).
 const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
 
-/// Canonical `role` vocabulary to Rust variant, in fixed painter-role order.
 const ROLE_VOCAB: &[(&str, &str)] = &[
     ("outline", "Outline"),
     ("coat", "Coat"),
@@ -28,7 +26,6 @@ const ROLE_VOCAB: &[(&str, &str)] = &[
     ("detail", "Detail"),
 ];
 
-/// Canonical `recolor` vocabulary to variant.
 const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("coat", "Coat"),
     ("coat_shade", "CoatShade"),
@@ -36,7 +33,6 @@ const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("fixed", "Fixed"),
 ];
 
-/// Canonical `kind` vocabulary to variant.
 const KIND_VOCAB: &[(&str, &str)] = &[
     ("head", "Head"),
     ("special", "Special"),
@@ -44,12 +40,10 @@ const KIND_VOCAB: &[(&str, &str)] = &[
     ("prop", "Prop"),
 ];
 
-/// The authored-asset schema is path-only.
 const GLYPH_KEYS: &[&str] = &["id", "kind", "viewbox", "anchor", "layer", "excluded"];
 const ANCHOR_KEYS: &[&str] = &["eye_y", "center_x", "word_top", "attach"];
 const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
 
-/// One emitted layer: role and recolor variant names, packed `ref_fill`, and quantized paths.
 struct Layer {
     role: &'static str,
     recolor: &'static str,
@@ -59,7 +53,6 @@ struct Layer {
     paths: Vec<Vec<String>>,
 }
 
-/// One emitted glyph: its id, kind, quantized anchors, and layers.
 struct Glyph {
     id: String,
     /// Emit-order rank of the kind: 0 head, 1 special, 2 accessory.
@@ -75,7 +68,6 @@ struct Glyph {
 }
 
 /// Generate `cat_glyphs_gen.rs` from `(file name, TOML text)` pairs read from `art/glyphs/`.
-///
 /// # Errors
 /// Any malformed TOML, unknown role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable path `d`-string, or colliding variant name.
 pub fn generate_from_assets(assets: &[(String, String)]) -> Result<String, String> {
@@ -83,7 +75,6 @@ pub fn generate_from_assets(assets: &[(String, String)]) -> Result<String, Strin
 }
 
 /// Generate `pet_glyphs_gen.rs` from the pose texts `assets`.
-///
 /// # Errors
 /// As [`generate_from_assets`].
 pub fn generate_pet_from_assets(assets: &[(String, String)]) -> Result<String, String> {
@@ -91,7 +82,6 @@ pub fn generate_pet_from_assets(assets: &[(String, String)]) -> Result<String, S
 }
 
 /// Generate `dog_glyphs_gen.rs` from the breed texts `assets`.
-///
 /// # Errors
 /// As [`generate_from_assets`].
 pub fn generate_dog_from_assets(assets: &[(String, String)]) -> Result<String, String> {
@@ -99,14 +89,12 @@ pub fn generate_dog_from_assets(assets: &[(String, String)]) -> Result<String, S
 }
 
 /// Generate `animal_glyphs_gen.rs` from the species-head texts `assets`.
-///
 /// # Errors
 /// As [`generate_from_assets`].
 pub fn generate_animal_from_assets(assets: &[(String, String)]) -> Result<String, String> {
     Ok(emit_animal_roster(&load_glyphs(assets)?))
 }
 
-/// Parse, order and collision-check every roster asset text, for all rosters.
 fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     let mut files: Vec<&(String, String)> = assets.iter().collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -134,8 +122,6 @@ fn load_glyphs(assets: &[(String, String)]) -> Result<Vec<Glyph>, String> {
     Ok(glyphs)
 }
 
-/// Parse one asset doc into a [`Glyph`], or `Ok(None)` if it is not a roster glyph
-/// (wrong kind, or `excluded = true`).
 fn glyph_from_doc(doc: &aterm_toml::Value, name: &str) -> Result<Option<Glyph>, String> {
     if doc.get("excluded").and_then(aterm_toml::Value::as_bool) == Some(true) {
         return Ok(None);
@@ -269,7 +255,6 @@ fn reject_unknown_keys(
     Ok(())
 }
 
-/// Quantize one parsed path into `PathSeg` literal strings in the `0..=FIXED_ONE` frame.
 fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
     let qx = |v: f32| quant(v, vw);
     let qy = |v: f32| quant(v, vh);
@@ -291,20 +276,17 @@ fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
         .collect()
 }
 
-/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`.
 fn quant(v: f32, extent: f32) -> u16 {
     let q = (v / extent * f32::from(FIXED_ONE)).round();
     q.clamp(0.0, f32::from(FIXED_ONE)) as u16
 }
 
-/// Quantize an already-normalized `0..1` anchor fraction to the fixed frame.
 fn quant_frac(f: f32) -> u16 {
     (f * f32::from(FIXED_ONE))
         .round()
         .clamp(0.0, f32::from(FIXED_ONE)) as u16
 }
 
-/// Snake-case asset id to UpperCamel Rust variant.
 fn variant_name(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     let mut cap = true;
@@ -327,7 +309,6 @@ fn lookup(vocab: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
     vocab.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
-/// Parse a `#RRGGBB` asset colour into packed `0x00RR_GGBB`.
 fn parse_hex_rgb(s: &str) -> Option<u32> {
     let h = s.strip_prefix('#')?;
     if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -343,7 +324,6 @@ fn num(v: &aterm_toml::Value) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Render the final Rust source.
 fn emit(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(HEADER);
@@ -415,7 +395,6 @@ fn emit(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the pet roster source.
 fn emit_pet(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(PET_HEADER);
@@ -450,7 +429,6 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the dog roster source.
 fn emit_dog(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(DOG_HEADER);
@@ -536,7 +514,6 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Emit the `GlyphDef` rows shared across roster tables.
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     for g in glyphs {
         s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
@@ -560,7 +537,6 @@ fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     }
 }
 
-/// The canonical-ordered subset of `vocab` variants that appear in `used`.
 fn present<'a>(
     vocab: &[(&str, &'static str)],
     used: impl Iterator<Item = &'a str>,
@@ -699,7 +675,6 @@ mod tests {
 
     use super::*;
 
-    /// Every roster asset under `dir`, read the way the generator examples read it.
     fn read_assets(dir: &Path) -> Vec<(String, String)> {
         asset_dir::read_toml_dir(dir).expect("read the roster asset dir")
     }
@@ -727,7 +702,6 @@ mod tests {
         );
     }
 
-    /// The regenerated source equals `cat_glyphs_gen.rs`.
     #[test]
     fn cat_glyphs_gen_matches_assets() {
         let generated =

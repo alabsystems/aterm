@@ -9,8 +9,6 @@ use super::super::tests::{blocks, finished, lines, lines_of, opened, running, st
 use super::*;
 use crate::{App, WindowId};
 
-/// A registration on `session`'s watcher list, any ring already pending
-/// drained.
 fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
     let sub = crate::session_watch::Subscription::single(
         &app.pool.get(session).expect("a live session").ctx.watchers,
@@ -23,11 +21,6 @@ fn having<'a>(got: &'a [String], needle: &str) -> Vec<&'a String> {
     got.iter().filter(|l| l.contains(needle)).collect()
 }
 
-/// THE ENGINE'S MARKS through the status sweep (plan §3.2): an
-/// OSC 9 sent with notifications off is counted (`mark - notify n=1`) and
-/// its body is in no record; bells are counted; an OSC 9;4 is progress
-/// (`state=normal pct=42`), never a notification; the integration's posture
-/// is said once.
 #[test]
 fn the_sweep_marks_what_the_engine_says_once() {
     let mut app = App::headless_for_test();
@@ -79,9 +72,6 @@ fn the_sweep_marks_what_the_engine_says_once() {
     }
 }
 
-/// `mark <run> status …` (plan §3.2): one typed mark per published status
-/// transition, beside the timeline's `status-change` row and with the same
-/// facts — a failing command's `out=fail code=1`.
 #[test]
 fn a_status_transition_is_one_typed_mark() {
     let mut app = App::headless_for_test();
@@ -128,8 +118,6 @@ fn a_status_transition_is_one_typed_mark() {
     );
 }
 
-/// A busy Claude Code screen (the shape the reader reads), its context
-/// indicator and its goal against the right edge above the composer.
 fn claude_screen(ctx: Option<u8>, goal: bool) -> Vec<String> {
     let rule = "\u{2500}".repeat(120);
     let right = |t: &str| format!("{}{t}", " ".repeat(120 - t.chars().count()));
@@ -162,10 +150,6 @@ fn paint(app: &App, sid: u64, rows: &[String]) {
     t.process(bytes.as_bytes());
 }
 
-/// CLAUDE CODE'S CONTEXT AND GOAL through the sweep's publish hold (plan
-/// §3.2; addendum A22): `mark <run> ctx pct=` when the context left moves a
-/// tenth, `mark <run> goal state=on` when the goal is armed, on the agent
-/// run.
 #[test]
 fn claude_codes_context_and_goal_are_marked_when_they_move() {
     let mut app = App::headless_for_test();
@@ -196,8 +180,6 @@ fn claude_codes_context_and_goal_are_marked_when_they_move() {
     assert!(run.starts_with('r'), "on the agent run: {ctx:?}");
 }
 
-/// THE SCREEN'S INTERRUPT (plan §3.2, `out=interrupted`): a turn the screen
-/// saw a person stop closes `out=interrupted` at its settle.
 #[test]
 fn a_stopped_turn_closes_interrupted() {
     for stopped in [true, false] {
@@ -243,9 +225,6 @@ fn a_stopped_turn_closes_interrupted() {
     );
 }
 
-/// THE LAUNCH CARD's amend (plan §3.2; addendum A28): the names it reads
-/// amend the agent run `src=screen conf=strong`, only what the run does not
-/// already hold; the same card again writes nothing.
 #[test]
 fn the_launch_card_amends_the_agent_run_once() {
     let card = aterm_phase::LaunchCard {
@@ -278,10 +257,6 @@ fn the_launch_card_amends_the_agent_run_once() {
     );
 }
 
-/// `mark - render state=… run=…` (plan §3.2; phase 6, 6F-7): every
-/// transition the ledger records is one mark with its row's fields, the
-/// same state twice too, as the ring keeps a row for each; the ledger's
-/// transitions name their state.
 #[test]
 fn every_render_transition_is_one_mark_with_its_row() {
     use crate::resize_ledger::Transition;
@@ -339,9 +314,6 @@ fn every_render_transition_is_one_mark_with_its_row() {
     );
 }
 
-/// THE CARRY: what the marks last wrote crosses an update as
-/// words and tenths on the `state` line, so a successor does not restate
-/// them.
 #[test]
 fn the_observed_values_cross_an_update_as_words() {
     let (tl, _hand) = opened();
@@ -404,10 +376,6 @@ pub(super) fn content_lines(
         .collect()
 }
 
-/// THE DRIFT FLUSH (plan §3.2): `mark - cwd cwd=<path>` when the OSC 7
-/// directory moved and `mark - title` when the informative title did, in
-/// the flush's own hold, which wakes the session's watchers (a one-minute
-/// hang detector).
 #[test]
 fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     let mut app = App::headless_for_test();
@@ -464,9 +432,6 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     assert!(!cwd[1].contains(" cwd="), "{cwd:?}");
 }
 
-/// The cwd and the title cross an update as fingerprints, never as text:
-/// a successor that reads the same directory and title says
-/// neither again.
 #[test]
 fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     let (tl, _hand) = opened();
@@ -512,10 +477,6 @@ fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     assert!(having(&lines(f.slog().log()), " mark - title ").is_empty());
 }
 
-/// `mark - modes n=<reverted>` (plan §3.2): a manual reset writes it in the
-/// `modes-restored` hold, `by=human` from the menu; the verb's direct run
-/// (no reader takes the lane) leaves the wake owed that the verb's arm
-/// takes.
 #[test]
 fn a_manual_reset_is_a_modes_mark_by_whoever_asked() {
     let (tl, _hand) = opened();
@@ -544,10 +505,6 @@ fn a_manual_reset_is_a_modes_mark_by_whoever_asked() {
     );
 }
 
-/// `mark - in-doubt verb=<w>` (plan §3.2; addendum A15): a keyed write
-/// whose outcome nobody knows is marked by its verb in the `in-doubt` row's
-/// hold, and the guard calls the control worker's wake once it is released:
-/// a parked `await log kind=in-doubt` returns (a one-minute hang detector).
 #[test]
 fn a_write_in_doubt_is_marked_by_its_verb_and_wakes_its_watchers() {
     let h = crate::session_store::test_handle(12);
@@ -647,14 +604,6 @@ pub(super) fn returned(rx: &std::sync::mpsc::Receiver<String>, site: &str) -> St
         .unwrap_or_else(|_| panic!("{site}: the parked await never returned"))
 }
 
-/// A WORKER'S TASK MOVES ARE TASK MARKS, each through
-/// its production entry point — `task mark` (the verb a worker's harness and
-/// a manager use) and the supervisor's attention (`meta set attention
-/// owner=supervisor`, whose caller wakes on `changed` as `serve_meta`'s
-/// change wake does) — each site's parked `await log kind=task` its
-/// one-minute hang detector: `mark - task rev= state= attention= [why=]
-/// [code=] src=aterm conf=exact`, the `task-change` row's fact, with no path,
-/// size or origin.
 #[test]
 fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     use crate::control::Scope;
@@ -729,12 +678,6 @@ fn a_workers_task_moves_are_task_marks_and_wake_the_log() {
     assert!(seeded.ctx.timeline.lock().unwrap().task().is_some());
 }
 
-/// THE FABRIC'S MARKS (plan §3.2; addendum A14), each through its verb's
-/// production entry point and the control worker's wake
-/// ([`crate::control::wake_sid_watchers`]), each site's parked `await log`
-/// its one-minute hang detector: a delivered row is `mail dir=in by=bridge`,
-/// a post is `mail dir=out`, its landing `mail-landed`, an `inbox seen`
-/// `mail-seen moved=1 word=`, and the hold `hold state=on|off`.
 #[test]
 fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     let (h, store) = fabric_rig(21);
@@ -818,20 +761,20 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
 
 /// T13'S IN-PROCESS NEGATIVE CONTROL for 5B-7's world test, which asserts
 /// presence only (the delivery path's fault gives no final positive
-/// signal): its check — a delivered inbox row has its `mail dir=in` mark at
-/// the row's offset — holds over the real fabric hook
+/// signal): its check — a delivered mail has its inbox row and its `mail
+/// dir=in` mark at the row's offset — holds over the real fabric hook
 /// ([`crate::fabric::FabricSession::record_fact`] on a `SessionCtx`) and
-/// fails over a hook that drops the `MailIn` fact, which writes the inbox
-/// row and no mark.
+/// fails over a hook that drops the `MailIn` fact, which writes no mark and
+/// so no row (the row is the mark since the ring was deleted, 6G-5).
 #[test]
-fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
+fn a_delivery_whose_hook_drops_the_fact_writes_no_row_and_no_mail_mark() {
     use std::sync::{Arc, RwLock};
 
     use aterm_session::SessionId;
 
     use crate::fabric::{FabricFact, FabricSession, Registry, SessionFabric};
 
-    /// A session whose fabric hook drops the `MailIn` fact: the row alone.
+    /// A session whose fabric hook drops the `MailIn` fact.
     struct DropsMailIn(Arc<crate::SessionCtx>);
     impl FabricSession for DropsMailIn {
         fn self_id(&self) -> &SessionId {
@@ -840,23 +783,15 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
         fn fabric(&self) -> &SessionFabric {
             FabricSession::fabric(&*self.0)
         }
-        fn record(&self, kind: &'static str, payload: String) {
-            FabricSession::record(&*self.0, kind, payload);
-        }
-        fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
-            if matches!(fact, FabricFact::MailIn { .. }) {
-                FabricSession::record(&*self.0, kind, payload);
-                false
-            } else {
-                FabricSession::record_fact(&*self.0, kind, payload, fact)
-            }
+        fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool {
+            !matches!(fact, FabricFact::MailIn { .. })
+                && FabricSession::record_fact(&*self.0, kind, fact)
         }
         fn fabric_changed(&self) {}
         fn holder_token(&self) -> Option<String> {
             None
         }
     }
-    /// A registry of the one session.
     struct One(Arc<dyn FabricSession>);
     impl Registry for One {
         fn sessions(&self) -> Vec<Arc<dyn FabricSession>> {
@@ -909,10 +844,9 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
         dropped.ctx.self_id.as_str(),
     );
     let e = check(&dropped.ctx, 7).expect_err("a dropped fact is caught");
-    assert!(e.contains("has no mail dir=in mark"), "{e}");
+    assert!(e.contains("no inbox row at off=7"), "{e}");
 }
 
-/// The `escalated` needs `ctx`'s log's fold holds, each as `by= src= conf=`.
 fn escalated_needs(ctx: &crate::SessionCtx) -> Vec<String> {
     let g = ctx.timeline.lock().unwrap();
     g.slog()
@@ -933,7 +867,6 @@ fn escalated_needs(ctx: &crate::SessionCtx) -> Vec<String> {
         .collect()
 }
 
-/// The `meta` marks of `ctx`'s log.
 fn meta_marks(ctx: &crate::SessionCtx) -> Vec<String> {
     lines_of(&ctx.timeline)
         .into_iter()
@@ -941,12 +874,6 @@ fn meta_marks(ctx: &crate::SessionCtx) -> Vec<String> {
         .collect()
 }
 
-/// THE META WRITERS' MARK (plan §3.2): a wire `meta set` is
-/// `mark - meta field=<f> value=<v>` by the connection's `log_actor`
-/// (`ctl` for an Owner instance client), through the dispatch's own
-/// `serve_meta`; an unset has no `value=`; the window's editor writes
-/// `by=human` and aterm's own stall line `by=aterm` (an attention text by
-/// its fingerprint, `fp=`).
 #[test]
 fn the_meta_writers_mark_the_log_by_their_writer() {
     let (h, store) = fabric_rig(31);
@@ -1004,12 +931,6 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
     assert!(last.contains(" field=role value=lead by=human "), "{last}");
 }
 
-/// THE ESCALATED NEED, DERIVED BY ATERM (addendum A16): the supervisor's
-/// attention raises `need word=escalated src=meta conf=strong` `by=aterm`
-/// whoever wrote it — the harness here — and a second writer of it raises no
-/// second need; aterm's own stall line, written over it, makes it no longer
-/// the effective owner's and its `clear` (by aterm) lifts the need though a
-/// harness's write raised it.
 #[test]
 fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -1098,14 +1019,6 @@ fn the_supervisors_attention_is_one_escalated_need_by_aterm() {
     );
 }
 
-/// THE SUPERVISOR'S ATTENTION TEXT NEVER LEAVES RAM (which turned "never stored" into the ring's own exposure; the
-/// design's tier table: box commands, question text and the screen's last
-/// line are never journaled, carried or published):
-/// an escalation over a
-/// Bash box whose command holds a sentinel, the shape `supervise::escalate`
-/// writes, is `mark - meta field=attention fp=<16 hex>`, the text's
-/// fingerprint, with the text beside it at `Tier::Content` (`attn_text=`),
-/// so the log's view prints the `meta-change` row as the ring does.
 #[test]
 fn the_supervisors_attention_text_never_leaves_ram() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -1210,12 +1123,6 @@ fn the_supervisors_attention_text_never_leaves_ram() {
     assert!(leaks.is_empty(), "{}", leaks.join("\n"));
 }
 
-/// THE META A SUCCESSOR RESTORES IS NO NEWS (`meta_fp`): the
-/// carry's `state` line holds each meta field's value as the log last said
-/// it, a fingerprint, never its text, and a successor that reads it back
-/// and restores the same value (`restore_carried_meta`, by aterm) writes
-/// its row's mark (one a row since phase 6) saying
-/// `carried=1`: no news.
 #[test]
 fn a_successor_restoring_the_same_meta_marks_it_carried() {
     use crate::session_timeline::MetaChange;
@@ -1273,12 +1180,6 @@ fn a_successor_restoring_the_same_meta_marks_it_carried() {
     );
 }
 
-/// THE AUTOPILOT TIMER IS A MOVE OF THE PAIR (6F-8; the review of 6F-8):
-/// its fingerprint holds the word and the timer (`land_at=`, whole
-/// seconds), so the word with a timer a minute later is a move (no
-/// `carried=`) and the same pair again is no news (`carried=1`); across a
-/// carry, a successor restoring the word with the timer the log last said
-/// is no news, and with another timer is a move.
 #[test]
 fn the_autopilot_timer_is_in_the_meta_fingerprint() {
     use crate::session_timeline::MetaChange;
@@ -1332,10 +1233,6 @@ fn the_autopilot_timer_is_in_the_meta_fingerprint() {
     );
 }
 
-/// A PROVEN CLAIM THE SWEEP CLEARS (`release_proven_if_gone`, the status
-/// sweep's call) is a `meta field=supervisor` mark `by=aterm` with no
-/// `value=`, and leaves the escalated need as the attention says: still
-/// one, never a second, never cleared by the claim's going.
 #[test]
 fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
     use crate::session_timeline::{MetaEdit, claim_supervisor_as, release_proven_if_gone};
@@ -1403,9 +1300,6 @@ fn a_proven_claim_the_sweep_clears_leaves_the_need_consistent() {
     );
 }
 
-/// `mark - story word=<verb>` (addendum A15): what `aterm ctl story` told,
-/// by its teller (carried in `Wake::Story`), written on the main thread
-/// after the point is noted, which wakes the session's watchers.
 #[test]
 fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
     let mut app = App::headless_for_test();
@@ -1439,21 +1333,13 @@ fn a_told_story_is_one_mark_by_its_teller_and_no_text() {
     assert!(got.iter().all(|l| !l.contains("SENTINEL")), "{got:?}");
 }
 
-/// ONE `meta-change` WRITER BY CONSTRUCTION: the general
-/// recorder refuses the kind (a debug build panics, a release build appends
-/// nothing), so no writer can skip the helper's mark and its derived
-/// `escalated`.
 #[test]
 #[should_panic(expected = "record_meta_change's")]
 fn a_meta_change_has_one_writer() {
     let mut tl = crate::session_timeline::SessionTimeline::default();
-    let _ = tl.record(
-        crate::session_timeline::META_CHANGE,
-        "field=role value=x".to_string(),
-    );
+    tl.record(crate::session_timeline::META_CHANGE);
 }
 
-/// The session's failure needs, and its `mark - seen by=harness` lines.
 fn failures_and_harness_seen(
     tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
 ) -> (usize, usize) {
@@ -1474,9 +1360,6 @@ fn failures_and_harness_seen(
     (failures, seen)
 }
 
-/// The relaunch's act at `ms` into the test, as the hosted lanes' row
-/// writer writes it (`harness_host::log_act`) for a step that brought a new
-/// agent process up (`upgrade_drive::started`).
 fn relaunch_at(
     tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     hand: &super::super::tests::Hand,
@@ -1488,9 +1371,6 @@ fn relaunch_at(
     g.slog_mut().observe_relaunch_act("relaunch", true, now);
 }
 
-/// `claude` in front (group `pgid`) of the running block `blk` begun at
-/// `start`, at `ms`: the sweep its name wakes opens its `agent` run under
-/// that block's `cmd` run, as the resolver and the status sweep do.
 fn claude_in_front(
     tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     hand: &super::super::tests::Hand,
@@ -1511,11 +1391,6 @@ fn claude_in_front(
     );
 }
 
-/// (a) A HARNESS RELAUNCH LIFTS THE FAILURE IT CAUSED:
-/// the old `claude` command, an agent in front of it, ends 143
-/// (`need=failure` on its run), the relaunched `claude` opens a new `cmd`
-/// run, and the relaunch's act writes `mark - seen by=harness src=aterm
-/// conf=strong` after it, so no failure need is left and `brief` names none.
 #[test]
 fn a_relaunch_lifts_the_failure_it_caused() {
     let (tl, hand) = opened();
@@ -1565,8 +1440,6 @@ fn a_relaunch_lifts_the_failure_it_caused() {
     assert!(!brief.contains("need=failure"), "{brief}");
 }
 
-/// (b) NEGATIVE CONTROLS: a relaunch's act written while no newer run of
-/// the failed kind is open writes no `seen`.
 #[test]
 fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
     let (tl, hand) = opened();
@@ -1589,8 +1462,6 @@ fn a_relaunch_with_no_newer_run_open_lifts_nothing() {
     );
 }
 
-/// (d) TWO FAILURES: a `seen` lifts every failure need, so a relaunch beside
-/// a second failure writes none and both stand (the session did fail).
 #[test]
 fn a_relaunch_beside_a_second_failure_lifts_neither() {
     use aterm_slog::{Close, Open, Out, RunOut};
@@ -1625,10 +1496,6 @@ fn a_relaunch_beside_a_second_failure_lifts_neither() {
     );
 }
 
-/// (f) A RESTART LIFTS NO FAILURE OF A COMMAND THAT RAN NO AGENT (the
-/// relaunch did not cause it): `make` ends 2 before the person starts
-/// `claude`, which is in front of its own command when the harness's
-/// restart step comes.
 #[test]
 fn a_restart_lifts_no_failure_of_a_command_that_ran_no_agent() {
     let (tl, hand) = opened();

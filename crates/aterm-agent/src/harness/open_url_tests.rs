@@ -607,7 +607,7 @@ fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() 
 [ai.mailbox]
 imap_url = "imap://127.0.0.1:1143/INBOX"
 user = "m27@example.test"
-password_file = "{}"
+password_file = '{}'
 "#,
         pass_file.display()
     );
@@ -763,8 +763,8 @@ password_file = "{}"
 #[test]
 fn headless_webmail_cdp_and_totp_complete_oauth_without_human_in_the_loop() {
     use crate::harness::headless_oauth::{
-        CdpClient, MailboxConfig, drive_cdp_oauth_with_webmail, generate_totp_at,
-        poll_mailbox_or_webmail_for_credential, split_nul_messages,
+        CdpClient, MailboxConfig, MailboxCredential, drive_cdp_oauth_with_webmail,
+        generate_totp_at, poll_mailbox_or_webmail_for_credential, split_nul_messages,
     };
     use std::io::{Read, Write};
 
@@ -892,8 +892,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                                 "state": "inbox",
                                 "url": "https://mail.example.test/u/0/inbox",
                                 "clicked_row": true,
-                                "html": "<div><p>Your verification code is: 908172</p></div>",
-                                "text": "Sign in to Claude\nYour verification code is: 908172"
+                                "html": "<div><p>Your verification code is: 111111</p><p>Your verification code is: 908172</p></div>",
+                                "text": "Sign in to Claude\nYour verification code is: 111111\nYour verification code is: 908172"
                             }),
                         };
                         aterm_json::json!({"result": {"type": "object", "value": val}})
@@ -973,6 +973,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 
     let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
     let mut delivered = Vec::new();
+    let mut seen_otps = std::collections::BTreeSet::new();
     let res = drive_cdp_oauth_with_webmail(
         &mut cdp,
         authorize_url,
@@ -986,6 +987,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 em,
                 Duration::from_secs(60),
                 Duration::ZERO,
+                &mut seen_otps,
             )
         },
         |cb_url| {
@@ -1001,6 +1003,213 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         ]
     );
     browser_thread.join().expect("browser thread");
+
+    fn poll_webmail_fixture(
+        cfg: &MailboxConfig,
+        email: &str,
+        message: &str,
+        seen_otps: &mut std::collections::BTreeSet<String>,
+    ) -> Result<MailboxCredential, &'static str> {
+        let (to_browser_r, to_browser_w) = std::io::pipe().unwrap();
+        let (from_browser_r, mut from_browser_w) = std::io::pipe().unwrap();
+        let message = message.to_owned();
+        let browser = std::thread::spawn(move || {
+            let mut reader = to_browser_r;
+            let mut pending = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                for msg in split_nul_messages(&mut pending) {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    let method = msg.get("method").and_then(Value::as_str).unwrap();
+                    let result = match method {
+                        "Target.createTarget" => aterm_json::json!({"targetId": "fresh"}),
+                        "Target.attachToTarget" => aterm_json::json!({"sessionId": "s_fresh"}),
+                        "Runtime.evaluate" => aterm_json::json!({
+                            "result": {"value": {
+                                "state": "inbox",
+                                "html": format!("<p>Your verification code: 111111</p><p>{message}</p>"),
+                                "text": format!("Sign in to Claude: 111111\n{message}")
+                            }}
+                        }),
+                        _ => aterm_json::json!({}),
+                    };
+                    let mut reply =
+                        aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result}))
+                            .unwrap();
+                    reply.push(0);
+                    if from_browser_w.write_all(&reply).is_err() || method == "Target.closeTarget" {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut client = CdpClient::new(to_browser_w, from_browser_r);
+        let result = poll_mailbox_or_webmail_for_credential(
+            &mut client,
+            cfg,
+            Some(email),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            seen_otps,
+        );
+        drop(client);
+        browser.join().expect("fresh-message browser fixture");
+        result
+    }
+
+    // An older build persisted this raw hash after consuming OTP 111111.
+    // Keep that history while accepting a fresh message's code in its own scope.
+    let webmail_cfg = MailboxConfig {
+        dir: None,
+        ..cfg.clone()
+    };
+    let seen_file = cfg.seen_file.as_ref().unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(seen_file)
+        .unwrap()
+        .write_all(b"d0176b48bafb572b\n")
+        .unwrap();
+    let legacy_history = std::fs::read(seen_file).unwrap();
+    assert_eq!(
+        poll_webmail_fixture(
+            &webmail_cfg,
+            "user-a@example.test",
+            "new message for another account",
+            &mut seen_otps,
+        ),
+        Ok(MailboxCredential::Otp("111111".to_owned())),
+        "another account may receive the same code within this flow"
+    );
+    let mut next_flow_otps = std::collections::BTreeSet::new();
+    assert_eq!(
+        poll_webmail_fixture(
+            &webmail_cfg,
+            "user-b@example.test",
+            "new message in a later authorization",
+            &mut next_flow_otps,
+        ),
+        Ok(MailboxCredential::Otp("111111".to_owned())),
+        "a later authorization may receive the same code for the same account"
+    );
+    let magic_link = "https://claude.ai/magic?token=fresh_message_link";
+    assert_eq!(
+        poll_webmail_fixture(
+            &webmail_cfg,
+            "user-a@example.test",
+            magic_link,
+            &mut seen_otps
+        ),
+        Ok(MailboxCredential::MagicLink(magic_link.to_owned())),
+    );
+    assert!(
+        poll_webmail_fixture(
+            &webmail_cfg,
+            "user-a@example.test",
+            &format!("new DOM timestamp, same consumed link: {magic_link}"),
+            &mut std::collections::BTreeSet::new(),
+        )
+        .is_err(),
+        "a unique consumed magic link remains refused in a later flow"
+    );
+    let maildir = cfg.dir.as_ref().unwrap();
+    std::fs::write(
+        maildir.join("flow.eml"),
+        "To: <user-b@example.test>\r\n\r\nYour verification code: 111111",
+    )
+    .unwrap();
+    let mut maildir_flow_otps = std::collections::BTreeSet::new();
+    assert_eq!(
+        poll_webmail_fixture(
+            &cfg,
+            "user-b@example.test",
+            "Maildir source has priority",
+            &mut maildir_flow_otps,
+        ),
+        Ok(MailboxCredential::Otp("111111".to_owned())),
+    );
+    assert!(maildir.join("flow.eml.clicked").is_file());
+    assert!(
+        poll_webmail_fixture(
+            &webmail_cfg,
+            "user-b@example.test",
+            "same flow, stale Maildir code in a new DOM",
+            &mut maildir_flow_otps,
+        )
+        .is_err(),
+        "a code already delivered from Maildir is also stale in webmail"
+    );
+    assert!(
+        std::fs::read(seen_file)
+            .unwrap()
+            .starts_with(&legacy_history)
+    );
+
+    {
+        let (to_browser_r, to_browser_w) = std::io::pipe().unwrap();
+        let (from_browser_r, mut from_browser_w) = std::io::pipe().unwrap();
+        let browser = std::thread::spawn(move || {
+            let mut reader = to_browser_r;
+            let mut pending = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                for msg in split_nul_messages(&mut pending) {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    let method = msg.get("method").and_then(Value::as_str).unwrap();
+                    let result = match method {
+                        "Target.createTarget" => aterm_json::json!({"targetId": "totp_missing"}),
+                        "Target.attachToTarget" => {
+                            aterm_json::json!({"sessionId": "s_totp_missing"})
+                        }
+                        "Runtime.evaluate" => aterm_json::json!({
+                            "result": {"value": {
+                                "state": "needs_totp",
+                                "url": "https://mail.example.test/login/2fa"
+                            }}
+                        }),
+                        _ => aterm_json::json!({}),
+                    };
+                    let mut reply =
+                        aterm_json::to_vec(&aterm_json::json!({"id": id, "result": result}))
+                            .unwrap();
+                    reply.push(0);
+                    if from_browser_w.write_all(&reply).is_err() || method == "Target.closeTarget" {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut client = CdpClient::new(to_browser_w, from_browser_r);
+        let no_totp_cfg = MailboxConfig {
+            dir: None,
+            totp_secret: None,
+            totp_secrets: BTreeMap::new(),
+            ..cfg.clone()
+        };
+        let mut empty_otps = std::collections::BTreeSet::new();
+        assert_eq!(
+            poll_mailbox_or_webmail_for_credential(
+                &mut client,
+                &no_totp_cfg,
+                Some("user-a@example.test"),
+                Duration::from_secs(60),
+                Duration::ZERO,
+                &mut empty_otps,
+            ),
+            Err("webmail sign-in requires a TOTP 2FA secret in mailbox.toml or ai-mailbox.toml"),
+            "missing TOTP secret on a 2FA webmail login must fail fast with a clear diagnostic"
+        );
+        drop(client);
+        browser.join().expect("totp-missing browser fixture");
+    }
 
     let store_dir = tmp.path().join("accounts");
     let label_profile =
@@ -1045,6 +1254,125 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         Some("582914")
     );
 
+    let thread_links_eml = concat!(
+        "To: <user-b@example.test>\r\n\r\n",
+        "<div><a href=\"https://claude.ai/magic?token=old_tok\">Sign in</a></div>",
+        "<div><a href=\"https://claude.ai/magic?token=new_tok\">Sign in</a></div>"
+    );
+    assert_eq!(
+        super::super::headless_oauth::extract_all_credentials_from_email(
+            thread_links_eml,
+            Some("user-b@example.test")
+        ),
+        vec![
+            super::super::headless_oauth::MailboxCredential::MagicLink(
+                "https://claude.ai/magic?token=old_tok".to_owned()
+            ),
+            super::super::headless_oauth::MailboxCredential::MagicLink(
+                "https://claude.ai/magic?token=new_tok".to_owned()
+            ),
+        ]
+    );
+    let thread_otps_eml = concat!(
+        "To: <user-b@example.test>\r\n\r\n",
+        "<div>Your verification code is: 111111</div>",
+        "<div>Your verification code is: 222222</div>"
+    );
+    assert_eq!(
+        super::super::headless_oauth::extract_all_credentials_from_email(
+            thread_otps_eml,
+            Some("user-b@example.test")
+        ),
+        vec![
+            super::super::headless_oauth::MailboxCredential::Otp("111111".to_owned()),
+            super::super::headless_oauth::MailboxCredential::Otp("222222".to_owned()),
+        ]
+    );
+
+    let autodiscover_cfg = MailboxConfig {
+        password: Some("app-pw".to_owned()),
+        ..MailboxConfig::default()
+    };
+    assert_eq!(
+        autodiscover_cfg
+            .effective_imap_url(Some("alice@fastmail.com"))
+            .as_deref(),
+        Some("imaps://imap.fastmail.com:993/INBOX")
+    );
+    assert_eq!(
+        autodiscover_cfg
+            .effective_webmail_url(Some("alice@fastmail.com"))
+            .as_deref(),
+        Some("https://app.fastmail.com/mail/Inbox")
+    );
+    assert_eq!(
+        autodiscover_cfg
+            .effective_imap_url(Some("alice@gmail.com"))
+            .as_deref(),
+        Some("imaps://imap.gmail.com:993/INBOX")
+    );
+    let mut scoped_passwords = BTreeMap::new();
+    scoped_passwords.insert("only@custom-domain.test".to_owned(), "pw".to_owned());
+    let scoped_cfg = MailboxConfig {
+        webmail_url: Some("https://mail.custom-domain.test".to_owned()),
+        passwords: scoped_passwords,
+        ..MailboxConfig::default()
+    };
+    assert_eq!(
+        super::super::headless_oauth::poll_mailbox_config_for_credential(
+            &scoped_cfg,
+            Some("only@custom-domain.test"),
+            Duration::from_secs(60),
+        ),
+        Err("webmail inbox requires headless browser")
+    );
+    let mut proton_only = BTreeMap::new();
+    proton_only.insert("only@example.test".to_owned(), "pw".to_owned());
+    let unconfigured_other_cfg = MailboxConfig {
+        passwords: proton_only,
+        ..MailboxConfig::default()
+    };
+    assert_eq!(
+        super::super::headless_oauth::poll_mailbox_config_for_credential(
+            &unconfigured_other_cfg,
+            Some("other@example.test"),
+            Duration::from_secs(60),
+        ),
+        Err("headless browser requires sign-in, but no mailbox is configured")
+    );
+
+    let std_maildir = tmp.path().join("std_maildir");
+    std::fs::create_dir_all(std_maildir.join("new")).expect("mkdir new");
+    std::fs::create_dir_all(std_maildir.join("cur")).expect("mkdir cur");
+    let new_msg = std_maildir.join("new").join("1700000000.123_1.host");
+    std::fs::write(
+        &new_msg,
+        "To: <user-b@example.test>\r\n\r\nYour verification code: 778899",
+    )
+    .expect("write maildir new msg");
+    let std_maildir_cfg = MailboxConfig::from_dir(&std_maildir);
+    assert_eq!(
+        super::super::headless_oauth::poll_mailbox_config_for_credential(
+            &std_maildir_cfg,
+            Some("user-b@example.test"),
+            Duration::from_millis(50),
+        ),
+        Ok(super::super::headless_oauth::MailboxCredential::Otp(
+            "778899".to_owned()
+        ))
+    );
+    let cur_msg = std_maildir.join("cur").join("1700000000.123_1.host:2,S");
+    std::fs::rename(&new_msg, &cur_msg).expect("move new to cur with :2,S flag");
+    assert_eq!(
+        super::super::headless_oauth::poll_mailbox_config_for_credential(
+            &std_maildir_cfg,
+            Some("user-b@example.test"),
+            Duration::from_millis(50),
+        ),
+        Err("timed out waiting for verification email in mailbox"),
+        "a message moved from new/ to cur/ with :2,S flags retains its clicked marker"
+    );
+
     for tag in ["style", "script"] {
         for space in [" ", "\t", "\r", "\n", "\x0c"] {
             let raw = format!(
@@ -1076,7 +1404,6 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 
     #[cfg(unix)]
     {
-        use crate::harness::headless_oauth::MailboxCredential;
         use std::os::unix::fs::PermissionsExt;
 
         struct RestorePermissions(PathBuf, std::fs::Permissions);
@@ -1109,6 +1436,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         std::fs::set_permissions(&probe_seen, std::fs::Permissions::from_mode(0o0)).unwrap();
         let seen_unreadable = std::fs::read(&probe_seen).is_err();
         let mut pending = None;
+        let mut seen_otps = std::collections::BTreeSet::new();
         let failed_probe = super::authorize_using_with_page(
             authorize_url,
             Some("user-b@example.test"),
@@ -1170,6 +1498,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 Some("user-b@example.test"),
                 Duration::from_secs(60),
                 Duration::ZERO,
+                &mut seen_otps,
             ),
             Ok(MailboxCredential::Otp("111111".to_owned())),
             "first browser request reuses the already-consumed HTTP credential"
@@ -1184,6 +1513,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 Some("user-b@example.test"),
                 Duration::from_secs(60),
                 Duration::ZERO,
+                &mut seen_otps,
             ),
             Ok(MailboxCredential::Otp("908172".to_owned())),
             "later browser request polls a fresh credential"
@@ -1209,4 +1539,76 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
     assert!(!super::page_needs_browser_before_email(
         "<html><body><p>Check your email for a magic link</p></body></html>"
     ));
+
+    {
+        use super::super::headless_oauth::{
+            base32_decode, discover_mailbox_config_files, generate_totp_at,
+        };
+        let otpauth_uri = "otpauth://totp/Proton:sol-m27%40proton.me?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Proton&digits=6&period=30"; // gitleaks:allow
+        assert_eq!(
+            base32_decode(otpauth_uri).as_deref(),
+            Some(b"12345678901234567890".as_slice())
+        );
+        assert_eq!(generate_totp_at(otpauth_uri, 59).as_deref(), Some("287082"));
+        let otpauth_8digit = "otpauth://totp/Example:user@example.test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=8&period=30"; // gitleaks:allow
+        assert_eq!(
+            generate_totp_at(otpauth_8digit, 59).as_deref(),
+            Some("94287082")
+        );
+
+        let split_home = tmp.path().join("split_home");
+        std::fs::create_dir_all(split_home.join(".config/aterm")).expect("config dir");
+        std::fs::create_dir_all(split_home.join(".secrets")).expect("secrets dir");
+        let pw_file = split_home.join(".secrets/m27.pass");
+        std::fs::write(&pw_file, "file-pass-m27\n").expect("write pw file");
+        std::fs::write(
+            split_home.join(".config/aterm/mailbox.toml"),
+            r#"
+"direct-user@proton.me" = "direct-pw"
+
+[password_files]
+"sol-m27@proton.me" = "~/.secrets/m27.pass"
+"#,
+        )
+        .expect("write config mailbox.toml");
+        std::fs::write(
+            split_home.join(".secrets/ai-mailbox.toml"),
+            format!(
+                r#"
+[totp_secrets]
+"m27" = "{otpauth_uri}"
+
+[mailbox_passwords]
+"sol-m27@proton.me" = "second-pw-m27"
+"#
+            ),
+        )
+        .expect("write secrets ai-mailbox.toml");
+
+        let merged = discover_mailbox_config_files(Some(&split_home), None, None)
+            .expect("merged split mailbox config");
+        assert_eq!(
+            merged
+                .password_for(Some("direct-user@proton.me"))
+                .as_deref(),
+            Some("direct-pw")
+        );
+        assert_eq!(
+            merged.password_for(Some("sol-m27@proton.me")).as_deref(),
+            Some("file-pass-m27")
+        );
+        assert_eq!(
+            merged
+                .mailbox_password_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some("second-pw-m27")
+        );
+        let resolved_totp = merged
+            .totp_secret_for(Some("sol-m27@proton.me"))
+            .expect("totp derived from otpauth label email");
+        assert_eq!(
+            generate_totp_at(&resolved_totp, 59).as_deref(),
+            Some("287082")
+        );
+    }
 }

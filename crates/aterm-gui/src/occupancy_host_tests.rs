@@ -166,9 +166,7 @@ fn the_board_logs_a_change_of_its_slots_or_disk_word_only() {
     );
 }
 
-/// A look stores the board it took, whatever the process holds, and every
-/// host reads it (the only test that touches the stored board). A poke's
-/// look, which takes no ring row.
+/// A look stores the board it took, whatever the process holds, and every host reads it.
 #[test]
 fn a_look_stores_the_board_it_took() {
     look(NOW, &[], Look::Poke);
@@ -230,11 +228,7 @@ fn hold_rooms_waits_parse_with_their_sys_word() {
     }
 }
 
-/// The slot term holds only over consecutive looks that each saw a usable
-/// slot, timed by their snapshots' stamps: twenty minutes of looks, not one
-/// look; a look with none free, a stale board, or a slots reading older than
-/// the board's cadence starts it over. The same snapshot seen again moves
-/// nothing.
+/// The slot term holds only over consecutive looks that each saw a usable slot.
 #[test]
 fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
     const NONE_FREE: SlotsView = SlotsView::Read {
@@ -316,11 +310,7 @@ fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
     assert_eq!(fed(&mut j, 92, THREE_ONE_FREE, Some(0)), None);
 }
 
-/// A BOARD WHOSE LOOKS STOPPED READS STALE ([`Judged::reading`]): a fresh
-/// board read up to two disk looks after it was taken reads fresh, and past
-/// that stale, however fresh it was when taken (its looks stopped, so what it
-/// judged then no longer speaks for now). NEGATIVE CONTROL: the same board
-/// read at its own look and at the edge.
+/// [`Judged::reading`] marks a board stale once more than [`STALE_AFTER`] has elapsed since it was taken.
 #[test]
 fn a_board_whose_looks_stopped_reads_stale() {
     let mut j = Judged::default();
@@ -470,14 +460,7 @@ fn the_reading_is_the_board_for_one_session() {
     assert_eq!(r.pressure, Some(MemoryPressure::Critical));
 }
 
-/// A slot's holder counts for the tab whose tree holds it: found by its pid
-/// in the sweep, attributed through its parent chain to the nearest tab
-/// shell. A holder outside every tab, or not in the sweep, counts for none;
-/// with no holders read or no sweep, nothing is attributed. A holder found
-/// in a tab counts only while one current start record matches both its
-/// sweep identity and the holder's birth. A reused pid or an unknown record
-/// cannot carry the sweep's parent chain to a different holder. The current
-/// start is asked of the holders found in a tab and of no other.
+/// A slot's holder counts for the tab whose process tree holds it while its current start record matches.
 #[test]
 fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
     use aterm_uds::process::{BootClock, ProcessBirth, ProcessStart};
@@ -645,8 +628,7 @@ fn board_with(j: &mut Judged, unix_ms: i64, free: u16, slot_tabs: Option<Vec<u64
     );
 }
 
-/// THE MACHINE'S PACE: six lines in any hour across every session, the
-/// seventh held; a line an hour old no longer counts. A nudge needs no slot.
+/// The machine paces six lines in any hour across every session.
 #[test]
 fn the_machine_paces_six_lines_an_hour_across_its_sessions() {
     let mut j = Judged::default();
@@ -667,9 +649,7 @@ fn the_machine_paces_six_lines_an_hour_across_its_sessions() {
     );
 }
 
-/// THE RESERVATION: one free slot reserves for one session's `hold-room`
-/// line; the next session waits until the reservation's ten minutes pass,
-/// or until the reserving session's tab is seen holding a slot.
+/// One free slot reserves for one session's `hold-room` line until [`RESERVE_MS`] elapses or the session's tab holds a slot.
 #[test]
 fn one_free_slot_is_reserved_for_one_line() {
     let mut j = Judged::default();
@@ -704,9 +684,7 @@ fn one_free_slot_is_reserved_for_one_line() {
     );
 }
 
-/// THE OLDEST HOLD FIRST: a younger hold that asks when a slot frees waits
-/// for an older one already waiting; the older takes it. An older hold that
-/// stopped asking keeps no one waiting.
+/// An older hold already waiting takes a freed slot ahead of a younger hold.
 #[test]
 fn the_oldest_hold_takes_a_freed_slot_first() {
     let older = NOW - 5 * 60 * MIN_MS;
@@ -754,10 +732,6 @@ fn a_stale_board_reserves_no_slot() {
     }
 }
 
-// SAMPLING AND THE WRITE'S RE-READ (design §3.1): under `prompt`, while a session's loop asks
-// for `hold-room`'s reading, the board samples every five seconds; a slot rule's write is
-// answered on the board re-read for it, no older than `FACT_FRESH_MS`.
-
 /// Every build slot of three taken.
 const NONE_OF_THREE: SlotsView = SlotsView::Read {
     n: 3,
@@ -787,9 +761,7 @@ fn sampled_at(unix_ms: i64, slots: SlotsView) -> Option<(FactsBoard, Arc<Snapsho
     ))
 }
 
-/// Half an hour at one-second ticks under `mode`: the window's look each minute, session `a`'s
-/// loop asking the board's reading at each look through `asks_to_s` (seconds), and a sampler
-/// pass each tick. The reads the sampler made, and the tick its pass first said stop.
+/// Runs half an hour at one-second ticks under `mode` and returns `(sampler_reads, first_stop_tick)`.
 fn sampled_half_hour(mode: Occupancy, asks_to_s: i64) -> (usize, Option<i64>) {
     let sessions = [(7, "a".to_string())];
     let kept = Mutex::new(Some(Judged::default()));
@@ -821,11 +793,7 @@ fn sampled_half_hour(mode: Occupancy, asks_to_s: i64) -> (usize, Option<i64>) {
     (reads, stopped)
 }
 
-/// OBSERVE SAMPLES NO FASTER THAN ITS LOOKS: under `observe` and `off` a loop's asks start no
-/// sampler and its passes read nothing (the minute looks alone); under `prompt`, asked at every
-/// look, the board is read every [`SAMPLE_EVERY`] between them. The sampler keeps to the asks:
-/// asked only through nine minutes, it reads until [`ASK_KEEP_MS`] past the last ask and stops;
-/// never asked, it reads nothing. NEGATIVE CONTROL: `prompt` asked throughout.
+/// `observe` and `off` do not run the sampler, while `prompt` samples every [`SAMPLE_EVERY_MS`] until [`ASK_KEEP_MS`] past the last ask.
 #[test]
 fn observe_samples_no_faster_than_its_looks() {
     let half_hour_s = 30 * 60;
@@ -858,10 +826,7 @@ fn observe_samples_no_faster_than_its_looks() {
     assert_eq!(sampled_half_hour(Occupancy::Prompt, -1), (0, Some(0)));
 }
 
-/// UNDER PROMPT THE SLOT TERM IS JUDGED ON THE SAMPLES: a slot taken for five seconds between
-/// two minute looks, which only a sample sees, starts `slots>=1 for=20m` over, so twenty
-/// minutes of looks do not span it. NEGATIVE CONTROL: under `observe` the looks alone judge
-/// it, and it spans.
+/// Under `prompt`, a slot taken between two minute looks restarts the `slots>=1 for=20m` term.
 #[test]
 fn under_prompt_the_slot_term_is_judged_on_the_samples() {
     let blip = NOW + 10 * MIN_MS + 5_000..NOW + 10 * MIN_MS + 10_000;
@@ -945,11 +910,7 @@ fn room_answer(j: &mut Judged, sid: &str, now_ms: i64) -> PaceGrant {
     j.answer(sid, RuleId::HoldRoom, ROOM_SINCE, now_ms)
 }
 
-/// A SLOT TAKEN SINCE THE LOOK HOLDS THE LINE: the minute look saw one free; the board re-read
-/// for the write half a minute later sees none, and the answer is `unmet`, no slot reserved.
-/// The look's board itself, half a minute old, types nothing (`stale`). NEGATIVE CONTROL: the
-/// slot still free at the re-read is answered with the room; the look's board within
-/// `FACT_FRESH_MS` of its landing is too.
+/// A slot taken between the minute look and the write's re-read returns [`PaceGrant::Unmet`] without reserving a slot.
 #[test]
 fn a_slot_taken_since_the_look_holds_the_line() {
     let now = NOW + 30_000;
@@ -972,9 +933,7 @@ fn a_slot_taken_since_the_look_holds_the_line() {
     ));
 }
 
-/// A STALE RE-READ REFUSES: a re-read whose snapshot landed, or whose slots were read, more than
-/// `FACT_FRESH_MS` before the answer, or whose slots say no age, is answered `stale`. NEGATIVE
-/// CONTROL: each at the edge is answered with the room.
+/// A re-read older than [`FACT_FRESH_MS`] or without slot age returns [`PaceGrant::Stale`].
 #[test]
 fn a_stale_reread_refuses() {
     let now = NOW + 30_000;
@@ -1001,10 +960,7 @@ fn a_stale_reread_refuses() {
     }
 }
 
-/// THE ROOM ANSWER CARRIES THE RE-READ FIGURES: the look's board says one slot of three and
-/// 96 GiB; the board re-read for the write says two and 64 GiB, and the answer's reading is the
-/// re-read's, stamped when its oldest figure was read, its slot term spanned to the re-read.
-/// NEGATIVE CONTROL: the look's reading says the other figures.
+/// [`PaceGrant::Room`] carries the re-read board's figures rather than the earlier look's.
 #[test]
 fn the_room_answer_carries_the_reread_figures() {
     let now = NOW + 30_000;
@@ -1024,10 +980,7 @@ fn the_room_answer_carries_the_reread_figures() {
     assert!(r.typeable_at(Some(now)));
 }
 
-/// A SLOT RULE IS NEVER ANSWERED A BARE GRANT (a bare `granted` to `hold-room` is an older
-/// build's, which types the line as decided): it is the room, or the line held, the pace's
-/// holds passed through (`b`'s line waits on the slot reserved for `a`'s). NEGATIVE CONTROL: a
-/// nudge's pace is the bare grant.
+/// A slot rule returns [`PaceGrant::Room`] or a hold reason, never [`PaceGrant::Granted`].
 #[test]
 fn a_slot_rule_is_never_answered_a_bare_grant() {
     let now = NOW + 30_000;
@@ -1049,9 +1002,6 @@ fn a_slot_rule_is_never_answered_a_bare_grant() {
     }
 }
 
-// SURFACING (slice 1e): the told word, the ready proxy, the slot-minutes idle while ready, the
-// status fields and the `occupancy` verb's replies.
-
 use aterm_agent::supervise::occupancy::rules::Guards;
 use aterm_agent::supervise::occupancy::{SaidHold, SaidRule, SaidVerdict};
 use aterm_agent::supervise::{Autopilot, Guard};
@@ -1063,7 +1013,7 @@ const HOUR_MS: i64 = 60 * MIN_MS;
 fn said(
     mode: Occupancy,
     since: Option<i64>,
-    verdicts: [SaidVerdict; 2],
+    verdicts: [SaidVerdict; RuleId::COUNT],
     guard: Option<Guard>,
 ) -> OccupancySaid {
     OccupancySaid {
@@ -1079,7 +1029,7 @@ fn said(
             brake: guard.filter(|g| !matches!(g, Guard::Person | Guard::Draft)),
             ..Guards::clear(Autopilot::Cruise)
         }),
-        rules: [
+        rules: vec![
             SaidRule {
                 rule: RuleId::WaitNudge,
                 verdict: verdicts[0],
@@ -1096,7 +1046,7 @@ fn said(
     }
 }
 
-const QUIET: [SaidVerdict; 2] = [SaidVerdict::Quiet, SaidVerdict::Quiet];
+const QUIET: [SaidVerdict; RuleId::COUNT] = [SaidVerdict::Quiet, SaidVerdict::Quiet];
 
 /// Thirty-one looks a minute apart from [`NOW`], one slot of three free and holders in tab 7
 /// (session `a`'s) and tab 9 (session `b`'s), the machine with room: what each look's row says.
@@ -1117,12 +1067,7 @@ fn thirty_minutes(j: &mut Judged, sessions: &[(u64, String)]) -> Vec<RingRow> {
         .collect()
 }
 
-/// THE READY PROXY AND THE SLOT-MINUTES IDLE WHILE READY: a told hold past two hours in a
-/// session whose tab held a slot reads ready once the board's slot term spans its twenty
-/// minutes, and each look from then counts one slot-minute (one usable slot, one ready
-/// session). NEGATIVE CONTROLS: a hold under two hours (in a tab that held a slot too, so the
-/// two hours are all it lacks), a closed hold, and a session nothing was told of are never
-/// ready, and with none ready no minute counts.
+/// A told hold past two hours in a tab that held a slot reads ready once the slot term spans twenty minutes.
 #[test]
 fn a_told_hold_past_two_hours_is_ready_while_a_slot_stands_free() {
     let sessions = [
@@ -1176,7 +1121,6 @@ fn a_told_hold_past_two_hours_is_ready_while_a_slot_stands_free() {
     assert_eq!(j.ready_now(), 1);
     assert_eq!(j.idle_ready_min(NOW + 30 * MIN_MS), looks);
 
-    // A closed hold is no longer ready, and the minutes stop.
     j.tell("a", Some(said(Occupancy::Observe, None, QUIET, None)));
     let t = NOW + 31 * MIN_MS;
     step(
@@ -1266,7 +1210,6 @@ fn the_status_fields_say_the_mode_the_hold_and_the_slots() {
     assert_eq!(f["ready"], "1");
     assert_eq!(f["slots"], "1/3");
     assert_eq!(f["idle_ready_min"], j.idle_ready_min(now).to_string());
-    // Another session's hold is its own.
     let other = fields(&status_words(Occupancy::Prompt, Some(&j), Some("z"), now));
     assert_eq!(other["occupancy_hold"], "none");
     assert_eq!(
@@ -1331,10 +1274,7 @@ fn hold_row(ts: i64, sid: &str, reason: &str) -> String {
     )
 }
 
-/// `occupancy check --replay` over the board's own rows and the session's ledger: the hold the
-/// ledger opened three hours back gives the nudge at the first look and `hold-room` once the
-/// slot term spans its twenty minutes. NEGATIVE CONTROL: a ledger with no hold rows gives no
-/// line of either.
+/// `occupancy check --replay` replays the decider over the board's rows and the session's ledger.
 #[test]
 fn check_replay_runs_the_decider_over_the_rows_and_the_ledger() {
     let sessions = [(7, "a".to_string())];
@@ -1408,10 +1348,7 @@ fn the_verb_takes_its_forms_and_refuses_others() {
     assert!(cmd_occupancy(None, "check --replay 1h").starts_with("ERR occupancy"));
 }
 
-/// A POKE BETWEEN THE MINUTE'S LOOKS TAKES NO ROW (the facts ring is a row a minute, §6): the
-/// board is taken afresh, but the rows, the sessions ready and the slot-minutes are the ticks'
-/// alone, so a day of rows stays a day however often the disk watch is poked. NEGATIVE
-/// CONTROL: each tick takes its row.
+/// A poke between minute ticks refreshes the board without adding a facts-ring row.
 #[test]
 fn a_poke_between_ticks_takes_no_row() {
     let sessions = [(7, "a".to_string())];
@@ -1453,10 +1390,6 @@ fn a_poke_between_ticks_takes_no_row() {
     assert_eq!(j.ready_now(), 1);
 }
 
-// THE SAMPLER'S LEAD AND ITS MODE (§3.1): a told hold's `hold-room` line is sampled from its slot
-// term's `for=` before the line can go, under the owner's `prompt` alone; a slot rule's write
-// re-reads the board under `prompt` alone.
-
 /// When session `a`'s hold, begun at [`ROOM_SINCE`], can first type `hold-room`'s line.
 const ROOM_DUE: i64 = ROOM_SINCE + rules::HOLD_ROOM_AFTER_MS;
 
@@ -1466,12 +1399,7 @@ fn lead_ms() -> i64 {
     i64::try_from(wait.for_ms).unwrap() + LOOK_EVERY_MS
 }
 
-/// A RUN TO `hold-room`'S CADENCE under the owner's `mode`: session `a`'s hold begun at
-/// [`ROOM_SINCE`], told by its loop running under `told` (nothing told for `None`); the
-/// window's look each minute from 25 minutes before [`ROOM_DUE`] to it, the loop asking the
-/// board at each look from then (its line can go from then, [`rules::wants_reading`]), a
-/// sampler pass each second, and a build slot taken for five seconds ten minutes before it. The
-/// reads the sampler made before [`ROOM_DUE`], and the slot term's span at the look then.
+/// Runs to [`ROOM_DUE`] under `mode` with `told` hold state and returns `(sampler_reads, slots_free_ms)`.
 fn lead_run(mode: Occupancy, told: Option<Occupancy>) -> (usize, Option<u64>) {
     let blip = ROOM_DUE - 10 * MIN_MS + 5_000..ROOM_DUE - 10 * MIN_MS + 10_000;
     let sessions = [(7, "a".to_string())];
@@ -1514,13 +1442,7 @@ fn lead_run(mode: Occupancy, told: Option<Occupancy>) -> (usize, Option<u64>) {
     )
 }
 
-/// A TOLD HOLD IS SAMPLED FROM ITS SLOT TERM'S `for=` BEFORE ITS LINE CAN GO: a loop asks the
-/// board only once `hold-room`'s line can go, but `slots>=1 for=20m` spans the twenty minutes
-/// before, so under `prompt` the board samples from the told hold, and a slot taken for five
-/// seconds ten minutes before the line can go starts the term over: at the look it can go, the
-/// term does not span. NEGATIVE CONTROLS: nothing told, the owner's `observe` or `off`, or a loop
-/// running under `observe`, and nothing is read before the line can go; the looks alone judge the
-/// term, which spans their 25 minutes across the slot taken between two of them.
+/// Under `prompt`, a told hold is sampled from its slot term's `for=` window before its line is due.
 #[test]
 fn a_told_hold_is_sampled_from_its_slot_terms_for_before_its_line_can_go() {
     let lead = usize::try_from(lead_ms() / SAMPLE_EVERY_MS).unwrap();
@@ -1547,13 +1469,7 @@ fn a_told_hold_is_sampled_from_its_slot_terms_for_before_its_line_can_go() {
     }
 }
 
-/// THE LEAD'S EDGES: from the slot term's `for=` and one look before the told hold's line can go
-/// to [`ASK_KEEP_MS`] after (by when its loop asks the board itself), and the look starts one
-/// sampler there; each line told typed moves the next lead to two hours after it; the rule told
-/// spent (with no line told typed here: a predecessor's), or its cap's four lines told typed,
-/// leaves none; a hold told closed keeps its lines, as a successor carries it, and a hold begun
-/// after them counts afresh; a session forgotten leaves none. NEGATIVE CONTROL: the owner's
-/// `observe` and `off` sample at no edge.
+/// The sampler lead window runs from `for=` plus one look before each due line until [`ASK_KEEP_MS`] after.
 #[test]
 fn the_lead_runs_from_the_slot_terms_for_before_each_line_to_its_loops_asks() {
     let lead = lead_ms();
@@ -1638,11 +1554,7 @@ fn the_lead_runs_from_the_slot_terms_for_before_each_line_to_its_loops_asks() {
     assert_eq!(edges(&j, due), [false; 5], "forgotten");
 }
 
-/// THE SAMPLER KEEPS TO THE OWNER'S MODE, EACH CHECK ALONE: a board whose loop asked under
-/// `prompt` samples under `prompt`, but not once the owner's mode reads `observe` or `off`, and a
-/// pass then reads nothing and stops; an ask under `observe` or `off` wants nothing, and clears
-/// what `prompt`'s asks wanted, so `prompt` then samples nothing either. NEGATIVE CONTROL: the
-/// ask under `prompt`, sampled under `prompt`.
+/// The sampler runs only while the owner's mode is `prompt`.
 #[test]
 fn the_sampler_keeps_to_the_owners_mode_each_check_alone() {
     for mode in [Occupancy::Observe, Occupancy::Off] {
@@ -1671,11 +1583,7 @@ fn the_sampler_keeps_to_the_owners_mode_each_check_alone() {
     }
 }
 
-/// A SLOT RULE'S WRITE RE-READS THE BOARD UNDER `prompt` ALONE: a loop whose policy still says
-/// `prompt` after the owner's mode moved to `observe` or `off` asks the pace of a `hold-room`
-/// line; nothing is read and the line waits (`stale`). A nudge's pace reads nothing under any
-/// mode. NEGATIVE CONTROL: under `prompt` the board is re-read once and the line answered with
-/// the room.
+/// A slot rule's write re-reads the board only when the owner's mode is `prompt`.
 #[test]
 fn a_slot_rules_write_rereads_the_board_under_prompt_alone() {
     let now = NOW + 30_000;

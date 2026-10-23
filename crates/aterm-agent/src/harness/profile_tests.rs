@@ -8,13 +8,10 @@ use aterm_tempfile::TempDir as Tmp;
 
 use super::*;
 
-/// The account id the composed profiles carry (invented).
 const UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
-/// The text planted wherever a value must never be kept.
 const SENTINEL: &str = "S3NT1NEL";
 
-/// 2026-10-15T00:00:00Z.
 const DAY: i64 = 1_792_022_400;
 
 fn tmp_dir(tag: &str) -> Tmp {
@@ -56,13 +53,66 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
         display.weekly.is_none(),
         "the old account's cache was rejected"
     );
-    for time in [now - 1, now + 15 * 60 + 1, DAY + 10 * 24 * 60 * 60] {
+    let aged = parse_subscription(text.as_bytes(), now + 15 * 60 + 1).unwrap();
+    assert_eq!(
+        aged.weekly.as_deref(),
+        Some("weekly 29% left \u{b7} 15m ago"),
+        "past fifteen minutes the cache shows with its age"
+    );
+    for time in [now - 61, now + 60 * 60 + 1, DAY + 10 * 24 * 60 * 60] {
         let display = parse_subscription(text.as_bytes(), time).unwrap();
         assert!(
-            display.weekly.is_none(),
+            display.weekly.is_none() && display.weekly_figure.is_none(),
             "future, stale or expired cache: {time}"
         );
     }
+}
+
+/// THE ONE AGE RULE of every weekly figure (owner, 2026-10-22: *"you also need to fix the
+/// weekly budget reporting for claude code harness"*): current for fifteen minutes, then
+/// with its age up to an hour, and nothing older, from the future or past its reset; tenths
+/// as the `/usage` cache has them.
+#[test]
+fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
+    const AT: i64 = 1_792_050_000;
+    let figure = WeeklyFigure {
+        used_x10: 380,
+        resets_at: AT + 86_400,
+        at: AT,
+    };
+    let words = |elapsed: i64| figure.words(AT + elapsed);
+    assert_eq!(words(0).as_deref(), Some("weekly 62% left"));
+    assert_eq!(words(15 * 60).as_deref(), Some("weekly 62% left"));
+    assert!(figure.current(AT + 15 * 60) && !figure.current(AT + 15 * 60 + 1));
+    assert_eq!(
+        words(16 * 60).as_deref(),
+        Some("weekly 62% left \u{b7} 16m ago")
+    );
+    assert_eq!(
+        words(60 * 60).as_deref(),
+        Some("weekly 62% left \u{b7} 60m ago")
+    );
+    assert_eq!(words(61 * 60), None, "older than an hour");
+    assert_eq!(
+        words(-60).as_deref(),
+        Some("weekly 62% left"),
+        "stamped up to a minute ahead of this clock: just read"
+    );
+    assert!(figure.current(AT - 60));
+    assert_eq!(words(-61), None, "a reading from further in the future");
+    assert_eq!(figure.words(AT + 86_400), None, "its window reset");
+    let tenths = WeeklyFigure {
+        used_x10: 385,
+        ..figure
+    };
+    assert_eq!(tenths.words(AT).as_deref(), Some("weekly 61.5% left"));
+    let older = WeeklyFigure {
+        at: AT - 1,
+        ..tenths
+    };
+    assert_eq!(WeeklyFigure::newer(Some(older), Some(figure)), Some(figure));
+    assert_eq!(WeeklyFigure::newer(Some(figure), Some(older)), Some(figure));
+    assert_eq!(WeeklyFigure::newer(None, Some(older)), Some(older));
 }
 
 #[test]
@@ -176,15 +226,10 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     assert!(read(&second_env, Some(&lone)).is_some());
 }
 
-/// The footer's display of one profile's bytes at `now`, by the selection's own parse.
 fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoProfile> {
     parse_selected(bytes).map(|selected| selected.subscription(now))
 }
 
-/// The plan usage is read by the footer's own selection and currency rule (Stats Deck v2
-/// T-A1): a reading fetched over fifteen minutes ago or in the future, windows that reset
-/// at or before now, another account's cache, a shared default home whose roster lists
-/// several logins, and an address the roster does not bind each give none.
 #[test]
 fn plan_usage_selection() {
     use super::super::accounts::{Roster, Row};
@@ -415,8 +460,6 @@ fn plan_usage_selection() {
     assert!(read(Some(&Roster::default()), now, None).is_some());
 }
 
-/// A whole composed profile: every allowlisted field, and a sentinel in
-/// every credential and identity field the real file can hold.
 fn composed() -> Value {
     json!({
         "numStartups": 42,
@@ -500,7 +543,6 @@ fn composed() -> Value {
     })
 }
 
-/// An object of `entries`, its keys computed.
 fn keyed(entries: &[(&str, Value)]) -> Value {
     let mut map = aterm_json::Map::new();
     for (key, value) in entries {
@@ -513,7 +555,6 @@ fn parsed(v: &Value) -> Profile {
     parse(aterm_json::to_string(v).expect("compose").as_bytes()).expect("a profile")
 }
 
-/// `v` with `path` (keys, top down) set to `to`.
 fn with(mut v: Value, path: &[&str], to: Value) -> Value {
     let mut at = &mut v;
     for key in path.get(..path.len() - 1).unwrap_or(&[]) {
@@ -529,7 +570,6 @@ fn with(mut v: Value, path: &[&str], to: Value) -> Value {
     v
 }
 
-/// `v` without `path`'s last key.
 fn without(mut v: Value, path: &[&str]) -> Value {
     let mut at = &mut v;
     for key in path.get(..path.len() - 1).unwrap_or(&[]) {
@@ -548,8 +588,6 @@ fn word(text: &str) -> Option<Word> {
     Word::new(text)
 }
 
-/// Every allowlisted field of a whole composed profile reads, in aterm's
-/// words.
 #[test]
 fn a_composed_profile_reads_every_allowlisted_field() {
     let p = parsed(&composed());
@@ -573,7 +611,6 @@ fn a_composed_profile_reads_every_allowlisted_field() {
     assert_eq!(p.credits_only, Some(vec!["nimbus".to_string()]));
     let usage = p.usage.expect("the cached body names this account");
     assert_eq!(usage.fetched_at_ms, 1_792_050_000_000);
-    /// A window as compared: bucket, name, tenths, reset.
     type Row<'a> = (&'a str, Option<&'a str>, Option<u16>, Option<i64>);
     let windows: Vec<Row<'_>> = usage
         .windows
@@ -646,8 +683,6 @@ fn a_composed_profile_reads_every_allowlisted_field() {
     );
 }
 
-/// THE SENTINEL TEST (design §8.4, A0): nothing the reader answers holds any
-/// part of a credential, an identity field or the account id.
 #[test]
 fn no_credential_identity_or_id_reaches_what_is_answered() {
     let text = aterm_json::to_string(&composed()).expect("compose");
@@ -692,8 +727,6 @@ fn no_credential_identity_or_id_reaches_what_is_answered() {
     assert!(whole.contains(UUID), "the control reader holds the id");
 }
 
-/// A KEY READS BACK FROM ITS TEXT ([`AccountKey::parse`]), as the accounts
-/// state keeps it, Claude's and Codex's alike.
 #[test]
 fn a_key_reads_back_from_its_text_and_nothing_else_does() {
     let claude = AccountKey::claude(UUID).expect("a key");
@@ -715,8 +748,6 @@ fn a_key_reads_back_from_its_text_and_nothing_else_does() {
     }
 }
 
-/// A file that is not one JSON object is the one word `unreadable` — its
-/// sentinels with it, never the parser's message.
 #[test]
 fn a_file_that_is_not_json_is_one_word() {
     for bad in [
@@ -734,8 +765,6 @@ fn a_file_that_is_not_json_is_one_word() {
     }
 }
 
-/// A kept field of another type reads as absent; the rest of the file
-/// still reads.
 #[test]
 fn a_field_of_another_shape_reads_absent_and_the_rest_still_reads() {
     let v = with(composed(), &["oauthAccount", "organizationType"], json!(5));
@@ -778,7 +807,6 @@ fn a_field_of_another_shape_reads_absent_and_the_rest_still_reads() {
     );
 }
 
-/// Text kept from the file is printable ASCII and short, or nothing.
 #[test]
 fn a_kept_text_is_a_short_printable_word_or_nothing() {
     let v = with(
@@ -801,8 +829,6 @@ fn a_kept_text_is_a_short_printable_word_or_nothing() {
     assert_eq!(word(""), None);
 }
 
-/// The served tier: the user's, else the organization's; a trailing
-/// multiple is the multiple, any other tier its own word.
 #[test]
 fn the_tier_is_the_users_else_the_organizations() {
     let p = parsed(&without(composed(), &["oauthAccount", "userRateLimitTier"]));
@@ -828,8 +854,6 @@ fn the_tier_is_the_users_else_the_organizations() {
     }
 }
 
-/// The plan word from every organization type Claude Code maps, any other
-/// as `other`, none without the field.
 #[test]
 fn the_plan_word_is_claude_codes_mapping() {
     for (raw, plan, title) in [
@@ -851,8 +875,6 @@ fn the_plan_word_is_claude_codes_mapping() {
     assert_eq!(p.plan.word, None);
 }
 
-/// The credits word: absent is unknown, `null` on, `out_of_credits` out,
-/// any other reason off with its reason.
 #[test]
 fn the_credits_word_follows_the_cached_reason() {
     let key = ["cachedExtraUsageDisabledReason"];
@@ -884,8 +906,6 @@ fn the_credits_word_follows_the_cached_reason() {
     );
 }
 
-/// The cached body is kept only where it names the profile's own account,
-/// as Claude Code itself drops it; and only with its fetch time.
 #[test]
 fn a_cached_body_of_another_account_is_dropped() {
     let other = with(
@@ -922,9 +942,6 @@ fn fable_at(plan: &str, seat: &str, tier: &str, features: Value) -> FablePlan {
     parsed(&with(v, &["cachedGrowthBookFeatures"], features)).fable
 }
 
-/// Every answer the two flags give, decided as Claude Code 2.1.301 decides
-/// whether Fable is billed to usage credits; a renamed or reshaped flag is
-/// `unknown`, never a guess.
 #[test]
 fn the_fable_plan_answer_follows_the_two_flags() {
     let tiers = "tengu_saffron_credits_only_tiers";
@@ -1056,13 +1073,6 @@ fn the_fable_plan_answer_follows_the_two_flags() {
     assert_eq!(FablePlan::LimitsEnd(Some(ends)).ends_at(), Some(ends));
 }
 
-/// The answer is decided in Claude Code's order: a login billed per request
-/// (an Enterprise seat `enterprise_usage_based`, the tier
-/// `default_claude_zero`) is included whatever the flags say — even the
-/// vendor's default tiers flag, `["enterprise"]`; a plan in the tiers flag
-/// is credits only with no lattice at all; and a lattice whose plan-wide
-/// keys Claude Code's parse would refuse is `unknown`, never read as half a
-/// flag.
 #[test]
 fn the_fable_plan_answer_is_decided_in_claude_codes_order() {
     let tiers = "tengu_saffron_credits_only_tiers";
@@ -1134,9 +1144,6 @@ fn the_fable_plan_answer_is_decided_in_claude_codes_order() {
     }
 }
 
-/// The key is design §3.1's hash, computed here independently: one id gives
-/// one key wherever it is read, the agent is in the hash, and the id is in
-/// no part of what a key prints.
 #[test]
 fn the_key_is_the_designs_hash_of_the_id() {
     let mut want = aterm_digest::Sha256::new();
@@ -1178,8 +1185,6 @@ fn the_key_is_the_designs_hash_of_the_id() {
     assert_eq!(AccountKey::claude(&"a".repeat(129)), None);
 }
 
-/// Every instant shape the vendor writes: UTC with and without a fraction,
-/// an offset applied, a bare date at midnight UTC; anything else none.
 #[test]
 fn instants_read_in_every_shape_the_vendor_writes() {
     let at = DAY + 18 * 3600 + 5 * 60;
@@ -1201,12 +1206,6 @@ fn instants_read_in_every_shape_the_vendor_writes() {
     }
 }
 
-/// The profile's path is aterm's home rule: beside the user's own
-/// `~/.claude` with no `CLAUDE_CONFIG_DIR`, inside any set one — the user's
-/// own `~/.claude` named by it included, as the real-Claude lab launches
-/// Claude Code (`CLAUDE_CONFIG_DIR || homedir()`) — in `$HOME` for an empty
-/// one, whose directory need not be known, beside another `HOME`'s `.claude`
-/// for a process with its own.
 #[test]
 fn the_profile_path_follows_the_home_rule() {
     use crate::harness::host_path::abs;
@@ -1397,8 +1396,6 @@ fn the_file_read_is_the_one_claude_code_picks() {
     );
 }
 
-/// A custom OAuth URL renames the profile when it is set and not empty, as
-/// Claude Code's JavaScript tests it.
 #[test]
 fn a_custom_oauth_url_counts_when_it_is_not_empty() {
     use std::ffi::OsStr;
@@ -1407,7 +1404,6 @@ fn a_custom_oauth_url_counts_when_it_is_not_empty() {
     assert!(!custom_oauth(None), "CONTROL: unset");
 }
 
-/// `read`: the file's profile, or the one word for why there is none.
 #[test]
 fn read_answers_the_profile_or_why_not() {
     let tmp = tmp_dir("read");
@@ -1461,9 +1457,6 @@ fn a_fifo_is_not_a_profile_and_does_not_block() {
     reader.join().expect("reader");
 }
 
-/// [`answers_to`]: the effective profile's `oauthAccount.emailAddress`
-/// compared with a row's address, case aside, in a home the process's
-/// environment names — `CLAUDE_CONFIG_DIR`'s profile inside it.
 #[test]
 fn a_login_answers_to_its_rows_address_alone() {
     let tmp = tmp_dir("answers");
@@ -1511,10 +1504,6 @@ fn a_login_answers_to_its_rows_address_alone() {
     assert_eq!(answers_to(&in_own, &home, row), Some(true));
 }
 
-/// [`muse_subscription_for`]: Muse Code's login store under the config
-/// home its environment names, the `meta` provider's `user_email` alone
-/// (MEASURED on 1.4.11-R6667.1), and only for a process on that
-/// provider.
 #[test]
 fn a_muse_login_store_names_its_account_alone() {
     let tmp = tmp_dir("muse-auth");

@@ -1,43 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenPGP detached-signature verification, pure (no I/O, no clock): a vendor digest
-//! document is accepted only under a v4 RSA signature by a key compiled into this binary
-//! (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` §1.2).
-//!
-//! The accepted subset is what a release signer emits; everything outside it is refused,
-//! never interpreted:
-//!
-//! - input: binary packets, or exactly one armored `PGP SIGNATURE` block (armor headers
-//!   ignored; the CRC24 line is never consulted — the RSA signature is the integrity check);
-//! - packets: old or new headers; old length-type 3, partial lengths, leftover bytes and
-//!   every tag but signature (2) and marker (10, skipped) are refused; at most eight
-//!   signatures, accepted iff one verifies;
-//! - signature: v4, type 0x00, RSA (1), SHA-512 (10) or SHA-256 (8); the unhashed area is
-//!   skipped by length and never read;
-//! - hashed subpackets: unknown critical types and a second creation time (2) or issuer
-//!   fingerprint (33) are refused; exactly one creation time, within
-//!   `[key.created, now + 7 d]`; every expiration (3) is honoured; the issuer fingerprint
-//!   must be `0x04 ‖ key.fingerprint`;
-//! - crypto: the signed message is `doc ‖ body[0..6+hashed_len] ‖ 0x04 0xFF ‖
-//!   be32(6+hashed_len)`; the digest's left 16 bits are a cheap reject only; the MPI must
-//!   fit its bit count and the modulus, and is left-padded to the modulus length because
-//!   ring verifies only a signature exactly as long as the modulus. Leading zero bytes and
-//!   an overstated bit count are accepted: v4 allows them (RFC 9580 §3.2 demands the
-//!   canonical form of v6 only) and a signer writing fixed-length PKCS#1 output emits them;
-//! - a `.sig` is not canonical: armor, packet framing, markers, the unhashed area and MPI
-//!   padding all vary under one verifying signature, so nothing may be keyed on its bytes.
+//! Pure OpenPGP detached-signature verification.
 
 use std::borrow::Cow;
 
 use ring::digest;
 use ring::signature::{self, RsaParameters, RsaPublicKeyComponents};
 
-/// The largest signature input accepted, armored or binary — the `.sig` fetch cap (§1.1).
+/// The largest signature input accepted, armored or binary.
 pub const MAX_SIGNATURE_LEN: usize = 16 * 1024;
-/// At most this many signature packets; more is refused even when one of them verifies.
 const MAX_SIGNATURES: usize = 8;
-/// How far past `now` a creation time may lie (signer clock skew).
 const FUTURE_SKEW_SECS: u64 = 7 * 24 * 60 * 60;
 
 const TAG_SIGNATURE: u8 = 2;
@@ -50,13 +23,12 @@ const HASH_SHA512: u8 = 10;
 const SUBPACKET_CREATION_TIME: u8 = 2;
 const SUBPACKET_EXPIRATION: u8 = 3;
 const SUBPACKET_ISSUER_FINGERPRINT: u8 = 33;
-/// The version octet a v4 key's issuer-fingerprint subpacket carries before the fingerprint.
 const FINGERPRINT_V4: u8 = 4;
 
 const ARMOR_BEGIN: &[u8] = b"-----BEGIN PGP SIGNATURE-----";
 const ARMOR_END: &[u8] = b"-----END PGP SIGNATURE-----";
 
-/// An RSA signing key compiled into the binary: the only key a document can verify under.
+/// An RSA signing key compiled into the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinnedRsaKey {
     /// The modulus, big-endian, without a leading zero byte.
@@ -69,9 +41,7 @@ pub struct PinnedRsaKey {
     pub fingerprint: [u8; 20],
 }
 
-/// Anthropic's Claude Code release signing key: v4 RSA-4096, created 2026-03-30,
-/// fingerprint `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`. A test re-derives every field
-/// from the committed `vendor_direct/fixtures/anthropic-claude-code.asc`.
+/// Anthropic's Claude Code release signing key.
 pub const ANTHROPIC_CLAUDE_CODE_RELEASE_KEY: PinnedRsaKey = PinnedRsaKey {
     n: &ANTHROPIC_CLAUDE_CODE_RELEASE_N,
     e: &[0x01, 0x00, 0x01],
@@ -124,8 +94,7 @@ pub struct VerifiedSignature {
     pub created: u32,
 }
 
-/// Why a signature was refused. Every variant is a refusal; none is ever downgraded to
-/// acceptance.
+/// Why a signature was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgpError {
     /// The signature input is longer than [`MAX_SIGNATURE_LEN`].
@@ -181,10 +150,6 @@ pub enum PgpError {
 }
 
 impl PgpError {
-    /// How far a refused signature got. With several signatures the furthest refusal is
-    /// reported, so one naming another issuer (refused by stage 4) never masks the time or
-    /// crypto refusal of one naming the pinned key. The report is unauthenticated: an added
-    /// packet that merely claims the pinned issuer outranks a genuine one's time refusal.
     const fn stage(self) -> u8 {
         match self {
             Self::TooLarge
@@ -259,13 +224,9 @@ impl std::fmt::Display for PgpError {
 
 impl std::error::Error for PgpError {}
 
-/// Verify `signature` (ASCII-armored or binary) over the exact bytes of `document` under
-/// `key`, at wall-clock `now_unix`.
-///
+/// Verify `signature`.
 /// # Errors
-///
-/// A framing refusal (armor, packet headers, packet count), or — when no signature packet
-/// verifies — the refusal of the one that got furthest.
+/// A framing refusal, or the refusal of the signature packet that got furthest.
 pub fn verify_detached(
     document: &[u8],
     signature: &[u8],
@@ -275,7 +236,6 @@ pub fn verify_detached(
     if signature.len() > MAX_SIGNATURE_LEN {
         return Err(PgpError::TooLarge);
     }
-    // A packet header always has its high bit set; armor is ASCII and never does.
     let packets = match signature.first() {
         Some(b) if b & 0x80 != 0 => Cow::Borrowed(signature),
         _ => Cow::Owned(dearmor(signature)?),
@@ -294,7 +254,6 @@ pub fn verify_detached(
     Err(refusal.unwrap_or(PgpError::NoSignature))
 }
 
-/// A bounds-checked cursor: every read either yields its bytes or `None`, never panics.
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -327,9 +286,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The binary packets inside exactly one armored `PGP SIGNATURE` block. Only blank lines
-/// may surround the block; header lines (`Key: value`) directly after BEGIN are skipped;
-/// the CRC24 line (the last non-blank body line, starting with `=`) is dropped unread.
 fn dearmor(text: &[u8]) -> Result<Vec<u8>, PgpError> {
     let mut lines = text.split(|&b| b == b'\n').map(<[u8]>::trim_ascii_end);
     loop {
@@ -366,8 +322,6 @@ fn dearmor(text: &[u8]) -> Result<Vec<u8>, PgpError> {
     aterm_codec::base64::decode_strict(&body.concat()).map_err(|_| PgpError::Armor)
 }
 
-/// The bodies of the signature packets in `bin`; marker packets are skipped and anything
-/// else refuses the whole input.
 fn signature_packets(bin: &[u8]) -> Result<Vec<&[u8]>, PgpError> {
     let mut r = Reader(bin);
     let mut bodies = Vec::new();
@@ -437,7 +391,6 @@ fn hash_for(id: u8) -> Result<Hash, PgpError> {
     }
 }
 
-/// A v4 RSA signature packet body, split into its fields.
 struct SignaturePacket<'a> {
     hash: Hash,
     /// `body[0..6 + hashed_len]`: version through the hashed subpackets — the hashed part.
@@ -488,7 +441,6 @@ impl<'a> SignaturePacket<'a> {
     }
 }
 
-/// The hashed subpackets this verifier acts on.
 struct Hashed<'a> {
     created: Option<u32>,
     /// The shortest non-zero expiration; zero means "never expires".
@@ -548,9 +500,6 @@ fn subpacket_u32(data: &[u8]) -> Result<u32, PgpError> {
         .map_err(|_| PgpError::BadSubpacket)
 }
 
-/// The MPI left-padded to `modulus_len` bytes. It must be non-empty, carry no bit above
-/// its declared count, and be no longer than the modulus; leading zero bytes and an
-/// overstated count are v4-legal (see the module rules) and accepted.
 fn left_padded(bits: u16, mpi: &[u8], modulus_len: usize) -> Result<Vec<u8>, PgpError> {
     let (&top, _) = mpi.split_first().ok_or(PgpError::BadMpi)?;
     let pad = modulus_len.checked_sub(mpi.len()).ok_or(PgpError::BadMpi)?;
@@ -566,7 +515,6 @@ fn left_padded(bits: u16, mpi: &[u8], modulus_len: usize) -> Result<Vec<u8>, Pgp
     Ok(out)
 }
 
-/// One signature packet against `key`: the checks run cheapest first, the RSA last.
 fn verify_one(
     document: &[u8],
     body: &[u8],
@@ -623,8 +571,7 @@ pub(crate) mod testkit {
 
     use super::*;
 
-    /// A throwaway RSA-4096 key (`openssl genpkey`, PKCS#8 DER) that signs the generated
-    /// vectors; it authorizes nothing.
+    /// A throwaway RSA-4096 key (`openssl genpkey`, PKCS#8 DER) that signs the generated vectors.
     pub(crate) const TEST_KEY_PKCS8: &[u8] =
         include_bytes!("vendor_direct/fixtures/openpgp-test-rsa4096.pk8.der");
 
@@ -705,8 +652,7 @@ pub(crate) mod testkit {
         TEST_KEY.pinned
     }
 
-    /// A binary v4 detached signature over `doc` by the test key: SHA-512, the issuer
-    /// fingerprint and `created` hashed, nothing unhashed.
+    /// A binary v4 detached signature over `doc` by the test key.
     #[must_use]
     pub(crate) fn sign_detached(doc: &[u8], created: u32) -> Vec<u8> {
         let hashed = [issuer(&TEST_KEY.pinned.fingerprint), created_at(created)].concat();
@@ -754,7 +700,6 @@ mod tests {
     const SIG_278: &[u8] =
         include_bytes!("vendor_direct/fixtures/claude-2.1.278-manifest.json.sig");
 
-    /// 2026-09-22T00:00:00Z: a fixed clock after both real signatures.
     const NOW: u64 = 1_790_035_200;
     const SIG_280_CREATED: u32 = 1_790_024_226;
     const SIG_278_CREATED: u32 = 1_789_781_019;
@@ -781,13 +726,10 @@ mod tests {
         subpacket(SUBPACKET_EXPIRATION, &secs.to_be_bytes())
     }
 
-    /// The hashed area a well-formed test signature carries.
     fn good_hashed() -> Vec<u8> {
         [issuer(&test_fingerprint()), created_at(TEST_SIG_CREATED)].concat()
     }
 
-    /// Everything a signer chooses; `trailer_delta` skews the hashed-length trailer the
-    /// signer hashes, to prove the verifier's trailer is exact.
     struct Spec {
         version: u8,
         sig_type: u8,
@@ -832,7 +774,6 @@ mod tests {
         }
     }
 
-    /// The v4 signature packet body `spec` describes, signed over `doc` by the test key.
     fn sign_body(doc: &[u8], spec: &Spec) -> Vec<u8> {
         let mut prefix = vec![spec.version, spec.sig_type, spec.pkalg, spec.hash];
         prefix.extend_from_slice(&u16::try_from(spec.hashed.len()).unwrap().to_be_bytes());
@@ -859,7 +800,6 @@ mod tests {
         body
     }
 
-    /// A new-format packet.
     fn packet(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut out = vec![0xC0 | tag];
         let n = body.len();
@@ -877,7 +817,6 @@ mod tests {
         out
     }
 
-    /// An old-format packet with a two-octet length, as GnuPG writes one.
     fn old_packet(tag: u8, body: &[u8]) -> Vec<u8> {
         let mut out = vec![0x80 | (tag << 2) | 1];
         out.extend(u16::try_from(body.len()).unwrap().to_be_bytes());
@@ -893,7 +832,6 @@ mod tests {
         verify_test(DOC, &signed(DOC, spec)).unwrap_err()
     }
 
-    /// `(end of the hashed area, start of left-16)` inside a v4 signature body.
     fn layout(body: &[u8]) -> (usize, usize) {
         let hashed_end = 6 + usize::from(u16::from_be_bytes([body[4], body[5]]));
         let unhashed_len =
@@ -901,7 +839,6 @@ mod tests {
         (hashed_end, hashed_end + 2 + unhashed_len)
     }
 
-    /// What the verifier hashes for `body` over `doc`.
     fn verifier_message(body: &[u8], doc: &[u8]) -> Vec<u8> {
         let (hashed_end, _) = layout(body);
         [
@@ -913,7 +850,6 @@ mod tests {
         .concat()
     }
 
-    /// `body` with its left-16 recomputed for `doc`, so only the RSA check can refuse it.
     fn with_left16_for(body: &[u8], doc: &[u8]) -> Vec<u8> {
         let (_, left16) = layout(body);
         let (alg, _) = algorithms(body[3]);
@@ -934,14 +870,11 @@ mod tests {
         .concat()
     }
 
-    /// `body` with its MPI (bit count included) replaced by `field`.
     fn with_mpi_field(body: &[u8], field: &[u8]) -> Vec<u8> {
         let (_, left16) = layout(body);
         [&body[..left16 + 2], field].concat()
     }
 
-    /// The real 2.1.280 signature as one binary packet — a signature by a key other than
-    /// the test key.
     fn foreign_packet() -> Vec<u8> {
         dearmor(SIG_280).unwrap()
     }
@@ -1149,8 +1082,6 @@ mod tests {
         assert_eq!(verify_test(DOC, &signed(DOC, &spec)), TEST_OK);
     }
 
-    /// Signs `short-mpi-0`, `short-mpi-1`, … until a signature's leading byte is zero (about
-    /// one document in 220), so its MPI is shorter than the modulus.
     #[test]
     fn a_short_mpi_is_left_padded_to_the_modulus() {
         let modulus_len = TEST_KEY.pinned.n.len();
@@ -1313,7 +1244,6 @@ mod tests {
 
     #[test]
     fn a_v3_signature_is_refused() {
-        // v3: hashed-material length 5, type, creation time, key id, pkalg, hash, left-16, MPI.
         let mut body = vec![3, 5, SIG_TYPE_BINARY];
         body.extend_from_slice(&TEST_SIG_CREATED.to_be_bytes());
         body.extend_from_slice(&test_fingerprint()[12..]);

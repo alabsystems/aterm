@@ -152,13 +152,24 @@ impl std::fmt::Debug for Walk {
     }
 }
 
+/// `path` as a walk names it ([`crate::refuse::canonical`]). Off Unix nothing is walked, so
+/// every path is [`Refusal::Unsupported`] before its spelling is read: a drive-letter path is
+/// absolute, never [`Refusal::Relative`].
+fn walk_path(path: &Path) -> Result<PathBuf, Refusal> {
+    if cfg!(unix) {
+        crate::refuse::canonical(path).ok_or(Refusal::Relative)
+    } else {
+        Err(Refusal::Unsupported)
+    }
+}
+
 impl Walk {
     /// Test `root` with [`refuse`].
     ///
     /// # Errors
     /// The [`Refusal`] the path test, the open or the volume check gave.
     pub fn begin(root: &RootSpec, policy: &Policy) -> Result<Walk, Refusal> {
-        let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
+        let canon = walk_path(&root.path)?;
         if let Some(why) = refuse(
             root.logical.as_deref(),
             &canon,
@@ -638,7 +649,7 @@ pub struct LevelRow {
 /// # Errors
 /// The [`Refusal`] the root earned, other than [`Refusal::TooBroad`].
 pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>, Refusal> {
-    let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
+    let canon = walk_path(&root.path)?;
     match refuse(
         root.logical.as_deref(),
         &canon,
@@ -663,7 +674,7 @@ pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>,
 /// # Errors
 /// The [`Refusal`] the path earned.
 pub fn entry_count_of(path: &Path, policy: &Policy) -> Result<u32, Refusal> {
-    let canon = crate::refuse::canonical(path).ok_or(Refusal::Relative)?;
+    let canon = walk_path(path)?;
     if let Some(why) = refuse(None, &canon, &policy.mounts, &policy.deny) {
         return Err(why);
     }

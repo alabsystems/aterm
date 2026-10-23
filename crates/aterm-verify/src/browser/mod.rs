@@ -5,7 +5,7 @@
 //!
 //! The modules are `verify wasm-smoke`'s dev build ([`crate::wasm_smoke::
 //! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
-//! by `verify glue`. [`page`] runs the wasm lanes' drivers in the same
+//! by `verify glue`. [`mod@page`] runs the wasm lanes' drivers in the same
 //! Chromium.
 pub(crate) mod cdp;
 pub(crate) mod chromium;
@@ -31,15 +31,14 @@ use crate::{Ctx, EnvSnapshot, exit};
 const LABEL: &str =
     "browser (both web modules in headless browsers: a WebGL2 boot, GPU vs CPU pixels)";
 
-/// cpu_gpu_parity.rs's grid.
+/// `cpu_gpu_parity.rs`'s grid.
 const ROWS: u16 = 6;
 const COLS: u16 = 12;
-/// cpu_gpu_parity.rs's font size.
+/// `cpu_gpu_parity.rs`'s font size.
 const PX: f32 = 18.0;
-/// cpu_gpu_parity.rs's web theme: fg, bg, cursor, selection (`0x00RRGGBB`).
+/// `cpu_gpu_parity.rs`'s web theme: fg, bg, cursor, selection (`0x00RRGGBB`).
 const THEME: [u32; 4] = [0x00E0_E0E0, 0x001E_1E2E, 0x00FF_FFFF, 0x0030_4060];
-/// cpu_gpu_parity.rs's content, one line per frame: every frame shows the
-/// red glyph, and each adds a line the one before it lacks.
+/// `cpu_gpu_parity.rs`'s content, one line per frame.
 const FRAMES: [&str; 4] = [
     "\x1b[31mRR\x1b[0m\r\n",
     "\x1b[44m  \x1b[0m\r\n",
@@ -47,14 +46,10 @@ const FRAMES: [&str; 4] = [
     "ab\r\n",
 ];
 
-/// The recorded-frame differential's grid (`recorded`): wider than the
-/// parity grid, so a line holds a run of each attribute.
+/// Recorded-frame differential grid dimensions.
 const DIFF_ROWS: u16 = 8;
 const DIFF_COLS: u16 = 40;
-/// Its content, one line per frame: weights and styles, every underline
-/// shape and the other decorations, indexed and true colours, box drawing,
-/// blocks and braille (drawn as sprites), a hyperlink, a sixel image (the
-/// image plane), then a cursor shape change.
+/// Recorded-frame differential content, one line per frame.
 const DIFF_FRAMES: [&str; 7] = [
     "\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[2mdim\x1b[0m \x1b[7mreverse\x1b[0m \x1b[1;3mbi\x1b[0m\r\n",
     "\x1b[4mund\x1b[0m \x1b[4:2mdbl\x1b[0m \x1b[4:3mcurl\x1b[0m \x1b[4:4mdot\x1b[0m \x1b[9mstrike\x1b[0m \x1b[53mover\x1b[0m\r\n",
@@ -86,8 +81,7 @@ fn spec() -> Value {
     })
 }
 
-/// The GPU page's frames by recording name: `parity-<k>` (the parity
-/// grid's), then `diff-<k>`.
+/// GPU page frames keyed by recording name (`parity-<k>`, then `diff-<k>`).
 fn named_gpu_frames(gpu: &judge::Answer) -> Vec<(String, &judge::Frame)> {
     let named = |seq: &str, frames: &'_ [judge::Frame]| -> Vec<(String, usize)> {
         (0..frames.len())
@@ -116,11 +110,9 @@ enum Stop {
 /// One page's answer and what it cost.
 struct Page {
     answer: judge::Answer,
-    /// From the navigation to the load event, where the lane drives the page
-    /// over the DevTools protocol.
+    /// Time from navigation to the load event over DevTools.
     load_ms: Option<f64>,
-    /// The lane's wait for the answer: the evaluation, or for a page that
-    /// posts its answer, the time since the page before it answered.
+    /// Wait time for the page's evaluation or posted answer.
     evaluate_ms: f64,
 }
 
@@ -170,9 +162,7 @@ impl Engine {
         }
     }
 
-    /// Why a GPU answer was not drawn by this engine, if it was not: a
-    /// Chromium that fell back to another backend, or a Firefox or WebKit
-    /// executable that is another browser.
+    /// Why `gpu` was not drawn by this engine, if it fell back or mismatched.
     fn not_drawn(&self, gpu: &judge::Answer) -> Option<String> {
         match self {
             Engine::Chromium(_, angle) => (!angle.drew(&gpu.adapter)).then(|| {
@@ -212,14 +202,11 @@ impl Engine {
 /// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes it.
 pub(crate) const ENGINES: [&str; 4] = ["metal", "swiftshader", "firefox", "webkit"];
 
-/// The WebKit session's part in a run. Its headless pages keep windows of
-/// their own ([`webkit`]), so it runs only where the caller lets it open
-/// them.
+/// WebKit session participation in a run.
 enum WebKitRow {
     /// Run it on the WebKit found; without one it is NOT RUN.
     Run(Result<webkit::WebKit, String>),
-    /// `--no-windows`: a named skip, naming first the fix for a missing
-    /// WebKit (`Some`).
+    /// Named skip under `--no-windows`, optionally carrying the missing-WebKit fix.
     Skip(Option<&'static str>),
     /// Not asked for (`browser-drive` without `--engine webkit`): no row.
     Off,
@@ -260,9 +247,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     sessions(r, &built, &chromium, &firefox, webkit, &[]);
 }
 
-/// Build both modules (`wasm-smoke`'s dev build) and lay the site in `site`
-/// ([`assemble`]): what that cost, counted from `t0`, or `None` with the row
-/// that says why in `r`.
+/// Build both wasm modules and assemble the site in `site`.
 fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cost> {
     let rustup = match crate::perf::wasm::build_tools(false) {
         Ok(rustup) => rustup,
@@ -293,9 +278,7 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
     })
 }
 
-/// Boot the pages in each browser session `wanted` names ([`ENGINES`];
-/// empty is every session this host runs): Chromium on each of its ANGLE
-/// backends, then Firefox, then WebKit as `webkit` says.
+/// Boot the pages in each requested browser session ([`ENGINES`]).
 fn sessions(
     r: &mut Report,
     built: &Built,
@@ -386,9 +369,7 @@ struct Cost {
     bind_ms: f64,
 }
 
-/// What every session shares: the served site, the lane's directory, what
-/// building and binding cost (`None` for a site `browser-site` laid), the
-/// scratch the browsers' profiles go in, and the ceiling on one session.
+/// Shared state across browser sessions in a run.
 struct Built {
     site: PathBuf,
     work: PathBuf,
@@ -397,8 +378,7 @@ struct Built {
     ceiling: Option<Duration>,
 }
 
-/// The pages, spec, font and module glue directories a laid site holds
-/// ([`assemble`]).
+/// Files and directories laid by [`assemble`].
 const SITE_FILES: [&str; 9] = [
     "cpu.html",
     "gpu.html",
@@ -411,14 +391,12 @@ const SITE_FILES: [&str; 9] = [
     "gpu",
 ];
 
-/// The entry of [`SITE_FILES`] `site` lacks, if it lacks one: a directory
-/// `browser-site` never laid.
+/// First entry of [`SITE_FILES`] missing from `site`, if any.
 fn site_lacks(site: &Path) -> Option<&'static str> {
     SITE_FILES.into_iter().find(|f| !site.join(f).exists())
 }
 
-/// A verb's report, printed, and its exit status: 1 when a row failed, else
-/// 3 when a row could not run or none ran, else 0.
+/// Render `r` and return its exit status (`0`, `1`, or `3`).
 fn finish(r: &Report) -> i32 {
     print!("{}", r.render());
     let t = crate::ladder::tally(std::slice::from_ref(r));
@@ -431,9 +409,7 @@ fn finish(r: &Report) -> i32 {
     }
 }
 
-/// `verify browser-site DIR`.
-/// rustup stable: a STOCK EXCEPTION) and bound, and the lane's site laid in
-/// DIR: the pages, the spec, the font and each module's glue.
+/// Entry point for `verify browser-site DIR`.
 pub fn site_main(args: &[String], cwd: &Path) -> i32 {
     let [dir] = args else {
         eprintln!("verify browser-site: takes one argument, the directory to lay the site in");
@@ -542,9 +518,7 @@ pub fn drive_main(args: &[String]) -> i32 {
     finish(&r)
 }
 
-/// One session: the pages booted in `engine`'s browser, judged, their frames
-/// and timings written to `<work>/<session>/`, and its two rows (the pages',
-/// then the worker's).
+/// Run and judge one browser session and record its rows in `r`.
 fn session(
     r: &mut Report,
     built: &Built,
@@ -680,9 +654,7 @@ fn session(
     Some(session)
 }
 
-/// One GPU run of `session` (the gpu page's, or its worker's) judged: against
-/// the session's CPU frames, its frames written to `frames_dir`, then held
-/// to the wgpu-WebGL `recording`.
+/// Judge one GPU run against CPU frames and the wgpu-WebGL `recording`.
 fn held(
     r: &mut Report,
     say: &dyn Fn(String) -> String,
@@ -732,8 +704,7 @@ fn page_timings(p: &Page) -> Value {
     })
 }
 
-/// The page timings that time a step of their own (a number, or one per
-/// frame): what a page's total less them spent on nothing it timed.
+/// Step keys summed to compute untimed page overhead.
 const TIMED: [&str; 15] = [
     "font_fetch_ms",
     "module_init_ms",
@@ -760,8 +731,7 @@ fn timed(t: &Value, key: &str) -> Option<f64> {
     }
 }
 
-/// The frame a per-frame timing's entry `k` is: `parity-<k>`, then
-/// `diff-<k>`.
+/// Recording frame name (`parity-<k>` or `diff-<k>`) for frame index `k`.
 fn frame_name(k: usize) -> String {
     match k.checked_sub(FRAMES.len()) {
         None => format!("parity-{k}"),
@@ -769,10 +739,7 @@ fn frame_name(k: usize) -> String {
     }
 }
 
-/// The readbacks' cost: each presented frame's gl.finish(), its copy onto a
-/// 2D canvas, its getImageData (where the copy's read of the GPU's frame is
-/// waited for; Chromium's finish() does not wait) and its base64, summed
-/// apart, with the frame each of the first and third took longest on.
+/// Format per-step readback timings (`finish`, `copy`, `getImageData`, `base64`).
 fn readback_split(t: &Value) -> Option<String> {
     let most = |key: &str| -> Option<String> {
         let each: Vec<f64> = t
@@ -806,8 +773,7 @@ fn readback_split(t: &Value) -> Option<String> {
     ))
 }
 
-/// One page's timings on one line: what the page measured, in its order,
-/// and what of its total it timed no step of.
+/// Format a single-line timing summary for page `p`.
 fn timing_line(who: &str, p: &Page) -> String {
     let t = &p.answer.timings;
     let num = |k: &str| t.get(k).and_then(Value::as_f64);
@@ -855,9 +821,7 @@ fn timing_line(who: &str, p: &Page) -> String {
     format!("{who}: {}", parts.join(", "))
 }
 
-/// The site directory: the pages, the lane's spec (for a page that fetches
-/// it), the bundled font, the CPU module's glue in `cpu/` and the GPU
-/// module's in `gpu/`.
+/// Assemble the browser test site and wasm glue in `site`.
 fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(site);
     std::fs::create_dir_all(site)
@@ -890,8 +854,7 @@ fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The browser, killed (by its pid) and reaped on drop if it is still
-/// running.
+/// Running browser process killed and reaped on drop.
 struct Running(LaneChild);
 
 impl Running {
@@ -933,8 +896,7 @@ fn log_stdio(log: &Path) -> Result<(ChildStdio, ChildStdio), Stop> {
     ))
 }
 
-/// Launch Chromium on `angle`, serve `site`, boot the three pages over the
-/// DevTools protocol and close the browser.
+/// Launch Chromium on `angle` and drive the three pages over DevTools.
 fn drive_chromium(
     browser: &chromium::Browser,
     site: &Path,
@@ -1000,8 +962,7 @@ fn drive_chromium(
     })
 }
 
-/// Launch Firefox on a fresh profile, under a scratch home, at the cpu page
-/// ([`drive_by_posts`]).
+/// Launch Firefox on a fresh profile and drive the pages via HTTP POST.
 fn drive_firefox(
     firefox: &firefox::Firefox,
     site: &Path,
@@ -1026,8 +987,7 @@ fn drive_firefox(
     Ok(pages.session(product))
 }
 
-/// Launch WebKit on a fresh profile, under a scratch home, with its
-/// frameworks, at the cpu page ([`drive_by_posts`]).
+/// Launch WebKit on a fresh profile and drive the pages via HTTP POST.
 fn drive_webkit(
     webkit: &webkit::WebKit,
     site: &Path,
@@ -1069,11 +1029,7 @@ impl PostedPages {
     }
 }
 
-/// Serve `site`, launch `browser` (`what` in a refusal) with the arguments
-/// and environment `launch` gives for the cpu page's URL
-/// (`?post=1&next=gpu,worker`) and its scratch `home`: the cpu page runs its
-/// lane, POSTs its answer and opens the gpu page, which opens the worker
-/// page.
+/// Serve `site`, launch `browser`, and collect the three posted page answers.
 fn drive_by_posts(
     what: &str,
     browser: &Path,
@@ -1130,10 +1086,7 @@ fn drive_by_posts(
     })
 }
 
-/// A posted-pages browser's scratch home, removed
-/// ([`firefox::remove_home`]) when dropped: made before the browser's
-/// [`Running`], it outlives the browser on every path out of
-/// [`drive_firefox`] and [`drive_webkit`].
+/// Scratch home directory removed ([`firefox::remove_home`]) on drop.
 struct ScratchHome(PathBuf);
 
 impl Drop for ScratchHome {
@@ -1142,8 +1095,7 @@ impl Drop for ScratchHome {
     }
 }
 
-/// A posted answer: `{ answer }`, parsed, or the page's `{ error }` as a
-/// finding.
+/// Parse a posted page answer or error payload.
 fn posted(kind: &str, body: &[u8]) -> Result<judge::Answer, Stop> {
     let fail = |what: String| Stop::Fail(format!("the {kind} page: {what}"));
     let v: Value =
@@ -1157,8 +1109,7 @@ fn posted(kind: &str, body: &[u8]) -> Result<judge::Answer, Stop> {
     judge::parse(answer).map_err(fail)
 }
 
-/// Open `<origin>/<kind>.html` in a fresh tab, wait for its load, run its
-/// lane and close the tab: the parsed answer.
+/// Open `<origin>/<kind>.html` in a fresh DevTools target, run its lane, and close the tab.
 fn page(cdp: &mut cdp::Cdp, origin: &str, kind: &str) -> Result<Page, Stop> {
     let fail = |what: String| Stop::Fail(format!("the {kind} page: {what}"));
     let target = cdp
@@ -1313,8 +1264,7 @@ pub(crate) fn pin_for(
 mod tests {
     use super::*;
 
-    /// The readback split sums each step apart and names the frame whose
-    /// read took longest, and the total counts what no step timed.
+    /// `readback_split` sums each step and `timing_line` reports untimed overhead.
     #[test]
     fn a_page_s_timings_split_its_readbacks_from_its_frames() {
         let t = json!({
@@ -1360,9 +1310,7 @@ mod tests {
         assert!(readback_split(&json!({})).is_none());
     }
 
-    /// A site is what `browser-site` lays, every entry of it; `browser-drive`
-    /// refuses a directory that lacks one, and its arguments, before any
-    /// browser starts.
+    /// `site_lacks` and `drive_main` reject incomplete sites and invalid CLI arguments.
     #[test]
     fn a_drive_needs_a_laid_site_and_named_sessions() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");

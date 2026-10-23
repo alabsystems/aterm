@@ -165,7 +165,6 @@ pub(crate) struct FreedTally {
 }
 
 impl FreedTally {
-    /// Nothing freed yet.
     const fn new() -> Self {
         Self {
             day: 0,
@@ -236,8 +235,6 @@ pub(crate) struct DiskFactsRaw {
     pub(crate) watch: bool,
 }
 
-/// A volume's name for a person: its mount point's last component
-/// ("Backup"), or the whole mount point where it has none ("/").
 fn volume_name(mount: &Path) -> String {
     mount.file_name().map_or_else(
         || mount.display().to_string(),
@@ -447,7 +444,8 @@ impl Board {
         self.demands.retain(|d| d.id != id);
     }
 
-    /// Return the maximum demanded bytes on `key` and the working directories of demanding sessions.
+    /// Return the maximum demanded bytes on `key` and the working directories of demanding
+    /// sessions.
     pub(crate) fn adopt(&self, key: &VolumeKey) -> Option<(u64, Vec<PathBuf>)> {
         let mine: Vec<&Demand> = self.demands.iter().filter(|d| &d.key == key).collect();
         let need = mine.iter().map(|d| d.need).max()?;
@@ -603,9 +601,7 @@ mod tests {
         }
     }
 
-    /// `status` reads `-` on an empty board, the session's mapped row once a
-    /// look resolved its working directory, and — for a session not mapped
-    /// yet — the row its spelling's mount names in the last table.
+    /// `status` reads `-` on an empty board.
     #[cfg(unix)]
     #[test]
     fn status_reads_the_row_of_the_sessions_volume_or_dashes() {
@@ -641,11 +637,8 @@ mod tests {
         assert!(b.row_of(9, Some("relative")).is_none());
     }
 
-    /// WINDOWS: a session's working directory in any spelling a Windows tab
-    /// reports — plain, verbatim (`\\?\`), another case, a trailing
-    /// separator, forward slashes, the drive path an MSYS `/c/…` report is
-    /// rewritten to — reads the row of the volume the table places it on,
-    /// so `status disk=` fills for a Windows tab.
+    /// WINDOWS: a session's working directory in any spelling a Windows tab reports reads the row
+    /// of the volume the table places it on.
     #[cfg(windows)]
     #[test]
     fn a_windows_spelling_reads_the_row_of_its_volume() {
@@ -697,9 +690,6 @@ mod tests {
         }
     }
 
-    /// A demand is registered, adopted as the largest need on its volume with
-    /// every demanding session's directory, and dropped by its id; a wait's
-    /// own reading replaces its volume's row.
     #[test]
     fn demands_are_adopted_by_their_volumes_largest_need() {
         let mut b = Board::new();
@@ -723,9 +713,7 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
-    /// A UTC midnight (2026-09-22T00:00:00Z).
     const UTC_MIDNIGHT: i64 = 20_718 * 86_400;
-    /// Two hours east of UTC: local midnight comes two hours before UTC's.
     const EAST_2H: i64 = 7_200;
 
     fn clock(unix: i64) -> Clock {
@@ -736,10 +724,6 @@ mod tests {
         }
     }
 
-    /// The tally adds every removal of the local day, names what the last
-    /// one was, ignores a removal that released nothing, and starts again
-    /// at LOCAL midnight: read after it, it is gone before any removal; the
-    /// next removal counts alone.
     #[test]
     fn freed_tally_counts_the_local_day_and_starts_again_at_its_midnight() {
         let local_midnight = UTC_MIDNIGHT - EAST_2H;
@@ -835,12 +819,6 @@ mod tests {
         }
     }
 
-    /// With the watch on, the deck reads the home volume's level and lines
-    /// (no floor where no pass removes, a private state root's volume, nor
-    /// with the automatic pass off), the inode emergency as its own flag,
-    /// the stuck sessions, every other measured volume by name, a stall
-    /// only once the beat is two look periods old (dated at the beat),
-    /// today's tally and the last home pass's hogs with its time.
     #[test]
     fn deck_facts_with_the_watch_on() {
         let home = VolumeKey::Container("disk3".to_owned());
@@ -951,10 +929,6 @@ mod tests {
         assert_eq!(b.deck_facts(&home, &now), DiskFactsRaw::default());
     }
 
-    /// With the harness off (the host's tick says no watch runs) the deck
-    /// reads no board facts, even from a board that holds a level, a stuck
-    /// session and a tally: it is empty with `watch` false, and the shelf
-    /// says it is not watched.
     #[test]
     fn with_the_harness_off_the_deck_reads_no_board_facts() {
         let home = VolumeKey::Container("disk3".to_owned());
@@ -987,12 +961,6 @@ mod tests {
         assert_eq!((off.stuck, off.freed_today), (0, None));
     }
 
-    /// THE WATCH'S JUDGEMENT STAYS (live5 F1): a wait's own reading of a
-    /// volume the watch measured — one built with no row to start from, as a
-    /// wait whose 8.3 `vol=` the board could not place builds it: the
-    /// owner's plain lines, no room, nothing removed there — replaces the
-    /// row's reading and keeps the watch's room, its raised lines and
-    /// `reclaimed_here`, the level read again on those lines.
     #[test]
     fn a_waits_own_reading_keeps_the_watchs_judgement_of_its_volume() {
         let key = VolumeKey::Container("disk3".to_owned());
@@ -1043,11 +1011,6 @@ mod tests {
         );
     }
 
-    /// A board holding one volume's row, its table placing `placed` on it,
-    /// and an 8.3 spelling `short` of that place the table cannot place as
-    /// written: a Windows drive (`C:\PROGRA~1\x`), or on unix a macOS
-    /// spelling outside every mount (no short names exist there; the rule
-    /// is pure).
     fn one_volume_board() -> (Board, &'static str, &'static str) {
         let mut b = Board::new();
         #[cfg(windows)]
@@ -1091,12 +1054,6 @@ mod tests {
         (b, placed, short)
     }
 
-    /// AN 8.3 TAB SPELLED LONG READS ITS VOLUME'S ROW (live5 F2): before any
-    /// look maps it and where no watch runs, a session whose reported
-    /// spelling was spelled long ([`Board::spell`]) reads the row its long
-    /// spelling places on — after the rows are replaced too (the first
-    /// reading publishes them whole), with no index to go stale — and only
-    /// while it still reports that spelling.
     #[test]
     fn a_session_spelled_long_reads_its_volumes_row_while_it_reports_it() {
         let (mut b, placed, short) = one_volume_board();

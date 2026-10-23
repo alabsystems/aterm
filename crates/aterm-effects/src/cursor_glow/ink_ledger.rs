@@ -77,9 +77,7 @@ impl InkLedger {
     pub(super) const STEADY_FLOOR: f32 = 6.0;
     /// Number of horizontal bands tracked per text cell.
     pub(super) const BANDS: usize = 4;
-    /// The text cells [`Self::admit_quads`]' scratch is sized for up front.
     const QUAD_CELLS: usize = 32;
-    /// The pieces [`Self::admit_masked`]'s scratch is sized for up front.
     const MASK_PIECES: usize = 4096;
     /// Contrast floor for the cursor head light over a dark streak bed.
     pub(crate) const HEAD_FLOOR: f32 = 3.6;
@@ -95,7 +93,6 @@ impl InkLedger {
     pub(super) const FEATHER_X: f32 = 0.45;
     /// Vertical feather height for masked lights as a fraction of cell height.
     pub(super) const FEATHER_Y: f32 = 0.35;
-    /// See [`Self::FEATHER_X`].
     const FEATHER_STEP: i32 = 2;
 
     /// The account index of band 0 of text cell `(row, col)`, or `None` for a
@@ -131,6 +128,12 @@ impl InkLedger {
             Some(at) => Some(at / Self::BANDS),
             None => None,
         }
+    }
+
+    /// Whether this frame keeps the over-ink contrast account.
+    #[inline]
+    pub(super) const fn is_on(&self) -> bool {
+        self.on
     }
 
     /// Close the ledger for the frame so an inactive ledger admits all lights.
@@ -226,8 +229,6 @@ impl InkLedger {
         ink.max(ground) + 0.05 >= floor * (ink.min(ground) + 0.05)
     }
 
-    /// The largest share `0..=1` of `add` account `at` can still take while
-    /// the account's ink keeps `floor` over what lies under that cell.
     fn room(&self, at: usize, add: [f32; 3], floor: f32) -> f32 {
         if add == [0.0; 3] {
             return 1.0;
@@ -385,12 +386,6 @@ impl InkLedger {
         share
     }
 
-    /// The light `quads` (its additive quads; source-over ones pass
-    /// uncharged) lays on each band of each text cell it reaches, summed as
-    /// the renderer adds it (a gradient quad at each column's own value):
-    /// fills `reached` (indices into `under`) and `peaks` (each band's
-    /// brightest pixel per channel, [`Self::BANDS`] a cell), and says whether
-    /// it reaches any.
     fn quad_peaks(&mut self, quads: &[GlowQuad]) -> bool {
         let (ox, oy, cw, ch) = self.grid;
         let (cwi, chi) = (cw as i32, ch as i32);
@@ -625,10 +620,6 @@ impl InkLedger {
         })
     }
 
-    /// Fill `knots_x`/`knots_y` with the slice edges of the box
-    /// `[x0, x1) × [y0, y1)` against the dimmed cells: its own edges, each
-    /// dimmed cell's edges, and the feather's slices off them, inside the
-    /// box.
     fn knots(&mut self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
@@ -674,11 +665,6 @@ impl InkLedger {
         meets
     }
 
-    /// One quad of a masked light, cut into the pieces [`Self::mask_at`]
-    /// asks for, into `out`: a source-over quad, or one no dimmed cell's
-    /// feather reaches, whole; otherwise each slice a gradient piece whose
-    /// ends carry the quad's own colour there times the mask there (the
-    /// column law makes a piece's ends meet its neighbours').
     fn mask_quad(&mut self, q: GlowQuad, out: &mut Vec<GlowQuad>) {
         let (x0, y0) = (i32::from(q.x), i32::from(q.y));
         let (x1, y1) = (x0 + i32::from(q.w), y0 + i32::from(q.h));
@@ -789,10 +775,6 @@ impl InkLedger {
         self.halo_pieces = pieces;
     }
 
-    /// One radial halo's account, cell by cell ([`Self::admit_halos_masked`]):
-    /// each text cell it reaches is charged the share of the halo its bands
-    /// can take down to `floor` at the halo's falloff there, and a cell that
-    /// keeps less than the whole halo joins `dims`.
     fn halo_dims(&mut self, (cx, cy): (f32, f32), (rx, ry): (f32, f32), premul: u32, floor: f32) {
         if rx <= 0.0 || ry <= 0.0 {
             return;
@@ -1057,7 +1039,7 @@ impl CursorGlow {
         self.ink_ledger.print
     }
 
-    /// Admit `quads[range]` at `tier` into this frame's over-ink ledger and return whether the cut fingerprint changed.
+    /// Admit `quads[range]` at `tier` into this frame's over-ink ledger.
     #[inline]
     pub fn admit_over_ink(
         &mut self,
@@ -1075,21 +1057,7 @@ impl CursorGlow {
         self.ink_ledger.admit_masked(quads, range, floor)
     }
 
-    /// Keep a caret light that spreads round the caret (the typing glow on
-    /// a dark page) off the ink of the rows above and below the caret's:
-    /// toward a cell of another row that holds a letter or a ground other
-    /// than the page `page` (a prompt's bar, a selection), each additive
-    /// quad of `quads[range]` eases down from its whole strength
-    /// [`Self::NEIGHBOUR_EASE_IN`] of a row inside the caret row's edge to
-    /// nothing [`Self::NEIGHBOUR_HOLD_Y`] of a row past it, one smooth
-    /// falloff across the edge (a hold that began at the edge stood the
-    /// glow's full strength against a cut there, a grey box with hard
-    /// horizontal edges), and recovers its whole strength over
-    /// [`Self::NEIGHBOUR_HOLD_X`] of a cell off the inked cells; over air it
-    /// is whole. So the glow lights the caret's own line and the page round
-    /// it, never a band of fog over the prompt's bar or the line above. A
-    /// row the frame did not hand over is air, as the glow always drew it.
-    /// Returns a print of what it cut.
+    /// Attenuate additive caret quads near inked neighbour rows and return the cut print.
     pub fn hold_off_neighbour_ink(
         &self,
         quads: &mut [GlowQuad],
@@ -1097,6 +1065,9 @@ impl CursorGlow {
         geom: Geom,
         page: u32,
     ) -> u64 {
+        if quads.is_empty() {
+            return 0;
+        }
         let Some((cr, _)) = caret else {
             return 0;
         };
@@ -1126,9 +1097,6 @@ impl CursorGlow {
         let mut print = 0u64;
         for q in quads.iter_mut().filter(|q| q.alpha == 0 && q.h > 0) {
             let ym = f32::from(q.y) + 0.5 * f32::from(q.h);
-            // The nearer edge of the caret row and how far inside it the
-            // quad stands (negative past it), and the row across that edge
-            // (the quad's own, once past it).
             let (inside, across) = if ym < 0.5 * (top + bot) {
                 (ym - top, cr - 1)
             } else {

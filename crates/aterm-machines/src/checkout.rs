@@ -59,7 +59,7 @@ pub(crate) fn unreachable(stderr: &[u8]) -> bool {
 pub(crate) struct Unread {
     /// What could not be done.
     pub(crate) why: String,
-    /// Origin's host could not be reached ([`unreachable`]).
+    /// Origin's host could not be reached ([`fn@unreachable`]).
     pub(crate) offline: bool,
 }
 
@@ -206,6 +206,24 @@ impl Stands {
     /// Whether an [`align`] would fetch.
     pub(crate) const fn moves(&self) -> bool {
         matches!(self, Self::Behind { .. } | Self::Unfetched { .. })
+    }
+
+    /// The probe this stand reads as when it was judged against origin as last fetched
+    /// ([`read_fetched`]): [`Self::probe`], saying so.
+    pub(crate) fn probe_as_fetched(&self) -> Probe {
+        match self {
+            Self::Current { branch, head } => Probe::Ok {
+                now: format!(
+                    "up to date with origin/{branch} at {}, as last fetched",
+                    short(head)
+                ),
+            },
+            Self::Behind { branch, tip, by } => Probe::Change {
+                from: format!("{} behind origin/{branch}, as last fetched", commits(*by)),
+                to: format!("fast-forwarded to origin/{branch} at {}", short(tip)),
+            },
+            Self::Unfetched { .. } | Self::Kept(_) => self.probe(),
+        }
     }
 }
 
@@ -387,6 +405,90 @@ fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, St
     }
 }
 
+/// Why [`read_fetched`] did not judge the checkout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NotFetched {
+    /// The checkout could not be read.
+    Unread(Unread),
+    /// It holds no record, as last fetched, of origin's default branch or of the tip that
+    /// branch names, so whether it is behind cannot be read without the network. `act` is the
+    /// git subcommand, run in the checkout, that records it (it asks origin): `aterm init
+    /// --develop` would not, since its probe of a checkout that is current fetches nothing.
+    Unrecorded {
+        /// What is missing.
+        why: String,
+        /// `remote set-head origin --auto` or `fetch origin`.
+        act: &'static str,
+    },
+}
+
+impl From<String> for NotFetched {
+    fn from(why: String) -> Self {
+        Self::Unread(why.into())
+    }
+}
+
+/// Origin's default branch and its tip as this checkout last fetched them
+/// (`refs/remotes/origin/HEAD`, which a clone writes, and the branch it names): no network read.
+fn fetched_head(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+) -> Result<(String, String), NotFetched> {
+    let symbolic = run(
+        sys,
+        &git(user, Some(path)).args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+        "symbolic-ref",
+    )?;
+    let default = match symbolic.status {
+        Some(0) => match stdout(&symbolic).strip_prefix("refs/remotes/origin/") {
+            Some(branch) if !branch.is_empty() => branch.to_owned(),
+            _ => {
+                return Err(NotFetched::from(
+                    "refs/remotes/origin/HEAD names no branch of origin's".to_owned(),
+                ));
+            }
+        },
+        Some(1) => {
+            return Err(NotFetched::Unrecorded {
+                why: "this checkout records no default branch of origin's \
+                      (refs/remotes/origin/HEAD), so whether it is behind cannot be read \
+                      without the network"
+                    .to_owned(),
+                act: "remote set-head origin --auto",
+            });
+        }
+        _ => {
+            return Err(NotFetched::from(
+                "cannot read the checkout's refs/remotes/origin/HEAD".to_owned(),
+            ));
+        }
+    };
+    let tip = run(
+        sys,
+        &git(user, Some(path)).args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{default}^{{commit}}"),
+        ]),
+        "rev-parse",
+    )?;
+    match tip.status {
+        Some(0) if oid(&stdout(&tip)) => Ok((default, stdout(&tip))),
+        Some(1) => Err(NotFetched::Unrecorded {
+            why: format!(
+                "refs/remotes/origin/HEAD names origin/{default}, which this checkout does not \
+                 hold, so whether it is behind cannot be read without the network"
+            ),
+            act: "fetch origin",
+        }),
+        _ => Err(NotFetched::from(format!(
+            "cannot read origin/{default} in the checkout"
+        ))),
+    }
+}
+
 fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -553,6 +655,27 @@ pub(crate) fn read(
         Err(Stop::Kept(why)) => Ok(Stands::Kept(why)),
         Err(Stop::Failed(unread)) => Err(unread),
     }
+}
+
+/// Where the checkout at `path` stands against `origin` as it last fetched it, with no network
+/// read at all (`aterm doctor`'s, design §5, S9): [`read`]'s judgement over
+/// `refs/remotes/origin/HEAD` and the branch it names, in place of `ls-remote`.
+/// # Errors
+/// The checkout could not be read, or it records no default branch of origin's or not its tip
+/// ([`NotFetched`]); the line names which, never a URL.
+pub(crate) fn read_fetched(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+) -> Result<Stands, NotFetched> {
+    let local = match local(sys, user, path, origin) {
+        Ok(local) => local,
+        Err(Stop::Kept(why)) => return Ok(Stands::Kept(why)),
+        Err(Stop::Failed(unread)) => return Err(NotFetched::Unread(unread)),
+    };
+    let (default, tip) = fetched_head(sys, user, path)?;
+    Ok(judge(sys, user, path, &local, &default, &tip, true)?)
 }
 
 /// Bring the checkout at `path` to origin's default branch when [`read`] says it moves: `git fetch

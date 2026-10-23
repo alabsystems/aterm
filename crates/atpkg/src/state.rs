@@ -213,7 +213,10 @@ pub fn agent_shadowed_in_shell(
     s
 }
 
-/// `managed <build> — routed at exec time by <stub>: inside aterm it runs the managed copy ahead of <foreign>, which this shell's PATH puts first — a shell that ran `<name>` before the stub was laid keeps the path it cached until `rehash` (zsh) / `hash -r` (bash), once (aterm help reroute)`.
+/// ``managed <build> — routed at exec time by <stub>: inside aterm it runs the managed copy
+/// ahead of <foreign>, which this shell's PATH puts first — a shell that ran `<name>` before
+/// the stub was laid keeps the path it cached until `rehash` (zsh) / `hash -r` (bash), once
+/// (aterm help reroute)``.
 #[must_use]
 pub fn agent_routed_in_shell(build: u64, stub: &Path, foreign: &Path) -> String {
     let name = stub

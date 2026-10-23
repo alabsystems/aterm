@@ -1969,7 +1969,8 @@ pub(crate) enum Parent {
 impl Parent {
     /// The judgment for a process whose parent reads `ppid`, born at `birth`, with `lineage` read
     /// of the same pid and launchd's pid version `launchd`: a lineage proves something only when
-    /// it is of the same birth and still names launchd as the parent.
+    /// it is of the same birth, still names launchd as the parent, and keeps its launcher's pid
+    /// version (Linux keeps none, so the parent's own birth is never read here).
     pub(crate) fn of(
         ppid: Option<u32>,
         lineage: Option<&aterm_uds::process::Lineage>,
@@ -1982,11 +1983,14 @@ impl Parent {
         let Some(lineage) = lineage else {
             return Self::Unjudged;
         };
-        if Some(lineage.identity.birth) != birth || lineage.parent != 1 {
+        if Some(lineage.identity.birth) != birth.map(aterm_uds::process::Birth::from)
+            || lineage.parent != 1
+            || lineage.launcher_version.is_none()
+        {
             Self::Unjudged
         } else if lineage.launchd_started(launchd) {
             Self::Launchd
-        } else if lineage.orphaned(launchd) {
+        } else if lineage.orphaned(launchd, 0, || None) {
             Self::Adopted
         } else {
             Self::Unjudged

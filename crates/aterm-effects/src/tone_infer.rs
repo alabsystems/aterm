@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tone-of-typing tracker caching the [`Tone`] stamped onto trail sound events.
+//! Tone-of-typing tracker caching the [`Tone`](crate::tone::Tone) stamped onto trail sound events.
 
 use aterm_time::Instant;
 use std::time::Duration;

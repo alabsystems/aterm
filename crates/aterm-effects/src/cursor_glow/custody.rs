@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typed input custody: stamps, press-credit ledger, insert seam, and `note_*` host input
-//! entry points.
+//! Typed input custody: stamps, press-credit ledger, insert seam, and `note_*` host input entry points.
 
 use super::*;
 
@@ -35,7 +34,7 @@ pub(super) struct RecentTypedRun {
     pub(super) len: u16,
     pub(super) glyphs: [char; RECENT_TYPED_RUN_CAP],
     pub(super) at: Instant,
-    /// The walk the run was laid on (`RAINBOW-KITTY-V2.md` , ).
+    /// The walk the run was laid on.
     pub(super) origin: Option<rk::ribbon::RunOrigin>,
 }
 
@@ -1189,7 +1188,7 @@ impl CursorGlow {
         }
     }
 
-    /// Host key hint: a navigation keypress (Ctrl-A/Ctrl-E, Home/End, arrows, word/line motions).
+    /// Host key hint: a navigation keypress (Ctrl-a/Ctrl-E, Home/End, arrows, word/line motions).
     pub fn note_navigation(&mut self, now: Instant) {
         self.recent_typed_run = None;
         self.unowned_caret = None;
@@ -1863,8 +1862,6 @@ impl CursorGlow {
         }
         let credits = self.typed_credits_within(now);
         if cr == pr && cc > pc {
-            // Exact for one cell, at least two for anything wider (the
-            // coalesce's own floor).
             return credits >= usize::from(cc - pc).min(2);
         }
         if credits >= 1 && self.carried_key_move == Some(((pr, pc), (cr, cc))) {

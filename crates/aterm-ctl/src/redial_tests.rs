@@ -136,10 +136,6 @@ fn relay<'b>(
     (code, String::from_utf8(out).expect("UTF-8 frames"))
 }
 
-/// The relay's frame parser: a session ends only on every target's
-/// `exited` frame (`@*` follows the live roster and never ends), a body that
-/// reads like a frame is skipped by its declared length, a header split
-/// across reads is not a frame yet, and unframeable input means "cannot say".
 #[test]
 fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     let mut t = FrameTracker::new("subscribe @s-a,@s-b screen,events\n");
@@ -191,10 +187,6 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     assert!(!t.session_over());
 }
 
-/// What a resumed `subscribe` asks the successor. `since=` (an old-process
-/// screen seq) goes; the carried event anchors (`since-block`, `since-turn`,
-/// ids the handoff carries) ride — never below the anchor the stream was
-/// opened with, and never on a multi-target stream.
 #[test]
 fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
     let none = EventAnchors::default();
@@ -320,11 +312,6 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
     }
 }
 
-/// A resumed `log` stream asks for what follows the LAST RECORD IT RELAYED, in
-/// the epoch it was read in — never the request's own `since-log=` (whose
-/// replay would push every relayed record again) and never nothing (which
-/// would lose what came between the legs): from the `sub` line's start, each
-/// `LOG` line, and a `GAP`'s `resync_to=`/`ep=`.
 #[test]
 fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
     let request = "subscribe @s-a log since-log=5 log-ep=1\n";
@@ -390,8 +377,6 @@ fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
     assert_eq!(t.anchors(), EventAnchors::default());
 }
 
-/// The fallback derives from the original request, not from a last leg pinned to
-/// its sid; a stream that named its session by sid has no fallback.
 #[test]
 fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     let seen = EventAnchors {
@@ -432,9 +417,6 @@ fn started_later(_: u32) -> Option<Stamp> {
     })
 }
 
-/// The decision at a refused resume: asked again, self as written, only after
-/// `ERR no such session` to the pinned form from a fresh successor, and never a
-/// third time.
 #[test]
 fn a_refused_pin_is_asked_again_only_of_a_fresh_successor() {
     let pinned = Ask {
@@ -633,14 +615,10 @@ enum Served {
 
 #[cfg(unix)]
 impl ChildSuccessor {
-    /// Spawn one playing `role` in `dir`, which unlinks `leave` when it goes,
-    /// and wait (bounded) until it listens.
     fn spawn(dir: &std::path::Path, role: &str, leave: &std::path::Path) -> Self {
         Self::start(dir, role, leave, false)
     }
 
-    /// [`ChildSuccessor::spawn`] as an orphan ([`Served::Orphan`]): started in
-    /// the background by a `/bin/sh` that exits at once.
     fn spawn_orphan(dir: &std::path::Path, role: &str, leave: &std::path::Path) -> Self {
         Self::start(dir, role, leave, true)
     }
@@ -705,12 +683,10 @@ impl ChildSuccessor {
         }
     }
 
-    /// What it was asked, one request per line.
     fn asked(&self) -> String {
         std::fs::read_to_string(&self.seen).unwrap_or_default()
     }
 
-    /// Its pid.
     fn pid(&self) -> u32 {
         match &self.process {
             Served::Child(child) => child.0.id(),
@@ -718,8 +694,6 @@ impl ChildSuccessor {
         }
     }
 
-    /// Crash it — `SIGKILL`, every connection closed with the process — and
-    /// reap it (an orphan is reaped by whatever adopted it).
     fn crash(&mut self) {
         match &mut self.process {
             Served::Child(child) => {
@@ -750,7 +724,6 @@ struct Orphan(Option<u32>);
 
 #[cfg(unix)]
 impl Orphan {
-    /// `SIGKILL` it, once.
     fn kill(&mut self) {
         unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
@@ -762,8 +735,6 @@ impl Orphan {
         }
     }
 
-    /// Its parent's pid: field 4 of `/proc/<pid>/stat` on Linux, else as
-    /// `ps` reads it.
     fn parent(&self) -> Option<u32> {
         let pid = self.0?;
         if cfg!(target_os = "linux") {
@@ -1514,19 +1485,16 @@ fn a_process_started_after_a_moment_is_fresh_against_it() {
     }
 }
 
-/// `pid`'s start as Linux records it (a `/proc/<pid>/stat` line with `state`
-/// and `starttime` `ticks`, and a `status` with effective uid 501), read through
-/// the Linux relay's parser by a uid-501 reader at 100 Hz.
 fn linux_started(pid: u32, ticks: u64, state: char) -> Option<Stamp> {
     let stat = format!(
         "{pid} (aterm) {state} 1 {pid} {pid} 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 {ticks} \
          7032832 463 18446744073709551615 205458244435968 205458248030472 281474793899808 0 0 0 \
          0 128 0 1 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     );
-    let status = "Name:\taterm\nUid:\t501\t501\t501\t501\n";
+    let status = format!("Name:\taterm\nTgid:\t{pid}\nUid:\t501\t501\t501\t501\n");
     let boot = aterm_uds::process::procfs::start(
         &stat,
-        status,
+        &status,
         &stat,
         i32::try_from(pid).ok()?,
         501,
@@ -1538,14 +1506,10 @@ fn linux_started(pid: u32, ticks: u64, state: char) -> Option<Stamp> {
     })
 }
 
-/// A fixed wall-clock moment the clock stand-ins below read around.
 fn wall_at(seconds: u64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(1_800_000_000 + seconds))
 }
 
-/// The boot clock orders a start and a hang-up wherever both have it, whatever
-/// the wall clock says; the wall clock decides only where one side lacks it,
-/// and with no shared clock the arrival is [`Arrival::Unknown`].
 #[test]
 fn the_boot_clock_orders_a_start_and_a_hangup_wherever_both_have_it() {
     let at = |boot: Option<u64>, wall: Option<u64>| Stamp {
@@ -1638,7 +1602,6 @@ struct StallState {
 
 #[cfg(unix)]
 impl Stall {
-    /// A consumer that stops at the first write holding `trigger`.
     fn at(trigger: &'static str) -> Self {
         Self(std::sync::Arc::new((
             std::sync::Mutex::new(StallState {
@@ -1651,7 +1614,6 @@ impl Stall {
         )))
     }
 
-    /// Wait (bounded, a hang detector) until a write is blocked.
     fn blocked(&self) {
         let (lock, wake) = &*self.0;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1663,14 +1625,12 @@ impl Stall {
         }
     }
 
-    /// Let every write through.
     fn release(&self) {
         let (lock, wake) = &*self.0;
         lock.lock().unwrap().released = true;
         wake.notify_all();
     }
 
-    /// What was written, once released.
     fn text(&self) -> String {
         String::from_utf8(self.0.0.lock().unwrap().bytes.clone()).unwrap()
     }
@@ -2010,9 +1970,6 @@ fn only_anchorless_blocking_reads_are_asked_again() {
     assert!(!is_blocking_read(&parts("send hi")));
 }
 
-/// A since-less `await log` cut by a replacement is not asked again, and its
-/// note says how to wait again without missing what the update wrote: from
-/// `status`'s cursor.
 #[test]
 fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
@@ -2031,8 +1988,6 @@ fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
     }
 }
 
-/// A cut `await edit ticket=` is not asked again (no successor knows the
-/// ticket), and its note says to wait by the file, which a successor does.
 #[test]
 fn a_cut_edit_wait_by_ticket_says_to_wait_by_the_file() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
@@ -2043,10 +1998,6 @@ fn a_cut_edit_wait_by_ticket_says_to_wait_by_the_file() {
     assert!(note.contains("await edit uri=<file-uri>"), "{note}");
 }
 
-/// A cut `turn` or `post` is reported as a replacement (exit 75, a note that it
-/// may already have taken effect), never as a bare error a caller would retry,
-/// and is never asked again; with nothing answering in time (`Hangup::Gone`)
-/// its gone note carries the same advice.
 #[test]
 fn a_cut_turn_or_post_is_reported_as_a_replacement_and_never_asked_again() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
@@ -2793,9 +2744,6 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     stranger.join().unwrap();
 }
 
-/// The session a request is dialled for, and whose host a forward's hang-up
-/// follows, is read by the wire's grammar: a leading `@<sid>` (SP or HT after
-/// it), or the one `@<sid>` a selectorless `subscribe` names second.
 #[test]
 fn the_session_a_request_names_is_read_by_the_wire_grammar() {
     let named = |line: &str| target_sid(line).map(|sid| sid.as_str().to_string());
@@ -2897,10 +2845,6 @@ fn a_call_to_a_peer_follows_the_peers_host_not_its_own() {
     successor.join().unwrap();
 }
 
-/// Where a redial looks follows how the call resolved
-/// ([`super::super::targets_in`]): a `--pid` pin follows no successor but its
-/// own process, `--sock` its path, and the flagless rule the calling session's
-/// graph entry or the alias.
 #[test]
 fn a_redial_follows_what_the_call_resolved_through() {
     use super::super::targets_in;

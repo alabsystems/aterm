@@ -132,8 +132,13 @@ pub const TOOLS: &[Tool] = &[
     ),
     os(
         "bash",
-        &["/bin/bash", "/usr/bin/bash"],
-        "a shell aterm integrates: macOS's 3.2 is what people run, so the bash integration's tests run it",
+        &[
+            "/bin/bash",
+            "/usr/bin/bash",
+            r"C:\Program Files\Git\bin\bash.exe",
+        ],
+        "a shell aterm integrates: macOS's 3.2 is what people run, so the bash integration's tests \
+         run it; on Windows, Git for Windows' bash, the one Claude Code's Bash tool runs",
     ),
     guest(
         "bash-3.2",

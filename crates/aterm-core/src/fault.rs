@@ -5,10 +5,10 @@
 //! Deterministic fault injection: a thread-local registry of armed fault points, so tests can
 //! force rare error branches and assert the path fails closed without panicking.
 //!
-//! Without `cfg(test)` or the `fault-injection` feature, [`triggered`] is an inlined `false`
+//! Without `cfg(test)` or the `fault-injection` feature, [`triggered`](crate::fault::triggered) is an inlined `false`
 //! and `arm`/`disarm` do not exist.
 //!
-//! Production builds pay nothing: [`triggered`] is an `#[inline]` `const
+//! Production builds pay nothing: [`triggered`](crate::fault::triggered) is an `#[inline]` `const
 //! false`. The registry and `arm`/`disarm` exist only in a test or debug build,
 //! where nothing arms a point but a test.
 //!

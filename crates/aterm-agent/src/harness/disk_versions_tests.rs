@@ -10,16 +10,12 @@ use crate::harness::disk::{
 };
 use aterm_uds::holders::{PathScan, PathUse};
 
-/// A fixed instant; never `SystemTime::now()`.
 const NOW: i64 = 1_789_603_200;
 
-/// No process uses anything.
 fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
 }
 
-/// A versions folder of single-file entries (the native layout), `(name,
-/// bytes)` each, under `tmp`.
 fn versions_of(tmp: &Tmp, files: &[(&str, &[u8])]) -> PathBuf {
     let dir = tmp.path().join("versions");
     std::fs::create_dir_all(&dir).expect("versions");
@@ -29,8 +25,6 @@ fn versions_of(tmp: &Tmp, files: &[(&str, &[u8])]) -> PathBuf {
     dir
 }
 
-/// The survey of `versions` with `launcher` as the live launcher, `locks` as
-/// Claude Code's lock folder, through `processes`.
 fn survey_of(
     tmp: &Tmp,
     versions: &Path,
@@ -55,16 +49,10 @@ fn survey_of(
     )
 }
 
-/// The canonical path of `versions/<name>`.
 fn entry(versions: &Path, name: &str) -> PathBuf {
     std::fs::canonicalize(versions.join(name)).expect("an entry")
 }
 
-/// A RESOLVED TARGET NAMES A VERSION ONLY FROM STRICTLY INSIDE `versions/`:
-/// the entry it lies in, itself or above it. NEGATIVE CONTROLS: the folder
-/// itself, a path beside it (a launcher copy resolves to itself) and no
-/// folder at all name none — the old fallback named the target itself, and
-/// every real version then read as not live.
 #[test]
 fn only_a_target_strictly_inside_versions_names_a_version() {
     let root = PathBuf::from("/v");
@@ -84,8 +72,6 @@ fn only_a_target_strictly_inside_versions_names_a_version() {
     assert_eq!(version_dir_of(Path::new("/v/2.1.2"), None), None);
 }
 
-/// A VERSION FILE IS SIZED AS A FILE: its length, not the `0 B+` of a listing
-/// it refuses; a version folder by its walk.
 #[test]
 fn a_version_file_is_sized_by_its_length_and_a_folder_by_its_walk() {
     let tmp = Tmp::new("versions-size");
@@ -105,8 +91,6 @@ fn a_version_file_is_sized_by_its_length_and_a_folder_by_its_walk() {
     assert_eq!(listed.len(), 2, "{listed:?}");
 }
 
-/// A LINK INSIDE `versions/` LEADING OUT IS NO ENTRY: its target is not the
-/// vendor's to lose, and no row may name it.
 #[test]
 fn a_link_in_versions_leading_out_is_no_entry() {
     let tmp = Tmp::new("versions-link");
@@ -124,9 +108,6 @@ fn a_link_in_versions_leading_out_is_no_entry() {
     assert_eq!(listed[0].path, entry(&versions, "2.1.1"));
 }
 
-/// THE COPY WITNESS: the one entry of the launcher's length AND content is
-/// its original. NEGATIVE CONTROLS: a launcher one byte off is a copy of
-/// none, and a launcher two entries are byte-identical to names neither.
 #[test]
 fn the_launcher_copy_names_the_one_version_of_its_bytes() {
     let tmp = Tmp::new("versions-copy");
@@ -167,11 +148,6 @@ fn the_launcher_copy_names_the_one_version_of_its_bytes() {
     );
 }
 
-/// THE DIGEST CACHE stands while the file's own stamp does: a digest is not
-/// read again for a file whose length, last write and creation are as it was
-/// kept under (here its bytes changed in place and its write time was put
-/// back, which only the cache can miss), across a save and a load; once the
-/// write time moves, the bytes are read again.
 #[test]
 fn a_digest_is_kept_under_the_files_own_stamp() {
     let tmp = Tmp::new("versions-cache");
@@ -213,12 +189,6 @@ fn a_digest_is_kept_under_the_files_own_stamp() {
     assert_ne!(read, first, "a moved stamp reads the bytes again");
 }
 
-/// A CACHE OF THE OLD, NARROWER IDENTITY IS NO CACHE: one written before the
-/// stamp took the one identity export's width (schema 1: on Windows a 32-bit
-/// volume serial and a 64-bit file index), holding this very file under its
-/// very length, times and old-width identity but a wrong digest, is read as a
-/// miss and the bytes digested anew — never taken for a hit. NEGATIVE
-/// CONTROL: the cache this reader writes back is a hit for the same file.
 #[test]
 fn a_cache_of_the_old_identity_width_is_a_miss() {
     let tmp = Tmp::new("versions-cache-width");
@@ -277,9 +247,6 @@ fn a_cache_of_the_old_identity_width_is_a_miss() {
     assert_eq!(kept, read, "the cache it writes is a hit");
 }
 
-/// WHAT STILL HOLDS A VERSION THAT IS NOT LIVE KEEPS IT: Claude Code's lock
-/// for it, a running process using it, a process scan that could not rule
-/// anyone out. NEGATIVE CONTROL: with none of them, nothing keeps it.
 #[test]
 fn a_lock_or_a_process_keeps_a_version_that_is_not_live() {
     let tmp = Tmp::new("versions-kept");
@@ -320,12 +287,6 @@ fn a_lock_or_a_process_keeps_a_version_that_is_not_live() {
     assert!(why.contains("could not be listed"), "{why}");
 }
 
-/// ONE PROCESS SCAN FOR EVERY VERSION: with nothing running from any of
-/// three versions that are not live, the processes are read once, not once a
-/// version. A scan names only each process's FIRST use, so NEGATIVE CONTROL:
-/// a process running from one version with a file open in another keeps BOTH
-/// (the one no use named is scanned again alone), and the third, which
-/// nothing uses, is still free. A lock keeps its version without a scan.
 #[test]
 fn every_version_is_judged_from_one_process_scan() {
     let tmp = Tmp::new("versions-one-scan");
@@ -570,8 +531,6 @@ fn a_version_used_through_a_short_spelling_keeps_that_version_alone() {
     }
 }
 
-/// THE ORDER OF VERSIONS: dotted numbers compared part by part; a name that
-/// is not one has no order, which keeps it ([`newer_than`]).
 #[test]
 fn versions_are_ordered_by_their_numbers_and_a_non_version_is_kept() {
     assert_eq!(version_number("2.1.286"), Some(vec![2, 1, 286]));
@@ -587,14 +546,6 @@ fn versions_are_ordered_by_their_numbers_and_a_non_version_is_kept() {
     assert!(newer_than("2.1.287.download", live).is_some());
 }
 
-/// THE WINDOWS LAYOUT, END TO END: `claude.exe` is a byte-for-byte COPY of
-/// `versions\2.1.2` (every entry a file). The live one is no row; an older
-/// one nothing holds is removable, its witness naming both the launcher and
-/// the live version; a newer one (the update a running claude.exe keeps from
-/// being swapped in) and one Claude Code's lock holds are kept. NEGATIVE
-/// CONTROLS: a launcher one byte off, and none at all, block every row — and
-/// off Windows a launcher that is a regular file names nothing either (the
-/// old fallback made every version removable, the live one included).
 #[test]
 fn a_launcher_copy_names_the_live_version_and_holds_are_kept() {
     let tmp = Tmp::new("versions-scan");

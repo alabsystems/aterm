@@ -35,7 +35,7 @@ pub fn picks(picker: &LoginPicker, method: Option<LoginMethod>) -> Result<usize,
         .ok_or_else(|| format!("it draws no `{}` row", method.label()))
 }
 
-/// Returns the action to select `method` in `picker` ([`picks`], [`Choice::Focus`], [`Choice::Accept`]).
+/// Returns the action to select `method` in `picker` ([`picks`], [`Choice::Focus`]).
 #[must_use]
 pub fn pick_method(
     prompt: &PromptV2,
@@ -112,7 +112,8 @@ pub enum PickerGate {
     Persons,
 }
 
-/// Classifies who owns the `/login` method picker ([`super::turn_end::TurnEndState::login_typed`]).
+/// Classifies who owns the `/login` method picker
+/// ([`super::turn_end::TurnEndState::login_typed_at`]).
 #[must_use]
 pub const fn picker_gate(typed: bool, shared: Option<&LoginShared>, renewed: bool) -> PickerGate {
     match (typed, shared) {
@@ -146,7 +147,7 @@ pub enum LoginShared {
         /// Tab carrying the sign-in.
         by: String,
     },
-    /// Sign-in completed in tab `by` ([`super::turn_end::RULE_LOGIN_SHARED`]).
+    /// Sign-in completed in tab `by` ([`super::turn_end::RULE_LOGIN_BACK`]).
     Back {
         /// Tab where sign-in completed.
         by: String,

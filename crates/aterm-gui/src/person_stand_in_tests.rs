@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SEAMS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2, the 5a tests of §12.5.6), on a headless App: a development build's stand-in for the person — `person look <window>`, which reaches the one looking rule alone and arms no timer, and `person menubar press <at>`, which clicks a menu-bar row by the path `chrome` prints and goes where a click goes — and `status`'s `end= end_seen= end_cheered=`, two facts kept apart.
+//! Headless `person` stand-in and `status` end-marker tests.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +14,6 @@ use crate::{App, WindowId};
 
 const SEC: u64 = 1_000;
 
-/// Shut the test's host down on success and assertion unwind alike.
 struct TestHost(crate::harness_host::HostHandle);
 
 impl Drop for TestHost {
@@ -23,7 +22,6 @@ impl Drop for TestHost {
     }
 }
 
-/// A host that supervises nothing: what the App's posture needs.
 fn host() -> TestHost {
     TestHost(crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -31,7 +29,6 @@ fn host() -> TestHost {
     ))
 }
 
-/// This window's host holds `session`'s live supervisor claim.
 fn claim(app: &App, session: u64) {
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     crate::session_timeline::claim_supervisor(
@@ -44,9 +41,6 @@ fn claim(app: &App, session: u64) {
     .expect("claimed");
 }
 
-/// A headless App, as the lab's is: session 0 runs Claude Code under Land,
-/// claimed by this host, in window 0's first tab, a second tab in front,
-/// window 0 frontmost and on no screen — nobody can look at it.
 fn desk() -> (App, String, TestHost) {
     let mut app = App::headless_for_test();
     let host = host();
@@ -72,7 +66,6 @@ fn desk() -> (App, String, TestHost) {
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
-/// The agent word the status sweep publishes for session 0.
 fn publish(app: &App, word: &'static str) -> bool {
     app.pool
         .get(0)
@@ -93,13 +86,10 @@ fn publish(app: &App, word: &'static str) -> bool {
         )
 }
 
-/// Session `sid`'s loop tells `face` through the host's wake.
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
 
-/// Session 0's task opens, its agent works `ms` on the ledger clock (moved
-/// on, not waited), and its loop tells landed: an end past the floor.
 fn end_after(app: &mut App, sid: &str, ms: u64) {
     tell(app, sid, Some(TaskFace::Open));
     assert!(publish(app, "busy"), "busy published");
@@ -110,7 +100,6 @@ fn end_after(app: &mut App, sid: &str, ms: u64) {
     tell(app, sid, Some(TaskFace::Landed));
 }
 
-/// Every tab's mark in window 0, as its strip is stamped.
 fn marks(app: &App) -> Vec<ChipLevel> {
     let ws = &app.windows[&WindowId(0)];
     let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = ws
@@ -123,7 +112,6 @@ fn marks(app: &App) -> Vec<ChipLevel> {
     metadata.iter().map(|m| m.attention).collect()
 }
 
-/// The value of `key=` among `line`'s words.
 fn field(line: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     line.split_whitespace()
@@ -131,14 +119,10 @@ fn field(line: &str, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `person look <window>` (`None`: off) on the main thread.
 fn look(app: &mut App, window: Option<u64>) -> Result<String, String> {
     app.person_stand_in(PersonAsked::Look(window))
 }
 
-/// THE VERB'S WORDS, AND WHO MAY SAY THEM (§12.5.2): an armed debug build
-/// reads `look <n>`, `look off` and `menubar press <at>`; anything else is
-/// the usage line.
 #[test]
 fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
     let armed = |rest: &str| parse_person(rest, true, || true);
@@ -184,11 +168,6 @@ fn the_person_verb_reads_its_forms_and_refuses_unarmed_and_in_release() {
     assert!(PERSON_DENIED.ends_with("(ATERM_DEBUG_PERSON_INVOKE=1 at launch)"));
 }
 
-/// A STAND-IN LOOK SEES THE FRONT TAB'S END BY THE ONE RULE (§12.5.6): an
-/// unseen landing on window 0's first tab, with the second in front: `person
-/// look 0` leaves its `•`, its Done for you row and `❯•`; once the first tab
-/// comes to the front it is seen, and the mark, the row and `❯•` go; with the
-/// look standing, a landing in the front tab is seen as it lands.
 #[test]
 fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     let (mut app, sid, _host) = desk();
@@ -230,11 +209,6 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert_eq!(app.status_glance().done.len(), 1, "a Done for you row");
 }
 
-/// A STAND-IN LOOK SEES AT ONCE (§12.5.2: the one rule runs where a look
-/// begins): the landed tab in front of window 0 and nobody looking, its end
-/// stands (the front tab wears no `•`: the Done for you row and `❯•` say
-/// it); `person look 0`, with no tab switch or landing after, sees it then,
-/// and the row and `❯•` go, the glance told.
 #[test]
 fn a_stand_in_look_sees_the_front_tab_at_once() {
     let (mut app, sid, _host) = desk();
@@ -256,11 +230,6 @@ fn a_stand_in_look_sees_the_front_tab_at_once() {
     assert_eq!(g.button_title(), "\u{276f}", "and `❯•`");
 }
 
-/// NOBODY LOOKS AT A WINDOW BEHIND ANOTHER (§12.5.2: the stand-in supplies
-/// only "on screen"; main's rule is `frontmost && on screen`): with a second
-/// window in front, `person look 0` and a tab switch in window 0 bring its
-/// landed tab to window 0's front, and its end stands; once window 1 closes
-/// and window 0 is the frontmost again, the same tab switch sees it.
 #[test]
 fn a_look_at_a_window_behind_sees_nothing() {
     let (mut app, sid, _host) = desk();
@@ -306,8 +275,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
     assert!(app.status_glance().done.is_empty(), "the row goes");
 }
 
-/// The fixtures of a Claude Code launch card on the glass
-/// (`claude_card_tests`' own, trimmed to what a card on show needs).
 mod card {
     use std::sync::Arc;
 
@@ -316,12 +283,9 @@ mod card {
 
     use crate::{App, WindowId};
 
-    /// The build the card names, and the process the facts are for.
     const VERSION: &str = "2.1.283";
     const PGID: i32 = 4242;
 
-    /// A Claude Code screen `rows` × `cols`: the wide launch card at row 1,
-    /// then the composer between its rules and the mode row at the bottom.
     fn screen(rows: usize, cols: usize) -> Vec<String> {
         let rule = "\u{2500}".repeat(cols);
         let mut screen = vec![
@@ -346,7 +310,6 @@ mod card {
         screen
     }
 
-    /// Paint `rows` into `session`'s terminal, the caret on the composer.
     fn feed(app: &App, session: u64, rows: &[String]) {
         let mut out = String::from("\x1b[2J");
         for (i, row) in rows.iter().enumerate() {
@@ -366,8 +329,6 @@ mod card {
         crate::term_lock(&term).process(out.as_bytes());
     }
 
-    /// A managed-store Claude Code of [`VERSION`] takes `session`'s front as
-    /// group [`PGID`]: its image published, the fence cut to it, its facts.
     fn launch(app: &App, session: u64) {
         use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
         let build = atpkg::vendor_direct::Version::parse(VERSION)
@@ -430,11 +391,6 @@ mod card {
     }
 }
 
-/// A STAND-IN LOOK ARMS NO TIMER (§12.5.6): with a live row on the band, a
-/// card on show and a pill standing in window 0, `person look 0` moves none
-/// of the wakes that read whether a window is on screen — the card's, the
-/// band's motion, the band's own, presence's (the pill's age), the harness
-/// glass's — nor `session_on_screen`.
 #[test]
 fn a_stand_in_look_arms_no_timer() {
     let wid = WindowId(0);
@@ -631,11 +587,6 @@ fn a_stand_in_press_goes_where_a_click_goes() {
     );
 }
 
-/// `status` SAYS THE END, SEEN AND CHEERED APART (§12.5.2, §12.5.6): no end,
-/// `end=- end_seen=- end_cheered=-`; a background landing, `end=<the unix
-/// second its face moved there> end_seen=0 end_cheered=0`; cheered by a pet
-/// and not yet looked at, `end_seen=0 end_cheered=1`; looked at,
-/// `end_seen=1`.
 #[test]
 fn status_says_the_end_seen_and_cheered_apart() {
     let (mut app, sid, _host) = desk();
@@ -719,11 +670,6 @@ fn status_says_the_end_seen_and_cheered_apart() {
     );
 }
 
-/// A CARRIED END'S CHEER IS SPENT (§11.2.3, item 8; §12.5.2): a seamless
-/// update puts the outgoing process's end on the glass cheered, so no pet
-/// here replays it, and `status` says `end_seen=0 end_cheered=1` for it
-/// unseen: `end_cheered=1` is that the end's cheer is spent, by a pet's
-/// frame or by the carry, not that a pet in this process cheered it.
 #[test]
 fn status_says_a_carried_ends_cheer_is_spent() {
     let (mut app, _sid, _host) = desk();

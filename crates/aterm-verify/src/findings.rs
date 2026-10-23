@@ -1,43 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a failure is: one [`Finding`] per failed test when a `targo test` log
-//! accounts for every one, else the failing row itself — each with the exact
-//! command that reruns just it, and the few lines that say what went wrong.
+//! Structured test and check failure findings with rerun commands and excerpts.
 
 use std::ffi::OsString;
 
 use crate::exec::Cmd;
 use crate::ladder::Finding;
 
-/// What the run prints when it kills a child at its ceiling ([`crate::exec`]),
-/// and for a test binary the run's ceiling left no time to start
-/// ([`crate::testrun`]).
+/// What the run prints when it kills a child at its ceiling ([`crate::exec`]).
 pub const CEILING_KILL: &str = "aterm-verify: TIMEOUT";
 
 /// How many lines of a failure's own output a finding carries.
 pub const MESSAGE_LINES: usize = 12;
 
-/// The failed tests of a `targo test` child, one finding each, with cargo's
-/// rerun spec and libtest's name (`-p atpkg --test atpkg_suite -- tar::ustar`).
-/// Each rerun line is prefixed with the variables the child ran under
-/// ([`rerun_env`]). A log that cannot account for every failure (a crashed
-/// binary, a torn log, a ceiling kill) is one finding for the whole row: a list
-/// that silently misses a failure is worse than no list. A test that refused
-/// the machine beside one that failed for the tree is no finding
-/// ([`split_test_findings`]).
+/// The failed tests of a `targo test` child, one finding each, or one for the whole row where
+/// the log cannot account for every failure.
 #[must_use]
 pub fn test_findings(label: &str, output: &str, env: &[(OsString, OsString)]) -> Vec<Finding> {
     split_test_findings(label, output, env).0
 }
 
-/// [`test_findings`], and the names of the failed tests it leaves out: those
-/// that carry [`crate::libtest::COULD_NOT_RUN_SENTINEL`] (a host with no fish,
-/// no node) beside at least one that failed for the tree. They decided
-/// nothing, so they are no finding, and the caller records them as COULD NOT
-/// RUN. Only a log that accounts for every failure is split, and one whose
-/// every failure refused the machine leaves nothing out (that child is
-/// [`crate::exec::Run::environment_failure`]'s; here it fails closed).
+/// [`test_findings`], and the names of the failed tests it leaves out.
 #[must_use]
 pub fn split_test_findings(
     label: &str,
@@ -83,11 +67,7 @@ pub fn split_test_findings(
     (found, refused)
 }
 
-/// The variables a rerun of a test child's failures must set: the child's own
-/// (`TRAIL_LAWS_FULL`, the measuring suites' bundle) and `--test-threads`.
-/// Where the build lands and which doc driver compiles (the doctests' stand-in
-/// and what it is told, [`crate::docdriver`]) change no test's verdict, so
-/// those stay off the line.
+/// The variables a rerun of a test child's failures must set.
 #[must_use]
 pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsString)> {
     const PLACEMENT: [&str; 5] = [
@@ -109,11 +89,7 @@ pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsStrin
     env
 }
 
-/// The one line a stage group's survivors add to the receipt
-/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1.2): what the run ended by pid, and
-/// what it named and left. `ended` and `named` are exe words, each shown by [`tally_words`];
-/// `partial` says the group's listing filled its buffer, so more may be left than it names.
-/// The run reports and ends now but does not turn red yet (§11 Q4).
+/// The one line a stage group's survivors add to the receipt.
 #[must_use]
 pub fn survivor_line(stage: &str, ended: &[String], named: &[String], partial: bool) -> String {
     let total = ended.len() + named.len();
@@ -158,8 +134,7 @@ pub fn tally_words(words: &[String]) -> String {
         .join(", ")
 }
 
-/// The row as one finding: its label, and the lines of its output that say
-/// what went wrong ([`excerpt`]).
+/// The row as one finding.
 #[must_use]
 pub fn row_finding(label: &str, output: &str) -> Finding {
     Finding {
@@ -179,12 +154,7 @@ pub fn label_finding(label: &str) -> Finding {
     }
 }
 
-/// The lines of a failing child's output worth reading first: its errors (an
-/// `error`, a panic, a `FAIL` row, a could-not-run) with the two lines either
-/// side of each, else its warnings the same way, at most `max`; with neither,
-/// its last `max` lines. An error repeated word for word (cargo prints one for
-/// each target that compiles the file) is shown once. cargo's progress lines
-/// and targo's lane banners never count.
+/// The lines of a failing child's output worth reading first.
 #[must_use]
 pub fn excerpt(output: &str, max: usize) -> Vec<String> {
     let plain = strip(output);
@@ -199,7 +169,6 @@ pub fn excerpt(output: &str, max: usize) -> Vec<String> {
             if picked.len() >= max {
                 break;
             }
-            // An error is the line and the location under it.
             let key = (l.trim(), lines.get(i + 1).map(|n| n.trim()));
             if hit(l) && !seen.contains(&key) {
                 seen.push(key);
@@ -222,8 +191,7 @@ pub fn excerpt(output: &str, max: usize) -> Vec<String> {
     picked.into_iter().map(|i| lines[i].to_string()).collect()
 }
 
-/// How a failed test failed: its block's lines, without the backtrace notes
-/// and frames `RUST_BACKTRACE` adds, at most [`MESSAGE_LINES`].
+/// How a failed test failed.
 fn test_message(block: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_trace = false;
@@ -256,7 +224,7 @@ fn is_frame(line: &str) -> bool {
     indented && ((digits > 0 && t[digits..].starts_with(": ")) || t.starts_with("at "))
 }
 
-/// cargo's progress verbs: a line that opens with one says nothing about a failure.
+/// Cargo's progress verbs: a line that opens with one says nothing about a failure.
 const PROGRESS_VERBS: [&str; 22] = [
     "Adding",
     "Blocking",
@@ -289,8 +257,7 @@ fn is_progress(line: &str) -> bool {
         .any(|v| t.strip_prefix(v).is_some_and(|rest| rest.starts_with(' ')))
 }
 
-/// What targo prints on every invocation in the unverified lane, whatever the
-/// outcome.
+/// What targo prints on every invocation in the unverified lane, whatever the outcome.
 const LANE_BANNERS: [&str; 3] = [
     "warning: nested explicit-unverified Targo propagation",
     "warning: UNVERIFIED: ",
@@ -303,8 +270,7 @@ fn is_banner(line: &str) -> bool {
         .any(|b| line.trim_start().starts_with(b))
 }
 
-/// A line that says what went wrong, as compilers, guards and test harnesses
-/// write one.
+/// A line that says what went wrong, as compilers, guards and test harnesses write one.
 fn is_error(line: &str) -> bool {
     let t = line.trim_start();
     ["error", "ERROR", "fatal", "FAIL", "COULD NOT RUN"]
@@ -324,8 +290,7 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
 
-/// `name` quoted for a shell when it holds anything but the characters a test
-/// path is made of.
+/// `name` quoted for a shell when it holds anything but the characters a test path is made of.
 fn shell_word(name: &str) -> String {
     if !name.is_empty()
         && name
@@ -382,8 +347,6 @@ mod tests {
         );
     }
 
-    /// A refusal beside a failure is left out of the findings and named; a log
-    /// whose every failure is a refusal leaves nothing out (fails closed).
     #[test]
     fn a_refusal_beside_a_failure_is_no_finding() {
         let sentinel = crate::libtest::COULD_NOT_RUN_SENTINEL;
@@ -393,7 +356,6 @@ mod tests {
         let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["-p atpkg --test x -- tar::ustar_is_pinned"]);
         assert_eq!(left, ["fish::live"]);
-        // NEGATIVE CONTROL: the refusal alone is a finding here.
         let (found, left) = split_test_findings("t", &refused, &[]);
         assert_eq!(found.len(), 1);
         assert!(left.is_empty());
@@ -414,7 +376,6 @@ mod tests {
         );
     }
 
-    /// The rerun keeps the child's variables and drops the ones that only place the build.
     #[test]
     fn a_rerun_sets_what_the_test_child_ran_under() {
         let cmd = Cmd::new("targo")

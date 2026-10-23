@@ -1317,7 +1317,8 @@ fn token_end(chars: &[char], i: usize) -> usize {
     j
 }
 
-/// True if `c` is an apostrophe or hyphen joined into a token between two token characters.
+/// True if `c` is an apostrophe or hyphen, which the scanner joins into a token when it sits
+/// between two token characters.
 #[inline]
 #[must_use]
 pub const fn is_interior_joiner(c: char) -> bool {

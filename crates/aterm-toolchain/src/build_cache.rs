@@ -446,7 +446,18 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// A machine whose environment is `env` and whose config files are `files`.
+    /// `unix`, a fixture's absolute path, as this platform spells one (`C:\w\repo` on
+    /// Windows, where `/w/repo` is not absolute).
+    fn native(unix: &str) -> String {
+        if cfg!(windows) && unix.starts_with('/') {
+            format!("C:{}", unix.replace('/', "\\"))
+        } else {
+            unix.to_owned()
+        }
+    }
+
+    /// A machine whose environment is `env` and whose config files are `files`, every
+    /// absolute path spelled as this platform spells it ([`native`]).
     fn decide(
         target: &str,
         cwd: Option<&str>,
@@ -455,7 +466,7 @@ mod tests {
     ) -> Option<String> {
         let env: BTreeMap<String, OsString> = env
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
+            .map(|(k, v)| ((*k).to_owned(), OsString::from(native(v))))
             .collect();
         let files: BTreeMap<PathBuf, Result<String, ()>> = files
             .iter()
@@ -465,21 +476,22 @@ mod tests {
                 } else {
                     Ok((*text).to_owned())
                 };
-                (PathBuf::from(p), text)
+                (PathBuf::from(native(p)), text)
             })
             .collect();
         let lookup = |k: &str| env.get(k).cloned();
         let read = |p: &Path| files.get(p).cloned().transpose();
         let writable = |_: &Path| Some(true);
-        let cwd = cwd.map(Path::new);
+        let cwd = cwd.map(native);
+        let home = native("/h");
         let m = Machine {
-            home: Some(Path::new("/h")),
-            cwd,
+            home: Some(Path::new(&home)),
+            cwd: cwd.as_deref().map(Path::new),
             env: &lookup,
             read: &read,
             writable: &writable,
         };
-        target_build_dir(Path::new(target), &m)
+        target_build_dir(Path::new(&native(target)), &m)
     }
 
     /// A build pinned to a target directory keeps its intermediates in
@@ -489,8 +501,11 @@ mod tests {
     fn a_pinned_target_keeps_its_intermediates_out_of_spotlight() {
         let w = Some("/w/repo");
         assert_eq!(
-            decide("/w/repo/target", w, &[], &[]).as_deref(),
-            Some("build.build-dir='/w/repo/target/build.noindex'")
+            decide("/w/repo/target", w, &[], &[]),
+            Some(format!(
+                "build.build-dir='{}'",
+                native("/w/repo/target/build.noindex")
+            ))
         );
         assert!(
             decide(

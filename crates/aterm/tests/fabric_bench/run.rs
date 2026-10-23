@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, each selected scenario over its own world, booted as
-//! the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with
-//! aterm's own options for the arm's tier — ordered at aterm's horizon by
-//! default — and retained by aterm's default rules as `aterm link broker`
-//! retains it, a headless `aterm`, and the real `aterm link serve` child it
-//! launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's
-//! `retention=off`, `log=off` and tick interval):
-//!
-//! 1. MESSAGING, on one node. [`latency`]: session A posts a `note` to session
-//!    B, one at a time on an idle bridge, and the clock runs from the `post`
-//!    reply to B's `await inbox` answering. [`burst`]: N posts back to back
-//!    from sender sessions to B (within B's allowance, [`BURST_WINDOW`]), with
-//!    B consuming as a real reader does. Then the census of the records each
-//!    message cost.
-//! 2. PING-PONG, on a node of its own ([`pingpong`]): A posts, B replies the
-//!    moment it sees the message, back to back, with the bridge's wait tally
-//!    on — the reply's wait on the delivery's inbox commit and the bridge's one
-//!    loop, which the latency phase waits out on purpose.
-//! 3. ATTACH, on a third node: a bridge that starts with N sessions, until
-//!    its node row and every session's presence row are on the broker again,
-//!    for each population in the spec; the census of what it wrote, the
-//!    killed bridge's fired will counted apart. And a second stop each
-//!    restart: a note the boot session posts to itself the moment the bridge
-//!    is killed, until it is visible — after the presence rows, the bus
-//!    mirror's start (over a retaining broker at `--log auto`), the refill
-//!    the rows owe and the live drain.
-//! 4. HANDOFF, on a fourth node ([`handoff`]): a successor instance's bridge
-//!    standing by on the held state dir while the holder quits saying `bye
-//!    handoff`; the outage until the successor's rows are acked, and a post
-//!    queued in the gap.
+//! The measured phases, each selected scenario over its own world, booted as the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with aterm's own options for the arm's tier — ordered at aterm's horizon by default — and retained by aterm's default rules as `aterm link broker` retains it, a headless `aterm`, and the real `aterm link serve` child it launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's `retention=off`, `log=off` and tick interval).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -64,16 +35,14 @@ pub struct Report {
 /// How long the bench lets a bridge run before it kills it again.
 const SUPERVISOR_HEALTHY: Duration = Duration::from_millis(5_500);
 
-/// How often the pid file is read while a killed bridge comes back: it marks
-/// the start of an attach, so it is read finely.
+/// How often the pid file is read while a killed bridge comes back.
 const PID_POLL: Duration = Duration::from_millis(1);
 
 fn request(ctl: &mut Ctl, line: &str) -> Reply {
     ctl.request(line).unwrap_or_else(|e| panic!("{line}: {e}"))
 }
 
-/// `from` posts a note to `to`: `(stamp before the request, stamp after the
-/// reply)`.
+/// `from` posts a note to `to`: `(stamp before the request, stamp after the reply)`.
 fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, u64) {
     let line = format!("@{from} post to=@{to} kind=note -- {text}");
     let t_call = clock.us();
@@ -83,13 +52,11 @@ fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, 
     (t_call, t_ret)
 }
 
-/// Park on `sid`'s inbox until a note row newer than `since` is there: `(the
-/// newest such row's id, the stamp when the answer arrived)`.
+/// Park on `sid`'s inbox until a note row newer than `since` is there.
 ///
 /// # Errors
 ///
-/// Any answer but a row — `OK timeout` after the hang detector — as the
-/// request and its reply.
+/// Any answer but a row — `OK timeout` after the hang detector — as the request and its reply.
 fn await_note(ctl: &mut Ctl, clock: Clock, sid: &str, since: u64) -> Result<(u64, u64), String> {
     let line = format!(
         "@{sid} await inbox since={since} kinds=note timeout={}",
@@ -130,8 +97,7 @@ fn rows_of(reply: &Reply) -> Vec<Row> {
         .collect()
 }
 
-/// LIST `sid`'s rows newer than `since` — not `--peek`: listing is what
-/// releases the sender's quota (see the module note).
+/// List `sid`'s rows newer than `since` — not `--peek`.
 fn list_since(ctl: &mut Ctl, sid: &str, since: u64) -> Vec<Row> {
     let line = format!("@{sid} inbox since={since}");
     let reply = request(ctl, &line);
@@ -157,8 +123,7 @@ fn spawn(w: &World) -> String {
         .to_string()
 }
 
-/// SPAWN `n` IDLE BYSTANDER SESSIONS ([`Spec::bystanders`]): sessions that never
-/// post or read, beside the two that talk.
+/// Spawn `n` idle bystander sessions ([`Spec::bystanders`]).
 fn bystanders(w: &World, n: usize) -> Vec<String> {
     if n > 0 {
         eprintln!("fabric bench: spawning {n} idle bystander session(s)");
@@ -184,8 +149,7 @@ fn presence_subject(w: &World, owner: &str) -> String {
     format!("/f/{FLEET}/pub/{}/{owner}/presence", w.node)
 }
 
-/// Wait until the node row and every one of `sids`' presence rows say
-/// `state=live` at an offset at or past `from`.
+/// Wait until the node row and every one of `sids`' presence rows say `state=live` at an offset at or past `from`.
 fn wait_live(w: &World, sids: &[String], from: u64, what: &str) {
     let mut owners: Vec<&str> = sids.iter().map(String::as_str).collect();
     owners.push("node");
@@ -201,8 +165,7 @@ fn wait_live(w: &World, sids: &[String], from: u64, what: &str) {
     });
 }
 
-/// One row a consumer saw: which message (its index), at which broker offset,
-/// stamped when.
+/// One row a consumer saw: which message (its index), at which broker offset, stamped when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Seen {
     j: usize,
@@ -212,23 +175,17 @@ struct Seen {
 
 /// What a reader saw.
 struct Consumed {
-    /// Every row it listed, in arrival order, A REPEAT INCLUDED: a message
-    /// delivered twice is two entries here, and [`tally`] refuses it.
+    /// Every row it listed, in arrival order, a repeat included.
     seen: Vec<Seen>,
     /// The newest row id it listed: where the next phase's reading starts.
     since: u64,
 }
 
-/// Read `sid`'s inbox like a reader until `want` DISTINCT messages whose text
-/// is `<prefix><j>` have arrived: each wake is followed by a listing, and a
-/// row is stamped VISIBLE at the wake that covered it (or at the listing, for
-/// one that arrived between the two). After each listing it tells `credit`
-/// how many it has listed.
+/// Read `sid`'s inbox like a reader until `want` distinct messages whose text is `<prefix><j>` have arrived.
+///
 /// # Errors
 ///
-/// A wait that timed out, or a row whose text is not `<prefix><j>` — a stray,
-/// or a late repeat of the previous phase's message, which this phase must not
-/// time as one of its own.
+/// A wait that timed out, or a row whose text is not `<prefix><j>` — a stray, or a late repeat of the previous phase's message, which this phase must not time as one of its own.
 fn consume(
     ctl: &mut Ctl,
     clock: Clock,
@@ -270,8 +227,7 @@ fn consume(
 /// Why a phase's rows are not each of its messages exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Miscount {
-    /// Message `j` arrived as two rows: at one offset (the endpoint's `off=`
-    /// dedup failed) or at two (the bus holds the record twice).
+    /// Message `j` arrived as two rows.
     Twice { j: usize, first: u64, again: u64 },
     /// Message `j` never arrived.
     Never(usize),
@@ -292,11 +248,11 @@ impl std::fmt::Display for Miscount {
     }
 }
 
-/// Each of `n` messages' row, by index. Pure (unit-tested).
+/// Each of `n` messages' row, by index.
+///
 /// # Errors
 ///
-/// The first [`Miscount`]: a message seen twice, one never seen, or an index
-/// past `n`.
+/// The first [`Miscount`]: a message seen twice, one never seen, or an index past `n`.
 fn tally(seen: &[Seen], n: usize) -> Result<Vec<Seen>, Miscount> {
     let mut by_j: Vec<Option<Seen>> = vec![None; n];
     for s in seen {
@@ -316,12 +272,10 @@ fn tally(seen: &[Seen], n: usize) -> Result<Vec<Seen>, Miscount> {
         .collect()
 }
 
-/// How many burst posts may be in flight — posted, not yet LISTED by the
-/// reader — at once.
+/// How many burst posts may be in flight — posted, not yet listed by the reader — at once.
 const BURST_WINDOW: usize = 56;
 
-/// aterm's per-peer allowance of unlisted rows (`aterm-gui` `SENDER_QUOTA`,
-/// crate-private there), which [`BURST_WINDOW`] stays under.
+/// Aterm's per-peer allowance of unlisted rows (`aterm-gui` `SENDER_QUOTA`, crate-private there), which [`BURST_WINDOW`] stays under.
 const RECIPIENT_ALLOWANCE: usize = 64;
 const _: () = assert!(BURST_WINDOW < RECIPIENT_ALLOWANCE);
 
@@ -330,8 +284,7 @@ fn may_post(posted: usize, listed: usize, window: usize) -> bool {
     posted < listed + window
 }
 
-/// The burst's flow control: the reader says how many messages it has listed,
-/// and the sender waits for room in [`BURST_WINDOW`] before each post.
+/// The burst's flow control.
 struct Credit {
     window: usize,
     /// `(listed, the reader has stopped)`.
@@ -361,13 +314,11 @@ impl Credit {
         self.moved.notify_all();
     }
 
-    /// Wait until post `posted` may go out. `false` when the reader stopped
-    /// first: its own answer says why.
+    /// Wait until post `posted` may go out.
     ///
     /// # Panics
     ///
-    /// After [`DEADLINE`] with the reader still running and no room — the hang
-    /// detector.
+    /// After [`DEADLINE`] with the reader still running and no room — the hang detector.
     fn acquire(&self, posted: usize) -> bool {
         let s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let (s, _) = self
@@ -388,8 +339,7 @@ impl Credit {
     }
 }
 
-/// Closes its [`Credit`] when dropped — on the reader's unwind too, so a
-/// failed reader never leaves the sender waiting out the hang detector.
+/// Closes its [`Credit`] when dropped — on the reader's unwind too, so a failed reader never leaves the sender waiting out the hang detector.
 struct CloseOnDrop<'a>(&'a Credit);
 
 impl Drop for CloseOnDrop<'_> {
@@ -398,9 +348,7 @@ impl Drop for CloseOnDrop<'_> {
     }
 }
 
-/// Every `undeliverable` verdict in `sids`' inboxes, read with `--peek` (so
-/// nothing is released): what a refused delivery leaves on its sender's lane,
-/// for a failure message.
+/// Every `undeliverable` verdict in `sids`' inboxes, read with `--peek` (so nothing is released).
 fn refusals(w: &World, sids: &[String]) -> String {
     let mut ctl = w.ctl();
     let found: Vec<String> = sids
@@ -441,8 +389,7 @@ fn stop_and_read(w: &mut World) -> Vec<Rec> {
     recs
 }
 
-/// Run `phases` beside a head sampler on `w`'s broker: what they answered, and
-/// both heads over the run ([`Heads`]).
+/// Run `phases` beside a head sampler on `w`'s broker.
 fn sampled<T: Send>(w: &World, clock: Clock, phases: impl FnOnce() -> T + Send) -> (T, Heads) {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
     let stop = AtomicBool::new(false);
@@ -467,12 +414,7 @@ fn ms_opt(a: Option<u64>, b: Option<u64>) -> Option<f64> {
     Some(ms(a?, b?))
 }
 
-/// THE LAST RECORDS, SEEN DURABLE. On a broker that serves ordered, wait until
-/// its durable head has caught up with its acked head as it stands now — the
-/// horizon's full flush, at most the horizon plus a batch and a flush away —
-/// so the phases' last records are seen durable before the sampler stops
-/// (without it, the burst's whole "every record durable" milestone falls
-/// after the run).
+/// The last records, seen durable.
 fn await_durable(broker: &Broker) {
     if broker.served_durability().served != astream_broker::Tier::Ordered {
         return;
@@ -489,9 +431,7 @@ fn await_durable(broker: &Broker) {
     });
 }
 
-/// The flushes a window cost: `after - before`, field by field, of
-/// [`Broker::flush_counts`] read at its two ends (under the log lock, so each
-/// count is between two whole batches; never inside a timed round trip).
+/// The flushes a window cost.
 fn flushes_between(before: FlushCounts, after: FlushCounts) -> FlushCounts {
     FlushCounts {
         barrier: after.barrier - before.barrier,
@@ -501,8 +441,7 @@ fn flushes_between(before: FlushCounts, after: FlushCounts) -> FlushCounts {
     }
 }
 
-/// A window's flushes for the report's JSON: the counts and each per delivered
-/// message.
+/// A window's flushes for the report's JSON: the counts and each per delivered message.
 fn flushes_json(f: FlushCounts, n: usize) -> Value {
     let per = |v: u64| (n > 0).then(|| stats::round3(v as f64 / n as f64));
     json!({
@@ -516,9 +455,7 @@ fn flushes_json(f: FlushCounts, n: usize) -> Value {
     })
 }
 
-/// A window's flushes for the report's tables: what a strict broker spends one
-/// full flush on per batch, an ordered one spends a barrier on, plus a full
-/// flush per escalated batch and per horizon; a relaxed one spends nothing.
+/// A window's flushes for the report's tables.
 fn flushes_line(f: FlushCounts, n: usize) -> String {
     let per = |v: u64| {
         if n == 0 {
@@ -539,17 +476,14 @@ fn flushes_line(f: FlushCounts, n: usize) -> String {
     )
 }
 
-/// The broker's RETENTION TICKS so far: how many it ran and how many it
-/// skipped because a compaction was under way (`BrokerStats::retention_ticks`
-/// and `retention_skips`).
+/// The broker's retention ticks so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ticks {
     run: u64,
     skipped: u64,
 }
 
-/// The broker's ticks now: read through `Broker::stats`, under the log lock,
-/// so never inside a timed round trip.
+/// The broker's ticks now: read through `Broker::stats`, under the log lock, so never inside a timed round trip.
 fn ticks(broker: &Broker) -> Ticks {
     let stats = broker.stats();
     Ticks {
@@ -583,17 +517,10 @@ fn ticks_line(t: Ticks) -> String {
 /// Publishes in one yardstick block.
 const CALIBRATION_PUBLISHES: usize = 50;
 
-/// The producer id the yardstick publishes under. No bridge's (a bridge's is
-/// its own, bound to its node's cap), so its records never meet a bridge's
-/// dedup; its subject (`/f/<F>/bench/…`) is under no filter a bridge holds.
+/// The producer id the yardstick publishes under.
 const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 
-/// THE YARDSTICK: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a
-/// time, from a client in this process — one round trip each, no aterm, no
-/// bridge — of three kinds ([`Yardstick`]): to a STRICT broker (one full
-/// flush each: the unit), to an ORDERED one on an ordinary subject (one
-/// barrier each), and to the same ordered broker on a PERSON-LANE subject,
-/// which aterm's table escalates (one full flush each, before the ack).
+/// The yardstick: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a time, from a client in this process — one round trip each, no aterm, no bridge — of three kinds ([`Yardstick`]).
 fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick {
     let block = |c: &mut astream_broker::Client, subject: &str, seq: &mut u64| -> Vec<f64> {
         (0..CALIBRATION_PUBLISHES)
@@ -631,19 +558,13 @@ fn calibrate(ruler: &Ruler, w: &World, clock: Clock, seq: &mut u64) -> Yardstick
 struct Yardstick {
     /// Bare publishes to a strict broker: the unit.
     strict: Vec<f64>,
-    /// Bare publishes to an ordered broker (aterm's options, the default
-    /// horizon), on a subject its table does not escalate.
+    /// Bare publishes to an ordered broker (aterm's options, the default horizon), on a subject its table does not escalate.
     ordered: Vec<f64>,
     /// The same, on a person-lane subject its table escalates.
     escalated: Vec<f64>,
 }
 
-/// The brokers the yardstick publishes to: for the strict block, the world's
-/// own when the world is Strict (what every run before the tier knob
-/// measured), else a Strict broker opened for it in the world's scratch
-/// directory; for the ordered and escalated blocks, always an ordered broker
-/// of its own, opened with aterm's ordered options (the default horizon and
-/// aterm's table), so the world's log holds none of their records.
+/// The brokers the yardstick publishes to.
 struct Ruler {
     own: Option<(Broker, BrokerHandle)>,
     sock: String,
@@ -710,8 +631,7 @@ impl Ruler {
         Self::god_of(&self.ordered_sock)
     }
 
-    /// What the ordered blocks' broker serves (astream serves ordered strict
-    /// off Apple and off the boot volume): the report says, beside them.
+    /// What the ordered blocks' broker serves (astream serves ordered strict off Apple and off the boot volume).
     fn ordered_served(&self) -> astream_broker::ServedInfo {
         self.ordered.0.served_durability()
     }
@@ -726,12 +646,7 @@ impl Drop for Ruler {
     }
 }
 
-/// BOOT ONE OF THE RUN'S WORLDS as the arm names it: its broker opened with
-/// [`opts_for`], retained by aterm's default rules unless the arm says
-/// `retention=off` (what `aterm link broker` opens: the rules at every open),
-/// its tick at the arm's interval when it names one, and the bridge's
-/// `--log off` when the arm says `log=off` (else the bridge's own default,
-/// `auto`, what ships).
+/// Boot one of the run's worlds as the arm names it.
 fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
     let flags: &[&str] = match spec.log {
         Log::Auto => &[],
@@ -747,10 +662,7 @@ fn boot_world(tag: &str, spec: &Spec, env: &[(&str, &str)]) -> World {
     w
 }
 
-/// The options a run's world opens its broker with: aterm's own for the arm's
-/// tier ([`harness::broker_opts`]: the tier and, on a weak one, aterm's
-/// escalation table) — so the ordered arm measures aterm's real table — with
-/// the arm's horizon when it names one.
+/// The options a run's world opens its broker with.
 fn opts_for(spec: &Spec) -> OpenOptions {
     use aterm_link::durability::Durability as Aterm;
     let mut opts = harness::broker_opts(match spec.durability {
@@ -839,23 +751,18 @@ struct LatSample {
     t_seen: u64,
 }
 
-/// How finely [`latency`] watches for the previous message's commit to land:
-/// an atomic load of the in-process broker's head, so it costs the stack
-/// nothing.
+/// How finely [`latency`] watches for the previous message's commit to land.
 const IDLE_POLL: Duration = Duration::from_micros(100);
 
 /// What the latency phase measured.
 struct LatRaw {
     /// The measured round trips.
     samples: Vec<LatSample>,
-    /// Every round trip's text, warm-up included: each one's idle wait is
-    /// checked against the log after the run.
+    /// Every round trip's text, warm-up included: each one's idle wait is checked against the log after the run.
     texts: Vec<String>,
     /// The newest row id it listed.
     since: u64,
-    /// The broker's flushes over the measured round trips: from just before
-    /// the first measured post to the end of the last one's idle wait (its
-    /// commit acked).
+    /// The broker's flushes over the measured round trips.
     flushes: FlushCounts,
     /// The broker's retention ticks over the same window ([`Ticks`]).
     ticks: Ticks,
@@ -918,21 +825,15 @@ struct BurstRaw {
     rets: Vec<u64>,
     /// Each message's row, by index ([`tally`]: each seen exactly once).
     seen: Vec<Seen>,
-    /// The broker's BATCHES over the burst: writer batches that appended a
-    /// record, from just before the first post to the record past the last
-    /// message (the burst's commit) — on the Strict log one full flush each,
-    /// on the Ordered one one barrier each: the cost pipelining folds
-    /// ([`burst`]).
+    /// The broker's batches over the burst.
     batches: u64,
-    /// The flushes those batches cost, by kind, over the same window
-    /// ([`Broker::flush_counts`]).
+    /// The flushes those batches cost, by kind, over the same window ([`Broker::flush_counts`]).
     flushes: FlushCounts,
     /// The broker's retention ticks over the same window ([`Ticks`]).
     ticks: Ticks,
 }
 
-/// The burst phase, reading `b`'s inbox on from row `since` (the latency
-/// phase's last).
+/// The burst phase, reading `b`'s inbox on from row `since` (the latency phase's last).
 fn burst(
     w: &World,
     broker: &Broker,
@@ -1015,12 +916,7 @@ fn burst(
     }
 }
 
-/// What a world's broker serves, in one line for its section: the tier in
-/// force, the one asked, why they differ, the horizon and the rule count —
-/// read from the broker itself (astream serves ordered strict off Apple and
-/// off the boot volume), never from the arm's word — and what it retains,
-/// read from it too (its retention rules and its tick's interval), beside the
-/// bridge's `--log` the arm set.
+/// What a world's broker serves, in one line for its section.
 fn served_line(w: &World, spec: &Spec) -> String {
     let broker = w.broker.as_ref().expect("the world serves its own broker");
     let s = broker.served_durability();
@@ -1368,16 +1264,14 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 /// One bridge restart.
 struct Round {
     sessions: usize,
-    /// The visible head just before the kill: every record the new bridge
-    /// writes is at or past it.
+    /// The visible head just before the kill: every record the new bridge writes is at or past it.
     mark: u64,
     /// The restarted bridge's pid: its node row names it.
     pid: i32,
     t_kill: u64,
     t_pid: u64,
     sids: Vec<String>,
-    /// THE LIVE MAIL ([`attach`]): its text, and the moment it was visible
-    /// in its recipient's inbox.
+    /// The live mail ([`attach`]): its text, and the moment it was visible in its recipient's inbox.
     mail: String,
     t_mail_seen: u64,
 }
@@ -1391,8 +1285,7 @@ fn read_pid(w: &World) -> Option<i32> {
         .ok()
 }
 
-/// Where one bridge's attach landed: its node row, and each session's row in
-/// the order the sessions were named.
+/// Where one bridge's attach landed: its node row, and each session's row in the order the sessions were named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachRows {
     node: u64,
@@ -1400,9 +1293,7 @@ struct AttachRows {
 }
 
 impl AttachRows {
-    /// The last of them, the node row included: when the attach is done. (A
-    /// bridge that wrote its node row after a session's would otherwise be
-    /// "done" before its node said live.)
+    /// The last of them, the node row included: when the attach is done.
     fn last(&self) -> u64 {
         self.sessions
             .iter()
@@ -1418,10 +1309,7 @@ impl AttachRows {
     }
 }
 
-/// Where the bridge `pid` published its attach among `rows` — `(offset,
-/// subject, body head line)`, all at or past the round's mark: its node row
-/// (`state=live … pid=<pid>`) and, under that row's `inc=`, each of
-/// `session_subjects`' first live row.
+/// Where the bridge `pid` published its attach among `rows` — `(offset, subject, body head line)`, all at or past the round's mark.
 fn attach_rows(
     rows: &[(u64, &str, &str)],
     node_subject: &str,
@@ -1447,10 +1335,7 @@ fn attach_rows(
     Some(AttachRows { node, sessions })
 }
 
-/// THE ATTACH'S STOP SIGNAL, with nothing asked of the broker inside the timed
-/// window: read `watch` — a subscription to the node's presence rows from the
-/// round's mark, opened BEFORE the kill — until the bridge `pid` has published
-/// its whole attach ([`attach_rows`]).
+/// The attach's stop signal, with nothing asked of the broker inside the timed window.
 fn await_attach(
     watch: &mut Subscription,
     node_subject: &str,
@@ -1485,11 +1370,9 @@ fn await_attach(
 /// What one population's restarts wrote, beside the times.
 #[derive(Default)]
 struct AttachRecords {
-    /// Each round's census of the attach, the killed bridge's fired will left
-    /// out.
+    /// Each round's census of the attach, the killed bridge's fired will left out.
     censuses: Vec<census::Census>,
-    /// Each round's fired wills: records the KILL caused (the broker publishing
-    /// the dead bridge's `state=gone` node row), landing inside the window.
+    /// Each round's fired wills.
     fired: Vec<usize>,
 }
 
@@ -1513,8 +1396,7 @@ impl AttachRecords {
     }
 }
 
-/// The attach world: grow the population, restart the bridge `rounds` times
-/// at each size, census.
+/// The attach world: grow the population, restart the bridge `rounds` times at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
     let mut w = boot_world("fbench-att", spec, &[]);
@@ -1807,9 +1689,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-/// What the run's broker promised, for the report's head and its JSON. Each
-/// world's section also says what its broker SERVES, read from the broker
-/// (astream serves ordered strict off Apple and off the boot volume).
+/// What the run's broker promised, for the report's head and its JSON.
 fn broker_note(spec: &Spec) -> String {
     match spec.durability {
         Tier::Strict => "astream Broker::open_opts with aterm's strict options (Durability::Strict: \
@@ -1835,10 +1715,7 @@ fn broker_note(spec: &Spec) -> String {
     }
 }
 
-/// What the run's broker RETAINS and what the bridge mirrors, for the
-/// report's head beside [`broker_note`]: what ships (aterm's default rules at
-/// every open, the bridge's `--log auto`, astream's minute between ticks)
-/// unless the arm names otherwise.
+/// What the run's broker retains and what the bridge mirrors, for the report's head beside [`broker_note`].
 fn retention_note(spec: &Spec) -> String {
     let rules = if spec.retention {
         "retained by aterm's default rules, set at every open \
@@ -1867,7 +1744,7 @@ fn retention_note(spec: &Spec) -> String {
     format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.")
 }
 
-/// Run only the selected scenario. The closure must contain world setup too.
+/// Run only the selected scenario.
 fn measure_scenario(
     selected: Scenario,
     scenario: Scenario,
@@ -1939,8 +1816,7 @@ pub fn measure(spec: &Spec) -> Report {
     }
 }
 
-/// [`profile::identity`] of the harness's `aterm`, or why it could not be read,
-/// which the lane takes as no identity.
+/// [`profile::identity`] of the harness's `aterm`, or why it could not be read, which the lane takes as no identity.
 fn binary_identity() -> String {
     profile::identity(Path::new(harness::aterm()))
         .unwrap_or_else(|why| format!("unreadable: {why}"))
@@ -1992,9 +1868,6 @@ mod tests {
         assert_eq!(calls.get(), 4);
     }
 
-    /// EACH ARM OPENS ITS BROKER AS ATERM OPENS IT: aterm's options for the
-    /// tier — the escalation table on the weak tiers, none on strict — and
-    /// the arm's horizon on ordered, aterm's own unless named.
     #[test]
     fn each_arm_opens_its_broker_with_aterms_options() {
         use super::*;

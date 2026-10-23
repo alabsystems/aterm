@@ -22,7 +22,6 @@ use crate::common::{FrameHold, Rec};
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 const FRAME_MS: u64 = 16;
-/// The prompt `$ `.
 const PROMPT: i32 = 2;
 
 /// One present, as the pet drew it, and the caret on it.
@@ -73,7 +72,6 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The native order: observe, prepare, tick, rescan.
     fn present(&mut self) {
         if self.hold.withholds(&self.term, self.now) {
             return;
@@ -187,11 +185,6 @@ enum Key {
     Delete,
 }
 
-/// A line editor's take: the prompt `$ ` at `row0`, then `keys`, each `(ms after the last,
-/// key)`, echoed 2 ms later. A character is written where the caret is and the caret placed
-/// after it; at the right margin a space and a CR take the terminal's own autowrap (which
-/// scrolls at the bottom row), as zsh does. A delete places the caret back and clears the
-/// rest of the screen. Returns the events and when the keys began.
 fn line_editor(row0: u16, keys: &[(u64, Key)]) -> Vec<(u64, Rec)> {
     let mut ev = Vec::new();
     let mut t = 300u64;
@@ -241,7 +234,6 @@ const TEXT: &[u8] =
     b"the quick brown fox jumps over the lazy dog and keeps on running far past the \
 barn and over the hill and down to the river where it stops to drink then goes on";
 
-/// `n` characters at `gap` ms a key.
 fn typed(n: usize, gap: u64) -> Vec<(u64, Key)> {
     TEXT.iter()
         .cycle()
@@ -250,8 +242,6 @@ fn typed(n: usize, gap: u64) -> Vec<(u64, Key)> {
         .collect()
 }
 
-/// `n` characters at a hand's uneven pace: 70 to 170 ms a key, a third of the spaces held a
-/// quarter second longer (a fixed seed).
 fn by_hand(n: usize) -> Vec<(u64, Key)> {
     let mut s = 7u64;
     TEXT.iter()
@@ -272,7 +262,6 @@ fn by_hand(n: usize) -> Vec<(u64, Key)> {
         .collect()
 }
 
-/// A flight: `(ms it left, where it came down (col, row), the caret then)`.
 type Flight = (u64, (f32, f32), (u16, u16));
 
 /// What the replay saw from `from` ms on.
@@ -308,14 +297,10 @@ fn seen(shots: &[Shot], from: u64) -> Seen {
     }
 }
 
-/// A line typed (`len` keys at 60 ms), a pause, then `dels` deletes `gap` ms apart, from a
-/// prompt at `row0`; what the replay saw from the first delete on.
 fn held_delete(row0: u16, len: usize, dels: usize, gap: u64) -> Seen {
     held_delete_paced(row0, len, dels, [gap, gap])
 }
 
-/// [`held_delete`] with the deletes' gaps alternating `gaps[0]`, `gaps[1]` ms: a held key's
-/// repeat as the terminal delivers it, where a pair of echoes can land in one frame.
 fn held_delete_paced(row0: u16, len: usize, dels: usize, gaps: [u64; 2]) -> Seen {
     let mut keys = typed(len, 60);
     keys.push((1_500, Key::Type(b' ')));
@@ -325,17 +310,6 @@ fn held_delete_paced(row0: u16, len: usize, dels: usize, gaps: [u64; 2]) -> Seen
     seen(&h.shots, from)
 }
 
-/// A HELD DELETE ON ONE ROW IS FOLLOWED ON THE PAWS: at 31, 21 and 16 deletes a second, evenly
-/// and as a terminal delivers a held key (gaps of 10 and 56 ms, or 12 and 42, a pair of echoes
-/// in one frame), no flight, and the cat walks or runs through nearly half the hold or more
-/// (the rest is its startle and its stop). Negative
-/// controls: the cat as it ran on 2026-10-21 (no faster than 26 cells a second, feet planted
-/// for the whole startle, no pace fed back): two bounds at 31 a second, the cat airborne or
-/// coiled for 136 of 214 presents and on its legs for 17; and the run's pace taken step by
-/// step (a pair of echoes in one frame read as a hundred cells a second, past the gallop),
-/// with the pounce kept for a gap the gallop would close in over 1.2 s: the even holds ran,
-/// the uneven ones pounced twice, on their legs for 0 to 31 of about 200 presents (as a live
-/// instance did under the control socket's own key timing).
 #[test]
 fn a_held_delete_on_one_row_is_followed_on_the_paws() {
     for gaps in [[32u64, 32], [48, 48], [64, 64], [10, 56], [12, 42]] {
@@ -354,11 +328,6 @@ fn a_held_delete_on_one_row_is_followed_on_the_paws() {
     }
 }
 
-/// A HELD DELETE ACROSS A SOFT WRAP IS ONE BOUND A WRAP, ONTO THE CARET'S ROW: across one wrap
-/// and two, mid-screen and at the bottom row, at 31, 21 and 16 deletes a second, no more
-/// flights than wraps, and every flight comes down on the row the caret is on. Negative
-/// control (as run on 2026-10-21): three or four flights for one wrap, one coming down on
-/// the row the caret had left, a screen's width from it.
 #[test]
 fn a_held_delete_across_a_wrap_is_one_bound_onto_the_carets_row() {
     for (row0, len, dels, wraps) in [
@@ -385,12 +354,6 @@ fn a_held_delete_across_a_wrap_is_one_bound_onto_the_carets_row() {
     }
 }
 
-/// A HELD KEY IS FOLLOWED ON THE PAWS, AND EVERY WRAP TYPED THROUGH IS ONE FLIGHT: typed at a
-/// held key's 33 and 20 a second and by hand, mid-screen and on the bottom row (whose wrap
-/// scrolls), the line's three wraps take one flight each, every one coming down on the row
-/// the caret is on, and nothing else flies. Negative controls (as run on 2026-10-21): the
-/// hop over the caret at the margin and the bound at the wrap, two flights a wrap; at 33 keys
-/// a second also a chain of pounces along each line.
 #[test]
 fn a_held_key_runs_and_each_wrap_typed_through_is_one_flight() {
     let takes: [(&str, Vec<(u64, Key)>); 3] = [
@@ -424,8 +387,6 @@ fn a_held_key_runs_and_each_wrap_typed_through_is_one_flight() {
     }
 }
 
-/// The faintest present, against the present each flight left from, from every launch of a
-/// body on glass to half a second after its landing: `(that share, ms)`.
 fn faintest_in_flight(shots: &[Shot]) -> (f32, u64) {
     let mut worst = (1.0f32, 0u64);
     let mut i = 1;
@@ -454,9 +415,6 @@ fn faintest_in_flight(shots: &[Shot]) -> (f32, u64) {
     worst
 }
 
-/// The brightest present, against the present each flight gathered with, from the first frame
-/// of its gather to its last landing frame: `(that share, ms)`. A flight that lifts a veil it
-/// gathered under (and lays it back on once landed) blinks.
 fn brightest_in_flight(shots: &[Shot]) -> (f32, u64) {
     let mut worst = (0.0f32, 0u64);
     let mut i = 1;
@@ -493,16 +451,6 @@ fn brightest_in_flight(shots: &[Shot]) -> (f32, u64) {
     worst
 }
 
-/// A FLIGHT OVER THE WORDS KEEPS ITS BODY. The bound back across a held delete's wrap flies
-/// over the line it is deleting, and a wrap typed through at the bottom row bounds beside the
-/// line just scrolled up. Veiled by each frame's box, the cat went from full to a fifth of
-/// itself and back within one flight, three times in two seconds at a wrap, and held-delete
-/// pounces flashed solid at every landing (2026-10-21, both themes: the owner's "blinking").
-/// From every launch to half a second after its landing, no present draws it below nine
-/// tenths of the presence it left with; from its gather to its landing, none draws it above the
-/// presence it gathered with. Negative controls: (as run on 2026-10-21) 56 of 255; (as run on
-/// 2026-10-22, with every gather lifting the rest veil) the held delete's bound, gathered under
-/// the veil, drawn at 455% of the presence it gathered with.
 #[test]
 fn a_flight_over_the_words_keeps_its_body() {
     let mut keys = typed(130, 60);
@@ -534,9 +482,6 @@ fn a_flight_over_the_words_keeps_its_body() {
     }
 }
 
-/// Each pose that went on glass and came off again in under [`POSE_MS`] between two other
-/// poses, as `(ms it began, before, pose, after, ms on glass)`, by the art's family: a leg's
-/// cycle (the walk's, the amble's, the run's) is one family, as are the flight's frames.
 fn flashes(shots: &[Shot]) -> Vec<(u64, String, String, String, u64)> {
     const POSE_MS: u64 = 25;
     let family = |s: &Shot| {
@@ -578,15 +523,8 @@ fn flashes(shots: &[Shot]) -> Vec<(u64, String, String, String, u64)> {
     out
 }
 
-/// A named line-editor take: its name, the prompt's row and its keys ([`line_editor`]).
 type NamedTake = (String, u16, Vec<(u64, Key)>);
 
-/// NO POSE FLASHES AS A LINE IS TYPED AND HELD: typed at 15, 20 and 33 keys a second through
-/// two wraps, mid-screen and on the bottom row, and a held delete back across them, every pose
-/// the cat takes stays on glass two 60 Hz frames before the next. Negative control (as run on
-/// 2026-10-22): typed at 15 a second toward the margin, the cat stopped in its stand, and the
-/// wrap's coil, timed under the stand's held stride, came out from behind it on its last
-/// frame: one frame of the crouch between the stand and the launch, at every wrap.
 #[test]
 fn no_pose_flashes_as_a_line_is_typed_and_held() {
     let mut takes: Vec<NamedTake> = Vec::new();

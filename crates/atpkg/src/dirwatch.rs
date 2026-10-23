@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A blocking watch over directories and files, for a thread that sleeps until something it reads may have moved: a kqueue of vnode filters on macOS, an inotify instance on Linux, and none elsewhere ([`Watcher::new`] answers `Unsupported`; nothing names a watch on Windows).
+//! A blocking watch over directories and files, for a thread that sleeps until something it reads may have moved: a kqueue of vnode filters on macOS, an inotify instance on Linux, and none elsewhere ([`Watcher::new`](crate::dirwatch::Watcher::new) answers `Unsupported`; nothing names a watch on Windows).
 
 use std::io;
 use std::path::Path;

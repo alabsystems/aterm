@@ -4,6 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/xdisplay.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): the libraries, the XCB connection under Xlib's display and the resource
+// database are aterm-x11's, where upstream used x11-dl and x11rb. The server timestamp cache is
+// gone with the activation-token request. A broken connection ends the event loop, not the process
+// (`install_io_error_exit_handler`). With no XSETTINGS manager no window is watched (upstream
+// selected events on window 0). SYNC is initialised for the resize sync counters.
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;

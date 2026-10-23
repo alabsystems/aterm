@@ -1494,21 +1494,14 @@ impl ReadOn {
     }
 }
 
-/// [`term_lock`] for a control thread's read of the screen, held on a whole DEC 2026 frame
-/// (`docs/measured/half-drawn-frame-2026-10-22.md`). While the frame is unfinished the lock is let
-/// go and the read parks on the session's watcher list, which its PTY reader rings at every burst,
-/// until [`whole_frame_bound`] or its caller hangs up; a frame still unfinished then is read as it
-/// stands and the reply says `frame=open`. A whole frame costs two flag loads. Never on the event
-/// loop (census OB-23).
+/// [`term_lock`] for a control thread's read of the screen, held on a whole DEC 2026 frame.
 #[track_caller]
 pub(crate) fn term_lock_whole(term: &Mutex<Terminal>) -> TermGuard<'_> {
     term_lock_whole_when(term, park::Lane::SERVED, |_| true)
 }
 
 /// [`term_lock_whole`] parked on `lane`, where `needs`, asked only of an unfinished frame, says
-/// whether this read waits; one call bound by a plain `let`, so the census sees the guard. A read
-/// that finishes whether or not its caller is there (a turn's committed phases) passes
-/// [`park::Lane::ignoring_hangup`].
+/// whether this read waits; one call bound by a plain `let`, so the census sees the guard.
 #[track_caller]
 pub(crate) fn term_lock_whole_when(
     term: &Mutex<Terminal>,
@@ -1529,7 +1522,6 @@ pub(crate) fn term_lock_whole_when(
         return guard;
     };
     drop(guard);
-    // Registered before the next look: a burst that closes the frame after it rings this.
     let sub = session_watch::Subscription::single(&watchers);
     loop {
         let guard = term_lock(term);
@@ -1538,7 +1530,6 @@ pub(crate) fn term_lock_whole_when(
             return guard;
         }
         drop(guard);
-        // Sliced like every control park, so a caller that hung up gets its lane back.
         let woke = park::park(|b| sub.wait(b), bound, lane, &|| false);
         if woke == park::Woke::HungUp {
             return term_lock(term);
@@ -2844,7 +2835,7 @@ pub(crate) enum HarnessFact {
     LandHeld,
 }
 
-/// THE LOOP'S PAUSE AFTER SHORT TURNS, as the window is told it ([`HarnessFact::Pause`], §10.5.3).
+/// THE LOOP'S PAUSE AFTER SHORT TURNS, as the window is told it ([`HarnessFact::Pause`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PausePlan {
     pub(crate) at_unix: i64,
@@ -10143,12 +10134,9 @@ impl App {
             .devtools_watch
             .take_return_prime(list_read, row.grant())
         {
-            // Back from the page aterm brought them to, with the list out of sight:
-            // macOS is asked about aterm again whatever they did there.
             let _ = self.devtools_helper.refresh_verdict();
         }
         if self.apply_devtools_step(step) {
-            // Held for a quiet moment, through the one hand-over.
             let _ = self.hand_devtools_to_owner(devtools_helper::Origin::Automatic);
         }
     }
@@ -10159,8 +10147,6 @@ impl App {
             devtools_watch::Step::Clear => {
                 self.except_clear(crate::message_reporters::DEVTOOLS_KEY);
                 if self.devtools_watch.take_refresh() {
-                    // This process was checked before the switch went on: macOS
-                    // keeps that verdict until a fresh aterm process asks.
                     let _ = self.devtools_helper.refresh_verdict();
                 }
                 false
@@ -10475,9 +10461,6 @@ impl App {
                         self.consent.invalidate_devtools();
                         self.devtools_watch.note_handed_over();
                         if self.devtools_watch.note_switched_on() {
-                            // The owner says the switch is on, where aterm cannot read the
-                            // list: macOS is asked about aterm again, and its answer is the
-                            // reading that confirms the press.
                             let _ = self.devtools_helper.refresh_verdict();
                         }
                     }
@@ -10491,9 +10474,6 @@ impl App {
                     // A grant is the window's own probe's to read
                     // ([`Self::tick_fda_hand_over`]); the panel reads no list.
                     if asks.recheck {
-                        // "I've switched it on": the card's Open Settings by another
-                        // door — the `opened` marker, a fresh probe and the watch
-                        // for the ✓.
                         self.note_macos_access_settings_opened(now);
                     }
                 }
@@ -10668,14 +10648,9 @@ impl App {
                     let _ = slot.set(debugger_access::read_asked(&config, host));
                 };
                 if !self.launch_ask_disk("aterm-launch-asked", answer) {
-                    // No thread to read it on: fail toward not asking, as a
-                    // record that cannot be read does (the ask drops).
                     return (HostAsked::Asked, Some(host));
                 }
                 if read == debugger_access::RecordRead::Thread {
-                    // The look that started the read waits for it, however fast
-                    // it ends: its end wakes the window, and the next look acts
-                    // on it.
                     return (HostAsked::Cold, None);
                 }
             }
@@ -17626,8 +17601,6 @@ impl App {
                 let capture_serviced =
                     service_captures && self.resume_deferred_gpu_captures(window, surface);
                 if !capture_serviced && (redraw_hidden || service_captures) {
-                    // Hidden AppKit windows can suppress request_redraw, so consume this
-                    // completion directly (as `resumed`'s handoff paint does).
                     self.redraw_window(window);
                 }
                 self.prune_deferred_gpu_captures();
@@ -17750,10 +17723,6 @@ impl App {
                 self.cancel_session_rename(window, session);
             }
             Wake::TabCmd { action, by, reply } => {
-                // Native drag gestures and controller tab commands share this wake; the
-                // wire close policy, exit attribution and last-tab escalation live in
-                // `App::tab_cmd_front` beside `App::tab_cmd_aimed`, which answer
-                // `reply` (a `tab new` once its tab lands).
                 self.tab_cmd_front(el, action, by, reply);
             }
             Wake::TabCmdAimed {
@@ -23088,8 +23057,6 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
         "aterm-chrome-font-warm",
         crate::qos::Role::Responsive,
         || {
-            // `Responsive`, not `Background`: the UI thread's first chrome raster blocks on
-            // this `OnceLock` init, so a demoted initializer would be a priority inversion.
             crate::tray_raster::warm_chrome_font_assets();
         },
     )
@@ -23418,8 +23385,6 @@ fn warm_prologue(
     if let Some(dir) = &reroute_dir {
         env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), dir.clone()));
     } else if std::env::var_os(atpkg::reroute::REROUTE_DIR_ENV).is_some() {
-        // An enclosing session's directory came in by inheritance: blank it so the
-        // integration's re-assert stays inert ("no export" must mean "not set").
         env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), String::new()));
     }
     if integrate {

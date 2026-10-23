@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! The SAME-BOX TREND LEDGER and the machine identity it is keyed by.
 
@@ -12,25 +11,16 @@ use super::floors::golden_dir;
 /// Same-box floor ratio.
 pub(crate) const TREND_RATIO: f64 = 0.70;
 
-/// How many most-recent same-box entries per metric form the reference (their MAX is the floor's base).
+/// How many most-recent same-box entries per metric form the reference.
 pub(crate) const TREND_WINDOW: usize = 10;
 
-/// How far apart one figure of two operating points may be and still be one machine
-/// state: the larger at most this many times the smaller. On an M5 Max the effects lane's
-/// reference full repaint measured within 0.2% of 535.8 us (blank 367.5 us) across six
-/// runs in one GPU state, 175.9 us (blank 117.6 us) and 195.3 us (blank 80.4 us) in two
-/// others, and its gated GPU ratios moved by up to 1.6x between states while the code did
-/// not change.
+/// How far apart one figure of two operating points may be and still be one machine state.
 pub(crate) const OPERATING_POINT_BAND: f64 = 1.25;
 
-/// One figure of the machine state a sample was measured in, when its number moves with a
-/// state the run does not set: a sample that names an operating point (one or more
-/// figures) is judged only against rows measured at the same point ([`same_point`]), so a
-/// state change is not read as a regression.
+/// One figure of the machine state a sample was measured in.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PointFigure {
-    /// The harness report key that measured it (`ref_gpu_p50_us`); a ledger row carries it
-    /// as a `<name>=<value>` column.
+    /// The harness report key that measured it (`ref_gpu_p50_us`).
     pub name: &'static str,
     pub value: f64,
 }
@@ -41,10 +31,9 @@ pub(crate) struct TrendSample {
     pub lane: &'static str,
     pub metric: String,
     pub value: f64,
-    /// LOWER is better (worst-latency metrics, e.g. the resize `*_worst_ms` fences): the same-box bound is best(MIN)/TREND_RATIO — a ceiling — instead of best(MAX)*TREND_RATIO — a floor.
+    /// LOWER is better (worst-latency metrics, e.g. the resize `*_worst_ms` fences).
     pub inverted: bool,
-    /// The figures of the operating point it was measured at; none when its number does not
-    /// depend on one.
+    /// The figures of the operating point it was measured at.
     pub at: Vec<PointFigure>,
 }
 
@@ -60,18 +49,16 @@ pub(crate) fn boxes_path() -> std::path::PathBuf {
 /// Who this machine is, as the ledger keys it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachineId {
-    /// The ledger's box column: a short name from the alias table, or a deterministic `box-<digest>` when nothing claims this machine.
+    /// The ledger's box column.
     pub key: String,
     /// Chip + logical cores (`Apple-M5-Max-18c`).
     pub shape: String,
-    /// The raw tokens this machine answers to, strongest first: `fp:<digest>` when a platform UUID could be read, then `host:<hostname>`.
+    /// The raw tokens this machine answers to, strongest first.
     pub identities: Vec<String>,
     /// An alias row explicitly claimed one of [`Self::identities`].
     pub claimed: bool,
 }
 
-/// Alphanumerics kept, runs of anything else collapsed to one `-`, so a chip
-/// string is safe in a TSV column and readable in a diff.
 fn slug(s: &str) -> String {
     let mut out = String::new();
     let mut pending_sep = false;
@@ -89,7 +76,6 @@ fn slug(s: &str) -> String {
     out
 }
 
-/// The machine's platform UUID, or `None` where none can be read.
 fn platform_uuid() -> Option<String> {
     if cfg!(target_os = "macos") {
         let out = Command::new(aterm_uds::os_path!("ioreg"))
@@ -133,8 +119,6 @@ fn platform_uuid() -> Option<String> {
     None
 }
 
-/// The stable, non-identifying machine fingerprint — `None` when no platform
-/// UUID is readable, in which case the hostname is all we have.
 fn platform_fingerprint() -> Option<String> {
     let raw = platform_uuid()?;
     let t = raw.trim();
@@ -150,8 +134,6 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
-/// Chip + logical cores, e.g. `Apple-M5-Max-18c`. Recorded per row so a wrong
-/// alias claim is DETECTABLE; see [`chip_of`] for what is actually compared.
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
         Command::new(aterm_uds::os_path!("sysctl"))
@@ -189,7 +171,7 @@ pub(crate) fn chip_of(shape: &str) -> &str {
     }
 }
 
-/// The box an alias table gives `identity` (`fp:<digest>` / `host:<name>`), or `None` when no row claims it.
+/// The box an alias table gives `identity` (`fp:<digest>` / `host:<name>`).
 pub(crate) fn alias_lookup(aliases: &str, identity: &str) -> Option<String> {
     aliases
         .lines()
@@ -220,7 +202,8 @@ pub(crate) fn alias_boxes(aliases: &str) -> Vec<String> {
 /// What a ledger row's box column means, resolved through the alias table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BoxRef {
-    /// An alias row claims this token (as `host:<token>`/`fp:<token>`) or declares it as a box name outright.
+    /// An alias row claims this token (as `host:<token>`/`fp:<token>`) or declares it as a box name
+    /// outright.
     Claimed(String),
     /// Nothing in the alias table mentions it.
     Unclaimed(String),
@@ -291,7 +274,6 @@ pub(crate) fn machine_id() -> MachineId {
     }
 }
 
-/// The tree a run measured, for its rows' sha column: see [`tree_label`].
 fn head_sha() -> String {
     let git = |args: &[&str]| {
         aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
@@ -309,11 +291,10 @@ fn head_sha() -> String {
     tree_label(sha.trim(), status.as_deref())
 }
 
-/// The perf golden dir, relative to the workspace root: a `--record` rewrites its files
-/// before the trend rows are written, so its changes do not make the measured tree dirty.
 const GOLDEN_REL: &str = "crates/aterm-verify/perf/golden/";
 
-/// HEAD's short `sha`, with `+dirty` when `git status --porcelain` names a tracked file outside [`GOLDEN_REL`] that differs from HEAD (or could not be read), so a row measured on uncommitted code does not pass as HEAD's.
+/// HEAD's short `sha`, with `+dirty` when `git status --porcelain` names a tracked file outside
+/// [`GOLDEN_REL`] that differs from HEAD (or could not be read).
 pub(crate) fn tree_label(sha: &str, porcelain: Option<&str>) -> String {
     let dirty = porcelain.is_none_or(|status| {
         status.lines().filter(|l| !l.trim().is_empty()).any(|line| {
@@ -360,9 +341,6 @@ pub(crate) fn rfc3339(secs: u64) -> String {
     )
 }
 
-/// Days past the Unix epoch as a UTC date, without a chrono dependency:
-/// civil-from-days (Howard Hinnant's algorithm, exact for the Gregorian
-/// calendar).
 fn civil_date(days: u64) -> String {
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
@@ -377,7 +355,6 @@ fn civil_date(days: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The eighth column of a row a re-record wrote ([`trend_rows`]).
 const RERECORDED: &str = "rerecorded";
 
 /// One parsed ledger row.
@@ -386,19 +363,16 @@ pub(crate) struct TrendRow<'a> {
     pub token: &'a str,
     pub metric: &'a str,
     pub value: f64,
-    /// What measured it ([`toolchain_lane`]); `""` on every row written
-    /// before the toolchain column existed.
+    /// What measured it ([`toolchain_lane`]).
     pub toolchain: &'a str,
     /// `""` on every row written before the shape column existed.
     pub shape: &'a str,
-    /// A run that re-recorded this row's lane wrote it: the lane's new level is declared, so this box's reference window for the metric starts here ([`judge_trend`]).
+    /// A run that re-recorded this row's lane wrote it.
     pub rerecorded: bool,
-    /// The figures of the operating point it was measured at (`<name>=<value>` columns after
-    /// the shape); none on a row that names none, as every row written before them.
+    /// The figures of the operating point it was measured at.
     pub at: Vec<(&'a str, f64)>,
 }
 
-/// A `<name>=<value>` ledger column with a finite positive value.
 fn parse_point(col: &str) -> Option<(&str, f64)> {
     let (name, value) = col.trim().split_once('=')?;
     let value = value
@@ -408,10 +382,7 @@ fn parse_point(col: &str) -> Option<(&str, f64)> {
     (!name.is_empty()).then_some((name, value))
 }
 
-/// Whether a row measured at `row` may judge a sample measured at `sample`: any row when
-/// the sample names no point; otherwise only a row that names every figure the sample does,
-/// each within [`OPERATING_POINT_BAND`] of the sample's, so a row that names none cannot
-/// show it was measured in this state.
+/// Whether a row measured at `row` may judge a sample measured at `sample`.
 pub(crate) fn same_point(sample: &[PointFigure], row: &[(&str, f64)]) -> bool {
     sample.iter().all(|f| {
         row.iter().any(|&(name, v)| {
@@ -479,7 +450,7 @@ pub(crate) struct Breach {
     pub inverted: bool,
 }
 
-/// The ledger tokens no alias row claims, each with the claimed box measured on the same chip, if one was: a machine that renamed itself and started a second, disconnected history has exactly that signature.
+/// The ledger tokens no alias row claims.
 pub(crate) fn orphans<'a>(rows: &[TrendRow<'a>], aliases: &str) -> Vec<(&'a str, Option<String>)> {
     let claimed: Vec<(String, &str)> = rows
         .iter()
@@ -520,14 +491,13 @@ pub(crate) struct TrendJudgment {
     pub breaches: Vec<Breach>,
     /// Metrics with NO same-box history: first run on this box.
     pub skipped: Vec<String>,
-    /// Metrics whose same-box history was all measured at another operating point, or names
-    /// none: a named skip, never a pass.
+    /// Metrics whose same-box history was all measured at another operating point.
     pub elsewhere: Vec<Elsewhere>,
     /// `(token, chip)` pairs that resolve to THIS box but were measured on a different CHIP.
     pub conflicts: Vec<(String, String)>,
 }
 
-/// Judge `samples` against the same-box history in the ledger text, with `aliases` deciding which rows are THIS box.
+/// Judge `samples` against the same-box history in the ledger text.
 pub(crate) fn judge_trend(
     ledger: &str,
     aliases: &str,
@@ -574,17 +544,12 @@ pub(crate) fn judge_trend(
             .copied()
             .filter(|r| r.metric == metric_key && r.value > 0.0)
             .collect();
-        // A metric's window starts at its lane's last re-record, or after the
-        // last row another toolchain or engine measured, whichever is later:
-        // neither declares a level this run's engine is held to. A row from
-        // before the column says nothing either way.
         let toolchain = toolchain_lane(s.lane);
         let recorded = rows.iter().rposition(|r| r.rerecorded).unwrap_or(0);
         let changed = rows
             .iter()
             .rposition(|r| !r.toolchain.is_empty() && r.toolchain != toolchain)
             .map_or(0, |i| i + 1);
-        // Within that span, only the rows measured at this run's operating point.
         let span = &rows[recorded.max(changed)..];
         let mut history: Vec<f64> = span
             .iter()
@@ -630,12 +595,6 @@ pub(crate) fn judge_trend(
     }
 }
 
-/// Which toolchain builds a lane's measurement binary, and for the wasm lane
-/// the engine that runs it: recorded per ledger row so cross-toolchain drift
-/// (a Trust-toolchain bump vs an upstream-stable bump) is never misread as a
-/// same-box perf change, and a metric's window starts after the last row
-/// another one measured ([`judge_trend`]). The wasm lane's rows before S10
-/// say `stable`: node measured them, and the pinned browser is not node.
 fn toolchain_lane(lane: &str) -> &'static str {
     if lane == "wasm" {
         "stable+chrome-headless-shell"
@@ -689,14 +648,14 @@ measured\n# at an operating point carries its figures last (the effects GPU keys
 against rows whose\n# figures are each within OPERATING_POINT_BAND of its own.\n# \
 date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\trerecorded\tpoint...\n";
 
-/// Whether this run's samples join the ledger, which holds only good states: every floor lane held, no alias claim merges two machines, and any trend breach is on a lane whose baseline this run re-recorded (`recorded` names those trend lanes), because a re-record declares the new level deliberate.
+/// Whether this run's samples join the ledger.
 pub(crate) fn may_append(lanes_ok: bool, judgment: &TrendJudgment, recorded: &[&str]) -> bool {
     lanes_ok
         && judgment.conflicts.is_empty()
         && judgment.breaches.iter().all(|b| recorded.contains(&b.lane))
 }
 
-/// The trend sub-gate: compare this run's samples against the same-box history, and append them when [`may_append`] allows.
+/// The trend sub-gate.
 pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&str]) -> LaneRun {
     let path = trend_path();
     let me = machine_id();
@@ -861,8 +820,6 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&s
 mod tests {
     use super::*;
 
-    /// A synthetic box for the pure-judgment tests: a name, and one fixed chip
-    /// so a row this helper writes and a row it judges agree.
     fn box_id(key: &str) -> MachineId {
         MachineId {
             key: key.to_string(),
@@ -872,13 +829,10 @@ mod tests {
         }
     }
 
-    /// [`judge_trend`] with no alias table, where the ledger's box column IS
-    /// the box.
     fn judged(ledger: &str, key: &str, samples: &[TrendSample]) -> TrendJudgment {
         judge_trend(ledger, "", &box_id(key), samples)
     }
 
-    /// [`trend_rows`] for a synthetic box.
     fn rows_for(date: &str, sha: &str, key: &str, samples: &[TrendSample]) -> String {
         trend_rows(date, sha, &box_id(key), samples, &[])
     }
@@ -893,8 +847,6 @@ mod tests {
         }
     }
 
-    /// The effects lane's GPU operating point: the reference full repaint's GPU p50 and the
-    /// blank one's, in us.
     fn gpu_point(ref_us: f64, blank_us: f64) -> Vec<PointFigure> {
         vec![
             PointFigure {
@@ -908,7 +860,6 @@ mod tests {
         ]
     }
 
-    /// A sample measured at [`gpu_point`]`(ref_us, blank_us)`.
     fn gpu_sample(metric: &str, value: f64, ref_us: f64, blank_us: f64) -> TrendSample {
         TrendSample {
             at: gpu_point(ref_us, blank_us),
@@ -950,9 +901,6 @@ mod tests {
         assert!(!may_append(true, &merged, &["throughput"]));
     }
 
-    /// A re-record declares its lane's new level: the rows it wrote start each
-    /// of that lane's metrics' windows, so the next run is held to the new
-    /// level, not to the best of the level it replaced.
     #[test]
     fn a_re_record_starts_its_lanes_window() {
         let old: String = (0..4)
@@ -1001,11 +949,6 @@ mod tests {
         assert!(!trend_ledger_rows(&old)[0].rerecorded);
     }
 
-    /// The box whose effects trend stayed red: its one seed row named no GPU state, and its
-    /// gated GPU ratios came from another one (episode 2.884 there; 1.80 with the reference
-    /// at 535.7 us and the blank at 367.5 us). A sample at an operating point is held only to
-    /// rows at that point, and with none it is a named skip, not a pass. NEGATIVE CONTROL:
-    /// the same sample naming no point is held to the seed row and breaches.
     #[test]
     fn a_gpu_ratio_is_judged_only_against_rows_at_its_operating_point() {
         let seed =
@@ -1045,11 +988,6 @@ mod tests {
         assert!(fresh.elsewhere.is_empty());
     }
 
-    /// A true slowdown measured in the same GPU state still fails, against the best of the
-    /// rows at that point alone: a row whose figures are each within the band counts, and
-    /// one whose reference matches but whose blank repaint does not (175.9/117.6 us against
-    /// 195.3/80.4 us, two states this box measured) is another point. NEGATIVE CONTROL: the
-    /// state's own level passes.
     #[test]
     fn a_true_slowdown_at_the_same_operating_point_still_fails() {
         let mut ledger = String::new();
@@ -1115,9 +1053,6 @@ mod tests {
         assert!(same_point(&[], &[]), "a sample with no point takes any row");
     }
 
-    /// The figures are columns after the shape, after `rerecorded` when both are written, so
-    /// a parser that reads only the eighth column for `rerecorded` still reads both rows
-    /// right.
     #[test]
     fn a_rows_operating_point_round_trips_beside_its_re_record_mark() {
         let me = box_id("boxA");
@@ -1327,8 +1262,6 @@ mod tests {
         );
     }
 
-    /// A row names the tree it measured: HEAD's sha alone only when nothing outside the golden
-    /// dir (which a record rewrites) differs from HEAD.
     #[test]
     fn a_row_measured_on_uncommitted_code_says_so() {
         assert_eq!(tree_label("abc", Some("")), "abc");
@@ -1365,11 +1298,6 @@ mod tests {
         );
     }
 
-    /// Rows another engine measured anchor nothing: the wasm lane's node rows
-    /// (`stable`) never hold the browser's numbers, and once the browser has
-    /// rows of its own they are the window. A row from before the toolchain
-    /// column cuts no window (the trust lanes' oldest rows). NEGATIVE
-    /// CONTROL: the same history spelled as the browser's breaches.
     #[test]
     fn another_engines_rows_start_no_window_for_this_one() {
         let row = |toolchain: &str, value: f64| {
@@ -1416,8 +1344,6 @@ mod tests {
          m21\thost:m15.local\tbefore the rename — SAME machine\n\
          m7\tfp:0123456789abcdef\ta different box\n";
 
-    /// A rename must not fork a box's history away from itself: both spellings
-    /// land on one key, and a machine the table never mentions on its own.
     #[test]
     fn a_rename_no_longer_forks_a_box_from_its_own_history() {
         assert_eq!(resolve_ledger_box(ALIASES, "m15.local").key(), "m21");
@@ -1449,8 +1375,6 @@ mod tests {
         );
     }
 
-    /// THE OTHER HALF, and the one that matters more: an identity nobody
-    /// claimed is NEVER folded into a box that merely looks similar.
     #[test]
     fn an_unclaimed_identity_stands_alone_and_is_never_merged() {
         let r = resolve_ledger_box(ALIASES, "some-other-mac.local");
@@ -1473,8 +1397,6 @@ mod tests {
         assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
     }
 
-    /// A box that has already written AUTO-KEYED rows keeps them when a human
-    /// finally names it — `box-<digest>` resolves through the `fp:` row.
     #[test]
     fn naming_a_box_adopts_the_rows_it_wrote_before_it_had_a_name() {
         assert_eq!(
@@ -1485,7 +1407,6 @@ mod tests {
         assert!(!resolve_ledger_box(ALIASES, "box-1111111111111111").is_claimed());
     }
 
-    /// THE GUARD ON THE CLAIM.
     #[test]
     fn a_chip_conflict_drops_the_rows_instead_of_comparing_across_machines() {
         let ledger =

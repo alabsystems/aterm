@@ -15,8 +15,6 @@ use crate::cursor_momentum::test_fixtures::{
 };
 use crate::cursor_momentum::{LightInkMemo, MomentumGlowConfig, MomentumGlowFrame};
 
-/// A straight run: the observation of every input, and the engine and its
-/// snapshot at every boundary (`engines[k]` is the state before input `k`).
 struct Straight {
     obs: Vec<Obs>,
     engines: Vec<MomentumGlow>,
@@ -39,13 +37,11 @@ fn straight(evs: &[Ev], clock: &Clock, epoch: Instant) -> Straight {
     run
 }
 
-/// Continues `g` over `evs`.
 fn resume(mut g: MomentumGlow, evs: &[Ev], clock: &Clock) -> (Vec<Obs>, MomentumGlow) {
     let obs = evs.iter().map(|ev| step(&mut g, clock, ev)).collect();
     (obs, g)
 }
 
-/// The first input whose observation differs, if any.
 fn first_divergence(a: &[Obs], b: &[Obs]) -> Option<usize> {
     if a.len() != b.len() {
         return Some(a.len().min(b.len()));
@@ -53,7 +49,6 @@ fn first_divergence(a: &[Obs], b: &[Obs]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
-/// Snapshot → bytes → snapshot → engine.
 fn through_bytes(s: &MomentumGlowSnapshot, epoch: Instant) -> MomentumGlow {
     let decoded = MomentumGlowSnapshot::decode(&s.encode()).expect("an encoding decodes");
     assert_eq!(decoded, *s, "decode(encode(s)) is s");
@@ -115,10 +110,6 @@ fn a_snapshot_taken_after_the_first_key_carries_negative_offsets_and_continues_e
     );
 }
 
-/// A snapshot restored onto another host's epoch, a week away, continues
-/// exactly when the later inputs are rebased with it. Negative control: the
-/// same restore with the inputs left on the old clock diverges, so the epoch
-/// is what carries time across.
 #[test]
 fn a_snapshot_restored_onto_another_epoch_continues_exactly() {
     let mut unrebased_diverged = 0usize;
@@ -171,10 +162,6 @@ fn strip(g: &mut MomentumGlow, field: Strip) {
     }
 }
 
-/// Negative control for the snapshot's coverage: an engine restored with any
-/// one field zeroed (built directly, past `validate`, which would refuse most
-/// of them) shows something different on some fixture, so every field the
-/// snapshot carries is load-bearing.
 #[test]
 fn stripping_any_one_field_makes_some_fixture_diverge() {
     let runs: Vec<_> = fixtures()
@@ -209,12 +196,6 @@ fn stripping_any_one_field_makes_some_fixture_diverge() {
     }
 }
 
-/// The light-ink memo is a cache: wherever the straight run holds a warm memo,
-/// an engine restored with it cold draws every later light frame byte for
-/// byte, including after a hue change (a miss) and an ink that differs only
-/// in its ignored alpha byte (a hit on another raw key). Negative control: the
-/// same engine with a poisoned memo on the current key draws differently, so
-/// the comparison sees the memo.
 #[test]
 fn a_restored_engine_with_a_cold_memo_draws_the_light_page_byte_for_byte() {
     let evs = light_page_burst();
@@ -253,9 +234,6 @@ fn a_restored_engine_with_a_cold_memo_draws_the_light_page_byte_for_byte() {
     );
 }
 
-/// An inert tick appends nothing to either stream, yet changes the state, and
-/// the snapshot captures that change: `fp_last` moves to `fp_prev`, and the
-/// latch, stamp and `fp_last` clear.
 #[test]
 fn an_inert_tick_leaves_the_streams_untouched_but_its_state_change_is_captured() {
     let clock = Clock::ahead(Duration::ZERO);
@@ -305,8 +283,6 @@ fn an_inert_tick_leaves_the_streams_untouched_but_its_state_change_is_captured()
     );
 }
 
-/// The rest state is all zeros and absences. Its encoding is the schema
-/// followed by 62 zero bytes, and it restores to rest.
 #[test]
 fn the_rest_state_encodes_as_the_schema_and_zeros_and_restores_to_rest() {
     let epoch = Clock::ahead(Duration::ZERO).origin;
@@ -331,7 +307,6 @@ fn the_rest_state_encodes_as_the_schema_and_zeros_and_restores_to_rest() {
     assert_eq!(g.snapshot(epoch), Ok(rest));
 }
 
-/// A hot, stamped state a step could have produced.
 fn hot() -> MomentumGlowSnapshot {
     MomentumGlowSnapshot {
         rate_value: 0.7f32.to_bits(),
@@ -344,7 +319,6 @@ fn hot() -> MomentumGlowSnapshot {
     }
 }
 
-/// A cooled state: the rate still stamped, nothing latched, τ dead.
 fn cooled() -> MomentumGlowSnapshot {
     MomentumGlowSnapshot {
         rate_value: 0.1f32.to_bits(),
@@ -456,7 +430,6 @@ fn decode_refuses_every_truncation_and_every_extension_by_length() {
     }
 }
 
-/// What decoding `s`'s encoding with byte `i` XORed by `mask` must give.
 fn expected_after_flip(
     s: &MomentumGlowSnapshot,
     i: usize,
@@ -538,7 +511,6 @@ fn expected_after_flip(
     }
 }
 
-/// Every byte under three masks, over a hot, a cooled and the rest state.
 #[test]
 fn every_byte_flip_is_refused_exactly_or_decodes_to_exactly_the_flipped_field() {
     let epoch = Clock::ahead(Duration::ZERO).origin;
@@ -980,21 +952,16 @@ fn validate_refuses_each_unreachable_state_with_its_own_variant() {
     }
 }
 
-/// The rest state.
 fn rest() -> MomentumGlowSnapshot {
     MomentumGlow::default()
         .snapshot(Clock::ahead(Duration::ZERO).origin)
         .expect("snapshots")
 }
 
-/// The hosted horizon in nanoseconds.
 fn horizon_ns() -> i128 {
     i128::try_from(MOMENTUM_PROFILE.horizon.as_nanos()).expect("the horizon fits i128 ns")
 }
 
-/// A negative offset is never past the horizon, so only the host's `Instant`
-/// range bounds it: one beyond it is refused at restore, and one inside it,
-/// decades before the epoch, restores and schedules without a panic.
 #[test]
 fn restore_refuses_a_negative_offset_outside_the_instant_range_and_accepts_one_inside_it() {
     let epoch = Clock::ahead(Duration::ZERO).origin;
@@ -1041,9 +1008,6 @@ fn restore_refuses_a_negative_offset_outside_the_instant_range_and_accepts_one_i
     assert!(g.next_change_deadline(stamp, LANE).is_some());
 }
 
-/// A stamp exactly at the horizon restores, and its schedule forms; one past
-/// it is refused before the epoch is consulted (the validate table holds the
-/// exact refusals).
 #[test]
 fn a_stamp_at_the_horizon_restores_and_schedules_and_one_past_it_is_refused() {
     let clock = Clock::ahead(Duration::ZERO);
@@ -1074,10 +1038,8 @@ fn a_stamp_at_the_horizon_restores_and_schedules_and_one_past_it_is_refused() {
     );
 }
 
-/// A 120 Hz lane.
 const LANE: Duration = Duration::from_micros(8_333);
 
-/// The latest whole-second instant `checked_add` forms from `base`, found by bisection.
 fn instant_ceiling(base: Instant) -> Instant {
     let (mut lo, mut hi) = (0u64, u64::MAX);
     while lo < hi {
@@ -1092,9 +1054,6 @@ fn instant_ceiling(base: Instant) -> Instant {
         .expect("the bisection's floor is formable")
 }
 
-/// Near the platform's `Instant` ceiling the epoch itself is representable,
-/// but a stamp whose settle schedule (`τ·ln 255 + SETTLE_MARGIN`, 333 s at the
-/// profile's longest τ) would cross the ceiling is refused at restore.
 #[test]
 fn near_the_instant_ceiling_a_stamp_whose_schedule_cannot_form_is_refused_and_any_other_schedules()
 {
@@ -1146,10 +1105,6 @@ fn near_the_instant_ceiling_a_stamp_whose_schedule_cannot_form_is_refused_and_an
     }
 }
 
-/// The rate's floor is what `on_key` stores over the least value that has
-/// not snapped (`SNAP_ZERO`, read with no time elapsed), and a key over a
-/// rate that reads 0 stores exactly the credit. Both validate; the bit just
-/// above the credit and just below the floor do not (the validate table).
 #[test]
 fn the_rate_floor_is_what_a_key_stores_over_the_least_live_value() {
     let clock = Clock::ahead(Duration::ZERO);
@@ -1174,10 +1129,6 @@ fn the_rate_floor_is_what_a_key_stores_over_the_least_live_value() {
     const { assert!(MOMENTUM_GLOW_KEY_CREDIT < LIVE_CREDIT_FLOOR) };
 }
 
-/// A hand-built τ outside the profile is refused at restore even though the
-/// engine computes with it, because no hosted tick latches it. The longest
-/// admitted τ restores and continues like the straight run (the "resets and
-/// inert arms" fixture latches it).
 #[test]
 fn a_latched_tau_past_the_profile_is_refused_and_the_profiles_own_is_restored() {
     let epoch = Clock::ahead(Duration::ZERO).origin;
@@ -1222,7 +1173,6 @@ fn a_latched_tau_past_the_profile_is_refused_and_the_profiles_own_is_restored() 
     );
 }
 
-/// splitmix64, seeded.
 struct Rng(u64);
 
 impl Rng {
@@ -1242,13 +1192,11 @@ impl Rng {
         xs[usize::try_from(self.below(xs.len() as u64)).expect("an index fits usize")]
     }
 
-    /// Uniform in `[0, 1)`.
     fn unit(&mut self) -> f32 {
         (self.next() >> 40) as f32 / (1u64 << 24) as f32
     }
 }
 
-/// A τ a tick latches.
 fn random_tau(r: &mut Rng) -> f32 {
     match r.below(7) {
         0 => TAU,
@@ -1261,7 +1209,6 @@ fn random_tau(r: &mut Rng) -> f32 {
     }
 }
 
-/// A key's τ, which the bare engine takes unadmitted.
 fn random_key_tau(r: &mut Rng) -> f32 {
     match r.below(12) {
         0 => f32::NAN,
@@ -1273,7 +1220,6 @@ fn random_key_tau(r: &mut Rng) -> f32 {
     }
 }
 
-/// The time to the next input.
 fn random_gap(r: &mut Rng) -> i128 {
     let n = |r: &mut Rng, k: u64| i128::from(r.below(k));
     match r.below(8) {
@@ -1286,9 +1232,6 @@ fn random_gap(r: &mut Rng) -> i128 {
     }
 }
 
-/// A tick on a dark or a light page, admitted under the profile, with each
-/// inert arm (disabled, zero intensity, no cursor, outside the grid) drawn
-/// now and then.
 fn random_tick(r: &mut Rng, at: i128) -> Ev {
     let dark = r.below(2) == 0;
     let geom = if r.below(2) == 0 { plain() } else { padded() };
@@ -1340,14 +1283,6 @@ struct Reached {
     negative_offsets: usize,
 }
 
-/// Every state random engine streams reach is accepted by `validate`, and
-/// restores to itself through its bytes, snapshotted at four epochs: the
-/// stream's start, half a day in, the horizon (every offset ≤ 0) and 400 days
-/// later (old stamps). The streams mix keys (some with τ the bare engine
-/// takes unadmitted), resets, dark and light ticks under τ from subnormal to
-/// the profile's longest, each inert arm, a tick repeated (settling), schedule
-/// queries, repeated instants, gaps from a frame to two days, and now and then a time that goes
-/// back (a bare engine fed by two clocks). Times stay in `[0, horizon]`.
 #[test]
 fn validate_accepts_every_state_random_engine_streams_reach_at_every_epoch() {
     let clock = Clock::ahead(Duration::ZERO);

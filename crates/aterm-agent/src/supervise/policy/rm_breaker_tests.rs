@@ -233,8 +233,7 @@ fn all_escalate(cases: &[(&str, &str)]) {
     }
 }
 
-/// `S=<scratch>/w; <middle>; rm -rf "$S/x"` for each middle command: the rule
-/// still proves the removal — the middle command keeps `S`…
+/// Assert that `S=<scratch>/w; <middle>; rm -rf "$S/x"` keeps `S` across each middle command.
 fn keeps(middles: &[&str]) {
     for middle in middles {
         let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
@@ -246,7 +245,7 @@ fn keeps(middles: &[&str]) {
     }
 }
 
-/// …or the rule forgets `S` after it.
+/// Assert that `S=<scratch>/w; <middle>; rm -rf "$S/x"` forgets `S` after each middle command.
 fn forgets(middles: &[&str]) {
     for middle in middles {
         let cmd = format!("S=/private/tmp/claude-502/w; {middle}; rm -rf \"$S/x\"");
@@ -1015,28 +1014,14 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
     ]);
 }
 
-/// SHELL_NAMES keeps every name whose assignment does not read back: in zsh
-/// and bash, each name the shell reports (`${(k)parameters}`, `compgen -v`) is
-/// assigned `/x/y` in a subshell and, where that succeeded, read back. Each lane
-/// that runs must find both kinds of its own shell's such names, those whose
-/// assignment fails and those assigned but read back otherwise (zsh 5.9 reports
-/// 64 and 6, bash 3.2 reports 12 and 7), so a probe that measures nothing, or
-/// never reads back, in one shell fails in that lane, whatever the other found.
-/// A shell not installed ends the test COULD NOT RUN once the other has run
-/// ([`Lanes`]).
-///
-/// Only an assignment that succeeded is read back: a failed one leaves the
-/// fresh shell's value, never `/x/y`, and reading zsh's read-only `userdirs`
-/// and `usergroups` walks the user and group databases over opendirectoryd,
-/// which a starved machine answers in minutes
-/// (`docs/measured/test-hygiene-2-2026-10-22.md`).
+/// `SHELL_NAMES` keeps every name in zsh and bash whose assignment fails or does not read back.
 #[cfg(unix)]
 #[test]
 fn every_name_whose_assignment_does_not_read_back_is_kept() {
     let mut lanes = Lanes::default();
     for (shell, probe, floors) in [
         (
-            "/bin/zsh",
+            "zsh",
             "for n in ${(k)parameters}; do [[ $n =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]] || continue; \
              ( eval \"$n=/x/y\" 2>/dev/null || exit 1; \
              [[ ${(P)n} == /x/y ]] || print -r -- \"= $n\"; exit 0 ) 2>/dev/null \
@@ -1044,7 +1029,7 @@ fn every_name_whose_assignment_does_not_read_back_is_kept() {
             (20, 2),
         ),
         (
-            "/bin/bash",
+            "bash",
             "for n in $(compgen -v); do ( eval \"$n=/x/y\" 2>/dev/null || exit 1; \
              [ \"${!n}\" = /x/y ] || echo \"= $n\"; exit 0 ) 2>/dev/null || echo \"$n\"; done",
             (5, 2),
@@ -1070,23 +1055,27 @@ fn every_name_whose_assignment_does_not_read_back_is_kept() {
     }
 }
 
-/// `shell -c line` reading no startup file: zsh's `-f` skips `~/.zshenv` and
-/// the rest (the caller clears the environment); bash's `-c` reads none with
-/// `BASH_ENV` cleared.
-fn no_startup<'a>(shell: &str, line: &'a str) -> Vec<&'a str> {
-    if shell.ends_with("zsh") {
-        vec!["-f", "-c", line]
-    } else {
-        vec!["-c", line]
-    }
+/// The flags that keep `shell` from reading a startup file: zsh's `-f` skips
+/// `~/.zshenv` and the rest (the caller clears the environment); bash reads
+/// none for a script with `BASH_ENV` cleared.
+fn no_startup(shell: &str) -> &'static [&'static str] {
+    if shell == "zsh" { &["-f"] } else { &[] }
 }
 
-/// `line` in installed `shell`, in `dir`, no startup file read, stdin closed,
-/// under the one-minute hang detector.
-fn run_shell(shell: &str, line: &str, dir: &Path) -> std::process::Output {
+/// `line` in the [`aterm_spec::host::TOOLS`] shell `shell` installed at
+/// `path`, in `dir`, no startup file read, stdin closed, under the one-minute
+/// hang detector. The shell reads `line` from a file outside `dir`, not from
+/// its command line: Windows bounds a command line (32,767 characters, and Git
+/// for Windows' `bash.exe` passes about 8,000 of them on), which a test's batch
+/// of lines outgrows.
+fn run_shell(shell: &str, path: &Path, line: &str, dir: &Path) -> std::process::Output {
+    let script = TempTree::new("script");
+    let file = script.0.path().join("line.sh");
+    std::fs::write(&file, line).expect("the line's file");
     aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(shell)
-            .args(no_startup(shell, line))
+        aterm_uds::spawnfd::command(path)
+            .args(no_startup(shell))
+            .arg(&file)
             .current_dir(dir)
             .env_clear()
             .env("PATH", "/usr/bin:/bin"),
@@ -1102,10 +1091,7 @@ fn in_shell(shell: &str, line: &str) -> String {
     out.trim().to_string()
 }
 
-/// The shells a test reads its lines in, and the ones this host lacks: each lane
-/// the host has runs, and the test then ends COULD NOT RUN naming the missing one
-/// (the rule of every multi-shell test, `aterm_spec::host::could_not_run_without`'s),
-/// so a bash defect still FAILS on a host without zsh.
+/// Multi-shell runner that executes each installed shell and reports missing shells on drop.
 #[derive(Default)]
 struct Lanes {
     absent: Vec<&'static str>,
@@ -1113,10 +1099,10 @@ struct Lanes {
 
 impl Lanes {
     /// `line` in `shell` as [`in_shell_both`] runs it, or `None`, noted, where
-    /// `shell` is not installed.
+    /// `shell` is found nowhere ([`aterm_spec::host::find_tool`]).
     fn run(&mut self, shell: &'static str, line: &str) -> Option<(String, String)> {
-        if Path::new(shell).exists() {
-            return Some(in_shell_both(shell, line));
+        if let Some(path) = aterm_spec::host::find_tool(shell) {
+            return Some(in_shell_at(shell, &path, line));
         }
         if !self.absent.contains(&shell) {
             self.absent.push(shell);
@@ -1161,11 +1147,8 @@ const LINE_END: char = '\u{1e}';
 
 impl Drop for Lanes {
     fn drop(&mut self) {
-        if !self.absent.is_empty() && !std::thread::panicking() {
-            aterm_spec::host::could_not_run(format!(
-                "no {} here, so that lane did not run",
-                self.absent.join(" or ")
-            ));
+        if !std::thread::panicking() {
+            aterm_spec::host::could_not_run_without(&self.absent);
         }
     }
 }
@@ -1257,7 +1240,7 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
              '{member}' S -v S -A S S=5 -t 'a[S=5]' >/dev/null 2>&1; fi; echo \"$S\""
         ));
     }
-    for (sh, lines) in [("/bin/zsh", zsh), ("/bin/bash", bash)] {
+    for (sh, lines) in [("zsh", zsh), ("bash", bash)] {
         let Some(read) = lanes.run_each(sh, &lines) else {
             continue;
         };
@@ -1295,7 +1278,7 @@ fn a_value_zsh_arithmetic_reads_is_read_too() {
         assert_eq!(resolve(cmd), Ok(vec!["/tmp/w/a/x".to_string()]), "{cmd}");
     }
     let out = in_shell(
-        "/bin/zsh",
+        "zsh",
         "A=S=5; S=/tmp/w/a; printf %d A >/dev/null 2>&1; B=S=6; printf %d /B >/dev/null \
          2>&1; echo \"$S\"",
     );
@@ -1343,7 +1326,7 @@ fn every_zsh_modifier_letter_is_not_text() {
         .chars()
         .map(|m| format!("(print -r -- \"{m} $S:{m}\") 2>/dev/null; "))
         .collect();
-    let out = in_shell("/bin/zsh", &format!("S=/tmp/w/a.b; {probe}"));
+    let out = in_shell("zsh", &format!("S=/tmp/w/a.b; {probe}"));
     let differ: Vec<char> = out
         .lines()
         .filter_map(|l| {
@@ -1475,7 +1458,7 @@ fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
                  printf 'S=%s' x >/dev/null; printf S=5 >/dev/null; print -r -- \"$S\"; \
                  (printf '%*s' S=5 x >/dev/null 2>&1; print -r -- \"$S\"); \
                  (printf '%.*s' S=6 x >/dev/null 2>&1; print -r -- \"$S\")";
-    let out = in_shell("/bin/zsh", probe);
+    let out = in_shell("zsh", probe);
     assert_eq!(
         out, "1\n5\n6",
         "zsh's printf reads arithmetic only where it says"
@@ -1484,16 +1467,14 @@ fn a_printf_format_with_no_numeric_conversion_reads_no_arithmetic() {
                  printf -%d S=2 >/dev/null 2>&1; print -r -- \"$S\"; \
                  printf -x%d S=3 >/dev/null 2>&1; print -r -- \"$S\"; \
                  printf -v T -%d S=4 >/dev/null 2>&1; print -r -- \"$S $T\"";
-    let out = in_shell("/bin/zsh", probe);
+    let out = in_shell("zsh", probe);
     assert_eq!(
         out, "1\n2\n3\n4 -4",
         "zsh's printf takes a `-` word other than `-v` as its format"
     );
 }
 
-/// A program run from disk cannot assign the shell's variables: the classifier's read-only
-/// external programs are [`PLAIN_CONSUMERS`] (that no member a shell runs as a builtin
-/// assigns is `a_command_that_can_assign_what_it_names_is_no_plain_consumer`'s).
+/// Read-only external programs run from disk cannot assign the shell's variables and are [`PLAIN_CONSUMERS`].
 #[test]
 fn an_external_read_only_program_names_nothing() {
     keeps(&[
@@ -1561,7 +1542,7 @@ fn a_named_descriptor_redirect_assigns_its_name() {
     ]);
     let probe = "S=/x; T=/y; U=/z; V=/v; echo hi {S}>/dev/null; ls {T}>/dev/null; \
                  echo '{U}'>/dev/null; echo hi {V} >/dev/null; print -r -- \"$S $T $U $V\"";
-    let out = in_shell("/bin/zsh", probe);
+    let out = in_shell("zsh", probe);
     let f: Vec<&str> = out.lines().last().unwrap_or("").split(' ').collect();
     assert!(
         f.len() == 4
@@ -1602,7 +1583,7 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
                  S=1; A=S=6; [ {-t,A} ]; print -r -- \"$S\"; \
                  S=1; printf '%s' S={7,8} >/dev/null; print -r -- \"$S\"";
     let mut lanes = Lanes::default();
-    if let Some((out, _)) = lanes.run("/bin/zsh", probe) {
+    if let Some((out, _)) = lanes.run("zsh", probe) {
         assert_eq!(
             out.trim(),
             "5\n6\n1",
@@ -1610,7 +1591,7 @@ fn a_brace_expanded_word_moves_the_words_the_rule_reads() {
         );
     }
     let probe = "S=1; printf {-vS,%s} /etc; echo \"$S\"; T=1; printf -{vT,-} /x; echo \"$T\"";
-    if let Some((out, _)) = lanes.run("/bin/bash", probe) {
+    if let Some((out, _)) = lanes.run("bash", probe) {
         assert_eq!(
             out.trim(),
             "/etc\n/x",
@@ -1674,10 +1655,10 @@ fn a_dash_format_with_no_numeric_conversion_reads_no_arithmetic() {
     let probe = "S=1; printf '--- %s ---' S=5 >/dev/null 2>&1; printf -%s S=6 >/dev/null 2>&1; \
                  printf '--- %d ---' S=7 >/dev/null 2>&1; echo \"$S\"";
     let mut lanes = Lanes::default();
-    if let Some((out, _)) = lanes.run("/bin/zsh", probe) {
+    if let Some((out, _)) = lanes.run("zsh", probe) {
         assert_eq!(out.trim(), "7", "zsh evaluates only the numeric `-` format");
     }
-    if let Some((out, _)) = lanes.run("/bin/bash", probe) {
+    if let Some((out, _)) = lanes.run("bash", probe) {
         assert_eq!(
             out.trim(),
             "1",
@@ -1844,7 +1825,7 @@ fn a_quoted_test_operand_names_nothing() {
         }
     }
     let mut lanes = Lanes::default();
-    for sh in ["/bin/zsh", "/bin/bash"] {
+    for sh in ["zsh", "bash"] {
         let Some(read) = lanes.run_each(sh, &lines) else {
             continue;
         };
@@ -1855,13 +1836,16 @@ fn a_quoted_test_operand_names_nothing() {
     }
 }
 
-/// `line` in `shell` as [`in_shell`] runs it: its stdout and its stderr.
+/// `line` in `shell` as [`in_shell`] runs it: its stdout and its stderr. A
+/// shell found nowhere ends the test COULD NOT RUN, naming where one comes from.
 fn in_shell_both(shell: &str, line: &str) -> (String, String) {
-    if !Path::new(shell).exists() {
-        aterm_spec::host::could_not_run(format!("no {shell} here to read the line as it does"));
-    }
+    in_shell_at(shell, &aterm_spec::host::need_tool(shell), line)
+}
+
+/// `line` in `shell`, installed at `path`, as [`in_shell_both`] runs it.
+fn in_shell_at(shell: &str, path: &Path, line: &str) -> (String, String) {
     let t = TempTree::new("shell");
-    let out = run_shell(shell, line, t.0.path());
+    let out = run_shell(shell, path, line, t.0.path());
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),

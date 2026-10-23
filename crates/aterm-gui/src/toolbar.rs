@@ -226,24 +226,19 @@ fn native_tab_cells(band_width: f64, count: usize, active: usize) -> Vec<(f64, f
     cells
 }
 
-/// THE NEEDS PILL'S SHARE of a strip whose tab band (between the traffic
-/// lights and the trailing "+") is `band_w` points: at most 40% of it (§5), so
-/// a lit pill never takes the tabs' room past that.
+/// Maximum width share (40%) of `band_w` that the needs pill may occupy.
 #[cfg(any(target_os = "macos", test))]
 fn pill_share(band_w: f64) -> f64 {
     (band_w * 0.4).floor().max(0.0)
 }
 
-/// The gap (points) the macOS pill keeps between its pieces, and its inner
-/// pad from its own edge.
+/// Gap and horizontal padding (points) for the macOS titlebar pill.
 #[cfg(any(target_os = "macos", test))]
 const PILL_GAP: f64 = 4.0;
 #[cfg(any(target_os = "macos", test))]
 const PILL_PAD: f64 = 8.0;
 
-/// The titlebar pill laid out in at most `share` points, its pads included
-/// (`aterm_messages::presence::pill_layout` inside them, `measure` the
-/// pieces' natural widths): its layout and whole width.
+/// Lay out the titlebar pill in at most `share` points, returning its layout and total width.
 #[cfg(any(target_os = "macos", test))]
 fn titlebar_pill_layout(
     words: &crate::presence::PillWords,
@@ -260,11 +255,6 @@ fn titlebar_pill_layout(
 mod shared_tests {
     use super::*;
 
-    /// THE TITLEBAR PILL'S AGE MOVES NO TAB (§5): two pills that differ only
-    /// in their age within its unit (3s and 47s) take the same width from
-    /// the band, so the tabs get the same cells — the words are measured at
-    /// their room, by a measure that, like the label's monospaced digits,
-    /// gives every digit one width.
     #[test]
     fn a_pills_age_moves_no_titlebar_tab_within_its_unit() {
         use crate::presence::{NeedSeverity, PillKind, PillWords};
@@ -343,9 +333,6 @@ mod shared_tests {
         );
     }
 
-    /// A tab that needs attention for a stated reason says it once: the
-    /// tooltip's `Needs attention: <reason>` line stands in for the bare clause,
-    /// and a tab with no reason line still gets the clause.
     #[test]
     fn the_hover_names_the_reason_once() {
         let metadata = TabStripMetadata {
@@ -386,7 +373,6 @@ mod shared_tests {
         }
     }
 
-    /// A native tab names its app in words, once: not when the title says it.
     #[test]
     fn the_hover_names_the_app_once() {
         let app = |icon| TabStripMetadata {
@@ -417,8 +403,6 @@ mod shared_tests {
         );
     }
 
-    /// Each connection role is stated (never visual-only): its own chrome
-    /// token(s) and its own hover-help line, one per direction.
     #[test]
     fn connection_roles_state_their_direction_in_chrome_and_help() {
         let conn_only = |conn| TabStripMetadata {
@@ -567,7 +551,6 @@ mod shared_tests {
         assert!(last.0 + last.1 <= 12.0 + f64::EPSILON);
     }
 
-    /// A wide window spends its whole band on titles: equal shares, no cap.
     #[test]
     fn wide_bands_are_split_evenly_and_spent_to_the_last_point() {
         for count in 1..=8usize {
@@ -597,8 +580,7 @@ mod shared_tests {
     }
 }
 
-/// The non-macOS toolbar seam: an in-memory tab-chrome model serving the
-/// `chrome` verb's line.
+/// Non-macOS in-memory tab-chrome seam serving the `chrome` verb.
 #[cfg(not(target_os = "macos"))]
 mod non_macos {
     use std::cell::RefCell;
@@ -727,9 +709,6 @@ mod non_macos_tests {
     use super::format_tab_chrome;
     use crate::tab_bar::TabStripMetadata;
 
-    /// `attention` is a bool because these tests only ask whether the `attention`
-    /// token prints; `ChipLevel::Wait` is the level whose chrome tokens are exactly
-    /// `["attention"]`, so it stands for "on".
     fn metadata(dirty: bool, busy: bool, attention: bool) -> TabStripMetadata {
         TabStripMetadata {
             icon: None,
@@ -747,7 +726,6 @@ mod non_macos_tests {
         }
     }
 
-    /// No tabs means no chrome model; one real tab remains explicit title identity.
     #[test]
     fn chrome_keeps_single_tab_identity() {
         assert_eq!(format_tab_chrome(&[], &[], &[], 0), None);
@@ -765,8 +743,6 @@ mod non_macos_tests {
         );
     }
 
-    /// 2+ tabs report the line in the exact macOS shape, so the introspection
-    /// output is platform-stable.
     #[test]
     fn chrome_line_matches_macos_shape() {
         let titles = vec!["zsh".to_string(), "vim".to_string(), "htop".to_string()];
@@ -783,7 +759,6 @@ mod non_macos_tests {
         );
     }
 
-    /// An out-of-range active index is clamped to the last tab.
     #[test]
     fn chrome_clamps_out_of_range_active() {
         let titles = vec!["a".to_string(), "b".to_string()];
@@ -824,73 +799,31 @@ mod macos {
     use crate::tab_model::TabId;
     use crate::{TabAction, Wake, WindowId};
 
-    /// Height (points) of the single chrome row; the ~14 pt traffic lights centre in it.
+    /// Height (points) of the single chrome row.
     const STRIP_HEIGHT: f64 = 28.0;
-
-    /// Leading gutter (points) inside the toolbar item before the first chip. The
-    /// `UnifiedCompact` toolbar already places the item past the traffic lights, so
-    /// this is only a tidy gap; [`strip_metrics`] widens it so the band never starts
-    /// before the measured lights' right edge plus [`LIGHTS_CLEARANCE`].
     const STRIP_LEADING_PAD: f64 = 4.0;
-
-    /// Clear space (points) kept between the trailing edge of the window's traffic
-    /// lights and the first tab chip.
     const LIGHTS_CLEARANCE: f64 = 10.0;
-
-    /// Width (points) of the trailing "+" New Tab button at the right end of the cluster.
     const PLUS_WIDTH: f64 = 28.0;
-
-    /// Trailing gutter (points) between the window's right edge and the "+", mirroring
-    /// the traffic-light inset.
     const TRAILING_PAD: f64 = 8.0;
-
-    /// Gap (points) between the last tab chip and the trailing "+" button, so a chip
-    /// never butts straight against it.
     const TAB_GAP: f64 = 6.0;
-
-    /// [`ChromeButton`] hover/press fill: a rounded rect inset by this margin, of fixed
-    /// height, centred on the strip's measured content line, with this corner radius.
     const BTN_INSET_X: f64 = 2.0;
     const BTN_PILL_HEIGHT: f64 = 20.0;
     const BTN_RADIUS: f64 = 6.0;
-
-    /// The "+" mark: half-length of each arm and the stroke width, drawn as two
-    /// round-capped strokes crossing on the strip's measured centre line.
     const PLUS_ARM: f64 = 5.5;
     const PLUS_STROKE: f64 = 1.6;
-
-    /// Min/max width (points) of the tab-strip item. A custom `NSView` has no intrinsic
-    /// size; without these `UnifiedCompact` collapses the strip into an overflow `»`.
     const STRIP_MIN_WIDTH: f64 = 120.0;
     const STRIP_MAX_WIDTH: f64 = 100_000.0;
-
-    /// Tab pill geometry: a rounded rect of fixed height centred on the measured
-    /// content line, inset horizontally by this margin (which is also the gap between
-    /// adjacent pills), with this corner radius.
     const TAB_PILL_INSET_X: f64 = 2.0;
     const TAB_PILL_HEIGHT: f64 = 22.0;
     const TAB_PILL_RADIUS: f64 = 7.0;
-
-    /// Height (points) of the hairline an unselected chip draws on its leading edge;
-    /// shorter than the pill so it divides titles without boxing them.
     const TAB_RULE_HEIGHT: f64 = 14.0;
-
-    /// Width cap (points) of the inline rename editor in the solo band, so it reads as
-    /// in-place editing rather than a dialog.
     const SOLO_EDITOR_WIDTH: f64 = 280.0;
-
-    /// Gap (points) between the solo title and its description, and the minimum clear
-    /// space kept at each end of the solo band before the title group is compressed.
     const SOLO_GAP: f64 = 10.0;
     const SOLO_EDGE_PAD: f64 = 12.0;
-    /// Height (points) of the solo band's title / description labels, and of the solo
-    /// status canvas trailing them.
     const SOLO_LABEL_HEIGHT: f64 = 18.0;
     const SOLO_STATUS_SIZE: f64 = 16.0;
 
-    /// A chip's placement, resolved once per refresh by [`set_window_tabs`] from the
-    /// measured [`StripMetrics`] and the tab count and handed to every [`TabView`], so
-    /// alignment, solo/tabbed mode and solo centre are applied together.
+    /// Resolved placement of a tab chip in the strip.
     #[derive(Clone, Copy, PartialEq, Debug)]
     struct TabGeometry {
         /// The measured content centre line, in the chip's own coordinates.
@@ -905,8 +838,7 @@ mod macos {
     }
 
     impl TabGeometry {
-        /// Whether the chip at `index` of a strip whose `active` chip is selected
-        /// draws a leading divider.
+        /// Whether the chip at `index` draws a leading divider when `active` is selected.
         #[must_use]
         const fn separates(index: usize, active: usize) -> bool {
             index > 0 && index != active && index != active + 1
@@ -1073,8 +1005,7 @@ mod macos {
         }
     }
 
-    /// Strip geometry measured from the live window: where the traffic lights sit, in
-    /// the container view's coordinates.
+    /// Strip geometry measured from the live window in container coordinates.
     #[derive(Clone, Copy, Debug)]
     struct StripMetrics {
         /// Vertical centre of the strip's content: the traffic lights' centre line in
@@ -1089,8 +1020,7 @@ mod macos {
         window_center_x: f64,
     }
 
-    /// [`plan_strip`]'s answer: every chip's cell plus the measurements its content
-    /// is placed against.
+    /// [`plan_strip`]'s output: chip cells and strip measurements.
     struct StripPlan {
         cells: Vec<(f64, f64)>,
         metrics: StripMetrics,
@@ -1098,8 +1028,7 @@ mod macos {
     }
 
     impl StripMetrics {
-        /// The content geometry of chip `index` of `n` whose cell starts at `cell_x`:
-        /// one tab is the window's title, not a switcher.
+        /// Content geometry of chip `index` of `n` starting at `cell_x`.
         fn geometry(&self, index: usize, n: usize, active: usize, cell_x: f64) -> TabGeometry {
             TabGeometry {
                 center_y: self.center_y,
@@ -1230,8 +1159,7 @@ mod macos {
         center_y: f64,
     }
 
-    /// The live inline rename editor: an `NSTextField` overlaying one tab chip,
-    /// plus the small relay object AppKit calls back on.
+    /// Live inline rename editor overlaying one tab chip.
     struct RenameEditor {
         /// The editable field. Its `stringValue` is the only home of the in-progress
         /// text; nothing else needs saving across a strip rebuild.
@@ -1388,9 +1316,7 @@ mod macos {
     }
 
     impl ChromeButton {
-        /// Build a titlebar "+" button of `frame`, relaying `action` through `proxy`
-        /// and named `accessibility_label` for VoiceOver (the drawn glyph alone is
-        /// not a name).
+        /// Build a titlebar "+" button of `frame`, relaying `action` through `proxy`.
         fn build(
             mtm: MainThread,
             proxy: EventLoopProxy<Wake>,
@@ -1406,7 +1332,9 @@ mod macos {
                 center_y: Cell::new(frame.size.height * 0.5),
                 tracking: RefCell::new(None),
             };
-            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one designated initializer, which is the next send. `-initWithFrame:` is `-(id)(NSRect)`, consumes that +1 and returns the initialised +1 that `Retained::from_owned` adopts.
+            // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one designated
+            // initializer, which is the next send. `-initWithFrame:` is `-(id)(NSRect)`,
+            // consumes that +1 and returns the initialised +1 that `Retained::from_owned` adopts.
             let this: Retained<Self> = unsafe {
                 let raw = Self::alloc_ivars(mtm, ivars);
                 if raw.is_null() {
@@ -1425,8 +1353,7 @@ mod macos {
             Some(this)
         }
 
-        /// Move this button onto the strip's measured content line. No-op when
-        /// unchanged, so the per-refresh call costs nothing in the steady state.
+        /// Move this button onto the strip's measured content line.
         fn set_center_y(&self, center_y: f64) {
             if self.ivars().center_y.get() == center_y {
                 return;
@@ -1435,8 +1362,7 @@ mod macos {
             mark_dirty(self.as_id());
         }
 
-        /// Whether `event`'s location is within the button's bounds (a click that ends on
-        /// it).
+        /// Whether `event`'s location is within the button's bounds.
         fn point_inside(&self, event: Id) -> bool {
             if event.is_null() {
                 return false;
@@ -1547,8 +1473,7 @@ mod macos {
         }
     }
 
-    /// A pill kind's tone: the stop hue for a stuck need, the wait hue for a
-    /// decide need, the dim ink for the person's own hold (the border's).
+    /// Return the `NSColor` selector for `kind`.
     fn tone_of(kind: crate::presence::PillKind) -> aterm_objc::Sel {
         match kind {
             crate::presence::PillKind::Need(crate::presence::NeedSeverity::Stuck) => {
@@ -1562,8 +1487,7 @@ mod macos {
     }
 
     impl NeedsPill {
-        /// A hidden pill for window `window`, its five labels built and
-        /// added.
+        /// Build a hidden pill for `window` with its five labels.
         fn build(
             mtm: MainThread,
             proxy: EventLoopProxy<Wake>,
@@ -1641,10 +1565,7 @@ mod macos {
             });
         }
 
-        /// Show `model` (or hide on `None`): each piece's text and ink, the
-        /// session it names, the accessibility sentence, and the whole
-        /// sentence as the pill's tool tip, so words the pill clipped (the
-        /// age first, then the remedy at the words' end) are one hover away.
+        /// Show `model` or hide on `None`.
         fn set_model(&self, model: Option<&crate::app_presence::NeedsPillModel>) {
             let ivars = self.ivars();
             let Some(model) = model else {
@@ -1697,10 +1618,7 @@ mod macos {
             mark_dirty(self.as_id());
         }
 
-        /// Lay the shown pill out in at most `max_w` points (its pads
-        /// included), its right edge at `right`, on the strip's measured
-        /// centre line: each label at its span of the engine's layout, the
-        /// pill framed around them.
+        /// Lay out the shown pill in at most `max_w` points with its right edge at `right`.
         fn lay_out(&self, max_w: f64, right: f64, strip_h: f64, center_y: f64) -> f64 {
             let ivars = self.ivars();
             let words = ivars.words.borrow();
@@ -1784,8 +1702,7 @@ mod macos {
         }
     }
 
-    /// Carry the window's pill model onto its view: built on the first lit
-    /// pill, hidden with none.
+    /// Sync the window's pill model onto its view.
     fn sync_pill(
         handle: &ToolbarHandle,
         mtm: MainThread,
@@ -1809,8 +1726,7 @@ mod macos {
         }
     }
 
-    /// Lay the window's pill out at `slot` (its share of the band, its right
-    /// edge there): its width (0 with none shown).
+    /// Lay out the window's pill at `slot`, returning its width.
     fn place_pill(handle: &ToolbarHandle, slot: PillSlot) -> f64 {
         handle.pill.borrow().as_ref().map_or(0.0, |pill| {
             pill.lay_out(slot.share, slot.right, slot.strip_h, slot.center_y)
@@ -1858,8 +1774,7 @@ mod macos {
         Some(())
     }
 
-    /// The whole `updateTrackingAreas` override: `[super updateTrackingAreas]`, then
-    /// swap in a fresh hover area so hover detection follows a geometry change.
+    /// Forward `updateTrackingAreas` to `super` and reinstall the hover tracking area.
     fn update_tracking_areas(sup: aterm_objc::ObjcSuper, tracking: &RefCell<Option<Obj>>) {
         // SAFETY: `[super updateTrackingAreas]` is `-(void)`; `super_receiver()` pairs
         // the instance with the declaring class, so lookup starts at `NSView`.
@@ -1871,8 +1786,7 @@ mod macos {
         install_tracking_area(sup.receiver, tracking);
     }
 
-    /// (Re)install a `mouseEnteredAndExited` tracking area covering the whole view (it
-    /// follows resizes via `InVisibleRect`), removing the prior one `tracking` holds.
+    /// Reinstall a `mouseEnteredAndExited` tracking area covering `view`.
     fn install_tracking_area(view: Id, tracking: &RefCell<Option<Obj>>) {
         // SAFETY: main-thread AppKit calls: `-removeTrackingArea:`/`-addTrackingArea:` are `-(void)(id)`; `-initWithRect:options:owner:userInfo:` consumes the +1 from `+alloc`, which `Obj::from_owned` adopts. AppKit holds the area's owner weakly, so the ivar retains the area.
         unsafe {
@@ -1976,7 +1890,7 @@ mod macos {
         title: RefCell<String>,
         /// The tab's hover: the strip's own tooltip vector (`App::tab_tooltips`, the
         /// composed session chrome plus its presence lines: the need, who drives it,
-        /// its agent's state, who last typed into it), set by [`Self::set_context`]
+        /// its agent's state, who last typed into it), set by [`TabView::set_context`]
         /// and at build.
         tooltip: RefCell<Option<String>>,
         /// The composed context-menu model (`session_chrome::compose_tab_menu`),
@@ -1997,9 +1911,7 @@ mod macos {
             const NAME: &str = "ATermTabView";
             type Ivars = TabIvars;
             protocols: [NSObject];
-            /// Paint the tab background: the active tab is an inset rounded pill with
-            /// a border, accent keyline and semibold label; an inactive tab is flat;
-            /// a hovered inactive tab gets a fainter pill.
+            /// Paint the tab background, border, accent keyline, and identity marks.
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
                 // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle.
@@ -2088,10 +2000,7 @@ mod macos {
                 self.paint_identity();
             }
 
-            /// A click on the tab (outside the close button), its status marks
-            /// included, posts `Wake::SelectTab { window, index }` and seeds the
-            /// drag gesture: a press on a background tab's `◆` takes the person
-            /// there (`docs/DESIGN-owner-surfaces-2026-10-16.md` §5).
+            /// Select the tab, open the context menu, or begin rename/drag on press.
             @sel(mouseDown:)
             fn mouseDown(&self, event: Id) {
                 // SAFETY: `-modifierFlags` is a side-effect-free `NSUInteger` getter on the live event, on the main thread.
@@ -2124,21 +2033,17 @@ mod macos {
                 });
             }
 
-            /// Right-click pops the session context menu at the pointer (composed by
-            /// `session_chrome::compose_tab_menu`).
+            /// Pop the session context menu at the pointer on right-click.
             @sel(rightMouseDown:)
             fn rightMouseDown(&self, event: Id) {
                 self.show_context_menu(event);
             }
 
-            /// A horizontal drag past one tab width posts
-            /// `Wake::TabCmd { Move { from, to } }` once per press (the `dragged`
-            /// latch), reusing `App::move_tab`.
+            /// Post a tab-move event once per press when dragged past half a tab width.
             @sel(mouseDragged:)
             fn mouseDragged(&self, event: Id) {
                 let ivars = self.ivars();
                 if ivars.dragged.get() {
-                    // already fired this gesture
                     return;
                 }
                 // SAFETY: side-effect-free geometry getters, main thread.
@@ -2174,14 +2079,11 @@ mod macos {
                 });
             }
 
-            /// Every press commits on `mouseDown:` (select, rename, the marks' menu)
-            /// or in `mouseDragged:` (a reorder), so the release does nothing; it is
-            /// still this view's, never forwarded up the responder chain.
+            /// Consume mouse-up without forwarding up the responder chain.
             @sel(mouseUp:)
             fn mouseUp(&self, _event: Id) {}
 
-            /// Pointer entered the tab: reveal the ✕ (hover-only on every tab, the
-            /// selected one included) and repaint the faint hover highlight.
+            /// Reveal the close button and repaint the hover highlight on enter.
             @sel(mouseEntered:)
             fn mouseEntered(&self, _event: Id) {
                 self.ivars().hovered.set(true);
@@ -2189,7 +2091,7 @@ mod macos {
                 mark_dirty(self.as_id());
             }
 
-            /// Pointer left the tab: hide the ✕ again and repaint.
+            /// Hide the close button and repaint on pointer exit.
             @sel(mouseExited:)
             fn mouseExited(&self, _event: Id) {
                 self.ivars().hovered.set(false);
@@ -2197,21 +2099,19 @@ mod macos {
                 mark_dirty(self.as_id());
             }
 
-            /// Rebuild the tracking area whenever the view's geometry changes, so hover
-            /// detection follows a resize.
+            /// Rebuild the tracking area when the view's geometry changes.
             @sel(updateTrackingAreas)
             fn updateTrackingAreas(&self) {
                 update_tracking_areas(self.super_receiver(), &self.ivars().tracking);
             }
 
-            /// Accept the first click in a non-key window, so one click raises the
-            /// window and selects the tab.
+            /// Accept the first click in a non-key window.
             @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
             }
 
-            /// VoiceOver press selects this tab through the same typed wake as a click.
+            /// Select this tab on VoiceOver press.
             @sel(accessibilityPerformPress)
             fn accessibilityPerformPress(&self) -> aterm_objc::Bool {
                 let ivars = self.ivars();
@@ -2222,8 +2122,7 @@ mod macos {
                 aterm_objc::Bool::YES
             }
 
-            /// The close × action: posts `Wake::CloseTab { window, index }`, handled by
-            /// `App::close_tab_at`.
+            /// Post `Wake::CloseTab` when the close button is clicked.
             @sel(closeTab:)
             fn close_tab(&self, _sender: Id) {
                 let ivars = self.ivars();
@@ -2236,10 +2135,7 @@ mod macos {
                 });
             }
 
-            /// The action of every live context-menu item. The item's `tag` decodes to
-            /// a [`MenuAction`] (undecodable is inert), posted as
-            /// `Wake::TabMenuAction` with the pop-time `menu_tab` identity (not the
-            /// positional index or live `tab_id`, which a refresh can re-label).
+            /// Dispatch a context-menu action decoded from the sender's tag.
             @sel(tabMenuAction:)
             fn tab_menu_action(&self, sender: Id) {
                 if sender.is_null() {
@@ -2259,9 +2155,7 @@ mod macos {
                 }
             }
 
-            /// The action of every per-peer connection row. The item's `tag` indexes the
-            /// pop-time `menu_conn` snapshot (the act needs a peer argument no
-            /// `MenuAction` tag can carry).
+            /// Dispatch a per-peer connection action indexed by the sender's tag.
             @sel(tabMenuConnection:)
             fn tab_menu_connection(&self, sender: Id) {
                 if sender.is_null() {
@@ -2283,8 +2177,7 @@ mod macos {
                 });
             }
 
-            /// The action of every agent-upgrade row. The item's `tag` indexes the
-            /// pop-time `menu_upgrade` snapshot.
+            /// Dispatch an agent-upgrade action indexed by the sender's tag.
             @sel(tabMenuUpgrade:)
             fn tab_menu_upgrade(&self, sender: Id) {
                 if sender.is_null() {
@@ -2310,8 +2203,7 @@ mod macos {
     }
 
     impl TabView {
-        /// Paint the shared icon IR and the dirty/busy/attention/connection status
-        /// shapes.
+        /// Paint the shared icon IR and status marks.
         fn paint_identity(&self) {
             let ivars = self.ivars();
             let metadata = self.metadata();
@@ -2381,8 +2273,6 @@ mod macos {
                                 appkit::send_v(circle(centre.x, centre.y, radius), sel!(fill));
                             }
                             TabIconPrimitive::Triangle { points } => {
-                                // No app icon uses a filled triangle yet; the IR walk
-                                // stays total.
                                 appkit::send_v(polygon(&points.map(at)), sel!(fill));
                             }
                         }
@@ -2522,8 +2412,7 @@ mod macos {
             }
         }
 
-        /// Build a tab view for `index`/`count` showing `title`, relaying through
-        /// `proxy`/`window`.
+        /// Build a tab view for `index`/`count` showing `title`.
         #[allow(
             clippy::too_many_arguments,
             reason = "tab state (id/index/count/text/active/metadata/ext) plus its render context (mtm/proxy/window/geometry); both are needed at construction and splitting them only relocates the list"
@@ -2653,8 +2542,7 @@ mod macos {
             Some(this)
         }
 
-        /// Place every sub-view and cache every ornament rect from the current bounds,
-        /// mode, metadata and centre line.
+        /// Place sub-views and cache ornament rects from the current bounds and metadata.
         fn relayout(&self) {
             let ivars = self.ivars();
             // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter.
@@ -2713,8 +2601,7 @@ mod macos {
             mark_dirty(self.as_id());
         }
 
-        /// The rename editor's frame in container coordinates (the editor is a sibling
-        /// of the chips).
+        /// Return the rename editor's frame in container coordinates.
         fn editor_frame(&self) -> CGRect {
             let ivars = self.ivars();
             // SAFETY: `-frame` is a side-effect-free `-(NSRect)` getter.
@@ -2735,8 +2622,7 @@ mod macos {
                 TAB_PILL_HEIGHT,
             )
         }
-        /// Solo layout: `title` beside its description, centred as one group on the
-        /// window's centre, app icon leading and status canvas trailing.
+        /// Lay out solo mode with the title, description, app icon, and status canvas centered.
         fn relayout_solo(&self, title: &str, bounds: CGRect, center_y: f64) {
             let ivars = self.ivars();
             let metadata = self.metadata();
@@ -2859,8 +2745,7 @@ mod macos {
             ]));
         }
 
-        /// Move this chip onto the measured content line / window centre and switch
-        /// between tabbed and solo.
+        /// Update this chip's geometry and relayout if changed.
         fn set_geometry(&self, geometry: TabGeometry) {
             let ivars = self.ivars();
             let unchanged = ivars.solo.get() == geometry.solo
@@ -2877,9 +2762,7 @@ mod macos {
             self.relayout();
         }
 
-        /// Update title and route/document context in place. The visible label keeps
-        /// the ⌘-hint only when it fits; hover, accessibility and introspection keep
-        /// the full strings.
+        /// Update title and tooltip context in place.
         fn set_context(&self, title: &str, tooltip: Option<&str>) {
             let tooltip_changed = self.ivars().tooltip.borrow().as_deref() != tooltip;
             let title_changed = {
@@ -2903,8 +2786,7 @@ mod macos {
             self.sync_semantics();
         }
 
-        /// Give the glyph-only close button an accessibility name; refreshed with the
-        /// tab context because the title follows live OSC titles.
+        /// Refresh the close button's tooltip and accessibility labels from the current title.
         fn sync_close_semantics(&self) {
             let title = self.ivars().title.borrow();
             let label_text = tab_close_accessibility_label(&title);
@@ -2924,8 +2806,7 @@ mod macos {
             }
         }
 
-        /// Apply the composed per-tab chrome extension's context-menu model in place, on
-        /// both diff and build paths, for the next right-click or `read_tab_menus`.
+        /// Update the context-menu entries in place.
         fn set_chrome_ext(&self, ext: &TabChromeExt) {
             let ivars = self.ivars();
             if *ivars.menu_entries.borrow() != ext.menu {
@@ -2933,21 +2814,15 @@ mod macos {
             }
         }
 
-        /// Re-stamp the stable tab id this chip displays; after a `move_tab` the id at
-        /// each position changes while views stay.
         fn set_tab_id(&self, id: TabId) {
             self.ivars().tab_id.set(id);
         }
 
-        /// The stable tab id this chip displays. Read only where a gesture captures
-        /// identity at its start (menu pop, rename install), never to resolve a gesture
-        /// in flight, since the diff path re-stamps it per position.
         fn tab_id(&self) -> TabId {
             self.ivars().tab_id.get()
         }
 
-        /// Build and pop this tab's context menu at the pointer from the stored model
-        /// (an empty model pops nothing).
+        /// Build and pop this tab's context menu at the pointer.
         fn show_context_menu(&self, event: Id) {
             let _ = self.ivars().proxy.send_event(Wake::TabContextMenuOpening {
                 window: self.ivars().window,
@@ -3074,9 +2949,7 @@ mod macos {
             )
         }
 
-        /// Diff icon/status/close metadata in place. Geometry changes only when an
-        /// icon or status appears or disappears; title changes and dirty saves never
-        /// rebuild the view.
+        /// Diff icon, status, and close metadata in place.
         fn set_metadata(&self, metadata: TabStripMetadata) {
             let old = self.ivars().metadata.replace(metadata);
             if old == metadata {
@@ -3094,9 +2967,7 @@ mod macos {
             self.sync_semantics();
         }
 
-        /// Take a new load step (design §12.4): a repaint when it, or the
-        /// meters' inks under a lit meter, moved; never a relayout, since the
-        /// meter takes no slot.
+        /// Update the load step and repaint when the meter or its inks change.
         fn set_load(&self, load: u8, inks_moved: bool) {
             let ivars = self.ivars();
             let mut metadata = ivars.metadata.get();
@@ -3114,8 +2985,7 @@ mod macos {
             }
         }
 
-        /// Re-resolve this tab's label ink against the current selected-tab color
-        /// override (the repaint half of [`set_active_tab_color`]).
+        /// Re-resolve this tab's label ink against the selected-tab color override.
         fn refresh_label_ink(&self) {
             let ivars = self.ivars();
             if ivars.solo.get() {
@@ -3134,8 +3004,7 @@ mod macos {
             }
         }
 
-        /// Flip the active flag in place (the diff path): recolour and re-weight the
-        /// label and repaint the accent pill.
+        /// Update the active flag in place and repaint.
         fn set_active(&self, active: bool) {
             if self.ivars().active.get() == active {
                 return;
@@ -3145,9 +3014,7 @@ mod macos {
             self.sync_semantics();
         }
 
-        /// Sync hover text and accessibility from the tab presentation. Every
-        /// context/state/selection diff path calls it so VoiceOver never lags the
-        /// pixels.
+        /// Sync hover text and accessibility attributes from the tab presentation.
         fn sync_semantics(&self) {
             let ivars = self.ivars();
             let metadata = self.metadata();
@@ -3169,8 +3036,7 @@ mod macos {
             }
         }
 
-        /// Show the close ✕ only while the pointer is inside this chip, the selected
-        /// tab included (a permanent ✕ there invites mis-clicks).
+        /// Show the close button only while the pointer is inside this chip.
         fn refresh_close_visibility(&self) {
             let ivars = self.ivars();
             let show = ivars.close_available.get()
@@ -3229,8 +3095,7 @@ mod macos {
                 Self::item_identifiers()
             }
 
-            /// Build the `NSToolbarItem` for the strip identifier, with the retained
-            /// container as its view.
+            /// Build the `NSToolbarItem` for the strip identifier.
             @sel(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)
             fn item_for_identifier(
                 &self,
@@ -3431,18 +3296,13 @@ mod macos {
         })
     }
 
-    /// The user's selected-tab color override (config `active_tab_color`), packed
-    /// `0xFF_RR_GG_BB`; `0` means no override (the translucent system pill).
+    /// Selected-tab color override packed as `0xFF_RR_GG_BB` (`0` means no override).
     static ACTIVE_TAB_COLOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// The authored chrome accent (theme or config `accent_color`), floored to 3:1
-    /// on the theme's background, packed like [`ACTIVE_TAB_COLOR`]; `0` keeps the
-    /// system accent (`controlAccentColor`).
+    /// Authored chrome accent packed as `0xFF_RR_GG_BB` (`0` uses `controlAccentColor`).
     static STRIP_ACCENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// The load meters' inks (design §12.4), packed like [`STRIP_ACCENT`]: the
-    /// Tab ink the selected chip's meter takes and the aterm ink the others'
-    /// take at 70 %, solved on the band (`aterm_vitals::ink::vitals_inks`).
+    /// Load meter inks packed as `0xFF_RR_GG_BB` for active and inactive chips.
     static STRIP_LOAD_TAB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static STRIP_LOAD_ATERM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -3743,9 +3603,7 @@ mod macos {
         sync_rename_overlay(handle, ids);
     }
 
-    /// Where a strip of `n` chips with `active` selected sits in the container now:
-    /// each chip's `(x, width)` cell, the measured traffic-light line and the strip
-    /// height.
+    /// Plan chip `(x, width)` cells, traffic-light metrics, and strip height for `n` chips.
     fn plan_strip(handle: &ToolbarHandle, n: usize, active: usize) -> StripPlan {
         let container = handle.container.id();
         // SAFETY: `container` is the live retained strip view; `-bounds` is a
@@ -3836,8 +3694,6 @@ mod macos {
             }
             tab.set_geometry(metrics.geometry(i, n, active, cx));
             if reframe {
-                // `set_geometry` re-lays only when the geometry itself moved; a new
-                // width with the same centre line still needs the content re-placed.
                 tab.relayout();
             }
         }
@@ -3903,10 +3759,7 @@ mod macos {
             type Ivars = RenameIvars;
             protocols: [NSObject, NSTextFieldDelegate];
 
-            /// `controlTextDidChange:`: canonicalize as the user types. Forbidden
-            /// formatting (control/bidi/invisible) is dropped and the value clamped to
-            /// the byte cap on a grapheme boundary, so the field simply stops taking
-            /// more and what the user sees is exactly what gets stored.
+            /// Sanitize and clamp the edited text as the user types.
             @sel(controlTextDidChange:)
             fn control_text_did_change(&self, notification: Id) {
                 // SAFETY: `-object` on the live NSNotification is the edited NSControl;
@@ -3930,8 +3783,7 @@ mod macos {
                 }
             }
 
-            /// `control:textView:doCommandBySelector:`: intercepts only Escape, which
-            /// latches a cancel and aborts the edit.
+            /// Intercept Escape to cancel the rename edit.
             @sel(control:textView:doCommandBySelector:)
             fn control_text_view_do_command(
                 &self,
@@ -3954,8 +3806,7 @@ mod macos {
                 aterm_objc::Bool::YES
             }
 
-            /// `controlTextDidEndEditing:`: the commit exit. Return, Tab and clicking
-            /// away all commit.
+            /// Commit or cancel the rename when editing ends.
             @sel(controlTextDidEndEditing:)
             fn control_text_did_end_editing(&self, notification: Id) {
                 if self.ivars().done.replace(true) {
@@ -4164,8 +4015,7 @@ mod macos {
         true
     }
 
-    /// Keep a live rename editor glued to its tab across a strip refresh. Called at
-    /// the end of every [`set_window_tabs`] path; `ids` is the refreshed tab order.
+    /// Keep a live rename editor aligned with its tab across a strip refresh.
     fn sync_rename_overlay(handle: &ToolbarHandle, ids: &[TabId]) {
         let outcome = {
             let rename = handle.rename.borrow();
@@ -4222,13 +4072,10 @@ mod macos {
         };
         use crate::appkit;
 
-        /// `@encode(BOOL)` for this target, so expectations hold on both arches (the
-        /// arm64 literal is pinned separately).
         fn bool_enc() -> &'static str {
             Bool::ENCODING
         }
 
-        /// A live, empty `NSView`, for the delegate's container ivar.
         fn a_view() -> Obj {
             // SAFETY: `+alloc`/`-init` on `NSView` gives a +1 zero-frame view;
             // `Obj::from_owned` adopts that one +1.
@@ -4236,8 +4083,6 @@ mod macos {
                 .expect("NSView")
         }
 
-        /// All five classes register, under the names AppKit already knows them
-        /// by, on the superclasses they had.
         #[test]
         fn all_five_declared_classes_register_as_they_did() {
             for (cls, name, superclass) in [
@@ -4265,8 +4110,6 @@ mod macos {
             }
         }
 
-        /// `ToolbarDelegate` conforms to `NSToolbarDelegate`. `-setDelegate:` is sent
-        /// raw, so without conformance the toolbar would come up empty.
         #[test]
         fn the_toolbar_delegate_conforms_to_nstoolbardelegate() {
             let cls = ToolbarDelegate::class();
@@ -4300,9 +4143,6 @@ mod macos {
             }
         }
 
-        /// The three rename rows match the encodings `NSTextFieldDelegate` (inheriting
-        /// `NSControlTextEditingDelegate`) declares, read via
-        /// [`aterm_objc::protocol_method_types`], rather than a literal in this file.
         #[test]
         fn the_rename_rows_encode_to_the_protocol_authority() {
             let cls = TabRenameTarget::class();
@@ -4347,8 +4187,6 @@ mod macos {
             assert_eq!(checked, 3, "every rename row was read from the authority");
         }
 
-        /// All thirty-eight registered encodings, read with `method_getTypeEncoding` and
-        /// checked against the table.
         #[test]
         fn the_runtime_reports_every_encoding_the_table_says() {
             let b = bool_enc();
@@ -4484,7 +4322,6 @@ mod macos {
             }
         }
 
-        /// The two `NSArray`-returning methods answer `@[STRIP_ITEM_ID]`, +0.
         #[test]
         fn the_identifier_methods_vend_exactly_the_strip_item() {
             let delegate =

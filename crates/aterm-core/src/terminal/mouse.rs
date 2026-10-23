@@ -162,7 +162,8 @@ impl Terminal {
     ///
     /// Returns the escape sequence to send to the application, or `None` if
     /// mouse reporting is disabled. Coordinates are 0-indexed.
-    /// [`WheelDir::code`] carries the button table (xterm buttons 4-7).
+    /// [`WheelDir::code`](aterm_types::mouse::WheelDir::code) carries the button table
+    /// (xterm buttons 4-7).
     #[inline]
     #[must_use]
     pub fn encode_mouse_wheel(

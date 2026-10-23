@@ -360,7 +360,8 @@ pub(crate) mod taint {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const WINDOW_OP: u32 = 1 << 4;
     pub(crate) const CONTROL: u32 = 1 << 5;
-    /// Askpass request from inside the spare (macOS only; [`askpass_refused`]).
+    /// Askpass request from inside the spare (macOS only;
+    /// [`askpass_refused`](super::askpass_refused)).
     #[cfg(target_os = "macos")]
     pub(crate) const ASKPASS: u32 = 1 << 6;
 }

@@ -13,6 +13,7 @@ use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
 use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
+use super::super::occupancy::said;
 use super::super::occupancy::{
     FactLine, OccupancyReading, OccupancySaid, SaidHold, SaidRule, SaidVerdict,
 };
@@ -56,7 +57,7 @@ struct DoorWatch {
     /// The board's reading last asked, with when, on the clock's milliseconds.
     asked: Option<(i64, OccupancyReading)>,
     /// What each rule last said ([`RuleId::index`]): a line once a change.
-    said: [Option<Said>; 2],
+    said: [Option<Said>; RuleId::COUNT],
     /// The clock's milliseconds and the wall's (unix ms) at the loop's start
     /// ([`Session::hold_seed_from`]): a hold's start in unix ms, for its episodes' ids.
     wall: Option<(i64, i64)>,
@@ -69,7 +70,7 @@ struct DoorWatch {
     /// again (the clock's).
     again: Option<(u64, i64)>,
     /// When each rule's word last changed ([`Self::said`]), unix ms.
-    said_at: [i64; 2],
+    said_at: [i64; RuleId::COUNT],
     /// What the last break judged beside the verdicts: the ready proxy, the guards, and the
     /// reading the decider judged ([`OccupancySaid`]).
     seen: Option<(bool, Guards, OccupancyReading)>,
@@ -308,7 +309,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A read of the agent's own background work at a break begun at `at`, standing `waited`,
-    /// `settled` once past it.
+    /// `settled` once past its settle.
     pub(super) fn hold_background(
         &mut self,
         screen: &Screen,
@@ -379,8 +380,8 @@ impl<C: Ctl> Session<'_, C> {
             declared: self.hold.clock.declared(),
         };
         if self.hold.door.books.hold_since_ms() != Some(since_ms) {
-            self.hold.door.said = [None; 2];
-            self.hold.door.said_at = [0; 2];
+            self.hold.door.said = [None; RuleId::COUNT];
+            self.hold.door.said_at = [0; RuleId::COUNT];
             if !armed(Fault::HeldAcrossHolds) {
                 self.hold.door.held.clear();
             }
@@ -434,18 +435,21 @@ impl<C: Ctl> Session<'_, C> {
             declared: self.hold.clock.declared(),
         });
         let door = &self.hold.door;
-        let rules = RuleId::ALL.map(|rule| {
-            let said = door.said[rule.index()].filter(|_| hold.is_some());
-            SaidRule {
-                rule,
-                verdict: said.map_or(SaidVerdict::Quiet, Said::verdict),
-                at_ms: if said.is_some() {
-                    door.said_at[rule.index()]
-                } else {
-                    0
-                },
-            }
-        });
+        let rules = said::told_rules(self.fx.slice2_recorded())
+            .into_iter()
+            .map(|rule| {
+                let said = door.said[rule.index()].filter(|_| hold.is_some());
+                SaidRule {
+                    rule,
+                    verdict: said.map_or(SaidVerdict::Quiet, Said::verdict),
+                    at_ms: if said.is_some() {
+                        door.said_at[rule.index()]
+                    } else {
+                        0
+                    },
+                }
+            })
+            .collect();
         let (ready, guards, reading) = door.seen.map_or(
             (false, None, OccupancyReading::default()),
             |(ready, guards, reading)| (ready, Some(guards), reading),
@@ -994,11 +998,15 @@ impl<C: Ctl> Session<'_, C> {
             hold: None,
             ready: false,
             guards: None,
-            rules: RuleId::ALL.map(|rule| SaidRule {
-                rule,
-                verdict: SaidVerdict::Quiet,
-                at_ms: 0,
-            }),
+            rules: told
+                .rules
+                .iter()
+                .map(|r| SaidRule {
+                    rule: r.rule,
+                    verdict: SaidVerdict::Quiet,
+                    at_ms: 0,
+                })
+                .collect(),
             ..told.clone()
         })
     }

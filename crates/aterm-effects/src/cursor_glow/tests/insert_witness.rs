@@ -5,9 +5,6 @@
 
 use super::*;
 
-/// Seed the hidden-caret TUI shape the row tests share: a spinner row at
-/// `(10, 19)`, the input row at `(12, 2)`, one typed echo `2 → 3` at 245 ms
-/// establishing it (`spawns == 1`, `last_anchor_sweep` on row 12).
 fn established_input_row_beside_a_spinner(glow: &mut CursorGlow, t0: Instant) {
     let g = geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
@@ -24,8 +21,6 @@ fn established_input_row_beside_a_spinner(glow: &mut CursorGlow, t0: Instant) {
     assert_eq!(glow.spawns(), 1, "the input echo establishes the row");
 }
 
-/// The row witness: an insert of unknown width (a Tab, a ⌃V) is bound to the row
-/// the hand was on when it was armed and spends on no other.
 #[test]
 fn a_tabs_insert_stamp_is_bound_to_the_row_the_hand_was_on() {
     let g = geom();
@@ -64,11 +59,6 @@ fn a_tabs_insert_stamp_is_bound_to_the_row_the_hand_was_on() {
     );
 }
 
-/// A bare Tab's licence is a gesture's, not a paste's: an unknown width has
-/// nothing to check but the row witness and the 32-cell bound, so it expires
-/// at [`CursorGlow::INSERT_GESTURE_HINT_FRESH`] rather than
-/// [`CursorGlow::INSERT_HINT_FRESH`], or a background job printing on the
-/// prompt row would light as a 32-cell sweep.
 #[test]
 fn a_program_hop_after_a_tab_s_gesture_window_stays_dark() {
     let g = geom();
@@ -106,9 +96,6 @@ fn a_program_hop_after_a_tab_s_gesture_window_stays_dark() {
     );
 }
 
-/// The row witness with a hidden caret (Claude Code's shape): the input row is
-/// established, a Tab is pressed on it, and from 300 ms later a spinner row
-/// advances one, one, then eight cells inside the insert window.
 #[test]
 fn a_spinner_row_advancing_after_a_tab_stays_dark() {
     let g = geom();
@@ -142,10 +129,6 @@ fn a_spinner_row_advancing_after_a_tab_stays_dark() {
     );
 }
 
-/// The row witness rides the band: an unknown-width insert (a multi-line
-/// paste's `[Pasted text #1 +N lines] `, a Tab's completion) is armed on Codex's
-/// composer row 13, and before its echo lands a streamed line moves the viewport
-/// `[11..56]` down one row.
 #[test]
 fn an_insert_witness_rides_a_band_move_and_the_row_it_left_spends_nothing() {
     let g = geom_codex();
@@ -225,9 +208,6 @@ fn an_insert_witness_rides_a_band_move_and_the_row_it_left_spends_nothing() {
     );
 }
 
-/// The unknown width's late receipt: a multi-line paste's receipt can land
-/// after the frame that observed the echo, like a priced one's
-/// (`a_receipt_that_lands_after_the_echoing_frame_still_lights_the_insert`).
 #[test]
 fn an_unknown_width_receipt_that_lands_late_claims_the_hop_by_its_row_witness() {
     let g = geom();
@@ -275,10 +255,6 @@ fn an_unknown_width_receipt_that_lands_late_claims_the_hop_by_its_row_witness() 
     );
 }
 
-/// The parked caret's witness: with the DEC cursor visible but parked at the
-/// origin while input row 2 is repainted under it, an unknown-width insert's
-/// witness is the row the anchored lane proved (`hand_row`), not the parked
-/// caret's.
 #[test]
 fn a_parked_carets_insert_witness_is_the_anchored_input_row_not_the_parked_row() {
     let g = geom();
@@ -351,8 +327,6 @@ fn a_parked_carets_insert_witness_is_the_anchored_input_row_not_the_parked_row()
     );
 }
 
-/// The parked proof is current: a visible caret on the row the anchored lane
-/// established is the hand's, whatever the program last printed.
 #[test]
 fn a_visible_caret_on_the_established_echo_row_is_not_parked_by_a_transcript_print() {
     let g = geom_codex();
@@ -406,9 +380,6 @@ fn a_visible_caret_on_the_established_echo_row_is_not_parked_by_a_transcript_pri
     );
 }
 
-/// The raised bound is the insert row's: with a 36-cell paste delivered and a
-/// key typed behind it, the anchored lane's cap rises to `insert_reach` for the
-/// insert's row only.
 #[test]
 fn a_spinner_past_the_typed_cap_beside_a_fresh_insert_stays_dark() {
     let g = geom();
@@ -444,11 +415,6 @@ fn a_spinner_past_the_typed_cap_beside_a_fresh_insert_stays_dark() {
     );
 }
 
-/// A drop as the first action on a never-typed hidden row whose receipt lands
-/// after the echoing frame: the frame refuses the keyless advance and brands the
-/// row; the late receipt, exactly the hop's width, retro-licenses it as one
-/// sweep and lifts the brand, so later keys anchor with no program-row
-/// refusals.
 #[test]
 fn a_first_action_drop_with_a_late_receipt_is_retro_licensed_and_unbrands_its_row() {
     let g = geom();
@@ -497,9 +463,6 @@ fn a_first_action_drop_with_a_late_receipt_is_retro_licensed_and_unbrands_its_ro
     assert_eq!(glow.spawns(), 4);
 }
 
-/// A priced 32-cell paste is not the unknown class: its width equals
-/// `INSERT_GESTURE_CELLS` but it admits no spinner's one-cell advance on
-/// another row.
 #[test]
 fn a_priced_paste_the_width_of_the_gesture_cap_is_not_the_unknown_class() {
     let g = geom();
@@ -529,8 +492,6 @@ fn a_priced_paste_the_width_of_the_gesture_cap_is_not_the_unknown_class() {
     );
 }
 
-/// A revoke is exact: a Tab dispatched while a paste drains is armed and revoked
-/// at its own instant in the same turn.
 #[test]
 fn a_revoked_tab_restores_the_paste_credit_it_accumulated_into() {
     let g = geom();
@@ -571,9 +532,6 @@ fn a_revoked_tab_restores_the_paste_credit_it_accumulated_into() {
     );
 }
 
-/// Two receipts straddling the echoing frame claim the hop together. A
-/// multi-file drop is one paste per file, echoed as one hop, and the second
-/// receipt can publish after the frame that saw it.
 #[test]
 fn two_receipts_straddling_the_frame_claim_the_refused_hop_together() {
     let g = wide_geom();
@@ -610,10 +568,6 @@ fn two_receipts_straddling_the_frame_claim_the_refused_hop_together() {
     assert!(dark.is_empty(), "dark: {dark:?}");
 }
 
-/// The unknown insert's bound counts once per licence. Every Tab press and
-/// auto-repeat arms a fresh unknown-width insert; a second unspent unknown arm
-/// must not add another 32 cells (a held Tab would reach ~1900), so a 68-cell
-/// program hop after three Tabs stays refused.
 #[test]
 fn repeated_unknown_inserts_do_not_widen_the_bound_past_the_gesture_cap() {
     let g = wide_geom();
@@ -669,8 +623,6 @@ fn repeated_unknown_inserts_do_not_widen_the_bound_past_the_gesture_cap() {
     );
 }
 
-/// The dispatch-time arm claims no pending hop: `note_insert_armed` is the
-/// delivery arm without the late-receipt claim.
 #[test]
 fn a_dispatch_time_insert_arm_claims_no_hop_refused_before_the_key() {
     let g = geom();
@@ -716,9 +668,6 @@ fn a_dispatch_time_insert_arm_claims_no_hop_refused_before_the_key() {
     }
 }
 
-/// The licensed insert's reappearance is bridged. A Tab completion or paste
-/// whose echo frame was read torn before its glyphs shows the caret hidden, then
-/// visible the insert's width on, with no print the anchored lane could judge.
 #[test]
 fn a_licensed_insert_s_hidden_to_visible_reappearance_is_laid_as_the_insert() {
     let g = geom();
@@ -767,10 +716,6 @@ fn a_licensed_insert_s_hidden_to_visible_reappearance_is_laid_as_the_insert() {
     }
 }
 
-/// A late receipt claims no hop refused before its own dispatch. A queued bare
-/// Tab's receipt carries its dispatch instant (`note_insert_delivered_from`) and
-/// claims only hops refused at or after it, since its bytes could not echo
-/// before dispatch; a program hop refused 50 ms earlier stays dark.
 #[test]
 fn a_late_receipt_claims_no_hop_refused_before_its_dispatch() {
     let g = geom();
@@ -822,10 +767,6 @@ fn a_late_receipt_claims_no_hop_refused_before_its_dispatch() {
     assert_eq!(glow.spawns(), 1, "{:?}", ring_rows(&glow));
 }
 
-/// A revoked arm is not a delivery: a bare Tab / ⌃V armed at dispatch, revoked
-/// when its write queued behind a draining paste, and re-armed when the write
-/// lands counts once in `inserts_delivered=` (the revoke undoes the arm's
-/// tick).
 #[test]
 fn a_revoked_insert_arm_undoes_its_delivered_tally_tick() {
     let t0 = Instant::now();
@@ -879,10 +820,6 @@ fn a_revoked_insert_arm_undoes_its_delivered_tally_tick() {
     assert_eq!(other.insert_tally().last_cells, 8);
 }
 
-/// The row law: an unknown-width insert belongs to the witnessed row only, and
-/// to no row when nothing witnessed the arm; a priced width belongs to the
-/// witnessed row and is also recognised by its whole width on a row nobody
-/// typed on (a partial advance there is a program row).
 #[test]
 fn insert_row_identity_is_the_witnessed_row_or_a_priced_whole_width() {
     let now = Instant::now();
@@ -944,9 +881,6 @@ fn insert_row_identity_is_the_witnessed_row_or_a_priced_whole_width() {
     );
 }
 
-/// A brand outranks the insert: a row that advanced keylessly before the arm is
-/// a program row for its entry's lifetime, and even a priced insert whose whole
-/// width matches its next advance is refused there `program-row`.
 #[test]
 fn a_row_branded_before_the_arm_refuses_even_a_whole_width_match() {
     let g = geom();

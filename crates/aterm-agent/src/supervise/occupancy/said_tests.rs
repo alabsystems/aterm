@@ -37,7 +37,11 @@ fn holding(held: &[Guard]) -> Guards {
     }
 }
 
-fn said(mode: Occupancy, verdicts: [SaidVerdict; 2], guards: Option<Guards>) -> OccupancySaid {
+fn said(
+    mode: Occupancy,
+    verdicts: [SaidVerdict; RuleId::COUNT],
+    guards: Option<Guards>,
+) -> OccupancySaid {
     let at_ms = SINCE + 5 * HOUR + 25 * MIN;
     OccupancySaid {
         mode,
@@ -47,7 +51,7 @@ fn said(mode: Occupancy, verdicts: [SaidVerdict; 2], guards: Option<Guards>) -> 
         }),
         ready: true,
         guards,
-        rules: [
+        rules: vec![
             SaidRule {
                 rule: RuleId::WaitNudge,
                 verdict: verdicts[0],
@@ -237,4 +241,27 @@ fn spans_and_clocks_are_spelled_plainly() {
     assert_eq!(clock_words(SINCE, 6 * 3600), "00:52");
     assert!(cap_words(RuleId::WaitNudge).starts_with(&rules::NUDGES_PER_DAY.to_string()));
     assert!(cap_words(RuleId::HoldRoom).starts_with(&rules::HOLD_ROOM_PER_HOLD.to_string()));
+}
+
+/// THE TOLD WORD'S RULES PRINT AS SLICE 1'S ARRAY DID (the slice-2 plan's D7): a tape compares the
+/// word's `Debug`, and the list's is the two-rule array's byte for byte, in both forms, so a
+/// slice-1 tape's tells replay unchanged. Every rule is slice 1's, so a recording with or without
+/// slice 2's doors carries every rule. NEGATIVE CONTROL: a list of one rule prints otherwise.
+#[test]
+fn the_told_rules_print_as_slice_ones_array() {
+    let s = said(
+        Occupancy::Prompt,
+        [SaidVerdict::Typed, SaidVerdict::Spent],
+        None,
+    );
+    let slice1: [SaidRule; 2] = [s.rules[0], s.rules[1]];
+    assert_eq!(format!("{:?}", s.rules), format!("{slice1:?}"));
+    assert_eq!(format!("{:#?}", s.rules), format!("{slice1:#?}"));
+    let told: Vec<RuleId> = s.rules.iter().map(|r| r.rule).collect();
+    assert_eq!(told, RuleId::ALL);
+    assert_eq!(told_rules(true), RuleId::ALL);
+    assert_eq!(told_rules(false), RuleId::ALL);
+    assert!(RuleId::ALL.into_iter().all(RuleId::slice1));
+    let one = vec![s.rules[0]];
+    assert_ne!(format!("{one:?}"), format!("{slice1:?}"));
 }

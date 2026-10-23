@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Control stream peer hangup detection ([`peer_state`], [`PeerState`], [`peer_closed`]).
-//! Distinguishes [`PeerState::Gone`] and [`PeerState::Idle`], and shuts sockets via [`hang_up`].
+//! Control stream peer hangup detection ([`peer_state`](crate::hangup::peer_state), [`PeerState`](crate::hangup::PeerState), [`peer_closed`](crate::hangup::peer_closed)).
+//! Distinguishes [`PeerState::Gone`](crate::hangup::PeerState::Gone) and [`PeerState::Idle`](crate::hangup::PeerState::Idle), and shuts sockets via [`hang_up`](crate::hangup::hang_up).
 
 use crate::CtlStream;
 
@@ -67,6 +67,7 @@ pub fn peer_closed(stream: &CtlStream) -> bool {
 pub fn hang_up(stream: &(impl Halves + ?Sized)) -> bool {
     let wrote = stream.shut(std::net::Shutdown::Write).is_ok();
     let read = stream.shut(std::net::Shutdown::Read).is_ok();
+    stream.wake_waiting();
     wrote || read
 }
 
@@ -78,6 +79,11 @@ pub trait Halves {
     /// The socket's own: on Darwin `ENOTCONN` for a half already shut, or a socket whose peer
     /// closed entirely.
     fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()>;
+
+    /// End any read or write already waiting on the socket once both halves are shut: the
+    /// shutdown itself does it on Unix and in Windows' [`CtlStream`], which wakes its own
+    /// parked reads.
+    fn wake_waiting(&self) {}
 }
 
 impl Halves for CtlStream {
@@ -90,11 +96,28 @@ impl Halves for std::net::TcpStream {
     fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()> {
         self.shutdown(how)
     }
+
+    /// Windows' `shutdown` ends no `recv` already waiting (only a later one fails at once),
+    /// so the socket's pending I/O is cancelled, every thread's: the waiting read returns.
+    #[cfg(windows)]
+    fn wake_waiting(&self) {
+        use std::os::windows::io::AsRawSocket as _;
+        let Ok(handle) = crate::win::ffi::RawHandle::try_from(self.as_raw_socket()) else {
+            return;
+        };
+        // SAFETY: the socket stays open across the call (`self` borrows it), and a null
+        // OVERLAPPED asks for every pending request on it; nothing pending is no error here.
+        let _ = unsafe { crate::win::ffi::CancelIoEx(handle, std::ptr::null_mut()) };
+    }
 }
 
 impl<S: Halves + ?Sized> Halves for &S {
     fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()> {
         (**self).shut(how)
+    }
+
+    fn wake_waiting(&self) {
+        (**self).wake_waiting();
     }
 }
 
@@ -341,5 +364,44 @@ mod tests {
         let (server, client) = crate::CtlStream::pair().expect("pair");
         drop(client);
         until_gone(&server, "a peer closed without a half-close");
+    }
+}
+
+/// What every platform's hang-up keeps, Windows' `shutdown` included ([`Halves::wake_waiting`]).
+#[cfg(test)]
+mod wake_tests {
+    use super::hang_up;
+    use std::io::Read as _;
+    use std::time::Duration;
+
+    /// A HANG-UP ENDS A READ WAITING ON THE SAME TCP SOCKET, its peer open and silent: on
+    /// Windows the read waited out its timeout. The pause only lets the read reach its wait;
+    /// a hang-up that lands first ends it as well, so the order never fails the test.
+    #[test]
+    fn a_hang_up_ends_a_read_waiting_on_a_tcp_socket() {
+        const HANG: Duration = Duration::from_secs(60);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peer =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (near, _) = listener.accept().expect("accept");
+        near.set_read_timeout(Some(HANG * 2)).expect("read timeout");
+        let reading = near.try_clone().expect("the reader's copy");
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (read_tx, read) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            let got = (&reading).read(&mut [0u8; 1]).map_err(|e| e.kind());
+            let _ = read_tx.send(got);
+        });
+        started.recv_timeout(HANG).expect("the reader starts");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(hang_up(&near), "both halves were open");
+        let got = read.recv_timeout(HANG);
+        assert!(
+            matches!(got, Ok(Ok(0) | Err(_))),
+            "the waiting read ends, with nothing read: {got:?}"
+        );
+        reader.join().expect("the reader");
+        drop(peer);
     }
 }

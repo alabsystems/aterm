@@ -17,14 +17,12 @@ use crate::pyjson::J;
 use crate::stop::{self, Stopped};
 use crate::{Fail, Res};
 
-/// The development seam an instance is started with so its hosted loops are taped: the name and its value.
+/// Development environment variable `(name, value)` that enables hosted-loop tape recording.
 #[must_use]
 pub fn seam() -> (String, String) {
     (store::HOSTED_SEAM.to_string(), "1".to_string())
 }
 
-/// Every tape file under `dir`, at any depth (a session's directory, `kept/`),
-/// in path order.
 fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     let mut dirs = vec![dir.to_path_buf()];
@@ -56,9 +54,6 @@ fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Whether the tape at `path` carries its run's end: its loop ended (a tape
-/// whose loop the instance's end cut off mid-wait has none, and replays only
-/// as ENDED).
 fn ended(path: &Path) -> bool {
     std::fs::read(path)
         .ok()
@@ -66,9 +61,6 @@ fn ended(path: &Path) -> bool {
         .is_some_and(|tape| tape.items.iter().any(|i| matches!(i, Item::End(_))))
 }
 
-/// The sessions under the store `dir` with a tape that has no end yet — a
-/// loop still recording — each by its directory's name, which is its sid
-/// without the `@` (`store::session_dir`); `kept/` is a person's, never one.
 fn recording(dir: &Path) -> io::Result<Vec<String>> {
     let mut sids = Vec::new();
     for path in tapes_under(dir)? {
@@ -89,7 +81,7 @@ fn recording(dir: &Path) -> io::Result<Vec<String>> {
     Ok(sids)
 }
 
-/// END EVERY LOOP STILL RECORDING under the store `dir` as a person ends it: its session's Autopilot turned off (`ctl @<sid> meta set autopilot off`), which stops the session's supervisor at its next look, so its tape carries its end.
+/// End every loop still recording under `dir` by setting its session's Autopilot to `off`.
 /// # Errors
 /// Interrupted.
 pub fn end_loops(door: &Door<'_>, dir: &Path) -> Result<bool, Stopped> {
@@ -122,7 +114,7 @@ pub fn end_loops(door: &Door<'_>, dir: &Path) -> Result<bool, Stopped> {
 pub struct Cost {
     /// The tapes.
     pub tapes: u64,
-    /// The tapes with no end: cut off mid-run (a lab not this run's to end, a loop that did not stop), what they count only a prefix.
+    /// Tapes with no end marker (cut off mid-run).
     pub open: u64,
     /// Their bytes.
     pub bytes: u64,
@@ -155,7 +147,7 @@ pub fn summary(dir: &Path) -> Result<Cost, String> {
     Ok(cost)
 }
 
-/// Each tape under `dir` replayed strictly (`aterm drive replay`'s replay, in this process): its path and the verdict's word, or why it could not be replayed.
+/// Replay each tape under `dir` strictly and return `(path, verdict_or_error)` pairs.
 #[must_use]
 pub fn replay_all(dir: &Path) -> Vec<(PathBuf, Result<report::Verdict, String>)> {
     let tapes = match tapes_under(dir) {
@@ -179,7 +171,6 @@ pub fn replay_all(dir: &Path) -> Vec<(PathBuf, Result<report::Verdict, String>)>
         .collect()
 }
 
-/// `tape`'s usage.
 const USAGE: &str = "tape promote <results-run|dir|tape> [--as NAME] [--fewer] | tape lint \
                      [FILE|DIR...] | tape replay-jailed [FILE|DIR...] | tape rerecord NAME \
                      [--fewer]";
@@ -204,7 +195,6 @@ pub fn corpus_dir() -> PathBuf {
     paths().repo.join("crates/aterm-agent/tests/testdata/tapes")
 }
 
-/// The host's names, long and short (`hostname`, `hostname -s`), each once.
 fn hostnames() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for args in [&[][..], &["-s"][..]] {
@@ -220,14 +210,13 @@ fn hostnames() -> Vec<String> {
     names
 }
 
-/// THE RECORDING MACHINE'S NAMES, each as the corpus's fixed token ([`corpus::token`]): the lab's state directory, the checkout (as built and through every link), the owner's homes (the account's and the caller's `HOME`, [`crate::paths::Paths::guarded_homes`]: a lab run under a scratch HOME still names the account's store, and the scratch home), the user's temporary directory, the login name and the host's names; and the account's home, which the lint looks for besides.
+/// Build the recording machine's scrub table and primary home path.
 /// # Errors
-/// No home, or a name the scrub refuses (a home at the root, a login name of two letters): a promote that cannot take it must not keep the tape.
+/// No home directory is set, or a name is refused by the scrub rules.
 pub fn machine_scrub() -> Result<(Scrub, PathBuf), String> {
     machine_scrub_of(paths())
 }
 
-/// [`machine_scrub`] for the paths `p`.
 fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String> {
     let home = PathBuf::from(p.need_home()?);
     let mut scrub = Scrub::new();
@@ -248,8 +237,6 @@ fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String>
     Ok((scrub, home))
 }
 
-/// A promote's source as named: a results run by its name
-/// (`s1-plain-01`, under `<state>/results/`), else the path given.
 fn source_path(from: &str) -> PathBuf {
     let run = crate::scn::results_dir().join(from);
     if !from.contains('/') && run.is_dir() {
@@ -282,9 +269,7 @@ pub(crate) fn corpus_name(name: &str) -> bool {
             .is_some_and(|b| b.is_ascii_alphanumeric())
 }
 
-/// THE ONE TAPE of `source` to promote: the file itself, or the one tape
-/// under the directory that carries its end.
-///
+/// Find the tape to promote: `source` itself, or the single ended tape under it.
 /// # Errors
 /// None ended there, or more than one (each named: give its path).
 fn the_tape(source: &Path) -> Result<PathBuf, String> {
@@ -326,9 +311,6 @@ pub(crate) fn run_failed(summary: &J) -> Option<String> {
     })
 }
 
-/// A results run's refusal ([`run_failed`]) from its `summary.json`, when
-/// `source` is a directory that holds one; a summary that does not read is
-/// refused too.
 fn summary_refusal(source: &Path) -> Result<(), String> {
     let path = source.join("summary.json");
     if !source.is_dir() || !path.exists() {
@@ -346,10 +328,6 @@ fn summary_refusal(source: &Path) -> Result<(), String> {
     }
 }
 
-/// What `new` loses of the corpus tape it would replace, each by its census
-/// word ([`Census`]): acts by their count, each a step the corpus holds a
-/// build to; a kind of decision (an approval, a question, a turn end, a
-/// wall) only when `new` holds none of a kind `old` held.
 fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
     let mut lost: Vec<&'static str> = [
         ("approval(s)", old.approvals, new.approvals),
@@ -367,8 +345,6 @@ fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
     lost
 }
 
-/// What the corpus tape at `path` holds, when there is one (one that does
-/// not read holds nothing a promote could lose).
 fn held(path: &Path) -> Option<Census> {
     let raw = std::fs::read(path).ok()?;
     Some(
@@ -378,12 +354,9 @@ fn held(path: &Path) -> Option<Census> {
     )
 }
 
-/// `source`'s tape promoted into the corpus as `name`:
-/// where it was written, what it is, and what the tape it replaced held.
-///
+/// Promote `source`'s tape into the corpus as `name`.
 /// # Errors
-/// A failed run, no tape to promote, a name the scrub refuses, the
-/// promote's refusal (`corpus::promote`), a loss not allowed, or the write.
+/// Failed run, missing tape, scrub/promote refusal, disallowed loss, or write error.
 fn promote_into(
     source: &Path,
     name: &str,
@@ -418,8 +391,6 @@ fn promote_into(
     Ok((out, kept, old))
 }
 
-/// What a promote or a rerecord says it wrote: the tape, what it holds and
-/// costs, and what the tape it replaced held.
 fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&Census>) {
     println!(
         "{verb} {}: {}, {} effects, {} bytes of text",
@@ -435,7 +406,7 @@ fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&C
 
 /// `tape promote <results-run|dir|tape> [--as NAME] [--fewer]`.
 /// # Errors
-/// A usage error (no source; no name a results run gives, and no `--as`), or the promote's refusal, said.
+/// A usage error or a promote refusal.
 pub fn cmd_promote(args: &[String]) -> Res {
     let (mut from, mut name, mut fewer) = (None, None, false);
     let mut it = args.iter();
@@ -481,7 +452,6 @@ pub fn cmd_promote(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The tapes `args` names, or the corpus's when it names none.
 fn named_or_corpus(args: &[String]) -> Result<Vec<PathBuf>, Fail> {
     let named: Vec<PathBuf> = if args.is_empty() {
         vec![corpus_dir()]
@@ -503,7 +473,7 @@ fn named_or_corpus(args: &[String]) -> Result<Vec<PathBuf>, Fail> {
     Ok(tapes)
 }
 
-/// `tape lint [FILE|DIR...]`: each tape's text form held to the corpus's lint on this machine (`corpus::lint`); exit 1 when any holds what a corpus may not.
+/// `tape lint [FILE|DIR...]`: lint each tape's text form against `corpus::lint`.
 /// # Errors
 /// No tape, or the machine's names do not resolve.
 pub fn cmd_lint(args: &[String]) -> Res {
@@ -533,9 +503,7 @@ pub fn cmd_lint(args: &[String]) -> Res {
     Ok(i32::from(flagged > 0))
 }
 
-/// THE REPLAY'S JAIL for the binary `bin` and the tape `tape`, both physical
-/// paths (`replay_jail.sb`'s holes filled).
-///
+/// Render the replay sandbox profile for `bin` and `tape`.
 /// # Errors
 /// A path a sandbox profile cannot quote.
 fn jail_profile(bin: &Path, tape: &Path) -> Result<String, String> {
@@ -550,17 +518,13 @@ fn jail_profile(bin: &Path, tape: &Path) -> Result<String, String> {
         .replace("@TAPE@", &quoted(tape)?))
 }
 
-/// What one jailed replay did: its exit code, its stdout and its stderr.
 struct Jailed {
     code: Option<i32>,
     out: String,
     err: String,
 }
 
-/// `aterm drive replay --check <asked>` run by `bin` in the jail whose
-/// profile names `allowed` (`sandbox-exec -p`), its environment cleared: what
-/// it did. A minute is the hang detector: a replay that has not ended by
-/// then is killed (it is this process's own child) and said to have hung.
+/// Run `aterm drive replay --check <asked>` under `sandbox-exec` allowing `allowed`.
 /// # Errors
 /// The profile, the spawn, or an interrupt.
 fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
@@ -608,8 +572,6 @@ fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
     })
 }
 
-/// A child's pipe read to its end on a thread of its own, so neither pipe
-/// fills while the other is read: its text, at the join.
 fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut text = String::new();
@@ -620,7 +582,7 @@ fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHand
     })
 }
 
-/// `tape replay-jailed [FILE|DIR...]`: the negative control first — a copy of the first tape, which the profile does not name, must be refused by the very binary and profile (exit 2, the tape not read) — then each tape replayed in its own jail by `aterm drive replay --check`; exit 1 when the control was not refused or a tape did not take every act as recorded.
+/// `tape replay-jailed [FILE|DIR...]`: verify the sandbox control and replay each tape jailed.
 /// # Errors
 /// No tape, no aterm built beside the lab, or the control's copy.
 pub fn cmd_replay_jailed(args: &[String]) -> Res {
@@ -685,9 +647,9 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     Ok(i32::from(failed > 0))
 }
 
-/// `tape rerecord NAME [--fewer]`: the scenario NAME on a fresh lab (`scn run NAME`, run 1, the tag `$LAB_TAG` or `survey`), then its tape promoted over the corpus's `NAME` — unless the run says it did not go as the scenario meant (its `error` or `exception`), or its tape loses what the one it would replace held ([`lost`]) and `--fewer` does not say the loss is deliberate ([`promote_into`]).
+/// `tape rerecord NAME [--fewer]`: run scenario `NAME` and promote its tape over the corpus.
 /// # Errors
-/// No scenario of that name (a tape promoted `--as` another name is rerecorded by hand), an interrupt, a failed run, or the promote's refusal.
+/// Unknown scenario name, an interrupt, a failed run, or a promote refusal.
 pub fn cmd_rerecord(args: &[String]) -> Res {
     let (name, fewer) = match args {
         [name] => (name, false),
@@ -729,7 +691,6 @@ pub fn cmd_rerecord(args: &[String]) -> Res {
 mod corpus_tests {
     use super::*;
 
-    /// A results run names its scenario; a run number is two digits.
     #[test]
     fn a_results_run_names_its_scenario() {
         let cases = [
@@ -751,10 +712,6 @@ mod corpus_tests {
         }
     }
 
-    /// THE JAIL'S PROFILE names the binary and the tape it is given and no
-    /// other file: every read denied but theirs and the loader's, every
-    /// write, the network, every program but the binary and every fork; and
-    /// a path the profile cannot quote is refused.
     #[test]
     fn the_jails_profile_names_its_binary_and_tape_only() {
         let profile =
@@ -774,10 +731,6 @@ mod corpus_tests {
         assert!(jail_profile(Path::new("/b/a\"terminal"), Path::new("/t")).is_err());
     }
 
-    /// A RUN THAT DID NOT GO AS ITS SCENARIO MEANT IS NOT PROMOTED: a results
-    /// run whose summary records an `error` (no card, a decision never
-    /// journaled) or an `exception` is refused before its tape is read, and
-    /// so is one whose summary does not read; nothing is written.
     #[test]
     fn a_failed_run_is_not_promoted() {
         let owned = aterm_tempfile::tempdir().expect("owned scratch");
@@ -800,9 +753,6 @@ mod corpus_tests {
         assert!(e.contains("carries its end"), "{e}");
     }
 
-    /// A RERECORD THAT LOSES WHAT THE CORPUS KEPT IS NAMED: every kind the
-    /// tape it replaces held more of — the survey's dismissal gone leaves
-    /// only the host's act; a box never drawn leaves no approval.
     #[test]
     fn a_tape_holding_fewer_names_what_it_lost() {
         let old = Census {
@@ -849,8 +799,6 @@ mod corpus_tests {
 mod scrub_tests {
     use super::*;
 
-    /// A tape recorded under a scratch HOME takes the account's home as the home (its
-    /// store's paths name it), and the scratch HOME's too.
     #[test]
     fn under_a_scratch_home_the_account_home_is_scrubbed_too() {
         let top = aterm_tempfile::Builder::new()

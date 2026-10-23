@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bridge loop wait tally ([`SEAM`], [`FILE`], [`Tally::parse`], [`Tally::since`],
-//! [`Tally::at_ns`], [`Recorder::idle`]) with per-[`Row`] log2 [`Hist`] buckets
-//! ([`Row::partitions`]): broker ([`Row::Request`], [`Row::Ack`], [`Row::Commit`]), verb lane
-//! ([`Row::LaneOutbox`], [`Row::LaneOther`], [`lane_row`]), [`crate::state::StateDir`]
-//! ([`Row::DirReplace`], [`Row::DirFlush`], [`Row::SetPostPin`], [`Row::AppendSelfAcked`],
-//! [`Kept`], [`Tally::dir`]), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`],
-//! [`Row::QueuedRecord`]), posts ([`Row::PostPublish`], [`Row::DrainPosts`]), and loop park/write
-//! ([`Row::Park`], [`Row::TallyWrite`]).
+//! Bridge loop wait tally ([`SEAM`](crate::wait_tally::SEAM), [`FILE`](crate::wait_tally::FILE), [`Tally::parse`](crate::wait_tally::Tally::parse), [`Tally::since`](crate::wait_tally::Tally::since),
+//! [`Tally::at_ns`](crate::wait_tally::Tally::at_ns), [`Recorder::idle`](crate::wait_tally::Recorder::idle)) with per-[`Row`](crate::wait_tally::Row) log2 [`Hist`](crate::wait_tally::Hist) buckets
+//! ([`Row::partitions`](crate::wait_tally::Row::partitions)): broker ([`Row::Request`](crate::wait_tally::Row::Request), [`Row::Ack`](crate::wait_tally::Row::Ack), [`Row::Commit`](crate::wait_tally::Row::Commit)), verb lane
+//! ([`Row::LaneOutbox`](crate::wait_tally::Row::LaneOutbox), [`Row::LaneOther`](crate::wait_tally::Row::LaneOther), [`lane_row`](crate::wait_tally::lane_row)), [`crate::state::StateDir`]
+//! ([`Row::DirReplace`](crate::wait_tally::Row::DirReplace), [`Row::DirFlush`](crate::wait_tally::Row::DirFlush), [`Row::SetPostPin`](crate::wait_tally::Row::SetPostPin), [`Row::AppendSelfAcked`](crate::wait_tally::Row::AppendSelfAcked),
+//! [`Kept`](crate::wait_tally::Kept), [`Tally::dir`](crate::wait_tally::Tally::dir)), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`](crate::wait_tally::Row::WakeEvent),
+//! [`Row::QueuedRecord`](crate::wait_tally::Row::QueuedRecord)), posts ([`Row::PostPublish`](crate::wait_tally::Row::PostPublish), [`Row::DrainPosts`](crate::wait_tally::Row::DrainPosts)), and loop park/write
+//! ([`Row::Park`](crate::wait_tally::Row::Park), [`Row::TallyWrite`](crate::wait_tally::Row::TallyWrite)).
 
 use std::io;
 use std::path::Path;

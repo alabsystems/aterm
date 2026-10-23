@@ -184,3 +184,48 @@ fn a_reader_hears_each_fact_in_words() {
     assert_eq!(runtime_spoken(7 * 3600 + 52 * 60), "7 hours 52 minutes");
     assert_eq!(runtime_spoken(3600 + 60), "1 hour 1 minute");
 }
+
+/// AN ACCOUNT WITH NO WEEKLY FIGURE says why in its title, in the footer's own words
+/// (`profile::WeeklyGap::words`), and to a reader in full (`WeeklyGap::spoken`, no glyph); a
+/// figure, where there is one, says the week instead, its age after a comma.
+#[test]
+fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
+    use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
+    let with = |weekly: Option<&str>| FooterFacts {
+        subscription: Some(SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 20x".into()),
+            weekly: weekly.map(str::to_owned),
+            weekly_gap: Some(WeeklyGap::Untapped),
+            ..SubscriptionDisplay::default()
+        }),
+        ..facts()
+    };
+    let said = |facts: &FooterFacts| {
+        (
+            fact_title(facts, None, Fact::Account).0,
+            fact_spoken_of(facts, None, Fact::Account, FactMask::default()).0,
+        )
+    };
+    let (title, spoken) = said(&with(None));
+    assert!(title.contains("weekly ? \u{b7} restart tab"), "{title}");
+    assert_eq!(
+        spoken,
+        "Account: owner@example.com, Max 20x, weekly figure unknown, a restart of the tab adds it"
+    );
+    let (title, spoken) = said(&with(Some("weekly 62% left")));
+    assert!(
+        title.contains("weekly 62% left") && !title.contains("restart tab"),
+        "{title}"
+    );
+    assert_eq!(
+        spoken,
+        "Account: owner@example.com, Max 20x, weekly 62% left"
+    );
+    let (title, spoken) = said(&with(Some("weekly 62% left \u{b7} 40m ago")));
+    assert!(title.contains("weekly 62% left \u{b7} 40m ago"), "{title}");
+    assert_eq!(
+        spoken,
+        "Account: owner@example.com, Max 20x, weekly 62% left, 40m ago"
+    );
+}

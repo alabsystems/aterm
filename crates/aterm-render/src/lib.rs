@@ -269,9 +269,6 @@ struct SharedFace {
     font: std::sync::Weak<crate::font::Font>,
 }
 
-// Every face some holder holds, and no other: each call prunes the rest
-// (`shared_faces_prune`), so the store needs no cap. A live face is never
-// evicted, or its next holder would read and parse a second copy.
 static SHARED_PARSED_FACES: std::sync::Mutex<Vec<SharedFace>> = std::sync::Mutex::new(Vec::new());
 
 /// The parsed face for `bytes` at `index`, reusing a live parse of the identical bytes when one exists.
@@ -767,7 +764,7 @@ pub fn regional_pair_key(cluster: &str, style: StyleBits, px_q: u32) -> Option<G
     })
 }
 
-/// `GlyphKey::ch_or_id` bit of a band icon that spills into the blank cell on each side of its own (design ruling 258).
+/// `GlyphKey::ch_or_id` bit of a band icon that spills into the blank cell on each side of its own.
 pub const CHROME_ICON_SPILL_BIT: u32 = 1 << 8;
 
 /// Where a sub-script key ([`StyleBits::SUB`]) carries its cell's sideways nudge ([`Script::Sub`](aterm_core::terminal::Script::Sub)) in [`GlyphKey::ch_or_id`].
@@ -790,13 +787,7 @@ pub const fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> 
     }
 }
 
-/// Whether band icon `icon` in cell `c` of a frame row (`cells`) spills into its
-/// neighbours: a band's badge whose neighbours are both blank (a space drawing no glyph,
-/// as the band's ` G TITLE` leaves them) in a cell that is not the row's first. A glass
-/// mark ([`BandIcon::is_glass_mark`]) never spills: it is fitted to its own cell, so it
-/// keeps one size and one baseline whatever its neighbours hold. The one rule
-/// [`Renderer::chrome_icon_key`] draws by and a host that cuts icons off part of a row
-/// (a menu card's scrub) reads.
+/// Whether band icon `icon` in cell `c` of a frame row (`cells`) spills into its neighbours.
 #[inline]
 #[must_use]
 pub fn chrome_icon_spills(icon: BandIcon, cells: &[RenderCell], c: usize) -> bool {
@@ -1659,8 +1650,6 @@ impl ImageCache {
             return;
         };
         if entry.tick == self.tick {
-            // Already the most recent use, in this frame (runs of cells share
-            // a placement): `begin_frame` takes a tick no entry holds.
             return;
         }
         self.order.remove(&entry.tick);
@@ -1755,8 +1744,6 @@ impl ImageCache {
                 break;
             };
             if tick >= self.frame_start || tick == self.tick {
-                // The frame's own (and the entry just inserted, before any
-                // frame) stay, and every entry after the least recent is newer.
                 break;
             }
             self.order.remove(&tick);
@@ -2129,63 +2116,63 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Apple Symbols.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf", // Hebrew
-    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf", // Arabic (beyond the primary's basic block)
-    "/usr/share/fonts/truetype/noto/NotoSansSyriac-Regular.ttf", // Syriac
-    "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf", // Thaana (Dhivehi)
-    "/usr/share/fonts/truetype/noto/NotoSansNKo-Regular.ttf",    // N'Ko
-    "/usr/share/fonts/truetype/noto/NotoSansAdlam-Regular.ttf",  // Adlam
-    "/usr/share/fonts/truetype/noto/NotoSansTifinagh-Regular.ttf", // Tifinagh
-    "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf", // Ethiopic
-    "/usr/share/fonts/truetype/noto/NotoSansVai-Regular.ttf",    // Vai
-    "/usr/share/fonts/truetype/noto/NotoSansCoptic-Regular.ttf", // Coptic
-    "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf", // Armenian
-    "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf", // Georgian
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf", // Devanagari
-    "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf", // Bengali
-    "/usr/share/fonts/truetype/noto/NotoSansGurmukhi-Regular.ttf", // Gurmukhi
-    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf", // Gujarati
-    "/usr/share/fonts/truetype/noto/NotoSansOriya-Regular.ttf",  // Oriya
-    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  // Tamil
-    "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf", // Telugu
-    "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf", // Kannada
-    "/usr/share/fonts/truetype/noto/NotoSansMalayalam-Regular.ttf", // Malayalam
-    "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf", // Sinhala
-    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",   // Thai
-    "/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf",    // Lao
-    "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",  // Khmer
-    "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf", // Myanmar
-    "/usr/share/fonts/truetype/noto/NotoSansTibetan-Regular.ttf", // Tibetan (fonts-noto-extra)
-    "/usr/share/fonts/truetype/noto/NotoSerifTibetan-Regular.ttf", // Tibetan (fonts-noto-core)
-    "/usr/share/fonts/truetype/noto/NotoSansCherokee-Regular.ttf", // Cherokee
-    "/usr/share/fonts/truetype/noto/NotoSansCanadianAboriginal-Regular.ttf", // Unified Canadian Aboriginal
-    "/usr/share/fonts/truetype/noto/NotoSansOsage-Regular.ttf",              // Osage
-    "/usr/share/fonts/truetype/noto/NotoSansDeseret-Regular.ttf",            // Deseret
-    "/usr/share/fonts/truetype/noto/NotoSansRunic-Regular.ttf",              // Runic
-    "/usr/share/fonts/truetype/noto/NotoSansCuneiform-Regular.ttf",          // Cuneiform
-    "/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf", // Egyptian Hieroglyphs
-    "/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf", // Musical Symbols (U+1D100..1D1FF)
+    "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSyriac-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansNKo-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansAdlam-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTifinagh-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansVai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCoptic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGurmukhi-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansOriya-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMalayalam-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansTibetan-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSerifTibetan-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCherokee-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCanadianAboriginal-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansOsage-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDeseret-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansRunic-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCuneiform-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansEgyptianHieroglyphs-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoMusic-Regular.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\msyh.ttc", // Microsoft YaHei: Han + kana (+ Cyrillic/Greek)
+    "C:\\Windows\\Fonts\\msyh.ttc",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\malgun.ttf", // Malgun Gothic: Hangul (syllables, jamo, compat jamo)
+    "C:\\Windows\\Fonts\\malgun.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\Nirmala.ttc", // Nirmala UI: all 9 Indic scripts + Sinhala
+    "C:\\Windows\\Fonts\\Nirmala.ttc",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\LeelawUI.ttf", // Leelawadee UI: Thai, Khmer, Lao
+    "C:\\Windows\\Fonts\\LeelawUI.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\sylfaen.ttf", // Sylfaen: Georgian (arial has no Georgian)
+    "C:\\Windows\\Fonts\\sylfaen.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\ebrima.ttf", // Ebrima: Ethiopic, Tifinagh, Vai, N'Ko
+    "C:\\Windows\\Fonts\\ebrima.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\gadugi.ttf", // Gadugi: Cherokee, Unified Canadian Aboriginal
+    "C:\\Windows\\Fonts\\gadugi.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\mvboli.ttf", // MV Boli: Thaana (Dhivehi)
+    "C:\\Windows\\Fonts\\mvboli.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\arial.ttf", // broad backstop: Latin/Greek/Cyrillic/Hebrew/Arabic/Armenian
+    "C:\\Windows\\Fonts\\arial.ttf",
 ];
 
 const NATIVE_SCRIPT_FALLBACK_CANDIDATES: &[&str] = &[
@@ -2689,10 +2676,6 @@ impl FallbackFace {
         bytes: &crate::font::FaceBytes,
         path: Option<String>,
     ) -> Result<FallbackFace, String> {
-        // The process-global intern, not the thread-local `FONT_BYTES_INTERN`:
-        // `build_fallback_chain` calls this from scoped worker threads, where a thread-local
-        // store is always empty. Admit first, publish second, so a refused face's file is
-        // never published.
         if !face_admissible(bytes, 0) {
             return Err("face is not admissible as a renderable font".to_string());
         }
@@ -2869,9 +2852,6 @@ impl RuntimeFallback {
 
     fn discover(&mut self, ch: char, ctx: FallbackProbeCtx) -> Option<usize> {
         for path in runtime_fallback_candidate_paths(ch, ctx) {
-            // Reuse an already-loaded face for this path (a previous code point routed here,
-            // accepted or declined): the per-char acceptance is a cheap probe raster, never a
-            // re-read/parse of the same large font.
             if let Some(i) = self.faces.iter().position(|f| f.path == path) {
                 if runtime_face_can_render(&self.faces[i], ch, ctx.use_ct) {
                     return Some(i);
@@ -3026,10 +3006,6 @@ impl font_chain::ChainProbe for RendererProbe<'_, '_> {
             }
             font_chain::Tier::Fallback => !self.yields_to_colour() && self.r.fallback_has(self.ch),
             font_chain::Tier::Symbol => {
-                // When nothing in the chain is chosen, every face in it
-                // yields, so decline WITHOUT consulting it: the consult
-                // would kick its lazy parse and turn this frame's colour
-                // glyph into a provisional `.notdef` until the parse lands.
                 if self.yields_to_colour() && !self.r.symbol_chain_may_be_chosen() {
                     false
                 } else {
@@ -3074,7 +3050,7 @@ fn runtime_face_can_render(face: &RuntimeFace, ch: char, use_ct: bool) -> bool {
 
 fn best_collection_face(bytes: &[u8], ch: char, pw: u16, pi: bool) -> Option<u32> {
     let n = aterm_font::fonts_in_collection(bytes).unwrap_or(1);
-    let mut best: Option<(u32, u32)> = None; // (rank, index)
+    let mut best: Option<(u32, u32)> = None;
     for i in 0..n {
         let Ok(face) = aterm_font::Face::parse(bytes, i) else {
             continue;
@@ -3121,7 +3097,7 @@ fn ct_face_can_render_shared(handle: crate::font::FaceBytes, index: u32, ch: cha
     )
 }
 
-/// W8 (b): the CoreText drawability probe.
+/// CoreText drawability probe.
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 #[must_use]
@@ -3137,8 +3113,6 @@ fn runtime_fallback_candidate_paths(ch: char, ctx: FallbackProbeCtx) -> Vec<Stri
     let mut paths: Vec<String> = Vec::new();
     #[cfg(target_os = "macos")]
     {
-        // CoreText returns the LastResort tofu font for an uncovered code point; drop it so
-        // the resolver can return `None` rather than claim a fake cover.
         if let Some(p) = macos_coretext::font_path_for_char(ch)
             && !path_is_last_resort(&p)
         {
@@ -3259,8 +3233,6 @@ fn relocate_missing_builtin_fonts(paths: &[String], user_prefix: usize) -> Vec<O
 }
 
 fn admit_chain_face(declared: &str, relocated: Option<&str>) -> Option<FallbackFace> {
-    // A bundled chain entry (`bundled:…`) names compiled-in bytes, not a file: admitted by
-    // borrowing them, under the same admission verdict as every discovered face.
     if let Some(bytes) = bundled::face_for_id(declared) {
         return FallbackFace::from_path_bytes(
             &crate::font::FaceBytes::Static(bytes),
@@ -3297,8 +3269,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
             .zip(&relocated)
             .map(|(p, moved)| {
                 scope.spawn(move || {
-                    // Straight into the store, no copy; on unix a candidate on the system
-                    // font volume is a file mapping, faulted in per glyph.
+                    // Admitted straight into the store.
                     admit_chain_face(p, moved.as_deref())
                 })
             })
@@ -3313,7 +3284,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     for (i, (p, face)) in paths.iter().zip(parsed).enumerate() {
         let Some(face) = face else {
             // Distinct branch.
-            continue; // unreadable or unparsable: skipped, does not end the scan
+            continue;
         };
         let keep_scanning = additive(i, p.as_str());
         chain.push(face);
@@ -3353,46 +3324,46 @@ fn build_symbol_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFace>
 }
 
 const SCRIPT_SUPPLEMENT_PROBES: &[char] = &[
-    '\u{05D0}',  // Hebrew
-    '\u{0628}',  // Arabic
-    '\u{0710}',  // Syriac
-    '\u{0780}',  // Thaana
-    '\u{07CA}',  // N'Ko
-    '\u{1E900}', // Adlam
-    '\u{2D30}',  // Tifinagh
-    '\u{1200}',  // Ethiopic
-    '\u{A500}',  // Vai
-    '\u{2C80}',  // Coptic
-    '\u{0531}',  // Armenian
-    '\u{10D0}',  // Georgian
-    '\u{0915}',  // Devanagari
-    '\u{0995}',  // Bengali
-    '\u{0A15}',  // Gurmukhi
-    '\u{0A95}',  // Gujarati
-    '\u{0B15}',  // Oriya
-    '\u{0B95}',  // Tamil
-    '\u{0C15}',  // Telugu
-    '\u{0C95}',  // Kannada
-    '\u{0D15}',  // Malayalam
-    '\u{0D9A}',  // Sinhala
-    '\u{0E01}',  // Thai
-    '\u{0E81}',  // Lao
-    '\u{1780}',  // Khmer
-    '\u{1000}',  // Myanmar
-    '\u{0F40}',  // Tibetan
-    '\u{1820}',  // Mongolian
-    '\u{A000}',  // Yi
-    '\u{13A0}',  // Cherokee
-    '\u{1401}',  // Canadian Aboriginal
-    '\u{104B0}', // Osage
-    '\u{10400}', // Deseret
-    '\u{16A0}',  // Runic
-    '\u{12000}', // Cuneiform
-    '\u{13000}', // Egyptian Hieroglyphs
-    '\u{4E2D}',  // Han
-    '\u{3042}',  // Hiragana
-    '\u{30A2}',  // Katakana
-    '\u{D55C}',  // Hangul
+    '\u{05D0}',
+    '\u{0628}',
+    '\u{0710}',
+    '\u{0780}',
+    '\u{07CA}',
+    '\u{1E900}',
+    '\u{2D30}',
+    '\u{1200}',
+    '\u{A500}',
+    '\u{2C80}',
+    '\u{0531}',
+    '\u{10D0}',
+    '\u{0915}',
+    '\u{0995}',
+    '\u{0A15}',
+    '\u{0A95}',
+    '\u{0B15}',
+    '\u{0B95}',
+    '\u{0C15}',
+    '\u{0C95}',
+    '\u{0D15}',
+    '\u{0D9A}',
+    '\u{0E01}',
+    '\u{0E81}',
+    '\u{1780}',
+    '\u{1000}',
+    '\u{0F40}',
+    '\u{1820}',
+    '\u{A000}',
+    '\u{13A0}',
+    '\u{1401}',
+    '\u{104B0}',
+    '\u{10400}',
+    '\u{16A0}',
+    '\u{12000}',
+    '\u{13000}',
+    '\u{4E2D}',
+    '\u{3042}',
+    '\u{30A2}',
+    '\u{D55C}',
 ];
 
 fn cmap_code_points(cmap: &aterm_font::cmap::Table<'_>) -> Vec<u32> {
@@ -4666,7 +4637,7 @@ mod macos_coretext {
     }
 
     impl CtFont {
-        /// Build a CTFont for the `index`-th face of `bytes` at `px` device pixels, instantiated at `variations` (`(fvar tag, design-space value)` pairs — W9; pass `&[]` for the default instance, byte-identical to before).
+        /// Build a CTFont for the `index`-th face of `bytes` at `px` device pixels, instantiated at `variations`.
         pub fn new(
             bytes: FaceBytes,
             index: u32,
@@ -4786,7 +4757,7 @@ mod macos_coretext {
                 CGContextSetShouldAntialias(ctx, true);
                 CGContextSetShouldSmoothFonts(ctx, thicken);
                 CGContextSetAllowsFontSmoothing(ctx, thicken);
-                CGContextSetGrayFillColor(ctx, 1.0, 1.0); // white ink → coverage
+                CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 let pos = [CGPoint { x: pen_x, y: pen_y }];
                 CTFontDrawGlyphs(self.font, glyphs.as_ptr(), pos.as_ptr(), 1, ctx);
                 CGContextRelease(ctx);
@@ -5039,14 +5010,10 @@ pub const fn select_face(
     } else if symbol_has {
         FaceId::SymbolFallback
     } else if color_has && wants_emoji {
-        // The colour face is reachable only for a code point that wants emoji presentation.
         FaceId::ColorEmoji
     } else if color_has {
-        // A default-text code point no mono face covers but the colour font does (⏺ without
-        // STIX/Apple Symbols): the colour glyph's monochrome silhouette, foreground-tinted.
         FaceId::ColorEmojiMono
     } else {
-        // Nothing covers it anywhere: the primary face renders `.notdef`.
         FaceId::Primary
     }
 }
@@ -5116,12 +5083,12 @@ fn resolve_styled_face_lazy(
             } else if covers(0) {
                 FacePick::Styled {
                     slot: 0,
-                    synthetic: StyleBits::ITALIC, // real bold + synthetic slant
+                    synthetic: StyleBits::ITALIC,
                 }
             } else if covers(1) {
                 FacePick::Styled {
                     slot: 1,
-                    synthetic: StyleBits::BOLD, // real italic + synthetic embolden
+                    synthetic: StyleBits::BOLD,
                 }
             } else {
                 FacePick::Primary
@@ -5320,7 +5287,7 @@ impl FramePlacement {
     }
 }
 
-/// W1: place the rendered frame (`src`, `src_w`×`src_h`, packed `0x00RRGGBB`) into a raw-window-sized destination (`dst_w`×`dst_h`) at its [`frame_placement`] (the centred [`band_offset`] horizontally, the platform [`band_offset_y`] vertically: top-pinned on Linux), painting the surrounding remainder bands `band_rgb` (the caller-resolved live background).
+/// Place the rendered frame (`src`, `src_w`×`src_h`, packed `0x00RRGGBB`) into a raw-window-sized destination (`dst_w`×`dst_h`) at its [`frame_placement`], painting the surrounding remainder bands `band_rgb`.
 #[allow(
     clippy::too_many_arguments,
     reason = "a destination surface + a source frame + the present flags is irreducibly 9 scalars; a struct would only relocate the list"
@@ -5399,9 +5366,9 @@ pub fn continue_chrome_edges(
 
 const FONT_DIRS: &[&str] = &[
     #[cfg(target_os = "macos")]
-    "Library/Fonts", // macOS user fonts
-    ".fonts",             // Linux user fonts (legacy ~/.fonts)
-    ".local/share/fonts", // Linux user fonts (XDG ~/.local/share/fonts)
+    "Library/Fonts",
+    ".fonts",
+    ".local/share/fonts",
     #[cfg(windows)]
     "AppData/Local/Microsoft/Windows/Fonts",
     #[cfg(target_os = "macos")]
@@ -5410,7 +5377,7 @@ const FONT_DIRS: &[&str] = &[
     "/System/Library/Fonts",
     "/usr/share/fonts",
     "/usr/local/share/fonts",
-    "/run/host/usr/share/fonts", // flatpak host fonts
+    "/run/host/usr/share/fonts",
     #[cfg(windows)]
     "C:\\Windows\\Fonts",
 ];
@@ -6823,7 +6790,6 @@ impl Renderer {
             if std::thread::Builder::new()
                 .name("aterm-fallback-parse".into())
                 .spawn(move || {
-                    // W8: build the WHOLE additive tier chain off-thread.
                     let _ = tx.send(build_host_fallback_chain(&thread_paths, user_prefix));
                 })
                 .is_ok()
@@ -6836,7 +6802,6 @@ impl Renderer {
     }
 
     fn install_fallback_chain(&mut self, chain: Vec<FallbackFace>) {
-        // Install the whole chain unless a face was injected meanwhile.
         if self.fallback_chain.is_empty() && !chain.is_empty() {
             self.fallback_chain = chain;
         }
@@ -7153,7 +7118,6 @@ impl Renderer {
             if std::thread::Builder::new()
                 .name("aterm-symbol-parse".into())
                 .spawn(move || {
-                    // A send error only means the renderer was dropped first.
                     let _ = tx.send(build_symbol_chain(&thread_paths, user_prefix));
                 })
                 .is_ok()
@@ -7221,7 +7185,7 @@ impl Renderer {
         self.styled_loaded = true;
         let Some(primary) = self.primary_path.clone() else {
             // Distinct branch.
-            return; // byte-loaded / embedded primary: no sibling to derive
+            return;
         };
         if bundled::is_bundled_id(&primary) {
             for (slot, bytes) in bundled::styled_siblings(&primary).into_iter().enumerate() {
@@ -7463,7 +7427,7 @@ impl Renderer {
         }
         rebuilt.styled_faces = self.styled_faces.clone();
         rebuilt.styled_loaded = true;
-        rebuilt.primary_path = self.primary_path.clone(); // diagnostics only
+        rebuilt.primary_path = self.primary_path.clone();
         rebuilt.fallback_chain = self.fallback_chain.clone();
         rebuilt.display_layer = self.display_layer.clone();
         rebuilt.clear_fallback_candidates();
@@ -7519,7 +7483,6 @@ impl Renderer {
     #[must_use]
     pub fn chrome_bold_face(&mut self) -> Option<(std::sync::Arc<[u8]>, u32)> {
         if let Some(b) = &self.bold_font_bytes {
-            // W6 keeps the injected bold as `Arc<[u8]>` already — share it.
             return Some((b.clone(), self.bold_font_index));
         }
         self.ensure_styled_faces();
@@ -7556,8 +7519,6 @@ impl Renderer {
     /// Fork the live terminal's font engine for a renderer-native semantic surface (Settings specimens, Markdown, editor chrome) without borrowing the presentation renderer or consulting a platform text widget.
     #[must_use]
     pub fn fork_semantic_surface(&self, px: f32, theme: Theme) -> Option<Self> {
-        // A sealed generation is closed over exact admitted bytes; the fork below would
-        // recreate candidate paths and reopen the filesystem.
         if self.admitted_sources_sealed {
             return self.rebuild_from_admitted(px, theme).ok();
         }
@@ -7797,15 +7758,11 @@ impl Renderer {
         }
         let (bytes, index, gid): (std::sync::Arc<[u8]>, u32, u16) = match key.glyph_class {
             GlyphClass::MonoGid => {
-                // A collapsed-ligature slice key re-tiles a wide raster
-                // (`rasterize_ligature_slice`); stage 1 leaves slices grayscale.
                 if key.ch_or_id >> LIG_SLICE_SHIFT != 0 {
                     return None;
                 }
                 let gid = key.ch_or_id as u16;
                 if key.source == FaceId::BoldPrimary {
-                    // The injected real bold file; `key.style` is the residual to synthesize,
-                    // and synthesis stays grayscale.
                     if key.style.0 != StyleBits::REGULAR.0 {
                         return None;
                     }
@@ -7813,8 +7770,6 @@ impl Renderer {
                 } else if key.style.0 == StyleBits::REGULAR.0 {
                     (self.shaping_primary_bytes.clone()?, self.primary_index, gid)
                 } else {
-                    // A styled run glyph: eligible only from a real styled face serving every
-                    // bit; a bold instance (`vf_bold_coords`) or synthetic residue declines.
                     if key.style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() {
                         return None;
                     }
@@ -7951,7 +7906,7 @@ impl Renderer {
         };
         #[cfg(not(target_os = "macos"))]
         let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
-            let _ = index; // the face index selects a CoreText face; macOS-only
+            let _ = index;
             None
         };
         if let Some(t) = ct {
@@ -7960,12 +7915,6 @@ impl Renderer {
             let (m, b) = f.rasterize(ch, eff_px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
         } else {
-            // No usable raster from this face: either a CoreText-only runtime face under the
-            // portable backend (honest `.notdef`), or a chain face whose deferred parse
-            // failed. Admission makes the latter unreachable, but if it happens the face
-            // would keep shadowing the entries behind it, so retire it, re-probe and draw
-            // again; the retire returns `true` only when it removed an entry, so the
-            // recursion terminates. The symbol tier is a chain too.
             if font.as_ref().is_some_and(LazyFontdue::known_bad) {
                 if source == FaceId::Fallback && self.retire_unparsable_fallback(&bytes) {
                     let _ = self.fallback_has(ch);
@@ -8031,7 +7980,7 @@ impl Renderer {
         // Distinct branch.
         if self.styled_retire_pending.iter().all(Option::is_none) {
             // Distinct branch.
-            return false; // the whole-frame common case: one array read
+            return false;
         }
         let mut retired = false;
         for slot in 0..3 {
@@ -8068,8 +8017,6 @@ impl Renderer {
             return fallback_cjk_scale((2 * self.cell_w) as f32, ideo_em * self.px);
         }
         if let (Some(p_em), Some(f_em)) = (self.primary_x_height_em(), norm.x_height_em) {
-            // Same px on both sides (the ratio is px-free); kept in px form so
-            // the policy fn's contract mirrors the CJK one.
             return fallback_xheight_scale(p_em * self.px, f_em * self.px);
         }
         1.0
@@ -8181,7 +8128,7 @@ impl Renderer {
     fn fill_styled_from_collection(&mut self, bytes: &std::sync::Arc<[u8]>, primary_index: u32) {
         let Some(n) = aterm_font::fonts_in_collection(bytes) else {
             // Distinct branch.
-            return; // not a collection (single-face file)
+            return;
         };
         let family = |face: &aterm_font::Face<'_>| {
             use aterm_font::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
@@ -8401,7 +8348,7 @@ impl Renderer {
         let gid = face.glyph_index(ch)?.0;
         if gid == 0 {
             // Distinct branch.
-            return None; // the portable path draws its own .notdef
+            return None;
         }
         variation::varied_glyph_raster_with_face(&face, gid, self.px)
     }
@@ -8446,7 +8393,7 @@ impl Renderer {
             .collect()
     }
 
-    /// Install the W9 variation config.
+    /// Install the font variation config.
     pub fn set_font_variations(&mut self, requests: &[(u32, f32)], dark_nudge: f32) -> bool {
         let dark_nudge = if dark_nudge.is_finite() {
             dark_nudge.clamp(0.0, 500.0)
@@ -8799,7 +8746,6 @@ impl Renderer {
 
     fn cell_geometry_and_px(&self, px: f32) -> (CellGeometry, f32) {
         if px != self.px && font_px_unchanged(self.px, px) {
-            // Not memoized: a later activation can move the live geometry.
             return ((self.cell_w, self.cell_h, self.baseline), self.px);
         }
         let memo = self.cell_geometry_memo.get();
@@ -8990,7 +8936,7 @@ impl Renderer {
         };
         #[cfg(not(target_os = "macos"))]
         let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
-            let _ = index; // the face index selects a CoreText face; macOS-only
+            let _ = index;
             None
         };
         let raw = if let Some(t) = ct {
@@ -9736,12 +9682,8 @@ impl Renderer {
             }
         } else if base.source == FaceId::Procedural || base.source == FaceId::ColorEmojiMono {
             // Distinct branch.
-            base // cell-exact / emoji silhouette: no synthetic or real styled variant
+            base
         } else if base.glyph_class == GlyphClass::MonoGid {
-            // A styled primary glyph is re-addressed by char (not the regular face's glyph
-            // id), so the rasterizer can pull it from the real styled sibling face, whose
-            // glyph ids differ, falling back to the regular face plus synthetic styling when no
-            // sibling exists.
             GlyphKey::mono_char(base.source, ch, style, self.px_q)
         } else if base.glyph_class == GlyphClass::Mono {
             GlyphKey { style, ..base }
@@ -9780,8 +9722,6 @@ impl Renderer {
     /// Shape an emoji grapheme cluster (ZWJ / skin-tone / keycap / flag) on the colour chain, cached.
     pub(crate) fn shape_cluster(&mut self, cluster: &str) -> Option<ClusterShape> {
         if let Some((shape, from_prev)) = self.cluster_shapes.get(cluster) {
-            // A previous-generation hit is served without re-shaping; promote it
-            // back into the current generation so it survives the next rotation.
             if from_prev {
                 self.cluster_shapes.insert(cluster, shape);
             }
@@ -10150,16 +10090,14 @@ impl Renderer {
                         })
                     });
                     face.as_mut().and_then(|f| {
-                        // `admit_collapsed` (config `merged_ligatures`) admits the Cascadia
-                        // N:1 form, which the raster path slices into per-cell tiles; off by
-                        // default (the 1:1 gate).
+                        // Shape with the configured merged-ligature admission.
                         f.shape(run, run_chars, admit_collapsed, shaping_buffer)
                     })
                 } else {
                     let (slot, source) = match pick {
                         FacePick::Styled { slot, .. } => (slot, styled_bytes[slot]),
                         FacePick::InjectedBold { .. } => (3, injected_bold),
-                        FacePick::Primary => (3, None), // handled above
+                        FacePick::Primary => (3, None),
                     };
                     let face = styled_row_faces[slot].get_or_insert_with(|| {
                         source.and_then(|(b, idx)| {
@@ -10256,8 +10194,6 @@ impl Renderer {
         let cap = self
             .glyph_ink_box_cached(h)
             .map_or(self.cell_h as f32 * 0.55, |(hh, _)| hh as f32);
-        // The face's own `●`, never a fallback's: the ring family is drawn because the
-        // fallbacks' rings are not the face's size.
         let dot = self.glyph_key_styled('\u{25cf}', style);
         let own = matches!(dot.source, FaceId::Primary | FaceId::BoldPrimary)
             && self.primary_unicode_gid('\u{25cf}').is_some();
@@ -10380,7 +10316,7 @@ impl Renderer {
 
     fn rasterize_ligature_slice(&mut self, key: GlyphKey, k: u16) -> GlyphImage {
         let cell_w = self.cell_w;
-        let gid = key.ch_or_id as u16; // low 16 bits — the wide glyph id
+        let gid = key.ch_or_id as u16;
         let parent = GlyphKey::mono_gid(gid, key.style, key.px_q);
         let (pw, ph, pxmin, pymin);
         let pbytes: Vec<u8>;
@@ -10461,12 +10397,6 @@ impl Renderer {
         }
         match key.glyph_class {
             GlyphClass::Mono => {
-                // A Procedural key for a char in the procedural ranges is cell-exact (the
-                // blit anchor lands on the cell's top-left). A shade key carries dither-phase
-                // bits above the code point (`shade_phase_key`), decoded here, the one place
-                // procedural bytes are made. A Procedural key outside those ranges can only
-                // be hand-built and falls back to the primary face. The key's `px_q` stands
-                // in for (cell_w, cell_h), both functions of this renderer's px and face.
                 if key.source == FaceId::Procedural && key.ch_or_id & REGIONAL_PAIR_BIT != 0 {
                     return self.rasterize_regional_pair(key);
                 }
@@ -10617,19 +10547,12 @@ impl Renderer {
                     key.source,
                     FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
                 ) {
-                    // Fallback faces rasterize through their own pipeline
-                    // (`fallback_mono_raster`).
                     self.fallback_mono_raster(key.source, ch)
                 } else if let Some(t) = self.hinted_primary_char(key, ch) {
-                    // Grid-fitted primary raster. Ordered above the instance raster because on
-                    // Windows it grid-fits that instance; on Linux it declines for a varied
-                    // primary and hands the cell down. The rasters below are the fail-safes.
                     t
                 } else if key.source == FaceId::Primary
                     && let Some(t) = self.vf_primary_char_raster(ch)
                 {
-                    // Portable path: the primary char's resolved variable instance (the raster
-                    // below draws only the fvar default).
                     t
                 } else {
                     let face = match key.source {
@@ -10873,16 +10796,8 @@ impl Renderer {
                     .then(|| self.vf_primary_gid_raster(gid))
                     .flatten()
                 {
-                    // Portable path: the resolved variable instance of the primary glyph.
                     t
                 } else {
-                    // `gid` was shaped on the picked styled face and means a different letter
-                    // anywhere else, so an unparsable (unreachable: admission is exact) or
-                    // absent styled slot draws no ink rather than re-picking a face. An
-                    // unparsable slot stays with its retire pending, so every gid of the plan in
-                    // flight is refused too, until `begin_frame_boundary`; the epoch bump makes
-                    // the next frame repaint with the style synthetic. The retire names the face
-                    // (`StyledFaceId`), so a replacement installed before the boundary survives.
                     if let FacePick::Styled { slot, .. } = pick
                         && !self.styled_faces[slot]
                             .as_ref()
@@ -11576,7 +11491,6 @@ impl Renderer {
     /// Pixel-row band `[y0, y1)` of grid row `r` (of `rows`) in a frame of height `h`.
     #[inline]
     pub fn row_pixel_band(&self, r: usize, rows: usize, h: usize) -> (usize, usize) {
-        // One band rule for every consumer, the fx slicer included.
         fx_raster::band_px(r, rows, h, self.grid_top(), self.cell_h)
     }
 
@@ -11892,7 +11806,7 @@ impl Renderer {
         r: usize,
         band: &mut Vec<u32>,
     ) {
-        let src = r + 1; // the kept row whose overshoot reaches up into band `r`
+        let src = r + 1;
         let (sy0, sy1) = self.row_band_px(src, h);
         let (by0, _) = self.row_band_px(r, h);
         if sy0 >= sy1 || by0 >= sy0 {
@@ -12183,7 +12097,6 @@ impl Renderer {
         };
         let may_have_sel = input.any_selection();
         let resolve = |c: usize, cell: &RenderCell| -> Option<u32> {
-            // A lead cell is wide iff the NEXT cell is its continuation.
             if may_have_sel
                 && let Some(hit) =
                     input.selection_hit(row, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
@@ -12253,10 +12166,6 @@ impl Renderer {
             }
         } else {
             for (c, cell) in cells.iter().take(cols).enumerate() {
-                // Composed row: the cell sits where its pane's run puts it, the fill clamped
-                // to that run's box (else a DECDWL pane's doubled fills repaint the
-                // neighbouring pane's background). Each column clamps to its own run box,
-                // so runs cannot merge.
                 if let Some(color) = resolve(c, cell) {
                     self.note_bg_run(color, band_base);
                     if band_base != Some(color) {
@@ -12284,8 +12193,6 @@ impl Renderer {
             let bg = if let Some(hit) = input.selection_hit(row, c, false, false) {
                 sel.at(hit).bg
             } else {
-                // An implicit tail cell is its pane's default bg, so under a wallpaper it
-                // shows the backdrop the base fill laid.
                 if wallpaper {
                     continue;
                 }
@@ -12778,7 +12685,6 @@ impl Renderer {
         ink: &mut Vec<bool>,
         out: &mut Vec<(usize, usize)>,
     ) -> bool {
-        // Cheap guards first, so the knob-off path resolves no metrics.
         if !self.underline_skip_descenders || dw == 0 {
             return false;
         }
@@ -12985,7 +12891,6 @@ impl Renderer {
             return;
         }
         for q in quads {
-            // As the GPU glow loop: skip quads past the grid's last row.
             if q.row as usize >= rows {
                 continue;
             }
@@ -13062,7 +12967,6 @@ impl Renderer {
         input: &RenderInput,
         dirty: Option<&[bool]>,
     ) {
-        // Cursor-effect stream: coords arrive window-absolute from the producer.
         self.draw_flat_add(pixels, w, h, input.rows, &input.glow_under, dirty, 0, 0);
     }
 
@@ -13079,7 +12983,6 @@ impl Renderer {
         }
         for mode in [FireMode::Add, FireMode::Over] {
             for q in input.fire_patch.iter().filter(|q| q.mode == mode) {
-                // As the GPU loop: skip quads past the grid's last row.
                 if q.row as usize >= input.rows {
                     continue;
                 }
@@ -13162,7 +13065,6 @@ impl Renderer {
         input: &RenderInput,
         dirty: Option<&[bool]>,
     ) {
-        // Cursor-effect stream: coords arrive window-absolute from the producer.
         self.draw_radial_add(pixels, w, h, input.rows, &input.glow_halo, dirty, 0, 0);
     }
 
@@ -13204,7 +13106,6 @@ impl Renderer {
         }
         for mode in [HaloMode::Add, HaloMode::Over] {
             for q in quads.iter().filter(|q| q.mode == mode) {
-                // Mirror the GPU loop, which skips quads past the grid's last row.
                 if q.row as usize >= rows {
                     continue;
                 }
@@ -13229,7 +13130,7 @@ impl Renderer {
                     let ny = halo_row_ny(y as i32 - cy, ry2);
                     if ny >= 256 {
                         // Distinct branch.
-                        continue; // whole row outside the ellipse — nothing lit
+                        continue;
                     }
                     let span = ((((256 - ny) * rx2) >> 8) as u32).isqrt() as i32 + 1;
                     let xs = (cx - span).max(x0 as i32).max(0) as usize;
@@ -13326,9 +13227,6 @@ impl Renderer {
             && let Some(atlas) = input.rain_atlas.as_deref()
             && atlas_texels_valid(atlas)
         {
-            // The `WHITE_RGB` fast path only when the atlas is provably white (the production
-            // invariant); both paths give the same pixels, the fast one skipping three
-            // per-texel mul8s.
             if rain_white {
                 for &qi in rain_row {
                     stamp_cat_quad::<true>(
@@ -13361,7 +13259,6 @@ impl Renderer {
         {
             for q in &input.cat_quads {
                 if q.row as usize == r {
-                    // Cats keep the general path: their atlas need not be white.
                     stamp_cat_quad::<false>(pixels, w, h, pad_x, pad_y, atlas, q);
                 }
             }
@@ -13660,7 +13557,6 @@ impl Renderer {
         let (fp_w, fp_h) = placement_footprint(&image.image, (cw, ch));
         let decoded = ic.get_or_decode(&image.image, fp_w, fp_h);
         if decoded.rgba.is_empty() || decoded.w == 0 {
-            // Decode failed (cached negative): draw nothing, bg shows through.
             return;
         }
         let sx0 = image.cell_col as usize * cw;
@@ -15072,8 +14968,6 @@ fn effect_stream_changed<T: PartialEq>(
         return !same;
     }
     if prev_damage.is_valid() {
-        // `prev` was emptied by the cache: compare what its metadata says it held
-        // against what current holds.
         return !(prev_damage.was_empty() == Some(true) && current.is_empty());
     }
     prev != current
@@ -15086,10 +14980,6 @@ fn mark_effect_stream_rows(
     current_damage: &EffectStreamDamage,
     fallback_rows: impl Iterator<Item = usize>,
 ) {
-    // The prev side is judged on its own validity, as in `effect_stream_changed`: the
-    // cache empties a payload exactly when its metadata is valid, and
-    // `EffectStreamDamage::rows` keeps the vacated rows, so a glow that moved from row 1
-    // to row 3 marks both.
     if prev_damage.is_valid() {
         prev_damage.mark_rows(dirty);
     }
@@ -15526,7 +15416,7 @@ pub fn scroll_shift_plan(
     if da == 0 || da.unsigned_abs() as usize >= rows {
         return None;
     }
-    let da = da as i32; // |da| < rows, and rows is small
+    let da = da as i32;
     if prev.rows != rows
         || prev.cols != input.cols
         || prev.default_bg != input.default_bg
@@ -15576,14 +15466,11 @@ pub fn scroll_shift_plan(
         let src = r as i64 + i64::from(da);
         if !(0..rows as i64).contains(&src) {
             // Distinct branch.
-            *row_dirty = true; // no in-range source ⇒ newly exposed
+            *row_dirty = true;
         } else if retained == RetainedRows::Diff
             && (row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
                 || row_overlays_differ_shifted(input, r, prev, src as usize))
         {
-            // A streaming flood is this shape: every retained row slides up unchanged and
-            // the one row the writer touched differs. Marking it, not refusing the plan,
-            // leaves the exposed strip plus its apron.
             *row_dirty = true;
         }
     }
@@ -16016,7 +15903,6 @@ pub fn compute_dirty_rows(
         let ch = cell_h.max(1) as i32;
         let last_row = rows.saturating_sub(1) as i32;
         for s in &input.free_sprites {
-            // As the GPU instance build: a degenerate sprite draws nothing.
             if s.w == 0 || s.h == 0 || s.aw == 0 || s.ah == 0 {
                 continue;
             }
@@ -16309,9 +16195,9 @@ pub fn glyph_quad(
         return None;
     }
     let vw = vx1 - vx0;
-    let u_left = (vx0 - gx0) / xs as f32; // source pixels from the glyph left
+    let u_left = (vx0 - gx0) / xs as f32;
     let vh = vy1 - vy0;
-    let v_top = (vy0 - gy0) / ys as f32; // source pixels from the glyph top
+    let v_top = (vy0 - gy0) / ys as f32;
     let rect = [vx0, vy0, vw, vh];
     let uv = [
         (ax as f32 + u_left) / aw,
@@ -16322,7 +16208,8 @@ pub fn glyph_quad(
     Some((rect, uv))
 }
 
-/// Horizontal cell origin (the `cell_x`/`cell_left` for [`blit`] / [`glyph_quad`]) that centres a combining mark's ink in column `c`.
+/// Horizontal cell origin (the `cell_x`/`cell_left` for [`Renderer::blit`] / [`glyph_quad`])
+/// that centres a combining mark's ink in column `c`.
 #[inline]
 #[must_use]
 pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
@@ -16464,9 +16351,6 @@ fn ligature_break_cols_into(
             input.selection_contains_cell(r, c, is_wide_lead, cell.wide)
         };
         for c in 0..n {
-            // A selected cell stays per-cell; excluding it from `shapeable`
-            // already splits the unselected runs to its left and right without
-            // excluding the first unselected cell after the selection.
             if selected(c) {
                 cols.push(c);
             }
@@ -17092,7 +16976,7 @@ pub const fn rgb_to_u32([r, g, b]: [u8; 3]) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// W9: theme polarity.
+/// Theme polarity.
 #[inline]
 #[must_use]
 pub fn theme_is_dark(bg: u32) -> bool {
@@ -17694,8 +17578,6 @@ fn stamp_free_sprite(
                 let dx = (px as i32 - ox) as usize;
                 if s.flip_x { aw - 1 - dx } else { dx }
             } else {
-                // The scaled arm filled `xmap` over exactly `px0..xend`, so this
-                // index is in range.
                 xmap[px - px0] as usize
             };
             let i = (arow + s.ax as usize + sx) * 4;
@@ -17902,8 +17784,6 @@ fn push_glow_rect(
     premul: u32,
     alpha: u8,
 ) {
-    // Additive black adds nothing, but source-over black darkens what it
-    // covers: only light skips a zero colour.
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) || clip.cell_h <= 0 {
         return;
     }
@@ -17981,9 +17861,9 @@ fn emit_aa_slab(
     }
     if ce > cs {
         // Distinct branch.
-        slab(cs, ce - cs, 1.0); // solid core
+        slab(cs, ce - cs, 1.0);
     }
-    slab(ce, 1, hi - ce as f32); // trailing AA edge pixel
+    slab(ce, 1, hi - ce as f32);
 }
 
 fn rdp_simplify(verts: &[BeamVertex], tol: f32) -> Vec<BeamVertex> {
@@ -18148,7 +18028,7 @@ fn beam_polyline(
     };
     let half_perp = (thickness * 0.5).max(0.5);
     let step = step.max(1) as f32;
-    let mut prev: Option<(bool, i32, i32, bool)> = None; // (axis, start, end, increasing)
+    let mut prev: Option<(bool, i32, i32, bool)> = None;
     for w in verts.windows(2) {
         let (a, b) = (w[0], w[1]);
         let (dx, dy) = (b.x - a.x, b.y - a.y);
@@ -18156,7 +18036,7 @@ fn beam_polyline(
         if seg < 1e-3 {
             continue;
         }
-        let horizontal = dy.abs() >= dx.abs(); // steep ⇒ vary X within each pixel-row
+        let horizontal = dy.abs() >= dx.abs();
         let major = if horizontal { dy.abs() } else { dx.abs() };
         let half =
             (half_perp * seg / major.max(1e-3)).min(half_perp * std::f32::consts::SQRT_2 + 0.5);
@@ -18271,11 +18151,11 @@ pub struct RibbonVertex {
     pub spine: f32,
     /// How far the profile reaches above the spine before it is exactly zero.
     pub up: f32,
-    /// …and below it.
+    /// How far the profile reaches below the spine before it is exactly zero.
     pub dn: f32,
-    /// The full-strength half-width above the spine…
+    /// The full-strength half-width above the spine.
     pub core_up: f32,
-    /// …and below it.
+    /// The full-strength half-width below the spine.
     pub core_dn: f32,
     /// Resolved colour `0x00RRGGBB` here (interpolated along the segment).
     pub color: u32,
@@ -18387,9 +18267,6 @@ fn ribbon_beam_ordered(
                 let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
                 let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
                 for y in y0..y1 {
-                    // Keep the generic splitter's conservative two-quad
-                    // admission check even though this 1px row can
-                    // emit at most one.
                     if out.len() + 2 > max_quads {
                         return false;
                     }
@@ -18531,8 +18408,6 @@ fn ribbon_beam_v_ordered(
                     1
                 };
                 for x in x0..x1 {
-                    // Admit the whole column or none of it: a column cut at a band boundary
-                    // would leave a visible notch.
                     if out.len() + bands + 1 > max_quads {
                         return false;
                     }
@@ -18608,24 +18483,24 @@ const MIX_WHITE: u32 = 0x00FF_FFFF;
 
 /// The comet bloom layers.
 pub const COMET_LAYERS: [(f32, f32, u32, f32, f32, usize); 4] = [
-    (5.5, 0.16, MIX_WHITE, 0.0, 0.0, 3),   // broad aura (style hue)
-    (3.0, 0.30, MIX_WHITE, 0.0, 0.0, 2),   // glow
-    (1.8, 0.55, MIX_WHITE, 0.12, 0.0, 2),  // inner glow
-    (1.0, 1.00, MIX_WHITE, 0.25, 0.45, 1), // hot white core (hotter toward the head)
+    (5.5, 0.16, MIX_WHITE, 0.0, 0.0, 3),
+    (3.0, 0.30, MIX_WHITE, 0.0, 0.0, 2),
+    (1.8, 0.55, MIX_WHITE, 0.12, 0.0, 2),
+    (1.0, 1.00, MIX_WHITE, 0.25, 0.45, 1),
 ];
 
 /// The phaser bloom layers (same tuple shape as [`COMET_LAYERS`]).
 pub const PHASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
-    (1.0, 0.95, MIX_WHITE, 0.06, 0.0, 1), // the fat spectrum band, laid-hue per cell
-    (1.45, 0.36, MIX_WHITE, 0.0, 0.0, 2), // soft edge glow — the neon falloff off the bar
-    (2.0, 0.14, MIX_WHITE, 0.0, 0.0, 3),  // faint outer haze
+    (1.0, 0.95, MIX_WHITE, 0.06, 0.0, 1),
+    (1.45, 0.36, MIX_WHITE, 0.0, 0.0, 2),
+    (2.0, 0.14, MIX_WHITE, 0.0, 0.0, 3),
 ];
 
 /// The sparkle ribbon layers (same tuple shape as [`COMET_LAYERS`]).
 pub const SPARKLE_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
-    (1.0, 1.00, MIX_WHITE, 0.10, 0.0, 1), // the ribbon, a whisper of white
-    (1.45, 0.40, MIX_WHITE, 0.0, 0.0, 2), // soft edge glow
-    (2.0, 0.16, MIX_WHITE, 0.0, 0.0, 3),  // faint outer haze
+    (1.0, 1.00, MIX_WHITE, 0.10, 0.0, 1),
+    (1.45, 0.40, MIX_WHITE, 0.0, 0.0, 2),
+    (2.0, 0.16, MIX_WHITE, 0.0, 0.0, 3),
 ];
 
 /// The light a bloom-layer stack lays on its own axis per unit of sample coverage, per channel `[r, g, b]`.
@@ -18654,18 +18529,18 @@ pub const BEAM_SPACE_HAZE: u32 = 0x005A_3BD6;
 
 /// The beam tube layers (same tuple shape as [`COMET_LAYERS`]).
 pub const BEAM_LAYERS: [(f32, f32, u32, f32, f32, usize); 5] = [
-    (0.55, 1.00, MIX_WHITE, 0.55, 0.30, 1), // photon axis (hotter toward the head)
-    (1.0, 0.95, MIX_WHITE, 0.20, 0.08, 1),  // solid tube body
-    (1.6, 0.58, BEAM_SPACE_HAZE, 0.18, 0.0, 1), // sheen sliding into the haze
-    (3.0, 0.30, BEAM_SPACE_HAZE, 0.55, 0.0, 2), // nebula sleeve
-    (5.5, 0.13, BEAM_SPACE_HAZE, 0.85, 0.0, 2), // deep-space wash
+    (0.55, 1.00, MIX_WHITE, 0.55, 0.30, 1),
+    (1.0, 0.95, MIX_WHITE, 0.20, 0.08, 1),
+    (1.6, 0.58, BEAM_SPACE_HAZE, 0.18, 0.0, 1),
+    (3.0, 0.30, BEAM_SPACE_HAZE, 0.55, 0.0, 2),
+    (5.5, 0.13, BEAM_SPACE_HAZE, 0.85, 0.0, 2),
 ];
 
 /// The laser filament layers (same tuple shape as [`COMET_LAYERS`]).
 pub const LASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
-    (2.9, 0.60, MIX_WHITE, 0.0, 0.0, 1),   // inner glow (pure hue)
-    (1.5, 0.95, MIX_WHITE, 0.10, 0.0, 1),  // beam body
-    (0.6, 1.00, MIX_WHITE, 0.26, 0.42, 1), // white-hot filament, hotter to the head
+    (2.9, 0.60, MIX_WHITE, 0.0, 0.0, 1),
+    (1.5, 0.95, MIX_WHITE, 0.10, 0.0, 1),
+    (0.6, 1.00, MIX_WHITE, 0.26, 0.42, 1),
 ];
 
 /// Emit the full layered-bloom comet beam for one contiguous run of swept-cell samples (broad aura under a white-hot core) into per-cell-row [`GlowQuad`]s.
@@ -18785,7 +18660,6 @@ fn layered_beam_quads(
 #[inline]
 fn blend(bg: u32, fg: u32, t: u8) -> u32 {
     if t == 0 {
-        // Keep `bg`'s transmittance byte: zero coverage adds nothing.
         return bg;
     }
     if t == 255 {
@@ -19385,7 +19259,6 @@ impl<'a> PremulRows<'a> {
         } else if keep.is_some() && r1 == keep {
             0
         } else {
-            // `None < Some(_)`: an empty slot is the lower.
             usize::from(r1 < r0)
         };
         let line = &self.src[y * self.sw * 4..(y + 1) * self.sw * 4];
@@ -19900,7 +19773,7 @@ mod tests {
         let mut r = Renderer::from_system(40.0, Theme::default()).expect(NO_FONT);
         r.set_primary_font(&bytes)
             .expect("the variable face is accepted as primary");
-        r.debug_force_fontdue(); // exercise the PORTABLE path even on macOS.
+        r.debug_force_fontdue();
 
         let cov = |r: &mut Renderer, w: f32| -> Option<Vec<u8>> {
             r.set_font_variations(&[(WGHT_TAG, w)], 0.0);
@@ -19926,11 +19799,11 @@ mod tests {
         assert_eq!(premul_rgb(0x00FF_FFFF, 0), 0);
         assert_eq!(premul_rgb(0x0012_34AB, 255), 0x0012_34AB);
         assert_eq!(premul_rgb(0x00FF_FF00, 128), {
-            let m = (255u32 * 128 + 127) / 255; // 128
+            let m = (255u32 * 128 + 127) / 255;
             (m << 16) | (m << 8)
         });
         assert_eq!(add_sat(0x0010_2030, 0x0001_0203), 0x0011_2233);
-        assert_eq!(add_sat(0x00F0_F0F0, 0x0020_2020), 0x00FF_FFFF); // clamps
+        assert_eq!(add_sat(0x00F0_F0F0, 0x0020_2020), 0x00FF_FFFF);
         let (d, a, b) = (0x0030_4050u32, 0x0011_2233u32, 0x0044_5566u32);
         assert_eq!(add_sat(add_sat(d, a), b), add_sat(add_sat(d, b), a));
         assert_eq!(add_sat(0x00AB_CDEF, 0), 0x00AB_CDEF);
@@ -20662,17 +20535,17 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let cases = [
-            Vec::new(),             // empty vs covered
-            a.clone(),              // same Arcs, same metadata (ptr_eq path)
-            row(&base, 3, 0),       // same Arc, shifted columns
-            row(&base, 2, 1),       // same Arc, different tile row
-            row(&same_bytes, 2, 0), // distinct Arc, equal payload — EQUAL
-            row(&diff_first, 2, 0), // payload differs at byte 0
-            row(&diff_last, 2, 0),  // payload differs at the LAST byte
-            row(&diff_meta, 2, 0),  // metadata-only difference
-            row(&diff_z, 2, 0),     // z-only difference
-            tagged(7),              // tag-only difference — EQUAL
-            a[..2].to_vec(),        // length mismatch
+            Vec::new(),
+            a.clone(),
+            row(&base, 3, 0),
+            row(&base, 2, 1),
+            row(&same_bytes, 2, 0),
+            row(&diff_first, 2, 0),
+            row(&diff_last, 2, 0),
+            row(&diff_meta, 2, 0),
+            row(&diff_z, 2, 0),
+            tagged(7),
+            a[..2].to_vec(),
         ];
         for (i, b) in cases.iter().enumerate() {
             let derived = untagged(&a) == untagged(b);
@@ -20900,7 +20773,7 @@ mod tests {
         let mut term = Terminal::new(4, 8);
         let prev = term.cell_frame(4, 8);
         let mut cur = term.cell_frame(4, 8);
-        cur.default_bg = 0x0012_3456; // a live OSC-11 background, differs from prev (UNSET)
+        cur.default_bg = 0x0012_3456;
         let mut dirty = Vec::new();
         assert!(
             matches!(
@@ -21118,7 +20991,7 @@ mod tests {
             .tables()
             .sbix
             .expect("Apple Color Emoji is an sbix face");
-        let target = 24usize; // a typical cell height
+        let target = 24usize;
         let (mut served, mut small_picks) = (0usize, 0usize);
         for gid in 0..face.number_of_glyphs() {
             let gid = aterm_font::GlyphId(gid);
@@ -21272,11 +21145,11 @@ mod tests {
             (ch(16) << 16) | (ch(8) << 8) | ch(0)
         };
         let pairs = [
-            (0x000000u32, 0xffffffu32), // white on black (light-on-dark)
-            (0xffffff, 0x000000),       // black on white (inverse — dark-on-light)
-            (0x111318, 0xd0d0d0),       // default theme fg/bg
-            (0x33415e, 0xffffff),       // text on selection bg (low contrast)
-            (0xff5555, 0x282a36),       // dark text on a red bg (inverse video)
+            (0x000000u32, 0xffffffu32),
+            (0xffffff, 0x000000),
+            (0x111318, 0xd0d0d0),
+            (0x33415e, 0xffffff),
+            (0xff5555, 0x282a36),
         ];
         for (bg, fg) in pairs {
             assert_eq!(blend(bg, fg, 0), bg & 0x00ff_ffff, "t=0 must be exact bg");
@@ -21303,7 +21176,7 @@ mod tests {
     #[test]
     fn opaque_blend_is_foreground_for_every_background() {
         for v in 0..=255u32 {
-            let fg = (v << 16) | (v << 8) | v; // grey fg hitting all 3 channels at value v
+            let fg = (v << 16) | (v << 8) | v;
             for &bg in &[0x000000u32, 0xFFFFFF, 0x808080, 0x123456, fg ^ 0x00FF_FFFF] {
                 assert_eq!(
                     blend(bg, fg, 255),
@@ -22149,7 +22022,7 @@ mod tests {
     #[cfg(windows)]
     fn windows_fallback_chain_covers_the_scripts_it_claims() {
         let paths = present_fallback_paths();
-        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
+        let chain = build_fallback_chain(&paths, 0);
         let present = |f: &str| std::path::Path::new(&format!("C:\\Windows\\Fonts\\{f}")).is_file();
         let claims: &[(&str, char, &str)] = &[
             ("Han", '\u{4E2D}', "msyh.ttc"),
@@ -22221,7 +22094,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn face_coverage(path: &str) -> std::collections::BTreeSet<u32> {
-        // A bundled chain/primary identity measures its compiled-in bytes.
         if let Some(bytes) = bundled::face_for_id(path) {
             return collection_coverage(bytes);
         }
@@ -22516,14 +22388,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(bundled::is_bundled_id);
             for ch in [
-                '\u{26A1}',  // ⚡
-                '\u{26BD}',  // ⚽
-                '\u{26BE}',  // ⚾
-                '\u{1F197}', // 🆗
-                '\u{1F195}', // 🆕
-                '\u{1F198}', // 🆘
-                '\u{1F201}', // 🈁
-                '\u{1F251}', // 🉑
+                '\u{26A1}',
+                '\u{26BD}',
+                '\u{26BE}',
+                '\u{1F197}',
+                '\u{1F195}',
+                '\u{1F198}',
+                '\u{1F201}',
+                '\u{1F251}',
             ] {
                 assert!(aterm_grapheme::is_emoji_presentation(ch));
                 if !r.color_font_has(ch) {
@@ -22659,11 +22531,11 @@ mod tests {
             assert!(deva.admits(ch), "U+{:04X}", ch as u32);
         }
         for ch in [
-            '\u{0E01}',  // Thai: another script
-            '\u{3008}',  // CJK punctuation: shared, another block
-            '\u{203B}',  // reference mark: shared, another block
-            '\u{F021}',  // private use: no script
-            '\u{1F600}', // emoji presentation
+            '\u{0E01}',
+            '\u{3008}',
+            '\u{203B}',
+            '\u{F021}',
+            '\u{1F600}',
             'a',
         ] {
             assert!(!deva.admits(ch), "U+{:04X}", ch as u32);
@@ -22955,17 +22827,8 @@ mod tests {
         r.seal_admitted_font_sources();
         let backstop_cov = face_coverage(backstop);
         let probes: &[char] = &[
-            '\u{2024}', // ․ ONE DOT LEADER
-            '\u{2043}', // ⁃ HYPHEN BULLET
-            '\u{2112}', // ℒ SCRIPT CAPITAL L
-            '\u{2120}', // ℠ SERVICE MARK
-            '\u{2216}', // ∖ SET MINUS
-            '\u{22A8}', // ⊨ TRUE (entailment)
-            '\u{22C8}', // ⋈ BOWTIE (relational join)
-            '\u{22F1}', // ⋱ DOWN RIGHT DIAGONAL ELLIPSIS
-            '\u{27F9}', // ⟹ LONG RIGHTWARDS DOUBLE ARROW
-            '\u{2A01}', // ⨁ N-ARY CIRCLED PLUS
-            '\u{2A7D}', // ⩽ LESS-THAN OR SLANTED EQUAL TO
+            '\u{2024}', '\u{2043}', '\u{2112}', '\u{2120}', '\u{2216}', '\u{22A8}', '\u{22C8}',
+            '\u{22F1}', '\u{27F9}', '\u{2A01}', '\u{2A7D}',
         ];
         let mut checked = 0usize;
         let mut unchecked = Vec::new();
@@ -23688,9 +23551,6 @@ mod tests {
         );
     }
 
-    /// A face stays shared however many others are live (the store used to
-    /// evict the oldest past twelve, and that face's next holder read and
-    /// parsed a second copy), and the store keeps none nobody holds.
     #[test]
     fn a_live_face_is_never_evicted_from_the_shared_store() {
         let tag = format!("shared-store test {:?}", std::thread::current().id());
@@ -23725,49 +23585,49 @@ mod tests {
             }
 
             let mut subtable = Vec::new();
-            push_u16(&mut subtable, 2); // format
-            push_u16(&mut subtable, 0); // length, filled after construction
-            push_u16(&mut subtable, 0); // language
+            push_u16(&mut subtable, 2);
+            push_u16(&mut subtable, 0);
+            push_u16(&mut subtable, 0);
             for high_byte in 0..256 {
                 push_u16(
                     &mut subtable,
                     if two_byte_key && high_byte == 0x23 {
                         // Distinct branch.
-                        8 // subheader 1
+                        8
                     } else {
                         // Distinct branch.
-                        0 // single-byte subheader 0
+                        0
                     },
                 );
             }
 
             if two_byte_key {
-                push_u16(&mut subtable, 0x18); // firstCode
-                push_u16(&mut subtable, 1); // entryCount
-                push_u16(&mut subtable, 0); // idDelta
-                push_u16(&mut subtable, 10); // idRangeOffset -> first glyph below
                 push_u16(&mut subtable, 0x18);
                 push_u16(&mut subtable, 1);
                 push_u16(&mut subtable, 0);
-                push_u16(&mut subtable, 4); // -> second glyph below
+                push_u16(&mut subtable, 10);
+                push_u16(&mut subtable, 0x18);
+                push_u16(&mut subtable, 1);
+                push_u16(&mut subtable, 0);
+                push_u16(&mut subtable, 4);
                 push_u16(&mut subtable, 1);
                 push_u16(&mut subtable, 2);
             } else {
                 push_u16(&mut subtable, 0x18);
                 push_u16(&mut subtable, 1);
                 push_u16(&mut subtable, 0);
-                push_u16(&mut subtable, 2); // -> sole glyph below
+                push_u16(&mut subtable, 2);
                 push_u16(&mut subtable, 1);
             }
             let length = u16::try_from(subtable.len()).expect("fixture fits format-2 length");
             subtable[2..4].copy_from_slice(&length.to_be_bytes());
 
             let mut cmap = Vec::new();
-            push_u16(&mut cmap, 0); // cmap version
-            push_u16(&mut cmap, 1); // one encoding record
-            push_u16(&mut cmap, 1); // Macintosh
-            push_u16(&mut cmap, 25); // Chinese legacy encoding
-            push_u32(&mut cmap, 12); // subtable follows header + record
+            push_u16(&mut cmap, 0);
+            push_u16(&mut cmap, 1);
+            push_u16(&mut cmap, 1);
+            push_u16(&mut cmap, 25);
+            push_u32(&mut cmap, 12);
             cmap.extend_from_slice(&subtable);
             cmap
         }
@@ -24310,8 +24170,8 @@ mod tests {
             "cold-run".to_string().into_boxed_str(),
             None,
         );
-        cold.rotate(); // cur → prev
-        cold.rotate(); // prev dropped (never promoted)
+        cold.rotate();
+        cold.rotate();
         assert!(
             cold.get(StyleBits::REGULAR, "cold-run").is_none(),
             "an un-promoted run is evicted after two rotations"
@@ -24490,7 +24350,7 @@ mod tests {
             // Distinct branch.
             if (0xD800..=0xDFFF).contains(&cp) {
                 // Distinct branch.
-                continue; // surrogate halves are not scalar values
+                continue;
             }
             let c = char::from_u32(cp).expect("non-surrogate is a scalar");
             let Some(want) = oracle.glyph_index(c).map(|g| g.0).filter(|&g| g != 0) else {
@@ -24589,7 +24449,7 @@ mod tests {
             }
             if diverged.is_empty() {
                 // Distinct branch.
-                continue; // this font has no Mac Roman quirk; try the next
+                continue;
             }
             demonstrated = true;
             let mut r = Renderer::from_bytes(&bytes, 16.0, Theme::default()).expect("renderer");
@@ -24754,7 +24614,7 @@ mod tests {
         for (row, &ch) in band.iter().enumerate() {
             let cell = &mut input.cells[row][1];
             assert_eq!(cell.ch, ch, "row {row}: the glyph sits at its column");
-            cell.text_presentation = true; // the band's presentation
+            cell.text_presentation = true;
         }
         assert!(
             input.cells[band.len() - 1][1].underline != input.cells[0][1].underline
@@ -24847,7 +24707,7 @@ mod tests {
     fn record_symbol_is_never_color_emoji() {
         let mut r = renderer();
         r.debug_block_on_lazy_fallbacks();
-        let key = r.glyph_key('\u{23FA}'); // ⏺
+        let key = r.glyph_key('\u{23FA}');
         eprintln!(
             "⏺ U+23FA resolved to {:?} / {:?}",
             key.source, key.glyph_class
@@ -25654,8 +25514,8 @@ mod tests {
     fn activate_px_light_switch_keeps_atlas_and_matches_set_px() {
         use aterm_core::terminal::Terminal;
         let mut r = renderer();
-        let pa = r.px(); // 16.0 base
-        let pb = pa * 2.0; // a 2× (Retina) sibling window
+        let pa = r.px();
+        let pb = pa * 2.0;
         let mut term = Terminal::new(1, 8);
         term.process(b"Metrics");
         let input_small = term.cell_frame(1, 8);
@@ -25929,7 +25789,7 @@ mod tests {
                 let img = r.glyph_image(key);
                 let Some((top, bottom)) = ink_cell_rows(img, baseline) else {
                     // Distinct branch.
-                    continue; // no ink at all (space)
+                    continue;
                 };
                 assert!(
                     top < floor,
@@ -25939,7 +25799,7 @@ mod tests {
                 );
                 if top < baseline.min(floor) || bottom - top > floor {
                     // Distinct branch.
-                    continue; // has a body on the line, or no seat to move into
+                    continue;
                 }
                 seated_cases += 1;
                 assert!(
@@ -26635,8 +26495,6 @@ mod tests {
                             partial |= b != 0x00f1_fa8c;
                         }
                     } else {
-                        // The icon never reaches a neighbour (its own columns
-                        // above and below the cell are the row's chrome).
                         if !(P..P + cw).contains(&x) {
                             assert_eq!(a, b, "{icon:?}: pixel ({x},{y}) outside the cell moved");
                         }
@@ -26733,7 +26591,6 @@ mod tests {
             (&parted_own, "in its own cell")
         };
         for icon in BandIcon::ALL {
-            // A filled star, disc or diamond has no stroke for a bold cell to weigh.
             if !matches!(icon, BandIcon::Sparkle | BandIcon::Disc | BandIcon::Diamond) {
                 assert!(
                     parted.contains(&format!("{icon:?}")),
@@ -26850,7 +26707,6 @@ mod tests {
                     else {
                         panic!("{icon:?}: a Mono raster");
                     };
-                    // A glass mark's key is its own cell's even between blanks.
                     assert_eq!(
                         (*width, *height),
                         (procedural::band_icon_width(cw, !icon.is_glass_mark()), ch)
@@ -26872,7 +26728,6 @@ mod tests {
 
     #[test]
     fn the_glass_marks_read_as_one_set_at_1x_and_2x() {
-        // `(x0, x1, y0, y1)`, inclusive, of a raster `w` wide.
         let ink_box = |w: usize, bytes: &[u8]| {
             let h = bytes.len() / w;
             let inked = |x: usize, y: usize| bytes[y * w + x] > 0;
@@ -26900,7 +26755,6 @@ mod tests {
             #[cfg(target_os = "macos")]
             let baseline = r.baseline();
             for (style, bold) in [(StyleBits::REGULAR, false), (StyleBits::BOLD, true)] {
-                // The face's own marks, where it has them: what the drawn ones stand beside.
                 let own = |r: &mut Renderer, c: char| {
                     let key = r.glyph_key_styled(c, style);
                     (matches!(key.source, FaceId::Primary | FaceId::BoldPrimary)
@@ -26914,7 +26768,6 @@ mod tests {
                 let dot = own(&mut r, '\u{25cf}');
                 let arrow = own(&mut r, '\u{2193}');
                 let at = format!("{px} px ({cw}x{ch}) {style:?}");
-                // A mark's key is its own cell's between blanks too: one raster.
                 let drawn = |r: &mut Renderer, icon| {
                     let key = band_icon_key(icon, style, true, r.px_q);
                     assert_eq!(
@@ -26934,7 +26787,6 @@ mod tests {
                     "{at}: ● ○ ◐ ◌ ⊘ ◉ ◈ ⌂ ◆ measure {boxes:?}"
                 );
                 let (w, h) = size(boxes[0]);
-                // The face's own `●`, no wider than the cell that face's `●` fills.
                 if let Some((dw, dh)) = dot {
                     assert!(
                         near(w, dw.min(cw)) && near(h, dh.min(cw)),
@@ -26961,9 +26813,6 @@ mod tests {
                     boxes[0],
                     "{at}: control, a disc off another face's ●"
                 );
-                // CONTROL: the fonts' own glyphs for the drawn marks, measured the same way
-                // (size and lowest row from the baseline), are not the set (SF Mono has none
-                // of them; the fallbacks' are off-size or off its baseline).
                 #[cfg(target_os = "macos")]
                 if let (Some(_), Some((_, ah))) = (dot, arrow) {
                     let family = {
@@ -26990,7 +26839,6 @@ mod tests {
                         let (gw, gh) = size(b);
                         (gw, gh, b.3 as i32 - *height as i32 - *ymin)
                     };
-                    // `⌂` only at the weight its card prints it in: bold, it is 14 × 14 at 24 px.
                     let marks: &[char] = if bold {
                         &['\u{25d0}', '\u{25cc}', '\u{25c9}', '\u{25c8}', '\u{25c6}']
                     } else {
@@ -27015,15 +26863,6 @@ mod tests {
         }
     }
 
-    /// A GLASS MARK KEEPS ONE INK BOX WHATEVER ITS NEIGHBOURS HOLD: every mark
-    /// ([`BandIcon::glass_mark`]), regular and bold, at 1x and 2x (12 and 24 px) on the
-    /// system face (SF Mono on macOS) and on Menlo, measured in the rendered frame as the
-    /// pixels that differ from the same row with the mark's cell blank, inks the same box
-    /// from its cell's corner between blanks (` ● `), beside a card's border (`│●│`), after
-    /// the Autopilot card's `∞` (`∞⤓`) and between letters (`H●H`), and no pixel outside its
-    /// own cell. NEGATIVE CONTROL: a band's badge (`ℹ`), measured the same way, spills
-    /// between blanks and keeps to its cell beside letters, so the measure tells two sizes
-    /// of one icon apart.
     #[test]
     fn a_glass_mark_keeps_one_ink_box_whatever_its_neighbours_hold() {
         const P: usize = 8;
@@ -27053,9 +26892,6 @@ mod tests {
                 r.set_pad(P);
                 let (cw, ch) = r.cell_size();
                 let top = r.grid_top();
-                // The icon at column 2 between `around`: the box `(x0, x1, y0, y1)`,
-                // half-open, from its cell's top left corner, of the pixels that differ
-                // from the row with that cell blank, and whether any lies outside its cell.
                 let ink = |r: &mut Renderer, around: [char; 2], icon: BandIcon, bold: bool| {
                     let frame = |r: &mut Renderer, drawn: bool| {
                         let mut input = Terminal::new(1, COLS as u16).cell_frame(1, COLS);
@@ -27114,7 +26950,6 @@ mod tests {
                             );
                         }
                     }
-                    // NEGATIVE CONTROL: the badge's two sizes, told apart by the same measure.
                     let (alone, spilled) = ink(&mut r, rows[0], BandIcon::Info, bold);
                     let (beside, kept) = ink(&mut r, rows[3], BandIcon::Info, bold);
                     assert!(
@@ -27127,19 +26962,6 @@ mod tests {
         }
     }
 
-    /// A BOLD GLASS MARK IS ITS REGULAR ONE'S SIZE: the ring family (every glass mark but
-    /// `⤓`) in its own cell, as the glass and the menus' lit rows lay it, at 10 to 36 px on
-    /// the system face (SF Mono on macOS) and on Menlo, wherever the two weights measure the
-    /// same capitals, `●`, head and baseline ([`Renderer::icon_metrics`]), inks the same box
-    /// in bold as in regular, so it is one size and its foot stands on one row, and the bold
-    /// mark has at least the regular one's ink. Centred for its stroke's parity, a bold
-    /// stroke of the cell's other parity stood half a pixel off the cell's middle and the
-    /// room on the short side cut the family a pixel under the regular one, its foot a row
-    /// higher: SF Mono at 26 px (a 2x menu at 13 px) drew a bold `●` 15 × 15 on rows -17..-3
-    /// beside the regular 16 × 16 on -17..-2, and at 14 px 8 × 8 beside 9 × 9; Menlo at 24 px
-    /// 13 × 13 beside 14 × 14. NEGATIVE CONTROL: `⤓`, whose stem keeps its stroke's crisp
-    /// centre, inks another box in bold at some size on each macOS face, so the measure tells
-    /// a mark centred by its stroke apart.
     #[test]
     fn a_bold_glass_mark_is_its_regular_ones_size() {
         let faces: &[Option<&str>] = if cfg!(target_os = "macos") {
@@ -27147,7 +26969,6 @@ mod tests {
         } else {
             &[None]
         };
-        // The ink box `(x0, x1, y0, y1)`, half-open, of a mark's own-cell raster, and its ink.
         let measure = |r: &mut Renderer, icon: BandIcon, style| {
             let key = band_icon_key(icon, style, false, r.px_q);
             let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
@@ -27214,13 +27035,6 @@ mod tests {
         }
     }
 
-    /// NO ICON INKS OVER THE FACE'S TALLEST LETTER on the faces a band is drawn in at 1x, 8 to
-    /// 16 px, regular and bold, spilled between blanks and in a cell of its own: every raster
-    /// [`band_icon_key`] names starts at or under the face's `head` row
-    /// ([`Renderer::icon_metrics`]) and never on the cell's top row. `↻`'s arrowhead stood over
-    /// its ring's top and inked row 0 on SF Mono at 13 px, Menlo at 11 (and at 12 and 14
-    /// bold), Courier New at 12 bold and Andale Mono at 11, against the row above. NEGATIVE
-    /// CONTROL: some icon starts on its ceiling row, so a row's overshoot would show.
     #[test]
     fn no_icon_inks_over_the_tallest_letter_on_a_real_face() {
         let faces: &[Option<&str>] = if cfg!(target_os = "macos") {
@@ -27816,9 +27630,9 @@ mod tests {
         let ownership = [
             vec![],
             vec![(1, 3)],
-            vec![(3, 6), (1, 2), (2, 5)], // unsorted and overlapping
+            vec![(3, 6), (1, 2), (2, 5)],
             vec![(0, 20)],
-            vec![(4, 2)], // empty interval
+            vec![(4, 2)],
         ];
         for own in ownership {
             raster.own = own;
@@ -28749,7 +28563,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn runtime_fallback_resolves_cjk() {
         let mut r = renderer_no_configured_fallbacks();
-        let key = r.glyph_key('中'); // U+4E2D
+        let key = r.glyph_key('中');
         assert_eq!(
             key.source,
             FaceId::RuntimeFallback,
@@ -30472,7 +30286,7 @@ mod comet_beam_tests {
                 .map(|i| (i as f32, (i as f32 * 0.7).sin() * 6.0))
                 .collect(),
             (0..25).map(|i| (i as f32 * 2.0, i as f32 * 2.0)).collect(),
-            (0..30).map(|i| (3.0, i as f32)).collect(), // vertical
+            (0..30).map(|i| (3.0, i as f32)).collect(),
         ];
         for path in paths {
             let run: Vec<CometSample> = path
@@ -30579,7 +30393,7 @@ mod subpixel_seat_tests {
             crate::Renderer::from_system(15.0, crate::Theme::default()).expect(crate::NO_FONT);
         if !renderer.set_font_subpixel("rgb") {
             // Distinct branch.
-            return; // this build has no LCD raster seam to exercise
+            return;
         }
         let mut input = crate::RenderInput::empty();
         input.rows = 1;

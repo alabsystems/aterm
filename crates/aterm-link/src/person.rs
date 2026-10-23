@@ -57,7 +57,8 @@ pub struct PersonCmd {
 
 /// Parse `aterm fabric <verb> …` for `verb` one of `halt`, `inbox`, `post`.
 /// # Errors
-/// An unknown flag, a flag without its value, no `--cap-file`, or the verb's own arguments missing or malformed.
+/// An unknown flag, a flag without its value, no `--cap-file`, or the verb's own arguments missing
+/// or malformed.
 pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
     let mut cap_files = Vec::new();
     let mut peek = false;
@@ -116,9 +117,6 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
     Ok(Some(PersonCmd { act, cap_files }))
 }
 
-/// `to=@<sid>@<node> kind=<k> [re=<off>] <text…>` — the three keys first, in
-/// any order; the first word that is not one of them starts the text, and an
-/// explicit `--` makes every word after it literal text.
 fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String> {
     let (mut to, mut kind, mut re) = (None, None, None);
     let mut text_at = literal_at.unwrap_or(words.len());
@@ -175,7 +173,7 @@ fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String
     })
 }
 
-/// Run one person verb against the broker `cfg` (the `[fabric] command`'s) names, as the person `cmd`'s cap files are minted for.
+/// Run one person verb against the broker `cfg` names using the person's cap files.
 #[must_use]
 pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let person = match person_of(&cmd.cap_files, &cfg.fleet) {
@@ -260,9 +258,10 @@ impl std::fmt::Display for Unprinted {
 
 impl std::error::Error for Unprinted {}
 
-/// The ONE person the cap files bind writes to, on `fleet`: the principal of every read-write grant whose principal is a person ([`is_person_id`]).
+/// The ONE person the cap files bind writes to, on `fleet`.
 /// # Errors
-/// An unreadable cap file, no person's grant, grants for two persons, or a person's grant on another fleet.
+/// An unreadable cap file, no person's grant, grants for two persons, or a person's grant on
+/// another fleet.
 pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
     use astream_cap::{Grant, Mode};
     let mut people = BTreeSet::new();
@@ -306,13 +305,10 @@ pub fn person_of(cap_files: &[String], fleet: &str) -> Result<String, String> {
     }
 }
 
-/// A broker connection with the person's caps attached, every exchange
-/// bounded by [`IO_TIMEOUT`].
 fn connect(cfg: &Config, cmd: &PersonCmd) -> io::Result<(Conn, Closer)> {
     connect_within(cfg, cmd, IO_TIMEOUT)
 }
 
-/// [`connect`] with every exchange bounded by `request`.
 fn connect_within(cfg: &Config, cmd: &PersonCmd, request: Duration) -> io::Result<(Conn, Closer)> {
     let (mut conn, closer) = transport::connect(&cfg.broker, request)?;
     transport::attach_cap_files(&mut conn, &cmd.cap_files)?;
@@ -327,18 +323,12 @@ struct Bounds {
     subscription: Duration,
 }
 
-/// The operator's bounds: a request answers within [`IO_TIMEOUT`], and a
-/// catch-up scan, which a broker marks while it reads, may stay silent up to
-/// [`astream_broker::IDLE_MARK_DEADLINE`] — longer than a request may take, so a
-/// long scan is read to its end.
 const LIVE: Bounds = Bounds {
     request: IO_TIMEOUT,
     subscription: astream_broker::IDLE_MARK_DEADLINE,
 };
 const _: () = assert!(LIVE.subscription.as_millis() > LIVE.request.as_millis());
 
-/// Publish once, as `person`, under a fresh sequence (the wall clock's nanoseconds; a record
-/// the broker deduped is an error), and answer the record's offset.
 fn publish(
     cfg: &Config,
     cmd: &PersonCmd,
@@ -361,7 +351,6 @@ fn publish(
     Ok(off)
 }
 
-/// `halt <reason>` / `halt off`.
 fn halt(cfg: &Config, cmd: &PersonCmd, person: &str, reason: Option<&str>) -> io::Result<()> {
     let subject = crate::subject::person_halt(&cfg.fleet, person);
     let mut body = format!(
@@ -390,7 +379,6 @@ fn halt(cfg: &Config, cmd: &PersonCmd, person: &str, reason: Option<&str>) -> io
     Ok(())
 }
 
-/// `post to=@<sid>@<node> kind=<k> [re=<off>] <text>`.
 fn post(
     cfg: &Config,
     cmd: &PersonCmd,
@@ -410,9 +398,6 @@ fn post(
     Ok(())
 }
 
-/// `inbox [--peek]`: print unread mail up to the broker head captured at start, then commit
-/// the consumer group through `head - 1` (`--peek` and failed stdout writes commit nothing;
-/// the commit connection verifies the same `LogIdentity` before committing).
 fn inbox(
     cfg: &Config,
     cmd: &PersonCmd,
@@ -540,8 +525,6 @@ fn inbox(
     Ok(())
 }
 
-/// The identity answered on this connection's attach, or a fresh Hello for an
-/// unguarded connection.
 fn inbox_log_identity(conn: &mut Conn) -> io::Result<Option<astream_broker::LogIdentity>> {
     match conn.seen_log_identity() {
         Some(log) => Ok(Some(log)),
@@ -549,10 +532,6 @@ fn inbox_log_identity(conn: &mut Conn) -> io::Result<Option<astream_broker::LogI
     }
 }
 
-/// A read past the inbox's liveness bound (`bound`), said in words: the broker
-/// marks a subscription it is reading for at least every
-/// [`astream_broker::IDLE_MARK`], so silence past the bound is a link that is
-/// gone, which a bare errno would not say.
 fn went_silent(e: io::Error, bound: Duration) -> io::Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
@@ -577,11 +556,11 @@ pub struct MintForOpts {
     pub out: Option<String>,
     /// `--fleet <F>`: default this host's configured fleet.
     pub fleet: Option<String>,
-    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds: every grant is stamped `exp=<now + this>`, and the broker refuses the ring from that instant on.
+    /// `--expires <N>d|<N>h` ([`parse_lifetime`]), as milliseconds.
     pub expires: Option<u64>,
 }
 
-/// Whether `id` is a PERSON: an `h-` human or an `a-` agent holding its own cap (§3.2), the principals `mint-for` mints [`crate::enable::person_grants`] for.
+/// Whether `id` is a PERSON.
 #[must_use]
 pub fn is_person_id(id: &str) -> bool {
     (id.starts_with("h-") || id.starts_with("a-")) && crate::subject::is_principal(id)
@@ -618,15 +597,10 @@ pub fn parse_lifetime(word: &str) -> Result<u64, String> {
     Ok(hours * HOUR_MS)
 }
 
-/// `grant` with `exp=<exp_ms>` added to its prefix: `rw,p=<P>:` becomes
-/// `rw,p=<P>,exp=<ms>:` and `ro:` becomes `ro,exp=<ms>:` — the grammar
-/// astream-cap reads (`field := "p=" … | "exp=" …`).
 fn with_expiry(grant: &str, exp_ms: u64) -> String {
     grant.replacen(':', &format!(",exp={exp_ms}:"), 1)
 }
 
-/// The fleet and the broker of THIS host's fabric, when it has one: the
-/// config's `[fabric] command`, else the rendezvous file's.
 fn this_fabric() -> Option<(String, String)> {
     crate::fabric::resolve_command(None, crate::fabric::config_path().as_deref())
         .ok()
@@ -641,8 +615,6 @@ fn this_fabric() -> Option<(String, String)> {
         })
 }
 
-/// `path` as an absolute path: itself, or joined to the working directory, so
-/// the line that names the cap names the file a later command reads.
 fn absolute(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_absolute() {
@@ -776,7 +748,6 @@ pub(crate) fn write_capability_to(out: &mut dyn io::Write, text: &str) -> io::Re
     out.write_all(text.as_bytes()).and_then(|()| out.flush())
 }
 
-/// Map a failed stdout write of a minted capability into an error message.
 fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
     written.map_err(|e| {
         format!(
@@ -786,8 +757,6 @@ fn cap_on_stdout(written: io::Result<()>) -> Result<(), String> {
     })
 }
 
-/// Write `lines` to `path` with mode 0600, refusing symlinks or different existing files; if an
-/// identical file already exists, tighten its mode to 0600 and warn if it was wider.
 fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(format!(
@@ -824,8 +793,6 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
     Ok(path.to_path_buf())
 }
 
-/// What a person does with the cap `mint-for <person>` just made: the
-/// commands, spelled with that cap.
 fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String {
     let human = person.starts_with("h-");
     let halt = if human {
@@ -855,11 +822,8 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
     )
 }
 
-/// Make `path` 0600 if it is not: `Ok(None)` when it already was, `Ok(Some(
-/// <old mode>))` when it was changed.
-///
+/// Make `path` 0600 if it is not.
 /// # Errors
-///
 /// The stat or the chmod.
 fn private_mode(path: &Path) -> io::Result<Option<u32>> {
     use std::os::unix::fs::PermissionsExt;
@@ -875,8 +839,6 @@ fn private_mode(path: &Path) -> io::Result<Option<u32>> {
 mod tests {
     use super::*;
 
-    /// A CAP STDOUT DID NOT TAKE WHOLE IS REFUSED, a reader that went away included: the cap
-    /// is the whole answer, and a person cannot present part of one.
     #[test]
     fn a_cap_stdout_did_not_take_whole_is_refused() {
         assert_eq!(cap_on_stdout(Ok(())), Ok(()));
@@ -889,8 +851,6 @@ mod tests {
         }
     }
 
-    /// `--expires` is a whole number of days or hours, never zero, never
-    /// past ten years.
     #[test]
     fn a_lifetime_is_days_or_hours() {
         assert_eq!(parse_lifetime("30d"), Ok(30 * 24 * 3_600_000));
@@ -902,8 +862,6 @@ mod tests {
         }
     }
 
-    /// A PERSON'S RING STAMPED WITH AN EXPIRY keeps its authority: every grant
-    /// carries `exp=` in astream's grammar, a principal grant beside its `p=`.
     #[test]
     fn a_person_ring_stamped_with_an_expiry_reads_its_expiry() {
         let exp = 1_800_000_000_000u64;
@@ -922,8 +880,6 @@ mod tests {
         }
     }
 
-    /// A PERSON is an `h-` or `a-` principal; a node, a session and a
-    /// malformed id are not.
     #[test]
     fn a_person_is_h_or_a_dash_and_a_principal() {
         assert!(is_person_id("h-andrew"));
@@ -937,7 +893,6 @@ mod tests {
         s.split_whitespace().map(str::to_string).collect()
     }
 
-    /// The three verbs' grammar: what each takes, and that a cap is required.
     #[test]
     fn each_verb_parses_its_words_and_refuses_the_rest() {
         let halt = parse("halt", &words("--cap-file c main is broken")).unwrap();
@@ -1100,7 +1055,6 @@ mod tests {
 
     #[cfg(unix)]
     impl StandIn {
-        /// When the inbox's group subscription reached the stand-in, if it did.
         fn subscribed(&self) -> Option<std::time::Instant> {
             let (state, _) = &*self.state;
             state.lock().unwrap_or_else(|e| e.into_inner()).subscribed
@@ -1137,8 +1091,6 @@ mod tests {
         }
     }
 
-    /// What an inbox waits on against a stand-in broker: every wait a hang
-    /// detector.
     const STAND_IN: Bounds = Bounds {
         request: aterm_spec::wait::MUST_HAPPEN,
         subscription: aterm_spec::wait::MUST_HAPPEN,
@@ -1587,9 +1539,6 @@ mod tests {
             .is_some_and(astream_broker::BrokerRefusal::is_permanent));
     }
 
-    /// ONLY A HUMAN'S RING CAN WRITE A HALT ROW, by astream's own publish rule:
-    /// a bridge applies a halt under an `h-` principal alone, so an `a-`
-    /// service's ring reaches its sessions and its mail, never the fleet face.
     #[test]
     fn only_a_humans_ring_can_publish_a_halt() {
         let secret = [7u8; 32];
@@ -1612,8 +1561,6 @@ mod tests {
         }
     }
 
-    /// The person is the one person-bound principal in the cap files, on this
-    /// fleet; a node's ring alone names none.
     #[test]
     fn the_person_is_read_off_the_cap_files() {
         let dir = std::env::temp_dir().join(format!("atl-person-{}", std::process::id()));

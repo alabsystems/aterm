@@ -7,8 +7,6 @@ use crate::supervise::tape::doors;
 use crate::supervise::tape::replay::{Options, replay};
 use crate::supervise::tape::report::{ActSide, Cause, Class, Mode, Report, Verdict};
 
-/// The scripted worker: a Read outside every allowed root, a read-only Bash
-/// box, then the session gone.
 fn script() -> Mock {
     let mut m = fenced(vec![
         busy_screen(),
@@ -22,14 +20,12 @@ fn script() -> Mock {
     m
 }
 
-/// The engine tests' options under `approve = "all"`.
 fn approve_all() -> SuperviseOpts {
     let mut opts = auto(30);
     opts.policy.approve = Approve::All;
     opts
 }
 
-/// A `/` home the Read rule reads `~` against on every host.
 fn owner_home(s: &mut Session<'_, TapedCtl<'_, Mock>>) {
     s.set_approval_env(ApprovalEnv {
         home: Some(PathBuf::from("/Users/_owner")),
@@ -37,15 +33,11 @@ fn owner_home(s: &mut Session<'_, TapedCtl<'_, Mock>>) {
     });
 }
 
-/// A run of [`script`] recorded under `approve = "all"`: its tape, and the
-/// keys the scripted worker was pressed.
 fn recorded() -> (Vec<u8>, Vec<String>) {
     let (bytes, keys, _) = recorded_under_header(|h| h.to_string());
     (bytes, keys)
 }
 
-/// [`recorded`] with its header's text made by `header` from the real one,
-/// which is handed back too.
 fn recorded_under_header(header: impl Fn(&str) -> String) -> (Vec<u8>, Vec<String>, String) {
     let mut m = script();
     let run = record_watch(&mut m, &approve_all(), owner_home);
@@ -54,24 +46,19 @@ fn recorded_under_header(header: impl Fn(&str) -> String) -> (Vec<u8>, Vec<Strin
     (run.tape.reframed(&header(&text)), keys, text)
 }
 
-/// Whether `request`, as the scripted worker took it, is a press: its verb,
-/// after any `@session` address, is `key`.
 fn is_press(request: &str) -> bool {
     request.split(' ').find(|w| !w.starts_with('@')) == Some("key")
 }
 
-/// A candidate of `sets` over the recorded policy.
 fn candidate(sets: &[(&str, &str)]) -> Candidate {
     under(sets).candidate.expect("a candidate")
 }
 
-/// The shadow of `bytes` under `sets`.
 fn shadowed(bytes: &[u8], sets: &[(&str, &str)]) -> crate::supervise::tape::shadow::Shadow {
     crate::supervise::tape::shadow::shadow(bytes, &candidate(sets))
         .unwrap_or_else(|e| panic!("the tape shadows: {e}"))
 }
 
-/// A counterfactual under the policy the recorded one becomes with `sets`.
 fn under(sets: &[(&str, &str)]) -> Options {
     Options {
         candidate: Some(Candidate {
@@ -85,12 +72,10 @@ fn under(sets: &[(&str, &str)]) -> Options {
     }
 }
 
-/// The tape `bytes` replayed with `options`.
 fn replayed(bytes: &[u8], options: &Options) -> Report {
     replay(bytes, options).unwrap_or_else(|e| panic!("the tape does not replay: {e}"))
 }
 
-/// Both sides of the first divergent act, when the verdict is one.
 fn divergent_act(report: &Report) -> Option<(Option<&ActSide>, Option<&ActSide>)> {
     match &report.verdict {
         Verdict::Diverged(d) => match &d.cause {
@@ -101,11 +86,6 @@ fn divergent_act(report: &Report) -> Option<(Option<&ActSide>, Option<&ActSide>)
     }
 }
 
-/// WOULD IT HAVE PRESSED UNDER "SAFE"? The run recorded under "all" pressed
-/// both boxes; replayed under `approve = "safe"`, the candidate takes another
-/// act at the first press — it escalates the Read instead — and the replay
-/// stops there: DIVERGED, a decision, the recorded press and the candidate's
-/// badge both said, and the decision before each.
 #[test]
 fn a_safe_policy_diverges_at_the_press_all_took() {
     let (bytes, keys) = recorded();
@@ -168,9 +148,6 @@ fn a_safe_policy_diverges_at_the_press_all_took() {
     );
 }
 
-/// THE NEGATIVE CONTROL: a candidate that changes only what this run never
-/// consults (the continuation's text, with the continuation off) takes every
-/// act the recorded run took, reads exactly what it read: REPRODUCED.
 #[test]
 fn a_key_the_run_never_consults_reproduces() {
     let (bytes, _) = recorded();
@@ -181,8 +158,6 @@ fn a_key_the_run_never_consults_reproduces() {
     assert!(acts.account.exact(), "{:?}", acts.account);
 }
 
-/// A key the policy's reader refuses is no counterfactual: the replay is
-/// refused, naming it, rather than run under the recorded policy.
 #[test]
 fn a_candidate_the_reader_refuses_is_no_replay() {
     let (bytes, _) = recorded();
@@ -192,10 +167,6 @@ fn a_candidate_the_reader_refuses_is_no_replay() {
     }
 }
 
-/// A BUILD THAT READS THE CLOCK MORE OFTEN (a planted variant of the loop:
-/// one clock read more before each screen) still takes every act the
-/// recorded run took — REPRODUCED in acts mode, its extra reads served by
-/// the virtual clock — while a strict replay drifts at its first extra read.
 #[test]
 fn an_extra_clock_read_passes_acts_and_drifts_strict() {
     let (bytes, _) = recorded();
@@ -215,10 +186,6 @@ fn an_extra_clock_read_passes_acts_and_drifts_strict() {
     assert_eq!(account.taken, 2, "{account:?}");
 }
 
-/// THE HOSTED LOOP'S TAPE — what `aterm drive replay` replays in a shipped
-/// build: a hosted run under the default policy ("all") pressed the Read;
-/// under `approve = "safe"` the candidate escalates it instead, and the
-/// replay stops at the press.
 #[test]
 fn a_hosted_tape_diverges_under_safe_at_the_press() {
     let dir = crate::supervise::test_scratch_path("ledger", "counterfactual-hosted");
@@ -253,12 +220,6 @@ fn a_hosted_tape_diverges_under_safe_at_the_press() {
     );
 }
 
-/// THE SHADOW UNDER "SAFE" LISTS EXACTLY THE AFFECTED BOXES: every decision
-/// on the tape is decided again, and the one point the candidate decides
-/// otherwise is the Read "all" pressed — the read-only Bash box after it is
-/// decided the same, and labelled TAINT, as every row after the first
-/// difference is; the turn ends, decided again in a strict replay on this
-/// (the recording) build, are the same.
 #[test]
 fn the_shadow_lists_exactly_the_boxes_safe_decides_otherwise() {
     let (bytes, _) = recorded();
@@ -306,9 +267,6 @@ fn the_shadow_lists_exactly_the_boxes_safe_decides_otherwise() {
     );
 }
 
-/// THE SHADOW'S NEGATIVE CONTROLS: under the recorded policy itself, and
-/// under a key the run never consults, every point is decided again and
-/// decided as recorded — exit 0, no row TAINT.
 #[test]
 fn the_shadow_under_an_unchanged_policy_decides_every_point_as_recorded() {
     let (bytes, _) = recorded();
@@ -326,9 +284,6 @@ fn the_shadow_under_an_unchanged_policy_decides_every_point_as_recorded() {
     }
 }
 
-/// ON ANOTHER BUILD the boxes are still decided again — from their marks'
-/// facts, no loop run — while each turn end is listed with why it is not:
-/// its fold is rebuilt only by a strict replay on the recording build.
 #[test]
 fn another_builds_shadow_decides_the_boxes_and_names_why_not_the_turn_ends() {
     let (bytes, _, _) = recorded_under_header(|text| {
@@ -362,11 +317,6 @@ fn another_builds_shadow_decides_the_boxes_and_names_why_not_the_turn_ends() {
     assert_eq!(shadow.differs(), 1, "{}", shadow.render());
 }
 
-/// A TURN END THE CANDIDATE DECIDES OTHERWISE: a run that typed the usage
-/// limit's continuation (`resume_limits`) shadowed with the switch off — the
-/// turn end is decided again beside the replayed loop, on the fold it
-/// rebuilt, and decided otherwise there, by another rule — and replayed in
-/// acts mode, it stops at the continuation the recorded run typed.
 #[test]
 fn a_turn_end_the_candidate_decides_otherwise_is_shadowed_and_stops_the_acts() {
     let mut m = Mock::new(vec![
@@ -411,9 +361,6 @@ fn a_turn_end_the_candidate_decides_otherwise_is_shadowed_and_stops_the_acts() {
     );
 }
 
-/// The act a counterfactual's report names as the recorded run's where the
-/// candidate did not take it: a divergent act's recorded side, the act it
-/// went on without, or the act it stopped short of.
 fn recorded_act(report: &Report) -> Option<&ActSide> {
     match &report.verdict {
         Verdict::Diverged(d) | Verdict::Stale(d) => match &d.cause {
@@ -425,9 +372,6 @@ fn recorded_act(report: &Report) -> Option<&ActSide> {
     }
 }
 
-/// A turn that ended after 3 minutes of work, the worker's last words
-/// `said`, at an empty composer in bypass mode: a point `continue@v1` types
-/// its continuation at.
 fn worked_turn(said: &str) -> Vec<String> {
     let mut r = rows(&[
         &format!("⏺ {said}"),
@@ -439,9 +383,6 @@ fn worked_turn(said: &str) -> Vec<String> {
     r
 }
 
-/// AUTOPILOT OFF WHERE THE RECORDED RUN PRESSED: the candidate parks — it
-/// gives its claim back, a release the recorded run made only at its end —
-/// and never presses.
 #[test]
 fn a_candidate_that_parks_diverges_at_the_press_it_never_takes() {
     let (bytes, _) = recorded();
@@ -469,9 +410,6 @@ fn a_candidate_that_parks_diverges_at_the_press_it_never_takes() {
     );
 }
 
-/// The same on the hosted loop's tape: under Autopilot off the candidate
-/// gives its claim back and parks where the hosted run pressed the Read, and
-/// the replay stops at that press — never STALE at the claim's release.
 #[test]
 fn a_hosted_candidate_that_parks_diverges_at_the_press() {
     let dir = crate::supervise::test_scratch_path("ledger", "counterfactual-parks");
@@ -496,12 +434,6 @@ fn a_hosted_candidate_that_parks_diverges_at_the_press() {
     assert!(press.words.contains(" key "), "{press:?}");
 }
 
-/// THE CONTINUATION SWITCHED OFF: a run that typed Cruise's continuation
-/// (`config::CONTINUE_TEXT`, `[aterm harness] Autopilot is Cruise: keep
-/// going. …`) at a turn's end (`continue@v1`), replayed with
-/// `continue = false` — the candidate decides nothing there and goes on to
-/// wait for the screen after the continuation, which the recorded run waited
-/// for only once it had typed.
 #[test]
 fn a_candidate_that_skips_the_continuation_diverges_at_it() {
     let mut m = Mock::new(vec![
@@ -553,9 +485,6 @@ fn a_candidate_that_skips_the_continuation_diverges_at_it() {
     );
 }
 
-/// [`recorded`] with its items edited by `edit`: the run as its tape would
-/// read had it gone otherwise (a press it did not make, an end it never
-/// wrote).
 fn recorded_edited(edit: impl FnOnce(&mut Vec<crate::supervise::tape::codec::Item>)) -> Vec<u8> {
     let (bytes, _) = recorded();
     let read = crate::supervise::tape::recover::recover(&bytes);
@@ -565,13 +494,11 @@ fn recorded_edited(edit: impl FnOnce(&mut Vec<crate::supervise::tape::codec::Ite
     crate::supervise::tape::testing::written(&header, &items)
 }
 
-/// Drop the last key press on a tape's items (the read-only Bash box's).
 fn without_the_last_press(items: &mut Vec<crate::supervise::tape::codec::Item>) {
     let press = last_press(items);
     items.remove(press);
 }
 
-/// Where a tape's last key press is among its items.
 fn last_press(items: &[crate::supervise::tape::codec::Item]) -> usize {
     items
         .iter()
@@ -584,14 +511,10 @@ fn last_press(items: &[crate::supervise::tape::codec::Item]) -> usize {
         .expect("a press")
 }
 
-/// Drop a tape's end (a run killed, or still running).
 fn without_the_end(items: &mut Vec<crate::supervise::tape::codec::Item>) {
     items.retain(|i| !matches!(i, crate::supervise::tape::codec::Item::End(_)));
 }
 
-/// A TAPE WITH NO END in acts mode: the recorded run stands for one that did
-/// not press the Bash box and went on running (its press removed, and then
-/// its end).
 #[test]
 fn a_tape_with_no_end_is_ended_only_when_spent() {
     for tape in [
@@ -622,10 +545,6 @@ fn a_tape_with_no_end_is_ended_only_when_spent() {
     assert_eq!((acts.account.taken, acts.account.acts), (2, 2));
 }
 
-/// THE SHADOW SAYS WHAT IT COULD NOT DECIDE: on another build, under the
-/// recorded policy, every box is decided again and as recorded, but no turn
-/// end is — so the exit is 3 (the tape cannot say there), never the 0 of
-/// "every point decided as recorded".
 #[test]
 fn a_shadow_that_could_not_decide_every_point_exits_3() {
     let (bytes, _, _) = recorded_under_header(|text| {
@@ -699,10 +618,6 @@ fn a_shadow_that_could_not_decide_every_point_exits_3() {
     );
 }
 
-/// `--shadow` OVER SEVERAL TAPES says each one: a tape that does not shadow
-/// (no decision on it) is named under its own heading with why, and the
-/// others' reports are kept — the exit the worst of them (a point decided
-/// otherwise first, then a tape that did not shadow).
 #[test]
 fn a_shadow_batch_keeps_every_tapes_report() {
     let dir = crate::supervise::ScratchDir::new("drive-replay", "shadow-batch");

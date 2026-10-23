@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EDITING WIN: what predictive editing buys someone typing real command lines over a link, and what it costs, MEASURED on the safety theorem's own world (`common/world.rs`): its aterm-core engine, its far ends in the byte forms measured from them, and its host wired the way aterm-gui wires the predictor (the key-time row, the edit keys handed to `predict_edit`, a chain painted all or none by aterm-core's span painter).
+//! THE EDITING WIN.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -12,52 +12,25 @@ use aterm_spec::rng::XorShift;
 
 use crate::world::{Config, Cost, Editor, Host, Key, Keymap, Sim, Stats, Unmodelled};
 
-/// The region design's probe seed and size, which this corpus reproduces.
 const CORPUS_SEED: u64 = 0xED17_2026_0001;
 const LINES: usize = 300;
-/// The keys the region probe's corpus held, and its lines per family: the
-/// port's own check that it is the same corpus.
 const REGION_KEYS: usize = 6999;
 const REGION_FAMILIES: [usize; 10] = [101, 37, 29, 20, 18, 19, 20, 33, 17, 6];
 
-/// The screen: a standard terminal, wide enough for every line of the corpus
-/// (the longest, `sudo ` before the `targo` test, is 47 cells with the prompt).
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// THE COST BOUNDS (assertion 5). A reconcile asks the host for at most two
-/// rows and two cells: the line's row (the tail a proof stands on, a chain's
-/// cells to the margin) and the row under it, THE FLOOR (`Rule::FloorBelow`,
-/// every cell its run's press read blank), added by the review of increment 4
-/// after the plan bounded a reconcile by one row (`cols + 2`); the shipping
-/// predictor reads both on every frame a standing proof is above a floor.
 const OBSERVE_BOUND: u64 = 2 * COLS as u64 + 2;
-/// The plan's bound on the ops a frame folds: every state of a chain of
-/// `EDIT_CHAIN_MAX` (64) ops folded from scratch, `64 * 65 / 2`.
 const FOLD_BOUND: u64 = 64 * 65 / 2;
-/// THE LIFETIME BOUND (assertion 7): the longest glitch window the predictor
-/// can have, its own function at the slowest link and the deepest backoff (the
-/// crate's documented 2 s ceiling).
 const LIFETIME_BOUND_US: u64 =
     aterm_predict::compute_glitch_window_ms(Some(u32::MAX), u8::MAX) * 1000;
 
-/// The links measured: a local shell, a LAN, a continent, an ocean, two; and
-/// 100 and 250 ms, the links the comparison of the predictor before the plan
-/// with the one shipping is quoted at (30, 100 and 250 ms), 250 ms being the
-/// glitch window's floor, where a link's echo first arrives later than the
-/// shortest window the predictor can have.
 const RTTS_MS: [u32; 8] = [1, 30, 80, 100, 160, 250, 320, 600];
-/// The links the controls and the switch corpus run on.
 const CONTROL_RTTS_MS: [u32; 3] = [80, 160, 320];
-/// The link's jitter seed (the region probe's), per round trip.
 const LINK_SEED: u64 = 7;
 
-/// What Enter runs: a command printing one line (`Program::run_command`'s
-/// choice 8), and, on the switch corpus, `cat` (choice 11), a cooked program
-/// reading the tty until Ctrl-C.
 const RUNS_A_COMMAND: u32 = 8;
 const STARTS_CAT: u32 = 11;
-/// What every other key reads: a choice no echo draws a suggestion for.
 const NO_SUGGESTION: u32 = 0;
 
 const CMDS: [&str; 20] = [
@@ -82,7 +55,6 @@ const CMDS: [&str; 20] = [
     "echo $PATH",
     "history | tail -20",
 ];
-/// The words Tab completes.
 const VOCAB: [&str; 7] = [
     "git", "grep", "kubectl", "docker", "targo", "tail", "history",
 ];
@@ -100,8 +72,6 @@ const FAMILY_NAMES: [&str; 10] = [
     "history",
     "word-motion",
 ];
-/// The families whose lines move the cursor or edit inside the text: the
-/// corpus the cooked and overwrite controls type.
 const EDITING_FAMILIES: [usize; 5] = [2, 3, 5, 6, 8];
 
 /// A key of the corpus.
@@ -126,7 +96,6 @@ enum Press {
 }
 
 impl Press {
-    /// The press the world's host sees.
     fn key(self) -> Key {
         match self {
             Self::G(c) => Key::Glyph(c),
@@ -152,8 +121,7 @@ impl Press {
     }
 }
 
-/// One press of the corpus: the key, the pause before it, and whether it is
-/// its line's first (the typist waits for the prompt, a round trip more).
+/// One press of the corpus.
 #[derive(Clone, Copy, Debug)]
 struct Stroke {
     key: Press,
@@ -168,7 +136,6 @@ struct Line {
     strokes: Vec<Stroke>,
 }
 
-/// The typist: the generator's state and the line being typed.
 struct Typist<'r> {
     rng: &'r mut XorShift,
     strokes: Vec<Stroke>,
@@ -203,8 +170,6 @@ impl Typist<'_> {
         }
     }
 
-    /// `n` presses of `key`, the first after `gap`, the rest at the arrow's
-    /// repeat.
     fn repeated(&mut self, key: Press, n: usize, gap: u32) {
         let mut gap = gap;
         for _ in 0..n {
@@ -213,8 +178,6 @@ impl Typist<'_> {
         }
     }
 
-    /// One line of family `family` typing `cmd`, in the region probe's order
-    /// of draws (so the corpus is its corpus).
     fn line(&mut self, family: usize, cmd: &[char]) {
         let start = self.draw(300, 900);
         let len = cmd.len();
@@ -359,7 +322,6 @@ impl Typist<'_> {
     }
 }
 
-/// THE CORPUS: [`LINES`] lines from [`CORPUS_SEED`].
 fn corpus() -> Vec<Line> {
     let mut rng = XorShift::new(CORPUS_SEED);
     let total: u64 = FAMILY_WEIGHTS.iter().sum();
@@ -390,8 +352,7 @@ fn corpus() -> Vec<Line> {
         .collect()
 }
 
-/// The screen a key's output settles to: the cursor's row, its text, the
-/// cursor, and the far end's buffer (its length and the cursor's index in it).
+/// The screen a key's output settles to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Truth {
     row: u16,
@@ -400,8 +361,6 @@ struct Truth {
     buffer: (usize, usize),
 }
 
-/// A corpus as one far end types it: the presses, what each terminator runs,
-/// the bytes each key's output takes, and the TRUTH after each key.
 struct Script {
     strokes: Vec<Stroke>,
     /// The line each press belongs to, and each line's first press.
@@ -419,7 +378,6 @@ struct Script {
     class: Vec<usize>,
 }
 
-/// The key classes the metrics are kept per.
 const CLASSES: [&str; 8] = [
     "glyph-end",
     "glyph-mid",
@@ -431,7 +389,6 @@ const CLASSES: [&str; 8] = [
     "unmodelled",
 ];
 
-/// The class of `key` pressed with the far end's buffer `(len, cur)`.
 fn class_of(key: Press, (len, cur): (usize, usize)) -> usize {
     match key {
         Press::G(_) if cur == len => 0,
@@ -445,7 +402,6 @@ fn class_of(key: Press, (len, cur): (usize, usize)) -> usize {
     }
 }
 
-/// A far end's configuration: the world's host, faithful, in `mode`.
 fn config(editor: Editor, integration: bool, mode: PredictMode) -> Config {
     Config {
         mode,
@@ -461,7 +417,6 @@ fn config(editor: Editor, integration: bool, mode: PredictMode) -> Config {
     }
 }
 
-/// The row `row` of `frame`, `cols` wide (a cell past a trimmed row is blank).
 fn row_text(frame: &RenderInput, row: u16, cols: usize, out: &mut Vec<char>) {
     out.clear();
     let cells = frame
@@ -471,8 +426,6 @@ fn row_text(frame: &RenderInput, row: u16, cols: usize, out: &mut Vec<char>) {
     out.extend((0..cols).map(|c| cells.get(c).map_or(' ', |cell| cell.ch)));
 }
 
-/// Type `lines` into `editor` with prediction off, every key read and its
-/// output delivered whole before the next: the truth after each key.
 fn script(lines: &[Line], editor: Editor, integration: bool, switch: bool) -> Script {
     let mut strokes = Vec::new();
     let mut line_of = Vec::new();
@@ -565,8 +518,6 @@ struct Piece {
     len: usize,
 }
 
-/// THE LINK for a round trip of `rtt_ms`: when each key is pressed, when the
-/// far end reads it, and the pieces its output comes back in, each in order.
 struct Timeline {
     press: Vec<Duration>,
     arrive: Vec<Duration>,
@@ -633,16 +584,12 @@ enum Variant {
     Phase0,
     Full,
     Sticky,
-    /// `Full` with `Rule::ScrollKeepsFirstKey` off: THE FIRST KEY's gate shut
-    /// at every coordinate move, as before this file found it should not be.
+    /// `Full` with `Rule::ScrollKeepsFirstKey` off.
     ShutAtScroll,
-    /// `Full` with `Rule::DarkOverText` off: a guess waiting on the screen as
-    /// it was painted over the line's text, as before this file measured what
-    /// that cost `Always`.
+    /// `Full` with `Rule::DarkOverText` off.
     PaintedOverText,
 }
 
-/// The variants of the main matrix (`ShutAtScroll` runs beside it).
 const VARIANTS: [Variant; 4] = [
     Variant::Baseline,
     Variant::Phase0,
@@ -662,9 +609,6 @@ impl Variant {
         }
     }
 
-    /// Configure `sim`'s predictor (and checker) before the first key. The
-    /// edit lane is switched off as aterm-gui's config switches it, through the
-    /// host (`Sim::set_editing`), which then reads no row for an edit key.
     fn prepare(self, sim: &mut Sim) {
         match self {
             Self::Baseline => {
@@ -707,9 +651,7 @@ struct Tally {
     max_wrong_us: u64,
     max_wrong_cells: u64,
     wrong_cell_us: u64,
-    /// MISPREDICTED CELLS: the times a cell went wrong on glass, and how long
-    /// each stayed wrong (`Meter::open_cells`), at the median, the 95th and 99th
-    /// percentiles and the longest.
+    /// MISPREDICTED CELLS.
     wrong_cells: u64,
     cell_life_p50_us: u64,
     cell_life_p95_us: u64,
@@ -725,8 +667,7 @@ struct Tally {
     stats: Stats,
 }
 
-/// What a run is: the far end, its integration, the link, the mode and the
-/// variant.
+/// What a run is: the far end, its integration, the link, the mode and the variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run {
     editor: Editor,
@@ -749,14 +690,10 @@ impl Run {
     }
 }
 
-/// Whether row `text` with the cursor drawn at `cursor` shows `t`: its text,
-/// and its cursor where the cursor is on its row (a cursor on another row, just
-/// after a terminator, says nothing about this one).
 fn shows(text: &[char], cursor: (u16, u16), t: &Truth) -> bool {
     text == t.text.as_slice() && (cursor.0 != t.row || cursor == t.cursor)
 }
 
-/// The measurement's view of a frame: per row asked for, `A`'s text and `D`'s.
 struct View {
     rows: Vec<(u16, Vec<char>, Vec<char>)>,
 }
@@ -783,7 +720,6 @@ impl View {
     }
 }
 
-/// The metrics' state across a run's frames.
 struct Meter<'s> {
     script: &'s Script,
     timeline: &'s Timeline,
@@ -796,11 +732,7 @@ struct Meter<'s> {
     /// The cells wrong at the last frame, while an episode runs.
     wrong: Option<u64>,
     wrong_run: Duration,
-    /// Each cell wrong at the last frame, and the frame it went wrong at: a
-    /// cell's LIFETIME runs from the first frame that shows it wrong to the
-    /// first that does not, whatever glyphs it shows wrong meanwhile (a cell
-    /// wrong under one guess and then under the next is one wrong cell to the
-    /// eye).
+    /// Each cell wrong at the last frame.
     open_cells: Vec<((u16, u16), Duration)>,
     /// The lifetimes of the cells that went right again, in microseconds.
     cell_lives: Vec<u64>,
@@ -808,14 +740,10 @@ struct Meter<'s> {
     tally: Tally,
 }
 
-/// `d` in microseconds, as the tallies keep injected time.
 fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
-/// The `q`th percentile of `sorted` (ascending), nearest rank rounded up: the
-/// median and the 95th percentile the perceived latency always quoted, and the
-/// lifetimes' 99th.
 fn percentile(sorted: &[u64], q: usize) -> u64 {
     sorted
         .get((sorted.len().saturating_sub(1) * q).div_ceil(100))
@@ -824,10 +752,6 @@ fn percentile(sorted: &[u64], q: usize) -> u64 {
 }
 
 impl Meter<'_> {
-    /// The states the line on row `row` passes through, as far as it has been
-    /// typed: from the screen its first key met (the terminator before it, or
-    /// the first prompt) to the newest key pressed whose truth is on that row,
-    /// searched back no further than the line before the newest key's.
     fn line_states(&self, row: u16) -> (Vec<&Truth>, &Truth) {
         let s = self.script;
         let newest = self.pressed.checked_sub(1);
@@ -859,8 +783,6 @@ impl Meter<'_> {
         (states, s.truth.get(m).unwrap_or(&s.initial))
     }
 
-    /// Measure the frame `sim` just drew, at `now`; `press` names the key
-    /// whose press drew it, if one did.
     fn frame(&mut self, sim: &Sim, now: Duration, press: Option<usize>) {
         let dt = now.saturating_sub(self.last);
         if let Some(cells) = self.wrong {
@@ -908,8 +830,6 @@ impl Meter<'_> {
                     .map(|(c, _)| (row, u16::try_from(c).unwrap_or(u16::MAX))),
             );
             if cells_now.len() == before {
-                // Every painted cell is one of the line's own glyphs: the drawn
-                // cursor is what no state of the line shows.
                 cells_now.push((row, if drawn.0 == row { drawn.1 } else { 0 }));
             }
             let cells = (cells_now.len() - before) as u64;
@@ -991,7 +911,6 @@ impl Meter<'_> {
         self.wrong = None;
     }
 
-    /// The per-key numbers, once every key has settled.
     fn finish(mut self) -> Tally {
         if self.wrong.is_some() {
             self.end_episode();
@@ -1053,8 +972,6 @@ impl Meter<'_> {
     }
 }
 
-/// Run `script` over `timeline` as `run` says: the theorem's clauses checked on
-/// every frame for a variant with every rule in force.
 fn measure(script: &Script, timeline: &Timeline, run: Run) -> Result<Tally, String> {
     let mut sim = Sim::sized(config(run.editor, run.integration, run.mode), ROWS, COLS);
     sim.corpus_shell(&VOCAB);
@@ -1182,7 +1099,6 @@ fn per_k(a: u64, presses: u64) -> f64 {
     }
 }
 
-/// One run's line of the report.
 fn report_line(run: Run, t: &Tally) -> String {
     let mut by = String::new();
     for (c, name) in CLASSES.iter().enumerate() {
@@ -1222,7 +1138,6 @@ fn report_line(run: Run, t: &Tally) -> String {
     )
 }
 
-/// The cost line of a set of runs.
 fn cost_line(name: &str, c: &Cost) -> String {
     let mean = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     format!(
@@ -1259,8 +1174,6 @@ fn the_corpus_is_the_region_probe_s() {
     );
 }
 
-/// Every run of the main matrix, in report order: each far end and
-/// integration, each link, each mode, each variant.
 fn main_runs() -> Vec<Run> {
     let mut runs = Vec::new();
     for editor in [Editor::Zle, Editor::Readline] {
@@ -1283,8 +1196,6 @@ fn main_runs() -> Vec<Run> {
     runs
 }
 
-/// `runs` over `lines`, every core busy, each with the script of its far end
-/// and integration (`switch`: the switch corpus).
 fn measure_all(lines: &[Line], runs: &[Run], switch: bool) -> Vec<Result<Tally, String>> {
     let mut worlds: Vec<(Editor, bool)> = runs.iter().map(|r| (r.editor, r.integration)).collect();
     worlds.sort_by_key(|&(e, i)| (format!("{e:?}"), i));
@@ -1302,7 +1213,6 @@ fn measure_all(lines: &[Line], runs: &[Run], switch: bool) -> Vec<Result<Tally, 
     })
 }
 
-/// Every run's tally, or every broken clause at once.
 fn tallies(runs: &[Run], results: Vec<Result<Tally, String>>) -> Vec<(Run, Tally)> {
     let mut broken = Vec::new();
     let mut out = Vec::new();
@@ -1321,9 +1231,6 @@ fn tallies(runs: &[Run], results: Vec<Result<Tally, String>>) -> Vec<(Run, Tally
     out
 }
 
-/// `Full`'s count of keys shown before their echo in each run of the main
-/// matrix at landing (assertion 3, a ratchet): `(editor, integration, rtt,
-/// mode, keys)`.
 const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
     (Editor::Zle, true, 1, PredictMode::Adaptive, 0),
     (Editor::Zle, true, 1, PredictMode::Always, 6538),
@@ -1391,7 +1298,6 @@ const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
     (Editor::Readline, false, 600, PredictMode::Always, 5192),
 ];
 
-/// THE EDITING WIN, the main matrix: the report, and the assertions on it.
 #[test]
 fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     let lines = corpus();
@@ -1652,10 +1558,6 @@ fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     );
 }
 
-/// Assertion 4: a cooked tty echoes `^[[D` for `←`, and readline's overwrite
-/// mode replaces where the others shift, so under either the class ladder never
-/// proves the class, and nothing of it is shown, on the corpus lines that use
-/// arrows and edit inside the text (`EDITING_FAMILIES`).
 #[test]
 fn a_cooked_tty_shows_no_motion_and_overwrite_mode_no_shift() {
     let lines: Vec<Line> = corpus()
@@ -1724,8 +1626,6 @@ fn a_cooked_tty_shows_no_motion_and_overwrite_mode_no_shift() {
     }
 }
 
-/// THE LADDER'S DECISION, measured: the class proofs end with their epoch
-/// (`Full`), or stay for the session (`Sticky`).
 #[test]
 fn class_proofs_end_with_their_line() {
     let lines = corpus();

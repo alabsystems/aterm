@@ -20,7 +20,8 @@ pub(crate) fn install_signal_handlers_as(arming: Arming) {
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerOwner {
-    /// The installed.
+    /// The installed `.app` bundle running windowed and, when it arrived through an update
+    /// handoff, past its Commit: the daily driver.
     App,
     /// Everything else.
     Other,
@@ -39,7 +40,8 @@ impl MarkerOwner {
         }
     }
 
-    /// Whether this owner's dead ([`markers::sweep`]).
+    /// Whether this owner's dead, empty marker is news to a `scan` launch's sweep
+    /// ([`markers::sweep`]).
     #[cfg(unix)]
     pub(crate) const fn is_news_to(self, scan: MarkerOwner) -> bool {
         match self {
@@ -64,7 +66,7 @@ pub(crate) enum Arming {
 }
 
 impl Arming {
-    /// The arming of a launch ([`Arming::Lab`]).
+    /// The arming of a launch; a lab desk's launch arms as [`Arming::Lab`] whatever else holds.
     #[must_use]
     pub(crate) const fn for_launch(
         installed_bundle: bool,
@@ -366,7 +368,7 @@ pub(crate) mod markers {
         dead_markers_of(dir, own_pid, MarkerOwner::App)
     }
 
-    /// Dead, empty markers of `owner` in `dir` ([`dead_app_markers`], [`MarkerOwner::Lab`]).
+    /// Dead, empty markers of `owner` in `dir` (`dead_app_markers`, [`MarkerOwner::Lab`]).
     #[must_use]
     pub(crate) fn dead_markers_of(dir: &Path, own_pid: u32, owner: MarkerOwner) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -605,7 +607,8 @@ mod imp {
         }
         let mut off = 0usize;
         while off < bytes.len() {
-            // SAFETY: `bytes[off..]` is live for the call and `fd` is non-negative.
+            // SAFETY: `bytes[off..]` is live for the call and `fd` is non-negative; `write` is
+            // async-signal-safe.
             let n = unsafe {
                 libc::write(
                     fd,
@@ -618,7 +621,8 @@ mod imp {
                 continue;
             }
             if n < 0 {
-                // SAFETY: `errno_location()` returns a valid, thread-local `*mut c_int`.
+                // SAFETY: `errno_location()` returns a valid, thread-local `*mut c_int`; reading
+                // it on this thread is sound and async-signal-safe.
                 let err = unsafe { *errno_location() };
                 if err == libc::EINTR {
                     continue;
@@ -628,7 +632,6 @@ mod imp {
         }
     }
 
-    /// # Safety The returned pointer is valid for the calling thread only.
     /// # Safety
     /// The returned pointer is valid for the calling thread only.
     #[inline]
@@ -657,7 +660,8 @@ mod imp {
             write_all_signal_safe(fd, BANNER_SUFFIX);
         }
 
-        // SAFETY: `act` is a zeroed `sigaction` with `SIG_DFL`.
+        // SAFETY: `act` is a zeroed `sigaction` with `SIG_DFL`; `sigaction` and `raise` are
+        // async-signal-safe.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
@@ -1164,7 +1168,8 @@ mod imp_windows {
         while off < bytes.len() {
             let mut written = 0u32;
             let len = u32::try_from(bytes.len() - off).unwrap_or(u32::MAX);
-            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param.
+            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param; `WriteFile`
+            // allocates nothing on our side, so a possibly corrupt heap does not matter.
             let ok = unsafe {
                 WriteFile(
                     handle,
@@ -1185,7 +1190,9 @@ mod imp_windows {
         let mut code = 0u32;
         let mut address = 0u64;
         let mut av: Option<(&[u8], u64)> = None;
-        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers.
+        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers; the
+        // record's fixed `#[repr(C)]` layout and the `number_parameters` check keep the
+        // `exception_information` reads in bounds.
         unsafe {
             if !info.is_null() {
                 let rec = (*info).exception_record;

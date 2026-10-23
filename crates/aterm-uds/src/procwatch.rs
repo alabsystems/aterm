@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session `exec` process watcher ([`ProcWatch::new`], [`ProcWatch::open`],
-//! [`ProcWatch::fd`], [`ProcWatch::drain`], [`ProcWatch::follow`],
-//! [`ProcWatch::scripted`], [`ProcScript`], [`ProcEvent::Exec`], [`MAX_CHILDREN`],
-//! [`NoWatch`]).
+//! Session `exec` process watcher ([`ProcWatch::new`](crate::procwatch::ProcWatch::new), [`ProcWatch::open`](crate::procwatch::ProcWatch::open),
+//! [`ProcWatch::fd`](crate::procwatch::ProcWatch::fd), [`ProcWatch::drain`](crate::procwatch::ProcWatch::drain), [`ProcWatch::follow`](crate::procwatch::ProcWatch::follow),
+//! [`ProcWatch::scripted`](crate::procwatch::ProcWatch::scripted), [`ProcScript`](crate::procwatch::ProcScript), [`ProcEvent::Exec`](crate::procwatch::ProcEvent::Exec), [`MAX_CHILDREN`](crate::procwatch::MAX_CHILDREN),
+//! [`NoWatch`](crate::procwatch::NoWatch)).
 
 #[cfg(target_vendor = "apple")]
 use crate::exitwatch::kq;

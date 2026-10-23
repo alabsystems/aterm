@@ -32,7 +32,11 @@ fn scratch_home(name: &str) -> aterm_tempfile::TempDir {
 }
 
 fn rollout_in(home: &Path, day: &str, thread: &str) -> PathBuf {
-    let dir = home.join(day);
+    // Joined name by name, so the path is spelled as `rollout_path` spells it
+    // (its fingerprint is the watermark's) on Windows too.
+    let dir = day
+        .split('/')
+        .fold(home.to_path_buf(), |dir, name| dir.join(name));
     std::fs::create_dir_all(&dir).expect("day folder");
     dir.join(format!("rollout-2025-10-19T22-03-11-{thread}.jsonl"))
 }

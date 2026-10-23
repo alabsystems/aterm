@@ -1,8 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
-// src/outline/mod.rs (`OutlineGlyphCollection`, `draw_unscaled`), Copyright
 //
-// Fontations Developers, MIT OR Apache-2.0 (see ../../LICENSE-FONTATIONS), modified by aterm.
+// The CFF adapters below are derived from read-fonts 0.43.2 src/ps/cs.rs
+// (`TransformSink`'s unscaled path, `NopFilterSink`) and skrifa 0.46.2
+// src/outline/mod.rs (`OutlineGlyphCollection`, `draw_unscaled`), Copyright
+// (c) 2019 Fontations Developers, MIT OR Apache-2.0 (see
+// ../../LICENSE-FONTATIONS), modified by the aterm project in 2026. The rest
+// of this file is aterm's.
 
 //! The face as the hinter reads it: skrifa's outline collection and font attributes.
 

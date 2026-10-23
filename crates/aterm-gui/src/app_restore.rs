@@ -592,7 +592,7 @@ impl App {
         }
     }
 
-    /// Projects a terminal or native split tab into a recursive v2 [`restore::TabRestore`] descriptor.
+    /// Projects a terminal or native split tab into a recursive v2 [`restore::RestoredTab`] descriptor.
     pub(crate) fn tab_restore_descriptor(
         &self,
         tab: &crate::tab_model::Tab,
@@ -665,7 +665,7 @@ impl App {
         })
     }
 
-    /// Projects a single native view leaf into its [`restore::ViewRestore`] descriptor.
+    /// Projects a single native view leaf into its [`restore::RestoredView`] descriptor.
     pub(crate) fn view_restore_descriptor(
         &self,
         view: crate::tab_model::ViewId,

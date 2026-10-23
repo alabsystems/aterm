@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's control socket keeps answering new clients however many persistent drivers hold connections to it, over the real socket of a headless instance of the one `aterm` binary.
+//! The window's control socket keeps answering new clients however many persistent drivers hold
+//! connections to it.
 
 #![cfg(unix)]
 #![allow(
@@ -23,44 +24,25 @@ mod ctl_accept;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The server's request lanes (`CONTROL_WORKERS` in `aterm-gui/src/control.rs`),
-/// its wait lanes (`CONTROL_WAIT_WORKERS`) and the request lanes that may serve
-/// a wait at once (`CONTROL_INLINE_WAITS`: what the artifact captures,
-/// `ARTIFACT_HANDOFF_LIMIT` of them, leave of the request lanes, less one):
-/// where the negative control expects a wait to be told busy, spelled here
-/// because the wire does not say it.
 const RPC_LANES: usize = 8;
 const WAIT_LANES: usize = 64;
 const ARTIFACT_CAPTURES: usize = 4;
 const INLINE_WAITS: usize = RPC_LANES - ARTIFACT_CAPTURES - 1;
 
-/// The busy reply, word for word (`aterm_types::control_verbs::CONTROL_BUSY_REPLY`:
-/// the listener's to a connection it cannot admit, a lane's to a wait none of
-/// its lanes may take).
 const BUSY: &str = "ERR control server busy; retry";
 
-/// How long a wait for something that must happen may take before it is read as a hang
-/// (AGENTS.md).
 const HANG: Duration = Duration::from_secs(60);
 
-/// The soft descriptor limit launchd gives an app it starts (the Dock, Finder,
-/// `open`): the window's own budget, which aterm does not raise.
 const LAUNCHD_SOFT_LIMIT: u64 = 256;
 
-/// A limit roomy enough that the connection cap (a quarter of it, at most 1024) is never what a
-/// test about the lanes runs into.
 const ROOMY_SOFT_LIMIT: u64 = 4_096;
 
-/// The open-connection cap the server derives from a soft descriptor limit
-/// (`control_connections_cap` in `control.rs`), spelled here because the wire
-/// does not say it.
 fn connection_cap(soft_limit: u64) -> usize {
     usize::try_from(soft_limit / 4)
         .unwrap_or(usize::MAX)
         .clamp(RPC_LANES, 1_024)
 }
 
-/// This process's soft and hard `RLIMIT_NOFILE`.
 fn descriptor_limits() -> (u64, u64) {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -72,8 +54,6 @@ fn descriptor_limits() -> (u64, u64) {
     (limit.rlim_cur, limit.rlim_max)
 }
 
-/// Give this test process room for every connection its tests hold at once (they run in
-/// parallel in one process), whatever shell started the suite.
 fn roomy_test_process() {
     let (soft, hard) = descriptor_limits();
     let wanted = ROOMY_SOFT_LIMIT.min(hard);
@@ -82,12 +62,12 @@ fn roomy_test_process() {
             rlim_cur: wanted,
             rlim_max: hard,
         };
-        // SAFETY: a valid resource id and a borrowed, initialized rlimit; raising the soft limit up to the hard one needs no privilege.
+        // SAFETY: a valid resource id and a borrowed, initialized rlimit; raising the soft limit up
+        // to the hard one needs no privilege.
         let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
     }
 }
 
-/// The scratch world, removed on drop.
 struct World(PathBuf);
 
 impl Drop for World {
@@ -96,8 +76,6 @@ impl Drop for World {
     }
 }
 
-/// The instance, killed and reaped on drop, with the lifeline that takes it
-/// down if this test process dies first.
 struct Reaped(Child, Option<aterm_uds::lifeline::Lifeline>);
 
 impl Drop for Reaped {
@@ -108,8 +86,6 @@ impl Drop for Reaped {
     }
 }
 
-/// A scratch world of its own per test: the tests of this binary run in
-/// parallel, each against its own instance.
 fn world(tag: &str) -> World {
     let name = format!("atln{tag}-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
@@ -125,8 +101,6 @@ fn world(tag: &str) -> World {
     could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
-/// Boot a headless instance on `sock` under a soft descriptor limit of
-/// `soft_limit` (the hard limit kept; COULD NOT RUN when it cannot have it).
 fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
     let (_, hard) = descriptor_limits();
     if hard < soft_limit {
@@ -150,7 +124,9 @@ fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
         rlim_cur: soft_limit,
         rlim_max: hard,
     };
-    // SAFETY: the hook runs in the forked child before `exec`; it only calls `setrlimit` (async-signal-safe, no allocation) on a value copied in, and `last_os_error` reads errno without allocating.
+    // SAFETY: the hook runs in the forked child before `exec`; it only calls `setrlimit`
+    // (async-signal-safe, no allocation) on a value copied in, and `last_os_error` reads errno
+    // without allocating.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == 0 {
@@ -182,7 +158,6 @@ fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
     (child, soft_limit)
 }
 
-/// The instance's token, read from beside its socket.
 fn token(sock: &Path) -> String {
     let path = format!("{}.token", sock.display());
     std::fs::read_to_string(&path)
@@ -191,21 +166,15 @@ fn token(sock: &Path) -> String {
         .to_string()
 }
 
-/// One persistent, authenticated control connection, driven the way
-/// `RelayCtl` drives it: a request line, then its one status line.
 struct Driver {
     reader: BufReader<UnixStream>,
 }
 
 impl Driver {
-    /// Dial and authenticate; nothing is read yet (the server's reply to a
-    /// refused connection is the first line the next request reads).
     fn open(sock: &Path, token: &str) -> Self {
         Self::try_open(sock, token).unwrap_or_else(|e| panic!("dial the control socket: {e}"))
     }
 
-    /// Dial and say nothing: a peer the server gives its handshake time to
-    /// (30 s from admission to present a token), in the parker, not on a lane.
     fn silent(sock: &Path) -> Self {
         let stream =
             UnixStream::connect(sock).unwrap_or_else(|e| panic!("dial the control socket: {e}"));
@@ -225,10 +194,6 @@ impl Driver {
         Ok(driver)
     }
 
-    /// Dial, authenticate and have one `version` answered. A refusal while the request lanes
-    /// are briefly full of work (a burst of connections authenticating on a loaded machine) is
-    /// the busy line clients retry on, so it is retried; one that lasts fails at the hang
-    /// detector with the server's last words.
     fn established(sock: &Path, token: &str) -> Result<Self, String> {
         let deadline = Instant::now() + HANG;
         loop {
@@ -253,21 +218,14 @@ impl Driver {
         self.reader.get_ref()
     }
 
-    /// Write one request line. A failed write is not the verdict: a connection
-    /// the listener refused may be closed before the line lands (`EPIPE`), and
-    /// its busy line is still there for the next read, which decides.
     fn send(&mut self, line: &str) {
         self.send_raw(format!("{line}\n").as_bytes());
     }
 
-    /// Write `bytes` as they are: part of a request, its newline still to come.
     fn send_raw(&mut self, bytes: &[u8]) {
         let _ = self.stream().write_all(bytes);
     }
 
-    /// A reply already waiting on the connection, read without blocking: the listener writes
-    /// its busy line before it accepts the next peer, so once a later peer is answered, a
-    /// refused connection holds that line.
     fn waiting_reply(&mut self) -> Option<String> {
         self.stream()
             .set_nonblocking(true)
@@ -302,16 +260,10 @@ impl Driver {
     }
 }
 
-/// Bound every read on `stream`. macOS refuses the option (`EINVAL`) on a
-/// socket its peer has already closed — a connection the listener refused and
-/// dropped at once — and a read there cannot block anyway: it returns the busy
-/// line, then end-of-file.
 fn bound_reads(stream: &UnixStream, timeout: Duration) {
     let _ = stream.set_read_timeout(Some(timeout));
 }
 
-/// A fresh one-shot client: AUTH and `version` in one write (as `aterm-ctl` sends them); the
-/// first reply line, even after a failed write.
 fn probe(sock: &Path, token: &str) -> String {
     let mut stream = match UnixStream::connect(sock) {
         Ok(stream) => stream,
@@ -328,17 +280,10 @@ fn probe(sock: &Path, token: &str) -> String {
     }
 }
 
-/// Whether a read error is the listener's close. Linux answers a read on a
-/// connection closed with input still unread (a wait refused busy, its request
-/// line never read) with `ECONNRESET` once, then end-of-file; macOS with
-/// end-of-file.
 fn hung_up(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::ConnectionReset
 }
 
-/// A fresh idle driver: dialled, authenticated and served one `version` (reads
-/// bounded at [`HANG`], as a [`probe`]'s are: a refused one reads its busy line
-/// at once), or the reply that refused it.
 fn idle_driver(sock: &Path, token: &str) -> Result<Driver, String> {
     let mut driver = Driver::try_open(sock, token).map_err(|e| format!("<dial error: {e}>"))?;
     bound_reads(driver.stream(), HANG);
@@ -350,9 +295,6 @@ fn idle_driver(sock: &Path, token: &str) -> Result<Driver, String> {
     }
 }
 
-/// [`idle_driver`] below the socket's cap: a busy line there is a moment (a
-/// lane still placing an earlier connection), dialled again until served — a
-/// [`HANG`] detector.
 fn idle_driver_below_cap(sock: &Path, token: &str) -> Result<Driver, String> {
     aterm_spec::wait::within(HANG, Duration::from_millis(50), || {
         match idle_driver(sock, token) {
@@ -363,18 +305,12 @@ fn idle_driver_below_cap(sock: &Path, token: &str) -> Result<Driver, String> {
     .unwrap_or_else(|| Err(BUSY.to_string()))
 }
 
-/// Text no row of this idle instance holds, until a test types it into the
-/// session.
 const WAIT_TEXT: &str = "zq-no-row-holds-this-qz";
 
-/// A wait the server can only end at its timeout (or when a test types
-/// [`WAIT_TEXT`]): `await match` for text no row of this idle instance holds.
 fn long_wait(timeout_ms: u64) -> String {
     format!("await match {WAIT_TEXT} timeout {timeout_ms}")
 }
 
-/// One wait the socket admitted, on a fresh connection, and the probe that followed it:
-/// `(wait, probe reply)`.
 fn admitted_wait(sock: &Path, token: &str, wait_ms: u64, reopened: &mut usize) -> (Driver, String) {
     loop {
         let mut wait = Driver::open(sock, token);
@@ -400,8 +336,6 @@ fn admitted_wait(sock: &Path, token: &str, wait_ms: u64, reopened: &mut usize) -
     }
 }
 
-/// A fresh client's answer below the socket's limits: a busy probe is a moment, probed again
-/// until it clears.
 fn answered(sock: &Path, token: &str) -> String {
     let mut reply = probe(sock, token);
     let deadline = Instant::now() + HANG;
@@ -416,8 +350,6 @@ fn answered(sock: &Path, token: &str) -> String {
 fn idle_and_waiting_drivers_do_not_starve_a_new_client() {
     const IDLE: usize = 12;
     const WAITING: usize = 12;
-    /// The waits' own timeout: a fresh client queued behind them would be
-    /// answered only when they end, far past a probe's [`HANG`] read bound.
     const WAIT_MS: u64 = 180_000;
 
     roomy_test_process();
@@ -628,9 +560,6 @@ fn the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open() {
     drop(waits);
 }
 
-/// `aterm ctl --sock <sock> <args…>` in the world's isolation, asked again, a fresh client
-/// each time, while the instance has not yet accepted it ([`ctl_accept::until_accepted`]): the
-/// client's own 10 s accept budget is a person's, and a loaded machine can miss it.
 fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
     ctl_accept::until_accepted(|| {
         let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -649,8 +578,6 @@ fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
 fn waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back() {
     const IDLE: usize = 16;
     const PAST: usize = 4;
-    /// Far longer than the test, so only a hangup can end these waits in time (checked below):
-    /// a wait that ended on its own would pass the drain vacuously.
     const WAIT_MS: u64 = 180_000;
 
     roomy_test_process();
@@ -797,8 +724,6 @@ fn waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back
     }
 }
 
-/// A wait with `version` right behind it on its own connection, in one write or, with
-/// `relay_shape`, as `RelayClient::write_line` writes (each line, then its newline).
 fn pipelined_wait(
     sock: &Path,
     token: &str,
@@ -847,8 +772,6 @@ fn pipelined_wait(
     }
 }
 
-/// One wait that ends on its own soon, with `version` behind it in the same write:
-/// `(wait, version)`.
 fn carried_timeout(sock: &Path, token: &str, text: &str) -> Result<(String, String), String> {
     for _ in 0..40 {
         let stream =
@@ -881,9 +804,6 @@ fn carried_timeout(sock: &Path, token: &str, text: &str) -> Result<(String, Stri
 #[test]
 fn pipelined_waits_are_held_while_wait_lanes_are_free() {
     const PIPELINED: usize = 2 * RPC_LANES;
-    /// The waits' own timeout: a hang bound they never reach. They end by the
-    /// event they wait for (the text typed below), so the test takes as long as
-    /// the server takes, not as long as a wait's clock.
     const WAIT_MS: u64 = 180_000;
 
     roomy_test_process();
@@ -965,8 +885,6 @@ fn pipelined_waits_are_held_while_wait_lanes_are_free() {
     }
 }
 
-/// Read until a line that starts with `upto` has arrived: the count of bytes
-/// before that line, and the line itself.
 fn read_through(reader: &mut BufReader<UnixStream>, upto: &str) -> (usize, String) {
     let mut before = 0;
     loop {
@@ -982,7 +900,6 @@ fn read_through(reader: &mut BufReader<UnixStream>, upto: &str) -> (usize, Strin
 
 #[test]
 fn peers_that_stop_mid_exchange_take_no_lane() {
-    /// Of each kind: twice the request lanes.
     const EACH: usize = 2 * RPC_LANES;
 
     roomy_test_process();
@@ -1069,11 +986,6 @@ fn peers_that_stop_mid_exchange_take_no_lane() {
     drop(silent);
 }
 
-/// THE TWO WAYS A LIVE TEST ASKS, on answers made here: [`ctl_accept::until_served`] (every
-/// other live test's) asks again on a missed accept and on the busy line, neither of which
-/// served anything, and returns the first answer that is neither, a failure included;
-/// [`ctl_accept::until_accepted`] (this file's, whose verdicts are the busy line) returns the
-/// busy line as it stands.
 #[test]
 fn a_busy_answer_is_asked_again_where_it_is_not_the_verdict() {
     use std::os::unix::process::ExitStatusExt as _;

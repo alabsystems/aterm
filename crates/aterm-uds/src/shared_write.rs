@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Whether an account other than this one can write a file or directory: any other-write bit, or a group-write bit unless the group is this user's own private group and nothing past the mode widens it.
+//! Whether an account other than this one can write a file or directory: any other-write bit,
+//! or a group-write bit unless the group is this user's own private group and nothing past the
+//! mode widens it.
 
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt as _;
@@ -20,7 +22,7 @@ pub struct Group {
     pub members: Vec<Vec<u8>>,
 }
 
-/// Whether an account other than this process's effective one can write the open `file`: [`others_can_write_as`] over its owner, group and mode, whether it carries an access ACL and the type of the filesystem it is on, all read from this one descriptor, with this system's account databases saying which group is this user's private one.
+/// Whether an account other than this process's effective one can write the open `file`.
 /// # Errors
 /// The `fstat` that reads its owner, group and mode failed.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -29,7 +31,7 @@ pub fn others_can_write(file: &std::fs::File) -> std::io::Result<bool> {
     Ok(judge(&md, acl::on_file(file), filesystem::of_file(file)))
 }
 
-/// [`others_can_write`] for what `path` itself names, a final symbolic link not followed (`lstat`, `lgetxattr`): the install-path walk judges each component as it stands.
+/// [`others_can_write`] for what `path` itself names, a final symbolic link not followed.
 /// # Errors
 /// The `lstat` of `path` failed.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -52,7 +54,7 @@ fn judge(md: &std::fs::Metadata, acl: bool, magic: Option<u32>) -> bool {
     )
 }
 
-/// Whether an account other than `me` can write a file or directory `owner` owns on group `gid` with `mode`, `widened` saying whether something past the mode may let other accounts write it (an extended access ACL, whose mask its group bits would be, or a remote filesystem): any other-write bit, or a group-write bit unless the file is `me`'s, is not widened, and `private` says `gid` is `me`'s private group.
+/// Whether an account other than `me` can write a path owned by `owner` on group `gid` with `mode`.
 #[must_use]
 pub fn others_can_write_as(
     me: u32,
@@ -65,22 +67,14 @@ pub fn others_can_write_as(
     mode & 0o022 != 0 && !(mode & 0o002 == 0 && owner == me && !widened && private(gid))
 }
 
-/// The POSIX access ACL's attribute: ext4, XFS, Btrfs and tmpfs keep it, and NFSv3 reads it
-/// through its ACL side protocol.
 const POSIX_ACL: &CStr = c"system.posix_acl_access";
 
-/// The extended-ACL attributes Linux exposes: [`POSIX_ACL`], and the NFSv4 ACL an NFSv4 mount
-/// reads from its server.
 const ACL_ATTRIBUTES: [&CStr; 2] = [POSIX_ACL, c"system.nfs4_acl"];
 
-/// `<errno.h>`'s `ENODATA` on Linux (the asm-generic value aarch64, x86_64, arm and riscv
-/// share): the file has no such attribute.
 const ENODATA: i32 = 61;
-/// `<errno.h>`'s `ENOTSUP` (`EOPNOTSUPP`) on Linux, as [`ENODATA`]: the filesystem keeps no
-/// such attribute.
 const ENOTSUP: i32 = 95;
 
-/// Whether a file carries an extended access ACL, by what `answer` says the length query of each ACL attribute returned: `None` it exists, `Some(errno)` it failed.
+/// Whether a file carries an extended access ACL, based on `answer`'s attribute length queries.
 #[must_use]
 pub fn acl_carried(mut answer: impl FnMut(&CStr) -> Option<i32>) -> bool {
     ACL_ATTRIBUTES
@@ -88,7 +82,7 @@ pub fn acl_carried(mut answer: impl FnMut(&CStr) -> Option<i32>) -> bool {
         .any(|name| !matches!(answer(name), Some(ENODATA | ENOTSUP)))
 }
 
-/// The `statfs` `f_type` of each network and FUSE filesystem the rule knows: NFS, SMB/CIFS (both of its magics), Ceph, AFS (kAFS and OpenAFS), 9P, Lustre, GPFS and FUSE (`fuseblk` and virtiofs included), from `<linux/magic.h>` and Lustre's and GPFS's own.
+/// The `statfs` `f_type` of each network and FUSE filesystem the rule knows.
 pub const REMOTE_FILESYSTEMS: [u32; 10] = [
     0x6969,
     0xFF53_4D42,
@@ -102,14 +96,12 @@ pub const REMOTE_FILESYSTEMS: [u32; 10] = [
     0x6573_5546,
 ];
 
-/// Whether a filesystem of type `magic` (`statfs`'s `f_type`) is a network or FUSE one ([`REMOTE_FILESYSTEMS`]), where a server or daemon decides who can write.
+/// Whether a filesystem of type `magic` (`statfs`'s `f_type`) is a network or FUSE one.
 #[must_use]
 pub fn remote_filesystem(magic: u32) -> bool {
     REMOTE_FILESYSTEMS.contains(&magic)
 }
 
-/// Whether the filesystem whose type `magic` read is remote, an unreadable type (`None`)
-/// counting as one.
 fn remote(magic: Option<u32>) -> bool {
     magic.is_none_or(remote_filesystem)
 }
@@ -133,7 +125,7 @@ pub fn user_private_group(
         && primaries.iter().all(|&other| other == uid)
 }
 
-/// [`user_private_group`] for this process's effective uid, over the system's account databases (NSS: `getpwuid_r`, `getgrgid_r`, then the passwd enumeration, `getpwent_r`).
+/// [`user_private_group`] for this process's effective uid, over the system's account databases.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn is_user_private_group(gid: u32) -> bool {
@@ -146,8 +138,6 @@ pub fn is_user_private_group(gid: u32) -> bool {
     )
 }
 
-/// [`user_private_group`] over what `account`, `group` and `primaries` read for `uid` and
-/// `gid`.
 fn private_group_by(
     uid: u32,
     gid: u32,
@@ -182,7 +172,6 @@ mod nss {
     }
 
     impl PasswdRecord {
-        /// A record for a lookup to fill.
         fn empty() -> Self {
             Self {
                 pw_name: std::ptr::null_mut(),
@@ -205,13 +194,10 @@ mod nss {
         gr_mem: *mut *mut c_char,
     }
 
-    /// `<errno.h>`'s `ENOENT` on Linux: `getpwent_r`'s end of the enumeration.
     const ENOENT: c_int = 2;
-    /// `<errno.h>`'s `ERANGE` on Linux: the record buffer is too small.
     const ERANGE: c_int = 34;
 
     unsafe extern "C" {
-        /// `<pwd.h>`: the reentrant `getpwuid`.
         fn getpwuid_r(
             uid: u32,
             pwd: *mut PasswdRecord,
@@ -219,7 +205,6 @@ mod nss {
             buflen: usize,
             result: *mut *mut PasswdRecord,
         ) -> c_int;
-        /// `<grp.h>`: the reentrant `getgrgid`.
         fn getgrgid_r(
             gid: u32,
             grp: *mut GroupRecord,
@@ -227,22 +212,16 @@ mod nss {
             buflen: usize,
             result: *mut *mut GroupRecord,
         ) -> c_int;
-        /// `<pwd.h>`: rewind the passwd enumeration.
         fn setpwent();
-        /// `<pwd.h>`: the next passwd entry, into the caller's record and buffer: 0, `ENOENT`
-        /// at the end, `ERANGE` when the buffer cannot hold it (the next call answers the
-        /// same entry), or another error.
         fn getpwent_r(
             pwd: *mut PasswdRecord,
             buf: *mut c_char,
             buflen: usize,
             result: *mut *mut PasswdRecord,
         ) -> c_int;
-        /// `<pwd.h>`: close the passwd enumeration.
         fn endpwent();
     }
 
-    /// The largest record buffer a lookup grows to before it gives no answer.
     const RECORD_LIMIT: usize = 1 << 20;
 
     /// `uid`'s passwd name and primary group, or `None` when the system has no such account.
@@ -327,7 +306,7 @@ mod nss {
         Failed,
     }
 
-    /// The uids of every entry whose primary group is `gid`, over an enumeration that `next` steps with a record buffer of the size it is handed, or `None` when the walk fails: any answer but an entry or the end, or an entry no buffer up to [`RECORD_LIMIT`] holds.
+    /// Collect uids whose primary group is `gid` across the passwd enumeration `next`.
     pub(super) fn walk(gid: u32, mut next: impl FnMut(usize) -> Step) -> Option<Vec<u32>> {
         let mut size = 4096usize;
         let mut uids = Vec::new();
@@ -345,11 +324,9 @@ mod nss {
         }
     }
 
-    /// The passwd enumeration's one owner in this process: `setpwent`, `getpwent_r` and
-    /// `endpwent` walk one process-global stream.
     static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The uids of every passwd entry whose primary group is `gid`, or `None` when the enumeration fails ([`walk`]).
+    /// The uids of every passwd entry whose primary group is `gid`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) fn primary_members(gid: u32) -> Option<Vec<u32>> {
         let _walk = ENUMERATION
@@ -390,9 +367,7 @@ mod acl {
     use std::os::unix::ffi::OsStrExt as _;
 
     unsafe extern "C" {
-        /// `<sys/xattr.h>`: an open file's attribute; a zero `size` asks only its length.
         fn fgetxattr(fd: c_int, name: *const c_char, value: *mut c_void, size: usize) -> isize;
-        /// `<sys/xattr.h>`: a path's attribute, a final symbolic link not followed.
         fn lgetxattr(
             path: *const c_char,
             name: *const c_char,
@@ -401,8 +376,6 @@ mod acl {
         ) -> isize;
     }
 
-    /// What one attribute-length call that returned `ret` answered: `None` it succeeded,
-    /// else its errno.
     fn answered(ret: isize) -> Option<i32> {
         if ret >= 0 {
             None
@@ -437,7 +410,6 @@ mod acl {
     pub(super) fn grant_group_class(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         unsafe extern "C" {
-            /// `<sys/xattr.h>`: set a path's attribute.
             fn setxattr(
                 path: *const c_char,
                 name: *const c_char,
@@ -498,7 +470,6 @@ mod filesystem {
     }
 
     impl Statfs {
-        /// A record for a call to fill.
         fn empty() -> Self {
             Self {
                 f_type: 0,
@@ -506,8 +477,6 @@ mod filesystem {
             }
         }
 
-        /// `f_type` after a call that returned `ret`: its low 32 bits, every magic number's
-        /// width, or `None` when the call failed.
         fn magic(&self, ret: c_int) -> Option<u32> {
             if ret == 0 {
                 u32::try_from(self.f_type & 0xFFFF_FFFF).ok()
@@ -518,9 +487,7 @@ mod filesystem {
     }
 
     unsafe extern "C" {
-        /// `<sys/vfs.h>`: the filesystem a path is on, a final symbolic link followed.
         fn statfs(path: *const c_char, buf: *mut Statfs) -> c_int;
-        /// `<sys/vfs.h>`: the filesystem an open file is on.
         fn fstatfs(fd: c_int, buf: *mut Statfs) -> c_int;
     }
 
@@ -588,7 +555,7 @@ mod filesystem {
     }
 }
 
-/// Test seam (Linux): gives account `uid` the permissions of `path`'s group class through a POSIX access ACL whose mask is those same bits, so the mode reads as before, as `setfacl -m u:<uid>:<group bits>` would.
+/// Test seam (Linux): grant account `uid` `path`'s group-class permissions via a POSIX access ACL.
 /// # Errors
 /// The `stat` or the `setxattr` failed (`ENOTSUP` on a filesystem that keeps no ACLs).
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
@@ -596,14 +563,14 @@ pub fn grant_group_class_by_acl(path: &std::path::Path, uid: u32) -> std::io::Re
     acl::grant_group_class(path, uid)
 }
 
-/// Test seam (Linux): the type of the filesystem `path` is on, as the judge reads it, or `None` when it cannot be read.
+/// Test seam (Linux): the type of the filesystem `path` is on, as the judge reads it.
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 #[must_use]
 pub fn filesystem_type_at(path: &std::path::Path) -> Option<u32> {
     filesystem::at_path(path)
 }
 
-/// Test seam (Linux): the passwd enumeration [`is_user_private_group`] reads, the uids whose primary group is `gid`, or `None` when it fails.
+/// Test seam (Linux): return the passwd uids whose primary group is `gid`.
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 #[must_use]
 pub fn primary_members(gid: u32) -> Option<Vec<u32>> {
@@ -628,8 +595,6 @@ mod tests {
         }
     }
 
-    /// Ubuntu's own shape is admitted; each fact that lets another account into the group
-    /// refuses it, as does a fact the system cannot answer.
     #[test]
     fn only_a_group_no_other_account_can_hold_is_private() {
         let me = account("ann", 1000);
@@ -696,10 +661,6 @@ mod tests {
         }
     }
 
-    /// The reader the system's answer goes through: the enumeration of the accounts whose
-    /// primary group it is decides (another account there, or an enumeration that failed,
-    /// refuses a group every other fact admits), and it is asked only once the account and
-    /// the group admit the group.
     #[test]
     fn the_other_accounts_primary_groups_are_read_last_and_decide() {
         let me = || Some(account("ann", 1000));
@@ -736,11 +697,6 @@ mod tests {
         );
     }
 
-    /// Group-write is this user's own write only on this user's file in their private
-    /// group, with nothing past the mode widening it; world-write, another owner's file, any
-    /// other group, or a widening (an ACL, whose mask the group bits then are, or a remote
-    /// filesystem) lets another account in, and a mode without write bits for others never
-    /// asks about the group.
     #[test]
     fn only_a_private_groups_write_is_the_owners_own() {
         let private = |gid: u32| gid == 1000;
@@ -802,9 +758,6 @@ mod tests {
         );
     }
 
-    /// An access ACL is either attribute's: a file on NFSv4 (no POSIX attribute, an NFSv4
-    /// one) carries one as a POSIX-ACL'd file does; only "no such attribute" and "none kept
-    /// here" from both answer none, and any other failure of either answers one.
     #[test]
     fn an_access_acl_is_either_attributes() {
         const EIO: i32 = 5;
@@ -837,8 +790,6 @@ mod tests {
         }
     }
 
-    /// Every remote type takes the exemption back, as does a type that cannot be read; local
-    /// ones (ext4, tmpfs, Btrfs, XFS, overlayfs, procfs) keep it.
     #[test]
     fn a_remote_or_unknown_filesystem_widens_the_mode() {
         assert!(remote(None), "an unreadable type");
@@ -857,8 +808,6 @@ mod tests {
         }
     }
 
-    /// A path is judged as it stands, a final link not followed: a link reads as its own
-    /// `0777` (every Linux link's; Darwin's is set so here), never as the `0644` file it names.
     #[test]
     fn a_link_is_judged_as_it_stands_not_through() {
         use std::os::unix::fs::PermissionsExt as _;

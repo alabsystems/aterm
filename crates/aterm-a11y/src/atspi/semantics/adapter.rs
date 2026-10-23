@@ -2,9 +2,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from accesskit_atspi_common 0.19.0 (Apache-2.0) src/adapter.rs
-// and Chromium's accessibility abstraction (Copyright 2017 The Chromium Authors,
-// governed by LICENSE-CHROMIUM).
+// Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
+// Apache-2.0) src/adapter.rs, and changed by the aterm project in 2026.
+//
+// Derived from Chromium's accessibility abstraction.
+// Copyright 2017 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE-CHROMIUM file.
 
 //! Window accessibility tree adapter for AT-SPI.
 

@@ -2246,8 +2246,12 @@ fn stage_failure_is_a_verdict(error: &str) -> bool {
     !crate::is_passing_refusal(error)
 }
 
+/// Whether a start probe's `error` says it started the candidate and saw no exit of its own:
+/// killed at its ceiling, a wait that failed, or a signal's end ([`verify::START_PROBE_SIGNALLED`],
+/// a verdict too). Its candidate stays where it ran.
 fn probe_left_unproven(error: &str) -> bool {
-    !stage_failure_is_a_verdict(error) && !error.starts_with("spawn ")
+    error.starts_with(verify::START_PROBE_SIGNALLED)
+        || (!stage_failure_is_a_verdict(error) && !error.starts_with("spawn "))
 }
 
 fn unproven_candidate_path(staging: &Staging) -> PathBuf {
@@ -3193,7 +3197,9 @@ fn verify_and_publish_incoming(
     };
     if let Err(error) = probed {
         if stage_failure_is_a_verdict(&error) {
-            let _ = std::fs::remove_dir_all(incoming);
+            if !probe_left_unproven(&error) {
+                let _ = std::fs::remove_dir_all(incoming);
+            }
             return Err(format!("staged bundle cannot start: {error}"));
         }
         if probe_left_unproven(&error) {
@@ -3673,7 +3679,9 @@ fn swap_admitted_stage(
     let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
 
     if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
-        // Keep a candidate whose start probe was killed mid-exec at its path while macOS finishes assessing it ([`keep_unproven_candidate`]).
+        // A candidate whose start probe saw no exit of its own (killed at its ceiling, or ended
+        // by a signal) stays at its path while macOS finishes assessing it
+        // ([`keep_unproven_candidate`]); any other failure is backed out.
         if probe_left_unproven(&error) {
             keep_unproven_candidate(&prepared, staging, unix_now_secs());
         } else {

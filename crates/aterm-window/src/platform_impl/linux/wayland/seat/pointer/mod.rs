@@ -5,6 +5,12 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Wayland pointer event handling and cursor management.
+//!
+//! LOCAL PATCH (aterm): the frames come from first-party `aterm_wayland::seat` and the cursor is
+//! the backend's own [`WinitPointer`] (cursor-shape-v1, else the cursor theme through
+//! libwayland-cursor), where upstream used smithay-client-toolkit. A pointer on a window's
+//! shadow-margin part shows that edge's resize cursor and a left press there resizes, as
+//! sctk-adwaita's frame did.
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -65,6 +71,8 @@ impl WinitState {
             let position: PhysicalPosition<f64> =
                 LogicalPosition::new(event.position.0, event.position.1).to_physical(scale_factor);
 
+            // LOCAL PATCH (aterm): upstream routed events on its client-side frame to the frame
+            // here; with no frame every event is the window's.
             match event.kind {
                 PointerKind::Enter { .. } => {
                     self.events_sink
@@ -228,7 +236,7 @@ pub struct WinitPointer {
     /// The surface the theme's images are shown on.
     surface: Owned,
     /// Keep the theme's global alive through a window thread's last in-flight
-    /// request, including one that outlasts the event loop.
+    /// request, including one that outlasts the event loop. Drop it after themes.
     shm: Arc<Owned>,
     /// The connection the objects are on, which outlives them.
     _connection: Arc<Connection>,

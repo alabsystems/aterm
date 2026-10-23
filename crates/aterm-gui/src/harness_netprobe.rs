@@ -42,8 +42,6 @@ impl Probe for SystemProbe {
     }
 
     fn connect(&self, addr: SocketAddr, within: Duration) -> io::Result<TcpStream> {
-        // Not std's own: a refusal on Windows takes about 2 s there, longer than
-        // a share of the budget, and would read as a timeout (aterm_http::connect).
         aterm_http::connect::connect_timeout(&addr, within)
     }
 
@@ -75,8 +73,7 @@ pub(crate) fn verified_handshake(
     .map(drop)
 }
 
-/// A failure that says the address cannot be reached from here: the kernel's own word, never a
-/// timeout.
+/// A failure that says the address cannot be reached from here.
 fn definite_failure(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -87,9 +84,7 @@ fn definite_failure(e: &io::Error) -> bool {
     ) || raw_unreachable(e)
 }
 
-/// A resolver answer that specifically says the name has no address. On macOS std reports
-/// `getaddrinfo` errors as `Uncategorized` with no raw OS code, so only the known no-name
-/// wording tells that answer from a temporary DNS failure.
+/// A resolver answer that specifically says the name has no address.
 fn definite_name_failure(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::NotFound {
         return true;
@@ -105,7 +100,7 @@ fn definite_name_failure(e: &io::Error) -> bool {
     }
 }
 
-/// The same four answers by raw errno, for a Unix error std has not mapped to its `ErrorKind`.
+/// The same four answers by raw errno.
 #[cfg(unix)]
 fn raw_unreachable(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|code| {
@@ -270,14 +265,12 @@ impl NetProbe {
         }
     }
 
-    /// The thread: parked while no lease lives, a probe when one is due, one
-    /// at a time.
+    /// The thread: parked while no lease lives, a probe when one is due, one at a time.
     fn run(&self) {
         self.run_before_park(|| {});
     }
 
-    /// The loop, with a seam just before parking under the state mutex where tests replay a lost
-    /// wake; production's callback is empty.
+    /// Runs the probe loop with `before_park` called before parking on the condvar.
     fn run_before_park(&self, mut before_park: impl FnMut()) {
         loop {
             {
@@ -336,11 +329,7 @@ impl NetProbe {
     }
 }
 
-/// What decides an agent's route, read now. `env` is its exec environment (`None`: unreadable,
-/// and nothing else is read), `argv` its command line, `cwd` its directory (not absolute:
-/// unknown, and its project settings are reported unread), `managed` and `prefs` Claude Code's
-/// managed-settings and managed-preferences directories, `home` this process's home (all
-/// parameters so tests read a scratch tree).
+/// What decides an agent's route, read now.
 fn gather(
     env: Option<Vec<String>>,
     argv: &[String],
@@ -398,10 +387,17 @@ pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> boo
     )
 }
 
-/// [`stored_login_of_agent`] over what was gathered: the environment
-/// (`accounts::ProcessLogin::of_env`), the settings sources (`with_settings`) and the vendor's
-/// profile store (`with_profile_store`: one names-only listing of the directory
-/// `accounts::profile_configs_dir` names).
+/// Whether a relaunch line of `argv` in `cwd` finds its settings chain admit the usage tap,
+/// read as the relaunch's own gate reads it (`upgrade_drive::tap_settings_admit`: under the
+/// host's home, `settings.json` and `cowork_settings.json` alike), not as the running
+/// process's own environment picks one of the two.
+pub(crate) fn tap_settings_admit_line(argv: &[String], cwd: &str) -> bool {
+    aterm_primer::home_dir().is_some_and(|home| {
+        aterm_agent::harness::upgrade_drive::tap_settings_admit(&home, argv, cwd)
+    })
+}
+
+/// [`stored_login_of_agent`] over what was gathered.
 fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
     use aterm_agent::harness::accounts;
     let Some(env) = facts.env.as_ref().filter(|env| !env.is_empty()) else {
@@ -454,7 +450,6 @@ mod tests {
         }
     }
 
-    /// Project the observed park/stop order, independently of the model's transition function.
     fn project_shutdown_park(observed: &[ShutdownObservation]) -> aterm_spec::interp::State {
         let park = observed.iter().position(|step| step.action == "Park");
         let stop = observed.iter().position(|step| step.action == "Stop");
@@ -472,9 +467,6 @@ mod tests {
         ])
     }
 
-    /// Replay a stop after the real worker checked its predicate but before it parks. The
-    /// unlocked publisher skips the mutex; a second wake then releases its worker, so neither
-    /// arm leaks.
     fn shutdown_at_park_trace(publisher: ShutdownPublisher) -> Vec<ShutdownObservation> {
         let probe = Arc::new(Seam::new(
             Err(io::Error::other("this fixture must never resolve")),
@@ -548,8 +540,6 @@ mod tests {
         Arc::try_unwrap(trace).unwrap().into_inner().unwrap()
     }
 
-    /// At the real park boundary a stop cannot lose the wake of a worker that checked its
-    /// predicate.
     #[test]
     fn shutdown_cannot_lose_the_park_wake_or_retain_the_worker() {
         let model = aterm_models_gui::netprobe_shutdown_park_model();
@@ -585,7 +575,6 @@ mod tests {
         );
     }
 
-    /// A loopback port nothing listens on: a real connect is refused.
     fn refused_port() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
@@ -601,7 +590,6 @@ mod tests {
         addr
     }
 
-    /// A v6 address the fake connector owns: never dialled.
     fn v6(n: u16) -> SocketAddr {
         SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n), 443))
     }
@@ -617,9 +605,6 @@ mod tests {
         Real,
     }
 
-    /// A probe whose resolver answers `addrs` (or fails), whose connects do
-    /// what `dial` says per address family, and whose handshake is the real
-    /// verified one or a fake answer; every dial is recorded, in order.
     struct Seam {
         addrs: io::Result<Vec<SocketAddr>>,
         v6: Dial,
@@ -676,8 +661,6 @@ mod tests {
         }
     }
 
-    /// A loopback listener that accepts one connection and answers `reply`
-    /// to whatever it is sent, then closes.
     fn answering(reply: &'static [u8]) -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
@@ -692,8 +675,6 @@ mod tests {
         addr
     }
 
-    /// Down only on a definite failure: the name not resolving, or every address refused (a
-    /// real refused loopback connect) or unreachable by the kernel's word.
     #[test]
     fn the_probe_reads_down_only_on_definite_failures() {
         let nx = Seam::new(
@@ -761,9 +742,6 @@ mod tests {
         assert_eq!(probe_once(&good, BUDGET), Outcome::Up);
     }
 
-    /// Two black-holed v6 addresses ahead of a working v4 one: IPv4 is dialled first on its share
-    /// of the budget and the probe is Up without dialling a black hole (negative control: not the
-    /// resolver's v6-first order).
     #[test]
     fn a_black_holed_ipv6_cannot_eat_the_budget() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
@@ -778,8 +756,6 @@ mod tests {
         drop(listener);
     }
 
-    /// The real verified handshake, offline: a loopback listener that answers the ClientHello
-    /// with an HTTP error (a captive portal's shape) reads Unknown, never Down or Up.
     #[test]
     fn a_garbage_answer_to_the_client_hello_reads_unknown() {
         let addr = answering(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
@@ -787,8 +763,6 @@ mod tests {
         assert_eq!(probe_once(&seam, BUDGET), Outcome::Unknown);
     }
 
-    /// A resolver that blocks: the ask never waits on it and reads Unknown, with one thread and
-    /// one probe in flight however often it is asked.
     #[test]
     fn a_resolver_that_blocks_past_the_budget_reads_unknown_and_starts_no_second_probe() {
         struct Stuck {
@@ -856,10 +830,8 @@ mod tests {
         np.stop();
     }
 
-    /// Claude Code's managed preference domain's file name (2.1.300).
     const MDM_DOMAIN: &str = "com.anthropic.claudecode.plist";
 
-    /// A scratch tree for the route's sources.
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("aterm-netprobe-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -873,11 +845,6 @@ mod tests {
         std::fs::write(path, text).expect("write");
     }
 
-    /// `HOME` (where the vendor's profile store is looked for) and the
-    /// variable Claude Code's `os.homedir()` reads
-    /// (`aterm_agent::harness::accounts::HOMEDIR_ENV`, `USERPROFILE` on
-    /// Windows), both naming `home`: a test's agent resolves its scratch
-    /// home alone, never the account's.
     fn homed(home: &Path) -> Vec<String> {
         let mut vars = vec![
             format!("HOME={}", home.display()),
@@ -891,10 +858,6 @@ mod tests {
         vars
     }
 
-    /// A quiet tree leaves the stored login. It is gone where a settings source (user, project,
-    /// `--settings`) gives an API key, a profile or an `apiKeyHelper` or does not parse, where the
-    /// vendor's profile store holds a config (`$HOME/.config/anthropic`, or `ANTHROPIC_CONFIG_DIR`)
-    /// or sits in a file-provider domain, and where the environment is unread or empty.
     #[test]
     fn an_agents_settings_and_profile_store_can_take_its_stored_login_away() {
         let dir = scratch("stored");
@@ -980,9 +943,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A quiet tree is the default route; each source that names a route makes it custom (user,
-    /// project, local, managed file, managed drop-in, a managed preference domain's presence,
-    /// `--settings` file or inline JSON), as does an unparseable file or an unknown directory.
     #[test]
     fn the_route_reads_every_settings_source_claude_code_reads() {
         let proxy = "{\"env\":{\"HTTPS_PROXY\":\"http://proxy.corp:3128\"}}";
@@ -1066,9 +1026,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An agent in a file-provider domain of the home is on the default route, its stored login
-    /// kept, while no settings document is there (a `stat`, nothing opened); one that is there,
-    /// however quiet, is never opened and makes the route custom.
     #[test]
     fn a_project_in_a_file_provider_domain_is_measured_unless_a_document_is_there() {
         let dir = scratch("provider");

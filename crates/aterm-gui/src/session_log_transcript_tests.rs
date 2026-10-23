@@ -17,15 +17,12 @@ use super::*;
 use crate::claude_footer::{LogWake, rig};
 use crate::codex_rollout_tap::{Host, Image};
 
-/// The Claude Code process in front ([`with_claude`]'s group).
 const PID: i32 = 300;
 
-/// A row's `timestamp` `ms` into the test (the hand clock's scale).
 fn at(ms: u64) -> String {
     iso(WALL0 + ms)
 }
 
-/// The RFC 3339 spelling of wall ms `wall`, as Claude Code writes it.
 fn iso(wall: u64) -> String {
     let mut s = aterm_types::rfc3339::format_rfc3339(wall / 1000);
     s.pop();
@@ -92,8 +89,6 @@ fn local_command(ms: u64, text: &str) -> String {
     )
 }
 
-/// A session with Claude Code in front (group [`PID`]), its agent run open,
-/// on a hand clock; its Claude home with the registry row; its transcript.
 struct Rig {
     tl: Arc<Mutex<SessionTimeline>>,
     hand: super::super::tests::Hand,
@@ -116,7 +111,6 @@ impl Rig {
         Rig::on(name, tl, hand)
     }
 
-    /// The rig over `tl`, its session already open on `hand`.
     fn on(name: &str, tl: Arc<Mutex<SessionTimeline>>, hand: super::super::tests::Hand) -> Rig {
         tl.lock().unwrap().note_root_group(100);
         with_claude(&tl);
@@ -133,7 +127,6 @@ impl Rig {
         }
     }
 
-    /// Claude Code wrote its transcript (empty so far).
     fn touch(&self) {
         self.append(&[]);
     }
@@ -187,13 +180,6 @@ fn having<'a>(got: &'a [String], needle: &str) -> Vec<&'a String> {
     got.iter().filter(|l| l.contains(needle)).collect()
 }
 
-/// THE STEPS OF A TURN (plan §2.4, §2.5) through the footer's own read: a
-/// transcript that held rows before the tap bound is history, said once
-/// (`source field=transcript state=partial skipped=<its length>`, S1); the
-/// rows after it confirm the screen's turn (`amend vref=`), open and close
-/// its Bash step under it, and amend the turn's own numbers — never on the
-/// close (A3); the screen's settle closes the turn (S9: an unmeasured build
-/// overrules nothing).
 #[test]
 fn a_turns_transcript_steps_reach_the_log_through_the_footer_read() {
     let mut r = Rig::new("slog-tx-steps");
@@ -260,9 +246,6 @@ fn a_turns_transcript_steps_reach_the_log_through_the_footer_read() {
     time_order_holds(&got).unwrap();
 }
 
-/// A FILE THAT DID NOT EXIST HELD NO HISTORY (S1 as built): Claude Code
-/// writes its transcript at its first prompt, after the run opened and the
-/// tap armed.
 #[test]
 fn a_transcript_written_after_the_tap_armed_is_read_from_its_first_byte() {
     let mut r = Rig::new("slog-tx-vacant");
@@ -291,11 +274,6 @@ fn a_transcript_written_after_the_tap_armed_is_read_from_its_first_byte() {
     time_order_holds(&got).unwrap();
 }
 
-/// A FIRST READ'S LOSS IS SAID (S23, S27): a transcript written after the
-/// tap armed, holding a row the fold cannot read, binds from its first byte
-/// and its lost row is said on a `source … dropped=1` mark at the batch's
-/// end: the batch's bind applies before its counts, so the count has a
-/// bound join to land on.
 #[test]
 fn a_first_binding_read_says_the_rows_it_lost() {
     for (name, broken) in [("slog-tx-lost", true), ("slog-tx-lost-ctl", false)] {
@@ -319,11 +297,6 @@ fn a_first_binding_read_says_the_rows_it_lost() {
     }
 }
 
-/// A BURST PAST THE QUEUE KEEPS ITS BIND (S1, S23): a transcript written
-/// after the tap armed whose first read holds more fresh steps than the
-/// queue keeps is still bound from its first byte (`skipped=0`, never its
-/// length), the steps dropped are said (`dropped=`), and the turn's next
-/// prompt and call apply.
 #[test]
 fn a_burst_past_the_queue_keeps_its_bind_and_says_its_count() {
     use aterm_agent::harness::steps::STEP_QUEUE;
@@ -361,8 +334,6 @@ fn a_burst_past_the_queue_keeps_its_bind_and_says_its_count() {
     time_order_holds(&got).unwrap();
 }
 
-/// S16: a batch longer than one chunk is applied over several holds, the
-/// lock released between them, none longer than [`CHUNK`] events.
 #[test]
 fn a_long_batch_is_applied_a_chunk_a_hold() {
     let mut r = Rig::new("slog-tx-chunks");
@@ -390,9 +361,6 @@ fn a_long_batch_is_applied_a_chunk_a_hold() {
     assert!(having(&r.lines(), " tool out=error ").len() == 1);
 }
 
-/// `batch` applied to `tl` on a hand clock that moves 7 ns at each read, so
-/// a hold (the lock taken, then released) books 7: what it applied and
-/// every hold it booked, in order.
 fn timed(tl: &Mutex<SessionTimeline>, batch: &StepBatch) -> (Applied, Vec<(Hold, u64)>) {
     let mut t = 0u64;
     let mut booked = Vec::new();
@@ -410,7 +378,6 @@ fn timed(tl: &Mutex<SessionTimeline>, batch: &StepBatch) -> (Applied, Vec<(Hold,
     (applied, booked)
 }
 
-/// A bind, then `n` compactions: a batch of `n + 1` events.
 fn compactions(n: u64) -> StepBatch {
     use aterm_agent::harness::steps::StepPos;
     let step = |off: u64, ev: StepEvent| Step {
@@ -431,10 +398,6 @@ fn compactions(n: u64) -> StepBatch {
     }
 }
 
-/// T31: each hold that applies a chunk is timed, from the lock taken to its
-/// release, and booked by its kind — a batch longer than one chunk books
-/// its full chunks, then its last hold; a read that found no new rows still
-/// takes the lock once, booked as a last hold.
 #[test]
 fn each_chunk_hold_is_timed_and_booked_by_its_kind() {
     let r = Rig::new("slog-tx-hold");
@@ -463,10 +426,6 @@ fn each_chunk_hold_is_timed_and_booked_by_its_kind() {
     assert!(booked.is_empty(), "{booked:?}");
 }
 
-/// S12: the footer read rings the session's watchers itself, under the
-/// timeline lock that took the owed wake — a subscription registered on the
-/// session holds a ring the moment the read returns, and a parked in-process
-/// `await log kind=tool` returns (a one-minute hang detector).
 #[test]
 fn the_footer_read_wakes_the_watchers_directly() {
     let h = crate::session_store::test_handle(7);
@@ -515,10 +474,6 @@ fn the_footer_read_wakes_the_watchers_directly() {
     assert!(reply.contains(" tool par=t1 "), "{reply}");
 }
 
-/// THE DISARM: a batch that finds no run to take it (the agent run closed)
-/// drops the tap, and the next read with a run in front arms a fresh one,
-/// bound at once at the file's length — what the file held is history,
-/// said by its own `source … skipped=` (S1).
 #[test]
 fn a_tap_with_no_run_to_take_it_disarms_and_rebinds_past_the_history() {
     let mut r = Rig::new("slog-tx-disarm");
@@ -557,11 +512,6 @@ fn a_tap_with_no_run_to_take_it_disarms_and_rebinds_past_the_history() {
     assert_eq!(having(&got, " turn vref=v2 ").len(), 1, "{got:?}");
 }
 
-/// THE LEAK RULE (D5 decision B; plan §2.7): rows carrying
-/// sentinels in a prompt, a reply's words, a tool's input, a tool's result,
-/// a limit notice and a local command's output, read through the footer's
-/// own path into a real timeline, leave none of them in any record at the
-/// content tier, the brief, the carry's lines or a record on the bus.
 #[test]
 fn a_transcripts_text_never_reaches_the_log() {
     let mut r = Rig::new("slog-tx-leak");
@@ -628,20 +578,12 @@ fn a_transcripts_text_never_reaches_the_log() {
     assert!(!bus.join("\n").contains("SENTINELTOOL"), "{bus:?}");
 }
 
-/// A thread id in UUIDv7 form: created 2025-10-20T05:03:11Z, so its rollout
-/// sits in that UTC day's folder ([`rollout_rows`]).
 const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
 
-/// The thread's rollout rows on `build`, stamped `ms` into the test: its
-/// `session_meta`, a turn (`turn-1`) with its call, its count and its end,
-/// and a turn (`turn-2`) the usage wall ends; every text a sentinel (never
-/// kept).
 fn rollout_rows(build: &str) -> String {
     rollout_rows_as(THREAD, build, 0, "turn")
 }
 
-/// [`rollout_rows`] of `thread`, every stamp `late` ms later, its turns
-/// `<turn>-1` and `<turn>-2`.
 fn rollout_rows_as(thread: &str, build: &str, late: u64, turn: &str) -> String {
     let at = |ms: u64| at(late + ms);
     let rows = [
@@ -681,9 +623,6 @@ fn rollout_rows_as(thread: &str, build: &str, late: u64, turn: &str) -> String {
     rows.iter().map(|r| format!("{r}\n")).collect()
 }
 
-/// A session with `agent` in front, its run open, on a hand clock moved
-/// past the rows; a `CODEX_HOME` holding [`THREAD`]'s rollout on `build`;
-/// and the target a proven claim's copy would name for it.
 fn codex_rig(
     name: &str,
     agent: &str,
@@ -697,7 +636,6 @@ fn codex_rig(
     codex_rig_opened(name, agent, build, 0)
 }
 
-/// [`codex_rig`], the run opened `opened` ms into the test.
 fn codex_rig_opened(
     name: &str,
     agent: &str,
@@ -743,8 +681,6 @@ fn codex_rig_opened(
     (tl, home, target, RolloutClaim(ctx))
 }
 
-/// Holds a real fd-less context and retires its captured copy after the
-/// test, without starting a claimant or asking the kernel for its identity.
 struct RolloutClaim(Arc<crate::SessionCtx>);
 
 impl Drop for RolloutClaim {
@@ -793,8 +729,6 @@ fn captured_start(_: u32) -> Option<String> {
     Some("Mon Oct 20 16:37:58 2026".to_string())
 }
 
-/// A captured identity with no wall-ms birth reading (so the run's floor
-/// stands), running the measured build.
 const MEASURED: Image = Image {
     start: captured_start,
     born_ms: unborn,
@@ -809,10 +743,6 @@ fn alab_12521(_: u32) -> Option<String> {
     Some("0.164.0-dev.12521+g3d3eb12d8".to_string())
 }
 
-/// A CODEX-ALAB'S ROLLOUT ROW REACHES `log` on the rollout tap's own thread:
-/// a Codex run in front,
-/// the thread its proven claim's copy names, its rollout on a measured
-/// build.
 #[test]
 fn a_codex_alab_rollout_row_reaches_the_log_through_the_rollout_tap() {
     let (vendor, _vendor_home, vendor_target, vendor_claim) =
@@ -893,7 +823,6 @@ fn a_codex_alab_rollout_row_reaches_the_log_through_the_rollout_tap() {
     }
 }
 
-/// The turns `got` opened, by their `vref`.
 fn turns_opened(got: &[String]) -> Vec<String> {
     got.iter()
         .filter(|l| l.contains(" turn ") && l.contains(" open t"))
@@ -903,10 +832,6 @@ fn turns_opened(got: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A TURN WRITTEN BEFORE THE RUN OPENED is history to the tap's fold as it
-/// is to the tracker (`codex "prompt"`, a relaunch that carries a turn on):
-/// the tap is armed with the run's open as its floor, so the first turn the
-/// log takes says the model, though the history's turn named the same one.
 #[test]
 fn a_turn_before_the_runs_open_is_history_and_the_next_says_the_model() {
     let (tl, _home, target, claim) =
@@ -922,7 +847,6 @@ fn a_turn_before_the_runs_open_is_history_and_the_next_says_the_model() {
     );
 }
 
-/// The claimant born after the first turn.
 fn born_late(_: u32) -> Option<u64> {
     Some(WALL0 + 3_500)
 }
@@ -931,11 +855,6 @@ fn alab_unmeasured(_: u32) -> Option<String> {
     Some("0.164.0-dev.99999+g0123abcd".to_string())
 }
 
-/// THE HOST LOOKS AT THE CLAIMANT (`codex_rollout_tap::read_once`): the
-/// process's start floors the read, so a turn its rollout held from before
-/// it (a thread it resumed) is history; and the build its image runs now
-/// decides with the rollout's own, so a thread started on a measured build
-/// whose claimant runs one nobody measured binds nothing.
 #[test]
 fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
     let (tl, _home, target, claim) = codex_rig("born", "codex", "0.164.0-dev.12521+g3d3eb12d8");
@@ -962,14 +881,6 @@ fn the_host_floors_at_the_claimants_start_and_holds_it_to_its_build() {
     );
 }
 
-/// EACH ASK THE ROLLOUT TAP ANSWERS IS COUNTED, AFTER ITS RECORDS (B5c;
-/// `status rollout= rollout_asks=`, the fence the lab's rollout leg reads
-/// past): one ask as the tap's thread answers it (`read_once`) writes a
-/// measured thread's turns and moves the count with the log's last seq at
-/// or past every record it wrote; never asked, `-` and 0; the read and apply
-/// of a measured thread's ask alone put its turns in the log and count
-/// nothing; the ask answered, `bound` and 1; asked again, 2, nothing read
-/// twice.
 #[test]
 fn each_ask_the_rollout_tap_answers_is_counted_after_its_records() {
     let fields = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().slog().rollout_fields();
@@ -1071,13 +982,6 @@ fn each_ask_the_rollout_tap_answers_is_counted_after_its_records() {
     }
 }
 
-/// THE SWEEP'S STOP IS SAID (B5c; `status rollout=stopped`): the status
-/// sweep's look whose claimant left the front ([`Ask::Stop`], through the
-/// sweep's own [`crate::codex_rollout_tap::follow_ask_as`]) reaches the tap's
-/// thread after the ask sent before it, so the read's turns are in the log,
-/// the count stays 1 and the word becomes `stopped`, where it used to keep
-/// `bound` for good; a session the tap never answered stays `-`; asked
-/// again, the tap answers afresh (`bound`, 2).
 #[test]
 fn a_stopped_rollout_tap_says_stopped_and_keeps_its_count() {
     use crate::codex_rollout_tap::{Ask, follow_ask_as};
@@ -1114,10 +1018,6 @@ fn a_stopped_rollout_tap_says_stopped_and_keeps_its_count() {
     );
 }
 
-/// A NEW TARGET IS A NEW TAP: the claim's copy naming another thread (a new
-/// conversation in the same process, or another process's) replaces the
-/// session's tap, so the new thread's rollout reaches the log; asked again
-/// on the same target, nothing is read twice.
 #[test]
 fn a_new_target_is_read_by_a_new_tap() {
     const NEXT: &str = "019a0000-0000-7000-8000-00000000000b";

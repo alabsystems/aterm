@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for Autopilot Land task-end detection, tab `•` badges, and look/focus clearing (`App::note_harness_phase`).
+//! Tests for Autopilot Land task-end detection, tab badges, and look/focus clearing.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,6 @@ use crate::presence::ChipLevel;
 
 const SEC: u64 = 1_000;
 
-/// A host that supervises nothing: what the App's posture needs to read
-/// `On`, shut down by the caller.
 fn idle_host() -> crate::harness_host::HostHandle {
     crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -22,10 +20,6 @@ fn idle_host() -> crate::harness_host::HostHandle {
     )
 }
 
-/// An App whose session 0 runs Claude Code under its own word `word`,
-/// claimed by this host (the word's arm), in window 0's first tab — with a
-/// second tab in front where `behind` — and window 0 looked at (the
-/// frontmost, on screen).
 fn desk(word: &str, behind: bool) -> (App, String, crate::harness_host::HostHandle) {
     let mut app = App::headless_for_test();
     let host = idle_host();
@@ -53,8 +47,6 @@ fn desk(word: &str, behind: bool) -> (App, String, crate::harness_host::HostHand
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
-/// Window 0 looked at (`on`: frontmost and on screen) or not (on no
-/// screen: headless, as the lab's window is).
 fn look(app: &mut App, on: bool) {
     app.frontmost_window = Some(WindowId(0));
     app.windows
@@ -63,7 +55,6 @@ fn look(app: &mut App, on: bool) {
         .band_on_screen_for_test = on;
 }
 
-/// The agent word the status sweep publishes for session `session`.
 fn publish(app: &App, session: u64, word: &'static str) -> bool {
     app.pool
         .get(session)
@@ -84,9 +75,6 @@ fn publish(app: &App, session: u64, word: &'static str) -> bool {
         )
 }
 
-/// Session `session`'s agent goes busy, works `ms` on the ledger clock (moved
-/// on, not waited), and sits at its prompt: both words fed to the A/B book
-/// as the sweep feeds them.
 fn work(app: &mut App, session: u64, ms: u64) {
     assert!(publish(app, session, "busy"), "busy published");
     app.note_harness_phase(session);
@@ -95,12 +83,10 @@ fn work(app: &mut App, session: u64, ms: u64) {
     app.note_harness_phase(session);
 }
 
-/// Session `sid`'s loop tells `face` through the host's wake.
 fn tell(app: &mut App, sid: &str, face: Option<TaskFace>) {
     app.apply_harness_fact(sid, crate::HarnessFact::Task(face));
 }
 
-/// Every tab's mark in window 0, as its strip is stamped.
 fn marks(app: &App) -> Vec<ChipLevel> {
     let ws = &app.windows[&WindowId(0)];
     let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = ws
@@ -113,7 +99,6 @@ fn marks(app: &App) -> Vec<ChipLevel> {
     metadata.iter().map(|m| m.attention).collect()
 }
 
-/// The ends the book counted this week.
 fn ends(app: &App) -> crate::harness_ab::AbEnds {
     app.harness_screen
         .ab
@@ -121,9 +106,6 @@ fn ends(app: &App) -> crate::harness_ab::AbEnds {
         .ends
 }
 
-/// THE ONE END IS ONE TABLE (§11.2.3, item 1): landed, from a face the
-/// window knew (open, theirs), after at least 30 s of work; every other move
-/// is none — Cruise has no end to tell.
 #[test]
 fn an_end_is_a_landing_from_a_known_face_past_the_floor() {
     use TaskFace::{Landed, Open, Theirs};
@@ -150,10 +132,6 @@ fn an_end_is_a_landing_from_a_known_face_past_the_floor() {
     }
 }
 
-/// THE TAB'S `•` FOR A LANDING NOBODY SAW (§11.2.1; §11.2.5 "The `•`"): two
-/// tabs, the background session under Land told open, 45 s of its agent's
-/// busy time, then landed — its tab wears the mark (`"done"` among its
-/// chrome states), and the page's Ends row counts one landing.
 #[test]
 fn a_background_landing_wears_the_mark_and_a_looked_at_one_none() {
     let (mut app, sid, host) = desk("land", true);
@@ -215,12 +193,6 @@ fn a_background_landing_wears_the_mark_and_a_looked_at_one_none() {
     host.shutdown_and_join();
 }
 
-/// A LANDING IS SEEN BY THE ONE LOOKING RULE (§11.2.1 "It goes when he
-/// looks"; §11.2.5 "Seen"): a switch to its tab quiets it with exactly one
-/// strip re-stamp; away and back does not mark it again; a second landing
-/// does; while the frontmost window is occluded, a switch quiets nothing;
-/// the menu bar's Go quiets it; someone else's turn (theirs) clears it and
-/// its mark.
 #[test]
 fn a_landing_is_seen_by_the_one_looking_rule_and_marks_again_when_new() {
     let (mut app, sid, host) = desk("land", true);
@@ -279,10 +251,6 @@ fn a_landing_is_seen_by_the_one_looking_rule_and_marks_again_when_new() {
     host.shutdown_and_join();
 }
 
-/// A LOOP'S RESTART ZEROES NO WORK (§11.2.3, item 2, "What never zeroes
-/// it"; the review's R12): 25 s of work, the loop restarted (unknown, then
-/// open restated from unknown), 10 s more, then landed — 35 s since the task
-/// opened, an end.
 #[test]
 fn a_loops_restart_zeroes_no_work() {
     let (mut app, sid, host) = desk("land", true);
@@ -306,10 +274,6 @@ fn a_loops_restart_zeroes_no_work() {
     host.shutdown_and_join();
 }
 
-/// THE CLIP (§11.2.3, item 3; the review's R2): a relaunch over a landed
-/// task restates the landing from unknown (the landing seed: no end), a
-/// reply runs 40 s, and its point WITHDRAWS the seed — open, then a landing,
-/// at one point.
 #[test]
 fn a_withdrawn_landing_seed_counts_none_of_the_replys_work() {
     let (mut app, sid, host) = desk("land", true);
@@ -342,9 +306,6 @@ fn a_withdrawn_landing_seed_counts_none_of_the_replys_work() {
     host.shutdown_and_join();
 }
 
-/// AN UNSEEN END AT REST ARMS NOTHING (§11.2.3, item 7; §11.2.5 "Idle"): with
-/// a landing standing unseen behind the front tab, 20 s on, presence folds no
-/// deadline, the harness's glass none and the card none — as before the end.
 #[test]
 fn an_unseen_end_at_rest_arms_nothing() {
     let (mut app, sid, host) = desk("land", true);
@@ -368,10 +329,6 @@ fn an_unseen_end_at_rest_arms_nothing() {
     host.shutdown_and_join();
 }
 
-/// A LANDING'S NEXT TASK IS TIMED FROM ITS OWN OPENING (§11.2.3, item 2;
-/// §11.6.3, item 4): open → landed after 45 s wears the mark and counts one
-/// landing; a new task opened (landed → open) restarts the time from Land to
-/// landed there, and the open takes the mark down.
 #[test]
 fn a_landings_next_task_is_timed_from_its_opening() {
     let (mut app, sid, host) = desk("land", true);
@@ -401,11 +358,6 @@ fn a_landings_next_task_is_timed_from_its_opening() {
     host.shutdown_and_join();
 }
 
-/// OFF THEN LAND OVER WORK NO LOOP WATCHED ARMS NOTHING (§11.2.4
-/// "Restatements arm nothing"; "Off, the agent's own switch, the master
-/// switch"): a task open under Land with 5 s of work, the session set Off
-/// (the loop stops, its claim given back), the person's own 40 s turn, then
-/// Land again — the loop restates open from unknown, and a landing follows.
 #[test]
 fn off_then_land_over_work_no_loop_watched_arms_nothing() {
     let (mut app, sid, host) = desk("land", true);
@@ -461,11 +413,6 @@ fn off_then_land_over_work_no_loop_watched_arms_nothing() {
     host.shutdown_and_join();
 }
 
-/// A SETTINGS TAB CLOSED BEHIND LEAVES THE TAB IN FRONT IN FRONT, AND ITS
-/// NEIGHBOUR'S END UNSEEN (the final check of 2026-10-20, W2): tabs [the tab
-/// in front, a background landing, Settings] in a looked-at window, the
-/// Settings tab closed by index as the strip's ✕, the tab menu and `ctl tab
-/// close` close it.
 #[test]
 fn closing_a_settings_tab_behind_keeps_the_front_and_the_neighbours_end_unseen() {
     let set_up = || {

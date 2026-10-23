@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Grid span-anchor hooks and row fingerprinting ([`AnchorSet`](crate::AnchorSet)).
+//! Grid span-anchor hooks and row fingerprinting ([`AnchorSet`]).
 
 use aterm_hash::FxHasher;
 use std::hash::Hasher;

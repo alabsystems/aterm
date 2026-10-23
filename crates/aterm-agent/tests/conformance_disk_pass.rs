@@ -17,12 +17,8 @@ type S = std::collections::BTreeMap<&'static str, i64>;
 
 const NOW: i64 = 1_792_195_200;
 
-/// Bytes in a GiB.
 const GIB_BYTES: u64 = 1 << 30;
 
-/// `posix`, a fixture's absolute POSIX path (`/h/x/target`), as one this
-/// host reads as absolute — a removal's guard refuses any other: itself on
-/// Unix, the same path on drive `C:` on Windows.
 fn abs(posix: &str) -> PathBuf {
     if cfg!(windows) {
         PathBuf::from(format!("C:{posix}"))
@@ -51,8 +47,6 @@ enum Event {
     Stopped(Option<u8>, u64),
 }
 
-/// One measured level: `(model action, free bytes the look read)` for the
-/// default config's lines (warn 40 GiB, floor 10 GiB, emergency 4 GiB).
 fn levels() -> [(&'static str, u64); 4] {
     [
         ("MeasureOk", 500 * GIB_BYTES),
@@ -145,11 +139,6 @@ fn recent(path: &str, last_used: i64) -> Row {
     )
 }
 
-/// A report at `free` bytes, `demand` adopted, holding rows of EVERY tier
-/// whatever the level (the real report makes an ended owner's whole row only
-/// from `low` and recent profiles' only below the floor; here the planner's
-/// own admission is what is held to the model), one of the whole rows a
-/// removal refuses.
 fn report_at(free: u64, demand: Option<u64>) -> Report {
     let config = Config::default();
     let rows = vec![
@@ -171,7 +160,6 @@ fn report_at(free: u64, demand: Option<u64>) -> Report {
     rep
 }
 
-/// The model's free-space word for `free` against a tier's `target`.
 fn word(free: u64, target: u64) -> &'static str {
     let t = Config::default().thresholds(None);
     if free >= target {
@@ -185,7 +173,6 @@ fn word(free: u64, target: u64) -> &'static str {
     }
 }
 
-/// Fire `action` on `s`, which must be enabled, every invariant holding after.
 fn step(m: &Model, s: &mut S, action: &str) -> Result<(), String> {
     if !m.action_enabled(action, s) {
         return Err(format!("`{action}` is not enabled in {s:?}"));
@@ -199,7 +186,6 @@ fn step(m: &Model, s: &mut S, action: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The model state after the look: its level measured, a demand adopted.
 fn looked(m: &Model, measure: &str, demand: bool) -> Result<S, String> {
     let mut s = m.init_state();
     step(m, &mut s, measure)?;
@@ -209,9 +195,6 @@ fn looked(m: &Model, measure: &str, demand: bool) -> Result<S, String> {
     Ok(s)
 }
 
-/// THE PROJECTION: replay `events` (what the real pass did, in order) onto `s`,
-/// each tier entered when its first event comes, each re-measure classified
-/// against the target of the tier the next event names.
 fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(), String> {
     let target_of = |tier: Option<Tier>| {
         plan.iter()
@@ -273,7 +256,6 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                 }
             }
             Event::Failed(_) => {
-                // A whole unit the remover refused: its locks, or its recheck.
                 step(m, s, "LockRefused")?;
             }
             Event::Stopped(tier, target) => {
@@ -287,10 +269,6 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
     Ok(())
 }
 
-/// A cargo build directory at `dir`, as cargo lays one: a signed
-/// `CACHEDIR.TAG`, `.rustc_info.json`, and two profiles (`debug/`,
-/// `release/`), each with every build lock, `.fingerprint/`, `deps/` (an
-/// rlib), `build/` and `incremental/`.
 fn lay(dir: &Path) -> PathBuf {
     for profile in ["debug", "release"] {
         let p = dir.join(profile);
@@ -320,7 +298,6 @@ fn lay(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).expect("canonical")
 }
 
-/// A scratch folder of this test's own, removed when it drops.
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -353,16 +330,10 @@ enum Whole {
     DeletesBeforeLocking,
 }
 
-/// Run the real pass on `rep`, re-measures answering `script` in turn (its
-/// last figure after that); a whole unit removed by the real primitive on a
-/// build directory laid for it (`whole`), its stages told as events; every
-/// other removal releasing what its row says; the `refused` rows refused
-/// before any lock: what it did, as events.
 fn run(rep: &Report, script: &[u64]) -> (Option<Applied>, Vec<Event>) {
     run_with(rep, script, Whole::Real)
 }
 
-/// [`run`], whole units removed as `whole` says.
 fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec<Event>) {
     let events = RefCell::new(Vec::new());
     let reads = RefCell::new(0usize);
@@ -460,9 +431,6 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
     (done, events.into_inner())
 }
 
-/// EVERY LEVEL, WITH AND WITHOUT A DEMAND, EACH OF SEVERAL RE-MEASURE SCRIPTS:
-/// the real planner admits exactly the tiers the model admits, and every step
-/// the real pass takes is one the model enables, its invariants holding after.
 #[test]
 fn the_real_pass_takes_only_the_models_steps_at_every_level() {
     let m = disk_reclaim_pass_model();
@@ -521,8 +489,6 @@ fn the_real_pass_takes_only_the_models_steps_at_every_level() {
     assert!(passes >= 12, "the passes ran: {passes}");
 }
 
-/// THE RESERVE: the real look releases it at a measured emergency and at no
-/// other level, exactly where the model lets `ReleaseReserve` fire.
 #[test]
 fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
     use aterm_agent::harness::cli::{ReserveMove, disk_reserve_look};
@@ -558,9 +524,6 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// NEGATIVE CONTROL: a planner that admits tier 4 for a demand at a measured
-/// `low` — recent caches taken for an agent's wait — is caught: projected the
-/// same way, its first recent row's tier is one the model does not admit.
 #[test]
 fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
     let m = disk_reclaim_pass_model();
@@ -602,10 +565,6 @@ fn a_planner_that_takes_recent_caches_for_a_demand_is_rejected() {
     assert!(caught.contains("Admit4"), "{caught}");
 }
 
-/// NEGATIVE CONTROL for the locks: a whole removal that deletes a profile's
-/// contents BEFORE the real primitive takes its locks (the defect
-/// `RemoveUnheld` stands for) is caught — its first delete projects onto
-/// `Remove` with no `LockHeld` before it.
 #[test]
 fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
     let m = disk_reclaim_pass_model();
@@ -631,11 +590,6 @@ fn a_whole_removal_that_deletes_before_it_locks_is_rejected() {
     );
 }
 
-/// NEGATIVE CONTROLS for the rest of the pass's invariants, each projected as
-/// the real pass's events are and each caught: tier 3 admitted at a measured
-/// `low` with no demand (`NoWholeAtLow`); a row journalled after the
-/// re-measure read its tier's target (`StopsAtTarget`); the reserve released
-/// below the floor but above the emergency (`ReserveOnlyMeasuredEmergency`).
 #[test]
 fn a_pass_that_breaks_any_other_invariant_is_rejected() {
     let m = disk_reclaim_pass_model();

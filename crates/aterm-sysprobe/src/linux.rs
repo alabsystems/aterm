@@ -533,7 +533,8 @@ pub const MIDR_DESIGN: u64 = 0xff00_fff0;
 
 /// `capacities` with each core raised to the highest capacity among the
 /// cores of its [`Design`], so one design at one clock is one level however
-/// firmware spreads its `cpu_capacity`.
+/// firmware spreads its `cpu_capacity`. Unchanged unless every core in
+/// `capacities` has a design.
 #[must_use]
 pub fn capacities_by_design(
     capacities: &[(u16, u32)],

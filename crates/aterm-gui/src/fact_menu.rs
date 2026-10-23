@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use aterm_agent::harness::footer::{FactKind, FactMask};
+use aterm_agent::harness::profile::{WeeklyFigure, WeeklyGap};
 use aterm_agent::harness::session_usage::{TrafficView, runtime_short, tokens_short};
 
 use crate::autopilot_menu::{
@@ -109,11 +110,7 @@ pub(crate) struct AccountMenuRow {
 /// Format a weekly availability string with a 5-cell meter bar.
 #[must_use]
 pub(crate) fn weekly_meter_bar(text: &str) -> String {
-    let pct = text
-        .split_whitespace()
-        .find_map(|w| w.strip_suffix('%'))
-        .and_then(|n| n.parse::<u32>().ok());
-    let Some(pct) = pct else {
+    let Some(pct) = weekly_pct(text) else {
         return text.to_string();
     };
     let filled = if pct == 0 {
@@ -128,6 +125,169 @@ pub(crate) fn weekly_meter_bar(text: &str) -> String {
     bar.push_str("  ");
     bar.push_str(text);
     bar
+}
+
+/// The whole percent weekly words name (`weekly 73% left`, `weekly 61.5% left · 16m ago`: 61),
+/// tenths cut as [`whole_left`] cuts them.
+fn weekly_pct(text: &str) -> Option<u32> {
+    let n = text.split_whitespace().find_map(|w| w.strip_suffix('%'))?;
+    let (whole, tenths) = n.split_once('.').unwrap_or((n, ""));
+    let whole = whole.parse::<u32>().ok()?;
+    let tenths = tenths.bytes().any(|b| (b'1'..=b'9').contains(&b));
+    Some(whole_left(whole.saturating_mul(10) + u32::from(tenths)))
+}
+
+/// The whole percent left of `left_x10` tenths, the footer's tenths cut, but never to the `0`
+/// an account row reads as limited while a tenth is left (`0.5% left`: 1).
+fn whole_left(left_x10: u32) -> u32 {
+    if left_x10 == 0 {
+        0
+    } else {
+        (left_x10 / 10).max(1)
+    }
+}
+
+/// The account menu's full why under the footer's short word for a weekly figure it has not
+/// got ([`WeeklyGap::words`]), in lines the card's widest content holds.
+pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
+    use aterm_agent::harness::tap::Refusal;
+    match gap {
+        WeeklyGap::TapOff => &[
+            "Claude Code reports the weekly figure only",
+            "to /usage and to its status line, and",
+            "aterm's usage tap is off ([harness]",
+            "usage_tap, or the harness is off for",
+            "Claude Code): open /usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Exe) => &[
+            "Claude Code reports the weekly figure only",
+            "to /usage and to its status line, and the",
+            "usage tap's command cannot name this aterm",
+            "(a temporary copy, or a path with a space):",
+            "open /usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Home) => &[
+            "aterm's usage tap rides only on the",
+            "machine's own Claude home, and this one",
+            "runs under a CLAUDE_CONFIG_DIR or HOME of",
+            "its own: open /usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Login) => &[
+            "aterm's usage tap rides only on the",
+            "machine's own login or one accounts.toml",
+            "lists, and this Claude Code is signed in",
+            "to another: open /usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Line) => &[
+            "aterm's usage tap never rides beside a",
+            "session's own --settings or --bare, and",
+            "this Claude Code was started with one:",
+            "open /usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Argv) => &[
+            "aterm cannot repeat this Claude Code's",
+            "options on a relaunch line (one it does",
+            "not know, or one that cannot resume), so",
+            "no restart adds its usage tap: open",
+            "/usage for the figure.",
+        ],
+        WeeklyGap::Unoffered(Refusal::Settings) => &[
+            "aterm's usage tap never rides over your",
+            "own statusLine, with hooks turned off,",
+            "beside an apiKeyHelper or a credential,",
+            "or past a settings file it cannot read,",
+            "and this Claude Code's settings have one",
+            "of them: open /usage for the figure.",
+        ],
+        WeeklyGap::Untapped => &[
+            "This Claude Code was started without",
+            "aterm's usage tap, and a restart in place",
+            "adds it (aterm ctl @<tab> restart). The",
+            "restart resumes this conversation with a",
+            "note to carry on, which takes a turn.",
+        ],
+        WeeklyGap::Unrestarted => &[
+            "This Claude Code was started without",
+            "aterm's usage tap, and aterm restarts in",
+            "place only a Claude Code it supervises",
+            "(Autopilot on) that a relaunch brings",
+            "back: open /usage for the figure.",
+        ],
+        WeeklyGap::NoReply => &[
+            "This Claude Code carries aterm's usage",
+            "tap: it sends the weekly figure with its",
+            "next reply, and no reply since it started",
+            "brought one.",
+        ],
+        WeeklyGap::Stale => &[
+            "This Claude Code carries aterm's usage",
+            "tap: it sends the weekly figure with each",
+            "reply, and no reply in the last hour",
+            "brought one.",
+        ],
+    }
+}
+
+/// What the account menu takes of a Claude Code footer's subscription `sub` (a 7d wall in its
+/// transcript when `walled`) at `now`: the session's figure for its own row (its whole percent
+/// left and, past [`WeeklyFigure::current`], its age, as [`row_figure`] gives a store's), the
+/// meter line, and why there is none where the footer says. A figure whose week has reset since
+/// the footer's read gives neither row nor meter (its words are the expired week's), and a
+/// wall's or a screen's words, with no figure behind them, give their own percent.
+pub(crate) fn weekly_facts(
+    sub: &aterm_agent::harness::profile::SubscriptionDisplay,
+    walled: bool,
+    now: i64,
+) -> (Option<(u32, String)>, Option<String>, Option<WeeklyGap>) {
+    let held = session_figure(sub, now);
+    let expired = held.is_none() && sub.weekly.is_some() && sub.weekly_figure.is_some();
+    let weekly = sub
+        .weekly
+        .clone()
+        .filter(|_| !expired)
+        .or_else(|| walled.then(|| "weekly 0% left".to_string()));
+    match weekly {
+        Some(weekly) => {
+            let row = match held {
+                Some(figure) => Some(row_figure(figure, now)),
+                None => weekly_pct(&weekly).map(|pct| (pct, String::new())),
+            };
+            (row, Some(weekly_meter_bar(&weekly)), None)
+        }
+        None => (None, None, sub.weekly_gap),
+    }
+}
+
+/// The figure behind the footer's weekly words in `sub` while its week still runs at `now`
+/// (`None`: a wall's or a screen's words, no figure, or one whose week has reset since): what
+/// the session's own account row compares with the store's by when each was read
+/// ([`account_menu_rows_from`]).
+pub(crate) fn session_figure(
+    sub: &aterm_agent::harness::profile::SubscriptionDisplay,
+    now: i64,
+) -> Option<WeeklyFigure> {
+    sub.weekly_figure
+        .filter(|figure| sub.weekly.is_some() && figure.resets_at > now)
+}
+
+/// An account row's figure and its age ([`account_menu_rows_from`]): its whole percent left,
+/// and ` · 40m ago`, ` · 3h ago` or ` · 2d ago` past [`WeeklyFigure::current`] (the footer's
+/// one age rule; a row keeps an older figure, with its age, where the footer drops it, and
+/// one stamped ahead of `now` with none).
+fn row_figure(figure: WeeklyFigure, now: i64) -> (u32, String) {
+    let left = whole_left(1000u32.saturating_sub(figure.used_x10.min(1000)));
+    let age = now.saturating_sub(figure.at);
+    if figure.current(now) || age <= 0 {
+        return (left, String::new());
+    }
+    let (n, unit) = if age < 3600 {
+        (age / 60, 'm')
+    } else if age < 2 * 86_400 {
+        (age / 3600, 'h')
+    } else {
+        (age / 86_400, 'd')
+    };
+    (left, format!(" \u{b7} {n}{unit} ago"))
 }
 
 /// Inputs used to build a fact menu.
@@ -152,6 +312,8 @@ pub(crate) struct FactMenuFacts {
     pub(crate) subscription: Option<String>,
     /// The weekly meter line (`▱▱▱▱▱  weekly 0% left`).
     pub(crate) weekly_meter: Option<String>,
+    /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
+    pub(crate) weekly_gap: Option<WeeklyGap>,
     /// The rotation accounts in roster order (dedicated first, then pool).
     pub(crate) accounts: Vec<AccountMenuRow>,
     /// Whether automatic rotation (`!state.pinned`) is active.
@@ -297,6 +459,15 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     "{}  {meter}",
                     aterm_agent::harness::footer::WEEKLY_MARK
                 )));
+            } else if let Some(gap) = facts.weekly_gap {
+                out.push(MenuRow::Note(format!(
+                    "{}  {}",
+                    aterm_agent::harness::footer::WEEKLY_MARK,
+                    gap.words()
+                )));
+                for line in weekly_gap_why(gap) {
+                    out.push(MenuRow::Note((*line).to_string()));
+                }
             }
             note(&mut out);
             if facts.accounts.is_empty() {
@@ -551,7 +722,7 @@ thread_local! {
 fn build_account_menu_rows(
     session_account: Option<&str>,
     session_email: Option<&str>,
-    session_pct_left: Option<u32>,
+    session: SessionWeek,
 ) -> (Vec<AccountMenuRow>, bool) {
     use aterm_agent::harness::accounts;
     if cfg!(test) {
@@ -583,9 +754,24 @@ fn build_account_menu_rows(
         &enrolled,
         session_account,
         session_email,
-        session_pct_left,
+        session,
         now,
     )
+}
+
+/// The session's own week as the footer holds it, for its own account's row only
+/// ([`account_menu_rows_from`]): the row [`Self::label`] names, else the one whose email the
+/// session's profile names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionWeek {
+    /// The roster label of the account the week is (`SubscriptionDisplay::label`).
+    pub(crate) label: Option<String>,
+    /// The figure behind the footer's words while its week runs ([`session_figure`]), which the
+    /// row takes over the store's where it was read later.
+    pub(crate) figure: Option<WeeklyFigure>,
+    /// The row's whole percent left and age from the footer's words ([`weekly_facts`]), where
+    /// the store holds nothing of the account.
+    pub(crate) left: Option<(u32, String)>,
 }
 
 #[must_use]
@@ -595,23 +781,31 @@ pub(crate) fn account_menu_rows_from(
     enrolled: &std::collections::BTreeSet<String>,
     session_account: Option<&str>,
     session_email: Option<&str>,
-    session_pct_left: Option<u32>,
+    session: SessionWeek,
     now: i64,
 ) -> (Vec<AccountMenuRow>, bool) {
     use aterm_agent::harness::accounts;
-    let active_label = session_account.or(state.active.as_deref()).or_else(|| {
-        session_email.and_then(|email| {
-            roster
-                .rows
-                .iter()
-                .find(|r| {
-                    r.email
-                        .as_deref()
-                        .is_some_and(|re| accounts::email_matches(re, email))
-                })
-                .map(|r| r.label.as_str())
-        })
-    });
+    // The session's week is its own account's: the row its login is judged to (on a one-row
+    // roster too, where the footer names no account), else the one its profile's email names;
+    // never a row whose email contradicts the profile's, nor the store's active fallback.
+    let session_row = match session.label.as_deref().or(session_account) {
+        Some(label) => roster.row(label).filter(|row| {
+            session_email.is_none_or(|email| {
+                row.email
+                    .as_deref()
+                    .is_none_or(|expected| accounts::email_matches(expected, email))
+            })
+        }),
+        None => session_email.and_then(|email| {
+            roster.rows.iter().find(|row| {
+                row.email
+                    .as_deref()
+                    .is_some_and(|expected| accounts::email_matches(expected, email))
+            })
+        }),
+    };
+    let session_label = session_row.map(|row| row.label.as_str());
+    let active_label = session_label.or(state.active.as_deref());
     let mut rows = Vec::with_capacity(roster.rows.len());
     for row in &roster.rows {
         let Some(account) = AccountLabel::new(&row.label) else {
@@ -621,30 +815,33 @@ pub(crate) fn account_menu_rows_from(
         let cond = accounts::condition(row, state, is_enrolled, now);
         let is_active = active_label == Some(row.label.as_str());
         let pct_left = if matches!(cond, accounts::Condition::Limited { .. }) {
-            Some(0)
+            Some((0, String::new()))
         } else {
             state
                 .accounts
                 .get(&row.label)
                 .and_then(|acct| {
-                    acct.windows
-                        .get("seven_day")
-                        .filter(|fig| fig.current(now) && !fig.cut())
-                        .map(|fig| 100u32.saturating_sub(fig.whole().min(100)))
-                        .or_else(|| {
-                            acct.sample
-                                .as_ref()
-                                .and_then(|s| s.week(now))
-                                .map(|(pct, _)| 100u32.saturating_sub(pct.min(100)))
-                        })
+                    let [tapped, sampled] = crate::claude_footer::store_figures(acct, now);
+                    let own = session
+                        .figure
+                        .filter(|_| session_label == Some(row.label.as_str()));
+                    WeeklyFigure::newer(tapped, sampled)
+                        .and_then(|store| WeeklyFigure::newer(Some(store), own))
+                        .map(|figure| row_figure(figure, now))
                         .or_else(|| {
                             acct.warned_week
                                 .as_ref()
                                 .and_then(|w| w.figure(accounts::WEEK_WINDOW_S, now))
-                                .map(|(pct, _)| 100u32.saturating_sub(pct.min(100)))
+                                .map(|(pct, _)| {
+                                    (100u32.saturating_sub(pct.min(100)), String::new())
+                                })
                         })
                 })
-                .or_else(|| is_active.then_some(session_pct_left).flatten())
+                .or_else(|| {
+                    (session_label == Some(row.label.as_str()))
+                        .then(|| session.left.clone())
+                        .flatten()
+                })
                 .or_else(|| {
                     matches!(
                         cond,
@@ -652,7 +849,7 @@ pub(crate) fn account_menu_rows_from(
                             | accounts::Condition::Unseen
                             | accounts::Condition::NotEnrolled
                     )
-                    .then_some(100)
+                    .then(|| (100, String::new()))
                 })
         };
         let class_word = match row.class {
@@ -661,16 +858,15 @@ pub(crate) fn account_menu_rows_from(
         };
         let has_email = row.email.is_some();
         let avail = match (cond, pct_left, has_email) {
-            (accounts::Condition::Limited { .. }, _, _) | (_, Some(0), _) => {
-                "0% left (limited)".to_string()
-            }
+            (accounts::Condition::Limited { .. }, _, _) => "0% left (limited)".to_string(),
+            (_, Some((0, age)), _) => format!("0% left{age} (limited)"),
             (accounts::Condition::SignedOut, _, true) => "signed out (auto-login)".to_string(),
             (accounts::Condition::SignedOut, _, false) => "signed out".to_string(),
-            (accounts::Condition::NotEnrolled, Some(pct), true) => {
-                format!("{pct}% left (auto-login)")
+            (accounts::Condition::NotEnrolled, Some((pct, age)), true) => {
+                format!("{pct}% left{age} (auto-login)")
             }
             (accounts::Condition::NotEnrolled, _, false) => "not enrolled".to_string(),
-            (_, Some(pct), _) => format!("{pct}% left"),
+            (_, Some((pct, age)), _) => format!("{pct}% left{age}"),
             (_, None, _) => cond.as_str().to_string(),
         };
         let enabled = !matches!(
@@ -712,7 +908,7 @@ impl App {
         let mut key = false;
         let mut session_acct: Option<String> = None;
         let mut session_email: Option<String> = None;
-        let mut session_pct: Option<u32> = None;
+        let mut session_week = SessionWeek::default();
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(facts) = timeline.claude_footer() {
@@ -741,21 +937,18 @@ impl App {
                     if !summary.is_empty() {
                         out.subscription = Some(summary);
                     }
-                    let weekly = sub.weekly.clone().or_else(|| {
-                        facts
-                            .usage
-                            .as_ref()
-                            .and_then(|u| u.wall.as_ref())
-                            .filter(|w| w.label == "7d")
-                            .map(|_| "weekly 0% left".to_string())
-                    });
-                    if let Some(weekly) = weekly {
-                        session_pct = weekly
-                            .split_whitespace()
-                            .find_map(|w| w.strip_suffix('%'))
-                            .and_then(|n| n.parse::<u32>().ok());
-                        out.weekly_meter = Some(weekly_meter_bar(&weekly));
-                    }
+                    let walled = facts
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.wall.as_ref())
+                        .is_some_and(|w| w.label == "7d");
+                    let now = aterm_time::unix_secs()
+                        .and_then(|n| i64::try_from(n).ok())
+                        .unwrap_or(0);
+                    (session_week.left, out.weekly_meter, out.weekly_gap) =
+                        weekly_facts(sub, walled, now);
+                    session_week.figure = session_figure(sub, now);
+                    session_week.label.clone_from(&sub.label);
                 }
                 (out.model, out.effort, out.path, out.branch, out.context) = (
                     facts.model,
@@ -774,7 +967,7 @@ impl App {
             (out.accounts, out.auto_rotate) = build_account_menu_rows(
                 session_acct.as_deref(),
                 session_email.as_deref(),
-                session_pct,
+                session_week,
             );
         }
         if matches!(fact, Fact::Path | Fact::Branch)

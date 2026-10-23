@@ -209,10 +209,11 @@ impl<'a> Reading<'a> {
             CauseId::AtermWork => "aterm itself".into(),
             CauseId::Unexplained => {
                 let part = match shown.map(|c| &c.cause.evidence) {
-                    Some(Evidence::Uncovered { part }) => *part,
-                    _ => Part::Services,
+                    Some(Evidence::Uncovered { part }) => self.part_word(*part),
+                    Some(Evidence::Unaccounted) => "unaccounted",
+                    _ => self.part_word(Part::Services),
                 };
-                format!("no cause aterm can name: {}", self.part_word(part))
+                format!("no cause aterm can name: {part}")
             }
             CauseId::Context(c) => {
                 return match (c, shown.map(|c| &c.cause.evidence)) {
@@ -522,6 +523,7 @@ impl<'a> Reading<'a> {
                 t.push_str(&format!(" coalition={id}"));
             }
             (_, Evidence::Uncovered { part }) => t.push_str(&format!(" part={}", part.word())),
+            (_, Evidence::Unaccounted) => t.push_str(" part=unaccounted"),
             (_, Evidence::Startup { wake: Some(w), .. } | Evidence::Wake(w)) => {
                 t.push_str(&Self::wake_words(w))
             }
@@ -993,6 +995,9 @@ impl Reading<'_> {
             }
             (_, Evidence::Uncovered { part }) => {
                 evidence.push(fact("part", "part", Jv::s(part.word()), "derived"));
+            }
+            (_, Evidence::Unaccounted) => {
+                evidence.push(fact("part", "part", Jv::s("unaccounted"), "derived"));
             }
             (_, Evidence::Startup { userspace_ms, wake }) => {
                 evidence.push(fact(

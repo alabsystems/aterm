@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `KERN_PROCARGS2`, the kernel's record of what a process was exec'd with: the workspace's one
-//! reader of it ([`read`], macOS) and one parser ([`parse`]).
+//! reader of it ([`read`](crate::procargs::read), macOS) and one parser ([`parse`](crate::procargs::parse)).
 
 /// One `KERN_PROCARGS2` answer, parsed ([`parse`]): views into its buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]

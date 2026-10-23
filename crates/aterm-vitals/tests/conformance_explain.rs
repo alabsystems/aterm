@@ -12,8 +12,8 @@ use aterm_models_misc::explain_honesty_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
 use aterm_vitals::explain::fixtures::{
-    Scene, USERSPACE_MS, calm_1510, finished_1032, lane_off_1032, liar_1032, spotlight_1032,
-    spotlight_late_1032, tab2_build_1048, wrapped_1218,
+    Scene, USERSPACE_MS, calm_1510, finished_1032, lane_off_1032, liar_1032, reaped_1510,
+    spotlight_1032, spotlight_late_1032, tab2_build_1048, wrapped_1218,
 };
 use aterm_vitals::explain::{
     ActivityId, CauseId, ClauseHold, CoalSplit, Context, Fault, OpenCause, Role, WhySubject,
@@ -41,6 +41,8 @@ struct Truth {
     lowpid_ms: i64,
     /// The earliest birth of every other process above pid 1.
     other_ms: i64,
+    lost: i64,
+    settled: i64,
 }
 
 /// The 10:32 moment's facts: Spotlight's two coalitions are Apple's, hold
@@ -62,6 +64,20 @@ const T1032: Truth = Truth {
     bound: 1,
     lowpid_ms: USERSPACE_MS,
     other_ms: USERSPACE_MS,
+    lost: 0,
+    settled: 0,
+};
+
+/// The calm Mac's facts: nothing holds its terms or the floor, userspace is
+/// 4 h 41 min old, WindowServer was born half a second after `logd` and
+/// `mds`, and memory and the thermal state read settled.
+const T1510: Truth = Truth {
+    terms: 0,
+    above: 0,
+    young: 0,
+    other_ms: USERSPACE_MS + 500,
+    settled: 1,
+    ..T1032
 };
 
 /// Tab 2's build with `mds` at 0.60, 80 % deferred: over 500 mc, under a
@@ -91,6 +107,16 @@ fn terms_failing_1032() -> Scene {
     scene
 }
 
+/// `scene` with the calm Mac's memory and thermal readings.
+fn read_calm(scene: Scene) -> Scene {
+    let calm = calm_1510();
+    Scene {
+        mem: calm.mem,
+        thermal: calm.thermal,
+        ..scene
+    }
+}
+
 /// The scenes: name, the readings, the caller's tab, the facts.
 fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
     let window = |scene: Scene| scene.samples().to_vec();
@@ -98,6 +124,15 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
     cut[2].procs_truncated = true;
     vec![
         ("10:32", window(spotlight_1032()), 1, T1032),
+        (
+            "10:32 with memory and the thermal state read",
+            window(read_calm(spotlight_1032())),
+            1,
+            Truth {
+                settled: 1,
+                ..T1032
+            },
+        ),
         (
             "the liar",
             window(liar_1032()),
@@ -153,17 +188,12 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
                 ..T1032
             },
         ),
+        ("the calm Mac", window(calm_1510()), 1, T1510),
         (
-            "the calm Mac",
-            window(calm_1510()),
+            "a coalition reaped after 1.50 cores on the calm Mac",
+            window(reaped_1510()),
             1,
-            Truth {
-                terms: 0,
-                above: 0,
-                young: 0,
-                other_ms: USERSPACE_MS + 500,
-                ..T1032
-            },
+            Truth { lost: 1, ..T1510 },
         ),
         (
             "a build that finished between sweeps",
@@ -248,16 +278,17 @@ fn project(m: &Model, t: Truth, snap: &Snapshot, tab: u64) -> [S; 3] {
         ("bound", t.bound),
         ("lowpid", rank(Some(t.lowpid_ms), t)),
         ("other", rank(Some(t.other_ms), t)),
+        ("lost", t.lost),
+        ("settled", t.settled),
         ("fresh", 0),
     ]);
+    let cpu = account(WhySubject::Cpu, Some(tab), snap);
     let mut mid = pre.clone();
     mid.extend([
         ("shown", flag(spotlight.is_some())),
         ("tabshown", flag(tab_work.is_some())),
-        (
-            "role",
-            role(account(WhySubject::Cpu, Some(tab), snap).you.role),
-        ),
+        ("role", role(cpu.you.role)),
+        ("none", flag(cpu.nothing_needed)),
         ("start", rank(facts.userspace_ms, t)),
         ("fresh", 1),
     ]);
@@ -327,6 +358,28 @@ fn a_signing_id_matched_alone_is_caught_by_claim_never_vouches() {
     let broken = replay(&mutant, &states, &["Detect", "Attach"])
         .unwrap_or_else(|e| panic!("Buggy 2 does not admit the liar: {e}"));
     assert_eq!(broken, ["ClaimNeverVouches"]);
+}
+
+/// `unexplained` blind to the residual: the calm Mac whose reaped coalition
+/// left 1.50 cores no coalition held reads "nothing needed".
+#[test]
+fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
+    let (_, samples, tab, truth) = cases()
+        .into_iter()
+        .find(|c| c.0.starts_with("a coalition reaped"))
+        .expect("the reaped coalition");
+    let model = explain_honesty_model();
+    let snap = read(&samples, Some(Fault::IgnoreUnaccounted));
+    let healthy = interp::with_buggy(&model, 0);
+    let states = project(&healthy, truth, &snap, tab);
+    assert!(
+        replay(&healthy, &states, &["Detect", "Attach"]).is_err(),
+        "the healthy model admits nothing needed beside a core no coalition held"
+    );
+    let mutant = interp::with_buggy(&model, 10);
+    let broken = replay(&mutant, &states, &["Detect", "Attach"])
+        .unwrap_or_else(|e| panic!("Buggy 10 does not admit the blind residual: {e}"));
+    assert_eq!(broken, ["LostWorkNeverNothingNeeded"]);
 }
 
 /// One clause tick in the model's terms: whether the candidate held, and

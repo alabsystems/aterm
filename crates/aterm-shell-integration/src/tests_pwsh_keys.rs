@@ -55,9 +55,6 @@ impl PowerShellWorld {
         vars
     }
 
-    /// The start of every test child's `-Command`. It refuses, before sourcing
-    /// any integration or hook, a host that does not honor USERPROFILE as
-    /// documented, and never falls back to its home.
     fn home_guard() -> &'static str {
         "if ($HOME -cne $env:ATERM_TEST_HOME) { throw 'private PowerShell home not active' }; \
          $__test_profile = [psobject](Join-Path $HOME 'profile\\CurrentUserCurrentHost.ps1'); \
@@ -67,7 +64,6 @@ impl PowerShellWorld {
          $global:PROFILE = $__test_profile; "
     }
 
-    /// Write `text` as the file `$PROFILE.<name>` names in this world.
     fn write_profile(&self, name: &str, text: &str) {
         let dir = self.home().join("profile");
         std::fs::create_dir_all(&dir).expect("private profile folder");
@@ -83,19 +79,12 @@ const PLAY_PROFILES: &str = "foreach ($__test_name in 'AllUsersAllHosts', 'AllUs
      $__test_file = $global:PROFILE.$__test_name; \
      if (Test-Path -LiteralPath $__test_file) { . $__test_file } }; ";
 
-/// The block an earlier aterm setup wrote into a Windows PowerShell 5.1 profile:
-/// the whole `profile.ps1` it was found in on 2026-10-18 (308 bytes, LF line
-/// endings), which kept every 5.1 tab in Emacs mode and out of the key layer
-/// until the layer took it back (`$__aterm_legacy_emacs_block`).
 const LEGACY_EMACS_BLOCK: &str = "\
 # aterm: emacs line-editing so Ctrl+A/Ctrl+E/Ctrl+K/Ctrl+U... move the cursor\n\
 # (Windows PowerShell 5.1's PSReadLine defaults to \"Windows\" mode, where Ctrl+A =\n\
 # SelectAll and Ctrl+E is unbound). Remove this block to revert.\n\
 if (Get-Module -ListAvailable PSReadLine) { Set-PSReadLineOption -EditMode Emacs }\n";
 
-/// The rows the KEY BINDINGS block binds, in its order: chord, function, and the
-/// stock Windows-mode function it may replace (`""`: the chord is unbound in
-/// Windows mode).
 const READLINE_ROWS: &[(&str, &str, &str)] = &[
     ("Ctrl+a", "BeginningOfLine", "SelectAll"),
     ("Ctrl+e", ACCEPT_THEN_END, ""),
@@ -121,16 +110,10 @@ const READLINE_ROWS: &[(&str, &str, &str)] = &[
     ("Alt+c", "CapitalizeWord", ""),
 ];
 
-/// The BriefDescription of the `Ctrl+e` script block (`AcceptSuggestion`, then
-/// `EndOfLine`), which `Get-PSReadLineKeyHandler -Bound` lists as its function.
 const ACCEPT_THEN_END: &str = "AcceptSuggestionAndEndOfLine";
 
-/// The Alt+u/l/c functions, which PSReadLine 2.0.0 (Windows PowerShell 5.1)
-/// lacks, as it lacks `BackwardKillInput` (measured 2026-10-16 with
-/// `[Microsoft.PowerShell.PSConsoleReadLine].GetMethod`; 2.4.5 has all four).
 const CASE_WORD_FUNCTIONS: &[&str] = &["UpcaseWord", "DowncaseWord", "CapitalizeWord"];
 
-/// The chords Windows mode keeps: none of them may be a row.
 const WINDOWS_MODE_KEEPS: &[&str] = &[
     "Tab",
     "Ctrl+z",
@@ -147,8 +130,6 @@ const WINDOWS_MODE_KEEPS: &[&str] = &[
     "End",
 ];
 
-/// The script's code without its comment lines, so a needle in a comment cannot
-/// satisfy a pin (SPECS.md §5.7).
 fn powershell_code() -> String {
     scripts::POWERSHELL
         .lines()
@@ -157,9 +138,6 @@ fn powershell_code() -> String {
         .join("\n")
 }
 
-/// The block's shape, on every host: after the readline shim, every gate, the
-/// `-Bound` read into an ordinal dictionary, the 2.0.0 fallbacks, and exactly the
-/// rows above.
 #[test]
 fn test_powershell_layers_readline_chords_over_windows_mode() {
     let code = powershell_code();
@@ -354,7 +332,6 @@ impl Bound {
             .map(|(_, function)| function.as_str())
     }
 
-    /// The bindings as a map; Windows mode lists each key once.
     fn map(&self) -> std::collections::BTreeMap<String, String> {
         let map: std::collections::BTreeMap<String, String> = self.keys.iter().cloned().collect();
         assert_eq!(
@@ -655,7 +632,6 @@ fn test_powershell_readline_layer_takes_back_atermss_legacy_emacs_block() {
 #[cfg(windows)]
 #[test]
 fn test_powershell_readline_layer_keeps_an_emacs_the_user_chose() {
-    /// One shell whose Emacs mode must survive the integration.
     struct Chosen {
         what: &'static str,
         /// `(the $PROFILE property naming the file, its text)`.
@@ -829,7 +805,6 @@ static GIT_BASH: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 #[cfg(windows)]
 impl ConptyShell {
-    /// A wait for something that must happen: a hang detector, not a latency budget.
     const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn spawn(
@@ -888,7 +863,6 @@ impl ConptyShell {
         aterm_pty::write_all(self.master, keys.as_bytes());
     }
 
-    /// Wait until the console has drawn `needle`.
     fn wait_for(&mut self, needle: &str, what: &str) {
         let deadline = std::time::Instant::now() + Self::HANG;
         while !self
@@ -909,7 +883,6 @@ impl ConptyShell {
         }
     }
 
-    /// Wait until the shell has exited (the reader saw EOF).
     fn wait_for_exit(&mut self, what: &str) {
         let deadline = std::time::Instant::now() + Self::HANG;
         loop {
@@ -927,7 +900,6 @@ impl ConptyShell {
         }
     }
 
-    /// The end of what the console drew, for a failure message.
     fn drawn(&self) -> String {
         let tail = &self.seen[self.seen.len().saturating_sub(3000)..];
         format!("{:?}", String::from_utf8_lossy(tail))

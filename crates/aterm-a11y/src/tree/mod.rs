@@ -1,9 +1,17 @@
 // Copyright 2021 The AccessKit Authors.
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Derived from accesskit_consumer 0.37.0 src/tree.rs and src/lib.rs.
+//
+// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under
+// Apache-2.0) src/tree.rs and src/lib.rs, and cut by the aterm project in
+// 2026 to what aterm's publisher reads: one tree per window (no grafted
+// subtrees), and an update's changes reported in node order, not hash order.
 
-//! Window accessibility tree ([`Tree`], [`TreeUpdate`], [`ChangeHandler`], [`Node`], [`text`]).
+//! Window accessibility tree ([`Tree`], [`TreeUpdate`], [`ChangeHandler`], [`Node`], [`text`](crate::text)).
+//!
+//! An update that breaks the model's rules (a node that is nobody's child, a
+//! child twice, a focus or root that is not in the tree) panics, as the
+//! upstream crate's does: the window that builds the tree is aterm itself.
 
 mod filters;
 mod iterators;

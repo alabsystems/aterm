@@ -84,8 +84,7 @@ pub fn seam_path(rustup_home: &Path, name: &str) -> PathBuf {
     toolchains_dir(rustup_home).join(name)
 }
 
-/// `<prefix>/store/trust` — the store tree a seam laid before the view existed
-/// resolves into; recognised as atpkg's so it can be re-pointed, never adopted.
+/// `<prefix>/store/trust` — the store tree a seam laid before the view existed resolves into.
 #[must_use]
 /// `<prefix>/store/trust` root recognized as atpkg-owned.
 pub fn owned_root(layout: &Layout) -> PathBuf {
@@ -210,8 +209,7 @@ impl fmt::Display for Deferred {
     }
 }
 
-/// How closely [`view_matches`] holds a view — or a [`crate::compat`] exec root, which is
-/// the same construction under another name — against the build it was laid from.
+/// How closely [`view_matches`] holds a view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Verification depth for [`view_matches`] and [`crate::compat`].
 pub enum Depth {
@@ -271,9 +269,9 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
 }
 
 /// Lay a view's `bin/` at `dst_bin` (created here, empty) from the build's `bin/`.
-///
 /// # Errors
-/// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another volume: it refuses rather than byte-copy the toolchain).
+/// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another volume: it
+/// refuses rather than byte-copy the toolchain).
 fn lay_bin(layout: &Layout, src_bin: &Path, dst_bin: &Path) -> io::Result<BinPlan> {
     let plan = bin_plan(src_bin)?;
     layout.ensure_dir(dst_bin)?;
@@ -284,7 +282,6 @@ fn lay_bin(layout: &Layout, src_bin: &Path, dst_bin: &Path) -> io::Result<BinPla
 }
 
 /// Lays a complete view of `build` at `dest` ([`lay_view_dirs`] then `bin/`).
-///
 /// # Errors
 /// Returns an error if `dest` exists or laying directories or binaries fails.
 #[cfg(unix)]
@@ -295,7 +292,6 @@ pub(crate) fn lay_view(layout: &Layout, build: &Path, dest: &Path) -> io::Result
 }
 
 /// Lays [`lay_view`] without `bin/` for [`crate::compat::ensure_root`].
-///
 /// # Errors
 /// Returns an error if `dest` exists or mirroring directories fails.
 #[cfg(unix)]
@@ -326,8 +322,7 @@ pub(crate) fn view_matches(build: &Path, view: &Path, depth: Depth) -> bool {
     first_mismatch(build, view, depth).is_none()
 }
 
-/// The first path at which the view at `view` stops being `build` at `depth`, or `None` when
-/// it matches.
+/// The first path at which the view at `view` stops being `build` at `depth`.
 #[must_use]
 /// First path where `view` mismatches `build` at `depth`, or `None` if it matches.
 pub(crate) fn first_mismatch(build: &Path, view: &Path, depth: Depth) -> Option<PathBuf> {
@@ -354,9 +349,7 @@ pub(crate) fn first_mismatch(build: &Path, view: &Path, depth: Depth) -> Option<
     }
 }
 
-/// [`first_mismatch`] over `bin/` alone, for a `view` known to be a real directory:
-/// `<view>/bin` a real directory holding exactly the build's [`BinPlan`], each entry a clone
-/// of its store file.
+/// [`first_mismatch`] over `bin/` alone.
 #[cfg(unix)]
 /// [`first_mismatch`] over `bin/` alone for a real directory `view`.
 pub(crate) fn bin_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
@@ -386,8 +379,7 @@ pub(crate) fn bin_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
     None
 }
 
-/// [`Depth::Deep`]'s byte check over the stock names: each of [`STOCK_NAMES`] the view
-/// presents must hold its Trust tool's bytes.
+/// [`Depth::Deep`]'s byte check over the stock names.
 #[cfg(unix)]
 /// [`Depth::Deep`] byte check over [`STOCK_NAMES`] in `view`.
 pub(crate) fn stock_bytes_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
@@ -424,10 +416,7 @@ fn dir_mismatch(_build: &Path, view: &Path, dir: &str, _depth: Depth) -> Option<
     Some(view.join(dir))
 }
 
-/// The half of [`first_mismatch`] over one of [`VIEW_DIRS`], `dir`, at `depth`: absent in
-/// the view when the build has none; a real directory otherwise, holding at
-/// [`Depth::Shallow`] the top-level regular files of `lib/` as clones of the store's (and
-/// nothing more is asked of the others), at [`Depth::Deep`] exactly the mirrored tree.
+/// The half of [`first_mismatch`] over one of [`VIEW_DIRS`].
 #[cfg(unix)]
 fn dir_mismatch(build: &Path, view: &Path, dir: &str, depth: Depth) -> Option<PathBuf> {
     let src = build.join(dir);
@@ -452,8 +441,7 @@ pub(crate) fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// [`Depth::Shallow`] over `lib/`: every regular file directly in `src` a clone of it in
-/// `dst`.
+/// [`Depth::Shallow`] over `lib/`: every regular file directly in `src` a clone of it in `dst`.
 #[cfg(unix)]
 fn top_files_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
     let Ok(listing) = std::fs::read_dir(src) else {
@@ -474,9 +462,7 @@ fn top_files_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
     None
 }
 
-/// [`Depth::Deep`] over one mirrored directory: exactly what [`mirror_tree`] lays —
-/// regular files cloned from the store's, symlinks with equal targets, real directories
-/// recursed — and nothing else, in either direction.
+/// [`Depth::Deep`] over one mirrored directory.
 #[cfg(unix)]
 fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
     let Ok(listing) = std::fs::read_dir(src) else {
@@ -531,7 +517,6 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
 }
 
 /// Builds or refreshes the view for `name` from `store/trust/current`.
-///
 /// # Errors
 /// Returns an error if `store/trust/current` is unreadable or the view cannot be written or cloned.
 pub fn refresh_view(layout: &Layout, name: &str) -> io::Result<Refreshed> {
@@ -679,8 +664,7 @@ pub enum ViewSource {
     LinkedNoSysroot(PathBuf),
 }
 
-/// Which source the view presents now — the link marker outranks the store, as it does
-/// for `which` and `list`.
+/// Which source the view presents now.
 #[must_use]
 /// Returns the current [`ViewSource`] for `layout`.
 pub fn view_source(layout: &Layout) -> ViewSource {
@@ -698,9 +682,7 @@ pub fn view_source(layout: &Layout) -> ViewSource {
     }
 }
 
-/// Whether the view at `view` already presents `checkout` as [`refresh_linked_view`] lays it:
-/// `bin/` a real directory holding exactly the stubs [`linked_stubs`] renders, byte for byte,
-/// and each of [`VIEW_DIRS`] a link to the checkout's, or absent when the checkout has none.
+/// Whether the view at `view` already presents `checkout` as [`refresh_linked_view`] lays it.
 #[cfg(unix)]
 fn linked_view_matches(checkout: &Path, view: &Path, plan: &BinPlan) -> bool {
     for dir in VIEW_DIRS {
@@ -718,10 +700,7 @@ fn linked_view_matches(checkout: &Path, view: &Path, plan: &BinPlan) -> bool {
     is_real_dir(&bin) && bin_holds_exactly(&bin, plan)
 }
 
-/// The stubs a linked view's `bin/` at `dst_bin` holds for `plan`: one
-/// [`crate::lay::Executable`] per entry, the `bin/` shim body that execs the checkout's file
-/// ([`crate::platform::shim_executable_to_env`], with no exported environment — a dev
-/// checkout's target never routes through an exec root, so no guard line is rendered).
+/// The stubs a linked view's `bin/` at `dst_bin` holds for `plan`.
 #[cfg(unix)]
 fn linked_stubs(dst_bin: &Path, plan: &BinPlan) -> io::Result<Vec<crate::lay::Executable>> {
     plan.entries
@@ -736,8 +715,7 @@ fn linked_stubs(dst_bin: &Path, plan: &BinPlan) -> io::Result<Vec<crate::lay::Ex
         .collect()
 }
 
-/// Whether `bin` holds exactly the stubs of `plan` — every entry a regular file whose
-/// bytes are the rendered stub, nothing extra — read with `lstat` and bounded reads.
+/// Whether `bin` holds exactly the stubs of `plan`.
 #[cfg(unix)]
 fn bin_holds_exactly(bin: &Path, plan: &BinPlan) -> bool {
     let Ok(want) = linked_stubs(bin, plan) else {
@@ -764,8 +742,7 @@ fn bin_holds_exactly(bin: &Path, plan: &BinPlan) -> bool {
     seen == want.len()
 }
 
-/// Move `at` (a directory, a link, anything) aside under `view` and remove it — how
-/// [`refresh_linked_view`] takes down what stood at a name before it lays its own.
+/// Move `at` (a directory, a link, anything) aside under `view` and remove it.
 #[cfg(unix)]
 fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
     if std::fs::symlink_metadata(at).is_err() {
@@ -780,9 +757,7 @@ fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Lay the view for a dev-linked `checkout`: the mirrored directories as
-/// links to the checkout's, and `bin/` staged as one exec stub per plan entry and swapped in
-/// when it differs.
+/// Lay the view for a dev-linked `checkout`.
 #[cfg(unix)]
 fn refresh_linked_view(
     layout: &Layout,
@@ -974,7 +949,6 @@ pub struct Probe {
 }
 
 /// Inspects the seam entry for `name` without modifying the filesystem.
-///
 /// # Errors
 /// Returns the `lstat`/`readlink` error when the entry exists but cannot be read.
 pub fn probe(layout: &Layout, rustup_home: &Path, name: &str) -> io::Result<Probe> {
@@ -1044,8 +1018,7 @@ pub enum Attached {
 }
 
 impl Attached {
-    /// Whether the seam is now recorded and live (everything but no-rustup, and an entry
-    /// left behind — nothing was recorded for it).
+    /// Whether the seam is now recorded and live.
     #[cfg(test)]
     #[must_use]
     /// Whether the seam is now recorded and live.
@@ -1172,8 +1145,7 @@ impl fmt::Display for Attached {
     }
 }
 
-/// Why a foreign link's toolchain is stale beside the store's trust build — the one kind
-/// of foreign entry [`repair`] re-points.
+/// Why a foreign link's toolchain is stale beside the store's trust build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Reason a foreign link's toolchain is stale relative to the store's trust build.
 pub enum Stale {
@@ -1195,8 +1167,7 @@ impl fmt::Display for Stale {
     }
 }
 
-/// Whether the toolchain at `sysroot` is stale beside the store's current trust build: gone,
-/// or older.
+/// Whether the toolchain at `sysroot` is stale beside the store's current trust build.
 #[must_use]
 /// Checks whether the toolchain at `sysroot` is missing or older than the store build.
 pub fn stale_against_store(layout: &Layout, sysroot: &Path) -> Option<Stale> {
@@ -1236,8 +1207,7 @@ fn commit_date(sysroot: &Path) -> Option<String> {
     })
 }
 
-/// Whether `sysroot` is a live rustc build tree's stage sysroot (`…/build/<triple>/stage0`,
-/// `stage1` or `stage2`, or `build/host/…`), as written or as it resolves.
+/// Whether `sysroot` is a live rustc build tree's stage sysroot.
 #[must_use]
 /// Whether `sysroot` is a stage sysroot inside a live `rustc` build tree.
 pub fn live_build_tree(sysroot: &Path) -> bool {
@@ -1282,8 +1252,6 @@ enum Heal {
 }
 
 fn unattended_heal(layout: &Layout, name: &str, entry: &Path, target: &Path) -> Heal {
-    // A target that is not UTF-8 could not be recorded as it is (`status.toml` is text), and
-    // a way back recorded wrong is a hold that never matches: such a link is left.
     if name != DEFAULT_SEAM || target.to_str().is_none() || !live_build_tree(target) {
         return Heal::No;
     }
@@ -1384,8 +1352,7 @@ pub fn replaced_note(layout: &Layout, rustup_home: &Path, name: &str) -> Option<
     }
 }
 
-/// Why an `attach` or [`detach`] did not happen. Every variant is fail-closed:
-/// nothing on disk changed.
+/// Why an `attach` or [`detach`] did not happen.
 #[derive(Debug)]
 /// Fail-closed reason an `attach` or [`detach`] was refused.
 pub enum Refusal {
@@ -1449,9 +1416,9 @@ impl fmt::Display for Refusal {
 impl std::error::Error for Refusal {}
 
 /// Attaches seam `name` by refreshing its view, linking it into rustup, and recording it.
-///
 /// # Errors
-/// Returns [`Refusal`] if `name` is disallowed, trust is missing, the entry is foreign, or I/O fails.
+/// Returns [`Refusal`] if `name` is disallowed, trust is missing, the entry is foreign, or I/O
+/// fails.
 #[cfg(test)]
 pub(crate) fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attached, Refusal> {
     attach_reporting(
@@ -1659,9 +1626,7 @@ pub enum SeamEvent {
 }
 
 impl SeamEvent {
-    /// The seam's name and the entry, when this is a foreign entry left alone
-    /// ([`Refusal::Foreign`]) — what the pass's `foreign:` marker names for the window,
-    /// whose one fix is [`DETACH_FIX`].
+    /// The seam's name and the entry.
     #[must_use]
     /// Seam name and path when this event is a [`Refusal::Foreign`].
     pub fn foreign_entry(&self) -> Option<(&str, &Path)> {
@@ -1813,7 +1778,6 @@ fn unlink_checked(path: &Path) -> io::Result<()> {
 }
 
 /// Detaches seam `name`, removing its owned link (or forcing removal) and dropping its record.
-///
 /// # Errors
 /// Returns [`Refusal`] if `name` is disallowed, the entry is foreign without `force`, or I/O fails.
 pub fn detach(
@@ -1979,8 +1943,7 @@ pub fn recorded_keys(layout: &Layout) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The recorded rustup seam names on the allowlist, which a re-assertion or a whole-set
-/// detach walks.
+/// The recorded rustup seam names on the allowlist.
 #[must_use]
 /// Recorded rustup seam names on [`SEAM_NAMES`].
 pub fn recorded_names(layout: &Layout) -> Vec<String> {
@@ -1992,8 +1955,7 @@ pub fn recorded_names(layout: &Layout) -> Vec<String> {
         .collect()
 }
 
-/// The `seams` keys the disk itself proves: every allowlisted rustup toolchain entry that
-/// resolves into this prefix.
+/// The `seams` keys the disk itself proves.
 #[must_use]
 /// Allowlisted rustup seam keys currently pointing into this prefix on disk.
 pub fn attached_keys(layout: &Layout) -> Vec<String> {
@@ -2066,8 +2028,7 @@ fn refusal_prefix(name: &str) -> String {
     k
 }
 
-/// Every recorded refusal, as `(name, why)` — what `status`/`doctor` print when the last
-/// pass could not lay a seam.
+/// Every recorded refusal.
 #[cfg(all(test, unix))]
 #[must_use]
 /// All recorded refusals as `(name, why)` pairs.
@@ -2113,8 +2074,7 @@ fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
     crate::status::write(layout, &s)
 }
 
-/// Re-assert every recorded seam, plus [`DEFAULT_SEAM`] when trust is installed or dev-linked
-/// to a sysroot.
+/// Re-assert every recorded seam.
 #[must_use]
 /// Re-asserts all recorded seams plus [`DEFAULT_SEAM`] when trust is available.
 pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<SeamEvent> {
@@ -2127,9 +2087,7 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<SeamEvent> {
     )
 }
 
-/// [`reassert`] for `aterm pkg repair`, the pass a person asks for: a foreign link to
-/// nothing, or to a toolchain older than the store's ([`stale_against_store`]), is
-/// re-pointed at the view too, and the line names what it was, so it can be linked back.
+/// [`reassert`] for `aterm pkg repair`.
 #[must_use]
 /// [`reassert`] for `aterm pkg repair`, also replacing stale foreign links once.
 pub fn repair(layout: &Layout, rustup_home: &Path) -> Vec<SeamEvent> {
@@ -2165,10 +2123,6 @@ fn reassert_with(
     for name in names {
         match attach_reporting(layout, rustup_home, &name, refresh, running, repair) {
             Ok((a, left)) => {
-                // Success clears the last recorded refusal, and so does a view left behind:
-                // every recorded refusal is decided before the view is touched, so this pass
-                // re-asked it, and a failed re-lay is `Io`, which is never recorded. An entry
-                // left behind is the exception: it is still the link the last pass refused.
                 if !matches!(a, Attached::LeftEntry { .. }) {
                     let _ = clear_refusal(layout, &name);
                 }
@@ -2218,8 +2172,6 @@ fn reassert_with(
                 }
             }
             Err(refusal) => {
-                // Recorded, not only returned: the GUI discards the pass's stdout. `Io` is a
-                // transient; recording it would make one EIO a standing fault in Settings.
                 if !matches!(refusal, Refusal::Io(_)) {
                     let _ = record_refusal(layout, &name, &refusal.to_string());
                     crate::quiet::clear_view_left(layout, &name);
@@ -2351,8 +2303,8 @@ mod tests {
         matches!(refusal(e), Some(Refusal::PutBack { .. }))
     }
 
-    /// The link an older toolchain's replacement re-pointed away from — the one whose way
-    /// back the line prints ([`put_back_hint`]).
+    /// The link an older toolchain's replacement re-pointed away from — the one whose way back the
+    /// line prints.
     #[cfg(unix)]
     fn replaced_older(e: &SeamEvent) -> Option<&Path> {
         match attached(e) {
@@ -2523,9 +2475,7 @@ mod tests {
         assert!(matches!(out, Attached::Adopted { .. }), "{out}");
     }
 
-    /// A rustup `trust` entry that is not atpkg's — a real directory, a link out of the
-    /// prefix, a regular file — is refused with the one fix, fail-closed: left exactly
-    /// as it stands, and nothing recorded.
+    /// A rustup `trust` entry that is not atpkg's is refused with the one fix and left alone.
     #[cfg(unix)]
     #[test]
     fn a_foreign_entry_is_refused_with_the_one_fix_and_left_alone() {
@@ -2609,9 +2559,7 @@ mod tests {
         assert_eq!(refused_key("trust"), "refused:rustup:trust");
     }
 
-    /// The unattended pass names the foreign entry it left alone
-    /// ([`SeamEvent::foreign_entry`]), for the pass's `foreign:` marker, and touches nothing;
-    /// once the entry is atpkg's, nothing is named.
+    /// The unattended pass names the foreign entry it left alone ([`SeamEvent::foreign_entry`]).
     #[cfg(unix)]
     #[test]
     fn the_unattended_pass_names_the_foreign_entry_it_left_alone() {
@@ -2630,9 +2578,7 @@ mod tests {
     }
 
     /// A compiler at `<sysroot>/bin/<name>` answering `-vV` with the `commit-date:` in
-    /// `<sysroot>/commit-date`: a hard link to one script per fixture, run once here unbounded,
-    /// because macOS assesses a new executable on its first exec (~20 s under load, past the
-    /// 5 s probe bound) and a link to an assessed file is not new.
+    /// `<sysroot>/commit-date`.
     #[cfg(unix)]
     fn dated_compiler(fx: &Fixture, sysroot: &Path, name: &str, date: &str) {
         let script = fx.root.path().join("dated-compiler");
@@ -2654,9 +2600,7 @@ mod tests {
         std::fs::write(sysroot.join("commit-date"), date).unwrap();
     }
 
-    /// An older sealed toolchain (`~/toolchains/trust-<rev>`): the unattended pass refuses it,
-    /// `repair` re-points it, names it and records the way back, leaving the tree; likewise a
-    /// link to a tree that is gone.
+    /// An older sealed toolchain (`~/toolchains/trust-<rev>`).
     #[cfg(unix)]
     #[test]
     fn repair_repoints_a_link_to_an_older_or_missing_toolchain_and_nothing_else() {
@@ -2762,8 +2706,8 @@ mod tests {
         assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), sealed);
     }
 
-    /// The store (build 9192, dated 2026-09-17) and a live build tree at `rel` whose `rustc`
-    /// says `date`, with rustup's `trust` linked at it.
+    /// The store (build 9192, dated 2026-09-17) and a live build tree at `rel` whose `rustc` says
+    /// `date`.
     #[cfg(unix)]
     fn stale_tree_fixture(fx: &Fixture, rel: &str, date: &str) -> PathBuf {
         let build = fx.install_trust(9192);
@@ -2786,8 +2730,7 @@ mod tests {
         )
     }
 
-    /// The shape the unattended heal is limited to: `…/build/<triple|host>/stage[0-2]`, as
-    /// written or as it resolves, and nothing near it.
+    /// The shape the unattended heal is limited to: `…/build/<triple|host>/stage[0-2]`.
     #[cfg(unix)]
     #[test]
     fn live_build_tree_is_the_stage_sysroot_shape_and_nothing_near_it() {
@@ -2828,9 +2771,7 @@ mod tests {
         assert!(live_build_tree(&alias));
     }
 
-    /// The unattended pass re-points an older live build tree at the view, says so with the
-    /// way back on the line, records what it replaced, leaves the tree alone and is quiet
-    /// after.
+    /// The unattended pass re-points an older live build tree at the view.
     #[cfg(unix)]
     #[test]
     fn the_unattended_pass_repoints_an_older_live_build_tree_and_records_the_way_back() {
@@ -2898,10 +2839,7 @@ mod tests {
         }
     }
 
-    /// The unattended pass leaves every other foreign link, each with a staleness control
-    /// where that is the point: an older seal, another prefix's older store build, a newer live
-    /// tree, one of unknown age (no date, a silent driver, emptied mid-rebuild), one that is
-    /// gone, an older live tree under a dev-link, and `trust-dev`.
+    /// The unattended pass leaves every other foreign link.
     #[cfg(unix)]
     #[test]
     fn the_unattended_pass_leaves_every_other_foreign_link() {
@@ -3002,8 +2940,7 @@ mod tests {
         assert_eq!(replaced_from(&fx.layout, "trust-dev"), None);
     }
 
-    /// An older numbered build of this store is the pre-view layout: re-pointed as ever, and
-    /// never recorded as a replaced toolchain.
+    /// An older numbered build of this store is the pre-view layout.
     #[cfg(unix)]
     #[test]
     fn a_link_to_a_store_build_is_never_recorded_as_replaced() {
@@ -3022,9 +2959,7 @@ mod tests {
         assert_eq!(replaced_note(&fx.layout, &fx.rustup, "trust"), None);
     }
 
-    /// The heal's in-use deferral, as for `repair`: with a compiler running from under the tree
-    /// (resolved through x.py's `host` link) or an unreadable table, the entry is left and
-    /// nothing recorded; the first pass that finds nothing running heals it.
+    /// The heal's in-use deferral.
     #[cfg(unix)]
     #[test]
     fn the_unattended_heal_waits_out_a_build_running_through_the_tree() {
@@ -3068,8 +3003,7 @@ mod tests {
         );
     }
 
-    /// The undo: after the printed `ln -sfn`, every unattended pass leaves the link (a recorded
-    /// refusal of its own) and doctor's note says so; only `repair` re-points it.
+    /// The undo.
     #[cfg(unix)]
     #[test]
     fn a_link_put_back_after_the_heal_is_left_by_every_pass_until_repair() {
@@ -3137,8 +3071,7 @@ mod tests {
         assert_eq!(replaced_from(&fx.layout, "trust"), Some(other));
     }
 
-    /// The hold is on the tree, whatever the spelling: `rustup toolchain link trust .` inside
-    /// `build/host/stage2` writes `build/<triple>/stage2/.` (rustup 1.29).
+    /// The hold is on the tree.
     #[cfg(unix)]
     #[test]
     fn a_link_put_back_with_rustups_own_spelling_is_held() {
@@ -3170,8 +3103,8 @@ mod tests {
         assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), rustups);
     }
 
-    /// A heal whose swap fails drops its in-flight record and leaves an earlier heal's way back
-    /// as it was; read as the hold, that record would block the heal for good.
+    /// A heal whose swap fails drops its in-flight record and leaves an earlier heal's way back as
+    /// it was.
     #[cfg(unix)]
     #[test]
     fn a_heal_whose_swap_fails_leaves_the_record_as_it_stood() {
@@ -3206,9 +3139,8 @@ mod tests {
         assert_eq!(replaced_from(&fx.layout, "trust"), Some(stage2));
     }
 
-    /// A heal cut off before its rename (only the in-flight record written) is finished by the
-    /// next pass, with no doctor note in between; cut off after it, the next pass that adopts
-    /// the entry settles the way back, and a link then put back is held.
+    /// A heal cut off before its rename (only the in-flight record written) is finished by the next
+    /// pass.
     #[cfg(unix)]
     #[test]
     fn a_heal_cut_off_before_or_after_its_rename_is_finished_by_the_next_pass() {
@@ -3257,8 +3189,7 @@ mod tests {
     }
 
     /// An in-flight record left by a heal that never renamed is never settled later as a
-    /// replacement: an entry laid afresh reports nothing replaced, and a later link to the
-    /// tree, once older again, is healed rather than held.
+    /// replacement.
     #[cfg(unix)]
     #[test]
     fn a_heal_cut_off_before_its_rename_and_never_finished_replaced_nothing() {
@@ -3286,8 +3217,7 @@ mod tests {
         );
     }
 
-    /// The entry is read again before the swap: a link changed while the view was laid is left
-    /// for the next pass, and nothing is recorded as replaced.
+    /// The entry is read again before the swap.
     #[cfg(unix)]
     #[test]
     fn a_link_changed_while_the_view_is_laid_is_left_for_the_next_pass() {
@@ -3330,8 +3260,7 @@ mod tests {
         assert_eq!(std::fs::read_link(&entry).unwrap(), seal);
     }
 
-    /// The printed way back runs as printed: its operands are quoted by the shim's rule, so a
-    /// path with a `'` in it is put back.
+    /// The printed way back runs as printed.
     #[cfg(unix)]
     #[test]
     fn the_printed_way_back_puts_back_a_path_with_a_quote_in_it() {
@@ -3356,8 +3285,7 @@ mod tests {
         assert!(is_put_back(&lines[0]), "{lines:?}");
     }
 
-    /// The same guard on the other re-point: a pre-view link to an older store build that a
-    /// live build runs through is left, and re-pointed once nothing runs from it.
+    /// The same guard on the other re-point.
     #[cfg(unix)]
     #[test]
     fn a_pre_view_store_link_a_live_build_runs_through_is_left_until_it_exits() {
@@ -3395,9 +3323,8 @@ mod tests {
         );
     }
 
-    /// A pre-view link to the view's own build (`store/trust/current`, or its number) is
-    /// re-pointed even while a process runs from that build or the table cannot be read: the
-    /// view is clones of that build, so no compiler switches.
+    /// A pre-view link to the view's own build (`store/trust/current`, or its number) is re-pointed
+    /// even while a process runs from that build or the table cannot be read.
     #[cfg(unix)]
     #[test]
     fn a_pre_view_link_to_the_views_own_build_is_repointed_under_a_running_build() {
@@ -3657,9 +3584,7 @@ mod tests {
         assert_eq!(recorded_names(&fx.layout), vec!["trust".to_string()]);
     }
 
-    /// The view: one clone per tool under its own name, each stock name a clone of its
-    /// Trust tool — its bytes on a new inode, never the store's own — `lib/` a real
-    /// directory of clones, and not one store file gaining a link.
+    /// The view.
     #[cfg(unix)]
     #[test]
     fn the_view_is_a_clone_of_the_build_with_the_stock_names_laid() {
@@ -3708,8 +3633,7 @@ mod tests {
         assert!(!refresh_view(&fx.layout, "trust").unwrap().changed);
     }
 
-    /// A stock-name copy an older bundle shipped is not presented: the view's `rustc` is a
-    /// clone of the store's `trustc`.
+    /// A stock-name copy an older bundle shipped is not presented.
     #[cfg(unix)]
     #[test]
     fn a_stock_copy_the_bundle_shipped_is_replaced_by_a_clone_of_the_trust_tool() {
@@ -3729,8 +3653,7 @@ mod tests {
         );
     }
 
-    /// The view follows `current`: after an update the stock names are clones of the new
-    /// build's tools.
+    /// The view follows `current`.
     #[cfg(unix)]
     #[test]
     fn the_view_follows_current_across_an_update() {
@@ -3765,8 +3688,7 @@ mod tests {
         );
     }
 
-    /// A view a live process runs from is left as it stands, for the executable's path in
-    /// either spelling and for an unreadable table.
+    /// A view a live process runs from is left as it stands.
     #[cfg(unix)]
     #[test]
     fn a_view_a_live_process_runs_from_is_left_as_it_stands() {
@@ -3831,9 +3753,7 @@ mod tests {
         assert!(view_matches(&new, &view, Depth::Deep));
     }
 
-    /// A view a command under `aterm pkg lease` holds is left as it stands (between two of
-    /// its steps nothing runs from it); the line names the holder, and once the run ends
-    /// the view follows `current`.
+    /// A view a command under `aterm pkg lease` holds is left as it stands.
     #[cfg(unix)]
     #[test]
     fn a_leased_view_is_left_as_it_stands_until_the_run_ends() {
@@ -3865,9 +3785,7 @@ mod tests {
         assert!(view_matches(&new, &view, Depth::Deep));
     }
 
-    /// A view left behind under a lease is recorded: the park's re-check finds nothing due
-    /// while the lease stands and [`crate::quiet::Due::View`] once the run ends, and the pass
-    /// it wakes lays the view and ends the record.
+    /// A view left behind under a lease is recorded.
     #[cfg(unix)]
     #[test]
     fn a_view_a_flip_left_behind_is_recorded_and_due_once_its_run_ends() {
@@ -3934,8 +3852,7 @@ mod tests {
         assert_eq!(crate::quiet::due_with(&fx.layout, t0, &quiet), None);
     }
 
-    /// With `~/.rustup/toolchains` gone no re-assertion reaches a seam, so the one that finds
-    /// no rustup ends the record of a view left behind.
+    /// With `~/.rustup/toolchains` gone no re-assertion reaches a seam.
     #[cfg(unix)]
     #[test]
     fn a_view_left_behind_ends_when_rustup_is_gone() {
@@ -3974,8 +3891,7 @@ mod tests {
         drop(lease);
     }
 
-    /// The dev-link arm takes a clone view down to lay its stubs; not while a build runs
-    /// from that clone view.
+    /// The dev-link arm takes a clone view down to lay its stubs.
     #[cfg(unix)]
     #[test]
     fn a_dev_link_does_not_take_down_a_view_a_build_runs_from() {
@@ -4012,8 +3928,7 @@ mod tests {
         crate::linkmode::unlink(&fx.layout, "trust").unwrap();
     }
 
-    /// A pass that leaves the view behind still clears a refusal the disk has answered: every
-    /// recorded refusal is decided before the view is touched, so the pass re-asked it.
+    /// A pass that leaves the view behind still clears a refusal the disk has answered.
     #[cfg(unix)]
     #[test]
     fn a_deferral_keeps_no_refusal_the_disk_answered_and_a_failed_relay_records_none() {
@@ -4073,8 +3988,7 @@ mod tests {
         crate::linkmode::unlink(&fx.layout, "trust").unwrap();
     }
 
-    /// End to end with a real process: a copy of this test binary stands in the store as
-    /// `targo` and runs from the view ([`probe_parks_in_the_view_until_killed`]).
+    /// End to end with a real process.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn reassert_leaves_a_view_a_live_build_runs_from_and_says_so() {
@@ -4177,9 +4091,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     const VIEW_PARKED: &str = "parked in the view";
 
-    /// The copy's whole job: say [`VIEW_PARKED`], then run from the view until the parent
-    /// kills it — or goes away, so a parent that dies first leaves no stray in the process
-    /// table.
+    /// The copy's whole job.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn probe_parks_in_the_view_until_killed() {
@@ -4198,8 +4110,7 @@ mod tests {
         }
     }
 
-    /// A dev checkout shaped like a sysroot: Trust-named tools in `bin/`, a `lib/`
-    /// with a driver, a `share/` — and no stock names, like the distribution.
+    /// A dev checkout shaped like a sysroot.
     #[cfg(unix)]
     fn sysroot_checkout(fx: &Fixture, label: &str) -> PathBuf {
         let dir = fx.root.path().join(label);
@@ -4217,8 +4128,7 @@ mod tests {
         dir
     }
 
-    /// A dev-linked trust is what rustup's `trust` presents: exec stubs into the checkout's
-    /// `bin/` (stock names to their Trust tools) and links to its directories.
+    /// A dev-linked trust is what rustup's `trust` presents.
     #[cfg(unix)]
     #[test]
     fn a_dev_linked_trust_is_what_rustup_presents_until_it_is_unlinked() {
@@ -4363,8 +4273,7 @@ mod tests {
         assert!(reassert(&fx.layout, &fx.rustup).is_empty());
     }
 
-    /// A dev-link to a checkout that is not a sysroot is refused and recorded, the view left
-    /// presenting the store; the refusal clears once the link goes.
+    /// A dev-link to a checkout that is not a sysroot is refused and recorded.
     #[cfg(unix)]
     #[test]
     fn a_dev_link_to_a_tree_that_is_no_sysroot_is_refused_and_recorded() {
@@ -4415,7 +4324,7 @@ mod tests {
     }
 
     /// A checkout inside atpkg's own prefix (its stubs would exec themselves) is refused as no
-    /// sysroot; a hand-edited stub is re-laid.
+    /// sysroot.
     #[cfg(unix)]
     #[test]
     fn a_checkout_inside_the_prefix_is_refused_and_an_edited_stub_is_relaid() {
@@ -4474,8 +4383,7 @@ mod tests {
         assert!(reassert(&fx.layout, &fx.rustup).is_empty());
     }
 
-    /// A dev-linked sysroot with no store build still gets the seam, pointing at a view of the
-    /// checkout.
+    /// A dev-linked sysroot with no store build still gets the seam.
     #[cfg(unix)]
     #[test]
     fn a_dev_linked_trust_with_no_store_build_still_gets_the_seam() {
@@ -4518,8 +4426,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(fx.seam("trust")).is_err());
     }
 
-    /// A symlinked tool in the bundle's `bin/` is not presented: every Trust frontend
-    /// refuses a symlinked sibling, so the view would only move the refusal.
+    /// A symlinked tool in the bundle's `bin/` is not presented.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_tool_in_the_bundle_is_left_out_of_the_view() {
@@ -4535,8 +4442,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(bin.join("rustc")).is_err());
     }
 
-    /// `(path, st_nlink, st_ctime, st_ctime_nsec)` of every entry under `dir`, sorted —
-    /// the part of an inode's identity tippy's guard snapshots and a link or unlink moves.
+    /// `(path, st_nlink, st_ctime, st_ctime_nsec)` of every entry under `dir`.
     #[cfg(unix)]
     fn inode_stamps(dir: &Path) -> Vec<(PathBuf, u64, i64, i64)> {
         use std::os::unix::fs::MetadataExt;
@@ -4556,8 +4462,7 @@ mod tests {
         out
     }
 
-    /// A second refresh of a matching view makes no link or unlink call: tippy pins the
-    /// `st_nlink` and `st_ctime` of its executable and siblings.
+    /// A second refresh of a matching view makes no link or unlink call.
     #[cfg(unix)]
     #[test]
     fn a_second_refresh_of_a_matching_view_touches_no_store_inode() {
@@ -4597,9 +4502,7 @@ mod tests {
         assert_ne!(inode_stamps(&build), store_before, "the stamps are blind");
     }
 
-    /// `view_matches` catches a stock name hard-linked to its Trust tool (both depths), one
-    /// with the Trust tool's attributes but other bytes (deep only), and a file planted deep in
-    /// `lib/` (deep only); the next refresh heals each.
+    /// `view_matches` catches a stock name hard-linked to its Trust tool (both depths).
     #[cfg(unix)]
     #[test]
     fn view_matches_rejects_a_linked_or_rebytten_stock_name_and_a_planted_file() {
@@ -4679,8 +4582,8 @@ mod tests {
         assert!(view_matches(&build, &view, Depth::Deep));
     }
 
-    /// Debris a killed rebuild left beside `bin/` (which `first_mismatch` ignores) is swept by
-    /// the next refresh, and only names of the producer's exact shape.
+    /// Debris a killed rebuild left beside `bin/` (which `first_mismatch` ignores) is swept by the
+    /// next refresh.
     #[cfg(unix)]
     #[test]
     fn a_killed_rebuilds_debris_is_swept_by_the_next_refresh() {
@@ -4737,9 +4640,8 @@ mod tests {
         );
     }
 
-    /// A `.DS_Store` under the view's `share/` is re-mirrored away without moving a `bin/` or
-    /// store `lib/` inode; a failing mirror fails before `bin/` on every retry; a stray in the
-    /// view's `bin/` does re-lay `bin/` (the control).
+    /// A `.DS_Store` under the view's `share/` is re-mirrored away without moving a `bin/` or store
+    /// `lib/` inode.
     #[cfg(unix)]
     #[test]
     fn a_rebuild_relays_only_the_part_that_differs() {
@@ -4794,9 +4696,7 @@ mod tests {
         assert!(view_matches(&build, &view, Depth::Deep));
     }
 
-    /// A matching view is accepted only where [`Layout::ensure_dir`] would accept it: behind a
-    /// symlink at `<prefix>/rustup` the refresh is refused, and a view directory at `0777` is
-    /// hardened to `0700`, with no store inode moved.
+    /// A matching view is accepted only where [`Layout::ensure_dir`] would accept it.
     #[cfg(unix)]
     #[test]
     fn a_matching_view_behind_a_link_or_a_loose_mode_is_not_accepted() {

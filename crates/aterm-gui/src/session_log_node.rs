@@ -1,58 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INSTANCE'S NODE LOG, host side (design
-//! §2.1 "node", §2.6 "Per instance", §6's instance row): one
-//! [`aterm_slog::NodeLog`] per process, what the instance itself did.
-//!
-//! Three producers, each a typed call:
-//! - **`start prev_end=`.** Written when the node log is first touched
-//!   ([`install`], at `main_entry`) as `prev_end=-`; the recovery census
-//!   (`recovery_census::record`'s thread) amends it with how the run before
-//!   this launch ended once it has read the ledger ([`NodeLogHost::note_prev_end`]:
-//!   `amend n start prev_end=<word>`, a caught signal's number in `code=`). A
-//!   launch that never reads the ledger (plain headless, dev) keeps `-`; a lab
-//!   desk reads its private root's own (
-//!   `recovery_census::cold_census`).
-//! - **`link state=`.** Every stored transition of the fabric link, through
-//!   `aterm_gui_fabric::on_link_moved` (that crate has no aterm-slog
-//!   dependency), installed by [`install`] before any bridge can attach.
-//! - **`config key=`.** Every schema key whose authored value moved in a
-//!   published config snapshot (`App::publish_native_config_snapshot`, the one
-//!   funnel every admitted snapshot passes): the schema's static NAME
-//!   ([`changed_config_keys`]), never a value and never a name a person chose.
-//!   A map member is named by the schema row that holds it; a changed key the
-//!   schema does not know, or one past [`CONFIG_KEYS_MAX`], is only counted
-//!   (`config n=`).
-//!
-//! THE LEAF LOCK. Each host holds its log under one `Mutex`, and nothing is
-//! ever taken under it: a write appends one record, and a read (`log n`,
-//! [`cmd_node_log`]) copies what its reply shows and renders after the lock
-//! is gone.
-//! It is taken under the fabric's link locks (the hook runs under
-//! `LINK.generation`, and in a report or a delivery's evidence under
-//! `LINK.link` too), so the ORDER is `LINK.log_transition` →
-//! `LINK.generation` → `LINK.link` → [`NodeLogHost`]'s lock, and under no
-//! other lock of this crate's.
-//!
-//! Local, additive and RAM only (T27): never journaled (D3), never carried
-//! (each process writes its own `start`) and never on the bus (D4): no
-//! record it takes is bus class.
+//! Host-side instance node log ([`aterm_slog::NodeLog`]) under its leaf lock.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{LazyLock, Mutex};
 
 use aterm_gui_fabric::{LinkMove, LinkSaid};
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, NodeLog, Src};
-// The recovery census, which reads the ledger, is unix's (`lib.rs`'s `mod
-// recovery_census`).
 #[cfg(any(unix, test))]
 use aterm_update::recovery_ledger::EndClass;
 
 use crate::session_log::{Clock, LogCopy, LogQuery, NODE_LOG_USAGE, render_log_copy};
 
-/// The most `config key=` marks one published snapshot writes; the rest of
-/// its changed keys are counted in one `config n=` mark.
+/// The most `config key=` marks one published snapshot writes.
 pub(crate) const CONFIG_KEYS_MAX: usize = 16;
 
 /// One instance's node log under its leaf lock.
@@ -66,8 +27,7 @@ struct Inner {
 }
 
 impl NodeLogHost {
-    /// A node log of epoch `ep` reading `clock`, its start written
-    /// (`prev_end=-`: the ledger is not read yet).
+    /// A node log of epoch `ep` reading `clock`, its start written.
     pub(crate) fn started(ep: u32, clock: Clock) -> NodeLogHost {
         let mut log = NodeLog::new(ep);
         let f = Fields::new().word(Key::PrevEnd, "-").unwrap_or_default();
@@ -85,8 +45,7 @@ impl NodeLogHost {
         f(&mut inner)
     }
 
-    /// The previous run's end, read off the recovery ledger: `amend n start
-    /// prev_end=<word>` (a signal's number in `code=`).
+    /// The previous run's end, read off the recovery ledger.
     #[cfg(any(unix, test))]
     pub(crate) fn note_prev_end(&self, class: EndClass) {
         let (word, code) = end_word(class);
@@ -107,9 +66,7 @@ impl NodeLogHost {
         });
     }
 
-    /// A stored fabric link transition: `mark n link state=<word> gen=<n>`,
-    /// attributed to the bridge when it is the bridge's word or deed, else
-    /// to aterm.
+    /// A stored fabric link transition.
     pub(crate) fn note_link(&self, mv: LinkMove) {
         let (by, conf) = match mv.said {
             LinkSaid::Report => (Actor::Bridge, Conf::Exact),
@@ -126,8 +83,7 @@ impl NodeLogHost {
         self.mark(m);
     }
 
-    /// The config keys a published snapshot moved: one `mark n config
-    /// key=<name>` per name, then `config n=<count>` for those not named.
+    /// The config keys a published snapshot moved.
     pub(crate) fn note_config(&self, names: &BTreeSet<&'static str>, unnamed: usize) {
         let named = names.len().min(CONFIG_KEYS_MAX);
         for name in names.iter().take(named) {
@@ -163,8 +119,7 @@ impl NodeLogHost {
         self.with(|i| i.log.last_seq())
     }
 
-    /// Every live record as its line, at the content tier (everything it
-    /// holds): what the tests read.
+    /// Every live record as its line, at the content tier (everything it holds).
     #[cfg(test)]
     pub(crate) fn lines(&self) -> Vec<String> {
         self.with(|i| {
@@ -183,7 +138,6 @@ fn config_mark(f: Fields) -> Mark {
 }
 
 /// The `prev_end=` word of a ledger end class, and a signal's number.
-/// Exhaustive: a new class does not compile until it has a word.
 #[cfg(any(unix, test))]
 const fn end_word(class: EndClass) -> (&'static str, Option<u8>) {
     match class {
@@ -198,13 +152,7 @@ const fn end_word(class: EndClass) -> (&'static str, Option<u8>) {
     }
 }
 
-/// The schema NAMES of the keys whose authored values differ between two
-/// semantic value maps (`ConfigSnapshot::semantic_values`), and how many
-/// changed keys no schema row names. Only the deepest changed paths count (a
-/// table's whole-table entry moves with any child). A path the schema does
-/// not hold is named by its nearest ancestor the schema does (a map's member
-/// by its map), so a name a person chose never reaches a record: every name
-/// returned is a schema row's static key.
+/// Schema names of changed keys between `before` and `after`, plus the unnamed count.
 pub(crate) fn changed_config_keys(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
@@ -249,22 +197,18 @@ fn schema_name(path: &str) -> Option<&'static str> {
     }
 }
 
-/// This process's node-log epoch, from its existing launch identity. A
-/// restart must not deterministically reuse an epoch just because both
-/// starts fell in one wall second; this log is never carried.
+/// This process's node-log epoch, from its existing launch identity.
 fn process_epoch() -> u32 {
     instance_epoch(crate::control_auth::process_instance_id())
 }
 
-/// A bounded fingerprint of the process identity (a launch nonce, with the
-/// existing high-resolution fallback), not a timestamp or an authority token.
-/// As with any finite u32 epoch, collisions remain possible.
+/// Bounded 32-bit FNV-1a fingerprint of the process instance id.
 const fn instance_epoch(instance: &str) -> u32 {
     let hash = aterm_hash::fnv1a_64(instance.as_bytes()).to_le_bytes();
     u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
 }
 
-/// THE instance's node log.
+/// The instance's node log.
 static NODE_LOG: LazyLock<NodeLogHost> =
     LazyLock::new(|| NodeLogHost::started(process_epoch(), Clock::default()));
 
@@ -273,24 +217,18 @@ pub(crate) fn node_log() -> &'static NodeLogHost {
     &NODE_LOG
 }
 
-/// Start the node log and hear the fabric link: called once at `main_entry`,
-/// before any bridge can attach. Idempotent.
+/// Start the node log and hear the fabric link.
 pub(crate) fn install() {
     let _ = node_log();
     aterm_gui_fabric::on_link_moved(heard_link);
 }
 
-/// Whether a `log` request names the node log: a bare `n` among its words
-/// (`n=<count>` is a count). Such a request is the instance's, Owner-only like
-/// `brief all`, and answered with no terminal (`control`'s dispatch).
+/// Whether a `log` request names the node log.
 pub(crate) fn names_node_log(rest: &str) -> bool {
     rest.split_whitespace().any(|w| w == "n")
 }
 
-/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`:
-/// `host`'s records as `log` prints a session's, under
-/// the same header. A node subtree, `lvl=` or `class=turn` names nothing
-/// here: a usage error.
+/// `log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]`.
 pub(crate) fn cmd_node_log(host: &NodeLogHost, rest: &str) -> String {
     let rest = rest
         .split_whitespace()

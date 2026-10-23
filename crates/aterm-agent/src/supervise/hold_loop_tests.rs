@@ -4,27 +4,17 @@
 use crate::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
 
-/// The door a hold crosses on a tape.
 const HOLD_DOOR: &str = "host.land_held";
 
-/// A reply that says no done.
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
-/// The retired token: a done claim, no defense.
 const TOKEN: &str = "Built and tested the parser.\nATERM-TASK-DONE";
-/// A defense that names open work: Land's strict reading holds it.
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
-/// The journal's note of a landing at the instruction's yield, as the loop
-/// writes it.
 const LANDED_NOTE: &str = "DONE seq=104 rule=land@v1 the worker said it is done after the land \
      instruction (autopilot land): nothing more is typed until a person or an orchestrator types";
-/// The landing's clean defense.
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all of \
                              it is merged into the remote main branch.";
 
-/// What the host was told, in order: the task's face, the hold, and each
-/// decided idle point of a Claude Code (`IdleHost::usage_tap`, told as the
-/// point is read, before it is folded in): the mark a tell made before any
-/// point stands before.
+/// What the host was told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Told {
     Face(TaskFace),
@@ -46,7 +36,6 @@ impl Holds {
             .clone()
     }
 
-    /// The holds told, in order.
     fn holds(&self) -> Vec<Option<LandHeld>> {
         self.told()
             .into_iter()
@@ -57,7 +46,6 @@ impl Holds {
             .collect()
     }
 
-    /// The faces and holds told, in order, the points left out.
     fn tells(&self) -> Vec<Told> {
         self.told()
             .into_iter()
@@ -96,8 +84,6 @@ impl IdleHost for Holds {
     }
 }
 
-/// A turn that ended after 3 minutes of work, the worker's last words `said`
-/// (each line its own row), at an empty composer.
 fn ended(said: &str) -> Vec<String> {
     let mut lines: Vec<String> = said.lines().map(|l| format!("⏺ {l}")).collect();
     for l in lines.iter_mut().skip(1) {
@@ -114,8 +100,6 @@ fn ended(said: &str) -> Vec<String> {
     r
 }
 
-/// The scripted server over `screens`, the session's word `word`, its
-/// screens at `gates` held until the loop types.
 fn scripted(screens: Vec<Vec<String>>, word: &'static str, gates: Vec<usize>) -> Mock {
     let mut m = Mock::new(screens);
     m.autopilot = Some(word);
@@ -126,7 +110,6 @@ fn scripted(screens: Vec<Vec<String>>, word: &'static str, gates: Vec<usize>) ->
     m
 }
 
-/// The hosted loop's options over `host`, its approval ledger at `ledger`.
 fn hosted(host: &Arc<Holds>, ledger: Option<&Path>) -> SuperviseOpts {
     SuperviseOpts {
         policy: SupervisorConfig {
@@ -139,7 +122,6 @@ fn hosted(host: &Arc<Holds>, ledger: Option<&Path>) -> SuperviseOpts {
     }
 }
 
-/// The test's pace: a 30 ms back-off.
 fn at_test_speed(s: &mut Watched<'_, '_>) {
     s.set_turn_end_timing(TurnEndTiming {
         short_backoff: Duration::from_millis(30),
@@ -148,7 +130,6 @@ fn at_test_speed(s: &mut Watched<'_, '_>) {
     });
 }
 
-/// A run of `m` over `host`: the lines said.
 fn run(m: &mut Mock, host: &Arc<Holds>, ledger: Option<&Path>) -> Vec<String> {
     let opts = hosted(host, ledger);
     let (lines, _) = watch_lines_with(m, &opts, |s| {
@@ -158,10 +139,6 @@ fn run(m: &mut Mock, host: &Arc<Holds>, ledger: Option<&Path>) -> Vec<String> {
     lines
 }
 
-/// The instruction, a nudge and the work between: the instruction's yield
-/// is progress (no defense), the nudge's a done claim (the same legs, its
-/// back-off read through), then SOMEONE ELSE'S TURN read live, and after
-/// its end another nudge.
 fn a_landing_with_someone_elses_turn() -> Vec<Vec<String>> {
     vec![
         busy_screen(),
@@ -176,7 +153,6 @@ fn a_landing_with_someone_elses_turn() -> Vec<Vec<String>> {
     ]
 }
 
-/// A hold of `nudges` since `since`, read with `legs` (none: unread).
 fn hold(since: Option<i64>, nudges: u32, legs: Option<&[HoldLeg]>) -> LandHeld {
     LandHeld {
         since_ms: since,
@@ -187,12 +163,6 @@ fn hold(since: Option<i64>, nudges: u32, legs: Option<&[HoldLeg]>) -> LandHeld {
     }
 }
 
-/// THE HOLD IS TOLD ONCE PER MOVE, AND AT EACH LAND ACT'S ROW (§12.3.6,
-/// 3b): none at the start; the instruction's row tells its `since` and no
-/// legs; its yield tells the legs that held it (no defense); the nudge's
-/// row tells the new count at once; the nudge's yield, held the same way,
-/// tells nothing (two equal points, one call); someone else's turn read live
-/// drops the legs, one call; and the next nudge's row counts two.
 #[test]
 fn the_hold_is_told_once_per_move_and_at_each_nudge() {
     let host = Arc::new(Holds::default());
@@ -236,11 +206,6 @@ fn the_hold_is_told_once_per_move_and_at_each_nudge() {
     );
 }
 
-/// A LAND ACT'S ROW AND A LIVE READ ARE TOLD BEFORE ANY POINT (§12.3.3,
-/// item 2): a session gone at its first wait after the nudge is typed, no
-/// read of the nudge's turn, was told the nudge's count; one gone while
-/// someone else's turn runs, read live and never ended, was told its legs
-/// dropped.
 #[test]
 fn a_land_acts_row_and_a_live_read_are_told_before_any_point() {
     let host = Arc::new(Holds::default());
@@ -293,8 +258,6 @@ fn a_land_acts_row_and_a_live_read_are_told_before_any_point() {
     );
 }
 
-/// A ledger row as the loop writes it, `ago` before now: the row, and its
-/// stamp (unix ms).
 fn ledger_row(rule_id: &str, command: &str, ago: Duration) -> (String, i64) {
     let row = crate::supervise::approvals::Row {
         rule_id,
@@ -307,7 +270,6 @@ fn ledger_row(rule_id: &str, command: &str, ago: Duration) -> (String, i64) {
     (row.to_json(at, None), at)
 }
 
-/// A ledger holding `rows`, its journal beside it holding `journal`.
 fn ledger(tag: &str, rows: &[String], journal: &[String]) -> (PathBuf, PathBuf) {
     let dir = crate::supervise::test_scratch_path("hold-loop", tag);
     let _ = std::fs::remove_dir_all(&dir);
@@ -323,13 +285,6 @@ fn ledger(tag: &str, rows: &[String], journal: &[String]) -> (PathBuf, PathBuf) 
     (dir, path)
 }
 
-/// EACH START TELLS THE SEED ONCE (§12.3.6, 3b; the loop's starts all reach
-/// `tell_start_face`): a restart over a Land episode its ledger holds — the
-/// instruction ten minutes back, a nudge five — tells, before any point,
-/// the hold it seeds (the instruction row's stamp, one nudge, unread) and
-/// nothing again until it moves; a restart over a landing (its face told
-/// at the start's later site, once the session's word is read) tells none;
-/// a fresh start tells none.
 #[test]
 fn each_start_tells_the_seed_once() {
     let min = |n: u64| Duration::from_secs(60 * n);
@@ -378,9 +333,6 @@ fn each_start_tells_the_seed_once() {
     assert_eq!(host.holds(), [None]);
 }
 
-/// THE HOLD ENDS AT A LANDING, told beside the face as it moves (§12.3.3):
-/// the instruction's yield names open work (held, read); the nudge's clean
-/// defense lands it — told none right after `landed`.
 #[test]
 fn the_hold_ends_at_a_landing() {
     let landing = |last: &str| {
@@ -420,8 +372,6 @@ fn the_hold_ends_at_a_landing() {
     assert!(!told.contains(&Told::Face(TaskFace::Landed)), "{told:#?}");
 }
 
-/// A Land episode with its instruction typed and its first yield judged:
-/// the hold read (no defense yet), in `st`.
 fn read_hold(st: &mut crate::supervise::policy::turn_end::TurnEndState) {
     use crate::supervise::policy::turn_end::{TurnEndReading, decide_turn_end};
     let now = Instant::now();
@@ -456,11 +406,6 @@ fn read_hold(st: &mut crate::supervise::policy::turn_end::TurnEndState) {
     );
 }
 
-/// THE HOLD IS TOLD GONE AT AN OFF PARK AND AT THE LOOP'S END (§12.3.3): a
-/// hold told, then the park's first act (`off_stood`, which ends the
-/// episode with no point folded in) tells none; a hold told, then the
-/// loop's end (`release_attention`) tells none; a loop that told none tells
-/// nothing at its end.
 #[test]
 fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
     let mut notes = Alone;
@@ -494,10 +439,6 @@ fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
     assert_eq!(host.holds(), [None], "the first ask alone");
 }
 
-/// CRUISE CHOSEN AT A HELD POINT ENDS THE HOLD AS ITS ACT IS TYPED (the
-/// third review of 3b): the instruction typed, its yield names open work
-/// (held, read), and the owner switches the session to Cruise just as that
-/// yield is drawn.
 #[test]
 fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
     let host = Arc::new(Holds::default());
@@ -541,12 +482,6 @@ fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
     );
 }
 
-/// THE HOLD IS TOLD ONLY WHERE IT IS THIS LOOP'S (§12.3.5,
-/// `Session::hold_is_ours`): a hold told, then the session's word read in
-/// another mode (a box's `meta` under Cruise, no reading of the switch
-/// folded in yet) tells none, the episode kept, and the word read Land
-/// again tells the hold again; a word left to the table's tells the
-/// episode's hold.
 #[test]
 fn a_hold_is_told_none_outside_land_and_behind_another_claim() {
     let reply = |word: &str| format!("OK title=- autopilot={word}\n");
@@ -610,10 +545,6 @@ fn a_hold_is_told_none_outside_land_and_behind_another_claim() {
     );
 }
 
-/// A TAPE RECORDED BEFORE THE HOLD'S DOOR (§12.7, "the engine lift"): the
-/// recorded run of [`the_hold_is_told_once_per_move_and_at_each_nudge`]'s
-/// script with its `host.land_held` outputs taken off, as a build before
-/// them taped it.
 #[test]
 fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_hold() {
     use crate::supervise::tape::replay::{Options, replay};

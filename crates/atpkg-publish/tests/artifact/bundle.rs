@@ -1231,4 +1231,9 @@ fn an_exposed_tool_the_stage_lacks_is_refused_even_without_the_smoke() {
         rd.flatten()
             .all(|e| !e.file_name().to_string_lossy().ends_with(".tar.zst"))
     }));
+    assert_eq!(
+        w.stages_left(),
+        0,
+        "a gate that only read the tree keeps no stage"
+    );
 }

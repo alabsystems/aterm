@@ -105,8 +105,8 @@ fn a_uuid_is_its_one_textual_form() {
     }
 }
 
-/// A real producer's missing stable entry makes its shim exec physical A, but
-/// Codex preserves the producer-bound route in its session record.
+/// A real producer's missing stable entry makes its shim exec physical A, but Codex preserves the
+/// producer-bound route in its session record.
 #[cfg(unix)]
 #[test]
 fn a_raw_fallback_record_keeps_its_producer_bound_resume_route() {
@@ -179,12 +179,7 @@ fn a_raw_fallback_record_keeps_its_producer_bound_resume_route() {
     );
 }
 
-/// THE VALIDATION: the line the live process itself ran — on its launch
-/// path (its exec path, its image, or atpkg's managed twin), its root flags
-/// in order and all of them (its prompt and images dropped), resuming its
-/// conversation last, under its own `CODEX_HOME`, in its own directory — is
-/// taken, and each way a planted record differs is refused (the negative
-/// controls).
+/// THE VALIDATION.
 #[cfg(unix)]
 #[test]
 fn a_resume_line_validates_only_as_the_live_process_ran() {
@@ -317,9 +312,6 @@ fn a_resume_line_validates_only_as_the_live_process_ran() {
     assert_eq!(validate(&good, 4243, &live()), Err("pid"));
 }
 
-/// THE VERDICT: a removal is orderly; a record standing with no word of an
-/// end, or as `upgrading`, is a crash; a signal it wrote down is a crash only
-/// where aterm sent it.
 #[test]
 fn the_exit_is_decided_from_the_copy_alone() {
     let copy = |seen: Seen| Copy {
@@ -369,12 +361,6 @@ fn the_exit_is_decided_from_the_copy_alone() {
     );
 }
 
-/// A RECORD NO READ EVER FOUND IS NO REMOVAL (AD-3 of the end-to-end run,
-/// 2026-10-16: a relaunched codex-alab killed before its record writer's
-/// first write was read as an orderly end and left at its shell). [`fold`]
-/// makes a removal only of a record an earlier read of the SAME identity
-/// saw; NEGATIVE CONTROLS: a record read standing and then gone is removed
-/// (orderly), and another identity's read never counts.
 #[test]
 fn a_record_never_written_is_never_read_as_removed() {
     let copy = |pid: u32, start: &str, seen: Seen| Copy {
@@ -406,10 +392,7 @@ fn a_record_never_written_is_never_read_as_removed() {
     );
 }
 
-/// THE LINE A NEVER-WRITTEN RECORD INHERITS ([`inherited`]): the line aterm's
-/// crash rule typed, for the process that runs exactly it. NEGATIVE
-/// CONTROLS: no typed line; a process that resumes another conversation or
-/// none; a line whose launch path or flags the live process did not run.
+/// THE LINE A NEVER-WRITTEN RECORD INHERITS ([`inherited`]).
 #[cfg(unix)]
 #[test]
 fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
@@ -476,9 +459,7 @@ fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
     );
 }
 
-/// The startup writer publishes its schema before the resumed native thread
-/// registers. A crash in that interval must keep the exact line this host
-/// already started, just as a crash before the first write does.
+/// The startup writer publishes its schema before the resumed native thread registers.
 #[cfg(unix)]
 #[test]
 fn an_initial_record_inherits_only_its_proven_relaunch_line() {
@@ -679,9 +660,7 @@ fn record_reads_are_bounded_regular_files_and_only_absence_is_never_seen() {
     }
 }
 
-/// THE LIVE READ, of a real process: a record read while it runs is kept
-/// with its line validated against that process's own exec record; a removed
-/// record is seen removed; once the process is gone nothing is read at all.
+/// THE LIVE READ.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_record_is_read_only_while_its_process_runs() {
@@ -745,12 +724,6 @@ fn the_record_is_read_only_while_its_process_runs() {
     assert_eq!(read_copy(pid, &start, None), None, "gone: nothing is read");
 }
 
-/// THE IDLE POINT IS THE RECORD'S OWN REST ([`idle_point`]): `status:
-/// "idle"` with `draftEmpty: true` and no word of an end. NEGATIVE
-/// CONTROLS: every other status, a draft in the composer, a draft not named
-/// (absent, `null`, or not a boolean — which reads as unknown and never
-/// refuses the record the crash rule decides from), and an idle record that
-/// names its end.
 #[test]
 fn the_idle_point_is_the_records_own_rest() {
     let parsed = |status: &str, draft: &str, exit: &str| {
@@ -780,13 +753,7 @@ fn the_idle_point_is_the_records_own_rest() {
     assert!(!idle_point(&absent), "no draft named is no idle point");
 }
 
-/// THE IDLE POINT IS READ LIVE, of a real process, from a PLANTED record
-/// ([`read_idle`]): a stand-in process (the kept signed `sleep`, its
-/// `CODEX_HOME` the test's directory) whose record says `idle` with an empty
-/// draft is at its idle point; the same process is not once its record says
-/// anything else. NEGATIVE CONTROLS: busy, a draft, no draft named, the
-/// record of another pid, a record removed or unreadable, another identity
-/// of the same pid, and the process gone — each reads no idle point.
+/// THE IDLE POINT IS READ LIVE.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
@@ -891,14 +858,6 @@ fn the_idle_point_is_read_live_from_the_record_of_a_running_process() {
     );
 }
 
-/// A RELAUNCH'S FIRST FRAME ([`first_frame`]): its TUI's frame at rest —
-/// `state` `idle`, `done` or `error` — even while its record says `busy`
-/// because the carry-on the relaunch lease holds back is owed (no idle point
-/// then: the hold must not wait for one), or the record's own rest, is its
-/// first idle; a turn (`working`) or a box (`blocked`) is a turn under way
-/// (the hold must not wait for its end either: codex-alab's own acts in it
-/// wait for the same lease). NEGATIVE CONTROLS: no frame named, one that is
-/// no string or no word this reads, and a record that names its end.
 #[test]
 fn a_relaunchs_first_frame_is_its_rest_or_a_turn_even_while_a_carry_on_is_owed() {
     let parsed = |status: &str, state: &str, exit: &str| {
@@ -953,10 +912,6 @@ fn a_relaunchs_first_frame_is_its_rest_or_a_turn_even_while_a_carry_on_is_owed()
     }
 }
 
-/// The codex-alab a `status` reply names as its PROVEN self-claim
-/// ([`proven_pid`]), its holder percent-encoded or not. NEGATIVE CONTROLS: an
-/// unproven claim, a proof with no holder, another holder, a holder whose
-/// pid is no number, and a reply that is not `OK`.
 #[test]
 fn a_proven_claim_names_its_codex_alab_only_when_proven() {
     assert_eq!(

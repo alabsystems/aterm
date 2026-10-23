@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The presence core without a host: a [`TestHost`] with a three-kind wall and a plain stall drives the wire level ranking, the story, the need's mark and age, the border's glow, the pill's words and geometry, the sanitizer and the idle view.
+//! Tests for the presence core without a host.
 
 use crate::presence::{
     AgentPhase, AgentReading, ChipLevel, Facts, Hand, HoldFact, Host, Level, Link, MailFacts,
@@ -70,12 +70,9 @@ impl Host for TestHost {
 }
 
 thread_local! {
-    /// The characters [`TestHost::columns`] has measured on this thread: the
-    /// work a walk of a token's cells does, read without a clock.
     static MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The characters `f` has the host measure.
 fn measured(f: impl FnOnce()) -> usize {
     MEASURED.with(|m| m.set(0));
     f();
@@ -119,9 +116,6 @@ pub(crate) fn need(severity: NeedSeverity, cause: StopCause, key: u64) -> NeedFa
     }
 }
 
-/// `status level=` keeps its ranking, a record unchanged by the owner
-/// surfaces: `hold > limited > attention > driven > driving > story > note >
-/// quiet`, a stall ranks with a wall, and aterm's own hand still counts.
 #[test]
 fn the_wire_level_ranks_as_before_and_the_border_reads_no_level() {
     let now = Instant::now();
@@ -212,10 +206,6 @@ fn the_wire_level_ranks_as_before_and_the_border_reads_no_level() {
     assert_eq!(busy.severity(), None);
 }
 
-/// The story's model half: a hold that lifts leaves a story, which is not
-/// calm while held and calm after; reading it (the watermark at the story's
-/// seq) quiets `level=`; a turn under aterm's own hand is counted, never
-/// news.
 #[test]
 fn a_story_is_news_until_read_and_aterms_own_turn_is_none() {
     let now = Instant::now();
@@ -233,7 +223,7 @@ fn a_story_is_news_until_read_and_aterms_own_turn_is_none() {
     s.absorb(TFacts::default(), now + Duration::from_secs(61));
     assert!(s.calm());
     assert_eq!(s.level(0), Level::Story);
-    assert_eq!(s.story_since(0).count(), 2, "the hold and its resume");
+    assert_eq!(s.story_seq, 2, "the hold and its resume");
     assert_eq!(s.level(s.story_seq), Level::Quiet, "read");
 
     let mut own = slot_of(
@@ -265,15 +255,15 @@ fn a_story_is_news_until_read_and_aterms_own_turn_is_none() {
         now,
     );
     assert_eq!(own.story_seq, 1, "counted");
-    assert_eq!(own.story_since(0).count(), 0, "not news");
-    assert_eq!(own.tell(StoryVerb::Chose, now), 2);
+    assert_eq!(own.tell(), 2, "a point told under the hand");
+    own.absorb(TFacts::default(), now);
+    assert_eq!(
+        own.level(0),
+        Level::Quiet,
+        "not news, once the hand is let go: aterm's own turn and its told point"
+    );
 }
 
-/// A background codex finishing its turn (OSC 7501 `working` → `done`, the
-/// host's count of them) is a story point: `status story=` counts it and
-/// `level=story` says it until it is read, and as news it counts in
-/// `turn_end_news`, which the host's tab `•` reads (the slot's own mark stays
-/// the need's and the hold's).
 #[test]
 fn a_programs_own_turn_end_is_a_story_point_and_counts_as_news() {
     let now = Instant::now();
@@ -325,9 +315,6 @@ fn a_programs_own_turn_end_is_a_story_point_and_counts_as_news() {
     assert_eq!(s.turn_end_news, 2, "watched: no news");
 }
 
-/// One driven codex turn ends twice, the ledger's settle and the program's
-/// own report, and the sweeps that read them land in either order: it is
-/// told ONCE either way, and in the same refresh.
 #[test]
 fn one_driven_turn_is_told_once_whichever_sweep_reads_which_end() {
     let now = Instant::now();
@@ -346,17 +333,23 @@ fn one_driven_turn_is_told_once_whichever_sweep_reads_which_end() {
         turn,
         ..TFacts::default()
     };
-    let turns = |s: &TSlot| s.story_since(0).count();
-
     let mut s = slot_of(at(1, 0, None), now);
     assert!(s.absorb(at(1, 0, Some(ledger(1, true))), t(1)));
     assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(2)));
-    assert_eq!((s.story_seq, turns(&s)), (1, 1), "settle, then done");
+    assert_eq!(
+        (s.story_seq, s.level(0)),
+        (1, Level::Story),
+        "settle, then done"
+    );
 
     let mut s = slot_of(at(1, 0, None), now);
     assert!(s.absorb(at(1, 1, None), t(1)));
     assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(2)));
-    assert_eq!((s.story_seq, turns(&s)), (1, 1), "done, then settle");
+    assert_eq!(
+        (s.story_seq, s.level(0)),
+        (1, Level::Story),
+        "done, then settle"
+    );
 
     let mut s = slot_of(at(1, 0, None), now);
     assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(1)));
@@ -365,7 +358,7 @@ fn one_driven_turn_is_told_once_whichever_sweep_reads_which_end() {
     let mut s = slot_of(at(1, 0, None), now);
     s.absorb(at(1, 0, Some(ledger(1, true))), t(1));
     s.absorb(at(2, 1, Some(ledger(1, true))), t(2));
-    assert_eq!((s.story_seq, turns(&s)), (2, 2));
+    assert_eq!((s.story_seq, s.level(0)), (2, Level::Story));
 
     let mut s = slot_of(at(1, 0, None), now);
     s.absorb(at(1, 0, Some(ledger(1, false))), t(1));
@@ -386,16 +379,12 @@ fn one_driven_turn_is_told_once_whichever_sweep_reads_which_end() {
     s.absorb(at(1, 1, None), t(1));
     s.absorb(at(1, 1, Some(ledger(1, true))), t(30));
     assert_eq!(
-        (s.story_seq, turns(&s)),
-        (2, 2),
+        (s.story_seq, s.level(0)),
+        (2, Level::Story),
         "an end before the ledger turn opened"
     );
 }
 
-/// The pairing does not depend on the order of the reads or on whether one
-/// refresh reads both, because it is decided by WHEN each turn began: the
-/// program's turn (`program_turn_began`) no earlier than the ledger's opened
-/// (`TurnFact::opened`, the ledger's own `started_ms`).
 #[test]
 fn a_turn_end_pairs_by_when_each_turn_began_in_every_order() {
     let now = Instant::now();
@@ -476,8 +465,6 @@ fn a_turn_end_pairs_by_when_each_turn_began_in_every_order() {
     }
 }
 
-/// A turn already recorded under aterm's own hand stays omitted when its
-/// delayed counterpart arrives after that hand was released.
 #[test]
 fn a_paired_owned_turn_does_not_leave_news_without_a_story() {
     let now = Instant::now();
@@ -518,30 +505,20 @@ fn a_paired_owned_turn_does_not_leave_news_without_a_story() {
             t(1),
         );
         s.absorb(at(1, ledger, false, false), t(2));
-        assert_eq!(
-            (s.story_seq, s.story_since(0).count(), s.level(0)),
-            (1, 1, Level::Story)
-        );
+        assert_eq!((s.story_seq, s.level(0)), (1, Level::Story));
     }
     let mut watched = slot_of(at(0, None, false, true), now);
     watched.absorb(at(1, None, false, true), t(1));
     assert_eq!(watched.level(0), Level::Quiet);
     watched.absorb(at(1, ledger, false, true), t(2));
-    assert_eq!(
-        (
-            watched.story_seq,
-            watched.story_since(0).count(),
-            watched.level(0)
-        ),
-        (1, 1, Level::Story)
-    );
+    assert_eq!((watched.story_seq, watched.level(0)), (1, Level::Story));
 
     let owned = |done_first: bool, unrelated_mail: bool| {
         let mut s = slot_of(at(0, None, true, false), now);
         let first_turn = if done_first { None } else { ledger };
         let first_ends = u64::from(done_first);
         s.absorb(at(first_ends, first_turn, true, false), t(1));
-        assert_eq!(s.story_since(0).count(), 0, "own-hand point stays omitted");
+        assert_eq!(s.story_seq, 1, "the own-hand point is counted");
         s.absorb(at(first_ends, first_turn, false, false), t(2));
         assert_eq!(s.level(0), Level::Quiet, "release alone is no news");
         let mut last = at(1, ledger, false, false);
@@ -552,29 +529,22 @@ fn a_paired_owned_turn_does_not_leave_news_without_a_story() {
         s
     };
     let mail = owned(false, true);
-    assert_eq!(
-        (mail.story_seq, mail.story_since(0).count(), mail.level(0)),
-        (2, 1, Level::Story)
-    );
+    assert_eq!((mail.story_seq, mail.level(0)), (2, Level::Story));
 
     let observed: Vec<_> = [false, true]
         .into_iter()
         .map(|done_first| {
             let s = owned(done_first, false);
-            (s.story_seq, s.story_since(0).count(), s.level(0))
+            (s.story_seq, s.level(0))
         })
         .collect();
     assert_eq!(
         observed,
-        vec![(1, 0, Level::Quiet); 2],
+        vec![(1, Level::Quiet); 2],
         "PAIRED_OWNED_POINT_BECAME_NEWS_WITHOUT_A_STORY"
     );
 }
 
-/// The level a driven turn leaves does not depend on which end is read
-/// first: told by the program's end in plain sight (no news), the settle that
-/// pairs with it is still the news a settle is, as it is read the other way
-/// round.
 #[test]
 fn one_driven_turn_is_news_whichever_end_is_read_first() {
     let now = Instant::now();
@@ -607,8 +577,6 @@ fn one_driven_turn_is_news_whichever_end_is_read_first() {
     }
 }
 
-/// A codex finishing its turn in the tab the person is looking at joins the
-/// story without being news: `level=` stays quiet.
 #[test]
 fn a_programs_turn_end_in_plain_sight_is_story_but_not_news() {
     let now = Instant::now();
@@ -625,8 +593,6 @@ fn a_programs_turn_end_in_plain_sight_is_story_but_not_news() {
     assert_eq!(s.level(0), Level::Story, "unwatched, it is news");
 }
 
-/// The story an agent told while nobody looked closes when the agent leaves;
-/// a new point after the exit is news again.
 #[test]
 fn an_agents_story_closes_when_the_agent_leaves() {
     let now = Instant::now();
@@ -656,7 +622,10 @@ fn an_agents_story_closes_when_the_agent_leaves() {
         now,
     );
     assert_eq!(s.level(0), Level::Quiet, "the agent left: its story closed");
-    assert_eq!(s.story_since(0).count(), 0);
+    assert_eq!(
+        s.story_seq, 1,
+        "the closed point is still counted (`story=`)"
+    );
     s.absorb(
         TFacts {
             turn: Some(TurnFact {
@@ -674,8 +643,6 @@ fn an_agents_story_closes_when_the_agent_leaves() {
     assert_eq!(s.level(0), Level::Story, "a point after the exit is news");
 }
 
-/// A wall the harness answers stands at `note` on the wire; one nobody
-/// answers is `limited`; the answer moving is a change.
 #[test]
 fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_limited() {
     let now = Instant::now();
@@ -718,9 +685,6 @@ fn a_wall_the_harness_answers_is_a_note_and_a_wall_nobody_answers_is_limited() {
     assert!(!s.absorb(same, now), "nothing moved");
 }
 
-/// THE MARK READS THE PUBLISHED NEED: a stuck need is the filled diamond with
-/// its cause, a decide need the hollow one, the person's hold the hand where
-/// nothing needs them, else none.
 #[test]
 fn the_chip_reads_the_published_need_and_the_persons_hold() {
     let now = Instant::now();
@@ -763,8 +727,6 @@ fn the_chip_reads_the_published_need_and_the_persons_hold() {
     );
 }
 
-/// A need's age counts from its episode: the same key re-read keeps it (its
-/// words may move), another key starts its own, and none clears it.
 #[test]
 fn a_need_keeps_its_age_until_its_episode_moves() {
     let t0 = Instant::now();
@@ -807,9 +769,6 @@ fn tones() -> PresenceTones {
     }
 }
 
-/// THE BORDER IS STEADY: stuck in the stop tone and decide in the wait tone
-/// at the plain law's width and the drop target's alpha, the yours outline in
-/// the dim ink at one pixel, and never a wash.
 #[test]
 fn the_border_is_steady_and_a_quiet_view_costs_nothing() {
     let mut v = View::default();
@@ -859,9 +818,6 @@ fn pill(kind: PillKind, tab: Option<usize>, act: Option<PillAct>, more: usize) -
     }
 }
 
-/// THE PILL'S PIECES: a background tab's pill carries its label and number
-/// and its age, a front tab's neither, the act only where offered, `+N` only
-/// with more needs, the hand's pill its own glyph and Hand Back.
 #[test]
 fn the_pill_names_a_background_tab_and_offers_the_act_in_front() {
     let now = Instant::now();
@@ -913,9 +869,6 @@ fn the_pill_names_a_background_tab_and_offers_the_act_in_front() {
     assert_eq!(yours.act, Some(PillAct::HandBack));
 }
 
-/// PILL HIT REGIONS RESOLVE TO THEIR ACTS THROUGH THE PAINTER'S OWN GEOMETRY:
-/// every unit of the laid-out pill is the body, the act or the `+N`, in
-/// that order left to right, and the margins resolve to nothing.
 #[test]
 fn pill_hit_regions_resolve_to_their_acts_through_the_layout() {
     let now = Instant::now();
@@ -953,10 +906,6 @@ fn pill_hit_regions_resolve_to_their_acts_through_the_layout() {
     );
 }
 
-/// THE WORDS CLIP FIRST, THEN THE LABEL, NEVER THE GLYPH: narrowing the pill
-/// shrinks the words to nothing before the label gives a unit, the glyph
-/// keeps its width at every size, and the `+N` then the act go only where
-/// the glyph alone would not fit beside them.
 #[test]
 fn the_words_clip_first_then_the_label_never_the_glyph() {
     let now = Instant::now();
@@ -984,9 +933,6 @@ fn the_words_clip_first_then_the_label_never_the_glyph() {
     }
 }
 
-/// A pill's free text keeps a path's `~` and a sentence's `·` but never the
-/// pill's own glyphs, and the wire token refuses presence's whole
-/// vocabulary, bidi and controls; the cap cuts with `…`.
 #[test]
 fn sanitize_refuses_presence_glyphs_bidi_and_control_characters() {
     let s = sanitize_token::<TestHost>(
@@ -1026,9 +972,6 @@ fn sanitize_refuses_presence_glyphs_bidi_and_control_characters() {
     );
 }
 
-/// The token strips what the band strips (TAG characters, ZWSP, WJ, the BOM,
-/// the Arabic letter mark, the soft hyphen, U+180E, the joiners, a Hangul
-/// filler, CGJ) on both paths.
 #[test]
 fn sanitize_strips_invisible_characters_on_every_path() {
     let hidden = [
@@ -1065,9 +1008,6 @@ fn sanitize_strips_invisible_characters_on_every_path() {
     );
 }
 
-/// A cell holds what the grid's cell holds: `1` and its first 16 marks, a
-/// mark with no cell to join is dropped, and a token is at most 17
-/// characters a cell of its cap.
 #[test]
 fn a_cell_holds_what_the_grids_cell_holds() {
     let marks = |n: usize| "\u{301}".repeat(n);
@@ -1099,9 +1039,6 @@ fn a_cell_holds_what_the_grids_cell_holds() {
     }
 }
 
-/// The walk of a token's cells is linear in what it is given, even on a raw
-/// string of one cell with 4,096 marks (counted in what the host measured,
-/// not a clock).
 #[test]
 fn the_cell_walk_is_linear_in_its_string() {
     for n in [256usize, 4096] {
@@ -1122,8 +1059,6 @@ fn the_cell_walk_is_linear_in_its_string() {
     }
 }
 
-/// The durations: the wire's `fmt_dur`, the pill's coarse age, and the
-/// pill's next figure, never before the next whole unit of what it prints.
 #[test]
 fn durations_and_the_pills_age_step_by_their_own_units() {
     assert_eq!(fmt_dur(Duration::from_secs(12)), "12s");
@@ -1164,9 +1099,6 @@ fn durations_and_the_pills_age_step_by_their_own_units() {
     }
 }
 
-/// The hover's state line: the program, the phase, the context left — three
-/// pieces for an agent, one for a shell, none for nothing — and no age (the
-/// hover is shown long after it is composed).
 #[test]
 fn the_state_line_has_a_piece_per_fact_it_knows() {
     let now = Instant::now();
@@ -1205,10 +1137,6 @@ fn the_state_line_has_a_piece_per_fact_it_knows() {
     assert_eq!(pieces(&unknown, None), None);
 }
 
-/// The program's own report (OSC 7501, `Facts::program`) is the state line's
-/// word where no agent reading names a phase, ahead of the shell's, and it
-/// names its program itself; a phase the screen's reader names keeps the line
-/// (the report is display, never the verdict).
 #[test]
 fn the_programs_own_report_is_named_only_where_the_reader_names_no_phase() {
     let now = Instant::now();
@@ -1252,8 +1180,6 @@ fn the_programs_own_report_is_named_only_where_the_reader_names_no_phase() {
     );
 }
 
-/// `ctl story` takes `chose` alone: the seven words no process sent are
-/// usage errors now.
 #[test]
 fn only_chose_is_a_told_story_word() {
     assert_eq!(StoryVerb::TOLD_WORDS, ["chose"]);
@@ -1271,8 +1197,6 @@ fn only_chose_is_a_told_story_word() {
     }
 }
 
-/// Mail still weighs on the wire level: an unread task with no hand is
-/// `attention`, with a hand it is the hand's.
 #[test]
 fn an_unread_task_waits_only_with_no_hand_on_the_session() {
     let now = Instant::now();

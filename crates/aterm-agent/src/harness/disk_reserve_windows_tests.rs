@@ -8,13 +8,11 @@ use std::os::windows::fs::MetadataExt as _;
 use super::*;
 use crate::harness::disk::tests::Tmp;
 
-/// `FILE_ATTRIBUTE_*` read back in these tests.
 const SPARSE: u32 = 0x200;
 const REPARSE: u32 = 0x400;
 const COMPRESSED: u32 = 0x800;
 const NOT_CONTENT_INDEXED: u32 = 0x2000;
 
-/// Run one of the system's own tools on `path`, which must succeed.
 fn run(tool: &str, args: &[&str], path: &Path) {
     let out = aterm_uds::spawnfd::command(tool)
         .args(args)
@@ -29,20 +27,14 @@ fn run(tool: &str, args: &[&str], path: &Path) {
     );
 }
 
-/// The attributes of what is at `path`, not following a link.
 fn attributes(path: &Path) -> u32 {
     std::fs::symlink_metadata(path)
         .expect("there")
         .file_attributes()
 }
 
-/// Give the file (or EMPTY folder) at `path` a reparse point that is no link
-/// ([`super::super::win::set_foreign_reparse_point`]): std then reads it as a
-/// plain file or folder — `is_symlink` false — as it reads a cloud
-/// placeholder, which a test cannot make.
 fn foreign_reparse(path: &Path) {
     use std::os::windows::fs::OpenOptionsExt as _;
-    /// `FILE_FLAG_BACKUP_SEMANTICS`: what opens a folder.
     const BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -55,8 +47,6 @@ fn foreign_reparse(path: &Path) {
     assert_ne!(meta.file_attributes() & REPARSE, 0, "a reparse point");
 }
 
-/// The bytes of the file at `path` that carries a reparse point no filter
-/// owns, read through the point itself (an ordinary open is refused).
 fn read_as_itself(path: &Path) -> Vec<u8> {
     use std::io::Read as _;
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -71,7 +61,6 @@ fn read_as_itself(path: &Path) -> Vec<u8> {
     bytes
 }
 
-/// The files in `folder`, by name.
 fn names_in(folder: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(folder)
         .expect("listed")
@@ -81,11 +70,6 @@ fn names_in(folder: &Path) -> Vec<String> {
     names
 }
 
-/// THE RESERVE IS WRITTEN, KEPT AND RELEASED ON WINDOWS: under the profile's
-/// `AppData\Local\aterm\disk-reserve`, written once `NOT_CONTENT_INDEXED`,
-/// neither sparse nor compressed nor a reparse point, holding at least its
-/// length in clusters; then left as it is, and released by a delete through
-/// its handle that says what it held; a second release finds nothing.
 #[test]
 fn the_reserve_is_written_once_and_released_through_its_handle() {
     let tmp = Tmp::new("reserve-win");
@@ -120,12 +104,6 @@ fn the_reserve_is_written_once_and_released_through_its_handle() {
     );
 }
 
-/// The reserve's folder a JUNCTION to a folder holding a file of the
-/// reserve's name is refused by `state`, `ensure` and `release`; that file
-/// survives byte for byte, and so does the junction. A regression guard: std
-/// reads a junction as a symlink too, so this does not tell the any-reparse-
-/// point check from `is_symlink` alone —
-/// [`a_reparse_point_that_is_no_link_is_never_the_reserve`] does.
 #[test]
 fn a_junction_for_the_reserves_folder_is_never_followed() {
     let tmp = Tmp::new("reserve-junction");
@@ -148,9 +126,6 @@ fn a_junction_for_the_reserves_folder_is_never_followed() {
     assert_ne!(attributes(&folder) & REPARSE, 0, "the junction stands");
 }
 
-/// A junction (a folder link) AT the reserve's name is not a regular file:
-/// refused by all three, and what it leads to is untouched. A regression
-/// guard, as above: std reads it as a symlink, and as no file either.
 #[test]
 fn a_junction_at_the_reserves_name_is_never_removed() {
     let tmp = Tmp::new("reserve-junction-name");
@@ -170,9 +145,6 @@ fn a_junction_at_the_reserves_name_is_never_removed() {
     assert_ne!(attributes(&path) & REPARSE, 0, "the junction stands");
 }
 
-/// A HARD LINK AT THE RESERVE'S NAME is a regular file holding its blocks,
-/// so it is the reserve; its release removes that NAME only, and the other
-/// name keeps the bytes (as an unlink does on Unix).
 #[test]
 fn releasing_a_hard_link_removes_only_its_name() {
     let tmp = Tmp::new("reserve-hardlink");
@@ -189,12 +161,6 @@ fn releasing_a_hard_link_removes_only_its_name() {
     assert_eq!(std::fs::read(&other).expect("kept"), vec![7u8; 64 * 1024]);
 }
 
-/// A NON-SURROGATE REPARSE POINT — what std reads as a plain file or folder,
-/// a cloud placeholder's kind — at the reserve's name or as its folder is not
-/// the reserve: `state`, `ensure` and `release` refuse it as not ours and
-/// leave it as it is, its bytes and its reparse point. NEGATIVE CONTROL for
-/// the any-reparse-point check: `is_symlink` is false for both, so a check
-/// that asked only that would take the file for the reserve.
 #[test]
 fn a_reparse_point_that_is_no_link_is_never_the_reserve() {
     let tmp = Tmp::new("reserve-foreign-reparse");
@@ -224,13 +190,6 @@ fn a_reparse_point_that_is_no_link_is_never_the_reserve() {
     assert_ne!(attributes(&folder) & REPARSE, 0, "left as it is");
 }
 
-/// A RESERVE MUST HOLD ITS BLOCKS. NEGATIVE CONTROL: in a folder that
-/// compresses what is written into it, `ensure` writes nothing (no reserve, no
-/// temporary). A reserve that `compact` compressed, or `fsutil` made sparse,
-/// in place is not counted as the reserve (`state` says it is thin), yet it is
-/// still aterm's own file, never left for good: `ensure` writes a whole one
-/// over it, and at an emergency `release` deletes a thin one for what it
-/// holds.
 #[test]
 fn a_compressed_or_sparse_reserve_is_not_counted_and_is_replaced() {
     let tmp = Tmp::new("reserve-thin");
@@ -290,13 +249,6 @@ fn a_compressed_or_sparse_reserve_is_not_counted_and_is_replaced() {
     }
 }
 
-/// ONE PASS AT A TIME ON WINDOWS: the pass lock is taken without waiting, a
-/// second taker (another open, as another instance makes) finds it held, and
-/// once the first lets go the next takes it. A junction at the lock's name is
-/// refused and what it leads to is untouched — by Windows itself, which will
-/// not open a folder as the lock's file, before any check of ours runs; the
-/// check after the open has its own control,
-/// [`a_reparse_point_at_the_pass_locks_name_is_never_the_lock`].
 #[test]
 fn the_pass_lock_lets_one_pass_run_at_a_time_on_windows() {
     let tmp = Tmp::new("pass-lock-win");
@@ -326,11 +278,6 @@ fn the_pass_lock_lets_one_pass_run_at_a_time_on_windows() {
     assert_eq!(names_in(&elsewhere), ["keep"]);
 }
 
-/// THE PASS LOCK IS NEVER TAKEN THROUGH A REPARSE POINT: a file at the lock's
-/// name carrying one that is no link (std reads it as a plain file, so the
-/// open as itself succeeds) is refused by the check after the open, and is
-/// left as it is. NEGATIVE CONTROL: without that check the lock would be
-/// taken on it (a junction never reaches the check: see above).
 #[test]
 fn a_reparse_point_at_the_pass_locks_name_is_never_the_lock() {
     let tmp = Tmp::new("pass-lock-reparse");

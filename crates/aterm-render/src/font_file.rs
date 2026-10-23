@@ -149,9 +149,6 @@ pub fn read_bounded_font_file_into(
     read_admitted_handle(file, length, max_bytes, buf)
 }
 
-/// The read half of [`read_bounded_font_file_into`], over a handle
-/// [`open_regular`] + [`check_observed_size`] already admitted, so the mapping
-/// path can fall back to the copy without reopening the pathname.
 fn read_admitted_handle(
     file: std::fs::File,
     length: u64,
@@ -213,9 +210,6 @@ unsafe impl Sync for MappedFontFile {}
 
 #[cfg(unix)]
 impl MappedFontFile {
-    /// Map `len` bytes of an already-admitted handle. `len` is the `fstat`
-    /// size [`check_observed_size`] bounded, so the mapping never addresses a
-    /// byte past the admission limit.
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd as _;
@@ -250,8 +244,6 @@ impl MappedFontFile {
             return Err(io::Error::last_os_error());
         }
         let Some(ptr) = std::ptr::NonNull::new(raw.cast::<u8>()) else {
-            // A NULL success is impossible with a NULL hint on every unix
-            // aterm builds for; treat it as a failed map rather than trust it.
             return Err(io::Error::other("mmap returned a null mapping"));
         };
         Ok(Self {
@@ -264,9 +256,6 @@ impl MappedFontFile {
 
 #[cfg(windows)]
 impl MappedFontFile {
-    /// Map `len` bytes of an already-admitted handle, read-only, as the unix `map` does: `len`
-    /// is the size [`check_observed_size`] bounded, and an empty file (which
-    /// `CreateFileMappingW` refuses) is refused up front.
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
 
@@ -329,8 +318,6 @@ impl MappedFontFile {
 
 #[cfg(not(any(unix, windows)))]
 impl MappedFontFile {
-    /// No mapping on this target: [`admit_font_file`] never asks for one
-    /// ([`open_for_admission`] answers `false`), and this says why if it did.
     fn map(_file: &std::fs::File, _len: u64) -> io::Result<Self> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
@@ -450,14 +437,12 @@ pub struct FaceTables {
     pub tables: Vec<Option<Vec<u8>>>,
 }
 
-/// Most table records a face directory may declare before it is refused as
-/// malformed.
 const MAX_TABLE_RECORDS: usize = 1024;
 
-/// Read tables `tags` of face `face_index` at `path` (each at most `max_table_bytes`) via [`open_regular`].
+/// Read tables `tags` of face `face_index` at `path` via [`open_regular`].
 ///
 /// # Errors
-/// The admission's error, a read error, or `InvalidData` for a file that is not an `sfnt` (or a collection without face `face_index`).
+/// Admission error, read error, or `InvalidData` for a non-`sfnt` or missing `face_index`.
 pub fn read_face_tables(
     path: &Path,
     face_index: u32,
@@ -670,7 +655,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A reused buffer reads what a fresh one does, including after a larger file.
     #[test]
     fn a_reused_buffer_reads_the_same_bytes_a_fresh_one_does() {
         let root = fixture_dir("reuse");
@@ -694,7 +678,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A refused path must not leave the previous font in a reused buffer.
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");
@@ -725,7 +708,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A one-shot read allocates no slack.
     #[test]
     fn a_fresh_read_allocates_no_slack() {
         let root = fixture_dir("exact-capacity");
@@ -757,7 +739,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A file under the system font directory maps; one under any user-writable directory copies.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
         #[cfg(target_os = "macos")]
@@ -811,9 +792,6 @@ mod tests {
         }
     }
 
-    /// The residency policy is [`maps_in_place`]: a file outside the system
-    /// font volume — here a fixture directory, standing in for every
-    /// user-writable path — is COPIED, empty or not, with exactly its bytes.
     #[test]
     fn admit_font_file_copies_a_file_off_the_system_font_volume() {
         let root = fixture_dir("admit-policy");

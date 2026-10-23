@@ -9,12 +9,10 @@ use crate::terminal::ClockReading;
 
 const COLS: u16 = 100;
 
-/// A distinctive transcript row.
 fn tx(i: usize) -> String {
     format!("⏺ transcript row {i:04} with words")
 }
 
-/// A composer box and footer: fixed bottom chrome.
 const CHROME: [&str; 5] = [
     "",
     "╭──────────────────────────╮",
@@ -238,9 +236,6 @@ fn independently_priced_archive_eviction_conforms_to_ring() {
     assert_eq!((read.first, read.lost, read.rows.len()), (4, 3, KEPT));
 }
 
-/// The row cap binds whatever the bytes allow, and gaps below the retained
-/// window are dropped with their rows (byte eviction itself is the ring
-/// conformance above).
 #[test]
 fn the_row_cap_evicts_and_gaps_leave_with_their_rows() {
     let mut b = AltArchive::with_limits(usize::MAX, 7);
@@ -262,21 +257,16 @@ fn the_row_cap_evicts_and_gaps_leave_with_their_rows() {
     assert_eq!(c.gaps().count(), 0);
 }
 
-/// One session's archive with its own budget, shaped like the live one the GUI
-/// spawns but counted in rows rather than megabytes.
 fn session(budget: usize) -> AltArchive {
     AltArchive::with_limits(budget, ALT_ARCHIVE_MAX_ROWS)
 }
 
-/// Scroll `n` transcript rows off the top of a 20-row region: rows `tx(0)` to
-/// `tx(n - 1)` are archived, newest last.
 fn scroll(a: &mut AltArchive, n: usize) {
     for s in 0..=n {
         commit(a, &frame(s, 20));
     }
 }
 
-/// The charge for one transcript row — the unit every pool size here is in.
 fn row_cost() -> usize {
     alt_archive_row_charge(tx(0).len())
 }
@@ -402,9 +392,6 @@ fn an_archive_that_is_off_takes_no_share() {
     assert!(off.shared_budget().is_none());
 }
 
-/// Conformance binding for `AltArchivePool`: the real archives driven beside
-/// `aterm-spec`'s `alt_archive_pool_model` (discharged by
-/// `scope_aggregate_models_prove_catch_and_multiply`), step for step.
 #[test]
 fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     let m = aterm_models_core::alt_archive_pool_model();
@@ -475,8 +462,6 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
     assert!(m.check_invariant("IdleTakesNothing", &st));
 }
 
-/// The one test in this binary that touches the process-wide pool, so the live
-/// count it asserts on is this session's own arithmetic.
 #[test]
 fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
     let pool = AltArchiveBudget::process();
@@ -650,7 +635,6 @@ fn hits_on(m: &mut DecModeMatcher, mut bytes: &[u8], on_alt: bool) -> Vec<(usize
     out
 }
 
-/// On the alt screen: `(final byte offset, is an exit)`.
 fn hits(m: &mut DecModeMatcher, bytes: &[u8]) -> Vec<(usize, bool)> {
     hits_on(m, bytes, true)
         .into_iter()
@@ -687,9 +671,6 @@ fn matcher_finds_esu_and_alt_exit() {
     }
 }
 
-/// On the main screen only an alt-screen enter splits (main-screen frames
-/// commit nothing); XTRESTORE of an alt mode is an exit candidate on the alt
-/// screen and an enter candidate on the main one.
 #[test]
 fn matcher_reports_by_screen_enters_and_xtrestore() {
     let main: &[(&[u8], Vec<(usize, HitKind)>)] = &[
@@ -755,8 +736,6 @@ fn matcher_survives_a_split_at_every_byte() {
     }
 }
 
-/// A Claude-shaped frame: sync open, cursor hidden, every row painted with CUP +
-/// text + EL, cursor shown, sync closed.
 fn sync_frame(rows: &[String]) -> Vec<u8> {
     let mut v = b"\x1b[?2026h\x1b[?25l".to_vec();
     for (r, text) in rows.iter().enumerate() {
@@ -766,7 +745,6 @@ fn sync_frame(rows: &[String]) -> Vec<u8> {
     v
 }
 
-/// The same paint with no 2026 bracket (vim/less style).
 fn plain_frame(rows: &[String]) -> Vec<u8> {
     let mut v = Vec::new();
     for (r, text) in rows.iter().enumerate() {
@@ -781,10 +759,6 @@ fn term() -> Terminal {
     t
 }
 
-/// The main screen's 2026 frames are not split, yet an alt-screen enter behind
-/// them in the same read still splits: the alt frames after it are each
-/// committed, and the main screen's closes neither commit nor mark the alt run
-/// as 2026-paced.
 #[test]
 fn an_enter_behind_main_screen_frames_in_one_read_still_splits() {
     let mut t = term();
@@ -801,9 +775,6 @@ fn an_enter_behind_main_screen_frames_in_one_read_still_splits() {
     assert_eq!(t.alt_archive().gaps().count(), 0);
 }
 
-/// XTRESTORE of 1049 that restores "on" while on the alt screen does not leave
-/// it, so nothing is committed early — not even inside an open 2026 window,
-/// where the grid is half painted.
 #[test]
 fn an_xtrestore_that_stays_on_the_alt_screen_commits_nothing_early() {
     let mut t = term();
@@ -820,8 +791,6 @@ fn an_xtrestore_that_stays_on_the_alt_screen_commits_nothing_early() {
     assert_eq!(t.alt_archive().gaps().count(), 0);
 }
 
-/// The exit is `?1049l` or XTRESTORE of a 1049 saved "off"; both get the
-/// matcher's one-byte-early split, so the alt grid is committed before the swap.
 #[test]
 fn alt_exit_commits_what_was_drawn_after_the_last_esu() {
     let exits: [(&[u8], &[u8]); 2] = [
@@ -850,9 +819,6 @@ fn alt_exit_commits_what_was_drawn_after_the_last_esu() {
     }
 }
 
-/// The host forces the primary screen (`mainscreen`) after a shell with no
-/// integration marks typed onto a dead pager's screen: every row that screen
-/// showed is readable afterwards, once, in order, behind one `leave` gap.
 #[test]
 fn host_leave_archives_the_rows_typed_onto_the_stuck_screen() {
     let mut t = term();
@@ -881,8 +847,6 @@ fn host_leave_archives_the_rows_typed_onto_the_stuck_screen() {
     assert_eq!(t.alt_archive().gaps().count(), 1);
 }
 
-/// The archive is off (`ATERM_ALT_ARCHIVE=0`): the recovery still leaves the
-/// screen; there is simply nothing to keep.
 #[test]
 fn host_leave_with_the_archive_off_still_leaves() {
     let mut t = Terminal::new(25, COLS);
@@ -895,9 +859,6 @@ fn host_leave_with_the_archive_off_still_leaves() {
     assert_eq!(t.alt_archive().gaps().count(), 0);
 }
 
-/// The conhost enter scan hops ESC to ESC: it finds `?1049h` wherever it sits
-/// (first, last, past `find_byte`'s 64-byte blocks, behind ESCs starting other
-/// sequences) and nothing that only resembles it.
 #[test]
 fn the_conhost_enter_scan_finds_1049h_and_nothing_else() {
     const ENTER: &[u8] = b"\x1b[?1049h";
@@ -920,7 +881,6 @@ fn the_conhost_enter_scan_finds_1049h_and_nothing_else() {
     }
 }
 
-/// A host reset wipes the archive like RIS does (RIS mid-read is below).
 #[test]
 fn a_host_reset_wipes_the_archive() {
     let mut h = term();
@@ -1021,9 +981,6 @@ mod adversarial {
         v.iter().map(|x| (*x).to_string()).collect()
     }
 
-    /// Every diffed frame narrows the chrome height, so rows that later change
-    /// in place inside a stale chrome band (a status block replaced by the
-    /// answer) are flushed on leave/resize/restore.
     #[test]
     fn a1_rows_edited_in_place_in_the_old_chrome_band_are_flushed_on_leave_and_resize() {
         let status = s(&[
@@ -1065,8 +1022,6 @@ mod adversarial {
         }
     }
 
-    /// Frames diffed before a leave measure the chrome, so a leave before the
-    /// first shift does not flush the composer and footer.
     #[test]
     fn a2_leave_before_any_shift_never_archives_the_composer() {
         let mut a = AltArchive::new();
@@ -1087,8 +1042,6 @@ mod adversarial {
         );
     }
 
-    /// An app that clears the alt screen and then leaves: the blank pre-swap
-    /// commit is no frame, so the composer and footer are not archived.
     #[test]
     fn a3_clear_then_exit_never_archives_the_composer() {
         let mut t = term();
@@ -1107,10 +1060,6 @@ mod adversarial {
         assert_eq!(texts, range(tx, 0..25));
     }
 
-    /// Stable anchors inside [0,T) (a todo list above a composer whose footer
-    /// ticks) must not outvote the few overlap anchors of a big scroll: fixed
-    /// rows under a block that moved are that frame's chrome, and the scrolled
-    /// rows are archived.
     #[test]
     fn a4_fixed_rows_under_a_big_scroll_never_outvote_it() {
         let todo = s(&[
@@ -1136,8 +1085,6 @@ mod adversarial {
         assert_eq!(a.texts(), range(tx, 0..17), "gaps = {:?}", gap_kinds(&a));
     }
 
-    /// Rows that leave at the bottom when the app scrolls back (rule 7) wait in
-    /// `below`, and a later jump's flush archives them.
     #[test]
     fn a6_rows_that_left_at_the_bottom_survive_a_later_jump() {
         let mut a = AltArchive::new();
@@ -1157,9 +1104,6 @@ mod adversarial {
         }
     }
 
-    /// Rows that left at the bottom and came back as the app scrolled forward
-    /// are archived once, in order, as they scroll off the top; a leave with
-    /// some still below flushes them.
     #[test]
     fn a6_rows_below_that_come_back_are_archived_once_in_order() {
         let mut a = AltArchive::new();
@@ -1179,9 +1123,6 @@ mod adversarial {
         assert_eq!(a.texts(), range(tx, 0..60));
     }
 
-    /// A full screen of short rows (<4 visible chars: line numbers, a word
-    /// list, `seq` in less) has no anchors; such rows vote weakly, so a half
-    /// page forward archives exactly the half page that left, with no gap.
     #[test]
     fn a5_short_rows_that_move_are_archived_exactly() {
         let mk = |st: usize| -> Vec<String> { (st..st + 20).map(|i| format!("{i}")).collect() };
@@ -1194,9 +1135,6 @@ mod adversarial {
         assert_eq!(a.gaps().count(), 0);
     }
 
-    /// Parser and archive equivalence under slicing for a 2026 stream that also
-    /// exits (1049l / 1047l / 47l), re-enters, RIS-es mid-read, soft-resets and
-    /// carries OSC / DCS strings.
     #[test]
     fn a8_chunked_equivalence_with_exits_ris_decstr_strings() {
         let mut data = b"\x1b[?1049h".to_vec();
@@ -1258,7 +1196,6 @@ mod adversarial {
     }
 }
 
-/// Xorshift for the random walks below: deterministic per seed.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -1281,7 +1218,6 @@ mod property_walk {
     use super::*;
     use std::collections::HashSet;
 
-    /// Transcript with blanks, rules and a repeated short row, like real output.
     fn row(i: usize) -> String {
         match i % 9 {
             3 => String::new(),
@@ -1294,11 +1230,6 @@ mod property_walk {
         !matches!(i % 9, 3 | 6 | 8)
     }
 
-    /// Random walk of a viewport over a growing Claude-like transcript, with
-    /// and without a pinned header: appends (auto-follow), scroll-backs,
-    /// scroll-forwards, jumps to live, rows edited in place, a ticking
-    /// spinner. Invariant after every commit: every unique row that left the
-    /// screen at the top is archived.
     #[test]
     fn p2_claude_like_walk_with_spinner_and_repeats() {
         const T: usize = 30;
@@ -1387,9 +1318,6 @@ mod property_walk {
 mod adversarial_boundaries {
     use super::*;
 
-    /// A read boundary right after `?1049h` must not let the epilogue commit
-    /// the blank alt grid as a baseline (the first real frame would then jump
-    /// and reanchor into the previous app run's rows).
     #[test]
     fn a8b_a_read_boundary_after_alt_enter_never_changes_the_archive() {
         let mut s1 = b"\x1b[?1049h".to_vec();
@@ -1429,10 +1357,6 @@ mod adversarial_boundaries {
         assert_eq!(split, whole);
     }
 
-    /// Under a pinned header the re-shown rows sit at `[pin, pin + back)`, not
-    /// `[0, back)`, and are archived rows `back_at..`; the read reports both
-    /// (`pin=` and `back_at=` on the wire) so a reader skips exactly the rows it
-    /// has.
     #[test]
     fn pin_and_back_at_locate_the_reshown_rows_under_a_pinned_header() {
         let hdr = "══ fake claude · session header ══".to_string();
@@ -1465,8 +1389,6 @@ mod chrome_after_adoption {
     use super::*;
     use crate::terminal::TerminalCheckpoint;
 
-    /// Claude Code's composer: a blank, a rule, the prompt, a rule, the footer,
-    /// with the rules drawn at the screen's width.
     fn claude_chrome(cols: usize) -> Vec<String> {
         vec![
             String::new(),
@@ -1484,7 +1406,6 @@ mod chrome_after_adoption {
             .collect()
     }
 
-    /// A composer box (`╭─╮ │ > text │ ╰─╯`) and footer, `inner` wide.
     fn boxed_chrome(inner: usize) -> Vec<String> {
         vec![
             String::new(),
@@ -1502,7 +1423,6 @@ mod chrome_after_adoption {
             .collect()
     }
 
-    /// Every archived row that is composer or footer, rules and boxes included.
     fn chrome_in(texts: &[String]) -> Vec<String> {
         texts
             .iter()
@@ -1511,15 +1431,12 @@ mod chrome_after_adoption {
             .collect()
     }
 
-    /// A terminal that adopted `cp` the way the seamless-update path does: a
-    /// fresh engine, then `restore_checkpoint`.
     fn adopted(cp: &TerminalCheckpoint) -> Terminal {
         let mut t = term();
         t.restore_checkpoint(cp);
         t
     }
 
-    /// The old process: `frame(s, 20)` for `s` in `0..=last` on the alt screen.
     fn worker_at(last: usize) -> Terminal {
         let mut t = term();
         t.process(b"\x1b[?1049h");
@@ -1529,8 +1446,6 @@ mod chrome_after_adoption {
         t
     }
 
-    /// After a restore on the alt screen, the app repainting the restored screen
-    /// archives nothing and is no rebaseline.
     #[test]
     fn restore_then_an_identical_frame_archives_nothing() {
         let mut t = adopted(&worker_at(3).checkpoint());
@@ -1543,9 +1458,6 @@ mod chrome_after_adoption {
         assert_eq!(t.alt_archive().texts(), range(tx, 3..6));
     }
 
-    /// A checkpoint captured inside an open 2026 window holds a half-painted
-    /// screen and is not the baseline (it would mis-measure the chrome, and the
-    /// next resize would flush the composer).
     #[test]
     fn a_restore_inside_an_open_2026_window_is_not_the_baseline() {
         let mut old = worker_at(3);
@@ -1572,9 +1484,6 @@ mod chrome_after_adoption {
         assert_eq!(texts, range(tx, 50..70));
     }
 
-    /// One installed frame with the composer, then a resize one row down or up:
-    /// no rule, `❯` or footer row is archived, and exactly the rows the new
-    /// screen no longer shows are.
     #[test]
     fn one_installed_frame_then_a_one_row_resize_archives_no_chrome() {
         let cases: [(Vec<String>, Vec<String>, Vec<String>); 3] = [
@@ -1615,9 +1524,6 @@ mod chrome_after_adoption {
         }
     }
 
-    /// A width resize redraws the chrome at the new width — rules, and a
-    /// composer box whose padding and borders change while its words do not —
-    /// and it is still chrome: `(installed, next, rows archived)`.
     #[test]
     fn chrome_redrawn_at_a_new_width_is_still_chrome() {
         let cases = [
@@ -1650,8 +1556,6 @@ mod chrome_after_adoption {
         }
     }
 
-    /// Counting too many rows as still shown is safe: a content row left out of
-    /// the resize flush is archived when it scrolls off the new screen.
     #[test]
     fn rows_left_out_of_a_resize_flush_are_archived_when_they_scroll_off() {
         let mut a = AltArchive::new();
@@ -1668,7 +1572,6 @@ mod chrome_after_adoption {
 mod handoff_carry {
     use super::*;
 
-    /// Every retained row, plus the counters and the differ's state.
     fn whole(a: &AltArchive) -> AltArchiveCarry {
         let (fence, mut c) = a.carry_head(true);
         assert!(a.carry_rows(&mut c, fence, 0, usize::MAX), "nothing moved");
@@ -1682,7 +1585,6 @@ mod handoff_carry {
         b
     }
 
-    /// The two archives answer every read alike.
     fn same(a: &AltArchive, b: &AltArchive, what: &str) {
         let last = a.last();
         for q in [
@@ -1696,7 +1598,6 @@ mod handoff_carry {
         assert_eq!(a.fence(), b.fence(), "{what}");
     }
 
-    /// back_at names a retained row whenever back > 0.
     fn back_in_range(a: &AltArchive, what: &str) {
         let r = a.read(AltArchiveQuery::oldest(0, 0));
         if r.back > 0 {
@@ -1710,9 +1611,6 @@ mod handoff_carry {
         }
     }
 
-    /// One random step of a viewport over a growing transcript (the walk of
-    /// `property_walk`), with the odd resize, redraw, leave/enter and blank
-    /// screen thrown in so every differ state gets carried at some point.
     struct Walk {
         len: usize,
         v: usize,
@@ -1773,7 +1671,6 @@ mod handoff_carry {
                     self.live = true;
                 }
                 14 => {
-                    // A resize: one row more or fewer.
                     self.t = if self.t > 18 && r.below(2) == 0 {
                         self.t - 1
                     } else {
@@ -1784,7 +1681,6 @@ mod handoff_carry {
                     self.live = true;
                 }
                 15 => {
-                    // A wholesale redraw into other content, and later back.
                     self.world = if self.world == 0 {
                         1 + r.below(3) as usize
                     } else {
@@ -1808,9 +1704,6 @@ mod handoff_carry {
         }
     }
 
-    /// A random history, a whole carry into a fresh archive, then the same
-    /// random frames into both: every read identical after every commit, and
-    /// back_at always in range.
     #[test]
     fn a_whole_carry_continues_exactly_where_the_old_archive_would() {
         let mut exact_steps = 0usize;
@@ -1855,8 +1748,6 @@ mod handoff_carry {
         );
     }
 
-    /// A tail: rows before `from` are left out and counted lost; the ones
-    /// carried keep their indices; the byte cap takes the newest rows.
     #[test]
     fn a_tail_carry_counts_what_it_leaves_out() {
         let mut a = AltArchive::new();
@@ -1887,11 +1778,6 @@ mod handoff_carry {
         assert_eq!(c.first, last - 4);
     }
 
-    /// A tail never stops short of what the adopting differ may point back
-    /// at: the last [`REANCHOR_SCREENS`] screens of rows (never before this
-    /// app run's floor) and the run the screen shows again. The host's `from`
-    /// only reaches further back. So a scroll-back past the host's tail, at
-    /// the same size, is recognized after the handoff exactly as before it.
     #[test]
     fn a_tail_carry_reaches_back_as_far_as_the_differ_can_point() {
         let screen = 25; // 20 transcript rows and 5 of chrome
@@ -1946,10 +1832,6 @@ mod handoff_carry {
         assert_eq!(c.first, floor);
     }
 
-    /// A scroll-back past the rows a carry brought (the byte cap left the
-    /// older ones out) cannot be matched against the archive: the rows it
-    /// re-shows are archived again when they scroll off — after a `jump` gap
-    /// at the newest row, so a reader is told, never silently.
     #[test]
     fn a_scroll_back_past_the_carried_rows_is_a_gap_not_a_silent_repeat() {
         let mut a = AltArchive::new();
@@ -1978,10 +1860,6 @@ mod handoff_carry {
         );
     }
 
-    /// The differ's state the freeze had no time for is taken afterwards —
-    /// exactly the state the freeze would have taken — only while nothing
-    /// was committed since. An edit in place moves the state but archives
-    /// nothing: the rows still attach, the state does not.
     #[test]
     fn the_differ_state_is_taken_off_the_freeze_only_while_nothing_committed() {
         let mut a = AltArchive::new();
@@ -2016,9 +1894,6 @@ mod handoff_carry {
         assert_eq!(AltArchive::new().import(c), AltArchiveImport::NoBaseline);
     }
 
-    /// The fence: rows are attached only while the archive stands where the
-    /// freeze saw it; otherwise the head carries counters only, and a reader
-    /// is told the rows were lost rather than handed rows of another screen.
     #[test]
     fn rows_attach_only_while_the_fence_holds() {
         let mut a = AltArchive::new();
@@ -2039,8 +1914,6 @@ mod handoff_carry {
         assert_eq!((r.rows.len(), r.lost), (0, last - 5));
     }
 
-    /// An archive that is off refuses a carry: an archive switched off on the
-    /// adopting side drops the rows.
     #[test]
     fn an_archive_that_is_off_refuses_the_carry() {
         let mut a = AltArchive::new();
@@ -2054,8 +1927,6 @@ mod handoff_carry {
         assert!(!b.enabled());
     }
 
-    /// A differ state that does not describe its own frame is dropped whole
-    /// (never repaired field by field); the rows and counters still land.
     #[test]
     fn a_differ_state_that_does_not_fit_is_dropped_whole() {
         let mut a = AltArchive::new();
@@ -2188,9 +2059,6 @@ mod handoff_carry {
         c
     }
 
-    /// Whatever a carry says, the import and every later frame are panic-free
-    /// and reads stay in range. Corrupt carries are real ones with a few fields
-    /// changed, so they sit on the validation's edges.
     #[test]
     fn no_carry_panics_the_import_or_any_frame_after_it() {
         let mut outcomes = [0usize; 3];

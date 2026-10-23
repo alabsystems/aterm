@@ -400,6 +400,18 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
                 }
                 continue;
             }
+            let mut row_sum = [0u32; 3];
+            for q in row.iter() {
+                if q.w > 0 && q.h > 0 {
+                    let c = q.color;
+                    row_sum[0] += (c >> 16) & 0xff;
+                    row_sum[1] += (c >> 8) & 0xff;
+                    row_sum[2] += c & 0xff;
+                }
+            }
+            if row_sum[0].max(row_sum[1]).max(row_sum[2]) <= peak {
+                continue;
+            }
             row.sort_unstable_by_key(|q| q.x);
             by_end.clear();
             by_end.extend_from_slice(row);

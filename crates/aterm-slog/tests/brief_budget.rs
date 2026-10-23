@@ -10,9 +10,6 @@ use aterm_slog::{
 
 use crate::support::{WALL0, agent_session, at, brief_mail_links_hold};
 
-/// A session of `turns` turns, each with an approval box, a person's input
-/// mark on every third, the last turn left open on a box; the OSC title set
-/// once.
 fn session(turns: u64) -> (Log, u64) {
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -141,9 +138,6 @@ fn brief_stays_within_its_budget() {
     }
 }
 
-/// THE FLOOR IS THE FIT AT ZERO, RENDERED ONCE: over sessions of 1 to 120
-/// turns, read whole, past a cursor and across an epoch (a gap line),
-/// `Briefing::floor` is byte for byte `fit` at budget 0, the one-line form.
 #[test]
 fn briefing_floor_is_its_fit_at_zero() {
     for turns in [1, 5, 30, 120] {
@@ -218,10 +212,6 @@ fn brief_sheds_in_order() {
     assert!(more.contains("marks:"), "{more}");
 }
 
-/// Every need and claim is named (§3.7, §7.4): the session line carries the
-/// most urgent observed need, a `need` line each other one, and a `claim
-/// need` line each need a mark raised; the one-line form counts them in
-/// `more=`.
 #[test]
 fn brief_names_every_need_and_claim() {
     let mut log = Log::new(0);
@@ -275,9 +265,6 @@ fn brief_names_every_need_and_claim() {
     );
 }
 
-/// The open turn's line comes from the fold, not the window: level-aware
-/// eviction never takes an open node's open record (it is pinned), and a
-/// window that lacks it (a reader's cursor past it) still briefs the turn.
 #[test]
 fn brief_keeps_the_open_turn_its_window_lacks() {
     let mut log = Log::with_limits(0, Limits::new(64, 1 << 20).expect("small"));
@@ -319,12 +306,6 @@ fn brief_keeps_the_open_turn_its_window_lacks() {
     assert!(turn.contains("· p1 approval edit open"), "{turn}");
 }
 
-/// A TURN WHOSE OPEN WAS EVICTED KEEPS ITS AUTHOR AND ITS EXCHANGE:
-/// on a 20-record ring, a harness `ctl turn`
-/// (`ledger=7`) settles, and later turns evict its open record while its
-/// close stays; the close restates `ledger=` (5F-4a) and its opener as
-/// `op_by=harness`, so the brief's line for it still says `by=harness
-/// ledger=7`.
 #[test]
 fn a_harness_turn_whose_open_was_evicted_still_briefs_its_author_and_ledger() {
     let mut log = Log::with_limits(1, Limits::new(20, 1 << 20).expect("a 20-record ring"));
@@ -376,8 +357,6 @@ fn a_harness_turn_whose_open_was_evicted_still_briefs_its_author_and_ledger() {
     assert!(line.contains(" by=harness ledger=7"), "{line}");
 }
 
-/// A log whose `mails` (`kind`, `off`) were delivered 10 ms apart, then a
-/// turn of `by` naming `cause` (if any) opened: the log, the turn and when.
 fn mail_then_turn(mails: &[(&str, u64)], by: Actor, cause: Option<&str>) -> (Log, Node, u64) {
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
@@ -416,7 +395,6 @@ fn mail_then_turn(mails: &[(&str, u64)], by: Actor, cause: Option<&str>) -> (Log
     (log, t, ms)
 }
 
-/// `t`'s line in `log`'s brief at `ms`.
 fn turn_line_of(log: &Log, t: Node, ms: u64) -> String {
     let b = log.brief("s-1", 100_000, WALL0 + ms);
     b.text
@@ -426,13 +404,6 @@ fn turn_line_of(log: &Log, t: Node, ms: u64) -> String {
         .to_string()
 }
 
-/// THE MAIL A TURN PROBABLY ANSWERED: a
-/// `ctl` turn opened after one delivered `kind=task` mail briefs
-/// ` mail=@9~` after its own fields, open and once closed (the fold keeps
-/// the newest closed turn's link); a `kind=note` mail, two task mails (the
-/// fold's `mail_amb=`, T10c), a person's turn and a turn naming its cause
-/// print none, the cause staying `cause=@9`; and no record `log` prints
-/// names the link.
 #[test]
 fn a_turn_after_one_task_mail_briefs_it_as_a_guess() {
     let (mut log, t, ms) = mail_then_turn(&[("task", 9)], Actor::Ctl, None);
@@ -484,8 +455,6 @@ fn a_turn_after_one_task_mail_briefs_it_as_a_guess() {
     }
 }
 
-/// Many walled turns (never ordinary, so never ranges) shed oldest first
-/// at level 3 rather than collapsing the whole session to one line.
 #[test]
 fn brief_sheds_old_turn_lines_before_the_session() {
     let mut log = Log::new(0);
@@ -518,10 +487,6 @@ fn brief_sheds_old_turn_lines_before_the_session() {
     assert!(more.starts_with("more=") && more.contains("t1"), "{more}");
 }
 
-/// THE GAP IS THE READ'S, NEVER INFERRED: a brief over a window narrowed to
-/// the records past a cursor (or one node's subtree) reports no loss when its
-/// read crossed none, however late its first seq; the gap a read did cross is
-/// printed as `log` prints it.
 #[test]
 fn a_narrowed_window_reports_only_the_gap_its_read_crossed() {
     let (log, now) = session(3);
@@ -545,8 +510,6 @@ fn a_narrowed_window_reports_only_the_gap_its_read_crossed() {
     );
 }
 
-/// A phase nothing has observed carries no reliability suffix: `?` is a
-/// claim's, and nothing claimed anything.
 #[test]
 fn an_unobserved_phase_claims_nothing() {
     let mut log = Log::new(1);
@@ -571,10 +534,6 @@ fn an_unobserved_phase_claims_nothing() {
     );
 }
 
-/// Phase 3B's bookkeeping kinds give no brief line: a `source` mark (a run's
-/// view of its transcript) and a `mail-landed` mark leave the brief exactly
-/// as it was, while a mark that is worth a line (a person's input,
-/// `Kind::Human`) still gets one.
 #[test]
 fn a_source_or_landing_mark_gives_no_brief_line() {
     let (mut log, now) = session(3);
@@ -615,11 +574,6 @@ fn a_source_or_landing_mark_gives_no_brief_line() {
     assert!(body(&rung).len() > body(&before).len(), "{rung}");
 }
 
-/// PHASE 3B (A5): `brief` reads a node's outcome, tools and steps from its
-/// close or an amend that refines it, by the fold's own rules: an exact
-/// `out=` amend is the turn's outcome and a strong one never is; a step's
-/// exact refinement is its line's outcome; a late rollup amend's `tools=`
-/// and `steps=` are the turn's.
 #[test]
 fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
     use aterm_slog::{Amend, Close, Open, Out, TurnOut};
@@ -720,10 +674,6 @@ fn brief_reads_an_exact_refinement_and_never_a_strong_one() {
     assert!(tl.contains(" · 3 steps shell 2 edit 1"), "{tl}");
 }
 
-/// PHASE 3B's MARKS LEAVE THE BRIEF AS IT WAS: a
-/// busy agent session's brief, every 3B mark written on every turn, holds
-/// every line it holds without them, at every budget; mail is the `mail in ·
-/// out` line and `act` and `story` one count line, both the first lines shed.
 #[test]
 fn the_3b_marks_leave_the_brief_as_it_was() {
     let (mut base, now) = session(12);
@@ -772,7 +722,6 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
             Kind::Shown => f
                 .word(Key::Need, "approval")
                 .and_then(|f| f.word(Key::Sev, "decide")),
-            // The row the log holds as its row alone: no line either.
             Kind::Row => f
                 .tok(Key::RowKind, "job-change")
                 .and_then(|f| f.text(Key::RowText, "exited job=j41 class=exited rev=1")),
@@ -855,11 +804,6 @@ fn the_3b_marks_leave_the_brief_as_it_was() {
     );
 }
 
-/// A CODEX-ALAB SESSION'S ACTS ARE THE ONE COUNT LINE:
-/// a self-supervised agent's acts (`meta set harness_act`, written as
-/// `act` marks by the connection's actor, `src=mark conf=claim`) leave the
-/// brief with every line it had without them, plus `acts N · stories 0`,
-/// which is shed first.
 #[test]
 fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
     let (mut base, now) = session(6);
@@ -912,9 +856,6 @@ fn a_codex_alab_sessions_acts_are_one_count_line_shed_first() {
     assert!(counted > 0, "the count line shows when it fits");
 }
 
-/// A RELAUNCHED SESSION (plan 5F-2's case of [`a_relaunched_sessions_acts_are_one_count_line_shed_first`]):
-/// [`session`]'s run, the agent exiting on its open box, then a relaunched
-/// agent's run with two turns.
 fn relaunched(acts: bool) -> (Log, u64) {
     let (mut log, _) = session(6);
     let run = log.state().run().expect("the run").node;
@@ -961,11 +902,6 @@ fn relaunched(acts: bool) -> (Log, u64) {
     (log, WALL0 + ms + 40_000)
 }
 
-/// A RELAUNCHED SESSION'S ACTS ARE THE ONE COUNT LINE:
-/// the hosted lanes' `act word=relaunch` marks (`by=harness
-/// src=aterm conf=strong`) leave the brief with every line it had without
-/// them — both runs, their turns and the exit — plus `acts 2 · stories 0`,
-/// which is shed first.
 #[test]
 fn a_relaunched_sessions_acts_are_one_count_line_shed_first() {
     let (base, now) = relaunched(false);
@@ -999,9 +935,6 @@ fn a_relaunched_sessions_acts_are_one_count_line_shed_first() {
     assert!(counted > 0, "the count line shows when it fits");
 }
 
-/// One of [`tx_session`]'s steps: a Claude Code tool call the transcript
-/// opened under the open turn (`tx`), or, for the base, a step under the
-/// run (a brief shows none) so the ids agree.
 fn tx_step(log: &mut Log, run: Node, tx: bool, ms: u64, close: bool) -> Node {
     let open = if tx {
         let turn = log.state().turn().expect("an open turn").node;
@@ -1031,8 +964,6 @@ fn tx_step(log: &mut Log, run: Node, tx: bool, ms: u64, close: bool) -> Node {
     p
 }
 
-/// A refinement the transcript wrote (`tx`), or, for the base, an agent
-/// mark (a brief shows none) so the seqs agree.
 fn tx_amend(log: &mut Log, run: Node, tx: Option<(Node, Kind, Fields)>, ms: u64) {
     match tx {
         Some((node, kind, f)) => {
@@ -1053,10 +984,6 @@ fn tx_amend(log: &mut Log, run: Node, tx: Option<(Node, Kind, Fields)>, ms: u64)
     }
 }
 
-/// [`session`] with what a Claude Code transcript adds (`tx`): two tool
-/// steps in each turn, one of them amended `out=error`, each closed turn
-/// amended with its vendor duration and tokens, and three tool steps open
-/// in the open turn.
 fn tx_session(turns: u64, tx: bool) -> (Log, u64) {
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -1128,10 +1055,6 @@ fn tx_session(turns: u64, tx: bool) -> (Log, u64) {
     (log, WALL0 + ms + 40_000)
 }
 
-/// what a transcript adds is shed before any line the brief
-/// held without it — its closed steps' lines and the open turn's open
-/// steps to the newest and a count first, then all of it — and with all
-/// of it shed the brief reads as it did without the transcript.
 #[test]
 fn the_transcript_sheds_before_what_the_brief_held_without_it() {
     let (base, now) = tx_session(12, false);

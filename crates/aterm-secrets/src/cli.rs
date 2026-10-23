@@ -786,10 +786,7 @@ mod unix {
         std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
     }
 
-    /// Say what a publish did: the version, a key rotation (for the ALab vault, what the next
-    /// release must carry; for any vault, that its second key change leaves out the builds
-    /// before handoff chains), and this machine's own sync failing (the publish stands either
-    /// way).
+    /// Print what a publish did, including any key rotation, held requests, or local sync warning.
     fn published(what: &str, done: &Published) -> ExitCode {
         let rotated = if done.rotated {
             ", signed by a new vault key the old one endorsed"
@@ -829,7 +826,8 @@ mod unix {
         ExitCode::SUCCESS
     }
 
-    /// The change a rotation of the ALab vault asks of aterm's next release, exactly as the two lines of crates/aterm-secrets/src/lib.rs read after it.
+    /// The `ALAB_SIGNER` and `ALAB_RETIRED` lines a rotation of the ALab vault asks of the next
+    /// release.
     pub(super) fn release_note(release: &client::AlabRelease) -> String {
         let retired: Vec<String> = release
             .retired
@@ -843,9 +841,7 @@ mod unix {
         )
     }
 
-    /// What a vault's first version with two handoff pairs costs: an aterm built before
-    /// chains parses at most one pair, so it fails every sync of this vault (`expected
-    /// locker: or signature:`) and, serving it, refuses the version (400), until it updates.
+    /// Warning printed when a vault's first version with two handoff pairs is published.
     const LONG_CHAIN_NOTE: &str = "this version carries a second key handoff: an aterm built before handoff chains reads at most one, so every Mac running one fails each sync of this vault, and a server running one refuses it, until it is updated\n";
 
     fn yes(answer: Option<String>) -> bool {
@@ -920,9 +916,8 @@ mod unix {
     /// The longest line a hidden prompt keeps (its buffer never grows, so no copy is left).
     const HIDDEN_MAX: usize = 1024;
 
-    /// One line typed at the terminal without echo. `None` with no terminal; Ctrl-C ends
-    /// the process (exit 130) once the terminal is put back; Ctrl-D on an empty line and
-    /// an empty line answer an empty value.
+    /// Read one line typed at the terminal without echo (`None` with no terminal; Ctrl-C exits
+    /// 130 after restoring terminal settings).
     fn ask_hidden(prompt: &str) -> Option<SecretBytes> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)
@@ -1034,7 +1029,8 @@ mod unix {
         })
     }
 
-    /// `join`'s status line for a Mac awaiting approval of `code` (including [`retype`] hint when applicable).
+    /// `join`'s status line for a Mac awaiting approval of `code` (including [`retype`] hint when
+    /// applicable).
     pub(super) fn waiting_line(host: &str, code: &str, retype: Option<&str>) -> String {
         let line = format!(
             "waiting for approval of {host} (code {code}): on an admin Mac run aterm secrets approve {code}"
@@ -1045,7 +1041,8 @@ mod unix {
         }
     }
 
-    /// `status`'s membership line for a Mac waiting for an admin to approve `code`, with [`retype`] for a vault with a join queue.
+    /// `status`'s membership line for a Mac waiting for an admin to approve `code`, with
+    /// [`retype`] for a vault with a join queue.
     pub(super) fn pending_membership(code: &str, retype: Option<&str>) -> String {
         let line = format!(
             "membership: waiting for approval (on an admin Mac: aterm secrets approve {code})"
@@ -1069,7 +1066,7 @@ mod unix {
         }
     }
 
-    /// This Mac's subscriber, where an admin's approver runs (§9).
+    /// This Mac's subscriber, where an admin's approver runs.
     pub(super) struct Subscriber<'a> {
         /// Its state now ([`service::state`]).
         pub(super) state: &'a dyn Fn() -> crate::Result<service::State>,
@@ -1149,7 +1146,8 @@ mod unix {
         )
     }
 
-    /// What a command that needs this Mac's approver says of it, for a vault that approves by `approval`.
+    /// What a command that needs this Mac's approver says of it, for a vault that approves by
+    /// `approval`.
     pub(super) fn approver_words(approver: &Approver, approval: Approval) -> Option<String> {
         let none = |why: &str| {
             format!(
@@ -2762,9 +2760,8 @@ mod tests {
         }
     }
 
-    /// A server set up with no flags answers the default vault's URL: on macOS it advertises
-    /// that name unless told another, or none, and only on every address at the URL's port,
-    /// so a server hand-run on loopback or another port takes no Mac's name.
+    /// On macOS, `serve` advertises the default vault's name only when listening on all addresses
+    /// at the default port and not told otherwise.
     #[test]
     fn serve_advertises_the_default_vaults_name_unless_told() {
         let advertised = |line: &str| {
@@ -2966,9 +2963,8 @@ mod tests {
         assert_eq!(edit_dirs(&admin).len(), 1);
     }
 
-    /// An edit on a new vault at a path under `root`: the person adds `note` while another
-    /// admin lets `mb` in and sets `other`, so the save is refused; reopened, the person quits
-    /// without saving and answers `publish` when asked to publish the draft as it is.
+    /// Run an edit where a concurrent publish forces a reopen, then quit unchanged and answer
+    /// `publish`.
     #[cfg(unix)]
     fn edit_reopened_unchanged(
         root: &std::path::Path,
@@ -3091,10 +3087,8 @@ mod tests {
         }
     }
 
-    /// `revoke` and `admins remove` name everything the machine could read: an admin read the
-    /// whole text in the admin locker, every host section's entries too; any machine read
-    /// `[everyone]`'s locker beside its own sections', so an `[everyone]` value its section
-    /// overrides is named as well.
+    /// `revoke` and `admins remove` list every secret the machine could read (everything for an
+    /// admin, `[everyone]` plus its own host sections for a member).
     #[cfg(unix)]
     #[test]
     fn letting_a_machine_go_names_everything_it_could_read() {
@@ -3142,10 +3136,8 @@ mod tests {
         );
     }
 
-    /// A JOIN CODE TYPED FOR A MACHINE (`revoke`, `set|unset --for`, as `admins`) reaches the
-    /// machine whose key has it, never one an older approver let in under that code as its
-    /// name; a name passes as typed, and a code no key has is refused, even when a machine is
-    /// so named.
+    /// A join code typed for a machine resolves to the machine whose key has that code, and a
+    /// code no key has is refused even if a machine bears it as its name.
     #[cfg(unix)]
     #[test]
     fn a_code_typed_for_a_machine_reaches_the_key_that_has_it() {
@@ -3231,9 +3223,8 @@ mod tests {
         }
     }
 
-    /// The approver goes in where it does not run: a subscriber that is not installed, or one
-    /// installed with no process, is installed; a running one is left be; a state that cannot
-    /// be read installs nothing (an install asks the same service manager).
+    /// `put_in_approver` installs a stopped or absent subscriber, leaves a running one alone, and
+    /// skips installation when the state cannot be read.
     #[cfg(unix)]
     #[test]
     fn the_approver_is_put_in_only_where_it_does_not_run() {
@@ -3298,9 +3289,8 @@ mod tests {
         );
     }
 
-    /// Where no approver runs on this Mac, a command that needs one says so, and that `aterm
-    /// secrets agent on` starts one; one it installed shows its install line; one that ran
-    /// already says nothing.
+    /// When no approver runs locally, commands that need one report why and name
+    /// `aterm secrets agent on`.
     #[cfg(unix)]
     #[test]
     fn a_command_whose_approver_does_not_run_says_what_starts_one() {
@@ -3344,10 +3334,8 @@ mod tests {
         assert!(!Approver::Skipped.runs() && !Approver::Failed(String::new()).runs());
     }
 
-    /// A vault at a path has no join queue, so nothing lets a machine in there by itself:
-    /// where `password` would say an open vault lets in every machine that asks, or a join
-    /// password lets in whoever types it, it says a machine joins only by an admin's approval
-    /// of its key.
+    /// A vault at a path has no join queue, so `lets_in_words` reports that machines join only by
+    /// admin approval of their key.
     #[cfg(unix)]
     #[test]
     fn a_vault_at_a_path_says_a_machine_joins_it_by_key() {
@@ -3377,10 +3365,8 @@ mod tests {
         assert_eq!(unix::lets_in_words(true, &closed), None);
     }
 
-    /// `create` puts this Mac's approver in, as `join` puts the subscriber in, so a machine
-    /// that types the new vault's join password is let in; `--no-agent` installs nothing, but
-    /// reads the subscriber, which, already running, approves for the new vault too; a failed
-    /// install leaves the vault made (exit 0) with a warning.
+    /// `create` installs the approver unless `--no-agent` is set or the vault is at a path, and a
+    /// failed install still succeeds with a warning.
     #[cfg(unix)]
     #[test]
     fn create_puts_in_the_approver_unless_told_not_to() {
@@ -3447,9 +3433,7 @@ mod tests {
         server.stop();
     }
 
-    /// A vault server that takes a vault's first version and then fails every read, as one that
-    /// goes away between `create`'s publish and its own sync: a GET before the PUT is 404, the
-    /// PUT 204, a GET after it 503.
+    /// Test server that accepts the first `PUT` (204) and returns 503 on subsequent `GET`s.
     #[cfg(unix)]
     struct LostAfterThePut {
         url: String,
@@ -3529,9 +3513,8 @@ mod tests {
         }
     }
 
-    /// A create whose own sync fails once the vault is published (its server gone between the
-    /// two) is no failure: the vault is out and source.toml names it, and a create run again
-    /// would be refused ("already exists there").
+    /// A `create` whose initial sync fails after publishing still succeeds and installs the
+    /// approver.
     #[cfg(unix)]
     #[test]
     fn a_create_whose_own_sync_fails_still_puts_the_approver_in() {
@@ -3581,8 +3564,7 @@ mod tests {
         lost.end();
     }
 
-    /// What leaves a vault letting machines in by itself (`password open`, as `set` and `new`)
-    /// puts this Mac's approver in where none runs, so what it prints holds; closing it
+    /// Opening a vault or setting a join password installs the approver when none runs; closing it
     /// (`off`) reads no subscriber.
     #[cfg(unix)]
     #[test]

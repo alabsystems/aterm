@@ -147,7 +147,7 @@ pub(crate) struct DeliveryTicket {
     pub(crate) insert: Option<InsertWidth>,
     /// The window that dispatched a key.
     pub(crate) window: Option<WindowId>,
-    /// The key's licence class ([`Self::window`]).
+    /// The key's licence class, re-stamped at delivery on [`Self::window`].
     pub(crate) key: Option<DeliveredClass>,
     /// When the bytes were dispatched at the input seam.
     pub(crate) dispatched_at: std::time::Instant,
@@ -609,7 +609,7 @@ pub(crate) fn tracked_egress(
     tracked_egress_ticketed(term, modes, sink, tracker, ev, mode, None)
 }
 
-/// The one egress law ([`DeliveryReceipt`]).
+/// The one egress law, its ticket published as a [`DeliveryReceipt`] on acceptance.
 pub(crate) fn tracked_egress_ticketed(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -804,7 +804,7 @@ pub(crate) const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_rank(typed)
 }
 
-/// Whether an input event carries fresh.
+/// Whether an input event carries fresh, discrete intent.
 #[inline]
 pub(crate) const fn is_present_recovery_stimulus(ev: &InputEvent) -> bool {
     !matches!(
@@ -1663,7 +1663,7 @@ pub(crate) mod paste_order {
         )
     }
 
-    /// The one submission body behind [`enqueue_metered`] and the report route.
+    /// The one submission body behind `enqueue_metered` and the report route.
     #[allow(
         clippy::too_many_arguments,
         reason = "enqueue_metered's handles, with the tracker optional for an encoded report"
@@ -1786,7 +1786,7 @@ pub(crate) mod paste_order {
         )
     }
 
-    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the Windows arm.
+    /// [`ordered_or_inline`] with the platform's routing fact explicit.
     #[allow(
         clippy::too_many_arguments,
         reason = "ordered_or_inline's handles plus the one routing fact it is parameterised on"
@@ -2181,7 +2181,8 @@ fn wheel_viewport_lines(notch_lines: i32, page_rows: u16, detent: bool) -> i32 {
     input::wheel_platform_lines(input::WheelPlatform::Host, notch_lines, page_rows, detent)
 }
 
-/// The modifier-independent.
+/// The modifier-independent (unshifted base) logical key of a winit event, for the keybinding
+/// lookup.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     use aterm_window::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -3192,7 +3193,7 @@ pub(crate) fn deliver_noted(
             reaches,
         };
         tl.slog_mut().person_input(Some(own), at);
-        tl.pay_burst_rows();
+        tl.ring_rows();
         tl.slog_take_wake()
     } else if let Ok(mut tl) = ctx.timeline.try_lock() {
         let at = tl.slog().now();
@@ -3201,7 +3202,7 @@ pub(crate) fn deliver_noted(
             reaches,
         };
         tl.slog_mut().person_input(Some(own), at);
-        tl.pay_burst_rows();
+        tl.ring_rows();
         false
     } else {
         false
@@ -3331,7 +3332,7 @@ impl TrickPress<'_> {
     }
 }
 
-/// Feed one key press through the kitty-command listener cascade:.
+/// Feed one key press through the kitty-command listener cascade.
 fn feed_trick_listener<'w>(
     listener: &'w mut aterm_effects::typed_tricks::TrickListener,
     tricks: &aterm_lexicon::TrickLexicon,
@@ -3587,7 +3588,7 @@ impl App {
         }
     }
 
-    /// External OS command surfaces.
+    /// External OS command surfaces can consume input before `on_key`/`App::input`.
     pub(crate) fn clear_front_move_license(&mut self) {
         if let Some(wid) = self.frontmost_window {
             self.clear_move_license(wid);
@@ -4029,8 +4030,8 @@ impl App {
         receipt_outcome(receipt)
     }
 
-    /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`],
-    /// [`crate::human_input::is_person_gesture`], [`Source::Human`]).
+    /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`]) when `ev` is a
+    /// person's gesture ([`crate::human_input::is_person_gesture`] from [`Source::Human`]).
     pub(crate) fn note_person_input(&self, session: u64, ev: &InputEvent, src: Source) {
         if matches!(src, Source::Human) && crate::human_input::is_person_gesture(ev) {
             self.spares.note_person(std::time::Instant::now());
@@ -4811,10 +4812,12 @@ impl App {
                                 }
                             };
                             if no_echo || tty_swallows || edit_swallowed {
-                                // Distinct branch.
+                                // A no-echo press arms nothing, but it is still sent and the
+                                // program may echo it after all.
                                 ws.predictor.note_unmodelled_input(now);
                             } else if chord_arrow {
-                                // A modified arrow (a lock in Kitty's modifier byte):
+                                // A modified arrow (a lock in Kitty's modifier byte) is
+                                // unmodelled input.
                                 ws.predictor.note_unmodelled_input(now);
                             } else {
                                 ws.predictor.set_mode(pmode);
@@ -5360,7 +5363,8 @@ impl App {
         receipt_outcome(receipt)
     }
 
-    /// Whether a precise delta of `dy_px`.
+    /// Whether a precise delta of `dy_px` (+ = into history) pushes a band parked on a history end
+    /// further past it (down at the live bottom, up at the top).
     fn precise_push_past_parked_edge(
         &self,
         wid: WindowId,
@@ -5432,7 +5436,7 @@ impl App {
                 term.scroll_display(step);
                 let landed = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
                 if landed == current {
-                    // The terminal's live clamp is authoritative if its history
+                    // The terminal's live clamp is authoritative.
                     break;
                 }
             }
@@ -6320,7 +6324,7 @@ impl App {
         }
     }
 
-    /// One press-disposition tail for [`on_key`]'s gate chain.
+    /// One press-disposition tail for [`Self::on_key`]'s gate chain.
     fn note_press_disposition(
         &mut self,
         wid: WindowId,
@@ -6492,7 +6496,7 @@ impl App {
         !self.physical_press_owners.contains_key(&physical_key)
     }
 
-    /// Resolves an OS auto-repeat from press-time physical ownership ([`on_key`]).
+    /// Resolves an OS auto-repeat from press-time physical ownership ([`Self::on_key`]).
     fn route_physical_repeat(
         &mut self,
         arrival_window: WindowId,
@@ -7459,7 +7463,7 @@ impl App {
             })
     }
 
-    /// Hardcoded Cmd-Shift chords of [`on_key`].
+    /// Hardcoded Cmd-Shift chords of [`Self::on_key`].
     fn on_key_super_shift_chord(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if mods.super_key()
             && mods.shift_key()
@@ -7512,7 +7516,7 @@ impl App {
         false
     }
 
-    /// Hardcoded Cmd (no Shift) chords of [`on_key`].
+    /// Hardcoded Cmd (no Shift) chords of [`Self::on_key`].
     fn on_key_super_chord(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if mods.super_key()
             && !mods.shift_key()
@@ -7676,7 +7680,7 @@ impl App {
             .is_some_and(|ws| !ws.preedit.is_empty())
     }
 
-    /// In-grid rename dispatch of [`on_key`].
+    /// In-grid rename dispatch of [`Self::on_key`].
     fn on_key_rename_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         let Some(session) = self.inline_rename_edit(wid).map(|edit| edit.session) else {
             return false;
@@ -7794,7 +7798,7 @@ impl App {
         }
     }
 
-    /// Find-mode keystroke dispatch of [`on_key`].
+    /// Find-mode keystroke dispatch of [`Self::on_key`].
     fn on_key_search_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return false;
@@ -7908,7 +7912,7 @@ impl App {
         }
     }
 
-    /// While a tab context menu is open on `wid`.
+    /// While a tab context menu is open on `wid`, drive it from the keyboard.
     fn on_key_tab_menu_mode(&mut self, wid: WindowId, ev: &KeyEvent) -> bool {
         if !self
             .windows
@@ -8001,6 +8005,7 @@ impl App {
                     ..
                 } => {
                     // An untracked release belongs to a press that predates the card
+                    // and must still reach a Kitty `REPORT_EVENT_TYPES` app.
                     false
                 }
                 InputEvent::Key { key, .. } => {
@@ -8086,7 +8091,7 @@ impl App {
         }
     }
 
-    /// Cmd-= / Cmd-+ / Cmd-- / Cmd-0 live font zoom (grow / shrink / reset) of [`on_key`].
+    /// Cmd-= / Cmd-+ / Cmd-- / Cmd-0 live font zoom (grow / shrink / reset) of [`Self::on_key`].
     fn on_key_font_zoom(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
         match font_zoom_repeat_action(mods, ev) {
             Some(crate::FontZoomRepeatAction::Increase) => {

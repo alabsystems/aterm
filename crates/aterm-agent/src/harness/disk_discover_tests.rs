@@ -18,22 +18,16 @@ use std::os::unix::fs::symlink;
 const DAY: i64 = 86_400;
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// A session id, as Claude Code names its sessions (a UUID).
 const DEAD: &str = "0dead000-0000-4000-8000-000000000001";
 const DEAD_TOO: &str = "0dead000-0000-4000-8000-000000000002";
 const LIVE: &str = "11fe0000-0000-4000-8000-000000000003";
-/// Sessions of a Claude Code with a `CLAUDE_CONFIG_DIR` of its own.
 const ELSEWHERE: &str = "0e15e000-0000-4000-8000-000000000005";
 const ELSEWHERE_ENDED: &str = "0e15e000-0000-4000-8000-000000000006";
 const COPIED: &str = "0e15e000-0000-4000-8000-000000000007";
-/// A session of a Claude Code whose directory links its `projects/` to
-/// `~/.claude`'s.
 const LINKED: &str = "0e15e000-0000-4000-8000-000000000008";
 
-/// A pid no process has (`kill(pid, 0)` answers ESRCH).
 const NO_PID: u32 = 0x7fff_fff0;
 
-/// Set the mtime of the file or directory at `path` to `at`.
 fn set_mtime(path: &Path, at: i64) {
     let when = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
@@ -51,8 +45,6 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).expect("canonical")
 }
 
-/// A registry record of Claude Code's (`~/.claude/sessions/<pid>.json`)
-/// naming `session` for `pid`.
 fn register(home: &Path, pid: u32, session: &str) {
     let dir = mkdirs(&home.join(".claude/sessions"));
     std::fs::write(
@@ -66,9 +58,6 @@ fn register(home: &Path, pid: u32, session: &str) {
     .expect("registry record");
 }
 
-/// Claude Code's temp root at `claude_tmp`, made as Claude Code makes it: `0700`,
-/// whatever the test's umask (Ubuntu's 002 would leave it group-writable, a root
-/// discovery refuses to search).
 fn claude_root(claude_tmp: &Path) {
     use std::os::unix::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
@@ -78,8 +67,6 @@ fn claude_root(claude_tmp: &Path) {
         .expect("Claude Code's temp root");
 }
 
-/// A Claude Code session's scratch build: `<tmp>/<project>/<session>/scratchpad/<sub>/target`,
-/// with a task output beside it and its transcript under `home`.
 fn scratch_build(claude_tmp: &Path, home: &Path, session: &str, sub: &str) -> PathBuf {
     claude_root(claude_tmp);
     let sdir = claude_tmp.join("-proj").join(session);
@@ -90,7 +77,6 @@ fn scratch_build(claude_tmp: &Path, home: &Path, session: &str, sub: &str) -> Pa
     canon(&target)
 }
 
-/// The discovery roots of the fixture under `tmp`.
 fn roots_at(tmp: &Tmp) -> Roots {
     Roots {
         cwds: Vec::new(),
@@ -107,7 +93,6 @@ fn roots_at(tmp: &Tmp) -> Roots {
     }
 }
 
-/// The found build directories as `(path, origin kind)`.
 fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
     d.found
         .iter()
@@ -126,14 +111,6 @@ fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
         .collect()
 }
 
-/// EVERY ROOT KIND, EACH BUILD DIRECTORY ONCE. An agent's
-/// `CARGO_TARGET_DIR`; a working directory's own build directory and its
-/// worktree root's; `$HOME`'s checkout with `target -> target.noindex` (ONE
-/// directory, found by the link resolved and by its own name — reported
-/// once, canonical) and a workspace one level down (`crates/target`); a
-/// build directory BESIDE a worktree (`wt-parent/m1-target`) and in a git
-/// worktree that lives outside `$HOME` (read from `.git/worktrees`); a
-/// Claude Code session's scratch build three levels down.
 #[test]
 fn every_root_kind_is_found_and_each_build_directory_once() {
     let tmp = Tmp::new("discover-roots");
@@ -210,7 +187,6 @@ fn every_root_kind_is_found_and_each_build_directory_once() {
     }
 }
 
-/// A spent budget stops the search and says so, keeping what it found.
 #[test]
 fn a_search_cut_short_keeps_what_it_found_and_says_so() {
     let tmp = Tmp::new("discover-budget");
@@ -233,10 +209,6 @@ fn a_search_cut_short_keeps_what_it_found_and_says_so() {
     );
 }
 
-/// An x.py checkout's `build/<host>/` gives only `stage<N>-<kind>` (N of 1 or more) and
-/// `bootstrap-tools` with a signed `CACHEDIR.TAG`: never a sysroot, stage0, `llvm` or a
-/// `-bin`/`-sysroot` tree, never through the `build/host` link, and the marker walk never
-/// enters `build/`.
 #[test]
 fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     let tmp = Tmp::new("discover-xpy");
@@ -308,8 +280,6 @@ fn an_xpy_checkout_gives_its_bootstrap_build_dirs_and_never_a_sysroot() {
     }
 }
 
-/// The Rust build cache under `$HOME` is searched: each marked `.cargo-build`, however deep,
-/// is a build directory with no owner that can end.
 #[test]
 fn the_rust_build_cache_gives_each_workspace_build_directory() {
     let tmp = Tmp::new("discover-build-cache");
@@ -345,11 +315,6 @@ fn the_rust_build_cache_gives_each_workspace_build_directory() {
     );
 }
 
-/// EACH CLAUDE CODE'S HOME, FOR THE ACCOUNT STATS' COUNT OF THE SESSIONS ON
-/// A HOME ([`RunningClaude::profile`]): a Claude Code with
-/// `CLAUDE_CONFIG_DIR` unset is on its user's `~/.claude.json`; one under a
-/// set `CLAUDE_CONFIG_DIR` on that directory's own; a relative one on the
-/// one under its working directory.
 #[test]
 fn each_running_claude_code_names_the_home_it_runs_in() {
     let home = PathBuf::from("/u");
@@ -393,8 +358,6 @@ fn each_running_claude_code_names_the_home_it_runs_in() {
     assert_eq!(profile(run(None, store, Some("/w")), None), Some(None));
 }
 
-/// THE SESSION'S OWNER: GONE ONLY WHEN NOTHING NAMES IT AND NOTHING OF IT
-/// WAS WRITTEN.
 #[test]
 fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() {
     let tmp = Tmp::new("discover-owners");
@@ -759,7 +722,6 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
     );
 }
 
-/// A config with the floor at 10 GiB and the dead-build switch as given.
 fn cfg(dead: bool) -> Config {
     Config {
         dead_build_dirs: dead,
@@ -767,7 +729,6 @@ fn cfg(dead: bool) -> Config {
     }
 }
 
-/// Survey what `roots` discovers under `tmp` at `now` with `free` bytes free.
 fn survey_at(tmp: &Tmp, roots: &Roots, now: i64, free: u64, config: Config) -> (Survey, Report) {
     let d = discover(roots, Budget::SHIPPED);
     let s = scan(
@@ -792,7 +753,6 @@ fn survey_at(tmp: &Tmp, roots: &Roots, now: i64, free: u64, config: Config) -> (
     (s, rep)
 }
 
-/// A re-measure that answers `script` in turn (its last figure after that).
 fn scripted(script: Vec<u64>, reads: &mut usize) -> impl FnMut() -> Option<u64> + '_ {
     move || {
         let got = script
@@ -805,14 +765,10 @@ fn scripted(script: Vec<u64>, reads: &mut usize) -> impl FnMut() -> Option<u64> 
     }
 }
 
-/// A test's process universe: the processes `pids` (ones it started) and no
-/// other, each read for real ([`scan_path_users_of`]).
 fn among(pids: Vec<u32>) -> impl Fn(&[PathBuf], &[u32]) -> std::io::Result<PathScan> {
     move |dirs, skip| scan_path_users_of(&pids, dirs, skip)
 }
 
-/// The shipped judge at `now`, on any device (a pressure row carries its
-/// own).
 fn judge_at(now: i64) -> Judge {
     Judge {
         now,
@@ -822,8 +778,6 @@ fn judge_at(now: i64) -> Judge {
     }
 }
 
-/// The real remover at `now`, among the running processes `processes` reads;
-/// none of them names a Claude Code directory the survey did not read.
 fn real_with(
     now: i64,
     processes: impl Fn(&[PathBuf], &[u32]) -> std::io::Result<PathScan>,
@@ -837,20 +791,14 @@ fn real_with(
     )
 }
 
-/// The real remover at `now`, among the processes `pids` (the test's own).
 fn real_among(now: i64, pids: Vec<u32>) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     real_with(now, among(pids))
 }
 
-/// The real remover at `now`, where no process of the test's runs.
 fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     real_among(now, Vec::new())
 }
 
-/// BELOW THE FLOOR, ENDED SESSIONS' BUILDS GO WHOLE FIRST (TIER 1, THE
-/// LONGEST UNWRITTEN FIRST, ALL OF THEM: NOBODY BUILDS THERE AGAIN), THEN THE
-/// IDLE CACHES (TIER 2), THEN THE LEAST RECENTLY USED PROFILES (TIER 4), EACH
-/// TIER STOPPED AT ITS OWN TARGET.
 #[test]
 fn below_the_floor_ended_sessions_builds_go_whole_first_then_idle_then_recent_caches() {
     let tmp = Tmp::new("discover-pass");
@@ -961,9 +909,6 @@ fn below_the_floor_ended_sessions_builds_go_whole_first_then_idle_then_recent_ca
     );
 }
 
-/// AT `LOW` (below the warning, above the floor) the same ended build goes
-/// whole and the idle cache goes, measured again; no recent profile is a row
-/// at all.
 #[test]
 fn at_low_an_ended_sessions_build_goes_whole_and_no_recent_profile_is_a_row() {
     let tmp = Tmp::new("discover-low");
@@ -1009,9 +954,6 @@ fn at_low_an_ended_sessions_build_goes_whole_and_no_recent_profile_is_a_row() {
     );
 }
 
-/// A live session, a recent build or a held lock keeps the whole directory (it is judged as
-/// any other, and the report says why); at the removal a lock taken or a session resumed
-/// since refuses it.
 #[test]
 fn a_live_owner_a_held_lock_or_a_recent_build_keeps_the_whole_directory() {
     let tmp = Tmp::new("discover-keep");
@@ -1090,9 +1032,6 @@ fn a_live_owner_a_held_lock_or_a_recent_build_keeps_the_whole_directory() {
     assert!(!gone.exists());
 }
 
-/// Above the floor, or with `dead_build_dirs` off, an ended session's build is like any other
-/// (its idle `incremental/` is the row) and its hog line says why the rest stays; so is it
-/// below the floor while the census is refused.
 #[test]
 fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
     let tmp = Tmp::new("discover-off");
@@ -1133,9 +1072,6 @@ fn above_the_floor_or_switched_off_an_ended_sessions_build_is_any_other() {
     );
 }
 
-/// The largest hogs (pure): an x.py checkout's build directories are one line naming
-/// slim_build.py, a line is what the rows would not free, a nested build directory counts in
-/// the outer only, biggest first, at most [`super::super::MAX_HOGS`], paths as `~/…`.
 #[test]
 fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
     let home = PathBuf::from("/h");
@@ -1214,9 +1150,6 @@ fn the_largest_hogs_are_what_no_row_frees_biggest_first() {
     );
 }
 
-/// The hogs a tick hands the window name what the pass left, not what it planned: a whole row
-/// refused at the removal, one gone only in part, and a profile a build locked just before
-/// its row each stay a hog with why; a directory another process removed is no hog.
 #[test]
 fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
     use crate::harness::cli::{DiskLook, DiskTick, disk_tick};
@@ -1320,8 +1253,6 @@ fn the_hogs_a_tick_hands_the_window_name_what_the_pass_left() {
     assert_eq!((went.whole, went.in_part), (1, 1), "{:#?}", done.removed);
 }
 
-/// An ended session's scratch folder: its temp directory (a task output
-/// in it) and its transcript, both days old by `now`; no build directory.
 fn session_folder(claude_tmp: &Path, home: &Path, session: &str) -> PathBuf {
     claude_root(claude_tmp);
     let sdir = claude_tmp.join("-proj").join(session);
@@ -1332,7 +1263,6 @@ fn session_folder(claude_tmp: &Path, home: &Path, session: &str) -> PathBuf {
     canon(&sdir)
 }
 
-/// The one whole row of `rep`, if it has one.
 fn whole_row(rep: &Report) -> Option<Row> {
     rep.rows
         .iter()
@@ -1340,10 +1270,6 @@ fn whole_row(rep: &Report) -> Option<Row> {
         .cloned()
 }
 
-/// A `target*` link out of an ended session's scratchpad never makes what it names the
-/// session's: found only through the scratchpad, the checkout's build directory is
-/// [`Origin::Linked`] (no whole row, `deps/` kept), and a whole row for it is refused at the
-/// removal since it is not inside the owner's folder.
 #[test]
 fn a_link_out_of_an_ended_sessions_scratchpad_never_gives_it_what_the_link_names() {
     let tmp = Tmp::new("discover-link-out");
@@ -1412,8 +1338,6 @@ fn a_link_out_of_an_ended_sessions_scratchpad_never_gives_it_what_the_link_names
     assert!(noindex.join("debug/deps/liblay.rlib").exists());
 }
 
-/// A build directory a checkout also names is the checkout's, whichever walk met it first;
-/// two owners at once make [`Origin::Linked`].
 #[test]
 fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
     let tmp = Tmp::new("discover-shared");
@@ -1455,8 +1379,6 @@ fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
     );
 }
 
-/// Run `f` until it answers `Err` (a spawned child's working directory and
-/// open files show at once; the hang detector allows a minute).
 fn until_err(mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
     within(MUST_HAPPEN, std::time::Duration::from_millis(20), || {
         f().err()
@@ -1464,10 +1386,6 @@ fn until_err(mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
     .map_or(Ok(()), Err)
 }
 
-/// A child working in an ended session's `deps/`, or holding a file of its folder open,
-/// refuses the whole removal (cargo takes no lock while tests run); the shipped
-/// [`remover`](crate::harness::disk::remover), the one judge here that reads every process,
-/// names the child too.
 #[test]
 fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     let tmp = Tmp::new("discover-running");
@@ -1526,8 +1444,6 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(!gone.exists());
 }
 
-/// A process that cannot be read (not a platform service), or a failed process listing, keeps
-/// a gone owner's build directory.
 #[test]
 fn a_process_that_cannot_be_read_keeps_a_gone_owners_build_directory() {
     let tmp = Tmp::new("discover-unreadable");
@@ -1572,8 +1488,6 @@ fn a_process_that_cannot_be_read_keeps_a_gone_owners_build_directory() {
     assert_eq!(removed.units, std::slice::from_ref(&gone));
 }
 
-/// THE SEARCH STAYS ON THE MEASURED VOLUME AND OUT OF MOUNT POINTS (review
-/// P5).
 #[test]
 fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
     let tmp = Tmp::new("discover-volume");
@@ -1621,8 +1535,6 @@ fn the_search_stays_on_the_measured_volume_and_out_of_mount_points() {
     assert!(super::mount_points().contains(&PathBuf::from("/")));
 }
 
-/// A working directory inside an x.py tree's `build/` never reaches stage0 or a sysroot: only
-/// the bootstrap rule, from the worktree root, finds `stage1-rustc`.
 #[test]
 fn a_cwd_inside_an_xpy_build_tree_never_reaches_stage0_or_a_sysroot() {
     let tmp = Tmp::new("discover-xpy-cwd");
@@ -1670,8 +1582,6 @@ fn the_privacy_guarded_folders_are_never_walked_from_home() {
     assert_eq!(got, [&planted[1]]);
 }
 
-/// A temp root another user could write in, or a link, is skipped with a note. Negative
-/// control: private again, its scratch build is found.
 #[test]
 fn a_temp_root_another_user_could_write_in_is_not_searched() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1701,8 +1611,6 @@ fn a_temp_root_another_user_could_write_in_is_not_searched() {
     assert_eq!(got, [&scratch]);
 }
 
-/// A search cut short before `$HOME` is done reaches no owner's build directory: checkouts are
-/// walked first.
 #[test]
 fn a_search_cut_short_in_home_reaches_no_owners_build_directory() {
     let tmp = Tmp::new("discover-cut-owner");
@@ -1728,7 +1636,6 @@ fn a_search_cut_short_in_home_reaches_no_owners_build_directory() {
     assert!(whole.found.iter().any(|f| f.origin.ownable()));
 }
 
-/// The journal's intent row for a whole removal names the session and its folder.
 #[test]
 fn the_journal_names_whose_build_directory_went_whole() {
     let tmp = Tmp::new("discover-journal");
@@ -1749,8 +1656,6 @@ fn the_journal_names_whose_build_directory_went_whole() {
     assert!(line.contains(&session_dir.display().to_string()), "{line}");
 }
 
-/// One workspace's build directory in the fixture's Rust build cache
-/// (`<cache><workspace>/.cargo-build`), its profile last used at `at`.
 fn cache_build(home: &Path, workspace: &Path, at: i64) -> PathBuf {
     let cache = atpkg::build_cache::cache_root(home);
     let dir = lay_target(&atpkg::build_cache::build_dir(&cache, workspace));
@@ -1758,7 +1663,6 @@ fn cache_build(home: &Path, workspace: &Path, at: i64) -> PathBuf {
     canon(&dir)
 }
 
-/// The whole rows of `rep` by path.
 fn whole_paths(rep: &Report) -> Vec<PathBuf> {
     rep.rows
         .iter()
@@ -1767,9 +1671,6 @@ fn whole_paths(rep: &Report) -> Vec<PathBuf> {
         .collect()
 }
 
-/// BELOW THE FLOOR, A REMOVED WORKSPACE'S RUST BUILD CACHE GOES WHOLE AFTER
-/// TEN MINUTES UNWRITTEN — the leftover of a deleted worktree that filled
-/// the disk twice on 2026-10-16.
 #[test]
 fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
     let tmp = Tmp::new("discover-build-cache-gone");
@@ -1851,9 +1752,6 @@ fn below_the_floor_a_removed_workspaces_build_cache_goes_whole() {
     );
 }
 
-/// AT THE REMOVAL a removed workspace's build cache is judged again: a
-/// worktree recreated since the survey (its `Cargo.toml` back) keeps it,
-/// and so does a process working inside it.
 #[test]
 fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     let tmp = Tmp::new("discover-build-cache-recheck");
@@ -1892,8 +1790,6 @@ fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     assert!(!dir.exists());
 }
 
-/// This process's captured executable and working directory are checked
-/// against owned real paths.
 #[test]
 fn this_processs_own_executable_and_working_directory_are_users() {
     let tmp = aterm_tempfile::tempdir().expect("owned process-path fixture");
@@ -1949,12 +1845,6 @@ fn this_processs_own_executable_and_working_directory_are_users() {
     );
 }
 
-/// `discover` never enters `~/Library/Containers`, `~/Library/Group Containers`,
-/// `~/Library/CloudStorage` or `~/Library/Mobile Documents` — whether handed as
-/// `CARGO_TARGET_DIR`, as a session `cwd`, as a `~/Library` child during the
-/// `$HOME` walk, as a `target` symlink inside a checkout, or as a linked
-/// worktree — while a target under `~/Library/Caches` (outside the fence) IS
-/// found.
 #[test]
 fn other_apps_data_is_never_entered_from_any_root() {
     let tmp = aterm_tempfile::Builder::new()
@@ -2035,10 +1925,6 @@ fn other_apps_data_is_never_entered_from_any_root() {
     }
 }
 
-/// THE CENSUS'S WORD ON A CLAUDE CODE'S LOGIN ([`Exec::stored_login`], the
-/// environment's half of the host's verdict, which the account stats read as
-/// `api-key-seen`): an exec environment with an API key, Bedrock's switch or
-/// a route of its own is on no stored login.
 #[test]
 fn the_census_reads_whether_a_claude_code_is_on_its_stored_login() {
     let stored = |env: &[&str]| {

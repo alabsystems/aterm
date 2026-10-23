@@ -1516,6 +1516,10 @@ pub(crate) struct SettingsViewState {
     page_chrome: Cell<PageChrome>,
     page_chrome_at: Cell<Option<(LogicalRect, f32)>>,
     page_chrome_memo: RefCell<Option<(ChromeInputs, PageChrome)>>,
+    /// The chooser's rows each width built while [`page`] builds the page, which every seat of it shares.
+    showcase_blocks: RefCell<Option<Vec<showcase_page::SharedBlocks>>>,
+    /// The Customize sheet's rows each width and room built while [`page`] builds the page.
+    showcase_sheet: RefCell<Option<Vec<showcase_page::SharedSheet>>>,
     pinned_place: Cell<Option<PinnedPlace>>,
     measuring_calm: Cell<bool>,
     status_extra: Cell<f32>,
@@ -1701,6 +1705,8 @@ impl SettingsViewState {
             page_chrome: Cell::new(PageChrome::FULL),
             page_chrome_at: Cell::new(None),
             page_chrome_memo: RefCell::new(None),
+            showcase_blocks: RefCell::new(None),
+            showcase_sheet: RefCell::new(None),
             pinned_place: Cell::new(None),
             measuring_calm: Cell::new(false),
             status_extra: Cell::new(0.0),
@@ -3766,7 +3772,7 @@ impl SettingsApp {
             return false;
         };
         let Some(index) = view.field_index_of(key) else {
-            // Distinct branch.
+            // An action from a prior Settings revision is consumed but changes nothing.
             return true;
         };
         let field = &view.legacy.fields[index];
@@ -4948,6 +4954,7 @@ impl SettingsApp {
         {
             let Some(entry) = manual_reset_schema_entry(index) else {
                 // Stale/forged actions cannot promote unknown structures into
+                // destructive dotted-key edits.
                 return EventResult::Handled;
             };
             if !view.raw_values.contains_key(entry.key) {
@@ -7878,28 +7885,51 @@ fn settings_page_scroll_limit(view: &SettingsViewState) -> usize {
     view.result_page_limit.get().unwrap_or(usize::MAX)
 }
 
-/// Whether `event` is a projection's reply, not something the person sent.
+/// Whether `event` is a projection's reply, not something the person sent;
+/// every event is named, so a new one must say which.
 const fn projection_reply(event: &AppEvent) -> bool {
-    matches!(
-        event,
+    match event {
         AppEvent::ConfigChanged(_)
-            | AppEvent::UpdateChanged { .. }
-            | AppEvent::PackagesChanged { .. }
-            | AppEvent::MessagesChanged { .. }
-            | AppEvent::HarnessChanged { .. }
-            | AppEvent::DocumentChanged { .. }
-            | AppEvent::DocumentEditorOpened { .. }
-            | AppEvent::ConfigEditorFinished { .. }
-            | AppEvent::ConfigPatchFinished { .. }
-            | AppEvent::ExternalOpenFinished { .. }
-            | AppEvent::ThemesFinished { .. }
-            | AppEvent::UpdateFinished { .. }
-            | AppEvent::PackagesFinished { .. }
-            | AppEvent::MessageActFinished { .. }
-            | AppEvent::ClipboardFinished { .. }
-            | AppEvent::RecoveryFinished { .. }
-            | AppEvent::SettingsDraftsCarried(_)
-    )
+        | AppEvent::UpdateChanged { .. }
+        | AppEvent::PackagesChanged { .. }
+        | AppEvent::MessagesChanged { .. }
+        | AppEvent::HarnessChanged { .. }
+        | AppEvent::DocumentChanged { .. }
+        | AppEvent::DocumentEditorOpened { .. }
+        | AppEvent::ConfigEditorFinished { .. }
+        | AppEvent::ConfigPatchFinished { .. }
+        | AppEvent::ExternalOpenFinished { .. }
+        | AppEvent::ThemesFinished { .. }
+        | AppEvent::UpdateFinished { .. }
+        | AppEvent::PackagesFinished { .. }
+        | AppEvent::MessageActFinished { .. }
+        | AppEvent::ClipboardFinished { .. }
+        | AppEvent::RecoveryFinished { .. }
+        | AppEvent::SettingsDraftsCarried(_) => true,
+        AppEvent::Action(_)
+        | AppEvent::FocusChanged(_)
+        | AppEvent::TextInput(_)
+        | AppEvent::EditorInput(_)
+        | AppEvent::EditorCommand(_)
+        | AppEvent::EditorCompletion(_)
+        | AppEvent::EditorConfigCompletion(_)
+        | AppEvent::EditorConfigCompletionRejected
+        | AppEvent::EditorConfigNavigate { .. }
+        | AppEvent::EditorConfigDismiss { .. }
+        | AppEvent::EditorConfigDiagnosticNavigate { .. }
+        | AppEvent::EditorViewportChanged { .. }
+        | AppEvent::ScrollLines(_)
+        | AppEvent::PressListPicture(_)
+        | AppEvent::ScrollAt { .. }
+        | AppEvent::StepFocus(_)
+        | AppEvent::ScrollPage(_)
+        | AppEvent::MarkdownScroll { .. }
+        | AppEvent::MarkdownPage { .. } => false,
+        #[cfg(any(a11y_tree, test))]
+        AppEvent::RevealControl(_)
+        | AppEvent::InsertText(_)
+        | AppEvent::EditorSetSelection { .. } => false,
+    }
 }
 
 impl SettingsApp {
@@ -8272,10 +8302,14 @@ impl SettingsApp {
             AppEvent::StepFocus(lines) => {
                 view.settle_messages_scroll();
                 if !self.step_message_focus(view, lines) && !view.step_list_focus(lines) {
+                    let kept = view.keyboard_shown(false);
                     view.page_reveal = None;
                     let limit = self.page_scroll_limit(view);
                     view.reduce_page_scroll(limit, SettingsPageScrollCommand::Lines(lines));
                     self.keep_message_focus_seated(view);
+                    if let Some(key) = kept {
+                        view.reveal_control(key);
+                    }
                 }
                 true
             }
@@ -9395,7 +9429,7 @@ fn choices_for_field(
 ) -> Option<Vec<String>> {
     match field.kind {
         EditKind::Enum { .. } if field.key == prefs::EDIT_PREDICTIVE_ECHO => {
-            // Distinct branch.
+            // `always` may expose password keystrokes: the picker offers only Off and Adaptive.
             Some(vec!["off".to_string(), "adaptive".to_string()])
         }
         EditKind::Enum { options } => {
@@ -12385,12 +12419,74 @@ fn status_line_height() -> f32 {
     22.0_f32.max(16.0 * settings_text_scale())
 }
 
+thread_local! {
+    /// The status's words as a page being built wrapped them ([`StatusWordsShared`]).
+    static STATUS_WORDS: RefCell<Option<StatusWords>> = const { RefCell::new(None) };
+}
+
+/// What the status's words wrapped to, by text and width.
+type WrappedBy<T> = aterm_hash::FxHashMap<(Box<str>, u32), T>;
+
+/// The status's words wrapped, by text and width: their lines, and the words broken.
+#[derive(Default)]
+struct StatusWords {
+    lines: WrappedBy<Vec<String>>,
+    broken: WrappedBy<usize>,
+}
+
+/// THE PAGE'S SEATS SHARE THE STATUS'S WORDS: while open, each text is wrapped at each width once a render.
+struct StatusWordsShared;
+
+impl StatusWordsShared {
+    fn open() -> Self {
+        STATUS_WORDS.with(|words| words.replace(Some(StatusWords::default())));
+        Self
+    }
+
+    fn once<T: Clone>(
+        text: &str,
+        width: f32,
+        of: fn(&mut StatusWords) -> &mut WrappedBy<T>,
+        wrap: impl FnOnce() -> T,
+    ) -> T {
+        let at = (Box::from(text), width.to_bits());
+        let seen = STATUS_WORDS.with(|words| {
+            words
+                .borrow_mut()
+                .as_mut()
+                .and_then(|words| of(words).get(&at).cloned())
+        });
+        seen.unwrap_or_else(|| {
+            let wrapped = wrap();
+            STATUS_WORDS.with(|words| {
+                if let Some(words) = words.borrow_mut().as_mut() {
+                    of(words).insert(at, wrapped.clone());
+                }
+            });
+            wrapped
+        })
+    }
+}
+
+impl Drop for StatusWordsShared {
+    fn drop(&mut self) {
+        STATUS_WORDS.with(|words| words.replace(None));
+    }
+}
+
 fn status_word_lines(text: &str, width: f32) -> Vec<String> {
-    wrap_to_box(text, width.max(1.0), &status_words_width)
-        .into_iter()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
-        .collect()
+    StatusWordsShared::once(
+        text,
+        width,
+        |words| &mut words.lines,
+        || {
+            wrap_to_box(text, width.max(1.0), &status_words_width)
+                .into_iter()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        },
+    )
 }
 
 fn status_words_width(text: &str) -> f32 {
@@ -12399,6 +12495,15 @@ fn status_words_width(text: &str) -> f32 {
 }
 
 fn broken_words(text: &str, width: f32) -> usize {
+    StatusWordsShared::once(
+        text,
+        width,
+        |words| &mut words.broken,
+        || words_broken(text, width),
+    )
+}
+
+fn words_broken(text: &str, width: f32) -> usize {
     let base = text.as_ptr() as usize;
     let starts: std::collections::BTreeSet<usize> = line_pieces(text)
         .into_iter()
@@ -13793,6 +13898,9 @@ fn page(
     width: SettingsWidth,
 ) -> UiNode {
     let record = state.scroll_record.borrow().clone();
+    let _shared = showcase_page::BlocksShared::open(state);
+    let _words = scroll::KeyboardWords::watch(state.common.last_focus.clone());
+    let _status = StatusWordsShared::open();
     let bars = settings_status_bars_height(state, width, cx.viewport) > 0.0;
     let seat = |chrome: PageChrome, calm: bool| {
         state.scroll_record.replace(record.clone());
@@ -13848,6 +13956,10 @@ fn page(
     };
     let seated_at = (cx.viewport, settings_text_scale());
     let decide = || {
+        #[cfg(test)]
+        if let Some(chrome) = PAGE_CHROME_HELD.with(Cell::get) {
+            return (chrome, seat(chrome, bars).0);
+        }
         let kept = record
             .as_ref()
             .filter(|record| {
@@ -13856,24 +13968,47 @@ fn page(
             .and_then(|_| state.page_chrome_at.get())
             .filter(|at| *at == seated_at)
             .map(|_| state.page_chrome.get());
+        // The seat built last, while no other has been since: a seat starts
+        // from the same record, so the same chrome seated again builds the
+        // same page and leaves the same state, and is not built twice.
+        let mut spare = None;
         if let Some(chrome) = kept {
-            let built = seat(chrome, bars).0;
+            let seated = seat(chrome, bars);
             let scrolled = record.as_ref().is_some_and(|record| record.top() > 0);
             if scrolled || state.revealed_stop_fits() {
-                return (chrome, built);
+                return (chrome, seated.0);
             }
+            spare = Some((chrome, seated));
         }
-        let chosen = PageChrome::ladder(width, cx.viewport)
-            .into_iter()
-            .find_map(|chrome| {
-                let (built, holds, cuts) = seat(chrome, bars);
-                holds.then_some((chrome, built, cuts))
-            });
-        let (chrome, built, cuts) = chosen.unwrap_or_else(|| {
-            let (built, _, cuts) = seat(PageChrome::FULL, bars);
-            (PageChrome::FULL, built, cuts)
+        let mut chosen = None;
+        let mut full_cuts = None;
+        for chrome in PageChrome::ladder(width, cx.viewport) {
+            let (built, holds, cuts) = match spare.take() {
+                Some((was, seated)) if was == chrome => seated,
+                _ => seat(chrome, bars),
+            };
+            if chrome == PageChrome::FULL {
+                full_cuts = Some(cuts);
+            }
+            if holds {
+                chosen = Some((chrome, Some(built), cuts));
+                break;
+            }
+            spare = Some((chrome, (built, holds, cuts)));
+        }
+        // No rung holds the page: FULL, its page built only where nothing
+        // is cut, since the trials below seat another and FULL again.
+        let (chrome, built, cuts) = chosen.unwrap_or_else(|| match (spare, full_cuts) {
+            (Some((was, (built, _, cuts))), _) if was == PageChrome::FULL => {
+                (PageChrome::FULL, Some(built), cuts)
+            }
+            (_, Some(cuts)) if cuts != (0, 0) => (PageChrome::FULL, None, cuts),
+            _ => {
+                let (built, _, cuts) = seat(PageChrome::FULL, bars);
+                (PageChrome::FULL, Some(built), cuts)
+            }
         });
-        if cuts == (0, 0) {
+        if let (Some(built), (0, 0)) = (built, cuts) {
             return (chrome, built);
         }
         let ladder = PageChrome::ladder(width, cx.viewport);
@@ -13927,6 +14062,8 @@ fn page(
         .as_ref()
         .filter(|(at, _)| *at == inputs)
         .map(|(_, chrome)| *chrome);
+    #[cfg(test)]
+    let remembered = remembered.filter(|_| PAGE_CHROME_HELD.with(Cell::get).is_none());
     let (chrome, built) = match remembered {
         Some(chrome) => {
             #[cfg(test)]
@@ -14408,6 +14545,10 @@ thread_local! {
     /// Whether this thread's renders draw a plain status's bar at its least
     /// ([`SettingsViewState::status_bar_most`]).
     pub(crate) static STATUS_BAR_LEAST: Cell<bool> = const { Cell::new(false) };
+    /// The chrome this thread's renders seat the page in, whatever the page
+    /// would choose: the chrome a frame held, which a test measures the
+    /// screens of.
+    pub(crate) static PAGE_CHROME_HELD: Cell<Option<PageChrome>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -20577,6 +20718,15 @@ fn rows_too_tall_to_stack() -> Option<f32> {
     ROWS_TOO_TALL_TO_STACK.with(Cell::get)
 }
 
+/// What the seat being built lays setting rows out by: [`RowsTooTallToStack`], and the lines
+/// [`FieldListRoom`] leaves a field ([`field_lines_most`]), all a row reads of it.
+fn seat_row_rooms() -> (Option<u32>, usize) {
+    (
+        rows_too_tall_to_stack().map(f32::to_bits),
+        field_lines_most(),
+    )
+}
+
 struct RowsTooTallToStack(Option<f32>);
 
 impl RowsTooTallToStack {
@@ -21600,8 +21750,8 @@ fn push_field_card(
 ) {
     match ListItem::of(node, height) {
         ListItem::Split(split) if !split.rows.is_empty() => {
-            let split = if split.outgrows(room) {
-                split.fitted(room)
+            let split = if split.outgrows(room, scroll::ListFoot::Peek) {
+                split.fitted(room, scroll::ListFoot::Peek)
             } else {
                 split
             };
@@ -30304,19 +30454,44 @@ fn metadata_value_text_width(text: &str, px: f32, code: bool) -> f32 {
 
 const MAX_METADATA_VALUE_LINES: usize = 64;
 
+/// A text's line pieces as byte ranges, each marked whether a space comes before it.
+type PieceCut = Arc<[(bool, std::ops::Range<usize>)]>;
+
 fn line_pieces(text: &str) -> Vec<(&str, &str)> {
+    thread_local! {
+        /// Each text's pieces as byte ranges: the cut is a pure function of
+        /// the text, and every render lays out the same rows again.
+        static CUTS: RefCell<aterm_hash::FxHashMap<Box<str>, PieceCut>> =
+            RefCell::new(aterm_hash::FxHashMap::default());
+    }
+    let cut = CUTS.with_borrow(|cuts| cuts.get(text).cloned());
+    let cut = cut.unwrap_or_else(|| {
+        let cut: PieceCut = line_piece_ranges(text).into();
+        CUTS.with_borrow_mut(|cuts| {
+            if cuts.len() >= 4_096 {
+                cuts.clear();
+            }
+            cuts.insert(text.into(), cut.clone());
+        });
+        cut
+    });
+    cut.iter()
+        .map(|(spaced, range)| (if *spaced { " " } else { "" }, &text[range.clone()]))
+        .collect()
+}
+
+fn line_piece_ranges(text: &str) -> Vec<(bool, std::ops::Range<usize>)> {
     let separator = FACT_SEPARATOR.trim();
-    let mut pieces: Vec<(&str, &str)> = Vec::new();
-    let mut last = 0;
+    let mut pieces: Vec<(bool, std::ops::Range<usize>)> = Vec::new();
     for piece in aterm_grapheme::pieces(text, |_| true) {
+        let end = piece.at + piece.text.len();
         if piece.text == separator
             && let Some(joined) = pieces.last_mut()
         {
-            joined.1 = &text[last..piece.at + piece.text.len()];
+            joined.1.end = end;
             continue;
         }
-        pieces.push((if piece.spaced { " " } else { "" }, piece.text));
-        last = piece.at;
+        pieces.push((piece.spaced, piece.at..end));
     }
     pieces
 }
@@ -30421,6 +30596,11 @@ fn fact_name_width(text: &str) -> f32 {
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
+/// FACTS SIT BESIDE THEIR NAMES until a word cannot, or until that takes
+/// more lines than a name over its fact: the column a long name leaves its
+/// fact wraps the fact into a column of words (Packages' Background service
+/// at 444pt with 2× text in Windows' face: six lines beside, a 256pt row in
+/// the list's 212pt room, never whole on any screen).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FactColumns {
     label: f32,
@@ -30439,7 +30619,7 @@ impl FactColumns {
         let label = label_width.max(widest.min(inner * 0.4)).min(inner);
         let value = (inner - label - ABOUT_METADATA_ROW_GAP).max(0.0);
         let px = 13.0 * crate::native_appearance::text_scale();
-        let beside = rows.iter().all(|(name, text)| {
+        let fits = rows.iter().all(|(name, text)| {
             let code = metadata_value_is_code(name);
             pieces_fit(about_fact_label(name), label, &fact_name_width)
                 && if code {
@@ -30451,19 +30631,37 @@ impl FactColumns {
                     })
                 }
         });
-        if beside {
-            Self {
-                label,
-                value,
-                stacked: false,
-            }
+        let beside = Self {
+            label,
+            value,
+            stacked: false,
+        };
+        let stacked = Self {
+            label: inner,
+            value: inner,
+            stacked: true,
+        };
+        if fits && beside.lines(rows) <= stacked.lines(rows) {
+            beside
         } else {
-            Self {
-                label: inner,
-                value: inner,
-                stacked: true,
-            }
+            stacked
         }
+    }
+
+    /// The lines `rows` take in these columns: a name and its fact side by
+    /// side take the taller of the two, stacked they take both.
+    fn lines(self, rows: &[(String, String)]) -> usize {
+        rows.iter()
+            .map(|(name, text)| {
+                let (names, facts) = fact_card_lines(name, text, self);
+                let (names, facts) = (names.len().max(1), facts.len().max(1));
+                if self.stacked {
+                    names + facts
+                } else {
+                    names.max(facts)
+                }
+            })
+            .sum()
     }
 }
 
@@ -31582,7 +31780,7 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         format!("Version {version} {state}; its release notes aren\u{2019}t available here.")
     } else if update.failing_persistent || update.dev_build || !update.installable.is_installable()
     {
-        // Distinct branch.
+        // Never "the newest version" where this copy does not update; the status card says why.
         "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled && (update.channel_unreadable || update.checked_at.is_none()) {
         // Channel unreadable or first check still pending.

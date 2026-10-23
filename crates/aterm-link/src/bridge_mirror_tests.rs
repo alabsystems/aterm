@@ -269,9 +269,7 @@ impl World {
         });
     }
 
-    /// Local records until the ring evicts `ms`. An eviction batch takes an
-    /// eighth of the ring, oldest first: a bell between `ms` and the next
-    /// bus-class record is the batch's second victim, so `ms` goes alone.
+    /// Local records until the ring evicts `ms`.
     fn evict(&mut self, ms: u64) {
         for _ in 0..64 {
             if !self.log(|log| log.live_ms().any(|m| m == ms)) {
@@ -382,8 +380,7 @@ impl World {
     }
 }
 
-/// A HOLE IS SAID ONCE: three records, the first landed, the second evicted
-/// before a take reached it — one cover, then the third record.
+/// Three records, the first landed, the second evicted before a take reached it: one cover, then the third record.
 #[test]
 fn log_mirror_conforms_to_derived_model() {
     let mut w = World::new();
@@ -422,11 +419,7 @@ fn log_mirror_conforms_to_derived_model() {
     );
 }
 
-/// a slot pinned and published under
-/// the export's fence is refused its landing (`fenced`), the successor that
-/// has not adopted the session answers `adopting` and the bridge keeps its
-/// pin, and once adopted the pin lands on the carried cursor — past the
-/// record the successor's ring has since evicted, which is never covered.
+/// A slot pinned and published under the export's fence waits until the successor adopts the session, then lands on the carried cursor.
 #[test]
 fn log_mirror_conforms_across_an_update_adopted_late() {
     let mut w = World::new();
@@ -486,9 +479,7 @@ fn log_mirror_conforms_across_an_update_adopted_late() {
     r.check("stood down: landed");
 }
 
-/// another writer's record at the pinned sequence is a collision
-/// (the bridge drops its connection and keeps the evidence), never a
-/// landing; the slot is re-pinned at a fresh sequence and lands.
+/// Another writer's record at the pinned sequence is a collision; the slot is re-pinned at a fresh sequence and lands.
 #[test]
 fn log_mirror_conforms_when_a_foreign_record_holds_the_pinned_seq() {
     let mut w = World::new();
@@ -513,9 +504,7 @@ fn log_mirror_conforms_when_a_foreign_record_holds_the_pinned_seq() {
     w.check("landed");
 }
 
-/// A BRIDGE KILLED WITH A PIN OUTSTANDING: the next bridge on the state dir
-/// reads the pin, republishes at the pinned sequence, reads the deduped
-/// answer back, and lands — the record on the bus once (§12 M6's count).
+/// A bridge killed with a pin outstanding: the next bridge on the state dir republishes at the pinned sequence, reads the deduped answer back, and lands.
 #[test]
 fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
     let (lane, mut first, _server) = rig_with_broker(&[]);
@@ -585,9 +574,7 @@ fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
     assert_eq!(rows.len(), 1, "on the bus once: {rows:?}");
 }
 
-/// **A TORN PIN AFTER A POWER CUT, AT THE BRIDGE: THE NEXT BOOT SETS IT ASIDE
-/// AND THE MIRROR RESUMES** — the real bridge, a real broker
-/// and a real state dir.
+/// A torn pin after a power cut is set aside on the next boot and the mirror resumes.
 #[test]
 fn a_torn_pin_after_a_power_cut_is_set_aside_and_the_next_boots_mirror_resumes() {
     for (reboot, copies) in [(true, true), (false, true), (true, false)] {
@@ -760,11 +747,7 @@ fn a_torn_pin_after_a_power_cut_is_set_aside_and_the_next_boots_mirror_resumes()
     }
 }
 
-/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE**. A dir whose pin a person moved aside, with `logkey` and `logfloor`
-/// on the media, resumes under the same key at the floor, and the hello
-/// writes that whole pin before any take — of the version an older build
-/// refuses, so one that ran here next stops rather than find no pin and mint
-/// a second key.
+/// A state dir with `logkey` and `logfloor` but no `logpin` writes a fresh `v=2` pin at hello.
 #[test]
 fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
     let key = [0x77; 16];
@@ -868,8 +851,6 @@ fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
 
         b.state.set_inc_seam(crate::state::IncSeam::default());
         if !legacy {
-            // Reopening loses every in-memory hint about a failed first
-            // fence. A visible v=2 still cannot stand for a successful flush.
             b.state = StateDir::open(b.state.root()).unwrap();
         }
         b.mirror_hello_answered("OK lane=2 build=b log=turns");
@@ -903,9 +884,7 @@ fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
     }
 }
 
-/// **A STOPPED PIN'S REMEDY SAYS WHAT EACH CHOICE COSTS, AND NO CAUSE IT
-/// CANNOT SHOW** — the real bridge's hello over a real
-/// state dir.
+/// A stopped pin's remedy names what each choice costs and no cause it cannot show.
 #[test]
 fn a_stopped_pins_remedy_names_what_each_choice_costs_and_no_cause_it_cannot_show() {
     let key = [0x3c; 16];
@@ -1006,9 +985,7 @@ fn a_stopped_pins_remedy_names_what_each_choice_costs_and_no_cause_it_cannot_sho
     }
 }
 
-/// **A RECOVERY NO CLEAN DISK HEALS IS SAID AND SURVIVED: THE BRIDGE ATTACHES
-/// IN EVERY LATER BOOT, AND THE MIRROR'S STOP NAMES THE FILE TO REPAIR**
-/// (sim item S7, `Bridge::recover`).
+/// A recovery no clean disk heals is survived across boots and the mirror's stop names the file to repair.
 #[cfg(unix)]
 #[test]
 fn a_recovery_no_clean_disk_heals_is_survived_and_the_mirror_stop_names_its_remedy() {
@@ -1098,9 +1075,7 @@ fn a_recovery_no_clean_disk_heals_is_survived_and_the_mirror_stop_names_its_reme
     }
 }
 
-/// NEGATIVE CONTROLS: each mutant's witness replayed against
-/// the real system through the broken call it stands for, and the projected
-/// law breaks.
+/// Negative controls: each mutant's witness replayed through its broken call breaks the projected law.
 #[test]
 fn log_mirror_conformance_rejects_each_mutant_through_its_broken_call() {
     let mut w = World::new();
@@ -1213,8 +1188,7 @@ fn log_mirror_conformance_rejects_each_mutant_through_its_broken_call() {
     );
 }
 
-/// a bridge with the mirror off sends the `hello`
-/// it always did, and no `log-take` or `log-landed` ever.
+/// A bridge with the mirror off sends `hello` without `log=` and never calls `log-take` or `log-landed`.
 #[test]
 fn a_bridge_with_the_mirror_off_sends_no_mirror_byte() {
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -1249,9 +1223,7 @@ fn a_bridge_with_the_mirror_off_sends_no_mirror_byte() {
     );
 }
 
-/// a busy landing (`fenced`) keeps the pin and waits its retry,
-/// never a pass every round; a definite refusal that is not the budget stops
-/// the mirror for this bridge's life, said to the endpoint, the pin kept.
+/// A fenced landing keeps the pin and waits its retry; a definite non-budget refusal stops the mirror.
 #[test]
 fn a_busy_landing_waits_and_a_definite_refusal_stops_the_mirror() {
     let mut w = World::new();
@@ -1296,8 +1268,7 @@ fn a_busy_landing_waits_and_a_definite_refusal_stops_the_mirror() {
     );
 }
 
-/// the node's total of mirrored bytes rides the pin across
-/// batches (and bridges); at the cap the mirror stops, said as `capped`.
+/// The node's total of mirrored bytes rides the pin across batches and stops the mirror at the cap.
 #[test]
 fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
     let mut w = World::new();
@@ -1350,11 +1321,7 @@ fn fill(w: &World, n: u64) -> Vec<u64> {
         .collect()
 }
 
-/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER. The node's pin says it mirrored past
-/// [`crate::mirror::TOTAL_MAX_BYTES`], a whole window's budget of it in a
-/// batch the broker's cut has since passed: the mirror reads `oldest=` again,
-/// forgets that batch, and goes on taking, landing and counting, never
-/// `capped`.
+/// On a retaining broker, once retention passes a mirrored batch, its window budget is reclaimed past `TOTAL_MAX_BYTES`.
 #[test]
 fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
     let mut w = World::retaining();
@@ -1389,8 +1356,7 @@ fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
     assert_eq!(w.view().0[0], 1, "the session's open is on the bus");
 }
 
-/// A NODE AT ITS WINDOW BUDGET WAITS, AND GOES ON WHEN THE BROKER GIVES ITS
-/// OLDEST UP.
+/// A node at its window budget waits and resumes when the broker advances `oldest=`.
 #[test]
 fn a_node_at_its_window_budget_waits_and_goes_on_when_the_broker_gives_its_oldest_up() {
     let mut w = World::retaining();
@@ -1437,11 +1403,7 @@ fn a_node_at_its_window_budget_waits_and_goes_on_when_the_broker_gives_its_oldes
     assert_eq!(w.view().0[0], 1, "the session's open is on the bus");
 }
 
-/// A BUDGET FILLED IN MANY SMALL BATCHES GOES ON ONCE THE CUT PASSES HALF OF
-/// THEM: a busy node's window
-/// filled in 1024 batches, sixteen times what the ledger keeps entries, waits
-/// at its budget, and the broker's cut past the older half of them gives the
-/// room back at the next take.
+/// A window budget filled in 1024 small batches resumes once the broker's cut passes the older half.
 #[test]
 fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
     const N: usize = 1024;
@@ -1477,9 +1439,7 @@ fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
     );
 }
 
-/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (owner decision D4). The start's `hello`, before any
-/// attach, says `log=auto` and asks for nothing, whatever the endpoint
-/// answers.
+/// An `auto` mirror runs only over a broker that retains it.
 #[test]
 fn an_auto_mirror_runs_only_over_a_broker_that_retains_it() {
     let lane_now = aterm_types::control_verbs::BRIDGE_LANE;
@@ -1588,10 +1548,7 @@ fn an_auto_mirror_a_broker_stops_retaining_is_withdrawn_before_it_says_so() {
     );
 }
 
-/// WHO SPAWNED WHOM STAYS LOCAL (D4's
-/// "senders stay local"): a spawned session's open names its parent
-/// (`parent=<sid>`) and the turn an edge opened restates its opener on its
-/// close (`op_by=<sid>`), both HOST.
+/// Spawned sessions' `parent=` and edge turns' `op_by=` stay local and never cross into a mirrored body.
 #[test]
 fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     use aterm_slog::{Actor, Close, Fields, Key, Open, Out, ShortId, Tier, TurnOut};
@@ -1690,9 +1647,7 @@ fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     assert_eq!(fold.state().totals.done, 1, "and the turn: {bodies:#?}");
 }
 
-/// a foreign record at the pinned seq of a batch's
-/// middle slot re-pins that slot and every later slot of its session at
-/// fresh seqs, in order; the slot before it keeps its own.
+/// A foreign record at a batch's middle slot re-pins that slot and every later slot of its session in order.
 #[test]
 fn a_collision_re_pins_the_slot_and_every_later_one_of_its_session_in_order() {
     let mut w = World::new();
@@ -1756,8 +1711,7 @@ fn a_collision_re_pins_the_slot_and_every_later_one_of_its_session_in_order() {
     );
 }
 
-/// a bridge killed with a batch pinned and never
-/// sent; another writer's record lands at the pinned seq meanwhile.
+/// A republished slot's dedup is read back, and a foreign record at the pinned seq is detected as a collision.
 #[test]
 fn a_republished_slots_dedup_is_read_back_and_a_foreign_one_is_a_collision() {
     let (lane, mut first, _server) = rig_with_broker(&[]);
@@ -1842,11 +1796,7 @@ fn a_republished_slots_dedup_is_read_back_and_a_foreign_one_is_a_collision() {
     );
 }
 
-/// THE BUDGET IS ASKED ONCE A FACE (fixer F20): a batch of three slots of
-/// one session makes one `Budget` round trip, not three (each round trip
-/// reads every owed ack first, so per slot it serialized the batch one strict
-/// ack at a time), and once a slot is on the bus the face is in the index:
-/// the next batch asks nothing.
+/// A batch of slots on one session makes one `Budget` round trip, and an indexed face asks nothing.
 #[test]
 fn a_batch_asks_the_subject_budget_once_a_face() {
     let mut w = World::new();
@@ -1882,11 +1832,7 @@ fn a_batch_asks_the_subject_budget_once_a_face() {
     assert_eq!(m.logs[SID].mirror_landed().map(|c| c.ms), Some(5));
 }
 
-/// A SESSION THE BUDGET REFUSES IS NOT LANDED (fixer F3): with the node's
-/// subject budget at the mirror's reserve, the session's `ev` face is refused
-/// and its cursor stays (said once, `log-refused`); once room comes back the
-/// face opens at the session's first `ms` — every record on the bus, no hole
-/// nobody said.
+/// A session refused by the subject budget is not landed and opens at its first `ms` once room returns.
 #[test]
 fn a_session_the_budget_refuses_waits_and_opens_with_no_hole() {
     let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
@@ -1976,11 +1922,7 @@ fn a_session_the_budget_refuses_waits_and_opens_with_no_hole() {
     assert_eq!(view.max_ms(), 2);
 }
 
-/// THE RETAKE AFTER A REFUSAL OWES ITS SNAPSHOT (fixer F3, completed): the
-/// refused batch held the session's snapshot, and nothing of it landed; the
-/// ring then evicted the session's claim, so the face opens with a cover —
-/// and the retake's snapshot, whose `upto=` reaches it, seeds the reader's
-/// fold with the open need.
+/// A retake after a subject-budget refusal still owes the session's snapshot.
 #[test]
 fn a_retake_after_a_budget_refusal_owes_its_snapshot() {
     let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
@@ -2086,10 +2028,7 @@ fn a_retake_after_a_budget_refusal_owes_its_snapshot() {
     );
 }
 
-/// A REFUSAL THAT IS NOT FOR GOOD IS SENT AGAIN (fixer F24): astream's
-/// `ERR_REFUSED` (a failed append or fsync) and a lapsed capability keep the
-/// slot owed and wait the retry — the mirror lands once the broker takes it;
-/// only a refusal for good (`ERR_BAD_SUBJECT`) stops it for the bridge's life.
+/// Transient broker refusals (`ERR_REFUSED`, expired cap) retry, while `ERR_BAD_SUBJECT` stops the mirror.
 #[test]
 fn a_transient_broker_refusal_is_retried_and_only_one_for_good_stops_the_mirror() {
     use astream_broker::proto::{
@@ -2138,10 +2077,7 @@ fn a_transient_broker_refusal_is_retried_and_only_one_for_good_stops_the_mirror(
     );
 }
 
-/// THE ALIAS KEY IS THE NODE'S, NOT ITS CAPS' (fixer F12): the key
-/// a bridge mirrors under rides its pin, and the next bridge of the same
-/// state dir — whatever caps it holds, renewed or none — takes the same key,
-/// so an edge is one alias on the bus across bridge lives.
+/// The alias key rides the node's pin across bridge restarts and capability changes.
 #[test]
 fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
     let mut w = World::new();
@@ -2175,9 +2111,7 @@ fn the_alias_key_survives_a_bridge_restart_and_a_cap_change() {
     assert_ne!(elsewhere.key(), key, "another node's is its own");
 }
 
-/// the round that reads a batch's acks
-/// parks for nothing while the landing they concluded is owed, so
-/// `log-landed` follows the last ack, not the roster's tick.
+/// The round that reads a batch's acks parks for zero duration while the landing is owed.
 #[test]
 fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     let mut w = World::new();
@@ -2259,9 +2193,7 @@ fn the_round_that_reads_a_batchs_acks_parks_for_nothing_before_its_landing() {
     );
 }
 
-/// AN EMPTY TAKE THAT SAYS `more=1` IS BUSY, NOT WORK: the
-/// endpoint copied nothing because a session's timeline lock was held at the
-/// take (`try_lock`'s `WouldBlock`: the lane never waits on the UI's lock).
+/// An empty take with `more=1` waits its retry backoff and never spins.
 #[test]
 fn an_empty_take_that_says_more_waits_its_retry_and_never_spins() {
     let mut w = World::new();
@@ -2312,10 +2244,7 @@ impl Drop for RestorePermissions {
     }
 }
 
-/// A RE-PIN THAT FAILS LANDS NOTHING: after a collision, a re-pin
-/// that cannot reserve a sequence, or cannot write its pin, leaves the
-/// collided slot owed its re-pin — the pass sends nothing and lands nothing,
-/// and the re-pin is tried again after `DEADLINE_RETRY`.
+/// After a collision, a failed re-pin sends and lands nothing and retries after `DEADLINE_RETRY`.
 #[cfg(unix)]
 #[test]
 fn a_failed_re_pin_lands_nothing_and_is_tried_again() {
@@ -2383,9 +2312,7 @@ fn a_failed_re_pin_lands_nothing_and_is_tried_again() {
     w.check("landed");
 }
 
-/// A BATCH OWED ITS RE-PIN SENDS NOTHING (in order): two slots of
-/// one session, the first collided and the second in flight when the
-/// collision dropped the connection, so owed again after the reattach.
+/// A batch owed its re-pin sends no slot at its old sequence.
 #[cfg(unix)]
 #[test]
 fn a_batch_owed_its_re_pin_sends_no_slot_at_its_old_sequence() {
@@ -2461,9 +2388,7 @@ fn a_batch_owed_its_re_pin_sends_no_slot_at_its_old_sequence() {
     );
 }
 
-/// OFF IS NOTHING, IN TIME: with the mirror off the loop's
-/// park is judged BEFORE the round settles what the items before left owed,
-/// as it was before the mirror.
+/// With the mirror off, the loop's park is judged before the round settles owed acks.
 #[test]
 fn with_the_mirror_off_the_park_is_judged_before_the_rounds_settle() {
     let (lane, mut bridge, _server) = rig_with_broker(&[(1, "s-a"), (2, "s-b")]);
@@ -2581,8 +2506,7 @@ fn successor(
     (next_lane, next)
 }
 
-/// a republished slot's dedup whose record
-/// retention took before the read-back is NOT a collision.
+/// A republished slot's dedup whose record retention took before read-back is sent again, not treated as a collision.
 #[test]
 fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
     let (lane, mut first) = FakeVerbLane::bridge(&[]);
@@ -2637,12 +2561,7 @@ fn a_dedup_whose_record_retention_took_is_sent_again_never_a_collision() {
     assert_eq!(landed(&next_lane), Some(1), "landed");
 }
 
-/// AND A SECOND DEDUP NAMING THE SAME UNSEEN OFFSET IS ANOTHER WRITER'S (the
-/// control for the test above): a foreign record at the pinned seq on a face
-/// the slot's is not — another session's, as a copy of this state dir would
-/// mirror — is unseen by the read-back too, so the slot is sent again; the
-/// broker, which still holds that record and its dedup entry, names the same
-/// offset again, and that is the collision, never a landing.
+/// A second dedup naming the same unseen offset is detected as a collision.
 #[test]
 fn a_second_dedup_at_an_offset_the_face_does_not_hold_is_a_collision() {
     let (lane, mut first) = FakeVerbLane::bridge(&[]);

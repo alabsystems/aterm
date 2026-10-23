@@ -394,15 +394,10 @@ use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFa
 
 /// How the chrome turns a char into a glyph of a [`ChromeFont`]: through the face's UNICODE cmap subtables ([`ChromeFont::unicode_glyph_index`]), as the terminal grid draws its primary face, never through `lookup_glyph_index`.
 pub(crate) trait UnicodeChars {
-    /// Whether the face maps `ch` to a real (non-`.notdef`) glyph.
     fn maps(&self, ch: char) -> bool;
-    /// The layout metrics of the glyph `ch` maps to, at `px`.
     fn char_metrics(&self, ch: char, px: f32) -> ChromeMetrics;
-    /// The metrics and coverage mask of the glyph `ch` maps to, at `px`.
     fn char_raster(&self, ch: char, px: f32) -> (ChromeMetrics, Vec<u8>);
-    /// [`Self::char_raster`] with the pen `dx` px (`0.0..1.0`) right of a whole pixel; `xmin` counts from that whole pixel.
     fn char_raster_at(&self, ch: char, px: f32, dx: f32) -> (ChromeMetrics, Vec<u8>);
-    /// The `kern` adjustment between the glyphs `left` and `right` map to.
     fn char_kern(&self, left: char, right: char, px: f32) -> Option<f32>;
 }
 
@@ -2012,9 +2007,6 @@ pub(crate) fn prepare_semantic_font(
             drop(fonts);
             let memo = renderer.clone();
             SEMANTIC_FORK_MEMO.with(|slot| {
-                // A `None` fork is cached too — a candidate with no installable
-                // renderer must not re-attempt the fork every frame, and the
-                // epoch moves the moment one lands.
                 *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
             });
             renderer
@@ -2325,7 +2317,7 @@ pub(crate) fn warm_chrome_font_assets() {
 #[cfg(test)]
 pub(crate) fn warm_chrome_font_assets() {}
 
-/// The pixel tab strip's font-readiness fingerprint (the Windows + Linux band, [`crate::tab_bar::pixel_band`]): the chrome-face install epoch with the coverage rung's size and the UI regular's presence folded in.
+/// The pixel tab strip's font-readiness fingerprint (the Windows + Linux band, `crate::tab_bar::pixel_band`): the chrome-face install epoch with the coverage rung's size and the UI regular's presence folded in.
 pub(crate) fn strip_band_font_epoch() -> u64 {
     let mut fonts = lock_fonts();
     fonts.poll_semantic_renderer();
@@ -3915,10 +3907,8 @@ impl Canvas {
                 if frac < 1.0 {
                     let a = dx.atan2(-dy).rem_euclid(TAU) / TAU;
                     let d_frac = if a <= frac {
-                        // Distinct branch.
                         -(a.min(frac - a)) // inside (negative)
                     } else {
-                        // Distinct branch.
                         (a - frac).min(1.0 - a) // outside (positive)
                     };
                     let d_px = d_frac * TAU * rr.max(1.0);
@@ -5153,8 +5143,6 @@ mod tests {
         let cold = strip_band_font_epoch();
         prepare_ui_fonts_for_direct_view_test();
         if !strip_band_ui_ready() {
-            // Host without a resolvable system UI face (CI): the decline
-            // branch above is the whole contract.
             aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }
         assert_ne!(

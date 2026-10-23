@@ -236,6 +236,13 @@ mod tests {
     use super::*;
     use crate::control::control_media::{Hops, take_hop};
 
+    /// A file URI this platform reads as an absolute path: Windows' needs a drive.
+    const X: &str = if cfg!(windows) {
+        "file:///C:/tmp/x.txt"
+    } else {
+        "file:///tmp/x.txt"
+    };
+
     /// One park slice of at most 5 ms: these tests never wait out a real bound.
     fn short(left: Duration) -> Duration {
         left.min(Duration::from_millis(5))
@@ -263,7 +270,7 @@ mod tests {
             posted.push(format!("{wake:?}"));
             true
         };
-        let uri = "file:///tmp/x.txt";
+        let uri = X;
         let ask = |scope, session, rest: &str, post: &mut dyn FnMut(Wake) -> bool| {
             serve_edit(
                 scope,
@@ -303,7 +310,7 @@ mod tests {
         let line = serve_edit(
             Scope::Owner,
             Some(9),
-            "file:///tmp/x.txt line=3",
+            &format!("{X} line=3"),
             &mut main_thread(&mut post),
             &mut never,
             Duration::from_secs(60),
@@ -329,7 +336,7 @@ mod tests {
         let line = serve_edit(
             Scope::Owner,
             Some(1),
-            "file:///tmp/x.txt",
+            X,
             &mut main_thread(&mut post),
             &mut never,
             Duration::from_millis(20),
@@ -354,7 +361,7 @@ mod tests {
         let raw = Wake::EditRequest(Box::new(EditCall {
             ticket: mint_ticket(),
             session: 1,
-            request: EditRequest::parse("file:///tmp/x.txt").expect("a request"),
+            request: EditRequest::parse(X).expect("a request"),
             real_uri: None,
             reply,
         }));
@@ -366,7 +373,7 @@ mod tests {
         let line = serve_edit(
             Scope::Owner,
             Some(1),
-            "file:///tmp/x.txt",
+            X,
             &mut MainPost::injected(
                 |wake| {
                     posted.push(wake);
@@ -475,7 +482,7 @@ mod tests {
         let line = serve_edit(
             Scope::Owner,
             Some(1),
-            "file:///tmp/x.txt",
+            X,
             &mut main_thread(&mut post),
             &mut hung,
             Duration::from_secs(60),
@@ -520,7 +527,7 @@ mod tests {
         };
         let line = serve_await_edit(
             Scope::Owner,
-            "edit uri=file:///tmp/x.txt timeout=10",
+            &format!("edit uri={X} timeout=10"),
             &mut main_thread(&mut post_timeout),
             &mut never,
             short,

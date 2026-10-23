@@ -1471,7 +1471,8 @@ impl ClaimedHandoff {
     }
 }
 
-/// Claimed handoff descriptors and wire string staged for [`HandoffEnv`] installation.
+/// Claimed handoff descriptors and wire string staged for
+/// [`HandoffEnv`](crate::handoff_env::HandoffEnv) installation.
 pub(crate) struct ClaimedIntake {
     fds_wire: String,
     masters: Vec<OwnedFd>,

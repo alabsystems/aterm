@@ -350,7 +350,8 @@ pub(crate) fn lens_body(
         .unwrap_or_default()
 }
 
-/// One column at `x` ([`Form::last`]).
+/// One column at `x`, `cw` wide, holding every one of `ids` in order, a [`Form::last`]
+/// one only as the last; `None` when they do not all fit.
 fn stack(
     (x, cw): (f64, f64),
     (top, bottom): (f64, f64),
@@ -613,7 +614,7 @@ impl<'a> Pen<'a> {
         }
     }
 
-    /// The shell: a soft shadow laid as rings.
+    /// The shell: a soft shadow laid as rings, the opaque ground and the rim.
     fn shell(&mut self, lg: &LensGeom) {
         let inks = self.inks;
         let m = lg.margin;
@@ -1962,7 +1963,7 @@ fn cores_section(c: Ctx<'_>, under: bool) -> Section<'_> {
     }
 }
 
-/// The strip: each cluster's caption in a gutter.
+/// The strip: each cluster's caption in a gutter, then its cores in heat inks.
 fn draw_cores(pen: &mut Pen<'_>, p: Place, cpu: &CpuView, gaps: f64) {
     let inks = pen.inks;
     let n = cpu.total().max(1);
@@ -2092,7 +2093,8 @@ fn busiest_section(c: Ctx<'_>) -> Section<'_> {
 /// Where a row's words start after the ∵ mark.
 const MARK_ADV: f64 = 11.0;
 
-/// Why now (RD §4.2) ([`account_of`], [`CLAUSE_STALE_MS`]).
+/// Why now (RD §4.2), worded from the account [`account_of`] gives; `None` unless a covering
+/// episode is open on facts no older than [`CLAUSE_STALE_MS`].
 fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
     let snap = c.snap;
     let a = account_of(WhySubject::Cpu, c.panes, snap);
@@ -2175,6 +2177,7 @@ fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
                     };
                     format!("no cause aterm can name: {word}")
                 }
+                Some(Evidence::Unaccounted) => "no cause aterm can name: unaccounted".to_owned(),
                 _ => "no cause aterm can name".to_owned(),
             };
             (false, base.clone(), base)
@@ -3579,7 +3582,7 @@ fn draw_lines(
 /// A laid lens: its prims, what a reader hears, and how its body went.
 pub(crate) struct LensLaid {
     pub(crate) prims: Vec<DrawPrim>,
-    /// "<Name> close-up".
+    /// "`<Name>` close-up".
     pub(crate) title: String,
     /// The explainer.
     pub(crate) explainer: String,

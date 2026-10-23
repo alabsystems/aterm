@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The comet cursor (`comet` trail style): the block cursor is a frosted fill wrapped in a round additive coma, with a few glints twinkling on its rim.
+//! The comet cursor (`comet` trail style).
 
 use aterm_time::Instant;
 
@@ -12,26 +12,16 @@ use crate::effect_util::lerp_rgb;
 
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// Shimmer rate in turns/second, at rest and at full blaze. The phase advances
-/// only on rendered frames, so a settled nucleus shimmers at the blink cadence.
 const SHIMMER_IDLE: f32 = 0.7;
 const SHIMMER_ACTIVE: f32 = 3.2;
 
-/// Coma radius in cell-heights: the diameter must cover the cell height, or
-/// the block's corners poke out and it reads as a rectangle.
 const RADIUS_IDLE: f32 = 0.54;
 const RADIUS_MAX: f32 = 0.82;
 
-/// Innermost-disc coverage before intensity, at rest and at full blaze. The
-/// outer discs scale down from it, each clamped by [`COV_CAP`].
 const COV_IDLE: f32 = 58.0;
 const COV_MAX: f32 = 148.0;
-/// Per-disc additive coverage ceiling, the light rod's and flame curtain's
-/// band: the stacked heart inside the caret cell saturates here per disc.
 const COV_CAP: f32 = 92.0;
 
-/// The coma's concentric discs, outermost first: (radius ×, coverage ×, the
-/// `ice_ramp` position at rest, its climb with the blaze).
 const COMA_DISCS: [(f32, f32, f32, f32); 4] = [
     (1.00, 0.30, 0.18, 0.06),
     (0.80, 0.58, 0.44, 0.12),
@@ -44,38 +34,26 @@ const fn cov_capped(cov: f32) -> f32 {
     if cov < COV_CAP { cov } else { COV_CAP }
 }
 
-/// The most light the stacked discs put on one pixel: every disc at its
-/// capped full-blaze coverage, where the breathing and the dial both peak at
-/// 1.
 const COMA_STACK_MAX: f32 = cov_capped(COV_MAX * COMA_DISCS[0].1)
     + cov_capped(COV_MAX * COMA_DISCS[1].1)
     + cov_capped(COV_MAX * COMA_DISCS[2].1)
     + cov_capped(COV_MAX * COMA_DISCS[3].1);
 
-/// The over-ink budget's share the rim glints claim outside the caret cell;
-/// the coma's rings take the rest, so rings and a glint landing on them sum
-/// to at most [`OVER_INK_COV_CAP`] over a neighbouring glyph.
 const GLINT_SHARE: f32 = 0.4;
 const RING_BUDGET: f32 = OVER_INK_COV_CAP * (1.0 - GLINT_SHARE);
 const GLINT_BUDGET: f32 = OVER_INK_COV_CAP * GLINT_SHARE;
 
-/// Outside the caret cell the stacked coverage is scaled by one constant, so
-/// the worst case lands exactly on [`RING_BUDGET`] and a resting coma stays
-/// proportionally dimmer: the rings keep their radial falloff and still
-/// brighten with the blaze, but can no longer bury the letter just typed.
 const COMA_OUTSIDE_SCALE: f32 = RING_BUDGET / COMA_STACK_MAX;
 const _: () = assert!(
     COMA_OUTSIDE_SCALE < 1.0 && RING_BUDGET + GLINT_BUDGET <= OVER_INK_COV_CAP,
     "the coma outside the caret must fit the over-ink budget"
 );
 
-/// Facet glints (tiny 4-point sparks) on the coma rim.
 const GLINTS: u32 = 4;
 
-/// Below this blaze the nucleus reports inactive, so the host stops the tick.
 const SETTLED_BLAZE: f32 = 0.02;
 
-/// The near-white the ice freezes toward — deliberately short of pure white so the coma's stacked core (additive) stays the brightest thing on screen.
+/// The near-white the ice freezes toward.
 pub(crate) const ICE_WHITE: u32 = 0x00F2_FAFF;
 
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
@@ -83,7 +61,7 @@ pub(crate) const ICE_WHITE: u32 = 0x00F2_FAFF;
 pub struct CometConfig {
     /// On when the `comet` style is chosen and the cursor is a focused, visible block.
     pub enabled: bool,
-    /// Overall scale `0..1`: the aurora's folded intensity (brightness dial × reduced motion × load shed), handed over by [`crate::cursor_fx::CursorFx::tick`] unchanged; 0 is fully inert.
+    /// Overall scale `0..1`.
     pub intensity: f32,
     /// The trail's base hue (`GlowConfig::color`); the coma freezes off it.
     pub color: u32,
@@ -91,20 +69,20 @@ pub struct CometConfig {
     pub accent: u32,
     /// The ground is dark (the coma is light) or light (the coma is ink under the letters).
     pub dark_theme: bool,
-    /// The theme's text and paper: a light ground's coma solves its ink against them, and its resting nucleus is held to [`LIGHT_NUCLEUS_CONTRAST`] against the paper.
+    /// The theme's text and paper.
     pub theme_fg: u32,
     pub theme_bg: u32,
-    /// [`Self::color`] is a PINNED cursor colour (a configured `cursor_color` or a program's OSC 12, which the trail colour follows): the settled nucleus is exactly that colour, and only the charge moves it ([`crate::color_math::wear_pinned`]).
+    /// [`Self::color`] is a PINNED cursor colour.
     pub pinned: bool,
 }
 
-/// The least WCAG contrast the comet's nucleus keeps against a LIGHT page at rest: a deep, saturated ice that reads as the comet's head, clearly above the caret's page floor ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]) rather than sitting on it.
+/// The least WCAG contrast the comet's nucleus keeps against a LIGHT page at rest.
 pub const LIGHT_NUCLEUS_CONTRAST: f32 = 6.0;
 
-/// What a tick produced: the nucleus block fill for the renderer and a fingerprint that changes on every visible step (0 when off).
+/// What a tick produced.
 #[derive(Clone, Copy, Debug)]
 pub struct CometFrame {
-    /// The frosted block-fill colour `0x00RRGGBB`, or `None` when the nucleus is off (the renderer then keeps the ordinary themed cursor fill).
+    /// The frosted block-fill colour `0x00RRGGBB`, or `None` when the nucleus is off.
     pub fill: Option<u32>,
     /// Fingerprint of the emitted fill + coma + glints (0 ⇒ nothing this frame).
     pub fp: u64,
@@ -118,17 +96,19 @@ pub struct CursorComet {
     last: Option<Instant>,
     /// Latched blaze at the last tick, so [`Self::is_active`] needs no clock.
     blaze: f32,
+    /// Cached `(color, theme_fg, theme_bg)` ink for the light-page coma.
+    light_ink_memo: Option<((u32, u32, u32), u32)>,
 }
 
 impl CursorComet {
-    /// Whether the host must keep arming the animation tick: only while the comet is charged (typing, or a jump flare cooling).
+    /// Whether the host must keep arming the animation tick: only while the comet is charged.
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
 
-    /// Advance one frame at `now` with the aurora's `blaze` (`0..1`, read after the aurora tick), the block cursor cell `cur` (`None`: hidden), grid `geom` and `cfg`.
+    /// Advance one frame at `now` with aurora `blaze`, block cursor cell `cur`, `geom`, and `cfg`.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + clock + blaze + geometry + config + the two streams it draws into"
@@ -183,7 +163,7 @@ impl CursorComet {
             if cfg.dark_theme {
                 self.emit_coma(cr, cc, e, breathe, phase, geom, cfg, out);
             } else {
-                Self::emit_coma_light(cr, cc, e, breathe, geom, cfg, under);
+                self.emit_coma_light(cr, cc, e, breathe, geom, cfg, under);
             }
         }
 
@@ -203,7 +183,12 @@ impl CursorComet {
     /// centred on the caret and held inside its row, a cell either side, its
     /// ink solved against the theme's text; it breathes with the shimmer as
     /// the dark coma does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
+    )]
     fn emit_coma_light(
+        &mut self,
         cr: u16,
         cc: u16,
         e: f32,
@@ -215,12 +200,24 @@ impl CursorComet {
         use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, push_ink_ellipse};
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let centre = geom.cell_center(cr, cc);
-        let ink = light_body_ink(
-            cfg.color,
-            cfg.theme_fg,
-            cfg.theme_bg,
-            LIGHT_BODY_ALPHA_CAP as u8,
+        let key = (
+            cfg.color & 0x00FF_FFFF,
+            cfg.theme_fg & 0x00FF_FFFF,
+            cfg.theme_bg & 0x00FF_FFFF,
         );
+        let ink = match self.light_ink_memo {
+            Some((k, ink)) if k == key => ink,
+            _ => {
+                let ink = light_body_ink(
+                    cfg.color,
+                    cfg.theme_fg,
+                    cfg.theme_bg,
+                    LIGHT_BODY_ALPHA_CAP as u8,
+                );
+                self.light_ink_memo = Some((key, ink));
+                ink
+            }
+        };
         let peak = LIGHT_BODY_ALPHA_CAP
             * (0.35 + 0.65 * e)
             * (1.0 - e)
@@ -476,7 +473,6 @@ mod tests {
         }
     }
 
-    /// Disabled or zero intensity: fully inert (no fill, no coma, fp 0, settled).
     #[test]
     fn disabled_or_zero_intensity_is_inert() {
         for (why, config) in [
@@ -513,7 +509,6 @@ mod tests {
         }
     }
 
-    /// A hidden cursor draws no coma; the fill stays resolved.
     #[test]
     fn hidden_cursor_draws_no_coma() {
         let mut nc = CursorComet::default();
@@ -531,7 +526,6 @@ mod tests {
         assert!(f.fill.is_some());
     }
 
-    /// Full blaze swells the coma and shines far brighter than at rest.
     #[test]
     fn blaze_swells_and_brightens() {
         let g = geom();
@@ -570,7 +564,6 @@ mod tests {
         );
     }
 
-    /// A light config: GitHub Light's text and paper, its cursor blue.
     fn light_cfg() -> CometConfig {
         CometConfig {
             color: 0x0009_69DA,
@@ -591,11 +584,6 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
-    /// ON PAPER THE NUCLEUS INKS A ROUND HEAD UNDER THE LETTERS AT REST: the
-    /// additive stream stays empty, and the resting coma is source-over ink
-    /// in the under-ink stream, inside the caret's row, reaching past both
-    /// edges of the caret's cell; at full blaze it is gone, the streak's own
-    /// nucleus being the head then.
     #[test]
     fn light_nucleus_inks_a_round_head_under_the_letters() {
         let g = geom();
@@ -670,10 +658,6 @@ mod tests {
         );
     }
 
-    /// ON PAPER THE NUCLEUS DEEPENS UNDER THE KEYS: hot, the block fill holds
-    /// at least the contrast against the paper it has at rest, and at least
-    /// the trail colour's own (white sinks into the page, so it never frosts
-    /// there).
     #[test]
     fn light_ground_nucleus_deepens_under_the_keys() {
         let g = geom();
@@ -701,8 +685,6 @@ mod tests {
         assert!(luma(fill(&d, 1.0)) > luma(fill(&d, 0.0)), "dark: it frosts");
     }
 
-    /// Every emitted quad is single-row, grid-interior, and ice-hued with capped
-    /// coverage (the renderer row-gate / parity / legibility invariants).
     #[test]
     fn quads_respect_grid_hue_and_cap() {
         let g = geom();
@@ -751,7 +733,6 @@ mod tests {
         }
     }
 
-    /// Charged keeps the tick armed; a dead blaze settles to inactive.
     #[test]
     fn settles_to_inactive_when_blaze_dies() {
         let g = geom();
@@ -776,8 +757,6 @@ mod tests {
         );
     }
 
-    /// An explicit trail colour re-tints the whole nucleus: the ramp derives
-    /// from the config hue, never a fixed palette.
     #[test]
     fn nucleus_follows_the_configured_hue() {
         let g = geom();
@@ -797,8 +776,6 @@ mod tests {
         );
     }
 
-    /// The coma surrounds the caret in a padded, headed window: the producer
-    /// folds in the grid origin, which the origin (0,0) tests cannot tell.
     #[test]
     fn coma_surrounds_the_caret_in_a_padded_headed_window() {
         let t0 = Instant::now();
@@ -901,8 +878,6 @@ mod tests {
         }
     }
 
-    /// Every additive quad of `out` summed per window pixel, as the
-    /// brightest channel: the light that lands on one pixel.
     fn light_per_pixel(out: &[GlowQuad], w: usize, h: usize) -> Vec<u32> {
         let mut px = vec![[0u32; 3]; w * h];
         for q in out {
@@ -918,10 +893,6 @@ mod tests {
         px.iter().map(|c| c[0].max(c[1]).max(c[2])).collect()
     }
 
-    /// The letter just typed beside the caret is never buried: at full
-    /// blaze, across a run of shimmer phases (so the rim glints turn
-    /// through), no pixel outside the caret cell sums more additive light
-    /// than the over-ink budget.
     #[test]
     fn the_coma_outside_the_caret_stays_inside_the_over_ink_budget() {
         let g = geom();
@@ -964,9 +935,6 @@ mod tests {
         );
     }
 
-    /// On a light page the comet keeps its caret and its identity: the
-    /// nucleus clears 3:1 on white at full blaze, and it lays no light over
-    /// the letters (its coma is the streak's head under them).
     #[test]
     fn the_light_comet_keeps_its_caret_and_lays_nothing_over_the_letters() {
         const WHITE: u32 = 0x00FF_FFFF;
@@ -1019,11 +987,6 @@ mod tests {
         assert!(!coma.is_empty(), "control: the dark arm lays its coma");
     }
 
-    /// At rest on a light page the nucleus reads clearly above the caret's
-    /// page floor, not on it: on white, Default Light and Solarized Light the
-    /// settled fill keeps [`LIGHT_NUCLEUS_CONTRAST`] against the page, with
-    /// the hue of the comet's ice and nothing whitened, and the heat only
-    /// deepens it from there.
     #[test]
     fn the_light_nucleus_rests_clearly_above_the_page_floor() {
         use crate::color_math::{contrast_ratio, light_body_fill, rgb2hsv};

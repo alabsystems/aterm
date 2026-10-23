@@ -49,8 +49,7 @@ pub struct Received {
 /// # Errors
 /// * `InvalidInput`: an empty payload (a zero-length stream `sendmsg` drops
 ///   the control message on Linux), or more than [`MAX_FDS`] descriptors.
-///
-/// Returns `InvalidInput` if `fds` is non-empty and `payload` is empty or `fds.len() > MAX_FDS`.
+/// * Anything `sendmsg(2)` reports, or `Unsupported` where there is no `SCM_RIGHTS` transport.
 pub fn send_with_fds(
     stream: &CtlStream,
     payload: &[u8],
@@ -74,8 +73,8 @@ pub fn send_vectored(stream: &CtlStream, bufs: &[IoSlice<'_>]) -> io::Result<usi
 /// # Errors
 /// * `InvalidInput`: an empty `buf` (indistinguishable from EOF), or
 ///   `max_fds` above [`MAX_FDS`].
-///
-/// Returns `InvalidInput` if `max_fds > MAX_FDS` or `InvalidData` on control-message truncation.
+/// * `InvalidData`: a truncated control message, or more than `max_fds` descriptors sent.
+/// * Anything `recvmsg(2)` reports, or `Unsupported` where there is no `SCM_RIGHTS` transport.
 pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::Result<Received> {
     scm::recv_with_fds(stream, buf, max_fds)
 }
@@ -94,8 +93,6 @@ pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
 ///
 /// # Errors
 /// As [`peer_pid`]'s, and `EBADF`/`ENOTSOCK` for a descriptor that names no socket.
-///
-/// Same as [`peer_pid`].
 #[cfg(unix)]
 pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
     scm::peer_pid_of_fd(fd)

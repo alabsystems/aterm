@@ -5,8 +5,6 @@
 
 use super::*;
 
-/// Sparkle's glitter train survives the next keystroke: an unlicensed batch
-/// reaches no teardown and a licensed one mints without clearing.
 #[test]
 fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
     let g = geom();
@@ -69,8 +67,6 @@ fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
     );
 }
 
-/// A denied program relocation retires only movement-owned click-dedup
-/// credit.
 #[test]
 fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
     let g = geom();
@@ -116,8 +112,6 @@ fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
     assert_eq!(glow.sound_cues.len(), 2, "echo adds no duplicate click");
 }
 
-/// `note_user_gesture` keeps the banked typed stamps: a Tab-class gesture landing with two keys'
-/// echoes in flight licenses its own sweep and leaves the bank intact.
 #[test]
 fn user_gesture_keeps_banked_typed_stamps_for_in_flight_echoes() {
     let g = geom();
@@ -151,9 +145,6 @@ fn user_gesture_keeps_banked_typed_stamps_for_in_flight_echoes() {
     assert_eq!(glow.spawns(), 1);
 }
 
-/// The completed hidden→visible boundary spares typed stamps younger than
-/// `TYPE_HINT_FRESH` (keys whose echoes are in flight through a TUI's DECTCEM
-/// repaint bracket) while retiring a stale bank.
 #[test]
 fn hidden_boundary_spares_fresh_typed_stamps_and_retires_stale() {
     let g = geom();
@@ -198,10 +189,6 @@ fn hidden_boundary_spares_fresh_typed_stamps_and_retires_stale() {
     );
 }
 
-/// With the DEC cursor hidden across frames (the repaint bracket never
-/// re-shows), a keystroke's echo is anchored to the print-run mutation site
-/// and spawns there (`echo_anchor_pass`); program-only output (no stamps)
-/// paints and spawns nothing.
 #[test]
 fn hidden_caret_typed_echo_anchors_to_print_site() {
     let g = geom();
@@ -232,10 +219,6 @@ fn hidden_caret_typed_echo_anchors_to_print_site() {
     );
 }
 
-/// With the DEC cursor visible but parked away from the caret (CUP 1;1 before
-/// show), the licensed echo anchors to the mutated row; and a visible cursor
-/// move owns its own tick, so the anchor lane never double-judges the same PTY
-/// delta (`cursor_move_observed`).
 #[test]
 fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
     let g = geom();
@@ -288,10 +271,6 @@ fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
     );
 }
 
-/// A program row's forward end-advance never consumes a banked typed stamp. With the cursor
-/// hidden, the input row (11) advances only after `note_typed` while the status row (9) grows on
-/// its own ~150 ms cadence (a Claude Code timer); a row seen advancing its end with no gesture
-/// fresh is branded a program row and refuses anchored sweeps, so every input echo lights.
 #[test]
 fn program_row_end_advance_never_consumes_a_typed_stamp() {
     let g = geom();
@@ -334,9 +313,6 @@ fn program_row_end_advance_never_consumes_a_typed_stamp() {
     );
 }
 
-/// The spoken-for arm: a spinner counter holds constant width until `(9)`
-/// becomes `(10)`, so its first end-advance has no keyless history and the
-/// taint brand cannot refuse it mid-burst.
 #[test]
 fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
     let g = geom();
@@ -378,8 +354,6 @@ fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
     );
 }
 
-/// A program row's brand survives a busy TUI printing on five rows (Claude Code mid-turn:
-/// spinner, composer, bullet, tool timer, workflow timer).
 #[test]
 fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
     let g = Geom {
@@ -454,9 +428,6 @@ fn a_busy_tuis_status_row_keeps_its_brand_across_five_print_rows() {
     );
 }
 
-/// The anchored lane's row memory evicts the least recently printed row, never a status row that
-/// is still ticking, so a spinner keeps its slot and brand through twenty transcript rows printed
-/// after it.
 #[test]
 fn a_ticking_status_row_keeps_its_brand_beside_a_streaming_transcript() {
     let g = Geom {
@@ -507,7 +478,6 @@ fn a_ticking_status_row_keeps_its_brand_beside_a_streaming_transcript() {
     assert_eq!(glow.spawns(), 0, "program output alone lights nothing");
 }
 
-/// What [`footer_tick_in_a_hesitated_keys_window`] measured.
 struct FooterTick {
     /// Presses forgotten.
     forgotten: u64,
@@ -519,42 +489,30 @@ struct FooterTick {
     verdict: Option<&'static str>,
 }
 
-/// What the hand presses between `s`'s echo and `i` in
-/// [`footer_tick_in_a_hesitated_keys_window`].
+/// What the hand presses between `s`'s echo and `i` in [`footer_tick_in_a_hesitated_keys_window`].
 #[derive(Clone, Copy, Debug)]
 enum BeforeI {
     /// Nothing: `i` follows `s`.
     Nothing,
-    /// A different-class press 4 ms before `i` — zle's Ctrl-R, as the host
-    /// sends it (`clear_typed`).
+    /// A different-class press 4 ms before `i`.
     CtrlR,
-    /// A typo erased: `x` echoed, then a Backspace (the host's line-editing
-    /// disarm and one priced erase), its echo 274 ms before `i`'s press.
+    /// A typo erased.
     Backspace,
-    /// The caret stepped left and back: two arrows (line-editing disarm and a
-    /// motion each), the second's echo 274 ms before `i`'s press.
+    /// The caret stepped left and back.
     Arrows,
 }
 
-/// How the screen scrolls between `s`'s echo and `i` in
-/// [`footer_tick_in_a_hesitated_keys_window`].
+/// How the screen scrolls between `s`'s echo and `i` in [`footer_tick_in_a_hesitated_keys_window`].
 #[derive(Clone, Copy, Debug)]
 enum ScrollBeforeI {
     /// It does not.
     None,
-    /// Up a row, the composer and its footer with the content (a line printed below them
-    /// pushed them up).
+    /// Up a row.
     WithTheContent,
-    /// Up a row under a bottom-anchored composer (full-screen Claude Code): a
-    /// transcript line above pushed the content up, and the composer and its
-    /// footer are redrawn on their own screen rows.
+    /// Up a row under a bottom-anchored composer (full-screen Claude Code).
     ComposerStays,
 }
 
-/// The frames of [`a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types`]:
-/// a composer on row 10 with its caret drawn, and a footer on row 12 whose
-/// first print (a timer ending at 15) came before typing began, so it is
-/// unbranded.
 fn footer_tick_in_a_hesitated_keys_window(
     before_i: BeforeI,
     scroll_before_i: ScrollBeforeI,
@@ -562,8 +520,6 @@ fn footer_tick_in_a_hesitated_keys_window(
     status_tick_in_a_hesitated_keys_window(before_i, scroll_before_i, 12)
 }
 
-/// [`footer_tick_in_a_hesitated_keys_window`] with the ticking status row on
-/// `status` (row 12 below the composer, the footer; row 8 above it, a spinner).
 fn status_tick_in_a_hesitated_keys_window(
     before_i: BeforeI,
     scroll_before_i: ScrollBeforeI,
@@ -658,9 +614,6 @@ fn status_tick_in_a_hesitated_keys_window(
     }
 }
 
-/// The visible-parked minibuffer gate refuses a run ending on a glyph no live
-/// press typed, and forgets the presses only when that run is the keys' own
-/// echo: below the drawn caret with the hand not typing on the caret's row.
 #[test]
 fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
     for scroll in [ScrollBeforeI::None, ScrollBeforeI::WithTheContent] {
@@ -684,12 +637,6 @@ fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
     );
 }
 
-/// A status row above the caret (Claude Code's spinner) is never the keys'
-/// echo ([`CursorGlow::refused_below_the_caret`]): its tick in a hesitated
-/// key's window is refused `program-row` and forgets nothing, even with the
-/// hand off the caret's row, where the same tick below the caret is the
-/// minibuffer's echo and forgets the press (the control of
-/// [`a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types`]).
 #[test]
 fn a_status_tick_above_the_caret_forgets_no_press_with_the_hand_off_its_row() {
     let m = status_tick_in_a_hesitated_keys_window(BeforeI::CtrlR, ScrollBeforeI::None, 8);
@@ -700,10 +647,6 @@ fn a_status_tick_above_the_caret_forgets_no_press_with_the_hand_off_its_row() {
     );
 }
 
-/// A line-editing press (a Backspace, an arrow) keeps the hand on its row
-/// ([`CursorGlow::clear_typed_keeping_hand`]), so the next key is guarded: the
-/// footer's unbranded tick in its window, over 250 ms after the edit's echo, is
-/// refused `program-row` and forgets nothing.
 #[test]
 fn a_line_editing_key_keeps_the_hand_on_its_row() {
     for before_i in [BeforeI::Backspace, BeforeI::Arrows] {
@@ -723,8 +666,6 @@ fn a_line_editing_key_keeps_the_hand_on_its_row() {
     }
 }
 
-/// When the caret stays on its screen row under a scroll, the hand's row stays with the caret,
-/// not the content.
 #[test]
 fn a_composer_that_stays_put_under_a_scroll_keeps_the_hand_on_its_row() {
     for before_i in [BeforeI::Nothing, BeforeI::Backspace, BeforeI::Arrows] {
@@ -742,10 +683,6 @@ fn a_composer_that_stays_put_under_a_scroll_keeps_the_hand_on_its_row() {
     }
 }
 
-/// Enter takes the hand off its row only when it hands the line to a shell, or
-/// when the host cannot tell ([`CursorGlow::note_return`]); into a foreground
-/// program's composer (shell integration says a command runs, or the alternate
-/// screen is up) it keeps it ([`CursorGlow::note_return_keeping_hand`]).
 #[test]
 fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
     let g = Geom {
@@ -814,8 +751,6 @@ fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
     );
 }
 
-/// A press the hand's-row hold kept ([`PressCredits::held_through`]) pays only for a move on the
-/// hand's row.
 #[test]
 fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
     let g = Geom {
@@ -876,8 +811,6 @@ fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
     }
 }
 
-/// A press the hand's-row hold kept is paid by its own late echo on the hand's
-/// row, however late.
 #[test]
 fn a_held_press_pays_for_its_own_late_echo_on_the_hand_s_row() {
     let g = Geom {
@@ -947,8 +880,6 @@ fn a_held_press_pays_for_its_own_late_echo_on_the_hand_s_row() {
     }
 }
 
-/// While the hand types on the drawn caret's row, an advance on another row is
-/// no key's echo, whatever glyph it ends on.
 #[test]
 fn a_status_tick_ending_on_a_live_press_s_glyph_is_no_key_s_echo() {
     let g = Geom {
@@ -1013,7 +944,6 @@ fn a_status_tick_ending_on_a_live_press_s_glyph_is_no_key_s_echo() {
     );
 }
 
-/// The taint brand never brands the established echo row (the `last_anchor_sweep` holder).
 #[test]
 fn an_unlicensed_paste_must_not_brand_the_established_echo_row() {
     let g = geom();

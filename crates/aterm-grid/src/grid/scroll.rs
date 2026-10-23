@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Grid display, content, and DECSTBM/DECLRMM region scrolling operations.
 
@@ -31,10 +30,7 @@ impl Grid {
         self.storage.mark_content_scroll(visible_rows, n);
     }
 
-    /// Record that the reader just brought the viewport down to the live
-    /// bottom: the one bump site for `reader_live_bottom_gen`, advancing when
-    /// `before` (the offset just before a reader-facing viewport primitive ran)
-    /// was non-zero and the offset is now zero.
+    /// Record that the reader just brought the viewport down to the live bottom.
     #[inline]
     const fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
         if before != 0 && self.storage.display_offset == 0 {
@@ -152,8 +148,6 @@ impl Grid {
         self.finish_scroll_up(n);
     }
 
-    /// Perform the ring/tiered-history mutation for an upward scroll without
-    /// recording presentation damage.
     fn scroll_up_storage(&mut self, n: usize) {
         debug_assert!(n > 0);
         debug_assert!(
@@ -183,9 +177,6 @@ impl Grid {
         );
     }
 
-    /// The append arm of `scroll_up`: the ring is below its cap, so the rows
-    /// scrolling off are kept and `rows_to_add` fresh rows are pushed as the new
-    /// bottom.
     fn grow_scrollback_ring(&mut self, rows_to_add: usize, cols: u16) {
         debug_assert!(
             !self.storage.rows.is_empty(),
@@ -210,7 +201,8 @@ impl Grid {
             let pages = &mut storage.pages;
             let needs_fill = fill != crate::Cell::EMPTY;
             for _ in 0..rows_to_add {
-                // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`, and rows drop before the backing pages.
+                // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`, and rows
+                // drop before the backing pages.
                 let mut row = unsafe { Row::new(cols, pages) };
                 if needs_fill {
                     row.erase_with(fill);
@@ -249,9 +241,8 @@ impl Grid {
         }
 
         if self.storage.lazy_buffer.should_drain() {
-            // During an off-thread reflow the store is detached and drain is
-            // suppressed (staged lines must survive), so cap the buffer here to
-            // keep heavy streaming through a long window bounded.
+            // During an off-thread reflow the store is detached and drain is suppressed, so
+            // cap the buffer here.
             if self.storage.scrollback_detached_for_reflow && self.storage.scrollback.is_none() {
                 self.bound_detached_lazy_buffer();
             } else if self.storage.compress_offload_active {
@@ -272,8 +263,6 @@ impl Grid {
         self.storage.absolute_row_counter += rows_to_reuse as u64;
     }
 
-    /// Steady-state line-feed fast path: single-row scroll with no tiered
-    /// scrollback attached.
     fn reuse_one_scrolled_row_no_scrollback(
         &mut self,
         cols: u16,
@@ -285,7 +274,6 @@ impl Grid {
         let phys = (oldest + ring_sb) % row_count;
 
         if self.storage.ring_extras.is_empty() {
-            // Skip extraction when no tiered scrollback consumes popped ring_extras.
         } else if let Some(mut bx) = self.storage.ring_extras.pop_front().flatten() {
             Self::extract_row_extras_into(
                 &mut bx,
@@ -305,14 +293,14 @@ impl Grid {
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
-            // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages` continues to outlive that owner.
+            // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
+            // continues to outlive that owner.
             unsafe { storage.rows[oldest].resize(cols, pages) };
             storage.rows[oldest].reset_with(fill);
         }
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
     }
 
-    /// General multi-row (or tiered-scrollback) reuse path.
     fn reuse_scrolled_rows_general(
         &mut self,
         rows_to_reuse: usize,
@@ -347,10 +335,6 @@ impl Grid {
         }
     }
 
-    /// Recycle one oldest ring row after its entering-row extras were
-    /// extracted: stage the evicted row to scrollback (lazy `DeferredLine`),
-    /// evict its page, resize and BCE-reset it as the fresh bottom row, and
-    /// advance `ring_head`.
     fn reuse_one_scrolled_row(
         &mut self,
         new_extras: super::scroll_convert::ScrolledRowExtras,
@@ -373,20 +357,16 @@ impl Grid {
         {
             let storage = &mut self.storage;
             let pages = &mut storage.pages;
-            // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages` continues to outlive that owner.
+            // SAFETY: The reused row remains stored in `storage.rows`, and `storage.pages`
+            // continues to outlive that owner.
             unsafe { storage.rows[oldest].resize(cols, pages) };
             storage.rows[oldest].reset_with(fill);
         }
         self.storage.ring_head = (self.storage.ring_head + 1) % row_count;
     }
 
-    /// The staging cap of the detached-reflow window: past it the oldest
-    /// staged window output is dropped.
     const DETACHED_LAZY_CAP: usize = 50_000;
 
-    /// Bound the lazy buffer while the tiered store is detached for an
-    /// off-thread reflow: draining is suppressed then, so heavy streaming would
-    /// grow it without bound.
     fn bound_detached_lazy_buffer(&mut self) {
         let len = self.storage.lazy_buffer.len();
         if len > Self::DETACHED_LAZY_CAP {
@@ -440,10 +420,6 @@ impl Grid {
         by_lines.max(buffer.front_rows_over(headroom, floor))
     }
 
-    /// Drop `over` of the oldest staged rows (the backlog is over its cap,
-    /// [`flood_overflow`](Self::flood_overflow)) and account for them:
-    /// * ordinary eviction: rows the configured line limit would not hold
-    ///   anyway, oldest first, store before staged (`truncate_oldest`).
     fn drop_flood_overflow(&mut self, over: usize) {
         let staged = self.storage.lazy_buffer.staged_rows();
         let over = over.min(staged);
@@ -649,10 +625,8 @@ impl Grid {
         if top == 0 && history_enabled {
             let blank_prefix = self.fresh_session_blank_prefix(n);
             if blank_prefix < n {
-                // Drop the leading fresh-session blanks with a history-free
-                // scroll, then archive from the first written row. Two
-                // sequential scrolls compose to the same visible result as one
-                // of `n`, while history gets only the transcript-bearing rows.
+                // Drop the leading fresh-session blanks with a history-free scroll, then
+                // archive from the first written row.
                 if blank_prefix > 0 {
                     self.scroll_region_up_history_free(top, bottom, blank_prefix);
                 }
@@ -664,9 +638,6 @@ impl Grid {
         self.scroll_region_up_history_free(top, bottom, n);
     }
 
-    /// The non-archival region scroll: shift rows `[top..=bottom]` up by `n`
-    /// within the viewport, BCE-fill the vacated bottom rows, and shift the
-    /// region's `CellExtras`; history and `absolute_row_counter` are untouched.
     fn scroll_region_up_history_free(&mut self, top: usize, bottom: usize, n: usize) {
         debug_assert!(n > 0 && n <= bottom - top + 1);
         debug_assert!(bottom < usize::from(self.storage.visible_rows));
@@ -696,10 +667,6 @@ impl Grid {
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
 
-    /// Record rows `top..=bottom` moving by `n` rows (down the screen when
-    /// `down`) on this batch's band record, or poison the record when `n` does
-    /// not fit an `i16` displacement (see
-    /// `GridPresentationState::record_row_band_move`).
     fn record_row_band_move_or_poison(&mut self, top: u16, bottom: u16, n: usize, down: bool) {
         match i16::try_from(n) {
             Ok(rows) => {
@@ -712,9 +679,6 @@ impl Grid {
         }
     }
 
-    /// Length of the leading run of blank rows among the `n` viewport rows a
-    /// scroll would displace through the physical top (rows `0..n`), but only
-    /// while the grid holds no history at all; otherwise 0.
     fn fresh_session_blank_prefix(&self, n: usize) -> usize {
         if self.storage.scrollback_lines() > 0 {
             return 0;
@@ -729,8 +693,6 @@ impl Grid {
             .count()
     }
 
-    /// Archive a full-width, top-anchored partial region while preserving the
-    /// fixed rows below its bottom margin.
     fn scroll_top_anchored_region_up_with_history(&mut self, n: usize, bottom: usize) {
         debug_assert!(n > 0);
         debug_assert!(bottom + 1 < usize::from(self.storage.visible_rows));
@@ -994,8 +956,7 @@ impl Grid {
     }
 }
 
-/// The flood cut: a burst the compression worker cannot keep up with must
-/// never leave a silent hole in history.
+/// The flood cut.
 #[cfg(test)]
 mod flood_cut_tests {
     use super::super::Grid;
@@ -1004,22 +965,12 @@ mod flood_cut_tests {
     use crate::CellFlags;
     use aterm_scrollback::Scrollback;
 
-    /// The engine's default scrollback memory budget (`TerminalConfig`,
-    /// `Scrollback::with_defaults`): what the GUI's sessions run with.
     const DEFAULT_BUDGET: usize = 100 * 1024 * 1024;
 
-    /// A budget whose headroom holds fewer staged `L<n>` rows than the 20k
-    /// floor, so the staging cap is the floor and a test-sized flood reaches
-    /// the drop path: the memory-bound case, where a cut is a loss (each test
-    /// checks it with [`assert_floor_is_the_cap`]).
     const FLOOR_BUDGET: usize = 2 * 1024 * 1024;
 
-    /// The worker's batch (`COMPRESS_BUDGET` in the GUI's compress worker).
     const BATCH: usize = 256;
 
-    /// A grid whose compression worker is attached but never runs on its own
-    /// (the starved-worker flood), over a store with this memory budget and
-    /// the store's own default 100k line limit.
     fn flooded_grid(cols: u16, ring: usize, budget: usize) -> Grid {
         let mut grid =
             Grid::with_tiered_scrollback(3, cols, ring, Scrollback::new(100, 1000, budget));
@@ -1035,8 +986,6 @@ mod flood_cut_tests {
             .ok()
     }
 
-    /// The number of a content row `L<n>` (a padded wide row `L<n>-----`
-    /// included).
     fn line_number(row: &str) -> usize {
         row.strip_prefix('L')
             .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
@@ -1044,8 +993,6 @@ mod flood_cut_tests {
             .unwrap_or_else(|| panic!("expected a content row `L<n>`, got {row:?}"))
     }
 
-    /// The contract: history is contiguous except where a marker row stands,
-    /// and each marker's count equals the numbering gap across it.
     fn assert_no_silent_hole(hist: &[String], origin: usize) -> Vec<(usize, u64)> {
         let mut markers = Vec::new();
         let mut expect_next: Option<usize> = None;
@@ -1072,9 +1019,6 @@ mod flood_cut_tests {
         markers
     }
 
-    /// The newest `limit` lines of `total` fed, as history rows: what a
-    /// scrollback with that limit holds once `total` lines have scrolled
-    /// through a 3-row screen whose last row is the blank after the final LF.
     fn newest(total: usize, limit: usize) -> Vec<String> {
         let first_on_screen = total - 2;
         (first_on_screen - limit..first_on_screen)
@@ -1082,23 +1026,15 @@ mod flood_cut_tests {
             .collect()
     }
 
-    /// The line a history of `limit` rows starts at once `total` lines have
-    /// been fed — the `origin` of [`assert_no_silent_hole`].
     fn window_top(total: usize, limit: usize) -> usize {
         (total - 2).saturating_sub(limit)
     }
 
-    /// A lower bound on what one staged `L<n>` row weighs (`feed`'s rows run
-    /// 2..=7 cells; a recycled body can be larger, never smaller): what a test
-    /// budget is sized against, erring toward more rows fitting.
     fn staged_row_bytes() -> usize {
         std::mem::size_of::<super::super::scroll_convert::DeferredLine>()
             + 7 * std::mem::size_of::<crate::Cell>()
     }
 
-    /// Precondition for the memory-bound tests: the store's headroom holds
-    /// fewer staged `L<n>` rows than the floor, so the floor is the cap and a
-    /// test-sized flood reaches the drop path well inside the 100k limit.
     fn assert_floor_is_the_cap(grid: &Grid) {
         let store = grid.scrollback().expect("a tiered store");
         let headroom = store.memory_budget() - store.budgeted_memory_used();
@@ -1167,8 +1103,6 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    /// Write `n` numbered full-width rows `L{start}----…` (every cell occupied),
-    /// CR + text + LF each.
     fn feed_wide(grid: &mut Grid, start: usize, n: usize, cols: u16) {
         for i in start..start + n {
             grid.carriage_return();
@@ -1436,10 +1370,6 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    /// Flood `total` lines in 1000-line chunks with one worker opportunity per
-    /// chunk — `guarded`: the GUI worker's `trickle_lazy_bounded`; otherwise
-    /// an unconditional batch — then the post-flood drain; returns every
-    /// marker left.
     fn trickled_flood_markers(total: usize, guarded: bool) -> Vec<(usize, u64)> {
         let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
         assert_floor_is_the_cap(&grid);
@@ -1476,9 +1406,6 @@ mod flood_cut_tests {
         );
     }
 
-    /// A memory-bound flood (40k lines, a trickle opportunity every 1000), then
-    /// a slow tail: 20 opportunities with `per_tick` lines before each, with no
-    /// quiet window for the worker.
     fn slow_tail(per_tick: usize, skip_while_cut: bool) -> (u64, Vec<(usize, u64)>) {
         let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
         assert_floor_is_the_cap(&grid);
@@ -1600,7 +1527,6 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    /// A late worker must not take the open marker even if pressure remains.
     #[test]
     fn pressure_relief_after_a_late_worker_leaves_one_marker_for_continued_overload() {
         let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);
@@ -1625,8 +1551,6 @@ mod flood_cut_tests {
         grid.assert_invariants();
     }
 
-    /// An owed count survives a worker's lock release, but permission to drain
-    /// does not: a reader can open a cut before the next bounded batch.
     #[test]
     fn a_cut_opened_between_pressure_batches_overrides_the_owed_count() {
         let mut grid = flooded_grid(80, 8, FLOOR_BUDGET);

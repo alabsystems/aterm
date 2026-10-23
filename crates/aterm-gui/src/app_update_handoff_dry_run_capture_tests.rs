@@ -9,7 +9,6 @@ fn caps() -> crate::seamless::WireCaps {
     crate::seamless::WireCaps::current()
 }
 
-/// A desk with history to carry, through the real parser.
 fn desk_with_history(
     app: &crate::App,
 ) -> std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>> {
@@ -22,9 +21,6 @@ fn desk_with_history(
     term
 }
 
-/// The dry run times the park's own capture and parks nothing: the reader stays
-/// attached, no attempt record exists, the engine is free and unchanged, and the
-/// measurement covers every handed session.
 #[test]
 fn a_dry_run_times_the_parks_own_capture_and_parks_nothing() {
     let mut app = crate::App::headless_for_test();
@@ -60,9 +56,6 @@ fn a_dry_run_times_the_parks_own_capture_and_parks_nothing() {
     assert_eq!(terminal.cursor(), cursor, "and read, not written");
 }
 
-/// A dry run that runs out of its window saturates the rung: an engine lock held
-/// for the whole window ends it as `EngineBusy`, and 1.5 × the window is the
-/// ceiling, so an untimeable desk gets the 80 ms rung 0.
 #[test]
 fn a_dry_run_that_runs_out_of_its_window_saturates_the_first_rung() {
     let mut app = crate::App::headless_for_test();
@@ -86,10 +79,6 @@ fn a_dry_run_that_runs_out_of_its_window_saturates_the_first_rung() {
     );
 }
 
-/// The seed end to end, over the shipping ledger writers: an automatic attempt's
-/// dry run seeds rung 0 (never below the last landed park) and is kept in the
-/// ledger; an explicit apply spends no dry run; a dry run that measured nothing
-/// (a parser mid-sequence over live output) falls back to the ledger.
 #[test]
 fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -193,7 +182,7 @@ fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
         .master = -1;
 }
 
-/// A prelaunched attempt as `prelaunch_out_of_band_handoff` records it, carrying `freeze_seed`, and the receiver its park sends the capture to.
+/// Prelaunched handoff attempt carrying `freeze_seed` and its park capture receiver.
 pub(crate) fn prelaunched(
     attempt_id: u64,
     mode: ApplyMode,
@@ -234,8 +223,6 @@ pub(crate) fn prelaunched(
     (record, transferred)
 }
 
-/// Seeding a prelaunched attempt stores the seed on that attempt, so the park's
-/// budget is the seeded ladder, not the 20 ms default.
 #[test]
 fn seeding_stores_the_first_rung_on_the_prelaunched_attempt() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -258,8 +245,6 @@ fn seeding_stores_the_first_rung_on_the_prelaunched_attempt() {
     );
 }
 
-/// The launched lane's next park budget climbs with the attempt's own misses:
-/// rung 0 is the dry run's seed, and each miss buys a strictly wider rung.
 #[test]
 fn the_launched_lanes_park_budget_climbs_its_attempts_seeded_ladder() {
     let mut app = crate::App::headless_for_test();
@@ -290,8 +275,6 @@ fn the_launched_lanes_park_budget_climbs_its_attempts_seeded_ladder() {
     }
 }
 
-/// A landed park (the launched lane's real park over a real PTY) writes its cost into the
-/// ledger's landed-park slot, the floor for the next update's first rung.
 #[test]
 fn a_landed_park_keeps_its_cost_for_the_next_updates_first_rung() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -352,8 +335,6 @@ fn a_landed_park_keeps_its_cost_for_the_next_updates_first_rung() {
     }
 }
 
-/// Session 0 on a real, quiet, close-on-exec PTY, as the park needs it (a
-/// stub's `-1` master reads as activity).
 fn quiet_pty(app: &mut crate::App) -> (i32, i32) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     app.pool
@@ -379,9 +360,6 @@ fn release_pty(app: &mut crate::App, (master, slave): (i32, i32)) {
     }
 }
 
-/// Publishes a passed pre-verification of `ticket`'s artifact carrying `policy`
-/// (`None`: no policy file), as the handoff worker does, and returns the policy
-/// the park will read.
 fn publish(
     app: &crate::App,
     ticket: &crate::native_updater_service::ApplyAttemptTicket,
@@ -394,8 +372,6 @@ fn publish(
     app.publish_preverified_pass_for_test(ticket, &read)
 }
 
-/// `extra` more live sessions (ids 1..=extra) beside session 0, each owning a duplicate of
-/// session 0's quiet master, registered and pooled as spawned tabs are.
 fn add_sessions_on(app: &mut crate::App, master: i32, extra: u64) {
     for id in 1..=extra {
         // SAFETY: `master` is the test's open PTY master; `F_DUPFD_CLOEXEC` returns a new descriptor this session owns, close-on-exec from birth.
@@ -409,8 +385,6 @@ fn add_sessions_on(app: &mut crate::App, master: i32, extra: u64) {
     }
 }
 
-/// Publishes a pass of `ticket`'s artifact declaring the chunked grant, as the
-/// arm-time pre-verification caches it.
 fn publish_chunked_pass(
     app: &crate::App,
     ticket: &crate::native_updater_service::ApplyAttemptTicket,
@@ -427,9 +401,6 @@ fn publish_chunked_pass(
         );
 }
 
-/// The park holds the pool to the dialled claim before it freezes: a cached pass
-/// says the candidate declares the chunked grant, but the held successor claimed
-/// `ATRZ1C`.
 #[test]
 fn a_park_refuses_a_desk_the_dialled_claim_cannot_carry_before_freezing() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -471,12 +442,6 @@ fn a_park_refuses_a_desk_the_dialled_claim_cannot_carry_before_freezing() {
     release_pty(&mut app, pty);
 }
 
-/// WHICH DONE THE OWNER SAW RIDES THE REAL PARK (owner surfaces §5): the
-/// prelaunched lane's park stamps what the status item knew of a session
-/// whose finished task the owner looked at on its manifest record
-/// (`SessionRecord::status_seen`, `App::status_carry_rows`: the one carry of
-/// what the owner saw and was told), naming that done by when its task
-/// entered it, so the successor reads it as seen.
 #[test]
 fn the_park_carries_which_done_the_owner_saw() {
     let carried = |looked: bool| {
@@ -537,9 +502,6 @@ fn the_park_carries_which_done_the_owner_saw() {
     assert!(!carried(false), "CONTROL: nobody looked, nothing carried");
 }
 
-/// A fork has no descriptor-message limit: when the launched lane falls back at runtime
-/// (`fork_after_park`, no dialer and no grant limit) with 63 tabs, the park is not refused and
-/// the fork gets every session by inheritance.
 #[test]
 fn a_fork_after_park_is_not_held_to_the_rendezvous_session_limit() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -768,7 +730,6 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     release_pty(&mut app, pty);
 }
 
-/// The scrollback sidecars in `dir`.
 fn park_until<T>(
     app: &mut crate::App,
     what: &str,
@@ -801,10 +762,6 @@ fn sidecars(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// The launched lane sends no scrollback under a policy that carries none: its history export
-/// starts before the policy can be read, so under `carry = "visible"` or `"repaint"` the park
-/// stops it, removes its sidecar and hands the worker `HistoryPlan::Withheld`, and the join
-/// counts every line as the policy's.
 #[test]
 fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
     use crate::handoff_history::{Fallback, HistoryExporter, HistoryPlan};
@@ -945,7 +902,7 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
     }
 }
 
-/// Holds `term`'s engine from another thread until the park's bounded take of it has run past its deadline (`park_budget_for_test::wait_gave_up`), returning once held, so a park on the real rung (`park_budget_for_test::real`) misses (its rollback no longer waits for the release: `a_missed_parks_rollback_never_waits_on_an_engine`).
+/// Hold `term`'s engine from another thread until the park's bounded take times out.
 pub(super) fn hold_engine_until_the_park_gives_up(
     term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
 ) -> std::thread::JoinHandle<()> {
@@ -962,10 +919,6 @@ pub(super) fn hold_engine_until_the_park_gives_up(
     holder
 }
 
-/// A missed park resumes the history export it paused: after a miss (engine held past the
-/// deadline) the tab prints more than 256 lines before the re-park, the export follows them
-/// before the re-park is tried, and the whole history still crosses through the second
-/// capture's join.
 #[test]
 fn a_missed_park_resumes_the_history_export_for_the_repark() {
     use crate::handoff_history::{ExportSessions, HistoryExporter, HistoryPlan};
@@ -1084,10 +1037,6 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK. Every park — and
-/// so every free mid-sequence re-park of a flood — pauses the history export before it freezes
-/// anything, and the export's worker answers only after its last look: on a desk of 32
-/// flooding tabs, 10–20 ms each, measured.
 #[test]
 fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     use crate::handoff_history::{HistoryExporter, HistoryPlan};
@@ -1199,11 +1148,6 @@ fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE. A park whose
-/// capture misses because another thread holds a session's engine
-/// (`CaptureFailure::EngineBusy`) rolls back before any successor held a PTY: nothing resized
-/// one, so no size is put back, and the rollback must not wait the holder out while every
-/// reader is still parked.
 #[test]
 fn a_missed_parks_rollback_never_waits_on_an_engine() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -1258,7 +1202,6 @@ fn a_missed_parks_rollback_never_waits_on_an_engine() {
     release_pty(&mut app, pty);
 }
 
-/// The dry run captures under the successor's policy.
 #[test]
 fn the_dry_run_captures_under_the_successors_policy_and_not_before_it_is_read() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

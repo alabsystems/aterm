@@ -417,6 +417,54 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         crate::supervise::occupancy::PaceGrant::Local
     }
 
+    /// Returns the session's book of declared wakes as the loop sees it (the occupancy design's
+    /// §4.1; [`crate::supervise::occupancy::WakesSeen`]): closed words and counts, never a
+    /// label. The default host keeps no book, and a replay of a build without the door reads the
+    /// empty one. Slice 2.0 lays the door; the loop asks it only where
+    /// `Fx::slice2_recorded` holds.
+    fn wakes(&self) -> crate::supervise::occupancy::WakesSeen {
+        crate::supervise::occupancy::WakesSeen::default()
+    }
+
+    /// Claims wake `ord` of episode `episode` for `door`'s one tell, under the book's one lock
+    /// ([`crate::supervise::occupancy::WakeClaim`]). Asked under `occupancy = "prompt"` alone,
+    /// just before the write; the host refuses unless its own copy of the owner's mode is
+    /// `prompt`. The default host keeps no book: every wake is gone.
+    act fn wake_claim(
+        &self,
+        ord: u16,
+        episode: u64,
+        door: crate::supervise::occupancy::WakeDoor,
+    ) -> crate::supervise::occupancy::WakeClaim {
+        let _ = (ord, episode, door);
+        crate::supervise::occupancy::WakeClaim::Gone
+    }
+
+    /// Releases this loop's claim on wake `ord` of episode `episode`, its line not typed. Honoured
+    /// only for a claim the host holds for this loop's door.
+    act fn wake_release(&self, ord: u16, episode: u64) {
+        let _ = (ord, episode);
+    }
+
+    /// Notifies the host that wake `ord` of episode `episode` was told through `door`. Honoured
+    /// only for a claim the host holds for that door.
+    fn wake_told(&self, ord: u16, episode: u64, door: crate::supervise::occupancy::WakeDoor) {
+        let _ = (ord, episode, door);
+    }
+
+    /// Writes the closed fact word `word` on the session's task record, or clears it for `None`
+    /// ([`crate::supervise::occupancy::FactWord`]): where a managed worker's manager reads that a
+    /// line would have gone but for them. Asked under `occupancy = "prompt"` alone; the host
+    /// refuses unless its own copy of the owner's mode is `prompt`. The default host keeps no
+    /// task record.
+    act fn task_fact(
+        &self,
+        word: Option<crate::supervise::occupancy::FactWord>,
+    ) -> crate::supervise::occupancy::NoteOutcome {
+        let _ = word;
+        crate::supervise::occupancy::NoteOutcome::NoTask
+    }
+
     /// Reports usage-credit and quota-warning notices read from the agent's screen.
     fn usage_seen(&self, seen: &UsageSeen) {
         let _ = seen;

@@ -628,6 +628,7 @@ mod glx {
                 *mut c_uint,
                 *mut c_uint,
             ) -> c_int;
+            connection_number = "XConnectionNumber": fn(XDisplay) -> c_int;
         }
     }
 

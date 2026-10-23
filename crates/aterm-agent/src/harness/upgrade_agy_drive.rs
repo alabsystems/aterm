@@ -240,7 +240,9 @@ fn witness(config: &Path, files: &[PathBuf], pid: u32) -> Held {
     }
 }
 
-/// Whether the dead process's crash file is left (`crash`, or a crash file of `pid` under `config` written no earlier than `started_ms`).
+/// Whether the dead process's crash file is left: `crash`, else a crash file of `pid` under
+/// `config` written no earlier than `started_ms` (a second's slack), and none when
+/// `started_ms` is `0` (unread).
 fn crash_left(config: &Path, pid: u32, crash: Option<&Path>, started_ms: u64) -> bool {
     if let Some(file) = crash {
         return file.is_file();

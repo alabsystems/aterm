@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Same-UID process descriptor and path holder scans: libproc on macOS, `/proc` on Linux
-//! (`holders_procfs.rs`).
+//! Same-UID process descriptor and path holder scans.
 
 use std::io;
 
@@ -13,8 +12,7 @@ pub struct HolderScan {
     pub holders: Vec<u32>,
     /// Processes whose descriptor table could not be read.
     pub unreadable: Vec<u32>,
-    /// Linux processes whose descriptor table only root reads (non-dumpable, such as
-    /// `ssh-agent`): no holder, and not unreadable. macOS lists none.
+    /// Linux processes whose descriptor table only root reads.
     pub sealed: Vec<u32>,
     /// Total processes scanned.
     pub scanned: usize,
@@ -29,18 +27,14 @@ impl HolderScan {
 }
 
 /// Scan live same-UID processes except `skip` for descriptors matching `rdev`.
-///
 /// # Errors
 /// The process listing itself failing; `Unsupported` off macOS.
-///
-/// Returns an error if the process listing fails.
 pub fn scan_rdev_holders(rdev: u64, skip: &[u32]) -> io::Result<HolderScan> {
     Ok(scan_holders_of(&[rdev], skip)?.pop().unwrap_or_default())
 }
 
-/// The `st_rdev` of the master of the PTY whose slave is `slave` (a process's controlling
-/// terminal, `e_tdev`), for a scan that asks whether a live process still holds that
-/// terminal's master.
+/// The `st_rdev` of the master of the PTY whose slave is `slave`.
+/// `None` when `/dev/ptmx` cannot be read, and off macOS.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn pty_master_rdev(slave: u64) -> Option<u64> {
@@ -59,9 +53,7 @@ pub fn pty_master_rdev(_slave: u64) -> Option<u64> {
 }
 
 /// Scan live same-UID processes except `skip` for each device in `rdevs`.
-///
 /// # Errors
-///
 /// Returns an error if the process listing fails.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -71,11 +63,8 @@ pub fn scan_holders_of(rdevs: &[u64], skip: &[u32]) -> io::Result<Vec<HolderScan
 }
 
 /// Scan live same-UID processes except `skip` for descriptors open on `path`.
-///
 /// # Errors
 /// `path` cannot be read (`stat`), or the process listing fails; `Unsupported` off macOS.
-///
-/// Returns an error if `path` cannot be stat'd or the process listing fails.
 #[cfg(target_vendor = "apple")]
 pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
     use std::os::unix::fs::MetadataExt as _;
@@ -91,12 +80,9 @@ pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<Hol
         .unwrap_or_default())
 }
 
-/// Scan live same-UID processes except `skip` for descriptors open on `path`: each
-/// `/proc/<pid>/fd/<n>`, `stat` through its link (`holders_procfs.rs`). A zombie holds
-/// nothing, and a table only root reads is in [`HolderScan::sealed`].
-///
+/// Scan live same-UID processes except `skip` for descriptors open on `path`; a table only root
+/// reads is in [`HolderScan::sealed`].
 /// # Errors
-///
 /// `path` cannot be read, the process listing fails, or the reads take longer than 10 s
 /// (`TimedOut`: a hung mount).
 #[cfg(target_os = "linux")]
@@ -110,11 +96,8 @@ pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<Hol
 }
 
 /// Scan live same-UID processes except `skip` for descriptors open on `path`.
-///
 /// # Errors
 /// Always `Unsupported`.
-///
-/// Returns `Unsupported` on platforms without a holder scan.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<HolderScan> {
     Err(io::Error::new(
@@ -123,8 +106,7 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
     ))
 }
 
-/// One walk of this uid's processes except `skip`: for each of `wanted`, in order, who holds a
-/// descriptor whose vnode answers it as `lookup` reads it.
+/// One walk of this uid's processes except `skip`.
 #[cfg(target_vendor = "apple")]
 fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderScan>> {
     let mut scans = vec![HolderScan::default(); wanted.len()];
@@ -148,11 +130,8 @@ fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderS
 }
 
 /// Scan live same-UID processes except `skip` for each device in `rdevs`.
-///
 /// # Errors
 /// Always `Unsupported`.
-///
-/// Returns `Unsupported` on platforms without a holder scan.
 #[cfg(not(target_vendor = "apple"))]
 pub fn scan_holders_of(_rdevs: &[u64], _skip: &[u32]) -> io::Result<Vec<HolderScan>> {
     Err(io::Error::new(
@@ -205,8 +184,7 @@ enum TableRead {
     Holds,
     /// No descriptor for it.
     Clear,
-    /// The process has exited (`ESRCH`), before the listing's read or during
-    /// the descriptors' reads: every descriptor it had is closed.
+    /// The process has exited.
     Exited,
     /// Unknown: the table was refused, or a read failed otherwise.
     Unreadable,
@@ -216,14 +194,11 @@ enum TableRead {
 #[cfg(target_vendor = "apple")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Failed {
-    /// `ESRCH`: no such process; it has exited (a zombie's descriptors are
-    /// closed at its exit) or been reaped.
+    /// `ESRCH`: no such process.
     Exited,
-    /// `EBADF`, reading one descriptor: closed since the listing, or its
-    /// number reused by something that is no vnode.
+    /// `EBADF`, reading one descriptor.
     Closed,
-    /// `ENOENT`, reading one descriptor or a working directory: its vnode is dead (revoked, or
-    /// its volume force-unmounted) and names no file, device or path.
+    /// `ENOENT`, reading one descriptor or a working directory.
     Dead,
     /// `EPERM`: the kernel will not tell this process.
     Refused,
@@ -236,9 +211,7 @@ impl Failed {
     const ESRCH: i32 = 3;
     const EPERM: i32 = 1;
     const EBADF: i32 = 9;
-    /// A descriptor's or a working directory's read's answer for a dead
-    /// vnode, and `proc_pidpath`'s for a process whose executable has been
-    /// unlinked since its exec (a rebuilt binary, a replaced app).
+    /// A descriptor's or a working directory's read's answer for a dead vnode.
     const ENOENT: i32 = 2;
 
     const fn of(errno: i32) -> Self {
@@ -251,8 +224,7 @@ impl Failed {
         }
     }
 
-    /// The failure the last libproc call on this thread reported (its
-    /// `errno`, cleared before the call by [`clear_errno`]).
+    /// The failure the last libproc call on this thread reported ([`clear_errno`]).
     fn last() -> Self {
         let failed = Self::of(errno());
         #[cfg(any(test, debug_assertions))]
@@ -261,8 +233,7 @@ impl Failed {
     }
 }
 
-/// What a vnode descriptor names: the file's device and inode, and the device a character
-/// special file stands for.
+/// What a vnode descriptor names.
 #[cfg(target_vendor = "apple")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Vnode {
@@ -297,24 +268,21 @@ struct Lookup {
     size: usize,
     /// The scan's key of the vnode read.
     key: fn(&Vnode) -> u128,
-    /// Whether a descriptor refused for its vnode ([`refusal_is_the_vnodes`]) is known not
-    /// to be the one sought: the file a scan of one file has just read the metadata of.
+    /// Whether a descriptor refused for its vnode ([`refusal_is_the_vnodes`]) is known not to be
+    /// the one sought.
     vnode_refusal_clears: bool,
 }
 
 #[cfg(target_vendor = "apple")]
 impl Lookup {
-    /// A device by its `st_rdev`, read with the descriptor's path
-    /// (`PROC_PIDFDVNODEPATHINFO`): the keeper's read, whose path lookup also
-    /// says a dead vnode is dead (`ENOENT`).
+    /// A device by its `st_rdev`, read with the descriptor's path (`PROC_PIDFDVNODEPATHINFO`).
     const BY_RDEV: Self = Self {
         flavor: ffi::PROC_PIDFDVNODEPATHINFO,
         size: ffi::VNODE_PATH_SIZE,
         key: Vnode::rdev_key,
         vnode_refusal_clears: false,
     };
-    /// A file by its device and inode, read without the path
-    /// (`PROC_PIDFDVNODEINFO`), which the match does not need.
+    /// A file by its device and inode.
     const BY_FILE: Self = Self {
         flavor: ffi::PROC_PIDFDVNODEINFO,
         size: ffi::VNODE_FD_SIZE,
@@ -323,16 +291,8 @@ impl Lookup {
     };
 }
 
-/// Whether the kernel refused (`EPERM`) each descriptor of `pid` in `refused` for its vnode
-/// and not for the process: the table lists again, each descriptor of it still listed is
-/// refused again, and then another vnode descriptor of the table is described. Read so, the
-/// permission to inspect the process held before and after each refusal; what was refused is
-/// the vnode's metadata, which macOS keeps from any reader but an entitled one (a file in a
-/// protected folder: `lsof` holds the `com.apple.rootless.datavault.metadata` entitlement).
-/// MEASURED 2026-10-22 on the owner's Mac: 66 descriptors of 7 of this uid's 496 processes
-/// (Apple daemons: `routined`, `ScreenTimeAgent`, `dmd`, …) refused, with and without the
-/// path; all 7 refusals were shown to be the vnodes' so, and each refused file's own `stat`
-/// was refused too (2026-10-21).
+/// Whether the kernel refused (`EPERM`) each descriptor of `pid` in `refused` for its vnode and
+/// not for the process.
 // Skip: bottoms out at the libproc FFI calls.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -340,11 +300,7 @@ fn refusal_is_the_vnodes(pid: i32, refused: &[i32], lookup: Lookup) -> bool {
     refusal_shown(refused, list_fds(pid), |fd| vnode_of(pid, fd, lookup))
 }
 
-/// [`refusal_is_the_vnodes`]' decision over its reads: `relisted` the table's listing
-/// again, `describe` one descriptor's read. A listing refused, a refused descriptor now
-/// described (or exited, or failed otherwise), or no other vnode descriptor described each
-/// leaves the refusal the process's. A refused descriptor read as closed or dead, or no
-/// longer listed, holds nothing.
+/// [`refusal_is_the_vnodes`]' decision over its reads.
 #[cfg(target_vendor = "apple")]
 fn refusal_shown(
     refused: &[i32],
@@ -370,9 +326,7 @@ fn refusal_shown(
         .any(|fd| describe(fd).is_ok())
 }
 
-/// What `pid`'s descriptor table says of each key in `wanted`, in order, each vnode
-/// descriptor read as `lookup` reads it, from one listing and one read per vnode
-/// descriptor.
+/// What `pid`'s descriptor table says of each key in `wanted`.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
@@ -398,8 +352,7 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     )
 }
 
-/// Fold a listed table's vnode reads; `vnodes_refused` says whether its refused
-/// descriptors were refused for their vnodes ([`refusal_is_the_vnodes`]).
+/// Fold a listed table's vnode reads ([`refusal_is_the_vnodes`]).
 #[cfg(target_vendor = "apple")]
 fn read_listed_table(
     wanted: &[u128],
@@ -439,10 +392,7 @@ fn read_listed_table(
             }
             Err(Failed::Exited) => return every(TableRead::Exited),
             Err(Failed::Closed | Failed::Dead) => {}
-            // A refusal is unknown unless it is shown to be the vnode's.
             Err(Failed::Refused) => refused.push(fd),
-            // Any other failure makes the verdict unknown for every key
-            // not found.
             Err(Failed::Other) => unreadable = true,
         }
     }
@@ -600,16 +550,14 @@ fn clear_errno() {
     unsafe { *ffi::__error() = 0 };
 }
 
-/// This thread's `errno`: what the last libproc call set, 0 for none.
+/// This thread's `errno`.
 #[cfg(target_vendor = "apple")]
 fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 /// List every live process PID owned by this UID.
-///
 /// # Errors
-///
 /// Returns an error if the process listing fails.
 #[cfg(target_vendor = "apple")]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
@@ -638,30 +586,61 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     }
 }
 
-/// List every live process PID owned by this UID.
+/// List every live process PID owned by this UID: its effective uid, as macOS's
+/// `PROC_UID_ONLY` lists ([`ours_by_owner`]).
 ///
 /// # Errors
-///
 /// Returns an error if `/proc` cannot be read.
 #[cfg(target_os = "linux")]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
-    use std::os::unix::fs::MetadataExt as _;
-    let me = std::fs::metadata("/proc/self")?.uid();
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { libc::geteuid() };
     procfs::uid_pids_in(std::path::Path::new(procfs::PROC), me)
 }
 
+/// Whether the process whose `/proc/<pid>` directory `owner` owns runs as effective uid `me`.
+/// The kernel gives a dumpable process's directory its effective uid, and a non-dumpable
+/// one's (`prctl(PR_SET_DUMPABLE, 0)`, as ssh-agent sets) to root, so a directory `me` does not
+/// own is judged by `effective`, its status's effective uid, read only then.
+#[cfg(any(target_os = "linux", test))]
+fn ours_by_owner(owner: u32, me: u32, effective: impl FnOnce() -> Option<u32>) -> bool {
+    owner == me || effective() == Some(me)
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::ours_by_owner;
+
+    /// A process is this uid's when it owns its directory, or, behind the root-owned
+    /// directory of a non-dumpable process, when its status names this effective uid; the
+    /// status is read only for a directory of another owner. NEGATIVE CONTROL: judge by the
+    /// directory's owner alone, and the non-dumpable process of this uid is left out.
+    #[test]
+    fn a_non_dumpable_process_is_this_uids_by_its_effective_uid() {
+        let unread = || -> Option<u32> { panic!("a directory this uid owns reads no status") };
+        assert!(ours_by_owner(501, 501, unread), "its own directory");
+        assert!(
+            ours_by_owner(0, 501, || Some(501)),
+            "non-dumpable, this uid's"
+        );
+        assert!(!ours_by_owner(0, 501, || Some(0)), "root's own");
+        assert!(
+            !ours_by_owner(0, 501, || None),
+            "a status that does not read"
+        );
+        assert!(!ours_by_owner(502, 501, || Some(502)), "another user's");
+    }
+}
+
 /// List every live process PID owned by this user SID.
-///
 /// # Errors
-///
 /// Returns an error if the process token or WTS enumeration fails.
 #[cfg(windows)]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
     win_pids::same_user_pids()
 }
 
-/// This process's token-user SID and the session manager's process listing: the
-/// Windows [`uid_pids`] listing.
+/// This process's token-user SID and the session manager's process listing ([`uid_pids`]).
 #[cfg(windows)]
 mod win_pids {
     use super::io;
@@ -672,13 +651,12 @@ mod win_pids {
     const TOKEN_QUERY: u32 = 0x0008;
     /// `WTS_CURRENT_SERVER_HANDLE` (this server).
     const WTS_CURRENT_SERVER: ffi::RawHandle = 0;
-    /// `WTS_ANY_SESSION` (`(DWORD)-2`): every session.
+    /// `WTS_ANY_SESSION` (`(DWORD)-2`).
     const WTS_ANY_SESSION: u32 = 0xFFFF_FFFE;
     /// `WTS_PROCESS_INFO_TYPE::WTSTypeProcessInfoLevel1`.
     const WTS_PROCESS_INFO_LEVEL1: u32 = 1;
 
-    /// This process's token-user SID, as the `TOKEN_USER` bytes that back it
-    /// (the SID is a pointer into them, so they are returned and kept alive).
+    /// This process's token-user SID.
     fn own_sid() -> io::Result<(Vec<u8>, *const core::ffi::c_void)> {
         let mut token: ffi::RawHandle = 0;
         // SAFETY: `GetCurrentProcess` is a pseudo-handle and `token` is a live out-pointer.
@@ -695,8 +673,7 @@ mod win_pids {
             return Err(io::Error::last_os_error());
         }
         let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` has `len` writable bytes; `TOKEN_USER` fills it with a `SID_AND_ATTRIBUTES`
-        // whose `Sid` points inside `buf`.
+        // SAFETY: `buf` has `len` writable bytes.
         let ok = unsafe {
             ffi::GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len)
         };
@@ -714,14 +691,13 @@ mod win_pids {
         Ok((buf, sid as *const core::ffi::c_void))
     }
 
-    /// [`super::uid_pids`]: the pids the session manager names with our owner SID.
+    /// [`super::uid_pids`].
     pub(super) fn same_user_pids() -> io::Result<Vec<u32>> {
         let (_buf, own) = own_sid()?;
         let mut level = WTS_PROCESS_INFO_LEVEL1;
         let mut info: *mut ffi::WtsProcessInfoExW = std::ptr::null_mut();
         let mut count: u32 = 0;
-        // SAFETY: level and out-params are live locals; on success the manager
-        // allocates `info`, freed below. We never open any listed process.
+        // SAFETY: level and out-params are live locals.
         let ok = unsafe {
             ffi::WTSEnumerateProcessesExW(
                 WTS_CURRENT_SERVER,
@@ -753,9 +729,7 @@ mod win_pids {
 }
 
 /// List every live process PID owned by this UID.
-///
 /// # Errors
-///
 /// Returns `Unsupported` on platforms without a reader.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
@@ -851,9 +825,7 @@ pub fn fd_is_pshm(fd: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
 }
 
 /// Sizes of the POSIX shared-memory objects held by `pid`.
-///
 /// # Errors
-///
 /// Returns an error if `pid`'s descriptor table cannot be read.
 #[cfg(target_vendor = "apple")]
 pub fn pshm_sizes_of(pid: u32) -> io::Result<Vec<u64>> {
@@ -867,8 +839,7 @@ pub fn pshm_sizes_of(pid: u32) -> io::Result<Vec<u64>> {
         .collect())
 }
 
-/// `pid`'s descriptor `fd`'s shared-memory size, or `None` when it is no shm descriptor (or is
-/// gone).
+/// `pid`'s descriptor `fd`'s shared-memory size.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn pshm_size(pid: i32, fd: i32) -> Option<u64> {
@@ -901,9 +872,7 @@ pub fn fd_is_pshm(_fd: std::os::fd::BorrowedFd<'_>) -> Option<u64> {
 }
 
 /// Sizes of the POSIX shared-memory objects held by `pid`.
-///
 /// # Errors
-///
 /// Returns `Unsupported` on platforms without a PSHM reader.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
@@ -942,8 +911,8 @@ mod hook {
     #[cfg(test)]
     type Hook = Box<dyn FnOnce(i32, &[(i32, u32)])>;
 
-    /// The pid whose reads [`refusing`] refuses, and each refused descriptor with the
-    /// reads of it left to refuse.
+    /// The pid whose reads [`refusing`] refuses, and each refused descriptor with the reads of it
+    /// left to refuse.
     #[cfg(test)]
     type Refusing = (i32, Vec<(i32, usize)>);
 
@@ -989,14 +958,13 @@ mod hook {
         }
     }
 
-    /// Every read of a descriptor's vnode a refusal can be shown to be the vnode's of,
-    /// answered as the kernel answers one it keeps from this process.
+    /// Every read of a descriptor's vnode a refusal can be shown to be the vnode's of, answered as
+    /// the kernel answers one it keeps from this process.
     #[cfg(test)]
     pub const ALWAYS: usize = usize::MAX;
 
-    /// Run `f` with this thread's first `reads` reads of each of `fds` of `pid` (a vnode's
-    /// metadata, with or without its path) refused (`EPERM`), as the kernel refuses a file in
-    /// a protected folder ([`ALWAYS`]: every read), or a refusal that does not last (`1`).
+    /// Run `f` with this thread's first `reads` reads of each of `fds` of `pid` refused (`EPERM`)
+    /// ([`ALWAYS`]: every read).
     #[cfg(test)]
     pub fn refusing<R>(pid: u32, fds: &[i32], reads: usize, f: impl FnOnce() -> R) -> R {
         let pid = i32::try_from(pid).expect("a pid");
@@ -1059,16 +1027,9 @@ mod tests {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
 
-    /// The floors the descriptors below are duplicated to: under 256, macOS's
-    /// default soft `RLIMIT_NOFILE` (`F_DUPFD_CLOEXEC` at or above the soft
-    /// limit fails `EINVAL`), and above `pspawn`'s 200, so no sibling test's
-    /// duplicate lands on either.
     const LOW: i32 = 210;
     const HIGH: i32 = 240;
 
-    /// `fd` duplicated, close-on-exec, to the lowest free number at or above
-    /// `at` (the allocator hands every other open the lowest free number, so
-    /// no other thread's descriptor takes that one once it closes).
     fn dup_at(fd: &std::os::fd::OwnedFd, at: i32) -> std::os::fd::OwnedFd {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
         const F_DUPFD_CLOEXEC: i32 = 67;
@@ -1083,8 +1044,6 @@ mod tests {
         unsafe { std::os::fd::OwnedFd::from_raw_fd(high) }
     }
 
-    /// XNU's kernel-private `EREDRIVEOPEN`: a `/dev/ptmx` open that lost the race for a pty
-    /// minor to another opener in any process.
     const EREDRIVEOPEN: i32 = -6;
 
     /// A fresh PTY master (a device no other process holds) at the lowest free number at or
@@ -1123,8 +1082,6 @@ mod tests {
         (fd, rdev)
     }
 
-    /// A descriptor closed between the listing and its read (`EBADF`) is not held and does not
-    /// make the table unknown.
     #[test]
     fn a_descriptor_closed_between_the_listing_and_its_read_is_not_held() {
         use std::os::fd::AsRawFd as _;
@@ -1221,10 +1178,6 @@ mod tests {
         }
     }
 
-    /// A file's scan clears a descriptor the kernel refused for its vnode, not for the
-    /// process ([`super::refusal_is_the_vnodes`]): no vnode refused so is the file just
-    /// stat'd. NEGATIVE CONTROLS: a refusal not shown to be the vnode's, one in a table
-    /// with no descriptor described, and a device's scan all stay unknown.
     #[test]
     fn a_refusal_shown_to_be_the_vnodes_is_not_the_file() {
         use super::{Failed, Lookup, TableRead};
@@ -1294,12 +1247,6 @@ mod tests {
         );
     }
 
-    /// [`super::refusal_shown`] CLEARS A REFUSAL ONLY WHEN EVERY READ SAYS IT IS THE VNODE'S:
-    /// the table listed again, each refused descriptor still listed refused again (or closed,
-    /// or dead, which hold nothing), and another vnode descriptor described. NEGATIVE
-    /// CONTROLS: the listing refused or gone, a refused descriptor now described, exited or
-    /// failed otherwise, and no other vnode descriptor described (refused, closed, or only a
-    /// pipe beside it) each leave the refusal the process's.
     #[test]
     fn a_refusal_is_the_vnodes_only_when_every_read_says_so() {
         use super::{Failed, Vnode, refusal_shown};
@@ -1378,7 +1325,6 @@ mod tests {
         );
     }
 
-    /// The scan's key of the file at `path` ([`super::Vnode::file_key`]).
     fn file_key(path: &std::path::Path) -> u128 {
         let meta = std::fs::metadata(path).expect("stat");
         super::Vnode {
@@ -1389,15 +1335,6 @@ mod tests {
         .file_key()
     }
 
-    /// A FILE'S SCAN CLEARS A REFUSAL ONLY ONCE LIBPROC SHOWS IT IS THE VNODE'S, over libproc's
-    /// own reads of a live child holding a file (descriptor 0) and `/dev/null` (1 and 2), with
-    /// the file's descriptor refused as the kernel refuses a file in a protected folder: refused
-    /// at every read, the table listed again and another descriptor described, it is not the
-    /// file sought, in one table's read, in the scan of every process and in the child's open
-    /// files (which then name `/dev/null` alone). NEGATIVE CONTROLS: a refusal that does not
-    /// last (the second read describes it), every vnode descriptor refused (nothing shows the
-    /// process may be read), the device scan, and a table refused to this uid (launchd's) all
-    /// stay unknown; with nothing refused the child's file is named.
     #[test]
     fn a_refusal_is_cleared_only_once_libproc_shows_it_is_the_vnodes() {
         use super::{Lookup, TableRead};
@@ -1497,8 +1434,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// A `sleep` whose stdin is `/dev/null`, once the kernel shows it holding the device, and
-    /// that device's rdev.
     fn a_holder_of_dev_null() -> (crate::spawnfd::Child, u64) {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
         let child = crate::spawnfd::command("/bin/sleep")
@@ -1530,8 +1465,6 @@ mod tests {
         }
     }
 
-    /// An exited process holds nothing: a killed, unreaped child (a zombie in
-    /// the listing) is a non-holder, never unreadable.
     #[test]
     fn an_exited_process_still_listed_holds_nothing() {
         let (mut child, rdev) = a_holder_of_dev_null();
@@ -1553,8 +1486,6 @@ mod tests {
         );
     }
 
-    /// A process that exits between the listing and the reads of its
-    /// descriptors holds nothing: its descriptor reads answer `ESRCH`.
     #[test]
     fn a_process_that_exits_after_its_listing_holds_nothing() {
         let (mut child, rdev) = a_holder_of_dev_null();
@@ -1578,9 +1509,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// A child holding `/dev/null` (a character device with a real rdev,
-    /// unlike a regular file) is found by its rdev, and a scan that skips that
-    /// child does not report it.
     #[test]
     fn the_scan_finds_a_child_holding_a_character_device() {
         let rdev = std::fs::metadata("/dev/null").expect("stat").rdev();
@@ -1615,9 +1543,6 @@ mod tests {
         );
     }
 
-    /// Asked about several devices at once (a child's `/dev/null`, our fresh PTY master asked
-    /// twice, a device nobody holds), each answer in order is the one a scan for that device
-    /// alone gives; `skip` holds for all of them; no device asked answers nothing.
     #[test]
     fn one_walk_answers_for_every_device_asked() {
         let me = std::process::id();
@@ -1664,29 +1589,22 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// An rdev nobody holds is held by nobody.
     #[test]
     fn an_unheld_rdev_has_no_holders() {
         let scan = super::scan_rdev_holders(0xfeed_0001, &[]).expect("scan");
         assert!(scan.holders.is_empty(), "{scan:?}");
     }
 
-    /// libproc's `pshm_fdinfo` is the size and layout the reader assumes: a region's read-only
-    /// custody descriptor and a writable twin both read back as shm of the size they were made,
-    /// at two sizes (so the offset reads the size, not a constant); a vnode, a socket and a pipe
-    /// are no shm.
     #[test]
     fn a_shared_memory_descriptor_is_named_with_its_size_and_nothing_else_is() {
         use std::os::fd::AsFd as _;
         assert_eq!(ffi::PSHM_FDINFO_SIZE, 1192);
         assert_eq!(ffi::PSHM_VST_SIZE, 112);
         for len in [crate::shm::PAGE, 5 * crate::shm::PAGE] {
-            // SAFETY: this private custody is queried only for metadata, never reopened, written or
-            // resized; both owners drop this iteration.
+            // SAFETY: this private custody is queried only for metadata.
             let (_region, custody) = unsafe { crate::shm::Region::create(len) }.expect("a region");
             assert_eq!(super::fd_is_pshm(custody.as_fd()), Some(len as u64));
-            // SAFETY: this private writable descriptor is queried only for metadata, never used to
-            // write, resize or map; both owners drop this iteration.
+            // SAFETY: this private writable descriptor is queried only for metadata.
             let (_twin, writable) =
                 unsafe { crate::shm::testing::create_with_writable_custody(len) }.expect("a twin");
             assert_eq!(super::fd_is_pshm(writable.as_fd()), Some(len as u64));
@@ -1699,9 +1617,6 @@ mod tests {
         assert_eq!(super::fd_is_pshm(r.as_fd()), None, "a pipe");
     }
 
-    /// The kernel's table names a process's shared-memory descriptors with their sizes: a region
-    /// held shows (its custody descriptor; the creator's mapping is no descriptor), and once its
-    /// descriptor closes it is gone.
     #[test]
     fn a_process_s_shared_memory_descriptors_are_listed_with_their_sizes() {
         let len = 13 * crate::shm::PAGE;
@@ -1713,8 +1628,7 @@ mod tests {
                 .count()
         };
         assert_eq!(mine(), 0);
-        // SAFETY: the fixture only inspects the descriptor table and drops these owners; nothing
-        // writes, maps or resizes the private object.
+        // SAFETY: the fixture only inspects the descriptor table and drops these owners.
         let (region, custody) = unsafe { crate::shm::Region::create(len) }.expect("a region");
         assert_eq!(mine(), 1, "the custody descriptor");
         drop(region);

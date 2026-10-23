@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Laying executables (the `bin/` shims, their `agents/` twins and `alab-` aliases, the pending
-//! stubs, the reroute stubs, the tombstones) through one writer: [`write_in_process`], and
-//! [`write_regenerable`] for a file every seed lays again.
+//! stubs, the reroute stubs, the tombstones) through one writer: [`write_in_process`](crate::lay::write_in_process), and
+//! [`write_regenerable`](crate::lay::write_regenerable) for a file every seed lays again.
 
 use std::ffi::OsStr;
 use std::io;

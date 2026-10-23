@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SESSIONS' `Every session` row on Settings ▸ Harness (design §11.5): where it stands, what it says, and what its presses ask of the host.
+//! Tests for the Every session row on the native Settings Harness page.
 
 use super::*;
 use crate::autopilot_timers::TimerChoice;
 use crate::harness_screen::EveryPress;
 use crate::native_app::HarnessRequest;
 
-/// The fixture with `n` sessions, each its own tab: the fixture's own (on
-/// Land by its word) first, then sessions following a default of Cruise,
-/// every third pinned Off.
 fn fixture_of(n: usize) -> HarnessState {
     let mut state = fixture();
     let first = state.sessions[0].clone();
@@ -37,8 +34,6 @@ fn fixture_of(n: usize) -> HarnessState {
     state
 }
 
-/// The state published to the open page again (a session opened or closed),
-/// as the App's publish delivers it.
 fn republish(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -52,7 +47,6 @@ fn republish(
         .expect("dispatched");
 }
 
-/// Every button of session `id`'s row, by key, and where it is drawn.
 fn row_frames(
     pages: &[crate::native_ui::CompiledUi],
     id: u64,
@@ -70,11 +64,6 @@ fn row_frames(
     frames
 }
 
-/// NOTHING MOVES UNDER THE POINTER (design §11.5.5): on one open page, a
-/// second session opening brings the `Every session` row in AFTER every
-/// per-session row, and the first row's five buttons stay where they were
-/// drawn; a third opening, and then one closing, move neither of the first
-/// two rows' buttons either.
 #[test]
 fn the_every_row_comes_after_the_rows_and_moves_none_of_them() {
     let cx = view_cx_at(1_000.0, 1_400.0);
@@ -111,13 +100,6 @@ fn the_every_row_comes_after_the_rows_and_moves_none_of_them() {
     assert_eq!(row_frames(&pages, 8), two);
 }
 
-/// A WORD'S PRESS MOVES NO ROW (design §11.7.7): on
-/// one open page, session 7 taking its own word from Settings ▸ Harness,
-/// handing it back to the default, and session 8 taking one change only the
-/// words of their setting lines (`follows the default` ↔ `its own setting,
-/// set 14:05 from Settings ▸ Harness`): every button of the rows under them
-/// and of the `Every session` row stays where it was drawn — beside the
-/// words and stacked.
 #[test]
 fn a_words_press_moves_no_row_under_it() {
     use crate::autopilot::{SetByWords, Surface};
@@ -207,10 +189,6 @@ fn a_words_press_moves_no_row_under_it() {
     }
 }
 
-/// THE ROW SAYS WHAT IS THERE AND WHAT EACH BUTTON MOVES (design §11.5.1):
-/// `Every session` and `4 sessions: 2 cruising, 1 landing, 1 off`; Cruise,
-/// Land, Timer and Follow the default, each spoken with its count (`Land
-/// every session, 2 sessions`) and described with what stays; no Off.
 #[test]
 fn the_every_row_says_what_is_there_and_what_each_button_moves() {
     let mut state = fixture_of(4);
@@ -332,9 +310,6 @@ fn the_every_row_says_what_is_there_and_what_each_button_moves() {
     }
 }
 
-/// THE ROW'S PRESSES ARE TYPED HOST REQUESTS (design §11.5.3, item 1): each
-/// press is one `HarnessRequest::Every`, the timer's choices included; an
-/// Off or a cancel is no press of the row.
 #[test]
 fn the_every_rows_presses_are_typed_host_requests() {
     let (mut runtime, instance, view) = harness_route(fixture_of(3));
@@ -399,10 +374,6 @@ fn the_every_rows_presses_are_typed_host_requests() {
     );
 }
 
-/// THE ROW IS WHOLE ON EVERY HOST (design §11.5.1): on the 80 × 24 window's
-/// page, the shipped page and a compact one, at 1× and 2× text, the row's
-/// four buttons are drawn with their faces whole, none of them overlapping
-/// another or the row's words, and inside the card.
 #[test]
 fn the_every_row_is_whole_on_every_host() {
     for (width, height) in [
@@ -462,7 +433,6 @@ fn the_every_row_is_whole_on_every_host() {
     }
 }
 
-/// The paint node `key` draws, on whichever page draws it.
 fn painted<'a>(
     pages: &'a [crate::native_ui::CompiledUi],
     key: &str,
@@ -473,11 +443,6 @@ fn painted<'a>(
         .unwrap_or_else(|| panic!("{key} is painted on no page"))
 }
 
-/// THE ROW MOVES WITH THE ROWS ABOVE IT, SO ITS PRESSES WAIT FOR A LOOK
-/// (design §11.5.7): with sessions 7, 8 and 9 listed, the middle one
-/// closing lifts session 9's row into 8's place and the `Every session` row
-/// under it, so the bulk Land then stands exactly where session 9's Land
-/// was drawn: a still pointer there would rest on it.
 #[test]
 fn the_every_row_moves_with_the_rows_above_it_and_its_presses_wait_for_a_look() {
     let cx = view_cx_at(1_000.0, 1_400.0);
@@ -529,10 +494,6 @@ fn the_every_row_moves_with_the_rows_above_it_and_its_presses_wait_for_a_look() 
     assert!(rows.iter().all(|(_, look)| **look), "{rows:?}");
 }
 
-/// THE ROW'S TIMER OPENS UNDER ITS TIMER AND FOLLOW THE DEFAULT (design
-/// §11.5.7): beside the words, its choices stand under those two columns
-/// only, so a row above shrinking (Cruise dropping the timers' `lands at`
-/// lines) never lifts one into the place of the row's Cruise or Land.
 #[test]
 fn the_every_rows_timer_opens_under_its_timer_and_follow() {
     let mut state = fixture_of(3);
@@ -571,14 +532,6 @@ fn the_every_rows_timer_opens_under_its_timer_and_follow() {
     }
 }
 
-/// THE ROW'S TIMER CHOICES STAND IN COLUMNS WHERE THEY WRAP (the post-landing
-/// check's owner-eye-3, and its review): `1 hour`, `2 hours`, `4 hours` and
-/// `at 18:00` laid in more lines than one take one width, so each line's
-/// first and second choice start where the line above's do; beside the
-/// words that width is the row's slot, two and two, so the first column
-/// starts under the Timer and the second under Follow the default — never
-/// `at 18:00` a few points right of `2 hours`, nor the grid a few points
-/// right of Follow.
 #[test]
 fn the_every_rows_timer_choices_line_up_where_they_wrap() {
     let mut state = fixture_of(3);
@@ -682,10 +635,6 @@ fn the_every_rows_timer_choices_line_up_where_they_wrap() {
     );
 }
 
-/// WHERE IT STEERS NONE, THE ROW'S LINE IS WHOLE (design §11.5.4): under
-/// the master switch off, on the 80 × 24 window's page, the shipped page
-/// and a wide one, at 1× and 2× text, the row reads `3 sessions · harness
-/// off in Settings` whole, its reason never cut.
 #[test]
 fn the_inert_rows_line_is_whole() {
     let mut off = fixture_of(3);
@@ -719,10 +668,6 @@ fn the_inert_rows_line_is_whole() {
     );
 }
 
-/// Whether `key` is drawn whole and live on `page`: painted uncut by the
-/// list's edges and unfaded, and on the page's semantics, so a person can
-/// reach it (rows scrolled under a kept caption are marked cut on purpose,
-/// `peek`, for the paint audit: that mark says nothing of what shows).
 fn drawn_whole(page: &crate::native_ui::CompiledUi, key: &str) -> bool {
     page.semantic(&UiKey::new(key)).is_some()
         && page
@@ -731,12 +676,6 @@ fn drawn_whole(page: &crate::native_ui::CompiledUi, key: &str) -> bool {
             .any(|n| n.key.as_str() == key && n.clip == n.rect && n.fade.is_none())
 }
 
-/// THE EVERY ROW'S OPEN TIMER SHOWS ITS LAST CHOICE TO A PRESS AND TO THE
-/// KEYBOARD (the final check of 2026-10-20, F1): at 2× text on the lab's
-/// narrow page (504 × 628 pt, and heights about it), three sessions and
-/// `land_at` set, the list paged to the `Every session` row, whose block
-/// with its Timer open is taller than the room under the SESSIONS caption
-/// the list keeps over it.
 #[test]
 fn the_every_rows_open_timer_shows_its_last_choice_to_a_press_and_to_the_keyboard() {
     let mut state = fixture_of(3);
@@ -838,8 +777,6 @@ fn the_every_rows_open_timer_shows_its_last_choice_to_a_press_and_to_the_keyboar
     );
 }
 
-/// The block of row `row` (`all` for the `Every session` row) on `page`:
-/// its rect, and how much of it the list's edges leave drawn.
 fn block_of(
     page: &crate::native_ui::CompiledUi,
     row: &str,
@@ -851,11 +788,6 @@ fn block_of(
         .map(|n| (n.rect, n.clip))
 }
 
-/// A TIMER CLOSED GIVES BACK THE PLACE ITS OPENING SCROLLED (the second
-/// review of 2026-10-20, R2): at 2× text on the lab's narrow page (504 ×
-/// 628 pt, and heights about it), three sessions and `land_at` set, the list
-/// paged to the `Every session` row with its Timer closed and the row drawn
-/// whole.
 #[test]
 fn a_timer_closed_gives_back_the_place_its_opening_scrolled() {
     let mut state = fixture_of(3);
@@ -914,12 +846,6 @@ fn a_timer_closed_gives_back_the_place_its_opening_scrolled() {
     );
 }
 
-/// A SESSION ROW'S OPEN TIMER STANDS IN COLUMNS WHERE IT WRAPS (the final
-/// check of 2026-10-20, F2; owner-eye-3, which §11.13 fixed for the Every
-/// row only): `1 hour`, `2 hours`, `4 hours`, `at 18:00` and `Cancel` (a
-/// timer armed) laid in more lines than one take one width, so each line's
-/// choices start where the first line's do — `at 18:00` under `1 hour`,
-/// `Cancel` under `2 hours`.
 #[test]
 fn a_session_rows_timer_choices_line_up_where_they_wrap() {
     let mut state = fixture_of(3);
@@ -1008,12 +934,6 @@ fn a_session_rows_timer_choices_line_up_where_they_wrap() {
     );
 }
 
-/// AN OPEN TIMER'S CHOICES SHOW TOGETHER, AND WITH WHAT WAS PRESSED (the
-/// tall-row parts of 2026-10-20 meeting F1): at 2× text on narrow pages of
-/// every height from 560 to 720 pt, the `Every session` row's Timer pressed
-/// from the first screen that lists it opens with `1 hour` and `at 18:00`,
-/// its first and last choices, both drawn whole, and the Timer button it was
-/// pressed by still drawn whole.
 #[test]
 fn an_open_timers_choices_show_together_and_with_its_button() {
     let mut state = fixture_of(3);

@@ -1120,7 +1120,7 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     )
 }
 
-/// [`crate::caps`] on macOS.
+/// [`fn@crate::caps`] on macOS.
 pub(crate) fn caps() -> crate::Caps {
     use crate::{Cap, Why};
     crate::Caps {

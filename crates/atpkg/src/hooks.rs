@@ -13,8 +13,7 @@ use crate::store::Layout;
 /// The hook file base name (`00-` sorts first).
 pub const HOOK_BASENAME: &str = "00-atpkg";
 
-/// The environment variables whose union (any one non-empty) says a process runs inside an
-/// aterm session, where the managed agent programs lead.
+/// The environment variables whose union (any one non-empty) says a process runs inside an aterm session.
 pub const AGENTS_MARKERS: &[&str] = &["ATERM_AGENTS_DIR", "ATERM_CHILD", "ATERM_SESSION_ID"];
 
 /// [`AGENTS_MARKERS`] formatted as a single POSIX parameter expansion word.
@@ -177,8 +176,7 @@ pub(crate) fn hook_is_current(dest: &Path, content: &str) -> bool {
         .is_ok_and(|have| have == content.as_bytes())
 }
 
-/// What stood at a hook's destination before this pass replaced it, so the publish phase
-/// can be undone as a whole.
+/// What stood at a hook's destination before this pass replaced it.
 enum Prev {
     /// Nothing did: an unwind takes the file this pass laid back out.
     Absent,
@@ -189,8 +187,6 @@ enum Prev {
     Foreign,
 }
 
-/// Move the regular file standing at `dest` out of the way, so a later failure in the
-/// publish loop can put it back.
 fn move_aside(dest: &Path) -> Prev {
     let meta = match fs::symlink_metadata(dest) {
         Ok(meta) => meta,
@@ -211,8 +207,6 @@ fn move_aside(dest: &Path) -> Prev {
     }
 }
 
-/// Put back what stood at `dest` before this pass replaced it — or take out the file it laid
-/// where nothing stood.
 fn restore_prev(dest: &Path, prev: Prev) {
     match prev {
         Prev::Absent => {
@@ -309,7 +303,6 @@ pub(crate) fn shell_dirs_not_private(home: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Whether `meta` (an `lstat`) is a directory as `ensure_private_dir` leaves it.
 fn laid_private(meta: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -471,8 +464,6 @@ pub(crate) enum RcWiring {
     Rewire,
 }
 
-/// The pass, the rc it may create read from `home` by `creates` ([`account_login_rc`], or
-/// none).
 fn refresh_with(
     layout: &Layout,
     wiring: RcWiring,
@@ -550,8 +541,6 @@ pub fn login_rc(shell: &str, home: &Path, xdg_config: Option<&Path>) -> Option<&
 /// macOS only.
 pub(crate) const HEALS_STORE: bool = cfg!(unix) && !cfg!(target_os = "macos");
 
-/// [`refresh_with`] as the executable at `exe` (canonical) runs it, for the account whose
-/// home is `home`, healing a store when `heals_store` ([`HEALS_STORE`]).
 fn refresh_as(
     layout: &Layout,
     wiring: RcWiring,
@@ -586,7 +575,7 @@ pub fn store_dir_of(
     (resolve(&dir.join("aterm-ctl"))? == binary).then_some(dir)
 }
 
-/// Create any missing [`aterm_uds::alias::NAMES`] symlinks in `store`.
+/// Create any missing [`aterm_types::argv0::ALIASES`] symlinks in `store`.
 #[cfg(unix)]
 pub(crate) fn ensure_store_aliases(store: &Path) -> Vec<&'static str> {
     aterm_types::argv0::ALIASES
@@ -607,10 +596,6 @@ pub(crate) fn canonical(path: &Path) -> Option<std::path::PathBuf> {
     fs::canonicalize(path).ok()
 }
 
-/// [`pass_at`] as the executable at `exe` runs it: the unattended pass
-/// ([`RcWiring::HonorOptOut`]) from a bundle that is not the release `aterm.app` writes
-/// nothing ([`HookPass::NotReleaseBundle`]); the asked-for pass ([`RcWiring::Rewire`],
-/// `atpkg repair`) runs from anywhere.
 fn pass_as(
     layout: &Layout,
     home: &Path,
@@ -641,7 +626,6 @@ pub(crate) fn pass_at(
     )
 }
 
-/// [`refresh_with`] over an explicit `home` and the three managed directories.
 fn refresh_at(
     home: &Path,
     bin_dir: &Path,
@@ -726,7 +710,6 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
         return;
     }
     if !ledger.insert(entry) {
-        // already on disk
         return;
     }
     if ensure_private_dir(&home.join(".aterm")).is_err() {
@@ -1035,10 +1018,6 @@ fn ensure_command_links(home: &Path) {
     ensure_command_links_from(home, &exe);
 }
 
-/// Whether `path` lies inside a release-named `aterm.app` bundle's `Contents/MacOS`: the one
-/// spelling of "ours" for the unattended writers of shared user state, both for an existing
-/// command link's target and for the executable that writes the links
-/// ([`ensure_command_links`]) or, unattended, the shell hooks ([`refresh`]).
 fn in_release_bundle(path: &Path) -> bool {
     path.to_string_lossy()
         .contains("/aterm.app/Contents/MacOS/")
@@ -1408,8 +1387,6 @@ pub(crate) fn fish_quote(p: &Path) -> String {
     out
 }
 
-/// Render `bin_dir` for a single-quoted PowerShell string literal: only the single quote is
-/// special there (doubled to escape), so a Windows path's backslashes pass through literally.
 fn ps_quote(bin_dir: &Path) -> String {
     bin_dir.to_string_lossy().replace('\'', "''")
 }
@@ -1424,8 +1401,6 @@ fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
     })
 }
 
-/// Write `content` to `dest`'s temp sibling, born `0600` and hardened, and hand back the
-/// temp path for the caller to rename into place.
 fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
     let name = dest
         .file_name()
@@ -2583,7 +2558,6 @@ mod tests {
     fn a_retired_name_that_cannot_leave_its_folder_stays_put() {
         use std::os::unix::fs::PermissionsExt as _;
         aterm_uds::host::could_not_run_as_root("a folder whose mode lacks write");
-        /// Puts the locked folder's mode back however the test ends.
         struct Unlock(PathBuf);
         impl Drop for Unlock {
             fn drop(&mut self) {
@@ -2948,7 +2922,6 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// fish is not a POSIX shell, and its double quotes are not sh's.
     #[test]
     fn fish_quoting_escapes_fishs_metacharacters_and_leaves_a_backtick_alone() {
         let hostile = PathBuf::from("/opt/a`b/c$d/e\"f/g\\h/i j");

@@ -557,7 +557,7 @@ pub fn arm_forwarding() -> Forwarding {
 
 /// [`exec_or_run`]'s Ctrl-C rule for a holder that waits on its child (`aterm pkg lease`): [`swallow_ctrl_c`], installed after the spawn, leaves the console's Ctrl-C to the child.
 /// # Errors
-/// The wait's.
+/// The wait on `child` failing.
 pub fn wait_standing_aside(
     child: &mut aterm_uds::spawnfd::TransparentChild,
     _forwarding: Forwarding,

@@ -2559,8 +2559,30 @@ fn agent_settings(
     Some(models::model_settings_of(&Value::Object(said_below)))
 }
 
+/// Every settings document a relaunch line of `argv` in `cwd` would have Claude Code read
+/// for the tap's [`super::tap::gate`]: under the host's home, the user's `settings.json` and
+/// `cowork_settings.json` alike (the line sets no cowork flag of its own, and the shell it is
+/// typed into may), the project's, the managed ones.
 pub(super) fn tap_settings(
     opts: &Opts,
+    argv: &[String],
+    cwd: &str,
+) -> Vec<(String, super::netwatch::Source)> {
+    tap_settings_under(&opts.home, argv, cwd)
+}
+
+/// WHETHER A RELAUNCH LINE OF `argv` IN `cwd` UNDER THE USER HOME `home` FINDS ITS SETTINGS
+/// ADMIT the usage tap ([`super::tap::settings_admit`] over [`tap_settings`]'s documents):
+/// the one judgment the relaunch's gate and the Claude Code footer's reason for a missing
+/// week share, so the footer never promises a restart the relaunch's line would not tap.
+#[must_use]
+pub fn tap_settings_admit(home: &Path, argv: &[String], cwd: &str) -> bool {
+    super::tap::settings_admit(&tap_settings_under(home, argv, cwd))
+}
+
+/// [`tap_settings`] under the user home `home`.
+fn tap_settings_under(
+    home: &Path,
     argv: &[String],
     cwd: &str,
 ) -> Vec<(String, super::netwatch::Source)> {
@@ -2580,7 +2602,7 @@ pub(super) fn tap_settings(
         let env = [format!(
             "{}={}",
             super::accounts::HOMEDIR_ENV,
-            opts.home.display()
+            home.display()
         )]
         .into_iter()
         .chain(account.clone())
@@ -2596,18 +2618,14 @@ pub(super) fn tap_settings(
     let mut out: Vec<(String, super::netwatch::Source)> = Vec::new();
     for cowork in [false, true] {
         let worker = worker(cowork);
-        let sources = claude_settings::sources_under(
-            &worker,
-            Path::new(cwd),
-            managed.as_deref(),
-            Some(&opts.home),
-        )
-        .into_iter()
-        .chain(
-            managed_preferences_dir()
-                .map(|dir| claude_settings::managed_preferences(&worker, &dir))
-                .unwrap_or_default(),
-        );
+        let sources =
+            claude_settings::sources_under(&worker, Path::new(cwd), managed.as_deref(), Some(home))
+                .into_iter()
+                .chain(
+                    managed_preferences_dir()
+                        .map(|dir| claude_settings::managed_preferences(&worker, &dir))
+                        .unwrap_or_default(),
+                );
         for source in sources {
             if !out.iter().any(|(name, _)| *name == source.name) {
                 out.push((source.name, source.text.into()));

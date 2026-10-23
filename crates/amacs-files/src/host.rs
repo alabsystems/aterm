@@ -328,7 +328,7 @@ impl Default for AdmitOptions {
     }
 }
 
-/// The blocking half of [`DocumentGrantStore::open_local`].
+/// The blocking half of `DocumentGrantStore::open_local`.
 pub fn admit_local_file(
     uri: &str,
     limit: usize,
@@ -2414,7 +2414,7 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// `normalize_process_temp_root` admits a temp-rooted document end to end.
+    /// A temp-rooted document, as `normalize_process_temp_root` rewrites it, admits end to end.
     #[test]
     fn component_walk_admits_a_process_temporary_root_path() {
         let path = unique_file("temporary-walk", b"walk\n");

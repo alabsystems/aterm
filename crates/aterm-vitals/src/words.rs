@@ -74,7 +74,6 @@ pub fn disk(bytes: u64) -> String {
     }
 }
 
-/// `rising` / `easing` after a figure, or nothing while steady.
 fn motion_suffix(m: Motion) -> String {
     m.word().map(|w| format!(", {w}")).unwrap_or_default()
 }
@@ -183,11 +182,8 @@ pub fn cores_figure(level: f32, total: Option<usize>, motion: Motion) -> String 
     s
 }
 
-/// A gibibyte, bytes.
 const GIB: f64 = 1_073_741_824.0;
-/// A mebibyte, bytes.
 const MIB: f64 = 1_048_576.0;
-/// Decimal units by power of 1000, from bytes up (v2 §6.0).
 const DEC_UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
 
 /// Target OS platform for platform-specific resource wording.
@@ -196,8 +192,7 @@ pub enum Platform {
     /// macOS.
     #[default]
     MacOs,
-    /// Linux: the load average counts threads waiting on disk too, the
-    /// process limits count threads, and no process's write counter is read.
+    /// Linux: the load average counts threads waiting on disk too, the process limits count threads, and no process's write counter is read.
     Linux,
     /// Windows.
     Windows,
@@ -235,15 +230,12 @@ impl Platform {
         }
     }
 
-    /// Whether its process limits, and so the Processes row, count threads.
     const fn counts_threads(self) -> bool {
         matches!(self, Self::Linux)
     }
 }
 
-/// What other users' processes are called on the OS family `family` (`macOS`,
-/// [`Platform::name`]): the split's services part, in `sys why` and the
-/// lens's Why now alike.
+/// What other users' processes are called on the OS family `family` (`macOS`, [`Platform::name`]).
 #[must_use]
 pub fn services_word(family: &str) -> &'static str {
     match family {
@@ -258,8 +250,7 @@ pub fn services_word(family: &str) -> &'static str {
 pub struct Locale {
     /// Whose wording.
     pub platform: Platform,
-    /// The local time's offset from UTC, seconds east: times print as local
-    /// `HH:MM`.
+    /// The local time's offset from UTC, seconds east: times print as local `HH:MM`.
     pub utc_offset_s: i64,
 }
 
@@ -309,11 +300,9 @@ pub enum Mark {
 /// Amount-column width ladder (`Det`, `Cols`, `NoCols`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ladder {
-    /// Details shows (wide, mid with Details, fwide with Details), so the
-    /// amount never repeats a Details figure.
+    /// Details shows (wide, mid with Details, fwide with Details).
     Det,
-    /// The aterm and Tab columns show but Details does not (mid, narrow,
-    /// fwide).
+    /// The aterm and Tab columns show but Details does not (mid, narrow, fwide).
     Cols,
     /// No scope columns (slim, fmid, fnarrow).
     NoCols,
@@ -324,8 +313,7 @@ pub enum Ladder {
 pub struct Clause {
     /// Its forms, longest first.
     pub forms: Vec<String>,
-    /// The clause as a sentence a screen reader says and ⌘C copies: units
-    /// spelled out and marks said as words (v2 §12).
+    /// The clause as a sentence a screen reader says and ⌘C copies.
     pub spoken: String,
     /// Its priority, 0 first: rule D folds the highest number first.
     pub prio: u8,
@@ -338,8 +326,6 @@ pub struct Clause {
 }
 
 impl Clause {
-    /// A clause of `forms` (longest first) at `prio`, in words ink, said as
-    /// its longest form.
     fn new(prio: u8, forms: Vec<String>) -> Self {
         let spoken = sentence(&speak(forms.first().map_or("", String::as_str)));
         Self {
@@ -380,14 +366,11 @@ pub struct StateWords {
     pub state: State,
     /// The state's clause, longest first (rule S tiers 1 and 3).
     pub clauses: Vec<String>,
-    /// The state in a word or two (tiers 2 and 4): `warn`, `low`, `full ~34
-    /// min`, `1 stuck`.
+    /// The state in a word or two (tiers 2 and 4): `warn`, `low`, `full ~34 min`, `1 stuck`.
     pub word: String,
-    /// The fslim header's label, drawn after the mark: `Disk low`, `Memory
-    /// warn`, `1 stuck` (Processes names itself through its mark and word).
+    /// The fslim header's label, drawn after the mark: `Disk low`, `Memory warn`, `1 stuck`.
     pub label: String,
-    /// The amount forms drawn before the state, longest first: the compact
-    /// ladder, without the freed figure the state outranks.
+    /// The amount forms drawn before the state, longest first.
     pub amount_forms: Vec<String>,
     /// The mark.
     pub mark: Mark,
@@ -398,8 +381,7 @@ pub struct StateWords {
 /// Candidate text forms (longest first) and ink for an `aterm` or `Tab` scope cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeCell {
-    /// The forms, longest first. A figure that does not fit shortens its
-    /// number, never its label.
+    /// The forms, longest first.
     pub forms: Vec<String>,
     /// Its ink: words for a figure, words2 for a phrase saying there is none.
     pub ink: InkKind,
@@ -430,21 +412,16 @@ pub struct Parts {
     pub unit: &'static str,
 }
 
-/// `v` rounded half up to a whole number (v2 §6.0).
 fn half_up(v: f64) -> f64 {
-    // The nudge rounds a half that binary floating point stores a hair low
-    // (12.5 % of 0.125 as 12.499…) up, as the reader expects.
     (v + 0.5 + 1e-9).floor()
 }
 
-/// `v` (at least 0) with `dec` decimals, rounded half up: `2.25` is `2.3`.
 fn fixed(v: f64, dec: usize) -> String {
     let scale = 10f64.powi(dec as i32);
     let r = half_up(v.max(0.0) * scale) / scale;
     format!("{r:.dec$}")
 }
 
-/// `n` units of `10^-dec` with `dec` decimals: `point(89, 2)` is `0.89`.
 fn point(n: u64, dec: u32) -> String {
     if dec == 0 {
         return n.to_string();
@@ -453,9 +430,6 @@ fn point(n: u64, dec: u32) -> String {
     format!("{}.{:0w$}", n / p, n % p, w = dec as usize)
 }
 
-/// `bytes` rounded half up to three significant digits: the significand
-/// (100..=999, or `bytes` itself under 100) and the power of ten of its last
-/// digit.
 fn sig3(bytes: u64) -> (u64, u32) {
     if bytes < 100 {
         return (bytes, 0);
@@ -470,8 +444,6 @@ fn sig3(bytes: u64) -> (u64, u32) {
     }
 }
 
-/// A significand from [`sig3`] in its decimal unit: the figure's decimals
-/// and the unit.
 fn sig_unit(sig: u64, e: u32) -> (u32, &'static str) {
     if sig < 100 && e == 0 {
         return (0, DEC_UNITS[0]);
@@ -494,8 +466,6 @@ pub fn grouped(n: u64) -> String {
     out
 }
 
-/// A rate's number (v2 §6.0): one decimal under 100 (`2.1`), whole and
-/// grouped from 100 (`410`, `9,999`).
 fn rate_figure(v: f64) -> String {
     let one = half_up(v.max(0.0) * 10.0) / 10.0;
     if one < 100.0 {
@@ -505,9 +475,6 @@ fn rate_figure(v: f64) -> String {
     }
 }
 
-/// A rate's number printed alone, not against a capacity (v2 §6.0): one
-/// decimal under 10 (`5.1`, `0.2`), whole and grouped from 10 (`38`,
-/// `410`), as [`bytes_lone`] prints bytes.
 fn rate_lone(v: f64) -> String {
     let one = half_up(v.max(0.0) * 10.0) / 10.0;
     if one < 10.0 {
@@ -648,7 +615,6 @@ pub fn clock(at_unix_ms: i64, now_unix_ms: i64, utc_offset_s: i64) -> String {
     if day == local(now_unix_ms).div_euclid(86_400) {
         hm
     } else {
-        // 1970-01-01 was a Thursday.
         format!("{} {hm}", WEEKDAYS[(day + 3).rem_euclid(7) as usize])
     }
 }
@@ -667,13 +633,10 @@ pub const fn resource_name(res: Resource) -> &'static str {
     }
 }
 
-/// `one` for a count of 1, else `many`.
 fn plural(n: u64, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
 }
 
-/// A growth rate per minute: `1.2 GB/min`, or `4.2 MB/min` under a tenth of
-/// a gigabyte.
 fn per_minute(bytes_per_s: f64) -> String {
     let per_min = bytes_per_s * 60.0;
     if per_min >= 0.95e8 {
@@ -683,8 +646,6 @@ fn per_minute(bytes_per_s: f64) -> String {
     }
 }
 
-/// The forms of a figure printed as `a of b` (Det), both (Cols) or `a/b`
-/// (NoCols).
 fn of_slash(ladder: Ladder, of: String, slash: String) -> Vec<String> {
     match ladder {
         Ladder::Det => vec![of],
@@ -764,7 +725,6 @@ fn memory_amount(view: &ResourceView, ladder: Ladder) -> Vec<String> {
     }
 }
 
-/// Today's aterm-freed bytes, while the watch runs and freed some.
 fn freed_today(facts: &RowFacts) -> Option<u64> {
     facts
         .disk
@@ -775,8 +735,6 @@ fn freed_today(facts: &RowFacts) -> Option<u64> {
         .filter(|&b| b > 0)
 }
 
-/// The Disk amount's shapes: `1.11 of 2.00 TB used` and `1.11/2.00 TB used`
-/// where the volume's size is known, and `1.11 TB used` alone.
 fn disk_shapes(view: &ResourceView) -> Option<(Option<(String, String)>, String)> {
     let used = view.now?.max(0.0) as u64;
     let alone = format!("{} used", bytes_dec(used));
@@ -818,8 +776,6 @@ fn disk_amount(view: &ResourceView, freed: Option<u64>, ladder: Ladder) -> Vec<S
     }
 }
 
-/// What a peak basis is called in an amount: `peak`, or `link` while the
-/// network learns its peak on the link's rate.
 fn basis_word(basis: CapBasis) -> Option<&'static str> {
     match basis {
         CapBasis::Peak => Some("peak"),
@@ -828,8 +784,6 @@ fn basis_word(basis: CapBasis) -> Option<&'static str> {
     }
 }
 
-/// Whether a two-series row's second series binds: Network's send
-/// direction, Processes' own-user count.
 fn second_binds(view: &ResourceView) -> bool {
     view.second.as_ref().is_some_and(|s| s.binds)
 }
@@ -998,10 +952,6 @@ fn scope_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
     }
 }
 
-/// A scope's writes (v2 §6.4), a rate printed alone ([`rate_lone`]):
-/// `writes 38 MB/s`, `writes 5.1 MB/s`, `writes 0` under 0.05 MB/s; from
-/// 100 MB/s the number shortens and the label stays (`writes 410 MB/s`,
-/// `writes 0.41 GB/s`, `writes 0.4 GB/s`).
 fn writes_forms(bytes_per_s: f64) -> Vec<String> {
     let mb = bytes_per_s / 1e6;
     if mb < 0.05 {
@@ -1020,7 +970,6 @@ fn writes_forms(bytes_per_s: f64) -> Vec<String> {
     forms
 }
 
-/// The mark and ink a row's state puts in its well (v2 §6.0 "Well", §9.3).
 fn state_mark(res: Resource, state: State) -> (Mark, InkKind) {
     let level = if res == Resource::Disk {
         Mark::Low
@@ -1054,7 +1003,7 @@ pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     })
 }
 
-/// Strip-spanning status sentence forms when a resource has no live cells (e.g., idle GPU or no agents).
+/// Strip-spanning status sentence forms when a resource has no live cells.
 #[must_use]
 pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     let view = &snap.resources[res.index()];
@@ -1077,8 +1026,6 @@ pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     }
 }
 
-/// One of the Disk row's states as the words say it (v2 §6.4), in Details
-/// order.
 struct DiskSaid {
     state: State,
     forms: Vec<String>,
@@ -1089,8 +1036,6 @@ struct DiskSaid {
     mark: Option<Mark>,
 }
 
-/// The home volume's free bytes now: the latest reading, else the row's
-/// capacity less its "now".
 fn disk_free(snap: &Snapshot) -> Option<u64> {
     let view = &snap.resources[Resource::Disk.index()];
     snap.volume
@@ -1100,7 +1045,6 @@ fn disk_free(snap: &Snapshot) -> Option<u64> {
         .or_else(|| Some((view.capacity? - view.now?).max(0.0) as u64))
 }
 
-/// A volume's level clause and word (v2 §6.4): `low, 41 GB free` / `low`.
 fn level_words(level: DiskLevel, free: Option<u64>) -> Option<(State, String, String)> {
     let free = free.map(|b| format!(", {} free", bytes_lone(b)));
     let free = free.as_deref().unwrap_or("");
@@ -1122,9 +1066,6 @@ fn level_words(level: DiskLevel, free: Option<u64>) -> Option<(State, String, St
     Some((state, form, word.into()))
 }
 
-/// The Disk row's states in Details order (v2 §6.4): filling within the
-/// hour, then the home volume's level, other volumes, sessions stuck on a
-/// full disk and a stalled watch.
 fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
     let facts = &snap.facts;
     let mut out = Vec::new();
@@ -1206,7 +1147,6 @@ fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
     out
 }
 
-/// The Processes row's job marks, worst first (v2 §6.7).
 struct JobSaid {
     state: State,
     mark: Mark,
@@ -1214,8 +1154,6 @@ struct JobSaid {
     words: String,
 }
 
-/// The jobs engine's marks in the well's order, each with its count: `1
-/// stuck`, `3 zombies`, `2 quiet`, `1 waiting for you`, `1 stopped`.
 fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
     let Some(jobs) = snap.jobs.as_deref() else {
         return Vec::new();
@@ -1257,7 +1195,6 @@ fn job_marks(snap: &Snapshot) -> Vec<JobSaid> {
     .collect()
 }
 
-/// `n` times as a reader says it: `once`, `twice`, `3 times`.
 fn times_words(n: u64) -> String {
     match n {
         1 => "once".into(),
@@ -1380,9 +1317,6 @@ fn cpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     out
 }
 
-/// The cause the cause engine holds for the Deck (RD §4.1, p1 ahead of
-/// busiest, so it folds after it): `∵ Spotlight, after start-up`, short
-/// `∵ Spotlight` ([`deck_cause`]). Said "Why: …".
 fn cause(snap: &Snapshot) -> Option<Clause> {
     let c = deck_cause(snap)?;
     let long = cause_words(c.word, c.context);
@@ -1393,9 +1327,7 @@ fn cause(snap: &Snapshot) -> Option<Clause> {
     )
 }
 
-/// A cause's words `base`, with the context that times it (RD §4.1):
-/// `Spotlight, after start-up`, `…, since wake`; any other context adds
-/// none. The one source of these words for the Deck, `sys why` and Why now.
+/// A cause's words `base`, with the context that times it (RD §4.1).
 #[must_use]
 pub fn cause_words(base: &str, context: Option<Context>) -> String {
     match context {
@@ -1405,9 +1337,6 @@ pub fn cause_words(base: &str, context: Option<Context>) -> String {
     }
 }
 
-/// The busiest program now (v2 §6.1 p1), its processes over the whole sweep
-/// grouped by name ([`RowFacts::busiest`]): `busiest rustc ×9 in Tab 3, 5.9
-/// cores`.
 fn busiest(snap: &Snapshot) -> Option<Clause> {
     let g = snap.facts.busiest.as_ref().filter(|g| g.cores >= 0.05)?;
     let place = match g.scope {
@@ -1590,8 +1519,6 @@ fn disk_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     out
 }
 
-/// The Disk row's growth over the last 10 minutes (v2 §6.4 p4): `+2.6 GB in
-/// 10 min`, `−1.2 GB in 10 min`, or `steady` under a tenth of a gigabyte.
 fn growth(delta: f64) -> Clause {
     if delta.abs() < 1e8 {
         return Clause::new(4, vec!["steady".into()])
@@ -1609,8 +1536,6 @@ fn growth(delta: f64) -> Clause {
     ))
 }
 
-/// Network's learning clause (v2 §6.5 p0), while its capacity is the link's
-/// because 24 hours are not yet read.
 fn network_learning(snap: &Snapshot) -> Option<Clause> {
     let view = &snap.resources[Resource::Network.index()];
     if !matches!(view.basis, CapBasis::Link | CapBasis::Learning)
@@ -1851,7 +1776,6 @@ pub fn disk_space_line(v: &VolumeSample) -> String {
     )
 }
 
-/// Unit symbols a reader spells out: the symbol, its plural and its singular.
 const SPOKEN_UNITS: [(&str, &str, &str); 13] = [
     ("TB", "terabytes", "terabyte"),
     ("GB", "gigabytes", "gigabyte"),
@@ -1887,10 +1811,6 @@ pub fn speak(text: &str) -> String {
     out.join(" ")
 }
 
-/// A figure as a reader says it: `~34` "about 34", `12%` "12 percent",
-/// `<1%` "less than 1 percent", `3.1k` "3.1 thousand", `1.2M` "1.2 million",
-/// `3.1k/min` "3.1 thousand per minute", `2.1/11.8` "2.1 of 11.8", `≥` "at
-/// least".
 fn speak_figure(w: &str) -> String {
     let digit = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
     if w == "≥" {
@@ -1923,8 +1843,6 @@ fn speak_figure(w: &str) -> String {
     w.to_string()
 }
 
-/// `s` as a sentence: a capital first letter (but `aterm` is never
-/// capitalised) and a closing full stop.
 fn sentence(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 1);
     let mut chars = s.chars();
@@ -1942,7 +1860,6 @@ fn sentence(s: &str) -> String {
     out
 }
 
-/// What a row's % is a share of, in words (v2 §12).
 fn capacity_words(res: Resource, view: &ResourceView) -> &'static str {
     match (res, view.basis) {
         (Resource::Network, CapBasis::Peak) => "its 7-day peak",
@@ -1954,7 +1871,6 @@ fn capacity_words(res: Resource, view: &ResourceView) -> &'static str {
     }
 }
 
-/// The amount as sentence 1 says it: the Details-showing form, spoken.
 fn spoken_amount(res: Resource, view: &ResourceView, facts: &RowFacts, loc: &Locale) -> String {
     match res {
         Resource::Network => {
@@ -1991,8 +1907,6 @@ fn spoken_amount(res: Resource, view: &ResourceView, facts: &RowFacts, loc: &Loc
     }
 }
 
-/// The scopes as sentence 2 says them: `aterm 6.8 cores, Tab 2 0.1 cores.`,
-/// `No per-app figure.`, `Tab 2 has no agent.`
 fn scope_sentences(
     res: Resource,
     view: &ResourceView,
@@ -2030,9 +1944,6 @@ fn scope_sentences(
     out
 }
 
-/// The last 10 minutes as sentence 3 says them (v2 §12): the trend from the
-/// first minute's mean to the last's, a peak well above now, the minutes
-/// over capacity and the minutes not read.
 fn trend_sentences(view: &ResourceView, now_ms: i64, loc: &Locale) -> Vec<String> {
     const COLS: usize = 60;
     let heat = view.heat_columns(10, COLS, now_ms);
@@ -2088,9 +1999,6 @@ fn trend_sentences(view: &ResourceView, now_ms: i64, loc: &Locale) -> Vec<String
     out
 }
 
-/// `n` of the last 10 minutes' 60 columns of 10 s as sentence 3 counts
-/// them: seconds under a minute (`30 seconds`), else whole minutes rounded
-/// half up (`2`), and all 10 only when every column counts.
 fn of_ten_minutes(n: usize) -> String {
     match n {
         0..6 => format!("{} seconds", n * 10),
@@ -2270,7 +2178,6 @@ mod tests {
     use crate::ring::Cell;
     use std::sync::Arc;
 
-    /// 10:40:00 UTC on Wednesday 2026-10-14, unix ms.
     const NOW: i64 = 1_791_974_400_000;
     const MIN_MS: i64 = 60_000;
     const MAC: Locale = Locale {
@@ -2282,7 +2189,6 @@ mod tests {
         utc_offset_s: 0,
     };
 
-    /// A row reading `now` of `capacity`, its heat their ratio.
     fn row(now: f64, capacity: f64) -> ResourceView {
         ResourceView {
             now: Some(now),
@@ -2292,8 +2198,6 @@ mod tests {
         }
     }
 
-    /// `view` with ten minutes of steady readings of its "now", the last
-    /// `over` of them over its maximum.
     fn steady(mut view: ResourceView, over: usize) -> ResourceView {
         let v = view.now;
         view.ring = (0..60)
@@ -2331,7 +2235,6 @@ mod tests {
         }
     }
 
-    /// A snapshot read once at [`NOW`] with tabs 2 and 3 (keys 2 and 3).
     fn snap() -> Snapshot {
         let tab = |key: u64| TabView {
             key,
@@ -2350,8 +2253,6 @@ mod tests {
         s.resources[res.index()] = view;
     }
 
-    /// Facts read with the snapshot whose Deck clause names Spotlight in
-    /// `context`, as the cause engine holds it.
     fn spotlight(context: Option<Context>) -> Option<Arc<WhyFacts>> {
         Some(Arc::new(WhyFacts {
             lane: CoalLane::On,
@@ -2364,7 +2265,6 @@ mod tests {
         }))
     }
 
-    /// The facts of a disk watch that judged the home volume at `level`.
     fn watch(level: DiskLevel) -> DiskFacts {
         DiskFacts {
             level: Some(level),
@@ -2376,9 +2276,6 @@ mod tests {
         }
     }
 
-    /// The trouble mockup's Disk row: 1.96 of 2.00 TB used, full in ~34 min
-    /// at 1.2 GB/min, low, two sessions stuck, 41.2 GB freed today, used
-    /// grew 2.6 GB in 10 min, the biggest folder ~/aterm/target.
     fn disk_trouble() -> Snapshot {
         let mut s = snap();
         let total = 2_000_000_000_000u64;
@@ -2417,7 +2314,6 @@ mod tests {
         s
     }
 
-    /// A job of `verdict` in tab 2.
     fn job(id: &str, verdict: Verdict) -> JobRow {
         JobRow {
             id: id.into(),
@@ -2450,8 +2346,6 @@ mod tests {
         }
     }
 
-    /// 897 of 16,000 processes, 578 of them this user's of 10,666; one job
-    /// stuck, two quiet, and one zombie in tab 2.
     fn processes_trouble() -> Snapshot {
         let mut s = snap();
         let mut view = row(897.0, 16_000.0);
@@ -2478,11 +2372,6 @@ mod tests {
         s
     }
 
-    /// One row of every resource, as the T-V8 ladders read them: 17.7 of 18
-    /// cores, GPU busy 12 %, 42.1 of 128 GiB, 1.11 of 2.00 TB with 41.2 GB
-    /// freed, 2.1 of 11.8 MB/s down (0.3 of 4.2 up), aterm 3.1k of 9.0k
-    /// tokens a minute, and 897 of 16,000 processes (3,412 of 126,592
-    /// threads on Linux).
     fn ladder_rows(loc: &Locale) -> Vec<(Resource, ResourceView)> {
         let mut net = row(2.1e6, 11.8e6);
         net.basis = CapBasis::Peak;
@@ -3016,10 +2905,8 @@ mod tests {
         }
     }
 
-    /// A clause's priority, keep flag, mark, ink and forms.
     type Shape = (u8, bool, Option<Mark>, InkKind, Vec<String>);
 
-    /// Each clause's [`Shape`].
     fn shape(clauses: &[Clause]) -> Vec<Shape> {
         clauses
             .iter()
@@ -3370,11 +3257,6 @@ mod tests {
         assert!(details(Resource::Gpu, &s, &MAC).is_empty());
     }
 
-    /// The Deck's cause clause (RD §4.1): p1 after the load and before
-    /// busiest (both p1, stably sorted, so it folds after busiest), marked ∵,
-    /// its long form naming the context that times it (start-up or wake, none
-    /// for the machine's), said "Why: …"; none without facts, without a
-    /// clause, or once the facts are older than 15 s, and never a state.
     #[test]
     fn cpu_details_name_the_cause_after_load_and_before_busiest() {
         let mut s = snap();

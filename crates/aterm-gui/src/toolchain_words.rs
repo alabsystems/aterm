@@ -14,46 +14,50 @@ use atpkg::progress::{PROGRESS_VERSION, Phase, sanitize_for_tty};
 
 /// The supersede key every report about one pass carries: announcement, live meter, and the installed / ended / failed records.
 pub(crate) const KEY_PASS: &str = "toolchain.pass";
+
 /// The managed-current record's key.
 pub(crate) const KEY_MANAGED: &str = "toolchain.managed";
+
 /// A routine pass planned at least this many bytes is very heavy system use.
 pub(crate) const HEAVY_PASS_BYTES: u64 = 250_000_000;
+
 /// The prefix of a machine-settings item's key: `toolchain.machine.` plus the item's first word (`universal-control`).
 pub(crate) const KEY_MACHINE_PREFIX: &str = "toolchain.machine.";
 
-/// Cap on a sanitized failure reason inside a row.
 const ERROR_CAP: usize = 60;
-/// Cap on a program name inside a row (the store's own names are short).
+
 const NAME_CAP: usize = 24;
 
 /// The first-run toolchain row's title, the one noun on every surface.
 pub(crate) const INSTALLING_ALAB: &str = "Installing ALab tools";
+
 /// A heavy routine pass's live row: the same noun, and the verb says it updates what is already there.
 pub(crate) const UPDATING_ALAB: &str = "Updating ALab tools";
+
 /// The toolchain records' titles, one per outcome, so `appstatus` and the log tell a deferral, a failure and an install apart by title.
 pub(crate) const PACKAGES_POSTPONED: &str = "ALab tools update postponed";
 pub(crate) const PACKAGES_INSTALLED: &str = "ALab tools installed";
+
 /// A pass that ended well with no roster (`seed-done:`).
 pub(crate) const PACKAGES_FINISHED: &str = "ALab tools checked";
 pub(crate) const PACKAGES_FAILED: &str = "Couldn't update ALab tools";
+
 /// A first run that failed (its row and record): it was an install, not an update.
 pub(crate) const ALAB_INSTALL_FAILED: &str = "Couldn't install ALab tools";
+
 /// A pass that ended with no ALab tools on disk and no failure seen (the set excluded, a clean exit over an empty store).
 pub(crate) const PACKAGES_NOT_INSTALLED: &str = "Couldn't install any ALab tools";
+
 /// Nothing to install on this machine, as a fact (nothing published for its architecture, or every program removed on purpose).
 pub(crate) const PACKAGES_UNAVAILABLE: &str = "No ALab tools to install";
 
-/// `⇣` — a pass moving bytes.
 const DOWN: char = '\u{21e3}';
-/// `ℹ`, a record of the lane at work (a pass put off, a machine setting a pass
-/// changed): a record wears its outcome's mark, not a moving row's.
+
 const NOTED: char = '\u{2139}';
 
 /// The pass name and start stamp that identify one `progress.json` writer, so a live meter is clamped to its own pass's high-water mark ([`snapshot_words`]).
 pub(crate) type PassId = (String, u64);
 
-/// The machine-settings records' capsule: Settings ▸ Security, where the
-/// `[machine]` settings and the This Mac status are ([`machine_settings`]).
 fn security() -> Intent {
     Intent::OpenSettings {
         route: crate::native_settings::SettingsRoute::Security
@@ -62,8 +66,6 @@ fn security() -> Intent {
     }
 }
 
-/// The `Packages` capsule every other toolchain record carries, pointing at the
-/// page that holds the durable record.
 fn packages() -> Intent {
     Intent::OpenSettings {
         route: crate::native_settings::SettingsRoute::Packages
@@ -72,14 +74,10 @@ fn packages() -> Intent {
     }
 }
 
-/// A glyph from the band's closed set. A test checks every glyph this module
-/// names is in it, so the fallback is unreachable here.
 fn glyph(ch: char) -> Glyph {
     Glyph::or_fallback(ch)
 }
 
-/// A toolchain record's row: the `Packages` capsule, classified a record
-/// ([`Message::record`]: `Hold::LogOnly`, never on glass).
 fn row(severity: Severity, title: impl AsRef<str>) -> Message {
     Message::new(tags::TOOLCHAIN, severity, title)
         .action(packages())
@@ -99,10 +97,6 @@ pub(crate) fn held_row(record: &Message) -> Message {
     row
 }
 
-/// A live toolchain row (the first run's announcement and meter, a heavy
-/// routine pass) with no capsule: work in flight is not a decision, so
-/// `Details ›` leads, and the cells a `Packages` chip would take keep the title
-/// whole at 60 columns and `Details ›` whole at 80.
 fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
     Message::new(tags::TOOLCHAIN, Severity::Info, title)
         .loads(PASS_LOADS)
@@ -113,14 +107,10 @@ fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
 /// The loads a pass row may show over its life ([`pass_load`] and the announcement's network).
 pub(crate) const PASS_LOADS: [Load; 3] = [Load::Network, Load::Disk, Load::Cpu];
 
-/// A toolchain record: logged and listed by `appstatus` as a
-/// finished activity (`outcome=warn` ⇔ Warn), never on glass.
 fn record(severity: Severity, title: impl AsRef<str>, detail: String) -> Message {
     row(severity, title).line(detail)
 }
 
-/// A record whose detail is atpkg's sentence, kept whole across lines: no
-/// reporter pre-cuts a sentence it received, and a record is never painted.
 fn whole_record(severity: Severity, title: &str, detail: &str) -> Message {
     row(severity, title).sentence(detail)
 }
@@ -244,8 +234,6 @@ pub(crate) fn deferred(detail: &str) -> Message {
     whole_record(Severity::Info, PACKAGES_POSTPONED, detail).glyph(glyph(NOTED))
 }
 
-/// Where the installed programs are used, when nothing narrows it: the one
-/// clause the installed record and the managed-current record share.
 const READY_IN_EVERY_TAB: &str = "ready in every aterm tab";
 
 /// Why the installed programs reach no tab of this window, from the recorded shell-integration outcome (`spawn::shell_integration_outcome`), or `None` when the integration runs (or no shell was prepared).
@@ -359,24 +347,18 @@ pub(crate) fn unusable(what: &str) -> Message {
     }
 }
 
-/// Nothing to install on this machine, and no failure: an Info record, "No ALab
-/// tools to install", atpkg's sentence kept whole as its detail.
 fn unavailable(what: &str) -> Message {
     whole_record(Severity::Info, PACKAGES_UNAVAILABLE, what)
         .glyph(glyph(NOTED))
         .key(KEY_PASS)
 }
 
-/// The Warn record [`failed`] and [`not_installed`] share: keyed to the pass,
-/// the `Packages` capsule, the reason as whole lines ([`whole_reason`]).
 fn bad_outcome(title: &str, what: &str) -> Message {
     row(Severity::Warn, title)
         .lines(whole_reason(what))
         .key(KEY_PASS)
 }
 
-/// A failure's reason, kept whole: a child that died after announcing leaves
-/// only its stderr.
 fn whole_reason(what: &str) -> Vec<String> {
     what.lines()
         .flat_map(|l| aterm_messages::text::split_sentence(l, DETAIL_LINE_CAP))
@@ -388,14 +370,11 @@ fn whole_reason(what: &str) -> Vec<String> {
 pub(crate) enum FirstRunShort {
     /// `seed-failed:` / `net-failed:` (or a pass that could not launch).
     Failed,
+
     /// `seed-nothing:` or a non-informational `seed-unusable:`: the pass ran and nothing is installed.
     Nothing,
 }
 
-/// A cause the person can act on themselves, so its own words are painted: a
-/// full disk, or atpkg's up-front refusal for one (`not enough disk space:
-/// needs … free, … free here (… short)`, matched by its head,
-/// [`atpkg::flow::DISK_REFUSAL_HEAD`]: the window and atpkg are one binary).
 fn actionable_cause(cause: &str) -> bool {
     let lower = cause.to_ascii_lowercase();
     [
@@ -435,8 +414,6 @@ pub(crate) fn appnotice(tag: Tag, text: &str) -> Message {
     }
 }
 
-/// `Claude Code 2.1.267 installed` from `aterm pkg install claude: 2.1.267
-/// installed`; `None` for text in any other shape.
 fn installed_words(text: &str) -> Option<String> {
     let rest = text.strip_prefix("aterm pkg install ")?;
     let (program, outcome) = rest.split_once(": ")?;
@@ -449,8 +426,6 @@ fn installed_words(text: &str) -> Option<String> {
         .then(|| format!("{name} {version} installed"))
 }
 
-/// The program as a person knows it: a vendor program's product from atpkg's
-/// table (`claude` is Claude Code), any other name verbatim (`gemini`).
 fn known_as(program: &str) -> &str {
     atpkg::vendor_direct::spec(program).map_or(program, |spec| spec.product)
 }
@@ -507,8 +482,10 @@ pub(crate) fn managed_current_for(
 pub(crate) struct ManagedItem {
     /// atpkg's name (`claude`).
     pub(crate) name: String,
+
     /// Its version, empty when the wire names none.
     pub(crate) version: String,
+
     /// `None` while it is its vendor's head (`(<Vendor> latest)`, an older atpkg's `(build <N>)`, or no parenthesis).
     pub(crate) standing: Option<String>,
 }
@@ -548,12 +525,16 @@ pub(crate) fn managed_items(text: &str) -> Vec<ManagedItem> {
 pub(crate) struct TabsBehind {
     /// Tabs whose shell runs a frozen PATH (measured, or carried and not yet measured) with no agent in front.
     pub(crate) frozen_shells: usize,
+
     /// Frozen tabs whose foreground is an agent that the live upgrade is not moving.
     pub(crate) frozen_agents: usize,
+
     /// Running agent sessions on a build older than the version this record names for their program that the live upgrade moves on.
     pub(crate) agents_behind: PerAgent,
+
     /// Running agent sessions running a build older than that version that will not move on their own.
     pub(crate) agents_held: PerAgent,
+
     /// Live tabs with no adoption mark whose shell's PATH was measured, two jobs in a row, to put a foreign copy of an agent program first (`SessionTimeline::path_settled_frozen`).
     pub(crate) shadowed: usize,
 }
@@ -578,14 +559,10 @@ impl PerAgent {
         each
     }
 
-    /// Every agent's sessions together.
     fn total(self) -> usize {
         self.0.iter().sum()
     }
 
-    /// Each agent's product name and count, Claude Code first and then in
-    /// [`Agent::ALL`](aterm_agent::harness::upgrade::Agent::ALL)'s order: the
-    /// order the record says them in.
     fn each(self) -> impl Iterator<Item = (&'static str, usize)> {
         aterm_agent::harness::upgrade::Agent::ALL
             .into_iter()
@@ -620,12 +597,6 @@ pub(crate) fn managed_current_words(
     )
 }
 
-/// The managed-current title over `items`, `None` when there are none. Every
-/// program is named: those at their vendor's head first, "current" (or
-/// "installed" while an agent session runs an older build, `lagging`), then the
-/// others grouped by what is said of them (`Claude Code 2.1.287 and Muse Code
-/// 1.4.9-R6297.1 not checked`). Versions are shown as `current_versions` and
-/// `other_versions` say; the parenthesis never is.
 fn managed_title(
     items: &[ManagedItem],
     lagging: bool,
@@ -670,7 +641,6 @@ fn managed_title(
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-/// `words` as a person reads a list: `a`, `a and b`, `a, b and c`.
 fn and_list(words: &[String]) -> String {
     match words {
         [] => String::new(),
@@ -851,8 +821,10 @@ pub(crate) fn machine_setting_words(item: &str) -> (String, String) {
 pub(crate) struct Foreign {
     /// The seam (`trust`) or the managed program a copy stands before.
     pub(crate) name: String,
+
     /// The entry or copy that is not aterm's.
     pub(crate) path: String,
+
     /// atpkg's fix sentence.
     pub(crate) fix: String,
 }
@@ -942,6 +914,7 @@ pub(crate) fn foreign_tools_entry(
 pub(crate) enum CToolchain {
     /// `missing`: no toolchain is installed (on a Mac, no Command Line Tools).
     Missing,
+
     /// `broken`: a compiler is installed and cannot build, which installing the toolchain fixes (off macOS: most often the libc headers).
     Broken,
 }
@@ -987,14 +960,18 @@ pub(crate) fn c_toolchain_entry(cause: CToolchain) -> aterm_messages::exceptions
 pub(crate) enum SnapshotWords {
     /// The file vanished at child exit: a live row has nothing honest left to say.
     Vanished,
+
     /// The pass is over (ended cleanly, with failures, or its writer gone) and the read claims no outcome.
     Over,
+
     /// Nothing planned while the pass runs.
     Quiet,
+
     /// A pass in flight: the words, the meter and the tailed cap, plus the pass they belong to (for the next read's high-water clamp).
     Live {
         /// The row's words: `Hold::Live { STALE_TAILED }`, keyed [`KEY_PASS`].
         message: Box<Message>,
+
         /// The writer's identity — pass name and start stamp.
         pass_id: PassId,
     },
@@ -1095,10 +1072,6 @@ pub(crate) fn pass_load(f: &atpkg::progress::ProgressFile) -> Option<Load> {
     }
 }
 
-/// The overall meter: programs, each weighted by phase. A finished program
-/// (done, failed or skipped) counts whole; one in flight counts its download
-/// as the first half (by bytes), a verify as half, its extraction as the
-/// second half (by bytes, to 99 %), a link as 99 %.
 fn overall_fill(f: &atpkg::progress::ProgressFile) -> Option<u16> {
     let total = u64::from(f.overall.programs_total);
     if total == 0 {
@@ -1124,9 +1097,6 @@ fn overall_fill(f: &atpkg::progress::ProgressFile) -> Option<u16> {
     u16::try_from(((done + in_flight) / total).min(1000)).ok()
 }
 
-/// The program the pass is working on now, as one phrase, plus that program's
-/// own byte meter when its phase has one: the fallback fill for a pass whose
-/// overall rollup is silent (no signed sizes to sum).
 fn current_program_line(f: &atpkg::progress::ProgressFile) -> (String, Option<u16>) {
     let active = f
         .programs
@@ -1171,8 +1141,6 @@ fn current_program_line(f: &atpkg::progress::ProgressFile) -> (String, Option<u1
     )
 }
 
-/// A program name is untrusted until it round-trips the store's name gate; one
-/// that fails simply has no words on the row.
 fn admitted_name(raw: &str) -> Option<String> {
     let name = atpkg::store::ToolName::new(raw)?;
     Some(sanitize_for_tty(name.as_str(), NAME_CAP))
@@ -1250,9 +1218,6 @@ mod tests {
         msg.meter.as_ref().map_or("", |m| m.stats.as_str())
     }
 
-    /// Every live toolchain row completes in its finished form (`Installed ALab
-    /// tools`, `Updated ALab tools`) with nothing else on the row moving at 60,
-    /// 80, 120 and 160 columns.
     #[test]
     fn every_live_toolchain_row_completes_in_its_finished_form() {
         use crate::message_band::assert_completes_in_place as completes;
@@ -1282,11 +1247,6 @@ mod tests {
         );
     }
 
-    /// Every record is a toolchain row with the `Packages` capsule (a
-    /// machine-settings record's is Settings ▸ Security, where its switches are)
-    /// and every live row carries none; each has a title inside the cap and a
-    /// glyph from the band's closed set, and each route is the Settings page's
-    /// own path.
     #[test]
     fn every_toolchain_record_carries_the_packages_capsule_and_an_admitted_glyph() {
         let rows = vec![
@@ -1358,9 +1318,6 @@ mod tests {
         }
     }
 
-    /// A first run that ended short is a failure row titled by how it ended;
-    /// the cause rides behind Details unless the person can fix it (a full
-    /// disk), and the capsule is the page that retries.
     #[test]
     fn a_first_run_that_ended_short_is_a_failure_row() {
         use crate::message_reporters::{Attention, attention};
@@ -1445,9 +1402,6 @@ mod tests {
         assert!(nothing.detail.is_empty());
     }
 
-    /// The announcement opens the row before any snapshot, keeps atpkg's size
-    /// as its only detail, is busy (no fraction yet), and is live under the
-    /// announcement cap.
     #[test]
     fn an_announcement_opens_the_row_before_any_snapshot() {
         let m = announced("installing 2 program(s) (about 1 GB)");
@@ -1495,10 +1449,6 @@ mod tests {
         assert_eq!(bare.meter.map(|m| m.stats), Some(String::new()));
     }
 
-    /// The first run is one row, every outcome a record: the announcement and
-    /// meter share the pass key, so the meter supersedes the announcement; the
-    /// outcome, managed-current and machine-settings words are `Hold::LogOnly`
-    /// records, and the one live row stays the meter.
     #[test]
     fn the_first_run_is_one_row_and_every_outcome_is_a_record() {
         let now = Instant::now();
@@ -1538,8 +1488,6 @@ mod tests {
         assert_eq!(center.log().len(), 9, "every report is on record");
     }
 
-    /// A wait that ran out is an unkeyed deferred record (Info, "ALab tools
-    /// update postponed", atpkg's sentence), never "failed", never a row.
     #[test]
     fn a_lock_wait_timeout_is_a_deferred_record_not_a_failure() {
         let m = deferred(
@@ -1553,10 +1501,6 @@ mod tests {
         assert!(m.detail[0].contains("trying again when it finishes or in 30 s"));
     }
 
-    /// A pass that left no ALab tools and saw no failure (`seed-nothing:`, an
-    /// exclusion's `seed-unusable:`) is "Couldn't install any ALab tools": Warn,
-    /// a record keyed to the pass with the Packages capsule, never titled
-    /// "failed".
     #[test]
     fn a_pass_that_left_no_tools_is_never_titled_failed() {
         let m = not_installed("ay: the signature did not verify");
@@ -1576,10 +1520,6 @@ mod tests {
         assert_eq!(excluded.severity, Severity::Warn);
     }
 
-    /// A `seed-unusable:` stating a fact about the machine (nothing published
-    /// for its architecture, every program removed on purpose) claims no failed
-    /// attempt: an Info record, "No ALab tools to install", atpkg's sentence
-    /// whole.
     #[test]
     fn an_informational_unusable_is_an_info_record_not_a_failure() {
         for body in [
@@ -1598,8 +1538,6 @@ mod tests {
         }
     }
 
-    /// The positive terminals are records with no meter and drop the pill's
-    /// own opening from the detail.
     #[test]
     fn the_positive_terminals_carry_no_meter_and_keep_the_sentence() {
         let m = installed(
@@ -1643,9 +1581,6 @@ mod tests {
         }
     }
 
-    /// A failure is a Warn record with no meter: "Couldn't update ALab tools",
-    /// then the host's whole sentence (`failure_cause`), control-stripped and
-    /// kept whole; its surface is the Settings ▸ Packages badge, never a row.
     #[test]
     fn a_failure_is_a_warn_record_with_no_meter() {
         let m = failed("partly installed: ay, trust");
@@ -1767,9 +1702,6 @@ mod tests {
         assert_eq!(pass_id, ("net".to_string(), 1_700_000_000));
     }
 
-    /// A pass whose byte rollup is silent (no byte total) still fills by
-    /// programs weighted by phase; every first-run pass, whatever its name, is
-    /// titled [`INSTALLING_ALAB`].
     #[test]
     fn a_silent_rollup_changes_nothing_the_programs_measure() {
         let mut f = file(Some(7), "net");
@@ -1805,8 +1737,6 @@ mod tests {
         );
     }
 
-    /// A live meter never runs backwards within one pass: the clamp is to the
-    /// same pass's high-water mark, and a different pass starts fresh.
     #[test]
     fn a_live_meter_never_runs_backwards_within_a_pass() {
         let (first, pass_id) = live_of(snapshot_words(Some(&snap(true)), None, false));
@@ -1841,9 +1771,6 @@ mod tests {
         assert_eq!(fill_of(&m), Some(350), "a new pass starts fresh");
     }
 
-    /// A pass that is over claims no outcome: a read of a pass that ended
-    /// (cleanly, with a failure, or with its writer gone) is `Over` whatever
-    /// the file says, and the outcome is the markers' record.
     #[test]
     fn a_pass_that_is_over_claims_no_outcome() {
         let mut f = file(None, "net");
@@ -1908,8 +1835,6 @@ mod tests {
         assert!(m.meter.as_ref().is_some_and(|m| m.busy));
     }
 
-    /// The phase words say "up to date" for a skipped program, and why a
-    /// program was pulled forward (scheduling, not progress) stays off the row.
     #[test]
     fn phase_words_say_up_to_date_and_keep_scheduling_off_the_row() {
         let mut f = file(Some(7), "net");
@@ -1944,8 +1869,6 @@ mod tests {
         assert_eq!(line, format!("{name} \u{00b7} up to date"));
     }
 
-    /// An archive atpkg fetched ahead waits at its whole size for the pass: the
-    /// row names the program the pass is extracting, not the finished download.
     #[test]
     fn a_download_waiting_for_the_pass_yields_to_the_program_in_hand() {
         let program = |phase, bytes_done, bytes_total| atpkg::progress::ProgramProgress {
@@ -2012,8 +1935,6 @@ mod tests {
         assert_eq!(appnotice(tags::UPDATE, "x").tag, tags::UPDATE);
     }
 
-    /// A program the pass could not check is named, never left out: the title
-    /// says it was not checked and the mark is a plain record's.
     #[test]
     fn a_program_the_pass_could_not_check_is_named_and_no_success() {
         let words = |wire: &str| managed_current(wire, 0, true, HookDialect::Zsh).unwrap();
@@ -2047,9 +1968,6 @@ mod tests {
         assert_eq!(m.severity, Severity::Success);
     }
 
-    /// Four agents fit the title whole: programs that share a word are grouped,
-    /// and a title still over the cap drops the versions of the programs not
-    /// current before anything is cut.
     #[test]
     fn four_agents_fit_the_title_whole() {
         let title = |[a, b, c, d]: [&str; 4]| {
@@ -2122,10 +2040,6 @@ mod tests {
         );
     }
 
-    /// The record says what is true of the running sessions: sessions the live
-    /// upgrade is moving turn "up to date" into "installed" and say when; a
-    /// frozen tab with an agent in front is told to source the hook once the
-    /// agent exits, never handed a line to type; the shell remedy stays last.
     #[test]
     fn the_managed_record_says_installed_while_sessions_lag_and_spares_agent_tabs() {
         let wire = "claude 2.1.282 (Anthropic latest); codex 0.157.0 (OpenAI latest)";
@@ -2167,9 +2081,6 @@ mod tests {
         assert_eq!(plain, "ready in every aterm tab");
     }
 
-    /// ONE COUNT PER AGENT, BY [`Agent::ALL`]: each agent counted lands on its
-    /// own product and no other's, said in `ALL`'s order (Claude Code first),
-    /// and the total is every count.
     #[test]
     fn each_agent_is_counted_on_its_own_product_in_alls_order() {
         let mut each = PerAgent::default();
@@ -2190,9 +2101,6 @@ mod tests {
         assert_eq!(PerAgent::default().total(), 0, "the negative control");
     }
 
-    /// EACH PRODUCT IS SAID WITH ITS OWN COUNT: the words named every lagging
-    /// session "Claude Code", so a Codex session behind the managed codex would
-    /// have read as a Claude Code one.
     #[test]
     fn each_lagging_product_is_named_with_its_own_count() {
         let wire = "claude 2.1.282 (Anthropic latest); codex 0.157.0 (OpenAI latest)";
@@ -2227,8 +2135,6 @@ mod tests {
         assert!(!detail.contains("Codex"), "{detail}");
     }
 
-    /// A session that will not move on its own is not said to move: it keeps
-    /// the title at "installed" and is pointed at `--status`.
     #[test]
     fn a_held_session_is_not_said_to_move_and_a_shadowed_tab_is_not_from_before() {
         let wire = "claude 2.1.282 (Anthropic latest)";
@@ -2266,10 +2172,6 @@ mod tests {
         );
     }
 
-    /// The remedy is spelled for the shell this window spawns: atpkg writes one
-    /// hook per dialect (`atpkg::hooks::hook_files`: `.zsh`, `.bash`, `.fish`,
-    /// `.ps1`), sourced the way that shell sources, and a shell atpkg has no hook
-    /// for is told a new tab.
     #[test]
     fn the_frozen_tab_remedy_is_the_hook_in_the_spawn_shells_dialect() {
         use aterm_core::shell_integration::ShellType;
@@ -2310,8 +2212,6 @@ mod tests {
         assert_eq!(HookDialect::from(ShellType::Wsl), HookDialect::None);
     }
 
-    /// "Every tab" rests on the installed record's evidence: a window whose
-    /// shell integration failed is told that record's cause instead.
     #[test]
     fn the_managed_row_stops_claiming_this_tab_when_integration_failed() {
         let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
@@ -2327,8 +2227,6 @@ mod tests {
         assert_eq!(detail, "ready in every aterm tab");
     }
 
-    /// The seed pill over every roster shape × integration outcome × frozen-tab
-    /// count × hook dialect:
     #[test]
     fn the_seed_pill_keeps_every_tab_promise_it_makes() {
         use crate::spawn::ShellIntegrationOutcome as Si;
@@ -2456,7 +2354,6 @@ mod tests {
         );
     }
 
-    /// Machine settings: one record per changed item, in wire order.
     #[test]
     fn machine_settings_record_one_entry_per_item_in_wire_order() {
         let rows =
@@ -2492,7 +2389,6 @@ mod tests {
         );
     }
 
-    /// A transfer's stats keep one width from its first megabyte to its last.
     #[test]
     fn byte_stats_keep_one_width_for_the_life_of_a_transfer() {
         for total in [200_000_000u64, 1_200_000_000, 74_000_000] {

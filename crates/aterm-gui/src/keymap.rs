@@ -392,6 +392,16 @@ fn windows_alt_code_digit(
 
 /// Whether a press goes out as its text because a dead key changed what it
 /// types, which its key does not say:
+///
+/// * A dead key that did not compose with the key after it: US-International
+///   `'` then `s` types `'s`. Windows posts both characters for the second
+///   press, and winit, finding two graphemes, reports the plain `s` as its
+///   logical key, so encoding the key alone typed `its` for `it's`.
+/// * A dead key then Space, the way to type the accent itself: German `^` then
+///   Space types `^`, US-International `'` then Space `'`. Windows posts the
+///   accent for the Space press, which winit still names `Space`, so encoding
+///   the key typed a space and the accent was lost (found on recorded key
+///   messages, `keymap_win_replay_tests`).
 #[cfg(any(windows, test))]
 fn windows_text_commit(logical_key: &WinitKey, text: Option<&str>, mods: Modifiers) -> bool {
     let chord = Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER;

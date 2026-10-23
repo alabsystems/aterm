@@ -145,7 +145,8 @@ unsafe extern "C" {
 /// The callout ([`Cell`], [`WakeTimer`]).
 extern "C" fn wake_timer_fired(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     if !info.is_null() {
-        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag.
+        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag, which outlives the timer
+        // (`Drop` invalidates it first); the `Cell` is written only on the run loop's own thread.
         unsafe { (*info.cast::<Cell<bool>>()).set(true) };
     }
 }
@@ -172,7 +173,8 @@ impl WakeTimer {
     /// The event loop's waker.
     #[must_use]
     pub fn main(_mtm: MainThread) -> Self {
-        // SAFETY: plain CoreFoundation getters.
+        // SAFETY: plain CoreFoundation getters; the mode constant is a static CFString
+        // CoreFoundation owns.
         unsafe { Self::on(CFRunLoopGetMain(), kCFRunLoopCommonModes) }
     }
 
@@ -195,7 +197,8 @@ impl WakeTimer {
             release: None,
             copy_description: None,
         };
-        // SAFETY: CoreFoundation copies `context`.
+        // SAFETY: CoreFoundation copies `context`; the flag it points at outlives the timer (`Drop`
+        // invalidates it first).
         let timer = unsafe {
             CFRunLoopTimerCreate(
                 std::ptr::null(),
@@ -290,7 +293,9 @@ impl WakeTimer {
 
 impl Drop for WakeTimer {
     fn drop(&mut self) {
-        // SAFETY: the timer is live.
+        // SAFETY: the timer is live; invalidating removes it from every run
+        // loop, so the callout can no longer reach `self.fired`, which drops
+        // after this body.
         unsafe {
             CFRunLoopTimerInvalidate(self.timer);
             CFRelease(self.timer.cast_const());

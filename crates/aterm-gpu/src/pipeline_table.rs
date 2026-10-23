@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared render pipeline specification table ([`PIPELINES`], [`build_wgpu`]) for the wgpu and Metal backends.
+//! Shared render pipeline specification table ([`PIPELINES`], `build_wgpu`) for the wgpu and
+//! Metal backends.
 /// Shader module containing a pipeline's entry points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ShaderLibrary {

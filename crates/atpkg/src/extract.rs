@@ -83,7 +83,7 @@ pub(crate) enum FrameChecksum {
     Required,
 }
 
-/// Steps 2–4 of [`vet_entry`].
+/// The pure component walk of [`vet_entry`].
 fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     // An absolute entry path can never be made relative to the root.
     if raw.is_absolute() {
@@ -131,7 +131,7 @@ fn leading_curdirs(raw: &Path) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Step 5 of [`vet_entry`].
+/// The last step of [`vet_entry`]: the join must still be under the root.
 fn join_under(root: &Path, rel: &Path) -> Result<PathBuf, ExtractReject> {
     let dest = root.join(rel);
     if !dest.starts_with(root) {
@@ -386,8 +386,8 @@ impl std::fmt::Display for SizeCapExceeded {
 
 impl std::error::Error for SizeCapExceeded {}
 
-/// Wraps the decompressor and bounds every byte the tar reader pulls against a shared
-/// ([`write_capped`]).
+/// Wraps the decompressor and bounds every byte the tar reader pulls against a shared,
+/// per-entry-reset budget ([`write_capped`]).
 struct CappedReader<R> {
     inner: R,
     budget: Rc<Cell<u64>>,
@@ -432,7 +432,7 @@ fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
 /// One node of the staged tree as the digest sees it.
 #[derive(Debug, Clone)]
 enum Node {
-    /// The folded permission bits.
+    /// The folded permission bits and the lowercase-hex content sha256.
     File(u32, String),
     /// Lowercase-hex sha256 of the raw target bytes ([`crate::tree::symlink_target_sha`]).
     Link(String),
@@ -489,7 +489,8 @@ impl TreeAccumulator {
         self.paths.insert(rel, node);
     }
 
-    /// Whether this extraction already wrote a regular file ([`Self::record_file`]).
+    /// Whether this extraction already wrote a regular file at exactly `rel`
+    /// ([`Self::record_file`]).
     fn wrote_file(&self, rel: &[u8]) -> bool {
         self.paths
             .get(rel)
@@ -699,7 +700,8 @@ impl<'a> Layer<'a> {
         self.opts.strip_components
     }
 
-    /// Every proper ancestor of `dest` below the root must be a real directory.
+    /// Every proper ancestor of `dest` below the root must be a real directory (or not exist yet),
+    /// never a symlink.
     fn guard_ancestors(&self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         if !self.laid_symlink {
             return Ok(());
@@ -1166,7 +1168,6 @@ fn extract_stream(
             }
             EntryKind::Directory => layer.directory(&raw, declared, mode)?,
             EntryKind::Regular => {
-                // Distinct branch.
                 layer.regular(&raw, mode, &mut entry)?;
             }
             EntryKind::Other if opts.allow_global_pax && entry.header().is_global_pax() => {
@@ -1798,7 +1799,8 @@ mod tests {
         let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
             return;
         };
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { libc::umask(0) };
         let d = PathBuf::from(dir);
         let root = d.join("staging");

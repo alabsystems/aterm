@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Multi-backend GPU resource and frame-encoding layer: [`DeviceHandle`] ([`DeviceHandle::Metal`]
-//! over [`crate::metal::resources::MetalResourceDevice`], [`crate::gl::device::GlDevice`]),
-//! [`LayerTexture`] ([`LayerTexture::wgpu`], [`LayerTexture::metal`]), [`LayerBuffer`]
-//! ([`LayerBuffer::wgpu`]), [`LayerSampler`], [`FrameEncoder`] ([`FrameEncoder::Metal`]),
+//! over [`crate::metal::resources::MetalResourceDevice`], `crate::gl::device::GlDevice`),
+//! [`LayerTexture`] (`LayerTexture::wgpu`, [`LayerTexture::metal`]), [`LayerBuffer`]
+//! (`LayerBuffer::wgpu`), [`LayerSampler`], [`FrameEncoder`] ([`FrameEncoder::Metal`]),
 //! [`FramePass`], [`TexelFormat`], [`ClearColor4`], [`FrameLoad`], [`metal_try_read_back`], and
 //! [`metal_stage_readback`].
 

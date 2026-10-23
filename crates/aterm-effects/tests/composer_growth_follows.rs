@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every growth of Claude Code's composer box follows and flows: the line the box carries a row up keeps its rainbow, which drifts and fades rather than vanishing, and the new row continues the old row's walk.
+//! Composer box growth rainbow-flow and walk-continuation tests.
 
 use crate::common::{
     caret_sample, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
@@ -21,17 +21,9 @@ const FRAME_US: u64 = 16_667;
 const FRAME_MS: f32 = FRAME_US as f32 / 1000.0;
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
-/// The census window after each wrap: past `FLOW_TOTAL_S` with room.
 const WINDOW_MS: u64 = 1600;
-/// Keys typed after a wrap before the new row's walk is read.
 const SNAP_KEYS: usize = 12;
-/// The largest step one column may take in the folded spectrum (`tri(t)`, as
-/// `Ink::sample` reads it) on a row past its walk's knee;
-/// [`WALK_LAY_RATE`](aterm_effects::rainbow_kitty::ribbon::WALK_LAY_RATE) is
-/// `1/36 ≈ 0.028`.
 const FOLDED_STEP_MAX: f32 = 0.03;
-/// When a stopped-hand census reads the new line: after the held park's flush,
-/// which replays the wrap key's echo and the relay no later than 0.25 s on.
 const STOPPED_SNAP_MS: u64 = 400;
 
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +35,6 @@ struct Shape {
     key_ms: u64,
 }
 
-/// The capture's window: 90×30, the retina cell, keys at 60 ms.
 const OWNER_90: Shape = Shape {
     rows: 30,
     cols: 90,
@@ -52,7 +43,6 @@ const OWNER_90: Shape = Shape {
     key_ms: 60,
 };
 
-/// A glass take: 60 columns, keys at 130 ms.
 const GLASS_60: Shape = Shape {
     rows: 30,
     cols: 60,
@@ -61,8 +51,6 @@ const GLASS_60: Shape = Shape {
     key_ms: 130,
 };
 
-/// A narrow composer, 20 columns (16 text cells) at 130 ms: words are long
-/// against the row, so a wrap can move more letters than it keeps.
 const NARROW_20: Shape = Shape {
     rows: 30,
     cols: 20,
@@ -80,12 +68,8 @@ enum Hand {
     Stops,
 }
 
-/// Text long enough for three wraps at 90 columns. `…AUDIT WH|Y` puts `WHY`
-/// under `HEY`, a twin.
 const NATURAL: &str = "HEY!!! [Image #1] in the other tab in aterm, I got this confirmation message. AUDIT WHY ATERM claude code harness introspection interface keeps losing the rainbow when the composer grows to a third row and then a fourth row while I keep typing at a steady pace so please make the old line flow and drift and fade away beautifully instead of vanishing at once like it does now";
 
-/// `tests/composer_box_growth_wrap.rs`'s config: rainbow kitty at 0.70 on
-/// the default dark theme.
 fn cfg() -> GlowConfig {
     GlowConfig {
         theme_fg: 0x00D0_D0D0,
@@ -94,20 +78,16 @@ fn cfg() -> GlowConfig {
     }
 }
 
-/// The rule row with its label, `workspace`, ten columns from the right.
 fn rule(cols: usize) -> String {
     let mut s: String = "\u{2500}".repeat(cols - 12);
     let _ = write!(s, "\x1b[{}Gworkspace\x1b[{}G\u{2500}", cols - 10, cols);
     s
 }
 
-/// The composer's bottom text row, 1-based (the status rows below it).
 fn text_row(s: Shape) -> usize {
     s.rows - 2
 }
 
-/// Greedy word wrap of one appended char at `width` text cells; returns whether
-/// the line count grew.
 fn append(lines: &mut Vec<String>, ch: char, width: usize) -> bool {
     let last = lines.last_mut().expect("a line");
     if last.chars().count() < width {
@@ -130,8 +110,6 @@ fn append(lines: &mut Vec<String>, ch: char, width: usize) -> bool {
     true
 }
 
-/// `text` with every Space that would land on a wrap dropped (the premise of [`append`]), so
-/// the words either side of it join; a no-op on a text that never puts a Space there.
 fn fit(text: &str, width: usize) -> String {
     let mut lines = vec![String::new()];
     let mut out = String::new();
@@ -145,8 +123,6 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// The final line layout `text` wraps to at `width`: for each final line,
-/// the indices of `text`'s chars on it.
 fn layout(text: &str, width: usize) -> Vec<Vec<usize>> {
     let mut lines: Vec<String> = vec![String::new()];
     let mut idx: Vec<Vec<usize>> = vec![Vec::new()];
@@ -166,9 +142,6 @@ fn layout(text: &str, width: usize) -> Vec<Vec<usize>> {
     idx
 }
 
-/// The control text: letters and spaces only, each char's case set by the
-/// parity of the final line it wraps onto, so no glyph stands under the same
-/// glyph on the line above (no `dr = −1` twins).
 fn alternating_case(text: &str, width: usize) -> String {
     let letters: String = fit(
         &text
@@ -194,9 +167,6 @@ fn alternating_case(text: &str, width: usize) -> String {
     out.into_iter().collect()
 }
 
-/// `text` (already fitted) with one glyph of final line `k`, nearest the line's
-/// middle, changed to the glyph above it, arming exactly one `dr = −1` twin
-/// inside the block.
 fn with_one_twin(text: &str, width: usize, k: usize) -> String {
     let lay = layout(text, width);
     let mut chars: Vec<char> = text.chars().collect();
@@ -279,7 +249,6 @@ struct OldWalk {
 }
 
 impl OldWalk {
-    /// Read off `h`'s ribbon at `(row, col)`, the moved word's first letter.
     fn at(h: &Host, row: u16, col: u16) -> Option<Self> {
         let rib = h.glow.v2_ribbon().expect("rainbow kitty owns the frame");
         let cell = rib
@@ -295,8 +264,6 @@ impl OldWalk {
         })
     }
 
-    /// The walk continued to column `col` of the new line (its text starts
-    /// at column 2): `(t, distance)`.
     fn continued(self, col: u16) -> (f32, f32) {
         let d = self.d + f32::from(col) - 2.0;
         (self.zero + walk_t(d), d)
@@ -316,7 +283,6 @@ impl Series {
         self.counts1.2 - self.counts0.2
     }
 
-    /// Every ninth frame, `t:cov/resident/on-old` — the failure message.
     fn curve(&self) -> String {
         self.frames
             .iter()
@@ -354,9 +320,6 @@ struct Host {
 }
 
 impl Host {
-    /// Claude Code's screen before the first key: alt screen, rule above the
-    /// text row, prompt marker, status row, caret at the inset; one frame
-    /// presented.
     fn new(s: Shape) -> Self {
         let mut term = Terminal::new(s.rows as u16, s.cols as u16);
         let tr = text_row(s);
@@ -395,8 +358,6 @@ impl Host {
         h
     }
 
-    /// The frame hold then the tick (as `tests/composer_box_growth_wrap.rs`
-    /// `Host::frame`), then the census while a wrap's window is open.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink_seen, self.now);
@@ -422,16 +383,12 @@ impl Host {
         self.advance_to(t);
     }
 
-    /// `(ribbon_followed=, ribbon_retired=, ribbon_follow_missed=)`.
     fn counts(&self) -> (u64, u64, u64) {
         self.glow
             .v2_status()
             .map_or((0, 0, 0), |s| (s.followed, s.retired, s.follow_missed))
     }
 
-    /// The target row's coverage census (`tests/composer_box_growth_wrap.rs`
-    /// `coverage`): the bed's quads whose vertical extent covers the row's
-    /// centre, weighted by opacity, over the row's pixel width.
     fn coverage(&self, row: u16) -> f32 {
         let centre = f32::from(self.g.origin_y) + (f32::from(row) + 0.5) * self.s.ch as f32;
         let sum: f32 = self
@@ -480,8 +437,6 @@ impl Host {
         self.active.as_mut().expect("open").frames.push(rec);
     }
 
-    /// One key `key_ms` after the last: the frames until then run, the
-    /// typed hint is armed at the key, the PTY answers `bytes`.
     fn press(&mut self, ch: char, bytes: &[u8]) {
         let t = self.last_key + Duration::from_millis(self.s.key_ms);
         self.advance_to(t);
@@ -503,8 +458,6 @@ impl Host {
         self.term.process(bytes);
     }
 
-    /// The open census's [`Snap`]: the newest standing cell of each column
-    /// on the row the text left and on the row it went to.
     fn snap(&mut self, typed_on: bool) {
         let Some(sr) = self.active.as_ref() else {
             return;
@@ -536,9 +489,6 @@ impl Host {
         self.active.as_mut().expect("open").snap = Some(snap);
     }
 
-    /// One ordinary key's echo as captured: the glyph at 1-based column `c` of
-    /// the text row, addressed from home, the status row touched, the caret
-    /// after it.
     fn glyph_bytes(&self, ch: char, c: usize) -> Vec<u8> {
         let tr = text_row(self.s);
         format!(
@@ -551,7 +501,6 @@ impl Host {
         .into_bytes()
     }
 
-    /// A Space's echo: the caret moves and nothing is written.
     fn space_bytes(&self, c: usize) -> Vec<u8> {
         let tr = text_row(self.s);
         format!(
@@ -561,8 +510,6 @@ impl Host {
         .into_bytes()
     }
 
-    /// The whole box repainted with `self.lines`, bottom-anchored, in the
-    /// captured first-wrap shape generalised to `n` text rows.
     fn box_bytes(&self) -> Vec<u8> {
         let tr = text_row(self.s);
         let rule_row = tr - self.lines.len();
@@ -584,7 +531,6 @@ impl Host {
         s.into_bytes()
     }
 
-    /// One key of the text; a key that wraps opens a wrap's census.
     fn key(&mut self, ch: char) {
         let width = self.s.cols - 4;
         let before = self.lines.last().expect("line").clone();
@@ -669,16 +615,11 @@ impl Host {
     }
 }
 
-/// Type `text` until `wraps` wraps have happened and each has had its
-/// window — the hand typing on through every window.
 fn run(s: Shape, text: &str, wraps: usize) -> Vec<Series> {
     let census: Vec<usize> = (1..=wraps).collect();
     run_census(s, text, &census, Hand::TypesOn)
 }
 
-/// Type `text` with a census opened at each wrap in `census` (ascending) until
-/// the last has had its window, typing on or stopping at the last censused
-/// wrap's key.
 fn run_census(s: Shape, text: &str, census: &[usize], hand: Hand) -> Vec<Series> {
     let last = *census.last().expect("a wrap to census");
     let mut h = Host::new(s);
@@ -709,7 +650,6 @@ fn run_census(s: Shape, text: &str, census: &[usize], hand: Hand) -> Vec<Series>
     h.done
 }
 
-/// Per wrap: the line carried a row up followed its text and flows there.
 fn assert_follows_and_flows(sr: &Series, what: &str) {
     let what = format!("{what}, wrap {}", sr.wrap_no);
     let curve = sr.curve();
@@ -775,9 +715,6 @@ fn assert_follows_and_flows(sr: &Series, what: &str) {
     }
 }
 
-/// The new line walks its own walk, read after the wrap (typing on or
-/// stopped): no column carries the row above's stop at that column, and every
-/// column continues the moved word's old walk ([`assert_the_walk_continues`]).
 fn assert_the_new_line_continues(snap: &Snap, first: Option<OldWalk>, what: &str) {
     assert!(
         snap.new_row.len() + 2 >= snap.expect,
@@ -814,9 +751,6 @@ fn assert_the_new_line_continues(snap: &Snap, first: Option<OldWalk>, what: &str
     );
 }
 
-/// The new row is the old row's walk continued: every lit column carries exactly
-/// [`OldWalk::continued`], the relaid first cell at its letter's old `t` and each later column
-/// one step on along the same walk.
 fn assert_the_walk_continues(new_row: &[(u16, f32)], first: OldWalk, what: &str) {
     let want: Vec<(u16, f32)> = new_row
         .iter()
@@ -874,15 +808,10 @@ struct NewRow {
     new_walk: Vec<(u32, f32)>,
 }
 
-/// Type `text` to its `wrap`-th wrap without a census, read the moved word's
-/// walk just before the wrapping key ([`OldWalk::at`]), press it, continue as
-/// `then` says, and read the two rows.
 fn read_new_row(s: Shape, text: &str, wrap: usize, then: Then) -> NewRow {
     read_new_row_lagged(s, text, wrap, then, 0)
 }
 
-/// [`read_new_row`] with every echo processed `lag_ms` after its press
-/// ([`Host::lag_ms`]).
 fn read_new_row_lagged(s: Shape, text: &str, wrap: usize, then: Then, lag_ms: u64) -> NewRow {
     let mut h = Host::new(s);
     h.census = vec![usize::MAX];
@@ -963,9 +892,6 @@ fn read_new_row_lagged(s: Shape, text: &str, wrap: usize, then: Then, lag_ms: u6
     }
 }
 
-/// The new row law: the whole new line is lit (moved word, wrap key's glyph and
-/// later keys) and continues the old row's walk ([`assert_the_walk_continues`]),
-/// with no column wearing the row above's stop at that column.
 fn assert_new_row_continues(nr: &NewRow, what: &str) {
     let cols: Vec<u16> = nr.new_row.iter().map(|c| c.0).collect();
     let line: Vec<u16> = (2..2 + nr.len as u16).collect();
@@ -996,8 +922,6 @@ fn assert_new_row_continues(nr: &NewRow, what: &str) {
     }
 }
 
-/// 90 columns at 60 ms, three growths, typing on; wraps 2 and 3 carry twins
-/// (asserted), `WHY` under `HEY` among them.
 #[test]
 fn every_growth_of_the_owner_s_composer_follows_its_text_and_flows() {
     let wraps = run(OWNER_90, NATURAL, 3);
@@ -1013,8 +937,6 @@ fn every_growth_of_the_owner_s_composer_follows_its_text_and_flows() {
     }
 }
 
-/// Each growth censused with the hand stopped at the wrapping key: the relay
-/// arrives on the held park, and the carried line still follows and flows.
 #[test]
 fn every_growth_of_the_owner_s_composer_follows_and_flows_when_the_hand_stops_at_the_wrap() {
     crate::common::par_map(&[1, 2, 3], |&k| {
@@ -1026,8 +948,6 @@ fn every_growth_of_the_owner_s_composer_follows_and_flows_when_the_hand_stops_at
     });
 }
 
-/// 60 columns at 130 ms, three growths; the first wrap twins against the rule's
-/// label (the `o` of `got` under the `o` of `workspace`, asserted).
 #[test]
 fn every_growth_at_the_glass_take_s_geometry_follows_its_text_and_flows() {
     let text = fit(NATURAL, GLASS_60.cols - 4);
@@ -1041,9 +961,6 @@ fn every_growth_at_the_glass_take_s_geometry_follows_its_text_and_flows() {
     }
 }
 
-/// One coincident letter does not change the exit. A is the no-twin control: letters only,
-/// each line's case alternating, so no glyph stands under the same glyph on the line above
-/// (asserted).
 #[test]
 fn one_coincident_letter_does_not_change_the_exit() {
     let width = OWNER_90.cols - 4;
@@ -1074,8 +991,6 @@ fn one_coincident_letter_does_not_change_the_exit() {
     }
 }
 
-/// Three rows that start alike (`HEY` / `HOW` / moved `HIS`): at wrap 2 the kept
-/// line's first glyph is an edge twin and the relaid word starts with it too.
 #[test]
 fn a_line_whose_first_glyph_twins_above_and_below_follows_whole() {
     let text = NATURAL
@@ -1100,12 +1015,6 @@ fn a_line_whose_first_glyph_twins_above_and_below_follows_whole() {
     }
 }
 
-/// The kept line follows its text and flows whatever the wrap's proportions,
-/// the hand stopped at the wrap: a wrap that moves more than it keeps (20
-/// columns, wrap 5 keeps `this` and moves `confirmatio`: the moved records are
-/// holes a row up only because the wrap relaid them, and must not refuse the
-/// follow), a long path carried down under a short line (`see` at 60 columns),
-/// and a wrap that keeps only one or two cells.
 #[test]
 fn every_wrap_proportion_s_kept_line_follows_and_flows() {
     let narrow = fit(NATURAL, NARROW_20.cols - 4);
@@ -1135,15 +1044,10 @@ fn every_wrap_proportion_s_kept_line_follows_and_flows() {
     });
 }
 
-/// `see` and a 61-letter path at 60 columns, 130 ms keys: the wrap keeps `see`
-/// (3) and moves 52 letters.
 const PATH_60: &str = "see crates/aterm-effects/src/rainbow_kitty/witness_follow_runs.rs";
 
-/// `please read` and an 83-letter path at 90 columns, 60 ms keys: the wrap
-/// keeps 11 and moves 74 letters.
 const PATH_90: &str = "please read crates/aterm-effects/src/rainbow_kitty/witness_follow_runs_and_the_relaid_suffix.rs now";
 
-/// A narrow pane of odd width: 21 columns, 17 text cells, 130 ms keys.
 const NARROW_21: Shape = Shape {
     rows: 30,
     cols: 21,
@@ -1152,17 +1056,11 @@ const NARROW_21: Shape = Shape {
     key_ms: 130,
 };
 
-/// [`NARROW_21`] with 60 ms keys.
 const NARROW_21_60: Shape = Shape {
     key_ms: 60,
     ..NARROW_21
 };
 
-/// The new row continues the moved word's walk, whatever the wrap's shape and
-/// whether the hand stops at the wrap (the relay arrives at the park flush,
-/// ≤ 0.25 s, and must still find its origin after the old cells melt at
-/// 0.12 s) or types on (the eaten Space's cell and later keys continue the
-/// relay's walk, not the old run's stops):
 #[test]
 fn every_wrap_shape_s_new_row_continues_the_old_row_s_walk() {
     let n20 = fit(NATURAL, NARROW_20.cols - 4);
@@ -1216,9 +1114,6 @@ fn every_wrap_shape_s_new_row_continues_the_old_row_s_walk() {
     });
 }
 
-/// A Space typed before the wrap's echo is not the word's Space: at 90 columns
-/// and 60 ms with each echo lagging its press, the key after each wrap key is a
-/// held Space.
 #[test]
 fn a_space_typed_before_the_wrap_s_echo_lands_leaves_the_moved_word_relaid() {
     let takes: Vec<(u64, usize)> = [10, 20, 40]
@@ -1235,7 +1130,6 @@ fn a_space_typed_before_the_wrap_s_echo_lands_leaves_the_moved_word_relaid() {
     });
 }
 
-/// The control: the same wraps with a letter after the first wrap key (`WHYX`) at every lag.
 #[test]
 fn the_control_a_letter_typed_before_the_wrap_s_echo_lands() {
     let text = NATURAL.replacen("AUDIT WHY ATERM", "AUDIT WHYX ATERM", 1);
@@ -1246,8 +1140,6 @@ fn the_control_a_letter_typed_before_the_wrap_s_echo_lands() {
     });
 }
 
-/// A wrap that moves no word continues one past the Space it ate: at 60 columns
-/// the first wrap is `…I got this ` + `c` (kept 55, w 0).
 #[test]
 fn a_wrap_that_moves_no_word_continues_one_past_the_eaten_space_whatever_the_echo_lag() {
     let s = Shape {
@@ -1285,14 +1177,10 @@ fn a_wrap_that_moves_no_word_continues_one_past_the_eaten_space_whatever_the_ech
     });
 }
 
-/// `to introspection|s` at 20 columns: the wrap keeps two cells.
 const KEPT_2: &str = "to introspections are fun";
 
-/// `I introspections|s` at 20 columns: the wrap keeps one cell.
 const KEPT_1: &str = "I introspectionss are fun";
 
-/// The repaint may arrive 120 ms after its key, just before the next key's
-/// 130 ms press.
 #[test]
 fn a_short_wrap_relay_survives_a_delayed_echo() {
     for (text, kept) in [(KEPT_1, 1), (KEPT_2, 2)] {
@@ -1304,7 +1192,6 @@ fn a_short_wrap_relay_survives_a_delayed_echo() {
     }
 }
 
-/// A real one-cell wrap proves its held park and relays the moved word.
 #[test]
 fn a_proved_short_wrap_does_not_reanchor_a_later_false_park() {
     let model = rainbow_short_wrap_park_model();

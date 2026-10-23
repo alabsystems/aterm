@@ -18,10 +18,8 @@ const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BUMP: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const NEXT: &str = "dddddddddddddddddddddddddddddddddddddddd";
-/// The bump after BUMP's release.
 const BUMP2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
-/// The fake world. History is one line: `history[i]` is an ancestor of every later one.
 struct World {
     dir: aterm_tempfile::TempDir,
     now: u64,
@@ -129,8 +127,6 @@ struct World {
 }
 
 impl World {
-    /// origin/main at TIP declaring 0.5.0, which is released (its tag on origin is
-    /// OLD's claim); everything provisioned; every child succeeds.
     fn new() -> Self {
         let mut versions = BTreeMap::new();
         versions.insert(OLD.into(), "0.5.0".into());
@@ -205,7 +201,6 @@ impl World {
         }
     }
 
-    /// A signal arrives while `step`'s child runs: the child ends, the release sees it.
     fn interrupt_at(&mut self, step: &str) -> bool {
         if self.signal_at == Some(step) {
             self.signal = Some(15);
@@ -247,7 +242,6 @@ impl World {
         self.history.last().cloned().unwrap_or_default()
     }
 
-    /// The executable digest of the bundle the journal names, if one is built.
     fn macho(&self) -> Option<String> {
         self.journal()?.artifact.map(|a| a.macho_sha256)
     }
@@ -704,8 +698,6 @@ impl Backend for World {
         self.calls.push(format!("cut {}", args[3..].join(" ")));
         let resuming = args.iter().any(|a| a == "--resume");
         let Some(reserved) = self.journal().and_then(|j| j.reserved) else {
-            // a resume finishes the claim its own journal holds, the bytes it names:
-            // it reads no release journal
             if resuming && let Some(cut) = self.cut.as_mut() {
                 cut.finished = self.cut_finishes;
                 return ran(self.cut_code);
@@ -781,7 +773,6 @@ fn passes() -> Vec<Finding> {
     }]
 }
 
-/// A gap this machine's operator closes: it refuses where the audit finds it.
 fn machine_gap() -> Vec<Finding> {
     vec![Finding {
         label: "x86 slice",
@@ -793,7 +784,6 @@ fn machine_gap() -> Vec<Finding> {
     }]
 }
 
-/// The cut's read-only pre-claim gate: another machine holds the release lease.
 fn lease_held() -> Refusal {
     Refusal::new(
         "release lease — the release lock is held by claim abcdef; nothing was claimed",
@@ -856,8 +846,6 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
     );
 }
 
-/// A run after RELEASED finds every step done by its facts and runs nothing again: no
-/// second publish, cut, shape check or fixture landing.
 #[test]
 fn a_second_run_finds_everything_done_and_only_checks() {
     let mut w = World::new();
@@ -887,9 +875,6 @@ fn a_second_run_finds_everything_done_and_only_checks() {
     );
 }
 
-/// A refusing generator refuses the release at the build step it runs beside, before the
-/// publish and the claim: nothing public, no number burned, and the bundle is kept, so the run
-/// after the fix stages the fixtures alone.
 #[test]
 fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
     let mut w = World::new();
@@ -923,9 +908,6 @@ fn a_generator_that_refuses_refuses_the_release_before_its_claim() {
     assert!(w.fixtures_on_main);
 }
 
-/// Fixtures staged and not landed (the landing's push failed after the cut) are landed
-/// by the next run, from the staging: the release's shape is not checked again and
-/// nothing is generated again.
 #[test]
 fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
     let mut w = World::new();
@@ -958,9 +940,6 @@ fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
     assert!(w.fixtures_on_main);
 }
 
-/// A run stopped at any step — refused by it, by a bug in the release itself (a panic),
-/// or by the engine sync after `pub stage` failing — ends in one line, its claim gone,
-/// and resumes there, running nothing it finished again.
 #[test]
 fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
     type Break = fn(&mut World);
@@ -1065,8 +1044,6 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
     }
 }
 
-/// A dry run that would go ahead — an owner gap open — changes nothing: no journal, no
-/// claim, no step that writes, and nobody asked.
 #[test]
 fn a_dry_run_changes_nothing_and_asks_nobody() {
     let mut w = World::new();
@@ -1101,14 +1078,6 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
     );
 }
 
-/// What would refuse the release refuses it at minute one — before the bump's push,
-/// the stage and the long steps — for a real run and a dry run alike: the
-/// machine's own refusals, a provisioning gap this machine's operator closes, the cut's
-/// read-only pre-claim gates (the release lease another machine holds), what would refuse
-/// the commit a `--bump` makes (the next version cut on origin, a leftover local tag of
-/// it, a predecessor whose claim commit main does not contain, a version main declares
-/// that no release has used), and, at step 4, the preflight's commit-only gates — none
-/// of them a fact the cut could read.
 #[test]
 fn what_would_refuse_the_release_refuses_it_before_anything_changes() {
     type Change = fn(&mut World);
@@ -1206,8 +1175,6 @@ fn what_would_refuse_the_release_refuses_it_before_anything_changes() {
     }
 }
 
-/// An owner gap is asked once, at the checks, before the stage; the long steps run; the
-/// release waits for it at the publish and goes on once it closes.
 #[test]
 fn an_owner_gap_is_asked_once_the_long_steps_run_and_the_release_waits_then_goes_on() {
     for undelivered in [0, 1] {
@@ -1263,7 +1230,6 @@ fn an_audit_that_could_not_ask_is_a_resumable_stop_where_it_is_needed() {
     assert_eq!(w.count("publish"), 0, "{:?}", w.calls);
 }
 
-/// A bare re-run keeps the READY candidate when main moved on: it never chases main.
 #[test]
 fn a_bare_rerun_keeps_the_ready_candidate() {
     let mut w = World::new();
@@ -1330,8 +1296,6 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     );
 }
 
-/// A cutter that is not R's own re-execs as R's own cutter ONCE (the same pid: its claim
-/// adopted); a re-exec that still is not R's refuses at step 3, never looping.
 #[test]
 fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     let mut w = World::new();
@@ -1372,8 +1336,6 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     );
 }
 
-/// A judge that cannot answer is no "no": it stops at step 4 as COULD NOT RUN, never
-/// after the hours of the steps whose record it would then not read either.
 #[test]
 fn a_judge_that_cannot_answer_stops_at_minute_one() {
     let mut w = World::new();
@@ -1392,8 +1354,6 @@ fn a_judge_that_cannot_answer_stops_at_minute_one() {
     assert_eq!(w.count("verify"), 0, "{:?}", w.calls);
 }
 
-/// The ledger row is written before sign-release. A nonzero publish refuses once,
-/// and its row must not let a re-run claim or ship before that missing work is done.
 #[test]
 fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cut() {
     let mut w = World::new();
@@ -1427,9 +1387,6 @@ fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cu
     assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
 }
 
-/// A run that published and stopped short of the claim leaves a re-run whose publish is
-/// skipped; the waiting audit and the cut's gates are still asked at the publish step, so an
-/// owner gap opened since is waited on before the claim, never met after it with a build spent.
 #[test]
 fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() {
     let mut w = World::new();
@@ -1454,10 +1411,6 @@ fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() 
     assert!(sleep < gates && gates < cut, "{:?}", w.calls);
 }
 
-/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC. The publish audits the provisioning
-/// first, and may wait there for the owner — hours; so what the cut would refuse is
-/// asked again after that wait, right before `pub publish` — and what changed during the
-/// wait (a rostered peer cut v0.6.0, the disk filled) refuses there, nothing public.
 #[test]
 fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
     type Change = fn(&mut World);
@@ -1486,9 +1439,6 @@ fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
     }
 }
 
-/// A signal ends the step's child — or the wait for the owner — and the release ends in
-/// ONE line, `INTERRUPTED at <step>`, exit 130, its claim gone, nothing past that step
-/// run: at step 3, R's cutter is never exec'd (an exec forgets every signal caught).
 #[test]
 fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     type Setup = fn(&mut World);
@@ -1544,13 +1494,8 @@ fn an_interrupt_ends_the_run_in_one_line_and_it_resumes() {
     }
 }
 
-/// The probe mode of [`a_real_sigterm_reaches_the_steps_group_and_ends_interrupted`]:
-/// set, the test is the release itself (its own process, its own signal handlers).
 const INTERRUPT_PROBE: &str = "ATERM_RELEASE_INTERRUPT_PROBE";
 
-/// The verify step's child in the probe: a shell (the step's child, its group's leader)
-/// and a subshell it leaves running (another member of that group), each writing what
-/// it was sent once its trap is armed.
 const PROBE_STEP: &str = r#"d="$1"
 ( trap 'echo TERM > "$d/grandchild"; exit 0' TERM
   echo armed > "$d/grandchild.armed"
@@ -1639,11 +1584,6 @@ fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
     );
 }
 
-/// A run killed outright (SIGKILL) leaves its step's children — a step runs several
-/// beside each other (the build and the fixture generator), each noted on its own
-/// (`running.child.<pid>`; a bare `running.child` is an older cutter's note): any one
-/// still alive holds the clone, named, and the refusal says to stop that process, never
-/// its group, where a trustd it started may live.
 #[test]
 fn every_child_a_killed_step_left_running_holds_the_clone() {
     let mut w = World::new();
@@ -1679,9 +1619,6 @@ fn every_child_a_killed_step_left_running_holds_the_clone() {
     );
 }
 
-/// A check that got no answer resolves nothing: owner gap, COULD NOT RUN, owner gap is
-/// ONE ask, resolved only when the check passes — here across two runs, the first
-/// stopped by `verify release` after the checks asked.
 #[test]
 fn a_check_that_could_not_run_keeps_the_ask_open() {
     let mut w = World::new();
@@ -1709,9 +1646,6 @@ fn a_check_that_could_not_run_keeps_the_ask_open() {
     );
 }
 
-/// `--commit` replaces an unpublished candidate and keeps the asks raised for the
-/// machine; `--forget` withdraws them, so no standing row outlives the release it was
-/// raised for — and refuses while a run is live, dropping and withdrawing nothing.
 #[test]
 fn asks_are_carried_over_a_replaced_candidate_and_withdrawn_by_forget() {
     let mut w = World::new();
@@ -1750,9 +1684,6 @@ fn asks_are_carried_over_a_replaced_candidate_and_withdrawn_by_forget() {
     assert!(w.journal().is_none());
 }
 
-/// An ask the checks delivered before the release had a journal, on a run that then
-/// stops before step 3 journals it, is withdrawn before the final line: no standing row
-/// outlives a run that left nothing able to resolve or withdraw it.
 #[test]
 fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
     let mut w = World::new();
@@ -1766,8 +1697,6 @@ fn an_ask_no_journal_took_is_withdrawn_when_the_run_stops_before_step_3() {
     assert_eq!(w.withdrawn, ["release.notary"]);
 }
 
-/// No claim is held to a prover, because no resume compiles: the cut claims bytes the release
-/// already built and verified, and its journal (`dist/cut-state.toml`) names them.
 #[test]
 fn a_claim_forgotten_and_resumed_is_never_built_again() {
     let mut w = World::new();
@@ -1807,9 +1736,6 @@ fn a_claim_forgotten_and_resumed_is_never_built_again() {
     );
 }
 
-/// A machine with no site checkout (`ship site` touched nothing) ends the
-/// release: the site is a hand step, journaled and said — in the final line of this run
-/// and every later one — never a refusal a re-run here would only repeat.
 #[test]
 fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends() {
     let mut w = World::new();
@@ -1865,11 +1791,6 @@ fn a_site_this_machine_cannot_sync_is_a_recorded_hand_step_and_the_release_ends(
     assert!(last.starts_with("REFUSED at 10/11 after-cut"), "{last}");
 }
 
-/// A PUBLISHED RELEASE IS NEVER RE-CUT, so a refusal of its shape after the cut is one
-/// no re-run of it can end — the very command resumes it and meets it again, and
-/// `--bump` never bumps twice, its tag on origin and its ledger line notwithstanding —
-/// and the way out is `--forget`, then `--bump`, which ships the successor under a
-/// number reserved above the cut's claim.
 #[test]
 fn a_shape_refusal_names_its_way_out_and_following_it_ships_the_successor() {
     let mut w = World::new();
@@ -1907,8 +1828,6 @@ fn a_shape_refusal_names_its_way_out_and_following_it_ships_the_successor() {
     assert_eq!(w.count("bump"), 1, "{:?}", w.calls);
 }
 
-/// `--forget` drops the journal and exits: a dry run's "nothing changes", and every
-/// flag of a run, would be ignored by it, so each is refused at parse.
 #[test]
 fn forget_takes_no_flag_it_would_ignore() {
     let parse = |args: &[&str]| {
@@ -1930,8 +1849,6 @@ fn forget_takes_no_flag_it_would_ignore() {
     ));
 }
 
-/// `--prepare` runs the heavy half and stops before the publish: PREPARED in the journal
-/// with the prover it held, the clone's run markers let go before its line.
 #[test]
 fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     let mut w = World::new();
@@ -2027,11 +1944,6 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     assert!(at("stage") < at("publish"), "{:?}", w.calls);
 }
 
-/// Only a claimed cut is past its prepare. A visible half that published and then stopped
-/// short of the claim (a peer claimed past the reservation) leaves the source public and its
-/// PREPARED record stale: the next bare run refuses before anything heavy, keeping the record;
-/// `--prepare` reserves anew, builds, verifies and records PREPARED again over the published
-/// source; and the bare run after it releases that build.
 #[test]
 fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     let mut w = World::new();
@@ -2089,7 +2001,6 @@ fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     assert_eq!(w.cut.as_ref().unwrap().build, fresh.build);
 }
 
-/// EVERY RELEASE PUBLISHES BY THE ENGINE THAT STAGED IT, ATTESTED AS THE STAGING TIER IS.
 #[test]
 fn what_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
     type Move = fn(&mut World);
@@ -2130,9 +2041,6 @@ fn what_moved_while_the_long_steps_ran_stages_again_before_the_publish() {
     }
 }
 
-/// Relative path flags are anchored ONCE, where the release started: the steps and the
-/// re-exec as R's own cutter run from the clone's root, where they would name another
-/// place.
 #[test]
 fn relative_path_flags_are_anchored_once_where_the_release_started() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -2186,10 +2094,6 @@ fn a_public_version_is_major_minor_zero() {
     }
 }
 
-/// `verify release` decides step 6 by its exit alone: a FAIL (1) refuses naming the
-/// command that reruns it; any other exit (3: a check could not run or was skipped; 2: a
-/// refused command line) is a resumable stop, never a pass; and a pass whose record
-/// cannot be read is a resumable stop too.
 #[test]
 fn the_verify_step_refuses_on_any_exit_but_a_recorded_pass() {
     for (code, exit) in [(1, 1), (3, 3), (2, 3), (0, 3)] {
@@ -2317,10 +2221,6 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_only_a_pass
     assert!(record(&r), "a pass is recorded for R's tree on these bytes");
 }
 
-/// A reservation origin's ledger reaches is SPENT: never re-numbered — its bytes carry
-/// it — and never claimed again, whether a peer's release overtook it while `verify
-/// release` judged it (the release stops there, nothing burned) or this clone's claim
-/// of it landed with no cut journal (the cut stopped between its push and its journal).
 #[test]
 fn a_spent_reservation_is_built_again_never_renumbered() {
     type Spend = fn(&mut World);

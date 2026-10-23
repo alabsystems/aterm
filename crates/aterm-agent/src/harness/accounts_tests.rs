@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the accounts core (`docs/DESIGN-claude-accounts-2026-10-01.md` §4–§7).
+//! Tests for the accounts core.
 
 use std::collections::BTreeSet;
 
@@ -10,7 +10,6 @@ use aterm_tempfile::TempDir as Tmp;
 use super::*;
 use crate::harness::host_path::abs;
 
-/// A fixed clock: never `now()`.
 const NOW: i64 = 1_790_000_000;
 const MIN: i64 = 60;
 const HOUR: i64 = 3600;
@@ -37,8 +36,6 @@ fn roster(rows: &[(&str, Class, Option<&str>)]) -> Roster {
     }
 }
 
-/// The design's own example: this machine's login, a second dedicated
-/// account and a shared one.
 fn three() -> Roster {
     roster(&[
         ("main", Class::Dedicated, None),
@@ -47,7 +44,6 @@ fn three() -> Roster {
     ])
 }
 
-/// Every row enrolled.
 fn all(roster: &Roster) -> BTreeSet<String> {
     roster.rows.iter().map(|r| r.label.clone()).collect()
 }
@@ -59,7 +55,6 @@ fn state() -> State {
     }
 }
 
-/// A state where `main` is the proven active account.
 fn on_main() -> State {
     State {
         active: Some("main".to_string()),
@@ -77,7 +72,6 @@ fn me(label: &str) -> Me<'_> {
     }
 }
 
-/// The session a rotation moves, on `account`.
 fn mover(account: &str) -> Mover<'_> {
     Mover {
         sid: "s-one",
@@ -85,8 +79,6 @@ fn mover(account: &str) -> Mover<'_> {
     }
 }
 
-/// [`begin_rotation`] on [`three`], every row enrolled, by the session
-/// [`mover`] names on `by`.
 fn rotation(
     s: &mut State,
     read: Option<&str>,
@@ -98,7 +90,6 @@ fn rotation(
     begin_rotation(s, &r, &all(&r), read, mover(by), to, now)
 }
 
-/// A wall whose row nobody dated: the owner's clearing is not asked about.
 fn wall() -> Point {
     Point::Wall {
         window: "five_hour".to_string(),
@@ -106,7 +97,6 @@ fn wall() -> Point {
     }
 }
 
-/// A wall whose row was written at `at`.
 fn wall_at(at: i64) -> Point {
     Point::Wall {
         window: "five_hour".to_string(),
@@ -114,7 +104,6 @@ fn wall_at(at: i64) -> Point {
     }
 }
 
-/// A sample read a minute ago, both windows running, far from their resets.
 fn sample(session: u32, week: u32) -> Sample {
     Sample {
         session_pct: Some(session),
@@ -123,6 +112,7 @@ fn sample(session: u32, week: u32) -> Sample {
         week_reset: Some(NOW + 3 * DAY),
         at: NOW - MIN,
         by: String::new(),
+        ..Sample::default()
     }
 }
 
@@ -134,8 +124,6 @@ fn low(state: &mut State, label: &str) {
     assert_eq!(note_sample(state, label, sample(95, 20), NOW).len(), 1);
 }
 
-/// A session wall on `label` that stands until `end` (its reset is the
-/// grace before that).
 fn limited(state: &mut State, label: &str, end: i64) {
     let events = note_wall(
         state,
@@ -174,8 +162,6 @@ fn why_not(
         .unwrap_or_else(|| panic!("{label} is a candidate"))
 }
 
-/// [`three`] as the owner writes it, its dirs absolute on this host
-/// ([`abs`]).
 fn reference() -> String {
     format!(
         r#"
@@ -199,7 +185,6 @@ dir = "{}"
     )
 }
 
-/// [`three`], its dirs as [`reference`] spells them.
 fn three_here() -> Roster {
     let (work, pool) = (abs("/logins/work-2"), abs("/logins/pool-a"));
     roster(&[
@@ -470,9 +455,6 @@ fn append_row_writes_only_what_the_next_read_admits() {
     }
 }
 
-/// ENROLLED MEANS A LOGIN WAS MADE: a row with a `dir` counts only where
-/// that directory holds at least one entry ([`login_made`]) — what the
-/// vendor's flow writes when it is run with the directory as its home.
 #[test]
 fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     let dir = tmp("enrolled");
@@ -548,7 +530,6 @@ fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     }
 }
 
-/// A state with every field set.
 fn full_state() -> State {
     let mut s = on_main();
     s.machine = "00112233aabbccdd".to_string();
@@ -566,6 +547,7 @@ fn full_state() -> State {
                 week_reset: Some(NOW + DAY),
                 at: NOW - 1,
                 by: String::new(),
+                ..Sample::default()
             },
             NOW
         )
@@ -819,9 +801,6 @@ fn unknown_keys_are_tolerated_and_a_file_this_build_must_not_guess_at_is_refused
     );
 }
 
-/// A stamp ahead of the clock (the clock ran fast, or another machine's does)
-/// reads back as `now` plus the skew for another machine's observation, `now`
-/// for this machine's own (the auth word's, the pin's).
 #[test]
 fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() {
     let ahead = NOW + DAY;
@@ -1158,8 +1137,6 @@ fn the_condition_table_in_its_order() {
     }
 }
 
-/// [`signed_out`]: the ENROLLED rows whose last word is signed out (roster
-/// order, and a sign-in ending one, are the host's look's test).
 #[test]
 fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
     let r = three();
@@ -1197,9 +1174,6 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
     assert_eq!(signed_out(&r, &s, &all(&r), NOW), Vec::<String>::new());
 }
 
-/// [`sign_in_next`]: the first OTHER row in roster order that is not signed
-/// in here — never enrolled, or signed out — with whether it signs in by
-/// renewal (an email) or `accounts login` (the review's acct-1, acct-4).
 #[test]
 fn the_row_to_sign_in_next_is_the_first_other_one_not_signed_in() {
     let mut r = three();
@@ -1536,8 +1510,6 @@ fn rule_1_stays_for_a_session_the_roster_does_not_govern() {
     }
 }
 
-/// Rule 2 follows a proven, fresh active account — and not one whose login is
-/// known signed out or that is no longer enrolled (neither is the model's).
 #[test]
 fn rule_2_follows_no_active_account_signed_out_or_not_enrolled() {
     let r = three();
@@ -1572,9 +1544,6 @@ fn rule_2_follows_no_active_account_signed_out_or_not_enrolled() {
     assert_eq!(ask(&s, &gone), Advice::Stay(StayWhy::NothingDue));
 }
 
-/// A PROVEN ACTIVE ACCOUNT THAT IS LOW, the hour's rotations spent: a session
-/// at its wall falls back on it — unless an account opens within 15 minutes,
-/// this session's own included (the model has no clock).
 #[test]
 fn a_low_active_account_is_fallen_back_on_and_not_rotated_past_for_a_low_one() {
     let r = three();
@@ -1764,9 +1733,6 @@ fn every_non_candidate_has_its_reason_by_name() {
     );
 }
 
-/// An account at its threshold is never a fresh candidate, however near its
-/// reset: the 15-minute guard is not part of `low`, or a spent account would
-/// be the best fresh candidate and a rotation would walk into a wall.
 #[test]
 fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
     let r = three();
@@ -1887,8 +1853,6 @@ fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_late
     );
 }
 
-/// An account holding a reset offer about to expire is NOT left early: the
-/// reset is offered only at a wall.
 #[test]
 fn rule_4_does_not_leave_an_account_whose_reset_offer_is_about_to_expire() {
     let r = three();
@@ -1925,8 +1889,6 @@ fn rule_4_does_not_leave_an_account_whose_reset_offer_is_about_to_expire() {
     }
 }
 
-/// WHO IS LEFT EARLY. The 15-minute guard is about leaving: a session is not
-/// moved off an account whose low window is about to reset.
 #[test]
 fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_reset() {
     let r = three();
@@ -2044,10 +2006,6 @@ fn rule_4_probes_when_the_sample_is_due_and_only_then() {
     assert_eq!(ask(&r, &s, Mode::Early, at + PROBE_MAX_S), Advice::Probe);
 }
 
-/// THE CLAIM'S SPACING ([`PROBE_APART_S`], [`probe_held`]): no account is
-/// probed within 90 s of ANY account's claim, and the same account not within
-/// its own floor, twice as long — which the ONE claim field keeps through
-/// another account's claim written over it.
 #[test]
 fn no_account_is_probed_within_ninety_seconds_of_any_accounts_claim() {
     let t = NOW;
@@ -2071,9 +2029,6 @@ fn no_account_is_probed_within_ninety_seconds_of_any_accounts_claim() {
     assert!(!probe_held(&on_main(), "main", t));
 }
 
-/// `advise` and the claim share one test ([`probe_held`]): under another
-/// account's fresh claim the probe is not advised, and the rule goes on to the
-/// leave check.
 #[test]
 fn under_another_accounts_fresh_claim_the_leave_check_answers() {
     let r = three();
@@ -2117,8 +2072,6 @@ fn under_another_accounts_fresh_claim_the_leave_check_answers() {
     assert_eq!(ask(&fresh_main, NOW), Advice::Stay(StayWhy::NothingDue));
 }
 
-/// The unproven active account is never probed: what a `/usage` read shows
-/// there is not known to be that account's.
 #[test]
 fn the_unproven_active_account_is_not_probed() {
     let r = three();
@@ -2235,9 +2188,6 @@ fn the_probe_interval_is_half_the_time_to_the_threshold_clamped() {
     assert!(probe_due(&Account::default(), NOW), "never sampled");
 }
 
-/// THE OWNER'S PIN (`accounts use`): the account's walls are cleared and it is
-/// active, proven and pinned; the compare-and-set holds it; `use --auto` ends
-/// it with a row, and a login found signed out ends it too.
 #[test]
 fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     let r = three();
@@ -2398,10 +2348,6 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     );
 }
 
-/// THE OWNER LIFTED THIS WALL (`Advice::Resume`, between rules 2 and 3). A
-/// session stands at its account's limit; the owner says `accounts use` for
-/// that account, which clears its walls and pins it; the session's row is
-/// older than the clearing, so it continues where it is.
 #[test]
 fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     let r = three();
@@ -2494,9 +2440,6 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     );
 }
 
-/// THE WAIT ENDS AT WHATEVER COMES FIRST. A session held at its wall — by a
-/// canary's hold, or by the machine's rotation bound — waits for the end of
-/// what holds it, or for the roster's next opening where that is sooner.
 #[test]
 fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first() {
     let r = three();
@@ -2576,8 +2519,6 @@ fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first()
     }
 }
 
-/// A ROTATION is the session's alone: its row names it, the account it chose
-/// is active and not proven, and it counts toward the machine's bound.
 #[test]
 fn a_rotation_is_one_sessions_and_is_proven_by_its_accounts_first_response() {
     let mut s = on_main();
@@ -2693,9 +2634,6 @@ fn the_compare_and_set_refuses_by_name_and_changes_nothing() {
     );
 }
 
-/// A STRUCK CANDIDATE puts `active` back, by the word it answered with: its
-/// own wall (limited), a login wall (signed out, which the model has not), a
-/// move that failed with no word (the no-reset ladder).
 #[test]
 fn a_struck_candidate_puts_active_back_and_nobody_else_was_moved() {
     let r = three();
@@ -2770,8 +2708,6 @@ fn a_struck_candidate_puts_active_back_and_nobody_else_was_moved() {
     assert_eq!((s.active.as_deref(), s.proven), (Some("work-2"), false));
 }
 
-/// THE CANARY'S HOLD LASTS TEN MINUTES, to the second, and is over however
-/// long after (the model's `Lapse` has no clock).
 #[test]
 fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
     let r = three();
@@ -2843,10 +2779,6 @@ fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
     );
 }
 
-/// A RELAUNCH THE HOST REFUSES TAKES THE ROTATION BACK EXACTLY — past an
-/// account that had itself not answered too: that account's `previous`, proof
-/// and canary record come back, so a later strike of it does not go back to
-/// nothing.
 #[test]
 fn a_refused_relaunch_takes_the_rotation_back_exactly() {
     let r = three();
@@ -2963,9 +2895,6 @@ fn a_refused_relaunch_takes_the_rotation_back_exactly() {
     }
 }
 
-/// `s-one` rotates main -> work-2 and hits work-2's wall before any response
-/// (recorded with no strike); `s-two` rotates past it to pool-a, which answers
-/// with a wall of its own.
 #[test]
 fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was() {
     let r = three();
@@ -3093,10 +3022,6 @@ fn a_candidate_struck_past_an_unanswered_account_leaves_that_account_as_it_was()
     assert_eq!((older.active.as_deref(), older.proven), (None, false));
 }
 
-/// The host records the wall in the same transaction as the move, and `advise`
-/// gives the same answer before or after: read as usable before its wall is
-/// recorded, `me` would turn "every other account limited" into
-/// `Stay(NoCandidate)` instead of the wait.
 #[test]
 fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
     let r = three();
@@ -3156,9 +3081,6 @@ fn at_a_wall_the_session_is_limited_whether_or_not_its_wall_is_recorded_yet() {
     assert_eq!(next_usable(&r, &s, &enrolled, NOW), Some(NOW));
 }
 
-/// [`Point::LostLogin`]: once the lost login is signed in again (an `ok`
-/// written after `seen`), the same point is advised the session's own account
-/// as a follow, at both of the advice's arms.
 #[test]
 fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     let r = three();
@@ -3234,10 +3156,6 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
     assert_eq!(taken.canary.map(|c| c.sid), Some("s-one".to_string()));
 }
 
-/// Over every small state, at a wall (recorded or not) and at a turn end:
-/// every rotation the advice gives commits on the state with the wall
-/// recorded, and refused its relaunch is taken back to exactly the state it
-/// was made on, less a pin the rotation ended.
 #[test]
 fn every_rotation_the_advice_gives_commits_once_the_wall_is_recorded() {
     let r = three();
@@ -3607,10 +3525,6 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
     assert_eq!(cond(&three(), &only_ran, "pool-a", NOW), Condition::Unseen);
 }
 
-/// An age read as `now - t < WINDOW` with no lower bound makes a stamp ahead of
-/// the clock recent for as long as the clock is behind it: rotation times
-/// would trip the breaker, a probe claim block the probe, and a held sample or
-/// wall shadow every real one.
 #[test]
 fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     let r = three();
@@ -3741,13 +3655,8 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
     assert_eq!(s.accounts["main"].limited_until(NOW), Some(NOW + 30 * MIN));
 }
 
-/// A process's kernel start, as a host would hand it over. Invented.
 const START: &str = "1790000000.250000";
 
-/// One reset attempt a wall, machine-wide: the claim is `Mine` only for the
-/// same session and process while in flight, and holds every other asker; once
-/// it has an outcome or is [`RESET_CLAIM_S`] old, the wall is attempted for
-/// everyone.
 #[test]
 fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     let until = NOW + 30 * HOUR;
@@ -4001,9 +3910,6 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
     assert_eq!(take(&mut older, "s-one", 41, until, NOW + 5), held);
 }
 
-/// A reset used or a limit found lifted clears only its claimed raw wall,
-/// with its timestamp retained in
-/// that wall's slot.
 #[test]
 fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     use aterm_phase::ResetKind;
@@ -4278,9 +4184,6 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     }
 }
 
-/// A reset is allowed only on this machine's own login, with the machine on
-/// that account or on none, and no other login on record as run within
-/// [`RESET_PROFILE_S`] before the process started.
 #[test]
 fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_record() {
     let r = three();
@@ -4623,14 +4526,6 @@ fn the_store_keeps_the_state_private_and_reads_back_what_it_wrote() {
     store.cancel_pin_request(&request, NOW).unwrap();
 }
 
-/// THE MACHINE ID IS MINTED ONCE AND KEPT (the account-stats design §6.3,
-/// F16): a transaction keeps it before its edit stamps anything — 0600 in
-/// `<dir>/machine` — and every load after, by this store or another
-/// instance's over the same directory, names that machine, as do the
-/// observations the transaction made; eight instances keeping one at once
-/// into an empty directory keep one; the id a `state.json` an older build
-/// wrote holds is the one kept, and the kept one then outranks a state that
-/// says another.
 #[test]
 fn the_machine_id_is_minted_once_and_kept() {
     let dir = tmp("machine-id");
@@ -4773,13 +4668,6 @@ fn the_machine_id_is_minted_once_and_kept() {
     );
 }
 
-/// A NAME PUT IN PLACE AFTER ITS OPEN FOUND NOTHING READS ABSENT, A LINK TO
-/// NOTHING IS REFUSED ([`absent_at_open`]): the look that tells a dangling
-/// link from an absent name can come after another instance linked its
-/// machine id in, as the eight keepers race in
-/// `the_machine_id_is_minted_once_and_kept`; the name was absent when it was
-/// opened, so the keeper mints, loses the link and reads the winner's id,
-/// where it was handed the open's `NotFound`.
 #[test]
 fn a_name_put_in_place_after_its_open_reads_absent() {
     let dir = tmp("absent-at-open");
@@ -4837,10 +4725,6 @@ fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
     assert_eq!(store.load(NOW), Ok((s, None)));
 }
 
-/// A state file that is not ours is never saved over: one of another schema,
-/// one that cannot be read, or one too large is refused by name, not read as
-/// an empty state the next save would write over the pin, walls and
-/// signed-out words it may hold.
 #[test]
 fn a_state_file_that_is_not_ours_is_a_refusal_and_never_an_empty_state() {
     let dir = tmp("not-ours");
@@ -5044,7 +4928,6 @@ fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> ProcessLogin {
     ProcessLogin::of_env(pairs.iter().copied())
 }
 
-/// A process on this machine's own login, default home, nothing else set.
 fn stored() -> ProcessLogin {
     ProcessLogin {
         login: None,
@@ -5174,8 +5057,6 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
     );
 }
 
-/// THE SESSION AS `advise` ASKS ABOUT IT ([`ProcessLogin::me`]): the row its
-/// login names, byte for byte, and the two facts carried over.
 #[test]
 fn a_process_login_names_its_row_byte_for_byte() {
     let r = three();
@@ -5210,8 +5091,6 @@ fn a_process_login_names_its_row_byte_for_byte() {
     );
 }
 
-/// [`judged_label`]: the row a process's login names, only for a stored login
-/// in the default home.
 #[test]
 fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
     let r = three();
@@ -5264,9 +5143,6 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
     assert_eq!(judged_label(&r, &stored().with_profile_store(true)), None);
 }
 
-/// [`ProcessLogin::of_exec_env`]: an environment that reads empty was not read
-/// and names no login, never the default one; one with entries but none of the
-/// login's is the default login.
 #[test]
 fn an_exec_environment_that_reads_empty_names_no_login() {
     let of = |entries: &[&str]| {
@@ -5284,8 +5160,6 @@ fn an_exec_environment_that_reads_empty_names_no_login() {
     assert_eq!(of(&[&home]).map(|who| who.default_home), Some(false));
 }
 
-/// [`footer_label`]: [`judged_label`], where the roster lists two or more
-/// rows; under a roster of one the same login is judged and named nowhere.
 #[test]
 fn the_footer_names_an_account_only_where_two_are_listed() {
     let two = roster(&[
@@ -5345,7 +5219,6 @@ fn the_roster_is_beside_the_config_by_one_rule() {
     assert_eq!(roster_beside(Path::new("")), None);
 }
 
-/// A weekly wall written ten seconds ago, resetting in an hour.
 fn weekly() -> StandingWall {
     StandingWall {
         at: (NOW - 10).unsigned_abs(),
@@ -5355,7 +5228,6 @@ fn weekly() -> StandingWall {
     }
 }
 
-/// The process that wrote [`weekly`]'s row started a minute before it.
 const STARTED: i64 = NOW - 70;
 
 #[cfg(unix)]
@@ -5529,10 +5401,6 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
     assert!(store.state_file().exists());
 }
 
-/// A row older than the process is recorded for nobody (design §5): after a
-/// relaunch under another login the transcript's last limit row is the
-/// previous process's, and read as this one's it would mark the account moved
-/// to limited.
 #[test]
 fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_for_nobody() {
     let dir = tmp("recorder-older");
@@ -5564,10 +5432,6 @@ fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_fo
     assert!(!state.accounts.contains_key("main"));
 }
 
-/// The wall is the account's of the process's own login, whatever account is
-/// active (design §5), and the recorder records, it does not strike: a wall on
-/// the account that has not answered yet leaves `active`, its proof, the
-/// canary and the undo where they were.
 #[test]
 fn a_wall_is_recorded_for_the_process_login_whatever_is_active_and_strikes_nothing() {
     let r = three();
@@ -5791,10 +5655,6 @@ fn the_recorder_keeps_what_is_on_record_and_ends_a_pin_at_its_wall() {
     assert!(!store.wake_path().exists());
 }
 
-/// The owner's clearing stands against a row still in a transcript (design §6,
-/// "The owner's word"): a session left standing at the cleared wall has taken
-/// no turn, so the host hands the recorder that same row at every look, and
-/// read as a wall met now it would put the wall back and end the pin.
 #[test]
 fn a_wall_the_owner_cleared_is_not_put_back_by_its_row_and_ends_no_pin() {
     let r = three();
@@ -5941,9 +5801,6 @@ fn the_recorder_refuses_a_state_that_is_not_ours_and_leaves_it_byte_for_byte() {
     assert!(state.accounts["main"].walls.contains_key("seven_day"));
 }
 
-/// A store whose directory cannot be made (a file stands where its parent
-/// should be) is `refused`, by the directory's name, with nothing written
-/// anywhere else; a session's end has nothing to forget there.
 #[test]
 fn the_recorder_says_refused_where_its_directory_cannot_be_made() {
     let dir = tmp("recorder-no-dir");
@@ -6025,8 +5882,6 @@ fn a_session_that_ended_is_forgotten_and_a_canarys_end_wakes_the_others() {
     assert!(after.sessions.is_empty());
 }
 
-/// [`several_listed`]: two or more rows in a roster file that admits, and only
-/// then.
 #[test]
 fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
     let dir = tmp("several");
@@ -6047,9 +5902,6 @@ fn several_accounts_are_listed_only_by_a_roster_that_admits_two() {
     assert!(!several_listed(Some(&path)), "a refused roster lists none");
 }
 
-/// A reset more than [`RESET_BELIEVED_S`] past its row is not believed: it is
-/// recorded as a wall naming none (the no-reset ladder), whoever hands it
-/// over: the recorder, the host's commit (`note_wall`) and a strike.
 #[test]
 fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     let r = three();
@@ -6123,8 +5975,6 @@ fn a_reset_more_than_eight_days_past_its_row_is_recorded_as_naming_none() {
     );
 }
 
-/// A tab closed with no word (a crash, a machine switched off) leaves its row,
-/// which the report's `on:` would name for ever.
 #[test]
 fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
     let dir = tmp("sessions-old");
@@ -6165,9 +6015,6 @@ fn a_session_row_older_than_thirty_days_is_dropped_when_the_state_is_saved() {
     );
 }
 
-/// The vendor's `profile` source comes ahead of the stored login: a process
-/// whose environment names it does not authenticate by a stored login, and
-/// neither does one on a machine whose profile store holds a config.
 #[test]
 fn the_vendors_profile_source_is_not_a_stored_login() {
     use std::path::PathBuf;
@@ -6236,10 +6083,6 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
     );
 }
 
-/// [`ProcessLogin::with_settings`]: a credential, profile or route in a settings
-/// `env` block, a login or home set there, an `apiKeyHelper`, or a source nobody
-/// could read makes the process no stored login, so its wall is recorded for
-/// nobody and the advice is to stay.
 #[test]
 fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
     use crate::harness::netwatch::Source;
@@ -6309,11 +6152,6 @@ fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
     );
 }
 
-/// THE LOCK IS WAITED FOR A BOUNDED TIME by a loop or a host thread
-/// (`Store::acquire_within`, `LOCK_LADDER`): held past it, the recorder
-/// answers `Refused` with exactly `LOCK_HELD` and a session's end is an
-/// error of the same words — nothing read, nothing written — and both
-/// record once the lock is free.
 #[test]
 fn the_recorder_waits_for_the_lock_a_bounded_time_and_says_it_is_held() {
     use std::time::Duration;
@@ -6368,16 +6206,12 @@ fn the_recorder_waits_for_the_lock_a_bounded_time_and_says_it_is_held() {
     assert!(!Recorded::Refused("state.json: schema 2".to_string()).lock_held());
 }
 
-/// The machine's own row, as a rosterless machine under `[harness]
-/// usage_notes` records it.
 fn own_row() -> Roster {
     Roster::own()
 }
 
-/// The own row's label.
 const OWN: &str = super::super::cli::ACCOUNTS_OWN_LABEL;
 
-/// What a screen says, as true at the answer `at` (on UTC's day).
 fn said(at: i64, credits: Option<CreditsRead>, warning: Option<WarningRead>) -> UsageSaid {
     UsageSaid {
         at,
@@ -6387,18 +6221,14 @@ fn said(at: i64, credits: Option<CreditsRead>, warning: Option<WarningRead>) -> 
     }
 }
 
-/// Credits carrying the answer at `at`, past a window resetting at `until`.
 fn on_credits(at: i64, until: Option<i64>) -> UsageSaid {
     said(at, Some(CreditsRead { until }), None)
 }
 
-/// Claude Code's warning, drawn after the answer at `at`, that the week (or
-/// the session window) is at `pct`, resetting at `reset`.
 fn warned(at: i64, weekly: bool, pct: u32, reset: Option<i64>) -> UsageSaid {
     said(at, None, Some(WarningRead { weekly, pct, reset }))
 }
 
-/// The reasons of the ledger's rows of `kind`.
 fn rows_of(store: &Store, kind: Kind) -> Vec<String> {
     store
         .tail(50)
@@ -6409,12 +6239,10 @@ fn rows_of(store: &Store, kind: Kind) -> Vec<String> {
         .collect()
 }
 
-/// `label`'s record as the store holds it at `now`.
 fn held(store: &Store, label: &str, now: i64) -> Account {
     store.load(now).expect("ours").0.account(label)
 }
 
-/// A limit row of `window`, written at `at`, that says credits are off.
 fn off_row(at: i64, window: &str) -> StandingWall {
     StandingWall {
         at: at.unsigned_abs(),
@@ -6427,7 +6255,6 @@ fn off_row(at: i64, window: &str) -> StandingWall {
     }
 }
 
-/// `label`'s credits set to `word` directly.
 fn set_credits(store: &Store, label: &str, word: Credits) {
     let mut note = None;
     store
@@ -6438,7 +6265,6 @@ fn set_credits(store: &Store, label: &str, word: Credits) {
         .expect("written");
 }
 
-/// Credits off, as a limit row an hour before [`NOW`] said.
 fn org_off() -> Credits {
     Credits::Off(CreditsOff {
         reason: "org_level_disabled".to_string(),
@@ -6447,13 +6273,6 @@ fn org_off() -> Credits {
     })
 }
 
-/// USAGE CREDITS ARE RECORDED AS AN EPISODE, AND ITS LINE IS ONCE A DAY
-/// (accounts v2 §5.4): the first answer seen served on credits begins an
-/// episode (a `credits` row, `in use`) that is the day's line; the same
-/// answer said again — the loop's retell, another tab, a loop started again
-/// — writes nothing, and a newer one inside the episode is its newest; the
-/// episode stands to the window's reset, and an answer after it lapsed begins
-/// the next.
 #[test]
 fn credits_are_an_episode_and_its_line_is_once_a_day() {
     let dir = tmp("credits");
@@ -6511,9 +6330,6 @@ fn credits_are_an_episode_and_its_line_is_once_a_day() {
     );
 }
 
-/// Credits stand [`CREDITS_STALE_S`] past the newest answer served on them,
-/// or to the reset of the window they carried past: named, else a session
-/// window from their start.
 #[test]
 fn credits_stand_past_their_newest_answer_or_to_their_windows_reset() {
     let c = CreditsUse {
@@ -6606,8 +6422,6 @@ fn an_older_credits_notice_cannot_extend_the_newest_episode() {
     assert_eq!(rows_of(&store, Kind::Credits), ["in use"]);
 }
 
-/// AN OLDER BUILD'S STATE (no usage keys) reads as none observed, and each
-/// word this build writes reads back whole.
 #[test]
 fn the_usage_keys_round_trip_and_an_older_state_reads_as_none() {
     let mut s = state();
@@ -6653,11 +6467,6 @@ fn the_usage_keys_round_trip_and_an_older_state_reads_as_none() {
     assert_eq!(back.account("main").credits, None, "{text}");
 }
 
-/// WHAT A LIMIT ROW SAYS OF CREDITS IS THE NEWEST WORD ON THEM where it is
-/// ([`record_wall`]): `overageStatus: rejected` with its reason and return is
-/// [`Credits::Off`]; a newer row that says they are on is [`Credits::On`];
-/// one that says nothing changes nothing, and neither does an older one, nor
-/// the same row read again.
 #[test]
 fn a_limit_rows_word_on_credits_is_the_newest_word_on_them() {
     use crate::harness::upgrade::CreditsWord;
@@ -6714,10 +6523,6 @@ fn a_limit_rows_word_on_credits_is_the_newest_word_on_them() {
     );
 }
 
-/// THE WEEK NEARLY USED WITH NO CREDITS IS A LINE ([`windows_full`]): the
-/// vendor's weekly warning at [`WINDOW_FULL_PCT`] with its reset more than a
-/// day off, on an account whose newest word on credits is a limit row's
-/// `off`, with that row's reason.
 #[test]
 fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
     let r = own_row();
@@ -6783,10 +6588,6 @@ fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
     );
 }
 
-/// A LIMIT RESET REFILLS THE WINDOW IT WAS AT, AND NO OTHER (the review of
-/// S5, rounds 3 to 5): on the one-account machine the vendor warned `96% of
-/// your weekly limit` and `91% of your session limit`, credits are off, and
-/// the week's line stands ([`windows_full`]).
 #[test]
 fn a_limit_reset_refills_the_walled_window_and_no_other() {
     let r = own_row();
@@ -6926,6 +6727,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
                 week_reset: Some(week_end),
                 at: NOW,
                 by: String::new(),
+                ..Sample::default()
             },
             NOW,
         );
@@ -7021,10 +6823,6 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
     }
 }
 
-/// A WARNING DRAWN BEFORE A RESET SAYS NOTHING AFTER IT, ON ANY TAB (the
-/// review of S5): tab B has been idle since its last answer, its
-/// footer still drawing `You've used 96% of your weekly limit`, when tab A
-/// meets the weekly wall and a reset refills the week.
 #[test]
 fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
     let dir = tmp("warned-before-reset");
@@ -7079,10 +6877,6 @@ fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
     );
 }
 
-/// CREDITS SEEN CARRYING A SESSION ARE ON (the review of S5): the owner told
-/// that the week is nearly used with credits off ([`windows_full`]) turns
-/// them on, and the next crossing goes on, on credits — with credits on, no
-/// limit row is written that could say they are.
 #[test]
 fn credits_seen_in_use_after_the_row_that_said_them_off_end_its_line() {
     let dir = tmp("credits-back-on");
@@ -7138,12 +6932,6 @@ fn credits_seen_in_use_after_the_row_that_said_them_off_end_its_line() {
     assert!(full(begun + 2 * HOUR + 5).is_empty(), "on again");
 }
 
-/// EACH WINDOW KEEPS ITS OWN WORD (the review of S5): Claude Code shows one
-/// warning at a time, the five-hour window's first, so the week nearly used
-/// with credits off stays a line ([`windows_full`]) when the footer turns to
-/// the session's warning — on a machine whose only reading of the week is
-/// the warning — and the week's word keeps the age of the answer it was
-/// drawn after.
 #[test]
 fn each_window_keeps_its_own_word() {
     let dir = tmp("warned-windows");
@@ -7178,10 +6966,6 @@ fn each_window_keeps_its_own_word() {
     assert!(full(end - DAY).is_empty(), "a week after its answer");
 }
 
-/// THE LINE'S WEEK IS THE WARNING'S WORD, NEVER A SAMPLE'S ([`windows_full`];
-/// S5 beside S3a's usage tap): on the one-account machine the vendor warned
-/// `92% of your weekly limit`, credits are off, and the tap reads the week at
-/// 96%.
 #[test]
 fn the_lines_week_is_the_warnings_word_never_a_samples() {
     let dir = tmp("warned-not-sample");
@@ -7276,8 +7060,6 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
     assert_eq!(full(later + 2 * MIN), line);
 }
 
-/// A tap reading's window, `pct_x10` tenths under `reset`, refilled from
-/// the figure `refilled` where one is given.
 fn win(pct_x10: u32, reset: i64, refilled: Option<u32>) -> Option<WindowRead> {
     Some(WindowRead {
         pct_x10,
@@ -7286,7 +7068,6 @@ fn win(pct_x10: u32, reset: i64, refilled: Option<u32>) -> Option<WindowRead> {
     })
 }
 
-/// A reading of the session window alone, written at `at`.
 fn five(w: Option<WindowRead>, at: i64, seen_before: bool) -> TapRead {
     TapRead {
         five_hour: w,
@@ -7296,10 +7077,6 @@ fn five(w: Option<WindowRead>, at: i64, seen_before: bool) -> TapRead {
     }
 }
 
-/// THE PER-WINDOW RECORD (the account-stats design §3.2): a reading's figure
-/// is kept in TENTHS with its own `as_of` (the reading's time, not the
-/// record's), source and machine, and its whole-percent copy goes to the
-/// sample, rounded half up.
 #[test]
 fn a_tap_reading_is_kept_in_tenths_with_its_own_as_of() {
     let mut s = state();
@@ -7343,10 +7120,6 @@ fn a_tap_reading_is_kept_in_tenths_with_its_own_as_of() {
     assert_eq!(back.accounts["main"].windows, s.accounts["main"].windows);
 }
 
-/// A LIMIT RESET USED INSIDE THE WINDOW OPENS AN EPOCH (the account-stats
-/// design §3.5): 100% and then, from the same process served since, 5%
-/// under the same reset — the record holds 5%, the epoch at the reading,
-/// one `reset` row, and the sample says 5.
 #[test]
 fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
     let reset = NOW + 3 * HOUR;
@@ -7407,9 +7180,6 @@ fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
     assert_eq!(s.accounts["main"].windows[SESSION_LIMIT].pct_x10, 1000);
 }
 
-/// ONE REFILL, HOWEVER MANY SESSIONS SEE IT (the account-stats design
-/// §3.5): tabs A and B on one account were both last read at 100%; a limit
-/// reset is used.
 #[test]
 fn every_session_that_sees_one_refill_records_it_once() {
     let reset = NOW + 3 * HOUR;
@@ -7485,14 +7255,6 @@ fn every_session_that_sees_one_refill_records_it_once() {
     assert_eq!((fig.pct_x10, fig.epoch_at), (20, Some(NOW + 11 * MIN)));
 }
 
-/// ANOTHER ACCOUNT SIGNED IN TO THE HOME (the account-stats design §3.1):
-/// the key is kept from the first reading that names one; a reading under
-/// another key drops everything observed of the old account, with one
-/// `epoch` row and the instant kept (`keyed_at`): its figures and sample,
-/// its wall (until AFTER the new account's reset, so by the newest anchor it
-/// would outrank the new reading in the view), its warning, its credits word
-/// and its reset offer; the login's word stays, and the wall's row read
-/// again does not put it back.
 #[test]
 fn a_reading_under_another_key_starts_the_figures_again() {
     use crate::harness::account_stats::{Tap, held_windows};
@@ -7587,10 +7349,6 @@ fn a_reading_under_another_key_starts_the_figures_again() {
     assert!(s.accounts["main"].walls.is_empty());
 }
 
-/// A FIGURE SERVED BEFORE THE NEW LOGIN WAS ADOPTED IS NOT TAKEN UNDER IT
-/// (the account-stats design §3.1, [`KEY_ADOPT_S`]): a reading is keyed by
-/// the profile the host reads, and a running Claude Code keeps serving on
-/// the login it holds for up to about 30 s after another signs in.
 #[test]
 fn a_figure_served_before_the_new_login_was_adopted_is_not_taken() {
     use crate::harness::profile::AccountKey;
@@ -7638,11 +7396,6 @@ fn a_figure_served_before_the_new_login_was_adopted_is_not_taken() {
     assert_eq!(figure(&s), Some((100, b_reset)));
 }
 
-/// THE ADOPTION'S BOUND, AS ITS TAKERS ASK IT ([`Account::adopting`], the
-/// gate [`note_reading`] keeps and the host's tap reads to try a held-back
-/// reading again): a reading served before the key changed, or up to the
-/// bound's last second after it, is adopting; one served at
-/// [`KEY_ADOPT_S`] after it is not.
 #[test]
 fn an_account_is_adopting_its_new_login_until_the_bound() {
     let changed = Account {
@@ -7658,12 +7411,6 @@ fn an_account_is_adopting_its_new_login_until_the_bound() {
     assert!(!Account::default().adopting(NOW - 5));
 }
 
-/// A DROP BESIDE ANOTHER ACCOUNT'S READING IS NO REFILL ([`note_reading`],
-/// the account-stats design §3.5): the process's reading before was A's 80%
-/// under B's key (held back while B's login was adopted, so the record holds
-/// nothing of it), and its next, served after the bound, is B's 20% under
-/// the same reset — lower, but no reset was used: B's figure is taken with
-/// no epoch and no `reset` row.
 #[test]
 fn a_drop_beside_another_accounts_reading_is_no_refill() {
     use crate::harness::profile::AccountKey;
@@ -7696,12 +7443,6 @@ fn a_drop_beside_another_accounts_reading_is_no_refill() {
     assert_eq!(resets(&events), 1, "{events:?}");
 }
 
-/// A PROCESS BEGUN AFTER A RESET USED INSIDE A WINDOW HOLDS NO REPLY FROM
-/// BEFORE IT ([`TapRead::born`], the review of A1): under the five hours'
-/// epoch, a first reading (`seen_before` false) of a process that began at
-/// or after it — a new tab, a one-turn worker — is taken; one of a process
-/// begun before it, or whose start nobody read, says nothing of the window
-/// and is held back ([`note_reading_held`]).
 #[test]
 fn a_first_reading_of_a_process_begun_after_the_epoch_is_taken() {
     let reset = NOW + 2 * HOUR;
@@ -7737,9 +7478,6 @@ fn a_first_reading_of_a_process_begun_after_the_epoch_is_taken() {
     assert_eq!((pct(&s), held), (80, false));
 }
 
-/// A WINDOW WHOSE RESET PASSED KEEPS ITS VOID FIGURE while readings name
-/// only the other window, for the stats to say `window reset …, no reading
-/// since` ([`WindowFig::current`]).
 #[test]
 fn a_void_window_keeps_its_figure_for_the_stats() {
     let mut s = state();
@@ -7764,11 +7502,6 @@ fn a_void_window_keeps_its_figure_for_the_stats() {
     );
 }
 
-/// THE ONE MERGE OF A WINDOW'S FIGURES ([`merge_fig`]): a void held figure
-/// gives way; the newest anchor wins; within one anchor the newest epoch
-/// cuts what was served before it and the largest of the rest stands; with
-/// both cut the newer is kept; the figure, its reset and its epoch are the
-/// same from either side.
 #[test]
 fn a_windows_figures_merge_by_anchor_then_epoch_then_size() {
     let fig = |pct_x10: u32, reset: i64, at: i64, epoch_at: Option<i64>| WindowFig {
@@ -7822,10 +7555,6 @@ fn a_windows_figures_merge_by_anchor_then_epoch_then_size() {
     assert_eq!(both(&fig(900, reset, NOW - 9, None), &plain).pct_x10, 900);
 }
 
-/// A RESET USED REFILLS THE WALLED WINDOW'S FIGURE ([`reset_outcome`]): the
-/// tap's 100% from before it is cut — an epoch at the outcome — and the
-/// sample written after it holds no figure of that window until a reading
-/// of it comes.
 #[test]
 fn a_reset_used_cuts_the_walled_windows_tap_figure() {
     let week_end = NOW + 4 * DAY;
@@ -7864,8 +7593,6 @@ fn a_reset_used_cuts_the_walled_windows_tap_figure() {
     assert_eq!(lifted.epoch_at, None);
 }
 
-/// The probe's sample of the session window at `pct` resetting at `reset`,
-/// and the week at `week`.
 fn sampled(pct: u32, reset: i64, week: u32) -> Sample {
     Sample {
         session_pct: Some(pct),
@@ -7874,11 +7601,10 @@ fn sampled(pct: u32, reset: i64, week: u32) -> Sample {
         week_reset: Some(NOW + 3 * DAY),
         at: 0,
         by: String::new(),
+        ..Sample::default()
     }
 }
 
-/// A tap reading of the session window at `pct` resetting at `reset`, and
-/// the week at `week`, written at `at` by a process the host read before.
 fn tapped(pct: u32, reset: i64, week: u32, at: i64) -> TapRead {
     TapRead {
         five_hour: Some(WindowRead {
@@ -7898,11 +7624,6 @@ fn tapped(pct: u32, reset: i64, week: u32, at: i64) -> TapRead {
     }
 }
 
-/// [`note_reading`]: within one reset the larger figure stands (60 over a
-/// stale process's later 58), a newer reset takes the newer window, an older
-/// window is never taken, a held window whose reset passed is void, and an
-/// unchanged reading writes nothing until the heartbeat, which writes the same
-/// figures again.
 #[test]
 fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news() {
     let mut s = state();
@@ -8000,13 +7721,6 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
     );
 }
 
-/// ON-SCREEN WARNINGS AND OVERAGE CREDITS ROTATE EARLY BEFORE THE WALL: a
-/// five-hour warning at or above [`LOW_SESSION_PCT`] (90%), a weekly warning at
-/// or above [`LOW_WEEK_PCT`] (97%), or overage credits carrying a session
-/// ([`Credits::InUse`]) marks the subscription [`Condition::Low`], ranks it
-/// behind fresh accounts (`WhyNot::LowAheadOfAWall` ahead of a wall, `Rank {
-/// low: true, .. }` at one), and moves the session to the next fresh
-/// subscription at a turn end in [`Mode::Early`] without typing `/usage`.
 #[test]
 fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the_wall() {
     let r = three();

@@ -20,15 +20,14 @@ use aterm_spec::wait::MUST_HAPPEN;
 pub use crate::ctl_accept::{until_served, was_never_accepted, was_turned_away};
 use crate::{child_output, launch_isolation};
 
-/// How often a readiness EXTRA ([`boot_with`]'s `ready`: a token file, a journal line) is asked once the instance has said its socket listens.
+/// How often a readiness EXTRA ([`boot_with`]'s `ready`: a token file, a journal line) is asked
+/// once the instance has said its socket listens.
 pub const POLL_GAP: Duration = Duration::from_millis(20);
 
-/// One booted headless instance plus its scratch world, torn down (kill, reap, remove) on every exit path.
+/// One booted headless instance plus its scratch world.
 pub struct Instance {
     pub child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it
-    /// ([`launch_isolation::lifeline`]).
+    /// Cut after `child` is killed (fields drop after `Drop::drop`).
     _lifeline: aterm_uds::lifeline::Lifeline,
     pub tmp: PathBuf,
     pub log: PathBuf,
@@ -54,7 +53,7 @@ pub fn remove_world(root: &Path) {
     }
 }
 
-/// The instance's descendants as `ps` shows them now (pid, parent, state, wait channel, age, command), for failure diagnostics.
+/// The instance's descendants as `ps` shows them now.
 #[cfg(unix)]
 pub fn process_tree(inst: &Instance) -> String {
     let out = std::process::Command::new(aterm_uds::os_path!("ps"))
@@ -109,7 +108,8 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A fresh exclusively created scratch root whose socket path fits `sun_path` as its clients dial it ([`launch_isolation::sock_fits`]: the instance's harness host dials the canonical spelling).
+/// A fresh exclusively created scratch root whose socket path fits `sun_path` as its clients dial
+/// it.
 #[track_caller]
 pub fn scratch_root(prefix: &str) -> PathBuf {
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
@@ -130,8 +130,6 @@ pub fn scratch_root(prefix: &str) -> PathBuf {
     could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
-/// Whether the log shows the OS refusing the control socket's `bind` — a
-/// sandboxed runner, not a product failure.
 fn bind_refused_by_the_os(log: &str) -> bool {
     log.lines().any(|l| {
         l.contains("control socket bind failed")
@@ -139,17 +137,11 @@ fn bind_refused_by_the_os(log: &str) -> bool {
     })
 }
 
-/// Whether the log shows CoreGraphics refusing a WindowServer connection — its
-/// own words when a process with no GUI session to join (an ssh login, a CI
-/// box) asks for one.
 fn window_server_refused(log: &str) -> bool {
     log.contains("FAILED TO establish the default connection to the WindowServer")
         || log.contains("_CGSDefaultConnection() is NULL")
 }
 
-/// A dead or never-ready child whose log shows it ASKED for a WindowServer
-/// connection fails the boot, naming the door: a headless
-/// instance never asks, so the refusal is the product's, not the login's.
 fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     let whole = std::fs::read_to_string(log).unwrap_or_default();
     assert!(
@@ -161,8 +153,6 @@ fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     );
 }
 
-/// The environment refusal a dead or socketless child's log names, if any:
-/// the OS refusing the socket's `bind`.
 fn environment_refusal(tail: &str) -> Option<&'static str> {
     bind_refused_by_the_os(tail).then_some("the OS refused the control socket's bind")
 }
@@ -179,12 +169,10 @@ pub fn boot(prefix: &str, args: &[&str]) -> Instance {
     )
 }
 
-/// Arm `cmd` — a `--headless` launch, before any `-e` payload — with its ready
-/// signal (`--ready-fd`, the FIFO in `dir`): the instance says once that its
-/// control socket listens, and [`await_ready`] waits on that word.
-///
+/// Arm `cmd`.
 /// # Panics
-/// The FIFO could not be made in `dir`: a scratch world this test cannot write to is a broken fixture.
+/// The FIFO could not be made in `dir`: a scratch world this test cannot write to is a broken
+/// fixture.
 pub fn arm_ready(cmd: &mut Command, dir: &Path) -> Ready {
     let ready = Ready::open(dir)
         .unwrap_or_else(|e| panic!("arm the instance's ready signal in {}: {e}", dir.display()));
@@ -202,7 +190,7 @@ pub fn boot_with(
     boot_under(prefix, None, configure, ready)
 }
 
-/// [`boot_with`], the instance launched by `/usr/bin/sandbox-exec` under the Seatbelt `profile` (SBPL), which it and everything it starts keep for good.
+/// [`boot_with`], the instance launched by `/usr/bin/sandbox-exec` under the Seatbelt `profile`.
 #[cfg(target_os = "macos")]
 #[track_caller]
 pub fn boot_jailed(
@@ -291,18 +279,14 @@ fn boot_under(
 }
 
 std::thread_local! {
-    /// The stand-ins [`standin`] puts in place while a boot's `configure` runs
-    /// ([`boot_with`], on that boot's thread); `None` outside one.
     static CONFIGURED: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The opening words of the refusal [`boot_with`] ends a test with when the instance's login
-/// shell names a stand-in by another path.
+/// The opening words of the refusal [`boot_with`] ends a test with when the instance's login shell
+/// names a stand-in by another path.
 pub const STANDIN_UNRESOLVED: &str = "the instance's login shell names a stand-in by another path";
 
-/// The PATH `cmd` launches with: the one set on it, none where it was removed,
-/// else this process's, which it inherits.
 fn launch_path(cmd: &Command) -> Option<std::ffi::OsString> {
     match cmd.get_envs().find(|(key, _)| *key == "PATH") {
         Some((_, value)) => value.map(std::ffi::OsStr::to_owned),
@@ -310,8 +294,6 @@ fn launch_path(cmd: &Command) -> Option<std::ffi::OsString> {
     }
 }
 
-/// Whether `a` and `b` name one file or folder: the same text, or the same
-/// place once both resolve.
 fn same_place(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -320,8 +302,6 @@ fn same_place(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// The stand-ins of `standins` a shell reaches by name: each whose folder is
-/// an entry of `path`, once.
 fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let Some(path) = path else {
         return Vec::new();
@@ -339,10 +319,7 @@ fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Ve
     out
 }
 
-/// THE GUARD ([`boot_with`]): the instance's own login shell names
-/// each of `standins` by the stand-in's path, or the test ends COULD NOT RUN
-/// ([`STANDIN_UNRESOLVED`]) with what it named instead — before the test can
-/// type anything: nothing has been typed but `command -v`.
+/// THE GUARD ([`boot_with`]).
 #[track_caller]
 fn prove_standins_resolve(inst: &Instance, standins: &[PathBuf]) {
     let names: Vec<&str> = standins
@@ -378,12 +355,10 @@ fn prove_standins_resolve(inst: &Instance, standins: &[PathBuf]) {
     }
 }
 
-/// What the instance's own login shell — its boot session's — names each of
-/// `names` (`command -v`, which runs nothing): one entry a name, empty where
-/// nothing answers.
-///
+/// What the instance's own login shell names each of `names` (`command -v`).
 /// # Panics
-/// A name a shell would read as more than one word, or a scratch root it would read as more than one quoted word, is a broken fixture.
+/// A name a shell would read as more than one word, or a scratch root it would read as more than
+/// one quoted word, is a broken fixture.
 #[track_caller]
 pub fn login_resolution(inst: &Instance, names: &[&str]) -> Vec<String> {
     for name in names {
@@ -491,10 +466,8 @@ pub fn await_ready<T>(
     );
 }
 
-/// Where a hung instance waits: one of its threads as `/usr/bin/sample` reads it over one second (macOS).
+/// Where a hung instance waits.
 pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
-    /// Enough for the frames from a thread's entry to its wait, at aterm's
-    /// depth.
     const STACK_LINES: usize = 80;
     if !cfg!(target_os = "macos") {
         return "(no sampler on this platform)".to_owned();
@@ -547,7 +520,7 @@ pub fn thread_stack(pid: u32, log: &Path, thread: Option<&str>) -> String {
 /// A `ctl` client that has not exited by now is hung.
 pub const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(120);
 
-/// `aterm ctl --sock <sock> <args…>` against `inst`, in its scratch world, stdout and stderr piped — not yet spawned.
+/// `aterm ctl --sock <sock> <args…>` against `inst`.
 pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -563,7 +536,8 @@ pub fn client_command(inst: &Instance, args: &[&str]) -> Command {
     cmd
 }
 
-/// Run `aterm drive <args…>` in `root`'s scratch environment with `extra` and `cwd` under [`CLIENT_EXIT_DEADLINE`].
+/// Run `aterm drive <args…>` in `root`'s scratch environment with `extra` and `cwd` under
+/// [`CLIENT_EXIT_DEADLINE`].
 pub fn drive_in(root: &Path, args: &[&str], extra: &[(&str, &str)], cwd: Option<&Path>) -> Output {
     let aterm = launch_isolation::aterm_executable();
     aterm_spec::wait::first_exec(&aterm, &["--help"]);
@@ -595,7 +569,7 @@ pub fn said(out: &Output) -> String {
     )
 }
 
-/// One bounded `aterm ctl` call, read until it exits (`support/child_output.rs`: a sibling's spawn can hold its pipes open), asked again while the instance has not yet ACCEPTED it or answers it busy ([`until_served`]).
+/// One bounded `aterm ctl` call.
 pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
     until_served(|| {
         let child = client_command(inst, args).spawn().expect("spawn aterm ctl");
@@ -604,7 +578,7 @@ pub fn ctl(inst: &Instance, args: &[&str]) -> Output {
     })
 }
 
-/// `aterm ctl --sock <sock> subscribe <args…>` against `inst`, returned once the server has ACKNOWLEDGED the subscription (`OK subscribe <n>`, which the client writes to stderr before any frame).
+/// `aterm ctl --sock <sock> subscribe <args…>` against `inst`.
 pub fn subscribed(inst: &Instance, args: &[&str]) -> Child {
     let mut request = vec!["subscribe"];
     request.extend_from_slice(args);
@@ -655,10 +629,10 @@ pub fn ctl_ok(inst: &Instance, args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("utf-8")
 }
 
-/// Put the executable script `text` at `path`, replacing whatever is there, and return once the file it names has been run.
-///
+/// Put the executable script `text` at `path`.
 /// # Panics
-/// When `path`'s directory cannot be made or the script cannot be written: a test without its fake decides nothing.
+/// When `path`'s directory cannot be made or the script cannot be written: a test without its fake
+/// decides nothing.
 pub fn standin(path: &Path, text: &str) {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -698,13 +672,6 @@ pub fn standin(path: &Path, text: &str) {
     run_once(path);
 }
 
-/// The build tree's read-only copy of `text` ([`standin`]): made by whichever
-/// process first needs it — written under a name of its own, then linked
-/// into place, so a concurrent maker finds it whole or makes it — and
-/// trusted only when it reads back as `text` (a digest is no proof) and is
-/// still read-only and executable: the mode is what keeps one test from
-/// writing every test's fake, so a file that lost it (a `chmod -R u+w` of the
-/// target dir, say) is not shared — the caller writes its own.
 fn shared_file(text: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     use std::os::unix::fs::PermissionsExt;
@@ -730,8 +697,6 @@ fn shared_file(text: &str) -> Option<PathBuf> {
     whole(&file).then_some(file)
 }
 
-/// Run `file` once, unbounded, `--version` its argument and every output and
-/// input null: the first exec the system checks ([`standin`]).
 fn run_once(file: &Path) {
     let _ = Command::new(file)
         .arg("--version")
@@ -772,7 +737,7 @@ pub fn type_line(inst: &Instance, sid: &str, line: &str) {
     ctl_ok(inst, &[&format!("@{sid}"), "key", "enter"]);
 }
 
-/// A zsh for a live test, found as every live suite finds its shells ([`aterm_spec::host::test_shell`]).
+/// A zsh for a live test.
 pub fn zsh() -> Option<&'static str> {
     static ZSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     ZSH.get_or_init(|| {
@@ -790,16 +755,16 @@ pub fn need_zsh() -> &'static str {
     }
 }
 
-/// A login shell for a live test whose claim holds under every shell aterm integrates alike, and the startup file a tab of it reads from the instance's home.
+/// A login shell for a live test whose claim holds under every shell aterm integrates alike.
 #[derive(Clone, Copy, Debug)]
 pub struct LoginShell {
     pub path: &'static str,
-    /// `.zshrc` or `.bashrc`: aterm's loader reads it in every tab (bash's, after the login profiles on macOS).
+    /// `.zshrc` or `.bashrc`.
     pub rc: &'static str,
     pub kind: aterm_shell_integration::ShellType,
 }
 
-/// zsh where the host has one (every Mac; the lab's Linux lane), else bash, which every Unix host aterm supports has at `/bin/bash`.
+/// zsh where the host has one (every Mac; the lab's Linux lane).
 pub fn login_shell() -> LoginShell {
     use aterm_shell_integration::ShellType;
     match zsh() {

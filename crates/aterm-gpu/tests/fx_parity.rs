@@ -17,7 +17,6 @@ use crate::common::{self, max_channel_delta};
 const ROWS: usize = 8;
 const COLS: usize = 24;
 
-/// xorshift64: deterministic and dependency-free.
 struct Rng(u64);
 
 impl Rng {
@@ -35,8 +34,6 @@ impl Rng {
     }
 }
 
-/// The renderers under test: the renderer's own arm and, in the oracle build
-/// on macOS or Linux, the wgpu oracle, each beside its own CPU twin.
 fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     let (cpu, gpu) = common::backends(18.0, theme);
     #[allow(unused_mut, reason = "the oracle build adds an arm")]
@@ -50,8 +47,6 @@ fn arms(theme: Theme) -> Vec<(&'static str, Renderer, aterm_gpu::GpuRenderer)> {
     out
 }
 
-/// After a frame: that it drew on the arm `arm` names (Metal is the native
-/// arm on macOS and GL on Linux; the oracle is neither).
 fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -69,8 +64,6 @@ fn assert_arm(arm: &str, gpu: &aterm_gpu::GpuRenderer) {
     let _ = (arm, gpu);
 }
 
-/// A base whose CPU and GPU pixels are byte-equal (procedural blocks and
-/// background fills, no glyph coverage), so any delta is the fx layers'.
 fn base_terminal() -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
@@ -104,8 +97,6 @@ fn layer(
     )
 }
 
-/// A random premultiplied art: additive texels (`a = 0` with colour), clear,
-/// opaque and translucent ones.
 fn premul_art(rng: &mut Rng) -> Arc<FxArt> {
     let (w, h) = (rng.range(1, 7) as u16, rng.range(1, 7) as u16);
     let mut data = Vec::new();
@@ -121,7 +112,6 @@ fn premul_art(rng: &mut Rng) -> Arc<FxArt> {
     Arc::new(FxArt::new(w, h, FxTexels::Rgba8Premul, data).expect("sized"))
 }
 
-/// A straight-alpha art with opaque, translucent and clear texels.
 fn straight_art(rng: &mut Rng) -> Arc<FxArt> {
     let (w, h) = (rng.range(1, 7) as u16, rng.range(1, 7) as u16);
     let mut data = Vec::new();
@@ -158,11 +148,6 @@ fn sprite_clip(rng: &mut Rng, x: i32, y: i32) -> PxRect {
     }
 }
 
-/// A random layer over a `w × h` frame: an all-additive or all-over palette
-/// (so a rect is one kind at both ends), rects, ramps and Index8 and Premul
-/// sprites at any scale for an Exact layer, Straight sprites for a Linear
-/// one; sometimes clipped, sometimes off the frame's edges, in either space,
-/// at any slot its blend allows.
 fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer {
     let additive = rng.below(2) == 0;
     let palette: Vec<FxInk> = (0..12)
@@ -264,10 +249,6 @@ fn random_layer(rng: &mut Rng, id: u64, linear: bool, w: i64, h: i64) -> FxLayer
     l
 }
 
-/// Items pixel law F says write nothing or write their lerped ink: a rect
-/// whose right end is past the palette, an Index8 texel past it, a ramps
-/// stack whose last rows run off the palette, and a rect additive at one end
-/// and source-over at the other.
 fn malformed_layer() -> FxLayer {
     let art =
         Arc::new(FxArt::new(3, 2, FxTexels::Index8, vec![1u8, 2, 3, 3, 2, 1]).expect("sized"));
@@ -319,10 +300,6 @@ fn malformed_layer() -> FxLayer {
     )
 }
 
-/// One frame of every kind at once: an additive gradient rect crossing three
-/// bands, a source-over flat rect, ramps, an Index8 sprite at an odd scale
-/// and flipped, a Premul sprite magnified and clipped, a sprite whose origin
-/// sits far left of the frame, two occluders, and the malformed layer.
 fn every_kind() -> (Vec<FxLayer>, Vec<PxRect>) {
     let index = Arc::new(
         FxArt::new(
@@ -429,10 +406,6 @@ fn every_kind() -> (Vec<FxLayer>, Vec<PxRect>) {
     (layers, occluders)
 }
 
-/// THE BYTE LAW: Exact fx layers draw byte-equal to the CPU on every arm,
-/// over the every-kind frame and random frames through the present path on
-/// one window (a frame whose layers changed repaints in full: the row diff
-/// takes only settled layers, `aterm_render::compute_dirty_rows`).
 #[test]
 fn exact_fx_layers_are_byte_exact_on_the_gpu() {
     let theme = Theme::default();
@@ -460,10 +433,13 @@ fn exact_fx_layers_are_byte_exact_on_the_gpu() {
         assert_ne!(c.pixels, cb.pixels, "{arm}: the every-kind frame paints");
         let shape = gpu.frame_shape();
         assert!(shape.fx_instances > 0, "{arm}: the GPU built fx instances");
-        assert_eq!(
-            max_channel_delta(&c.pixels, &g.pixels),
-            0,
-            "{arm}: the every-kind frame is byte-exact"
+        let delta = max_channel_delta(&c.pixels, &g.pixels);
+        common::assert_byte_exact(
+            "exact_fx_layers_are_byte_exact_on_the_gpu",
+            &format!("{arm}: the every-kind frame"),
+            &gpu,
+            delta,
+            format_args!("{arm}: the every-kind frame is byte-exact (got {delta})"),
         );
         let mut rng = Rng(0x5eed_f00d_0dd5_cafe);
         let mut layers: Vec<FxLayer> = Vec::new();
@@ -501,14 +477,17 @@ fn exact_fx_layers_are_byte_exact_on_the_gpu() {
                 gpu.present_input_readback(&mut win, &input),
             );
             let delta = max_channel_delta(&c.pixels, &g.pixels);
-            assert_eq!(delta, 0, "{arm}: frame {frame} over {layers:#?}");
+            common::assert_byte_exact(
+                "exact_fx_layers_are_byte_exact_on_the_gpu",
+                &format!("{arm}: frame {frame}"),
+                &gpu,
+                delta,
+                format_args!("{arm}: frame {frame} (got {delta}) over {layers:#?}"),
+            );
         }
     }
 }
 
-/// THE BAND LAW on the GPU: a settled additive layer spans every row while
-/// only rows 2 and 5 change, so the damaged frame repaints the band 2..=5 under
-/// one scissor and Loads rows 3 and 4.
 #[test]
 fn fx_dirty_band_restamps_only_its_band_on_the_gpu() {
     let theme = Theme::default();
@@ -578,8 +557,6 @@ fn fx_dirty_band_restamps_only_its_band_on_the_gpu() {
     }
 }
 
-/// Linear layers (Straight sprites in the sRGB groups) hold FreeSprite's
-/// linear-light tolerance: at most 2 per channel.
 #[test]
 fn linear_fx_layers_hold_the_free_sprite_tolerance() {
     let theme = Theme::default();
@@ -612,10 +589,6 @@ fn linear_fx_layers_hold_the_free_sprite_tolerance() {
     }
 }
 
-/// THE BYTE RECOVERY per arm: all 256 values of every channel through the
-/// Rgba8 atlas (a Premul art), every index through the R8 atlas and every
-/// palette byte (an Index8 art over 255 entries), drawn 1:1 and opaque,
-/// reach the frame unchanged.
 #[test]
 fn fx_texel_bytes_survive_the_arm() {
     let theme = Theme::default();
@@ -675,10 +648,6 @@ fn fx_texel_bytes_survive_the_arm() {
     }
 }
 
-/// THE COMPARATOR'S CONTROL: the same art through FreeSprite's float path
-/// (a float UV picks the texel, a float linear-light blend composites it)
-/// shows a nonzero delta at odd scales, where the fx integer path (integer
-/// texel map, `over_premul` on the Unorm view) shows none.
 #[test]
 fn free_sprites_float_path_misses_where_fx_maps_exactly() {
     let theme = Theme::default();
@@ -777,11 +746,6 @@ fn free_sprites_float_path_misses_where_fx_maps_exactly() {
     }
 }
 
-/// THE PASS LAW (design §4.5): an fx layer draws inside a group of its own
-/// format, so a frame drawing one opens exactly the passes of the same frame
-/// drawing the effect whose slot it shares: Exact Under as a `glow_under`
-/// quad, Exact Glow and Over as a `nova_add` quad, Linear Under and Over as a
-/// FreeSprite under and over the text.
 #[test]
 fn fx_layers_open_the_passes_their_slots_already_open() {
     let theme = Theme::default();
@@ -886,11 +850,6 @@ fn fx_layers_open_the_passes_their_slots_already_open() {
     }
 }
 
-/// `fx_prefetch` makes arts resident without drawing (design §4.6, eager
-/// residency): a prefetch-only frame uploads the art's texels and draws
-/// byte-equal to the frame without it; the same prefetch again uploads
-/// nothing; and the first frame that draws the art uploads only its instances
-/// and palette, where a renderer with no prefetch also uploads the texels.
 #[test]
 fn fx_prefetch_makes_arts_resident_without_drawing() {
     let theme = Theme::default();
@@ -975,10 +934,6 @@ fn fx_prefetch_makes_arts_resident_without_drawing() {
     }
 }
 
-/// A rebuilt device holds no fx residency: a fresh renderer handed the same
-/// layer `Arc`s, and a renderer whose arm residency was dropped mid-life,
-/// re-mint the atlases, refill them from the atlas log and draw byte-equal
-/// to the CPU and to the frame before.
 #[test]
 fn fx_residency_refills_after_a_device_rebuild() {
     let theme = Theme::default();
@@ -1015,9 +970,6 @@ fn fx_residency_refills_after_a_device_rebuild() {
     );
 }
 
-/// Whether a neighbour stream changes a pixel the fx layer paints: some pixel
-/// `solo` (the layer alone) moved from `base` (no layer) and `with` (the layer
-/// and the neighbour) moved from `solo`.
 fn shares_pixels(base: &[u32], solo: &[u32], with: &[u32]) -> bool {
     base.iter()
         .zip(solo)
@@ -1025,8 +977,6 @@ fn shares_pixels(base: &[u32], solo: &[u32], with: &[u32]) -> bool {
         .any(|((b, s), w)| b != s && s != w)
 }
 
-/// THE SLOT LAW (design §4.5): each slot draws between the same neighbours on
-/// the GPU as on the CPU.
 #[test]
 fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
     use aterm_render::{FireMode, FirePatch, GlowQuad, HaloMode, RainHalo};
@@ -1241,8 +1191,6 @@ fn fx_slots_draw_between_their_neighbours_on_the_gpu() {
     }
 }
 
-/// A `bloom` layer with no aurora on the frame: an additive rect and an
-/// Index8 sprite at the Glow slot.
 fn blooming_layer() -> FxLayer {
     let art =
         Arc::new(FxArt::new(3, 2, FxTexels::Index8, vec![1u8, 0, 2, 2, 1, 0]).expect("sized"));
@@ -1280,8 +1228,6 @@ fn blooming_layer() -> FxLayer {
     l
 }
 
-/// THE BLOOM FEED (design §4.6): a `bloom` layer is the bloom's light on a
-/// frame with no aurora.
 #[test]
 fn bloom_fx_layers_feed_the_gpu_bloom() {
     let theme = Theme::default();
@@ -1389,11 +1335,6 @@ fn an_fx_only_bloom_frame_takes_the_crown() {
     assert_eq!(over_white(false), 0, "control: a plain layer does not");
 }
 
-/// THE FRAME ART BUDGET on the GPU (design §4.6): a frame naming nine
-/// distinct 2048×1024 Index8 arts (half again what a 4096² atlas holds)
-/// draws the first two, which fill [`aterm_core::render::FX_FRAME_ART_TEXELS`],
-/// and refuses the other seven on the CPU and every arm alike: byte-exact,
-/// with the refusals counted in `fx_refused`.
 #[test]
 fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
     use aterm_core::render::{FX_ART_MAX_SIDE, FX_FRAME_ART_TEXELS};
@@ -1457,11 +1398,6 @@ fn an_over_budget_frame_draws_the_same_arts_on_the_gpu() {
     }
 }
 
-/// THE GATE OWES THE PREFETCH (design §4.6, eager residency): an unchanged
-/// frame re-presents cached pixels through `render_input_cached`'s gate, but
-/// a new `fx_prefetch` list (which draws nothing, so the pixels compare
-/// equal) misses once, and that encode uploads the arts; the same list again
-/// hits.
 #[test]
 fn a_new_prefetch_misses_the_cached_gate_once() {
     let theme = Theme::default();

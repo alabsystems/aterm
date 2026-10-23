@@ -308,8 +308,7 @@ mod macos {
                 if into.contains(&next) {
                     continue;
                 }
-                // SAFETY: `protocol` answers a live protocol object or nil, and
-                // `protocol_parents` tolerates nil.
+                // SAFETY: `protocol` answers a live protocol object or nil.
                 stack.extend(protocol_parents(protocol(cstr_named(&next))));
                 into.push(next);
             }
@@ -332,8 +331,7 @@ mod macos {
             &mut names,
             target.informal.iter().map(|(n, _)| (*n).to_owned()),
         );
-        // SAFETY: `cls` is a live class object; `superclass_of` tolerates and
-        // terminates at nil, and `class_protocols` tolerates nil.
+        // SAFETY: `cls` is a live class object.
         let mut walk = unsafe { superclass_of(cls) };
         while !walk.is_null() {
             // SAFETY: `walk` is a live class while non-null.
@@ -352,8 +350,7 @@ mod macos {
     fn protocols_declaring(sel: Sel) -> Vec<(String, String)> {
         let mut found = Vec::new();
         for (name, proto) in loaded_protocols() {
-            // SAFETY: `proto` came from `objc_copyProtocolList` and protocol
-            // objects are immortal; `sel` is interned.
+            // SAFETY: `proto` came from `objc_copyProtocolList` and protocol objects are immortal.
             if let Some(types) = unsafe { protocol_method_types(proto, sel, true) } {
                 found.push((name, strip_method_offsets(&types)));
             }
@@ -372,8 +369,7 @@ mod macos {
             fn free(ptr: *mut std::ffi::c_void);
         }
         let mut count: std::ffi::c_uint = 0;
-        // SAFETY: the runtime writes the count through the pointer and hands
-        // back a malloc'd array this function owns, or null with a zero count.
+        // SAFETY: the runtime writes the count through the pointer.
         let list = unsafe { objc_copyProtocolList(&raw mut count) };
         if list.is_null() {
             return Vec::new();
@@ -386,8 +382,7 @@ mod macos {
             let name = unsafe { CStr::from_ptr(protocol_getName(proto)) };
             out.push((name.to_string_lossy().into_owned(), proto));
         }
-        // SAFETY: The array is this function's to free; the protocol objects it held are immortal
-        // and are not touched.
+        // SAFETY: The array is this function's to free.
         unsafe { free(list.cast()) };
         out
     }
@@ -405,9 +400,7 @@ mod macos {
             return Vec::new();
         }
         let mut count: std::ffi::c_uint = 0;
-        // SAFETY: `proto` is a live protocol object; the runtime writes the
-        // count through the pointer and hands back a malloc'd array this
-        // function owns, or null with a zero count.
+        // SAFETY: `proto` is a live protocol object.
         let list = unsafe { protocol_copyProtocolList(proto, &raw mut count) };
         if list.is_null() {
             return Vec::new();
@@ -418,8 +411,7 @@ mod macos {
             let name = unsafe { CStr::from_ptr(protocol_getName(*list.add(i))) };
             names.push(name.to_string_lossy().into_owned());
         }
-        // SAFETY: the array is this function's to free; the protocol objects it
-        // held are immortal and are not touched.
+        // SAFETY: the array is this function's to free.
         unsafe { free(list.cast()) };
         names
     }
@@ -436,12 +428,9 @@ mod macos {
         unsafe extern "C" {
             fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> std::ffi::c_int;
         }
-        // SAFETY: `DlInfo` is four raw pointers, for which an all-zero bit pattern is a valid
-        // (null) value.
+        // SAFETY: `DlInfo` is four raw pointers, so an all-zero bit pattern is valid.
         let mut info: DlInfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `imp` is a code address the runtime handed back and is never
-        // dereferenced; `dladdr` reads the loader's tables and fills `info`,
-        // answering 0 for an address in no loaded image.
+        // SAFETY: `imp` is a code address the runtime handed back and is never dereferenced.
         let ok = unsafe { dladdr(imp, &raw mut info) };
         if ok == 0 || info.dli_fname.is_null() {
             return None;
@@ -455,9 +444,7 @@ mod macos {
     }
 
     fn protocol_declares(p: &'static CStr, name: &str) -> Option<String> {
-        // SAFETY: `protocol` answers a live protocol object or nil (nil for a
-        // framework that is not loaded, which `protocol_method_types`
-        // tolerates), and `sel_named` interns the selector.
+        // SAFETY: `protocol` answers a live protocol object or nil.
         let types = unsafe { protocol_method_types(protocol(p), sel_named(name), true) };
         types.map(|t| strip_method_offsets(&t))
     }
@@ -567,9 +554,7 @@ mod macos {
         ) -> (Source, Option<String>) {
             let mut hits: Vec<(&'static CStr, String)> = Vec::new();
             for name in authorities {
-                // SAFETY: `protocol` returns a live protocol object or nil (nil
-                // for a framework that is not loaded, which
-                // `protocol_method_types` tolerates), and `sel` is interned.
+                // SAFETY: `protocol` returns a live protocol object or nil.
                 if let Some(types) = unsafe { protocol_method_types(protocol(name), sel, true) } {
                     hits.push((name, strip_method_offsets(&types)));
                 }
@@ -591,9 +576,7 @@ mod macos {
                 return (Source::Protocol(first), Some(encoding.clone()));
             }
             for name in target.authority_classes {
-                // SAFETY: every name here is a framework class that is linked
-                // and live; `sel` is interned. `method_types` answers `None`
-                // for a selector the class does not implement.
+                // SAFETY: every name here is a framework class that is linked and live.
                 if let Some(types) = unsafe { method_types(class(name), sel) } {
                     return (Source::Class(name), Some(strip_method_offsets(&types)));
                 }
@@ -976,11 +959,8 @@ mod macos {
                 return;
             }
             const NS_TERMINATE_NOW: usize = 1;
-            // SAFETY: `applicationShouldTerminate:` is registered `Q@:@` (audited
-            // in part A, against the protocol where this host has it and the
-            // fork's declaration where it does not); `app_delegate` and `app` are
-            // the live objects AppKit is holding; the handler consults a hook this
-            // process never installs and performs no send of its own.
+            // SAFETY: `applicationShouldTerminate:` is registered `Q@:@` (audited in part A);
+            // `app_delegate` and `app` are the live objects AppKit is holding.
             let reply: usize = unsafe {
                 let send: unsafe extern "C-unwind" fn(Id, Sel, Id) -> usize = checked_msg();
                 send(app_delegate, sel!(applicationShouldTerminate:), app)
@@ -1279,8 +1259,7 @@ mod macos {
                 builder.add_method(sel!(atermAuditLyingRect), imp, PROBE_LIE);
             }
             let probe = builder.register();
-            // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject` subclass whose only ivar
-            // is a zero-sized Rust payload.
+            // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject` subclass with ZST ivars.
             let obj = unsafe {
                 let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
                 send(send(probe.class().as_id(), sel!(alloc)), sel!(init))
@@ -1325,8 +1304,7 @@ mod macos {
                 builder.add_method(sel!(atermAuditLyingPoint), point_imp, PROBE_LIE_POINT);
             }
             let point_probe = builder.register();
-            // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject`
-            // subclass whose only ivar is a zero-sized Rust payload.
+            // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject` subclass with ZST ivars.
             let pobj = unsafe {
                 let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
                 send(send(point_probe.class().as_id(), sel!(alloc)), sel!(init))
@@ -1472,8 +1450,7 @@ mod macos {
             expect_agreement: bool,
         ) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
-            // SAFETY: `probe_point` really is `(id, SEL) -> CGPoint`, correct for both
-            // registrations, which share that function.
+            // SAFETY: `probe_point` has signature `(id, SEL) -> CGPoint` for both registrations.
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the control sends through a deliberately mis-registered row, which the checked send would refuse"
@@ -1483,8 +1460,7 @@ mod macos {
                     aterm_objc::msg();
                 send(obj, sel)
             };
-            // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an autoreleased
-            // signature or nil.
+            // SAFETY: `obj` is live.
             let sig: Id = unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = checked_msg();
                 f(obj, sel!(methodSignatureForSelector:), sel)
@@ -1554,8 +1530,7 @@ mod macos {
 
         fn probe_row(&mut self, obj: Id, sel: Sel, encoding: &str, expect_agreement: bool) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
-            // SAFETY: `probe_rect` really is `(id, SEL) -> CGRect`, correct for both registrations,
-            // which share that function.
+            // SAFETY: `probe_rect` has signature `(id, SEL) -> CGRect` for both registrations.
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the control sends through a deliberately mis-registered row, which the checked send would refuse"
@@ -1638,8 +1613,7 @@ mod macos {
         }
 
         fn audited_class(&mut self, instance: Id) -> (aterm_objc::ClassPtr, Option<String>) {
-            // SAFETY: `instance` is a live object; `-class` is `#@:` on every
-            // Apple runtime and `object_getClass` reads the isa directly.
+            // SAFETY: `instance` is a live object and `-class` is `#@:` on every Apple runtime.
             let (reported, isa) = unsafe {
                 let send: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::ClassPtr =
                     checked_msg();
@@ -1813,8 +1787,7 @@ mod macos {
             let cls = unsafe { class_of(instance) };
             for name in ours {
                 let sel = sel_named(name);
-                // SAFETY: `cls` is live and `sel` is interned; `method_imp`
-                // answers `None` for a selector the class does not respond to.
+                // SAFETY: `cls` is live and `sel` is interned.
                 let Some(imp) = (unsafe { aterm_objc::method_imp(cls, sel) }) else {
                     self.fail(format!(
                         "{}: the class has no implementation of it at all",

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE GEMINI CLI LANE, ITS I/O HALF ([`super::super::upgrade_gemini`] is the pure half): a Gemini CLI that crashed out of its tab is relaunched there on its own session, in its own project, and one aterm's own end took is brought back in its reopened tab.
+//! THE GEMINI CLI LANE.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,33 +21,21 @@ use super::{
 };
 use crate::supervise::run::composer_guard_at;
 
-/// The process facts the Gemini CLI lane rests on, each read when asked: the Claude lane's [`Kernel`] plus Gemini CLI's needs.
+/// The process facts the Gemini CLI lane rests on.
 pub(super) trait GeminiKernel: Kernel {
-    /// Whether `pid` lives.
     fn alive(&self, pid: u32) -> bool;
-    /// `pid`'s argv and initial environment (`KERN_PROCARGS2`).
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs>;
-    /// The executable the kernel mapped for `pid`.
     fn exe(&self, pid: u32) -> Option<PathBuf>;
-    /// `pid`'s working directory, as the kernel names it (the path a node process's `process.cwd()` returns: its project).
     fn cwd(&self, pid: u32) -> Option<String>;
-    /// When `pid` started, unix milliseconds, never later than it did (the kernel's microsecond birth where it keeps one; else a second's read, less its slack).
     fn start_ms(&self, pid: u32) -> Option<u64>;
-    /// The Gemini CLI child `pid` started (`node --max-old-space-size=… <the script>`), where one lives.
     fn child_of(&self, pid: u32) -> Option<u32>;
-    /// Whether the orphaned child `child` of a killed parent still reads the terminal: alive and in the terminal's foreground group.
     fn reads_terminal(&self, child: u32) -> bool;
-    /// Whether `shell`'s group holds its terminal again (`pgid == tpgid`).
     fn shell_has_terminal(&self, shell: u32) -> bool;
-    /// The live Gemini CLI parents whose parent is `shell`, with their argv.
     fn gemini_children(&self, shell: u32) -> Vec<(u32, Vec<String>)>;
-    /// The live Gemini CLI parents ([`ug::is_gemini_process`]) whose working directory is `root`, each with its argv and its start ([`Self::start_ms`]; `0` unread).
     fn project_geminis(&self, root: &str) -> Option<Vec<(u32, Vec<String>, u64)>>;
-    /// Whether `pid` is still the foreground group of `tab` by the host's own roster: asked right before every typed act.
     fn in_tab(&self, c: &mut Client, pid: u32, tab: &str) -> bool;
 }
 
-/// `pid`'s start as [`GeminiKernel::start_ms`] reads it on this host.
 fn live_start_ms(pid: u32) -> Option<u64> {
     #[cfg(target_vendor = "apple")]
     {
@@ -146,8 +134,6 @@ impl GeminiKernel for Live {
     }
 }
 
-/// The Gemini CLI lane's per-tab record prefix ([`Agent::record_prefix`]),
-/// `gemini-`: placed at compile time, which fails where Gemini CLI keys none.
 const PREFIX: &str = match Agent::Gemini.record_prefix() {
     Some(prefix) => prefix,
     None => panic!("the Gemini CLI lane keys its records by tab"),
@@ -162,7 +148,7 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// THE PROJECT DIRECTORY OF `root` under the Gemini directory `gemini` (`<gemini>/tmp/<slug>`): the slug `projects.json` maps the project to, where that directory's `.project_root` names it, else the one directory under `tmp/` whose `.project_root` does (the CLI's own lookup, bundle: `ProjectRegistry.getShortId`).
+/// THE PROJECT DIRECTORY OF `root` under the Gemini directory `gemini` (`<gemini>/tmp/<slug>`).
 pub(super) fn project_dir(gemini: &Path, root: &str) -> Option<PathBuf> {
     if root.is_empty() {
         return None;
@@ -201,18 +187,13 @@ pub(super) fn project_dir(gemini: &Path, root: &str) -> Option<PathBuf> {
     }
 }
 
-/// When `meta` says its file was last written, unix milliseconds.
 fn mtime_ms(meta: &std::fs::Metadata) -> Option<u64> {
     let at = meta.modified().ok()?;
     u64::try_from(at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
-/// One session file read: its name, its words, its mtime.
 type Read = (String, String, Option<u64>);
 
-/// THE SESSION FILES OF `chats` WRITTEN SINCE `since_ms` (a second's slack
-/// before it): every `session-*.jsonl` whose mtime is no earlier, the only
-/// ones that can hold a header, a turn or a switch of a process started then.
 fn files_since(chats: &Path, since_ms: u64) -> Option<Vec<Read>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(chats).ok()?.flatten() {
@@ -235,9 +216,6 @@ fn files_since(chats: &Path, since_ms: u64) -> Option<Vec<Read>> {
     Some(out)
 }
 
-/// THE FILES OF `session` IN `chats` (`session-*-<id8>.jsonl`, a legacy
-/// `.json` named with no words), for the pre-check and the witness's count of
-/// that session's resumes.
 fn session_files(chats: &Path, session: &str) -> Option<Vec<Read>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(chats).ok()?.flatten() {
@@ -265,7 +243,7 @@ fn as_files(read: &[Read]) -> Vec<ug::ChatsFile<'_>> {
         .collect()
 }
 
-/// THE PRE-CHECK OF A RESUME OF `session` IN `chats`, read now ([`ug::precheck`]); unreadable reads as [`Precheck::Unreadable`].
+/// THE PRE-CHECK OF A RESUME OF `session` IN `chats`.
 pub(super) fn precheck_at(chats: Option<&Path>, session: &str) -> Precheck {
     let Some(read) = chats.and_then(|c| session_files(c, session)) else {
         return Precheck::Unreadable("chats".to_string());
@@ -273,11 +251,6 @@ pub(super) fn precheck_at(chats: Option<&Path>, session: &str) -> Precheck {
     ug::precheck(&as_files(&read), session)
 }
 
-/// THE SESSION THE PROCESS `pid` (argv `argv`, started at `start_ms`) OF THE
-/// PROJECT `root` RUNS, by the start-time rule ([`ug::witness`]) over the
-/// project's chats directory `chats`, read now: with another Gemini CLI of
-/// the project started within [`ug::START_WINDOW_MS`] of it (or none that can
-/// be read) as started together.
 fn witness_of(
     chats: Option<&Path>,
     root: &str,
@@ -310,18 +283,12 @@ fn witness_of(
     )
 }
 
-/// The version of the Gemini CLI install the script `script` (a parent's
-/// `argv[1]`) is (`<install>/package.json` beside its `bundle/`, the link
-/// resolved); `None` where none is read.
 fn bundle_version(script: Option<&String>) -> Option<String> {
     let resolved = std::fs::canonicalize(script?).ok()?;
     let install = resolved.parent()?.parent()?;
     ug::package_version(&std::fs::read_to_string(install.join("package.json")).ok()?)
 }
 
-/// Whether no other live Gemini CLI of the project runs `session`, as far as
-/// a read tells: none names it in its argv (a person resumed it in another
-/// tab), and the start-time rule names it for none.
 fn session_free(chats: Option<&Path>, root: &str, session: &str, k: &dyn GeminiKernel) -> bool {
     let Some(others) = k.project_geminis(root) else {
         return false;
@@ -332,7 +299,7 @@ fn session_free(chats: Option<&Path>, root: &str, session: &str, k: &dyn GeminiK
     })
 }
 
-/// THE LINE A PERSON IS TOLD for `snap`'s Gemini CLI, where running it is safe: Gemini CLI's own `gemini --resume <uuid>` in its project, behind its homes ([`ug::told_line`]), for the session its witness named — else the one its argv names — and only where the pre-check, read now, says that resume loads every turn ([`Precheck::Safe`]).
+/// THE LINE A PERSON IS TOLD for `snap`'s Gemini CLI.
 pub(super) fn told(snap: &super::super::relaunch::Snapshot) -> Option<String> {
     let run = snap.gemini()?;
     let session = snap
@@ -342,7 +309,7 @@ pub(super) fn told(snap: &super::super::relaunch::Snapshot) -> Option<String> {
     told_at(&session, run.chats.as_deref(), &run.env, &snap.cwd)
 }
 
-/// [`told`] of `session` in the project `root` whose chats directory is `chats`, behind the homes `env`: the line where the pre-check, read now, says the resume loads every turn.
+/// [`told`] of `session` in the project `root` whose chats directory is `chats`.
 pub(super) fn told_at(
     session: &str,
     chats: Option<&Path>,
@@ -354,11 +321,6 @@ pub(super) fn told_at(
         .flatten()
 }
 
-/// THE WORD OF THE RELAUNCH LINE'S OWN COMMAND (its block `block`,
-/// [`St::line_block`], read right before the line was typed), once it ended
-/// ([`ug::line_exit_kind`]): the CLI refused the resume (`42`), or the shell
-/// could not run the line (refused too), or the relaunched Gemini CLI ended
-/// by its own or someone's hand, or crashed.
 fn line_word(c: &mut Client, st: &St, k: &dyn GeminiKernel) -> Option<ExitKind> {
     let status = line_status(c, &st.tab, st.line_block)?;
     if relaunched_lives(st, k) {
@@ -367,9 +329,6 @@ fn line_word(c: &mut Client, st: &St, k: &dyn GeminiKernel) -> Option<ExitKind> 
     Some(ug::line_exit_kind(status))
 }
 
-/// Whether the Gemini CLI the relaunch line started ([`St::relaunched_pid`])
-/// still lives: alive, and the very process found, never another that took
-/// its number.
 fn relaunched_lives(st: &St, k: &dyn GeminiKernel) -> bool {
     st.relaunched_pid != 0
         && k.alive(st.relaunched_pid)
@@ -378,9 +337,6 @@ fn relaunched_lives(st: &St, k: &dyn GeminiKernel) -> bool {
                 .is_some_and(|s| squash(&s) == st.relaunched_start))
 }
 
-/// WHETHER `st` IS THE RECORD OF AN EARLIER ATTEMPT AT THIS VERY EXIT THAT
-/// TYPED ITS LINE: the same tab's record, naming `snap`'s process, its line
-/// typed after that process started.
 fn typed_for_exit(st: &St, snap: &super::super::relaunch::Snapshot) -> bool {
     let started_ms = snap.gemini().map_or(0, |run| run.started_ms);
     st.agent == Agent::Gemini
@@ -390,7 +346,7 @@ fn typed_for_exit(st: &St, snap: &super::super::relaunch::Snapshot) -> bool {
             || st.relaunched_at.saturating_mul(1000).saturating_add(1000) >= started_ms)
 }
 
-/// A Gemini CLI TUI's run, read while it runs, for relaunch on exit ([`super::super::relaunch::snapshot`] vetted job, tab and terminal): the parent `pid` (`node <script>`), its program and argv, its Gemini home, its project (its working directory) and that project's chats directory, its start and its child, the homes its line carries, the block it runs in, and the session the start-time rule names ([`witness_of`]: `None` where none is, with why).
+/// A Gemini CLI TUI's run.
 pub(super) fn snapshot(
     opts: &Opts,
     tab: &str,
@@ -452,11 +408,6 @@ pub(super) fn snapshot(
     })
 }
 
-/// THE WORD THE EXIT OF `snap`'S GEMINI CLI LEFT: its shell's exit status of
-/// the block it ran in ([`super::super::relaunch::GeminiRun::block`]), read by
-/// its table ([`ug::exit_kind`]) — but for its own restart met by its own
-/// session id ([`own_restart`]: [`ExitKind::Restarted`]); `None` while no
-/// status is drawn.
 fn shell_word(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
@@ -473,13 +424,6 @@ fn shell_word(
     })
 }
 
-/// WHETHER `status` IS `snap`'S OWN RESTART REFUSED FOR ITS OWN SESSION ID:
-/// a launch under `--session-id <uuid>` that exited `42` ([`ug::restart_id`])
-/// where the start-time rule, read now, names a session for the process
-/// ([`witness_of`]) — which is that very id: the rule names one only where
-/// the session begun since the start is the one the argv names
-/// ([`ug::argv_session`], which with no `--resume`/`-r` is the
-/// `--session-id` `restart_id` read), so no other comparison is owed.
 fn own_restart(snap: &super::super::relaunch::Snapshot, status: i64, k: &dyn GeminiKernel) -> bool {
     let (Some(run), Some(_)) = (snap.gemini(), ug::restart_id(status, &snap.argv)) else {
         return false;
@@ -495,7 +439,7 @@ fn own_restart(snap: &super::super::relaunch::Snapshot, status: i64, k: &dyn Gem
     .is_ok()
 }
 
-/// One look at a Gemini CLI that left its tab ([`super::super::relaunch::exit_record`] repeats it): whether the parent still runs (stopped, it is no exit yet) and, once gone, its shell's word by its table: a crash, its own or someone's end, or a start it refused.
+/// One look at a Gemini CLI that left its tab ([`super::super::relaunch::exit_record`] repeats it).
 pub(super) fn look_at_exit(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
@@ -522,13 +466,11 @@ pub(super) fn look_at_exit(
     }
 }
 
-/// The dialect of `shell` from its executable, as the relaunch line is
-/// written for it ([`shell_dialect_of`]).
 fn shell_dialect(shell: u32, k: &dyn GeminiKernel) -> Option<upgrade::Dialect> {
     shell_dialect_of(shell, k.args(shell))
 }
 
-/// Relaunch on exit, Gemini CLI lane ([`super::super::relaunch::after_exit`] hands a Gemini CLI snapshot here): its TUI `snap` left its tab and nobody owns the exit.
+/// Relaunch on exit.
 pub(super) fn after_exit(
     opts: &Opts,
     snap: &super::super::relaunch::Snapshot,
@@ -569,7 +511,6 @@ pub(super) fn after_exit_onto(
         Err(why) => return said(r, format!("busy:{why}")),
     };
     if k.alive(snap.pid) && k.process_start(snap.pid).as_deref() == Some(snap.start.as_str()) {
-        // Stopped, alive: no exit yet, never a crash.
         return said(r, "wait:not-exited");
     }
     prune_known(opts, vec![snap.tab.clone()]);
@@ -786,15 +727,10 @@ pub(super) fn after_exit_onto(
     r
 }
 
-/// WHETHER A SESSION THAT TOOK NO TURN IS RESUMED ALL THE SAME
-/// ([`Precheck::NoTurns`]): only on its own restart (`restarted`, the
-/// record's `quiet`) of a launch that carried no first prompt
-/// ([`ug::carries_first_prompt`]).
 fn resumes_turnless(restarted: bool, argv: &[String]) -> bool {
     restarted && !ug::carries_first_prompt(argv)
 }
 
-/// A pre-check that is not [`Precheck::Safe`] in a person's words.
 fn unsafe_said(session: &str, check: &Precheck) -> String {
     match check {
         Precheck::Unsafe { pick, missing } => format!(
@@ -813,8 +749,6 @@ fn unsafe_said(session: &str, check: &Precheck) -> String {
     }
 }
 
-/// A relaunch refused before any record is made: one ledger line, the step's
-/// word (`refused:…`, the host's `Cannot`, which tells the person).
 fn refuse(opts: &Opts, r: Report, step: &str, detail: &str) -> Report {
     let r = said(r, step);
     if !opts.dry_run {
@@ -823,9 +757,6 @@ fn refuse(opts: &Opts, r: Report, step: &str, detail: &str) -> Report {
     r
 }
 
-/// [`super::expired`] for a Gemini CLI relaunch: its exit over [`STALE_S`]
-/// ago — or the last hand that held its line, whichever is later — and not
-/// relaunched, its shell gone, or relaunched and never come up.
 fn expired(st: &St, now: u64, k: &dyn GeminiKernel) -> Option<(&'static str, String)> {
     match st.phase {
         Phase::Exiting { at_s }
@@ -848,15 +779,13 @@ fn expired(st: &St, now: u64, k: &dyn GeminiKernel) -> Option<(&'static str, Str
     }
 }
 
-/// The chats directory `st` records, `None` for none.
 fn st_chats(st: &St) -> Option<PathBuf> {
     (!st.gemini_chats.is_empty()).then(|| PathBuf::from(&st.gemini_chats))
 }
 
-/// Plan the relaunch from what the record keeps: the shell's dialect, the heal it needs, the `cd` to the project (where the shell's differs), and the line — `gemini <carried flags> --resume <uuid>` ([`ug::rewrite_argv`]; the shell's own `gemini`, never a Cellar path) behind the homes the process ran under ([`ug::line_env`], REQUIRED: a line that cannot hold them is refused).
+/// Plan the relaunch from what the record keeps.
 pub(super) fn plan(opts: &Opts, st: &St, k: &dyn GeminiKernel) -> Result<Plan, NoPlan> {
-    // No shell ([`NO_SHELL`], a tab's own Gemini CLI) is refused for good, as
-    // the Claude, agy and Muse Code lanes' plans refuse it: nothing would read the line.
+    // No shell (a tab's own Gemini CLI) is refused for good: nothing would read the line.
     if st.shell == NO_SHELL {
         return Err(NoPlan::Refused {
             why: "not-a-shell-job".to_string(),
@@ -902,8 +831,6 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn GeminiKernel) -> Result<Plan, N
     })
 }
 
-/// Relaunch the Gemini CLI `st` records at its tab's shell, the harness's
-/// hand on the tab through every wait and until the new TUI's first idle.
 fn relaunch(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn GeminiKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = relaunch_held(opts, r, st, c, &mut hand, k);
@@ -1021,7 +948,6 @@ fn relaunch_held(
     await_held(opts, r, st, c, hand, k)
 }
 
-/// Record a Gemini CLI relaunch that stops here, with one ledger line.
 fn fail(opts: &Opts, r: Report, st: &mut St, why: &str, detail: &str) -> Report {
     st.fail(why, now_s());
     let step = match why {
@@ -1033,14 +959,6 @@ fn fail(opts: &Opts, r: Report, st: &mut St, why: &str, detail: &str) -> Report 
     r
 }
 
-/// THE RELAUNCH LINE RAN AND ENDED with no relaunched Gemini CLI found leading
-/// the tab: decided at once by its word ([`line_word`]) — a resume the CLI
-/// refused, or a line the shell could not run, stops for good
-/// (`refused:resume-refused`, never typed again: critic X4); one that ended
-/// by its own or someone's hand is theirs (`ended:relaunch-ended`); one that
-/// crashed is closed as gone before it was adopted, and the exit's next
-/// attempt types it again on that very word ([`after_exit_onto`]); one no
-/// word tells stops (`refused:relaunch-unwitnessed`).
 fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
     let now = now_s();
     let (step, detail) = match kind {
@@ -1080,9 +998,6 @@ fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
     r
 }
 
-/// Whether `pid` (argv `argv`) is the relaunch this lane typed: a child of
-/// the line's shell, not the exited TUI, a Gemini CLI TUI resuming the
-/// recorded session.
 fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn GeminiKernel) -> bool {
     pid != st.pid
         && matches!(st.phase, Phase::Relaunched { .. } | Phase::Exiting { .. })
@@ -1091,8 +1006,6 @@ fn relaunched_by_us(pid: u32, argv: &[String], st: &St, k: &dyn GeminiKernel) ->
         && ug::argv_session(argv).as_deref() == Some(st.thread.as_str())
 }
 
-/// After the relaunch line: find the new TUI and carry on with it, or hand it
-/// back to its loop ([`adopt`]).
 fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn GeminiKernel) -> Report {
     let mut hand = Hand::take_or_none(c, &st.tab);
     let r = await_held(opts, r, st, c, &mut hand, k);
@@ -1100,7 +1013,6 @@ fn await_new(opts: &Opts, r: Report, st: &mut St, c: &mut Client, k: &dyn Gemini
     r
 }
 
-/// [`await_new`] with the harness's `hand` held; its caller gives it back.
 fn await_held(
     opts: &Opts,
     r: Report,
@@ -1163,7 +1075,6 @@ fn await_held(
     }
 }
 
-/// The relaunched TUI `new`, on the record whatever becomes of it.
 fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     if st.relaunched_pid == 0 {
         st.relaunched_start = k.process_start(new).map(|s| squash(&s)).unwrap_or_default();
@@ -1173,11 +1084,6 @@ fn found<K: Kernel + ?Sized>(st: &mut St, new: u32, k: &K) {
     st.relaunched_pid = new;
 }
 
-/// What the start-time rule names for the relaunched process `new`, within
-/// [`super::super::Timings::gemini_witness`] (its header lands 542-1108 ms
-/// after its child starts, measured): `Some(Ok(session))`, `Some(Err)` for a
-/// rule that names none (another start, a `/clear`), `None` for one gone or
-/// never read meanwhile.
 fn new_witness(
     opts: &Opts,
     st: &St,
@@ -1212,10 +1118,6 @@ fn new_witness(
     seen.filter(|_| k.alive(new))
 }
 
-/// THE RELAUNCHED GEMINI CLI CAME UP ON ANOTHER SESSION than the one its line
-/// resumed — its start-time rule names another (`--resume <uuid>` brings back
-/// that id or refuses, so it never should): nothing more is said into it,
-/// and the person is told (`refused:started-other`).
 fn started_other(opts: &Opts, r: Report, st: &mut St, new: u32, other: &str) -> Report {
     st.fail("started-other", now_s());
     let mut r = said(r, "refused:started-other");
@@ -1232,13 +1134,6 @@ fn started_other(opts: &Opts, r: Report, st: &mut St, new: u32, other: &str) -> 
     r
 }
 
-/// Hand the relaunched Gemini CLI back to its supervisor (`adopted`): the new
-/// TUI leads the tab by the host's own roster and THE START-TIME RULE NAMES
-/// ITS SESSION for it (else another: [`started_other`]; none: adopted on its
-/// line's word, `adopt-unwitnessed` in the ledger); the record stays in
-/// flight, and at its loop's next idle point the relaunch primitive's
-/// continuation ([`super::super::relaunch::resume`]) types the carry-on
-/// ([`carry_on`]) — only where the rule names the session by then.
 fn adopt(
     opts: &Opts,
     mut r: Report,
@@ -1307,12 +1202,11 @@ fn adopt(
     r
 }
 
-/// A Gemini CLI relaunch in flight carried on from where it stopped: the relaunch primitive's continuation step for a Gemini CLI record ([`super::super::relaunch::resume`]), and every other caller's.
+/// A Gemini CLI relaunch in flight carried on from where it stopped.
 pub(in crate::harness) fn carry_in_flight(opts: &Opts, r: Report, st: St, session: &str) -> Report {
     carry_in_flight_with(opts, r, st, session, &Live)
 }
 
-/// [`carry_in_flight`] over the kernel `k`.
 fn carry_in_flight_with(
     opts: &Opts,
     r: Report,
@@ -1353,20 +1247,11 @@ fn carry_in_flight_with(
     r
 }
 
-/// Whether Gemini CLI's composer on `scr` is empty: its caret row holds
-/// nothing (the placeholder is read as nothing,
-/// [`aterm_phase::gemini::composer_draft`]) and no row of its draft holds a
-/// word.
 fn composer_empty(scr: &super::Screen) -> bool {
     aterm_phase::gemini::composer_draft(&scr.rows)
         .is_some_and(|(_, lines)| lines.iter().all(|l| l.trim().is_empty()))
 }
 
-/// The last look before typing into Gemini CLI's composer: a fresh read
-/// reading idle by its reader (no box, no turn running, its composer drawn,
-/// no menu, not shell mode) with the composer empty, that read's generation
-/// (which the typed turn is fenced on) and the caret it draws (`>`, `*` under
-/// YOLO), which the guard anchors to.
 fn typing_fence(c: &mut Client, tab: &str) -> Result<(Option<String>, char), &'static str> {
     let _ = turn_takes_gen(c);
     let Some(scr) = screen(c, tab) else {
@@ -1386,11 +1271,6 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<(Option<String>, char), &'s
     Ok((scr.generation, caret))
 }
 
-/// Type `text` into Gemini CLI's composer as one turn, fenced on
-/// `generation` and submitted under the composer's guard
-/// (`composer_guard_at(<caret>, 1, …)`: its caret drawn one blank in, the
-/// supervisor's own guard for this composer) once the echo has held still
-/// (`idle=600`: an Enter within 30 ms of a key is a newline to it, bundle).
 fn type_text(
     c: &mut Client,
     tab: &str,
@@ -1413,17 +1293,9 @@ fn type_text(
     turn_verdict(&head)
 }
 
-/// The column Gemini CLI draws its caret in (` > text`: one blank in), as
-/// its reader says it ([`aterm_phase::ScreenReader::caret_column`]).
 const CARET_COLUMN: usize = 1;
 
-/// The relaunched TUI `new` is up: once its composer is drawn, THE
-/// START-TIME RULE NAMES ITS SESSION FOR IT — its own file names the session
-/// its line resumed (another: [`started_other`], nothing typed; none, read
-/// within [`super::super::Timings::gemini_witness`]: `done:no-continue`,
-/// nothing typed, said) — and it reads idle and empty with no person at the
-/// tab, the continuation is typed (`continued`); a quiet relaunch types
-/// nothing.
+/// The relaunched TUI `new` is up.
 #[allow(clippy::too_many_arguments)]
 fn carry_on(
     opts: &Opts,
@@ -1519,7 +1391,7 @@ fn carry_on(
     r
 }
 
-/// Remove Gemini CLI records nothing will visit again, as codex-alab's path removes its own: a record goes once its tab is proven gone, it is unwritten for [`super::STATE_KEEP_S`] and settled; never one in flight or not matching its name, and nothing in a dry run or a background break.
+/// Remove Gemini CLI records nothing will visit again.
 pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;
@@ -1550,7 +1422,7 @@ pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     }
 }
 
-/// The prune of one sweep: every tab the host's roster names is live, and the rendezvous registry speaks for the rest where it may.
+/// The prune of one sweep.
 pub(super) fn sweep_prune(opts: &Opts, live_tabs: Option<&[LiveTab]>) {
     prune_known(
         opts,
@@ -1562,14 +1434,12 @@ pub(super) fn sweep_prune(opts: &Opts, live_tabs: Option<&[LiveTab]>) {
     );
 }
 
-/// [`prune`] with the tabs `known_live` proven live, the rendezvous registry
-/// read for the rest only where it can vouch for this state root.
 fn prune_known(opts: &Opts, known_live: Vec<String>) {
     let graph = registry_graph();
     prune(opts, now_s(), registry_life(graph.as_deref(), &known_live));
 }
 
-/// The live Gemini CLI holders of the `gemini-<tab>` records in `sessions`, for the status view ([`super::upgrade_status::Holder`]): the TUI leading the tab and its install's version.
+/// The live Gemini CLI holders of the `gemini-<tab>` records in `sessions`.
 pub(super) fn holders(
     sessions: &BTreeSet<String>,
     live_tabs: Option<&[LiveTab]>,

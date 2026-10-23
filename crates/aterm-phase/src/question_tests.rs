@@ -48,7 +48,7 @@ fn why(d: &QuestionDialog) -> &'static str {
     }
 }
 
-/// The incident screen (S6-01, a four-tab dialog at 180 columns) reads whole.
+/// The incident screen (a four-tab dialog at 180 columns) reads whole.
 #[test]
 fn the_incident_question_reads_whole() {
     let (r, p, d) = read(QUESTION_TABS_INCIDENT);
@@ -457,8 +457,7 @@ fn every_live_question_capture_reads_as_its_form() {
     }
 }
 
-/// A bare question at column 0 (S6-02) is inside the box, not a shell line ending it;
-/// the chat row's `❯` at column 0 is the dialog's focus, not a user's row.
+/// A bare question at column 0 is inside the box, and the chat row's `❯` at column 0 is the dialog's focus.
 #[test]
 fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     let (r, p, d) = read(QUESTION_TABS_SECOND);
@@ -485,9 +484,7 @@ fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     }
 }
 
-/// The Submit (review) tab, which draws no footer, is the question dialog. Negative
-/// controls: without `Review your answers` it is a question with its head off the
-/// screen, form unknown, never the review; over a composer (quoted) it is no box.
+/// The Submit (review) tab, which draws no footer, is read as the question dialog.
 #[test]
 fn the_review_tab_is_a_question() {
     for (text, unanswered) in [(QUESTION_REVIEW, false), (QUESTION_REVIEW_UNANSWERED, true)] {
@@ -538,16 +535,7 @@ fn the_review_tab_is_a_question() {
     }
 }
 
-/// THE REVIEW TAB WITH AN AUTO-DENY COUNTDOWN — HAND-BUILT where 2.1.301's
-/// code draws it (its permission reason block, between the answers and
-/// `Ready to submit your answers?`; not measured): the countdown row, and
-/// the same wrapped onto a second row as a narrow pane draws it, and through
-/// its very words onto three in a pane narrower than them, each over its own
-/// blank row, is passed over — the review is read whole, its four answers
-/// and its focus as before — and the box's countdown reads its time.
-/// NEGATIVE CONTROLS: any other row at column 0 there (another `⚠` warning,
-/// one or wrapped, a countdown with no blank row under it) is no review: its
-/// head off the screen, form unknown, escalated.
+/// The review tab with an auto-deny countdown is read whole and exposes the countdown duration.
 #[test]
 fn the_review_tab_is_read_whole_over_its_countdown() {
     let r = screen(QUESTION_REVIEW);
@@ -569,8 +557,6 @@ fn the_review_tab_is_read_whole_over_its_countdown() {
             "⚠ Claude Code will automatically deny this request in 0:14, to avoid",
             "blocking progress on an unattended session",
         ],
-        // A pane narrower than its words: `deny
-        // this request in` wrapped too.
         vec![
             "⚠ Claude Code will automatically deny this",
             "request in 0:14, to avoid blocking progress on",
@@ -861,9 +847,7 @@ fn a_cut_question_is_head_off_screen_never_idle() {
     assert!(!parse_prompt_v2(&r[rule..]).expect("whole").head_off_screen);
 }
 
-/// F2, measured on Claude Code 2.1.302: a multi-select
-/// whose policy text wraps over more rows than a read's top leaves of the
-/// dialog.
+/// A multi-select whose policy text wraps over more rows than a read's top leaves of the dialog is read with its head off the screen.
 #[test]
 fn a_multi_select_cut_inside_its_free_text_row_is_head_off_screen() {
     let grid = screen(QUESTION_MULTI_TYPED_41X60_2_1_302);
@@ -996,15 +980,7 @@ fn cuts_under_the_head(r: &[String], what: &str) -> Vec<(String, bool, QuestionF
         .collect()
 }
 
-/// , on Claude Code 2.1.302: every frame of
-/// the four reflow sweeps from 33 columns (under it option 1 wraps), both
-/// policy texts typed and `down` to `Submit`, rebuilt whole
-/// ([`reflow_dialog`], first held to the nine measured dialogs it redraws
-/// row for row), is the dialog with its head off the screen when cut at
-/// any row from option 1 down to the divider, wherever the whole reads as
-/// the multi-select — every frame the text kept its rows in (the widths
-/// the harness types at, column 8 and column 9) and the frames `Submit`
-/// was drawn over that still read.
+/// Every frame of the four 2.1.302 reflow sweeps from 33 columns is read with its head off the screen when cut at any row from option 1 down to the divider.
 #[test]
 fn a_multi_select_cut_under_its_head_is_head_off_screen_at_every_swept_width() {
     let template = QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1].1;
@@ -2095,11 +2071,7 @@ fn a_question_whose_footer_wraps_is_read_whole() {
     }
 }
 
-/// Claude Code 2.1.300 MEASURED (2026-10-15, the
-/// real-Claude lab): a multi-select whose free-text row holds the long-term
-/// text, typed by hand, after `down` to `Submit` — at 47 columns every row
-/// kept, the text drawn one cell left of its label column (`[✔]Decide`); at
-/// 39 the same, `Submit` drawn over the text's last row.
+/// Claude Code 2.1.300 multi-select captures with the long-term text after `down` to `Submit` at 39 and 47 columns.
 const REFLOW_39_2_1_300: &str =
     include_str!("fixtures/claude-2.1.300-question-multi-reflow-39col.txt");
 const REFLOW_47_2_1_300: &str =
@@ -2203,14 +2175,7 @@ fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
     out
 }
 
-/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2). 2.1.300 draws
-/// a multi-select's free-text checkbox as a text with its space inside it
-/// (`["[", tick, "]", " "]`, no fixed-width box, unlike every option's), and
-/// once the focus leaves a text that overflows the row, the flex layout takes
-/// that space: the text and every row it wraps onto start one cell left of
-/// the label column (`  4. [✔]Decide …`, rows at column 8; MEASURED with the
-/// long-term text at 38, 39 and 41 to 51 columns, the short-term text's
-/// widths a layout model's prediction only).
+/// A multi-select free-text row drawn without a space after its checkbox (`  4. [✔]Decide …`, rows at column 8) reads whole.
 #[test]
 fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     let (r, p, d) = read(REFLOW_47_2_1_300);
@@ -2334,12 +2299,7 @@ fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
     assert_eq!(d.focus(), QuestionFocus::Button);
 }
 
-/// 's F2 residual: only a person's keys put the focus on a
-/// dialog's `Chat about this` row (the loop never moves it there), and a
-/// tail cut AT that row is the dialog with its head off the screen, focused
-/// or not: the walk up from the footer finds no divider over the chat row,
-/// so it is the fallback ([`QShape::fallback`]) or the footer alone, both
-/// with the head off.
+/// A tail cut at a dialog's `Chat about this` row is read as the dialog with its head off the screen, focused or not.
 #[test]
 fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
     let mut frames: Vec<(String, &str)> = vec![
@@ -2425,8 +2385,7 @@ fn a_cut_at_the_chat_row_a_person_focused_is_the_dialog_with_its_head_off() {
     );
 }
 
-/// (Questions): `Submit` drawn over the text's last row
-/// leaves the rest of that row on the button row.
+/// `Submit` drawn over the text's last row leaves the rest of that row on the button row and is never read whole.
 #[test]
 fn a_button_row_a_residue_is_glued_to_is_never_read_whole() {
     let (r, p, d) = read(REFLOW_57_2_1_300);

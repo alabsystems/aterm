@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AUTOPILOT, the window's side (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2): the per-session harness control the footer's chip cycles, Settings ▸ Harness sets, and `aterm ctl @<sid> meta set autopilot` writes.
+//! AUTOPILOT, the window's side (`docs/DESIGN-harness-autopilot-2026-10-15.md` §2).
 
 use std::sync::OnceLock;
 
@@ -10,24 +10,25 @@ use aterm_effects::harness_card::CardPalette;
 
 use crate::{App, WindowId};
 
-/// What the window's harness is, for every session's Autopilot at once: the part of a session's effective mode that is not the session's own word.
+/// What the window's harness is, for every session's Autopilot at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum HarnessPosture {
-    /// No host: this instance has no control socket, so nothing supervises any session (`harness_host` starts only with one).
+    /// No host: this instance has no control socket, so nothing supervises any session.
     #[default]
     Unhosted,
-    /// The policy supervises nothing here: `[harness] enabled = false` — or a headless instance under `[harness] headless = false` ([`crate::harness_host::would_supervise`]).
+    /// The policy supervises nothing here: `[harness] enabled = false`, or a headless instance
+    /// under `[harness] headless = false`.
     MasterOff,
-    /// The host supervises, and a session with no word of its own runs under this default (`[harness] autopilot`).
+    /// The host supervises, and a session with no word of its own runs under this default.
     On(Autopilot),
     /// The host runs, with some agent tables disabled.
     Restricted(Autopilot, u8),
-    /// The host runs, and this session's agent's OWN switch is off (`[harness.codex] enabled = false`, the master on): what [`Self::for_agent`] joins [`Self::Restricted`] to for a KNOWN agent the policy does not admit (§10.2.3, item 5).
+    /// The host runs, and this session's agent's OWN switch is off.
     AgentOff(aterm_phase::Program),
 }
 
 impl HarnessPosture {
-    /// The posture of a window that has a host (`hosted`) running `cfg`, a headless instance where `headless`.
+    /// Posture of a window with host status `hosted`, running `cfg`, and `headless` state.
     #[must_use]
     pub(crate) fn of(hosted: bool, cfg: &SupervisorConfig, headless: bool) -> Self {
         if !hosted {
@@ -49,7 +50,7 @@ impl HarnessPosture {
         }
     }
 
-    /// Join the published program with the same policy gate the worker uses: an admitted agent runs under the table's default, a known one whose own switch is off reads [`Self::AgentOff`] (its chip and its row name the switch, §10.2.1).
+    /// Join the published program with the same policy gate the worker uses.
     pub(crate) fn for_agent(self, agent: Option<aterm_phase::Program>) -> Self {
         match (self, agent) {
             (Self::Restricted(default, admitted), Some(agent))
@@ -64,7 +65,7 @@ impl HarnessPosture {
     }
 }
 
-/// What an agent's own switch off says (§10.2.1): its Settings row's label (`prefs::agent_switch_label`: `Supervise <product> sessions`, and Codex's `Watch codex-alab sessions` since aterm supervises no Codex) and `is off` — `Supervise Claude Code sessions is off` — so the chip, its row and the menu name the switch a click turns on (`App::press_harness_switch`).
+/// What an agent's own switch off says (§10.2.1).
 #[must_use]
 pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static str {
     use aterm_phase::Program;
@@ -78,23 +79,20 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
     }
 }
 
-/// ONE MODE'S SENTENCE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.1), in the form each surface says it: the owner's own words ("keep finding more to do", "wrap it up") around the engine's truth, the remote main branch.
+/// One mode's sentence in the form each surface renders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModeWords {
     /// The mode the sentence says.
     pub(crate) mode: Autopilot,
-    /// The Autopilot chip's title, after `autopilot: <mode> — `
-    /// (`claude_lights::ChipFace::explanation`).
+    /// The Autopilot chip's title, after `autopilot: <mode> — `.
     pub(crate) chip: &'static str,
-    /// The `Autopilot set to <mode>` record's line, after its tab
-    /// (`message_reporters::autopilot_set`).
+    /// The `Autopilot set to <mode>` record's line, after its tab.
     pub(crate) record: &'static str,
-    /// Settings ▸ Harness's mode button, as its description says what a
-    /// press does (`native_settings_harness`'s `mode_description`).
+    /// Settings ▸ Harness's mode button, as its description says what a press does.
     pub(crate) button: &'static str,
 }
 
-/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1): the chip's title, the records, Settings ▸ Harness and the manual (`aterm help harness`'s AUTOPILOT) read it, so a mode is never said two ways.
+/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1).
 pub(crate) const MODE_WORDS: [ModeWords; 3] = [
     ModeWords {
         mode: Autopilot::Cruise,
@@ -133,20 +131,21 @@ pub(crate) const fn mode_words(mode: Autopilot) -> &'static ModeWords {
     }
 }
 
-/// A session's EFFECTIVE Autopilot as the window shows it: the mode it runs under, or why the harness runs none at all.
+/// A session's EFFECTIVE Autopilot as the window shows it: the mode it runs under, or why the
+/// harness runs none at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AutopilotView {
     /// Cruise: the work kept going; nothing the agent says ends it.
     Cruise,
-    /// Land: all of the work landed on the remote main branch, then nothing typed until someone's turn.
+    /// Land: all work landed on the remote main branch, then nothing typed until someone's turn.
     Land,
     /// Off: the harness keeps its hands off this session.
     Off,
-    /// `[harness] enabled = false`: no session is supervised, whatever its word ([`HarnessPosture::MasterOff`]).
+    /// `[harness] enabled = false`: no session is supervised, whatever its word.
     MasterOff,
     /// No host (no control socket): nothing supervises any session ([`HarnessPosture::Unhosted`]).
     Unhosted,
-    /// The master switch on and this agent's own switch off ([`HarnessPosture::AgentOff`], §10.2.3 item 5): read as the master switch's off everywhere — `off` on the wire, no word a cycle writes, a click turning that switch on — but NAMED as the agent's switch (`Supervise Claude Code sessions is off`, [`agent_switch_off`]).
+    /// The master switch on and this agent's own switch off.
     AgentOff(aterm_phase::Program),
 }
 
@@ -161,10 +160,10 @@ pub(crate) enum ChipTone {
     Dim,
 }
 
-/// The chip while a click's word is being written and read back (§2.3, "changing"): `◐`, drawn alone.
+/// The chip while a click's word is being written and read back (§2.3, "changing").
 pub(crate) const PENDING_GLYPH: &str = "\u{25d0}";
 
-/// The clause v1's spelling of the Autopilot chip's title ends with where no host runs a harness and a click opens Settings ▸ Harness ([`AutopilotView::title`], which the face table's tests hold `claude_lights::autopilot_title` to): the page by the name its rail row shows (`SettingsRoute::Harness`).
+/// Title suffix when no host runs a harness and a click opens Settings ▸ Harness.
 #[cfg(test)]
 macro_rules! open_harness_click {
     () => {
@@ -172,7 +171,7 @@ macro_rules! open_harness_click {
     };
 }
 
-/// The clause v1's spelling of the title ends with where a switch of aterm.toml holds the harness off — the master switch, the agent's own — and a click turns it on, as the top rule's `on` does (owner, 2026-10-20: "remove the harness settings button in the UX").
+/// Title suffix when an `aterm.toml` switch holds the harness off.
 #[cfg(test)]
 macro_rules! harness_on_click {
     () => {
@@ -192,7 +191,7 @@ impl AutopilotView {
         Self::AgentOff(aterm_phase::Program::Claude),
     ];
 
-    /// The view of a session whose own word is `word` under `posture`: the posture's absence of a harness first, then the one resolver's rule (the word, else the table's default).
+    /// The view of a session whose own word is `word` under `posture`.
     #[must_use]
     pub(crate) fn of(posture: HarnessPosture, word: Option<Autopilot>) -> Self {
         match posture {
@@ -213,7 +212,7 @@ impl AutopilotView {
         }
     }
 
-    /// The mode the harness runs the session under: `None` where it runs none ([`Self::MasterOff`], [`Self::Unhosted`], [`Self::AgentOff`]).
+    /// The mode the harness runs the session under: `None` where it runs none.
     #[must_use]
     pub(crate) const fn mode(self) -> Option<Autopilot> {
         match self {
@@ -224,7 +223,7 @@ impl AutopilotView {
         }
     }
 
-    /// The view as a small number (`0..=10`), distinct for every view — an agent's own switch off by its agent — for the repaint keys that pack it (`claude_lights::WindowLights::autopilot_term`, bits 8–15; the harness card's).
+    /// The view as a small number (`0..=10`), distinct for every view.
     #[must_use]
     pub(crate) const fn code(self) -> u64 {
         match self {
@@ -243,7 +242,7 @@ impl AutopilotView {
         matches!(self, Self::Cruise | Self::Land)
     }
 
-    /// The colours the harness's glass wears under this view (§3): Cruise's spectrum, Land's sunset, Off's moonbow (white); none where no harness runs ([`Self::MasterOff`], [`Self::Unhosted`], [`Self::AgentOff`]).
+    /// The colours the harness's glass wears under this view (§3).
     #[must_use]
     pub(crate) const fn card_palette(self) -> Option<CardPalette> {
         match self {
@@ -254,7 +253,9 @@ impl AutopilotView {
         }
     }
 
-    /// Whether, and in what colours, the harness's glass — the launch card, the composer's border — is drawn for a session under this view, where `supervised` says this window's host holds its live claim: Cruise and Land only under that claim; Off with none, since Off stops the session's worker, which gives the claim back (`harness_host`'s `OffSessions`), so Off rests on the view alone — the view says a host runs with the master switch and the agent's on.
+    /// Whether, and in what colours, the harness's glass — the launch card, the composer's border —
+    /// is drawn for a session under this view, where `supervised` says this window's host holds
+    /// its live claim.
     #[must_use]
     pub(crate) const fn wears_glass(self, supervised: bool) -> Option<CardPalette> {
         match self {
@@ -263,7 +264,7 @@ impl AutopilotView {
         }
     }
 
-    /// The word a click writes ([`App::cycle_session_autopilot`]): the next mode in [`Autopilot::ALL`]'s order (Cruise → Land → Off → Cruise).
+    /// The word a click writes ([`App::cycle_session_autopilot`]).
     #[must_use]
     pub(crate) fn next(self) -> Option<Autopilot> {
         let mode = self.mode()?;
@@ -282,7 +283,7 @@ impl AutopilotView {
         }
     }
 
-    /// The word drawn beside the glyph at rest: none for Cruise (its `∞` alone, the indicator the owner asked for), `land`, `off`, and `off` where no harness runs.
+    /// The word drawn beside the glyph at rest.
     #[must_use]
     pub(crate) const fn word(self) -> Option<&'static str> {
         match self {
@@ -292,7 +293,7 @@ impl AutopilotView {
         }
     }
 
-    /// What the chip shows at rest: the glyph, then its word after a space where it has one (`∞`, `⤓ land`, `○ off`, `⊘ off`).
+    /// What the chip shows at rest: the glyph, then its word after a space where it has one.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn label(self) -> String {
@@ -355,7 +356,7 @@ impl AutopilotView {
         }
     }
 
-    /// The word `status` and `ls` print for a supervisable agent session (`autopilot=`, [`wire_field`]): the mode, and `off` wherever the harness runs none — the master switch off, or no host.
+    /// The word `status` and `ls` print for a supervisable agent session.
     #[must_use]
     pub(crate) const fn wire(self) -> &'static str {
         match self {
@@ -366,7 +367,7 @@ impl AutopilotView {
     }
 }
 
-/// THE ONE THEME PREDICATE of the harness's persistent glass — the composer's border, and the agents panel the harness paints: the session's palette where its glass is worn ([`AutopilotView::wears_glass`]), or, in a window with no host ([`AutopilotView::Unhosted`]) whose policy would supervise the agent were there one (`unhosted_on`: the master switch and the agent's own on, [`App::unhosted_glass`]) and whose session's own `word` is not Off, the word's (Land's sunset, else Cruise's spectrum: the border an unhosted window has always drawn).
+/// THE ONE THEME PREDICATE of the harness's persistent glass.
 #[must_use]
 pub(crate) fn harness_theme(
     view: AutopilotView,
@@ -383,14 +384,14 @@ pub(crate) fn harness_theme(
     })
 }
 
-/// THE HARNESS SWITCH (owner, 2026-10-20: "there needs to be an "on" button drawn for the claude harness"; 2026-10-21: "alab harness on"): the one on/off switch at the right of a hosted agent session's composer top rule, ` alab harness ● on ` while the harness carries the session — the CLI's lockup at the rule's left names the program.
+/// State of the harness toggle switch drawn for the active session's harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HarnessSwitch {
-    /// The harness carries the session (Cruise or Land): `● on` lit; a click turns the session Off ([`App::toggle_session_harness`]).
+    /// The harness carries the session (Cruise or Land): `● on` lit; a click turns the session Off.
     On,
-    /// The harness's hands are off, held so by the switch named: `○ off` lit and `on` drawn as a button; a click turns it on ([`App::switch_harness_on`]).
+    /// The harness's hands are off, held so by the switch named.
     Off(SwitchOff),
-    /// A click turned a switch of aterm.toml on and the policy in force has not read it back yet: `◐ turning on`, and a click does nothing until it does or [`SWITCH_SETTLE`] passes (`claude_lights`).
+    /// A click turned a switch of aterm.toml on and the policy in force has not read it back yet.
     Turning,
 }
 
@@ -401,11 +402,12 @@ pub(crate) enum SwitchOff {
     Session,
     /// Its agent's own switch, `[harness.<agent>] enabled = false`.
     Agent(aterm_phase::Program),
-    /// The master switch, `[harness] enabled = false` (or a headless instance under `[harness] headless = false`).
+    /// The master switch, `[harness] enabled = false` (or a headless instance under
+    /// `[harness] headless = false`).
     Master,
 }
 
-/// How long a click's switch write may take to read back before the switch stops saying `◐ turning on` ([`HarnessSwitch::Turning`]): the config lane's write, the watcher's next poll (half a second) and the host's adoption, with room to spare.
+/// Timeout for a switch write to read back before clearing `◐ turning on`.
 pub(crate) const SWITCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl HarnessSwitch {
@@ -427,7 +429,8 @@ impl HarnessSwitch {
         matches!(self, Self::On)
     }
 
-    /// Its state as a screen reader is told it (`Role::Switch`'s toggled state): on, off, or mixed while it turns on.
+    /// Its state as a screen reader is told it (`Role::Switch`'s toggled state): on, off, or
+    /// mixed while it turns on.
     #[must_use]
     pub(crate) const fn toggled(self) -> Option<bool> {
         match self {
@@ -437,7 +440,7 @@ impl HarnessSwitch {
         }
     }
 
-    /// What the switch is, said after its name (the accessibility node's description): what holds it off, and what a click does.
+    /// What the switch is, said after its name (the accessibility node's description).
     #[must_use]
     pub(crate) fn described(self, product: &str) -> String {
         match self {
@@ -460,10 +463,10 @@ impl HarnessSwitch {
     }
 }
 
-/// The aterm.toml key of the headless gate (`[harness] headless`), which turns supervision off in a headless instance alone.
+/// The aterm.toml key of the headless gate (`[harness] headless`).
 pub(crate) const HARNESS_HEADLESS_KEY: &str = "harness.headless";
 
-/// The aterm.toml key of `agent`'s own switch (`harness.<agent>.enabled`), found among the switch rows Settings ▸ Harness draws ([`crate::prefs::agent_switch`]): `None` for an agent with no table.
+/// The `aterm.toml` key of `agent`'s own switch (`harness.<agent>.enabled`).
 #[must_use]
 pub(crate) fn agent_switch_key(agent: aterm_phase::Program) -> Option<&'static str> {
     crate::prefs::NESTED_LEAVES
@@ -477,13 +480,11 @@ pub(crate) fn agent_switch_key(agent: aterm_phase::Program) -> Option<&'static s
 pub(crate) struct SwitchOnPlan {
     /// The aterm.toml switches that hold it off, each written `true`.
     pub(crate) keys: Vec<&'static str>,
-    /// The session's own word is written `cruise`: it, or the table's
-    /// default under no word, would leave the session Off with every switch
-    /// on.
+    /// The session's own word is written `cruise`.
     pub(crate) cruise: bool,
 }
 
-/// [`SwitchOnPlan`] for a session of `agent` whose own word is `word`, under `cfg` in an instance that is `headless` or not: every switch of aterm.toml that holds it off — the master switch, the headless gate, the agent's own switch — and its word where that would still leave it Off.
+/// [`SwitchOnPlan`] for a session of `agent` with mode `word` under `cfg` and `headless`.
 #[must_use]
 pub(crate) fn switch_on_plan(
     cfg: &SupervisorConfig,
@@ -510,7 +511,7 @@ pub(crate) fn switch_on_plan(
     }
 }
 
-/// A session's own Autopilot word, read from its context (its metadata, a leaf lock taken alone): `None` while it has none.
+/// A session's own Autopilot word, read from its context (its metadata, a leaf lock taken alone).
 #[must_use]
 pub(crate) fn word_of(ctx: &crate::SessionCtx) -> Option<Autopilot> {
     ctx.meta
@@ -519,18 +520,17 @@ pub(crate) fn word_of(ctx: &crate::SessionCtx) -> Option<Autopilot> {
         .autopilot_word()
 }
 
-/// This process's host's claim holder ([`crate::harness_host::holder`]), built once: it names the process, which a frame never changes, and the render path compares a session's claim against it ([`App::session_autopilot`], [`App::harness_ab_arm`]).
+/// This process's host's claim holder ([`crate::harness_host::holder`]), built once.
 pub(crate) fn own_holder() -> &'static str {
     static HOLDER: OnceLock<String> = OnceLock::new();
     HOLDER.get_or_init(crate::harness_host::holder)
 }
 
-/// One pass's reading of the metrics clock (`metrics::now_us`) for the liveness of supervisor claims ([`App::session_autopilot_on`]): read at most once, and only for a claim of this host's that lapses.
+/// Metrics clock reading (`metrics::now_us`) for supervisor claim liveness.
 #[derive(Debug, Default)]
 pub(crate) struct ClaimClock(std::cell::Cell<Option<u64>>);
 
 impl ClaimClock {
-    /// The pass's instant, read on first ask.
     fn now_us(&self) -> u64 {
         if let Some(now) = self.0.get() {
             return now;
@@ -543,7 +543,7 @@ impl ClaimClock {
     }
 }
 
-/// The `autopilot=` word `status` and the `sessions` roster print beside `supervisor=`: the session's EFFECTIVE mode ([`AutopilotView::wire`]) when it runs an agent the harness supervises (`supervisable`: its published program by `crate::harness_host::agent_of`), joined with that agent's policy gate, `-` otherwise — a shell, an editor, an agent no reader is measured for.
+/// The `autopilot=` word `status` and the `sessions` roster print beside `supervisor=`.
 #[must_use]
 pub(crate) fn wire_field(
     posture: HarnessPosture,
@@ -557,13 +557,13 @@ pub(crate) fn wire_field(
     }
 }
 
-/// The `land_at=` field `status`, `ls` and the bare `meta` print (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.5): the instant a timed Cruise lands, in unix seconds, from the stored `land_at` (unix ms), and `-` while none is stored.
+/// The `land_at=` field `status`, `ls` and the bare `meta` print.
 #[must_use]
 pub(crate) fn land_at_field(land_at: Option<i64>) -> String {
     land_at.map_or_else(|| "-".to_string(), |ms| ms.div_euclid(1000).to_string())
 }
 
-/// The `task=` word `status` and `ls` print (§9.4.1): the task's face as the session's loop last told it (`open|landed|theirs`) for a supervisable agent session (`agent`) whose face this window knows (`told_here`: its host holds the live supervisor claim, or the live claim is a proven self-claim whose own acts tell it, Autopilot Land), and `-` otherwise — another process's supervisor sends no fact here, so a face it would leave stale is never printed, and `-` too before anyone has told one.
+/// The `task=` word `status` and `ls` print (§9.4.1).
 #[must_use]
 pub(crate) const fn task_field(
     face: Option<aterm_agent::harness::acts::TaskFace>,
@@ -576,7 +576,7 @@ pub(crate) const fn task_field(
     }
 }
 
-/// The `pause=` field `status` and `ls` print after `task=` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.5.1): the unix second the loop's pause after short turns ends, as the session's loop last told this window's host, for a supervisable agent session (`agent`) whose live claim that host holds (`claimed_here`) — and `-` otherwise, as `task=`.
+/// The `pause=` field `status` and `ls` print after `task=`.
 #[must_use]
 pub(crate) fn pause_field(
     pause: Option<crate::PausePlan>,
@@ -589,7 +589,7 @@ pub(crate) fn pause_field(
     }
 }
 
-/// THE WINDOW SURFACE A PERSON PRESSED to write a session's Autopilot pair (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.7.3, items 1 and 2): stored with the writer ([`crate::session_timeline::AutopilotSetBy`]), so the records, the Autopilot menu, Settings ▸ Harness and `meta` can say whose hand it was.
+/// THE WINDOW SURFACE A PERSON PRESSED to write a session's Autopilot pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Surface {
     /// The footer's Autopilot chip ([`App::cycle_session_autopilot`]).
@@ -614,7 +614,7 @@ impl Surface {
         Self::EverySession,
     ];
 
-    /// Its word after `human:` in `meta`'s `autopilot_by=` and the restore leaf's `autopilot_by` (§11.7.2).
+    /// Its word after `human:` in `meta`'s `autopilot_by=` and the restore leaf's `autopilot_by`.
     #[must_use]
     pub(crate) const fn word(self) -> &'static str {
         match self {
@@ -645,20 +645,17 @@ impl Surface {
     }
 }
 
-/// WHO SET A SESSION'S AUTOPILOT, IN WORDS (§11.7.3, item 4): composed where it is shown — a record, the Autopilot menu's note, a SESSIONS row — from the stored setter, never kept ([`App::autopilot_set_by_words`]).
+/// WHO SET A SESSION'S AUTOPILOT, IN WORDS (§11.7.3, item 4): composed where it is shown.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SetByWords {
-    /// Who, as a line ends: `over aterm ctl`, `from the chip`, `from tab 2
-    /// (✳ Claude Code)`, `before aterm restarted`.
+    /// Trailing attribution phrase (`over aterm ctl`, `from the chip`, or tab origin).
     pub(crate) by: String,
-    /// When, as the local clock and day read it; `None` for a word carried
-    /// from before a restart with no setter, or where the zone cannot be
-    /// read.
+    /// When, as the local clock and day read it.
     pub(crate) at: Option<crate::harness_glass::Stamp>,
 }
 
 impl SetByWords {
-    /// The words of a setter (the stored one: `None` for a word that names none) as the session's word stands (`has_word`), with `sid_place(sid)` naming the tab of a session that wrote over its edge connection (`None`: no live session has that sid).
+    /// Attribution words for a stored setter as the session's Autopilot mode stands.
     #[must_use]
     pub(crate) fn of(
         set_by: Option<crate::session_timeline::AutopilotSetBy>,
@@ -698,7 +695,7 @@ impl SetByWords {
         })
     }
 
-    /// The menu's note and a SESSIONS row's words (§11.7.1): `set 14:05 over aterm ctl`, `set Fri 14:05 from the chip` (clock times, never ages, the day named against `today` by [`crate::harness_glass::Stamp::words`]), `set before aterm restarted`.
+    /// The menu's note and a SESSIONS row's words (§11.7.1).
     #[must_use]
     pub(crate) fn line(&self, today: Option<i64>) -> String {
         match self.at {
@@ -707,7 +704,7 @@ impl SetByWords {
         }
     }
 
-    /// A record's line (§11.7.1): `set over aterm ctl`, `set from the chip` — the record has its own time.
+    /// A record's line (§11.7.1): `set over aterm ctl`, `set from the chip`.
     #[must_use]
     pub(crate) fn record_line(&self) -> String {
         format!("set {}", self.by)
@@ -715,7 +712,7 @@ impl SetByWords {
 }
 
 impl App {
-    /// The window's harness posture now: whether it has a host, and the policy in force (the config watcher's, `harness_policy`).
+    /// The window's harness posture now: whether it has a host, and the policy in force.
     #[must_use]
     pub(crate) fn harness_posture(&self) -> HarnessPosture {
         HarnessPosture::of(
@@ -725,7 +722,7 @@ impl App {
         )
     }
 
-    /// Whether a window with no host wears the harness's glass for `agent` ([`harness_theme`]'s `unhosted_on`): the policy in force would supervise it were there a host — the master switch on, and the agent's own.
+    /// Whether a window with no host wears the harness's glass for `agent`.
     #[must_use]
     pub(crate) fn unhosted_glass(&self, agent: Option<aterm_phase::Program>) -> bool {
         matches!(
@@ -735,7 +732,7 @@ impl App {
         )
     }
 
-    /// Publish [`Self::harness_posture`] into the session registry, for the readers off the main thread (the `sessions` roster).
+    /// Publish [`Self::harness_posture`] into the session registry.
     pub(crate) fn publish_harness_posture(&self) {
         let posture = self.harness_posture();
         self.store
@@ -744,7 +741,7 @@ impl App {
             .set_harness_posture(posture);
     }
 
-    /// Session `local_id`'s Autopilot: `(word, view, supervised)` — its own word (`None`: unset, the table's default decides), the EFFECTIVE view under this window's posture ([`AutopilotView::of`]), and whether this window's host holds its live supervisor claim now (the claim's holder is [`crate::harness_host::holder`]): what the chip and the harness card draw.
+    /// Session `local_id`'s Autopilot: `(word, view, supervised)`.
     #[must_use]
     pub(crate) fn session_autopilot(
         &self,
@@ -753,7 +750,7 @@ impl App {
         self.session_autopilot_on(local_id, &ClaimClock::default())
     }
 
-    /// [`Self::session_autopilot`] on a pass's shared claim clock: a pass over every pane of a frame reads the clock at most once, and only where a claim of this host's lapses.
+    /// [`Self::session_autopilot`] on a pass's shared claim clock.
     #[must_use]
     pub(crate) fn session_autopilot_on(
         &self,
@@ -765,20 +762,20 @@ impl App {
         (word, view, supervised)
     }
 
-    /// The agent session `local_id` publishes that the host supervises or watches, if any ([`crate::harness_host::admitted`]: its timeline's program, never a vendor `codex`).
+    /// The agent session `local_id` publishes that the host supervises or watches, if any.
     pub(crate) fn session_agent(&self, local_id: u64) -> Option<aterm_phase::Program> {
         self.pool
             .get(local_id)
             .and_then(|session| crate::harness_host::admitted(&session.ctx))
     }
 
-    /// Session `local_id`'s OWN posture: the window's, joined with its agent's switch ([`HarnessPosture::for_agent`]) — what its chip draws, what Settings ▸ Harness's buttons for it act under, and what a press of them is checked against.
+    /// Session `local_id`'s OWN posture.
     pub(crate) fn session_harness_posture(&self, local_id: u64) -> HarnessPosture {
         self.harness_posture()
             .for_agent(self.session_agent(local_id))
     }
 
-    /// [`Self::session_autopilot_on`] for an `agent` the caller already read under its one timeline guard (the footer's), with a fourth answer only the composer's top line reads: whether the live claim is a PROVEN SELF-CLAIM (`SessionMeta::supervisor_proven`, [`crate::self_claim`]) — codex-alab carrying itself, whose harness is ALab's though this window's host holds no claim.
+    /// [`Self::session_autopilot_on`] for an `agent` already read under the timeline guard.
     pub(crate) fn session_autopilot_for(
         &self,
         local_id: u64,
@@ -814,7 +811,7 @@ impl App {
         )
     }
 
-    /// Write session `local_id`'s own Autopilot word (`None`: unset it, and the table's default decides) — the same store write `meta set|unset autopilot` makes, through the same typed ladder ([`Self::write_session_meta_field`]): no control-socket round trip, nothing sent to the PTY, never a person's keystroke (no `human_ms=` stamp).
+    /// Write session `local_id`'s own Autopilot word.
     pub(crate) fn set_session_autopilot(
         &mut self,
         local_id: u64,
@@ -824,7 +821,7 @@ impl App {
         self.set_session_autopilot_timed(local_id, word, None, surface)
     }
 
-    /// THE WINDOW'S ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1): session `local_id`'s own word and, beside `cruise` only, the instant its timed Cruise lands (`land_at`, unix ms; `None`: no timer) — `session_timeline::apply_autopilot`, the store write `meta set autopilot … [until=]` makes.
+    /// THE WINDOW'S ONE WRITER OF THE AUTOPILOT PAIR (§9.3.6, item 1).
     pub(crate) fn set_session_autopilot_timed(
         &mut self,
         local_id: u64,
@@ -845,7 +842,7 @@ impl App {
         self.autopilot_pair_written(local_id, write)
     }
 
-    /// THE FAN-OUT of a window write of session `local_id`'s Autopilot pair (the window's writer, [`Self::set_session_autopilot_timed`]; the timer's cancel, `App::cancel_autopilot_timer`): the timer indexed again from what is stored, and an open Autopilot menu for the session built again (`App::refresh_autopilot_menu`) — both even where the write moved nothing (a wire write of the same pair whose wake is still in flight).
+    /// THE FAN-OUT of a window write of session `local_id`'s Autopilot pair.
     pub(crate) fn autopilot_pair_written(
         &mut self,
         local_id: u64,
@@ -854,7 +851,7 @@ impl App {
         self.autopilot_pair_fanned_out(local_id, write, true)
     }
 
-    /// WRITE MANY SESSIONS' AUTOPILOT PAIRS AT ONCE (design §11.5.3, item 6; the `Every session` row): each `(local_id, word, land_at)` written as the window's one writer writes one ([`Self::set_session_autopilot_timed`]), with that write's own fan-out — the timer index, an open menu, the crash journal's owed words, the footer, the A/B arm and the keyed record — by `by` at `surface` (its setter, §11.7.3, item 2), but the page published ONCE, after the loop: each publish reads every session (`App::harness_state`), so N writes each publishing would read N² sessions on one click.
+    /// WRITE MANY SESSIONS' AUTOPILOT PAIRS AT ONCE.
     pub(crate) fn write_autopilot_batch(
         &mut self,
         writes: &[(u64, Option<Autopilot>, Option<i64>)],
@@ -881,8 +878,6 @@ impl App {
         moved
     }
 
-    /// [`Self::autopilot_pair_written`]'s fan-out, the page's publish in it
-    /// where `publish` (the batch publishes once, after its loop).
     fn autopilot_pair_fanned_out(
         &mut self,
         local_id: u64,
@@ -915,7 +910,7 @@ impl App {
         true
     }
 
-    /// THE KEYED RECORD OF A MOVE OF SESSION `local_id`'S AUTOPILOT PAIR (§2, §9.3.2; §11.7.1): the window's own write ([`Self::autopilot_pair_written`]) and a write over the wire (`App::on_meta_changed`) alike — titled by what is stored now, its line led by the session's place, the timer the write dropped (`dropped`, read before the index was built again) said cancelled, and its last line who set it, from the setter the write stored ([`Self::autopilot_set_by_words`]).
+    /// THE KEYED RECORD OF A MOVE OF SESSION `local_id`'S AUTOPILOT PAIR (§2, §9.3.2; §11.7.1).
     pub(crate) fn record_autopilot_change(
         &mut self,
         local_id: u64,
@@ -959,7 +954,7 @@ impl App {
         self.record_message(message);
     }
 
-    /// THE STORED SETTER OF SESSION `local_id`'S AUTOPILOT, IN WORDS (§11.7.3, item 4; [`SetByWords::of`]), composed now: an edge writer's sid names its tab and title as they read now ([`Self::autopilot_setter_tab`]).
+    /// Stored setter of session `local_id`'s Autopilot in words ([`SetByWords::of`]).
     pub(crate) fn autopilot_set_by_words(&self, local_id: u64) -> Option<SetByWords> {
         let (set_by, has_word) = {
             let meta = self
@@ -974,7 +969,7 @@ impl App {
         SetByWords::of(set_by, has_word, |sid| self.autopilot_setter_tab(sid))
     }
 
-    /// The tab of the live session whose sid is `sid`, as a setter's words name it (§11.7.3, item 4): `tab 2 (✳ Claude Code)` — its place ([`Self::session_place`]) and its label by the one namer ([`Self::tab_label_of_session`]), the label left out where it is the place's own words.
+    /// The tab of the live session whose sid is `sid`, as a setter's words name it.
     pub(crate) fn autopilot_setter_tab(&self, sid: &str) -> Option<String> {
         let local = self
             .store
@@ -993,7 +988,7 @@ impl App {
         })
     }
 
-    /// A WRITE OVER THE WIRE moved session `local_id`'s Autopilot pair (`meta set|unset autopilot …` from an Owner client, the fabric or aterm's harness: `App::on_meta_changed`, §11.7.3, item 3): its keyed record, through the window's own builders ([`Self::record_autopilot_change`]), where the session's [`crate::session_timeline::SessionMeta::autopilot_revision`] is not the one last recorded — so a wake for another field, a write the window already recorded, and a session only restored here record nothing.
+    /// A WRITE OVER THE WIRE moved session `local_id`'s Autopilot pair.
     pub(crate) fn record_wire_autopilot(
         &mut self,
         local_id: u64,
@@ -1014,7 +1009,7 @@ impl App {
         self.record_autopilot_change(local_id, dropped, revision);
     }
 
-    /// The chip's click: session `local_id`'s EFFECTIVE mode steps to the next in [`Autopilot::ALL`]'s order (Cruise → Land → Off → Cruise, [`AutopilotView::next`]) and is written as its own word ([`Self::set_session_autopilot`]).
+    /// Advance session `local_id`'s effective Autopilot mode to the next in [`Autopilot::ALL`].
     pub(crate) fn cycle_session_autopilot(&mut self, local_id: u64) -> AutopilotView {
         let (_, view, _) = self.session_autopilot(local_id);
         let Some(next) = view.next() else {
@@ -1024,7 +1019,7 @@ impl App {
         self.session_autopilot(local_id).1
     }
 
-    /// THE HARNESS SWITCH, flipped (the composer top rule's switch, [`HarnessSwitch`]): a session the harness carries (Cruise or Land) is turned Off — its own word written `off`, which takes the whole harness off it (supervision, the launch card's rainbow kitty, the composer border's branding and the glass transcript rewrites) — and one it does not carry is turned on from whichever switch holds it off ([`Self::switch_harness_on`]).
+    /// THE HARNESS SWITCH, flipped (the composer top rule's switch, [`HarnessSwitch`]).
     pub(crate) fn toggle_session_harness(&mut self, local_id: u64) -> AutopilotView {
         let (_, view, _) = self.session_autopilot(local_id);
         match HarnessSwitch::of(view) {
@@ -1039,7 +1034,7 @@ impl App {
         self.session_autopilot(local_id).1
     }
 
-    /// THE SWITCH'S "ON" (owner, 2026-10-20: "there needs to be an "on" button drawn for the claude harness"): turn the harness on for session `local_id` in ONE click, from whichever switch holds it off ([`switch_on_plan`]) — the master switch, the session's agent's own switch, and the session's own word, as many of them as are off.
+    /// Turn the harness switch on for session `local_id` and record the pending toggle.
     pub(crate) fn switch_harness_on(&mut self, local_id: u64) -> SwitchOnPlan {
         let (word, _, _) = self.session_autopilot(local_id);
         let plan = switch_on_plan(
@@ -1057,7 +1052,7 @@ impl App {
         plan
     }
 
-    /// Open Settings ▸ Harness in window `wid` (the no-host chip, the Autopilot menu's `Harness settings…`, View ▸ Coding Agent Harness…, the palette): the one Settings tab, raised there at the Harness route, and landed at `focus` (§10.3.3, item 8) — a session's row, drawn selected until the next press or scroll, SUPERVISION, or [`HarnessFocus::Top`], the page's top (§10.3.1: View ▸ Coding Agent Harness… opens at the top).
+    /// Open Settings ▸ Harness in window `wid`.
     pub(crate) fn open_harness_settings(
         &mut self,
         wid: WindowId,
@@ -1082,12 +1077,6 @@ mod set_by_tests;
 mod tests {
     use super::*;
 
-    /// THE `on` BUTTON'S PLAN ([`switch_on_plan`]): it writes exactly the
-    /// switches that hold the session off — the master switch, the headless
-    /// gate in a headless instance only, the session's agent's own switch
-    /// and no other agent's — and the session's word `cruise` only where
-    /// its word, or the table's default under none, would leave it Off with
-    /// every switch on.
     #[test]
     fn the_on_button_writes_exactly_the_switches_that_hold_it_off() {
         use aterm_phase::Program;
@@ -1154,10 +1143,6 @@ mod tests {
         );
     }
 
-    /// THE SWITCH A VIEW SHOWS ([`HarnessSwitch::of`]): lit while the
-    /// harness carries the session, off — naming the switch that holds it —
-    /// in every other hosted view, and none without a host; a screen reader
-    /// is told on, off, or mixed while it turns on.
     #[test]
     fn every_hosted_view_has_a_switch_and_no_unhosted_one_does() {
         for view in AutopilotView::ALL {
@@ -1187,9 +1172,6 @@ mod tests {
         assert_eq!(HarnessSwitch::Turning.toggled(), None);
     }
 
-    /// §2.1's precedence: no host and the master switch win over every word;
-    /// otherwise the word, else the table's default — the one resolver's rule,
-    /// checked against it for every pair.
     #[test]
     fn the_view_is_the_master_switch_then_the_word_then_the_default() {
         for word in [
@@ -1221,8 +1203,6 @@ mod tests {
         }
     }
 
-    /// The posture: no host first, then the policy's switch (and the
-    /// headless instance's), then the table's default.
     #[test]
     fn the_posture_reads_the_host_the_switch_and_the_default() {
         let on = SupervisorConfig::default();
@@ -1255,9 +1235,6 @@ mod tests {
         assert_eq!(HarnessPosture::default(), HarnessPosture::Unhosted);
     }
 
-    /// The chip table of §2.3, glyph, word, tone and title; a click cycles
-    /// the modes in `Autopilot::ALL`'s order, and does nothing where no
-    /// harness runs.
     #[test]
     fn the_chips_follow_the_designs_table_and_cycle_in_order() {
         let rows = [
@@ -1351,13 +1328,6 @@ mod tests {
         assert_eq!(AutopilotView::Cruise.wears_glass(false), None, "CONTROL");
     }
 
-    /// AN AGENT'S OWN SWITCH OFF IS NAMED (§10.2.1, §10.2.5): for each
-    /// supervisable agent, its switch off under the master switch on joins to
-    /// `AgentOff` — `⊘ off`, dim, titled with the switch's own Settings label
-    /// and a click that turns it on, `off` on the wire, no word a cycle
-    /// writes, no default — and counts as Off in the A/B where no claim is
-    /// live, while every other agent of the same policy runs the table's
-    /// default.
     #[test]
     fn an_agents_own_switch_off_reads_agent_off_and_the_master_wins() {
         use crate::harness_screen::AbArm;
@@ -1452,8 +1422,6 @@ mod tests {
         assert!(codes.iter().all(|c| *c < 256), "bits 8-15 hold it");
     }
 
-    /// A host that supervises nothing (`Acts` inert, no sessions): what the
-    /// App's posture needs to read `On`, shut down by the caller.
     fn idle_host() -> crate::harness_host::HostHandle {
         crate::harness_host::HostHandle::for_supervised_test(
             Vec::new(),
@@ -1461,7 +1429,6 @@ mod tests {
         )
     }
 
-    /// The session's records of the window's writes, oldest first.
     fn autopilot_records(app: &App) -> Vec<(String, Vec<String>)> {
         let key = format!(
             "harness.autopilot.{}",
@@ -1475,13 +1442,6 @@ mod tests {
             .collect()
     }
 
-    /// THE WINDOW'S WRITE (§2.3: "A click on Autopilot writes the session's
-    /// word in-process … it sends nothing to the PTY and is not a person's
-    /// keystroke"): the word lands in the store `meta set autopilot` writes,
-    /// as its one word, recorded as the ordinary `meta-change`, ringing the
-    /// host, leaving a keyed `harness` record, and stamping no person's hand;
-    /// a write that moves nothing does none of it; `None` hands the session
-    /// back to the default.
     #[test]
     fn the_window_writes_the_word_and_the_chip_cycles_it() {
         let mut app = App::headless_for_test();
@@ -1663,11 +1623,6 @@ mod tests {
         assert_eq!(app.harness_state().sessions[0].view, AutopilotView::Cruise);
     }
 
-    /// AN UNHOSTED WINDOW KEEPS THE SWITCHES (the cross-track review of
-    /// 2026-10-19): with no control socket nothing supervises, but its
-    /// border and panel wear the word's colours only where the policy in
-    /// force would supervise the agent — the master switch off, or Claude
-    /// Code's own switch off, leaves them bare, as a hosted window's are.
     #[test]
     fn an_unhosted_window_keeps_the_master_and_agent_switches() {
         use aterm_phase::Program;
@@ -1724,8 +1679,6 @@ mod tests {
         assert_eq!(read("sh"), "-", "non-agent rows do not claim a mode");
     }
 
-    /// The posture the App publishes into the registry is the one the
-    /// `sessions` roster reads off the main thread.
     #[test]
     fn the_app_publishes_its_posture_to_the_registry() {
         let mut app = App::headless_for_test();
@@ -1743,9 +1696,6 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// The Autopilot menu's `Harness settings…` page (and the no-host
-    /// chip's): Settings ▸ Harness, opened in the window it was pressed in
-    /// (View ▸ Coding Agent Harness… opens it in the front one).
     #[test]
     fn the_harness_page_opens_in_the_window_asked() {
         use crate::native_settings::SettingsRoute;
@@ -1773,8 +1723,6 @@ mod tests {
         );
     }
 
-    /// `status`/`ls`: the effective mode for a supervisable agent, `off`
-    /// wherever no harness runs, and `-` for anything else.
     #[test]
     fn the_wire_word_is_the_effective_mode_of_an_agent_session() {
         let on = HarnessPosture::On(Autopilot::Cruise);

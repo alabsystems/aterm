@@ -98,7 +98,7 @@ pub fn verify_roster(
     raw: Vec<u8>,
     sig: &[u8],
 ) -> Result<VerifiedRoster, RosterReject> {
-    // Step 1: no anchor, no authority.
+    // No anchor, no authority.
     if master_pubkeys.is_empty() {
         return Err(RosterReject::Disabled);
     }
@@ -220,7 +220,7 @@ impl Roster {
 
     /// Admit the roster itself.
     pub fn admit(&self, floor_seq: u64, now_unix: i64) -> Result<(), RosterReject> {
-        // Step 6, the ratchet: strong for a client that has seen a newer roster, nothing for
+        // The ratchet: strong for a client that has seen a newer roster, nothing for
         // a fresh install.
         if self.roster_seq < floor_seq {
             return Err(RosterReject::Rollback);

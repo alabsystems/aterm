@@ -18,7 +18,6 @@ const ROWS: usize = 53;
 const COLS: usize = 113;
 const CW: usize = 15;
 const CH: usize = 28;
-/// Claude Code's text width: `COLS - 4` (1-based columns 3..=COLS-2).
 const TW: usize = COLS - 4;
 const FRAME_US: u64 = 16_667;
 
@@ -50,8 +49,6 @@ fn cfg() -> GlowConfig {
     }
 }
 
-/// Greedy word wrap at `TW`, a break's space dropped, the caret (an index
-/// into `text`) mapped to (line, col-in-line).
 fn wrap(text: &[char], caret: usize) -> (Vec<Vec<char>>, (usize, usize)) {
     let mut lines: Vec<Vec<char>> = vec![Vec::new()];
     let mut pos: Vec<(usize, usize)> = Vec::with_capacity(text.len() + 1);
@@ -102,11 +99,8 @@ fn wrap(text: &[char], caret: usize) -> (Vec<Vec<char>>, (usize, usize)) {
     (lines, caret_pos)
 }
 
-/// One screen row the composer draws: its row, its cells, and whether it is
-/// one of the box's rules.
 type ScreenRow = (usize, Vec<char>, bool);
 
-/// The composer model: the text, the caret, what the screen holds.
 struct Composer {
     text: Vec<char>,
     caret: usize,
@@ -161,7 +155,6 @@ impl Composer {
         }
     }
 
-    /// Ink's diff of the whole box against the screen, one DEC 2026 chunk.
     fn render(&mut self) -> Vec<u8> {
         let (rows, (cr, cc)) = self.rows_for();
         let mut s = String::new();
@@ -206,7 +199,6 @@ impl Composer {
     }
 }
 
-/// A Backspace in a key schedule.
 const BACKSPACE: char = '\u{8}';
 
 /// A fixture surface owns the production family.
@@ -245,9 +237,10 @@ pub struct Sim {
     pub holes_seen: Vec<String>,
     pub verbose: bool,
     last_decl_seq: u64,
-    /// The typed region at the end: (row, first col) — every cell from it to the caret should carry live light.
+    /// The typed region at the end: (row, first col).
     pub cov: Option<(u16, u16)>,
-    /// `(key index, ms)`: the render that echoes that key ([`Sim::run`]) stops before its park and the rest lands `ms` later (the app stalled mid-write; the host presents the half-written frame, the caret hidden).
+    /// `(key index, ms)`: split the render for that key before its park, the rest landing `ms`
+    /// later.
     pub tear: Option<(usize, u64)>,
 }
 
@@ -379,8 +372,6 @@ impl Sim {
         v
     }
 
-    /// Interior holes on every row: a column between two live cells of the
-    /// same row that has no live cell of its own.
     fn scan_holes(&mut self) {
         let t = self.ms();
         let Some(rib) = self.glow.v2_ribbon() else {
@@ -446,10 +437,6 @@ impl Sim {
         let _ = self.render_head(false);
     }
 
-    /// [`Sim::render`], its bytes cut before the park and the rest landing
-    /// `torn` ms later, the frames between presented; for a caller that
-    /// schedules nothing meanwhile ([`Sim::run`] queues the rest as its own
-    /// event).
     fn render_torn(&mut self, torn: Option<u64>) {
         let Some(ms) = torn else {
             self.render();
@@ -461,9 +448,6 @@ impl Sim {
         }
     }
 
-    /// Echo every pending key: the composer repaints. With `torn` only the
-    /// bytes before the park are processed and the rest is returned for the
-    /// caller to land.
     fn render_head(&mut self, torn: bool) -> Option<Vec<u8>> {
         let keys: Vec<char> = std::mem::take(&mut self.pending);
         if keys.is_empty() {
@@ -502,7 +486,7 @@ impl Sim {
         None
     }
 
-    /// Set the composer's text instantly (no keys), the caret at `caret`, rendered and one frame shown; the ribbon untouched.
+    /// Set the composer's text instantly with the caret at `caret` and render one frame.
     pub fn preload(&mut self, text: &str, caret: usize) {
         self.comp.text = text.chars().collect();
         self.comp.caret = caret;
@@ -512,7 +496,7 @@ impl Sim {
         self.advance_to_ms(t);
     }
 
-    /// Run a schedule: `keys` (press ms, char), `renders` (render ms) — a render echoes every key pressed at or before it.
+    /// Run a schedule: `keys` (press ms, char), `renders` (render ms).
     pub fn run(&mut self, keys: &[(u64, char)], renders: &[u64]) {
         const KEY: u8 = 0;
         const REST: u8 = 1;
@@ -592,7 +576,6 @@ impl Sim {
     }
 }
 
-/// Keys of `s` from `start` ms, `gap` ms apart.
 fn keys_of(s: &str, start: u64, gap: u64) -> Vec<(u64, char)> {
     s.chars()
         .enumerate()
@@ -600,9 +583,6 @@ fn keys_of(s: &str, start: u64, gap: u64) -> Vec<(u64, char)> {
         .collect()
 }
 
-/// A render per key at `delay(i)` after it, serialized: a render never
-/// precedes the previous one (the app processes input in order), and renders
-/// that land on the same ms are one.
 fn renders_for(keys: &[(u64, char)], delay: impl Fn(usize) -> u64) -> Vec<u64> {
     let mut out: Vec<u64> = Vec::new();
     let mut last = 0u64;
@@ -619,17 +599,12 @@ fn renders_for(keys: &[(u64, char)], delay: impl Fn(usize) -> u64) -> Vec<u64> {
 const L1: &str = "ok. I also noticed that there was a typing latency stall on this machine. there was a message alert about it.";
 const L2: &str = "it said that the CPUs were busy. Keep designing superior solutions so that the end user experience is not";
 
-/// The second screen: typing before `[Image #1]`; the Space after `hthe`
-/// pushes the placeholder onto a new row and the box grows.
 fn typing_before_the_placeholder(gap: u64, delay: u64) -> (Sim, u16) {
     let lead = " There is a problem wit hthe";
     let keys = |s: &Sim| keys_of(&format!("{lead} cu"), s.ms() + 100, gap);
     placeholder_take(keys, |_| delay, None)
 }
 
-/// The composer before `[Image #1]` with the keys `keys` makes and their
-/// renders `delay(i)` after them, render `tear` torn; returns the take and
-/// the caret's screen row before the first key.
 fn placeholder_take(
     keys: impl Fn(&Sim) -> Vec<(u64, char)>,
     delay: impl Fn(usize) -> u64,
@@ -651,11 +626,8 @@ fn placeholder_take(
     (s, row0)
 }
 
-/// The Space after `hthe` and its index among the take's keys.
 const GROWTH_KEY: usize = " There is a problem wit hthe".len();
 
-/// Whether the box grew under the take: the caret's line is a row higher
-/// than when typing began (the non-vacuity check).
 fn grew(s: &Sim, row0: u16) -> bool {
     s.caret().0 + 1 == row0
 }
@@ -679,9 +651,6 @@ fn a_space_that_grows_the_box_lights_its_own_cell() {
     }
 }
 
-/// The first screen, stalled: `interrupted` typed at the end of the second
-/// line, key `at_key`'s echo held `stall` ms, so the wrap's repaint brings the
-/// rest of the word at once.
 fn interrupted_wrapped_in_a_stall(gap: u64, stall: u64, at_key: usize) -> Sim {
     let mut s = Sim::new("workspace");
     s.verbose = true;
@@ -701,8 +670,6 @@ fn interrupted_wrapped_in_a_stall(gap: u64, stall: u64, at_key: usize) -> Sim {
     s
 }
 
-/// Whether the log shows a licensed same-row move that went back at least
-/// `cells` — the wrap's re-anchor (the non-vacuity check).
 fn re_anchored(s: &Sim, cells: u16) -> bool {
     s.log.iter().any(|l| {
         l.contains(" Licensed ")
@@ -737,9 +704,6 @@ fn a_word_wrapped_in_a_stalled_repaint_is_lit_whole() {
     }
 }
 
-/// The Space that grows the box, echoed `late` ms after its key while the
-/// hand pauses: no stamp is fresh when the grown box shows, so only the
-/// key's unpaid press can pay its `+1`, which it does in the text's frame.
 #[test]
 fn a_growth_echo_after_a_pause_lights_its_own_cell() {
     for late in [300u64, 600, 1_200] {
@@ -764,9 +728,6 @@ fn a_growth_echo_after_a_pause_lights_its_own_cell() {
     }
 }
 
-/// The Space that grows the box, its render torn before the park: the host
-/// presents the grown box with the caret hidden for `ms`, so the follow pass
-/// carries the line a frame before the caret shows, and the hand rides with it.
 #[test]
 fn a_growth_echo_torn_before_its_caret_lights_its_own_cell() {
     for ms in [40u64, 200, 600] {
@@ -791,9 +752,6 @@ fn a_growth_echo_torn_before_its_caret_lights_its_own_cell() {
     }
 }
 
-/// The old text the hand edits inside of: one line, padded at its start to
-/// `TW - typed` columns, so `typed` keys fill it and the next key pushes its
-/// last word onto a new row.
 fn old_line(typed: usize) -> String {
     let mut line = String::from(
         "alpha beta gamma delta epsilon zeta eta theta iota kapa lambda mu nu xi omicron pi rho sigma tau upsilonx",
@@ -804,15 +762,8 @@ fn old_line(typed: usize) -> String {
     line
 }
 
-/// Where the hand edits the old text.
 const EDIT_COL: u16 = 40;
 
-/// An edit inside old text whose key grows the box. The hand reaches column
-/// [`EDIT_COL`] by a hop from the line's end (Home, a word hop, a long arrow
-/// run: one navigation, one jump) with `hop`, else with no key (a click);
-/// then `typed`, the growth key and one more key, `gap` ms apart, each echoed
-/// 3 ms after it except the growth key's, echoed `late` ms after it or torn
-/// for `torn` ms.
 fn edit_that_grows_the_box(
     typed: &str,
     hop: bool,
@@ -846,9 +797,6 @@ fn edit_that_grows_the_box(
     (s, row - 1, keys[n].0)
 }
 
-/// Whether the hand's band rode with its line: the band under `col` on `row`
-/// was born before `before` ms, carried with its walk and clocks rather than
-/// begun again where the line now stands.
 fn band_rode(s: &Sim, row: u16, col: u16, before: u64) -> bool {
     let before = s.t0 + Duration::from_millis(before);
     s.glow
@@ -859,10 +807,6 @@ fn band_rode(s: &Sim, row: u16, col: u16, before: u64) -> bool {
         .any(|c| c.row == row && (c.col0..c.col1).contains(&col) && c.born < before)
 }
 
-/// The hop's wake rides with the hand. Inside a hop's wake the typed keys'
-/// band holds the wake's cells too (`Ribbon::fold_wakes_into_band`), and the
-/// growth key's insert pushes that tail along, so its every record reads as
-/// a hole one row up.
 #[test]
 fn a_growth_echo_inside_a_hops_wake_lights_its_own_cell() {
     for (late, torn) in [(600u64, None), (3, Some(200u64))] {
@@ -890,11 +834,6 @@ fn a_growth_echo_inside_a_hops_wake_lights_its_own_cell() {
     }
 }
 
-/// One typed glyph on the hand's line before the growth key. With the caret
-/// shown on the grown row the caret is the second witness to the glyph's
-/// move; with the caret withheld by a torn present the glyph waits for it
-/// (`Witness::await_caret`), so the growth echo lights its own cell either
-/// way and the glyph's band rides up with its line.
 #[test]
 fn a_growth_echo_after_one_typed_glyph_lights_its_own_cell() {
     for (late, torn) in [(3u64, None), (600, None), (3, Some(200u64))] {
@@ -917,9 +856,6 @@ fn a_growth_echo_after_one_typed_glyph_lights_its_own_cell() {
     }
 }
 
-/// The box moves down a row under a torn edit (a footer below it shrank):
-/// the hand, moved up onto the line above a freshly typed one, types one
-/// glyph, then a key whose echo repaints the box a row lower, torn.
 #[test]
 fn a_torn_box_move_down_keeps_the_edit_lit() {
     for torn in [40u64, 200] {
@@ -984,8 +920,6 @@ fn a_torn_box_move_down_keeps_the_edit_lit() {
     }
 }
 
-/// `all thes`, the `s` echoed in the Space's column, then Backspace and the
-/// Space 40 ms apart and `subtrees`.
 fn retyped_over_a_typo(merged: bool) -> Sim {
     let mut s = Sim::new("");
     s.verbose = true;
@@ -1005,8 +939,6 @@ fn retyped_over_a_typo(merged: bool) -> Sim {
     s
 }
 
-/// The derived same-caret licence's verdict for `evidence` after one press
-/// (`aterm_models_effects::same_caret_typed_echo_model`).
 fn same_caret_model_admits(evidence: &str) -> bool {
     let model = aterm_models_effects::same_caret_typed_echo_model();
     let mut state = model.init_state();
@@ -1016,7 +948,6 @@ fn same_caret_model_admits(evidence: &str) -> bool {
     state["admitted"] == 1
 }
 
-/// Whether the hand owns a live typed cell at `(row, col)` born after `at` ms.
 fn laid_after(s: &Sim, row: u16, col: u16, at: u64) -> bool {
     let born = s.t0 + Duration::from_millis(at);
     s.glow
@@ -1027,12 +958,6 @@ fn laid_after(s: &Sim, row: u16, col: u16, at: u64) -> bool {
         .any(|c| c.row == row && c.col == col && c.typing && !c.leaving() && c.born >= born)
 }
 
-/// The owner's `the▯subtrees` (2026-10-16): a Space retyped over a typo in its
-/// own column, its echo merged with the Backspace's, is the Space's echo: the
-/// Backspace's retreat was never seen and the column now spells the key typed
-/// since, so the repaint is the erase's retreat and the Space's advance, and
-/// the key's cell is laid there, as the derived licence admits
-/// (`RetypedInPlace`).
 #[test]
 fn a_space_retyped_over_a_typo_in_one_repaint_lights_its_own_cell() {
     for merged in [false, true] {
@@ -1095,9 +1020,6 @@ fn a_space_retyped_over_a_typo_in_one_repaint_lights_its_own_cell() {
     }
 }
 
-/// Negative control: with no Backspace pressed, the app replacing the hand's
-/// glyph in place with the pending key's glyph under an unchanged caret is
-/// no echo of that key, and the model refuses it too (`ReplacedNoErase`).
 #[test]
 fn a_glyph_replaced_in_place_without_an_erase_claims_no_key() {
     let mut s = Sim::new("");
@@ -1130,10 +1052,6 @@ fn a_glyph_replaced_in_place_without_an_erase_claims_no_key() {
     );
 }
 
-/// Negative control: once the Backspace's own echo was seen apart (the caret
-/// stepped back), the erase is past, so the app later replacing the glyph
-/// before the unchanged caret with the pending Space is no correction and
-/// claims no key, as the derived licence refuses it (`ReplacedNoErase`).
 #[test]
 fn a_glyph_replaced_after_its_erase_echoed_claims_no_key() {
     let mut s = Sim::new("");

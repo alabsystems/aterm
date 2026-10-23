@@ -250,7 +250,7 @@ impl CursorRainbow {
             || (self.paint > SETTLED_ENERGY && self.fp_last != self.fp_prev)
     }
 
-    /// Whether the caret is painted (`paint > SETTLED_ENERGY`) with identical last two frames.
+    /// Whether the caret is not [`Self::is_active`] but still painted (`paint > SETTLED_ENERGY`).
     #[must_use]
     #[inline]
     pub const fn settling(&self) -> bool {
@@ -857,39 +857,66 @@ impl CursorRainbow {
         let table = crate::color_math::relative_luminance_table();
         let base = light_on_glass(page, 0);
         let mut scratch = std::mem::take(&mut self.rim_scratch);
-        let mut pile_light = |quads: &[GlowQuad], colour: &dyn Fn(usize) -> u32| -> f32 {
-            scratch.clear();
-            scratch.resize(w * h, page);
-            let mut aurora = 0.0f32;
-            for (i, &(start, _, _, _)) in rings.iter().enumerate() {
-                let end = rings
-                    .get(i + 1)
-                    .map_or(quads.len(), |&(next, _, _, _)| next);
-                let c = colour(i);
-                let c_light = crate::color_math::relative_luminance_with(table, c);
-                for q in &quads[start..end] {
-                    let x_off = (u32::from(q.x) - x0) as usize;
-                    let qw = usize::from(q.w);
-                    for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
-                        let row_start = (yy - y0) as usize * w + x_off;
-                        for px in &mut scratch[row_start..row_start + qw] {
-                            *px = crate::spectrum::compose_on_glass(*px, c, q.alpha);
-                            aurora += c_light;
-                        }
+        scratch.clear();
+        scratch.resize(w * h, 0);
+        let mut ring_pixels = [0u32; HALO_LAYERS as usize];
+        for (i, &(start, _, _, _)) in rings.iter().enumerate() {
+            let end = rings
+                .get(i + 1)
+                .map_or(quads.len(), |&(next, _, _, _)| next);
+            let bit = 1u32 << (i * 8);
+            for q in &quads[start..end] {
+                if q.alpha != 0 {
+                    continue;
+                }
+                let x_off = (u32::from(q.x) - x0) as usize;
+                let qw = usize::from(q.w);
+                ring_pixels[i] += u32::from(q.w) * u32::from(q.h);
+                for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
+                    let row_start = (yy - y0) as usize * w + x_off;
+                    for px in &mut scratch[row_start..row_start + qw] {
+                        *px += bit;
                     }
                 }
             }
-            scratch
-                .iter()
-                .map(|&px| {
-                    if px == page {
-                        0.0
-                    } else {
-                        (crate::color_math::relative_luminance_with(table, px) - base).max(0.0)
+        }
+        let mut buckets = [(0u32, 0u32); 32];
+        let mut n_buckets = 0usize;
+        for &mask in &scratch {
+            if mask == 0 {
+                continue;
+            }
+            if let Some((_, count)) = buckets[..n_buckets].iter_mut().find(|(m, _)| *m == mask) {
+                *count += 1;
+            } else if n_buckets < buckets.len() {
+                buckets[n_buckets] = (mask, 1);
+                n_buckets += 1;
+            }
+        }
+        let pile_light = |quads: &[GlowQuad], colour: &dyn Fn(usize) -> u32| -> f32 {
+            let _ = quads;
+            let mut cols = [0u32; HALO_LAYERS as usize];
+            let mut aurora = 0.0f32;
+            for (i, &px_count) in ring_pixels[..rings.len()].iter().enumerate() {
+                let c = colour(i);
+                cols[i] = c;
+                aurora += px_count as f32 * crate::color_math::relative_luminance_with(table, c);
+            }
+            let mut sum = 0.0f32;
+            for &(mask, count) in &buckets[..n_buckets] {
+                let mut px = page;
+                for (i, &c) in cols[..rings.len()].iter().enumerate() {
+                    let hits = (mask >> (i * 8)) & 0xff;
+                    for _ in 0..hits {
+                        px = crate::spectrum::compose_on_glass(px, c, 0);
                     }
-                })
-                .sum::<f32>()
-                + aterm_render::hdr::HDR_GLOW_BOOST * aurora
+                }
+                if px != page {
+                    sum += count as f32
+                        * (crate::color_math::relative_luminance_with(table, px) - base).max(0.0);
+                }
+            }
+            sum + aterm_render::hdr::HDR_GLOW_BOOST * aurora
         };
         let grey_rings: [u32; HALO_LAYERS as usize] =
             std::array::from_fn(|i| rings.get(i).map_or(0, |r| premul_rgb(RIM_LIGHT_GREY, r.1)));
@@ -1123,11 +1150,19 @@ fn light_on_glass_with(
     page: u32,
     premul: u32,
 ) -> f32 {
-    crate::color_math::relative_luminance_with(
+    let pr = ((page >> 16) & 0xff) as usize;
+    let pg = ((page >> 8) & 0xff) as usize;
+    let pb = (page & 0xff) as usize;
+    let r = ((premul >> 16) & 0xff) as usize;
+    let g = ((premul >> 8) & 0xff) as usize;
+    let b = (premul & 0xff) as usize;
+    crate::color_math::relative_luminance_rgb(
         table,
-        crate::spectrum::compose_on_glass(page, premul, 0),
+        (pr + r).min(255),
+        (pg + g).min(255),
+        (pb + b).min(255),
     ) + aterm_render::hdr::HDR_GLOW_BOOST
-        * crate::color_math::relative_luminance_with(table, premul)
+        * crate::color_math::relative_luminance_rgb(table, r, g, b)
 }
 
 /// Solve one ring's premultiplied colour on `page` for [`RIM_LIGHT`].
@@ -1160,6 +1195,11 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
         } else {
             hi = mid;
             hi_eval = Some((c, added));
+        }
+        if let (Some((lc, _)), Some((hc, _))) = (lo_eval, hi_eval)
+            && lc == hc
+        {
+            break;
         }
     }
     let err = |premul: u32| (light(premul) - base - target).abs();

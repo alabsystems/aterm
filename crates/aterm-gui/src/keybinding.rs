@@ -13,7 +13,7 @@ const MOD_CTRL: u8 = 1 << 1;
 const MOD_ALT: u8 = 1 << 2;
 const MOD_SHIFT: u8 = 1 << 3;
 
-/// The key portion of a [`Chord`], normalized so a config string and a live key event compare equal.
+/// Normalized key portion of a [`Chord`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum KeyToken {
     /// A printable character key, lowercased (`a`, `=`, `[`).
@@ -246,10 +246,6 @@ pub(crate) fn builtin_shadow_label(chord_str: &str) -> Option<&'static str> {
     )
 }
 
-/// The testable core of [`builtin_shadow_label`] with both gates explicit. With
-/// the Cmd/Super suite compiled off (`suite_live` false, Linux) `on_key`
-/// intercepts none of these chords, so a `super+t` binding is a plain rebind and
-/// every probe answers `None`.
 fn builtin_shadow_label_when(
     chord_str: &str,
     suite_live: bool,
@@ -352,8 +348,6 @@ pub(crate) fn is_unbind_action(name: &str) -> bool {
     matches!(name.trim(), "none" | "unbind")
 }
 
-/// Map a config modifier word, aliases included (`win`/`meta` are Cmd/Super,
-/// `opt` is Alt), to its mask bit.
 fn modifier_bit(word: &str) -> Option<u8> {
     Some(match word {
         "cmd" | "command" | "super" | "win" | "meta" => MOD_CMD,
@@ -364,14 +358,10 @@ fn modifier_bit(word: &str) -> Option<u8> {
     })
 }
 
-/// Map a config key word (the final `+`-segment) to a [`KeyToken`]: a single
-/// character is a `Char`, `plus`/`minus`/`equal` spell characters, and any other
-/// word is looked up as a named key.
 fn key_token(word: &str) -> Option<KeyToken> {
     let mut chars = word.chars();
     let first = chars.next()?;
     if chars.next().is_none() {
-        // Single character: fold to lowercase so case is carried only by SHIFT.
         return Some(KeyToken::Char(first.to_ascii_lowercase()));
     }
     match word {
@@ -413,8 +403,6 @@ fn key_token(word: &str) -> Option<KeyToken> {
     Some(KeyToken::Named(named))
 }
 
-/// The ASCII punctuation a US/UK layout composes with Shift, and which therefore
-/// never appears as a chord's key.
 const SHIFT_COMPOSED_ASCII: &[char] = &[
     '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '{', '}', '|', ':', '"', '<', '>',
     '?',
@@ -474,7 +462,6 @@ impl Chord {
                 return Err("write the + key as plus".to_string());
             }
             if key.is_some() {
-                // A token after the key segment means the key wasn't last.
                 return Err("the key must come last".to_string());
             }
             if let Some(bit) = modifier_bit(seg) {
@@ -497,7 +484,6 @@ impl Chord {
                 let mut chars = s.chars();
                 let c = chars.next()?;
                 if chars.next().is_some() {
-                    // multi-char (composed) string is not a chord key
                     return None;
                 }
                 KeyToken::Char(c.to_ascii_lowercase())
@@ -622,15 +608,13 @@ pub(crate) fn chord_layout_twin(
     aterm_winit_keymap::layout_letter_twin_for(logical, physical)
 }
 
-/// The chord → action map `on_key` consults before its hardcoded matches: the platform seeds ([`Self::platform_defaults`]) overlaid by `[keybindings]`.
+/// Chord-to-action map combining platform defaults and `[keybindings]` overrides.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Keybindings {
     map: HashMap<Chord, Action>,
 }
 
 impl Keybindings {
-    /// Collect the parsed map, the unbind chords ([`is_unbind_action`]) and an
-    /// unprefixed warning per skipped entry.
     fn collect(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (HashMap<Chord, Action>, Vec<Chord>, Vec<String>) {
@@ -771,7 +755,7 @@ impl Keybindings {
         Self::resolved_warn(table).0
     }
 
-    /// Like [`Self::resolved`] but returns the user-table warnings (seeds never warn).
+    /// Like `Self::resolved` but returns the user-table warnings (seeds never warn).
     #[must_use]
     pub(crate) fn resolved_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
@@ -837,7 +821,7 @@ impl Keybindings {
     }
 }
 
-/// The user `[key_sequences]` table: chord -> raw bytes, an input-policy override that sends exactly those bytes whatever the running app negotiated.
+/// User `[key_sequences]` chord-to-raw-bytes map.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct KeySequences {
     map: HashMap<Chord, Vec<u8>>,
@@ -857,7 +841,7 @@ impl KeySequences {
         KeySequences { map }
     }
 
-    /// Like [`Self::from_config`] but returns the warnings, so the GUI can surface dropped rules.
+    /// Like `Self::from_config` but returns the warnings, so the GUI can surface dropped rules.
     #[must_use]
     pub(crate) fn from_config_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
@@ -866,7 +850,6 @@ impl KeySequences {
         (KeySequences { map }, warns)
     }
 
-    /// Collect the parsed map plus an unprefixed warning per skipped entry.
     fn collect(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (HashMap<Chord, Vec<u8>>, Vec<String>) {
@@ -1046,7 +1029,6 @@ mod tests {
         WinitKey::Character(SmolStr::new(c))
     }
 
-    /// `cmd+shift+t` parses to the cmd+shift mask and the lowercased `t` key.
     #[test]
     fn parse_basic_chord() {
         let c = Chord::parse("cmd+shift+t").unwrap();
@@ -1054,8 +1036,6 @@ mod tests {
         assert_eq!(c.key, KeyToken::Char('t'));
     }
 
-    /// Modifier order does not matter, case is folded, and the modifier
-    /// aliases (super → cmd, option → alt, control → ctrl) name the same chord.
     #[test]
     fn chord_order_case_and_aliases_parse_equal() {
         for (a, b) in [
@@ -1073,7 +1053,6 @@ mod tests {
         }
     }
 
-    /// Named keys parse to their `NamedKey`, with common aliases.
     #[test]
     fn named_keys_parse() {
         assert_eq!(
@@ -1094,7 +1073,6 @@ mod tests {
         );
     }
 
-    /// Malformed chords are rejected with a reason (the loader warns + skips).
     #[test]
     fn malformed_chords_rejected() {
         assert!(Chord::parse("").is_err());
@@ -1111,7 +1089,6 @@ mod tests {
         );
     }
 
-    /// Action names parse, including the indexed `switch_tab_<n>` form (1..=9).
     #[test]
     fn action_names_parse() {
         assert_eq!(Action::parse("new_tab"), Some(Action::NewTab));
@@ -1139,8 +1116,6 @@ mod tests {
         assert_eq!(Action::parse("switch_tab_99"), None);
     }
 
-    /// A live event builds the chord its config string parses to (case-folded, base
-    /// logical key).
     #[test]
     fn event_chord_matches_parsed() {
         let parsed = Chord::parse("cmd+t").unwrap();
@@ -1152,7 +1127,6 @@ mod tests {
         assert_eq!(parsed_shift, live_shift);
     }
 
-    /// A bare modifier press (no key) is not a chord.
     #[test]
     fn bare_modifier_event_is_none() {
         assert!(
@@ -1160,8 +1134,6 @@ mod tests {
         );
     }
 
-    /// A populated table resolves a configured chord to its action and still
-    /// misses on unbound chords.
     #[test]
     fn config_table_resolves_and_misses() {
         let mut table = std::collections::BTreeMap::new();
@@ -1180,7 +1152,6 @@ mod tests {
         assert_eq!(kb.lookup(&ch("t"), ModifiersState::SUPER), None);
     }
 
-    /// A malformed chord or unknown action is skipped; the rest of the table stays.
     #[test]
     fn bad_entries_skipped_rest_kept() {
         let mut table = std::collections::BTreeMap::new();
@@ -1196,8 +1167,6 @@ mod tests {
         assert_eq!(kb.map.len(), 1);
     }
 
-    /// With no config, off macOS the standard terminal chords are seeded (no Super
-    /// key needed) and a user entry overlays and wins; macOS keeps an empty table.
     #[test]
     fn platform_defaults_seed_terminal_chords() {
         let kb = Keybindings::resolved(None);
@@ -1265,9 +1234,6 @@ mod tests {
         }
     }
 
-    /// `plus` binds the `+` key (`ctrl++` cannot be written), and Ctrl+Plus is
-    /// seeded for zoom-in: the de-DE/Nordic main-row `+` and the numpad `+` arrive
-    /// unshifted.
     #[test]
     fn plus_is_bindable_and_seeded_for_zoom_in() {
         assert_eq!(
@@ -1397,8 +1363,6 @@ mod tests {
         );
     }
 
-    /// Full screen is a bindable action under both spellings (off macOS no menu
-    /// bar reaches it).
     #[test]
     fn fullscreen_is_a_bindable_action() {
         assert_eq!(Action::parse("fullscreen"), Some(Action::ToggleFullscreen));
@@ -1419,7 +1383,6 @@ mod tests {
         );
     }
 
-    /// Find-again is bindable but unseeded: `f3` is also a live console key.
     #[test]
     fn find_again_is_bindable_but_unseeded() {
         assert_eq!(Action::parse("find_next"), Some(Action::FindNext));
@@ -1448,8 +1411,6 @@ mod tests {
         );
     }
 
-    /// `"none"` / `"unbind"` masks a platform seed without a warning; unbinding a
-    /// never-bound chord is a no-op, and the other seeds survive.
     #[test]
     fn unbind_value_masks_platform_seed() {
         let mut table = std::collections::BTreeMap::new();
@@ -1537,8 +1498,6 @@ mod tests {
         }
     }
 
-    /// Display uppercases ASCII only, matching `parse`'s fold, so non-ASCII keys
-    /// (`ß`, `é`) display verbatim and round-trip.
     #[test]
     fn display_round_trips_non_ascii_chord_keys() {
         for spelling in ["ctrl+ß", "ctrl+é", "ctrl+shift+a", "alt+µ"] {
@@ -1553,9 +1512,6 @@ mod tests {
         assert_eq!(Chord::parse("ctrl+a").unwrap().display(), "Ctrl+A");
     }
 
-    /// Backslash escapes expand to bytes (TOML literal-string style), and any
-    /// other char — including a control char a TOML basic string already expanded —
-    /// passes through as its UTF-8 bytes.
     #[test]
     fn key_sequence_parses_escapes() {
         assert_eq!(parse_byte_sequence("\\n").unwrap(), vec![0x0a]);
@@ -1572,7 +1528,6 @@ mod tests {
         assert_eq!(parse_byte_sequence("ab").unwrap(), b"ab".to_vec());
     }
 
-    /// Malformed escapes are rejected (the loader warns + skips that entry).
     #[test]
     fn key_sequence_rejects_bad_escapes() {
         assert!(parse_byte_sequence("\\q").is_err());
@@ -1582,8 +1537,6 @@ mod tests {
         assert!(parse_byte_sequence("\\").is_err());
     }
 
-    /// A `[key_sequences]` table parses to chord -> bytes, looks up by live event,
-    /// misses on unbound chords, and skips a malformed line (fail-open).
     #[test]
     fn key_sequences_from_config_and_lookup() {
         let mut table = std::collections::BTreeMap::new();
@@ -1609,7 +1562,6 @@ mod tests {
         assert_eq!(ks.map.len(), 2, "the bad chord was skipped");
     }
 
-    /// A value over the byte cap is rejected; one exactly at the cap is accepted.
     #[test]
     fn key_sequence_oversized_value_rejected() {
         let at_cap = "a".repeat(MAX_KEY_SEQUENCE_BYTES);
@@ -1621,8 +1573,6 @@ mod tests {
         assert!(parse_byte_sequence(&too_big).is_err());
     }
 
-    /// A bad `\u{HEX}` scalar is an `Err`, never a panic; a valid astral scalar
-    /// expands to its UTF-8 bytes.
     #[test]
     fn key_sequence_unicode_brace_edge_cases() {
         assert!(parse_byte_sequence("\\u{}").is_err());
@@ -1634,8 +1584,6 @@ mod tests {
         );
     }
 
-    /// Keybindings beat key_sequences; a key_sequences chord on a hardcoded Cmd
-    /// shortcut still resolves to `Sequence`; an unbound chord falls through.
     #[test]
     fn resolve_chord_precedence() {
         use std::collections::BTreeMap;
@@ -1684,8 +1632,6 @@ mod tests {
         );
     }
 
-    /// A chord on a non-Latin layout matches its US key's binding — the key
-    /// the PTY encoder would otherwise have sent the control byte of.
     #[test]
     fn a_layout_letter_matches_its_us_keys_binding_only_in_a_chord() {
         use aterm_window::keyboard::KeyCode;
@@ -1784,8 +1730,6 @@ mod tests {
         assert!(!Action::Copy.is_paste());
     }
 
-    /// A `focus_pane_*` binding claims its chord only when focus can move that
-    /// way.
     #[test]
     fn a_pane_focus_binding_claims_its_chord_only_when_focus_can_move() {
         use crate::pane::FocusDir;
@@ -1828,9 +1772,6 @@ mod tests {
         );
     }
 
-    /// Off the arrows a `focus_pane_*` binding claims its chord whatever the
-    /// geometry, and the geometry is not even asked: `ctrl+j` falling through would
-    /// write LF, which bash runs as accept-line.
     #[test]
     fn a_pane_focus_binding_off_the_arrows_always_claims_its_chord() {
         use std::collections::BTreeMap;
@@ -1875,7 +1816,6 @@ mod tests {
         );
     }
 
-    /// `pane_focus_dir` names exactly the four pane-focus actions.
     #[test]
     fn pane_focus_dir_names_the_four_focus_actions() {
         use crate::pane::FocusDir;
@@ -1896,8 +1836,6 @@ mod tests {
         }
     }
 
-    /// `builtin_shadow_label` maps known built-ins (normalizing spelling), asserted
-    /// through the gate-explicit core with the suite live, so on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
         let known = |chord: &str, menu_bar: bool| builtin_shadow_label_when(chord, true, menu_bar);
@@ -1922,8 +1860,6 @@ mod tests {
         );
     }
 
-    /// With the Cmd/Super suite compiled off (Linux) nothing can shadow it, so a
-    /// `super+t` rebind never warns of a built-in.
     #[test]
     fn builtin_shadow_label_is_silent_when_the_suite_is_gated_off() {
         assert_eq!(builtin_shadow_label_when("cmd+c", false, true), None);
@@ -1934,7 +1870,6 @@ mod tests {
         );
     }
 
-    /// chord_in_keybindings detects a cross-table collision (normalized).
     #[test]
     fn chord_in_keybindings_detects_cross_table() {
         use std::collections::BTreeMap;
@@ -1944,7 +1879,6 @@ mod tests {
         assert!(!chord_in_keybindings("cmd+x", &kb));
     }
 
-    /// `from_config_warn` returns one warning per dropped rule and keeps the good one.
     #[test]
     fn key_sequences_from_config_warn_returns_dropped_rules() {
         use std::collections::BTreeMap;
@@ -1959,8 +1893,6 @@ mod tests {
         assert_eq!(warns.len(), 4, "one warning per dropped rule: {warns:?}");
     }
 
-    /// Keybindings::from_config_warn reports a bad chord + unknown action; resolved_warn
-    /// surfaces the same user warnings atop the platform defaults.
     #[test]
     fn keybindings_from_config_warn_reports_unknown_action_and_bad_chord() {
         use std::collections::BTreeMap;

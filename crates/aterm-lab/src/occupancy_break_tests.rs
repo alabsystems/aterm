@@ -9,7 +9,7 @@ use std::path::Path;
 
 use aterm_agent::supervise::occupancy::rules::NUDGE_SEAM;
 use aterm_agent::supervise::occupancy::{templates, waiting_declared};
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_agent::supervise::{Autopilot, Occupancy, SupervisorConfig};
 
 use super::*;
 use crate::scn::{Plan, scenarios};
@@ -61,11 +61,11 @@ fn its_scratch_aterm_toml_grants_prompt_under_cruise() {
     let (cfg, notes) =
         SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml("", HARNESS_KEYS));
     assert!(notes.is_empty(), "{notes:?}");
-    assert!(cfg.occupancy.grant().is_some(), "{:?}", cfg.occupancy);
+    assert_eq!(cfg.occupancy, Occupancy::Prompt);
     assert_eq!(cfg.autopilot, Autopilot::Cruise);
     assert_eq!(cfg.human_grace_s, 5);
     let (plain, _) = SupervisorConfig::from_aterm_toml(&crate::lab::scratch_aterm_toml("", ""));
-    assert!(plain.occupancy.grant().is_none(), "{:?}", plain.occupancy);
+    assert_ne!(plain.occupancy, Occupancy::Prompt);
 }
 
 /// THE INSTANCE GETS THE NUDGE'S SEAM AT A MINUTE: `LAB_INSTANCE_ENV` takes the scenario's words

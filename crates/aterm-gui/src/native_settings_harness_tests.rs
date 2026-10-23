@@ -78,8 +78,6 @@ pub(super) fn fixture() -> HarnessState {
     }
 }
 
-/// The A/B book's week the fixture publishes: each arm's time, a few boxes
-/// on each side, begun today.
 fn ab_week() -> AbWeek {
     let mut week = AbWeek::default();
     week.arms[AbArm::Cruise.index()] = AbArmTotals {
@@ -110,10 +108,6 @@ fn ab_week() -> AbWeek {
     week
 }
 
-/// [`fixture`] whose A/B week leads (§11.6.1): Cruise with 6h 10m of
-/// working time, <1% of it held, beside Off's 25m, 14% held — or, where
-/// not `both`, Cruise alone, under the note — and ends counted: five
-/// landings with their spans and one quiet end.
 fn fixture_led(both: bool) -> HarnessState {
     let mut state = fixture();
     let mut week = ab_week();
@@ -139,7 +133,6 @@ fn fixture_led(both: bool) -> HarnessState {
     state
 }
 
-/// A Settings controller holding `state`, its view on Settings ▸ Harness.
 fn harness_route(
     state: HarnessState,
 ) -> (
@@ -150,7 +143,6 @@ fn harness_route(
     harness_route_over(state, None)
 }
 
-/// [`harness_route`] over an aterm.toml `source`, where one is given.
 fn harness_route_over(
     state: HarnessState,
     source: Option<&str>,
@@ -185,9 +177,6 @@ fn harness_route_over(
     (runtime, instance, view)
 }
 
-/// Every page of the route at `cx`, compiled: page 0, then each page to the
-/// bound the render recorded — each as a scroll seats it, which lets go of
-/// the control a press kept in view.
 fn every_page(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -219,7 +208,6 @@ fn every_page(
     }
 }
 
-/// The semantic node `key` on any of `pages`.
 fn node<'a>(
     pages: &'a [crate::native_ui::CompiledUi],
     key: &str,
@@ -230,15 +218,6 @@ fn node<'a>(
         .unwrap_or_else(|| panic!("{key} is on no page"))
 }
 
-/// THE ROUTE IS ITS SPECIAL PAGE (§4): the heading, the rail's own word; the
-/// STATUS card with the policy's words, the UPDATES card's running harness
-/// version and links to the existing update pages, and the Refresh and Open aterm.toml
-/// actions; the five registry rows as their ordinary `settings/control/<key>`
-/// controls; the session's row with its three buttons, the mode it runs
-/// under selected; the WHAT THE HARNESS DID card from the fixture's counts,
-/// the person's wait in hours and minutes and the cut said; the A/B card with
-/// both arms and the sentence that sets them side by side; and the effective
-/// table, `default` or `yours` by key.
 #[test]
 fn the_harness_route_renders_its_cards_and_controls() {
     let (mut runtime, instance, view) = harness_route(fixture());
@@ -511,12 +490,6 @@ fn the_harness_route_renders_its_cards_and_controls() {
     );
 }
 
-/// THE QUIET STATES: no agent session open says so, once (the SESSIONS
-/// card, not STATUS too); an A/B book with no time says so on each row
-/// (`none seen yet`, `not measured yet`, `none yet`, `none`, `nothing yet`:
-/// the Ends and Unsupervised rows stand, §11.6.7), with none of the old
-/// run's rows; an
-/// unread page says it is reading.
 #[test]
 fn the_harness_route_says_what_it_has_not_got() {
     let mut empty = fixture();
@@ -585,11 +558,6 @@ fn the_harness_route_says_what_it_has_not_got() {
     }
 }
 
-/// THE PRESSES: a session's Land asks the host for that word, typed; a press
-/// for a session the snapshot no longer lists, or under the master switch
-/// off, asks for nothing and says why; Refresh asks for a reading; Open
-/// aterm.toml is the Manual route's own act at the `[harness]` table, and the
-/// page stays.
 #[test]
 fn the_harness_routes_presses_are_typed_host_requests() {
     let press = |runtime: &mut NativeRuntime,
@@ -680,11 +648,6 @@ fn the_harness_routes_presses_are_typed_host_requests() {
     );
 }
 
-/// THE SESSION ROW'S STATE LINE AND TIMER (§9.3.4): an armed timer reads
-/// `lands at 18:00` under the row's detail (clock times only); the row's
-/// `Timer` disclosure opens `1 hour`, `2 hours`, `4 hours`, `at 18:00` (with `[harness]
-/// land_at` set) and `Cancel` (while armed), each a typed host request
-/// (`HarnessTimerRequest`), and closes again.
 #[test]
 fn a_sessions_timer_disclosure_arms_and_cancels_its_timed_cruise() {
     use crate::autopilot_timers::TimerChoice;
@@ -852,12 +815,6 @@ fn a_sessions_timer_disclosure_arms_and_cancels_its_timed_cruise() {
     );
 }
 
-/// EACH SESSION'S BUTTONS BY ITS OWN POSTURE: with Codex's switch Off (the
-/// window's posture `Restricted`), a Codex session's Cruise, Land and Off are
-/// drawn inert, nothing selected, and a press of one asks the host for
-/// nothing and names the switch; a Claude Code session beside it — its
-/// agent admitted — stays live, its mode selected, and its Land asks for the
-/// word.
 #[test]
 fn a_sessions_buttons_follow_its_agents_own_switch() {
     let mut state = fixture();
@@ -926,10 +883,6 @@ fn a_sessions_buttons_follow_its_agents_own_switch() {
     );
 }
 
-/// THE TIMER BY ITS SESSION'S OWN POSTURE, as the mode buttons (above): with
-/// Codex's switch Off, a Codex row's `Timer` is drawn inert and its `1 hour`
-/// asks the host for nothing and names the switch; the Claude Code row
-/// beside it stays live and its `1 hour` is a typed timer request.
 #[test]
 fn a_sessions_timer_follows_its_agents_own_switch() {
     use crate::autopilot_timers::TimerChoice;
@@ -1001,11 +954,6 @@ fn a_sessions_timer_follows_its_agents_own_switch() {
     );
 }
 
-/// AN AGENT SWITCHED OFF BY ITS OWN TABLE IS ON THE EFFECTIVE TABLE: with
-/// only `[harness.codex] enabled = false` written, the SETTINGS IN
-/// ATERM.TOML card lists `codex.enabled: false · yours` and counts the rest
-/// as more defaults — never "all … settings" at their defaults while STATUS
-/// says a written setting limits supervision.
 #[test]
 fn an_agent_switched_off_is_on_the_effective_table() {
     let policy = crate::app_config::HarnessPolicy::read("[harness.codex]\nenabled = false\n");
@@ -1042,12 +990,6 @@ fn an_agent_switched_off_is_on_the_effective_table() {
     );
 }
 
-/// THE PAGE IS WHOLE ON EVERY HOST it is drawn for: every page of it, at
-/// every Dynamic Type rung, from the phone page and the 80×24 window's short
-/// landscape (its pager beside the cards) to a roomy desktop, the effective
-/// table closed and open — no text of the page's overflows, nothing is
-/// materially clipped, and every hit target is material and inside the
-/// window.
 #[test]
 fn the_harness_route_is_whole_on_every_host() {
     let hosts = [320.0, 584.0, 849.0, 1_200.0]
@@ -1094,9 +1036,6 @@ fn the_harness_route_is_whole_on_every_host() {
     });
 }
 
-/// The words the paint node `key` draws, on whichever page draws it: its
-/// text, or the lines of a text wrapped to its column (`<key>/line-<n>`),
-/// joined again.
 fn painted_text(pages: &[crate::native_ui::CompiledUi], key: &str) -> String {
     let node = pages
         .iter()
@@ -1132,12 +1071,6 @@ fn painted_text(pages: &[crate::native_ui::CompiledUi], key: &str) -> String {
     painted_words(&lines.join("\n"))
 }
 
-/// WHOSE WORD IT RUNS UNDER, ON A LINE OF ITS OWN (design §11.7.1,
-/// §11.7.7): a SESSIONS row with the longest setter's words — the Every
-/// session row's, set more than a year back so its date names the year —
-/// says `its own setting, set 4 Oct 2024 14:05 from Settings ▸ Harness,
-/// every session` on the line under it (`harness/session/<id>/setting`),
-/// its detail no longer carrying `its own setting`.
 #[test]
 fn a_rows_setting_line_is_whole_in_its_label_on_every_host() {
     use crate::autopilot::{SetByWords, Surface};
@@ -1211,14 +1144,6 @@ fn a_rows_setting_line_is_whole_in_its_label_on_every_host() {
     );
 }
 
-/// A STACKED ROW'S FLOW COUNTS ITS SETTING LINE (design §10.3.4, §11.7.7):
-/// on short hosts at 2× text, a stacked SESSIONS row with its setting, state
-/// and day lines takes only as many lines of buttons as let the whole row
-/// fit one card of the page — its faces cut, their labels whole, where it
-/// must — so some page shows the row whole wherever a shorter flow could
-/// (on the shortest hosts not even one line of buttons lets it fit), and no
-/// text overflows: every height from the 80 × 24 window's page to a tall
-/// phone page, on the phone's width and the narrow window's.
 #[test]
 fn a_stacked_rows_flow_counts_its_setting_line() {
     use crate::harness_glass::Stamp;
@@ -1326,10 +1251,6 @@ fn a_stacked_rows_flow_counts_its_setting_line() {
     });
 }
 
-/// THE DEFAULT AUTOPILOT is a short choice, so it is drawn as segments in
-/// its row on the page (no page-wide picker) — on whichever page its row
-/// falls, under one switch per supervised agent — and a segment saves its
-/// mode.
 #[test]
 fn the_default_autopilot_is_segments_on_the_page() {
     let (mut runtime, instance, view) = harness_route(fixture());
@@ -1365,10 +1286,6 @@ fn the_default_autopilot_is_segments_on_the_page() {
     assert!(state.choice_picker.is_none(), "no page-wide picker");
 }
 
-/// ONLY A CARRYING DEFAULT'S BUTTON SAYS IT FOLLOWS THE DEFAULT: under
-/// `[harness] autopilot = "off"` the Off button pins Off like any other
-/// press (`harness_screen::hands_back`), so no button's description claims
-/// to follow `[harness] autopilot`.
 #[test]
 fn an_off_defaults_button_does_not_say_it_follows_the_default() {
     let follows = |default: Autopilot| -> Vec<&'static str> {
@@ -1392,14 +1309,6 @@ fn an_off_defaults_button_does_not_say_it_follows_the_default() {
     assert_eq!(follows(Autopilot::Land), ["land"]);
 }
 
-/// THE SWITCHES EXPLAIN THEMSELVES on their own page, as every page's rows
-/// do ([`prefs::row_notes`]): what supervision does under Supervise coding
-/// agents, Cruise/Land/Off under Default autopilot, All/Safe/None under
-/// Approve permission boxes, each inside its row; what an agent's own switch
-/// does once, after the last of them, and the question priorities once,
-/// after Question priority, each the run's own stop
-/// (`settings/shared-note/…`), never inside that row's lines, as if its
-/// alone, nor under Answer questions as well.
 #[test]
 fn the_harness_switches_draw_their_notes() {
     let agents: Vec<(String, &str)> = aterm_phase::Program::ALL
@@ -1490,10 +1399,6 @@ fn the_harness_switches_draw_their_notes() {
     }
 }
 
-/// A ROW THAT DOES NOTHING SAYS SO: with Supervise coding agents Off the
-/// harness runs no supervisor, so every finer row of the card is saved and
-/// idle (`SupervisorConfig::on_for` is `enabled && !off.contains(agent)`),
-/// and with Answer questions Off, Question priority is.
 #[test]
 fn the_harness_rows_say_when_they_are_inactive() {
     let label = |pages: &[crate::native_ui::CompiledUi], key: &str| -> String {
@@ -1542,12 +1447,6 @@ fn the_harness_rows_say_when_they_are_inactive() {
     );
 }
 
-/// AN IDLE ROW'S CONTROL IS MUTED, every segment of it: with Supervise
-/// coding agents Off, every finer row's control — Default autopilot's and
-/// Approve permission boxes' and Question priority's segments, the agents'
-/// switches — carries `muted`, so the painter draws it in quiet ink
-/// rather than the live accent (`native_ui`'s
-/// `a_muted_selected_segment_paints_no_accent`); the master switch does not.
 #[test]
 fn an_idle_rows_control_is_muted_every_segment_of_it() {
     let muted = |source: Option<&str>| -> Vec<String> {
@@ -1603,10 +1502,6 @@ fn an_idle_rows_control_is_muted_every_segment_of_it() {
     );
 }
 
-/// OFF ITS PAGE A HARNESS ROW SAYS WHOSE IT IS: Modified's card and
-/// Search's heading for the supervision rows name the Harness page once
-/// ("Harness supervision"), so "Watch codex-alab sessions · Off" there never
-/// reads as Codex itself switched off, and never as "Harness · Harness …".
 #[test]
 fn the_harness_rows_name_their_page_off_it() {
     for key in harness_page_rows() {
@@ -1622,8 +1517,6 @@ fn the_harness_rows_name_their_page_off_it() {
     );
 }
 
-/// The actual Settings controller offers a live Cancel from the raw armed
-/// instant even without a local clock face; an unarmed row still has none.
 #[test]
 fn a_sessions_timer_without_a_local_face_still_offers_cancel() {
     use crate::autopilot_timers::TimerChoice;
@@ -1672,8 +1565,6 @@ fn a_sessions_timer_without_a_local_face_still_offers_cancel() {
     }
 }
 
-/// The visual label a page paints on button `key` (its semantic label keeps
-/// the whole sentence).
 fn button_face(pages: &[crate::native_ui::CompiledUi], key: &str) -> String {
     pages
         .iter()
@@ -1687,11 +1578,6 @@ fn button_face(pages: &[crate::native_ui::CompiledUi], key: &str) -> String {
         .unwrap_or_else(|| panic!("{key} paints no button"))
 }
 
-/// THE TIMER'S `at` BUTTON SAYS THE DAY IT WOULD ARM (§9.3.4; the Together
-/// run's D6, where it read `at 18:36` beside `lands Sat 18:36`): an offer for
-/// today reads `at 18:00` and says `Cruise until 18:00, then land`; once
-/// today's has passed it reads `at Sat 18:00` and says `Cruise until
-/// Saturday 18:00, then land`, as the state line writes the armed time.
 #[test]
 fn the_timers_at_button_names_the_day_it_would_arm() {
     let mut policy = SupervisorConfig::default();
@@ -1737,8 +1623,6 @@ fn the_timers_at_button_names_the_day_it_would_arm() {
     }
 }
 
-/// A press of `action` (with `value`) on the page, and the host requests it
-/// made.
 fn press_for_requests(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -1765,7 +1649,6 @@ fn press_for_requests(
         .collect()
 }
 
-/// The paint node `key` on `page`, where it is drawn.
 fn painted<'a>(
     page: &'a crate::native_ui::CompiledUi,
     key: &str,
@@ -1773,9 +1656,6 @@ fn painted<'a>(
     page.paint.iter().find(|node| node.key.as_str() == key)
 }
 
-/// SESSIONS STAYS ON THE FIRST SCREEN UNDER STATUS'S TODAY (§4 item 2,
-/// §10.3.3 item 6): on the 80 × 24 window's page (584 × 348) and the shipped
-/// 744 × 420, at 1× and 2× text, page 0 holds SESSIONS' heading.
 #[test]
 fn sessions_stays_on_the_first_screen_under_todays_lines() {
     use crate::native_ui::{StyleRef, UiContent};
@@ -1790,13 +1670,7 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
         (1.0, 584.0, 348.0, Some(StyleRef::Hero), false),
         (1.0, 744.0, 420.0, Some(StyleRef::Hero), false),
         (1.0, 849.0, 900.0, Some(StyleRef::Hero), false),
-        (
-            2.0,
-            584.0,
-            348.0,
-            cfg!(windows).then_some(StyleRef::Primary),
-            false,
-        ),
+        (2.0, 584.0, 348.0, None, false),
         (2.0, 744.0, 420.0, Some(StyleRef::Hero), true),
     ] {
         at_each_text_scale(&[scale], "Harness first screen", |_| {
@@ -1846,10 +1720,6 @@ fn sessions_stays_on_the_first_screen_under_todays_lines() {
     }
 }
 
-/// TODAY'S LINES GIVE WAY IN STEPS (§10.3.1, §10.3.4 "A narrow page"):
-/// Hero type and the second line where the budget holds both; plain type
-/// first where it does not, or where the Hero line is not whole at the
-/// width; then the second line goes; then the block.
 #[test]
 fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     use crate::native_settings::harness_page::today_block;
@@ -1953,13 +1823,6 @@ fn todays_lines_give_way_hero_then_plain_then_the_second_line() {
     });
 }
 
-/// A NOTE IS NEVER DRAWN IN HERO TYPE, AND KEEPS THE COUNTS' ROOM (owner-eye-7):
-/// Hero type is for a
-/// line of counts; `nothing yet today` and `reading…` say no count, and are
-/// drawn in the page's plain type — in the Hero line's slot wherever Hero
-/// would hold them, so the counts that replace them (the first reading, the
-/// day's first act) move nothing under STATUS: SESSIONS' heading stands where
-/// it stood, at 1× and 2× text.
 #[test]
 fn todays_notes_are_drawn_in_the_pages_plain_type() {
     use crate::harness_screen::{TODAY_NOTHING_YET, TODAY_READING};
@@ -2072,14 +1935,11 @@ fn todays_notes_are_drawn_in_the_pages_plain_type() {
     });
 }
 
-/// Whether `text` is one line of Hero type in `width`.
 fn fits_in_hero(text: &str, width: f32) -> bool {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Hero);
     crate::tray_raster::ui_text_width_for(face, text, px) <= width
 }
 
-/// A fixture whose session 7 has a day of its own today, and a second row
-/// whose title it shares where `twin`.
 fn fixture_with_a_day(twin: bool) -> HarnessState {
     use aterm_agent::harness::stats::Tally;
     let mut state = fixture();
@@ -2118,10 +1978,6 @@ fn fixture_with_a_day(twin: bool) -> HarnessState {
     state
 }
 
-/// A ROW'S DAY, ITS SHOW AND THE LANDING (§10.3.1, §10.3.2): the row says
-/// its day (`harness/session/7/today`); its `Show` asks the host to raise
-/// it; `harness/land` with `session/7` draws its Show selected and its card
-/// on the accent, until the next press.
 #[test]
 fn a_rows_day_its_show_and_its_landing() {
     use crate::native_app::{HarnessRequest, SemanticInput};
@@ -2212,12 +2068,6 @@ fn a_rows_day_its_show_and_its_landing() {
     );
 }
 
-/// THE LANDED ROW'S CARD HOLDS ITS WHOLE BLOCK, CLEAR OF ITS WORDS (owner-eye-3):
-/// the accent card is drawn around the
-/// row's whole block — its title and detail, its buttons, its state line,
-/// its day and its open timer's buttons — inset so its outline touches no
-/// glyph and no button: 8 px beside them, half the gap between rows over and
-/// under them; never cut by its card.
 #[test]
 fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
     use crate::harness_glass::Stamp;
@@ -2345,17 +2195,6 @@ fn a_landed_rows_card_holds_its_whole_block_clear_of_its_words() {
     );
 }
 
-/// THE LANDING DRAWS ALL OF THE BLOCK IT SELECTS (the review of
-/// v3/polish-page's fixes): the Autopilot menu's `Harness settings…`
-/// lands Settings ▸ Harness on a SESSIONS row and draws its whole block —
-/// the row, its state, its day, its open timer — on the accent, so the page
-/// scrolls until all of that block
-/// is whole in the list's room (live, not cut by its edge nor a fading
-/// picture in the strip kept for a status bar) wherever the room holds it,
-/// and to the block's top where it is taller than the list: on the 80 × 24
-/// window's page (584 × 348), the shipped 744 × 420, a short wide host
-/// (1200 × 348), taller ones (480, 528, 600) and a 1200 × 456, at 1× and 2×
-/// text, its timer closed and open.
 #[test]
 fn a_landing_draws_all_of_the_block_it_selects() {
     use crate::native_app::SemanticInput;
@@ -2450,11 +2289,6 @@ fn a_landing_draws_all_of_the_block_it_selects() {
     );
 }
 
-/// THE LANDING DRAWS ALL OF A BLOCK THAT HEADS A RUN OF ITS CARD (the
-/// post-landing check's behaviour-1): at 2× text on the lab's narrow page
-/// (504 × 628 pt, and a few heights about it), three sessions each under
-/// an `18:00` timer, the Autopilot menu's `Harness settings…` lands on
-/// each row with its Timer open.
 #[test]
 fn a_landing_draws_all_of_a_block_that_heads_a_run_of_its_card() {
     use crate::native_app::SemanticInput;
@@ -2595,10 +2429,6 @@ fn a_landing_draws_all_of_a_block_that_heads_a_run_of_its_card() {
     );
 }
 
-/// [`fixture_led`] with the long words the lab's book shows: STATUS's
-/// `Automatic, limited by 2 settings in aterm.toml`, four landings in Ends,
-/// and WHAT THE HARNESS DID's full set of rows with four-digit hours
-/// (`1123h 53m in 7 days`).
 fn fixture_long_facts() -> HarnessState {
     let mut state = fixture_led(true);
     state.words = "Automatic, limited by 2 settings in aterm.toml".to_string();
@@ -2631,7 +2461,7 @@ pub(super) fn fact_cards_whole<'a>(
     fact_cards_read(pages, cards, true, context)
 }
 
-/// [`fact_cards_whole`], its values' lines held whole only where `values` says so (a value longer than [`MAX_METADATA_VALUE_LINES`] lines ends in `…` by design).
+/// [`fact_cards_whole`], its values' lines held whole only where `values` says so.
 pub(super) fn fact_cards_read<'a>(
     pages: &[crate::native_ui::CompiledUi],
     cards: &[&'a str],
@@ -2683,13 +2513,6 @@ pub(super) fn fact_cards_read<'a>(
         .collect()
 }
 
-/// THE FACT CARDS' LABELS ARE WHOLE AT LARGE TYPE, AND THEIR VALUES WRAP
-/// (the post-landing check's owner-eye-2 / behaviour-3, and its review):
-/// STATUS, EFFECT OF EACH AUTOPILOT and WHAT THE HARNESS DID size their
-/// label column from their own labels at the text scale now, as far as it
-/// leaves the values their widest word (`fact_label_width`), and a value too
-/// long for its column wraps between its words, each fact it lists starting
-/// a line (`metadata_value_lines`).
 #[test]
 fn the_fact_cards_labels_are_whole_at_large_type() {
     let state = fixture_long_facts();
@@ -2737,13 +2560,6 @@ fn the_fact_cards_labels_are_whole_at_large_type() {
     });
 }
 
-/// TAB CONTROL'S SUMMARY KEEPS ITS LABELS WHOLE AT LARGE TYPE (the review
-/// of the post-landing check's page fixes): FLEET & TAB SUMMARY sizes its
-/// label column as Settings ▸ Harness's fact cards do (`fact_label_width`),
-/// so at 2× text on the 504 pt page and a wide one `Computers`, `System
-/// Vitals` and `Live Monitor` are whole, and on the wide one this Mac's
-/// vitals wrap whole (on the narrow one at 2× they take more than the
-/// value's eight lines).
 #[test]
 fn tab_controls_summary_keeps_its_labels_whole_at_large_type() {
     use crate::harness_screen::{TabComputer, TabControlState};
@@ -2802,9 +2618,6 @@ fn tab_controls_summary_keeps_its_labels_whole_at_large_type() {
     });
 }
 
-/// TWO ROWS THAT SHARE A TITLE READ APART (hunt surfaces-F5): two Claude
-/// Code panes of one tab are two rows whose every button is spoken by a
-/// name of its own — the title and the pane.
 #[test]
 fn two_rows_that_share_a_title_have_buttons_that_read_apart() {
     let state = fixture_with_a_day(true);
@@ -2852,15 +2665,6 @@ fn two_rows_that_share_a_title_have_buttons_that_read_apart() {
     );
 }
 
-/// A ROW'S WORDS KEEP ITS PLACE WHOLE, AND ITS BUTTONS THEIR FACES (§10.3.4,
-/// "A narrow page"; the review of v3/stats-fold): two `✳ Claude
-/// Code` rows of one tab — in the first window, and in a second — on the
-/// narrowest Medium page (760), on Medium pages where a fifth fixed button
-/// squeezed the words (780, 820), and on Compact pages (320, 340, 584), at
-/// 1×, 1.25× and 2× text: each row paints its place (`Tab 1, left pane`,
-/// `Window 2, tab 1, right pane`) whole at the head of its detail — on a
-/// stacked row narrower than the place, on as many lines as it takes — and no
-/// face of its five buttons is cut.
 #[test]
 fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
     let faces = [
@@ -2922,9 +2726,6 @@ fn a_rows_words_keep_its_place_whole_and_its_buttons_their_faces() {
     }
 }
 
-/// The fixture with `n` refusals today (oldest first, a minute apart from
-/// 18:00 UTC), every other one session 7's and the rest a closed session's,
-/// and `total` today in all.
 fn fixture_deciding(n: usize, total: u64) -> HarnessState {
     use aterm_agent::harness::stats::{Decision, DecisionKind};
     let mut state = fixture();
@@ -2958,8 +2759,6 @@ fn fixture_deciding(n: usize, total: u64) -> HarnessState {
     state
 }
 
-/// The keys of `state`'s DECIDED FOR YOU rows, oldest first:
-/// `harness/decided/<id>`, each its decision's id.
 fn decided_keys(state: &HarnessState) -> Vec<String> {
     state
         .stats
@@ -2976,14 +2775,6 @@ fn decided_keys(state: &HarnessState) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// DECIDED FOR YOU ON THE PAGE (§10.4.2, item 4; §10.4.3 "controls prefs
-/// lists the keys"): the card comes right after SESSIONS, keyed
-/// `harness/decided`; it lists the newest three rows (`harness/decided/<id>`,
-/// each its decision's id), each labelled with its clock and sentence, the
-/// open session's with `Show tab` (`harness/decided/<id>/show`), whose action is
-/// the SESSIONS row's own Show (behind its one Owner fence) and asks the
-/// host to raise it; then `Show all 5` (`harness/decided/all`, collapsed),
-/// which opens the rest.
 #[test]
 fn decided_for_you_lists_its_keys_after_sessions() {
     use crate::native_app::HarnessRequest;
@@ -3062,8 +2853,6 @@ fn decided_for_you_lists_its_keys_after_sessions() {
     );
 }
 
-/// THE CAP SAID (§10.4.1, "at most 64"): with more choices today than are
-/// kept, the disclosure says the newest it lists of how many.
 #[test]
 fn decided_for_you_says_the_newest_of_how_many() {
     let (mut runtime, instance, view) = harness_route(fixture_deciding(64, 80));
@@ -3089,9 +2878,6 @@ fn decided_for_you_says_the_newest_of_how_many() {
     );
 }
 
-/// NO CARD ON AN EMPTY DAY (§10.4.1, "present only when today holds a
-/// decision"): the fixture's day has counts but no decision, so no
-/// `harness/decided` key is on any page, and STATUS counts none.
 #[test]
 fn no_decided_card_on_a_day_without_a_choice() {
     let (mut runtime, instance, view) = harness_route(fixture_deciding(0, 0));
@@ -3121,10 +2907,6 @@ fn no_decided_card_on_a_day_without_a_choice() {
     );
 }
 
-/// SHOW TAB FOR A SESSION SESSIONS DOES NOT LIST (§10.4.2, item 4): the
-/// agent has exited, its tab is open, so the decision's row names it by its
-/// title and its `Show tab` asks the host to raise it — the reducer takes
-/// the id from [`HarnessState::decided_open`] as well as from SESSIONS.
 #[test]
 fn a_decided_show_tab_raises_a_session_sessions_does_not_list() {
     use crate::native_app::HarnessRequest;
@@ -3160,11 +2942,6 @@ fn a_decided_show_tab_raises_a_session_sessions_does_not_list() {
     );
 }
 
-/// DECIDED FOR YOU IS WHOLE ON EVERY HOST: open with every kept row of
-/// long sentences, on a phone page, the 80 × 24 window's, a Medium and a
-/// wide one, at 1×, 1.25× and 2× text: no text overflows or is clipped, and
-/// every hit target is material and inside its parent; a sentence wraps
-/// (its label whole).
 #[test]
 fn decided_for_you_is_whole_on_every_host() {
     use aterm_agent::harness::stats::{Decision, DecisionKind};
@@ -3268,10 +3045,6 @@ fn decided_for_you_is_whole_on_every_host() {
     });
 }
 
-/// SETTINGS ▸ HARNESS ▸ TAB CONTROL (`/tabs`): renders the Fleet & Tab
-/// Summary card, Accessible Computers spreadsheet, and Sessions & Tabs
-/// spreadsheet with live AI CLI status and `Show tab` buttons, whole across
-/// desktop and compact hosts.
 #[test]
 fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
     use crate::harness_screen::{TabComputer, TabControlState, TabSpreadsheetRow};
@@ -3453,7 +3226,6 @@ fn tab_control_route_renders_computers_sessions_and_live_ai_cli_status() {
     );
 }
 
-/// The keys of every semantic node on `pages`, in order.
 fn semantic_keys(pages: &[crate::native_ui::CompiledUi]) -> Vec<String> {
     pages
         .iter()
@@ -3462,11 +3234,6 @@ fn semantic_keys(pages: &[crate::native_ui::CompiledUi]) -> Vec<String> {
         .collect()
 }
 
-/// THE VERDICT UP FRONT (§11.6.1, §11.6.5 "The order"): EFFECT OF EACH
-/// AUTOPILOT comes right after the page's actions, ahead of SUPERVISION and
-/// WHAT THE HARNESS DID, after SESSIONS and DECIDED FOR YOU; nothing above
-/// SESSIONS moves (`sessions_stays_on_the_first_screen_under_todays_lines`
-/// holds it, unchanged).
 #[test]
 fn effect_comes_right_after_the_pages_actions() {
     let (mut runtime, instance, view) = harness_route(fixture_deciding(5, 5));
@@ -3504,13 +3271,6 @@ fn effect_comes_right_after_the_pages_actions() {
     assert_eq!(next, Some(&"harness/ab"), "{cards:#?}");
 }
 
-/// THE LEAD SAYS WHAT IT MEASURES (§11.6.1, §11.6.5 "The caption"): with
-/// both sides past the floor, EFFECT opens with `Working time held at a box
-/// or a question`
-/// drawn in the page's plain type, the two shares under it in Hero type,
-/// each with its working time beside it plain, and the block spoken whole
-/// (`harness/ab/lead`, as `controls prefs` lists it); the Held row is not
-/// drawn.
 #[test]
 fn the_lead_says_what_it_measures_and_the_held_row_gives_way() {
     use crate::native_ui::{StyleRef, UiContent};
@@ -3582,12 +3342,6 @@ fn the_lead_says_what_it_measures_and_the_held_row_gives_way() {
     assert!(all.iter().any(|k| k == "harness/ab/row/held"));
 }
 
-/// THE LEAD GIVES WAY HERO TO PLAIN (§11.6.3 item 2, §11.6.4 "2× text on
-/// the 584 × 348 page"; as `todays_lines_give_way_hero_then_plain_then_the_second_line`):
-/// the shares in Hero type where the row is whole at the card's width;
-/// else the whole lead in plain lines, broken only at its joins, every word
-/// of both sides drawn; the note plain at plain height, broken between
-/// words where it must be.
 #[test]
 fn the_lead_gives_way_hero_then_plain() {
     use crate::harness_ab::{AbLead, LeadShare, ab_lead};
@@ -3731,10 +3485,6 @@ fn the_lead_gives_way_hero_then_plain() {
     });
 }
 
-/// THE LEAD'S WORDS STAND ON ITS FIGURES' BASELINE (§11.6.1): on the
-/// compiled page at 1× and 2× text, each side's plain working time is painted
-/// on the same baseline as its Hero share, and the two sides share one — as
-/// a line of type reads, never the words floating at the figure's middle.
 #[test]
 fn the_leads_words_stand_on_its_figures_baseline() {
     use crate::native_ui::{SemanticRole, StyleRef, UiContent, text_paint_metrics};
@@ -3784,12 +3534,6 @@ fn the_leads_words_stand_on_its_figures_baseline() {
     });
 }
 
-/// A BACKGROUND LANDING MOVES NO SWITCH (§11.6.7): EFFECT sits above
-/// SUPERVISION, so the week's first landing — a session's loop telling it
-/// while Settings ▸ Harness is shown — changes the Ends row's words, never
-/// the card's rows: on the shipped 744 × 420 page and the 80 × 24 window's
-/// 584 × 348, at 1× text, every SUPERVISION control is on the same page at
-/// the same rect before and after, and EFFECT's card is as tall.
 #[test]
 fn a_background_landing_moves_no_switch() {
     let controls = |state: HarnessState, (width, height): (f32, f32)| {
@@ -3889,14 +3633,6 @@ pub(super) fn fixture_landings() -> HarnessState {
     state
 }
 
-/// THE PAGE COUNTS LANDINGS, AS DRAWN (design §12.4.1): read back
-/// from the compiled page, the Every row says `1 landing, 1 landed, 1
-/// quiet`, and so does its Cruise button; WHAT THE HARNESS DID draws
-/// `Landed` over `Land prompts` and, under Kept going, `of them a done
-/// claim checked`, keyed apart from the `of those` row under Approved
-/// (each fact is keyed by its label, and a compile refuses two of one
-/// key); STATUS's today line and the landed session's day line lead with
-/// landings.
 #[test]
 fn the_page_draws_its_landings_and_the_done_claims_checked() {
     let (mut runtime, instance, view) = harness_route(fixture_landings());
@@ -3937,15 +3673,6 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     }
 }
 
-/// EVERY MODE'S SENTENCE COMES FROM ONE TABLE (§12.4.1, §12.4.6):
-/// for each mode, the Autopilot chip's title (`autopilot: <mode> — <chip>`),
-/// the `Autopilot set to <mode>` record's line, the SESSIONS row's button's
-/// description as a screen reader reads it off this page, the note under
-/// the page's Default autopilot row (`prefs::footnote_of`, which the page
-/// paints: `the_harness_switches_draw_their_notes`), and `aterm help
-/// harness`'s AUTOPILOT section each say that surface's form from
-/// `autopilot::MODE_WORDS` — and a timed Cruise's title, record and manual
-/// line theirs.
 #[test]
 fn every_mode_sentence_comes_from_mode_words() {
     use crate::autopilot::{MODE_WORDS, TIMED_CRUISE_CHIP, TIMED_CRUISE_RECORD};
@@ -4049,11 +3776,6 @@ fn every_mode_sentence_comes_from_mode_words() {
     );
 }
 
-/// THE OCCUPANCY ROW IS DISPLAY-ONLY (occupancy 1e; the red-team's F14): the effective table
-/// shows `[harness] occupancy` as aterm.toml reads it — `observe`, the default, and `prompt`
-/// only where the owner wrote it — as a fact row no press reaches: no node on any page of the
-/// route acts on occupancy. NEGATIVE CONTROL: the route's editable autopilot has controls that
-/// act.
 #[test]
 fn the_occupancy_row_shows_the_mode_and_nothing_writes_it() {
     let rows = config_rows(&SupervisorConfig::default());

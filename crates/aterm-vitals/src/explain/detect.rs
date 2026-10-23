@@ -12,7 +12,7 @@ use crate::model::{MemView, Pressure, Snapshot, Thermal, Throttle};
 pub const FLOOR_MC: i64 = 500;
 /// A covering cause's floor as a share of the busy figure, per mille.
 pub const FLOOR_PM: i64 = 100;
-/// `unexplained` holds from this much of one part's CPU no other cause covers, millicores.
+/// `unexplained` holds from this much of one part's CPU no other cause covers, or of the split's unaccounted residual, millicores.
 pub const UNEXPLAINED_MC: i64 = 1000;
 /// `startup` holds while userspace is younger than this, ms.
 pub const STARTUP_AGE_MS: i64 = 30 * 60 * 1000;
@@ -206,6 +206,10 @@ pub enum Evidence {
         /// That part: `aterm`, `others` or `services`.
         part: Part,
     },
+    /// Work no coalition held over the window: the split's unaccounted
+    /// residual (a coalition reaped inside the window, one a truncated list
+    /// left out), which no part and no row holds, so nothing covers it.
+    Unaccounted,
     /// Userspace's start.
     Startup {
         /// When it started, unix ms.
@@ -334,14 +338,21 @@ fn covered(r: &CoalRow) -> i64 {
 /// The causes that hold over `facts`' window.
 #[must_use]
 pub fn detect(facts: &WhyFacts, snap: &Snapshot) -> Vec<Candidate> {
-    detect_as(facts, snap, true)
+    detect_as(facts, snap, true, true)
 }
 
-/// [`detect`], matching activities' signing ids under Apple's voucher only where `vouched`.
-pub(crate) fn detect_as(facts: &WhyFacts, snap: &Snapshot, vouched: bool) -> Vec<Candidate> {
+/// [`detect`], matching activities' signing ids under Apple's voucher only
+/// where `vouched`, and letting `unexplained` cover the split's unaccounted
+/// residual only where `residual`.
+pub(crate) fn detect_as(
+    facts: &WhyFacts,
+    snap: &Snapshot,
+    vouched: bool,
+    residual: bool,
+) -> Vec<Candidate> {
     let split = &facts.split;
     let mut out = if split.via == Via::Coalitions {
-        covering(facts, vouched)
+        covering(facts, vouched, residual)
     } else {
         Vec::new()
     };
@@ -399,8 +410,11 @@ pub(crate) fn with_machine(mut causes: Vec<Candidate>, snap: &Snapshot) -> Vec<C
     causes
 }
 
-/// The covering causes of a split by coalition, busiest first.
-fn covering(facts: &WhyFacts, vouched: bool) -> Vec<Candidate> {
+/// The covering causes of a split by coalition, busiest first; `unexplained`
+/// takes the split's unaccounted residual where `residual` and it is larger
+/// than every part's uncovered CPU, so work no coalition held past a core is
+/// never left uncovered.
+fn covering(facts: &WhyFacts, vouched: bool, residual: bool) -> Vec<Candidate> {
     let split = &facts.split;
     let busy = split.global_mc;
     let mut out = Vec::new();
@@ -476,7 +490,15 @@ fn covering(facts: &WhyFacts, vouched: bool) -> Vec<Candidate> {
     }
     let taken: HashSet<u64> = out.iter().flat_map(|c| c.coalitions.clone()).collect();
     let (part, left) = uncovered(split, &out, &taken);
-    if left >= UNEXPLAINED_MC && above_floor(left, busy) {
+    let lost = split.unaccounted_mc;
+    if residual && lost > left {
+        if lost >= UNEXPLAINED_MC && above_floor(lost, busy) {
+            out.push(Candidate {
+                evidence: Evidence::Unaccounted,
+                ..measured(CauseId::Unexplained, lost)
+            });
+        }
+    } else if left >= UNEXPLAINED_MC && above_floor(left, busy) {
         out.push(Candidate {
             coalitions: split
                 .rows

@@ -13,11 +13,8 @@ use super::tests::{
 };
 use super::*;
 
-/// The fixture root: one directory per release, one per desk inside it.
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/handoff");
 
-/// Every `(release, desk)` checked in, pinned so a lost fixture directory is a red test rather
-/// than a guard that silently checks less.
 const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.91.0", "claude-code-1049"),
     ("v0.91.0", "history"),
@@ -460,10 +457,27 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.122.0", "stalled-sequence"),
     ("v0.122.0", "twelve-panes"),
     ("v0.122.0", "variants"),
+    ("v0.123.0", "carried-state"),
+    ("v0.123.0", "claude-code-1049"),
+    ("v0.123.0", "colour-and-shell"),
+    ("v0.123.0", "engine-state"),
+    ("v0.123.0", "fold"),
+    ("v0.123.0", "held-failed"),
+    ("v0.123.0", "held-pane"),
+    ("v0.123.0", "held-withheld"),
+    ("v0.123.0", "history"),
+    ("v0.123.0", "history-carry"),
+    ("v0.123.0", "incident-55x149"),
+    ("v0.123.0", "link-dense"),
+    ("v0.123.0", "link-dense-history"),
+    ("v0.123.0", "policy-repaint"),
+    ("v0.123.0", "policy-visible"),
+    ("v0.123.0", "shell-integration"),
+    ("v0.123.0", "stalled-sequence"),
+    ("v0.123.0", "twelve-panes"),
+    ("v0.123.0", "variants"),
 ];
 
-/// The desk set, one `("vX.Y.0", "<desk>")` row per desk: every release from that floor on must
-/// pin the desk.
 const REQUIRED_DESKS: &[(&str, &str)] = &[
     ("v0.97.0", "claude-code-1049"),
     ("v0.97.0", "colour-and-shell"),
@@ -480,9 +494,6 @@ const REQUIRED_DESKS: &[(&str, &str)] = &[
     ("v0.100.0", "held-pane"),
 ];
 
-/// Every held pane the producer carried (v0.100.0 on) is shown in the order it was named, at its
-/// carried geometry, without scrollback, with how its command ended, and with no link left (the
-/// successor strips every link from a held screen, which has no process behind it).
 fn assert_held_panes_shown(desk: &Desk, incoming: &IncomingHandoff) {
     let label = desk.label();
     assert_eq!(
@@ -691,7 +702,6 @@ struct SessionExpectation {
     render_debt_cut: Option<u64>,
 }
 
-/// One desk directory, read.
 struct Desk {
     release: String,
     name: String,
@@ -709,7 +719,6 @@ impl Desk {
             .unwrap_or_else(|error| panic!("{}: {file}: {error}", self.label()))
     }
 
-    /// What the parent recorded for session `local_id`.
     fn expected(&self, local_id: u64) -> &SessionExpectation {
         self.parent
             .session
@@ -718,7 +727,6 @@ impl Desk {
             .unwrap_or_else(|| panic!("{}: parent.toml has session {local_id}", self.label()))
     }
 
-    /// The name of session `local_id`'s history sidecar beside the manifest.
     fn hist_name(&self, local_id: u64) -> String {
         format!(
             "{}.s{local_id}.hist",
@@ -726,8 +734,6 @@ impl Desk {
         )
     }
 
-    /// The name of held pane `local_id`'s history sidecar beside the
-    /// manifest (v0.101.0 on).
     fn held_hist_name(&self, local_id: u64) -> String {
         format!(
             "{}.h{local_id}.hist",
@@ -735,7 +741,6 @@ impl Desk {
         )
     }
 
-    /// The layout sidecar's name beside the manifest.
     fn layout_name(&self) -> String {
         format!(
             "{}.layout.toml",
@@ -744,7 +749,6 @@ impl Desk {
     }
 }
 
-/// `N` bytes from the fixture's lowercase hex, or a panic naming the desk.
 fn unhex<const N: usize>(label: &str, text: &str) -> [u8; N] {
     assert_eq!(text.len(), 2 * N, "{label}: {N} bytes of hex");
     let mut out = [0u8; N];
@@ -755,7 +759,6 @@ fn unhex<const N: usize>(label: &str, text: &str) -> [u8; N] {
     out
 }
 
-/// Every desk of every release under [`FIXTURES`], in a stable order.
 fn every_desk() -> Vec<Desk> {
     let mut releases = std::fs::read_dir(FIXTURES)
         .expect("the handoff fixture root exists")
@@ -769,7 +772,6 @@ fn every_desk() -> Vec<Desk> {
         .collect()
 }
 
-/// The desks of `release` in `dir`, one per directory holding a `parent.toml`, in name order.
 fn release_desks(release: &str, dir: &std::path::Path) -> Vec<Desk> {
     let mut names = std::fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("{}: a release fixture dir: {error}", dir.display()))
@@ -795,10 +797,6 @@ fn release_desks(release: &str, dir: &std::path::Path) -> Vec<Desk> {
         .collect()
 }
 
-/// The producer's own commitment, recomputed from the checked-in bytes with no
-/// consumer involved: the placeholder substitution touched no hashed byte (each
-/// session's meta in the manifest is exactly its extracted `s<id>.meta.json`),
-/// and the recorded digests are the digests of these files.
 fn assert_fixture_is_self_consistent(desk: &Desk) {
     let label = desk.label();
     let body = String::from_utf8(desk.read(&desk.parent.manifest)).expect("UTF-8 manifest");
@@ -906,9 +904,6 @@ fn assert_fixture_is_self_consistent(desk: &Desk) {
     }
 }
 
-/// The first `take` lines of a history sidecar, read off the bytes the parent wrote in v0.94.0's
-/// format (`ATHIST1`: an eight-byte magic, the wrap width as `u16` LE, two zero bytes, then frames
-/// of a `u32` LE length and a line-codec block).
 fn sidecar_history(label: &str, bytes: &[u8], take: u64) -> Vec<Line> {
     let (head, mut frames) = bytes.split_at_checked(12).expect("a sidecar header");
     assert_eq!(
@@ -935,8 +930,6 @@ fn sidecar_history(label: &str, bytes: &[u8], take: u64) -> Vec<Line> {
     lines
 }
 
-/// Every line of `terminal`'s history-holding grid (the saved primary under
-/// an alternate screen), oldest first.
 fn history_lines(label: &str, terminal: &Terminal) -> Vec<Line> {
     let grid = terminal.main_grid();
     (0..grid.scrollback_lines())
@@ -948,8 +941,6 @@ fn history_lines(label: &str, terminal: &Terminal) -> Vec<Line> {
         .collect()
 }
 
-/// `got` is `want`, line for line: as text (so a failure reads as the lines that differ), then as
-/// each line's line-codec encoding, so an import that keeps the words and drops the colours fails.
 fn assert_same_lines(label: &str, got: &[Line], want: &[Line], what: &str) {
     let text = |lines: &[Line]| {
         lines
@@ -967,10 +958,6 @@ fn assert_same_lines(label: &str, got: &[Line], want: &[Line], what: &str) {
     assert!(wire(got) == wire(want), "{label}: {what}, cell for cell");
 }
 
-/// The proof function and its frames are the parent's: the producer recorded the proof its own
-/// `adoption_proof` took over fixed inputs and the `ProofReady`/`Commit` frames for it, and this
-/// build's must be the same bytes (domain, field order, `READY_WIRE_LEN`, both magics), or every
-/// parent of that release reads `AdoptionMismatch` whatever the consumer admits.
 fn assert_proof_function_is_the_parents(desk: &Desk) {
     let label = desk.label();
     let identities = desk
@@ -1028,9 +1015,6 @@ fn assert_proof_function_is_the_parents(desk: &Desk) {
     );
 }
 
-/// A desk laid out for this process to adopt as a successor: the release's files copied into a
-/// private control dir (the consumer deletes what it takes), fresh PTYs standing in for the
-/// parent's, and the launch environment `outgoing_parent_env` and the worker would publish.
 struct Staged {
     /// The scratch HOME and runtime dir, put back and removed by `teardown`.
     scratch: ScratchEnv,
@@ -1047,8 +1031,6 @@ struct Staged {
 }
 
 impl Staged {
-    /// Close every descriptor still ours, put HOME and the runtime dir back and remove the
-    /// scratch.
     fn teardown(self) {
         for fd in self
             .slaves
@@ -1062,18 +1044,12 @@ impl Staged {
     }
 }
 
-/// One session's meta rewrite: the local id and what its JSON becomes.
 type MetaRewrite<'a> = (u64, &'a dyn Fn(&str) -> String);
 
-/// Stage `desk`, with `rewrite_meta` applied to the manifest's copy of the named session's meta,
-/// standing in for a producer this build disagrees with (the recorded digests then no longer
-/// describe the wire).
 fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
     stage_with(desk, rewrite_meta, None)
 }
 
-/// [`stage`], with `rewrite_manifest` applied to the manifest's record keys (no digest covers
-/// them), standing in for a producer that wrote a key this desk's did not.
 fn stage_with(
     desk: &Desk,
     rewrite_meta: Option<MetaRewrite<'_>>,
@@ -1165,10 +1141,6 @@ fn stage_with(
     }
 }
 
-/// The history carry is taken before the proof (v0.94.0 on): the sidecar the parent named for
-/// `adopted` is opened whole, at the depth it stamped, and unlinked; nothing is counted lost at
-/// this hop but the lines the parent left behind and counted (`history_dropped`, v0.97.0 on); and
-/// the session's running loss and the foreground holder cross.
 fn assert_history_taken(desk: &Desk, staged: &Staged, adopted: &Adopted) {
     let label = desk.label();
     let id = adopted.local_id;
@@ -1204,8 +1176,6 @@ fn assert_history_taken(desk: &Desk, staged: &Staged, adopted: &Adopted) {
     }
 }
 
-/// The history lands after Commit (v0.94.0 on): each adopted session is hydrated as
-/// `spawn_session` hydrates it and imported as the successor's worker imports it.
 fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
     let label = desk.label();
     let config = aterm_core::config::TerminalConfig {
@@ -1291,9 +1261,6 @@ fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
     }
 }
 
-/// A held pane's scrollback lands after Commit (v0.101.0 on): each shown pane is restored as
-/// `App::restore_held_leaf` restores it ([`crate::held_pane_session`], then
-/// [`crate::held_pane_history`]) and imported by the shared worker.
 fn assert_held_history_imports(desk: &Desk, held: Vec<crate::seamless::HeldPane>) {
     let label = desk.label();
     for pane in held {
@@ -1380,8 +1347,6 @@ fn assert_held_history_imports(desk: &Desk, held: Vec<crate::seamless::HeldPane>
     }
 }
 
-/// The text of absolute row `abs` of `terminal`'s history-holding grid, history or visible; `None`
-/// once the row is evicted or past the screen.
 fn text_at(terminal: &Terminal, abs: u64) -> Option<String> {
     let grid = terminal.main_grid();
     let oldest = grid.oldest_absolute_row();
@@ -1398,16 +1363,8 @@ fn text_at(terminal: &Terminal, abs: u64) -> Option<String> {
     grid.row_text(row).map(|text| text.trim_end().to_string())
 }
 
-/// One block a full clear blanked, as `(id, text_cleared, command_text_cleared,
-/// prompt_start_row, command_start_row, output_start_row)`.
 type BlankedBlock = (u64, bool, bool, u64, Option<u64>, Option<u64>);
 
-/// The blocks a full clear blanked in session `local_id`'s parent, read off the producer's own
-/// meta bytes (`s<id>.meta.json`, which [`assert_fixture_is_self_consistent`] holds to the
-/// manifest) through `aterm_json`'s value tree, never this build's decode of them, which is what
-/// is checked: every finished block (`shell.output_blocks`) and the block being built
-/// (`shell.current_block`) that carries `text_cleared` or `command_text_cleared`, in the meta's
-/// order.
 fn carried_blanked_blocks(desk: &Desk, local_id: u64) -> Vec<BlankedBlock> {
     use aterm_json::Value;
     let label = desk.label();
@@ -1463,9 +1420,6 @@ fn carried_blanked_blocks(desk: &Desk, local_id: u64) -> Vec<BlankedBlock> {
         .collect()
 }
 
-/// The full-clear flags cross the decode: the blocks this build's reader of session `local_id`'s
-/// meta (`checkpoint`, the adopted session's) carries as blanked are exactly the ones the
-/// producer's bytes carry ([`carried_blanked_blocks`]), at the same rows.
 fn assert_clear_flags_decoded(
     desk: &Desk,
     local_id: u64,
@@ -1497,11 +1451,6 @@ fn assert_clear_flags_decoded(
     );
 }
 
-/// [`assert_history_imports`]' check of the meta's state in the hydrated, imported `engine`: every
-/// application colour is live, the completed-command count is the parent's, the carried blocks
-/// keep the cleared flags the parent recorded, and each carried mark names its prompt row (every
-/// shell on these desks prompts as `dev@devhost`) and a readable output end, which holds only if
-/// the successor continued the parent's absolute numbering through the import.
 fn assert_meta_state_lands(
     label: &str,
     id: u64,
@@ -1628,9 +1577,6 @@ fn assert_meta_state_lands(
     }
 }
 
-/// The meta's state is reassembled (v0.95.0 on): this build reads, from the older producer's meta,
-/// the absolute row counters, whether an application colour diff rides it, and the
-/// shell-integration phase, marks and count the parent recorded.
 fn assert_meta_state_crosses(
     label: &str,
     expected: &SessionExpectation,
@@ -1684,8 +1630,6 @@ fn assert_meta_state_crosses(
     }
 }
 
-/// The render debt crosses (v0.101.0 on): the successor owes the program exactly what its
-/// parent's engine owed it, so the same epoch judge and repaint nudge judge the tab.
 fn assert_render_debt_crosses(
     label: &str,
     session: &SessionExpectation,
@@ -1723,8 +1667,6 @@ fn assert_render_debt_crosses(
     );
 }
 
-/// The rows of render debt `parent.toml` recorded for a session, `"<shift>,<pushed>"`, read here
-/// rather than by the consumer's parser, which is what is checked.
 fn recorded_render_debt(label: &str, row: &str) -> aterm_core::terminal::RenderDebt {
     row.split_once(',')
         .and_then(|(shift, pushed)| {
@@ -1736,16 +1678,11 @@ fn recorded_render_debt(label: &str, row: &str) -> aterm_core::terminal::RenderD
         .unwrap_or_else(|| panic!("{label}: a recorded render debt reads: {row:?}"))
 }
 
-/// The columns of render debt each session's record carries, by local id: the record's own
-/// `render_debt_cut` key, read off the manifest's bytes as a TOML tree, never by the consumer's
-/// record.
 fn carried_render_debt_cuts(desk: &Desk) -> std::collections::BTreeMap<u64, u64> {
     let wire = String::from_utf8(desk.read(&desk.parent.manifest)).expect("UTF-8 manifest");
     wire_render_debt_cuts(&desk.label(), &wire)
 }
 
-/// Independently read additive debt from immutable producer bytes, requiring unique,
-/// nonnegative session identities and counts.
 fn wire_render_debt_cuts(label: &str, manifest: &str) -> std::collections::BTreeMap<u64, u64> {
     let (_, wire) = manifest.split_once('\n').expect("nonce header");
     let tree = aterm_toml::from_str::<aterm_toml::Value>(wire)
@@ -1778,13 +1715,8 @@ fn wire_render_debt_cuts(label: &str, manifest: &str) -> std::collections::BTree
     cuts
 }
 
-/// One carried Settings draft as `(leaf, key, text)`. The leaf is the TOML path of the table that
-/// holds the draft's `settings_drafts` list: `windows[w].restored_tabs[t].root`, then `.first` or
-/// `.second` for each split, then `.view`.
 type LeafDraft = (String, String, String);
 
-/// Every Settings draft the parent's layout sidecar carries, with its leaf, read off the bytes,
-/// never by the consumer (whose parse, sanitize and per-view bound are what the guard checks).
 fn wire_settings_drafts(label: &str, wire: &str) -> Vec<LeafDraft> {
     fn collect(label: &str, path: &str, value: &aterm_toml::Value, out: &mut Vec<LeafDraft>) {
         match value {
@@ -1842,8 +1774,6 @@ fn wire_settings_drafts(label: &str, wire: &str) -> Vec<LeafDraft> {
     drafts
 }
 
-/// Every Settings draft on this build's placed layout, with the leaf that holds it, spelled as
-/// [`wire_settings_drafts`] spells the parent's.
 fn placed_settings_drafts(layout: &crate::restore::RestoreManifest) -> Vec<LeafDraft> {
     use crate::restore::{RestoredSplitTree, RestoredView};
     fn walk(path: String, node: &RestoredSplitTree, out: &mut Vec<LeafDraft>) {
@@ -1877,10 +1807,6 @@ fn placed_settings_drafts(layout: &crate::restore::RestoreManifest) -> Vec<LeafD
     drafts
 }
 
-/// The Settings drafts are placed (v0.98.0 on): every unsaved draft the parent's layout carries is
-/// on this build's placed layout, on the leaf that carried it, key and text intact, and none is
-/// dropped as unreadable, or Settings would reopen without the person's text on every hop from
-/// that release.
 fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usize {
     let label = desk.label();
     let wire = String::from_utf8(desk.read(&desk.layout_name())).expect("UTF-8 layout");
@@ -1919,12 +1845,6 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
     count
 }
 
-/// The guard: every desk of every shipped release adopts in this build exactly. Every session,
-/// repainting only what its producer flagged (a `carry = "repaint"` policy desk, v0.97.0 on), each
-/// screen the carried bytes verbatim at the carried geometry, each control carry read, each meta's
-/// state reassembled ([`assert_meta_state_crosses`]), the layout placed with every Settings draft
-/// ([`assert_settings_drafts_placed`]), and both digests, so the adoption proof, equal what that
-/// release's parent committed to.
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     const SHARDS: usize = 4;
@@ -1981,9 +1901,6 @@ pub(super) fn assert_written_desks_adopt(dir: &std::path::Path) {
     }
 }
 
-/// One desk through [`every_shipped_producers_desk_adopts_exactly_and_proves`]'s checks, the
-/// Settings drafts it placed counted: the shipped desks, and the desks this build's generator
-/// writes ([`assert_written_desks_adopt`]).
 fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
     let label = desk.label();
     assert_eq!(
@@ -2128,8 +2045,6 @@ fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
     drafts
 }
 
-/// The meta check is not vacuous: it catches what nothing else in the guard can, a consumer that
-/// stops reading the shell-integration state while the wire is the parent's own.
 #[test]
 fn a_consumer_that_drops_the_shell_state_fails_only_the_meta_check() {
     let Some(_env) = env_alone() else { return };
@@ -2209,9 +2124,6 @@ fn a_consumer_that_drops_the_shell_state_fails_only_the_meta_check() {
     staged.teardown();
 }
 
-/// The render-debt check holds the columns too: no digest or proof covers a record's
-/// `render_debt_cut` (the key sits beside the hashed meta and grids), so only that check can fail
-/// a consumer that stops reading it.
 #[test]
 fn a_consumer_that_drops_column_debt_fails_the_exact_debt_check() {
     let Some(_env) = env_alone() else { return };
@@ -2268,8 +2180,6 @@ fn a_consumer_that_drops_column_debt_fails_the_exact_debt_check() {
     staged.teardown();
 }
 
-/// The mark check reads a full clear off the parent's record, not off the engine it judges, and it
-/// is not vacuous.
 #[test]
 fn a_consumer_that_moves_a_full_clears_flags_or_rows_fails_the_mark_check() {
     type Checkpoint = aterm_core::terminal::TerminalCheckpoint;
@@ -2411,8 +2321,6 @@ fn a_consumer_that_moves_a_full_clears_flags_or_rows_fails_the_mark_check() {
     staged.teardown();
 }
 
-/// The flag check reads the producer's bytes, not this build's decode of them, and a reader that
-/// lost the clear's flags fails it.
 #[test]
 fn a_consumer_that_decodes_a_meta_without_its_clear_flags_fails_the_flag_check() {
     type Checkpoint = aterm_core::terminal::TerminalCheckpoint;
@@ -2483,7 +2391,6 @@ fn a_consumer_that_decodes_a_meta_without_its_clear_flags_fails_the_flag_check()
     staged.teardown();
 }
 
-/// The first Settings leaf of `layout` that holds a carried draft.
 fn settings_leaf_with_drafts(
     layout: &mut crate::restore::RestoreManifest,
 ) -> &mut crate::restore::NativeLeafRestore {
@@ -2505,8 +2412,6 @@ fn settings_leaf_with_drafts(
         .expect("a Settings leaf that holds a carried draft")
 }
 
-/// The drafts check is not vacuous: [`assert_settings_drafts_placed`] fails a consumer that loses
-/// a carried Settings draft, or places it on another leaf, while the wire is the parent's own.
 #[test]
 fn a_consumer_that_loses_or_moves_a_settings_draft_fails_the_drafts_check() {
     let Some(_env) = env_alone() else { return };
@@ -2608,7 +2513,6 @@ fn a_consumer_that_loses_or_moves_a_settings_draft_fails_the_drafts_check() {
     staged.teardown();
 }
 
-/// A `vX.Y.0` fixture label as `(X, Y, 0)`, for ordering releases.
 fn release_triple(label: &str) -> (u64, u64, u64) {
     let parts = label
         .strip_prefix('v')
@@ -2625,8 +2529,6 @@ fn release_triple(label: &str) -> (u64, u64, u64) {
     (*major, *minor, *patch)
 }
 
-/// The desks [`REQUIRED_DESKS`] asks of `release`: every row whose floor is
-/// at or below it.
 fn required_desks_of(
     table: &'static [(&'static str, &'static str)],
     release: &str,
@@ -2638,10 +2540,6 @@ fn required_desks_of(
         .collect()
 }
 
-/// Every release pins each required desk from that desk's floor on, and each is checked in. The
-/// cutter refuses a cut whose predecessor misses one (`aterm-release`'s
-/// `gates::handoff_fixtures_of`); this is the same rule over the tree as it stands, red before
-/// anyone tries to cut.
 #[test]
 fn every_release_since_the_floor_pins_the_required_desks() {
     let desks = every_desk();
@@ -2672,8 +2570,6 @@ fn every_release_since_the_floor_pins_the_required_desks() {
     }
 }
 
-/// THE SUCCESSOR SAYS WHAT DEGRADED (the 2026-09-22/23 update audit, plan
-/// P1-5).
 #[test]
 fn a_repainted_session_is_counted_for_the_landing_row() {
     let Some(_env) = env_alone() else { return };
@@ -3275,7 +3171,6 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
     }
 }
 
-/// A v0.97.0 policy desk is said as the policy's request.
 #[test]
 fn a_v097_policy_desk_is_said_as_the_policys_request() {
     use aterm_update_core::handoff_policy::{CarryCeiling, HandoffPolicy, ProducerRange};

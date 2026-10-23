@@ -42,7 +42,6 @@ impl Fixture {
         self.seed_with(&[], &[])
     }
 
-    /// The scratch aterm.toml: the install consent declined, or the default config.
     fn configure(&self, declined: bool) {
         let config = self.root.path().join("config");
         std::fs::create_dir_all(config.join("aterm")).unwrap();
@@ -57,7 +56,6 @@ impl Fixture {
         .unwrap();
     }
 
-    /// `atpkg seed` on the config as it stands, with `args` after the verb and `envs` set.
     fn seed_with(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg("seed")
@@ -77,8 +75,6 @@ impl Fixture {
         cmd.output().expect("run dev atpkg seed")
     }
 
-    /// Everything the adoption lane writes, by the crate's own path accessors — the shell
-    /// hooks' `~/.aterm` (and the rc ledger in it) included.
     fn adoption_writes(&self) -> Vec<PathBuf> {
         [
             self.layout.adopted(),
@@ -93,19 +89,15 @@ impl Fixture {
         .collect()
     }
 
-    /// The scratch `~/.zshrc`, as it stands.
     fn zshrc(&self) -> String {
         std::fs::read_to_string(self.home.join(".zshrc")).unwrap()
     }
 
-    /// The zsh hook the seed writes.
     fn zsh_hook(&self) -> PathBuf {
         self.home.join(".aterm/shell.d/00-atpkg.zsh")
     }
 }
 
-/// `zsh -f` with nothing but `PATH=/usr/bin:/bin` and the scratch HOME, sourcing the seed's
-/// hook and then running `script`: what an ordinary shell outside aterm makes of it.
 fn in_hooked_zsh(fx: &Fixture, script: &str) -> std::io::Result<Output> {
     Command::new("/bin/zsh")
         .arg("-f")
@@ -159,9 +151,6 @@ fn a_declined_seed_adopts_nothing_and_lays_no_stubs() {
     assert!(fx.zsh_hook().is_file(), "and the shell hooks: {text}");
 }
 
-/// End the calling test COULD NOT RUN in a build that pins no root key
-/// ([`atpkg::PKG_TRUST_ANCHORS`] empty): the manager is off there and adopts nothing,
-/// so an enabled seed has nothing to show.
 fn needs_a_pinned_root() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         aterm_uds::host::could_not_run(
@@ -170,8 +159,6 @@ fn needs_a_pinned_root() {
     }
 }
 
-/// A RECORDED DECLINE (`uninstall --all`) outranks the default consent: the seed says so
-/// and writes nothing — no adoption, no stub, no hook, no rc block.
 #[test]
 fn a_seed_on_a_declined_store_writes_nothing() {
     let fx = Fixture::new("decline-marker");
@@ -188,9 +175,6 @@ fn a_seed_on_a_declined_store_writes_nothing() {
     assert_eq!(fx.zshrc(), "", "{text}");
 }
 
-/// THE SEED WIRES THE SHELL: the hooks and the rc block are written by the seed itself; an
-/// ordinary shell that sources the hook gets `bin/` APPENDED behind its own PATH (never in
-/// front of it), and `targo` resolves there at once — to a stub that says `trust`'s state.
 #[test]
 fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
     needs_a_pinned_root();
@@ -269,11 +253,6 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
     }
 }
 
-/// ONE STORE WHATEVER `$XDG_DATA_HOME` SAYS (docs/TOOLCHAIN-PACKAGE-MANAGER.md §10). The
-/// variable set in a shell rc is missing from a desktop launcher's or an ssh session's
-/// environment, so the installer's seed sees it and the window's seed does not: both must
-/// lay the one store under `HOME` and leave the hook naming its `bin/`, never a second,
-/// empty store the hooks move to (and a multi-GB set downloaded twice).
 #[test]
 fn the_store_and_its_hook_do_not_follow_xdg_data_home() {
     needs_a_pinned_root();
@@ -307,9 +286,6 @@ fn the_store_and_its_hook_do_not_follow_xdg_data_home() {
     );
 }
 
-/// A pass in flight on `progress`, its plan `program` alone, downloading: this test process
-/// stands in for it, its heartbeat kept fresh by a thread until the returned flag is raised,
-/// as a real pass's is.
 fn fake_pass(
     progress: PathBuf,
     program: &'static str,
@@ -320,7 +296,6 @@ fn fake_pass(
     fake_pass_until_done(progress, program, None)
 }
 
-/// [`fake_pass`] whose `program` row reads `done` once `done` is raised — the pass still live.
 fn fake_pass_until_done(
     progress: PathBuf,
     program: &'static str,
@@ -366,14 +341,10 @@ fn fake_pass_until_done(
     (landed, heartbeat)
 }
 
-/// The fixture's `targo` stub run as a tool call runs it — no terminal — with its stderr
-/// lines streamed to the returned receiver.
 fn unattended_targo(fx: &Fixture) -> (Child, std::sync::mpsc::Receiver<String>) {
     unattended_targo_under(fx, &[])
 }
 
-/// [`unattended_targo`] run by `wrapper` (a program and its arguments, the stub's path and
-/// `--version` after them), or directly when it is empty.
 fn unattended_targo_under(
     fx: &Fixture,
     wrapper: &[&str],
@@ -411,10 +382,8 @@ fn unattended_targo_under(
     (child, rx)
 }
 
-/// Hang detector, not a latency budget: the most any step below may take.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The first line on `rx` that contains `needle`.
 fn line_with(rx: &std::sync::mpsc::Receiver<String>, needle: &str) -> String {
     loop {
         let line = rx
@@ -426,7 +395,6 @@ fn line_with(rx: &std::sync::mpsc::Receiver<String>, needle: &str) -> String {
     }
 }
 
-/// trust lands: its build's `targo`, and the shim renamed over the stub.
 fn land_targo(fx: &Fixture) {
     use std::os::unix::fs::PermissionsExt as _;
     let shim = fx.layout.bin_dir().join("targo");
@@ -445,7 +413,6 @@ fn land_targo(fx: &Fixture) {
     std::fs::rename(&laid, &shim).unwrap();
 }
 
-/// `child`'s exit and its whole stdout, within the hang detector.
 fn exit_and_stdout(mut child: Child) -> (std::process::ExitStatus, String) {
     let until = std::time::Instant::now() + HANG;
     let done = loop {
@@ -463,10 +430,6 @@ fn exit_and_stdout(mut child: Child) -> (std::process::ExitStatus, String) {
     (done, stdout)
 }
 
-/// AN UNATTENDED CALLER WAITS FOR ITS PROGRAM AND THEN RUNS IT: while a live pass's
-/// `progress.json` has `trust` on its way, a `targo` started with no terminal (an agent's
-/// tool call) says so on stderr and waits; the moment the real shim is renamed over the
-/// stub, the command runs with its arguments and its stdout is the tool's alone.
 #[test]
 fn an_unattended_targo_waits_for_trust_and_then_runs() {
     needs_a_pinned_root();
@@ -496,10 +459,6 @@ fn an_unattended_targo_waits_for_trust_and_then_runs() {
     );
 }
 
-/// A WAIT FOR A NAME ITS PROGRAM DOES NOT BRING ENDS WHEN THE PROGRAM LANDS, not when the
-/// pass does: trust's row reads done while no `targo` shim stands (its build exposes no such
-/// command), so the waiting `targo` says so and exits 127 while the pass is still live — a
-/// wait that ended only with the pass would hold the tool call for the pass's whole length.
 #[test]
 fn an_unattended_targo_answers_once_trust_lands_without_it() {
     needs_a_pinned_root();
@@ -523,11 +482,6 @@ fn an_unattended_targo_answers_once_trust_lands_without_it() {
     line_with(&rx, "trust is installed, and it has no command named targo");
 }
 
-/// A STUB RUN BEFORE THE PASS BEGINS WAITS FOR IT. The window's first-run seed promises the
-/// update it spawns next (`pass-owed.json`, the window its owner), so an unattended `targo`
-/// run in the seconds before that update writes `progress.json` waits for trust instead of
-/// exiting 127; the update begins, plans and retires the promise, trust lands, and the
-/// command runs.
 #[test]
 fn an_unattended_targo_waits_for_the_pass_the_window_seed_promised() {
     needs_a_pinned_root();
@@ -611,11 +565,6 @@ fn an_unattended_targo_waits_for_the_pass_the_window_seed_promised() {
     assert_eq!(stdout, "ran targo --version\n");
 }
 
-/// A PROMISED PASS THAT PLANS WITHOUT TRUST ENDS THE WAIT AT ONCE: the update begins, plans
-/// a set that leaves `trust` out (a name the signed index does not serve on this machine)
-/// and retires the promise; the `targo` waiting on that promise answers 127 with the
-/// honesty edge while the pass still runs, rather than waiting it out (the hang detector
-/// fires if it does).
 #[test]
 fn a_waiting_targo_answers_once_the_promised_plan_leaves_trust_out() {
     needs_a_pinned_root();
@@ -646,9 +595,6 @@ fn a_waiting_targo_answers_once_the_promised_plan_leaves_trust_out() {
     line_with(&rx, "trust is no longer part of the default set");
 }
 
-/// THE UPDATE A SEED PROMISED ENDS THE PROMISE: a whole update that returns before any
-/// plan — here its index cannot be resolved — retires the window seed's `pass-owed.json`,
-/// so a stub waiting on it answers at once rather than at the promise's deadline.
 #[test]
 fn a_whole_update_ends_the_promise_it_was_spawned_on() {
     needs_a_pinned_root();
@@ -708,9 +654,6 @@ fn a_whole_update_ends_the_promise_it_was_spawned_on() {
     );
 }
 
-/// The window's seed (`--wait-lock`) makes no network request on an empty store
-/// with all vendor programs excluded, while a typed seed resolves the index
-/// through the local counting proxy.
 #[test]
 fn a_window_seed_asks_no_index_and_a_typed_one_does() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -804,8 +747,6 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
     );
 }
 
-/// `atpkg update` on the fixture's store and empty registry, with `args` after the verb and
-/// `envs` set, to its end within the hang detector.
 fn update_with(fx: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
         .arg("update")
@@ -836,8 +777,6 @@ fn update_with(fx: &Fixture, args: &[&str], envs: &[(&str, &str)]) -> Output {
     child.wait_with_output().unwrap()
 }
 
-/// A config that wants no vendor program: every request an update makes goes to the
-/// fixture's empty registry.
 fn no_vendors(fx: &Fixture) {
     let config = fx.root.path().join("config");
     std::fs::create_dir_all(config.join("aterm")).unwrap();
@@ -852,7 +791,6 @@ fn no_vendors(fx: &Fixture) {
     .unwrap();
 }
 
-/// The window's seed, `spawner` the window: it promises the update the window runs next.
 fn window_seed(fx: &Fixture, spawner: u32) {
     let progress = fx.layout.progress_file();
     let out = fx.seed_with(
@@ -868,11 +806,6 @@ fn window_seed(fx: &Fixture, spawner: u32) {
     assert!(fx.layout.pass_owed_file().is_file(), "{}", describe(&out));
 }
 
-/// A TYPED UPDATE LEAVES A WINDOW SEED'S PROMISE TO THAT WINDOW'S UPDATE. `aterm pkg update`
-/// typed between the window's seed and the update the window spawns returns without planning
-/// the set (here its index cannot be resolved); the promise is not its own, nor its
-/// spawner's, so it stands — a stub waiting on it keeps waiting for the window's update —
-/// and the window's update, whose spawner holds it, retires it when it returns.
 #[test]
 fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
     needs_a_pinned_root();
@@ -904,9 +837,6 @@ fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
     );
 }
 
-/// A PROMISE ENDS WITH ITS OWNER, NOT WITH ITS PID. The promise records its owner's start
-/// time; when the owner's pid names another process — a window that crashed, its pid taken —
-/// a stub waiting on it answers 127 at once rather than at the deadline.
 #[test]
 fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
     needs_a_pinned_root();
@@ -935,11 +865,6 @@ fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
     line_with(&rx, "nothing is installing right now");
 }
 
-/// A PENDING STUB SAYS WHETHER A PERSON ASKED. Its bump names the program either way —
-/// every reader that orders work by it sees the same name — and a stub that has no terminal
-/// on stdin and stderr (a script, an agent's tool call) marks its line unattended, so its
-/// agent never jumps the toolchain's bytes; on a terminal (a pseudo-terminal here, which
-/// `isatty` cannot tell from a person's) the line is the plain name a person's always was.
 #[test]
 fn a_pending_stub_says_whether_a_person_asked() {
     use std::os::fd::{FromRawFd as _, OwnedFd};
@@ -975,9 +900,9 @@ fn a_pending_stub_says_whether_a_person_asked() {
     );
 }
 
-/// A stub run in a sandbox that denies `process-info-pidinfo` (`EPERM` from
-/// `proc_pidinfo`, while `kill(pid, 0)` still answers) falls back to checking
-/// the owner's pid and waits for `trust` to land.
+/// A stub run in a sandbox that denies `process-info-pidinfo` (`EPERM` from `proc_pidinfo`, while
+/// `kill(pid, 0)` still answers) falls back to checking the owner's pid and waits for `trust` to
+/// land.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandboxed_stub_that_cannot_read_the_owners_start_time_still_waits() {

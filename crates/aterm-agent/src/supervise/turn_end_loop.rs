@@ -125,7 +125,7 @@ pub(crate) fn composer_guard_at(caret: char, column: usize, text: &str) -> Strin
 
 /// Post-wake settle window before typing into an agent session.
 pub(super) const WAKE_SETTLE: Duration = Duration::from_secs(30);
-/// Each session's own share of the wake's settle ([`WAKE_SETTLE`]).
+/// Each session's own share of the wake's settle, added past [`WAKE_SETTLE`], is below this.
 pub(super) const WAKE_SPREAD: Duration = Duration::from_secs(60);
 
 /// How long the session repository's last answer stands for the same done words
@@ -313,7 +313,7 @@ impl<C: Ctl> Session<'_, C> {
         now_ms.saturating_add(ahead)
     }
 
-    /// The wall clock now.
+    /// The wall clock now (unix milliseconds) and how many milliseconds `t` lies ahead of it.
     fn ms_ahead(&self, t: Instant) -> (i64, i64) {
         let now = self.fx.mono();
         let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
@@ -437,7 +437,7 @@ impl<C: Ctl> Session<'_, C> {
         self.seed_model_switch_in(&body, None);
     }
 
-    /// [`Self::seed_model_switch`] over the ledger's text.
+    /// `Self::seed_model_switch` over the ledger's text.
     pub(super) fn seed_model_switch_in(&mut self, body: &str, journal: Option<&str>) {
         let fallback = Restart::Model { to: String::new() };
         let journaled = journal.map_or_else(JournaledRelaunch::default, |j| {
@@ -1955,7 +1955,7 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// The policy's `WaitUntil` ran out on the point still showing.
+    /// The policy's `WaitUntil` ran out on the point still showing, or an edge decides it again.
     pub(super) fn turn_end_now(
         &mut self,
         seen: &Turn,
@@ -2899,6 +2899,8 @@ impl<C: Ctl> Session<'_, C> {
 
     /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT ([`Self::foreground_program`],
     /// [`Self::redecide_soon`], [`LaunchCall::Again`], [`UNDRAWN_INPUT_HANG`]).
+    ///
+    /// [`LaunchCall::Again`]: super::approval_loop::LaunchCall::Again
     pub(super) fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
         let now = self.fx.mono();
         let unread = self

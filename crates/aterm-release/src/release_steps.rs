@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real [`crate::release::Backend`]: what `targo --unverified ship release` asks of git, the publication engine, verification records, the release cache, the children it runs (the build, `verify release`, `pub stage`/`pub publish`, the cut), the site sync, the channel and the owner's aterm.
+//! Real [`crate::release::Backend`] implementation for `targo --unverified ship release`.
 
 use aterm_uds::spawnfd::{Command, Stdio, command};
 use std::io::Write as _;
@@ -16,10 +16,6 @@ use crate::release::{
     Prover, RELEASE_COMMAND, Ran, Refusal, Reservation, Step,
 };
 
-/// Where `ship check`'s export and wasm32 gates keep what they leave behind (each run's
-/// own [`Scratch`] under `runs/`, the shared wasm32 target directory): `preflight/` of
-/// the clone's release cache ([`crate::snapshot::CacheRoot`]), outside the clone so the
-/// tree stays clean, persistent so the wasm32 build is warm.
 fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     let dir = crate::snapshot::CacheRoot::for_repo(repo)?.preflight();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -29,17 +25,12 @@ fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
 /// The variable `publish/pre-promote` reads for the running release's own cutter: set on `pub publish`, whose engine passes it through to the hook.
 pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
 
-/// A child the release waits on, made unable to block on a terminal: git asks no
-/// person ([`crate::credential_wait::ask_no_one`]: no prompt, no askpass), and — on Unix — the child the leader of a NEW SESSION (`setsid`), which also
-/// makes it the leader of its own process group, the group the interrupt forwards to.
 fn detach(cmd: &mut Command) {
     crate::credential_wait::ask_no_one(cmd);
     #[cfg(unix)]
     cmd.setsid(true);
 }
 
-/// Write `step`'s child `pid`'s note in `release` ([`crate::release::child_note`]): the
-/// note's path.
 fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
     let started = started_of(pid).unwrap_or_default();
     let note = crate::release::child_note(release, pid);
@@ -90,7 +81,6 @@ impl crate::site::Launch for StepChildren {
     }
 }
 
-/// A pid's start time (`ps -o lstart=`), `None` when no such process lives.
 fn started_of(pid: u32) -> Option<String> {
     let out = {
         command(aterm_uds::os_path!("ps"))
@@ -125,8 +115,6 @@ pub struct Real {
     argv: Vec<std::ffi::OsString>,
 }
 
-/// A forwarded child's guard ([`Real::spawn_forwarded`]): while it lives, the interrupt
-/// is handed to the child's group and its note ([`crate::release::child_note`]) names it.
 struct Forwarded {
     _running: interrupt::Running,
     note: Option<PathBuf>,
@@ -172,7 +160,6 @@ impl Real {
             |cwd| crate::release::anchor(&engine, &cwd),
         );
         let state = home.join(".local/state/aterm-release");
-        // The local clock, read in this process (`localtime_r`), never a `date` child.
         let started = now();
         let offset = i64::try_from(started)
             .ok()
@@ -223,14 +210,12 @@ impl Real {
         out.success().then(|| out.stdout_utf8().trim().to_string())
     }
 
-    /// `git -C <clone>` that talks to origin (a fetch, `ls-remote`): forwarded.
     fn remote_git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
         let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.arg("-C").arg(&self.repo).args(args);
         self.output_forwarded(&mut cmd)
     }
 
-    /// `git -C <engine>` (its fetch and push among them): forwarded.
     fn engine_git(&self, args: &[&str]) -> Option<String> {
         let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.arg("-C").arg(&self.engine).args(args);
@@ -240,8 +225,6 @@ impl Real {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// `git -C <engine> <args>` whose exit code is its answer: the code and the output,
-    /// `Err` when git did not run or was ended by a signal.
     fn engine_git_code(&self, args: &[&str]) -> Result<(i32, std::process::Output), String> {
         let e = self.engine.display();
         let mut cmd = command(aterm_uds::os_path!("git"));
@@ -256,9 +239,6 @@ impl Real {
         Ok((code, out))
     }
 
-    /// `rev` in the engine, as the full sha of a commit it holds: `Ok(None)` when it holds
-    /// no such commit (`rev-parse --verify -q` exits 1 and says nothing), `Err` when git
-    /// could not answer (any other exit: not a repository, a broken object store).
     fn engine_commit(&self, rev: &str) -> Result<Option<String>, String> {
         let e = self.engine.display();
         let spec = format!("{rev}^{{commit}}");
@@ -274,10 +254,6 @@ impl Real {
         }
     }
 
-    /// The one spawn path for a child the release waits on: an interrupted release starts
-    /// none (`ErrorKind::Interrupted`); the child is [`detach`]ed, named in a note of its
-    /// own while it runs ([`crate::release::child_note`], a real run), and handed the
-    /// interrupt ([`interrupt::Running`]) until the returned guard drops.
     fn spawn_forwarded(
         &self,
         cmd: &mut Command,
@@ -301,8 +277,6 @@ impl Real {
         ))
     }
 
-    /// [`Real::spawn_forwarded`] as `Command::output` has it: stdin empty, both
-    /// streams captured.
     fn output_forwarded(&self, cmd: &mut Command) -> std::io::Result<std::process::Output> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -318,8 +292,6 @@ impl Real {
             .unwrap_or_else(|_| "alabsystems/aterm".to_string())
     }
 
-    /// `program` with the release's environment: the build-steering variables and the
-    /// launcher's own removed ([`scrub`]), the one engine named.
     fn scrubbed(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut cmd = command(program);
         scrub(&mut cmd);
@@ -327,7 +299,6 @@ impl Real {
         cmd
     }
 
-    /// A child with the release's build environment, from the clone.
     fn child(&self, program: impl AsRef<std::ffi::OsStr>, prover: Option<&Prover>) -> Command {
         let mut cmd = self.scrubbed(program);
         cmd.current_dir(&self.repo).stdin(Stdio::null());
@@ -337,8 +308,6 @@ impl Real {
         cmd
     }
 
-    /// The cut's command: R's own cutter (this binary — it re-ran itself as R's), the
-    /// `cut` verb, from this clone, with the release's prover and engine.
     fn cut_command(&self, args: &[String], prover: &Prover) -> Command {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-release"));
         let mut cmd = self.child(exe, Some(prover));
@@ -346,8 +315,6 @@ impl Real {
         cmd
     }
 
-    /// `pub publish aterm --repo-path <this clone>`, a child with the release's prover and
-    /// engine.
     fn publish_command(&self, prover: &Prover) -> Command {
         let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
         cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
@@ -364,7 +331,6 @@ impl Real {
         self.logged_to(step, cmd, stream)
     }
 
-    /// [`Real::logged`], its output on the terminal too when `stream`.
     fn logged_to(&self, step: Step, cmd: &mut Command, stream: bool) -> Ran {
         let log = self.step_log(step);
         let mut file = match std::fs::OpenOptions::new()
@@ -455,29 +421,20 @@ impl Real {
         }
     }
 
-    /// Note the step's child `pid` while it runs ([`crate::release::child_note`], a real run
-    /// only), one note per child since a step runs several beside each other: the note's
-    /// path, for the guard that removes it.
     fn note_child(&self, pid: u32) -> Option<PathBuf> {
         (!self.scratch_logs).then(|| note_child_in(&self.release, self.step, pid))
     }
 
-    /// `step`'s log: `<logs>/<nn>-<step>.log`.
     fn step_log(&self, step: Step) -> PathBuf {
         self.logs
             .join(format!("{:02}-{}.log", step.number(), step.name()))
     }
 
-    /// The log of the child named `what` that `step` runs beside its main one, beside
-    /// the step's own: `<logs>/<nn>-<step>-<what>.log`.
     fn side_log(&self, step: Step, what: &str) -> PathBuf {
         self.logs
             .join(format!("{:02}-{}-{what}.log", step.number(), step.name()))
     }
 
-    /// The engine to its own origin/main, its appended audit rows kept (the pub-sync
-    /// pattern): `pub stage` refuses an engine that is not exactly its origin/main, and
-    /// every dry run and stage appends a row to the tracked `verification-log.jsonl`.
     fn engine_sync(&self) -> Result<(), Refusal> {
         let e = self.engine.display().to_string();
         if self.engine_git(&["fetch", "-q", "origin"]).is_none() {
@@ -564,9 +521,6 @@ impl Real {
             .any(|l| !l.ends_with(" verification-log.jsonl"))
     }
 
-    /// The submodule at its gitlink, and that gitlink on the branch `.gitmodules`
-    /// declares for it ([`crate::gates::submodules_on_declared_branch`]): at the sync
-    /// and at every commit move, so before anything is staged or published.
     fn submodule_sync(&self, step: Step) -> Result<(), Refusal> {
         let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.args(["submodule", "update", "--init", "vendor/astream"])
@@ -589,14 +543,10 @@ impl Real {
         })
     }
 
-    /// The one clean-tree judge ([`crate::clean`]): the tree's own `.gitignore` rules,
-    /// never `.git/info/exclude` or `core.excludesFile`.
     fn dirty(&self) -> Result<Vec<String>, String> {
         crate::gates::dirty_paths(&self.repo).map_err(|e| e.to_string())
     }
 
-    /// Why the clone is not at `commit`'s tree and clean — what a verified record vouches
-    /// for — or `None` when it is.
     fn off_tree(&self, commit: &str) -> Option<Vec<String>> {
         let want = self.git_out(&["rev-parse", &format!("{commit}^{{tree}}")]);
         let head = self.git_out(&["rev-parse", "HEAD^{tree}"]);
@@ -617,8 +567,6 @@ impl Real {
         }
     }
 
-    /// This clone's main to `rev`: a fast-forward, or — only when every commit it would
-    /// leave is on origin/main already — back to it.
     fn main_to(&mut self, rev: &str) -> Result<(), Refusal> {
         let head = self.head();
         let ancestor = |s: &mut Self, a: &str, b: &str| s.is_ancestor(a, b);
@@ -646,7 +594,6 @@ impl Real {
         }
     }
 
-    /// No engine at its path (no checkout, no `bin/pub`), with the fix.
     fn no_engine(&self) -> Option<Refusal> {
         let e = self.engine.display().to_string();
         (!self.engine.join(".git").exists() || !self.engine.join("bin/pub").is_file()).then(|| {
@@ -657,8 +604,6 @@ impl Real {
         })
     }
 
-    /// Why the engine cannot stage at all — none at its path, not on `main`, changes
-    /// besides its audit log — or `None`.
     fn engine_unready(&self) -> Option<Refusal> {
         if let Some(why) = self.no_engine() {
             return Some(why);
@@ -681,9 +626,6 @@ impl Real {
         })
     }
 
-    /// The engine a read-only run drives: a `git clone --shared` of the engine in the run's
-    /// own scratch directory, at its origin's main (fetched now), origin set to the engine's
-    /// own, as a release's sync would leave the engine.
     fn scratch_engine(&self, scratch: &Scratch) -> Result<PathBuf, Refusal> {
         if let Some(why) = self.no_engine() {
             return Err(why);
@@ -751,8 +693,6 @@ impl Real {
         Ok(copy)
     }
 
-    /// Why the engine's cargo-metadata guard cannot run here — it runs `rustup run
-    /// trust targo metadata` — or `None`.
     fn metadata_toolchain(&self) -> Option<Refusal> {
         let Some(dir) = rustup_dir() else {
             return Some(Refusal::new(
@@ -862,10 +802,6 @@ impl Real {
         )
     }
 
-    /// R laid out at `root` (under `base`'s `dry-run/`) the way `pub stage --repo-path`
-    /// needs a checkout: `git clone --shared` of this checkout (objects borrowed), R
-    /// checked out, origin set to this checkout's origin, each submodule cloned the same
-    /// way at its gitlink.
     fn dry_clone(&self, base: &Path, root: &Path, r: &str) -> Result<(), String> {
         let log = base.join("dry-run-clone.log");
         let _ = std::fs::write(&log, "");
@@ -1117,8 +1053,6 @@ impl Real {
         )
     }
 
-    /// `git archive` of `r` into `dest`, without `.cargo/`, each submodule written from
-    /// its own object store at the gitlink `r` records.
     fn archive_into(&self, r: &str, dest: &Path) -> bool {
         let script = format!(
             "command set -o pipefail 2>/dev/null; git {} -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
@@ -1145,10 +1079,6 @@ impl Real {
             })
     }
 
-    /// `pub stage aterm --commit R --repo-path <this clone>`, the engine synced before
-    /// and after it (the stage appends its audit row: recorded then, or the step
-    /// refuses), into the current step's log: step 4's, or the publish's when the engine
-    /// that staged R moved since.
     fn stage_run(&self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
         self.compat_check(c)?;
         self.engine_sync()?;
@@ -1160,8 +1090,6 @@ impl Real {
         Ok(ran)
     }
 
-    /// R's x86_64 compat slice checked with stable before anything is staged
-    /// ([`crate::buildplan::compat_check`]); its output in the stage's side log.
     fn compat_check(&self, c: &Candidate) -> Result<(), Refusal> {
         let log = self.side_log(self.step, "x86_64-check");
         match crate::buildplan::compat_check(&self.repo, &c.commit, &log) {
@@ -1204,9 +1132,6 @@ impl Real {
         }
     }
 
-    /// A forwarded child with the release's build environment and its prover, its two
-    /// streams captured and appended to `log`: the runner the fixture generator is
-    /// handed.
     fn captured(
         &self,
         prover: &Prover,
@@ -1220,9 +1145,6 @@ impl Real {
         Ok(out)
     }
 
-    /// The release's own handoff fixtures for its reserved identity, written by the
-    /// in-tree generator in the clone into the release cache unless staged already
-    /// (`fixtures::stage`), its output into `log`.
     fn stage_fixtures_run(
         &self,
         c: &Candidate,
@@ -1256,9 +1178,6 @@ impl Real {
         })
     }
 
-    /// `ship build` as the build step's child (R's own cutter, this binary: it reads the
-    /// journal's reservation and builds its bundle once into the release cache), and the
-    /// COMPLETE entry it left, read back by the key it built under.
     fn build_run(
         &self,
         c: &Candidate,
@@ -1322,15 +1241,11 @@ impl Real {
         }
     }
 
-    /// The published release `tag` as GitHub's API serves it to the release token.
     fn release_json(&self, slug: &str, tag: &str) -> Result<aterm_json::Value, String> {
         self.github_read(&format!("repos/{slug}/releases/tags/{tag}"))
             .map_err(|e| format!("could not read {slug} {tag} from GitHub's API ({e})"))
     }
 
-    /// The evergreen pointer as github.com serves a stranger: the first hop of
-    /// `releases/latest/download/aterm-appcast.toml` is a 302 to exactly this tag's
-    /// appcast, which names this version and binds its `url` to this tag and its DMG.
     fn pointer_problems(
         &self,
         slug: &str,
@@ -1368,9 +1283,6 @@ impl Real {
         Ok(appcast_problems(&text, slug, tag, version))
     }
 
-    /// The release alab.systems would link: the site's own election of the macOS
-    /// download ([`crate::site::releases::elect_mac`]) over the channel's release list
-    /// (through the authenticated `gh`).
     fn site_tag(&self, slug: &str) -> Result<String, String> {
         let list = self
             .github_read(&format!("repos/{slug}/releases?per_page=30"))
@@ -1384,26 +1296,18 @@ impl Real {
             .map_err(|e| format!("the site could not tell which release to link on {slug} ({e})"))
     }
 
-    /// The release's child rules for a child of the running step that this process starts
-    /// itself ([`StepChildren`]): noted under the step on a real run.
     fn step_children(&self) -> StepChildren {
         StepChildren {
             noted: (!self.scratch_logs).then(|| (self.release.clone(), self.step)),
         }
     }
 
-    /// The JSON GitHub's REST API answers at `path` ([`crate::github::get_via`]), each curl
-    /// under the release's child rules ([`StepChildren`]: a session of its own, the interrupt
-    /// handed to it, noted while it runs), and nothing asked once an interrupt is caught.
     fn github_read(&self, path: &str) -> Result<aterm_json::Value, String> {
         let spawn: std::sync::Arc<dyn aterm_update_core::github_rest::Spawn> =
             std::sync::Arc::new(crate::github::Launched(self.step_children()));
         crate::github::get_via(Some(&spawn), path).map_err(|e| e.to_string())
     }
 
-    /// `ship site --latest`, in this process: its transcript into the step's log (and the
-    /// terminal under `--verbose`), every child it starts without the variables [`scrub`]
-    /// removes and under the release's child rules ([`StepChildren`]).
     fn site(&mut self, slug: &str) -> Result<AfterCut, Refusal> {
         if interrupt::caught().is_some() {
             return Err(Refusal::new(
@@ -1460,7 +1364,6 @@ impl Real {
     }
 }
 
-/// A step's log, and the terminal too when `echo`.
 struct StepLog {
     file: std::fs::File,
     echo: bool,
@@ -1562,8 +1465,6 @@ pub fn site_outcome(
     }
 }
 
-/// Whether the journal's bundle is built for this release: its store entry COMPLETE in the
-/// release cache, its bytes re-proved, built by the release's prover.
 fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> Answer {
     let Some(a) = artifact else {
         return Answer::no("no bundle is built for it yet");
@@ -1604,8 +1505,6 @@ fn short(sha: &str) -> &str {
     sha.get(..9).unwrap_or(sha)
 }
 
-/// `unix` on a clock `offset` seconds east of UTC, as a log directory's stamp:
-/// `YYYYMMDDTHHMMSS` (what `date +%Y%m%dT%H%M%S` printed).
 fn local_stamp(unix: u64, offset: i64) -> String {
     let local = i64::try_from(unix)
         .unwrap_or(i64::MAX)
@@ -1666,7 +1565,6 @@ pub(crate) fn launcher_env(name: &str) -> bool {
         .any(|p| name.starts_with(p))
 }
 
-/// Remove from `cmd` every variable [`clears`] or [`launcher_env`] names.
 fn scrub(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if let Some(name) = name.to_str()
@@ -1677,8 +1575,6 @@ fn scrub(cmd: &mut Command) {
     }
 }
 
-/// The identity a release's handoff fixtures are written as: its version and the
-/// reservation the shipped binary stamps (build n, release commit C).
 fn fixture_pins(c: &Candidate, reserved: &Reservation) -> crate::fixtures::Pins {
     crate::fixtures::Pins {
         version: c.version.clone(),
@@ -1687,7 +1583,6 @@ fn fixture_pins(c: &Candidate, reserved: &Reservation) -> crate::fixtures::Pins 
     }
 }
 
-/// Where the clone's release cache stages them.
 fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
     crate::snapshot::CacheRoot::for_repo(repo)
         .map(|cache| cache.handoff_fixtures())
@@ -1700,8 +1595,6 @@ fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
         })
 }
 
-/// A child run beside another, joined: what it answered — or, its thread having
-/// panicked (a bug in the release), a resumable stop naming it.
 fn joined(
     handle: std::thread::ScopedJoinHandle<'_, Result<String, Refusal>>,
     what: &str,
@@ -1715,8 +1608,6 @@ fn joined(
     })
 }
 
-/// One of the cut's own gates, refusing in its own words, as a refusal: its first line
-/// named by the gate, its `fix:` line the remedy, the rest the detail.
 fn cut_refusal(gate: &str, why: &str) -> Refusal {
     let first = why.lines().next().unwrap_or("");
     let fix = why
@@ -1734,8 +1625,6 @@ fn cut_refusal(gate: &str, why: &str) -> Refusal {
     )
 }
 
-/// A captured child's output appended to `log`, both streams (a write that fails loses
-/// only the log's copy: the verdict is the child's exit).
 fn append_output(log: &Path, out: &std::process::Output) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1840,9 +1729,6 @@ impl Wasm32Tools {
     }
 }
 
-/// Where rustup is for the engine's children: the PATH entry that has it, else
-/// `$CARGO_HOME/bin`, else `~/.cargo/bin` — where its installer puts it, which a
-/// shell's PATH can leave out.
 fn rustup_dir() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
@@ -1851,8 +1737,6 @@ fn rustup_dir() -> Option<PathBuf> {
         .find(|d| d.join("rustup").is_file())
 }
 
-/// This process's PATH with `dir` appended when it is not on it — appended, so
-/// nothing PATH already finds is shadowed.
 fn path_with(dir: &Path) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
@@ -1862,8 +1746,6 @@ fn path_with(dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(dirs).unwrap_or(path)
 }
 
-/// The engine's report files (its `.out`'s top level: the hits, the gitleaks reports,
-/// the metadata error) copied to `to`, which outlives a read-only run's sources.
 fn keep_reports(out: &Path, to: &Path) {
     let _ = std::fs::remove_dir_all(to);
     if std::fs::create_dir_all(to).is_err() {
@@ -1876,7 +1758,6 @@ fn keep_reports(out: &Path, to: &Path) {
     }
 }
 
-/// The report a failing gitleaks guard names (`gitleaks findings (see <report>)`).
 fn gitleaks_report(guard: &str) -> Option<&str> {
     guard
         .strip_prefix("gitleaks findings (see ")?
@@ -1974,8 +1855,6 @@ pub enum EngineCause {
     Source,
 }
 
-/// The engine's words for each refusal of the machine's (a substring of its `FAIL:`
-/// line); every other refusal is the tree's.
 const MACHINE_REFUSALS: [(&str, EngineCause); 17] = [
     ("gitleaks not installed", EngineCause::NoGitleaks),
     ("gitleaks crashed", EngineCause::GitleaksBroke),
@@ -2164,8 +2043,6 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
     aterm_verify::rustup::wasm_clause(config).map_err(|e| Refusal::new(e.why, e.remedy))
 }
 
-/// The problems with the source manifest pair a completed `pub publish` leaves on the
-/// channel (each asset exactly once).
 fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
     crate::channel::SOURCE_ATTESTATION_ASSETS
         .into_iter()
@@ -2378,9 +2255,6 @@ fn linux_inventory(
     bad
 }
 
-/// What the after-cut step makes of the pointer's answer: its shape problems, or, when
-/// GitHub could not be read, a COULD NOT RUN refusal (never a shape problem, whose
-/// refusal ends a published release).
 fn pointer_verdict(read: Result<Vec<String>, String>) -> Result<Vec<String>, Refusal> {
     read.map_err(|why| {
         Refusal::new(
@@ -2391,10 +2265,6 @@ fn pointer_verdict(read: Result<Vec<String>, String>) -> Result<Vec<String>, Ref
     })
 }
 
-/// The pointer's first hop judged: `Ok(None)` for a 302 to exactly `want`;
-/// `Ok(Some(problem))` for a shape fact (404: no published release holds the pointer; a
-/// 302 elsewhere: another release holds GitHub's latest); `Err` for any other answer (a
-/// 5xx, a 403 rate limit), the caller's COULD NOT RUN.
 fn pointer_hop_problem(
     ptr: &str,
     want: &str,
@@ -2465,7 +2335,6 @@ impl Backend for Real {
         )
     }
 
-    /// Woken by an interrupt: the owner's wait ends the moment one arrives.
     fn sleep(&mut self, secs: u64) {
         for _ in 0..secs {
             if interrupt::caught().is_some() {
@@ -2475,8 +2344,6 @@ impl Backend for Real {
         }
     }
 
-    /// To the terminal, and to the run's transcript beside its step logs — a closed
-    /// terminal (SIGHUP) loses no line, and a write to it never ends the run.
     fn say(&mut self, line: &str) {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{line}");
@@ -2761,10 +2628,6 @@ impl Backend for Real {
         engine_rows_in(&text, commit)
     }
 
-    /// Whether the engine that would publish is the one that staged: its HEAD at its
-    /// origin/main, a fast-forward of `staged`, and nothing changed since `staged` but the
-    /// data plane its stage's drift check (`revalidate_push_inputs`) lets move
-    /// (`verification-log.jsonl`, `mappings.json`, `handoff/`).
     fn engine_now(&mut self, staged: &str) -> Result<EngineNow, String> {
         let e = self.engine.display().to_string();
         let head = self.engine_commit("HEAD")?;
@@ -2849,8 +2712,6 @@ impl Backend for Real {
         }
     }
 
-    /// `git ls-remote --refs <staging.remote> refs/heads/main` against the attestation's
-    /// `staging.attested_rev`, as `pub promote` asks it before it promotes.
     fn staging_moved(&mut self) -> Result<Option<String>, String> {
         let path = self.repo.join("publish/.out/attestation.json");
         let text = std::fs::read_to_string(&path)
@@ -2901,11 +2762,6 @@ impl Backend for Real {
         ))
     }
 
-    /// The bump, committed on origin/main's tip and pushed before anything is staged (`pub
-    /// stage --commit` stages only an ancestor of origin/main, and merging an old-base bump
-    /// into a newer main leaves the lockfile behind): the engine's `bin/pub-bump-edit` (the
-    /// version and the intra-workspace requirements) on this clone, the lockfile with the
-    /// prover's `targo`, a check that only version lines moved, one commit, one push.
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal> {
         let edit = self.engine.join("bin/pub-bump-edit");
         if !edit.is_file() {
@@ -3321,9 +3177,6 @@ impl Backend for Real {
         })
     }
 
-    /// Beside each other: the fixture generator on a thread of its own (its own target
-    /// directory, `target-fixture-guard`, and log), `ship build` on this one (the release
-    /// cache's target directories).
     fn build(
         &mut self,
         c: &Candidate,
@@ -3504,8 +3357,6 @@ impl Backend for Real {
     }
 }
 
-/// `aterm ctl <verb> <line>` — the owner's aterm, from this shell: `Ok(its reply)` only
-/// when it answered `OK` (the row is up, or resolved), else why not.
 fn notice(verb: &[&str], line: &str) -> Result<String, String> {
     let out = {
         command("aterm")
@@ -3699,9 +3550,7 @@ pub fn check(repo: &Path, opts: &CheckOptions) -> i32 {
     found.exit_code()
 }
 
-/// [`check`]'s sections for the commit `opts` names, each gate's lines printed as it
-/// ends.
-///
+/// Run [`check`]'s sections for the commit `opts` names.
 /// # Errors
 /// The commit names no commit, or its `Cargo.toml` carries no release version.
 fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
@@ -3862,8 +3711,6 @@ mod tests {
         assert!(crate::release::child_notes(dir.path()).is_empty());
     }
 
-    /// Only a 404 or a 302 elsewhere is the pointer's shape; a read that says nothing about
-    /// the release (a 5xx, a rate-limit 403) is COULD NOT RUN.
     #[test]
     fn a_pointer_that_could_not_be_read_is_could_not_run() {
         let refused = pointer_verdict(Err("https://x/latest could not be read: timeout".into()))
@@ -3943,7 +3790,6 @@ mod tests {
         }
     }
 
-    /// The lean shape passes; each way a release is out of shape is named.
     #[test]
     fn a_release_is_judged_by_the_lean_shape_github_serves() {
         assert_eq!(
@@ -3992,8 +3838,6 @@ mod tests {
         assert!(!appcast_problems(&unbound, slug, "v0.6.0", "0.6.0").is_empty());
     }
 
-    /// The engine's dry run, read in its own words: each guard's verdict with its
-    /// location lines, and its refusals.
     #[test]
     fn the_engines_dry_run_is_read_in_its_own_words() {
         let text = "== exported 5807 of 7058 tracked files from abc\n\
@@ -4013,10 +3857,6 @@ mod tests {
         assert_eq!(EngineRun::read(0, "").tail, Vec::<String>::new());
     }
 
-    /// Every engine refusal is the tree's unless its words name the machine's,
-    /// wherever in the run it came: a manifest or config refusal before the export and
-    /// a transform's after it are the tree's; a remote, the engine's own state, the
-    /// commit's place and gitleaks are the machine's.
     #[test]
     fn an_engine_refusal_is_sorted_by_its_cause() {
         for line in [
@@ -4077,10 +3917,6 @@ mod tests {
         }
     }
 
-    /// The export guards' outcome, by cause: a finding or a refusal of the tree refuses
-    /// whatever stopped the run after it; a refusal of the machine's, or a metadata
-    /// guard that failed for want of its toolchain, could not run; a clean exit that
-    /// heard its guards passes; a run that judged nothing could not run.
     #[test]
     fn the_export_guards_pass_refuse_or_could_not_run() {
         let (log, reports) = (Path::new("/c/dry-run.log"), Path::new("/c/reports"));
@@ -4180,8 +4016,6 @@ mod tests {
         }
     }
 
-    /// A gitleaks finding is named by its place in the export and its rule, never by
-    /// what it matched.
     #[test]
     fn a_gitleaks_finding_is_named_by_place_and_rule_never_by_its_secret() {
         let report = r#"[{"File":"/x/export/a/b.rs","StartLine":7,"RuleID":"generic-api-key","Match":"key=hunter2","Secret":"hunter2"}]"#;
@@ -4197,8 +4031,6 @@ mod tests {
         assert_eq!(gitleaks_report("private references (2)"), None);
     }
 
-    /// `ship check --export` end to end, offline: a stub engine whose `bin/pub` prints
-    /// what its commit says, its origin and the candidate's origin local.
     #[test]
     fn ship_check_export_drives_a_scratch_copy_of_the_engine_at_its_origins_main() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4325,8 +4157,6 @@ mod tests {
         assert!(checked(&repo, &opts("no-such-commit", &engine)).is_err());
     }
 
-    /// THE WASM32 GATE, offline: a stub rustup on the clause's PATH answers `target add`,
-    /// `which` and `run … cargo check` as the real one would.
     #[test]
     fn the_wasm32_gate_runs_rs_own_clause_under_a_stub_rustup() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4411,16 +4241,10 @@ mod tests {
         assert!(scratch.dir.join("wasm-src/publish/config.sh").is_file());
     }
 
-    /// The env that turns [`probe_every_tree_the_release_writes_under_a_crlf_config`] on:
-    /// the directory it works in.
     const CRLF_PROBE_ENV: &str = "ATERM_RELEASE_CRLF_PROBE_DIR";
-    /// That probe's name, as `--exact` wants it.
     const CRLF_PROBE: &str =
         "release_steps::tests::probe_every_tree_the_release_writes_under_a_crlf_config";
 
-    /// The child half of [`every_tree_the_release_writes_is_the_commits_bytes`]: the engine
-    /// copy, the dry run's clone, the wasm32 gate's archive and the cut tree (made, moved,
-    /// then claimed) hold R's bytes, submodules included.
     #[test]
     fn probe_every_tree_the_release_writes_under_a_crlf_config() {
         use crate::ledger::testing;
@@ -4538,10 +4362,6 @@ mod tests {
         );
     }
 
-    /// Every tree a release writes from git holds the commit's own bytes under a
-    /// releaser's global config that turns LF into CRLF (`core.autocrlf`, `core.eol`, an
-    /// attributes file): a CRLF `bin/pub` does not run, and a CRLF cut tree reads clean to
-    /// the clean-tree judge.
     #[test]
     fn every_tree_the_release_writes_is_the_commits_bytes() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4594,8 +4414,6 @@ mod tests {
         );
     }
 
-    /// `ship check`'s exit: a refusal outranks a gate that could not run, which
-    /// outranks a pass.
     #[test]
     fn a_refusal_outranks_a_gate_that_could_not_run() {
         let gate = |outcome: Outcome| PrecheckGate { name: "g", outcome };
@@ -4659,8 +4477,6 @@ mod tests {
         assert!(!attestation_promotes(&engineless, &a));
     }
 
-    /// The staging tier as `pub promote` asks it again: its main, by `git ls-remote
-    /// --refs`, against the commit the attestation names.
     #[test]
     fn a_staging_tier_that_moved_since_the_attestation_is_named() {
         let (s, t) = ("5".repeat(40), "6".repeat(40));
@@ -4683,9 +4499,6 @@ mod tests {
         assert!(staging_moved_from(&twice, &s).is_some());
     }
 
-    /// `--engine` reaches every child: the cut, the stage and `pub publish`'s pre-promote
-    /// (`ship check` by R's own cutter, the running release's binary) read the one engine
-    /// the release judged, never `~/publication` by default.
     #[test]
     fn the_engine_the_release_judges_is_the_one_every_child_reads() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4740,8 +4553,6 @@ mod tests {
         assert!(edit.get_envs().any(|kv| kv == engine));
     }
 
-    /// A step's child under `--verbose`: both its streams reach the step's log on one
-    /// pipe, in the order written, and its exit code is the step's.
     #[test]
     fn a_verbose_step_logs_both_streams_in_the_order_written() {
         let dir = aterm_tempfile::tempdir().unwrap();

@@ -992,7 +992,7 @@ impl Rendezvous {
         )
     }
 
-    /// Parse one.
+    /// Parse one. `command` is read as `[fabric] command` is ([`fabric::command_in_toml`]).
     ///
     /// # Errors
     /// Not TOML, a key missing or not a string, or a `command` that is neither form.
@@ -1333,6 +1333,11 @@ fn has_dotted_fabric(lines: &[&str]) -> bool {
 }
 
 /// `text` with the `[fabric]` table and every `[fabric.<sub>]` table removed.
+///
+/// # Errors
+/// A file that is not valid TOML, a result that still defines `fabric` (a dotted key or an
+/// inline table, which this editor does not remove), or one that does not read back as `text`
+/// without it (`reads_back`).
 pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> {
     let table: aterm_toml::Table = aterm_toml::from_str(text).map_err(|e| {
         format!(
@@ -1892,7 +1897,7 @@ pub(crate) fn launchctl_list() -> String {
         .unwrap_or_default()
 }
 
-/// What launchd's `gui/<uid>` domain.
+/// What launchd's `gui/<uid>` domain says of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchdJob {
     /// The domain holds no such job.
@@ -4204,7 +4209,7 @@ mod tests {
     }
 
     /// On macOS a 0700 root carrying an `everyone allow read` entry is open to every user
-    /// though its mode says otherwise: step 2 refuses it, dry or not, and makes no state
+    /// though its mode says otherwise: the root step refuses it, dry or not, and makes no state
     /// directory in it; the mint secret's writer refuses that root as well.
     #[cfg(target_os = "macos")]
     #[test]

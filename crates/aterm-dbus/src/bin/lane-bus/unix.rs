@@ -11,26 +11,16 @@ use std::time::{Duration, Instant};
 
 use aterm_dbus::{Connection, Message, Type, Value, address};
 
-/// One call's deadline.
 const CALL: Duration = Duration::from_secs(10);
 
-/// The hang detector of `atspi-listen`, and of a `seat` step that waits for
-/// the lab (whose own waits are one-minute hang detectors): it never decides a
-/// verdict.
 const LISTEN_LIMIT: Duration = Duration::from_secs(600);
 
-/// A wait for something that must happen (a frame's focus to move): a hang
-/// detector, never a budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// How often a wait polls.
 const POLL: Duration = Duration::from_millis(100);
 
-/// The AT-SPI state bit `active` (at-spi2-core's `ATSPI_STATE_ACTIVE`): a
-/// frame's window holds the keyboard focus.
 const ACTIVE_BIT: u32 = 1;
 
-/// The walk's bounds: a tree deeper or larger than this is reported cut.
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 2000;
 
@@ -47,7 +37,6 @@ const SC_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const SC_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
 const SC_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
 
-/// The AT-SPI 2 roles, by number (at-spi2-core's `AtspiRole`).
 const ROLES: [&str; 130] = [
     "invalid",
     "accelerator_label",
@@ -181,7 +170,6 @@ const ROLES: [&str; 130] = [
     "push_button_menu",
 ];
 
-/// The AT-SPI 2 states, by bit (at-spi2-core's `AtspiStateType`).
 const STATES: [&str; 45] = [
     "invalid",
     "active",
@@ -332,8 +320,6 @@ pub(crate) fn main() -> ExitCode {
     }
 }
 
-/// The filtering proxies (`xhide`, `wlhide`), which run until killed: a
-/// fault when one cannot listen or reach its server.
 fn xhide(display: &str, server: &str, hide: &str) -> Result<(), Fail> {
     crate::xhide::run(display, server, hide).map_err(Fail::Fault)
 }
@@ -342,8 +328,6 @@ fn wlhide(listen: &str, server: &str, rules: &[String]) -> Result<(), Fail> {
     crate::wlhide::run(listen, server, rules).map_err(Fail::Fault)
 }
 
-/// An X client's failure: no server (or no extension) to speak to is "not
-/// here", anything else a fault.
 fn x_fail(e: crate::xdnd::Error) -> Fail {
     match e {
         crate::xdnd::Error::NoServer(why) => Fail::NotHere(why),
@@ -351,7 +335,6 @@ fn x_fail(e: crate::xdnd::Error) -> Fail {
     }
 }
 
-/// Call `member` and return the reply's body.
 fn call(
     conn: &mut Connection,
     dest: &str,
@@ -368,7 +351,6 @@ fn call(
         .map_err(|e| e.to_string())
 }
 
-/// A property, unwrapped from its variant.
 fn property(
     conn: &mut Connection,
     dest: &str,
@@ -391,7 +373,6 @@ fn property(
     }
 }
 
-/// The unique name that owns `name` on this bus, if any.
 fn owner(conn: &mut Connection, name: &str) -> Option<String> {
     call(
         conn,
@@ -407,7 +388,6 @@ fn owner(conn: &mut Connection, name: &str) -> Option<String> {
     .map(str::to_owned)
 }
 
-/// The process behind a connection on this bus.
 fn pid_of(conn: &mut Connection, name: &str) -> Option<u32> {
     call(
         conn,
@@ -422,7 +402,6 @@ fn pid_of(conn: &mut Connection, name: &str) -> Option<u32> {
     .as_u32()
 }
 
-/// The unique names on this bus that process `pid` holds.
 fn names_of(conn: &mut Connection, pid: u32) -> Vec<String> {
     let names: Vec<String> = call(
         conn,
@@ -450,8 +429,6 @@ fn names_of(conn: &mut Connection, pid: u32) -> Vec<String> {
         .collect()
 }
 
-/// The accessibility bus: `AT_SPI_BUS_ADDRESS`, else at-spi2-core's answer
-/// to `org.a11y.Bus.GetAddress` on the session bus.
 fn a11y_bus() -> Result<Connection, Fail> {
     let addr = match std::env::var("AT_SPI_BUS_ADDRESS") {
         Ok(a) if !a.is_empty() => a,
@@ -479,7 +456,6 @@ fn a11y_bus() -> Result<Connection, Fail> {
     Connection::open(&addresses).map_err(|e| Fail::NotHere(format!("accessibility bus: {e}")))
 }
 
-/// An object reference `(so)`.
 fn object_ref(v: &Value) -> Option<(String, String)> {
     let fields = v.as_struct()?;
     let bus = fields.first()?.as_str()?;
@@ -490,7 +466,6 @@ fn object_ref(v: &Value) -> Option<(String, String)> {
     Some((bus.to_owned(), path.to_owned()))
 }
 
-/// The children an `a(so)` reply names.
 fn children_of(body: &[Value]) -> Vec<(String, String)> {
     body.first()
         .and_then(Value::as_array)
@@ -498,8 +473,6 @@ fn children_of(body: &[Value]) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The applications on the bus whose root is named `app` and whose
-/// process is `pid`.
 fn find_app(conn: &mut Connection, app: &str, pid: u32) -> Result<Vec<(String, String)>, Fail> {
     let body = call(conn, REGISTRY, ROOT, ACCESSIBLE, "GetChildren", Vec::new())
         .map_err(|e| Fail::NotHere(format!("the registry's children: {e}")))?;
@@ -515,7 +488,6 @@ fn find_app(conn: &mut Connection, app: &str, pid: u32) -> Result<Vec<(String, S
     Ok(found)
 }
 
-/// `atspi-walk <app> <pid>`.
 fn walk(app: &str, pid: u32) -> Result<(), Fail> {
     let mut conn = a11y_bus()?;
     let apps = find_app(&mut conn, app, pid)?;
@@ -548,7 +520,6 @@ fn walk(app: &str, pid: u32) -> Result<(), Fail> {
     Ok(())
 }
 
-/// One node's line, and its children.
 fn describe(
     conn: &mut Connection,
     bus: &str,
@@ -662,7 +633,6 @@ fn describe(
     (line, kids)
 }
 
-/// A reading, or `ERR(<why>)` with no spaces, so a line stays one record.
 fn field(r: Result<String, &String>) -> String {
     match r {
         Ok(s) => s,
@@ -677,7 +647,6 @@ fn role_name(role: u32) -> String {
         .map_or_else(|| format!("role{role}"), |n| (*n).to_owned())
 }
 
-/// `GetState`'s `au`: two words, bit `n` of the 64 being state `n`.
 fn state_names(body: &[Value]) -> String {
     let words: Vec<u32> = body
         .first()
@@ -704,7 +673,6 @@ fn state_names(body: &[Value]) -> String {
     }
 }
 
-/// `GetAttributes`' `a{ss}`, sorted by key.
 fn attributes(body: &[Value]) -> String {
     let mut pairs: Vec<String> = body
         .first()
@@ -724,7 +692,6 @@ fn attributes(body: &[Value]) -> String {
     }
 }
 
-/// `GetExtents`' `(iiii)` as `x,y,w,h`.
 fn extents(body: &[Value]) -> String {
     body.first()
         .and_then(Value::as_struct)
@@ -732,8 +699,6 @@ fn extents(body: &[Value]) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-/// A string, quoted with its control characters escaped, so it fits on one
-/// line and reads back unambiguously.
 fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -761,8 +726,6 @@ fn quote_value(v: &Value) -> String {
     }
 }
 
-/// Any value, on one line: strings quoted, an object reference as
-/// `ref(<path>)`, containers bracketed.
 fn render(v: &Value) -> String {
     if let Some((_, path)) = object_ref(v) {
         return format!("ref({path})");
@@ -800,9 +763,6 @@ fn render(v: &Value) -> String {
     }
 }
 
-/// One event's line: `<ms> <pid> <Interface>.<Member> <path> <body>`. An AT-SPI
-/// event's body is `(siiva{sv})`: the detail, two numbers, any data and
-/// properties, which print only when there are any.
 fn event_line(ms: u128, pid: u32, msg: &Message) -> String {
     let iface = msg
         .interface
@@ -836,7 +796,6 @@ fn event_line(ms: u128, pid: u32, msg: &Message) -> String {
     line
 }
 
-/// `atspi-listen <app> <out> <stop>`.
 fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
     let mut conn = a11y_bus()?;
     conn.add_match("type='signal'", CALL).map_err(Fail::fault)?;
@@ -895,7 +854,6 @@ fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-/// An X window id as xdotool prints it (decimal), or `0x…`.
 fn parse_window(word: &str) -> Option<u32> {
     match word.strip_prefix("0x") {
         Some(hex) => u32::from_str_radix(hex, 16).ok(),
@@ -903,7 +861,6 @@ fn parse_window(word: &str) -> Option<u32> {
     }
 }
 
-/// `seat`'s `app` for a client that publishes no AT-SPI frame.
 const NO_APP: &str = "-";
 
 /// One step of `seat`.
@@ -930,20 +887,15 @@ enum Step {
     FingerMove(Point),
     /// The finger lifted.
     FingerUp,
-    /// Hold for this many milliseconds: a stimulus (a key held down), never a
-    /// wait for something to happen.
+    /// Hold for this many milliseconds.
     Sleep(u64),
     /// Create this file: tells the lab a point was reached.
     Touch(String),
-    /// Wait until this file exists: the lab says go on (a hang detector of
-    /// [`LISTEN_LIMIT`]).
+    /// Wait until this file exists: the lab says go on (a hang detector of [`LISTEN_LIMIT`]).
     Wait(String),
 }
 
-/// Where a finger goes: a point of the screen in its pixels (the
-/// monitor's, which a screencast stream of it shares: logical pixels times
-/// the monitor's scale), given, or read as `X Y` from a file when the step
-/// runs (so the lab can aim from what the window reports).
+/// Where a finger goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Point {
     At(i32, i32),
@@ -951,8 +903,6 @@ enum Point {
 }
 
 impl Step {
-    /// Whether the step drives the pointer (Mutter makes the seat's pointer
-    /// with the session's first such event).
     fn drives_pointer(&self) -> bool {
         matches!(
             self,
@@ -960,9 +910,6 @@ impl Step {
         )
     }
 
-    /// Whether the step drives the touchscreen: RemoteDesktop places a
-    /// finger only in a screencast stream's space, so such a session records
-    /// the monitor ([`seat`]).
     fn drives_touch(&self) -> bool {
         matches!(
             self,
@@ -971,15 +918,11 @@ impl Step {
     }
 }
 
-/// The motion that makes a session's pointer before its keyboard: up and left
-/// past any lane screen, so the seat parks it in the top-left corner, where
-/// no lane window lies.
 const PARK: Step = Step::Motion {
     dx: -4000,
     dy: -4000,
 };
 
-/// The keysyms `seat` names, beside `0x…`.
 const KEYSYMS: [(&str, u32); 15] = [
     ("Shift_L", 0xffe1),
     ("Control_L", 0xffe3),
@@ -1012,7 +955,6 @@ fn keysym(word: &str) -> Option<u32> {
     }
 }
 
-/// The evdev button codes: BTN_LEFT, BTN_RIGHT, BTN_MIDDLE.
 fn button(word: &str) -> Option<i32> {
     match word {
         "left" => Some(0x110),
@@ -1022,8 +964,6 @@ fn button(word: &str) -> Option<i32> {
     }
 }
 
-/// A pointer motion `DX,DY` (or `DX DY`, as a `move:@PATH` file holds it), in
-/// whole logical pixels, each within the reach of any screen.
 fn motion(text: &str) -> Option<(i32, i32)> {
     let mut it = text.trim().split([',', ' ']).filter(|w| !w.is_empty());
     let (dx, dy) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
@@ -1031,7 +971,6 @@ fn motion(text: &str) -> Option<(i32, i32)> {
     (it.next().is_none() && reach(dx) && reach(dy)).then_some((dx, dy))
 }
 
-/// Parse `seat`'s steps.
 fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for w in words {
@@ -1135,9 +1074,6 @@ fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
     Ok(steps)
 }
 
-/// Whether the frame that application `app` of process `pid` publishes is
-/// `active` (its window holds the keyboard focus); `None` while there is no
-/// such application or frame, or a reading fails.
 fn frame_active(conn: &mut Connection, app: &str, pid: u32) -> Option<bool> {
     let (bus, root) = find_app(conn, app, pid).ok()?.into_iter().next()?;
     let kids = call(conn, &bus, &root, ACCESSIBLE, "GetChildren", Vec::new()).ok()?;
@@ -1162,7 +1098,6 @@ fn frame_active(conn: &mut Connection, app: &str, pid: u32) -> Option<bool> {
     None
 }
 
-/// Wait until `frame_active` reads `want`, within the hang detector.
 fn await_focus(conn: &mut Connection, app: &str, pid: u32, want: bool) -> Result<(), Fail> {
     let t0 = Instant::now();
     loop {
@@ -1180,7 +1115,6 @@ fn await_focus(conn: &mut Connection, app: &str, pid: u32, want: bool) -> Result
     }
 }
 
-/// Wait until `path` exists, within `limit` (a hang detector).
 fn await_file(path: &str, limit: Duration) -> Result<(), Fail> {
     let t0 = Instant::now();
     while !Path::new(path).exists() {
@@ -1195,9 +1129,6 @@ fn await_file(path: &str, limit: Duration) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `seat <mutter-pid> <app> <app-pid> <step>...`: a RemoteDesktop session of
-/// the Mutter that is process `mutter-pid`, for the steps' length; Mutter
-/// ends it, and removes its devices, when it stops.
 fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     let mut a11y = if app == NO_APP {
         None
@@ -1284,11 +1215,6 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// `cast <mutter-pid> <out.png>`: one frame of the primary monitor of the
-/// Mutter that is process `mutter`, as its compositor composited it, written
-/// to `out` as a PNG: a ScreenCast session of its own (no RemoteDesktop, the
-/// cursor left out), whose PipeWire stream `gst-launch-1.0` reads one buffer
-/// of (`pipewiresrc`, `videoconvert`, `pngenc`).
 fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
     let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
     let sc = names_of(&mut conn, mutter)
@@ -1359,8 +1285,6 @@ fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-/// The PipeWire node of the screencast stream `stream`, from its
-/// `PipeWireStreamAdded` (a hang detector).
 fn stream_node(conn: &mut Connection, stream: &str) -> Result<u32, Fail> {
     let started = Instant::now();
     while started.elapsed() < HANG {
@@ -1390,8 +1314,6 @@ fn stream_node(conn: &mut Connection, stream: &str) -> Result<u32, Fail> {
     )))
 }
 
-/// One buffer of PipeWire node `node`, as a PNG at `out`: `gst-launch-1.0`,
-/// waited for within the hang detector and killed past it.
 fn one_frame(node: u32, out: &Path) -> Result<(), Fail> {
     let location = format!("location={}", out.display());
     let path = format!("path={node}");
@@ -1440,16 +1362,11 @@ fn one_frame(node: u32, out: &Path) -> Result<(), Fail> {
     }
 }
 
-/// The `DX DY` the file `path` holds now (a `move:@PATH` step's).
 fn motion_from(path: &str) -> Result<(i32, i32), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     motion(&text).ok_or_else(|| format!("{path}: not `DX DY` ({text:?})"))
 }
 
-/// `xseat <app> <app-pid> <step>...`: `seat`'s steps faked through XTEST on
-/// the X display `DISPLAY` names ([`crate::xtest`]), the input of weston's x11
-/// backend nested in it: weston's seat reads its X window, which covers the X
-/// screen.
 fn xseat(app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     if steps.iter().any(Step::drives_touch) {
         return Err(Fail::Usage(
@@ -1498,14 +1415,12 @@ fn xseat(app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// An X client's failure as a step's text.
 fn x_why(e: crate::xdnd::Error) -> String {
     match e {
         crate::xdnd::Error::NoServer(why) | crate::xdnd::Error::Fault(why) => why,
     }
 }
 
-/// The seat's pointer moved by `(dx, dy)` logical pixels.
 fn relative_motion(
     conn: &mut Connection,
     rd: &str,
@@ -1524,9 +1439,6 @@ fn relative_motion(
     .map(drop)
 }
 
-/// A screencast of the primary monitor, tied to the RemoteDesktop session
-/// `session` (it starts and stops with it): the stream a finger's position
-/// is given in.
 fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<String, Fail> {
     let id = property(conn, rd, session, RD_SESSION, "SessionId").map_err(Fail::Fault)?;
     let id = id
@@ -1572,7 +1484,6 @@ fn record_monitor(conn: &mut Connection, rd: &str, session: &str) -> Result<Stri
     }
 }
 
-/// Where a finger goes, read now: `(x, y)` in the stream's pixels.
 fn point(at: &Point) -> Result<(f64, f64), String> {
     let (x, y) = match at {
         Point::At(x, y) => (*x, *y),
@@ -1585,8 +1496,6 @@ fn point(at: &Point) -> Result<(f64, f64), String> {
     Ok((f64::from(x), f64::from(y)))
 }
 
-/// The steps of one `seat` session, in order; `stream` is the screencast a
-/// finger's position is given in, when the session has one.
 fn run_steps(
     conn: &mut Connection,
     rd: &str,

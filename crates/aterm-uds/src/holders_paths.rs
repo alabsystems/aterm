@@ -1764,10 +1764,13 @@ mod tests {
 
     const HANG: Duration = Duration::from_secs(60);
 
+    /// A new directory of this run's own: never one an earlier run with this pid kept, which may hold a copy that never showed it ran.
     fn fresh(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("aterm-uds-paths-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("mkdir");
+        let d = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-uds-paths-{name}-"))
+            .tempdir()
+            .expect("mkdir")
+            .keep();
         std::fs::canonicalize(&d).expect("canonical")
     }
 

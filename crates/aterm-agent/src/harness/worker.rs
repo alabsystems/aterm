@@ -234,7 +234,7 @@ pub(crate) fn starter_of(
     })
 }
 
-/// What a worker's line names beside its program ([`line`]).
+/// What a worker's line names beside its program ([`fn@line`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fresh<'a> {
     /// `model=`: the CLI's `--model`.
@@ -311,7 +311,7 @@ fn xdg_base(name: &str) -> bool {
     name.starts_with("XDG_") && name.ends_with("_HOME")
 }
 
-/// [`line`] by its parts.
+/// [`fn@line`] by its parts.
 pub(super) fn line_of(
     cli: &WorkerCli,
     dialect: Dialect,

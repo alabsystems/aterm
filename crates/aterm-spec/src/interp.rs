@@ -29,7 +29,6 @@ struct Seen {
     len: usize,
 }
 
-/// A [`Seen`] entry's hash half.
 const TAG: u64 = !0 << 32;
 
 impl Seen {
@@ -44,8 +43,6 @@ impl Seen {
     /// which its last multiply mixed from every value.
     #[inline]
     const fn home(&self, tag: u64) -> usize {
-        // A power-of-two length of at least 16 and below 2^32 slots: `tag >> shift` is a
-        // slot.
         (tag >> (64 - self.table.len().trailing_zeros())) as usize
     }
 
@@ -114,10 +111,6 @@ const fn key_hash(key: &[i64]) -> u64 {
     h
 }
 
-/// `0..n`, counted by a type of this crate's own. The walks loop over actions and successors
-/// once per state; a `Range<usize>` loop there runs a dependency's unoptimized copy of
-/// `Range::next` (an opt-level-1 crate links the generic copies its dependencies export rather
-/// than inlining its own), which took about a tenth of the non-vacuity sweep.
 struct Upto {
     at: usize,
     end: usize,
@@ -141,19 +134,12 @@ impl Iterator for Upto {
     }
 }
 
-/// A walk's reached states, numbered in the order first seen. Every walk here is breadth-first
-/// and queues a state exactly when it numbers it, so the numbers ARE the queue: the state to
-/// expand next is the lowest number not yet expanded, and no state is held twice.
 trait Reached<S: ?Sized>: Default {
-    /// How many states are numbered.
     fn len(&self) -> usize;
-    /// State number `i`.
     fn get(&self, i: usize) -> &S;
-    /// `s`'s number, and whether this call gave it (`false`: it had been seen).
     fn number(&mut self, s: &S) -> (usize, bool);
 }
 
-/// A compiled walk's states: each is its key, so the table holds them.
 impl Reached<[i64]> for Seen {
     fn len(&self) -> usize {
         self.len
@@ -194,36 +180,21 @@ impl Reached<State> for Kept {
     }
 }
 
-/// One walk's view of a model: how it starts, steps, checks and names a state.
 trait Walker {
-    /// A state as the walk reads it.
     type S: ?Sized + PartialEq;
-    /// The states a walk has numbered ([`Reached`]).
     type Reached: Reached<Self::S>;
-    /// The state being expanded, copied out of [`Walker::Reached`] (which grows meanwhile) into
-    /// a holder reused for every state of the walk.
     type Held: Default + std::borrow::Borrow<Self::S>;
-    /// One step's successors, in a buffer reused for every step of the walk.
     type Next: Default;
-    /// What every action and invariant at one state reads (loop-invariant
-    /// across them, so built once per expanded state — see `bmc`).
     type Env;
     fn init(&self) -> Self::Held;
-    /// Copy `s` into `held`.
     fn hold(&self, s: &Self::S, held: &mut Self::Held);
     fn env(&self, s: &Self::S) -> Self::Env;
-    /// Whether invariant `i` holds at `s`.
     fn holds(&self, env: &Self::Env, s: &Self::S, i: usize) -> bool;
-    /// Every successor of `s` under action `a`, in [`Model::successors_in`]'s order, into
-    /// `next` (replacing what it held); returns how many.
     fn successors(&self, env: &Self::Env, s: &Self::S, a: usize, next: &mut Self::Next) -> usize;
-    /// Successor `k` of the last [`Walker::successors`] into `next`.
     fn nth<'n>(&self, next: &'n Self::Next, k: usize) -> &'n Self::S;
-    /// `s` as the public [`State`].
     fn state(&self, s: &Self::S) -> State;
 }
 
-/// The model evaluated as written: [`Walker`] over `BTreeMap` states.
 struct ByName<'m>(&'m Model);
 
 impl Walker for ByName<'_> {
@@ -258,8 +229,6 @@ impl Walker for ByName<'_> {
     }
 }
 
-/// The model resolved once: [`Walker`] over value slices in sorted-name order. Every state of
-/// a compiled model binds the same names, so its values are its identity.
 impl Walker for Compiled {
     type S = [i64];
     type Reached = Seen;
@@ -289,9 +258,6 @@ impl Walker for Compiled {
     }
 }
 
-/// One breadth-first walk's working set, each part reused for the whole walk: the states
-/// numbered so far (which are also the queue, [`Reached`]), the state being expanded, and one
-/// step's successors.
 struct Walk<W: Walker> {
     reached: W::Reached,
     held: W::Held,
@@ -301,7 +267,6 @@ struct Walk<W: Walker> {
 }
 
 impl<W: Walker> Walk<W> {
-    /// A walk with `w`'s initial state numbered (0) and nothing expanded.
     fn new(w: &W) -> Self {
         let mut reached = W::Reached::default();
         reached.number(w.init().borrow());
@@ -313,8 +278,6 @@ impl<W: Walker> Walk<W> {
         }
     }
 
-    /// Hold the next state to expand, in the order numbered; `false` once every numbered state
-    /// has been expanded.
     fn pop(&mut self, w: &W) -> bool {
         if self.expanded == self.reached.len() {
             return false;
@@ -325,11 +288,11 @@ impl<W: Walker> Walk<W> {
     }
 }
 
-/// A model resolved once, for a caller that walks its space itself (a record asserted at each step, a law that must break alone, a reachability question no invariant states).
+/// A model resolved once, for a caller that walks its space itself.
 pub struct Resolved(Compiled);
 
 impl Resolved {
-    /// Resolve `m`; `None` for a model whose updates write a name its initial state does not bind (a `State` that grows a key has no fixed slice).
+    /// Resolve `m`; `None` for a model whose updates write a name its initial state does not bind.
     #[must_use]
     pub fn new(m: &Model) -> Option<Self> {
         Compiled::new(m).map(Self)
@@ -342,7 +305,6 @@ impl Resolved {
     }
 
     /// The index of state variable `name` in a state slice.
-    ///
     /// # Panics
     /// If `name` is not one of the model's state variables.
     #[must_use]
@@ -353,7 +315,7 @@ impl Resolved {
             .unwrap_or_else(|| panic!("`{name}` is not a state variable"))
     }
 
-    /// Every successor of `s` under the model's `a`-th action ([`Model::successors_in`]: the same states, in the same order).
+    /// Every successor of `s` under the model's `a`-th action.
     #[must_use]
     pub fn successors(&self, a: usize, s: &[i64]) -> Vec<Vec<i64>> {
         self.0.successors(a, s)
@@ -382,8 +344,6 @@ macro_rules! walk {
     };
 }
 
-/// Guard against a runaway state space: every derived model is bounded by construction, so
-/// crossing this many reachable states means the bounds regressed.
 const MAX_STATES: usize = 100_000;
 
 /// The BFS drivers evaluate the `&Action`/`&Invariant` they hold rather than re-resolving each
@@ -397,7 +357,7 @@ fn names_are_unique(m: &Model) -> bool {
     actions.len() == m.actions.len() && invariants.len() == m.invariants.len()
 }
 
-/// A copy of `m` with the named constants overridden (the interpreter reads constants from `m.consts`, so this is the interpreter analogue of a `.cfg` override list).
+/// A copy of `m` with the named constants overridden.
 #[must_use]
 pub fn with_consts(m: &Model, overrides: &[(&str, i64)]) -> Model {
     let mut m = m.clone();
@@ -409,14 +369,13 @@ pub fn with_consts(m: &Model, overrides: &[(&str, i64)]) -> Model {
     m
 }
 
-/// A copy of `m` with its `Buggy` constant set to `b` — the prove-and-catch protocol's variant flip.
+/// A copy of `m` with its `Buggy` constant set to `b`.
 #[must_use]
 pub fn with_buggy(m: &Model, b: i64) -> Model {
     with_consts(m, &[("Buggy", b)])
 }
 
-/// Exhaustive bounded model check: BFS the reachable state space over every action, checking every invariant at every state.
-///
+/// Exhaustive bounded model check.
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`] (a model-bounds regression, never a property of a healthy derived model).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -428,7 +387,6 @@ pub fn bmc(m: &Model) -> Result<usize, (State, &'static str)> {
 pub type BmcFired = (Result<usize, (State, &'static str)>, BTreeSet<&'static str>);
 
 /// [`bmc`], and the actions that fired (had a successor) from the states it checked.
-///
 /// # Panics
 /// As [`bmc`].
 #[cfg_attr(trust_verify, trust::skip)]
@@ -477,7 +435,6 @@ fn bmc_on<W: Walker>(m: &Model, w: &W) -> (Result<usize, (State, &'static str)>,
 }
 
 /// The prove-and-catch protocol (the `Buggy` convention), interpreter tier.
-///
 /// # Panics
 /// On an invariant violation at `Buggy = 0`, or a vacuous property (no counterexample at `Buggy = 1`).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -507,7 +464,6 @@ pub fn prove_and_catch(m: &Model) -> usize {
 }
 
 /// The invariants some reachable state of `m` violates, all of them in one walk where checking each alone costs a walk apiece.
-///
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`], or on an expression the interpreter cannot evaluate (a function-valued model).
 #[must_use]
@@ -525,7 +481,6 @@ pub fn violated_invariants(m: &Model) -> BTreeSet<&'static str> {
 }
 
 /// [`violated_invariants`] over at most the interpreter's state budget.
-///
 /// # Panics
 /// On an expression the interpreter cannot evaluate (a function-valued model).
 #[must_use]
@@ -579,7 +534,6 @@ fn violated_invariants_on<W: Walker>(
 }
 
 /// The actions that fire (have a successor from some reachable state) anywhere in `m`'s bounded space.
-///
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`] (a model-bounds regression), exactly like [`bmc`].
 #[must_use]
@@ -621,7 +575,6 @@ fn fired_actions_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
 }
 
 /// Whether each of `actions` is a VIOLATION STEP of `m`.
-///
 /// # Panics
 /// If `m` declares no action named one of `actions`, or its reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
 #[must_use]
@@ -690,7 +643,6 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
 }
 
 /// Every state reachable in `m`'s bounded space, each once, in BFS order.
-///
 /// # Panics
 /// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
 #[must_use]
@@ -760,7 +712,6 @@ fn find_deadlock_on<W: Walker>(
         if !any_succ {
             let st = w.state(st);
             if !is_final(&st) {
-                // stuck, and not a legitimate work-complete terminal
                 return Some(st);
             }
         }
@@ -780,7 +731,7 @@ pub struct Fairness<'a> {
 /// A fair behaviour that leaves the goal for good.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NonProgressCycle {
-    /// From `Init` to the loop's first state: `("Init", init)`, then one `(action, state after it)` per step.
+    /// From `Init` to the loop's first state.
     pub stem: Vec<(&'static str, State)>,
     /// The loop, from the stem's last state back to it, one `(action, state after it)` per step.
     pub cycle: Vec<(&'static str, State)>,
@@ -794,7 +745,6 @@ impl NonProgressCycle {
     /// The state the loop starts and ends at.
     #[must_use]
     pub fn entry(&self) -> &State {
-        // The stem always holds at least `("Init", init)`.
         &self.stem[self.stem.len() - 1].1
     }
 }
@@ -839,8 +789,6 @@ impl std::fmt::Display for NonProgressCycle {
     }
 }
 
-/// The whole reachable state graph, stutter steps dropped, numbered in BFS order
-/// (so a lower index is never farther from `Init`).
 struct StateGraph {
     /// Per state, `(action index, successor index)` for every step that changes
     /// the state — the steps fairness can demand.
@@ -986,13 +934,11 @@ fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, W::Reached) {
         for (a, act) in m.actions.iter().enumerate() {
             let made = w.successors(&env, st, a, &mut walk.next);
             if made > 0 {
-                // Before the stutter drop: a stutter still fires.
                 graph.fired.insert(act.name);
             }
             for k in upto(made) {
                 let ns = w.nth(&walk.next, k);
                 if ns == st {
-                    // a stutter: fairness neither demands nor credits it
                     continue;
                 }
                 let (id, new) = walk.reached.number(ns);
@@ -1038,7 +984,6 @@ fn fair_indices(m: &Model, names: &[&str], kind: &str) -> Vec<usize> {
 }
 
 /// A reachable non-progress cycle under `fairness`.
-///
 /// # Panics
 /// If `fairness` names an action the model does not declare, or names one action both weakly and strongly fair (one of the two would be dead text).
 #[must_use]
@@ -1058,7 +1003,6 @@ pub struct Space {
     walked: Walked,
 }
 
-/// Each graph state of a [`Space`], by index, in the form its walk held it.
 enum Walked {
     /// The model resolved once and each state as its value slice: a liveness
     /// goal is evaluated without building an environment map per state, and a
@@ -1069,7 +1013,6 @@ enum Walked {
 }
 
 impl Walked {
-    /// Graph state `i` as the public [`State`].
     fn state(&self, i: usize) -> State {
         match self {
             Walked::Compiled(c, walked) => c.state(walked.key(i)),
@@ -1077,7 +1020,6 @@ impl Walked {
         }
     }
 
-    /// `f` of graph state `i`, borrowed where the walk holds it as a [`State`].
     fn with_state<R>(&self, i: usize, f: impl FnOnce(&State) -> R) -> R {
         match self {
             Walked::Compiled(c, walked) => f(&c.state(walked.key(i))),
@@ -1088,7 +1030,6 @@ impl Walked {
 
 impl Space {
     /// Walk `m`'s reachable space.
-    ///
     /// # Panics
     /// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
     #[must_use]
@@ -1155,7 +1096,7 @@ impl Space {
         }
     }
 
-    /// [`find_nonprogress_cycle`] over this space's model, without walking it again (the algorithm is documented there).
+    /// [`find_nonprogress_cycle`] over this space's model, without walking it again.
     #[must_use]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn find_nonprogress_cycle(
@@ -1315,7 +1256,6 @@ pub fn admits(m: &Model, prev: &State, next: &State) -> Option<&'static str> {
 }
 
 /// The one successor of `state` under `action` whose `var` is `value`.
-///
 /// # Panics
 /// If two successors share `var == value`.
 #[must_use]
@@ -1339,9 +1279,6 @@ mod tests {
     use super::*;
     use crate::test_models::{config_catalog_snapshot_model, ring_model, subscribe_model};
 
-    /// A reported lasso must be one: every stem and loop step admitted by the action it names,
-    /// the loop closing on its entry, and the goal false on the loop — checked against the
-    /// model's own transition relation, not the checker's word.
     fn assert_lasso(m: &Model, cycle: &NonProgressCycle, goal: impl Fn(&State) -> bool) {
         assert_eq!(
             cycle.stem[0],
@@ -1368,8 +1305,6 @@ mod tests {
         assert_eq!(&at, cycle.entry(), "the loop closes on its entry");
     }
 
-    /// A lane that retries forever and never lands: every state is legal and has a successor,
-    /// so the invariant and deadlock checks both pass it.
     #[test]
     fn a_retry_loop_that_never_lands_passes_every_older_check_and_is_found() {
         let m = crate::ty_model! {
@@ -1408,8 +1343,6 @@ mod tests {
         );
     }
 
-    /// A loop reached only through several steps is reported with the run that reaches it:
-    /// the stem retraces, from `Init`, how the walk first reached each state on the way.
     #[test]
     fn a_loop_several_steps_from_init_is_reported_with_the_run_that_reaches_it() {
         let m = crate::ty_model! {
@@ -1439,8 +1372,6 @@ mod tests {
         assert_eq!(stem, [("Init", 0), ("Walk", 1), ("Walk", 2)]);
     }
 
-    /// A lane that always reaches its goal is clean — and only because of the
-    /// fairness it states.
     #[test]
     fn a_lane_that_always_lands_is_clean_and_its_fairness_is_what_makes_it_so() {
         let m = crate::ty_model! {
@@ -1469,9 +1400,6 @@ mod tests {
         );
     }
 
-    /// Fairness excludes starvation-only cycles: a loop that exists only by never taking an
-    /// action that stays enabled is not weakly fair, and one that exists only by never taking
-    /// an action whose gate it keeps passing open is not strongly fair.
     #[test]
     fn fairness_excludes_starvation_only_cycles() {
         let spin = crate::ty_model! {
@@ -1530,9 +1458,6 @@ mod tests {
         );
     }
 
-    /// Strong fairness removes the states where the gate is open, not the whole component: a
-    /// loop that never passes the gate is still a fair livelock (Emerson–Lei), while one where
-    /// every loop passes the gate lands.
     #[test]
     fn strong_fairness_keeps_a_loop_that_never_passes_the_gate() {
         let ring = crate::ty_model! {
@@ -1573,8 +1498,6 @@ mod tests {
         assert_eq!(find_nonprogress_cycle(&pair, done, &fair), None);
     }
 
-    /// A wedge short of the goal is a non-progress behaviour too (it stutters
-    /// there forever), so the check subsumes `find_deadlock` for liveness.
     #[test]
     fn a_wedge_short_of_the_goal_is_reported_as_a_stall() {
         let m = crate::ty_model! {
@@ -1596,9 +1519,6 @@ mod tests {
         assert_eq!(find_deadlock(&m, finished).map(|s| s["at"]), Some(1));
     }
 
-    /// A step that writes every variable back to its own value is a stutter
-    /// (TLA+'s `<<A>>_vars`): it is not "enabled" for fairness, so declaring it
-    /// fair forces nothing, and it is never progress.
     #[test]
     fn a_step_that_changes_nothing_is_a_stutter_not_progress() {
         let m = crate::ty_model! {
@@ -1616,9 +1536,6 @@ mod tests {
         assert!(stall.cycle.is_empty() && stall.moves.is_empty(), "{stall}");
     }
 
-    /// The iterative Tarjan pass against its definition: two states share a component exactly
-    /// when each reaches the other inside the subset asked about (the low-link hand-back to the
-    /// caller frame is easy to get wrong).
     #[test]
     fn components_are_exactly_the_mutual_reachability_classes() {
         let mut rng = crate::rng::XorShift::new(0x2545_F491_4F6C_DD1D);
@@ -1676,10 +1593,6 @@ mod tests {
         }
     }
 
-    /// One walk answers each watched action as a walk of its own would: `Some(true)` for an
-    /// action every lawful firing of which breaks a law, `Some(false)` for one a lawful firing
-    /// of which lands lawful, `None` for one that fires only where a law is already broken or
-    /// never.
     #[test]
     fn violation_steps_answer_each_action_as_its_own_walk_would() {
         let m = crate::ty_model! {
@@ -1721,8 +1634,6 @@ mod tests {
         );
     }
 
-    /// [`bmc_fired`] is [`bmc`]'s verdict, and where that verdict is `Ok` its fired set is
-    /// [`fired_actions`]' answer.
     #[test]
     fn bmc_fired_is_bmc_and_fired_actions_in_one_walk() {
         for m in [
@@ -1741,9 +1652,6 @@ mod tests {
         }
     }
 
-    /// A [`Space`] answers what the one-shot walks answer: the same cycle (or `None`) under each
-    /// fairness asked of one graph, `bmc`'s state count, and `fired_actions`' fired set,
-    /// stutters included.
     #[test]
     fn a_space_answers_what_the_one_shot_walks_answer() {
         let m = crate::ty_model! {
@@ -1808,10 +1716,6 @@ mod tests {
         assert_eq!(space.states(), 1);
     }
 
-    /// Every walk, run on the compiled form and on the model as written, gives
-    /// the same answer — and so does every single step and invariant at every
-    /// reachable state, so an agreement cannot hide behind a coincidence of
-    /// whole-walk results.
     fn assert_walks_agree(m: &Model) {
         let c = Compiled::new(m).expect("a model whose updates write declared variables");
         let by = ByName(m);
@@ -1885,8 +1789,6 @@ mod tests {
         }
     }
 
-    /// Committed models, nondeterministic ranges among them (the gui and
-    /// update models), each at both `Buggy` settings.
     #[test]
     fn compiled_walks_are_the_by_name_walks_on_committed_models() {
         use crate::test_models::{
@@ -1906,11 +1808,6 @@ mod tests {
         }
     }
 
-    /// The resolution corners no committed model happens to exercise: a state
-    /// variable shadowing a constant, a constant declared twice, a `\A` index
-    /// shadowing a variable, nested `\A`s over one index name, an inner `\A`
-    /// index read beside an outer one in one fused step, an empty range, a
-    /// range and a plain update writing the same variable, and every operator.
     #[test]
     fn compiled_walks_are_the_by_name_walks_on_the_resolution_corners() {
         use crate::derive::{
@@ -2019,8 +1916,6 @@ mod tests {
         );
     }
 
-    /// A panic the model as written raises is raised by the compiled form, with
-    /// the same message, and only when the expression is evaluated.
     #[test]
     #[should_panic(expected = "unbound identifier `nope` in model evaluation")]
     fn the_compiled_form_raises_an_unbound_identifier_when_it_reads_it() {
@@ -2041,8 +1936,6 @@ mod tests {
         let _ = c.holds(0, &[0]);
     }
 
-    /// Every read the model as written makes, the compiled form makes in the same order with
-    /// the same outcome: the same value, or the same panic at the same operand.
     #[test]
     fn the_compiled_form_reads_what_eval_reads_and_fails_where_eval_fails() {
         use crate::derive::{
@@ -2128,9 +2021,6 @@ mod tests {
         assert!(panics >= 8, "only {panics} cases panic");
     }
 
-    /// Two keys whose hashes agree in their top half (found by search) share a tag and a home
-    /// slot, and each still gets its own number: the table compares the keys behind a matching
-    /// tag.
     #[test]
     fn seen_numbers_keys_whose_tags_collide_apart_and_keeps_numbers_as_it_grows() {
         let (a, b) = (
@@ -2157,9 +2047,6 @@ mod tests {
         assert_eq!((seen.key(0), seen.key(1)), (&a[..], &b[..]));
     }
 
-    /// An update writing a name the initial state does not bind grows a
-    /// `BTreeMap` state by a key, which a slice cannot: such a model is walked
-    /// as written, never compiled into a different identity.
     #[test]
     fn a_model_writing_an_undeclared_variable_is_walked_as_written() {
         use crate::derive::{Action, StateVar, Update, int};
@@ -2183,8 +2070,6 @@ mod tests {
         assert_eq!(reachable_states(&m), reachable_on(&m, &ByName(&m)));
     }
 
-    /// A state grown by an undeclared name is told apart by its names as well as its values:
-    /// `{a: 0, b: 1}` and `{a: 0, c: 1}` are two states, and the walk expands both.
     #[test]
     fn states_grown_by_different_names_are_different_states() {
         use crate::derive::{Action, StateVar, Update, int};
@@ -2214,8 +2099,6 @@ mod tests {
         assert_eq!(bmc(&m), Ok(4));
     }
 
-    /// A fairness assumption about an action the model does not have is a typo,
-    /// never a silently weaker verdict.
     #[test]
     #[should_panic(expected = "which the model does not declare")]
     fn fairness_naming_an_undeclared_action_panics() {

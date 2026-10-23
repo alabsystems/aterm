@@ -137,7 +137,7 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Put `text` on the system pasteboard (the status item's Copy "ssh <host>").
+    /// Put `text` on the system pasteboard (the status item's Copy "`ssh <host>`").
     #[cfg_attr(
         not(target_os = "macos"),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -245,7 +245,8 @@ pub(crate) trait AppRt {
     /// Subscribe to the OS reduce-motion change notification (macOS: `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` on the workspace centre), posting [`Wake::ReduceMotionChanged`] so the main thread re-queries [`Self::reduce_motion`] and repaints.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
 
-    /// Hold App Nap off for the rest of the process's life.
+    /// Hold App Nap off for the rest of the process's life; the activity ends when the returned
+    /// token is released.
     fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
         None
     }
@@ -1357,7 +1358,9 @@ pub(crate) const fn redraw_is_exposure() -> bool {
     false
 }
 
-/// Linux/BSD application-runtime using the **pure-winit** surface (NO new system libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the deferred GTK4 work): the appearance method drives `aterm_window::Window::set_theme` so the client-side-decoration light/dark variant honours config `window_theme`.
+/// Linux/BSD application-runtime using the **pure-winit** surface (NO new system libraries): the
+/// appearance method drives `aterm_window::Window::set_theme` so the client-side-decoration
+/// light/dark variant honours config `window_theme`.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) struct AppRtLinux {
     pub(crate) probe_preferences: bool,

@@ -7,7 +7,6 @@ use crate::restore::{
     WindowLayout,
 };
 
-/// `layout_digest` keyed on the wire rather than a struct (`seamless::layout_wire_digest`).
 fn wire_digest(wire: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(LAYOUT_PROOF_DOMAIN);
@@ -16,7 +15,6 @@ fn wire_digest(wire: &str) -> [u8; 32] {
     hasher.finalize()
 }
 
-/// The digest of a re-serialization of the parsed layout.
 fn child_digest_of_wire(wire: &str) -> Option<[u8; 32]> {
     layout_digest(&RestoreManifest::from_toml(wire)?)
 }
@@ -99,7 +97,6 @@ fn realistic_layout() -> RestoreManifest {
     }])
 }
 
-/// Control: with the same build on both ends the parent's digest and the reparsed one agree.
 #[test]
 fn same_build_parent_and_child_layout_digests_agree() {
     let layout = realistic_layout();
@@ -117,9 +114,6 @@ fn same_build_parent_and_child_layout_digests_agree() {
     );
 }
 
-/// The lemma both breaks are instances of: a digest over the child's re-serialization equals the
-/// parent's iff the child's parse and re-serialize is a byte fixed point on the parent's wire,
-/// which nothing establishes across a version boundary.
 #[test]
 fn layout_digest_equality_is_exactly_wire_fixed_pointness() {
     let modern = realistic_layout().to_toml().expect("serialize");
@@ -157,10 +151,6 @@ fn live_checkpoint() -> aterm_core::terminal::TerminalCheckpoint {
     t.checkpoint_visible().expect("parser is Ground")
 }
 
-/// The degrade arm's premise: re-carrying at 0 cures a shape refusal, because a visible-only carry
-/// is canonical by construction even when the inactive grid holds a scrollback-bearing saved
-/// primary. Both halves: the carried capture is refused, the visible-only capture of the same
-/// terminal is not.
 #[test]
 fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
     let mut t = aterm_core::terminal::Terminal::new(49, 131);
@@ -198,9 +188,6 @@ fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
     screen_digest(&[(0, visible_only)]).expect("and the digest commits it");
 }
 
-/// The refusal names which check refused, which session, and which of its two grids. The blob
-/// here has more records than the wire allows the inactive grid, whose history is unrepresentable
-/// because the single `history_lines` beside it describes the main blob.
 #[test]
 fn an_over_long_inactive_grid_blob_names_itself() {
     let mut cp = live_checkpoint();
@@ -229,8 +216,6 @@ fn an_over_long_inactive_grid_blob_names_itself() {
     );
 }
 
-/// Control for the screen side: same build, so the parent's digest and one over the child's
-/// reconstructed checkpoint agree.
 #[test]
 fn same_build_parent_and_child_screen_digests_agree() {
     let cp = live_checkpoint();
@@ -252,10 +237,6 @@ fn same_build_parent_and_child_screen_digests_agree() {
     );
 }
 
-/// The colour and shell-integration carry crosses the real wire: parsed by the strict child
-/// parser, reassembled and adopted intact, with the screen digest a fixed point. An untouched
-/// session's key set is pinned exactly: no `color` or `shell` key, `absolute_row_counter` always
-/// (a live grid's counter is at least its rows), `output_state` once it has printed.
 #[test]
 fn colour_and_shell_state_cross_the_meta_wire() {
     let plain = live_checkpoint();
@@ -333,13 +314,6 @@ fn colour_and_shell_state_cross_the_meta_wire() {
     );
 }
 
-/// What a shell's prompt left pending about its cwd crosses the REAL wire
-/// (docs/DESIGN-cwd-reports-2026-10-19.md): that the shell signs its own report, the cwd a
-/// key-bound program's report replaced (restored once the successor's host
-/// says the program left the foreground), and a report held at the prompt of
-/// a shell that does not sign (applied at the successor's next `A`). Each is
-/// in the meta JSON, the strict child parser reads it back, and the adopted
-/// engine acts on it.
 #[test]
 fn the_prompts_pending_cwd_crosses_the_meta_wire() {
     use aterm_core::terminal::{ShellIntegrationNonce, Terminal};
@@ -424,11 +398,6 @@ fn the_prompts_pending_cwd_crosses_the_meta_wire() {
     assert_eq!(adopted.current_working_directory(), Some("/home/me/src"));
 }
 
-/// The parser carry crosses the real wire: a session parked inside `ESC [ 38;5;19` is carried at
-/// the Full rung with its partial CSI in the meta's additive `parser` key; the strict child parser
-/// reads it, the screen digest is a fixed point over it and covers it, and the adopted engine
-/// finishes the sequence with the queued `6m`. A meta without the key still parses and adopts at
-/// Ground.
 #[test]
 fn a_partial_parser_crosses_the_meta_wire_inside_the_digest() {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
@@ -492,12 +461,6 @@ fn a_partial_parser_crosses_the_meta_wire_inside_the_digest() {
     assert!(screen_digest_refs(vec![(0, &old)]).is_ok());
 }
 
-/// A DCS header crosses the meta wire both ways. A session parked inside `ESC P $` (a DECRQSS
-/// whose `qm ESC \` is still queued) carries the header under the parser key's `exact`, beside
-/// the `DcsIgnore` an older build writes for every header: this build reads `exact`, the screen
-/// digest covers it, and the adopted engine answers the query. An older build drops `exact` and
-/// restores its own `DcsIgnore`, which swallows the string so the payload never prints; an older
-/// producer's meta adopts here the same way.
 #[test]
 fn a_dcs_header_crosses_the_meta_wire_both_ways() {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
@@ -571,12 +534,6 @@ fn a_dcs_header_crosses_the_meta_wire_both_ways() {
     );
 }
 
-/// The engine's in-flight output state crosses the real wire: the REP character, an open OSC 8
-/// link, an SGR 58 underline colour, a VT52 address in progress, a ZWJ waiting for its emoji, the
-/// XTPUSHSGR stack (whole and selective) and an XTSAVE'd mode, carried at the Full rung in the
-/// meta's additive `output_state` key, each finish the queued tail as one engine fed the whole
-/// stream does. The screen digest is a fixed point over it and covers it. A meta without the key
-/// still parses and adopts with none of it.
 #[test]
 fn the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest() {
     use aterm_core::terminal::Terminal;
@@ -694,10 +651,6 @@ fn the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest() {
     }
 }
 
-/// An `output_state` this build cannot read (a wrong type, a REP character
-/// that is not one character) costs that state and nothing else: the meta
-/// still parses, the session is adopted with its screen, and it resumes with
-/// none of the in-flight state, as from a producer that wrote no key.
 #[test]
 fn an_unreadable_output_state_costs_only_itself() {
     let cp = live_checkpoint();
@@ -727,11 +680,6 @@ fn an_unreadable_output_state_costs_only_itself() {
     }
 }
 
-/// Cross-version break 4: `parse_checkpoint_meta` demands every key in
-/// [`CHECKPOINT_META_REQUIRED_KEYS`], so a wire missing one does not parse. That costs the
-/// session's screen and nothing else: it adopts onto a blank engine at its pane's geometry and
-/// repaints. Still a break (every tab repainting on every hop is not seamless), which is why the
-/// list is frozen (next test).
 #[test]
 fn cross_version_missing_required_meta_key_costs_the_screen_not_the_adoption() {
     let cp = live_checkpoint();
@@ -780,10 +728,9 @@ fn cross_version_missing_required_meta_key_costs_the_screen_not_the_adoption() {
     assert_eq!(used_cells, 0, "a screen that is not decoded is not charged");
 }
 
-/// The required key list is frozen, pinned verbatim: it may only shrink (delete a line here and in
-/// [`CHECKPOINT_META_REQUIRED_KEYS`] together). The producer of every handoff is the older build,
-/// so a key added to the list is one no producer in the field sends, and every tab would arrive
-/// without a parseable meta and repaint on every hop. A new meta field is additive
+/// The required key list may only shrink (delete a line here and in
+/// [`CHECKPOINT_META_REQUIRED_KEYS`] together): the producer of every handoff is the older build,
+/// so a key added to the list is one no producer in the field sends. A new meta field is additive
 /// (`#[serde(default)]` on `CheckpointMeta`), never required.
 #[test]
 fn the_required_meta_keys_are_frozen() {
@@ -812,9 +759,6 @@ fn the_required_meta_keys_are_frozen() {
     );
 }
 
-/// The child proves with its own `build_info::build_number()` and `build_info::git_commit()`; the
-/// parent expects the apply ticket's `target_build`/`target_commit`. Any disagreement breaks the
-/// proof.
 #[test]
 fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     let ids = [(0u64, 7i32, 4242i32)];
@@ -858,10 +802,9 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     );
 }
 
-/// The tripwire for the frozen cross-version wire, and the one test here that does not compare
-/// [`adoption_proof`] against itself: a changed domain string, a reordered field, a dropped length
-/// prefix or a different [`normalize_commit`] keeps every self-consistent test green while the two
-/// builds compute different digests (an `AdoptionMismatch`; see [`adoption_proof`]).
+/// The tripwire for the frozen cross-version wire: a changed domain string, a reordered field, a
+/// dropped length prefix or a different [`normalize_commit`] keeps every self-consistent test green
+/// while the two builds compute different digests.
 #[test]
 fn the_v1_adoption_digest_is_frozen_to_this_exact_vector() {
     const FROZEN: &str = "9f32e4a273bbb14fb95b80b90788b41fce5cbfbc9fff94051934eb9b7d78ccbd";

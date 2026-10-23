@@ -9,13 +9,10 @@ use crate::harness::upgrade::{
     gate_release, gate_restart, next_step, ready_since, requested_step,
 };
 
-/// The recorded conversation, target and salt (from its state file:
-/// `"salt":1790373062`, `"to":"2.1.283"`).
 const INCIDENT_SESSION: &str = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
 const INCIDENT_SALT: u64 = 1_790_373_062;
 const INCIDENT_TAB: &str = "s-b5cf2faabac5ce5127bd";
 
-/// The ledger's four announcements (`t`, marker), UTC.
 const LEDGER: [(u64, &str); 4] = [
     (1_790_485_402, "ATERM-UPGRADE-READY-cd35db51"),
     (1_790_487_206, "ATERM-UPGRADE-READY-86dddca2"),
@@ -23,13 +20,10 @@ const LEDGER: [(u64, &str); 4] = [
     (1_790_490_814, "ATERM-UPGRADE-READY-12cbabd0"),
 ];
 
-/// The state file aterm 0.93.0 left, byte for byte.
 const OWNERS_STATE: &str = r#"{"asks":0,"at":0,"confirm_by":0,"from":"2.1.281","last_seq":766968,"launch_model":"","line":"","mark":0,"marker":"ATERM-UPGRADE-READY-12cbabd0","model_before":"","noted":"","notice_pid":4205,"notice_start":"Thu Sep 24 04:27:57 2026","phase":"failed","pid":0,"resumed_on":"","resumed_pid":0,"salt":1790373062,"seq_since":1790519879,"shell":0,"source":"managed","tab":"s-b5cf2faabac5ce5127bd","to":"2.1.283","why":"unanswered"}"#;
 
-/// Where the recorded rows ran (the home directory rewritten).
 const CWD: &str = "/Users//owner/aterm/.claude/worktrees/harness-upgrade";
 
-/// The keys every row of the recorded transcript carries after its own.
 fn tail_keys(ts: &str, session: &str) -> String {
     format!(
         r#""timestamp":"{ts}","userType":"external","entrypoint":"cli","cwd":"{CWD}","sessionId":"{session}","version":"2.1.281","gitBranch":"docs/keeper-approved","slug":"shimmying-wibbling-salamander""#
@@ -40,8 +34,6 @@ fn json_str(text: &str) -> String {
     aterm_json::to_string(&Value::from(text)).expect("json")
 }
 
-/// A turn typed into the composer (`origin` `human` for a person's, the
-/// supervisor's and the upgrade's alike).
 fn typed_row(ts: &str, session: &str, text: &str, source: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000002","type":"user","message":{{"role":"user","content":{}}},"uuid":"00000000-0000-4000-8000-000000000003","permissionMode":"bypassPermissions","origin":{{"kind":"human"}},"promptSource":"{source}","turnOrigin":"human",{}}}"#,
@@ -50,7 +42,6 @@ fn typed_row(ts: &str, session: &str, text: &str, source: &str) -> String {
     )
 }
 
-/// A `/loop` wakeup's `continue` (`isMeta`, `turnOrigin` `scheduled`).
 fn scheduled_row(ts: &str, session: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-000000000004","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000005","type":"user","message":{{"role":"user","content":"continue"}},"isMeta":true,"uuid":"00000000-0000-4000-8000-000000000006","permissionMode":"bypassPermissions","promptSource":"system","scheduledTaskId":"00000001","scheduledFireId":"00000000-0000-4000-8000-000000000004","turnOrigin":"scheduled","queuePriority":"later","queueSkipAttachments":true,{}}}"#,
@@ -58,7 +49,6 @@ fn scheduled_row(ts: &str, session: &str) -> String {
     )
 }
 
-/// A background workflow's completion (`origin` `task-notification`).
 fn notification_row(ts: &str, session: &str) -> String {
     let text = "<task-notification>\n<task-id>w0000001</task-id>\n<status>completed</status>\n<summary>Dynamic workflow \"keeper phases\" completed</summary>\n</task-notification>";
     format!(
@@ -68,10 +58,6 @@ fn notification_row(ts: &str, session: &str) -> String {
     )
 }
 
-/// The login wall as Claude Code 2.1.281 writes it: a `<synthetic>` assistant
-/// row, `isApiErrorMessage` and `error` `authentication_failed`, its one text
-/// `Login expired · Please run /login` (every turn from 05:00:24 to 14:33:36
-/// UTC ended on one, 45-86 ms after it began).
 fn auth_wall_row(ts: &str, session: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-00000000000a","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-8000-00000000000b","message":{{"diagnostics":null,"id":"00000000-0000-4000-8000-00000000000c","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"Login expired · Please run /login"}}],"context_management":null}},"error":"authentication_failed","isApiErrorMessage":true,"perTurnEffort":"xhigh","session_id":"{session}",{}}}"#,
@@ -86,8 +72,6 @@ fn duration_row(ts: &str, session: &str, ms: u64) -> String {
     )
 }
 
-/// What a person's `/login` writes once the browser sign-in is done: the
-/// caveat (`isMeta`), the command and its output.
 fn login_rows(ts: &str, session: &str) -> [String; 3] {
     let caveat = "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>";
     let command = "<command-name>/login</command-name>\n            <command-message>login</command-message>\n            <command-args></command-args>";
@@ -110,8 +94,6 @@ fn login_rows(ts: &str, session: &str) -> [String; 3] {
     ]
 }
 
-/// A row of the session's own model saying `text` (the agent's prose is
-/// the owner's and is paraphrased; the READY line is verbatim).
 fn model_row(ts: &str, session: &str, text: &str, stop: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-00000000000f","isSidechain":false,"message":{{"model":"claude-opus-5-5","id":"msg_0000000000000000000001","type":"message","role":"assistant","content":[{{"type":"text","text":{}}}],"container":null,"stop_reason":"{stop}","stop_sequence":null,"stop_details":null,"usage":{{"input_tokens":2,"output_tokens":40}},"input_transformations":[],"diagnostics":null,"context_management":null}},"apiBlockIndex":1,"requestId":"req_0000000000000000000001","type":"assistant","uuid":"00000000-0000-4000-8000-000000000010","advisorModel":"claude-opus-5-5","effort":"xhigh","perTurnEffort":"xhigh","session_id":"{session}",{}}}"#,
@@ -120,7 +102,6 @@ fn model_row(ts: &str, session: &str, text: &str, stop: &str) -> String {
     )
 }
 
-/// A tool's result, as Claude Code writes it between two model rows.
 fn tool_result_row(ts: &str, session: &str) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-000000000011","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000012","type":"user","message":{{"role":"user","content":[{{"tool_use_id":"toolu_0000000000000000000001","type":"tool_result","content":"(the worktrees' state)","is_error":false}}]}},"uuid":"00000000-0000-4000-8000-000000000013","sourceToolAssistantUUID":"00000000-0000-4000-8000-00000000000f","session_id":"{session}",{}}}"#,
@@ -128,8 +109,6 @@ fn tool_result_row(ts: &str, session: &str) -> String {
     )
 }
 
-/// The upgrade's notice with `marker`, as 0.93.0 typed it (the same text
-/// this build types).
 fn notice_text(marker: &str) -> String {
     upgrade::prepare_prompt(
         &Version::parse("2.1.281").expect("from"),
@@ -139,9 +118,6 @@ fn notice_text(marker: &str) -> String {
     )
 }
 
-/// The recorded rows, 05:00:24 to 14:34:21 UTC (shape only: every key, nesting
-/// and type and the vendor's and harness's texts kept; ids, paths and the
-/// agent's prose rewritten), for the conversation `session`.
 fn incident(session: &str, upto: usize, login: bool) -> String {
     let wall = |ts_in: &str, ts_out: &str, ms: u64| {
         [
@@ -230,9 +206,6 @@ fn incident(session: &str, upto: usize, login: bool) -> String {
     rows.join("\n") + "\n"
 }
 
-/// The screen the session showed at the wall, as `text --json` answers it:
-/// [`aterm_phase::prompt::fixtures::LOGIN_EXPIRED`], the caret at column 2, no
-/// person's input.
 fn walled_screen_json() -> String {
     let rows = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
     screen_json(&rows)
@@ -250,9 +223,6 @@ fn screen_json(rows: &[String]) -> String {
     )
 }
 
-/// A stand-in agent in [`TAB`] whose argv a relaunch can carry: this test
-/// binary, parked, with the filter alone (a positional; `--exact` is a flag
-/// the plan refuses).
 fn stand_in() -> Command {
     let mut c = Command::new(std::env::current_exe().expect("exe"));
     c.arg(PARK[0])
@@ -265,7 +235,6 @@ fn stand_in() -> Command {
     c
 }
 
-/// Targets holding the recorded target build.
 fn to_2_1_283() -> Targets {
     Targets {
         managed: Some(Candidate {
@@ -363,8 +332,6 @@ fn visit_at(
     }
 }
 
-/// The screen once the person's `/login` is done: its command and output
-/// under the wall, the composer empty.
 fn logged_in_rows() -> Vec<String> {
     let mut rows =
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
@@ -387,20 +354,12 @@ fn logged_in_screen_json() -> String {
     screen_json(&logged_in_rows())
 }
 
-/// The recorded screen seq (the state's `last_seq`): a screen that has not
-/// moved since the state was written.
 const OWNERS_SEQ: &str = r#""seq":766968"#;
 
-/// `screen` (`text --json`) at the owner's seq.
 fn at_owners_seq(screen: String) -> String {
     screen.replace(r#""seq":77"#, OWNERS_SEQ)
 }
 
-/// The owner's state file with the stand-in's pid and start where 0.93.0's
-/// notice named the owner's (4205, `Thu Sep 24 04:27:57 2026`), and the
-/// stand-in's tab and running build (the stand-in runs 1.0.0, and a record
-/// an older build wrote names its process by the build it was found behind):
-/// every other byte as read.
 fn owners_state_for(sf: &SessionFile) -> St {
     let text = OWNERS_STATE
         .replace(r#""from":"2.1.281""#, r#""from":"1.0.0""#)
@@ -413,8 +372,6 @@ fn owners_state_for(sf: &SessionFile) -> St {
     St::from_json(&text).expect("the owner's state reads")
 }
 
-/// A state of the recorded upgrade: `phase`, the round's first `asks` markers
-/// typed, the notice's fences on the stand-in.
 fn incident_state(phase: Phase, asks: usize) -> impl FnOnce(&SessionFile, u64) -> St {
     move |sf, now| {
         let asked: Vec<String> = LEDGER[..asks].iter().map(|(_, m)| m.to_string()).collect();
@@ -441,8 +398,6 @@ fn incident_state(phase: Phase, asks: usize) -> impl FnOnce(&SessionFile, u64) -
     }
 }
 
-/// The recorded rows up to the person's `/login` and its output: the login
-/// back, the agent not yet asked anything.
 fn up_to_the_login(upto: usize) -> String {
     let all = incident(INCIDENT_SESSION, upto, true);
     let cut = all
@@ -452,17 +407,14 @@ fn up_to_the_login(upto: usize) -> String {
     all[..=cut].to_string()
 }
 
-/// `epoch` as a transcript's `timestamp`.
 fn ts(epoch: u64) -> String {
     crate::harness::usage::rfc3339_utc(i64::try_from(epoch).expect("epoch"))
 }
 
-/// The unix second of one of the recorded stamps.
 fn at(stamp: &str) -> u64 {
     crate::harness::upgrade_models::parse_utc(stamp).expect("a stamp")
 }
 
-/// The facts of an idle, settled Claude at an empty composer, nobody at it.
 fn idle() -> Facts {
     Facts {
         status: "idle".to_string(),
@@ -473,9 +425,6 @@ fn idle() -> Facts {
     }
 }
 
-/// The login wall is read from the screen (the supervisor's wall recogniser) and the transcript
-/// (its last word on the login: the `authentication_failed` row, lifted by `Login successful` or
-/// a model's answer).
 #[test]
 fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
@@ -571,20 +520,14 @@ fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     );
 }
 
-/// A second recorded session (Claude Code 2.1.283): its rows' shared keys,
-/// home, branch and slug rewritten.
 fn keys_2_1_283(ts: &str) -> String {
     format!(
         r#""timestamp":"{ts}","userType":"external","entrypoint":"cli","cwd":"/Users//owner/aterm","sessionId":"{OTHER_SESSION}","version":"2.1.283","gitBranch":"main","slug":"rewritten-slug""#
     )
 }
 
-/// That session's conversation.
 const OTHER_SESSION: &str = "07e2381c-db77-4897-bfb1-0e1d5acd881d";
 
-/// A local command's row as Claude Code 2.1.283 writes it: a `system` row,
-/// `subtype` `local_command`, the text in a top-level `content`, not the
-/// caveat-first `user` row 2.1.281 writes.
 fn local_command_2_1_283(ts: &str, content: &str, run: bool) -> String {
     let run = if run {
         r#""commandRun":{"command":"login","args":""},"#
@@ -598,8 +541,6 @@ fn local_command_2_1_283(ts: &str, content: &str, run: bool) -> String {
     )
 }
 
-/// The login as Claude Code 2.1.283 writes it (two `system`/`local_command` rows with a top-level
-/// `content`: the `/login`, then `Login successful`) lifts the wall at `Login successful`.
 #[test]
 fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
     let asked = format!(
@@ -641,9 +582,6 @@ fn the_login_as_2_1_283_writes_it_lifts_the_wall() {
     assert_eq!(upgrade::login_lifted_at(&other), None);
 }
 
-/// Which notice reached the model: over the recorded rows, each of the four
-/// notices' own turn was the login wall's, before the login and after it (the
-/// model's later READY answered the last notice as history).
 #[test]
 fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
     for upto in 1..=4 {
@@ -701,11 +639,6 @@ fn a_notice_answered_only_by_the_wall_never_reached_the_model() {
     assert_eq!(upgrade::notice_fate(&again, marker), Some(false));
 }
 
-/// A session at the login wall is never asked, and nothing of the upgrade's
-/// is spent there: every gate waits `login` (the owner's `--now` and a break
-/// of background work included), with no re-ask, give-up, void or restart, and
-/// an announced upgrade's clock (and the READY's) restarts at every look that
-/// finds the wall.
 #[test]
 fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
     let wall = Facts {

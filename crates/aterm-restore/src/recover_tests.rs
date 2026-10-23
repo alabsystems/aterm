@@ -17,7 +17,6 @@ const WRITER: WriterIdentity<'static> = WriterIdentity {
 
 const CONFIG: u64 = 0x5EED;
 
-/// A live engine and the writer journaling it, as the parse thread runs them.
 struct Live {
     term: Terminal,
     writer: JournalWriter<VecStore>,
@@ -41,7 +40,6 @@ impl Live {
         Self::new(rows, cols, Geometry::v1())
     }
 
-    /// A slice read, processed and appended, as the reader does.
     fn slice(&mut self, bytes: &[u8]) {
         self.gathered += bytes.len() as u64;
         self.writer.set_gathered(self.gathered).expect("gathered");
@@ -85,8 +83,6 @@ fn restored(r: Recovery) -> Restored {
     }
 }
 
-/// The visible state a person sees: the restored checkpoint, rebuilt and projected
-/// without history.
 fn visible(c: &TerminalCheckpoint) -> TerminalCheckpoint {
     Terminal::from_checkpoint(c)
         .checkpoint_journal(0)
@@ -94,8 +90,6 @@ fn visible(c: &TerminalCheckpoint) -> TerminalCheckpoint {
         .without_seed_lineage()
 }
 
-/// A session restored from its region is the live session: the keyframe plus the
-/// replayed tail, exact, with nothing lost.
 #[test]
 fn a_restore_is_the_live_session() {
     let mut live = Live::v1(6, 40);
@@ -125,7 +119,6 @@ fn a_restore_is_the_live_session() {
     small.slice(b"abcdefgh");
     small.keyframe(0);
     for bytes in [&b"0123456789abcdef"[..], b"\r\n0123456789abcd", b"t"] {
-        // [24, 56), [56, 88), an 8-byte gap, then [96, 120)
         small.slice(bytes);
     }
     let r = restored(small.recover(true));
@@ -138,17 +131,11 @@ fn a_restore_is_the_live_session() {
     );
 }
 
-/// The cursor and the visible rows a person sees.
 fn screen_of(t: &Terminal) -> ((u16, u16), String) {
     let cursor = t.cursor();
     ((cursor.row, cursor.col), t.visible_content())
 }
 
-/// A kitty-graphics command in the tail is never called exact, because what it does
-/// depends on state no keyframe carries: an image transmitted before the keyframe and
-/// placed after it, and a chunked transmission the keyframe cut, each place an image live
-/// (moving the cursor by the rows it spans, so the text after it lands lower) and fail in
-/// the replay (the image store and the chunk under way are not in the checkpoint).
 #[test]
 fn a_kitty_command_in_the_tail_is_never_called_exact() {
     let cases: [(&str, &[u8], &[u8]); 2] = [
@@ -189,10 +176,6 @@ fn a_kitty_command_in_the_tail_is_never_called_exact() {
     );
 }
 
-/// A Kitty unscroll in the tail is never called exact: it pulls the newest history lines
-/// onto the screen, and the scratch engine holds only the keyframe's bridge as its
-/// history (here none, as a caught-up history ring leaves it), so the replay scrolls in
-/// blank rows where the live engine pulled lines.
 #[test]
 fn a_kitty_unscroll_in_the_tail_is_never_called_exact() {
     let shell = || {
@@ -226,10 +209,6 @@ fn a_kitty_unscroll_in_the_tail_is_never_called_exact() {
     );
 }
 
-/// The checkpoint carries no shell-integration nonce, but the replay depends on whether
-/// one was in use: an OSC 7 a background job prints while an authenticated shell sits at
-/// its prompt is HELD live (it waits for the shell's next prompt, and the shell's `C`
-/// drops it), and lands at once in an engine with no nonce in use.
 #[test]
 fn a_cwd_report_held_at_an_authenticated_prompt_stays_held_in_the_replay() {
     const NONCE: [u8; 32] = [0x3C; 32];
@@ -292,9 +271,6 @@ fn a_cwd_report_held_at_an_authenticated_prompt_stays_held_in_the_replay() {
     );
 }
 
-/// Without the tail (the keeper's second try) the keyframe alone comes back, its tail
-/// counted as unreplayed; with a config the restorer does not run, a replayed tail is not
-/// exact.
 #[test]
 fn the_keyframe_alone_and_a_foreign_config_are_not_exact() {
     let mut live = Live::v1(4, 30);
@@ -334,9 +310,6 @@ fn the_keyframe_alone_and_a_foreign_config_are_not_exact() {
     assert_eq!(foreign.losses, Losses::default(), "nothing else was lost");
 }
 
-/// A host setter after the newest keyframe (its fingerprint stored in the setter's own
-/// hold) that no keyframe followed costs exactness, counted as `config_moved`: the tail
-/// past the keyframe may hold bytes processed under the new settings.
 #[test]
 fn a_setter_after_the_keyframe_is_counted_until_a_keyframe_follows() {
     use crate::writer::{store_cell_px, store_config_fp};
@@ -389,8 +362,6 @@ fn a_setter_after_the_keyframe_is_counted_until_a_keyframe_follows() {
     assert_eq!(read_header(&dead).map(|h| h.cell_px), Ok(Some((18, 36))));
 }
 
-/// A tail that overflowed past the keyframe is not replayed onto it (replaying the rest
-/// would skip bytes): the keyframe alone comes back, the overflow counted.
 #[test]
 fn an_overflowed_tail_is_counted_never_replayed_across_a_gap() {
     let geometry = Geometry::custom(64 * 1024, 256, 4096).expect("a small tail");
@@ -413,7 +384,6 @@ fn an_overflowed_tail_is_counted_never_replayed_across_a_gap() {
     );
 }
 
-/// Bytes the gather thread read and the parse thread never committed are counted.
 #[test]
 fn gathered_but_unprocessed_bytes_are_counted() {
     let mut live = Live::v1(4, 30);
@@ -426,11 +396,6 @@ fn gathered_but_unprocessed_bytes_are_counted() {
     assert!(!r.exact);
 }
 
-/// A region a memory shed superseded is never called exact, whichever rung reads it: the
-/// SUPERSEDED record it ends with is counted where the walk meets it, replayed or not, and
-/// the screen it held is still the screen it restores (what a window that died before the
-/// keeper took the new region's COMPANION gets back, pulsed to redraw over it), wherever
-/// in the ring it lands.
 #[test]
 fn a_superseded_region_restores_its_screen_and_is_never_exact() {
     let mut live = Live::v1(4, 30);
@@ -461,17 +426,12 @@ fn a_superseded_region_restores_its_screen_and_is_never_exact() {
     let geometry = Geometry::custom(64 * 1024, 96, 4096).expect("a test layout");
     let mut small = Live::new(4, 30, geometry);
     for bytes in [&b"ab"[..], b"cd", b"0123456789"] {
-        // 24, 24 and 32 bytes: [0, 80)
         small.slice(bytes);
     }
     small.writer.append_superseded().expect("[80, 96)");
     assert!(restored(small.recover(true)).losses.superseded);
 }
 
-/// A region that takes a session's journal over mid-stream (the memory shed's replacement)
-/// continues the stream count: the gather thread's running count it inherits counts from
-/// the session's first byte, and the restore counts in flight only what was gathered and
-/// never processed.
 #[test]
 fn a_region_resumed_mid_stream_counts_in_flight_only_what_it_missed() {
     let geometry = Geometry::v1();
@@ -525,9 +485,6 @@ fn a_region_resumed_mid_stream_counts_in_flight_only_what_it_missed() {
     assert_eq!(r.losses.in_flight_lost, 64, "only what it missed");
 }
 
-/// A shed history ring reads as no history, never as a fault: its cap is 0, which a reader
-/// refuses under any run, and the ring holds none; a run found under a cap of 0 (a writer
-/// that exported into a shed ring, which the window's never does) is refused, not read.
 #[test]
 fn a_shed_ring_reads_as_no_history_and_a_run_under_it_is_refused() {
     let geometry = Geometry::custom(64 * 1024, 64 * 1024, 4096).expect("a small ring");
@@ -578,8 +535,6 @@ fn a_shed_ring_reads_as_no_history_and_a_run_under_it_is_refused() {
     );
 }
 
-/// A resize the host applied with no output after it (so no RESIZE record) is counted,
-/// as is a mark the keyframe budget left in the tail and a lost resize.
 #[test]
 fn unjournaled_resizes_lost_resizes_and_left_marks_are_counted() {
     let mut live = Live::v1(4, 30);
@@ -657,7 +612,6 @@ fn unjournaled_resizes_lost_resizes_and_left_marks_are_counted() {
     assert!(!r.exact);
 }
 
-/// A region that is no journal, or a journal with no valid keyframe, takes the META rung.
 #[test]
 fn no_header_or_no_keyframe_is_the_meta_rung() {
     let blank = VecStore::new(Geometry::v1().region_len);
@@ -747,9 +701,6 @@ fn no_header_or_no_keyframe_is_the_meta_rung() {
     assert_eq!(read_header(&dead).map(|h| h.ctl_count), Ok(5_101));
 }
 
-/// The history ring's run comes back across its wrap, in order, under its identity; its
-/// admission holds when nothing moved the identity, and is refused across a clear in the
-/// replayed tail or a ring left under an older identity.
 #[test]
 fn the_ring_run_reads_back_and_its_admission_checks_identity() {
     let geometry = Geometry::custom(64 * 1024, 64 * 1024, 2048).expect("a small ring");
@@ -818,8 +769,6 @@ fn the_ring_run_reads_back_and_its_admission_checks_identity() {
     assert!(!stale.history_admissible(), "never from an older identity");
 }
 
-/// Panic-free on any bytes: random regions, and a valid region with random bytes
-/// overwritten anywhere, recover to a screen or the META rung and never panic.
 #[test]
 fn recovery_is_panic_free_on_any_bytes() {
     let geometry = Geometry::custom(16 * 1024, 2048, 2048).expect("a small region");
@@ -913,9 +862,6 @@ fn recovery_is_panic_free_on_any_bytes() {
     }
 }
 
-/// A writer stopped between a floor that evicted the whole tail window and the commit of
-/// the record it made room for leaves a floor past the commit: the keyframe's tail is
-/// gone, which is an overflow (counted, the keyframe alone), not damage.
 #[test]
 fn a_death_after_a_floor_that_evicted_everything_is_an_overflow() {
     let geometry = Geometry::custom(64 * 1024, 64, 4096).expect("a one-record ring");
@@ -977,9 +923,6 @@ fn a_death_after_a_floor_that_evicted_everything_is_an_overflow() {
     );
 }
 
-/// A tail damaged or torn where corruption or a stopped writer leaves it: each row is a
-/// valid region (a keyframe at tail position 24, stream 8, a 96-byte ring) whose tail
-/// words and bytes are replaced.
 #[test]
 fn a_damaged_tail_stops_at_its_first_fault_and_counts_the_rest() {
     use aterm_core::grid::ResizePolicy;
@@ -1105,8 +1048,6 @@ fn a_damaged_tail_stops_at_its_first_fault_and_counts_the_rest() {
     }
 }
 
-/// Header words are absolute counters, not wrapping ring offsets. Both the skipped
-/// tail gap and history wrap must refuse an unrepresentable next boundary.
 #[test]
 fn absolute_ring_counters_refuse_wraparound_without_reading_it() {
     let geometry = Geometry::custom(64 * 1024, 256, 2048).expect("small region");
@@ -1197,8 +1138,6 @@ fn absolute_ring_counters_refuse_wraparound_without_reading_it() {
     assert_eq!(outcomes, vec![true; 6]);
 }
 
-/// An early damaged record may salvage a validated prefix, never an unchecked
-/// identity or a gap hidden in that prefix.
 #[test]
 fn every_salvaged_history_prefix_is_valid_before_admission() {
     use crate::records::encode_history_chunk;
@@ -1350,11 +1289,6 @@ fn every_salvaged_history_prefix_is_valid_before_admission() {
     }
 }
 
-/// A verified mark's slice is counted before its append, so a writer that dies after the
-/// append and before the K6 keyframe the mark triggers commits (before its begin, or
-/// inside its encode and copy, once a prompt) restores as NOT exact with the mark
-/// counted, never as exact without the prompt's state; once that keyframe commits, the
-/// restore holds the mark and is exact.
 #[test]
 fn a_death_before_a_marks_keyframe_counts_the_mark() {
     use crate::policy::{KeyframePolicy, Reason};
@@ -1419,10 +1353,6 @@ fn a_death_before_a_marks_keyframe_counts_the_mark() {
     );
 }
 
-/// A replay that ends inside a sequence the restored engine can only swallow is not
-/// exact, whatever else held: an APC whose consumer started (a kitty-graphics query the
-/// live engine answers at its terminator, the restored one never) is counted, and the
-/// restored engine swallows the rest of it rather than print it.
 #[test]
 fn a_replay_ending_inside_a_swallowed_sequence_is_not_exact() {
     let mut live = Live::v1(6, 40);
@@ -1448,10 +1378,6 @@ fn a_replay_ending_inside_a_swallowed_sequence_is_not_exact() {
     );
 }
 
-/// A replay that ends inside a hooked DCS query (whose reply lives in its handler, so no
-/// carry holds it) restores the screen the replay reached, the query swallowed and
-/// counted, not the keyframe alone: a keyframe from before an ED3 the tail replayed would
-/// bring back the screen and the history the clear removed.
 #[test]
 fn a_replay_ending_inside_a_query_keeps_what_it_replayed() {
     let mut live = Live::new(6, 40, Geometry::v1());
@@ -1486,8 +1412,6 @@ fn a_replay_ending_inside_a_query_keeps_what_it_replayed() {
     );
 }
 
-/// A writer that dies anywhere inside a history append leaves a ring run that is the run
-/// before the append or the run after it: never empty where both were whole.
 #[test]
 fn a_death_inside_a_history_append_keeps_the_committed_run() {
     use crate::store::CountdownStore;
@@ -1584,10 +1508,6 @@ fn a_death_inside_a_history_append_keeps_the_committed_run() {
     assert!(windows > 50, "{windows} death points");
 }
 
-/// A resize a keyframe absorbed (the capture seeds the journal's watermark to the
-/// engine's ordinal, so no RESIZE record follows it) is journaled by that keyframe: only
-/// RESIZE records past the keyframe's `tail_from` speak for later resizes, and an older
-/// record before it says nothing about the host's word.
 #[test]
 fn a_resize_the_keyframe_absorbed_is_not_unjournaled() {
     let mut live = Live::v1(6, 30);
@@ -1619,8 +1539,6 @@ fn a_resize_the_keyframe_absorbed_is_not_unjournaled() {
     assert!(r.exact, "{:?}", r.losses);
 }
 
-/// Export the whole history of `live`'s engine into the ring (a fresh reset at its
-/// oldest), as the window's journal worker does.
 fn export_all(live: &mut Live, cap: usize) -> HistoryFence {
     let fence = live.term.history_fence();
     live.writer
@@ -1638,10 +1556,6 @@ fn export_all(live: &mut Live, cap: usize) -> HistoryFence {
     fence
 }
 
-/// The history join's inputs (the plan's §3.2 N3): the head is the keyframe's fence moved
-/// on by what the replay pushed, the carried lines the scratch engine's history, and the
-/// ring's run an export fenced under the keyframe's identity with its end clamped to the
-/// head's.
 #[test]
 fn the_join_facts_line_the_ring_up_below_the_replay() {
     let mut live = Live::v1(6, 40);
@@ -1706,8 +1620,6 @@ fn the_join_facts_line_the_ring_up_below_the_replay() {
     );
 }
 
-/// The ring's lines the dead engine had already evicted when it keyframed are skipped,
-/// never brought back: the export starts at the head's oldest row.
 #[test]
 fn the_join_never_reaches_below_the_head_s_oldest_row() {
     let mut live = Live::v1(6, 40);
@@ -1740,10 +1652,6 @@ fn the_join_never_reaches_below_the_head_s_oldest_row() {
     assert_eq!((export.first, export.lines), (facts.head.oldest, 0));
 }
 
-/// A ring far older than the engine (it kept exporting while the engine's line limit
-/// evicted): the chunks an import decodes start at the one holding the export's first
-/// row, never a chunk wholly below it, and skip fewer lines than that chunk holds; the
-/// lines they give from there are the live history's at the same rows.
 #[test]
 fn an_import_decodes_only_the_chunks_it_takes_within_the_newest_bound() {
     let mut live = Live::v1(6, 40);
@@ -1832,9 +1740,6 @@ fn an_import_decodes_only_the_chunks_it_takes_within_the_newest_bound() {
     assert_eq!(lines_of(&newest, take), live_lines(newest.first, take));
 }
 
-/// No head across a clear or a reflow inside the replay: a clear counts nothing (the
-/// person erased what the ring held), a reflow counts the keyframe's lines below its
-/// bridge.
 #[test]
 fn a_clear_or_a_reflow_in_the_tail_leaves_no_head() {
     let mut live = Live::v1(6, 40);

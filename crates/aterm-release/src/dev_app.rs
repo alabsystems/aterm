@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship dev-app`: build THIS checkout, dirty or not, into `aterm (dev).app`, sign it locally and install it BESIDE the release — the code in front of you running as the app you launch.
+//! `ship dev-app`: build this checkout into `aterm (dev).app`, sign it locally, and install it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -18,16 +18,15 @@ pub const DEV_BUNDLE_ID: &str = "com.aterm.aterm.dev";
 /// The dev build's `CFBundleDisplayName`.
 pub const DEV_DISPLAY_NAME: &str = "aterm (dev)";
 
-/// The dev build's bundle name on disk, in `--out` and where it is installed: never `aterm.app`, which is the release's.
+/// The dev build's bundle name on disk, in `--out` and where it is installed: never `aterm.app`.
 pub const DEV_APP_NAME: &str = "aterm (dev).app";
 
-/// The updater's dev mark (`aterm_update::bundle::DEV_BUILD_KEY`): a bundle whose sealed Info.plist says `true` here is never replaced by an update.
+/// The updater's dev mark (`aterm_update::bundle::DEV_BUILD_KEY`).
 pub const DEV_MARK_KEY: &str = "ATermDevBuild";
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
                           LaunchServices.framework/Support/lsregister";
 
-/// The release's default home, and the user's when that is not writable.
 const APPLICATIONS: &str = "/Applications";
 
 pub const USAGE: &str = "
@@ -95,7 +94,7 @@ pub struct Options {
 /// Where the assembled bundle is installed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Install {
-    /// `/Applications`, or `~/Applications` when that is not writable; LaunchServices is told of it.
+    /// `/Applications`, or `~/Applications` when that is not writable.
     Applications,
     /// `--install-dir`: there, and nothing else is told.
     Into(PathBuf),
@@ -216,8 +215,6 @@ pub fn run_identity(remove: bool, keychain: Option<&Path>) -> Result<(), String>
     }
 }
 
-/// The keychain `identity` acts on, and whether it belongs on the search list (only the
-/// default one does).
 fn identity_keychain(keychain: Option<&Path>, home: &Path, cwd: &Path) -> (PathBuf, bool) {
     match keychain {
         Some(path) => (cwd.join(path), false),
@@ -289,9 +286,6 @@ impl Stamp {
         })
     }
 
-    /// The build script's pins (`crates/aterm/build.rs` THE PIN, and the build number
-    /// through SOURCE_DATE_EPOCH, as the cutter pins them): given these it asks git
-    /// nothing.
     fn pins(&self) -> [(&'static str, String); 4] {
         [
             ("SOURCE_DATE_EPOCH", self.build.to_string()),
@@ -302,8 +296,6 @@ impl Stamp {
     }
 }
 
-/// `--target-dir`: the caller's `CARGO_TARGET_DIR` (relative to the checkout) or the
-/// checkout's `target/`.
 fn target_dir(root: &Path, env: Option<OsString>) -> PathBuf {
     match env.filter(|v| !v.is_empty()).map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
@@ -312,9 +304,6 @@ fn target_dir(root: &Path, env: Option<OsString>) -> PathBuf {
     }
 }
 
-/// The one build: `<stage2>/targo --unverified build --release -p aterm`, from `root`,
-/// with the Trust bin dir first on PATH so targo's children resolve trustc beside it,
-/// pinned to `stamp`.
 fn build_command(
     stage2: &Path,
     root: &Path,
@@ -358,7 +347,6 @@ fn build_command(
     cmd
 }
 
-/// The first line `program args` prints, under the hang detector.
 fn first_line(run: &dyn Run, program: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = aterm_uds::spawnfd::command(program);
     cmd.args(args);
@@ -369,7 +357,8 @@ fn first_line(run: &dyn Run, program: &Path, args: &[&str]) -> Option<String> {
 
 /// `ship dev-app [...]`: build, assemble, sign and (unless `--no-install`) install.
 /// # Errors
-/// The first step that could not be done, said with its remedy; nothing is installed after a failed step.
+/// The first step that could not be done, said with its remedy; nothing is installed after a failed
+/// step.
 pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
     let run = &dev_identity::Bounded;
     if !opts.pin {
@@ -446,8 +435,6 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// The release's layout of `bin` at `<out>/aterm (dev).app` under the dev identity, the
-/// [`DEV_MARK_KEY`] mark sealed in when `pin`.
 fn assemble(
     root: &Path,
     out: &Path,
@@ -484,8 +471,6 @@ fn assemble(
     Ok(app)
 }
 
-/// Say so when a process runs out of `app`: replacing it lands for that process's NEXT
-/// launch.
 fn note_running(app: &Path) {
     let prefix = format!("{}/", app.join("Contents/MacOS").display());
     let running = crate::bundle::running_processes()
@@ -500,8 +485,6 @@ fn note_running(app: &Path) {
     }
 }
 
-/// `codesign args…` under the hang detector, which must succeed; `state` says what a
-/// service that did not answer leaves (nothing is installed after it).
 fn codesign(run: &dyn Run, args: &[&dyn AsRef<OsStr>], state: &str) -> Result<Output, String> {
     let mut cmd = aterm_uds::spawnfd::command(CODESIGN);
     cmd.args(args.iter().map(|a| a.as_ref()));
@@ -525,8 +508,6 @@ fn codesign(run: &dyn Run, args: &[&dyn AsRef<OsStr>], state: &str) -> Result<Ou
     }
 }
 
-/// Sign `app` as `with` says, then verify it `--strict`. An identity's signature must
-/// yield an identity-based designated requirement — the property it is signed for.
 fn sign(app: &Path, with: &SignWith, home: &Path, run: &dyn Run) -> Result<(), String> {
     let identity = match with {
         SignWith::AdHoc => None,
@@ -590,8 +571,6 @@ fn sign(app: &Path, with: &SignWith, home: &Path, run: &dyn Run) -> Result<(), S
     Ok(())
 }
 
-/// `/Applications` when this user may write it (access(2), so nothing is written there
-/// to find out), else `~/Applications` (made).
 fn applications_dir(home: &Path) -> Result<PathBuf, String> {
     let system = Path::new(APPLICATIONS);
     if atpkg::platform::dir_writable_by_caller(system) {
@@ -602,8 +581,6 @@ fn applications_dir(home: &Path) -> Result<PathBuf, String> {
     Ok(user)
 }
 
-/// Copy the tree at `src` to `dst` (absent): directories, files with their mode, and
-/// symlinks as links — what a sealed bundle is made of.
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     let meta =
         std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
@@ -632,8 +609,6 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Install `app` into `dir` as [`DEV_APP_NAME`], replacing a previous dev install: a
-/// verified copy is moved into place, so a failed copy leaves the old one.
 fn install(
     app: &Path,
     dir: &Path,
@@ -705,8 +680,6 @@ fn install(
     Ok(())
 }
 
-/// Point `<bin_dir>/aterm` at `exe`, and `<bin_dir>/amacs` at the `amacs` beside it,
-/// replacing a link (atomically) and never a file.
 fn link_cli(exe: &Path, bin_dir: &Path, run: &dyn Run) -> Result<Option<PathBuf>, String> {
     std::fs::create_dir_all(bin_dir).map_err(|e| format!("create {}: {e}", bin_dir.display()))?;
     let link = bin_dir.join("aterm");
@@ -739,8 +712,6 @@ fn link_cli(exe: &Path, bin_dir: &Path, run: &dyn Run) -> Result<Option<PathBuf>
     Ok(displaced)
 }
 
-/// Point the link `link` at `target`, atomically, unless something other than a link
-/// holds the name (said, and left).
 fn point_link(target: &Path, link: &Path) -> Result<Option<PathBuf>, String> {
     let dir = link.parent().unwrap_or(Path::new("."));
     let prior = match std::fs::symlink_metadata(link) {
@@ -788,7 +759,6 @@ mod tests {
         }
     }
 
-    /// The program and arguments of every logged call, joined.
     fn log(fake: &Fake) -> Vec<String> {
         fake.0.borrow().log.iter().map(|c| c.join(" ")).collect()
     }
@@ -880,10 +850,6 @@ mod tests {
         }
     }
 
-    /// The one build runs the Trust targo on its explicit `--unverified` lane from the
-    /// checkout, its bin dir first on PATH, pinned to the plist's stamp, with what would
-    /// swap the toolchain, move the binary or mark it a release scrubbed — and
-    /// RUSTFLAGS left to the caller.
     #[test]
     fn the_build_is_the_trust_targo_on_its_unverified_lane() {
         let stage2 = Path::new("/store/trust/9192/bin");
@@ -966,9 +932,6 @@ mod tests {
         assert!(!envs.contains_key("RUSTFLAGS"));
     }
 
-    /// The stamp is read as `crates/aterm/build.rs` reads it: HEAD's committer epoch,
-    /// its 12-digit id with `-dirty` once the tree changes, and the commits since the
-    /// newest `v*.*.0` tag (0 without one).
     #[test]
     fn the_stamp_is_heads_facts_as_the_build_script_reads_them() {
         let (_dir, root) = scratch();
@@ -1031,9 +994,6 @@ mod tests {
         );
     }
 
-    /// `identity --keychain` names a file against the current directory, as every check
-    /// here reads it, never against ~/Library/Keychains as `security` would; only the
-    /// default keychain goes on the search list.
     #[test]
     fn a_relative_keychain_is_the_current_directorys() {
         let (home, cwd) = (Path::new("/Users//u"), Path::new("/work"));
@@ -1060,9 +1020,6 @@ mod tests {
         assert_eq!(target_dir(root, Some("/abs".into())), PathBuf::from("/abs"));
     }
 
-    /// The dev bundle is the release's layout around this checkout's binary under its
-    /// own identity, and the updater reads the mark it seals as a dev build — absent
-    /// under --no-pin.
     #[test]
     fn the_dev_bundle_is_the_release_layout_under_its_own_identity() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1100,7 +1057,6 @@ mod tests {
         }
     }
 
-    /// A bundle laid out for the sign and install steps: one executable, one alias link.
     fn bundle_at(dir: &Path) -> PathBuf {
         let app = dir.join(DEV_APP_NAME);
         std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
@@ -1126,10 +1082,6 @@ mod tests {
         );
     }
 
-    /// By default the "aterm dev" identity signs when its keychain exists — by its hash,
-    /// its requirement read back and found identity-based — and ad hoc when there is
-    /// none; a keychain that exists and cannot be used stops the build before any
-    /// codesign.
     #[test]
     fn the_default_signer_is_the_dev_identity_when_it_exists() {
         let (_dir, home) = scratch();
@@ -1189,8 +1141,6 @@ mod tests {
         assert!(refused.contains("not identity-based"), "{refused}");
     }
 
-    /// A codesign that never answers stops the build in one line naming the bundle's
-    /// state; codesign's own failure comes through as a failure.
     #[test]
     fn a_codesign_that_does_not_answer_stops_with_the_bundle_state() {
         let (_dir, root) = scratch();
@@ -1218,9 +1168,6 @@ mod tests {
         assert!(failed.contains("scripted failure"), "{failed}");
     }
 
-    /// The install is a verified copy moved into place — links kept, the previous
-    /// install replaced — run once with `--version`; LaunchServices is told only of an
-    /// install in the Applications folders.
     #[test]
     fn install_moves_a_verified_copy_into_place() {
         let (_dir, root) = scratch();
@@ -1273,8 +1220,6 @@ mod tests {
         );
     }
 
-    /// `aterm` on PATH is pointed at the dev build, naming the build it displaced; one
-    /// already there displaces nothing, and a file is never replaced.
     #[test]
     fn the_path_link_is_a_choice_that_names_what_it_displaced() {
         let (_dir, root) = scratch();
@@ -1303,8 +1248,6 @@ mod tests {
         );
     }
 
-    /// `amacs` goes with `aterm`: the dev bundle's editor takes the release's link, and is
-    /// named, never run.
     #[test]
     fn the_editor_link_goes_with_aterm() {
         let (_dir, root) = scratch();

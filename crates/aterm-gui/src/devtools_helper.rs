@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SYSTEM SETTINGS HAND-OVERS: the one lane that brings the owner to System Settings ▸ Privacy & Security ▸ Developer Tools or ▸ Full Disk Access ([`Page`]), and aterm's own panel beside it (owner ask 2026-10-15: "I need some kind of banner explaining why I need this for aterm, and I need for aterm to be autopopulated when this menu appears. make this even lower friction"; owner ask 2026-10-16: "on starting aterm, I didn't see aterm automatically enable file system access everywhere on a new machine … It needs to enable all these by default", on macOS 26 Tahoe and 27).
+//! System Settings hand-overs (`Privacy & Security` ▸ `Developer Tools` or `Full Disk Access`) and the helper panel beside them.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -895,7 +895,6 @@ impl Panel {
             } else if self.dropped_at.is_some() {
                 dropped_how()
             } else if self.bundle.is_none() {
-                // No icon to drag: + leads.
                 HELPER_HOW_PLUS.to_owned()
             } else {
                 HELPER_HOW.to_owned()
@@ -1047,7 +1046,6 @@ impl Panel {
                 self.listed_on = on;
                 self.empty = empty;
                 let phase = if off || on {
-                    // aterm is on this list: whatever the drag did, it is here.
                     Phase::Explain
                 } else if self
                     .dropped_at
@@ -1225,9 +1223,7 @@ impl Rect {
 
 /// How the live panel measures its words: AppKit's text system there, a fixed-width estimate in the tests.
 pub(crate) trait Measure {
-    /// The height `text` takes wrapped at `width`, set in `tone`.
     fn text_height(&self, text: &str, tone: Tone, width: f64) -> f64;
-    /// The width of a push button titled `title`.
     fn button_width(&self, title: &str) -> f64;
 }
 

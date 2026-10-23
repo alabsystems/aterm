@@ -1738,6 +1738,24 @@ fn nonreading_peer_cannot_hold_a_guarded_write_past_its_deadline() {
         })),
     );
     let (_nonreading_client, server) = CtlStream::pair().unwrap();
+    // Full before the reply: Windows takes one send whole while the socket has room (the
+    // 8 MiB reply went out in a single write), so its size alone never waits on the peer.
+    server
+        .set_write_timeout(Some(std::time::Duration::from_millis(50)))
+        .unwrap();
+    let room = loop {
+        match (&server).write(&[0; 64 * 1024]) {
+            Ok(written) => assert!(written > 0, "a write takes bytes or refuses"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(
+            room.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "a socket nobody reads fills: {room}"
+    );
     let mut outbox = control_lanes::Outbox::default();
     outbox.attach_within(reply, std::time::Duration::from_millis(100));
     let started = std::time::Instant::now();
@@ -17742,8 +17760,7 @@ fn await_log_kind_program_answers_on_the_programs_move() {
     std::thread::spawn(move || {
         let _ = tx.send(await_log(&h2, &store2, &parked));
     });
-    let _ = h
-        .ctx
+    h.ctx
         .timeline
         .lock()
         .unwrap()
@@ -18129,6 +18146,8 @@ fn the_autopilot_words_meta_lines_wait_on_the_journal() {
 fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     const W: &str = "s-00000000000000aa";
     const MINE: &str = "s-00000000000000bb";
+    // An absolute folder: Windows' names a drive.
+    const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
     let spawned = |sid: &SessionId| sid.as_str() == W;
     let gate = |line: &str| drive_gate(line, &hosts, &spawned);
@@ -18164,7 +18183,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         (format!("hold {W} off"), "hold"),
         (format!("@{W} close"), "close"),
         (
-            "spawn agent=claude cwd=/tmp from=s-0000000000000c03 len=5".to_owned(),
+            format!("spawn agent=claude cwd={CWD} from=s-0000000000000c03 len=5"),
             "spawn",
         ),
     ] {
@@ -18190,10 +18209,10 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         other => panic!("{other:?}"),
     }
     for word in ["gemini", "agy", "muse"] {
-        match gate(&format!("spawn agent={word} model=m-1 cwd=/tmp len=5")) {
+        match gate(&format!("spawn agent={word} model=m-1 cwd={CWD} len=5")) {
             Ok(DriveLine::Act { line, .. }) => assert_eq!(
                 line,
-                format!("spawn agent={word} model=m-1 cwd=/tmp len=5 raise=false")
+                format!("spawn agent={word} model=m-1 cwd={CWD} len=5 raise=false")
             ),
             other => panic!("{word}: {other:?}"),
         }

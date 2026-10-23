@@ -263,6 +263,7 @@ pub struct CursorGlow {
     row_prev: Vec<char>,
     row_cur_meta: Option<RowProbe>,
     row_prev_meta: Option<RowProbe>,
+    probed_spans: status::TextSpans,
     row_shown: Vec<char>,
     row_shown_meta: Option<RowProbe>,
     recent_typed_run: Option<RecentTypedRun>,

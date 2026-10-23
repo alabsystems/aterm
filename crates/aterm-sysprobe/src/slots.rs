@@ -496,7 +496,7 @@ mod live {
         Refused,
     }
 
-    /// Implements [`observe`] with a test hook invoked while each slot file is open.
+    /// Implements [`super::observe`] with a test hook invoked while each slot file is open.
     pub(super) fn observe_in(
         dir: &Path,
         mono_ms: u64,
@@ -645,7 +645,7 @@ mod live {
         }
     }
 
-    /// macOS implementation of [`live_witness`].
+    /// macOS implementation of [`super::live_witness`].
     pub(super) fn witness() -> impl FnMut(&Record) -> bool {
         let mut table: Option<Option<Vec<kproc::Record>>> = None;
         let mut used: Vec<u32> = Vec::new();

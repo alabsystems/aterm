@@ -34,7 +34,8 @@ const DECIDED_SHOWN: usize = 3;
 /// The most lines one choice's sentence is drawn on (its label keeps it whole).
 const DECIDED_LINES: usize = 4;
 
-/// A SESSIONS row's timer press: `harness/session/<id>/land-in/<minutes>`.
+/// A SESSIONS row's timer press: `harness/session/<id>/land-in/<minutes>`, `…/land-at` or
+/// `…/land-cancel`.
 pub(super) fn timer_action(local_id: u64, choice: TimerChoice) -> String {
     let prefix = crate::harness_screen::SESSION_ACTION_PREFIX;
     match choice {
@@ -127,7 +128,8 @@ pub(super) const HARNESS_TAB_CONTROL: &str = "harness/tab-control";
 /// The page's heading (its rail label is the route's, "Harness").
 pub(super) const HARNESS_PAGE_TITLE: &str = "Coding agent harness";
 
-/// The SUPERVISION card's registry rows ([`super::ai_page::ai_page_rows`]).
+/// The SUPERVISION card's registry rows: the Harness section's but the AI CLIs'
+/// ([`super::ai_page::ai_page_rows`]).
 pub(super) fn harness_page_rows() -> impl Iterator<Item = &'static str> {
     prefs::NESTED_LEAVES
         .iter()
@@ -971,7 +973,7 @@ pub(super) fn row_cards(
 /// How far a SESSIONS row's words stand inside the block its landing draws the accent card on.
 pub(super) const ROW_INSET: f32 = 8.0;
 
-/// [`row_cards`] ([`session_timer`], [`ROW_INSET`]).
+/// [`row_cards`]; with `blocks`, each row's block keeps [`ROW_INSET`] beside its words.
 fn row_cards_inset(
     key: &str,
     names: (&str, (&str, &str)),
@@ -1217,7 +1219,8 @@ fn switch_rows(
     page_box_setting_rows(state, &rows, width, inner, None, Some(row_room))
 }
 
-/// "No Claude Code or Codex session is open".
+/// "No Claude Code, Codex, … session is open": every agent the harness supervises or watches
+/// (`Program::ALL`, `harness_table`) by its product name.
 fn no_session_open() -> String {
     let products: Vec<&str> = aterm_phase::Program::ALL
         .into_iter()

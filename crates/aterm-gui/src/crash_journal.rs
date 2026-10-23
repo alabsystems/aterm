@@ -2,14 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Crash-recovery layout journal (`journal-<pid>-<nanos>.toml`) backed by [`RestoreManifest`].
-//!
-//! * [`JournalHeader::programs`], [`JournalHeader::handed`], and [`crate::restore::AgentRestore`]
-//!   record active commands and agent relaunch state; [`Lane::take_over_at_commit`] and
-//!   [`Lane::carry_forward`] hand ownership across seamless updates.
-//! * [`Lane`] throttles layout writes to [`MIN_WRITE_INTERVAL`] while flushing [`OwnerWords`]
-//!   immediately ([`Lane::note_owner_words`], [`Durable`], [`Lane::poll_writer`]).
-//! * [`claim_at_boot`] and [`classify_death`] reopen dead writers' journals subject to
-//!   [`PROBATION`] and [`JournalHeader::second_chance`].
 #![cfg_attr(
     not(unix),
     allow(
@@ -28,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::restore::RestoreManifest;
 
-/// At most one journal write per this interval (), and at most one capture.
+/// Minimum interval between journal writes and captures.
 pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// At most one journal write per this interval when only titles changed.
@@ -145,8 +137,7 @@ pub(crate) struct JournalHeader {
     /// The writer's boot reopened a journal whose writer was on probation and was stopped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) second_chance: bool,
-    /// Every terminal leaf whose foreground was a program other than its shell
-    /// when the image was captured.
+    /// Every terminal leaf whose foreground was a program other than its shell when the image was captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) programs: Option<Vec<LeafProgram>>,
     /// The writing build names its run in `session.toml` at quit (`restore::write_quit`).
@@ -355,8 +346,7 @@ pub(crate) struct Lost {
 /// The reopened layout's terminal panes whose saved folder is not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PanesWithoutFolder {
-    /// Panes whose restore asks for a folder no shell can start in: each
-    /// starts in the home folder, and a Messages row names the folder.
+    /// Panes whose restore asks for a folder no shell can start in: each starts in the home folder, and a Messages row names the folder.
     pub(crate) gone: usize,
     /// Panes a program held ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`]).
     pub(crate) unasked: usize,
@@ -415,8 +405,7 @@ impl Reopened {
                 crate::restore::RestoredSplitTree::Leaf {
                     view: crate::restore::RestoredView::Terminal(leaf),
                 } => {
-                    // A held tab's agent is the holder's: never relaunched
-                    // (`App::carry_restored_identity`, ruling 23).
+                    // A held tab's agent is the holder's: never relaunched.
                     if let Some(agent) = leaf.resumes_agent().filter(|agent| {
                         seen.as_ref()
                             .is_none_or(|seen| !seen.contains(&agent.ran_as()))
@@ -493,9 +482,7 @@ impl Reopened {
         told
     }
 
-    /// The layout's terminal panes whose folder no shell can start in
-    /// (`not_found`, the spawn's own check [`crate::spawn_folder::folder_fault`]),
-    /// counted from each window's canonical tabs, else its legacy mirror.
+    /// The layout's terminal panes whose folder no shell can start in (`not_found`, the spawn's own check [`crate::spawn_folder::folder_fault`]), counted from each window's canonical tabs, else its legacy mirror.
     pub(crate) fn panes_without_folder(
         &self,
         not_found: impl Fn(&str) -> bool,
@@ -633,9 +620,7 @@ pub(crate) struct QuitLayout {
     pub(crate) written_unix_ms: Option<u64>,
 }
 
-/// How much later than an unstamped quit layout's date a journal image may be
-/// and still be that quit's own: the layout's date is a file mtime (HFS+
-/// truncates up to 1 s, FAT up to 2 s), the image's is milliseconds.
+/// How much later than an unstamped quit layout's date a journal image may be and still be that quit's own.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const QUIT_DATE_SLACK_MS: u64 = 2_000;
 
@@ -752,8 +737,7 @@ mod unix {
                     dir.join(id.lock_name()).display()
                 )
             })?;
-            // SAFETY: `create_locked` returns a descriptor it opened for this
-            // call and nobody else owns; the `OwnedFd` closes it exactly once.
+            // SAFETY: `create_locked` returns a descriptor it opened for this call and nobody else owns; the `OwnedFd` closes it exactly once.
             let lock = unsafe { OwnedFd::from_raw_fd(fd) };
             Ok(Self {
                 dir: dir.to_path_buf(),
@@ -858,8 +842,7 @@ mod unix {
 
     impl Drop for JournalOwner {
         fn drop(&mut self) {
-            // SAFETY: `flock` on the descriptor this owner holds open until
-            // its field drops right after; LOCK_UN never waits.
+            // SAFETY: `flock` on the descriptor this owner holds open until its field drops right after; LOCK_UN never waits.
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the release: LOCK_UN before the descriptor closes"
@@ -1105,7 +1088,7 @@ mod unix {
     }
 
     /// The reader's half: take every dead writer's journal in `dir` and decide what this launch
-    /// reopens (rules in the module docs).
+    /// reopens.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

@@ -29,7 +29,7 @@ use windows as platform;
 pub use self::platform::*;
 
 /// Helper for converting between platform-specific and generic
-/// [`VideoModeHandle`]/[`MonitorHandle`]
+/// `VideoModeHandle`/[`MonitorHandle`]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Fullscreen {
     // Windows only (winit-core step 5, WC.8): see `crate::window::Fullscreen`.

@@ -2940,7 +2940,8 @@ fn the_trail_colors_note_names_the_saved_styles_law() {
 
 #[test]
 fn a_note_a_run_shares_is_the_stop_after_the_run() {
-    let note = &prefs::trail_color_note(prefs::DEFAULT_CURSOR_TRAIL_STYLE, true, false);
+    let note =
+        &prefs::trail_color_note(crate::app_config::default_cursor_trail_style(), true, false);
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     for (width, height) in [(1_074.0, 900.0), (584.0, 900.0), (390.0, 900.0)] {
         let mut lab =
@@ -4869,7 +4870,9 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
         ),
         (
             SettingsRoute::Home,
-            (738.0, 180.0),
+            // Windows' 1.1 line height holds no whole row of the trail
+            // preview in a 180pt window: the list has none to start with.
+            (738.0, if cfg!(windows) { 186.0 } else { 180.0 }),
             Some("settings/top/cursor-trail/preview"),
             "settings/top/cursor-trail/title-row",
         ),
@@ -4881,14 +4884,18 @@ fn a_text_size_change_keeps_a_screen_that_starts_with_what_it_lists_otherwise() 
         ),
     ] {
         set_scale(1.0);
-        let mut lab = Lab::new("");
+        // Top Settings as it lists with a trail drawn (Windows draws none by default).
+        let mut lab = Lab::new(&crate::app_config::trail_drawn(""));
         lab.state_mut().navigate(route);
         let _ = lab.compile(width, height);
         let plan = lab.state().scroll_plan().expect("a list");
         let top = match from {
-            Some(key) => plan
-                .stop_of_identity(&UiKey::new(key))
-                .expect("1× lists it"),
+            Some(key) => plan.stop_of_identity(&UiKey::new(key)).unwrap_or_else(|| {
+                let listed: Vec<_> = (0..plan.len())
+                    .filter_map(|stop| plan.identities(stop).next().map(UiKey::as_str))
+                    .collect();
+                panic!("{route:?} {width}x{height} at 1× lists {key}: {listed:?}")
+            }),
             None => plan.len(),
         };
         lab.state_mut().scroll_page_to(top);
@@ -5296,7 +5303,10 @@ fn a_status_is_read_whole_and_nothing_pressed_moves() {
 #[test]
 fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
     at_each_text_scale(&[2.0], "a control the wheel left cut", |_| {
-        let (width, height) = (444.0, 292.0);
+        // Windows' narrower UI face draws the switch whole after the wheel at
+        // 444pt; at 424pt it leaves it cut over the heights 444pt does on the
+        // Mac (284-296pt).
+        let (width, height) = (if cfg!(windows) { 424.0 } else { 444.0 }, 292.0);
         let switch = UiKey::new(THEME_MODE_ACTION);
         let drawn = |compiled: &crate::native_ui::CompiledUi| {
             compiled
@@ -5321,7 +5331,8 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
                 None,
             ),
         ] {
-            let mut lab = Lab::new("");
+            // Top Settings as it lists with a trail drawn (Windows draws none by default).
+            let mut lab = Lab::new(&crate::app_config::trail_drawn(""));
             lab.state_mut().navigate(SettingsRoute::Home);
             let _ = lab.compile(width, height);
             lab.dispatch(AppEvent::FocusChanged(Some(switch.clone())));
@@ -5347,7 +5358,11 @@ fn a_control_the_wheel_left_cut_stays_where_it_was_drawn() {
             assert_eq!(
                 drawn(&back),
                 cut,
-                "under {status} the wheel back up draws the switch cut by the room's edge"
+                "under {status} the wheel back up draws the switch cut by the room's edge: {:?}",
+                back.paint
+                    .iter()
+                    .find(|node| node.key == switch)
+                    .map(|node| (node.rect, node.clip))
             );
             assert!(
                 lab.compile(width, height) == back,
@@ -6095,6 +6110,8 @@ fn a_kept_caption_heads_a_row_on_every_last_screen() {
 }
 
 #[test]
+// The in-app updater's page: Windows has none (`native_updater_here`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_press_on_softwares_cut_auto_update_row_only_scrolls_it_in() {
     let (width, height) = (584.0, 348.0);
     let mut lab = Lab::new("");

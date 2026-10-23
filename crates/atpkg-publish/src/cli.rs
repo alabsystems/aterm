@@ -92,7 +92,7 @@ pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     }
 }
 
-/// Run one command line (without argv[0]).
+/// Run one command line (without `argv[0]`).
 pub fn run(args: &[String]) -> Result<()> {
     let Some((verb, rest)) = args.split_first() else {
         eprint!("{}", usage());
