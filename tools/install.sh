@@ -639,7 +639,9 @@ download_release_asset() { # <tag> <name> <expected-size> <destination>
 	stop_download_meter
 	# Under bash 3.2 web_curl's subshell, the pipeline's first stage, exits 130
 	# once curl dies of the Ctrl-C the whole run got, and the run goes on: end it
-	# by the signal, never as a failed download.
+	# by the signal, never as a failed download. The run's INT trap does that
+	# too, but not in a subshell (linux_verifier_ready downloads in one), which
+	# starts with it reset.
 	case "$rc" in
 	129) die_of HUP 129 ;;
 	130) die_of INT 130 ;;
@@ -892,6 +894,23 @@ die_of() { # <signal> <status>
 	trap - "$1"
 	kill -s "$1" "$(exec sh -c 'echo "$PPID"')" || true
 	exit "$2"
+}
+
+# A Ctrl-C ends the run by it, whatever the child it lands in does with it. The
+# terminal sends it to the whole foreground group, but bash ends a waiting
+# shell only when its child died of it (wait-and-cooperative-exit), and some
+# children catch it and exit: python3 while it starts up, hdiutil. After one,
+# an `if` or a `||` read the exit as an answer and the run went on (a Linux run
+# skipped its app as having no Python 3.11, then seeded the toolset), and
+# elsewhere the run ended with the child's status, not by the Ctrl-C. bash runs
+# this trap once the child returns, whatever its status. A subshell starts with
+# it reset, as with any caught signal. main sets it first, and the test seam
+# before it returns, so a suite's functions run under it as a run's do. Never
+# at the top level: under `curl | bash` that line runs while the rest of the
+# script is still arriving, and a Ctrl-C that cut the download short would end
+# it with a syntax error or status 0, not by the signal.
+end_on_ctrl_c() {
+	trap 'die_of INT 130' INT
 }
 
 # The gate may only vouch for a bundle the fresh install would have accepted:
@@ -3443,21 +3462,45 @@ drop_stage() {
 install_app_cleanup() {
 	# Best-effort only, and never let a cleanup failure rewrite the exit status.
 	set +e
-	# If the swap was interrupted after the old bundle was set aside, restore it,
-	# first: under bash 5 a second Ctrl-C ends this trap at the next child it
-	# waits on, and what is left then must not be a folder with no aterm.app.
+	# A Ctrl-C, a hangup or a TERM while this runs must not cut it short, and its
+	# children start with them ignored: before, a Ctrl-C here (a second one, or
+	# the first after a refusal) ended the run at the step it killed, and left a
+	# folder with no aterm.app, a staging copy or a set-aside old copy nothing
+	# later removes. A run a Ctrl-C ended still dies of it once this returns.
+	trap '' INT HUP TERM
+	# If the swap was interrupted after the old bundle was set aside, restore it.
 	if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
 		mv "$OLD" "$DEST/aterm.app"
 	fi
+	drop_stage
+	# The set-aside copy goes only once an aterm.app is in place again.
+	if [[ -n "$OLD" && -d "$OLD" ]]; then
+		if [[ -e "$DEST/aterm.app" ]]; then
+			rm -rf "$OLD"
+		else
+			echo "install.sh: NOTE: could not put the previous aterm.app back (it is at $OLD; restore it with: sudo mv '$OLD' '$DEST/aterm.app')" >&2
+		fi
+	fi
 	# Only a DMG is mounted; the lean zip is expanded into this same path, and
-	# `rm -rf "$TMP"` below is all it needs.
+	# `rm -rf "$TMP"` below is all it needs. A detach can wedge, so it alone
+	# takes a Ctrl-C, which cuts it and goes on to the -force fallback.
+	local mounted=0
 	if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
+		trap : INT HUP TERM
 		hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
 			{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
+		trap '' INT HUP TERM
+		# A mount point with anything in it is the image still mounted: the
+		# -force detach failed too, or a Ctrl-C cut it. rm would walk its
+		# read-only tree, an error for each file, so it stays, and says how to
+		# detach it; the rest of the download goes.
+		if [[ -n "$(ls -A "$MNT" 2>/dev/null)" ]]; then
+			mounted=1
+			echo "install.sh: NOTE: the disk image is still mounted at $MNT (detach it with: sudo hdiutil detach -force '$MNT')" >&2
+			find "$TMP" -mindepth 1 -maxdepth 1 ! -name "${MNT##*/}" -exec rm -rf {} +
+		fi
 	fi
-	drop_stage
-	[[ -n "$OLD" ]] && rm -rf "$OLD"
-	rm -rf "$TMP"
+	[[ "$mounted" == 1 ]] || rm -rf "$TMP"
 }
 
 # Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
@@ -4793,6 +4836,7 @@ place_store_binary() {
 # The test seam: a suite sources this file with ATERM_INSTALL_LIBRARY_ONLY=1 to
 # drive the functions above without parsing arguments or touching the host.
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
+	end_on_ctrl_c
 	return 0 2>/dev/null || exit 0
 fi
 
@@ -5005,6 +5049,7 @@ print_install_plan() {
 # lines would be mechanical churn and risk pushing literal tabs into multi-line
 # strings.
 main() {
+end_on_ctrl_c
 ARGV=("$@")
 TAG=""
 TAG_INPUT=""
