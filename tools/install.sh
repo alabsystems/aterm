@@ -589,20 +589,25 @@ start_download_meter() {
 	# Below this a meter is noise: the manifest and its signature are a few
 	# hundred bytes and complete before the first tick would ever fire.
 	[[ "$total" -ge 8000000 ]] || return 0
-	(
-		got=0 pct=0 last=-1
-		while :; do
-			sleep 2
-			got="$(wc -c <"$destination" 2>/dev/null | tr -d '[:space:]')" || got=""
-			[[ -n "$got" ]] || continue
-			pct=$((got * 100 / total))
-			[[ "$pct" != "$last" ]] || continue
-			last="$pct"
-			printf '\r  %s MB / %s MB (%s%%)  ' \
-				"$((got / 1000000))" "$((total / 1000000))" "$pct" >&2
-		done
-	) &
+	download_meter "$destination" "$total" "$$" &
 	DOWNLOAD_METER_PID=$!
+}
+
+# The meter itself, a tick every 2 s while <run>, the run's own shell, lives. A
+# run a Ctrl-C ends under bash 5 never reaches stop_download_meter, and this
+# background job ignores the Ctrl-C (a script starts one with SIGINT ignored),
+# so it ends by itself rather than draw on over the person's prompt.
+download_meter() { # <destination> <total> <run>
+	local got pct last=-1
+	while sleep 2 && kill -0 "$3" 2>/dev/null; do
+		got="$(wc -c 2>/dev/null <"$1" | tr -d '[:space:]')" || got=""
+		[[ -n "$got" ]] || continue
+		pct=$((got * 100 / $2))
+		[[ "$pct" != "$last" ]] || continue
+		last="$pct"
+		printf '\r  %s MB / %s MB (%s%%)  ' \
+			"$((got / 1000000))" "$(($2 / 1000000))" "$pct" >&2
+	done
 }
 
 # Always safe to call, including when no meter was started. Clears the line so
@@ -632,6 +637,14 @@ download_release_asset() { # <tag> <name> <expected-size> <destination>
 	start_download_meter "$destination" "$expected_size"
 	fetch_release_asset "$tag" "$name" "$expected_size" >"$destination" || rc=$?
 	stop_download_meter
+	# Under bash 3.2 web_curl's subshell, the pipeline's first stage, exits 130
+	# once curl dies of the Ctrl-C the whole run got, and the run goes on: end it
+	# by the signal, never as a failed download.
+	case "$rc" in
+	129) die_of HUP 129 ;;
+	130) die_of INT 130 ;;
+	143) die_of TERM 143 ;;
+	esac
 	if [[ "$rc" -ne 0 ]]; then
 		echo "install.sh: download of $name from release $tag failed" >&2
 		return 1
@@ -868,12 +881,13 @@ bounded_cut() { # <signal> <status>
 	die_of "$1" "$2"
 }
 
-# Ends the subshell it runs in by <signal>, its trap reset first, so the shell
-# waiting on it, which got the same signal (the terminal sends a Ctrl-C to its
-# whole process group), ends too: bash ends a waiting shell whose child died of
-# the SIGINT it got, but goes on after a child's ordinary exit
-# (wait-and-cooperative-exit). sh's parent is this subshell, whose pid bash 3.2
-# cannot name. <status> if it lives on.
+# Ends the shell it runs in by <signal>, its trap reset first. The run's own
+# shell runs its EXIT trap and dies of it. A subshell's death of it ends the
+# shell waiting on it, which got the same signal (the terminal sends a Ctrl-C
+# to its whole process group), too: bash ends a waiting shell whose child died
+# of the SIGINT it got, but goes on after a child's ordinary exit
+# (wait-and-cooperative-exit). sh's parent is this shell, whose pid bash 3.2
+# cannot name in a subshell. <status> if it lives on.
 die_of() { # <signal> <status>
 	trap - "$1"
 	kill -s "$1" "$(exec sh -c 'echo "$PPID"')" || true
@@ -3429,6 +3443,12 @@ drop_stage() {
 install_app_cleanup() {
 	# Best-effort only, and never let a cleanup failure rewrite the exit status.
 	set +e
+	# If the swap was interrupted after the old bundle was set aside, restore it,
+	# first: under bash 5 a second Ctrl-C ends this trap at the next child it
+	# waits on, and what is left then must not be a folder with no aterm.app.
+	if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
+		mv "$OLD" "$DEST/aterm.app"
+	fi
 	# Only a DMG is mounted; the lean zip is expanded into this same path, and
 	# `rm -rf "$TMP"` below is all it needs.
 	if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
@@ -3436,10 +3456,6 @@ install_app_cleanup() {
 			{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
 	fi
 	drop_stage
-	# If the swap was interrupted after the old bundle was set aside, restore it.
-	if [[ -n "$OLD" && -d "$OLD" && ! -e "$DEST/aterm.app" ]]; then
-		mv "$OLD" "$DEST/aterm.app"
-	fi
 	[[ -n "$OLD" ]] && rm -rf "$OLD"
 	rm -rf "$TMP"
 }
