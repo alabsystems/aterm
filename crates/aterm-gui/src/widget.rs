@@ -194,8 +194,8 @@ impl std::fmt::Debug for SpecimenWallpaper {
 
 /// Complete renderer state for one bounded, real terminal-frame specimen. `input` is an
 /// immutable engine snapshot; every other field is reapplied to an isolated renderer fork
-/// just before `render_input`, so an uncommitted Settings candidate neither mutates a live
-/// renderer nor borrows another Settings view's state.
+/// just before `try_render_input`, so an uncommitted Settings candidate neither mutates a
+/// live renderer nor borrows another Settings view's state.
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalSpecimenSpec {
     pub(crate) input: Arc<RenderInput>,
@@ -300,8 +300,7 @@ impl TerminalSpecimenSpec {
 
 /// The only constructor of [`DrawPrim::Text`]. Its size is a [`StepPx`],
 /// mintable only by [`TypeStep`](crate::type_scale::TypeStep), so every chrome
-/// text site maps to a named step of the 5-step type scale. `weight` picks the
-/// Mono bold sibling; `face` picks Mono or the Ui/UiBold face.
+/// text site maps to a named step of the type scale.
 pub(crate) fn text_prim(
     x: f32,
     baseline: f32,
@@ -336,8 +335,7 @@ pub(crate) enum DrawPrim {
         fill: Rgba,
     },
     /// A ring: a faint full-circle `track` and a bold arc filling `frac` of
-    /// the turn (clockwise from 12 o'clock) in `fill`. Its one user is the
-    /// Appearance button icon, a half-filled ring.
+    /// the turn (clockwise from 12 o'clock) in `fill`.
     Ring {
         cx: f32,
         cy: f32,
@@ -408,6 +406,28 @@ pub(crate) enum DrawPrim {
         width: f32,
         color: Rgba,
     },
+    /// A dashed stroke `width` thick, its dashes `on` long and `off` apart:
+    /// the rect's outline, inside the rect as an unrounded
+    /// [`DrawPrim::Stroke`] draws it, with every corner solid. A rect too
+    /// thin to have an inside (at most two `width`s across) is one band
+    /// along its longer side, at least `width` thick: a line from `(x, y)`
+    /// when `w` or `h` is 0, the stroke right of or below it. A negative `w`
+    /// or `h` spans the rect on the other side of `(x, y)`. Each edge or
+    /// band starts with a dash at its left or top end. Every length snaps to
+    /// whole device pixels, a dash or gap to at least one, and each pixel is
+    /// inked once; `on <= 0` draws nothing and `off <= 0` a solid stroke.
+    /// Walls, hollow buckets, the free-space outline, projections, missing
+    /// days.
+    Dashed {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        width: f32,
+        on: f32,
+        off: f32,
+        color: Rgba,
+    },
     /// A filled HSV colour disk (the settings colour wheel): per-pixel polar hue (0° at 12
     /// o'clock, clockwise, as [`DrawPrim::Ring`] arcs) and saturation (radius), scaled by
     /// `value`, with a ~1px anti-aliased rim.
@@ -439,9 +459,8 @@ pub(crate) enum DrawPrim {
         icon: aterm_render::BandIcon,
         color: Rgba,
     },
-    /// A bitmap in the `w`×`h` rect at `(x, y)`, baked at device scale: the
-    /// raster bakes `art` at exactly the rect's device size, once per size
-    /// (cached), so it is sharp at every display scale and never resampled.
+    /// A bitmap in the `w`×`h` rect at `(x, y)`, baked from `art` at the rect's exact device
+    /// size (cached per size), so it is never resampled.
     Image {
         x: f32,
         y: f32,
@@ -538,6 +557,19 @@ impl DrawPrim {
                 f32_bits(state, &[*x1, *y1, *x2, *y2, *width]);
                 color.hash(state);
             }
+            Self::Dashed {
+                x,
+                y,
+                w,
+                h,
+                width,
+                on,
+                off,
+                color,
+            } => {
+                f32_bits(state, &[*x, *y, *w, *h, *width, *on, *off]);
+                color.hash(state);
+            }
             Self::HsvDisk { cx, cy, r, value } => f32_bits(state, &[*cx, *cy, *r, *value]),
             Self::ClipPush { x, y, w, h } => f32_bits(state, &[*x, *y, *w, *h]),
             Self::FadePush { y, h, from, to } => f32_bits(state, &[*y, *h, *from, *to]),
@@ -571,10 +603,8 @@ fn f32_bits(state: &mut impl Hasher, values: &[f32]) {
 /// device size it is drawn at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ImageArt {
-    /// The aterm · ALab rainbow kitty: the pet roster's tabby mid-stretch
-    /// (`PetStretchHind`: long body, tail up, content closed eyes, the pose of
-    /// `assets/aterm-rainbow-kitty.png`) in the brand coat, its keyline pale
-    /// on a dark ground.
+    /// The aterm · ALab rainbow kitty: the pet roster's tabby in the `PetStretchHind` pose of
+    /// `assets/aterm-rainbow-kitty.png`, in the brand coat, its keyline pale on a dark ground.
     BrandKitty { dark: bool },
 }
 
@@ -701,6 +731,7 @@ pub(crate) fn translate_prims(prims: &mut [DrawPrim], dx: f32, dy: f32) {
             DrawPrim::Panel { x, y, .. }
             | DrawPrim::Capsule { x, y, .. }
             | DrawPrim::Stroke { x, y, .. }
+            | DrawPrim::Dashed { x, y, .. }
             | DrawPrim::ClipPush { x, y, .. }
             | DrawPrim::BandIcon { x, y, .. }
             | DrawPrim::Image { x, y, .. } => {
@@ -899,6 +930,16 @@ mod tests {
                 x2: 9.0,
                 y2: 7.0,
                 width: 1.5,
+                color: ink,
+            },
+            DrawPrim::Dashed {
+                x: 1.0,
+                y: 2.0,
+                w: 20.0,
+                h: 10.0,
+                width: 1.0,
+                on: 1.5,
+                off: 1.0,
                 color: ink,
             },
             DrawPrim::HsvDisk {
@@ -1117,6 +1158,9 @@ mod tests {
                 nudged!(p, Stroke(x, y, w, h, radius, width, color))
             }
             DrawPrim::Line { .. } => nudged!(p, Line(x1, y1, x2, y2, width, color)),
+            DrawPrim::Dashed { .. } => {
+                nudged!(p, Dashed(x, y, w, h, width, on, off, color))
+            }
             DrawPrim::HsvDisk { .. } => nudged!(p, HsvDisk(cx, cy, r, value)),
             DrawPrim::ClipPush { .. } => nudged!(p, ClipPush(x, y, w, h)),
             DrawPrim::FadePush { .. } => nudged!(p, FadePush(y, h, from, to)),

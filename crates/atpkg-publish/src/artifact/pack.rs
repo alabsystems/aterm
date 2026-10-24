@@ -24,9 +24,10 @@ use crate::triple::{Os, Triple};
 pub struct Pack;
 
 impl Packer for Pack {
-    /// Every pack is compressed by the zstd CLI ([`tarwrite::COMPRESSOR`]).
+    /// Every pack is compressed in this process by aterm-zstd ([`tarwrite::Zstd`]): this
+    /// machine needs no compressor of its own.
     fn can_pack(&self) -> std::result::Result<(), String> {
-        tarwrite::compressor_on_path().map(|_| ())
+        Ok(())
     }
 
     fn pack(&self, ctx: &Ctx, request: &PackRequest) -> Result<PackOutcome> {

@@ -45,13 +45,16 @@ use crate::trail_sound::SoundKind;
 /// The live cap (§5.6); typical at 12 cps is ≈ 20.
 pub const STAR_CAP: usize = 40;
 
-/// How long an evicted star has to finish (§5.6): its envelope is multiplied by `spend(age_since_eviction / 40 ms)`, so it leaves on the theme's own curve and never pops (T5).
+/// How long an evicted star has to finish (§5.6): its envelope is multiplied by
+/// `spend(age_since_eviction / 40 ms)`, so it leaves on the theme's own curve and never pops (T5).
 pub const EVICT_FINISH_MS: f32 = 40.0;
 
-/// The catch's shortened life, ms: a gold m1 the resident pet reached for is put on this finish on the frame the paw lands, so it leaves on the theme's curve rather than blinking out (T5).
+/// The catch's shortened life, ms: a gold m1 the resident pet reached for is put on this finish on
+/// the frame the paw lands, so it leaves on the theme's curve rather than blinking out (T5).
 pub const CATCH_FINISH_MS: f32 = EVICT_FINISH_MS;
 
-/// How many finishing stars the pool holds beyond [`STAR_CAP`] before the one nearest the end of its finish is dropped.
+/// How many finishing stars the pool holds beyond [`STAR_CAP`] before the one nearest the end of
+/// its finish is dropped.
 pub const STAR_FINISH_SLACK: usize = 8;
 
 /// The pool's fixed capacity: [`STAR_CAP`] live plus [`STAR_FINISH_SLACK`] finishing.
@@ -66,43 +69,55 @@ pub const DEAL_M2_IN: u32 = 4;
 /// One in this many typed cells gets a dealt m1 hero (§5.6).
 pub const DEAL_M1_IN: u32 = 12;
 
-/// One in this many laid ribbon cells carries a field star (§5.6), hashed stably per cell so the sky does not shimmer as the ribbon re-plans.
+/// One in this many laid ribbon cells carries a field star (§5.6), hashed stably per cell so the
+/// sky does not shimmer as the ribbon re-plans.
 pub const FIELD_DEAL_IN: u32 = 2;
 
 /// One in this many field stars is an m2 rather than an m3.
 pub const FIELD_M2_IN: u32 = 2;
 
-/// The hot field deal: every laid cell carries a field star once the honest spine (`ctx.disp`, not the resume-floored birth spine) is at or over [`FIELD_HOT_DISP`].
+/// The hot field deal: every laid cell carries a field star once the honest spine (`ctx.disp`, not
+/// the resume-floored birth spine) is at or over [`FIELD_HOT_DISP`].
 pub const FIELD_DEAL_IN_HOT: u32 = 1;
 
-/// The spine at or above which the field deal is [`FIELD_DEAL_IN_HOT`] instead of [`FIELD_DEAL_IN`].
+/// The spine at or above which the field deal is [`FIELD_DEAL_IN_HOT`] instead of
+/// [`FIELD_DEAL_IN`].
 pub const FIELD_HOT_DISP: f32 = 0.7;
 
 /// The share of laid cells that carry a field star at flow's `heat == 1`: every one.
 pub const FIELD_SHARE_FLOW: f32 = 1.0 / FIELD_DEAL_IN_HOT as f32;
 
-/// The share of laid cells that carry a field star at `heat == 0`: [`FIELD_DEAL_IN`] as a probability.
+/// The share of laid cells that carry a field star at `heat == 0`: [`FIELD_DEAL_IN`] as a
+/// probability.
 pub const FIELD_SHARE_COLD: f32 = 1.0 / FIELD_DEAL_IN as f32;
 
-/// The combo ladder's first rung: every 16th key of a run takes an m2 where the strike deal gave a grain or nothing (§23, "Flow state").
+/// The combo ladder's first rung: every 16th key of a run takes an m2 where the strike deal gave a
+/// grain or nothing (§23, "Flow state").
 pub const LADDER_M2_KEYS: u32 = 16;
 
-/// The second rung: every 32nd key of a run takes a white m2 ([`TINT_WHITE_RGB`]), so it reads as a different mark from the first.
+/// The second rung: every 32nd key of a run takes a white m2 ([`TINT_WHITE_RGB`]), so it reads as a
+/// different mark from the first.
 pub const LADDER_WHITE_KEYS: u32 = 32;
 
-/// The top rung: every 64th key of a run takes an earned gold m1 ([`TINT_GOLD_RGB`]), never demoted by spacing or a dry bucket (§5.8, D5).
+/// The top rung: every 64th key of a run takes an earned gold m1 ([`TINT_GOLD_RGB`]), never demoted
+/// by spacing or a dry bucket (§5.8, D5).
 pub const LADDER_GOLD_KEYS: u32 = 64;
 
-/// A field star's life, s: a star cannot read its cell per frame, so it rides the cell's shape (`edge-in` × the ribbon's `expiry_melt`) over the horizon at which the cell is surely gone, the exit swoosh's whole span (1.69 s; §5.6).
+/// A field star's life, s: a star cannot read its cell per frame, so it rides the cell's shape
+/// (`edge-in` × the ribbon's `expiry_melt`) over the horizon at which the cell is surely gone, the
+/// exit swoosh's whole span (1.69 s; §5.6).
 pub const FIELD_LIFE_S: f32 = SWOOSH_TOTAL_S;
 
-/// A field star's hold after the last key on its row ([`Star::lit`]), ms: the `H` of the field lane's half-life envelope (§5.6).
+/// A field star's hold after the last key on its row ([`Star::lit`]), ms: the `H` of the field
+/// lane's half-life envelope (§5.6).
 pub const FIELD_HOLD_MS: f32 = 300.0;
 
 /// A field star's half-life after hold, ms.
 pub const FIELD_TAU_MS: f32 = 250.0;
 
-/// The field fade's span after the last key, seconds (`H + 2.32·τ` through [`half_life_life_s`], 0.88 s): when [`Star::dead`] drops a field star whose row the hand has left, and the end of the reduced-motion fade.
+/// The field fade's span after the last key, seconds (`H + 2.32·τ` through [`half_life_life_s`],
+/// 0.88 s): when [`Star::dead`] drops a field star whose row the hand has left, and the end of the
+/// reduced-motion fade.
 #[inline]
 #[must_use]
 pub const fn field_fade_life_s() -> f32 {
@@ -115,13 +130,16 @@ pub const STRIKE_SECOND_M3_DISP: f32 = 0.5;
 /// Minimum spacing between heroes, in cells (§5.2).
 pub const HERO_MIN_SPACING_CELLS: u16 = 3;
 
-/// One sky star per cell: a strike dealt onto a cell that already carries a live sky star moves up to this many cells toward the caret's leading edge (the cell the next key lays) or is dropped; further would put a star over glass the hand has not reached.
+/// One sky star per cell: a strike dealt onto a cell that already carries a live sky star moves up
+/// to this many cells toward the caret's leading edge (the cell the next key lays) or is dropped;
+/// further would put a star over glass the hand has not reached.
 pub const STRIKE_REACH_CELLS: u16 = 1;
 
 /// At most this many heroes live on one row at a time (§5.2).
 pub const HERO_MAX_LIVE_PER_ROW: u8 = 2;
 
-/// Share of m1/m2 stars whose tint is `spectrum_snap(field at the birth cell)` (§5.3): warm stars over the old end, violet over the new.
+/// Share of m1/m2 stars whose tint is `spectrum_snap(field at the birth cell)` (§5.3): warm stars
+/// over the old end, violet over the new.
 pub const TINT_FIELD_SHARE: f32 = 0.75;
 
 /// Share of m1/m2 that are `#FFFFFF` — an A-type star; halo and stubs white (§5.3).
@@ -133,7 +151,8 @@ pub const M2_BODY_TINT: f32 = 0.6;
 /// Share that are `#FFFF00` gold, the only class that carries diagonal glints (§5.3).
 pub const TINT_GOLD_SHARE: f32 = 1.0 - TINT_FIELD_SHARE - TINT_WHITE_SHARE;
 
-/// The gold tint itself (§5.3), and the only value of [`Star::tint`] for which `push_twinkle_star`'s `gold` argument may be true.
+/// The gold tint itself (§5.3), and the only value of [`Star::tint`] for which
+/// `push_twinkle_star`'s `gold` argument may be true.
 pub const TINT_GOLD_RGB: u32 = 0x00FF_FF00;
 
 /// The A-type white tint (§5.3), and the colour of the hero's body and nucleus (D2).
@@ -154,14 +173,16 @@ pub const SKY_JITTER_CW: f32 = 0.3;
 /// The 1× cell height, device px (7×14 at 1×, 15×28 on a retina screen).
 pub const CELL_1X_CH: f32 = 14.0;
 
-/// The device-pixel scale of a cell of height `ch` against the 1× cell: `ch / CELL_1X_CH` — 1 at 1×, 2 on the retina cell, 9/7 at the test fixture's `ch` 18.
+/// The device-pixel scale of a cell of height `ch` against the 1× cell: 1 at 1×, 2 on the retina
+/// cell, 9/7 at the test fixture's `ch` 18.
 #[inline]
 #[must_use]
 pub const fn px_scale(ch: f32) -> f32 {
     ch / CELL_1X_CH
 }
 
-/// An integer pixel size ruled at 1×, at cell height `ch`: truncated like `star_arm_px` (never rounding up on a fractional scale), floored at one pixel.
+/// An integer pixel size ruled at 1×, at cell height `ch`: truncated like `star_arm_px` (never
+/// rounding up on a fractional scale), floored at one pixel.
 #[inline]
 #[must_use]
 pub const fn px_at(ch: f32, at_1x: i32) -> i32 {
@@ -175,17 +196,20 @@ pub const SCINT_F_MIN: f32 = 8.0;
 /// Upper bound of the seeded arm-size rate, Hz (§5.5, D12).
 pub const SCINT_F_MAX: f32 = 12.0;
 
-/// The photosensitivity exemption bound, device px at 2× (§5.5): a mark whose bbox is at or under this may scintillate in size at 8-12 Hz, since a general-flash threshold is an area threshold.
+/// The photosensitivity exemption bound, device px at 2× (§5.5): a mark whose bbox is at or under
+/// this may scintillate in size at 8-12 Hz, since a general-flash threshold is an area threshold.
 #[cfg(test)]
 pub const SCINT_BBOX_MAX_PX: i32 = 10;
 
 /// The m2's integer arm floor, px (§5.2, §5.5: "m2 … (2 ↔ 3 px)").
 pub const M2_ARM_MIN_PX: i32 = 2;
 
-/// Light-theme count scale (§5.2): counts × 0.6 in every population, since area must not accumulate on a light ground (L6).
+/// Light-theme count scale (§5.2): counts × 0.6 in every population, since area must not accumulate
+/// on a light ground (L6).
 pub const LIGHT_COUNT_SCALE: f32 = 0.6;
 
-/// Coverage divisor for a transient star whose current pixel sits over a probed-occupied or unknown cell (§5.2's text-safe arm).
+/// Coverage divisor for a transient star whose current pixel sits over a probed-occupied or unknown
+/// cell (§5.2's text-safe arm).
 pub const TEXT_SAFE_DIV: f32 = 3.0;
 
 /// The m1 hero's coverage request in the sky lane (§5.2).
@@ -206,19 +230,23 @@ pub const M2_COV_TRANSIENT: f32 = 34.0;
 /// The m3's request in the transient lane (§5.2).
 pub const M3_COV_TRANSIENT: f32 = 38.0;
 
-/// The m2's 3×3 disc, as a share of `c` (§5.7): what an m2 adds on top of `push_twinkle_star`'s stack.
+/// The m2's 3×3 disc, as a share of `c` (§5.7): what an m2 adds on top of `push_twinkle_star`'s
+/// stack.
 pub const M2_DISC_ADD: f32 = 0.35;
 
-/// The m3's four arm rects, as a share of `c`: the grain's tinted Airy disc (§5.7, D2), each arm `arm` px outboard of the 1-px core.
+/// The m3's four arm rects, as a share of `c`: the grain's tinted Airy disc (§5.7, D2), each arm
+/// `arm` px outboard of the 1-px core.
 pub const M3_CROSS_ADD: f32 = 0.45;
 
 /// The m3's composited centre as a multiple of `c`: §5.2's `1.6·c` (98 sky / 61 transient).
 pub const M3_CENTRE_ADD: f32 = 1.6;
 
-/// The four outboard tint stubs, as a share of `c` (§5.7): each arm's coloured tip, outside `star_body_px(arm)`.
+/// The four outboard tint stubs, as a share of `c` (§5.7): each arm's coloured tip, outside
+/// `star_body_px(arm)`.
 pub const STUB_COV_SHARE: f32 = 1.0;
 
-/// How long each tint stub is, px at the 1× cell ([`CELL_1X_CH`]), running outboard from `star_body_px(arm) + 1`: two, so the arm visibly ends in colour.
+/// How long each tint stub is, px at the 1× cell ([`CELL_1X_CH`]), running outboard from
+/// `star_body_px(arm) + 1`: two, so the arm visibly ends in colour.
 pub const STUB_LEN_PX: i32 = 2;
 
 /// [`STUB_LEN_PX`] at cell height `ch` ([`px_at`]).
@@ -231,19 +259,23 @@ pub const fn stub_len_px(ch: f32) -> i32 {
 /// §3.2 rank 8: the halo may not outshine the core.
 pub const HALO_CAP_SHARE: f32 = 1.0;
 
-/// The m1 halo's peak, as a share of `c` (§5.7): the hero's whole request, 61 levels in the sky and 50 transient.
+/// The m1 halo's peak, as a share of `c` (§5.7): the hero's whole request, 61 levels in the sky and
+/// 50 transient.
 pub const M1_HALO_SHARE: f32 = 1.0;
 
 /// The m2 halo's peak, as a share of `c` (§5.7): `0.80 · 48 = 38` levels in the sky, 27 transient.
 pub const M2_HALO_SHARE: f32 = 0.80;
 
-/// The m1 halo's radius as a multiple of its nominal arm (`star_arm(ch, STAR_ARM_HERO)`; §5.7): 8 px at 1×, 11 at `ch` 18, 16 at 2×.
+/// The m1 halo's radius as a multiple of its nominal arm (`star_arm(ch, STAR_ARM_HERO)`; §5.7):
+/// 8 px at 1×, 11 at `ch` 18, 16 at 2×.
 pub const M1_HALO_R_ARM: f32 = 3.0;
 
-/// The m2 halo's radius as a multiple of its nominal arm (`star_arm(ch, STAR_ARM_STD)`, §5.7), floored at [`M2_HALO_R_MIN_PX`].
+/// The m2 halo's radius as a multiple of its nominal arm (`star_arm(ch, STAR_ARM_STD)`, §5.7),
+/// floored at [`M2_HALO_R_MIN_PX`].
 pub const M2_HALO_R_ARM: f32 = 2.4;
 
-/// The m2 halo's radius floor in px at the 1× cell (§5.7's `max(6, 2.4·arm)`): below 6 px a radial falloff around a 5 px body reads as a second core.
+/// The m2 halo's radius floor in px at the 1× cell (§5.7's `max(6, 2.4·arm)`): below 6 px a radial
+/// falloff around a 5 px body reads as a second core.
 pub const M2_HALO_R_MIN_PX: f32 = 6.0;
 
 /// [`M2_HALO_R_MIN_PX`] at cell height `ch` ([`px_scale`]).
@@ -253,7 +285,8 @@ pub const fn m2_halo_r_min_px(ch: f32) -> f32 {
     M2_HALO_R_MIN_PX * px_scale(ch)
 }
 
-/// The m2 disc's shoulder: how far the tinted disc reaches past the centre pixel on each axis, px at the 1× cell.
+/// The m2 disc's shoulder: how far the tinted disc reaches past the centre pixel on each axis, px
+/// at the 1× cell.
 pub const M2_DISC_SHOULDER_PX: i32 = 1;
 
 /// [`M2_DISC_SHOULDER_PX`] at cell height `ch` ([`px_at`]).
@@ -263,28 +296,38 @@ pub const fn m2_disc_shoulder_px(ch: f32) -> i32 {
     px_at(ch, M2_DISC_SHOULDER_PX)
 }
 
-/// The halo breathes its hue: how far, in `SPECTRUM_LUT` entries, a halo's colour walks from its star's stop on the luminance clock (+15 at the twinkle peak, −15 at the trough; [`halo_rgb`]).
+/// The halo breathes its hue: how far, in `SPECTRUM_LUT` entries, a halo's colour walks from its
+/// star's stop on the luminance clock (+15 at the twinkle peak, −15 at the trough; [`halo_rgb`]).
 pub const HALO_HUE_SWING_ENTRIES: i32 = 15;
 
-/// The caret law on the star's own centre (`cursor_glow` §8 d: the brightest pixel of the frame is under the cursor): the relative luminance no pixel a sky star composites may exceed, over the ground it sits on.
+/// The caret law on the star's own centre (`cursor_glow` §8 d: the brightest pixel of the frame is
+/// under the cursor): the relative luminance no pixel a sky star composites may exceed, over the
+/// ground it sits on.
 pub const STAR_LIGHT_CEIL: f32 = RAINBOW_CARET_LIGHT_FLOOR * RAINBOW_SPARKLE_LIGHT_SHARE / 255.0;
 
 /// The veil pool's fixed capacity, reserved once (§18).
 pub const AURORA_CAP: usize = 64;
 
-/// How tall the veil is, in `ch`: the box is `bottom − 0.35 ch, bottom)`, `bottom` being the sky band's anchor (the ribbon's top under `tall`, the glyph row's top under `underline`, never lower than the glyph row's top).
+/// How tall the veil is, in `ch`: the box is `[bottom − 0.35 ch, bottom)`, `bottom` being the sky
+/// band's anchor (the ribbon's top under `tall`, the glyph row's top under `underline`, never lower
+/// than the glyph row's top).
 pub const AURORA_TALL_CH: f32 = 0.35;
 
-/// The veil's peak coverage byte at full momentum, at the line: its brightest pixel, since the falloff is centred on the box's bottom edge and each veil is clipped to its own column (no two veils sum).
+/// The veil's peak coverage byte at full momentum, at the line: its brightest pixel, since the
+/// falloff is centred on the box's bottom edge and each veil is clipped to its own column (no two
+/// veils sum).
 pub const AURORA_COV_PEAK: f32 = 40.0;
 
 /// Below this birth spine a key lays no veil.
 pub const AURORA_COLD_DISP: f32 = 0.15;
 
-/// The veil's horizontal falloff radius in `cw`, centred on the cell: at the cell's own edge (`dx = 0.5 cw`) the weight is `0.88`, so a row of clipped per-cell veils reads as one band with a 12 % scallop, not as beads.
+/// The veil's horizontal falloff radius in `cw`, centred on the cell: at the cell's own edge
+/// (`dx = 0.5 cw`) the weight is `0.88`, so a row of clipped per-cell veils reads as one band with
+/// a 12 % scallop, not as beads.
 pub const AURORA_REACH_CW: f32 = 2.0;
 
-/// Veil halos stardust may draw per frame: one `RainHalo` per live cell (a veil never splits across rows).
+/// Veil halos stardust may draw per frame: one `RainHalo` per live cell (a veil never splits across
+/// rows).
 pub const AURORA_HALO_BUDGET: usize = AURORA_CAP;
 
 /// The composited centre of a sky m1 — `STAR_STACK_ADD · c` (§5.2, §3.2 rank 4).
@@ -293,7 +336,8 @@ pub const CENTRE_M1_SKY: f32 = STAR_STACK_ADD * M1_COV_SKY;
 /// The composited centre of a sky m2 — stack plus the [`M2_DISC_ADD`] disc.
 pub const CENTRE_M2_SKY: f32 = (STAR_STACK_ADD + M2_DISC_ADD) * M2_COV_SKY;
 
-/// The composited centre of a sky m3 — the core rect alone, priced at [`M3_CENTRE_ADD`] (the arms are outboard and stack nothing on it).
+/// The composited centre of a sky m3 — the core rect alone, priced at [`M3_CENTRE_ADD`] (the arms
+/// are outboard and stack nothing on it).
 pub const CENTRE_M3_SKY: f32 = M3_CENTRE_ADD * M3_COV_SKY;
 
 /// The composited centre of a transient m1.
@@ -383,7 +427,8 @@ pub const HOLD_M3_TRANSIENT_MS: f32 = 20.0;
 /// Transient m3 half-life, ms.
 pub const TAU_M3_TRANSIENT_MS: f32 = 67.0;
 
-/// The sky lift for an m1/m2 strike star, px per second (§5.6: "lift −3 px/s, integer-stepped, 1-2 px over life").
+/// The sky lift for an m1/m2 strike star, px per second (§5.6: "lift −3 px/s, integer-stepped,
+/// 1-2 px over life").
 pub const SKY_LIFT_PX_PER_S: f32 = -3.0;
 
 /// [`SKY_LIFT_PX_PER_S`] at cell height `ch` ([`px_scale`]).
@@ -393,29 +438,40 @@ pub const fn sky_lift_px_per_s(ch: f32) -> f32 {
     SKY_LIFT_PX_PER_S * px_scale(ch)
 }
 
-/// The slipstream's share: a sky star born under a hand at speed inherits a backward drift of `STREAM_SHARE_CW · cw / IOI` px/s, `IOI` being the observed interval between the last two Typed keys (T4): 3.0 cells of whole travel at 12 cps, 2.0 at 8 cps, nothing at a stroll.
+/// The slipstream's share: a sky star born under a hand at speed inherits a backward drift of
+/// `STREAM_SHARE_CW · cw / IOI` px/s, `IOI` being the observed interval between the last two Typed
+/// keys (T4): 3.0 cells of whole travel at 12 cps, 2.0 at 8 cps, nothing at a stroll.
 pub const STREAM_SHARE_CW: f32 = 1.05;
-/// The drift's decay, ms: `v(age) = v₀ · e^(−age/τ)`, so the sky slows from the instant it is born and a star's travel is bounded whatever the hand does next.
+/// The drift's decay, ms: `v(age) = v₀ · e^(−age/τ)`, so the sky slows from the instant it is born
+/// and a star's travel is bounded whatever the hand does next.
 pub const STREAM_TAU_MS: f32 = 300.0;
-/// Where the drift ends, ms after birth: the longest sky class life (strike m1, 460), so the sky is at rest one star-life after the last key.
+/// Where the drift ends, ms after birth: the longest sky class life (strike m1, 460), so the sky is
+/// at rest one star-life after the last key.
 pub const STREAM_END_MS: f32 = 460.0;
-/// `1 − e^(−STREAM_END_MS / STREAM_TAU_MS)`, the share of the asymptote spent by the drift's end, as a literal.
+/// `1 − e^(−STREAM_END_MS / STREAM_TAU_MS)`, the share of the asymptote spent by the drift's end,
+/// as a literal.
 pub const STREAM_SPENT: f32 = 0.784_11;
-/// The IOI clamp's fast end, ms: the fastest priced hand (33 cps: 525 px/s on a 16 px cell, 8.2 cells of travel, frontier-clamped).
+/// The IOI clamp's fast end, ms: the fastest priced hand (33 cps: 525 px/s on a 15 px cell,
+/// 8.2 cells of travel, frontier-clamped).
 pub const STREAM_IOI_MIN_MS: f32 = 30.0;
-/// The IOI clamp's slow end, ms — and the IOI a session's first key is priced at, having no interval to read (under the stroll gate: nothing).
+/// The IOI clamp's slow end, ms — and the IOI a session's first key is priced at, having no
+/// interval to read (under the stroll gate: nothing).
 pub const STREAM_IOI_MAX_MS: f32 = 600.0;
 /// The stroll gate, open: an IOI at or under this (≥ 6.7 cps) streams at the whole priced velocity.
 pub const STREAM_IOI_RUN_MS: f32 = 150.0;
-/// The stroll gate, closed: an IOI at or over this (≤ 3 cps) streams nothing; between the two gates the velocity is smoothstepped in.
+/// The stroll gate, closed: an IOI at or over this (≤ 3 cps) streams nothing; between the two gates
+/// the velocity is smoothstepped in.
 pub const STREAM_IOI_STROLL_MS: f32 = 333.0;
-/// The spine gate: only a star born at `birth_disp ≥ 0.5` inherits the drift — the second grain's own threshold.
+/// The spine gate: only a star born at `birth_disp ≥ 0.5` inherits the drift — the second grain's
+/// own threshold.
 pub const STREAM_DISP: f32 = 0.5;
 
-/// The exhaust's share, cells of `cw` per key interval (§33): the near layer, four times the sky's, through the same gate, clamp and decay ([`stream_px_per_s_with_share`]).
+/// The exhaust's share, cells of `cw` per key interval (§33): the near layer, four times the sky's,
+/// through the same gate, clamp and decay ([`stream_px_per_s_with_share`]).
 pub const EXHAUST_SHARE_CW: f32 = 4.0 * STREAM_SHARE_CW;
 
-/// The slipstream's velocity, px/s backward, for cell width `cw` and observed key interval `ioi_ms`: [`stream_px_per_s_with_share`] at [`STREAM_SHARE_CW`].
+/// The slipstream's velocity, px/s backward, for cell width `cw` and observed key interval
+/// `ioi_ms`.
 #[inline]
 #[must_use]
 pub const fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
@@ -434,7 +490,8 @@ const fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
     share * cw * 1000.0 / ioi * gate
 }
 
-/// The whole travel, px, of a star born at `px_per_s`: the drift's integral, `v₀ · τ · STREAM_SPENT`.
+/// The whole travel, px, of a star born at `px_per_s`: the drift's integral,
+/// `v₀ · τ · STREAM_SPENT`.
 #[inline]
 #[must_use]
 pub const fn stream_travel_px(px_per_s: f32) -> f32 {
@@ -450,31 +507,44 @@ fn stream_unit(age_ms: f32) -> f32 {
     ((1.0 - (-age_ms.max(0.0) / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
 }
 
-/// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`], §23) takes its strike as an m2 born at the erased cell's sky (grabbing the star the Backspace was retiring, if live) and pulled one cell into the caret's on the throw's ease-out, then pinned.
+/// The mend's pull window, ms: a key that mends a typo run ([`super::Mend`], §23) takes its strike
+/// as an m2 (an m1 for an earned key) born at the erased cell's sky (grabbing the star the
+/// Backspace was retiring, if live) and pulled one cell into the caret's on the throw's ease-out,
+/// then pinned.
 pub const MEND_PULL_MS: f32 = 110.0;
 
 /// The drag time constant of a shed fragment, ms (§5.6).
 pub const DRAG_TAU_MS: f32 = 90.0;
 
-/// The erase throw's window, ms (§5.6: "radial throw 2-4 px over 80 ms ease-out, up and away from the caret, then pinned + twinkling").
+/// The erase throw's window, ms (§5.6: "radial throw 2-4 px over 80 ms ease-out, up and away from
+/// the caret, then pinned + twinkling").
 pub const ERASE_THROW_MS: f32 = 80.0;
 
-/// The exhaust throw's window, ms (§33), under the transient lives so grains die on the wing: a transient m3 (175.6 ms) reaches its reach with 16 ms left, while the 1-in-4 m2 (245.9 ms) lands and twinkles for 86 ms.
+/// The exhaust throw's window, ms (§33), under the transient lives so grains die on the wing: a
+/// transient m3 (175.6 ms) reaches its reach with 16 ms left, while the 1-in-4 m2 (245.9 ms) lands
+/// and twinkles for 86 ms.
 pub const EXHAUST_THROW_MS: f32 = 160.0;
 
-/// The exhaust's rise, cells of `ch`: how far a grain lifts over its throw, dealt 0.5..1.0 of it by seed.
+/// The exhaust's rise, cells of `ch`: how far a grain lifts over its throw, dealt 0.5..1.0 of it by
+/// seed.
 pub const EXHAUST_RISE_CH: f32 = 0.15;
 
-/// The exhaust's m2 deal: one grain in 4 is an m2, only where the birth spine (never flow's heat) is at or over [`FIELD_HOT_DISP`].
+/// The exhaust's m2 deal: one grain in 4 is an m2, only where the birth spine (never flow's heat)
+/// is at or over [`FIELD_HOT_DISP`].
 pub const EXHAUST_M2_IN: u32 = 4;
 
-/// The exhaust's headroom: nothing is thrown while the live sky is within this many stars of [`STAR_CAP`], leaving room for what a key and a nav gesture bring (a strike, a field star, a five-star fan and its shed), so a spark never causes a hero's eviction.
+/// The exhaust's headroom: nothing is thrown while the live sky is within this many stars of
+/// [`STAR_CAP`], leaving room for what a key and a nav gesture bring (a strike, a field star, a
+/// five-star fan and its shed), so a spark never causes a hero's eviction.
 pub const EXHAUST_HEADROOM: usize = 8;
 
-/// The landing fan's window, ms: at the m2's 30 ms hold the throw has covered 47 % of the reach, 60 % at the hero's 40 ms, so all five stars clear a 15×28 caret cell (under the host's opaque caret) before their brightest hold is spent; they then twinkle pinned.
+/// The landing fan's window, ms: at the m2's 30 ms hold the throw has covered 47 % of the reach,
+/// 60 % at the hero's 40 ms, so all five stars clear a 15×28 caret cell (under the host's opaque
+/// caret) before their brightest hold is spent; they then twinkle pinned.
 pub const FAN_THROW_MS: f32 = 110.0;
 
-/// The mini-fan's window, ms, on the same reasoning as [`FAN_THROW_MS`]: the hop's pixels are covered inside the m2's hold.
+/// The mini-fan's window, ms, on the same reasoning as [`FAN_THROW_MS`]: the hop's pixels are
+/// covered inside the m2's hold.
 pub const MINI_FAN_THROW_MS: f32 = 100.0;
 
 const _: () = assert!(
@@ -491,19 +561,24 @@ pub const FAN_THROW_JITTER_MIN: f32 = 0.55;
 /// Upper end of the fan's per-star throw jitter (§6.5 layer 11).
 pub const FAN_THROW_JITTER_MAX: f32 = 1.05;
 
-/// The fan's vertical squash: distance buys the fan length along the line, not height, at this aspect.
+/// The fan's vertical squash: distance buys the fan length along the line, not height, at this
+/// aspect.
 pub const FAN_SQUASH: f32 = 0.62;
 
-/// The fan's rise ceiling, in `ch`, above and below the landing row's centre: the smallest fan's reach (the Enter landing's D8 reach), so no fan rises higher than the smallest fan is thrown.
+/// The fan's rise ceiling, in `ch`, above and below the landing row's centre: the smallest fan's
+/// reach (the Enter landing's D8 reach), so no fan rises higher than the smallest fan is thrown.
 pub const FAN_RISE_MAX_CH: f32 = 1.6;
 
-/// Lower end of the per-star jitter on the rise cap, `cap·(0.80..1.00)`, seeded, so re-aimed stars scatter under the ceiling instead of lining up on it (§6.5 layer 11).
+/// Lower end of the per-star jitter on the rise cap, `cap·(0.80..1.00)`, seeded, so re-aimed stars
+/// scatter under the ceiling instead of lining up on it (§6.5 layer 11).
 pub const FAN_RISE_JITTER_MIN: f32 = 0.80;
 
-/// The focus-lost ember, ms (§8.2): every live star is put on a 300 ms `spend` finish beside the ribbon's own ember.
+/// The focus-lost ember, ms (§8.2): every live star is put on a 300 ms `spend` finish beside the
+/// ribbon's own ember.
 pub const FOCUS_EMBER_MS: f32 = 300.0;
 
-/// Minimum radial reach of an erase throw, px at the 1× cell (§5.6; scaled by [`px_scale`] where thrown, like every reach and sputter below).
+/// Minimum radial reach of an erase throw, px at the 1× cell (§5.6; scaled by [`px_scale`] where
+/// thrown, like every reach and sputter below).
 pub const ERASE_REACH_MIN_PX: f32 = 2.0;
 /// Maximum radial reach of an erase throw, px at the 1× cell (§5.6).
 pub const ERASE_REACH_MAX_PX: f32 = 4.0;
@@ -512,7 +587,8 @@ pub const MINI_FAN_REACH_MIN_PX: f32 = 1.0;
 /// Maximum radial reach of a mini-fan throw, px at the 1× cell (§5.6).
 pub const MINI_FAN_REACH_MAX_PX: f32 = 2.0;
 
-/// Share of the meteor head's velocity a shed fragment inherits along the path (§5.6: `v₀ = 0.12·v_head`).
+/// Share of the meteor head's velocity a shed fragment inherits along the path (§5.6:
+/// `v₀ = 0.12·v_head`).
 pub const SHED_ALONG_SHARE: f32 = 0.12;
 /// Minimum perpendicular sputter of a shed fragment, px/ms at the 1× cell (§5.6).
 pub const SHED_PERP_MIN: f32 = 0.4;
@@ -523,7 +599,7 @@ pub const SHED_PERP_MAX: f32 = 1.1;
 pub const ERASE_M3_N: u16 = 3;
 /// Erase: how many m2 stars one Backspace throws (§5.6).
 pub const ERASE_M2_N: u16 = 1;
-/// A kill mints one star per this many erased cells (§5.6, and [`Event::Kill`]'s own restatement: "1 star per 3 cells, cap 8").
+/// A kill mints one star per this many erased cells (§5.6).
 pub const KILL_CELLS_PER_STAR: u16 = 3;
 /// Maximum stars minted by a single kill gesture.
 pub const KILL_STAR_MAX: u16 = 8;
@@ -538,7 +614,10 @@ pub const STARDUST_QUAD_BUDGET: usize = 284;
 /// Haloed stars stardust may draw on one frame (§18: "≤ 16", the cap's 4 m1 + 12 m2).
 pub const STARDUST_HALO_BUDGET: usize = 16;
 
-/// Source-over `RainHalo`s stardust may spend on one light frame. §3.3 draws every light star as ink ([`push_twinkle_over_twin`] spends up to five per star, split per crossed row); §18 holds a light frame to ≤ 400 of `MAX_HALOS 512`, with the meteor's train chain at 96 ahead of the sky.
+/// Source-over `RainHalo`s stardust may spend on one light frame. §3.3 draws every light star as
+/// ink ([`push_twinkle_over_twin`] lays five shapes per star, nine with gold glints, each split per
+/// crossed row); §18 holds a light frame to ≤ 400 of `MAX_HALOS 512`, with the meteor's train
+/// chain at 96 ahead of the sky.
 pub const STARDUST_LIGHT_HALO_BUDGET: usize = 268;
 
 const _: () = assert!(
@@ -546,17 +625,21 @@ const _: () = assert!(
     "§18: the light frame's 400-halo law — train chain + sky"
 );
 
-/// The source-over ceiling of a light-theme star mark (§3.3: `light_ink_bold` is `InkRole::Leading`, cap 236).
+/// The source-over ceiling of a light-theme star mark (§3.3: `light_ink_bold` is
+/// `InkRole::Leading`, cap 236).
 pub const LIGHT_ALPHA_CAP: f32 = 236.0;
 
 /// A star's magnitude: the distribution that makes a field a field (§5.1 no. 2, §5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StarClass {
-    /// The hero: white body + tapers, four tinted stubs, a tinted halo, and (gold only, at twinkle peak only) four diagonal glints.
+    /// The hero: white body + tapers, four tinted stubs, a tinted halo, and (gold only, at twinkle
+    /// peak only) four diagonal glints.
     M1,
-    /// The medium star: a tint-washed body + tapers ([`M2_BODY_TINT`]), a 3×3 disc (sky lane only), four tinted stubs, a small halo.
+    /// The medium star: a tint-washed body + tapers ([`M2_BODY_TINT`]), a 3×3 disc (sky lane only),
+    /// four tinted stubs, a small halo.
     M2,
-    /// The grain: a 1-px core with four arms at [`M3_CROSS_ADD`]·c outboard of it (its Airy disc), all in its cell's stop.
+    /// The grain: a 1-px core with four arms at [`M3_CROSS_ADD`]·c outboard of it (its Airy disc),
+    /// all in its cell's stop.
     M3,
 }
 
@@ -586,7 +669,8 @@ impl StarClass {
         }
     }
 
-    /// The arm clock's floor, as a share of the nominal arm (§5.5): m2/m3 swing at full depth, m1 only ±12 %.
+    /// The arm clock's floor, as a share of the nominal arm (§5.5): m2/m3 swing at full depth, m1
+    /// only ±12 %.
     #[inline]
     #[must_use]
     pub const fn arm_floor(self) -> f32 {
@@ -596,7 +680,8 @@ impl StarClass {
         }
     }
 
-    /// The smallest integer arm this class is ever drawn at, at cell height `ch` (§5.5 at `ch` 18: m1 3 ↔ 4, m2 2 ↔ 3, m3 1 ↔ 2 px).
+    /// The smallest integer arm this class is ever drawn at, at cell height `ch` (§5.5 at `ch` 18:
+    /// m1 3 ↔ 4, m2 2 ↔ 3, m3 1 ↔ 2 px).
     #[inline]
     #[must_use]
     pub const fn arm_min_px(self, ch: f32) -> i32 {
@@ -606,7 +691,8 @@ impl StarClass {
         }
     }
 
-    /// The core-brightness floor on the luminance clock (§5.5's table): m1 `0.85 + 0.15·e`, m2 `0.70 + 0.30·e`, m3 `env` at full depth.
+    /// The core-brightness floor on the luminance clock (§5.5's table): m1 `0.85 + 0.15·e`, m2
+    /// `0.70 + 0.30·e`, m3 `env` at full depth.
     #[inline]
     #[must_use]
     pub const fn core_floor(self) -> f32 {
@@ -632,7 +718,8 @@ impl StarClass {
         (h / 1000.0, t / 1000.0)
     }
 
-    /// This class's whole life in seconds for `lane`: `H + 2.32·τ`, deriving the published 225 / 340 / 460 ms.
+    /// This class's whole life in seconds for `lane`: `H + 2.32·τ`, deriving the published
+    /// 225 / 340 / 460 ms.
     #[inline]
     #[must_use]
     pub const fn life_s(self, lane: StarLane) -> f32 {
@@ -644,7 +731,8 @@ impl StarClass {
     }
 }
 
-/// Which population minted a star (§5.6), and so how it is priced, how long it lives, how it moves, and whether it may touch the glint bucket.
+/// Which population minted a star (§5.6), and so how it is priced, how long it lives, how it moves,
+/// and whether it may touch the glint bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StarLane {
     /// Born on every typed glyph, in the sky band of the new cell.
@@ -653,7 +741,8 @@ pub enum StarLane {
     Field,
     /// Born on Backspace (and per 3 cells of a kill, cap 8) around the erased cells.
     Erase,
-    /// The exhaust (§33): one per typed key, born in the caret cell's sky band and thrown back along the row on its own wind ([`EXHAUST_SHARE_CW`], [`EXHAUST_THROW_MS`]).
+    /// The exhaust (§33): one per typed key, born in the caret cell's sky band and thrown back
+    /// along the row on its own wind ([`EXHAUST_SHARE_CW`], [`EXHAUST_THROW_MS`]).
     Exhaust,
     /// The meteor's shed fragments (§6.5 layer 5).
     Shed,
@@ -664,21 +753,24 @@ pub enum StarLane {
 }
 
 impl StarLane {
-    /// True for the sky lanes — priced by the sparkle law, composited centre ≤ [`super::timing::FIELD_STAR_COV_CEIL`] (§5.2 ceiling 1).
+    /// True for the sky lanes — priced by the sparkle law, composited centre ≤
+    /// [`super::timing::FIELD_STAR_COV_CEIL`] (§5.2 ceiling 1).
     #[inline]
     #[must_use]
     pub const fn is_sky(self) -> bool {
         matches!(self, Self::Strike | Self::Field)
     }
 
-    /// True for the transient lanes — they fly over ink, so they are priced by [`super::timing::TRANSIENT_STAR_COV_CEIL`] (§5.2 ceiling 2).
+    /// True for the transient lanes — they fly over ink, so they are priced by
+    /// [`super::timing::TRANSIENT_STAR_COV_CEIL`] (§5.2 ceiling 2).
     #[inline]
     #[must_use]
     pub const fn is_transient(self) -> bool {
         !self.is_sky()
     }
 
-    /// True where a star may cue a glint at all (§13): erase-born stardust and the exhaust never chime, and meteor-lane stars ride the rain instead.
+    /// True where a star may cue a glint at all (§13): erase-born stardust and the exhaust never
+    /// chime, and meteor-lane stars ride the rain instead.
     #[inline]
     #[must_use]
     pub const fn may_chime(self) -> bool {
@@ -738,12 +830,14 @@ impl Motion {
     }
 }
 
-/// A star's finish: how a star leaves before its life is up (§5.6's cap, §8.2's focus ember, field stars dying with their cells).
+/// A star's finish: how a star leaves before its life is up (§5.6's cap, §8.2's focus ember, field
+/// stars dying with their cells).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Finish {
     /// The edge the finish started on.
     pub at: Instant,
-    /// The finish's span in seconds — 0.040 for an eviction, 0.300 for the focus ember, the cell's own retract for a field star.
+    /// The finish's span in seconds — 0.040 for an eviction, 0.300 for the focus ember, the cell's
+    /// own retract for a field star.
     pub span_s: f32,
 }
 
@@ -795,7 +889,8 @@ pub struct Star {
     pub class: StarClass,
     /// Population (§5.6) — pricing, envelope, motion, budget behaviour.
     pub lane: StarLane,
-    /// Window-absolute X of the centre, pinned to a device pixel at birth (§5.4): drift is expressed as integer steps of the centre.
+    /// Window-absolute X of the centre, pinned to a device pixel at birth (§5.4): drift is
+    /// expressed as integer steps of the centre.
     pub x: f32,
     /// Window-absolute Y of the centre, pinned the same way.
     pub y: f32,
@@ -803,21 +898,28 @@ pub struct Star {
     pub home_row: Option<u16>,
     /// The birth edge.
     pub born: Instant,
-    /// The last key edge that lit this star: the field lane's fade clock ([`FIELD_HOLD_MS`] / [`FIELD_TAU_MS`] run from here).
+    /// The last key edge that lit this star: the field lane's fade clock ([`FIELD_HOLD_MS`] /
+    /// [`FIELD_TAU_MS`] run from here).
     pub lit: Instant,
     /// Deterministic seed, hashed from `(row, col, mint)` at the spawn edge (§18).
     pub seed: u32,
-    /// The star's chroma, constant for its life: one of the seven snapped stops, [`TINT_WHITE_RGB`] or [`TINT_GOLD_RGB`] (§5.3, C1).
+    /// The star's chroma, constant for its life: one of the seven snapped stops, [`TINT_WHITE_RGB`]
+    /// or [`TINT_GOLD_RGB`] (§5.3, C1).
     pub tint: u32,
-    /// True for a gold star (§5.3's 15 % deal, or the fan's hero, D6): the only stars with diagonal glints (§5.2).
+    /// True for a gold star (§5.3's 15 % deal, or the fan's hero, D6): the only stars with diagonal
+    /// glints (§5.2).
     pub gold: bool,
-    /// Birth velocity in px/ms, `(vx, vy)`: the throw for erase / fan / mini-fan, the inherited `0.12·v_head` for a shed fragment, the −3 px/s lift for a sky m1/m2.
+    /// Birth velocity in px/ms, `(vx, vy)`: the throw for erase / fan / mini-fan, the inherited
+    /// `0.12·v_head` for a shed fragment, the −3 px/s lift for a sky m1/m2.
     pub v0: (f32, f32),
     /// The seeded arm-size scintillation rate, Hz, in `[SCINT_F_MIN, SCINT_F_MAX]` (§5.5, D12).
     pub f: f32,
-    /// The slipstream's travel, px ≥ 0: how far this star drifts backward over [`STREAM_END_MS`], priced once at birth from the observed key interval (T4) and clamped to its row's blank frontier ([`Stardust::stream_reach`], L4).
+    /// The slipstream's travel, px ≥ 0: how far this star drifts backward over [`STREAM_END_MS`],
+    /// priced once at birth from the observed key interval (T4) and clamped to its row's blank
+    /// frontier ([`Stardust::stream_reach`], L4).
     pub stream: f32,
-    /// The mend's pull, px ≥ 0: how far left of its home this star was born, drawn in over [`MEND_PULL_MS`] ([`Star::pos`]).
+    /// The mend's pull, px ≥ 0: how far left of its home this star was born, drawn in over
+    /// [`MEND_PULL_MS`] ([`Star::pos`]).
     pub pull: f32,
     /// The finish this star is on, if any ([`Finish`]).
     pub finish: Option<Finish>,
@@ -829,14 +931,15 @@ const _: () = assert!(
 );
 
 impl Star {
-    /// Seconds since birth, saturating at zero (a star handed a `now` before its own edge is a newborn, never a negative age).
+    /// Seconds since birth, saturating at zero.
     #[inline]
     #[must_use]
     pub fn age_s(&self, now: Instant) -> f32 {
         now.saturating_duration_since(self.born).as_secs_f32()
     }
 
-    /// Seconds since the last key that lit this star ([`Star::lit`]), saturating at zero — the field fade's clock.
+    /// Seconds since the last key that lit this star ([`Star::lit`]), saturating at zero — the
+    /// field fade's clock.
     #[inline]
     #[must_use]
     pub fn idle_s(&self, now: Instant) -> f32 {
@@ -850,14 +953,17 @@ impl Star {
         self.class.life_s(self.lane)
     }
 
-    /// Born at full: true inside the class hold `H` (§5.6), when a star draws at its nominal arm and full core; both scintillation clocks take over at `age ≥ H`, still reading `now − born`.
+    /// Born at full: true inside the class hold `H` (§5.6), when a star draws at its nominal arm
+    /// and full core; both scintillation clocks take over at `age ≥ H`, still reading `now − born`.
     #[inline]
     #[must_use]
     pub fn in_hold(&self, now: Instant) -> bool {
         self.age_s(now) < self.class.envelope_s(self.lane).0
     }
 
-    /// True once the star must leave the pool: past its life, past the point where its [`Finish`] alone takes it under [`STAR_CULL_ALPHA`], or (a field star) past the field fade from its row's last key ([`field_fade_life_s`]).
+    /// True once the star must leave the pool: past its life, past the point where its [`Finish`]
+    /// alone takes it under [`STAR_CULL_ALPHA`], or (a field star) past the field fade from its
+    /// row's last key ([`field_fade_life_s`]).
     #[inline]
     #[must_use]
     pub fn dead(&self, now: Instant) -> bool {
@@ -866,7 +972,8 @@ impl Star {
             || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
     }
 
-    /// The population envelope at `now`: `1` for the hold, then half-life τ (§5.6), times the [`Finish`] if any.
+    /// The population envelope at `now`: `1` for the hold, then half-life τ (§5.6), times the
+    /// [`Finish`] if any.
     #[inline]
     #[must_use]
     pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
@@ -902,7 +1009,8 @@ impl Star {
         px_col(self.x, geom)
     }
 
-    /// Whether this star is in the sky of `row`: "row or row − 1" depending on the ribbon spelling ([`in_sky_of_row`]).
+    /// Whether this star is in the sky of `row`: its pixel row is `row` or `row − 1`
+    /// ([`in_sky_of_row`]).
     #[inline]
     #[must_use]
     pub fn in_sky_of(&self, row: u16, geom: Geom) -> bool {
@@ -919,7 +1027,8 @@ impl Star {
         !SPECTRUM_ANCHORS[WARM_STOPS..].contains(&self.tint)
     }
 
-    /// The luminance phase, radians (§5.5): `φ = hash(row, col, seed)·2π`; warm tints take `φ`, cool ones `φ + π`, so warm and cool neighbours never blink together.
+    /// The luminance phase, radians (§5.5): `φ = hash(row, col, seed)·2π`; warm tints take `φ`,
+    /// cool ones `φ + π`, so warm and cool neighbours never blink together.
     #[inline]
     #[must_use]
     pub fn lum_phase(&self) -> f32 {
@@ -931,14 +1040,16 @@ impl Star {
         }
     }
 
-    /// The certified 2.86 Hz luminance envelope at `now` (§5.5; `effect_util::twinkle_env`, `TWINKLE_OMEGA 9` rad/s, under WCAG 2.3.1's general-flash bound).
+    /// The certified 2.86 Hz luminance envelope at `now` (§5.5; `effect_util::twinkle_env`,
+    /// `TWINKLE_OMEGA 9` rad/s, under WCAG 2.3.1's general-flash bound).
     #[inline]
     #[must_use]
     pub fn twinkle(&self, now: Instant) -> f32 {
         twinkle_env(self.age_s(now), self.lum_phase())
     }
 
-    /// True where this star's body and nucleus may carry `push_twinkle_star`'s diagonal glints: gold only, at twinkle peak only (§5.2, §5.7).
+    /// True where this star's body and nucleus may carry `push_twinkle_star`'s diagonal glints:
+    /// gold only, at twinkle peak only (§5.2, §5.7).
     #[inline]
     #[must_use]
     pub fn glinting(&self, now: Instant) -> bool {
@@ -951,7 +1062,9 @@ impl Star {
         self.lane != StarLane::Exhaust || light_keeps(self.seed, cfg)
     }
 
-    /// Whether this star moves or ramps every frame: a throw inside its window, a shed fragment under drag (for its whole life), or a field star inside its 18 ms `edge-in`.
+    /// Whether this star moves or ramps every frame: a throw inside its window, a mend pull inside
+    /// [`MEND_PULL_MS`], a shed fragment under drag (for its whole life), or a field star inside
+    /// its 18 ms `edge-in`.
     #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
@@ -972,7 +1085,10 @@ impl Star {
         }
     }
 
-    /// Seconds until this star's integer arm next steps on §5.5's size clock, `arm = round(A·(floor + (1 − floor)·sin²(2π·f·age + φ)))` at cell height `ch`, solved in closed form: the arm toggles where `sin²` crosses `((k + 0.5)/A − floor)/(1 − floor)`, twice per `1/(2f)` period, so it is never more than 62.5 ms away.
+    /// Seconds until this star's integer arm next steps on §5.5's size clock,
+    /// `arm = round(A·(floor + (1 − floor)·sin²(2π·f·age + φ)))` at cell height `ch`, solved in
+    /// closed form: the arm toggles where `sin²` crosses `((k + 0.5)/A − floor)/(1 − floor)`, twice
+    /// per `1/(2f)` period, so it is never more than 62.5 ms away.
     #[inline]
     #[must_use]
     pub fn next_arm_step_s(&self, ch: f32, now: Instant) -> Option<f32> {
@@ -1004,7 +1120,8 @@ impl Star {
         best
     }
 
-    /// Seconds until a gold star's diagonal glints next switch (`|sin(ω·age + φ)| ≥ 0.92`, §5.2, §5.5), exact on the luminance clock.
+    /// Seconds until a gold star's diagonal glints next switch (`|sin(ω·age + φ)| ≥ 0.92`, §5.2,
+    /// §5.5), exact on the luminance clock.
     #[inline]
     #[must_use]
     pub fn next_glint_toggle_s(&self, now: Instant) -> Option<f32> {
@@ -1015,7 +1132,8 @@ impl Star {
         next_sine_crossing_s(theta, TWINKLE_GLINT_FRAC.asin(), TWINKLE_OMEGA)
     }
 
-    /// Seconds until a lifting star's integer position next steps (§5.6): `pos = origin + round(v₀·age)` steps where `|v₀|·age` next reaches a half.
+    /// Seconds until a lifting star's integer position next steps (§5.6):
+    /// `pos = origin + round(v₀·age)` steps where `|v₀|·age` next reaches a half.
     #[inline]
     #[must_use]
     pub fn next_lift_step_s(&self, now: Instant) -> Option<f32> {
@@ -1045,7 +1163,8 @@ impl Star {
         (self.stream * stream_unit(age_ms)).round() as i32
     }
 
-    /// Seconds until a streaming star's integer position next steps: where `stream · u(age)` next reaches a half, solved as `age = −τ · ln(1 − u · STREAM_SPENT)` ([`stream_unit`]).
+    /// Seconds until a streaming star's integer position next steps: where `stream · u(age)` next
+    /// reaches a half, solved as `age = −τ · ln(1 − u · STREAM_SPENT)` ([`stream_unit`]).
     #[inline]
     #[must_use]
     pub fn next_stream_step_s(&self, now: Instant) -> Option<f32> {
@@ -1091,7 +1210,9 @@ impl Star {
         (x - self.stream_px(age_ms) - self.pull_px(age_ms), y)
     }
 
-    /// Where this star comes to rest: its position at the end of its motion (a throw's reach, a drift's or lift's death). §5.4's transient clearance is asked of this pixel ([`Stardust::settle`]): a core never lands on a probed glyph.
+    /// Where this star comes to rest: its position at the end of its motion (a throw's reach, a
+    /// drift's or lift's death). §5.4's transient clearance is asked of this pixel
+    /// ([`Stardust::settle`]): a core never lands on a probed glyph.
     #[inline]
     #[must_use]
     pub fn rest(&self) -> (i32, i32) {
@@ -1129,7 +1250,8 @@ impl Star {
     }
 }
 
-/// The shared glint token bucket (§8.1 no. 2, §13, D5), refilled on the frame clock in `Engine::tick`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
+/// The shared glint token bucket (§8.1 no. 2, §13, D5), refilled on the frame clock in
+/// `Engine::tick`: `tokens = min(GLINT_CAP, tokens + GLINT_REFILL_PER_S · dt)`.
 #[derive(Clone, Copy, Debug)]
 pub struct StarBudget {
     tokens: f32,
@@ -1144,7 +1266,7 @@ impl Default for StarBudget {
 }
 
 impl StarBudget {
-    /// A full bucket (see [`StarBudget::at`]).
+    /// A full bucket, whose first [`Self::refill`] adds nothing.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -1174,7 +1296,8 @@ impl StarBudget {
         true
     }
 
-    /// A meteor empties the bucket on its move edge (§8.1 no. 2, §13), so the ~250 ms of typing under the rain is silent.
+    /// A meteor empties the bucket on its move edge (§8.1 no. 2, §13), so the ~250 ms of typing
+    /// under the rain is silent.
     #[inline]
     pub const fn empty(&mut self) {
         self.tokens = 0.0;
@@ -1188,16 +1311,20 @@ impl StarBudget {
     }
 }
 
-/// One glint the sky has earned and paid for (§13): one sine at a lattice degree, octave-folded into 2800, 5600) Hz, amplitude-twinkled at the star's own scintillation rate.
+/// One glint the sky has earned and paid for (§13): one sine at a lattice degree, octave-folded
+/// into `[2800, 5600)` Hz, amplitude-twinkled at the star's own scintillation rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glint {
-    /// The hero's column, which the host maps to stereo pan (§13: "pan = the star's column ± 0.03").
+    /// The hero's column, which the host maps to stereo pan (§13: "pan = the star's column
+    /// ± 0.03").
     pub col: u16,
-    /// The star's seeded scintillation rate, Hz — the glint's amplitude twinkle rides it at depth 0.5, so the sound opens and closes with the light it belongs to.
+    /// The star's seeded scintillation rate, Hz — the glint's amplitude twinkle rides it at depth
+    /// 0.5, so the sound opens and closes with the light it belongs to.
     pub f: f32,
 }
 
-/// What this frame knows about the glyphs: the snapshot §5.4's birth gate is asked of, so a star is never drawn over a stroke (L4).
+/// What this frame knows about the glyphs: the snapshot §5.4's birth gate is asked of, so a star is
+/// never drawn over a stroke (L4).
 #[derive(Clone, Debug, Default)]
 pub struct GlyphProbe {
     rows: [ProbedRow; Self::ROWS],
@@ -1211,13 +1338,17 @@ pub enum CellInk {
     /// A blank (`' '`): provably clear, `Some(false)` everywhere.
     #[default]
     Blank,
-    /// Any other glyph, a wide continuation (`'\0'`) included: `Some(true)` at every pixel of the cell (L4's law, unchanged).
+    /// Any other glyph, a wide continuation (`'\0'`) included: `Some(true)` at every pixel of the
+    /// cell (L4's law).
     Glyph,
-    /// A light horizontal box-drawing rule (`─` U+2500 and its dashed and half-length siblings): `Some(true)` only inside [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`], `Some(false)` above and below.
+    /// A light horizontal box-drawing rule (`─` U+2500 and its dashed and half-length siblings):
+    /// `Some(true)` only inside [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`], `Some(false)` above and
+    /// below.
     Rule,
 }
 
-/// Classify one probed char (the host's `Terminal::row_cols_into` convention: `'\0'` at a wide continuation, `' '` for a blank).
+/// Classify one probed char (the host's `Terminal::row_cols_into` convention: `'\0'` at a wide
+/// continuation, `' '` for a blank).
 #[inline]
 #[must_use]
 pub const fn cell_ink(ch: char) -> CellInk {
@@ -1230,7 +1361,8 @@ pub const fn cell_ink(ch: char) -> CellInk {
     }
 }
 
-/// Where a light horizontal rule's stroke begins, as a fraction of the cell height from its top (§5.4).
+/// Where a light horizontal rule's stroke begins, as a fraction of the cell height from its top
+/// (§5.4).
 pub const RULE_INK_TOP_CH: f32 = 0.35;
 
 /// Where a light horizontal rule's stroke ends, as a fraction of the cell height from its top.
@@ -1253,7 +1385,9 @@ const _: () = assert!(
     "a rise out of the underline zone must stop short of the row above's stroke band"
 );
 
-/// The stroke band in whole pixels: the device-pixel offsets from a cell's top that a light rule's band covers at cell height `ch`, half-open; the one rounding the pixel probe and the rise's headroom share.
+/// The stroke band in whole pixels: the device-pixel offsets from a cell's top that a light rule's
+/// band covers at cell height `ch`, half-open; the one rounding the pixel probe and the rise's
+/// headroom share.
 #[inline]
 #[must_use]
 pub fn rule_stroke_px(ch: usize) -> std::ops::Range<i32> {
@@ -1270,10 +1404,12 @@ struct ProbedRow {
 }
 
 impl GlyphProbe {
-    /// How many rows a probe holds — the caret's and its two neighbours, which is exactly what `CursorGlow` captures.
+    /// How many rows a probe holds — the caret's and its two neighbours, which is exactly what
+    /// `CursorGlow` captures.
     pub const ROWS: usize = 3;
 
-    /// Nothing probed: every in-grid cell answers `None`, so no sky star is born until the host has looked (§5.4).
+    /// Nothing probed: every in-grid cell answers `None`, so no sky star is born until the host has
+    /// looked (§5.4).
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -1292,7 +1428,8 @@ impl GlyphProbe {
         }
     }
 
-    /// [`Self::probe_row`] with the per-cell class ([`cell_ink`]): a [`CellInk::Rule`] is recorded as ink (for [`Self::at`]) and as a rule (for [`Self::at_px`]'s stroke band).
+    /// [`Self::probe_row`] with the per-cell class ([`cell_ink`]): a [`CellInk::Rule`] is recorded
+    /// as ink (for [`Self::at`]) and as a rule (for [`Self::at_px`]'s stroke band).
     #[inline]
     pub fn probe_row_ink(&mut self, row: i32, cells: &[CellInk]) {
         let slot = self.slot_for(row, cells.len());
@@ -1352,14 +1489,16 @@ impl GlyphProbe {
         slot
     }
 
-    /// Forget everything: a reset, a layout change, a style switch, and every scroll or band move (the host re-probes before the next deal).
+    /// Forget everything: a reset, a layout change, a style switch, and every scroll or band move
+    /// (the host re-probes before the next deal).
     #[inline]
     pub const fn clear(&mut self) {
         self.live = 0;
         self.at = 0;
     }
 
-    /// The gate (§5.4): `Some(true)` a glyph is there, `Some(false)` provably blank, `None` outside this probe's knowledge.
+    /// The gate (§5.4): `Some(true)` a glyph is there, `Some(false)` provably blank, `None` outside
+    /// this probe's knowledge.
     #[inline]
     #[must_use]
     pub fn at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
@@ -1383,7 +1522,9 @@ impl GlyphProbe {
         Some(inked)
     }
 
-    /// [`Self::at`] for §5.4's sky question: does this `row − 1` cell carry ink the zone `[top − 0.30 ch, top − 0.04 ch]` could touch? A light rule answers `Some(false)` here (its band ends where the zone begins) while [`Self::at`] still says `Some(true)`.
+    /// [`Self::at`] for §5.4's sky question: does this `row − 1` cell carry ink the zone
+    /// `[top − 0.30 ch, top − 0.04 ch]` could touch? A light rule answers `Some(false)` here (its
+    /// band ends where the zone begins) while [`Self::at`] still says `Some(true)`.
     #[inline]
     #[must_use]
     pub fn sky_at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
@@ -1456,9 +1597,11 @@ pub struct ShedSow {
     pub at_px: (f32, f32),
     /// The head's own velocity in px/ms, unscaled.
     pub v_head: (f32, f32),
-    /// The meteor's arc position at this station: the fragment wears `spectrum_snap(t_m(s_i))`, the train's colour where it was shed (§6.5 layer 5, C1).
+    /// The meteor's arc position at this station: the fragment wears `spectrum_snap(t_m(s_i))`, the
+    /// train's colour where it was shed (§6.5 layer 5, C1).
     pub tint_t: f32,
-    /// This station's seed, hashed from the flight's seed and the station index, so a flight sheds the same debris every time (§18).
+    /// This station's seed, hashed from the flight's seed and the station index, so a flight sheds
+    /// the same debris every time (§18).
     pub seed: u32,
     /// How many grains at this station; the meteor's law is one.
     pub n: u16,
@@ -1469,13 +1612,15 @@ pub struct ShedSow {
 pub struct FanSow {
     /// Window-absolute px of the landing cell's centre.
     pub at_px: (f32, f32),
-    /// Throw reach in px — the length of the outermost star's throw on [`Motion::Throw`]'s ease-out over [`FAN_THROW_MS`], along the line; its rise is the sky's ([`fan_rise`]).
+    /// Throw reach in px — the length of the outermost star's throw on [`Motion::Throw`]'s ease-out
+    /// over [`FAN_THROW_MS`], along the line; its rise is the sky's ([`fan_rise`]).
     pub reach: f32,
-    /// The landing's walk ([`LandingWalk`]): `walk.at(0.0)` is the pin's stop, and a star thrown `dx` px along the row snaps to `walk.at(dx / cw)` (C1).
+    /// The landing's walk ([`LandingWalk`]): `walk.at(0.0)` is the pin's stop, and a star thrown
+    /// `dx` px along the row snaps to `walk.at(dx / cw)` (C1).
     pub walk: LandingWalk,
     /// The landing's seed — the whole of the party's variance (§6.5).
     pub seed: u32,
-    /// How many stars, `min(5 + cells/1.8, 14) + party·4` capped at `timing::FAN_MAX_N`.
+    /// How many stars, at most `timing::FAN_MAX_N` (`meteor::fan_count` for a big landing).
     pub n: u8,
     /// Whether this landing carries its gold m1 hero.
     pub hero: bool,
@@ -1536,14 +1681,11 @@ pub struct Stardust {
     paper_ink: PaperInkMemo,
 }
 
-/// One star a frame painted: its centre, the reach its arms keep a word icon
-/// by ([`KeepOut::covers`] at half of it, as the sky's own test), the
-/// window-pixel box `(x0, x1, y0, y1)` its quads and lights fill, and the
-/// keys of those lights ([`Stardust::mark_lights`]). The word pass draws its
-/// icons after the sky: an icon new to the frame still has these stars on
-/// it, which the host lifts off light by light. The box alone is not the
-/// star: other lights' pieces inside it (a train cut row by row behind a
-/// lettered row) went with it and left a dark notch in the wash.
+/// One star a frame painted: its centre, its reach (an icon within half of it lifts the star, as
+/// [`KeepOut::covers`] tests), the window-pixel box `(x0, x1, y0, y1)` its quads and halos fill,
+/// and the keys of those lights ([`Stardust::mark_lights`]). The word pass draws its icons after
+/// the sky, so the host lifts a star off a new icon by its lights' keys, not by its box: other
+/// lights' pieces can lie inside the box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SkyMark {
     /// The star's centre, window pixels.
@@ -1709,13 +1851,16 @@ impl Stardust {
         self.stars.iter()
     }
 
-    /// Drain the glints minted since the last [`Stardust::emit`] (§13), one per token spent, at the hero's column.
+    /// Drain the glints minted since the last [`Stardust::emit`] (§13), one per token spent, at the
+    /// hero's column.
     #[cfg(test)]
     pub fn take_glints(&mut self) -> std::vec::Drain<'_, Glint> {
         self.glints.drain(..)
     }
 
-    /// Deal this event's births against the ribbon's planned bands: after [`Ribbon::plan`] and before any emit, since §5.4's zones are relative to [`super::ribbon::Band::top`] and the cell may have been laid this frame (T2).
+    /// Deal this event's births against the ribbon's planned bands: after [`Ribbon::plan`] and
+    /// before any emit, since §5.4's zones are relative to [`super::ribbon::Band::top`] and the
+    /// cell may have been laid this frame (T2).
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         match *ev {
             Event::Typed { cells, class, .. } => {
@@ -1764,7 +1909,8 @@ impl Stardust {
         self.stars.push(star);
     }
 
-    /// The cat catches a star: put the one live, unfinished gold sky m1 whose home pixel and birth edge are `(x, y, born)` on its catch finish, on the frame the paw lands.
+    /// The cat catches a star: put the one live, unfinished gold sky m1 whose home pixel and birth
+    /// edge are `(x, y, born)` on its catch finish, on the frame the paw lands.
     #[inline]
     pub fn catch(&mut self, x: f32, y: f32, born: Instant, at: Instant) -> bool {
         let Some(star) = self.stars.iter_mut().find(|s| {
@@ -1783,7 +1929,9 @@ impl Stardust {
         star.finish != before
     }
 
-    /// Shed fragments (§6.5 layer 5): `spec.n` m3 grains born at `spec.at_px`, each inheriting [`SHED_ALONG_SHARE`] of the head's velocity plus a seeded perpendicular sputter, under [`DRAG_TAU_MS`].
+    /// Shed fragments (§6.5 layer 5): `spec.n` m3 grains born at `spec.at_px`, each inheriting
+    /// [`SHED_ALONG_SHARE`] of the head's velocity plus a seeded perpendicular sputter, under
+    /// [`DRAG_TAU_MS`].
     pub fn sow_shed(&mut self, at: Instant, spec: ShedSow, ctx: &Ctx<'_>) {
         if spec.n == 0 {
             return;
@@ -1823,7 +1971,9 @@ impl Stardust {
         }
     }
 
-    /// The landing fan (§6.5 layer 11, D6): 1 gold m1 + 4 m2 + rest m3 in throw order, thrown radially over [`FAN_THROW_MS`] to `reach·(0.55..1.05)`, each coloured by the landing walk at its rest column.
+    /// The landing fan (§6.5 layer 11, D6): in throw order a gold m1 and 4 m2 (with a hero, else
+    /// one m2), then m3, thrown radially over [`FAN_THROW_MS`] to `reach·(0.55..1.05)`, each but
+    /// the hero coloured by the landing walk at its rest column.
     pub fn sow_fan(&mut self, at: Instant, spec: FanSow, ctx: &Ctx<'_>) {
         let n = usize::from(spec.n).max(1);
         let cw = (ctx.geom.cw as f32).max(1.0);
@@ -1985,7 +2135,8 @@ impl Stardust {
         self.stars.len()
     }
 
-    /// True when the sky is empty — one of the three pools `Engine::next_change_deadline` folds (§18).
+    /// True when the sky is empty — one of the three pools `Engine::next_change_deadline` folds
+    /// (§18).
     #[must_use]
     #[cfg(test)]
     pub const fn at_rest(&self) -> bool {
@@ -2001,7 +2152,8 @@ impl Stardust {
                 || self.veil.iter().any(|v| v.age_s(now) < EDGE_IN_S))
     }
 
-    /// The cadence law: the next instant a star changes what is on glass, or `None` when the sky is empty (T6).
+    /// The cadence law: the next instant a star changes what is on glass, or `None` when the sky is
+    /// empty (T6).
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
         if self.stars.is_empty() && self.veil.is_empty() {
@@ -2110,7 +2262,8 @@ impl Stardust {
         self.ioi_ms = STREAM_IOI_MAX_MS;
     }
 
-    /// Seam point 12 (`translate_scroll_state`), the sky's half: move every star with the viewport by `rows` cell heights and drop those that leave the grid.
+    /// Seam point 12 (`translate_scroll_state`), the sky's half: move every star with the viewport
+    /// by `rows` cell heights and drop those that leave the grid.
     pub fn translate_scroll(&mut self, rows: u16, cell_h: u16) {
         if rows == 0 {
             return;
@@ -2600,11 +2753,10 @@ impl Stardust {
         let g = ctx.geom;
         let ch = g.ch as f32;
         // The sky is never below the glyph row's top: under `underline` the
-        // band's top lies among the letters, and a star born just above it
-        // would sit on the ascenders or at x-height, reading as an apostrophe
-        // on paper. Above the row's top it is in the row above's foot (a pixel
-        // clear of the row's top at any cell height), which the probe
-        // certified blank above.
+        // band's top lies among the letters, where a star reads as an
+        // apostrophe on paper. Above the row's top it is in the row above's
+        // foot (a pixel clear of the row's top at any cell height), which the
+        // probe certified blank.
         let cell_top = f32::from(g.origin_y) + f32::from(row) * ch;
         let top = ribbon
             .band(row, col)
@@ -3016,8 +3168,8 @@ impl Stardust {
             let x0 = origin_x + i32::from(v.col) * cw;
             let x1 = x0 + cw;
             // The veil keeps off a lettered or filled cell of the row it
-            // lies in, as a star and the ribbon's top do (looks6 N4: under
-            // `underline` it tinted a powerline segment's grey bar violet).
+            // lies in (a powerline segment's bar under `underline`), as a
+            // star and the ribbon's top do.
             let tall_px = y1 - y0;
             let (y0, y1) = self.keep_out.below((x0, x1), (y0, y1));
             if y1 <= y0 {
@@ -3089,9 +3241,8 @@ struct Paint {
 impl Paint {
     /// Its arm's peak reach plus one, px: the reach every cull keys on
     /// ([`Self::kept_out`], [`SkyMark::reach`]). Only the drawn arm
-    /// scintillates; a cull keyed on it (8-12 Hz, so 16-24 Hz in reach)
-    /// added and dropped a star sitting on a cull's edge whole at that rate,
-    /// past [`crate::TWINKLE_FLASH_BOUND_HZ`] (looks6 review).
+    /// scintillates; a cull keyed on it would add and drop a star on a cull's
+    /// edge at 16-24 Hz, past [`crate::TWINKLE_FLASH_BOUND_HZ`].
     #[inline]
     const fn reach(&self) -> i32 {
         let hi = if self.arm_hi > self.arm_lo {
@@ -3104,9 +3255,9 @@ impl Paint {
 
     /// Whether this star lies where no star is drawn: on a word icon or a
     /// lettered or filled cell of another row ([`KeepOut`], its centre within
-    /// half an arm of one), or, on paper, with any arm within a cell of the
-    /// caret's block ([`Ctx::near_paper_caret`]); the arm at its peak, so the
-    /// answer holds for the star's life while it stands still.
+    /// half its reach of one), or, on paper, with its reach within a cell of
+    /// the caret's block ([`Ctx::near_paper_caret`]); the reach is the arm at
+    /// its peak, so the answer holds for the star's life while it stands still.
     #[inline]
     fn kept_out(&self, ctx: &Ctx<'_>, keep_out: &KeepOut) -> bool {
         let reach = self.reach();
@@ -3529,7 +3680,7 @@ const fn cell_hash(row: u16, col: u16, salt: u32) -> u32 {
     )
 }
 
-/// A seed's uniform draw on `0, 1)`.
+/// A seed's uniform draw on `[0, 1)`.
 #[inline]
 pub(super) const fn hash01(h: u32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
@@ -3618,7 +3769,8 @@ fn in_sky_of_row(y: f32, row: u16, geom: Geom) -> bool {
     (0..=1).contains(&(i32::from(row) - px_row(y, geom)))
 }
 
-/// Whether a device pixel is inside the effects box (`Geom::fx_*`: the grid plus the `head` band, §5.4's row-0 sky).
+/// Whether a device pixel is inside the effects box (`Geom::fx_*`: the grid plus the `head` band,
+/// §5.4's row-0 sky).
 #[inline]
 pub(super) const fn on_glass(p: (i32, i32), geom: Geom) -> bool {
     p.0 >= geom.fx_left() && p.0 < geom.fx_right() && p.1 >= geom.fx_top() && p.1 < geom.fx_bot()
@@ -3668,7 +3820,9 @@ fn default_band_top(geom: Geom, cfg: &Config, row: u16) -> f32 {
     }
 }
 
-/// One halo: a radial peak split into per-cell-row [`RainHalo`] quads sharing one centre and falloff; `Add` premultiplied for dark, `Over` ink with the centre over-alpha in the high byte for light.
+/// One halo: a radial peak split into per-cell-row [`RainHalo`] quads sharing one centre and
+/// falloff; `Add` premultiplied for dark, `Over` ink with the centre over-alpha in the high byte
+/// for light.
 #[inline]
 pub(super) fn push_halo_quads(
     out: &mut Vec<RainHalo>,
@@ -3731,6 +3885,12 @@ fn push_halo_quads_clipped(
     }
     let ch = geom.ch as i32;
     let oy = i32::from(geom.origin_y);
+    let x0_u = x0 as u16;
+    let w_u = (x1 - x0) as u16;
+    let cx_u = cx as u16;
+    let cy_u = cy as u16;
+    let rx_u = rx as u16;
+    let ry_u = ry as u16;
     let mut yy = y0;
     while yy < y1 {
         if out.len() >= cap {
@@ -3740,31 +3900,33 @@ fn push_halo_quads_clipped(
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(RainHalo {
             row: row.max(0) as u16,
-            x: x0 as u16,
+            x: x0_u,
             y: yy as u16,
-            w: (x1 - x0) as u16,
+            w: w_u,
             h: (band_end - yy) as u16,
             color,
-            cx: cx as u16,
-            cy: cy as u16,
-            rx: rx as u16,
-            ry: ry as u16,
+            cx: cx_u,
+            cy: cy_u,
+            rx: rx_u,
+            ry: ry_u,
             mode,
         });
         yy = band_end;
     }
 }
 
-/// One cell of the aurora: the veil above one laid ribbon cell (1a′).
+/// One cell of the aurora: the veil above one laid ribbon cell (§5.9).
 #[derive(Clone, Copy, Debug)]
 pub struct Veil {
     /// The laid cell's row.
     pub row: u16,
     /// The laid cell's column — the veil's box is this column, and only this column.
     pub col: u16,
-    /// The ribbon's field at the cell (C2), unfolded — the bed folds it with `tri` when it draws, and so does the veil.
+    /// The ribbon's field at the cell (C2), unfolded — the bed folds it with `tri` when it draws,
+    /// and so does the veil.
     pub t: f32,
-    /// The veil's peak, as a share of [`AURORA_COV_PEAK`], priced once at birth from `Ctx::birth_disp` ([`veil_gain`]).
+    /// The veil's peak, as a share of [`AURORA_COV_PEAK`], priced once at birth from
+    /// `Ctx::birth_disp` ([`veil_gain`]).
     pub gain: f32,
     /// The key that laid the cell — the `edge-in` and the horizon read it.
     pub born: Instant,
@@ -3789,7 +3951,8 @@ impl Veil {
         now.saturating_duration_since(self.lit).as_secs_f32()
     }
 
-    /// The veil's alpha at `now`: the field lane's envelope ([`field_lane_envelope`]), so it leaves with the ribbon like the field stars.
+    /// The veil's alpha at `now`: the field lane's envelope ([`field_lane_envelope`]), so it leaves
+    /// with the ribbon like the field stars.
     #[inline]
     #[must_use]
     pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
@@ -3806,13 +3969,16 @@ impl Veil {
             || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
     }
 
-    /// Put this cell on a finish ending at `at + span_s`, unless one that ends sooner already stands ([`Star::finish_by`]'s rule).
+    /// Put this cell on a finish ending at `at + span_s`, unless one that ends sooner already
+    /// stands ([`Star::finish_by`]'s rule).
     #[inline]
     pub fn finish_by(&mut self, at: Instant, span_s: f32) {
         Finish::keep_sooner(&mut self.finish, at, span_s);
     }
 
-    /// The window Y the veil's box ends at (exclusive) and its falloff centres on: the row's sky band anchor ([`default_band_top`], the ribbon's top under `tall`), never below the glyph row's top, so under `underline` the veil still sits wholly above the text.
+    /// The window Y the veil's box ends at (exclusive) and its falloff centres on: the row's sky
+    /// band anchor ([`default_band_top`], the ribbon's top under `tall`), never below the glyph
+    /// row's top, so under `underline` the veil still sits wholly above the text.
     #[inline]
     #[must_use]
     pub fn bottom_px(&self, geom: Geom, cfg: &Config) -> f32 {
@@ -3821,7 +3987,8 @@ impl Veil {
     }
 }
 
-/// The field lane's envelope, shared by the field star ([`Star::envelope`]) and the aurora's veil ([`Veil::envelope`]).
+/// The field lane's envelope, shared by the field star ([`Star::envelope`]) and the aurora's veil
+/// ([`Veil::envelope`]).
 #[inline]
 #[must_use]
 pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
@@ -3836,7 +4003,8 @@ pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bo
     birth * expiry_melt(age_s / FIELD_LIFE_S.max(f32::EPSILON)) * hand * fin
 }
 
-/// The aurora's gain at a birth spine: `0` below [`AURORA_COLD_DISP`], then `smoothstep` up to `1` at a spine of one (0.37 at 0.5, 0.71 at 0.7).
+/// The aurora's gain at a birth spine: `0` below [`AURORA_COLD_DISP`], then `smoothstep` up to `1`
+/// at a spine of one (0.37 at 0.5, 0.71 at 0.7).
 #[inline]
 #[must_use]
 pub fn veil_gain(birth_disp: f32) -> f32 {
@@ -4178,7 +4346,8 @@ fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
     q.alpha == 0 && qx <= x && x < qx + i32::from(q.w) && qy <= y && y < qy + i32::from(q.h)
 }
 
-/// The pixels [`settle_under_ceiling`] watches on one star: its centre, the first pixel of each arm past the body (where stub, taper and halo ring meet), and its four orthogonal neighbours.
+/// The pixels [`settle_under_ceiling`] watches on one star: its centre, the first pixel of each arm
+/// past the body (where stub, taper and halo ring meet), and its four orthogonal neighbours.
 pub const SETTLE_PIXELS: usize = 9;
 
 fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((i32, i32), u32)]) {
@@ -4363,7 +4532,8 @@ fn price_centre(
     }
 }
 
-/// One light-theme star, as [`push_twinkle_over_twin`] takes it: `push_twinkle_star`'s parameter set minus the quad budget.
+/// One light-theme star, as [`push_twinkle_over_twin`] takes it: `push_twinkle_star`'s parameter
+/// set minus the quad budget.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LightStar {
     pub(crate) centre: (i32, i32),
@@ -4414,7 +4584,9 @@ fn star_ink_on_paper(tint: u32, cfg: &Config) -> u32 {
     }
 }
 
-/// The light-theme star (§3.3, §5.2): a horizontal and a vertical arm (each a full-length tip lay and a shorter body lay) on a round nucleus, plus four diagonal glint dots when gold, all source-over falloff ellipses in the star's ink on the page.
+/// The light-theme star (§3.3, §5.2): a horizontal and a vertical arm (each a full-length tip lay
+/// and a shorter body lay) on a round nucleus, plus four diagonal glint dots when gold, all
+/// source-over falloff ellipses in the star's ink on the page.
 pub(crate) fn push_twinkle_over_twin(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -4688,11 +4860,9 @@ mod tests {
         sc
     }
 
-    /// A star whose centre lies on the pet's body is not drawn, on dark and
-    /// on paper, nor one on the box the body's last move carries it to; one
-    /// beside the body is (the trail gallery's `burst` t0 on paper, where
-    /// purple sky stars would stand on a flying companion's face and back).
-    /// The negative control: the same sky with no body noted draws it.
+    /// A star whose centre lies on the pet's body, or on the box the body's last move carries it
+    /// to, is not drawn on dark or on paper; one beside the body is. The negative control notes no
+    /// body and draws it.
     #[test]
     fn no_star_is_drawn_on_the_pet_s_body() {
         let t0 = Instant::now();
@@ -4983,9 +5153,7 @@ mod tests {
                     );
                 }
             }
-            // Both anchors' skies are in the row above's foot: the underline's
-            // band top lies among the letters, and its sky never below the row's
-            // top (`sky_birth_px`).
+            // Both anchors' skies are in the row above's foot (`sky_birth_px`).
             for (c, row, side) in [(&tall, 4, "tall"), (&under, 4, "underline")] {
                 let cx = ctx_in(g, t0, c, (5, 30));
                 let mut births = 0usize;
@@ -6761,11 +6929,8 @@ mod tests {
         }
     }
 
-    /// The aurora keeps off a filled cell of the row it lies in (looks6 N4:
-    /// under `underline` its veils tinted a powerline segment's grey bar
-    /// violet; the bar is filled, not inked, so the sky probe saw it free).
-    /// The control is the same run with nothing kept out: its veils lie on
-    /// those cells.
+    /// The aurora keeps off a filled cell of the row it lies in (a powerline segment's bar), which
+    /// the sky probe sees as free. The control keeps nothing out, and its veils lie on the cells.
     #[test]
     fn the_aurora_keeps_off_a_filled_cell_above() {
         let c = cfg(true);
@@ -6818,14 +6983,9 @@ mod tests {
         );
     }
 
-    /// The gallery's judges (looks6 round 3): beside the dog's face the
-    /// sky's band stepped square at the icon's sprite box, a cell wider
-    /// than the face each side, where the aurora's veils were dropped whole.
-    /// The frame's shade cuts a light by the face's drawn rows
-    /// (`CursorGlow::shade_word_icons`), so the aurora keeps off a lettered
-    /// or filled cell's box but leaves an icon's to that shade: its veils
-    /// lie in the icon box's columns, and with the box cut as a filled
-    /// cell's (the negative control) none does.
+    /// The aurora keeps off a lettered or filled cell's box but leaves a word icon's to the face's
+    /// shade (`CursorGlow::shade_word_icons`): its veils lie in the icon box's columns, and with
+    /// the box cut as a filled cell's (the negative control) none does.
     #[test]
     fn the_aurora_leaves_a_word_icon_to_its_face_s_shade() {
         let c = cfg(true);
@@ -7424,8 +7584,7 @@ mod tests {
         (sky, g, born)
     }
 
-    /// The row a sky star of row 5 is born in: the row above, under either
-    /// anchor (the underline's sky is never below the row's top).
+    /// The row a sky star of row 5 is born in: the row above, under either anchor.
     fn band_row(_: &Config) -> i32 {
         4
     }
@@ -7765,9 +7924,8 @@ mod tests {
             grains, 15,
             "tall under a blank row threw {grains} grains, not one per key from the second"
         );
-        // The underline's sky is the row above's foot, as tall's is (its band
-        // top lies among the letters, and its sky is never below the row's
-        // top: `sky_birth_px`), so its grains are tall's.
+        // The underline's sky is the row above's foot, as tall's is
+        // (`sky_birth_px`), so its grains are tall's.
         let mut under = cfg(true);
         under.ribbon_tall = false;
         let (grains, _) = run(&under, &|sky, col| {
@@ -9065,16 +9223,9 @@ mod tests {
         }
     }
 
-    /// A star standing on a cull's edge is drawn or dropped for its whole
-    /// life, never in step with its arm's scintillation (looks6 review: the
-    /// keep-out and paper-caret culls keyed on the drawn arm, 8-12 Hz, so a
-    /// star whose reach straddled a box's edge or the caret's margin was
-    /// added and dropped whole at 15-24 Hz). Every placement across the
-    /// band, on a keep-out box (dark and paper) and on the paper caret's
-    /// margin, makes at most [`crate::TWINKLE_FLASH_BOUND_HZ`] visibility
-    /// transitions in any second, and the star's mark keeps one reach, the
-    /// value `lift_stars` keys on. The negative control culls the same
-    /// frames by the drawn arm: some placement then toggles past the bound.
+    /// A star on a keep-out box's edge (dark and paper) or the paper caret's margin makes at most
+    /// [`crate::TWINKLE_FLASH_BOUND_HZ`] visibility transitions a second and keeps one mark reach.
+    /// The negative control culls by the drawn arm and toggles past the bound.
     #[test]
     fn a_star_on_a_cull_s_edge_never_blinks_with_its_arm() {
         let t0 = Instant::now();

@@ -40,7 +40,8 @@ pub const IMAP_USER_ENV: &str = "ATERM_OPEN_URL_IMAP_USER";
 /// Environment variable holding the IMAP / HTTP Basic / Webmail password.
 pub const IMAP_PASS_ENV: &str = "ATERM_OPEN_URL_IMAP_PASS";
 
-/// Environment variable naming a webmail inbox URL (e.g. `https://mail.proton.me/u/0/inbox`) for headless CDP polling.
+/// Environment variable naming a webmail inbox URL (e.g. `https://mail.proton.me/u/0/inbox`) for
+/// headless CDP polling.
 pub const WEBMAIL_URL_ENV: &str = "ATERM_OPEN_URL_WEBMAIL_URL";
 
 /// Environment variable holding a webmail password for headless CDP sign-in.
@@ -57,6 +58,12 @@ pub const SECRETS_MAILBOX_TOML_FILE: &str = "ai-mailbox.toml";
 
 /// Subdirectory under the accounts store holding persistent per-account browser profiles.
 pub const BROWSER_PROFILES_DIR: &str = "browsers";
+
+/// Subdirectory under Claude Code's accounts store holding the other CLIs' browser profiles
+/// ([`vendor_profile_dir`]): apart from [`BROWSER_PROFILES_DIR`], which Claude Code's own
+/// renewals search by email and label ([`resolve_browser_profile_dir`]), so a vendor's sign-in
+/// never makes a profile there that one of them would then pick.
+pub const VENDOR_PROFILES_DIR: &str = "vendor-browsers";
 
 /// A label as [`MailboxConfig::contested_labels`] keeps it.
 fn contest_key(label: &str) -> String {
@@ -94,8 +101,8 @@ pub struct MailboxConfig {
     pub seen_file: Option<PathBuf>,
     /// Words in the sender of the vendor's sign-in mail (`connector::Accounts::mail_senders`),
     /// which a webmail inbox's rows are chosen by and, where any is given, every other mail's
-    /// `From:` domain must name ([`MailFilter`]); empty for Claude Code's (`claude`,
-    /// `anthropic`).
+    /// `From:` domain must name ([`MailFilter`]); empty for Claude Code's own reads, whose
+    /// webmail rows are chosen by `claude` and `anthropic`.
     pub senders: Vec<String>,
     /// Where set, the earliest a mail may be dated (unix seconds): a vendor sign-in's start, so
     /// a code mailed before it is never taken ([`MailFilter`]).
@@ -119,7 +126,8 @@ impl MailboxConfig {
         }
     }
 
-    /// True when at least one mailbox source (directory, HTTP URL, IMAP URL, or webmail credentials) is configured.
+    /// True when at least one mailbox source (directory, HTTP URL, IMAP URL, or webmail
+    /// credentials) is configured.
     #[must_use]
     pub fn is_configured(&self) -> bool {
         self.dir.is_some()
@@ -1871,23 +1879,36 @@ pub fn resolve_browser_profile_dir(
 }
 
 /// The persistent browser profile a vendor sign-in of the row with `email` (else its
-/// `label_key`, `<cli>-<label>`) runs in under `store_dir`: keyed by the EXACT email, never its
-/// `+tag`-less base or a label's profile, so a plus-addressed row never signs in through
-/// another row's signed-in profile; an email the profile key would not spell one to one
-/// (a `+`, or one cut at 64 characters) carries its digest as well.
+/// `label_key`, `<cli>-<label>`) runs in under Claude Code's store `store_dir`: keyed by the
+/// EXACT email, never its `+tag`-less base or a label's profile, so a plus-addressed row never
+/// signs in through another row's signed-in profile; an email the profile key would not spell
+/// one to one (a `+`, or one cut at 64 characters) carries its digest as well. It is the
+/// vendors' own, under [`VENDOR_PROFILES_DIR`], unless that is not made yet and Claude Code's
+/// own profile of that exact email is (`<store_dir>/browsers/<key>`, the one its renewals pick
+/// first for the email): then the vendors share that one. So no vendor sign-in makes a
+/// directory Claude Code's renewals would pick ([`resolve_browser_profile_dir`]) in place of a
+/// row's label profile, or in place of the person's browser where the row has none.
 #[must_use]
 pub fn vendor_profile_dir(store_dir: &Path, label_key: &str, email: Option<&str>) -> PathBuf {
+    let vendors = store_dir.join(VENDOR_PROFILES_DIR);
     let Some(email) = email.map(str::trim).filter(|e| !e.is_empty()) else {
-        return browser_profile_dir(store_dir, Some(label_key));
+        return vendors.join(sanitize_profile_key(label_key));
     };
     let lower = email.to_ascii_lowercase();
     let key = sanitize_profile_key(&lower);
-    let key = if key == lower.replace('@', "-at-") {
+    let exact = key == lower.replace('@', "-at-");
+    let key = if exact {
         key
     } else {
         format!("{key}-{}", &fnv1a_hex(&lower)[..8])
     };
-    store_dir.join(BROWSER_PROFILES_DIR).join(key)
+    let own = vendors.join(&key);
+    let claudes = store_dir.join(BROWSER_PROFILES_DIR).join(&key);
+    if exact && !own.is_dir() && claudes.is_dir() {
+        claudes
+    } else {
+        own
+    }
 }
 
 /// The key of a vendor row's browser profile where the row names no email: `<cli>-<label>`
@@ -1905,7 +1926,8 @@ pub fn vendor_label_key(cli: super::accounts::Cli, label: &str) -> String {
 /// The persistent browser profile of `cli`'s row `label` (with `email`): the one its headless
 /// sign-ins run in and `accounts browser` opens in a window. Claude Code's is under its own
 /// store (`store_dir`, [`resolve_browser_profile_dir`]); every other CLI's is the email's own
-/// under Claude Code's store (`shared_dir`, [`vendor_profile_dir`]), shared by every vendor.
+/// under Claude Code's store (`shared_dir`, [`vendor_profile_dir`]), shared by every vendor,
+/// and with Claude Code only where its own profile of that exact email already is.
 #[must_use]
 pub fn row_browser_profile(
     cli: super::accounts::Cli,
@@ -2289,12 +2311,22 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
         if is_mime_part_header_line(line) {
             continue;
         }
-        let words: Vec<&str> = line.split_whitespace().collect();
+        let raw_words: Vec<&str> = line.split_whitespace().collect();
+        if raw_words.is_empty() {
+            continue;
+        }
+        let words: Vec<&str> = line
+            .split(|c: char| c.is_whitespace() || !c.is_ascii())
+            .filter(|s| !s.is_empty())
+            .collect();
         if words.is_empty() {
             continue;
         }
+        let line_has_non_ascii_letters = line.chars().any(|c| !c.is_ascii() && c.is_alphabetic());
         nonempty_line_idx += 1;
-        if words.len() == 1
+        if raw_words.len() == 1
+            && words.len() == 1
+            && !line_has_non_ascii_letters
             && let Some(d) = clean_digits(words[0])
             && d.len() == 1
         {
@@ -2333,7 +2365,19 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
             || lower.contains("one-time")
             || lower.contains("passcode")
             || lower.contains("otp")
-            || lower.contains("authenticate");
+            || lower.contains("authenticate")
+            || line.contains("验证码")
+            || line.contains("验证")
+            || line.contains("登录")
+            || line.contains("动态码")
+            || line.contains("一次性密码")
+            || line.contains("安全码")
+            || line.contains("口令")
+            || line.contains("認證")
+            || line.contains("驗證碼")
+            || line.contains("認証コード")
+            || line.contains("確認コード")
+            || line.contains("인증");
         if line_has_context {
             context_lines_left = 4;
             if let Some((prev_idx, ref prev_otp)) = last_standalone
@@ -2343,7 +2387,9 @@ pub fn extract_otps_from_email(raw_email: &str, target_email: Option<&str>) -> V
             }
         }
         let has_context = context_lines_left > 0;
-        if words.len() == 1
+        if raw_words.len() == 1
+            && words.len() == 1
+            && !line_has_non_ascii_letters
             && let Some(otp) = is_six_digit_otp(words[0])
         {
             if has_context {
@@ -3404,7 +3450,8 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Why no credential is sent to `url`: `imap://` and `http://` carry it in cleartext, so only to a loopback host.
+/// Why no credential is sent to `url`: `imap://` and `http://` carry it in cleartext, so they are
+/// used only for a loopback host.
 fn cleartext_refusal(url: &str) -> Option<&'static str> {
     if let Some(imap) = parse_imap_url(url) {
         return (!imap.tls && !is_loopback_host(&imap.host)).then_some(
@@ -3424,7 +3471,8 @@ fn cleartext_refusal(url: &str) -> Option<&'static str> {
     )
 }
 
-/// Why `cfg` is not polled for `target_email`: an `imap://` login, or an `http://` password or token, to a host that is not loopback ([`cleartext_refusal`]).
+/// Why `cfg` is not polled for `target_email`: an `imap://` login, or an `http://` password or
+/// token, to a host that is not loopback ([`cleartext_refusal`]).
 #[must_use]
 pub fn plaintext_credential_refusal(
     cfg: &MailboxConfig,
@@ -4255,6 +4303,8 @@ const CODE_INPUT_HELPERS_JS: &str = r#"
 /// An enabled control or native form submission must be attempted before latching a step.
 /// Missing actions leave input-event-driven pages to advance on their next DOM observation.
 const SUBMIT_INPUT_HELPERS_JS: &str = r#"
+  const disallowedSubmitLabel = label =>
+    /cancel|deny|decline|reject|revoke|logout|log out|sign out|signout|not you|sign up|create|with |without |switch |another |do not |don't |dont |agree|accept|cookie|terms|policy|allow all|同意|接受|取消|拒绝|注册|退出|登出|注销|切换|条款|协议/i.test(label);
   const submitInput = (input, buttons, labelPattern) => {
     const enabled = control => !control.disabled && !control.hidden &&
       !control.matches(":disabled") && control.getAttribute("aria-disabled") !== "true";
@@ -4262,11 +4312,13 @@ const SUBMIT_INPUT_HELPERS_JS: &str = r#"
     const form = input.form;
     const owner = button => "form" in button ? button.form : button.closest("form");
     const owned = buttons.filter(button => owner(button) === form);
+    const btnLabel = button => String(button.innerText || button.value || button.getAttribute("aria-label") || "").trim();
     const isSubmit = button => (button.tagName === "BUTTON" && button.type === "submit") ||
       (button.tagName === "INPUT" && ["submit", "image"].includes(button.type));
-    const button = (form && owned.find(button => isSubmit(button) && enabled(button))) ||
+    const button = (form && owned.find(button => isSubmit(button) && enabled(button) && !disallowedSubmitLabel(btnLabel(button)))) ||
       owned.find(button => button.type !== "reset" && enabled(button) &&
-        labelPattern.test(String(button.innerText || button.value || "")));
+        !disallowedSubmitLabel(btnLabel(button)) &&
+        labelPattern.test(btnLabel(button)));
     if (button) {
       button.click();
       return true;
@@ -4385,7 +4437,7 @@ pub fn oauth_step_js(
     if (otpVal && !otpDone) {{
       const filledInput = fillCodeInputs(otpInputs, otpVal);
       if (!filledInput) return {{ state: "loading", url: href }};
-      if (!submitInput(filledInput, buttons, /verify|continue|submit|sign in|log in/i)) {{
+      if (!submitInput(filledInput, buttons, /verify|continue|submit|sign in|log in|下一步|继续|验证|确认|提交|登录/i)) {{
         return {{ state: "loading", url: href }};
       }}
       return {{ state: "submitted_otp", url: href }};
@@ -4396,7 +4448,7 @@ pub fn oauth_step_js(
   const emailDone = {email_submitted};
   if (emailInput && emailVal && !emailDone) {{
     setNativeValue(emailInput, emailVal);
-    if (!submitInput(emailInput, buttons, /continue|sign in|log in|next|send/i)) {{
+    if (!submitInput(emailInput, buttons, /continue|sign in|log in|next|send|下一步|继续|登录|发送|验证|确认|提交/i)) {{
       return {{ state: "loading", url: href }};
     }}
     return {{ state: "submitted_email", url: href }};
@@ -4717,7 +4769,7 @@ pub(super) fn webmail_step_js(
 {SUBMIT_INPUT_HELPERS_JS}
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image']"));
   const clickSubmit = (input) => submitInput(input, buttons,
-    /sign in|log in|authenticate|unlock|verify|continue|next|submit/i);
+    /sign in|log in|authenticate|unlock|verify|continue|next|submit|下一步|继续|登录|验证|确认|提交/i);
   const visibleControl = (el) => Boolean(el) && !el.disabled && !el.hidden && el.type !== "hidden" &&
     !el.matches(":disabled") && el.getAttribute("aria-disabled") !== "true";
   const editableControl = (el) => visibleControl(el) && !el.readOnly &&
@@ -4829,7 +4881,7 @@ pub(super) fn webmail_step_js(
   for (const row of rows) {{
     const rt = String(row.innerText || "").toLowerCase();
     const hasSender = senderWords.some(word => rt.includes(word));
-    const hasAuth = rt.includes("sign in") || rt.includes("sign-in") || rt.includes("verification") || rt.includes("verify") || rt.includes("login") || rt.includes("log in") || rt.includes("magic") || rt.includes("code") || rt.includes("otp") || rt.includes("passcode");
+    const hasAuth = rt.includes("sign in") || rt.includes("sign-in") || rt.includes("verification") || rt.includes("verify") || rt.includes("login") || rt.includes("log in") || rt.includes("magic") || rt.includes("code") || rt.includes("otp") || rt.includes("passcode") || rt.includes("验证码") || rt.includes("验证") || rt.includes("登录") || rt.includes("动态码") || rt.includes("安全码") || rt.includes("認證") || rt.includes("驗證碼") || rt.includes("認証コード") || rt.includes("確認コード") || rt.includes("인증");
     if (hasSender && hasAuth) {{
       vendorAuthRows.push(row);
     }} else if (hasSender) {{
@@ -5004,7 +5056,7 @@ pub fn poll_webmail_via_cdp(
                     let text = val.get("text").and_then(Value::as_str).unwrap_or("");
                     if !html.is_empty() || !text.is_empty() {
                         let synthetic = format!(
-                            "To: {}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{}\n{}",
+                            "Delivered-To: {}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{}\n{}",
                             target_email.unwrap_or(""),
                             html,
                             text
@@ -5275,7 +5327,7 @@ pub fn drive_cdp_oauth_with_webmail(
                 } else {
                     return Err("headless browser reached an invalid local callback URL");
                 };
-                // This reached page may already have delivered the callback before this duplicate GET.
+                // The page may already have delivered the callback before this duplicate GET.
                 let _ = deliver_callback(cb_url);
                 return Ok(());
             }
@@ -5404,7 +5456,8 @@ pub fn authorize_with_headless_browser_config(
     )
 }
 
-/// Continue an HTTP probe with its already-consumed credential before polling again.
+/// Continue an HTTP probe with its already-consumed credential before polling again. A window's
+/// pass that never ran on the profile is made up first ([`super::browser_window::make_up_tidy`]).
 #[cfg(unix)]
 pub(super) fn authorize_with_headless_browser_config_and_credential(
     authorize_url: &str,
@@ -5451,6 +5504,11 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
+            let _ = super::browser_window::make_up_tidy(
+                &mut cdp,
+                profile_dir,
+                Instant::now() + super::browser_window::MAKE_UP_WITHIN,
+            );
             let mut seen_otps = BTreeSet::new();
 
             let t0 = Instant::now();
@@ -5608,7 +5666,7 @@ pub struct FlowBound {
     pub callback_port: Option<u16>,
 }
 
-fn query_values(url: &str, key: &str) -> Vec<String> {
+pub(super) fn query_values(url: &str, key: &str) -> Vec<String> {
     let Some((_, tail)) = url.split_once('?') else {
         return Vec::new();
     };
@@ -5622,12 +5680,18 @@ fn query_values(url: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// The decoded value of the query parameter `key` of `url`.
+fn unique_query_value(url: &str, key: &str) -> Result<Option<String>, ()> {
+    let mut vals = query_values(url, key).into_iter();
+    let Some(first) = vals.next() else {
+        return Ok(None);
+    };
+    vals.all(|v| v == first).then_some(Some(first)).ok_or(())
+}
+
+/// The decoded value of the query parameter `key` of `url`, absent where values conflict.
 #[must_use]
 pub fn query_value(url: &str, key: &str) -> Option<String> {
-    let mut vals = query_values(url, key).into_iter();
-    let first = vals.next()?;
-    vals.all(|v| v == first).then_some(first)
+    unique_query_value(url, key).ok().flatten()
 }
 
 /// The port of `url` where it is a loopback `http://` URL (`127.0.0.1`, `localhost`).
@@ -5647,15 +5711,23 @@ fn loopback_port(url: &str) -> Option<u16> {
 
 impl FlowBound {
     /// The flow `start` (the sign-in's first page) names.
-    #[must_use]
-    pub fn of(start: &str) -> FlowBound {
-        let redirect_uri = query_value(start, "redirect_uri");
-        FlowBound {
-            client_id: query_value(start, "client_id"),
+    ///
+    /// # Errors
+    /// Returns a reason without the URL or its values if duplicate `client_id`,
+    /// `redirect_uri` or `state` parameters have conflicting decoded values.
+    pub fn of(start: &str) -> Result<FlowBound, &'static str> {
+        let client_id = unique_query_value(start, "client_id")
+            .map_err(|()| "the sign-in URL names conflicting clients")?;
+        let redirect_uri = unique_query_value(start, "redirect_uri")
+            .map_err(|()| "the sign-in URL names conflicting callback destinations")?;
+        let state = unique_query_value(start, "state")
+            .map_err(|()| "the sign-in URL names conflicting OAuth states")?;
+        Ok(FlowBound {
+            client_id,
             callback_port: redirect_uri.as_deref().and_then(loopback_port),
             redirect_uri,
-            state: query_value(start, "state"),
-        }
+            state,
+        })
     }
 
     /// Why `url` (a page, or a mailed link) is outside this flow on `hosts`: it names another
@@ -5845,7 +5917,7 @@ fn emails_in(text: &str) -> Vec<String> {
     .collect()
 }
 
-/// An email as a vendor's account names it: trimmed and lowercased, its `+tag` KEPT, since a
+/// An email as a vendor's account names it: trimmed and lowercased, its `+tag` kept, since a
 /// plus-addressed row is another account of the vendor's ([`super::accounts::email_matches`]).
 fn exact_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
@@ -5873,7 +5945,7 @@ fn says_signed_in(page: &Page) -> bool {
 }
 
 /// Whether the page names an account other than the row's as the one signed in: any email it
-/// shows (in its text or on a button) that is not EXACTLY the row's, the vendor's own addresses
+/// shows (in its text or on a button) that is not exactly the row's, the vendor's own addresses
 /// apart ([`domain_names`]).
 fn another_account(page: &Page, gate: &Gate<'_>) -> bool {
     let Some(want) = gate.email.map(exact_email) else {
@@ -5892,7 +5964,7 @@ fn another_account(page: &Page, gate: &Gate<'_>) -> bool {
         .any(|e| exact_email(&e) != want && !vendor(&e))
 }
 
-/// Whether the page names the row's EXACT email as the account signed in to it (its signed-in
+/// Whether the page names the row's exact email as the account signed in to it (its signed-in
 /// words beside the email, [`SIGNED_IN_WORDS`]), and no other: the page's proof of the row's
 /// account. A page that only echoes the email aterm typed (`we sent a code to …`) proves
 /// nothing.
@@ -6053,6 +6125,10 @@ const MAIL_WORDS: &[&str] = &[
     "verification code",
     "magic link",
     "sent a link",
+    "验证码",
+    "已发送",
+    "查收邮件",
+    "验证邮件",
 ];
 
 const SUCCESS_WORDS: &[&str] = &[
@@ -6069,6 +6145,11 @@ const SUCCESS_WORDS: &[&str] = &[
     "signed in successfully",
     "return to your terminal",
     "go back to your terminal",
+    "授权成功",
+    "登录成功",
+    "设备已授权",
+    "可以关闭此页面",
+    "可关闭此窗口",
 ];
 
 /// The step one vendor sign-in page calls for (design §6): a pure judgment of the page's host,
@@ -6235,8 +6316,9 @@ pub const VENDOR_PAGE_JS: &str = r#"(() => {
     const t = String(i.type || "").toLowerCase(), n = String(i.name || "").toLowerCase();
     const a = String(i.autocomplete || "").toLowerCase(), m = String(i.inputMode || "").toLowerCase();
     if (t === "password") return "password";
-    if (t === "email" || n.includes("email") || a.includes("email") || a === "username") return "email";
+    if (t === "email" || a.includes("email") || a === "username") return "email";
     if (a === "one-time-code" || n.includes("code") || n.includes("otp") || m === "numeric" || i.maxLength === 1) return "code";
+    if (n.includes("email")) return "email";
     return "other";
   };
   const inputs = Array.from(document.querySelectorAll("input")).filter(visible)
@@ -6290,17 +6372,23 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
     return {{ ok: true }};
   }}
   if (verb === "email") {{
-    const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email' i], input[autocomplete*='email' i], input[autocomplete='username' i]")).find(textInput);
+    const isCodeField = el => {{
+      const t = String(el.type || "").toLowerCase(), n = String(el.name || "").toLowerCase();
+      const a = String(el.autocomplete || "").toLowerCase(), m = String(el.inputMode || "").toLowerCase();
+      return t !== "email" && !a.includes("email") && a !== "username" &&
+        (a === "one-time-code" || n.includes("code") || n.includes("otp") || m === "numeric" || el.maxLength === 1);
+    }};
+    const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email' i], input[autocomplete*='email' i], input[autocomplete='username' i]")).filter(el => !isCodeField(el)).find(textInput);
     if (!input || !value) return {{ ok: false }};
     setNativeValue(input, value);
-    return {{ ok: submitInput(input, buttons, /continue|next|sign in|log in|send|submit/i) }};
+    return {{ ok: submitInput(input, buttons, /continue|next|sign in|log in|send|submit|下一步|继续|登录|发送|验证|确认|提交/i) }};
   }}
   if (verb === "code") {{
     const explicit = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i]")).filter(textInput);
     const boxes = Array.from(document.querySelectorAll("input[maxlength='1']")).filter(textInput);
     const filled = fillCodeInputs(codeInputsFor(explicit, boxes), value);
     if (!filled) return {{ ok: false }};
-    return {{ ok: submitInput(filled, buttons, /continue|verify|confirm|submit|next|sign in|log in/i) }};
+    return {{ ok: submitInput(filled, buttons, /continue|verify|confirm|submit|next|sign in|log in|下一步|继续|验证|确认|提交|登录/i) }};
   }}
   return {{ ok: false }};
 }})()"#
@@ -6686,8 +6774,9 @@ fn in_profile(
 
 /// The headless browser as a vendor sign-in's [`super::login_drive::Approver`]: the persistent
 /// profile of the row's email (else `<cli>-<label>`) under Claude Code's store, shared by every
-/// vendor ([`row_browser_profile`]); the mailbox configured for that email, its inbox rows chosen
-/// by the vendor's senders.
+/// vendor ([`row_browser_profile`], [`vendor_profile_dir`]), where a window's pass that never
+/// ran is made up first ([`super::browser_window::make_up_tidy`]); the mailbox configured for
+/// that email, its inbox rows chosen by the vendor's senders.
 #[derive(Debug, Clone)]
 pub struct VendorApprover {
     /// Claude Code's store directory (`accounts::Store::shared_dir`).
@@ -6758,6 +6847,10 @@ impl super::login_drive::Approver for VendorApprover {
         use super::login_drive::Approval;
         use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
         use std::os::fd::OwnedFd;
+        let bound = match FlowBound::of(handoff.url) {
+            Ok(bound) => bound,
+            Err(why) => return Approval::Refused(why.to_owned()),
+        };
         let profile_dir = self.profile_dir(handoff.email);
         let _ = aterm_types::fs_restricted::ensure_private_dir(
             profile_dir.parent().unwrap_or(&self.shared_dir),
@@ -6782,7 +6875,6 @@ impl super::login_drive::Approver for VendorApprover {
             cfg
         });
         let senders = self.senders;
-        let bound = FlowBound::of(handoff.url);
         let sign_in_once = self.sign_in_once.as_str();
         let types_email = self.types_email;
         let ran = in_profile(&profile_dir, |profile_dir| {
@@ -6799,6 +6891,13 @@ impl super::login_drive::Approver for VendorApprover {
                 .map_err(|_| "could not spawn headless browser")?;
             let _guard = BrowserChild::new(child);
             let mut cdp = CdpClient::new(cmd_write, out_read);
+            let _ = super::browser_window::make_up_tidy(
+                &mut cdp,
+                profile_dir,
+                handoff
+                    .deadline
+                    .min(Instant::now() + super::browser_window::MAKE_UP_WITHIN),
+            );
             let mut seen_otps = BTreeSet::new();
             let gate = Gate {
                 hosts: handoff.hosts,

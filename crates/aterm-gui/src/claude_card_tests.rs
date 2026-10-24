@@ -25,7 +25,7 @@ const MODEL_WIDE_END: &str = "Opus 5.5 \u{b7} Claude Ma\u{4E2D}";
 const GRAY: [u8; 3] = [130, 130, 130];
 
 fn banner() -> &'static str {
-    aterm_phase::anchor_text("launch.banner")
+    aterm_phase::anchor!("launch.banner")
 }
 
 fn card_screen(rows: usize, cols: usize, model: &str, version: &str) -> Vec<String> {
@@ -5573,10 +5573,10 @@ const NARROW_CAPTURES: [NoticeCapture; 7] = [
 fn notice_rows() -> [String; 2] {
     let screen = WIDE.screen();
     let rows = [screen[WIDE.top].clone(), screen[WIDE.top + 1].clone()];
-    assert!(rows[0].starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated"))));
+    assert!(rows[0].starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))));
     assert_eq!(
         rows[1],
-        format!("  {}", aterm_phase::anchor_text("notice.updated_details"))
+        format!("  {}", aterm_phase::anchor!("notice.updated_details"))
     );
     rows
 }
@@ -5905,10 +5905,8 @@ fn the_vendors_notice_stays_bare_where_the_banner_may_not_go() {
         }),
         ("reworded", true, |app, session| {
             let mut rows = WIDE.screen();
-            rows[WIDE.top + 1] = format!(
-                "  see {}",
-                aterm_phase::anchor_text("notice.updated_details")
-            );
+            rows[WIDE.top + 1] =
+                format!("  see {}", aterm_phase::anchor!("notice.updated_details"));
             feed_capture(app, session, &WIDE, &rows);
         }),
         ("find bar up", true, |app, _| app.search_enter()),
@@ -6026,9 +6024,9 @@ fn pty(reader: &mut std::os::unix::net::UnixStream, want: usize) -> Vec<u8> {
 #[test]
 fn a_press_on_the_notice_never_reaches_the_vendors_link() {
     use aterm_session::sink::SinkWriter;
-    let changelog = aterm_phase::anchor_text("notice.changelog");
+    let changelog = aterm_phase::anchor!("notice.changelog");
     let vendor_url = format!("https://{changelog}");
-    let tail = aterm_phase::anchor_text("notice.updated_details")
+    let tail = aterm_phase::anchor!("notice.updated_details")
         .strip_prefix(changelog)
         .expect("the details row opens with the changelog link");
     let details = format!("  \x1b]8;;{vendor_url}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
@@ -6192,8 +6190,8 @@ fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
         (usize::from(term.rows()), usize::from(term.cols()))
     };
     assert!(cols >= 100, "the pane holds the notice whole ({cols})");
-    let changelog = aterm_phase::anchor_text("notice.changelog");
-    let tail = aterm_phase::anchor_text("notice.updated_details")
+    let changelog = aterm_phase::anchor!("notice.changelog");
+    let tail = aterm_phase::anchor!("notice.updated_details")
         .strip_prefix(changelog)
         .expect("the details row opens with the changelog link");
     let details = format!("  \x1b]8;;https://{changelog}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
@@ -6371,7 +6369,7 @@ fn a_settled_notice_at_rest_costs_the_frame_nothing() {
     let reworded = format!(
         "\x1b7\x1b[{};1H  see {}\x1b8",
         NOTICE_TOP + 2,
-        aterm_phase::anchor_text("notice.updated_details")
+        aterm_phase::anchor!("notice.updated_details")
     );
     assert_eq!(
         step(&mut app, reworded.as_bytes()).notice_reads,
@@ -6406,10 +6404,9 @@ fn the_banner_stays_while_the_card_scrolls_off() {
         for (i, row) in rows.iter().enumerate() {
             let sgr = if row.ends_with("/proj") {
                 format!("\x1b[38;2;{};{};{}m", GRAY[0], GRAY[1], GRAY[2])
-            } else if row.starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated")))
-            {
+            } else if row.starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))) {
                 "\x1b[1m".to_string()
-            } else if row.contains(aterm_phase::anchor_text("notice.updated_details")) {
+            } else if row.contains(aterm_phase::anchor!("notice.updated_details")) {
                 "\x1b[38;2;153;153;153m".to_string()
             } else {
                 String::new()
@@ -6448,7 +6445,7 @@ fn the_banner_stays_while_the_card_scrolls_off() {
         frame(&mut app, wid);
         let top = 4 - k;
         assert!(
-            rows[top].starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated"))),
+            rows[top].starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))),
             "CONTROL: the notice at row {top}: {rows:#?}"
         );
         assert_eq!(

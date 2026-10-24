@@ -146,10 +146,10 @@ pub enum Kept {
     Removed,
 }
 
-/// Accounts v2's view of the machine's own Claude login.
+/// Accounts v2's view of the Claude row that serves this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeAccounts {
-    /// The own row's label.
+    /// The serving row's label (the own row's where the roster is refused).
     pub label: String,
     /// Whether `accounts.toml` lists the row.
     pub listed: bool,
@@ -207,15 +207,12 @@ pub struct Facts {
     pub record: Record,
     /// The row's credential variables set in this environment (names only).
     pub env_credentials: Vec<&'static str>,
-    /// Its own accounts pool, where its roster sits beside `accounts.toml` and the harness
-    /// signs it in (`accounts renew --cli <id>`): every CLI but Claude Code, whose is
-    /// [`Facts::accounts`].
+    /// Its own accounts pool ([`pool_for`]); Claude Code's is [`Facts::accounts`].
     pub pool: Option<CliAccounts>,
 }
 
-/// A CLI's own accounts pool ([`Facts::pool`]): the per-connector view of the accounts a
-/// roster beside `accounts.toml` lists (`accounts-<cli>.toml`), where Claude Code's is
-/// [`ClaudeAccounts`], whose fields stay its own.
+/// A CLI's own accounts pool ([`Facts::pool`]): the rows its roster beside `accounts.toml`
+/// (`accounts-<cli>.toml`) lists.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliAccounts {
     /// Its roster (`accounts-<cli>.toml`).
@@ -308,11 +305,11 @@ fn foreign_of(
         .find(|p| p.is_file())
 }
 
-/// Accounts v2's own row, read through this machine's renewals: the label, its bound login
-/// and, where it renews, its state; the usage limit whether or not it renews. A roster file
-/// that is refused stands for no roster at all ([`ClaudeAccounts::refused`]), as it does for
-/// accounts; a `state.json` that cannot be read drops only the lifecycle words. `None` where
-/// `logins.json` cannot be read as this build's.
+/// Accounts v2's view of the serving Claude row: the active row when it is ready here, else the
+/// own row when it is, else the first ready row, else the own row. A refused roster yields only
+/// its refusal ([`ClaudeAccounts::refused`]); a `state.json` that cannot be read drops only the
+/// lifecycle words. `None` with no harness state root, or where `logins.json` cannot be read as
+/// this build's.
 fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     use crate::harness::accounts;
     let store = accounts::Store::at(m.harness_state.as_ref()?);
@@ -439,8 +436,8 @@ fn claude_profile(m: &Machine<'_>, home: &Path) -> (bool, Option<String>) {
     }
 }
 
-/// Whether Codex keeps its login anywhere but `auth.json` in its home (`cli_auth_credentials_store`
-/// = `keyring`, `auto` or `ephemeral` in its `config.toml`), where aterm does not look: its
+/// Whether Codex keeps its login anywhere but `auth.json` in its home, where aterm does not look
+/// (`cli_auth_credentials_store` = `keyring`, `auto` or `ephemeral` in its `config.toml`): its
 /// account pool then has no row's own login file to start a session under.
 #[must_use]
 pub fn codex_keyring(home: &Path) -> bool {
@@ -459,10 +456,9 @@ pub fn codex_keyring(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The end of Codex's usage limit, from its own `rate_limits` readings
-/// ([`super::codex_limits::home_pick`]: the newest login's, a passed reset void, the
-/// largest share within each window's anchor): a window at 100% whose reset is ahead. No
-/// reading of that login within 6 h says nothing.
+/// The end of Codex's usage limit from its own `rate_limits` readings
+/// ([`super::codex_limits::home_pick`]): the latest reset ahead of a window at 100%, read only
+/// from a reading no older than [`super::codex_limits::FRESH_S`].
 fn codex_limit(home: &Path, now: i64) -> Option<i64> {
     use super::codex_limits as limits;
     let pick = limits::home_pick(home, now)?;
@@ -553,10 +549,9 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
     }
 }
 
-/// `cli`'s own accounts pool ([`CliAccounts`]), where its roster file sits beside
-/// `accounts.toml` and the harness has a sign-in for it: a connection's (Codex's), or a pool
-/// CLI's that is no connection of `aterm ai`'s (Grok Build's, Kimi Code's), whose `aterm ai
-/// login` runs this pool's sign-in alone.
+/// `cli`'s own accounts pool, where its roster file sits beside `accounts.toml` and the harness
+/// signs it in (`accounts renew --cli <id>`). `None` where there is no such roster or sign-in,
+/// and for Claude Code, whose pool is [`ClaudeAccounts`].
 #[must_use]
 pub fn pool_for(m: &Machine<'_>, cli: crate::harness::accounts::Cli) -> Option<CliAccounts> {
     use crate::harness::accounts::{self, Cli};

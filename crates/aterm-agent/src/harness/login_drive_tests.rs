@@ -830,3 +830,95 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     assert!(held.is_none(), "CONTROL");
     assert_eq!(path_of(&desk), Some(OsString::from("/usr/bin:/bin")));
 }
+
+/// OVER SSH a person's Codex sign-in opens no browser on this machine's desk and is one the
+/// person can finish: `codex login` opens the default browser through LaunchServices whatever
+/// its `PATH`, and its page calls back to this machine's 127.0.0.1:1455, which the person's
+/// browser cannot reach, so a browser row runs `codex login --device-auth` under the no-desk
+/// sandbox with the opener-free `PATH` (a Grok Build browser row its device route too). CONTROL:
+/// at the desk the browser row runs plain `codex login` with this process's `PATH`, and a Kimi
+/// row, whose page calls nothing back, keeps its route over SSH.
+#[cfg(target_os = "macos")]
+#[test]
+fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk() {
+    use std::ffi::OsStr;
+    let bed = GrokBed::new();
+    let home = bed.tmp.path().join("home");
+    let parent = vars(&[("PATH", "/usr/bin:/bin"), ("TERM", "xterm")]);
+    let sandbox = Some(Path::new(SANDBOX_EXEC));
+    let roster = crate::harness::accounts::Roster::parse_for(
+        Cli::Codex,
+        "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\nemail = \"codex-one@example.com\"\n",
+    )
+    .expect("codex's roster");
+    let store = crate::harness::accounts::Store::at_for(
+        &bed.tmp.path().join("state"),
+        Cli::Codex,
+        bed.tmp.path(),
+    );
+    let route = CODEX_SIGNIN.route(None).expect("codex's route");
+    assert!(calls_back_here(route), "the default is the browser route");
+    let codex = Request {
+        cli: Cli::Codex,
+        route,
+        row: roster.row("codex-1").expect("the row"),
+        staging: &bed.staging,
+        store: &store,
+        hosts: route.hosts.of(None).expect("fixed"),
+    };
+    let path_of = |cmd: &aterm_uds::spawnfd::Command| {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new("PATH"))
+            .and_then(|(_, v)| v.map(OsStr::to_os_string))
+    };
+    let (cmd, held) = login_command(&codex, &home, &parent, (true, sandbox)).expect("over SSH");
+    assert_eq!(cmd.get_program(), OsStr::new(SANDBOX_EXEC));
+    let args: Vec<OsString> = cmd.get_args().map(OsStr::to_os_string).collect();
+    assert_eq!(args[..2], [OsString::from("-p"), OsString::from(NO_DESK)]);
+    assert_eq!(
+        args[3..],
+        [OsString::from("login"), OsString::from("--device-auth")],
+        "{args:?}"
+    );
+    let held = held.expect("an opener-free PATH, held");
+    assert_eq!(path_of(&cmd), Some(held.path().as_os_str().to_os_string()));
+    let missing = bed.tmp.path().join("no-sandbox-exec");
+    assert!(
+        login_command(&codex, &home, &parent, (true, Some(&missing)))
+            .is_err_and(|why| why.contains("over SSH") && why.contains("is not here")),
+        "no sandbox, nothing run"
+    );
+    let (desk, held) = login_command(&codex, &home, &parent, (false, sandbox)).expect("desk");
+    assert_ne!(desk.get_program(), OsStr::new(SANDBOX_EXEC), "CONTROL");
+    let args: Vec<OsString> = desk.get_args().map(OsStr::to_os_string).collect();
+    assert_eq!(args, [OsString::from("login")], "CONTROL: {args:?}");
+    assert!(held.is_none(), "CONTROL");
+    assert_eq!(path_of(&desk), Some(OsString::from("/usr/bin:/bin")));
+
+    let grok_browser = GROK_SIGNIN
+        .route(Some(Flow::Browser))
+        .expect("grok's browser route");
+    let grok = Request {
+        cli: Cli::Grok,
+        route: grok_browser,
+        row: bed.roster.row("grok-1").expect("the row"),
+        staging: &bed.staging,
+        store: &bed.store,
+        hosts: grok_browser.hosts.of(None).expect("fixed"),
+    };
+    assert_eq!(
+        login_route(&grok, true).map(|r| r.flow),
+        Ok(Flow::Device),
+        "grok's loopback route over SSH"
+    );
+    assert_eq!(
+        login_route(&grok, false).map(|r| r.flow),
+        Ok(Flow::Browser),
+        "CONTROL: at the desk"
+    );
+    let kimi_route = KIMI_SIGNIN.route(None).expect("kimi's route");
+    assert!(
+        !calls_back_here(kimi_route),
+        "CONTROL: kimi's page calls nothing back"
+    );
+}

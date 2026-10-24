@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The framebuffer-fetch route against the split (design §5, lane B6): on a Metal device whose
-//! fetch probe passed, a frame's Unorm-law light draws through its rows' fetch twins inside the
-//! one sRGB pass, and lands the same bytes as the split and the CPU.
+//! The framebuffer-fetch route against the split (`docs/DESIGN-card-engine-2026-10-19.md` §5):
+//! on a Metal device whose fetch probe passed, a frame's Unorm-law light draws through its rows'
+//! fetch twins inside the one sRGB pass, and lands the same bytes as the split and the CPU.
 
 use std::sync::Arc;
 
@@ -296,8 +296,8 @@ fn frame_under(
     (frame, gpu.frame_shape())
 }
 
-/// THE ROUTE LAW: on a device whose probe passed, every twin's light lands the bytes the split
-/// lands and the CPU's integer law, in one pass; elsewhere the route stays the split.
+/// On a device whose probe passed, every twin's light lands the bytes the split lands and the
+/// CPU's integer law, in one pass; elsewhere the route stays the split.
 #[test]
 fn the_fetch_route_lands_the_splits_bytes_in_one_pass() {
     let light = Theme {
@@ -367,7 +367,7 @@ fn the_fetch_route_lands_the_splits_bytes_in_one_pass() {
     assert!(missing.is_empty(), "the scenes never drew {missing:?}");
 }
 
-/// ROUTE (1) OF THE PASS ECONOMY: an Exact Under layer whose every pixel is opaque is stored at the
+/// Route (1) of the pass economy: an Exact Under layer whose every pixel is opaque is stored at the
 /// end of the base pass through the sRGB view and lands the bytes its Unorm-law `over` lands (the
 /// CPU's), on both routes, and its frame pays fewer passes; a translucent one, or one a cursor glow
 /// under the text sits on, keeps its own group.

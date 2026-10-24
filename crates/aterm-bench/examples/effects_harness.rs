@@ -232,7 +232,7 @@ struct Way {
 
 /// How each frame is presented, in turn: the shipped plan, the two ablations, the shipped plan
 /// with the GPU clock paused, and the shipped plan kept on the split (the Unorm-law light in
-/// passes of its own, as before the framebuffer-fetch route), which prices the route in place.
+/// passes of its own), which prices the framebuffer-fetch route in place.
 const WAYS: [Way; 5] = [
     Way {
         ablation: UnormAblation::Off,

@@ -257,11 +257,12 @@ impl CursorPhaser {
                 premul_rgb(hsv2rgb(hue + fringe, 0.95, 1.0), cov)
             };
             let half_h = (ch * 0.5 * hx).max(1.0);
+            let inv_half_h = 1.0 / half_h;
             let half_h_i32 = half_h as i32;
             let mut dy = -half_h_i32;
             while dy < half_h_i32 {
                 let h = slab.min(half_h_i32 - dy).max(1);
-                let ym = (dy as f32 + h as f32 * 0.5) / half_h;
+                let ym = (dy as f32 + h as f32 * 0.5) * inv_half_h;
                 let hw = (r * (1.0 - ym * ym).max(0.0).sqrt()) as i32;
                 if hw >= 1 {
                     let y = cy_i32 + dy;

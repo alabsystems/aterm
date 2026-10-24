@@ -678,10 +678,9 @@ fn the_offer_counts_as_presented_only_on_glass_in_a_focused_window() {
     assert!(!app.system_state_presented_active(instance));
 }
 
-/// A choice made while a run is going reaches the worker, which stops the
-/// pass ahead of it as it takes the plan (design §3.3): the window asks for
-/// no Stop, then or on a busy read after, so none can reach the choice's own
-/// run, however soon after its admission the read comes.
+/// A choice made during a run reaches the worker, which stops the pass ahead of it as it takes the
+/// plan (design §3.3); the window asks for no Stop, then or on a busy read after, so none can reach
+/// the choice's own run.
 #[test]
 fn a_choice_during_a_run_leaves_the_pass_ahead_to_the_worker() {
     let mut app = App::headless_for_test();
@@ -722,6 +721,93 @@ fn a_pressed_stop_is_asked_once() {
     fresh(&mut app, running());
     fresh(&mut app, running());
     assert!(calls().is_empty(), "the worker keeps it");
+}
+
+#[test]
+fn a_stop_during_admission_keeps_permissions_held_after_the_old_ack() {
+    let mut app = App::headless_for_test();
+    let (wid, _, view) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    let allowed = Some(crate::InitialSetupPermissionPolicy {
+        revision: 4,
+        allowed: true,
+    });
+    fresh(
+        &mut app,
+        SetupStatus {
+            permissions: allowed,
+            ..running()
+        },
+    );
+    press(&mut app, wid, view, "system-state/group/2/leave");
+    let before_stop = receipt();
+    let chosen = app
+        .system_state_host
+        .pending_apply
+        .as_ref()
+        .expect("the choice is awaiting admission")
+        .plan
+        .clone();
+    assert!(!chosen.selection.contains(Setting::Dock));
+    press(&mut app, wid, view, "system-state/stop");
+    assert_eq!(calls(), ["stop"]);
+    assert!(
+        app.system_state_host.pending_apply.is_some(),
+        "Stop keeps the admission receipt and busy reservation"
+    );
+    assert_eq!(app.access_revision(), None);
+    before_stop.accept();
+    app.resolve_system_state_apply();
+    assert!(
+        app.system_state_host.pending_apply.is_none(),
+        "the owned receipt still resolves"
+    );
+    // The Stop's worker has not saved its file yet, so this otherwise fresh
+    // read names the admitted plan and the earlier permission decision.
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(chosen.clone()),
+            permissions: allowed,
+            ..running()
+        },
+    );
+    assert_eq!(
+        app.access_revision(),
+        None,
+        "an admission sent before Stop cannot reopen permission guidance"
+    );
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(chosen),
+            permissions: allowed,
+            finished: true,
+            ..SetupStatus::default()
+        },
+    );
+    assert_eq!(
+        app.access_revision(),
+        None,
+        "even a completed allowed run cannot undo the local Stop"
+    );
+
+    press(&mut app, wid, view, "system-state/group/2/set-up");
+    receipt().accept();
+    app.resolve_system_state_apply();
+    fresh(
+        &mut app,
+        SetupStatus {
+            permissions: allowed,
+            ..running()
+        },
+    );
+    assert_eq!(
+        app.access_revision(),
+        Some(4),
+        "a new choice after Stop may release its own permission hold"
+    );
+    assert!(calls().is_empty(), "the new choice does not stop itself");
 }
 
 #[test]
@@ -892,6 +978,78 @@ fn a_page_opened_by_hand_shows_and_reads_the_plan_in_force() {
 }
 
 #[test]
+fn unknown_plan_check_waits_for_the_saved_plan_after_reopen() {
+    fn saved_plan() -> Plan {
+        let mut selection = aterm_types::macos_setup::Selection::none();
+        selection.set(Setting::Permissions, true);
+        selection.set(Setting::Dock, true);
+        Plan {
+            selection,
+            vault_url: "http://saved.local:7484/v1/team".into(),
+        }
+    }
+    let mut app = App::headless_for_test();
+    let (wid, first_instance, _) = page(&mut app);
+    app.set_system_state_handlers_for_test(handlers());
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(saved_plan()),
+            ..SetupStatus::default()
+        },
+    );
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.app(first_instance).is_none());
+    assert!(app.open_system_state_tab());
+    let (_, view) = app.active_native_view(wid).unwrap();
+    assert!(!app.native_runtime.system_state_mut().unwrap().plan_known());
+
+    // No tick has hydrated the new page from the last status yet.
+    press(&mut app, wid, view, "system-state/check");
+    assert!(
+        calls().is_empty(),
+        "no default-plan Check or reading starts"
+    );
+    assert!(app.native_runtime.take_system_state_action().is_none());
+
+    fresh(
+        &mut app,
+        SetupStatus {
+            plan: Some(saved_plan()),
+            ..SetupStatus::default()
+        },
+    );
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        check: |plan| {
+            assert_eq!(plan, saved_plan());
+            note("checked saved plan".into());
+            CheckStarted {
+                reading: true,
+                check: true,
+            }
+        },
+        observe: |plan| {
+            assert_eq!(plan, saved_plan());
+            note("read saved plan".into());
+            true
+        },
+        ..handlers()
+    });
+    press(&mut app, wid, view, "system-state/check");
+    press(&mut app, wid, view, "system-state/check");
+    assert_eq!(calls(), ["checked saved plan", "read saved plan"]);
+    assert!(app.system_state_host.pending_apply.is_none());
+    assert_eq!(
+        app.native_runtime
+            .system_state_mut()
+            .unwrap()
+            .reviewed_plan(),
+        saved_plan()
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
 fn check_again_and_restore_are_not_shown_as_a_run() {
     for (key, words) in [
         ("system-state/check", "Checking this Mac…"),
@@ -927,9 +1085,8 @@ fn check_again_and_restore_are_not_shown_as_a_run() {
     }
 }
 
-/// A requested Check can fail even when the separately observed rows are in
-/// place. Its result belongs to exactly the plan it read, including a typed
-/// vault address; a later edit must not reinstall it from the next poll.
+/// A Check's result belongs to exactly the plan it read, typed vault address included: it can fail
+/// with the observed rows in place, and once a later edit hides it, no poll restores it.
 #[test]
 fn check_notes_follow_the_exact_dispatched_plan() {
     use crate::system_state::SetupCheck;
@@ -1021,8 +1178,7 @@ fn check_notes_follow_the_exact_dispatched_plan() {
                 outcome == "failed" && !typed_url,
                 "without a review context, the menu matches only the saved plan"
             );
-            // Both URL and selection mismatches were checked above; exercise a
-            // real subsequent field edit and repeated current status, too.
+            // A later field edit hides the note, and a poll of the same status does not restore it.
             type_into(
                 &mut app,
                 wid,
@@ -1178,9 +1334,8 @@ fn a_pass_overlapping_check_again_is_shown_as_a_run_with_its_stop() {
     fresh(&mut app, running());
     assert!(stop_shown(&app, wid));
 
-    // A pass held the worker when Check again was pressed: the check did not
-    // start, so nothing is labelled as one. Its forced reading ran, so Check
-    // again did start, and the page says nothing about it not starting.
+    // A pass held the worker when Check again was pressed: no check started, so nothing is
+    // labelled one, but its forced reading ran, so the page never says Check again did not start.
     let mut app = App::headless_for_test();
     let (wid, _, view) = page(&mut app);
     app.set_system_state_handlers_for_test(InitialSetupHandlers {
@@ -1279,11 +1434,9 @@ fn stop_and_open_change_no_plan() {
     assert!(app.system_state_host.pending_apply.is_none());
 }
 
-/// A CONTROL CLIENT'S OPEN SPENDS ITS OWN EVIDENCE: a row's Open acted by a
-/// control client (`aterm ctl app act system-state/row/<slug>/open`) takes the
-/// press evidence it left, as every other action does, so the person's next
-/// press on the page is still theirs. Left pending, the client's gesture would
-/// taint it: a Turn On… that starts nothing, an Apply that mints no admission.
+/// A row's Open acted by a control client (`aterm ctl app act system-state/row/<slug>/open`)
+/// spends the press evidence it left, as every other action does; left pending, it would taint
+/// the person's next press (a Turn On… that starts nothing, an Apply that mints no admission).
 #[test]
 fn a_clients_open_spends_its_evidence_so_the_persons_next_press_is_theirs() {
     use crate::workstation_setup::PagePress;
@@ -1552,9 +1705,8 @@ fn no_offer_is_shown_over_a_choice_still_being_admitted() {
     // nothing, but the window still waits for the choice's answer.
     app.close_active_native_tab(wid).unwrap();
     page(&mut app);
-    // The startup's offer reaches the window before the choice's answer: the
-    // choice answers for this launch, so the offer is let go, and the window
-    // still reads the choice's answer when it comes.
+    // The startup's offer arrives before the choice's answer: the choice answers for this launch,
+    // so the offer is let go and the window still reads the choice's answer.
     let (send, receive) = mpsc::channel();
     app.attach_system_state_offer(Request::new(Plan::default(), send));
     assert_eq!(
@@ -1643,8 +1795,7 @@ fn idle_ticks_keep_the_shown_frame() {
         .unwrap()
         .common()
         .presentation_revision;
-    // No repaint or input occurs during these idle ticks. Repeated identical
-    // worker snapshots also leave the shown frame valid.
+    // Idle ticks with identical worker snapshots and no input keep the shown frame.
     for tick in 1..=40 {
         app.tick_system_state(start + Duration::from_millis(tick * 250));
         app.publish_system_state(status.clone());
@@ -1680,11 +1831,9 @@ fn idle_ticks_keep_the_shown_frame() {
     );
 }
 
-/// TURN ON SYNC IS THE PERSON'S ALONE: their press on the Secrets vault row's
-/// Turn On Sync asks the worker to install the subscriber they turned off
-/// (design §3.3); a control client's press turns nothing on, since only the
-/// person undoes their own choice, and spends its evidence, so the person's
-/// next press is still theirs.
+/// The person's press on the vault row's Turn On Sync asks the worker to install the subscriber
+/// they turned off (design §3.3); a control client's press turns nothing on and spends its
+/// evidence, so the person's next press is still theirs.
 #[test]
 fn only_a_persons_turn_on_sync_turns_the_sync_on() {
     use crate::workstation_setup::PagePress;
@@ -1739,10 +1888,9 @@ fn a_status_due_before_the_next_tick_is_asked_for_and_owes_no_wake_until_the_tic
     );
 }
 
-/// A System State page in a minimized, hidden (Cmd-H) or fully covered window
-/// (winit's Occluded, which `on_occlusion_changed` records) is no page anyone can
-/// see: the village does not walk there and the window is not redrawn for it, and
-/// the page counts as shown again once the window is back on screen.
+/// A page in a minimized, hidden (Cmd-H) or fully covered window (winit's Occluded, recorded by
+/// `on_occlusion_changed`) is not shown: its village does not walk and the window is not redrawn
+/// for it until the window is back on screen.
 #[test]
 fn a_page_in_an_occluded_window_is_not_shown() {
     let mut app = App::headless_for_test();
@@ -1825,9 +1973,8 @@ fn a_walking_tick_redraws_only_the_windows_that_show_the_page() {
     );
 }
 
-/// A page in an unfocused split pane is one someone sees: a run walks its
-/// village though the window that shows the page in front is too short for
-/// one, and the split pane's own render, not the front one's, decides it.
+/// A page in an unfocused split pane is seen: a run walks its village though the front window's
+/// page is too short for one, because the split pane's own render decides it.
 #[test]
 fn a_split_panes_village_walks_beside_a_front_page_too_short_for_one() {
     let mut app = App::headless_for_test();
@@ -1888,9 +2035,7 @@ fn a_split_panes_village_walks_beside_a_front_page_too_short_for_one() {
     );
 }
 
-/// A page key moves System State's list a page of its room, as it moves
-/// Settings': never the eight wheel lines that carried a short list past
-/// what it never showed.
+/// A page key moves System State's list a page of its room, as it moves Settings'.
 #[test]
 fn a_page_key_moves_the_list_a_page_of_its_room() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};

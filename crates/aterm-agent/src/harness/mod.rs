@@ -201,6 +201,9 @@ pub(crate) fn fake_instance(
     let token_file = aterm_uds::latest::token_path_for_sock(&path).expect("token path");
     std::fs::write(token_file, format!("{token}\n")).expect("token");
     let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
+    // The suite spawns children beside every fixture: a scan of one mid-spawn would drain an
+    // inherited copy of these sockets (`aterm_uds::keep_out_of_children`).
+    aterm_uds::keep_out_of_children(&listener).expect("keep the listener out of children");
     listener.set_nonblocking(true).expect("nonblocking accept");
     let (cancelled, cancel) = std::io::pipe().expect("server cancellation");
     let active = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -250,9 +253,11 @@ pub(crate) fn fake_instance(
                 Err(_) => break,
             };
             let _ = conn.set_nonblocking(false);
+            let _ = aterm_uds::keep_out_of_children(&conn);
             let Ok(cut) = conn.try_clone() else {
                 continue;
             };
+            let _ = aterm_uds::keep_out_of_children(&cut);
             {
                 let mut active = serving.lock().unwrap_or_else(|p| p.into_inner());
                 if ended.load(std::sync::atomic::Ordering::SeqCst) {
@@ -264,6 +269,7 @@ pub(crate) fn fake_instance(
                 drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
                 continue;
             };
+            let _ = aterm_uds::keep_out_of_children(&out);
             let mut lines = std::io::BufReader::new(conn).lines();
             if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
                 drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());

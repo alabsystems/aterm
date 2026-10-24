@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Supervisor decision journal ([`super::SuperviseOpts::journal`], [`JournalRecord::of_line`],
-//! [`NEEDS`]); a record's `kind` is one of [`Word::ALL`]'s names, or `other` for a line that
-//! begins with any other word (each a loop journals is one of [`Noted::ALL`]):
+//! Supervisor decision journal ([`super::SuperviseOpts::journal`]): one JSON record per line a
+//! loop prints ([`JournalRecord::of_line`]). A record's `kind` is one of [`Word::ALL`]'s names,
+//! or `other` for a line that begins with any other word (each a loop journals is one of
+//! [`Noted::ALL`]):
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
@@ -206,10 +207,9 @@ impl Word {
     }
 }
 
-/// Every other word a loop journals a line with: its record's `kind` stays `other` (the
-/// readers of these lines read the line's first word, as every build wrote them), and a
-/// reader names it by [`Self::of_line`]. Together with [`Word`] it is every word a loop's
-/// journal holds (a test build refuses to journal any other, [`Journal::record`]).
+/// Every other word a loop journals a line with. Its record's `kind` stays `other` (readers
+/// read these lines' first word) and a reader names it by [`Self::of_line`]; with [`Word`] it
+/// covers every word a journal holds (a test build refuses any other, [`Journal::record`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Noted {
     Done,
@@ -662,9 +662,9 @@ impl Journal {
         j
     }
 
-    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped `t_ms`. A test
-    /// build refuses a line the ledger would read `unread` (`ledger::assert_marked`): every
-    /// line a loop journals begins with a [`Word`] or a [`Noted`] word.
+    /// Appends the record of `line` ([`JournalRecord::of_line`]), stamped `t_ms`. A test build
+    /// refuses a line the ledger would read `unread` (`ledger::assert_marked`): every line a
+    /// loop journals begins with a [`Word`] or a [`Noted`] word.
     pub fn record(&mut self, t_ms: i64, line: &str, warn: &mut dyn Write) -> Option<String> {
         self.record_marked(t_ms, line, None, warn)
     }
@@ -742,10 +742,8 @@ impl Journal {
         true
     }
 
-    /// A write that failed: said once ([`Self::warn`]), and when the file
-    /// system is out of space or quota, the window's disk watch is asked to
-    /// look now ([`crate::harness::disk::poke`]) — aterm's own failing write
-    /// is a sighting of the full disk like an agent's screen.
+    /// A write that failed: warned once ([`Self::warn`]); an out-of-space or quota error also
+    /// asks the window's disk watch to look now ([`crate::harness::disk::poke`]).
     fn failed(&mut self, e: &std::io::Error, what: &str, warn: &mut dyn Write) {
         if crate::harness::disk::poke::is_out_of_space(e) {
             let path = self
@@ -1019,10 +1017,8 @@ mod tests {
         }
     }
 
-    /// EVERY WORD IS READ BY ITS OWN NAME: each [`Word`] is the kind of a line that begins
-    /// with its printed form, and of nothing else; its name reads back to it; `RECONNECTED`
-    /// is `reconnect`; NEGATIVE CONTROL: a word in lower case, and a word no line is read by,
-    /// are `other`.
+    /// Each [`Word`] is the kind of a line that begins with its printed form and of nothing
+    /// else, and its name reads back to it; a lower-case word or an unknown one is `other`.
     #[test]
     fn every_word_is_read_by_its_own_name() {
         let mut names: Vec<&str> = Word::ALL.iter().map(|w| w.name()).collect();
@@ -1111,11 +1107,8 @@ mod tests {
         assert!(JournalRecord::from_json("{\"t\":1,\"kind\":\"event\",\"line\":").is_err());
     }
 
-    /// AN OUT-OF-SPACE WRITE ASKS THE DISK WATCH TO LOOK: a journal write
-    /// that fails with `ENOSPC` or `EDQUOT` pokes the watch
-    /// ([`crate::harness::disk::poke`]) naming the journal, as the watch's
-    /// handler hears it; NEGATIVE CONTROL: any other failure (a permission
-    /// denied) pokes nothing.
+    /// A journal write that fails with `ENOSPC` or `EDQUOT` pokes the disk watch naming the
+    /// journal; any other failure pokes nothing.
     #[test]
     fn a_journal_write_out_of_space_pokes_the_disk_watch() {
         use crate::harness::disk::poke::{Cause, set_handler};

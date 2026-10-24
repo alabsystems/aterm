@@ -669,6 +669,13 @@ fn build_and_start(
             listener.id(),
             aterm_vz_agent::WATCH_PORT,
         );
+        // The log's own evidence of the bring-up order (§6): the listener is set before the
+        // start is asked, so no guest dial can come before it.
+        eprintln!(
+            "aterm-vz-host {}: the watch listener is set on port {}; the VM's start is asked next",
+            aterm_vz::helper::stamp(),
+            aterm_vz_agent::WATCH_PORT
+        );
 
         let mut aterm_fs = None;
         let fs_devices = send_id(vm.id(), sel!(directorySharingDevices));

@@ -376,10 +376,10 @@ fn credential_ready(
 
 /// Whether git's own github.com lookups, through the helpers `user`'s configuration names and
 /// asked as a clone asks, already hand back exactly `token` for every repository alike
-/// ([`Git::uniform`]): the secrets vault's helper reads the synced token itself, so a rotation
-/// reaches git with nothing here to redo, and the keychain is neither written nor made git's
-/// only helper. A lookup git cannot run, or settings that ask for some repositories otherwise,
-/// is no answer: the keychain path then runs as before and reports its own failure.
+/// ([`Git::uniform`]). The vault's helper then reads the synced token itself, so a rotation
+/// reaches git with nothing to redo, and the keychain is neither written nor made git's only
+/// helper. A lookup git cannot run, or settings that answer some repositories otherwise, is no
+/// answer: the keychain path runs.
 pub(super) fn lookups_answer(sys: &dyn System, user: &User, token: &Secret) -> bool {
     let git = Git::keychain();
     git.fill_as_configured(sys, Some(user), GITHUB)
@@ -668,12 +668,8 @@ mod tests {
         );
     }
 
-    /// EVERY BLOCKED STEP SAYS WHY IN SYSTEM STATE'S WORDS (design §3.3): the probe
-    /// decides the reason at the step that stopped, from what that step knows (no git, the
-    /// token file absent or unusable, GitHub's kind of failure, another account, the
-    /// settings, a folder in the way), never from the engine's line; the row the plan pass
-    /// reads carries it, and the Repositories row's note is its words. A step that decides
-    /// none gives no note here, and the page words that row itself.
+    /// Every blocked step's reason is decided where it stopped, never from the engine's line, and
+    /// the Repositories row's note is its words; a step that decides none gives no note.
     #[test]
     fn every_blocked_step_says_why_in_system_states_words() {
         use crate::init_observe::observation;
@@ -920,11 +916,9 @@ mod tests {
         }
     }
 
-    /// git's own lookups already answering the synced token alike for every repository (the
-    /// secrets vault's helper, which reads it itself) are ready as they are: nothing goes into
-    /// the keychain and git's settings are not rewritten, so the next rotation of the synced
-    /// token reaches git. Ones that answer another token, or that some repositories' settings
-    /// could answer otherwise, still get the keychain.
+    /// Lookups that already answer the synced token alike for every repository are kept: nothing
+    /// goes into the keychain and git's settings are not rewritten. Ones that answer another
+    /// token, or that some repositories' settings could answer otherwise, still get the keychain.
     #[test]
     fn lookups_that_already_answer_the_synced_token_are_kept_as_they_are() {
         let context = |item: &NativeRepositories| {

@@ -1400,7 +1400,11 @@ pub const GROK_ANCHORS: &[Anchor] = &[
         "Authentication required: your session has expired",
         "1.0.67",
     ),
-    lit("grok.auth.not_logged_in", "Not logged in", "1.0.67"),
+    lit(
+        "grok.auth.not_logged_in",
+        "Not logged in. Run `grok login`.",
+        "1.0.70",
+    ),
 ];
 
 /// Every string aterm guards on in Kimi Code's screen ([`crate::kimi`]), as 2.3.1 drew it.
@@ -1518,7 +1522,8 @@ pub fn rollout_reduction_stem(build: &str) -> String {
     }
 }
 
-/// The text of the anchor `id`.
+/// The text of the anchor `id`, for an id known only at run time; a literal id is
+/// [`anchor!`](macro@crate::anchor), which the build resolves and checks.
 #[must_use]
 pub fn anchor(id: &str) -> &'static str {
     match ANCHORS
@@ -1537,7 +1542,18 @@ pub fn anchor(id: &str) -> &'static str {
     }
 }
 
-/// [`anchor`] at compile time.
+/// The text of the anchor with the literal id `$id`, evaluated by the compiler: an id no
+/// table names fails the build, and the reader pays nothing to look it up.
+#[macro_export]
+macro_rules! anchor {
+    ($id:literal) => {{
+        const TEXT: &str = $crate::anchor_text($id);
+        TEXT
+    }};
+}
+
+/// [`anchor`](fn@anchor) at compile time: the walk [`anchor!`](macro@crate::anchor) evaluates.
+/// Called at run time it walks every table, so a run-time id goes through [`anchor`](fn@anchor).
 #[must_use]
 pub const fn anchor_text(id: &str) -> &'static str {
     const fn same(a: &str, b: &str) -> bool {

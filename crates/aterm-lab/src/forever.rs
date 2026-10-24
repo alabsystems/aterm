@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: Autopilot Land and Cruise, LIVE, on every harness aterm supervises — the real Claude Code, Gemini CLI, agy and Muse Code TUIs under a private headless aterm with the harness ON (its defaults), against the stub, each conversation scripted turn by turn ([`crate::stub::scripted_reply`]: the custom mode `forever`, whose rules pick a turn's reply by the scenario's word in the conversation and the act of the harness it answers).
+//! `forever` ([`cmd_forever`]): Autopilot Land and Cruise live on every harness aterm supervises.
+//! The real Claude Code, Gemini CLI, agy and Muse Code TUIs run under a private aterm with the
+//! harness on (its defaults), against the stub, each conversation scripted turn by turn
+//! ([`crate::stub::scripted_reply`]: the custom mode `forever`, whose rules pick a turn's reply by
+//! the scenario's word in the conversation and the act of the harness it answers).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -39,13 +43,15 @@ pub const CLEAN: &str = "Nothing left: the parser is committed and pushed to ori
 
 const ASK_KEY: &str = "a person asks: what stands now";
 
-/// The reply to it: no done claim, no defense, no question, opening with none of Muse Code's tool-row heads.
+/// The reply to it: no done claim, no defense, no question, opening with none of Muse Code's
+/// tool-row heads.
 pub const ASK_REPLY: &str = "Here is where it stands: the parser module is written and tested.";
 
 /// The need L3 and L6 name.
 pub const NEED: &str = "rotate the deploy key";
 
-/// N1–N4's needs (`cruise-n`), each under the 64 cells the needs entry's writer keeps of a need, so every surface can read it whole.
+/// N1–N4's needs (`cruise-n`), each under the 64 cells the needs entry's writer keeps of a need,
+/// so every surface can read it whole.
 pub const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings";
 /// …the second of N1's.
 pub const NEED_B: &str = "the release credential to sign 0.48.0";
@@ -63,7 +69,8 @@ const LONG_PACE_MS: i64 = 7_000;
 )]
 const LONG_PACE_S: f64 = LONG_PACE_MS as f64 / 1000.0;
 
-/// How long a long reply of `text` keeps its agent busy at the least: its hold, and its pace before each of its deltas ([`crate::stub::split_deltas`]).
+/// How long a long reply of `text` keeps its agent busy at the least: its hold, and its pace
+/// before each of its deltas ([`crate::stub::split_deltas`]).
 #[must_use]
 pub fn long_reply_ms(text: &str) -> i64 {
     let words = i64::try_from(crate::stub::split_deltas(text).len()).unwrap_or(0);
@@ -105,7 +112,8 @@ const WORK_KEY: &str = "Implemented the parser";
 
 const OPEN_KEY: &str = "The docs PR is still open";
 
-/// L12's question in prose (`classify_said`: a question, no choice, no destructive word; no done claim).
+/// L12's question in prose (`classify_said`: a question, no choice, no destructive word; no done
+/// claim).
 pub const QUESTION: &str = "Should the parser also accept tab-indented input?";
 const QUESTION_KEY: &str = "tab-indented input";
 const ANSWER_KEY: &str = "Nobody is here to choose:";
@@ -120,7 +128,8 @@ const PERSON_STAND_MS: u64 = 8_000;
 const DRAFT_HANG: Duration = Duration::from_secs(60);
 const EXCHANGE_WATCH_MS: i64 = QUIET_UNDER_OFF_MS + 30_000;
 
-/// P2's replies, each opening `Wrote ` (Muse Code's tool-row head) with a plain word after it: L14's work report, its need and defense, its clean defense; C3's done claim and its defense.
+/// P2's replies, each opening `Wrote ` (Muse Code's tool-row head) with a plain word after it:
+/// L14's work report, its need and defense, its clean defense; C3's done claim and its defense.
 pub const W_WORK: &str = "Wrote the parser module and its unit tests in this turn.";
 pub const W_NEEDS: &str = "Wrote the docs for the parser too.\nNEEDS YOU: rotate the deploy key\nNothing left: the parser is committed and pushed to origin/main.";
 pub const W_DEFENSE: &str = "Wrote the last commit to origin/main.\nNothing left: the parser is committed and pushed to origin/main.";
@@ -129,13 +138,18 @@ pub const W_CHECKED: &str = "Wrote the last checks for the parser.\nNothing left
 const W_WORK_KEY: &str = "Wrote the parser module";
 const W_DONE_KEY: &str = "Wrote the parser and pushed";
 
-/// C4: THE OWNER'S OWN CONTINUATION, IN TWO PARAGRAPHS (`[harness] continue_text`, set on the lab of a run holding `cruise-o`: [`owner_keys`]): a blank line, then a `Nothing left:` line and a `NEEDS YOU:` line of its own, every line a head agy's reader would take where a blank line in a message cut it (agy draws the rows under it two columns in, as a reply's: `aterm_phase::agy`'s header).
+/// C4: the owner's own continuation in two paragraphs (`[harness] continue_text`, set on the lab
+/// of a run holding `cruise-o`: [`owner_keys`]): a blank line, then a `Nothing left:` line and a
+/// `NEEDS YOU:` line of its own, every line a head agy's reader would take where a blank line in
+/// a message cut it (agy draws the rows under it two columns in, as a reply's: `aterm_phase::agy`'s
+/// header).
 pub const OWNER_CONTINUE: &str = "Keep going on the owner's terms: finish the parser, verify it and land it.\n\nNothing left: is a line you write only once everything is on remote main.\nNEEDS YOU: lines are for credentials only.";
 const OWNER_KEY: &str = "on the owner's terms";
 const OWNER_TAIL: &str = "lines are for credentials only";
 const DONE_CLAIM_KEY: &str = "Merged the parser";
 
-/// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's `continue_text`: a TOML basic string, its line breaks escaped.
+/// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's `continue_text`: a TOML basic
+/// string, its line breaks escaped.
 #[must_use]
 pub fn owner_keys() -> String {
     let mut q = String::from("continue_text = \"");
@@ -151,7 +165,9 @@ pub fn owner_keys() -> String {
     q
 }
 
-/// The startup deadline of a worker's record (`harness_host::STARTUP_DEADLINE`, the crate's own): a record `working` as its starter left it whose agent shows no composer by then is marked `stalled why=startup`.
+/// The startup deadline of a worker's record (aterm-gui's `harness_host::STARTUP_DEADLINE`): a
+/// record `working` as its starter left it whose agent shows no composer by then is marked
+/// `stalled why=startup`.
 pub const STARTUP_DEADLINE_MS: i64 = 120_000;
 const PAST_DEADLINE_MS: i64 = 30_000;
 
@@ -177,7 +193,9 @@ const WALL_AHEAD_MS: i64 = 240_000;
 const WALL_LIFT_EARLY_MS: i64 = 3_000;
 const WALL_LOST_MS: i64 = 5 * 60_000;
 
-/// The grace past a reset the harness waits on `program` (the harness's word, [`Harness::name`]) before it goes on (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy, Gemini CLI), 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
+/// The grace past a reset the harness waits on `program` ([`Harness::name`]) before it goes on
+/// (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy, Gemini
+/// CLI), 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
 #[must_use]
 pub fn wall_grace_ms(program: &str) -> i64 {
     use aterm_phase::Program;
@@ -191,7 +209,12 @@ pub fn wall_grace_ms(program: &str) -> i64 {
     i64::try_from(turn_end::TurnEndTiming::default().grace_for(p).as_millis()).unwrap_or(i64::MAX)
 }
 
-/// The claim the stub's wall is raised with on harness `h` ([`wall_step`]): a five-hour window, which Claude Code reads off the unified-limit headers and Muse Code off the `usage_limit_reached` body; on agy's Gemini API key the claim names nothing and the stub answers the key's spent per-day quota; Gemini CLI gets a Google account's spent usage limit ([`crate::stub::gemini::ACCOUNT_CLAIM`]), the 429 on which its usage-limit dialog names the reset.
+/// The claim the stub's wall is raised with on harness `h` ([`wall_step`]): a five-hour window,
+/// which Claude Code reads off the unified-limit headers and Muse Code off the
+/// `usage_limit_reached` body; on agy's Gemini API key the claim names nothing and the stub
+/// answers the key's spent per-day quota; Gemini CLI gets a Google account's spent usage limit
+/// ([`crate::stub::gemini::ACCOUNT_CLAIM`]), whose 429 makes its usage-limit dialog name the
+/// reset.
 #[must_use]
 pub const fn wall_claim(h: Harness) -> &'static str {
     match h {
@@ -200,7 +223,8 @@ pub const fn wall_claim(h: Harness) -> &'static str {
     }
 }
 
-/// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead` ms on (W1's [`WALL_AHEAD_MS`], W2's further, [`Chain::wall_ahead_ms`]).
+/// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead`
+/// ms on (W1's [`WALL_AHEAD_MS`], the others' [`Chain::wall_ahead_ms`]).
 #[must_use]
 pub const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
     (now + ahead + 59_999) / 60_000 * 60
@@ -209,9 +233,12 @@ pub const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
 const WALL_HID_AHEAD_MS: i64 = 420_000;
 const WALL_DAY_AHEAD_MS: i64 = 25 * 60 * 1000;
 const WALL_CLIMB_AHEAD_MS: i64 = 45 * 60 * 1000;
-/// G3's shift ([`Chain::shifts`]): each raise again moves the reset this far on — past the loop's back-off after a try the dialog came back on (2 min, then 4: `approval_loop.rs`'s `LIMIT_RETRY_BACKOFF_S`), so each try waits the reset the dialog names, never the back-off alone.
+/// G3's shift ([`Chain::shifts`]): each raise again moves the reset this far on, past the loop's
+/// back-off after a try the dialog came back on (2 min, then 4: `approval_loop.rs`'s
+/// `LIMIT_RETRY_BACKOFF_S`), so each try waits the reset the dialog names.
 pub const SHIFT_STEP_MS: i64 = 5 * 60 * 1000;
-/// How many times G3's wall is raised again at its reset: the dialog drawn again with a new reset after each of two tries, the third getting through.
+/// How many times G3's wall is raised again at its reset: the dialog drawn again with a new reset
+/// after each of two tries, the third getting through.
 pub const SHIFT_TIMES: usize = 2;
 /// W4's redraw: the resume typed past the first reset meets the wall raised again this far on.
 pub const REDRAW_AHEAD_MS: i64 = 5 * 60 * 1000;
@@ -219,92 +246,124 @@ const WALL_SWITCH_AHEAD_MS: i64 = 15 * 60 * 1000;
 const WALL_RELAUNCH_AHEAD_MS: i64 = 10 * 60 * 1000;
 /// How long after the told W6's lab reads the conversation again ([`unread_restore_due`]).
 pub const UNREAD_RESTORE_AFTER_TOLD_MS: i64 = 60_000;
-/// How long past the told's due (the reset and [`futile_after_ms`]) W6's lab reads the conversation again with no told seen: the told is then late.
+/// How long past the told's due (the reset and [`futile_after_ms`]) W6's lab reads the
+/// conversation again with no told seen: the told is then late.
 pub const UNREAD_TOLD_LATE_MS: i64 = 10 * 60 * 1000;
-/// The words of the loop's hold on a limit whose conversation no read names (`turn_end.rs`'s `limit-conversation-unread`).
+/// The words of the loop's hold on a limit whose conversation no read names (`turn_end.rs`'s
+/// `limit-conversation-unread`).
 pub const UNREAD_WORDS: &str = "the remembered limit's conversation is unread";
 
-/// The loop's bound on a limit held unread past its reset before the owner is told (`exception.rs`'s `FUTILE_AFTER`), in ms.
+/// The loop's bound on a limit held unread past its reset before the owner is told
+/// (`exception.rs`'s `FUTILE_AFTER`), in ms.
 #[must_use]
 pub fn futile_after_ms() -> i64 {
     i64::try_from(aterm_agent::supervise::policy::exception::FUTILE_AFTER.as_millis())
         .unwrap_or(i64::MAX)
 }
 
-/// The words of the owner's told for a limit held unread (`Exception::unread_limit`'s why): its `EXCEPTION` line carries them.
+/// The words of the owner's told for a limit held unread (`Exception::unread_limit`'s why), which
+/// its `EXCEPTION` line carries.
 #[must_use]
 pub fn unread_told_words() -> String {
     aterm_agent::supervise::policy::exception::Exception::unread_limit().why
 }
-/// The latest the notice may leave the screen: this long before the reset, so the loop reads and decides the screen without it while the wait stands.
+/// The latest the notice may leave the screen: this long before the reset, so the loop reads and
+/// decides the screen without it while the wait stands.
 pub const HIDE_BEFORE_RESET_MS: i64 = 120_000;
 const HIDE_TRIES: usize = 32;
-/// The local command whose output scrolls the notice away: Muse Code prints `  Rules loaded this session (in precedence order):`, `  user: none`, `  project: none` under the turn's end and sends no request (measured on 1.4.10).
+/// Muse Code's local command whose output scrolls the notice away: it prints `  Rules loaded this
+/// session (in precedence order):`, `  user: none`, `  project: none` under the turn's end and
+/// sends no request (measured on 1.4.10).
 pub const HIDE_COMMAND: &str = "/rules";
-/// The words of Muse Code's usage wall (`◆ Usage limit reached · /upgrade (…) …`): a screen holding none of them has lost the notice.
+/// The words of Muse Code's usage wall (`◆ Usage limit reached · /upgrade (…) …`): a screen
+/// holding none of them has lost the notice.
 pub const WALL_WORDS: &str = "Usage limit reached";
-/// agy's local command whose output scrolls the notice away: with no `title` block in its settings (the lab's), `/title` prints `  ⎿  Error: No title command configured in settings.json.`
+/// agy's local command whose output scrolls the notice away: with no `title` block in its settings
+/// (the lab's), `/title` prints `  ⎿  Error: No title command configured in settings.json.`
 pub const AGY_HIDE_COMMAND: &str = "/title";
-/// The words of agy's quota wall: the Gemini API's message in its `⚠ agent executor error: …` block, and the block's last row (`Error ID: <id>`), which leaves the screen last as the rows above it scroll away.
+/// The words of agy's quota wall: the Gemini API's message in its `⚠ agent executor error: …`
+/// block, and the block's last row (`Error ID: <id>`), the last to scroll off the screen.
 pub const AGY_WALL_WORDS: [&str; 2] = ["exceeded your current quota", "Error ID: "];
-/// The option of Gemini CLI's usage-limit dialog that takes it away: `2.`
+/// The option of Gemini CLI's usage-limit dialog that takes the dialog away.
 pub const GEMINI_HIDE_OPTION: &str = "2. Stop";
-/// The words of Gemini CLI's usage-limit dialog: its title, and the reset row a Google account's spent quota draws under it.
+/// The words of Gemini CLI's usage-limit dialog: its title, and the reset row a Google account's
+/// spent quota draws under it.
 pub const GEMINI_WALL_WORDS: [&str; 2] = ["Usage limit reached", "Access resets at"];
-/// Claude Code's local command whose output scrolls the notice away once its countdown is cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name from then on (`──── <name> ─`), and with an argument typed no command menu is drawn (measured on 2.1.307 under the stub's five-hour limit: twelve of them take the notice off a 50-row tab, and the stub reads no request).
+/// Claude Code's local command whose output scrolls the notice away once its countdown is
+/// cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under
+/// its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name
+/// from then on (`──── <name> ─`), and with an argument typed no command menu is drawn (measured
+/// on 2.1.307).
 pub const CLAUDE_HIDE_COMMAND: &str = "/rename forever-w2";
-/// The words of Claude Code's usage limit: the turn's `⎿  You've hit your session limit · resets …`, its `⏺ Usage limit reached · continuing automatically at …` row, and the footer's `⚠ Usage limit reached · limit resets …` banner.
+/// The words of Claude Code's usage limit: the turn's `⎿  You've hit your session limit · resets
+/// …`, its `⏺ Usage limit reached · continuing automatically at …` row, and the footer's `⚠ Usage
+/// limit reached · limit resets …` banner.
 pub const CLAUDE_WALL_WORDS: [&str; 4] = [
     "session limit",
     "Usage limit",
     "usage limit",
     "limit resets",
 ];
-/// Claude Code's countdown, cancelled before the notice can be scrolled away ([`Hide::cancel`]): while it is armed its footer draws `⚠ Usage limit reached · limit resets …` and `Continuing automatically at … · esc to cancel` under every local command's rows; Esc cancels it — `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` — and the banner leaves the footer (measured on 2.1.307).
+/// Claude Code's countdown, cancelled before the notice can be scrolled away ([`Hide::cancel`]):
+/// while it is armed its footer draws `⚠ Usage limit reached · limit resets …` and `Continuing
+/// automatically at … · esc to cancel` under every local command's rows; Esc cancels it (`⏺
+/// Automatic continue cancelled · /rate-limit-options to re-arm`) and the banner leaves the footer
+/// (measured on 2.1.307).
 pub const CLAUDE_CANCEL: Cancel = Cancel {
     key: "escape",
     armed: "esc to cancel",
     cancelled: "Automatic continue cancelled",
 };
 
-/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): cases otherwise held only by unit tests. `same-words`' first prompt carries this path, one word with no space.
+/// A path, one word with no space, that `same-words`' first prompt carries (`--mode resid`).
 pub const LONG_TOKEN: &str = "lab/parser-module-parser-module-parser.rs";
-/// The size `same-words`' tab is resized to once its first point is decided (`resize <rows> <cols>`): narrower, so the opener re-wraps, and taller, so more of the conversation above the reply comes into sight.
+/// The size `same-words`' tab is resized to once its first point is decided (`resize <rows>
+/// <cols>`): narrower, so the opener re-wraps, and taller, so more of the conversation above the
+/// reply comes into sight.
 pub const RESIZED: (u16, u16) = (104, 62);
 const _: () = assert!(RESIZED.0 < 144);
 const RESIZE_AFTER_MS: i64 = 5_000;
 const TURN_AFTER_RESIZE_MS: i64 = 30_000;
 const SAME_TURN: &str = "now carry on with the parser module and report";
 const SAME_TURN_KEY: &str = "now carry on with the parser module";
-/// `tall-scroll`'s report rows ([`scroll_reply`]): with its head, the work report's words and each agent's own rows around them, a few rows taller than the tab's 50, so a few notches bring its opener back.
+/// `tall-scroll`'s report rows ([`scroll_reply`]): with its head, the work report and each
+/// agent's own rows, a few rows taller than the tab's 50, so a few notches bring its opener back.
 pub const SCROLL_LINES: usize = 46;
 const SCROLL_AFTER_MS: i64 = 5_000;
 const SCROLL_NOTCHES: u32 = 40;
 const SCROLL_STILL: u32 = 3;
 const SCROLL_HELD_MS: i64 = 10_000;
-/// How long the chain is watched after the last notch: the loop has read the scrolled screen (its recheck is 5 s at the most) and decided there, long before the first point's due.
+/// How long the chain is watched after the last notch: the loop has read the scrolled screen (its
+/// recheck is 5 s at the most) and decided there, long before the first point's due.
 pub const SCROLL_WATCH_MS: i64 = 40_000;
 
 /// F3's reply to its tool's result: no words, so the turn ends on the tool's row ([`read_call`]).
 pub const TOOL_AFTER: &str = "";
 
-/// The factor `--mode ladder` scales the short back-off ladder by (the product's development seam, `turn_end::LADDER_SCALE_SEAM`): an eighth, so the steps of 2, 4, 8, 16, 32 and 60 min are 15 s to 7.5 min, and the ladder to its cap and the cap decided again fit in about 16 min.
+/// The factor `--mode ladder` scales the short back-off ladder by (`turn_end::LADDER_SCALE_SEAM`):
+/// an eighth, so the steps of 2 to 60 min are 15 s to 7.5 min, and the ladder to its cap and the
+/// cap decided again fit in about 16 min.
 pub const LADDER_SCALE: f64 = 0.125;
-/// How many back-offs `ladder` must see decided: the doubling steps to the cap (2, 4, 8, 16, 32, 60 min), and the cap once more.
+/// How many back-offs `ladder` must see decided: the doubling steps to the cap (2, 4, 8, 16, 32,
+/// 60 min), and the cap once more.
 pub const LADDER_STEPS: u32 = 7;
 const LADDER_LIMIT_MS: i64 = 25 * 60 * 1000;
 const STEP_SLACK_MS: i64 = 2_500;
 
-/// The instance environment `--mode ladder` runs its aterm under: the ladder's seam at [`LADDER_SCALE`] (a development build reads it, a shipped one never).
+/// The instance environment `--mode ladder` runs its aterm under: the ladder's seam at
+/// [`LADDER_SCALE`], which only a development build reads.
 #[must_use]
 pub fn ladder_env() -> String {
     format!("{}={LADDER_SCALE}", turn_end::LADDER_SCALE_SEAM)
 }
 
-/// The shipped short back-off ladder, in minutes, one step per short turn in a row from the first: 2 min doubled to the 60 min cap, and the cap again — the judge's own word of it, which the product's timing is held to in a test (`forever_tests.rs`).
+/// The shipped short back-off ladder in minutes, one step per short turn in a row: 2 min doubled
+/// to the 60 min cap, then the cap again. A test in `forever_tests.rs` holds it to the product's
+/// own timing.
 pub const SHIPPED_LADDER_MIN: [i64; LADDER_STEPS as usize] = [2, 4, 8, 16, 32, 60, 60];
 
-/// The step the ladder names for a point that closed `streak` short turns ([`SHIPPED_LADDER_MIN`], the cap past its end), scaled by `scale`, in ms.
+/// The step the ladder names for a point that closed `streak` short turns, in ms, scaled by
+/// `scale` ([`SHIPPED_LADDER_MIN`], the cap past its end).
 #[must_use]
 pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
     let i = usize::try_from(streak.max(1) - 1)
@@ -319,7 +378,10 @@ pub fn ladder_step_ms(streak: u32, scale: f64) -> i64 {
     ms
 }
 
-/// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical path), read-only, which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's `read_file`, agy's `view_file`, Muse Code's `read_file` (its path read from its workspace root: an absolute one only where its file policy allows).
+/// F3's tool call on harness `h`: a read of the chain's own `README.md` (`file`, its physical
+/// path), which each CLI runs with no confirm in the lab's jail: Claude Code's `Read`, Gemini CLI's
+/// `read_file`, agy's `view_file`, Muse Code's `read_file` (with a path relative to its workspace
+/// root: its file policy allows an absolute one only in some places).
 #[must_use]
 pub fn read_call(h: Harness, file: &Path) -> J {
     let abs = file.to_string_lossy().into_owned();
@@ -339,7 +401,8 @@ pub fn read_call(h: Harness, file: &Path) -> J {
     J::obj([("name", J::s(name)), ("input", input)])
 }
 
-/// Why F3 is out of this lab's reach on harness `h`: no turn of its ends on a tool's row with no words after it (`None` where one does).
+/// Why F3 is out of this lab's reach on harness `h`: `None` where a turn can end on a tool's row
+/// with no words after it.
 #[must_use]
 pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
     (h == Harness::Agy).then_some(
@@ -347,7 +410,9 @@ pub fn tool_end_out_of_reach(h: Harness) -> Option<&'static str> {
     )
 }
 
-/// Why W1 or W2 (`mode`'s scenario) is out of this lab's reach on harness `h`, where it is: `None` where the stub draws the harness's own usage wall and, for W2, the lab takes its notice off the screen ([`hide_of`]).
+/// Why `mode`'s wall scenario is out of this lab's reach on harness `h`: `None` where the stub
+/// draws the usage wall the scenario needs and, for W2 and W4, the lab can take its notice off
+/// the screen ([`hide_of`]).
 #[must_use]
 pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     match mode {
@@ -400,18 +465,23 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
     }
 }
 
-/// How W2 takes the wall's notice off harness `h`'s screen while the wait stands ([`hide_step`]): a local command entered again and again (it sends no request), or the dialog's option chosen once; or why the harness has neither.
+/// How W2 takes the wall's notice off harness `h`'s screen while the wait stands ([`hide_step`]):
+/// a local command entered again and again (it sends no request), or the dialog's option chosen
+/// once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hide {
     /// What takes the notice away.
     pub by: HideBy,
-    /// The words of the harness's usage wall: a screen holding none of them has lost the notice ([`notice_gone`]).
+    /// The words of the harness's usage wall: a screen holding none of them has lost the notice
+    /// ([`notice_gone`]).
     pub words: &'static [&'static str],
-    /// A key pressed once first, where the program draws the notice for as long as its own countdown is armed (Claude Code's [`CLAUDE_CANCEL`]).
+    /// A key pressed once first, where the program draws the notice for as long as its own
+    /// countdown is armed (Claude Code's [`CLAUDE_CANCEL`]).
     pub cancel: Option<Cancel>,
 }
 
-/// The key that cancels a program's own countdown to its reset, and the words that show it armed and cancelled ([`Hide::cancel`]).
+/// The key that cancels a program's own countdown to its reset, and the words that show it armed
+/// and cancelled ([`Hide::cancel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancel {
     /// The key (`aterm ctl key`).
@@ -425,9 +495,11 @@ pub struct Cancel {
 /// What takes a harness's notice away ([`Hide::by`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HideBy {
-    /// A local command, typed into the empty composer and entered once the menu offers it first ([`menu_offers`]), again and again until the notice has scrolled away.
+    /// A local command, typed into the empty composer and entered once the menu offers it first
+    /// ([`menu_offers`]), again and again until the notice has scrolled away.
     Command(&'static str),
-    /// The dialog's option, chosen once: the focus moved onto it (Down) and Enter pressed only once the dialog draws it focused ([`dialog_focus`]).
+    /// The dialog's option, chosen once: focus moved onto it (Down), then Enter once the dialog
+    /// draws it focused ([`dialog_focus`]).
     Option(&'static str),
 }
 
@@ -485,7 +557,8 @@ impl Harness {
         Harness::Muse,
     ];
 
-    /// The verb's word, the lab's `agent`, the reader's program word (the needs entry's `<program>`: `Program::name`).
+    /// The verb's word, the lab's `agent`, the reader's program word (the needs entry's
+    /// `<program>`: `Program::name`).
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -510,7 +583,9 @@ impl Harness {
     }
 }
 
-/// Which chains run: the measured pass's by Autopilot (`land`, `cruise`, `both`), the coverage chains (`cover`), or the hour's cap on a lab of its own (`cap`).
+/// Which chains run: the measured pass's by Autopilot (`land`, `cruise`, `both`), the coverage
+/// chains (`cover`), the hour's cap (`cap`), the residuals (`resid`), the scaled ladder
+/// (`ladder`), or one of the stub's usage walls (`wall`, `wall-…`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Land,
@@ -525,23 +600,32 @@ pub enum Mode {
     Resid,
     /// The back-off ladder past its fourth step, scaled (`ladder`).
     Ladder,
-    /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini CLI's on a key's spent per-day quota.
+    /// W1 on the usage-limit dialog that names no reset (`wall-day`): Gemini CLI's on a key's spent
+    /// per-day quota.
     WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung (`wall-climb`): the ladder climbed while NEEDS YOU stands.
+    /// W1 on that dialog, its quota standing past the ladder's first rung (`wall-climb`): the
+    /// ladder climbed while NEEDS YOU stands.
     WallClimb,
-    /// W3, G3's climb across a changed reset (`wall-shift`): Gemini CLI's usage-limit dialog drawn again with a new reset after each try.
+    /// W3, G3's climb across a changed reset (`wall-shift`): Gemini CLI's usage-limit dialog drawn
+    /// again with a new reset after each try.
     WallShift,
-    /// W4, the redraw after a typed resume (`wall-redraw`): the resume typed past the reset meets the wall again, under a new reset.
+    /// W4, the redraw after a typed resume (`wall-redraw`): the resume typed past the reset meets
+    /// the wall again, under a new reset.
     WallRedraw,
-    /// W5, the cross-program end (`wall-switch`): another agent started in the tab under the first one's remembered limit.
+    /// W5, the cross-program end (`wall-switch`): another agent started in the tab under the first
+    /// one's remembered limit.
     WallSwitch,
-    /// W6, the unread limit told (`wall-unread`): Claude Code's limit held unread past its reset by `FUTILE_AFTER`.
+    /// W6, the unread limit told (`wall-unread`): Claude Code's limit held unread past its reset by
+    /// `FUTILE_AFTER`.
     WallUnread,
-    /// W7, the per-day dialog answered Stop (`wall-day-stop`): Gemini CLI's usage-limit dialog that names no reset, answered `2. Stop` as a person would, kept trying on its ladder while NEEDS YOU stands.
+    /// W7, the per-day dialog answered Stop (`wall-day-stop`): Gemini CLI's usage-limit dialog
+    /// that names no reset, answered `2. Stop` as a person would, kept trying on its ladder while
+    /// NEEDS YOU stands.
     WallDayStop,
     /// W8, a usage wall under Cruise (`wall-cruise`).
     WallCruise,
-    /// W9, the agent ended and launched again by a person under its standing wall (`wall-relaunch`).
+    /// W9, the agent ended and launched again by a person under its standing wall
+    /// (`wall-relaunch`).
     WallRelaunch,
     /// W10, Gemini CLI's per-model bucket (`wall-bucket`): its dialog's `Stop`, never its switch.
     WallBucket,
@@ -573,7 +657,8 @@ impl Mode {
         })
     }
 
-    /// A mode of the stub's usage wall, on a lab of its own on each harness it reaches ([`wall_out_of_reach`]), and its one scenario.
+    /// A mode of the stub's usage wall, on a lab of its own on each harness it reaches
+    /// ([`wall_out_of_reach`]), and its one scenario.
     #[must_use]
     pub const fn walled(self) -> Option<Scenario> {
         match self {
@@ -598,7 +683,9 @@ impl Mode {
     }
 }
 
-/// What a chain's repository holds once laid ([`lay_repo`]), beside its `main`, committed and pushed to `origin`: the five legs of the repository probe (`aterm_agent::harness::repo_work::probe`) one at a time.
+/// What a chain's repository holds once laid ([`lay_repo`]) beside its `main`, committed and
+/// pushed to `origin`: the five legs of the repository probe
+/// (`aterm_agent::harness::repo_work::probe`), one at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Repo {
     /// Nothing the remote's `main` lacks.
@@ -616,7 +703,8 @@ pub enum Repo {
 }
 
 impl Repo {
-    /// What the repository suffix must name of it (`RepoWork::summary`'s words), and the words of the other legs it must not.
+    /// What the repository suffix must name of it (`RepoWork::summary`'s words), and the words of
+    /// the other legs it must not.
     #[must_use]
     pub const fn named(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
@@ -713,35 +801,38 @@ pub enum Chain {
     Wall,
     /// W2 (the usage wall whose notice leaves the screen: the remembered wall).
     WallHid,
-    /// F18 (a person's keystroke into an instant turn: P4C's chain, its person's prompt typed `as=person`).
+    /// F18 (a person's keystroke into an instant turn: P4C's chain, its person's prompt typed
+    /// `as=person`).
     InstantPerson,
-    /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize) and SAME (a new turn answered with the very words of the one before).
+    /// F1 and F2 (a judged turn's opener re-wrapped and revealed by a resize) and SAME (a new turn
+    /// answered with the very words of the one before).
     SameWords,
-    /// F1 BY A SCROLL (a judged turn's opener scrolled into sight from the history above the screen by a wheel, nothing submitted).
+    /// F1 by a scroll (a judged turn's opener scrolled into sight from the history above the
+    /// screen by a wheel, nothing submitted).
     TallScroll,
     /// F3 (a first turn ended on a tool's row after a launch).
     ToolEnd,
     /// LADDER (the back-off ladder doubled to its cap, scaled).
     Ladder,
-    /// W1 on Gemini CLI's usage-limit dialog that names no reset (a key's spent per-day quota), kept trying on the entitlement ladder while a person is told.
+    /// W1 on Gemini CLI's usage-limit dialog that names no reset (`--mode wall-day`).
     WallDay,
-    /// W1 on that dialog, its quota standing past the ladder's first rung: the ladder climbed while a person is told.
+    /// W1 on that dialog, its quota standing past the ladder's first rung (`--mode wall-climb`).
     WallClimb,
-    /// W3 (G3): Gemini CLI's usage-limit dialog drawn again with a new reset after each try ([`Chain::shifts`]).
+    /// W3 (`--mode wall-shift`, [`Chain::shifts`]).
     ShiftWall,
-    /// W4: the resume typed past the reset meets the wall again, under a new reset.
+    /// W4 (`--mode wall-redraw`).
     RedrawWall,
-    /// W5: another agent started in the tab under the first one's remembered limit ([`switch_step`]).
+    /// W5 (`--mode wall-switch`, [`switch_step`]).
     SwitchWall,
-    /// W6: Claude Code's limit held unread past its reset by `FUTILE_AFTER`, told, then read again ([`unread_step`]).
+    /// W6 (`--mode wall-unread`, [`unread_step`]).
     UnreadWall,
-    /// W7: Gemini CLI's per-day dialog answered `Stop`, kept trying while a person is told.
+    /// W7 (`--mode wall-day-stop`).
     DayStopWall,
-    /// W8: a usage wall met by Cruise's act.
+    /// W8 (`--mode wall-cruise`).
     CruiseWall,
-    /// W9: the agent ended and launched again in its tab under its standing wall ([`relaunch_step`]).
+    /// W9 (`--mode wall-relaunch`, [`relaunch_step`]).
     RelaunchWall,
-    /// W10: Gemini CLI's per-model bucket's dialog ([`crate::stub::gemini::BUCKET_CLAIM`]).
+    /// W10 (`--mode wall-bucket`, [`crate::stub::gemini::BUCKET_CLAIM`]).
     BucketWall,
 }
 
@@ -797,15 +888,19 @@ pub enum Scenario {
     N2,
     N3,
     N4,
-    /// The harness's END (§12.5.4): the window at rest with ends and needs standing, then each chain's chip in front ([`surfaces::judge_end`]).
+    /// The harness's end (§12.5.4): the window at rest with ends and needs standing, then each
+    /// chain's chip in front ([`surfaces::judge_end`]).
     End,
-    /// A person's keystroke into an instant turn no read saw run: their own exchange, left to them (the review's F18).
+    /// A person's keystroke into an instant turn no read saw run: their own exchange, left to them.
     F18,
-    /// A judged turn's opener re-wrapped and revealed by a resize, nothing submitted: not judged again (the review's F1 and F2).
+    /// A judged turn's opener re-wrapped and revealed by a resize, nothing submitted: not judged
+    /// again (F1 and F2).
     Rewrap,
-    /// A new turn answered with the very words of the reply before it, under its own opener: judged as its own point (`b9/resid3`'s submission).
+    /// A new turn answered with the very words of the reply before it, under its own opener:
+    /// judged as its own point.
     SameWords,
-    /// A judged turn's opener scrolled into sight from the history above the screen by a wheel, nothing submitted: not judged again (F1's other path).
+    /// A judged turn's opener scrolled into sight from the history above the screen by a wheel,
+    /// nothing submitted: not judged again (F1's other path).
     Scrolled,
     /// A first turn ended on a tool's row after a launch: judged (F3).
     F3,
@@ -949,7 +1044,8 @@ impl Scenario {
 pub enum Opening {
     /// Its first prompt, typed as `lab turn` types one.
     Prompt,
-    /// Its first prompt typed as a person types it: the draft stands in the composer, then Enter ([`person_turn`]).
+    /// Its first prompt typed as a person types it: the draft stands in the composer, then Enter
+    /// ([`person_turn`]).
     Person,
     /// No prompt: the manager tab stands at its composer (L15's starter).
     Idle,
@@ -958,7 +1054,8 @@ pub enum Opening {
 }
 
 impl Chain {
-    /// The measured pass's chains (`--mode both`), with P4's instant ones and the window's three (L16, L17, N1–N4).
+    /// The measured pass's chains (`--mode both`), with P4's instant ones and the window's three
+    /// (L16, L17, N1–N4).
     pub const ALL: [Chain; 16] = [
         Chain::LandA,
         Chain::LandB,
@@ -978,7 +1075,8 @@ impl Chain {
         Chain::CruiseN,
     ];
 
-    /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off control.
+    /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off
+    /// control.
     pub const COVER: [Chain; 9] = [
         Chain::LandQ,
         Chain::LandP,
@@ -994,13 +1092,16 @@ impl Chain {
     /// The cap's chains (`--mode cap`, on a lab of their own: the cap is the instance's).
     pub const CAPPED: [Chain; 2] = [Chain::Cap, Chain::Off];
 
-    /// The wall's chain (`--mode wall`, alone on a lab of its own: the stub's usage wall meets every conversation it serves, so not even the Off control shares it).
+    /// The wall's chain (`--mode wall`, alone on a lab of its own: the stub's usage wall meets
+    /// every conversation it serves, so not even the Off control shares it).
     pub const WALLED: [Chain; 1] = [Chain::Wall];
 
     /// The remembered wall's chain (`--mode wall-hid`, alone on a lab of its own for W1's reason).
     pub const WALL_HID: [Chain; 1] = [Chain::WallHid];
 
-    /// The residuals' chains (`--mode resid`): F18's beside its negative control, P4C's chain whose person's prompt goes through the control socket (judged as a turn of the conversation); F1, F2 and SAME's; F1's by a scroll; F3's; and the Off control.
+    /// The residuals' chains (`--mode resid`): F18's beside its negative control (P4C's chain,
+    /// whose person's prompt goes through the control socket and is judged as a turn of the
+    /// conversation); F1, F2 and SAME's; F1's by a scroll; F3's; and the Off control.
     pub const RESID: [Chain; 6] = [
         Chain::InstantCruise,
         Chain::InstantPerson,
@@ -1010,7 +1111,8 @@ impl Chain {
         Chain::Off,
     ];
 
-    /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is the instance's, [`ladder_env`]) and the Off control.
+    /// The ladder's chain (`--mode ladder`, on a lab of its own: the scale is the instance's,
+    /// [`ladder_env`]) and the Off control.
     pub const LADDER: [Chain; 2] = [Chain::Ladder, Chain::Off];
     /// The per-day quota's chain (`--mode wall-day`, alone on a lab of its own for W1's reason).
     pub const WALL_DAY: [Chain; 1] = [Chain::WallDay];
@@ -1042,7 +1144,7 @@ impl Chain {
     /// The bucket's chain (`--mode wall-bucket`, alone for W1's reason).
     pub const WALL_BUCKET: [Chain; 1] = [Chain::BucketWall];
 
-    /// Every chain of every mode, each once (`--chains` names one of them; the tests' census of them).
+    /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
     pub fn every() -> Vec<Chain> {
         let mut v: Vec<Chain> = Chain::ALL.to_vec();
@@ -1071,7 +1173,7 @@ impl Chain {
         v
     }
 
-    /// The chains a mode runs: the Off control in every mode but the wall's.
+    /// The chains a mode runs: the Off control in every mode but the walled ones.
     #[must_use]
     pub fn of_mode(mode: Mode) -> Vec<Chain> {
         match mode {
@@ -1102,7 +1204,8 @@ impl Chain {
         }
     }
 
-    /// The chains of `mode` harness `h` runs: W2's only where a local command takes the notice away ([`wall_out_of_reach`]).
+    /// The chains of `mode` harness `h` runs: those out of its reach left out
+    /// ([`wall_out_of_reach`], [`tool_end_out_of_reach`]).
     #[must_use]
     pub fn of_mode_on(mode: Mode, h: Harness) -> Vec<Chain> {
         Chain::of_mode(mode)
@@ -1143,7 +1246,9 @@ impl Chain {
         )
     }
 
-    /// How many times the lab raises its wall again at the reset instead of lifting it ([`wall_move`]): G3's dialog drawn again with a new reset after each of [`SHIFT_TIMES`] tries, W4's once, under the resume typed past the first reset. None for the other chains.
+    /// How many times the lab raises its wall again at the reset instead of lifting it
+    /// ([`wall_move`]): G3's [`SHIFT_TIMES`], W4's once (under the resume typed past the first
+    /// reset), none for the other chains.
     #[must_use]
     pub fn shifts(self) -> usize {
         match self {
@@ -1153,7 +1258,8 @@ impl Chain {
         }
     }
 
-    /// How far each raise again moves the reset on ([`wall_move`]): a whole number of minutes, so each reset stays on the minute the dialog and the notices name.
+    /// How far each raise again moves the reset on ([`wall_move`]): whole minutes, so each reset
+    /// stays on the minute the dialog and the notices name.
     #[must_use]
     pub fn shift_step_ms(self) -> i64 {
         match self {
@@ -1162,7 +1268,10 @@ impl Chain {
         }
     }
 
-    /// W2's hide runs on its tab on harness `h` ([`hide_step`]): W2's own, W6's (its notice gone before the conversation is made unread), W7's (the per-day dialog answered Stop), and W4's where the resume is typed only past it — Claude Code's countdown cancelled, Gemini CLI's dialog answered Stop.
+    /// W2's hide runs on its tab on harness `h` ([`hide_step`]): W2's own, W6's (its notice gone
+    /// before the conversation is made unread), W7's (the per-day dialog answered Stop), and W4's
+    /// where the resume is typed only past it (Claude Code's countdown cancelled, Gemini CLI's
+    /// dialog answered Stop).
     #[must_use]
     pub fn hides_on(self, h: Harness) -> bool {
         match self {
@@ -1186,7 +1295,10 @@ impl Chain {
         }
     }
 
-    /// The claim its wall is raised with on harness `h` ([`wall_step`]): [`wall_claim`]'s, but on the per-day quota's chain the one on which the stub answers the Gemini API's key a spent per-day quota ([`WALL_CLAIM`]: it names no Code Assist limit), whose dialog names no reset; on the bucket's the account's limit on the Pro model ([`crate::stub::gemini::BUCKET_CLAIM`]).
+    /// The claim its wall is raised with on harness `h` ([`wall_step`]): [`wall_claim`]'s, but on
+    /// the per-day quota's chains [`WALL_CLAIM`], on which the stub answers the Gemini API key a
+    /// spent per-day quota (it names no Code Assist limit) whose dialog names no reset; on the
+    /// bucket's, the account's limit on the Pro model ([`crate::stub::gemini::BUCKET_CLAIM`]).
     #[must_use]
     pub const fn wall_claim_on(self, h: Harness) -> &'static str {
         match self {
@@ -1226,7 +1338,8 @@ impl Chain {
         }
     }
 
-    /// Its worker is one a manager waits on (a task record), so the ladder after its landing is a managed worker's ([`next_step_ms`]).
+    /// Its worker is one a manager waits on, so the ladder after its landing is a managed worker's
+    /// ([`next_step_ms`]).
     #[must_use]
     pub fn managed(self) -> bool {
         self.tasked() || self == Chain::Worker
@@ -1280,7 +1393,8 @@ impl Chain {
         }
     }
 
-    /// The word its conversation carries (its first prompt), by which the stub's rules know it: no other chain's word holds it.
+    /// The word its conversation carries (its first prompt), by which the stub's rules know it: no
+    /// other chain's word holds it.
     #[must_use]
     pub fn token(self) -> String {
         format!("FOREVERLAB-{}.", self.name().to_ascii_uppercase())
@@ -1365,13 +1479,15 @@ impl Chain {
         }
     }
 
-    /// Its tab carries a worker's task record (`task mark working from=ctl` before the agent starts): a manager waits on it.
+    /// Its tab carries a worker's task record (`task mark working from=ctl` before the agent
+    /// starts): a manager waits on it.
     #[must_use]
     pub const fn tasked(self) -> bool {
         matches!(self, Chain::LandE | Chain::LandT)
     }
 
-    /// Its landing is the scenario: watched past the ladder's next step after it, and the stub's dumps read for a new turn after it.
+    /// Its landing is the scenario: watched past the ladder's next step after it, and the stub's
+    /// dumps read for a new turn after it.
     #[must_use]
     pub const fn lands(self) -> bool {
         matches!(
@@ -1396,7 +1512,8 @@ impl Chain {
         )
     }
 
-    /// Its replies are sent at once: no delay before the first byte, no pause between deltas (P4: a turn over before any read sees the worker busy).
+    /// Its replies are sent at once: no delay before the first byte, no pause between deltas (P4:
+    /// a turn over before any read sees the worker busy).
     #[must_use]
     pub const fn instant(self) -> bool {
         matches!(
@@ -1410,14 +1527,17 @@ impl Chain {
         )
     }
 
-    /// A PERSON'S PROMPT MID-CHAIN (P4P): typed as the first prompt is, once the done check's defense was decided, while the loop waits out its back-off.
+    /// A person's prompt mid-chain (P4P): typed as the first prompt is, once the done check's
+    /// defense was decided, while the loop waits out its back-off.
     #[must_use]
     pub fn asks(self) -> Option<String> {
         matches!(self, Chain::InstantCruise | Chain::InstantPerson)
             .then(|| format!("{} {ASK_KEY}", self.token()))
     }
 
-    /// Its person's prompt mid-chain ([`Self::asks`]) is typed AS A PERSON TYPES IT ([`person_turn`]: `send|key as=person`, a person's hand on the session), not through the control socket (F18).
+    /// Its person's prompt mid-chain ([`Self::asks`]) is typed as a person types it
+    /// ([`person_turn`]: `send|key as=person`, a person's hand on the session), not through the
+    /// control socket (F18).
     #[must_use]
     pub fn asks_as_person(self) -> bool {
         self == Chain::InstantPerson
@@ -1441,7 +1561,8 @@ impl Chain {
         )
     }
 
-    /// The stub's rules for its conversation, most specific first ([`crate::stub::scripted_reply`]).
+    /// The stub's rules for its conversation, most specific first
+    /// ([`crate::stub::scripted_reply`]).
     #[must_use]
     pub fn rules(self) -> Vec<J> {
         let token = self.token();
@@ -1604,7 +1725,8 @@ impl Chain {
         }
     }
 
-    /// The orchestrator's turn the lab types into its tab mid-watch, and when ([`orchestrator_due`]).
+    /// The orchestrator's turn the lab types into its tab mid-watch, and when
+    /// ([`orchestrator_due`]).
     #[must_use]
     pub const fn orchestrated(self) -> Option<&'static str> {
         match self {
@@ -1638,7 +1760,7 @@ pub fn open_defense() -> String {
     format!("{CLEAN}\nThe docs PR is still open.")
 }
 
-/// L6's reply, `lines` tall: ONE need near its top, the defense at its bottom.
+/// L6's reply, `lines` tall: one need near its top, the defense at its bottom.
 #[must_use]
 pub fn tall_reply(lines: usize) -> String {
     let mut s = format!("Here is the landing report.\nNEEDS YOU: {NEED}\n");
@@ -1649,7 +1771,9 @@ pub fn tall_reply(lines: usize) -> String {
     s
 }
 
-/// `tall-scroll`'s reply: a head, [`SCROLL_LINES`] rows of a report, then the work report's words ([`WORK`]) — taller than the 50 rows of the window's tab, so once the turn is over its opener stands in the history above the screen (the agent's own, where it draws its transcript in a view of its own).
+/// `tall-scroll`'s reply: a head, [`SCROLL_LINES`] rows of a report, then [`WORK`]: taller than
+/// the window's 50-row tab, so once the turn is over its opener stands in the history above the
+/// screen (the agent's own, where it draws its transcript in a view of its own).
 #[must_use]
 pub fn scroll_reply() -> String {
     let mut s = String::from("Here is where the parser stands.\n");
@@ -1660,7 +1784,8 @@ pub fn scroll_reply() -> String {
     s
 }
 
-/// The custom mode's spec: every chain's rules, each reply after [`REPLY_DELAY_MS`], and the plain work reply for a turn no rule picks.
+/// The custom mode's spec: every chain's rules, each reply after [`REPLY_DELAY_MS`], and the plain
+/// work reply for a turn no rule picks.
 #[must_use]
 pub fn spec(chains: &[Chain]) -> J {
     J::obj([
@@ -1675,7 +1800,8 @@ pub fn spec(chains: &[Chain]) -> J {
     ])
 }
 
-/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order): F3's first turn answered with that harness's read of its own `README.md` ([`read_call`]) on the rule that answers its prompt.
+/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order): F3's
+/// first turn answered with that harness's read of its own `README.md` ([`read_call`]).
 #[must_use]
 pub fn spec_on(chains: &[Chain], h: Harness, dirs: &[PathBuf]) -> J {
     let mut sp = spec(chains);
@@ -1743,7 +1869,9 @@ pub struct Row {
 }
 
 impl Row {
-    /// The row records something done to the agent: a key pressed or a text typed (`approved`, `declined`, `typed`), or one tried (`escalated`, `deferred`) — every decision but a record (`waiting`) or a skip.
+    /// The row records something done to the agent: a key pressed or a text typed (`approved`,
+    /// `declined`, `typed`), or one tried (`escalated`, `deferred`); any decision but `waiting` or
+    /// `skipped`.
     #[must_use]
     pub fn acted(&self) -> bool {
         !matches!(self.decision.as_str(), "waiting" | "skipped")
@@ -1757,11 +1885,13 @@ pub struct StubSeen {
     pub baseline: usize,
     /// Its requests read (after the landing; Off: all of them).
     pub read: usize,
-    /// Of those, the ones holding more harness-marked user texts than [`Self::baseline`]: a new turn of the harness's.
+    /// Of those, the ones holding more harness-marked user texts than [`Self::baseline`]: a new
+    /// turn of the harness's.
     pub new_turns: usize,
 }
 
-/// What one tab's records said, each with its time (ms), in order: the journal's lines, the ledger's rows, and the `status`, `meta` and `task` words at each change.
+/// What one tab's records said, each with its time (ms), in order: the journal's lines, the
+/// ledger's rows, and the `status`, `meta` and `task` words at each change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub journal: Vec<(i64, String)>,
@@ -1778,11 +1908,13 @@ pub struct Seen {
     pub reply_ms: Option<i64>,
     /// When a person's prompt mid-chain was typed (P4P, [`Chain::asks`]).
     pub asked_ms: Option<i64>,
-    /// When one was typed that the composer did not take: it never stood there as typed, or stood there still after Enter twice.
+    /// When one was typed that the composer did not take: it never stood there as typed, or stood
+    /// there still after Enter twice.
     pub ask_refused_ms: Option<i64>,
     /// When watching stopped.
     pub end_ms: i64,
-    /// The stub's witness (L5, L7: after the landing; Off: the whole conversation); `None` where it was never read.
+    /// The stub's witness (L5, L7: after the landing; Off: the whole conversation); `None` where it
+    /// was never read.
     pub stub: Option<StubSeen>,
     /// What the coverage chains' run did and read beside the records.
     pub cover: Cover,
@@ -1790,24 +1922,29 @@ pub struct Seen {
     pub window: surfaces::Window,
 }
 
-/// What a coverage chain's run did to its tab, and read of it, beside the records ([`Seen`]), each with its time (ms).
+/// What a coverage chain's run did to its tab, and read of it, beside the records ([`Seen`]), each
+/// with its time (ms).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cover {
     /// L13: when the person's Enter went in under their standing draft.
     pub person_ms: Option<i64>,
-    /// L13: `status human_ms=` read once their Enter took the draft: how long ago a person's gesture reached the session (`-`: none ever).
+    /// L13: `status human_ms=` read once their Enter took the draft: how long ago a person's
+    /// gesture reached the session (`-`: none ever).
     pub person_stamp: Option<String>,
-    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what the real key path posted and counted.
+    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what the real key path posted
+    /// and counted.
     pub keyed: Option<Keyed>,
     /// L13, CAP: when the lab's orchestrator turn went in.
     pub turn_ms: Option<i64>,
-    /// The stub's witness of a window no harness turn may fall in: L13's exchange (its first prompt to the orchestrator's turn), CAP's hour (after the act to the turn after it).
+    /// The stub's witness of a window no harness turn may fall in: L13's exchange (its first
+    /// prompt to the orchestrator's turn), CAP's hour (after the act to the turn after it).
     pub window_stub: Option<StubSeen>,
     /// L15: the manager's sid.
     pub starter: Option<String>,
     /// L15: the worker's spawn reply.
     pub spawn: Option<String>,
-    /// L15: when the manager's `await task @<w> since=0` returned, its exit status and what it printed.
+    /// L15: when the manager's `await task @<w> since=0` returned, its exit status and what it
+    /// printed.
     pub awaited: Option<(i64, i32, String)>,
     /// L15: the worker's `result`, as printed (its standard output).
     pub result: Option<String>,
@@ -1815,21 +1952,29 @@ pub struct Cover {
     pub agent: Option<String>,
     /// L15: the `result` reply's header (`OK <n> source=… bytes=<n>`, on its standard error).
     pub result_head: Option<String>,
-    /// L15: the agent the worker's spawn started, as `meta worker=` names it once the watch is over.
+    /// L15: the agent the worker's spawn started, as `meta worker=` names it once the watch is
+    /// over.
     pub worker: Option<String>,
-    /// W1: when the lab raised the stub's usage wall, and the unix second it resets at ([`wall_step`]).
+    /// W1: when the lab raised the stub's usage wall, and the unix second it resets at
+    /// ([`wall_step`]).
     pub wall: Option<(i64, i64)>,
     /// W1: when the lab gave the stub its scripted mode back.
     pub lifted_ms: Option<i64>,
-    /// W1: when the PROGRAM WENT ON BY ITSELF past the wall: the first of the conversation's requests from the wall's lift on carrying its own continuation ([`carries_continuation`]: Claude Code's, which goes on at the reset with no act of the harness's), read from the stub's dumps once the watch is over ([`went_on_witness`]).
+    /// W1: when the program went on by itself past the wall: the first of the conversation's
+    /// requests from the wall's lift on carrying its own continuation ([`carries_continuation`]:
+    /// Claude Code's, which goes on at the reset with no act of the harness's), read from the
+    /// stub's dumps once the watch is over ([`went_on_witness`]).
     pub went_on_ms: Option<i64>,
-    /// C4: the user texts of the conversation's requests that carry the owner's continuation ([`OWNER_KEY`]), each as the agent sent it, read from the stub's dumps once the watch is over ([`owner_witness`]).
+    /// C4: the user texts of the conversation's requests that carry the owner's continuation
+    /// ([`OWNER_KEY`]), each as the agent sent it, read from the stub's dumps once the watch is
+    /// over ([`owner_witness`]).
     pub owner_texts: Option<Vec<String>>,
     /// W2: the notice scrolled out of sight ([`hide_step`]).
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
     pub hide_gave_up: Option<String>,
-    /// W3, W4: each time the lab raised the wall again at its reset instead of lifting it ([`wall_move`]), and the unix second the new wall resets at, in order.
+    /// W3, W4: each time the lab raised the wall again at its reset instead of lifting it
+    /// ([`wall_move`]), and the unix second the new wall resets at, in order.
     pub shifted: Vec<(i64, i64)>,
     /// W5: the switch to the second agent ([`switch_step`]).
     pub switch: Option<Switch>,
@@ -1839,31 +1984,38 @@ pub struct Cover {
     pub unread: Option<Unread>,
     /// W6: why the conversation was not made unread or read again.
     pub unread_gave_up: Option<String>,
-    /// W9: the agent ended and launched again in its tab ([`relaunch_step`]): a [`Switch`] to the same agent, its wall never lifted.
+    /// W9: the agent ended and launched again in its tab ([`relaunch_step`]): a [`Switch`] to the
+    /// same agent, its wall never lifted.
     pub relaunch: Option<Switch>,
     /// W9: why the relaunch was not made, where it was not.
     pub relaunch_gave_up: Option<String>,
-    /// F18: `status human_ms=` read once the person's mid-chain Enter took their draft ([`Chain::asks_as_person`]): a stamp where a person's hand reached the session.
+    /// F18: `status human_ms=` read once the person's mid-chain Enter took their draft
+    /// ([`Chain::asks_as_person`]): a stamp where a person's hand reached the session.
     pub ask_stamp: Option<String>,
     /// F1, F2: when the lab resized the tab ([`RESIZED`]), and what the resize and `dims` answered.
     pub resized: Option<(i64, String)>,
-    /// F1 BY A SCROLL: the wheel the lab turned over the tab, and what the screen showed ([`scroll_step`]).
+    /// F1 by a scroll: the wheel the lab turned over the tab, and what the screen showed
+    /// ([`scroll_step`]).
     pub scrolled: Option<Scrolled>,
-    /// F3: how many of the conversation's requests carried a tool's result back (the stub's dumps), read once its watch is over.
+    /// F3: how many of the conversation's requests carried a tool's result back (the stub's
+    /// dumps), read once its watch is over.
     pub tool_results: Option<usize>,
-    /// F3: the screen's last rows read once the first point after the prompt was journaled, and when.
+    /// F3: the screen's last rows read once the first point after the prompt was journaled, and
+    /// when.
     pub first_screen: Option<(i64, Vec<String>)>,
 }
 
 impl Cover {
-    /// The unix second the stub's wall resets at now: the last raise again's ([`Cover::shifted`]), else the first wall's.
+    /// The unix second the stub's wall resets at now: the last raise again's ([`Cover::shifted`]),
+    /// else the first wall's.
     #[must_use]
     pub fn reset_now(&self) -> Option<i64> {
         let (_, first) = self.wall?;
         Some(self.shifted.last().map_or(first, |(_, r)| *r))
     }
 
-    /// The unix second the wall answering a request at `t` (ms) named: the last raise at or before it, `None` before the wall was raised and from its lift on ([`Cover::lifted_ms`]).
+    /// The unix second the wall answering a request at `t` (ms) named: the last raise at or before
+    /// it; `None` before the wall was raised and from its lift on ([`Cover::lifted_ms`]).
     #[must_use]
     pub fn reset_at(&self, t: i64) -> Option<i64> {
         let (raised, first) = self.wall?;
@@ -1880,7 +2032,8 @@ impl Cover {
     }
 }
 
-/// W5's switch ([`switch_step`]): the first agent ended in the tab, the stub's wall lifted (the limit is that agent's account's), the second agent launched there and its first prompt typed.
+/// W5's switch ([`switch_step`]): the first agent ended in the tab, the stub's wall lifted (the
+/// limit is that agent's account's), the second agent launched there and its first prompt typed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Switch {
     /// The second agent's harness word ([`Harness::name`]).
@@ -1897,7 +2050,8 @@ pub struct Switch {
     pub prompt_ms: i64,
 }
 
-/// W6's unread conversation ([`unread_step`]): Claude Code's transcript of the chain's conversation moved aside, so no read names the conversation the limit stopped, and moved back.
+/// W6's unread conversation ([`unread_step`]): Claude Code's transcript of the chain's
+/// conversation moved aside, so no read names the conversation the limit stopped, then moved back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Unread {
     /// The transcript.
@@ -1908,7 +2062,8 @@ pub struct Unread {
     pub restored_ms: Option<i64>,
 }
 
-/// F1 BY A SCROLL, AS DRIVEN ([`scroll_step`]): the wheel turned up over `tall-scroll`'s tab, a row a notch, until its opener was in sight.
+/// F1 by a scroll, as driven ([`scroll_step`]): the wheel turned up over `tall-scroll`'s tab, a
+/// row a notch, until its opener was in sight.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scrolled {
     /// When the first notch was turned: F1's law holds from there ([`crate::forever::cover`]'s
@@ -1921,30 +2076,40 @@ pub struct Scrolled {
     pub notches: u32,
     /// What `mouse` answered where it did not say `OK`.
     pub refused: Option<String>,
-    /// The tab's `modes` before the first notch: `alt_screen=` and `mouse_mode=`, whether the agent takes the wheel (it scrolls its own view) or the tab's viewport moves.
+    /// The tab's `modes` before the first notch (`alt_screen=`, `mouse_mode=`): whether the agent
+    /// takes the wheel (it scrolls its own view) or the tab's viewport moves.
     pub modes: String,
-    /// The tab's history above its screen before the first notch, as `lines` answered (`OK <rows> …`): the rows a viewport can scroll back.
+    /// The tab's history above its screen before the first notch, as `lines` answered (`OK <rows>
+    /// …`): the rows a viewport can scroll back.
     pub history: String,
     /// Whether the opener (the chain's token) was on the screen before the first notch.
     pub before: bool,
-    /// Whether it was in sight after the last notch: on the live screen where the agent took the wheel, in the tab's viewport where it did not.
+    /// Whether it was in sight after the last notch: on the live screen where the agent took the
+    /// wheel, in the tab's viewport where it did not.
     pub after: bool,
-    /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport after the last notch, as `scroll` answered it (`OK <offset> <max>`), with where the opener and the live screen were (`search`).
+    /// Where the agent takes no wheel (`mouse_mode=none`): the tab's viewport after the last
+    /// notch, as `scroll` answered it (`OK <offset> <max>`), with where the opener and the live
+    /// screen were (`search`).
     pub viewport: Option<String>,
     /// Whether the live screen (the one the harness reads) changed under the wheel at all.
     pub moved: bool,
     /// The screen's rows after the last notch, blank rows left out.
     pub rows: Vec<String>,
-    /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after the last notch; `None` before that read.
+    /// Whether the opener was still on the screen [`SCROLL_HELD_MS`] after the last notch; `None`
+    /// before that read.
     pub held: Option<bool>,
 }
 
-/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]): each key a real `NSEvent` posted into the windowed instance's own event queue, and the session's count of a person's gestures around them.
+/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]): each key a real
+/// `NSEvent` posted into the windowed instance's own event queue, and the session's count of a
+/// person's gestures around them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keyed {
-    /// The presses `hwkey` handed to the window's event queue (`OK posted=<n>`): the text's characters and each Enter.
+    /// The presses `hwkey` handed to the window's event queue (`OK posted=<n>`): the text's
+    /// characters and each Enter.
     pub posted: u64,
-    /// How many of them it posted while the window was the key window of the active app (`key=1`): none in the jail, whose instance is no Launch Services application, so nothing can activate it.
+    /// How many of them it posted while the window was the key window of the active app (`key=1`):
+    /// none in the jail, whose instance is no Launch Services application and cannot be activated.
     pub key_window: u64,
     /// `status human_seq=` before the first key.
     pub seq_before: u64,
@@ -1957,17 +2122,21 @@ pub struct Keyed {
 pub struct Hidden {
     /// When the first hiding command's Enter went in: the screen before it was the notice's own.
     pub first_ms: i64,
-    /// When the Enter of the command that scrolled the notice away went in (the screen before it still drew the notice).
+    /// When the Enter of the command that scrolled the notice away went in (the screen before it
+    /// still drew the notice).
     pub enter_ms: i64,
     /// When the lab read the screen without it.
     pub seen_ms: i64,
-    /// That screen's content seq (`status seq=`, the journal's `seq=`): a point read at it or after is a screen without the notice.
+    /// That screen's content seq (`status seq=`, the journal's `seq=`): a point read at it or after
+    /// is a screen without the notice.
     pub seq: Option<u64>,
     /// The hiding commands entered, or the dialog's option chosen (once) ([`Hide::by`]).
     pub commands: usize,
-    /// That command or option ([`Hide::label`]): Muse Code's [`HIDE_COMMAND`], agy's [`AGY_HIDE_COMMAND`], Gemini CLI's [`GEMINI_HIDE_OPTION`].
+    /// That command or option ([`Hide::label`]): Muse Code's [`HIDE_COMMAND`], agy's
+    /// [`AGY_HIDE_COMMAND`], Gemini CLI's [`GEMINI_HIDE_OPTION`].
     pub command: &'static str,
-    /// The notice was taken by choosing the dialog's option ([`HideBy::Option`]): the screen after it draws the turn's error that option leaves (Gemini CLI's `✕ [API Error: An unknown error occurred.]`), a wall its reader reads that no longer names the limit.
+    /// The notice was taken by choosing the dialog's option ([`HideBy::Option`]), which leaves the
+    /// turn's error on the screen ([`notice_gone`]).
     pub stopped: bool,
     /// The notice's words ([`Hide::words`]).
     pub words: &'static [&'static str],
@@ -2122,7 +2291,10 @@ fn streak_at(seen: &Seen, t: i64) -> Option<u32> {
     })
 }
 
-/// P3 OF `docs/measured/forever-lab-2026-10-20.md`: the point records (`point@v1`) written before the first prompt at `t0` — a point judged before anyone asked the agent anything (a frame drawn before its banner, a blank first screen), which counts a short turn the agent never ran and starts every back-off a step late.
+/// P3 of `docs/measured/forever-lab-2026-10-20.md`: the point records (`point@v1`) written before
+/// the first prompt at `t0`. A point judged before anyone asked the agent anything (a frame drawn
+/// before its banner, a blank first screen) counts a short turn the agent never ran and starts
+/// every back-off a step late.
 #[must_use]
 pub fn points_before_prompt(seen: &Seen, t0: i64) -> Vec<&Row> {
     seen.ledger
@@ -2131,7 +2303,10 @@ pub fn points_before_prompt(seen: &Seen, t0: i64) -> Vec<&Row> {
         .collect()
 }
 
-/// The tab's first point and first back-off, as `lab forever` reports them (P3): `first point +5.6 s (short turns in a row: 1), first back-off +5.6 s "1 short turn(s) in a row: 2 min back-off", 0 point record(s) before the first prompt` — every point record before the first prompt named with its time (before `t0`: `-…`).
+/// The tab's first point and first back-off, as `lab forever` reports them (P3), such as
+/// `first point +5.6 s (short turns in a row: 1), first back-off +5.6 s "1 short turn(s) in a row:
+/// 2 min back-off", 0 point record(s) before the first prompt`, every point record before the
+/// first prompt named with its time (before `t0`: `-…`).
 #[must_use]
 pub fn first_point_line(seen: &Seen, t0: i64) -> String {
     let streak = |r: &Row| {
@@ -2188,7 +2363,9 @@ pub fn first_point_line(seen: &Seen, t0: i64) -> String {
     )
 }
 
-/// The ladder's next step after a point that closed `streak` short turns: the wait before the next act, were the ladder still going (none for a worker its manager waits on, through its first [`turn_end::MANAGED_SHORT_TURNS`]).
+/// The ladder's next step after a point that closed `streak` short turns: the wait before the next
+/// act, were the ladder still going (none for a worker its manager waits on, through its first
+/// [`turn_end::MANAGED_SHORT_TURNS`]).
 #[must_use]
 pub fn next_step_ms(streak: u32, managed: bool) -> i64 {
     if managed && streak <= turn_end::MANAGED_SHORT_TURNS {
@@ -2203,7 +2380,8 @@ pub fn next_step_ms(streak: u32, managed: bool) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// How long the landing at `t` is watched for after it (L5, L7): through the ladder's next step and [`PAST_NEXT_STEP_MS`] more, at least [`QUIET_AFTER_LANDED_MIN_MS`].
+/// How long the landing at `t` is watched for after it (L5, L7): through the ladder's next step and
+/// [`PAST_NEXT_STEP_MS`] more, at least [`QUIET_AFTER_LANDED_MIN_MS`].
 #[must_use]
 pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
     let step = next_step_ms(streak_at(seen, t).unwrap_or(1), managed);
@@ -2211,7 +2389,10 @@ pub fn quiet_after_landed_ms(seen: &Seen, t: i64, managed: bool) -> i64 {
         .max(QUIET_AFTER_LANDED_MIN_MS)
 }
 
-/// THE JUDGE of one chain's records `seen` (its `program`: the reader's word the needs entry names), `t0` the first prompt's time: each of its scenarios' verdict, in order — every one a FAIL where the chain's records hold a fault of their own ([`chain_faults`]: an act before its due, an act typed twice, a point before the first prompt), its own judge's words kept.
+/// The judge of one chain's records `seen` (`program`: the reader's word the needs entry names),
+/// `t0` the first prompt's time: each of its scenarios' verdict, in order. Every one is a `FAIL`
+/// where the chain's records hold a fault of their own ([`chain_faults`]: an act before its due,
+/// an act typed twice, a point before the first prompt), its own judge's words kept.
 #[must_use]
 pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
     let faults = chain_faults(seen, t0);
@@ -3055,7 +3236,9 @@ fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
     }
 }
 
-/// How long the loop waits after a continuation at a usage wall that met the wall again, at the least (`TurnEndTiming::limit_backoff`'s first rung): its next is due at that or the reset and its grace, whichever is later.
+/// How long the loop waits after a continuation at a usage wall that met the wall again, at the
+/// least (`TurnEndTiming::limit_backoff`'s first rung): its next is due at that or the reset and
+/// its grace, whichever is later.
 #[must_use]
 pub fn limit_retry_ms() -> i64 {
     turn_end::TurnEndTiming::default()
@@ -3167,7 +3350,10 @@ pub struct Step {
     pub line: String,
 }
 
-/// The short back-off ladder's steps from `t0`, as the journal decided them: the first turn-end `WAITING … N short turn(s) in a row: …` of each point, in order — a wall's back-off and the take window's left out, and a step told again left out whether under its point's `seq=` or a re-read's own ([`same_backoff`]: the same streak and due).
+/// The short back-off ladder's steps from `t0`, as the journal decided them: the first turn-end
+/// `WAITING … N short turn(s) in a row: …` of each point, in order — a wall's back-off and the take
+/// window's left out, and a step told again left out whether under its point's `seq=` or a
+/// re-read's own ([`same_backoff`]: the same streak and due).
 #[must_use]
 pub fn ladder_steps(seen: &Seen, t0: i64) -> Vec<Step> {
     let mut seqs: Vec<Option<String>> = Vec::new();
@@ -3330,7 +3516,10 @@ fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
     out
 }
 
-/// What fails every scenario of a chain, whatever each scenario's own judge says: an act typed before the due its back-off named ([`early_acts`]), an act typed twice with no point judged between ([`doubled_acts`]), a point before the first prompt or a first point that closed other than one short turn ([`p3_faults`]).
+/// What fails every scenario of a chain, whatever each scenario's own judge says: an act typed
+/// before the due its back-off named ([`early_acts`]), an act typed twice with no point judged
+/// between ([`doubled_acts`]), a point before the first prompt or a first point that closed other
+/// than one short turn ([`p3_faults`]).
 #[must_use]
 pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
     let mut out = early_acts(seen, t0);
@@ -3845,7 +4034,9 @@ fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
     .map_err(|e| could_not(&format!("{}: {e}", p.display())))
 }
 
-/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as named and as resolved) and every folder under it: the manager's and the other chains' folders, under L15's folder trust ([`launcher`]).
+/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as named and as resolved)
+/// and every folder under it: the manager's and the other chains' folders, under L15's folder trust
+/// ([`launcher`]).
 #[must_use]
 pub fn gemini_trusted_project(proj: &str) -> String {
     let real = std::fs::canonicalize(proj)
@@ -3931,9 +4122,13 @@ fn agy_trusted(dirs: &[PathBuf]) -> Vec<String> {
     trusted
 }
 
-/// THE RENDERER THAT TAKES THE WHEEL, for `tall-scroll`'s tab ([`scroll_launcher`]): the harness reads the tab's LIVE screen (`text --json`), which a scroll of the tab's own viewport never moves, so only an agent that scrolls its own view brings a judged opener back into the harness's sight.
+/// The renderer that takes the wheel, for `tall-scroll`'s tab ([`scroll_launcher`]): the harness
+/// reads the tab's live screen (`text --json`), which a scroll of the tab's own viewport never
+/// moves, so only an agent that scrolls its own view brings a judged opener back into the
+/// harness's sight.
 pub const SCROLL_CLAUDE_ENV: &str = "CLAUDE_CODE_NO_FLICKER=1";
-/// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s reason): its settings the run's with `altScreenMode` `always`, and its onboarding done.
+/// agy's `tall-scroll` home under the run's scratch ([`SCROLL_CLAUDE_ENV`]'s reason): its settings
+/// the run's with `altScreenMode` `always`, and its onboarding done.
 pub const SCROLL_AGY_HOME: &str = "agy-scroll-home";
 /// The system settings Gemini CLI's `tall-scroll` tab reads ([`SCROLL_CLAUDE_ENV`]'s reason).
 pub const SCROLL_GEMINI_SETTINGS: &str = "{\"ui\":{\"useAlternateBuffer\":true}}";
@@ -4002,7 +4197,10 @@ fn scroll_launcher(
     Ok(Some(script))
 }
 
-/// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose offset at the unix second `now` is not the machine's, and a half-hour one (a guess of the machine's zone, or any whole hour off it, never lands on it): `Asia/Kolkata` (GMT+5:30, no daylight saving), or `America/St_Johns` (GMT-2:30 or -3:30) on a machine at +5:30.
+/// The zone a walled run's Gemini CLI runs in ([`launcher`]): one whose offset at the unix second
+/// `now` is not the machine's, and a half-hour one (a guess of the machine's zone, or any whole
+/// hour off it, never lands on it): `Asia/Kolkata` (GMT+5:30, no daylight saving), or
+/// `America/St_Johns` (GMT-2:30 or -3:30) on a machine at +5:30.
 #[must_use]
 pub fn foreign_tz(now: i64) -> &'static str {
     if crate::sys::local_offset_s(now) == 19_800 {
@@ -4318,7 +4516,8 @@ fn person_keys(
     Ok(None)
 }
 
-/// The `hwkey` name of the key that types `c`: `space` for a space (the verb splits its words on it), the character itself otherwise.
+/// The `hwkey` name of the key that types `c`: `space` for a space (the verb splits its words on
+/// it), the character itself otherwise.
 #[must_use]
 pub fn hwkey_name(c: char) -> String {
     if c == ' ' {
@@ -4377,7 +4576,8 @@ fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
     Ok(Some(laid))
 }
 
-/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the jail's reach): `exec` the lab's build, so the process is `node` running its script, as the manager's is.
+/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the jail's reach): `exec`
+/// the lab's build, so the process is `node` running its script, as the manager's is.
 #[must_use]
 pub fn gemini_wrapper(bin: &str) -> String {
     format!(
@@ -4804,13 +5004,16 @@ fn meta_words(door: &Door<'_>, sid: &str) -> String {
 
 const MARK: &str = "[aterm harness]";
 
-/// Whether a user text is the harness's: its mark, or one of its answers (`Nobody is here to …`: Land's answer, the reversible answer and the answer text carry no mark).
+/// Whether a user text is the harness's: its mark, or one of its answers (`Nobody is here to …`:
+/// Land's answer, the reversible answer and the answer text carry no mark).
 #[must_use]
 pub fn harness_said(text: &str) -> bool {
     text.contains(MARK) || text.contains(ANSWER_HEAD)
 }
 
-/// The harness's user texts a request `body` of conversation `token` holds ([`harness_said`], by the reader of whichever of the three APIs it speaks); `None` for a request of another conversation.
+/// The harness's user texts a request `body` of conversation `token` holds ([`harness_said`], by
+/// the reader of whichever of the three APIs it speaks); `None` for a request of another
+/// conversation.
 #[must_use]
 pub fn marked_turns(body: &[u8], token: &str) -> Option<usize> {
     if !String::from_utf8_lossy(body).contains(token) {
@@ -4826,10 +5029,15 @@ pub fn marked_turns(body: &[u8], token: &str) -> Option<usize> {
     .max()
 }
 
-/// CLAUDE CODE'S OWN CONTINUATION of a usage limit, as its request carries it: the opening words of the user text it sends when its countdown fires at the reset (`Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.`, the transcript's `origin.kind` `auto-continuation` prompt), beside the act the limit cut.
+/// Claude Code's own continuation of a usage limit, as its request carries it: the opening words
+/// of the user text it sends when its countdown fires at the reset (the transcript's
+/// `origin.kind` `auto-continuation` prompt: `Your claude.ai usage limit has reset. Continue the
+/// task you were working on when the limit was reached; do not repeat work that is already
+/// complete.`).
 pub const CLAUDE_CONTINUES: &str = "Your claude.ai usage limit has reset. Continue the task";
 
-/// Whether request `body` of conversation `token` carries the program's own continuation of a usage limit: one of its user texts holds [`CLAUDE_CONTINUES`] (a Messages API body: Claude Code's).
+/// Whether request `body` of conversation `token` carries the program's own continuation of a usage
+/// limit: one of its user texts holds [`CLAUDE_CONTINUES`] (a Messages API body: Claude Code's).
 #[must_use]
 pub fn carries_continuation(body: &[u8], token: &str) -> bool {
     String::from_utf8_lossy(body).contains(token)
@@ -4842,7 +5050,10 @@ fn dumps(run: &Run) -> Vec<(i64, Vec<u8>)> {
     dumps_in(&run.w.join("dump"))
 }
 
-/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms, body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a side call's `side-<n>.json`, whose copy of a conversation is no request of its turns' — Muse Code's reminder observer renders the whole conversation into one text with line breaks, which C4 would read as the owner's words reaching the agent so.
+/// The stub's dumps of the conversations' turns in `dir`, `(modified ms, body)` each:
+/// `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a side call's `side-<n>.json`. Muse
+/// Code's reminder observer renders the whole conversation, line breaks and all, into one side-call
+/// text, which C4 would read as the owner's words reaching the agent.
 #[must_use]
 pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
     crate::stub::turn_dumps(dir)
@@ -4885,7 +5096,9 @@ fn went_on_witness(run: &Run, tab: &Tab) -> Option<i64> {
     first_continuation(&dumps(run), &tab.chain.token(), since)
 }
 
-/// C4's witness of what reached the agent ([`Cover::owner_texts`]): every user text of conversation `token`'s requests holding [`OWNER_KEY`], by the reader of whichever of the three APIs it speaks, each once.
+/// C4's witness of what reached the agent ([`Cover::owner_texts`]): every user text of conversation
+/// `token`'s requests holding [`OWNER_KEY`], by the reader of whichever of the three APIs it
+/// speaks, each once.
 #[must_use]
 pub fn owner_texts(dumps: &[Vec<u8>], token: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -5008,7 +5221,12 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
     }
 }
 
-/// The end (ms) of the walled chain's window no harness text may reach the stub in ([`Cover::window_stub`]), from the land act that met its wall: the wall's reset (W1, W2, W4's first wall: the resume past it meets the redraw), the last raise again's (W3: a try resends its turn, no new text), the first agent's exit (W5: the second's conversation is its own; W9: the agent launched again opens a new one, judged by its acts), the conversation read again (W6: held unread past the reset).
+/// The end (ms) of the walled chain's window no harness text may reach the stub in
+/// ([`Cover::window_stub`]), from the land act that met its wall: the wall's reset (W1, W2, W4's
+/// first wall: the resume past it meets the redraw), the last raise again's (W3: a try resends its
+/// turn, no new text), the first agent's exit (W5: the second's conversation is its own; W9: the
+/// agent launched again opens a new one, judged by its acts), the conversation read again (W6: held
+/// unread past the reset).
 #[must_use]
 pub fn wall_window_end(chain: Chain, cover: &Cover) -> Option<i64> {
     let (_, reset_s) = cover.wall?;
@@ -5039,7 +5257,11 @@ pub enum WallMove {
     Lift,
 }
 
-/// What the lab does to chain `chain`'s raised wall at `now`: nothing until [`WALL_LIFT_EARLY_MS`] before the reset now standing ([`Cover::reset_now`]); then raised again [`Chain::shift_step_ms`] on while the chain has shifts left ([`Chain::shifts`]: the try or the resume past that reset meets the new one), else lifted. W5's is never lifted by time: its switch lifts it ([`switch_step`]). Nothing once lifted, or before the wall was raised.
+/// What the lab does to chain `chain`'s raised wall at `now`: nothing until [`WALL_LIFT_EARLY_MS`]
+/// before the reset now standing ([`Cover::reset_now`]); then raised again [`Chain::shift_step_ms`]
+/// on while the chain has shifts left ([`Chain::shifts`]: the try or the resume past that reset
+/// meets the new one), else lifted. W5's is never lifted by time: its switch lifts it
+/// ([`switch_step`]). Nothing once lifted, or before the wall was raised.
 #[must_use]
 pub fn wall_move(chain: Chain, cover: &Cover, now: i64) -> WallMove {
     let Some(reset) = cover.reset_now() else {
@@ -5131,7 +5353,10 @@ fn waits_on_the_wall(s: &Seen) -> bool {
     })
 }
 
-/// Whether harness `h`'s screen `text` no longer draws the wall's notice: its composer drawn, no row holding any of the wall's words ([`Hide::words`]), and its reader reading no wall — at Gemini CLI, no usage-limit dialog (its Stop leaves `✕ [API Error: An unknown error occurred.]`, a wall that no longer names the limit).
+/// Whether harness `h`'s screen `text` no longer draws the wall's notice: its composer drawn, no
+/// row holding any of the wall's words ([`Hide::words`]), and its reader reading no wall — at
+/// Gemini CLI, no usage-limit dialog (its Stop leaves `✕ [API Error: An unknown error occurred.]`,
+/// a wall that no longer names the limit).
 #[must_use]
 pub fn notice_gone(h: Harness, text: &str) -> bool {
     let Ok(hide) = hide_of(h) else {
@@ -5160,7 +5385,10 @@ pub fn notice_gone(h: Harness, text: &str) -> bool {
     composer && !wall && !hide.words.iter().any(|w| text.contains(w))
 }
 
-/// Claude Code's composer's first row (its `❯` taken off), between the composer's rules as its reader finds them (`aterm_phase::phase:: composer_rules`, which takes a rule carrying a label: `──── forever-w2 ─` once `/rename` named the session), or `None` where no frame is drawn. Not `screen::composer_row`'s Claude reading, which also takes agy's `>` frame for a composer.
+/// Claude Code's composer's first row (its `❯` taken off), between the composer's rules as its
+/// reader finds them (`aterm_phase::phase::composer_rules`, which takes a rule carrying a label:
+/// `──── forever-w2 ─` once `/rename` named the session), or `None` where no frame is drawn. Not
+/// `screen::composer_row`'s Claude reading, which also takes agy's `>` frame for a composer.
 #[must_use]
 pub fn claude_composer(rows: &[String]) -> Option<String> {
     let (top, bottom) = aterm_phase::phase::composer_rules(rows)?;
@@ -5169,7 +5397,8 @@ pub fn claude_composer(rows: &[String]) -> Option<String> {
     Some(first.strip_prefix('❯').unwrap_or(&first).trim().to_string())
 }
 
-/// The option a dialog on `text` draws focused (`● 2. Stop` inside its box's `│` borders reads `2. Stop`), or `None` where no row draws one.
+/// The option a dialog on `text` draws focused (`● 2. Stop` inside its box's `│` borders reads
+/// `2. Stop`), or `None` where no row draws one.
 #[must_use]
 pub fn dialog_focus(text: &str) -> Option<String> {
     text.lines().find_map(|r| {
@@ -5185,7 +5414,8 @@ pub fn dialog_focus(text: &str) -> Option<String> {
     })
 }
 
-/// Whether harness `h`'s composer holds `cmd` as typed and its command menu's first row is that very command, so Enter runs it.
+/// Whether harness `h`'s composer holds `cmd` as typed and its command menu's first row is that
+/// very command, so Enter runs it.
 #[must_use]
 pub fn menu_offers(h: Harness, text: &str, cmd: &str) -> bool {
     let rows: Vec<String> = text.lines().map(str::to_string).collect();
@@ -5380,7 +5610,9 @@ fn hide_step(door: &Door<'_>, h: Harness, tab: &mut Tab, now: i64) -> Result<(),
     Ok(())
 }
 
-/// Whether the program's own countdown stands armed on `text`: its armed words drawn ([`Cancel::armed`]) and not yet its cancel ([`Cancel::cancelled`]; the armed row stays in the conversation above it once cancelled).
+/// Whether the program's own countdown stands armed on `text`: its armed words drawn
+/// ([`Cancel::armed`]) and not yet its cancel ([`Cancel::cancelled`]; the armed row stays in the
+/// conversation above it once cancelled).
 #[must_use]
 pub fn countdown_armed(text: &str, c: Cancel) -> bool {
     text.contains(c.armed) && !text.contains(c.cancelled)
@@ -5457,7 +5689,10 @@ fn choose_option(
     Ok(Ok(enter))
 }
 
-/// The agent W5 starts in harness `h`'s tab under `h`'s remembered limit ([`switch_step`]): one whose limits the loop reads and decides on too (`turn_end.rs`'s `met_under_another`), on another account: Muse Code after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the measured pairs, in which each holds the other.
+/// The agent W5 starts in harness `h`'s tab under `h`'s remembered limit ([`switch_step`]): one
+/// whose limits the loop reads and decides on too (`turn_end.rs`'s `met_under_another`), on another
+/// account: Muse Code after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the
+/// measured pairs, in which each holds the other.
 #[must_use]
 pub fn switch_to(h: Harness) -> Harness {
     match h {
@@ -5466,12 +5701,18 @@ pub fn switch_to(h: Harness) -> Harness {
     }
 }
 
-/// How W5 ends harness `h`'s agent at its wall ([`exit_agent`]): Muse Code takes ctrl+c twice (measured: its `exit-confirm` capture); Claude Code too (`footers.rs`'s quit), but its usage limit's countdown takes the first ctrl+c for its cancel, so the countdown is cancelled first where it stands armed ([`CLAUDE_CANCEL`]; measured on 2.1.308: ctrl+c twice at the armed countdown drew `Automatic continue cancelled` and left Claude Code in the tab); agy `/quit` (its relaunch lane's); Gemini CLI's usage-limit dialog takes the keys first, so it is answered `2. Stop` ([`GEMINI_HIDE_OPTION`]) and then `/quit` (its relaunch lane's).
+/// How W5 ends harness `h`'s agent at its wall ([`exit_agent`]): Muse Code takes ctrl+c twice (its
+/// `exit-confirm` capture); Claude Code too (`footers.rs`'s quit), but its usage limit's countdown
+/// takes the first ctrl+c for its cancel, so the countdown is cancelled first where it stands
+/// armed ([`CLAUDE_CANCEL`], measured on 2.1.308); agy takes `/quit`; Gemini CLI's usage-limit
+/// dialog takes the keys first, so it is answered `2. Stop` ([`GEMINI_HIDE_OPTION`]) and then
+/// `/quit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// ctrl+c, half a second, ctrl+c.
     CtrlCTwice,
-    /// The program's own countdown cancelled where it stands armed ([`countdown_armed`], [`cancel_countdown`]), then ctrl+c twice.
+    /// The program's own countdown cancelled where it stands armed ([`countdown_armed`],
+    /// [`cancel_countdown`]), then ctrl+c twice.
     CancelThenCtrlCTwice(Cancel),
     /// The command, then Enter.
     Command(&'static str),
@@ -5490,7 +5731,8 @@ pub fn exit_of(h: Harness) -> Exit {
     }
 }
 
-/// The program `ls` names in session `sid`'s row (`program=<word>`), a login shell's leading `-` cut.
+/// The program `ls` names in session `sid`'s row (`program=<word>`), a login shell's leading `-`
+/// cut.
 #[must_use]
 pub fn program_of(ls: &str, sid: &str) -> Option<String> {
     ls.lines()
@@ -5579,7 +5821,9 @@ fn exit_agent(door: &Door<'_>, sid: &str, h: Harness) -> Result<Result<(i64, i64
     }
 }
 
-/// How long past the first agent's reset W5 watches its tab: the longest grace a program's resume waits ([`wall_grace_ms`]) and [`PERSISTENCE_GRACE_MS`] more, so a resume of the ended limit typed into the second agent is seen.
+/// How long past the first agent's reset W5 watches its tab: the longest grace a program's resume
+/// waits ([`wall_grace_ms`]) and [`PERSISTENCE_GRACE_MS`] more, so a resume of the ended limit
+/// typed into the second agent is seen.
 #[must_use]
 pub fn switch_watch_until(reset_s: i64) -> i64 {
     let grace = Harness::ALL
@@ -5701,7 +5945,8 @@ fn agent_again(
     }))
 }
 
-/// Where W6 moves a transcript aside ([`unread_step`]): `<id>.jsonl.unread` beside it, which no reader of `*.jsonl` takes.
+/// Where W6 moves a transcript aside ([`unread_step`]): `<id>.jsonl.unread` beside it, which no
+/// reader of `*.jsonl` takes.
 #[must_use]
 pub fn aside_of(file: &Path) -> PathBuf {
     let mut name = file.file_name().unwrap_or_default().to_os_string();
@@ -5709,7 +5954,8 @@ pub fn aside_of(file: &Path) -> PathBuf {
     file.with_file_name(name)
 }
 
-/// When the loop told the owner of a limit held unread ([`unread_told_words`]): the first `EXCEPTION` line after `since` that carries the told's words.
+/// When the loop told the owner of a limit held unread ([`unread_told_words`]): the first
+/// `EXCEPTION` line after `since` that carries the told's words.
 #[must_use]
 pub fn told_unread(seen: &Seen, since: i64) -> Option<i64> {
     let words = unread_told_words();
@@ -5719,7 +5965,9 @@ pub fn told_unread(seen: &Seen, since: i64) -> Option<i64> {
         .map(|(t, _)| *t)
 }
 
-/// Whether W6's lab reads the conversation again at `now` ([`unread_step`]): [`UNREAD_RESTORE_AFTER_TOLD_MS`] after the told, or, with none seen, [`UNREAD_TOLD_LATE_MS`] past its due (the reset and [`futile_after_ms`]), so the run ends either way.
+/// Whether W6's lab reads the conversation again at `now` ([`unread_step`]):
+/// [`UNREAD_RESTORE_AFTER_TOLD_MS`] after the told, or, with none seen, [`UNREAD_TOLD_LATE_MS`]
+/// past its due (the reset and [`futile_after_ms`]), so the run ends either way.
 #[must_use]
 pub fn unread_restore_due(seen: &Seen, u: &Unread, reset_s: i64, now: i64) -> bool {
     match told_unread(seen, u.moved_ms) {
@@ -6745,7 +6993,11 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     Ok(Some(asked))
 }
 
-/// `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`.
+/// `forever --harness <claude|gemini|agy|muse|all> [--mode MODE] [--chains a,b] [--no-surfaces]
+/// [--window] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`, `cap`, `wall`,
+/// `wall-hid`, `wall-day`, `wall-climb`, `wall-shift`, `wall-redraw`, `wall-switch`,
+/// `wall-unread`, `wall-day-stop`, `wall-cruise`, `wall-relaunch`, `wall-bucket`, `resid` or
+/// `ladder`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);

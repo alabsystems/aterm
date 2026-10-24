@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GPU terminal renderer (`GpuRenderer`, Metal/wgpu backend orchestration, and glyph/quad pipelines).
+//! The GPU terminal renderer (`GpuRenderer`): backend orchestration and the glyph/quad pipelines.
 
 #[cfg(wgpu_arm)]
 use std::collections::HashMap;
@@ -97,9 +97,11 @@ macro_rules! impl_pod_zeroable {
             let $t { $($f: _),+ } = v;
             $({ let f: $ft = v.$f; is_pod(&f); })+
         };
-        // SAFETY: `$t` is `#[repr(C)]`, `Copy + 'static`, and padding-free, so the all-zero pattern is valid.
+        // SAFETY: `$t` is `#[repr(C)]`, `Copy + 'static`, and padding-free, so the all-zero
+        // pattern is valid.
         unsafe impl ::aterm_bits::Zeroable for $t {}
-        // SAFETY: `$t` has no padding and every field is `Pod`, so any `size_of::<$t>()`-byte pattern is valid.
+        // SAFETY: `$t` has no padding and every field is `Pod`, so any `size_of::<$t>()`-byte
+        // pattern is valid.
         unsafe impl ::aterm_bits::Pod for $t {}
     };
 }
@@ -1770,7 +1772,8 @@ macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }
 
-/// The border thickness scaled by `DropOverlay::border_scale_q4` (1/16 units), at least one pixel.
+/// `base` scaled by `DropOverlay::border_scale_q4` (1/16 units, 0 keeps `base`), at least one
+/// pixel once scaled.
 #[inline]
 pub(crate) fn scaled_border_px(base: u32, scale_q4: u8) -> u32 {
     if scale_q4 == 0 {
@@ -1887,8 +1890,8 @@ const FRAME_GROUPS: usize = 8;
 
 const GROUP_SRGB: [bool; FRAME_GROUPS] = {
     let mut srgb = [true; FRAME_GROUPS];
-    srgb[G_GLOW_UNDER] = false; // EMBERFORGE flame body (One/One)
-    srgb[G_GLOW] = false; // aurora / nova / rain halos (One/One)
+    srgb[G_GLOW_UNDER] = false; // the glow, Exact fx and fire under the text
+    srgb[G_GLOW] = false; // aurora, nova and rain halos, and the glow and over fx
     srgb[G_WDECO_ADD] = false; // sparkle-word additive layer (One/One)
     srgb
 };
@@ -2184,19 +2187,22 @@ pub struct FrameShape {
     pub ablation: UnormAblation,
     pub unorm_draws: u32,
     pub unorm_instances: u64,
-    /// Where those Unorm-law draws went: passes of their own, or inside the sRGB passes through framebuffer fetch.
+    /// Where the Unorm-law draws went: their own passes, or the sRGB passes by framebuffer fetch.
     pub route: UnormRoute,
-    /// Whether the frame's Exact Under fx stored at the end of the base pass through the sRGB view (route (1) of the pass economy: every Exact Under layer drew opaque and no cursor glow drew under the text).
+    /// Whether the Exact Under fx stored at the end of the base pass through the sRGB view
+    /// (route (1): every Exact Under layer drew opaque and no cursor glow drew under the text).
     pub under_store: bool,
-    /// The renderer's framebuffer-fetch verdict as of the frame ([`GpuRenderer::fetch_probe`]): `None` until a frame that drew Unorm-law light settled it.
+    /// The framebuffer-fetch verdict as of the frame ([`GpuRenderer::fetch_probe`]): `None` until
+    /// a frame that drew Unorm-law light settled it.
     pub fetch_probe: Option<FetchProbe>,
     pub fx_instances: u32,
     /// The fx bytes the frame uploaded: its instances, its palette and [`Self::fx_atlas_bytes`].
     pub fx_upload_bytes: u64,
-    /// The texel bytes of the fx atlas regions the frame wrote: 0 once every art it draws is resident.
+    /// Texel bytes of the fx atlas regions the frame wrote: 0 once every art it draws is resident.
     pub fx_atlas_bytes: u64,
     pub fx_refused: u64,
-    /// Metal: the frames in flight the frame's fx atlas sync waited for before rewriting a region they may read (a region reused after eviction, or written once more), and the nanoseconds it parked for them; 0 on the other arms, whose queues order the writes.
+    /// Metal: the frames in flight the fx atlas sync waited for before rewriting a region they may
+    /// read, and the nanoseconds it parked; 0 on the other arms, whose queues order the writes.
     pub fx_reader_waits: u64,
     pub fx_reader_wait_ns: u64,
 }
@@ -2235,10 +2241,10 @@ impl UnormAblation {
 /// How a frame's Unorm-law draws (the additive and glow groups) reached the offscreen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UnormRoute {
-    /// In passes of their own on the Unorm view: every arm, and Metal until its device passed the fetch probe.
+    /// Own passes on the Unorm view: every arm, and Metal until its device passed the fetch probe.
     #[default]
     Split,
-    /// Inside the sRGB passes, through framebuffer fetch (Metal on an Apple GPU whose probe passed): no pass of their own.
+    /// Inside the sRGB passes, by framebuffer fetch (Metal on an Apple GPU whose probe passed).
     Fetch,
 }
 
@@ -2261,7 +2267,8 @@ impl UnormRoute {
         }
     }
 
-    /// The route a renderer starts on: the fetch route wherever the device allows it, unless the `ATERM_GPU_UNORM_ROUTE` dev seam (`seam`, which no release reads) names the split.
+    /// The route a renderer starts on: fetch wherever the device allows it, unless the
+    /// `ATERM_GPU_UNORM_ROUTE` dev seam (`seam`, `None` without dev seams) names the split.
     #[inline]
     fn initial(seam: Option<&std::ffi::OsStr>) -> Self {
         seam.and_then(std::ffi::OsStr::to_str)
@@ -2276,14 +2283,15 @@ pub enum FetchStage {
     Store,
     /// A stored byte, fetched and stored again, came back another byte.
     RoundTrip,
-    /// A fetch after a fixed-function sRGB blend in the same pass read another byte than the pass stores.
+    /// A fetch after a fixed-function sRGB blend in the pass read another byte than it stores.
     InPass,
 }
 
-/// What a device's framebuffer-fetch probe found: whether `encode(decode(b)) == b` for all 256 bytes of every channel through its sRGB store and fetch (Metal, lane B6).
+/// What a device's framebuffer-fetch probe found: whether `encode(decode(b)) == b` for all 256
+/// bytes of every channel through its sRGB store and fetch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchProbe {
-    /// The device has no framebuffer fetch (not an Apple GPU), or the arm has none: the split stays.
+    /// No framebuffer fetch on the device (not an Apple GPU) or on the arm: the split stays.
     Unsupported,
     /// Every byte came back: Unorm-law draws blend inside the sRGB passes.
     Passed,
@@ -2366,7 +2374,8 @@ impl FrameShape {
     }
 }
 
-/// What a built frame plan holds by the Unorm byte law, the ablation it was built under, the route those draws took ([`route_frame_plan`]), and whether its Exact Under fx stores in the base pass (route (1)).
+/// A built frame plan's Unorm-law draws and instances, its ablation, the route those draws took
+/// ([`route_frame_plan`]), and whether its Exact Under fx stores in the base pass (route (1)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PlanUnorm {
     pub(crate) ablation: UnormAblation,
@@ -2376,7 +2385,8 @@ pub(crate) struct PlanUnorm {
     pub(crate) under_store: bool,
 }
 
-/// One draw: bind `pipe` (its fetch twin when `fetch`) and `atlas` on change, bind `stream`, draw `count` instanced quads, inside the pass `group` coalesces into.
+/// One draw: bind `pipe` (its fetch twin when `fetch`) and `atlas` on change, bind `stream`, and
+/// draw `count` instanced quads in the pass `group` coalesces into.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DrawItem {
     pub(crate) group: u8,
@@ -2384,12 +2394,12 @@ pub(crate) struct DrawItem {
     pub(crate) atlas: Option<DrawAtlas>,
     pub(crate) stream: StreamId,
     pub(crate) count: u32,
-    /// A Unorm-law draw routed through its framebuffer-fetch twin, inside the sRGB view ([`UnormRoute::Fetch`]).
+    /// A Unorm-law draw routed through its fetch twin in the sRGB view ([`UnormRoute::Fetch`]).
     pub(crate) fetch: bool,
 }
 
 impl DrawItem {
-    /// Whether this draw renders through the offscreen's sRGB view: an sRGB group's, or a fetch twin's.
+    /// Whether this draw renders through the sRGB view: an sRGB group's or a fetch twin's.
     #[inline]
     pub(crate) const fn srgb(&self) -> bool {
         GROUP_SRGB[self.group as usize] || self.fetch
@@ -2404,11 +2414,13 @@ pub(crate) struct FramePlanCtx {
     pub(crate) has_wallpaper: bool,
     pub(crate) cursor_opaque: bool,
     pub(crate) ablation: UnormAblation,
-    /// Every Exact layer at Under draws only opaque pixels ([`fx_gpu::under_draws_opaque`]): route (1) of the pass economy may store its fx at the end of the base pass.
+    /// Every Exact layer at Under draws only opaque pixels ([`fx_gpu::under_draws_opaque`]), so
+    /// route (1) of the pass economy may store its fx at the end of the base pass.
     pub(crate) under_opaque: bool,
 }
 
-/// Route `plan`'s Unorm-law draws, which [`build_frame_plan`] builds on the split, by `route`: under [`UnormRoute::Fetch`] (Metal, on a device whose framebuffer-fetch probe passed) each takes its row's twin in the sRGB view, so the frame opens no Unorm-view pass.
+/// Route `plan`'s Unorm-law draws (built on the split) by `route`: under [`UnormRoute::Fetch`]
+/// each takes its row's twin in the sRGB view, so the frame opens no Unorm-view pass.
 #[cfg(target_os = "macos")]
 pub(crate) fn route_frame_plan(plan: &mut [DrawItem], unorm: &mut PlanUnorm, route: UnormRoute) {
     unorm.route = route;
@@ -2481,10 +2493,9 @@ pub(crate) fn build_frame_plan(
         DrawPipe::FxLinear,
         Some(DrawAtlas::Fx),
     );
-    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): the letters on a
-    // body drawn under the text (a knock layer, `FxLayer::knock`) cut it to the
-    // page, before any trail draws, recolouring the body and keeping the
-    // page's alpha (glass stays glass).
+    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): a knock layer's (`FxLayer::knock`)
+    // letters cut its body, drawn under the text, to the page before any trail draws,
+    // recolouring the body and keeping the page's alpha.
     push(
         G_BASE_BG,
         StreamId::GlyphKnock,
@@ -3041,13 +3052,16 @@ struct ArmSubmitBSlot {
 
 #[cfg(target_os = "macos")]
 struct MetalArmLive {
-    /// The first-frame warm this arm waits out and takes the framebuffer-fetch verdict from (&[`crate::metal::warm::FIRST_FRAME`] but in a test that runs a warm of its own).
+    /// The first-frame warm this arm waits out and takes the fetch verdict from
+    /// ([`crate::metal::warm::FIRST_FRAME`], or a test's own latch).
     warm: &'static crate::metal::warm::WarmLatch,
     mint: crate::metal::resources::MetalResourceDevice,
     session: crate::metal::encoder::EncodeSession,
     lib: crate::metal::ffi::Library,
     psos: [Option<crate::metal::ffi::Obj>; pipeline_table::PIPELINE_COUNT],
-    /// The device's framebuffer-fetch verdict ([`crate::metal::fetch::verdict`]), `None` until the first frame that draws Unorm-law light settles it ([`Self::fetch_verdict`]): [`FetchProbe::Passed`] routes those draws through [`Self::fetch_psos`].
+    /// The device's framebuffer-fetch verdict, `None` until the first frame that draws Unorm-law
+    /// light settles it ([`Self::fetch_verdict`]); [`FetchProbe::Passed`] routes those draws
+    /// through [`Self::fetch_psos`].
     fetch: Option<FetchProbe>,
     fetch_psos: [Option<crate::metal::ffi::Obj>; pipeline_table::FETCH_TWIN_COUNT],
     nearest: crate::metal::ffi::Obj,
@@ -3071,13 +3085,13 @@ struct MetalArmLive {
     encode_band_shifts: std::cell::Cell<u64>,
     fx_tex: [Option<fx_gpu::FxArmTex>; 2],
     fx_hazard: FxHazard,
-    /// The last fx sync's reader settle ([`Self::sync_fx`]): the frames in
-    /// flight it waited for before rewriting a region they may read, and the
-    /// nanoseconds it parked.
+    /// The last fx sync's reader settle ([`Self::sync_fx`]): the frames in flight it waited for
+    /// before rewriting a region they may read, and the nanoseconds it parked.
     fx_reader_wait: (u64, u64),
     #[cfg(any(test, debug_assertions))]
     fx_shared_palette: Option<(crate::device_layer::LayerTexture, u32)>,
-    /// The pipeline states the pipeline warms ([`crate::metal::warm::spawn`]) built off this thread and this arm has not adopted yet ([`Self::adopt_warmed`]), and the sender each warm's worker takes.
+    /// Pipeline states the warms ([`crate::metal::warm::spawn`]) built off this thread that this
+    /// arm has not adopted yet ([`Self::adopt_warmed`]), and the sender each warm's worker takes.
     warmed: (
         std::sync::mpsc::Sender<crate::metal::warm::Warmed>,
         std::sync::mpsc::Receiver<crate::metal::warm::Warmed>,
@@ -3102,7 +3116,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// The fx hazard drill's record of a Metal arm, kept in test and debug builds only (a zero-sized no-op in release).
+/// The fx hazard drill's record of a Metal arm (zero-sized outside test and debug builds).
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct FxHazard {
@@ -3265,7 +3279,9 @@ impl MetalArmLive {
             .expect("inserted above"))
     }
 
-    /// `row`'s state against a `present`-format destination: a `cell.metal` row, which draws into the offscreen whatever the destination (the bloom's glow extract), is the frame's own ([`Self::pso`]); any other is keyed by the attachment it resolves to, as Metal's cache keys it.
+    /// `row`'s state against a `present`-format destination: a `cell.metal` row draws into the
+    /// offscreen whatever the destination (the bloom's glow extract), so it is the frame's own
+    /// ([`Self::pso`]); any other is keyed by the attachment format it resolves to.
     fn present_pso(
         &mut self,
         row: Pipeline,
@@ -3383,7 +3399,8 @@ impl MetalArmLive {
         }
         let stream = slot.as_ref().expect("sized above");
         if !bytes.is_empty() {
-            // SAFETY: shared storage of at least `bytes.len()`; `drain_pending` guarantees this ring slot is idle.
+            // SAFETY: shared storage of at least `bytes.len()`; `drain_pending` guarantees this
+            // ring slot is idle.
             unsafe { layer.write_buffer_from_zero(&stream.buf, bytes) };
         }
         Ok(stream.buf.metal().clone_retained())
@@ -3397,7 +3414,8 @@ impl MetalArmLive {
         let slot = &mut self.submit_b_slots[self.submit_b_idx].blit_u;
         if let Some((memo, buf)) = slot.as_mut() {
             if aterm_bits::bytes_of(memo) != aterm_bits::bytes_of(&want) {
-                // SAFETY: `buf` is a shared-storage buffer of `size_of::<BlitUniform>()` owned by this idle ring slot.
+                // SAFETY: `buf` is a shared-storage buffer of `size_of::<BlitUniform>()` owned by
+                // this idle ring slot.
                 unsafe { layer.write_buffer_from_zero(buf, aterm_bits::bytes_of(&want)) };
                 *memo = want;
             }
@@ -3500,7 +3518,10 @@ impl MetalArmLive {
         Ok(slot.as_ref().expect("filled above"))
     }
 
-    /// The device's framebuffer-fetch verdict, settled for a frame that draws Unorm-law light: a warm's once it landed, `None` (the split, for this frame) while the first-frame warm or this arm's pipeline warm still owes it, so no frame waits on the probe, else this arm's own [`crate::metal::fetch::verdict`] (a test, or a warm whose probe could not run).
+    /// The device's framebuffer-fetch verdict for a frame that draws Unorm-law light: a warm's
+    /// once it landed; `None` (the split, for this frame) while the first-frame warm or this arm's
+    /// warm still owes it, so no frame waits on the probe; else the process's known verdict or
+    /// this arm's own probe ([`crate::metal::fetch::verdict`]).
     fn fetch_verdict(&mut self) -> Option<FetchProbe> {
         if self.fetch.is_none() {
             self.adopt_warmed();
@@ -3564,7 +3585,8 @@ impl MetalArmLive {
         }
     }
 
-    /// Take one pipeline warm's build: its state where this arm has not built one meanwhile, or the verdict its probe settled for the process (none where the probe could not run, so a frame probes again).
+    /// Take one warm's build: its state unless this arm built one meanwhile, or the verdict its
+    /// probe settled for the process (none where the probe could not run, so a frame probes again).
     fn adopt(&mut self, warmed: crate::metal::warm::Warmed) {
         use crate::metal::warm::{WarmItem, Warmed};
         let Warmed { item, pso } = warmed;
@@ -3598,7 +3620,10 @@ impl MetalArmLive {
         }
     }
 
-    /// Start a pipeline warm for what this arm's frames and presents can bind under `knobs` ([`crate::metal::warm::bindable`]) that it neither holds nor is owed: the twins too, unless the device's verdict is known and is not a pass, and first the device's framebuffer-fetch probe, where the verdict is unknown and no first-frame warm owes it, so no frame probes on this thread ([`Self::fetch_verdict`]).
+    /// Start a pipeline warm for what this arm's frames and presents can bind under `knobs`
+    /// ([`crate::metal::warm::bindable`]) that it neither holds nor is owed: the twins unless the
+    /// verdict is known and not a pass, led by the fetch probe where the verdict is unknown and no
+    /// first-frame warm owes it, so no frame probes on this thread.
     fn warm_pipelines(&mut self, knobs: crate::metal::warm::PresentKnobs) {
         use crate::metal::warm::WarmItem;
         self.adopt_warmed();
@@ -3629,7 +3654,9 @@ impl MetalArmLive {
         }
     }
 
-    /// Wait (a hang detector of `hang`) until the pipeline warms built all they owe, and put each build back for the frames to take ([`Self::adopt_warmed`]): the items whose build failed (the probe, which hands over no state, is none of them).
+    /// Wait (a hang detector of `hang`) until the warms built all they owe, put each build back
+    /// for the frames to take, and return the items whose build failed (never the probe, which
+    /// hands over no state).
     #[cfg(test)]
     fn await_warmed(&mut self, hang: std::time::Duration) -> Vec<crate::metal::warm::WarmItem> {
         let began = aterm_time::Instant::now();
@@ -3668,7 +3695,8 @@ impl MetalArmLive {
         if slot.uniform_key == Some((w, h, text_blend)) {
             return;
         }
-        // SAFETY: `slot.uniform` is a shared-storage `Uniforms` buffer and `cur_slot` was awaited at staging start.
+        // SAFETY: `slot.uniform` is a shared-storage `Uniforms` buffer and `cur_slot` was awaited
+        // at staging start.
         unsafe {
             layer.write_buffer_from_zero(
                 &slot.uniform,
@@ -3700,7 +3728,8 @@ impl MetalArmLive {
             });
         }
         let stream = slot.as_ref().expect("sized above");
-        // SAFETY: shared storage of at least `bytes.len()` and `cur_slot` was awaited at staging start.
+        // SAFETY: shared storage of at least `bytes.len()` and `cur_slot` was awaited at staging
+        // start.
         unsafe { layer.write_buffer_from_zero(&stream.buf, bytes) };
         Ok(true)
     }
@@ -4091,12 +4120,13 @@ impl MetalArmCell {
     }
 }
 
-// SAFETY: moving the holder is sound because `live_mut` checks the minting thread and `objc_release` is thread-safe.
+// SAFETY: moving the holder is sound because `live_mut` checks the minting thread and
+// `objc_release` is thread-safe.
 #[cfg(target_os = "macos")]
 unsafe impl Send for MetalArmCell {}
 
-/// The shared frame walk both backends execute.
-/// `plan`'s passes ([`coalesce_frame_passes`]): the base group always, each group a draw names, each on the view its draws take (a fetch draw takes the sRGB view in a Unorm-law group).
+/// `plan`'s passes ([`coalesce_frame_passes`]): the base group always and each group a draw names,
+/// each on the view its draws take (a fetch draw takes the sRGB view in a Unorm-law group).
 fn plan_passes(plan: &[DrawItem]) -> ([usize; FRAME_GROUPS], [bool; FRAME_GROUPS], usize) {
     let mut enabled = [false; FRAME_GROUPS];
     let mut srgb = GROUP_SRGB;
@@ -4548,7 +4578,7 @@ impl GpuSurface {
         self.copyable
     }
 
-    /// The bytes a presented snapshot of this surface holds as taken ([`crate::video_tap::RawCapture::allocation`]).
+    /// The bytes a presented snapshot holds ([`crate::video_tap::RawCapture::allocation`]).
     #[must_use]
     #[inline]
     pub fn snapshot_bytes(&self) -> Option<usize> {
@@ -4827,7 +4857,6 @@ fn grow_atlas(
     }
     let need_h = probe.occupied_height();
     if need_h > cap_h {
-        // Distinct branch.
         return None; // genuine overflow: caller repacks fresh into a new texture
     }
     if dirty_hi == 0 {
@@ -5199,7 +5228,8 @@ impl WindowGpu {
         self.last_present_work_ns
     }
 
-    /// CPU wall time encoding the latest successful present up to its last commit, excluding recorded frame-slot/ring parks.
+    /// CPU wall time encoding the latest successful present up to its last commit, excluding
+    /// recorded frame-slot and ring parks.
     #[must_use]
     #[inline]
     pub const fn last_present_encode_ns(&self) -> u64 {
@@ -5232,7 +5262,7 @@ impl WindowGpu {
         self.acquire_queue_sample_ns.take()
     }
 
-    /// Wall time the latest armed present blocked on GPU completion (frame-slot wait plus ring drain).
+    /// Wall time the latest armed present blocked on the GPU (frame-slot wait plus ring drain).
     #[must_use]
     #[inline]
     pub const fn last_gpu_park_ns(&self) -> u64 {
@@ -5370,7 +5400,8 @@ impl WindowGpu {
         self.edr_max = 0.0;
     }
 
-    /// Project the applied window metadata plus the planner's resolved format onto the four `HdrReconfigureRetag` model variables.
+    /// The applied window metadata and the planner's resolved format, projected onto the four
+    /// `HdrReconfigureRetag` model variables.
     #[cfg(all(test, wgpu_arm))]
     #[must_use]
     pub(crate) fn project_hdr_reconfigure_state(
@@ -5399,7 +5430,7 @@ impl WindowGpu {
         }
     }
 
-    /// The recorded raw EDR maximum, so the frontend can carry it across rebuilds that replace a window's `WindowGpu`.
+    /// The recorded raw EDR maximum, which the frontend carries across `WindowGpu` rebuilds.
     #[must_use]
     #[inline]
     pub const fn edr_max(&self) -> f32 {
@@ -5438,7 +5469,7 @@ impl WindowGpu {
         self.resident_input_epoch
     }
 
-    /// Return the byte length of [`GpuRenderer::virtual_presented_snapshot_current`] when available.
+    /// The byte length of [`GpuRenderer::virtual_presented_snapshot_current`], when available.
     #[must_use]
     pub fn virtual_snapshot_bytes(&self) -> Option<usize> {
         #[cfg(gl_arm)]
@@ -5474,7 +5505,8 @@ impl WindowGpu {
         None
     }
 
-    /// Clone the resident semantic model with the transport translation applied to its effects, as one read, so input and translation always match.
+    /// Clone the resident semantic model with the transport translation applied to its effects,
+    /// in one read so input and translation match.
     #[must_use]
     pub fn clone_resident_input_with_transport_at(&self, epoch: u64) -> Option<(RenderInput, i32)> {
         (epoch != 0 && epoch != u64::MAX && self.resident_input_epoch == epoch).then(|| {
@@ -5693,18 +5725,23 @@ pub struct GpuRenderer {
     last_frame_passes: u32,
     frame_shape: FrameShape,
     ablation: UnormAblation,
-    /// The route the Metal arm's frame plans take where the device passed the fetch probe ([`UnormRoute::Fetch`] unless the `ATERM_GPU_UNORM_ROUTE` seam or [`Self::set_unorm_route`] chose the split).
+    /// The route the Metal arm's frame plans take where the device passed the fetch probe:
+    /// [`UnormRoute::Fetch`] unless the `ATERM_GPU_UNORM_ROUTE` seam or [`Self::set_unorm_route`]
+    /// chose the split.
     unorm_route: UnormRoute,
     /// A verdict standing in for the Metal arm's ([`Self::set_fetch_probe_seam`]).
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     fetch_probe_seam: Option<FetchProbe>,
-    /// The first-frame warm the Metal arm's mint waits out (&[`crate::metal::warm::FIRST_FRAME`] but in a test that runs a warm of its own, [`Self::set_first_frame_latch_for_test`]).
+    /// The first-frame warm the Metal arm's mint waits out ([`crate::metal::warm::FIRST_FRAME`],
+    /// or a test's own, [`Self::set_first_frame_latch_for_test`]).
     #[cfg(target_os = "macos")]
     first_frame: &'static crate::metal::warm::WarmLatch,
-    /// [`Self::warm_effect_pipelines`] was asked for: the Metal arm's mint starts the pipeline warm that a request before it could not.
+    /// [`Self::warm_effect_pipelines`] was asked for: the Metal arm's mint starts the warm that a
+    /// request before it could not.
     #[cfg(target_os = "macos")]
     metal_warm_wanted: bool,
-    /// A window surface attached on this renderer, whose swapchain may be f16 (an EDR screen, `hdr_glow`): a headless renderer presents to a Bgra8Unorm target alone.
+    /// A window surface attached on this renderer, whose swapchain may be f16 (an EDR screen,
+    /// `hdr_glow`); a headless renderer presents to a Bgra8Unorm target only.
     #[cfg(target_os = "macos")]
     metal_on_screen: bool,
     last_gpu_time_serial: Option<u64>,
@@ -5833,7 +5870,8 @@ pub(crate) struct ShimmerScratch {
     h: u32,
 }
 
-/// Headless virtual swapchain (see [`WindowGpu::virtual_target`]) that [`GpuRenderer::present_virtual`] renders into.
+/// Headless virtual swapchain (see [`WindowGpu::virtual_target`]) that
+/// [`GpuRenderer::present_virtual`] renders into.
 #[cfg(wgpu_arm)]
 pub(crate) struct VirtualTarget {
     #[cfg(wgpu_arm)]
@@ -6107,7 +6145,6 @@ impl VertexBuffer {
 
     #[cfg(wgpu_arm)]
     fn upload_via(&mut self, handle: crate::device_layer::DeviceHandle<'_>, bytes: &[u8]) -> bool {
-        // See `should_slice`.
         if !should_slice(bytes.len()) {
             return false;
         }
@@ -6122,7 +6159,8 @@ impl VertexBuffer {
             self.buf = handle.create_instance_buffer(self.label, new_cap);
             self.capacity = new_cap;
         }
-        // SAFETY: wgpu has no precondition and Metal callers rewrite streams only after command buffers settle.
+        // SAFETY: wgpu has no precondition and Metal callers rewrite streams only after command
+        // buffers settle.
         unsafe { handle.write_buffer_from_zero(&self.buf, bytes) };
         true
     }
@@ -6830,12 +6868,9 @@ fn frame_effect_pipelines(
     want
 }
 
-/// Which fx pipelines a frame's fx streams need, as `(fx, fx_linear, fx_store)`.
-///
-/// An opaque Exact Under stream is stored in the base pass (route (1),
-/// [`build_frame_plan`]) whenever the frame's GlowUnder stream turns out
-/// empty, so `fx_store` is demanded for it; `fx` covers it only when the
-/// frame may keep it at its own group (a GlowUnder stream to draw).
+/// Which fx pipelines a frame's fx streams need, as `(fx, fx_linear, fx_store)`: an opaque Exact
+/// Under stream always demands `fx_store` (route (1), [`build_frame_plan`]), and `fx` too while a
+/// GlowUnder stream keeps it in its own group.
 #[cfg(wgpu_arm)]
 fn fx_effect_demand(inst: &Instances, under_opaque: bool) -> (bool, bool, bool) {
     let fx = |s: fx_gpu::FxStream| !inst.fx[s as usize].is_empty();
@@ -7029,7 +7064,8 @@ impl GpuRenderer {
         Self::new_with_family(None, px, theme)
     }
 
-    /// Like [`GpuRenderer::new`], but resolves a configured font family (or font file path) first, mirroring [`Renderer::from_system_with_family`].
+    /// Like [`GpuRenderer::new`], but resolves a configured font family (or font file path) first,
+    /// mirroring [`Renderer::from_system_with_family`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_with_family(family: Option<&str>, px: f32, theme: Theme) -> Result<Self, String> {
         let family_owned = family.map(String::from);
@@ -7366,16 +7402,16 @@ impl GpuRenderer {
         self.raster_changed(|cpu| cpu.set_runtime_font_discovery(enabled));
     }
 
-    /// Test/debug forward of [`debug_block_on_lazy_fallbacks`], so CPU-vs-GPU comparisons are deterministic.
+    /// Test/debug forward of [`Renderer::debug_block_on_lazy_fallbacks`], so CPU-vs-GPU
+    /// comparisons are deterministic.
     #[doc(hidden)]
     #[inline]
     pub fn debug_block_on_lazy_fallbacks(&mut self) {
         self.cpu.debug_block_on_lazy_fallbacks();
     }
 
-    /// A test's negative control: draw companions under the text without the
-    /// knock-out (`aterm_render::Renderer::set_knock_out`), on this renderer's
-    /// glyph-knock stream as on its CPU twin.
+    /// A test's negative control: draw companions under the text without the knock-out
+    /// (`aterm_render::Renderer::set_knock_out`), on the glyph-knock stream as on the CPU twin.
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub fn set_knock_out(&mut self, on: bool) {
@@ -7403,7 +7439,7 @@ impl GpuRenderer {
         self.color_res = None;
     }
 
-    /// Install the text-shaping config (ligatures and OpenType features) on the wrapped CPU face and drop the atlas.
+    /// Install the text-shaping config (ligatures, OpenType features) and drop the atlas.
     #[inline]
     pub fn set_text_shaping(&mut self, shaping: aterm_render::TextShapingConfig) {
         self.raster_changed(|cpu| cpu.set_text_shaping(shaping));
@@ -7416,7 +7452,8 @@ impl GpuRenderer {
         self.cpu.unsupported_user_feature_tags()
     }
 
-    /// Install the coverage blend mode (config `text_blending`) on the wrapped CPU face, which `encode_frame` reads for the shader uniform.
+    /// Install the coverage blend mode (config `text_blending`) on the wrapped CPU face, which
+    /// `encode_frame` reads for the shader uniform.
     #[inline]
     pub fn set_text_blending(&mut self, mode: aterm_render::TextBlending) {
         self.cpu.set_text_blending(mode);
@@ -7429,7 +7466,7 @@ impl GpuRenderer {
         self.cpu.text_blending()
     }
 
-    /// Set macOS `font_thicken` on the wrapped CPU face and drop the atlas when the face reports a change (coverage bytes differ).
+    /// Set macOS `font_thicken` on the wrapped CPU face and drop the atlas when it changed.
     pub fn set_font_thicken(&mut self, on: bool) {
         self.raster_changed(|cpu| {
             let changed = cpu.font_thicken() != on;
@@ -7440,7 +7477,7 @@ impl GpuRenderer {
         });
     }
 
-    /// Install the variable-font configuration (`font_variation` / `font_weight`) and rebuild the glyph atlas.
+    /// Install the variable-font config (`font_variation`, `font_weight`) and rebuild the atlas.
     pub fn set_font_variations(&mut self, requests: &[(u32, f32)], dark_nudge: f32) {
         self.raster_changed(|cpu| cpu.set_font_variations(requests, dark_nudge));
     }
@@ -7474,7 +7511,7 @@ impl GpuRenderer {
         });
     }
 
-    /// Explicit selected-text foreground (theme `selectionForeground`), or `None` for the contrast-floor default.
+    /// Selected-text foreground (theme `selectionForeground`), or `None` for the contrast floor.
     #[inline]
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
         self.cpu.set_selection_fg(fg);
@@ -7512,7 +7549,7 @@ impl GpuRenderer {
         self.cpu.cursor_opacity()
     }
 
-    /// Mark the pane unfocused (`true`) or focused for selection theming, via the CPU face (`effective_selection_bg`).
+    /// Mark the pane unfocused (`true`) or focused for selection theming.
     #[inline]
     pub fn set_selection_inactive(&mut self, inactive: bool) {
         self.cpu.set_selection_inactive(inactive);
@@ -7559,7 +7596,7 @@ impl GpuRenderer {
         self.raster_changed(|cpu| cpu.set_fallback_bytes(bytes))
     }
 
-    /// Append a broad-coverage fallback face, so several scripts can find coverage. Invalidates the atlas.
+    /// Append a fallback face, so several scripts can find coverage, and invalidate the atlas.
     pub fn add_fallback_font_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.raster_changed(|cpu| cpu.add_fallback_bytes(bytes))
     }
@@ -7614,7 +7651,7 @@ impl GpuRenderer {
         self.raster_changed(|cpu| cpu.set_config_emoji_font(path));
     }
 
-    /// Install the display layer (`display_font`, [`Renderer::set_display_faces`]) and invalidate the atlas when it changed.
+    /// Install the display layer (`display_font`), invalidating the atlas when it changed.
     pub fn set_display_faces(&mut self, ids: &[&str]) -> Result<(), String> {
         let before = self.cpu.display_faces();
         self.cpu.set_display_faces(ids)?;
@@ -7683,7 +7720,8 @@ impl GpuRenderer {
         self.cpu.admitted_font_sources_sealed()
     }
 
-    /// Worker-only settlement of every path-backed face in the wrapped generation, for hosts that did not seal before installing.
+    /// Worker-only settlement of every path-backed face in the wrapped generation, for hosts that
+    /// did not seal before installing.
     #[inline]
     pub fn seal_admitted_font_sources(&mut self) -> aterm_render::AdmittedFontSources {
         self.cpu.seal_admitted_font_sources()
@@ -7703,14 +7741,15 @@ impl GpuRenderer {
         self.cpu.glyph_cache_len()
     }
 
-    /// Rebuild the font at `px`/`theme` from the sealed sources, keeping the device, pipelines and surfaces, and invalidating the atlases once.
+    /// Rebuild the font at `px`/`theme` from the sealed sources, keeping the device, pipelines and
+    /// surfaces, and invalidating the atlases once.
     pub fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
         let cpu = self.cpu.rebuild_from_admitted(px, theme)?;
         self.set_face(cpu, theme);
         Ok(())
     }
 
-    /// Fail-soft rebuild.
+    /// Rebuild this renderer from the sealed font sources on a fresh GPU context.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn rebuild_on_fresh_context(&self, px: f32) -> Result<Self, String> {
         let cpu = self.cpu.rebuild_from_admitted(px, self.theme)?;
@@ -7884,7 +7923,7 @@ impl GpuRenderer {
         self.cpu.overshoot_rule_widened()
     }
 
-    /// Project the exact `PresentPrev` and `GpuGateCache` origin stamps used by the `AsymmetricPadLayout` refinement anchors.
+    /// The `PresentPrev` and `GpuGateCache` origin stamps the `AsymmetricPadLayout` anchors read.
     #[doc(hidden)]
     #[must_use]
     #[inline]
@@ -7953,28 +7992,32 @@ impl GpuRenderer {
         self.ablation
     }
 
-    /// Set the pass-economy ablation (the `ATERM_GPU_ABLATE_UNORM` seam's programmatic twin, for the effects perf lane and tests).
+    /// Set the pass-economy ablation (the `ATERM_GPU_ABLATE_UNORM` seam's programmatic twin).
     #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
     #[inline]
     pub const fn set_unorm_ablation(&mut self, ablation: UnormAblation) {
         self.ablation = ablation;
     }
 
-    /// The route frame plans take where the device allows it ([`UnormRoute::Fetch`] by default); [`FrameShape::route`] is the route the latest frame took.
+    /// The route frame plans take where the device allows it ([`UnormRoute::Fetch`] by default);
+    /// [`FrameShape::route`] is the route the latest frame took.
     #[must_use]
     #[inline]
     pub const fn unorm_route(&self) -> UnormRoute {
         self.unorm_route
     }
 
-    /// Choose the route frame plans take where the device allows it (the `ATERM_GPU_UNORM_ROUTE` seam's programmatic twin): [`UnormRoute::Split`] keeps a fetch-capable device on the split, for the effects perf lane's A/B and the fetch differentials.
+    /// Choose the route frame plans take where the device allows it (the `ATERM_GPU_UNORM_ROUTE`
+    /// seam's programmatic twin): [`UnormRoute::Split`] keeps a fetch-capable device on the split.
     #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
     #[inline]
     pub const fn set_unorm_route(&mut self, route: UnormRoute) {
         self.unorm_route = route;
     }
 
-    /// The renderer's framebuffer-fetch verdict: the Metal arm's device's probe ([`FetchProbe`]), [`FetchProbe::Unsupported`] on any other arm, and `None` until the Metal arm has minted and a frame that draws Unorm-law light settled it.
+    /// The framebuffer-fetch verdict: the Metal arm's device probe, [`FetchProbe::Unsupported`] on
+    /// any other arm, and `None` until the Metal arm has minted and a frame that draws Unorm-law
+    /// light settled it.
     #[must_use]
     pub fn fetch_probe(&self) -> Option<FetchProbe> {
         #[cfg(target_os = "macos")]
@@ -7988,7 +8031,8 @@ impl GpuRenderer {
         Some(FetchProbe::Unsupported)
     }
 
-    /// Stand `verdict` in for the Metal arm's framebuffer-fetch verdict (`None`: the device's own), so a test drives a device that failed, refused or lacks the probe on hardware that passes it.
+    /// Stand `verdict` in for the Metal arm's fetch verdict (`None`: the device's own), so a test
+    /// can drive a device that failed, refused or lacks the probe.
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     #[inline]
     pub const fn set_fetch_probe_seam(&mut self, verdict: Option<FetchProbe>) {
@@ -8005,7 +8049,8 @@ impl GpuRenderer {
         None
     }
 
-    /// Mint the Metal arm against `latch` rather than the process's first-frame warm, so a test that runs a warm of its own never holds another test's frames on it.
+    /// Mint the Metal arm against `latch` rather than the process's first-frame warm, so a test
+    /// that runs its own warm never holds another test's frames on it.
     #[cfg(all(target_os = "macos", test))]
     pub(crate) const fn set_first_frame_latch_for_test(
         &mut self,
@@ -8014,7 +8059,10 @@ impl GpuRenderer {
         self.first_frame = latch;
     }
 
-    /// The route the Metal arm (`arm`) gives a frame, `unorm` saying whether the frame draws Unorm-law light: [`UnormRoute::Fetch`] only where `want` (the renderer's [`Self::unorm_route`]) asks for it and the device's verdict (or the test `seam`'s) is [`FetchProbe::Passed`]. Only a frame with that light settles a verdict ([`MetalArmLive::fetch_verdict`]), so a session that draws none never probes.
+    /// The route the Metal arm gives a frame (`unorm`: it draws Unorm-law light):
+    /// [`UnormRoute::Fetch`] only where `want` asks for it and the verdict (`seam`'s, else the
+    /// device's) is [`FetchProbe::Passed`]. Only a frame with that light settles a verdict
+    /// ([`MetalArmLive::fetch_verdict`]), so a session that draws none never probes.
     #[cfg(target_os = "macos")]
     fn metal_unorm_route(
         arm: Option<&mut MetalArmCell>,
@@ -8150,13 +8198,13 @@ impl GpuRenderer {
         self.cpu.pad_top()
     }
 
-    /// Override the top-only interior pad on the inner CPU renderer (read each frame) without changing the framebuffer size.
+    /// Override the top-only interior pad (read each frame) without changing the framebuffer size.
     #[inline]
     pub fn set_pad_top(&mut self, pad_top: usize) {
         self.cpu.set_pad_top(pad_top);
     }
 
-    /// Declare the top grid rows that are host chrome and the tone their surface extends into the padding.
+    /// Declare the host-chrome top rows and the tone their surface extends into the padding.
     #[inline]
     pub fn set_chrome_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
         self.cpu.set_chrome_bleed(bleed);
@@ -8259,7 +8307,7 @@ impl GpuRenderer {
         self.metal_armed = true;
     }
 
-    /// Disarm the Metal arm in-process so the differentials' wgpu oracle twin can reach the wgpu arm.
+    /// Disarm the Metal arm in-process so the differentials' wgpu oracle twin reaches the wgpu arm.
     #[cfg(target_os = "macos")]
     #[cfg(test)]
     pub(crate) fn disarm_metal_for_test(&mut self) {
@@ -8377,7 +8425,7 @@ impl GpuRenderer {
         (&self.ctx.adapter_name, &self.ctx.backend)
     }
 
-    /// Whether the additive streams (aurora, sparkle-add, bloom halo) composite byte-exact with CPU `add_sat`.
+    /// Whether the additive streams (aurora, sparkle-add, bloom halo) match CPU `add_sat` exactly.
     #[inline]
     pub const fn additive_is_byte_exact(&self) -> bool {
         self.ctx.srgb_offscreen
@@ -8850,7 +8898,10 @@ impl GpuRenderer {
         self.present_pass_switched(was, on);
     }
 
-    /// A present switch went from `was` to `on` (or a first window went on screen, which may bring an f16 swapchain): a pass it turned on, where the Metal arm's pipeline warm was asked for, gets its pipelines built on a worker before a frame binds them ([`Self::warm_effect_pipelines`]).
+    /// A present switch went from `was` to `on` (or a first window went on screen, which may bring
+    /// an f16 swapchain): once the Metal arm's warm was asked for
+    /// ([`Self::warm_effect_pipelines`]), a pass it turned on gets its pipelines built on a worker
+    /// before a frame binds them.
     #[inline]
     fn present_pass_switched(&mut self, was: bool, on: bool) {
         #[cfg(target_os = "macos")]
@@ -8914,11 +8965,10 @@ impl GpuRenderer {
 
     /// Config `hdr_glow` (default on).
     pub fn set_hdr_glow(&mut self, on: bool) {
-        // The HDR swapchain and the DirectComposition visual swapchain are
-        // mutually exclusive: once the instance is visual, `hdr_glow` stays off
-        // (its composition semantics there are unverified and the instance
-        // cannot be rebuilt without tearing down every window). Every config
-        // path funnels through here.
+        // The HDR swapchain and the DirectComposition visual swapchain are mutually exclusive:
+        // once the instance is visual, `hdr_glow` stays off (its composition there is unverified,
+        // and rebuilding the instance would tear down every window). Every config path funnels
+        // through here.
         if on && self.ctx.visual_swapchain {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -8954,7 +9004,8 @@ impl GpuRenderer {
         self.present_pass_switched(was, strength > 0.0);
     }
 
-    /// Start recording this window's swapchain frames submitted through the WSI present path, with [`crate::video_tap::CaptureOpts`].
+    /// Start recording this window's swapchain frames submitted through the WSI present path, with
+    /// [`crate::video_tap::CaptureOpts`].
     pub fn video_begin(
         &self,
         win: &mut WindowGpu,
@@ -9226,7 +9277,7 @@ impl GpuRenderer {
         unreachable!("a wgpu one-shot cannot exist on a wgpu-free build")
     }
 
-    /// Complete the one-shot map, blocking only after the explicit capture has left the present hot path.
+    /// Complete the one-shot map, blocking only after the capture has left the present hot path.
     pub fn presented_snapshot_finish(&self, win: &mut WindowGpu) -> Result<(), String> {
         let tap = win
             .presented_snapshot
@@ -9248,7 +9299,8 @@ impl GpuRenderer {
         unreachable!("a wgpu one-shot cannot exist on a wgpu-free build")
     }
 
-    /// Take the completed exact destination as its staging buffer mapped it ([`crate::video_tap::RawCapture`]).
+    /// Take the completed exact destination as its staging buffer mapped it
+    /// ([`crate::video_tap::RawCapture`]).
     pub fn presented_snapshot_take(
         &self,
         win: &mut WindowGpu,
@@ -9259,7 +9311,8 @@ impl GpuRenderer {
             .take_raw()
     }
 
-    /// Copy and synchronously read the current persistent virtual destination without arming or forcing a present.
+    /// Copy and synchronously read the current persistent virtual destination without arming or
+    /// forcing a present.
     pub fn virtual_presented_snapshot_current(
         &self,
         win: &WindowGpu,
@@ -9354,7 +9407,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Render a [`RenderInput`] snapshot (from [`aterm_core::terminal::Terminal::cell_frame_into`]) on the GPU and read it back.
+    /// Render a [`RenderInput`] snapshot (from [`aterm_core::terminal::Terminal::cell_frame_into`])
+    /// on the GPU and read it back.
     pub fn render_input(
         &mut self,
         win: &mut WindowGpu,
@@ -9414,7 +9468,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Fallible twin of [`Self::render_input`], rejecting excessive dimensions before changing window tracking or encoding a frame.
+    /// Fallible twin of [`Self::render_input`], rejecting excessive dimensions before changing
+    /// window tracking or encoding a frame.
     pub fn try_render_input(
         &mut self,
         win: &mut WindowGpu,
@@ -10253,7 +10308,8 @@ impl GpuRenderer {
         })
     }
 
-    /// Drop a window's Metal swapchain once the renderer is disarmed, so its stale layer is unparented and the wgpu layer beneath shows.
+    /// Drop a window's Metal swapchain once the renderer is disarmed, so its stale layer is
+    /// unparented and the wgpu layer beneath shows.
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_disarm_sweep(
         &mut self,
@@ -11410,7 +11466,8 @@ impl GpuRenderer {
                 if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
                     return Err("the readback copy did not complete".to_owned());
                 }
-                // SAFETY: shared storage sized `row * dh` whose writing command buffer has completed.
+                // SAFETY: shared storage sized `row * dh` whose writing command buffer has
+                // completed.
                 let bgra = unsafe { mtl::buffer_bytes(&rb, row * dh as usize) };
                 let mut rgba = vec![0u8; bgra.len()];
                 for (dst, src) in rgba
@@ -11426,7 +11483,8 @@ impl GpuRenderer {
         )
     }
 
-    /// [`Self::metal_present_bytes_with_scope_for_test`]'s present onto a standalone drawable of `format` (an EDR window's `Rgba16Float` too).
+    /// [`Self::metal_present_bytes_with_scope_for_test`]'s present onto a standalone drawable of
+    /// `format` (an EDR window's `Rgba16Float` too).
     #[cfg(all(target_os = "macos", test))]
     pub(crate) fn metal_present_standalone_for_test<T>(
         &mut self,
@@ -11740,7 +11798,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Create an on-screen presentation surface for `target` at the given pixel size, on the same instance and adapter as the offscreen renderer.
+    /// Create an on-screen presentation surface for `target` at the given pixel size, on the
+    /// offscreen renderer's instance and adapter.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create_window_surface<W: WindowTarget>(
         &mut self,
@@ -11796,7 +11855,9 @@ impl GpuRenderer {
         }
     }
 
-    /// [`Self::create_window_surface`], with `sink`, the frontend's presenter for the window, which the GL arm posts the window's frames through where a window surface would stall the window system ([`FrameSink`]).
+    /// [`Self::create_window_surface`] with `sink`, the frontend's presenter ([`FrameSink`]), which
+    /// the GL arm posts the window's frames through where a window surface would stall the window
+    /// system.
     #[cfg(target_os = "linux")]
     pub fn create_window_surface_with_sink<W: WindowTarget>(
         &mut self,
@@ -11957,7 +12018,8 @@ impl GpuRenderer {
         })
     }
 
-    /// Configure the canvas surface [`crate::GpuContext::for_canvas`] made, at `width` x `height` (clamped like every framebuffer).
+    /// Configure the canvas surface [`crate::GpuContext::for_canvas`] made, at `width` x `height`
+    /// (clamped like every framebuffer).
     #[cfg(target_arch = "wasm32")]
     pub fn configure_canvas_surface(
         &self,
@@ -12011,9 +12073,8 @@ impl GpuRenderer {
 
     #[cfg(wgpu_arm)]
     fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-        // Mailbox where it exists: a non-blocking, newest-frame-wins present, the
-        // lowest-latency mode. Input latency takes priority over animation
-        // smoothness.
+        // Mailbox where it exists: non-blocking, newest-frame-wins, the lowest-latency mode;
+        // input latency outranks animation smoothness.
         if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             return wgpu::PresentMode::Mailbox;
         }
@@ -12534,7 +12595,8 @@ impl GpuRenderer {
     #[cfg(windows)]
     #[cfg(wgpu_arm)]
     fn dx12_swap_chain(surface: &wgpu::Surface) -> Option<aterm_win32::com::Com> {
-        // SAFETY: `swap_chain()` returns an `AddRef`'d `IDXGISwapChain3` pointer adopted and released once by `Com`.
+        // SAFETY: `swap_chain()` returns an `AddRef`'d `IDXGISwapChain3` pointer adopted and
+        // released once by `Com`.
         unsafe {
             let hal_surf = surface.as_hal::<wgpu::hal::api::Dx12>()?;
             Some(aterm_win32::com::Com::from_interface(
@@ -12556,7 +12618,8 @@ impl GpuRenderer {
             return false;
         };
         let mut out = core::ptr::null_mut();
-        // SAFETY: `sc` is a live `IDXGISwapChain3` and `GetContainingOutput` writes one owned `IDXGIOutput` on success.
+        // SAFETY: `sc` is a live `IDXGISwapChain3` and `GetContainingOutput` writes one owned
+        // `IDXGIOutput` on success.
         let hr = unsafe {
             (sc.vtable::<IDXGISwapChain3_Vtbl>().GetContainingOutput)(sc.as_raw(), &mut out)
         };
@@ -12610,7 +12673,7 @@ impl GpuRenderer {
         supported && unsafe { (vt.SetColorSpace1)(sc.as_raw(), cs) } >= 0
     }
 
-    /// Render the frame offscreen and present it by blitting that texture into `surf`'s swapchain on the GPU.
+    /// Render the frame offscreen and present it by blitting that texture into `surf`'s swapchain.
     #[inline]
     pub fn present_input(
         &mut self,
@@ -13478,7 +13541,10 @@ impl GpuRenderer {
         VirtualTarget { tex, w, h }
     }
 
-    /// Build every effect pipeline not yet resident, off the frame path: the wgpu arm's here, the Metal arm's on a worker that hands each to the arm as it lands, every row and twin its frames and presents can bind under this renderer's present switches (first the device's framebuffer-fetch probe, where no first-frame warm owes it), from its mint when it has not minted yet and again for a pass a switch turns on later. A no-op on the GL arm.
+    /// Build every effect pipeline not yet resident, off the frame path: the wgpu arm's here; the
+    /// Metal arm's on a worker that hands each over as it lands, covering every row and twin its
+    /// frames and presents can bind under the present switches, from its mint if it has not
+    /// minted yet and again for a pass a switch turns on later. A no-op on the GL arm.
     pub fn warm_effect_pipelines(&mut self) {
         #[cfg(wgpu_arm)]
         for which in EFFECT_PIPELINES {
@@ -13491,7 +13557,7 @@ impl GpuRenderer {
         }
     }
 
-    /// Start the Metal arm's pipeline warm under this renderer's present switches, if the arm is live.
+    /// Start the Metal arm's pipeline warm under the present switches, if the arm is live.
     #[cfg(target_os = "macos")]
     fn metal_warm_pipelines(&mut self) {
         let knobs = crate::metal::warm::PresentKnobs {
@@ -13505,7 +13571,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Test seam: wait (a hang detector of `hang`) until the Metal arm's pipeline warms built all they owe, leaving each build for the frames to take: the items whose build failed.
+    /// Test seam: wait (a hang detector of `hang`) until the Metal arm's warms built all they owe,
+    /// leaving each build for the frames to take; returns the items whose build failed.
     #[cfg(all(target_os = "macos", test))]
     pub(crate) fn await_pipeline_warm_for_test(
         &mut self,
@@ -13545,7 +13612,7 @@ impl GpuRenderer {
         }
     }
 
-    /// `(count, nanoseconds)` this renderer has spent building effect pipelines since construction.
+    /// `(count, nanoseconds)` spent building effect pipelines since construction.
     #[inline]
     pub const fn effect_pipeline_build_cost(&self) -> (u32, u64) {
         #[cfg(wgpu_arm)]
@@ -14129,10 +14196,9 @@ impl GpuRenderer {
             .unwrap_or_else(|| self.shimmer_epoch.elapsed().as_secs_f32() % SHIMMER_PHASE_WRAP_S)
     }
 
-    /// The foot (frame px) of the lowest row holding a glyph in columns
-    /// `x0..x1` that reaches into the band `y0..y1`, or `0` when every such
-    /// row is blank. A row in a smooth scroll reaches its offset further each
-    /// way.
+    /// The foot (frame px) of the lowest row holding a glyph in columns `x0..x1` that reaches into
+    /// the band `y0..y1`, or `0` when every such row is blank. A row in a smooth scroll reaches its
+    /// offset further each way.
     fn lettered_foot(
         &self,
         input: &RenderInput,
@@ -14194,10 +14260,8 @@ impl GpuRenderer {
         let x1 = (hx1.saturating_add(cw)).min(w);
         let y1 = hot_top.min(h);
         let y0 = hot_top.saturating_sub(rise.ceil() as u32).min(y1);
-        // The haze never bends a letter: it rises through the blank rows over
-        // the hot band and fades out at the foot of the first lettered row
-        // (resampled by up to `SHIMMER_AMP_PX`, an echo's `e` over an Enter's
-        // flames fell to 2.84:1).
+        // The haze never bends a letter: it rises through the blank rows over the hot band and
+        // fades out at the foot of the first lettered row.
         let foot = self.lettered_foot(input, (x0, x1), (y0, y1), (cw, ch));
         let (y0, rise) = if foot > y0 {
             (foot.min(y1), y1.saturating_sub(foot) as f32)
@@ -15999,12 +16063,10 @@ impl GpuRenderer {
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 let (cell_x, ccw, _) = place(r, c, row_uniform, rcw);
                 if off_right(cell_x, ccw) {
-                    // Distinct branch.
                     if row_uniform {
-                        // Distinct branch.
                         break; // off the right edge of the clamped framebuffer — see vis_rows
                     }
-                    continue; // a mixed row's runs are not monotone in x — see the glyph loop
+                    continue; // a mixed row's runs are not monotone in x
                 }
                 let slot = &mut key_scratch[r * cols + c];
                 if !Self::drawable(cell) || (row_has_images && input.image_hides_glyph_at(r, c)) {
@@ -16549,12 +16611,10 @@ impl GpuRenderer {
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 let (cx, ccw, run) = place(r, c, row_uniform, rcw);
                 if off_right(cx, ccw) {
-                    // Distinct branch.
                     if row_uniform {
-                        // Distinct branch.
                         break; // off the right edge of the clamped framebuffer — see vis_rows
                     }
-                    continue; // a mixed row's runs are not monotone in x — see above
+                    continue; // a mixed row's runs are not monotone in x
                 }
                 let Some(key) = key_scratch[r * cols + c] else {
                     continue;
@@ -16820,12 +16880,10 @@ impl GpuRenderer {
                 };
                 let (cx, ccw, run) = place(r, c, row_uniform, rcw);
                 if off_right(cx, ccw) {
-                    // Distinct branch.
                     if row_uniform {
-                        // Distinct branch.
                         break; // off the right edge of the clamped framebuffer — see vis_rows
                     }
-                    continue; // a mixed row's runs are not monotone in x — see the base loop
+                    continue; // a mixed row's runs are not monotone in x
                 }
                 if !Self::drawable(cell)
                     || input.cluster_at(r, c).is_some()
@@ -17009,12 +17067,10 @@ impl GpuRenderer {
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 let (cx, ccw, run) = place(r, c, row_uniform, rcw);
                 if off_right(cx, ccw) {
-                    // Distinct branch.
                     if row_uniform {
-                        // Distinct branch.
                         break; // off the right edge of the clamped framebuffer — see vis_rows
                     }
-                    continue; // a mixed row's runs are not monotone in x — see the base loop
+                    continue; // a mixed row's runs are not monotone in x
                 }
                 if cell.wide
                     || (matches!(cell.underline, UnderlineStyle::None)
@@ -18360,7 +18416,8 @@ pub(crate) type PresentReplay = (Vec<u8>, [bool; 3]);
 
 #[cfg(all(target_os = "macos", test))]
 impl GpuRenderer {
-    /// The streams the most recent frame's plan drew, so differential fixtures can prove they drive the rows they claim.
+    /// The streams the most recent frame's plan drew, so differential fixtures can prove they
+    /// drive the rows they claim.
     #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_plan_streams_for_test(&self) -> Vec<(StreamId, DrawPipe)> {
         self.frame_plan
@@ -18369,7 +18426,7 @@ impl GpuRenderer {
             .collect()
     }
 
-    /// The recorded pass-0 load op, so a fixture can prove it exercised the scissored `Load` path rather than assuming the dirty diff engaged.
+    /// The recorded pass-0 load op, so a fixture can prove it exercised the scissored `Load` path.
     #[cfg(wgpu_arm)]
     pub(crate) fn last_frame_load_for_test(&self) -> crate::device_layer::FrameLoad {
         self.last_frame_load
@@ -18528,7 +18585,8 @@ impl GpuRenderer {
             "the differential replays the frame that was just encoded"
         );
         let ubuf = mint.buffer(std::mem::size_of::<Uniforms>())?;
-        // SAFETY: `Uniforms` is `Pod` into an exactly-sized fresh shared buffer with no GPU work in flight.
+        // SAFETY: `Uniforms` is `Pod` into an exactly-sized fresh shared buffer with no GPU work in
+        // flight.
         unsafe {
             crate::metal::ffi::buffer_write(
                 &ubuf,
@@ -18647,7 +18705,8 @@ impl GpuRenderer {
             }
             let palette_bytes: &[u8] = aterm_bits::cast_slice(&self.fx.palette);
             let palette = mint.buffer(palette_bytes.len().max(16))?;
-            // SAFETY: fresh shared buffer of at least the palette's length with no GPU work in flight.
+            // SAFETY: fresh shared buffer of at least the palette's length with no GPU work in
+            // flight.
             unsafe { crate::metal::ffi::buffer_write(&palette, palette_bytes) };
             let [r8, rgba] =
                 texes.map(|t| t.expect("sync_fx_tex mints a texture").tex.into_metal());
@@ -18917,7 +18976,8 @@ impl GpuRenderer {
 
         let offscreen =
             mint.texture_2d(PixelFormat::Rgba8Unorm, fw as usize, fh as usize, usage)?;
-        // SAFETY: fresh 2D managed texture of `fw x fh` seeded with `fw * fh * 4` tightly packed bytes.
+        // SAFETY: fresh 2D managed texture of `fw x fh` seeded with `fw * fh * 4` tightly packed
+        // bytes.
         unsafe {
             mtl::texture_upload(
                 offscreen.obj(),
@@ -19100,7 +19160,8 @@ impl GpuRenderer {
                     t.ph as usize,
                     TEXTURE_USAGE_SHADER_READ,
                 )?;
-                // SAFETY: fresh managed texture of `pw x ph` seeded with `pw * ph * 4` tightly packed RGBA bytes.
+                // SAFETY: fresh managed texture of `pw x ph` seeded with `pw * ph * 4` tightly
+                // packed RGBA bytes.
                 unsafe {
                     mtl::texture_upload(
                         card.obj(),
@@ -19716,7 +19777,8 @@ mod tests {
         }
     }
 
-    /// The fetch route moves every Unorm-law draw, and only those, onto its row's twin in the sRGB view, in the same order with the same counts, so a full plan is one pass; the record still counts the Unorm-law draws (the ablation's subject), under the route they took.
+    /// The fetch route moves exactly the Unorm-law draws onto their twins, in order and count, so a
+    /// full plan is one pass.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_fetch_route_draws_every_unorm_law_row_through_its_twin_in_one_pass() {
@@ -19786,7 +19848,8 @@ mod tests {
         );
     }
 
-    /// Route (1) of the pass economy: an opaque Exact Under fx is stored at the end of the base pass through the sRGB view, in the CPU's draw order, only while no cursor glow under the text sits between; its Unorm group then empties and its passes merge away.
+    /// Route (1): an opaque Exact Under fx stores at the end of the base pass only while no cursor
+    /// glow draws under the text.
     #[test]
     fn an_opaque_under_fx_stores_in_the_base_pass_only_without_a_glow_under() {
         let ctx = |under_opaque| FramePlanCtx {
@@ -20840,9 +20903,8 @@ mod tests {
         );
     }
 
-    /// A window that shrinks keeps its GL bloom half texture (the storage still holds the smaller
-    /// frame), and the halo drawn through that roomy storage is the one a window that never resized
-    /// draws, out to the frame's edge.
+    /// A shrunk window keeps its GL bloom half texture, and the halo drawn through that roomy
+    /// storage matches a never-resized window's out to the frame's edge.
     #[cfg(gl_arm)]
     #[test]
     fn a_bloom_through_kept_storage_matches_one_never_resized() {
@@ -21175,7 +21237,7 @@ mod tests {
         input
     }
 
-    /// One frame of [`glow_over_text`] on a fresh armed renderer that `setup` configured: the shape it took and how many framebuffer-fetch twins it built.
+    /// One [`glow_over_text`] frame on a fresh armed renderer: its shape and the fetch twins built.
     #[cfg(target_os = "macos")]
     fn glow_frame_on(setup: impl FnOnce(&mut GpuRenderer)) -> (FrameShape, usize) {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -21195,7 +21257,8 @@ mod tests {
         (gpu.frame_shape(), twins)
     }
 
-    /// FAIL CLOSED: a device whose framebuffer-fetch verdict is anything but Passed (it failed, its probe could not run, or it has no fetch) draws its Unorm-law light on the split, whatever route the renderer asks for: the frame pays its passes and builds no twin.
+    /// A device whose fetch verdict is anything but Passed draws its Unorm-law light on the split
+    /// whatever route the renderer asks for, building no twin.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_device_that_did_not_pass_the_probe_draws_its_unorm_light_on_the_split() {
@@ -21235,7 +21298,8 @@ mod tests {
         assert!(twins > 0);
     }
 
-    /// THE SHIPPED ROUTE: a renderer nothing configured routes Unorm-law light through framebuffer fetch, every Apple GPU has it, and this device passes its probe, so its default glow frame is one pass.
+    /// An unconfigured renderer routes Unorm-law light through fetch, every Apple GPU has fetch,
+    /// and on a device that passes its probe the default glow frame is one pass.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_default_route_is_the_fetch_and_this_device_takes_it() {
@@ -21273,7 +21337,8 @@ mod tests {
         assert!(twins > 0, "it drew through a twin");
     }
 
-    /// An armed renderer with every present pass on (the bloom, the shimmer, both crowns, a window on screen that may present f16), routing its Unorm-law light through framebuffer fetch.
+    /// An armed renderer with every present pass on (bloom, shimmer, both crowns, a window on
+    /// screen that may present f16), routing Unorm-law light through framebuffer fetch.
     #[cfg(target_os = "macos")]
     fn every_pass_on() -> GpuRenderer {
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -21288,7 +21353,9 @@ mod tests {
         gpu
     }
 
-    /// A default window's first frames on `gpu`, presented to a fresh `format` swapchain on a screen of `edr` headroom: a blank grid, then the first prompt (its cursor's aurora and a Claude card's fx layer), then the same prompt with an emoji.
+    /// A default window's first frames on `gpu`, presented to a fresh `format` swapchain on a
+    /// screen of `edr` headroom: a blank grid, the first prompt (cursor aurora and a Claude card's
+    /// fx layer), then the prompt with an emoji.
     #[cfg(target_os = "macos")]
     fn present_first_frames(
         gpu: &mut GpuRenderer,
@@ -21408,7 +21475,9 @@ mod tests {
         );
     }
 
-    /// THE PIPELINE WARM HANDS OVER: a renderer that asked for it before its arm minted starts it from the mint, the warm builds every row and twin it names on the shipped shaders, and once it handed them over a default window's first frames (every present pass on, at both swapchain formats) build no pipeline on the render thread. The control: the same frames without the warm build their own.
+    /// A warm asked for before the arm minted starts from the mint and hands over every row and
+    /// twin, so a default window's first frames build no pipeline on the render thread; without
+    /// the warm they build their own.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
@@ -21471,7 +21540,8 @@ mod tests {
         }
     }
 
-    /// A pass whose switch was off when the warm ran is warmed when the switch turns it on, and only then.
+    /// A pass whose switch was off when the warm ran is warmed when the switch turns it on, and
+    /// only then.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pass_switched_on_after_the_warm_is_warmed_then() {
@@ -21997,27 +22067,23 @@ impl<T> WindowTarget for T where
 {
 }
 
-/// The frontend's own presenter for one window, which the GL arm posts the
-/// window's frames through instead of a window surface where the window
-/// system's GL stalls it (an X11 window on NVIDIA's GLX under a compositing
-/// manager: every resize of a window with a `GLXWindow` stalls the X server
-/// and the GPU for every client). Handed to
-/// [`GpuRenderer::create_window_surface_with_sink`], which uses it only there.
+/// The frontend's own presenter for one window, which the GL arm posts frames through instead of
+/// a window surface where the window system's GL stalls it (X11 on NVIDIA's GLX under a
+/// compositor, where every resize of a `GLXWindow` stalls the X server and the GPU for every
+/// client). Handed to [`GpuRenderer::create_window_surface_with_sink`].
 #[cfg(target_os = "linux")]
 pub trait FrameSink: Send {
     /// Get ready to post. `Err` says why it cannot, and the window is posted
     /// through its window surface instead.
     fn attach(&mut self) -> Result<(), String>;
 
-    /// Post one `width` x `height` frame: size the store, wait until the
-    /// window system has read the last post, have `draw` write a rectangle of
-    /// the frame into the store (`0x00RRGGBB` words, rows top first, `width`
-    /// words a row), and post that rectangle. `damage` (`[x0, y0, x1, y1]`,
-    /// half-open) is the part of the frame that differs from the last post,
-    /// `None` all of it; the sink widens it to the whole frame wherever its
-    /// store does not hold the last post (the first post, a new size), and
-    /// hands `draw` the rectangle it settled on. An empty one posts nothing.
-    /// `draw`'s `Err` posts nothing and is returned.
+    /// Post one `width` x `height` frame: size the store, wait until the window system has read
+    /// the last post, have `draw` write a rectangle of the frame into the store (`0x00RRGGBB`
+    /// words, rows top first, `width` words a row), and post that rectangle. `damage`
+    /// (`[x0, y0, x1, y1]`, half-open; `None` for all of it) is the part that differs from the
+    /// last post; the sink widens it to the whole frame wherever its store does not hold the last
+    /// post (the first post, a new size) and hands `draw` the rectangle it settled on. An empty
+    /// one posts nothing; `draw`'s `Err` posts nothing and is returned.
     fn post(
         &mut self,
         width: u32,
@@ -22265,10 +22331,9 @@ mod atlas_upload_sync_tests {
         )
     }
 
-    /// An LRU rewrite: a tile evicted from a full atlas gives its region to
-    /// the next tile, written in place into the texture two frames in flight
-    /// sample, so the write first settles both; the texture is kept, only the
-    /// new tile's texels upload, and the region reads back as the new tile.
+    /// An fx region rewritten after an LRU eviction first settles both frames in flight that
+    /// sample it; the texture is kept, only the new tile's texels upload, and the region reads back
+    /// as the new tile.
     #[test]
     fn an_fx_region_rewrite_settles_every_frame_reader() {
         let _pool = AutoreleasePool::new();

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHERE A SLOW STEP'S TIME WENT: a mark at the end of each inner call ([`lap`]), kept only inside
+//! Where a slow step's time went: a mark at the end of each inner call ([`lap`]), kept only inside
 //! a timed run on the same thread ([`within`]), said in one line ([`Laps`]'s `Display`). A mark
 //! outside a run costs one thread-local look and keeps nothing.
 

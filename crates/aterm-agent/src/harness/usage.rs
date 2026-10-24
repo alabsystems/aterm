@@ -2549,11 +2549,11 @@ mod tests {
         include_str!("../../tests/testdata/vendor/2.1.278/screen/usage.txt");
 
     fn hint() -> String {
-        format!("   {}", aterm_phase::anchor("prompt.cancel"))
+        format!("   {}", aterm_phase::anchor!("prompt.cancel"))
     }
 
     fn retry_hints() -> String {
-        format!("   r to retry · {}", aterm_phase::anchor("prompt.cancel"))
+        format!("   r to retry · {}", aterm_phase::anchor!("prompt.cancel"))
     }
 
     fn settled() -> Vec<String> {

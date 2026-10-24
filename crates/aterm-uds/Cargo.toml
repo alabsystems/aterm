@@ -25,9 +25,9 @@ aterm-vitals = { workspace = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and
 # parser, which this crate re-exports and its `process` reads argv with; the
-# job probe's socket decoders (`jobs::darwin::unix_listener`,
+# job probe's socket table decoders (`jobs::darwin::unix_listeners`,
 # `jobs::linux::listening_unix`, `parse_fd_link`), which the listener-holder
-# scan (`holders::scan_listener_holders`) reads a socket's record with; on
+# scan (`holders::scan_listener_holders`) reads the kernel's socket table with; on
 # Windows, the one rule that places a kernel path under a directory across
 # Windows' spellings (`volumes::Table::is_under`, over the mount table it
 # reads): the path-user scan compares through it and nothing else; and the one

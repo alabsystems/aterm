@@ -1500,12 +1500,9 @@ const SLICE2_DOORS: [&str; 5] = [
     "host.task_fact",
 ];
 
-/// A SLICE-1 TAPE REPLAYS UNCHANGED (the slice-2 plan's 2.0 and D7): an observed break's tape
-/// whose header names none of slice 2's doors, as slice 1's build wrote it, reproduces on this
-/// build, every told word compared byte for byte at `host.occupancy_said`, as does the same tape
-/// under the header this build writes; the loop asked none of slice 2's doors. NEGATIVE
-/// CONTROL: the tape's first told word with a rule left out of its list, what a build telling
-/// another set of rules prints, diverges at `host.occupancy_said`.
+/// A slice-1 tape (no slice-2 doors in its header) reproduces, every told word compared byte for
+/// byte at `host.occupancy_said`, as does the same tape under this build's header. A told word
+/// with a rule left out of its list diverges there.
 #[test]
 fn a_slice_one_tape_replays_unchanged() {
     use crate::supervise::tape::codec::Item;
@@ -1603,13 +1600,10 @@ fn a_slice_one_tape_replays_unchanged() {
     assert_eq!(d.door.as_deref(), Some("host.occupancy_said"), "{d:?}");
 }
 
-/// A SLICE-1 TAPE OF A MANAGED WORKER'S LINE BEFORE ITS FIRST FOLD REPLAYS UNCHANGED (2.4's
-/// review): a prompt watch of a tasked worker whose due nudge comes before any fold, recorded as
-/// a build with no read of the record at the write recorded it (`ManagedUnread`), with slice 2's
-/// doors out of its header and off its tape, reproduces: the write reads the record only on a
-/// tape slice 2's doors recorded (`Session::managed_at_write`). This build's own recording reads
-/// it once and reproduces under its own header. NEGATIVE CONTROL: the unread tape under this
-/// build's header diverges, at the read it never recorded.
+/// A slice-1 tape of a managed worker's nudge before its first fold, recorded with no read of the
+/// record at the write (`ManagedUnread`), reproduces: the write reads the record only on a tape
+/// slice 2's doors recorded (`Session::managed_at_write`). Under this build's header it diverges
+/// at the read it never recorded.
 #[test]
 fn a_slice_one_tape_of_a_managed_workers_early_line_replays_unchanged() {
     use crate::supervise::occupancy::fault::{self, Fault};
@@ -1687,13 +1681,8 @@ fn a_slice_one_tape_of_a_managed_workers_early_line_replays_unchanged() {
     );
 }
 
-/// A RAISED WORD REPLAYS UNDER THE K ITS TAPE NAMES: a watch whose nudge the autopilot holds,
-/// its K shortened by the setup, tells its host a ready-idle line, and its tape reproduces, every
-/// told word compared byte for byte at `host.occupancy_said`, under the `[setup]
-/// occupancy.k_looks` its header carries. NEGATIVE CONTROL: the same tape with that row taken
-/// out, as the header of a build before the K clock reads (no K: `due::K_NEVER`), diverges at
-/// `host.occupancy_said`: the replay tells no raise, and asks its next effect where the tape holds
-/// the raised word.
+/// A ready-idle word replays under the `[setup] occupancy.k_looks` its header carries; with that
+/// row taken out (no K: `due::K_NEVER`) the replay tells no raise and diverges at the told word.
 #[test]
 fn a_ready_idle_word_replays_under_the_k_its_tape_names() {
     use crate::supervise::tape::recover::recover;
@@ -1759,7 +1748,7 @@ fn assert_diverged_at_the_told_word(report: &crate::supervise::tape::report::Rep
 }
 
 /// A watch whose nudge the autopilot holds past ten looks, recorded under a K none of its lines
-/// reaches (what a build with no K clock told): its header, as `header` rewrites it, and items.
+/// reaches (what a build with no K clock told): its encoded header and its items.
 fn unraised_watch(tag: &str) -> (String, Vec<crate::supervise::tape::codec::Item>) {
     use crate::supervise::tape::recover::recover;
     let (dir, ledger) = ledger_at(tag);
@@ -1815,12 +1804,9 @@ fn as_recorded(header: &str, k: Option<i64>, slice1: bool) -> String {
         .collect()
 }
 
-/// A TAPE A BUILD BEFORE THE K CLOCK WROTE REPLAYS UNCHANGED: slice 2's doors in its header and
-/// no `[setup] occupancy.k_looks` row (what the builds of sub-slices 2.0 to 2.2 wrote), of a nudge
-/// the autopilot held past ten looks, reproduces: the row's absence reads as no K
-/// (`due::K_NEVER`), so no told word names a line ready-idle; as does that tape with slice 2's
-/// doors out too (slice 1's). NEGATIVE CONTROL: the same tape under the shipped K, the row
-/// `occupancy.k_looks=10`, diverges at the told word that K raises.
+/// A tape from before the K clock (no `[setup] occupancy.k_looks` row) replays unraised, with or
+/// without slice 2's doors: the row's absence reads as no K (`due::K_NEVER`). Under the shipped
+/// K it diverges at the told word K raises.
 #[test]
 fn a_tape_from_before_the_k_clock_replays_unraised() {
     use crate::supervise::tape::replay::{Options, replay};
@@ -1840,11 +1826,9 @@ fn a_tape_from_before_the_k_clock_replays_unraised() {
     assert_diverged_at_the_told_word(&replayed(Some(k), false));
 }
 
-/// A SLICE-1 TAPE TELLS NO READY-IDLE LINE, WHATEVER K ITS HEADER NAMES (the slice-2 plan's D7):
-/// the tape above with slice 2's doors out of its header and the shipped K in, reproduces: the
-/// told word's `ready_idle` is held to slice 1's shape where the recording lacks slice 2's doors
-/// (`Fx::slice2_recorded`). NEGATIVE CONTROL: the same K with slice 2's doors in diverges at the
-/// told word it raises, so the doors alone kept the slice-1 tape's words.
+/// A slice-1 tape tells no ready-idle line whatever K its header names: `ready_idle` keeps slice
+/// 1's shape where the recording lacks slice 2's doors (`Fx::slice2_recorded`). With the doors in,
+/// the same K diverges at the word it raises.
 #[test]
 fn a_slice_one_tape_tells_no_ready_idle_line_whatever_its_k() {
     use crate::supervise::tape::replay::{Options, replay};

@@ -3,7 +3,7 @@
 
 use super::fixtures::{CONCURRENT_LIMIT, DRAFT, IDLE, SIGNED_OUT_TURN, WALL_QUOTA};
 use super::*;
-use crate::prompt::fixtures::screen;
+use crate::prompt::fixtures::{bash_one_row, composer as claude_composer, rows, screen};
 use crate::reader::{Program, identify, program_of, read};
 use crate::wall::{Placement, WallKind};
 
@@ -114,5 +114,67 @@ fn kimi_s_screens_are_its_own_by_name_and_by_sight() {
     assert_eq!(
         identify(Some("less"), &screen(IDLE)).program(),
         Program::Generic
+    );
+}
+
+/// Kimi Code's welcome box as a Claude Code transcript quotes it, `indent` columns in: five
+/// under its Bash tool's `⎿` (`aterm ctl text` of a Kimi tab), two in its own reply.
+fn quoted_welcome(indent: usize) -> Vec<String> {
+    let pad = " ".repeat(indent);
+    let edge = "─".repeat(40);
+    vec![
+        format!("{pad}╭{edge}╮"),
+        format!("{pad}│{}│", " ".repeat(40)),
+        format!("{pad}│  ▐█▛█▛█▌  Welcome to Kimi Code!{}│", " ".repeat(8)),
+        format!("{pad}│  ▐█████▌  Run /login or /provider to get started.│"),
+        format!("{pad}╰{edge}╯"),
+    ]
+}
+
+/// A CLAUDE CODE SCREEN QUOTING KIMI CODE'S WELCOME IS STILL CLAUDE CODE'S, whatever runtime hosts
+/// it (none named, `node` for an npm install, `ssh`, `tmux`): the welcome box in its Bash tool's
+/// output or its reply, above its own composer, and a box of its own under such a quote, read as
+/// its box. CONTROL: the welcome box with no Claude Code frame under it is Kimi Code's by sight,
+/// and Claude Code's screens unquoted are its own.
+#[test]
+fn a_claude_code_screen_quoting_kimi_codes_welcome_is_still_claude_codes() {
+    let mut tool = rows(&["⏺ Bash(aterm ctl @s-kimi text | head -5)"]);
+    let mut quote = quoted_welcome(5);
+    quote[0] = format!("  ⎿  {}", quote[0].trim_start());
+    tool.extend(quote);
+    tool.extend(rows(&["", "⏺ That tab is Kimi Code at its welcome.", ""]));
+    let mut reply = rows(&["⏺ Its screen opens so:", ""]);
+    reply.extend(quoted_welcome(2));
+    reply.push(String::new());
+    for (what, above) in [("tool output", &tool), ("a reply", &reply)] {
+        let mut claude = above.clone();
+        claude.extend(claude_composer("  ? for shortcuts"));
+        for program in [None, Some("node"), Some("ssh"), Some("tmux")] {
+            assert_eq!(
+                identify(program, &claude).program(),
+                Program::Claude,
+                "{what} under {program:?}"
+            );
+        }
+        let mut boxed = above.clone();
+        boxed.extend(bash_one_row());
+        let reading = read(Some("node"), &boxed, None);
+        assert_eq!(reading.program, Program::Claude, "{what}: its box");
+        assert!(reading.prompt.is_some(), "{what}: its box is read");
+
+        assert!(
+            is_kimi_screen(above),
+            "CONTROL: the quote alone is Kimi Code's by sight"
+        );
+        assert_eq!(identify(None, above).program(), Program::Kimi, "CONTROL");
+    }
+    assert_eq!(
+        identify(Some("node"), &claude_composer("  ? for shortcuts")).program(),
+        Program::Claude
+    );
+    let unquoted = read(Some("node"), &bash_one_row(), None);
+    assert!(
+        unquoted.prompt.is_some(),
+        "CONTROL: Claude Code's box alone"
     );
 }

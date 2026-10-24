@@ -3,7 +3,6 @@
 
 //! Muse Code (`muse`) terminal screen grammar, prompt/card parsers, and phase classifier.
 
-use crate::anchors::anchor_text;
 use crate::phase::{Phase, is_rule, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
 use crate::text::blank;
@@ -38,7 +37,7 @@ fn is_panel_head(row: &str) -> bool {
     let t = crate::text::trim_end(row);
     t == "main"
         || t.strip_prefix("main · ")
-            .is_some_and(|rest| rest == const { anchor_text("muse.panel.select") })
+            .is_some_and(|rest| rest == const { crate::anchor!("muse.panel.select") })
 }
 
 fn is_panel_row(row: &str) -> bool {
@@ -93,9 +92,11 @@ fn any_frame(rows: &[String]) -> Option<Frame> {
 
 fn frame(rows: &[String]) -> Option<Frame> {
     any_frame(rows).filter(|f| {
-        !crate::text::contains(&rows[f.top], const { anchor_text("muse.sidechat.label") })
-            && !crate::text::trim(&rows[f.footer])
-                .ends_with(const { anchor_text("muse.sidechat.footer") })
+        !crate::text::contains(
+            &rows[f.top],
+            const { crate::anchor!("muse.sidechat.label") },
+        ) && !crate::text::trim(&rows[f.footer])
+            .ends_with(const { crate::anchor!("muse.sidechat.footer") })
     })
 }
 
@@ -162,7 +163,7 @@ pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
 const STATUS_GLYPHS: [char; 3] = ['◇', '◈', '◆'];
 
 fn is_status_row(row: &str) -> bool {
-    let hint = const { anchor_text("muse.busy.interrupt") };
+    let hint = const { crate::anchor!("muse.busy.interrupt") };
     row.starts_with(STATUS_GLYPHS)
         && crate::text::trim_end(row)
             .strip_suffix(')')
@@ -172,7 +173,7 @@ fn is_status_row(row: &str) -> bool {
 fn is_status_first_frame(row: &str) -> bool {
     row.strip_prefix(STATUS_GLYPHS[0])
         .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|r| crate::text::trim_end(r) == const { anchor_text("muse.busy.first") })
+        .is_some_and(|r| crate::text::trim_end(r) == const { crate::anchor!("muse.busy.first") })
 }
 
 fn is_reply_head(row: &str) -> bool {
@@ -181,7 +182,7 @@ fn is_reply_head(row: &str) -> bool {
 
 fn is_banner_row(row: &str) -> bool {
     crate::text::trim(row)
-        .strip_prefix(const { anchor_text("muse.banner") })
+        .strip_prefix(const { crate::anchor!("muse.banner") })
         .and_then(|v| v.strip_prefix(' '))
         .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
 }
@@ -227,10 +228,10 @@ fn status_head(rows: &[String]) -> Option<(usize, Option<&str>)> {
     let (i, row) = rows.iter().enumerate().rev().find(|(_, row)| {
         row.strip_prefix('│')
             .map(crate::text::trim_start)
-            .is_some_and(|text| text.starts_with(const { anchor_text("muse.card.status") }))
+            .is_some_and(|text| text.starts_with(const { crate::anchor!("muse.card.status") }))
     })?;
     let state = card_text(row)
-        .and_then(|text| text.strip_prefix(const { anchor_text("muse.card.status") }))
+        .and_then(|text| text.strip_prefix(const { crate::anchor!("muse.card.status") }))
         .and_then(|text| text.rsplit_once(' ').map(|(_, state)| state))
         .filter(|state| !state.is_empty() && state.bytes().all(|b| b.is_ascii_uppercase()));
     Some((i, state))
@@ -242,17 +243,17 @@ fn status_spent_none(rows: &[String]) -> bool {
             .iter()
             .take_while(|r| r.starts_with('│'))
             .filter_map(|r| card_text(r))
-            .find_map(|t| t.strip_prefix(const { anchor_text("muse.card.usage") }))
+            .find_map(|t| t.strip_prefix(const { crate::anchor!("muse.card.usage") }))
             .and_then(|spent| crate::text::trim(spent).split_once(' '))
             .is_some_and(|(count, unit)| {
-                count == "0" && unit.starts_with(const { anchor_text("muse.card.tokens") })
+                count == "0" && unit.starts_with(const { crate::anchor!("muse.card.tokens") })
             })
     })
 }
 
 fn usage_turns(rows: &[String]) -> Option<u64> {
     rows.iter().rev().find_map(|r| {
-        let count = card_text(r)?.strip_prefix(const { anchor_text("muse.card.turns") })?;
+        let count = card_text(r)?.strip_prefix(const { crate::anchor!("muse.card.turns") })?;
         let count = count.strip_prefix(' ').map(crate::text::trim)?;
         (!count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
             .then(|| count.parse().ok())
@@ -270,14 +271,14 @@ enum Rest {
 
 fn carded(rows: &[String]) -> Turn {
     match card_state(rows) {
-        Some(s) if s == const { anchor_text("muse.card.idle") } && status_spent_none(rows) => {
+        Some(s) if s == const { crate::anchor!("muse.card.idle") } && status_spent_none(rows) => {
             Turn::Fresh
         }
-        Some(s) if s == const { anchor_text("muse.card.completed") } => {
+        Some(s) if s == const { crate::anchor!("muse.card.completed") } => {
             Turn::Carded(Rest::Completed)
         }
-        Some(s) if s == const { anchor_text("muse.card.failed") } => Turn::Carded(Rest::Failed),
-        Some(s) if s == const { anchor_text("muse.card.cancelled") } => {
+        Some(s) if s == const { crate::anchor!("muse.card.failed") } => Turn::Carded(Rest::Failed),
+        Some(s) if s == const { crate::anchor!("muse.card.cancelled") } => {
             Turn::Carded(Rest::Cancelled)
         }
         Some(_) => Turn::Unknown,
@@ -292,7 +293,7 @@ fn is_view_hint(rows: &[String], i: usize) -> bool {
     leading_spaces(&rows[i]) == 2
         && i.checked_sub(1).is_some_and(|above| blank(&rows[above]))
         && crate::text::trim(&rows[i])
-            .strip_prefix(const { anchor_text("muse.panel.view") })
+            .strip_prefix(const { crate::anchor!("muse.panel.view") })
             .and_then(|kind| kind.strip_suffix(')'))
             .is_some_and(|kind| !kind.is_empty() && kind.chars().all(|c| c.is_ascii_lowercase()))
 }
@@ -306,7 +307,7 @@ fn in_abnormal_end(rows: &[String], i: usize) -> bool {
         s.checked_sub(1).is_some_and(|above| blank(&rows[above]))
             && crate::text::trim(&rows[s])
                 .strip_prefix("warning: ")
-                .is_some_and(|w| w.starts_with(const { anchor_text("muse.resume.abnormal") }))
+                .is_some_and(|w| w.starts_with(const { crate::anchor!("muse.resume.abnormal") }))
     })
 }
 
@@ -397,13 +398,13 @@ fn read_rows(
 fn read_row(row: &str) -> bool {
     leading_spaces(row) == 2
         && crate::text::trim(row)
-            .strip_prefix(const { anchor_text("muse.tool.read") })
+            .strip_prefix(const { crate::anchor!("muse.tool.read") })
             .is_some_and(names_a_path)
 }
 
 fn search_row(row: &str) -> bool {
     let Some(rest) = crate::text::trim(row)
-        .strip_prefix(const { anchor_text("muse.tool.searched") })
+        .strip_prefix(const { crate::anchor!("muse.tool.searched") })
         .filter(|_| leading_spaces(row) == 2)
     else {
         return false;
@@ -434,13 +435,13 @@ fn branched(rows: &[String], head: usize) -> bool {
 
 fn is_own_row_head(row: &str) -> bool {
     row.strip_prefix("◆ ").is_some_and(|r| {
-        crate::text::trim_end(r) == const { anchor_text("muse.queued") }
-            || r.starts_with(const { anchor_text("muse.recap") })
-            || r.starts_with(const { anchor_text("muse.notice.message") })
-            || r.strip_prefix(const { anchor_text("muse.worked") })
+        crate::text::trim_end(r) == const { crate::anchor!("muse.queued") }
+            || r.starts_with(const { crate::anchor!("muse.recap") })
+            || r.starts_with(const { crate::anchor!("muse.notice.message") })
+            || r.strip_prefix(const { crate::anchor!("muse.worked") })
                 .and_then(|t| t.split_once(" · "))
                 .is_some_and(|(took, _)| is_elapsed(took))
-            || r.strip_prefix(const { anchor_text("muse.notice.finished") })
+            || r.strip_prefix(const { crate::anchor!("muse.notice.finished") })
                 .and_then(|t| t.rsplit_once(" · "))
                 .is_some_and(|(_, took)| is_elapsed(took))
     })
@@ -486,14 +487,18 @@ fn notice(rows: &[String]) -> Option<(usize, String)> {
 }
 
 fn interrupting(rows: &[String], f: Frame) -> bool {
-    footer_says(rows, f, const { anchor_text("muse.footer.interrupting") })
+    footer_says(
+        rows,
+        f,
+        const { crate::anchor!("muse.footer.interrupting") },
+    )
 }
 
 fn steering(rows: &[String], f: Frame) -> bool {
     [
-        anchor_text("muse.footer.steering"),
-        anchor_text("muse.footer.queued"),
-        anchor_text("muse.footer.replacing"),
+        crate::anchor!("muse.footer.steering"),
+        crate::anchor!("muse.footer.queued"),
+        crate::anchor!("muse.footer.replacing"),
     ]
     .iter()
     .any(|said| footer_says(rows, f, said))
@@ -513,7 +518,7 @@ pub fn title_runs(title: &str) -> bool {
     let mut chars = title.chars();
     chars
         .next()
-        .is_some_and(|c| const { anchor_text("muse.title.spinner") }.contains(c))
+        .is_some_and(|c| const { crate::anchor!("muse.title.spinner") }.contains(c))
         && chars.next() == Some(' ')
 }
 
@@ -537,9 +542,9 @@ fn panel_work(row: &str) -> Option<&'static str> {
     if !is_elapsed(took) {
         return None;
     }
-    if *state == const { anchor_text("muse.panel.running") } {
+    if *state == const { crate::anchor!("muse.panel.running") } {
         Some(WORK_RUNNING)
-    } else if *state == const { anchor_text("muse.panel.watching") } {
+    } else if *state == const { crate::anchor!("muse.panel.watching") } {
         Some(MONITOR_WATCHING)
     } else {
         None
@@ -558,7 +563,8 @@ fn work(rows: &[String]) -> Option<&'static str> {
     named(WORK_RUNNING).or_else(|| named(MONITOR_WATCHING))
 }
 
-/// Returns the background-work kind.
+/// The background work the panel under the composer names (running work, else a watching
+/// monitor) while no turn runs: idle, at a question, or limited.
 #[must_use]
 pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     let what = work(rows)?;
@@ -638,9 +644,9 @@ pub fn message_drawn(rows: &[String]) -> bool {
     scope(rows, top).1.is_some()
 }
 
-/// MUSE CODE HAS DRAWN ON `rows` ([`crate::ScreenReader::program_drawn`]): a composer's frame
-/// (its side chat's too), a box, its sign-in screen, or its launch card. The shell's own lines
-/// before it draws (the prompt and the command line that launched it) are none of these.
+/// Whether Muse Code has drawn on `rows` ([`crate::ScreenReader::program_drawn`]): a composer's
+/// frame (its side chat's too), a box, its sign-in screen, or its launch card, none of which the
+/// shell's prompt and launch line are.
 #[must_use]
 pub fn program_drawn(rows: &[String]) -> bool {
     any_frame(rows).is_some() || is_muse_screen(rows) || launch_card_scan(rows).0.is_some()
@@ -661,16 +667,16 @@ pub fn end_hidden(rows: &[String]) -> bool {
 }
 
 const TOOL_HEADS: [&str; 3] = [
-    anchor_text("muse.tool.ran"),
-    anchor_text("muse.tool.wrote"),
-    anchor_text("muse.tool.edited"),
+    crate::anchor!("muse.tool.ran"),
+    crate::anchor!("muse.tool.wrote"),
+    crate::anchor!("muse.tool.edited"),
 ];
 
 const NAMED_TOOL_HEADS: [&str; 4] = [
-    anchor_text("muse.tool.read_memory"),
-    anchor_text("muse.tool.saved_memory"),
-    anchor_text("muse.tool.read_goal"),
-    anchor_text("muse.tool.used"),
+    crate::anchor!("muse.tool.read_memory"),
+    crate::anchor!("muse.tool.saved_memory"),
+    crate::anchor!("muse.tool.read_goal"),
+    crate::anchor!("muse.tool.used"),
 ];
 
 fn tool_row(head: &str) -> bool {
@@ -717,14 +723,14 @@ fn duration(text: &str) -> bool {
 
 /// Muse Code's tool rows that draw no outcome branch ([`tool_block`]).
 fn bare_tool_row(head: &str) -> bool {
-    head.strip_prefix(const { anchor_text("muse.tool.fetched") })
+    head.strip_prefix(const { crate::anchor!("muse.tool.fetched") })
         .and_then(|rest| rest.strip_prefix(' '))
         .is_some_and(|rest| {
             let token = rest.split(' ').next().unwrap_or_default();
             is_url(token) && own_tail(&rest[token.len()..], true)
         })
         || head
-            .strip_prefix(const { anchor_text("muse.tool.invalid_work") })
+            .strip_prefix(const { crate::anchor!("muse.tool.invalid_work") })
             .is_some_and(|tail| own_tail(tail, false))
 }
 
@@ -800,7 +806,7 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     let (at, lines) = ended(rows)?;
     let head = *lines.first()?;
     let (_, message) = notice(rows)?;
-    if head == const { anchor_text("muse.turn.interrupted") }
+    if head == const { crate::anchor!("muse.turn.interrupted") }
         || tool_block(&lines)
         || branched(rows, at)
         || wall_of(&message).is_some()
@@ -886,7 +892,7 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
             continue;
         };
         let message = lines.join(" ");
-        if top == const { anchor_text("muse.turn.interrupted") }
+        if top == const { crate::anchor!("muse.turn.interrupted") }
             || tool_block(&lines)
             || wall_of(&message).is_some()
             || is_fault(&message)
@@ -900,9 +906,9 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
 
 fn is_fault(message: &str) -> bool {
     [
-        anchor_text("muse.fault.config"),
-        anchor_text("muse.fault.prepare"),
-        anchor_text("muse.fault.state"),
+        crate::anchor!("muse.fault.config"),
+        crate::anchor!("muse.fault.prepare"),
+        crate::anchor!("muse.fault.state"),
     ]
     .iter()
     .any(|f| message.starts_with(f))
@@ -916,53 +922,53 @@ fn faulted(rows: &[String]) -> bool {
 #[must_use]
 pub fn interrupted(rows: &[String]) -> bool {
     ended(rows).is_some_and(|(_, lines)| {
-        lines.first().copied() == Some(const { anchor_text("muse.turn.interrupted") })
+        lines.first().copied() == Some(const { crate::anchor!("muse.turn.interrupted") })
     }) || rests_on(rows) == Some(Rest::Cancelled)
 }
 
 fn signed_out(rows: &[String]) -> Option<usize> {
     let end = rows.iter().rposition(|r| !blank(r))?;
-    if crate::text::trim(&rows[end]) != const { anchor_text("muse.signin.keys") } {
+    if crate::text::trim(&rows[end]) != const { crate::anchor!("muse.signin.keys") } {
         return None;
     }
     rows[..end].iter().rposition(|r| {
-        crate::text::trim(r).starts_with(const { anchor_text("muse.signin.browser") })
+        crate::text::trim(r).starts_with(const { crate::anchor!("muse.signin.browser") })
     })
 }
 
 fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
     let auth = [
-        anchor_text("muse.wall.key"),
-        anchor_text("muse.wall.saved_key"),
-        anchor_text("muse.wall.no_login"),
-        anchor_text("muse.wall.payment_api"),
-        anchor_text("muse.wall.payment_muse"),
-        anchor_text("muse.wall.onboarding"),
+        crate::anchor!("muse.wall.key"),
+        crate::anchor!("muse.wall.saved_key"),
+        crate::anchor!("muse.wall.no_login"),
+        crate::anchor!("muse.wall.payment_api"),
+        crate::anchor!("muse.wall.payment_muse"),
+        crate::anchor!("muse.wall.onboarding"),
     ];
     let lost = [
-        anchor_text("muse.wall.invalid"),
-        anchor_text("muse.wall.missing"),
-        anchor_text("muse.wall.denied"),
-        anchor_text("muse.wall.canceled"),
-        anchor_text("muse.wall.unreachable"),
+        crate::anchor!("muse.wall.invalid"),
+        crate::anchor!("muse.wall.missing"),
+        crate::anchor!("muse.wall.denied"),
+        crate::anchor!("muse.wall.canceled"),
+        crate::anchor!("muse.wall.unreachable"),
     ];
     if auth.contains(&message) || lost.iter().any(|l| message.starts_with(l)) {
         return Some((WallKind::Auth, None));
     }
-    if let Some(rest) = message.strip_prefix(const { anchor_text("muse.wall.usage") }) {
+    if let Some(rest) = message.strip_prefix(const { crate::anchor!("muse.wall.usage") }) {
         if matches!(rest, "" | ".") {
             return Some((WallKind::UsageSession, None));
         }
-        let rest = rest.strip_prefix(const { anchor_text("muse.wall.usage.upgrade") })?;
-        let (_, tail) = rest.split_once(const { anchor_text("muse.wall.usage.more") })?;
+        let rest = rest.strip_prefix(const { crate::anchor!("muse.wall.usage.upgrade") })?;
+        let (_, tail) = rest.split_once(const { crate::anchor!("muse.wall.usage.more") })?;
         let reset = tail
-            .split_once(const { anchor_text("muse.wall.usage.reset") })
+            .split_once(const { crate::anchor!("muse.wall.usage.reset") })
             .map(|(_, at)| crate::text::trim(at).trim_end_matches('.').to_string())
             .filter(|at| !at.is_empty());
         return Some((WallKind::UsageSession, reset));
     }
     if let Some((_, tail)) = message
-        .strip_prefix(const { anchor_text("muse.wall.quota") })
+        .strip_prefix(const { crate::anchor!("muse.wall.quota") })
         .and_then(|r| r.split_once(" quota"))
     {
         let reset = tail
@@ -972,9 +978,9 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
             .filter(|at| !at.is_empty());
         return Some((WallKind::UsageSession, reset));
     }
-    let rest = message.strip_prefix(const { anchor_text("muse.wall.model_failed") })?;
+    let rest = message.strip_prefix(const { crate::anchor!("muse.wall.model_failed") })?;
     let code = rest
-        .strip_prefix(const { anchor_text("muse.wall.api_error") })
+        .strip_prefix(const { crate::anchor!("muse.wall.api_error") })
         .and_then(|r| r.get(..4))
         .and_then(|c| c.strip_suffix(':'))
         .and_then(|c| c.parse::<u16>().ok());
@@ -998,23 +1004,23 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
 #[must_use]
 pub fn remedy(message: &str) -> Option<String> {
     let m = crate::text::trim(message);
-    if m == const { anchor_text("muse.wall.key") } {
+    if m == const { crate::anchor!("muse.wall.key") } {
         let (_, r) = m.split_once(" — ")?;
         return Some(
             r.strip_suffix(" it")
                 .map_or_else(|| r.to_string(), |verb| format!("{verb} META_API_KEY")),
         );
     }
-    if m == const { anchor_text("muse.wall.saved_key") } {
+    if m == const { crate::anchor!("muse.wall.saved_key") } {
         return m.split_once(" — ").map(|(_, r)| r.to_string());
     }
-    if m == const { anchor_text("muse.wall.no_login") } {
+    if m == const { crate::anchor!("muse.wall.no_login") } {
         return m.split_once("; ").map(|(_, r)| r.to_string());
     }
     if [
-        anchor_text("muse.wall.payment_api"),
-        anchor_text("muse.wall.payment_muse"),
-        anchor_text("muse.wall.onboarding"),
+        crate::anchor!("muse.wall.payment_api"),
+        crate::anchor!("muse.wall.payment_muse"),
+        crate::anchor!("muse.wall.onboarding"),
     ]
     .contains(&m)
     {
@@ -1061,9 +1067,9 @@ pub fn retrying(rows: &[String]) -> Option<Retry> {
     }
     let status = (0..f.top).rev().find(|&i| is_status_row(&rows[i]))?;
     let t = crate::text::trim(rows.get(status + 1)?.strip_prefix("└ ")?);
-    let rest = t.strip_prefix(const { anchor_text("muse.retry.api") })?;
-    let (reason, tail) = rest.split_once(const { anchor_text("muse.retry.in") })?;
-    let (wait, attempt) = tail.split_once(const { anchor_text("muse.retry.attempt") })?;
+    let rest = t.strip_prefix(const { crate::anchor!("muse.retry.api") })?;
+    let (reason, tail) = rest.split_once(const { crate::anchor!("muse.retry.in") })?;
+    let (wait, attempt) = tail.split_once(const { crate::anchor!("muse.retry.attempt") })?;
     let (k, n) = attempt.split_once('/')?;
     let code = reason
         .rsplit_once("(HTTP ")
@@ -1083,12 +1089,12 @@ fn option(row: &str) -> Option<(u8, &str, bool)> {
 
 fn trust_box(rows: &[String]) -> Option<(usize, std::ops::Range<usize>, usize)> {
     let keys = rows.iter().rposition(|r| !blank(r))?;
-    if !crate::text::trim(&rows[keys]).ends_with(const { anchor_text("muse.trust.keys") }) {
+    if !crate::text::trim(&rows[keys]).ends_with(const { crate::anchor!("muse.trust.keys") }) {
         return None;
     }
     let title = rows[..keys]
         .iter()
-        .position(|r| crate::text::trim(r) == const { anchor_text("muse.trust.title") })?;
+        .position(|r| crate::text::trim(r) == const { crate::anchor!("muse.trust.title") })?;
     let first = (title + 1..keys).find(|&i| option(&rows[i]).is_some())?;
     let end = (first..keys)
         .find(|&i| option(&rows[i]).is_none())
@@ -1115,9 +1121,9 @@ fn trust_prompt(
         .collect();
     if sound(&options) {
         for o in &mut options {
-            o.role = if o.label == const { anchor_text("muse.trust.yes") } {
+            o.role = if o.label == const { crate::anchor!("muse.trust.yes") } {
                 Role::Trust
-            } else if o.label == const { anchor_text("muse.trust.quit") } {
+            } else if o.label == const { crate::anchor!("muse.trust.quit") } {
                 Role::Exit
             } else {
                 Role::Other
@@ -1126,7 +1132,7 @@ fn trust_prompt(
     }
     let path = rows[title + 1..opts.start].iter().find_map(|r| {
         crate::text::trim(r)
-            .strip_prefix(const { anchor_text("muse.trust.path") })
+            .strip_prefix(const { crate::anchor!("muse.trust.path") })
             .map(|p| crate::text::trim(p).to_string())
     });
     let footer = crate::text::trim(&rows[keys]).to_string();
@@ -1198,14 +1204,14 @@ struct Approval {
 }
 
 const TOP_LABELS: [&str; 8] = [
-    anchor_text("muse.composer.voice"),
-    anchor_text("muse.composer.voice_prefix"),
-    anchor_text("muse.composer.talk"),
-    anchor_text("muse.composer.recording"),
-    anchor_text("muse.composer.transcribing"),
-    anchor_text("muse.composer.offline"),
-    anchor_text("muse.composer.error"),
-    anchor_text("muse.sidechat.label"),
+    crate::anchor!("muse.composer.voice"),
+    crate::anchor!("muse.composer.voice_prefix"),
+    crate::anchor!("muse.composer.talk"),
+    crate::anchor!("muse.composer.recording"),
+    crate::anchor!("muse.composer.transcribing"),
+    crate::anchor!("muse.composer.offline"),
+    crate::anchor!("muse.composer.error"),
+    crate::anchor!("muse.sidechat.label"),
 ];
 
 fn labelled(rule: &str) -> bool {
@@ -1215,7 +1221,7 @@ fn labelled(rule: &str) -> bool {
 fn approval_box(rows: &[String]) -> Option<Approval> {
     let (bottom, _) = bottom_and_footer(rows)?;
     let end = (0..bottom).rev().find(|&i| !blank(&rows[i]))?;
-    let hint = crate::text::trim(&rows[end]) == const { anchor_text("muse.box.permissions") };
+    let hint = crate::text::trim(&rows[end]) == const { crate::anchor!("muse.box.permissions") };
     let last = if hint {
         (0..end).rev().find(|&i| !blank(&rows[i]))?
     } else {
@@ -1273,13 +1279,13 @@ fn is_edge_tail(row: &str) -> bool {
 
 fn approval_kind(title: &str, write_path: bool, url: bool, tool: bool) -> PromptKind {
     let t = crate::text::trim(title);
-    if t == const { anchor_text("muse.box.shell") } {
+    if t == const { crate::anchor!("muse.box.shell") } {
         PromptKind::Bash
-    } else if t == const { anchor_text("muse.box.file") } && write_path {
+    } else if t == const { crate::anchor!("muse.box.file") } && write_path {
         PromptKind::Write
-    } else if t == const { anchor_text("muse.box.network") } && url {
+    } else if t == const { crate::anchor!("muse.box.network") } && url {
         PromptKind::NetworkRequest
-    } else if t == const { anchor_text("muse.box.tool") } && tool {
+    } else if t == const { crate::anchor!("muse.box.tool") } && tool {
         PromptKind::Tool
     } else {
         PromptKind::Other
@@ -1287,14 +1293,14 @@ fn approval_kind(title: &str, write_path: bool, url: bool, tool: bool) -> Prompt
 }
 
 fn approval_role(label: &str) -> Role {
-    if label == const { anchor_text("muse.box.once") }
-        || label == const { anchor_text("muse.box.stage_once") }
+    if label == const { crate::anchor!("muse.box.once") }
+        || label == const { crate::anchor!("muse.box.stage_once") }
     {
         Role::Once
     } else if label == "No"
         || label.starts_with("No,")
-        || label == const { anchor_text("muse.box.stage_abort") }
-        || label == const { anchor_text("muse.box.reject") }
+        || label == const { crate::anchor!("muse.box.stage_abort") }
+        || label == const { crate::anchor!("muse.box.reject") }
     {
         Role::Deny
     } else if (label.starts_with("Yes,") || label.starts_with("Yes "))
@@ -1303,7 +1309,7 @@ fn approval_role(label: &str) -> Role {
         Role::Session
     } else if label.starts_with("Yes,")
         || label.starts_with("Yes ")
-        || label.starts_with(const { anchor_text("muse.box.always_prefix") })
+        || label.starts_with(const { crate::anchor!("muse.box.always_prefix") })
     {
         Role::Persist
     } else {
@@ -1312,9 +1318,9 @@ fn approval_role(label: &str) -> Role {
 }
 
 fn is_stage_row(t: &str) -> bool {
-    t.starts_with(const { anchor_text("muse.box.stage_skipped") })
-        || t.starts_with(const { anchor_text("muse.box.stage_argv") })
-        || t.strip_prefix(const { anchor_text("muse.box.stage") })
+    t.starts_with(const { crate::anchor!("muse.box.stage_skipped") })
+        || t.starts_with(const { crate::anchor!("muse.box.stage_argv") })
+        || t.strip_prefix(const { crate::anchor!("muse.box.stage") })
             .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
 }
 
@@ -1350,7 +1356,7 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
                 .collect()
         })
         .unwrap_or_default();
-    let write_label = const { anchor_text("muse.box.write_path") }.trim_end();
+    let write_label = const { crate::anchor!("muse.box.write_path") }.trim_end();
     let path = body
         .clone()
         .find(|&i| {
@@ -1366,7 +1372,7 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
                 .collect();
             (!out.is_empty()).then_some(out)
         });
-    let url_label = const { anchor_text("muse.box.full_url") };
+    let url_label = const { crate::anchor!("muse.box.full_url") };
     let url = body
         .clone()
         .find(|&i| trimmed(i).starts_with(url_label))
@@ -1381,10 +1387,10 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
     let network: Vec<String> = body
         .clone()
         .map(trimmed)
-        .filter(|t| t.starts_with(const { anchor_text("muse.box.network_row") }))
+        .filter(|t| t.starts_with(const { crate::anchor!("muse.box.network_row") }))
         .map(str::to_string)
         .collect();
-    let tool_label = const { anchor_text("muse.box.tool_row") };
+    let tool_label = const { crate::anchor!("muse.box.tool_row") };
     let tool = body
         .clone()
         .find(|&i| trimmed(i).starts_with(tool_label))
@@ -1402,7 +1408,7 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
     };
     let network_command = (kind == PromptKind::Other
         && b.title
-            .is_some_and(|t| trimmed(t) == const { anchor_text("muse.box.network") }))
+            .is_some_and(|t| trimmed(t) == const { crate::anchor!("muse.box.network") }))
     .then(|| command_rows.join(" "));
     let (command_rows, path, notes) = match kind {
         PromptKind::Bash => (command_rows, None, notes),
@@ -1510,7 +1516,7 @@ fn question_keys(rows: &[String], end: usize) -> Option<(usize, String)> {
         };
         if words.starts_with("Enter to ") {
             return words
-                .ends_with(const { anchor_text("muse.question.esc") })
+                .ends_with(const { crate::anchor!("muse.question.esc") })
                 .then_some((start, words));
         }
     }
@@ -1520,7 +1526,7 @@ fn question_keys(rows: &[String], end: usize) -> Option<(usize, String)> {
 fn is_question_head(row: &str) -> bool {
     row.strip_prefix(STATUS_GLYPHS)
         .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|r| r.starts_with(const { anchor_text("muse.question.title") }))
+        .is_some_and(|r| r.starts_with(const { crate::anchor!("muse.question.title") }))
 }
 
 fn is_position_row(row: &str) -> bool {
@@ -1618,11 +1624,11 @@ fn question_prompt(rows: &[String], q: Question) -> PromptV2 {
     let keys = q.key_words.clone();
     if q.head.is_some()
         && q.position.is_none()
-        && keys == const { anchor_text("muse.question.keys") }
+        && keys == const { crate::anchor!("muse.question.keys") }
         && sound(&options)
     {
         for o in &mut options {
-            o.role = if o.label == const { anchor_text("muse.question.none") } {
+            o.role = if o.label == const { crate::anchor!("muse.question.none") } {
                 Role::Other
             } else {
                 Role::Answer
@@ -1679,7 +1685,7 @@ pub struct QuestionNotes {
 pub fn question_notes(rows: &[String]) -> Option<QuestionNotes> {
     let f = frame(rows)?;
     let q = question_box(rows, f)?;
-    let label = const { anchor_text("muse.question.note") }.trim_end();
+    let label = const { crate::anchor!("muse.question.note") }.trim_end();
     let at = (q.first..=q.last)
         .find(|&i| is_note_row(&rows[i]) && crate::text::trim(&rows[i]).starts_with(label))?;
     let mut text = crate::text::trim(&rows[at])
@@ -1711,8 +1717,8 @@ fn review_option(row: &str) -> Option<(&'static str, bool)> {
     };
     let label = crate::text::trim(label);
     [
-        anchor_text("muse.question.submit"),
-        anchor_text("muse.question.interrupt"),
+        crate::anchor!("muse.question.submit"),
+        crate::anchor!("muse.question.interrupt"),
     ]
     .into_iter()
     .find(|&l| l == label)
@@ -1747,13 +1753,13 @@ fn review_box(rows: &[String], f: Frame) -> Option<Review> {
         } else {
             format!("{t} {words}")
         };
-        if words.starts_with(const { anchor_text("muse.question.review") }) {
+        if words.starts_with(const { crate::anchor!("muse.question.review") }) {
             keys_start = Some(k);
             break;
         }
     }
     let keys_start = keys_start?;
-    if !words.ends_with(const { anchor_text("muse.question.review.back") }) {
+    if !words.ends_with(const { crate::anchor!("muse.question.review.back") }) {
         return None;
     }
     let head = (0..keys_start)
@@ -1825,7 +1831,7 @@ pub fn is_review(p: &PromptV2) -> bool {
     p.kind == PromptKind::Question
         && p.footer
             .as_deref()
-            .is_some_and(|f| f.starts_with(const { anchor_text("muse.question.review") }))
+            .is_some_and(|f| f.starts_with(const { crate::anchor!("muse.question.review") }))
 }
 
 /// Parses the active modal prompt card (trust, approval, question, or review) on `rows`.
@@ -1869,7 +1875,7 @@ fn muse_banner_version(row: &str) -> Option<&str> {
         return None;
     }
     let after = crate::text::trim(row)
-        .strip_prefix(const { anchor_text("muse.banner") })?
+        .strip_prefix(const { crate::anchor!("muse.banner") })?
         .strip_prefix(' ')?;
     let len = after
         .bytes()
@@ -1943,7 +1949,7 @@ pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&
 /// Returns whether `row` is the composer's top rule at rest (the idle voice-input rule).
 #[must_use]
 pub fn is_idle_voice_rule(row: &str) -> bool {
-    is_top_rule(row) && crate::text::contains(row, const { anchor_text("muse.composer.voice") })
+    is_top_rule(row) && crate::text::contains(row, const { crate::anchor!("muse.composer.voice") })
 }
 
 fn newest_cards(rows: &[String]) -> Vec<std::ops::Range<usize>> {
@@ -1957,8 +1963,8 @@ fn newest_cards(rows: &[String]) -> Vec<std::ops::Range<usize>> {
             && let Some(end) = (i + 1..f.top).find(|&j| rows[j].starts_with('└'))
         {
             let head = rows.get(i + 1).map_or("", String::as_str);
-            if crate::text::contains(head, const { anchor_text("muse.card.status") })
-                || crate::text::contains(head, const { anchor_text("muse.card.session_usage") })
+            if crate::text::contains(head, const { crate::anchor!("muse.card.status") })
+                || crate::text::contains(head, const { crate::anchor!("muse.card.session_usage") })
             {
                 cards.push(i + 1..end);
             }
@@ -2002,12 +2008,12 @@ fn subscription_tier(line: &str) -> Option<String> {
 /// Extracts the subscription plan tier from a `/status` or `/usage` card on `rows`.
 #[must_use]
 pub fn subscription_card_plan(rows: &[String]) -> Option<String> {
-    let billing = card_value(rows, const { anchor_text("muse.card.billing") });
+    let billing = card_value(rows, const { crate::anchor!("muse.card.billing") });
     let line = billing.or_else(|| {
         newest_cards(rows).into_iter().rev().find_map(|body| {
             body.rev().find_map(|j| {
                 let t = card_text(&rows[j])?;
-                t.starts_with(const { anchor_text("muse.card.subscription") })
+                t.starts_with(const { crate::anchor!("muse.card.subscription") })
                     .then_some(t)
             })
         })
@@ -2022,7 +2028,7 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
         let account = card_body_value(
             rows,
             body.clone(),
-            const { anchor_text("muse.card.account") },
+            const { crate::anchor!("muse.card.account") },
         )?;
         Some((account, body))
     })?;
@@ -2033,7 +2039,7 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
     if !email.contains('@') || email.chars().any(char::is_whitespace) {
         return None;
     }
-    let plan = card_body_value(rows, body, const { anchor_text("muse.card.billing") })
+    let plan = card_body_value(rows, body, const { crate::anchor!("muse.card.billing") })
         .and_then(subscription_tier);
     Some((email.to_owned(), plan))
 }
@@ -2048,7 +2054,7 @@ pub struct UsageCardWeekly {
 /// Extracts the [`UsageCardWeekly`] quota summary from a Muse Code `/usage` card on `rows`.
 #[must_use]
 pub fn usage_card_weekly(rows: &[String]) -> Option<UsageCardWeekly> {
-    let weekly = card_value(rows, const { anchor_text("muse.card.weekly") })?;
+    let weekly = card_value(rows, const { crate::anchor!("muse.card.weekly") })?;
     let (used, rest) = weekly.split_once('%')?;
     if !crate::text::trim(rest).starts_with("used") {
         return None;
@@ -2146,9 +2152,9 @@ pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
 #[doc(hidden)]
 pub mod fixtures {
     /// A spawned worker's tab before Muse Code 1.4.12 draws: the shell's echo of the line
-    /// that launched it, nothing under it (`aterm-lab forever` r11, `r11cv-muse`, seq 33).
+    /// that launched it, nothing under it.
     pub const LAUNCH_LINE: &str = include_str!("fixtures/muse-1.4.12-launch-line.txt");
-    /// The same tab at Muse Code's first reply, the launch line still above it (seq 1751).
+    /// The same tab at Muse Code's first reply, the launch line still above it.
     pub const FIRST_REPLY_UNDER_LAUNCH_LINE: &str =
         include_str!("fixtures/muse-1.4.12-first-reply-under-launch-line.txt");
     pub const BOX_TRUST: &str = include_str!("fixtures/muse-1.4.9-R6297.1-box-trust.txt");

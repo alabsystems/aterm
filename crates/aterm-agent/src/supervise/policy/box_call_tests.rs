@@ -240,7 +240,7 @@ fn a_box_the_transcript_does_not_prove_is_not_proved() {
             " Esc to cancel · Tab to amend",
             format!(
                 " Esc to cancel · Tab to amend · ctrl+x ctrl+k {}",
-                aterm_phase::anchor_text("hint.agents_twice")
+                aterm_phase::anchor!("hint.agents_twice")
             ),
         ),
         (

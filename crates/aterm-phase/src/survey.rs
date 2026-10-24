@@ -234,7 +234,7 @@ pub fn drafts_card(rows: &[String]) -> Option<(usize, usize)> {
             Some(None)
         }
     })??;
-    let drafted = const { crate::anchors::anchor_text("card.drafted") };
+    let drafted = const { crate::anchor!("card.drafted") };
     let head = (hint.saturating_sub(MAX_DRAFTS_ROWS)..hint)
         .rev()
         .find_map(|i| {
@@ -260,7 +260,7 @@ const MAX_DRAFTS_ROWS: usize = 12;
 /// dismiss`, then ` · +N more queued` when more are queued.
 fn is_drafts_hint(row: &str) -> bool {
     crate::text::trim_end(row)
-        .strip_prefix(const { crate::anchors::anchor_text("card.drafts_hint") })
+        .strip_prefix(const { crate::anchor!("card.drafts_hint") })
         .is_some_and(|rest| {
             rest.is_empty()
                 || rest
@@ -323,7 +323,7 @@ fn is_ask_options_row(row: &str) -> bool {
     matches!(
         (cells.next(), cells.next(), cells.next()),
         (Some(key), Some(':'), Some(' ')) if key.is_ascii_alphanumeric()
-    ) && rest.contains(const { crate::anchors::anchor_text("card.dont_ask") })
+    ) && rest.contains(const { crate::anchor!("card.dont_ask") })
 }
 
 /// The labels a rating names itself by: the card's buttons, and the word the pending
@@ -333,11 +333,10 @@ const RATING_LABELS: [&str; 4] = ["Bad", "Fine", "Good", "Unsure"];
 /// `Feedback: <label> · Esc to undo`, in column 0: the rating's pending step, drawn for
 /// 3 s after a person's `1`/`2`/`3` (the key word is their `escape` binding).
 fn is_pending_row(row: &str) -> bool {
-    let Some(rest) = row.strip_prefix(const { crate::anchors::anchor_text("survey.pending") })
-    else {
+    let Some(rest) = row.strip_prefix(const { crate::anchor!("survey.pending") }) else {
         return false;
     };
-    let undo = const { crate::anchors::anchor_text("survey.pending_undo") }
+    let undo = const { crate::anchor!("survey.pending_undo") }
         .split_once(' ')
         .map_or("", |(_, tail)| tail);
     rest.split_once(" · ").is_some_and(|(label, hint)| {
@@ -347,16 +346,16 @@ fn is_pending_row(row: &str) -> bool {
 
 /// `Thanks for the feedback!` alone on its row, in column 0.
 fn is_thanks_row(row: &str) -> bool {
-    crate::text::trim_end(row) == const { crate::anchors::anchor_text("survey.thanks") }
+    crate::text::trim_end(row) == const { crate::anchor!("survey.thanks") }
 }
 
 /// The row under the thanks: `(Optional) Press [1] to tell us what went wrong · /feedback`,
 /// or, where the follow-up is off, `Use /feedback to share detailed feedback anytime.`
 fn is_thanks_second_row(row: &str) -> bool {
     let row = crate::text::trim_end(row);
-    (row.starts_with(const { crate::anchors::anchor_text("survey.optional_press") })
+    (row.starts_with(const { crate::anchor!("survey.optional_press") })
         && row.ends_with(" · /feedback"))
-        || row == const { crate::anchors::anchor_text("survey.feedback_anytime") }
+        || row == const { crate::anchor!("survey.feedback_anytime") }
 }
 
 /// The rating's own aftermath, parked in the card's slot above the composer: the pending step (`Feedback: Bad · Esc to undo`, 3 s), then the thanks (`Thanks for the feedback!` over the follow-up offer, 5 s).

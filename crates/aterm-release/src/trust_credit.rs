@@ -1,28 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The D27 gate's credit epoch and its "proved (calculus)" counter (Trust's proven-core
-//! plan, VF1; soundness-by-construction plan M0.4).
+//! The "proved (calculus)" counter and its credit-epoch ledger.
 //!
-//! Trust's VF1 grades every passing obligation on three axes (`trust_types::authority_grade`):
+//! Trust grades every passing obligation on three axes (`trust_types::authority_grade`):
 //! `encoding` (where the checked proposition came from), `discharge` (who decided it) and
 //! `premises`. Only `encoding = proven-calculus` (a VC calculus proved sound in the Clean
-//! kernel, VF5) makes a proof a claim about the program; no proof authority states it yet,
-//! so the counter starts at 0. The grades ride `targo trust check`'s per-package record,
-//! `<target-dir>/trust/obligations/<package>.ndjson` (`trust.obligations.v1`, [`tally`]),
-//! never the terminal log and never `report.ndjson`.
+//! kernel) makes a proof a claim about the program; no proof authority states it yet, so the
+//! counter starts at 0. The grades ride `targo trust check`'s per-package record
+//! ([`record_path`], read by [`tally`]), never the terminal log or `report.ndjson`.
 //!
-//! The epoch ledger ([`EPOCHS`], [`parse_epochs`]) is versioned rows, the last one current.
-//! A row maps the grade a proof had before it (`proved`, ungraded) to the grade it is
-//! credited at now, and holds the "proved (calculus)" floor the lane guards against
-//! regression ([`judge`]): fewer calculus proofs than the current epoch's floor fails the
-//! run, as a library below its proved floor does.
+//! The ledger ([`EPOCHS`], [`parse_epochs`]) is versioned rows, the last one current. A row
+//! maps the grade a proof had before it to the grade it is credited at now, and holds the
+//! floor [`judge`] guards: fewer calculus proofs than the current floor fails the run.
 //!
-//! A prover that states no grade (targo before Trust `fd10060b24a`, the installed 0.11.0
-//! among them) writes obligation lines without the three fields, and its record reads as
-//! **ungraded**: its calculus count is 0 and the counter says so ([`Credit::line`]). A
-//! half-graded line, or an encoding this reader does not know, is refused, never read as
-//! ungraded: a grade nobody can read is not credit.
+//! A prover that states no grade (targo 0.11.0, for one) writes obligation lines without the
+//! three fields, and its record reads as ungraded and counts 0 ([`Credit::line`]). A
+//! half-graded line or an unknown encoding is refused: a grade nobody can read is not credit.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,9 +68,10 @@ pub struct Epoch {
 /// `<epoch>\t<old grade>\t<mapped encoding>\t<proved (calculus) floor>\t<why>`.
 ///
 /// # Errors
-/// A row without five fields, an epoch that is not the one after the row before, a mapped
-/// grade that is not an encoding, a floor that is not a count, a floor lower than the
-/// epoch before's, or no row at all.
+/// A row without five fields, an epoch that is not a number or not the one after the row
+/// before, an old grade other than `proved` in the first row or an encoding in a later one, a
+/// mapped grade that is not an encoding, a floor that is not a count, a floor lower than the
+/// epoch before's, an empty reason, or no row at all.
 pub fn parse_epochs(text: &str) -> Result<Vec<Epoch>, String> {
     let mut out: Vec<Epoch> = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -196,9 +191,9 @@ struct Line {
 /// `discharge`, `premises` is ungraded (a prover that states no grade).
 ///
 /// # Errors
-/// Another schema, a line that is not JSON, an obligation line with no status, a line with
-/// some but not all of the three grade fields, an encoding or discharge outside the
-/// vocabulary, or a half-`ungraded` triple.
+/// An empty record, another schema, a line that is not JSON, an obligation line with no
+/// status, a line with some but not all of the three grade fields, an encoding or discharge
+/// outside the vocabulary, or a half-`ungraded` triple.
 pub fn tally(text: &str) -> Result<Tally, String> {
     let mut t = Tally::default();
     let mut lines = text.lines();
@@ -366,7 +361,8 @@ pub fn read_record(target: &Path, package: &str) -> Option<Result<Tally, String>
 }
 
 /// `ship trust credit <record>…`: the counter over the records named, judged against the
-/// working ledger. 0 holds, 1 regressed or a record refused, 2 the ledger unreadable.
+/// working ledger. 0 holds, 1 regressed or a record refused, 2 the ledger missing or
+/// unreadable.
 pub fn run_cmd(repo: &Path, records: &[PathBuf]) -> i32 {
     let epoch = match current_epoch(repo) {
         Ok(Some(e)) => e,
@@ -422,7 +418,7 @@ mod tests {
         )
     }
 
-    /// An obligation line as targo after Trust `fd10060b24a` writes it.
+    /// An obligation line as a grading targo writes it.
     fn graded(status: &str, encoding: &str, discharge: &str) -> String {
         format!(
             r#"{{"col":0,"discharge":"{discharge}","encoding":"{encoding}","file":"src/lib.rs","key":"alpha::f#1","kind":"overflow","line":1,"premises":[],"status":"{status}","stop":null}}"#

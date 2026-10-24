@@ -29,6 +29,7 @@ fn job(id: u32, unit: &str) -> RawJob {
 fn hello() -> Hello {
     Hello {
         proto: PROTO,
+        key: [3; 32],
         agent_sha256: [7; 32],
         boot_id: "b".into(),
         kernel: "k".into(),
@@ -95,9 +96,9 @@ fn hello_then_booting_while_jobs_run_then_ready_degraded_then_beats() {
         let want: Vec<&str> = want.iter().map(|j| j.unit.as_str()).collect();
         assert_eq!(units(sent), want);
     }
-    // A job's elapsed time runs from when the agent first saw it: 0 in that frame, and at
-    // least a tick in the next, which waits out the tick while the boot is not over
-    // (the Fake's is over only once its whole script was asked for).
+    // A job's elapsed time runs from when the agent first saw it: 0 in that frame and at
+    // least a tick in the next, since each frame waits out a tick until the Fake's whole
+    // script was asked for.
     let elapsed = |id: u32| -> Vec<u64> {
         booting
             .iter()

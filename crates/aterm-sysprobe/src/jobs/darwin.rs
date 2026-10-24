@@ -37,6 +37,8 @@ pub const PROC_FLAG_SLEADER: u32 = 0x20;
 pub const PROC_FLAG_CONTROLT: u32 = 0x80;
 /// `PROC_FLAG_EXEC`: the process ran a program since its fork.
 pub const PROC_FLAG_EXEC: u32 = 0x4000;
+/// `PROC_FLAG_INEXIT`: the process is on its way out of `exit`, which closes its descriptors.
+pub const PROC_FLAG_INEXIT: u32 = 0x4;
 /// `FREAD` in `proc_fileinfo.fi_openflags`.
 pub const FREAD: u32 = 0x1;
 /// `FWRITE` in `proc_fileinfo.fi_openflags`.
@@ -53,7 +55,7 @@ pub const SOCKINFO_TCP: i32 = 2;
 pub const INI_IPV4: u8 = 0x1;
 /// `INI_IPV6` in `insi_vflag`.
 pub const INI_IPV6: u8 = 0x2;
-/// `S_IFMT`, `S_IFREG`, `S_IFCHR` of `vst_mode`.
+/// `S_IFMT`: the file-type bits of `vst_mode`.
 pub const S_IFMT: u16 = 0o170_000;
 /// A regular file.
 pub const S_IFREG: u16 = 0o100_000;
@@ -112,14 +114,8 @@ pub const SOCKET_VFLAG_AT: usize = 288;
 pub const SOCKET_FADDR_AT: usize = 296;
 /// `… psi.soi_proto.pri_tcp.tcpsi_state`.
 pub const SOCKET_TCP_STATE_AT: usize = 344;
-/// `… psi.soi_options` (`short`): the socket's `SO_*` options.
-pub const SOCKET_OPTIONS_AT: usize = 188;
-/// `… psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path`: the path a unix-domain socket is bound at.
-pub const SOCKET_UN_PATH_AT: usize = 282;
 /// The length of `sun_path`.
 pub const SUN_PATH_LEN: usize = 104;
-/// `SOCKINFO_UN`: a unix-domain socket.
-pub const SOCKINFO_UN: i32 = 3;
 /// `SO_ACCEPTCONN`: the socket listens.
 pub const SO_ACCEPTCONN: u16 = 0x2;
 /// `PROX_FDTYPE_SOCKET`: a socket descriptor, as `PROC_PIDLISTFDS` types it.
@@ -194,6 +190,7 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("PROC_FLAG_SLEADER", PROC_FLAG_SLEADER as i64),
     ("PROC_FLAG_CONTROLT", PROC_FLAG_CONTROLT as i64),
     ("PROC_FLAG_EXEC", PROC_FLAG_EXEC as i64),
+    ("PROC_FLAG_INEXIT", PROC_FLAG_INEXIT as i64),
     ("SOCKINFO_IN", SOCKINFO_IN as i64),
     ("SOCKINFO_TCP", SOCKINFO_TCP as i64),
     ("INI_IPV4", INI_IPV4 as i64),
@@ -300,18 +297,9 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         SOCKET_TCP_STATE_AT as i64,
     ),
     (
-        "offsetof(struct socket_fdinfo, psi.soi_options)",
-        SOCKET_OPTIONS_AT as i64,
-    ),
-    (
-        "offsetof(struct socket_fdinfo, psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path)",
-        SOCKET_UN_PATH_AT as i64,
-    ),
-    (
         "sizeof(((struct sockaddr_un *)0)->sun_path)",
         SUN_PATH_LEN as i64,
     ),
-    ("SOCKINFO_UN", SOCKINFO_UN as i64),
     ("SO_ACCEPTCONN", SO_ACCEPTCONN as i64),
     ("PROX_FDTYPE_SOCKET", PROX_FDTYPE_SOCKET as i64),
     ("KERN_PROC", KERN_PROC as i64),
@@ -509,7 +497,8 @@ pub struct TcpFd {
     pub queued_read: u64,
 }
 
-/// Decode a `socket_fdinfo`.
+/// Decode a `socket_fdinfo`'s TCP part: `Some(None)` for any other socket; `None` when `b` is
+/// shorter than the struct.
 #[must_use]
 pub fn socket(b: &[u8]) -> Option<Option<TcpFd>> {
     if b.len() < SOCKET_SIZE {
@@ -547,24 +536,78 @@ pub fn socket(b: &[u8]) -> Option<Option<TcpFd>> {
     }))
 }
 
-/// Decode a `socket_fdinfo` as a unix-domain listener: `Some(Some(path))` for an `AF_UNIX` socket that
-/// listens (`SO_ACCEPTCONN`), with the path it is bound at up to its NUL (at most [`SUN_PATH_LEN`]
-/// bytes); `Some(None)` for any other socket, an unbound listener among them; `None` when `b` is
-/// shorter than the struct. A stream a listener accepted carries the listener's path too, so the
-/// path alone names no listener.
+/// `net.local.stream.pcblist_n`: the kernel's table of unix-domain stream sockets, every
+/// process's, read with no reference on any descriptor (XNU `unp_pcblist_n`). The records are
+/// private structs packed to 4, read here at the sizes and offsets measured on macOS 27.0.1;
+/// [`unix_listeners`] refuses a table of other sizes, and its reader self-checks the rest
+/// (`aterm_uds::holders`).
+pub const UNIX_STREAM_TABLE: &std::ffi::CStr = c"net.local.stream.pcblist_n";
+/// A table record's kind: an `xsocket_n`.
+pub const XSO_SOCKET: u32 = 0x1;
+/// A table record's kind: an `xunpcb_n`, which its socket's `xsocket_n` follows.
+pub const XSO_UNPCB: u32 = 0x200;
+/// `sizeof(struct xunpcb_n)`.
+pub const XUNPCB_SIZE: usize = 588;
+/// `offsetof(struct xunpcb_n, xu_au.xuu_addr.sun_path)`: the path the socket is bound at.
+pub const XUNPCB_PATH_AT: usize = 78;
+/// `sizeof(struct xsocket_n)`.
+pub const XSOCKET_SIZE: usize = 104;
+/// `offsetof(struct xsocket_n, so_options)`.
+pub const XSOCKET_OPTIONS_AT: usize = 20;
+/// `offsetof(struct xsocket_n, so_uid)`.
+pub const XSOCKET_UID_AT: usize = 64;
+/// `offsetof(struct xsocket_n, so_last_pid)`.
+pub const XSOCKET_LAST_PID_AT: usize = 68;
+
+/// A listening unix-domain socket in a [`UNIX_STREAM_TABLE`] read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixListenerRow<'a> {
+    /// The process that last bound it or listened on it (`so_last_pid`): a fork that only
+    /// accepts on it is not named (measured).
+    pub pid: u32,
+    /// The user whose credentials made it (`so_uid`).
+    pub uid: u32,
+    /// The path it is bound at, up to its NUL (at most [`SUN_PATH_LEN`] bytes).
+    pub path: &'a [u8],
+}
+
+/// The bound listeners in a [`UNIX_STREAM_TABLE`] read: each `xunpcb_n` with a path whose
+/// `xsocket_n` says `SO_ACCEPTCONN`. A stream a listener accepted carries the listener's path
+/// too, so the path alone names no listener. `None` when the table is not laid out as this
+/// build reads it: a record running past the end, a length word under 8, or an `xunpcb_n` or
+/// `xsocket_n` of another size.
 #[must_use]
-pub fn unix_listener(b: &[u8]) -> Option<Option<&[u8]>> {
-    if b.len() < SOCKET_SIZE {
-        return None;
+pub fn unix_listeners(table: &[u8]) -> Option<Vec<UnixListenerRow<'_>>> {
+    let header = usize::try_from(u32_at(table, 0)?).ok()?;
+    let mut at = header;
+    let mut bound: Option<&[u8]> = None;
+    let mut rows = Vec::new();
+    while table.len().checked_sub(at)? > header {
+        let len = usize::try_from(u32_at(table, at)?).ok()?;
+        let record = table.get(at..at.checked_add(len)?)?;
+        // A record too short for its kind word (a length under 8) is `None` here.
+        match u32_at(record, 4)? {
+            XSO_UNPCB if len == XUNPCB_SIZE => {
+                let raw = record.get(XUNPCB_PATH_AT..XUNPCB_PATH_AT + SUN_PATH_LEN)?;
+                let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+                bound = raw.get(..end).filter(|path| !path.is_empty());
+            }
+            XSO_SOCKET if len == XSOCKET_SIZE => {
+                let listens = u32_at(record, XSOCKET_OPTIONS_AT)? & u32::from(SO_ACCEPTCONN) != 0;
+                if let Some(path) = bound.take().filter(|_| listens) {
+                    rows.push(UnixListenerRow {
+                        pid: u32_at(record, XSOCKET_LAST_PID_AT)?,
+                        uid: u32_at(record, XSOCKET_UID_AT)?,
+                        path,
+                    });
+                }
+            }
+            XSO_UNPCB | XSO_SOCKET => return None,
+            _ => {}
+        }
+        at = at.checked_add(len.next_multiple_of(8))?;
     }
-    let listens = i32_at(b, SOCKET_KIND_AT)? == SOCKINFO_UN
-        && u16_at(b, SOCKET_OPTIONS_AT)? & SO_ACCEPTCONN != 0;
-    if !listens {
-        return Some(None);
-    }
-    let raw = b.get(SOCKET_UN_PATH_AT..SOCKET_UN_PATH_AT + SUN_PATH_LEN)?;
-    let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
-    Some(raw.get(..end).filter(|path| !path.is_empty()))
+    Some(rows)
 }
 
 /// The fields of a `kinfo_proc` the probe reads.

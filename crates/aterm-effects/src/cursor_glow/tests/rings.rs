@@ -116,9 +116,8 @@ fn every_style_lands_a_veil_ring_on_light() {
     }
 }
 
-/// On dark a capped-impact landing's light reaches at least 1.8 times as far
-/// as a hop's, every style: the round blooms (Fire, Water) by their radius,
-/// the veil held to its row by its reach along it.
+/// On dark a capped-impact landing's light reaches at least 1.8 times as far as a hop's, in every
+/// style.
 #[test]
 fn classic_landing_ring_expands_wider_with_the_jump() {
     let g = geom();
@@ -396,21 +395,17 @@ fn a_landing_at_the_grids_edge_fades_before_the_edge() {
     }
 }
 
-/// A DARK FIRE'S LANDING FLASH BURNS AS AN EMBER TO ITS RIM: every pixel
-/// its bloom lights over a dark page, through its life, is lit an
-/// orange-red (the light it adds at most 30 degrees of hue, saturated),
-/// never the khaki a thin amber lays over the dark where a bloom thins out
-/// (a dim `#352b1c` disc around a jump's landing). Negative control: laid in
-/// the white-hot flash cooling to amber, the same blooms light khaki pixels.
+/// Every pixel a dark Fire landing's bloom lights, through its life, is an orange-red (its added
+/// light within 30 degrees of hue, saturated), never the khaki a thin amber lays over a dark
+/// page. Negative control: the white-hot flash cooling to amber lights khaki pixels.
 #[test]
 fn a_dark_fire_landing_flash_burns_as_an_ember_to_its_rim() {
     let g = tall_geom();
     let caret = (3u16, 12u16);
     let (cx, cy) = g.cell_center(caret.0, caret.1);
     let c = cfg(GlowStyle::Fire, true);
-    // The light a pixel adds over the page, read when it shows (the
-    // largest channel at least 10, past the halo's rounding): warm when it
-    // is an orange-red.
+    // The light a pixel adds over the page, read when its largest channel is at least 10 (past
+    // the halo's rounding): warm when it is an orange-red.
     let warm = |p: u32, bg: u32| {
         let ch = |sh: u32| ((p >> sh) & 0xff).saturating_sub((bg >> sh) & 0xff);
         let most = ch(16).max(ch(8)).max(ch(0));
@@ -762,25 +757,13 @@ fn a_paper_landing_veil_keeps_the_caret_row_through_a_hidden_caret() {
     assert!(lit_hidden > 0, "the hidden-caret frame lays no veil at all");
 }
 
-/// THE DARK LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, IN ITS STYLE'S
-/// HUE (the trail gallery's `enter-bottom` at 120 ms: unbound, after an
-/// Enter at the bottom row the bloom, carried up with the scrolled text,
-/// stands as a round grey haze two rows over the caret on `$ echo` and `the
-/// qu`: sparkle `#303236`, comet `#2d3237`, phaser and lumen `#1f322f`,
-/// laser `#272437`). The dark twin of the paper tests above, on two dark
-/// themes, each veiled style with its own colour and the accent a window
-/// derives from it (brightened 1.5x, near white). Through the whole frame
-/// step (a jump lays the landing on the bottom row, the Enter's two scrolls
-/// carry it two rows up with the text, and one frame the host withholds the
-/// caret) the landing's light lies over none of the rows above the caret's.
-/// And the ring itself, landed two rows up where the scroll left it: every
-/// pixel it lays lies in the caret's row within
-/// [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] of its centre (graded by the
-/// landing's impact, [`classic_ring_radius_factor`]), the theme's text over
-/// it keeps 4.5:1, and its light is its style's hue (its lift over the page
-/// saturated 0.6 or more). NEGATIVE CONTROL: the veil unbound
-/// ([`CursorGlow::veil_unbound`]) lies over the rows above, leaves the
-/// caret's row, and its light is grey.
+/// On two dark themes, each veiled style's landing light lies over no row above the caret's
+/// through a jump to the bottom row, two scrolls and a frame with no caret. A ring landed two rows
+/// up, where the scrolls left it, stays in the caret's row within
+/// [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] of its centre (graded by [`classic_ring_radius_factor`]),
+/// keeps the theme's text 4.5:1 and wears its style's hue (its lift saturated 0.6 or more).
+/// Negative control: the veil unbound ([`CursorGlow::veil_unbound`]) lies over the rows above,
+/// leaves the caret's row, and is grey.
 #[test]
 fn a_dark_landing_veil_stays_in_the_caret_row_in_its_hue() {
     let g = tall_geom();
@@ -834,8 +817,7 @@ fn a_dark_landing_veil_stays_in_the_caret_row_in_its_hue() {
                 for (ms, cur) in [(32u64, Some(caret)), (48, None), (120, Some(caret))] {
                     let now = t1 + Duration::from_millis(ms);
                     glow.tick(cur, now, &c, g, &mut out);
-                    // The landing's own light, as the frame laid it (the
-                    // frame's other halos, a sparkle's stars, fly free).
+                    // The landing's own light alone (a sparkle's stars fly free).
                     let (mut ring_out, mut halos) = (Vec::new(), Vec::new());
                     glow.emit_ring(now, &c, g, cur, &mut ring_out, &mut halos);
                     let mut glass = Glass::new(g, bg);
@@ -1039,13 +1021,9 @@ fn a_ring_on_the_last_row_melts_into_the_box_edge() {
     );
 }
 
-/// A COLOUR THE USER CHOSE LANDS AS ITSELF: unchosen, the dark landing veil
-/// re-hues a near-grey ring colour to the trail's and pushes every colour to
-/// full value and a clean chroma, which would land a pinned white accent
-/// green and a pinned `#8040c0` Laser `#9f40ff`. With the colour chosen
-/// ([`ColourPins`]), the veil's light keeps the chosen colour's hue and
-/// saturation (a grey stays grey), held legible by its coverage alone.
-/// Negative control: the same colours unchosen are re-hued or saturated.
+/// A colour the user chose ([`ColourPins`]) lands as itself on dark: the veil keeps its hue and
+/// saturation (a grey stays grey), held legible by its coverage alone. Negative control: the same
+/// colours unchosen are re-hued or saturated.
 #[test]
 fn a_chosen_colour_lands_as_itself_on_dark() {
     let g = geom();

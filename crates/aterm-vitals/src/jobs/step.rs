@@ -137,6 +137,9 @@ pub struct Evidence {
     pub gate: InputGate,
     /// Zombies first seen ≥ 10 s ago whose parent is a live member.
     pub zombies: Option<Zombies>,
+    /// Their parent names a wait of its own that counts as legitimate (an `xargs` blocked reading
+    /// its input): it reaps late, not never.
+    pub zombie_parent_waits: bool,
     /// The Tier A wait of the waiting leaves.
     pub wait: Wait,
     /// A Tier B naming holding this episode, and how it counts.
@@ -412,7 +415,10 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         Class::BusySilent
     } else if t.polling.on && !tty_wait {
         Class::Polling
-    } else if ev.zombies.is_some() {
+    } else if ev.zombies.is_some() && !ev.zombie_parent_waits {
+        // A parent that reaps late waits legitimately all the same, by its own wait (xargs reaps
+        // before its next fork, and blocks on its input between): its zombies are a finding of
+        // their own. Another leaf's wait (the `tail -F` before a deadlocked parent) is no sign.
         Class::Zombie
     } else {
         Class::Waiting

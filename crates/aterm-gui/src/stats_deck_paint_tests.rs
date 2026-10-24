@@ -335,6 +335,8 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
             cores: 99.9,
             n: 999,
             scope: Some(ProcScope::Tab(FRONT)),
+            born_ms: None,
+            unborn: 999,
         }
     } else {
         Busiest {
@@ -342,6 +344,8 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
             cores: 5.9,
             n: 9,
             scope: Some(ProcScope::Tab(3)),
+            born_ms: None,
+            unborn: 9,
         }
     });
 
@@ -1740,4 +1744,173 @@ fn deck_gallery() {
         }
     }
     assert_eq!(written.len(), scenes.len() * 5 * 2 * 2);
+}
+
+/// The merged deck's gallery sizes: the mockups' 2238, 1100 and 700 device px at 2×, and the
+/// widest at 1×.
+const MERGED_SIZES: [(f64, f64); 4] = [(1119.0, 2.0), (550.0, 2.0), (350.0, 2.0), (1119.0, 1.0)];
+
+/// The landed mockups' deck band: rows 56..158 of each, under the 56-row titlebar and down to
+/// the terminal, the band's 2-row seam included.
+const MOCKUP_BAND: std::ops::Range<usize> = 56..158;
+
+/// The rule between a mockup's band and the deck's render in a `_vs_mockup` stack, device px.
+const STACK_RULE_PX: usize = 4;
+
+/// Each landed mockup ([`mockup_file`]) by the render it is held against: its scene, width in
+/// device px (2×, as the mockups are drawn) and ground, and the words in its band, counted as the
+/// mockups' generator counts them ([`band_words`]).
+const MOCKUPS: [(DeckScene, u32, &str, usize); 6] = [
+    (DeckScene::Busy, 2238, "dark", 110),
+    (DeckScene::Busy, 2238, "light", 110),
+    (DeckScene::Calm, 2238, "dark", 91),
+    (DeckScene::Calm, 2238, "light", 91),
+    (DeckScene::Busy, 1100, "dark", 61),
+    (DeckScene::Busy, 700, "dark", 45),
+];
+
+/// A landed mockup's file in `docs/design-studies`: the narrower forms name their width.
+fn mockup_file(scene: DeckScene, px: u32, ground: &str) -> String {
+    let at = if px == 2238 {
+        String::new()
+    } else {
+        format!("-{px}")
+    };
+    format!("top-deck-{}-{ground}{at}-2026-10-23.png", scene.name())
+}
+
+/// The full-width mockups' right block edges at 2238 px, printed beside the deck's own and never
+/// asserted: the mockups measured their words in SF, the deck draws Helvetica Neue.
+const MOCKUP_EDGES_2238: [(&str, u32); 7] = [
+    ("rail", 313),
+    ("Processes", 856),
+    ("CPU", 1207),
+    ("Memory", 1572),
+    ("divider", 1801),
+    ("Disk", 2015),
+    ("right edge", 2226),
+];
+
+/// The words `prims` draw: tokens holding a letter or digit, `·` splitting as a space.
+fn band_words(prims: &[DrawPrim]) -> usize {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            DrawPrim::Text { s, .. } => Some(s.as_str()),
+            _ => None,
+        })
+        .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == '·'))
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count()
+}
+
+/// Each instrument's x-extent over its hit regions in device px, in the order the hits first
+/// name them.
+fn block_edges(hits: &[Hit]) -> String {
+    let mut blocks: Vec<(Instrument, f32, f32)> = Vec::new();
+    for h in hits {
+        let (x, _, w, _) = h.rect;
+        match blocks.iter_mut().find(|b| b.0 == h.instrument()) {
+            Some(b) => {
+                b.1 = b.1.min(x);
+                b.2 = b.2.max(x + w);
+            }
+            None => blocks.push((h.instrument(), x, x + w)),
+        }
+    }
+    blocks
+        .iter()
+        .map(|(i, a, b)| format!("{} {a:.0}–{b:.0}", i.word()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The landed mockup `file`'s deck band ([`MOCKUP_BAND`], decoded with `aterm_png`) above `ours`
+/// (`w` px wide, the mockup's own width), a grey rule between: the stack and its height.
+fn under_mockup(file: &str, ours: &[u8], w: usize) -> (Vec<u8>, usize) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/design-studies")
+        .join(file);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let (art, aw, ah) = aterm_png::decode_rgba8(&bytes, 4096).expect("the mockup decodes");
+    assert_eq!(aw, w, "{file} is drawn at the render's width");
+    assert!(ah >= MOCKUP_BAND.end, "{file}: {ah} rows");
+    let mut out = art[MOCKUP_BAND.start * w * 4..MOCKUP_BAND.end * w * 4].to_vec();
+    out.extend_from_slice(&[0x80, 0x80, 0x80, 0xFF].repeat(w * STACK_RULE_PX));
+    out.extend_from_slice(ours);
+    let h = out.len() / (w * 4);
+    (out, h)
+}
+
+/// The merged deck's scenes as the window's deck draws them (v2 until the merged painter lands),
+/// on each ground at each of [`MERGED_SIZES`], each printed with its blocks' x-edges and its word
+/// count; at a mockup's size, also `<name>_vs_mockup.png`, the mockup's band above the render.
+#[test]
+#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
+fn merged_gallery() {
+    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let (mut renders, mut stacks) = (0, 0);
+    for m in DeckScene::ALL {
+        let sc = Scene::Merged(m);
+        let snap = scene(sc);
+        for (w, s) in MERGED_SIZES {
+            for (ground, inks) in [("dark", super::tests::dark_inks()), ("light", light_inks())] {
+                let mut input = input_of(sc, &snap, DeckForm::Full);
+                input.inks = inks;
+                let g = geom(w, s, DeckForm::Full);
+                let (prims, hits) = deck_paint(&g, &input);
+                let [r, gr, b] = inks.ground;
+                let (rgba, pw, ph) = crate::tray_raster::rasterize_tray(
+                    &prims,
+                    g.w as u32,
+                    g.h as u32,
+                    1.0,
+                    [r, gr, b, 0xFF],
+                );
+                let name = format!("{}_{w}pt_{s}x_{ground}", m.name());
+                let write = |file: String, rgba: &[u8], pw: u32, ph: u32| {
+                    let png = crate::app_introspect::encode_rgba8_png(rgba, pw, ph)
+                        .expect("the frame encodes");
+                    std::fs::write(dir.join(file), png).expect("the PNG writes");
+                };
+                write(format!("{name}.png"), &rgba, pw, ph);
+                renders += 1;
+                println!(
+                    "{name}: {} words; {}",
+                    band_words(&prims),
+                    block_edges(&hits)
+                );
+                let mockup = MOCKUPS
+                    .iter()
+                    .find(|k| k.0 == m && k.1 == pw && k.2 == ground);
+                if let Some(&(_, _, _, words)) = mockup {
+                    let file = mockup_file(m, pw, ground);
+                    let (stack, sh) = under_mockup(&file, &rgba, pw as usize);
+                    write(format!("{name}_vs_mockup.png"), &stack, pw, sh as u32);
+                    stacks += 1;
+                    let edges = if pw == 2238 {
+                        MOCKUP_EDGES_2238
+                            .iter()
+                            .map(|(at, x)| format!("{at} {x}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        "not measured".to_owned()
+                    };
+                    println!("{name} mockup ({file}): {words} words; right edges {edges}");
+                }
+            }
+        }
+    }
+    assert_eq!(renders, DeckScene::ALL.len() * MERGED_SIZES.len() * 2);
+    assert_eq!(
+        stacks,
+        MOCKUPS.len(),
+        "every mockup is stacked over its render"
+    );
 }

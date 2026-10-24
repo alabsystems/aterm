@@ -139,7 +139,8 @@ pub fn settings_panel(rows: &[String]) -> Option<SettingsPanel> {
 #[must_use]
 pub fn usage_tab_mark(row: &str) -> bool {
     let t = crate::text::trim(row);
-    USAGE_MARKS.iter().any(|mark| t.starts_with(mark)) || t.starts_with(anchor("usage.loading"))
+    USAGE_MARKS.iter().any(|mark| t.starts_with(mark))
+        || t.starts_with(crate::anchor!("usage.loading"))
 }
 
 /// Returns `true` if `row` indicates the Usage tab is still loading or unsettled.
@@ -154,7 +155,7 @@ pub fn usage_unsettled(row: &str) -> bool {
 /// Returns `true` if `row` is the panel's cancel-hint footer row.
 #[must_use]
 pub fn panel_tail(row: &str) -> bool {
-    crate::text::trim(row).eq_ignore_ascii_case(anchor("prompt.cancel"))
+    crate::text::trim(row).eq_ignore_ascii_case(crate::anchor!("prompt.cancel"))
 }
 
 #[cfg(test)]

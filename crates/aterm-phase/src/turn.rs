@@ -17,7 +17,7 @@ pub fn fresh(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
         return false;
     };
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     let Some(card) = rows[..frame.top].iter().rposition(|r| r.contains(banner)) else {
         return false;
     };
@@ -65,7 +65,7 @@ pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
 #[must_use]
 pub fn launch_card_read(rows: &[String]) -> Option<LaunchCardRead> {
     let frame = composer_frame(rows)?;
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     let card = rows.iter().rposition(|r| r.contains(banner))?;
     if card >= frame.top || rows[card + 1..frame.top].iter().any(|r| r.starts_with('❯')) {
         return None;
@@ -182,7 +182,7 @@ const READ_ROWS: usize = NARROW_ROWS + 1;
 /// Scans `rows` for the newest launch banner row and its [`CardPlace`].
 #[must_use]
 pub fn launch_card_scan(rows: &[String]) -> (Option<usize>, Option<CardPlace>) {
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     let Some((top, layout)) = rows
         .iter()
         .enumerate()
@@ -216,7 +216,7 @@ fn wide_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace> 
 }
 
 fn narrow_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace> {
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     let row = rows.get(top)?;
     let at = crate::text::find(row, banner)?;
     let after = crate::text::trim_end(&row[at + banner.len()..]);
@@ -250,7 +250,7 @@ fn narrow_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace
 /// Returns whether `changed` rows leave a previously scanned launch card unmoved.
 #[must_use]
 pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[usize]) -> bool {
-    let anchor = const { crate::anchors::anchor_text("launch.banner") };
+    let anchor = const { crate::anchor!("launch.banner") };
     if let Some(top) = banner {
         let moved = |span: usize| {
             changed
@@ -287,7 +287,7 @@ pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[us
 /// Extracts the version slice (`2.1.300`) from the banner row of a card at `place`.
 #[must_use]
 pub fn launch_card_version<'a>(rows: &'a [String], place: &CardPlace) -> Option<&'a str> {
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     let row = rows.get(place.top)?;
     let at = crate::text::find(row, banner)?;
     let opens = match place.mascot_row {
@@ -318,7 +318,7 @@ impl<'a> CardWords<'a> {
 /// Extracts the [`CardWords`] for a launch card at `place` on `rows`.
 #[must_use]
 pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<CardWords<'a>> {
-    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let banner = const { crate::anchor!("launch.banner") };
     if !matches!(place.rows, CARD_ROWS | NARROW_ROWS) {
         return None;
     }
@@ -581,7 +581,7 @@ fn said_message(rows: &[String]) -> Option<(usize, String)> {
 
 fn is_hook_verdict(said: &str) -> bool {
     let words = said.split_whitespace().collect::<Vec<_>>().join(" ");
-    let stopped = const { crate::anchors::anchor_text("hook.stopped") };
+    let stopped = const { crate::anchor!("hook.stopped") };
     let opens = |label: &str| {
         words
             .strip_prefix(label)
@@ -590,8 +590,8 @@ fn is_hook_verdict(said: &str) -> bool {
     words
         .strip_prefix(stopped)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-        || opens(const { crate::anchors::anchor_text("hook.prompt_blocked") })
-        || opens(const { crate::anchors::anchor_text("hook.expansion_blocked") })
+        || opens(const { crate::anchor!("hook.prompt_blocked") })
+        || opens(const { crate::anchor!("hook.expansion_blocked") })
 }
 
 /// Extracts the user's opening `❯` prompt for the turn ended by [`said_tail`].
@@ -661,14 +661,14 @@ fn message_at(rows: &[String], last: usize) -> Option<(usize, String)> {
 }
 
 fn is_idle_notice(said: &str) -> bool {
-    let notice = const { crate::anchors::anchor_text("turn.idle_compacted") };
+    let notice = const { crate::anchor!("turn.idle_compacted") };
     let mut words = said.split_whitespace();
     notice.split_whitespace().all(|w| words.next() == Some(w))
         && words.next().is_none_or(|w| w == "·")
 }
 
 fn before_idle_compaction(rows: &[String], head: usize) -> usize {
-    let recap = const { crate::anchors::anchor_text("turn.recap") };
+    let recap = const { crate::anchor!("turn.recap") };
     let mut k = head;
     while k > 0 {
         let r = &rows[k - 1];
@@ -724,12 +724,11 @@ pub fn interrupted(rows: &[String]) -> bool {
         return false;
     };
     let said = rows[block].trim_start_matches(['⏺', '●']).trim();
-    if rows[block].starts_with(['⏺', '●'])
-        && said == const { crate::anchors::anchor_text("question.declined") }
+    if rows[block].starts_with(['⏺', '●']) && said == const { crate::anchor!("question.declined") }
     {
         return true;
     }
-    let text = const { crate::anchors::anchor_text("turn.interrupted") };
+    let text = const { crate::anchor!("turn.interrupted") };
     rows[block..end].iter().any(|r| {
         crate::text::trim_start(r)
             .strip_prefix('⎿')
@@ -1332,7 +1331,7 @@ mod tests {
 
     #[test]
     fn every_recorded_card_is_placed_or_refused_by_its_layout() {
-        let banner = crate::anchors::anchor_text("launch.banner");
+        let banner = crate::anchor!("launch.banner");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .expect("the fixtures")
@@ -2157,7 +2156,7 @@ mod tests {
         assert_eq!(launch_card_version(&card[..0], &place), None);
         let shifted = CardPlace { top: 1, ..place };
         assert_eq!(launch_card_version(&card, &shifted), None);
-        let banner = crate::anchors::anchor_text("launch.banner");
+        let banner = crate::anchor!("launch.banner");
         let at_text_col = "\u{276F} is it at Claude Code v2.1.284";
         assert_eq!(
             at_text_col
@@ -2221,7 +2220,7 @@ mod tests {
 
     #[test]
     fn a_kept_card_reading_is_the_scans() {
-        let anchor = crate::anchors::anchor_text("launch.banner");
+        let anchor = crate::anchor!("launch.banner");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .expect("the fixtures")

@@ -249,8 +249,8 @@ mod tests {
         assert_eq!(reads(), before, "an off lane reads nothing");
     }
 
-    /// A reader that answers nothing (no accelerator: every OS but macOS) turns the lane off at
-    /// once, as unsupported rather than as keys gone missing, and is never read again.
+    /// A reader that answers nothing marks the lane unsupported, not off for keys gone missing,
+    /// at its first read.
     #[test]
     fn no_accelerator_turns_the_lane_off_as_unsupported() {
         let mut lane = GpuLane::new(GpuLane::INERT);
@@ -281,9 +281,8 @@ mod tests {
         assert_eq!(lane.read(&bars(), next).map(|(_, _, c)| c), Some(false));
     }
 
-    /// The host reads the clients in a whole reading on a split tick, never in a hidden deck's
-    /// machine reading; the model turns two reads into this process's share; the inert arm a
-    /// test's reader starts with reads nothing.
+    /// The model turns two reads into this process's share; the inert arm a test's reader
+    /// starts with reads nothing.
     #[test]
     fn the_reader_reads_the_clients_in_whole_readings_only() {
         let mut reader = Reader::new(Arc::default());

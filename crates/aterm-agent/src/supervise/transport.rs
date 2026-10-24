@@ -150,10 +150,11 @@ impl RelayCtl {
         };
         let given = self.token.as_deref().filter(|_| self.is_endpoint(sock));
         let (stream, token) = match given {
-            Some(t) => (
-                CtlStream::connect(sock).map_err(|e| connect_failed(&e))?,
-                t.trim().to_string(),
-            ),
+            Some(t) => {
+                let stream = CtlStream::connect(sock).map_err(|e| connect_failed(&e))?;
+                aterm_uds::keep_out_of_children(&stream).map_err(|e| connect_failed(&e))?;
+                (stream, t.trim().to_string())
+            }
             None => {
                 let (stream, token) =
                     aterm_ctl::connect_then_read_token(sock).map_err(|e| connect_failed(&e))?;

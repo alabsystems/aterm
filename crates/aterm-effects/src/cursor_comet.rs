@@ -223,6 +223,14 @@ impl CursorComet {
         under: &mut Vec<GlowQuad>,
     ) {
         use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, push_ink_ellipse};
+        let peak = LIGHT_BODY_ALPHA_CAP
+            * (0.35 + 0.65 * e)
+            * (1.0 - e)
+            * (0.86 + 0.14 * breathe)
+            * cfg.intensity.clamp(0.0, 1.0);
+        if peak < 1.0 {
+            return;
+        }
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let centre = geom.cell_center(cr, cc);
         let key = (
@@ -243,24 +251,11 @@ impl CursorComet {
                 ink
             }
         };
-        let peak = LIGHT_BODY_ALPHA_CAP
-            * (0.35 + 0.65 * e)
-            * (1.0 - e)
-            * (0.86 + 0.14 * breathe)
-            * cfg.intensity.clamp(0.0, 1.0);
         let budget = under
             .len()
             .saturating_add(crate::cursor_glow::LIGHT_MARK_QUADS);
-        push_ink_ellipse(
-            under,
-            geom,
-            centre,
-            (cw * (0.9 + 0.3 * e), cw * (0.9 + 0.3 * e)),
-            ch * 0.46,
-            ink,
-            peak,
-            budget,
-        );
+        let rx = cw * (0.9 + 0.3 * e);
+        push_ink_ellipse(under, geom, centre, (rx, rx), ch * 0.46, ink, peak, budget);
     }
 
     /// Emit the coma + rim glints as premultiplied additive quads (dark page).
@@ -289,14 +284,17 @@ impl CursorComet {
         let cov_core =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.86 + 0.14 * breathe);
 
+        let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
+        let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
         let discs = COMA_DISCS.map(|(rx, cov_x, t0, dt)| {
-            let ramp = ice_ramp(cfg.color, t0 + dt * e);
+            let ramp = ice_ramp_with(cfg.color, dimmed, whitened, t0 + dt * e);
             let color = if rx >= 1.0 {
                 lerp_rgb(cfg.accent, ramp, 0.45)
             } else {
                 ramp
             };
-            (radius * rx, (cov_core * cov_x).min(COV_CAP), color)
+            let r = radius * rx;
+            (r, r * r, (cov_core * cov_x).min(COV_CAP), color)
         });
         let slab = ((ch * 0.125) as i32).max(2);
         let wob_freq = 0.55 / ch.max(1.0) * 10.0;
@@ -304,13 +302,12 @@ impl CursorComet {
         let wobble = |ym: f32| 1.0 + 0.05 * (ym * wob_freq + wob_phase).sin();
 
         let (cxi, cyi) = (cx as i32, cy as i32);
-        for &(r, cov, color) in &discs {
+        for &(r, r2, cov, color) in &discs {
             let cov = cov as u8;
             if r < 1.0 || cov == 0 {
                 continue;
             }
             let premul = premul_rgb(color, cov);
-            let r2 = r * r;
             let r_i = r as i32;
             let mut dy = -r_i;
             while dy < r_i {
@@ -336,7 +333,7 @@ impl CursorComet {
             let mut ring_premul = [0u32; 4];
             let (mut sum, mut acc) = (0.0f32, [0.0f32; 3]);
             for i in 0..discs.len() {
-                let (_, cov, color) = discs[i];
+                let (_, _, cov, color) = discs[i];
                 sum += cov;
                 for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
                     acc[k] += ((color >> sh) & 0xff) as f32 * cov;
@@ -348,7 +345,8 @@ impl CursorComet {
                 if cov == 0 {
                     continue;
                 }
-                let avg = |k: usize| ((acc[k] / sum).round() as u32).min(255);
+                let inv_sum = 1.0 / sum;
+                let avg = |k: usize| ((acc[k] * inv_sum).round() as u32).min(255);
                 ring_premul[i] = premul_rgb((avg(0) << 16) | (avg(1) << 8) | avg(2), cov);
             }
             let top = (cy - outer).floor() as i32;
@@ -411,7 +409,7 @@ impl CursorComet {
     reason = "the slab row, the shared disc table and the cell cut; one call site"
 )]
 fn ring_row(
-    discs: &[(f32, f32, u32); 4],
+    discs: &[(f32, f32, f32, u32); 4],
     ring_premul: &[u32; 4],
     (cx, cy): (f32, f32),
     (y, h): (i32, i32),
@@ -423,7 +421,7 @@ fn ring_row(
 ) {
     let ym = y as f32 + h as f32 * 0.5 - cy;
     let ym2 = ym * ym;
-    let d2_0 = discs[0].0 * discs[0].0 - ym2;
+    let d2_0 = discs[0].1 - ym2;
     if d2_0 <= 0.0 {
         return;
     }
@@ -432,21 +430,19 @@ fn ring_row(
     if hw0 < 1.0 {
         return;
     }
-    let hw = [
-        hw0,
-        {
-            let d2 = discs[1].0 * discs[1].0 - ym2;
-            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
-        },
-        {
-            let d2 = discs[2].0 * discs[2].0 - ym2;
-            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
-        },
-        {
-            let d2 = discs[3].0 * discs[3].0 - ym2;
-            if d2 > 0.0 { d2.sqrt() * wob } else { 0.0 }
-        },
-    ];
+    let mut hw = [hw0, 0.0, 0.0, 0.0];
+    let d2_1 = discs[1].1 - ym2;
+    if d2_1 > 0.0 {
+        hw[1] = d2_1.sqrt() * wob;
+        let d2_2 = discs[2].1 - ym2;
+        if d2_2 > 0.0 {
+            hw[2] = d2_2.sqrt() * wob;
+            let d2_3 = discs[3].1 - ym2;
+            if d2_3 > 0.0 {
+                hw[3] = d2_3.sqrt() * wob;
+            }
+        }
+    }
     let cx_round = cx.round() as i32;
     let x_edges = hw.map(|w| {
         if w == 0.0 {
@@ -486,16 +482,23 @@ fn ring_row(
 /// near-white): dimmed hue, pure hue, whitened hue, [`ICE_WHITE`].
 #[inline]
 const fn ice_ramp(color: u32, t: f32) -> u32 {
+    ice_ramp_with(
+        color,
+        lerp_rgb(color, 0x0000_0000, 0.50),
+        lerp_rgb(color, ICE_WHITE, 0.55),
+        t,
+    )
+}
+
+#[inline]
+const fn ice_ramp_with(color: u32, dimmed: u32, whitened: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.45 {
-        lerp_rgb(lerp_rgb(color, 0x0000_0000, 0.50), color, t / 0.45)
+        lerp_rgb(dimmed, color, t / 0.45)
+    } else if t < 0.78 {
+        lerp_rgb(color, whitened, (t - 0.45) / 0.33)
     } else {
-        let whitened = lerp_rgb(color, ICE_WHITE, 0.55);
-        if t < 0.78 {
-            lerp_rgb(color, whitened, (t - 0.45) / 0.33)
-        } else {
-            lerp_rgb(whitened, ICE_WHITE, (t - 0.78) / 0.22)
-        }
+        lerp_rgb(whitened, ICE_WHITE, (t - 0.78) / 0.22)
     }
 }
 

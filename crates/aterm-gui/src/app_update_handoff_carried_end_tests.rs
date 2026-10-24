@@ -672,17 +672,13 @@ fn prove_self_claim(ctx: &crate::SessionCtx, home: &std::path::Path, thread: &st
     );
 }
 
-/// A PROVEN SELF-CLAIM'S SHORT LANDING CROSSES A SEAMLESS UPDATE: a codex-alab
-/// worker's landing under the work floor puts no end on the glass, and an
-/// update's fence refused its mark on the worker's task record: the Commit
-/// that raised the fence stood down, its drawn face moved
-/// ([`a_self_claims_face_that_moves_after_the_park_stands_the_commit_down`]),
-/// and this is the next attempt's park. It carries the claim's face (`end=- face=landed@<at>`, where no loop at the
-/// successor would restate it), and once the claim is proven again there,
-/// the successor's status sweep marks the carried record `done why=landed`
-/// with the report its rollout holds. NEGATIVE CONTROL: the same record with
-/// no face carried (the row before this carry) stays `working`: no pass at
-/// the successor ever marks it.
+/// A codex-alab worker's short landing under the work floor puts no end on the glass, and the
+/// update's fence refused its mark on the task record. After the Commit stood down for the moved
+/// face ([`a_self_claims_face_that_moves_after_the_park_stands_the_commit_down`]), the next park
+/// carries the claim's face (`end=- face=landed@<at>`, which no loop at the successor restates),
+/// and once the claim is proven again there, the successor's status sweep marks the carried
+/// record `done why=landed` with its rollout's report. Negative control: with no face carried,
+/// the record stays `working`.
 #[test]
 fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -831,13 +827,12 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
     });
 }
 
-/// A SELF-CLAIM'S FACE THAT MOVES AFTER THE PARK STANDS THE COMMIT DOWN: the
-/// update's fence goes up at the Commit, after the park drew the session's
-/// `autopilot_end` row, so a landing between the two would cross with no face
-/// and its refused mark would be made nowhere. The Commit compares the face
-/// beside the drawn claims (`App::carried_claims_held`) and stands down, and
-/// the next attempt's draw carries the face. CONTROL: with nothing moved
-/// since the park, the drawn claims hold.
+/// A self-claim's face that moves after the park stands the Commit down: the update's fence goes
+/// up at the Commit, after the park drew the session's `autopilot_end` row, so a landing between
+/// the two would cross with no face and its refused mark would be made nowhere. The Commit
+/// compares the face beside the drawn claims (`App::carried_claims_held`) and stands down, and the
+/// next attempt's draw carries the face. Control: with nothing moved since the park, the drawn
+/// claims hold.
 #[test]
 fn a_self_claims_face_that_moves_after_the_park_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -904,11 +899,10 @@ fn a_self_claims_face_that_moves_after_the_park_stands_the_commit_down() {
     });
 }
 
-/// A CARRIED FACE CROSSES A SECOND UPDATE made before the claim is proven
-/// again at the successor: the session's park restates the face the first
-/// update carried (`SessionTimeline::carried_task_face`). NEGATIVE CONTROLS: a
-/// session adopted with no face carries none on, and nor does one told a face
-/// since it was adopted (what was told here is no claim's carry).
+/// A carried face crosses a second update made before the claim is proven again at the
+/// successor: the session's park restates the face the first update carried
+/// (`SessionTimeline::carried_task_face`). Negative controls: a session adopted with no face
+/// carries none on, and nor does one told a face since it was adopted.
 #[test]
 fn a_carried_self_claim_face_crosses_a_second_update_before_the_claim_returns() {
     let host = idle_host();
@@ -965,12 +959,11 @@ fn a_carried_self_claim_face_crosses_a_second_update_before_the_claim_returns() 
     host.shutdown_and_join();
 }
 
-/// IN THE GAP OF A PROVEN SELF-CLAIM'S OWN RE-EXEC (its `upgrade@v1`, then
-/// the claim given back) the record is drawn owed, `claim_known=false`, so
-/// the successor holds its watch-only loop off (`SessionRecord::claim_grace`)
-/// and that loop's start face cannot overwrite the carried one; and the face
-/// the claim showed is carried. NEGATIVE CONTROL: a plain give-back, with no
-/// `upgrade@v1` before it, is drawn known free and carries no face.
+/// In the gap of a proven self-claim's own re-exec (its `upgrade@v1`, then the claim given back)
+/// the record is drawn owed, `claim_known=false`, so the successor holds its watch-only loop off
+/// (`SessionRecord::claim_grace`) and that loop's start face cannot overwrite the carried one; the
+/// face the claim showed is carried. Negative control: a plain give-back, with no `upgrade@v1`
+/// before it, is drawn known free and carries no face.
 #[test]
 fn a_self_claims_reexec_gap_is_drawn_owed_with_its_face() {
     let state = aterm_tempfile::Builder::new()
@@ -1043,11 +1036,10 @@ fn a_self_claims_reexec_gap_is_drawn_owed_with_its_face() {
     });
 }
 
-/// A TURN BEGUN AFTER A LANDING REOPENS the task record from the face the
-/// claim showed or a seamless update carried, never from a face held only
-/// because the shown one went unknown, which may be aterm's own watch-only
-/// loop's start face. NEGATIVE CONTROL: the same open face, carried, reopens
-/// the record `working`.
+/// A turn begun after a landing reopens the task record from the face the claim showed or a
+/// seamless update carried, never from a face held only because the shown one went unknown (which
+/// may be aterm's own watch-only loop's start face). Negative control: the same open face, carried,
+/// reopens the record `working`.
 #[test]
 fn only_a_shown_or_carried_open_face_reopens_a_landed_task() {
     use crate::task_record::{TaskMark, TaskState, WHY_LANDED, mark_session_task};

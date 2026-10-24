@@ -744,7 +744,7 @@ fn each_reading_follows_its_rows() {
             glass_row(&app, wid, rule)
         );
     }
-    let banner = aterm_phase::anchor_text("launch.banner");
+    let banner = aterm_phase::anchor!("launch.banner");
     let card = |model: &str| -> Vec<String> {
         let mut rows = screen(&AT_REST);
         rows[1] =
@@ -792,7 +792,7 @@ fn each_reading_follows_its_rows() {
 #[test]
 fn a_refused_card_costs_a_settled_frame_nothing() {
     let rule = AT_REST.bottom();
-    let banner = aterm_phase::anchor_text("launch.banner");
+    let banner = aterm_phase::anchor!("launch.banner");
     let card = || -> Vec<String> {
         let mut rows = screen(&AT_REST);
         rows[1] =

@@ -366,10 +366,9 @@ fn a_bring_up_below_the_floor_is_refused_before_it_clones() {
     ));
 }
 
-/// A cut bake's partial and an old pin's baked disk are the lane's own, and go before the
-/// floor is read: they cannot hold the volume under it at every bring-up. NEGATIVE CONTROL:
-/// a file the lane does not own frees the same and is never removed, so the bring-up is
-/// refused.
+/// A cut bake's partial and an old pin's baked disk go before the floor is read. The negative
+/// control: a file the lane does not own is never removed, so a bring-up only it would lift
+/// over the floor is refused.
 #[test]
 fn the_lanes_own_leftovers_go_before_the_floor_is_read() {
     let s = scratch();

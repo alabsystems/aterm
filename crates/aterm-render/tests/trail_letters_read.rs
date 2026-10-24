@@ -2,13 +2,13 @@
 // Copyright 2026 Andrew Yates
 //
 // Every letter a cursor trail lies on reads at the bar: the trail gallery's scenes replayed through
-// the shipping effects pipeline (the page host's `EffectsPipeline::apply`, which runs the same
-// cursor family as a window) and the real renderer, every 16 ms frame, each lettered cell judged
-// as `aterm-lab trail-contrast` judges a gallery frame: the lower of the whole cell's median ink
-// against its median ground and the worst pixel row's lower median of each solid ink pixel against
-// its nearest ring of ground (`local_contrast`), on the default dark theme, GitHub Light and
-// Default Light.
+// the shipping effects pipeline (`EffectsPipeline::apply`, which runs a window's cursor family) and
+// the real renderer, every 16 ms frame, each lettered cell judged as `aterm-lab trail-contrast`
+// judges a gallery frame: the lower of the whole cell's median ink against its median ground and
+// the worst pixel row's lower median of each solid ink pixel against its nearest ring of ground
+// (`local_contrast`).
 
+use crate::wcag::{contrast, luma};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 use aterm_effects::cursor_fx::TrailColor;
@@ -73,25 +73,6 @@ pub const PAPER_GREY: Look = Look {
     bg: 0x00FF_FFFF,
     cursor: 0x0009_69DA,
 };
-
-fn lin(c: u32) -> f64 {
-    let s = f64::from(c & 0xff) / 255.0;
-    if s <= 0.040_45 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn luma(p: u32) -> f64 {
-    0.2126 * lin(p >> 16) + 0.7152 * lin(p >> 8) + 0.0722 * lin(p)
-}
-
-pub fn contrast(a: u32, b: u32) -> f64 {
-    let (la, lb) = (luma(a), luma(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
-}
 
 /// Each channel's median (the upper one of an even count).
 fn median(px: &[u32]) -> u32 {
@@ -629,10 +610,10 @@ const SCENES: [Scene; 4] = [Scene::Typing, Scene::EnterBottom, Scene::Burst, Sce
 const LOOKS: [Look; 3] = [DARK, GITHUB_LIGHT, DEFAULT_LIGHT];
 const DIM_LOOKS: [Look; 3] = [DIM_GREY, SOLARIZED_DARK, PAPER_GREY];
 
-/// THE LEGIBILITY LAW, judged frame by frame: every style the picker offers but classic (main's
-/// byte-identical v0.28 restoration, ruled), on dark, GitHub Light and Default Light, through
-/// typing, a burst, an Enter at the bottom row (the echo and the printed line every frame after
-/// it) and wide letters, keeps every letter it lies on at 4.5:1 or better.
+/// Every style but classic (whose spectrum face keeps its v0.28 bytes), on dark, GitHub Light
+/// and Default Light, through typing, a burst, an Enter at the bottom row (the echo and the
+/// printed line every frame after it) and wide letters, keeps every letter it lies on at 4.5:1
+/// or better, frame by frame.
 #[test]
 fn every_letter_a_trail_lies_on_reads_at_the_bar() {
     let mut jobs = Vec::new();
@@ -659,12 +640,9 @@ fn every_letter_a_trail_lies_on_reads_at_the_bar() {
     assert!(verdicts.iter().all(|v| v.worst.is_some()));
 }
 
-/// The negative control: the same replays with the letter guard off bury letters, each one a
-/// defect the trail gallery photographed: the ribbon's Enter flare across the
-/// printed line and the echo, Laser's Enter bolt across the printed line, the caret bloom of
-/// Beam, Phaser, Comet, Lumen and Sparkle on the newest letters, Water's wave through the letters
-/// on dark and in the burst on paper, the ribbon head's bloom in the burst, and Fire's spark on a
-/// wide letter on both papers.
+/// Negative control: with the letter guard off, each of these replays buries a letter (the
+/// ribbon's and Laser's Enter flares across the printed line, the caret blooms on the newest
+/// letters, Water's wave, the ribbon head's bloom in the burst, Fire's spark on a wide letter).
 #[test]
 fn without_the_letter_guard_the_trails_bury_letters() {
     let jobs = [
@@ -695,11 +673,9 @@ fn without_the_letter_guard_the_trails_bury_letters() {
     );
 }
 
-/// CLASSIC IN A CHOSEN COLOUR (looks6 N10, 2026-10-23): Classic's spectrum face keeps its v0.28
-/// bytes (ruled), but its one-colour face is a colour the user chose (`cursor_trail_color =
-/// "#d03a8c"`) and the newest letter under it read 3.46:1 to 3.51:1 on the dark page. The guard
-/// holds that face in intensity only, so every letter keeps the bar through typing and a burst.
-/// Negative control: the guard off buries a letter under it.
+/// Classic's one-colour face in a colour the user chose (`cursor_trail_color = "#d03a8c"`) keeps
+/// every letter at the bar through typing and a burst: the guard holds that face in intensity
+/// only (the spectrum face keeps its v0.28 bytes). Negative control: the guard off buries a letter.
 #[test]
 fn classic_in_a_chosen_colour_keeps_every_letter() {
     let run = |scene: Scene, guard: bool| {
@@ -748,17 +724,11 @@ fn classic_in_a_chosen_colour_keeps_every_letter() {
     );
 }
 
-/// THE LAW ON DIM TEXT: text that clears the bar with little room, a 5.0:1 grey on the dark
-/// page and Solarized Dark's 4.75:1, reads its solid ink under the guard's floor on the bare
-/// page, so a guard that gives up on it leaves every light whole (a 5.0:1 grey under Sparkle's
-/// caret bloom read 1.01:1, Solarized under Laser's Enter bolt 1.34:1). Every style but
-/// classic, through every scene, keeps each letter it lies on at four fifths of the theme's
-/// own contrast ([`look_bar`]); the ribbons too, through every scene: the pet under `echo`'s
-/// `o` on `dim-grey` (3.59:1, now veiled with the page under its letters) and the bed's top
-/// edge under `fox` on Solarized Dark (3.54:1, the ring reading the page's green with the
-/// bed's blue, now held at that mix; their controls are `aterm-effects`' unit laws, the pet's
-/// path through a replay being the frame's own). Negative control: the guard off buries a
-/// letter under that bar in each of the control replays.
+/// On [`DIM_GREY`] and [`SOLARIZED_DARK`], whose solid ink reads under the guard's floor on the
+/// bare page (a guard that gave up on it would leave every light whole), every style but classic,
+/// through every scene, keeps each letter it lies on at four fifths of the theme's own contrast
+/// ([`look_bar`]). Negative control: the guard off buries a letter under that bar in each control
+/// replay.
 #[test]
 fn every_letter_on_a_dim_theme_keeps_its_own_reading() {
     let mut jobs = Vec::new();

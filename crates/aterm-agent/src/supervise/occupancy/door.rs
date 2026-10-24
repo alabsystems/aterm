@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure decision helpers for typing a due fact line at a drawn break under `prompt`, and the hung-call stuck fact under `[harness] stuck_break_note` ([`BreakLine::Stuck`], [`stuck_at_break`]).
+//! Pure decision helpers for typing a due fact line at a drawn break under `prompt`, and for the
+//! hung-call stuck fact under `[harness] stuck_break_note` ([`BreakLine::Stuck`],
+//! [`stuck_at_break`]).
 
 use super::reading::OccupancyReading;
 use super::rules::{self, Books, Guards, HoldSeen, RuleId};
@@ -41,7 +43,8 @@ impl StatusSeen {
         })
     }
 
-    /// Whether a person's hand may be on the session within `grace_s` (treating missing stamps as present).
+    /// Whether a person's hand may be on the session within `grace_s` (a missing stamp counts as
+    /// present).
     #[must_use]
     pub fn person(&self, grace_s: u32) -> bool {
         self.driver || self.human.within(grace_s) != Some(false)
@@ -59,7 +62,8 @@ pub struct AtWrite {
     pub upgrade_due: bool,
 }
 
-/// A line at a break (§2.1's order): a built-in rule's (rank 5), or the hung-call stuck fact (rank 4: after the upgrade's notice, before the nudges).
+/// A line at a break (§2.1's order): a built-in rule's (rank 5), or the hung-call stuck fact
+/// (rank 4: after the upgrade's notice, before the nudges).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakLine {
     /// A built-in rule's line under `prompt`.
@@ -75,7 +79,8 @@ impl From<RuleId> for BreakLine {
 }
 
 impl BreakLine {
-    /// The autopilots its lines are for: a rule's ([`rules::modes`]); the stuck fact's, every one but Off (system awareness §14.4).
+    /// The autopilots its lines are for: a rule's ([`rules::modes`]); for the stuck fact, every
+    /// one but Off (system awareness §14.4).
     #[must_use]
     pub const fn modes(self) -> &'static [Autopilot] {
         match self {
@@ -85,7 +90,9 @@ impl BreakLine {
     }
 }
 
-/// Returns the first write-time hold on a due `line`, if any: the break's line gone, the host's withhold, then the upgrade's notice due (rank 3, which every nudge and the stuck fact wait for).
+/// Returns the first write-time hold on a due `line`, if any: the break's line gone, the host's
+/// withhold, then the upgrade's notice due (rank 3, which every nudge and the stuck fact wait
+/// for).
 #[must_use]
 pub fn write_held(line: impl Into<BreakLine>, w: AtWrite) -> Option<Guard> {
     use super::fault::{Fault, armed};
@@ -121,7 +128,10 @@ pub enum StuckVerdict {
     Due,
 }
 
-/// Judges the stuck fact at a break (§2.1's rank 4; its episode untold, its reading fresh): ungranted without the key, else held by `g` for its autopilots ([`BreakLine::modes`]), then by `w` ([`write_held`]), then by the session's pace ([`rules::pace_next`]); else due. Asked at the decider and again at the write.
+/// Judges the stuck fact at a break (§2.1's rank 4, for an untold episode on a fresh reading):
+/// ungranted without the key, else held by `g` for its autopilots ([`BreakLine::modes`]), then
+/// by `w` ([`write_held`]), then by the session's pace ([`rules::pace_next`]); else due. Asked at
+/// the decider and again at the write.
 #[must_use]
 pub fn stuck_at_break(
     grant: Option<&StuckBreakGrant>,
@@ -166,7 +176,8 @@ impl FactDoor {
     }
 }
 
-/// The `fact-intent@v1` reason for an episode of a kind other than the hold: `kind=<word> episode=<hex> door=<word>`, which [`seed_rows_in`] reads back.
+/// The `fact-intent@v1` reason for an episode of a kind other than the hold:
+/// `kind=<word> episode=<hex> door=<word>`, which [`seed_rows_in`] reads back.
 #[must_use]
 pub fn fact_intent_reason(key: EpisodeKey, door: FactDoor) -> String {
     format!(
@@ -343,10 +354,10 @@ pub fn outcome_reason(
     }
 }
 
-/// THE TASK DOOR'S MARK (`door=task`): every row the occupancy loop books for a managed
-/// session's fact word carries it (its intent, its outcome, its clear, and under `observe` its
-/// would-be note), and no reader of the typed door's rows ([`seed_rows_in`], [`break_lines_in`],
-/// `rules::would_rows_in`, the Harness page's counts) takes such a row for a line.
+/// The task door's mark: every row the occupancy loop books for a managed session's fact word
+/// carries it (intent, outcome, clear and, under `observe`, the would-be note), and no reader of
+/// the typed door's rows ([`seed_rows_in`], [`break_lines_in`], `rules::would_rows_in`, the
+/// Harness page's counts) takes such a row for a line.
 pub const TASK_DOOR: &str = "door=task";
 
 /// Whether a row's `reason` is the task door's ([`TASK_DOOR`]).
@@ -364,8 +375,8 @@ pub(crate) struct TaskCustody {
 }
 
 impl TaskCustody {
-    /// Read this session's acknowledged notes and clears beside actual hold boundaries.
-    /// An intent, would-be note or refusal cannot replace an acknowledged predecessor.
+    /// Reads this session's acknowledged notes and clears beside its hold boundaries. An intent,
+    /// would-be note or refusal never replaces an acknowledged predecessor.
     pub(crate) fn from_ledger(body: &str, sid: Option<&str>) -> Self {
         let want = sid.map(|sid| sid.trim_start_matches('@'));
         let hold = FactKind::Hold.rule();
@@ -407,7 +418,8 @@ impl TaskCustody {
         custody
     }
 
-    /// A stale/relaunch close can be observed after the ledger was read but before task seeding.
+    /// Marks the hold closed: a stale or relaunch close can come after the ledger was read but
+    /// before task seeding.
     pub(crate) fn close(&mut self) {
         self.closed = true;
     }
@@ -459,7 +471,10 @@ pub fn task_clear_reason(word: super::FactWord, outcome: super::NoteOutcome) -> 
     }
 }
 
-/// Extracts the fact rows for `sid` from ledger `body`, oldest first, for [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row; the task door's rows ([`is_task_row`]) none.
+/// Extracts the fact rows for `sid` from ledger `body`, oldest first, for
+/// [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its
+/// `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row, but none
+/// of the task door's rows ([`is_task_row`]).
 #[must_use]
 pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, SeedOutcome)> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
@@ -509,12 +524,11 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
     rows
 }
 
-/// When (unix ms, oldest first) each line of aterm's own a loop before this one typed at a break
-/// went, from ledger `body`: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break`
-/// (a rider's `door=turn-end` row is no line of its own) and its `fact-hold@v1` rows `typed`
-/// (the door's lines under `prompt`; a `fact-would@v1` row never went). A successor paces the
-/// stuck line by them, as [`super::rules::would_rows_in`] seeds the door's own books; each comes
-/// with its kind (`NoProgress` or `Hold`).
+/// When (unix ms, oldest first) each line an earlier loop typed at a break went, from ledger
+/// `body`, with its kind: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break` (a
+/// rider's `door=turn-end` row is no line of its own) and its `fact-hold@v1` rows `typed`. A
+/// successor paces the stuck line by them, as [`super::rules::would_rows_in`] seeds the door's
+/// own books.
 #[must_use]
 pub fn break_lines_in(body: &str, sid: Option<&str>) -> Vec<(i64, FactKind)> {
     let (stuck, hold) = (FactKind::NoProgress.rule(), FactKind::Hold.rule());

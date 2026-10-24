@@ -72,7 +72,7 @@ pub(crate) enum FactAct {
     UseAccount(AccountLabel),
     /// Unpin and return to automatic account rotation (dedicated → pool).
     AutoRotate,
-    /// Open a tab at the account settings directory (`~/.aterm`).
+    /// Open a tab in the folder of the account roster (`accounts.toml`, beside `aterm.toml`).
     AccountSettings,
 }
 
@@ -229,12 +229,11 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
     }
 }
 
-/// What the account menu takes of a Claude Code footer's subscription `sub` (a 7d wall in its
-/// transcript when `walled`) at `now`: the session's figure for its own row (its whole percent
-/// left and, past [`WeeklyFigure::current`], its age, as [`row_figure`] gives a store's), the
-/// meter line, and why there is none where the footer says. A figure whose week has reset since
-/// the footer's read gives neither row nor meter (its words are the expired week's), and a
-/// wall's or a screen's words, with no figure behind them, give their own percent.
+/// What the account menu takes from a footer's subscription `sub` at `now` (`walled`: a 7d wall
+/// in its transcript): the session's own row figure (as [`row_figure`] gives it), the meter
+/// line, and the footer's gap where there is neither. A figure whose week has reset since the
+/// footer read it gives no row or meter; a wall's or a screen's words, with no figure behind
+/// them, give their own percent.
 pub(crate) fn weekly_facts(
     sub: &aterm_agent::harness::profile::SubscriptionDisplay,
     walled: bool,
@@ -271,10 +270,8 @@ pub(crate) fn session_figure(
         .filter(|figure| sub.weekly.is_some() && figure.resets_at > now)
 }
 
-/// An account row's figure and its age ([`account_menu_rows_from`]): its whole percent left,
-/// and ` · 40m ago`, ` · 3h ago` or ` · 2d ago` past [`WeeklyFigure::current`] (the footer's
-/// one age rule; a row keeps an older figure, with its age, where the footer drops it, and
-/// one stamped ahead of `now` with none).
+/// An account row's whole percent left and, once the figure is past [`WeeklyFigure::current`],
+/// its age (` · 40m ago`, ` · 3h ago`, ` · 2d ago`); a figure stamped ahead of `now` has no age.
 fn row_figure(figure: WeeklyFigure, now: i64) -> (u32, String) {
     let left = whole_left(1000u32.saturating_sub(figure.used_x10.min(1000)));
     let age = now.saturating_sub(figure.at);
@@ -316,7 +313,7 @@ pub(crate) struct FactMenuFacts {
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
     /// The pooled CLI the session runs, whose roster [`Self::accounts`] lists (`None`: Claude
-    /// Code's, as every menu was before other CLIs had pools).
+    /// Code's).
     pub(crate) cli: Option<aterm_agent::harness::accounts::Cli>,
     /// The rotation accounts in roster order (dedicated first, then pool).
     pub(crate) accounts: Vec<AccountMenuRow>,
@@ -331,7 +328,8 @@ pub(crate) struct FactMenuFacts {
     pub(crate) folder_hygiene: Vec<String>,
     /// Repository hygiene & drift notes for [`Fact::Branch`] (`repo_work::RepoHygiene`).
     pub(crate) git_hygiene: Vec<String>,
-    /// Whether the top-effort key toggle row offers to turn the key on (`Some(true)`) or off (`Some(false)`).
+    /// Whether the top-effort key toggle row offers to turn the key on (`Some(true)`) or off
+    /// (`Some(false)`).
     pub(crate) key_row: Option<bool>,
     /// Refusal note shown above disabled typed rows.
     pub(crate) note: Option<String>,
@@ -1002,9 +1000,9 @@ impl App {
             .unwrap_or(aterm_agent::harness::accounts::Cli::Claude)
     }
 
-    /// `aterm harness accounts use <label> --cli <id>` (or `--auto` where `label` is `None`) for
-    /// another CLI's pool, from its fact menu: the pin its own store keeps, which a launch aterm
-    /// makes of the CLI takes ([`aterm_agent::harness::cli::run_accounts_of`]).
+    /// `aterm harness accounts use <label> --cli <id>` (`--auto` where `label` is `None`) for
+    /// another CLI's pool, from its fact menu: the pin lands in that CLI's own store, where aterm's
+    /// next launch of the CLI reads it ([`aterm_agent::harness::cli::run_accounts_of`]).
     fn use_pool_account(cli: aterm_agent::harness::accounts::Cli, label: Option<&str>) {
         use aterm_agent::harness::cli::{
             AccountsCmd, AccountsOf, Env, LiveAccounts, run_accounts_of,

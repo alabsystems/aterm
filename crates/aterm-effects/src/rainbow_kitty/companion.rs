@@ -22,7 +22,7 @@ pub const FLYING_LEAD_0: f32 = -0.30;
 /// `LEAD_MAX = +0.22` cell.
 pub const FLYING_LEAD_MAX: f32 = 0.22;
 
-/// The 1-px look-back toward the launch lasts **250 ms** after arrival (§7.2, row "Eyes").
+/// The 1-px look-back toward the launch lasts 250 ms after arrival (§7.2, row "Eyes").
 pub const FLYING_LOOKBACK_MS: f32 = 250.0;
 
 /// The squint holds 200 ms past the arrival edge (§7.2, row "Eyes").
@@ -469,23 +469,34 @@ impl PetOnGlass {
     #[inline]
     #[must_use]
     pub fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
+        Self::of_with_body_px(frame, geom).map(|(on_glass, _)| on_glass)
+    }
+
+    /// Read [`PetOnGlass`] and the body's window-pixel box `(x0, x1, y0, y1)` off the pet's published frame in a single pass.
+    #[inline]
+    #[must_use]
+    pub fn of_with_body_px(frame: &PetFrame, geom: Geom) -> Option<(Self, (i32, i32, i32, i32))> {
         let cell_w = u16::try_from(geom.cw).ok()?;
         let cell_h = u16::try_from(geom.ch).ok()?;
         let cols = u16::try_from(geom.cols).ok()?;
         let rows = u16::try_from(geom.rows).ok()?;
-        let (x0, x1, _, _) = frame.body_px(cell_w, cell_h, cols, rows)?;
+        let (x0, x1, y0, y1) = frame.body_px(cell_w, cell_h, cols, rows)?;
         let cw = f32::from(cell_w);
         if cw <= 0.0 {
             return None;
         }
-        Some(Self {
-            col: x0 as f32 / cw,
-            width: (x1 - x0) as f32 / cw,
-            row: u16::try_from(frame.row.round().max(0.0) as u32).unwrap_or(u16::MAX),
-            settled: frame.action.settled(),
-            purr: frame.purr,
-            contented: frame.contented,
-        })
+        let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        Some((
+            Self {
+                col: x0 as f32 / cw,
+                width: (x1 - x0) as f32 / cw,
+                row: u16::try_from(frame.row.round().max(0.0) as u32).unwrap_or(u16::MAX),
+                settled: frame.action.settled(),
+                purr: frame.purr,
+                contented: frame.contented,
+            },
+            (x0 + ox, x1 + ox, y0 + oy, y1 + oy),
+        ))
     }
 
     /// The body's column span, `[left, right]`, in fractional grid columns.
@@ -516,12 +527,10 @@ impl PetOnGlass {
 const SHADE_BORDER_CELLS: f32 = 0.30;
 
 /// The pet's body as the sky draws around it: a star whose centre lies on the
-/// body is not drawn, so the cat flies in front of the sky and no star sits
-/// on its fur (on paper, purple sky stars would stand on a flying
-/// companion's face and back, `burst` t0). The pet ticks after the sky emits,
-/// so the shade is the body's last box joined with that box carried on by
-/// its last frame's move (the box it is about to be drawn at), each shaved
-/// of the tile's transparent border at the sides.
+/// body is not drawn, so the cat flies in front of the sky. The pet ticks after
+/// the sky emits, so the shade is the body's last box joined with that box
+/// carried on by its last frame's move (the box it is about to be drawn at),
+/// each shaved of the tile's transparent border at the sides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PetShade {
     /// The last two drawn boxes, `(x0, x1, y0, y1)` in window pixels, newest first.
@@ -569,11 +578,7 @@ impl PetShade {
 /// filled cell (a powerline segment, a selection) of a row the caret is not
 /// on, as window-pixel boxes `(x0, x1, y0, y1)`, right and bottom exclusive.
 /// No star is drawn on them and the ribbon's body never feathers up into
-/// them. The gallery's judges, 2026-10-23 (looks6 N3, N4): sky stars on the
-/// dog's face and pink sparkles on the fox's, the Enter flare washing the
-/// fox's white chin lilac, a bright star on the `2` of `main +2` and a green
-/// one in its gap, and the bed's top feather tinting the segment's bottom
-/// 3-4 px (yellow to olive, its grey bar to violet).
+/// them.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct KeepOut {
     /// Every box: the word icons' and the lettered or filled cells'.
@@ -700,11 +705,9 @@ impl KeepOut {
     /// What is left of a column's span `(y0, y1)` across `(x0, x1)` once
     /// every lettered or filled cell's box it meets is cut off its top: the
     /// span below the lowest box bottom it meets (empty when a box reaches
-    /// its foot). A word icon is not among them: the frame's shade cuts a
-    /// light by the face's drawn rows (`CursorGlow::shade_word_icons`), and
-    /// a column cut whole by the icon's sprite box, which is wider than the
-    /// face, carved a square notch out of the sky beside the dog's face
-    /// (looks6 round 3).
+    /// its foot). Word icons are left out: the frame's shade cuts a light by
+    /// the face's drawn rows (`CursorGlow::shade_word_icons`), and the icon's
+    /// sprite box, wider than the face, would notch the sky beside it.
     #[inline]
     #[must_use]
     pub fn below(&self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> (i32, i32) {
@@ -783,16 +786,11 @@ impl PetOffer {
 
 /// The seat law's ink probe ([`placement`]) over a frame's cells: whether
 /// (`row`, `col`) holds a letter. A row the frame carries holds only its
-/// written columns; the columns past them, inside the grid's `cols`, are the
-/// frame's implicit blank (unwritten glass), not unknown. Read as unknown,
-/// they would make every probe of a head that sits past a line's last letter
-/// blind, and the blind seat would put it behind the caret, on the letters: a
-/// kitten-size nyan head at the end of `... the kitty flies` typed to two
-/// cells short of the margin would sit on `flies` from the last key through
-/// its landing (the trail gallery's `burst` on GitHub Light, 1.1 to 2.6:1
-/// under the head) where a larger head, reaching back over a letter, rises
-/// into the row above. A row the frame does not carry, or a column past the
-/// grid, is unknown.
+/// written columns; the columns past them, inside the grid's `cols`, are
+/// blank glass, not unknown: read as unknown, they would blind every probe of
+/// a head past a line's last letter, and the blind seat would put it behind
+/// the caret, on the letters. A row the frame does not carry, or a column
+/// past the grid, is unknown.
 #[inline]
 #[must_use]
 pub fn cell_ink(
@@ -868,9 +866,9 @@ mod tests {
         }
     }
 
-    /// The head at a line's end, typed up to the margin: the line is written
-    /// up to the cells the mirror seat would cover, which are blank (spaces, or
-    /// keys whose echo has not landed), and the row above is blank.
+    /// Typed up to the margin, the head at a line's end rises into the row
+    /// above once and stays; mid-line, a held sky keeps it up. Negative
+    /// control: unheld, the head goes down and up with the keys.
     #[test]
     fn at_the_line_s_end_the_head_rises_once_and_stays() {
         let walk = |held: bool, margin: bool| -> Vec<(u16, u16, Side)> {
@@ -945,12 +943,9 @@ mod tests {
         );
     }
 
-    /// A head past a line's last letter, over the row's unwritten columns,
-    /// rises into the row above when the line is written up to the caret:
-    /// the frame's trimmed row reads blank past its written cells
-    /// ([`cell_ink`]), so the probe is not blind. Negative control: read as
-    /// unknown, the columns blind the probe and the head sits behind the
-    /// caret on the letters.
+    /// A head past a line's last letter reads the row's unwritten columns blank
+    /// ([`cell_ink`]) and rises into the row above. Negative control: read as
+    /// unknown, they blind the probe and the head sits behind the caret.
     #[test]
     fn a_head_past_the_last_letter_reads_the_unwritten_columns_blank() {
         use aterm_core::terminal::RenderCell;
@@ -1019,8 +1014,8 @@ mod tests {
         cell_span(s.x, i32::from(s.w), CW, 120)
     }
 
-    /// L-A: the router names one body, the host duty's, and a frame whose body
-    /// is already claimed draws nothing.
+    /// The router names one body, the host duty's, and a frame whose body is
+    /// already claimed draws nothing.
     #[test]
     fn a_claimed_frame_draws_no_second_body() {
         for (duty, want) in [
@@ -1092,7 +1087,7 @@ mod tests {
         }
     }
 
-    /// L-D: whatever the caret column and ink, the seat never covers the caret
+    /// Whatever the caret column and ink, the seat never covers the caret
     /// cell or an avoidable inked cell, keeps the shipped seat on blank glass
     /// wherever it clears the caret, yields behind where the margin clamp makes
     /// it intrude, and carries one position.
@@ -1307,11 +1302,9 @@ mod tests {
         assert_ne!(mixed.row, 7, "a single unknowable cell in the span yields");
     }
 
-    /// THE KEEP-OUT (looks6 N3, N4): a mark whose reach touches a word
-    /// icon's or another row's lettered box is kept off it, and one beside
-    /// it is not; a body standing on the row under a lettered box reaches
-    /// no higher than the row's top over it, easing back to its own reach
-    /// beside it. Negative control: an empty keep-out keeps nothing.
+    /// A mark that reaches a box is kept off it and one beside it is not; a body under a box
+    /// reaches no higher than its row's top there, easing back beside it. Negative control: an
+    /// empty keep-out keeps nothing.
     #[test]
     fn the_keep_out_holds_marks_and_the_body_s_top_off_its_boxes() {
         let mut k = KeepOut::default();

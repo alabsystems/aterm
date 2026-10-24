@@ -1762,10 +1762,10 @@ impl WordDecorations {
 
     #[inline]
     fn begin_baker_frame(&mut self, geom: EffectGeom, _animals: bool) {
+        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         if self.cat_baker_ready {
             return;
         }
-        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
         self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
         self.cat_baker_ready = true;
@@ -2386,8 +2386,11 @@ impl WordDecorations {
             };
             let mouth_y = sprite.y + i32::from(sprite.h) / 2;
             let note_dir = if flip_x { -1.0 } else { 1.0 };
+            let alpha_f = f32::from(alpha);
+            let cw_f = f32::from(geom.cell_w);
+            let ch_f = f32::from(geom.cell_h);
             for (slot, note) in note_sprites.iter_mut().zip(notes.iter().flatten()) {
-                let a = (f32::from(note.alpha) * f32::from(alpha) / 255.0 * sing) as u8;
+                let a = (f32::from(note.alpha) * alpha_f / 255.0 * sing) as u8;
                 if a == 0 {
                     continue;
                 }
@@ -2409,10 +2412,8 @@ impl WordDecorations {
                 ) else {
                     continue;
                 };
-                let nx = mouth_x + (note_dir * note.dx * f32::from(geom.cell_w)).round() as i32
-                    - i32::from(nw) / 2;
-                let ny =
-                    mouth_y + (note.dy * f32::from(geom.cell_h)).round() as i32 - i32::from(nh) / 2;
+                let nx = mouth_x + (note_dir * note.dx * cw_f).round() as i32 - i32::from(nw) / 2;
+                let ny = mouth_y + (note.dy * ch_f).round() as i32 - i32::from(nh) / 2;
                 *slot = Some(FreeSprite {
                     x: if placement.in_motion() {
                         nx
@@ -2478,7 +2479,6 @@ impl WordDecorations {
             return None;
         }
         self.begin_baker_frame(geom, true);
-        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
 
         let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
@@ -2546,55 +2546,61 @@ impl WordDecorations {
 
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [const { None }; crate::kitty_pet::PET_MOTES_MAX];
-        let side = crate::kitty_pet::mote_tile_side(geom.cell_h);
-        for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
-            let alpha = (f32::from(m.alpha) * f32::from(pet.alpha) / 255.0) as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let Some((x, y, dest)) = crate::kitty_pet::mote_box_px(
-                (m.col, m.row),
-                m.scale,
-                (geom.cell_w, geom.cell_h),
-                (geom.cols, geom.rows),
-            ) else {
-                continue;
-            };
-            let bucket = Self::pet_mote_rot_bucket(m.rot);
-            let host = Self::pet_mote_host_id(m.kind, bucket, side);
-            let Some(tile) = self.cat_baker.host_peek(host).or_else(|| {
-                if !self.cat_baker.can_bake() {
-                    return None;
+        if pet.alpha > 0 {
+            let pet_alpha_f = f32::from(pet.alpha);
+            let mut side = 0u16;
+            for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
+                let alpha = (f32::from(m.alpha) * pet_alpha_f / 255.0) as u8;
+                if alpha == 0 {
+                    continue;
                 }
-                let side_u32 = u32::from(side);
-                let paint = match &mut self.mote_scratch {
-                    Some(tile) => {
-                        tile.reset(side_u32, side_u32);
-                        tile
-                    }
-                    slot @ None => slot.insert(aterm_scene::Tile::new(side_u32, side_u32)),
+                let Some((x, y, dest)) = crate::kitty_pet::mote_box_px(
+                    (m.col, m.row),
+                    m.scale,
+                    (geom.cell_w, geom.cell_h),
+                    (geom.cols, geom.rows),
+                ) else {
+                    continue;
                 };
-                Self::paint_pet_mote(paint, m.kind, bucket, side);
-                self.cat_baker.host_tile(host, side, side, paint.pixels())
-            }) else {
-                continue;
-            };
-            *slot = Some(FreeSprite {
-                x,
-                y,
-                w: dest,
-                h: dest,
-                art: tile.art,
-                clip: PxRect::EVERYWHERE,
-                tint: Self::pet_mote_on_page(
-                    m.kind,
-                    m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
-                    page,
-                ),
-                alpha,
-                flip_x: false,
-                z: FreeZ::OverText,
-            });
+                if side == 0 {
+                    side = crate::kitty_pet::mote_tile_side(geom.cell_h);
+                }
+                let bucket = Self::pet_mote_rot_bucket(m.rot);
+                let host = Self::pet_mote_host_id(m.kind, bucket, side);
+                let Some(tile) = self.cat_baker.host_peek(host).or_else(|| {
+                    if !self.cat_baker.can_bake() {
+                        return None;
+                    }
+                    let side_u32 = u32::from(side);
+                    let paint = match &mut self.mote_scratch {
+                        Some(tile) => {
+                            tile.reset(side_u32, side_u32);
+                            tile
+                        }
+                        slot @ None => slot.insert(aterm_scene::Tile::new(side_u32, side_u32)),
+                    };
+                    Self::paint_pet_mote(paint, m.kind, bucket, side);
+                    self.cat_baker.host_tile(host, side, side, paint.pixels())
+                }) else {
+                    continue;
+                };
+                *slot = Some(FreeSprite {
+                    x,
+                    y,
+                    w: dest,
+                    h: dest,
+                    art: tile.art,
+                    clip: PxRect::EVERYWHERE,
+                    tint: Self::pet_mote_on_page(
+                        m.kind,
+                        m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
+                        page,
+                    ),
+                    alpha,
+                    flip_x: false,
+                    z: FreeZ::OverText,
+                });
+            }
         }
         let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
             [const { None }; crate::kitty_pet::PET_DEPARTURES_MAX];
@@ -2670,24 +2676,7 @@ impl WordDecorations {
         if alpha == 0 {
             return None;
         }
-        let ghost = crate::kitty_pet::PetFrame {
-            alpha,
-            lane_alpha: alpha,
-            action: pet.action,
-            pose: d.pose,
-            col: d.col,
-            row: d.row,
-            lift: d.lift,
-            facing_left: d.facing_left,
-            scale_x: d.scale_x,
-            scale_y: d.scale_y,
-            purr: 0.0,
-            contented: false,
-            under_ink: pet.under_ink,
-            motes: [None; crate::kitty_pet::PET_MOTES_MAX],
-            departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
-        };
-        let (x0, x1, y0, y1) = ghost.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)?;
+        let (x0, x1, y0, y1) = d.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)?;
         let key = crate::pet_baker::PetBakeKey {
             pose: d.pose,
             coat: d.coat,
@@ -2989,7 +2978,6 @@ impl WordDecorations {
         }
 
         self.begin_baker_frame(geom, false);
-        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.dog_baker.begin_frame(geom.cell_w, geom.cell_h);
 
         let key = crate::dog_baker::DogBakeKey {
@@ -6213,6 +6201,10 @@ fn emit_peek<'a>(
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) -> Option<(i32, i32)> {
+    if peek.peek_done {
+        return None;
+    }
+    let ps = peek.start?;
     let ch = i32::from(geom.cell_h);
     let rest = i32::from(cat_rest_reveal(g.hart));
     let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
@@ -6226,19 +6218,15 @@ fn emit_peek<'a>(
         // are demoted to it). The clock latched at birth, so the pose shows
         // from the first presented frame and the flags never advance while
         // reduced. An unlatched clock (defensive) shows nothing.
-        if peek.peek_done || peek.start.is_none() {
-            return None;
-        }
         (CAT_RISE_MS, false, true)
     } else {
-        let ps = peek.start?;
         if now < ps {
             arm_until(active_until, ps + Duration::from_millis(total));
             *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
             return None;
         }
         let t = now.saturating_duration_since(ps).as_millis() as u64;
-        if peek.peek_done || t >= total {
+        if t >= total {
             return None;
         }
         arm_until(active_until, ps + Duration::from_millis(total));
@@ -6653,13 +6641,7 @@ fn emit_rainbow_ink(
     } else {
         0.0
     };
-    let hue_at = |u: f32| {
-        hsv2rgb(
-            (base_hue + u * span_used + phase).rem_euclid(360.0),
-            sat,
-            val,
-        )
-    };
+    let hue_at = |u: f32| hsv2rgb(base_hue + u * span_used + phase, sat, val);
     let (guard_hues, guard_len) = if span_used == 0.0 {
         let h0 = hue_at(0.0);
         ([h0; 4], 1)
@@ -6774,7 +6756,7 @@ fn emit_rainbow_sparkles(
                 DecoGlyph::Star4
             },
             blend: DecoBlend::Add,
-            color: hsv2rgb((base_hue + 120.0 * i as f32 + 45.0 * p) % 360.0, 0.72, 1.0),
+            color: hsv2rgb(base_hue + 120.0 * i as f32 + 45.0 * p, 0.72, 1.0),
             alpha: scale_u8(env_intensity * shimmer * 0.82),
         };
         *fp = fold_deco(*fp, &d);
@@ -6829,14 +6811,8 @@ fn cat_color_context(cells: &[RenderCell], start: u16, end: u16) -> CatColorKey 
     let mut count = 1u32;
     let lo = start.saturating_sub(4);
     let hi = end.saturating_add(4).min(cells.len().saturating_sub(1));
-    for (i, cell) in cells[lo..=hi].iter().enumerate() {
-        let col = lo + i;
-        if (start..=end).contains(&col)
-            || cell.wide
-            || cell.ch == ' '
-            || cell.ch == '\0'
-            || cell.ch.is_whitespace()
-        {
+    for cell in cells[lo..start].iter().chain(&cells[end + 1..hi + 1]) {
+        if cell.wide || cell.ch == ' ' || cell.ch == '\0' || cell.ch.is_whitespace() {
             continue;
         }
         for (dst, src) in sum.iter_mut().zip(cell.fg) {
@@ -7039,19 +7015,34 @@ fn band_occupancy(
     if sampled == 0 {
         return None;
     }
+    let is_occupied = |cell: &RenderCell| {
+        cell.wide || (cell.ch != ' ' && cell.ch != '\0' && !cell.ch.is_whitespace())
+    };
     let mut occupied = 0u32;
     for r in r0..=r1 {
         let Some(line) = cells.get(r) else {
             continue;
         };
-        for c in c0..=c1 {
-            if skip_cols.as_ref().is_some_and(|s| s.contains(&c)) {
-                continue;
+        let end = line.len().min(c1.saturating_add(1));
+        if end <= c0 {
+            continue;
+        }
+        match &skip_cols {
+            Some(s) if *s.start() <= c1 && *s.end() >= c0 => {
+                let s0 = (*s.start()).clamp(c0, end);
+                let s1 = s.end().saturating_add(1).clamp(s0, end);
+                for cell in line[c0..s0].iter().chain(&line[s1..end]) {
+                    if is_occupied(cell) {
+                        occupied += 1;
+                    }
+                }
             }
-            if line.get(c).is_some_and(|cell| {
-                cell.wide || (cell.ch != ' ' && cell.ch != '\0' && !cell.ch.is_whitespace())
-            }) {
-                occupied += 1;
+            _ => {
+                for cell in &line[c0..end] {
+                    if is_occupied(cell) {
+                        occupied += 1;
+                    }
+                }
             }
         }
     }

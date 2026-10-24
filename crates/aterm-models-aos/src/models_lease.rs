@@ -1,46 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The worker-lease ledger of Aos M5b's distributed search: the formal model `AosWorkerLease` of
-//! `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11.7, over the rules of §11.5 as
-//! `aterm-effects`' `aos_momentum::lease::Ledger` implements them (the ledger is authoritative
-//! where the design text differs).
+//! The formal model `AosWorkerLease` of Aos M5b's worker-lease ledger
+//! (`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11.7), over the rules of §11.5 as
+//! `aterm-effects`' `aos_momentum::lease::Ledger` implements them; the ledger wins where the design
+//! text differs.
 
 use aterm_spec::derive::*;
 
 /// One job and two workers, A honest and B possibly lying, after both said hello and the search
-/// opened (design §11.7, "Formal model `AosWorkerLease`", with its 2026-10-23 review).
+/// opened (design §11.7, "Formal model `AosWorkerLease`").
 ///
-/// **Variables.** `job` is the job's state: 0 `Pending`, 1 `Leased`, 2 `Claimed`, 3 `Cancelled`,
-/// 4 `Exhausted`. `attempts` counts the leases issued, `holder` is the worker (1 A, 2 B) of the
-/// live lease or of the accepted claim. `wa`/`wb` are the workers' states: 0 `Idle`, 1 `Busy`,
-/// 2 `Draining { Expired }`, 3 `Draining { Cancelled }`, then `Gone` as 4 `Eof`, 5
-/// `DrainTimeout`, 6 `Retired`, 7 `Refused`. `ea`/`eb` are the epochs (attempts) of the lease each
-/// holds or drains. `ra`/`rb` are the epochs of each worker's result in flight (0: none), `lb`
-/// whether B's differs from the truth (A never lies). `acc` is the accepted claim and `late` a
-/// late claim awaiting the job's claim (0 none, 1 the truth, 2 the lie). `resent` records the
-/// claim holder's one resend. `out` is 0 open, 1 complete, 2 void. Ghosts: `twice` (a second
-/// accept), `stale` (an accept on an expired lease), `post` (an accept after a cancel) and
-/// `ignored` (a claim differing from the accepted one arrived and `out` is not void).
+/// Variables: `job` is 0 `Pending`, 1 `Leased`, 2 `Claimed`, 3 `Cancelled`, 4 `Exhausted`.
+/// `attempts` counts the leases issued; `holder` is the worker (1 A, 2 B) of the live lease or the
+/// accepted claim. `wa`/`wb` are the workers' states: 0 `Idle`, 1 `Busy`, 2 `Draining { Expired }`,
+/// 3 `Draining { Cancelled }`, then `Gone` as 4 `Eof`, 5 `DrainTimeout`, 6 `Retired`, 7 `Refused`.
+/// `ea`/`eb` are the epochs (attempts) of the lease each holds or drains, `ra`/`rb` the epochs of
+/// each worker's result in flight (0: none), and `lb` whether B's differs from the truth (A never
+/// lies). `acc` is the accepted claim and `late` a late claim awaiting the job's claim (0 none, 1
+/// the truth, 2 the lie). `resent` records the claim holder's one resend. `out` is 0 open, 1
+/// complete, 2 void. Ghosts: `twice` (a second accept), `stale` (an accept on an expired lease),
+/// `post` (an accept after a cancel) and `ignored` (a claim differing from the accepted one arrived
+/// and `out` is not void).
 ///
-/// **Actions.** Worker sends: `SendX` (the result of the lease it holds or drains), `LieB`, and
-/// `ResendX` (a copy of its accepted claim; B's differing resend is a `LieB`). Arrivals, each
-/// compared in the same step: `AcceptX` (the holder, the current epoch), `CompareX` (a resend),
-/// `LateX` (a result on an expired lease, which retires its sender) and `DropX` (a result that
-/// crossed a cancel). The coordinator's: `LeaseX`, `ExpireX` (`tick` at the deadline; a job back
-/// to `Pending`, or `Exhausted` at the limit, which voids), `DrainTimeoutX` (drains end in the
-/// order they began), `Cancel` (an interrupt of the open search: it voids, and cancels the job and
-/// its holder in the same step, as `Ledger::void` does) and `Finish` (`Ledger::finish`: the job
-/// claimed and no worker draining). `LoseX` is a worker's EOF, read after its frames; `AckX` its
-/// `Cancelled`. A loss or expiry that leaves an open job with no `Idle` or `Busy` worker voids
-/// (`NoWorkers`), as the ledger's settle does; a voiding resend kills its sender (`Refused`).
+/// Actions: worker sends `SendX` (the result of the lease it holds or drains), `LieB` and `ResendX`
+/// (a copy of its accepted claim; B's differing resend is a `LieB`). Arrivals, each compared in the
+/// same step: `AcceptX` (the holder, the current epoch), `CompareX` (a resend), `LateX` (a result
+/// on an expired lease, which retires its sender) and `DropX` (a result that crossed a cancel).
+/// The coordinator's: `LeaseX`, `ExpireX` (a job back to `Pending`, or `Exhausted` at the limit,
+/// which voids), `DrainTimeoutX` (drains end in the order they began), `Cancel` (voids, and
+/// cancels the job and its holder in the same step, as `Ledger::void` does) and `Finish`
+/// (`Ledger::finish`: the job claimed and no worker draining). `LoseX` is a worker's EOF, read
+/// after its frames; `AckX` its `Cancelled`. A loss or expiry that leaves an open job with no
+/// `Idle` or `Busy` worker voids (`NoWorkers`), as the ledger's settle does; a voiding resend kills
+/// its sender (`Refused`).
 ///
-/// **Dials.** 1 `ExpireKeepsLease` (dead at `Buggy = 0`): the holder drains, the job stays leased;
-/// it breaks `LeasedByBusy` and [`aos_worker_lease_liveness`]. 2: an equal resend is accepted
-/// again. 3: a late result for a `Pending` job is accepted as its claim (the fence checks the
-/// job, not the worker and epoch). 4: the interrupt leaves the holder holding. 5: a differing
-/// resend or late result is dropped, not compared. 6: expiry at the limit re-leases to the
-/// expiring holder in the same step, capped at `MaxAttempts + 1`. Each breaks its own law alone.
+/// Dials, each of which alone breaks its own law: 1 (the action `ExpireKeepsLease`) the holder
+/// drains and the job stays leased, breaking `LeasedByBusy` and [`aos_worker_lease_liveness`]. 2:
+/// an equal resend is accepted again. 3: a late result for a `Pending` job is accepted as its claim
+/// (the fence checks the job, not the worker and epoch). 4: `Cancel` leaves the holder holding. 5:
+/// a differing resend or late result is dropped, not compared. 6: expiry at the limit re-leases to
+/// the expiring holder in the same step, capped at `MaxAttempts + 1`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn aos_worker_lease_model() -> Model {
@@ -345,9 +345,8 @@ pub fn aos_worker_lease_model() -> Model {
 
 /// `Settles`: every fair run of [`aos_worker_lease_model`] ends complete or void,
 /// `[]<>(out == 1 || out == 2)`. Its fairness is the coordinator's transitions alone (a lease, an
-/// expiry at the deadline, a drain's grace, the finish), the minimal set `verify::audit_liveness`
-/// keeps: it rests on no send of B's, no acknowledgement and no late result. Dial 1
-/// (`ExpireKeepsLease`) breaks it: the job stays leased to a drained worker and nobody can take it.
+/// expiry, a drain's grace, the finish), the minimal set `verify::audit_liveness` accepts: it rests
+/// on no send of B's, no acknowledgement and no late result. Dial 1 (`ExpireKeepsLease`) breaks it.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(aos_worker_lease_model)]

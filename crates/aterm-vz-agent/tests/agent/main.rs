@@ -26,7 +26,8 @@ pub const HANG: Duration = Duration::from_secs(60);
 /// The agent's debug executable, which the stand-ins are.
 pub const AGENT: &str = env!("CARGO_BIN_EXE_aterm-vz-agent");
 
-/// A retained executable for contained integration runs; ordinary tests use Cargo's bin.
+/// The executable the stand-ins run: `ATERM_VZ_AGENT_TEST_IMAGE` (an absolute path to a
+/// retained copy, for contained runs) when set, else Cargo's bin.
 pub fn agent_exe() -> PathBuf {
     match std::env::var_os("ATERM_VZ_AGENT_TEST_IMAGE") {
         Some(path) => {

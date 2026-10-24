@@ -41,7 +41,8 @@ pub const PROBE_WAIT: Duration = Duration::from_secs(3);
 /// How long the look before a join or a sync waits for the vault ([`SecretsOps::reachable`]).
 pub const REACH_WAIT: Duration = Duration::from_secs(30);
 
-/// How long that look keeps trying while macOS holds this app's lookups and LAN connects for a person's answer to its Local Network question.
+/// How long that look keeps trying while macOS holds this app's lookups and LAN connects for a
+/// person's answer to its Local Network question.
 pub const CONSENT_WAIT: Duration = Duration::from_secs(3 * 60);
 
 static CONSENT_SPENT: AtomicBool = AtomicBool::new(false);
@@ -68,9 +69,8 @@ fn patient_look(
     answer
 }
 
-/// What an Offline row adds when the vault went unheard as macOS's Local Network gate leaves a
-/// connection ([`Look::Held`]); a quiet pass says nothing else, so the row is where a Don't
-/// Allow gets named.
+/// What an Offline row adds when macOS's Local Network gate held the vault's connection
+/// ([`Look::Held`]): a quiet pass says nothing else, so the row is where a Don't Allow is named.
 const LOCAL_NETWORK: &str = "if macOS asked whether this app may find devices on your local \
      network and it was not allowed, turn it on in System Settings > Privacy & Security > Local \
      Network";
@@ -89,7 +89,8 @@ pub trait SecretsOps: Send + Sync {
     /// The state cannot be read; the error names no value.
     fn status(&self) -> aterm_secrets::Result<Status>;
 
-    /// The vault this Mac is configured for now (its `source.toml`), without the rest of its state.
+    /// The vault this Mac is configured for now (its `source.toml`), without the rest of its
+    /// state.
     /// # Errors
     /// The configuration cannot be read; the error names no value.
     fn configured(&self) -> aterm_secrets::Result<Option<Config>>;
@@ -110,12 +111,14 @@ pub trait SecretsOps: Send + Sync {
     /// What the vault at `source` answers now.
     fn reachable(&self, source: &Source) -> Look;
 
-    /// Copy this Mac's vault files (`source.toml`, `state.toml`) into `into` before a join replaces them, admitting only `replaces` under the snapshot's state lock.
+    /// Copy this Mac's vault files (`source.toml`, `state.toml`) into `into` before a join
+    /// replaces them, admitting only `replaces`, under the snapshot's state lock.
     /// # Errors
     /// A file could not be read or copied; the join is then not made.
     fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()>;
 
-    /// Join the vault at `source.0` (a URL, `#<signer>` pin allowed, or a path), replacing only the configuration `source.1` admits under the client's actual write lock.
+    /// Join the vault at `source.0` (a URL, `#<signer>` pin allowed, or a path), replacing only
+    /// the configuration `source.1` admits, under the client's write lock.
     /// # Errors
     /// The join failed; the error names no value.
     fn join(
@@ -133,9 +136,9 @@ pub trait SecretsOps: Send + Sync {
     /// The job could not be installed or started.
     fn install_subscriber(&self) -> aterm_secrets::Result<String>;
 
-    /// Repair a missing subscriber only while this login has not turned sync
-    /// off. Live implementations order this check and install with agent off;
-    /// `None` means the newer choice was preserved, not an installation.
+    /// Install a missing subscriber unless this login turned sync off; `None` means it was left
+    /// off. The live port orders the check and install with a turn-off
+    /// (`aterm_secrets::service::repair_subscriber`).
     fn repair_subscriber(&self) -> aterm_secrets::Result<Option<String>> {
         if self.turned_off() {
             return Ok(None);
@@ -143,10 +146,13 @@ pub trait SecretsOps: Send + Sync {
         self.install_subscriber().map(Some)
     }
 
-    /// Whether the person turned the subscriber off (`aterm_secrets::service::subscriber_turned_off`): their recorded choice, which System State's setup installs nothing over.
+    /// Whether the person turned the subscriber off
+    /// (`aterm_secrets::service::subscriber_turned_off`): their recorded choice, which System
+    /// State's setup installs nothing over.
     fn turned_off(&self) -> bool;
 
-    /// Wait for a subscriber System State's setup just installed to keep running, read again through launchd's restart window (`aterm_secrets::service::back_within_restart_window`).
+    /// Wait for a subscriber System State's setup just installed to keep running, read again
+    /// through launchd's restart window (`aterm_secrets::service::back_within_restart_window`).
     /// # Errors
     /// It does not keep running (the error names its log), or cannot be read.
     fn started(&self) -> Result<(), String>;
@@ -159,7 +165,8 @@ pub trait SecretsOps: Send + Sync {
     /// The state cannot be read.
     fn synced(&self) -> aterm_secrets::Result<bool>;
 
-    /// Fetch and apply the vault once (`aterm_secrets::client::sync`, no long-poll), writing again a file that failed, was deleted or was changed.
+    /// Fetch and apply the vault once (`aterm_secrets::client::sync`, no long-poll), writing
+    /// again a file that failed, was deleted or was changed.
     /// # Errors
     /// The vault could not be fetched or applied; the error names no value.
     fn sync(&self) -> aterm_secrets::Result<()>;
@@ -435,9 +442,11 @@ pub enum Typed {
     Skip,
 }
 
-/// Ask the person for the vault's join password ([`PASSWORD_PROMPT`], no echo), blanks around it dropped.
+/// Ask the person for the vault's join password ([`PASSWORD_PROMPT`], no echo), blanks around
+/// it dropped.
 /// # Errors
-/// The read failed (no terminal after all); [`io::ErrorKind::Interrupted`] when the person stopped the prompt (Ctrl-C).
+/// The read failed (no terminal after all); [`io::ErrorKind::Interrupted`] when the person
+/// stopped the prompt (Ctrl-C).
 pub fn ask_password(sys: &dyn System) -> io::Result<Typed> {
     let Some(answer) = sys.ask(PASSWORD_PROMPT, true)? else {
         return Ok(Typed::Nothing);
@@ -452,7 +461,8 @@ pub fn ask_password(sys: &dyn System) -> io::Result<Typed> {
     })
 }
 
-/// Ask the person whether to trust a vault signer seen for the first time: `y` or `yes` trusts it.
+/// Ask the person whether to trust a vault signer seen for the first time: `y` or `yes` trusts
+/// it.
 pub fn confirm_signer(sys: &dyn System, fingerprint: &str) -> bool {
     let question = format!(
         "The vault is signed by {fingerprint}; compare it with aterm secrets status on an admin Mac. Trust it? [y/N] "
@@ -513,7 +523,8 @@ pub fn selected_vault<'a>(
 pub enum Replaces {
     /// Whichever its probe reads.
     Any,
-    /// Only the one the caller read (`None`: no vault configured) when it chose this try on that read.
+    /// Only the one the caller read (`None`: no vault configured) when it chose this try on
+    /// that read.
     Read(Option<Config>),
 }
 
@@ -554,7 +565,8 @@ pub(crate) fn selected(
 
 /// The secrets vault item for this run.
 /// # Errors
-/// The run does not name exactly one user, or the person stopped a prompt (Ctrl-C); nothing was changed then.
+/// The run does not name exactly one user, or the person stopped a prompt (Ctrl-C); nothing
+/// was changed then.
 pub fn items(
     sys: &dyn System,
     ctx: &Ctx,
@@ -672,8 +684,8 @@ fn shown(source: &str) -> String {
 /// How the run came to the vault an item reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
-    /// This Mac had it configured: an apply only starts a subscriber that does not run, and
-    /// asks nobody anything.
+    /// This Mac had it configured: an apply starts a subscriber that does not run and writes
+    /// again the files a sync left unwritten, asking nobody anything.
     Configured,
     /// A person at the terminal is joining it (they named it, pressed Enter, or the ALab
     /// vault answered), and gave its join password or none: the join may confirm a signer
@@ -684,9 +696,9 @@ enum Origin {
     Selected,
 }
 
-/// What an apply is to do, as the last probe planned it: what its journal line's revert
-/// undoes ([`Vault`]'s `revert`), whether it needs the vault to answer, and all an apply
-/// makes: what changed since the probe is the next try's to plan and journal.
+/// What an apply is to do, as the last probe planned it: what its journal line's revert undoes,
+/// whether it needs the vault to answer, and everything the apply makes. What changed since the
+/// probe is the next try's to plan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Planned {
     /// A join: this Mac's key (made when it has none), the source and state files, a request
@@ -977,8 +989,8 @@ impl Vault {
             return Ok(());
         }
         self.subscribe()?;
-        // Off may have waited for the local install's decision lock. It wins
-        // afterward too: no readiness retry or file sync starts on its behalf.
+        // A turn-off that waited on the install's decision lock still wins: no readiness
+        // retry or file sync follows.
         if !planned.join && self.ops.turned_off() {
             return Ok(());
         }
@@ -1106,9 +1118,8 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool, of
         to: WRITTEN.into(),
     };
     match &status.membership {
-        // Off is the person's choice even when a file is missing or changed. Neither
-        // setup path repairs those files or installs the subscriber without a new join.
-        // Say the membership and that choice, not that the files are materialized.
+        // Off is the person's choice even with a file missing or changed: no setup path
+        // repairs files or installs the subscriber without a new join.
         Membership::In { seq, .. } if off => Probe::Ok {
             now: format!("in vault {name} (seq {seq}); {SYNC_OFF}"),
         },
@@ -1246,9 +1257,8 @@ impl Item for Vault {
             },
             _ => true,
         };
-        // A subscriber the person turned off is their choice, which setup keeps, System
-        // State's and `aterm init`'s alike: no change to make, the files as last synced.
-        // Only a new join (a vault chosen at `aterm init`'s prompt) turns it back on.
+        // Sync off stands for System State and `aterm init` alike: no change, the files as
+        // last synced. Only a new join turns it on.
         let off = self.origin != Origin::Chosen && unsynced.is_some() && self.ops.turned_off();
         let unsynced = unsynced.filter(|_| !off);
         let probe = judge(&status, &self.source, unsynced, synced, off);
@@ -2990,11 +3000,9 @@ mod tests {
         journaled_first(&ops.log());
     }
 
-    /// SYNC OFF IS THE PERSON'S RECORDED CHOICE, WHICH SETUP KEEPS: a member whose
-    /// subscriber they turned off (`aterm secrets agent off`) is no change to make. A new
-    /// join is theirs too, and asks for sync: it installs the subscriber, which clears the
-    /// record, or an approved join would never land. NEGATIVE CONTROL: with no record, the
-    /// same member is a change that installs it.
+    /// A member whose subscriber the person turned off (`aterm secrets agent off`) is no change
+    /// to make; with no record (the control) it is a change that installs it. A new join turns
+    /// sync on: its install clears the record.
     #[test]
     fn a_subscriber_turned_off_is_left_off_by_setup() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -3152,10 +3160,8 @@ mod tests {
         assert!(ops.turned_off());
     }
 
-    /// AN INSTALL THAT LEAVES NO PROCESS IS A FAILED STEP NAMING ITS LOG: setup waits
-    /// through launchd's restart window for a subscriber it installed, and one that
-    /// never keeps running fails the step (retried, then said on the menu line), never
-    /// a wait Set up now repeats. NEGATIVE CONTROL: one that keeps running is changed.
+    /// A subscriber that never keeps running through launchd's restart window fails its step,
+    /// naming its log, and is never a wait; one that keeps running (the control) is changed.
     #[test]
     fn an_install_that_leaves_no_subscriber_running_is_a_failed_step_naming_its_log() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -3503,11 +3509,9 @@ mod tests {
         assert_eq!(ops.installs(), 0);
     }
 
-    /// A JOIN STILL WAITING FOR AN ADMIN ON A MAC WHOSE SYNC THE PERSON TURNED OFF is
-    /// their choice, said truly: an approval lands only once sync is on, so the row is no
-    /// person's step to approve and nothing to wait on, and setup installs nothing over
-    /// the record. NEGATIVE CONTROL: with no record, the same Mac installs the subscriber,
-    /// which finishes the join once approved.
+    /// A join waiting for an admin on a Mac with Sync off says so and is no step and nothing to
+    /// wait on (an approval lands only once sync is on), and setup installs nothing over the
+    /// record. With no record (the control) the subscriber is installed.
     #[test]
     fn a_pending_join_with_sync_off_says_so_and_installs_nothing() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
@@ -3534,9 +3538,9 @@ mod tests {
         }
     }
 
-    /// `aterm init` and System State keep Sync off for a member or plain source even when
-    /// its files are unwritten. Neither installs the subscriber nor repairs the files or
-    /// clears Off. NEGATIVE CONTROL: without Off both paths install and repair as needed.
+    /// `aterm init` and System State keep Sync off for a member or plain source even with its
+    /// files unwritten: no path installs the subscriber, repairs the files or clears Off.
+    /// Without Off (the control) both install and repair as needed.
     #[test]
     fn aterm_init_keeps_the_persons_sync_off() {
         for membership in [Membership::In { seq: 7, heard: 0 }, Membership::Plain] {

@@ -108,23 +108,28 @@ pub(crate) fn light_ink_vivid_over_floor(rgb: u32, theme_bg: u32, a_max: u8, flo
         ch(16) | ch(8) | ch(0)
     };
     let top = if peak == 0 { 1.0 } else { 255.0 / peak as f32 };
+    let top_rgb = scaled(top);
     if a_max == 0
         || rgb2hsv(bold).1 < VIVID_LIFT_CHROMA_MIN
         || lum(bold) >= floor
-        || lum(scaled(top)) < floor
+        || lum(top_rgb) < floor
     {
         return light_ink_over_floor(rgb, theme_bg, a_max, floor);
     }
     let (mut lo, mut hi) = (1.0f32, top);
+    let (mut lo_rgb, mut hi_rgb) = (bold, top_rgb);
     for _ in 0..FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo + hi);
-        if lum(scaled(mid)) >= floor {
+        let mid_rgb = scaled(mid);
+        if mid_rgb == hi_rgb || (mid_rgb != lo_rgb && lum(mid_rgb) >= floor) {
             hi = mid;
+            hi_rgb = mid_rgb;
         } else {
             lo = mid;
+            lo_rgb = mid_rgb;
         }
     }
-    scaled(hi)
+    hi_rgb
 }
 
 /// The HSV saturation below which [`light_ink_vivid_over_floor`] treats a hue as grey and keeps the walk toward white.

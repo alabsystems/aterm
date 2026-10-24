@@ -20,7 +20,8 @@ pub(crate) struct HwKeySpec {
     pub count: u32,
     /// Milliseconds between successive presses.
     pub interval_ms: u64,
-    /// `shape=press`: build each event from a CoreGraphics keyboard event wrapped by `+[NSEvent eventWithCGEvent:]`.
+    /// `shape=press`: build each event from a CoreGraphics keyboard event wrapped by
+    /// `+[NSEvent eventWithCGEvent:]`.
     pub press: bool,
 }
 
@@ -34,21 +35,19 @@ const MAX_COUNT: u32 = 5000;
 const MAX_INTERVAL_MS: u64 = 1000;
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
-/// WHILE THE PERSON'S BUTTONS ARE IN FRONT. The main thread sets it
-/// ([`publish_persons_front`], from `App::publish_hwkey_front` at every park and at `hwkey`'s
-/// own hop) while the front window holds acts only a person may take: System State as its
-/// active view (an Apply that admits a setup plan as the window's own, a row's `Turn On…`;
-/// `docs/DESIGN-system-state-2026-10-21.md` §6), or a gateway card (Take Over and Hand Back
-/// behind a key). `hwkey`'s keys take the person's own unmarked key path, so a burst reads it
-/// before EVERY key and stops once it is set ([`run_burst`]). A burst that was already running
-/// when the page or a card came to the front posts nothing more on it.
+/// Set while the front window holds acts only a person may take: System State as its active view
+/// (an Apply that admits a setup plan as the window's own, a row's `Turn On…`;
+/// `docs/DESIGN-system-state-2026-10-21.md` §6) or a gateway card (a palette, the Overview or a
+/// tab menu: Take Over and Hand Back behind a key). The main thread sets it
+/// ([`publish_persons_front`], from `App::publish_hwkey_front` at every park and at `hwkey`'s own
+/// hop). `hwkey`'s keys take the person's own unmarked key path, so a burst reads it before every
+/// key and stops once it is set ([`run_burst`]).
 static PERSONS_FRONT: AtomicBool = AtomicBool::new(false);
 
-/// Every key a burst has posted in this process, counted BEFORE the post, so the key's dispatch
+/// Every key a burst has posted in this process, counted before the post so the key's dispatch
 /// always finds the count moved. System State reads it beside the control clients' gesture count
-/// (`App::take_system_state_press`). A key that reached the page before its burst saw
-/// [`PERSONS_FRONT`] (one already queued as the page came to the front) is then still never a
-/// person's press.
+/// (`App::take_system_state_press`), so a key that reached the page before its burst saw
+/// [`PERSONS_FRONT`] is still never a person's press.
 static POSTED: AtomicU64 = AtomicU64::new(0);
 
 /// The main thread's word on the front window: `true` while System State or a gateway card is
@@ -278,7 +277,7 @@ fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     Ok((mods, count, interval, press, kept.join(" ")))
 }
 
-/// PURE parser for `hwkey <name> [mods=<list>] [count=<n>] [interval=<ms>] [shape=press|built]`.
+/// Pure parser for `hwkey <name> [mods=<list>] [count=<n>] [interval=<ms>] [shape=press|built]`.
 pub(crate) fn parse_hwkey(rest: &str) -> Result<HwKeySpec, String> {
     let (tok_mods, count, interval_ms, press, body) = take_tokens(rest)?;
     let (prefix_mods, body) = take_inline_mods(body.trim());
@@ -347,7 +346,9 @@ fn usage() -> String {
         .to_string()
 }
 
-/// Post the request as real `NSEvent`s into this application's event queue; the number of presses posted.
+/// Post the request as real `NSEvent`s into this application's event queue, returning the number
+/// of presses posted. It runs on the control thread, so a key waits in the queue behind a parked
+/// main thread as a physical key does.
 #[cfg(target_os = "macos")]
 pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> {
     use aterm_objc::{Bool, CGPoint, Id, Sel, autoreleasepool, class, sel};
@@ -390,7 +391,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 .posting_permit()
                 .map_err(|()| "ERR hwkey: a sudo password sheet is up\n".to_string())?;
             autoreleasepool(|_| {
-                // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
+                // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and `-systemUptime` is
+                // `-(NSTimeInterval)`, a plain scalar getter.
                 let ts = unsafe {
                     let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
                     if info.is_null() {
@@ -398,7 +400,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                     }
                     appkit::send_f64(info, sel!(systemUptime))
                 };
-                // SAFETY: the AppKit event factory with a non-nil characters pair (winit dereferences both unconditionally) and a nil graphics context, exactly as upstream winit's `replace_event` builds a synthetic key event (aterm-window no longer carries it).
+                // SAFETY: the AppKit event factory with a non-nil characters pair (winit
+                // dereferences both unconditionally) and a nil graphics context, exactly as
+                // upstream winit's `replace_event` builds a synthetic key event.
                 let built = |kind: usize| unsafe {
                     let make: unsafe extern "C-unwind" fn(
                         Id,
@@ -443,7 +447,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 if down.is_null() {
                     return Err("ERR hwkey: NSEvent construction failed\n".to_string());
                 }
-                // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared application with a live event; see the thread-safety note.
+                // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared
+                // application with a live event; AppKit documents it as safe from any thread, and
+                // this runs on the control thread.
                 unsafe {
                     let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
                         aterm_objc::checked_msg();
@@ -501,7 +507,8 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     }
 }
 
-/// Non-macOS: there is no NSEvent queue to post into, and falling back to the socket path would hide the very stall this verb measures, so it refuses.
+/// Non-macOS: there is no NSEvent queue to post into, and falling back to the socket path would
+/// hide the very stall this verb measures, so it refuses.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String> {
     Err("ERR hwkey: hardware-path injection is implemented on macOS only\n".to_string())
@@ -513,11 +520,10 @@ mod tests {
 
     use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey, run_burst};
 
-    /// A BURST ALREADY RUNNING STOPS AT THE PERSON'S BUTTONS: System State (or a
-    /// gateway card) comes to the front after the second key of five, and the
-    /// burst posts nothing more, saying how many it did post. Every posted key
-    /// was counted before its post. CONTROL: with nothing of the person's in
-    /// front all five post, and a front already up posts none.
+    /// System State (or a gateway card) coming to the front after the second key of five stops
+    /// the burst, which says how many it posted; every posted key was counted before its post.
+    /// Control: with nothing of the person's in front all five post, and a front already up posts
+    /// none.
     #[test]
     fn a_running_burst_stops_once_the_persons_buttons_come_to_the_front() {
         let front = AtomicBool::new(false);

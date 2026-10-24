@@ -326,8 +326,6 @@ impl Tools for HostTools {
     }
 
     fn compressor(&self) -> &dyn super::tarwrite::Compressor {
-        static ON_PATH: std::sync::LazyLock<super::tarwrite::ZstdCli> =
-            std::sync::LazyLock::new(super::tarwrite::ZstdCli::default);
-        &*ON_PATH
+        &super::tarwrite::Zstd
     }
 }

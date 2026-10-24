@@ -447,14 +447,14 @@ pub fn no_run<'a>(args: &[&'a str]) -> Vec<&'a str> {
 pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) -> Out {
     const TEST_ROW_HANG_SECS: u32 = 1800;
     let built = up
-        .lima
+        .guest
         .shell_streamed(&up.home, &cargo(&no_run(args)), "  | ");
     if !built.ok() {
         return built;
     }
     let mut argv = hang_detector(TEST_ROW_HANG_SECS);
     argv.extend(cargo(args));
-    let mut out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+    let mut out = up.guest.shell_streamed(&up.home, &argv, "  | ");
     out.secs += built.secs;
     out
 }
@@ -515,7 +515,7 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
             &guest::cargo_env(arch, &target_dir, false),
             &verifier_build_args(&manifest, arch.triple(), assertions),
         );
-        let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+        let out = up.guest.shell_streamed(&up.home, &argv, "  | ");
         let exe = format!("{target_dir}/{}/release/{VERIFIER}", arch.triple());
         let name = format!("{tag} bootstrap verifier: static {shape} build");
         if !out.ok() {
@@ -849,7 +849,7 @@ impl Gui<'_> {
             ),
         ];
         for (argv, stdin) in steps {
-            let out = self.up.lima.shell(&self.up.home, &argv, stdin);
+            let out = self.up.guest.shell(&self.up.home, &argv, stdin);
             if !out.ok() {
                 return Err(format!("{}: {}", argv.join(" "), out.tail(3)));
             }
@@ -1102,7 +1102,12 @@ impl Gui<'_> {
         for guest_path in found.text.lines().filter(|l| l.starts_with('/')) {
             let file = guest_path.rsplit('/').next().unwrap_or("crash.log");
             let name = format!("{}-{file}", self.name);
-            if self.up.lima.copy_out(guest_path, &results.join(&name)).ok() {
+            if self
+                .up
+                .guest
+                .copy_out(guest_path, &results.join(&name))
+                .ok()
+            {
                 kept.push(name);
             }
         }
@@ -1181,7 +1186,7 @@ impl Gui<'_> {
             .nth(3)
             .ok_or_else(|| format!("`image` answered {image}"))?;
         let png = results.join(&frame);
-        let copied = self.up.lima.copy_out(guest_png, &png);
+        let copied = self.up.guest.copy_out(guest_png, &png);
         if !copied.ok() {
             return Err(format!("{guest_png} not copied out: {}", copied.tail(2)));
         }
@@ -1396,7 +1401,7 @@ impl Gui<'_> {
             return Err(format!("lane-bus cast: {}", cast.tail(3)));
         }
         let local = results.join(format!("{}{suffix}-monitor.png", self.name));
-        let copied = self.up.lima.copy_out(&guest_png, &local);
+        let copied = self.up.guest.copy_out(&guest_png, &local);
         if !copied.ok() {
             return Err(format!("{guest_png} not copied out: {}", copied.tail(2)));
         }
@@ -1445,7 +1450,7 @@ impl Gui<'_> {
             return Err(format!("lane-bus xgrab {win}: {}", grab.tail(3)));
         }
         let ppm = results.join(format!("{}{suffix}.ppm", self.name));
-        let copied = self.up.lima.copy_out(&guest_ppm, &ppm);
+        let copied = self.up.guest.copy_out(&guest_ppm, &ppm);
         if !copied.ok() {
             return Err(format!("{guest_ppm} not copied out: {}", copied.tail(2)));
         }
@@ -1502,7 +1507,7 @@ impl Gui<'_> {
             .find(|l| l.ends_with(".png"))
             .ok_or_else(|| format!("weston-screenshooter wrote no PNG in {dir}"))?;
         let local = results.join(format!("{}{suffix}-output.png", self.name));
-        let copied = self.up.lima.copy_out(&format!("{dir}/{name}"), &local);
+        let copied = self.up.guest.copy_out(&format!("{dir}/{name}"), &local);
         if !copied.ok() {
             return Err(format!("{dir}/{name} not copied out: {}", copied.tail(2)));
         }
@@ -1583,7 +1588,7 @@ impl Gui<'_> {
             .nth(3)
             .map(|guest_path| {
                 let to = results.join(&frame);
-                self.up.lima.copy_out(guest_path, &to).ok()
+                self.up.guest.copy_out(guest_path, &to).ok()
             })
             .unwrap_or(false);
         let summary = self.expect(&["metrics"], &|r| r.starts_with("OK "))?;
@@ -2040,7 +2045,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 "\n=== {tag}: libc oracle conformance (cell {}) ===",
                 arch.triple()
             );
-            let out = up.lima.shell_streamed(
+            let out = up.guest.shell_streamed(
                 &up.home,
                 &cargo(
                     &oracle_env,
@@ -2080,7 +2085,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             let started = Instant::now();
             let name =
                 format!("{tag} tests: dl x11 wayland xkb window, live on Xvfb, weston and Mutter");
-            let bus = up.lima.shell_streamed(
+            let bus = up.guest.shell_streamed(
                 &up.home,
                 &cargo(
                     &env,
@@ -2123,7 +2128,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                         tests.extend(["-p", p]);
                     }
                     tests.extend(["--", "--nocapture"]);
-                    let out = up.lima.shell_streamed(
+                    let out = up.guest.shell_streamed(
                         &up.home,
                         &cargo(&live, &format!("{repo}/Cargo.toml"), "test", &tests),
                         "  | ",
@@ -2166,7 +2171,7 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         if ask.wgpu_oracle {
             build.extend(["--features", "aterm-gpu/wgpu-oracle"]);
         }
-        let out = up.lima.shell_streamed(
+        let out = up.guest.shell_streamed(
             &up.home,
             &cargo(&env, &format!("{repo}/Cargo.toml"), "build", &build),
             "  | ",
@@ -2484,21 +2489,14 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             Err(e) => disk.push(format!("guest build output NOT removed: {e}")),
         }
     }
-    if let Ok(Some(vm)) = up.lima.state()
-        && let Some(bytes) = linux::host_disk_bytes(&vm)
-    {
+    if let Some(held) = up.guest.host_disk() {
         disk.push(format!(
             "host: the VM disk holds {} (sparse, <= {} GiB; trimmed after a clean)",
-            linux::gib(bytes),
+            linux::gib(held.bytes),
             linux::DISK_GIB
         ));
     }
-    let keep_up = ask.keep_up;
-    if keep_up {
-        up.stop_units();
-    } else {
-        up.release();
-    }
+    up.end(ask.keep_up);
     let report = render(&rows, &disk, t0.elapsed().as_secs_f64());
     print!("\n{report}");
     let path = results.join("report.txt");
@@ -2664,6 +2662,9 @@ mod tests {
             code,
             text: text.into(),
             secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         let verb = ["image", "plain", "deck-gpu-off"];
         assert_eq!(
@@ -2854,6 +2855,9 @@ error: 1 target failed:
             code: Some(101),
             text: broken.into(),
             secs: 2.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         let r = test_verdict("t", &out);
         assert_eq!(r.verdict, Verdict::Fail);
@@ -2862,6 +2866,9 @@ error: 1 target failed:
             code: Some(0),
             text: "     Running tests/a.rs (t/debug/deps/a-0123)\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured\n".into(),
             secs: 1.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         let r = test_verdict("t", &clean);
         assert_eq!(
@@ -2872,6 +2879,9 @@ error: 1 target failed:
             code: Some(0),
             text: "     Running tests/a.rs (t/debug/deps/a-0123)\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out\n".into(),
             secs: 1.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         assert_eq!(test_verdict("t", &nothing).verdict, Verdict::NotRun);
     }
@@ -3127,6 +3137,9 @@ Layer 5 (pos 0x50000000):
             code,
             text: dump.to_string(),
             secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         assert_eq!(read_weston_view(&observation(Some(0)), "1501"), Ok(view));
         assert!(read_weston_view(&observation(Some(0)), "150").is_err());

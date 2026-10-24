@@ -2,22 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! System State's reading of one setting from the shared engine's rows
-//! (`docs/DESIGN-system-state-2026-10-21.md` §3.3, §5): one standing per row,
-//! and a current value only in the page's exact words. A value the rows do not
-//! establish stays `None` (the page's `—`); nothing here guesses one.
+//! (`docs/DESIGN-system-state-2026-10-21.md` §3.3, §5): one standing per row, and a current
+//! value only in the page's exact words. A value the rows do not establish stays `None` (the
+//! page's `—`).
 //!
-//! The words come from a typed [`Reading`] the item took in its own probe and
-//! hands over as its row's `detail` (the engine's item-specific output a caller
-//! acts on), never from the human `from` line `aterm doctor` and `aterm init`
-//! print, which stays the engine's. Two settings are read from shared items
-//! that take no reading: Caps Lock from the keyboard items' rendered mapping, and
-//! Trackpad scrolling from the defaults items' rendered value.
+//! The words come from a typed [`Reading`] the item took in its own probe and hands over as its
+//! row's `detail`, not from the human `from` line `aterm doctor` and `aterm init` print. The
+//! exceptions are two settings whose shared items take no reading: Caps Lock reads the keyboard
+//! items' rendered mapping and Trackpad scrolling the defaults items' rendered value.
 
 use crate::model::{Effect, ItemReport, Outcome};
 use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
 use std::sync::{Mutex, PoisonError};
 
-/// What an init item's probe read, in terms System State words (design §3.3).
+/// What an init item's probe read, in System State's terms (design §3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reading {
     /// No attached keyboard service maps Caps Lock: the key still does Caps Lock.
@@ -41,8 +39,8 @@ pub enum Reading {
     SignedIn,
     /// A rustup toolchain carries rust-docs.
     DocsInstalled,
-    /// A Rust build or tooling cache of aterm's sits where Spotlight indexes it, which
-    /// the item makes in place; the notes of [`Self::KeptOut`] go with it.
+    /// aterm's Rust build or tooling cache is missing, which the item makes; the counts are those
+    /// of [`Self::KeptOut`].
     BuildsIndexed {
         /// The person's project build folders Spotlight indexes.
         projects: usize,
@@ -312,7 +310,7 @@ pub fn standing(row: &ItemReport) -> Standing {
     }
 }
 
-/// The worse of two standings for one row made of several items.
+/// A standing's severity: a row made of several items takes its worst part's.
 const fn rank(standing: Standing) -> u8 {
     match standing {
         Standing::NotNeeded => 0,
@@ -326,12 +324,10 @@ const fn rank(standing: Standing) -> u8 {
     }
 }
 
-/// One setting's row from the rows its items reported. No rows is an unknown row.
-/// Its description (`detail`) is its worst parts' reasons (`why`), and a row that
-/// differs has none: the engine's `from → to` line is never one (§3.3). A row that
-/// waits takes its note from the first waiting part whose item said why
-/// ([`Reading::Waits`]); the engine's line stays its description, which the page
-/// never shows under it.
+/// One setting's row from the rows its items reported; no rows is an unknown row. Its
+/// description (`detail`) is its worst parts' reasons (`why`), and a row that differs has none
+/// (§3.3). A waiting row's note is the [`Reading::Waits`] reason of the first waiting part that
+/// gives one, never the engine's line.
 #[must_use]
 pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
     let subject = Subject::Setting(setting);
@@ -350,10 +346,7 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
             now(setting, rows)
         }
     };
-    // The worst parts' reasons. A row that differs has none to give: its value
-    // names the part that differs, and a planned part's `from → to` line (and
-    // a `why` it carries, the order the plan reads it in) is the engine's,
-    // which `aterm init` and `aterm doctor` print.
+    // A row that differs has no reasons to give: the planned parts' lines are the engine's.
     let detail = if standing == Standing::Differs {
         Vec::new()
     } else {
@@ -413,10 +406,9 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
     }
 }
 
-/// The Rust in Spotlight row's note for `count` of the person's own project build
-/// folders that Spotlight indexes: what keeps one out, said once and asked of no one.
-/// aterm never renames them: a program started from one may still be under macOS's
-/// first-exec check.
+/// The Rust in Spotlight row's note for `count` of the person's project build folders Spotlight
+/// indexes: how to keep one out, asked of no one. aterm never renames them: a program started
+/// from one may still be under macOS's first-exec check.
 #[must_use]
 pub fn projects_note(count: usize) -> String {
     let each = if count == 1 { "it" } else { "each" };
@@ -847,10 +839,8 @@ mod tests {
         assert_eq!(read.detail.as_deref(), Some("offline"));
     }
 
-    /// A WAITING ROW SAYS WHY IN A PERSON'S WORDS (design §3.3): its note is the reason
-    /// the first waiting part's item decided (`Reading::Waits`), never the engine's line,
-    /// which stays its description; a waiting part whose item decided none, a part of
-    /// another standing beside it, and a row that does not wait give no note.
+    /// A waiting row's note is the reason of the first waiting part whose item decided one, never
+    /// the engine's line; a row with no such part, or one that does not wait, gives no note.
     #[test]
     fn a_waiting_row_notes_the_reason_its_item_decided_and_never_the_engine_line() {
         let blocked = |wait: Option<Wait>, why: &str| ItemReport {
@@ -896,12 +886,8 @@ mod tests {
         assert_eq!((read.standing, read.note), (Standing::Failed, None));
     }
 
-    /// NO ENGINE LINE IN A DESCRIPTION (design §3.3: a row that differs shows
-    /// its value alone). A planned part's `from → to` line, and the `why` a
-    /// planned part carries (the order the plan reads it in), is the engine's,
-    /// which `aterm init` prints: a row that differs has no description, and a
-    /// row of another standing takes its worst parts' reasons, never their
-    /// `from → to`.
+    /// A row that differs has no description (design §3.3): a planned part's `from → to` and its
+    /// `why` are the engine's; a row of another standing takes its worst parts' reasons.
     #[test]
     fn a_row_that_differs_carries_no_engine_line_as_its_description() {
         let gestures = [

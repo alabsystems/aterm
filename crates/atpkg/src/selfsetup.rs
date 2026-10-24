@@ -58,7 +58,7 @@ pub struct Places {
     pub xdg_data: PathBuf,
     /// `$XDG_CONFIG_HOME`, else `~/.config`.
     pub xdg_config: PathBuf,
-    /// `ATERM_INSTALL_DIR`: THE app location of a scoped run.
+    /// `ATERM_INSTALL_DIR`: the one app location of a scoped run.
     pub install_dir: Option<PathBuf>,
     /// `ATERM_BIN_DIR`, else `~/.local/bin`.
     pub bin_dir: PathBuf,
@@ -286,12 +286,11 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Why `program` may still be in macOS's check of its first exec, which crashes when the file
-/// goes mid-check: `None` once a `--version` run of it ended without our kill (at `hang`, or on
-/// a failed wait), or once the kernel refused to exec it ([`never_execs`]), which it does
-/// before that check. An exec waits on that check, so its exit, or a signal of its own or
-/// macOS's, comes after it. Through sudo, a shell asks it and says when the run ends
-/// ([`ENDED`], [`shell_end_unproven`]).
+/// Why `program` may still be in macOS's check of its first exec (which crashes when the file
+/// goes mid-check), or `None` once a `--version` run of it ended without our kill (at `hang`, or
+/// on a failed wait) or the kernel refused to exec it ([`never_execs`]), which it does before
+/// that check. An exec waits on the check, so any end but our kill comes after it. Through sudo,
+/// a shell runs the program and says when the run ends ([`ENDED`], [`shell_end_unproven`]).
 fn first_exec_unproven(program: &Path, run_as: RunAs, hang: Duration) -> Option<String> {
     const UNASKED: &str = "was not asked, and only its answer shows macOS is done checking its \
                            first start";
@@ -355,11 +354,11 @@ fn sudo_may_not_have_run(run_as: RunAs, code: Option<i32>) -> bool {
 }
 
 /// Why `out`, sudo's run of [`ENDED`] asking `program`, does not show the program ran: `None`
-/// once the program printed anything, or the shell wrote `ended <status>` for a run it started.
-/// No such line is sudo's end (its refusal, or one it cannot exec the shell for) or the
-/// shell's (a fork that failed). An `ended 126` or `ended 127` with nothing printed may be the
-/// shell's own failure to exec the program (denied, gone, a folder), which proves nothing but
-/// a kernel refusal it names ([`says_never_execs`]).
+/// once the program printed anything or the shell wrote `ended <status>`. With no such line, the
+/// end is sudo's (its refusal, or a shell it cannot exec) or the shell's (a failed fork). An
+/// `ended 126` or `ended 127` with nothing printed may be the shell's own failure to exec the
+/// program (denied, gone, a folder), which proves nothing unless it names a kernel refusal
+/// ([`says_never_execs`]).
 fn shell_end_unproven(out: &std::process::Output, program: &Path) -> Option<String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let (printed, ended) = match stdout
@@ -428,6 +427,7 @@ fn strerror(code: i32) -> String {
 
 /// The programs in `app` aterm's tools may have started: each file in `Contents/MacOS` but a
 /// link, since an older toolset's `aterm-cli` starts its siblings (`atpkg` for `pkg`).
+///
 /// # Errors
 /// The directory, an entry in it or an entry's metadata cannot be read. A missing directory
 /// holds no programs; any other unread inventory proves nothing about their first starts.
@@ -718,8 +718,9 @@ fn open_checked(
     Ok(file)
 }
 
-/// `path`'s text, from a regular file only: a pipe behind a link is refused, not waited on. Reading
-/// needs no owner (only what a sweep writes does), so root still sees a block it may not rewrite.
+/// `path`'s text, from a regular file only: a pipe behind a link is refused, not waited on.
+/// Reading needs no owner (only what a sweep writes does), so root still sees a block it may not
+/// rewrite.
 fn read_checked(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
     let mut text = String::new();
@@ -1259,9 +1260,9 @@ const SUDO: &str = "/usr/bin/sudo";
 const TRUE: &str = "/usr/bin/true";
 /// The shell a run through sudo asks a program by ([`ENDED`]), with its flags: bash, whose words
 /// for an exec it could not make [`says_never_execs`] reads (macOS's `/bin/sh` may be zsh, which
-/// says a kernel refusal otherwise), reading no startup file (`--norc`: the account's `.bashrc`,
-/// which sshd's `SSH_CLIENT` has it read) and none the environment names (`-p`: `BASH_ENV`), so
-/// nothing but the program and the script writes what is read as the run.
+/// words a kernel refusal otherwise), reading no startup file (`--norc`: sshd's `SSH_CLIENT` has
+/// bash read the account's `.bashrc`) and none the environment names (`-p`: `BASH_ENV`), so only
+/// the program and the script write what is read as the run.
 #[cfg(target_vendor = "apple")]
 const SH: [&str; 3] = ["/bin/bash", "--norc", "-p"];
 /// See the Apple twin.

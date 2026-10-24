@@ -796,22 +796,20 @@ fn a_signing_run_needs_the_key_and_both_token_files() {
 }
 
 #[test]
-fn a_signing_run_needs_the_compressor_before_any_build() {
-    let w = World::new("alab-compressor");
-    let lacks = atpkg_publish::artifact::tarwrite::compressor_in(Some(std::ffi::OsStr::new("")))
-        .expect_err("an empty PATH has no zstd");
-    *w.fx.packer.lacks.lock().expect("lacks") = Some(lacks);
+fn a_signing_run_needs_a_packer_that_can_pack_before_any_build() {
+    let w = World::new("alab-can-pack");
+    *w.fx.packer.lacks.lock().expect("lacks") = Some("a stand-in packer's lack".into());
     let (r, _) = w.run(false);
-    let e = r.expect_err("no compressor");
+    let e = r.expect_err("a packer that cannot pack");
     assert!(matches!(e, Error::CannotRun(_)), "{e}");
     assert!(
         e.to_string()
-            .contains("this Mac cannot pack: no `zstd` on this builder's PATH"),
+            .contains("this Mac cannot pack: a stand-in packer's lack"),
         "{e}"
     );
     assert!(
         w.fx.packer.legs().is_empty(),
-        "a build ran without a compressor"
+        "a build ran on a packer that cannot pack"
     );
     assert!(
         !w.state().attempts_file("ay", 3).exists(),

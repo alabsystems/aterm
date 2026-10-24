@@ -65,7 +65,7 @@ fn a_fresh_session_is_idle_at_its_composer_and_its_placeholder_is_no_draft() {
     let caret = caret_at(&rows);
     assert_eq!(r.composer, Some((caret, vec![String::new()])));
     assert!(
-        rows[caret].contains(anchor_text("gemini.composer.placeholder")),
+        rows[caret].contains(crate::anchor!("gemini.composer.placeholder")),
         "{}",
         rows[caret]
     );
@@ -165,7 +165,7 @@ fn the_spinner_is_busy_through_thinking_streaming_and_retries() {
         let status = status_at(&rows);
         assert!(is_spinner_row(&rows[status]), "{what}");
         assert!(
-            rows[status].contains(anchor_text("gemini.status.cancel")),
+            rows[status].contains(crate::anchor!("gemini.status.cancel")),
             "{what}"
         );
         let mut gone = rows.clone();
@@ -358,7 +358,7 @@ fn the_command_menu_is_no_box_and_no_evidence() {
     let bottom = caret_at(&rows) + 1;
     let footer = rows
         .iter()
-        .position(|r| r.contains(anchor_text("gemini.footer.workspace")))
+        .position(|r| r.contains(crate::anchor!("gemini.footer.workspace")))
         .expect("the footer");
     let mut closed = rows[..=bottom].to_vec();
     closed.extend_from_slice(&rows[footer..]);
@@ -438,9 +438,9 @@ fn the_shell_box_is_a_bash_prompt_with_its_roles() {
     assert_eq!(
         labels(&p),
         vec![
-            anchor_text("gemini.box.once"),
-            anchor_text("gemini.box.session"),
-            anchor_text("gemini.box.deny")
+            crate::anchor!("gemini.box.once"),
+            crate::anchor!("gemini.box.session"),
+            crate::anchor!("gemini.box.deny")
         ]
     );
     assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
@@ -496,7 +496,7 @@ fn the_file_boxes_are_write_and_edit_prompts() {
             vec![Role::Once, Role::Persist, Role::Other, Role::Deny],
             "{what}"
         );
-        assert_eq!(labels(&p)[2], anchor_text("gemini.box.editor"));
+        assert_eq!(labels(&p)[2], crate::anchor!("gemini.box.editor"));
         let rows = screen(text);
         assert_eq!(ClaudeReader.prompt(&rows), None, "the control");
         assert_eq!(AgyReader.prompt(&rows), None, "the control");
@@ -521,7 +521,7 @@ fn the_question_tool_is_a_question_with_answers() {
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
     let p = r.prompt.expect("the question");
     assert_eq!(p.kind, PromptKind::Question);
-    assert_eq!(p.title, anchor_text("gemini.question.title"));
+    assert_eq!(p.title, crate::anchor!("gemini.question.title"));
     assert_eq!(p.description, "Which colour should the lab probe use?");
     assert_eq!(labels(&p), vec!["Red", "Blue", "Enter a custom value"]);
     assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
@@ -534,7 +534,7 @@ fn the_question_tool_is_a_question_with_answers() {
     assert!(
         p.footer
             .as_deref()
-            .is_some_and(|f| f.starts_with(anchor_text("gemini.question.keys")))
+            .is_some_and(|f| f.starts_with(crate::anchor!("gemini.question.keys")))
     );
     let rows = screen(QUESTION);
     assert!(!matches!(
@@ -558,8 +558,11 @@ fn the_usage_limit_dialog_is_a_box_with_nothing_to_press() {
     assert_eq!((r.wall, r.composer), (None, None));
     let p = r.prompt.expect("the dialog");
     assert_eq!(p.kind, PromptKind::UsageLimit);
-    assert!(p.title.starts_with(anchor_text("gemini.usage.title")));
-    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert!(p.title.starts_with(crate::anchor!("gemini.usage.title")));
+    assert_eq!(
+        labels(&p),
+        vec![crate::anchor!("gemini.usage.retry"), "Stop"]
+    );
     assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
     assert_eq!(p.cancel, None);
 
@@ -601,8 +604,11 @@ fn the_accounts_usage_limit_dialog_names_its_reset_and_is_the_same_box() {
     assert_eq!((r.wall, r.composer), (None, None));
     let p = r.prompt.expect("the dialog");
     assert_eq!(p.kind, PromptKind::UsageLimit);
-    assert!(p.title.starts_with(anchor_text("gemini.usage.title")));
-    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert!(p.title.starts_with(crate::anchor!("gemini.usage.title")));
+    assert_eq!(
+        labels(&p),
+        vec![crate::anchor!("gemini.usage.retry"), "Stop"]
+    );
     assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
     assert_eq!(p.cancel, None);
     let rows = screen(LIMIT_DIALOG_ACCOUNT);
@@ -639,7 +645,7 @@ fn the_buckets_usage_limit_dialog_offers_its_switch_and_stop() {
             LIMIT_DIALOG_BUCKET_UPGRADE,
             vec![
                 "Switch to gemini-3.5-flash",
-                anchor_text("gemini.usage.upgrade"),
+                crate::anchor!("gemini.usage.upgrade"),
                 "Stop",
             ],
         ),
@@ -651,7 +657,7 @@ fn the_buckets_usage_limit_dialog_offers_its_switch_and_stop() {
         assert_eq!(p.kind, PromptKind::UsageLimit);
         assert_eq!(p.title, "Usage limit reached for all Pro models.");
         assert_eq!(labels(&p), want);
-        assert!(labels(&p)[0].starts_with(anchor_text("gemini.usage.switch")));
+        assert!(labels(&p)[0].starts_with(crate::anchor!("gemini.usage.switch")));
         assert!(roles(&p).iter().all(|&r| r == Role::Other));
         assert_eq!(
             limit_reset(&screen(fixture)),
@@ -662,7 +668,7 @@ fn the_buckets_usage_limit_dialog_offers_its_switch_and_stop() {
     assert!(
         !labels(&measured)
             .iter()
-            .any(|l| l.starts_with(anchor_text("gemini.usage.switch")))
+            .any(|l| l.starts_with(crate::anchor!("gemini.usage.switch")))
     );
 }
 
@@ -835,7 +841,7 @@ fn the_trust_dialog_is_a_trust_prompt() {
     assert_eq!(r.composer, None);
     let p = r.prompt.expect("the dialog");
     assert_eq!(p.kind, PromptKind::Trust);
-    assert_eq!(p.description, anchor_text("gemini.trust.title"));
+    assert_eq!(p.description, crate::anchor!("gemini.trust.title"));
     assert_eq!(
         labels(&p),
         vec![
@@ -882,7 +888,7 @@ fn an_api_error_row_is_the_turns_wall() {
         assert!(
             rows[w.row + 1..]
                 .iter()
-                .any(|r| r.contains(anchor_text("gemini.error.failed"))),
+                .any(|r| r.contains(crate::anchor!("gemini.error.failed"))),
             "{what}"
         );
         let mut replied = rows.clone();
@@ -973,11 +979,11 @@ fn an_exited_gemini_is_read_as_nothing() {
     assert_eq!(identify(None, &rows).program(), Program::Generic);
     assert!(
         rows.iter()
-            .any(|r| r.contains(anchor_text("gemini.exit.resume")))
+            .any(|r| r.contains(crate::anchor!("gemini.exit.resume")))
     );
     assert!(
         rows.iter()
-            .any(|r| r.contains(anchor_text("gemini.exit.farewell")))
+            .any(|r| r.contains(crate::anchor!("gemini.exit.farewell")))
     );
     let last = rows
         .iter()
@@ -1359,13 +1365,13 @@ fn several_questions_are_read_tab_by_tab_and_left_to_a_person() {
     let p = r.prompt.expect("the review");
     assert_eq!(p.kind, PromptKind::Question);
     assert!(p.options.is_empty());
-    assert_eq!(p.description, anchor_text("gemini.question.review"));
+    assert_eq!(p.description, crate::anchor!("gemini.question.review"));
     assert!(p.notes.iter().any(|n| n == "Colour → Red"), "{:?}", p.notes);
     assert!(p.notes.iter().any(|n| n == "Size → Small"), "{:?}", p.notes);
     assert!(
         p.footer
             .as_deref()
-            .is_some_and(|f| f.starts_with(anchor_text("gemini.question.submit")))
+            .is_some_and(|f| f.starts_with(crate::anchor!("gemini.question.submit")))
     );
     let answered = gemini(QUESTION_MULTI_ANSWERED);
     assert_eq!(
@@ -1410,7 +1416,7 @@ fn the_mcp_fetch_and_expansion_boxes_are_read_whole() {
         "{}",
         fetch.title
     );
-    assert_eq!(fetch.description, anchor_text("gemini.box.proceed"));
+    assert_eq!(fetch.description, crate::anchor!("gemini.box.proceed"));
     assert_eq!(roles(&fetch), vec![Role::Once, Role::Persist, Role::Deny]);
     let wide = gemini(BOX_SANDBOX_EXPANSION).prompt.expect("the expansion");
     assert_eq!(wide.kind, PromptKind::Other);
@@ -1477,7 +1483,10 @@ fn narrow_errors_and_the_no_access_dialog() {
         "{}",
         p.description
     );
-    assert_eq!(labels(&p), vec![anchor_text("gemini.usage.retry"), "Stop"]);
+    assert_eq!(
+        labels(&p),
+        vec![crate::anchor!("gemini.usage.retry"), "Stop"]
+    );
     assert_eq!(roles(&p), vec![Role::Other, Role::Other]);
     assert_eq!(identify(None, &rows).program(), Program::Gemini);
     let stopped = gemini(NARROW_NO_ACCESS_STOPPED).wall.expect("the error");
@@ -1526,9 +1535,9 @@ fn a_box_kept_over_the_composer_is_a_persons_prompt() {
         assert_eq!(
             labels(&p),
             vec![
-                anchor_text("gemini.box.once"),
-                anchor_text("gemini.box.session"),
-                anchor_text("gemini.box.deny")
+                crate::anchor!("gemini.box.once"),
+                crate::anchor!("gemini.box.session"),
+                crate::anchor!("gemini.box.deny")
             ],
             "{what}"
         );
@@ -1593,7 +1602,7 @@ fn a_session_under_its_sandbox_reads_as_without_it() {
         let footer = rows.len() - 1;
         assert!(rows[footer].contains(says), "{what}: {:?}", rows[footer]);
         assert!(
-            rows[footer - 1].contains(anchor_text("gemini.footer.workspace")),
+            rows[footer - 1].contains(crate::anchor!("gemini.footer.workspace")),
             "{what}"
         );
         let mut moved = rows.clone();
@@ -1707,9 +1716,9 @@ fn the_expansion_box_after_a_denial_is_read_whole() {
         assert_eq!(
             labels(&p),
             vec![
-                anchor_text("gemini.box.once"),
-                anchor_text("gemini.box.session"),
-                anchor_text("gemini.box.deny")
+                crate::anchor!("gemini.box.once"),
+                crate::anchor!("gemini.box.session"),
+                crate::anchor!("gemini.box.deny")
             ],
             "{what}"
         );
@@ -2088,7 +2097,7 @@ fn the_footer_names_its_model_and_the_banner_its_login() {
     );
     let at = idle
         .iter()
-        .rposition(|r| r.contains(anchor_text("gemini.footer.workspace")))
+        .rposition(|r| r.contains(crate::anchor!("gemini.footer.workspace")))
         .expect("the footer")
         + 1;
     let mut chosen = idle.clone();
@@ -2118,7 +2127,7 @@ fn the_footer_names_its_model_and_the_banner_its_login() {
     );
     let scrolled: Vec<String> = idle
         .iter()
-        .filter(|r| !r.contains(anchor_text("gemini.banner.auth.tail").trim()))
+        .filter(|r| !r.contains(crate::anchor!("gemini.banner.auth.tail").trim()))
         .cloned()
         .collect();
     assert_eq!(banner_login(&scrolled), None);

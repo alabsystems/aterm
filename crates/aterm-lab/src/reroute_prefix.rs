@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A scratch atpkg prefix that routes an agent the way the owner's does: the
-//! `reroute/` stub, the `agents/` twin, then the store build
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §8, launch shape 2).
+//! A scratch atpkg prefix that routes an agent the way the owner's does: the `reroute/` stub,
+//! the `agents/` twin, then the store build (`docs/DESIGN-card-engine-2026-10-19.md` §8, launch
+//! shape 2).
 //!
-//! The build is an APFS clone of one of the owner's store builds, laid at the
-//! same `store/<program>/<build>` path under a new scratch HOME's default
-//! prefix, with its sidecar records. The rest is laid by this checkout's
-//! atpkg, as the owner's aterm lays it: the `current` flip, the `bin/` shim,
-//! the `agents/` twin (`atpkg::activate::install_shims_env`, which reconciles
-//! the twin) and the reroute stubs (`atpkg::reroute::lay`). The owner's
-//! prefix is only ever read.
+//! The build is an APFS clone of one of the owner's store builds, at the same
+//! `store/<program>/<build>` path under a new scratch HOME's default prefix, with its sidecar
+//! records. This checkout's atpkg lays the rest as the owner's aterm does: the `current` flip,
+//! the `bin/` shim, the `agents/` twin and the reroute stubs. The owner's prefix is only ever read.
 
 use std::path::{Path, PathBuf};
 
@@ -48,23 +45,18 @@ pub fn store_of(exe: &Path) -> Option<(PathBuf, String, u64)> {
         .then(|| (prefix.to_path_buf(), program, build))
 }
 
-/// Lay a prefix under the new HOME `home` (its default prefix) whose
-/// `store/<program>/<build>` is a clone of the owner's build holding `source`
-/// (a store executable, [`store_of`]), activated, with its `bin/` shim, its
-/// `agents/` twin and the reroute stubs, then run the clone once
-/// (`--version`): macOS assesses a new file at its first exec, and the first
-/// measured launch must not pay it. A `hold` directory holds the caller's
-/// scratch from before cloning, is stamped on the awake clock
-/// ([`aterm_uds::deadline::stamp_exec`]) just before that exec, and removed
-/// once the clone showed it ran by printing. A clone that printed nothing,
-/// or a run that could not be started or read, leaves it: macOS may still
-/// be assessing the clone. A
-/// caller whose `home` nothing removes passes none.
+/// Lay a prefix under the new HOME `home` (its default prefix) whose `store/<program>/<build>` is
+/// a clone of the owner's build holding `source` (a store executable, [`store_of`]), activated,
+/// with its `bin/` shim, `agents/` twin and reroute stubs, then run the clone once (`--version`)
+/// so the first measured launch does not pay macOS's first-exec assessment. `hold`, a directory
+/// whose presence keeps the caller's scratch, is made before cloning, stamped
+/// ([`aterm_uds::deadline::stamp_exec`]) just before that exec, and removed once the clone printed
+/// anything; when it printed nothing, or the run could not be started or read, `hold` stays, as
+/// macOS may still be assessing the clone. A caller whose `home` nothing removes passes none.
 /// # Errors
-/// `source` is no store build's executable; the scratch prefix is the owner's
-/// or already holds a store; a clone, copy or lay failed; the twin does not
-/// name the clone or the stub is not laid; `hold` could not be made; the
-/// clone never printed a version.
+/// `source` is no store build's executable; the scratch prefix is the owner's or already holds a
+/// store; a clone, copy or lay failed; the twin does not name the clone or the stub is not laid;
+/// `hold` could not be made; the clone could not be run or never printed a version.
 pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, String> {
     let source = std::fs::canonicalize(source)
         .map_err(|e| format!("cannot resolve {}: {e}", source.display()))?;
@@ -250,11 +242,8 @@ mod tests {
         exe
     }
 
-    /// THE CHAIN RUNS: inside an aterm session (`ATERM_SESSION_ID`) the
-    /// reroute stub execs the twin, which execs the clone with its shim
-    /// environment; the clone is the owner's bytes at the same store path
-    /// under the scratch prefix, `current` names it, and the owner's store is
-    /// untouched.
+    /// Inside an aterm session (`ATERM_SESSION_ID`) the stub execs the twin, which execs the
+    /// clone with its shim environment; the owner's store is untouched.
     #[test]
     fn the_stub_runs_the_twin_which_runs_the_clone() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -343,12 +332,9 @@ mod tests {
         );
     }
 
-    /// A CLONE KILLED BEFORE IT PRINTED KEEPS ITS HOLD: a clone that dies by a
-    /// signal at its `--version` (a Ctrl-C at the terminal reaches it, as it
-    /// shares the lab's process group) is no proof it ran, so the hold made
-    /// and stamped before its exec stays for the caller's abort to keep the
-    /// scratch. A silent normal exit also keeps it. NEGATIVE CONTROL: one
-    /// that printed only an error showed it ran: `lay` fails, and the hold goes.
+    /// A clone killed or silent at its `--version` gave no proof it ran, so its stamped hold
+    /// stays; negative control: one that printed only an error ran, so `lay` fails and the hold
+    /// goes.
     #[test]
     fn a_clone_killed_before_it_printed_keeps_its_hold() {
         for (what, body, kept) in [

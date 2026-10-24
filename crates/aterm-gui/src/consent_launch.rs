@@ -536,7 +536,7 @@ impl LaunchConsent {
 
     /// The pass ended with `rows`: every folder answered notes the bundle id, so no later
     /// launch walks again.
-    pub(crate) fn pass_ended(&mut self, rows: &[(Folder, WarmupRow)]) {
+    pub(crate) fn pass_ended(&mut self, rows: &[(Folder, WarmupRow)], retired: bool) {
         if self.warmup != Warmup::Walking {
             return;
         }
@@ -549,8 +549,19 @@ impl LaunchConsent {
             self.answered = Some((bundle_id, Some(true)));
             aterm_log::info!("file access at launch: every folder answered");
         } else {
+            if retired {
+                // The approval was withdrawn, not answered. A fresh admitted
+                // policy may start a new pass, with a new gate and worker.
+                self.warmup = Warmup::Pending;
+                self.next_look = None;
+            }
             aterm_log::info!(
-                "file access at launch: a folder went unanswered; asked again next launch"
+                "file access at launch: a folder went unanswered; {}",
+                if retired {
+                    "waiting for another approval"
+                } else {
+                    "asked again next launch"
+                }
             );
         }
     }
@@ -799,7 +810,7 @@ mod tests {
         let mut state = LaunchConsent::with_reach(reach);
         state.started("com.aterm.aterm", 7);
         assert!(state.walking());
-        state.pass_ended(&[(Folder::Documents, WarmupRow::Denied)]);
+        state.pass_ended(&[(Folder::Documents, WarmupRow::Denied)], false);
         assert!(state.settled());
         assert!(state.owns_rows(7), "its rows stay its own after it ended");
         assert!(!state.owns_rows(8), "an owner's later pass is not");
@@ -808,7 +819,7 @@ mod tests {
 
         let mut state = LaunchConsent::with_reach(reach);
         state.started("com.aterm.aterm", 1);
-        state.pass_ended(&[(Folder::Documents, WarmupRow::Asking)]);
+        state.pass_ended(&[(Folder::Documents, WarmupRow::Asking)], false);
         assert!(state.settled());
         assert_eq!(state.answered("com.aterm.aterm"), Some(false));
         NOTED.with(|noted| assert_eq!(noted.borrow().len(), 1));

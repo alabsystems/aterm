@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS memory-pressure notification seam.
-//!
-//! A development build hears the system through the one source [`SYSTEM_SEAM`] names
-//! ([`Source`]): the kernel's notifications, a stand-in system held at one level, or none
-//! (every live test's and `lab instance`'s), where only the `pressure` verb moves it. A
-//! shipped binary reads no seam and always hears the kernel.
+//! macOS memory-pressure notifications. A development build can hear a stand-in system or
+//! none instead ([`SYSTEM_SEAM`]); a shipped binary reads no seam and always hears the kernel.
 
 use std::ffi::OsString;
 use std::os::raw::c_void;
@@ -15,10 +11,9 @@ use std::ptr;
 use crate::crash_restore::PressureLevel;
 
 /// The system this process hears: unset, the kernel's; `normal`, `warn` or `critical`, a
-/// stand-in system held at that level, which reports it once, as this process installs its
-/// source; [`NO_SYSTEM`], none at all, so the process's pressure is what the `pressure` verb
-/// injects. Every live test instance (`crates/aterm/tests/support/launch_isolation.rs`) and
-/// every `aterm-lab` world is set to [`NO_SYSTEM`], so the host's own pressure never sheds
+/// stand-in system held at that level, which reports it once as this process installs its
+/// source; [`NO_SYSTEM`], none, so only the `pressure` verb moves the level. Live test
+/// instances and `aterm-lab` worlds set [`NO_SYSTEM`], so the host's own pressure never sheds
 /// what a test waits on.
 const SYSTEM_SEAM: &str = "ATERM_DEBUG_SYSTEM_PRESSURE";
 
@@ -56,8 +51,8 @@ struct Ctx {
     source: DispatchObject,
 }
 
-// SAFETY: the handler runs on a serial dispatch queue; the callback is `Send` and the leaked source
-// pointer is only read, never freed.
+// SAFETY: a dispatch source never runs its handler concurrently with itself; the callback is
+// `Send` and the leaked source pointer is only read, never freed.
 unsafe impl Send for Ctx {}
 
 /// The line this source logs for every level the OS reports, on the dispatch thread itself.

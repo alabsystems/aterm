@@ -41,6 +41,49 @@ fn typed_into(w: &mut World, reader: u32) {
     });
 }
 
+/// The tab's shell ran `ls` in front and is back at its prompt: a pass saw it put a group of its
+/// own in front, and one saw the prompt its marks show.
+fn ran_one(w: &mut World) {
+    let shell = w.tab(1).tab.shell_pid;
+    let shell_pgid = w.p(shell).pgid;
+    w.run_fg(1, 3, "ls", sleeper(1100, "ls"));
+    let _ = w.tick(TICK_MS);
+    w.exit(1100, false);
+    if let Some(b) = w.tab(1).tab.block.as_mut() {
+        b.open = false;
+        b.status = Some(0);
+    }
+    w.tab(1).tpgid = shell_pgid;
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+}
+
+/// A sleeping event queue at `fd` whose entries read `idents`.
+fn read_queue(fd: i32, idents: &[u64]) -> aterm_vitals::jobs::Fd {
+    aterm_vitals::jobs::Fd {
+        fd,
+        kind: aterm_vitals::jobs::FdKind::EventQueue {
+            sleeping: Some(true),
+            knotes: Some(
+                idents
+                    .iter()
+                    .map(|&ident| aterm_vitals::jobs::Knote {
+                        ident,
+                        filter: aterm_vitals::jobs::KnoteFilter::Read,
+                    })
+                    .collect(),
+            ),
+        },
+    }
+}
+
+fn tty_fd(fd: i32) -> aterm_vitals::jobs::Fd {
+    aterm_vitals::jobs::Fd {
+        fd,
+        kind: aterm_vitals::jobs::FdKind::Device { tty: true },
+    }
+}
+
 fn wire(v: &JobsView, id: &str) -> String {
     v.row(id)
         .unwrap_or_else(|| {
@@ -340,9 +383,8 @@ fn an_exited_block_keeps_its_row_and_status_for_a_minute() {
     assert!(v.row("b7").is_none());
 }
 
-/// A COMMAND FOLLOWED BY ANOTHER BETWEEN TWO TICKS KEEPS ITS STATUS: the
-/// tab's block is the next command's by the tick that would have read `D`,
-/// and the ended block it replaced carries the status.
+/// The tab's block is the next command's by the tick that would have read `D`; the ended block it
+/// replaced carries the status.
 #[test]
 fn a_command_followed_by_another_between_two_ticks_keeps_its_status() {
     let mut w = World::new();
@@ -357,9 +399,8 @@ fn a_command_followed_by_another_between_two_ticks_keeps_its_status() {
     assert!(v.row("b8").is_some(), "the next command is its own job");
 }
 
-/// AN EXITED COMMAND'S ROW NAMES ITS PROGRAM, NEVER THE SHELL LEFT BEHIND:
-/// the program exits before the shell writes `D`, and a tick between the two
-/// sees the shell alone in the block.
+/// The program exits before the shell writes `D`, and a tick between the two sees the shell alone
+/// in the block.
 #[test]
 fn an_exited_commands_row_names_its_program_not_the_shell_left_behind() {
     let mut w = World::new();
@@ -442,7 +483,7 @@ fn findings_count_stopped_d_state_and_the_process_table() {
     );
 }
 
-/// A held process outside every tab's tree: launchd adopted it (I1's `gh`).
+/// A held process outside every tab's tree, adopted by launchd.
 fn held_orphan(pid: u32, name: &str, aterm: bool) -> Proc {
     let mut p = sleeper(pid, name);
     p.ppid = 1;
@@ -605,11 +646,9 @@ fn a_held_finding_prints_one_row_with_its_age() {
     );
 }
 
-/// A ROW THAT HAS NOT STARTED FOR ANOTHER REASON IS NAMED BY IT, AND IS NO PART OF THE CHECK'S
-/// EPISODE: an x86_64 orphan Rosetta translates and one on a volume not proven local are each
-/// counted from their first sighting under their own kind (`translating`, `not-started`), and
-/// three of them across two readings open no backed-up episode of macOS's program check, nor
-/// count as held.
+/// An x86_64 orphan Rosetta translates and one on a volume not proven local are named by their own
+/// kind (`translating`, `not-started`) from their first sighting, and neither counts as held nor
+/// opens a program-check episode.
 #[test]
 fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
     use aterm_vitals::jobs::StartWait;
@@ -646,12 +685,10 @@ fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
     }
 }
 
-/// THE DYLIB CASE, A HEURISTIC: inside a backed-up episode, a member that started, holds a dylib
-/// a build just wrote open and used no CPU since the reading before is named "probably waiting for
-/// the same check"; the same member is not named outside an episode, at its first reading, while
-/// its CPU moves, with no fresh dylib open, when macOS's program check holds it itself (the
-/// kernel's fact stands alone), or when another process took its pid since (its CPU is not the
-/// one the reading before kept).
+/// Inside a backed-up episode, a started member that holds a fresh dylib open and used no CPU since
+/// the reading before is named "probably waiting for the same check" (a heuristic); never outside
+/// an episode, at its first reading, while its CPU moves, without a fresh dylib, when the check
+/// holds it itself, or once another process took its pid.
 #[test]
 fn inside_an_episode_a_member_flat_on_a_fresh_dylib_probably_waits_for_the_same_check() {
     use aterm_vitals::jobs::{Fd, FdKind};
@@ -1000,10 +1037,8 @@ fn a_typed_sleep_poll_loop_is_one_polling_job_that_reaches_stuck() {
     assert_eq!(most, 1, "one row for the whole loop, never one per sleep");
 }
 
-/// A BLOCK LEARNED AFTER ITS GROUP IN FRONT IS THAT GROUP'S JOB: an engine
-/// restored with a command running, or a fork swept before the reader fed its
-/// `C`, shows the group in front a tick before its block. The block takes
-/// that job over and stays one job, through the next ticks, to its `D`.
+/// An engine restored mid-command, or a fork swept before the reader fed its `C`, shows the group
+/// in front a tick before its block: the block takes that job over, one job to its `D`.
 #[test]
 fn a_block_learned_after_its_group_in_front_is_that_groups_one_job() {
     let mut w = World::new();
@@ -1049,10 +1084,8 @@ fn a_block_learned_after_its_group_in_front_is_that_groups_one_job() {
     );
 }
 
-/// A BACKGROUND WRITER IS JUDGED BY ITS LINES: the mode word is the
-/// foreground reader's, at a prompt the line editor's raw one, so the
-/// shell's own redraws and a background job's `\r` spinner are no progress
-/// of the tab's sole background job, and its lines are.
+/// At a prompt the mode word is the line editor's raw one, so the shell's redraws and a `\r`
+/// spinner are no progress of the tab's sole background job; its lines are.
 #[test]
 fn a_sole_background_job_is_judged_by_its_lines_under_the_line_editors_raw_word() {
     let mut w = World::new();
@@ -1068,9 +1101,7 @@ fn a_sole_background_job_is_judged_by_its_lines_under_the_line_editors_raw_word(
     assert_eq!(row.class, Class::Running, "{}", row.wire());
 }
 
-/// A LONE BACKGROUND JOB IS NOT CREDITED WITH THE SHELL'S LINES: a tick in
-/// which the shell wrote a mark of its own (a prompt, a command that ran and
-/// ended between two ticks) gives the tab's lines to no background job; a
+/// A tick in which the shell wrote a mark of its own gives the tab's lines to no background job; a
 /// tick with lines and no mark gives them to it.
 #[test]
 fn a_lone_background_job_is_not_credited_with_a_tick_the_shell_wrote_in() {
@@ -1091,12 +1122,9 @@ fn a_lone_background_job_is_not_credited_with_a_tick_the_shell_wrote_in() {
     assert_eq!(row.class, Class::Running, "{}", row.wire());
 }
 
-/// A STOP AND `fg` NO TICK SAW KEEP THE ONE JOB: the tab's block is the `fg`
-/// block by the next tick, the stopped one ended in a stop, and the job's own
-/// group is in front again. It keeps its id and quiet clock (the shell's own
-/// lines that tick, its notice of `fg` after `fg`'s `C` among them, are none
-/// of its progress), never exits with the stop's status nor leaves its
-/// program an orphan.
+/// The `fg` block is the tab's by the next tick, with the job's group in front again: the job keeps
+/// its id and quiet clock (the shell's notice of `fg` is no progress of it), never exits and leaves
+/// no orphan.
 #[test]
 fn a_stop_and_fg_no_tick_saw_keep_the_one_job_and_its_quiet_clock() {
     let mut w = World::new();
@@ -1137,12 +1165,9 @@ fn a_stop_and_fg_no_tick_saw_keep_the_one_job_and_its_quiet_clock() {
     }
 }
 
-/// THE NEXT COMMAND TYPED AHEAD IS ITS OWN BLOCK'S JOB: a tick that read the
-/// tab before `D` gave the group the next command put in front to the block
-/// that was ending. Once the next block is the tab's, that block hands it
-/// over: the ended block's job exits with its status (or parks, when its
-/// command was stopped) and the next command is the next block's job, no
-/// orphan.
+/// A tick before `D` gave the group the typed-ahead command put in front to the ending block: once
+/// the next block is the tab's, the ended job exits with its status (or parks, if stopped) and the
+/// next command is the next block's job.
 #[test]
 fn the_next_command_typed_ahead_is_its_own_blocks_job() {
     for stopped in [false, true] {
@@ -1206,9 +1231,8 @@ fn in_the_shells_group(w: &mut World, pid: u32, name: &str) {
     w.add(p);
 }
 
-/// A SURVIVOR IN THE SHELL'S OWN GROUP NEVER HIDES THE JOB `fg` RESUMES: the
-/// `tee` an earlier block left as an orphan is in every block's unit, and the
-/// block `fg` opens resumes the parked job by the group in front.
+/// The `tee` an earlier block left as an orphan is in every block's unit, and the block `fg` opens
+/// still resumes the parked job by the group in front.
 #[test]
 fn a_survivor_in_the_shells_own_group_never_hides_the_job_fg_resumes() {
     let mut w = World::new();
@@ -1244,10 +1268,8 @@ fn inferior(w: &mut World, pid: u32, gdb: u32, state: ProcState) {
     w.add(p);
 }
 
-/// A DEBUGGER'S CHILD IT PUTS IN FRONT IS ITS BLOCK'S: gdb's inferior, first
-/// seen stopped in a group gdb made for it, is gdb's job's, and gets the
-/// terminal at `continue`: the block's job (gdb) keeps it rather than giving
-/// way to it.
+/// gdb's inferior, first seen stopped in a group gdb made for it, is gdb's job's, which keeps it
+/// when it gets the terminal at `continue`.
 #[test]
 fn a_debuggers_child_it_puts_in_front_is_its_blocks() {
     let mut w = World::new();
@@ -1365,9 +1387,8 @@ fn an_uncertain_parent_chain_defers_transfer_until_a_later_read_proves_it() {
     }
 }
 
-/// A DEBUGGER'S TRACED STOP IS NO STOP OF ITS JOB: the inferior stopped at a
-/// breakpoint leaves gdb in front as the block's last group, so a Ctrl-Z of
-/// gdb and `fg` no tick saw resume the one job.
+/// The inferior stopped at a breakpoint leaves gdb in front, so a Ctrl-Z of gdb and `fg` no tick
+/// saw resume the one job.
 #[test]
 fn a_debuggers_traced_stop_keeps_it_the_group_fg_resumes() {
     let mut w = World::new();
@@ -1389,9 +1410,8 @@ fn a_debuggers_traced_stop_keeps_it_the_group_fg_resumes() {
     assert_eq!(row.kind, JobKind::Shell, "{}", row.wire());
 }
 
-/// A PARKED JOB'S PROCESS IN THE SHELL'S OWN GROUP NEVER TAKES THE NEXT
-/// BLOCK: `less <(tail -f log)` parked by Ctrl-Z keeps the `tail` the shell
-/// started for it, and the next command is its own block's job.
+/// `less <(tail -f log)` parked by Ctrl-Z keeps the `tail` the shell started for it, and the next
+/// command is its own block's job.
 #[test]
 fn a_parked_jobs_process_in_the_shells_own_group_never_takes_the_next_block() {
     let mut w = World::new();
@@ -1419,18 +1439,10 @@ fn a_parked_jobs_process_in_the_shells_own_group_never_takes_the_next_block() {
     );
 }
 
-/// A STOPPED MEMBER OUT OF FRONT IS NO HELD STOP: job control took the
-/// terminal from it. A Ctrl-Z'd job stays parked while the next command holds
-/// the terminal, and a member stopped while another of its job's groups runs
-/// in front (gdb's inferior at a breakpoint, the command bash moved on to
-/// past a stopped one of its list) is no stop of that job's, which is judged
-/// by what runs in front. None reads quiet or stuck however long it lasts.
-/// A stage stopped in the group in front (`kill -STOP` of `a` in `a | b`)
-/// holds it. A group the program in front made for itself (ninja's step)
-/// stopped at the terminal is that program's job's, which waits on it and
-/// reads quiet (its wait is capped there). A pipeline whose leader
-/// exited before its Ctrl-Z stays parked by its group, and a `cmd &` job the
-/// terminal stopped (`SIGTTIN`) is the shell's to `fg`: parked.
+/// A Ctrl-Z'd job, a pipeline whose leader exited before its Ctrl-Z and a `cmd &` the terminal
+/// stopped stay parked, and a member stopped while another of its job's groups runs in front never
+/// reads quiet or stuck. A stage stopped in the group in front holds it; a stopped group the
+/// program in front made is that program's job's, which reads quiet.
 #[test]
 fn a_stopped_member_out_of_front_is_no_held_stop() {
     for setup in [
@@ -1545,16 +1557,10 @@ fn a_stopped_member_out_of_front_is_no_held_stop() {
     }
 }
 
-/// A `fg` TYPED AHEAD AND READ BEFORE THE LAST BLOCK'S `D` RESUMES THE
-/// PARKED JOB: a pass reads the tab while block 13 (`make`, over, swept or
-/// not before the pass read the processes, or never seen at all) is still
-/// open and the parked vim already in front. Block 13's job ends with its
-/// own status once `D` is read, also when a pass reads make's `D` before
-/// `fg`'s `C`, and the resumed job is `fg`'s block's, keeping its id, with no
-/// orphan beside it, also when it is Ctrl-Z'd again before the next pass. One
-/// that quits before the next pass never takes make's status, and make's job
-/// then takes none either (a command list's `D` would read the same); one
-/// whose `fg` writes no block (a zle widget's) ends with no status.
+/// A pass reads the tab while block 13 (`make`) is still open and the parked vim already in front:
+/// make's job ends with its own status once `D` is read, and vim's job resumes under its own id
+/// with no orphan. If vim quits first, neither job takes make's status; under a zle widget's `fg`,
+/// vim's job ends with no status.
 #[test]
 fn a_typed_ahead_fg_read_before_the_last_blocks_d_resumes_the_parked_job() {
     for case in [
@@ -1665,11 +1671,8 @@ fn a_typed_ahead_fg_read_before_the_last_blocks_d_resumes_the_parked_job() {
     }
 }
 
-/// A COMMAND LIST THAT ENDS IN `fg` GIVES WAY PAST A SURVIVOR ITS RECIPE
-/// LEFT: `make test && fg` started a server with `&` in make's group, which
-/// launchd adopted when make exited, so nothing of the block's own command
-/// lives on in the shell's tree. The parked job takes the block, and the
-/// server is an orphan's.
+/// `make test && fg` started a server with `&` that launchd adopted when make exited: the parked
+/// job takes the block, and the server is an orphan's.
 #[test]
 fn a_command_list_ending_in_fg_gives_way_past_a_survivor_its_recipe_left() {
     let mut w = World::new();
@@ -1712,11 +1715,8 @@ fn a_command_list_ending_in_fg_gives_way_past_a_survivor_its_recipe_left() {
     assert_eq!(v.row("b13").map(|r| r.exit), Some(None), "{:?}", v.rows);
 }
 
-/// `fg %1` READ BEFORE A STOP'S `D` NEVER MERGES ITS JOB INTO THE STOPPED
-/// ONE: a pass reads the tab while vim's block is still open, vim stopped
-/// behind it, and the job `fg %1` resumes already in front. Vim's job keeps
-/// its block until `D` parks it, and the resumed job is `fg %1`'s block's,
-/// keeping its id.
+/// A pass reads the tab while vim's block is still open, vim stopped and the job `fg %1` resumes in
+/// front: vim's job keeps its block until `D` parks it, and `fg %1`'s job keeps its own id.
 #[test]
 fn fg_of_another_job_read_before_a_stops_d_never_merges_it_into_the_stopped_one() {
     let mut w = World::new();
@@ -1757,12 +1757,8 @@ fn fg_of_another_job_read_before_a_stops_d_never_merges_it_into_the_stopped_one(
     );
 }
 
-/// BASH MOVING ON PAST A STOPPED COMMAND KEEPS THE NEXT ONE ITS BLOCK'S:
-/// bash sends one block per line, so after a Ctrl-Z of `vim a` in
-/// `vim a; vim b` the block stays open with `vim b` in front. Seen there at
-/// two passes, `vim b` is the block's last group in front though `vim a` is
-/// stopped behind it, so a Ctrl-Z of `vim b` and `fg` no tick saw resume the
-/// one job.
+/// After a Ctrl-Z of `vim a` in bash's `vim a; vim b`, the block stays open with `vim b` in front:
+/// a Ctrl-Z of `vim b` and `fg` no tick saw resume the one job.
 #[test]
 fn bash_moving_on_past_a_stopped_command_keeps_the_next_one_its_blocks() {
     let mut w = World::new();
@@ -1790,11 +1786,8 @@ fn bash_moving_on_past_a_stopped_command_keeps_the_next_one_its_blocks() {
     );
 }
 
-/// A JOB BASH BRINGS FORWARD IN A LIST PAST A STOP IS RESUMED: bash sends
-/// one block per line, so after a Ctrl-Z of `make` in `make; fg %1` the
-/// block stays open with the parked vim in front. Make's job parks, never
-/// taking vim's lines, and vim's job takes the block and its lines from the
-/// pass after the one that resumed it.
+/// After a Ctrl-Z of `make` in bash's `make; fg %1`, the block stays open with vim in front: make's
+/// job parks without vim's lines, and vim's job takes the block and its lines from the next pass.
 #[test]
 fn a_job_bash_brings_forward_in_a_list_past_a_stop_is_resumed() {
     let mut w = World::new();
@@ -1842,9 +1835,8 @@ fn a_job_bash_brings_forward_in_a_list_past_a_stop_is_resumed() {
     );
 }
 
-/// A JOB A COMMAND LIST BRINGS FORWARD KEEPS WHAT ITS GROUP FORKED:
-/// `./build.sh &` forks a step into its group while `pytest && fg` hands it
-/// the terminal; the step is the build's, and pytest's row keeps its name.
+/// `./build.sh &` forks a step into its group while `pytest && fg` hands it the terminal: the step
+/// is the build's, and pytest's row keeps its name.
 #[test]
 fn a_job_a_command_list_brings_forward_keeps_what_its_group_forked() {
     let mut w = World::new();
@@ -1876,10 +1868,8 @@ fn a_job_a_command_list_brings_forward_keeps_what_its_group_forked() {
     );
 }
 
-/// A JOB PARKED IN TWO GROUPS TAKES THE BLOCK THAT RESUMES ONE: bash's
-/// `vim a; vim b`, both stopped, parks one job keyed by vim a's group, and
-/// `cargo build; fg` resumes vim b; the job takes the block while vim a stays
-/// stopped beside it.
+/// bash's `vim a; vim b`, both stopped, parks one job keyed by vim a's group; `cargo build; fg`
+/// resumes vim b, and the job takes the block.
 #[test]
 fn a_job_parked_in_two_groups_takes_the_block_that_resumes_one() {
     let mut w = World::new();
@@ -1913,14 +1903,9 @@ fn a_job_parked_in_two_groups_takes_the_block_that_resumes_one() {
     );
 }
 
-/// A JOB A COMMAND LIST BRINGS FORWARD THAT QUITS AT ONCE LEAVES MAKE NO
-/// STATUS: `make && fg` resumes vim, which quits (`:cq`) before a pass gave it
-/// the block, and the list's `D` is `fg`'s, not make's, also when a pass
-/// reads vim gone before the reader feeds that `D`, when the job keeps a
-/// process substitution in the shell's group (`vim <(tail -f log)`), and when
-/// a child it started in its group lives on adopted (`fg` waits for no
-/// grandchild). vim's own row ends with it. A swept zombie and a different
-/// process that reused vim's PID prove no live vim either.
+/// `make && fg` resumes vim, which quits (`:cq`) before a pass gave it the block: the list's `D` is
+/// `fg`'s, not make's, and vim's row ends. A swept zombie or a process that reused vim's pid proves
+/// no live vim either.
 #[test]
 fn a_job_a_command_list_brings_forward_that_quits_at_once_leaves_make_no_status() {
     for (between, extra) in [
@@ -1983,10 +1968,8 @@ fn a_job_a_command_list_brings_forward_that_quits_at_once_leaves_make_no_status(
     }
 }
 
-/// A COMMAND LINE THE SHELL RUNS ITSELF TAKES ITS LINES: past `sleep 1`, a
-/// builtin loop (`while :; do echo tick; done`) keeps the terminal with the
-/// shell, and its block's job is judged by the lines it prints, also over
-/// passes that could not read the shell's terminal group.
+/// Past `sleep 1`, a builtin loop keeps the terminal with the shell, and the block's job is judged
+/// by the lines it prints, also when a pass could not read the shell.
 #[test]
 fn a_command_line_the_shell_runs_itself_takes_its_lines() {
     for unread in [false, true] {
@@ -2014,13 +1997,10 @@ fn a_command_line_the_shell_runs_itself_takes_its_lines() {
     }
 }
 
-/// A STOP'S `D` READ BEFORE THE `fg` THAT RESUMED IT PARKS NOTHING: vim,
-/// Ctrl-Z'd and resumed by a `fg` no pass saw, is in front again when a pass
-/// reads the stop's `D` but not yet `fg`'s `C`; its job runs on in front and
-/// takes `fg`'s block, whose shell's notice of `fg` is no line of vim's. One
-/// whose `fg` writes no block (a zle widget's) is its group's job: what vim
-/// forks joins it, a second Ctrl-Z parks it, and it ends when vim does, also
-/// while a process substitution of its command line lives on.
+/// vim, Ctrl-Z'd and resumed by a `fg` no pass saw, is in front when a pass reads the stop's `D`:
+/// its job runs on and takes `fg`'s block, whose notice of `fg` is no line of vim's. Under a `fg`
+/// that writes no block (a zle widget's) it is its group's job, which a second Ctrl-Z parks and
+/// which ends with no status when vim does.
 #[test]
 fn a_stops_d_read_before_the_fg_that_resumed_it_parks_nothing() {
     for widget in [false, true] {
@@ -2090,10 +2070,8 @@ fn a_stops_d_read_before_the_fg_that_resumed_it_parks_nothing() {
     }
 }
 
-/// A COMMAND LIST THAT MOVES ON PAST THE JOB IT BROUGHT FORWARD KEEPS ITS
-/// STATUS: bash's `make; fg %1; git status`, with vim Ctrl-Z'd again before a
-/// pass gave it the block, ends with git's status on the list's row, also
-/// when git ran between two passes.
+/// bash's `make; fg %1; git status`, with vim Ctrl-Z'd again before a pass gave it the block, ends
+/// with git's status on the list's row, also when git ran between two passes.
 #[test]
 fn a_command_list_that_moves_on_past_the_job_it_brought_forward_keeps_its_status() {
     for seen in [true, false] {
@@ -2127,12 +2105,8 @@ fn a_command_list_that_moves_on_past_the_job_it_brought_forward_keeps_its_status
     }
 }
 
-/// A COMMAND LIST'S `D` THAT IS ITS `fg`'S STOP IS NO STATUS OF ITS OWN:
-/// `make && fg` resumes vim, which is Ctrl-Z'd before a pass gave it the
-/// block, so `fg` and the list return the stop's status. make's job takes
-/// none, whether a pass saw the shell hold the terminal before the reader fed
-/// that `D` or a `fg` typed at once put vim in front again before the pass,
-/// its `C` read or not.
+/// `make && fg` resumes vim, which is Ctrl-Z'd before a pass gave it the block, so the list's `D`
+/// is the stop's: make's job takes no status, also when vim is put in front again at once.
 #[test]
 fn a_command_lists_d_that_is_its_fgs_stop_is_no_status_of_its_own() {
     for case in ["between", "again", "again read"] {
@@ -2173,11 +2147,8 @@ fn a_command_lists_d_that_is_its_fgs_stop_is_no_status_of_its_own() {
     }
 }
 
-/// A LIST'S LATER COMMAND IN FRONT TAKES ITS BLOCK BACK: in bash's `make; fg
-/// %1; make install`, the background `./fetch.sh` the list brought forward
-/// ends within a pass and make install runs on, so the list's status is make
-/// install's however long it ran; in `make; fg %1; fg %2`, the second job
-/// `fg` resumed takes the block and its own status.
+/// In bash's `make; fg %1; make install`, the list's status is make install's once the `./fetch.sh`
+/// it brought forward ends; in `make; fg %1; fg %2`, the second job resumed takes its own status.
 #[test]
 fn a_lists_later_command_in_front_takes_its_block_back() {
     for second in [false, true] {
@@ -2226,12 +2197,9 @@ fn a_lists_later_command_in_front_takes_its_block_back() {
     }
 }
 
-/// A BLOCK WHOSE GROUP IN FRONT EMPTIED TAKES ITS LINES: in `seq 1 40 |
-/// timeout 3600 xargs ./step.sh`, seq exits and timeout has left for a group
-/// of its own, so the terminal's group holds no process while the shell waits
-/// and the steps print; the block's job and the tab's one background group
-/// that can run, timeout's, are judged by those lines, also beside a parked
-/// editor.
+/// In `seq 1 40 | timeout 3600 xargs ./step.sh`, seq exits and timeout runs in a group of its own,
+/// so the group in front is empty while the steps print: the block's job and timeout's take the
+/// lines.
 #[test]
 fn a_block_whose_group_in_front_emptied_takes_its_lines() {
     for (zombie, parked) in [(false, false), (true, false), (false, true)] {
@@ -2265,9 +2233,8 @@ fn a_block_whose_group_in_front_emptied_takes_its_lines() {
     }
 }
 
-/// A BACKGROUND JOB TAKES NO LINES OF A PROGRAM IN FRONT WITHOUT A BLOCK: in a
-/// shell that writes no OSC 133 marks, a silent `make &` beside the vim in
-/// front is judged without the lines vim prints.
+/// In a shell that writes no OSC 133 marks, a silent `make &` beside the vim in front takes none of
+/// vim's lines.
 #[test]
 fn a_background_job_takes_no_lines_of_a_program_in_front_without_a_block() {
     let mut w = World::new();
@@ -2286,9 +2253,7 @@ fn a_background_job_takes_no_lines_of_a_program_in_front_without_a_block() {
     );
 }
 
-/// A PARKED JOB TAKES NO LINES: with vim Ctrl-Z'd and `ping -i 5 host &` the
-/// one background group that runs, the lines at the prompt are ping's, and
-/// vim stays parked.
+/// With vim Ctrl-Z'd and `ping -i 5 host &` running, the lines at the prompt are ping's.
 #[test]
 fn a_parked_job_takes_no_lines() {
     let mut w = World::new();
@@ -2310,14 +2275,8 @@ fn a_parked_job_takes_no_lines() {
     );
 }
 
-/// A JOB TAKES ONLY LINES ONE OF ITS PROCESSES COULD HAVE WRITTEN: a job none
-/// of whose processes made a system call over the tick is credited none of
-/// the terminal's lines. A silent `python3 -m http.server &` takes none of
-/// what `seq 1 40 | setsid xargs ./step.sh` prints once seq exits; a hung
-/// `./sync.sh &` takes none of the line editor's redraws at the prompt; a
-/// `git push` hung on its peer takes none of a `tail -f &`'s lines; and
-/// `git diff | timeout 1800 claude -p`'s claude, the one background group,
-/// takes its own lines while one of its tool calls runs.
+/// A job none of whose processes made a system call over the tick is credited none of the
+/// terminal's lines.
 #[test]
 fn a_job_takes_only_lines_one_of_its_processes_could_have_written() {
     let mut w = World::new();
@@ -2419,20 +2378,9 @@ fn a_job_takes_only_lines_one_of_its_processes_could_have_written() {
     );
 }
 
-/// A COMMAND WHOSE OUTPUT A SERVER OUTSIDE THE TAB WRITES TAKES ITS LINES:
-/// `ssh build make` over a shared connection hands its terminal to the master
-/// ssh, outside the tab's tree, and waits on it over a socket (as tmux's
-/// client does on its server); while no other job of the tab stirs (a
-/// Ctrl-Z'd `sudo vim`, whose stopped processes aterm may not read, makes no
-/// system call), the lines the tab prints are the command's in front. Hung
-/// beside a `tail -f &` started with it, it takes none of tail's lines; a
-/// command hung with no such socket takes none of a stray writer's (a server
-/// a subshell left behind, no job's); one aterm may not read (`sudo mount`)
-/// takes none of a background `ping`'s, read or not, nor the last line of a
-/// `make &` that ended, nor a background job's that turned root's (`exec
-/// sudo`); a hung `git fetch` takes none of the notice zsh
-/// prints as it reaps `make &`; and a polling loop none of `rails server &`'s
-/// log.
+/// `ssh build make` over a shared connection waits on the master ssh, outside the tab's tree, over
+/// a socket: while no other job of the tab stirs, the lines the tab prints are the command's. A
+/// command hung beside another writer takes none of that writer's lines.
 #[test]
 fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
     for parked in [false, true] {
@@ -2523,8 +2471,7 @@ fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
         wire(&v, "b10")
     );
 
-    // `sudo mount` hung, its processes root's, beside `ping -i 5 host &`, which prints: also a
-    // `sudo ping` aterm may not read either.
+    // `sudo mount` hung, its processes root's, beside a printing `ping -i 5 host &`, read or not.
     for refused in [false, true] {
         let mut w = World::new();
         let shell = w.tab(1).tab.shell_pid;
@@ -2699,12 +2646,9 @@ fn a_command_whose_output_a_server_outside_the_tab_writes_takes_its_lines() {
     );
 }
 
-/// A GROUP A PROGRAM MADE FOR ITS CHILDREN IS ITS JOB'S: ninja starts each
-/// step in a group of its own and prints only its `\r` status line; the steps
-/// are the build's members, whose work is its progress, and no step is a row
-/// of its own. A stop in such a group is held (no `fg` resumes it), also under
-/// a root that never put a group in front; a job stopped in the group job
-/// control put in front too parks by that stop.
+/// ninja starts each step in a group of its own: the steps are the build's members, never rows of
+/// their own. A stop in such a group is held (no `fg` resumes it); one in the group the shell put
+/// in front parks the job.
 #[test]
 fn a_group_a_program_made_for_its_children_is_its_jobs() {
     let mut w = World::new();
@@ -2792,8 +2736,7 @@ fn a_group_a_program_made_for_its_children_is_its_jobs() {
     );
 
     // Ctrl-Z of `cargo nextest run`, which starts each test in a group of its own and stops them
-    // as it stops: the job parks by nextest's stop, in the group the shell put in front, whatever
-    // pid a test drew below it.
+    // as it stops: the job parks by nextest's stop, whatever pid a test drew below it.
     let mut w = World::new();
     let shell = w.tab(1).tab.shell_pid;
     w.mark(1);
@@ -2818,12 +2761,8 @@ fn a_group_a_program_made_for_its_children_is_its_jobs() {
     );
 }
 
-/// A NESTED SHELL'S JOBS ARE ROWS OF THEIR OWN: `bash` run in the tab's zsh
-/// put `vim` in front, so it does job control, and its `curl … &` hung on a
-/// silent server is a background job that reads stuck, never part of the
-/// shell's row that reads the person's keys at its prompt; its `vim &`, which
-/// stopped reading the terminal from the background, waits for bash's `fg`:
-/// parked.
+/// `bash` run in the tab's zsh put `vim` in front, so it does job control: its hung `curl … &`
+/// reads stuck and its stopped `vim &` parked, neither part of bash's row.
 #[test]
 fn a_nested_shells_jobs_are_rows_of_their_own() {
     let mut w = World::new();
@@ -2866,17 +2805,9 @@ fn a_nested_shells_jobs_are_rows_of_their_own() {
     );
 }
 
-/// A TERMINAL SESSION NESTED IN THE TAB'S IS A ROW OF ITS OWN: sudo under
-/// `use_pty` runs its command (and its monitor) in a session of its own on a
-/// new terminal, as `script` runs its shell, and an agent its pty tool call.
-/// That session is one row beside its opener's, judged by its own processes:
-/// it takes the lines it writes while its opener holds the terminal (through
-/// each session the opener sits in), and a command of it hung on a silent
-/// peer reads stuck while sudo's row reads the terminal and the agent's row
-/// runs on its redraws, also when the agent runs in `nvim`'s terminal. A
-/// session in another is a row of its own, and one whose reader in front waits
-/// for the person's keys reads its own terminal's word: fine (a shell in
-/// Emacs's buffer at its prompt reads a line).
+/// A nested session (sudo's `use_pty` command and monitor, `script`'s shell, an agent's pty call)
+/// is one row beside its opener's, judged by its own processes: it takes the lines it writes, and
+/// one hung on a silent peer reads stuck while the opener's row runs on.
 #[test]
 fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     // Root's processes: none read (macOS refuses another user's counters), or read without a
@@ -2926,7 +2857,7 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
             match root {
                 1 if pid != sudo => w.p(pid).refused = true,
                 2 if pid != sudo => w.p(pid).counters.syscalls = None,
-                // `sudo -u $USER`: sudo and its monitor root's, the command yours.
+                // `sudo -u $USER`: sudo and its monitor root's, the command the person's.
                 3 if pid != 1302 => w.p(pid).refused = true,
                 _ => {}
             }
@@ -3148,10 +3079,9 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
         wire(&v, "n1310")
     );
 
-    // Codex's pty call at `create-vite`'s raw prompt (after `npm install` polled while the person
-    // typed to Codex) and Emacs's shell at a hung `curl`: the person's keys reach Codex's own
-    // prompt, never the call's terminal, which wakes only to the agent's keys, and Emacs keeps
-    // echo off in every shell it opens; each reads by its leaves, not as the person's read.
+    // Codex's pty call at `create-vite`'s raw prompt and Emacs's shell at a hung `curl`: the
+    // person's keys go to Codex, never the call's terminal, and Emacs keeps echo off in every shell
+    // it opens; neither reads as the person's read.
     for emacs in [false, true] {
         let mut w = World::new();
         let opener = if emacs { "emacs" } else { "codex" };
@@ -3199,8 +3129,8 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
             if (rel == 80_000 || rel == 200_000) && !emacs {
                 *w.p(1311).counters.syscalls.get_or_insert(0) += 1;
             }
-            // The call's shell wakes (a child's exit) over two passes you typed in: what sits in
-            // front of its terminal took no key.
+            // The call's shell wakes (a child's exit) over two passes the person typed in: what
+            // sits in front of its terminal took no key.
             if (rel == 140_000 || rel == 160_000) && !emacs {
                 *w.p(1310).counters.syscalls.get_or_insert(0) += 1;
             }
@@ -3295,9 +3225,8 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
         );
     }
 
-    // The person types to Codex as its pty call starts polling and once more as the agent writes
-    // into that call, then waits: two chance wakes, the first from no reading at all, show no
-    // key of the person's reaches the call.
+    // The person types to Codex as its pty call starts polling and again as the agent writes into
+    // it: two chance wakes show no key of the person's reaches the call.
     let mut w = World::new();
     w.run_fg(1, 5, "codex", sleeper(1300, "codex"));
     let mut lead = Proc::new(1310, 1300, "bash");
@@ -3451,13 +3380,9 @@ fn a_terminal_session_nested_in_the_tabs_is_a_row_of_its_own() {
     );
 }
 
-/// THE SHELL'S OWN PTY IS NO COMMAND'S: an async prompt's worker (pure's and
-/// spaceship's zsh-async, run in a `zpty` the shell opened, a fork that kept
-/// the shell's program) and the `git` it runs belong to no command's row and
-/// leave none behind, also in a zsh run in the tab's and one swept before the
-/// shell's first mark. A pty a program other than the shell opened is a
-/// session of its own, also one a fork that kept that program leads (Python's
-/// `pty.fork()`), the tab's root an agent.
+/// An async prompt's worker (zsh-async in a `zpty`, a fork that kept the shell's program) and its
+/// `git` belong to no command's row; a pty another program opened is a session of its own, also one
+/// led by a fork that kept that program (Python's `pty.fork()`).
 #[test]
 fn the_shells_own_pty_is_no_commands() {
     // One swept before the shell's first mark: no row.
@@ -3551,12 +3476,8 @@ fn the_shells_own_pty_is_no_commands() {
     }
 }
 
-/// A STOPPED SUDO PARKS WITH ITS COMMAND: Ctrl-Z of `sudo vim` stops vim, its
-/// monitor stays awake and takes its terminal back, and sudo stops itself;
-/// both rows read parked, and `ping -i 5 host &`, the one background group
-/// that can print, takes its lines. A job the shell in `script` parked is
-/// that shell's: the session reads by what holds its terminal, the shell at
-/// its prompt (fine) or a command hung in front (stuck).
+/// Ctrl-Z of `sudo vim` parks sudo's row and its session's while `ping -i 5 host &` takes the
+/// lines; a job `script`'s shell parked leaves that session read by what holds its terminal.
 #[test]
 fn a_stopped_sudo_parks_with_its_command() {
     let mut w = World::new();
@@ -3645,11 +3566,9 @@ fn a_stopped_sudo_parks_with_its_command() {
     }
 }
 
-/// A BACKGROUND JOB WHOSE LEADER LEFT ONLY AN ADOPTED CHILD IS OVER:
-/// `./start-server.sh &` started `nohup ./server &` in its group and exited,
-/// so launchd adopted the server; the job's row ends, and the server is
-/// nobody's. A debugger that attached from another tab adopts nothing: the
-/// job runs on.
+/// `./start-server.sh &` started `nohup ./server &` in its group and exited, so launchd adopted the
+/// server: the job's row ends. A debugger attached from another tab adopts nothing, so the job runs
+/// on.
 #[test]
 fn a_background_job_whose_leader_left_only_an_adopted_child_is_over() {
     for (traced, reaper) in [(false, false), (false, true), (true, false)] {
@@ -3686,11 +3605,8 @@ fn a_background_job_whose_leader_left_only_an_adopted_child_is_over() {
     }
 }
 
-/// A COMMAND TYPED AHEAD OF A BLOCK'S END ENDS NOTHING BUT THAT BLOCK: zsh
-/// runs the `less x` typed while make ran once it wrote make's `D`, and a
-/// pass that reads that `D` with less in front, before less's own `C`, ends
-/// make's job with make's status; less is its own job, which its block then
-/// takes.
+/// zsh runs `less x`, typed while make ran, once it writes make's `D`; a pass that reads that `D`
+/// with less in front ends make's job with make's status, and less is a job of its own.
 #[test]
 fn a_command_typed_ahead_of_a_blocks_end_ends_nothing_but_that_block() {
     let mut w = World::new();
@@ -3723,10 +3639,8 @@ fn a_command_typed_ahead_of_a_blocks_end_ends_nothing_but_that_block() {
     assert_eq!(less[0].kind, JobKind::Shell, "{:?}", v.rows);
 }
 
-/// TWO JOBS ONE LIST BROUGHT FORWARD LEAVE ITS STATUS TO THE LAST: bash's
-/// `make; fg %vim; fg %less` resumes vim, which is Ctrl-Z'd, then less, which
-/// quits before a pass gave it the block, so the list's `D` is less's `fg`'s
-/// and make's row takes none, vim living on stopped.
+/// bash's `make; fg %vim; fg %less` resumes vim, which is Ctrl-Z'd, then less, which quits before a
+/// pass gave it the block: the list's `D` is less's `fg`'s, so make's row takes no status.
 #[test]
 fn two_jobs_one_list_brought_forward_leave_its_status_to_the_last() {
     let mut w = World::new();
@@ -3761,10 +3675,8 @@ fn two_jobs_one_list_brought_forward_leave_its_status_to_the_last() {
     );
 }
 
-/// A DEFERRAL IN ANOTHER TAB LEAVES THIS TAB'S ALONE: two tabs run
-/// `make && fg` as their block 13, and the pass that reads one tab's `D`, its
-/// vim quit, finds the other tab's list bringing its vim forward under a block
-/// of the same id; the first tab's make still takes no status.
+/// Two tabs run `make && fg` as block 13; the pass that reads tab 1's `D` (its vim quit) also sees
+/// tab 2's list bring vim forward, and tab 1's make still takes no status.
 #[test]
 fn a_deferral_in_another_tab_leaves_this_tabs_alone() {
     let mut w = World::new();
@@ -3803,10 +3715,8 @@ fn a_deferral_in_another_tab_leaves_this_tabs_alone() {
     );
 }
 
-/// A TOOL CALL SEEN IN ITS AGENT'S GROUP BEFORE IT DETACHED LEAVES THE
-/// AGENT'S JOB A SHELL JOB: a pass that reads Claude Code's child between its
-/// fork and its `setsid` holds it in the agent's block's job, and the call,
-/// detached, is no group in front for that job to be found by.
+/// A pass reads Claude Code's child between its fork and its `setsid`: once detached, the call is
+/// no group in front for the agent's block's job to be found by, and that job stays a shell job.
 #[test]
 fn a_tool_call_seen_in_its_agents_group_before_it_detached_leaves_the_agents_job_a_shell_job() {
     let mut w = World::new();
@@ -3830,9 +3740,8 @@ fn a_tool_call_seen_in_its_agents_group_before_it_detached_leaves_the_agents_job
     );
 }
 
-/// A SURVIVOR THAT EXITED BEFORE THE PASS READ IT LEAVES NO ORPHAN: the sweep
-/// listed make's compiler, which exited before the pass read it, at the pass
-/// that read make's `D`.
+/// At the pass that reads make's `D`, the sweep lists make's compiler, which exits before the pass
+/// reads it.
 #[test]
 fn a_survivor_that_exited_before_the_pass_read_it_leaves_no_orphan() {
     let mut w = World::new();
@@ -3856,12 +3765,8 @@ fn a_survivor_that_exited_before_the_pass_read_it_leaves_no_orphan() {
     );
 }
 
-/// A COMMAND TYPED AHEAD OF ONE NO TICK SAW IN FRONT IS ITS OWN BLOCK'S JOB:
-/// block 7 (a builtin, or a command shorter than a pass) never had a group of
-/// its own in front, so a tick that read the tab before its `D` took the next
-/// command's group for block 7's own. Block 7 ended in no stop, so block 8
-/// resumes nothing: block 7's job exits with its status and the next command
-/// is block 8's job.
+/// Block 7 (a builtin) never had a group in front, so a tick before its `D` took the next command's
+/// group for its own; block 7 still exits with its status, and make is block 8's job.
 #[test]
 fn a_command_typed_ahead_of_one_no_tick_saw_in_front_is_its_own_blocks_job() {
     let mut w = World::new();
@@ -3896,11 +3801,8 @@ fn a_command_typed_ahead_of_one_no_tick_saw_in_front_is_its_own_blocks_job() {
     }
 }
 
-/// CTRL-Z AND `bg` NO TICK SAW PARK THE ONE JOB: by the next tick its block
-/// ended in a stop and its command runs on in the background. The job keeps
-/// its id and quiet clock as a background job, never exits with the stop's
-/// status nor leaves its program an orphan. The shell busy with the stop a
-/// tick before the reader fed `D`, then leaving the job alive, is no polling.
+/// The job stays one background job with its id and quiet clock, never exits with the stop's
+/// status nor leaves an orphan; the shell's system calls over the stop are no polling.
 #[test]
 fn ctrl_z_and_bg_no_tick_saw_park_the_one_job() {
     let mut w = World::new();
@@ -3934,11 +3836,8 @@ fn ctrl_z_and_bg_no_tick_saw_park_the_one_job() {
     }
 }
 
-/// `fg` NEVER NAMES THE JOB IT RESUMES: not a parked block's job (a tick may
-/// see its group in front before the reader fed `fg`'s `C`, even the tick
-/// after the one that saw the stop), nor a `cmd &` job, nor a group a tick saw
-/// in front before any block and then stopped. The job keeps its own command,
-/// so it is never judged by (nor teaches) the `fg` command's class.
+/// Neither a parked block's job, a `cmd &` job nor a group stopped before any block is judged by
+/// (or teaches) the `fg` command's class.
 #[test]
 fn fg_never_names_the_job_it_resumes() {
     for setup in ["parked block", "cmd &", "stopped before a block"] {
@@ -3984,10 +3883,8 @@ fn fg_never_names_the_job_it_resumes() {
     }
 }
 
-/// A BLOCK'S OWN `C` NEVER VOIDS ITS JOB'S LINES: the reader may feed `C`
-/// after a pass's clock, so the block starts, and the shell's mark is
-/// stamped, past the pass that first finds it. The job's next tick still
-/// credits the lines its command printed after `C`.
+/// The reader may feed `C` after a pass's clock; the job's next tick still credits the lines its
+/// command printed after it.
 #[test]
 fn a_blocks_own_c_fed_after_a_pass_never_voids_its_jobs_lines() {
     let mut w = World::new();
@@ -4004,9 +3901,8 @@ fn a_blocks_own_c_fed_after_a_pass_never_voids_its_jobs_lines() {
     assert_eq!(row.class, Class::Running, "{}", row.wire());
 }
 
-/// A BACKGROUND JOB `fg` RESUMED IS ITS GROUP'S OWN: `make &` was never in
-/// front under a block, so the block `fg` resumes it under records its group
-/// as the job's own, and a stop and `fg` no tick saw keep the one job.
+/// A `cmd &` job was never in front under a block, so the block `fg` resumes it under records its
+/// group as the job's own.
 #[test]
 fn a_background_job_fg_resumed_keeps_its_group_through_a_stop_and_fg_no_tick_saw() {
     let mut w = World::new();
@@ -4026,10 +3922,8 @@ fn a_background_job_fg_resumed_keeps_its_group_through_a_stop_and_fg_no_tick_saw
     assert_ne!(row.verdict, Verdict::Exited, "{}", row.wire());
 }
 
-/// A STOP AND `fg` NO TICK SAW KEEP AN `a && b` BLOCK ONE JOB: the stopped
-/// command is the block's second group, not its first, and is in front
-/// again under the `fg` block, also when a tick saw the shell take the
-/// terminal back before the reader fed the stop's `D`.
+/// The stopped command is the block's second group (`make && make test`), also when a tick saw the
+/// shell take the terminal back before the stop's `D`.
 #[test]
 fn a_stop_and_fg_no_tick_saw_keep_a_later_command_of_a_block_its_jobs() {
     for before_d in [false, true] {
@@ -4060,10 +3954,8 @@ fn a_stop_and_fg_no_tick_saw_keep_a_later_command_of_a_block_its_jobs() {
     }
 }
 
-/// `fg`'S BLOCK READ BEFORE THE SHELL HANDS THE TERMINAL OVER RESUMES THE
-/// PARKED JOB: a tick finds `fg`'s block with the shell alone in front, and
-/// the tick that sees the parked group in front makes it that block's job,
-/// one job that takes the lines it prints.
+/// A tick sees `fg`'s block with the shell still in front; the parked job then takes that block,
+/// staying one job that takes the lines it prints.
 #[test]
 fn fgs_block_read_before_the_shell_hands_the_terminal_over_resumes_the_parked_job() {
     let mut w = World::new();
@@ -4090,13 +3982,8 @@ fn fgs_block_read_before_the_shell_hands_the_terminal_over_resumes_the_parked_jo
     );
 }
 
-/// `fg`'S NOTICE AFTER A PASS'S CLOCK IS NONE OF THE JOB'S PROGRESS: the
-/// pass that resumes a parked job can take its clock between `fg`'s `C` and
-/// the shell's notice, so the notice lands in the job's next tick, which
-/// credits it nothing either, also when the pass read the group in front
-/// well after its clock (a slow sweep). A line the job prints after the
-/// notice is its own however long that next tick comes after (a slow
-/// cadence).
+/// The resuming pass's clock can fall between `fg`'s `C` and the shell's notice: the notice credits
+/// the job's next tick nothing (also after a slow sweep), and a line the job prints later does.
 #[test]
 fn fgs_notice_after_the_resuming_pass_clock_is_none_of_the_jobs_progress() {
     for (lag, notice, own_line) in [(0, 5, false), (1_500, 1_200, false), (0, 5, true)] {
@@ -4622,7 +4509,10 @@ fn a_zombie_writes_nothing() {
 /// A PROCESS TICKING AT ITS IDLE RATE WROTE NOTHING: a runtime's timers wake it as often over a
 /// tick the tab printed nothing in as over one it printed in. A JVM deadlocked in front takes
 /// none of a `tail -f &`'s lines, and an idle `python3 -m http.server &` leaves a loop run after
-/// it its own.
+/// it its own. A pass a moment after the last teaches no rate, so a working `gradle` keeps its
+/// lines beside `tail -f &`, and judges one as over a whole tick, so a hung `python3 client.py`
+/// takes none of the line that ran it; a JVM in front whose wakes vary wrote nothing at the
+/// most they make.
 #[test]
 fn a_process_ticking_at_its_idle_rate_wrote_nothing() {
     let mut w = World::new();
@@ -4655,6 +4545,78 @@ fn a_process_ticking_at_its_idle_rate_wrote_nothing() {
     assert_eq!(
         v.row("b9").map(|r| r.class),
         Some(Class::Running),
+        "{}",
+        wire(&v, "b9")
+    );
+
+    // `./gradlew test` in front, its daemon's threads waking it ten times a second, beside a
+    // `tail -f &`: a pass 40 ms after the last (the host's disk look) caught one wake.
+    let mut w = World::new();
+    w.run_bg(1, sleeper(1400, "tail"));
+    let mut gradle = sleeper(1300, "java");
+    gradle.syscalls_per_s = 10;
+    w.run_fg(1, 9, "./gradlew test --console=plain", gradle);
+    w.tty_mode(1, true, true);
+    let _ = run_to(&mut w, 10_000, |_, _| {});
+    w.advance(40);
+    *w.p(1300).counters.syscalls.get_or_insert(0) += 1;
+    let _ = w.observe();
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    let v = run_to(&mut w, 120_000, |w, _| w.line_from(1, &[1300, 1400]));
+    assert_eq!(
+        v.row("b9").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "b9")
+    );
+
+    // `python3 client.py` hung on its server's reply, its asyncio heartbeat waking it once a
+    // second, beside a `tail -f &`: a line read 300 ms after a pass runs one at once, which caught
+    // one of its wakes.
+    let mut w = World::new();
+    w.run_bg(1, sleeper(1400, "tail"));
+    let mut client = sleeper(1300, "python3");
+    client.syscalls_per_s = 1;
+    client.fds.push(tcp_fd(5));
+    w.run_fg(1, 9, "python3 client.py", client);
+    w.tty_mode(1, true, true);
+    let _ = run_to(&mut w, 20_000, |_, _| {});
+    for _ in 0..30 {
+        for _ in 0..9 {
+            let _ = w.tick(TICK_MS);
+        }
+        w.advance(300);
+        *w.p(1300).counters.syscalls.get_or_insert(0) += 2;
+        w.line_from(1, &[1400]);
+        let _ = w.observe();
+    }
+    let v = w.tick(TICK_MS);
+    assert!(
+        v.row("b9")
+            .and_then(|r| r.quiet_ms)
+            .is_some_and(|q| q >= 540_000),
+        "{}",
+        wire(&v, "b9")
+    );
+
+    // The JVM deadlocked in front wakes 38 or 42 times a second: at the most it wrote nothing.
+    let mut w = World::new();
+    w.run_bg(1, sleeper(1400, "tail"));
+    let mut java = sleeper(1300, "java");
+    java.syscalls_per_s = 38;
+    w.run_fg(1, 9, "java -jar app.jar", java);
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        if rel % 12_000 == 0 {
+            *w.p(1300).counters.syscalls.get_or_insert(0) += 8;
+        }
+        if rel % 24_000 == 0 {
+            w.line_from(1, &[1400]);
+        }
+    });
+    assert_eq!(
+        v.row("b9").map(|r| r.quiet_ms),
+        Some(Some(1_200_000)),
         "{}",
         wire(&v, "b9")
     );
@@ -4799,6 +4761,9 @@ fn a_nested_session_the_persons_keys_reach_stays_so() {
 /// A NESTED SESSION'S LINE READ IS ITS LEADER'S ALONE, WAITING ON NOTHING ELSE: a REPL in Emacs's
 /// buffer hung on its socket, or a shell there stuck in the kernel on a dead share, reads that
 /// wait; and a shell there at its prompt beside a background job hung on its peer is no line read.
+/// A REPL there at its prompt whose event loop holds the terminal reads a line; one whose loop
+/// waits on its socket alone (asyncio's, the statement running), or a background `./sync &` there
+/// whose loop waits on its connection (also with its entries unlisted), is none.
 #[test]
 fn a_nested_line_read_is_the_leaders_alone_waiting_on_nothing_else() {
     for (name, hang) in [("python3", 0), ("bash", 1), ("zsh", 2)] {
@@ -4838,12 +4803,111 @@ fn a_nested_line_read_is_the_leaders_alone_waiting_on_nothing_else() {
             v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
         );
     }
+
+    for (go, listed) in [(false, true), (true, true), (true, false)] {
+        let mut w = World::new();
+        w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+        let mut lead = Proc::new(1310, 1300, if go { "bash" } else { "python3" });
+        lead.sid = 1310;
+        lead.tty = true;
+        lead.fds.push(tty_fd(0));
+        if !go {
+            lead.fds
+                .extend([read_queue(5, &[6, 7]), socket_fd(6), tcp_fd(7)]);
+        }
+        w.add(lead);
+        if go {
+            let mut sync = Proc::new(1311, 1310, "sync");
+            sync.sid = 1310;
+            sync.tty = true;
+            sync.fds.push(if listed {
+                read_queue(3, &[4, 7])
+            } else {
+                aterm_vitals::jobs::Fd {
+                    fd: 3,
+                    kind: aterm_vitals::jobs::FdKind::EventQueue {
+                        sleeping: Some(true),
+                        knotes: None,
+                    },
+                }
+            });
+            sync.fds
+                .extend([pipe_end(4, 0xC1, 0xC2, false, 0, 0), tcp_fd(7)]);
+            w.add(sync);
+        }
+        w.fronts.insert(1310, 1310);
+        w.terms.insert(
+            1310,
+            TermWord {
+                canonical: true,
+                echo: !go,
+                queued: 0,
+            },
+        );
+        w.tty_mode(1, false, false);
+        typed_into(&mut w, 1310);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert!(
+            v.row("n1310").is_some_and(|r| r.verdict != Verdict::Fine
+                && r.wait.as_ref().map(|w| w.name) != Some(WaitName::TtyBuiltinRead)),
+            "go {go}, listed {listed}: {}",
+            wire(&v, "n1310")
+        );
+    }
+
+    // `node` started by js-comint, at its `> ` prompt: its event loop waits with the terminal and
+    // its own wake pipe in its set (on macOS without lane L6 its entries go unlisted), and a bash
+    // there on Linux at `read -t 30`, waiting in `select`.
+    for reader in 0..3 {
+        let mut w = World::new();
+        w.run_fg(1, 5, "emacs", sleeper(1300, "emacs"));
+        let mut node = Proc::new(1310, 1300, if reader == 2 { "bash" } else { "node" });
+        node.sid = 1310;
+        node.tty = true;
+        node.fds.push(tty_fd(0));
+        match reader {
+            0 => node.fds.push(read_queue(12, &[0, 13])),
+            1 => node.fds.push(aterm_vitals::jobs::Fd {
+                fd: 12,
+                kind: aterm_vitals::jobs::FdKind::EventQueue {
+                    sleeping: Some(true),
+                    knotes: None,
+                },
+            }),
+            _ => node.wchan = Some("do_select".into()),
+        }
+        w.add(node);
+        w.fronts.insert(1310, 1310);
+        w.terms.insert(
+            1310,
+            TermWord {
+                canonical: true,
+                echo: false,
+                queued: 0,
+            },
+        );
+        w.tty_mode(1, false, false);
+        typed_into(&mut w, 1310);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert_eq!(
+            v.row("n1310")
+                .map(|r| (r.verdict, r.wait.as_ref().map(|w| w.name))),
+            Some((Verdict::Fine, Some(WaitName::TtyBuiltinRead))),
+            "reader {reader}: {}",
+            wire(&v, "n1310")
+        );
+    }
 }
 
 /// THE TAB'S ROOT DOES JOB CONTROL WHILE IT IS THE SHELL A PASS SAW AT ITS PROMPT: in a tab with
 /// no marks, zsh's line editor reading raw keys in front shows it, and a `git pull &` stopped at
 /// its credential prompt parks. After `exec ninja` the root is ninja, which does none: a step it
-/// stopped in a group of its own is held, and the block reads no line of the shell's.
+/// stopped in a group of its own is held, and the block reads no line of the shell's, also when
+/// a pass read the tab before the `C` (or, without marks, the line editor's raw word) and the
+/// root after the exec; the steps it starts in groups of their own are its block's, which runs
+/// while they compile, as are those of a ninja in the shell's own group (`exec cmake --build`,
+/// `out=$(ninja)`), whose hung step keeps a row of its own in a tab without marks. After `exec
+/// python3` the REPL's raw prompt shows no shell: hung on a lock, its block reads no line.
 #[test]
 fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
     let mut w = World::new();
@@ -4889,5 +4953,660 @@ fn the_tabs_root_does_job_control_while_it_is_the_shell_a_pass_saw() {
         v.rows.iter().all(|r| r.verdict != Verdict::Parked
             && r.wait.as_ref().map(|w| w.name) != Some(WaitName::TtyBuiltinRead)),
         "{rows:?}"
+    );
+
+    // The passes that read the tab before `exec ninja`'s `C` read the root after the exec, the
+    // first with the prompt's marks, and the `C` is a mark too.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+    w.mark(1);
+    let root = w.p(shell);
+    root.name = "ninja".into();
+    root.exec += 1;
+    let _ = w.tick(TICK_MS);
+    let _ = w.tick(TICK_MS);
+    w.mark(1);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 7,
+        started_ms: at,
+        open: true,
+        command: "exec ninja".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    for (pid, ppid, name) in [(2310, shell, "sh"), (2311, 2310, "ssh")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 2310;
+        p.sid = shell;
+        p.tty = true;
+        p.state = ProcState::Stopped;
+        w.add(p);
+    }
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    let rows: Vec<String> = v.rows.iter().map(|r| r.wire()).collect();
+    assert!(
+        v.rows.iter().all(|r| r.verdict != Verdict::Parked
+            && r.wait.as_ref().map(|w| w.name) != Some(WaitName::TtyBuiltinRead)),
+        "{rows:?}"
+    );
+
+    // In a tab without marks, a pass that read zsh's raw word at its prompt and the root after
+    // `exec ninja`.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.tty_mode(1, false, false);
+    let _ = w.tick(TICK_MS);
+    let _ = w.tick(TICK_MS);
+    let root = w.p(shell);
+    root.name = "ninja".into();
+    root.exec += 1;
+    let _ = w.tick(TICK_MS);
+    w.tty_mode(1, true, true);
+    for (pid, ppid, name) in [(2310, shell, "sh"), (2311, 2310, "ssh")] {
+        let mut p = Proc::new(pid, ppid, name);
+        p.pgid = 2310;
+        p.sid = shell;
+        p.tty = true;
+        p.state = ProcState::Stopped;
+        w.add(p);
+    }
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(
+        v.rows.iter().all(|r| r.verdict != Verdict::Parked),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+
+    // `exec ninja` building: each step in a group of its own, its status line redrawn with `\r`.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 7,
+        started_ms: at,
+        open: true,
+        command: "exec ninja".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    let root = w.p(shell);
+    root.name = "ninja".into();
+    root.exec += 1;
+    let v = run_to(&mut w, 600_000, |w, rel| {
+        let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+        w.exit(born - 1, false);
+        let mut cc = Proc::new(born, shell, "cc");
+        cc.sid = shell;
+        cc.tty = true;
+        cc.state = ProcState::Running;
+        cc.cpu_per_s = 900_000_000;
+        cc.counters.cpu_ns = 400_000_000;
+        w.add(cc);
+        w.cr(1);
+    });
+    let rows: Vec<String> = v.rows.iter().map(|r| r.wire()).collect();
+    assert_eq!(
+        (
+            v.row("b7").map(|r| r.class),
+            v.rows.iter().filter(|r| r.id != "b7").count()
+        ),
+        (Some(Class::Running), 0),
+        "{rows:?}"
+    );
+
+    // `exec cmake --build build`, whose ninja runs in the root's group, and `out=$(ninja)`, whose
+    // ninja runs in the shell's: the steps are each one's block's.
+    for exec in [true, false] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let shell_pgid = w.p(shell).pgid;
+        w.mark(1);
+        let _ = w.tick(TICK_MS);
+        let at = w.at;
+        w.tab(1).tab.block = Some(Block {
+            id: 7,
+            started_ms: at,
+            open: true,
+            command: if exec {
+                "exec cmake --build build"
+            } else {
+                "out=$(ninja)"
+            }
+            .to_owned(),
+            status: None,
+            stopped: false,
+        });
+        if exec {
+            let root = w.p(shell);
+            root.name = "cmake".into();
+            root.exec += 1;
+        }
+        let mut ninja = sleeper(1100, "ninja");
+        ninja.ppid = shell;
+        ninja.pgid = shell_pgid;
+        ninja.sid = shell;
+        ninja.tty = true;
+        w.add(ninja);
+        let v = run_to(&mut w, 600_000, |w, rel| {
+            let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+            w.exit(born - 1, false);
+            let mut cc = Proc::new(born, 1100, "cc");
+            cc.sid = shell;
+            cc.tty = true;
+            cc.state = ProcState::Running;
+            cc.cpu_per_s = 900_000_000;
+            cc.counters.cpu_ns = 400_000_000;
+            w.add(cc);
+            w.cr(1);
+        });
+        let rows: Vec<String> = v.rows.iter().map(|r| r.wire()).collect();
+        assert_eq!(
+            (
+                v.row("b7").map(|r| r.class),
+                v.rows.iter().filter(|r| r.id != "b7").count()
+            ),
+            (Some(Class::Running), 0),
+            "exec {exec}: {rows:?}"
+        );
+    }
+
+    // `out=$(ninja)` in a tab without marks, a step of it hung on its download: no block takes the
+    // step, which keeps a row of its own.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    let shell_pgid = w.p(shell).pgid;
+    let mut ninja = sleeper(1100, "ninja");
+    ninja.ppid = shell;
+    ninja.pgid = shell_pgid;
+    ninja.sid = shell;
+    ninja.tty = true;
+    w.add(ninja);
+    let mut get = curl(3000);
+    get.ppid = 1100;
+    get.sid = shell;
+    get.tty = true;
+    w.add(get);
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(
+        v.row("j3000").is_some_and(|r| r.verdict != Verdict::Fine),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+
+    // `exec python3` at its raw `>>>`, then hung on a lock it holds, the terminal cooked again.
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    let _ = w.tick(TICK_MS);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 8,
+        started_ms: at,
+        open: true,
+        command: "exec python3".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    let root = w.p(shell);
+    root.name = "python3".into();
+    root.exec += 1;
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 10_000, |_, _| {});
+    w.tty_mode(1, true, true);
+    let v = run_to(&mut w, 1_200_000, |_, _| {});
+    assert!(
+        v.row("b8").is_some_and(|r| r.verdict != Verdict::Fine
+            && r.wait.as_ref().map(|w| w.name) != Some(WaitName::TtyBuiltinRead)),
+        "{}",
+        wire(&v, "b8")
+    );
+}
+
+/// A SHELL THAT GAVE WAY TO ANOTHER IN PLACE ENDS ITS BLOCK AT THE NEW ONE'S PROMPT: after `exec
+/// zsh` the new shell writes no marks (its integration does not load again), so two passes that
+/// find it alone at its line editor in front, a shell seen doing job control, close the block,
+/// with no status. A background job then takes the tab's lines, and the next command is a row of
+/// its own. One such pass is the shell's own `read -q`, answered, a program in the shell's group
+/// reading raw keys (`vim $(fzf)`) is no prompt, and pwsh, which never put a group in front (a
+/// shell it ran did), runs a cmdlet in its own process at a raw word: each block keeps its
+/// command.
+#[test]
+fn a_shell_exec_in_place_ends_its_block_at_the_new_ones_prompt() {
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    ran_one(&mut w);
+    let at = w.at;
+    w.tab(1).tab.block = Some(Block {
+        id: 7,
+        started_ms: at,
+        open: true,
+        command: "exec zsh".to_owned(),
+        status: None,
+        stopped: false,
+    });
+    w.p(shell).exec += 1;
+    w.tty_mode(1, false, false);
+    let _ = run_to(&mut w, 6_000, |_, _| {});
+    w.run_bg(1, sleeper(1500, "ping"));
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1500]));
+    assert_eq!(
+        (
+            v.row("j1500").map(|r| r.class),
+            v.row("b7").is_none_or(|r| r.verdict == Verdict::Exited)
+        ),
+        (Some(Class::Running), true),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+    let mut vim = Proc::new(1600, shell, "vim");
+    vim.sid = shell;
+    vim.tty = true;
+    w.add(vim);
+    w.tab(1).tpgid = 1600;
+    let v = w.tick(TICK_MS);
+    assert!(
+        v.row("j1600").is_some() && v.row("b7").is_none_or(|r| r.verdict == Verdict::Exited),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+
+    for fzf in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let shell_pgid = w.p(shell).pgid;
+        ran_one(&mut w);
+        let at = w.at;
+        let command = if fzf {
+            "vim $(fzf)"
+        } else {
+            "read -q '?Deploy? ' && ./deploy.sh"
+        };
+        w.tab(1).tab.block = Some(Block {
+            id: 7,
+            started_ms: at,
+            open: true,
+            command: command.to_owned(),
+            status: None,
+            stopped: false,
+        });
+        w.tty_mode(1, false, false);
+        if fzf {
+            let mut p = Proc::new(1200, shell, "fzf");
+            p.pgid = shell_pgid;
+            p.sid = shell;
+            p.tty = true;
+            w.add(p);
+            let _ = run_to(&mut w, 10_000, |w, _| w.line_from(1, &[1200]));
+            w.exit(1200, false);
+        } else {
+            let _ = w.tick(TICK_MS);
+        }
+        let mut p = Proc::new(1300, shell, if fzf { "vim" } else { "sh" });
+        p.sid = shell;
+        p.tty = true;
+        w.add(p);
+        w.tab(1).tpgid = 1300;
+        w.tty_mode(1, !fzf, !fzf);
+        let v = run_to(&mut w, 60_000, |w, _| w.line_from(1, &[1300]));
+        assert!(
+            v.row("b7").is_some_and(|r| r.class == Class::Running)
+                && v.rows.iter().all(|r| !r.id.starts_with('j')),
+            "{command}: {:?}",
+            v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+        );
+    }
+
+    // `Invoke-WebRequest https://host/big.iso -OutFile big.iso` in a pwsh tab: the download runs
+    // in pwsh itself, at the raw word its console left, and pwsh never put a group in front, also
+    // after `exec pwsh` from a zsh that did, or once a zsh it ran put its `make` in front.
+    for case in 0..3 {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let shell_pgid = w.p(shell).pgid;
+        if case == 1 {
+            ran_one(&mut w);
+            w.p(shell).exec += 1;
+        }
+        w.p(shell).name = "pwsh".into();
+        w.mark(1);
+        let _ = w.tick(TICK_MS);
+        if case == 2 {
+            let at = w.at;
+            w.tab(1).tab.block = Some(Block {
+                id: 3,
+                started_ms: at,
+                open: true,
+                command: "zsh".to_owned(),
+                status: None,
+                stopped: false,
+            });
+            let mut zsh = Proc::new(1100, shell, "zsh");
+            zsh.pgid = shell_pgid;
+            zsh.sid = shell;
+            zsh.tty = true;
+            w.add(zsh);
+            let mut make = Proc::new(1200, 1100, "make");
+            make.sid = shell;
+            make.tty = true;
+            w.add(make);
+            w.tab(1).tpgid = 1200;
+            let _ = run_to(&mut w, 4_000, |_, _| {});
+            w.exit(1200, false);
+            w.exit(1100, false);
+            if let Some(b) = w.tab(1).tab.block.as_mut() {
+                b.open = false;
+                b.status = Some(0);
+            }
+            w.tab(1).tpgid = shell_pgid;
+        }
+        w.mark(1);
+        let _ = w.tick(TICK_MS);
+        let at = w.at;
+        w.tab(1).tab.block = Some(Block {
+            id: 4,
+            started_ms: at,
+            open: true,
+            command: "Invoke-WebRequest https://host/big.iso -OutFile big.iso".to_owned(),
+            status: None,
+            stopped: false,
+        });
+        w.tty_mode(1, false, false);
+        let v = run_to(&mut w, 60_000, |_, _| {});
+        assert!(
+            v.row("b4").is_some_and(|r| r.verdict != Verdict::Exited),
+            "case {case}: {:?}",
+            v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A NESTED SHELL AT ITS PROMPT LEAVES THE TAB TO ITS BACKGROUND: `bash` run in the tab, back at
+/// its line editor after `vim`, holds the terminal while its `ping host &` prints, and the
+/// background job takes the lines, as at the tab shell's own prompt.
+#[test]
+fn a_nested_shell_at_its_prompt_leaves_the_tab_to_its_background() {
+    let mut w = World::new();
+    let shell = w.tab(1).tab.shell_pid;
+    w.mark(1);
+    w.run_fg(1, 4, "bash", sleeper(1100, "bash"));
+    let mut vim = Proc::new(1200, 1100, "vim");
+    vim.sid = shell;
+    vim.tty = true;
+    w.add(vim);
+    w.tab(1).tpgid = 1200;
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(1200, false);
+    w.tab(1).tpgid = 1100;
+    w.tty_mode(1, false, false);
+    let mut ping = Proc::new(1300, 1100, "ping");
+    ping.sid = shell;
+    ping.tty = true;
+    w.add(ping);
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1300]));
+    assert_eq!(
+        v.row("j1300").map(|r| r.class),
+        Some(Class::Running),
+        "{:?}",
+        v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+    );
+}
+
+/// A BACKGROUND JOB TAKES NO LINES FROM WHAT HOLDS THE TERMINAL: a `pip install &` retrying its
+/// dead index wakes on its timer, writes nothing, and reads no `top` redraws as its own; nor
+/// does a `curl -O … &` of a `bash` run in the tab, while that bash prints in front through a
+/// loop of its own (`while read -r l; do echo "$l"; done < big.log`) or fzf, bound to its
+/// Ctrl-R, redraws there in bash's own group.
+#[test]
+fn a_background_job_takes_no_lines_from_what_holds_the_terminal() {
+    let mut w = World::new();
+    let mut pip = sleeper(1400, "pip");
+    pip.syscalls_per_s = 3;
+    pip.fds.push(tcp_fd(4));
+    w.run_bg(1, pip);
+    w.run_fg(1, 9, "top", sleeper(1300, "top"));
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[1300]));
+    assert_ne!(
+        v.row("j1400").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "j1400")
+    );
+
+    for fzf in [false, true] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        w.mark(1);
+        w.run_fg(1, 4, "bash", sleeper(1100, "bash"));
+        let mut vim = Proc::new(1200, 1100, "vim");
+        vim.sid = shell;
+        vim.tty = true;
+        w.add(vim);
+        w.tab(1).tpgid = 1200;
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        w.exit(1200, false);
+        w.tab(1).tpgid = 1100;
+        let mut curl = Proc::new(1300, 1100, "curl");
+        curl.sid = shell;
+        curl.tty = true;
+        curl.syscalls_per_s = 3;
+        curl.fds.push(tcp_fd(5));
+        w.add(curl);
+        let writer = if fzf {
+            let mut p = Proc::new(1400, 1100, "fzf");
+            p.pgid = 1100;
+            p.sid = shell;
+            p.tty = true;
+            w.add(p);
+            w.tty_mode(1, false, false);
+            1400
+        } else {
+            w.tty_mode(1, true, true);
+            1100
+        };
+        let v = run_to(&mut w, 600_000, |w, _| w.line_from(1, &[writer]));
+        assert_ne!(
+            v.row("j1300").map(|r| r.class),
+            Some(Class::Running),
+            "fzf {fzf}: {:?}",
+            v.rows.iter().map(|r| r.wire()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// A PARENT THAT REAPS LATE WAITS ALL THE SAME: `tail -F app.log | xargs -P4 -I{} ./notify {}`,
+/// whose xargs reaps a finished `notify` only before its next fork, waits on the log: fine,
+/// its zombie a finding of its own. A `./ingest` there deadlocked, reading nothing, or hung on
+/// its server, leaves its zombies to the zombie class, whatever tail waits on.
+#[test]
+fn a_parent_that_reaps_late_waits_all_the_same() {
+    for (deadlocked, served) in [(false, false), (true, false), (true, true)] {
+        let mut w = World::new();
+        let shell = w.tab(1).tab.shell_pid;
+        let mut tail = sleeper(2000, "tail");
+        tail.fds = follow_fds();
+        tail.fds.push(pipe_end(1, 0xB2, 0xB1, true, 0, 0));
+        w.run_fg(1, 9, "tail -F app.log | xargs -P4 -I{} ./notify {}", tail);
+        let mut xargs = sleeper(2001, if deadlocked { "python3" } else { "xargs" });
+        xargs.ppid = shell;
+        xargs.pgid = 2000;
+        xargs.sid = shell;
+        xargs.tty = true;
+        xargs.fds.push(pipe_end(
+            0,
+            0xB1,
+            0xB2,
+            false,
+            if deadlocked { 0 } else { 0x8 },
+            0,
+        ));
+        if served {
+            xargs.fds.push(tcp_fd(5));
+        }
+        w.add(xargs);
+        let mut z = sleeper(2010, "notify");
+        z.ppid = 2001;
+        z.pgid = 2000;
+        z.sid = shell;
+        z.tty = true;
+        z.state = ProcState::Zombie;
+        w.add(z);
+        let v = run_to(&mut w, 1_200_000, |_, _| {});
+        assert!(
+            v.row("b9").is_some_and(|r| if deadlocked {
+                r.class == Class::Zombie && r.verdict != Verdict::Fine
+            } else {
+                (r.class, r.verdict) == (Class::Waiting, Verdict::Fine)
+            }),
+            "served {served}: {}",
+            wire(&v, "b9")
+        );
+    }
+}
+
+/// A NESTED SESSION IS JUDGED BY ITS OWN LINES ONCE THEY REACH THE TAB: `script -q rec.log npm
+/// install` copies npm's terminal, cooked, to a tab it keeps raw; npm's lines arrive as lines, so
+/// once its registry stops answering its spinner's `\r` redraws are no progress and it reads
+/// stuck. A `make` in nvim's terminal, which nvim redraws without line feeds, runs on them, and
+/// so does `pytest -v` there, whose first rows nvim drew with line feeds.
+#[test]
+fn a_nested_session_is_judged_by_its_own_lines_once_they_reach_the_tab() {
+    let mut w = World::new();
+    w.run_fg(
+        1,
+        5,
+        "script -q rec.log npm install",
+        sleeper(1300, "script"),
+    );
+    let mut npm = Proc::new(1301, 1300, "node");
+    npm.sid = 1301;
+    npm.tty = true;
+    npm.fds.push(tcp_fd(5));
+    w.add(npm);
+    w.fronts.insert(1301, 1301);
+    w.terms.insert(
+        1301,
+        TermWord {
+            canonical: true,
+            echo: true,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 1_200_000, |w, rel| {
+        if rel < 20_000 {
+            w.line_from(1, &[1300, 1301]);
+        } else {
+            w.cr(1);
+        }
+    });
+    assert_eq!(
+        v.row("n1301").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{}",
+        wire(&v, "n1301")
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 5, "nvim", sleeper(1300, "nvim"));
+    let mut sh = Proc::new(1310, 1300, "zsh");
+    sh.sid = 1310;
+    sh.tty = true;
+    w.add(sh);
+    let mut make = Proc::new(1311, 1310, "make");
+    make.sid = 1310;
+    make.tty = true;
+    w.add(make);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: true,
+            echo: true,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 600_000, |w, _| w.cr(1));
+    assert_eq!(
+        v.row("n1310").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "n1310")
+    );
+
+    let mut w = World::new();
+    w.run_fg(1, 5, "nvim", sleeper(1300, "nvim"));
+    let mut sh = Proc::new(1310, 1300, "zsh");
+    sh.sid = 1310;
+    sh.tty = true;
+    w.add(sh);
+    let mut pytest = Proc::new(1311, 1310, "python3");
+    pytest.sid = 1310;
+    pytest.tty = true;
+    pytest.fds.push(tcp_fd(5));
+    w.add(pytest);
+    w.fronts.insert(1310, 1311);
+    w.terms.insert(
+        1310,
+        TermWord {
+            canonical: true,
+            echo: true,
+            queued: 0,
+        },
+    );
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 600_000, |w, rel| {
+        if rel < 20_000 {
+            w.line_from(1, &[1300, 1311]);
+        } else {
+            w.cr(1);
+        }
+        let at = w.at;
+        w.tab(1).tab.drawn_ms = Some(at);
+    });
+    assert_eq!(
+        v.row("n1310").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "n1310")
+    );
+}
+
+/// A NESTED SESSION TAKES NONE OF ITS OPENER'S ECHO: `until curl -sf localhost:8080/health; do
+/// sleep 1; done` in nvim's terminal, against a server that never answers, while the person
+/// edits in another window: nvim redraws the person's keys, which are none of the loop's lines.
+#[test]
+fn a_nested_session_takes_none_of_its_openers_echo() {
+    let mut w = World::new();
+    w.run_fg(1, 5, "nvim", sleeper(1300, "nvim"));
+    let mut sh = Proc::new(1310, 1300, "zsh");
+    sh.sid = 1310;
+    sh.tty = true;
+    w.add(sh);
+    w.fronts.insert(1310, 1310);
+    w.tty_mode(1, false, false);
+    let v = run_to(&mut w, 600_000, |w, rel| {
+        let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
+        w.exit(born - 1, false);
+        let mut p = Proc::new(born, 1310, if born % 2 == 0 { "curl" } else { "sleep" });
+        p.sid = 1310;
+        p.tty = true;
+        w.add(p);
+        w.fronts.insert(1310, born);
+        w.typed(1, 1300);
+        w.line_from(1, &[1300]);
+    });
+    assert_ne!(
+        v.row("n1310").map(|r| r.class),
+        Some(Class::Running),
+        "{}",
+        wire(&v, "n1310")
     );
 }

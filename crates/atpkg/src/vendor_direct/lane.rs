@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The vendor-direct lane (design §1.3–§1.5): one program's head, its decision and its landing, run ahead of and apart from the index lane.
+//! The vendor-direct lane (design §1.3–§1.5): one program's head, its decision and its landing,
+//! run ahead of and apart from the index lane.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -53,11 +54,13 @@ pub(crate) struct Lane<'a> {
     pub trust: &'a Trust,
     /// A verified index to read a legacy build's version from, when the caller holds one.
     pub legacy_index: Option<&'a TrustedIndex>,
-    /// A person asked for the program by name (`update <program>`, `install <program>`, `claude update`) — not a pass, and not the head watch.
+    /// A person asked for the program by name (`update <program>`, `install <program>`,
+    /// `claude update`), not a pass or the head watch.
     pub asked: bool,
     /// The clock (Unix seconds).
     pub now: i64,
-    /// This landing's place in line for the link among lanes landing side by side ([`crate::flow::DownloadTurns`]), waited for by its payload's download alone: the program taken first has the whole link, however slow, while another lane verifies, unpacks and activates what it already has.
+    /// This landing's place in line for the link among lanes landing side by side
+    /// ([`crate::flow::DownloadTurns`]); only its payload's download waits for it.
     pub download_turn: Option<&'a crate::flow::DownloadTicket<'a>>,
 }
 
@@ -90,7 +93,8 @@ pub(crate) enum Verdict {
         /// What stays active.
         keeping: Installed,
     },
-    /// The vendor's release channel could not be reached, or did not serve a document; nothing moved and nothing was judged.
+    /// The vendor's release channel could not be reached, or did not serve a document; nothing
+    /// moved and nothing was judged.
     Unreachable {
         /// What stays active.
         keeping: Installed,
@@ -118,7 +122,9 @@ pub(crate) enum Verdict {
         /// The yanked build.
         from: Installed,
     },
-    /// The verified build's platform signature check did not finish in time ([`StageError::VerifyDeferred`]): no verdict on the bytes and no fault, so nothing moved, nothing is memoized, its archive is kept, and the next pass checks it again.
+    /// The verified build's platform signature check did not finish in time
+    /// ([`StageError::VerifyDeferred`]): no verdict on the bytes and no fault, so nothing moved,
+    /// nothing is memoized, its archive is kept, and the next pass checks it again.
     Deferred {
         /// The version whose check did not finish.
         version: Version,
@@ -138,7 +144,10 @@ pub(crate) enum Verdict {
     },
     /// The program is dev-linked: managed from its checkout.
     Linked,
-    /// The active build is ALab's own ([`crate::alab::build_is_alab`]), no pin the channel signs for this machine names a build it may install, and the signed policy revokes nothing of it: kept, never decided against the vendor's head and never replaced by it, asked or not ([`crate::alab`]'s source rule).
+    /// The active build is ALab's own ([`crate::alab::build_is_alab`]), the channel signs no pin
+    /// this machine may install, and the signed policy revokes nothing of it: kept, and never
+    /// decided against or replaced by the vendor's head, asked or not ([`crate::alab`]'s source
+    /// rule).
     AlabKept {
         /// How a line names the active build ([`crate::alab::build_words`]).
         what: String,
@@ -150,7 +159,8 @@ pub(crate) enum Verdict {
         /// The restoration I/O error.
         error: String,
     },
-    /// The active ALab build is revoked (a signed yank names it, or it is below the signed floor) and the newest retained ALab build below it that nothing revokes is active now.
+    /// The active ALab build is revoked (a signed yank names it, or it is below the signed floor)
+    /// and the newest retained ALab build below it that nothing revokes is active now.
     AlabRolledBack {
         /// How a line names the revoked build.
         from: String,
@@ -159,14 +169,18 @@ pub(crate) enum Verdict {
         /// How a line names it.
         to: String,
     },
-    /// The active ALab build is revoked and no retained ALab build is admissible: its commands are disabled, as the index lane disables a revoked build ([`crate::gate`]), until the channel pins one this machine may install or a person chooses the vendor's build (`aterm pkg update <program> --vendor`).
+    /// The active ALab build is revoked and no retained ALab build is admissible: its commands
+    /// are disabled, as the index lane disables a revoked build ([`crate::gate`]), until the
+    /// channel pins one this machine may install or a person chooses the vendor's build
+    /// (`aterm pkg update <program> --vendor`).
     AlabTombstoned {
         /// How a line names the revoked build.
         what: String,
         /// Why it is revoked.
         why: Revoked,
     },
-    /// The vendor publishes no build the lane can verify for this machine ([`VendorSpec::serves`]): nothing was asked of any host.
+    /// The vendor publishes no build the lane can verify for this machine
+    /// ([`VendorSpec::serves`]): nothing was asked of any host.
     Unavailable {
         /// The canonical `unavailable on <target>: <hint>` state.
         state: String,
@@ -180,7 +194,8 @@ pub(crate) struct Outcome {
     pub spec: &'static VendorSpec,
     /// What happened.
     pub verdict: Verdict,
-    /// The per-version staging name of a payload the lane resolved, so a pass-end gc spares its `.part`.
+    /// The per-version staging name of a payload the lane resolved, so a pass-end gc spares its
+    /// `.part`.
     pub asset: Option<String>,
 }
 
@@ -219,7 +234,9 @@ impl Outcome {
         verdict_line(self.spec, &self.verdict)
     }
 
-    /// Why the vendor's head is not what runs, for a row that keeps the active build — a hold, a yank, a newer install, a rollback, an unreached channel, a signature check that did not finish ([`Verdict::Deferred`]): no fault, and never a claim to be the latest.
+    /// Why the vendor's head is not what runs, for a row that keeps the active build (a hold, a
+    /// yank, a newer install, a rollback, an unreached channel, an unfinished signature check, a
+    /// kept ALab build): no fault, and never a claim to be the latest.
     #[must_use]
     pub(crate) fn kept_clause(&self) -> Option<String> {
         let vendor = self.spec.vendor;
@@ -280,6 +297,7 @@ impl Outcome {
     }
 
     /// Convert this outcome into an [`InstallReport`] or [`FlowError`].
+    ///
     /// # Errors
     /// The lane installed nothing it could stand behind: its line says why.
     pub(crate) fn into_install(self, layout: &Layout) -> Result<InstallReport, FlowError> {
@@ -402,14 +420,16 @@ impl Pending {
         self.candidate.artifact.artifact().size
     }
 
-    /// What stays on disk when it is finished, when the documents say exactly (a raw binary is its download; an archive's unpacked size is not published).
+    /// What stays on disk once it lands, when the documents say exactly (a raw binary is its
+    /// download; an archive's unpacked size is not published).
     #[must_use]
     pub(crate) fn disk_bytes(&self) -> Option<u64> {
         let a = self.candidate.artifact.artifact();
         (a.payload == "raw-binary").then_some(a.size)
     }
 
-    /// What its landing's disk gate checks: the download and the tree it unpacks to, an archive's at its unpack bound.
+    /// What its landing's disk gate checks: the download and the tree it unpacks to, an archive's
+    /// at its unpack bound.
     #[must_use]
     pub(crate) const fn landing_bytes(&self) -> crate::flow::LandingBytes {
         crate::flow::LandingBytes::of(self.candidate.artifact.artifact())
@@ -433,14 +453,18 @@ pub(crate) fn install_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool
     }
 }
 
-/// What the lane read of one program before its pass's index landed ([`read_ahead`]): the head, and when it named a version other than the installed one, that version's documents, verified.
+/// What the lane read of one program before its pass's index landed ([`read_ahead`]): the head
+/// and, when it named a version other than the installed one, that version's verified documents.
 #[derive(Debug, Clone)]
 pub(crate) struct ReadAhead {
     head: Head,
     verified: Option<(Version, Resolution)>,
 }
 
-/// The network half of [`plan_one`], which needs no index: `spec`'s head, conditional on its stamp's validator, and — when it names a version other than the installed one of a program no local pin holds, the one an install would fetch — that version's documents, verified ([`resolve::verify`] reads and checks; it writes nothing).
+/// The network half of [`plan_one`], which needs no index: `spec`'s head, conditional on its
+/// stamp's validator, and, when it names a version other than the installed one of a program no
+/// local pin holds, that version's documents, verified ([`resolve::verify`] writes nothing).
+/// `None` for a dev-linked program, a kept ALab build, or a triple the vendor does not serve.
 pub(crate) fn read_ahead(
     layout: &Layout,
     spec: &'static VendorSpec,
@@ -482,7 +506,9 @@ pub(crate) fn read_ahead(
     Some(ReadAhead { head, verified })
 }
 
-/// The reads ahead of a pass's vendor plans, one slot per program of the table, each filled by a thread of its own ([`Reads::read`]) while the pass resolves its index, and taken by that program's plan ([`Reads::take_read`]).
+/// The reads ahead of a pass's vendor plans, one slot per program of the table, each filled by a
+/// thread of its own ([`Reads::read`]) while the pass resolves its index, and taken by that
+/// program's plan ([`Reads::take_read`]).
 pub(crate) struct Reads {
     answers: std::sync::Mutex<Vec<ReadSlot>>,
     changed: std::sync::Condvar,
@@ -540,7 +566,8 @@ impl Reads {
         self.changed.notify_all();
     }
 
-    /// `program`'s read, waited for until `until` (for as long as it takes with `None`): what was read, or [`StillReading`] at `until`.
+    /// `program`'s read, waited for until `until` (with `None`, for as long as it takes): what was
+    /// read, or [`StillReading`] at `until`.
     pub(crate) fn take_read(
         &self,
         program: &str,
@@ -578,12 +605,16 @@ impl Reads {
     }
 }
 
-/// The lane for `spec` short of payload bytes: the installed build, the head (a 304 when it has not moved), the decision, and for an install the verified candidate.
+/// The lane for `spec` short of payload bytes: the installed build, the head (a 304 when it has
+/// not moved), the decision, and for an install the verified candidate.
 pub(crate) fn plan_one(lane: &Lane<'_>, spec: &'static VendorSpec, held: bool) -> Step {
     plan_one_with(lane, spec, held, None)
 }
 
-/// [`plan_one`] over what was read of `spec` before the pass's index landed ([`read_ahead`]): its head instead of asking again, and its verified documents when the decision installs the version they were verified for — the decision itself, under the yanks the fresh index binds, made here as ever.
+/// [`plan_one`] over what [`read_ahead`] read of `spec` before the pass's index landed: its head
+/// instead of asking again, and its verified documents when the decision installs the version
+/// they were verified for. The decision itself is made here, under the yanks the fresh index
+/// binds.
 pub(crate) fn plan_one_with(
     lane: &Lane<'_>,
     spec: &'static VendorSpec,
@@ -889,9 +920,9 @@ fn admit_candidate(lane: &Lane<'_>, pending: Pending, inputs: &super::decide::In
         keeping: pending.installed,
     };
     let Some(digest) = c.vouch.digest() else {
-        // No document names grok's digest: the first-seen log and the memo judge the bytes
-        // once they are measured ([`measure`]). An earlier refusal of this version holds
-        // without a download, since nothing short of the bytes could tell a new cut from it.
+        // No document names grok's digest: the first-seen log and the memo judge the bytes once
+        // [`measure`] has them. An earlier refusal of this version holds without a download, since
+        // nothing short of the bytes could tell a new cut from it.
         if pending.stamp.refused_at(c.version) {
             return fall_back(refuse(refused_unmeasured(spec.program, c.version)), true);
         }
@@ -960,17 +991,19 @@ fn recut(c: &Candidate, first: &AuthenticatedDigest) -> String {
     )
 }
 
-/// THE MEASURE STEP, for a candidate no document names a digest for (grok): its bytes are
-/// downloaded to the staging path the landing reads, held to their exact size, hashed, and the
-/// digest held to the first-seen log and the refusal memo before anything is staged.
-/// [`land`] then reuses the file ([`crate::flow::land_artifact`]), and only once the darwin
-/// team pin has passed those bytes is their digest logged.
+/// The measure step, for a candidate no document names a digest for (grok): its bytes are
+/// downloaded to the staging path the landing reads, held to their exact size and hashed, and the
+/// digest is held to the first-seen log and the refusal memo before anything is staged. [`land`]
+/// then reuses the file ([`crate::flow::land_artifact`]) and logs the digest only once the darwin
+/// team pin has passed those bytes.
 ///
 /// # Errors
-/// [`FlowError::Download`] for a download that failed or came up short (nothing is memoized);
-/// [`FlowError::VendorRefused`] for a digest other than the one first seen for the version (a
-/// re-cut, memoized) or one an earlier pass refused; the disk gate's and the first-seen log's
-/// own errors. The downloaded file is removed on every error.
+/// [`FlowError::Download`] for a staging directory that cannot be made, a download that failed
+/// or came up short (nothing is memoized), a file that cannot be hashed or a first-seen log that
+/// cannot be checked; [`FlowError::VendorRefused`] for a row [`resolve::admit`] refuses, a digest
+/// other than the one first seen for the version (a re-cut, memoized), one an earlier pass
+/// refused, or one the candidate's anchor does not take; the staging path's and the disk gate's
+/// own errors. Every error from the download on removes the file.
 fn measure(lane: &Lane<'_>, pending: &Pending) -> Result<Pending, FlowError> {
     let (spec, c) = (pending.spec, &pending.candidate);
     let art = c.artifact.artifact();
@@ -1071,7 +1104,8 @@ fn measure(lane: &Lane<'_>, pending: &Pending) -> Result<Pending, FlowError> {
     })
 }
 
-/// Download, verify, stage (the darwin Developer ID gate inside), activate and shim a candidate [`plan_one`] verified.
+/// Download, verify, stage (the darwin Developer ID gate inside), activate and shim a candidate
+/// [`plan_one`] verified.
 pub(crate) fn land_one(lane: &Lane<'_>, pending: &Pending) -> Outcome {
     let spec = pending.spec;
     let mut measured = None;
@@ -1446,7 +1480,9 @@ fn retained_legacy_below(layout: &Layout, program: &str, below: u64) -> Vec<u64>
     builds
 }
 
-/// Whether [`roll_back_by_hand`] may land `program` on its retained `build`: complete as [`installed_of`] reads one (a vendor build by its record, a legacy index build by its marker), with a `bin/` to run, and named by no yank in `policy`.
+/// Whether [`roll_back_by_hand`] may land `program` on its retained `build`: complete as
+/// [`installed_of`] reads one (a vendor build by its record, a legacy index build by its marker),
+/// with a `bin/` to run, and revoked by nothing in `policy` (a yank, or an ALab build's floor).
 pub(crate) fn rollback_lands_on(
     layout: &Layout,
     policy: &Policy,
@@ -1466,7 +1502,8 @@ pub(crate) fn rollback_lands_on(
         }
 }
 
-/// What a by-hand rollback moved, each build as a line names it: a version, or a legacy index build's `build <n>`.
+/// What a by-hand rollback moved, each build as a line names it: a version, or a legacy index
+/// build's `build <n>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HandRollback {
     /// The build it left.
@@ -1477,7 +1514,9 @@ pub(crate) struct HandRollback {
     pub(crate) to_build: u64,
 }
 
-/// Re-activate the newest retained admissible build below the active one (`atpkg rollback <program>`).
+/// Re-activate the newest retained admissible build below the active one
+/// (`atpkg rollback <program>`).
+///
 /// # Errors
 /// Nothing complete is active, no admissible build is retained, or the flip could not be laid.
 pub(crate) fn roll_back_by_hand(
@@ -1576,7 +1615,9 @@ fn keep_legacy_facts(
     }
 }
 
-/// The legacy index build a rollback of `program` would land on (the `active` one, or the newest retained below the active vendor build) when no signed root is held for it: none in its stamp and no recorded row for that build carrying one (an older client's first vendor install or stamp rewrite can drop it).
+/// The legacy index build a rollback of `program` would land on (the `active` one, or the newest
+/// retained below the active vendor build) when no signed root is held for it: none in its stamp
+/// and no recorded row for that build carrying one (an older client could drop it).
 pub(crate) fn legacy_root_owed(layout: &Layout, program: &str, active: Option<u64>) -> Option<u64> {
     let build = match installed_of(layout, program, active) {
         Installed::Legacy { build, .. } => build,
@@ -1748,7 +1789,9 @@ fn verdict_line(spec: &VendorSpec, verdict: &Verdict) -> String {
     }
 }
 
-/// A vendor world for tests: a fake fetcher serving synthetic claude releases signed by the committed test key and synthetic codex releases (release JSON, `SHA256SUMS`, tarball), with every fetch recorded, and a codesign stand-in that passes every Mach-O.
+/// A vendor world for tests: a fake fetcher serving synthetic claude releases signed by the
+/// committed test key and synthetic codex releases (release JSON, `SHA256SUMS`, tarball), with
+/// every fetch recorded, and a codesign stand-in that passes every Mach-O.
 #[cfg(test)]
 pub(crate) mod world {
     use std::collections::BTreeMap;
@@ -2821,10 +2864,10 @@ mod tests {
         assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
     }
 
-    /// THE TEAM PIN, for each new row: a darwin Mach-O signed by another team is refused and
-    /// memoized; grok's measured digest is never logged for it, and its version is not
-    /// fetched again until a person asks; kimi's documented digest was logged before the
-    /// download, as codex's is.
+    /// The team pin, for each new row: a darwin Mach-O signed by another team is refused and
+    /// memoized; grok's measured digest is never logged for it, and its version is not fetched
+    /// again until a person asks; kimi's documented digest was logged before the download, as
+    /// codex's is.
     #[test]
     fn a_build_signed_by_another_team_is_refused_and_memoized_for_kimi_and_grok() {
         let refusing = world::trust_refusing_signers();
@@ -3549,9 +3592,9 @@ mod tests {
         );
     }
 
-    /// THE GATE JUDGES THE CLONE AS A MACH-O OF ITS OWN: a codesign verdict refusing
-    /// `bin/codex-old` alone refuses the landing — nothing swapped in, nothing shimmed —
-    /// though OpenAI's own entry passes.
+    /// The gate judges a clone as a Mach-O of its own: a codesign verdict refusing
+    /// `bin/codex-old` alone refuses the landing (nothing swapped in, nothing shimmed), though
+    /// OpenAI's own entry passes.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_gate_judges_codex_olds_clone_as_a_mach_o_of_its_own() {

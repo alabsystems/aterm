@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! On-disk caffeine state (`<state dir>/caffeine.state`), encoded as `key=value`
-//! lines (`mode=off|forever|until`, `ends=<s?>`, `span=<s?>`, `deadline=<s?>`, `boot=<uuid>`).
-//! A timed mode ends at `ends` on the boot clock ([`Clocks::since_boot`]), which only a file of
-//! this boot is read against. `deadline` is that end on the wall clock as the save read it:
-//! builds before `ends` keep their deadline there, so they read a timed mode this build saves,
-//! and the mug saves it again within a tick of a change of the date ([`refresh`]); a file one of
-//! them wrote (no `ends`) is read against the wall clock as it reads now, never as more than its
-//! span away, until the mug that takes its mode saves it back with its `ends` ([`take`]). A mode
-//! saved in an earlier boot or an unparseable file restores to [`Mode::Off`].
+//! On-disk caffeine state (`<state dir>/caffeine.state`): `key=value` lines
+//! (`mode=off|forever|until`, `ends=<secs>`, `span=<secs>`, `deadline=<secs>`, `boot=<uuid>`).
+//!
+//! A timed mode ends at `ends` on the boot clock ([`Clocks::since_boot`]), so only a file of this
+//! boot is read against it. `deadline` is that end on the wall clock as the save read it, for
+//! builds that predate `ends`; the mug saves it again once the date changes ([`refresh`]). A file
+//! with no `ends` is read against the wall clock now, never as more than its span away, until the
+//! mug that takes it saves it back ([`take_saving`]). A mode saved in an earlier boot, or an
+//! unparseable file, restores to [`Mode::Off`].
 
 use std::io;
 use std::path::Path;
@@ -77,8 +77,8 @@ pub fn encode(saved: &Saved, now: Clocks) -> String {
     text
 }
 
-/// Decodes state text written by [`encode`] or by a build before `ends`, whose wall-clock
-/// deadline is read at `now`, never as more than its span away.
+/// Decodes state text written by [`encode`]; a text with no `ends` (an older build's) has its
+/// wall-clock deadline read at `now`, never as more than its span away.
 #[must_use]
 pub fn decode(text: &str, now: Clocks) -> Option<Saved> {
     parse(text, now).map(|(saved, _)| saved)
@@ -151,10 +151,9 @@ fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
     Some((Saved { mode, boot }, wall_only))
 }
 
-/// How far, in seconds, a file's wall-clock `deadline` may sit from where the wall clock now puts
-/// its end before [`refresh`] saves it again, and a deadline past its span from where the span
-/// puts it before [`take`] answers its file as one to save back: more than the whole-second
-/// readings of the two clocks wander apart, or of one clock in two processes a moment apart.
+/// The slack, in seconds, before [`refresh`] saves a file whose wall-clock `deadline` has moved
+/// off its end, and before [`take`] answers a deadline past its span as one to save back: more
+/// than whole-second readings of the two clocks, or of one clock in two processes, wander apart.
 pub const DRIFT_SECS: u64 = 5;
 
 /// Whether `text` holds `mode`, a timed mode of this boot (`boot`), saved before a change of the
@@ -196,7 +195,8 @@ pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: Clocks) 
     }
 }
 
-/// Reads and decodes at `now` the regular state file at `path` (up to [`READ_CAP`] bytes, `O_NOFOLLOW | O_NONBLOCK` on Unix).
+/// Reads and decodes at `now` the regular state file at `path` (up to [`READ_CAP`] bytes,
+/// `O_NOFOLLOW | O_NONBLOCK` on Unix).
 #[must_use]
 pub fn read(path: &Path, now: Clocks) -> Option<Saved> {
     decode(&read_text(path)?, now)
@@ -231,10 +231,9 @@ const HOLD_WAIT: Duration = Duration::from_secs(1);
 /// How often a save waiting for a [`Held`] tries it again.
 const HOLD_POLL: Duration = Duration::from_millis(1);
 
-/// A save's `flock` on the state file's directory, whose inode no rename of the file replaces:
-/// taken once the new text is flushed and held over the rename (and a [`save_over`]'s re-read
-/// before it), so no other save of this build renames between that re-read and the rename;
-/// dropping it lets go (`LOCK_UN`).
+/// A save's `flock` on the state file's directory (whose inode no rename of the file replaces),
+/// held from the flush over a [`save_over`]'s re-read and the rename, so no other save that takes
+/// it renames between the two; dropping it unlocks.
 struct Held(std::fs::File);
 
 impl Drop for Held {
@@ -354,11 +353,10 @@ fn this_boots(mode: Mode) -> Saved {
 }
 
 /// [`save_at`], unless the file at `path` no longer holds `was` once the new text is flushed:
-/// whether it was saved. A writer that changed the file since `was` was read keeps its change.
-/// The last read and the rename run under the directory's [`Held`], which every save of this
-/// build takes for its rename, so none lands between the two (but one that waited
-/// [`HOLD_WAIT`] for it in vain). A build before this one takes no hold: its rename landing
-/// there, in a re-read and a rename (about 0.1 ms on APFS), is still overwritten.
+/// whether it was saved, so a writer that changed the file since keeps its change. The re-read
+/// and the rename run under the directory's [`Held`], so no other save lands between them unless
+/// its [`HOLD_WAIT`] ran out; a build that takes no hold can still land there (a window of about
+/// 0.1 ms on APFS) and be overwritten.
 ///
 /// # Errors
 ///
@@ -386,17 +384,13 @@ pub fn load(path: &Path, now: Clocks) -> Mode {
     take(path, now).0
 }
 
-/// [`load`], and the text the mode was restored from when the file is one to save back, because
-/// every read of it restores it anew: a timed mode on the wall clock alone (a build before `ends`
-/// wrote it), which a read after a change of the date reads as a span longer or shorter than the
-/// mode restored now; or a mode of this boot the restore changed, a deadline more than its span
-/// and [`DRIFT_SECS`] away (a hand-edited or damaged file), which every read brings in to a full
-/// span, or one gone, which a build before `ends` reads as on again once the date is set back.
-/// Saved, either reads as the mode restored now. A deadline past its span by no more than
-/// [`DRIFT_SECS`] (a writer's fresh span, read at clocks a moment behind the writer's) is brought
-/// in only in the mode answered, and the file is left as it is: that writer read its clocks
-/// after `now` and posts its notification after its save, so the take that notification brings
-/// reads the span as written.
+/// [`load`], and the text the mode was restored from when the file is one to save back because
+/// every read of it restores it anew: a timed mode on the wall clock alone (no `ends`), or a mode
+/// of this boot the restore changed (a deadline gone, or more than its span and [`DRIFT_SECS`]
+/// away). A deadline past its span by no more than [`DRIFT_SECS`] (a writer's fresh span read at
+/// clocks a moment behind its own) is brought in only in the mode answered, and the file is left
+/// as written: that writer posts its notification after its save, and the take it brings reads
+/// the span as written.
 #[must_use]
 pub fn take(path: &Path, now: Clocks) -> (Mode, Option<String>) {
     let Some(text) = read_text(path) else {
@@ -459,9 +453,8 @@ fn take_saving_with(path: &Path, now: Clocks, mut landing: impl FnMut(&Path)) ->
 
 /// Saves `mode` again, encoded at `now`, when the file at `path` holds it as a timed mode saved
 /// before a change of the date ([`drifted`]), unless a writer changes it first ([`save_over`]):
-/// whether it was saved. A build before `ends` reads the end on the wall clock alone, so until
-/// then it reads as much more time left as the date was set back, or as off once set forward
-/// past the end. The file is read only for a timed mode.
+/// whether it was saved. This keeps `deadline` true for a build that reads the end on the wall
+/// clock alone. The file is read only for a timed mode.
 ///
 /// # Errors
 ///
@@ -625,9 +618,8 @@ mod tests {
         assert_eq!(restore(Some(timed), Some(BOOT), NOW + 10), Mode::Off);
     }
 
-    /// A span saved ten minutes ago, read after the wall clock was set back a day or forward a
-    /// day, has the 50 minutes it had; the file says its end on the wall clock as the save read
-    /// it, for a build that reads only that.
+    /// A saved span keeps its time through the wall clock set back or forward a day, and the file
+    /// keeps its end on the wall clock for builds that read only that.
     #[test]
     fn a_saved_span_keeps_its_time_through_a_change_of_the_date() {
         let saved = Saved {
@@ -646,9 +638,8 @@ mod tests {
         }
     }
 
-    /// A file a build before `ends` wrote keeps its deadline on the wall clock: it is read
-    /// against the wall clock as it reads now, never as more than its span away, and from then
-    /// on runs on the boot clock.
+    /// A file with no `ends` is read against the wall clock now, never as more than its span away,
+    /// and from then on runs on the boot clock.
     #[test]
     fn an_earlier_builds_file_restores_bounded_by_its_span() {
         let earlier = |deadline: u64| {
@@ -685,9 +676,8 @@ mod tests {
         assert!(saved.contains(&format!("\nends={}\n", NOW.since_boot + HOUR - 600)));
     }
 
-    /// A file with no `ends` is one to save back, whatever its boot: read again once the date is
-    /// set back a day, it reads a full span where the mode restored now has an hour or nothing
-    /// left, while that mode saved reads the time it had.
+    /// A file with no `ends` is one to save back, whatever its boot: re-read after the date is set
+    /// back it would read a full span, while the mode saved reads the time it had.
     #[test]
     fn a_file_with_no_ends_is_one_to_save_back() {
         let earlier = |deadline: u64| {
@@ -742,10 +732,9 @@ mod tests {
         assert_eq!(take(&path, NOW).1, None);
     }
 
-    /// A file of this boot whose restore changes its mode is one to save back: a deadline a day
-    /// away on a span of an hour comes in to the hour, and one gone is off. Saved, it reads the
-    /// time it had half an hour on, not the full hour each read would restore anew. One past the
-    /// hour by no more than [`DRIFT_SECS`] comes in to it too, and is left as it is.
+    /// A file of this boot whose restore changes its mode is saved back once: a deadline a day
+    /// away comes in to its hour, and one gone is off. One past its span by no more than
+    /// [`DRIFT_SECS`] is brought in but left as it is.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_restore_that_changes_this_boots_mode_is_saved_back() {
@@ -783,9 +772,8 @@ mod tests {
         assert_eq!(take(&path, later).1, None, "saved once");
     }
 
-    /// A writer whose change lands between the read and the save-back keeps it: the save-back
-    /// of an earlier build's 8 hours is dropped, and the writer's off is taken in its place. A
-    /// writer landing at every save-back ends the takes at the third, unsaved.
+    /// A writer's change landing before the save-back is kept; a writer landing at every
+    /// save-back ends the takes at the last of [`TAKE_ROUNDS`], unsaved.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_writers_change_landing_before_the_save_back_is_kept() {
@@ -826,11 +814,8 @@ mod tests {
         );
     }
 
-    /// A writer's `on 1h` landing before the save-back of an earlier build's 8 hours, on clocks
-    /// up to a few seconds past the take's: the read after it brings the writer's hour in by
-    /// that much in the mode taken, and leaves the writer's file as it is, which a take at the
-    /// writer's clocks reads as its hour. A deadline past the hour by more than [`DRIFT_SECS`]
-    /// is saved in.
+    /// A writer's `on 1h` landing before a save-back, on clocks up to [`DRIFT_SECS`] past the
+    /// take's, is left as written; further past, the take's hour is saved in.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_writers_span_taken_at_clocks_behind_its_own_is_left_as_written() {
@@ -867,9 +852,8 @@ mod tests {
         }
     }
 
-    /// A save takes its directory's hold once its text is flushed and keeps it over its last read
-    /// and its rename, so no other save of this build lands between the two, and lets go once
-    /// saved. With the hold taken elsewhere, a save whose wait is up renames without it.
+    /// A save holds its directory from the flush over its last read and its rename, then lets go;
+    /// with the hold taken elsewhere, a save whose wait is up renames without it.
     #[cfg(unix)]
     #[test]
     fn a_save_renames_under_its_directorys_hold() {
@@ -974,8 +958,8 @@ mod tests {
         assert_eq!(landed, 1);
     }
 
-    /// The boot clock is the one that counts time asleep (`mach_continuous_time`), bracketed by
-    /// two direct reads of it: neither the wall clock nor one that stops in sleep.
+    /// The boot clock counts time asleep: [`clocks`] reads between two direct reads of
+    /// `continuous_ms`, so it is neither the wall clock nor one that stops in sleep.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_boot_clock_counts_time_asleep() {

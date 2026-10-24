@@ -1115,7 +1115,7 @@ fn a_patch_to_a_generated_files_source_reaches_the_build_and_autoconf_never_runs
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());
     let source = bash_source();
-    // bash52-018 changed `parse.y` alone; bash53-016 changes `configure.ac`, then `configure`.
+    // Shaped like bash52-018 (`parse.y` alone) and bash53-016 (`configure.ac`, then `configure`).
     let patches = [
         bash_patch_of(1, &["parse.y"]),
         bash_patch_of(2, &["configure.ac", "configure"]),
@@ -1786,10 +1786,9 @@ fn only_linux_holds_the_rustup_row_to_the_guest_agents_musl_std() {
     }
 }
 
-/// A run that provides (no `--check`) carries `--linux` down to stable: on a machine
-/// whose stable has every target but the guest agent's musl std, a plain run finds the
-/// rustup row in place and a `--linux` run asks stable for that std. This rustup refuses
-/// every change, so the add it was asked for is named in the run's lines.
+/// A provide run carries `--linux` down to stable: where stable lacks only the guest
+/// agent's musl std, a plain run finds the rustup row in place and a `--linux` run asks for
+/// that std (named in the run's lines, since this rustup refuses every change).
 #[test]
 fn a_linux_run_asks_stable_for_the_guest_agents_musl_std_and_a_plain_run_does_not() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -2015,7 +2014,7 @@ fn the_root_image_is_unpacked_read_only_under_its_rows_own_cap() {
     );
 }
 
-/// A fixture URL ending in `file`'s own name, as the real row's do.
+/// A fixture URL ending in `file`'s own name, as the real rows' URLs do.
 fn fixture_url(file: aterm_vz::pins::File) -> &'static str {
     leak(format!(
         "https://fixture.invalid/release-{{v}}/unpacked/{}",
@@ -2234,8 +2233,8 @@ fn a_release_ubuntu_archived_names_the_archive_host_and_the_bump() {
     assert_eq!(names(&m.tooling), Vec::<String>::new());
 }
 
-/// A run whose only row Ubuntu archived is COULD NOT RUN in the archive's words, never a
-/// red FAIL (§3). NEGATIVE CONTROL: a run whose fetch fails otherwise is FAIL.
+/// A run whose only row Ubuntu archived is COULD NOT RUN in the archive's words, never FAIL.
+/// Control: a run whose fetch fails otherwise is FAIL.
 #[test]
 fn a_run_that_meets_an_archived_release_could_not_run() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -2270,8 +2269,7 @@ fn a_run_that_meets_an_archived_release_could_not_run() {
 }
 
 /// A kernel row that lost its initrd, or holds one of another size, is not in place: a
-/// check says so and a run fetches the row again. NEGATIVE CONTROL: the whole row reads in
-/// place and fetches nothing.
+/// check says so and a run fetches the row again. Control: the whole row reads in place.
 #[test]
 fn a_files_row_missing_a_file_is_not_in_place() {
     let home = aterm_tempfile::tempdir().unwrap();

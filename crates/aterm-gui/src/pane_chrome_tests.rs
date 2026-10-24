@@ -1457,11 +1457,9 @@ fn bar_page(cell: (usize, usize)) -> (aterm_core::terminal::Terminal, usize, usi
     (term, rows, cols)
 }
 
-/// THE SCROLLBAR'S FX LAYERS LAND THE RETIRED QUADS' BYTES (design §6, lane
-/// B7): every bar the chrome can draw, alone or a thumb over its track, at
-/// every opacity the chrome uses, draws on the CPU exactly the pixels its
-/// per-row coverage quads drew. Control: a layer whose caps read one coverage
-/// level too high differs.
+/// Every bar the chrome can draw, alone or a thumb over its track, at every opacity the chrome
+/// uses, draws on the CPU exactly the pixels its per-row coverage quads drew. The control: a
+/// layer whose caps read one coverage level too high differs.
 #[test]
 fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu() {
     let mut cpu = aterm_render::Renderer::from_bytes(
@@ -1505,7 +1503,7 @@ fn the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu() {
 }
 
 /// A GPU renderer and a CPU one, both on the bundled font, so the two lay the same cells on every
-/// host (a system font's differ: Windows' lays 11x21 to the bundled 9x23 at 18 px).
+/// host (a system font's cells differ by host).
 fn gpu_and_cpu_on_the_bundled_font() -> (aterm_gpu::GpuRenderer, aterm_render::Renderer) {
     let theme = aterm_render::Theme::default();
     let bundled = || {
@@ -1579,11 +1577,9 @@ fn bar_under_card(
     (bar, card)
 }
 
-/// Each pixel of `cut` (the bar's frame with the card's occluder) is the
-/// bare page's under the card and the uncut bar's frame beside it; the
-/// bar draws under the card without the occluder (CONTROL), and beside it
-/// on the card's rows, where the retired scrub dropped every quad of a
-/// card row that met the card.
+/// Each pixel of `cut` (the bar's frame with the card's occluder) is the bare page's under the
+/// card and the uncut frame's elsewhere; the control: without the occluder the bar draws under
+/// the card. The bar also stays beside the card on the card's rows.
 fn assert_cut_at_the_card(
     arm: &str,
     width: usize,
@@ -1618,9 +1614,7 @@ fn assert_cut_at_the_card(
     );
 }
 
-/// A BAR HALF UNDER A CARD IS CUT AT THE CARD'S EDGE (lane B7): a menu
-/// card's occluder cuts the bar's fx layer at the card's box, so the part
-/// beside the card stays.
+/// A menu card's occluder cuts the bar's fx layer at the card's box; the part beside it stays.
 #[test]
 fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_cpu() {
     let mut cpu = aterm_render::Renderer::from_bytes(
@@ -1675,9 +1669,8 @@ fn a_bar_half_under_a_card_is_cut_at_the_cards_edge_on_the_gpu() {
     );
 }
 
-/// A RESTING BAR COSTS NOTHING: a parked bar's next frames lay the very layer
-/// they laid (same content `Arc`, so no damage and no art build), and a bar
-/// that moves or fades lays a new one. Control: the fade's first frame.
+/// A parked bar's next frames lay the very layer they laid (same content `Arc`: no damage, no
+/// art build). The control: a moved thumb lays a new one.
 #[test]
 fn a_resting_bar_keeps_its_layer_and_a_moving_one_lays_a_new_one() {
     let mut overlay = PaneOverlay::default();

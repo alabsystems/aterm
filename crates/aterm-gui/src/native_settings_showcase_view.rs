@@ -436,10 +436,9 @@ pub(crate) fn themes_page(
             let chooser = panel_width(chooser, page_width);
             let demo_width = (page_width - chooser - COLUMN_GAP).max(0.0);
             let (strip_box, strip) = strip_node(state, demo_width);
-            // THE STRIP STANDS OVER A STATUS'S BAR: the demo gives up what
-            // the bar covers of the column, and the bar shortens for a
-            // control of the strip it would still cover. Laid out under the
-            // bar, the sheet's Done at 640x480 at 2× text was 8pt of 48.
+            // The strip stands over a status's bar: the demo gives up what the bar
+            // covers of the column, and the bar shortens for a strip control it would
+            // still cover.
             let cover = (state.status_extra.get() - (body - room)).max(0.0);
             let demo_height = (room - cover - DEMO_STRIP_GAP - strip).max(0.0);
             state.note_pinned_status_room(&strip_box, body - DEMO_STRIP_GAP - strip);
@@ -682,7 +681,8 @@ fn chooser_pinned_height(state: &SettingsViewState, pins: ChooserPins) -> f32 {
     head + footer
 }
 
-/// The tallest stop of the chooser's rows at `inner` listed with no captions, each a stop of its own.
+/// The tallest stop of the chooser's rows at `inner` listed with no captions, each a stop of
+/// its own.
 fn chooser_rows_tallest(state: &SettingsViewState, inner: f32, narrow: bool) -> f32 {
     with_blocks(state, (inner, narrow, ""), false, |entry| {
         entry

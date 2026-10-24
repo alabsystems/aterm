@@ -422,7 +422,9 @@ impl RelayClient<aterm_uds::CtlStream> {
     /// # Errors
     /// I/O errors connecting to `sock_path` or writing the auth line.
     pub fn connect_local(sock_path: &str, token: &str) -> std::io::Result<Self> {
-        Self::authenticated(aterm_uds::CtlStream::connect(sock_path)?, token)
+        let stream = aterm_uds::CtlStream::connect(sock_path)?;
+        aterm_uds::keep_out_of_children(&stream)?;
+        Self::authenticated(stream, token)
     }
 
     /// [`connect_local`](RelayClient::connect_local) with [`aterm_ctl::connect_then_read_token`].

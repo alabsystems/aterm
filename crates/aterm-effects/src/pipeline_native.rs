@@ -27,7 +27,8 @@ use aterm_render::GlowQuad;
 use aterm_render::sprites::{FreeSprite, FreeZ};
 use aterm_time::Instant;
 
-/// What one content-scroll snapshot did to the cursor family's coordinates ([`EffectsPipeline::sync_scroll`]).
+/// What one content-scroll snapshot did to the cursor family's coordinates
+/// ([`EffectsPipeline::sync_scroll`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScrollChange {
     /// Whole-plane rows the content moved up (translated, not reset).
@@ -53,10 +54,12 @@ impl ScrollChange {
     }
 }
 
-/// What the torn-space retirement does with Rainbow Kitty's band, which is about the grid's cells rather than the window's pixels.
+/// What the torn-space retirement does with Rainbow Kitty's band, which is about the grid's cells
+/// rather than the window's pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TornBand {
-    /// The coordinate space itself was replaced (the alternate screen, a tab or terminal switch, a re-grid).
+    /// The coordinate space itself was replaced (the alternate screen, a tab or terminal switch, a
+    /// re-grid).
     Curtain,
     /// A history viewport is on glass over an unchanged live grid.
     Keep,
@@ -73,7 +76,8 @@ pub struct Delivery {
     pub key: Option<DeliveredClass>,
 }
 
-/// The cursor row the host captured under its terminal lock, with the class of detector that may read it.
+/// The cursor row the host captured under its terminal lock, with the class of detector that may
+/// read it.
 #[derive(Clone, Copy, Debug)]
 pub struct RowProbe<'a> {
     pub row: u16,
@@ -91,19 +95,23 @@ pub type Flanks<'a> = (Option<&'a [char]>, Option<&'a [char]>);
 pub struct CursorStep<'a> {
     /// The family's frame input (clock, caret, geometry, the policy folds).
     pub input: CursorFxInput,
-    /// The resolved glow config, already folded for motion, audibility and the live shape's head anchor ([`crate::cursor_fx::head_dx_for`]).
+    /// The resolved glow config, already folded for motion, audibility and the live shape's head
+    /// anchor ([`crate::cursor_fx::head_dx_for`]).
     pub glow: &'a GlowConfig,
     /// The comet's config, already gated by the motion policy.
     pub trail: TrailConfig,
     /// The motion policy lets the family animate (`CursorFx::begin`'s fresh-ink reduced arm).
     pub animate: bool,
     pub row_probe: Option<RowProbe<'a>>,
-    /// The cells of the frame about to be presented (window rows), whose text tells the dark streak where it crosses air ([`crate::cursor_glow::CursorGlow::observe_frame_text`]).
+    /// The cells of the frame about to be presented (window rows), whose text tells the dark streak
+    /// where it crosses air ([`crate::cursor_glow::CursorGlow::observe_frame_text`]).
     pub frame_cells: Option<&'a [Vec<RenderCell>]>,
     /// The window cell `(row, col)` of `frame_cells`' first cell: `(0, 0)`
     /// for the window's own cells, a split's offset for its focused pane's.
     pub frame_cells_at: (u16, u16),
-    /// Keystrokes the host batched since its last step, replayed at this frame's instant after the history fence (a page's straggler keys; a native window notes each key at its press and passes `0`).
+    /// Keystrokes the host batched since its last step, replayed at this frame's instant after the
+    /// history fence (a page's straggler keys; a native window notes each key at its press and
+    /// passes `0`).
     pub pending_keys: u32,
     /// The echo anchor `(row, col, seq)` and the glyph its run ended on.
     pub print_anchor: Option<(u16, u16, u64)>,
@@ -130,7 +138,8 @@ pub enum CanvasInk {
 /// The flying head's seat for a frame ([`EffectsPipeline::route_flying_head`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FlyingSeat {
-    /// Whole rows lifted above the caret's row, for the host's [`crate::word_decorations::KittyCursorLayout::lift`].
+    /// Whole rows lifted above the caret's row, for the host's
+    /// [`crate::word_decorations::KittyCursorLayout::lift`].
     pub lift: f32,
     /// The target seat `(x0, x1, y0, y1)` in grid pixels, right and bottom exclusive.
     pub px: Option<(i32, i32, i32, i32)>,
@@ -219,7 +228,8 @@ pub struct PaneDrain {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WordPanesOut {
     pub fp: u64,
-    /// The focused pane's placement when it got past suspension — where the host's typed dog may draw (it draws on no suspended pane).
+    /// The focused pane's placement when it got past suspension — where the host's typed dog may
+    /// draw (it draws on no suspended pane).
     pub focus_place: Option<PanePlace>,
     /// Some pane rescanned its snapshot this frame.
     pub rescanned: bool,
@@ -349,7 +359,8 @@ impl EffectsPipeline {
         &mut self.companions
     }
 
-    /// The companions and the cursor family together, for a host step that feeds one from the other in one breath (the song's sync reads the glow's style while it drives the flying head).
+    /// The companions and the cursor family together, for a host step that feeds one from the other
+    /// in one breath (the song's sync reads the glow's style while it drives the flying head).
     #[inline]
     pub const fn companions_with_cursor(
         &mut self,
@@ -395,7 +406,8 @@ impl EffectsPipeline {
         &self.rain_latches
     }
 
-    /// The owner the cursor family's retained light belongs to: `(terminal identity, alternate screen)`, `None` before the first frame.
+    /// The owner the cursor family's retained light belongs to: `(terminal identity, alternate
+    /// screen)`, `None` before the first frame.
     #[inline]
     #[must_use]
     pub const fn owner_space(&self) -> Option<(u64, bool)> {
@@ -425,7 +437,8 @@ impl EffectsPipeline {
         &mut self.streak_panes
     }
 
-    /// Apply the terminal's cumulative content-scroll clock to the cursor family, the one scroll law both hosts run.
+    /// Apply the terminal's cumulative content-scroll clock to the cursor family, the one scroll
+    /// law both hosts run.
     #[inline]
     pub fn sync_scroll(&mut self, current: ContentScrollState, now: Instant) -> ScrollChange {
         let decision = content_scroll_decision(self.cursor_scroll_state, current);
@@ -466,7 +479,8 @@ impl EffectsPipeline {
         }
     }
 
-    /// The last content-scroll snapshot the cursor family consumed — the baseline a host's witness capture compares its rows against.
+    /// The last content-scroll snapshot the cursor family consumed — the baseline a host's witness
+    /// capture compares its rows against.
     #[inline]
     #[must_use]
     pub const fn scroll_baseline(&self) -> Option<ContentScrollState> {
@@ -479,7 +493,8 @@ impl EffectsPipeline {
         self.cursor_scroll_state = state;
     }
 
-    /// The front terminal was replaced under this surface (tab switch, pane-focus move, session migration), so every coordinate, probe and stream baseline belongs to the old grid.
+    /// The front terminal was replaced under this surface (tab switch, pane-focus move, session
+    /// migration), so every coordinate, probe and stream baseline belongs to the old grid.
     #[inline]
     pub fn front_replaced(&mut self, now: Instant) {
         self.cursor.glow.drop_row_probe();
@@ -514,7 +529,8 @@ impl EffectsPipeline {
         self.companion.resight_coordinate_space();
     }
 
-    /// [`Self::retire_torn`] for the same surface re-gridded (resize, font step, DPI change, divider drag, zoom that keeps focus).
+    /// [`Self::retire_torn`] for the same surface re-gridded (resize, font step, DPI change,
+    /// divider drag, zoom that keeps focus).
     #[inline]
     pub fn regrid_torn(&mut self, now: Instant) {
         self.retire_torn_marks(TornBand::Curtain, now);
@@ -539,7 +555,8 @@ impl EffectsPipeline {
         self.free_scratch.clear();
     }
 
-    /// The owner fence, keyed `(terminal identity, alternate screen)`: the first observation baselines silently.
+    /// The owner fence, keyed `(terminal identity, alternate screen)`: the first observation
+    /// baselines silently.
     #[inline]
     pub fn fence_owner(&mut self, current: (u64, bool), now: Instant) -> bool {
         let changed = self
@@ -554,7 +571,8 @@ impl EffectsPipeline {
         changed
     }
 
-    /// The cursor family's frame ([`step_cursor_family`]) on this pipeline's engines, with the host's resolved glow config.
+    /// The cursor family's frame ([`step_cursor_family`]) on this pipeline's engines, with the
+    /// host's resolved glow config.
     #[inline]
     pub fn cursor_step(
         &mut self,
@@ -671,10 +689,9 @@ impl EffectsPipeline {
         }
         self.decos.begin_host_frame();
         let fp = self.tick_words(g.now, g);
-        // The tick clears the sprite list before it draws (a primed tick's
-        // sprites with it), so every sprite in it is this tick's: counting
-        // from the length before the tick skipped a primed frame's icons,
-        // and the sky drew its stars on them (looks6 N3).
+        // The tick clears the sprite list before it draws (a primed tick's sprites with it), so
+        // every sprite in it is this tick's; counting from the length before the tick would skip
+        // a primed frame's icons, and the sky would draw its stars on them.
         self.note_word_icons(0);
         WordGridOut {
             fp,
@@ -698,7 +715,8 @@ impl EffectsPipeline {
         )
     }
 
-    /// This tick's positioned peek landings reach the pet as fractional cells (the cues clear at the next tick's start, so forward them promptly).
+    /// This tick's positioned peek landings reach the pet as fractional cells (the cues clear at
+    /// the next tick's start, so forward them promptly).
     #[inline]
     pub fn forward_peek_cues(&mut self, now: Instant, cell: (u16, u16)) {
         self.companion
@@ -809,7 +827,8 @@ impl EffectsPipeline {
         self.decos.retain_panes(keep);
     }
 
-    /// Place the pane staging sprites (a companion the host drew for the focused pane) into the window grid and append them to its channel.
+    /// Place the pane staging sprites (a companion the host drew for the focused pane) into the
+    /// window grid and append them to its channel.
     #[inline]
     pub fn place_pane_sprites(&mut self, place: PanePlace) {
         translate_free_into_pane(&mut self.pane_free, place);
@@ -822,7 +841,8 @@ impl EffectsPipeline {
         self.pane_free.clear();
     }
 
-    /// The resident pet's emission ([`CompanionOwner::emit_on`]), the palette sampled over `cells` (the snapshot the pet stands on).
+    /// The resident pet's emission ([`CompanionOwner::emit_on`]), the palette sampled over `cells`
+    /// (the snapshot the pet stands on).
     #[inline]
     pub fn draw_pet(
         &mut self,
@@ -987,7 +1007,8 @@ impl EffectsPipeline {
         self.shade_word_icons(input);
     }
 
-    /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the word engine's ink.
+    /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the
+    /// word engine's ink.
     #[inline]
     pub fn pet_prepare(&mut self, facts: PetFacts<'_>) -> PetTick {
         self.companion.prepare(facts, &mut self.decos)
@@ -1002,26 +1023,19 @@ impl EffectsPipeline {
         pane_off: (u16, u16),
         now: Instant,
     ) {
-        let mut frame = *pet_frame;
-        frame.row += f32::from(pane_off.0);
-        frame.col += f32::from(pane_off.1);
-        let on_glass = if self.cursor.glow.v2_status().is_some() && frame.alpha > 0 {
-            crate::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
-        } else {
-            None
-        };
         // The body the sky draws no star on: the box `PetOnGlass` reads, in
         // window pixels.
-        let body = on_glass.and_then(|_| {
-            let (cw, ch) = (u16::try_from(geom.cw).ok()?, u16::try_from(geom.ch).ok()?);
-            let (cols, rows) = (
-                u16::try_from(geom.cols).ok()?,
-                u16::try_from(geom.rows).ok()?,
-            );
-            let (x0, x1, y0, y1) = frame.body_px(cw, ch, cols, rows)?;
-            let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
-            Some((x0 + ox, x1 + ox, y0 + oy, y1 + oy))
-        });
+        let (on_glass, body) = if self.cursor.glow.v2_status().is_some() && pet_frame.alpha > 0 {
+            let mut frame = *pet_frame;
+            frame.row += f32::from(pane_off.0);
+            frame.col += f32::from(pane_off.1);
+            match crate::rainbow_kitty::companion::PetOnGlass::of_with_body_px(&frame, geom) {
+                Some((on_glass, body)) => (Some(on_glass), Some(body)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         self.cursor.glow.note_pet_body(body);
         let offer = self.cursor.glow.pet_offer(geom, on_glass);
         if let Some(star) = self.companion.note_v2_offer(&offer) {
@@ -1042,13 +1056,16 @@ impl EffectsPipeline {
         rain_engine(&mut self.rain, || cfg)
     }
 
-    /// The rain engine, for the host's notes into it (a config reload, the agent-output and focus notes).
+    /// The rain engine, for the host's notes into it (a config reload, the agent-output and focus
+    /// notes).
     #[inline]
     pub fn rain_mut(&mut self) -> Option<&mut MatrixRain> {
         self.rain.as_deref_mut()
     }
 
-    /// A layout re-grid: the rain keeps its engine (so opening a split does not kill the window's rain) and rebaselines only its coordinate-space state (occupancy bitset, material bank), so stale emission does not leak.
+    /// A layout re-grid: the rain keeps its engine (so opening a split does not kill the window's
+    /// rain) and rebaselines only its coordinate-space state (occupancy bitset, material bank), so
+    /// stale emission does not leak.
     #[inline]
     pub fn regrid_rain(&mut self) {
         if let Some(rain) = self.rain.as_deref_mut() {
@@ -1058,7 +1075,8 @@ impl EffectsPipeline {
         self.rain_add_scratch.clear();
     }
 
-    /// The shell's Execute rising edge for `session` — noted every frame, with or without an engine.
+    /// The shell's Execute rising edge for `session` — noted every frame, with or without an
+    /// engine.
     #[inline]
     pub const fn note_rain_shell(&mut self, session: u64, executing: bool) -> bool {
         self.rain_latches.note_shell_executing(session, executing)
@@ -1090,7 +1108,8 @@ impl EffectsPipeline {
         )
     }
 
-    /// Place a composed frame's pane-local rain into the window grid, clipped at the pane's interior edges.
+    /// Place a composed frame's pane-local rain into the window grid, clipped at the pane's
+    /// interior edges.
     #[inline]
     pub fn place_rain(&mut self, place: PanePlace) {
         translate_rain_into_pane(
@@ -1168,7 +1187,8 @@ impl EffectsPipeline {
         self.streak.as_deref()
     }
 
-    /// Prism wake on one grid, appended to the window's nova channel after the word pass (the decorations own its clear).
+    /// Prism wake on one grid, appended to the window's nova channel after the word pass (the
+    /// decorations own its clear).
     #[inline]
     pub fn streak_grid(&mut self, s: Option<&StreakGrid<'_>>) -> Option<(StreakFrame, bool)> {
         let Some(s) = s else {
@@ -1221,7 +1241,8 @@ impl EffectsPipeline {
         self.streak_panes.remove(&(session, slot));
     }
 
-    /// Prism wake on one pane of a composed frame: a history viewport or the alternate screen drops the pane's engine.
+    /// Prism wake on one pane of a composed frame: a history viewport or the alternate screen drops
+    /// the pane's engine.
     #[inline]
     pub fn streak_pane(
         &mut self,

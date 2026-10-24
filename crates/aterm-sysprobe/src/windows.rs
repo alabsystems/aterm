@@ -491,12 +491,13 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                 field(rec, name_off + offset_of!(UnicodeString64, buffer)),
                 u16_at(rec, name_off).unwrap_or(0),
             );
+            let start = i64_at(rec, offset_of!(ProcessInformation64, create_time))
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0);
             found.push((
                 ProcessReading {
                     pid: u32::try_from(pid).unwrap_or(u32::MAX),
-                    start: i64_at(rec, offset_of!(ProcessInformation64, create_time))
-                        .and_then(|value| u64::try_from(value).ok())
-                        .filter(|value| *value > 0),
+                    start,
                     ppid: u32::try_from(field(
                         rec,
                         offset_of!(ProcessInformation64, inherited_from_unique_process_id),
@@ -521,6 +522,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     read_at: None,
                     coalition: None,
                     version: None,
+                    birth_ms: start.and_then(crate::procs::birth_of_filetime),
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

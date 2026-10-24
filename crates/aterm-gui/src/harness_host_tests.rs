@@ -2075,7 +2075,6 @@ fn the_disk_watchs_looks_tell_the_window_each_end_once() {
     assert_eq!(count(&HostNote::DiskPlenty), 1, "{told:?}");
 }
 
-/// A tab working in an 8.3 spelling reads its volume's row.
 #[cfg(windows)]
 #[test]
 fn a_tab_in_a_short_spelled_folder_reads_its_volumes_row() {
@@ -2115,7 +2114,6 @@ fn a_tab_in_a_short_spelled_folder_reads_its_volumes_row() {
     }
 }
 
-/// An 8.3 tab reads its volume's row before any look, and with no watch.
 #[cfg(windows)]
 #[test]
 fn an_8_3_tab_reads_its_volumes_row_before_any_look_and_with_no_watch() {
@@ -5597,7 +5595,6 @@ fn scratch_server(tag: &str) -> (String, std::thread::JoinHandle<Vec<String>>) {
     (path, h)
 }
 
-/// The loop's writes are fenced on its claim.
 #[cfg(unix)]
 #[test]
 fn the_loops_writes_are_fenced_on_its_own_claim() {
@@ -5907,11 +5904,9 @@ struct Acting {
     /// The agent in the tab cannot be read for now: every snapshot read answers none, as a
     /// live read that fails does, the process itself alive and its end the kernel's.
     unreadable: AtomicBool,
-    /// THE PROCESS HOLDING EACH TAB'S FOREGROUND while the roster names
-    /// an agent there, and its program:
-    /// a new one at every launch — an agent arriving in a
-    /// tab at its shell ([`Self::set`]) or another job put in front of it
-    /// ([`Self::another_job`]) — the first [`snap`]'s.
+    /// The process holding each tab's foreground while the roster names an agent there, and its
+    /// program: a new one at every launch (an agent arriving at the tab's shell, [`Self::set`], or
+    /// another job put in front of it, [`Self::another_job`]), the first [`snap`]'s.
     pids: Mutex<HashMap<String, (u32, Program)>>,
     /// The line's agent, adopted and not named yet: a relaunch's or a carry's `adopted` is
     /// a process its line started that the step found registered (live:
@@ -5927,13 +5922,11 @@ struct Acting {
     read: Mutex<Vec<(String, u32)>>,
     /// The conversation Claude's own record names now, when it moved.
     conversation: Mutex<Option<String>>,
-    /// The conversation a snapshot READ names (`Some(None)`: none yet, a
-    /// Claude Code at its first-run screen); unset, [`Self::read_conversation`]'s,
-    /// else the fixture's own.
+    /// The conversation a snapshot read names (`Some(None)`: none yet, a Claude Code at its
+    /// first-run screen); unset, [`Self::read_conversation`]'s, else the fixture's own.
     session_now: Mutex<Option<Option<String>>>,
-    /// The conversation a SNAPSHOT READ of the tab's agent names, when it
-    /// is not the fixture's ([`snap`]): another agent started in the tab
-    /// that holds another conversation.
+    /// The conversation a snapshot read of the tab's agent names when it is not the fixture's
+    /// ([`snap`]): another agent started in the tab that holds another conversation.
     read_conversation: Mutex<Option<String>>,
     /// What each worker's first run was told to do with the tab's relaunch
     /// mark: `(clear_badge, unset_mark)` ([`WorkerJob::unset_mark`]).
@@ -6125,7 +6118,7 @@ struct Acting {
     /// worker said of each.
     withheld_point: Mutex<Option<bool>>,
     withheld_said: Mutex<Vec<Option<String>>>,
-    /// The tabs whose claim in [`Self::claims`] is a PROVEN self-claim
+    /// The tabs whose claim in [`Self::claims`] is a proven self-claim
     /// (`status supervisor_proven=1`).
     proven: Mutex<std::collections::HashSet<String>>,
     /// Each run of a worker's loop, by tab, with the proven self-claim it
@@ -6143,22 +6136,20 @@ struct Acting {
     /// `done:resumed`, codex-alab's relaunch's word for a line that landed,
     /// its agent in the tab — [`Self::adopted_in`]).
     self_relaunch_steps: Mutex<VecDeque<String>>,
-    /// THE CODEX-ALAB EACH NEXT CRASH-RULE LANDING STARTS, killed before
-    /// any read of it reaches it and before any pass names it — the tab left
-    /// at its shell — having proved its claim (`Some`: aterm's copy of ITS
-    /// record taken, [`Self::self_copies`]) or not (`None`).
+    /// The codex-alab each next crash-rule landing starts, killed before any read or pass reaches
+    /// it (the tab left at its shell), having proved its claim (`Some`: aterm's copy of its record
+    /// taken, [`Self::self_copies`]) or not (`None`).
     self_landed_unread: Mutex<VecDeque<Option<self_claimed::Copy>>>,
     /// Whether each session's proven self-claimed agent is at its own idle
     /// point ([`Acts::self_idle`]), by tab; none: not.
     self_idle: Mutex<HashMap<String, bool>>,
-    /// THE SCREEN'S PUBLICATION `rev` the roster names every agent with
-    /// ([`FollowStamp::rev`]): moved by a test as the status sweep moves it
-    /// when the verdict a tab's screen reads changes (a `/resume` picked).
+    /// The screen's publication `rev` the roster names every agent with ([`FollowStamp::rev`]):
+    /// moved by a test as the status sweep moves it when the verdict a tab's screen reads changes
+    /// (a `/resume` picked).
     rev: AtomicU64,
-    /// THE SCREEN'S MOVES UNDER A VERDICT THAT STOOD ([`FollowStamp::screen`],
-    /// `AgentPublication::screen_moves`): moved by a test as the status sweep
-    /// moves it when an idle agent's screen moves and its verdict does not (a
-    /// `/clear` drawn).
+    /// The screen's moves under a verdict that stood ([`FollowStamp::screen`],
+    /// `AgentPublication::screen_moves`): moved by a test as the status sweep moves it when an
+    /// idle agent's screen moves and its verdict does not (a `/clear` drawn).
     screen: AtomicU64,
 }
 type SelfRelaunched = (String, Vec<String>, Option<restart_stamp::Cause>);
@@ -8605,10 +8596,9 @@ struct Accts {
     seen: Mutex<Vec<(Option<String>, Option<String>)>>,
     /// The accounts ledger as each relaunch found it.
     found: Mutex<Vec<Vec<&'static str>>>,
-    /// Another writer, at the n-th read of the seat from now ([`Self::at_seat_read`]):
-    /// what a test puts between two of a move's steps, between step 0's lock-free read of
-    /// the state and the commit (the move's second read of the seat,
-    /// [`account_transact_of`]'s, for the commit's clock, before it takes the lock).
+    /// Another writer, run at the n-th read of the seat from now ([`Self::at_seat_read`]): what a
+    /// test puts between a move's lock-free read of the state and its commit (the second read of
+    /// the seat, [`account_transact_of`]'s, for the commit's clock, before it takes the lock).
     at_read: Mutex<Option<(usize, SeatAct)>>,
     pids: std::sync::atomic::AtomicU32,
     /// The bounded wait of every take of the store's lock, the seat's and
@@ -15549,11 +15539,8 @@ fn a_fact_lines_pace_is_refused_where_the_worker_takes_no_step() {
     assert_eq!(pace(&swept), PaceGrant::Granted);
 }
 
-/// THE GUI'S OWN GATE ON THE TASK DOOR (the occupancy design's manager door, plan 2.4): a
-/// worker's fact word reaches its session's task record only while the owner's mode in force here
-/// is `prompt`; under `observe` and `off` the worker answers `Fenced` and the act is never called,
-/// whatever word the loop asked with. NEGATIVE CONTROL: under `prompt` the same call reaches the
-/// act, with the session's own sid and the word as asked.
+/// Under `observe` and `off` a worker's fact word is `Fenced` and never reaches the act; under
+/// `prompt` it reaches it with the session's own sid and the word as asked.
 #[test]
 fn a_workers_task_fact_is_refused_unless_the_owners_mode_here_is_prompt() {
     use aterm_agent::supervise::Occupancy;
@@ -15710,14 +15697,9 @@ fn a_workers_canary_reads_its_own_sessions_stuck_call_from_the_jobs_board() {
     );
 }
 
-/// THE WORKER'S FACTS ARE EACH OF ITS OWN SESSION'S CALLS THAT MADE NO PROGRESS, PROVED ALIVE
-/// ([`IdleHost::facts`], the hung-call design's R2): of tab 4's rows (session `s-hung`), every
-/// live agent call reading `no_progress`, worst first, each regardless of the call beside them
-/// that makes progress (which keeps the canary's evidence `Unknown`), and only those whose leader
-/// is proved alive at the ask ([`Acts::leader_lives`]): the one quiet longest, whose leader ended
-/// since the view was read, is left out, so is one reborn under its pid since (another birth), and
-/// so is one whose birth was not read. The reading is as of the view, fresh. NEGATIVE CONTROLS: a
-/// view past [`crate::vitals_jobs::JOBS_FRESH`], and a board no view was posted to, read nothing.
+/// The worker's facts ([`IdleHost::facts`]) are its own session's `no_progress` agent calls, worst
+/// first, whose leader is proved alive at the ask ([`Acts::leader_lives`]); a view past
+/// [`crate::vitals_jobs::JOBS_FRESH`], or a board no view was posted to, reads nothing.
 #[test]
 fn a_workers_facts_are_its_sessions_calls_that_made_no_progress_proved_alive() {
     use aterm_agent::supervise::BackgroundEvidence;
@@ -18676,8 +18658,8 @@ fn kill_until_reaped(pid: i32) {
     });
 }
 
-/// A tab on `master` registered in a fresh store, its agent named in
-/// `group` as `program`: `(store, sid, name)` — `name` names it again.
+/// A tab on `master` registered in a fresh store, its agent named `claude` in `group`:
+/// `(store, sid, name)`, where `name` names its program again.
 #[cfg(unix)]
 fn tab_on(master: i32, local: u64, group: i32) -> (Store, String, impl Fn(Option<&str>)) {
     let store = crate::session_store::new_store();
@@ -18741,8 +18723,8 @@ fn the_real_hold_reads_the_tabs_foreground_and_its_leader() {
     end_pty_job(master, leader, group);
 }
 
-/// The hold is the group leader's ([`holds`]), on a real pseudo-terminal whose shell stays: the
-/// agent — its group's leader.
+/// The hold is the group leader's ([`holds`]): on a real pty whose shell stays, it ends with the
+/// agent, its group's leader, though a member of the group lives on in the foreground.
 #[cfg(unix)]
 #[test]
 fn the_hold_reads_the_groups_leader() {
@@ -22215,11 +22197,9 @@ struct Probe {
     /// is never reused as a later worker's identity.
     workers: Mutex<Vec<Arc<AtomicBool>>>,
     badge_on: AtomicBool,
-    /// While set, a body asked to stop LINGERS — still running, its stop
-    /// read — before it returns ([`Linger`]): the old worker a stop leaves
-    /// is observed whole, and a host that starts the session's next worker
-    /// once the old one is merely asked to stop, before it is reaped, runs
-    /// two bodies at once (`old + cur`, `max_running`).
+    /// While set, a body asked to stop lingers, still running with its stop read, before it
+    /// returns ([`Linger`]): a host that starts the session's next worker before the old one is
+    /// reaped runs two bodies at once (`old + cur`, `max_running`).
     lingering: Mutex<bool>,
     /// Rung as [`Self::lingering`] clears.
     let_end: Condvar,
@@ -22228,8 +22208,7 @@ struct Probe {
     /// failure that moves no projected variable (one past the history's
     /// cap) is waited for by this count.
     backoffs: AtomicUsize,
-    /// The session's agent is a VENDOR Codex (the model's `vendor`, while
-    /// the roster names it): what the test made it.
+    /// The session's agent is a vendor Codex (the model's `vendor`, while the roster names it).
     vendor: AtomicBool,
     /// What the roster tells the host of it ([`FollowStamp::vendor`]): the
     /// same as [`Self::vendor`], save in the negative control that withholds
@@ -23595,19 +23574,17 @@ struct RestartSeen {
     hand: bool,
     /// Another supervisor claims the session (the model's `hand` 2).
     claim: bool,
-    /// An act's KILL was sent while another hand held it.
+    /// An act's `SIGKILL` was sent while another hand held it.
     held_kill: bool,
     /// A relaunch was typed into the tab while another supervisor claimed
     /// it.
     into_claim: bool,
-    /// The agent's own PROVEN SELF-CLAIM stands on the session (the model's
-    /// `selfclaim`; the codex-alab self-claim contract, §4).
+    /// The agent's own proven self-claim stands on the session (the model's `selfclaim`).
     self_claim: bool,
     /// aterm holds a copy of that agent's record (the model's `copy`).
     copy: bool,
-    /// The relaunch the copy owed across a Commit was made WITHOUT the line
-    /// it validated — left to the lane (the model's `lost`): read off the
-    /// snapshot the real host relaunched, never assumed.
+    /// The relaunch the copy owed across a Commit was made without the line it validated, left
+    /// to the lane (the model's `lost`): read off the snapshot the real host relaunched.
     lost: bool,
     /// The agent is codex-alab (the model's `alab`): the host admitted a
     /// Codex, which it does only as codex-alab.
@@ -24463,7 +24440,7 @@ fn resumed_and_relaunched(mut job: ShellJob, a: &Acting, host: &HostHandle) {
     host.shutdown_and_join();
 }
 
-/// An exit whose program still runs is nobody's yet ( rulings 13 and 15).
+/// An exit whose program still runs is nobody's yet.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stamped_program_stopped_under_a_hand_that_came_and_went_is_relaunched() {
@@ -27904,7 +27881,7 @@ fn a_roster_of_one_account_takes_its_taps_readings() {
     }
 }
 
-/// The tap follows the one account through its renewal (accounts v2 S7).
+/// The tap follows the one account through its renewal.
 #[cfg(unix)]
 #[test]
 fn a_renewed_one_account_login_keeps_its_taps_readings() {
@@ -28085,7 +28062,9 @@ fn a_fresh_reading_not_taken_is_tried_again() {
     assert_eq!(w.rows(accounts::Kind::Sample), 2);
 }
 
-/// The tap's reading that times a wall is the tab's own process's newest, stamped when the tap wrote it, and recorded nowhere. Negative controls answer nothing: the switch off, no tap on the argv, a Codex, a file older than the process.
+/// The reading that times a wall is the tab's own process's newest, stamped when the tap wrote it,
+/// and recorded nowhere. Negative controls answer nothing: the switch off, no tap on the argv, a
+/// Codex, a file older than the process.
 #[cfg(unix)]
 #[test]
 fn a_tapped_processs_own_reading_times_its_wall_under_the_switch() {
@@ -30089,9 +30068,8 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
     );
 }
 
-/// A SCREEN THAT READS AS STARTED STARTS NO CODEX WORKER NO CLAIM CARRIES, and a
-/// codex worker codex-alab may not claim (a halt, Autopilot off) is not judged yet;
-/// every other read, and every other worker's, is the screen's.
+/// A screen that reads as started starts no codex worker no claim carries, and under a halt or
+/// Autopilot off a codex worker's screen is not judged at all.
 #[test]
 fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     let trust = StartupSeen::Holds(StartupHold::Trust {
@@ -30123,12 +30101,9 @@ fn an_unclaimed_codex_worker_is_never_started_by_its_screen() {
     );
 }
 
-/// A STARTUP STALL FOLLOWS CODEX-ALAB'S WORDS: codex-alab takes its attention down once
-/// its screen's step is done (a sign-in completed, the onboarding going on) while the stall
-/// stands, so a stall quoting it names what holds the screen now ([`restates`],
-/// `StartupMark::Restated`), on a record still `stalled why=startup` under the stall's own
-/// attention. NEGATIVE CONTROLS: a quote that still holds, a stall that never quoted
-/// codex-alab, a person's or another writer's entry, and a record moved on are left alone.
+/// A startup stall follows codex-alab's words as they go and come, naming what holds the screen
+/// now ([`restates`]); a quote that still holds, a stall that never quoted codex-alab, a person's
+/// entry and a record moved on are left alone.
 #[test]
 fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -30228,13 +30203,8 @@ fn a_startup_stall_restates_codex_alabs_words_as_they_move() {
     }
 }
 
-/// A CODEX-ALAB STARTUP SCREEN THAT WAITS FOR A PERSON IS NAMED BY ITS OWN ATTENTION:
-/// over a screen codex holds (its folder-trust dialog, a box, no composer, or a composer
-/// no claim carries), codex-alab's standing attention is what holds the worker
-/// ([`StartupHold::Asked`]), and its stall's attention, newer than codex-alab's and so
-/// the one aterm shows, quotes codex-alab's words within an entry's cap. NEGATIVE
-/// CONTROLS: a shell in front (codex-alab gone, its attention stale), a codex-alab that
-/// may not claim and any other worker read as before.
+/// Over a screen codex holds, codex-alab's standing attention holds the worker
+/// ([`StartupHold::Asked`]) and the stall's attention quotes its words within an entry's cap.
 #[test]
 fn a_codex_alab_startup_screen_is_named_by_its_own_attention() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
@@ -30381,12 +30351,9 @@ fn a_codex_alab_startup_screen_is_named_by_its_own_attention() {
     );
 }
 
-/// A CODEX WORKER CARRIED BY ITS OWN PROVEN CLAIM: before the claim, its tab
-/// is read as any worker's (a shell, so no agent yet), and a Codex composer
-/// alone starts nothing (OpenAI's codex, or a codex-alab that has not carried
-/// the tab, would leave the task working forever); once codex-alab proves its
-/// claim the worker is started, and no held deadline judges it (it answers for
-/// its own screens with its own attention).
+/// Before codex-alab proves its claim, a Codex composer alone starts nothing (an unclaimed codex
+/// would leave the task working forever); once it does, the worker starts and no held deadline
+/// judges it.
 #[test]
 fn a_codex_worker_its_proven_claim_carries_is_started_and_never_held() {
     use crate::task_record::{TaskMark, TaskState};
@@ -32896,10 +32863,8 @@ fn a_tab_busy_at_the_removal_is_unknown_on_windows() {
         .to_string_lossy()
         .replace('\\', "/");
     let report = if plain.starts_with('/') {
-        // Distinct branch.
         format!("\x1b]7;file://{plain}\x07")
     } else {
-        // Distinct branch.
         format!("\x1b]7;file:///{plain}\x07")
     };
     let store = crate::session_store::new_store();
@@ -33636,12 +33601,9 @@ fn the_windows_disk_resume_presents_the_in_memory_token() {
     );
 }
 
-/// The window's sweeps present the harness's in-memory token on the window's own socket, probed
-/// with `version`, never the token beside it: the restart and upgrade lanes' acts ([`live_acts`]'
-/// shared options, read here through `snapshot`, the look a relaunch and a restart's carry-on
-/// begin with) and the owner's view ([`live_view`]'s [`window_drive_opts`], through
-/// [`upgrade_drive::View::refresh`]). The word writer ([`crate::upgrade_host::word_writer_at`])
-/// starts from the same options and dials no socket.
+/// The window's sweeps (the lanes' acts, [`live_acts`], and the owner's view,
+/// [`window_drive_opts`]) present the harness's in-memory token on its own socket, never the token
+/// beside it; the word writer ([`crate::upgrade_host::word_writer_at`]) dials no socket.
 #[cfg(unix)]
 #[test]
 fn the_windows_sweeps_present_the_in_memory_token_on_its_own_socket() {

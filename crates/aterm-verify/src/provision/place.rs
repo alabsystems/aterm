@@ -59,9 +59,9 @@ impl Scratch {
         Ok(dir)
     }
 
-    /// Run a program copied into this scratch. A nonempty stdout response proves it ran
-    /// from the copy; only then may cleanup or placement rename its image. A spawn,
-    /// read or wait error cannot establish that proof, and an unwind must retain it too.
+    /// Run a program copied into this scratch. A nonempty stdout proves it ran from the
+    /// copy; only then may cleanup or placement rename its image. A spawn, read or wait
+    /// error, or an unwind, keeps the scratch.
     pub(super) fn run_copied(
         self,
         host: &dyn Host,
@@ -97,9 +97,9 @@ impl Scratch {
         Ok(retained.0.take().expect("the building scratch is owned"))
     }
 
-    /// Keep the scratch, where what ran from it has not shown it ran: its path. The
-    /// give-up exec stamp records this retention, not proof of execution; without a run
-    /// proof the tooling reclaim keeps the image regardless of elapsed time or reboot.
+    /// Keep the scratch, where what ran from it has not shown it ran, and return its path.
+    /// The exec stamp records the retention, not a run: without the run marker the tooling
+    /// reclaim keeps the image however old it is, across a reboot too.
     pub(super) fn keep(self) -> PathBuf {
         aterm_uds::deadline::stamp_exec(self.path());
         self.dir.keep()
@@ -143,8 +143,8 @@ pub(super) fn file_name(url: &str) -> String {
     }
 }
 
-/// Download `url` into a new empty directory of the scratch and hold it to its pin: the
-/// size, then the sha256. The path of the checked file. A fetch Ubuntu's primary host
+/// Download `url` into a new empty directory of the scratch and hold it to its pin (the
+/// size, then the sha256); returns the checked file's path. A fetch Ubuntu's primary host
 /// refused by redirecting it to its http-only archive is [`Refused::CouldNotRun`] in the
 /// words that name the pin bump ([`aterm_vz::pins::archived`]), never curl's protocol
 /// error alone.
@@ -249,12 +249,11 @@ pub(super) fn plain_tar(
 }
 
 /// Give every file under `tree` one modification time, a minute ago. atpkg's extractor
-/// stamps each file with the moment it wrote it, in the archive's order, so a source tree's
-/// generated files can come out older than what they are generated from (bash's
-/// `configure` than its `aclocal.m4`, `y.tab.c` than `parse.y`), and `make` would then run
-/// autoconf and bison to remake them. To `make` equal times are up to date, as the
-/// archive's own were. The minute keeps a file a later step writes (a patch) newer even to
-/// the Command Line Tools' make 3.81, which compares whole seconds.
+/// stamps each file with the moment it wrote it, in archive order, so a generated file can
+/// come out older than its source (bash's `configure` than its `aclocal.m4`, `y.tab.c` than
+/// `parse.y`) and `make` would run autoconf and bison to remake it. To `make`, equal times
+/// are up to date. The minute keeps a file a later step writes (a patch) newer even to the
+/// Command Line Tools' make 3.81, which compares whole seconds.
 pub(super) fn settle_times(tree: &Path) -> Result<(), String> {
     let settled = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
     let mut dirs = vec![tree.to_path_buf()];
@@ -466,11 +465,10 @@ pub(super) fn touch_stamp(dir: &Path) {
 }
 
 /// Put the finished `tree` at `dest` with one rename, unless `complete()` (of `dest`)
-/// holds already: another run placed the same pin, and its tree, which may be running,
-/// stays. Whatever else stands at `dest` (a copy with no stamp, or a stamp of another pin)
-/// may be running too: it is renamed aside into a kept `.replaced-*` folder beside the
-/// scratch, never removed with it. A rename that fails because another run placed the same
-/// pin meanwhile is no failure when `complete()` holds.
+/// already holds: another run placed the same pin, and its tree, which may be running,
+/// stays. Anything else at `dest` may be running too, so it is renamed aside into a kept
+/// `.replaced-*` folder beside the scratch, never removed. A rename that loses a race to
+/// another run placing the same pin is no failure when `complete()` holds.
 pub(super) fn place(
     scratch: &Scratch,
     tree: &Path,

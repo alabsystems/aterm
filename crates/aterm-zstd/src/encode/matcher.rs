@@ -26,7 +26,8 @@ pub(crate) struct Search {
     pub(crate) chain_log: u32,
     /// Chain links followed per search.
     pub(crate) depth: u32,
-    /// 0 takes the first match found; 1 or 2 also try the next one or two positions.
+    /// 0 takes the best match at the first position that has one; 1 or 2 also try the next
+    /// one or two positions.
     pub(crate) lazy: u8,
     /// A match this long ends the search and the lazy steps.
     pub(crate) target: usize,
@@ -40,7 +41,7 @@ pub(crate) struct Matcher {
     chain_mask: u32,
     /// The first position not yet inserted.
     next: u32,
-    /// The two most recent distances, the first tried at each position.
+    /// The two most recent distances, tried first at each position.
     reps: [u32; 2],
 }
 
@@ -312,7 +313,7 @@ fn hash4(h: &[u8], i: usize, log: u32) -> usize {
 
 /// How many bytes from `h[a..]` equal those from `h[b..]` (`a < b`), at most `max`.
 #[inline]
-fn common(h: &[u8], a: usize, b: usize, max: usize) -> usize {
+pub(crate) fn common(h: &[u8], a: usize, b: usize, max: usize) -> usize {
     let (Some(x), Some(y)) = (h.get(a..a + max), h.get(b..b + max)) else {
         return 0;
     };

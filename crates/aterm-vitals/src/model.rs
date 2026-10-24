@@ -60,9 +60,10 @@ pub struct ProcSample {
     pub at_ns: Option<u64>,
     /// macOS resource coalition ID (read on split ticks only).
     pub coalition: Option<u64>,
-    /// macOS pid version (`p_idversion`), which a new process and each exec take anew (read on split ticks only).
+    /// macOS pid version (`p_idversion`), new at each process and exec (read on split ticks only).
     pub version: Option<i32>,
-    /// Process start time in Unix ms.
+    /// When it started, unix ms (a fork's time, which an exec keeps); the host reads it on
+    /// every whole reading (one with a sweep), `None` where unread.
     pub birth_ms: Option<i64>,
 }
 
@@ -192,6 +193,14 @@ impl Pressure {
             _ => return None,
         })
     }
+
+    /// The level a kept [`Self::rank`] stands for: the worst whose rank it reaches.
+    fn of_rank(rank: f64) -> Self {
+        [Self::Critical, Self::Warn]
+            .into_iter()
+            .find(|p| p.rank().is_some_and(|r| rank >= f64::from(r)))
+            .unwrap_or(Self::Normal)
+    }
 }
 
 /// The VM's cumulative counters (two readings give rates).
@@ -242,7 +251,8 @@ pub const THRASH_SWAP_KIB_S: f64 = 4096.0;
 pub struct MemSample {
     /// Physical memory.
     pub total: u64,
-    /// Process memory in bytes (macOS anonymous minus purgeable; Linux anon + shmem; Windows in-use minus pools).
+    /// Process memory in bytes (macOS anonymous minus purgeable; Linux anon + shmem; Windows
+    /// in-use minus pools).
     pub app: u64,
     /// Non-pageable kernel/wired memory in bytes.
     pub wired: u64,
@@ -266,7 +276,8 @@ pub struct MemSample {
     pub commit: Option<CommitSample>,
 }
 
-/// Promised virtual memory charge against the system commit limit (enforced on Windows, advisory on Linux).
+/// Virtual memory promised against the system commit limit (enforced on Windows, advisory on
+/// Linux).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CommitSample {
     /// Committed bytes.
@@ -549,7 +560,8 @@ impl TcpCounts {
         self.syn_sent.saturating_add(self.syn_recv)
     }
 
-    /// Sockets in teardown states (`FIN_WAIT1 + FIN_WAIT2 + TIME_WAIT + CLOSE_WAIT + LAST_ACK + CLOSING`).
+    /// Sockets in teardown states: `FIN_WAIT1`, `FIN_WAIT2`, `TIME_WAIT`, `CLOSE_WAIT`,
+    /// `LAST_ACK` and `CLOSING`.
     #[must_use]
     pub const fn closing_total(&self) -> u32 {
         self.fin_wait1
@@ -587,7 +599,7 @@ pub struct LinkRates {
 pub struct LinkView {
     /// Cumulative counters and attributes from this reading.
     pub sample: LinkSample,
-    /// Per-second rates over the last sample window (`None` on first reading or after counter reset).
+    /// Per-second rates over the last sample window (`None` on a first reading or a counter reset).
     pub rates: Option<LinkRates>,
 }
 
@@ -596,7 +608,7 @@ pub struct LinkView {
 pub struct NetView {
     /// Every interface read on this sample, in probe order.
     pub links: Vec<LinkView>,
-    /// Aggregate rates summed across counted (`counts == true`) interfaces over the last sample window.
+    /// Rates summed across counted (`counts == true`) interfaces over the last sample window.
     pub rates: Option<LinkRates>,
     /// Sample window duration in nanoseconds when `rates` is present.
     pub window_ns: Option<u64>,
@@ -827,6 +839,9 @@ pub struct MemView {
     pub used_gib: TrendView,
     /// Used GiB over the last two minutes.
     pub history: Vec<Option<f32>>,
+    /// The pressure over the same seconds as `history`, second for second: the worst level read
+    /// in each (a short silence filled as `history` fills it), `None` where none was read.
+    pub pressure_history: Vec<Option<Pressure>>,
     /// Paging per second; `None` until two readings with counters exist.
     pub rates: Option<MemRates>,
 }
@@ -876,9 +891,8 @@ impl ScopeView {
     }
 
     /// This scope and `other`, a disjoint one read in the same sweeps (two panes of one tab), as
-    /// one: counts, figures and their averages add, a figure only one of them read is that
-    /// one's, and the busier top process is the pair's. The variance (`mad`) adds too, a bound
-    /// on the sum's own.
+    /// one: counts, figures and averages add (`mad` too, as a bound), a figure only one of them
+    /// read is that one's, and the busier top process wins.
     #[must_use]
     pub fn sum(&self, other: &Self) -> Self {
         let trend = |a: TrendView, b: TrendView| TrendView {
@@ -984,9 +998,12 @@ pub struct ProcView {
     pub refused: bool,
     /// Its GPU share of the device (`1.0` the whole GPU), while client shares are held.
     pub gpu: Option<f32>,
+    /// When it started, unix ms ([`ProcSample::birth_ms`]); `None` where unread.
+    pub birth_ms: Option<i64>,
 }
 
-/// Breakdown of busy CPU cores across `aterm`, other user processes, and system/unattributed services.
+/// Busy CPU cores split across aterm, the user's other processes, and system or unattributed
+/// services.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Split {
     /// The machine's busy cores-worth (the cores' own ticks).
@@ -1019,7 +1036,7 @@ pub struct TabView {
 }
 
 /// Which scope a busy process is attributed to ([`Snapshot::top`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProcScope {
     /// One of this instance's tabs, by its key ([`TabRoot::tab`]): a process in any pane of a
     /// split tab is that tab's, so its rows group and its busiest program stays named as one.
@@ -1054,6 +1071,88 @@ pub struct Busiest {
     pub n: usize,
     /// Whose they all are; `None` when they differ.
     pub scope: Option<ProcScope>,
+    /// The earliest birth read among them, unix ms; `None` when none was read.
+    pub born_ms: Option<i64>,
+    /// How many of them have no birth read, any of whom may be older than [`Self::born_ms`].
+    pub unborn: usize,
+}
+
+/// One program in one scope: every process of the sweep sharing its short name and its
+/// innermost scope ([`Snapshot::programs`]), idle ones too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramGroup {
+    /// The short name they share, as the processes chose it (data, never an instruction).
+    pub name: String,
+    /// The scope they all count in.
+    pub scope: ProcScope,
+    /// How many processes.
+    pub n: u32,
+    /// Their cores-worth over the sweep interval, summed (a process with no rate counts 0).
+    pub cores: f32,
+    /// Their footprints, summed over those read; `None` when none was.
+    pub footprint: Option<u64>,
+    /// The earliest birth read among them, unix ms; `None` when none was.
+    pub born_ms: Option<i64>,
+    /// How many of them have no birth read, any of whom may be older than [`Self::born_ms`].
+    pub unborn: u32,
+}
+
+impl ProgramGroup {
+    fn new(name: &str, scope: ProcScope) -> Self {
+        Self {
+            name: name.to_owned(),
+            scope,
+            n: 0,
+            cores: 0.0,
+            footprint: None,
+            born_ms: None,
+            unborn: 0,
+        }
+    }
+
+    fn add(&mut self, cores: f32, footprint: Option<u64>, birth_ms: Option<i64>) {
+        self.n += 1;
+        self.cores += cores;
+        if let Some(f) = footprint {
+            self.footprint = Some(self.footprint.unwrap_or(0).saturating_add(f));
+        }
+        match birth_ms {
+            Some(b) => self.born_ms = earliest(self.born_ms, Some(b)),
+            None => self.unborn += 1,
+        }
+    }
+
+    /// Its oldest member's age at `at_unix_ms` (0 for a birth after it, as a wall-clock step
+    /// can make), ms; `None` when no member's birth was read, never 0 for that. A lower bound
+    /// while [`Self::unborn`] is above 0.
+    #[must_use]
+    pub fn age_ms(&self, at_unix_ms: i64) -> Option<u64> {
+        age_at(self.born_ms, at_unix_ms)
+    }
+}
+
+impl ProcView {
+    /// Its age at `at_unix_ms`, ms ([`ProgramGroup::age_ms`]'s terms).
+    #[must_use]
+    pub fn age_ms(&self, at_unix_ms: i64) -> Option<u64> {
+        age_at(self.birth_ms, at_unix_ms)
+    }
+}
+
+impl Busiest {
+    /// Its oldest busy member's age at `at_unix_ms`, ms ([`ProgramGroup::age_ms`]'s terms).
+    #[must_use]
+    pub fn age_ms(&self, at_unix_ms: i64) -> Option<u64> {
+        age_at(self.born_ms, at_unix_ms)
+    }
+}
+
+fn earliest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    a.into_iter().chain(b).min()
+}
+
+fn age_at(born_ms: Option<i64>, at_unix_ms: i64) -> Option<u64> {
+    born_ms.map(|b| u64::try_from(at_unix_ms.saturating_sub(b)).unwrap_or(0))
 }
 
 /// Processes [`Snapshot::top`] keeps.
@@ -1121,7 +1220,8 @@ impl Resource {
 
     /// Whether a scope's figure is in the row's own unit, and so a share of the row's capacity:
     /// busy cores, memory, tokens per minute and processes. A scope's Disk figure is a write rate
-    /// beside the volume's used bytes, and GPU and Network keep no figure per scope.
+    /// beside the volume's used bytes, Network keeps no figure per scope, and GPU keeps one only
+    /// while client reads are held.
     #[must_use]
     pub const fn scope_shares_capacity(self) -> bool {
         match self {
@@ -1187,7 +1287,7 @@ pub enum CapBasis {
 }
 
 impl CapBasis {
-    /// Maximum heat fraction for this basis (`1.5` for `Fixed`, `1.0` for `Peak`/`Link`).
+    /// Maximum heat fraction for this basis (`1.0` for `Peak` and `Link`, unbounded otherwise).
     #[must_use]
     pub fn heat_ceiling(self) -> f32 {
         match self {
@@ -1221,7 +1321,7 @@ pub struct ScopeFig {
     /// The newest [`SCOPE_RUN_BUCKETS`] of the scope's 10 s cells, oldest first, raw; empty where
     /// the scope never read this row.
     pub run: Arc<[Cell]>,
-    /// Bucket index of the last cell in `run` (covering Unix seconds `[10 * run_k, 10 * run_k + 10)`).
+    /// Bucket index of the last cell in `run` (Unix seconds `[10 * run_k, 10 * run_k + 10)`).
     pub run_k: i64,
 }
 
@@ -1234,11 +1334,10 @@ impl ScopeFig {
     }
 
     /// One tab's figure from its panes' `figs`, each a scope inside `within` (all tabs): `now`
-    /// and each run cell's mean add over the panes that read them, so a bucket no pane read
-    /// stays hollow and a pane opened mid-run counts only where it read. A cell's max adds
-    /// too, an upper bound where the panes peaked at different readings. Each figure is held
-    /// at `within`'s, so this tab stays inside all tabs; that binds only on GPU, whose scope
-    /// figures are each held at the Mac's and so can sum past it. One pane's is its own.
+    /// and each run cell's mean and max (an upper bound) add over the panes that read them, so a
+    /// bucket no pane read stays hollow. Each figure is held at `within`'s so the tab stays inside
+    /// all tabs; that binds only on GPU, whose pane figures are each held at the Mac's and so can
+    /// sum past it. One pane's is its own.
     fn sum(figs: &[&Self], within: &Self) -> Self {
         if let [one] = figs {
             return (*one).clone();
@@ -1298,7 +1397,7 @@ pub struct Series {
     pub now: Option<f64>,
     /// Its capacity now, raw; `None` where unknown.
     pub capacity: Option<f64>,
-    /// One hour of 10 s cells, oldest first (last cell is the open bucket [`ResourceView::ring_k`]).
+    /// One hour of 10 s cells, oldest first; the last is the open bucket [`ResourceView::ring_k`].
     pub ring: Arc<[Cell]>,
     /// Whether this series binds now (its share of capacity is the row's).
     pub binds: bool,
@@ -1319,8 +1418,11 @@ pub struct ResourceView {
     pub state: Option<State>,
     /// The hour of 10 s cells, oldest first, raw.
     pub ring: Arc<[Cell]>,
-    /// Bucket index of the last cell in `ring` (covering Unix seconds `[10 * ring_k, 10 * ring_k + 10)`).
+    /// Bucket index of the last cell in `ring` (Unix seconds `[10 * ring_k, 10 * ring_k + 10)`).
     pub ring_k: i64,
+    /// Memory's pressure, cell for cell with `ring`: the worst level read in each bucket, `None`
+    /// (hollow) where none was read; empty on every other row ([`Self::pressure_columns`]).
+    pub pressure: Arc<[Option<Pressure>]>,
     /// aterm's figure.
     pub aterm: ScopeFig,
     /// Scope figure for the requested tab (or an empty tab in [`Snapshot::resources`]).
@@ -1349,6 +1451,33 @@ impl ResourceView {
     #[must_use]
     pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
         columns_of(&self.ring, self.ring_k, per_s, ncols, now_unix_ms)
+    }
+
+    /// Memory's pressure in [`Self::columns`]' columns, column for column: the worst level read
+    /// in each column's buckets, `None` (hollow) where none was read or the row keeps none.
+    #[must_use]
+    pub fn pressure_columns(
+        &self,
+        per_s: u32,
+        ncols: usize,
+        now_unix_ms: i64,
+    ) -> Vec<Option<Pressure>> {
+        let cells: Vec<Cell> = self
+            .pressure
+            .iter()
+            .map(|p| {
+                let r = p.and_then(Pressure::rank).map(f64::from);
+                Cell {
+                    mean: r,
+                    max: r,
+                    over: false,
+                }
+            })
+            .collect();
+        columns_of(&cells, self.ring_k, per_s, ncols, now_unix_ms)
+            .into_iter()
+            .map(|c| c.max.map(Pressure::of_rank))
+            .collect()
     }
 
     /// Resample the 1-hour ring into `ncols` heat columns at `per_s` seconds per column.
@@ -1509,7 +1638,7 @@ pub struct RowFacts {
     pub proc_limits: ProcLimits,
 }
 
-/// ONE ACCOUNT'S WEEKLY PLAN FIGURE over the [`PEAK_DAYS`] days ending today, a point a day:
+/// One account's weekly plan figure over the [`PEAK_DAYS`] days ending today, a point a day:
 /// the front tab's account's where a pane of it runs under one, else the account read most
 /// recently. A day with no row was not read; the day the week reset has two rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1615,8 +1744,12 @@ pub struct Snapshot {
     pub cores_window_ns: Option<u64>,
     /// Busy CPU breakdown across scopes, once two full sweeps and core ticks are available.
     pub split: Option<Split>,
-    /// Process rows: `aterm` processes (up to [`ATERM_ROWS`]) plus top [`TOP_ROWS`] by CPU and footprint.
+    /// Process rows: aterm's (up to [`ATERM_ROWS`]), the top [`TOP_ROWS`] by CPU and by
+    /// footprint, and every other process with a GPU share.
     pub procs: Vec<ProcView>,
+    /// Programs by scope, busiest first: every aterm and tab group (up to [`ATERM_ROWS`]) plus
+    /// the machine's top [`TOP_ROWS`] by CPU and, separately, by footprint.
+    pub programs: Vec<ProgramGroup>,
     /// Whether the process sweep stopped at its cap.
     pub procs_truncated: bool,
     /// The thermal state, where read.
@@ -1670,8 +1803,8 @@ impl Snapshot {
         })
     }
 
-    /// Return [`ResourceView`] for `res` with the [`ScopeFig`] of the tab whose panes are the
-    /// sessions `panes` attached ([`ScopeFig::sum`] over the ones the row holds).
+    /// The [`ResourceView`] for `res`, its `tab` the summed figures of the sessions `panes` (one
+    /// tab's split panes) that the row holds.
     #[must_use]
     pub fn resource(&self, res: Resource, panes: &[u64]) -> ResourceView {
         let mut v = self.resources[res.index()].clone();
@@ -1927,6 +2060,8 @@ struct ProcPass {
     figs: Option<SweepFigs>,
     /// `sys procs`' rows ([`keep_rows`]).
     rows: Vec<ProcView>,
+    /// [`Snapshot::programs`] ([`keep_programs`]).
+    programs: Vec<ProgramGroup>,
     /// `(aterm_cores, user_other_cores, cpu_unreadable_count)` for [`Split`].
     split_parts: Option<(f32, f32, u32)>,
     /// `(aterm, others, services)` GPU shares for [`crate::gpu_clients::GpuSplit`].
@@ -1946,6 +2081,9 @@ struct Rows {
     net_tx: BucketRing,
     /// Processes run by this user.
     yours: BucketRing,
+    /// Memory pressure's rank ([`Pressure::rank`]), pushed beside Memory's ring: a bucket's
+    /// largest reading is the worst level read in it.
+    pressure: BucketRing,
     /// Last known fixed capacity per row.
     caps: [Option<f64>; 7],
     /// aterm's figures' hour, by row.
@@ -2020,6 +2158,8 @@ pub struct Vitals {
     gpu_history: History,
     mem: Trend,
     mem_history: History,
+    /// The pressure's rank each second, beside `mem_history` ([`History::push_worst_at`]).
+    pressure_history: History,
     last_counters: Option<(u64, MemCounters)>,
     last_sweep_at: Option<u64>,
     last_cpu: HashMap<u32, (Option<u64>, u64)>,
@@ -2067,7 +2207,7 @@ impl Vitals {
         self.seq
     }
 
-    /// Inject a fault into scope-balance attribution or the cause engine for negative-control testing.
+    /// Inject a fault into scope-balance attribution or the cause engine, for negative controls.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn with_fault(mut self, fault: crate::explain::Fault) -> Self {
@@ -2136,6 +2276,8 @@ impl Vitals {
             self.mem.push(used, mem_dt_s);
             self.last_mem_at = Some(s.at_ns);
             self.mem_history.push_at(Some(used), s.at_ns);
+            self.pressure_history
+                .push_worst_at(m.pressure.rank().map(f32::from), s.at_ns);
             let rates = m.counters.and_then(|now| {
                 let before = self.last_counters.replace((s.at_ns, now));
                 let (then_ns, then) = before?;
@@ -2148,10 +2290,17 @@ impl Vitals {
                 sample: m,
                 used_gib: self.mem.view(),
                 history: self.mem_history.to_vec(),
+                pressure_history: self
+                    .pressure_history
+                    .to_vec()
+                    .into_iter()
+                    .map(|r| r.map(|r| Pressure::of_rank(f64::from(r))))
+                    .collect(),
                 rates,
             })
         } else {
             self.mem_history.push_at(None, s.at_ns);
+            self.pressure_history.push_worst_at(None, s.at_ns);
             None
         };
 
@@ -2232,6 +2381,7 @@ impl Vitals {
             cores_window_ns,
             split,
             procs: pass.rows,
+            programs: pass.programs,
             procs_truncated: s.procs_truncated,
             thermal: s.thermal,
             load: s.load,
@@ -2390,6 +2540,8 @@ impl Vitals {
         let mut writers: Vec<Writer> = Vec::new();
         let mut groups: Vec<Busiest> = Vec::new();
         let mut group_of: HashMap<&str, usize> = HashMap::new();
+        let mut programs: Vec<ProgramGroup> = Vec::new();
+        let mut program_of: HashMap<(ProcScope, &str), usize> = HashMap::new();
         for (index, ((p, m), r)) in procs
             .iter()
             .zip(membership.iter())
@@ -2458,6 +2610,8 @@ impl Vitals {
                         if g.scope != Some(scope) {
                             g.scope = None;
                         }
+                        g.born_ms = earliest(g.born_ms, p.birth_ms);
+                        g.unborn += usize::from(p.birth_ms.is_none());
                     }
                     None => {
                         group_of.insert(&p.name, groups.len());
@@ -2466,10 +2620,19 @@ impl Vitals {
                             cores,
                             n: 1,
                             scope: Some(scope),
+                            born_ms: p.birth_ms,
+                            unborn: usize::from(p.birth_ms.is_none()),
                         });
                     }
                 }
             }
+            let program = *program_of
+                .entry((scope(), p.name.as_str()))
+                .or_insert_with(|| {
+                    programs.push(ProgramGroup::new(&p.name, scope()));
+                    programs.len() - 1
+                });
+            programs[program].add(cores, p.footprint, p.birth_ms);
             if m.aterm {
                 aterm_acc.add(p, r);
             }
@@ -2514,6 +2677,7 @@ impl Vitals {
                 scope: row_scope,
                 refused: p.cpu_ns.is_none(),
                 gpu: r.gpu,
+                birth_ms: p.birth_ms,
             });
         }
         global.top = global_acc.top.clone();
@@ -2578,6 +2742,7 @@ impl Vitals {
                 busiest,
             }),
             rows: keep_rows(rows),
+            programs: keep_programs(programs),
             split_parts: ownership_known.then_some((aterm_cores, others, global_acc.refused)),
             gpu_parts,
             window_ns: Some(wall_ns),
@@ -2661,6 +2826,32 @@ fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
     mine
 }
 
+fn busiest_program_first(a: &ProgramGroup, b: &ProgramGroup) -> std::cmp::Ordering {
+    b.cores
+        .total_cmp(&a.cores)
+        .then(b.footprint.unwrap_or(0).cmp(&a.footprint.unwrap_or(0)))
+        .then(a.name.cmp(&b.name))
+}
+
+/// [`Snapshot::programs`]' bound, as [`keep_rows`] bounds the rows: every aterm and tab group
+/// up to [`ATERM_ROWS`], and of the machine's others the [`TOP_ROWS`] busiest and the
+/// [`TOP_ROWS`] largest of the rest.
+fn keep_programs(groups: Vec<ProgramGroup>) -> Vec<ProgramGroup> {
+    let (mut kept, mut rest): (Vec<ProgramGroup>, Vec<ProgramGroup>) = groups
+        .into_iter()
+        .partition(|g| g.scope != ProcScope::Other);
+    kept.sort_by(busiest_program_first);
+    kept.truncate(ATERM_ROWS);
+    rest.sort_by(busiest_program_first);
+    let mut by_foot = rest.split_off(rest.len().min(TOP_ROWS));
+    by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
+    by_foot.truncate(TOP_ROWS);
+    kept.extend(rest);
+    kept.extend(by_foot);
+    kept.sort_by(busiest_program_first);
+    kept
+}
+
 impl Rows {
     fn absorb(
         &mut self,
@@ -2720,6 +2911,8 @@ impl Rows {
         }
         let mem_over = facts.swap_rate.is_some_and(|r| r >= SWAP_OVER_BPS);
         self.rings[Memory.index()].push(now, mem.map(|m| m.used() as f64), mem_over);
+        let pressure = mem.and_then(|m| m.pressure.rank()).map(f64::from);
+        self.pressure.push(now, pressure, false);
 
         let vol = s.volume.as_ref().filter(|v| v.total > 0);
         if let Some(v) = vol {
@@ -2885,6 +3078,15 @@ impl Rows {
                 Disk => disk_state,
                 _ => None,
             };
+            if res == Memory {
+                view.pressure = ring
+                    .iter()
+                    .map(|(k, _)| {
+                        let worst = self.pressure.bucket(k).and_then(|b| b.cell().max);
+                        worst.map(Pressure::of_rank)
+                    })
+                    .collect();
+            }
             view.aterm = fig(Some(&self.aterm), res, tokens.agents > 0);
             view.tab = fig(None, res, false);
             view.tabs = s
@@ -3144,8 +3346,7 @@ fn net_capacity(
     }
 }
 
-/// The [`PlanRun`] of `peaks`' weeks on `today`: the front tab's account's week
-/// ([`WeekFact::front`]) where one is kept, else the week read most recently.
+/// The [`PlanRun`] of `peaks`' weeks on `today`.
 fn plan_run(peaks: &Peaks, weeks: &[WeekFact], today: u32) -> Option<PlanRun> {
     let front = weeks
         .iter()
@@ -3743,12 +3944,169 @@ mod tests {
             (b.name.as_str(), b.n, b.scope),
             ("rustc", 9, Some(ProcScope::Tab(7)))
         );
+        assert_eq!((b.born_ms, b.unborn), (None, 9), "no birth read, never 0");
         assert!((b.cores - 5.4).abs() < 1e-4, "{b:?}");
         let mut mixed = procs(1_200, 4_000);
         mixed[3].ppid = 1;
         let s = v.absorb(&sample(12, &[0, 0, 200, 200], mixed));
         let b = s.facts.busiest.expect("a busy program");
         assert_eq!((b.n, b.scope), (9, None));
+    }
+
+    /// A PROGRAM'S AGE IS ITS OLDEST MEMBER'S, WITHIN ITS SCOPE: nine rustc in Tab 1 born a
+    /// minute apart and two older rustc outside aterm are two groups, and the tab's age is its
+    /// own oldest member's though that one sits idle. The busiest program's birth is its busy
+    /// members' earliest. NEGATIVE CONTROLS: a member with no birth read counts as unborn and
+    /// leaves the others' oldest; a group with none read has no age, never 0; a birth after the
+    /// reading (a wall-clock step) reads 0, not a wrap.
+    #[test]
+    fn a_program_groups_age_is_its_oldest_members_within_its_scope() {
+        const T0: i64 = 1_790_000_000_000;
+        const MIN: i64 = 60_000;
+        let born = |p: ProcSample, birth_ms: Option<i64>| ProcSample { birth_ms, ..p };
+        let procs = |rustc_ms: u64, other_ms: u64, unread_ms: u64| {
+            let mut p = vec![
+                proc(100, 1, 0, 200, "aterm"),
+                proc(200, 100, 0, 5, "zsh"),
+                born(proc(201, 200, 0, 300, "cargo"), Some(T0 - MIN)),
+            ];
+            p.extend((0..9u32).map(|i| {
+                let cpu = if i == 0 { 0 } else { rustc_ms };
+                let p = proc(300 + i, 201, cpu, 100, "rustc");
+                born(p, Some(T0 + i64::from(i) * MIN))
+            }));
+            p.push(born(
+                proc(900, 1, other_ms, 50, "rustc"),
+                Some(T0 - 60 * MIN),
+            ));
+            p.push(born(proc(901, 1, unread_ms, 50, "rustc"), None));
+            p.push(born(proc(950, 1, 0, 10, "mds"), None));
+            p
+        };
+        let at = T0 + 47 * MIN;
+        let reading = |at_s: u64, busy: &[u64], procs: Vec<ProcSample>, at_unix_ms: i64| Sample {
+            at_unix_ms,
+            ..sample(at_s, busy, procs)
+        };
+        let mut v = Vitals::new();
+        let _ = v.absorb(&reading(10, &[0, 0, 0, 0], procs(0, 0, 0), at - 1000));
+        let s = v.absorb(&reading(11, &[0, 0, 100, 100], procs(600, 600, 0), at));
+        let group = |s: &Snapshot, name: &str, scope: ProcScope| {
+            s.programs
+                .iter()
+                .find(|g| g.name == name && g.scope == scope)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} in {scope:?}: {:?}", s.programs))
+        };
+        let tab = group(&s, "rustc", ProcScope::Tab(7));
+        assert_eq!((tab.n, tab.born_ms, tab.unborn), (9, Some(T0), 0));
+        assert_eq!(tab.age_ms(at), Some(47 * 60_000), "its idle oldest counts");
+        assert!((tab.cores - 4.8).abs() < 1e-4, "{tab:?}");
+        assert_eq!(tab.footprint, Some(900 << 20));
+        let other = group(&s, "rustc", ProcScope::Other);
+        assert_eq!(
+            (other.n, other.born_ms, other.unborn),
+            (2, Some(T0 - 60 * MIN), 1),
+            "its own scope; the unread member is unborn"
+        );
+        let mds = group(&s, "mds", ProcScope::Other);
+        assert_eq!((mds.born_ms, mds.unborn, mds.age_ms(at)), (None, 1, None));
+        assert_eq!(tab.age_ms(T0 - 1), Some(0), "a birth after the reading");
+        assert_eq!(
+            group(&s, "cargo", ProcScope::Tab(7)).born_ms,
+            Some(T0 - MIN)
+        );
+        assert_eq!(
+            s.programs[0].name, "rustc",
+            "busiest first: {:?}",
+            s.programs
+        );
+        assert_eq!(
+            s.procs
+                .iter()
+                .find(|p| p.pid == 305)
+                .and_then(|p| p.age_ms(at)),
+            Some(42 * 60_000),
+            "a row carries its birth"
+        );
+        let b = s.facts.busiest.clone().expect("a busy program");
+        assert_eq!(
+            (b.name.as_str(), b.n, b.scope, b.born_ms, b.unborn),
+            ("rustc", 9, None, Some(T0 - 60 * MIN), 0)
+        );
+        let s = v.absorb(&reading(
+            12,
+            &[0, 0, 200, 200],
+            procs(1_200, 600, 0),
+            at + 1000,
+        ));
+        let b = s.facts.busiest.expect("a busy program");
+        assert_eq!(
+            (b.n, b.scope, b.born_ms, b.unborn, b.age_ms(at + 1000)),
+            (
+                8,
+                Some(ProcScope::Tab(7)),
+                Some(T0 + MIN),
+                0,
+                Some(46 * 60_000 + 1000)
+            ),
+            "its busy members' earliest: the idle oldest and the idle outsider are not busy"
+        );
+        let s = v.absorb(&reading(
+            13,
+            &[0, 0, 300, 300],
+            procs(1_800, 600, 600),
+            at + 2000,
+        ));
+        let b = s.facts.busiest.expect("a busy program");
+        assert_eq!(
+            (b.n, b.scope, b.born_ms, b.unborn),
+            (9, None, Some(T0 + MIN), 1),
+            "a busy member whose birth went unread is counted unborn"
+        );
+    }
+
+    #[test]
+    fn the_programs_kept_are_every_aterm_group_and_the_machines_busiest_and_largest() {
+        let group = |name: String, scope, cores: f32, footprint: usize| ProgramGroup {
+            name,
+            scope,
+            n: 1,
+            cores,
+            footprint: Some(footprint as u64),
+            born_ms: None,
+            unborn: 1,
+        };
+        let mut all: Vec<ProgramGroup> = (0..3 * TOP_ROWS)
+            .map(|i| {
+                let cores = i as f32 / 100.0;
+                group(
+                    format!("other{i}"),
+                    ProcScope::Other,
+                    cores,
+                    3 * TOP_ROWS - i,
+                )
+            })
+            .collect();
+        all.extend((0..5).map(|i| group(format!("tab{i}"), ProcScope::Tab(7), 0.0, 1)));
+        all.push(group("aterm".into(), ProcScope::Aterm, 0.0, 0));
+        let kept = keep_programs(all);
+        let ours = kept.iter().filter(|g| g.scope != ProcScope::Other).count();
+        assert_eq!(ours, 6, "every aterm and tab group");
+        let others: Vec<&str> = kept
+            .iter()
+            .filter(|g| g.scope == ProcScope::Other)
+            .map(|g| g.name.as_str())
+            .collect();
+        assert_eq!(others.len(), 2 * TOP_ROWS);
+        let busiest = format!("other{}", 3 * TOP_ROWS - 1);
+        assert_eq!(kept[0].name, busiest, "busiest first");
+        assert!(others.contains(&"other0"), "the largest of the rest");
+        let neither = format!("other{}", TOP_ROWS + 5);
+        assert!(
+            !others.contains(&neither.as_str()),
+            "neither busy nor large"
+        );
     }
 
     #[test]
@@ -4385,6 +4743,170 @@ mod tests {
         assert_eq!(s.resource(Memory, &[99]).aterm, mem.aterm);
     }
 
+    /// A reading at `t_ms` whose memory is `(GiB in use, pressure)`; `None` reads no memory.
+    fn pressed(t_ms: u64, cadence_ms: u32, reading: Option<(u64, Pressure)>) -> Sample {
+        let mut s = at(t_ms, cadence_ms);
+        match reading {
+            Some((used_gib, pressure)) => {
+                let m = s.mem.as_mut().expect("the rig reads memory");
+                m.app = used_gib << 30;
+                m.pressure = pressure;
+            }
+            None => s.mem = None,
+        }
+        s
+    }
+
+    #[test]
+    fn memory_keeps_the_worst_pressure_of_each_bucket_and_an_unread_bucket_hollow() {
+        use Pressure::{Critical, Normal, Unknown, Warn};
+        let reading = |t: u64| match t {
+            3 => Some(Critical),
+            5 | 40 => Some(Warn),
+            30..40 => Some(Unknown),
+            41 => None,
+            _ => Some(Normal),
+        };
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in (0..43u64).filter(|t| !(20..30).contains(t)) {
+            s = v.absorb(&pressed(t * 1000, 1000, reading(t).map(|p| (8, p))));
+        }
+        let mem = &s.resources[Memory.index()];
+        assert_eq!(
+            means(&mem.ring)
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            [true, true, false, true, true],
+            "the run behind it"
+        );
+        assert_eq!(
+            *mem.pressure,
+            [Some(Critical), Some(Normal), None, None, Some(Warn)],
+            "the worst of 0-9 s is its one critical reading; 20-29 s read nothing; 30-39 s read \
+             memory but no pressure; 40-42 s keeps its warn past an unread and a normal reading"
+        );
+    }
+
+    #[test]
+    fn memory_pressure_keeps_two_minutes_second_for_second_beside_used() {
+        use Pressure::{Critical, Normal, Unknown};
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for i in 0..40u64 {
+            let p = match i {
+                5 => Some(Critical),
+                8 | 9 => Some(Unknown),
+                12..32 | 34 | 35 => None,
+                _ => Some(Normal),
+            };
+            s = v.absorb(&pressed(i * 500, 500, p.map(|p| (8, p))));
+        }
+        let m = s.mem.as_ref().expect("memory read last");
+        assert_eq!(
+            m.pressure_history.len(),
+            m.history.len(),
+            "the same seconds"
+        );
+        assert_eq!(m.pressure_history.len(), 20);
+        assert_eq!(
+            m.pressure_history[2],
+            Some(Critical),
+            "a second keeps its worst"
+        );
+        assert_eq!(
+            m.pressure_history[4], None,
+            "memory but no pressure is hollow"
+        );
+        assert!(
+            m.pressure_history[6..16].iter().all(Option::is_none),
+            "a long silence is hollow, never normal"
+        );
+        assert_eq!(
+            (m.history[17], m.pressure_history[17]),
+            (None, None),
+            "a second read without memory between two normal ones is hollow, not filled"
+        );
+        assert_eq!(m.pressure_history[19], Some(Normal));
+    }
+
+    #[test]
+    fn memory_pressure_columns_align_with_the_runs_columns() {
+        use Pressure::{Critical, Normal, Warn};
+        let level = |t: u64| match t / 10 {
+            7 => Critical,
+            18 | 19 => Warn,
+            _ => Normal,
+        };
+        // Used memory rises with the level, so the largest reading in a run's column names the
+        // worst level its buckets read: a column-for-column oracle that knows no column edge.
+        let used = |p: Pressure| match p {
+            Critical => 16,
+            Warn => 12,
+            _ => 8,
+        };
+        let worst_of = |max: Option<f64>| {
+            max.map(|b| {
+                [Critical, Warn, Normal]
+                    .into_iter()
+                    .find(|&p| b >= (used(p) << 30) as f64)
+                    .unwrap_or(Normal)
+            })
+        };
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in (0..400u64).filter(|t| !(250..275).contains(t)) {
+            s = v.absorb(&pressed(t * 1000, 1000, Some((used(level(t)), level(t)))));
+        }
+        let mem = &s.resources[Memory.index()];
+        assert_eq!(mem.pressure.len(), mem.ring.len(), "one level per run cell");
+        assert_eq!(mem.ring.len(), 40);
+        for (i, (cell, p)) in mem.ring.iter().zip(mem.pressure.iter()).enumerate() {
+            assert_eq!(*p, worst_of(cell.max), "cell {i}");
+        }
+        for (per, n) in [(10, 60), (20, 30), (30, 20), (60, 10), (60, 60)] {
+            let cols = mem.columns(per, n, s.at_unix_ms);
+            let worst = mem.pressure_columns(per, n, s.at_unix_ms);
+            let want: Vec<_> = cols.iter().map(|c| worst_of(c.max)).collect();
+            assert_eq!(worst, want, "{per} s columns");
+            for p in [Some(Critical), Some(Warn), Some(Normal), None] {
+                assert!(worst.contains(&p), "{per} s: {p:?} drawn");
+            }
+        }
+        assert_eq!(
+            mem.pressure_columns(10, 60, s.at_unix_ms)[45..47],
+            [None, None],
+            "250-269 s read nothing"
+        );
+    }
+
+    #[test]
+    fn without_a_pressure_reading_the_pressure_run_is_hollow_never_normal() {
+        let mut v = Vitals::new();
+        let mut s = Snapshot::default();
+        for t in 0..95u64 {
+            s = v.absorb(&pressed(t * 1000, 1000, Some((8, Pressure::Unknown))));
+        }
+        let mem = &s.resources[Memory.index()];
+        assert!(mem.ring.iter().all(|c| c.mean.is_some()), "memory is read");
+        assert_eq!(mem.pressure.len(), mem.ring.len());
+        assert!(mem.pressure.iter().all(Option::is_none));
+        let m = s.mem.as_ref().expect("memory");
+        assert_eq!(m.pressure_history.len(), m.history.len());
+        assert!(m.pressure_history.iter().all(Option::is_none));
+        for res in Resource::ALL {
+            let r = &s.resources[res.index()];
+            assert!(res == Memory || r.pressure.is_empty(), "{res:?} keeps none");
+            assert!(
+                r.pressure_columns(10, 60, s.at_unix_ms)
+                    .iter()
+                    .all(Option::is_none),
+                "{res:?}"
+            );
+        }
+    }
+
     #[test]
     fn hidden_reads_fill_global_rows() {
         let mut v = Vitals::new();
@@ -4420,12 +4942,9 @@ mod tests {
         }
     }
 
-    /// GPU per scope from two client reads 2 s apart: aterm's own client (pid 100) and the tab's
-    /// cargo (201) count in their scopes, another user's WindowServer in services, and a client
-    /// whose name is not the swept process's (pid 200 reused) in no process's, its time left to
-    /// services as unclaimed. The rows' figures hold
-    /// this tab ≤ all tabs ≤ the Mac's, the device read in whole percent included (0 while the
-    /// clients read above it), and say "not per app" only while no client read is held.
+    /// GPU per scope from two client reads: each client counts in its process's scope, a reused
+    /// pid's time stays with services as unclaimed, the rows hold this tab ≤ all tabs ≤ the Mac's
+    /// (a device reading of 0 included), and "not per app" shows only while no client read is held.
     #[test]
     fn gpu_time_per_scope_comes_from_the_client_reads() {
         use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
@@ -4685,11 +5204,8 @@ mod tests {
         assert_eq!(back.aterm.run.len(), 7, "aterm's run goes on");
     }
 
-    /// Tab 1 split in two panes ([`TabRoot::tab`]): pane 8 (node, 0.25 cores) opens 200 s in
-    /// beside pane 7 (cargo, 0.5 cores), and no sweep runs from 400 s to 450 s. "This tab" is
-    /// both panes summed in each row a scope shares, cell by cell: hollow only where no pane
-    /// read, the focused pane's alone before the other opened, never past all tabs. One pane
-    /// reads as its own figure, as before tabs were summed.
+    /// Tab 1 split in two panes, one opened 200 s in, with a 50 s gap in the sweeps: "this tab"
+    /// is both panes summed cell by cell, hollow only where no pane read, never past all tabs.
     #[test]
     fn a_split_tab_reads_its_panes_summed() {
         let split = |i: u64| {
@@ -4820,9 +5336,8 @@ mod tests {
         assert_eq!(s.tab_of(&[99]), None);
     }
 
-    /// Each pane's GPU figure is held at the Mac's device reading (12%), so two panes at 10%
-    /// each sum past it; the tab's figure is held at all tabs', and this tab ≤ all tabs ≤ the
-    /// Mac's holds for the split tab too.
+    /// Two panes at 10% each, each within the Mac's 12%, sum past it, so the split tab's GPU
+    /// figure is held at all tabs'.
     #[test]
     fn a_split_tabs_gpu_stays_inside_all_tabs() {
         use crate::gpu_clients::{GpuClientRow, GpuClientsSample};
@@ -4873,9 +5388,8 @@ mod tests {
         );
     }
 
-    /// A process in either pane of a split tab is that tab's ([`TabRoot::tab`]): rustc in both
-    /// panes is one program of Tab 1 among the busiest, the top processes and the writers,
-    /// never two scopes nor none. CONTROL: the same panes as two tabs leave it unnamed.
+    /// rustc in both panes of a split tab is one program of Tab 1 among the busiest, the top
+    /// processes and the writers; the same panes as two tabs (the control) leave its scope unnamed.
     #[test]
     fn a_split_tabs_processes_are_the_tabs() {
         let read = |tab_of_8: u64| {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The serve loop: `Exec`'s four ways to end kept apart, stdin, `merge`, the group a
-//! dropped connection kills, `cwd` and exactly `env`, the clock, `Mount` and `Poweroff`.
+//! The serve loop: `Exec`'s endings kept apart, stdin, `merge`, the group a dropped
+//! connection kills, `cwd` and exactly `env`, the clock, `Mount` and `Poweroff`.
 
 use std::os::unix::fs::PermissionsExt as _;
 
@@ -144,7 +144,7 @@ fn stdin_reaches_the_command_and_its_eof_ends_it() {
         (Exit::Exited(0), String::new())
     );
 
-    // This real command never reads stdin. Its pid is the acknowledgement that it ran.
+    // This command never reads stdin; its pid line shows it ran.
     let stalled = || {
         let mut exec = agent.stand_in(&["hang", &test_pid()]);
         exec.stdin = Stdin::Pipe;
@@ -183,8 +183,8 @@ fn stdin_reaches_the_command_and_its_eof_ends_it() {
     let stop = held.0.try_clone().unwrap();
     let (done, produced) = std::sync::mpsc::channel();
     let sent = std::thread::spawn(move || {
-        // A finite burst, not a wait for pipe latency. The gated worker unit control
-        // proves both exact admission bounds independently of a kernel's pipe size.
+        // A finite burst past both limits; the unit test in `src/serve.rs` pins the exact
+        // bounds, independent of the kernel's pipe size.
         for _ in 0..=MAX_PENDING_STDIN_CHUNKS {
             if wire::write_frame(&mut producer, &large).is_err() {
                 break;
@@ -353,9 +353,13 @@ fn no_lane_user_or_a_switch_off_the_guest_never_runs_the_command() {
 }
 
 /// The identity switch itself needs root, so everywhere else it is a named skip: an
-/// ignored test on every platform, which off the Linux guest's root fails if run.
+/// ignored test on every platform, which off the Linux guest's root fails if run. Its
+/// stand-in runs as uid 65534, which cannot enter the lane user's 0750 home: in the guest
+/// the stand-in is a copy in a directory everyone enters, named by
+/// `ATERM_VZ_AGENT_TEST_IMAGE` (V4, measured: from the lane's own target directory it was
+/// not started, `Permission denied`).
 #[test]
-#[ignore = "needs root in the Linux guest: the identity switch (setgroups, setgid, setuid, then the cwd's chdir) runs as the guest's root; run it there with --ignored"]
+#[ignore = "needs root in the Linux guest: the identity switch (setgroups, setgid, setuid, then the cwd's chdir) runs as the guest's root; run it there with --ignored, and ATERM_VZ_AGENT_TEST_IMAGE naming a copy of the agent uid 65534 can execute"]
 fn the_identity_switch_runs_the_command_as_the_lane_user_in_its_groups_and_cwd() {
     #[cfg(target_os = "linux")]
     as_the_lane_user();

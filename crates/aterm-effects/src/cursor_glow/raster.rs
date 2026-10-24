@@ -1062,6 +1062,8 @@ pub(crate) fn push_ripple_ring(
     let rslab = 1;
     let inner_rx = (rx - thick).max(0.0);
     let inner_ry = ry * (inner_rx / rx);
+    let inv_ry = 1.0 / ry;
+    let inv_inner_ry = if inner_ry > 0.5 { 1.0 / inner_ry } else { 0.0 };
     let (cxi, cyi) = (cx as i32, cy as i32);
     let ry_i = ry as i32;
     let mut dy = -ry_i;
@@ -1073,10 +1075,11 @@ pub(crate) fn push_ripple_ring(
             dy += h;
             continue;
         }
-        let ym = (dy as f32 + h as f32 * 0.5) / ry;
+        let dy_mid = dy as f32 + h as f32 * 0.5;
+        let ym = dy_mid * inv_ry;
         let outer = rx * (1.0 - ym * ym).max(0.0).sqrt();
-        let inner = if inner_ry > 0.5 {
-            let yin = (dy as f32 + h as f32 * 0.5) / inner_ry;
+        let inner = if inv_inner_ry > 0.0 {
+            let yin = dy_mid * inv_inner_ry;
             inner_rx * (1.0 - yin * yin).max(0.0).sqrt()
         } else {
             0.0

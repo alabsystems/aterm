@@ -16,13 +16,16 @@ use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 
 /// The stand-in `claude` (and `codex`, `gemini`, `agy`, `muse`: the same script under
 /// each name): `--version` answers at once (the helper runs every fake once
-/// that way, `headless_boot::standin`); any other call writes the
-/// trusted-folders file its environment names (Gemini CLI's
-/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, empty where none) to
+/// that way, `headless_boot::standin`), and so, unrecorded, do agy's quota and
+/// model reads (`-p /usage`, `-p /model`), which an agy spawn makes before its
+/// launch: recorded, one could stand in for the launch at the test's read. Any
+/// other call writes the trusted-folders file its environment names (Gemini
+/// CLI's `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, empty where none) to
 /// `$HOME/trust.txt`, then its argv NUL-separated to `$HOME/argv.bin`, whole
 /// (written aside, then renamed), and exits 0.
 const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
+    case \" $* \" in *' -p /usage '*|*' -p /model '*) exit 0 ;; esac\n\
     printf '%s' \"${GEMINI_CLI_TRUSTED_FOLDERS_PATH-}\" > \"$HOME/trust.txt\"\n\
     for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$HOME/argv.part\" && \
     mv \"$HOME/argv.part\" \"$HOME/argv.bin\"\n";

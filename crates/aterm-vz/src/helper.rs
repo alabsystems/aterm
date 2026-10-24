@@ -26,9 +26,10 @@ use std::time::{Duration, Instant};
 use aterm_vz_agent::wire::{self, Frame, Hello, Job};
 
 use crate::console::{Console, Seen};
-use crate::detect::{SPAN, Space, TICK, Watch};
+use crate::detect::{Fired, SPAN, Space, TICK, Watch};
+use crate::key::Key;
 use crate::machine::{Conn, Event, Machine, Sink};
-use crate::plan::{Plan, ShareEntry};
+use crate::plan::{Disk, Plan, ShareEntry};
 use crate::proto::{Attach, PROTO, Phase, Reply, Request, StateReport};
 use crate::record::{DiskLock, Holder, Kernel, Paths, Pids, Record};
 use crate::space::Free;
@@ -42,6 +43,15 @@ pub const HOLD_CONNS: bool = false;
 
 /// How long a `Stop` from `down` waits for the guest to power off before the hard stop.
 pub const STOP_GRACE: Duration = SPAN;
+
+/// The `Lost` words of a VM whose guest powered itself off, with no stop of the helper's
+/// under way and no detector fired: the one end a bake seals after.
+pub const POWERED_OFF: &str = "the guest stopped: it powered itself off";
+
+/// The dials of the watch port that may wait for their hello at once. A later one is
+/// refused unread: a guest process that holds this many silent dials when the agent dials
+/// makes the boot lost (the agent's dial is refused, and it dials once), never ready.
+pub const MAX_DIALS: usize = 8;
 
 /// Who the helper is, as its record and `State` name it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +74,9 @@ pub struct Config {
     pub record: Option<(PathBuf, Record)>,
     /// [`HOLD_CONNS`], or the measure's other arm.
     pub hold_conns: bool,
+    /// Where each `Boot` writes its key disk ([`crate::key`]), which the plan's disks gain,
+    /// read-only, last.
+    pub key_disk: PathBuf,
     /// The live disk's volume's free space, read every [`TICK`] while the VM runs.
     pub free: Box<dyn FnMut() -> Result<Free, String> + Send>,
 }
@@ -74,6 +87,7 @@ impl std::fmt::Debug for Config {
             .field("ident", &self.ident)
             .field("record", &self.record)
             .field("hold_conns", &self.hold_conns)
+            .field("key_disk", &self.key_disk)
             .finish_non_exhaustive()
     }
 }
@@ -89,10 +103,15 @@ pub enum Input {
     Closed(u64),
     /// The machine did something.
     Machine(Event),
-    /// The agent sent a frame on its watch connection.
-    Watch(Frame),
-    /// The watch connection ended, and why.
-    WatchClosed(String),
+    /// A frame of the watch port's dial `u64`. Its reader posts none until the dial's first
+    /// frame was a `Hello` carrying this boot's key, and that hello comes first, its key
+    /// zeroed.
+    Watch(u64, Frame),
+    /// The dial's first frame was no hello with this boot's key, and why: no frame of it is
+    /// believed, and the helper keeps listening.
+    WatchRefused(u64, String),
+    /// The dial's connection ended after its hello, and why.
+    WatchClosed(u64, String),
     /// A second passed.
     Tick,
 }
@@ -119,6 +138,29 @@ impl Drop for Session {
         // sees EOF whether or not the helper's process ends.
         let _ = self.out.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// One dial of the watch port: the connection object and the core's writer on it.
+#[derive(Debug)]
+struct Dial {
+    /// Held for the dial's life: the object owns the descriptor (fact 31).
+    _conn: Conn,
+    out: UnixStream,
+}
+
+impl Drop for Dial {
+    fn drop(&mut self) {
+        // Its reader thread holds a duplicate: a shutdown ends it, and the guest's end sees
+        // EOF, whether or not the object's close comes later.
+        let _ = self.out.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// A dial whose hello has not come yet, since when.
+#[derive(Debug)]
+struct Pending {
+    dial: Dial,
+    since: Duration,
 }
 
 /// A stop under way.
@@ -164,10 +206,20 @@ pub struct Core<M: Machine> {
     hello: Option<Hello>,
     jobs: Vec<Job>,
     failed_units: Vec<String>,
-    watch_conn: Option<(Conn, UnixStream)>,
+    /// This boot's key: a dial whose first frame is a `Hello` carrying it is the agent's.
+    key: Option<Key>,
+    /// The dials whose hello has not come yet.
+    dials: BTreeMap<u64, Pending>,
+    next_dial: u64,
+    /// The agent's watch connection: the first dial whose hello carried the key.
+    watch_conn: Option<(u64, Dial)>,
     /// Whether this boot's watch connection was taken: the agent dials once per boot (§6),
     /// so every later dial of port 1025 is refused and its frames never reach the core.
     watch_taken: bool,
+    /// This boot's refused dials before the agent's: how many, and the last one's words,
+    /// which the boot detector's words carry (an agent of another protocol is refused
+    /// here, its hello unread).
+    refused: (usize, Option<String>),
     held: BTreeMap<u64, (u64, Conn)>,
     next_conn: u64,
     stopping: Option<Stopping>,
@@ -195,7 +247,8 @@ macro_rules! note {
 }
 
 /// Now, as `helper.log` stamps each line: Unix seconds and milliseconds.
-fn stamp() -> String {
+#[must_use]
+pub fn stamp() -> String {
     aterm_time::since_epoch().map_or_else(
         || "?".to_string(),
         |t| format!("{}.{:03}", t.as_secs(), t.subsec_millis()),
@@ -229,8 +282,12 @@ impl<M: Machine> Core<M> {
             hello: None,
             jobs: Vec::new(),
             failed_units: Vec::new(),
+            key: None,
+            dials: BTreeMap::new(),
+            next_dial: 1,
             watch_conn: None,
             watch_taken: false,
+            refused: (0, None),
             held: BTreeMap::new(),
             next_conn: 1,
             stopping: None,
@@ -289,10 +346,19 @@ impl<M: Machine> Core<M> {
             Input::Request(sid, request) => self.request(sid, request, now),
             Input::Closed(sid) => self.close(sid, now),
             Input::Machine(event) => self.event(event, now),
-            Input::Watch(frame) => self.frame(frame, now),
-            Input::WatchClosed(why) => {
-                note!("the watch connection ended: {why}");
-                self.watch_conn = None;
+            Input::Watch(dial, frame) => self.watch_frame(dial, frame, now),
+            Input::WatchRefused(dial, why) => {
+                if self.dials.remove(&dial).is_some() {
+                    self.refuse(why);
+                }
+                Flow::Go
+            }
+            Input::WatchClosed(dial, why) => {
+                if self.watch_conn.as_ref().is_some_and(|(d, _)| *d == dial) {
+                    note!("the watch connection ended: {why}");
+                    self.watch_conn = None;
+                }
+                self.dials.remove(&dial);
                 Flow::Go
             }
             Input::Tick => self.tick(now),
@@ -518,7 +584,29 @@ impl<M: Machine> Core<M> {
             self.fail(words);
             return self.settle(now);
         }
+        let mut plan = plan;
+        let key = match crate::key::fresh().and_then(|key| {
+            crate::key::write_disk(&self.cfg.key_disk, &key)?;
+            Ok(key)
+        }) {
+            Ok(key) => key,
+            Err(e) => {
+                self.fail(format!(
+                    "the boot's key disk {}: {e}",
+                    self.cfg.key_disk.display()
+                ));
+                return self.settle(now);
+            }
+        };
+        plan.disks.push(Disk {
+            path: self.cfg.key_disk.clone(),
+            read_only: true,
+        });
+        self.key = Some(key);
+        self.dials.clear();
         note!("booting:\n{}", plan.config_text(&limits));
+        // The last boot's console is kept beside this one's (a bake's, once its clone boots).
+        let _ = std::fs::rename(&plan.console_log, previous_console(&plan.console_log));
         self.console_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -529,6 +617,7 @@ impl<M: Machine> Core<M> {
         self.console = Console::new();
         self.watch = Some(Watch::new(now));
         self.watch_taken = false;
+        self.refused = (0, None);
         self.space = Space::new(now);
         self.last_note = now;
         self.shares = plan.shares.clone();
@@ -724,7 +813,7 @@ impl<M: Machine> Core<M> {
                 Flow::Go
             }
             Event::Watch(conn) => {
-                self.watch_opened(conn);
+                self.watch_opened(conn, now);
                 Flow::Go
             }
             Event::GuestStopped => self.stopped(None),
@@ -742,7 +831,7 @@ impl<M: Machine> Core<M> {
         let why = match (&error, &self.stopping) {
             (Some(e), _) => format!("the guest stopped with an error: {e}"),
             (None, Some(s)) => s.why().to_string(),
-            (None, None) => "the guest stopped: it powered itself off".into(),
+            (None, None) => POWERED_OFF.into(),
         };
         match error {
             Some(_) => self.fail(why.clone()),
@@ -754,59 +843,94 @@ impl<M: Machine> Core<M> {
             }
         }
         self.held.clear();
+        self.dials.clear();
         self.watch_conn = None;
         Flow::Exit(format!("the VM stopped: {why}"))
     }
 
-    /// The agent dialed port 1025. Only a boot's first dial is its watch connection (§6: the
-    /// agent dials once, at start, and exits if that fails): a later one, whoever in the guest
-    /// made it, is closed unread, so no frame of it (a `Beat` that would hide a silent agent,
-    /// a `Hello` naming another agent) reaches the core.
-    fn watch_opened(&mut self, conn: Conn) {
+    /// Something in the guest dialed port 1025. Any guest process may (§6), so no frame of a
+    /// dial is believed until its first is a `Hello` carrying this boot's key, which only
+    /// guest root reads: its reader thread ([`read_dial`]) checks that, and posts nothing
+    /// else first. The first dial whose hello carried the key is the watch connection; the
+    /// others still waiting are closed then, and every later dial is closed unread (the
+    /// agent dials once per boot). A dial that says no hello within [`SPAN`] is closed at a
+    /// tick.
+    fn watch_opened(&mut self, conn: Conn, now: Duration) {
+        let port = conn.port();
         if self.watch_taken {
             note!(
-                "a second dial of the watch port {} refused: the agent dials once per boot",
-                conn.port()
+                "a dial of the watch port {port} after the agent's refused unread: the agent \
+                 dials once per boot"
             );
             return;
         }
-        self.watch_taken = true;
-        let (mut reader, writer) = match (conn.stream(), conn.stream()) {
+        let Some(key) = self.key else {
+            note!("a dial of the watch port {port} with no boot under way refused unread");
+            return;
+        };
+        if self.dials.len() >= MAX_DIALS {
+            self.refuse(format!(
+                "unread, since {MAX_DIALS} dials already wait for their hello"
+            ));
+            return;
+        }
+        let (reader, out) = match (conn.stream(), conn.stream()) {
             (Ok(r), Ok(w)) => (r, w),
             (Err(e), _) | (_, Err(e)) => {
-                note!("the watch connection's descriptor: {e}");
+                note!("a watch dial's descriptor: {e}");
                 return;
             }
         };
+        let dial = self.next_dial;
+        self.next_dial += 1;
         let inputs = self.inputs.clone();
         let spawned = std::thread::Builder::new()
-            .name("vz-watch".into())
-            .spawn(move || {
-                loop {
-                    match wire::read_frame(&mut reader) {
-                        Ok(Some(frame)) => {
-                            if inputs.send(Input::Watch(frame)).is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => {
-                            let _ = inputs.send(Input::WatchClosed(
-                                "the agent closed its watch connection".into(),
-                            ));
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = inputs.send(Input::WatchClosed(e.to_string()));
-                            return;
-                        }
-                    }
-                }
-            });
+            .name(format!("vz-watch-{dial}"))
+            .spawn(move || read_dial(dial, reader, &key, &inputs));
         if let Err(e) = spawned {
             note!("the watch reader: {e}");
             return;
         }
-        self.watch_conn = Some((conn, writer));
+        self.dials.insert(
+            dial,
+            Pending {
+                dial: Dial { _conn: conn, out },
+                since: now,
+            },
+        );
+    }
+
+    /// A dial of the watch port was refused, for `why`; the helper keeps listening.
+    fn refuse(&mut self, why: String) {
+        note!("a dial of the watch port refused: {why}; the helper keeps listening");
+        if self.hello.is_none() {
+            self.refused = (self.refused.0 + 1, Some(why));
+        }
+    }
+
+    /// A frame of dial `dial`, which its reader posts only after that dial's keyed hello.
+    fn watch_frame(&mut self, dial: u64, frame: Frame, now: Duration) -> Flow {
+        if self.watch_conn.as_ref().is_some_and(|(d, _)| *d == dial) {
+            return self.frame(frame, now);
+        }
+        let Some(pending) = self.dials.remove(&dial) else {
+            // A dial already closed: nothing of it is believed.
+            return Flow::Go;
+        };
+        if self.watch_taken || !matches!(frame, Frame::Hello(_)) {
+            return Flow::Go;
+        }
+        self.watch_taken = true;
+        let others = std::mem::take(&mut self.dials);
+        if !others.is_empty() {
+            note!(
+                "{} other dial(s) of the watch port closed unread: the agent's carried the key",
+                others.len()
+            );
+        }
+        drop(others);
+        self.watch_conn = Some((dial, pending.dial));
+        self.frame(frame, now)
     }
 
     fn frame(&mut self, frame: Frame, now: Duration) -> Flow {
@@ -898,11 +1022,11 @@ impl<M: Machine> Core<M> {
                 note!("the record {}: {e}", path.display());
             }
         }
-        if let Some((_, w)) = &mut self.watch_conn
+        if let Some((_, dial)) = &mut self.watch_conn
             && let Some(t) = aterm_time::since_epoch()
         {
             let unix_ns = u64::try_from(t.as_nanos()).unwrap_or(u64::MAX);
-            if let Err(e) = wire::write_frame(w, &Frame::Clock { unix_ns }) {
+            if let Err(e) = wire::write_frame(&mut dial.out, &Frame::Clock { unix_ns }) {
                 note!("Clock: {e}");
             }
         }
@@ -918,9 +1042,17 @@ impl<M: Machine> Core<M> {
     fn boot_note(&self) -> String {
         if self.hello.is_none() {
             let (lines, _) = self.console.counts();
+            let refused = match &self.refused {
+                (n, Some(last)) => {
+                    format!("{n} dial(s) of the watch port refused, the last: {last}; ")
+                }
+                _ => String::new(),
+            };
             return match self.console.last_line() {
-                Some(line) => format!("no hello yet; {lines} console lines, the last: {line}"),
-                None => "no hello yet; no console line yet".into(),
+                Some(line) => {
+                    format!("no hello yet; {refused}{lines} console lines, the last: {line}")
+                }
+                None => format!("no hello yet; {refused}no console line yet"),
             };
         }
         if self.jobs.is_empty() {
@@ -936,6 +1068,16 @@ impl<M: Machine> Core<M> {
     }
 
     fn tick(&mut self, now: Duration) -> Flow {
+        let silent: Vec<u64> = self
+            .dials
+            .iter()
+            .filter(|(_, p)| now.saturating_sub(p.since) >= SPAN)
+            .map(|(d, _)| *d)
+            .collect();
+        for dial in silent {
+            self.dials.remove(&dial);
+            self.refuse(format!("no hello within {} s", SPAN.as_secs()));
+        }
         if !self.ever_attached && now >= SPAN {
             return Flow::Exit(format!(
                 "no session attached within {} s of the helper's start",
@@ -986,7 +1128,11 @@ impl<M: Machine> Core<M> {
             .as_ref()
             .and_then(|w| w.check(now, self.console.last_progress()))
         {
-            return self.fire(now, fired.why());
+            let mut why = fired.why();
+            if let (Fired::BootBeforeAgent, (n, Some(last))) = (&fired, &self.refused) {
+                why = format!("{why}; {n} dial(s) of the watch port refused, the last: {last}");
+            }
+            return self.fire(now, why);
         }
         if self.space.due(now) {
             match (self.cfg.free)() {
@@ -1039,6 +1185,76 @@ impl<M: Machine> Core<M> {
 }
 
 /// Read one session's requests into `inputs` until it closes.
+/// Whether `frame`, a dial's first, is a `Hello` carrying `key`: that hello with its key
+/// zeroed, or why not.
+///
+/// # Errors
+/// It is another frame, or a hello with another key.
+pub fn keyed_hello(frame: Frame, key: &Key) -> Result<Hello, String> {
+    match frame {
+        Frame::Hello(mut h) => {
+            let keyed = crate::key::same(&h.key, key);
+            h.key = [0; crate::key::LEN];
+            if keyed {
+                Ok(h)
+            } else {
+                Err(format!(
+                    "its hello (agent {}, boot {}) carried another key",
+                    crate::hex(&h.agent_sha256),
+                    h.boot_id
+                ))
+            }
+        }
+        other => Err(format!(
+            "its first frame was kind {:#04x}, not the agent's hello",
+            other.kind()
+        )),
+    }
+}
+
+/// A watch dial's reader: its first frame must be a keyed hello ([`keyed_hello`]), or the
+/// dial is refused and nothing of it is posted; then every frame, until it ends.
+fn read_dial(dial: u64, mut reader: UnixStream, key: &Key, inputs: &Sender<Input>) {
+    let first = match wire::read_frame(&mut reader) {
+        Ok(Some(frame)) => keyed_hello(frame, key),
+        Ok(None) => Err("it closed before any hello".into()),
+        Err(e) => Err(format!("its first frame: {e}")),
+    };
+    let hello = match first {
+        Ok(hello) => hello,
+        Err(why) => {
+            let _ = inputs.send(Input::WatchRefused(dial, why));
+            return;
+        }
+    };
+    if inputs
+        .send(Input::Watch(dial, Frame::Hello(hello)))
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        match wire::read_frame(&mut reader) {
+            Ok(Some(frame)) => {
+                if inputs.send(Input::Watch(dial, frame)).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = inputs.send(Input::WatchClosed(
+                    dial,
+                    "the agent closed its watch connection".into(),
+                ));
+                return;
+            }
+            Err(e) => {
+                let _ = inputs.send(Input::WatchClosed(dial, e.to_string()));
+                return;
+            }
+        }
+    }
+}
+
 fn read_session(sid: u64, stream: UnixStream, inputs: &Sender<Input>) {
     let mut channel = Channel::new(stream);
     loop {
@@ -1221,6 +1437,25 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
     })
 }
 
+/// Where the previous boot's console is kept: `console.log`'s `console.1.log`.
+#[must_use]
+pub fn previous_console(console_log: &Path) -> PathBuf {
+    console_log.with_extension("1.log")
+}
+
+/// A helper's run files at its exit: the record and the socket only while the record is
+/// still `record`'s (a lab that saw its session end reads no record of this helper), and
+/// the key disk whoever's record is there, since this helper wrote it under the lock.
+pub fn release_run_files(paths: &Paths, record: &Record, socket: &Path) {
+    let ours =
+        Record::read(&paths.record()).is_some_and(|r| r.pid == record.pid && r.uniq == record.uniq);
+    if ours {
+        let _ = std::fs::remove_file(paths.record());
+        let _ = std::fs::remove_file(socket);
+    }
+    let _ = std::fs::remove_file(paths.key_disk());
+}
+
 /// This process, as a helper's [`Ident`].
 #[must_use]
 pub fn this_process(helper_sha256: String, live_disk: PathBuf) -> Ident {
@@ -1259,6 +1494,7 @@ pub fn run<M: Machine>(
         ident,
         record: Some((paths.record(), held.record.clone())),
         hold_conns,
+        key_disk: paths.key_disk(),
         free: Box::new(move || crate::space::read(&live_disk)),
     };
     let core = Core::new(machine, cfg, inputs.clone());
@@ -1270,14 +1506,9 @@ pub fn run<M: Machine>(
     } = held;
     let (why, core) = serve(listener, &socket, core, &inputs, &rx);
     note!("exiting: {why}");
-    // The record and the socket go first, then the sessions (their EOF), then the lock: a
-    // lab that saw its session end reads no record of this helper, and waits for its pid.
-    let ours =
-        Record::read(&paths.record()).is_some_and(|r| r.pid == record.pid && r.uniq == record.uniq);
-    if ours {
-        let _ = std::fs::remove_file(paths.record());
-        let _ = std::fs::remove_file(&socket);
-    }
+    // The run files go first, then the sessions (their EOF), then the lock: a lab that saw
+    // its session end reads no record of this helper, and waits for its pid.
+    release_run_files(paths, &record, &socket);
     drop(core);
     drop(lock);
     Ok(why)

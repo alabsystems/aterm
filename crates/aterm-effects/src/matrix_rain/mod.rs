@@ -1873,12 +1873,20 @@ impl MatrixRain {
             return;
         }
         let (cw, ch) = (i32::from(ctx.geom.cell_w), i32::from(ctx.geom.cell_h));
+        if cw <= 0 || ch <= 0 {
+            return;
+        }
         let grid_w = i32::from(ctx.geom.cols) * cw;
         let grid_h = i32::from(ctx.geom.rows) * ch;
         let premul = premul_rgb(ctx.ramp[15], self.head_alpha / 2);
         if premul == 0 {
             return;
         }
+        let cap = i32::from(u16::MAX);
+        let rx = cw.clamp(1, cap) as u16;
+        let ry = ch.clamp(1, cap) as u16;
+        let half_cw = cw / 2;
+        let half_ch = ch / 2;
         let len = self.halo_cands.len();
         let mut idx = (self.tick / u64::from(self.dq.max(1))) as usize % len;
         for _ in 0..len {
@@ -1890,27 +1898,28 @@ impl MatrixRain {
             if add.len() + 3 > MAX_RAIN_ADD {
                 return;
             }
-            let x0 = (i32::from(c) * cw - cw / 2).max(0);
-            let x1 = (i32::from(c) * cw + cw + cw / 2).min(grid_w);
-            let y0 = (i32::from(r) * ch - ch / 2).max(0);
-            let y1 = (i32::from(r) * ch + ch + ch / 2).min(grid_h);
-            if x1 <= x0 || y1 <= y0 || ch == 0 {
+            let cell_x = i32::from(c) * cw;
+            let cell_y = i32::from(r) * ch;
+            let x0 = (cell_x - half_cw).max(0);
+            let x1 = (cell_x + cw + half_cw).min(grid_w);
+            let y0 = (cell_y - half_ch).max(0);
+            let y1 = (cell_y + ch + half_ch).min(grid_h);
+            if x1 <= x0 || y1 <= y0 {
                 continue;
             }
-            let cap = i32::from(u16::MAX);
-            let cx = (i32::from(c) * cw + cw / 2).clamp(0, cap) as u16;
-            let cy = (i32::from(r) * ch + ch / 2).clamp(0, cap) as u16;
-            let rx = cw.clamp(1, cap) as u16;
-            let ry = ch.clamp(1, cap) as u16;
+            let cx = (cell_x + half_cw).clamp(0, cap) as u16;
+            let cy = (cell_y + half_ch).clamp(0, cap) as u16;
+            let x = x0 as u16;
+            let w = (x1 - x0) as u16;
             let mut yy = y0;
             while yy < y1 {
                 let band_row = yy / ch;
                 let band_end = ((band_row + 1) * ch).min(y1);
                 add.push(RainHalo {
                     row: band_row as u16,
-                    x: x0 as u16,
+                    x,
                     y: yy as u16,
-                    w: (x1 - x0) as u16,
+                    w,
                     h: (band_end - yy) as u16,
                     color: premul,
                     cx,

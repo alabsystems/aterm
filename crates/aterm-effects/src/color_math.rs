@@ -325,6 +325,8 @@ pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let c = v * s;
     let h_deg = if (0.0..360.0).contains(&h) {
         h
+    } else if (360.0..720.0).contains(&h) {
+        h - 360.0
     } else {
         h.rem_euclid(360.0)
     };

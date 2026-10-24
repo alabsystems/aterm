@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The process sweep: every process's pid, parent, CPU time, footprint and short name, read in one pass for the system-awareness stats (`docs/DESIGN-system-awareness-2026-10-16.md`), which turn two sweeps into per-process rates and walk the parent links to tell aterm's processes, and each tab's, from the rest.
+//! The process sweep: every process's pid, parent, CPU time, footprint and short name, read in one
+//! pass for the system-awareness stats (`docs/DESIGN-system-awareness-2026-10-16.md`).
 
 /// The sweep stops here.
 pub const MAX_PROCESSES: usize = 16_384;
@@ -19,7 +20,8 @@ pub struct ProcessReading {
     pub cpu_ns: Option<u64>,
     /// Its memory in bytes: macOS `ri_phys_footprint`, Linux `RssAnon + VmSwap`, Windows its private commit; `None` where refused.
     pub footprint: Option<u64>,
-    /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`: storage reads, not page-cache hits); `None` where refused, and on Linux.
+    /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`: storage reads,
+    /// not page-cache hits); `None` where refused, and off macOS.
     pub disk_read: Option<u64>,
     /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, and on Linux. An unreaped zombie keeps its final count, its start and its `disk_read` (macOS), though not its CPU time or footprint.
     pub disk_written: Option<u64>,
@@ -48,6 +50,8 @@ pub struct ProcessReading {
     pub coalition: Option<u64>,
     /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew, read with [`Self::coalition`]; `None` otherwise, for a zombie, and off macOS.
     pub version: Option<i32>,
+    /// When it started, unix ms: on Linux its boot-clock start against `/proc/uptime` and the wall clock read once a sweep ([`birth_of_boot_start`]), on Windows its creation `FILETIME` ([`birth_of_filetime`]). `None` on macOS, whose [`Self::start`] is Mach absolute time, which stops while the Mac sleeps (the kernel record, [`crate::kproc::record`], gives the wall birth there), and where unread.
+    pub birth_ms: Option<i64>,
 }
 
 /// What a sweep reads beyond each process's row ([`processes_with`]).
@@ -110,6 +114,20 @@ pub fn parse_statm_resident(text: &str) -> Option<u64> {
     text.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// A start on the boot clock (`start_ns` since boot, sleep included, as Linux counts a process's start) as unix ms, against the boot clock and the wall clock read together (`boot_now_ns`, `unix_now_ms`). A start after that moment (a process born while the sweep ran) is that moment; `None` before the epoch.
+#[must_use]
+pub fn birth_of_boot_start(start_ns: u64, boot_now_ns: u64, unix_now_ms: i64) -> Option<i64> {
+    let age_ms = i64::try_from(boot_now_ns.saturating_sub(start_ns) / 1_000_000).ok()?;
+    unix_now_ms.checked_sub(age_ms).filter(|ms| *ms >= 0)
+}
+
+/// A Windows creation `FILETIME` (100 ns ticks since 1601-01-01 UTC) as unix ms; `None` before the epoch.
+#[must_use]
+pub fn birth_of_filetime(ticks: u64) -> Option<i64> {
+    const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+    i64::try_from(ticks.checked_sub(UNIX_EPOCH_TICKS)? / 10_000).ok()
+}
+
 /// Mach ticks to nanoseconds at the timebase `numer/denom`.
 #[must_use]
 pub fn ticks_to_ns(ticks: u64, numer: u32, denom: u32) -> u64 {
@@ -163,10 +181,10 @@ pub(crate) mod imp {
     use crate::jobs::RunState;
     use crate::jobs::darwin::{PROC_FLAG_CONTROLT, PROC_FLAG_EXEC};
 
-    /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), as the crate's macOS arm declares it (the reference `libc` does not export it).
+    /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), which the `libc` crate does not export.
     const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 
-    /// `struct proc_bsdshortinfo` (64 bytes, as the macOS arm pins it).
+    /// `struct proc_bsdshortinfo` (64 bytes).
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub(crate) struct ShortInfo {
@@ -357,6 +375,7 @@ pub(crate) mod imp {
                 read_at,
                 coalition,
                 version,
+                birth_ms: None,
             });
         }
         if opts.coalitions {
@@ -545,6 +564,85 @@ mod tests {
     }
 
     #[test]
+    fn a_boot_clock_start_is_its_wall_birth() {
+        const NOW_MS: i64 = 1_790_000_000_000;
+        let boot = 3_600 * 1_000_000_000;
+        assert_eq!(
+            birth_of_boot_start(boot - 47 * 60 * 1_000_000_000, boot, NOW_MS),
+            Some(NOW_MS - 47 * 60_000)
+        );
+        assert_eq!(
+            birth_of_boot_start(boot + 5_000_000, boot, NOW_MS),
+            Some(NOW_MS),
+            "born while the sweep ran"
+        );
+        assert_eq!(
+            birth_of_boot_start(0, u64::MAX, NOW_MS),
+            None,
+            "before the epoch"
+        );
+        assert_eq!(
+            birth_of_boot_start(0, boot, i64::MIN),
+            None,
+            "past the range"
+        );
+    }
+
+    #[test]
+    fn a_filetime_is_its_unix_birth() {
+        assert_eq!(birth_of_filetime(116_444_736_000_000_000), Some(0));
+        assert_eq!(
+            birth_of_filetime(116_444_736_000_000_000 + 17_900_000_000_000_000 + 12_345),
+            Some(1_790_000_000_001)
+        );
+        assert_eq!(birth_of_filetime(116_444_735_999_999_999), None);
+        assert_eq!(birth_of_filetime(u64::MAX), Some(1_833_029_933_770_955));
+    }
+
+    /// Live on Linux: this process's swept birth is `ps`'s reckoning of it (`/proc/stat`'s
+    /// `btime` plus its start in clock ticks), within `btime`'s whole second.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_sweep_reads_this_processs_birth_as_ps_reckons_it() {
+        let me = std::process::id();
+        let swept = processes()
+            .expect("a sweep")
+            .procs
+            .into_iter()
+            .find(|p| p.pid == me)
+            .and_then(|p| p.birth_ms)
+            .expect("this process's birth");
+        let stat = std::fs::read_to_string("/proc/stat").expect("/proc/stat");
+        let btime: i64 = stat
+            .lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|b| b.trim().parse().ok())
+            .expect("btime");
+        let own = std::fs::read_to_string(format!("/proc/{me}/stat")).expect("its stat");
+        let start = crate::jobs::linux::parse_stat(&own)
+            .expect("its start")
+            .start;
+        // SAFETY: `sysconf` reads a constant.
+        let hz = i64::from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1);
+        let ps_ms = btime * 1000 + i64::try_from(start).expect("ticks") * 1000 / hz;
+        // `btime` is a whole second and `/proc/uptime` a centisecond, each cut short, so the
+        // two reckonings part by up to 1.01 s plus the milliseconds each division drops.
+        assert!(
+            (swept - ps_ms).abs() <= 1_100,
+            "swept {swept}, ps reckons {ps_ms}"
+        );
+    }
+
+    /// The macOS sweep reads no wall birth: its start is Mach absolute time, which stops while
+    /// the Mac sleeps, so an age from it would read hours young after a night's sleep.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_sweep_leaves_the_birth_to_the_kernel_record() {
+        let sweep = processes().expect("a sweep");
+        assert!(sweep.procs.iter().all(|p| p.birth_ms.is_none()));
+    }
+
+    #[test]
     fn a_tick_frequency_reduces_to_its_timebase() {
         assert_eq!(timebase_of_frequency(24_000_000), Some((125, 3)));
         assert_eq!(timebase_of_frequency(1_000_000_000), Some((1, 1)));
@@ -553,7 +651,8 @@ mod tests {
         assert_eq!(timebase_of_frequency(u64::MAX), None, "terms past u32");
     }
 
-    /// The sweep's CPU time is the kernel's, in nanoseconds, however this process runs: a spinning child, stopped so that both readings count the same CPU at any load, reads within 2x of what `wait4` reports for it.
+    /// The sweep's CPU time is the kernel's, in nanoseconds, natively or under Rosetta: a stopped
+    /// spinning child reads within 2x of what `wait4` reports for it.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_sweep_reads_a_stopped_childs_cpu_time_as_wait4_counts_it() {

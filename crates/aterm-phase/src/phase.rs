@@ -1100,7 +1100,7 @@ fn ends_live_zone(row: &str) -> bool {
 /// The launch card's own logo row (` ▐▛███▜▌ Claude Code v2.1.283`).
 fn is_launch_card_row(row: &str) -> bool {
     crate::text::trim_start(row).starts_with('\u{2590}')
-        && row.contains(const { crate::anchors::anchor_text("launch.banner") })
+        && row.contains(const { crate::anchor!("launch.banner") })
 }
 
 /// A row that can be the status row.
@@ -1218,7 +1218,7 @@ pub fn busy_zone_start(rows: &[String]) -> usize {
         }
         None => boxed.unwrap_or(0),
     };
-    let notice = const { crate::anchors::anchor_text("exit.resume") };
+    let notice = const { crate::anchor!("exit.resume") };
     let exited = rows
         .iter()
         .rposition(|r| crate::text::trim_end(r) == notice)
@@ -1538,7 +1538,7 @@ pub fn last_said_index(rows: &[String]) -> Option<usize> {
 
 /// The vendor's own `⏺` paragraph that row `i` is a row of, as its bullet row.
 fn vendor_paragraph(rows: &[String], i: usize) -> Option<usize> {
-    const NOTICES: &[&str] = &[crate::anchors::anchor_text("notice.auto_mode")];
+    const NOTICES: &[&str] = &[crate::anchor!("notice.auto_mode")];
     let mut open = i;
     while !rows[open].starts_with(['⏺', '●']) {
         if !in_message(&rows[open]) {
@@ -1643,11 +1643,7 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
 /// A hint or banner row that says Claude Code goes on by itself.
 fn says_the_vendor_goes_on(row: &str) -> bool {
     let flat = row.replace('\u{2219}', "\u{b7}");
-    find_ascii_ci(
-        &flat,
-        const { crate::anchors::anchor_text("wall.auto_continue") },
-    )
-    .is_some()
+    find_ascii_ci(&flat, const { crate::anchor!("wall.auto_continue") }).is_some()
         || find_ascii_ci(&flat, "continuing shortly").is_some()
         || find_ascii_ci(&flat, "available again \u{b7} continuing now").is_some()
 }
@@ -2031,7 +2027,7 @@ fn is_stop_hook_summary(row: &str) -> bool {
     let Some(rest) = row
         .strip_prefix(['⏺', '●'])
         .map(crate::text::trim_start)
-        .and_then(|r| r.strip_prefix(crate::anchors::anchor("hook.ran")))
+        .and_then(|r| r.strip_prefix(crate::anchor!("hook.ran")))
     else {
         return false;
     };
@@ -2039,14 +2035,14 @@ fn is_stop_hook_summary(row: &str) -> bool {
     digits > 0
         && rest[digits..]
             .strip_prefix(' ')
-            .is_some_and(|r| r.starts_with(crate::anchors::anchor("hook.ran.stop")))
+            .is_some_and(|r| r.starts_with(crate::anchor!("hook.ran.stop")))
 }
 
 /// Whether `text`, a column-2 `⎿` row's past its `⎿`.
 fn is_summary_label(text: &str) -> bool {
-    text.split_once(crate::anchors::anchor("hook.error.label"))
+    text.split_once(crate::anchor!("hook.error.label"))
         .is_some_and(|(name, _)| !name.is_empty() && !name.contains(char::is_whitespace))
-        || text.starts_with(crate::anchors::anchor("hook.feedback"))
+        || text.starts_with(crate::anchor!("hook.feedback"))
 }
 
 /// Whether `text`, a column-2 `⎿` row's past its `⎿`, is the row a hook's error opens.
@@ -2603,7 +2599,7 @@ mod tests {
             let r = screen(text);
             let card = r
                 .iter()
-                .rposition(|row| row.contains(crate::anchor("launch.banner")))
+                .rposition(|row| row.contains(crate::anchor!("launch.banner")))
                 .expect("the new launch card");
             assert_eq!(busy_signal(&r), None, "{name}");
             assert_eq!(status_row(&r), None, "{name}");
@@ -2636,7 +2632,7 @@ mod tests {
     }
 
     fn busy_rows(r: &[String]) -> Vec<usize> {
-        let busy = crate::anchor("busy.interrupt");
+        let busy = crate::anchor!("busy.interrupt");
         (0..r.len()).filter(|&i| r[i].contains(busy)).collect()
     }
 
@@ -2675,7 +2671,7 @@ mod tests {
             let live = busy_zone_start(&r);
             let card = r
                 .iter()
-                .rposition(|row| row.contains(crate::anchor("launch.banner")))
+                .rposition(|row| row.contains(crate::anchor!("launch.banner")))
                 .expect("the new launch card");
             assert!(live > card, "{name}: {live} {card}");
             assert!(
@@ -2701,7 +2697,7 @@ mod tests {
         use crate::prompt::fixtures::{
             CTRLC_RELAUNCH_STALE_QUESTION, EXIT_RELAUNCH_STALE_FOOTER, screen,
         };
-        let notice = crate::anchor("exit.resume");
+        let notice = crate::anchor!("exit.resume");
         for (name, text, footer) in [
             ("exit", EXIT_RELAUNCH_STALE_FOOTER, "esc to interrupt"),
             (

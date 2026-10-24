@@ -402,6 +402,9 @@ mod tests {
             code: Some(code),
             text: "captured scp result".into(),
             secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         };
         assert!(copied_frame(&detail, local, &copied(0)).is_ok());
         assert!(

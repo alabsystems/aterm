@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings control catalogue ([`SettingsState`]), overlay geometry and roles
-//! ([`SettingsGeom`], [`Roles`]), and row writers ([`blank_row`], [`write_str`]).
+//! Settings control catalogue ([`SettingsState`]), overlay geometry and roles ([`SettingsGeom`],
+//! [`Roles`]), the aurora, banner and System State village painters, and row writers
+//! ([`blank_row`], [`write_str`]).
 
 use aterm_core::terminal::RenderCell;
 
@@ -353,11 +354,9 @@ pub(crate) fn parse_rainbow_kitty_village_spec(spec: &str) -> (u64, bool, usize,
     (phase_ms, busy, done, total, states)
 }
 
-/// Paint the village ground, progress state bar, paths, synergy connectors, gardens, and buildings.
-///
-/// When no station is actively transitioning (`'W'`), the entire village layout and every building,
-/// garden, path, bridge, lantern garland, and plaza fountain is 100% invariant with respect to
-/// `phase_ms`—only changing when the system state configuration (`states`) changes.
+/// Paint the village ground, progress bar, paths, synergy connectors, gardens and buildings. Only
+/// an assembling station (`'W'`) reads `phase_ms`; with none, the drawing changes only with
+/// `states`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_rainbow_kitty_village_architecture(
     prims: &mut Vec<DrawPrim>,
@@ -397,7 +396,7 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
         fill: rgba(rim, if dark_sky { 0xD8 } else { 0xB8 }),
     });
 
-    // Progress state bar fill inside the village ground: advances as stations transition D -> W -> G.
+    // The progress bar inside the ground, advancing as stations go D -> W -> G.
     let assembling = states.iter().filter(|&&c| c == 'W').count();
     let progress =
         ((done as f32 + assembling as f32 * 0.45) / (total.max(1) as f32)).clamp(0.0, 1.0);
@@ -416,7 +415,7 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
         });
     }
 
-    // Static cobblestone stepping stones along the village path (never jittering on phase_ms).
+    // Cobblestones along the path, fixed in place.
     let stone_step = 16.0_f32;
     let mut sx = x + 10.0;
     let mut s_idx = 0usize;
@@ -460,7 +459,7 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
                 fill: rgba(BLOB_MARIGOLD, if dark_sky { 0xE4 } else { 0xCC }),
             });
 
-            // Tri-house district synergy: blooming courtyard tree behind a 3-house verified cluster.
+            // Three verified houses in a row: a courtyard tree between the last two.
             if i >= 1 && states[i - 1] == 'G' {
                 let trunk_h = (max_house_h * 0.48).clamp(5.0, 11.0);
                 prims.push(DrawPrim::Panel {
@@ -590,7 +589,7 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
     for (i, state) in states.iter().copied().enumerate() {
         let hue = stripes[i % stripes.len()];
         let cx = x + pad_x + (i as f32 + 0.5) * slot_w;
-        // Archetype height variation is deterministic by station index, never pulsing when stable.
+        // The archetype, and so the height, follows the station index alone.
         let archetype = i % 6;
         let arch_tallness = match archetype {
             0 => 0.96, // Observatory Dome
@@ -781,7 +780,7 @@ pub(crate) fn paint_rainbow_kitty_village_architecture(
             }
 
             if state == 'G' {
-                // Completed station side flower planter box (100% static when state is 'G').
+                // A completed station's flower planter.
                 let planter_w = (house_w * 0.28).clamp(2.4, 4.8);
                 let planter_x = hx + house_w - planter_w * 0.35;
                 prims.push(DrawPrim::Panel {
@@ -1158,8 +1157,7 @@ mod tests {
         assert_eq!(before.len(), 4, "each kitty has a body");
         assert_eq!(after.len(), before.len());
         for (kitty, ((x0, y0), (x1, y1))) in before.into_iter().zip(after).enumerate() {
-            // At either speed, one millisecond advances the stroll by less than
-            // 0.066 px and the hop by less than 0.066 px.
+            // At either speed, one millisecond moves the stroll and the hop under 0.066 px.
             assert!(
                 (x1 - x0).abs() < 0.1 && (y1 - y0).abs() < 0.1,
                 "kitty {kitty}: ({x0}, {y0}) jumped to ({x1}, {y1})"

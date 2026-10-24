@@ -1,30 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S OWN ADMISSION, in a leaf module of its own
-//! (`workstation_setup::permission_gate`): the gate ([`PermissionGate`]) that
-//! reads who touched System State and which plan revision the window's own
-//! Apply admitted, and the token it alone mints ([`AdmittedAccess`]). Nothing
-//! else lives here.
+//! The window's own admission, in a leaf module of its own (`workstation_setup::permission_gate`):
+//! the gate ([`PermissionGate`]) that reads who touched System State and which plan revision the
+//! window's own Apply admitted, and the token it alone mints ([`AdmittedAccess`]).
 //!
-//! The compiler holds the token to its door. `AdmittedAccess` is a braced
-//! struct whose fields are private to this module, one of them of a private
-//! type ([`AdmissionSeal`]) that is neither `Clone`, `Copy` nor `Default`; the
-//! gate's own fields are private here too. A private field is visible in its
-//! module and that module's children, and this module has no children, so
-//! nothing outside this file (`workstation_setup` included) can build or copy
-//! an admission in safe Rust, or set the gate's record of the window's own
-//! admission but through the gate's transitions; and no `impl Copy for
-//! AdmittedAccess` compiles anywhere.
+//! The compiler holds the token to its door. `AdmittedAccess` is a braced struct whose fields are
+//! private to this module, one of them of a private type ([`AdmissionSeal`]) that is neither
+//! `Clone`, `Copy` nor `Default`, and the gate's fields are private too. A private field is
+//! visible only in its module and that module's children, and this module has none, so nothing
+//! outside this file (`workstation_setup` included) can build or copy an admission in safe Rust,
+//! or set the gate's record of the window's own admission but through its transitions.
 //!
-//! The aterm-census guard `devtools-door` holds this file to that shape: no
-//! `mod`, no macro defined here and none invoked but by a path from the extern
-//! prelude (`::std::matches!`), no alias, glob import, `unsafe`, trait impl for
-//! the token, or attribute that could expand into code, and an
-//! `AdmissionSeal` value only inside `PermissionGate::admitted` and the test
-//! mint. Outside this file no line names `AdmissionSeal` (a macro's body that
-//! did would expand here with this file's privacy), and the census looks for
-//! the unsafe reads that could forge an admission and that no type can stop.
+//! The aterm-census guard `devtools-door` holds this file to that shape: no `mod`, no macro
+//! defined here and none invoked but by an extern-prelude path (`::std::matches!`), no alias, glob
+//! import, `unsafe`, trait impl for the token, or attribute that could expand into code, and an
+//! `AdmissionSeal` value only inside `PermissionGate::admitted` and the test mint. Outside this
+//! file no line may name `AdmissionSeal` (a macro body that did would expand here with this
+//! file's privacy), and the census flags the unsafe reads that could forge an admission, which
+//! no type can stop.
 
 use super::{AdmittedBy, PagePress};
 
@@ -34,23 +28,23 @@ enum PermissionHold {
     None,
     Decision,
     FreshStatus,
+    /// Stop withdraws automatic work locally. Only a later person's own
+    /// row press may still use an otherwise known admitted policy.
+    Stopped {
+        person: bool,
+    },
 }
 
-/// THE STANDING YES (owner, 2026-10-21: "combine with the original
-/// authorization for disk access, debugging, and network access so that these
-/// are all AUTO APPROVED BY DEFAULT!!!! no user required"; design §6): proof
-/// that this window itself admitted a setup plan with its Permissions group,
-/// and of which revision. Only [`PermissionGate::admitted`] makes one, and only
-/// for the window's own admission — its automatic answer to the startup offer,
-/// or a person's press on the page — or for a person's press on a row's own
-/// button. A control client's `act` or `key`, a status poll and a hand-edited
-/// plan record never make one: none of them is the window's own Apply, which
-/// alone sets the gate's record of the window's own admission
-/// ([`PermissionGate::observe`] after [`PermissionGate::accepted`]).
+/// The standing yes (design §6): proof that this window itself admitted a setup plan with its
+/// Permissions group, and of which revision. Only [`PermissionGate::admitted`] makes one, for the
+/// window's own admission (its automatic answer to the startup offer, or a person's press on the
+/// page) or for a person's press on a row's own button. A control client's `act` or `key`, a
+/// status poll and a hand-edited plan record never make one: only the window's own Apply sets the
+/// gate's record of its admission ([`PermissionGate::observe`] after
+/// [`PermissionGate::accepted`]).
 ///
-/// `crate::native_settings::OwnerYes::from_admitted` spends one as the yes a
-/// debugger-access change needs. Neither `Clone` nor `Copy`, and its fields are
-/// private to this file.
+/// `crate::native_settings::OwnerYes::from_admitted` spends one as the yes a debugger-access
+/// change needs.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AdmittedAccess {
     revision: u64,
@@ -58,9 +52,8 @@ pub(crate) struct AdmittedAccess {
     _seal: AdmissionSeal,
 }
 
-/// What makes an [`AdmittedAccess`] one admission: private to this file, so
-/// only this file can make one, and neither `Clone`, `Copy` nor `Default`, so
-/// no copy of an admission compiles.
+/// What makes an [`AdmittedAccess`] one admission: private to this file, and neither `Clone`,
+/// `Copy` nor `Default`.
 #[derive(Debug, PartialEq, Eq)]
 struct AdmissionSeal;
 
@@ -76,8 +69,7 @@ impl AdmittedAccess {
         self.by
     }
 
-    /// A token minted outside the gate, for tests only (debugger_access's
-    /// Unix tests).
+    /// A token minted outside the gate (test-only).
     #[cfg(test)]
     #[cfg(unix)]
     pub(crate) const fn for_test(revision: u64) -> Self {
@@ -116,8 +108,8 @@ pub(super) struct PermissionGate {
     /// An accepted Apply's provenance, waiting for the fresh status that
     /// releases the hold and names its revision.
     accepted_by: Option<AdmittedBy>,
-    /// THE WINDOW'S OWN ADMISSION: who, and the revision it admitted. Cleared
-    /// by every newer mutating intent and by any status naming another plan.
+    /// The window's own admission: who, and the revision it admitted. Cleared by every newer
+    /// mutating intent and by any status naming another plan.
     own: Option<(AdmittedBy, u64)>,
 }
 
@@ -139,6 +131,16 @@ impl PermissionGate {
         self.hold = PermissionHold::Decision;
         // A newer mutating intent supersedes the window's own admission until
         // its own acceptance (if it is the window's) names a revision again.
+        self.own = None;
+        self.accepted_by = None;
+    }
+
+    pub(super) fn stop(&mut self) {
+        let person = ::std::matches!(
+            self.hold,
+            PermissionHold::None | PermissionHold::Stopped { person: true }
+        ) && self.policy.is_some_and(|policy| policy.allowed);
+        self.hold = PermissionHold::Stopped { person };
         self.own = None;
         self.accepted_by = None;
     }
@@ -231,12 +233,14 @@ impl PermissionGate {
         };
     }
 
-    /// The standing yes, while the plan the status names (Permissions
-    /// admitted, nothing held) is the window's own admission; or, for
-    /// `person_press` — a person's press on a row's own button — while that
-    /// plan stands at all. THE ONE DOOR that makes an [`AdmittedAccess`].
+    /// The standing yes, while the plan the status names (Permissions admitted, nothing held) is
+    /// the window's own admission; or, for `person_press` (a person's press on a row's own
+    /// button), while that plan stands at all. The one door that makes an [`AdmittedAccess`].
     pub(super) fn admitted(&self, person_press: bool) -> Option<AdmittedAccess> {
-        if !self.allowed() {
+        let stopped_press = person_press
+            && ::std::matches!(self.hold, PermissionHold::Stopped { person: true })
+            && self.policy.is_some_and(|policy| policy.allowed);
+        if !self.allowed() && !stopped_press {
             return None;
         }
         let policy = self.policy?;

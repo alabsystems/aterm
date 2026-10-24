@@ -380,7 +380,7 @@ pub struct AwaitSys {
     pub scope_aterm: bool,
 }
 
-/// A job that left the engine's view after it exited, as the host's event ring remembers its `exited` event.
+/// A job that left the engine's view after it exited, from its `exited` event in the host's ring.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndedJob {
     /// Its tab's key.
@@ -466,7 +466,8 @@ pub enum VolumeTerm {
 pub struct VolumeWait {
     /// The terms.
     pub terms: Vec<VolumeTerm>,
-    /// `vol=` as given (percent-encoded; the host decodes it, and refuses one that is not absolute), else the session's own volume.
+    /// `vol=` as given (percent-encoded; the host decodes it and refuses one that is not
+    /// absolute); `None` for the session's own volume.
     pub vol: Option<String>,
     /// The caller's patience, ms.
     pub timeout_ms: u64,
@@ -867,12 +868,11 @@ impl AwaitSys {
         }))
     }
 
-    /// THE WAIT'S ONE SPELLING, which [`Self::parse`] reads back as this wait: `sys`, `quiet`
+    /// The wait's one spelling, which [`Self::parse`] reads back as this wait: `sys`, `quiet`
     /// where the preset's terms are in it, each explicit term `and`-joined (a number in its
-    /// metric's base unit), then `for=` and `scope=aterm` where set. Two spellings of one wait
-    /// spell it one way (`avail>=8GiB` and `avail>=8589934592B`). The timeout is the caller's
-    /// patience, not the wait, and is left out. Of a wait `parse` made: a wait built by hand may
-    /// not read back.
+    /// metric's base unit), then `for=` and `scope=aterm` where set, so two spellings of one wait
+    /// spell it one way. The timeout is the caller's patience, not the wait, and is left out. Only
+    /// a wait `parse` made is sure to read back.
     #[must_use]
     pub fn canonical(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -1194,7 +1194,8 @@ pub struct Outcome {
     pub values: Vec<String>,
     /// `<metric>:<why>` for each preset term that dropped out.
     pub skipped: Vec<String>,
-    /// The refusal of an explicit term this host cannot measure, or of a wait on a job that ended without meeting it (`ERR gone job=<id>`).
+    /// The refusal of an explicit term this host cannot measure, or of a wait on a job that ended
+    /// without meeting it (`ERR gone job=<id>`).
     pub refused: Option<String>,
     /// The job terms (`job=<id>`, `task=<id>`) whose job neither the view nor the ring holds.
     pub absent: Vec<String>,
@@ -1239,7 +1240,8 @@ pub fn evaluate(wait: &AwaitSys, s: &Snapshot, tab_keys: &[u64]) -> Outcome {
     evaluate_with(wait, s, tab_keys, &[])
 }
 
-/// [`evaluate`], with the jobs that left the view after they exited (`ended`, from the host's event ring).
+/// [`evaluate`], with the jobs that left the view after they exited (`ended`, from the host's
+/// event ring).
 #[must_use]
 pub fn evaluate_with(
     wait: &AwaitSys,
@@ -1709,11 +1711,10 @@ mod tests {
         assert!(o.refused.is_none() && !o.holds, "{o:?}");
     }
 
-    /// THE VOLUME WAIT IN THE ONE GRAMMAR (`docs/DESIGN-harness-occupancy-2026-10-20.md`
-    /// §3.1; `aterm-gui`'s `control_disk` runs it): a size needs its unit, spelled exactly,
-    /// and is whole; `room` and the level words read; one or two terms joined by `and`;
-    /// `vol=` and `timeout=` and none of the machine wait's words (`for=`, `scope=`); never
-    /// mixed with machine terms.
+    /// The volume wait (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.1, run by `aterm-gui`'s
+    /// `control_disk`): a size needs its exact unit and is whole; `room` and the level words read;
+    /// one or two terms join by `and`; it takes `vol=` and `timeout=` but not `for=` or `scope=`,
+    /// and never mixes with machine terms.
     #[test]
     fn the_volume_wait_is_parsed_by_the_one_grammar() {
         let volume = |s: &str| match AwaitSys::parse(s) {
@@ -1789,9 +1790,8 @@ mod tests {
         assert_eq!(AwaitSys::parse("sys cpu<50% vol=/x"), Err(USAGE.to_owned()));
     }
 
-    /// ONE SPELLING A WAIT: each wait reads back from its canonical spelling as itself, the
-    /// spelling is its own (a fixed point), and two spellings of one wait spell it one way.
-    /// NEGATIVE CONTROL: waits that differ spell apart.
+    /// Each wait reads back from its canonical spelling as itself (a fixed point), two spellings
+    /// of one wait spell it one way, and waits that differ spell apart.
     #[test]
     fn a_wait_reads_back_from_its_one_spelling() {
         for text in [
@@ -2187,8 +2187,7 @@ mod tests {
         );
     }
 
-    /// A SLOT NOT PROVEN EITHER WAY may be free or not: a slots term holds
-    /// only when it holds whichever way each turns out.
+    /// A slots term holds only when it holds whichever way each unproven slot turns out.
     #[test]
     fn a_slots_term_holds_only_on_slots_proven_either_way() {
         let on = |slots: SlotsView, text: &str| {
@@ -2214,9 +2213,7 @@ mod tests {
         assert!(on(read_slots(3, 2, 1, 0, 0), "sys slots=1"));
     }
 
-    /// A SLOTS READING THE HOST READ AT REST is older than a wait may judge
-    /// by: the snapshot carries its age, and past [`SLOTS_FRESH_MS`] it is
-    /// warming, an unread one included.
+    /// Past [`SLOTS_FRESH_MS`] a slots reading is warming, an unread one included.
     #[test]
     fn a_slots_reading_older_than_the_armed_period_is_warming() {
         let at = |slots: SlotsView, age_ms: Option<u64>| {

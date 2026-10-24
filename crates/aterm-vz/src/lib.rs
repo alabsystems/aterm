@@ -26,18 +26,16 @@
 //! - [`client`]: the `Helper` port (the lab's side), its socket arm with the detached start
 //!   and its Fake arm;
 //! - [`sign`]: the content-addressed ad hoc signing of the helper the lab built;
-//! - [`agent`]: the agent's command client over a vsock descriptor (`Exec`, `Poweroff`).
+//! - [`agent`]: the agent's command client over a vsock descriptor (`Exec`, `Poweroff`);
+//! - [`key`]: the boot's key, written to the key disk only guest root reads, which the
+//!   agent's `Hello` must carry before the helper believes any frame of its dial.
 //!
 //! The library loads no framework and starts no VM: only `aterm-vz-host` opens
 //! Virtualization.framework, at `Boot`, so linking this library (the lab and its tests do)
-//! loads nothing of it. The lab's `Driver` is V4. Where they join: [`layers::Prepared::Bake`]
-//! hands V4's bake the disk it boots through the helper, with the ISO
-//! [`layers::Layers::seed_iso`] makes; [`layers::Prepared::Live`] names the disk every later
-//! boot attaches; and [`space::RUN_FLOOR`] is the floor the helper stops a running VM at, in
-//! [`space::below_run`]'s words.
+//! loads nothing of it.
 //!
 //! The lane takes its inputs only from what `verify provision --linux` placed and stamped
-//! for the pin ([`pins::base`], [`pins::kernel_files`]), and reading them at a bring-up marks
+//! for the pin ([`pins::base`], [`pins::kernel_files`]); reading them at a bring-up marks
 //! their rows used, so the tooling cache's idle reclaim keeps them while the lane runs.
 
 #[cfg(unix)]
@@ -50,6 +48,8 @@ pub mod detect;
 #[cfg(unix)]
 pub mod helper;
 pub mod kernel;
+#[cfg(unix)]
+pub mod key;
 pub mod layers;
 #[cfg(unix)]
 pub mod machine;

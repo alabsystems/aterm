@@ -9,7 +9,8 @@ use super::{Bound, Corpus, Finding, Line, Rule, SourceFile, Tree, after_ws, has,
 /// Product source: everything the guards call the tree, vendored code aside.
 pub(super) const PRODUCT: &[&str] = &["crates/", "apps/"];
 
-/// This crate's own source, which spells every name a rule that reads literals bans (its tables and its planted cases).
+/// This crate's own source, which spells every name a literal-reading rule bans (its tables and
+/// its planted cases).
 pub(super) const CENSUS_CRATE: &str = "crates/aterm-census/";
 
 /// The engine crates: no platform API in their default build.
@@ -48,14 +49,16 @@ const ENGINE_BANNED: &[(&str, Bound, &str)] = &[
     ("#[link", Bound::Word, "a native library"),
 ];
 
-/// The `std` modules a grouped import (`use std::{fs, net::TcpStream};`) may not name in an engine crate.
+/// The `std` modules a grouped import (`use std::{fs, net::TcpStream};`) may not name in an
+/// engine crate.
 const ENGINE_STD_MODULES: &[(&str, &str)] = &[
     ("fs", "the filesystem"),
     ("net", "a socket"),
     ("thread", "a thread"),
 ];
 
-/// Platform frameworks read on the text view (`link(name = "AppKit")` or framework path literals).
+/// Platform frameworks read on the text view (`link(name = "AppKit")` or framework path
+/// literals).
 const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
     ("CoreText", Bound::Sub),
     ("Metal", Bound::Word),
@@ -73,7 +76,7 @@ fn engine_shipped(rel: &str) -> bool {
     rel != "crates/aterm-effects/src/file_feed.rs"
 }
 
-/// Does a directory or file of `rel` name test code.
+/// Does a directory or file of `rel` name test code?
 pub(super) fn test_path(rel: &str) -> bool {
     rel.split('/').any(|part| {
         part.trim_end_matches(".rs")
@@ -82,7 +85,9 @@ pub(super) fn test_path(rel: &str) -> bool {
     })
 }
 
-/// Top-level out-of-line modules declared under a test-only `cfg` (`#[cfg(test)] mod rig;`), every file such a module loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it), and their directories.
+/// Top-level out-of-line modules declared under a test-only `cfg` (`#[cfg(test)] mod rig;`),
+/// every file such a module loads in turn (`#[path = "x_more_tests.rs"] mod more;` in it), and
+/// their directories.
 fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let push = |out: &mut Vec<String>, file: String| {
@@ -124,9 +129,10 @@ fn declared_test_modules(corpus: &Corpus, prefixes: &[&str]) -> Vec<String> {
     }
 }
 
-/// Which files under some prefixes are test code, and which ship whatever their names or their parents say.
+/// Which files under some prefixes are test code, and which ship whatever their names or their
+/// parents say.
 pub(super) struct TestCode {
-    /// [`declared_test_modules`].
+    /// The files and directories [`declared_test_modules`] names.
     declared: Vec<String>,
     /// What a shipped line of a shipped file loads ([`Corpus::shipped_loads`]).
     shipped: std::collections::BTreeSet<String>,
@@ -140,7 +146,9 @@ impl TestCode {
         Self { declared, shipped }
     }
 
-    /// Is `rel` test code by its parent's say ([`declared_test_modules`]: the file a test-only `mod` loads, or one in that module's own directory) that nothing ships? A file a shipped `mod` or `include!` of a shipped file also loads (`#[cfg(test)] mod tests;` beside `#[path = "x/tests.rs"] mod shipped;`) ships, and is read.
+    /// Is `rel` test code by its parent's say (the file a test-only `mod` loads, or one in that
+    /// module's own directory: [`declared_test_modules`]) that nothing ships? A file that a
+    /// shipped `mod` or `include!` of a shipped file also loads ships, and is read.
     pub(super) fn holds(&self, rel: &str) -> bool {
         in_declared(&self.declared, rel) && !self.shipped.contains(rel)
     }
@@ -297,7 +305,8 @@ fn renderer_terminal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// `aterm_core::…Terminal`, or `Terminal` as a borrowed, annotated or returned type (`&Terminal`, `: Terminal`, `-> Terminal`).
+/// `aterm_core::…Terminal`, or `Terminal` as a borrowed, annotated or returned type
+/// (`&Terminal`, `: Terminal`, `-> Terminal`).
 fn names_terminal(code: &str) -> Option<&'static str> {
     let b = code.as_bytes();
     for at in hits(code, "Terminal", Bound::Sub) {
@@ -344,7 +353,8 @@ fn dev_read(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Matches `fs::read(…)` or `fs::read_to_string(…)` whose first argument is a `/dev/…` literal.
+/// Matches `fs::read(…)` or `fs::read_to_string(…)` whose first argument is a `/dev/…`
+/// literal.
 fn reads_a_device(line: Line<'_>) -> bool {
     hits(line.code, "fs::read", Bound::Sub).any(|at| {
         let mut rest = &line.code[at + "fs::read".len()..];
@@ -363,7 +373,8 @@ fn reads_a_device(line: Line<'_>) -> bool {
     })
 }
 
-/// Query APIs whose first call opens a SkyLight connection and triggers WindowServer main-thread preflight.
+/// Query APIs whose first call opens a SkyLight connection and triggers WindowServer's
+/// main-thread preflight.
 const INPUT_PROBES: &[&str] = &[
     "modifierFlags_class",
     "NSEvent modifierFlags",
@@ -398,7 +409,8 @@ fn input_probe(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Source prefixes for `aterm-gui`, `aterm-cli`, `amacs-*`, and `aterm-diskwalk` that resolve protected paths via consent.
+/// The crates that take protected paths resolved from consent: aterm-gui and its `aterm-gui-*`
+/// libraries, aterm-cli, `amacs-*` and aterm-diskwalk.
 const PROTECTED_SCOPE: &[&str] = &[
     "crates/aterm-gui/src/",
     "crates/aterm-gui-",
@@ -432,8 +444,7 @@ fn protected_folder(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         .chain(["Volumes", "Containers", "CloudStorage"])
         .collect();
     // Test code by its name (`_tests.rs`) or by its parent's say (the file a
-    // `#[cfg(test)] mod tests;` loads): neither ships, unless a shipped line
-    // loads it too.
+    // `#[cfg(test)] mod tests;` loads) is skipped unless a shipped line loads it too.
     let test_code = TestCode::read(tree.corpus, PROTECTED_SCOPE);
     for file in tree.corpus.under(PROTECTED_SCOPE) {
         let named_test = file.rel.ends_with("_tests.rs") && !test_code.ships(&file.rel);
@@ -636,7 +647,7 @@ fn keeper_no_mmap(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 const RESTORE_OWN: &[&str] = &["crates/aterm-restore/src/"];
 /// The crash restore's crate, as a closure names it.
 const RESTORE_CRATE: &str = "crates/aterm-restore";
-/// Crates that carry bytes off the host (`aterm-link`, `aterm-net`, `aterm-http`, `aterm-gui-fabric`).
+/// Crates that carry bytes off the host.
 const OFF_HOST_CRATES: &[&str] = &[
     "crates/aterm-link",
     "crates/aterm-net",
@@ -919,7 +930,8 @@ fn std_command(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// The door one line of code opens on the alias (`StdCommand::new`, `StdCommand as …`, or `type … = StdCommand`).
+/// The door one line of code opens on the alias (`StdCommand::new`, `StdCommand as …`, or
+/// `type … = StdCommand`).
 fn std_command_door(code: &str) -> Option<&'static str> {
     for at in hits(code, "StdCommand", Bound::Word) {
         let rest = &code[at + "StdCommand".len()..];
@@ -1050,7 +1062,7 @@ fn syscalls_by_number(code: &str) -> Vec<usize> {
 /// The supervisor's source directory (including `policy/`).
 const SUPERVISE: &[&str] = &["crates/aterm-agent/src/supervise/"];
 
-/// Supervisor files where a direct clock read is allowed (`fx.rs`, `tape/`, `transport.rs`, `mail.rs`).
+/// Supervisor files where a direct clock read is allowed.
 const SUPERVISE_CLOCK_HOMES: &[&str] = &[
     "crates/aterm-agent/src/supervise/fx.rs",
     "crates/aterm-agent/src/supervise/tape/",
@@ -1063,13 +1075,17 @@ const SUPERVISE_CLOCK_HOMES: &[&str] = &[
 pub(super) enum ClockShape {
     /// Anywhere (a word): `Instant::now`, `thread::sleep`, called or passed.
     Named,
-    /// A free reader: called (`unix_ms(…)`) or named by a path (`limit::unix_now`, passed as a fn item).
+    /// A free reader: called (`unix_ms(…)`) or named by a path (`limit::unix_now`, passed as a
+    /// fn item).
     Reader,
-    /// A method: called on a receiver (`t.elapsed()`) or named by a path (`Instant::elapsed`), never a field of the same name.
+    /// A method: called on a receiver (`t.elapsed()`) or named by a path (`Instant::elapsed`),
+    /// never a field of the same name.
     Method,
-    /// A free function: called bare (`read_small(…)`) or by a path (`limit::offset_at(…)`, `footer::shell_cwds`).
+    /// A free function: called bare (`read_small(…)`) or by a path (`limit::offset_at(…)`,
+    /// `footer::shell_cwds`).
     Free,
-    /// The head of a path that is CALLED: `fs::read(…)`, `std::fs::OpenOptions::new()`, `File::open(…)`.
+    /// The head of a path that is called: `fs::read(…)`, `std::fs::OpenOptions::new()`,
+    /// `File::open(…)`.
     PathCall,
 }
 
@@ -1200,11 +1216,11 @@ const SUPERVISE_READS: &[(&str, ClockShape, &str)] = &[
     ),
 ];
 
-/// Functions where a phase-2 read is allowed (`claim::default_holder` for `process::id`).
+/// Functions where a phase-2 read is allowed, by file, name and the read.
 const SUPERVISE_READ_HOMES: &[(&str, &str, &str)] =
     &[("claim.rs", "default_holder", "process::id")];
 
-/// Functions that wrap the system wall clock (`journal::unix_ms`, `limit::unix_now`, `limit::unix_now_ms`).
+/// Functions that wrap the system wall clock.
 const SUPERVISE_READER_HOMES: &[(&str, &str)] = &[
     ("journal.rs", "unix_ms"),
     ("limit.rs", "unix_now"),
@@ -1331,7 +1347,7 @@ const SUPERVISE_LOOKS: &[(&str, ClockShape, &str)] = &[
     ),
 ];
 
-/// Supervisor files where every machine look is allowed (`policy/probe_live.rs` and `policy/probe.rs`).
+/// Supervisor files where every machine look is allowed.
 const SUPERVISE_LOOK_FILES: &[&str] = &[
     "crates/aterm-agent/src/supervise/policy/probe_live.rs",
     "crates/aterm-agent/src/supervise/policy/probe.rs",
@@ -1395,7 +1411,7 @@ struct LiveReader<'t> {
     public: bool,
 }
 
-/// Derives all functions belonging to a derived door's live body across [`SUPERVISE_LOOK_HOMES`] files.
+/// Every function of a derived door's live body across the [`SUPERVISE_LOOK_HOMES`] files.
 fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
     let mut files: Vec<(&SourceFile, Vec<&'static str>)> = Vec::new();
     for &(home, name, why) in SUPERVISE_LOOK_HOMES {
@@ -1469,7 +1485,8 @@ fn live_readers<'t>(tree: &'t Tree<'_>) -> Vec<LiveReader<'t>> {
     }
 }
 
-/// Whether the shipped `fn name` of `file` takes `self` and whether it is visible outside its module.
+/// Whether the shipped `fn name` of `file` takes `self`, and whether it is visible outside its
+/// module.
 fn signature(file: &SourceFile, name: &str) -> Option<(bool, bool)> {
     let attributed = super::graph::attribute(file);
     let start = attributed.iter().position(|l| {
@@ -1583,7 +1600,7 @@ pub(super) struct UseLeaf<'s> {
     pub(super) glob: bool,
 }
 
-/// THE NAMES ONE `use` STATEMENT BINDS, each with its whole path.
+/// The names one `use` statement binds, each with its whole path.
 pub(super) fn use_leaves(stmt: &str) -> Vec<UseLeaf<'_>> {
     let mut out = Vec::new();
     if let Some(at) = hits(stmt, "use", Bound::Word).next() {
@@ -1650,7 +1667,8 @@ fn top_level_members(group: &str) -> Vec<&str> {
     out
 }
 
-/// A `type` alias of a plain path, read as the import it amounts to (`type Mono = std::time::Instant;` binds `Instant` as `Mono`, as `use std::time::Instant as Mono;` does).
+/// A `type` alias of a plain path, read as the import it amounts to
+/// (`type Mono = std::time::Instant;` binds `Instant` as `Mono`, as a `use … as Mono` does).
 pub(super) fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
     let at = hits(code, "type", Bound::Word).next()?;
     let head = code[..at].trim();
@@ -1673,7 +1691,8 @@ pub(super) fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
     })
 }
 
-/// Checks whether an imported leaf binds a clock read, sleep, or phase-2 read out of the line view's sight.
+/// Whether an imported leaf binds a clock read, sleep or phase-2 read out of the line view's
+/// sight.
 fn imported_read(
     leaf: &UseLeaf<'_>,
     by_path: &std::collections::BTreeSet<&str>,
@@ -2073,7 +2092,8 @@ pub(super) fn first_hit<'a>(
     None
 }
 
-/// Whether `rest` after a [`ClockShape::PathCall`] head is `::segment`s followed by a call (`::read(…)`).
+/// Whether `rest` after a [`ClockShape::PathCall`] head is `::segment`s followed by a call
+/// (`::read(…)`).
 fn path_called(rest: &str) -> bool {
     let mut rest = rest;
     let mut segments = 0;
@@ -2339,7 +2359,8 @@ mod tests {
         );
     }
 
-    /// A module its parent declares test-only at top level is treated as test code along with its directory.
+    /// A module its parent declares test-only at top level is test code, and so is its
+    /// directory.
     #[test]
     fn a_module_the_parent_declares_test_only_is_test_code() {
         let threaded = "fn rig() { std::thread::scope(|s| { s.spawn(|| ()); }); }\n";
@@ -2486,13 +2507,9 @@ mod tests {
         assert_eq!(spots(&found), ["crates/aterm-gui/src/page/shipped.rs:1"]);
     }
 
-    /// A file is test code only while no shipped line loads it: the file a
-    /// `#[cfg(test)] mod tests;` names, mounted again by a shipped `#[path]`
-    /// (on its own line, on the `mod`'s line, or through `cfg_attr`), one in
-    /// its directory mounted so, one a shipped `include!` brings in, and a
-    /// `_tests.rs` a shipped `mod` loads are each read, and so is what a
-    /// shipped mount of them loads in turn. CONTROLS: the test module's own
-    /// child, and a `_tests.rs` only a test `mod` loads, stay test code.
+    /// A test module's file that a shipped `#[path]`, `include!` or `mod` also loads is read,
+    /// and so is what a shipped mount of it loads in turn; what only a test module loads stays
+    /// test code.
     #[test]
     fn a_test_module_a_shipped_line_also_loads_is_read() {
         let literal = "const P: &str = \"/Volumes/aterm/aterm.app\";\n";
@@ -2574,7 +2591,7 @@ mod tests {
             ),
             ["crates/aterm-gui/src/page/tests/forge/deep.rs:1"]
         );
-        // CONTROL: the test module declares the same child, and it stays test.
+        // The test module's own child stays test code.
         let own = ("crates/aterm-gui/src/page/tests.rs", "mod forge;\n");
         assert!(found(tests, &[own]).is_empty());
     }
@@ -2853,7 +2870,8 @@ mod tests {
         assert!(found[0].detail.contains("`winit`"), "{found:?}");
     }
 
-    /// Walks the keeper's dependency closure through `Cargo.lock` and flags transitive GUI packages or missing lock entries.
+    /// The keeper's dependency closure through `Cargo.lock`: a transitive GUI package or a
+    /// missing lock entry is a finding.
     #[test]
     fn the_keepers_closure_is_walked_through_cargo_lock() {
         use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
@@ -3034,7 +3052,8 @@ mod tests {
         );
     }
 
-    /// Each way the supervisor's code can read a clock or sleep past its door, with the line it fires on.
+    /// Each way the supervisor's code can read a clock or sleep past its door, with the line it
+    /// fires on.
     #[test]
     fn every_clock_read_past_the_supervisors_door_is_found() {
         let cases: &[(&str, &str, usize)] = &[
@@ -3217,7 +3236,8 @@ mod tests {
         }
     }
 
-    /// The door's own reads, same-named fields, prose, test code, home files, and code outside the supervisor are silent.
+    /// The door's own reads, same-named fields, prose, test code, home files and code outside
+    /// the supervisor are silent.
     #[test]
     fn the_door_and_the_clocks_homes_are_silent() {
         let src = "let now = self.fx.mono();\nlet d = self.fx.since(at);\nself.fx.sleep(pause);\n\
@@ -3651,7 +3671,8 @@ mod tests {
         );
     }
 
-    /// Calls on the probe, pure helpers in live-body files, injected readers, and internal live-body chains are silent.
+    /// Calls on the probe, pure helpers in live-body files, injected readers and internal
+    /// live-body chains are silent.
     #[test]
     fn the_probe_and_its_live_bodies_own_files_are_silent() {
         let policy = "ctx.probe.settings_env(worker, &ctx.cwd)?;\n\

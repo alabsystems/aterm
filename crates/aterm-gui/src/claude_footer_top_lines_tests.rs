@@ -1405,3 +1405,40 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
         "NEGATIVE CONTROL: the off face's `on` button"
     );
 }
+
+/// ANOTHER CLI'S ACCOUNT CHIP NEVER NAMES A CLAUDE CODE ROW: a session whose footer names the
+/// account Claude Code's roster judges (`claude-1`) reads, once its reader is Codex's, as `Codex
+/// CLI` alone, since nothing judged its login in Codex's own pool. CONTROL: while it is Claude
+/// Code's, its chip keeps the footer's own words, which name that account.
+#[test]
+fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
+    use crate::a11y_tree::HarnessChip;
+    let (app, wid, session) = glass_with(
+        &AT_REST,
+        FooterFacts {
+            account: Some("claude-1".into()),
+            ..facts()
+        },
+    );
+    let account = |app: &App| {
+        app.claude_chips_a11y(wid)
+            .into_iter()
+            .find(|c| c.chip == HarnessChip::Account)
+            .map(|c| c.label)
+            .expect("an Account chip")
+    };
+    assert!(
+        account(&app).contains("claude-1"),
+        "CONTROL: {}",
+        account(&app)
+    );
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_agent_reader_program_for_test(Some(aterm_phase::Program::Codex));
+    assert_eq!(account(&app), "Codex CLI");
+}

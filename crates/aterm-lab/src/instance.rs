@@ -144,11 +144,10 @@ impl World {
 }
 
 /// The development seams every lab world sets ([`World::env`], the lab runs' `lab_vars`, the
-/// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), and
-/// the instance hears no system's memory pressure (`aterm-gui`'s `memory_pressure::SYSTEM_SEAM`
-/// set to `none`), so its level is the one a driver sets with the `pressure` verb, never the
-/// host's, and a loaded host sheds no scrollback or history ring mid-run. The lab sets them, so
-/// `--env` and `LAB_INSTANCE_ENV` refuse them (`lab_sets`).
+/// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), and the
+/// instance hears no system memory pressure (`ATERM_DEBUG_SYSTEM_PRESSURE=none`), so only the
+/// `pressure` verb sets its level and a loaded host sheds nothing mid-run. `--env` and
+/// `LAB_INSTANCE_ENV` refuse them (`lab_sets`).
 #[must_use]
 pub(crate) fn seams() -> [(String, String); 2] {
     [
@@ -173,7 +172,7 @@ fn private_home_roots(home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Keep the platform's existing state location explicit.
+/// The platform's aterm state root under `home`.
 fn private_state_home(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     return home.join("Library/Application Support/aterm");
@@ -630,6 +629,24 @@ pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     paths().need_aterm().map(Path::to_path_buf)
 }
 
+/// The scenes `--scene` passes to aterm as `ATERM_DEBUG_SCENE` (aterm-gui's `icon_scene`):
+/// procedural chrome icons, and a debug build's merged-deck fixture scenes read in place of the
+/// machine.
+const SCENES: [&str; 4] = ["band-icons", "deck-busy", "deck-calm", "deck-absent"];
+
+/// `--scene`'s value when it names one of [`SCENES`].
+/// # Errors
+/// The usage error naming them.
+fn scene_arg(scene: Option<String>) -> Result<Option<String>, Fail> {
+    match scene {
+        Some(s) if !SCENES.contains(&s.as_str()) => Err(Fail::usage(format!(
+            "instance: --scene takes {}, not '{s}'",
+            SCENES.join(", ")
+        ))),
+        scene => Ok(scene),
+    }
+}
+
 /// `instance`: a private aterm, headless unless `--window`, held until this command ends.
 /// # Errors
 /// Usage, or the instance could not start or answer.
@@ -648,10 +665,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     count("--lines", &lines)?;
     let font_px = take_value(&mut a, "--font-px")?;
     let scale = take_value(&mut a, "--scale")?;
-    let scene = take_value(&mut a, "--scene")?;
-    if scene.as_deref().is_some_and(|s| s != "band-icons") {
-        return Err(Fail::usage("instance: --scene takes band-icons"));
-    }
+    let scene = scene_arg(take_value(&mut a, "--scene")?)?;
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
@@ -1317,6 +1331,31 @@ mod terminal_selection_tests {
 }
 
 #[cfg(test)]
+mod scene_tests {
+    use super::{SCENES, scene_arg};
+
+    #[test]
+    fn scene_takes_the_icon_and_deck_scenes_and_names_them_otherwise() {
+        assert_eq!(scene_arg(None).ok(), Some(None));
+        for name in ["band-icons", "deck-busy", "deck-calm", "deck-absent"] {
+            assert_eq!(
+                scene_arg(Some(name.to_string())).ok(),
+                Some(Some(name.to_string()))
+            );
+        }
+        for wrong in ["deck", "deck-", "busy", "deck-hot", "Deck-busy"] {
+            let fail = scene_arg(Some(wrong.to_string())).expect_err(wrong);
+            assert_eq!(fail.code, 2, "a usage error");
+            let msg = fail.msg.unwrap_or_default();
+            assert!(msg.contains(&format!("'{wrong}'")), "{msg}");
+            for name in SCENES {
+                assert!(msg.contains(name), "{msg}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod band_tests {
     use super::reveal_pending;
 
@@ -1341,8 +1380,6 @@ mod band_tests {
 mod world_tests {
     use super::*;
 
-    /// A world kept stays when it drops, and one whose keep was released
-    /// (`predict-live`, once its shell's copy showed it ran) goes.
     #[test]
     fn a_released_world_goes_when_it_drops() {
         let mut kept = World::new(CONFIG_OFF).expect("fresh private world");

@@ -257,7 +257,8 @@ pub struct Starter {
 }
 
 impl WorkerCli {
-    /// Whether the worker's first prompt may hold a blank line ([`aterm_phase::ScreenReader::bounds_messages`]).
+    /// Whether the worker's first prompt may hold a blank line
+    /// ([`aterm_phase::ScreenReader::bounds_messages`]).
     #[must_use]
     pub fn blank_lines(&self) -> bool {
         self.agent.reader().bounds_messages()
@@ -407,7 +408,8 @@ pub(crate) fn session_id_of(mut b: [u8; 16]) -> String {
 /// Format the shell command line a worker runs at its first prompt.
 ///
 /// # Errors
-/// Line exceeds budget, a carried directory is relative, starter argv is unreadable, or `model` starts with `-`.
+/// The line exceeds its budget, a carried directory is relative, the starter's argv holds a flag
+/// no table knows, `model` starts with `-`, or the trusted-folders file is not an absolute path.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -443,9 +445,9 @@ pub(super) fn line_of(
     env: &[(&str, &str)],
     fresh: &Fresh<'_>,
 ) -> Result<String, String> {
-    // Rootless: under the worker's own directory (a root alone, as Windows
-    // spells one with no drive, is not the worker's). An empty XDG base
-    // directory is unset to the XDG rule, as it was to the starter.
+    // A rootless value would resolve under the worker's own folder, not the starter's; a root
+    // with no drive (as Windows may spell one) passes. An empty XDG base directory is unset to
+    // the XDG rule, as it was to the starter.
     if let Some((name, value)) = env.iter().find(|(name, value)| {
         cli.dirs.contains(name)
             && !Path::new(value).has_root()

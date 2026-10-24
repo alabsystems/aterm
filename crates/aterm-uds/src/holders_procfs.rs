@@ -105,8 +105,8 @@ pub(super) fn table(proc: &Path, pid: u32) -> Table {
 
 /// Every pid under `proc` that runs as effective uid `me`: its directory's owner. The kernel
 /// keeps `/proc/<pid>` the effective uid's when the process is non-dumpable and gives root only
-/// the entries inside (`task_dump_owner` spares a `0555` directory; measured in the Linux
-/// guest, 2026-10-23, `docs/measured/linux-lane-2026-10-23.md`).
+/// the entries inside (`task_dump_owner` spares a `0555` directory, as
+/// `docs/measured/linux-lane-2026-10-23.md` records).
 ///
 /// # Errors
 ///
@@ -494,11 +494,9 @@ mod tests {
         );
     }
 
-    /// A table's life is read off `stat` and `status` whatever bytes the command name holds:
-    /// the kernel cuts a name at 15 bytes, in the middle of a letter if it falls there, and
-    /// `prctl(PR_SET_NAME)` sets any bytes. A refused table of a lone zombie so named is exited,
-    /// a live one's sealed, and a zombie leader's with other threads unknown. NEGATIVE CONTROL:
-    /// read the files with `read_to_string`, and the zombie's and the live table's are unknown.
+    /// `stat` and `status` are read lossily ([`crate::process::read_proc_text`]), so a table
+    /// whose command name is no UTF-8 is judged by its state like any other. Negative control:
+    /// read with `read_to_string`, and the lone zombie's and the live process's are unknown.
     #[test]
     fn a_table_whose_command_name_is_not_utf8_is_judged_by_its_state() {
         let sealed = roots_own();
@@ -526,10 +524,10 @@ mod tests {
         );
     }
 
-    /// A listener is held by the process whose table names its socket: a stream accepted at the
-    /// listener's path, another listener and a zombie hold nothing, and a sealed table is sealed.
-    /// The table is read as bytes, so another socket's name that is no UTF-8 is a row like any
-    /// other. A path no listener is bound at reads no table, and a missing `net/unix` is an error.
+    /// A listener is held by the process whose table names its socket; a stream accepted at its
+    /// path, another listener and a zombie hold nothing, and a sealed table is sealed. A path no
+    /// listener is bound at reads no table. `net/unix` is read as bytes, so a path that is no
+    /// UTF-8 is a row like any other, and a missing `net/unix` is an error.
     #[test]
     fn a_listener_is_held_by_the_process_whose_table_names_its_socket() {
         let sealed = roots_own();
@@ -621,10 +619,9 @@ mod tests {
         );
     }
 
-    /// A pid is the uid its directory's owner names, which the kernel keeps the effective
-    /// uid's, dumpable or not (`live_tests` holds that on the kernel): no `status` is read, so
-    /// one naming another uid moves nothing. NEGATIVE CONTROL: judge a directory `me` does not
-    /// own by its status's `Uid:` line, and the other uid is handed this uid's process.
+    /// A pid's uid is its directory's owner, never `status`'s `Uid:` line (`live_tests` holds
+    /// the kernel to that). Negative control: judged by `Uid:`, the other uid is handed this
+    /// uid's process.
     #[test]
     fn a_process_is_the_uid_its_directorys_owner_names() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -683,13 +680,13 @@ mod live_tests {
     const HANG: Duration = Duration::from_secs(60);
 
     /// A running copy of `/bin/sleep`, killed and reaped when it drops, so a failed assertion
-    /// or a hang detector leaves nothing running (and nothing holding the test's output open).
+    /// or a hang detector leaves nothing running.
     struct Sleeper(crate::spawnfd::Child);
 
     impl Sleeper {
-        /// A copy of `/bin/sleep` at `copy` with `mode`, run with `held` as its stdin and no
-        /// other stdio, returned once its exec is done: the kernel names the task after the
-        /// copy (`comm`) only after it has settled the task's dumpability (`begin_new_exec`).
+        /// A copy of `/bin/sleep` at `copy` with `mode` and `held` as its stdin, returned once
+        /// its exec is done: the kernel names the task after the copy (`comm`) only after it has
+        /// settled the task's dumpability (`begin_new_exec`).
         fn start(copy: &Path, mode: u32, held: &Path) -> Self {
             std::fs::copy("/bin/sleep", copy).expect("copy /bin/sleep");
             std::fs::set_permissions(copy, std::fs::Permissions::from_mode(mode)).expect("chmod");
@@ -729,13 +726,11 @@ mod live_tests {
         }
     }
 
-    /// A child holding a file is its holder and names it; the same program exec'd from a copy
-    /// this uid may run but not read, which the kernel makes non-dumpable (as `ssh-agent`
-    /// makes itself) and so gives root its table, is sealed, not unreadable, and still this
-    /// uid's by its directory's owner, which the kernel keeps its effective uid's. A kernel
-    /// that keeps such an exec dumpable (`fs.suid_dumpable = 1`) seals nothing: COULD NOT
-    /// RUN. NEGATIVE CONTROL: the readable copy, the same program on the same file, is listed
-    /// and holds it.
+    /// A child holding a file is its holder and names it. A copy this uid may run but not read
+    /// is non-dumpable (as `ssh-agent` makes itself), so its table is root's: sealed, not
+    /// unreadable, and still this uid's by its directory's owner. COULD NOT RUN where
+    /// `fs.suid_dumpable = 1` keeps such an exec dumpable. Negative control: the readable copy
+    /// of the same program on the same file is listed and holds it.
     #[test]
     fn the_kernels_tables_name_a_holder_and_seal_a_non_dumpable_one() {
         crate::host::could_not_run_as_root("a program this uid may run but not read");

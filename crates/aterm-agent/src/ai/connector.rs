@@ -459,9 +459,9 @@ pub struct SignIn {
     /// with `open` or `xdg-open` from `PATH` opens nothing.
     pub no_opener: bool,
     /// The operating systems (`std::env::consts::OS`) on which the CLI opens its page in the
-    /// default browser through the OS itself, whatever its `PATH` (Grok Build on macOS): there
-    /// its sign-in child runs under [`crate::harness::login_drive::NO_DESK`], and nothing runs
-    /// where that sandbox is missing.
+    /// default browser through the OS itself, whatever its `PATH` (Grok Build and Codex on
+    /// macOS): there its sign-in child runs under [`crate::harness::login_drive::NO_DESK`], and
+    /// nothing runs where that sandbox is missing.
     pub no_desk: &'static [&'static str],
     /// Whether the headless approver may type the row's email into the vendor's sign-in page and
     /// read the row's mailbox for the code it mails: `false` where that one form signs a new
@@ -611,7 +611,15 @@ const CODEX_HOSTS: &[&str] = &["auth.openai.com"];
 /// `authUrl` on auth.openai.com whose `redirect_uri` is `http://127.0.0.1:1455/auth/callback`,
 /// and opens no browser), or `codex login --device-auth` where the row names `flow = "device"`
 /// (recorded on codex-old 0.164.0: the link and the code each on the line after its lead, the
-/// link always `https://auth.openai.com/codex/device`, so the page asks for the code).
+/// link always `https://auth.openai.com/codex/device`, so the page asks for the code). Its own
+/// `codex login` (a person's browser sign-in, `accounts login`) opens the default browser
+/// through LaunchServices whatever its `PATH` (codex 0.164.0-dev under an empty `PATH`: `starting
+/// browser login flow`, then `webbrowser::os: failed to get default browser, falling back to
+/// Safari` where the no-desk sandbox denied the lookup), so on macOS its child runs under
+/// [`crate::harness::login_drive::NO_DESK`] (`no_desk`); the app server, a renewal's route,
+/// answers `initialize`, `account/read` and `account/login/start` under it unchanged (0.164.0-dev,
+/// a scratch `CODEX_HOME`: a `loginId` and an `authUrl` on auth.openai.com, its loopback
+/// listening on 127.0.0.1:1455, nothing on its standard error).
 pub const CODEX_SIGNIN: SignIn = SignIn {
     routes: &[
         Route {
@@ -637,7 +645,7 @@ pub const CODEX_SIGNIN: SignIn = SignIn {
     ],
     env: &[],
     no_opener: true,
-    no_desk: &[],
+    no_desk: &["macos"],
     types_email: true,
 };
 

@@ -3,7 +3,7 @@
 
 //! Release download transport (`web_curl`) and Linux head-only target selection tests.
 
-use crate::support::{Lib, Scratch, follows_redirects, q, read, s};
+use crate::support::{Lib, Scratch, bash, follows_redirects, install_sh, q, read, s};
 
 const DOWNLOAD: &str = "https://github.com/example/aterm/releases/download";
 
@@ -181,6 +181,58 @@ fn a_download_is_held_to_the_named_size() {
         "an overlong body is read to at most the named size plus one byte"
     );
     assert_eq!(recs[failed].rc, 1, "a failed GET is a failed download");
+}
+
+/// A Ctrl-C during a download ends the run by it, its EXIT trap run, and is no
+/// failed download. The group leader stands for a terminal's foreground group,
+/// and the curl web_curl runs sends that group the Ctrl-C and dies of it. Under
+/// bash 3.2 web_curl's subshell then exited 130, the run went on, said the
+/// download failed and exited 1.
+#[test]
+fn a_ctrl_c_during_a_download_ends_the_run() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.env("INSTALL_SH", s(&install_sh()));
+    lib.step(
+        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nkill -s INT 0\\nexec /bin/sleep 30\\n' >\"$TMPDIR/bin/curl\" && \
+         chmod +x \"$TMPDIR/bin/curl\" && cat >\"$TMPDIR/download.bash\" <<'EOF'
+ATERM_INSTALL_LIBRARY_ONLY=1
+. \"$INSTALL_SH\"
+PATH=\"$TMPDIR/bin:$PATH\" REPO_SLUG=example/aterm
+trap 'echo cleaned >\"$TMPDIR/cleaned\"' EXIT
+download_release_asset v0.92.0 aterm-appcast.toml 3 \"$TMPDIR/got\" || echo \"went on ($?)\"
+EOF",
+    );
+    let call = lib.call(
+        format!(
+            "/usr/bin/perl -e '$SIG{{INT}} = \"DEFAULT\"; setpgrp(0, 0); exec @ARGV or die' {} \"$TMPDIR/download.bash\"; \
+             echo \"ended $? $(cat \"$TMPDIR/cleaned\" 2>/dev/null)\"",
+            q(s(&bash()))
+        ),
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[call].out, "ended 130 cleaned", "{}", recs[call].err);
+    assert!(!recs[call].err.contains("failed"), "{}", recs[call].err);
+}
+
+/// The download meter ends with the run: a run a Ctrl-C ends under bash 5 never
+/// reaches stop_download_meter, and the meter, a background job, ignores the
+/// Ctrl-C. Before, it drew on, and once the run's EXIT trap removed the file it
+/// printed an error over the person's prompt every 2 s, all session.
+#[test]
+fn the_download_meter_ends_with_the_run() {
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let call = lib.call(
+        "true & gone=$!; wait \"$gone\"; download_meter \"$TMPDIR/removed\" 10000000 \"$gone\"; echo ended",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(
+        (recs[call].out.as_str(), recs[call].err.as_str()),
+        ("ended", "")
+    );
 }
 
 struct Target {

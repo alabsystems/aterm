@@ -231,9 +231,9 @@ fn identity_keychain(keychain: Option<&Path>, home: &Path, cwd: &Path) -> (PathB
     }
 }
 
-/// The build facts, read from the checkout ONCE, exactly as `crates/aterm/build.rs`
-/// would read them: the plist is stamped with them and the build is pinned to them
-/// ([`Stamp::pins`]), so plist and binary agree even when HEAD moves mid-build.
+/// The build facts, read from the checkout once, as `crates/aterm/build.rs` would read them: the
+/// plist is stamped with them and the build is pinned to them ([`Stamp::pins`]), so plist and
+/// binary agree even when HEAD moves mid-build.
 #[derive(Debug, PartialEq, Eq)]
 struct Stamp {
     version: String,
@@ -1277,9 +1277,8 @@ mod tests {
         );
     }
 
-    /// An install whose first `--version` never exited was started and never showed it
-    /// ran: the next install leaves it exactly where it is until the hold is spent (a
-    /// restart here), and then replaces it.
+    /// An install whose first `--version` never exited stays exactly where it is, the next install
+    /// refused, until its hold is spent; an install then replaces it.
     #[test]
     fn an_install_that_never_showed_it_ran_stays_until_its_hold_is_spent() {
         let (_dir, root) = scratch();

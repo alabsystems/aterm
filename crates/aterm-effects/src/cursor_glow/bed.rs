@@ -348,14 +348,20 @@ pub(crate) fn lay_dark_bed(
         };
         let (first, last) = (run[0], run[run.len() - 1]);
         let (tail_x, head_x) = (first.x - dir * cwf * 0.5, last.x + dir * cwf * 0.5);
+        let inv_tail_w = 1.0 / (cwf * DARK_BED_TAIL_CELLS);
+        let inv_wedge_w = if wedge_cells > 0.0 {
+            1.0 / (cwf * wedge_cells)
+        } else {
+            0.0
+        };
         let taper_at = |x: f32| {
             if !one_row {
                 return 1.0;
             }
-            let tail = smooth((x - tail_x).abs() / (cwf * DARK_BED_TAIL_CELLS));
-            let wedge = if wedge_cells > 0.0 {
+            let tail = smooth((x - tail_x).abs() * inv_tail_w);
+            let wedge = if inv_wedge_w > 0.0 {
                 let behind = ((last.x - x) * dir).max(0.0);
-                (1.0 - behind / (cwf * wedge_cells)).clamp(0.0, 1.0)
+                (1.0 - behind * inv_wedge_w).clamp(0.0, 1.0)
             } else {
                 1.0
             };

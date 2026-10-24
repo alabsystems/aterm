@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
-use aterm_phase::anchors::anchor_text;
 
 use super::codex_rollout::{
     RolloutRead, Streamed, first_line_of, is_rollout_of, is_thread_id, rollouts_by_write,
@@ -16,9 +15,9 @@ use super::codex_rollout::{
 use super::codex_steps::{CODEX_MEASURED_BUILDS, CodexStepFold};
 use super::steps::{StepBatch, StepMark};
 
-const SESSION_META: &str = anchor_text("rollout.session_meta");
-const KEY_ID: &str = anchor_text("rollout.id");
-const KEY_CLI_VERSION: &str = anchor_text("rollout.cli_version");
+const SESSION_META: &str = aterm_phase::anchor!("rollout.session_meta");
+const KEY_ID: &str = aterm_phase::anchor!("rollout.id");
+const KEY_CLI_VERSION: &str = aterm_phase::anchor!("rollout.cli_version");
 
 /// Why a tap bound nothing, in one word ([`Self::word`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

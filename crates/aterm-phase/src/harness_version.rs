@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Structured incremental numeric version (`major.minor`) of an agent CLI harness, starting at `0.1`.
+/// Structured incremental numeric version (`major.minor`) of a CLI harness, at least `0.1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HarnessVersion {
     major: u16,
@@ -127,8 +127,9 @@ impl HarnessVersion {
         }
     }
 
-    /// Parse a canonical `"<major>.<minor>"` (or `"v<major>.<minor>"`) string into `(major, minor)`.
-    /// Rejects leading zeros on multi-digit components, empty parts, and non-digit characters.
+    /// Parse `"<major>.<minor>"` (or `"v<major>.<minor>"`) into `(major, minor)`. Rejects leading
+    /// zeros on multi-digit components, empty parts, non-digit characters and values over
+    /// `u16::MAX`.
     #[must_use]
     pub const fn parse_major_minor(s: &str) -> Option<(u16, u16)> {
         let bytes = s.as_bytes();
@@ -267,7 +268,7 @@ impl CliHarness {
         CliHarness::Kimi,
     ];
 
-    /// Canonical harness identifier (`"codex-alab"`, `"claude"`, `"agy"`, `"grok"`, `"kimi"`, `"muse"`, `"gemini"`).
+    /// Canonical harness identifier (`"codex-alab"`, `"claude"`, `"agy"`, …).
     #[inline]
     #[must_use]
     pub const fn id(self) -> &'static str {
@@ -282,7 +283,7 @@ impl CliHarness {
         }
     }
 
-    /// Lowercase CLI executable name (`"codex"`, `"claude"`, `"agy"`, `"grok"`, `"kimi"`, `"muse"`, `"gemini"`).
+    /// Lowercase CLI executable name: `"codex"` for codex-alab, else the [`id`](Self::id).
     #[inline]
     #[must_use]
     pub const fn cli(self) -> &'static str {
@@ -297,7 +298,7 @@ impl CliHarness {
         }
     }
 
-    /// Display product name (`"codex-alab"`, `"Claude Code"`, `"Antigravity CLI"`, `"Grok"`, `"Kimi Code"`, `"Muse Code"`, `"Gemini CLI"`).
+    /// Display product name (`"Claude Code"`, `"Antigravity CLI"`, …).
     #[inline]
     #[must_use]
     pub const fn product(self) -> &'static str {

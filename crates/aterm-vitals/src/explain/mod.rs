@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHY: who uses the machine's CPU, read per resource coalition: the facts the cause engine and `sys why` read. RD is `docs/DESIGN-resource-details-2026-10-20.md`, SA `docs/DESIGN-system-awareness-2026-10-16.md`.
+//! Who uses the machine's CPU, read per resource coalition: the facts the cause engine and `sys
+//! why` read. RD is `docs/DESIGN-resource-details-2026-10-20.md`, SA
+//! `docs/DESIGN-system-awareness-2026-10-16.md`.
 
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -32,12 +34,10 @@ pub type IdMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<IdHash
 /// A set of the kernel's integer ids, hashed by [`IdHasher`].
 pub type IdSet<K> = std::collections::HashSet<K, BuildHasherDefault<IdHasher>>;
 
-/// The split's hasher for integer ids (FxHash's multiply-rotate, rustc's):
-/// a split tick hashes ids some ten thousand times (700 processes, 650
-/// coalitions), which std's SipHash made about half the split's own CPU
-/// (m22, 2026-10-23). The ids are the kernel's, which no process picks, so
-/// a keyed hash buys nothing here. Local, since this crate depends on
-/// nothing.
+/// The split's hasher for integer ids (FxHash's multiply-rotate, rustc's): a split tick hashes ids
+/// some ten thousand times (700 processes, 650 coalitions), where std's SipHash cost about half the
+/// split's own CPU. The ids are the kernel's, which no process picks, so a keyed hash buys nothing.
+/// Local, since this crate depends on nothing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdHasher(u64);
 
@@ -95,7 +95,8 @@ pub enum CoalLane {
     Unsupported,
     /// macOS answered the launch self-check: the split is by coalition.
     On,
-    /// macOS's self-check missed, or a read did not read as the layout the readers hold: the split is by subtraction.
+    /// macOS's self-check missed, or a read did not match the record layout the readers hold: the
+    /// split is by subtraction.
     Off,
 }
 
@@ -106,7 +107,8 @@ impl CoalLane {
         self == Self::On
     }
 
-    /// The unavailable word a reply prints for the coalitions: `lane_off:coalitions`, the other views' `lane_off:<lane>` form, on every OS whose lane does not read, or `None` while it reads.
+    /// The unavailable word a reply prints for the coalitions (`lane_off:coalitions`, the other
+    /// views' `lane_off:<lane>` form) wherever the lane does not read; `None` while it reads.
     #[must_use]
     pub fn word(self) -> Option<&'static str> {
         (!self.on()).then_some("lane_off:coalitions")
@@ -129,7 +131,8 @@ pub struct CoalUsage {
     pub cpu_ns: u64,
     /// Bytes its members read from storage, exited members' included.
     pub bytes_read: u64,
-    /// [`Self::cpu_ns`] by thread QoS, ns: unspecified, maintenance, background, utility, legacy, user-initiated, user-interactive.
+    /// [`Self::cpu_ns`] by thread QoS, ns: unspecified, maintenance, background, utility, legacy,
+    /// user-initiated, user-interactive.
     pub eqos_ns: [u64; QOS_CLASSES],
     /// Its live members' footprint, bytes; `None` where the kernel's record ends before it.
     pub footprint: Option<u64>,
@@ -140,7 +143,8 @@ pub struct CoalUsage {
 pub struct CoalSample {
     /// How many coalitions the kernel listed (a listed one that answered nothing has no row).
     pub listed: u32,
-    /// The highest id the kernel listed, answered or not (the reader's `aterm_sysprobe::coalitions::CoalitionRead::newest`): one listed on a later read above it was made after this one (the kernel numbers coalitions in order and never reuses an id).
+    /// The highest id the kernel listed, answered or not: one listed above it on a later read was
+    /// made after this one (the kernel numbers coalitions in order and never reuses an id).
     pub newest: Option<u64>,
     /// Whether the list filled its buffer, so the newest may be missing.
     pub truncated: bool,
@@ -171,7 +175,8 @@ pub enum Voucher {
 }
 
 impl Voucher {
-    /// The wire word: `apple`, `app_store`, `developer_id`, `development`, `enterprise`, `ad_hoc`, `unsigned`, `unknown`.
+    /// The wire word: `apple`, `app_store`, `developer_id`, `development`, `enterprise`, `ad_hoc`,
+    /// `unsigned`, `unknown`.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -187,7 +192,8 @@ impl Voucher {
     }
 }
 
-/// Who one coalition lead is, as the host read it (its image and its code signature), for the process born at `birth_ms` with pid `pid`.
+/// Who one coalition lead is, as the host read it (its image and its code signature), for the
+/// process born at `birth_ms` with pid `pid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LeadIdentity {
     /// The pid.
@@ -199,7 +205,7 @@ pub struct LeadIdentity {
     pub exe: String,
     /// What its signature vouches for.
     pub voucher: Voucher,
-    /// Its signing identifier: a claim the signer chose, which only [`Self::voucher`] says whose it is.
+    /// Its signing identifier: a claim the signer chose; only [`Self::voucher`] says whose it is.
     pub signing_id: Option<String>,
     /// Its team id, for a developer's signature.
     pub team: Option<String>,
@@ -317,7 +323,8 @@ impl Part {
     }
 }
 
-/// A coalition as last seen with a live member: one with no member left keeps its part and its name.
+/// A coalition as last seen with a live member: one with no member left keeps its part and its
+/// name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Named {
     /// Where its work counts.
@@ -354,15 +361,20 @@ pub struct CoalRow {
     pub id: u64,
     /// Where its work counts.
     pub part: Part,
-    /// Its CPU over the window, millicores (from 0 for one made inside it; 0 for one not [`Self::measured`]).
+    /// Its CPU over the window, millicores (from 0 for one made inside it; 0 for one not
+    /// [`Self::measured`]).
     pub cpu_mc: i64,
-    /// Whether its counters were read at both ends of the window (or it was made inside it): `false` for one the base should have held and did not, or whose counter went back, whose figures over the window read 0 and whose work the residual holds.
+    /// Whether its counters were read at both ends of the window (or it was made inside it).
+    /// `false` for one the base should have held and did not, or whose counter went back: its
+    /// figures over the window read 0, and the residual holds its work.
     pub measured: bool,
-    /// Of that, a delegated job's members' work, counted in their tab instead, millicores (never above [`Self::cpu_mc`]).
+    /// Of that, a delegated job's members' work, counted in their tab instead, millicores (never
+    /// above [`Self::cpu_mc`]).
     pub delegated_mc: i64,
     /// Of [`Self::cpu_mc`], what ran at maintenance or background QoS (deferred work), millicores.
     pub deferred_mc: i64,
-    /// Its seven QoS buckets' growth over the window, millicores: what [`Self::deferred_mc`] is a share of.
+    /// Its seven QoS buckets' growth over the window, millicores: what [`Self::deferred_mc`] is a
+    /// share of.
     pub qos_mc: i64,
     /// Bytes per second it read from storage over the window.
     pub read_bps: u64,
@@ -370,20 +382,19 @@ pub struct CoalRow {
     pub footprint: Option<u64>,
     /// Its live members in this tick's sweep.
     pub live: u32,
-    /// The tabs its live members are in, by the tab's key, sorted, where it
-    /// has live members and every one is in a tab; `None` otherwise. A
-    /// caller scoped to a tab sees the row only when they are all that tab's
-    /// (aterm's own coalition holds aterm, which is in no tab, so it never
-    /// is).
+    /// The tabs its live members are in, by key, sorted, when it has live members and all are in
+    /// tabs; `None` otherwise. A caller scoped to a tab sees the row only when they are all that
+    /// tab's (never aterm's own coalition: aterm is in no tab).
     pub tabs: Option<Vec<u64>>,
-    /// Whether members of it have exited, so its counters include work of processes that no longer exist.
+    /// Whether members of it have exited, so its counters include work of processes now gone.
     pub finished: bool,
     /// Its lead, or the one it had when a member was last seen.
     pub lead: Option<Lead>,
 }
 
 impl CoalRow {
-    /// Its deferred share, per mille of its QoS buckets ([`Self::qos_mc`]), never past 1000; `None` where the buckets did not grow.
+    /// Its deferred share, per mille of its QoS buckets ([`Self::qos_mc`]), never past 1000; `None`
+    /// where the buckets did not grow.
     #[must_use]
     pub fn deferred_pm(&self) -> Option<u16> {
         deferred_pm(self.deferred_mc, self.qos_mc)
@@ -399,14 +410,17 @@ pub fn deferred_pm(deferred: i64, qos: i64) -> Option<u16> {
     })
 }
 
-/// The busy CPU over one matched window, millicores: every figure is over the same window, and `global = aterm + delegated + others + services + unaccounted` exactly.
+/// The busy CPU over one matched window, millicores: every figure is over the same window, and
+/// `global = aterm + delegated + others + services + unaccounted` exactly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoalSplit {
     /// How it was made.
     pub via: Via,
-    /// Whether every coalition was read and every process swept at both ends of the window, so every row is measured (`exact`), or not (`heuristic`, as every split by subtraction is).
+    /// Whether every coalition was read and every process swept at both ends of the window, so
+    /// every row is measured (`exact`), or not (`heuristic`, as every split by subtraction is).
     pub exact: bool,
-    /// Whether the kernel's list of coalitions stopped short at either end of the window (`cannot what=coalition_list why=truncated`).
+    /// Whether the kernel's list of coalitions stopped short at either end of the window
+    /// (`cannot what=coalition_list why=truncated`).
     pub list_truncated: bool,
     /// Coalitions the kernel listed (0 by subtraction).
     pub listed: u32,
@@ -414,17 +428,23 @@ pub struct CoalSplit {
     pub global_mc: i64,
     /// aterm's coalitions.
     pub aterm_mc: i64,
-    /// A delegated job's members' work under launchers outside aterm, moved to aterm's side (0 by subtraction, where aterm already holds it).
+    /// A delegated job's members' work under launchers outside aterm, moved to aterm's side (0 by
+    /// subtraction, where aterm already holds it).
     pub delegated_mc: i64,
     /// The user's other coalitions, less the delegated work.
     pub others_mc: i64,
-    /// Every other coalition, less the delegated work; by subtraction, the busy figure less aterm and others, never below 0.
+    /// Every other coalition, less the delegated work; by subtraction, the busy figure less aterm
+    /// and others, never below 0.
     pub services_mc: i64,
     /// What no part holds, signed and never clamped.
     pub unaccounted_mc: i64,
-    /// Each tab's live work over the window, by its key ([`TabRoot::tab`](crate::model::TabRoot::tab): a tab split into panes is one), in the host's order: its processes alive at both ends of it, delegated members included.
+    /// Each tab's live work over the window, by its key ([`TabRoot::tab`]; a tab split into panes
+    /// is one), in the host's order: its processes alive at both ends of it, delegated members
+    /// included.
     pub tabs: Vec<(u64, i64)>,
-    /// The live work over the window of aterm's processes in no tab: itself, its helpers, and a delegated job's members whose tab closed (so it is of [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone).
+    /// The live work over the window of aterm's processes in no tab (itself, its helpers, and a
+    /// delegated job's members whose tab closed), so of [`Self::aterm_mc`] plus
+    /// [`Self::delegated_mc`], not of aterm's coalitions alone.
     pub own_mc: i64,
     /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every live figure
     /// ([`Self::own_mc`] and [`Self::tabs`]), never below 0: work in no
@@ -432,11 +452,14 @@ pub struct CoalSplit {
     /// Taken from the parts' nanoseconds and rounded once, so the parts'
     /// own rounding never reads as a millicore of it.
     pub unattributed_mc: i64,
-    /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still differ from the part, which is rounded once, by a millicore or two.
+    /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set
+    /// so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still
+    /// differ from the part, rounded once, by a millicore or two.
     pub rows: Vec<CoalRow>,
 }
 
-/// The split's five parts with one tab's work taken out of aterm's, millicores: they add up to [`CoalSplit::global_mc`] exactly.
+/// The split's five parts with one tab's work taken out of aterm's, millicores: they add up to
+/// [`CoalSplit::global_mc`] exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Parts {
     /// The tab's live work.
@@ -447,18 +470,19 @@ pub struct Parts {
     pub others: i64,
     /// Services.
     pub services: i64,
-    /// The signed residual: the split's, plus the tab's live figure past aterm's, where it ran ahead.
+    /// The signed residual: the split's, plus any of the tab's live figure past aterm's.
     pub unaccounted: i64,
 }
 
 impl CoalSplit {
-    /// The parts with tab `tab`'s work (the caller's) out of aterm's: none for no tab, or one the split did not read.
+    /// The parts with tab `tab`'s work (the caller's) out of aterm's: none for no tab or one the
+    /// split did not read.
     #[must_use]
     pub fn parts(&self, tab: Option<u64>) -> Parts {
         self.parts_of(tab.as_slice())
     }
 
-    /// [`Self::parts`] for the tab of the sessions `panes` (its split panes, one of which its key is), its work out of aterm's.
+    /// [`Self::parts`] for the tab whose split panes are the sessions `panes`.
     #[must_use]
     pub fn parts_of(&self, panes: &[u64]) -> Parts {
         let tab: i64 = self
@@ -491,23 +515,27 @@ pub struct WhyFacts {
     pub lane: CoalLane,
     /// The split.
     pub split: CoalSplit,
-    /// Whether the split tick's sweep stopped at its cap, so each tab's figure may be short of its work.
+    /// Whether the split tick's sweep stopped at its cap, so a tab's figure may fall short.
     pub procs_truncated: bool,
     /// The machine's timeline, where read.
     pub timeline: Option<TimelineSample>,
-    /// When userspace started, unix ms: the earliest birth among the live processes above pid 1 (launchd outlives a userspace restart), where births were read and the sweep was whole.
+    /// When userspace started, unix ms: the earliest birth among the live processes above pid 1
+    /// (launchd outlives a userspace restart), where births were read and the sweep was whole.
     pub userspace_ms: Option<i64>,
     /// This aterm's user, where read.
     pub self_uid: Option<u32>,
     /// The causes that hold over the window, ranked ([`detect()`]).
     pub causes: Vec<Candidate>,
-    /// The episodes open after this tick, ranked the same way: covering causes only, since a context keeps no episode.
+    /// The episodes open after this tick, ranked the same way: covering causes only, since a
+    /// context keeps no episode.
     pub open: Vec<OpenCause>,
     /// The Deck's cause clause after this tick ([`deck_cause`] reads it).
     pub clause: Option<DeckCause>,
 }
 
-/// A defect the negative controls inject into the real split or its cause engine (`tests/conformance_scope_balance.rs`, `tests/conformance_explain.rs`), through [`Vitals::with_fault`](crate::Vitals::with_fault).
+/// A defect the negative controls (`tests/conformance_scope_balance.rs`,
+/// `tests/conformance_explain.rs`) inject into the real split or its cause engine, through
+/// [`Vitals::with_fault`](crate::Vitals::with_fault).
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
@@ -523,12 +551,12 @@ pub enum Fault {
     /// inside the window ran (`unattributed_mc`) leaves it for services, the
     /// reaper's (SA's `DropReapedChildTime`).
     DropReapedChildTime,
-    /// A named activity's members are matched by signing id alone, under any voucher (`tests/conformance_explain.rs`).
+    /// A named activity's members are matched by signing id alone, under any voucher.
     MatchBySigningIdOnly,
     /// The Deck's clause shows and goes with its candidate, with no hold.
     NoHold,
-    /// `unexplained` reads only the three parts, so the split's unaccounted
-    /// residual goes uncovered however large (`tests/conformance_explain.rs`).
+    /// `unexplained` reads only the three parts, so the split's unaccounted residual goes uncovered
+    /// however large.
     IgnoreUnaccounted,
 }
 
@@ -573,7 +601,8 @@ impl Fault {
     }
 }
 
-/// Each coalition's lead among `members` (`(pid, coalition, birth_ms)`, every live process whose coalition and birth were read): its earliest-born member, ties to the lower pid, never pid 0.
+/// Each coalition's lead among `members` (`(pid, coalition, birth_ms)` of every live process whose
+/// coalition and birth were read): its earliest-born member, ties to the lower pid, never pid 0.
 #[must_use]
 pub fn leads(members: &[(u32, u64, i64)]) -> Vec<(u64, u32)> {
     let mut first: IdMap<u64, (i64, u32)> = IdMap::default();
@@ -588,7 +617,11 @@ pub fn leads(members: &[(u32, u64, i64)]) -> Vec<(u64, u32)> {
     out
 }
 
-/// Name `read`'s coalitions in `names` from this tick's sweep `procs`: each one with a live member takes its part (aterm's for one holding this instance, `self_pid`, or a tab's shell, so a tab adopted from a predecessor counts; others for one holding a process of user `self_uid`; else services) and its lead, with the identity `identities` hold for that pid and birth.
+/// Names `read`'s coalitions in `names` from this tick's sweep `procs` and returns each
+/// coalition's live member count. Each one with a live member takes its part (aterm's when it
+/// holds this instance, `self_pid`, or a tab's shell, so a tab adopted from a predecessor counts;
+/// others' when it holds a process of user `self_uid`; else services) and its lead, with the
+/// identity `identities` hold for that pid and birth.
 pub fn name(
     names: &mut IdMap<u64, Named>,
     read: &CoalSample,
@@ -650,7 +683,8 @@ pub fn name(
     live
 }
 
-/// The facts' running state between split ticks: the base the next window starts at, each coalition's last name, each lead identity read, and the last facts.
+/// The facts' running state between split ticks: the base the next window starts at, each
+/// coalition's last name, each lead identity read, and the last facts.
 #[derive(Debug, Default)]
 pub(crate) struct WhyState {
     base: Option<CoalBase>,
@@ -681,7 +715,8 @@ impl WhyState {
         }
     }
 
-    /// The facts snapshot `snap` (of sample `s`) carries: new ones for a split tick with a window, else the last ones.
+    /// The facts snapshot `snap` (of sample `s`) carries: new ones for a split tick with a window,
+    /// else the last ones.
     pub(crate) fn absorb(
         &mut self,
         s: &Sample,

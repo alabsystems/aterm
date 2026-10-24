@@ -25,7 +25,8 @@ use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 /// The Folded deck's height in points (124 device px at 2×, 62 at 1×): two blocks of four rows.
 pub(crate) const FOLDED_PT: f64 = 62.0;
 
-/// The Full table's height in points before what it adds to the Folded height is rounded up to whole terminal cells.
+/// The Full table's height in points, before what it adds to the Folded height is rounded up
+/// to whole terminal cells.
 pub(crate) const FULL_TABLE_PT: f64 = 100.0;
 
 /// Which form the stats bars take (`[sys] stats_bars`).
@@ -91,7 +92,8 @@ impl StatsBars {
     }
 }
 
-/// The Deck's height in device pixels at `scale` in the window's form `deck`, or 0 when the Deck is not the stats bars' form.
+/// The Deck's height in device pixels at `scale` in the window's form `deck`, or 0 when the
+/// Deck is not the stats bars' form.
 pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usize) -> usize {
     if !(form.takes_room() && scale.is_finite() && scale > 0.0) {
         return 0;
@@ -147,7 +149,8 @@ const fn tests_attached() -> bool {
     false
 }
 
-/// The inks solved on a ground, its words and its accent ([`ink::vitals_inks`], a few microseconds to tens of them on a light ground), remembered for the last few grounds.
+/// [`ink::vitals_inks`] on a ground, its words and its accent, remembered for the last four
+/// grounds (a solve takes microseconds, tens of them on a light ground).
 pub(crate) fn cached_inks(ground: Rgb, value: Rgb, accent: Rgb) -> VitalsInks {
     type Key = (Rgb, Rgb, Rgb);
     thread_local! {
@@ -205,7 +208,8 @@ impl crate::App {
         chrome_head_px(head_pts, scale, form, deck, cell_px)
     }
 
-    /// The Deck's height in window `wid`'s head when it draws there ([`Self::deck_frame`]'s Deck), in the window's own form and at its own cell height, as the head sites count it.
+    /// The Deck's height in window `wid`'s head when it draws there, in the window's own form
+    /// and at its own cell height, as the head sites count it.
     pub(crate) fn deck_drawn_px(&self, wid: crate::WindowId) -> usize {
         let form = self.stats_bars_form();
         let Some(ws) = self.windows.get(&wid) else {
@@ -221,7 +225,8 @@ impl crate::App {
         }
     }
 
-    /// The Deck's rows in window `wid`'s frame in device pixels while it draws in the head (`Self::deck_drawn_px`).
+    /// The Deck's rows in window `wid`'s frame in device pixels while it draws in the head
+    /// (`Self::deck_drawn_px`).
     pub(crate) fn deck_rows_px(&self, wid: crate::WindowId) -> Option<std::ops::Range<usize>> {
         let deck = self.deck_drawn_px(wid);
         if deck == 0 {
@@ -1888,7 +1893,8 @@ pub(crate) struct DeckFrame {
 }
 
 impl crate::App {
-    /// The window's frame height as the presenters compose it (the head, the top pad, the rows and the strip, the bottom pad), in device px.
+    /// The window's frame height in device px as the presenters compose it: the head, the
+    /// top pad, the rows and the strip, the bottom pad.
     pub(crate) fn stats_frame_h(&self, wid: crate::WindowId) -> usize {
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
@@ -1920,6 +1926,16 @@ impl crate::App {
         let (tab_key, tab_label) = self.deck_tab(wid);
         let tab_panes = self.deck_tab_panes(wid);
         let tab_count = ws.tab_set.tabs().len();
+        // A deck scene's front tab is its window's, the one its readings name (its panes come
+        // from `deck_tab_panes`, which the lens's sentence reads too).
+        #[cfg(debug_assertions)]
+        let (tab_label, tab_count) = match self.vitals.deck_scene {
+            Some(scene) => {
+                let (_, label, count) = deck_fixtures::DeckContext::of(scene).front_tab();
+                (label, count)
+            }
+            None => (tab_label, tab_count),
+        };
         let prefs = crate::native_appearance::current_preferences();
         let (dwc, contrast) = (prefs.differentiate_without_color, prefs.high_contrast);
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
@@ -2005,7 +2021,8 @@ impl crate::App {
         }
     }
 
-    /// The instance's attention marks for the bars, worst first, from the stuck engine's view on the snapshot.
+    /// The instance's attention marks for the bars, worst first, from the stuck engine's view
+    /// on the snapshot.
     pub(crate) fn stats_marks(&self) -> Vec<StatsMark> {
         self.vitals
             .snapshot
@@ -2026,7 +2043,8 @@ impl crate::App {
             .then_some((fx, fy - top))
     }
 
-    /// The instrument under the pointer on the stats card, from the hit regions its last layout recorded.
+    /// The instrument under the pointer on the stats card, from the hit regions its last
+    /// layout recorded.
     pub(crate) fn stats_hit_under_pointer(&self, wid: crate::WindowId) -> Option<Hit> {
         let (x, y) = self.stats_card_point(wid)?;
         let _ = self.stats_deck_fp(wid);
@@ -2087,7 +2105,8 @@ impl crate::App {
         prims
     }
 
-    /// The stats card's fingerprint for `wid` (`0` when it shows none), the `RepaintKey` term.
+    /// The stats card's fingerprint for `wid` (`0` when it shows none), the `RepaintKey`
+    /// term.
     pub(crate) fn stats_deck_fp(&self, wid: crate::WindowId) -> u64 {
         let lens = self.stats_lens_fp(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2103,7 +2122,8 @@ impl crate::App {
         self.windows.get(&wid).map_or(0, |ws| ws.deck_memo.get().1) ^ lens
     }
 
-    /// Rasterize the stats card into `wid`'s paint-only `deck_card`, re-rasterizing only when its prims or placement moved, and the lens into its own card.
+    /// Rasterize the stats card into `wid`'s paint-only `deck_card`, again only when its prims
+    /// or placement moved, and the lens into its own card.
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
         let Some(f) = self.deck_frame(wid) else {
@@ -2154,7 +2174,8 @@ impl crate::App {
         });
     }
 
-    /// Fold the stats card and the open lens under the card the window would otherwise present (the backends take one tray surface), cached by the cards' identities.
+    /// Fold the stats card and the open lens under the card the window would otherwise
+    /// present (the backends take one tray surface), cached by the cards' identities.
     pub(crate) fn fold_stats_deck(&mut self, wid: crate::WindowId) {
         use std::hash::{Hash, Hasher};
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -2190,38 +2211,42 @@ impl crate::App {
         if ws.deck_fold.as_ref().is_some_and(|c| c.fp == fp) {
             return;
         }
-        let x0 = cards.iter().map(|c| c.dx).min().unwrap_or(0);
-        let y0 = cards.iter().map(|c| c.dy).min().unwrap_or(0);
-        let x1 = cards.iter().map(|c| c.dx + c.pw).max().unwrap_or(0);
-        let y1 = cards.iter().map(|c| c.dy + c.ph).max().unwrap_or(0);
-        let (pw, ph) = (x1 - x0, y1 - y0);
-        let Some(len) = usize::try_from(u64::from(pw) * u64::from(ph) * 4).ok() else {
-            ws.deck_fold = None;
-            return;
-        };
-        let mut rgba = vec![0; len];
-        let ok = cards.iter().all(|card| {
-            crate::tray_raster::composite_rgba_surface(
-                &mut rgba,
-                (pw, ph),
-                (x0, y0),
-                &card.rgba,
-                (card.pw, card.ph),
-                (card.dx, card.dy),
-            )
-        });
-        ws.deck_fold = ok.then_some(crate::SettingsCard {
-            scrim: None,
-            rgba,
-            pw,
-            ph,
-            dx: x0,
-            dy: y0,
-            fp,
-            geom: fp,
-            raster_fingerprint_once: std::sync::OnceLock::new(),
-        });
+        ws.deck_fold = fold_cards(&cards, fp);
     }
+}
+
+/// `cards` composited in order onto one surface over their union, the fold the backends present
+/// ([`crate::App::fold_stats_deck`]), fingerprinted `fp`; `None` when the union's bytes do not
+/// fit a `usize` or a card does not composite.
+pub(crate) fn fold_cards(cards: &[&crate::SettingsCard], fp: u64) -> Option<crate::SettingsCard> {
+    let x0 = cards.iter().map(|c| c.dx).min().unwrap_or(0);
+    let y0 = cards.iter().map(|c| c.dy).min().unwrap_or(0);
+    let x1 = cards.iter().map(|c| c.dx + c.pw).max().unwrap_or(0);
+    let y1 = cards.iter().map(|c| c.dy + c.ph).max().unwrap_or(0);
+    let (pw, ph) = (x1 - x0, y1 - y0);
+    let len = usize::try_from(u64::from(pw) * u64::from(ph) * 4).ok()?;
+    let mut rgba = vec![0; len];
+    let ok = cards.iter().all(|card| {
+        crate::tray_raster::composite_rgba_surface(
+            &mut rgba,
+            (pw, ph),
+            (x0, y0),
+            &card.rgba,
+            (card.pw, card.ph),
+            (card.dx, card.dy),
+        )
+    });
+    ok.then_some(crate::SettingsCard {
+        scrim: None,
+        rgba,
+        pw,
+        ph,
+        dx: x0,
+        dy: y0,
+        fp,
+        geom: fp,
+        raster_fingerprint_once: std::sync::OnceLock::new(),
+    })
 }
 
 /// The deck's accessibility group's name (Stats Deck v2 §12).
@@ -2736,9 +2761,8 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// The merged deck's inks on every built-in band, under Increase
-    /// Contrast below, then on the mockups' two grounds above the inks the
-    /// mockups' generator drew, to judge against the swatches in
+    /// The merged deck's inks on every built-in band, with Increase Contrast's below, then on
+    /// the mockups' two grounds above the mockups' own inks, to judge against
     /// `docs/design-studies/top-deck-*-2026-10-23.png`.
     #[test]
     #[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
@@ -3029,7 +3053,7 @@ pub(crate) mod tests {
 
     /// The deck of a split tab, focused on pane 8, reads the whole tab: each scoped row's "this
     /// tab" share is both panes', inside all tabs, and its words say so. CONTROL: the focused
-    /// pane alone, what the deck read before a tab was summed, is less.
+    /// pane alone is less.
     #[test]
     fn a_split_tabs_deck_reads_every_pane() {
         let snap = split_tab(7, 8);
@@ -3101,11 +3125,9 @@ pub(crate) mod tests {
         font_px: 26.0,
     };
 
-    /// Where the Deck sits in the head: under macOS's titlebar at the head's
-    /// foot, as it always has; where the strip is the window's band (Linux,
-    /// Windows) at the head's top, with the band's lift less the Deck so the
-    /// band keeps its whole height under it (the Linux lane's
-    /// `proof-20261019-174123` found it over the band's middle).
+    /// The Deck sits at the head's foot under macOS's titlebar; where the strip is the
+    /// window's band (Linux, Windows), at the head's top, so the band keeps its whole height
+    /// under it.
     #[cfg(unix)]
     #[test]
     fn the_deck_takes_the_heads_foot_under_a_titlebar_and_its_top_over_a_band() {
@@ -3306,7 +3328,8 @@ pub(crate) mod tests {
         assert_eq!(words::pct(Some(0.004)), "<1%");
     }
 
-    /// T-G12 (Stats Deck v2 §12): the deck reads as one group of six OS
+    /// T-G12 (Stats Deck v2 §12): the deck reads as one group of six OS resource meters and
+    /// its CPU cores, each meter saying its row's words.
     #[cfg(a11y_tree)]
     #[test]
     fn a11y_meters() {
@@ -3425,6 +3448,6 @@ pub(crate) mod tests {
 #[path = "stats_deck_paint_tests.rs"]
 pub(crate) mod paint_tests;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 #[path = "stats_deck_fixtures.rs"]
 pub(crate) mod deck_fixtures;

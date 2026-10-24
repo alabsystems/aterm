@@ -724,16 +724,6 @@ impl PetWorld {
                         Some(self.selection_rect.map_or(rect, |old| old.union(rect)));
                 }
                 let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
-                let excluded = !spans.is_empty()
-                    && spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi);
-                let overlaid = !overlay_spans.is_empty()
-                    && overlay_spans
-                        .iter()
-                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
-                let typed = !typed_spans.is_empty()
-                    && typed_spans
-                        .iter()
-                        .any(|&(lo, hi)| lo <= local_c && local_c < hi);
                 let bg = (u32::from(cell.bg[0]) << 16)
                     | (u32::from(cell.bg[1]) << 8)
                     | u32::from(cell.bg[2]);
@@ -779,12 +769,24 @@ impl PetWorld {
                 } else {
                     PetGlyph::Substantive
                 });
-                let lasting =
-                    excluded || scan.image(frame_c).is_some() || line != LineSize::SingleWidth;
-                let transient = selected || overlaid;
+                let lasting = line != LineSize::SingleWidth
+                    || (!spans.is_empty()
+                        && spans.iter().any(|&(lo, hi)| lo <= local_c && local_c < hi))
+                    || scan.image(frame_c).is_some();
+                let transient = selected
+                    || (!overlay_spans.is_empty()
+                        && overlay_spans
+                            .iter()
+                            .any(|&(lo, hi)| lo <= local_c && local_c < hi));
                 let others = lasting || transient;
-                let painted = glyph || typed || bg != default_bg;
-                if (glyph && !speck) || typed || bg != default_bg {
+                let hull_ink = (glyph && !speck)
+                    || bg != default_bg
+                    || (!typed_spans.is_empty()
+                        && typed_spans
+                            .iter()
+                            .any(|&(lo, hi)| lo <= local_c && local_c < hi));
+                let painted = hull_ink || speck;
+                if hull_ink {
                     hull_lo = hull_lo.min(c as u16);
                     hull_hi = c as u16 + 1;
                 }

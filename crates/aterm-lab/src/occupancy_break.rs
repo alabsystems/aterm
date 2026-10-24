@@ -47,7 +47,7 @@ const SLEPT: &str = "slept";
 
 const BASH_TIMEOUT_MS: i64 = 600_000;
 
-const WORKFLOW_BOX: &str = aterm_phase::anchors::anchor_text("box.workflow");
+const WORKFLOW_BOX: &str = aterm_phase::anchor!("box.workflow");
 
 const WAITS_WITHIN_S: f64 = 120.0;
 

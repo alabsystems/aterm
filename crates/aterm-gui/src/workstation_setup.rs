@@ -27,7 +27,8 @@ pub struct SetupAnswer {
     pub decision: WorkstationSetupDecision,
     pub password: Option<aterm_secrets::SecretBytes>,
     pub receipt: Option<crate::InitialSetupApplyReceipt>,
-    /// The plan is a group choice (or a Join) made on the page, not the plan as it stood (the first-run offer applied, or Set up now): it is the chooser's, never the provisional plan aterm chose by itself (§3.5).
+    /// The plan is a group choice (or a Join) made on the page, not the plan as it stood
+    /// (the first-run offer applied, or Set up now), so never a provisional plan aterm chose.
     pub chosen: bool,
     /// A Join: the plan names the vault the person typed, which moves the Mac.
     pub vault_typed: bool,
@@ -204,12 +205,11 @@ pub(crate) enum AdmittedBy {
     Person,
 }
 
-/// THE WINDOW'S OWN ADMISSION: the gate that reads who touched System State
-/// and which revision the window's own Apply admitted ([`PermissionGate`]), and
-/// the token it alone mints ([`AdmittedAccess`]), live in a leaf module of
-/// their own, whose private fields nothing else in the crate can reach: not
-/// this module, nor its tests (the aterm-census guard `devtools-door` holds the
-/// leaf to that shape).
+/// The window's own admission: the gate that reads who touched System State and which
+/// revision the window's own Apply admitted ([`PermissionGate`]), and the token only it
+/// mints ([`AdmittedAccess`]), live in a leaf module whose private fields nothing else in
+/// the crate reaches, this module and its tests included. The aterm-census guard
+/// `devtools-door` holds the leaf to that shape.
 #[path = "workstation_setup_gate.rs"]
 mod permission_gate;
 pub(crate) use permission_gate::AdmittedAccess;
@@ -227,11 +227,10 @@ pub(crate) enum PagePress {
     Nobody,
 }
 
-/// What a real gate gives the debugger step's Tier-1 rig
-/// (`debugger_access::conformance`, the model's `Admitted`): the gate takes an
-/// Apply — the page's own answer to the startup offer (`window`), or a control
-/// client's — and the fresh status naming revision 1 with its Permissions group
-/// admitted, and answers the standing yes it then holds.
+/// The standing yes, if any, a real gate holds for the debugger step's conformance rig
+/// (`debugger_access::conformance`) after an Apply (the page's own answer to the startup offer
+/// when `window`, else a control client's) and a fresh status naming revision 1 with its
+/// Permissions group admitted.
 #[cfg(test)]
 pub(crate) fn gate_admission_for_test(window: bool) -> Option<AdmittedAccess> {
     let mut gate = PermissionGate::default();
@@ -355,7 +354,7 @@ const fn preview_mode(requested: bool, headless: bool, private: bool) -> Preview
     }
 }
 
-/// Exercise the real offer with an inert worker.
+/// The `saved-subset` preview's selection: every row but Dock, Messages and FaceTime.
 fn preview_subset() -> Selection {
     use aterm_types::macos_setup::Setting;
     let mut selected = Selection::all();
@@ -414,7 +413,8 @@ const fn may_start(headless: bool, painted: bool, incoming_pending: bool) -> boo
     !headless && painted && !incoming_pending
 }
 
-/// A carried command is inert in a validated running-window handoff.
+/// Whether this launch may offer the first-run setup: one with no command, or a relaunch
+/// of a running window through a validated handoff, where a carried command is inert.
 pub(crate) const fn eligible_launch_command(
     commandless: bool,
     relaunch: bool,
@@ -446,6 +446,13 @@ impl App {
     pub(crate) fn hold_initial_setup_permissions(&mut self) {
         self.workstation_setup.unified = true;
         self.workstation_setup.permissions.hold();
+        self.retire_launch_warmup();
+    }
+
+    pub(crate) fn stop_initial_setup_permissions(&mut self) {
+        self.workstation_setup.unified = true;
+        self.workstation_setup.permissions.stop();
+        self.retire_launch_warmup();
     }
 
     pub(crate) fn accepted_initial_setup_apply(&mut self) {
@@ -460,9 +467,11 @@ impl App {
         &mut self,
         policy: Option<crate::InitialSetupPermissionPolicy>,
     ) {
-        if self.workstation_setup.permissions.observe(policy)
-            && let Some(policy) = policy
-        {
+        let approved_here = self.workstation_setup.permissions.observe(policy);
+        if self.access_revision().is_none() {
+            self.retire_launch_warmup();
+        }
+        if approved_here && let Some(policy) = policy {
             // The window's own admission: the debugger's step, parked for want
             // of one, or over for an earlier revision, looks again (design §6:
             // a new approval asks again; once per Mac, so a Mac that answered
@@ -488,15 +497,13 @@ impl App {
         self.workstation_setup.permissions.note_touch(controller);
     }
 
-    /// Whose gestures led to the page's action being handled now (design §6):
-    /// a person's press only when a person touched the page and no control
-    /// client's gesture came since the page's previous action. Call it once
-    /// per action the page queued, as that action is taken: a row's
-    /// `Turn On…` passes `== PagePress::Person` as its `by_person`. A key an
-    /// `hwkey` burst posted counts as a control client's gesture too
-    /// (`hwkey::posted_keys`): its real `NSEvent` carries no gesture mark, and
-    /// one already queued as the page came to the front reaches it before the
-    /// burst stops.
+    /// Whose gestures led to the page's action being taken now (design §6): a person's press
+    /// only when a person touched the page and no control client's gesture came since the
+    /// page's previous action. Call it once per queued action, as it is taken (a row's
+    /// `Turn On…` passes `== PagePress::Person` as its `by_person`). Keys an `hwkey` burst
+    /// posted count as a control client's gestures (`hwkey::posted_keys`): their real
+    /// `NSEvent`s carry no gesture mark, and one queued as the page came to the front reaches
+    /// it before the burst stops.
     pub(crate) fn take_system_state_press(&mut self) -> PagePress {
         let controller_gestures = self
             .agents
@@ -530,9 +537,9 @@ impl App {
             .apply_started(answers_offer, press);
     }
 
-    /// THE STANDING YES for an access step the window starts by itself: the
-    /// plan with its Permissions group admitted, while that plan is the
-    /// window's own admission (design §6). `None` otherwise.
+    /// The standing yes for an access step the window starts by itself: the plan with its
+    /// Permissions group admitted, while that plan is the window's own admission (design §6).
+    /// `None` otherwise.
     pub(crate) fn admitted_access(&self) -> Option<AdmittedAccess> {
         self.workstation_setup.permissions.admitted(false)
     }
@@ -630,6 +637,67 @@ mod tests {
         Some(crate::InitialSetupPermissionPolicy { revision, allowed })
     }
 
+    #[test]
+    fn a_local_stop_keeps_only_a_later_persons_explicit_permission_intent() {
+        for controller in [false, true] {
+            let mut app = App::headless_for_test();
+            app.observe_initial_setup_permissions(policy(4, true));
+            app.stop_initial_setup_permissions();
+            assert_eq!(app.access_revision(), None);
+            assert!(app.admitted_access().is_none());
+            let answer = app.with_gesture_source(controller, |app| {
+                app.note_system_state_touch();
+                let press = app.take_system_state_press();
+                app.admitted_by_press(press == PagePress::Person)
+            });
+            assert_eq!(
+                answer.is_some(),
+                !controller,
+                "a control client never mints the yes"
+            );
+            if let Some(answer) = answer {
+                assert_eq!((answer.revision(), answer.by()), (4, AdmittedBy::Person));
+            }
+            assert_eq!(
+                app.access_revision(),
+                None,
+                "one row's press never reopens automatic work"
+            );
+        }
+
+        for broader_hold in [0, 1] {
+            let mut app = App::headless_for_test();
+            app.observe_initial_setup_permissions(policy(4, true));
+            app.hold_initial_setup_permissions();
+            if broader_hold == 1 {
+                app.accepted_initial_setup_apply();
+            }
+            app.stop_initial_setup_permissions();
+            assert!(
+                app.admitted_by_press(true).is_none(),
+                "Stop never weakens an existing decision or fresh-status hold"
+            );
+        }
+        for current in [None, policy(4, false)] {
+            let mut app = App::headless_for_test();
+            app.observe_initial_setup_permissions(policy(4, true));
+            app.stop_initial_setup_permissions();
+            app.observe_initial_setup_permissions(current);
+            assert!(
+                app.admitted_by_press(true).is_none(),
+                "unknown and revoked current policy remain closed"
+            );
+        }
+        let mut app = App::headless_for_test();
+        app.observe_initial_setup_permissions(policy(4, true));
+        app.stop_initial_setup_permissions();
+        app.hold_initial_setup_permissions();
+        assert!(
+            app.admitted_by_press(true).is_none(),
+            "a later Restore or choice restores its ordinary strict hold"
+        );
+    }
+
     /// One Apply through the gate as the host runs it: the hold, who it came
     /// from, the receipt, and the fresh status naming `revision`. Returns
     /// whether that status established the window's own admission.
@@ -640,10 +708,8 @@ mod tests {
         gate.observe(policy(revision, true))
     }
 
-    /// THE STANDING YES (design §6) is the window's own admission only: the
-    /// page's automatic answer to the startup offer, with nobody's gesture in
-    /// it, or a person's press on the page — and only for the revision that
-    /// admission named, while that plan stands.
+    /// The standing yes is the window's own admission only (the page's automatic answer or a
+    /// person's press), for the revision it named, while that plan stands.
     #[test]
     fn the_standing_yes_is_the_windows_own_admission_of_the_plan_in_force() {
         let mut gate = PermissionGate::default();
@@ -679,12 +745,9 @@ mod tests {
         assert!(gate.admitted(false).is_none(), "an unreadable status");
     }
 
-    /// NEVER FROM A CONTROL CLIENT, A STATUS POLL OR A HAND-EDITED RECORD: a
-    /// plan admitted by a control client's Apply, or one a status names that no
-    /// Apply of this window admitted (a poll, a record edited by hand), allows
-    /// the page's guidance but is no standing yes. A person's press on a row's
-    /// own button is one while the plan stands; a control client's is never one
-    /// (`App::admitted_by_press`).
+    /// A control client's Apply, a status poll or a hand-edited record allows the page's
+    /// guidance but mints no standing yes; a person's press on a row's own button does while
+    /// the plan stands.
     #[test]
     fn no_control_client_status_poll_or_record_mints_the_standing_yes() {
         let mut gate = PermissionGate::default();
@@ -713,10 +776,9 @@ mod tests {
         );
     }
 
-    /// Whose gesture an action came from: a control client's gesture anywhere
-    /// since the page's previous action, or one on the page itself, taints it,
-    /// whatever else touched the page; a person's touch alone is a person's
-    /// press; nothing is nobody's. Each take starts the evidence again.
+    /// A control client's gesture since the page's previous action, anywhere or on the page,
+    /// taints the press; a person's touch alone is a person's press, and no touch is nobody's.
+    /// Each take starts afresh.
     #[test]
     fn a_control_clients_gesture_is_never_a_persons_press() {
         let mut gate = PermissionGate::default();
@@ -737,18 +799,10 @@ mod tests {
         assert_eq!(gate.take_press(u64::MAX), PagePress::Nobody);
     }
 
-    /// THE PAGE'S OWN AUTOMATIC ANSWER, END TO END THROUGH THE HOST: the startup
-    /// offer on System State, its first frame presented, its first tick in an
-    /// active window with nobody touching it — the page queues its Apply, the
-    /// host answers the offer (`App::run_system_state_action` →
-    /// `App::note_system_state_apply` with the offer pending and no gesture),
-    /// the worker accepts it, and the fresh status naming the plan with its
-    /// Permissions group makes the window's own admission (`AdmittedBy::Window`),
-    /// the standing yes the debugger step spends. It holds when a control
-    /// client drove another tab meanwhile: agents at work elsewhere never cost a
-    /// new Mac its yes. CONTROL: a control client's gesture on the page itself
-    /// before that answer leaves the same plan admitted and no standing yes.
-    /// Any rework of the automatic run must keep this path.
+    /// The page's automatic answer to the startup offer, end to end through the host, makes
+    /// the window's own admission (`AdmittedBy::Window`), even while a control client drives
+    /// another tab. Control: a control client's gesture on the page itself first leaves the
+    /// plan admitted and no standing yes.
     #[test]
     fn the_pages_automatic_answer_is_the_windows_own_admission() {
         for (elsewhere, on_page) in [(false, false), (true, false), (false, true)] {

@@ -739,7 +739,7 @@ fn choose_text(
 pub const NOTES_UNREAD: &str = "its notes field did not read open after Tab";
 
 fn none_of_the_above(prompt: &PromptV2) -> Option<usize> {
-    let none = aterm_phase::anchor("muse.question.none");
+    let none = aterm_phase::anchor!("muse.question.none");
     prompt
         .options
         .iter()
@@ -747,14 +747,14 @@ fn none_of_the_above(prompt: &PromptV2) -> Option<usize> {
 }
 
 fn is_muse_question(prompt: &PromptV2) -> bool {
-    prompt.footer.as_deref() == Some(aterm_phase::anchor("muse.question.keys"))
+    prompt.footer.as_deref() == Some(aterm_phase::anchor!("muse.question.keys"))
 }
 
 fn muses_persons_question(prompt: &PromptV2) -> Option<String> {
     let footer = prompt.footer.as_deref()?;
-    let what = if footer == aterm_phase::anchor("muse.question.keys_multi") {
+    let what = if footer == aterm_phase::anchor!("muse.question.keys_multi") {
         "Muse Code's call of several questions"
-    } else if footer == aterm_phase::anchor("muse.question.keys_toggle") {
+    } else if footer == aterm_phase::anchor!("muse.question.keys_toggle") {
         "Muse Code's multi-select question"
     } else {
         return None;
@@ -796,7 +796,7 @@ fn review_answer(
     }
     let header = prompt
         .title
-        .strip_prefix(aterm_phase::anchor("muse.question.title"))
+        .strip_prefix(aterm_phase::anchor!("muse.question.title"))
         .map(str::trim)
         .unwrap_or_default();
     if header.is_empty() || header.contains(", ") || prompt.head_off_screen {
@@ -804,15 +804,15 @@ fn review_answer(
     }
     let want = format!(
         "{header}: {}{}{text}",
-        aterm_phase::anchor("muse.question.none"),
-        aterm_phase::anchor("muse.question.review.note")
+        aterm_phase::anchor!("muse.question.none"),
+        aterm_phase::anchor!("muse.question.review.note")
     );
     if prompt.description != want {
         return Decision::escalate(begun(
             "its review holds other answers than the note the supervisor wrote",
         ));
     }
-    let submit = aterm_phase::anchor("muse.question.submit");
+    let submit = aterm_phase::anchor!("muse.question.submit");
     let (Some(at), Some(focus)) = (
         prompt.options.iter().position(|o| o.label == submit),
         prompt.options.iter().position(|o| o.focused),
@@ -844,7 +844,7 @@ fn review_answer(
         unproven: Some(format!(
             "policy {word}: the worker decides: the review of its policy text written as the note \
              of `{}`",
-            aterm_phase::anchor("muse.question.none")
+            aterm_phase::anchor!("muse.question.none")
         )),
     }
 }
@@ -1043,11 +1043,11 @@ fn note_answer(
         subject: format!(
             "{} → {} (the {word} policy text as its note)",
             prompt.description,
-            aterm_phase::anchor("muse.question.none")
+            aterm_phase::anchor!("muse.question.none")
         ),
         unproven: Some(format!(
             "policy {word}: the worker decides: its policy text written as the note of `{}`",
-            aterm_phase::anchor("muse.question.none")
+            aterm_phase::anchor!("muse.question.none")
         )),
     }
 }

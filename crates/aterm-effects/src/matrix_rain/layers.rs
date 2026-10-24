@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rain's cells as fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §6,
-//! lane B7): one Grid-space Linear layer a grid row, under every other Linear
-//! layer, so a row whose cells did not change is a layer that did not change
-//! and the renderer repaints only the rows the rain moved in.
+//! The rain's cells as fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §6), one a grid row
+//! ([`RainLayers`]), so the renderer repaints only the rows the rain moved in.
 
 use std::sync::Arc;
 

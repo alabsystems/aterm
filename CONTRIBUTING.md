@@ -50,8 +50,8 @@ What to run before a pull request:
   ends COULD NOT RUN and names what provides it. After `verify provision`,
   with ALab's default set and the Command Line Tools installed, the only
   COULD NOT RUN left are for a tool aterm provides no copy of yet (zstd,
-  which only a publish host carries), a tool only another OS or the Linux
-  guest has, or hardware this machine lacks.
+  which only tests run, as the oracle aterm-zstd is held to), a tool only
+  another OS or the Linux guest has, or hardware this machine lacks.
 * `targo --unverified run -q -p aterm-verify -- fmt`, the formatter check
   (`fmt --fix` rewrites what it finds).
 * `targo-tippy --workspace --all-targets --keep-going -- -D warnings`,

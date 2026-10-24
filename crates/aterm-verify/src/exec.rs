@@ -962,12 +962,31 @@ fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
     match st {
         Ok(st) => Run {
             ok: st.success(),
-            output: String::new(),
+            output: ended_by_signal(st),
             code: st.code(),
             spawn_error: None,
         },
         Err(e) => failed_to_wait(&e.to_string()),
     }
+}
+
+/// The line a child killed by a signal cannot write for itself, naming the signal; empty for
+/// a child that exited.
+fn ended_by_signal(st: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(sig) = st.signal() {
+            let core = if st.core_dumped() {
+                ", core dumped"
+            } else {
+                ""
+            };
+            return format!("aterm-verify: the child was killed by signal {sig}{core}\n");
+        }
+    }
+    let _ = st;
+    String::new()
 }
 
 fn failed_to_wait(why: &str) -> Run {
@@ -1062,6 +1081,22 @@ mod tests {
         assert_eq!(
             run(&ask, env_in(&tmp)).trimmed_output(),
             "x unset /usr/bin:/bin"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_killed_by_a_signal_says_which_after_what_it_wrote() {
+        let tmp = crate::mktemp_dir("atv-signalled").expect("mktemp");
+        let run = run(
+            &Cmd::new("/bin/sh").args(["-c", "echo started; kill -KILL $$"]),
+            env_in(&tmp),
+        );
+        assert!(!run.ok && run.code.is_none(), "{run:?}");
+        assert_eq!(
+            run.trimmed_output(),
+            "started\naterm-verify: the child was killed by signal 9"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

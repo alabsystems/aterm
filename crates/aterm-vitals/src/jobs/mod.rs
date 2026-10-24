@@ -18,7 +18,7 @@ pub use step::{Fault, Progress, Tick, Track};
 pub use units::Jobs;
 pub use wait::{TierB, map_leaf_frame};
 
-/// How long a job reads RUNNING after a progress event.
+/// How long a job reads `running` after a progress event.
 pub const RUNNING_WINDOW_MS: u64 = 5_000;
 /// How long an exited job keeps its row.
 pub const EXITED_KEEP_MS: u64 = 60_000;
@@ -292,8 +292,9 @@ pub struct JobProc {
     pub tty: Option<u32>,
     /// That terminal's foreground process group.
     pub tpgid: Option<u32>,
-    /// That terminal's line discipline, read for a session leader (`aterm_sysprobe::jobs::term_word`);
-    /// `None` for any other process, or where aterm's user may not open the terminal.
+    /// That terminal's line discipline, read for a session leader
+    /// (`aterm_sysprobe::jobs::term_word`); `None` for any other process, or where aterm's user
+    /// may not open the terminal.
     pub term: Option<TermWord>,
     /// Its counters; `None` where refused.
     pub counters: Option<JobCounters>,
@@ -303,19 +304,24 @@ pub struct JobProc {
     pub wchan: Option<String>,
     /// Its descriptors, when asked for; `None` when not asked or refused.
     pub fds: Option<Vec<Fd>>,
-    /// Whether macOS's program check holds it before its first instruction (`aterm_sysprobe::jobs::AtStart::Held`).
+    /// Whether macOS's program check holds it before its first instruction
+    /// (`aterm_sysprobe::jobs::AtStart::Held`).
     pub program_check: bool,
 }
 
-/// What keeps a process whose one thread never ran from its first instruction past 20 s (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), as the host judged it (`aterm_sysprobe::jobs::AtStart`).
+/// What keeps a process whose one thread never ran from its first instruction past 20 s
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), as the host judged it
+/// (`aterm_sysprobe::jobs::AtStart`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StartWait {
     /// macOS's program check holds it: native, its executable on a local volume.
     #[default]
     ProgramCheck,
-    /// An x86_64 process on an arm64 Mac: Rosetta translates it, and aterm's Developer Tools grant does not reach that.
+    /// An x86_64 process on an arm64 Mac: Rosetta translates it, and aterm's Developer Tools
+    /// grant does not reach that.
     Translating,
-    /// Its executable is on a volume not proven local: it has not started, and nothing read says why.
+    /// Its executable is on a volume not proven local: it has not started, and nothing read
+    /// says why.
     NotStarted,
 }
 
@@ -331,12 +337,14 @@ impl StartWait {
     }
 }
 
-/// One process of aterm's user whose one thread never ran past 20 s, member of a job or not, as the host read it: held at macOS's program check, translating, or not started ([`StartWait`]).
+/// One process of aterm's user, in a job or not, whose one thread never ran past 20 s: held at
+/// macOS's program check, translating, or not started ([`StartWait`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeldProc {
     /// Its pid.
     pub pid: u32,
-    /// Which program the pid runs: its pid version where read (it moves on exec), else its start. A wrapper that execs its held tool starts a new held time.
+    /// Which program the pid runs: its pid version where read (it moves on exec), else its
+    /// start. A wrapper that execs its held tool starts a new held time.
     pub exec: u64,
     /// Its executable's basename, else its short name.
     pub name: String,
@@ -463,7 +471,7 @@ impl Consumer {
     }
 }
 
-/// What the agent-transcript join (P2b) learned about one detached call.
+/// What the agent-transcript join learned about one detached call.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallHint {
     /// The call's leader pid.
@@ -514,6 +522,9 @@ pub struct JobTab {
     pub output_ms: Option<u64>,
     /// When aterm last read PTY output holding a line feed, host ms.
     pub line_output_ms: Option<u64>,
+    /// When aterm last read PTY output that drew the screen (put the cursor on a row of its own
+    /// choosing or moved rows: nvim, Emacs, a pager, whose line feeds are cursor moves), host ms.
+    pub drawn_ms: Option<u64>,
     /// PTY bytes read so far (cumulative).
     pub output_bytes: u64,
     /// When the program last consumed typed input, host ms.
@@ -575,7 +586,8 @@ pub struct JobTick {
     pub self_uid: Option<u32>,
     /// The cheap sweep of every process.
     pub sweep: Vec<SweepProc>,
-    /// The detailed readings of what [`Jobs::plan`] asked for (a process gone or refused meanwhile is simply absent).
+    /// The detailed readings of what [`Jobs::plan`] asked for (a process gone or refused
+    /// meanwhile is absent).
     pub procs: Vec<JobProc>,
     /// Every tab.
     pub tabs: Vec<JobTab>,
@@ -585,7 +597,8 @@ pub struct JobTick {
     pub lanes: LanesSeen,
     /// The per-user process limit (`kern.maxprocperuid`, `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
-    /// aterm's user's processes that have not started now: macOS's program check holds them, Rosetta translates them, or their volume is not proven local.
+    /// aterm's user's processes that have not started: held at macOS's program check,
+    /// translated by Rosetta, or on a volume not proven local.
     pub held: Vec<HeldProc>,
 }
 
@@ -1046,12 +1059,16 @@ pub struct Named {
     pub for_ms: u64,
 }
 
-/// A stretch of readings in which macOS's program check is backed up (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1): it opens at the first reading where one of aterm's user's programs was held at the reading before too, or three are held at once, and closes at the second reading in a row that finds none held.
+/// A stretch of readings in which macOS's program check is backed up
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1). It opens at the first reading where one
+/// of aterm's user's programs was held at the reading before too, or three are held at once, and
+/// closes at the second reading in a row that finds none held.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeldEpisode {
     /// The reading it opened at, host ms.
     pub opened_ms: u64,
-    /// From its opening to its last reading that found a program held (this one, while one is held), ms.
+    /// From its opening to its last reading that found a program held (this one, while one is
+    /// held), ms.
     pub for_ms: u64,
     /// The most programs held at one reading.
     pub peak: u32,
@@ -1070,7 +1087,8 @@ pub struct Findings {
     pub d_state: Vec<Named>,
     /// Orphans burning a core for ≥ 10 min with no side writes.
     pub busy_orphans: Vec<Named>,
-    /// Own processes macOS's program check holds, members of a job or not, each held since the first reading that saw it held, by pid; a lower bound (only aterm's user is read).
+    /// Own processes macOS's program check holds, in a job or not, each since the first reading
+    /// that saw it held, by pid; a lower bound (only aterm's user is read).
     pub program_check: Vec<Named>,
     /// Of those, the ones aterm started: how many, and the longest held, ms.
     pub program_check_aterm: (u32, u64),
@@ -1078,11 +1096,15 @@ pub struct Findings {
     pub program_check_episode: Option<HeldEpisode>,
     /// The episode that closed at this reading (set on that one view only).
     pub program_check_drained: Option<HeldEpisode>,
-    /// Own x86_64 processes on an arm64 Mac whose one thread never ran past 20 s, each since the first reading that saw it so: Rosetta translates them ("translating (Rosetta)"), and aterm's Developer Tools grant does not reach that.
+    /// Own x86_64 processes on an arm64 Mac whose one thread never ran past 20 s, each since the
+    /// first reading that saw it so ([`StartWait::Translating`]).
     pub translating: Vec<Named>,
-    /// Own processes with the same signature whose executable is not proven on a local volume, each since the first reading that saw it so: they have not started, and nothing read says why.
+    /// Own processes with the same signature whose executable is not proven on a local volume,
+    /// each since the first reading that saw it so ([`StartWait::NotStarted`]).
     pub not_started: Vec<Named>,
-    /// Inside a backed-up episode, the job members that started but whose CPU did not move since the reading before while they hold a fresh dylib open: probably waiting for the same check, a heuristic (§5.1's dylib case; U4 is unmeasured). `for_ms` is 0.
+    /// Inside a backed-up episode, the job members that started but whose CPU did not move since
+    /// the reading before while they hold a fresh dylib open: probably waiting for the same
+    /// check, a heuristic (§5.1's dylib case). `for_ms` is 0.
     pub probably_program_check: Vec<Named>,
     /// Own-uid processes, zombies included.
     pub own_procs: u64,
@@ -1125,7 +1147,8 @@ pub struct JobsView {
     pub demand: Demand,
     /// Lanes that are off, as `lane_off:<name>` words for `sys jobs --json`.
     pub lanes_off: Vec<&'static str>,
-    /// The tabs PARKED ON THE PERSON'S READ this tick, ascending.
+    /// The tabs, ascending, whose every live job waits at the person's own terminal read this
+    /// tick and none is watched at the fast cadence (stuck, or on a suspect wait).
     pub parked_tabs: Vec<u64>,
 }
 
@@ -1237,7 +1260,7 @@ pub fn median(values: impl IntoIterator<Item = u64>) -> u64 {
     v[(v.len() - 1) / 2]
 }
 
-/// φ × 1000 for `quiet_ms` against `mu_ms`: `t /`, the exponential phi-accrual form.
+/// φ × 1000 for `quiet_ms` against `mu_ms`: `t / (μ · ln 10)`, the exponential phi-accrual form.
 #[must_use]
 pub fn phi_milli(quiet_ms: u64, mu_ms: u64) -> u64 {
     let den = u128::from(mu_ms.max(1)) * 2_302_585;

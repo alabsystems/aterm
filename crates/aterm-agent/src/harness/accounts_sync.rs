@@ -4258,6 +4258,15 @@ fn spawn_row_renewal(
             return RenewalDispatch::Held;
         }
     }
+    // The machine's one sign-in at a time, taken before anything is admitted: while another
+    // sign-in (a vendor's renewal, `accounts browser`'s window, another process's) holds it this
+    // renewal is Held, so a pin request stays pending for a later upkeep, with no cooldown
+    // started and nothing woken, and the lock taken here is held by the work it starts.
+    let signin = match accounts::Store::at(state_dir).signin_now() {
+        Ok(Some(signin)) => signin,
+        Ok(None) => return RenewalDispatch::Held,
+        Err(_) => return RenewalDispatch::Failed,
+    };
     let Some(mut permit) = AutoRenewPermit::claim_with_mailbox(
         renew_guard,
         &next_label,
@@ -4368,13 +4377,7 @@ fn spawn_row_renewal(
                     now_done,
                 )
             };
-            let Ok(Some(_signin)) = store.signin_within() else {
-                if let Some(request) = &pin_request {
-                    let _ = store
-                        .cancel_pin_request(request, crate::supervise::limit::unix_now().max(now));
-                }
-                return;
-            };
+            let _signin = signin;
             let renewed = (|| {
                 let opener = resolve_opener_link(&home_owned, &store);
                 let non_headless_fallback = select_auto_renew_browser(
@@ -7890,6 +7893,92 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .cancel_pin_request(&final_request, UPKEEP_NOW)
             .unwrap();
         assert_eq!(store.load(UPKEEP_NOW).unwrap().0, pinned);
+    }
+
+    /// A PERSON'S PIN OF A CLAUDE CODE ROW WAITS OUT ANOTHER CLI'S SIGN-IN: while a vendor's
+    /// sign-in (another process's, so this one's admission is free) holds the machine's sign-in
+    /// lock, the pin's renewal is Held before anything is admitted, its request stays pending
+    /// for a later upkeep, no cooldown starts and no work is queued. CONTROL: once the lock is
+    /// free the same request starts its renewal (dropped here unrun), holding the lock itself.
+    #[test]
+    fn a_vendor_sign_in_holding_the_lock_keeps_a_claude_pin_request_pending() {
+        use std::sync::{Arc, Mutex};
+
+        let w = World::new();
+        w.write_config("[fleet]\nmachine = \"m27\"\n");
+        let store = accounts::Store::at(&w.state);
+        store.machine_id("0123456789abcdef").unwrap();
+        let roster = Roster {
+            rows: ["m27", "m27-2"]
+                .into_iter()
+                .map(|label| Row {
+                    label: label.into(),
+                    dir: Some(store.logins_dir().join(label).to_str().unwrap().into()),
+                    email: Some(format!("{label}@example.test")),
+                    ..Row::default()
+                })
+                .collect(),
+        };
+        fs::write(w.roster(), format_roster_toml(&roster).unwrap()).unwrap();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        type Work = Box<dyn FnOnce() + Send>;
+        let queued: Arc<Mutex<Vec<Work>>> = Arc::new(Mutex::new(Vec::new()));
+        let into_queue = Arc::clone(&queued);
+        let spawn = move |work| {
+            into_queue.lock().unwrap().push(work);
+            Ok(())
+        };
+        let request = match store.select_account(&roster, "m27", UPKEEP_NOW).unwrap() {
+            accounts::PinSelection::Renew(request) => request,
+            accounts::PinSelection::Pinned => panic!("the fixture login is absent"),
+        };
+        let kimi = accounts::Store::at_for(&w.state, accounts::Cli::Kimi, &w.home);
+        let vendor = kimi
+            .signin_now()
+            .unwrap()
+            .expect("the vendor's sign-in takes the lock");
+        assert!(
+            store.signin_now().unwrap().is_none(),
+            "the lock is held against this store too"
+        );
+        let renew = || {
+            renew_requested_pin(
+                &w.home,
+                &w.state,
+                &w.roster(),
+                request.clone(),
+                UPKEEP_NOW,
+                &guard,
+                &spawn,
+            )
+        };
+        assert_eq!(renew(), RenewalDispatch::Held);
+        assert!(queued.lock().unwrap().is_empty(), "nothing queued");
+        assert_eq!(
+            store.load(UPKEEP_NOW).unwrap().0.pending_pin,
+            Some(request.clone()),
+            "the person's pin stays pending"
+        );
+        {
+            let admitted = guard.lock().unwrap();
+            assert!(!admitted.in_flight);
+            assert!(!admitted.last_attempt.contains_key("m27"), "no cooldown");
+        }
+
+        drop(vendor);
+        assert_eq!(renew(), RenewalDispatch::Started, "CONTROL");
+        assert_eq!(queued.lock().unwrap().len(), 1);
+        assert!(
+            kimi.signin_now().unwrap().is_none(),
+            "CONTROL: the queued renewal holds the lock"
+        );
+        queued.lock().unwrap().clear();
+        assert!(!guard.lock().unwrap().in_flight);
+        assert!(
+            kimi.signin_now().unwrap().is_some(),
+            "released with its work"
+        );
+        store.cancel_pin_request(&request, UPKEEP_NOW).unwrap();
     }
 
     #[test]

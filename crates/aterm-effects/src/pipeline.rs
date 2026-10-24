@@ -1266,8 +1266,8 @@ impl EffectsPipeline {
         }
     }
 
-    /// Update theme-derived rain colors without requiring the host to replay every matrix-rain knob
-    /// after a live theme change.
+    /// Update theme-derived rain colors without the host replaying every matrix-rain knob after a
+    /// live theme change.
     #[inline]
     pub fn set_matrix_rain_theme(&mut self, default_bg: u32, theme_fg: u32, theme_accent: u32) {
         let default_bg = default_bg & 0x00FF_FFFF;
@@ -1287,7 +1287,7 @@ impl EffectsPipeline {
         }
     }
 
-    /// Reduce-motion for rain.
+    /// Reduce-motion for rain, which sets it for every effect ([`Self::set_reduced_motion`]).
     #[inline]
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
         self.set_reduced_motion(on);
@@ -4665,16 +4665,9 @@ mod tests {
         }
     }
 
-    /// THE WORD ICONS' SHADE reaches what the host draws (looks6 N3): every
-    /// host hands it the trail's streams before its word pass names the
-    /// frame's icons (the web host here, a capture and a split frame in the
-    /// window), so the shade lifts the light off an icon new to the frame in
-    /// the published streams, where a shade of the glow's own buffers left
-    /// the Return's flare and the sky's stars on the `fox`. It lifts the
-    /// light off the face's drawn texels only: the sprite box's transparent
-    /// margin keeps light, where a cut to the box's foot carved a notch out
-    /// of the wash. Negative control: unshaded, the same frames lay light
-    /// on the face.
+    /// The trail's published streams lay no light on a word icon's drawn texels, while the sprite
+    /// box's transparent margin keeps its light. Negative control: unshaded, the same frames lay
+    /// light on the face.
     #[test]
     fn the_published_trail_lays_no_light_on_a_word_icon() {
         use aterm_core::render::FxTexels;

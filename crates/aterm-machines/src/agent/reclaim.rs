@@ -55,13 +55,13 @@ const MAC: Commands<'static> = Commands {
 };
 
 /// The job's `/bin/sh` script, run as `sh -c <script> <label> <run> <boot id> <seconds>
-/// <folder>...`. Unless the Mac has restarted since uninstall read `<boot id>`, it first
-/// waits `<seconds>` with no wake inside them, so they are awake time whether or not `sleep`
-/// counts time asleep. Then it atomically claims each folder's [`KEPT`] and empties only one
-/// whose regular, non-link claim names `<run>`, from inside that folder. The claim goes last
-/// so a run cut short by a shutdown is taken up at the next boot. It removes each folder,
-/// `stage/`, `state/` and the agent root that is empty then. Last it removes its plist and
-/// itself.
+/// <folder>...`. Unless the Mac has restarted since uninstall read `<boot id>`, it first waits
+/// `<seconds>` with no wake inside them, so they are awake time whether or not `sleep` counts
+/// time asleep. Then, from inside each folder that is not a link, it atomically claims its
+/// [`KEPT`] and empties it only where the claim is a regular file, not a link, naming `<run>`,
+/// removing the claim last so a run a shutdown cuts short is taken up at the next boot. It
+/// removes each folder, `stage/`, `state/` and the agent root that is empty then, and last its
+/// plist and itself.
 fn script(layout: &Layout, plist: &Path, label: &str, c: &Commands<'_>) -> String {
     let Commands {
         session,
@@ -456,8 +456,8 @@ mod tests {
         );
         assert!(!dir.join(CLAIM).exists());
 
-        // A shutdown after the claim leaves the exact run's claim for its launchd job to
-        // resume. No second marker is needed, and the completed job removes its claim.
+        // A shutdown after the claim leaves the run's claim for its job to resume; the finished
+        // job removes it.
         let layout = Layout {
             root: tmp.path().join("resumed"),
         };

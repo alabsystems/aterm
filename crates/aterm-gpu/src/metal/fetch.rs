@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Framebuffer fetch on Apple GPUs (design §5, lane B6): whether a device may draw a frame's Unorm-law groups inside its sRGB passes, decided once per device by an exhaustive 256-value round trip through its sRGB store and fetch.
+//! Framebuffer fetch on Apple GPUs (`docs/DESIGN-card-engine-2026-10-19.md` §5, the pass
+//! economy): whether a device may draw a frame's Unorm-law light inside its sRGB passes,
+//! decided once per device.
 //!
-//! A frame's additive and glow light blends by the Unorm byte law, so on every arm it draws on the offscreen's Unorm view, and a frame that holds it opens a pass per switch of view: five for a card or a cursor glow over text. On a device with framebuffer fetch (`[[color(0)]]`, an Apple GPU), each Unorm-law row has a twin (`*_fetch` in `cell.metal`) that reads the stored byte through the sRGB view, applies its row's blend in exact integers and stores the result through the same view, so the frame stays in one pass. That is byte-exact only where the device's sRGB fetch and store return every byte: `encode(decode(b)) == b` for all 256 values, through the very conversions the twins call, and where a twin fetching what an earlier fixed-function sRGB blend of its own pass left reads the byte the pass would store. This module probes exactly that, once per device, and caches the answer; until it is [`FetchProbe::Passed`] the split stays.
+//! Unorm-law light (additive and glow) draws on the offscreen's Unorm view, so a frame that
+//! holds it opens a pass per switch of view. On a device with framebuffer fetch
+//! (`[[color(0)]]`), each Unorm-law row has a twin (`*_fetch` in `cell.metal`) that fetches the
+//! stored byte through the sRGB view, blends in exact integers and stores through the same
+//! view, keeping the frame in one pass. That is byte-exact only where the device's sRGB fetch
+//! and store round-trip all 256 bytes through the conversions the twins call
+//! (`encode(decode(b)) == b`), and where a fetch after a fixed-function sRGB blend in the same
+//! pass reads the byte the pass would store. [`probe`] checks exactly that; until a device's
+//! cached verdict is [`FetchProbe::Passed`] the split stays.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -17,7 +27,8 @@ use crate::device_layer::{
 use crate::pipeline_table::{Pipeline, PipelineSpec, WriteMask};
 use crate::{FetchProbe, FetchStage};
 
-/// `MTLGPUFamilyApple1`: every Apple GPU answers it, and every Apple GPU has framebuffer fetch. An Intel or AMD Mac's GPU answers the `Mac2` family alone.
+/// `MTLGPUFamilyApple1`: every Apple GPU answers it, and every Apple GPU has framebuffer
+/// fetch. An Intel or AMD Mac's GPU answers the `Mac2` family alone.
 const GPU_FAMILY_APPLE1: isize = 1001;
 
 /// The probe's fragment stages, by entry point: [`SHIPPED`] in the process, mutants in the tests.
@@ -27,9 +38,12 @@ pub(crate) struct Stages {
     pub(crate) store: &'static str,
     /// Row 1, and row 3 in a pass of its own: every stored byte, fetched and stored again.
     pub(crate) trip: &'static str,
-    /// Rows 2 and 3: a colour over the uploaded bytes at a fractional alpha, through a fixed-function sRGB blend, which leaves values off the byte lattice in the tile until the pass stores them.
+    /// Rows 2 and 3: a colour over the uploaded bytes at a fractional alpha, through a
+    /// fixed-function sRGB blend, which leaves values off the byte lattice in the tile until
+    /// the pass stores them.
     pub(crate) blend: &'static str,
-    /// Row 2: the trip in its blend's own pass, so it fetches what the blend left in the tile rather than the byte a load reads back.
+    /// Row 2: the trip in its blend's own pass, so it fetches what the blend left in the tile
+    /// rather than the byte a load reads back.
     pub(crate) in_pass: &'static str,
 }
 
@@ -48,12 +62,15 @@ const ROWS: u32 = 4;
 /// One row's bytes.
 const ROW_LEN: usize = (ROW * 4) as usize;
 
-/// Whether `dev` has framebuffer fetch, so `cell.metal` compiles its twins and probe for it ([`super::shaders::source_for`]).
+/// Whether `dev` has framebuffer fetch, so `cell.metal` compiles its twins and probe for it
+/// ([`super::shaders::source_for`]).
 pub(crate) fn capable(dev: &Device) -> bool {
     dev.supports_family(GPU_FAMILY_APPLE1)
 }
 
-/// Whether `lib` is a `cell.metal` compiled with its twins and probe for a device with framebuffer fetch: without them (an Intel or AMD Mac, or a compiler that refused them, [`super::pipelines::compile_library`]) the device reads as [`FetchProbe::Unsupported`].
+/// Whether `lib` is a `cell.metal` compiled with its twins and probe for a device with
+/// framebuffer fetch: without them (an Intel or AMD Mac, or a compiler that refused them,
+/// [`super::pipelines::compile_library`]) the device reads as [`FetchProbe::Unsupported`].
 pub(crate) fn compiled_with_twins(dev: &Device, lib: &Library) -> bool {
     capable(dev) && lib.function(SHIPPED.store).is_some()
 }
@@ -71,7 +88,8 @@ fn cached(id: u64) -> Option<FetchProbe> {
         .map(|&(_, v)| v)
 }
 
-/// What the process knows of `dev`'s verdict without probing: [`FetchProbe::Unsupported`] where `lib` (its `cell.metal`) holds no twins, else the cached verdict, else `None`.
+/// What the process knows of `dev`'s verdict without probing: [`FetchProbe::Unsupported`]
+/// where `lib` (its `cell.metal`) holds no twins, else the cached verdict, else `None`.
 pub(crate) fn known(dev: &Device, lib: &Library) -> Option<FetchProbe> {
     if !compiled_with_twins(dev, lib) {
         return Some(FetchProbe::Unsupported);
@@ -79,7 +97,11 @@ pub(crate) fn known(dev: &Device, lib: &Library) -> Option<FetchProbe> {
     cached(dev.registry_id())
 }
 
-/// The device's verdict: [`FetchProbe::Unsupported`] where `lib` (the device's `cell.metal`, [`super::pipelines::compile_library`]) holds no twins, else [`settle`] of [`probe`] with [`SHIPPED`]. The first-frame warm asks on its cell lane, off the first window's thread; an arm asks itself only for the first frame that draws Unorm-law light while no warm still owes the probe ([`super::warm::WarmLatch::probe_pending`]). A device that fails is reported once, on stderr, as its verdict is cached.
+/// The device's verdict: [`FetchProbe::Unsupported`] where `lib` (its `cell.metal`) holds no
+/// twins, else [`settle`] of [`probe`] with [`SHIPPED`]. The first-frame warm asks off the
+/// first window's thread; an arm asks itself only for its first frame that draws Unorm-law
+/// light while no warm owes the probe ([`super::warm::WarmLatch::probe_pending`]). A failing
+/// device is reported once on stderr, when its verdict is cached.
 pub(crate) fn verdict(
     mint: &MetalResourceDevice,
     session: &EncodeSession,
@@ -107,7 +129,10 @@ pub(crate) fn verdict(
     v
 }
 
-/// `id`'s cached verdict, else `probe`'s, cached unless it was [`FetchProbe::Refused`] (the probe could not run, so the next ask probes again), with whether this call cached it. The cache is not held across `probe`, so two first asks may both probe; the first verdict cached stands.
+/// `id`'s cached verdict, else `probe`'s, cached unless it was [`FetchProbe::Refused`] (the
+/// probe could not run, so the next ask probes again), with whether this call cached it. The
+/// cache is not held across `probe`, so two first asks may both probe; the first verdict cached
+/// stands.
 fn settle(id: u64, probe: impl FnOnce() -> FetchProbe) -> (FetchProbe, bool) {
     if let Some(v) = cached(id) {
         return (v, false);
@@ -124,7 +149,14 @@ fn settle(id: u64, probe: impl FnOnce() -> FetchProbe) -> (FetchProbe, bool) {
     (v, true)
 }
 
-/// The probe itself, through `stages` ([`Stages`]): one 256 × 4 Rgba8Unorm target drawn through its sRGB view in two passes. The first draws row 0 by `store` over zeroed colour, row 1 by `trip` over the bytes the store stage should give, row 2 by `blend` and then `in_pass`, and row 3 by `blend`; the second draws row 3 by `trip`, over the bytes the first stored. Pixel `x` carries `x`, `255 − x` and `x ^ 0x5A` (`fetch_probe_bytes`), so each channel meets every byte. Row 0 must read back those bytes, row 1 itself, and row 2 row 3's bytes: a fetch inside the blend's pass sees the byte the pass stores. Every row's alpha is uploaded and must come back untouched, as the twins' Color write mask keeps it.
+/// The probe itself, through `stages` ([`Stages`]): one 256 × 4 Rgba8Unorm target drawn
+/// through its sRGB view in two passes. The first draws row 0 by `store` over zeroed colour,
+/// row 1 by `trip` over the bytes the store stage should give, row 2 by `blend` and then
+/// `in_pass`, and row 3 by `blend`; the second draws row 3 by `trip`, over the bytes the first
+/// stored. Pixel `x` carries `x`, `255 − x` and `x ^ 0x5A` (`fetch_probe_bytes`), so each
+/// channel meets every byte. Row 0 must read back those bytes, row 1 itself, and row 2 row 3's
+/// bytes: a fetch inside the blend's pass sees the byte the pass stores. Every row's alpha is
+/// uploaded and must come back untouched, as the twins' Color write mask keeps it.
 pub(crate) fn probe(
     mint: &MetalResourceDevice,
     session: &EncodeSession,
@@ -146,7 +178,8 @@ const fn row_bytes(x: u32) -> [u8; 3] {
     [x, 255 - x, x ^ 0x5A]
 }
 
-/// The rows as uploaded: row 0 zero colour under alpha `x`, the others the bytes under alphas of their own.
+/// The rows as uploaded: row 0 zero colour under alpha `x`, the others the bytes under alphas
+/// of their own.
 fn upload_rows() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(ROW_LEN * ROWS as usize);
     for x in 0..ROW {
@@ -162,7 +195,9 @@ fn upload_rows() -> Vec<u8> {
     bytes
 }
 
-/// What each row must read back, given what the probe read (`got`): row 0 the bytes, row 1 itself, rows 2 and 3 the colour the separate pass stored in row 3, each under its uploaded alpha.
+/// What each row must read back, given what the probe read (`got`): row 0 the bytes, row 1
+/// itself, rows 2 and 3 the colour the separate pass stored in row 3, each under its uploaded
+/// alpha.
 fn expected_rows(got: &[u8]) -> Vec<u8> {
     let mut want = upload_rows();
     for x in 0..ROW as usize {
@@ -192,7 +227,9 @@ fn judge(got: &[u8], want: &[u8]) -> FetchProbe {
     }
 }
 
-/// The spec of a probe stage: `vs_bg` and its layout, the stage's fragment, the sRGB view, the Color write mask, and no blend but the blend stage's straight-alpha over (the cursor blend's).
+/// The spec of a probe stage: `vs_bg` and its layout, the stage's fragment, the sRGB view, the
+/// Color write mask, and no blend but the blend stage's straight-alpha over (the cursor
+/// blend's).
 fn stage_spec(fs: &'static str, blended: bool) -> PipelineSpec {
     let base = if blended {
         Pipeline::CursorBlend
@@ -256,7 +293,8 @@ fn run(
     let mut rows = Vec::with_capacity(ROWS as usize);
     for y in 0..ROWS as u16 {
         let row = layer.try_create_instance_buffer("aterm-gpu fetch probe row", 12)?;
-        // SAFETY: the buffer is freshly minted shared storage no GPU work has touched, written once before the one command buffer that reads it.
+        // SAFETY: the buffer is freshly minted shared storage no GPU work has touched, written
+        // once before the one command buffer that reads it.
         unsafe { layer.write_buffer_from_zero(&row, &row_instance(y)) };
         rows.push(row);
     }
@@ -309,7 +347,8 @@ fn run(
         ROW as usize,
         ROWS as usize,
     )?;
-    // SAFETY: `readback` is shared storage of `stride * ROWS` bytes, and `metal_stage_readback` returned after the copy that wrote it completed.
+    // SAFETY: `readback` is shared storage of `stride * ROWS` bytes, and
+    // `metal_stage_readback` returned after the copy that wrote it completed.
     let bytes = unsafe { super::ffi::buffer_bytes(&readback, stride * ROWS as usize) };
     let mut got = Vec::with_capacity(ROW_LEN * ROWS as usize);
     for y in 0..ROWS as usize {

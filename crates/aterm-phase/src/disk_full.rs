@@ -114,7 +114,7 @@ fn segments(row: &str) -> impl Iterator<Item = &str> {
 }
 
 fn notification(rows: &[String], i: usize) -> Option<DiskFull> {
-    let anchor = const { crate::anchors::anchor_text("wall.disk_full") };
+    let anchor = const { crate::anchor!("wall.disk_full") };
     let row = crate::text::trim_end(&rows[i]);
     segments(row).find_map(|seg| {
         let words = after_glyph(seg);
@@ -165,7 +165,7 @@ fn result_row(row: &str) -> Option<&str> {
 }
 
 fn exit_row(row: &str) -> bool {
-    let exit = const { crate::anchors::anchor_text("wall.disk_full.tool_exit") };
+    let exit = const { crate::anchor!("wall.disk_full.tool_exit") };
     result_row(crate::text::trim_end(row))
         .and_then(|t| t.strip_prefix(FAILED_RESULT))
         .and_then(|t| t.strip_prefix(exit))
@@ -185,9 +185,9 @@ fn result_head(rows: &[String], i: usize) -> Option<&str> {
 
 fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
     let heads = [
-        const { crate::anchors::anchor_text("wall.disk_full.tool") },
-        const { crate::anchors::anchor_text("wall.disk_full.tool_inodes") },
-        const { crate::anchors::anchor_text("wall.disk_full.tool_quota") },
+        const { crate::anchor!("wall.disk_full.tool") },
+        const { crate::anchor!("wall.disk_full.tool_inodes") },
+        const { crate::anchor!("wall.disk_full.tool_quota") },
         TOOL_HEAD_BEFORE_2_1_309,
     ];
     let row = crate::text::trim_end(&rows[i]);
@@ -215,10 +215,10 @@ fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
             Code::Enospc
         }
     } else {
-        if !joined.contains(const { crate::anchors::anchor_text("wall.disk_full.tool_dir") }) {
+        if !joined.contains(const { crate::anchor!("wall.disk_full.tool_dir") }) {
             return None;
         }
-        if head == const { crate::anchors::anchor_text("wall.disk_full.tool_quota") } {
+        if head == const { crate::anchor!("wall.disk_full.tool_quota") } {
             Code::Edquot
         } else {
             Code::Enospc
@@ -253,14 +253,14 @@ fn pre_start(rows: &[String], i: usize, room: usize) -> Option<DiskFull> {
     let joined = drawn.join(" ");
     let said = joined
         .strip_prefix(FAILED_RESULT)?
-        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start") })?;
+        .strip_prefix(const { crate::anchor!("wall.disk_full.pre_start") })?;
     let (code, rest) = [
         (
-            const { crate::anchors::anchor_text("wall.disk_full.pre_start_full") },
+            const { crate::anchor!("wall.disk_full.pre_start_full") },
             Code::Enospc,
         ),
         (
-            const { crate::anchors::anchor_text("wall.disk_full.pre_start_quota") },
+            const { crate::anchor!("wall.disk_full.pre_start_quota") },
             Code::Edquot,
         ),
     ]
@@ -272,14 +272,12 @@ fn pre_start(rows: &[String], i: usize, room: usize) -> Option<DiskFull> {
             .strip_prefix(')')?;
         Some((code, rest))
     })?;
-    let rest = rest
-        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start_volume") })?;
-    let (dir, rest) =
-        rest.split_once(const { crate::anchors::anchor_text("wall.disk_full.tool_dir") })?;
+    let rest = rest.strip_prefix(const { crate::anchor!("wall.disk_full.pre_start_volume") })?;
+    let (dir, rest) = rest.split_once(const { crate::anchor!("wall.disk_full.tool_dir") })?;
     let advice = rest
-        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start_ran") })?
+        .strip_prefix(const { crate::anchor!("wall.disk_full.pre_start_ran") })?
         .strip_prefix(' ')?;
-    let whole = advice == const { crate::anchors::anchor_text("wall.disk_full.free_space") };
+    let whole = advice == const { crate::anchor!("wall.disk_full.free_space") };
     (!dir.is_empty() && whole && word_wrapped(&drawn, room)).then(|| DiskFull {
         code,
         source: Source::ToolOutput,
@@ -302,7 +300,7 @@ fn word_wrapped(drawn: &[&str], room: usize) -> bool {
 }
 
 fn goal_cleared(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
-    let anchor = const { crate::anchors::anchor_text("wall.disk_full.goal") };
+    let anchor = const { crate::anchor!("wall.disk_full.goal") };
     let row = crate::text::trim_end(&rows[i]);
     let seg = if vendor {
         let t = row.trim_start();

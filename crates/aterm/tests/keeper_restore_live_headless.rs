@@ -465,7 +465,9 @@ fn a_crashed_window_s_session_comes_back_with_its_exact_screen() {
 
     await_status(&mut ctl, "journal", "live");
     await_prompt(&mut ctl, Some("ARMED-42"));
-    ctl.type_line("printf 'B-ONLY-%s' 43; sleep 600");
+    // `exec`: a forked job-control child can print "child setpgid ... Operation not
+    // permitted" after B's screen is read, which C then replays.
+    ctl.type_line("printf 'B-ONLY-%s' 43; exec sleep 600");
     ctl.expect_on_screen("B-ONLY-43");
     await_status(&mut ctl, "journal_ring_lag", "0");
     let (b_screen, b_modes) = screen_and_modes(&mut ctl);

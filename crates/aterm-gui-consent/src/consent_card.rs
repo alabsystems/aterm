@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS access card's decisions; it posts nothing, as the need is System State's Full Disk Access row.
+//! The macOS access card's decisions. It posts nothing: the need surfaces as System State's Full
+//! Disk Access row.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,7 +21,8 @@ pub const RECORD: &str = "privacy-fda-record";
 /// A record is four short lines.
 pub const MAX_RECORD_BYTES: usize = 160;
 
-/// How long, after the question is raised, the instance keeps re-checking the probe for the grant, and how long a due card waits on a pending probe before it is retired unraised.
+/// How long the instance re-checks the probe for the grant after the question is raised, and how
+/// long a due card waits on a pending probe before it is retired unraised.
 pub const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 
 const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -34,7 +36,8 @@ pub const RENEW_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How long an owner who pressed *Open Settings* is presumed to have acted.
 pub const OWNER_ACTED_HOLD: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
-/// How long a fresh process gives the window's own probe before a denied read beside a verified grant is believed.
+/// How long a fresh process gives the window's own probe before a denied read beside a verified
+/// grant is believed.
 pub const LAUNCH_SETTLE: Duration = Duration::from_secs(90);
 
 /// Needs closer together than this are one need.
@@ -43,7 +46,7 @@ pub const NEED_DEBOUNCE: Duration = Duration::from_secs(60);
 /// At most one `aterm.log` line per this interval says that macOS asked.
 pub const NEED_LOG_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// The retired row's title (R15): the ask, a question, so it claims nothing.
+/// The retired row's title: the ask, a question, so it claims nothing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const FDA_TITLE: &str = "Turn on Full Disk Access?";
 
@@ -53,10 +56,11 @@ pub const FDA_WHY: &str = "macOS forgets an Allow when aterm updates";
 /// The one action, as an imperative: the entry's `Then::press` sentence.
 pub const FDA_THEN: &str = "turn on aterm in Full Disk Access";
 
-/// What the switch grants, said where the ask is: a consequence Apple's own pane states ("data like Mail, Messages, Safari"), not a promise of a benefit.
+/// What the switch grants, said where the ask is: a consequence Apple's own pane states ("data
+/// like Mail, Messages, Safari"), not a promise of a benefit.
 pub const FDA_GRANTS: &str = "Full Disk Access lets programs you run in aterm, agents included, read protected data such as Mail and Messages";
 
-/// What aterm does next, true whatever S1 answers.
+/// What aterm does next.
 pub const FDA_AFTER: &str = "aterm checks now and after each update, and says so in \
                                     aterm's Messages once Full Disk Access is on";
 
@@ -169,7 +173,8 @@ impl NeedWords {
 /// What the marker records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Marker {
-    /// *Not now* was pressed by an older aterm: System State spends it as the Not now of the first approved setup revision it meets, then retires it ([`retire_not_now`]).
+    /// *Not now* was pressed by an older aterm: System State spends it as the Not now of the
+    /// first approved setup revision it meets, then retires it ([`retire_not_now`]).
     NotNow,
     /// *Open Settings* was pressed and the outcome is not yet known.
     Opened,
@@ -282,7 +287,7 @@ pub struct AccessRecord {
 }
 
 impl AccessRecord {
-    /// The field-wise MAX of two records: no field ever moves backwards.
+    /// The field-wise max of two records: no field ever moves backwards.
     #[inline]
     pub const fn merged(self, other: Self) -> Self {
         const fn max(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -358,7 +363,8 @@ pub fn read_record(config_path: Option<&Path>) -> AccessRecord {
         .unwrap_or_default()
 }
 
-/// Merge `update` into the record on disk (field-wise max, under the shared write lock) and return what is there now.
+/// Merge `update` into the record on disk (field-wise max, under the shared write lock) and
+/// return what is there now.
 pub fn write_record(
     config_path: Option<&Path>,
     update: AccessRecord,
@@ -402,7 +408,8 @@ fn verified_key(here: &str, bundle_id: &str) -> String {
     format!("{here} {bundle_id}")
 }
 
-/// Whether the record's grant was verified on the Mac whose hardware UUID is `here`, for `bundle_id`.
+/// Whether the record's grant was verified on the Mac whose hardware UUID is `here`, for
+/// `bundle_id`; `None` without a stamp, a `here` or a `bundle_id`.
 pub fn verified_here(
     config_path: Option<&Path>,
     here: Option<&str>,
@@ -433,7 +440,8 @@ fn with_verified_host(current: &str, key: &str) -> Option<String> {
     )
 }
 
-/// Note that the grant was verified on the Mac whose hardware UUID is `here`, for `bundle_id`.
+/// Note that the grant was verified on the Mac whose hardware UUID is `here`, for `bundle_id`;
+/// the stamp keeps the most recent `MAX_VERIFIED_HOSTS` entries.
 pub fn write_verified_host(
     config_path: Option<&Path>,
     here: &str,
@@ -515,10 +523,8 @@ pub struct CardHost {
     pub need_logged: Option<Instant>,
     /// A kept need must not be decided again before this ([`NotDue::Settling`]).
     pub settle_retry_at: Option<Instant>,
-    /// A `[privacy]` switch settled the card while its launch check was still
-    /// owed (no verdict yet: off at launch, or turned off while the worker
-    /// read). A switch off is a pause, never an answer: once every switch is
-    /// on, the host runs the check again ([`CardState::rearm_launch`]).
+    /// A `[privacy]` switch settled the card while its launch check was still owed; the host
+    /// runs the check again once every switch is on ([`CardState::rearm_launch`]).
     pub launch_held: bool,
 }
 
@@ -584,7 +590,7 @@ pub enum NotDue {
     Answered,
     /// The probe reports the grant is held.
     Granted,
-    /// The probe did not observe a denial (`unknown`: refused, or the lane is off) — not a denial.
+    /// The probe did not observe a denial (`unknown`: refused, or the lane is off).
     NotObservedDenied,
     /// A grant keyed to this requirement class would not survive a rebuild.
     GrantUnstable(DrClass),
@@ -600,7 +606,8 @@ pub enum NotDue {
     Held,
     /// A grant was verified before and the probe reads off now.
     ReadsOffAfterVerified,
-    /// A verified grant reads off inside [`LAUNCH_SETTLE`] of this process starting: not concluded.
+    /// A verified grant reads off within [`LAUNCH_SETTLE`] of this process starting: not
+    /// concluded.
     Settling,
 }
 
@@ -682,7 +689,8 @@ impl From<&LaunchVerdict> for Verdict {
     }
 }
 
-/// Whether a need verdict is the anomaly the log keeps a trace of: macOS showed a dialog for a program of this aterm while this process reads Full Disk Access as granted.
+/// Whether a need verdict is the anomaly the log keeps a trace of: macOS showed a dialog for a
+/// program of this aterm while this process reads Full Disk Access as granted.
 pub const fn is_prompt_while_granted(cause: NeedCause, verdict: &NeedVerdict) -> bool {
     matches!(cause, NeedCause::PromptObserved { .. })
         && matches!(verdict, NeedVerdict::Quiet(NotDue::Granted))
@@ -812,19 +820,16 @@ pub enum CardPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardState {
     phase: CardPhase,
-    /// When the offer became due — the anchor of a due card's wait on a
-    /// pending probe.
+    /// When the offer became due: the anchor of a due card's wait on a pending probe.
     due_since: Option<Instant>,
     /// When the question was first raised in this episode.
     first_raised: Option<Instant>,
     /// The owner pressed something on the row (Open Settings, or Details).
     owner_acted: bool,
-    /// How many times the one-shot has asked its worker for a verdict
-    /// ([`DECIDE_ATTEMPTS`]).
+    /// How many times the one-shot has asked its worker for a verdict ([`DECIDE_ATTEMPTS`]).
     decide_attempts: u8,
-    /// A need arrived while the card was busy (launch check under way, or a
-    /// question already raised): it is re-evaluated the moment the phase
-    /// settles ([`CardState::take_pending_need`]).
+    /// A need arrived while the card was busy (launch check under way, or a question raised);
+    /// it is re-evaluated once the phase settles ([`CardState::take_pending_need`]).
     pending_need: bool,
 }
 
@@ -868,7 +873,9 @@ impl CardState {
         }
     }
 
-    /// Admit one lifecycle step against the current settings, including a pending worker verdict or a raised question. A launch check it settled before its verdict came runs again once every switch is on ([`Self::rearm_launch`]).
+    /// Admit one lifecycle step against the current settings, including a pending worker verdict
+    /// or a raised question. With a switch off the card settles and drops a kept need; a launch
+    /// check it settled runs again once every switch is on ([`Self::rearm_launch`]).
     pub const fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
         if enabled && notice {
             true
@@ -879,13 +886,10 @@ impl CardState {
         }
     }
 
-    /// A `[privacy]` switch settled the card before its launch check gave a
-    /// verdict (off at launch, or turned off while the worker read), and every
-    /// switch is on again: back to [`CardPhase::Idle`] with a fresh attempt
-    /// budget and a clean episode, so the next step runs the launch check as a
-    /// launch would. A switch off is a pause, never an answer. Only from
-    /// [`CardPhase::Settled`]; `true` when re-armed. The host knows whether the
-    /// launch check gave its verdict; the machine does not.
+    /// Back to [`CardPhase::Idle`] with a fresh attempt budget and a clean episode, once every
+    /// `[privacy]` switch is on again after one settled the card before its launch check gave a
+    /// verdict: a switch off is a pause, never an answer. Only from [`CardPhase::Settled`]; `true`
+    /// when re-armed. The host, not the machine, knows whether the launch check gave its verdict.
     pub fn rearm_launch(&mut self) -> bool {
         if self.phase != CardPhase::Settled {
             return false;
@@ -923,7 +927,7 @@ impl CardState {
         self.pending_need = true;
     }
 
-    /// The grant answers a need that was kept before it: drop the kept need without deciding it.
+    /// The grant answers a need kept before it: drop the kept need undecided.
     pub const fn discard_pending_need(&mut self) {
         self.pending_need = false;
     }
@@ -944,7 +948,8 @@ impl CardState {
             if now.duration_since(since) >= DECIDE_TIMEOUT)
     }
 
-    /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once [`DECIDE_ATTEMPTS`] are spent.
+    /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once
+    /// [`DECIDE_ATTEMPTS`] are spent.
     pub const fn reopen_deciding(&mut self) -> bool {
         if self.decide_attempts >= DECIDE_ATTEMPTS {
             self.settle();
@@ -1906,8 +1911,8 @@ mod tests {
         forgets_record: bool,
         /// Negative control: an ask that ignores the window's age.
         ignores_window_age: bool,
-        /// A negative control: the run departs from the model, so its guards are not asserted
-        /// (its invariants are the check).
+        /// Negative control: the run departs from the model, so the model's guards are not
+        /// asserted; its invariants are the check.
         lenient: bool,
     }
 
@@ -2289,10 +2294,8 @@ mod tests {
         assert_eq!(lapses.phase(), CardPhase::Settled);
     }
 
-    /// A LAUNCH CHECK A SWITCH HELD RUNS AGAIN: a card the current policy
-    /// settled (off at launch, or turned off while its worker read) re-arms to
-    /// `Idle` with a fresh attempt budget, so the launch check starts from the
-    /// beginning; a card in any other phase is left as it is.
+    /// Re-arming restarts the launch check from `Idle` with a fresh attempt budget, and only from
+    /// `Settled`.
     #[test]
     fn a_launch_check_a_switch_held_rearms_from_settled_only() {
         let t0 = Instant::now();

@@ -55,8 +55,8 @@ pub enum Holds {
     /// A program: held to its execute bit.
     Program,
     /// A disk image the Linux lane's VM clones (`aterm_vz::pins`): held to being a regular
-    /// file of its size, there and whenever the row is read in place, and made read-only
-    /// (0444), since nothing writes it.
+    /// file of its size when placed and whenever a run or `--check` reads the row in place,
+    /// and made read-only (0444).
     Image {
         /// Its size in bytes.
         bytes: u64,
@@ -66,7 +66,8 @@ pub enum Holds {
 /// How a row is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
-    /// Upstream release archive verified against `anchor` and unpacked with `strip` leading components dropped.
+    /// Upstream release archive verified against `anchor` and unpacked with `strip` leading
+    /// components dropped.
     Unpack {
         /// Archives per host.
         archives: &'static [Archive],
@@ -76,8 +77,8 @@ pub enum Install {
         anchor: Anchor,
         /// Required files in the unpacked tree (e.g. license notices).
         keep: &'static [&'static str],
-        /// The most the tree may hold, in bytes: `None` is the shared cap, sized for the
-        /// tool rows; a row whose tree outgrows it names its own, by the same rule.
+        /// The most the tree may hold, in bytes: `None` takes the shared cap, sized for the
+        /// tool rows; a row whose tree outgrows it names its own.
         cap: Option<u64>,
         /// What the pin's file (its tool row's `exe`) is.
         holds: Holds,
@@ -90,7 +91,8 @@ pub enum Install {
         /// The files, each for its host.
         files: &'static [Archive],
     },
-    /// Upstream source tarball built with Trust (`targo --unverified build --release --locked --no-default-features`).
+    /// Upstream source tarball built with Trust
+    /// (`targo --unverified build --release --locked --no-default-features`).
     Build {
         /// Source tarball.
         source: Archive,

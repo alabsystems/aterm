@@ -2,28 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the lease ledger ([`Ledger`]) to `AosWorkerLease`
-//! (`aterm_models_aos::aos_worker_lease_model`, design §11.7): the real ledger, driven with one
-//! job, two workers and `max_attempts = MaxAttempts`, takes every step the model takes, in lock
-//! step, and the calls the model's guards rule out move nothing.
-//!
-//! Two walks drive it: seeded random episodes (deterministic xorshift, no host entropy) and an
-//! exhaustive walk that replays the model's shortest path to each reachable state on a fresh
-//! ledger and takes every move allowed from it. Each `Buggy` dial's negative control runs over
-//! the exhaustive walk at every transition its dial touches.
+//! (`aterm_models_aos::aos_worker_lease_model`, design §11.7): driven with one job, two workers
+//! and `max_attempts = MaxAttempts`, the real ledger takes every step the model takes, in lock
+//! step, and the calls the model's guards rule out move nothing. Seeded random episodes and an
+//! exhaustive walk drive it; each `Buggy` dial's negative control runs over the exhaustive walk.
 //!
 //! The projection reads the job, the attempts (`Counts::leases`), the holder, each worker's
-//! state and epoch, the accepted claim, the awaiting late claim ([`Ledger::awaiting`]) and `out`
-//! (its own `Complete | Void`) off the ledger. The frames in flight, the one resend and the
-//! ghosts come from the harness: `twice` is a second `Effect::Accepted`, `stale` an accept of a
-//! lease the harness ticked past its deadline, `post` an accept while the ledger was void, and
-//! `ignored` an accepted claim that differs from a claim delivered for comparison while the
-//! ledger is not void.
+//! state and epoch, the accepted claim, the awaiting late claim and `out` off the ledger. The
+//! frames in flight, the resend and the ghosts come from the harness: `twice` is a second
+//! `Effect::Accepted`, `stale` an accept of a lease ticked past its deadline, `post` an accept
+//! while the ledger was void, and `ignored` an accepted claim that differs from one delivered
+//! while the ledger is not void.
 //!
-//! Time: the window is short and the grace long, every call advances the clock, and an expiry
-//! or drain timeout is a `tick` at exactly that worker's deadline. Drains begin at distinct
-//! times and end in that order, which the model's `DrainTimeoutX` guard states; a busy worker's
-//! deadline is pushed past another's drain timeout by one progress frame, a call the model does
-//! not see (it moves no projected variable).
+//! Every call advances the clock, so drains begin at distinct times and, sharing one grace, end in
+//! that order (the model's `DrainTimeoutX` guard); an expiry or drain timeout is a `tick` at
+//! exactly that worker's deadline. A busy worker's deadline is pushed past another's drain timeout
+//! by a progress frame, which moves no projected variable.
 
 use std::collections::BTreeSet;
 
@@ -782,10 +776,8 @@ fn every_transition(
     (probes, taken)
 }
 
-/// The seeded walks reach only part of the model's states. This replays the model's shortest
-/// path to each reachable state on a fresh ledger, makes the calls the model rules out there,
-/// then takes each move the model allows from it, so every transition of the bounded space is a
-/// checked real step.
+/// The seeded walks reach only part of the model's states; this makes every transition of the
+/// bounded space a checked real step.
 #[test]
 fn every_transition_of_the_lease_model_is_a_real_step() {
     for max_attempts in [2u8, 1] {
@@ -802,10 +794,9 @@ fn every_transition_of_the_lease_model_is_a_real_step() {
     }
 }
 
-/// Dial 1 (`ExpireKeepsLease`, an action the healthy model does not have) drains the holder and
-/// keeps its job leased. At every expiry of the bounded space, the mutant admits that step and
-/// the healthy model does not; the real ledger, ticked just before the deadline, moves nothing,
-/// and ticked at it, releases the job (the healthy `ExpireX`), never the mutant's state.
+/// Dial 1 (`ExpireKeepsLease`, an action the healthy model lacks) drains the holder and keeps its
+/// job leased. At every expiry the mutant admits that step and the healthy model does not; the
+/// real ledger moves nothing when ticked just before the deadline and releases the job at it.
 #[test]
 fn negative_control_expire_keeps_lease_the_real_tick_releases_the_job() {
     let mutant = interp::with_buggy(&config(2), 1);

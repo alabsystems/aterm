@@ -153,13 +153,12 @@ impl From<ProcessBirth> for Birth {
 
 /// Process identity token (`<pid>@<birth>:<idversion>`, or `<pid>@<birth>` where the kernel
 /// keeps no pid version) re-read before each pid signal. Two reads that agree saw no reuse of
-/// the pid between them, and, where the identity has a pid version (Apple), no exec. Linux's has
-/// none: an exec keeps the pid and the start, so it reads as the same identity, and only a
-/// caller's own reads (the executable it judged) can see it. On Linux the signal goes through a
-/// pidfd opened before the last read ([`signal_by_handle`]), so a pid reused after that read is
-/// never signalled, unless the kernel refuses the pidfd and the signal goes by pid; elsewhere
-/// such a reuse is not excluded. An exec after the last read is excluded on no kernel: a pidfd
-/// names the process, not its program.
+/// the pid between them and, where the identity has a pid version (Apple), no exec; on Linux an
+/// exec keeps the pid and the start, so only a caller's own reads (the executable it judged)
+/// can see it. On Linux the signal goes through a pidfd opened before the last read
+/// ([`signal_by_handle`]), so a pid reused after that read is never signalled unless the kernel
+/// refuses the pidfd; elsewhere such a reuse is not excluded. No kernel excludes an exec after
+/// the last read: a pidfd names the process, not its program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The pid.
@@ -354,11 +353,10 @@ impl EndControl for EndControlLive {
 /// read: `open(pid)`, then `identity(pid)` must still equal `token`, then `send(&handle, sig)`.
 /// A handle names the process it was opened on, so a pid reused after the open cannot be
 /// reached, and a reuse before it shows in the read. An open the kernel will not make takes the
-/// same read and then `kill(pid, sig)`, as a kernel with no handles does: `ENOSYS`
-/// ([`std::io::ErrorKind::Unsupported`], a kernel before 5.3 or a seccomp filter that says so)
-/// or `EPERM` ([`std::io::ErrorKind::PermissionDenied`], a seccomp filter's usual answer;
-/// `pidfd_open` itself never refuses a permission). Every other open error is returned unread
-/// (`ESRCH`: the process is gone). Never a group.
+/// same read and then `kill(pid, sig)`: `ENOSYS` ([`std::io::ErrorKind::Unsupported`], a kernel
+/// before 5.3 or a seccomp filter) or `EPERM` ([`std::io::ErrorKind::PermissionDenied`], a
+/// seccomp filter's usual answer; `pidfd_open` itself never refuses a permission). Every other
+/// open error is returned unread (`ESRCH`: the process is gone). Never a group.
 ///
 /// # Errors
 /// The open's or the signal's, or [`std::io::ErrorKind::NotFound`] when the read no longer
@@ -1016,7 +1014,7 @@ pub fn continuous_ms() -> Option<u64> {
     boot_clock_now().map(|BootClock(ns)| ns / 1_000_000)
 }
 
-/// HOW LONG THIS MACHINE HAS SLEPT SINCE IT BOOTED.
+/// How long this machine has slept since it booted.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1266,8 +1264,7 @@ fn linux_reader() -> Option<(u32, u64)> {
 
 /// A `/proc` text file, its bytes decoded lossily. The kernel writes a command name as raw
 /// bytes cut at 15 (a UTF-8 letter may be cut, and `prctl(PR_SET_NAME)` sets any bytes), so
-/// `stat` and `status` need hold no UTF-8; a command name is words only, and every field a
-/// reader here parses is ASCII.
+/// `stat` and `status` need hold no UTF-8; every field a reader here parses is ASCII.
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
 pub(crate) fn read_proc_text(path: &std::path::Path) -> std::io::Result<String> {
     std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -1472,13 +1469,11 @@ pub mod procfs {
     }
 
     /// The members of process group `pgid` among `rows` (each a pid and the read of its
-    /// `/proc/<pid>/stat`), listed off a `/proc` that does or does not list every process
-    /// (`shows_every`, [`shows_every_process`]): a row whose text names its own pid in `pgid`,
-    /// unless it has exited ([`exited`]: an exited stage leader is a zombie in its group until
-    /// it is reaped, and holds nothing; a process whose main thread alone exited is still
-    /// listed). A gone row is skipped. The listing is complete only when the `/proc` lists
-    /// every process, every other row read and parsed, and at most [`super::MAX_GROUP_PIDS`]
-    /// members were found (the first that many are kept).
+    /// `/proc/<pid>/stat`): each row whose text names its own pid in `pgid`, unless it has exited
+    /// ([`exited`]: an exited stage leader is a zombie in its group until it is reaped, and holds
+    /// nothing). A gone row is skipped. The listing is complete only when `shows_every` is set
+    /// ([`shows_every_process`]), every other row read and parsed, and at most
+    /// [`super::MAX_GROUP_PIDS`] members were found (the first that many are kept).
     #[cfg(any(unix, windows))]
     #[must_use]
     pub fn group_of(
@@ -1799,7 +1794,7 @@ fn host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
     env_host_name(env).or_else(os_host_name)
 }
 
-/// The OS's own name for this machine now, NEVER `$HOSTNAME`.
+/// The OS's own name for this machine now, never `$HOSTNAME`.
 #[must_use]
 pub fn kernel_host_name() -> Option<String> {
     os_host_name()
@@ -2164,12 +2159,10 @@ mod start_tests {
     const STATUS_501: &str = "Name:\tcat\nState:\tR (running)\nTgid:\t13\nPid:\t13\n\
          Uid:\t501\t502\t501\t502\nGid:\t20\t20\t20\t20\n";
 
-    /// Field 22 counted from the command name's last `)`, the effective uid as the second
-    /// `Uid:` id, a tick as its first instant; another pid's line, a zombie (in either read),
-    /// another euid, two disagreeing `stat` reads, a thread's id, a short line and a zero tick
-    /// rate answer `None`; a process whose main thread alone exited has its start. NEGATIVE
-    /// CONTROL: judge the first read's state alone, and the process that died between the reads
-    /// has a start.
+    /// `stat` field 22 counted from the command name's last `)`, the effective uid as the second
+    /// `Uid:` id, a tick as its first instant; a process whose main thread alone exited has its
+    /// start, and every failure case answers `None`. Negative control: judge the first read's
+    /// state alone, and the process that died between the reads has a start.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_start_is_read_off_proc_as_linux_writes_it() {
@@ -2247,18 +2240,14 @@ mod start_tests {
         STATUS_501.replace("Tgid:\t13\nPid:\t13", &format!("Tgid:\t{pid}\nPid:\t{pid}"))
     }
 
-    /// A lineage off `/proc` as Linux writes it: the fields counted from the command name's
-    /// last `)`, the start tick as both birth and unique id, no pid version, and the group and
-    /// terminal of the second read, one the kernel prints negative (its `int` with the sign bit
-    /// set) as its device; a process whose main thread alone exited (`Z` with other threads)
-    /// reads, as the group listing and the presence read take it. A zombie, a dead process, one
-    /// that died between the reads, another euid, a pid reused between the reads, a thread's id,
-    /// a terminal that does not read, a cut line and another pid's line read nothing. NEGATIVE
-    /// CONTROLS: drop the second read's start check, and the reused pid reads; drop the second
-    /// read's state check, and the process that died between the reads reads live; map the
-    /// terminal to `None`, and a member with one would be proven free of it; read a terminal
-    /// that does not convert as none (`parse_stat`), and the negative one would too; judge a
-    /// row's state alone, whatever its threads, and the running process reads nothing.
+    /// A lineage off `/proc` as Linux writes it: the start tick as both birth and unique id, no
+    /// pid version, and the group and terminal of the second read (a terminal the kernel prints
+    /// negative is its `int` with the sign bit set); a process whose main thread alone exited
+    /// reads, and every case in the table reads nothing. Negative controls: drop the second
+    /// read's start or state check, and the reused pid or the process that died between the
+    /// reads reads live; map the terminal to `None`, or read one that does not convert as none
+    /// (`parse_stat`), and a member with one would be proven free of it; judge a row's state
+    /// alone, whatever its threads, and the running process reads nothing.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_lineage_is_read_off_proc_as_linux_writes_it() {
@@ -2346,14 +2335,12 @@ mod start_tests {
     }
 
     /// A group is listed from every `/proc/<pid>/stat`: its live members by `pgrp` (a command
-    /// name of `x) (y` among them, and a process whose main thread alone exited, `Z` with three
-    /// threads), never its zombie leader or a dead row, a gone row skipped; an unreadable or
-    /// garbled row, more members than the bound, or a `/proc` that does not list every process
-    /// leave it incomplete. NEGATIVE CONTROLS: stop skipping zombies, and the exited leader is
-    /// listed; skip every `Z` row whatever its threads, and the running process is left out of
-    /// a listing that reads complete; read an unreadable row as gone, and a listing with a hole
-    /// reads complete; start the listing complete whatever its `/proc` shows, and one off a
-    /// `/proc` that hides processes reads complete.
+    /// name of `x) (y` and a `Z` row with three threads among them), never its zombie leader or a
+    /// dead row; a gone row is skipped, and an unreadable or garbled row, more members than the
+    /// bound, or a `/proc` that does not list every process leave it incomplete. Negative
+    /// controls: stop skipping zombies, and the exited leader is listed; skip every `Z` row, and
+    /// the running process is left out; read an unreadable row as gone, or start the listing
+    /// complete whatever `/proc` shows, and a listing with a hole reads complete.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_group_is_listed_from_proc_without_its_zombies() {
@@ -2411,12 +2398,10 @@ mod start_tests {
         assert!(!full.complete, "past the bound");
     }
 
-    /// Whether `/proc` lists every process is read off its mount: a `proc` mount at `/proc`
-    /// with no `hidepid`, or `hidepid=0` or `off`, does; one with any other mode (`noaccess`,
-    /// `invisible`, `ptraceable`, or their numbers), a table with no `proc` mount at `/proc`,
-    /// and an empty one do not. A `proc` mount elsewhere and other file systems under `/proc`
-    /// are not it. NEGATIVE CONTROL: read the mode `invisible` as shown, and a `/proc` that
-    /// hides this uid's non-dumpable processes from its listing reads as listing them.
+    /// `/proc` lists every process only under a `proc` mount at `/proc` with no `hidepid`, or
+    /// `hidepid=0` or `off`; a `proc` mount elsewhere and other file systems under `/proc` do
+    /// not count. Negative control: read `invisible` as showing every process, and a `/proc` that
+    /// hides this uid's non-dumpable processes reads as listing them.
     #[test]
     fn a_proc_mounted_to_hide_processes_shows_no_listing_whole() {
         let line = |at: &str, fs: &str, options: &str| {
@@ -2462,8 +2447,8 @@ mod start_tests {
 
     /// A listing's row is gone only when the kernel says its process is (`ENOENT`, `ESRCH`):
     /// `EPERM`, a `hidepid=1` mount's answer for another user's process, and every other error
-    /// leave a hole, so on such a mount no listing reads whole. NEGATIVE CONTROL: read a refused
-    /// permission as gone, and the listing with a hidden row reads whole.
+    /// leave a hole. Negative control: read a refused permission as gone, and the listing with a
+    /// hidden row reads whole.
     #[cfg(unix)]
     #[test]
     fn a_row_the_kernel_will_not_show_leaves_the_listing_partial() {
@@ -2504,11 +2489,10 @@ mod start_tests {
         }
     }
 
-    /// A `/proc` file whose command name holds no UTF-8 still reads: the kernel cuts a name at
-    /// 15 bytes, in the middle of a letter if it falls there, and `prctl(PR_SET_NAME)` sets any
-    /// bytes. Its lineage and start are judged, its group row is text, and an exited row reads
-    /// so; a file gone by its read is gone. NEGATIVE CONTROL: read the files with
-    /// `read_to_string`, and the lineage reads nothing and the row is unreadable.
+    /// A `/proc` file whose command name holds no UTF-8 still reads
+    /// ([`super::read_proc_text`]): its lineage, start, group row and exited row are judged.
+    /// Negative control: read the files with `read_to_string`, and the lineage reads nothing and
+    /// the row is unreadable.
     #[cfg(unix)]
     #[test]
     fn a_proc_file_whose_command_name_is_not_utf8_still_reads() {
@@ -2673,10 +2657,9 @@ mod presence_tests {
     use super::{ProcessPresence, process_presence, read_birth};
     use std::time::{Duration, Instant};
 
-    /// A child that has exited and is not yet reaped (a zombie) holds its pid and nothing else:
-    /// its presence reads `Exited`, a live one's `Present`, and the zombie reads no birth.
-    /// NEGATIVE CONTROL: answer `Present` whenever the pid answers signal zero, and the zombie
-    /// reads `Present`.
+    /// A child that has exited and is not yet reaped (a zombie) reads `Exited`, a live one
+    /// `Present`, and the zombie reads no birth. Negative control: answer `Present` whenever the
+    /// pid answers signal zero, and the zombie reads `Present`.
     #[test]
     fn an_exited_unreaped_child_reads_exited() {
         let mut child = crate::spawnfd::command("/bin/sleep")
@@ -2947,8 +2930,8 @@ mod end_proven_tests {
         );
     }
 
-    /// Q5's two forms: Apple's `<pid>@<birth_us>:<idversion>`, Linux's `<pid>@<start_ticks>`
-    /// with no version. NEGATIVE CONTROL: print `idversion.unwrap_or(0)` always, and the
+    /// A token's two forms: Apple's `<pid>@<birth_us>:<idversion>`, Linux's `<pid>@<start_ticks>`
+    /// with no version. Negative control: print `idversion.unwrap_or(0)` always, and the
     /// versionless token reads `…:0`, a version Linux never had.
     #[test]
     fn a_token_prints_its_version_only_where_the_kernel_keeps_one() {
@@ -3007,14 +2990,12 @@ mod end_proven_tests {
         (result, log.into_inner())
     }
 
-    /// The handle is opened on the token's pid first, the identity of that pid re-read after
-    /// it, and the signal goes through that handle only while the read still names the token.
-    /// An open the kernel will not make (`ENOSYS`, or the `EPERM` a seccomp filter answers)
-    /// takes the same read before a `kill` of that pid; an open that finds the process gone
-    /// sends nothing and reads nothing. NEGATIVE CONTROLS: make the re-read and ignore its
-    /// answer, and the pid reused after the open is sent the signal; open, read or kill any pid
-    /// but the token's, and its step names that pid; fall back on `ENOSYS` alone, and the
-    /// filtered open sends nothing.
+    /// The handle is opened on the token's pid first, that pid's identity re-read after it, and
+    /// the signal goes through the handle only while the read still names the token. An open the
+    /// kernel will not make (`ENOSYS`, or a seccomp filter's `EPERM`) takes the same read before
+    /// a `kill` of that pid; an open that finds the process gone sends and reads nothing.
+    /// Negative controls: ignore the re-read's answer, and the pid reused after the open is
+    /// signalled; fall back on `ENOSYS` alone, and the filtered open sends nothing.
     #[test]
     fn a_handle_signal_reaches_only_the_process_the_handle_was_opened_on() {
         let token = Identity {

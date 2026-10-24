@@ -1303,7 +1303,7 @@ fn card(app: &App, session: u64) {
         String::new(),
         format!(
             " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}2.1.283",
-            aterm_phase::anchor_text("launch.banner")
+            aterm_phase::anchor!("launch.banner")
         ),
         "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} Claude Max"
             .to_string(),

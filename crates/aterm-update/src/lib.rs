@@ -108,7 +108,9 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
     read_ledger_text_checked(path).ok().flatten()
 }
 
-/// [`read_ledger_text`] that keeps the one distinction a READ-then-replace writer needs.
+/// [`read_ledger_text`] that keeps the one distinction a read-then-replace writer needs:
+/// `Ok(None)` is a file absent or not a ledger, `Err` a present file this read could not get
+/// through, which a writer must not replace with defaults.
 #[cfg(target_os = "macos")]
 fn read_ledger_text_checked(path: &std::path::Path) -> std::io::Result<Option<String>> {
     use std::io::Read;
@@ -144,7 +146,8 @@ pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
 pub use progress::{Progress, ProgressNotify, set_progress_observer};
 
-/// For every lane that relaunches aterm forwarding its own argv.
+/// Argv forwarding for every lane that relaunches aterm: the leading `--window` pins the boot
+/// swap adds are stripped, so no relaunch re-grows them.
 pub use relaunch::{
     RELAUNCH_OF_RUNNING_ENV, reexec_forwarded_args, running_window_successor_args,
     window_successor_args,
@@ -224,7 +227,8 @@ pub enum ApplyOutcome {
     Deferred(String),
     /// The bundle was swapped but re-exec into the new binary failed.
     ReExecFailed(String),
-    /// A LaunchServices-launched seamless successor found its build crash-looping and put.
+    /// A LaunchServices-launched seamless successor found its build crash-looping and put the
+    /// previous build back without re-executing it; the caller must exit now.
     Reverted(String),
     /// A macOS window launch ([`ImageReplacement::WindowKeepsImage`]) found this stage ready.
     LeftForSession {
@@ -235,18 +239,25 @@ pub enum ApplyOutcome {
     },
 }
 
-/// What a launch's boot apply may do to the process's image, decided once by the caller.
+/// What a launch's boot apply may do to the process's image, decided once by the caller. An
+/// `execve` soon after LaunchServices launched a process leaves LaunchServices answering pid -1
+/// for the app for the rest of its life, so a window that may have been launched that way keeps
+/// its image when its own lane can install the stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageReplacement {
     /// The boot may swap a ready stage and exec the build it installed.
     Replaceable,
-    /// A macOS window no parent handed.
+    /// A macOS window no parent handed off to: it leaves a ready stage for its window's
+    /// in-session lane ([`ApplyOutcome::LeftForSession`]). With `[update] auto_apply` on, once
+    /// [`LEFT_STAGE_ESCAPE`] earlier launches left the stage and ended without it landing, or the
+    /// record cannot count this launch, the boot swaps and execs it.
     WindowKeepsImage,
     /// LaunchServices started this process as a seamless successor (it was handed a rendezvous).
     LaunchedSuccessor,
 }
 
-/// How many launches that left one stage for their window's automatic lane.
+/// How many launches that left one stage for their window's automatic lane must have ended,
+/// with the stage still there, before the next window launch of it swaps and execs it at boot.
 pub const LEFT_STAGE_ESCAPE: usize = 2;
 
 /// What a launch of this build can prove about its boot trial.
@@ -254,7 +265,8 @@ pub const LEFT_STAGE_ESCAPE: usize = 2;
 pub enum TrialWitness {
     /// A launch that opens windows.
     Window,
-    /// A `--headless` launch.
+    /// A `--headless` launch. It proves only the engine and control socket, so a trial a window
+    /// launched waits for a window while that wait lasts.
     Headless,
 }
 
@@ -290,7 +302,8 @@ pub fn running_is_dev_marked() -> bool {
     }
 }
 
-/// "Check for updates automatically".
+/// "Check for updates automatically" (`[update] enabled`) on a platform the updater runs on
+/// ([`enabled`]). It gates only the lanes nobody asked for, such as the background checker.
 #[must_use]
 pub fn automatic() -> bool {
     enabled() && aterm_update_core::settings::update_enabled()
@@ -423,7 +436,11 @@ pub fn preverify_staged_for_handoff(
     )
 }
 
-/// The code-signing identifier of a handoff candidate.
+/// The code-signing identifier of a handoff candidate (the staged `.app`, or `activation`),
+/// which the launched lane's rendezvous gates its dialer on.
+///
+/// # Errors
+/// No staging root, or `codesign` failed or named no identifier.
 #[cfg(target_os = "macos")]
 pub fn handoff_candidate_signing_identifier(
     activation: Option<&std::path::Path>,
@@ -438,7 +455,7 @@ pub fn handoff_candidate_signing_identifier(
     }
 }
 
-/// What a cached pass cannot vouch.
+/// What a cached pass cannot vouch for.
 #[cfg(target_os = "macos")]
 pub fn handoff_cached_pass_refusal(
     target_build: u64,
@@ -458,7 +475,7 @@ pub fn handoff_cached_pass_refusal(
     }
 }
 
-/// Off macOS there is no bundle staging root, so no floor to refuse.
+/// Off macOS there is no bundle staging root, so no floor to refuse by.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn handoff_cached_pass_refusal(
@@ -479,7 +496,8 @@ pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::fr
 #[cfg(not(target_os = "macos"))]
 pub const HANDOFF_PREVERIFY_BOUND: std::time::Duration = std::time::Duration::ZERO;
 
-/// What an outgoing build learns from a handoff candidate's bundle once the pre-verify.
+/// What an outgoing build learns from a handoff candidate's bundle once the pre-verify has
+/// authenticated it, never from a bundle that failed a check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandoffCandidateFacts {
     /// The candidate's signed handoff policy.
@@ -498,7 +516,7 @@ impl HandoffCandidateFacts {
         )
     }
 
-    /// The facts as a pre-verification may pass them.
+    /// The facts as a pre-verification may pass them on.
     #[cfg(target_os = "macos")]
     fn admitted(
         policy: aterm_update_core::handoff_policy::PolicyRead,
@@ -631,7 +649,8 @@ pub struct HandoffCaptureRecord {
     pub build: u64,
     /// RFC3339 UTC of the measurement.
     pub at: String,
-    /// The last landed park's real cost, the readers' stop to a capture ready to hand.
+    /// The last landed park's real cost, the readers' stop to a capture ready to hand over, in
+    /// microseconds (0 when none was kept).
     pub park_us: u64,
     /// The build that was running when that park landed (0 when unknown).
     pub park_build: u64,
@@ -716,7 +735,7 @@ pub struct ApplyLaneReport {
     pub last_refusal: String,
     /// RFC3339 UTC of [`Self::last_refusal`].
     pub last_refusal_at: String,
-    /// The running build's boot trial waiting FOR a window, in words, with when the wait ends.
+    /// The running build's boot trial waiting for a window, in words, with when the wait ends.
     pub trial_wait: String,
     /// The last timed handoff capture, the first freeze rung it seeded and the last landed park.
     pub handoff_capture: Option<HandoffCaptureRecord>,
@@ -759,7 +778,7 @@ pub fn apply_lane_report(_current_build: u64) -> Option<ApplyLaneReport> {
     None
 }
 
-/// Non-macOS: `witness` is not read.
+/// Off macOS: Linux runs its own boot apply (`witness` is not read); elsewhere nothing applies.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn apply_staged_if_ready_preserving_fds_exact(
@@ -792,7 +811,9 @@ pub fn confirm_boot_health_exact(
     install::confirm_boot_health(current_build, Some(current_commit), witness)
 }
 
-/// A terminal session of this executable is starting (an interactive launch).
+/// A terminal session of this executable is starting (an interactive launch). On Linux it counts
+/// against a replaced executable's trial and returns whether this launch is a start of it; the
+/// caller confirms it with [`confirm_linux_session`] once the shell first speaks.
 #[must_use]
 pub fn linux_session_started(_current_build: u64, _current_commit: &str) -> bool {
     #[cfg(target_os = "linux")]
@@ -805,10 +826,16 @@ pub fn linux_session_started(_current_build: u64, _current_commit: &str) -> bool
     }
 }
 
-/// How long a terminal session that counted a start of a replaced Linux executable's trial waits.
+/// How long a terminal session that counted a start of a replaced Linux executable's trial waits
+/// for its shell's first output before deferring the trial's verdict: half of
+/// `linux_trial::START_SETTLES_SECS`, leaving the other half for the move to land.
 pub const LINUX_SESSION_SILENT_DEFER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A session [`linux_session_started`] counted as a pending trial's start.
+/// A session [`linux_session_started`] counted as a pending trial's start has been up for
+/// [`LINUX_SESSION_SILENT_DEFER`] with a silent shell: on Linux, moves the trial's stamp forward
+/// once, so a slow-starting healthy build is not rolled back. It confirms nothing; `true` when
+/// it moved. A try that did not land is retried after `pause(span)`, which answers `false` to
+/// stop.
 #[must_use]
 pub fn defer_linux_session_verdict(
     _current_build: u64,
@@ -825,13 +852,17 @@ pub fn defer_linux_session_verdict(
     }
 }
 
-/// Reads now the path of the executable this process runs.
+/// Reads now the path of the executable this process runs, which the Linux lane keeps for the
+/// process's life: read first after a sibling replaced the executable, it would name the
+/// unlinked file and the process would run no background check. A no-op off Linux.
 pub fn linux_capture_executable() {
     #[cfg(target_os = "linux")]
     linux::capture_context();
 }
 
-/// A windowed Linux launch has opened its display (its event loop is built).
+/// A windowed Linux launch has opened its display (its event loop is built): on Linux, counts it
+/// against a replaced executable's trial, for a launch whose display the boot apply could not
+/// vouch for. `NotApplicable` elsewhere.
 #[must_use]
 pub fn linux_window_opened(_current_build: u64, _current_commit: &str) -> ApplyOutcome {
     #[cfg(target_os = "linux")]
@@ -844,7 +875,8 @@ pub fn linux_window_opened(_current_build: u64, _current_commit: &str) -> ApplyO
     }
 }
 
-/// What a terminal session's confirmation of a replaced Linux executable came.
+/// What a terminal session's confirmation of a replaced Linux executable came to
+/// ([`confirm_linux_session`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinuxSessionConfirm {
     /// Confirmed, or nothing was waiting on this process.
@@ -884,12 +916,13 @@ pub fn confirm_boot_health_exact(
     }
 }
 
-/// Sealed installed-bundle identity plus the durable exact-artifact receipt written by the most.
+/// Sealed installed-bundle identity plus the durable exact-artifact receipt written by the most
+/// recent successful swap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledUpdateFacts {
     pub build_number: u64,
     pub git_commit: String,
-    /// The bundle's marketing version (`CFBundleShortVersionString`), display.
+    /// The bundle's marketing version (`CFBundleShortVersionString`), for display only.
     pub version: Option<String>,
     pub receipt_build_number: Option<u64>,
     pub receipt_dmg_sha256: Option<String>,
@@ -1057,7 +1090,8 @@ pub fn wait_while_uncommitted_handoff_candidate(bound: std::time::Duration) -> b
     waited
 }
 
-/// The bound on [`wait_while_uncommitted_handoff_candidate`] for the background lanes a successor.
+/// The bound on [`wait_while_uncommitted_handoff_candidate`] for a successor's boot lanes:
+/// past its grant-hold budget, so they start only after Commit or once it was told to exit.
 pub const UNCOMMITTED_CANDIDATE_HOLD_BOUND: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
@@ -1079,7 +1113,9 @@ pub fn trial_launch_count(_build: u64) -> u32 {
     0
 }
 
-/// A successor of `build` leaving by rule.
+/// A successor of `build` leaving by rule (its parent closed the rendezvous, or it refused the
+/// handoff) gives back the boot-trial launch it counted, if not given back yet: it did not fail
+/// the build. `true` when a launch was given back, or owed to the next apply-lock holder.
 #[cfg(target_os = "macos")]
 pub fn forgive_own_trial_launch(build: u64) -> bool {
     install::forgive_own_trial_launch(build)
@@ -1145,23 +1181,26 @@ pub fn installed_update_facts_checked() -> Result<Option<InstalledUpdateFacts>, 
     Ok(None)
 }
 
-/// What [`supersede_installed_activation`].
+/// What [`supersede_installed_activation`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SupersededActivation {
     pub activation_build: u64,
     pub restored_build: u64,
     pub newer_build: u64,
     pub trial_launches: u32,
-    /// `Some(why)` when the exchange happened (the running build is back at the install path).
+    /// `Some(why)` when the exchange happened but the activation's boot trial could not be
+    /// disarmed; the next boot apply finishes it.
     pub trial_disarm_deferred: Option<String>,
 }
 
 /// Why [`supersede_installed_activation`] moved nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupersedeRefusal {
-    /// About the moment: the apply lock was busy past the background wait.
+    /// About the moment: a busy apply lock, a verification that failed or ran out of budget, a
+    /// stage or window launch still in flight, or a failed exchange. A later try may pass.
     ForNow(String),
-    /// About the disk: it is not the one shape the retire can undo.
+    /// About the disk: it is not the one shape the retire can undo, and only a change to the
+    /// disk lets a later try through.
     Settled(String),
 }
 
@@ -1187,7 +1226,12 @@ impl std::fmt::Display for SupersedeRefusal {
     }
 }
 
-/// A newer verified stage retires an unconfirmed activation.
+/// A newer verified stage retires an unconfirmed activation: the running build goes back to the
+/// install path and the activation's trial is disarmed without counting a launch, so the staged
+/// lane applies `newer_build` with a fresh trial.
+///
+/// # Errors
+/// A [`SupersedeRefusal`] when nothing moved.
 #[cfg(target_os = "macos")]
 pub fn supersede_installed_activation(
     current_build: u64,
@@ -1205,6 +1249,9 @@ pub fn supersede_installed_activation(
 }
 
 /// Non-macOS: there is no installed `.app` activation to retire.
+///
+/// # Errors
+/// Always [`SupersedeRefusal::Settled`].
 #[cfg(not(target_os = "macos"))]
 pub fn supersede_installed_activation(
     _current_build: u64,
@@ -1221,7 +1268,8 @@ pub fn supersede_installed_activation(
 /// A GUI-supplied hook the background check uses to surface self-healing events.
 pub type HealthNotify = Box<dyn Fn(String, String) + Send>;
 
-/// The `title` [`HealthNotify`] is called with when a persistent failure this process reported.
+/// The `title` [`HealthNotify`] is called with when a persistent failure this process reported
+/// has healed.
 pub const HEALTH_RECOVERED_TITLE: &str = "aterm auto-update recovered";
 
 /// A GUI-supplied hook fired when a strictly newer build has just been staged.
@@ -1230,7 +1278,8 @@ pub type StagedNotify = Box<dyn Fn(u64, String) + Send>;
 /// A GUI-supplied hook fired after a background check pass whose recorded outcome changed.
 pub type CheckedNotify = Box<dyn Fn() + Send>;
 
-/// One process-wide network/staging lane shared by the periodic scheduler and every user-triggered.
+/// One process-wide network/staging lane shared by the periodic scheduler and every
+/// user-triggered check.
 #[cfg(target_os = "macos")]
 fn check_lane() -> &'static check_lane::Lane {
     static LANE: check_lane::Lane = check_lane::Lane::new();
@@ -1249,7 +1298,8 @@ fn persistent_notice_is_owed(announced: Option<&str>, class: Option<&str>) -> bo
     class.is_some_and(|class| persistent_notice_is_new(announced, class))
 }
 
-/// The `title` [`HealthNotify`] is called with when a persistent failure of `class` is first.
+/// The `title` [`HealthNotify`] is called with when a persistent failure of `class` is first
+/// announced, naming the half of updating that is broken.
 #[must_use]
 pub fn health_failing_title(class: &str) -> &'static str {
     match health_class_canonical(class) {
@@ -1259,7 +1309,8 @@ pub fn health_failing_title(class: &str) -> &'static str {
     }
 }
 
-/// The class a persistent-failure title stands.
+/// The class a persistent-failure title stands for, from the title [`health_failing_title`]
+/// writes or its older wording; `None` for any other title.
 #[must_use]
 pub fn health_failing_class(title: &str) -> Option<&'static str> {
     const LEGACY: [(&str, &str); 3] = [
@@ -1286,7 +1337,8 @@ fn health_class_canonical(class: &str) -> &'static str {
     }
 }
 
-/// The instant a persistent-failure notice's body dates its streak.
+/// The instant a persistent-failure notice's body dates its streak from (the stamp after
+/// "since "), or `None`.
 #[must_use]
 pub fn health_notice_since(body: &str) -> Option<&str> {
     let (_, rest) = body.split_once(" since ")?;
@@ -1299,16 +1351,20 @@ pub fn health_notice_since(body: &str) -> Option<&str> {
     well_formed.then_some(stamp)
 }
 
-/// The `title` [`HealthNotify`] is called with when the class this process already announced.
+/// The `title` [`HealthNotify`] is called with when the class this process already announced
+/// is still failing and its count has moved; the body restates the count.
 pub const HEALTH_RESTATED_TITLE: &str = "aterm auto-update still failing";
 
-/// The `title` [`HealthNotify`] is called with when this machine cannot READ its release channel.
+/// The `title` [`HealthNotify`] is called with when this machine cannot read its release
+/// channel, and so is not updating at all. It names no ledger class.
 pub const STRANDED_TITLE: &str = "aterm is not updating on this machine";
 
-/// The `title` [`HealthNotify`] is called with when an executable the Linux lane installed.
+/// The `title` [`HealthNotify`] is called with when an executable the Linux lane installed has
+/// waited over an hour for the next aterm a person starts, which finishes the update.
 pub const INSTALL_AWAITS_START_TITLE: &str = "Start a new aterm to finish the update";
 
-/// The `title` [`HealthNotify`] is called with when that wait.
+/// The `title` [`HealthNotify`] is called with when that wait is over, for the window to take
+/// its notice down; it is never shown.
 pub const INSTALL_WAIT_OVER_TITLE: &str = "aterm update no longer waits for a start";
 
 /// The `title` [`HealthNotify`] is called with when a crash loop ended a Linux install's trial.
@@ -1411,9 +1467,14 @@ impl HealthAnnouncer {
     }
 }
 
+/// The classes `Health::persistent_class` can name, in the order an adopted class outranks
+/// another ([`AnnouncedHealth::adopt`]).
 const ANNOUNCED_CLASSES: [&str; 4] = ["manifest", "stage", "pipeline", "apply"];
 
-/// What this process has announced about the ledger's health.
+/// What this process has announced about the ledger's health, held for the process rather than
+/// one checker thread: a replacement generation, or a successor whose parent announced, must
+/// still send the recovery the window's latch waits for. One word, no lock: the class's 1-based
+/// index in [`ANNOUNCED_CLASSES`] above bit 32, the count below it, `0` for nothing announced.
 pub(crate) struct AnnouncedHealth(std::sync::atomic::AtomicU64);
 
 impl AnnouncedHealth {
@@ -1443,7 +1504,8 @@ impl AnnouncedHealth {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Leave `announced`.
+    /// Leaves `announced`, a tick's verdict over the word `taken`, unless the word moved
+    /// meanwhile (an adoption, another generation's verdict); then that one stands.
     #[cfg(target_os = "macos")]
     fn settle(&self, taken: u64, announced: Option<(&str, u32)>) {
         let _ = self.0.compare_exchange(
@@ -1454,7 +1516,9 @@ impl AnnouncedHealth {
         );
     }
 
-    /// Take up `class` as announced.
+    /// Takes up `class` as announced by this process's parent, unless a class that outranks it
+    /// already is. Its count is unknown here, so a streak still failing is restated, never
+    /// announced again.
     pub(crate) fn adopt(&self, class: &str) {
         let adopted = Self::encode(Some((health_class_canonical(class), 0)));
         let _ = self.0.try_update(
@@ -1464,7 +1528,7 @@ impl AnnouncedHealth {
         );
     }
 
-    /// The class the process stands announced.
+    /// The class the process stands announced for, if any.
     #[cfg(all(test, target_os = "macos"))]
     fn class(&self) -> Option<&'static str> {
         Self::decode(self.load()).map(|(class, _)| class)
@@ -2145,7 +2209,10 @@ pub struct LinuxUpdateStatus {
     pub refused_newer: bool,
 }
 
-/// The same single background checker.
+/// Starts the process's one background checker, sampling its source before each cycle so a
+/// configuration reload takes effect without a restart. Each cycle runs under `catch_unwind`,
+/// takes `checker.lock` within a bound, and stamps [`checker_watch::WATCH`], so the window's
+/// watchdog can start a replacement once the stamp goes stale ([`respawn_stalled_checker`]).
 #[cfg(target_os = "macos")]
 pub fn spawn_background_check_with_source(
     current_build: u64,
@@ -2163,8 +2230,8 @@ pub fn spawn_background_check_with_source(
     );
 }
 
-/// [`spawn_background_check_with_source`] with automatic checks `automatic`: off, `sweep`
-/// stands in for the scheduled checks' sweep of `staged/`.
+/// [`spawn_background_check_with_source`] with automatic checks on or off (`automatic`); while
+/// they are off, `sweep` stands in for the scheduled checks' sweep of `staged/`.
 #[cfg(target_os = "macos")]
 fn spawn_background_check_in(
     automatic: bool,
@@ -2178,8 +2245,8 @@ fn spawn_background_check_in(
         // No scheduled check sweeps here, and a bundle an earlier stage or another process's
         // asked check left must still go.
         sweep.start_resident();
-        // Said once per process, where the updater's lines go: the one record of why this
-        // machine is not checking by itself. A typed or clicked check still runs.
+        // The one record of why this machine is not checking by itself; a typed or clicked
+        // check still runs.
         if enabled() {
             log(
                 "automatic update checks are off — [update] enabled = false (Settings ▸ \
@@ -2227,11 +2294,10 @@ static UNCHECKED_SWEEP: std::sync::LazyLock<UncheckedSweep> = std::sync::LazyLoc
     )
 });
 
-/// The sweep of `staged/` where no scheduled check comes: what earlier stages left goes as
-/// each exec stamp is spent ([`install::sweep_left_incoming_until_none_held`]), as every
-/// check's sweep would take it, on one thread at a time, which a start while it runs sends
-/// round once more. The launch's thread stays for the life of the process; an asked check's
-/// ends once nothing is held.
+/// The sweep of `staged/` where no scheduled check runs: what earlier stages left goes as each
+/// exec stamp is spent ([`install::sweep_left_incoming_until_none_held`]). One thread runs at
+/// a time, and a start while it runs sends it round once more. The launch's thread stays for
+/// the life of the process; an asked check's ends once nothing is held.
 #[cfg(target_os = "macos")]
 #[derive(Clone)]
 struct UncheckedSweep {
@@ -2245,7 +2311,7 @@ struct UncheckedSweep {
 struct UncheckedSweepState {
     running: bool,
     again: bool,
-    /// Once nothing is held the thread lists `staged/` again every FIRST_EXEC_HANG.
+    /// Once nothing is held the thread lists `staged/` again every `FIRST_EXEC_HANG`.
     resident: bool,
 }
 
@@ -2268,10 +2334,8 @@ impl UncheckedSweep {
         self.start_staying(false);
     }
 
-    /// [`Self::start`] for the process's life: once nothing is held its thread lists
-    /// `staged/` again every FIRST_EXEC_HANG (a readdir, no network), so a bundle another
-    /// process's asked check left goes once its hold is spent. It ends when there is no
-    /// `staged/` to sweep (not an installed copy).
+    /// [`Self::start`] for the process's life, so a bundle another process's asked check left
+    /// goes once its hold is spent; it ends when there is no `staged/` to sweep.
     fn start_resident(&self) {
         self.start_staying(true);
     }
@@ -2320,9 +2384,9 @@ impl UncheckedSweep {
     }
 }
 
-/// Runs a check someone asked for. With automatic checks off no scheduled check follows it,
-/// so `sweep` takes what it left once each hold is spent. A CLI check's own thread dies with
-/// its process; a running app's sweep, or the next launch, takes what it left.
+/// Runs a check someone asked for. With automatic checks off no scheduled check follows it, so
+/// `sweep` takes what it left; a CLI's sweep dies with it, and a running app's or the next
+/// launch's takes the rest.
 #[cfg(target_os = "macos")]
 fn asked_check(automatic: bool, sweep: &UncheckedSweep, check: impl FnOnce()) {
     check();
@@ -2349,7 +2413,8 @@ const SETTINGS_MISS_LOG_EVERY: u64 = 60;
 #[cfg(target_os = "macos")]
 const CHECKER_DEFERRAL_LOG_EVERY: u64 = 3600 / cadence::INTERVAL_SECS;
 
-/// Every how many consecutive cycles that found this process's own check lane busy the loop says.
+/// Every how many consecutive cycles that found this process's own check lane busy the loop
+/// says so again.
 #[cfg(target_os = "macos")]
 const LANE_BUSY_LOG_EVERY: u64 = 6;
 
@@ -2366,7 +2431,8 @@ struct CheckerArgs {
     staging: std::sync::Arc<dyn Fn() -> Option<paths::Staging> + Send + Sync>,
     /// How long a cycle waits for `checker.lock` before it defers.
     checker_lock_wait: std::time::Duration,
-    /// After how many consecutive deferrals to a holder showing no progress the loop checks.
+    /// After how many consecutive deferrals to a holder showing no progress the loop checks
+    /// without the lock.
     checker_ungated_after: u64,
     /// The check lane a cycle takes.
     lane: &'static check_lane::Lane,
@@ -2417,7 +2483,7 @@ type CheckFn = dyn Fn(u64, &Source) -> Result<Option<String>, String> + Send + S
 #[cfg(target_os = "macos")]
 type GateFn = dyn Fn(&std::path::Path, std::time::Duration) -> CheckerGate + Send + Sync;
 
-/// The arguments the process's checker was started.
+/// The arguments the process's checker was started with.
 #[cfg(target_os = "macos")]
 static CHECKER_ARGS: std::sync::OnceLock<std::sync::Arc<CheckerArgs>> = std::sync::OnceLock::new();
 
@@ -2468,7 +2534,7 @@ pub fn respawn_stalled_checker(_stalled_generation: u64) -> Option<u64> {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckerExit {
-    /// A replacement took.
+    /// A replacement took over; this thread was last in `phase`.
     Superseded { phase: checker_watch::CheckerPhase },
 }
 
@@ -2552,7 +2618,10 @@ fn holder_fresh(lock_wait: std::time::Duration) -> std::time::Duration {
     lock_wait / 2
 }
 
-/// The holder's beat: while a cycle holds `checker.lock` and its checker is alive.
+/// The holder's beat: while a cycle holds `checker.lock` and its checker is alive, a thread
+/// rewrites the lock every quarter of the lock wait, so a sibling can tell it from a stopped one.
+/// It is joined on drop, before the lock is let go, so it never stamps a lock another process
+/// then holds.
 #[cfg(target_os = "macos")]
 struct HolderBeat {
     stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -2716,7 +2785,8 @@ pub(crate) fn stage_holder_alive() -> HolderAlive {
         })
 }
 
-/// A cycle's hold on `checker.lock`, with its [`HolderBeat`].
+/// A cycle's hold on `checker.lock`, with its [`HolderBeat`]. The beat is declared first so it
+/// drops, and stops, before the lock is released.
 #[cfg(target_os = "macos")]
 struct HeldGate {
     _beat: Option<HolderBeat>,
@@ -3251,7 +3321,8 @@ fn run_checker(
     }
 }
 
-/// After a wait that ended on a detected wake.
+/// After a wait that ended on a detected wake: clears the backoff and the failure log, dates
+/// the wake for [`cadence::after_wake`], and gives the network `settle` before the next check.
 #[cfg(target_os = "macos")]
 fn settle_after_wake(
     schedule: &mut cadence::Cadence,
@@ -3279,7 +3350,7 @@ fn installed_build_observed(app_root: &std::path::Path) -> Result<u64, String> {
 #[cfg(target_os = "macos")]
 type PlistIdentity = (std::path::PathBuf, u64, u64, u64, i64, i64, i64, i64);
 
-/// The last build [`installed_build_observed`] read, and the plist it read it.
+/// The last build [`installed_build_observed`] read, and the plist it read it from.
 #[cfg(target_os = "macos")]
 static INSTALLED_BUILD: std::sync::Mutex<Option<(PlistIdentity, u64)>> =
     std::sync::Mutex::new(None);
@@ -3421,11 +3492,13 @@ fn automatic_apply_on() -> bool {
     AUTOMATIC_APPLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Serializes the tests that mutate the process-global "this machine cannot read its release channel" latch (`unreadable::STRANDED`), since a crate's tests run as threads of one process.
+/// Serializes the tests that mutate the process-global stranded latch (`unreadable::STRANDED`),
+/// since a crate's tests run as threads of one process.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A snapshot of the updater's state for the "Check for Updates" menu and the `aterm-ctl update`.
+/// A snapshot of the updater's state for the "Check for Updates" menu and the `aterm-ctl update`
+/// query, read from the durable markers without network I/O.
 #[derive(Debug, Clone)]
 pub struct UpdateStatus {
     pub linux: Option<LinuxUpdateStatus>,
@@ -3449,7 +3522,7 @@ pub struct UpdateStatus {
     pub outcome: String,
     /// RFC3339 UTC time of the last completed-check receipt (empty if absent).
     pub updated_at: String,
-    /// Self-healing ledger snapshot.
+    /// Consecutive failed checks in the standing acquisition streak (0 when healthy).
     pub failing_checks: u32,
     /// Class of the most recent failure.
     pub failing_kind: String,
@@ -3457,11 +3530,13 @@ pub struct UpdateStatus {
     pub failing_applies: u32,
     /// RFC3339 UTC start of the current unhealthy period (empty if healthy).
     pub failing_since: String,
-    /// Whether the ledger's `pipeline` streak crossed [`PERSISTENT_AFTER`].
+    /// Whether a stranding failure class (`pipeline`, `manifest`, `stage` or `apply`) is
+    /// persistent ([`PERSISTENT_AFTER`]).
     pub failing_persistent: bool,
     /// The class of the standing acquisition streak (the one [`Self::failing_checks`] counts).
     pub failing_checks_kind: String,
-    /// The stranded verdict.
+    /// Whether the last completed check found this machine unable to read its release channel.
+    /// It records no ledger failure, so [`Self::failing_persistent`] never says it.
     pub channel_unreadable: bool,
 }
 
@@ -3499,7 +3574,7 @@ impl UpdateStatus {
         line
     }
 
-    /// Whether the ledger says update checks are persistently failing on the pipeline class.
+    /// Whether a stranding failure class is persistently failing ([`Self::failing_persistent`]).
     #[must_use]
     pub const fn is_failing_persistently(&self) -> bool {
         self.failing_persistent
@@ -3529,7 +3604,8 @@ impl UpdateStatus {
     }
 }
 
-/// "Check for updates automatically" is not whether the updater runs.
+/// The loop's schedule after a healthy check ([`after_healthy_check`]): the one-minute re-check
+/// while the head in flight's count is within `cadence::IN_FLIGHT_CHECKS`, else the base interval.
 #[cfg(all(test, target_os = "macos"))]
 mod after_healthy_check_tests {
     use super::{after_healthy_check, cadence, github};
@@ -3731,7 +3807,8 @@ struct StatusReconciliation {
     outcome: ReconciledStatusOutcome,
 }
 
-/// Projects one observed call of [`reconcile_status_outcome`] onto the bounded.
+/// Projects one observed call of [`reconcile_status_outcome`] onto the bounded
+/// `NativeUpdateStatusReconciliation.ReconcileStatus` transition.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -3887,7 +3964,7 @@ const _: () = assert!(
 #[cfg(target_os = "macos")]
 const SKIP_JITTER_SECS: u64 = 60;
 
-/// Why this cycle must not spend a network check, if it.
+/// Why this cycle must not spend a network check, if it must not.
 #[cfg(all(target_os = "macos", test))]
 fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<String> {
     checker_skip_at(staging, base, unix_now_secs()).map(|(reason, _)| reason)
@@ -4161,7 +4238,8 @@ pub fn status(_current_build: u64) -> Option<UpdateStatus> {
 /// How old a completed check may be before `aterm ctl update status` flags the ledger as frozen.
 pub const STALE_CHECK_AFTER: std::time::Duration = cadence_bounds::STALE_CHECK_AFTER;
 
-/// Whether `stamp`, an RFC 3339 UTC timestamp as this crate writes them.
+/// Whether `stamp`, an RFC 3339 UTC timestamp as this crate writes them, is older than `secs`
+/// ago. A stamp that does not start with an ASCII digit is never stale.
 #[must_use]
 pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
     if !stamp.as_bytes().first().is_some_and(u8::is_ascii_digit) {
@@ -4213,7 +4291,8 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
     })
 }
 
-/// Why a manual check cannot run right now, or `None` when it.
+/// Why a manual check cannot run right now, or `None` when it can: a retired checker generation
+/// still holds this process's check lane, and a check would only queue behind it.
 #[cfg(target_os = "macos")]
 fn manual_check_blocked(watch: &checker_watch::CheckerWatch) -> Option<String> {
     let holder = watch.snapshot()?.blocked_by()?;
@@ -4555,7 +4634,8 @@ mod checker_skip_tests {
     }
 }
 
-/// The per-cycle read of the installed bundle's build number spawns PlistBuddy only when the plist.
+/// The per-cycle read of the installed bundle's build number spawns PlistBuddy only when the
+/// plist moved, and the floor that yanks it is a gate read.
 #[cfg(all(test, target_os = "macos"))]
 mod installed_build_tests {
     use std::cell::Cell;
@@ -5137,7 +5217,8 @@ mod team_pin_tests {
     }
 }
 
-/// A policy this process could not read just then refuses the pre-verification as a passing.
+/// A policy this process could not read just then refuses the pre-verification as a passing
+/// condition.
 #[cfg(all(test, target_os = "macos"))]
 mod handoff_candidate_facts_tests {
     use super::*;

@@ -1935,10 +1935,9 @@ impl SettingsViewState {
     }
 
     fn reduce_page_scroll(&mut self, limit: usize, command: SettingsPageScrollCommand) {
-        // A scroll by lines — the wheel, the keys, a reader's — is the
-        // person's: the list seats on its stops again. An absolute one that
-        // names the stop it is on (a re-clamp after aterm.toml changed)
-        // scrolls nothing.
+        // A scroll by lines (the wheel, the keys, a reader's) is the person's: the list seats on
+        // its stops again. An absolute one to the stop it is on (a re-clamp after aterm.toml
+        // changed) scrolls nothing.
         if matches!(command, SettingsPageScrollCommand::Lines(_)) {
             self.drop_list_nudge();
         }
@@ -2412,7 +2411,7 @@ impl SettingsViewState {
         std::mem::take(&mut self.consent_warmup_requests) > 0
     }
 
-    /// Drain the *Open Privacy & Security…* press (see `consent_open_requests`).
+    /// Drain the *Open Privacy & Security…* press.
     pub(crate) fn take_consent_open_request(&mut self) -> bool {
         std::mem::take(&mut self.consent_open_requests) > 0
     }
@@ -7601,10 +7600,9 @@ fn for_each_authored_manual_match(
 ) {
     let mut folded = String::new();
     for key in authored_manual_override_keys(view) {
-        // Schema membership decides this on its own and now costs a binary
-        // search, so it runs before the fold and the word-start/acronym
-        // scan, which touch every byte of the key. Both tests are pure, so the
-        // order between them is not observable.
+        // Schema membership alone decides this and costs a binary search, so it runs before the
+        // fold and the word-start/acronym scan, which touch every byte of the key; both are
+        // pure, so their order is not observable.
         if crate::native_config_language::config_schema_entry(key).is_some()
             && !crate::native_config_language::is_compatibility_only_key(key)
         {
@@ -7775,8 +7773,8 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
     }
     let answer = advanced_effect_of(key);
     ANSWERS.with_borrow_mut(|answers| {
-        // The registry's keys and a config's own: a bound only a config of
-        // thousands of keys reaches.
+        // The cache holds the registry's keys and a config's own; only a config of thousands
+        // of keys reaches this bound.
         if answers.len() >= 4_096 {
             answers.clear();
         }
@@ -9899,9 +9897,9 @@ fn picker_candidate<'a>(state: &'a SettingsViewState, key: &str) -> Option<&'a s
 }
 
 fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
-    // The row is resolved lazily, through the O(1) key index, in the one arm that
-    // reads it: the preview spec alone calls this ~50 times per event-loop
-    // iteration while a Settings tab is up.
+    // The row is resolved lazily, through the O(1) key index, in the one arm that reads it:
+    // the preview spec alone calls this ~50 times per event-loop iteration while Settings is
+    // up.
     if let Some(candidate) = segment_candidate(state, key) {
         return candidate;
     }
@@ -9912,10 +9910,9 @@ fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
         }) => candidate.trim().to_string(),
         Some(ChoiceOption { value: None, .. }) => effective_default_for_field(key),
         None => {
-            // Presence is authoritative: a retained empty draft means “remove
-            // this override”, not “preview the stale committed seed”.  The
-            // active field includes IME projection; inactive siblings retain
-            // their committed draft bytes after focus moves.
+            // Presence is authoritative: a retained empty draft means "remove this override",
+            // not "preview the stale committed seed". The active field includes its IME
+            // projection; inactive siblings keep their committed draft bytes.
             if let Some(input) = state.field_inputs.get(key) {
                 let draft = if state.editing_field.as_deref() == Some(key) {
                     input.projection().text
@@ -12479,7 +12476,8 @@ struct StatusWords {
     broken: WrappedBy<usize>,
 }
 
-/// THE PAGE'S SEATS SHARE THE STATUS'S WORDS: while open, each text is wrapped at each width once a render.
+/// While open, the page's seats share the status's words: each text is wrapped at each width
+/// once a render.
 struct StatusWordsShared;
 
 impl StatusWordsShared {
@@ -13099,8 +13097,8 @@ fn weighed<K: PartialEq, V: Copy>(
     })
 }
 
-/// WHAT THE PERSON IS ON IN THE TOOLBAR NO STATUS TAKES THE PLACE OF (R2 of seat_scroll): the
-/// keyboard on the compact toolbar's search, which a docked status or reload warning replaces.
+/// Whether the keyboard is on the compact toolbar's search, which no docked status or reload
+/// warning takes the place of (R2 of `seat_scroll`).
 fn keyboard_on_toolbar_search(state: &SettingsViewState) -> bool {
     state.common.last_focus.as_ref().is_some_and(|key| {
         let key = key.as_str();
@@ -15058,7 +15056,7 @@ fn page(
                 (!state.keyboard_short_of(record.as_ref()) || !state.keyboard_cut())
                     .then_some((trial, built))
             });
-        // A trial seated last: the chrome kept is seated again.
+        // Where a trial was seated last and none was taken, the kept chrome is seated again.
         match taken {
             Some((trial, built)) => {
                 chrome = trial;
@@ -15448,7 +15446,8 @@ fn page_chrome(
     (heading, subtitle && !state.page_chrome.get().no_subtitle)
 }
 
-/// SHORT WINDOWS SHED CHROME BEFORE CONTENT.
+/// The chrome a page draws around its list, which a short window sheds rung by rung
+/// ([`PageChrome::ladder`]) before it cuts content.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PageChrome {
     no_subtitle: bool,
@@ -15531,9 +15530,8 @@ thread_local! {
     /// Whether this thread's renders draw a plain status's bar at its least
     /// ([`SettingsViewState::status_bar_most`]).
     pub(crate) static STATUS_BAR_LEAST: Cell<bool> = const { Cell::new(false) };
-    /// The chrome this thread's renders seat the page in, whatever the page
-    /// would choose: the chrome a frame held, which a test measures the
-    /// screens of.
+    /// The chrome this thread's renders seat the page in, whatever the page would choose (a
+    /// test holds a frame's chrome to measure its screens).
     pub(crate) static PAGE_CHROME_HELD: Cell<Option<PageChrome>> = const { Cell::new(None) };
     /// Whether this thread's renders stack a compact window's statuses under
     /// the page rather than dock them in the toolbar.
@@ -15762,7 +15760,7 @@ fn plain_status_extra(
     .max(0.0)
 }
 
-/// THE BAR UNDER A RELOAD WARNING SHORTENS FOR WHAT THE PERSON IS ON TOO
+/// How far a plain status's bar under a reload warning can shorten for what the person is on
 /// ([`SettingsViewState::seat_scroll`], [`plain_status_extra`], [`status_words_node`]).
 fn plain_status_slack(
     state: &SettingsViewState,
@@ -18617,11 +18615,9 @@ fn top_card_row(
         row.layout.height = Length::Fixed(compact_inline_row_height());
     }
     if stacked {
-        // A card's column too narrow for a short choice's segments side by
-        // side (Window appearance at the largest text on a phone-width card,
-        // in a UI face wider than the one it was drawn in) sets them on as
-        // few lines as their labels allow, as a page's stacked row does
-        // ([`wrap_segments`]), rather than cut a label to "Li…".
+        // Where a card's column is too narrow for a short choice's segments side by side, they
+        // wrap onto as few lines as their labels allow ([`wrap_segments`]), as a page's stacked
+        // row does, rather than cut a label to "Li…".
         if let Some(field) = state.field_by_key(key)
             && !segments_hold_their_labels(field, text_width)
         {
@@ -22042,12 +22038,10 @@ fn settings_fields_page(
     };
 
     if state.choice_picker.is_some() {
-        // The picker is a complete transient decision surface: the list
-        // waits behind it at its exact scroll and the preview stays the
-        // evidence for the highlighted choice. As on Top Settings, a compact
-        // page sheds its heading (the picker names the setting), and a short
-        // one shows the preview at its least height, leaving the choices the
-        // room.
+        // The picker is a complete transient decision surface: the list waits behind it at its
+        // exact scroll and the preview stays the evidence for the highlighted choice. A compact
+        // page sheds its heading (the picker names the setting), and a short one shows the
+        // preview at its least height, leaving the choices the room.
         if width == SettingsWidth::Compact {
             out.retain(|node| {
                 !node.key.as_str().starts_with("settings/page-heading/")
@@ -24296,18 +24290,11 @@ fn parent_or_motion_inactivity(
             key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.style.is_some();
         let trail_style_invalid = key == prefs::EDIT_CURSOR_TRAIL_STYLE && trail_resolution.unknown;
         if trail_tuning || trail_style_enabling || trail_style_invalid {
-            // AN UNKNOWN STYLE DISABLES NOTHING. `resolve_trail_style`
-            // substitutes the default style and the trail RENDERS, so every
-            // other row in this block still governs the drawn wake: the
-            // Music-effects switch sounds it, and each TRAIL_TUNING_KEYS row
-            // shapes it — duration, length, wake, intensity, radius, ring,
-            // colour, accent, sprite, the bloom trio, shimmer, HDR glow and SDR
-            // boost. The STYLE row's own authored value is the only unusable
-            // one, so it alone takes the Unavailable shape; the rest fall
-            // through to the gates that really do silence them (Music effects
-            // off, Fire-only shimmer, bloom off, motion) and pick up a
-            // live-effect-preserving note below. Same shape as the invalid
-            // theme selector's `Constraint`-beside-a-live-effect projection.
+            // An unknown style disables nothing: `resolve_trail_style` substitutes the default
+            // style and the trail renders, so every other row here (the Music-effects switch,
+            // each TRAIL_TUNING_KEYS row) still governs the drawn wake. Only the style row's
+            // authored value takes the Unavailable shape; the rest fall through to the gates
+            // that do silence them (Music effects off, Fire-only shimmer, bloom off, motion).
             if trail_style_invalid {
                 return Some(unavailable(
                     "The configured cursor style is outside this setting's registered choices, so the runtime draws its default trail instead; open Manual to repair the authored value",
@@ -25056,12 +25043,10 @@ fn setting_effect_projection(
         if let Some(note) = registered_value_issue {
             notes.push(note);
         } else {
-            // One reason a setting does nothing: where it cannot take effect in
-            // this copy at all, that it would also wait on another setting adds
-            // nothing ("No effect" already says it). What its press does to
-            // another setting is no such reason, and is said still: Music
-            // effects' press turns Serious Mode off where nothing can sound
-            // too, and that note went with the reason.
+            // One reason a setting does nothing: where it cannot take effect in this copy at
+            // all, that it would also wait on another setting adds nothing. What its press does
+            // to another setting is still said (Music effects' press turns Serious Mode off even
+            // where nothing can sound).
             if let Some(note) = platform_unavailability(state, patch, key, availability) {
                 notes.push(note);
                 notes.extend(top_effect_serious_press_note(state, patch, key, motion));
@@ -26442,7 +26427,9 @@ const fn debugger_alert_not_hardened_bullet(
     }
 }
 
-/// aterm's own alert before a debugger-access change pressed on Settings ▸ Security (debugger design §3.4 step 1): only that press raises it; System State's debugger step asks nothing of aterm's own. Returns `(title, body, proceed)`.
+/// aterm's own alert before a debugger-access change pressed on Settings ▸ Security (debugger
+/// design §3.4 step 1): only that press raises it; System State's debugger step raises none of
+/// aterm's own. Returns `(title, body, proceed)`.
 pub(crate) fn debugger_access_alert(
     change: aterm_containment::consent::DebuggerChange,
     facts: &crate::debugger_access::DebuggerFacts,
@@ -26799,7 +26786,9 @@ impl OwnerQuiet {
     }
 }
 
-/// The owner's yes ([`OwnerYes`]), its doors ([`owner_confirms_with`], `OwnerYes::from_admitted`) and the alert's arm ([`ConfirmArm`]) live in a leaf module whose private field nothing else in the crate can reach (the aterm-census guard `devtools-door` holds the leaf to that shape).
+/// The owner's yes ([`OwnerYes`]), its doors ([`owner_confirms_with`], `OwnerYes::from_admitted`)
+/// and the alert's arm ([`ConfirmArm`]) live in a leaf module whose private field nothing else
+/// in the crate can reach (the aterm-census guard `devtools-door` holds the leaf to that shape).
 #[path = "native_settings_owner_yes.rs"]
 mod owner_yes;
 pub(crate) use owner_yes::{ConfirmArm, OwnerYes, owner_confirms_with};
@@ -29663,7 +29652,7 @@ fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: 
     }
 }
 
-/// WHAT A SETTING READS AS NOW.
+/// The words setting `key` reads as now in `snapshot`.
 pub(crate) fn effective_value_words(
     snapshot: &crate::native_config_service::ConfigSnapshot,
     key: &str,
@@ -30447,11 +30436,10 @@ fn fit_row_field_placeholder(
     unset: Option<(&str, bool)>,
     held: Option<&str>,
 ) {
-    // A ONE-LINE ROW'S FIELD TAKES THE WIDTH ITS UNSET WORDS NEED from the
-    // name's column, down to the name's floor ([`one_line_name_floor`]), as a
-    // row's button does ([`fit_row_button_words`]): measured on the words
-    // the field shows unset (`unset`), so a value written or typed into it
-    // never moves it.
+    // A one-line row's field takes the width its unset words need from the name's column,
+    // down to the name's floor ([`one_line_name_floor`]), as a row's button does
+    // ([`fit_row_button_words`]). It is measured on the unset words, so a value written or
+    // typed into it never moves it.
     if !stacked && let Some((unset, chip)) = unset {
         let spare = (one_line_label_room(row, text_width) - one_line_name_floor(name)).max(0.0);
         if let Some(control) = row
@@ -31623,11 +31611,8 @@ fn fact_name_width(text: &str) -> f32 {
     crate::tray_raster::ui_text_width_for(face, text, px)
 }
 
-/// FACTS SIT BESIDE THEIR NAMES until a word cannot, or until that takes
-/// more lines than a name over its fact: the column a long name leaves its
-/// fact wraps the fact into a column of words (Packages' Background service
-/// at 444pt with 2× text in Windows' face: six lines beside, a 256pt row in
-/// the list's 212pt room, never whole on any screen).
+/// Facts sit beside their names until a word cannot, or until that takes more lines than a
+/// name over its fact; then each name stacks over its fact.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FactColumns {
     label: f32,
@@ -37503,7 +37488,7 @@ const fn fixed_height(node: &UiNode) -> f32 {
     }
 }
 
-/// ONE SEARCH, ONE REACH.
+/// A search's text and the one reach all its results are matched at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SearchQuery<'a> {
     pub(crate) text: &'a str,

@@ -152,7 +152,7 @@ fn an_interrupted_turn_is_the_persons() {
         assert!(
             screen(text)
                 .iter()
-                .any(|r| r.contains(anchor_text("agy.turn.interrupted"))),
+                .any(|r| r.contains(crate::anchor!("agy.turn.interrupted"))),
             "the box's refusal ends on the same row"
         );
     }
@@ -224,14 +224,14 @@ fn the_exec_box_is_a_bash_prompt_with_its_roles() {
         assert_eq!((r.composer, r.wall), (None, None));
         let p = r.prompt.expect("the box");
         assert_eq!(p.kind, PromptKind::Bash);
-        assert_eq!(p.title, anchor_text("agy.title.command"));
+        assert_eq!(p.title, crate::anchor!("agy.title.command"));
         assert_eq!(p.command, command);
         assert_eq!(p.readings(), vec![command.to_string()]);
         assert_eq!(
             roles(&p),
             vec![Role::Once, Role::Session, Role::Persist, Role::Deny]
         );
-        assert_eq!(labels(&p)[0], anchor_text("agy.box.once"));
+        assert_eq!(labels(&p)[0], crate::anchor!("agy.box.once"));
         assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
         assert_eq!(p.select, Select::Digits);
         assert_eq!(
@@ -359,7 +359,7 @@ fn the_file_boxes_are_write_and_edit_prompts() {
         assert_eq!(ClaudeReader.prompt(&screen(text)), None, "the control");
     }
     let p = agy(BOX_CREATE).prompt.expect("the box");
-    assert_eq!(labels(&p)[1], anchor_text("agy.create.persist"));
+    assert_eq!(labels(&p)[1], crate::anchor!("agy.create.persist"));
     let p = agy(BOX_EDIT).prompt.expect("the box");
     assert!(labels(&p).iter().all(|l| !l.contains("shift+tab")));
     assert_eq!(p.options.len(), 2);
@@ -407,7 +407,10 @@ fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     assert_eq!(p.path.as_deref(), Some("/tmp/at.XXXXXX/work"));
     assert_eq!(
         labels(&p),
-        vec![anchor_text("agy.trust.yes"), anchor_text("agy.trust.no")]
+        vec![
+            crate::anchor!("agy.trust.yes"),
+            crate::anchor!("agy.trust.no")
+        ]
     );
     assert_eq!(roles(&p), vec![Role::Trust, Role::Exit]);
     assert!(p.options.iter().all(|o| o.n.is_none()));
@@ -467,7 +470,7 @@ fn an_exit_pending_is_idle_but_never_evidence() {
         let what = provenance(text).unwrap_or_default();
         let rows = screen(text);
         let footer = rows.iter().rposition(|r| !blank(r)).expect("the footer");
-        assert!(rows[footer].starts_with(anchor_text(hint)), "{what}");
+        assert!(rows[footer].starts_with(crate::anchor(hint)), "{what}");
         assert_eq!(footer_of(&rows[footer]), Footer::ExitPending, "{what}");
         let r = agy(text);
         assert_eq!(
@@ -483,7 +486,8 @@ fn an_exit_pending_is_idle_but_never_evidence() {
         assert!(!r.fresh, "{what}");
         assert_eq!(identify(None, &rows).program(), Program::Agy, "{what}");
         let mut back = rows.clone();
-        back[footer] = rows[footer].replacen(anchor_text(hint), anchor_text("agy.footer.idle"), 1);
+        back[footer] =
+            rows[footer].replacen(crate::anchor(hint), crate::anchor!("agy.footer.idle"), 1);
         assert_eq!(phase(&back), (Phase::Idle, true), "the control: {what}");
     }
     for (row, pending) in [
@@ -508,7 +512,7 @@ fn one_ctrl_c_over_a_draft_arms_the_exit_and_keeps_the_draft() {
     let text = lab::CTRL_C_DRAFT;
     let rows = screen(text);
     let footer = rows.iter().rposition(|r| !blank(r)).expect("the footer");
-    let hint = anchor_text("agy.footer.exit");
+    let hint = crate::anchor!("agy.footer.exit");
     assert!(rows[footer].starts_with(hint));
     assert_eq!(footer_of(&rows[footer]), Footer::ExitPending);
     let r = agy(text);
@@ -560,7 +564,7 @@ fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     let w = r.wall.expect("the wall");
     assert_eq!(w.kind, WallKind::Auth);
     assert!(
-        w.message.ends_with(anchor_text("agy.signin.wall")),
+        w.message.ends_with(crate::anchor!("agy.signin.wall")),
         "{}",
         w.message
     );
@@ -569,7 +573,7 @@ fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     assert_eq!(crate::reader::AgyReader.prompt(&rows), None);
     assert!(
         rows.iter()
-            .any(|r| r.contains(anchor_text("agy.signin.oauth")))
+            .any(|r| r.contains(crate::anchor!("agy.signin.oauth")))
     );
     let unnamed = edited(&rows, " Select login method:", "");
     assert_eq!(wall(&unnamed), None);
@@ -830,7 +834,7 @@ fn a_permission_modes_hint_is_an_empty_composer() {
         "agy.mode.hint.plan",
         "agy.mode.hint.best_of_n",
     ] {
-        let hint = anchor_text(id);
+        let hint = crate::anchor(id);
         for shown in [hint.to_string(), format!("{}...", &hint[..28])] {
             let on = edited(&rows, ">", &format!("> {shown}"));
             assert_eq!(
@@ -841,7 +845,7 @@ fn a_permission_modes_hint_is_an_empty_composer() {
             assert_eq!(phase(&on), (Phase::Idle, true), "{shown}");
         }
     }
-    let plan = anchor_text("agy.mode.hint.plan");
+    let plan = crate::anchor!("agy.mode.hint.plan");
     for typed in ["Plan mo...".to_string(), format!("{plan} and then some")] {
         let on = edited(&rows, ">", &format!("> {typed}"));
         assert_eq!(
@@ -932,7 +936,7 @@ fn the_pending_edits_esc_is_disabled() {
         .position(|r| is_key_row(r))
         .expect("the key row");
     let said = "Esc disabled during file edits — press 1 to accept or 2 to reject.";
-    assert!(said.starts_with(anchor_text("agy.edit.esc_disabled")));
+    assert!(said.starts_with(crate::anchor!("agy.edit.esc_disabled")));
     for indent in ["", "  "] {
         let mut esc = rows.clone();
         esc.insert(keys + 1, format!("{indent}{said}"));
@@ -1586,7 +1590,7 @@ fn the_survey_is_a_rating_card_never_the_composer_or_a_box() {
     assert_eq!((card.dismissable, card.withheld()), (true, None));
     assert_eq!(
         crate::text::trim(&rows[card.head]),
-        anchor_text("agy.survey.question")
+        crate::anchor!("agy.survey.question")
     );
     assert_eq!(rows[card.options], " [1] Good  [2] Fine  [3] Bad  [0] Skip");
     assert_eq!(
@@ -1623,7 +1627,7 @@ fn the_survey_is_a_rating_card_never_the_composer_or_a_box() {
 
     let at = rows
         .iter()
-        .position(|r| r.starts_with(anchor_text("agy.error.id")))
+        .position(|r| r.starts_with(crate::anchor!("agy.error.id")))
         .expect("the error id");
     let mut back = rows[..=at].to_vec();
     back.extend([
@@ -1746,7 +1750,7 @@ fn a_failed_turn_is_a_wall_by_the_status_the_api_answered() {
     let rows = screen(lab::ERROR_401);
     let id = rows
         .iter()
-        .position(|r| r.starts_with(anchor_text("agy.error.id")))
+        .position(|r| r.starts_with(crate::anchor!("agy.error.id")))
         .expect("the error id");
     let mut replied = rows.clone();
     replied.splice(
@@ -1776,7 +1780,7 @@ fn the_first_run_screens_are_boxes_of_no_kind() {
     let scheme = agy(lab::FIRST_RUN_SCHEME).prompt.expect("the picker");
     assert_eq!(
         (scheme.kind, scheme.title.as_str()),
-        (PromptKind::Other, anchor_text("agy.onboarding.scheme"))
+        (PromptKind::Other, crate::anchor!("agy.onboarding.scheme"))
     );
     assert_eq!(
         labels(&scheme),
@@ -1796,7 +1800,7 @@ fn the_first_run_screens_are_boxes_of_no_kind() {
     let terms = agy(lab::FIRST_RUN_TERMS).prompt.expect("the terms");
     assert_eq!(
         (terms.kind, terms.title.as_str()),
-        (PromptKind::Other, anchor_text("agy.onboarding.terms"))
+        (PromptKind::Other, crate::anchor!("agy.onboarding.terms"))
     );
     assert_eq!(terms.options.len(), 3);
     assert!(

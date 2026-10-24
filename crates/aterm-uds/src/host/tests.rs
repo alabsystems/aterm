@@ -246,7 +246,7 @@ fn the_refusal_names_its_provider() {
     );
     let zstd = tool("zstd").refusal();
     assert!(
-        zstd.contains("aterm provides none: only a rostered publish host"),
+        zstd.contains("aterm provides none: it is the outside reference the tests judge"),
         "{zstd}"
     );
     let cc = tool("cc").refusal();

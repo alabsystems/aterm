@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive ledger`: multi-source timeline joining worker turn history, watcher journal, fabric mail, and reply row counts.
+//! `aterm drive ledger`: multi-source timeline joining worker turn history, watcher journal,
+//! fabric mail, and reply row counts.
 //!
 //! The session log places every time: each turn by its record's `t=` joined by `ledger=`,
-//! each message by its `mail` mark joined by `inbox=`. The clock anchor (`--source anchor`),
-//! which guessed them from when the instance's control socket was made, was removed on
-//! [`ANCHOR_REMOVED`].
+//! each message by its `mail` mark joined by `inbox=`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -33,7 +32,7 @@ fn bare_sid(s: &str) -> &str {
 }
 
 /// Whether `from`, a row's attested sender, is the session `worker` names
-/// (`@s-…`/`s-…`, or `@s-…@n-…` for a session on another node) — the WHOLE
+/// (`@s-…`/`s-…`, or `@s-…@n-…` for a session on another node): the whole
 /// principal, never the sid alone.
 fn is_from_session(from: &str, worker: &str) -> bool {
     let worker = worker.strip_prefix('@').unwrap_or(worker);
@@ -246,7 +245,7 @@ fn log_record(line: &str) -> Option<(&str, &str, &str, Option<i64>)> {
 struct LogTurns {
     /// Each `ledger=` id's turn start, wall ms: the turn's open record's
     /// `t=`, or — its open evicted — its close's `t=` less `dur_ms` (the
-    /// close restates `ledger=`, 5F-4a).
+    /// close restates `ledger=`).
     start: BTreeMap<u64, i64>,
     /// Of `start`, the turns placed by their close: the open was evicted.
     by_close: usize,
@@ -700,8 +699,9 @@ fn log_placed_mail<C: Ctl>(
     }));
 }
 
-/// An EVENT the worker's turn ended with, waiting for words: `idle`, and in a journal an older
-/// build's removed `watch --mail` wrote, its `turn` (a report folded in) and `idle-no-report`.
+/// An EVENT the worker's turn ended with, waiting for words: `idle`, `question`, `limited`,
+/// and, in a journal an older build's `watch --mail` wrote, `turn` (a report folded in) and
+/// `idle-no-report`.
 fn ended_on_words(phase: &str) -> bool {
     matches!(
         phase,

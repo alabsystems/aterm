@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BOOK OF DECLARED WAKES THROUGH THE ONE `aterm` BINARY against a real `aterm --headless`
-//! (the occupancy slice-2 plan's 2.5): `wake`, `waits` and `await wake` are served on a session;
-//! a process of the tab's own tree books a wake under the kernel's proof of its peer (and passes
-//! the verb's op-class fence on `@self`), and a client outside the tree is refused and sees the
-//! book redacted.
+//! The book of declared wakes through the one `aterm` binary against a real `aterm --headless`:
+//! a process of the tab's own tree books a wake under the kernel's proof of its peer (passing the
+//! verb's op-class fence on `@self`), and a client outside the tree is refused and sees the book
+//! redacted.
 
 #![cfg(unix)]
 
@@ -25,8 +24,8 @@ fn boot() -> Instance {
     )
 }
 
-/// `aterm ctl <args…>` from outside the session's tree must be refused as another session's: the
-/// host knows the tab's shell from its spawn, so no refusal waits on a machine snapshot naming it.
+/// `aterm ctl <args…>` from outside the session's tree must be refused as another session's; the
+/// host knows the tab's shell from its spawn, so the refusal needs no machine snapshot.
 #[track_caller]
 fn refused(inst: &Instance, args: &[&str]) {
     const OTHER: &str = "ERR denied wake: another session's";
@@ -46,11 +45,10 @@ fn rows(printed: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A WAKE OF THE TAB'S OWN TREE, AND NONE FROM OUTSIDE IT: the test's own client (no process of
-/// the tab's) is refused `wake`, `await wake`, `wake rm` and `wake taken`; an `aterm ctl @self`
-/// run as an agent runs it, under a `sh` of the tab's shell (the process the wake is declared
-/// for, which `read` keeps alive past the book's tick), books one, and its `waits` shows the
-/// label that the outside client's `waits` never sees.
+/// An `aterm ctl @self` under a `sh` of the tab's shell books a wake and sees its label (`read`
+/// keeps that `sh`, the process the wake is declared for, alive past the book's tick); the test's
+/// own client, outside the tree, is refused `wake`, `await wake`, `wake rm` and `wake taken`, and
+/// sees the book redacted.
 #[test]
 fn a_tabs_own_tree_books_a_wake_and_a_client_outside_it_is_refused() {
     let inst = boot();

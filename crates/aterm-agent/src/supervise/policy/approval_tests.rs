@@ -3041,7 +3041,11 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
     ] {
         let rows = note_box(name);
         let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
-        assert_eq!(p.notes, [anchor("box.note_no_rule")], "{name}");
+        assert_eq!(
+            p.notes,
+            [aterm_phase::anchor!("box.note_no_rule")],
+            "{name}"
+        );
         for c in [
             git_host(ctx()),
             ApprovalCtx {
@@ -3079,7 +3083,11 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
     ] {
         let rows = note_box(name);
         let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
-        assert_eq!(p.notes, [anchor("box.note_no_rule")], "{name}");
+        assert_eq!(
+            p.notes,
+            [aterm_phase::anchor!("box.note_no_rule")],
+            "{name}"
+        );
         let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
         assert!(noted(why, &r), "{name}: {r}");
     }
@@ -3088,7 +3096,7 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
     assert!(r.contains("bypass session"), "{r}");
     let at = rows
         .iter()
-        .position(|r| r.trim() == anchor("box.note_no_rule"))
+        .position(|r| r.trim() == aterm_phase::anchor!("box.note_no_rule"))
         .expect("the note row");
     let mut two = rows.clone();
     two.insert(at + 1, String::new());
@@ -3120,7 +3128,11 @@ fn no_rule_box(command: &str) -> Vec<String> {
         .collect();
     let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(command);
     assert_eq!(p.command, command);
-    assert_eq!(p.notes, [anchor("box.note_no_rule")], "{command}");
+    assert_eq!(
+        p.notes,
+        [aterm_phase::anchor!("box.note_no_rule")],
+        "{command}"
+    );
     rows
 }
 
@@ -3345,7 +3357,7 @@ fn a_note_free_folder_box_is_held_to_the_proof_gaps_as_the_no_rule_note_is() {
         assert!(
             p.options
                 .iter()
-                .any(|o| o.label.contains(anchor("box.read_grant"))),
+                .any(|o| o.label.contains(aterm_phase::anchor!("box.read_grant"))),
             "{name}: a folder grant"
         );
         let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
@@ -3353,7 +3365,11 @@ fn a_note_free_folder_box_is_held_to_the_proof_gaps_as_the_no_rule_note_is() {
     }
     let inside = folder_box("assignment-inside");
     let p = aterm_phase::prompt::parse_prompt_v2(&inside).expect("inside");
-    assert_eq!(p.notes, [anchor("box.note_no_rule")], "the no-rule note");
+    assert_eq!(
+        p.notes,
+        [aterm_phase::anchor!("box.note_no_rule")],
+        "the no-rule note"
+    );
     let r = reason(&on_screen(&inside, &git_host(ctx()))).to_string();
     assert!(r.starts_with("assigns a variable (space reading): FOO=1") && r.ends_with(note));
     for (command, why) in [

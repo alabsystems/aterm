@@ -4195,8 +4195,8 @@ fn an_agy_about_to_exit_is_never_typed_into() {
         let reading = aterm_phase::read(Some("agy"), rows, None);
         TurnEndReading::of(&reading, rows, drafted, Some(3 * MIN), None, None)
     };
-    let shortcuts = aterm_phase::anchor_text("agy.footer.idle");
-    let ctrl_c = aterm_phase::anchor_text("agy.footer.exit");
+    let shortcuts = aterm_phase::anchor!("agy.footer.idle");
+    let ctrl_c = aterm_phase::anchor!("agy.footer.exit");
     let held = " ".repeat(ctrl_c.chars().count());
     let draft_sent = TurnEndAction::Submit {
         rule_id: RULE_CONTINUE,
@@ -4242,10 +4242,10 @@ fn an_agy_about_to_exit_is_never_typed_into() {
         }
         let footer = rows
             .iter()
-            .rposition(|r| r.starts_with(aterm_phase::anchor_text(hint)))
+            .rposition(|r| r.starts_with(aterm_phase::anchor(hint)))
             .expect("the hint on the footer");
         let mut back = rows.clone();
-        back[footer] = rows[footer].replacen(aterm_phase::anchor_text(hint), back_to, 1);
+        back[footer] = rows[footer].replacen(aterm_phase::anchor(hint), back_to, 1);
         assert_eq!(
             at(&mut TurnEndState::default(), &reading_of(&back, drafted), t),
             control,
@@ -7477,12 +7477,12 @@ fn a_memory_wall_restarts_the_agent_and_never_types() {
     let t = t0();
     let banner = format!(
         "{} (140.4GB) \u{2014} restart and resume with claude --continue",
-        aterm_phase::anchor_text("wall.memory")
+        aterm_phase::anchor!("wall.memory")
     );
     let resume = "claude --model opus --resume 5f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
     let restart = format!(
         "memory critical: restart it, then resume with {resume}: {} (140.4GB)",
-        aterm_phase::anchor_text("wall.memory")
+        aterm_phase::anchor!("wall.memory")
     );
     let restart = restart.as_str();
     let no_continue = |a: &TurnEndAction| match a {
@@ -7537,7 +7537,7 @@ fn a_memory_wall_restarts_the_agent_and_never_types() {
             &a,
             &format!(
                 "memory critical: restart it: {} (140.4GB)",
-                aterm_phase::anchor_text("wall.memory")
+                aterm_phase::anchor!("wall.memory")
             )
         ) && no_continue(&a)
             && !is_escalate(&a, "--resume"),

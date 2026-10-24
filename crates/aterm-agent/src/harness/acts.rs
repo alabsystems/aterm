@@ -261,11 +261,10 @@ const UPGRADING_LABEL: &str = "upgrading";
 const LABEL_VERSION_MAX: usize = 19;
 
 /// The harness's own label for a hosted lane's row `row` at its `step`, once a new agent came up
-/// ([`super::upgrade_drive::started`]): `upgrading to <ver>` for an upgrade's restart (`to`, the
-/// build it moved to, without its build metadata or the `(<source>)` the drive's rows add;
-/// `upgrading` when that is not a version), `restarting` for any other; `None` for a step that
-/// started nothing. The words are closed templates and a version's characters, never the
-/// worker's text.
+/// ([`super::upgrade_drive::started`]): `upgrading to <ver>` for an upgrade's restart (`to`
+/// without its build metadata or `(<source>)`; plain `upgrading` when that is not a version),
+/// else `restarting`; `None` for a step that started nothing. The words are closed templates
+/// and a version's characters, never the worker's text.
 #[must_use]
 pub fn relaunch_label(row: &str, step: &str, to: &str) -> Option<String> {
     if !super::upgrade_drive::started(step) {
@@ -735,10 +734,8 @@ mod tests {
         assert_eq!(mark, format!("act word=escalate rule={}", "r".repeat(40)));
     }
 
-    /// The harness labels only its own moments, in closed words: a restart once a new agent came
-    /// up (an upgrade's naming the build it moved to), and the loop's carry-on after a usage wall;
-    /// every label fits the `mark` verb's 32 graphemes and 40 bytes, and goes on the wire as one
-    /// `text=` word.
+    /// The harness labels only its own moments, in closed words, and every label fits the `mark`
+    /// verb's 32 graphemes and 40 bytes as one `text=` word.
     #[test]
     fn the_harness_labels_its_own_moments_in_closed_words() {
         let cases = [

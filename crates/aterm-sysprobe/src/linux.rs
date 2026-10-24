@@ -834,11 +834,40 @@ fn owner(entry: &std::fs::DirEntry) -> Option<u32> {
     }
 }
 
+/// The wall clock, unix ms, that a sweep reads beside `/proc/uptime` to turn each process's boot-clock start into its birth ([`ProcessReading::birth_ms`]).
+pub type WallMs = fn() -> Option<i64>;
+
+/// [`Root::new`]'s [`WallMs`]: the system's wall clock.
+fn system_wall_ms() -> Option<i64> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(since.as_millis()).ok()
+}
+
+/// `/proc/uptime`'s first field (the boot clock, sleep included, in seconds to the centisecond) in nanoseconds.
+#[must_use]
+pub fn parse_uptime_ns(text: &str) -> Option<u64> {
+    let field = text.split_whitespace().next()?;
+    let (whole, frac) = field.split_once('.').unwrap_or((field, ""));
+    if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs: u64 = whole.parse().ok()?;
+    let frac_ns: u64 = if frac.is_empty() {
+        0
+    } else {
+        format!("{frac:0<9}").parse().ok()?
+    };
+    secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)
+}
+
 /// `/proc`, `/sys` and `/sys/fs/cgroup` under one root directory: `/` on a Linux machine ([`Root::system`]), a fixture tree in tests.
 #[derive(Clone, Debug)]
 pub struct Root {
     base: PathBuf,
     nvidia: NvidiaBusy,
+    wall_ms: WallMs,
 }
 
 impl Root {
@@ -848,6 +877,7 @@ impl Root {
         Self {
             base: base.into(),
             nvidia: no_nvml,
+            wall_ms: system_wall_ms,
         }
     }
 
@@ -865,6 +895,13 @@ impl Root {
     #[must_use]
     pub(crate) fn with_nvidia(self, nvidia: NvidiaBusy) -> Self {
         Self { nvidia, ..self }
+    }
+
+    /// This root with `wall_ms` as its wall clock: the test arm a fixture tree's births are read against.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_wall_ms(self, wall_ms: WallMs) -> Self {
+        Self { wall_ms, ..self }
     }
 
     /// `rel` under the root.
@@ -1239,6 +1276,10 @@ impl Root {
         let hz = hz.max(1);
         let mut procs = Vec::new();
         let mut truncated = false;
+        let clock = self
+            .read("proc/uptime", parse_uptime_ns)
+            .flatten()
+            .zip((self.wall_ms)());
         for entry in std::fs::read_dir(self.at("proc")).ok()?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -1274,9 +1315,10 @@ impl Root {
                 }
                 footprint
             };
+            let start = u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok();
             procs.push(ProcessReading {
                 pid,
-                start: u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok(),
+                start,
                 ppid: stat.ppid,
                 exec: Some(stat.exec()),
                 cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
@@ -1294,6 +1336,9 @@ impl Root {
                 read_at,
                 coalition: None,
                 version: None,
+                birth_ms: start.zip(clock).and_then(|(start, (boot, wall))| {
+                    crate::procs::birth_of_boot_start(start, boot, wall)
+                }),
             });
         }
         Some(Sweep { procs, truncated })

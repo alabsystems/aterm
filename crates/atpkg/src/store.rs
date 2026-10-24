@@ -1227,9 +1227,8 @@ pub(crate) fn link_aside(_build_dir: &Path) -> std::io::Result<()> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-/// Give an aside whose `<build>` link a crash kept from being laid its link back: nothing is
-/// at `build_dir` and `<build>.noindex` is a real directory. Whatever the tree is, complete
-/// or partial, the rest of the store then reads it at its name.
+/// Lay back the `<build>` link a crash kept from an aside (complete or partial) when nothing is
+/// at `build_dir` and `<build>.noindex` is a real directory; whether it did.
 pub(crate) fn relink_aside(build_dir: &Path) -> bool {
     let Some(aside) = aterm_toolchain::layout::aside_of(build_dir) else {
         return false;
@@ -1242,6 +1241,7 @@ pub(crate) fn relink_aside(build_dir: &Path) -> bool {
 /// Move the real build directory `build_dir` into `<build>.noindex` and link `<build>` to it.
 /// The caller has proved nothing runs from it and nothing names it as the active build:
 /// a tree macOS may still be assessing a first exec in never moves.
+///
 /// # Errors
 /// `build_dir` is not a real directory, its aside's name is taken, or the rename or the link
 /// failed (a failed link puts the directory back).
@@ -1331,7 +1331,7 @@ pub(crate) fn sync_dir(dir: &Path) {
     }
 }
 
-/// Attempt an ORDERED flush of `dir` ([`aterm_durable::ordered`]).
+/// Attempt an ordered flush of `dir`, not a full one ([`aterm_durable::ordered`]).
 pub(crate) fn sync_dir_ordered(dir: &Path) {
     if let Ok(handle) = std::fs::File::open(dir) {
         let _ = aterm_durable::ordered(&handle);
@@ -1434,11 +1434,14 @@ pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
 /// the build within [`aterm_uds::deadline::FIRST_EXEC_HANG`] of it.
 pub(crate) const UNPROVEN_SUFFIX: &str = ".unproven";
 
-/// Executables a resolve check started that never exited on their own, each with when that was seen: this process's hold where the [`UNPROVEN_SUFFIX`] mark could not be written.
+/// Executables a resolve check started that never exited on their own, each with when that was
+/// seen: this process's hold where the [`UNPROVEN_SUFFIX`] mark could not be written.
 static UNPROVEN: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Hold the build `exe` (`<build>/bin/<tool>`, as [`crate::flow::bundle_resolve_check`] names it) ships in place ([`held_unproven`]): macOS may still be assessing its first exec, and syspolicyd crashes when the file goes mid-assessment.
+/// Hold in place ([`held_unproven`]) the build that ships `exe` (`<build>/bin/<tool>`, as
+/// [`crate::flow::bundle_resolve_check`] names it): macOS may still be assessing its first exec,
+/// and syspolicyd crashes when the file goes mid-assessment.
 pub(crate) fn hold_unproven(exe: &Path) {
     UNPROVEN
         .lock()
@@ -1452,7 +1455,9 @@ pub(crate) fn hold_unproven(exe: &Path) {
     }
 }
 
-/// Whether `tree` holds an executable [`hold_unproven`] took less than [`aterm_uds::deadline::FIRST_EXEC_HANG`] ago, in this process or (by its [`UNPROVEN_SUFFIX`] mark) in any.
+/// Whether `tree` holds an executable [`hold_unproven`] took less than
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] ago, in this process or (by its [`UNPROVEN_SUFFIX`]
+/// mark) in any.
 pub(crate) fn held_unproven(tree: &Path) -> bool {
     let here = UNPROVEN
         .lock()
@@ -1465,10 +1470,10 @@ pub(crate) fn held_unproven(tree: &Path) -> bool {
 }
 
 /// Whether the [`UNPROVEN_SUFFIX`] mark at `mark` is younger than
-/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, as
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, aged as
 /// [`aterm_uds::deadline::copy_wait_left`] ages an exec stamp: an awake clock below the stamp
-/// means a restart, which ended the assessment; without a reading, the mark's modification
-/// time. A mark that is there but cannot be read holds.
+/// means a restart, which ended the assessment; with no reading, the mark's modification time
+/// counts. A mark that is there but cannot be read holds.
 fn unproven_mark_holds(mark: &Path) -> bool {
     let text = match std::fs::read_to_string(mark) {
         Ok(text) => text,
@@ -1623,7 +1628,6 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
 
 #[must_use]
 fn caller_can_use_prefix(p: &Path) -> bool {
-    // Writable: we can install here.
     if p.ancestors()
         .find(|a| a.exists())
         .is_some_and(crate::platform::dir_writable_by_caller)
@@ -2824,9 +2828,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The mark a resolve check leaves holds its build for every process (a later `aterm pkg`
-    /// starts with nothing in memory) until FIRST_EXEC_HANG of awake time has passed or the Mac
-    /// restarted; the discard that then removes the build takes the mark with it.
+    /// The mark a resolve check leaves holds its build in every process until FIRST_EXEC_HANG of
+    /// awake time has passed or the Mac restarted; the discard that then removes the build takes
+    /// the mark with it.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn an_unproven_mark_holds_its_build_in_every_process_until_it_is_spent() {

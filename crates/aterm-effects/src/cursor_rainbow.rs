@@ -933,8 +933,13 @@ impl CursorRainbow {
             let mut peak = crate::color_math::relative_luminance_with(table, field) * 255.0;
             for &(mask, _) in &buckets[..n_buckets] {
                 let mut px = field;
-                for (i, &c) in cols[..rings.len()].iter().enumerate() {
-                    let hits = (mask >> (i * 8)) & 0xff;
+                let mut m = mask;
+                for &c in &cols[..rings.len()] {
+                    if m == 0 {
+                        break;
+                    }
+                    let hits = m & 0xff;
+                    m >>= 8;
                     for _ in 0..hits {
                         px = crate::spectrum::compose_on_glass(px, c, 0);
                     }
@@ -954,8 +959,13 @@ impl CursorRainbow {
             let mut sum = 0.0f32;
             for &(mask, count) in &buckets[..n_buckets] {
                 let mut px = page;
-                for (i, &c) in cols[..rings.len()].iter().enumerate() {
-                    let hits = (mask >> (i * 8)) & 0xff;
+                let mut m = mask;
+                for &c in &cols[..rings.len()] {
+                    if m == 0 {
+                        break;
+                    }
+                    let hits = m & 0xff;
+                    m >>= 8;
                     for _ in 0..hits {
                         px = crate::spectrum::compose_on_glass(px, c, 0);
                     }
@@ -967,10 +977,12 @@ impl CursorRainbow {
             }
             sum + aterm_render::hdr::HDR_GLOW_BOOST * aurora
         };
-        let grey_rings: [u32; HALO_LAYERS as usize] =
-            std::array::from_fn(|i| rings.get(i).map_or(0, |r| premul_rgb(RIM_LIGHT_GREY, r.1)));
-        let init_cols: [u32; HALO_LAYERS as usize] =
-            std::array::from_fn(|i| rings.get(i).map_or(0, |r| r.3));
+        let mut grey_rings = [0u32; HALO_LAYERS as usize];
+        let mut init_cols = [0u32; HALO_LAYERS as usize];
+        for (i, &(_, cov, _, light)) in rings.iter().enumerate() {
+            grey_rings[i] = premul_rgb(RIM_LIGHT_GREY, cov);
+            init_cols[i] = light;
+        }
         let target = pile_light(&grey_rings);
         let have = pile_light(&init_cols);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
@@ -1104,16 +1116,11 @@ fn push_ring(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32
     let th = ((geom.ch as i32) / 8).max(2);
     push_ring_rect(out, geom, x, y, w, th, premul);
     push_ring_rect(out, geom, x, y + h - th, w, th, premul);
-    push_ring_rect(out, geom, x, y + th, th, (h - 2 * th).max(0), premul);
-    push_ring_rect(
-        out,
-        geom,
-        x + w - th,
-        y + th,
-        th,
-        (h - 2 * th).max(0),
-        premul,
-    );
+    let side_h = h - 2 * th;
+    if side_h > 0 {
+        push_ring_rect(out, geom, x, y + th, th, side_h, premul);
+        push_ring_rect(out, geom, x + w - th, y + th, th, side_h, premul);
+    }
 }
 
 /// Clamp a pixel rect to the effects box and split it into per-cell-row [`GlowQuad`]s.
@@ -1139,15 +1146,16 @@ fn push_ring_rect(
     }
     let ch = geom.ch as i32;
     let oy = geom.origin_y as i32;
+    let qw = (x1 - x0) as u16;
+    let mut row = (y0 - oy).div_euclid(ch);
     let mut yy = y0;
     while yy < y1 {
-        let row = (yy - oy).div_euclid(ch);
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(GlowQuad {
             row: row.max(0) as u16,
             x: x0 as u16,
             y: yy as u16,
-            w: (x1 - x0) as u16,
+            w: qw,
             h: (band_end - yy) as u16,
             color: premul,
             alpha: 0,
@@ -1155,6 +1163,7 @@ fn push_ring_rect(
             alpha2: 0,
         });
         yy = band_end;
+        row += 1;
     }
 }
 
@@ -1294,7 +1303,8 @@ fn ring_light_on_page(arc: u32, cov: u8, page: u32, scale: f32) -> u32 {
             break;
         }
     }
-    let err = |premul: u32| (light(premul) - base - target).abs();
+    let target_light = base + target;
+    let err = |premul: u32| (light(premul) - target_light).abs();
     let (a, err_a) = (lo_eval.0, (lo_eval.1 - target).abs());
     let (b, err_b) = (hi_eval.0, (hi_eval.1 - target).abs());
     let (mut best, mut best_err) = if err_a <= err_b {

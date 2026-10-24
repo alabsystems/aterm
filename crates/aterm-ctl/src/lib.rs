@@ -784,6 +784,7 @@ pub fn connect_then_read_token(sock: &str) -> io::Result<(CtlStream, io::Result<
 fn connect_then_read<T>(sock: &str, read: impl FnOnce(&str) -> T) -> io::Result<(CtlStream, T)> {
     let pinned = pin_alias(sock);
     let stream = CtlStream::connect(&pinned)?;
+    aterm_uds::keep_out_of_children(&stream)?;
     Ok((stream, read(&pinned)))
 }
 

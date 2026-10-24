@@ -1610,9 +1610,9 @@ enum ArchivedSpace {
 struct ArchivedColour {
     rgb: Rgb,
     space: ArchivedSpace,
-    /// For a named colour (`NSColorSpace` 6, such as `textColor`), which carries a fallback
-    /// `NSColor` (an app that opens the archive gets the live system colour instead, and
-    /// `rgb` is the fallback): the name it gives itself when that is ASCII, else empty.
+    /// For a named colour (`NSColorSpace` 6, such as `textColor`): the name it gives itself
+    /// when that is ASCII, else empty. `rgb` is then the archived fallback, not the live
+    /// system colour an app that opens the archive shows.
     named: Option<String>,
     /// Whether a component lay far enough below 0 or above 1 that clipping it to that range
     /// changed its byte.
@@ -1815,8 +1815,7 @@ fn icc_description(icc: &[u8]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// The rest of the note on a named colour: Terminal.app opens the archive and shows the
-/// system's colour for that name, so the fallback aterm reads can differ from it.
+/// The rest of the note on a named colour.
 const TERMINAL_APP_NAMED_NOTE: &str = "Terminal.app shows the system's current colour for it, \
                                        which can differ (in Dark Mode, say); the fallback saved \
                                        with it was used";

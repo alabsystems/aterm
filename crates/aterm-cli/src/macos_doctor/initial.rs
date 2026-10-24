@@ -130,8 +130,8 @@ impl Stage {
     }
 }
 
-/// The workstation preferences a plan selects: its original eight rows without
-/// the two sign-outs, which are the Accounts stage's.
+/// The workstation preferences a plan selects, without the two sign-outs, which are the Accounts
+/// stage's.
 pub(super) fn preferences(selection: Selection) -> Selection {
     let mut preferences = selection.workstation();
     preferences.set(Setting::Messages, false);
@@ -168,6 +168,21 @@ struct Progress {
     /// ([`chosen_keeps`]): the groups that stayed are not set again, so a change the
     /// person made to them since stays. `None`: every preference the plan selects.
     only: Option<Selection>,
+    /// The selection of the plan this progress was staged for, which [`Self::plan`]
+    /// binds ([`Self::bind`]): what the next choice is measured from when a choice before
+    /// it was cut short after it saved its plan, before its progress, so the saved plan
+    /// moved ahead of the run ([`Self::staged`]). `None` in a record an older aterm wrote.
+    selection: Option<Selection>,
+}
+
+/// The plan a run's progress was staged for, as a choice measures from it
+/// ([`Progress::staged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Staged {
+    /// That plan's selection.
+    selection: Selection,
+    /// Whether that plan's vault is the choice's.
+    vault_kept: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -222,15 +237,43 @@ fn plan_digest(plan: &Plan) -> [u8; 32] {
 
 impl Progress {
     fn for_plan(plan: &Plan) -> Self {
-        Self {
+        let mut progress = Self {
             completed: plan.selection.is_empty(),
-            plan: plan_digest(plan),
             ..Self::default()
-        }
+        };
+        progress.bind(plan);
+        progress
+    }
+
+    /// Bind this progress to `plan`: its digest, and its selection ([`Self::selection`]).
+    fn bind(&mut self, plan: &Plan) {
+        self.plan = plan_digest(plan);
+        self.selection = Some(plan.selection);
     }
 
     fn belongs_to(self, plan: &Plan) -> bool {
         self.plan == plan_digest(plan)
+    }
+
+    /// The plan this progress was staged for, as a choice of `plan` measures from it
+    /// ([`chosen_keeps`], [`carried_access`]): the saved plan (`saved`) when the progress
+    /// is its own. A choice cut short after it saved its plan, before its progress, left
+    /// the saved plan ahead of the run, and the run is still the one this progress
+    /// records: then the selection the record keeps ([`Self::selection`]). Its vault is
+    /// `plan`'s when the binding says so. `None` for a record an older aterm wrote that
+    /// belongs to no plan saved here.
+    fn staged(self, saved: Option<&Plan>, plan: &Plan) -> Option<Staged> {
+        let selection = match saved {
+            Some(saved) if self.belongs_to(saved) => saved.selection,
+            _ => self.selection?,
+        };
+        Some(Staged {
+            selection,
+            vault_kept: self.belongs_to(&Plan {
+                selection,
+                vault_url: plan.vault_url.clone(),
+            }),
+        })
     }
 
     fn next_for_plan(self, plan: &Plan) -> Result<Self, String> {
@@ -346,9 +389,9 @@ fn fold_stop_request(root: &Path) -> Result<(), String> {
     {
         progress.stopped = true;
         progress.running = None;
-        // An upgrade can derive this Stop from its predecessor until the
-        // physical next-run record catches up. Persist it before unlinking
-        // the request, or a later read could otherwise lose the Stop.
+        // An upgrade can derive this Stop from its predecessor until the physical next-run
+        // record catches up: persist it before removing the request, or a later read could lose
+        // the Stop.
         if progress_file(root)? != Some(progress) {
             save_progress(root, progress)?;
         }
@@ -378,25 +421,24 @@ fn settle_stop_request_with(
     }
 }
 
-/// Ask the admitted run `revision` to stop at its next stage boundary (System
-/// State's Stop, or a choice that replaces its plan). It is durable when this
-/// returns: a relaunch reads the run as stopped even if the process ends before
-/// the running stage does. Takes only the short Stop-record lock, never the
-/// profile lock, and probes nothing.
+/// Ask the admitted run `revision` to stop at its next stage boundary (System State's Stop, or a
+/// choice that replaces its plan). It is durable when this returns, so a relaunch reads the run
+/// as stopped; it takes only the short Stop-record lock and probes nothing.
 pub fn request_initial_setup_stop(revision: u64) -> Result<(), String> {
     ensure_person_scope()?;
     request_stop_at(&state_root()?, revision)
 }
 
-/// The access revision a new revision of `plan` continues, when its prior run
-/// (`previous` and its `progress`) managed Permissions too: a change to another
-/// group is not a new approval of the grants, so it hands nothing to macOS again
-/// and a Not now stays answered (System State design §3.3, §6). Turning the
+/// The access revision a new revision of `plan` continues, when its prior run (its
+/// `progress`, staged for the saved plan `previous` or, after a choice cut short once it
+/// saved its plan, for the plan before it: [`Progress::staged`]) managed Permissions too:
+/// a change to another group is not a new approval of the grants, so it hands nothing to
+/// macOS again and a Not now stays answered (System State design §3.3, §6). Turning the
 /// Permissions group off and on again is a new approval.
 fn carried_access(previous: Option<&Plan>, progress: Option<Progress>, plan: &Plan) -> Option<u64> {
-    let (previous, progress) = previous.zip(progress)?;
-    (progress.belongs_to(previous)
-        && previous.selection.contains(Setting::Permissions)
+    let progress = progress?;
+    let staged = progress.staged(previous, plan)?;
+    (staged.selection.contains(Setting::Permissions)
         && plan.selection.contains(Setting::Permissions))
     .then(|| progress.access_revision())
 }
@@ -435,8 +477,8 @@ fn parse_progress(value: &Value) -> Result<Progress, String> {
         .and_then(|bits| u16::try_from(bits).ok())
         .filter(|bits| bits & !Stage::KNOWN == 0)
         .ok_or("unrecognized initial setup progress")?;
-    // A record from before the sign-outs were their own stage ran them inside the
-    // Workstation stage: its finished Workstation finished them too.
+    // A record without `stages` (an older aterm's) ran the sign-outs inside the Workstation
+    // stage: its finished Workstation finished them too.
     if value.get("stages").is_none() && done & Stage::Workstation.bit() != 0 {
         done |= Stage::Accounts.bit();
     }
@@ -504,6 +546,16 @@ fn parse_progress(value: &Value) -> Result<Progress, String> {
                 .ok_or("invalid initial setup preference scope")?,
         ),
     };
+    let selection = match value.get("plan_selection") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|bits| u16::try_from(bits).ok())
+                .and_then(Selection::from_bits)
+                .ok_or("invalid initial setup plan selection")?,
+        ),
+    };
     Ok(Progress {
         done,
         completed,
@@ -515,6 +567,7 @@ fn parse_progress(value: &Value) -> Result<Progress, String> {
         access,
         admitted_vault,
         only,
+        selection,
     })
 }
 
@@ -539,6 +592,9 @@ fn progress_record(progress: Progress) -> Value {
         }
         if let Some(only) = progress.only {
             fields.insert("workstation_only".into(), Value::from(only.bits()));
+        }
+        if let Some(selection) = progress.selection {
+            fields.insert("plan_selection".into(), Value::from(selection.bits()));
         }
     }
     record
@@ -642,10 +698,9 @@ fn saved_plan_provisional(root: &Path) -> Result<bool, String> {
     }
 }
 
-/// `aterm doctor --apply`'s plan: the original eight rows, and aterm's own
-/// permissions too (approved by default, System State design §6) unless the
-/// person's Cancel or Restore stands, which an explicit apply supersedes only for
-/// the rows it names.
+/// `aterm doctor --apply`'s plan: every workstation row, and aterm's own permissions too
+/// (approved by default, System State design §6) unless the person's Cancel or Restore stands,
+/// which an explicit apply supersedes only for the rows it names.
 pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> {
     // A System State Stop asked for the run this revives is part of its record.
     fold_stop_request(root)?;
@@ -673,14 +728,11 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
             plan.selection.set(setting, true);
         }
     }
-    // aterm's own permissions are set up by default (the owner's standing
-    // approval), so an explicit profile carries them too; after a Cancel or a
-    // Restore it does not re-open the hand-overs the person stopped.
     plan.selection.set(Setting::Permissions, !stopped);
     progress.access = carried_access(Some(&previous), Some(prior), &plan);
     save_workstation_authorization(root, &plan)?;
     save_plan(root, &plan)?;
-    progress.plan = plan_digest(&plan);
+    progress.bind(&plan);
     progress.done &= !(Stage::Workstation.bit() | Stage::Accounts.bit());
     progress.completed = false;
     progress.running = None;
@@ -1102,43 +1154,36 @@ fn stage_restart(
     next.admitted_vault = vault;
     (next.done, next.only) = chosen_keeps(restart, previous.as_ref(), prior, plan);
     // Restore put the Mac preferences back, and only the person sets them again: Set
-    // up now sets every one the plan selects; a choice sets only the groups it turned
-    // on (and those a choice since the Restore turned on and no pass has set yet, which
-    // `chosen_keeps` carries), and a Join or a Leave as is none. Nothing restored is
-    // recorded applied until a pass sets it (the pass writes `applied` itself). An
-    // unreadable decision is rewritten below, as before.
-    let (decision, restored) = decision_record(root).unwrap_or((Decision::Missing, false));
-    // A choice since Restore whose decision never landed (a crash after its plan and its
-    // progress, not yet admitted, were saved) left the record restored: the groups it
-    // queued are still the person's, and `chosen_keeps` carries them with this choice's.
-    let unlanded = prior.is_some_and(|prior| {
-        !prior.admitted
-            && previous
-                .as_ref()
-                .is_some_and(|(saved, _)| prior.belongs_to(saved))
-    });
-    if restored {
-        let everything = next.done & Stage::Workstation.bit() == 0 && next.only.is_none();
-        if !chosen {
-            next.done &= !Stage::Workstation.bit();
-            next.only = None;
-        } else if (decision == Decision::Stopped(Stop::Restored) && !unlanded) || everything {
-            let before = previous
-                .as_ref()
-                .map_or(plan.selection, |(saved, _)| saved.selection);
-            let added = turned_on(before, plan);
-            next.done &= !Stage::Workstation.bit();
-            next.only = None;
-            if added.is_empty() {
+    // up now sets every one the plan selects; a choice or a Join sets what the restored
+    // record queues ([`Restored::queued_after`]): the groups a choice turned on since the
+    // Restore that no pass has set yet, never a group left as it was or turned to Leave
+    // as is. The record, not the run's progress, holds that queue and the plan it was
+    // measured from, so nothing staged before the Restore runs after it, and a choice cut
+    // short before its record landed is measured again from the plan before it. Nothing
+    // restored is recorded applied until a pass sets it (the pass writes that itself,
+    // [`record_applied`]). An unreadable decision is rewritten below, as before.
+    let restored = decision_record(root).map_or(None, |(_, restored)| restored);
+    let mut still_restored = None;
+    if let Some(restored) = restored {
+        next.done &= !Stage::Workstation.bit();
+        next.only = None;
+        if chosen {
+            let saved = previous.as_ref().map(|(saved, _)| saved);
+            let queued = restored.queued_after(prior, saved, plan);
+            if queued.is_empty() {
                 next.done |= Stage::Workstation.bit();
             } else {
-                next.only = Some(added);
+                next.only = Some(queued);
             }
+            still_restored = Some(Restored {
+                queued: Some(queued),
+                selection: Some(plan.selection),
+                ..restored
+            })
+            .filter(|restored| restored.owes(plan.selection));
         }
     }
-    // The same plan again by Set up now, or the window resuming the plan it
-    // offered, is not a person shaping it: a provisional plan stays one (§3.5).
-    // A group choice is, even one that returns to aterm's plan.
+    // Only a person's choice makes a provisional plan theirs (`InitialSetupRestart::chosen`).
     let provisional = !chosen
         && previous
             .as_ref()
@@ -1157,8 +1202,8 @@ fn stage_restart(
             Err(error) => return Err(format!("cannot reset {what}: {error}")),
         }
     }
-    if restored && chosen {
-        save_restored_decision(root)?;
+    if let Some(restored) = still_restored {
+        save_restored_decision(root, false, restored)?;
     } else if mac_settings_kept(plan, next.done) {
         save_workstation_decision(root, true)?;
     } else {
@@ -1177,31 +1222,30 @@ fn turned_on(before: Selection, plan: &Plan) -> Selection {
     added
 }
 
-/// What a person's choice keeps of the run it replaces (System State design §3.3): a step
-/// that run finished stays finished while the choice leaves its groups and the vault as
-/// they were, so a choice runs only what it changed, and never resets the Dock or signs
-/// Messages and FaceTime out again for another group. A Join runs the vault's steps again:
-/// Secrets, and GitHub repositories, whose token the vault brings. Set up now keeps
-/// nothing. The done bits it keeps, and the preferences the Workstation stage sets
-/// ([`Progress::only`]).
-///
-/// The Workstation stage holds two groups, Keyboard & Trackpad and Desktop & Dock, so
-/// it keeps its progress per preference: a group turned to Leave as is changes nothing
-/// on the Mac, and keeps a finished stage finished; a group turned to Set up is the only
-/// one the stage sets again, so the other group's changes since stay.
+/// What a person's choice keeps of the run it replaces (System State design §3.3): the done bits
+/// of each stage whose groups and vault it left as they were, and the preferences the Workstation
+/// stage still sets ([`Progress::only`]). A choice therefore never resets the Dock or signs
+/// Messages and FaceTime out again for another group. A Join or a new vault runs Secrets and
+/// GitHub repositories (whose token the vault brings) again; Set up now keeps nothing. The
+/// Workstation stage holds two groups, so it keeps progress per preference: a group turned to
+/// Leave as is keeps a finished stage finished, and one turned to Set up is the only one it sets
+/// again.
+/// What changed is measured from the plan the run's progress was staged for ([`Progress::staged`]):
+/// the saved plan, unless a choice cut short after saving its plan never ran, when the next choice
+/// is measured from the run it left and still runs only what it changed.
 fn chosen_keeps(
     restart: Restart,
     previous: Option<&(Plan, bool)>,
     prior: Option<Progress>,
     plan: &Plan,
 ) -> (u16, Option<Selection>) {
-    let (true, Some((previous, true)), Some(prior)) = (restart.chosen, previous, prior) else {
+    let (true, Some((saved, true)), Some(prior)) = (restart.chosen, previous, prior) else {
         return (0, None);
     };
-    if !prior.belongs_to(previous) {
+    let Some(previous) = prior.staged(Some(saved), plan) else {
         return (0, None);
-    }
-    let vault_again = restart.joins || previous.vault_url != plan.vault_url;
+    };
+    let vault_again = restart.joins || !previous.vault_kept;
     let kept = Stage::ALL
         .into_iter()
         .filter(|stage| {
@@ -1260,16 +1304,156 @@ fn save_workstation_authorization(root: &Path, plan: &Plan) -> Result<(), String
     save_workstation_decision(root, plan.selection.workstation().is_empty())
 }
 
-/// The first-run decision after a choice made since Restore: pending, and the Mac
-/// preferences still restored, so a later choice keeps them so until a pass sets them.
-fn save_restored_decision(root: &Path) -> Result<(), String> {
-    write_json(
-        &root.join("first-run.json"),
-        &json!({"profile":PROFILE,"state":"pending","restored":true}),
-    )
+/// The first-run decision while Mac preferences stand restored ([`Restored`]): the
+/// Restore itself (`stopped`), or pending after a choice made since.
+fn save_restored_decision(root: &Path, stopped: bool, restored: Restored) -> Result<(), String> {
+    write_json(&root.join("first-run.json"), &restored.record(stopped))
 }
 
-/// The first-run decision: `applied` for Mac settings with nothing left to do, else pending.
+/// The first-run record a Restore writes: every Mac preference it puts back stands
+/// restored, nothing is queued to set again (a choice staged before it, admitted or not,
+/// runs no more), and the next choice is measured from the plan in force now.
+pub(super) fn save_restore(root: &Path) -> Result<(), String> {
+    let selection = authorized_selection(root).ok().flatten();
+    save_restored_decision(root, true, Restored::at_restore(selection))
+}
+
+/// The settings of `selection` that `keep` keeps.
+fn filtered(selection: Selection, keep: impl Fn(Setting) -> bool) -> Selection {
+    let mut kept = Selection::none();
+    for setting in Setting::ALL {
+        kept.set(setting, selection.contains(setting) && keep(setting));
+    }
+    kept
+}
+
+/// What the first-run record keeps while Mac preferences stand restored (System State
+/// design §3.4, Restore): which preferences stand restored, which a choice since has
+/// queued to set again, and the plan the queue was measured from, in one record written
+/// whole, so no write cut short leaves them out of step with each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Restored {
+    /// The Mac preferences Restore put back that no pass has set since. A pass takes out
+    /// those it set ([`record_applied`]); while one the plan selects is left, nothing
+    /// reads applied. A group turned to Leave as is stays in, but counts only while the
+    /// plan selects it again, and a group turned back on is queued, so its pass takes it
+    /// out.
+    left: Selection,
+    /// The preferences a choice since the Restore turned to Set up that no pass has set
+    /// yet: what the Workstation stage sets ([`Progress::only`]). `None` in a pending
+    /// record an older aterm wrote, which kept them in the run's progress
+    /// ([`Self::queue`]).
+    queued: Option<Selection>,
+    /// The plan's selection the record was written against: what the next choice turned
+    /// on is measured from it, never from a plan a choice cut short saved before its
+    /// record. `None` in an older record: the saved plan.
+    selection: Option<Selection>,
+}
+
+impl Restored {
+    /// Restore's record ([`save_restore`]), against the plan's `selection`, if any.
+    fn at_restore(selection: Option<Selection>) -> Self {
+        Self {
+            left: preferences(Selection::all()),
+            queued: Some(Selection::none()),
+            selection,
+        }
+    }
+
+    /// The record's restored fields, with `stopped` for a Restore's own. A `"restored":
+    /// true` (or a Restore's, with none) from an older aterm stands for every preference.
+    fn read(value: &Value, stopped: bool) -> Result<Self, String> {
+        let bits = |name: &str| match value.get(name) {
+            None => Ok(None),
+            Some(field) => field
+                .as_u64()
+                .and_then(|bits| u16::try_from(bits).ok())
+                .and_then(Selection::from_bits)
+                .map(Some)
+                .ok_or_else(|| format!("invalid first-run {name} preferences")),
+        };
+        let left = match value.get("restored") {
+            None | Some(Value::Bool(true)) => preferences(Selection::all()),
+            Some(_) => bits("restored")?.unwrap_or_else(Selection::none),
+        };
+        let queued = match bits("queued")? {
+            None if stopped => Some(Selection::none()),
+            queued => queued,
+        };
+        Ok(Self {
+            left,
+            queued,
+            selection: bits("selection")?,
+        })
+    }
+
+    fn record(self, stopped: bool) -> Value {
+        let mut record = json!({"profile":PROFILE,"state":if stopped {"restored"} else {"pending"},"restored":self.left.bits()});
+        if let Some(fields) = record.as_object_mut() {
+            if let Some(queued) = self.queued {
+                fields.insert("queued".into(), Value::from(queued.bits()));
+            }
+            if let Some(selection) = self.selection {
+                fields.insert("selection".into(), Value::from(selection.bits()));
+            }
+        }
+        record
+    }
+
+    /// The queue: the record's, or for an older pending record, the scope the run's
+    /// unfinished Workstation stage of the saved plan had still to set.
+    fn queue(self, progress: Option<Progress>, saved: Option<&Plan>) -> Selection {
+        self.queued.unwrap_or_else(|| match (progress, saved) {
+            (Some(progress), Some(saved))
+                if progress.belongs_to(saved) && progress.done & Stage::Workstation.bit() == 0 =>
+            {
+                progress.only.unwrap_or_else(Selection::none)
+            }
+            _ => Selection::none(),
+        })
+    }
+
+    /// What a choice of `plan` leaves queued: what the queue held that `plan` still
+    /// selects, and the preferences `plan` turned on since the plan the record was written
+    /// against.
+    fn queued_after(self, prior: Option<Progress>, saved: Option<&Plan>, plan: &Plan) -> Selection {
+        let before = self
+            .selection
+            .or_else(|| saved.map(|saved| saved.selection))
+            .unwrap_or(plan.selection);
+        let now = preferences(plan.selection);
+        let (queued, added) = (self.queue(prior, saved), turned_on(before, plan));
+        filtered(now, |setting| {
+            queued.contains(setting) || added.contains(setting)
+        })
+    }
+
+    /// The record after a pass that set `set`: none of it stands restored or queued.
+    fn after_pass(self, set: Selection, progress: Option<Progress>, saved: Option<&Plan>) -> Self {
+        let queued = self.queue(progress, saved);
+        Self {
+            left: filtered(self.left, |setting| !set.contains(setting)),
+            queued: Some(filtered(queued, |setting| !set.contains(setting))),
+            ..self
+        }
+    }
+
+    /// Whether a preference `selection` selects stands restored or queued: the Mac
+    /// settings it selects are not all applied.
+    fn owes(self, selection: Selection) -> bool {
+        let planned = preferences(selection);
+        let queued = self.queued.unwrap_or_else(Selection::none);
+        Setting::ALL.into_iter().any(|setting| {
+            planned.contains(setting) && (self.left.contains(setting) || queued.contains(setting))
+        })
+    }
+}
+
+/// The first-run decision an authorization starts from: `applied` for Mac settings with
+/// nothing left to do, else pending. It replaces what a Restore kept ([`Restored`]), so it
+/// is written as a plan is authorized, never by a pass: by a restart once it has decided
+/// what of a Restore still stands ([`stage_restart`]), by the explicit profile, and by an
+/// admission. A pass marks the decision pending with [`record_pending`], which keeps it.
 fn save_workstation_decision(root: &Path, applied: bool) -> Result<(), String> {
     write_json(
         &root.join("first-run.json"),
@@ -1611,54 +1795,87 @@ fn decision_at(root: &Path) -> Result<Decision, String> {
     decision_record(root).map(|(decision, _)| decision)
 }
 
-/// Whether the plan still owes Mac settings outside `set`, the selection a pass set, so
-/// the pass records nothing applied ([`super::record_applied`]):
+/// Record the profile applied after a pass over `set` (the selection it set) that needs
+/// nothing more, unless the plan still owes Mac settings outside `set`:
 ///
-/// - the Mac preferences stand restored ([`decision_record`]; a record that cannot be
-///   read does not) and the authorized plan selects a preference `set` leaves out, which
-///   no pass set again since Restore;
+/// - a preference the authorized plan selects stands restored, or queued to set again,
+///   and `set` leaves it out ([`Restored`]; a record that cannot be read owes nothing):
+///   the record keeps the rest, less what `set` set, so once every group the plan
+///   selects has been set again since a Restore, piece by piece or by Set up now, the
+///   profile reads applied;
 /// - or the run's progress has a Mac settings stage that `set` has no part in and has
 ///   not finished: the sign-outs after a preferences pass that failed, or the preferences
 ///   before the sign-outs' pass.
-pub(super) fn owed_beyond(root: &Path, set: Selection) -> bool {
+pub(super) fn record_applied(root: &Path, set: Selection) -> Result<(), String> {
     let planned = authorized_selection(root)
         .ok()
         .flatten()
         .unwrap_or_default();
-    let outside = |part: fn(Selection) -> Selection| {
-        let (planned, set) = (part(planned), part(set));
-        Setting::ALL
+    let (progress, plan) = (
+        progress(root).ok().flatten(),
+        saved_plan(root).ok().flatten(),
+    );
+    let restored = match decision_record(root) {
+        Ok((decision, Some(restored))) => Some((
+            decision == Decision::Stopped(Stop::Restored),
+            restored.after_pass(set, progress, plan.as_ref()),
+        )),
+        _ => None,
+    };
+    let stage_owed = progress.zip(plan.as_ref()).is_some_and(|(progress, plan)| {
+        progress.belongs_to(plan)
+            && [
+                (
+                    Stage::Workstation,
+                    preferences as fn(Selection) -> Selection,
+                ),
+                (Stage::Accounts, accounts),
+            ]
             .into_iter()
-            .any(|setting| planned.contains(setting) && !set.contains(setting))
-    };
-    if decision_record(root).is_ok_and(|(_, restored)| restored) && outside(preferences) {
-        return true;
+            .any(|(stage, part)| {
+                stage.selected(plan) && part(set).is_empty() && progress.done & stage.bit() == 0
+            })
+    });
+    if !stage_owed && !restored.is_some_and(|(_, restored)| restored.owes(planned)) {
+        return write_json(
+            &root.join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+        );
     }
-    let (Ok(Some(progress)), Ok(Some(plan))) = (progress(root), saved_plan(root)) else {
-        return false;
-    };
-    progress.belongs_to(&plan)
-        && [
-            (
-                Stage::Workstation,
-                preferences as fn(Selection) -> Selection,
-            ),
-            (Stage::Accounts, accounts),
-        ]
-        .into_iter()
-        .any(|(stage, part)| {
-            stage.selected(&plan) && part(set).is_empty() && progress.done & stage.bit() == 0
-        })
+    match restored {
+        // What this pass set stands restored no more.
+        Some((stopped, restored)) => save_restored_decision(root, stopped, restored),
+        None => Ok(()),
+    }
 }
 
-/// The first-run decision, and whether the Mac preferences stand restored: a Restore,
-/// or a choice since that has not had a pass set them ([`save_restored_decision`]).
-fn decision_record(root: &Path) -> Result<(Decision, bool), String> {
+/// Mark the first-run decision pending as a Mac settings pass begins, before it sets
+/// anything; [`record_applied`] records what the pass set once it needs nothing more.
+/// What a Restore keeps ([`Restored`]) stays whole: which preferences stand restored, which
+/// are queued, and the plan they were measured from. So a pass that sets one group (a
+/// choice's scope, or the sign-outs), or one cut short, leaves every other group restored
+/// or queued, and the profile never reads applied for a group no pass set again. Every
+/// pass marks pending through this, the real one and a test's stand-in alike; a decision
+/// that cannot be read is written plain pending, as before.
+pub(super) fn record_pending(root: &Path) -> Result<(), String> {
+    match decision_record(root) {
+        Ok((_, Some(restored))) => save_restored_decision(root, false, restored),
+        _ => write_json(
+            &root.join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "pending" }),
+        ),
+    }
+}
+
+/// The first-run decision, and what of a Restore it keeps while Mac preferences stand
+/// restored ([`Restored`]): a Restore, or a choice since that has not had a pass set
+/// them all again.
+fn decision_record(root: &Path) -> Result<(Decision, Option<Restored>), String> {
     let path = root.join("first-run.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Decision::Missing, false));
+            return Ok((Decision::Missing, None));
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
@@ -1673,8 +1890,17 @@ fn decision_record(root: &Path) -> Result<(Decision, bool), String> {
         Some("restored") => Decision::Stopped(Stop::Restored),
         _ => return Err("unrecognized first-run decision".into()),
     };
-    let restored = decision == Decision::Stopped(Stop::Restored)
-        || (decision == Decision::Pending && value["restored"].as_bool() == Some(true));
+    let restored = match decision {
+        Decision::Stopped(Stop::Restored) => Some(Restored::read(&value, true)?),
+        Decision::Pending
+            if value
+                .get("restored")
+                .is_some_and(|restored| *restored != Value::Bool(false)) =>
+        {
+            Some(Restored::read(&value, false)?)
+        }
+        _ => None,
+    };
     flush_record_with(&path, durable_name)?;
     Ok((decision, restored))
 }
@@ -1684,8 +1910,9 @@ struct Records {
     plan: Option<(Plan, bool)>,
     progress: Option<Progress>,
     decision: Decision,
-    /// The Mac preferences stand restored ([`decision_record`]).
-    restored: bool,
+    /// What of a Restore the decision keeps while Mac preferences stand restored
+    /// ([`decision_record`]).
+    restored: Option<Restored>,
     /// The saved plan is one aterm chose by itself ([`save_plan_as`]).
     provisional: bool,
     /// A person's Stop no pass has folded in yet ([`request_stop_at`]).
@@ -1796,7 +2023,11 @@ fn snapshot_from_observation(
             let completed = progress.is_some_and(|progress| progress.done & stage.bit() != 0);
             // Restored preferences a choice since left alone are no run's to apply.
             let restoring = *stage == Stage::Workstation
-                && (stopped == Some(Stop::Restored) || (records.restored && completed));
+                && (stopped == Some(Stop::Restored)
+                    || (completed
+                        && records
+                            .restored
+                            .is_some_and(|restored| restored.owes(plan.selection))));
             let recorded_running =
                 progress.is_some_and(|progress| progress.running == Some(*stage));
             let interrupted = !finished && !completed && recorded_running && !active;
@@ -1846,8 +2077,7 @@ fn status_at(root: &Path, fallback: Plan) -> Result<(Plan, bool, Vec<Row>), Stri
 trait InitialHost {
     /// A legacy plan's one pass: its original workstation rows, sign-outs included.
     fn legacy(&mut self, root: &Path) -> Result<Option<Report>, String>;
-    /// The workstation preferences, without the sign-outs ([`Stage::Accounts`]).
-    /// The Workstation stage: the plan's preferences, or `only` these
+    /// The Workstation stage: the plan's preferences without the sign-outs, or `only` these
     /// ([`Progress::only`]).
     fn workstation(
         &mut self,
@@ -1855,8 +2085,8 @@ trait InitialHost {
         only: Option<Selection>,
     ) -> Result<Option<Report>, String>;
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
-    /// The Permissions stage of `revision`: complete once every grant is in place,
-    /// not needed, or handed to macOS in this revision (System State design §6).
+    /// The Permissions stage of `revision`, complete as `access::stage_rows` says (System State
+    /// design §6).
     fn permissions(&mut self, plan: &Plan, revision: u64) -> Result<Vec<Row>, String>;
     fn secrets(
         &mut self,
@@ -1896,10 +2126,9 @@ pub struct SetupHooks {
     /// A stage started or ended.
     pub stage: for<'a> fn(StageEvent<'a>),
     /// Whether System State is the visible view of a focused window now
-    /// (`aterm_types::macos_setup::system_state_front`). The Accounts stage opens
-    /// Messages and FaceTime and may raise macOS's Accessibility and Automation
-    /// prompts, so it runs only then (design §6); otherwise it parks, and the
-    /// window wakes the run when the page comes to the front.
+    /// (`aterm_types::macos_setup::system_state_front`). The Accounts stage may raise macOS's
+    /// Accessibility and Automation prompts, so it runs only then (design §6); otherwise it
+    /// parks, and the window wakes the run when the page comes to the front.
     pub on_screen: fn() -> bool,
 }
 
@@ -1965,6 +2194,7 @@ pub struct InitialSetupParkMark {
     materialization: Option<aterm_secrets::client::MaterializationMark>,
     interfaces: Option<Vec<aterm_secrets::network::InterfaceAddress>>,
     retry_due: Option<u64>,
+    mac_settings_retry_due: Option<u64>,
 }
 
 impl std::fmt::Debug for InitialSetupParkMark {
@@ -1992,11 +2222,19 @@ impl InitialSetupParkMark {
     pub fn retry_due(&self) -> Option<u64> {
         self.retry_due
     }
+
+    /// A selected, unfinished Mac settings stage has a second automatic try
+    /// due. Its token is consumed independently of a Secrets deadline.
+    pub fn mac_settings_retry_due(&self) -> Option<u64> {
+        self.mac_settings_retry_due
+    }
 }
 
 /// What a parked run waits on that moves without the window: this login's vault
 /// state and, only for admitted pending Secrets, local interface changes or an
-/// existing retry deadline. No sockets, vault request or prompt is made here.
+/// existing retry deadline. A selected, unfinished Mac settings stage also
+/// wakes for its second automatic try. No sockets, vault request or prompt is
+/// made here.
 pub fn initial_setup_park_mark() -> InitialSetupParkMark {
     initial_setup_park_mark_at(
         state_root().ok().as_deref(),
@@ -2061,25 +2299,50 @@ fn initial_setup_park_mark_reading(
             && matches!(
                 records.decision,
                 Decision::Pending | Decision::Applied(true)
-            )
-            && Stage::Secrets.selected(plan))
-        .then_some((root, progress, Stage::Repositories.selected(plan)))
+            ))
+        .then_some((
+            root,
+            progress,
+            Stage::Secrets.selected(plan),
+            Stage::Repositories.selected(plan),
+            (progress.done & Stage::Workstation.bit() == 0
+                && Stage::Workstation.settings().iter().any(|setting| {
+                    plan.selection.contains(*setting)
+                        && progress.only.is_none_or(|only| only.contains(*setting))
+                }))
+                || (Stage::Accounts.selected(plan) && progress.done & Stage::Accounts.bit() == 0),
+        ))
     });
-    let unfinished_secrets =
-        pending.filter(|(_, progress, _)| progress.done & Stage::Secrets.bit() == 0);
+    let unfinished_secrets = pending.filter(|(_, progress, secrets, _, _)| {
+        *secrets && progress.done & Stage::Secrets.bit() == 0
+    });
     let materialization_run = pending
-        .filter(|(_, progress, repositories)| {
-            progress.done & Stage::Secrets.bit() == 0
-                || (*repositories && progress.done & Stage::Repositories.bit() == 0)
+        .filter(|(_, progress, secrets, repositories, _)| {
+            *secrets
+                && (progress.done & Stage::Secrets.bit() == 0
+                    || (*repositories && progress.done & Stage::Repositories.bit() == 0))
         })
-        .map(|(_, progress, _)| progress.revision);
+        .map(|(_, progress, _, _, _)| progress.revision);
     InitialSetupParkMark {
         vault,
         materialization_run,
         materialization: materialization_run.and_then(|_| materialization()),
         interfaces: unfinished_secrets.and_then(|_| interfaces()),
-        retry_due: unfinished_secrets
-            .and_then(|(root, progress, _)| secrets_retry::retry_due(root, progress.revision, now)),
+        retry_due: unfinished_secrets.and_then(|(root, progress, _, _, _)| {
+            secrets_retry::retry_due(root, progress.revision, now)
+        }),
+        mac_settings_retry_due: pending
+            .filter(|(_, _, _, _, mac_settings)| *mac_settings)
+            .and_then(|(root, progress, _, _, _)| {
+                super::mac_settings_retry_due(
+                    root,
+                    progress.revision,
+                    &aterm_types::version::build_id(),
+                    now,
+                )
+                .ok()
+                .flatten()
+            }),
     }
 }
 
@@ -2113,6 +2376,134 @@ mod parked_secrets_route_tests {
             membership,
             names: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_workstation_retry_deadline_wakes_after_the_worker_has_parked() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = plan(Setting::Dock);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut doctor = super::super::tests::NeverVerifies::dock();
+        let started = 1_800_000_000;
+        let read = |after| {
+            initial_setup_park_mark_with(Some(root.path()), None, started + after, || {
+                panic!("a Dock-only run must not inspect network interfaces")
+            })
+        };
+        // The actual worker permits ten consecutive retry passes, with nine
+        // minute-long backoffs. Its last pass is before this item's second try.
+        for minute in 0..10 {
+            let report = doctor
+                .pass_at(root.path(), plan.selection, started + minute * 60)
+                .unwrap();
+            assert_eq!(SetupNext::of(&report.rows), SetupNext::Retry);
+            assert_eq!(doctor.relaunches(), 1, "minute {minute}: still held");
+        }
+        let parked = read(540);
+        assert_eq!(parked.mac_settings_retry_due(), None);
+        assert_eq!(parked, read(599), "no early retry or changed park fact");
+        assert_ne!(
+            parked,
+            read(600),
+            "the second allowed doctor attempt must wake a parked worker"
+        );
+        assert_eq!(read(600).mac_settings_retry_due(), Some(started + 600));
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        doctor
+            .pass_at(root.path(), plan.selection, started + 600)
+            .unwrap();
+        assert_eq!(doctor.relaunches(), 2);
+        let spent = read(600);
+        assert_eq!(spent.mac_settings_retry_due(), None);
+        assert_eq!(spent, read(1_200), "no third attempt is armed");
+        doctor
+            .pass_at(root.path(), plan.selection, started + 1_200)
+            .unwrap();
+        assert_eq!(doctor.relaunches(), 2, "the per-build cap stays spent");
+    }
+
+    #[test]
+    fn a_mac_settings_deadline_requires_a_selected_unfinished_admitted_stage() {
+        for setting in [Setting::Dock, Setting::Messages] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let selected = plan(setting);
+            authorize_at(root.path(), &selected).unwrap().unwrap();
+            let mut doctor = if setting == Setting::Dock {
+                super::super::tests::NeverVerifies::dock()
+            } else {
+                super::super::tests::NeverVerifies::accounts()
+            };
+            doctor
+                .pass_at(root.path(), selected.selection, 1_000)
+                .unwrap();
+            let read = || {
+                initial_setup_park_mark_with(Some(root.path()), None, 1_600, || {
+                    panic!("no selected Secrets stage")
+                })
+                .mac_settings_retry_due()
+            };
+            assert_eq!(read(), Some(1_600), "{setting:?}");
+            let pending = progress(root.path()).unwrap().unwrap();
+            let stage = if setting == Setting::Dock {
+                Stage::Workstation
+            } else {
+                Stage::Accounts
+            };
+            for blocked in [
+                Progress {
+                    done: stage.bit(),
+                    ..pending
+                },
+                Progress {
+                    completed: true,
+                    ..pending
+                },
+                Progress {
+                    stopped: true,
+                    ..pending
+                },
+                Progress {
+                    admitted: false,
+                    ..pending
+                },
+                Progress {
+                    revision: pending.revision + 1,
+                    ..pending
+                },
+            ] {
+                save_progress(root.path(), blocked).unwrap();
+                assert_eq!(read(), None, "{setting:?}: {blocked:?}");
+            }
+            if setting == Setting::Dock {
+                for only in [Selection::none(), plan(Setting::Widgets).selection] {
+                    save_progress(
+                        root.path(),
+                        Progress {
+                            only: Some(only),
+                            ..pending
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(read(), None, "the choice left this scope alone");
+                }
+            }
+            save_progress(root.path(), pending).unwrap();
+            save_plan(root.path(), &plan(Setting::Permissions)).unwrap();
+            assert_eq!(read(), None, "mismatched plan");
+            save_progress(
+                root.path(),
+                Progress {
+                    plan: plan_digest(&plan(Setting::Permissions)),
+                    ..pending
+                },
+            )
+            .unwrap();
+            assert_eq!(read(), None, "no selected Mac settings stage");
+            save_plan(root.path(), &selected).unwrap();
+            save_progress(root.path(), pending).unwrap();
+            request_stop_at(root.path(), pending.revision).unwrap();
+            assert_eq!(read(), None, "a requested Stop holds before the fold");
+        }
     }
 
     #[test]
@@ -2539,12 +2930,9 @@ fn execute_initial(
     Ok(execute_pass(host, root, password, SetupHooks::NONE)?.map(|(report, _)| report))
 }
 
-/// One pass over the selected stages that are not done, in order, asking `hooks`
-/// and the durable stop request before each, and at the end, whether a person
-/// stopped this revision. A stop is folded into the progress record here, under
-/// the profile lock the pass already holds, and ends the revision without
-/// cancelling its plan; one that comes during the last stage of a run that
-/// finishes is spent, and the run is completed ([`stop_at_boundary`]).
+/// One pass over the selected stages that are not done, in order, asking `hooks` and the durable
+/// stop request before each and at the end whether a person stopped this revision
+/// ([`stop_at_boundary`]). A Stop ends the revision without cancelling its plan.
 fn execute_pass(
     host: &mut dyn InitialHost,
     root: &Path,
@@ -2763,9 +3151,8 @@ fn execute_pass(
     let stages_finished = Stage::ALL
         .iter()
         .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0);
-    // Follow-up can change preferences too. An in-process Stop holds before
-    // that work even while its separate durable save has not run. Preserve
-    // the last-stage rule: a run whose selected stages finished is completed.
+    // The follow-up can change preferences too, so a Stop holds before it, even one whose
+    // durable save has not run yet; a run whose selected stages finished is completed instead.
     if !stages_finished && stop_at_boundary(root, &mut progress, hooks)? {
         report.rows.push(Row {
             name: "System State".into(),
@@ -2789,10 +3176,8 @@ fn execute_pass(
         save_progress(root, progress)?;
         next = SetupNext::Done;
     }
-    // The pass's end is a boundary too. A Stop asked for during the last stage
-    // of a run that then finished came too late: the run is completed, and the
-    // request is spent. One asked for while work is left stops the run here,
-    // so no later pass of it runs.
+    // The pass's end is a boundary too: a Stop asked for during the last stage of a run that
+    // finished is spent, and one asked for while work is left stops the run here.
     if stop_at_boundary(root, &mut progress, hooks)? {
         report.rows.push(Row {
             name: "System State".into(),
@@ -2981,8 +3366,10 @@ mod tests {
                     backup: root.join("original-preferences.json"),
                 }));
             }
+            // As the real sign-out pass marks and records its pass ([`record_pending`],
+            // [`record_applied`]).
+            record_pending(root)?;
             let rows = self.stage(Stage::Accounts)?;
-            // As the real sign-out pass records its pass ([`super::super::record_applied`]).
             if rows_ready(&rows) {
                 let planned = authorized_selection(root)?.unwrap_or_default();
                 record_applied(root, accounts(planned))?;
@@ -3003,9 +3390,10 @@ mod tests {
                 return Ok(None);
             }
             self.only.push(only);
+            // As the real pass marks its pass pending before it sets anything, and records
+            // it: over the plan's preferences, or `only` those a choice narrowed it to.
+            record_pending(root)?;
             let rows = self.stage(Stage::Workstation)?;
-            // As the real pass records its pass: over the plan's preferences, or `only`
-            // those a choice narrowed it to.
             if rows_ready(&rows) {
                 let mut set = preferences(authorized_selection(root)?.unwrap_or_default());
                 if let Some(only) = only {
@@ -4699,12 +5087,9 @@ mod tests {
         }
     }
 
-    /// A later choice that leaves the widgets row as is withdraws the clear setup still owes,
-    /// one that leaves every Mac settings group as is (the vault alone) too; a restart that
-    /// keeps the row (a Join leaves the groups as they were) withdraws nothing, and once the
-    /// grant arrives that run's follow-up clears Notification Center's widgets. Negative
-    /// control: reading a choice without Mac settings as no answer clears them after the
-    /// vault-alone plan.
+    /// A later choice that leaves the widgets row as is, the vault-alone one included, withdraws
+    /// the clear setup still owes; a restart that keeps the row withdraws nothing, and once the
+    /// grant arrives that run's follow-up clears Notification Center's widgets.
     #[test]
     fn a_choice_that_leaves_the_widgets_as_is_withdraws_the_clear_setup_owes() {
         use super::super::tests::{WIDGETS, Withholding};
@@ -5324,7 +5709,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(report.needs_attention());
-        // The explicit profile carries aterm's permissions (a new stage here).
+        // The explicit profile carries aterm's permissions, so their stage runs too.
         assert_eq!(
             host.calls,
             [
@@ -8093,10 +8478,8 @@ mod tests {
         selection
     }
 
-    /// The Workstation stage holds two page groups, Keyboard & Trackpad and Desktop &
-    /// Dock. Keyboard & Trackpad turned to Leave as is changes nothing on the Mac, so the
-    /// finished stage stays finished: the Dock, which the person may have changed since,
-    /// is not set again for another group's choice.
+    /// Keyboard & Trackpad turned to Leave as is keeps the finished Workstation stage finished,
+    /// so the Dock is not set again for another group's choice.
     #[test]
     fn a_group_turned_to_leave_as_is_keeps_the_finished_workstation_stage() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -8126,9 +8509,8 @@ mod tests {
         assert!(finished_at(root.path()).unwrap());
     }
 
-    /// A group turned to Set up after the Workstation stage finished is the only one the
-    /// stage sets: the other group's preferences, which the person may have changed
-    /// since, stay as they are.
+    /// A group turned to Set up after the Workstation stage finished is the only one it sets
+    /// again.
     #[test]
     fn a_group_turned_on_after_the_stage_finished_sets_only_that_groups_preferences() {
         use aterm_types::macos_setup::Group;
@@ -8306,21 +8688,110 @@ mod tests {
         }
     }
 
-    /// A finished run whose Mac preferences a Restore put back (`plan` first).
+    /// A finished run whose Mac preferences a Restore put back (`plan` first), with the
+    /// record Restore writes.
     fn restored_after(plan: &Plan) -> aterm_tempfile::TempDir {
         let root = aterm_tempfile::tempdir().unwrap();
         authorize_at(root.path(), plan).unwrap();
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
-        write_json(
-            &root.path().join("first-run.json"),
-            &json!({"profile":PROFILE,"state":"restored"}),
-        )
-        .unwrap();
+        save_restore(root.path()).unwrap();
         assert_eq!(
             decision_at(root.path()).unwrap(),
             Decision::Stopped(Stop::Restored)
         );
         root
+    }
+
+    pub(super) fn staged_restored_choice() -> (aterm_tempfile::TempDir, Plan) {
+        use aterm_types::macos_setup::Group;
+        let root = restored_after(&leaving(&[Group::Desktop]));
+        let plan = Plan::default();
+        let mut attempt = InitialSetupRestart::chosen();
+        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            attempt.persist_with(
+                root,
+                &plan,
+                false,
+                || Ok(None),
+                |_, _| Err("injected failure before final admission".into()),
+                observe_restart,
+            )
+        });
+        assert!(failed.result.is_err());
+        assert!(attempt.pending());
+        let staged = progress(root.path()).unwrap().unwrap();
+        assert!(!staged.admitted);
+        assert_eq!(staged.only, Some(group_selection(Group::Desktop)));
+        assert_eq!(decision_at(root.path()).unwrap(), Decision::Pending);
+        drop(attempt);
+        (root, plan)
+    }
+
+    #[test]
+    fn a_fresh_restored_startup_keeps_the_groups_no_pass_set_again() {
+        use aterm_types::macos_setup::Group;
+        let (root, plan) = staged_restored_choice();
+        let original = revision_at(root.path()).unwrap();
+        let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        let revision = startup
+            .persist_at(root.path(), &plan)
+            .result
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision, original + 1);
+        let host = run_pass(root.path(), revision);
+        assert_eq!(host.only, [Some(group_selection(Group::Desktop))]);
+        assert!(finished_at(root.path()).unwrap());
+        assert_eq!(
+            restored_left(root.path()),
+            (Decision::Pending, Some(group_selection(Group::Input))),
+            "Keyboard & Trackpad were restored and no pass set them again"
+        );
+        assert_ne!(workstation_row(root.path()).status, "applied");
+    }
+
+    #[test]
+    fn a_different_restored_startup_choice_still_sets_its_whole_plan() {
+        let (root, mut plan) = staged_restored_choice();
+        plan.selection.set(Setting::Spotlight, false);
+        let mut startup = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        let revision = startup
+            .persist_at(root.path(), &plan)
+            .result
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress(root.path()).unwrap().unwrap().only, None);
+        assert_eq!(decision_record(root.path()).unwrap().1, None);
+        let host = run_pass(root.path(), revision);
+        assert_eq!(host.only, [None]);
+        assert!(finished_at(root.path()).unwrap());
+        assert_eq!(decision_at(root.path()).unwrap(), Decision::Applied(true));
+        assert_eq!(workstation_row(root.path()).status, "applied");
+    }
+
+    /// The first-run decision, and the Mac preferences it keeps restored, if any.
+    fn restored_left(root: &Path) -> (Decision, Option<Selection>) {
+        let (decision, restored) = decision_record(root).unwrap();
+        (decision, restored.map(|restored| restored.left))
+    }
+
+    /// One pass of the admitted run `revision` on a fake host: what it set.
+    fn run_pass(root: &Path, revision: u64) -> Fake {
+        let mut host = Fake::default();
+        execute_initial_for_revision(&mut host, root, revision, &mut None, SetupHooks::NONE)
+            .unwrap();
+        host
+    }
+
+    /// The default plan with `groups` turned to Leave as is.
+    fn leaving(groups: &[aterm_types::macos_setup::Group]) -> Plan {
+        let mut plan = Plan::default();
+        for group in groups {
+            for setting in group.settings() {
+                plan.selection.set(*setting, false);
+            }
+        }
+        plan
     }
 
     /// The Workstation row of the run a snapshot shows.
@@ -8333,10 +8804,9 @@ mod tests {
             .expect("the plan selects Mac settings")
     }
 
-    /// After Restore, a choice of another group, a group turned to Leave as is, or a Join
-    /// sets no Mac preference again (the manual: Restore stops automatic setup, and a
-    /// group turned to Leave as is changes nothing), and none is recorded applied: not
-    /// by this choice, nor by any later one before a pass sets them.
+    /// After Restore, a choice of another group, a group turned to Leave as is, or a Join sets no
+    /// Mac preference again, and none is recorded applied by this choice or any later one before
+    /// a pass sets them.
     #[test]
     fn a_choice_or_a_join_after_restore_leaves_the_restored_preferences_alone() {
         use aterm_types::macos_setup::Group;
@@ -8455,14 +8925,13 @@ mod tests {
         assert_eq!(host.only, [Some(group_selection(Group::Desktop))]);
         // Keyboard & Trackpad were never set again: the record still stands restored.
         assert_eq!(
-            decision_record(root.path()).unwrap(),
-            (Decision::Pending, true)
+            restored_left(root.path()),
+            (Decision::Pending, Some(group_selection(Group::Input)))
         );
     }
 
-    /// Desktop & Dock turned to Set up after the stage finished, its pass fails, and the
-    /// person turns it back to Leave as is: the stage owes nothing, so it is finished,
-    /// never waiting on a pass with nothing to set.
+    /// A group turned to Set up whose pass failed, then back to Leave as is, leaves the stage
+    /// finished: it owes nothing.
     #[test]
     fn a_group_turned_on_then_off_before_its_pass_finishes_the_stage() {
         use aterm_types::macos_setup::Group;
@@ -8562,8 +9031,8 @@ mod tests {
             decision_record(root.path())
         );
         assert_eq!(
-            decision_record(root.path()).unwrap(),
-            (Decision::Pending, true)
+            restored_left(root.path()),
+            (Decision::Pending, Some(group_selection(Group::Input)))
         );
         // Set up now sets every group again, and only then is the profile applied.
         let revision = restart_at(root.path(), &Plan::default()).unwrap();
@@ -8580,51 +9049,242 @@ mod tests {
         assert_eq!(decision_at(root.path()).unwrap(), Decision::Applied(true));
     }
 
-    /// A choice after Restore whose decision write never landed (a crash or an I/O error
-    /// after its plan and its progress were saved, before admission) leaves the record
-    /// restored and the saved plan the choice's own. The next choice keeps the groups that
-    /// attempt queued: Desktop & Dock, which the person turned on, is set.
+    /// A choice after Restore cut short before its decision landed (a crash or an I/O
+    /// error after its plan was saved, or after its progress too, before admission) leaves
+    /// the Restore's record, which names the plan it was taken against. The next choice is
+    /// measured from that plan, not from the plan the cut-short choice saved, so Desktop &
+    /// Dock, which the person turned on, is set; and it is the only step that runs: the
+    /// run's other steps are measured from the plan its progress was staged for, so
+    /// Spotlight, Permissions (whose access revision stands), the vault and the sign-outs
+    /// stay as the run left them.
     #[test]
     fn a_choice_whose_decision_write_failed_is_not_lost() {
         use aterm_types::macos_setup::Group;
-        let mut no_desktop = Plan::default();
-        for setting in Group::Desktop.settings() {
-            no_desktop.selection.set(*setting, false);
+        for cut in ["after its plan", "after its progress"] {
+            let root = restored_after(&leaving(&[Group::Desktop]));
+            let access = access_revision_at(root.path()).unwrap();
+            let before = |name: &str| std::fs::read(root.path().join(name)).unwrap();
+            let (decision, progress_record) =
+                (before("first-run.json"), before("initial-setup.json"));
+            system_state_choice(root.path(), &Plan::default());
+            // What that choice leaves when it stops at `cut`.
+            std::fs::write(root.path().join("first-run.json"), &decision).unwrap();
+            if cut == "after its plan" {
+                std::fs::write(root.path().join("initial-setup.json"), &progress_record).unwrap();
+            } else {
+                let staged = progress(root.path()).unwrap().unwrap();
+                save_progress(
+                    root.path(),
+                    Progress {
+                        admitted: false,
+                        ..staged
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(saved_plan(root.path()).unwrap(), Some(Plan::default()));
+            let revision = system_state_choice(root.path(), &Plan::default());
+            assert_eq!(
+                access_revision_at(root.path()).unwrap(),
+                access,
+                "{cut}: nothing is handed to macOS again"
+            );
+            let host = run_pass(root.path(), revision);
+            assert_eq!(host.calls, [Stage::Workstation], "{cut}");
+            assert_eq!(
+                host.only,
+                [Some(group_selection(Group::Desktop))],
+                "{cut}: the group the person turned on is set"
+            );
         }
-        let root = restored_after(&no_desktop);
-        system_state_choice(root.path(), &Plan::default());
-        // What that choice leaves when it stops between `save_progress` and
-        // `save_restored_decision`: its progress staged, not admitted, and the record
-        // still restored.
+    }
+
+    /// A choice cut short once it saved its plan, before its progress landed, never ran:
+    /// the run is still the one its progress records, staged for the plan before it, which
+    /// the progress keeps. The next choice is measured from that plan, not from the one the
+    /// cut-short choice saved, so it runs only what it changed: Desktop & Dock turned on
+    /// sets that group alone, and a Join runs only the vault's steps. Spotlight, Permissions
+    /// (whose access revision stands, so nothing is handed to macOS again) and the
+    /// sign-outs (Messages and FaceTime are not signed out again) stay as the run left
+    /// them. NEGATIVE CONTROL: Set up now still runs every step.
+    #[test]
+    fn a_choice_cut_short_after_its_plan_runs_only_what_it_changed() {
+        use aterm_types::macos_setup::Group;
+        let joined = Plan {
+            vault_url: "http://team.local:7484/v1/team".into(),
+            ..Plan::default()
+        };
+        for (how, first, then, runs) in [
+            (
+                "a choice",
+                leaving(&[Group::Desktop]),
+                Plan::default(),
+                &[Stage::Workstation][..],
+            ),
+            (
+                "a join",
+                Plan::default(),
+                joined.clone(),
+                &[Stage::Secrets, Stage::Repositories][..],
+            ),
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(root.path(), &first).unwrap();
+            execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
+            assert!(finished_at(root.path()).unwrap(), "{how}");
+            let access = access_revision_at(root.path()).unwrap();
+            let choose = |root: &Path| {
+                if how == "a join" {
+                    system_state_join(root, &then)
+                } else {
+                    system_state_choice(root, &then)
+                }
+            };
+            let before = |name: &str| std::fs::read(root.path().join(name)).unwrap();
+            let (decision, progress_record) =
+                (before("first-run.json"), before("initial-setup.json"));
+            choose(root.path());
+            // What that choice leaves when it stops after its plan.
+            std::fs::write(root.path().join("first-run.json"), &decision).unwrap();
+            std::fs::write(root.path().join("initial-setup.json"), &progress_record).unwrap();
+            assert_eq!(
+                saved_plan(root.path()).unwrap(),
+                Some(then.clone()),
+                "{how}"
+            );
+            let revision = choose(root.path());
+            assert_eq!(
+                access_revision_at(root.path()).unwrap(),
+                access,
+                "{how}: nothing is handed to macOS again"
+            );
+            let host = run_pass(root.path(), revision);
+            assert_eq!(host.calls, runs, "{how}");
+            if how == "a choice" {
+                assert_eq!(host.only, [Some(group_selection(Group::Desktop))]);
+            }
+            assert!(finished_at(root.path()).unwrap(), "{how}");
+            let revision = system_state_apply(root.path(), &then, false, || Ok(None));
+            let host = run_pass(root.path(), revision);
+            assert!(
+                host.calls.contains(&Stage::Workstation) && host.calls.contains(&Stage::Accounts),
+                "{how}: Set up now runs every step: {:?}",
+                host.calls
+            );
+        }
+    }
+
+    /// A choice staged but never admitted (its admission commit failed) and then a Restore:
+    /// the Restore stands over it. A later choice of another group sets no Mac preference
+    /// again, not even the group that choice turned on before the Restore.
+    #[test]
+    fn a_choice_staged_before_a_restore_is_not_set_after_it() {
+        use aterm_types::macos_setup::Group;
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &leaving(&[Group::Desktop])).unwrap();
+        execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
+        let failed = observe_mutation_at(root.path(), None, Err("busy".into()), |root| {
+            InitialSetupRestart::chosen().persist_with(
+                root,
+                &Plan::default(),
+                false,
+                || Ok(None),
+                |_, _| Err("disk full".into()),
+                observe_restart,
+            )
+        })
+        .result;
+        assert!(failed.is_err(), "{failed:?}");
         let staged = progress(root.path()).unwrap().unwrap();
-        save_progress(
-            root.path(),
-            Progress {
-                admitted: false,
-                ..staged
-            },
-        )
-        .unwrap();
+        assert!(!staged.admitted, "{staged:?}");
+        assert_eq!(staged.only, Some(group_selection(Group::Desktop)));
+        save_restore(root.path()).unwrap();
+        let mut no_spotlight = Plan::default();
+        no_spotlight.selection.set(Setting::Spotlight, false);
+        let revision = system_state_choice(root.path(), &no_spotlight);
+        let host = run_pass(root.path(), revision);
+        assert!(
+            !host.calls.contains(&Stage::Workstation),
+            "Desktop & Dock was set after the Restore: {:?}",
+            host.calls
+        );
+        assert_eq!(
+            restored_left(root.path()),
+            (Decision::Pending, Some(preferences(Selection::all())))
+        );
+    }
+
+    /// After a Restore, every group the plan selects set again piece by piece reads
+    /// applied, as Set up now does: Desktop & Dock turned on (its pass sets it), then
+    /// Keyboard & Trackpad turned to Leave as is and back to Set up (its pass sets it).
+    /// Each pass takes its group out of the restored record.
+    #[test]
+    fn every_group_set_again_since_a_restore_reads_applied() {
+        use aterm_types::macos_setup::Group;
+        let root = restored_after(&leaving(&[Group::Desktop]));
+        let revision = system_state_choice(root.path(), &Plan::default());
+        let host = run_pass(root.path(), revision);
+        assert_eq!(host.only, [Some(group_selection(Group::Desktop))]);
+        assert_eq!(
+            restored_left(root.path()),
+            (Decision::Pending, Some(group_selection(Group::Input)))
+        );
+        assert_ne!(workstation_row(root.path()).status, "applied");
+        // Keyboard & Trackpad to Leave as is: nothing is set, and nothing the plan
+        // selects stands restored any more.
+        let revision = system_state_choice(root.path(), &leaving(&[Group::Input]));
+        let host = run_pass(root.path(), revision);
+        assert!(
+            !host.calls.contains(&Stage::Workstation),
+            "{:?}",
+            host.calls
+        );
+        // And back to Set up: its pass sets it, and the profile reads applied.
+        let revision = system_state_choice(root.path(), &Plan::default());
+        let host = run_pass(root.path(), revision);
+        assert_eq!(host.only, [Some(group_selection(Group::Input))]);
+        assert_eq!(restored_left(root.path()), (Decision::Applied(true), None));
+        assert_eq!(workstation_row(root.path()).status, "applied");
+    }
+
+    /// A Restore record an older aterm wrote names no preferences, and reads as every
+    /// one restored; so does a pending record of a choice since with `"restored": true`,
+    /// which kept its queue in the run's progress, as before.
+    #[test]
+    fn an_older_restored_record_reads_every_preference_restored() {
+        use aterm_types::macos_setup::Group;
+        let root = restored_after(&leaving(&[Group::Desktop]));
         write_json(
             &root.path().join("first-run.json"),
             &json!({"profile":PROFILE,"state":"restored"}),
         )
         .unwrap();
-        let revision = system_state_choice(root.path(), &Plan::default());
-        let mut host = Fake::default();
-        execute_initial_for_revision(
-            &mut host,
-            root.path(),
-            revision,
-            &mut None,
-            SetupHooks::NONE,
+        assert_eq!(
+            restored_left(root.path()),
+            (
+                Decision::Stopped(Stop::Restored),
+                Some(preferences(Selection::all()))
+            )
+        );
+        system_state_choice(root.path(), &Plan::default());
+        // What an older aterm's choice wrote, its queue in the progress.
+        write_json(
+            &root.path().join("first-run.json"),
+            &json!({"profile":PROFILE,"state":"pending","restored":true}),
         )
         .unwrap();
         assert_eq!(
-            host.only,
-            [Some(group_selection(Group::Desktop))],
-            "the group the person turned on is set: {:?}",
-            host.calls
+            restored_left(root.path()),
+            (Decision::Pending, Some(preferences(Selection::all())))
+        );
+        let mut no_spotlight = Plan::default();
+        no_spotlight.selection.set(Setting::Spotlight, false);
+        let revision = system_state_choice(root.path(), &no_spotlight);
+        let host = run_pass(root.path(), revision);
+        assert_eq!(host.only, [Some(group_selection(Group::Desktop))]);
+        assert_eq!(
+            restored_left(root.path()),
+            (Decision::Pending, Some(group_selection(Group::Input)))
         );
     }
 }

@@ -50,11 +50,10 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
         .collect())
 }
 
-/// [`selected_items`], each item with the setting whose System State row it reports to.
-/// A pass builds all of its preference items with one call: the widget, desktop and Dock
-/// items of that call share one [`DesktopActivation`], and a second call would build a
-/// second one with the same id, whose families the engine never relaunches (it settles
-/// an id once, with the last item's activation).
+/// [`selected_items`], each item with the setting whose System State row it reports to. Build a
+/// pass's preference items with one call: its widget, desktop and Dock items share one
+/// [`DesktopActivation`], and the engine settles an id once, with its last item's activation, so
+/// a second call's activation under the same id would never relaunch its families.
 ///
 /// # Errors
 /// An absent or ambiguous user, or an invalid selected keyboard model.
@@ -97,7 +96,8 @@ pub fn selected_tagged_items(
     Ok(items)
 }
 
-/// The setup row of the desktop item with `id` (`consumer.widgets.notification-center@alice`: the widgets row), for a caller that recorded the items a pass withheld ([`Item::withheld`]) and follows them up.
+/// The setup row of the desktop item with `id` (`consumer.widgets.notification-center@alice`: the
+/// widgets row), for a caller following up the items a pass withheld ([`Item::withheld`]).
 #[must_use]
 pub fn setting_of(id: &str) -> Option<Setting> {
     let (name, _) = id.split_once('@')?;
@@ -106,7 +106,9 @@ pub fn setting_of(id: &str) -> Option<Setting> {
         .map(|(setting, _)| setting)
 }
 
-/// The items of this build that `id`, from a record an older aterm wrote, stands for. aterm 0.118.0 and older ran one widgets item, `init.widgets@<user>`, whose keys are now each a `[consumer] widgets` row's own item.
+/// The ids of this build's items that `id`, from a record an older aterm wrote, stands for:
+/// `init.widgets@<user>` stands for each `[consumer] widgets` row's own item (where `withheld`,
+/// only those whose domain is in another app's container), and any other id for itself.
 #[must_use]
 pub fn current_ids(id: &str, withheld: bool) -> Vec<String> {
     match id.split_once('@') {
@@ -165,7 +167,8 @@ pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<PreferenceIt
         .collect())
 }
 
-/// Apply Caps Lock as Control to attached HID services without replacing the persistent modifier preferences.
+/// Apply Caps Lock as Control to attached HID services without replacing the persistent modifier
+/// preferences.
 /// # Errors
 /// The setup did not resolve exactly one local user.
 pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -666,8 +669,8 @@ struct Desktop {
 type Changes = Vec<(Target, Read<PValue>, PValue)>;
 
 impl DesktopKind {
-    /// What the pending changes read, for System State's words (design §3.3), from
-    /// the values themselves: an absent key holds macOS's default, which is not read.
+    /// What the pending changes read, for System State's words, from the values themselves: an
+    /// absent key holds macOS's default, which is not read.
     fn reading(self, changes: &Changes) -> Option<Reading> {
         let reads = |key: &str, value: bool| {
             changes.iter().any(|(target, read, _)| {
@@ -2441,6 +2444,98 @@ mod tests {
     }
 
     #[test]
+    fn an_initially_correct_dock_is_rechecked_after_another_desktop_item_relaunches_it() {
+        for (change_desktop, managed) in [(false, true), (true, false), (true, true)] {
+            let who = user("alice", 501);
+            let settings = [Setting::Desktop, Setting::Dock];
+            let (sys, desk) = desktop_of(&who, Desk::before());
+            let first = pass(&sys, selected_desktop_items(&who, &settings), Mode::Apply);
+            assert!(first.rows.iter().all(|row| row.outcome == Outcome::Changed));
+            let recorded = journaled(&sys).len();
+            {
+                let mut state = desk.lock().unwrap();
+                state.events.clear();
+                if change_desktop {
+                    state.write(
+                        WINDOW_MANAGER,
+                        "EnableStandardClickToShowDesktop",
+                        PValue::Bool(true),
+                    );
+                }
+                state.managed = managed.then(|| PValue::Array(vec![pin("Mail")]));
+            }
+            let run = pass(&sys, selected_desktop_items(&who, &settings), Mode::Apply);
+            let after = pass(&sys, selected_desktop_items(&who, &settings), Mode::Plan);
+            let repinned = change_desktop && managed;
+            assert_eq!(
+                after.rows[1].outcome,
+                if repinned {
+                    Outcome::Planned
+                } else {
+                    Outcome::Ok
+                },
+                "{:?}",
+                after.rows
+            );
+            {
+                let state = desk.lock().unwrap();
+                assert_eq!(state.count("kill Dock"), usize::from(change_desktop));
+                assert!(
+                    !state
+                        .events
+                        .iter()
+                        .any(|e| e.starts_with(&format!("write {DOCK}"))),
+                    "{:?}",
+                    state.events
+                );
+                assert_eq!(
+                    same_apps(
+                        &sys,
+                        state.read(DOCK, "persistent-apps").unwrap(),
+                        &dock_apps(&usual_dock_apps())
+                    ),
+                    !repinned
+                );
+            }
+            assert!(
+                journaled(&sys)[recorded..]
+                    .iter()
+                    .all(|(id, _)| id != "init.dock@alice"),
+                "{:?}",
+                journaled(&sys)
+            );
+            assert!(
+                run.attempts
+                    .iter()
+                    .all(|attempt| attempt.id != "init.dock@alice")
+            );
+            assert_eq!(
+                outcomes(&run),
+                [
+                    (
+                        "init.desktop@alice",
+                        if change_desktop {
+                            Outcome::Changed
+                        } else {
+                            Outcome::Ok
+                        }
+                    ),
+                    (
+                        "init.dock@alice",
+                        if repinned {
+                            Outcome::Failed
+                        } else {
+                            Outcome::Ok
+                        }
+                    ),
+                ],
+                "{:?}",
+                run.rows
+            );
+        }
+    }
+
+    #[test]
     fn a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply() {
         let who = user("alice", 501);
         let (sys, desk) = desktop_with(&who, Desk::before(), false);
@@ -2631,11 +2726,9 @@ mod tests {
         sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
     }
 
-    /// One pass of setup's Workstation stage and of the doctor, as both build and run it
-    /// (`init::prepare_workstation_selected`, whose items carry the setting each reports
-    /// to, then the before-images and the apply), with the widgets, desktop and Dock all
-    /// to change: each reader relaunches once and every item reads back changed, tagged
-    /// with its own setting.
+    /// One Workstation pass as setup and the doctor build and run it
+    /// (`init::prepare_workstation_selected`) with the widgets, desktop and Dock all to change:
+    /// each reader relaunches once and every item reads back changed, tagged with its own setting.
     #[test]
     fn a_tagged_pass_relaunches_each_reader_once() {
         let who = user("alice", 501);

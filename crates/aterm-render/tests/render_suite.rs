@@ -7,6 +7,8 @@
 mod alone;
 #[path = "common/sprites.rs"]
 mod sprites;
+#[path = "common/wcag.rs"]
+mod wcag;
 
 mod anchor_reuse;
 mod asymmetric_pad_layout;

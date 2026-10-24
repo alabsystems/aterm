@@ -4336,14 +4336,18 @@ impl App {
                 continue;
             }
             let (mut label, description) = self.fact_spoken(hit.session, hit.fact, hit.restores);
-            if hit.fact == Fact::Account
-                && hit.restores.is_empty()
-                && let Some(named) = crate::a11y_tree::account_chip_label(
-                    self.session_cli(hit.session),
+            let cli = self.session_cli(hit.session);
+            // The footer's account is judged against Claude Code's roster alone, so another
+            // CLI's chip names no label from it (as its menu takes none): its product alone.
+            let judged = (cli == aterm_agent::harness::accounts::Cli::Claude)
+                .then(|| {
                     self.shown_facts(hit.session)
                         .and_then(|(facts, _)| facts.account)
-                        .as_deref(),
-                )
+                })
+                .flatten();
+            if hit.fact == Fact::Account
+                && hit.restores.is_empty()
+                && let Some(named) = crate::a11y_tree::account_chip_label(cli, judged.as_deref())
             {
                 label = named;
             }

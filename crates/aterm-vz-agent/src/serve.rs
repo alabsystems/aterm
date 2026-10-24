@@ -106,7 +106,7 @@ impl InputBudget {
     }
 }
 
-/// Its charge lasts until the write finishes, or the queued chunk is discarded.
+/// A stdin chunk, charged to its budget until its write finishes or it is discarded.
 struct InputChunk {
     bytes: Vec<u8>,
     budget: InputBudget,
@@ -205,7 +205,7 @@ pub fn connection<S: Stream>(conn: S, system: &dyn System) {
     conn.shutdown();
 }
 
-/// The one child constructor (clippy.toml's ONE CHILD CONSTRUCTOR): std's, because the
+/// The one child constructor (clippy.toml's one-child-constructor ban): std's, because the
 /// agent is std-only for the musl guest build.
 #[expect(
     clippy::disallowed_types,
@@ -221,11 +221,10 @@ struct Started {
     merged: Option<io::PipeReader>,
 }
 
-/// Why `exec` did not start, from `spawn`'s error: std reports a failed `chdir`, hook or
-/// `execve` back through its close-on-exec pipe, so this is never an exit status. As the
-/// lane user the `cwd` is entered after the switch ([`switch_identity`]), so a refusal
-/// there names the `cwd` with the program: the agent, as root, sees a directory the user
-/// may not.
+/// Why `exec` did not start, from `spawn`'s error (std reports a failed `chdir`, hook or
+/// `execve` through its close-on-exec pipe, never as an exit status). As the lane user a
+/// refusal names the `cwd` with the program, since the root agent may see a directory the
+/// user cannot enter.
 fn not_started(exec: &Exec, identity: &Identity, e: &io::Error) -> String {
     let program = String::from_utf8_lossy(exec.argv.first().map_or(&[][..], Vec::as_slice));
     let cwd = Path::new(OsStr::from_bytes(&exec.cwd));
@@ -286,9 +285,9 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
 }
 
 /// Make `cmd`'s child the lane user ([`Identity::Switch`]) in `cwd`, before its exec. The
-/// child enters `cwd` after the switch, in its hook: std's own `current_dir` runs before
-/// any `pre_exec` hook, so it would enter as root a directory the user cannot, which lima
-/// (`cd` as the user) refuses.
+/// hook enters `cwd` after the switch because std's `current_dir` runs before any
+/// `pre_exec` hook, and as root it would enter a directory the user cannot (lima, which
+/// `cd`s as the user, refuses those).
 #[cfg(target_os = "linux")]
 fn switch_identity(
     cmd: &mut impl std::os::unix::process::CommandExt,
@@ -512,7 +511,7 @@ mod tests {
 
     const HANG: Duration = Duration::from_secs(60);
 
-    /// The actual forwarding worker held inside its first write until its owner releases it.
+    /// A child pipe whose first write blocks until the test releases it.
     struct HeldWriter {
         entered: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,

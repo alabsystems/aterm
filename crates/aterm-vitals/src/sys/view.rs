@@ -10,7 +10,7 @@ use super::query::{ScopeArg, SysQuery, View};
 use super::why;
 use super::{Ctx, Freshness, clock_ms, exe_word, pct};
 use crate::events::{EventKind, LoadScope, millicores};
-use crate::model::{ProcScope, ProcView, RowScope, ScopeView, Snapshot};
+use crate::model::{ProcScope, ProcView, ProgramGroup, RowScope, ScopeView, Snapshot};
 use crate::words;
 use crate::writes::ProgramHour;
 
@@ -2183,6 +2183,30 @@ fn disk_summary(ctx: &Ctx<'_>) -> String {
     out
 }
 
+/// Why a process's age is unknown: its birth was not read on this reading (the OS gave none:
+/// on macOS its kernel record missed or named another program, as after an exec).
+const BIRTH_UNREAD: &str = "not_sampled";
+
+/// [`Snapshot::programs`] in `scope`, as [`procs_in_scope`] takes the rows. A program groups
+/// by tab ([`ProcScope::Tab`] is the tab's key, its least pane's), so a pane's programs are its
+/// tab's: the target pane's key alone would miss them in any pane of a split tab but that one.
+fn programs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'a ProgramGroup> {
+    let by_tab = if scope == ScopeArg::Pane {
+        ScopeArg::Tab
+    } else {
+        scope
+    };
+    let keys = scope_keys(ctx, by_tab);
+    s.programs
+        .iter()
+        .filter(|g| match scope {
+            ScopeArg::Aterm => g.scope != ProcScope::Other,
+            ScopeArg::Global => true,
+            _ => matches!(g.scope, ProcScope::Tab(k) if keys.contains(&k)),
+        })
+        .collect()
+}
+
 fn procs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'a ProcView> {
     let keys = scope_keys(ctx, scope);
     s.procs
@@ -2246,7 +2270,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     ));
     for r in rows.iter().take(q.top) {
         let mut t = format!(
-            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={}",
+            "proc pid={} exe={} label={} pgid={} cpu_mc={} wait_mc={} fp_bytes={} peak_bytes={} write_bps={} gpu_ppm={} stat={} age_ms={}",
             r.pid,
             exe_word(&r.name),
             proc_label(ctx, s, r),
@@ -2263,7 +2287,8 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
                 if r.refused { "refused" } else { "warming" }
             ),
             rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
-            r.state.word()
+            r.state.word(),
+            rec(r.age_ms(s.at_unix_ms), BIRTH_UNREAD)
         );
         if let RowScope::Tab(k) = r.scope
             && !matches!(scope, ScopeArg::Pane | ScopeArg::Tab)
@@ -3146,6 +3171,39 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     );
     o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
+    o.set("age_ms", Jv::known_or(r.age_ms(s.at_unix_ms), BIRTH_UNREAD));
+    o
+}
+
+/// One program in its scope: its oldest member's age, a lower bound while a member's birth
+/// went unread.
+fn program_json(ctx: &Ctx<'_>, s: &Snapshot, g: &ProgramGroup) -> Jv {
+    let mut o = Jv::obj([
+        ("exe", Jv::s(exe_word(&g.name))),
+        (
+            "scope",
+            Jv::s(match g.scope {
+                ProcScope::Tab(_) => "tab",
+                ProcScope::Aterm => "aterm",
+                ProcScope::Other => "other",
+            }),
+        ),
+    ]);
+    if let ProcScope::Tab(k) = g.scope {
+        o.set("local", Jv::u(k));
+        if let Some(n) = ctx.tab_number(k) {
+            o.set("tab", Jv::u(n as u64));
+        }
+    }
+    o.set("n", Jv::u(u64::from(g.n)));
+    o.set(
+        "age_ms",
+        match (g.age_ms(s.at_unix_ms), g.unborn) {
+            (Some(age), 0) => Jv::u(age),
+            (Some(age), _) => Jv::at_least(age, BIRTH_UNREAD),
+            (None, _) => Jv::why(BIRTH_UNREAD),
+        },
+    );
     o
 }
 
@@ -3174,6 +3232,16 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
             ),
         ),
         ("more", Jv::u(rows.len().saturating_sub(q.top) as u64)),
+        (
+            "programs",
+            Jv::Arr(
+                programs_in_scope(ctx, s, scope)
+                    .into_iter()
+                    .take(q.top)
+                    .map(|g| program_json(ctx, s, g))
+                    .collect(),
+            ),
+        ),
     ])
 }
 

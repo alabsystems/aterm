@@ -3,6 +3,7 @@
 
 //! Fire-cursor contrast halo tests.
 
+use crate::wcag::contrast;
 use aterm_core::render::{CharFg, FireHaloCell, FireMode, FirePatch};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DirtyDecision, Renderer, Theme, compute_dirty_rows};
@@ -14,25 +15,6 @@ fn renderer() -> Renderer {
 
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
-}
-
-fn lin(c: u32) -> f64 {
-    let s = c as f64 / 255.0;
-    if s <= 0.040_45 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn rel_luma(p: u32) -> f64 {
-    0.2126 * lin((p >> 16) & 0xff) + 0.7152 * lin((p >> 8) & 0xff) + 0.0722 * lin(p & 0xff)
-}
-
-fn contrast(a: u32, b: u32) -> f64 {
-    let (la, lb) = (rel_luma(a), rel_luma(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
 }
 
 fn bright_fire(row: u16, ch: usize, x: usize, w: usize, cov_cap: u8) -> FirePatch {

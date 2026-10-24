@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance tests binding `WakeBook` (`aterm_models_harness::wake_book_model`) to a
-//! session's book of declared wakes: [`WakeBook`]'s `declare`, `on_source`, `on_look`,
-//! `answer_begin`, `answer_done`, `heard`, `claim`, `release`, `told`, `rm`, `taken` and
-//! `reconcile`, [`ParkBook::park`], and [`prove`] for a peer outside the tree. The model's one
-//! wake is the book's wake #1: `st` and `parked` are projected from the book and the parks, and
-//! at every state the book is probed on copies, so a door's claim is granted exactly where the
-//! model's wake is ready or answered, an `await wake` is answered exactly where it is ready, and a
-//! park stands exactly where the model parks. The need, `unless=`'s reading at the tell, a turn
-//! heard and the loop's guards at a claim are the callers' (the model's environment).
+//! Tier-1 conformance of `WakeBook` (`aterm_models_harness::wake_book_model`) to a session's
+//! book of declared wakes: [`WakeBook`]'s steps, [`ParkBook::park`], and [`prove`] for a peer
+//! outside the tree. The model's one wake is the book's wake #1, and at every state the book is
+//! probed on copies, so a claim is granted, an `await wake` answered and a park taken exactly
+//! where the model says. The need, `unless=` at the tell, a heard turn and the loop's guards at a
+//! claim are the model's environment.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 

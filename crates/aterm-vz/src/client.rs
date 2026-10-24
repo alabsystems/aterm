@@ -192,6 +192,10 @@ pub struct Session {
     pub swapped: bool,
     /// The agent's hello, once the VM is `Ready`.
     pub hello: Option<Hello>,
+    /// The `Lost` words this session heard, whichever request's wait read them: a command's
+    /// `Release` after its connection ended reads the `Lost` a detector broadcast, and
+    /// [`Session::why_lost`] still names it (V4, measured).
+    lost: Option<String>,
 }
 
 impl Session {
@@ -213,6 +217,7 @@ impl Session {
             keep: false,
             swapped: false,
             hello: None,
+            lost: None,
         };
         session.send(&Request::Attach(attach.clone()))?;
         session
@@ -263,6 +268,7 @@ impl Session {
             };
             match &reply {
                 Reply::Lost { why, tail } => {
+                    self.lost = Some(why.clone());
                     return Err(ClientError::Lost {
                         why: why.clone(),
                         tail: tail.clone(),
@@ -406,6 +412,51 @@ impl Session {
             Reply::State(s) => Some(Ok(*s)),
             _ => None,
         })
+    }
+
+    /// Wait for the VM to stop with no request of this session's (a guest asked to power
+    /// off on a command connection, the bake's end): the helper's `Lost` once the VM
+    /// stopped, whose words say how. A guest that powered itself off reads
+    /// [`crate::helper::POWERED_OFF`]; a detector that fired, a `Stop` or a hard stop reads
+    /// otherwise.
+    ///
+    /// # Errors
+    /// The VM failed, the helper ended the session with no `Lost`, or it said nothing for the
+    /// span.
+    pub fn wait_stopped(&mut self) -> Result<String, ClientError> {
+        let ended: Result<(), ClientError> =
+            self.until("the guest's power-off", &mut |_| {}, |_, _| None);
+        match ended {
+            Err(ClientError::Lost { why, .. }) => Ok(why),
+            Err(e) => Err(e),
+            Ok(()) => Err(ClientError::Closed),
+        }
+    }
+
+    /// Why a command connection of this session ended before its `Exit`: the session's
+    /// `Lost` (heard now, or by an earlier request), or the VM's phase. A VM that is stopping
+    /// is waited for, as
+    /// [`Session::wait_stopped`] waits (a one-minute hang detector), so the words are the
+    /// stop's own (the detector that fired, a `Stop`, the guest's power-off), never only
+    /// "stopping": a guest that stopped answering under a command read "the VM is stopping"
+    /// where §10 names the missed heartbeat (V4, measured).
+    pub fn why_lost(&mut self) -> String {
+        if let Some(why) = &self.lost {
+            return why.clone();
+        }
+        match self.state() {
+            Err(ClientError::Lost { why, .. }) => why,
+            Err(ClientError::Closed) => "the helper ended the session".into(),
+            Err(e) => e.to_string(),
+            Ok(s) if s.phase == Phase::Stopping => match self.wait_stopped() {
+                Ok(why) => why,
+                Err(e) => format!("the VM was stopping, and then {e}"),
+            },
+            Ok(s) if s.phase != Phase::Ready => format!("the VM is {}", s.phase.name()),
+            Ok(_) => "the agent closed the command connection before its Exit (the VM is still \
+                      ready)"
+                .into(),
+        }
     }
 
     /// Close the session; the release rule runs (§5.1).

@@ -61,9 +61,8 @@ fn bytes(app: &App, session: u64, s: &str) {
     crate::term_lock(&term).process(s.as_bytes());
 }
 
-/// Claude Code's launch card and prompt as it paints them INLINE (no clear),
-/// from the cursor down: a blank row, the card, a blank row, the composer
-/// between its rules and the mode row.
+/// Claude Code's launch card and prompt as it paints them inline (no clear), from the cursor down:
+/// a blank row, the card, a blank row, the composer between its rules and the mode row.
 fn inline_claude(version: &str) -> String {
     let screen = card_screen(24, 120, MODEL, version);
     let rule = "\u{2500}".repeat(120);
@@ -81,9 +80,9 @@ fn inline_claude(version: &str) -> String {
     rows.join("\r\n")
 }
 
-/// `rows` written at their own rows from the top with NO clear (cursor
-/// addressing and erase-line alone, the path row in [`GRAY`] as [`feed`]
-/// paints it): what a program that does not clear the screen leaves.
+/// `rows` written at their own rows from the top with no clear (cursor addressing and erase-line
+/// alone, the path row in [`GRAY`] as [`feed`] paints it): what a program that does not clear the
+/// screen leaves.
 fn paint_at(app: &App, session: u64, rows: &[String]) {
     let mut out = String::new();
     for (i, row) in rows.iter().enumerate() {
@@ -305,7 +304,8 @@ fn the_build_policy_is_the_images_source_by_its_banner_build() {
     );
 }
 
-/// A Claude Code with a published image and cut fence is decorated on its first frame with no footer facts.
+/// A Claude Code with a published image and cut fence is decorated on its first frame with no
+/// footer facts.
 #[test]
 fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     let (mut app, wid, session, host) = bare_window();
@@ -378,7 +378,8 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     host.shutdown_and_join();
 }
 
-/// The gate keeps every card bare unless its token, reader kind, build, untainted mark, and fence match the drawer.
+/// The gate keeps every card bare unless its token, reader kind, build, untainted mark, and fence
+/// match the drawer.
 #[test]
 fn the_gate_keeps_every_card_but_its_drawers_own_bare() {
     let screen = card_screen(24, 120, MODEL, VERSION);
@@ -471,8 +472,8 @@ fn agy_card_screen(version: &str) -> Vec<String> {
     screen
 }
 
-/// The image of an agy of build `version` leading group `pgid`: a store
-/// image — whose banner the gate does not hold to its build.
+/// The image of an agy of build `version` leading group `pgid`: a store image, whose banner the
+/// gate does not hold to its build.
 fn agy_image(pgid: i32, version: &str) -> HolderImage {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
     HolderImage::of(
@@ -599,10 +600,9 @@ fn an_agy_card_is_judged_by_its_fence_alone() {
     );
 }
 
-/// Muse Code 1.4.12's first output after its launcher's `\e[3J\e[H\e[2J`,
-/// captured live from `lab muse` (`ctl subscribe @sid bytes`): four
-/// newlines, three reverse indexes at the top of a region (rows 1-7) its
-/// span starts on, its banner in the rows they opened, then its composer.
+/// Muse Code 1.4.12's first output after its launcher's `\e[3J\e[H\e[2J`, captured from `lab muse`
+/// (`ctl subscribe @sid bytes`): four newlines, three reverse indexes at the top of a region (rows
+/// 1-7) its span starts on, its banner in the rows they opened, then its composer.
 const MUSE_1_4_12_STARTUP: &[u8] = include_bytes!("fixtures/muse-1.4.12-inline-startup.bin");
 
 /// A Muse Code image leading group `pgid`: a vendor binary outside the
@@ -618,7 +618,8 @@ fn muse_image(pgid: i32) -> HolderImage {
     )
 }
 
-/// Muse Code's banner in rows it opened (or erased) at its own start is decorated; a previous one's stays bare.
+/// Muse Code's banner in rows it opened (or erased) at its own start is decorated; a previous one's
+/// stays bare.
 #[test]
 fn a_muse_codes_banner_in_the_rows_it_opened_is_decorated() {
     let run = |stale: bool| {
@@ -678,7 +679,8 @@ fn a_muse_codes_banner_in_the_rows_it_opened_is_decorated() {
     assert_eq!(reasons.last().map(String::as_str), Some("fence"));
 }
 
-/// A same-build inline relaunch keeps the old card above the new process's span bare until it paints its own.
+/// A same-build inline relaunch keeps the old card above the new process's span bare until it
+/// paints its own.
 #[test]
 fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
     let (mut app, wid, session, host) = bare_window();
@@ -722,7 +724,8 @@ fn a_same_build_inline_relaunch_keeps_the_old_card_bare() {
 const CLAUDE_2_1_304_INLINE: &str =
     include_str!("../tests/fixtures/claude-card/claude-2.1.304-inline-first-frame-144col.out");
 
-/// A same-build inline relaunch on Claude Code 2.1.304's captured first-frame bytes keeps the old card bare.
+/// A same-build inline relaunch on Claude Code 2.1.304's captured first-frame bytes keeps the old
+/// card bare.
 #[test]
 fn a_relaunch_of_2_1_304_keeps_its_old_card_bare_on_its_own_bytes() {
     const BUILD: &str = "2.1.304";
@@ -992,12 +995,10 @@ fn a_width_resize_keeps_the_card_decorated() {
     assert_eq!(after, None, "CONTROL: no lend, bare: {reasons:?}");
 }
 
-/// Claude Code 2.1.304's inline redraw after a width resize, byte for byte
-/// as it wrote it in the lab at 120 columns (2026-10-23; the project path
-/// redacted to the same length): inside DEC 2026, home, every row erased
-/// whole a row at a time down the screen, home again, then its card from
-/// the top, the composer between its rules and the mode row, the cursor
-/// moved back up into the composer.
+/// Claude Code 2.1.304's inline redraw after a width resize at 120 columns, byte for byte (the
+/// project path redacted to the same length): inside DEC 2026, home, every row erased whole down
+/// the screen, home again, then its card from the top, the composer between its rules and the mode
+/// row, the cursor moved back up into the composer.
 const CLAUDE_2_1_304_RESIZE_REDRAW: &str =
     include_str!("../tests/fixtures/claude-card/claude-2.1.304-inline-resize-redraw-120col.out");
 
@@ -1458,9 +1459,9 @@ fn a_restore_books_the_groups_its_carried_stopped_drawers_lead() {
     );
 }
 
-/// The image of a Claude Code of UNKNOWN build (a Homebrew install, a
-/// development link) at `exe`, leading group `pgid`, started at `start`:
-/// the Registry rung, held to the build its own registry row reports.
+/// The image of a Claude Code of unknown build (a Homebrew install, a development link) at `exe`,
+/// leading group `pgid`, started at `start`: the Registry rung, held to the build its own registry
+/// row reports.
 fn unknown_claude(pgid: i32, exe: &str, start: u64) -> HolderImage {
     use atpkg::image::{ImageBuild, ProgramTag};
     HolderImage::of(
@@ -1522,9 +1523,9 @@ fn take_front(app: &App, session: u64, pgid: i32, image: HolderImage, kind: CutK
     token
 }
 
-/// Ctrl-Z as the reader sees it: the shell's group and image in front, the
-/// stopped program's footer facts LEFT STANDING for its group (nothing
-/// drops them on a group edge), the fence cut to no drawer.
+/// Ctrl-Z as the reader sees it: the shell's group and image in front, the stopped program's
+/// footer facts left standing for its group (nothing drops them on a group edge), the fence cut to
+/// no drawer.
 fn shell_in_front(app: &App, session: u64) {
     use atpkg::image::{ImageBuild, ProgramTag};
     {
@@ -1545,7 +1546,8 @@ fn shell_in_front(app: &App, session: u64) {
     cut(app, session, None, CutKind::Group, true);
 }
 
-/// The registry rung decorates an unknown-build Claude Code once its row lands and survives Ctrl-Z and `fg`.
+/// The registry rung decorates an unknown-build Claude Code once its row lands, across Ctrl-Z and
+/// `fg`.
 #[test]
 fn the_registry_rung_survives_ctrl_z_and_fg() {
     const BREW: &str = "/opt/homebrew/bin/claude";
@@ -1629,7 +1631,8 @@ fn the_registry_rung_survives_ctrl_z_and_fg() {
     }
 }
 
-/// The registry rung holds an unknown-build image to its own row alone, never another group's or a replaced image's.
+/// The registry rung holds an unknown-build image to its own row alone, never another group's or a
+/// replaced image's.
 #[test]
 fn the_registry_rung_holds_an_image_to_its_own_row_alone() {
     let (mut app, wid, session, host) = bare_window();

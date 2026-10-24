@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A rounded bar as fx items (`docs/DESIGN-card-engine-2026-10-19.md` §6,
-//! lane B7): the body one source-over rectangle, the two semicircular caps one
-//! Index8 art per `(width, radius)` whose texels are the cap's antialiased
-//! coverage (`SS × SS` samples a pixel) and whose palette turns each coverage
-//! into the bar's colour at that share of its opacity. Every pixel lands the
-//! bytes the per-pixel-row coverage runs it replaces landed: the caps' inks are
-//! those runs' `(premul(rgb, a), a)` with `a = (alpha·hits + SS²/2) / SS²`.
+//! A rounded bar as fx items (`docs/DESIGN-card-engine-2026-10-19.md` §6):
+//! the body one source-over rectangle, the two semicircular caps one Index8 art
+//! per `(width, radius)` whose texels are the cap's antialiased coverage
+//! (`SS × SS` samples a pixel) and whose palette turns each coverage into the
+//! bar's colour at that share of its opacity, `(premul(rgb, a), a)` with
+//! `a = (alpha·hits + SS²/2) / SS²`, so every pixel lands the bytes a
+//! per-pixel-row coverage run would.
 
 use std::sync::Arc;
 

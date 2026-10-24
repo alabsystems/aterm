@@ -40,7 +40,8 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
         })
 }
 
-/// Whether `program`'s composer is left bare but for the top rule's switch under `switch` (agy while its switch is not on).
+/// Whether `program`'s composer is left bare but for the top rule's switch under `switch` (agy
+/// while its switch is not on).
 pub(crate) fn bare_while_off(
     program: Option<aterm_phase::Program>,
     switch: Option<crate::autopilot::HarnessSwitch>,
@@ -82,7 +83,7 @@ struct TopHit {
     ghost: bool,
 }
 
-/// A top line's lockup on the glass, the hover title's target (design §7).
+/// A top line's lockup on the glass, the hover title's target.
 struct MarkWrite {
     frame_row: usize,
     term_row: usize,
@@ -287,7 +288,8 @@ struct CachedPaneText {
     weekly: std::cell::OnceCell<Option<aterm_phase::muse::UsageCardWeekly>>,
     /// Muse Code's subscription tier on `rows` ([`PaneTextCache::subscription_plan`]).
     plan: std::cell::OnceCell<Option<String>>,
-    /// The rule's coverable run and its glyph on frame row `.0` ([`rule_mask_into`], [`Self::stamps`]).
+    /// The rule's coverable run and its glyph on frame row `.frame_row` ([`rule_mask_into`],
+    /// [`Self::stamps`]).
     rule_run: std::cell::Cell<Option<KeptRun>>,
     /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`], [`Self::rule_run`]).
     top_run: std::cell::Cell<Option<KeptTop>>,
@@ -314,7 +316,7 @@ struct CachedPaneText {
     kept_cells: std::cell::RefCell<KeptRows>,
 }
 
-/// The D-2 row revisions of the scratch a pane's rows were read from ([`StampLane`]).
+/// The row revisions of the scratch a pane's rows were read from ([`StampLane`]).
 #[derive(Debug, Default)]
 struct RowStamps {
     lane: Option<StampLane>,
@@ -1146,7 +1148,8 @@ impl PaneTextCache {
         footer
     }
 
-    /// Publish footer facts and discard a weekly reading selected by an older model.
+    /// Take in the timeline's facts; a change of the shown model drops the weekly quota read for
+    /// the old one.
     fn note_facts(
         &mut self,
         leaf_index: usize,
@@ -1437,7 +1440,8 @@ impl PaneFooter {
         &self.shown
     }
 
-    /// Whether the facts shown name a Claude Code build newer than 2.1.303.
+    /// Whether the facts shown name a Claude Code build that takes the top-effort key's toggle
+    /// ([`crate::claude_slash::takes_key_toggle`]), read once per change of `shown`.
     fn key_typed(&mut self) -> bool {
         match self.typed {
             Some((at, typed)) if at == self.shown_gen => typed,
@@ -1708,7 +1712,7 @@ struct Job {
 
 enum Command {
     Request(Job),
-    /// `None` retires the session.
+    /// A `None` pgid retires the session.
     Stop {
         session: u64,
         pgid: Option<i32>,
@@ -2129,7 +2133,7 @@ struct Resolver {
     /// and whether its process is awaited ([`Watch`]).
     schedule: WatchSchedule,
     known: HashMap<u64, Identity>,
-    /// Per PROCESS: its transcript-tail memo, kept while the process lives.
+    /// Per process: its transcript-tail memo, kept while the process lives.
     tails: ProcessTails,
     /// Per watched session: its usage fold.
     folds: HashMap<u64, footer::FooterCache>,
@@ -2624,15 +2628,15 @@ struct TapAsks {
     /// The window's seat ([`TapSeat`]), asked at each read whose profile passed its gate.
     seat: fn() -> TapSeat,
     /// Whether the settings chain a relaunch line of the process's argv in its directory reads
-    /// admits the tap, read as the relaunch reads it (`upgrade_drive::tap_settings_admit`),
-    /// asked once per image beside [`Asks::stored_login`].
+    /// admits the tap (`upgrade_drive::tap_settings_admit`), asked once per image beside
+    /// [`Asks::stored_login`].
     settings: fn(&[String], &str) -> bool,
     /// Whether aterm's restart in place is offered for process `pid` in tab `tab` now
     /// ([`crate::restart_act::offered_for`]), asked at a read whose footer would promise it.
     restart: fn(&str, u32) -> bool,
 }
 
-/// A window with no usage tap: no seat, every settings chain quiet, every restart offered.
+/// A window with no usage tap: no seat, every settings chain admitting it, every restart offered.
 #[cfg(test)]
 const NO_TAP: TapAsks = TapAsks {
     seat: TapSeat::default,
@@ -2678,7 +2682,8 @@ fn process_files(pid: u32) -> Option<Vec<PathBuf>> {
     aterm_uds::holders::open_files(pid).ok()
 }
 
-/// [`process_args`], [`process_files`], [`live_roster`], [`aterm_types::dirs::home_dir`] and [`live_tap`].
+/// [`process_args`], [`process_files`], [`live_roster`], [`aterm_types::dirs::home_dir`] and
+/// [`live_tap`].
 const LIVE: Asks = Asks {
     files: process_files,
     args: process_args,
@@ -2791,7 +2796,8 @@ fn cached_offset(
     Some(offset)
 }
 
-/// Read `identity`'s facts and publish them on `timeline`: `Some` when they MOVED ([`Found`]).
+/// Read `identity`'s facts and publish them on `timeline`; the first part is `Some` when they
+/// moved.
 fn resolve_into(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -2804,11 +2810,10 @@ fn resolve_into(
     Found,
     crate::session_log::transcript::Applied,
 ) {
-    // THE SESSION LOG'S STEP TAP (phase 3B): armed before the read while the
-    // log holds a run that reads a transcript, with that run's watermark and
-    // floor — one short hold of the (leaf) timeline lock, released before
-    // any file is read. A tap still waiting for its file is armed again, so
-    // the run in front now gives it its floor and watermark.
+    // The session log's step tap is armed before the read while the log holds a run that reads
+    // a transcript, with that run's watermark and floor, under one short hold of the (leaf)
+    // timeline lock released before any file is read. A tap still waiting for its file is armed
+    // again, so the run in front now gives it its floor and watermark.
     if !fold.steps_armed() || !fold.steps_bound() {
         let arm = timeline
             .lock()
@@ -2876,7 +2881,7 @@ fn resolve_facts_at(
     )
 }
 
-/// The resolver's process-directory capability.
+/// [`resolve_facts_at`] with the process-cwd reader passed in.
 fn resolve_facts_at_with_cwd(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -3290,15 +3295,13 @@ fn resolve_facts_at_with_cwd(
     )
 }
 
-/// THE WEEKLY FIGURE a Claude Code footer shows in `sub`, one age rule for every source
-/// ([`WeeklyFigure::words`]). Where the profile read passed its account gate (`gated`,
-/// naming the process's tab where its environment does), its own figures (the newer of
-/// this process's usage-tap reading, [`own_tap_figure`], and Claude Code's `/usage` cache as
-/// `sub` was read) say it while current; else a 7d wall in the transcript, or one the
-/// accounts store holds of this process's own account, says `weekly 0% left`; else the newest
-/// figure still shown (its own, aged, or the store's of its own account, [`own_stored_week`]);
-/// and where none is, why ([`WeeklyGap`]). `roster` is the accounts roster as the resolver
-/// read it, which names the account the store keeps this process's week under.
+/// The weekly figure a Claude Code footer shows in `sub`, one age rule for every source
+/// ([`WeeklyFigure::words`]). Where the profile read passed its account gate (`gated`, naming
+/// the process's tab where its environment does), its own figures (the newer of its usage-tap
+/// reading, [`own_tap_figure`], and the `/usage` cache) say it while current; else a 7d wall in
+/// the transcript, or one the accounts store holds of its own account ([`own_stored_week`]),
+/// says `weekly 0% left`; else the newest figure still shown, its own or the store's; else why
+/// none is ([`WeeklyGap`]).
 fn weekly_into(
     sub: &mut SubscriptionDisplay,
     facts: &FooterFacts,
@@ -3364,13 +3367,10 @@ fn weekly_into(
     });
 }
 
-/// THIS PROCESS'S OWN USAGE-TAP FIGURE: the week of the reading its tap wrote for tab `tab`
-/// in `dir` since the process started ([`tap::Reading::read`]), whatever its age, for its own
-/// login in the default home only (the tap's words of its login and home, against the
-/// process's exec environment). A reading names no account: after a `/login` to another
-/// account inside the same login, the week the process last held reads as the new account's
-/// until a reply brings the new one's (the `/usage` cache names its account, and a cache of
-/// another is dropped when the profile is read).
+/// This process's own usage-tap figure: the week of the reading its tap wrote for tab `tab` in
+/// `dir` since the process started ([`tap::Reading::read`]), whatever its age, for its own login
+/// in the default home only. A reading names no account, so after a `/login` to another account
+/// the week the process last held reads as the new account's until a reply brings the new one's.
 fn own_tap_figure(identity: &Identity, tab: &str, dir: &std::path::Path) -> Option<WeeklyFigure> {
     let pid = u32::try_from(identity.pid).ok()?;
     let started = i64::try_from(identity.started?).ok()?;
@@ -3388,15 +3388,12 @@ fn own_tap_figure(identity: &Identity, tab: &str, dir: &std::path::Path) -> Opti
     })
 }
 
-/// WHY NO RELAUNCH LINE WOULD CARRY THE USAGE TAP for this process (`relaunch::tap_of`'s and
-/// `tap::gate`'s refusals), at each read: a Claude home or `HOME` of its own; a login no line
-/// taps as the machine's own (`tap::Armed::lone_for`: neither the default one, the lone one
-/// `roster`'s one row is bound to in the seat's store, nor, where the machine has none, one
-/// `roster` names), judged against the roster as it reads now; else the image's own reason
-/// ([`tap_line_refusal`], `Identity::unoffered`). `None` where a line would, and where its
-/// login was not read. Whether aterm restarts the tab at all is asked at each read
-/// (`TapAsks::restart`), not here. A process that carries the tap is not asked: its footer
-/// never says why a line would not (`weekly_into`).
+/// Why no relaunch line would carry the usage tap for this process (`relaunch::tap_of`'s and
+/// `tap::gate`'s refusals), judged at each read: a Claude home or `HOME` of its own; a login no
+/// line taps as the machine's own (`tap::Armed::lone_for`: not the default one, nor the lone one
+/// the store binds `roster`'s one row to, nor, where the machine has no lone one, one `roster`
+/// names); else the image's own reason ([`tap_line_refusal`]). `None` where a line would, and
+/// where its login was not read.
 fn tap_refusal(
     identity: &Identity,
     asks: Asks,
@@ -3437,10 +3434,10 @@ fn tap_refusal(
     identity.unoffered
 }
 
-/// WHY NO RELAUNCH LINE OF THIS IMAGE'S ARGV IN `cwd` WOULD CARRY THE USAGE TAP, judged once per
-/// image beside its stored login: options no relaunch line can repeat, its own `--settings` or
-/// `--bare` (`tap::line_refusal`), or a settings chain that does not admit it
-/// (`TapAsks::settings`). `None` where a line would.
+/// Why no relaunch line of this image's argv in `cwd` would carry the usage tap, judged once per
+/// image: an option no relaunch line can repeat or its own `--settings` or `--bare`
+/// (`tap::line_refusal`), or a settings chain that does not admit it (`TapAsks::settings`).
+/// `None` where a line would.
 fn tap_line_refusal(identity: &Identity, asks: Asks, cwd: &str) -> Option<tap::Refusal> {
     if let Some(why) = tap::line_refusal(&identity.argv) {
         return Some(why);
@@ -3460,12 +3457,9 @@ struct StoreWeek {
 
 /// The store's figures of `acct`'s week at `now`, whatever their age: its usage-tap figure
 /// (`windows["seven_day"]`, not cut by a limit reset since) and its sample's
-/// ([`accounts::Sample::week`]), each while its window runs. A sample carries its weekly
-/// observation time separately from its publication time: a tap heartbeat keeps the held
-/// window's time, while a settled `/usage` panel is a new observation even when its figures
-/// match (`accounts::note_reading_held`, `accounts::note_sample`). Older records without that
-/// time use the sample's `at`. The footer ([`store_week`]) and the account menu's rows
-/// (`fact_menu::account_menu_rows_from`) judge their age.
+/// ([`accounts::Sample::week`]), each while its window runs. A sample's figure is dated by its
+/// weekly observation time (`week_read_at`), else its `at`; [`store_week`] and
+/// `fact_menu::account_menu_rows_from` judge the age.
 pub(crate) fn store_figures(acct: &accounts::Account, now: i64) -> [Option<WeeklyFigure>; 2] {
     let window = acct.windows.get(accounts::WEEK_LIMIT);
     let tapped = window
@@ -3500,12 +3494,9 @@ fn store_week(acct: &accounts::Account, now: i64) -> StoreWeek {
     }
 }
 
-/// [`store_week`] of THIS PROCESS'S OWN ACCOUNT, from the accounts store under harness state
-/// `store`: only for a process in the machine's default Claude home and `HOME` (the only one
-/// whose readings the store keeps, `harness_host`'s tap step), under the label its own login
-/// is judged to (`accounts::judged_label` over `roster`, the machine's own row where it lists
-/// none, as the tap's note judges it); `None` for any other process, and where no label is
-/// judged, so no other account's week or wall reaches its footer.
+/// [`store_week`] of this process's own account ([`own_label`]) from the accounts store under
+/// harness state `store`; `None` where no label is judged, so no other account's week or wall
+/// reaches its footer.
 fn own_stored_week(
     identity: &Identity,
     roster: Option<&accounts::Roster>,
@@ -3518,11 +3509,11 @@ fn own_stored_week(
     Some(store_week(state.accounts.get(&label)?, now))
 }
 
-/// THE ROSTER LABEL OF THIS PROCESS'S OWN ACCOUNT, for a process in the machine's default Claude
-/// home and `HOME` only: the label its own login is judged to (`accounts::judged_label` over
-/// `roster`, the machine's own row where it lists none), as the tap's note judges it. The
-/// store's week is read under it ([`own_stored_week`]), and the account menu's row it names is
-/// the only one the footer's week reaches (`SubscriptionDisplay::label`).
+/// The roster label of this process's own account, for a process in the machine's default Claude
+/// home and `HOME` only (the one whose readings the store keeps): the label its login is judged
+/// to (`accounts::judged_label` over `roster`, or the machine's own row where it lists none). The
+/// account menu's row it names is the only one the footer's week reaches
+/// (`SubscriptionDisplay::label`).
 fn own_label(identity: &Identity, roster: Option<&accounts::Roster>, asks: Asks) -> Option<String> {
     let login = identity.login.as_ref().filter(|login| login.default_home)?;
     let home = (asks.home)()?;
@@ -3607,7 +3598,8 @@ fn shown_model(timeline: &SessionTimeline, facts: Option<&FooterFacts>) -> Optio
     facts.filled_model_effort(card).0.map(str::to_owned)
 }
 
-/// Computes the repaint-key fingerprint for `facts` combined with `card` and `show_usage`.
+/// The repaint key's fingerprint of `facts` with `card`, the `usage` switch and the hidden facts
+/// `off`.
 pub(crate) fn fingerprint(
     facts: Option<&FooterFacts>,
     card: Option<&aterm_phase::LaunchCard>,
@@ -3971,7 +3963,7 @@ struct RowUndo {
     before: Vec<RenderCell>,
     /// The cells the write put there.
     painted: Vec<RenderCell>,
-    /// The row's D-2 revision before the write, when the write cleared it.
+    /// The row's revision before the write, when the write cleared it.
     rev_before: Option<u64>,
     clusters: TextUndo<Box<str>>,
     combining: TextUndo<Box<[char]>>,
@@ -4148,14 +4140,10 @@ impl FooterUndo {
         self.write.is_some()
     }
 
-    /// Frame row `frame_row` of `scratch`, its cells in `cols`, as the
-    /// PROGRAM wrote them: each cell the write on the glass put there — a
-    /// rule's chips and facts and a hidden fact's `off`, the card's line,
-    /// the banner over Claude's update notice, the top rule's border, ghost
-    /// and switch, a relabelled pill and the run packed behind it, an agy
-    /// transcript edit — read as the cell it covered, and the row ending
-    /// where it ended before the write padded it: what [`undo`] would put
-    /// back, read without writing and without allocating.
+    /// Frame row `frame_row` of `scratch`, its cells in `cols`, as the program wrote them: each
+    /// cell the write on the glass put there read as the cell it covered, and the row ending
+    /// where it ended before the write padded it. This is what [`undo`] would put back, read
+    /// without writing or allocating.
     #[cfg(any(a11y_tree, test))]
     fn program_cells<'a>(
         &'a self,
@@ -4519,7 +4507,7 @@ impl App {
         fp
     }
 
-    /// WHAT aterm DRAWS FOR `session`'s TOP-EFFORT KEY on its top rule ([`PaneFooter::key_typed`]).
+    /// What aterm draws for `session`'s top-effort key on its top rule ([`PaneFooter::key_typed`]).
     fn key_face(
         &self,
         ws: &crate::WindowState,
@@ -4554,7 +4542,7 @@ impl App {
         }
     }
 
-    /// The harness switch and the theme GEMINI CLI's or CODEX's top line (`prog`) wears.
+    /// The harness switch and the theme Gemini CLI's or Codex's top line (`prog`) wears.
     fn bare_top_harness(
         &self,
         ws: &crate::WindowState,
@@ -4587,7 +4575,7 @@ impl App {
         (switch, theme.filter(|_| switch.is_some()))
     }
 
-    /// The repaint key's term for GEMINI CLI's or CODEX's top line ([`Self::bare_top_harness`]).
+    /// The repaint key's term for Gemini CLI's or Codex's top line ([`Self::bare_top_harness`]).
     fn bare_top_term(
         &self,
         ws: &crate::WindowState,
@@ -4609,7 +4597,7 @@ impl App {
                 .rotate_left(23)
     }
 
-    /// SPLICE ONE PANE'S TOP LINE (design §6.2) ([`top_line`], [`PaneFooter::compose_top`]).
+    /// Splice one pane's top line ([`top_line`], [`PaneFooter::compose_top`]).
     fn splice_top_line(
         &self,
         ws: &crate::WindowState,
@@ -5027,10 +5015,9 @@ impl App {
                     _ => None,
                 };
                 if !held && gate.is_none() {
-                    // No drawer and no facts: a card this window keeps for
-                    // the session left by its identity (Claude stopped or
-                    // gone), which bounds its next show
-                    // (`claude_card::RESHOW_MS`). Nothing is read.
+                    // No drawer and no facts: a card this window keeps for the session left
+                    // by its identity (Claude stopped or gone) bounds its next show
+                    // (`claude_card::RESHOW_MS`). Only a Gemini CLI or Codex top line is read.
                     if ws.claude_card.keeps(session) {
                         cards.push(crate::claude_card::drawerless_leaf(
                             leaf_index, session, pane,
@@ -5858,7 +5845,8 @@ fn read_rule_under(rows: &[String], reach: aterm_phase::phase::FrameReach) -> Fo
     })
 }
 
-/// Vendor drift, logged.
+/// Log a mode row this aterm cannot read, once per Claude Code build and row head, up to
+/// [`DRIFT_ROWS_LOGGED`] in a run.
 fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
     static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unread =
@@ -5882,7 +5870,7 @@ fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
     );
 }
 
-/// How many distinct unreadable rows (per build) one run logs.
+/// How many distinct unreadable rows one run logs, across every build.
 const DRIFT_ROWS_LOGGED: usize = 16;
 
 /// The row under the composer that opens with a pill glyph but names no pill this build knows.
@@ -5930,7 +5918,7 @@ struct VoiceRule {
     label: usize,
 }
 
-/// THE RUN A TOP LINE IS LAID ON ([`compose_top`]).
+/// The run a top line is laid on ([`compose_top`]).
 fn laid_run(key: &TopKey) -> (TopRun, usize) {
     let run = key.run;
     let lockup = cli_mark(key.program).map(|mark| mark.lockup_cells(key.build));
@@ -5965,7 +5953,7 @@ enum TopLine {
     Slab,
 }
 
-/// WHERE `program`'S TOP LINE IS on a pane's cached rows, and its kind.
+/// Where `program`'s top line is on a pane's cached rows, and its kind.
 fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(usize, TopLine)> {
     use aterm_phase::Program;
     let session = cached.key.session;
@@ -6135,7 +6123,7 @@ fn read_top_run(
     })
 }
 
-/// THE HARNESS SWITCH'S PAINT on one pane's composer top rule ([`compose_top`]).
+/// The harness switch's paint on one pane's composer top rule ([`compose_top`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SwitchPaint {
     face: crate::autopilot::HarnessSwitch,
@@ -6221,7 +6209,7 @@ impl SwitchFace {
 /// How many forms a switch face has, widest first ([`switch_face`]).
 const SWITCH_TIERS: usize = 4;
 
-/// THE HARNESS SWITCH'S FACE.
+/// The harness switch's face at `tier`, `None` past its narrowest.
 fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     use crate::autopilot::HarnessSwitch;
     let mut f = SwitchFace {
@@ -6320,10 +6308,8 @@ fn push_on_button(f: &mut SwitchFace) {
     f.push("\u{258c}", SwitchInk::Cap);
 }
 
-/// The widest of `paint`'s faces that leaves the rule `room` cells — two
-/// of the rule's own on either side — and its tier: the switch alone, as it
-/// stood before the lockup, the law [`lay_top`]'s ladder keeps the switch
-/// to (its `alone` rung).
+/// The widest of `paint`'s faces that fits `room` cells with two of the rule's own on either
+/// side, and its tier: the switch alone, as [`lay_top`]'s lockup-less rungs lay it.
 #[cfg(test)]
 fn fitted_switch_face(paint: SwitchPaint, room: usize) -> Option<(usize, SwitchFace)> {
     (0..SWITCH_TIERS)
@@ -6401,7 +6387,7 @@ fn switch_cell(
     cell
 }
 
-/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink` quieted 30% toward the
+/// The settling switch's ink (`◐ turning on`, [`switch_cell`]): `ink` quieted 30% toward the
 /// ground, then floored back to 4.5:1 against it.
 fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     legible_on(mix(ink, ground, 0.3), ground)
@@ -6436,7 +6422,7 @@ const fn pack_rgb(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
 }
 
-/// THE FACTS' WORDS' INKS on a pane (§8): made from what the pane itself gives the glass.
+/// The facts' word inks on a pane, made from what the pane itself gives the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FactInks {
     /// A value at rest ([`VALUE_LIFT`], [`value_fg`], [`legible_on`]).
@@ -6466,10 +6452,10 @@ pub(crate) fn greyed_ink(gray: [u8; 3], blank: RenderCell) -> [u8; 3] {
 }
 
 /// How far a greyed word is quieted from the live value toward the ground where the program's grey
-/// reads no quieter than the value ([`greyed_on`], [`switch_cell`]).
+/// reads no quieter than the value ([`greyed_on`]).
 const GREYED_QUIET: f32 = 0.3;
 
-/// A WORD GREYED ON PURPOSE on `ground` ([`visible_on`]).
+/// A word greyed on purpose on `ground` ([`visible_on`]).
 fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     let ink = if reads_on(gray, ground) < reads_on(value, ground) {
         gray
@@ -6510,7 +6496,7 @@ enum Lockup {
     Icon,
 }
 
-/// One rung of THE NARROW LADDER ([`ladder`]).
+/// One rung of the narrow ladder ([`ladder`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rung {
     tier: Option<usize>,
@@ -6519,11 +6505,11 @@ struct Rung {
     need: usize,
 }
 
-/// The most rungs a ladder has: a full rung a switch tier, then the icon, the icon compact and
+/// The most rungs a ladder has: a full rung per switch tier, then the icon, the icon compact and
 /// the switch alone.
 const LADDER_MAX: usize = SWITCH_TIERS + 3;
 
-/// THE NARROW LADDER of a top line whose switch is `switch` ([`lay_top`]).
+/// The narrow ladder of a top line whose switch is `switch`, widest rung first ([`lay_top`]).
 fn ladder(switch: Option<SwitchPaint>, lockup: Option<usize>) -> ([Rung; LADDER_MAX], usize) {
     let none = Rung {
         tier: None,
@@ -6613,7 +6599,7 @@ fn first_fit(span: usize, rungs: &[Rung]) -> Option<Rung> {
     rungs.iter().copied().find(|r| r.need <= span)
 }
 
-/// THE LADDER LAID ([`ladder`]).
+/// The first rung of [`ladder`] that fits `span` cells, and its switch face.
 fn lay_top(
     span: usize,
     switch: Option<SwitchPaint>,
@@ -6628,7 +6614,7 @@ fn lay_top(
     Some((rung, face))
 }
 
-/// What a composer top line is composed from ([`compose_top`]) ([`top_build`]).
+/// What a composer top line is composed from ([`compose_top`], [`top_build`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TopKey {
     frame_row: usize,
@@ -6718,7 +6704,7 @@ const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// THE CLI'S TOP LINE ([`top_line`]).
+/// Compose the CLI's top line ([`top_line`]).
 fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>) {
     compose_top_in(key, top, version, TITLE_LEAD);
 }
@@ -6975,7 +6961,7 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
     }
 }
 
-/// THE HOVER TITLE's words ([`hover_title`]).
+/// The hover title's words ([`hover_title`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HoverTitle<'a> {
     product: &'a str,
@@ -7084,7 +7070,7 @@ pub(crate) const fn top_mark_id(session: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// THE MARK'S SPRITE for a top rule composed from `key` into `top` (design §6.4).
+/// The mark's sprite for a top rule composed from `key` into `top`.
 fn mark_layer(
     key: &TopKey,
     top: &ComposedTop,
@@ -7274,7 +7260,7 @@ fn push_agy_inline_markdown(
     changed
 }
 
-/// THE INKS agy's and Muse Code's transcript is rewritten in ([`render_agy_markdown_row`],
+/// The inks agy's and Muse Code's transcript is rewritten in ([`render_agy_markdown_row`],
 /// [`collect_agy_transcript_edits`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MarkdownInks {
@@ -7864,7 +7850,7 @@ fn split_agy_subagent_suffixes(s: &str) -> (&str, Option<&str>, Option<&str>) {
     (body, expand, elapsed)
 }
 
-/// Render an `agy` subagent status or tree row in the transcript with rainbow bling and clean UX.
+/// Render an `agy` subagent status or tree row in the transcript, its name in rainbow ink.
 fn render_agy_subagent_transcript_row(
     row: &str,
     row_idx: usize,
@@ -8096,10 +8082,9 @@ fn render_agy_panel_item_row(
         out.push(blank);
     }
     if let Some((unwrapped, after_agent)) = aterm_phase::agy::split_agent_panel_item(rest) {
-        // Column 4..4+unwrapped.chars().count() matches `agents_panel::agy_agent_row`'s `name`
-        // span, and `claude_panel::make_look` leaves `agy_agent` name cells untouched so this
-        // full-spectrum bold rainbow in `scratch.cells` is preserved while `claude_panel`
-        // animates the status dot at column 2.
+        // Columns 4..4+unwrapped.chars().count() are `agents_panel::agy_agent_row`'s `name`
+        // span, whose `agy_agent` cells `claude_panel::make_look` leaves alone, so this rainbow
+        // stays while `claude_panel` animates the status dot at column 2.
         push_rainbow_text(
             unwrapped,
             (panel_idx as f32) * 0.23,
@@ -8945,11 +8930,8 @@ mod tests {
         }
     }
 
-    /// A VERSIONED LIT FACE'S PILL IS THE SWITCH'S OWN STATE (agy's `▐ ● on
-    /// ▌`, review 13): in every form its cells are the switch's and no form
-    /// has the off face's `on` button, and on a themed line the arc runs
-    /// through the words while the pill keeps its caps and fill. CONTROL:
-    /// every off form keeps its button, after the switch's cells.
+    /// A versioned lit face's pill is the switch's own cells in every form, never the off face's
+    /// `on` button, and keeps its caps and fill on a themed line; every off form keeps its button.
     #[test]
     fn a_lit_pill_is_the_switchs_own_state_not_an_on_button() {
         use crate::autopilot::{HarnessSwitch, SwitchOff};

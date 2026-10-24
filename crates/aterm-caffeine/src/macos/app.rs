@@ -272,8 +272,7 @@ impl Mug {
     }
 
     /// The tick, and a wake from sleep. A timed mode that has ended is taken from the file again
-    /// ([`Mug::reload`]): the mug's own restores off, and a writer's change saved before its
-    /// notification is taken is kept.
+    /// ([`Mug::reload`]): the mug's own reads off, and a writer's change not yet notified is kept.
     fn tick(&mut self, now: Clocks, menu_open: bool) -> Next {
         if self.mode.settled(now) == self.mode {
             if !self.apply(now) {
@@ -306,10 +305,9 @@ impl Mug {
         Next::Stop(Exit::Quit)
     }
 
-    /// Save a timed mode again once the date has been changed since its save ([`state::refresh`]),
-    /// so that a build before `ends`, which reads the file's end on the wall clock alone, reads
-    /// the end this mug holds within a tick of the change. A failure leaves this build's readers
-    /// right and the mug running; it is logged.
+    /// Save a timed mode again once the date has changed since its save ([`state::refresh`]), so
+    /// a build that reads the end on the wall clock alone reads the mug's end within a tick. A
+    /// failure is logged and the mug runs on: readers of `ends` are right either way.
     fn refresh(&self, now: Clocks) {
         let file = self.paths.state_file();
         if let Err(err) = state::refresh(&file, self.mode, now) {
@@ -320,13 +318,11 @@ impl Mug {
         }
     }
 
-    /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]):
-    /// one on the wall clock alone, or one whose deadline the restore changed, but for one
-    /// brought in by no more than [`state::DRIFT_SECS`]. So no later read of the file, by
-    /// `status`, a bridge or the next mug, reads another time than the mug holds by more than
-    /// those seconds. A writer's change that lands before that save is taken instead
-    /// ([`state::take_saving`]). Whether the save, if due, was made; when it was not, the mug
-    /// keeps its own mode, settled at `now`, so one that has ended is off.
+    /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]), so
+    /// no later read of it (`status`, a bridge, the next mug) is off the mug's mode by more than
+    /// [`state::DRIFT_SECS`]; a writer's change that lands first is taken instead
+    /// ([`state::take_saving`]). Whether the save, if one was due, was made; when not, the mug
+    /// keeps its own mode, settled at `now`.
     fn take(&mut self, now: Clocks) -> bool {
         let file = self.paths.state_file();
         match (self.take_saved)(&file, now) {
@@ -341,9 +337,9 @@ impl Mug {
         }
     }
 
-    /// Take the file's mode: a writer's, or the mug's own. The mode held is applied even when
-    /// the take's save fails and the mug stops, so a span that has ended lets go of the activity
-    /// at once, not only when the app stops, which waits for an open menu ([`schedule_stop`]).
+    /// Take the file's mode, a writer's or the mug's own, and apply it even when the take's save
+    /// fails and the mug stops, so an ended span lets go of the activity at once rather than when
+    /// the app stops, which waits for an open menu ([`schedule_stop`]).
     fn reload(&mut self, now: Clocks) -> Next {
         let took = self.take(now);
         if !self.apply(now) || !took {
@@ -506,10 +502,10 @@ aterm_objc::declare_class! {
             if self.quit_from_outside() { TERMINATE_CANCEL } else { TERMINATE_NOW }
         }
 
-        /// As the app's delegate, what `-terminate:` posts just before it exits the process, from
+        /// As the app's delegate, what `-terminate:` posts just before it exits the process from
         /// inside `-run` (a logout, a restart or a shutdown): [`run`] never gets back to its
-        /// discard of the copy, so it is made here. `-stop:`, how the menu's Quit and an update's
-        /// restart end `-run`, posts nothing.
+        /// discard of the copy, so it is made here. `-stop:` (the menu's Quit, an update's
+        /// restart) posts nothing.
         @sel(applicationWillTerminate:)
         fn application_will_terminate(&self, _note: Id) {
             if MainThread::new().is_none() {
@@ -1192,8 +1188,8 @@ mod tests {
         assert!(mug.awake.is_none());
     }
 
-    /// Ten minutes into Activate for 1 Hour, the wall clock set back a day: the mug still lets
-    /// go at the hour's end, and the hold, the file and the tooltip agree.
+    /// With the wall clock set back a day mid-span, the mug still lets go at the hour's end, and
+    /// the hold, the file and the tooltip agree.
     #[test]
     fn a_clock_set_back_keeps_the_mac_awake_no_longer_than_the_span() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1285,10 +1281,8 @@ mod tests {
         assert_eq!(std::fs::read(&file).expect("read"), before);
     }
 
-    /// Activate for 8 Hours an hour from its end, in a file an earlier build wrote, taken at the
-    /// start (the update's restart into this build) or from a writer: the mug saves it back on
-    /// the boot clock, so a read of the file once the date is set back or forward a day
-    /// (`status`, a bridge, the next mug) has the 50 minutes the mug holds.
+    /// A file with no `ends`, taken at the start or from a writer, is saved back on the boot clock,
+    /// so a read after the date moves a day has the time the mug holds.
     #[test]
     fn an_earlier_builds_file_is_saved_back_on_the_boot_clock() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1329,10 +1323,8 @@ mod tests {
         }
     }
 
-    /// A deadline a day away on a span of an hour (a hand-edited or damaged file), taken at the
-    /// start or from a writer: the mug holds the hour and saves it so, and a read half an hour on
-    /// (`status`, a bridge, the next mug) has the half hour left the mug holds, not a full hour
-    /// again.
+    /// A deadline a day away on a span of an hour, taken at the start or from a writer, is saved
+    /// in to the hour, so a read half an hour on has the half hour the mug holds.
     #[test]
     fn a_deadline_past_its_span_is_saved_in_to_it() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1368,9 +1360,8 @@ mod tests {
         }
     }
 
-    /// Activate for 8 Hours, then the date set back or forward a day: the next tick saves the
-    /// mode again, so the file's wall-clock end, all a build before `ends` reads, is where the
-    /// wall clock now puts the end the mug holds. A tick with the date unchanged, and the one
+    /// After the date moves a day, the next tick saves the mode again so the file's wall-clock end
+    /// is where the wall clock now puts the mug's end; a tick with the date unchanged, and the one
     /// after the save, leave the file alone.
     #[test]
     fn a_change_of_the_date_saves_the_wall_clock_end_again() {
@@ -1414,9 +1405,8 @@ mod tests {
         }
     }
 
-    /// A writer's change saved after the mug's, with the date set back a day since and the
-    /// writer's notification not yet taken: the tick that comes first saves nothing of the mug's
-    /// over it, whatever the writer chose.
+    /// A writer's change saved after the mug's and a change of the date, not yet notified: the
+    /// next tick saves nothing of the mug's over it.
     #[test]
     fn a_tick_after_a_change_of_the_date_keeps_a_writers_mode() {
         let later = Clocks {
@@ -1443,10 +1433,9 @@ mod tests {
         }
     }
 
-    /// Activate for 1 Hour, and a writer's save as the hour ends, its notification not yet
-    /// taken: on with no end, a new hour, or a new hour on clocks a second ahead of the tick's.
-    /// The tick that ends the hour takes the writer's mode and leaves its file as it is; with no
-    /// writer, it lets go and saves off.
+    /// A writer's save as the hour ends, not yet notified (on with no end, a new hour, or one on
+    /// clocks a second ahead): the tick that ends the hour takes the writer's mode and leaves its
+    /// file as it is; with no writer, it lets go and saves off.
     #[test]
     fn the_tick_that_ends_a_span_keeps_a_writers_mode() {
         let end = NOW + HOUR;
@@ -1480,9 +1469,8 @@ mod tests {
         }
     }
 
-    /// Activate for 1 Hour, and obstruct the save-back after its expired state is read, the menu
-    /// open: the tick stops on the real storage error and lets go of the activity itself, off,
-    /// rather than leaving it to the stop, which waits for the menu to close.
+    /// A span whose save-back fails with the menu open lets go of the activity on the tick
+    /// itself, not at the stop, which waits for the menu to close.
     #[test]
     fn a_span_that_ends_on_a_failed_save_lets_go_at_once() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");

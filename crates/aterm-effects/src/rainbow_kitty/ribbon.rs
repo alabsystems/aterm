@@ -35,7 +35,12 @@ pub const HOT_EDGE_CELLS: f32 = 3.0;
 /// The hot edge's line thickness, px.
 pub const HOT_EDGE_THICKNESS: f32 = 1.0;
 
-/// How far back from its head end a run the hand has left feathers in, in cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin to nothing at the end the caret jumped off instead of standing square-cut there, at the end and along the top edge beside it. Wide enough that its pixel-fine boundaries step by no more than a fifth of the body a column (0.9 stepped by 0.23), narrow enough that the band an Enter leaves goes dark with a submit's (1.5 dimmed its newest end a frame early).
+/// How far back from its head end a run the hand has left feathers in, in
+/// cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin
+/// to nothing at the end the caret jumped off instead of standing square-cut
+/// there, at the end and along the top edge beside it. Wide enough that its
+/// pixel-fine boundaries step by no more than a fifth of the body a column,
+/// narrow enough that the band an Enter leaves goes dark with a submit's.
 pub const HEAD_FEATHER_CELLS: f32 = 1.2;
 
 /// The furthest back, in cells, the crisp edge may reach when a key is born on a change of speed or under an open theme ([`edge_cells`]): the same alpha law over a longer `d`, so a longer streak, never a brighter one.
@@ -156,9 +161,8 @@ pub const RAIL_REACH_MAX_CH: f32 = DN_TOP_CH;
 
 /// The hairline of body the vivid rail leaves under the row, in cells
 /// ([`rail_gap_px`]): a descender's foot ends on the row's last pixel row,
-/// and a rail laid at the row's bottom would meet it, so the foot would read
-/// against the rail's gold next to it (`g` of `dog` at 1.38:1 in every
-/// rainbow kitty burst).
+/// and a rail laid at the row's bottom would meet it and leave the foot
+/// little contrast against the rail's vivid ink.
 pub const RAIL_GAP_CH: f32 = 0.06;
 
 /// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, at least one.
@@ -209,19 +213,14 @@ pub const BED_SAT_FLOOR: f32 = 1.0;
 /// held at its edge too ([`dim_edge_held`]).
 pub const DIM_THEME_BARE: f32 = 7.0;
 
-/// THE DIM BED'S EDGE (looks6 N11, 2026-10-23). Where the bed's top crosses a
-/// letter, the letter's anti-aliased pixels sit on page above and bed below,
-/// and a reader of that edge (`aterm-lab trail-contrast`'s ring, each channel's
-/// median) sees the page's green with the bed's blue: Solarized Dark's `#002b36`
-/// over a `#160480` bed reads `#162b80`, and `fox`'s `o` read 3.54:1 there,
-/// under four fifths of the theme's 4.75:1. On a dim theme the bed is held
-/// so that its brightest channel mix with the page keeps a letter's edge
-/// pixel ([`DIM_EDGE_SOLID`] of the text's reading) at
+/// Where the bed's top crosses a letter, the letter's anti-aliased pixels sit
+/// on page above and bed below, and a reader of that edge sees each channel's
+/// larger of the two. On a dim theme the bed is held so that this mix keeps a
+/// letter's edge pixel ([`DIM_EDGE_SOLID`] of the text's reading) at
 /// [`PAPER_BAR_THEME_SHARE`] of the theme's own, with this margin.
 pub const DIM_EDGE_GUARD: f32 = 0.03;
 
-/// The share of the text's reading its weakest solid pixel keeps (the
-/// judge's solid share).
+/// The share of the text's reading a letter's weakest solid pixel keeps.
 pub const DIM_EDGE_SOLID: f32 = 0.85;
 
 /// The light bed's one weight.
@@ -237,8 +236,7 @@ pub const PAPER_WEIGHT_LEADING: f32 = 0.30;
 /// ([`paper_caret_ink`]): the caret law's 4.5:1, as every effect-owned
 /// caret's ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]). Held to a
 /// graphic's 3:1, a hot burst's green and orange stops would print their
-/// carets at 3.26:1 on white (`#6a9d01`, `#f35d01`; the trail gallery's
-/// `burst`, every rainbow spelling on both light themes).
+/// carets under 4.5:1 on white.
 pub const PAPER_CARET_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 
 /// The least contrast a point mark keeps against a light page ([`paper_mark_ink`]).
@@ -333,7 +331,9 @@ pub const FLOW_SETTLE_SHARE: f32 = 0.40;
 
 /// The seam's level.
 pub const SEAM_LEVEL: f32 = (1.0 - 1.0 / HOT_EDGE_CELLS) * (1.0 - 1.0 / HOT_EDGE_CELLS);
-/// The re-anchor's floor, cells, matching `cursor_glow::classify_move` (which admits a re-anchor only at `raw_dist > 2`).
+/// The re-anchor's floor, cells, matching the `raw_dist > 2` floor of
+/// `cursor_glow`'s `classify_move`; a shorter backward hop re-anchors only on
+/// a proof (`short_reanchor`, `rewrap_start`).
 pub const RE_ANCHOR_MIN_CELLS: u16 = 3;
 
 /// The exit swoosh past the grace.
@@ -1084,15 +1084,13 @@ pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
 }
 
-/// THE DARK BED KEEPS ITS STOPS' CHROMA: held to the letters' luminance
-/// budget (some 0.07 under `#d0d0d0` text), every hue from orange to
-/// yellow-green has no vivid colour left in sRGB (OKLab chroma 0.08 to 0.10:
-/// `#753a00` brown, `#4d4d00` olive, `#375200`), and unbent, a third of the
-/// walk draws the body in mud (`#524504`, `#374e03`).
-/// The bend draws orange as a red-orange and yellow as a deep orange, both
-/// as vivid as the budget allows (chroma 0.12 and more), and crosses the
-/// basin to green inside the yellow→green interval, as the light bed's
-/// [`PAPER_HUE_BEND`] bends yellow off the paper. Degrees in → out.
+/// Held to the letters' luminance budget, every hue from orange to
+/// yellow-green has no vivid colour left in sRGB, and unbent, a third of the
+/// walk draws the dark bed in brown and olive mud. The bend draws orange as a
+/// red-orange and yellow as a deep orange, both as vivid as the budget
+/// allows, and crosses the basin to green inside the yellow→green interval,
+/// as the light bed's [`PAPER_HUE_BEND`] bends yellow off the paper. Degrees
+/// in → out.
 const DARK_HUE_BEND: [(f32, f32); 4] = [(0.0, 0.0), (30.0, 14.0), (60.0, 24.0), (90.0, 92.0)];
 
 fn dark_hue_bent(rgb: u32) -> u32 {
@@ -1700,10 +1698,9 @@ const FEATHER_ROOM_SHARE: f32 = 0.6;
 /// `end_px` px within `end_reach` px of the left end of `segs` (where the
 /// plan eases a run's tail in) unless the head is there. The rasterizer
 /// holds a window's light flat across each stride, so a run's tail easing
-/// in from [`RUN_TAIL_EASE`] over its cell's three slabs stood as a stair of
-/// flat blocks (looks6 round 3: `2f0f13` to `880e04` in 4-5 px steps, on the
-/// dark wash and the paper under-stripe alike). The reach is a place, not a
-/// coverage step, so a window keeps its layout while its light changes.
+/// in from [`RUN_TAIL_EASE`] over its cell's three slabs would stand as a
+/// stair of flat blocks. The reach is a place, not a coverage step, so a
+/// window keeps its layout while its light changes.
 fn for_each_feathered(
     segs: &[Segment],
     feather: HeadFeather,
@@ -1754,7 +1751,7 @@ fn for_each_feathered(
         {
             let n = ((here.x - p.x).abs() / px).floor() as usize;
             if n > 1 {
-                let nf = n as f32;
+                let inv_nf = 1.0 / (n as f32);
                 let (dx, d_spine, d_up, d_dn, dt, d_cov) = (
                     here.x - p.x,
                     here.spine - p.spine,
@@ -1764,7 +1761,7 @@ fn for_each_feathered(
                     here.cov - p.cov,
                 );
                 for k in 1..n {
-                    let u = k as f32 / nf;
+                    let u = k as f32 * inv_nf;
                     each(
                         None,
                         LaidSegment {
@@ -1823,35 +1820,37 @@ pub struct Ribbon {
     /// Test-only: leave a run the hand has left square-cut at its head end (no [`Ribbon::head_feather`]), the negative control of the feather's test.
     #[cfg(test)]
     head_square: bool,
-    /// Test-only: keep the hot edge on a run the hand has left, as it was, the negative control of the hot edge's hand test.
+    /// Test-only: keep the hot edge on a run the hand has left, the negative
+    /// control of the hot edge's hand test.
     #[cfg(test)]
     hot_edge_left_lit: bool,
-    /// Test-only: lay the boundaries inside a head feather's reach at the stride, as they were ([`for_each_feathered`]), the negative control of the smooth feather's test.
+    /// Test-only: lay the boundaries inside a head feather's reach at the
+    /// stride ([`for_each_feathered`]), the negative control of the smooth
+    /// feather's test.
     #[cfg(test)]
     feather_coarse: bool,
-    /// Test-only: lay a run's tail at the stride, as it was, the negative
-    /// control of the tail's ease ([`STAIR_COV_STEP`]).
+    /// Test-only: lay a run's tail at the stride, the negative control of the
+    /// tail's fine lay ([`RUN_END_FINE_CELLS`]).
     #[cfg(test)]
     tail_stair: bool,
-    /// Test-only: centre the hot edge on the row's top under a kept box, as
-    /// it was, the negative control of its inset.
+    /// Test-only: centre the hot edge on the row's top under a kept box, the
+    /// negative control of its inset.
     #[cfg(test)]
     hot_edge_on_bar: bool,
-    /// Test-only: step a line's hold to its target in one frame, as it first
-    /// did, the negative control of the hold's ease.
+    /// Test-only: step a line's hold to its target in one frame, the negative
+    /// control of the hold's ease.
     #[cfg(test)]
     hold_steps: bool,
-    /// Test-only: lay the rail at the row's bottom ([`RAIL_GAP_CH`] off), as
-    /// it was, the negative control of the descenders' hairline.
+    /// Test-only: lay the rail at the row's bottom ([`RAIL_GAP_CH`] off), the
+    /// negative control of the descenders' hairline.
     #[cfg(test)]
     rail_flush: bool,
     /// Test-only: draw the pet's and the flat ribbon alike on paper (no
-    /// rail, one body), as they were, looks6 N9's negative control.
+    /// rail, one body), the negative control of their reading apart there.
     #[cfg(test)]
     paper_alike: bool,
     /// Test-only: leave each row's hold behind when a scroll or a band move
-    /// carries its line away, as it first did, the negative control of the
-    /// carried hold.
+    /// carries its line away, the negative control of the carried hold.
     #[cfg(test)]
     holds_left_behind: bool,
     /// Each row's hold ([`Run::hold`]), with when it was last eased, and its
@@ -2197,7 +2196,7 @@ impl Ribbon {
 
     /// Whether the vivid rail is drawn: under the comet body on either
     /// page, so the pet's ribbon keeps its under-edge on paper too, where
-    /// without it the pet's and the flat ribbon read alike (looks6 N9).
+    /// without it the pet's and the flat ribbon read alike.
     #[inline]
     #[must_use]
     pub const fn rail_lit(cfg: &Config) -> bool {
@@ -2936,7 +2935,11 @@ impl Ribbon {
             }
             self.flow_row(from.0, at);
         } else {
-            // A line the hand left downward by anything but a navigation (a Return, the line feed after it) is printed text now: its light dims to [`RETURN_PRINTED_SHARE`] over [`RETURN_DIM_S`], clear of its letters by the time the output lands, and goes on out through the swoosh's retract (at full light the band under the line's last word took it under 4.5:1 on paper for longer than a sixth of a second).
+            // A line the hand left downward by anything but a navigation (a Return, the line
+            // feed after it) is printed text now: its light dims to [`RETURN_PRINTED_SHARE`]
+            // over [`RETURN_DIM_S`], clear of its letters by the time the output lands (at full
+            // light the band under its last word holds it under 4.5:1 on paper), and goes on
+            // out through the swoosh's retract.
             if to.0 > from.0 && licence != Licence::Nav {
                 self.print_row(from.0, at);
             }
@@ -4444,20 +4447,15 @@ impl Ribbon {
     /// ink under it (a column either side of its span included) is held
     /// inside its own row: its body takes the pane's last-row shape (spine
     /// lifted by the lower reach, so nothing reaches past the row's bottom)
-    /// and its rail stays dark. Without it the body's lower reach
-    /// ([`DN_FLOOR_CH`] to [`DN_TOP_CH`]), a wave crest's core and the rail lay
-    /// up to a third of a cell of light on the next line's ascenders (the
-    /// trail gallery's context and enter-bottom frames: 1 to 5 px of the core
-    /// across the tops of the row below). The pane's last row is held (it has
-    /// no row under it). A row first lit over ink is born held, one first lit
-    /// over a blank row or a row the probe does not know is born free; one
-    /// whose next row inks while it is lit eases into its row over
-    /// [`HOLD_EASE_S`], and one whose next row clears, or whose line flows into
-    /// the fold, lets go over [`HOLD_RELEASE_S`]; while the probe does not know
-    /// the row below (a scroll's frame clears it) the row keeps its level. A
-    /// scroll or a band move carries each row's hold with its line, so a line
-    /// typed on the last row and scrolled up by its Enter over the line it
-    /// prints stays in its row from the scroll's frame on.
+    /// and its rail stays dark, so no light lies on the next line's
+    /// ascenders. The pane's last row is held too (no row is under it). A row
+    /// first lit over ink is born held, one first lit over a blank or unknown
+    /// row is born free; one whose next row inks while it is lit eases into
+    /// its row over [`HOLD_EASE_S`], and one whose next row clears, or whose
+    /// line flows into the fold, lets go over [`HOLD_RELEASE_S`]; while the
+    /// probe does not know the row below (a scroll's frame clears it) the row
+    /// keeps its level. A scroll or a band move carries each row's hold with
+    /// its line.
     pub fn plan_over(&mut self, ctx: &Ctx<'_>, below: Option<&GlyphProbe>) {
         self.ink.sync(ctx.cfg);
         self.ground = ctx.cfg.theme_bg;
@@ -5054,12 +5052,12 @@ impl Ribbon {
             (spine, up, dn)
         };
         let pane_bot = self.pane_bot(ctx, chf);
-        let (spine, up, dn) = if hold <= 0.0 {
+        let (spine, up, dn) = if hold <= 0.0 || pane_bot <= row_bot {
             shape(pane_bot)
         } else if hold >= 1.0 {
-            shape(pane_bot.min(row_bot))
+            shape(row_bot)
         } else {
-            let (free, held) = (shape(pane_bot), shape(pane_bot.min(row_bot)));
+            let (free, held) = (shape(pane_bot), shape(row_bot));
             let mix = |a: f32, b: f32| a + (b - a) * hold;
             (
                 mix(free.0, held.0),
@@ -5608,7 +5606,7 @@ impl Ribbon {
         let kept_up = |x: f32, spine: f32, up: f32, row: u16| self.kept_up(ctx, x, spine, up, row);
         let head_feather = |run: &Run| self.head_feather(ctx, run);
         // The flat ribbon on paper lies flatter than the pet's comet body:
-        // lower, its plateau carried near its top (looks6 N9).
+        // lower, its plateau carried near its top.
         let flat_paper = !ctx.cfg.dark_theme && !Self::comet(ctx.cfg) && !alike;
         #[cfg(test)]
         let coarse = self.feather_coarse;
@@ -5665,6 +5663,7 @@ impl Ribbon {
                     (0.0, 0.0)
                 };
                 if rail_layer {
+                    let rail_scale = RAIL_GAIN * (1.0 - run.hold);
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
@@ -5680,7 +5679,7 @@ impl Ribbon {
                             core_up: 0.0,
                             core_dn: dn * RAIL_CORE_SHARE,
                             color: ink.rail_at(seg.t),
-                            cov: seg.cov * RAIL_GAIN * feather(seg.x) * (1.0 - run.hold),
+                            cov: seg.cov * rail_scale * feather(seg.x),
                             lift: 0.0,
                             lift_span: 0.0,
                         });
@@ -5934,10 +5933,9 @@ impl Ribbon {
         let intensity = clamp01(ctx.cfg.intensity);
         let gain_intensity = gain * intensity;
         let feather = self.head_feather(ctx, run);
-        // The edge is a line a pixel thick centred on the body's top:
-        // held at the row's top under a lettered or filled cell above,
-        // its upper half lay on the cell's foot (looks6 round 3: the
-        // bottom of `main +2`'s yellow segment lifted by 77).
+        // The edge is a line a pixel thick centred on the body's top: held at
+        // the row's top under a lettered or filled cell above, its upper half
+        // would lie on the cell's foot, so it is held half its thickness in.
         #[cfg(test)]
         let inset = if self.hot_edge_on_bar {
             0.0
@@ -5946,6 +5944,7 @@ impl Ribbon {
         };
         #[cfg(not(test))]
         let inset = 0.5 * HOT_EDGE_THICKNESS;
+        let inv_reach = 1.0 / reach;
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -5956,12 +5955,11 @@ impl Ribbon {
             if !(0.0..=reach).contains(&behind) && !in_seam {
                 continue;
             }
-            let d = behind / cw;
-            let a_rel =
-                (1.0 - d / cells)
-                    .max(0.0)
-                    .powi(2)
-                    .max(if in_seam { seam_lvl } else { 0.0 });
+            let a_rel = (1.0 - behind * inv_reach).max(0.0).powi(2).max(if in_seam {
+                seam_lvl
+            } else {
+                0.0
+            });
             let cov = (HOT_EDGE_COV_MAX * a_rel * gain_intensity * feather.at(seg.x))
                 .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
@@ -8059,13 +8057,10 @@ mod tests {
         }
     }
 
-    /// The gallery's judges (looks6 round 3, N4): under the yellow `main +2`
-    /// powerline segment on the row above the caret's, the hot edge, a line
-    /// a pixel thick held centred on the row's top, lay half on the
-    /// segment's foot and tinted its bottom pixels (`cdcd00` to `e0fb4d`).
-    /// Held its half thickness inside the row, the edge lights nothing above
-    /// the row's top under the segment; centred on the top (the negative
-    /// control) it does.
+    /// Under a filled cell on the row above the caret's (the gallery's yellow
+    /// `main +2` powerline segment), the hot edge held half its thickness
+    /// inside the row lights nothing above the row's top; centred on the top
+    /// (the negative control) it does.
     #[test]
     fn the_hot_edge_keeps_off_a_filled_cell_above() {
         let g = gallery_geom();
@@ -8128,13 +8123,10 @@ mod tests {
         );
     }
 
-    /// The gallery's judges (looks6 round 3): the run's tail eased in from
-    /// [`RUN_TAIL_EASE`] over the stride's three slabs and stood as a stair
-    /// of flat 4-5 px blocks (`2f0f13` to `880e04` on dark, and on the paper
-    /// wash and its under-stripe). On the gallery's 14 px cells the tail's
-    /// light now steps by no more than an eighth of the body's from one lit
-    /// column to the next, on dark and on paper; laid at the stride (the
-    /// negative control) it steps by a fifth or more.
+    /// On the gallery's 14 px cells a run's tail light steps by no more than
+    /// an eighth of the body's from one lit column to the next, on dark and
+    /// on paper; laid at the stride (the negative control) it steps by a fifth
+    /// or more.
     #[test]
     fn the_run_s_tail_eases_in_without_a_stair() {
         let g = gallery_geom();
@@ -10608,8 +10600,7 @@ mod tests {
     /// meets the ground next to it, keep the text at the body's bar at every
     /// phase of the wave, and the rail is still lit below them. Negative
     /// control: the rail laid at the row's bottom (`rail_flush`) takes those
-    /// pixels to 1.35:1 (in the trail gallery's rainbow kitty bursts, `g` of
-    /// `dog` by its foot at 1.38:1).
+    /// pixels under the bar.
     #[test]
     fn the_rail_leaves_the_descenders_a_hairline_of_body() {
         let c = cfg(true, true);
@@ -10662,14 +10653,11 @@ mod tests {
         }
     }
 
-    /// THE DIM BED'S EDGE (looks6 N11): where the bed's top crosses a
-    /// letter, the lab's ring reads each channel's larger of page and bed,
-    /// and Solarized Dark's page green with the bed's blue read `fox`'s `o`
-    /// at 3.54:1. Every stop of the walk on a dim dark theme keeps a
-    /// letter's edge pixel (the judge's solid share of the text's reading)
-    /// at four fifths of the theme's own contrast over that mix, and a
-    /// theme past the dim bar keeps its bed byte for byte. Negative
-    /// control: the bed unheld fails that edge on Solarized Dark.
+    /// Every stop of the walk on a dim dark theme keeps a letter's edge pixel
+    /// (the judge's solid share of the text's reading) at four fifths of the
+    /// theme's own contrast over each channel's larger of page and bed, and a
+    /// theme past the dim bar keeps its bed byte for byte. Negative control:
+    /// the bed unheld fails that edge on Solarized Dark.
     #[test]
     fn a_dim_theme_s_bed_keeps_the_letters_at_its_edge() {
         let chmax = |a: u32, b: u32| {
@@ -10742,10 +10730,9 @@ mod tests {
 
     #[test]
     fn on_paper_the_pet_s_ribbon_and_the_flat_one_read_apart() {
-        // looks6 N9: on paper the pet's ribbon and the flat one drew one
-        // body. The pet's keeps its under-edge (ink below the row's bottom
-        // past the hairline) and the flat one none and a lower reach; drawn
-        // alike (the negative control) the two columns match.
+        // On paper the pet's ribbon keeps its under-edge (ink below the row's
+        // bottom past the hairline) and the flat one has none and a lower
+        // reach; drawn alike (the negative control) the two columns match.
         let g = geom();
         let ch = g.ch as f32;
         let row_top = f32::from(g.origin_y) + 2.0 * ch;
@@ -10821,10 +10808,8 @@ mod tests {
         let c = flat(true, true);
         assert!(!Ribbon::comet(&c) && !Ribbon::rail_lit(&c));
         assert!(Ribbon::comet(&cfg(true, true)) && Ribbon::rail_lit(&cfg(true, true)));
-        // looks6 N9 (owner, 2026-10-23) lights the pet's rail on paper too:
-        // without its under-edge the pet's ribbon and the flat one read alike
-        // there, so L6's bed alone below the baseline now holds for the
-        // flat spelling only.
+        // The pet's rail is lit on paper too, so L6's bed alone below the
+        // baseline holds for the flat spelling only.
         assert!(
             Ribbon::rail_lit(&cfg(false, true)) && !Ribbon::rail_lit(&flat(false, true)),
             "on paper the pet keeps its under-edge and the flat spelling none"
@@ -10859,11 +10844,9 @@ mod tests {
 
     /// A row of light whose next line holds ink stays inside its own row: no
     /// body, core, wave crest or rail lies on the next line's ascenders, at any
-    /// phase of the wave, dark or light, tall, short or flat (unheld, the trail
-    /// gallery's context and enter-bottom frames lay the core 1 to 5 px into
-    /// the row below). The band is still drawn in its row. Negative controls:
-    /// the same typing over a row probed blank, and over no probe at all,
-    /// reaches below the row's bottom.
+    /// phase of the wave, dark or light, tall, short or flat. The band is still
+    /// drawn in its row. Negative controls: the same typing over a row probed
+    /// blank, and over no probe at all, reaches below the row's bottom.
     #[test]
     fn a_row_with_ink_below_keeps_its_light_inside_the_row() {
         let g = geom();
@@ -11058,14 +11041,10 @@ mod tests {
         }
     }
 
-    /// A LINE A SCROLL CARRIES UP KEEPS ITS ROW'S SHAPE (the trail gallery's
-    /// `enter-bottom` frame: Enter on the bottom row scrolls the echo up over
-    /// the line it prints, and a hold left behind lays the core across the
-    /// printed ascenders in that frame, 1.5:1 by the lab's local judge).
-    /// Typed on the pane's last row, the line is laid inside its row; carried
-    /// up two rows, on the scroll's frame (the probe cleared, knowing nothing
-    /// below) and on every frame after (the probe knowing the printed line),
-    /// no light lies past its row's bottom. Negative control: the hold left
+    /// Typed on the pane's last row and carried up two rows by a scroll, a
+    /// line lays no light past its row's bottom, on the scroll's frame (the
+    /// probe cleared, knowing nothing below) and on every frame after (the
+    /// probe knowing the printed line). Negative control: the hold left
     /// behind by the scroll (`holds_left_behind`) lays the body's lower reach
     /// on the printed line in the scroll's frame.
     #[test]

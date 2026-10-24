@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Foreground process-image inspection and title/prompt tracking for a session's PTY.
+//! The foreground process image a session's PTY holds (its holder image), the launch card's
+//! gate on it, and the byte-driven arm that reads it at each OSC 133/633 `C`.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,8 @@ pub(crate) enum CardProgram {
 }
 
 impl CardProgram {
-    /// The card drawer `program` names (`aterm_phase::program_of`: `claude`, `claude-code`, `agy`, `muse`, `muse-bin-<version>`), or `None`.
+    /// The card drawer `program` names (`aterm_phase::program_of`: `claude`, `claude-code`,
+    /// `agy`, `muse`, `muse-bin-<version>`), or `None`.
     pub(crate) fn of(program: &str) -> Option<Self> {
         Self::from_program(aterm_phase::program_of(program)?)
     }
@@ -68,7 +70,8 @@ impl CardProgram {
         }
     }
 
-    /// What this drawer's banner says about its build, as aterm-phase declares it beside the reader.
+    /// What this drawer's banner says about its build, as aterm-phase declares it beside the
+    /// reader.
     pub(crate) const fn banner_build(self) -> aterm_phase::BannerBuild {
         match self {
             Self::Claude => aterm_phase::turn::LAUNCH_CARD_BUILD,
@@ -97,7 +100,7 @@ impl CardProgram {
     }
 }
 
-/// THE CARD'S GATE for the current holder image (card engine §3.8): the drawer's token, the card
+/// The card's gate for the current holder image (card engine §3.8): the drawer's token, the card
 /// reader its card must come from, the rows that reader reads, and the build policy the card's
 /// banner is held to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +133,8 @@ impl CardGate {
 pub(crate) enum GateBuild {
     /// The image's own build.
     Exact(atpkg::vendor_direct::Version),
-    /// An image of unknown build (brew, a dev link, an ALab build without its record) of a program whose banner prints its build.
+    /// An image of unknown build (brew, a dev link, an ALab build without its record) of a
+    /// program whose banner prints its build.
     Registry(atpkg::vendor_direct::Version),
     /// A program whose banner is not known to print its build: the fence alone decides.
     ProvenanceOnly,
@@ -138,13 +142,12 @@ pub(crate) enum GateBuild {
     None,
 }
 
-/// The process group each holder-fence mark's drawer image leads (card engine §3.7). Marks are
-/// retired by liveness: when the process watch hears a stopped drawer's leader exit
-/// (`exec_edges::ExecEdges::take_gone`), the parse stage retires its mark
-/// (`Terminal::retire_holder_mark`), so dead stopped drawers never push a live one's mark out
-/// past [`aterm_core::terminal::MAX_HOLDER_MARKS`]. A cut to a drawer image (`spawn::note_cut`)
-/// and a restore's adoption (`spawn::adopt_restored_holder`) note the group of each mark they
-/// lay; the session timeline keeps the book, so a reattached reader still has it.
+/// The process group each holder-fence mark's drawer image leads (card engine §3.7). When the
+/// process watch hears a stopped drawer's leader exit (`exec_edges::ExecEdges::take_gone`), the
+/// parse stage retires its mark (`Terminal::retire_holder_mark`), so dead stopped drawers never
+/// push a live one's mark out past [`aterm_core::terminal::MAX_HOLDER_MARKS`]. A cut to a drawer
+/// image (`spawn::note_cut`) and a restore's adoption (`spawn::adopt_restored_holder`) note the
+/// group of each mark they lay; the session timeline keeps the book for a reattached reader.
 #[derive(Debug, Default)]
 pub(crate) struct DrawerGroups(Vec<(i32, u64)>);
 
@@ -215,7 +218,7 @@ impl EdgeKind {
     }
 }
 
-/// One reading of a foreground group leader's image (§3.4).
+/// One reading of a foreground group leader's image (card engine §3.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HolderImage {
     /// A hash of pid, process start, executable and classified build ([`token_of`]).
@@ -301,7 +304,8 @@ impl HolderImage {
         is_script_shell(&self.exe)
     }
 
-    /// THE BUILD POLICY (card engine §3.8).
+    /// The build policy (card engine §3.8) this drawer's banner is held to; `None` for an
+    /// image that draws no card.
     pub(crate) fn gate_build(
         &self,
         registry: impl FnOnce() -> Option<atpkg::vendor_direct::Version>,
@@ -376,7 +380,8 @@ pub(crate) fn token_word(token: Option<u64>) -> String {
     token.map_or_else(|| "-".to_string(), |t| format!("{t:016x}"))
 }
 
-/// THE SNAPSHOT TOKEN (I5): FNV-1a/64 of the pid, process start, executable and classification.
+/// The snapshot token (card engine I5): FNV-1a/64 of the pid, process start, executable and
+/// classification.
 pub(crate) fn token_of(pid: i32, start_us: u64, exe: &Path, build: &ImageBuild) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     h.write_u32_le(pid.cast_unsigned());
@@ -399,7 +404,9 @@ pub(crate) fn unread(pgid: i32, _last: Option<&HolderImage>) -> HolderImage {
     HolderImage::unread(pgid)
 }
 
-/// THE READ (shipping `SessionFactory::edge_image`), on the gather thread at an edge, or on the parse stage for the byte arm's re-read.
+/// Read `pgid`'s holder image (the shipping `SessionFactory::edge_image`), on the gather thread
+/// at an edge or on the parse stage for the byte arm's re-read. A `last` image of the same
+/// process is kept, re-stamped.
 pub(crate) fn read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
     let read_ns = crate::metrics::now_ns();
     let Some(pid) = u32::try_from(pgid).ok().filter(|p| *p > 1) else {
@@ -470,7 +477,8 @@ struct RootsCache {
 
 static ROOTS: Mutex<Option<RootsCache>> = Mutex::new(None);
 
-/// The managed prefix's [`ImageRoots`], resolved once and again only when `aterm.toml` or the prefix directory changes.
+/// The managed prefix's [`ImageRoots`], resolved once and again only when `aterm.toml` or the
+/// prefix directory changes.
 pub(crate) fn roots() -> Option<Arc<ImageRoots>> {
     let config = atpkg::config::config_path().and_then(|p| stamp(&p));
     let cached = ROOTS
@@ -505,7 +513,7 @@ pub(crate) enum Offer {
     Irrelevant,
 }
 
-/// THE PUBLICATION RULE, pure.
+/// The publication rule: what offering `offered` over the session's `current` holder image does.
 pub(crate) fn decide(current: Option<&HolderImage>, offered: &HolderImage) -> Offer {
     if !offered.card_relevant() && !current.is_some_and(HolderImage::card_relevant) {
         return Offer::Irrelevant;
@@ -516,7 +524,8 @@ pub(crate) fn decide(current: Option<&HolderImage>, offered: &HolderImage) -> Of
     Offer::Published
 }
 
-/// THE EDGED INBOX (§3.5).
+/// The edged inbox (card engine §3.5): the sessions with a published edge the sweep has not
+/// seen.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EdgeInbox(Arc<Mutex<Vec<u64>>>);
 
@@ -541,14 +550,16 @@ impl EdgeInbox {
     }
 }
 
-/// THE C-CUT SCAN (§3.6).
+/// The C-cut scan (card engine §3.6): where each OSC 133/633 `C` in the PTY bytes ends, an
+/// unfinished one carried into the next batch.
 #[derive(Debug, Default)]
 pub(crate) struct CScan {
     carry: Vec<u8>,
 }
 
 impl CScan {
-    /// Clear `ends` and fill it with the cut offsets in `batch`, ascending, each in `1..=batch.len()`.
+    /// Clear `ends` and fill it with the cut offsets in `batch`, ascending, each in
+    /// `1..=batch.len()`.
     pub(crate) fn ends(&mut self, batch: &[u8], ends: &mut Vec<usize>) {
         ends.clear();
         let mut at = 0;
@@ -752,14 +763,14 @@ fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
         .map(|p| from + base + p)
 }
 
-/// THE BYTE-DRIVEN ARM's state in one PTY reader's parse stage (§3.6).
+/// The byte-driven arm's state in one PTY reader's parse stage (card engine §3.6).
 #[derive(Debug)]
 pub(crate) struct ByteArm {
     /// One initial observation also covers an already-running or direct -e
     /// holder, where the foreground group never changes.
     initial: bool,
-    /// The signed command is still an unresolved shell. It can exec after
-    /// any number of output batches, not just the next four slices.
+    /// The signed command is still an unresolved shell, which can exec after
+    /// any number of output batches.
     unresolved: bool,
     /// An accepted C owes a read before the next slice in this batch.
     boundary_due: bool,
@@ -871,7 +882,8 @@ impl ByteArm {
         Some(read(holder, last))
     }
 
-    /// A gather read or re-read satisfies this batch's observation even if publication was irrelevant.
+    /// A gather read or re-read satisfies this batch's observation even if publication was
+    /// irrelevant.
     pub(crate) fn note_read(&mut self, image: &Arc<HolderImage>) {
         self.initial = false;
         self.boundary_due = false;
@@ -889,7 +901,8 @@ impl ByteArm {
         }
     }
 
-    /// The engine's accepted command mark and resulting shell state, read under its existing hold.
+    /// The engine's accepted command mark and resulting shell state, read under its existing
+    /// hold.
     pub(crate) const fn note_shell(&mut self, signed_c: bool, executing: bool) {
         if self.kernel {
             return;
@@ -914,7 +927,8 @@ pub(crate) fn dev_tail() -> String {
     )
 }
 
-/// THE I1 TEST SEAMS: what a watched session's timeline held inside each slice's term-lock hold, and the mutant that publishes after the hold.
+/// I1's test seams: what a watched session's timeline held inside each slice's term-lock
+/// hold, and the controls' mutants it runs.
 #[cfg(test)]
 pub(crate) mod hold_hook {
     use std::collections::HashMap;
@@ -1137,7 +1151,8 @@ pub(crate) mod cut_cost {
         }
     }
 
-    /// Median MB/s of `runs` passes without the arm and with it (alternating, after one untimed pass of each), and the cuts and image reads one pass with it made.
+    /// Median MB/s of `runs` passes without the arm and with it (alternating, after one untimed
+    /// pass of each), and the cuts and image reads one pass with it made.
     pub(crate) fn c_cut_cost(
         corpus: &[u8],
         batch: usize,
@@ -1602,7 +1617,7 @@ mod tests {
         assert_eq!(arm.next_cut(usize::MAX), None);
     }
 
-    /// THE ORACLE: where the engine's parser dispatches each OSC the engine
+    /// The oracle: where the engine's parser dispatches each OSC the engine
     /// takes as a 133/633 `C` (`TerminalHandler::osc_dispatch_inner`'s command
     /// number, `parse_shell_osc`'s first character), byte by byte.
     #[derive(Default)]

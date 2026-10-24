@@ -1792,8 +1792,8 @@ fn nonreading_peer_cannot_hold_a_guarded_write_past_its_deadline() {
         })),
     );
     let (_nonreading_client, server) = CtlStream::pair().unwrap();
-    // Full before the reply: Windows takes one send whole while the socket has room (the
-    // 8 MiB reply went out in a single write), so its size alone never waits on the peer.
+    // Full before the reply: Windows takes one send whole while the socket has room, so a
+    // reply's size alone never waits on the peer.
     server
         .set_write_timeout(Some(std::time::Duration::from_millis(50)))
         .unwrap();
@@ -2393,10 +2393,9 @@ fn dispatch_await_task_resolves_its_list_and_refuses_what_it_cannot() {
     );
 }
 
-/// THE LIST FORM'S PER-TARGET FACT EDGE (`@<sel>:<rev>:<fact_rev>`, which the ctl client's
-/// re-arm legs send): an element's own fact edge wins over the request's `fact_since=`, so a word
-/// noted past it answers at once. CONTROL: an element whose edge is the record's `fact_rev` waits
-/// to its short timeout, so the edge decided, not the word standing.
+/// The list form's per-target fact edge (`@<sel>:<rev>:<fact_rev>`) wins over the request's
+/// `fact_since=`, so a word noted past it answers at once. CONTROL: an element whose edge is
+/// the record's `fact_rev` waits to its short timeout.
 #[test]
 fn dispatch_await_task_reads_each_targets_own_fact_edge() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task, mark_session_task_fact};
@@ -16992,12 +16991,10 @@ fn the_harness_token_reads_as_harness_and_holds_owner_power() {
     );
 }
 
-/// A connection that presents the window harness's in-memory token writes `by=harness` into the
-/// session log, and one that presents the token beside the socket writes `by=ctl`, over a socket
-/// end to end: the agent's own connector ([`aterm_agent::harness::upgrade_drive::harness_client`],
-/// which the window's drive, its disk resume and the hosted loop dial with), the real handshake
-/// ([`authenticate_connection`]), a lane that enters the principal it proved, and the log's own
-/// `mark` and `log` verbs. The mark is the label the supervise loop writes after a usage wall.
+/// A connection presenting the window harness's in-memory token writes `by=harness` into the
+/// session log, and one presenting the token beside the socket writes `by=ctl`, end to end
+/// through the agent's own connector ([`aterm_agent::harness::upgrade_drive::harness_client`]),
+/// the real handshake ([`authenticate_connection`]) and the log's `mark` and `log` verbs.
 #[cfg(unix)]
 #[test]
 fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by_ctl() {
@@ -17561,11 +17558,9 @@ fn a_guarded_submit_into_a_busy_sink_after_typing_keeps_its_id_in_doubt() {
     assert_eq!(pastes.get(), 1, "typed exactly once");
 }
 
-/// A guarded re-press the sink takes none of until its window ends, after an earlier Enter
-/// went, wrote nothing of its own: it stops the re-presses as a missed one does, so the verdict
-/// says `submitted=0 pressed=<n>` (an Enter written and not seen, as the harness reads it:
-/// `an_enter_written_and_not_seen_is_a_continuation_typed`), never the first Enter's "typed,
-/// not submitted" reply. That verdict is `OK`, so the `id=` is spent.
+/// A guarded re-press the sink takes none of, after an earlier Enter went, stops the re-presses
+/// as a missed one does: the verdict says `submitted=0 pressed=<n>`, never the first Enter's
+/// "typed, not submitted" reply, and is `OK`, so the `id=` is spent.
 #[test]
 #[cfg(unix)]
 fn a_guarded_re_press_into_a_busy_sink_says_the_enter_that_went() {
@@ -17625,12 +17620,11 @@ fn a_guarded_re_press_into_a_busy_sink_says_the_enter_that_went() {
     assert_eq!(pastes.get(), 1, "typed exactly once");
 }
 
-/// A `turn` that stops before it writes anything (its `if-gen=` fence moved, a `typed=1`
-/// turn whose keys cannot all go out before its deadline, a session that exited before the
-/// paste) tells the claim so, whatever it answered: the retry with the same `id=` types. One
-/// that stops after its paste (a hold before the submit press) keeps its sequence, and so do a
-/// `typed=1` turn's keys: one that typed is a duplicate on the retry, and one the session's
-/// exit cut after its first key stays in doubt.
+/// A `turn` that stops before it writes anything (its `if-gen=` fence moved, a `typed=1` turn
+/// whose keys cannot all go out before its deadline, a session that exited before the paste)
+/// leaves its `id=` for the retry, which types, whatever it answered. One that stops after its
+/// paste keeps its sequence, as do a `typed=1` turn's keys: one that typed is a duplicate on the
+/// retry, and one the session's exit cut after its first key stays in doubt.
 #[test]
 fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
     let store = session_store::new_store();

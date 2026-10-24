@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A SESSION'S REPOSITORY HOLDS THAT NO REMOTE MAIN HAS.
+//! What a session's repository holds that no remote main has, and its hygiene for the fact
+//! menus.
 
 use std::cell::Cell;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +20,7 @@ pub const STATE_FILES: usize = 4096;
 
 const PATH_CHARS: usize = 72;
 
-/// WHAT ONE REPOSITORY HOLDS THAT NO REMOTE MAIN HAS ([`probe`]).
+/// What one repository holds that no remote main has ([`probe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoWork {
     /// The repository's top-level directory, as `git rev-parse --show-toplevel` names it.
@@ -38,7 +39,8 @@ pub struct RepoWork {
     pub main_ref: String,
     /// The first [`NAMED_PATHS`] changed or untracked paths, each printable ([`printable`]).
     pub paths: Vec<String>,
-    /// THE WORK'S STATE.
+    /// A hash of the work ([`state_of`]); `None` when not read (cut short, or past
+    /// [`STATE_FILES`] paths), and then no other finding is the same ([`Self::same`]).
     pub state: Option<u64>,
 }
 
@@ -53,7 +55,7 @@ impl RepoWork {
             || self.unlanded > 0
     }
 
-    /// The finding of the reads' output.
+    /// The finding of `git status --porcelain=v1 -z` and stash-list output; `None` for nothing.
     #[must_use]
     pub fn of_git(
         repo: &str,
@@ -93,7 +95,7 @@ impl RepoWork {
         work.found().then_some(work)
     }
 
-    /// WHETHER TWO PROBES FOUND THE SAME WORK.
+    /// Whether two probes found the same work: both nothing, or equal findings of a known state.
     #[must_use]
     pub fn same(a: Option<&Self>, b: Option<&Self>) -> bool {
         match (a, b) {
@@ -158,7 +160,7 @@ impl RepoWork {
     }
 }
 
-/// WHAT ONE PROBE OF A SESSION'S REPOSITORY READ ([`probe`]).
+/// What one probe of a session's repository read ([`probe`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RepoRead {
     /// Nothing no remote main has: the probe finished and found nothing, or
@@ -197,7 +199,7 @@ impl RepoRead {
         }
     }
 
-    /// Whether this reading permits the existing clean-repository policy.
+    /// Whether the reading is [`Self::Clean`]: nothing found, or no probe can run here.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
         matches!(self, Self::Clean)
@@ -209,9 +211,8 @@ impl RepoRead {
         matches!(self, Self::Unread)
     }
 
-    /// WHETHER TWO PROBES READ THE SAME WORK ([`RepoWork::same`]): both clean,
-    /// or both the same finding of a known state. An unfinished probe never
-    /// counts as the same state.
+    /// Whether two probes read the same work: both clean, or both the same finding of a
+    /// known state ([`RepoWork::same`]). An unread probe never matches.
     #[must_use]
     pub fn same(a: &Self, b: &Self) -> bool {
         match (a, b) {
@@ -222,10 +223,11 @@ impl RepoRead {
     }
 }
 
-/// REPOSITORY HYGIENE & DRIFT FROM `origin/main` ([`probe_hygiene`]).
+/// Repository hygiene and drift from the main branch ([`probe_hygiene`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoHygiene {
-    /// Target main branch (`origin/main`, `origin/master`, or local `main`).
+    /// The main branch drift counts against: `origin/HEAD`'s target, `origin/main`,
+    /// `origin/master`, else local `main` or `master`.
     pub main_ref: String,
     /// Commits on `HEAD` not in `main_ref`.
     pub ahead: usize,
@@ -248,7 +250,8 @@ pub struct RepoHygiene {
     pub stale_branches: Vec<String>,
     /// Bytes held across linked worktrees of this repository.
     pub worktree_bytes: u64,
-    /// Bytes held in temp / build directories (`target*`, `*.noindex`) of this repo.
+    /// Bytes held in build and temp directories (`target`, `target-*`, `target.*`,
+    /// `*.noindex`, `.tmp*`) of this repository.
     pub temp_bytes: u64,
     /// Free bytes available on the drive holding this repository.
     pub drive_free_bytes: Option<u64>,
@@ -376,7 +379,7 @@ impl RepoHygiene {
         parts
     }
 
-    /// Compact note rows for the Branch & Hygiene menu (`crate::fact_menu`).
+    /// Note rows for the branch fact menu (aterm-gui's `Fact::Branch`).
     #[must_use]
     pub fn notes(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -427,7 +430,7 @@ impl RepoHygiene {
         out
     }
 
-    /// Compact note rows for the Folder (`Fact::Path`) menu.
+    /// Note rows for the folder fact menu (aterm-gui's `Fact::Path`).
     #[must_use]
     pub fn folder_notes(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -443,7 +446,8 @@ impl RepoHygiene {
     }
 }
 
-/// THE DIRECTORY THE SESSION WORKS IN.
+/// The directory the session works in: the last `cwd` its transcript `tail` wrote, else
+/// `started` (absolute paths only).
 #[must_use]
 pub fn session_dir(started: &str, tail: Option<&str>) -> Option<std::path::PathBuf> {
     let written = tail.and_then(|t| {
@@ -481,7 +485,7 @@ pub fn printable(text: &str) -> String {
     format!("…{tail}")
 }
 
-/// WHAT THE REPOSITORY `dir` IS IN HOLDS THAT NO REMOTE MAIN HAS.
+/// What the repository `dir` is in holds that no remote main has.
 /// A deadline-cut read is [`RepoRead::Unread`], not a clean result.
 #[must_use]
 pub fn probe(dir: &Path, home: Option<&Path>, limit: Duration) -> RepoRead {
@@ -597,7 +601,7 @@ fn probe_reads(dir: &Path, reads: &Reads<'_>) -> Option<RepoWork> {
     Some(work)
 }
 
-/// Probe repository hygiene and drift from `origin/main` (or local `main`) at `dir`.
+/// Probe repository hygiene and drift from the main branch ([`RepoHygiene::main_ref`]) at `dir`.
 #[must_use]
 pub fn probe_hygiene(dir: &Path, home: Option<&Path>, limit: Duration) -> Option<RepoHygiene> {
     let home = home?;
@@ -858,7 +862,8 @@ fn bounded_dir_bytes(
     total
 }
 
-/// THE WORK'S STATE ([`RepoWork::state`]) of the repository at `root`.
+/// The work's state ([`RepoWork::state`]) of the repository at `root`: a hash of `head`, `stash`
+/// and each listed path's status, size and mtime; `None` past [`STATE_FILES`] paths.
 #[must_use]
 pub fn state_of(root: &Path, head: &str, stash: &str, listed: &str) -> Option<u64> {
     let mut text = format!("{head}\n{stash}\n");
@@ -891,7 +896,7 @@ pub fn state_of(root: &Path, head: &str, stash: &str, listed: &str) -> Option<u6
     Some(aterm_hash::fnv1a_64(text.as_bytes()))
 }
 
-/// THE STASH ENTRIES OF ONE BRANCH among `list`.
+/// The entries of `list` (`git stash list --format=%gs`) stashed on `branch`, one per line.
 #[must_use]
 pub fn stashes_on(list: &str, branch: Option<&str>) -> String {
     let name = branch.unwrap_or("(no branch)");

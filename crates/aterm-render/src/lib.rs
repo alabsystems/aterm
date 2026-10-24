@@ -64,13 +64,10 @@ mod colr;
 pub mod deco;
 mod emoji_cluster;
 pub mod fire_field;
-/// The face.
 pub mod font;
 pub mod font_catalog;
-/// The glyph-resolution chain as one pure, exhaustively verifiable policy.
 pub mod font_chain;
 pub mod font_file;
-/// The art registry and CPU painting for fx layers.
 pub mod fx;
 mod fx_damage;
 mod fx_raster;
@@ -89,7 +86,6 @@ pub mod ligature_shaping;
 pub mod procedural;
 /// The scanline signed-area coverage rasterizer every outline fill in this crate uses.
 pub mod raster;
-/// A rounded bar (body and antialiased caps) as fx items.
 pub mod rounded_bar;
 pub mod scroll_translate;
 pub mod spill;
@@ -489,9 +485,9 @@ pub enum FaceId {
     Primary,
     /// A real bold weight of the primary family injected by the host ([`Renderer::set_bold_font`]), for SGR-bold cells the primary covers.
     BoldPrimary,
-    /// The broad-coverage Unicode fallback face (cjk, symbols, math).
+    /// The broad-coverage Unicode fallback face (CJK, symbols, math).
     Fallback,
-    /// A monochrome symbol fallback (e.g. stix Two Math), after [`FaceId::Fallback`] and before [`FaceId::ColorEmoji`].
+    /// A monochrome symbol fallback (e.g. STIX Two Math), after [`FaceId::Fallback`] and before [`FaceId::ColorEmoji`].
     SymbolFallback,
     /// No font at all: box-drawing / block / braille coverage synthesized from the cell geometry by [`procedural`].
     Procedural,
@@ -820,7 +816,7 @@ pub const fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: 
     }
 }
 
-/// Fold a cell's absolute pixel-position parity into a procedural shade key (u+2591–2593).
+/// Fold a cell's absolute pixel-position parity into a procedural shade key (U+2591–2593).
 #[inline]
 #[must_use]
 pub const fn shade_phase_key(key: GlyphKey, cell_px_x: usize, cell_px_y: usize) -> GlyphKey {
@@ -1377,8 +1373,7 @@ pub struct Renderer {
     underline_skip_descenders: bool,
     undercurl_masks: UndercurlMaskCache,
     fx_scratch: fx_raster::FxScratch,
-    /// [`Self::set_legacy_sprites`]: the old sprite path, drawn where the
-    /// old composite drew it, as a differential oracle.
+    /// [`Self::set_legacy_sprites`]: the legacy sprite path, a differential test's oracle.
     #[cfg(any(test, debug_assertions))]
     legacy_sprites: Option<legacy_sprite_oracle::LegacySprites>,
     alpha_memo: Option<Box<AlphaMemoBank>>,
@@ -1527,7 +1522,7 @@ impl WindowCpu {
         self.presented_edge_rows = rows;
     }
 
-    /// Presenter scratch: store this redraw's fallback-parse-pending signal and return the previous one (see the field doc).
+    /// Presenter scratch: store this redraw's fallback-parse-pending signal and return the previous one.
     pub fn swap_fallback_pending(&mut self, pending: bool) -> bool {
         std::mem::replace(&mut self.fallback_pending_prev, pending)
     }
@@ -1832,7 +1827,7 @@ pub fn is_generic_monospace_family(family: &str) -> bool {
     )
 }
 
-/// The bundled last-resort monospace face (font-embed).
+/// The bundled last-resort monospace face.
 #[cfg(feature = "embedded-font")]
 pub fn embedded_font() -> &'static [u8] {
     include_bytes!("../assets/DejaVuSansMono.ttf")
@@ -1854,7 +1849,7 @@ pub struct DisplayFace {
 /// The virtual-family scheme for bundled display faces.
 pub const DISPLAY_FACE_SCHEME: &str = "display:";
 
-/// The bundled display faces (font-display), in display order.
+/// The bundled display faces, in display order.
 pub const DISPLAY_FACES: &[DisplayFace] = &[
     DisplayFace {
         id: "chunky",
@@ -1958,7 +1953,7 @@ pub fn display_mix_face_index(ch: char, total: usize) -> usize {
     ((ch as u32).wrapping_mul(2_654_435_761) >> 16) as usize % total
 }
 
-/// How a bundled display face is fitted into the terminal grid (font-display-fit).
+/// How a bundled display face is fitted into the terminal grid.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DisplayFaceFit {
     /// The face is proportional.
@@ -2035,7 +2030,7 @@ pub fn display_face_fit(bytes: &[u8]) -> Option<DisplayFaceFit> {
     })
 }
 
-/// The uniform scale a display face is drawn at in a `cell_w` x `cell_h` cell at `px` (font-display-fit).
+/// The uniform scale a display face is drawn at in a `cell_w` x `cell_h` cell at `px`.
 #[doc(hidden)]
 #[must_use]
 pub fn display_face_scale(fit: &DisplayFaceFit, px: f32, cell_w: usize, cell_h: usize) -> f32 {
@@ -2116,7 +2111,7 @@ struct DisplayLayerFace {
     fit: DisplayFaceFit,
 }
 
-/// The bundled Symbols Nerd Font (font-2b).
+/// The bundled Symbols Nerd Font.
 #[cfg(feature = "embedded-font")]
 pub fn embedded_symbols_font() -> &'static [u8] {
     include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf")
@@ -3277,12 +3272,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
         let workers: Vec<_> = paths[..speculative]
             .iter()
             .zip(&relocated)
-            .map(|(p, moved)| {
-                scope.spawn(move || {
-                    // Admitted straight into the store.
-                    admit_chain_face(p, moved.as_deref())
-                })
-            })
+            .map(|(p, moved)| scope.spawn(move || admit_chain_face(p, moved.as_deref())))
             .collect();
         workers
             .into_iter()
@@ -3293,7 +3283,6 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     let mut chain = Vec::new();
     for (i, (p, face)) in paths.iter().zip(parsed).enumerate() {
         let Some(face) = face else {
-            // Distinct branch.
             continue;
         };
         let keep_scanning = additive(i, p.as_str());
@@ -3760,23 +3749,23 @@ pub fn ct_padded_extent(ink: f64, pad: f64) -> usize {
     (ink + 2.0 * pad).ceil() as usize + 1
 }
 
-/// Cjk normalization clamp bounds.
+/// CJK normalization clamp bounds.
 pub const CJK_SCALE_MIN: f32 = 0.85;
 /// See [`CJK_SCALE_MIN`].
 pub const CJK_SCALE_MAX: f32 = 1.15;
-/// X-height normalization clamp bounds for non-cjk fallback faces.
+/// X-height normalization clamp bounds for non-CJK fallback faces.
 pub const XHEIGHT_SCALE_MIN: f32 = 0.75;
 /// See [`XHEIGHT_SCALE_MIN`].
 pub const XHEIGHT_SCALE_MAX: f32 = 1.25;
 
-/// The rasterization scale for a cjk fallback face.
+/// The rasterization scale for a CJK fallback face.
 #[inline]
 #[must_use]
 pub fn fallback_cjk_scale(cell2_px: f32, ideo_adv_px: f32) -> f32 {
     scale_clamped(cell2_px, ideo_adv_px, CJK_SCALE_MIN, CJK_SCALE_MAX)
 }
 
-/// The rasterization scale for a non-cjk fallback face.
+/// The rasterization scale for a non-CJK fallback face.
 #[inline]
 #[must_use]
 pub fn fallback_xheight_scale(primary_xh_px: f32, face_xh_px: f32) -> f32 {
@@ -3855,7 +3844,7 @@ pub fn fallback_fit_scale(
     fit_scale_about_advance_centre(box_w, box_h, width, height, xmin, advance, true)
 }
 
-/// How a fitted fallback raster is sized and anchored, by the code point's Unicode class ([`fallback_fit_class`]):.
+/// How a fitted fallback raster is sized and anchored, by the code point's Unicode class ([`fallback_fit_class`]).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FallbackFit {
@@ -5039,7 +5028,8 @@ pub enum FacePick {
     Styled { slot: usize, synthetic: StyleBits },
 }
 
-/// The styled-face resolution policy, extracted as a pure function of the requested style and the face-availability facts so it can be exhaustively verified independently of font i/o (see `crates/aterm-render/tests/styled_faces.rs`, which enumerates the complete 2^6 input space).
+/// The styled-face resolution policy, a pure function of the requested style and face availability
+/// so `crates/aterm-render/tests/styled_faces.rs` can enumerate all 2^6 inputs.
 #[inline]
 #[must_use]
 pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool; 3]) -> FacePick {
@@ -7196,7 +7186,7 @@ impl Renderer {
         }
         self.styled_loaded = true;
         let Some(primary) = self.primary_path.clone() else {
-            // Distinct branch.
+            // A byte-loaded or embedded primary has no sibling file to derive.
             return;
         };
         if bundled::is_bundled_id(&primary) {
@@ -7989,9 +7979,7 @@ impl Renderer {
     }
 
     fn apply_pending_styled_retires(&mut self) -> bool {
-        // Distinct branch.
         if self.styled_retire_pending.iter().all(Option::is_none) {
-            // Distinct branch.
             return false;
         }
         let mut retired = false;
@@ -8139,7 +8127,6 @@ impl Renderer {
 
     fn fill_styled_from_collection(&mut self, bytes: &std::sync::Arc<[u8]>, primary_index: u32) {
         let Some(n) = aterm_font::fonts_in_collection(bytes) else {
-            // Distinct branch.
             return;
         };
         let family = |face: &aterm_font::Face<'_>| {
@@ -8359,7 +8346,7 @@ impl Renderer {
         }
         let gid = face.glyph_index(ch)?.0;
         if gid == 0 {
-            // Distinct branch.
+            // Gid 0 is `.notdef`: the caller's plain raster draws it.
             return None;
         }
         variation::varied_glyph_raster_with_face(&face, gid, self.px)
@@ -8677,7 +8664,7 @@ impl Renderer {
         self.underline_skip_descenders
     }
 
-    /// Fetch (or rasterize and cache) the aa undercurl tile for the current base cell box and resolved underline band ([`deco::undercurl_coverage`]).
+    /// Fetch (or rasterize and cache) the antialiased undercurl tile for the current base cell box and resolved underline band ([`deco::undercurl_coverage`]).
     #[must_use]
     pub fn undercurl_mask(&self) -> std::sync::Arc<Vec<u8>> {
         let d = self.deco_metrics();
@@ -9115,7 +9102,7 @@ impl Renderer {
         vibrancy::effective_minimum_contrast(self.min_contrast, self.bg_opacity)
     }
 
-    /// Set the default-background opacity (0..=1, clamped; Ghostty's `background-opacity`, the M5 vibrancy knob).
+    /// Set the default-background opacity (0..=1, clamped; Ghostty's `background-opacity`).
     #[inline]
     pub fn set_background_opacity(&mut self, opacity: f32) {
         self.bg_opacity = if opacity.is_finite() {
@@ -9349,7 +9336,7 @@ impl Renderer {
         self.cursor_blink_phase
     }
 
-    /// Force the cursor to be drawn as `style` regardless of both the frame's host/effect override and the terminal's decscusr style (`None` restores their normal precedence).
+    /// Force the cursor to be drawn as `style` regardless of both the frame's host/effect override and the terminal's DECSCUSR style (`None` restores their normal precedence).
     #[inline]
     pub fn set_cursor_style_override(&mut self, style: Option<CursorStyle>) {
         self.cursor_style_override = style;
@@ -9693,7 +9680,7 @@ impl Renderer {
                 px_q: self.px_q,
             }
         } else if base.source == FaceId::Procedural || base.source == FaceId::ColorEmojiMono {
-            // Distinct branch.
+            // Cell-exact or an emoji silhouette: no styled variant.
             base
         } else if base.glyph_class == GlyphClass::MonoGid {
             GlyphKey::mono_char(base.source, ch, style, self.px_q)
@@ -9861,7 +9848,8 @@ impl Renderer {
         self.stem_gamma
     }
 
-    /// Set the native grid-fitting mode (config `font_hinting`, which the host passes here, the `stem_gamma` discipline).
+    /// Set the native grid-fitting mode (config `font_hinting`), returning whether it changed;
+    /// macOS has no hinted path and ignores it.
     pub fn set_font_hinting(&mut self, mode: &str) -> bool {
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
@@ -10101,10 +10089,8 @@ impl Renderer {
                             ))
                         })
                     });
-                    face.as_mut().and_then(|f| {
-                        // Shape with the configured merged-ligature admission.
-                        f.shape(run, run_chars, admit_collapsed, shaping_buffer)
-                    })
+                    face.as_mut()
+                        .and_then(|f| f.shape(run, run_chars, admit_collapsed, shaping_buffer))
                 } else {
                     let (slot, source) = match pick {
                         FacePick::Styled { slot, .. } => (slot, styled_bytes[slot]),
@@ -10316,7 +10302,7 @@ impl Renderer {
         self.cached_glyph(key).ink
     }
 
-    /// Pre-rasterize printable ASCII (u+0020..=u+007E), regular and bold, so the first frame's atlas build pulls warm `GlyphImage`s.
+    /// Pre-rasterize printable ASCII (U+0020..=U+007E), regular and bold, so the first frame's atlas build pulls warm `GlyphImage`s.
     pub fn prewarm_ascii(&mut self) {
         for ch in '\u{20}'..='\u{7E}' {
             let key = self.glyph_key(ch);
@@ -11880,27 +11866,18 @@ impl Renderer {
         }
     }
 
-    /// THE KNOCK-OUT: letters on a companion's body read against the page.
-    /// A body on a knock layer ([`aterm_core::render::FxLayer::knock`]: the pet, its departures,
-    /// the idle cat) is knocked out under every glyph that lies
-    /// on it: the glyph's coverage, dilated by one pixel
-    /// ([`KNOCK_DILATE_OFFSETS`]), is stamped in the colour the background
-    /// pass painted under the cell, over the body and before any trail
-    /// draws. The ink then reads against the page, ringed by a one-pixel
-    /// hairline of page, whatever the coat; where no body lies the stamp
-    /// lays the page on the page. It holds while the body is there and
-    /// never comes and goes: a flight keeps its whole silhouette from its
-    /// gather to its landing, a resting cat keeps its full body, and no
-    /// letter under either reads against fur (unstamped, the trail
-    /// gallery's `burst` measured 1.3 to 4.4:1 under a resting or flying
-    /// body). A cell the background pass left to a wallpaper has no page
-    /// colour here and keeps its body; the GPU builds the same stamps
-    /// (`aterm-gpu`'s glyph-knock stream). The stamp sets the page's colour
-    /// only: each pixel keeps the transmittance it had ([`knock_blend`]), so
-    /// on a translucent window the page round a glyph off the body stays
-    /// glass; a stamp in the opaque page would draw a solid glyph-shaped
-    /// outline round every letter the body's box touched, even under an
-    /// all-transparent body.
+    /// The knock-out: letters on a companion's body read against the page. Under every
+    /// glyph that lies on a body of a knock layer ([`aterm_core::render::FxLayer::knock`]:
+    /// the pet, its departures, the idle cat), the glyph's coverage dilated by two pixels
+    /// ([`KNOCK_DILATE_OFFSETS`]) is stamped over the body, before any trail draws, in the
+    /// colour the background pass painted under the cell; where no body lies, the stamp
+    /// lays the page on the page. The ink then reads against a ring of page whatever the
+    /// coat, for as long as the body is there. A cell the background pass left to a
+    /// wallpaper has no page colour here and keeps its body. The GPU builds the same
+    /// stamps (`aterm-gpu`'s glyph-knock stream). The stamp sets the page's colour
+    /// only: each pixel keeps its transmittance ([`knock_blend`]), since a stamp in the
+    /// opaque page would outline every letter the body's box touched on a translucent
+    /// window, even under an all-transparent body.
     #[allow(clippy::too_many_arguments)]
     fn knock_out_under_text<I>(
         &mut self,
@@ -13412,7 +13389,6 @@ impl Renderer {
                 for y in y0..(y0 + q.h as usize).min(h) {
                     let ny = halo_row_ny(y as i32 - cy, ry2);
                     if ny >= 256 {
-                        // Distinct branch.
                         continue;
                     }
                     let span = ((((256 - ny) * rx2) >> 8) as u32).isqrt() as i32 + 1;
@@ -14255,7 +14231,7 @@ pub const fn fire_halo_alpha(strength: u8) -> u8 {
     (floor + strength as u32 * span / 255) as u8
 }
 
-/// The device-px dilation offsets.
+/// The device-px offsets a fire contrast halo stamps its glyph at ([`HALO_IN_FIRE_RGB`]).
 pub const HALO_DILATE_OFFSETS: [(i32, i32); 14] = [
     (-1, -1),
     (0, -1),
@@ -14280,9 +14256,8 @@ const KNOCK_SCRATCH_RESIDENT: usize = 8;
 /// The knock-out's dilation ([`Renderer::knock_out_under_text`]): the
 /// glyph's coverage stamped at every offset within two pixels (a disc, the
 /// corners off). An anti-aliased edge pixel stamps only its own share of
-/// page, so one pixel of dilation left a fur-and-page blend round every
-/// soft edge; two put a whole pixel of page beyond the ink's last soft
-/// pixel.
+/// page, so it takes two pixels to put a whole pixel of page beyond the
+/// ink's last soft pixel.
 pub const KNOCK_DILATE_OFFSETS: [(i32, i32); 21] = [
     (0, 0),
     (-1, -1),
@@ -14557,7 +14532,7 @@ pub const fn cursor_shown(style: CursorStyle, blink_phase: bool) -> bool {
     }
 }
 
-/// The pixel rects (`[x, y, w, h]`) a cursor of `style` paints in the cursor colour for the cell at `(x0, y0)` of size `cell_w` x `cell_h`:.
+/// Visit the pixel rects (`[x, y, w, h]`) a cursor of `style` paints in the cursor colour for the cell at `(x0, y0)` of size `cell_w` x `cell_h`.
 pub fn for_each_cursor_rect(
     style: CursorStyle,
     x0: usize,
@@ -14907,7 +14882,7 @@ fn row_glyph_ink_may_differ(
         || prev.chrome_raster(r) != cur.chrome_raster(r)
 }
 
-/// Whether the two snapshots' d-2 per-row revision lanes may be compared to decide the cell half of the row diff (`row_cells_differ`).
+/// Whether the two snapshots' per-row revision lanes may be compared to decide the cell half of the row diff (`row_cells_differ`).
 #[inline]
 #[must_use]
 pub fn row_revisions_comparable(prev_input: &RenderInput, input: &RenderInput) -> bool {
@@ -15292,7 +15267,7 @@ fn mark_selection_row(dirty: &mut [bool], r: usize) {
 /// The verdict of [`compute_dirty_rows`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirtyDecision {
-    /// Not reusable: geometry, scrollback or live default bg changed, or either frame has a double-height row (a decdhl glyph spans two bands).
+    /// Not reusable: geometry, scrollback or live default bg changed, or either frame has a double-height row (a DECDHL glyph spans two bands).
     FullRepaint,
     /// Reusable.
     Rows(DirtyRows),
@@ -15313,7 +15288,7 @@ pub struct DirtyRows {
     pub glow_halo_changed: bool,
     /// Whether the under-glyph light (`glow_under`) changed.
     pub glow_under_changed: bool,
-    /// Whether the fire field (`fire_patch`) changed (phase B3b, like `glow_under`).
+    /// Whether the fire field (`fire_patch`) changed.
     pub fire_patch_changed: bool,
     /// Whether the comet trail (`cursor_trail` / `cursor_trail_color`) changed.
     pub trail_changed: bool,
@@ -15739,7 +15714,7 @@ pub fn scroll_shift_plan(
     for (r, row_dirty) in dirty.iter_mut().enumerate() {
         let src = r as i64 + i64::from(da);
         if !(0..rows as i64).contains(&src) {
-            // Distinct branch.
+            // No in-range source: the row is newly exposed.
             *row_dirty = true;
         } else if retained == RetainedRows::Diff
             && (row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
@@ -16848,7 +16823,7 @@ fn apply_synthetic_style(
     (w, bytes)
 }
 
-/// SRGB eotf — gamma-encoded channel (0..1) → linear-light (0..1), the proper piecewise curve (not a bare `pow(2.2)`, which is visibly wrong near black where terminal text edges live).
+/// sRGB EOTF — gamma-encoded channel (0..1) → linear-light (0..1), the proper piecewise curve (not a bare `pow(2.2)`, which is visibly wrong near black where terminal text edges live).
 #[inline]
 #[must_use]
 pub fn srgb_to_linear(c: f32) -> f32 {
@@ -16859,7 +16834,7 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Inverse sRGB oetf.
+/// Inverse sRGB OETF.
 #[inline]
 #[must_use]
 pub fn linear_to_srgb(l: f32) -> f32 {
@@ -16930,7 +16905,7 @@ pub fn correct_alpha(fg_l: f32, bg_l: f32, a: f32) -> f32 {
     ((blend_l - bg_l) / (fg_l - bg_l)).clamp(0.0, 1.0)
 }
 
-/// Relative luminance (bt.709, the WCAG luminance the contrast floors compare) of a packed `0x00RRGGBB` sRGB pixel, via the per-byte LUT.
+/// Relative luminance (BT.709, the WCAG luminance the contrast floors compare) of a packed `0x00RRGGBB` sRGB pixel, via the per-byte LUT.
 #[inline]
 #[must_use]
 pub fn linear_luminance(rgb: u32) -> f32 {
@@ -17897,7 +17872,6 @@ fn emit_aa_slab(
         slab(il, 1, cs as f32 - lo);
     }
     if ce > cs {
-        // Distinct branch.
         slab(cs, ce - cs, 1.0);
     }
     slab(ce, 1, hi - ce as f32);
@@ -23632,10 +23606,10 @@ mod tests {
                 push_u16(
                     &mut subtable,
                     if two_byte_key && high_byte == 0x23 {
-                        // Distinct branch.
+                        // Subheader 1 (a subHeaderKeys entry is the index × 8).
                         8
                     } else {
-                        // Distinct branch.
+                        // Subheader 0.
                         0
                     },
                 );
@@ -24387,9 +24361,7 @@ mod tests {
         let mut r = Renderer::from_bytes(bytes, 16.0, Theme::default()).expect("renderer");
         let (mut covered, mut cmap_divergences) = (0u64, 0u64);
         for cp in 0u32..=0x10_FFFF {
-            // Distinct branch.
             if (0xD800..=0xDFFF).contains(&cp) {
-                // Distinct branch.
                 continue;
             }
             let c = char::from_u32(cp).expect("non-surrogate is a scalar");
@@ -24488,7 +24460,6 @@ mod tests {
                 }
             }
             if diverged.is_empty() {
-                // Distinct branch.
                 continue;
             }
             demonstrated = true;
@@ -25828,7 +25799,6 @@ mod tests {
                 let key = r.glyph_key(ch);
                 let img = r.glyph_image(key);
                 let Some((top, bottom)) = ink_cell_rows(img, baseline) else {
-                    // Distinct branch.
                     continue;
                 };
                 assert!(
@@ -25838,7 +25808,6 @@ mod tests {
                      {baseline}) — so the band clip erases the character"
                 );
                 if top < baseline.min(floor) || bottom - top > floor {
-                    // Distinct branch.
                     continue;
                 }
                 seated_cases += 1;
@@ -26766,7 +26735,10 @@ mod tests {
         }
     }
 
-    /// The drawn glass marks read as one set with the default face's own: the ring family as its `●`, and `⤓` within a row of the face's own `⤓` where it has one (Iosevka, Windows' default), else of its `↓` (SF Mono has no `⤓`). `⤓` is drawn at the capitals' height on the baseline, which hinting snaps with the digits beside it (`⤓18:00`) and not with the arrows: Iosevka Term Semibold at 12 px under Windows' hinting sets its capitals, digits and `⤓`'s top on the same rows, and its `↓` two rows taller (a row over the capitals, a row under the baseline).
+    /// The drawn glass marks read as one set with the default face's own: the ring family matches
+    /// its `●`, and `⤓` lies within a row of the face's own `⤓` where it has one (Iosevka), else of
+    /// its `↓` (SF Mono has no `⤓`). `⤓` stands on the baseline at the capitals' height, which
+    /// hinting snaps with the digits beside it (`⤓18:00`), not with the arrows.
     #[test]
     fn the_glass_marks_read_as_one_set_at_1x_and_2x() {
         let ink_box = |w: usize, bytes: &[u8]| {
@@ -30446,7 +30418,6 @@ mod subpixel_seat_tests {
         let mut renderer =
             crate::Renderer::from_system(15.0, crate::Theme::default()).expect(crate::NO_FONT);
         if !renderer.set_font_subpixel("rgb") {
-            // Distinct branch.
             return;
         }
         let mut input = crate::RenderInput::empty();

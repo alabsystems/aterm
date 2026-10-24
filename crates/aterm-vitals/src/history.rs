@@ -41,7 +41,8 @@ pub struct VolumeId {
     pub total: u64,
 }
 
-/// One kept free-history bucket: its start (unix ms), the least free bytes read in it, and how many readings.
+/// One kept free-history bucket: its start (unix ms), the least free bytes read in it, and how
+/// many readings.
 pub type FreeRow = (i64, u64, u32);
 
 /// A free history as the host writes it ([`FreeHistory::saved`]).
@@ -74,7 +75,8 @@ impl FreeHistory {
         Self::default()
     }
 
-    /// Record `free` bytes of the volume mounted at `mount`, `total` bytes in size, read at `at_unix_ms`.
+    /// Record `free` bytes of the volume mounted at `mount`, `total` bytes in size, read at
+    /// `at_unix_ms`.
     ///
     /// A volume at another mount point starts the history afresh. A history restored from an
     /// earlier run ([`Self::restored`]) is also started afresh by the same mount point at
@@ -263,7 +265,8 @@ pub fn rates(ring: &BucketRing) -> Rates {
     }
 }
 
-/// Seconds until `free` bytes run out at `rate60`.
+/// Seconds until `free` bytes run out at `rate60`; `None` without a positive rate, before the
+/// disk has been filling for [`FILLING_FOR_MS`], or at [`TTF_MAX_S`] and beyond.
 #[must_use]
 pub fn time_to_full(free: u64, rate60: Option<f64>, filling_for_ms: i64) -> Option<f64> {
     let rate = rate60.filter(|r| *r > 0.0)?;

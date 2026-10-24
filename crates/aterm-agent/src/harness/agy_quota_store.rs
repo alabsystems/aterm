@@ -555,9 +555,10 @@ pub struct LaunchPick {
     pub got: Got,
 }
 
-/// Choose the model an agy launch runs ([`agy_quota::pick`]) for `asked` (a `model=`), or agy's
-/// default when `None`, from `store`'s current reading. `None` when rotation is off, or no
-/// reading or default model could be had: the launch then runs as asked.
+/// Chooses the model an agy launch runs ([`agy_quota::pick`]) for `asked` (a `model=`), or agy's
+/// default when `None`, from `store`'s current reading. `None` when rotation is off, no reading
+/// or default model could be had, or the only reading is stale past a refill: the launch then
+/// runs as asked.
 #[must_use]
 pub fn rotate_launch(
     asked: Option<&str>,
@@ -570,8 +571,8 @@ pub fn rotate_launch(
         return None;
     }
     let (reading, got) = current(store, source, now, rotation.low, false).ok()?;
-    // Keep the prior window visible, but an unsuccessful refresh after its refill cannot
-    // establish availability for a launch or keep it waiting on a reset that already passed.
+    // A stale reading past its refill can neither show what is available now nor hold the
+    // launch for a reset that already passed.
     if got == Got::Stale && reading.refill_passed(now) {
         return None;
     }

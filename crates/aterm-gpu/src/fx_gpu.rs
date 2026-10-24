@@ -48,7 +48,8 @@ pub(crate) const FX_TEXELS_SHIFT: u32 = 3;
 /// `flags` bits 8-15.
 pub(crate) const FX_REACH_SHIFT: u32 = 8;
 
-/// The atlas's first side, and its cap (also clamped to the device's 2-D texture limit, [`GpuRenderer::fx_atlas_cap`]).
+/// The atlas's first side, and its cap (also clamped to the device's 2-D texture limit,
+/// [`GpuRenderer::fx_atlas_cap`]).
 pub(crate) const FX_ATLAS_MIN: u32 = 512;
 pub(crate) const FX_ATLAS_CAP: u32 = 4096;
 
@@ -71,7 +72,8 @@ pub(crate) enum FxStream {
 pub(crate) const FX_STREAM_COUNT: usize = FxStream::LinearOver as usize + 1;
 
 impl FxStream {
-    /// The stream a layer draws into, or `None` for the one placement the engine refuses (a Linear layer at Glow: the CPU draws it nowhere).
+    /// The stream a layer draws into, or `None` for the one placement the engine refuses (a
+    /// Linear layer at Glow: the CPU draws it nowhere).
     #[inline]
     pub(crate) const fn of(slot: FxSlot, blend: FxBlend) -> Option<Self> {
         match (slot, blend) {
@@ -92,7 +94,8 @@ pub(crate) const fn palette_word(ink: FxInk) -> u32 {
     ((c >> 16) & 0xff) | (((c >> 8) & 0xff) << 8) | ((c & 0xff) << 16) | ((ink.alpha as u32) << 24)
 }
 
-/// Palette entries per row of the GL arm's palette texture (`cell.glsl` fetches entry `j` at `(j % 1024, j / 1024)`).
+/// Palette entries per row of the GL arm's palette texture (`cell.glsl` fetches entry `j`
+/// at `(j % 1024, j / 1024)`).
 #[cfg(gl_arm)]
 pub(crate) const FX_PALETTE_ROW: u32 = 1024;
 
@@ -178,8 +181,8 @@ impl ShelfPack {
         }
     }
 
-    /// Place a `w × h` region: on the lowest shelf tall enough with room (in
-    /// its leftmost free span wide enough), else on a new shelf, else `None`.
+    /// Place a `w × h` region: on the shortest shelf tall enough with room (in its leftmost
+    /// free span wide enough), else on a new shelf, else `None`.
     fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         let side = self.side;
         let mut best: Option<(usize, usize)> = None;
@@ -259,17 +262,14 @@ struct Resident {
 
 /// One of the two fx atlases, CPU side: an LRU residency over one texture.
 ///
-/// An art the frame draws (or prefetches) and that is not resident takes a
-/// free region; when none is free, the least recently used run of arts no
-/// admission of this frame asked for that frees a region whole gives theirs
-/// back (eviction, [`FxAtlasSide::victims`]); when no run can make room, a
-/// new generation is minted holding the frame's arts (compaction). Every region
-/// write gets the next sequence number, and an arm's texture brings itself
-/// up to date by uploading the resident arts written after its last sync
-/// ([`sync_fx_tex`]): resident regions are disjoint, so the order of those
-/// uploads cannot matter, and an evicted region is never read again before
-/// a write puts a resident art there. A write into a region a frame in
-/// flight may read waits for those frames on Metal (`before_write`).
+/// An art the frame draws or prefetches that is not resident takes a free region; failing
+/// that, the least recently used run of arts this frame did not ask for gives its regions
+/// back ([`FxAtlasSide::victims`]); failing that, a new generation is minted holding the
+/// frame's arts. Each region write takes the next sequence number, and an arm's texture
+/// syncs by uploading the resident arts written since its last sync ([`sync_fx_tex`]):
+/// resident regions are disjoint, so upload order cannot matter, and an evicted region is
+/// not read until a write puts a resident art there. On Metal, a write into a region a frame
+/// in flight may read waits for those frames (`before_write`).
 #[derive(Debug)]
 pub(crate) struct FxAtlasSide {
     kind: FxAtlasKind,
@@ -429,15 +429,13 @@ impl FxAtlasSide {
         }
     }
 
-    /// The arts whose eviction makes room for a `w × h` region, chosen
-    /// among the runs that free it whole: a run of neighbouring columns on a
-    /// shelf at least `h` tall, at least `w` wide, or the shelves from one to
-    /// the bottom, whose giving back leaves `h` rows under the last kept one.
-    /// A run may hold only arts no admission of this frame asked for. Of
-    /// those runs, the one whose most recently used art is least recently
-    /// used (LRU: no art goes while an older one would do), then the fewest
-    /// arts, then the shortest shelf, then the oldest writes. `None` when no
-    /// run frees the room (the caller mints).
+    /// The arts whose eviction makes room for a `w × h` region, chosen among the runs that
+    /// free it whole: neighbouring columns at least `w` wide on a shelf at least `h` tall, or
+    /// the shelves from one to the bottom when giving them back leaves `h` rows under the
+    /// last kept one. A run holds only arts no admission of this frame asked for. The pick is
+    /// the run whose newest use is oldest (no art goes while an older one would do), then the
+    /// fewest arts, the shortest shelf, the oldest writes. `None` when no run frees the room
+    /// (the caller mints).
     fn victims(&self, w: u32, h: u32) -> Option<Vec<u128>> {
         /// A shelf's columns: a free span or a resident's region.
         struct Seg {
@@ -665,7 +663,8 @@ pub(crate) struct FxGpu {
 }
 
 impl FxGpu {
-    /// Make every art this frame's layers draw, and every prefetched art, resident in the CPU atlases.
+    /// Make every art this frame's layers draw, and every prefetched art, resident in the
+    /// CPU atlases.
     pub(crate) fn admit(&mut self, layers: &[FxLayer], prefetch: &[Arc<FxArt>], cap: u32) {
         self.slicer.rule(layers);
         let epoch = self.slicer.budget().epoch();
@@ -713,7 +712,8 @@ impl FxGpu {
                 .all(|(m, p)| Arc::ptr_eq(m, p))
     }
 
-    /// Build this frame's fx instances into `out` (one vector per [`FxStream`], cleared first) and its palette, slicing every layer under `band_open`.
+    /// Build this frame's fx instances into `out` (one vector per [`FxStream`], cleared
+    /// first) and its palette, slicing every layer under `band_open`.
     pub(crate) fn build(
         &mut self,
         f: &FxFrame,
@@ -763,7 +763,8 @@ impl FxGpu {
         aterm_render::knock_rects(f, layers, occluders, &mut self.slicer, out);
     }
 
-    /// Append this frame's `bloom` layers to `cursor_glow_add`, or return `None` when no layer blooms.
+    /// The bloom source: `cursor_glow_add` and then this frame's `bloom` layers' quads, or
+    /// `None` when no layer blooms.
     pub(crate) fn bloom_source<'s>(
         &'s mut self,
         f: &FxFrame,
@@ -792,7 +793,8 @@ pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
     !input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom)
 }
 
-/// Whether the present's crown (the HDR or SDR aurora boost over the bloom source) has light to read.
+/// Whether the present's crown (the HDR or SDR aurora boost over the bloom source) has
+/// light to read.
 #[inline]
 pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
     input
@@ -1215,10 +1217,9 @@ mod tests {
         [sprite_layer(arts), knock, bloom]
     }
 
-    /// ONE RULING A FRAME: every reader of a frame's layers (the knock-out,
-    /// the atlas admission, the instances' slice, the bloom source) reads one
-    /// frame art budget, ruled once when the frame's layers change, by
-    /// whichever reads first, and not at all while they stand.
+    /// Every reader of a frame's layers (the knock-out, the atlas admission, the slice, the
+    /// bloom source) reads one frame art budget, ruled by whichever reads first when the
+    /// layers change and not at all while they stand.
     #[test]
     fn a_frame_rules_its_art_budget_once() {
         struct Rig {
@@ -1300,11 +1301,9 @@ mod tests {
         );
     }
 
-    /// THE FRAME BUDGET FITS THE ATLAS: at the cap, every frame whose drawn
-    /// arts keep the budget's law (each side at most half the cap, at most a
-    /// quarter of the cap's area in all) is wholly resident after admission,
-    /// in disjoint regions, whatever the generation held before and whatever
-    /// the prefetch asks beside it.
+    /// At the cap, every frame whose drawn arts keep the budget's law (each side at most half
+    /// the cap, at most a quarter of the cap's area in all) is wholly resident after admission,
+    /// in disjoint regions, whatever the generation held before and the prefetch asks beside it.
     #[test]
     fn every_frame_within_the_art_budget_is_resident() {
         let mut rng = 0x2545_f491_4f6c_dd1du64;
@@ -1428,12 +1427,8 @@ mod tests {
         Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, data).expect("sized"))
     }
 
-    /// BAKED TILES LIVE BY LRU: a companion that bakes two new tiles a frame
-    /// and holds one tile all along runs through a full atlas without a mint:
-    /// each new tile takes the region of the least recently used one, the
-    /// held tile and the frame's own tiles are never evicted, the resident
-    /// set is always the newest tiles, and an arm's sync uploads only the
-    /// tiles written since it last synced.
+    /// An eviction gives back the one run of neighbours whose newest use is oldest, where plain
+    /// LRU would give back more arts, and an art taller than every shelf takes the bottom shelf.
     #[test]
     fn an_eviction_gives_back_one_run_not_the_cache() {
         // A 512 square of 100 × 100 tiles: five shelves of five, the first
@@ -1490,6 +1485,10 @@ mod tests {
         assert_eq!(side.len(), 25 - 2 + 1 - 5 + 1);
     }
 
+    /// Baked tiles live by LRU: a companion that bakes two new tiles a frame and holds one
+    /// runs through a full atlas without a mint, never evicting the held tile or a frame's own
+    /// tiles, keeping the newest resident, and an arm's sync uploads only the tiles written
+    /// since it last synced.
     #[test]
     fn baked_tiles_cycle_through_a_full_atlas_by_lru() {
         let mut side = FxAtlasSide::new(FxAtlasKind::Rgba);

@@ -975,19 +975,56 @@ fn is_supported_auth_url(url: &str) -> bool {
             || url.starts_with("http://localhost:"))
 }
 
-fn contains_matching_email(text: &str, target: &str) -> bool {
-    text.split(|c: char| {
+#[derive(Clone, Copy)]
+enum EmailText {
+    Recipient,
+    Body,
+}
+
+fn email_tokens(text: &str, kind: EmailText) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    let mut escaped = false;
+    text.split(move |c: char| {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+            return false;
+        }
+        if c == '"' {
+            quoted = true;
+            return false;
+        }
         c.is_whitespace()
-            || matches!(
-                c,
-                '<' | '>' | ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | ':'
-            )
+            || c.is_control()
+            || matches!(c, '<' | '>' | ',' | ';' | '(' | ')' | '[' | ']' | ':')
+            || (matches!(kind, EmailText::Body)
+                && matches!(
+                    c,
+                    '（' | '）'
+                        | '，'
+                        | '；'
+                        | '：'
+                        | '【'
+                        | '】'
+                        | '「'
+                        | '」'
+                        | '《'
+                        | '》'
+                        | '。'
+                        | '、'
+                ))
     })
-    .filter(|tok| tok.contains('@'))
-    .any(|tok| {
-        let cleaned = tok.trim_matches('.');
-        super::accounts::email_matches(cleaned, target)
-    })
+    .map(|tok| tok.trim_end_matches('.'))
+    .filter(|tok| tok.contains('@') && !tok.contains(['"', '\\']))
+}
+
+fn contains_matching_email(text: &str, target: &str, kind: EmailText) -> bool {
+    email_tokens(text, kind).any(|cleaned| super::accounts::email_matches(cleaned, target))
 }
 
 fn same_base_mailbox_different_tag(addr: &str, target: &str) -> bool {
@@ -1006,17 +1043,25 @@ fn same_base_mailbox_different_tag(addr: &str, target: &str) -> bool {
 }
 
 fn contains_conflicting_plus_sibling(text: &str, target: &str) -> bool {
-    text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '<' | '>' | ',' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | ':'
-            )
+    email_tokens(text, EmailText::Recipient)
+        .any(|cleaned| same_base_mailbox_different_tag(cleaned, target))
+}
+
+fn contains_conflicting_tagged_plus_sibling(text: &str, target: &str, kind: EmailText) -> bool {
+    email_tokens(text, kind).any(|cleaned| {
+        cleaned
+            .split_once('@')
+            .is_some_and(|(local, _)| local.contains('+'))
+            && same_base_mailbox_different_tag(cleaned, target)
     })
-    .filter(|tok| tok.contains('@'))
-    .any(|tok| {
-        let cleaned = tok.trim_matches('.');
-        same_base_mailbox_different_tag(cleaned, target)
+}
+
+fn contains_untagged_base_mailbox_of(text: &str, target: &str) -> bool {
+    email_tokens(text, EmailText::Recipient).any(|cleaned| {
+        cleaned
+            .split_once('@')
+            .is_some_and(|(local, _)| !local.contains('+'))
+            && same_base_mailbox_different_tag(cleaned, target)
     })
 }
 
@@ -1112,7 +1157,9 @@ fn json_value_any_email(val: &Value, pred: &dyn Fn(&str) -> bool) -> bool {
 }
 
 fn json_value_matches_email(val: &Value, target: &str) -> bool {
-    json_value_any_email(val, &|s| contains_matching_email(s, target))
+    json_value_any_email(val, &|s| {
+        contains_matching_email(s, target, EmailText::Recipient)
+    })
 }
 
 fn json_value_contains_conflicting_plus_sibling(val: &Value, target: &str) -> bool {
@@ -1296,25 +1343,69 @@ pub(super) fn check_json_recipients(
     )
 }
 
+fn decoded_email_body_for_recipient_check(raw_email: &str) -> String {
+    let body_section = split_header_body(raw_email).map_or(raw_email, |(_, b)| b);
+    let mut parts = decode_mime_base64_parts(raw_email);
+    if !parts.is_empty() {
+        parts = decode_rfc2047_words(&decode_qp_mime_parts(&parts));
+    }
+    let main_decoded = if is_top_level_base64_email(raw_email) {
+        decode_base64_block(body_section.trim()).unwrap_or_default()
+    } else if is_quoted_printable_email(raw_email) {
+        decode_rfc2047_words(&decode_quoted_printable(body_section))
+    } else {
+        decode_rfc2047_words(&decode_qp_mime_parts(body_section))
+    };
+    let subj = extract_rfc5322_subject(raw_email).unwrap_or_default();
+    let srcdoc = extract_iframe_srcdoc_fragments(&format!("{main_decoded}\n{parts}"));
+    decode_html_amp(&format!(
+        "{body_section}\n{main_decoded}\n{parts}\n{subj}\n{srcdoc}"
+    ))
+}
+
 pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
     let target_trimmed = target.trim();
     if target_trimmed.is_empty() {
         return true;
     }
+    let target_has_plus = target_trimmed
+        .split_once('@')
+        .is_some_and(|(l, _)| l.contains('+'));
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email)
         && let Some(obj) = doc.as_object()
     {
-        let (saw_json_recipient, matched) = check_json_recipients(obj, target_trimmed, 0);
-        if matched {
+        let (saw_json_recipient, primary_matched, envelope_matched, conflicting_plus) =
+            check_json_recipients_inner(obj, target_trimmed, 0, false);
+        if primary_matched {
             return true;
+        }
+        let mut json_body = String::new();
+        extract_json_email_fields(&doc, &mut Vec::new(), &mut Vec::new(), &mut json_body);
+        let json_body = decode_html_amp(&json_body);
+        if envelope_matched && !conflicting_plus {
+            return !contains_conflicting_tagged_plus_sibling(
+                &json_body,
+                target_trimmed,
+                EmailText::Body,
+            ) || (target_has_plus
+                && contains_matching_email(&json_body, target_trimmed, EmailText::Body));
         }
         if saw_json_recipient {
             return false;
         }
+        return contains_matching_email(&json_body, target_trimmed, EmailText::Body)
+            && (target_has_plus
+                || !contains_conflicting_tagged_plus_sibling(
+                    &json_body,
+                    target_trimmed,
+                    EmailText::Body,
+                ));
     }
     let head = split_header_body(raw_email).map_or(raw_email, |(h, _)| h);
     let mut saw_recipient_header = false;
+    let mut saw_primary_recipient_header = false;
     let mut saw_envelope_match = false;
+    let mut saw_base_envelope_match = false;
     let mut saw_conflicting_plus_sibling = false;
     for line in unfold_rfc5322_headers(head) {
         if let Some((k, v)) = line.split_once(':') {
@@ -1325,30 +1416,72 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
                     saw_recipient_header = true;
                 }
                 if is_primary_recipient_key(&key) {
-                    if contains_matching_email(&decoded_v, target_trimmed) {
+                    if decoded_v.contains('@') {
+                        saw_primary_recipient_header = true;
+                    }
+                    if contains_matching_email(&decoded_v, target_trimmed, EmailText::Recipient) {
                         return true;
                     }
                     if contains_conflicting_plus_sibling(&decoded_v, target_trimmed) {
                         saw_conflicting_plus_sibling = true;
                     }
-                } else if contains_matching_email(&decoded_v, target_trimmed) {
+                } else if contains_matching_email(&decoded_v, target_trimmed, EmailText::Recipient)
+                {
                     saw_envelope_match = true;
+                } else if target_has_plus
+                    && contains_untagged_base_mailbox_of(&decoded_v, target_trimmed)
+                    && !contains_conflicting_tagged_plus_sibling(
+                        &decoded_v,
+                        target_trimmed,
+                        EmailText::Recipient,
+                    )
+                {
+                    saw_base_envelope_match = true;
                 }
             } else if key == "received" && v.to_ascii_lowercase().contains("for ") {
                 let decoded_v = decode_rfc2047_words(v);
-                if contains_matching_email(&decoded_v, target_trimmed) {
+                if contains_matching_email(&decoded_v, target_trimmed, EmailText::Recipient) {
                     saw_envelope_match = true;
+                } else if target_has_plus
+                    && contains_untagged_base_mailbox_of(&decoded_v, target_trimmed)
+                    && !contains_conflicting_tagged_plus_sibling(
+                        &decoded_v,
+                        target_trimmed,
+                        EmailText::Recipient,
+                    )
+                {
+                    saw_base_envelope_match = true;
                 }
             }
         }
     }
+    let decoded_body = decoded_email_body_for_recipient_check(raw_email);
     if saw_envelope_match && !saw_conflicting_plus_sibling {
-        return true;
+        return !contains_conflicting_tagged_plus_sibling(
+            &decoded_body,
+            target_trimmed,
+            EmailText::Body,
+        ) || (target_has_plus
+            && contains_matching_email(&decoded_body, target_trimmed, EmailText::Body));
+    }
+    if saw_base_envelope_match && !saw_primary_recipient_header && !saw_conflicting_plus_sibling {
+        return contains_matching_email(&decoded_body, target_trimmed, EmailText::Body)
+            && !contains_conflicting_tagged_plus_sibling(
+                &decoded_body,
+                target_trimmed,
+                EmailText::Body,
+            );
     }
     if saw_recipient_header {
         return false;
     }
-    contains_matching_email(raw_email, target_trimmed)
+    contains_matching_email(&decoded_body, target_trimmed, EmailText::Body)
+        && (target_has_plus
+            || !contains_conflicting_tagged_plus_sibling(
+                &decoded_body,
+                target_trimmed,
+                EmailText::Body,
+            ))
 }
 
 fn is_non_auth_link(url: &str) -> bool {
@@ -3012,6 +3145,7 @@ pub(super) fn loopback_http_exchange(
     let rest = url
         .strip_prefix("http://")
         .ok_or("loopback client takes http:// only")?;
+    let rest = rest.split('#').next().unwrap_or(rest);
     let (authority, tail) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
@@ -3021,12 +3155,17 @@ pub(super) fn loopback_http_exchange(
     } else {
         format!("/{tail}")
     };
-    let (_, port_str) = authority
+    let (host, port_str) = authority
         .rsplit_once(':')
         .ok_or("loopback URL is missing a port")?;
+    if !matches!(host, "127.0.0.1" | "localhost") {
+        return Err("loopback URL authority is not localhost or 127.0.0.1");
+    }
     let port: u16 = port_str
         .parse()
-        .map_err(|_| "loopback URL port is invalid")?;
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or("loopback URL port is invalid")?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|_| "could not connect to local OAuth / callback server")?;
@@ -3295,6 +3434,7 @@ enum Origin {
 /// request can leave the provider origin.
 pub(super) struct MailboxFlow {
     origin: Origin,
+    bound: super::headless_oauth::FlowBound,
     callback_port: u16,
     callback_path: String,
     state: String,
@@ -3319,6 +3459,8 @@ impl MailboxFlow {
             Pin::Hosts(hosts) if hosted_url(authorize_url, hosts) => Origin::Hosts(hosts),
             Pin::Hosts(_) => return Err("this authorize origin needs the manual browser"),
         };
+        let bound = super::headless_oauth::FlowBound::of(authorize_url)
+            .map_err(|_| "the authorize URL has conflicting flow parameters")?;
         let callback = one_query_param(authorize_url, "redirect_uri")
             .ok_or("the authorize URL has no single local callback")?;
         let (port, path, query) =
@@ -3328,6 +3470,7 @@ impl MailboxFlow {
         }
         Ok(Self {
             origin,
+            bound,
             callback_port: port,
             callback_path: path.to_owned(),
             state: one_query_param(authorize_url, "state")
@@ -3336,10 +3479,21 @@ impl MailboxFlow {
     }
 
     pub(super) fn admits_provider_url(&self, url: &str) -> bool {
-        match self.origin {
-            Origin::Prefix(prefix) => url.starts_with(prefix) && provider_url(url),
-            Origin::Hosts(hosts) => hosted_url(url, hosts),
-        }
+        let hosts: &[&str] = match self.origin {
+            Origin::Prefix(prefix) => {
+                if !(url.starts_with(prefix) && provider_url(url)) {
+                    return false;
+                }
+                &["claude.ai", "claude.com"]
+            }
+            Origin::Hosts(hosts) => {
+                if !hosted_url(url, hosts) {
+                    return false;
+                }
+                hosts
+            }
+        };
+        self.bound.outside(url, hosts).is_none()
     }
 
     pub(super) fn is_callback(&self, url: &str) -> bool {
@@ -3348,6 +3502,7 @@ impl MailboxFlow {
                 && path == self.callback_path
                 && one_query_param(url, "state").as_deref() == Some(self.state.as_str())
                 && one_query_param(url, "code").is_some()
+                && super::headless_oauth::query_values(url, "error").is_empty()
         })
     }
 }

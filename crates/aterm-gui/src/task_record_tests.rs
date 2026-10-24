@@ -788,10 +788,9 @@ fn a_result_path_is_judged_lexically() {
     assert_eq!(result_path(&native("/nonexistent/tasksx/b.txt"), dir), None);
 }
 
-/// A WINDOWS STATE DIR: a result under `%LOCALAPPDATA%\aterm\tasks` is
-/// judged under it, a space travelling pct-encoded, and kept as spelled; so
-/// is one under a state root spelled with `/` (`ATERM_STATE_HOME=C:/…`),
-/// which `tasks\<file>` joins with `\`.
+/// A result under `%LOCALAPPDATA%\aterm\tasks` is judged under it, a space travelling
+/// pct-encoded, and kept as spelled; so is one under a state root spelled with `/`
+/// (`ATERM_STATE_HOME=C:/…`), which `tasks\<file>` joins with `\`.
 #[cfg(windows)]
 #[test]
 fn a_windows_result_path_is_judged_under_its_state_dir() {
@@ -1238,9 +1237,9 @@ fn hold_room(n: usize) -> Option<FactWord> {
     Some(FactWord::new(RuleId::HoldRoom, n).expect("a nonzero ordinal"))
 }
 
-/// THE FACT WORD ON EVERY REPLY (the occupancy design's manager door): `task`, an `await task`
-/// row and the `EVENT … task` row read `fact=<word|-> fact_rev=<n>` once the word was first
-/// edited, and nothing before; the edit posts one task wake, and its outcome names what it did.
+/// `task`, an `await task` row and the `EVENT … task` row read `fact=<word|-> fact_rev=<n>`
+/// once the word was first edited, and nothing before; the edit posts one task wake, and its
+/// outcome names what it did.
 #[test]
 fn the_fact_word_round_trips_on_task_await_and_its_event() {
     let handle = crate::session_store::test_handle(11);
@@ -1345,12 +1344,9 @@ fn the_fact_word_round_trips_on_task_await_and_its_event() {
     );
 }
 
-/// The carry row holds the fact word and its `fact_rev=` (plan R1, and 2.4's safety review: a
-/// word the carry dropped was noted again by the successor's loop, moving `fact_rev` a second
-/// time for one episode): a successor reads both back, an older row with neither reads `None` and
-/// 0, a rev that is no number reads 0 rather than refusing the record, and a word reads only as
-/// the closed word, only past rev 0, never refusing the record. NEGATIVE CONTROL: a row carrying
-/// a key twice is refused, so the leniency is the fact keys' alone.
+/// The carry row holds the fact word and its `fact_rev=`, so a successor's note of the word it
+/// finds standing moves nothing. A missing or malformed fact key, or a word at rev 0, reads as
+/// no word or rev 0 rather than refusing the record; a key carried twice is refused.
 #[test]
 fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
     let t0 = Instant::now();
@@ -1566,9 +1562,9 @@ fn no_mark_moves_the_fact_and_the_fact_edit_moves_nothing_else() {
     );
 }
 
-/// S16c's regression: `result`'s repair CAS compares the `rev` it read, and a fact edit between
-/// the read and the repair moves no `rev`, so the repair still lands. NEGATIVE CONTROL:
-/// `NoteBumpsNews` (the edit moves `rev`) makes the CAS miss and the repair is lost.
+/// `result`'s repair CAS compares the `rev` it read, and a fact edit between the read and the
+/// repair moves no `rev`, so the repair still lands. The negative control: under
+/// `NoteBumpsNews` (the edit moves `rev`) the CAS misses and the repair is lost.
 #[test]
 fn the_repair_cas_still_matches_after_a_fact_edit() {
     use crate::occupancy_host::fault::{Fault, with};
@@ -1625,9 +1621,9 @@ fn the_repair_cas_still_matches_after_a_fact_edit() {
     );
 }
 
-/// THE PLANT TEST: what a worker can write onto its own session (its attention text, its
-/// title, description and role) never reaches `fact=`. Before any fact edit no `fact=` token stands on `task` or an
-/// `await task` row; after one, exactly one stands, and it is the closed word noted.
+/// What a worker can write onto its own session (its attention text, title, description and
+/// role) never reaches `fact=`: before any fact edit no `fact=` token stands on `task` or an
+/// `await task` row, and after one exactly one stands, the closed word noted.
 #[test]
 fn a_planted_attention_or_title_never_reaches_fact() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};

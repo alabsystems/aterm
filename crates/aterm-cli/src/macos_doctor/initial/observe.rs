@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The read-only pass behind System State's rows
-//! (`docs/DESIGN-system-state-2026-10-21.md` §3.5, §5): every local row, managed
-//! or not, read through the same items a run applies, in `Plan` mode, which
-//! writes nothing and raises no prompt. GitHub repositories, which reads the
-//! network and the keychain, is read only when the caller asks for it; the
-//! caller also leaves out the Messages and FaceTime rows unless that group is
-//! set up or the person pressed Check again, because they read the person's
-//! own account state.
-//!
-//! It never takes the profile lock or the setup slot, so it runs beside a pass;
-//! the caller drops a reading taken while that row's own stage ran.
+//! The read-only pass behind System State's rows (`docs/DESIGN-system-state-2026-10-21.md` §3.5,
+//! §5): every local row, managed or not, read through the same items a run applies, in `Plan`
+//! mode, which writes nothing and raises no prompt. It takes neither the profile lock nor the
+//! setup slot, so it runs beside a pass; the caller drops a reading taken while that row's own
+//! stage ran.
 
 use super::*;
 use aterm_machines::init::WorkstationGroup;
@@ -143,11 +137,8 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
     out
 }
 
-/// A row a run changed for macOS to take up at the next login reads ✓ "at login"
-/// while the value it wrote still reads in place, until this login session ends.
-/// Only an in-place reading is marked: a row that reads differently since (a
-/// Restore, a change by hand), or could not be read, says so; a guessed ✓ is
-/// never shown.
+/// A row a run changed for macOS to take up at the next login reads "at login" while the value
+/// it wrote still reads in place, until this login session ends; any other reading is kept.
 fn at_login(observation: Observation, held: bool) -> Observation {
     if !held || observation.standing != Standing::InPlace {
         return observation;
@@ -174,32 +165,26 @@ enum VaultRead {
         with_password: bool,
     },
     /// Asked to join, and the person turned sync off since
-    /// ([`aterm_secrets::service::subscriber_off_path`]): the subscriber that finishes an
-    /// approved join does not run, by their choice. It reads Sync off in place, as
-    /// [`Self::TurnedOff`] does, with what that means for the join and the row's quiet
-    /// Turn On Sync.
+    /// ([`aterm_secrets::service::subscriber_off_path`]), so the subscriber that finishes an
+    /// approved join does not run. It reads Sync off in place, as [`Self::TurnedOff`] does.
     PendingOff { code: Option<String> },
     /// A member whose subscriber runs; `synced` once every file is written.
     Member { synced: bool },
-    /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is
-    /// installed but has stayed down past launchd's restart window
-    /// (`aterm_secrets::service::RESTART_WINDOW`). Nothing starts it again by itself: the Secrets stage
-    /// installs it, so Set up now does.
+    /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is installed but
+    /// has stayed down past launchd's restart window. Nothing starts it again by itself: the
+    /// Secrets stage installs it, so Set up now does.
     Stopped,
-    /// A member with no subscriber installed and no record that the person turned
-    /// it off: a `join` or `create` that installed none, a hand that removed it, or
-    /// a join made from a copy of aterm that went away. The Secrets stage installs
-    /// it, so Set up now does.
+    /// A member with no subscriber installed and no record that the person turned it off. The
+    /// Secrets stage installs it, so Set up now does.
     NotSetUp,
     /// A member whose subscriber does not run because the person turned it off
     /// (`aterm_secrets::service::subscriber_off_path`: `aterm secrets agent off`, or
     /// a `join` or `create` with `--no-agent`): their choice, the row's wanted
     /// state (design §4), which setup leaves be.
     TurnedOff,
-    /// A member whose subscriber is not running and is never installed from here:
-    /// this aterm runs from a copy that goes away (a disk image, an App Translocation
-    /// copy), which a launchd job must not name (`aterm_secrets::service::transient`,
-    /// the Secrets stage's own rule). Only a person moves aterm.
+    /// A member whose subscriber is not running and is never installed from here: this aterm runs
+    /// from a copy that goes away (a disk image, an App Translocation copy), which a launchd job
+    /// must not name (`aterm_secrets::service::transient`). Only a person moves aterm.
     Fleeting,
     /// The vault dropped this Mac.
     Revoked,
@@ -219,11 +204,8 @@ enum Subscriber {
     TurnedOff,
 }
 
-/// A member's reading: whether every file is `written`, its `subscriber`, and
-/// `exe`, the program this aterm runs from (`None` when unknown). A subscriber
-/// that does not run is no sync to wait for: nothing starts it but the Secrets
-/// stage, which installs it unless the person turned it off or this aterm runs
-/// from a copy that goes away.
+/// A member's reading, from whether every file is `written`, its `subscriber`, and `exe` (the
+/// program this aterm runs from, `None` when unknown).
 fn member_read(written: bool, subscriber: Subscriber, exe: Option<&Path>) -> VaultRead {
     match subscriber {
         Subscriber::Running => VaultRead::Member { synced: written },
@@ -240,11 +222,9 @@ fn member_read(written: bool, subscriber: Subscriber, exe: Option<&Path>) -> Vau
 static SUBSCRIBER_DOWN_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
-/// This login's subscriber now. One read installed but not running may be
-/// launchd's gap between two runs of a job that ended (`KeepAlive`), so it is
-/// read again until it runs or has stayed down past launchd's restart window since it
-/// was first seen down; until then the row does not flip to a change to make.
-/// The first read that finds it down waits for that at most once.
+/// This login's subscriber now. One read installed but not running may be launchd's gap between
+/// two `KeepAlive` runs, so it is read again until it runs or stays down past
+/// `aterm_secrets::service::RESTART_WINDOW` since first seen down ([`SUBSCRIBER_DOWN_SINCE`]).
 fn subscriber_now(home: &Path) -> Result<Subscriber, String> {
     use aterm_secrets::service::{self, Job, State};
     let running = || -> Result<Option<bool>, String> {
@@ -343,9 +323,8 @@ const SYNCING: &str = "Waits for the vault to finish syncing this Mac";
 /// nothing restarts it by itself, and Set up now (the Secrets stage) starts it.
 const STOPPED: &str = "The sync is not running; Set up now starts it";
 
-/// The note of a member Mac with no subscriber installed and no record that the
-/// person turned it off: it never syncs by itself, whatever left it so, and Set up
-/// now (the Secrets stage) installs it. It names no command: several leave it so.
+/// The note of a member Mac with no subscriber installed and no record that the person turned
+/// it off. It names no command, since several leave it so.
 const NOT_SET_UP: &str = "Not set up to sync this Mac; Set up now installs it";
 
 /// The value of a member Mac whose subscriber the person turned off, which is
@@ -371,19 +350,15 @@ const FLEETING: &str = "Move aterm to Applications and open it from there";
 /// hold: an admin Mac approves it, and the subscriber finishes the join.
 const APPROVAL: &str = "Waits for an admin Mac to approve this Mac";
 
-/// What a pending join that went with a password adds: its proof matched nothing
-/// if the password was mistyped, and Join with the password typed again under the
-/// row's disclosure sends a new one. Said once, in the row's note, never as an alert.
+/// What a pending join sent with a password adds to its note: a mistyped password matches
+/// nothing, and Join with it retyped under the row's disclosure sends a new proof.
 const RETYPE: &str = "or retype the join password";
 
-/// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault,
-/// Out of sync, Not syncing, Not set up, or In sync, and Sync off, which the person
-/// chose and so reads in place. A member whose sync process does not run, not by
-/// the person's choice, differs (Set up now starts it), and only a managed row
-/// says so, since Set up now leaves a group left as is alone. `here` is what the last probe of the ALab vault heard
-/// when the plan names it ([`scope::VaultHere::note`]): a row not joined then waits
-/// with that note instead of asking again before the next launch. Every row that
-/// waits says what on (design §3.3).
+/// The Secrets vault row in §3.3's words: Not joined, Awaiting code, Other vault, Out of sync,
+/// Not syncing, Not set up, In sync, or Sync off (the person's choice, so in place). A stopped or
+/// uninstalled subscriber differs, with a note only on a managed row. `here` is the last ALab
+/// vault probe's note when the plan names that vault ([`scope::VaultHere::note`]): a managed row
+/// not joined waits with it until the next launch.
 fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Observation {
     let subject = Subject::Setting(Setting::Secrets);
     let person = if managed {
@@ -450,8 +425,7 @@ fn vault_observation(read: &VaultRead, managed: bool, here: Option<&str>) -> Obs
         VaultRead::Unconfigured | VaultRead::Revoked => (Standing::Differs, "Not joined", None),
         VaultRead::OtherVault => (Standing::Differs, "Other vault", None),
     };
-    // An opt-out reads in place at the person's value, which is the wanted one
-    // then, as a grant the person opted out of does (`access::honor_opt_out`).
+    // An opt-out is the row's wanted value, as for a grant (`access::honor_opt_out`).
     let wanted = if matches!(read, VaultRead::TurnedOff | VaultRead::PendingOff { .. }) {
         SYNC_OFF
     } else {
@@ -757,9 +731,7 @@ mod tests {
         out
     }
 
-    /// EVERY VAULT ROW THAT WAITS SAYS WHAT ON (design §3.3): a sync to finish, an
-    /// admin Mac's approval, or a vault this network did not answer for. The page
-    /// never shows a waiting row with nothing under it.
+    /// Every waiting vault row has a note that says what it waits on (§3.3).
     #[test]
     fn every_waiting_vault_row_says_what_it_waits_on() {
         let mut waiting = 0;
@@ -777,10 +749,8 @@ mod tests {
         assert!(waiting >= 4, "the waiting rows were read: {waiting}");
     }
 
-    /// A JOIN WAITING FOR AN ADMIN ON A MAC WHOSE SYNC THE PERSON TURNED OFF reads as
-    /// their choice, as a member's Sync off does: in place at Sync off, which is what the
-    /// row wants then (so the page offers Turn On Sync), with a note that says an
-    /// approval lands only once sync is on. It never asks for an approval it cannot use.
+    /// A pending join whose sync the person turned off reads Sync off in place, with a note that
+    /// an approval lands only once sync is on.
     #[test]
     fn a_pending_join_with_sync_off_reads_sync_off_and_says_what_that_means() {
         for (code, note) in [
@@ -801,12 +771,8 @@ mod tests {
         }
     }
 
-    /// AN ATERM RUN FROM A DISK IMAGE SAYS TO MOVE IT (the Secrets stage's
-    /// `fleeting_program_row`, in the row's words): a member whose subscriber is not
-    /// running, opened from a copy that goes away, needs the person (only they move
-    /// aterm), and its note, which the menu line carries too, says what to do. The same
-    /// member whose subscriber runs only waits for a sync; opened from Applications,
-    /// a subscriber that does not run is a change Set up now makes.
+    /// A member whose subscriber cannot run from a disk image needs the person to move aterm; a
+    /// running subscriber there only waits for the sync.
     #[test]
     fn a_vault_member_run_from_a_disk_image_says_to_move_aterm_to_applications() {
         let image = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
@@ -849,15 +815,8 @@ mod tests {
         );
     }
 
-    /// A SYNC THAT DOES NOT RUN IS A CHANGE, NOT A WAIT, UNLESS THE PERSON TURNED
-    /// IT OFF: nothing starts a member's stopped or never-installed subscriber by
-    /// itself, so the row differs, the headline counts it and Set up now, whose
-    /// Secrets stage installs the subscriber, starts it; a subscriber with no job
-    /// says it is not set up, naming no command (several leave it so). One the
-    /// person turned off (`aterm secrets agent off`, a `--no-agent` join or create)
-    /// is their choice: it reads Sync off in place, at the value it wants, so it is
-    /// no change to make. Only a running subscriber with files still to write waits
-    /// for the sync, and a group left as is gets no word of a change.
+    /// A stopped or never-installed subscriber is a change Set up now makes, not a wait; one the
+    /// person turned off reads Sync off in place, and an unmanaged group gets no note.
     #[test]
     fn a_vault_member_whose_sync_does_not_run_is_a_change_set_up_now_makes() {
         let installed = Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm"));
@@ -919,9 +878,7 @@ mod tests {
         }
     }
 
-    /// A MISTYPED JOIN PASSWORD HAS A WAY OUT, SAID ONCE (main's `RETYPE`): a pending
-    /// join that went with a password says the password can be typed again, beside the
-    /// approval code or the wait; one that went without says nothing of a password.
+    /// Only a pending join sent with a password offers to retype it, beside the code or the wait.
     #[test]
     fn a_pending_join_sent_with_a_password_says_it_can_be_retyped() {
         for (read, seen) in every_vault_observation() {

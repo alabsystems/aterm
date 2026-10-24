@@ -64,18 +64,21 @@ impl std::error::Error for StageError {}
 /// A stage's pre-swap hook: examines the verified `.incoming` tree.
 pub(crate) type PreSwapHook<'a> = &'a dyn Fn(&Path) -> Result<(), StageError>;
 
-/// A stage's sidecar hook: given the folded `tree_root`, the `(suffix, bytes)` sidecars to write beside the build.
+/// A stage's sidecar hook: the `(suffix, bytes)` sidecars to write beside the build, given
+/// the folded `tree_root`.
 pub(crate) type SidecarHook<'a> =
     &'a dyn Fn(&str) -> Result<Vec<(&'static str, Vec<u8>)>, StageError>;
 
 /// Caller steps inside [`verify_and_stage`].
 #[derive(Clone, Copy, Default)]
 pub struct StageHooks<'a> {
-    /// Run on the `.incoming` tree after the digest and `tree_root` checks and before anything flushes or publishes it.
+    /// Run on the `.incoming` tree after the digest and `tree_root` checks, before anything
+    /// flushes or publishes it.
     pub pre_swap: Option<PreSwapHook<'a>>,
     /// Asked once the tree is verified.
     pub sidecars: Option<SidecarHook<'a>>,
-    /// `(name, target)` tool names laid in the verified `.incoming` tree before [`Self::pre_swap`] sees it.
+    /// `(name, target)` tool names laid in the verified `.incoming` tree before
+    /// [`Self::pre_swap`] sees it.
     pub aliases: &'a [(&'a str, &'a str)],
 }
 
@@ -95,7 +98,7 @@ fn io_step(step: &str, e: std::io::Error) -> StageError {
     StageError::Io(std::io::Error::new(e.kind(), m))
 }
 
-/// The download-integrity gate: whether `file` holds the bytes `artifact`'s signed digest ([`Artifact::digest`]) names.
+/// The download-integrity gate: whether `file` holds the bytes `artifact`'s signed digest names.
 pub(crate) fn check_signed_digest(artifact: &Artifact, file: &Path) -> Result<(), StageError> {
     let (alg, expected) = artifact.digest().unwrap_or((DigestAlg::Sha256, ""));
     let got = crate::tree::file_digest(file, alg).map_err(|e| io_step("read the archive", e))?;
@@ -118,7 +121,7 @@ fn size_cap(artifact: &Artifact) -> u64 {
     }
 }
 
-/// The maximum entry count — a tar-bomb (millions of tiny entries) guard well above any real toolchain bundle.
+/// The most entries a payload may hold: a tar-bomb guard well above any real toolchain bundle.
 pub(crate) const MAX_ENTRIES: u64 = 4_000_000;
 
 /// Extraction ceiling when no signed installed-size estimate is available.
@@ -350,7 +353,7 @@ fn check_developer_id(
     check_signed_tree(tree, &signer, exposes, verify)
 }
 
-/// A [`StageHooks::pre_swap`] gate for an ALAB PACK of an ALab-built agent program ([`crate::alab`]).
+/// A [`StageHooks::pre_swap`] gate for an ALab package of an agent program ([`crate::alab`]).
 pub(crate) fn alab_pack_gate(
     exposes: &[String],
     check: StrictCheck,
@@ -492,7 +495,8 @@ fn check_signed_tree(
     Ok(())
 }
 
-/// Lay the verified download at `archive` down under `dest` in the shape `artifact.payload` names, and return the `tree_root` of what was laid down.
+/// Lay the verified download at `archive` down under `dest` in the shape `artifact.payload`
+/// names, and return the `tree_root` of what was laid down.
 pub fn stage_payload(
     artifact: &Artifact,
     archive: &Path,
@@ -501,7 +505,8 @@ pub fn stage_payload(
     stage_payload_modes(artifact, archive, dest).map(|(root, _)| root)
 }
 
-/// [`stage_payload`], also handing back the permission bits it declared per regular file ([`TreeAccumulator::declared_modes`]).
+/// [`stage_payload`], also handing back the permission bits it declared per regular file
+/// ([`TreeAccumulator::declared_modes`]).
 pub(crate) fn stage_payload_modes(
     artifact: &Artifact,
     archive: &Path,
@@ -1187,7 +1192,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     }
     // The outgoing tree is behind the build's link when it was laid aside, else at its name;
     // a toolchain comes in aside, in `<build>.noindex` behind a `<build>` link
-    // ([`crate::store::lays_aside`]).
+    // (`store::lays_aside`).
     let linked = aterm_toolchain::layout::is_linked_aside(build_dir);
     let aside = aterm_toolchain::layout::aside_of(build_dir);
     let outgoing = if linked {
@@ -1246,7 +1251,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     if retired && let Some(ref old) = superseded {
         let _ = crate::store::remove_tree(old);
     }
-    // A spent hold on the tree this swap replaced.
+    // The `.unproven` hold was on the tree this swap replaced, so it is spent.
     if let Some(mark) = crate::store::sidecar_path(build_dir, crate::store::UNPROVEN_SUFFIX) {
         let _ = std::fs::remove_file(mark);
     }
@@ -1914,8 +1919,8 @@ mod tests {
         assert!(!build.with_file_name("18.noindex").exists());
     }
 
-    /// A toolchain build staged before the layout (a real directory at its name) that is
-    /// staged again comes back aside, and a `<build>.noindex` no link named is taken.
+    /// A toolchain build that is a real directory at its name comes back aside when staged
+    /// again, and a `<build>.noindex` no link named is taken.
     #[cfg(target_os = "macos")]
     #[test]
     fn re_staging_a_plain_toolchain_build_lays_it_aside() {

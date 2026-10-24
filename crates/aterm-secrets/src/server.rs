@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keyless HTTP vault server ([`serve`], [`Running::stop`]) enforcing connection and body caps
-//! ([`MAX_CONNECTIONS`], [`MAX_PEER_CONNECTIONS`], [`MAX_PUTS`], [`MAX_PEER_PUTS`],
-//! [`crate::envelope::MAX_ENVELOPE`]), signer pins and handoff chains ([`crate::ALAB_SIGNER`],
-//! [`crate::ALAB_RETIRED`], [`crate::envelope::Envelope::check_pin`],
-//! [`crate::envelope::Envelope::check_extends`]), and join queues ([`JOIN_CHANGE_GAP`],
-//! [`crate::transport::parse_join_line`]).
+//! The keyless HTTP vault server ([`serve`]): it holds each vault's latest signed envelope,
+//! takes a PUT only when its signer and handoff chain check out, holds long-polls, and queues
+//! join requests, under per-server and per-address caps.
 
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
@@ -84,7 +81,7 @@ pub const JOIN_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const JOIN_CHANGE_GAP: Duration = Duration::from_secs(10);
 /// How often the log notes changes to one queued join request.
 const JOIN_NOTE_EVERY_SECS: u64 = 60 * 60;
-/// Minimum interval before an unchanged join re-post refreshes its queue timestamp ([`JOIN_TTL_SECS`]).
+/// How long before an unchanged join re-post refreshes its queue time ([`JOIN_TTL_SECS`]).
 const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
 /// The most vaults one server holds.
 pub const MAX_VAULTS: usize = 64;
@@ -189,7 +186,7 @@ fn supervise(
     }
 }
 
-/// A running server on a listener already bound (tests bind `127.0.0.1:0`) ([`Running::stop`]).
+/// A server running on an already bound listener (tests bind `127.0.0.1:0`).
 pub struct Running {
     /// Where it listens.
     pub addr: SocketAddr,
@@ -405,7 +402,7 @@ struct Slot {
     wake: Arc<Condvar>,
 }
 
-/// A queued join request and the address it came from (`None`: queued before addresses were kept).
+/// A queued join request and the address it came from (`None`: no `peer` line in the store).
 #[derive(Clone)]
 struct Queued {
     request: JoinRequest,
@@ -1483,8 +1480,8 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
         match crate::transport::PublishLock::take_clearing_dead(&shared.vault_path(name)) {
             Ok(lock) => lock,
             // Only a sender of a version the server would take gets here (an admin, or a
-            // machine putting its copy back), so the lock is named to it, by its name in the
-            // store, which a client's 200-character quote keeps; the log has the whole path.
+            // machine putting its copy back), so the answer names the lock by its file name,
+            // which fits a client's quote; the log has the whole path.
             Err(crate::transport::NotTaken::Held { lock, holder }) => {
                 let held_by = crate::transport::held_by(&holder);
                 note(&format!(
@@ -1614,11 +1611,10 @@ fn takes_over(
 }
 
 /// Hold a newer version an admin published at the vault's store file itself (an admin whose
-/// vault is that path), read again at each read of the vault, each slice of a held long-poll
-/// and each PUT: the server reads its store at launch,
-/// and without this would serve the version before and write the next publish built on it
-/// over the path's, a revoke included. A version there is held only as a PUT of it would be
-/// ([`takes_over`]); any other file changes nothing.
+/// vault is that path), checked at each read of the vault, each slice of a held long-poll and
+/// each PUT. Without it the server serves what it read at launch, and the next publish built
+/// on that overwrites the path's version, a revoke included. A version there is held only as a
+/// PUT of it would be ([`takes_over`]); any other file changes nothing.
 fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
     let Some(slot) = state.vaults.get_mut(name) else {
         return;
@@ -3630,10 +3626,8 @@ mod tests {
         running.stop();
     }
 
-    /// An admin whose vault is the store file itself publishes there: the server answers that
-    /// version from its next request on (a read, or a long-poll it holds), and refuses a
-    /// publish built on the copy it held before as not newer, not writing it over the path's;
-    /// a file holding an older version, or one another key signed, changes nothing.
+    /// A version an admin publishes at the store file is served from the next request on, and a
+    /// publish built on the server's older copy is refused; an older or foreign file is ignored.
     #[test]
     fn a_version_published_at_the_store_file_is_served_and_kept() {
         let root = aterm_tempfile::tempdir().expect("tempdir");

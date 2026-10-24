@@ -152,11 +152,7 @@ pub fn cmd_browser(args: &[String]) -> Res {
         {
             eprintln!("aterm-lab: linux: build output NOT removed: {e}");
         }
-        if ask.keep_up {
-            up.stop_units();
-        } else {
-            up.release();
-        }
+        up.end(ask.keep_up);
         if let Err(s) = stopped {
             return Err(s.into());
         }
@@ -232,7 +228,7 @@ fn drive(
     let repo = linux::repo();
     let guest_site = format!("{lane}/site");
     let _ = up.sh(&["rm".into(), "-rf".into(), guest_site.clone()]);
-    let copied = up.lima.copy_dir_in(site, &lane);
+    let copied = up.guest.copy_dir_in(site, &lane);
     if !copied.ok() {
         rows.push(Row {
             name: "the site copied into the guest".into(),
@@ -277,7 +273,7 @@ fn drive(
         build.extend(arch.target_args());
         build.extend(["-p", "aterm-verify", "--bin", "aterm-verify"].map(String::from));
         let built = up
-            .lima
+            .guest
             .shell_streamed(&up.home, &guest::with_env(&env, &build), "  | ");
         if !built.ok() {
             rows.push(row(
@@ -287,7 +283,7 @@ fn drive(
             continue;
         }
         let verify = format!("{}/aterm-verify", arch.bin_dir(&format!("{lane}/target")));
-        let fetched = up.lima.shell_streamed(
+        let fetched = up.guest.shell_streamed(
             &up.home,
             &guest::with_env(
                 &env,
@@ -332,7 +328,7 @@ fn drive(
                 .iter()
                 .flat_map(|e| ["--engine".to_string(), (*e).to_string()]),
         );
-        let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+        let out = up.guest.shell_streamed(&up.home, &argv, "  | ");
         up.stop_units();
         let kept = keep(up, &out_dir, &results.join(arch.name()));
         let mut detail = detail_of(&out.text);
@@ -359,7 +355,7 @@ pub const DRIVE_HANG_SECS: u32 = 900;
 fn keep(up: &Up, out_dir: &str, to: &Path) -> Option<String> {
     let _ = std::fs::remove_dir_all(to);
     let parent = to.parent()?;
-    let copied = up.lima.copy_dir_out(out_dir, parent);
+    let copied = up.guest.copy_dir_out(out_dir, parent);
     if !copied.ok() {
         return Some(copied.tail(3));
     }

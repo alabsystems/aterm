@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22).
+//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the
+//! machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22).
 
 use crate::model::User;
 use crate::port::{Cmd, Secret, System};
@@ -35,7 +36,8 @@ const INCLUDE_DEPTH: usize = 10;
 pub(crate) enum Lookups {
     /// git's own github.com lookups go to the helper alone, as the account, host-wide.
     Ready,
-    /// They do not: why, naming a setting's key and the file it is in, never its value (a helper's command can carry a credential).
+    /// They do not: why, naming a setting's key and the file it is in, never its value (a
+    /// helper's command can carry a credential).
     Not(String),
 }
 
@@ -46,7 +48,8 @@ impl Lookups {
     }
 }
 
-/// How a credential reaches git: the program, the one helper every request names, and the variables a test adds.
+/// How a credential reaches git: the program, the one helper every request names, and the
+/// variables a test adds.
 pub(crate) struct Git {
     program: PathBuf,
     helper: String,
@@ -63,7 +66,9 @@ impl Git {
         }
     }
 
-    /// For a test against a real git: `helper` (git's own `store --file=<scratch>`, which keeps the credential in a file the test reads), and no system configuration read (`GIT_CONFIG_NOSYSTEM=1`), so no keychain helper is configured anywhere the run looks.
+    /// For a test against a real git: `helper` (git's own `store --file=<scratch>`, which keeps
+    /// the credential in a file the test reads), and no system configuration
+    /// (`GIT_CONFIG_NOSYSTEM=1`), so no keychain helper is configured anywhere the run looks.
     #[cfg(test)]
     pub(crate) fn isolated(helper: &str) -> Self {
         Self {
@@ -105,7 +110,9 @@ impl Git {
         ])
     }
 
-    /// Store `token` for `account` at `host` (`git credential approve`), then read it back ([`Self::fill`]): git reports no helper's failure to store, so the read is the proof.
+    /// Store `token` for `account` at `host` (`git credential approve`), then read it back
+    /// ([`Self::fill`]): git reports no helper's failure to store, so the read is the proof.
+    ///
     /// # Errors
     /// The account or host cannot be a credential field, git could not run whole, or the
     /// helper does not hand back exactly this token. No error carries credential bytes.
@@ -141,7 +148,9 @@ impl Git {
         }
     }
 
-    /// The token the helper holds for `account` at `host` (`git credential fill`), or `None` when it holds none: git then ends at its disabled prompt (exit 128) without asking.
+    /// The token the helper holds for `account` at `host` (`git credential fill`), or `None`
+    /// when it holds none: git then ends at its disabled prompt (exit 128) without asking.
+    ///
     /// # Errors
     /// The account or host cannot be a credential field, git could not run whole, or its
     /// answer is not one password. No error carries credential bytes.
@@ -155,12 +164,11 @@ impl Git {
         self.fill_by(sys, &self.credential(user, "fill"), host, Some(account))
     }
 
-    /// [`Self::fill`] through every helper the account's configuration names, as git's own
-    /// lookups go, rather than this one's helper alone, and asked as a clone asks, with no
-    /// account (git adds one a `credential.username` names): what a clone of a repository at
-    /// `host` gets when every one is asked alike ([`Self::uniform`]); the secrets vault's helper
-    /// reads the synced token itself. A helper that would ask in a window is told not to
-    /// (`GCM_INTERACTIVE=never`, Git Credential Manager's switch), as git's prompt is.
+    /// [`Self::fill`] through every helper the account's configuration names, asked as a clone
+    /// asks (no account; git adds the one a `credential.username` names): what a clone at `host`
+    /// gets when [`Self::uniform`] holds. `GCM_INTERACTIVE=never` keeps Git Credential Manager
+    /// from asking in a window, as git's own prompt is kept off.
+    ///
     /// # Errors
     /// As [`Self::fill`].
     pub(crate) fn fill_as_configured(
@@ -215,7 +223,10 @@ impl Git {
         answer
     }
 
-    /// Whether git's own github.com lookups go to this one's helper alone, as `account`, host-wide (`useHttpPath` false, so a clone never asks for a per-repository entry the host-wide token is not filed under), or the setting that keeps them from it.
+    /// Whether git's own github.com lookups go to this one's helper alone, as `account`,
+    /// host-wide (`useHttpPath` false, so a clone never asks for a per-repository entry the
+    /// host-wide token is not filed under), or the setting that keeps them from it.
+    ///
     /// # Errors
     /// git could not run whole or its answer is not configuration.
     pub(crate) fn configured(
@@ -299,7 +310,10 @@ impl Git {
         cmd.args(["--get-regexp", SETTINGS])
     }
 
-    /// Point git's github.com lookups at this one's helper alone, as `account`, host-wide, in the account's global configuration: the empty entry first resets the helpers earlier files name (CLT's own `osxkeychain` among them).
+    /// Point git's github.com lookups at this one's helper alone, as `account`, host-wide, in the
+    /// account's global configuration: the empty entry first resets the helpers earlier files
+    /// name (CLT's own `osxkeychain` among them).
+    ///
     /// # Errors
     /// A `git config` run failed (output withheld).
     pub(crate) fn configure(
@@ -686,7 +700,8 @@ fn scrub(bytes: &mut [u8]) {
     aterm_uds::secret::scrub(bytes);
 }
 
-/// The git runs above as the test arm keys them, for the tests of `aterm init`'s and the controller's GitHub steps: each scripts a [`crate::port::Fake`] answer for one of them.
+/// The git runs above as the test arm keys them, for the tests of `aterm init`'s and the
+/// controller's GitHub steps: each scripts a [`crate::port::Fake`] answer for one of them.
 #[cfg(test)]
 pub(crate) mod script {
     use super::{Git, HELPER, USE_PATH, USERNAME};
@@ -848,8 +863,8 @@ mod tests {
         user("alice", 501)
     }
 
-    /// git's URL matching as [`scope`] reads it. The real-git test below holds the spellings
-    /// the review found to what git itself hands a github.com credential to.
+    /// git's URL matching as [`scope`] reads it; the real-git test below checks the hard
+    /// spellings against what git itself hands a github.com credential to.
     #[test]
     fn a_setting_applies_to_github_as_git_matches_its_url() {
         for (url, want) in [
@@ -1581,10 +1596,9 @@ mod tests {
         }
     }
 
-    /// The real CLT git, in a scratch HOME with no system configuration, answers a fill as
-    /// configured from the helper the account's XDG file names (the secrets vault's: a reset,
-    /// then a helper that answers only a request naming no account, as a clone's names none),
-    /// which is what a clone's own request gets; a setting for a path under the host makes the
+    /// A real CLT git in a scratch HOME answers a fill as configured from the account's XDG
+    /// helper (the vault's shape: a reset, then a helper that answers only a request naming no
+    /// account), as a clone's own request does; a setting for a path under the host makes the
     /// lookups not alike.
     #[test]
     fn lookups_as_configured_reach_the_accounts_own_helpers_as_a_clone_does() {

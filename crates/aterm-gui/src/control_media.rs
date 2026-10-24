@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Control-socket media capture (`image`, `window`, `video`), UI inspection, and session `spawn`/`close` verbs.
+//! Control-socket media capture (`image`, `window`, `video`), UI inspection, and session
+//! `spawn`/`close` verbs.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -240,7 +241,8 @@ pub(crate) fn call_main_within<T>(
     recv_within(&rx, within).map_err(MainHopError::Reason)
 }
 
-/// Returns the refusal for a main-thread hop: the client hung up (unless its input is committed), the main thread is stalled, or (macOS) aterm is showing a modal dialog.
+/// Returns the refusal for a main-thread hop: the client hung up (unless its input is
+/// committed), the main thread is stalled, or (macOS) aterm is showing a modal dialog.
 pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
     // A verb committed to finishing input it began is the one exception
     // ([`crate::control::CommittedInput`]: a `turn` whose text is typed still
@@ -540,7 +542,8 @@ fn prepare_image_target(
     Ok((target, Some(path)))
 }
 
-/// Handles `image`, capturing the client frame of the window showing the target session (the front window by default) as a PNG file, or inline with `--bytes`.
+/// Handles `image`, capturing the client frame of the window showing the target session (the
+/// front window by default) as a PNG file, or inline with `--bytes`.
 pub(crate) fn cmd_image(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -943,11 +946,9 @@ mod window_target_refusal_tests {
         );
     }
 
-    /// `OPEN FACT-MENU <NAME>` TAKES EVERY NAME `controls` PRINTS: each
-    /// fact's wire name (`fact=<key>`, [`crate::claude_lights::Fact::key`]),
-    /// the top rule's key's `top-effort` and the account group's `account`
-    /// among them, and the usage names them all. NEGATIVE CONTROL: a bogus
-    /// name, a missing one and a trailing word are refused with that usage.
+    /// `open fact-menu <name>` takes every name `controls` prints (each fact's `fact=<key>`,
+    /// [`crate::claude_lights::Fact::key`]), and the usage names them all. NEGATIVE CONTROL: a
+    /// bogus name, a missing one and a trailing word are refused with that usage.
     #[test]
     fn open_fact_menu_names_its_fact() {
         use crate::claude_lights::Fact;
@@ -993,14 +994,10 @@ mod window_target_refusal_tests {
         assert_eq!(super::fact_menu_operand("fact-menus"), None);
     }
 
-    /// EVERY `Fact` IS IN `Fact::EVERY`, SO EACH PARSES AND THE USAGE NAMES
-    /// IT: one list below writes both an exhaustive `match` over `Fact` (a
-    /// new variant does not compile until it is listed) and the facts
-    /// `EVERY` is held to, so a fact left out of `EVERY`, which
-    /// `Fact::parse` walks and `open fact-menu`'s usage prints, fails here.
-    /// Each wire name is its own and parses back to its fact. NEGATIVE
-    /// CONTROL: a fact dropped from `EVERY` fails the walk; a variant
-    /// dropped from the list fails to compile.
+    /// One list writes an exhaustive `match` over `Fact` and the facts `Fact::EVERY` is held
+    /// to, so a fact left out of `EVERY` (which `Fact::parse` walks and the usage prints) fails
+    /// here, and a new variant does not compile until it is listed. Each wire name parses back
+    /// to its fact.
     #[test]
     fn every_fact_is_in_every_so_each_parses_and_the_usage_names_it() {
         use crate::claude_lights::Fact;
@@ -1821,7 +1818,8 @@ fn recv_video_reply(
     }
 }
 
-/// Handles `video [<seconds>] ...` (and `status`, `stop`, `frames`), recording the front window's presented frames to `frame_NNNN.png` files plus an `index.json`.
+/// Handles `video [<seconds>] ...` (and `status`, `stop`, `frames`), recording the front
+/// window's presented frames to `frame_NNNN.png` files plus an `index.json`.
 pub(crate) fn cmd_video(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -2116,7 +2114,8 @@ fn settings_section_usage() -> String {
         .join(" | ")
 }
 
-/// Handles `settings ...`: open, close or toggle the Settings tab, show a section, or set/unset an `aterm.toml` key.
+/// Handles `settings ...`: open, close or toggle the Settings tab, show a section, or set or
+/// unset an `aterm.toml` key.
 pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let t = rest.trim();
     let (word, tail) = match t.split_once(char::is_whitespace) {
@@ -2187,9 +2186,10 @@ fn settings_field_wire_reply(completion: Result<String, String>) -> String {
     }
 }
 
-/// Returns a pre-hop refusal for a retired `invoke <name>`, or for a person-only action ([`crate::menu::InvokeAuthority::PersonOnly`]) without the person stand-in.
+/// Returns a pre-hop refusal for a retired `invoke <name>`, or for a person-only action
+/// ([`crate::menu::InvokeAuthority::PersonOnly`]) without the person stand-in.
 pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
-    // A RETIRED name answers with what to use instead, before any hop.
+    // A retired name answers with what to use instead, before any hop.
     if let Some(instead) = crate::menu::retired_invoke_name(name) {
         return Some(format!("ERR retired: {instead}\n"));
     }
@@ -2565,7 +2565,8 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// Parsed `trail` control query (`Status`, or `Admissions(n)`: the last `n` admission records, all when `n` is omitted).
+/// Parsed `trail` control query (`Status`, or `Admissions(n)`: the last `n` admission records,
+/// all when `n` is omitted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailForm {
     Admissions(Option<usize>),
@@ -3137,7 +3138,8 @@ impl crate::App {
                   split, raise, theme and a worker's task — and `reply` its answer; \
                   a struct would only rename the Wake's fields"
     )]
-    /// Handles `Wake::SpawnSession`: validates the theme, aim and worker, then books the tab or split off the event loop and replies once it lands.
+    /// Handles `Wake::SpawnSession`: validates the theme, aim and worker, then books the tab or
+    /// split off the event loop and replies once it lands.
     pub(crate) fn spawn_session_aimed(
         &mut self,
         aim: SpawnAim,
@@ -3202,7 +3204,8 @@ impl crate::App {
         }))
     }
 
-    /// Resolves the host window and, for a worker, checks that this instance can launch it, before booking a spawn.
+    /// Resolves the host window and, for a worker, checks that this instance can launch it,
+    /// before booking a spawn.
     pub(crate) fn resolve_spawn(
         &self,
         aim: SpawnAim,
@@ -3220,7 +3223,8 @@ impl crate::App {
         })
     }
 
-    /// Books an asynchronous session or worker spawn off the event loop and invokes `taken` on completion.
+    /// Books an asynchronous session or worker spawn off the event loop and invokes `taken` on
+    /// completion.
     pub(crate) fn book_spawn(&mut self, plan: SpawnPlan, booking: SpawnBooking, taken: SpawnTaken) {
         let SpawnPlan {
             owner,
@@ -3294,7 +3298,8 @@ impl crate::App {
         Ok(Spawned { sid, worker })
     }
 
-    /// Sends the `OK <sid>` spawn reply to `reply` and starts the worker launcher if the client received it.
+    /// Sends the `OK <sid>` spawn reply to `reply` and starts the worker launcher if the client
+    /// received it.
     pub(crate) fn answer_spawn(
         &mut self,
         spawned: Result<Spawned, String>,
@@ -3601,7 +3606,8 @@ pub(crate) fn cmd_close(
     }
 }
 
-/// Handles `chrome`, dumping the front window's native chrome (toolbar, menu bar or menu model), the drawn autopilot chips, the status-item menu and the presence line.
+/// Handles `chrome`, dumping the front window's native chrome (toolbar, menu bar or menu model),
+/// the drawn autopilot chips, the status-item menu and the presence line.
 pub(crate) fn cmd_chrome(proxy: &EventLoopProxy<Wake>) -> String {
     let lines = match call_main(proxy, |tx| Wake::ReadChrome { reply: tx }) {
         Ok(lines) => lines,
@@ -4146,7 +4152,7 @@ mod wire_tab_close_guard_tests {
         state
     }
 
-    /// The newest close's reason and closer, from the closed index (6G-9).
+    /// The newest close's reason and closer, from the closed index.
     fn last_exit(app: &App) -> (ExitReason, String) {
         let g = app.store.read().unwrap_or_else(|p| p.into_inner());
         let row = g

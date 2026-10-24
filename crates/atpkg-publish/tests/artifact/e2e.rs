@@ -4,7 +4,7 @@
 //! The bundle pack end to end on the real tools: a sysroot of `cc`-built Mach-Os whose
 //! `trustc` is a fixture Trust compiler, packed by [`pack_bundle_with`] over the host's
 //! tools ([`HostTools`]: `strip`, `codesign`, `otool` for relocation, the client's lineage
-//! checker), compressed by aterm-zstd's raw-block writer in place of the zstd CLI. The
+//! checker), compressed by aterm-zstd's raw-block writer in place of its encoder. The
 //! published shape — `bin/rustc` and `bin/trustc` the same program under two ad-hoc
 //! signatures — must ship as one inode, one signature, a compiler that runs.
 //!
@@ -61,7 +61,8 @@ fn ino(p: &Path) -> u64 {
 }
 
 /// [`HostTools`] in every call but the compressor, which is aterm-zstd's raw-block writer:
-/// the pack's shape is under test, not the zstd CLI's compression.
+/// the pack's shape is under test, not the encoder's compression (the tar writer's tests
+/// hold that).
 struct HostButRaw;
 
 impl Tools for HostButRaw {

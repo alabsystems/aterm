@@ -1005,8 +1005,7 @@ mod tests {
         );
     }
 
-    /// Linux's `exe` link of an unlinked file ends ` (deleted)`: the census takes the mark off,
-    /// so the process is still known by its file name and is said to run a deleted binary.
+    /// Linux's ` (deleted)` mark comes off the `exe` link, so the process keeps its file name.
     #[cfg(unix)]
     #[test]
     fn linux_s_deleted_mark_is_taken_off_the_executable() {

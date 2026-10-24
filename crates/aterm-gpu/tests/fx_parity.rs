@@ -655,7 +655,8 @@ fn fx_texel_bytes_survive_the_arm() {
 /// at odd scales and mirrors, under both laws: an Exact sprite is byte-exact
 /// whatever its texels, and a Linear one is byte-exact wherever its texels
 /// and ink are opaque (its blend has nothing to round), so a delta there is
-/// a texel picked differently. Translucent Linear texels hold the Linear 2.
+/// a texel picked differently. Translucent Linear texels hold
+/// `FxBlend::Linear.parity()`.
 #[test]
 fn sprites_map_texels_exactly_at_odd_scales_under_both_laws() {
     let theme = Theme::default();
@@ -1008,12 +1009,10 @@ fn tiles_layer(arts: &[Arc<FxArt>]) -> FxLayer {
     )
 }
 
-/// EVICTION DRAWS WHAT THE CPU DRAWS: frames whose arts outgrow the fx
-/// atlas evict the arts the frame does not draw and reuse their regions;
-/// every frame, a window's frame after another window's frame evicted its
-/// arts, and a frame after a device rebuild that followed evictions, land
-/// the CPU's bytes on every arm. A region left holding the art it held
-/// before shows as another art's texels.
+/// Frames whose arts outgrow the fx atlas evict arts the frame does not draw and reuse their
+/// regions; every frame, a window's frame after another window's frame evicted its arts, and a
+/// frame after a device rebuild that followed evictions land the CPU's bytes on every arm. A
+/// region still holding its old art shows as another art's texels.
 #[test]
 fn fx_atlas_evictions_draw_every_frame_as_the_cpu() {
     let theme = Theme::default();
@@ -1587,11 +1586,10 @@ fn a_frame_whose_fx_fails_closed_counts_no_fx() {
     );
 }
 
-/// THE SCROLLBAR'S ROUNDED BARS ARE BYTE-EXACT ON EVERY ARM (lane B7): the
-/// body rectangle and the two antialiased caps of one Index8 art a
-/// `(width, radius)`, each cap clipped to its own rows, land the CPU's bytes on
-/// the native arm and the wgpu oracle, at every width the chrome draws, from a
-/// dot to a page-tall bar, on and across row bands, and a thumb over its track.
+/// The scrollbar's rounded bars are byte-exact on every arm: the body rectangle and the two
+/// antialiased caps of one Index8 art a `(width, radius)`, each cap clipped to its own rows,
+/// land the CPU's bytes on the native arm and the wgpu oracle, opaque and translucent, at every
+/// width the chrome draws and on and across row bands.
 #[test]
 fn rounded_bars_are_byte_exact_on_the_gpu() {
     use aterm_render::rounded_bar::{CapArts, RoundedBar, push_items};

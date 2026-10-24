@@ -17,9 +17,9 @@ use crate::screen::{field, is_card_row, is_idle, is_options_row, status_row};
 use crate::stop::{self, Stopped};
 use crate::util::{keep_tree, now, py_repr, stamp};
 
-const BANNER: &str = aterm_phase::anchors::anchor_text("launch.banner");
-const PENDING: &str = aterm_phase::anchors::anchor_text("survey.pending");
-const THANKS: &str = aterm_phase::anchors::anchor_text("survey.thanks");
+const BANNER: &str = aterm_phase::anchor!("launch.banner");
+const PENDING: &str = aterm_phase::anchor!("survey.pending");
+const THANKS: &str = aterm_phase::anchor!("survey.thanks");
 
 /// Why a scenario stopped short.
 #[derive(Debug)]

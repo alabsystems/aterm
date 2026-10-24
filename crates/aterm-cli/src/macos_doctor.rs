@@ -295,12 +295,10 @@ fn apply_preferences_at(
     apply_part_at(root, Part::Preferences { only })
 }
 
-/// The Accounts stage of a setup run: the selected Messages and FaceTime
-/// sign-outs, with the one Accessibility request they need. A sign-out opens
-/// Messages or FaceTime, presses its controls, and may raise macOS's
-/// Accessibility and Automation prompts, so it runs only while System State is
-/// on screen (`on_screen`, System State design §6); until then the stage waits
-/// for the page. Accounts signed out already need neither, and finish here.
+/// The Accounts stage of a setup run: the selected Messages and FaceTime sign-outs, with the one
+/// Accessibility request they need. A sign-out drives those apps and may raise macOS's
+/// Accessibility and Automation prompts, so it runs only while System State is on screen
+/// (`on_screen`, System State design §6); accounts already signed out finish here.
 fn apply_accounts_at(root: &Path, on_screen: bool) -> Result<Option<Report>, String> {
     apply_part_at(root, Part::Accounts { on_screen })
 }
@@ -344,7 +342,8 @@ fn apply_on_first_run_with(
     apply_part_with(root, sys, host, build, now, Part::All)
 }
 
-/// One unattended pass over `part` of the authorized selection, on `sys` and `host`, as `build` at `now`: what each stage of the System State worker runs.
+/// One unattended pass over `part` of the authorized selection, on `sys` and `host`, as `build`
+/// at `now`: what each stage of the System State worker runs.
 fn apply_part_with(
     root: &Path,
     sys: &dyn System,
@@ -659,6 +658,27 @@ fn held_back(failed: &[Failed], build: &str, now: u64) -> Vec<(String, Hold)> {
             Some((failed.item.clone(), Hold::Back(why.into())))
         })
         .collect()
+}
+
+/// A second automatic Mac settings try is due in this run and build. Return
+/// the latest due deadline so an older, still-blocked item cannot hide another
+/// item's deadline. Reading this never spends or restarts an attempt.
+fn mac_settings_retry_due(
+    root: &Path,
+    revision: u64,
+    build: &str,
+    now: u64,
+) -> Result<Option<u64>, String> {
+    let record = Automatic::load(root, revision)?;
+    Ok(record
+        .failed
+        .iter()
+        .filter(|failed| {
+            failed.build == build && failed.tries == 1 && !record.settled.contains(&failed.item)
+        })
+        .map(|failed| failed.at.saturating_add(SECOND_TRY_AFTER.as_secs()))
+        .filter(|due| *due <= now)
+        .max())
 }
 
 fn count_tries(failed: &mut Vec<Failed>, build: &str, now: u64, items: &[String]) {
@@ -1055,6 +1075,9 @@ trait Host {
     /// settled, so a read-back after it reads what the relaunched process kept.
     fn restart(&mut self, name: &str, reads: &[&Target]) -> Result<(), String>;
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String>;
+    /// Put the live settings `saved` holds back as well as the saved preferences. A setting
+    /// whose saved preference is back but loads only at the next login is `ok`, with a note
+    /// to log out: Restore reads a `blocked` row as a preference it could not put back.
     fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row>;
 }
 
@@ -1415,7 +1438,7 @@ impl Host for NativeHost {
                     },
                 });
             } else {
-                rows.push(Row { name: "Original active scroll direction".into(), status: "blocked".into(), detail: "the previous implicit or non-boolean setting has no recorded runtime value; log out and back in to load its restored preference".into() });
+                rows.push(Row { name: "Original active scroll direction".into(), status: "ok".into(), detail: "the previous implicit or non-boolean setting has no recorded runtime value; log out and back in to load its restored preference".into() });
             }
         }
         if saved.iter().any(|s| {
@@ -1424,7 +1447,7 @@ impl Host for NativeHost {
                     .key
                     .starts_with("com.apple.keyboard.modifiermapping.")
         }) {
-            rows.push(Row { name: "Original active keyboard mapping".into(), status: "blocked".into(), detail: "the live HID service mappings from before this setup were not recorded, so log out and back in to load the saved mappings".into() });
+            rows.push(Row { name: "Original active keyboard mapping".into(), status: "ok".into(), detail: "the live HID service mappings from before this setup were not recorded, so log out and back in to load the saved mappings".into() });
         }
         rows
     }
@@ -1519,13 +1542,11 @@ fn durable_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 /// Publish `entry`, a name in `directory`: flush the directory, unless this process already
-/// flushed it while it was the same directory and `entry` named the same file there. A record
-/// written again is a new file (a rename over it), and a directory put in place of another is
-/// a new directory, so either is flushed again; a directory's other names are not this flush's
-/// business. A name moved away and back in between is the one change this cannot see, and
-/// nothing moves a doctor record or its directories. Every doctor pass reads and writes its
-/// records through here: flushing each one's whole chain to `/` every time made the passes
-/// queue on the shared directories' locks.
+/// flushed it while it was the same directory (device and inode) and `entry` named the same file
+/// there, so the doctor's passes do not queue on the shared directories' locks. A record written
+/// again (a rename over it) or a directory replaced is new and flushed again; a name moved away
+/// and back in between is the one change this cannot see, and nothing moves a doctor record or
+/// its directories.
 fn durable_name(directory: &Path, entry: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     type Identity = (u64, u64);
@@ -1662,7 +1683,7 @@ fn execute_pass(
     }
     if host.selection().is_empty() {
         if action == Action::Apply {
-            record_applied(root, host.selection())?;
+            initial::record_applied(root, host.selection())?;
         }
         report.rows.push(Row {
             name: "Selected Mac settings".into(),
@@ -1671,8 +1692,8 @@ fn execute_pass(
         });
         return Ok(report.into());
     }
-    // The sign-outs are their own stage now: a pass of every preference is the
-    // full profile's, with or without them.
+    // The sign-outs are their own stage: a pass of every preference is the full profile's, with
+    // or without them.
     let full_profile =
         initial::preferences(host.selection()) == initial::preferences(Selection::all());
     let previous_activation = if full_profile {
@@ -1726,28 +1747,13 @@ fn execute_pass(
     );
     settled.extend(host.settled());
     if !report.needs_attention() {
-        record_applied(root, host.selection())?;
+        initial::record_applied(root, host.selection())?;
     }
     Ok(Pass {
         report,
         unverified,
         settled,
     })
-}
-
-/// Record the profile applied after a pass over `set` that needs nothing more, unless the
-/// plan still owes Mac settings outside `set` ([`initial::owed_beyond`]): a pass that set
-/// one group after Restore, or only the sign-outs, leaves the record restored, so a group
-/// no pass set again still reads restored; and the sign-outs after a preferences pass
-/// that failed leave it pending.
-fn record_applied(root: &Path, set: Selection) -> Result<(), String> {
-    if initial::owed_beyond(root, set) {
-        return Ok(());
-    }
-    write_json(
-        &root.join("first-run.json"),
-        &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
-    )
 }
 
 fn apply_preferences(
@@ -1776,10 +1782,8 @@ fn apply_preferences(
         save_backup(&report.backup, &saved)?;
     }
     if group == WorkstationGroup::Preferences {
-        write_json(
-            &root.join("first-run.json"),
-            &json!({ "profile": PROFILE, "state": "pending" }),
-        )?;
+        // Pending, keeping what a Restore keeps: this pass may set one group only.
+        initial::record_pending(root)?;
     }
     append_workstation(host, group, true, report);
     let attempts = host.attempts();
@@ -1886,9 +1890,8 @@ fn apply_preferences(
     if refresh(host, &reload.iter().collect::<Vec<_>>(), report) && full_profile {
         settle_pending_refresh(host, root)?;
     }
-    // Read the rollback back once each reader is up again: one that wrote its own value
-    // over the original as it started did not keep it, and is named as that alone, not
-    // also as back.
+    // A key whose relaunched reader did not keep the rollback is named as lost alone, not also
+    // as back.
     let lost = not_retained(host, &put_back);
     if !lost.is_empty() {
         if let Some((at, restored)) = restored_row {
@@ -2236,10 +2239,7 @@ fn same_original(a: &PValue, b: &PValue) -> bool {
 }
 
 fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Report, String> {
-    write_json(
-        &root.join("first-run.json"),
-        &json!({ "profile": PROFILE, "state": "restored" }),
-    )?;
+    initial::save_restore(root)?;
     save_withheld(root, &Withheld::default())?;
     let saved = load_backup(&report.backup)?;
     let mut activation = pending_refresh(root)?;
@@ -2273,10 +2273,10 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
             continue;
         }
         match restore_one(host, &item.target, item.value.as_ref(), &mut refused) {
-            Ok(wrote) => {
-                if wrote {
-                    put_back.push((item.target.clone(), item.value.clone()));
-                }
+            Ok(_) => {
+                // An earlier pass may have written this original before exiting. Its
+                // reader is still relaunched below and must retain it this time too.
+                put_back.push((item.target.clone(), item.value.clone()));
                 report.rows.push(Row {
                     name: item.target.describe(),
                     status: "restored".into(),
@@ -2296,8 +2296,6 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
         settle_pending_refresh(host, root)?;
     }
-    // Read back once each reader is up again: a reader that wrote its own value over the
-    // original as it started did not keep it.
     for name in not_retained(host, &put_back) {
         if let Some(row) = report
             .rows
@@ -2383,7 +2381,7 @@ fn own_account(uid: u32) -> aterm_machines::model::User {
     }
 }
 
-/// Of `put_back` (each key and the value a rollback or a Restore wrote back), the keys
+/// Of `put_back` (each key and the original value verified before relaunch), the keys
 /// that no longer read that value once their readers were relaunched and up again
 /// ([`refresh`]): a reader that wrote its own over it as it started.
 fn not_retained(host: &mut dyn Host, put_back: &[(Target, Option<PValue>)]) -> Vec<String> {
@@ -2502,9 +2500,8 @@ mod tests {
         full_disk_access: Option<bool>,
         /// Whether the widgets row also clears Notification Center's widget list.
         notification_center: bool,
-        /// The Window Manager's widget key is of Notification Center's item: an item that
-        /// leaves one key for want of the grant and reaches another, as init's widgets row
-        /// did before each catalog row became its own item, whose tries the doctor counts
+        /// The Window Manager's widget key belongs to the widgets item too, so one item leaves
+        /// one key for want of the grant and reaches another; the doctor counts its tries
         /// whichever pass makes them.
         bundles: bool,
         withheld: Vec<String>,
@@ -2614,6 +2611,16 @@ mod tests {
             }
         }
 
+        pub(super) fn accounts() -> Self {
+            Self {
+                host: Fake {
+                    accounts_fail: true,
+                    ..Fake::default()
+                },
+                now: std::time::SystemTime::now(),
+            }
+        }
+
         /// What `apply_on_first_run_at` runs once the stage is due.
         pub(super) fn pass(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.now += std::time::Duration::from_secs(61);
@@ -2622,6 +2629,22 @@ mod tests {
                 &Inert::default(),
                 &mut self.host,
                 "1.0.0+gtest",
+                self.now,
+            )
+        }
+
+        pub(super) fn pass_at(
+            &mut self,
+            root: &Path,
+            selected: Selection,
+            seconds: u64,
+        ) -> Result<Report, String> {
+            self.now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            self.host.select(selected);
+            automatic_pass(
+                &mut self.host,
+                root,
+                &aterm_types::version::build_id(),
                 self.now,
             )
         }
@@ -2941,6 +2964,43 @@ mod tests {
         );
     }
 
+    /// The Caps Lock mapping, and a scroll direction the Mac had never set, load only at the
+    /// next login once Restore puts them back. That is a note to log out, not a setting
+    /// Restore failed to put back, so neither row reads `blocked`.
+    #[test]
+    fn a_setting_that_loads_at_the_next_login_is_restored_not_blocked() {
+        let saved = [
+            Saved {
+                target: Target {
+                    domain: "-g".into(),
+                    key: "com.apple.keyboard.modifiermapping.1452-610-0".into(),
+                    host: true,
+                },
+                value: None,
+                granted: true,
+            },
+            Saved {
+                target: Target::new("-g", "com.apple.swipescrolldirection"),
+                value: None,
+                granted: true,
+            },
+        ];
+        let (mut host, _) = inert_host(Some(true), Vec::new);
+        let rows = host.restore_runtime(&saved);
+        let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Original active scroll direction",
+                "Original active keyboard mapping"
+            ]
+        );
+        for row in &rows {
+            assert_eq!(row.status, "ok", "{}: {}", row.name, row.detail);
+            assert!(row.detail.contains("log out and back in"), "{}", row.detail);
+        }
+    }
+
     #[test]
     fn restore_leaves_a_container_before_image_alone_without_the_grant() {
         let saved = [
@@ -3035,9 +3095,8 @@ mod tests {
     }
 
     /// A Dock under management: once relaunched it takes a second to start, then shows the
-    /// pins it is given whatever was written, as the 2026-10-21 managed Dock did. `defaults`
-    /// reads and writes its one domain, and `pgrep`, `launchctl print`, `killall` and
-    /// `sleep` act on it.
+    /// pins it is given whatever was written. `defaults` reads and writes its one domain, and
+    /// `pgrep`, `launchctl print`, `killall` and `sleep` act on it.
     #[derive(Default)]
     struct ManagedDock(std::sync::Mutex<ManagedState>);
 
@@ -3048,6 +3107,9 @@ mod tests {
         /// The sleeps left until a relaunched Dock is past its start.
         starting: Option<u32>,
         kills: usize,
+        writes: usize,
+        interrupt_before_restart: bool,
+        keep_original: bool,
     }
 
     /// One pin of `label`, with the GUID a Dock gives a tile it loaded.
@@ -3084,6 +3146,7 @@ mod tests {
                     let value = plist::parse(fragment.as_bytes()).ok()?;
                     dock.prefs.retain(|(k, _)| k != key);
                     dock.prefs.push(((*key).into(), value));
+                    dock.writes += 1;
                     Some(Ran::ok(""))
                 }
                 ("/usr/bin/pgrep", ["-u", _, "-x", "Dock"]) => {
@@ -3091,6 +3154,11 @@ mod tests {
                 }
                 ("/bin/launchctl", ["print", _]) => Some(Ran::ok("")),
                 ("/usr/bin/killall", ["-u", _, "Dock"]) => {
+                    if dock.interrupt_before_restart {
+                        dock.interrupt_before_restart = false;
+                        drop(dock);
+                        panic!("simulated exit before the reader was relaunched");
+                    }
                     dock.pid += 1;
                     dock.starting = Some(1);
                     dock.kills += 1;
@@ -3101,8 +3169,10 @@ mod tests {
                         *left = left.saturating_sub(1);
                         if *left == 0 {
                             dock.starting = None;
-                            dock.prefs.retain(|(k, _)| k != "persistent-apps");
-                            dock.prefs.push(("persistent-apps".into(), managed_pins()));
+                            if !dock.keep_original {
+                                dock.prefs.retain(|(k, _)| k != "persistent-apps");
+                                dock.prefs.push(("persistent-apps".into(), managed_pins()));
+                            }
                         }
                     }
                     Some(Ran::ok(""))
@@ -3116,12 +3186,10 @@ mod tests {
         }
     }
 
-    /// The doctor's relaunch after it puts a value back waits, as the shared items' own
-    /// does, until the relaunched reader runs again and what it reads has settled, so the
-    /// read-back after it reads what the reader kept: a managed Dock that shows its own pins
-    /// over the original a second into its start is reported as not keeping it. Negative
-    /// control: a read right after the bare kill the doctor's relaunch was races the Dock's
-    /// start and reads the original back, as if it were kept.
+    /// The relaunch after a value is put back waits, as the shared items' own does, until the
+    /// reader runs again and its reads settle, so a managed Dock that shows its own pins a
+    /// second into its start is reported as not keeping the original. Negative control: a read
+    /// right after a bare kill races the Dock's start and reads the original back.
     #[test]
     fn a_restores_read_back_waits_for_the_relaunched_reader_to_settle() {
         let pins = Target::new("com.apple.dock", "persistent-apps");
@@ -3184,6 +3252,93 @@ mod tests {
         assert_eq!(read, [("persistent-apps".to_owned(), Ok(original))]);
     }
 
+    #[test]
+    fn an_interrupted_restore_rechecks_an_already_original_value_after_relaunch() {
+        for keep_original in [true, false] {
+            let pins = Target::new("com.apple.dock", "persistent-apps");
+            let original = PValue::Array(vec![loaded_pin("Mail", 1)]);
+            let dock = std::sync::Arc::new(ManagedDock(std::sync::Mutex::new(ManagedState {
+                prefs: vec![(
+                    "persistent-apps".into(),
+                    PValue::Array(vec![loaded_pin("aterm", 2)]),
+                )],
+                pid: 100,
+                interrupt_before_restart: true,
+                keep_original,
+                ..ManagedState::default()
+            })));
+            let root = aterm_tempfile::tempdir().expect("scratch");
+            let backup = root.path().join("original-preferences.json");
+            save_backup(
+                &backup,
+                &[Saved {
+                    target: pins.clone(),
+                    value: Some(original.clone()),
+                    granted: true,
+                }],
+            )
+            .unwrap();
+            let before = std::fs::read(&backup).unwrap();
+            let new_host = || {
+                NativeHost::over(
+                    Box::new(Inert {
+                        full_disk_access: Some(true),
+                        model: Some(std::sync::Arc::clone(&dock) as std::sync::Arc<dyn Model>),
+                        ..Inert::default()
+                    }),
+                    Box::new(|_, _, _| Ok(Workstation::of(Vec::new()))),
+                )
+            };
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute(&mut new_host(), root.path(), Action::Restore)
+            }));
+            assert!(interrupted.is_err());
+            assert_eq!(
+                pending_refresh(root.path()).unwrap(),
+                std::slice::from_ref(&pins)
+            );
+            {
+                let state = dock.0.lock().unwrap();
+                assert_eq!(state.prefs, [("persistent-apps".into(), original.clone())]);
+                assert_eq!((state.writes, state.kills), (1, 0));
+            }
+
+            let report = execute(&mut new_host(), root.path(), Action::Restore).unwrap();
+            let row = report
+                .rows
+                .iter()
+                .find(|row| row.name == pins.describe())
+                .unwrap();
+            let state = dock.0.lock().unwrap();
+            assert_eq!((state.writes, state.kills), (1, 1));
+            assert_eq!(
+                state.prefs,
+                [(
+                    "persistent-apps".into(),
+                    if keep_original {
+                        original
+                    } else {
+                        managed_pins()
+                    },
+                )]
+            );
+            assert!(pending_refresh(root.path()).unwrap().is_empty());
+            assert_eq!(std::fs::read(&backup).unwrap(), before);
+            assert_eq!(
+                report.needs_attention(),
+                !keep_original,
+                "{}",
+                report.to_text()
+            );
+            assert_eq!(
+                row.status,
+                if keep_original { "restored" } else { "error" },
+                "{}",
+                report.to_text()
+            );
+        }
+    }
+
     /// A shared item that pins the Dock and never verifies, whose before-image of the
     /// Dock's pins, `.0`, the doctor's rollback puts back.
     struct Repinned(PValue);
@@ -3241,11 +3396,9 @@ mod tests {
         }
     }
 
-    /// The rollback of a change that did not verify reads each key it put back once its
-    /// reader is up again: a managed Dock that shows its own pins over the original a second
-    /// into its start is reported, in one `error` row, as not keeping them, and the pins
-    /// are not also listed as back. Negative control: without that read-back the report
-    /// says the pins are back and nothing more.
+    /// A rollback's read-back runs once each reader is up again, so pins a managed Dock did not
+    /// keep are reported in one `error` row and not also as back. Negative control: without the
+    /// read-back the report says the pins are back.
     #[test]
     fn a_rollback_its_relaunched_reader_did_not_keep_is_reported_once_as_not_kept() {
         let pins = Target::new("com.apple.dock", "persistent-apps");
@@ -3356,11 +3509,10 @@ mod tests {
         assert!(doctor.follow_up(root.path()).unwrap().is_none());
     }
 
-    /// aterm 0.118.0 and older recorded their one widgets item, `init.widgets@<user>`: for the
-    /// follow-up, which with the grant still reads it as Notification Center's row, clears
-    /// that list once and drops the record; and as settled, which holds each of the three
-    /// widget rows as it is. Negative control: loading the follow-up record's ids as written
-    /// runs no follow-up, and drops the record with the list as it was.
+    /// The one widgets item aterm 0.118.0 and older recorded, `init.widgets@<user>`, reads as
+    /// Notification Center's row for the follow-up, which clears that list once, and as each of
+    /// the three widget rows when settled. Negative control: reading the follow-up record's ids
+    /// as written runs no follow-up.
     #[test]
     fn a_follow_up_an_older_aterm_recorded_still_clears_notification_center() {
         let mut widgets = Selection::none();
@@ -4109,8 +4261,7 @@ mod tests {
         assert_eq!(load_withheld(root.path()).unwrap().items, [WIDGETS]);
     }
 
-    /// A Workstation pass a choice narrowed to the groups it turned on selects those
-    /// groups' preferences alone, so the other group's settings stay as the person left them.
+    /// A narrowed pass leaves the other group's settings as the person left them.
     #[test]
     fn a_narrowed_preferences_pass_selects_only_the_groups_it_names() {
         let root = aterm_tempfile::tempdir().expect("scratch");
@@ -4139,9 +4290,78 @@ mod tests {
         );
     }
 
-    /// A Workstation pass whose scope a choice narrowed to nothing (a group turned to Set
-    /// up, then back before its pass landed) owes nothing: it reports the stage done, never
-    /// the blocked "waiting for the next automatic Mac settings retry" on every pass.
+    /// After a Restore, a choice turned Desktop & Dock to Set up: its Workstation pass (the
+    /// real one, scoped to that group) marks the first-run decision pending without
+    /// dropping what the Restore keeps, so Keyboard & Trackpad, which it never set, still
+    /// stand restored and the profile does not read applied; the pass takes out only what
+    /// it set. NEGATIVE CONTROL: the same pass with no Restore reads applied.
+    #[test]
+    fn a_narrowed_pass_after_a_restore_leaves_the_other_group_restored() {
+        use aterm_types::macos_setup::Group;
+        let group = |group: Group| {
+            let mut selection = Selection::none();
+            for setting in group.settings() {
+                selection.set(*setting, true);
+            }
+            selection
+        };
+        let (desktop, input) = (group(Group::Desktop), group(Group::Input));
+        let record = |root: &Path| -> Value {
+            aterm_json::from_slice(&std::fs::read(root.join("first-run.json")).unwrap()).unwrap()
+        };
+        let pass = |root: &Path| {
+            let mut host = Fake::default();
+            let report = apply_part_with(
+                root,
+                &Inert::default(),
+                &mut host,
+                BUILD,
+                at(0),
+                Part::Preferences {
+                    only: Some(desktop),
+                },
+            )
+            .expect("pass")
+            .expect("the pass ran");
+            assert!(!report.needs_attention(), "{:?}", report.rows);
+            assert_eq!(host.selected, Some(desktop));
+        };
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        write_json(
+            &root.path().join("first-run.json"),
+            &json!({
+                "profile": PROFILE,
+                "state": "pending",
+                "restored": initial::preferences(Selection::all()).bits(),
+                "queued": desktop.bits(),
+                "selection": Selection::all().bits(),
+            }),
+        )
+        .unwrap();
+        pass(root.path());
+        let after = record(root.path());
+        assert_eq!(after["state"].as_str(), Some("pending"), "{after}");
+        assert_eq!(
+            after["restored"].as_u64(),
+            Some(u64::from(input.bits())),
+            "Keyboard & Trackpad were never set again: {after}"
+        );
+        assert_eq!(after["queued"].as_u64(), Some(0), "{after}");
+        assert!(!first_run_complete(root.path()).unwrap());
+
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+        pass(root.path());
+        assert!(
+            first_run_complete(root.path()).unwrap(),
+            "{}",
+            record(root.path())
+        );
+    }
+
+    /// A Workstation pass a choice narrowed to nothing (a group turned to Set up, then back
+    /// before its pass landed) reports the stage done, never a blocked retry on every pass.
     #[test]
     fn an_empty_workstation_scope_is_a_finished_stage() {
         let root = aterm_tempfile::tempdir().expect("scratch");
@@ -5190,6 +5410,40 @@ mod tests {
     }
 
     const BUILD: &str = "1.0.0+gaaaa";
+
+    #[test]
+    fn mac_settings_deadlines_name_only_unspent_current_run_and_build_attempts() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let failed = |item: &str, build: &str, tries, at| Failed {
+            item: item.into(),
+            build: build.into(),
+            tries,
+            at,
+        };
+        Automatic {
+            settled: vec!["settled".into()],
+            failed: vec![
+                failed("older", BUILD, 1, 0),
+                failed("later", BUILD, 1, 600),
+                failed("settled", BUILD, 1, 1),
+                failed("spent", BUILD, 2, 2),
+                failed("untried", BUILD, 0, 3),
+                failed("another-build", "other", 1, 4),
+            ],
+        }
+        .save(root.path(), 7)
+        .unwrap();
+        let due = |revision, build, now| {
+            mac_settings_retry_due(root.path(), revision, build, now).unwrap()
+        };
+        assert_eq!(due(7, BUILD, 599), None);
+        assert_eq!(due(7, BUILD, 600), Some(600));
+        assert_eq!(due(7, BUILD, 1_199), Some(600));
+        assert_eq!(due(7, BUILD, 1_200), Some(1_200));
+        assert_eq!(due(7, BUILD, 599), None, "a backward clock is not due");
+        assert_eq!(due(8, BUILD, 2_000), None, "another run");
+        assert_eq!(due(7, "absent-build", 2_000), None, "another build");
+    }
 
     #[test]
     fn a_standing_failure_is_tried_twice_and_then_never_again_by_the_automatic_worker() {

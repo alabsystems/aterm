@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `write_held`,
-//! `HoldClock`, and `Books`, and, in its stuck runs (`Key = 1`), to the stuck fact's door:
-//! `FactsState::observe`/`pending` on a facts reading and `stuck_at_break` under the owner's
-//! `[harness] stuck_break_note` grant; and, in its hold-rule runs, `age` and `esc` to the K clock
-//! (`DueClock`) the loop feeds after the decider, whose `sample` its `Sample` and `SampleLast`
-//! drive in their own evidence windows.
+//! Tier-1 conformance of `OccupancyDoor` to `occupancy::decide`, `write_held`, `HoldClock` and
+//! `Books`; in its stuck runs (`Key = 1`), to `FactsState` and `stuck_at_break` under the
+//! `[harness] stuck_break_note` grant; in its hold-rule runs, `age` and `esc` to the K clock
+//! (`DueClock`), whose `sample` its `Sample` and `SampleLast` drive in their own evidence windows.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -60,8 +58,8 @@ struct Real {
     /// The hung call's leader's birth: an episode closed in an odd variant's run reopens on a
     /// call born later in the same group.
     birth: u64,
-    /// The K clock, fed as the loop's `door_k` feeds it, on its own clock: `look` moves one look
-    /// at each `Sample` and `SampleLast` alone, so the hold's and the pace's clocks never age it.
+    /// The K clock, fed as the loop's `door_k` feeds it. Its clock, `look`, moves only at
+    /// `Sample` and `SampleLast`, so the hold's and the pace's clocks never age it.
     due: DueClock<EpisodeKey>,
     look: i64,
     /// The episode the K clock was last fed, if any.
@@ -288,7 +286,7 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
 
 /// The K clock's feed at `st`, as the loop's `door_k` makes it after the decider: the run's
 /// episode with the guard holding it (for a due line, the one its write finds; for a paced one,
-/// none), or nothing for a quiet or spent line. The stuck fact's line is not the loop's K clock's.
+/// none), or nothing for a quiet or spent line. The stuck fact's line does not feed it.
 fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
     if run.stuck {
         return;
@@ -311,10 +309,9 @@ fn k_feed(m: &Model, st: &State, r: &mut Real, run: Run) {
     r.due.observe(&named, r.look);
 }
 
-/// The walk holds `age` and `esc` to the K clock: in a hold rule's run, committed or with a
-/// defect planted in the clock. A defect planted in the decider or the hold shows where the model
-/// says through `held` and the verdict; the clock downstream of it would show it again wherever
-/// the line it forgets stood due.
+/// Whether the walk holds `age` and `esc` to the K clock: in a hold rule's run, committed or with
+/// a defect planted in the clock. A defect in the decider or the hold already shows through `held`
+/// and the verdict, so the clock downstream of it is not checked there.
 fn k_projected(run: Run) -> bool {
     !run.stuck
         && run.fault.is_none_or(|f| {
@@ -325,8 +322,8 @@ fn k_projected(run: Run) -> bool {
         })
 }
 
-/// A person holds the line the K clock was last fed: the real clock never raises under them (the
-/// slice-2 plan's S15), which the model's `SampleLast` does not draw.
+/// A person holds the line the K clock was last fed: the real clock never raises under them,
+/// which the model's `SampleLast` does not draw.
 fn person_holds(r: &Real) -> bool {
     r.k_key
         .and_then(|key| r.due.get(&key))

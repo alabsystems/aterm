@@ -84,8 +84,8 @@ impl Choice {
 /// One reading of the two clocks a mode is kept and shown against.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Clocks {
-    /// Whole seconds since this Mac booted, time asleep included (`mach_continuous_time`): no
-    /// change of the date or time moves it, and every deadline is on it.
+    /// Whole seconds since this Mac booted, time asleep included (`mach_continuous_time`); every
+    /// deadline is on it.
     pub since_boot: u64,
     /// Whole seconds since the Unix epoch, as the wall clock reads.
     pub wall: u64,
@@ -132,7 +132,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// On for `span` seconds from `now`, or [`Mode::Forever`] for `None`.
+    /// On for `span` seconds from `now` (off for zero), or [`Mode::Forever`] for `None`.
     #[inline]
     #[must_use]
     pub const fn activate(span: Option<u64>, now: Clocks) -> Self {
@@ -164,9 +164,8 @@ impl Mode {
         }
     }
 
-    /// This mode as it stands at `now`: off past its deadline, and with no more than its span
-    /// left (a deadline further off, which no choice sets, such as a hand-edited file's, comes
-    /// in to its span).
+    /// This mode at `now`: off past its deadline, and with no more than its span left (a deadline
+    /// further off, such as a hand-edited file's, comes in to its span).
     #[inline]
     #[must_use]
     pub const fn settled(self, now: Clocks) -> Self {
@@ -318,9 +317,8 @@ mod tests {
         );
     }
 
-    /// The wall clock set back a day ten minutes into a span (by the person, or by the Mac
-    /// correcting a clock that ran fast) leaves the span the time it had: it keeps the Mac awake
-    /// no longer than it was set for, and its end on the wall clock moves back with the date.
+    /// A wall clock set back a day mid-span keeps the span to the time it was set for, and its end
+    /// on the wall clock moves back with the date.
     #[test]
     fn a_wall_clock_set_back_keeps_no_span_longer_than_it_was_set_for() {
         for choice in TIMED {

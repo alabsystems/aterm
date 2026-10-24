@@ -10340,7 +10340,7 @@ fn d_projected(rows: &[String], text: &str) -> (i64, i64, i64, i64) {
     let open = refusal.label != REFUSAL_LABEL;
     let placeholder = format!(
         "{REFUSAL_LABEL}, {}",
-        aterm_phase::anchor("prompt.amend_no")
+        aterm_phase::anchor!("prompt.amend_no")
     );
     let held = if !open || refusal.label == placeholder {
         0

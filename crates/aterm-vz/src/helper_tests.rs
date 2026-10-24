@@ -6,6 +6,7 @@
 //! is handed, and every wait on another thread is a one-minute hang detector.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -129,6 +130,7 @@ impl Rig {
             ident,
             record,
             hold_conns,
+            key_disk: dir.path().join("key.img"),
             free: Box::new(move || {
                 Ok(Free {
                     bytes: *reading.lock().unwrap(),
@@ -264,6 +266,27 @@ impl Rig {
             .expect("the agent dialed")
             .try_clone()
             .unwrap()
+    }
+
+    /// This boot's key, as guest root reads it off the key disk.
+    fn key(&self) -> crate::key::Key {
+        aterm_vz_agent::key::read_disk(&self.dir.path().join("key.img"))
+            .unwrap()
+            .expect("a boot wrote its key disk")
+    }
+
+    /// Take the posted inputs until `done` holds, a one-minute hang detector each.
+    fn pump_until(&mut self, now: Duration, mut done: impl FnMut(&Self) -> bool) -> Flow {
+        for _ in 0..64 {
+            if done(self) {
+                return Flow::Go;
+            }
+            let flow = self.pump(now);
+            if flow != Flow::Go {
+                return flow;
+            }
+        }
+        panic!("the core did not get there within 64 inputs");
     }
 
     /// The agent sends `frame`; the core takes it at `now`.
@@ -565,9 +588,10 @@ fn a_guest_running_another_agent_is_stopped_naming_both_hashes_never_through_it(
     assert_eq!(
         why,
         [format!(
-            "NOT RUN — the guest runs agent {} (protocol 1); this checkout built {} (protocol 1)",
+            "NOT RUN — the guest runs agent {} (protocol {p}); this checkout built {} (protocol {p})",
             "cd".repeat(32),
-            agent_hex()
+            agent_hex(),
+            p = wire::PROTO
         )]
     );
     // A guest that does not power off is stopped hard a span after the request (3 s).
@@ -963,25 +987,383 @@ fn state_reports_the_record_the_beat_the_free_space_and_the_tail() {
 }
 
 #[test]
-fn a_watch_connection_is_kept_and_its_frames_reach_the_core() {
+fn a_keyed_dial_is_kept_and_its_frames_reach_the_core_with_the_key_withheld() {
     let mut rig = Rig::new(Script::default());
     rig.attached(1, false);
     assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    // The boot's plan gained the key disk, read-only, last; the file is owner-only.
+    let Some(Call::Boot(p)) = rig
+        .seen
+        .calls()
+        .into_iter()
+        .find(|c| matches!(c, Call::Boot(_)))
+    else {
+        panic!("booted");
+    };
+    let key_disk = rig.dir.path().join("key.img");
+    assert_eq!(
+        p.disks.last(),
+        Some(&Disk {
+            path: key_disk.clone(),
+            read_only: true
+        })
+    );
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&key_disk).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let key = rig.key();
     let (conn, mut guest) = conn_pair(aterm_vz_agent::WATCH_PORT, &rig.seen.live_conns);
     assert_eq!(
         rig.core.handle(Input::Machine(Event::Watch(conn)), S),
         Flow::Go
     );
-    assert_eq!(rig.seen.live(), 1, "the watch connection's object is held");
+    assert_eq!(rig.seen.live(), 1, "the dial's object is held");
+    wire::write_frame(
+        &mut guest,
+        &Frame::Hello(crate::machine::fake::hello(AGENT, key)),
+    )
+    .unwrap();
     wire::write_frame(&mut guest, &Frame::Beat { uptime_ms: 5 }).unwrap();
+    let Input::Watch(dial, Frame::Hello(h)) = rig.rx.recv_timeout(SPAN).unwrap() else {
+        panic!("the hello first");
+    };
+    assert_eq!(
+        h.key,
+        [0; crate::key::LEN],
+        "the key is zeroed before the core"
+    );
     assert!(matches!(
         rig.rx.recv_timeout(SPAN).unwrap(),
-        Input::Watch(Frame::Beat { uptime_ms: 5 })
+        Input::Watch(d, Frame::Beat { uptime_ms: 5 }) if d == dial
     ));
     drop(guest);
     assert!(matches!(
         rig.rx.recv_timeout(SPAN).unwrap(),
-        Input::WatchClosed(_)
+        Input::WatchClosed(d, _) if d == dial
+    ));
+}
+
+#[test]
+fn a_forger_that_dials_first_is_refused_and_the_agent_that_dials_after_is_taken() {
+    // A guest process that is not root dials port 1025 before the agent, with a hello that
+    // names the plan's agent, a Ready and a Beat, but a key it guessed.
+    let mut rig = Rig::with(
+        Script {
+            on_boot: vec![
+                FakeEvent::Started,
+                FakeEvent::Forger {
+                    agent_sha256: AGENT,
+                    speaks: true,
+                },
+                FakeEvent::Agent {
+                    agent_sha256: AGENT,
+                    ready: true,
+                },
+            ],
+            ..Script::default()
+        },
+        false,
+        true,
+    );
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    assert_eq!(
+        rig.pump_until(S * 9, |r| r.core.phase() == Phase::Ready),
+        Flow::Go
+    );
+    let (sent, ended) = rig.sent(1);
+    assert!(!ended);
+    // Every hello the session heard is the agent's: no frame of the forger's was believed.
+    let readies: Vec<_> = sent
+        .iter()
+        .filter_map(|r| match r {
+            Reply::Ready(h) => Some(h.boot_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(readies, [BOOT_ID]);
+    assert!(
+        !sent
+            .iter()
+            .any(|r| matches!(r, Reply::Booting(n) if n.contains("forged"))),
+        "{sent:?}"
+    );
+    let (path, _) = rig.core.cfg.record.clone().unwrap();
+    assert_eq!(
+        Record::read(&path).unwrap().boot_id.as_deref(),
+        Some(BOOT_ID)
+    );
+    // The forger's dial is closed (its end reads EOF, and no Clock); the agent's got the
+    // host's clock.
+    let mut forger = rig.seen.forger_ends.lock().unwrap().remove(0);
+    // macOS refuses the option on a socket its peer closed (EINVAL): already closed.
+    let _ = forger.set_read_timeout(Some(SPAN));
+    assert!(
+        !matches!(wire::read_frame(&mut forger), Ok(Some(_))),
+        "the forger's dial is closed, and hears nothing"
+    );
+    let mut end = rig.watch_end();
+    end.set_read_timeout(Some(SPAN)).unwrap();
+    assert!(matches!(
+        wire::read_frame(&mut end).unwrap(),
+        Some(Frame::Clock { .. })
+    ));
+    // Only the agent's dial is held.
+    assert_eq!(rig.seen.live(), 1);
+}
+
+#[test]
+fn the_agents_keyed_dial_closes_every_dial_still_waiting_at_once() {
+    // Two guest processes dial before the agent and say nothing, so no tick has closed them
+    // when the agent's keyed hello comes.
+    let mut rig = Rig::with(
+        Script {
+            on_boot: vec![
+                FakeEvent::Started,
+                FakeEvent::Forger {
+                    agent_sha256: AGENT,
+                    speaks: false,
+                },
+                FakeEvent::Forger {
+                    agent_sha256: AGENT,
+                    speaks: false,
+                },
+                FakeEvent::Agent {
+                    agent_sha256: AGENT,
+                    ready: true,
+                },
+            ],
+            ..Script::default()
+        },
+        false,
+        true,
+    );
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    assert_eq!(
+        rig.pump_until(S * 9, |r| r.core.phase() == Phase::Ready),
+        Flow::Go
+    );
+    // Long before a silent dial's minute: only the agent's dial is held.
+    assert_eq!(rig.seen.live(), 1);
+    assert!(rig.core.dials.is_empty());
+    let ends = std::mem::take(&mut *rig.seen.forger_ends.lock().unwrap());
+    assert_eq!(ends.len(), 2);
+    for end in &ends {
+        // Closed, not waiting: EOF at once, never WouldBlock (the negative control is the
+        // silent dials' own test, where a waiting dial reads WouldBlock until its tick).
+        end.set_nonblocking(true).unwrap();
+        let mut probe = [0u8; 1];
+        let got = (&*end).read(&mut probe);
+        assert!(matches!(got, Ok(0)), "a waiting dial was closed: {got:?}");
+    }
+}
+
+#[test]
+fn a_helpers_exit_removes_the_key_disk_and_only_its_own_record_and_socket() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::at(dir.path().join("vz.noindex"));
+    std::fs::create_dir_all(paths.run_dir()).unwrap();
+    let ours = Record {
+        pid: 4242,
+        uniq: 77,
+        helper_sha256: HELPER.into(),
+        proto: PROTO,
+        live_disk: paths.live_disk(),
+        started: 1_792_000_000,
+        boot_id: None,
+        agent_sha256: None,
+    };
+    let socket = paths.socket();
+    let lay = |record: &Record| {
+        record.write(&paths.record()).unwrap();
+        std::fs::write(&socket, b"").unwrap();
+        std::fs::write(paths.key_disk(), b"aterm-vz-key v1").unwrap();
+    };
+    lay(&ours);
+    release_run_files(&paths, &ours, &socket);
+    assert!(!paths.record().exists() && !socket.exists());
+    assert!(!paths.key_disk().exists(), "no key outlives its helper");
+    // The negative control: another helper's record and socket stay; the key disk this
+    // helper wrote under the lock still goes.
+    let theirs = Record {
+        pid: 5151,
+        uniq: 88,
+        ..ours.clone()
+    };
+    lay(&theirs);
+    release_run_files(&paths, &ours, &socket);
+    assert_eq!(Record::read(&paths.record()).map(|r| r.pid), Some(5151));
+    assert!(socket.exists());
+    assert!(!paths.key_disk().exists());
+}
+
+#[test]
+fn a_boot_keeps_the_last_boots_console_beside_its_own() {
+    let mut rig = ready_rig(false, true);
+    assert_eq!(rig.console("[    1.0] the first boot\n", S * 11), Flow::Go);
+    // The guest stops by itself; a second boot follows on another helper's core.
+    let log = rig.console_log();
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("the first boot")
+    );
+    let plan = plan(&log);
+    let mut second = Rig::with(agent_script(), false, false);
+    second.attached(1, false);
+    assert_eq!(
+        second.req(1, Request::Boot(Box::new(plan)), Duration::ZERO),
+        Flow::Go
+    );
+    let kept = std::fs::read_to_string(previous_console(&log)).unwrap();
+    assert!(kept.contains("the first boot"), "{kept}");
+    let fresh = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!fresh.contains("the first boot"), "{fresh}");
+}
+
+#[test]
+fn the_negative_control_a_forger_alone_never_makes_the_vm_ready_and_the_boot_detector_names_it() {
+    let mut rig = Rig::new(Script {
+        on_boot: vec![
+            FakeEvent::Started,
+            FakeEvent::Forger {
+                agent_sha256: AGENT,
+                speaks: true,
+            },
+        ],
+        ..Script::default()
+    });
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    assert_eq!(rig.pump(S), Flow::Go, "its refusal");
+    assert_eq!(rig.core.phase(), Phase::Booting);
+    assert_eq!(rig.ticks(S * 2, S * 59), Flow::Go);
+    assert_eq!(rig.core.phase(), Phase::Booting);
+    assert_eq!(rig.ticks(S * 60, S * 60), Flow::Go);
+    assert_eq!(rig.seen.calls().last(), Some(&Call::HardStop));
+    let (sent, _) = rig.sent(1);
+    assert!(!sent.iter().any(|r| matches!(r, Reply::Ready(_))));
+    let why = lost_why(&sent);
+    assert_eq!(why.len(), 1, "{why:?}");
+    assert!(
+        why[0].starts_with("NOT RUN — the boot hung before the agent")
+            && why[0].ends_with(&format!(
+                "1 dial(s) of the watch port refused, the last: its hello (agent {}, boot \
+                 forged) carried another key",
+                agent_hex()
+            )),
+        "{why:?}"
+    );
+}
+
+#[test]
+fn silent_dials_close_after_a_minute_and_dials_past_the_cap_close_unread() {
+    let mut on_boot = vec![FakeEvent::Started];
+    on_boot.extend((0..=MAX_DIALS).map(|_| FakeEvent::Forger {
+        agent_sha256: AGENT,
+        speaks: false,
+    }));
+    let mut rig = Rig::new(Script {
+        on_boot,
+        ..Script::default()
+    });
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    let mut ends = std::mem::take(&mut *rig.seen.forger_ends.lock().unwrap());
+    assert_eq!(ends.len(), MAX_DIALS + 1);
+    // The one past the cap was closed unread at once; the others wait.
+    let mut last = ends.pop().unwrap();
+    let _ = last.set_read_timeout(Some(SPAN));
+    assert!(!matches!(wire::read_frame(&mut last), Ok(Some(_))));
+    for end in &ends {
+        end.set_nonblocking(true).unwrap();
+        let mut probe = [0u8; 1];
+        let got = (&*end).read(&mut probe);
+        assert!(
+            matches!(&got, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a waiting dial is still open: {got:?}"
+        );
+        end.set_nonblocking(false).unwrap();
+    }
+    // The console keeps the boot alive; a minute after they dialed, a tick closes them.
+    for t in 1..60 {
+        assert_eq!(
+            rig.console(&format!("[  {t}.0] line {t}\n"), S * t),
+            Flow::Go
+        );
+    }
+    assert_eq!(rig.ticks(S * 59, S * 59), Flow::Go);
+    assert_eq!(rig.seen.live(), MAX_DIALS);
+    assert_eq!(rig.ticks(S * 60, S * 60), Flow::Go);
+    assert_eq!(rig.seen.live(), 0);
+    for mut end in ends {
+        let _ = end.set_read_timeout(Some(SPAN));
+        assert!(!matches!(wire::read_frame(&mut end), Ok(Some(_))));
+    }
+    // The agent's keyed dial after them is taken.
+    let key = rig.key();
+    let (conn, mut guest) = conn_pair(aterm_vz_agent::WATCH_PORT, &rig.seen.live_conns);
+    wire::write_frame(
+        &mut guest,
+        &Frame::Hello(crate::machine::fake::hello(AGENT, key)),
+    )
+    .unwrap();
+    assert_eq!(
+        rig.core.handle(Input::Machine(Event::Watch(conn)), S * 61),
+        Flow::Go
+    );
+    assert_eq!(
+        rig.pump_until(S * 61, |r| r.core.hello.is_some()),
+        Flow::Go,
+        "Hello"
+    );
+    let (sent, _) = rig.sent(1);
+    assert!(
+        sent.iter()
+            .any(|r| matches!(r, Reply::Booting(n) if n.contains(BOOT_ID))),
+        "{sent:?}"
+    );
+}
+
+#[test]
+fn the_agents_own_watch_code_is_taken_after_a_forger_and_beats() {
+    let mut rig = Rig::new(Script {
+        on_boot: vec![
+            FakeEvent::Started,
+            FakeEvent::Forger {
+                agent_sha256: AGENT,
+                speaks: true,
+            },
+            FakeEvent::RealAgent {
+                agent_sha256: AGENT,
+                tick_ms: 20,
+            },
+        ],
+        ..Script::default()
+    });
+    rig.attached(1, false);
+    assert_eq!(rig.boot(1, Duration::ZERO), Flow::Go);
+    assert_eq!(
+        rig.pump_until(S * 9, |r| r.core.phase() == Phase::Ready),
+        Flow::Go
+    );
+    // Its beats reach the heartbeat detector: past a minute after Ready, the VM is up.
+    assert_eq!(
+        rig.pump_until(S * 70, |r| {
+            r.core.watch.as_ref().and_then(Watch::last_beat) == Some(S * 70)
+        }),
+        Flow::Go,
+        "a Beat"
+    );
+    assert_eq!(rig.ticks(S * 70, S * 70), Flow::Go);
+    assert_eq!(rig.core.phase(), Phase::Ready);
+    let (sent, _) = rig.sent(1);
+    assert!(matches!(
+        sent.iter().find(|r| matches!(r, Reply::Ready(_))),
+        Some(Reply::Ready(h)) if h.boot_id == BOOT_ID && h.key == [0; crate::key::LEN]
     ));
 }
 
@@ -989,22 +1371,15 @@ fn a_watch_connection_is_kept_and_its_frames_reach_the_core() {
 fn a_second_dial_of_the_watch_port_is_refused_and_none_of_its_frames_reach_the_core() {
     let mut rig = ready_rig(false, false);
     let live = rig.seen.live();
-    // Something else in the guest dials port 1025 after the agent did, and has already
-    // written a beat and a hello naming another agent.
+    // Something else in the guest dials port 1025 after the agent did, even with this
+    // boot's key (guest root), and has already written a beat and a hello.
+    let key = rig.key();
     let (conn, mut other) = conn_pair(aterm_vz_agent::WATCH_PORT, &rig.seen.live_conns);
     other.set_read_timeout(Some(SPAN)).unwrap();
+    let mut forged = crate::machine::fake::hello([0xcd; 32], key);
+    forged.boot_id = "forged".into();
+    wire::write_frame(&mut other, &Frame::Hello(forged)).unwrap();
     wire::write_frame(&mut other, &Frame::Beat { uptime_ms: 1 }).unwrap();
-    wire::write_frame(
-        &mut other,
-        &Frame::Hello(wire::Hello {
-            proto: wire::PROTO,
-            agent_sha256: [0xcd; 32],
-            boot_id: "forged".into(),
-            kernel: "6.8.0-142-generic".into(),
-            uptime_ms: 1,
-        }),
-    )
-    .unwrap();
     assert_eq!(
         rig.core.handle(Input::Machine(Event::Watch(conn)), S * 11),
         Flow::Go
@@ -1035,6 +1410,28 @@ fn a_second_dial_of_the_watch_port_is_refused_and_none_of_its_frames_reach_the_c
     assert_eq!(
         lost_why(&sent),
         ["the guest stopped answering (no heartbeat for 60 s); VM stopped"]
+    );
+}
+
+#[test]
+fn a_hello_is_believed_only_with_this_boots_key() {
+    let key = [0x42; crate::key::LEN];
+    let mut other = key;
+    other[31] ^= 1;
+    let h = crate::machine::fake::hello(AGENT, key);
+    assert_eq!(
+        keyed_hello(Frame::Hello(h.clone()), &key).map(|h| h.key),
+        Ok([0; crate::key::LEN])
+    );
+    assert!(
+        keyed_hello(Frame::Hello(h), &other)
+            .unwrap_err()
+            .contains("carried another key")
+    );
+    assert!(
+        keyed_hello(Frame::Beat { uptime_ms: 1 }, &key)
+            .unwrap_err()
+            .contains("not the agent's hello")
     );
 }
 

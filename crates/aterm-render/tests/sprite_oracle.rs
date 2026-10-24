@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The differential law of lane B7 (`docs/DESIGN-card-engine-2026-10-19.md`
+//! The sprite layers' differential law (`docs/DESIGN-card-engine-2026-10-19.md`
 //! §6): every companion sprite the old path could draw, drawn as a sprite
-//! layer ([`aterm_render::sprites`]), is the old stamp byte for byte, the
-//! knock-out included: on random pages, at 1:1 and integer scales, mirrored,
-//! cut by a peek's window or a pane's box, under and over the text, on the
-//! full path and the damaged one. The old path is the
-//! [`aterm_render::legacy_sprite_oracle`]. At a non-integer scale the two
-//! part on purpose: the layer maps a texel by the floor of its scale (Law F,
-//! the same on the CPU, Metal and wgpu) where the old stamp sampled texel
-//! centres.
+//! layer ([`aterm_render::sprites`]), is the old stamp
+//! ([`aterm_render::legacy_sprite_oracle`]) byte for byte, the knock-out
+//! included: on random pages, at 1:1 and integer scales, mirrored, cut by a
+//! peek's window or a pane's box, under and over the text, on the full path and
+//! the damaged one. At a non-integer scale the two part on purpose: the layer
+//! maps a texel by the floor of its scale (Law F, the same on the CPU, Metal
+//! and wgpu) where the old stamp sampled texel centres.
 
 use std::sync::Arc;
 

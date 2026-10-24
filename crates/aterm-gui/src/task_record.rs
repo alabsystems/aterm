@@ -118,7 +118,8 @@ pub(crate) struct TaskRecord {
     pub(crate) result_bytes: u64,
     /// Path to the result file under [`tasks_dir`], if any.
     pub(crate) result_path: Option<PathBuf>,
-    /// Whether supervisor, `NEEDS YOU:` or codex-alab's own attention stands on the session ([`supervisor_attention`]).
+    /// Whether supervisor, `NEEDS YOU:` or codex-alab's own attention stands on the session
+    /// ([`supervisor_attention`]).
     pub(crate) attention: bool,
     /// Wall-clock timestamp (unix ms) when the current state was entered.
     pub(crate) since_unix_ms: u64,
@@ -130,9 +131,9 @@ pub(crate) struct TaskRecord {
     pub(crate) agent: Option<aterm_phase::Program>,
     /// Canonical `cwd` trusted by the starter when spawning the worker.
     pub(crate) trusted_cwd: Option<String>,
-    /// THE FACT WORD the harness loop noted for a managed worker under the owner's `prompt`
-    /// ([`mark_session_task_fact_if`], `fact=`): the line it would have typed but for the manager.
-    /// Only the closed [`FactWord`] stands here; a mark never touches it.
+    /// The fact word the harness loop noted for a managed worker under the owner's `prompt`
+    /// (`fact=`, [`mark_session_task_fact_if`]): the line it would have typed but for the
+    /// manager. A mark never touches it.
     pub(crate) fact: Option<FactWord>,
     /// The fact word's own revision (`fact_rev=`): moved by every edit of [`Self::fact`], never by
     /// a mark, and never moving [`Self::rev`], so no `await task` past a rev wakes on it.
@@ -168,8 +169,8 @@ impl TaskRecord {
         out
     }
 
-    /// ` fact=<word|-> fact_rev=<n>` once the fact word was ever edited (`fact_rev` past 0): a
-    /// record the harness never noted reads as it did before the word.
+    /// ` fact=<word|-> fact_rev=<n>` once the fact word was ever edited (`fact_rev` past 0); a
+    /// record the harness never noted carries neither field.
     pub(crate) fn push_fact(&self, out: &mut String) {
         if self.fact_rev == 0 {
             return;
@@ -193,7 +194,8 @@ impl TaskRecord {
         }
     }
 
-    /// Formats the record for seamless-update handoff ([`crate::session_store::SessionRecord::task`]).
+    /// Formats the record for seamless-update handoff
+    /// ([`crate::session_store::SessionRecord::task`]).
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn carry_row(&self) -> String {
@@ -227,12 +229,11 @@ impl TaskRecord {
 
     /// Restores and validates a [`TaskRecord`] from a seamless-update carry row.
     ///
-    /// The fact word crosses with its `fact_rev=` (absent, or not a number, reads 0), read as the
-    /// closed [`FactWord`] alone: a word that does not parse, or one with no rev past 0, reads
-    /// `None` and keeps the record. The successor's loop then finds the word its predecessor
-    /// noted standing, as after a plain restart, so noting the same episode again moves nothing
-    /// and wakes no `facts=1` waiter twice (`Session::door_task_seed` clears a word no open hold
-    /// stands for, under the owner's `prompt` alone).
+    /// A `fact_rev=` absent or not a number reads 0; a `fact=` that is no [`FactWord`], or has no
+    /// rev past 0, reads `None` and keeps the record. The successor's loop finds the carried word
+    /// standing, as after a plain restart, so noting the same episode again wakes no `facts=1`
+    /// waiter twice; the loop clears a carried word no open hold stands for (aterm-agent's
+    /// `Session::door_task_seed`).
     #[must_use]
     pub(crate) fn from_carry_row(
         row: &str,
@@ -496,7 +497,8 @@ fn spelled_as_its_parts(path: &Path) -> bool {
     }
 }
 
-/// The attention owner codex-alab raises its own points left to a person under (a box it left unanswered, a wall, a login): a worker that carries itself, waiting on someone.
+/// The attention owner codex-alab raises its own points for a person under (a box it left
+/// unanswered, a wall, a login): a worker that carries itself, waiting on someone.
 pub(crate) const SELF_CLAIM_ATTENTION_OWNER: &str = "codex-alab";
 
 /// The attention owners whose entries move the task record's attention flag.
@@ -583,7 +585,8 @@ pub(crate) struct MarkedWith {
     pub(crate) attention_moved: bool,
 }
 
-/// [`mark_session_task_within`] applied only when `when` holds on the session's whole timeline (its record and its task face, read together under the lock the mark takes).
+/// [`mark_session_task_within`] applied only when `when` holds on the session's whole timeline
+/// (its record and task face, read together under the lock the mark takes).
 pub(crate) fn mark_session_task_seen(
     ctx: &SessionCtx,
     local_id: u64,
@@ -703,19 +706,18 @@ pub(crate) fn mark_session_task_fact(
     mark_session_task_fact_if(ctx, local_id, word, fence_wait, || true)
 }
 
-/// THE FACT WORD'S EDIT (`fact=`, the occupancy design's manager door): `word` set on
-/// `ctx`'s task record, or cleared with `None`, under the lock a mark takes
-/// ([`mark_session_task_with`]) and the fence a committing update holds (waiting at most
-/// `fence_wait`). It moves [`TaskRecord::fact_rev`] alone, never `rev`, `entered`, `since` or
-/// `state`, so every `await task` past a rev and `result`'s repair CAS read the record as before;
-/// a waiter that asked for facts (`facts=1`) and the session's `EVENT … task` see it. A word
-/// already standing is noted again without a move, and a clear with none standing moves nothing.
+/// Sets the fact word (`fact=`, the occupancy design's manager door) on `ctx`'s task record, or
+/// clears it with `None`, under the lock a mark takes and the fence a committing update holds
+/// (waiting at most `fence_wait`). It moves only [`TaskRecord::fact_rev`], so `await task` past a
+/// rev and `result`'s repair CAS see no change; a `facts=1` waiter and the session's
+/// `EVENT … task` see it. Noting the standing word again, or clearing with none standing, moves
+/// nothing.
 ///
 /// [`NoteOutcome::NoTask`] with no record, [`NoteOutcome::Closed`] for a word on an `exited`
 /// record (a clear is always taken), [`NoteOutcome::Fenced`] when the fence held past
-/// `fence_wait` or the caller's live write authority (`when`) was withdrawn. Read that authority
-/// after both the fence and timeline waits, beside the edit: a mode change during either wait
-/// must retain the loop's pending note or clear without moving the record or posting a wake.
+/// `fence_wait` or `when` (the caller's live write authority) is false. `when` is read after both
+/// the fence and timeline waits, so a mode change during either wait leaves the loop's note or
+/// clear pending and moves no record and posts no wake.
 pub(crate) fn mark_session_task_fact_if(
     ctx: &SessionCtx,
     local_id: u64,
@@ -826,11 +828,10 @@ pub(crate) fn cmd_result(ctx: &SessionCtx, local_id: u64, rest: &str) -> String 
     }
 }
 
-/// THE MISSED RESULT, KEPT: the record `record` (as `result` read it) marked
-/// again with `found`'s size as its `result_bytes=` — every other fact as it
-/// stands, a new rev, its waiters woken — then the snapshot at `path` and its
-/// sidecar written over with it, so `task`, `await task` and every later
-/// `result` agree.
+/// Marks `record` (as `result` read it) again with `found`'s size as its `result_bytes=`, when
+/// the record has not moved since: every other field as it stands, a new rev, its waiters woken.
+/// Then writes the snapshot at `path` and its sidecar over with it, so `task`, `await task` and
+/// every later `result` agree.
 fn repair_result(
     ctx: &SessionCtx,
     local_id: u64,

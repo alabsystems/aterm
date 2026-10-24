@@ -27,10 +27,10 @@ impl RowBands {
 
     /// The band of a `rows`-row grid holding window pixel row `y` (`rows > 0`):
     /// row 0 also holds every pixel above the grid, the last row every pixel
-    /// below it. A row a `usize` holds goes through the slicer's own
-    /// [`crate::fx_raster::band_at`] (one divide instruction, where i128's is a
-    /// library call: a changed layer pays this twice per item); only a row
-    /// past it divides in i128.
+    /// below it. A row that fits a `usize` goes through the slicer's own
+    /// [`crate::fx_raster::band_at`] (a native divide, where i128's is a library
+    /// call a changed layer pays twice per item); only a larger row divides in
+    /// i128.
     #[inline]
     pub(crate) const fn band_of(self, y: i128, rows: usize) -> usize {
         if y < 0 {
@@ -94,15 +94,13 @@ fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
 
 /// Mark the bands `layer` may write: each item's rows (its bounds moved and
 /// clipped as the layer draws it), not their hull, so a layer whose items
-/// stand apart down the frame marks the rows they stand on, as quads of the
-/// same pixels would, and none between.
+/// stand apart down the frame marks only the rows they stand on.
 ///
 /// Every item's rows lie inside the hull's bands, so the walk stops once each
 /// of those is dirty: a changed layer whose old self already marked its bands
-/// (a card redrawn in place) costs no walk, and one whose items tile their hull
-/// (a card) stops at the first items that reach all of them. A hull of one band
-/// is marked whole: at worst that over-marks a band whose items the clip cut
-/// away, which damage allows.
+/// costs no walk, and one whose items tile their hull stops at the first items
+/// that reach all of them. A one-band hull is marked whole, at worst
+/// over-marking a band the clip emptied, which damage allows.
 #[inline]
 fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
     let Some((y0, y1)) = window_rows(layer, bands) else {

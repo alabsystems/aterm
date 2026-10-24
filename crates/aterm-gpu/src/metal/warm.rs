@@ -15,10 +15,12 @@ use super::pipelines;
 use crate::FetchProbe;
 use crate::pipeline_table::{ALL_PIPELINES, FetchTwin, Pipeline, ShaderLibrary};
 
-/// What decides a first window's first frames beyond their text: the launch's config, as the window will pin it onto its renderer.
+/// What decides a first window's first frames beyond their text: the launch's config, as the
+/// window will pin it onto its renderer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FirstFrameKnobs {
-    /// The cursor aurora (a `cursor_trail_style` other than Off, or `cursor_momentum_glow`): the first prompt's cursor lights it, so that frame binds the additive glow.
+    /// The cursor aurora (a `cursor_trail_style` other than Off, or `cursor_momentum_glow`):
+    /// the first prompt's cursor lights it, so that frame binds the additive glow.
     pub aurora: bool,
     /// The aurora's bloom (`cursor_trail_bloom`).
     pub bloom: bool,
@@ -26,11 +28,16 @@ pub struct FirstFrameKnobs {
     pub hdr_glow: bool,
     /// The aurora's crown on an SDR screen (`cursor_glow_sdr_boost` above 0).
     pub sdr_glow: bool,
-    /// An fx layer on the first frames (the Claude card, `[claude_footer] card`): its Exact row.
+    /// An fx layer on the first frames (the Claude card, `[claude_footer] card`): the Exact row.
     pub fx: bool,
 }
 
-/// What a first window builds over its first frames under `knobs`, in the order it needs them, as `(row, swapchain format)`: the text frame's rows (the colour-glyph row for a prompt that carries an emoji), the present blit at both swapchain formats (which one a window gets depends on its screen's EDR potential, which only the attach can read), then what the first prompt's aurora binds: its additive glow, the bloom and the crown, then the fx Exact row a card's layers bind. Where `fetch` (the device passed the framebuffer-fetch probe) the frame draws its glow and fx through their twins ([`first_frame_twins`]), so the glow row is the bloom's extract alone and the fx row is never bound.
+/// What a first window builds over its first frames under `knobs`, in the order it needs
+/// them, as `(row, swapchain format)`: the text frame's rows, the present blit at both
+/// swapchain formats (which one a window gets depends on its screen's EDR potential, which
+/// only the attach can read), then the aurora's rows and the fx Exact row. Where `fetch`, glow
+/// and fx draw through their twins ([`first_frame_twins`]), so the glow row serves only the
+/// bloom's extract and the fx row is not built.
 pub(crate) fn first_frame_rows(
     knobs: FirstFrameKnobs,
     fetch: bool,
@@ -63,7 +70,8 @@ pub(crate) fn first_frame_rows(
     rows
 }
 
-/// The framebuffer-fetch twins a first window's frames bind under `knobs` where `fetch`: the aurora's glow and the card's fx.
+/// The framebuffer-fetch twins a first window's frames bind under `knobs` where `fetch`: the
+/// aurora's glow and the card's fx.
 pub(crate) fn first_frame_twins(knobs: FirstFrameKnobs, fetch: bool) -> Vec<FetchTwin> {
     let mut twins = Vec::new();
     if fetch && knobs.aurora {
@@ -80,9 +88,12 @@ pub(crate) fn first_frame_twins(knobs: FirstFrameKnobs, fetch: bool) -> Vec<Fetc
 pub(crate) enum WarmItem {
     /// A library compile.
     Library(ShaderLibrary),
-    /// A PSO build, keyed by its row and the colour attachment it resolves to (`pipelines::metal_format`): what Metal's pipeline cache keys on, so a frame row built against any swapchain format is the same item.
+    /// A PSO build, keyed by its row and the colour attachment it resolves to
+    /// (`pipelines::metal_format`), as Metal's pipeline cache keys it: a frame row built
+    /// against any swapchain format is one item.
     Pipeline(Pipeline, PixelFormat),
-    /// The device's framebuffer-fetch probe ([`super::fetch::verdict`]), which the cell lane runs once the rows its frames bind whatever the verdict are built.
+    /// The device's framebuffer-fetch probe ([`super::fetch::verdict`]), which the cell lane
+    /// runs once it has built the rows its frames bind under either verdict.
     FetchProbe,
     /// A framebuffer-fetch twin's PSO build.
     Twin(FetchTwin),
@@ -136,11 +147,10 @@ impl Lane {
     }
 }
 
-/// The libraries the first window always needs, which the warm compiles first
-/// and the window waits for from the claim on, as [`Phase::Running`]'s `owed`
-/// bits: a window that arrived while the warm was between them compiled
-/// `blit.metal` a second time (the CS-1 bench: 12.6 ms of main thread with the
-/// window at +60 ms).
+/// The libraries the first window always needs, which the warm compiles first and the window
+/// waits for from the claim on, as [`Phase::Running`]'s `owed` bits: otherwise a window
+/// arriving between the two compiles compiles `blit.metal` a second time (12.6 ms of main
+/// thread).
 const OWED: [ShaderLibrary; 2] = [ShaderLibrary::Cell, ShaderLibrary::Blit];
 
 /// [`Phase::Running`]'s `owed` bit for the device's framebuffer-fetch probe,
@@ -165,7 +175,9 @@ pub(crate) struct WarmLatch {
 pub(crate) static FIRST_FRAME: WarmLatch = WarmLatch::new(DEADLINE);
 
 impl WarmLatch {
-    /// A latch whose window waits at most `deadline` after the warm began: [`DEADLINE`] in the process, a hang detector in a test that holds the warm and so must not race the shipped window.
+    /// A latch whose window waits at most `deadline` after the warm began: [`DEADLINE`] in the
+    /// process, a hang detector in a test that holds the warm and so must not race the
+    /// shipped window.
     #[inline]
     pub(crate) const fn new(deadline: Duration) -> Self {
         Self {
@@ -177,7 +189,8 @@ impl WarmLatch {
         }
     }
 
-    /// Claim this latch's one warm: `None` once one has begun, so a launch that warms its config twice (`warm_config_moved`) compiles once.
+    /// Claim this latch's one warm: `None` once one has begun, so a launch that warms its
+    /// config twice (`warm_config_moved`) compiles once.
     pub(crate) fn begin(&'static self) -> Option<FirstFrameWarm> {
         let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         if *phase != Phase::Idle {
@@ -256,7 +269,8 @@ impl WarmLatch {
         self.settled.notify_all();
     }
 
-    /// Wait while the warm still owes `item` (an [`OWED`] library) or has it in flight, never past this latch's deadline ([`DEADLINE`] for [`FIRST_FRAME`]) after the warm began.
+    /// Wait while the warm still owes `item` (an [`OWED`] library) or has it in flight, never
+    /// past this latch's deadline ([`DEADLINE`] for [`FIRST_FRAME`]) after the warm began.
     pub(crate) fn await_item(&self, item: WarmItem) {
         let owed_bit = match item {
             WarmItem::Library(lib) => OWED.iter().position(|o| *o == lib).map(|i| 1 << i),
@@ -287,7 +301,9 @@ impl WarmLatch {
         }
     }
 
-    /// Whether the warm still owes the device's framebuffer-fetch verdict: it is running and has not finished its probe. A window asks rather than waits, so the probe never sits on a frame's path.
+    /// Whether the warm still owes the device's framebuffer-fetch verdict: it is running and
+    /// has not finished its probe. A window asks rather than waits, so the probe never sits on
+    /// a frame's path.
     pub(crate) fn probe_pending(&self) -> bool {
         matches!(
             self.current_phase(),
@@ -313,7 +329,8 @@ pub struct FirstFrameWarm {
 }
 
 impl FirstFrameWarm {
-    /// Compile and build what a first window builds over its first frames ([`first_frame_rows`] under `knobs`), each library before its first row, and drop it all.
+    /// Compile and build what a first window builds over its first frames ([`first_frame_rows`]
+    /// under `knobs`), each library before its first row, and drop it all.
     /// # Errors
     /// No Metal device, or the first compile or build that failed.
     pub fn run(mut self, knobs: FirstFrameKnobs) -> Result<(), String> {
@@ -453,7 +470,9 @@ fn walk_cell_lane(
     Ok(())
 }
 
-/// The device's framebuffer-fetch verdict through `cell` (its `cell.metal`), probed on a session of its own and settled for the process ([`super::fetch::verdict`]), so an arm minted later reads it ([`super::fetch::known`]); `None` where no session could open.
+/// The device's framebuffer-fetch verdict through `cell` (its `cell.metal`), probed on a
+/// session of its own and settled for the process ([`super::fetch::verdict`]) so an arm minted
+/// later reads it ([`super::fetch::known`]); `None` where no session could open.
 fn settle_verdict(dev: &Device, cell: &Library) -> Option<FetchProbe> {
     let loss = Arc::new(super::loss::LossLatch::new());
     let session = super::encoder::EncodeSession::new(dev, Arc::clone(&loss)).ok()?;
@@ -474,7 +493,9 @@ pub struct PresentKnobs {
     pub bloom: bool,
     /// The heat shimmer (`set_shimmer`).
     pub shimmer: bool,
-    /// The aurora's crown on an EDR screen and the f16 swapchain it draws into (`set_hdr_glow`, on a renderer with a window on screen: a headless one presents to a Bgra8Unorm target alone).
+    /// The aurora's crown on an EDR screen and the f16 swapchain it draws into
+    /// (`set_hdr_glow`, on a renderer with a window on screen: a headless one presents to a
+    /// Bgra8Unorm target alone).
     pub hdr_glow: bool,
     /// The aurora's crown on an SDR screen (`set_sdr_glow_boost` above 0).
     pub sdr_glow: bool,
@@ -494,7 +515,10 @@ impl PresentKnobs {
     }
 }
 
-/// The destinations a present binds `row` against under `knobs`, as its callers pass them: the tray card the Rgba8Unorm present copy, the blit and the SDR crown the swapchain, at f16 too where one may exist ([`PresentKnobs::hdr_glow`]). Any other row draws into an offscreen, whose format is its own whatever the destination: one build.
+/// The destinations a present binds `row` against under `knobs`: the tray card the Rgba8Unorm
+/// present copy; the blit and the SDR crown the swapchain, at f16 too where one may exist
+/// ([`PresentKnobs::hdr_glow`]). Any other row draws into an offscreen whose format does not
+/// depend on the destination: one build.
 #[inline]
 const fn destinations(row: Pipeline, knobs: PresentKnobs) -> &'static [PixelFormat] {
     match row {
@@ -515,7 +539,11 @@ const EVERY_FIRST_FRAME: FirstFrameKnobs = FirstFrameKnobs {
     fx: true,
 };
 
-/// Every build a live arm's frames and presents can bind under `knobs`: each row at the destinations its present meets ([`destinations`]; one item for a row that draws into an offscreen, as Metal keys it) and, where `twins`, each framebuffer-fetch twin. In the order a frame comes to need them once its first frames drew: what a frame binds whatever the device's verdict, then the twins, in table order; then, where `twins`, each twinned row, which a frame binds only on the split; and last what a first-frame warm builds, which the first frames build for themselves.
+/// Every build a live arm's frames and presents can bind under `knobs`: each row at the
+/// destinations its present meets ([`destinations`]) and, where `twins`, each framebuffer-fetch
+/// twin. Ordered as a frame comes to need them: what it binds whatever the verdict, then the
+/// twins, then the twinned rows (bound only on the split), and last what a first-frame warm
+/// builds, which the first frames build for themselves.
 pub(crate) fn bindable(knobs: PresentKnobs, twins: bool) -> Vec<WarmItem> {
     let first: Vec<WarmItem> = first_frame_rows(EVERY_FIRST_FRAME, twins)
         .into_iter()
@@ -544,19 +572,24 @@ pub(crate) fn bindable(knobs: PresentKnobs, twins: bool) -> Vec<WarmItem> {
     items
 }
 
-/// One build a pipeline warm hands its arm: the item, and its pipeline state, `None` where it failed (the frame that binds it builds it and says why) or, for the device's framebuffer-fetch probe, always (the verdict is the process's, [`super::fetch::known`]).
+/// One build a pipeline warm hands its arm: the item and its pipeline state, `None` where the
+/// build failed (the frame that binds it builds it and says why) and always for the
+/// framebuffer-fetch probe (its verdict is the process's, [`super::fetch::known`]).
 pub(crate) struct Warmed {
     pub(crate) item: WarmItem,
     pub(crate) pso: Option<Obj>,
 }
 
-// SAFETY: a `Warmed` carries one `MTLRenderPipelineState`, immutable once built, which Metal documents as usable from any thread; objc retain/release are thread-safe, and the +1 moves once.
+// SAFETY: a `Warmed` carries one `MTLRenderPipelineState`, immutable once built, which Metal
+// documents as usable from any thread; objc retain/release are thread-safe, and the +1 moves
+// once.
 unsafe impl Send for Warmed {}
 
 /// The arm's `MTLDevice`, moved to the worker that builds for it.
 struct WorkerDevice(Device);
 
-// SAFETY: an `MTLDevice` may be used from several threads at once (Metal's threading model: devices, libraries and pipeline states are thread-safe), and this holder moves its +1 once.
+// SAFETY: an `MTLDevice` may be used from several threads at once (Metal's threading model:
+// devices, libraries and pipeline states are thread-safe), and this holder moves its +1 once.
 unsafe impl Send for WorkerDevice {}
 
 impl WorkerDevice {
@@ -566,7 +599,10 @@ impl WorkerDevice {
     }
 }
 
-/// Start a pipeline warm: build `items` (the device's framebuffer-fetch probe where the arm owes it, then [`bindable`]) for `dev` on a worker of their own, sending each to `to` as it lands, each library compiled before its first row and the first-frame warm (`latch`) waited out where it has the same compile or build in flight. The worker ends early once `to`'s receiver is gone; it is detached unless a test joins it: how many items it handed over.
+/// Start a pipeline warm: build `items` for `dev` on a worker of its own, each library compiled
+/// before its first row, sending each build to `to` as it lands and waiting out any compile or
+/// build the first-frame warm (`latch`) has in flight. The worker ends early once `to`'s
+/// receiver is gone and returns how many items it handed over.
 /// # Errors
 /// The worker could not start.
 pub(crate) fn spawn(
@@ -585,7 +621,9 @@ pub(crate) fn spawn(
         })
 }
 
-/// Build each of `items` in order and hand it over, until `hand` refuses one: how many it handed over, the refused one with them. The device's framebuffer-fetch probe ([`WarmItem::FetchProbe`]) settles the process's verdict ([`settle_verdict`]).
+/// Build each of `items` in order and hand it over until `hand` refuses one: how many it
+/// handed over, the refused one with them. The framebuffer-fetch probe
+/// ([`WarmItem::FetchProbe`]) settles the process's verdict ([`settle_verdict`]).
 fn build_each(
     dev: &Device,
     latch: &WarmLatch,
@@ -660,7 +698,10 @@ fn bench_compile(
     }
 }
 
-/// THE FIRST-FRAME COMPILE MEASUREMENT's warm half (`benches/first_frame_compile.rs`, which runs the job on a thread of its own): begin the warm — with the launch's default knobs, or with the aurora off, the text frame and the blit alone — and hand back its job, which answers how long the warm took.
+/// The first-frame compile measurement's warm half: begin the warm (the launch's default knobs,
+/// or every knob off: the text frame and the blit alone) and hand back its job, which
+/// `benches/first_frame_compile.rs` runs on a thread of its own and which answers how long the
+/// warm took.
 /// # Errors
 /// A second call in one process.
 #[doc(hidden)]
@@ -685,7 +726,10 @@ pub fn first_frame_bench_warm(
     })
 }
 
-/// THE FIRST-FRAME COMPILE MEASUREMENT's main half: the first mint's compiles on the calling thread (`cell.metal`, the text frame's rows, the present blit; the device's framebuffer-fetch verdict is not on a mint's path, which routes Unorm-law light on the split while the warm owes it), each after waiting out the same item in flight on a warm the caller began, as the arm's own do, then what the first prompt's aurora binds (the glow row, the bloom, the SDR crown).
+/// The first-frame compile measurement's main half: the first mint's compiles on the calling
+/// thread (`cell.metal`, the text frame's rows, the present blit), each after waiting out the
+/// same item on the caller's warm, as an arm does, then the aurora's glow, bloom and SDR
+/// crown rows.
 /// # Errors
 /// No Metal device, or a shipped shader that does not compile.
 #[doc(hidden)]
@@ -834,13 +878,11 @@ mod tests {
         assert_eq!(LATCH.current_phase(), Phase::Settled);
     }
 
-    /// The window waits for the libraries the warm owes it — `cell.metal`
-    /// and `blit.metal`, from the claim on — and for anything else the warm
-    /// has IN FLIGHT, and nothing more: held inside the cell compile, a wait on
-    /// the cell library ends when that compile returns, a wait on the blit
-    /// library only when the blit compile does; held inside the blit compile,
-    /// a wait on a library the warm finished, or on one it has not reached
-    /// and does not owe, returns at once.
+    /// The window waits for the libraries the warm owes (`cell.metal` and `blit.metal`, from
+    /// the claim on) and for anything else in flight, and nothing more: held inside the cell
+    /// compile, a cell wait ends when that compile returns and a blit wait only when the blit
+    /// compile does; held inside the blit compile, a wait on a finished library, or on one
+    /// the warm has not reached and does not owe, returns at once.
     #[test]
     fn the_window_waits_for_what_the_warm_owes_or_has_in_flight() {
         static LATCH: WarmLatch = WarmLatch::new(HANG);
@@ -933,7 +975,9 @@ mod tests {
         );
     }
 
-    /// The warm owes the device's framebuffer-fetch verdict from the claim until its probe ran, and a window only asks: pending while owed or in flight, not once the probe finished, before a warm began, or after it ended.
+    /// The warm owes the framebuffer-fetch verdict from the claim until its probe ran: pending
+    /// while owed or in flight, not once the probe finished, before a warm began, or after it
+    /// ended.
     #[test]
     fn the_probe_is_pending_from_the_claim_until_the_warm_ran_it() {
         static LATCH: WarmLatch = WarmLatch::new(DEADLINE);
@@ -953,7 +997,10 @@ mod tests {
         assert!(!ENDED.probe_pending(), "a warm that ended owes nothing");
     }
 
-    /// THE PIPELINE WARM'S REACH: with every present switch on it names every row of the table, at every destination its present meets, and every framebuffer-fetch twin, so nothing a frame or present binds is left for the render thread to build, and it names what a first-frame warm builds after all else, so a warm that races the first frames spends its first builds on what they leave. A switch turned off drops its pass's row alone (the EDR crown's, the f16 destinations with it), and no twins drops the twins alone.
+    /// With every present switch on, a pipeline warm names every row of the table at every
+    /// destination its present meets and every framebuffer-fetch twin, and names what a
+    /// first-frame warm builds last. A switch turned off drops its pass's row alone (the EDR
+    /// crown's takes the f16 destinations with it), and no twins drops the twins alone.
     #[test]
     fn the_pipeline_warm_names_every_row_and_twin_a_frame_can_bind() {
         let on = PresentKnobs {
@@ -1042,7 +1089,9 @@ mod tests {
         );
     }
 
-    /// A pipeline warm hands every item it is given over as it lands, built on the shipped shaders (the device's framebuffer-fetch probe settled for the process), and its worker ends once it built them; a worker whose arm is gone builds the one item in hand and stops.
+    /// A pipeline warm hands over each item as it lands, built on the shipped shaders (the
+    /// framebuffer-fetch probe settled for the process), and its worker ends once it built
+    /// them; a worker whose arm is gone builds the one item in hand and stops.
     #[test]
     fn the_pipeline_warm_hands_over_each_build_and_stops_when_its_arm_is_gone() {
         static LATCH: WarmLatch = WarmLatch::new(DEADLINE);

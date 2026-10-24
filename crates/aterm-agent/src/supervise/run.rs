@@ -292,12 +292,11 @@ pub struct Caps {
     pub await_agent: Option<bool>,
     /// Whether `status` reports a measured `input=` age.
     pub input: Option<bool>,
-    /// Whether the last `status` printed the session log's head (`log_seq= log_ep= … turn=`).
-    /// `None` until a `status` is read this session (or since a reconnect): the first busy
-    /// wait then reads one itself (6H-5, `log_wake`).
+    /// Whether the last `status` printed the session log's head (`log_seq= log_ep= … turn=`);
+    /// `None` until a `status` is read this session or since a reconnect.
     pub log: Option<bool>,
-    /// `Some(false)` once the host refused the loop's `await log` (an older build answers the
-    /// comma list `ERR usage`): the loop waits on the screen from then on.
+    /// `Some(false)` once the host refused the loop's `await log` (an older build answers
+    /// `ERR usage`): the loop waits on the screen until a reconnect.
     pub await_log: Option<bool>,
 }
 
@@ -795,9 +794,9 @@ const WRITING_CAP: Duration = Duration::from_secs(3);
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
 /// Hang-detector cap for an idle read held while the program's window title still reports a running turn.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
-/// A hang detector for a read held while the agent has drawn nothing of its own
-/// ([`Session::first_frame_owed`]): a minute in which the screen did not move, never a
-/// latency budget, since a starved program may draw its first frame long after it started.
+/// Hang detector for a read held while the agent has drawn nothing of its own
+/// ([`Session::first_frame_owed`]): a minute of unmoved screen, not a latency budget, since a
+/// starved program may draw its first frame long after it started.
 const FIRST_FRAME_HANG: Duration = Duration::from_secs(60);
 const UNSCOPED_CAP: Duration = WRITING_CAP;
 const BOXED_BUSY_CAP: Duration = Duration::from_secs(2);
@@ -904,8 +903,7 @@ pub(super) enum FirstFrame {
 }
 
 impl FirstFrame {
-    /// Whether this loop held a read as the agent still starting: it saw the agent before its
-    /// first frame, so the agent started under it.
+    /// Whether this loop held a read as the agent still starting, so the agent started under it.
     pub(super) const fn saw_start(self) -> bool {
         match self {
             Self::Owed { held } | Self::Drawn { held } => held,
@@ -1278,8 +1276,7 @@ fn journaled_hold(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Opt
                     });
             }
             "continued" | "typed" => {
-                // An act typed at a point read since the last wait: no
-                // wait came before it there.
+                // An act typed at a point read since the last wait: no wait came before it there.
                 if std::mem::take(&mut point_read) {
                     reset(&mut hold, &mut act, &mut streak);
                 }
@@ -1966,7 +1963,8 @@ pub struct Session<'a, C: Ctl> {
     survey_kind: Option<aterm_phase::SurveyKind>,
     running: super::policy::turn_end::RunningTurn,
     wall_reset: Option<(String, Option<i64>)>,
-    /// What the usage tap read of the walled process, and the reset the wall is waited to by it and the notice together ([`turn_end_loop::WallTap`]). Dropped with the wall.
+    /// The usage tap's read of the walled process and the reset the wall waits for, from it and
+    /// the notice together ([`turn_end_loop::WallTap`]); dropped with the wall.
     wall_tap: Option<turn_end_loop::WallTap>,
     stuck_asked: Option<Instant>,
     stuck_rung: wall_memory::StuckRung,
@@ -2006,14 +2004,13 @@ pub struct Session<'a, C: Ctl> {
     changed_streak: u32,
     press_retry: Option<approval_loop::PressRetry>,
     limit_retry: Option<approval_loop::LimitRetry>,
-    /// Gemini CLI's usage-limit dialog as the last read that drew it showed
-    /// it, kept till a point that is neither the dialog nor the error its
-    /// `Stop` leaves, or a read of another box
+    /// Gemini CLI's usage-limit dialog as the last read that drew it showed it, kept until a point
+    /// that is neither the dialog nor its `Stop`'s error, or a read of another box
     /// ([`approval_loop::LimitDialogRead`]).
     limit_dialog_read: Option<approval_loop::LimitDialogRead>,
-    /// The key of the point the limit episode's badge was carried to that is
-    /// not its dialog nor its `Stop`'s error ([`Self::limit_badge_carry`]):
-    /// it goes once a point's fold ends the episode.
+    /// The key of the point the limit episode's badge was carried to, when that point is neither
+    /// its dialog nor its `Stop`'s error ([`Self::limit_badge_carry`]); cleared once a point's
+    /// fold ends the episode.
     limit_badge_away: Option<String>,
     driver: bool,
     question: approval_loop::QuestionMemory,
@@ -2795,8 +2792,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         Ok(r)
     }
 
-    /// Track the failed request's recovery window, including direct metadata
-    /// reads which must bypass ordinary claim renewal. `None` is a transport loss.
+    /// Tracks the failed request's outage window, including for direct metadata reads that bypass
+    /// ordinary claim renewal. `None` is a transport loss.
     pub(super) fn note_exchange(&mut self, args: &[&str], reply: Option<&CtlReply>) {
         let kind = || args[..args.len().min(2)].join(" ");
         if reply.is_none_or(|r| self.unserved(r)) {
@@ -2886,18 +2883,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         by_screen
     }
 
-    /// WHETHER THE AGENT'S FIRST FRAME IS STILL OWED ON `screen`, for a hosted loop (one an
-    /// [`IdleHost`] runs, beside an agent it saw in the tab): no read since the loop began
-    /// showed anything the agent drew, and this one shows nothing either: the screen could be
-    /// the shell's alone ([`aterm_phase::shell_alone`]: blank, or one unbroken run of rows,
-    /// a prompt and the line it echoed), and the agent's reader finds nothing of its own on
-    /// it ([`aterm_phase::ScreenReader::program_drawn`]). The agent is the one `status` last
-    /// named, else the one `meta` says the session's task started (`worker=`), else the one
-    /// the screen names ([`aterm_phase::identify`]); when nothing names one (Gemini CLI's
-    /// process is `node`, and the loop reads `status` only after its first point), every
-    /// reader that knows its program's frame is asked. A read that shows something of the
-    /// agent's settles it, and every read after it is judged as it stands. A loop with no
-    /// host owes none.
+    /// Whether the agent's first frame is still owed on `screen` for a hosted loop: no read since
+    /// the loop began showed anything the agent drew, the screen could be the shell's alone
+    /// ([`aterm_phase::shell_alone`]), and the agent's reader finds nothing of its own on it
+    /// ([`aterm_phase::ScreenReader::program_drawn`]). The agent is the one `status` last named,
+    /// else the task's `worker=`, else the one the screen names; when nothing names one (Gemini
+    /// CLI's process is `node`), every reader that knows its program's frame is asked. Once a
+    /// read shows the agent's frame it stays drawn. A loop with no host owes none.
     fn first_frame_owed(&mut self, screen: &Screen, hosted: bool) -> bool {
         if matches!(self.first_frame, FirstFrame::Drawn { .. }) {
             return false;
@@ -3551,12 +3543,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         // The session log's cursor a timed-out log wait left standing ([`Self::log_wake`]).
         let mut log_at: Option<log_wake::LogHead> = None;
         loop {
-            // The hosted loop's stop ends a turn that may run for hours:
-            // the look it returns to says so ([`Self::look`]). Checked here
-            // and before each of the turn's other waits (before the wait
-            // for the next change), so a stop
-            // in any wait of the turn ends the turn, spent, rather than as
-            // the refusal of its next wait ([`Self::call`]).
+            // A stop ends the turn, however long it has run, as spent ([`Self::spent_turn`]). It
+            // is checked here and before each of the turn's other waits, so a stop in any wait
+            // ends the turn rather than surfacing as the refusal of its next wait ([`Self::call`]).
             if self.stopped() {
                 return Ok(self.spent_turn());
             }
@@ -3565,9 +3554,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 .min(self.setup.wait_step);
             let mut unsettled = false;
             let mut settled = false;
-            // A READ SHOWED THE TURN RUNNING (`footer_seen`, the busy row up): the log may
-            // wake the wait for its end, and the read after it still decides (6H-5,
-            // [`log_wake`]). A cursor stands only from one such wait to the next.
+            // Once a read showed the turn running (`footer_seen`), the log may wake the wait for
+            // its end ([`log_wake`]); the read after it still decides. A cursor stands only from
+            // one such wait to the next.
             let on_the_log = footer_seen && matches!(next, Next::Gone(_));
             if !on_the_log {
                 log_at = None;
@@ -3606,12 +3595,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.watch_context(&screen, reader, &mut |line| review.say(line))?;
             }
             let mut phase = reader.phase(&screen.rows);
-            // A PROGRAM STILL STARTING IS NOT IDLE, NOR BUSY. Until the agent has drawn
-            // something of its own ([`Self::first_frame_owed`]), a read of a screen it has not
-            // drawn on (blank, or the shell's echo of the line that launched it) is no point
-            // and no turn running: the loop waits for the screen to move and reads again. A
-            // screen that stands unmoved FIRST_FRAME_HANG ends the hold, read as it stands,
-            // and the agent is taken as drawn. Not for a box or a wall, which the agent drew.
+            // A program still starting is neither idle nor busy. Until the agent has drawn
+            // something of its own ([`Self::first_frame_owed`]), the loop waits for the screen
+            // to move and reads again. A screen unmoved for FIRST_FRAME_HANG ends the hold and
+            // the agent is taken as drawn. A box or a wall skips the hold: the agent drew it.
             if !matches!(phase, Phase::Prompt | Phase::Limited { .. })
                 && self.fx.mono() < deadline
                 && self.first_frame_owed(&screen, opts.is_some_and(|o| o.idle_host.is_some()))
@@ -3660,20 +3647,14 @@ impl<'a, C: Ctl> Session<'a, C> {
                 transcript_idle = true;
             }
             if phase != Phase::Busy && !writing {
-                // A READ TORN MID-REPAINT IS NO POINT. The footer this wait saw leave latches
-                // at the first batch it is off the screen, and a reply growing under the window
-                // is repainted row by row with its footer last: a read there shows the composer
-                // frame and no busy footer, idle to every reader, while the reply still streams
-                // (Claude Code 2.1.307, `r7-both` L6: `- check 65 passed` of 80 judged a point,
-                // the reply's `NEEDS YOU:` above it never read). An idle read straight after
-                // that latch whose frame its reader judges not whole
-                // ([`ScreenReader::frame_torn`]: by default the composer frame's geometry,
-                // [`aterm_phase::phase::composer_frame_torn`]) is read once more after the
-                // short settle, as a read with no composer yet is (`writing`), and that read
-                // decides. A frame the program bracketed in DEC 2026 never gets this far
-                // unfinished: the server holds `await gone` until it closes, and the read
-                // waits for it ([`Self::text_json`]); one it did not bracket, the server's
-                // `gone` settles on ([`aterm_core::terminal::GONE_SETTLE`]).
+                // A read torn mid-repaint is no point. A reply growing under the window is
+                // repainted row by row with its footer last, so a read just after the busy
+                // footer left can show the composer frame and no footer while the reply still
+                // streams. Such an idle read whose frame its reader judges torn
+                // ([`ScreenReader::frame_torn`]) is read once more after the short settle, and
+                // that read decides. A frame bracketed in DEC 2026 never gets here unfinished,
+                // since the read waits for it to close ([`Self::text_json`]); for an unbracketed
+                // one the server's `gone` waits out [`aterm_core::terminal::GONE_SETTLE`].
                 if phase == Phase::Idle
                     && footer_seen
                     && matches!(next, Next::Gone(_))
@@ -4469,12 +4450,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         deadline: &mut Instant,
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
-        // THE WORD NO HOST HAS ANSWERED YET (the loop's start-up read was
-        // lost: [`Self::drive`]) is read first, before anything of this look
-        // is decided — the survey's duty and the Off park read it — and a
-        // seeded landing still armed is decided under it, as the start would
-        // have, and its face told. Lost again, it is this look's outage, and
-        // the look after it reads again.
+        // The Autopilot word no host has answered yet (the start-up read was lost,
+        // [`Self::drive`]) is read before anything of this look is decided, since the survey's
+        // duty and the Off park read it; a seeded landing still armed is decided under it and
+        // its face told. Lost again, it is this look's outage, and the next look reads again.
         if review.unattended() && !self.autopilot.answered() {
             self.autopilot.begin();
             let mode = self.autopilot_read(opts)?;
@@ -4628,12 +4607,10 @@ impl<'a, C: Ctl> Session<'a, C> {
             })
             && !submitted_over(state.handed_submit, &turn.screen)
         {
-            // The point already handed over, still showing: the screen
-            // moved (a footer tick, a banner) and nothing the point is made
-            // of did. Nothing is pressed or reported, and what the decision
-            // read of it is the new screen's too (the decision review's
-            // RR-DEC-2: the host's gate read a repaint's raw wall, and the
-            // quiet upgrade restarted the agent at a refused request).
+            // The point already handed over, still showing: the screen moved (a footer tick, a
+            // banner) but nothing the point is made of did. Nothing is pressed or reported, and
+            // the decision's read carries to the new screen, so the host's gate never acts on a
+            // repaint's raw wall.
             if let Some(old) = state.handed_seq.replace(turn.screen.seq) {
                 self.carry_point(old, turn.screen.seq);
             }
@@ -6031,7 +6008,9 @@ impl<C: Ctl> Session<'_, C> {
         Some(words)
     }
 
-    /// Offers a settled background-work break to [`IdleHost::at_background`] and updates occupancy state; then the stuck fact's line under `[harness] stuck_break_note`, then the door's write (§2.1).
+    /// Offers a settled background-work break to [`IdleHost::at_background`] and updates occupancy
+    /// state, then writes the stuck fact's line (`[harness] stuck_break_note`) and the door's, in
+    /// the occupancy design's §2.1 order.
     fn host_steps_in_background(
         &mut self,
         screen: &Screen,
@@ -6085,7 +6064,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
             }
             self.hold_background(screen, at, waited, settled, cfg, review);
-            // §2.1's rank 4, before the nudges: the stuck fact's own line.
+            // The stuck fact's own line (the occupancy design's §2.1 rank 4), before the nudges.
             let stuck = self.stuck_break(screen, (at, waited), false, cfg, review)?;
             if stuck {
                 *since = None;
@@ -6111,10 +6090,8 @@ impl<C: Ctl> Session<'_, C> {
         } else if self.turn_end.act_untaken() {
             Some(Guard::ActUntaken)
         } else if self.settling().is_some() {
-            // Wake settle guard (`Guard::WakeSettle`).
             Some(Guard::WakeSettle)
         } else if cfg.is_some_and(|cfg| self.credits_hold_here(cfg, &screen.rows)) {
-            // Usage credits guard (`Guard::Credits`).
             Some(Guard::Credits)
         } else {
             None
@@ -6137,7 +6114,8 @@ impl<C: Ctl> Session<'_, C> {
             *since = None;
             line_gone = Some(Guard::HostLine);
         }
-        // §2.1's rank 4, after the host's line and before the nudges: the stuck fact's own.
+        // The stuck fact's own line (the occupancy design's §2.1 rank 4), after the host's line
+        // and before the nudges.
         if self.stuck_break(screen, (at, waited), line_gone.is_some(), cfg, review)? {
             *since = None;
             line_gone = Some(Guard::HostLine);
@@ -6235,9 +6213,8 @@ impl<C: Ctl> Session<'_, C> {
             review.note(&format!("HOST seq={} {line}", point.screen.seq));
         }
         if idle {
-            // The point its last step passed over while it still wanted one
-            // is offered again only after a step of the wait
-            // ([`Self::host_passed`]): never at once.
+            // The point the host's last step passed over is offered again only after a step of
+            // the wait ([`Self::host_passed`]), never at once.
             if self.host_passed.is_some() && self.host_passed == Some(self.review_key(point)) {
                 return Ok(false);
             }

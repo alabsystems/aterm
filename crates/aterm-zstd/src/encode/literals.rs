@@ -15,7 +15,7 @@ const TREELESS: u8 = 3;
 /// Below this many literals a new Huffman code rarely pays for its description.
 const MIN_FOR_NEW_CODE: usize = 32;
 
-/// Below this many literals one stream is used, above it four (a coding choice; four
+/// Below this many literals one stream is used, otherwise four (a coding choice; four
 /// decode faster). One stream also needs both sizes to fit 10 bits (RFC 8878
 /// §3.1.1.3.1.1, `Size_Format` 00).
 const ONE_STREAM_BELOW: usize = 256;
@@ -134,8 +134,9 @@ const fn compressed_header_len(n: usize) -> usize {
 
 /// A Huffman-coded section of `kind` ([`COMPRESSED`] carrying `desc`, or [`TREELESS`]):
 /// the header, the description, then one stream or a 6-byte `Jump_Table` and four
-/// (RFC 8878 §3.1.1.3.1.4, §3.1.1.3.1.6). `false`, with `out` partly written, when the
-/// sizes do not fit the header (the caller then writes the literals raw).
+/// (RFC 8878 §3.1.1.3.1.4, §3.1.1.3.1.6). `false`, writing nothing, when four streams would
+/// hold fewer than 256 literals or the sizes do not fit the header or the jump table (the
+/// caller then writes the literals raw).
 fn write_huffman(
     kind: u8,
     lits: &[u8],

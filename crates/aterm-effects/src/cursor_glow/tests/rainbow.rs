@@ -995,16 +995,10 @@ fn rainbow_decays_to_empty_when_idle() {
     );
 }
 
-/// THE PET UNDER A DIM THEME'S LETTERS (looks6 N11): the knock-out rings
-/// each glyph in a pixel of page, and `dim-grey`'s `o` of `echo` still read
-/// 3.59:1 at its cell over the pet's coat. Every lettered cell the pet's
-/// body reaches, but the caret's, takes the page at an opacity that keeps
-/// the letter at its bar over a coat of the letter's own colour (the worst
-/// any coat can be); a bright theme's text, and cells outside the body,
-/// take none. Every pixel of every such cell holds the bar: the veil's
-/// eased ends lie outside a word's first and last letters (looks6 review:
-/// eased inside them, their outer 3 px read 1.30-4.05:1), and stop at the
-/// caret's cell, which takes no veil. Negative control: the veil off
+/// Under a dim theme's letters, every pixel of each lettered cell the pet's body reaches, but the
+/// caret's, keeps its bar over a coat of the letter's own colour (the worst any coat can be): the
+/// veil's eased ends lie outside a word's first and last letters and stop at the caret's cell. A
+/// bright theme's text, and cells outside the body, take no veil. Negative control: the veil off
 /// leaves that coat whole.
 #[test]
 fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
@@ -1101,13 +1095,9 @@ fn a_dim_theme_s_letters_read_over_the_pet_through_a_page_veil() {
     );
 }
 
-/// THE WORD ICONS' SHADE: the word pass draws its icons after the trail has
-/// drawn the frame, so an icon new to the frame (a word a Return completed)
-/// found the sky's stars and the ribbon's light on it: a fox's chin washed
-/// lilac on dark and pink sparkles on its cheek on paper. Once the frame's
-/// icons are named, no light of the frame lies on an icon above its foot,
-/// on either page. Negative control: unshaded, the same frame lays light on
-/// the icon.
+/// The word pass draws its icons after the trail, so with the frame's icons noted and shaded
+/// (`note_word_icons`, `shade_word_icons`) no light of the frame lies on an icon above its foot,
+/// even one new to the frame, on either page. Negative control: unshaded, the frame lights it.
 #[test]
 fn a_word_icon_new_to_the_frame_wears_no_trail_light() {
     let g = geom();

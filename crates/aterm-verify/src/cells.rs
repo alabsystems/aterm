@@ -79,7 +79,8 @@ fn host_triple(ctx: &Ctx) -> Result<String, String> {
         .ok_or_else(|| format!("`{} -vV` named no host triple", trustc.display()))
 }
 
-/// One `cshim` row: a C-bearing build script replaced, for one triple, by cargo's own override on the command line.
+/// One `cshim` row: a C-bearing build script replaced, for one triple, by cargo's own
+/// override on the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shim {
     pub package: String,
@@ -100,7 +101,8 @@ impl Shim {
     }
 }
 
-/// [`POLICY`], parsed: `cshim <name>@<version> <triple> <links> <why>`, TAB-separated, `#` and blank lines ignored.
+/// [`POLICY`], parsed: `cshim <name>@<version> <triple> <links> <why>`, TAB-separated, `#`
+/// and blank lines ignored.
 ///
 /// # Errors
 /// The first row that is not a well-formed `cshim` for one non-wasm triple.
@@ -159,13 +161,16 @@ pub enum CellOutcome {
     Checked(String),
     /// Nothing was compiled: why, and the install that clears it.
     Skipped { why: String, fix: String },
-    /// The tree did not hold for the cell: the first cause, and the lines that say what went wrong.
+    /// The tree did not hold for the cell: the first cause, and the lines that say what went
+    /// wrong.
     Failed { status: String, detail: Vec<String> },
-    /// The machine could not answer for the cell (no graph, no toolchain, a child that never ran): what failed, and how.
+    /// The machine could not answer for the cell (no graph, no toolchain, a child that never
+    /// ran): what failed, and how.
     CouldNotRun { status: String, detail: Vec<String> },
 }
 
-/// The `cells` check's stage: one row per selected cell, then the `cshim` rows nothing could use.
+/// The `cells` check's stage: one row per selected cell, the windows-sys oracles when a
+/// Windows cell is selected, then the `cshim` rows nothing could use.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let policy = match std::fs::read_to_string(ctx.root.join(POLICY))
         .map_err(|e| format!("cannot read {POLICY}: {e}"))
@@ -261,7 +266,8 @@ pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
     cells.iter().any(|c| c.triple.ends_with("-pc-windows-msvc"))
 }
 
-/// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin -- <verb> --root <R>`, from `<R>`.
+/// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin
+/// -- <verb> --root <R>`, from `<R>`.
 ///
 /// # Errors
 /// The current-directory error from making a relative path absolute.
@@ -293,7 +299,8 @@ pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str) -> std::io::Result<Cmd> {
     Ok(cmd)
 }
 
-/// The reason an oracle that decided nothing gives on its last `… could not run: <reason>` line.
+/// The reason an oracle that decided nothing gives on its last `… could not run: <reason>`
+/// line.
 #[must_use]
 pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
     output
@@ -424,7 +431,8 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
     }
 }
 
-/// Whether `shim` is live in the lint's graph and in the test-target pass's: its package at its version is in each.
+/// Whether `shim` is live in the lint's graph and in the test-target pass's: its package at
+/// its version is in each.
 #[must_use]
 pub fn shim_lanes(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) -> (bool, bool) {
     let live = |nodes: &BTreeSet<PkgId>| {
@@ -461,7 +469,8 @@ fn dead_shim(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) ->
     })
 }
 
-/// What the all-targets pass compiles: the members it selects and excludes, and their target dependencies, dev-dependencies included.
+/// What the all-targets pass compiles: the members it selects and excludes, and their target
+/// dependencies, dev-dependencies included.
 #[derive(Debug, Default)]
 pub struct TestGraph {
     pub nodes: BTreeSet<PkgId>,
@@ -713,8 +722,8 @@ pub fn resolve_roots(
     Ok((graph, paths))
 }
 
-/// One cell, end to end: its graph, its shims, its toolchain, the lint of
-/// its root package, and the all-targets pass over its workspace members.
+/// One cell, end to end: its graph, its shims, its toolchain, the lint of its roots, and (off
+/// wasm32) the all-targets pass over its workspace members.
 fn check_cell(
     ctx: &Ctx,
     rustup: &Path,
@@ -1039,8 +1048,8 @@ fn read_cargo_run(
     Ok(read)
 }
 
-/// The two cargo runs one cell makes, sharing its toolchain, cwd, target
-/// dir and shims.
+/// The two cargo runs one cell makes, sharing its toolchain, cwd and target dir; each pass
+/// carries its own shims.
 struct CellCargo<'a> {
     ctx: &'a Ctx,
     triple: &'a str,
@@ -1051,7 +1060,8 @@ struct CellCargo<'a> {
 }
 
 impl CellCargo<'_> {
-    /// Build `<toolchain cargo> <verb> --target <triple>` with this cell's toolchain environment and job cap.
+    /// Build `<toolchain cargo> <verb> --target <triple>` with this cell's toolchain
+    /// environment and job cap.
     fn base(&self, verb: &str) -> Cmd {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
@@ -1109,7 +1119,8 @@ impl CellCargo<'_> {
     }
 }
 
-/// What a foreign cell's lint denies after `--`: the `clippy.toml` bans (and, off wasm, an `#[expect]` no ban fulfils).
+/// What a foreign cell's lint denies after `--`: the `clippy.toml` bans (and, off wasm, an
+/// `#[expect]` no ban fulfils).
 #[must_use]
 pub fn lint_flags(triple: &str) -> &'static [&'static str] {
     if triple.starts_with("wasm32") {
@@ -1153,8 +1164,7 @@ pub const CELLS_KEY: &str = "[package.metadata.aterm] cells";
 /// The workspace's members, from `targo metadata --no-deps`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Members {
-    /// Every member's name (the NAME, which `--exclude` takes, is not always
-    /// the directory).
+    /// Every member's package name, which `--exclude` takes (not always its directory's).
     pub names: BTreeSet<String>,
     /// Each cell's extra roots: the members whose manifests name it under
     /// [`CELLS_KEY`].
@@ -1340,7 +1350,8 @@ pub fn judges_warnings(triple: &str) -> bool {
             .any(|host| os(host).as_deref() == Some(own.as_str()))
 }
 
-/// The OSes (a triple past its architecture) no fleet machine runs whose cells still judge warnings ([`judges_warnings`]).
+/// The OSes (a triple past its architecture) no fleet machine runs whose cells still judge
+/// warnings ([`judges_warnings`]).
 pub const WARNINGS_JUDGED_OFF_FLEET: [&str; 1] = ["pc-windows-msvc"];
 
 /// Whether a warning's lint code makes a cell red: any lint rustc itself raises.
@@ -1447,8 +1458,7 @@ pub fn package_id_name(id: &str) -> &str {
         .trim_end_matches(".git")
 }
 
-/// Is `dir` inside `root`, both canonicalised (`/tmp` and `/private/tmp`
-/// name one place on macOS)?
+/// The summary's ` (… not owed: …)` note: the proc macros and the crates only they reach.
 fn not_owed_note(proc_macros: &BTreeSet<String>, host_deps: &BTreeSet<String>) -> String {
     let mut kinds = Vec::new();
     if !proc_macros.is_empty() {
@@ -1467,7 +1477,8 @@ fn not_owed_note(proc_macros: &BTreeSet<String>, host_deps: &BTreeSet<String>) -
     format!(" ({} not owed: {})", kinds.join(" and "), names.join(", "))
 }
 
-/// The cell's packages cargo compiles for the HOST: every proc macro, and every package only proc macros reach.
+/// The cell's packages cargo compiles for the host: every proc macro, and every package only
+/// proc macros reach.
 pub fn host_side(graph: &Graph, is_proc_macro: impl Fn(&PkgId) -> bool) -> BTreeSet<PkgId> {
     let mut target = BTreeSet::from([graph.root.clone()]);
     let mut stack = vec![graph.root.clone()];
@@ -1481,6 +1492,8 @@ pub fn host_side(graph: &Graph, is_proc_macro: impl Fn(&PkgId) -> bool) -> BTree
     graph.nodes.difference(&target).cloned().collect()
 }
 
+/// Is `dir` inside `root`, both canonicalised (`/tmp` and `/private/tmp` name one place on
+/// macOS)? Where either does not resolve, the two are compared as given.
 fn path_is_inside(dir: &Path, root: &Path) -> bool {
     match (dir.canonicalize(), root.canonicalize()) {
         (Ok(d), Ok(r)) => d.starts_with(r),
@@ -1640,10 +1653,9 @@ mod tests {
         }
     }
 
-    /// The test-target forest of a real (private, compiler-free) workspace
-    /// holds only the selected members, their dev-dependencies and their
-    /// target dependencies: no build-only or proc-macro subtree, no excluded
-    /// member's oracle.
+    /// A real workspace's test-target forest (resolved, never compiled) holds only the selected
+    /// members and their dev and target dependencies: no build-only or proc-macro subtree, no
+    /// excluded member's oracle.
     #[test]
     fn the_test_target_forest_has_only_selected_members_dev_and_target_dependencies() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -1730,7 +1742,7 @@ mod tests {
         assert!(parse_test_forest("0other v1.0.0\n", &one).is_err());
     }
 
-    /// A member a selected proc macro depends on is printed as both its target node and its host node.
+    /// A member a selected proc macro depends on prints as both a target and a host node.
     #[test]
     fn a_member_a_proc_macro_uses_is_read_as_its_target_copy() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -2080,9 +2092,8 @@ mod tests {
         assert!(parse_members(not_a_list, &cells).is_err());
     }
 
-    /// An extra root's graph is joined onto the cell's: the test pass selects
-    /// it and its own members, the host side stays empty, and a cell no member
-    /// names (the negative control) still excludes it.
+    /// An extra root's graph is joined onto the cell's: the test pass selects it and its own
+    /// members, the host side stays empty, and a cell no member names still excludes it.
     #[test]
     fn an_extra_root_joins_the_cells_graph_and_its_test_pass() {
         let dir = aterm_tempfile::tempdir().expect("private resolver fixture");
@@ -2167,7 +2178,7 @@ mod tests {
         assert_eq!(selected, ["app", "guest", "guest-only", "shared"]);
         assert_eq!(excluded, ["mac-only"]);
 
-        // The negative control: a cell the guest does not name leaves it out.
+        // Control: a cell the guest does not name leaves it out.
         let (extra, graph) = resolve("win-arm", "app");
         assert!(extra.is_empty());
         let normal: BTreeSet<String> = graph.nodes.iter().map(|id| id.name.clone()).collect();

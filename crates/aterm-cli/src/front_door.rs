@@ -51,7 +51,8 @@ pub enum AliasRoute {
     /// because `$EDITOR` names one executable, which `git` and the rest run with the file and no
     /// room for a verb.
     Amacs,
-    /// Not an alias: `aterm`, `aterm-cli` (the front door forced to a session), a renamed copy.
+    /// The front door itself: `aterm`, `aterm-cli` (forced to a session), a renamed copy, and the
+    /// window alias running the hidden open probe (`__tcc-open`).
     FrontDoor,
 }
 

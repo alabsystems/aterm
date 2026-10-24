@@ -2,12 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! The sprite path the fx engine replaced (`SpriteQuad`, `FreeSprite` and
-//! their atlases, until lane B7 of `docs/DESIGN-card-engine-2026-10-19.md`),
-//! kept as the differential oracle the companions and the rain are held to:
-//! the stamp is the old `stamp_free_sprite` (whose white-rain and cat-quad
-//! twins drew the same bytes over their texels), the knock boxes are the old
-//! `knock_rects`, and [`crate::Renderer::set_legacy_sprites`] draws them where
-//! the old composite did, so a frame through either path can be compared
+//! their atlases), kept as the differential oracle the companions and the rain
+//! are held to: [`stamp`] is the old `stamp_free_sprite` (whose white-rain and
+//! cat-quad twins drew the same bytes over their texels), the knock boxes are
+//! the old `knock_rects`, and [`crate::Renderer::set_legacy_sprites`] draws them
+//! where the old composite did, so a frame through either path can be compared
 //! byte for byte.
 
 use std::sync::Arc;

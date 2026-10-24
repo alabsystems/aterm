@@ -110,19 +110,16 @@ impl std::fmt::Display for Scenario {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walks {
-    /// Every walk from every start ([`walk_from`]), and random walks
+    /// Every walk from every start ([`walk_from`]), and random walks from this seed.
     Every(u64),
-    /// Only the walks whose frames the theme in use's row decides: the list
-    /// opened and drawn through every change before the person's first
-    /// event (R1, R3), and the keyboard put on its control (R2). The four Off
-    /// sweeps differ in that row alone, the same list with no landing and no
-    /// control the row decides after a wheel or a key, so Off on Nord's
-    /// other walks stand for the other three's.
+    /// Only the walks whose frames the theme in use's row decides: the list opened and drawn
+    /// through every change before the person's first event (R1, R3), and the keyboard put on its
+    /// control (R2). The four Off sweeps differ in that row alone, so Off on Nord's other walks
+    /// stand for the other three's.
     Opening,
-    /// Only the walks reviews found ([`reviewed`]).
+    /// Only the regression walks ([`reviewed`]).
     Reviewed,
-    /// The walks the keyboard's control decides ([`walk_from`]), and
-    /// random walks.
+    /// The walks the keyboard's control decides ([`walk_from`]), and random walks from this seed.
     Control(u64),
 }
 
@@ -312,9 +309,11 @@ impl Frame {
         self.chooser() && whole_in_list(&self.screen, key)
     }
 
-    /// frame's laid-out rects — the list holds every row it has, one off its
-    /// screen at the bounds scrolling gives it ([`crate::native_ui::ListRoom`]),
-    /// so what lies between the two is the same on every screen.
+    /// Whether no screen of the list can show the row `landing` whole and `kept` of the control
+    /// `key` with it: both listed, and what the two need of the list taller than its room.
+    /// Measured on this frame's laid-out rects: the list holds every row it has, one off its
+    /// screen at the bounds scrolling gives it ([`crate::native_ui::ListRoom`]), so what lies
+    /// between the two is the same on every screen.
     fn apart(&self, landing: &str, key: &str, kept: Kept) -> bool {
         let (Some((row, _)), Some((control, _))) =
             (laid_of(&self.screen, landing), laid_of(&self.screen, key))
@@ -360,9 +359,9 @@ impl Frame {
     }
 }
 
-/// whether it shows the theme in use's row and the chooser's first row whole
-/// in the list; and where the list lays the control, the landing and the
-/// first row out on it ([`Frame::placed`]), under a room that tall.
+/// What one screen of the list shows: how much of the keyboard's control, whether the theme in
+/// use's row and the chooser's first row are whole in the list, and where the list lays the
+/// control, the landing and the first row out on it ([`Frame::placed`]), under a room that tall.
 #[derive(Clone, Copy, Debug)]
 struct Screenful {
     control: Option<Kept>,
@@ -379,18 +378,13 @@ struct Screenful {
     chrome: Chrome,
 }
 
-/// EVERY SCREEN A LIST CAN DRAW THAT SHOWS WHAT A RULE READS, as a frame
-/// measures it: the list drawn at its scrolls in a view opened as the walk's
-/// was, in the same window, text size and bars, the keyboard on the same
-/// control, the same filter and trial and the same reveal pending, held where
-/// the scroll puts it — what geometry lets any keeping draw, measured on the
-/// screens and never asked of the code that seats the list. Keyed by the
-/// scroll each screen drew. ONLY WHERE NEEDED: around the listed stops its
-/// rule reads (the keyboard's control, and the landing or the first row as
-/// [`Reads`] says), out to the first screen on each side that lays it wholly
-/// past the room; a list moves its rows up as it scrolls on, so no screen
-/// past those shows it, which the screens drawn hold to ([`Sweep::measure`]:
-/// where they do not, every scroll).
+/// Every screen a list can draw that shows what a rule reads, as a frame measures it: the list
+/// drawn at its scrolls in a view opened as the walk's was (window, text size, bars, keyboard,
+/// filter, trial and pending reveal alike), keyed by the scroll each screen drew. It measures the
+/// screens and never asks the code that seats the list. Only around the listed stops its rule
+/// reads ([`Reads`]), out to the first screen on each side that lays them wholly past the room: a
+/// list moves its rows up as it scrolls, so no screen past those shows them ([`Sweep::measure`]
+/// looks at every scroll where the screens drawn do not hold to this).
 struct Reach {
     screens: BTreeMap<usize, Screenful>,
     /// Scrolls asked for that drew another, or none.
@@ -414,7 +408,10 @@ struct Reach {
     chrome: PageChrome,
 }
 
-/// ([`Sweep::judge`]).
+/// A plain status's bar under the page as a frame draws it, and the least it can be. The bar's
+/// height is the code's choice down to that least (it shortens for the control the person is on,
+/// down to its words' one line), so a room it leaves is geometry only as the bar at its least
+/// leaves it ([`Sweep::judge`]).
 #[derive(Clone, Copy, Debug)]
 struct StatusBar {
     tall: f32,
@@ -462,8 +459,8 @@ impl StatusBar {
     }
 }
 
-/// EVERY CHROME THE PAGE CAN DRAW A FRAME AT `drawn` IN: each rung of its
-/// ladder, and under a bar each with the bars' room given.
+/// Every chrome the page can draw a frame at `drawn` in: each rung of its ladder and, under a
+/// bar, each with the bars' room given.
 fn rungs(drawn: Drawn) -> Vec<PageChrome> {
     set_text_scale(f32::from(drawn.scale));
     let cx = cx_of(drawn);
@@ -558,14 +555,12 @@ impl Reach {
             .collect()
     }
 
-    /// `at` says the list lays it out — the laid-out rects say whether the
-    /// room holds it, the paint how much of it a screen shows, as a frame
-    /// counts it ([`Frame::kept`]): the frame draws no list; it is taller
-    /// than the list's room, or owed a part, taller than the room and at best
-    /// starts a screen at the list's top. `Err` where the room holds as much
-    /// of it as the rule asks and no screen paints it so, or a scroll drew no
-    /// screen to measure: no geometry says why, a fault. That the list
-    /// scrolls by stops is no cause.
+    /// Why no screen shows what a rule asks of a stop of the list where `at` lays it out, by the
+    /// laid-out rects (whether the room holds it) and the paint ([`Frame::kept`]): the frame draws
+    /// no list; no screen lays it out in the list; it is taller than the list's room; or, owed a
+    /// part, it is taller than the room and at best starts a screen at the list's top. `Err`
+    /// otherwise, or where a scroll drew no screen to measure: no geometry says why, a fault.
+    /// That the list scrolls by stops is no cause.
     fn cause(&self, at: Placed, owed: Kept) -> Result<String, String> {
         if !self.list {
             return Ok("no list: the frame's room holds none of its stops".to_string());
@@ -654,12 +649,10 @@ enum Reads {
     FirstRow,
 }
 
-/// WHAT A WALK'S VIEW HOLDS THAT LAYS THE PAGE OUT, past what the scenario
-/// opened it with and [`ReachOf`]'s other fields: the sheet open or shut,
-/// the Community disclosure (Left and Right on it), the Keep menu, an open
-/// picker, the side the segment highlights (read only while the theme
-/// follows the system), the drafts the person typed in the sheet's fields,
-/// and what they typed in Settings' search.
+/// What a walk's view holds that lays the page out, past what the scenario opened it with and
+/// [`ReachOf`]'s other fields: the sheet open or shut, the Community disclosure, the Keep menu, an
+/// open picker, the side the segment highlights (read only while the theme follows the system),
+/// the drafts typed in the sheet's fields, and Settings' search.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Held {
     search: String,
@@ -763,11 +756,11 @@ struct Sweep {
     screens: AtomicUsize,
 }
 
-/// Where a screen lays a stop out under the list's top: its top, its
-/// height, and how much of it the screen paints.
+/// Where a screen lays one stop out ([`Place`]), `None` where it is no stop of the list.
 type Placed = fn(&Screenful) -> Option<Place>;
 
-/// [`Frame::placed`].
+/// Where a stop is laid out under the list's top: its top, its height, and how much of it the
+/// screen paints ([`Frame::placed`]).
 type Place = (f32, f32, f32);
 
 /// A view a walk or a reach draws.
@@ -875,10 +868,9 @@ impl Sweep {
         })
     }
 
-    /// THE SCREENS OF A FRAME DRAWN IN `chrome`: the reach `key` names in
-    /// the chrome the page chooses, and where the frame drew another (one
-    /// it held), the reach in the frame's, with the page's as the choice
-    /// the code had too, as the bar at its least is ([`Sweep::at_least`]).
+    /// The screens of a frame drawn in `chrome`: the reach `key` names in the chrome the page
+    /// chooses and, where the frame drew another (one it held), the reach in the frame's, with the
+    /// page's as the choice the code had too, as the bar at its least is ([`Sweep::at_least`]).
     fn framed(&self, key: &ReachOf, chrome: PageChrome) -> (Arc<Reach>, Option<Arc<Reach>>) {
         let chosen = self.reach(key);
         if chosen.chrome == chrome {
@@ -891,10 +883,9 @@ impl Sweep {
         (held, Some(chosen))
     }
 
-    /// R2 AND R5 OF A FRAME THAT SHOWS `now` of the keyboard's control
-    /// where it owes `owed`, drawn in `chrome`: `Err` names a screen that
-    /// shows it so (in any chrome the page can draw, [`rungs`], and under
-    /// the bar at its least too) or, where none does, one that shows more of
+    /// R2 and R5 of a frame that shows `now` of the keyboard's control where it owes `owed`, drawn
+    /// in `chrome`: `Err` names a screen that shows it so (in any chrome the page can draw,
+    /// [`rungs`], and under the bar at its least too) or, where none does, one that shows more of
     /// it than the frame; `Ok` names the geometry that excepts it.
     fn judge(
         &self,
@@ -1538,9 +1529,10 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // control as R2 asks, the status's bar at its least — none does
-        // where this one shows the control so, its bar at its least, and the
-        // two lie further apart than the room.
+        // R3: the theme in use whole on every frame before the person's first event, wherever a
+        // screen shows it so with the keyboard's control as R2 asks and the status's bar at its
+        // least. None does where this one shows the control so, its bar at its least, and the two
+        // lie further apart than the room.
         let apart = !bar.is_some_and(StatusBar::not_least)
             && owed
                 .as_ref()
@@ -1604,11 +1596,11 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 }
             }
         }
-        // than R2 asks (what it owes where a screen shows that, else the most
-        // a screen shows), the nearest of the screens that show it so.
-        // Where only a screen seated partway into the control's own stop
-        // shows it as R2 asks (a stop taller than the room), the frame that
-        // starts there.
+        // R4: back where the wheel turned, no event of the person's since, the wheel's screen;
+        // where it shows the keyboard's control less than R2 asks (what it owes where a screen
+        // shows that, else the most a screen shows), the nearest of the screens that show it so.
+        // Where only a screen seated partway into the control's own stop shows it as R2 asks (a
+        // stop taller than the room), the frame that starts there.
         let into_its_stop = |owed: Kept| {
             control.as_deref().is_some_and(|key| {
                 frame.kept(key).covers(owed)
@@ -1668,11 +1660,12 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // [`SettingsViewState::seat_scroll`] reads it: by the keyboard's
-        // control where the wheel's screen showed its stop, as many stops
-        // the list's top where the wheel left it at its top. But where that
-        // screen shows the keyboard's control less than R2 asks and another
-        // shows it so, the nearest of those: no further than R2 needs.
+        // R4 in between: in another window, text size or bars, no event of the person's since,
+        // the list at the wheel's place, clamped at the list's end. The place is held as
+        // [`SettingsViewState::seat_scroll`] reads it: by the keyboard's control where the wheel's
+        // screen showed its stop, as many stops under the screen's top; else by the screen's
+        // first stop, and at the list's top where the wheel left it there. Where that screen
+        // shows the keyboard's control less than R2 asks and another shows it so, the nearest.
         if let Some(wheel) = wheeled.as_ref()
             && drawn != wheel.drawn
             && frame.list
@@ -1741,13 +1734,11 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 );
             }
         }
-        // A REACH JUDGES A FRAME BY ITS LIST: each one a rule read for this
-        // frame lists the stops the frame lists, as tall, drew every screen in
-        // the frame's chrome, and at the frame's scroll leaves the list the
-        // frame's room — else its key left out something the view holds, and
-        // it judges the frame by another page's screens. Under a status, a
-        // reach for another reveal sizes the bar, and so the list, for that:
-        // what its key holds is judged by the reach it names for the frame's.
+        // A reach judges a frame by its list: each one a rule read for this frame lists the stops
+        // the frame lists, as tall, drew every screen in the frame's chrome, and at the frame's
+        // scroll leaves the list the frame's room; else its key left out something the view
+        // holds. Under a status, a reach for another reveal sizes the bar, and so the list, for
+        // that, so it is judged by the reach its key names for the frame's reveal.
         if frame.list
             && let Some(top) = frame.top
         {
@@ -1833,24 +1824,15 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
     found
 }
 
-/// THE WALK FROM `start`: through the windows that follow its own round
-/// `windows`, half the others (so between two windows each change, out and
-/// back, is walked once, from one of them), the other text size, the warning
-/// and a status, and back, in each of the ways below that `taken` names, and
-/// the keys on the keyboard's control. ONE WALK, so a start opens one view:
-/// its ways in an order that leaves each the keyboard where a walk of its own
-/// would start it — nothing of the person's before the frames drawn again,
-/// the keyboard on the scenario's control (off the list, nowhere) for the
-/// wheels, the keys that move it last. Each change is drawn again, by nothing
-/// or by a reply the person did not cause, and half the wheels, so a change
-/// follows a wheel straight and after its frame drawn again; a wheel's place
-/// is held through two changes and back, one of them drawn again (each change
-/// is the one in the walks from half the windows), and under the text size or
-/// a bar through another. A WHEEL, OR THE KEYBOARD PUT ON ITS CONTROL, IN
-/// ANOTHER WINDOW is walked from that window's own start, which wheels and
-/// puts the keyboard there and goes on to the windows that follow it: only the
-/// text size and the bars, whose changed state no start of a walk is, are
-/// wheeled and focused in from here.
+/// The walk from `start`: through the windows that follow it round `windows` (half the others,
+/// so each change between two windows is walked once, from one of them), the other text size, the
+/// warning and a status, and back, in each of the ways `taken` names, then the keys on the
+/// keyboard's control. One walk, so a start opens one view: its ways are ordered so each leaves
+/// the keyboard where a walk of its own would start it. Each change is drawn again, by nothing or
+/// by a reply the person did not cause, as are half the wheels; a wheel's place is held through
+/// two changes and back, and under the text size or a bar through another. A wheel, or the
+/// keyboard put on its control, in another window is walked from that window's own start; only
+/// the text size and the bars, which no walk starts in, are wheeled and focused in from here.
 fn walk_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -> Vec<Step> {
     use Step::{Again, Down, Focus, Left, Right, Status, Type, Up, Warning, Wheel};
     let at = windows
@@ -2469,19 +2451,16 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // A status over a pinned control (the filter, and
-        // the strip's Done beside the sheet), which the sweep counted whole
-        // by its clipped rect.
+        // A status over a pinned control (the filter, and the strip's Done beside the sheet),
+        // judged by its paint, not its clipped rect.
         (filter, at(w444x420, 2), vec![Focus, Status]),
         (filter, at(w444x420, 2), vec![Wheel(8), Status]),
         (first, at((640, 480), 2), vec![Status]),
-        // A status that took the keyboard's control out of
-        // view, the list sent back to a place no wheel had put it.
+        // A status that takes the keyboard's control out of view.
         (closed, at(w444x292, 2), vec![Window((600, 200)), Status]),
         (row, at((600, 200), 1), vec![Window((380, 300)), Status]),
-        // The keyboard on the row next to the theme in
-        // use's before the first frame, which a screen shows with it (R3),
-        // under the bar at its least too.
+        // The keyboard on the row next to the theme in use's before the first frame, which a
+        // screen shows with it (R3), under the bar at its least too.
         (row, at(w1284x714, 2), vec![Again]),
         (row, at(w178x348, 1), vec![Status, Text]),
         // Reaches in windows no rule was tuned on.
@@ -2490,15 +2469,13 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((380, 300), 1),
             vec![Wheel(4), Status, Again, Status, Wheel(-4), Status],
         ),
-        // The person's own keys, the keyboard left on its
-        // control (R5).
+        // The person's own keys, the keyboard left on its control (R5).
         (filter, at((230, 420), 2), vec![Up]),
         (closed, at(w300x160, 1), vec![Up]),
         (side, at(w444x180, 1), vec![Up, Up]),
         (filter, at(w178x348, 1), vec![Down, Type]),
-        // The keyboard on a row by the theme in use's
-        // before the first frame, a landing the keyboard's row held off the
-        // screen on a frame measured again (R3).
+        // The keyboard on a row by the theme in use's before the first frame, the landing held
+        // off the screen by the keyboard's row on a frame measured again (R3).
         (
             row_after,
             at(w1284x714, 2),
@@ -2508,14 +2485,14 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         (row_after, at(w178x348, 2), vec![Text]),
         (row_default, at(w444x292, 2), vec![Window((980, 420))]),
         (pack, at((1_440, 900), 2), vec![Text]),
-        // A status over a row taller than the room, which
-        // the bar at its least shows 64pt of, its words whole (R2).
+        // A status over a row taller than the room, which the bar at its least shows 64pt of, its
+        // words whole (R2).
         (row_after, at(w178x348, 2), vec![Focus, Warning, Status]),
         (row_after, at(w178x348, 2), vec![Warning, Status, Focus]),
         (closed, at(w178x348, 2), vec![Focus, Warning, Status]),
         (closed, at(w178x348, 2), vec![Status, Status]),
-        // A filter change that held the chrome the short
-        // list of results had chosen, the long list back with less room (R5).
+        // A filter change under the chrome the short list of results chose, the long list back
+        // with less room (R5).
         (
             filter,
             at(w444x292, 1),
@@ -2551,9 +2528,8 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w584x348, 1),
             vec![Down, Type, Window((380, 300)), Erase, Again, Warning],
         ),
-        // A long name wrapped at 2× text, its row in the
-        // list's faded foot, which the code counted shown and the paint did
-        // not (R3, R4).
+        // A long name wrapped at 2× text, its row in the list's faded foot, judged by the paint
+        // (R3, R4).
         (latte, at((330, 260), 1), vec![Text, Status]),
         (
             latte,
@@ -2589,16 +2565,14 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // Up on Customize, which the last screen showed
-        // cut, scrolled it out of view (R5).
+        // Up on Customize, which the last screen showed cut (R5).
         (closed, at((600, 200), 2), vec![Status, Focus, Up]),
         (
             closed,
             at(w444x292, 2),
             vec![Window((600, 200)), Status, Focus, Up],
         ),
-        // The wheel's place over a re-layout, the filter
-        // its screen listed (R4).
+        // The wheel's place over a re-layout, the filter its screen listed (R4).
         (
             filter_tokyo,
             at((300, 292), 2),
@@ -2619,10 +2593,9 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // What a view holds past the scenario's opening
-        // that lays the page out — the Community disclosure Left shuts and
-        // Right opens, a draft typed in the sheet's foreground field — which
-        // a reach must hold too ([`Held`]).
+        // What a view holds past the scenario's opening that lays the page out (the Community
+        // disclosure Left shuts and Right opens, a draft in the sheet's foreground field), which a
+        // reach must hold too ([`Held`]).
         (
             pack,
             at(w444x292, 1),
@@ -2680,12 +2653,10 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w178x348),
             ],
         ),
-        // A control the room holds, whole on no screen of
-        // a list that scrolls by stops — foreground under the caption COLORS
-        // repeats over every screen of its rows (R2, R5), and under a status
-        // the built-in section's caption over its first theme, a stop grouped
-        // for the room before the bar, 64pt in 48pt (R2, R3); Latte under a
-        // status is the long name's first walk above.
+        // A control the room holds, whole on no screen of a list that scrolls by stops: foreground
+        // under the caption COLORS repeats over every screen of its rows (R2, R5), and under a
+        // status the built-in section's caption over its first theme, a stop grouped for the room
+        // before the bar, 64pt in 48pt (R2, R3).
         (drawn, at(w444x292, 2), vec![Down, Window(w444x180)]),
         (drawn, at(w444x180, 2), vec![Down, Again]),
         (drawn, at(w178x348, 2), vec![Down, Type]),
@@ -2707,8 +2678,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w178x348, 1),
             vec![Wheel(4), Window(w584x348), Window(w178x348)],
         ),
-        // Round 9's review: Again after a wheel back to the list's top, which
-        // chose the page's chrome again (R1).
+        // Again after a wheel back to the list's top, the page's chrome chosen again (R1).
         (background, at(w444x420, 1), vec![Wheel(-12), Again]),
         (drawn, at((900, 260), 1), vec![Warning, Wheel(-12), Again]),
         (palette, at((260, 500), 1), vec![Warning, Wheel(-12), Again]),
@@ -2718,9 +2688,8 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((380, 300), 1),
             vec![Status, Warning, Wheel(-12), Again],
         ),
-        // Round 9's review: the chooser's footer under the bars, a switch
-        // under its label that no stop the room holds showed, and one the
-        // list's edge cut counted as none of it (R2, R5).
+        // The chooser's footer under the bars: a switch under its label that no stop the room
+        // holds shows, and one the list's edge cuts (R2, R5).
         (follow, at(w178x348, 2), vec![Warning, Status]),
         (follow, at(w178x348, 2), vec![Warning, Status, Left]),
         (folder, at(w178x348, 2), vec![Warning, Status]),
@@ -2735,14 +2704,12 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((700, 250), 2),
             vec![Status, Window((480, 360))],
         ),
-        // Round 9's review: a wheel's place under a status, the keyboard on
-        // Done outside the list, moved by the warning (R4).
+        // A wheel's place under a status, the keyboard on Done outside the list, moved by the
+        // warning (R4).
         (drawn, at((380, 300), 1), vec![Status, Wheel(-4), Warning]),
-        // Round 9's review: a reach whose screens were drawn in another chrome
-        // than the frame's.
+        // A reach whose screens were drawn in another chrome than the frame's.
         (save_as, at((380, 300), 1), vec![Wheel(1), Status]),
-        // Round 9's review: a row the list draws as a picture, its cause
-        // measured as shown.
+        // A row the list draws as a picture, its cause measured as shown.
         (
             pack,
             at((980, 420), 2),
@@ -2762,12 +2729,10 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w444x180),
             ],
         ),
-        // Round 9's review: a colour row's well and the one over it in the
-        // room a status leaves (R2, R5).
+        // A colour row's well and the one over it in the room a status leaves (R2, R5).
         (well, at((380, 300), 1), vec![Status]),
         (field, at(w444x420, 2), vec![Status, Up]),
-        // Round 10's review: the text size there and back after a wheel,
-        // which chose the sheet's chrome again (R4).
+        // The text size there and back after a wheel, the sheet's chrome chosen again (R4).
         (palette, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
         (background, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
         (field, at(w444x420, 1), vec![Wheel(-2), Text, Text]),
@@ -2784,16 +2749,15 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             vec![Wheel(2), Wheel(-4), Text, Again, Text],
         ),
         (palette, at(w444x420, 1), vec![Text, Text]),
-        // Round 10's review: a chrome kept, or chosen again, that cut the
-        // keyboard's control under a bar (R2).
+        // A chrome kept, or chosen again, that cuts the keyboard's control under a bar (R2).
         (
             background,
             at((1_385, 640), 1),
             vec![Window((1_268, 165)), Refresh, Up, Warning, Tick, Again],
         ),
         (drawn, at((1_195, 191), 2), vec![Warning, Text]),
-        // Round 10's review: the pack row under its heading at 2× text, and
-        // the theme in use under a status before the first event (R2, R3).
+        // The pack row under its heading at 2× text, and the theme in use under a status before
+        // the first event (R2, R3).
         (
             pack,
             at((590, 727), 2),
@@ -2814,8 +2778,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at((320, 340), 2),
             vec![Window((339, 920)), Warning, Status],
         ),
-        // Round 10's review, its walks at any window size (each one another
-        // goes on from left to that one).
+        // Walks at any window size.
         (
             follow,
             at((756, 310), 2),
@@ -3385,11 +3348,10 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((1_209, 180)),
             ],
         ),
-        // Round 10's walks at any window size: the landing under a status
-        // before the first event (R3), a reveal for a stop the screen chosen
-        // did not draw (R1, R2), a key under a held chrome and a colour row
-        // taller than the room the bars leave (R2), and the settings sidebar,
-        // which scrolls on its own, under a wheel's place (R4).
+        // Walks at any window size: the landing under a status before the first event (R3), a
+        // reveal for a stop the chosen screen did not draw (R1, R2), a key under a held chrome and
+        // a colour row taller than the room the bars leave (R2), and the settings sidebar, which
+        // scrolls on its own, under a wheel's place (R4).
         (
             row,
             at((520, 691), 2),
@@ -3569,9 +3531,8 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Warning,
             ],
         ),
-        // Round 11's review: a window back at a size it was drawn at, which
-        // recalled the chrome it drew there though that cut the keyboard's
-        // control and another rung kept it whole (R2).
+        // A window back at a size it was drawn at, where the chrome it drew there cuts the
+        // keyboard's control and another rung keeps it whole (R2).
         (
             save_as,
             at(w380x300, 1),
@@ -3613,9 +3574,8 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window(w380x300),
             ],
         ),
-        // Round 11's review: a chrome that cut the keyboard's control where
-        // a richer rung, or a leaner one seated partway into the control's
-        // stop, showed it whole (R2).
+        // A chrome that cuts the keyboard's control where a richer rung, or a leaner one seated
+        // partway into the control's stop, shows it whole (R2).
         (well, at((931, 186), 1), vec![Status, Warning]),
         (well, at((931, 186), 1), vec![Warning, Status]),
         (well, at((931, 186), 1), vec![Focus, Status, Warning]),
@@ -3630,15 +3590,14 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             at(w380x300, 1),
             vec![Press(CUSTOMIZE), Status, Press(SAVE_AS)],
         ),
-        // Round 11's review: the keyboard on Settings' search in the
-        // toolbar, which a status's bar covered, or the toolbar's dock took
-        // the place of (R2).
+        // The keyboard on Settings' search in the toolbar, under a status's bar or the toolbar's
+        // dock (R2).
         (search, at(w178x348, 2), vec![Focus, Warning, Status]),
         (search, at(w178x348, 2), vec![Wheel(8), Warning, Status]),
         (search, at(w178x348, 2), vec![Wheel(1), Warning]),
         (search, at(w444x420, 1), vec![Warning, Status]),
-        // Round 11's review: a colour well, which no words name, crossed by
-        // the list's floor or bottom edge, owed what it painted (R2).
+        // A colour well, which no words name, crossed by the list's floor or bottom edge, owed
+        // what it painted (R2).
         (
             drawn,
             at((380, 164), 1),
@@ -3661,10 +3620,9 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((444, 262)),
             ],
         ),
-        // Round 11's review, widened: a rung that shows a cut control no
-        // less than the screen before did, where none shows it whole, and a
-        // status docked in the compact toolbar that took more of the window
-        // than its bars stacked at their least (R2).
+        // A rung that shows a cut control no less than the screen before did, where none shows it
+        // whole, and a status docked in the compact toolbar that took more of the window than its
+        // bars stacked at their least (R2).
         (
             drawn,
             at((380, 318), 1),
@@ -3798,9 +3756,8 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
 /// scenario whose list is longest (Pack's) is not the run's long pole.
 const KEEPING_WORKERS: usize = 12;
 
-/// `scenario`'s frames held to the keeping rules: the walks through every
-/// change and back ([`walk_from`]) that `taken` names, random walks, and the
-/// walks reviews found ([`reviewed`]).
+/// `scenario`'s frames held to the keeping rules: the walks through every change and back
+/// ([`walk_from`]) that `taken` names, random walks, and the regression walks ([`reviewed`]).
 fn sweep(scenario: Scenario, taken: Walks) {
     let started = std::time::Instant::now();
     let sweep = Sweep::new(scenario);

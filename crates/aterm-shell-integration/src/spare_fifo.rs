@@ -57,14 +57,13 @@ fn sweep_dead_with(
 }
 
 /// Unlink the FIFO at `path`, and `link` while it names it, holding a wake on the FIFO across both
-/// unlinks; the wake is returned, and closes when the caller drops it. The wake opens the FIFO for
-/// reading and writing, which no FIFO makes wait or refuses, reader or none. A shell waiting to open
-/// it is let through; a shell that resolved `link` before its unlink and opens the FIFO while the
-/// wake is held finds a writer. Either reads the end once the wake closes, finds its link gone,
-/// and exits. A write-only, non-blocking wake is refused (`ENXIO`) while no reader holds the FIFO,
-/// which is the instant a shell spends between reading the end and opening it again: that shell
-/// would then wait for ever on a FIFO nobody can name.
-/// If the wake cannot open, both names stay for a later sweep.
+/// unlinks; the caller drops the returned wake to close it. The wake opens the FIFO read-write,
+/// which never waits or fails for want of a reader. A shell waiting to open the FIFO, or one that
+/// resolved `link` before its unlink, gets through, reads the end once the wake closes, finds its
+/// link gone, and exits. A write-only, non-blocking wake fails (`ENXIO`) while no reader holds the
+/// FIFO, as in the instant a shell spends between reading the end and opening it again, which
+/// would leave that shell waiting for ever on a FIFO nobody can name. If the wake cannot open,
+/// both names stay for a later sweep.
 fn release(path: &Path, link: &Path) -> Option<std::fs::File> {
     let wake = std::fs::OpenOptions::new()
         .read(true)

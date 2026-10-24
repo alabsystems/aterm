@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The vz lane's guest agent build (docs/DESIGN-vz-guest-2026-10-23.md §6, slice V1):
-//! [`build_agent`] cross-builds `crates/aterm-vz-agent` as a static
-//! `aarch64-unknown-linux-musl` executable and places it content-addressed at
-//! `vz.noindex/agent/<sha256>/aterm-vz-agent`, the directory the guest's boot share is.
+//! The vz lane's guest agent build (docs/DESIGN-vz-guest-2026-10-23.md §6): [`build_agent`]
+//! cross-builds `crates/aterm-vz-agent` as a static `aarch64-unknown-linux-musl` executable and
+//! places it content-addressed at `vz.noindex/agent/<sha256>/aterm-vz-agent`, the directory the
+//! guest's boot share is.
 //!
 //! STOCK EXCEPTION: the build runs on rustup stable, because Trust has no Linux std
-//! ([`crate::linux_guest::RUST`]'s note), linked by stable's own `rust-lld` against the
-//! musl std `targo --unverified verify provision --linux` places. It is spelt as the design
-//! spells it: `rustup run stable cargo build --locked … --target aarch64-unknown-linux-musl`
-//! with `--config` tables for the linker and its flags, never `RUSTFLAGS`.
+//! ([`crate::linux_guest::RUST`]'s note), linked by stable's own `rust-lld` against the musl std
+//! `targo --unverified verify provision --linux` places, configured by `--config` tables, never
+//! `RUSTFLAGS`.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -751,8 +750,8 @@ mod tests {
         assert!(why(&far).contains("past the file"));
     }
 
-    /// A corrupt table is refused before placement, including omitted entries and offsets
-    /// that would wrap. Complete static output is accepted; a named loader is refused.
+    /// A malformed or truncated program-header table, or one whose later entry names a loader, is
+    /// refused before anything is placed.
     #[test]
     fn malformed_program_headers_are_refused_before_an_agent_is_placed() {
         let good = elf(2, 183, 1);
@@ -854,10 +853,8 @@ mod tests {
         assert_eq!(std::fs::read(&placed.path).expect("read"), bytes);
     }
 
-    /// A concurrent build that places the same agent while this one writes its copy wins,
-    /// whether it lands before this one looks or between the look and the rename: its copy
-    /// (which a guest may already run) is kept, never removed or renamed over, and this
-    /// one's partial goes.
+    /// The same agent placed by another build before the look or before the rename is kept, and
+    /// this one's partial goes.
     #[test]
     fn a_copy_another_build_placed_meanwhile_is_kept() {
         use std::os::unix::fs::MetadataExt as _;
@@ -892,8 +889,7 @@ mod tests {
         }
     }
 
-    /// The negative control: a directory that appears between the look and the rename
-    /// without this agent in it is a failure, never a placing.
+    /// Negative control: a directory without this agent that appears before the rename fails it.
     #[test]
     fn a_rename_lost_to_a_directory_without_the_agent_fails() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");

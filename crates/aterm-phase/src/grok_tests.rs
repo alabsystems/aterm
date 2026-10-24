@@ -3,7 +3,7 @@
 
 use super::fixtures::{REPLY_QUOTES_RATE_LIMIT, SIGNED_OUT, WALL_PLAN_RATE_LIMIT};
 use super::*;
-use crate::prompt::fixtures::screen;
+use crate::prompt::fixtures::{composer, rows, screen};
 use crate::reader::{Program, identify, program_of, read};
 use crate::wall::{Placement, WallKind};
 
@@ -113,4 +113,58 @@ fn the_signed_out_screen_is_grok_s_own_and_its_sign_in_wall() {
     let shell = screen("$ ls\nCargo.toml  src\n$ ");
     assert_eq!(identify(None, &shell).program(), Program::Generic);
     assert_eq!(identify(Some("zsh"), &rows).program(), Program::Generic);
+}
+
+/// A CLAUDE CODE SCREEN QUOTING GROK BUILD'S SIGN-IN SCREEN IS STILL CLAUDE CODE'S: its Bash
+/// tool's output (`aterm ctl text` of a Grok tab) shows the approval line, `Waiting for
+/// approval...` and the `ctrl+q  quit` key row above its own composer. CONTROL: those rows with no
+/// Claude Code frame under them are Grok Build's by sight.
+#[test]
+fn a_claude_code_screen_quoting_groks_sign_in_screen_is_still_claude_codes() {
+    let quote = rows(&[
+        "⏺ Bash(aterm ctl @s-grok text | tail -12)",
+        "  ⎿  ~/proj",
+        "     Approve in your browser to finish signing in.",
+        "     Make sure your browser shows this code.",
+        "     Waiting for approval...",
+        "     ctrl+q  quit",
+        "",
+    ]);
+    assert!(is_grok_screen(&quote), "CONTROL: Grok Build's by sight");
+    assert_eq!(identify(None, &quote).program(), Program::Grok, "CONTROL");
+    let mut claude = quote;
+    claude.extend(composer("  ? for shortcuts"));
+    for program in [None, Some("node"), Some("ssh")] {
+        assert_eq!(
+            identify(program, &claude).program(),
+            Program::Claude,
+            "{program:?}"
+        );
+    }
+}
+
+/// A NOT-LOGGED-IN WALL IS GROK BUILD'S OWN SENTENCE, NOT THE BARE PHRASE OTHER CLIS OPEN WITH: a
+/// reply quoting another CLI's `Not logged in. …` (netlify's) is no wall. CONTROL: Grok Build's
+/// own `Not logged in. Run `grok login`.` is an ended login.
+#[test]
+fn a_reply_line_opening_with_another_clis_not_logged_in_is_no_grok_login_wall() {
+    let card = |lines: &[&str]| {
+        let mut rows = screen(WALL_PLAN_RATE_LIMIT);
+        let at = rows
+            .iter()
+            .rposition(|r| r.contains("rate limit for your plan"))
+            .expect("the card's body");
+        rows.splice(at..=at, lines.iter().map(|l| (*l).to_string()));
+        rows
+    };
+    let quoted = card(&[
+        "  I ran `netlify status`; it printed:",
+        "    Not logged in. Please log in to see site status.",
+    ]);
+    assert_eq!(wall(&quoted), None);
+    assert_eq!(
+        wall(&card(&["    Not logged in. Run `grok login`."])).map(|w| w.kind),
+        Some(WallKind::Auth),
+        "CONTROL"
+    );
 }

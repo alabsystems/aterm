@@ -924,10 +924,11 @@ pub const TOOLS: &[Tool] = &[
     unprovided(
         "zstd",
         &["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"],
-        "only a rostered publish host packs with it, until S17's encoder (row 18)",
-        "the producer compresses every pack at -19 on a rostered publish host, and one producer \
-         test packs through it, the oracle its other tests' raw-block writer (aterm-zstd) is held \
-         to; S17's encoder retires it (row 18)",
+        "it is the outside reference the tests judge aterm-zstd's encoder by, so aterm builds no \
+         copy; nothing packs or ships with it (row 18)",
+        "the oracle aterm-zstd's encoder is held to: its -t and -d of the encoder's frames, and \
+         its -19 sizes, which level 19 stays within 3% of (tests/encode_cli.rs); and the one \
+         producer test that decodes a pack with it; no lane or publish host runs it (row 18)",
     ),
     unprovided(
         "gitleaks",
@@ -986,7 +987,8 @@ pub const TOOLS: &[Tool] = &[
     hardware(
         "virtualization",
         "Apple silicon with Virtualization.framework",
-        "the Linux lane's own VM runs on Virtualization.framework through aterm-vz's helper; \
-         the lane reads `kern.hv_support` by sysctl, with no framework loaded",
+        "the Linux lane's own VM runs on Virtualization.framework through aterm-vz's helper, in a \
+         console session, since the framework's VM process opens a WindowServer connection at \
+         each boot; the lane reads `kern.hv_support` by sysctl, with no framework loaded",
     ),
 ];

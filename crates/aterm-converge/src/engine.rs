@@ -203,10 +203,16 @@ pub fn run_scoped(
         }
     }
     let mut awaiting: Vec<(String, usize, usize)> = Vec::new();
+    let mut passive: Vec<(String, usize, usize)> = Vec::new();
     let mut rows: Vec<ItemReport> = Vec::with_capacity(items.len());
     for (position, &index) in order.iter().enumerate() {
         let item = items[index].as_ref();
         let activation = activations[index].as_deref();
+        let item_mode = if mode == Mode::Apply && !scope.applies(item.class()) {
+            Mode::Plan
+        } else {
+            mode
+        };
         let (row, awaits) =
             if item.requires() == Requires::Console && !scope.admits(Requires::Console) {
                 let why = scope.not_own_account.map_or_else(
@@ -219,12 +225,7 @@ pub fn run_scoped(
                 row.why = Some(why);
                 (row, false)
             } else {
-                let mode = if mode == Mode::Apply && !scope.applies(item.class()) {
-                    Mode::Plan
-                } else {
-                    mode
-                };
-                let blocker = (mode == Mode::Apply)
+                let blocker = (item_mode == Mode::Apply)
                     .then(|| unmet_prerequisite(item, &rows))
                     .flatten();
                 match blocker {
@@ -249,7 +250,7 @@ pub fn run_scoped(
                     }
                     None => run_one(
                         item,
-                        mode,
+                        item_mode,
                         journal,
                         &rows,
                         hold.as_deref(),
@@ -259,6 +260,14 @@ pub fn run_scoped(
             };
         if awaits && let Some(activation) = activation {
             awaiting.push((activation.id(), rows.len(), index));
+        } else if item_mode == Mode::Apply
+            && hold.is_none()
+            && row.outcome == Outcome::Ok
+            && let Some(activation) = activation
+        {
+            // Another item can relaunch this item's reader after its successful probe.
+            // Only an actual activation needs another read; this item changes nothing.
+            passive.push((activation.id(), rows.len(), index));
         } else {
             on_row(&row);
         }
@@ -272,7 +281,15 @@ pub fn run_scoped(
                     .map(|&(_, at, item)| (at, item))
                     .collect();
                 awaiting.retain(|(of, _, _)| *of != id);
-                settle(activation, &mine, items, &mut rows, journal, on_row);
+                let unchanged: Vec<(usize, usize)> = passive
+                    .iter()
+                    .filter(|(of, _, _)| *of == id)
+                    .map(|&(_, at, item)| (at, item))
+                    .collect();
+                passive.retain(|(of, _, _)| *of != id);
+                settle(
+                    activation, &mine, &unchanged, items, &mut rows, journal, on_row,
+                );
             }
         }
     }
@@ -282,25 +299,45 @@ pub fn run_scoped(
 fn settle(
     activation: &dyn Activation,
     awaiting: &[(usize, usize)],
+    passive: &[(usize, usize)],
     items: &[Box<dyn Item + '_>],
     rows: &mut [ItemReport],
     journal: &mut dyn Journal,
     on_row: &mut dyn FnMut(&ItemReport),
 ) {
-    if awaiting.is_empty() {
-        return;
-    }
-    let activated: Result<Vec<(String, String)>, (bool, String)> = match activation.pending() {
-        Err(why) => Err((false, why)),
-        Ok(None) => Ok(Vec::new()),
-        Ok(Some((from, to))) => journal
-            .before_change(&activation.id(), &from, &to, None)
-            .map_err(|why| (true, format!("the journal refused the record ({why})")))
-            .and_then(|()| activation.activate().map_err(|why| (false, why))),
+    let mut invoked = false;
+    let activated: Result<Vec<(String, String)>, (bool, String)> = if awaiting.is_empty() {
+        Ok(Vec::new())
+    } else {
+        match activation.pending() {
+            Err(why) => Err((false, why)),
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some((from, to))) => journal
+                .before_change(&activation.id(), &from, &to, None)
+                .map_err(|why| (true, format!("the journal refused the record ({why})")))
+                .and_then(|()| {
+                    invoked = true;
+                    activation.activate().map_err(|why| (false, why))
+                }),
+        }
     };
-    for &(at, index) in awaiting {
+    let mut completing: Vec<_> = awaiting
+        .iter()
+        .map(|&(at, index)| (at, index, false))
+        .chain(passive.iter().map(|&(at, index)| (at, index, true)))
+        .collect();
+    completing.sort_unstable_by_key(|&(at, _, _)| at);
+    for (at, index, passive) in completing {
         let item = items[index].as_ref();
         let row = &mut rows[at];
+        if passive {
+            if invoked {
+                let last = read_back_as(item, row, Outcome::Ok, "rechecked after activation");
+                finish(item, row, &last);
+            }
+            on_row(row);
+            continue;
+        }
         let failed = match &activated {
             Err((refused, why)) => Some((*refused, why.as_str())),
             Ok(failed) => failed
@@ -327,19 +364,23 @@ fn settle(
 }
 
 fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
+    read_back_as(item, row, Outcome::Changed, "applied")
+}
+
+fn read_back_as(item: &dyn Item, row: &mut ItemReport, success: Outcome, after: &str) -> Probe {
     let back = item.probe();
     match &back {
         Probe::Ok { now } => {
-            row.outcome = Outcome::Changed;
+            row.outcome = success;
             row.to = Some(now.clone());
         }
         Probe::Change { from: now, .. } => {
             row.outcome = Outcome::Failed;
-            row.why = Some(format!("applied, but it still reads {now}"));
+            row.why = Some(format!("{after}, but it still reads {now}"));
         }
         Probe::Unusable { why } => {
             row.outcome = Outcome::Failed;
-            row.why = Some(format!("applied, but the read-back did not answer: {why}"));
+            row.why = Some(format!("{after}, but the read-back did not answer: {why}"));
         }
         Probe::Blocked { why }
         | Probe::Waits { why, .. }
@@ -347,7 +388,7 @@ fn read_back(item: &dyn Item, row: &mut ItemReport) -> Probe {
         | Probe::Deferred { why }
         | Probe::Person { how: why, .. } => {
             row.outcome = Outcome::Failed;
-            row.why = Some(format!("applied, but the read-back says: {why}"));
+            row.why = Some(format!("{after}, but the read-back says: {why}"));
         }
     }
     back
@@ -1487,6 +1528,7 @@ pub(crate) mod tests {
 
     struct Writer {
         id: &'static str,
+        class: Class,
         probes: std::sync::Mutex<Vec<Probe>>,
         apply: Result<(), String>,
         after: Vec<String>,
@@ -1498,6 +1540,7 @@ pub(crate) mod tests {
         fn new(id: &'static str, events: &Events, activation: Option<&Arc<Relaunch>>) -> Self {
             Self {
                 id,
+                class: Class::Preference,
                 probes: std::sync::Mutex::new(vec![change(), ok()]),
                 apply: Ok(()),
                 after: Vec::new(),
@@ -1518,7 +1561,7 @@ pub(crate) mod tests {
             Layer::Workstation
         }
         fn class(&self) -> Class {
-            Class::Preference
+            self.class
         }
         fn title(&self) -> String {
             self.id.into()
@@ -1691,12 +1734,15 @@ pub(crate) mod tests {
                 pending,
                 result,
             });
+            let mut unchanged = Writer::new("c", &events, Some(&dock));
+            unchanged.probes = std::sync::Mutex::new(vec![ok(), ok()]);
             let items: Vec<Box<dyn Item>> = vec![
                 Box::new(Writer::new("a", &events, Some(&dock))),
                 Box::new(Writer::new("b", &events, Some(&dock))),
+                Box::new(unchanged),
             ];
             let rows = recorded(&items, Mode::Apply, &events, refuses);
-            for row in &rows {
+            for row in &rows[..2] {
                 assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
                 let why = row.why.clone().unwrap();
                 assert!(why.starts_with("applied, but not activated: "), "{why}");
@@ -1707,6 +1753,8 @@ pub(crate) mod tests {
                 };
                 assert_eq!(row.explain, Some(explained(&probe)), "{row:?}");
             }
+            assert_eq!(rows[2].outcome, Outcome::Ok);
+            assert!(rows[2].from.is_none() && rows[2].revert.is_none());
             let events = events.lock().unwrap();
             assert_eq!(
                 events.iter().any(|event| event == "activate relaunch.dock"),
@@ -1714,6 +1762,132 @@ pub(crate) mod tests {
                 "{events:?}"
             );
             assert_eq!(events.iter().filter(|event| *event == "probe a").count(), 1);
+            assert_eq!(
+                events.iter().filter(|event| *event == "probe c").count(),
+                if ran { 2 } else { 1 }
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event.as_str(), "apply c" | "journal c"))
+            );
+            assert_eq!(events.iter().filter(|event| *event == "row c").count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_shared_activation_rechecks_initially_correct_items_without_reapplying_them() {
+        for after in [
+            ok(),
+            change(),
+            Probe::Unusable {
+                why: "the reader cannot be read".into(),
+            },
+        ] {
+            for result in [Ok(Vec::new()), Err("partially relaunched".into())] {
+                let events = Events::default();
+                let dock = Arc::new(Relaunch {
+                    id: "relaunch.dock",
+                    events: Arc::clone(&events),
+                    pending: Ok(Some(("old".into(), "new".into()))),
+                    result,
+                });
+                let mut unchanged = Writer::new("unchanged", &events, Some(&dock));
+                unchanged.probes = std::sync::Mutex::new(vec![ok(), after.clone()]);
+                let mut outside = Writer::new("outside", &events, None);
+                outside.probes = std::sync::Mutex::new(vec![ok(), change()]);
+                let items: Vec<Box<dyn Item>> = vec![
+                    Box::new(unchanged),
+                    Box::new(outside),
+                    Box::new(Writer::new("writer", &events, Some(&dock))),
+                ];
+                let rows = recorded(&items, Mode::Apply, &events, &[]);
+                let row = &rows[0];
+                assert_eq!(
+                    row.outcome,
+                    if matches!(after, Probe::Ok { .. }) {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Failed
+                    },
+                    "{rows:?}"
+                );
+                assert!(row.from.is_none() && row.revert.is_none());
+                assert_eq!(rows[1].outcome, Outcome::Ok);
+                if row.outcome == Outcome::Failed {
+                    assert_eq!(row.explain, Some(explained(&after)));
+                    assert!(row.why.as_ref().is_some_and(|why| !why.is_empty()));
+                }
+                let events = events.lock().unwrap();
+                let at = |event: &str| events.iter().position(|seen| seen == event).unwrap();
+                assert!(at("activate relaunch.dock") < at("row unchanged"));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| *event == "probe unchanged")
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| *event == "probe outside")
+                        .count(),
+                    1
+                );
+                for id in ["unchanged", "outside", "writer"] {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| **event == format!("row {id}"))
+                            .count(),
+                        1
+                    );
+                }
+                assert!(!events.iter().any(|event| matches!(
+                    event.as_str(),
+                    "apply unchanged" | "journal unchanged"
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn a_class_read_as_a_plan_is_not_rechecked_by_an_applied_shared_activation() {
+        for mode in [Mode::Plan, Mode::Apply] {
+            let events = Events::default();
+            let dock = relaunch("relaunch.dock", &events);
+            let mut unchanged = Writer::new("unchanged", &events, Some(&dock));
+            unchanged.probes = std::sync::Mutex::new(vec![ok(), change()]);
+            let mut writer = Writer::new("writer", &events, Some(&dock));
+            writer.class = Class::Relay;
+            let items: Vec<Box<dyn Item>> = vec![Box::new(unchanged), Box::new(writer)];
+            let mut journal = Recorded {
+                events: Arc::clone(&events),
+                refuses: &[],
+            };
+            let rows = run_scoped(&items, mode, Scope::REPAIR, &mut journal, &mut |_| {}).unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Ok);
+            assert_eq!(
+                rows[1].outcome,
+                if mode == Mode::Apply {
+                    Outcome::Changed
+                } else {
+                    Outcome::Planned
+                }
+            );
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| *event == "probe unchanged")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events.iter().any(|event| event == "activate relaunch.dock"),
+                mode == Mode::Apply
+            );
         }
     }
 
@@ -1761,18 +1935,26 @@ pub(crate) mod tests {
             pending: Ok(None),
             result: Ok(Vec::new()),
         });
-        let items: Vec<Box<dyn Item>> = vec![Box::new(Writer::new("a", &events, Some(&dock)))];
+        let mut unchanged = Writer::new("unchanged", &events, Some(&dock));
+        unchanged.probes = std::sync::Mutex::new(vec![ok(), change()]);
+        let items: Vec<Box<dyn Item>> = vec![
+            Box::new(Writer::new("a", &events, Some(&dock))),
+            Box::new(unchanged),
+        ];
         let rows = recorded(&items, Mode::Apply, &events, &[]);
         assert_eq!(rows[0].outcome, Outcome::Changed);
+        assert_eq!(rows[1].outcome, Outcome::Ok);
         assert_eq!(
             *events.lock().unwrap(),
             [
                 "probe a",
                 "journal a",
                 "apply a",
+                "probe unchanged",
                 "pending relaunch.dock",
                 "probe a",
-                "row a"
+                "row a",
+                "row unchanged",
             ]
         );
         let events = Events::default();
@@ -1786,6 +1968,15 @@ pub(crate) mod tests {
         assert_eq!(rows[0].outcome, Outcome::Ok);
         assert_eq!(rows[1].outcome, Outcome::Failed);
         assert_eq!(rows[1].why.as_deref(), Some("defaults write failed"));
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "probe a")
+                .count(),
+            1
+        );
         assert!(
             !events
                 .lock()

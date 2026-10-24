@@ -40,7 +40,7 @@ fn every_measured_login_screen_is_read_as_its_state() {
     for id in ["login.no_browser", "login.paste"] {
         assert!(!LOGIN_OPENING.contains(crate::anchors::anchor(id)), "{id}");
     }
-    assert!(LOGIN_OPENING.contains(crate::anchors::anchor("login.opening")));
+    assert!(LOGIN_OPENING.contains(crate::anchor!("login.opening")));
     assert_eq!(
         login_screen(&screen(LOGIN_ERROR)),
         Some(LoginScreen::Failed)

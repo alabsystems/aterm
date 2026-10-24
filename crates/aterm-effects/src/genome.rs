@@ -147,18 +147,24 @@ fn vote_token(
 /// token votes, `None` when silent.
 #[inline]
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
-    if tok_chars.iter().all(char::is_ascii) {
-        if tok_chars.len() < 2 {
-            return None;
-        }
-        let mut h = aterm_hash::FNV64_OFFSET;
-        for &c in tok_chars {
-            if !c.is_ascii_alphabetic() {
+    let mut h = aterm_hash::FNV64_OFFSET;
+    let mut ascii_ok = true;
+    for (i, &c) in tok_chars.iter().enumerate() {
+        if c.is_ascii_alphabetic() {
+            h = aterm_hash::fnv_mix_u64(h, u64::from(c.to_ascii_lowercase() as u8));
+        } else if c.is_ascii() {
+            if tok_chars[i + 1..].iter().all(char::is_ascii) {
                 return None;
             }
-            h = aterm_hash::fnv_mix_u64(h, u64::from(c.to_ascii_lowercase() as u8));
+            ascii_ok = false;
+            break;
+        } else {
+            ascii_ok = false;
+            break;
         }
-        return Some(mix(h));
+    }
+    if ascii_ok {
+        return (tok_chars.len() >= 2).then(|| mix(h));
     }
     tok.clear();
     tok.extend(tok_chars.iter().copied());
@@ -307,8 +313,11 @@ pub const fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     let mut k = 0;
     while k < 5 {
         let s_k = planes[k];
-        let t_k = if (t >> k) & 1 == 1 { !0u64 } else { 0u64 };
-        ge = (s_k & !t_k) | (!(s_k ^ t_k) & ge);
+        ge = if (t >> k) & 1 != 0 {
+            ge & s_k
+        } else {
+            ge | s_k
+        };
         k += 1;
     }
     ge

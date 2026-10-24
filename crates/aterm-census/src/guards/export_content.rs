@@ -424,19 +424,16 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     out.extend(found.into_iter().flatten());
 }
 
-/// How much of a file the engine's grep reads for a NUL before it calls the
-/// file binary: macOS's grep (BSD grep 2.6.0) looks only in its first 32 KiB
-/// read, so a file whose first NUL comes later is text to it (measured: a
-/// first NUL at byte 32767 is binary to `grep -IlE`, at 32768 text).
+/// How much of a file the engine's grep reads for a NUL before it calls the file binary:
+/// macOS's grep (BSD grep 2.6.0) looks only in its first 32 KiB read (a first NUL at byte 32767
+/// is binary to `grep -IlE`, at 32768 text).
 const GREP_HEAD: usize = 32 << 10;
 
-/// One exported file as the engine reads it: its path, its content as the
-/// engine's grep reads it, and what it decodes to ([`Plaintext`]). The
-/// transforms leave a file holding a NUL as it is. A file with a NUL where the
-/// engine's grep looks ([`GREP_HEAD`]) is binary to it: a match in its bytes,
-/// as in what it decodes to, is a binary hit, at no line and cleared by no
-/// tag, so it is one finding per row at line 0. Otherwise its lines are held
-/// as [`by_line`] says.
+/// One exported file as the engine reads it: its path, its content as the engine's grep reads
+/// it, and what it decodes to ([`Plaintext`]). The transforms leave a file holding a NUL as it
+/// is; one with a NUL where the engine's grep looks ([`GREP_HEAD`]) is binary to it, so a match
+/// in its bytes, as in what it decodes to, is one finding per row at line 0, cleared by no tag.
+/// Otherwise its lines are held as [`by_line`] says.
 fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
     for (k, _) in held.candidates(rel.as_bytes()) {
         if held.rows[k].line.is_match(rel) {

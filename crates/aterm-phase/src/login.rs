@@ -3,7 +3,6 @@
 
 //! Reader for Claude Code's `/login` dialog states and interrupted-login walls.
 
-use crate::anchors::anchor_text;
 use crate::text::{contains, trim, trim_end};
 
 /// One of the picker's methods, by the words its row opens with.
@@ -22,9 +21,9 @@ impl LoginMethod {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            LoginMethod::Subscription => anchor_text("login.subscription"),
-            LoginMethod::Console => anchor_text("login.console"),
-            LoginMethod::Platform => anchor_text("login.platform"),
+            LoginMethod::Subscription => crate::anchor!("login.subscription"),
+            LoginMethod::Console => crate::anchor!("login.console"),
+            LoginMethod::Platform => crate::anchor!("login.platform"),
         }
     }
 
@@ -119,7 +118,7 @@ pub fn login_screen(rows: &[String]) -> Option<LoginScreen> {
     if has("login.success") {
         let row = body
             .iter()
-            .find(|r| contains(r, anchor_text("login.success")))
+            .find(|r| contains(r, crate::anchor!("login.success")))
             .map(|r| (*r).to_string())
             .unwrap_or_default();
         return Some(LoginScreen::Success { row });
@@ -195,7 +194,7 @@ const LOGIN_ROW: &str = "❯ /login";
 fn interrupted_row(row: &str) -> bool {
     trim(row)
         .strip_prefix('⎿')
-        .is_some_and(|rest| trim(rest) == anchor_text("login.interrupted"))
+        .is_some_and(|rest| trim(rest) == crate::anchor!("login.interrupted"))
 }
 
 fn said_above(rows: &[String], i: usize) -> Option<usize> {

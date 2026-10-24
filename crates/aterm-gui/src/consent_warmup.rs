@@ -25,8 +25,14 @@ const RESULT_QUEUE_CAP: usize = 16;
 /// each folder. A folder already asked stays asked — macOS's dialog cannot be taken back —
 /// but the next waits. Only the launch pass is gated; the owner's own pass from the
 /// Security page never is.
+#[derive(Debug, Default)]
+struct WarmupGateState {
+    open: bool,
+    retired: bool,
+}
+
 #[derive(Clone, Debug, Default)]
-pub(crate) struct WarmupGate(Arc<(Mutex<bool>, Condvar)>);
+pub(crate) struct WarmupGate(Arc<(Mutex<WarmupGateState>, Condvar)>);
 
 impl WarmupGate {
     /// A gate that starts open: a pass starts only at its step moment.
@@ -40,28 +46,44 @@ impl WarmupGate {
     pub(crate) fn set(&self, open: bool) {
         let (state, changed) = &*self.0;
         let mut state = state.lock_or_recover();
-        if *state != open {
-            *state = open;
+        let open = open && !state.retired;
+        if state.open != open {
+            state.open = open;
             changed.notify_all();
         }
+    }
+
+    /// Withdraw this automatic pass permanently. Its current syscall may
+    /// finish, but no later folder can start, even after a newer approval.
+    pub(crate) fn retire(&self) {
+        let (state, changed) = &*self.0;
+        let mut state = state.lock_or_recover();
+        state.retired = true;
+        state.open = false;
+        changed.notify_all();
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.0.0.lock_or_recover().retired
     }
 
     /// Whether the gate is open.
     #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
-        *self.0.0.lock_or_recover()
+        self.0.0.lock_or_recover().open
     }
 
     /// Wait until the gate is open (the worker; it may wait for the life of the process,
     /// as a listing parked in `tccd` may).
-    fn wait_open(&self) {
+    fn wait_open(&self) -> bool {
         let (state, changed) = &*self.0;
         let mut open = state.lock_or_recover();
-        while !*open {
+        while !open.open && !open.retired {
             open = changed
                 .wait(open)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        !open.retired
     }
 }
 
@@ -74,7 +96,8 @@ pub(crate) enum ReadDirOutcome {
     /// The listing failed with this raw errno.
     #[cfg(any(target_os = "macos", test))]
     Failed(i32),
-    /// The probe was not performed: a headless instance, a unit test, an executable outside a `.app`, or off macOS.
+    /// The probe was not performed: a headless instance, a unit test, an executable outside a
+    /// `.app`, or off macOS.
     Refused,
 }
 
@@ -84,12 +107,13 @@ pub(crate) enum WarmupRow {
     /// Nothing has been asked about this folder in this process.
     #[default]
     Unknown,
-    /// The worker is inside this folder's listing syscall, perhaps parked behind a system dialog with no timeout, so the row can stay here indefinitely.
+    /// The worker is inside this folder's listing syscall, perhaps parked behind a system dialog
+    /// with no timeout, so the row can stay here indefinitely.
     Asking,
     /// The listing succeeded from this process.
     #[cfg(any(target_os = "macos", test))]
     Allowed,
-    /// `EPERM(1)` — the TCC refusal. macOS is not asking again for this folder.
+    /// `EPERM`, the TCC refusal: macOS does not ask again for this folder.
     Denied,
     /// Some other errno.
     #[cfg(any(target_os = "macos", test))]
@@ -97,7 +121,7 @@ pub(crate) enum WarmupRow {
 }
 
 impl WarmupRow {
-    /// The report spelling, which is also the panel spelling: the `privacy` verb's folder rows read it.
+    /// The report and panel spelling, which the `privacy` verb's folder rows read.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
@@ -111,7 +135,7 @@ impl WarmupRow {
     }
 }
 
-/// What one listing means for a folder's row: the one place the mapping lives, so a test can drive it.
+/// What one listing means for a folder's row: the one place the mapping lives.
 pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> WarmupRow {
     #[cfg(not(any(target_os = "macos", test)))]
     let _ = folder;
@@ -130,7 +154,8 @@ pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> Wa
     }
 }
 
-/// The one OS question this module asks, injected like every consent probe (`control_privacy::ConsentProbes`).
+/// The one OS question this module asks, injected like every consent probe
+/// (`consent_state::ConsentProbes`).
 #[derive(Clone, Copy)]
 pub(crate) struct WarmupProbe {
     /// Lists one already-resolved directory. May park indefinitely.
@@ -231,14 +256,15 @@ pub(crate) enum StartOutcome {
     DialogUp,
     /// `[privacy] enabled = false`, `warmup = "never"`, or a headless instance.
     Refused,
-    /// No configured folder name resolved to a path — every name was unknown, or `$HOME` is unset.
+    /// No configured folder name resolved to a path: every name was unknown, or `$HOME` is unset.
     NoFolders,
     /// The OS refused the thread.
     SpawnFailed,
 }
 
 impl StartOutcome {
-    /// Why a confirmed press started nothing, in the owner's words — `None` when a worker is walking, this press's or one already out.
+    /// Why a confirmed press started nothing, in the owner's words; `None` while a worker walks,
+    /// this press's or one already out.
     pub(crate) const fn refusal(self) -> Option<&'static str> {
         match self {
             Self::Started | Self::AlreadyLive => None,
@@ -301,7 +327,7 @@ impl WarmupState {
         Self::new(true)
     }
 
-    /// An instance whose worker answers every folder with `read_dir`: a stand-in that reaches no filesystem, for the window's tests.
+    /// An instance whose worker answers every folder with `read_dir` (test-only).
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_read_dir_for_test(read_dir: fn(&Path) -> ReadDirOutcome) -> Self {
         let mut state = Self::inert();
@@ -470,7 +496,7 @@ impl WarmupState {
         self.last_pass_ms
     }
 
-    /// Arm a hold with no worker behind it, so a unit test can drive the automatic-apply gate without spawning anything.
+    /// Arm a hold with no worker behind it (test-only).
     #[cfg(all(test, unix))]
     pub(crate) fn arm_hold_for_test(&mut self, started_at: Instant, hold_cap: Duration) {
         self.generation = self.generation.wrapping_add(1);
@@ -481,7 +507,8 @@ impl WarmupState {
         });
     }
 
-    /// The in-place-apply hold (design §3.5): true while a warm-up worker is live and the hold has not reached its cap.
+    /// The in-place-apply hold: true while a warm-up worker is live and the hold has not reached
+    /// its cap.
     pub(crate) fn holds_automatic_apply(&self, now: Instant) -> bool {
         self.live
             .is_some_and(|live| hold_active(live.started_at, live.hold_cap, now))
@@ -560,8 +587,8 @@ fn run_pass(
     let mut answers: Vec<(Folder, ReadDirOutcome)> = Vec::with_capacity(walk.len());
     for (folder, path) in walk {
         // The launch pass asks nothing while the person is away from System State.
-        if let Some(gate) = gate {
-            gate.wait_open();
+        if gate.is_some_and(|gate| !gate.wait_open()) {
+            break;
         }
         post(
             tx,
@@ -925,8 +952,6 @@ mod tests {
         );
     }
 
-    /// A GATED PASS PARKS: shut, its worker asks no folder (a shut gate is never
-    /// passed, so no message can arrive); opened, it walks to its end.
     #[test]
     fn a_gated_pass_asks_nothing_until_its_gate_opens() {
         let mut state = WarmupState::inert();

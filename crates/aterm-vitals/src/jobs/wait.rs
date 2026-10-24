@@ -145,8 +145,12 @@ pub struct JobFacts {
     /// The job holds the terminal's foreground.
     pub holds_fg: bool,
     /// The job is a shell itself reading a line (its own `read` builtin, a nested session's shell
-    /// at its prompt), taken while no leaf names a wait of its own.
+    /// at its prompt), taken while no leaf names a wait of its own other than the reader's own
+    /// event loop, where that can hold its terminal.
     pub builtin: bool,
+    /// The process reading that line, the job's leader: the tab's shell for its block, or the
+    /// nested session's leader.
+    pub reader: u32,
     /// The terminal mode word, only when stamped after the job's last output.
     pub tty: Option<TtyMode>,
     /// No typed input is queued.
@@ -167,10 +171,13 @@ pub fn name_job(
         .first()
         .map_or((shell.0, shell.1.to_owned()), |(p, n)| (*p, n.clone()));
     let mut best: Option<Wait> = None;
+    let mut own_wait = false;
     for (pid, name) in leaves {
         let Some(w) = leaf_wait(scene, job.consumer, *pid, name, 0) else {
             continue;
         };
+        own_wait |=
+            !(*pid == job.reader && w.name == WaitName::EventLoop && reads_terminal(scene, *pid));
         if best.as_ref().is_none_or(|b| rank(w.name) < rank(b.name)) {
             best = Some(w);
         }
@@ -180,8 +187,10 @@ pub fn name_job(
         return w.clone();
     }
     // A shell's line read, while no leaf names a wait of its own (a REPL blocked on its socket,
-    // a `cd` into a dead share).
-    if job.builtin && best.is_none() {
+    // a `cd` into a dead share, a background job hung on its peer): the reader's own event loop
+    // may be the read itself (a REPL's loop with the terminal in its set, a timed `read` in
+    // `select`), one that lists no read of a terminal (asyncio's, on its socket) is not.
+    if job.builtin && !own_wait {
         return Wait::bare(WaitName::TtyBuiltinRead, Standing::Legit, shell.0, shell.1);
     }
     if job.holds_fg
@@ -196,6 +205,41 @@ pub fn name_job(
         }
     }
     best.unwrap_or_else(|| Wait::bare(WaitName::Unnamed, Standing::Capped, first.0, &first.1))
+}
+
+/// The wait `pid` names of its own, as a leaf of a job whose consumer is `consumer`.
+#[must_use]
+pub fn wait_of(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str) -> Option<Wait> {
+    leaf_wait(scene, consumer, pid, name, 0)
+}
+
+/// Whether `pid`'s sleeping event queues may hold its terminal: one lists a read of a terminal
+/// it holds, or one lists no entries (macOS without lane L6), or none sleeps on one (Linux's
+/// `select`, by its wait channel).
+fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
+    let Some(p) = scene.procs.get(&pid) else {
+        return false;
+    };
+    let fds: &[Fd] = p.fds.as_deref().unwrap_or(&[]);
+    let mut queues = fds
+        .iter()
+        .filter_map(|f| match &f.kind {
+            FdKind::EventQueue {
+                sleeping: Some(true),
+                knotes,
+            } => Some(knotes),
+            _ => None,
+        })
+        .peekable();
+    queues.peek().is_none()
+        || queues.any(|knotes| {
+            knotes.as_ref().is_none_or(|k| {
+                k.iter().any(|k| {
+                    k.filter == KnoteFilter::Read
+                        && fd_is(fds, k.ident, |f| matches!(f, FdKind::Device { tty: true }))
+                })
+            })
+        })
 }
 
 fn leaf_wait(

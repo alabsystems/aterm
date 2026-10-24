@@ -76,7 +76,7 @@ impl ResetKind {
 
     fn noun(self) -> &'static str {
         match self {
-            ResetKind::Session => anchor("reset.kind.session_count"),
+            ResetKind::Session => crate::anchor!("reset.kind.session_count"),
             _ => self.name(),
         }
     }
@@ -108,19 +108,19 @@ impl ResetKind {
     /// The confirmation's yes.
     #[must_use]
     pub fn yes(self) -> String {
-        format!("{} {}", anchor("reset.yes"), self.name())
+        format!("{} {}", crate::anchor!("reset.yes"), self.name())
     }
 
     fn row_head(self) -> String {
-        format!("{} {}", anchor("reset.row"), self.name())
+        format!("{} {}", crate::anchor!("reset.row"), self.name())
     }
 
     fn early(self) -> String {
         format!(
             "{} {} {}",
-            anchor("reset.early"),
+            crate::anchor!("reset.early"),
             self.name(),
-            anchor("reset.early.anyway")
+            crate::anchor!("reset.early.anyway")
         )
     }
 
@@ -227,7 +227,7 @@ pub fn reset_row(prompt: &PromptV2, order: &[ResetKind]) -> Option<ResetRow> {
 /// Whether choosing an option labelled `label` spends a reset.
 #[must_use]
 pub fn spends_reset(label: &str) -> bool {
-    opens(label, anchor("reset.weekly_row"))
+    opens(label, crate::anchor!("reset.weekly_row"))
         || ResetKind::ALL
             .into_iter()
             .any(|kind| opens(label, &kind.row_head()) || opens(label, &kind.yes()))
@@ -285,7 +285,7 @@ fn grant_of(label: &str, kind: ResetKind) -> Option<(u32, &str)> {
         .strip_prefix(kind.row_head().as_str())?
         .strip_prefix(" (")?
         .strip_suffix(')')?;
-    let (left, day) = inner.split_once(&format!(" {} ", anchor("reset.row.until")))?;
+    let (left, day) = inner.split_once(&format!(" {} ", crate::anchor!("reset.row.until")))?;
     let left = number(left).filter(|&n| n >= 1)?;
     (take_day(day) == Some("")).then_some((left, day))
 }
@@ -421,7 +421,7 @@ pub fn reset_confirm(prompt: &PromptV2, rows: &[String]) -> ConfirmRead {
         return ConfirmRead::Inexact("options");
     };
     if confirm.label != kind.yes()
-        || keep.label != anchor("reset.no")
+        || keep.label != crate::anchor!("reset.no")
         || confirm.n.is_some()
         || keep.n.is_some()
         || confirm.focused == keep.focused
@@ -469,11 +469,11 @@ fn keeps_a_reset(prompt: &PromptV2, rows: &[String]) -> bool {
     if prompt
         .options
         .iter()
-        .any(|o| crate::text::trim(&o.label) == anchor("reset.no"))
+        .any(|o| crate::text::trim(&o.label) == crate::anchor!("reset.no"))
     {
         return true;
     }
-    let stays = anchor("reset.confirm.stays");
+    let stays = crate::anchor!("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
     let early: Vec<String> = ResetKind::ALL.into_iter().map(ResetKind::early).collect();
     rows.get(prompt.span.0..first.row.min(rows.len()))
@@ -481,8 +481,8 @@ fn keeps_a_reset(prompt: &PromptV2, rows: &[String]) -> bool {
         .iter()
         .map(|row| crate::text::trim(row))
         .any(|row| {
-            row.starts_with(anchor("reset.confirm.refills"))
-                || [stays, anchor("reset.confirm.use_by")]
+            row.starts_with(crate::anchor!("reset.confirm.refills"))
+                || [stays, crate::anchor!("reset.confirm.use_by")]
                     .iter()
                     .any(|part| row.contains(part))
                 || early.iter().any(|tail| row.contains(tail.as_str()))
@@ -499,12 +499,12 @@ fn confirm_text(
     {
         return Err("early");
     }
-    let stays = anchor("reset.confirm.stays");
-    let use_by = anchor("reset.confirm.use_by");
+    let stays = crate::anchor!("reset.confirm.stays");
+    let use_by = crate::anchor!("reset.confirm.use_by");
     let now = stays.split(SEP).next().unwrap_or(stays);
     let left = use_by.split(SEP).next().unwrap_or(use_by);
     let (limits, rest) = text
-        .strip_prefix(anchor("reset.confirm.refills"))
+        .strip_prefix(crate::anchor!("reset.confirm.refills"))
         .and_then(|rest| rest.strip_prefix(' '))
         .and_then(|rest| rest.split_once(&format!(" {now}")))
         .filter(|(_, rest)| rest.is_empty() || rest.starts_with(' '))
@@ -547,7 +547,7 @@ pub enum ResetPending {
 pub fn reset_pending(rows: &[String]) -> Option<(ResetPending, usize)> {
     let named = |row: &str| {
         let title = crate::text::trim(row);
-        if title == anchor("limit.title") {
+        if title == crate::anchor!("limit.title") {
             Some((ResetPending::Checking, "reset.checking"))
         } else {
             reset_title(title).map(|_| (ResetPending::Resetting, "reset.resetting"))
@@ -585,7 +585,7 @@ fn is_guide(row: &str) -> bool {
     let t = crate::text::trim(row);
     t.split(SEP).all(|item| item.contains(" to "))
         && t.split(SEP)
-            .any(|item| item.eq_ignore_ascii_case(anchor("prompt.cancel")))
+            .any(|item| item.eq_ignore_ascii_case(crate::anchor!("prompt.cancel")))
 }
 
 /// What the vendor's answer to a reset says ([`reset_line`]).
@@ -613,23 +613,27 @@ pub enum ResetLine {
 #[must_use]
 pub fn reset_line(text: &str) -> ResetLine {
     let text = crate::text::trim(text).replace('’', "'");
-    let (body, asks) = match text.strip_suffix(&format!("{SEP}{}", anchor("reset.continue"))) {
-        Some(body) => (body, true),
-        None => (text.as_str(), false),
-    };
+    let (body, asks) =
+        match text.strip_suffix(&format!("{SEP}{}", crate::anchor!("reset.continue"))) {
+            Some(body) => (body, true),
+            None => (text.as_str(), false),
+        };
     if let Some((kind, left)) = spent_line(&text) {
         ResetLine::Spent { kind, left, asks }
     } else if let Some((kind, left)) = walled_line(&text) {
         ResetLine::Walled { kind, left }
-    } else if body == anchor("reset.lifted") || body == anchor("reset.clear") {
+    } else if body == crate::anchor!("reset.lifted") || body == crate::anchor!("reset.clear") {
         ResetLine::Lifted { asks }
-    } else if ResetKind::ALL
-        .into_iter()
-        .any(|kind| text.starts_with(&format!("{} {}{SEP}", kind.capital(), anchor("reset.kept"))))
-    {
+    } else if ResetKind::ALL.into_iter().any(|kind| {
+        text.starts_with(&format!(
+            "{} {}{SEP}",
+            kind.capital(),
+            crate::anchor!("reset.kept")
+        ))
+    }) {
         ResetLine::Kept
-    } else if text.starts_with(&format!("{}{SEP}", anchor("reset.login")))
-        || text == anchor("reset.login")
+    } else if text.starts_with(&format!("{}{SEP}", crate::anchor!("reset.login")))
+        || text == crate::anchor!("reset.login")
     {
         ResetLine::Login
     } else {
@@ -638,13 +642,13 @@ pub fn reset_line(text: &str) -> ResetLine {
 }
 
 fn left_of(segment: &str, kind: ResetKind) -> Option<u32> {
-    let use_by = anchor("reset.confirm.use_by");
+    let use_by = crate::anchor!("reset.confirm.use_by");
     let left = use_by.split(SEP).next().unwrap_or(use_by);
     kind.resets_of(segment.strip_suffix(&format!(" {left}"))?)
 }
 
 fn spent_line(text: &str) -> Option<(ResetKind, Option<u32>)> {
-    let stays = anchor("reset.confirm.stays");
+    let stays = crate::anchor!("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
     ResetKind::ALL.into_iter().find_map(|kind| {
         let rest = text.strip_prefix(kind.done())?.strip_prefix(SEP)?;
@@ -661,7 +665,7 @@ fn walled_line(text: &str) -> Option<(ResetKind, u32)> {
         let rest = text
             .strip_prefix(kind.capital().as_str())?
             .strip_prefix(' ')?
-            .strip_prefix(anchor("reset.walled"))?
+            .strip_prefix(crate::anchor!("reset.walled"))?
             .strip_prefix(' ')?;
         let (limit, count) = rest.split_once(SEP)?;
         if !limit.contains(" until ") {

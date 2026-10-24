@@ -1698,25 +1698,45 @@ pub fn resample_nearest_into(
         out.copy_from_slice(&src[..total_bytes]);
         return;
     }
+    let y_step = sh / th;
+    let y_rem = sh % th;
+    let x_step = sw / tw;
+    let x_rem = sw % tw;
+    let mut sy = 0usize;
+    let mut y_acc = 0usize;
     let mut prev_sy = usize::MAX;
     for ty in 0..th {
-        let sy = ty * sh / th;
+        let cur_sy = sy;
+        sy += y_step;
+        y_acc += y_rem;
+        if y_acc >= th {
+            y_acc -= th;
+            sy += 1;
+        }
         let row_d = ty * row_bytes;
-        if sy == prev_sy {
+        if cur_sy == prev_sy {
             let prev_row_d = row_d - row_bytes;
             out.copy_within(prev_row_d..prev_row_d + row_bytes, row_d);
             continue;
         }
-        prev_sy = sy;
-        let row_s = sy * src_row_bytes;
+        prev_sy = cur_sy;
+        let row_s = cur_sy * src_row_bytes;
         if sw == tw {
             out[row_d..row_d + row_bytes].copy_from_slice(&src[row_s..row_s + row_bytes]);
             continue;
         }
         let src_row = src[row_s..row_s + src_row_bytes].as_chunks::<4>().0;
         let dst_row = out[row_d..row_d + row_bytes].as_chunks_mut::<4>().0;
-        for (tx, dst_px) in dst_row.iter_mut().enumerate() {
-            *dst_px = src_row[tx * sw / tw];
+        let mut sx = 0usize;
+        let mut x_acc = 0usize;
+        for dst_px in dst_row {
+            *dst_px = src_row[sx];
+            sx += x_step;
+            x_acc += x_rem;
+            if x_acc >= tw {
+                x_acc -= tw;
+                sx += 1;
+            }
         }
     }
 }

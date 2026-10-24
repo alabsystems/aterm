@@ -330,12 +330,11 @@ const FIRE_PAL_ADD: [[i32; 3]; 5] = [
 ];
 
 /// The hottest palette index additive fire lays: a breath past the amber
-/// stop ([`FIRE_PAL_ADD`]`[3]`), short of the field's own ceiling
-/// ([`FIRE_IDX_MAX`]). Up there the palette mixes toward its cream stop, and
-/// a pale gold laid thin over a dark page (a tongue's feathered foot and
-/// flanks) reads as a tan curtain, not a flame (`#c1964c` to `#ca9a42`, the
-/// trail gallery's dark `burst`, looks6 round 3); amber laid thin stays an
-/// amber. The shaders' `fire_pal_add` hold the same cap.
+/// stop (`FIRE_PAL_ADD[3]`), short of the field's own ceiling
+/// (`FIRE_IDX_MAX`). Above it the palette mixes toward its cream stop, and
+/// pale gold laid thin over a dark page (a tongue's feathered foot and
+/// flanks) reads as a tan curtain, not a flame; amber laid thin stays amber.
+/// The shaders' `fire_pal_add` hold the same cap.
 pub const FIRE_ADD_IDX_MAX: i32 = 780;
 
 /// [`FIRE_PAL_ADD`] at `idx`, held to at most `cap`.
@@ -717,14 +716,9 @@ mod tests {
 
     #[test]
     fn additive_fire_laid_thin_over_a_dark_page_reads_amber_not_tan() {
-        // looks6 round 3: the field's hottest light, mixed toward the cream
-        // stop, laid thin over a dark page read as a tan curtain (#c1964c to
-        // #ca9a42: warm, greyed, mid-bright) under the dark fire's feathered
-        // feet and flanks. Held a breath past amber, no sample of a hot or
-        // warm burn over the gallery's dark page reads tan but a few
-        // samples at the edge of the band (160 of 128,250); up to the
-        // field's own ceiling (the negative control), fifteen times as many
-        // do.
+        // Held a breath past amber, thin additive fire over a dark page reads tan (warm, greyed,
+        // mid-bright) in only a few samples at the band's edge; up to the field's own ceiling
+        // (the negative control), many times as many do.
         const PAGE: u32 = 0x0011_1318;
         let tan = |cap: i32| {
             let mut tan = 0usize;

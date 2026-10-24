@@ -888,12 +888,10 @@ fn under_root_a_dry_run_judges_an_install_folder_to_be_made_as_the_run_would() {
     );
 }
 
-/// `sh install.sh` starts bash in POSIX mode, where a command substitution
-/// keeps set -e, so a root walk run in one stopped at `head`'s early exit
-/// from a long `find` and answered nothing, which its caller read as "nothing
-/// another account owns". The script leaves that mode first: the walk names
-/// the tree. A walk that ends without an answer refuses all the same, naming
-/// the path it walked.
+/// `sh install.sh` starts bash in POSIX mode, where a command substitution keeps set -e and
+/// `head`'s early exit from a long `find` would end a root walk with no answer. The script
+/// leaves that mode first, so the walk names the tree; a walk that ends without an answer
+/// refuses all the same, naming the path it walked.
 #[test]
 fn under_sh_a_root_walk_names_what_it_finds_and_one_that_ends_early_refuses() {
     let scratch = Scratch::new();
@@ -1828,14 +1826,13 @@ fn under_root_a_build_takes_no_name_a_link_another_account_can_redirect() {
 }
 
 /// What `under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses` walks:
-/// folders, a way of 42 links in a mounted folder and in a plain one with a bin folder's
-/// `cc` at the start of each, folders the first look after a walk swaps for another while
-/// `SWAP` names one, and a mountinfo fixture of each kind of Linux mount, read by the real
-/// reader (`kernel_linux_mounts`) on both platforms. `$W/roots` lists each mount as
-/// `<dev> <statfs type> <folder>` (`-` for a type stat cannot read), and `folder_ids` and
-/// `folder_types` answer from it what this host's stat would for a real one, matching a
-/// folder to a mount by identity; elsewhere `folder_ids` reads the host on macOS and gives
-/// Linux's root device, whose type the fixture says is FUSE.
+/// folders, a way of 42 links in a mounted and in a plain folder (each led to by a bin
+/// folder's `cc`), folders the first `folder_ids` call swaps for others while `SWAP` names
+/// one, and a mountinfo fixture read by the real reader (`kernel_linux_mounts`) on both
+/// platforms. `$W/roots` lists each mount as `<dev> <statfs type> <folder>` (`-` for a type
+/// stat cannot read), and `folder_ids` and `folder_types` answer from it as the host's stat
+/// would; off it, `folder_ids` reads the host on macOS and gives Linux's root device, which is
+/// FUSE here.
 const FOREIGN_MOUNTS: &str = r#"FOREIGN_LIST="$TMPDIR/foreign"; : >"$FOREIGN_LIST"
 umask 022; W="$TMPDIR/w"; ABC="$W/a b"$'\t'"c\\d"
 mkdir -p "$W/vol/d" "$W/net/d" "$W/ok/d" "$W/fl/d" "$W/tree/sub/d" "$W/bad/d" "$W/stack/d" \
@@ -1914,15 +1911,12 @@ folder_types() {
 	return "$s"
 }"#;
 
-/// The Mac's mount table for that walk: `mount`'s lines, the kernel's own after them, and
-/// the fixture's macOS-only mounts (`$W/tree2/at on it` and `$W/sib (old)` among them; the
-/// lines naming `$W/hm/x on $W/sys`, `$W/hm/y on $W/obin/cc` and `$W/hm/z on /usr/bin` are
-/// each one mount at a folder whose name holds ` on `, not one at `$W/sys`, `$W/obin/cc` or
-/// `/usr/bin`). Each `/dev/disk9s<n>` a line starts with has the device `$W/nodes` gives it
-/// (the real nodes, the host's): `$W/gr` is a graft that shows Preboot's device with no mount
-/// of its own, `$W/un` a volume no line names, `$W/fs` a FUSE volume over a local one,
-/// `$W/uf` an account's disk that a forged local line names too, and `$W/lf` a local volume
-/// with a tree in it.
+/// The Mac's mount table for that walk: the fixture's macOS-only mounts, then the host's own.
+/// The lines naming `$W/hm/x on $W/sys`, `$W/hm/y on $W/obin/cc` and `$W/hm/z on /usr/bin`
+/// each mount a folder whose name holds ` on `. Each `/dev/disk9s<n>` has the device
+/// `$W/nodes` gives it: `$W/gr` is a graft that shows Preboot's device with no mount of its
+/// own, `$W/un` a volume no line names, `$W/fs` a FUSE volume over a local one, `$W/uf` an
+/// account's disk that a forged local line names too, and `$W/lf` a local volume with a tree.
 const FOREIGN_MACOS: &str = r#"mkdir -p "$W/gr/d" "$W/un/d" "$W/lf/d" "$W/lf/t/x" "$W/fs/d" "$W/uf/d" &&
 	ln -s x "$W/lf/t/l"
 printf '%s\n' "1:50 - /System/Volumes/Data$W/fl" "1:51 - $W/stack" \
@@ -1980,19 +1974,13 @@ const FOREIGN_LINUX: &str = r#"linux_mounts() { kernel_linux_mounts "$W/mountinf
 no_table() { linux_mounts() { return 1; }; }"#;
 
 /// A walk proves nothing through a filesystem whose owners and modes do not say who may
-/// change it: one a server or another account's daemon serves (on Linux a network or FUSE
-/// one, but for the one / is on), or on macOS a volume that is not local or that an account
-/// mounted, which it can take away and attach another in place of. The way to a folder or
-/// file in one, by any spelling, a tree or a folder root takes programs from with one in
-/// it, a way of more than 40 links through one, a mount table that cannot be read when it
-/// is needed, and a folder gone or swapped by the time the walk ends each refuse, whether
-/// or not its held descriptor's /dev/fd name can be read. Only what the walk crosses is
-/// looked at: on macOS a walk that crosses no volume reads no mount table (and a folder
-/// that only a mount's name spells is no mount), a volume it crosses is judged by its disk
-/// alone, and no mount's folder is stat'd; on Linux a mount outside the tree is never asked
-/// its type, nor its folder stat'd, as one whose server stopped answering would hang the
-/// look. On macOS a volume the walk crosses passes only from a disk a local mount no
-/// account made names, which a graft's device is too.
+/// change it: on Linux a network or FUSE one (but for the one / is on), on macOS a volume that
+/// is not local or that an account mounted. A way into one by any spelling, a tree or a bin
+/// folder with one in it, a way of more than 40 links through one, a mount table unread when
+/// it is needed, and a folder swapped by the time the walk ends each refuse. Only what the walk
+/// crosses is looked at: on macOS no mount's folder is stat'd, and on Linux none outside the
+/// tree, since one whose server stopped answering would hang the look. On macOS a volume the
+/// walk crosses passes only from a disk that a local mount no account made names.
 #[test]
 fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
     let scratch = Scratch::new();
@@ -2228,10 +2216,10 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
 fn a_mount_table_read_cut_off_ends_at_the_cut_off() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
-    // Advance only the reader's clock once the escaped holder is ready, so the
-    // outer minute hang detector never races a real minute spent in bounded.
-    // The holder must acknowledge a release written after the read returns;
-    // it kills itself, or expires after 120 seconds if that release never comes.
+    // The fake sleep advances the reader's clock only once the escaped holder is ready, so a real
+    // minute in `bounded` never races the outer one-minute hang detector. The holder acknowledges
+    // the release written after the read returns, then SIGKILLs itself; it expires after 120
+    // seconds without one.
     lib.step("VERIFY_WAIT_SECS=60; LINE='/dev/disk1s1 on / (apfs, local, journaled)'");
     let rows = [
         (
@@ -3070,11 +3058,18 @@ fn a_root_run_copies_the_app_where_only_root_can_reach_it() {
         "id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }\n\
          log() { printf '%s\\n' \"$*\" >>\"$TMPDIR/log\"; }\n\
          ls_entry() { command ls \"$@\" | awk -v u=\"${STAGE_UID:-0}\" 'NR == 1 && NF >= 9 { $3 = u } { print }'; }\n\
+         mode_of() {\n\
+         \tif [ \"$(uname -s)\" = Darwin ]; then\n\
+         \t\tcommand ls -led \"$1\" | awk 'NR == 1 { m = substr($1, 1, 10) } NR > 1 && /^ *[0-9]+: / { a = \"+\" } END { printf \"%s%s\", m, a }'\n\
+         \telse\n\
+         \t\tcommand ls -nd \"$1\" | awk '{ m = substr($1, 1, 10); if (substr($1, 11, 1) == \"+\") m = m \"+\"; printf \"%s\", m }'\n\
+         \tfi\n\
+         }\n\
          ditto() {\n\
          \tlog \"ditto $2\"\n\
-         \tlog \"into: $(command ls -nd \"${2%/*}\" | awk '{print $1}')\"\n\
+         \tlog \"into: $(mode_of \"${2%/*}\")\"\n\
          \tfor e in \"$DEST\"/* \"$DEST\"/.[!.]*; do\n\
-         \t\t[ -e \"$e\" ] && log \"in dest: $(command ls -nd \"$e\" | awk '{print $1}') ${e##*/}\"\n\
+         \t\t[ -e \"$e\" ] && log \"in dest: $(mode_of \"$e\") ${e##*/}\"\n\
          \tdone\n\
          \tmkdir -p \"$2/Contents/MacOS\" && : >\"$2/Contents/MacOS/aterm\" && [ -z \"${DITTO_FAILS:-}\" ]\n\
          }\n\
@@ -3192,7 +3187,23 @@ fn an_interrupted_root_run_leaves_no_staging_folder_behind() {
          ( install_app_cleanup ); ls -A \"$DEST\"; echo +; ls -A \"$DEST/aterm.app\"",
         &[],
     );
+    // The set-aside bundle is back before the cleanup's first child, a DMG's
+    // detach: under bash 5 a second Ctrl-C ends the trap at the next child it
+    // waits on.
+    let back_first = lib.call(
+        "mkdir -p \"$TMPDIR/dmg/aterm.app\" && staged dmg >/dev/null && OLD=\"$DEST/.aterm.app.old.x\" && \
+         mv \"$DEST/aterm.app\" \"$OLD\" && ( CONTAINER_KIND=dmg; \
+         hdiutil() { [ ! -d \"$DEST/aterm.app\" ] || echo back >\"$TMPDIR/at-detach\"; }; install_app_cleanup ); \
+         cat \"$TMPDIR/at-detach\"",
+        &[],
+    );
     let recs = lib.run(&scratch);
+    assert_eq!(
+        (recs[back_first].rc, recs[back_first].out.as_str()),
+        (0, "back"),
+        "{}",
+        recs[back_first].err
+    );
     for (label, i, kept) in [
         ("before the swap", before_swap, &[][..]),
         ("mid-swap", mid_swap, &["aterm.app", "+", "installed"][..]),

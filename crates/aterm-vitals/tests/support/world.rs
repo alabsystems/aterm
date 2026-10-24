@@ -280,8 +280,8 @@ impl World {
         t.tpgid = t.tab.shell_pid;
     }
 
-    /// Ctrl-Z: the open block ends in a stop (`D` with 128 plus the host's SIGTSTP, which the
-    /// host decodes), and the shell has the terminal again.
+    /// Ctrl-Z: the open block ends in a stop (`D` with 148, Linux's 128 plus SIGTSTP, and the
+    /// `stopped` flag the host decodes from it), and the shell has the terminal again.
     pub fn stop_block(&mut self, key: u64) {
         self.close_block(key, 148);
         if let Some(b) = self.tab(key).tab.block.as_mut() {

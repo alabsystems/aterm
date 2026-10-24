@@ -1065,23 +1065,58 @@ pub fn sign_in_live(
 /// The private `PATH` directory a [`login_command`] holds, removed when it drops.
 pub type LoginPath = Option<aterm_tempfile::TempDir>;
 
+/// Whether `route`'s page hands the login back on a loopback callback on the machine the CLI
+/// runs on (a [`Completion::Loopback`] route, and Codex's app server, whose `redirect_uri` is
+/// `http://127.0.0.1:1455/…`): a browser on another machine cannot finish it.
+#[must_use]
+pub fn calls_back_here(route: &Route) -> bool {
+    match &route.drive {
+        Drive::Lines { completion, .. } => *completion == Completion::Loopback,
+        Drive::AppServer => true,
+    }
+}
+
+/// The route `accounts login` runs for `req` ([`login_command`]): the row's own, except over
+/// SSH (`over_ssh`) where that one calls back to this machine ([`calls_back_here`]), which the
+/// person's browser, on their own machine, cannot reach: there it is the CLI's device route
+/// (Codex's `login --device-auth`, Grok Build's), whose page any browser finishes.
+/// # Errors
+/// Over SSH, a route that calls back here of a CLI that has no device route.
+pub fn login_route(req: &Request<'_>, over_ssh: bool) -> Result<&'static Route, String> {
+    if !over_ssh || !calls_back_here(req.route) {
+        return Ok(req.route);
+    }
+    req.signin()
+        .and_then(|signin| signin.route(Some(Flow::Device)))
+        .ok_or_else(|| {
+            format!(
+                "over SSH, {}'s browser sign-in calls back to this machine, which your browser \
+                 cannot reach, and it has no device sign-in; run it at this machine's desk",
+                req.cli.connector().product
+            )
+        })
+}
+
 /// `accounts login <label> --cli <id>`'s command: `req`'s sign-in on this terminal, where the
 /// CLI shows its own URL and code. At the desk it may open the person's browser, and its
 /// environment is [`child_env`]'s with this process's `PATH`. Over SSH (`over_ssh`) a browser
 /// it opened would be this machine's, not the person's, so there a [`SignIn::no_opener`] CLI gets
 /// the opener-free `PATH` ([`child_program`], whose directory the [`LoginPath`] holds) and a
 /// [`SignIn::no_desk`] one runs under `no_desk` ([`NO_DESK`]), and it prints its URL for the
-/// person to open where they are. A Codex browser route runs `codex login`, the app server
-/// being the harness's alone.
+/// person to open where they are; a route that calls back to this machine runs as the CLI's
+/// device route there ([`login_route`]). A Codex browser route runs `codex login`, the app
+/// server being the harness's alone.
 /// # Errors
-/// Over SSH, no private `PATH` could be made, or a no-desk CLI's sandbox is missing or cannot
-/// run here ([`sandbox_refusal`]).
+/// Over SSH, no private `PATH` could be made, a no-desk CLI's sandbox is missing or cannot
+/// run here ([`sandbox_refusal`]), or the route calls back here and the CLI has no device route
+/// ([`login_route`]).
 pub fn login_command(
     req: &Request<'_>,
     home: &Path,
     var: &dyn Fn(&str) -> Option<OsString>,
     (over_ssh, no_desk): (bool, Option<&Path>),
 ) -> Result<(aterm_uds::spawnfd::Command, LoginPath), String> {
+    let route = login_route(req, over_ssh)?;
     let program = program_of(req.cli, home);
     let signin = req.signin();
     let opener_free = over_ssh && signin.is_some_and(|s| s.no_opener);
@@ -1094,9 +1129,9 @@ pub fn login_command(
     let env = signin
         .map(|signin| child_env(req.cli, signin, req.staging, &path, var))
         .unwrap_or_default();
-    let mut args = match req.route.drive {
+    let mut args = match route.drive {
         Drive::AppServer => vec!["login".to_owned()],
-        Drive::Lines { .. } => child_args(req.route, req.row.vendor.region),
+        Drive::Lines { .. } => child_args(route, req.row.vendor.region),
     };
     let mut program = program;
     if over_ssh && signin.is_some_and(|s| s.no_desk.contains(&std::env::consts::OS)) {

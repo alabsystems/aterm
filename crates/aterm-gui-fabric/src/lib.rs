@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session fabric endpoint ([`SessionFabric`]): bounded [`Inbox`] ring, outbound post queue, [`Holds`] gate, the verb handlers (`inbox`, `post`, `topic`, `await inbox`, `hold`, and the bridge's `deliver`, `outbox`, `link`, `hello`), and instance `LINK` state.
+//! Per-session fabric endpoint ([`SessionFabric`]): bounded [`Inbox`] ring, outbound post queue,
+//! [`Holds`] gate, the verb handlers (`inbox`, `post`, `topic`, `await inbox`, `hold`, and the
+//! bridge's `deliver`, `outbox`, `link`, `hello`), and instance `LINK` state.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -17,7 +19,8 @@ use aterm_gui_timing::now_ms;
 pub trait FabricSession: Send + Sync {
     fn self_id(&self) -> &SessionId;
     fn fabric(&self) -> &SessionFabric;
-    /// Record one `kind` row on the session's timeline: what it says, typed ([`FabricFact`]), for the session log's mark, which is the row; returns whether the log's readers were owed a wake.
+    /// Record one `kind` row on the session's timeline, its typed [`FabricFact`] for the session
+    /// log's mark; returns whether the log's readers were owed a wake.
     fn record_fact(&self, kind: &'static str, fact: FabricFact<'_>) -> bool;
     /// Tell the presence band this session's mail or hold moved.
     fn fabric_changed(&self);
@@ -46,13 +49,16 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
 pub trait Timeline {
     /// One `kind` row, its typed [`FabricFact`] (see [`FabricSession::record_fact`]).
     fn record_fact(&mut self, kind: &'static str, fact: FabricFact<'_>) -> bool;
-    /// Whether this session's log is the one the predecessor of a seamless update wrote, carried and read (not one that started over after a gap), so every [`FabricFact::MailIn`] that predecessor recorded is already in it ([`FabricCarry::marked`]).
+    /// Whether this session's log is the one a seamless update's predecessor wrote, carried and
+    /// read (not one that started over after a gap), so every [`FabricFact::MailIn`] it recorded is
+    /// already in it ([`FabricCarry::marked`]).
     fn log_carried(&self) -> bool {
         false
     }
 }
 
-/// What a fabric record says, typed, for the session log's mark beside it ([`FabricSession::record_fact`]), so nothing parses a timeline payload back.
+/// What a fabric record says, typed, for the session log's mark beside it
+/// ([`FabricSession::record_fact`]), so nothing parses a timeline payload back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FabricFact<'a> {
     /// A row delivered to this session's inbox.
@@ -110,7 +116,8 @@ pub enum FabricFact<'a> {
         reason: &'a str,
         generation: u64,
     },
-    /// A parked `inbox get @<off>` asked the bridge for the record at `off` (the `fetch` row the bridge drains).
+    /// A parked `inbox get @<off>` asked the bridge for the record at `off` (the `fetch` row the
+    /// bridge drains).
     Fetch { off: u64 },
 }
 
@@ -157,7 +164,8 @@ pub const BODY_MAX: usize = 256 * 1024;
 /// The largest inline `post` text (the argument form).
 pub const POST_INLINE_MAX: usize = 4 * 1024;
 
-/// How many outbound posts one session may hold waiting for the bridge, and how many bytes of retained body they may hold together.
+/// How many outbound posts one session may hold waiting for the bridge, and how many bytes of
+/// retained body they may hold together.
 pub const OUTBOX_CAP: usize = 128;
 pub const OUTBOX_BYTES_MAX: usize = 4 * 1024 * 1024;
 
@@ -169,7 +177,8 @@ const DEDUP_CAP: usize = 2 * RING_CAP;
 
 const REASON_MAX: usize = 128;
 
-/// The seven session-timeline record kinds the fabric writes that the `events` digest carries, under these same wire names (`EVENT <local> inbox <id> …`); the fabric's `hold-advisory` row stays off the digest.
+/// The seven session-timeline record kinds the fabric writes that the `events` digest carries,
+/// under these same wire names (`EVENT <local> inbox <id> …`); its `hold-advisory` row stays off.
 pub const FABRIC_EVENT_KINDS: &[&str] = &[
     "inbox",
     "inbox-seen",
@@ -200,14 +209,16 @@ pub const fn is_within_post_inline_max(len: usize) -> bool {
     len <= POST_INLINE_MAX
 }
 
-/// Return `true` iff a peer with `unlisted_from_peer` unlisted inbox rows has room under [`SENDER_QUOTA`].
+/// Return `true` iff a peer with `unlisted_from_peer` unlisted inbox rows has room under
+/// [`SENDER_QUOTA`].
 #[must_use]
 #[inline]
 pub const fn sender_within_quota(unlisted_from_peer: usize) -> bool {
     unlisted_from_peer < SENDER_QUOTA
 }
 
-/// Return `true` iff adding `add_bytes` to an outbox with `(queued_posts, queued_bytes)` stays within [`OUTBOX_CAP`], [`BODY_MAX`], and [`OUTBOX_BYTES_MAX`].
+/// Return `true` iff adding `add_bytes` to an outbox with `(queued_posts, queued_bytes)` stays
+/// within [`OUTBOX_CAP`], [`BODY_MAX`], and [`OUTBOX_BYTES_MAX`].
 #[must_use]
 #[inline]
 pub const fn outbox_has_room(queued_posts: usize, queued_bytes: usize, add_bytes: usize) -> bool {
@@ -303,11 +314,12 @@ pub struct InboxRow {
     pub from: String,
     /// One of [`KINDS`].
     pub kind: String,
-    /// One of [`TRUSTS`]: the receiver's verdict on what the content is.
+    /// `human`, `agent`, `relayed` or `screen`: the receiver's verdict on what the content is.
     pub trust: String,
     /// The offset this message answers, when it answers one.
     pub re: Option<u64>,
-    /// The local post id `re` resolves to through the post table, when the answer is to something this session sent.
+    /// The local post id `re` resolves to through the post table, when the answer is to something
+    /// this session sent.
     pub re_id: Option<u64>,
     /// Advisory deadline in ms.
     pub dl: Option<u64>,
@@ -317,7 +329,8 @@ pub struct InboxRow {
     pub verdict: Option<String>,
     /// This session's verdict on the row, as `inbox seen <id> <verdict>` last recorded it.
     pub decision: Option<String>,
-    /// The kind this message claimed before the receiver demoted it (a relayed row is always `note`, whatever it says it is).
+    /// The kind this message claimed before the receiver demoted it (a relayed row is always
+    /// `note`).
     pub demoted: Option<String>,
     /// The relay chain, comma-joined, when the message came through one.
     pub via: Option<String>,
@@ -329,7 +342,8 @@ pub struct InboxRow {
     pub topic: Option<String>,
     /// Whether a non-peek `inbox` has listed this row.
     pub listed: bool,
-    /// A broadcast the delivering bridge offers again to a successor that keeps this sid while it is unhandled.
+    /// A broadcast the delivering bridge offers again, while it is unhandled, to a successor that
+    /// keeps this sid.
     pub refill: bool,
     on_log: bool,
 }
@@ -414,13 +428,13 @@ pub struct PostRow {
     /// The offset the record landed at, once the bridge says so.
     pub off: Option<u64>,
     landed_on_log: bool,
-    /// The offset this post answers, carried through to the bridge so the published record's body can say `re=`.
+    /// The offset this post answers, carried to the bridge so the published record can say `re=`.
     pub re: Option<u64>,
     /// Advisory deadline in ms, carried through the same way.
     pub dl: Option<u64>,
     /// The relay chain, when the sender declared one.
     pub via: Option<String>,
-    /// The caller's idempotency key (`post key=<token>`), carried to the bridge on every `outbox` drain.
+    /// The caller's idempotency key (`post key=<token>`), carried on every `outbox` drain.
     pub key: Option<String>,
     /// The bridge retired this post `dup=1`.
     pub dup: bool,
@@ -437,7 +451,9 @@ pub struct PostRow {
 pub struct Hold {
     /// Pct-encoded reason, or `-`.
     pub reason: String,
-    /// `person` (the person at the window took the tab over: Take Over, [`HoldIssuer::Person`]), `remote` (another Mac's hold over a drive connection, [`HoldIssuer::Remote`]), `fleet` (a human's halt through the bridge, or a lost bridge) or `local` (the instance Owner's own halt, over the local control socket).
+    /// `person` (Take Over at the window, [`HoldIssuer::Person`]), `remote` (another Mac's hold
+    /// over a drive connection, [`HoldIssuer::Remote`]), `fleet` (a human's halt through the
+    /// bridge, or a lost bridge) or `local` (the instance Owner's halt over the local socket).
     pub origin: String,
 }
 
@@ -557,7 +573,8 @@ impl Holds {
         }
     }
 
-    /// Whose hold the session shows (`status hold_by=`, the survey's `hold_by=`, the need classifier's [`aterm_types::needs::HoldWord`]).
+    /// Whose hold the session shows (`status hold_by=`, the survey's `hold_by=`, the need
+    /// classifier's [`aterm_types::needs::HoldWord`]).
     pub const fn word(&self) -> Option<aterm_types::needs::HoldWord> {
         use aterm_types::needs::HoldWord;
         if self.person.is_some() {
@@ -595,7 +612,7 @@ impl Holds {
         }
     }
 
-    /// Every standing hold, in this order: the person's, a remote node's, the fleet's, then the local one.
+    /// Every standing hold in order: the person's, a remote node's, the fleet's, then the local.
     pub fn standing(&self) -> impl Iterator<Item = Hold> + '_ {
         [
             (PERSON_ORIGIN, self.person.as_ref()),
@@ -654,7 +671,8 @@ impl Holds {
     }
 }
 
-/// The `reason=` of the fleet hold a lost bridge leaves under `[fabric] hold_on_bridge_lost = true` ([`bridge_lost`]).
+/// The `reason=` of the fleet hold a lost bridge leaves under
+/// `[fabric] hold_on_bridge_lost = true` ([`bridge_lost`]).
 pub const FABRIC_LOST: &str = "fabric-lost";
 
 impl PostRow {
@@ -682,10 +700,13 @@ pub struct Inbox {
     bus_head: u64,
     addressed_head: Option<u64>,
     oldest_on_bus: Option<u64>,
-    /// The offsets this session took or refused, oldest first, each with whether its delivery recorded a [`FabricFact::MailIn`] (a quota refusal records none).
+    /// The offsets this session took or refused, oldest first, each with whether its delivery
+    /// recorded a [`FabricFact::MailIn`] (a quota refusal records none).
     dedup: VecDeque<(u64, bool)>,
     dedup_set: HashSet<u64>,
-    /// THE MARKS A SEAMLESS UPDATE CARRIED ([`FabricCarry::marked`]): offsets the carried log already marks delivered, which this successor's bridge offers again. Each is taken back into the ring once with no second mark.
+    /// The marks a seamless update carried ([`FabricCarry::marked`]): offsets the carried log
+    /// already marks delivered, which this successor's bridge offers again. Each is taken back into
+    /// the ring once, with no second mark.
     carried_marks: HashSet<u64>,
     holds: Holds,
     advisory: Option<(Hold, u64)>,
@@ -774,7 +795,8 @@ pub struct FabricCarry {
     /// Waiting posts this handoff could not carry, by id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncarried: Vec<u64>,
-    /// How many owed receipts this handoff could not carry (their asks' senders wait out their own deadlines, as for any receipt that never comes).
+    /// How many owed receipts this handoff could not carry (their asks' senders wait out their own
+    /// deadlines).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub receipts_uncarried: u64,
     /// The session's `dropped=` at the draw ([`Inbox::dropped`]).
@@ -783,10 +805,14 @@ pub struct FabricCarry {
     /// The broadcasts this session held unhandled at the draw (`topic=`, id past `seen`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub broadcasts_uncarried: u64,
-    /// Of [`Self::broadcasts_uncarried`], the ones the successor's bridge offers again, which are therefore not lost.
+    /// Of [`Self::broadcasts_uncarried`], the ones the successor's bridge offers again (not lost).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub broadcasts_refilled: u64,
-    /// The offsets, on [`Self::bus_log`], of the mail whose delivery this session's log marked (`mail dir=in`), oldest first, as far as the budget reached. The successor's bridge offers the unhandled ones again, because the ring is not carried. A successor whose log is the carried one ([`Timeline::log_carried`]) takes each such row back into its ring without a second mark. Otherwise its fold would hold the mail twice (`mail in 2`, and no turn could link it).
+    /// The offsets, on [`Self::bus_log`], of the mail whose delivery this session's log marked
+    /// (`mail dir=in`), oldest first, as far as the budget reached. The ring is not carried, so the
+    /// successor's bridge offers the unhandled ones again; a successor whose log is the carried one
+    /// ([`Timeline::log_carried`]) takes each back into its ring without a second mark, or its fold
+    /// would hold the mail twice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marked: Vec<u64>,
 }
@@ -827,7 +853,9 @@ pub struct ReceiptCarry {
     pub from: String,
 }
 
-/// The most mailbox bytes — carried posts and owed receipts, each at what the manifest's TOML spends on it ([`PostCarry::cost`], [`ReceiptCarry::cost`]) — one handoff manifest carries across every session ([`FabricCarry`]).
+/// The most mailbox bytes one handoff manifest carries across every session ([`FabricCarry`]):
+/// carried posts and owed receipts, each at what the manifest's TOML spends on it
+/// ([`PostCarry::cost`], [`ReceiptCarry::cost`]).
 pub const CARRY_MAIL_BYTES: usize = 256 * 1024;
 
 /// What one carried row costs the manifest beyond its escaped strings.
@@ -844,21 +872,27 @@ pub fn toml_cost(s: &str) -> usize {
         .fold(0, usize::saturating_add)
 }
 
-/// The reason a post the handoff could not carry is retired with in the successor ([`FabricCarry::uncarried`]).
+/// The reason a post the handoff could not carry is retired with in the successor
+/// ([`FabricCarry::uncarried`]).
 pub const NOT_CARRIED: &str = "not-carried";
 
-/// The reason a queued reply is retired with when the bus log it answers was replaced by one that does not hold the record its `re=` names (`Inbox::forget_bus_offsets`).
+/// The reason a queued reply is retired with when its bus log was replaced by one that does not
+/// hold the record its `re=` names (`Inbox::forget_bus_offsets`).
 pub const LOG_REPLACED: &str = "log-replaced";
 
 const CARRY_INT_MAX: u64 = i64::MAX as u64;
 
-/// How many inbox row ids a seamless update leaves this process between the park's draw and its `_exit` ([`SessionFabric::handoff_carry`]).
+/// How many inbox row ids a seamless update leaves this process between the park's draw and its
+/// `_exit` ([`SessionFabric::handoff_carry`]).
 pub const INBOX_ID_RESERVE: u64 = 1 << 12;
 
-/// How often a delivery waiting on a committing update — one past [`INBOX_ID_RESERVE`], or a broadcast — logs that it is still waiting ([`SessionFabric::wait_fenced_delivery`]): a cadence, never a bound.
+/// How often a delivery waiting on a committing update (one past [`INBOX_ID_RESERVE`], or a
+/// broadcast) logs that it still waits ([`SessionFabric::wait_fenced_delivery`]): a cadence, never
+/// a bound.
 pub const MSG_ROOM_NOTICE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The production bound every fenced verb waits for a committing update before it answers [`HOLD_BUSY`] ([`SessionFabric::fence_wait`], which reads it through the process's timing value).
+/// The production bound every fenced verb waits for a committing update before it answers
+/// [`HOLD_BUSY`] ([`SessionFabric::fence_wait`] reads it through the process's timing value).
 pub const HOLD_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FabricCarry {
@@ -882,7 +916,8 @@ impl FabricCarry {
             .fold(0, usize::saturating_add)
     }
 
-    /// Give up the rows, keep the counters. A shed mark costs only a second `mail dir=in` mark for that mail in the successor's log.
+    /// Give up the rows, keep the counters. A shed mark costs only a second `mail dir=in` mark for
+    /// that mail in the successor's log.
     pub fn shed(&mut self) -> bool {
         if self.posts.is_empty()
             && self.receipts.is_empty()
@@ -946,7 +981,8 @@ pub struct KeeperCarry {
     /// The first standing hold, as [`render_hold`] writes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<String>,
-    /// Every other standing hold, one row each (the fleet's and the owner's beside the person's, the owner's beside the fleet's).
+    /// Every other standing hold, one row each (the fleet's and the owner's beside the person's,
+    /// the owner's beside the fleet's).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub more_holds: Vec<String>,
     /// The id lease: inbox row, post, receipt.
@@ -966,7 +1002,8 @@ pub struct KeeperCarry {
     /// The receipts still owed.
     #[serde(skip_serializing_if = "is_zero")]
     pub owed: u64,
-    /// The session's `dropped=` at the sample ([`Inbox::dropped`]), which the recovered session goes on counting from.
+    /// The session's `dropped=` at the sample ([`Inbox::dropped`]), which the recovered session
+    /// goes on counting from.
     #[serde(skip_serializing_if = "is_zero")]
     pub dropped: u64,
 }
@@ -1279,7 +1316,8 @@ impl SessionFabric {
         f(&mut self.lock())
     }
 
-    /// The bound every fenced verb on this session waits for a committing update before it answers [`HOLD_BUSY`], or a test's own ([`Self::set_fence_wait`]), so a test of what outlasts the bound need not sit out the real one.
+    /// The bound every fenced verb on this session waits for a committing update before it
+    /// answers [`HOLD_BUSY`]; a test may set its own ([`Self::set_fence_wait`]).
     pub fn fence_wait(&self) -> std::time::Duration {
         #[cfg(any(test, debug_assertions))]
         if let Some(wait) = *self.fence_wait.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -1294,13 +1332,13 @@ impl SessionFabric {
         *self.fence_wait.lock().unwrap_or_else(|p| p.into_inner()) = Some(wait);
     }
 
-    /// How many times a waiter on this session has blocked on the fence ([`note_fence_block`]), every thread's.
+    /// How often waiters on any thread blocked on this session's fence ([`note_fence_block`]).
     #[cfg(any(test, debug_assertions))]
     pub fn fence_waits(&self) -> u64 {
         self.fence_waits.load(Ordering::SeqCst)
     }
 
-    /// The bound the latest waiter that blocked on this session's fence waits ([`note_fence_block`]).
+    /// The bound the latest waiter blocked on this session's fence waits ([`note_fence_block`]).
     #[cfg(any(test, debug_assertions))]
     pub fn fence_bound(&self) -> Option<Option<std::time::Duration>> {
         *self.fence_bound.lock().unwrap_or_else(|p| p.into_inner())
@@ -1324,7 +1362,8 @@ impl SessionFabric {
         self.lock().closed
     }
 
-    /// The delivered rows newer than `after` that `want` asks for, with the highest id ever delivered here ([`MailSince::high`]) and how many rows above `after` the ring still holds ([`MailSince::present`]).
+    /// The delivered rows newer than `after` that `want` asks for, the highest id ever delivered
+    /// here, and how many rows above `after` the ring still holds ([`MailSince`]).
     pub fn mail_since(&self, after: u64, want: &MailFilter) -> MailSince {
         let inbox = self.lock();
         if after >= inbox.last_msg_id {
@@ -1392,7 +1431,8 @@ impl SessionFabric {
         })
     }
 
-    /// [`Self::topic_add`], recording through `record` (a session's own [`FabricSession::record_fact`]), with the move's [`FabricFact::Topic`] for the session log's mark beside the row.
+    /// [`Self::topic_add`], recording the move's [`FabricFact::Topic`] through `record` (a
+    /// session's own [`FabricSession::record_fact`]).
     pub fn topic_add_recording(
         &self,
         t: &str,
@@ -1456,7 +1496,7 @@ impl SessionFabric {
         *set = topics.into_iter().collect();
     }
 
-    /// Whether broker offset `off` names mail this session holds (what `send|turn cause=@<off>` may name).
+    /// Whether broker offset `off` names mail this session holds (what `cause=@<off>` may name).
     pub fn holds_offset(&self, off: u64) -> bool {
         let inbox = self.lock();
         inbox.rows.iter().any(|r| r.off == off)
@@ -1479,7 +1519,8 @@ impl SessionFabric {
         self.person_refusals.load(Ordering::Relaxed)
     }
 
-    /// The halt a lost bridge did not make on this session, while it still speaks for the link (`status hold_advisory=`).
+    /// The halt a lost bridge did not make on this session, while it still speaks for the link
+    /// (`status hold_advisory=`).
     pub fn hold_advisory(&self) -> Option<Hold> {
         let current = *LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         let inbox = self.lock();
@@ -1491,13 +1532,15 @@ impl SessionFabric {
         }
     }
 
-    /// How many times this session's hold has moved (see the field).
+    /// How many times this session's hold has moved, a direct reset counted too
+    /// ([`Self::note_direct_reset`]).
     #[cfg(any(test, debug_assertions))]
     pub fn hold_serial(&self) -> u64 {
         self.hold_serial.load(Ordering::Acquire)
     }
 
-    /// The commit's reading of this session's hold, and the fence that keeps it true until the process exits.
+    /// The commit's reading of this session's hold, and the fence that keeps it true until the
+    /// process exits.
     #[cfg(any(unix, test, debug_assertions))]
     pub fn fence_hold(&self, successor_reads_carry: bool) -> u64 {
         let mut inbox = self.lock();
@@ -1506,7 +1549,8 @@ impl SessionFabric {
         Self::serial_of(&self.hold_serial, &inbox)
     }
 
-    /// Everything a handoff carries of this session's fabric that can move after the park drew the manifest.
+    /// A serial of what a handoff carries of this session's fabric that can move after the park
+    /// drew the manifest.
     #[cfg(any(unix, test, debug_assertions))]
     pub fn carry_serial(&self) -> u64 {
         let inbox = self.lock();
@@ -1520,7 +1564,8 @@ impl SessionFabric {
             .wrapping_add(inbox.outbox_moves)
     }
 
-    /// Whether this session has numbered an inbox row past the id the last handoff manifest carried ([`Inbox::msg_id_ceiling`]).
+    /// Whether this session has numbered an inbox row past the id the last handoff manifest
+    /// carried ([`Inbox::msg_id_ceiling`]).
     #[cfg(any(unix, test, debug_assertions))]
     pub fn past_handoff_ceiling(&self) -> bool {
         let inbox = self.lock();
@@ -1586,7 +1631,9 @@ impl SessionFabric {
         Some(inbox)
     }
 
-    /// Run `change` — a change the handoff carries that lives off this endpoint (a task mark, `task_record::mark_session_task`).
+    /// Run `change`, a change the handoff carries that lives off this endpoint (a task mark,
+    /// `task_record::mark_session_task`), under the fabric lock once no update fences the session;
+    /// `None` past `wait`.
     pub fn run_unfenced<T>(
         &self,
         wait: std::time::Duration,
@@ -1598,7 +1645,8 @@ impl SessionFabric {
         Some(out)
     }
 
-    /// A manual reset that ran directly on this session's engine (`manual_reset::run_direct`), outside the byte stream, made known to a seamless Commit before it is answered.
+    /// A manual reset that ran directly on this session's engine (`manual_reset::run_direct`),
+    /// outside the byte stream, made known to a seamless Commit before it is answered.
     pub fn note_direct_reset(&self, fence_wait: Option<std::time::Duration>) -> bool {
         let inbox = self.lock();
         let inbox = match fence_wait {
@@ -1930,7 +1978,7 @@ impl SessionFabric {
         self.changed.notify_all();
     }
 
-    /// **the presence facts' mail read** (aterm-gui's `App::sense`).
+    /// The mail half of the presence facts (aterm-gui's `App::sense`).
     pub fn mail_facts(&self) -> aterm_messages::presence::MailFacts {
         let inbox = self.lock();
         let seen = inbox.seen;
@@ -1968,7 +2016,8 @@ impl SessionFabric {
         }
     }
 
-    /// What the resident pet's room reads: the newest row id when it is unseen (else 0), whether an unseen row is past its `dl=`, and whether a hold stands.
+    /// What the resident pet's room reads: the newest row id when it is unseen (else 0), whether an
+    /// unseen row is past its `dl=`, and whether a hold stands.
     pub fn room_facts(&self, now_ms: u64) -> (u64, bool, bool) {
         let inbox = self.lock();
         let seen = inbox.seen;
@@ -2043,7 +2092,8 @@ struct BridgeHello {
 enum HelloLog {
     /// No `log=`, or a word this endpoint does not read.
     Off,
-    /// `log=auto`: a `[fabric] log = "auto"` bridge (the default) whose last attach did not find the broker retaining; over a retaining broker that bridge says `log=turns`.
+    /// `log=auto`: a `[fabric] log = "auto"` bridge (the default) whose last attach did not find
+    /// the broker retaining; over a retaining broker that bridge says `log=turns`.
     Auto,
     /// `log=turns`: it asks this endpoint to serve `log-take`/`log-landed`.
     Turns,
@@ -2269,10 +2319,8 @@ fn stale_in() -> Option<std::time::Duration> {
 }
 
 fn note_work_owed() {
-    // Only a connected bridge can owe anything. This is also the gate every other writer of this
-    // struct has: `bridge_attached`, `link_report` and `link_evidence` all refuse a write that
-    // does not belong to the live bridge generation, so a caller with no bridge cannot move the
-    // link's state.
+    // Only a connected bridge can owe anything: the gate `bridge_attached`, `link_report` and
+    // `link_evidence` keep too, so a caller with no live bridge cannot move the link's state.
     if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
         return;
     }
@@ -2338,7 +2386,8 @@ pub fn fabric_state_seen() -> &'static str {
     fabric_state()
 }
 
-/// The link's three reported facts (reason, rtt, ack age), as `fabric status` prints them; `status` prints the last two ([`fabric_status_tail`]).
+/// The link's three reported facts (reason, rtt, ack age), as `fabric status` prints them;
+/// `status` prints the last two ([`fabric_status_tail`]).
 pub fn fabric_link_facts() -> (String, Option<u64>, Option<u64>) {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
     let reason = if link.up || link.reason.is_empty() {
@@ -2486,7 +2535,8 @@ fn wake_presence(store: &Store) {
     }
 }
 
-/// Whether the bridge that owns the link said, in its `hello`, that it offers a kept session's unhandled broadcasts again after a relaunch (`refill=…say`).
+/// Whether the owning bridge said in its `hello` that it offers a kept session's unhandled
+/// broadcasts again after a relaunch (`refill=…say`).
 pub fn bridge_refills_broadcasts() -> bool {
     #[cfg(any(test, debug_assertions))]
     if link_section_is_foreign() {
@@ -2505,7 +2555,8 @@ const HELLO_USAGE: &str =
 
 const BUILD_TOKEN_MAX: usize = 64;
 
-/// `hello lane=<n> [build=<token>] [refill=<lane,...>] [log=auto|turns]`: answers `OK lane=<n> build=<b>` (` log=turns` when asked), or `OK stale=1 …` to a superseded incarnation.
+/// `hello lane=<n> [build=<token>] [refill=<lane,...>] [log=auto|turns]`: answers
+/// `OK lane=<n> build=<b>` (` log=turns` when asked), or `OK stale=1 …` to a stale incarnation.
 pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     let mut lane: Option<u32> = None;
     let mut build: Option<String> = None;
@@ -2598,7 +2649,7 @@ pub fn with_current_bridge<T>(
     lane_owns(generation).then(operation)
 }
 
-/// Whether the bridge that owns the link asked for the bus mirror in its recorded `hello` (`log=turns`).
+/// Whether the owning bridge asked for the bus mirror in its recorded `hello` (`log=turns`).
 #[must_use]
 pub fn bridge_mirrors_logs() -> bool {
     #[cfg(any(test, debug_assertions))]
@@ -2613,7 +2664,9 @@ pub fn bridge_mirrors_logs() -> bool {
         .is_some_and(|h| h.log == HelloLog::Turns)
 }
 
-/// Whether the node mirrors, as the owning bridge last said it (the word the store's `session_log_mirror::Shared::served` keeps).
+/// Whether the node mirrors, as the owning bridge last said it; `None` for an `auto` bridge whose
+/// mirror has not reported `unretained`. aterm-gui's `session_log_mirror::Shared::served` keeps
+/// the word.
 #[must_use]
 pub fn bridge_mirror_word() -> Option<bool> {
     #[cfg(any(test, debug_assertions))]
@@ -2747,7 +2800,7 @@ pub fn note_lane_fault(generation: Option<BridgeGeneration>) {
     link.lane_faults = link.lane_faults.saturating_add(1);
 }
 
-/// What the attached bridge said about itself and how its lane has gone, as `fabric status` prints it.
+/// What the attached bridge said of itself and how its lane has gone, as `fabric status` prints it.
 pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
     let (lane, build) = link
@@ -2804,12 +2857,15 @@ fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
     true
 }
 
-/// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log <identity>` / `link bye <quit|handoff>` / `link mirror …` / `link set-aside files=<n>` / `link quarantine torn=<k>`, from the bridge lane whose generation `generation` is.
+/// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log <identity>` /
+/// `link bye <quit|handoff>` / `link mirror …` / `link set-aside files=<n>` /
+/// `link quarantine torn=<k>`, from the bridge lane of `generation`.
 pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGeneration>) -> String {
     cmd_link_after_log_switch(store, rest, generation, || {})
 }
 
-/// `cmd_link` with the endpoint's additional log-clock retirement, called exactly on a completed `forgot=1` switch before releasing the transition.
+/// [`cmd_link`], calling `on_forgot` (the endpoint's log-clock retirement) on a completed
+/// `forgot=1` switch, before the transition is released.
 pub fn cmd_link_after_log_switch(
     store: &impl AsStore,
     rest: &str,
@@ -3064,7 +3120,8 @@ pub fn bridge_lost(store: &impl AsStore, generation: BridgeGeneration) -> usize 
     bridge_lost_waking(store, generation, &|_| {})
 }
 
-/// [`bridge_lost`], calling `wake` with each session's id whose session log owes its readers a wake (the halt's `hold` mark), once its fabric lock is released.
+/// [`bridge_lost`], calling `wake` with the id of each session whose log owes its readers a wake
+/// (the halt's `hold` mark), once its fabric lock is released.
 #[cfg(any(unix, test, debug_assertions))]
 pub fn bridge_lost_waking(
     store: &impl AsStore,
@@ -3130,7 +3187,7 @@ pub fn set_hold_on_bridge_lost(on: bool) {
     LINK.hold_on_loss.store(on, Ordering::Relaxed);
 }
 
-/// Whether a lost bridge halts the sessions it governed ([`set_hold_on_bridge_lost`]; `false` by default).
+/// Whether a lost bridge halts its sessions ([`set_hold_on_bridge_lost`]; `false` by default).
 #[cfg(any(unix, test, debug_assertions))]
 pub fn holds_on_bridge_lost() -> bool {
     LINK.hold_on_loss.load(Ordering::Relaxed)
@@ -3155,13 +3212,15 @@ fn advise(ctx: &dyn FabricSession, lost: Hold, generation: BridgeGeneration) -> 
     true
 }
 
-/// Whether a standing hold, of any origin, refuses `verb`: whether its input reaches the PTY ([`aterm_types::control_verbs::Input::PTY`]).
+/// Whether a standing hold, of any origin, refuses `verb`: whether its input reaches the PTY
+/// ([`aterm_types::control_verbs::Input::PTY`]).
 #[must_use]
 pub fn is_pty_reaching(verb: &str) -> bool {
     aterm_types::control_verbs::input_of(verb).contains(aterm_types::control_verbs::Input::PTY)
 }
 
-/// The refusal a halted session answers `verb` with, or `None` when the verb may proceed ([`is_pty_reaching`], then [`hold_refusal`]).
+/// The refusal a halted session answers `verb` with, or `None` when the verb may proceed
+/// ([`is_pty_reaching`], then [`hold_refusal`]).
 #[must_use]
 pub fn halt_refusal(ctx: &dyn FabricSession, verb: &str) -> Option<String> {
     if !is_pty_reaching(verb) {
@@ -3232,7 +3291,8 @@ pub fn open_halt_refusal(store: &impl AsStore, verb: &str, rest: &str) -> Option
     app_halt_refusal(store, "invoke")
 }
 
-/// A principal address: a bare principal ([`is_principal`]), or `<owner>@<node>` for a session behind a node, both halves bare.
+/// A principal address: a bare principal ([`is_principal`]), or `<owner>@<node>` for a session
+/// behind a node, both halves bare.
 pub fn valid_principal(p: &str) -> bool {
     match p.split_once('@') {
         Some((owner, node)) => is_principal(owner) && is_principal(node),
@@ -3294,10 +3354,13 @@ pub const HOLD_PERSON_USAGE: &str = "ERR usage: origin=person is the window's ow
                                             Tab); hold <sid> on|off [reason=<pct>] \
                                             [origin=fleet|local]\n";
 
-/// The refusal of a `hold` that is not its issuer's to make: an Owner naming or lifting the fleet hold, or a remote one no drive connection serves.
+/// The refusal of a `hold` that is not its issuer's to make: an Owner naming or lifting the fleet
+/// hold, or a remote one no drive connection serves.
 pub const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet hold\n";
 
-/// The answer to a fenced verb (`hold`, `post`, `topic add|drop`, `inbox seen` with a verdict, …) that waited [`SessionFabric::fence_wait`] while a seamless update committed the session, and saw it neither land nor stand down.
+/// The answer to a fenced verb (`hold`, `post`, `topic add|drop`, `inbox seen` with a verdict, …)
+/// that waited [`SessionFabric::fence_wait`] while a seamless update committed the session, and
+/// saw it neither land nor stand down.
 pub const HOLD_BUSY: &str = "ERR busy update-committing\n";
 
 #[cfg(any(test, debug_assertions))]
@@ -3397,13 +3460,15 @@ enum Applied {
     Changed { held: bool },
     /// The slot already stood as asked.
     Unchanged { held: bool },
-    /// An Owner-issued act named the fleet's slot, or an Owner `off` found only a fleet hold standing.
+    /// An Owner's act named the fleet's slot, or an Owner `off` found only a fleet hold standing.
     FleetHeld,
     /// The act named a slot its issuer may not touch.
     NotItsSlot,
-    /// A remote node's set while the person's hold stands or another node's does, or its lift of another node's.
+    /// A remote node's set while the person's or another node's hold stands, or its lift of
+    /// another node's.
     Taken,
-    /// A seamless update was committing the session for the whole of the wait the caller allowed ([`SessionFabric::fence_hold`]).
+    /// A seamless update was committing the session for the whole wait the caller allowed
+    /// ([`SessionFabric::fence_hold`]).
     Fenced,
 }
 
@@ -3478,7 +3543,7 @@ fn apply_hold_as(
         }
     }
     if issuer == HoldIssuer::Owner {
-        // Not the owner's slot to name at all (`cmd_hold` refuses it first; this keeps the rule where the slots are).
+        // Not the owner's slot to name (`cmd_hold` refuses it first; the rule stays by the slots).
         if act.origin() != Some("local") {
             return Applied::FleetHeld;
         }
@@ -3548,13 +3613,13 @@ fn link_section_is_foreign() -> bool {
 #[cfg(any(test, debug_assertions))]
 static LINK_RESET_ALSO: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
-/// Have every [`with_link_reset`] section also run `reset` at its start and its end, under the section's lock.
+/// Have every [`with_link_reset`] section also run `reset` at its start and end, under its lock.
 #[cfg(any(test, debug_assertions))]
 pub fn also_reset_with_the_link(reset: fn()) {
     let _ = LINK_RESET_ALSO.set(reset);
 }
 
-/// Run `f` with the process-wide bridge link reset to "never launched", and reset it again on the way out.
+/// Run `f` with the process-wide bridge link reset to "never launched", and reset again after.
 #[cfg(any(test, debug_assertions))]
 pub fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     static LINK_TESTS: Mutex<()> = Mutex::new(());
@@ -3621,12 +3686,13 @@ pub fn touched_contains(sid: &str) -> bool {
         .any(|r| r.sids.contains(sid))
 }
 
-/// The owner's local hold a restore layout carried, put back on a session that is registered already.
+/// The owner's local hold a restore layout carried, put back on an already registered session.
 pub fn carry_hold(ctx: &dyn FabricSession, hold: Hold) -> bool {
     carry_hold_waking(ctx, hold, &|| {})
 }
 
-/// [`carry_hold`], calling `wake` when the session log's readers are owed a wake (its `hold` mark), once the fabric lock is released.
+/// [`carry_hold`], calling `wake` once the fabric lock is released when the session log owes its
+/// readers a wake (its `hold` mark).
 pub fn carry_hold_waking(ctx: &dyn FabricSession, hold: Hold, wake: &dyn Fn()) -> bool {
     let act = HoldAct::Set(Hold {
         origin: "local".to_string(),
@@ -3667,7 +3733,8 @@ pub fn cmd_hold(store: &impl AsStore, rest: &str, issuer: HoldIssuer) -> String 
     cmd_hold_within(store, rest, issuer, None)
 }
 
-/// [`cmd_hold`], calling `wake` with the session's id when the session log's readers are owed a wake (its `hold` mark), once the fabric lock is released.
+/// [`cmd_hold`], calling `wake` with the session's id once the fabric lock is released when its
+/// log owes its readers a wake (its `hold` mark).
 pub fn cmd_hold_waking(
     store: &impl AsStore,
     rest: &str,
@@ -3836,12 +3903,14 @@ const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> 
                              [more=1] [text=<pct>]) \
                              | deliver <sid> receipt=<rid> off=<n|->\n";
 
-/// `deliver` — put one bus record in a session's inbox, close an outbound post (`landed=`), answer a parked `inbox get @<off>` (`fetched=`), or retire an owed receipt (`receipt=`).
+/// `deliver` — put one bus record in a session's inbox, close an outbound post (`landed=`), answer
+/// a parked `inbox get @<off>` (`fetched=`), or retire an owed receipt (`receipt=`).
 pub fn cmd_deliver(store: &impl AsStore, rest: &str) -> String {
     cmd_deliver_waking(store, rest, &|_| {})
 }
 
-/// [`cmd_deliver`], calling `wake` with the session's id when the session log's readers are owed a wake (a `mail` or `mail-landed` mark), once the fabric lock is released.
+/// [`cmd_deliver`], calling `wake` with the session's id once the fabric lock is released when its
+/// log owes its readers a wake (a `mail` or `mail-landed` mark).
 pub fn cmd_deliver_waking(store: &impl AsStore, rest: &str, wake: &dyn Fn(&SessionId)) -> String {
     let store = &store.as_store();
     let mut toks = rest.split_whitespace();
@@ -3922,7 +3991,8 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
                 Err(_) => return DELIVER_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "err") {
-            // A bridge is a separate process and its output is still input: the reason is one bounded token or the line is refused.
+            // The bridge's output is still input: the reason is one bounded token or the line is
+            // refused.
             if !valid_dead_reason(v) {
                 return DELIVER_USAGE.to_string();
             }
@@ -4119,13 +4189,16 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
             }
             f.via = Some(v.to_string());
         } else if let Some(v) = kv(tok, "topic") {
-            // CLOSED TO THE GRAMMAR, like every other word on this line: the bridge is a separate process and its output is still input, and a topic that could carry a space or an `=` is a topic that can invent a second field on the `msg` row this becomes.
+            // The topic is closed to the grammar, like every word on this line: the bridge's output
+            // is still input, and a topic with a space or an `=` could invent a field on the `msg`
+            // row.
             if !is_topic(v) {
                 return Err(DELIVER_USAGE.to_string());
             }
             f.topic = Some(v.to_string());
         } else if let Some(v) = kv(tok, "verdict") {
-            // CLOSED, like `trust=`: a receipt's word is one of three, and an agent never reads a verdict token this endpoint did not classify.
+            // The verdict is closed, like `trust=`: a receipt's word is one of three, and an agent
+            // never reads a verdict token this endpoint did not classify.
             if !VERDICTS.contains(&v) {
                 return Err(DELIVER_USAGE.to_string());
             }
@@ -4373,7 +4446,7 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
         let sid = h.self_id().as_str();
         let inbox = h.fabric().lock();
         for r in &inbox.receipts {
-            // Older bridges ignore unknown receipt fields.
+            // A bridge that did not ask (`earlier-receipts=1`) would ignore `log=earlier`.
             if r.earlier_log && !earlier_receipts {
                 continue;
             }
@@ -4404,7 +4477,8 @@ pub fn cmd_outbox_sent(store: &impl AsStore, rest: &str) -> String {
     cmd_outbox_sent_waking(store, rest, &|_| {})
 }
 
-/// [`cmd_outbox_sent`], calling `wake` with the session's id when the session log's readers are owed a wake (a `mail-landed` mark), once the fabric lock is released.
+/// [`cmd_outbox_sent`], calling `wake` with the session's id once the fabric lock is released
+/// when its log owes its readers a wake (a `mail-landed` mark).
 pub fn cmd_outbox_sent_waking(
     store: &impl AsStore,
     rest: &str,
@@ -4510,9 +4584,8 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         .count();
     if unread_from_peer >= SENDER_QUOTA {
         // A refused broadcast is counted once: its offset is remembered as delivered, so a bridge
-        // that starts and walks this topic again from an earlier unhandled row
-        // ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no more — rather than
-        // refused, and counted, a second time.
+        // that walks this topic again from an earlier unhandled row ([`InboxRow::refill`]) is
+        // answered `OK 0` rather than refused and counted a second time.
         if topic.is_some() {
             inbox.dropped += 1;
             remember_offset(&mut inbox, off, false);
@@ -4736,11 +4809,13 @@ pub fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
 /// The reason [`parse_hold`] gives a carried hold it could not read.
 pub const CARRIED_UNREADABLE: &str = "carried-unreadable";
 
-/// The reason a keeper meta gives a carried hold whose own reason it had no room for ([`KeeperCarry::rungs`]).
+/// The reason a keeper meta gives a carried hold whose own reason it had no room for
+/// ([`KeeperCarry::rungs`]).
 #[cfg(unix)]
 pub const REASON_NOT_CARRIED: &str = "not-carried";
 
-/// Every standing hold except a remote node's (a drive hold is not carried), as the carries write them ([`render_hold`] rows), in [`Holds::standing`]'s order.
+/// Every standing hold but a remote node's (a drive hold is not carried), as [`render_hold`] rows
+/// in [`Holds::standing`]'s order.
 pub fn render_holds(holds: &Holds) -> Vec<String> {
     holds
         .standing()
@@ -5017,7 +5092,8 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
     let deadline = std::time::Instant::now() + wait;
     loop {
         let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
-            // Evicted from under a parked read: only an answered slot is ever evicted, and this one was pending — but a reader that cannot tell must say "nothing" rather than hang.
+            // Evicted from under a parked read, though only an answered slot is evicted and this
+            // one was pending: a reader that cannot tell says "nothing" rather than hang.
             return fetch_failure("no-record", off);
         };
         match &inbox.fetches[i].1 {
@@ -5194,7 +5270,8 @@ fn post_body_offset(rest: &str) -> Option<usize> {
 const WAIT_DEFAULT_MS: u64 = 30_000;
 const WAIT_MAX_MS: u64 = 600_000;
 
-/// `post` — queue one outbound message and, for the kinds that need a correlation id, wait for the offset it landed at.
+/// `post` — queue one outbound message and, for the kinds that need a correlation id, wait for
+/// the offset it landed at.
 pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> String {
     let mut to: Option<String> = None;
     let mut kind: Option<String> = None;
@@ -5224,7 +5301,8 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         } else if let Some(v) = kv(tok, "via") {
             via = Some(v.to_string());
         } else if let Some(v) = kv(tok, "key") {
-            // BOUNDED AT THE DOOR, like `to`: it is printed onto the `outbox` line and into the bridge's state dir, so its charset is the charset of the ids those already carry, and nothing longer.
+            // The key is bounded at the door, like `to`: it is printed onto the `outbox` line and
+            // into the bridge's state dir, so it keeps to the charset and length of the ids there.
             if !valid_key(v) {
                 return POST_USAGE.to_string();
             }
@@ -5439,7 +5517,8 @@ fn wait_receipt_on_log(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
     let mut guard = ctx.fabric().lock();
     loop {
-        // The post's own record must still be on the log: a move that kept it (a moved generation, below the fork) keeps the wait.
+        // The post's own record must still be on the log (a moved generation below the fork
+        // keeps it).
         if !post.on_log() {
             return format!("ERR log-replaced id={id} off={off}\n");
         }
@@ -5499,7 +5578,8 @@ fn wait_is_futile() -> bool {
     }
 }
 
-/// `await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] [topic=<t>]` (the caller strips `timeout=<ms>`).
+/// `await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] | await inbox re=<off> [since=<id>]
+/// [kinds=<k|hold,...>] [topic=<t>]` (the caller strips `timeout=<ms>`).
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
     const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] \
                          [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
@@ -5529,7 +5609,8 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
             }
             kinds = Some(list);
         } else if let Some(v) = kv(tok, "topic") {
-            // THE GRAMMAR `post to=say:<t>` AND `topic add` TAKE: a word outside it is a topic no row can carry, so a wait on it could only time out.
+            // `is_topic` is the grammar `post to=say:<t>` and `topic add` take: no row carries a
+            // topic outside it, so a wait on one could only time out.
             if !is_topic(v) {
                 return USAGE.to_string();
             }
@@ -5565,7 +5646,8 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
     let hold_at_arm = guard.holds.is_held();
     let named = re.map(|off| guard.watch(off, true));
     loop {
-        // The named post's record must still be on the log: a moved generation that kept it (below the fork) keeps the wait.
+        // The named post's record must still be on the log (a moved generation below the fork
+        // keeps it).
         if let Some(post) = &named
             && !post.on_log()
         {
@@ -5605,7 +5687,7 @@ mod test_support {
 
     use super::{FabricFact, FabricSession, Registry, SessionFabric, Timeline};
 
-    /// What every record rings, as aterm-gui's timeline rings its session's watchers on each append.
+    /// What every record rings, as aterm-gui's timeline rings its session's watchers.
     #[derive(Default)]
     pub(crate) struct Watchers {
         rung: Mutex<u64>,
@@ -5664,7 +5746,8 @@ mod test_support {
         pub(crate) fact: String,
     }
 
-    /// What a fact says, as these tests read it: its words and offsets in the `k=v` order of the row aterm-gui's view prints for it (which its own goldens pin), so a test names the floor, the verdict or the hold a move stated.
+    /// What a fact says: its words and offsets in the `k=v` order of the row aterm-gui's view
+    /// prints for it, so a test names the floor, the verdict or the hold a move stated.
     pub(crate) fn said(fact: FabricFact<'_>) -> String {
         let or_dash = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
         match fact {
@@ -5749,7 +5832,7 @@ mod test_support {
     pub(crate) struct TestTimeline {
         events: Vec<Event>,
         pub(crate) facts: Vec<String>,
-        /// What [`Timeline::log_carried`] answers: a seamless update's successor whose log is the carried one.
+        /// What [`Timeline::log_carried`] answers.
         pub(crate) log_carried: bool,
     }
 
@@ -5821,7 +5904,8 @@ mod test_support {
         local_id: u64,
     }
 
-    /// A fresh, unregistered session with process-local id `local_id`, on the test timing value (the fence and notice waits at their test lengths).
+    /// A fresh, unregistered session with process-local id `local_id`, on the test timing value
+    /// (the fence and notice waits at their test lengths).
     pub(crate) fn test_handle(local_id: u64) -> TestHandle {
         aterm_gui_timing::select_fast();
         let sid = SessionId::generate();
@@ -5843,7 +5927,7 @@ mod test_support {
         by_local: BTreeMap<u64, Arc<SessionCtx>>,
         /// Every `link set-aside` count handed over ([`Registry::torn_state_set_aside`]), in order.
         pub(crate) set_aside: std::sync::Mutex<Vec<u64>>,
-        /// Whether each of those came from a bridge that says when its quarantine is empty, in the same order.
+        /// Whether each of those came from a bridge that says when its quarantine is empty.
         pub(crate) told_when_empty: std::sync::Mutex<Vec<bool>>,
         /// Every `link quarantine` count handed over ([`Registry::torn_state_held`]), in order.
         pub(crate) held: std::sync::Mutex<Vec<u64>>,
@@ -7545,7 +7629,8 @@ mod inbox_hold {
     fn a_wait_parked_with_nothing_owed_answers_stale_when_a_later_debt_goes_stale() {
         use std::time::Duration;
         with_link(|| {
-            // A fetch parked with nothing owed looks again a whole horizon later: shorten the horizon so the test waits 300 ms of it, not the instance's 6 s.
+            // A fetch parked with nothing owed looks again a horizon later: 300 ms here, not the
+            // instance's 6 s.
             STALE_AFTER_IN_TEST.store(300, Ordering::Relaxed);
             let store = new_store();
             let (_sid, ctx) = registered(&store);

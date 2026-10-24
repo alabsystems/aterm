@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos-workers-bench`'s unit tests: the Williams order's two balance properties, the summary parser on
-//! real captures, each gate's pass and fail, C0 on a real bundle, C1–C3 holding and not, the fault
-//! session's criteria and the record's stable lines.
+//! `aos-workers-bench`'s unit tests, on real captures and a real bundle.
 
 use super::*;
 
-/// A real `--workers 8` summary of the session's workload (`aos-search --grid --plans <the M4 record's
-/// 17-line file> --workers 8`, captured 2026-10-23 on this tree's debug lab; its `wrote` line dropped).
+/// A real `--workers 8` summary of the session's workload (`aos-search --grid --plans <the M4
+/// record's 17-line file> --workers 8`), its `wrote` line dropped.
 const P8: &str = r"aos-search policy=38c83f009e0e build=aterm-lab_0.128.0+gd97369e77400-dirty toolchain=aterm-lab_0.128.0+gd97369e77400-dirty
 MEASURED (never scored) evaluator_build_ms=6380.4
 search proposer=grid grid v1 config=c4b618825d6c

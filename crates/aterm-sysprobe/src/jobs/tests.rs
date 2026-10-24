@@ -200,51 +200,103 @@ fn a_socket_answer_names_tcp_state_peer_and_queue() {
     assert_eq!(darwin::socket(&b[..100]), None);
 }
 
-/// A `socket_fdinfo` of `kind`, its `soi_options` `options`, bound at `path`.
-fn socket_bytes(kind: i32, options: u16, path: &[u8]) -> Vec<u8> {
-    let mut b = vec![0u8; darwin::SOCKET_SIZE];
-    put(&mut b, darwin::SOCKET_KIND_AT, &kind.to_ne_bytes());
-    put(&mut b, darwin::SOCKET_OPTIONS_AT, &options.to_ne_bytes());
-    put(&mut b, darwin::SOCKET_UN_PATH_AT, path);
+/// A `net.local.stream.pcblist_n` read: its `xinpgen` head, `records` each padded to 8, and its
+/// `xinpgen` tail.
+fn unix_table(records: &[Vec<u8>]) -> Vec<u8> {
+    let mut b = vec![0u8; 24];
+    put(&mut b, 0, &24u32.to_ne_bytes());
+    let tail = b.clone();
+    for record in records {
+        b.extend_from_slice(record);
+        b.resize(b.len().next_multiple_of(8), 0);
+    }
+    b.extend_from_slice(&tail);
     b
 }
 
+/// A table record of `kind`, `len` bytes long.
+fn table_record(kind: u32, len: usize) -> Vec<u8> {
+    let mut b = vec![0u8; len];
+    put(&mut b, 0, &u32::try_from(len).unwrap().to_ne_bytes());
+    put(&mut b, 4, &kind.to_ne_bytes());
+    b
+}
+
+/// One unix-domain stream's records, as the table lays them out: its `xunpcb_n` bound at `path`
+/// (empty: unbound), its `xsocket_n` with `so_options` `options`, made by `uid` and last bound
+/// by `pid`, and its receive buffer's record.
+fn unix_stream(path: &[u8], options: u32, uid: u32, pid: u32) -> [Vec<u8>; 3] {
+    let mut pcb = table_record(darwin::XSO_UNPCB, darwin::XUNPCB_SIZE);
+    put(&mut pcb, darwin::XUNPCB_PATH_AT, path);
+    let mut so = table_record(darwin::XSO_SOCKET, darwin::XSOCKET_SIZE);
+    put(&mut so, darwin::XSOCKET_OPTIONS_AT, &options.to_ne_bytes());
+    put(&mut so, darwin::XSOCKET_UID_AT, &uid.to_ne_bytes());
+    put(&mut so, darwin::XSOCKET_LAST_PID_AT, &pid.to_ne_bytes());
+    [pcb, so, table_record(0x2, 32)]
+}
+
 #[test]
-fn a_unix_listener_is_read_from_its_socket_record() {
+fn the_unix_stream_table_names_each_bound_listener() {
     let path = b"/Users//u/f/bus.sock";
-    let listening = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN | 0x4, path);
-    assert_eq!(
-        darwin::unix_listener(&listening),
-        Some(Some(&path[..])),
-        "a listener, with another option set beside SO_ACCEPTCONN"
-    );
-    let accepted = socket_bytes(darwin::SOCKINFO_UN, 0x4, path);
-    assert_eq!(
-        darwin::unix_listener(&accepted),
-        Some(None),
-        "an accepted stream carries its listener's path and is no listener"
-    );
-    let tcp = socket_bytes(darwin::SOCKINFO_TCP, darwin::SO_ACCEPTCONN, path);
-    assert_eq!(darwin::unix_listener(&tcp), Some(None), "a TCP listener");
-    let unbound = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN, b"");
-    assert_eq!(darwin::unix_listener(&unbound), Some(None), "no bound path");
-    assert_eq!(
-        darwin::unix_listener(&listening[..darwin::SOCKET_SIZE - 1]),
-        None,
-        "a short answer"
-    );
+    let listens = u32::from(darwin::SO_ACCEPTCONN);
     let full = [b'p'; darwin::SUN_PATH_LEN];
-    let mut no_nul = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN, &full);
+    let mut no_nul = unix_stream(&full, listens, 0, 44);
     put(
-        &mut no_nul,
-        darwin::SOCKET_UN_PATH_AT + darwin::SUN_PATH_LEN,
+        &mut no_nul[0],
+        darwin::XUNPCB_PATH_AT + darwin::SUN_PATH_LEN,
         b"tail",
     );
-    assert_eq!(
-        darwin::unix_listener(&no_nul),
-        Some(Some(&full[..])),
-        "a path with no NUL ends at sun_path's length"
+    let table = unix_table(
+        &[
+            unix_stream(path, listens | 0x4, 501, 41),
+            unix_stream(path, 0x4, 501, 42),
+            unix_stream(b"", listens, 501, 43),
+            no_nul,
+        ]
+        .concat(),
     );
+    assert_eq!(
+        darwin::unix_listeners(&table),
+        Some(vec![
+            darwin::UnixListenerRow {
+                pid: 41,
+                uid: 501,
+                path: &path[..],
+            },
+            darwin::UnixListenerRow {
+                pid: 44,
+                uid: 0,
+                path: &full[..],
+            },
+        ]),
+        "a listener with another option set beside SO_ACCEPTCONN, and one whose path has no NUL \
+         and ends at sun_path's length; not the stream it accepted, which carries its path, nor \
+         an unbound listener"
+    );
+    assert_eq!(
+        darwin::unix_listeners(&unix_table(&[])),
+        Some(vec![]),
+        "no streams"
+    );
+    assert_eq!(
+        darwin::unix_listeners(&table[..table.len() - 30]),
+        None,
+        "a record running past the end"
+    );
+    for (kind, len) in [
+        (darwin::XSO_UNPCB, darwin::XUNPCB_SIZE - 4),
+        (darwin::XSO_SOCKET, darwin::XSOCKET_SIZE + 8),
+    ] {
+        let resized = unix_table(&[table_record(kind, len)]);
+        assert_eq!(
+            darwin::unix_listeners(&resized),
+            None,
+            "a record of kind {kind:#x} and another size"
+        );
+    }
+    let mut zero = unix_table(&[table_record(0x2, 32)]);
+    put(&mut zero, 24, &0u32.to_ne_bytes());
+    assert_eq!(darwin::unix_listeners(&zero), None, "a length word under 8");
 }
 
 #[test]
@@ -334,10 +386,8 @@ fn an_arch_answer_gives_its_cpu_type() {
     assert_eq!(darwin::archinfo_cputype(&b[..4]), None);
 }
 
-/// Only a process whose one thread never ran, 20 s or more after its fork,
-/// neither stopped nor traced, reads held, and then only native and on a
-/// local volume: M1's row is held and M2's normal exec, caught at its first
-/// instruction, is not.
+/// M1's row reads held and M2's normal exec, caught at its first instruction, does not; each
+/// other guard of [`judge_start`] moves M1's row off held.
 #[test]
 fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
     let m1 = StartFacts {
@@ -430,10 +480,9 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
                     150 50 20 10 20 0 3 0 123456 0 0";
 
-/// Every field is read past a command name holding parentheses; a terminal the kernel prints
-/// negative (its `int`, the sign bit set by a pts minor of 2^19 or more) keeps its 32 bits, and
-/// one that is no number refuses the line. NEGATIVE CONTROL: read a terminal that does not fit a
-/// `u32` as 0, and the far terminal reads as none.
+/// Every field is read past a command name holding parentheses. A terminal the kernel prints
+/// negative (a pts minor of 2^19 or more sets its `int`'s sign bit) keeps its 32 bits rather than
+/// reading as none, and one that fits neither an `int` nor a `u32` refuses the line.
 #[test]
 fn a_stat_line_gives_every_field_past_any_command_name() {
     let s = linux::parse_stat(STAT).unwrap();
@@ -757,11 +806,9 @@ fn table(mounts: &[(&str, bool, bool)]) -> Table {
     }
 }
 
-/// Only a temporary-files root on a local, non-automounted mount is
-/// opened. NEGATIVE CONTROLS: a home folder, a remote mount under `/tmp`,
-/// an automount, a `..` that would climb out. Unix: [`TAIL_ROOTS`] are unix
-/// folders, and a Windows table places no `/…` path (nor is a tail read
-/// there: [`tail_has_lf`] answers `None`).
+/// Only a temporary-files root on a local, non-automounted mount is opened: never a home folder,
+/// a remote mount under `/tmp`, an automount or a `..` that climbs out. Unix only: [`TAIL_ROOTS`]
+/// are unix folders, and off unix [`tail_has_lf`] answers `None`.
 #[cfg(unix)]
 #[test]
 fn only_a_local_temporary_file_is_opened_for_its_tail() {
@@ -791,9 +838,8 @@ fn only_a_local_temporary_file_is_opened_for_its_tail() {
     );
 }
 
-/// A mount table proves a volume local only when it was read whole: a cut one
-/// may have left out the mount that holds the path, so its local answer is
-/// unread, while a mount it lists as remote still reads remote.
+/// A cut mount table proves no volume local (the mount it left out may hold the path), while a
+/// mount it lists as remote still reads remote.
 #[cfg(unix)]
 #[test]
 fn a_cut_mount_table_proves_no_volume_local() {
@@ -878,8 +924,54 @@ fn this_process_reads_itself_with_threads_counters_and_descriptors() {
     }
 }
 
-/// Both lanes pass their self-check in a plain test binary (design §5.3:
-/// each lane self-checks inside the running binary).
+/// A PROCESS'S SOCKETS ARE READ ONLY ONCE IT IS SETTLED (`macos::settled`): it ran this program at
+/// the reader's last pass too, and it is not exiting. A fork that never exec'd, a program the last
+/// pass did not see run, and one on its way out of `exit` are not.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_a_settled_process_has_its_sockets_read() {
+    use darwin::{PROC_FLAG_EXEC as EXEC, PROC_FLAG_INEXIT as EXIT};
+    assert!(macos::settled(EXEC, true));
+    assert!(
+        !macos::settled(EXEC, false),
+        "a program the last pass did not see run"
+    );
+    assert!(!macos::settled(0, true), "a fork that never exec'd");
+    assert!(!macos::settled(EXEC | EXIT, true), "on its way out of exit");
+}
+
+/// THE READER WAITS ONE PASS BEFORE IT READS A SOCKET: this process's socket reads `Other` at a
+/// reader's first pass and in detail at the next, which finds the same program running. NEGATIVE
+/// CONTROL: a fresh reader, with no last pass, reads it `Other` again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_socket_reads_in_detail_from_the_second_pass_that_finds_its_program() {
+    use std::os::fd::AsRawFd as _;
+    let (end, _peer) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+    let fd = end.as_raw_fd();
+    let me = std::process::id();
+    let kind = |reader: &mut JobsReader| {
+        reader
+            .read(ReadReq { pid: me, fds: true })
+            .and_then(|f| f.fds)
+            .and_then(|fds| fds.into_iter().find(|d| d.fd == fd))
+            .map(|d| d.kind)
+    };
+    let mut reader = JobsReader::new();
+    assert_eq!(
+        kind(&mut reader),
+        Some(FdKind::Other),
+        "the first pass reads no socket"
+    );
+    assert_eq!(
+        kind(&mut reader),
+        Some(FdKind::Socket),
+        "the second reads it"
+    );
+    assert_eq!(kind(&mut JobsReader::new()), Some(FdKind::Other));
+}
+
+/// Both lanes pass their self-check in a plain test binary.
 #[cfg(target_os = "macos")]
 #[test]
 fn both_lanes_self_check_on() {
@@ -964,9 +1056,9 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
     child.wait().expect("reaped");
 }
 
-/// A FORK THAT KEPT ITS PARENT'S PROGRAM RAN NONE OF ITS OWN: the sweep reads `exec` off the
-/// kernel's flag (macOS `P_EXEC`, Linux `PF_FORKNOEXEC`), which a shell's own session lacks (zsh's
-/// `zpty` worker) and a program a fork ran (`sleep`) has.
+/// The sweep reads `exec` off the kernel's flag (macOS `P_EXEC` set, Linux `PF_FORKNOEXEC`
+/// clear): `false` for a fork that kept its parent's program (zsh's `zpty` worker), `true` for a
+/// program a fork ran (`sleep`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_fork_that_kept_its_parents_program_ran_none_of_its_own() {
@@ -996,13 +1088,10 @@ fn a_fork_that_kept_its_parents_program_ran_none_of_its_own() {
     assert_eq!(read, (Some(Some(true)), Some(Some(false))));
 }
 
-/// The job probe's CPU times are nanoseconds: a spinning child, stopped so
-/// that every reading counts the same CPU at any load, reads its counters and
-/// the sum of its threads each within 2x of what `wait4` reports for it. The
-/// two come in different units: `proc_pid_rusage` counts the kernel's Mach
-/// ticks, and `PROC_PIDTHREADINFO` gives nanoseconds. Thread times scaled as
-/// ticks read 125/3 too large, natively and under Rosetta
-/// (`docs/measured/rosetta-mac-2026-10-20.md` §3 (b)).
+/// The job probe's CPU times are nanoseconds: a spinning child, stopped so every reading counts
+/// the same CPU at any load, reads its counters and its threads' sum each within 2x of `wait4`'s.
+/// `proc_pid_rusage` counts Mach ticks and `PROC_PIDTHREADINFO` nanoseconds; thread times scaled
+/// as ticks read 125/3 too large (`docs/measured/rosetta-mac-2026-10-20.md` §3 (b)).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() {
@@ -1022,12 +1111,9 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
     );
 }
 
-/// A start-suspended spawn reads one thread whose handle is `0`, stopped and
-/// untraced, so its stop, not its age, keeps it from reading held (the age is
-/// read 21 s ahead, so the bound is passed with no wait). The job probe reads
-/// the same facts, its mount from the table it holds and its age from its own
-/// clock; a reader handed a table places the executable by that table. This
-/// process, which runs, never reads a lone `0`.
+/// A start-suspended spawn reads one thread whose handle is `0`, stopped and untraced, so its
+/// stop, not its age (read 21 s ahead), keeps it from reading held. The job probe reads the same
+/// facts, and a reader handed a mount table places the executable by that table.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
@@ -1138,9 +1224,7 @@ fn a_program_stopped_after_it_ran_keeps_its_thread_handles() {
     cat.wait().expect("reaped");
 }
 
-/// A FRESH DYLIB is one whose name ends `.dylib` and whose data changed at most an hour
-/// before the process that holds it started, or since; a start that is unread, or a change
-/// time before the epoch, makes none fresh.
+/// An unread start, or a change time before the epoch, makes no dylib fresh.
 #[test]
 fn a_fresh_dylib_is_one_written_at_most_an_hour_before_its_holder_started() {
     let start = 1_800_000_000_000_000u64;
@@ -1193,9 +1277,8 @@ fn a_fresh_dylib_is_one_written_at_most_an_hour_before_its_holder_started() {
     }
 }
 
-/// A MEMBER'S DESCRIPTORS NAME A FRESH DYLIB IT HOLDS OPEN: this process, which started
-/// before the scratch files were written, holds a `.dylib` written now (fresh), a text file
-/// written now and a `.dylib` whose change time was set a day back (neither).
+/// This process, which started before its scratch files were written, holds a `.dylib` written
+/// now (fresh), a text file written now and a `.dylib` changed a day back (neither).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_members_descriptors_name_a_fresh_dylib_it_holds_open() {

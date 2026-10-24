@@ -9,17 +9,13 @@
 //! | baked | `baked/<base sha>-<seed fingerprint>.img`, a clone of base grown to 60 GiB | only during its bake, as `*.partial.img`; then 0444 |
 //! | live | `live/aterm-linux.img`, beside `live/aterm-linux.toml` naming its baked disk | yes: the lane's disk, provisioned in place |
 //!
-//! Every bring-up runs [`Layers::prepare`] under the lane lock. It removes every partial file
-//! before it reads a directory, holds the volume to the free-space floor, keeps the live
-//! disk unless there is none or its record names another base, and clones only a sealed
-//! baked disk. A provisioning plan is no input here: a changed plan is provisioned in place
-//! on the live disk, and never bakes.
+//! [`Layers::prepare`] brings the disks up. A changed provisioning plan is no input here: it
+//! is provisioned in place on the live disk and never bakes.
 //!
-//! What this module does not do is start a VM. [`Prepared::Bake`] hands the caller (the
-//! lab's vz driver, V4) the partial disk its bake boots through the helper (V2) with
-//! [`Layers::seed_iso`]; [`PartialBake::seal`] finishes it once that VM has stopped. The
-//! live disk is replaced only while no helper holds it: the helper's `flock` on
-//! `live/aterm-linux.img.lock` (V2) is what a caller checks first.
+//! This module starts no VM. The caller boots a [`Prepared::Bake`] disk through the helper
+//! with [`Layers::seed_iso`] and calls [`PartialBake::seal`] once that VM has stopped. It calls
+//! [`Layers::prepare`], which may replace the live disk, only when no VM runs: a running VM
+//! keeps the disks it booted on.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -311,11 +307,11 @@ impl Layers {
 
     /// Bring the disks up for `base` and the seed whose fingerprint is `seed`, under the
     /// lane lock. In order:
-    /// 1. every `*.partial.img` in `baked/` and `live/` is removed, unread, and so is every
-    ///    baked disk neither this one nor the live record's: the lane's own leftovers, which
-    ///    could otherwise hold the volume under its floor at every bring-up;
-    /// 2. the volume is held to [`crate::space::BRING_UP_FLOOR`] (else [`Error::Floor`]: nothing is cloned
-    ///    or baked);
+    /// 1. every `*.partial.img` in `baked/` and `live/` is removed unread, and so is every
+    ///    baked disk that is neither this one nor the live record's, so leftovers cannot hold
+    ///    the volume under its floor;
+    /// 2. the volume is held to [`crate::space::BRING_UP_FLOOR`] (else [`Error::Floor`], and
+    ///    nothing is cloned or baked);
     /// 3. the live disk is kept where its record names `base` ([`Prepared::Live`],
     ///    `cloned: None`);
     /// 4. otherwise the sealed baked disk for `base` and `seed` is cloned to live
@@ -326,8 +322,8 @@ impl Layers {
     /// removed and cloned.
     ///
     /// # Errors
-    /// [`Error::Floor`] below the floor, [`Error::Input`] for a base larger than the disk,
-    /// [`Error::Io`] for a failed clone or write.
+    /// [`Error::Floor`] below the floor, [`Error::Input`] for a base that cannot be read or is
+    /// larger than the disk, [`Error::Io`] for a failed volume read, removal, clone or write.
     pub fn prepare(
         &self,
         host: &dyn Host,
@@ -472,13 +468,11 @@ impl Layers {
         aterm_durable::durable_dir(&self.live_dir()).map_err(|e| io("flush", &self.live_dir(), &e))
     }
 
-    /// The seed ISO for `seed`, `seed/<fingerprint>.iso`, made first where it is not there:
-    /// its three files are written to a scratch directory, `hdiutil` makes the ISO beside
-    /// them, and one rename puts it in place. Every other ISO and scratch under `seed/`
-    /// is removed.
+    /// The seed ISO `seed/<fingerprint>.iso`, made in a scratch directory and renamed into
+    /// place where it is not there yet. Every other entry under `seed/` is removed.
     ///
     /// # Errors
-    /// [`Error::Io`]: the files or the ISO could not be made.
+    /// [`Error::Io`]: the files or the ISO could not be made or placed.
     pub fn seed_iso(&self, host: &dyn Host, seed: &Seed) -> Result<PathBuf, Error> {
         let dir = self.seed_dir();
         std::fs::create_dir_all(&dir).map_err(|e| io("create", &dir, &e))?;

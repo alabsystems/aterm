@@ -86,10 +86,9 @@ impl StatLine {
     }
 }
 
-/// The controlling terminal's device from `stat`'s `tty_nr`: the kernel prints its encoded
-/// device as a C `int`, so a pts minor of 2^19 or more sets the sign bit and prints negative,
-/// the same 32 bits. A field that is neither an `int` nor a `u32` is no device, and the line is
-/// malformed: never read as no terminal.
+/// The controlling terminal's device from `stat`'s `tty_nr`: the kernel prints the encoded device
+/// as a C `int`, so a pts minor of 2^19 or more prints negative and is read back as its 32 bits. A
+/// field that is neither an `int` nor a `u32` makes the line malformed, never "no terminal".
 fn tty_device(field: &str) -> Option<u32> {
     let t: i64 = field.parse().ok()?;
     u32::try_from(t)

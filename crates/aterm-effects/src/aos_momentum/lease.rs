@@ -574,7 +574,7 @@ impl Ledger {
     }
 
     /// Completes the open search when every job is claimed and no worker is draining (design
-    /// §11.5); otherwise changes nothing. Step 5 runs only after it.
+    /// §11.5); otherwise changes nothing. Design §11.3's step 5 runs only after it.
     /// # Errors
     /// [`ClockBackwards`].
     pub fn finish(&mut self, now: Nanos) -> Result<(), ClockBackwards> {

@@ -1239,9 +1239,8 @@ fn fire_on_a_light_ground_is_ink_never_light() {
                mixed: bool,
                each: &mut dyn FnMut(&CursorGlow, &[GlowQuad], u16)| {
         let (mut glow, mut out, mut text) = (CursorGlow::default(), Vec::new(), vec![' '; g.cols]);
-        // The controls' seams: the ceilings off (`unsolved`), and the
-        // roots laid as they stood before they were feathered (`coarse`,
-        // looks6 round 3).
+        // The controls' seams: the ceilings off (`unsolved`), and the roots laid in coarse
+        // slabs (`coarse`).
         glow.light_body_unsolved = unsolved;
         glow.fire_light_root_coarse = coarse;
         let mut t = Instant::now();
@@ -1396,9 +1395,8 @@ fn fire_on_a_light_ground_is_ink_never_light() {
         (4.5..20.0).contains(&mixed),
         "the light ink stays readable over visible flame on its dark cell ({mixed:.2}:1)"
     );
-    // The roots' feather's control: with the ceilings off, roots laid in
-    // the flame's coarse slabs (as before looks6 round 3) obscure the light
-    // ink the feathered roots keep clear.
+    // The roots' feather's control: with the ceilings off, roots laid in the flame's coarse
+    // slabs obscure the light ink the feathered roots keep clear.
     let uncapped_mixed = mixed_run((true, true));
     assert!(
         uncapped_mixed < 4.5,
@@ -2907,8 +2905,7 @@ fn the_dark_fire_is_never_olive() {
             for above in [None, Some(&text_above as &dyn Fn(usize) -> _)] {
                 let (glow, out) = dark_fire_burst_with(keys, gap, above, true, None, &|glow| {
                     glow.fire_core_uncooled = uncooled;
-                    // The control lays the cores where round 5 laid them,
-                    // one per tongue on its axis, on one floor.
+                    // The control lays one core per tongue on its axis, on one floor.
                     glow.fire_even_cores = uncooled;
                 });
                 let mut ink: Vec<(u16, u16)> = (start..start + keys).map(|c| (row, c)).collect();
@@ -3349,17 +3346,12 @@ fn dark_lift(p: u32) -> f32 {
         .sum()
 }
 
-/// THE KEPT FLAME RISES IN THE GAPS, NOT OVER THE LETTERS (fire dark under a
-/// line of text: one crest along the line lays a muddy haze over the letters
-/// in bands, each letter outlined dark in it). Typed as
-/// `echo the quick brown fox` under a line of text, quick and slower, over
-/// the newest eight cells and the caret's: the brightest blank cell (a
-/// word's gap, the caret's) lays at least three times the light over the
-/// baseline that the brightest letter's counters carry, every letter keeps
-/// the row's bar (6.2:1) in the composed frame, and the blaze rings no
-/// letter of the row. Negative control: laid as one crest along the line
-/// ([`CursorGlow::fire_kept_crest`]), its letters' counters carry at least
-/// half the gaps' light and the blaze rings them.
+/// Typed as `echo the quick brown fox` under a line of text, quick and slower, over the newest
+/// eight cells and the caret's: the brightest blank cell lays at least three times the light that
+/// the brightest letter's counters carry, every letter keeps the row's bar (6.2:1), and the blaze
+/// rings no letter of the row. Negative control: laid as one crest along the line
+/// ([`CursorGlow::fire_kept_crest`]), the counters carry at least half the gaps' light and the
+/// blaze rings them.
 #[test]
 fn the_kept_flame_rises_in_the_gaps_not_over_the_letters() {
     let g = tall_geom();
@@ -3414,18 +3406,12 @@ fn the_kept_flame_rises_in_the_gaps_not_over_the_letters() {
     }
 }
 
-/// UNDER A KEPT LETTER THE FLAME EASES IN OVER PIXELS (fire dark under a line
-/// of text: a hold over the letters that gives way to the air's in one pixel
-/// draws a two-pixel line of gold beads along the baseline). Typed as
-/// `echo the quick brown fox` under a line of text, quick and slower, over
-/// the newest eight cells' letters with no descender: down every pixel
-/// column under the baseline the light changes from one pixel row to the
-/// next by at most a fifth of the brightest light the flame lays in that
-/// band ([`CursorGlow::FIRE_DARK_CAP_EASE_PX`] and the roots laid a pixel a
-/// slab), and every letter keeps the row's bar. Negative control: capped
-/// hard ([`CursorGlow::fire_kept_cap_hard`]) a step of over a fifth; and
-/// laid as one crest along the line ([`CursorGlow::fire_kept_crest`], so a
-/// core under every letter) a step of half or more.
+/// Typed as `echo the quick brown fox` under a line of text, quick and slower, over the newest
+/// eight cells' letters with no descender: down every pixel column under the baseline the light
+/// changes from one pixel row to the next by at most a fifth of the band's brightest, and every
+/// letter keeps the row's bar. Negative controls: capped hard ([`CursorGlow::fire_kept_cap_hard`])
+/// a step of over a fifth; capped hard and laid as one crest ([`CursorGlow::fire_kept_crest`]) a
+/// step of half or more.
 #[test]
 fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
     let g = tall_geom();
@@ -3550,10 +3536,9 @@ fn dark_burst_on(
 
 #[test]
 fn the_air_flames_taper_from_feathered_roots() {
-    // Over the burst's newest eight letters: how many pixels the gold cores
-    // stand proud of their flames' bodies (a core past its flame read as a
-    // straight-sided column), and the share of the lit columns whose root
-    // lies within a pixel of the run's lowest (a ruler-straight floor).
+    // Over the burst's newest eight letters: how many pixels the gold cores stand proud of their
+    // flames' bodies (a core past its flame reads as a straight-sided column), and the share of
+    // the lit columns whose root lies within a pixel of the run's lowest (a ruler-straight floor).
     let shape = |keys: u16, columns: bool| -> (i32, usize, usize) {
         let (glow, g, caret) = dark_burst(keys, |glow| glow.fire_column_tongues = columns);
         let bg = DARK_PAIR.1 as i32 & 0xff;
@@ -3715,10 +3700,8 @@ fn paper_fire_runs(
 
 #[test]
 fn paper_fire_leaves_no_lone_ember_dash_on_a_lettered_row() {
-    // looks6 N2: a tongue too short to rise left its root slab as a lone
-    // dash on paper. No visible run in the typed row is at least 6 px long
-    // and at most 3 px tall, typing and cooling; the squat tongues (the
-    // negative control) leave such dashes.
+    // No visible run in the typed row is at least 6 px long and at most 3 px tall, typing and
+    // cooling; the squat tongues (the negative control) leave such lone dashes.
     let g = tall_geom();
     let mut c = cfg(GlowStyle::Fire, true);
     c.dark_theme = false;
@@ -3777,12 +3760,9 @@ fn paper_fire_leaves_no_lone_ember_dash_on_a_lettered_row() {
 
 #[test]
 fn a_paper_tongue_s_root_feathers_over_pixels_not_a_cut() {
-    // looks6 round 3 (N2): a short gap tongue's root eased over 3 px laid
-    // in the flame's 2 px slabs, and stood cut flat in two steps (`ffb875`
-    // to `fff6ee` from one pixel row to the next). Up from each lit
-    // column's lowest pixel, the first four rows rise by no more than 0.45
-    // of the column's peak a row, typing and cooling; laid coarse (the
-    // negative control) a root steps by more.
+    // Up from each lit column's lowest pixel, the first four rows rise by no more than 0.45 of
+    // the column's peak a row, typing and cooling; laid coarse (the negative control) a root
+    // steps by more.
     let g = tall_geom();
     let mut c = cfg(GlowStyle::Fire, true);
     c.dark_theme = false;
@@ -3855,10 +3835,8 @@ fn a_paper_tongue_s_root_feathers_over_pixels_not_a_cut() {
 
 #[test]
 fn a_dark_fire_keeps_its_forge_and_embers_off_a_filled_row_above() {
-    // looks6 N8: under a prompt's powerline bar (a filled row, no letters
-    // over most of it) the forge's crown lifted the bar over the caret and
-    // the embers floated over it as grit. Neither lays light on the bar;
-    // unheld (the negative control) both do.
+    // Under a prompt's powerline bar (a filled row, no letters over most of it) neither the
+    // forge's crown nor the embers lay light on the bar; unheld (the negative control) both do.
     let g = tall_geom();
     let (row, ch, cw) = (4u16, g.ch as i32, g.cw as i32);
     let bar = 0x0030_3030u32;
@@ -3921,10 +3899,8 @@ fn a_dark_fire_keeps_its_forge_and_embers_off_a_filled_row_above() {
 
 #[test]
 fn a_paper_fire_keeps_its_tongues_and_embers_off_a_filled_row_above() {
-    // looks6 round 2: on paper a tongue stopped only at a letter above, so
-    // under a prompt's dark powerline bar its tongues and embers rose onto
-    // the bar as muddy amber. The bar stops them as a letter does: its body
-    // stays bare; unheld (the negative control) the fire paints it.
+    // Under a prompt's dark powerline bar the bar stops paper fire's tongues and embers as a
+    // letter does: its body stays bare; unheld (the negative control) the fire paints it.
     let g = tall_geom();
     let (row, ch, cw) = (4u16, g.ch as i32, g.cw as i32);
     let (pair, bar) = ((0x001F_2328u32, 0x00FF_FFFFu32), 0x0033_3333u32);
@@ -4033,13 +4009,8 @@ const AIR_BURSTS: [(&str, Burst); 2] = [
 
 #[test]
 fn the_dark_air_cores_stand_apart_not_as_a_comb() {
-    // One gold core per tongue, each on its tongue's axis and its root on
-    // the air's floor, read as a row of evenly spaced beads (looks6 N8); a
-    // root lifted a pixel or two still read as one floor, and lifts drawn
-    // at random put three of the gallery `burst`'s five roots on one (its
-    // `t0`). The gallery's judges (round 3): no three neighbouring roots
-    // within 2 px of each other. Laid even (the negative control), three
-    // neighbours share a floor.
+    // No three neighbouring roots lie within 2 px of each other; laid even (the negative
+    // control), three neighbours share a floor.
     let comb = |burst: Burst, even: bool| -> (usize, Vec<i32>) {
         let (glow, g, caret) = burst(&|glow: &mut CursorGlow| glow.fire_even_cores = even);
         let roots: Vec<i32> = air_core_roots(&glow, g, caret)
@@ -4075,11 +4046,8 @@ fn the_dark_air_cores_stand_apart_not_as_a_comb() {
 
 #[test]
 fn a_dark_air_core_stands_on_its_own_flame_s_root() {
-    // looks6 round 3: lifted alone to break the comb, a core's gold root
-    // hung mid-flame, a gold stick cut off from the flame's root under it
-    // (`fire-dark-burst.t0`). The whole tongue now rises with its core: no
-    // core's root shows more than 4 px above its flame's at its x. Lifted
-    // alone (the negative control), a core stands 6 px or more above.
+    // The whole tongue rises with its core: no core's root shows more than 4 px above its
+    // flame's at its x. Lifted alone (the negative control), a core stands 6 px or more above.
     let floating = |burst: Burst, alone: bool| -> Vec<i32> {
         let (glow, g, caret) = burst(&|glow: &mut CursorGlow| glow.fire_core_lift_alone = alone);
         air_core_roots(&glow, g, caret)
@@ -4174,13 +4142,8 @@ fn burst_tan_share(cap: i32) -> f32 {
 
 #[test]
 fn the_dark_burst_burns_amber_tongues_not_a_tan_curtain() {
-    // looks6 round 3 (the judges' first must-fix): the dark burst's
-    // tongues merged into a beige-tan curtain (`fire-dark-burst.fly`,
-    // #c1964c, #c3913f, #cc9a41): the field's hottest light, a pale gold,
-    // laid thin under each tongue's feathered foot and flanks. Additive fire
-    // now stops a breath past amber: at most 2.5% of the burst's light
-    // reads tan (measured 1.3%). Up to the field's own ceiling (the negative
-    // control), 3.5% or more does (measured 4.9%).
+    // Additive fire stops a breath past amber, so at most 2.5% of the burst's light reads tan;
+    // up to the field's own ceiling (the negative control), 3.5% or more does.
     let held = burst_tan_share(aterm_render::fire_field::FIRE_ADD_IDX_MAX);
     assert!(
         held <= 0.025,
@@ -4254,13 +4217,9 @@ fn ribbon_light_on_the_bar_above(unheld: bool) -> u64 {
 
 #[test]
 fn the_rainbow_block_s_halo_keeps_off_the_prompt_bar_above() {
-    // looks6 round 3, N4: the rainbow block's halo rings laid their top
-    // bars along the foot of the powerline segment over the caret
-    // (`#cdcd00` to `#e1e92a` under `main +2` in the gallery's `context`).
-    // Held off an inked or filled row next to the caret's as the momentum
-    // glow is, the frame lays a twelfth or less there of what it laid with
-    // the rings whole (the negative control; measured a sixteenth, the rest
-    // the rings' eased edge and the ribbon's own held light).
+    // Held off an inked or filled row next to the caret's as the momentum glow is, the rainbow
+    // block's halo rings lay a twelfth or less on the powerline segment over the caret of what
+    // they lay whole (the negative control).
     let held = ribbon_light_on_the_bar_above(false);
     let whole = ribbon_light_on_the_bar_above(true);
     assert!(
@@ -4364,15 +4323,9 @@ fn dark_return_mud_under_the_printed_line(in_guard: bool) -> usize {
 
 #[test]
 fn a_dark_return_s_train_keeps_clear_of_the_letter_guard_s_reach() {
-    // looks6 round 3, N6 e120: the Return's warm segment under `quick`
-    // (`4b4721`, `5a4b2c`, `7a624c`, `693e3b`) was the letter guard's cut:
-    // shown below the printed letters' bodies, the train lay inside the
-    // guard's judge of the row's cells, which cut it there and eased it back
-    // over its feather into the prompt's row, and a warm light cut to a
-    // share of itself reads maroon, brown and olive on a dark page. Kept
-    // clear of the guard's reach, tapering to a point at its edge, the train
-    // lays a twentieth or less of the mud it laid inside it (the negative
-    // control; measured 24 against 2058).
+    // A warm light the letter guard cuts to a share of itself reads maroon, brown and olive on a
+    // dark page. Kept clear of the guard's reach and tapering to a point at its edge, the Return's
+    // train lays a twentieth or less of the mud it lays inside it (the negative control).
     let clear = dark_return_mud_under_the_printed_line(false);
     let inside = dark_return_mud_under_the_printed_line(true);
     assert!(

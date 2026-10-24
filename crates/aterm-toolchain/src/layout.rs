@@ -104,8 +104,8 @@ pub fn spotlight_exposed_builds(prefix: &Path) -> Vec<ExposedBuild> {
         let Some(program) = program_dir.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        // Resolved whole: a current build laid aside resolves to `<build>.noindex`, which is
-        // no plain build, as it is no exposed one.
+        // A current build laid aside canonicalizes to `<build>.noindex`, no plain build name,
+        // so it marks no exposed build active.
         let current = std::fs::canonicalize(program_dir.path().join("current"))
             .ok()
             .and_then(|target| {

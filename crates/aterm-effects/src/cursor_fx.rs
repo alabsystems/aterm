@@ -33,7 +33,8 @@ pub(crate) struct FloorFillMemo {
 pub struct CursorFx {
     /// The aurora — every style's light, the rainbow kitty ribbon included.
     pub glow: CursorGlow,
-    /// The cadence comet — the directional `TrailCell` body of the `comet` style (disabled for every other style).
+    /// The cadence comet: the directional `TrailCell` body of the `comet` style (disabled for
+    /// every other style).
     pub trail: CursorTrail,
     /// Typing-cadence heat: comet ignition and the rainbow/phaser block energy.
     pub cadence: TypingCadence,
@@ -43,13 +44,15 @@ pub struct CursorFx {
     pub droplet: CursorDroplet,
     /// The typing-momentum glow — every style, every shape, unless the rainbow owns the caret.
     pub momentum: MomentumHost,
-    /// The light rod — the bar shape of every style, and the emitter block of the styles with no bespoke body.
+    /// The light rod: the bar shape of every style, and the emitter block of the styles with no
+    /// bespoke body.
     pub beamrod: CursorBeamRod,
     /// The `comet` block body.
     pub comet: CursorComet,
     /// The `phaser` block body.
     pub phaser: CursorPhaser,
-    /// The additive light this tick produced — the aurora first, then every body's halo appended in tick order.
+    /// The additive light this tick produced: the aurora first, then every body's halo in tick
+    /// order.
     pub glow_scratch: Vec<GlowQuad>,
     /// Test-only: skip momentum halo warming on dark fire and light sparkle,
     /// and leave sparkle's paper caret its dark-theme colour.
@@ -59,16 +62,17 @@ pub struct CursorFx {
     /// place of [`crate::cursor_momentum::MOMENTUM_FIRE_EMBER`].
     #[cfg(test)]
     pub(crate) momentum_fire_ember: Option<u32>,
-    /// Test-only: leave the rainbow block's halo rings whole over an inked
-    /// row next to the caret's, as they were: the negative control of their
-    /// hold ([`CursorGlow::hold_off_neighbour_ink`]).
+    /// Test-only: leave the rainbow block's halo rings whole over an inked row next to the
+    /// caret's, the negative control of [`CursorGlow::hold_off_neighbour_ink`].
     #[cfg(test)]
     pub(crate) rainbow_rim_unheld: bool,
-    /// The comet cells this tick produced, projected through load shedding, brightness, and legibility.
+    /// The comet cells this tick produced, projected through load shedding, brightness, and
+    /// legibility.
     pub trail_scratch: Vec<TrailCell>,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
     pub(crate) legible_memo: Option<((u32, u32, u32), f32)>,
-    /// Memoised [`floor_block_fill`] for the last `(candidate, ground, live_cursor, pinned_cursor)`.
+    /// Memoised [`floor_block_fill`] for the last
+    /// `(candidate, ground, live_cursor, pinned_cursor)`.
     pub(crate) floor_fill_memo: Option<FloorFillMemo>,
 }
 
@@ -87,17 +91,21 @@ pub struct CursorFxInput {
     pub blink_phase: bool,
     /// The effective live cursor colour, `0x00RRGGBB`.
     pub live_cursor: u32,
-    /// Whether that colour was pinned (by config or a program's OSC 12) rather than the theme's seed.
+    /// Whether that colour was pinned (by config or a program's OSC 12) rather than the theme's
+    /// seed.
     pub cursor_color_pinned: bool,
-    /// The live default background (DECSCNM-folded), `0x00RRGGBB`: the ground every body solves its light against.
+    /// The live default background (DECSCNM-folded), `0x00RRGGBB`: the ground every body solves
+    /// its light against.
     pub default_bg: u32,
     /// The background of the cell under the caret (`0x00RRGGBB`), read from the rendered frame.
     pub cursor_cell_bg: Option<u32>,
     /// The window-space effect geometry (grid origin, frame extent).
     pub geom: Geom,
-    /// The cursor-effect focus fold (OS focus, the recording pin, the typed wake) — the `focused=` `trail status` prints.
+    /// The cursor-effect focus fold (OS focus, the recording pin, the typed wake): the `focused=`
+    /// that `trail status` prints.
     pub focused: bool,
-    /// The SOFT load-shed envelope, `0..=1`, applied after the tick to the comet's cell bed and the caret fill.
+    /// The soft load-shed envelope, `0..=1`, applied after the tick to the comet's cell bed and
+    /// the caret fill.
     pub shed_envelope: f32,
     /// The user's brightness for the comet's cell bed, `0..=1`.
     pub trail_brightness: f32,
@@ -105,9 +113,11 @@ pub struct CursorFxInput {
     pub body_allowed: bool,
     /// The user's typing-momentum glow switch (`cursor_momentum_glow`; a page's glow switch).
     pub momentum_glow: bool,
-    /// The user pinned an explicit trail colour (`cursor_trail_color`): the rod then wears it instead of the style's signature shade.
+    /// The user pinned an explicit trail colour (`cursor_trail_color`): the rod then wears it
+    /// instead of the style's signature shade.
     pub user_tinted: bool,
-    /// The user pinned an explicit accent (`cursor_trail_accent`): the lights that wear it draw it as itself.
+    /// The user pinned an explicit accent (`cursor_trail_accent`): the lights that wear it draw
+    /// it as itself.
     pub accent_pinned: bool,
 }
 
@@ -120,17 +130,20 @@ pub struct CursorFxFrame {
     pub trail_fp: u64,
     /// The comet colour the presented cells render at.
     pub trail_color: u32,
-    /// The caret body this tick resolved through the fill-precedence law and the load-shed projection.
+    /// The caret body this tick resolved through the fill-precedence law and the load-shed
+    /// projection.
     pub block_fill: Option<BlockFill>,
     /// The laser bolt owns the block: the caret's shape is `Bolt`.
     pub bolt_cursor: bool,
     /// The rainbow owns a blinking block: the shape is pinned steady.
     pub twinkle_cursor: bool,
-    /// The momentum glow is hot: this Blinking* style pinned to its Steady* twin (`None` when cold, or when the style does not blink).
+    /// The momentum glow is hot: this Blinking* style pinned to its Steady* twin (`None` when
+    /// cold, or when the style does not blink).
     pub momentum_steady: Option<CursorStyle>,
 }
 
-/// Where the streak's head attaches in its cell: a thin bar's insertion point, else the cell centre.
+/// Where the streak's head attaches in its cell: a thin bar's insertion point, else the cell
+/// centre.
 #[inline]
 #[must_use]
 pub const fn head_dx_for(style: CursorStyle) -> f32 {
@@ -305,10 +318,12 @@ pub const fn resolve_block_fill(
 /// The least WCAG contrast an effect-owned caret fill keeps against the ground under it.
 pub const CARET_PAGE_MIN_CONTRAST: f32 = 4.5;
 
-/// The margin past [`CARET_PAGE_MIN_CONTRAST`] Sparkle's gold paper caret keeps for the renderer's rounding.
+/// The margin past [`CARET_PAGE_MIN_CONTRAST`] Sparkle's gold paper caret keeps for the renderer's
+/// rounding.
 const SPARKLE_PAPER_CARET_GUARD: f32 = 0.15;
 
-/// The least WCAG contrast the comet's cell bed alone leaves a letter it lies under: the theme's ink over the bed's tint of the page.
+/// The least WCAG contrast the comet's cell bed alone leaves a letter it lies under: the theme's
+/// ink over the bed's tint of the page.
 pub const BED_INK_FLOOR: f32 = 10.0;
 
 /// Whether `glow` is the comet style drawing its own streak (its beam on).
@@ -318,7 +333,8 @@ pub const fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
     glow.beam && matches!(glow.style, GlowStyle::Comet)
 }
 
-/// Share of the comet bed's opacity at which peak alpha in `color` over `ground` keeps `ink` at [`BED_INK_FLOOR`] contrast.
+/// Share of the comet bed's opacity at which peak alpha in `color` over `ground` keeps `ink` at
+/// [`BED_INK_FLOOR`] contrast.
 #[inline]
 #[must_use]
 pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
@@ -366,7 +382,8 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     ((f32::from(lo) - 0.5).max(0.0) / f32::from(peak)).clamp(0.0, 1.0)
 }
 
-/// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness alone ([`crate::color_math::floor_contrast_keeping_hue`]).
+/// Floor an effect-owned caret fill against the page `ground` ([`caret_page_floor`]), by lightness
+/// alone ([`crate::color_math::floor_contrast_keeping_hue`]).
 #[inline]
 #[must_use]
 pub fn floor_block_fill(
@@ -392,7 +409,8 @@ pub fn floor_block_fill(
     }
 }
 
-/// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], the rainbow kitty's paper caret's too.
+/// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], the
+/// rainbow kitty's paper caret's too.
 #[inline]
 #[must_use]
 pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
@@ -491,7 +509,8 @@ impl GlowSpelling {
 /// The numeric knobs of the cursor family's config.
 #[derive(Clone, Copy, Debug)]
 pub struct GlowKnobs {
-    /// Whether the trail may draw at all (Serious Mode folded in by the host; the style decides the rest).
+    /// Whether the trail may draw at all (Serious Mode folded in by the host; the style decides
+    /// the rest).
     pub enabled: bool,
     /// An explicit trail colour; `None` takes the style's default.
     pub color: Option<u32>,
@@ -538,7 +557,8 @@ pub const fn brighten(color: u32, factor: f32) -> u32 {
         | channel(color, 0, factor)
 }
 
-/// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose automatic colour is the cursor's.
+/// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose automatic colour is the
+/// cursor's.
 #[inline]
 #[must_use]
 pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
@@ -554,7 +574,8 @@ pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
     }
 }
 
-/// Whether an AUTOMATIC glow colour (no explicit `cursor_trail_color`) takes the live cursor colour this frame.
+/// Whether an automatic glow colour (no explicit `cursor_trail_color`) takes the live cursor
+/// colour this frame.
 #[inline]
 #[must_use]
 pub const fn glow_color_follows_live_cursor(style: GlowStyle, cursor_color_pinned: bool) -> bool {
@@ -649,7 +670,8 @@ pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str>
     }
 }
 
-/// The colour `style` draws when `cursor_trail_color` is unset and it does not follow the cursor, with its plain name.
+/// The colour `style` draws when `cursor_trail_color` is unset and it does not follow the cursor,
+/// with its plain name.
 #[inline]
 #[must_use]
 pub const fn own_trail_color(
@@ -668,7 +690,8 @@ pub const fn own_trail_color(
     Some((color, name))
 }
 
-/// What an unset `cursor_trail_color` draws for `style`'s trail on a block, by name, where that is not the live cursor's colour.
+/// What an unset `cursor_trail_color` draws for `style`'s trail on a block, by name, where that is
+/// not the live cursor's colour.
 #[inline]
 #[must_use]
 pub const fn trail_color_default_name(
@@ -726,7 +749,8 @@ impl TrailColor {
     /// The word for the cursor's colour in a trail colour setting.
     pub const CURSOR_WORD: &'static str = "cursor";
 
-    /// A trail colour setting as written (native `cursor_trail_color`, a page's `set_cursor_glow_color`).
+    /// A trail colour setting as written (native `cursor_trail_color`, a page's
+    /// `set_cursor_glow_color`).
     #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
@@ -743,7 +767,8 @@ impl TrailColor {
         }
     }
 
-    /// An explicit colour where one is given, else [`Self::Automatic`]: a colour knob that cannot say "the cursor's".
+    /// An explicit colour where one is given, else [`Self::Automatic`]: a colour knob that cannot
+    /// say "the cursor's".
     #[inline]
     #[must_use]
     pub const fn automatic_or_pinned(color: Option<u32>) -> Self {
@@ -774,7 +799,8 @@ impl TrailColor {
         }
     }
 
-    /// Whether a colour was chosen at all: the rod wears it ([`CursorFxInput::user_tinted`]) and Classic draws its one-colour face.
+    /// Whether a colour was chosen at all: the rod wears it ([`CursorFxInput::user_tinted`]) and
+    /// Classic draws its one-colour face.
     #[inline]
     #[must_use]
     pub const fn chosen(self) -> bool {
@@ -834,7 +860,8 @@ const fn is_block(style: CursorStyle) -> bool {
 }
 
 impl CursorFx {
-    /// The per-frame preamble, before the host feeds the glow engine its row probe, print anchor and delivered inserts.
+    /// The per-frame preamble, before the host feeds the glow engine its row probe, print anchor
+    /// and delivered inserts.
     #[inline]
     pub fn begin(&mut self, live_viewport: bool, animate: bool) {
         if !live_viewport {
@@ -854,7 +881,8 @@ impl CursorFx {
         self.cadence = TypingCadence::default();
     }
 
-    /// The caret's coordinate space was replaced (re-grid, new owner, alternate screen swap, torn frame).
+    /// The caret's coordinate space was replaced (re-grid, new owner, alternate screen swap, torn
+    /// frame).
     #[inline]
     pub fn retire_body_geometry(&mut self) {
         self.trail.reset();
@@ -898,7 +926,8 @@ impl CursorFx {
         self.trail.reset();
     }
 
-    /// Any body (not the aurora, not the comet) still animating — the part of the scheduler's frame-cadence set this step owns.
+    /// Any body (not the aurora, not the cadence comet) still animating: the part of the
+    /// scheduler's frame-cadence set this step owns.
     #[inline]
     #[must_use]
     pub fn bodies_active(&self) -> bool {
@@ -910,7 +939,8 @@ impl CursorFx {
             || self.phaser.is_active()
     }
 
-    /// A body that still owes frames but not the frame cadence, once its fingerprint stops moving frame to frame.
+    /// A body that still owes frames but not the frame cadence, once its fingerprint stops moving
+    /// frame to frame.
     #[inline]
     #[must_use]
     pub fn bodies_settling(&self) -> bool {
@@ -941,7 +971,8 @@ impl CursorFx {
         }
     }
 
-    /// The frame step: the aurora, then every block body off the aurora's post-tick state, then the comet, then the caret's one owner.
+    /// The frame step: the aurora, then every block body off the aurora's post-tick state, then
+    /// the comet, then the caret's one owner.
     #[inline]
     pub fn tick(
         &mut self,
@@ -1016,11 +1047,9 @@ impl CursorFx {
         );
         let twinkle_cursor = rainbow_frame.fill.is_some() && rainbow_cfg.blinking;
         let rainbow_owns_caret = rainbow_frame.fill.is_some();
-        // On a dark page the block's halo rings keep off an inked or filled
-        // row next to the caret's, as the momentum glow does: their top
-        // bars lay the caret's light along the foot of a prompt's powerline
-        // segment over it (looks6 round 3, N4: `#cdcd00` to `#e1e92a` under
-        // `main +2`).
+        // On a dark page the block's halo rings keep off an inked or filled row next to the
+        // caret's, as the momentum glow does: their top bars would lay the caret's light along
+        // the foot of a prompt's powerline segment above it.
         #[cfg(test)]
         let rim_held = !self.rainbow_rim_unheld;
         #[cfg(not(test))]
@@ -1036,11 +1065,13 @@ impl CursorFx {
             0
         };
         let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23) ^ rim_print.rotate_left(29);
+        let blaze = self.glow.blaze();
+        let beam_hue = self.glow.beam_hue();
         let body_from = self.glow_scratch.len();
         let droplet_frame = self.droplet.tick(
             cur,
             now,
-            self.glow.blaze(),
+            blaze,
             geom,
             &DropletConfig {
                 enabled: matches!(glow_cfg.style, GlowStyle::Water) && rainbow_block,
@@ -1075,9 +1106,9 @@ impl CursorFx {
         let warm = !self.momentum_unwarmed;
         #[cfg(not(test))]
         let warm = true;
-        // Sparkle's caret on paper is its paper gold deepened in its hue, not
-        // its dark-theme peach, which deepens to a mustard brown beside the
-        // gold its puff wears. A colour the user chose is its own.
+        // Sparkle's caret on paper is its paper gold deepened in its hue, not its dark-theme
+        // peach, which deepens to a mustard brown beside the gold its puff wears. A colour the
+        // user chose is its own.
         let sparkle_paper_rod = (warm
             && !dark
             && !tinted
@@ -1086,8 +1117,7 @@ impl CursorFx {
         .then(|| crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0));
         let (rod_color, rod_haze) = match glow_cfg.style {
             GlowStyle::Beam => (glow_cfg.color, aterm_render::BEAM_SPACE_HAZE),
-            GlowStyle::Sparkle if sparkle_paper_rod.is_some() => {
-                let gold = sparkle_paper_rod.unwrap_or(glow_cfg.color);
+            GlowStyle::Sparkle if let Some(gold) = sparkle_paper_rod => {
                 (gold, (gold >> 1) & 0x007F_7F7F)
             }
             GlowStyle::Water if !tinted => (0x0032_DCDE, 0x000E_66B4),
@@ -1095,9 +1125,9 @@ impl CursorFx {
             GlowStyle::RainbowKitty if !tinted => (0x00FF_66CC, 0x0046_1E64),
             GlowStyle::Phaser if !tinted => {
                 let hue = if dark {
-                    self.glow.beam_hue()
+                    beam_hue
                 } else {
-                    crate::color_math::light_spectrum_hue(self.glow.beam_hue())
+                    crate::color_math::light_spectrum_hue(beam_hue)
                 };
                 let c = crate::cursor_glow::hsv2rgb(hue, 0.75, 0.95);
                 (c, (c >> 1) & 0x007F_7F7F)
@@ -1114,13 +1144,7 @@ impl CursorFx {
         // charge are the paper gold its body wears, not the peach of its
         // dark-theme colour, which deepens to brown (looks6 N7). A pinned
         // cursor colour or the user's own trail colour is never recoloured.
-        let sparkle_paper_gold = (warm
-            && glow_cfg.enabled
-            && !dark
-            && !tinted
-            && !f.cursor_color_pinned
-            && matches!(glow_cfg.style, GlowStyle::Sparkle))
-        .then(|| crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0));
+        let sparkle_paper_gold = sparkle_paper_rod.filter(|_| glow_cfg.enabled);
         self.momentum.set_light_vivid(sparkle_paper_gold.is_some());
         let momentum_frame = self.momentum.tick(
             cur,
@@ -1136,7 +1160,9 @@ impl CursorFx {
                 hue: if !glow_cfg.enabled {
                     f.live_cursor & 0x00FF_FFFF
                 } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
-                    crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
+                    sparkle_paper_rod.unwrap_or_else(|| {
+                        crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
+                    })
                 } else {
                     rod_color
                 },
@@ -1187,7 +1213,6 @@ impl CursorFx {
             })
             .filter(|s| *s != f.cursor_style);
         let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53) ^ held_print.rotate_left(31);
-        let blaze = self.glow.blaze();
         let body_from = self.glow_scratch.len();
         let comet_frame = self.comet.tick(
             cur,
@@ -1218,7 +1243,7 @@ impl CursorFx {
         let phaser_frame = self.phaser.tick(
             cur,
             now,
-            self.glow.beam_hue(),
+            beam_hue,
             energy,
             dark,
             geom,
@@ -1288,7 +1313,7 @@ impl CursorFx {
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
             && matches!(glow_cfg.style, GlowStyle::Laser);
-        let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, self.glow.blaze(), dark));
+        let bolt_fill = bolt_cursor.then(|| bolt_body(glow_cfg.color, blaze, dark));
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
         if trail_cfg.enabled {
             crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);

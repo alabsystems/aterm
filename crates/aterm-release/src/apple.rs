@@ -145,11 +145,10 @@ enum OnDisk {
 
 /// What a read-only run says of this machine's Apple state, given the valid identities, the
 /// request key, the folder the operator named (`cert_dir`), and what the watched folders hold
-/// for that key ([`OnDisk`]). A current certificate for the key there (the secrets vault fills
-/// both on every Mac) that provision can make an identity, by importing it or the certificate
-/// that issued it, is a step for whoever runs provision, not the owner's errand at Apple; one
-/// the keychain already holds with its issuer and still refuses is. A folder or key it could
-/// not read stops it as it stops a real run.
+/// for that key. A certificate for the key that provision can make an identity, by importing
+/// it or its issuer, is a step for whoever runs provision; one the keychain holds with its
+/// issuer and still refuses is the owner's errand at Apple. A folder or key it could not read
+/// stops it as it stops a real run.
 fn read_only(
     id: &str,
     identities: Vec<String>,
@@ -217,7 +216,8 @@ fn read_only(
     }
 }
 
-/// The driver: it reads the world, and only one branch creates anything.
+/// The driver: it re-reads the world each run, and only a confirmed [`generate`] makes a new
+/// key.
 pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -870,7 +870,8 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     }
 }
 
-/// Run 1: an RSA-2048 keypair and a CSR, both born here.
+/// A first run's RSA-2048 key and CSR, both made here; existing key material is never
+/// overwritten.
 fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Err(Outcome::Blocked {
@@ -1112,8 +1113,8 @@ struct Look {
 }
 
 /// [`Look`] at the watched folders, given the SHA-1s of the identities the keychain does not
-/// trust (`invalid`), with a certificate still good `secs` from now and the keychain's copy of
-/// the certificate that issued a PEM leaf read by `issuer`.
+/// trust (`invalid`), how long a certificate must stay good (`secs`), and `issuer`, which
+/// finds the keychain's copy of a PEM leaf's issuer.
 fn look(
     key: &Path,
     watch: &Watch,
@@ -1957,12 +1958,9 @@ fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>
 mod tests {
     use super::*;
 
-    /// A read-only look at a Mac whose request key's certificate is already on disk (the
-    /// secrets vault fills both) names provision as the step, an operator's, with the folder
-    /// the operator named, when provision can make it an identity: by importing it, or the
-    /// certificate that issued it. A certificate the keychain holds with its issuer and still
-    /// refuses, a key with no current certificate, and no key are the owner's errand at Apple,
-    /// and the refused one is named, with provision run on the same folder.
+    /// A read-only look names provision, with the operator's folder, as the step when it can
+    /// make the on-disk certificate an identity; a refused certificate (named), no current one,
+    /// or no key is the owner's errand at Apple, and a folder or key it could not read blocks.
     #[test]
     fn a_key_whose_certificate_is_on_disk_is_provisions_step_not_an_errand() {
         let key = Path::new("/nonexistent/devid-m9.key");
@@ -2037,12 +2035,9 @@ mod tests {
         }
     }
 
-    /// A current certificate for the key in a watched folder is unimported while no identity
-    /// the keychain refuses is that certificate, unchained once one is and its issuer is not in
-    /// the keychain (this one's issuer is itself, no Developer ID authority), and refused when
-    /// its issuer is; one past a horizon, or for another key, is nothing. A refused or ended one
-    /// is passed over for another certificate for the key, the one provision's wait installs,
-    /// and the first refused is named when every one is refused.
+    /// A certificate on disk is judged by its key, its expiry and the keychain; a refused or
+    /// expired one is passed over for another for the key, and the first refused is named when
+    /// every one is refused.
     #[test]
     fn a_certificate_on_disk_is_judged_by_its_key_its_end_and_the_keychain() {
         let scratch = aterm_tempfile::tempdir().expect("tempdir");

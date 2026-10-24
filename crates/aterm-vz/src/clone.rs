@@ -146,9 +146,7 @@ mod tests {
         l2p.devoffset
     }
 
-    /// A clone shares its source's blocks on the device until one side writes, which is
-    /// what makes a 60 GiB disk cost what the guest writes. NEGATIVE CONTROL: a byte copy
-    /// of the same file, mode kept, lies elsewhere on the device.
+    /// The negative control is a byte copy of the same file.
     #[test]
     fn a_clone_shares_its_sources_blocks_and_a_copy_does_not() {
         use std::io::Write as _;

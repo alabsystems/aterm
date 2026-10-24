@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`aterm_zstd::encode`] held to the reference decoder: the zstd CLI (its
-//! `aterm_uds::host::TOOLS` row) tests and decompresses every frame the encoder writes
-//! for the generated and recorded inputs, and refuses our frames damaged. Without the
-//! CLI the test ends COULD NOT RUN.
+//! `aterm_uds::host::TOOLS` row) tests and decompresses the encoder's frames of the
+//! generated inputs, and refuses them damaged. Without the CLI the test ends COULD NOT RUN.
 
 use std::path::{Path, PathBuf};
 
@@ -17,8 +16,8 @@ fn cli() -> PathBuf {
     aterm_uds::host::need_tool("zstd")
 }
 
-/// `zstd -q -t <file>` passes, and `zstd -q -d -c <file>` writes `want`; or, for a
-/// damaged frame, both refuse it.
+/// Whether `zstd -q -t <file>` passes, and what `zstd -q -d -c <file>` writes (`None` when
+/// it fails).
 fn judged(zstd: &Path, file: &Path) -> (bool, Option<Vec<u8>>) {
     let tested = aterm_uds::spawnfd::command(zstd)
         .args(["-q", "-t"])
@@ -36,7 +35,7 @@ fn judged(zstd: &Path, file: &Path) -> (bool, Option<Vec<u8>>) {
     )
 }
 
-/// Every corpus frame at five configurations passes `zstd -t` and `zstd -d` gives its
+/// Every corpus frame at eight configurations passes `zstd -t` and `zstd -d` gives its
 /// input back; the frames the CLI judged carry every width of the sequence count.
 #[test]
 fn the_zstd_cli_decodes_every_frame_the_encoder_writes() {
@@ -53,6 +52,9 @@ fn the_zstd_cli_decodes_every_frame_the_encoder_writes() {
             (1, None, Checksum::Xxh64, Feed::OneShot),
             (3, None, Checksum::Omitted, Feed::OneShot),
             (19, None, Checksum::Xxh64, Feed::OneShot),
+            // A lazy level matches every word of `many_sequences`' last block: more sequences
+            // than a two-byte count holds, which the parse by price would split into parts.
+            (12, None, Checksum::Omitted, Feed::OneShot),
             (
                 7,
                 Some(11),
@@ -64,6 +66,21 @@ fn the_zstd_cli_decodes_every_frame_the_encoder_writes() {
                 None,
                 Checksum::Xxh64,
                 Feed::Flushed(if big { 200_000 } else { 1000 }),
+            ),
+            // The parse by price without fractional prices (level 19's is above).
+            (
+                17,
+                None,
+                Checksum::Omitted,
+                Feed::Chunks(if big { 131_072 } else { 4096 }),
+            ),
+            // The producer's packs: level 19 streamed at the widest window, whose long
+            // matches past the tree come from anchors.
+            (
+                19,
+                Some(27),
+                Checksum::Xxh64,
+                Feed::Chunks(if big { 100_000 } else { 1000 }),
             ),
         ] {
             jobs.push((i, name.clone(), level, window_log, checksum, feed));
@@ -103,13 +120,12 @@ fn the_zstd_cli_decodes_every_frame_the_encoder_writes() {
     );
 }
 
-/// The far end of the format held to the CLI: frames of the largest window this encoder
+/// The far end of the format held to the CLI: frames at the largest window this encoder
 /// writes (2^27, `Window_Descriptor` exponent 17, RFC 8878 §3.1.1.1.2) with matches of
-/// offset codes 24 to 27, written in one call (the content size declared beside the
-/// descriptor) and streamed, with and without flushes. Each far copy is matched: the
-/// frame is the 16 KiB of noise, a 4-byte RLE block per 128 KiB of zeros and a little
-/// more, where one copy missed would add its 4 KiB of noise again as literals; the
-/// control, under a 2^26 window, misses the two copies past it by that much.
+/// offset codes 24 to 27, written in one call and streamed, with and without flushes.
+/// Every far copy is matched: the frame is about the 16 KiB of noise and a 4-byte RLE block
+/// per 128 KiB of zeros, and a missed copy adds its 4 KiB of noise as literals; the
+/// control, under a 2^26 window, misses the two copies past it.
 #[test]
 fn the_zstd_cli_decodes_frames_at_the_largest_window() {
     let zstd = cli();
@@ -146,9 +162,8 @@ fn the_zstd_cli_decodes_frames_at_the_largest_window() {
         );
         std::fs::remove_file(&file).expect("remove the frame");
     });
-    // The control on the bound: under a 2^26 window the two farthest copies are out of
-    // reach, and their noise is in the frame again. That frame (exponent 16, offset codes
-    // 24 and 25) is the CLI's too.
+    // The control on the bound: the two farthest copies' noise is back in the frame, which
+    // the CLI decodes too (exponent 16, offset codes 24 and 25).
     let near = write_frame(
         &input,
         Options::new().level(1).window_log(26),
@@ -208,4 +223,58 @@ fn the_zstd_cli_refuses_our_frames_damaged() {
             "{what}: our decoder decoded it"
         );
     }
+}
+
+/// The acceptance bar of the producer's encoder (docs/DESIGN-init-system-2026-10-20.md,
+/// row 18): level 19 at its own window (2^23, `zstd -19`'s) makes frames within 3% of what
+/// `zstd -19 --single-thread` makes of the same input, here on archive-shaped inputs (a
+/// toolchain-like mix with far copies, source-like text, and a pattern with one-byte
+/// inserts). Both frames declare the content size and carry the checksum. The control:
+/// level 9, a lazy parse, misses that bar on every one of them, so it is a bar a weaker
+/// parse fails.
+#[test]
+fn level_19_stays_within_3_percent_of_zstd_19() {
+    let zstd = cli();
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-zstd-encode-cli-ratio")
+        .tempdir()
+        .expect("scratch");
+    let inputs = [
+        ("mixed:2m", crate::support::mixed(2 << 20, 11)),
+        ("words:1m", crate::support::words(1 << 20, 12)),
+        ("inserts:300k", crate::support::inserts(300_000, 9)),
+    ];
+    let within = |ours: usize, theirs: usize| ours * 100 <= theirs * 103;
+    on_every_core(&inputs, |(name, input)| {
+        let file = dir.path().join(name.replace(':', "_"));
+        std::fs::write(&file, input).expect("write the input");
+        let cli = aterm_uds::spawnfd::command(&zstd)
+            .args(["-q", "-19", "--single-thread", "-c"])
+            .arg(&file)
+            .output()
+            .unwrap_or_else(|e| panic!("{}: {e}", zstd.display()));
+        assert!(
+            cli.status.success(),
+            "{name}: zstd -19: {}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let theirs = cli.stdout.len();
+        let at = |level| {
+            aterm_zstd::compress(
+                input,
+                &Options::new().level(level).checksum(Checksum::Xxh64),
+            )
+            .len()
+        };
+        let (ours, lazy) = (at(19), at(9));
+        assert!(
+            within(ours, theirs),
+            "{name}: level 19 made {ours} B, zstd -19 {theirs} B (+{:.2}%)",
+            (ours as f64 / theirs as f64 - 1.0) * 100.0
+        );
+        assert!(
+            !within(lazy, theirs),
+            "{name}: the control, level 9, made {lazy} B, within 3% of zstd -19's {theirs} B"
+        );
+    });
 }

@@ -236,15 +236,15 @@ pub struct Live {
     pub stamp: WallStamp,
     /// When it was posted.
     pub posted_at: Instant,
-    /// When the work began.
+    /// When the work began: the post, kept across a supersede by key while the activity stays.
     pub started_at: Instant,
     /// Bumped by every restate.
     pub revision: u32,
     /// The current action list's version.
     action_revision: Option<u64>,
-    /// Duplicate posts folded.
+    /// Duplicate posts folded into it.
     pub repeats: u32,
-    /// `None` while queued.
+    /// When the row reached the glass, where its hold anchors; `None` while queued.
     pub on_glass_since: Option<Instant>,
     /// Default/For/Ask rows: `None` until first glass.
     pub fold_at: Option<Instant>,
@@ -259,15 +259,15 @@ pub struct Live {
     pub seen: bool,
     /// The last capsule pressed.
     pub acted: Option<(ActionIndex, Instant)>,
-    /// Eligible for the glass.
+    /// Eligible for the glass: false inside the progress grace.
     pub revealed: bool,
     /// When an unrevealed row becomes eligible.
     pub reveal_at: Option<Instant>,
-    /// The latest a held-back reveal may wait.
+    /// The latest a held-back reveal may wait to: its grace's end plus [`REVEAL_DEFER_MAX`].
     reveal_cap: Option<Instant>,
-    /// The motion epoch.
+    /// The motion epoch: set when the row reaches the glass, reset when its activity changes.
     pub motion_since: Option<Instant>,
-    /// The eta estimator, fed while the meter carries an amount.
+    /// The ETA estimator, fed while the meter carries an amount.
     pub track: ProgressTrack,
     /// The declared heavy load, and when it began.
     pub load: Option<(Load, Instant)>,
@@ -444,7 +444,7 @@ impl Live {
         }
     }
 
-    /// A duplicate of `msg`.
+    /// Whether this row duplicates `msg`.
     pub(crate) fn duplicates(&self, msg: &Message) -> bool {
         let owner = |m: &Message| m.origin.wire_owned(m.key.as_deref());
         if owner(&self.msg) != owner(msg) {
@@ -531,7 +531,7 @@ pub enum PostOutcome {
     Suppressed,
 }
 
-/// What one family pass ([`MessageCenter::sync_digest`]).
+/// What one family pass did ([`MessageCenter::sync_digest`]).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DigestSync {
     /// Entries that were not open and now are.
@@ -665,7 +665,8 @@ impl MessageCenter {
         }
     }
 
-    /// The display's frame period.
+    /// Set the display's frame period, which glides and echoes are read on while in flight:
+    /// clamped to 240 Hz at the fastest and [`ANIM_FRAME`] at the slowest.
     pub fn set_refresh(&mut self, period: Duration) {
         self.refresh = period.clamp(Duration::from_micros(4_167), ANIM_FRAME);
     }
@@ -963,7 +964,9 @@ impl MessageCenter {
         fixed
     }
 
-    /// Close one record that already left the glass as fixed by name.
+    /// Close as fixed, in the words `fixed`, one record that already left the glass, at `wall` but
+    /// never before it first retired. `false` and nothing written for a live row, an open
+    /// exception, empty words, or a record already resolved, answered, superseded or carried.
     pub fn fix_record(
         &mut self,
         id: MessageId,
@@ -1268,7 +1271,8 @@ impl MessageCenter {
         true
     }
 
-    /// Aterm is quitting.
+    /// Aterm is quitting: every open row retires [`Retired::Quit`] with no echo (there is no next
+    /// frame). Returns how many rows it closed.
     pub fn quit(&mut self, now: Instant) -> usize {
         let mut closed = 0;
         while !self.live.is_empty() {
@@ -1325,7 +1329,7 @@ impl MessageCenter {
         true
     }
 
-    /// The row was read.
+    /// The row was read: a Default, For or Standing row folds now; Live and Ask rows stay.
     pub fn mark_seen(&mut self, id: MessageId, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
@@ -1342,7 +1346,8 @@ impl MessageCenter {
         true
     }
 
-    /// A queued row nobody could have seen waits.
+    /// Restart the patience of a queued row nobody could have seen: it waits a whole span from
+    /// `now`.
     pub fn restart_patience(&mut self, id: MessageId, now: Instant) -> bool {
         let Some(row) = self.live.iter_mut().find(|l| l.id == id && l.is_queued()) else {
             return false;
@@ -1392,7 +1397,9 @@ impl MessageCenter {
         self.act(id, action, now)
     }
 
-    /// Reveal the rows whose grace.
+    /// Reveal the rows whose grace is over, show the load words that have lasted, retire what is
+    /// due (folds only when `holds`: a handoff freeze suspends them, never staleness or patience),
+    /// end the echoes that are over, and re-rank the queue.
     pub fn settle(&mut self, now: Instant, holds: bool) -> Settled {
         let before = self.glass_signature();
         let mut revealed = false;
@@ -2760,7 +2767,7 @@ impl MessageCenter {
         Some(intent)
     }
 
-    /// The cause ended.
+    /// Resolve every digest exception under `prefix` as `outcome`: its cause ended.
     pub fn resolve_digest_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
         self.end_digest_prefix(prefix, &Retired::Resolved(outcome), now)
     }

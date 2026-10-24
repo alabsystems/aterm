@@ -1,0 +1,441 @@
+schema = 2
+
+[[windows]]
+rows = 30
+cols = 100
+active_tab = 0
+outer_x = 96
+outer_y = 48
+inner_px = [700, 420]
+active_item = 0
+
+[windows.show]
+fullscreen = false
+minimized = false
+z_order = 0
+key = true
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev"
+title = "ssh"
+focused = true
+local_id = 0
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src"
+title = "vim"
+focused = true
+local_id = 1
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "imgcat"
+focused = true
+local_id = 2
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "cat"
+focused = true
+local_id = 3
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev"
+title = "screen"
+focused = true
+local_id = 4
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "tmux"
+focused = true
+local_id = 5
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "img2sixel"
+focused = true
+local_id = 6
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev"
+title = "mc"
+focused = true
+local_id = 7
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "htop"
+focused = true
+local_id = 8
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev"
+title = "zsh"
+focused = true
+local_id = 9
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev"
+title = "vt52-menu"
+focused = true
+local_id = 10
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/notes"
+title = "zsh"
+focused = true
+local_id = 11
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 12
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 13
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+focused = true
+local_id = 14
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+focused = true
+local_id = 15
+
+[[windows.tabs]]
+kind = "leaf"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+focused = true
+local_id = 16
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 0
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 1
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 2
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 3
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 4
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 5
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 6
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 7
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 8
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 9
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 10
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 11
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 12
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 13
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 14
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 15
+
+[[windows.tab_order]]
+kind = "terminal"
+index = 16
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "ssh"
+local_id = 0
+sid = "s-00000000010000000000"
+log_ep = 1792853148
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src"
+title = "vim"
+local_id = 1
+sid = "s-00000000010000010101"
+log_ep = 1792853149
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "imgcat"
+local_id = 2
+sid = "s-00000000010000020202"
+log_ep = 1792853150
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "cat"
+local_id = 3
+sid = "s-00000000010000030303"
+log_ep = 1792853151
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "screen"
+local_id = 4
+sid = "s-00000000010000040404"
+log_ep = 1792853152
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "tmux"
+local_id = 5
+sid = "s-00000000010000050505"
+log_ep = 1792853153
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "img2sixel"
+local_id = 6
+sid = "s-00000000010000060606"
+log_ep = 1792853154
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "mc"
+local_id = 7
+sid = "s-00000000010000070707"
+log_ep = 1792853155
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "htop"
+local_id = 8
+sid = "s-00000000010000080808"
+log_ep = 1792853156
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "zsh"
+local_id = 9
+sid = "s-00000000010000090909"
+log_ep = 1792853157
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev"
+title = "vt52-menu"
+local_id = 10
+sid = "s-000000000100000a0a0a"
+log_ep = 1792853158
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/notes"
+title = "zsh"
+local_id = 11
+sid = "s-000000000100000b0b0b"
+log_ep = 1792853159
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 12
+sid = "s-000000000100000c0c0c"
+log_ep = 1792853160
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 13
+sid = "s-000000000100000d0d0d"
+log_ep = 1792853161
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 14
+sid = "s-000000000100000e0e0e"
+log_ep = 1792853162
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 15
+sid = "s-000000000100000f0f0f"
+log_ep = 1792853163
+
+[[windows.restored_tabs]]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "leaf"
+
+[windows.restored_tabs.root.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 16
+sid = "s-00000000010000101010"
+log_ep = 1792853164

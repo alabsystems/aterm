@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `WakeBook` and `WakeRoom`: each proved at `Buggy = 0` in every configuration it declares (the
-//! book under `prompt`, `observe`, a managed worker and an unhosted session), each law broken by
-//! the mutant written to break it with every other mutant removed, each liveness mutant's
-//! invariant twin among them, and walked along the paths the design names: an edge latched
-//! through a false level, an answer heard, an unheard answer retold once, a failed reply, a
-//! crash mid-write, an expiry under a teller's hold, and the room's oldest-first reservation, a
-//! holder's re-ask and a lapse. Tier-1 is `aterm-agent/tests/conformance_wakes.rs` (the book)
-//! and `aterm-gui`'s `occupancy_host::conformance` (the room).
-//!
-//! The non-vacuity sweep and the audits of `AParkedWaitIsAnswered` and `TheReservationEnds` are
-//! `aterm-models`' `non_vacuity` (the models and their liveness register themselves), not
-//! repeated here.
+//! Tier 0 of `WakeBook` and `WakeRoom`: each holds at `Buggy = 0` in every configuration it
+//! declares, each law breaks under its own mutant alone, each liveness mutant has an invariant
+//! twin, and walks follow the paths the design names. Tier 1 is
+//! `aterm-agent/tests/conformance_wakes.rs` (the book) and `aterm-gui`'s
+//! `occupancy_host::conformance` (the room). The non-vacuity sweep and the liveness audits are
+//! `aterm-models`' `non_vacuity`.
 
 use aterm_models_harness::{
     wake_book_liveness, wake_book_model, wake_room_liveness, wake_room_model,
@@ -66,7 +60,7 @@ const ROOM_MUTANTS: [(&str, i64, &str, Config); 5] = [
     ("CountOwn", 5, "AHolderIsNeverRefused", &[]),
 ];
 
-/// The most states any configuration of either model reaches, at any dial.
+/// A bound on the states any configuration of either model reaches, at any dial.
 const STATE_BOUND: usize = 50_000;
 
 fn book(config: Config) -> Model {
@@ -203,8 +197,8 @@ fn then(more: &[&'static str]) -> Vec<&'static str> {
     [&READY[..], more].concat()
 }
 
-/// AN EDGE LATCHES: a file made and gone between two looks makes the wake ready though its level
-/// reads false; read only by level, the edge is missed.
+/// A file made and gone between two looks makes the wake ready though its level reads false;
+/// read only by level, the edge is missed.
 #[test]
 fn an_edge_latches_through_a_false_level() {
     let m = book(&[]);
@@ -218,9 +212,8 @@ fn an_edge_latches_through_a_false_level() {
     assert!(!level.check_invariant("NoMissedEdge", &missed));
 }
 
-/// AN AWAIT IS ANSWERED ONCE: a parked wait on a ready wake whose need holds is answered, its
-/// reply written, and told once the loop sees a turn run after it; a told wake is claimed by no
-/// door. Unhosted, the written answer is told at once.
+/// A parked wait on a ready wake whose need holds is answered once, and told once the loop sees
+/// a turn run after it; no door claims a told wake. Unhosted, the answer is told at once.
 #[test]
 fn an_await_is_answered_once_and_heard() {
     let m = book(&[]);
@@ -248,8 +241,7 @@ fn an_await_is_answered_once_and_heard() {
     assert_eq!(told["st"], 6);
 }
 
-/// AN UNHEARD ANSWER is retold once by a door under `prompt`; heard, it is not; retold after it
-/// was heard, the line breaks its law.
+/// An unheard answer is retold once by a door under `prompt`; a heard one is not.
 #[test]
 fn an_unheard_answer_is_retold_once_by_a_door() {
     let m = book(&[]);
@@ -277,8 +269,8 @@ fn an_unheard_answer_is_retold_once_by_a_door() {
     assert_eq!(released["st"], 4, "back to answered, not to ready");
 }
 
-/// A FAILED REPLY leaves the wake ready for the next answer, never lost; recorded answered before
-/// its write, the answer is lost.
+/// A failed reply leaves the wake ready for the next answer; recorded answered before its write,
+/// the answer is lost.
 #[test]
 fn a_failed_reply_leaves_the_wake_ready() {
     let m = book(&[]);
@@ -290,8 +282,8 @@ fn a_failed_reply_leaves_the_wake_ready() {
     assert!(!early.check_invariant("NoLostAnswer", &lost));
 }
 
-/// A CRASH MID-WRITE: an intent row with no outcome releases the claim, and the one retell goes;
-/// a typed row makes it told. Released after a typed row, the retell breaks the law.
+/// A crash mid-write (an intent row with no outcome) releases the claim for its one retell; a
+/// typed row makes the wake told.
 #[test]
 fn a_crash_mid_write_retells_once() {
     let m = book(&[]);
@@ -319,7 +311,7 @@ fn a_crash_mid_write_retells_once() {
     assert!(!wrong.check_invariant("OneTypedLine", &twice));
 }
 
-/// UNDER `observe` an await is still answered and no line is typed; a managed worker and an
+/// Under `observe` an await is still answered and no line is typed; a managed worker and an
 /// unhosted session type none either.
 #[test]
 fn observe_answers_and_types_nothing() {
@@ -341,8 +333,8 @@ fn observe_answers_and_types_nothing() {
     assert!(!typed.check_invariant("NothingTypedUnderObserve", &wrong));
 }
 
-/// AN EXPIRY ENDS a wake a teller holds as any other: answering or claimed, it is gone; answered,
-/// it is told by its answer. Gone, nothing tells it.
+/// An expiry ends a held wake: answering or claimed, it is gone; answered, it is told by its
+/// answer. Nothing tells a gone wake.
 #[test]
 fn an_expiry_ends_a_held_wake() {
     let m = book(&[]);
@@ -363,8 +355,7 @@ fn an_expiry_ends_a_held_wake() {
     assert!(!wrong.check_invariant("OnlyReadyIsTold", &told));
 }
 
-/// ONE SLOT RESERVES FOR THE OLDEST HOLD: with `a` waiting, `c` is refused the freed slot and `a`
-/// takes it; granted ahead of `a`, `c` breaks the law.
+/// With `a` waiting, a freed slot is `a`'s to take, never the younger `c`'s.
 #[test]
 fn one_slot_reserves_for_the_oldest_hold() {
     let m = wake_room_model();
@@ -392,8 +383,8 @@ fn one_slot_reserves_for_the_oldest_hold() {
     assert!(!herd.check_invariant("OneUnitOneTellWhileReserved", &two));
 }
 
-/// A HOLDER'S RE-ASK, its write skipped, is granted against its own reservation, even with the
-/// slot gone to its build, and renews nothing; refused, or renewed, it breaks its law.
+/// A holder's re-ask, its write skipped, is granted against its own reservation even with the
+/// slot gone to its build, and renews nothing.
 #[test]
 fn a_holders_reask_is_granted_and_renews_nothing() {
     let m = wake_room_model();
@@ -411,8 +402,8 @@ fn a_holders_reask_is_granted_and_renews_nothing() {
     assert!(!renew.check_invariant("AReservationIsTakenOnce", &wrong));
 }
 
-/// A RESERVATION ENDS at its lapse, and the next hold may take the slot; kept while another waits,
-/// it outlives its lapse.
+/// A reservation ends at its lapse and the next hold may take the slot; kept while another
+/// waits, it outlives its lapse.
 #[test]
 fn a_reservation_ends_at_its_lapse() {
     let m = wake_room_model();

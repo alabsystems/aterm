@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Free sprites as fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §6,
-//! lane B7): a [`FreeSprite`] is one baked art drawn under the Linear law, and
-//! [`SpriteLayers`] publishes a frame's sprites into
-//! `RenderInput::fx_layers`, one Grid-space layer a sprite, so identity damage
-//! ([`crate::RowBands`]) repaints only the bands a sprite left or reached. The
-//! companions publish through it, and the renderers' tests build their
-//! sprites with it.
+//! Free sprites as fx layers (`docs/DESIGN-card-engine-2026-10-19.md` §6): a [`FreeSprite`]
+//! is one baked art drawn under the Linear law, and [`SpriteLayers`] publishes a frame's
+//! sprites into `RenderInput::fx_layers`, one Grid-space layer a sprite, so identity damage
+//! ([`crate::RowBands`]) repaints only the bands a sprite left or reached. The companions
+//! publish through it, and the renderers' tests build their sprites with it.
 
 use std::sync::Arc;
 
@@ -203,12 +201,12 @@ impl Look {
 /// Publishes a frame's [`FreeSprite`]s as fx layers, one a sprite in emission
 /// order: a Grid-space Linear layer whose content is the sprite at the origin,
 /// placed by the layer's offset and cut by its clip. A sprite that keeps its
-/// look keeps its content's `Arc`, so a sprite that did not change is a layer
-/// that did not change (`aterm-render`'s identity damage repaints nothing for
-/// it), and one that only moved repaints the bands it left and reached. A
-/// layer's id is its sprite's look and z, never its index, so a sprite
-/// appearing or leaving earlier in the order changes no other sprite's layer;
-/// sprites of one look share the id and damage pairs them in order.
+/// look keeps its content's `Arc`, so an unchanged sprite is an unchanged layer
+/// (identity damage repaints nothing for it), and one that only moved repaints
+/// the bands it left and reached. A layer's id is its sprite's look and z, never
+/// its index, so a sprite appearing or leaving earlier in the order changes no
+/// other sprite's layer; sprites of one look share the id and damage pairs them
+/// in order.
 #[derive(Debug, Default)]
 pub struct SpriteLayers {
     salt: u64,

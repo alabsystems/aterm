@@ -234,9 +234,8 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
     assert_eq!(local.stats().duplicates, 1);
 }
 
-/// The fold is the same whatever the spread runs: threads, or a spread that skips jobs, as the
-/// serial one `select` runs. Under `CheckLevel::All` every claim made on the test pool's threads
-/// is compared row by row with a serial judgment, so every distinct candidate's rows are compared.
+/// `select_spread`, on threads or on a spread that skips jobs, selects as `select` does, and so
+/// does a serial finish at `CheckLevel::All` ([`serial_finish`]).
 #[test]
 fn select_spread_equals_select() {
     let ev = evaluator();
@@ -415,10 +414,9 @@ fn a_forged_best_is_contradicted_before_any_held_out_read() {
     assert_eq!(n(&ev.reads().looks), 0);
 }
 
-/// The steering attack (design §11.1): the true winner's claim inflated so another admitted plan
-/// claims the best key. The honest claimed winner is judged in full and equals its claim; the
-/// inflated claim is never dominated, so the check reaches an inflated row and voids the search
-/// before the held-out split is read.
+/// The steering attack (design §11.1): the true winner's claim, inflated so another admitted plan
+/// claims the best key, is never dominated, so once the claimed winner is judged in full the check
+/// reaches an inflated row and voids the search before the held-out split is read.
 #[test]
 fn an_inflated_winner_is_found_by_the_dominance_check() {
     let ev = fresh();
@@ -1076,8 +1074,8 @@ impl Pool {
     }
 }
 
-/// A distributed search through the coordinator: honest workers, the claims given to the fold,
-/// step 5, and the one held-out read.
+/// A distributed search of `text` through a simulated pool of `workers`, each claim passed
+/// through `alter`, then step 5.
 fn pooled(
     text: &str,
     workers: u32,
@@ -1455,9 +1453,9 @@ fn a_broken_tail_from_a_gone_worker_is_dropped() {
     assert_eq!(pool.c.ledger().counts().dropped, before + 1);
 }
 
-/// The compiler keeps a claimed row out of m4 only while `Claim`'s and `RawClaim`'s fields stay
-/// private: E0616 locks against a `pub` field being read outside `dist.rs`, but not against a
-/// field being made `pub(super)`, so the declarations themselves are pinned here.
+/// A claim's rows stay out of m4 only while `Claim`'s and `RawClaim`'s fields are private: E0616
+/// refuses a read of a private field outside `dist.rs`, not of one made `pub(super)`, so the
+/// declarations themselves are pinned.
 #[test]
 fn a_claims_rows_stay_private_to_dist() {
     let src = include_str!("dist.rs");

@@ -2023,6 +2023,35 @@ fn draw_cores(pen: &mut Pen<'_>, p: Place, cpu: &CpuView, gaps: f64) {
     }
 }
 
+/// The busiest program in the chosen scope, its processes grouped by name: `rustc ×9 in Tab 3,
+/// 5.9 cores`, and how long it has been up once it has run long (`, up 47 min`; `up ≥ 47 min`
+/// while a member's birth went unread).
+fn busiest_line(c: Ctx<'_>) -> Option<String> {
+    let snap = c.snap;
+    let b = snap
+        .facts
+        .busiest
+        .as_ref()
+        .filter(|b| c.bar == Bar::Global || b.scope.is_some_and(|s| c.in_scope(s)))?;
+    let who = b
+        .scope
+        .map(|s| format!(" in {}", c.scope_word(s)))
+        .unwrap_or_default();
+    let times = if b.n > 1 {
+        format!(" \u{d7}{}", b.n)
+    } else {
+        String::new()
+    };
+    let up = words::up_words(b.age_ms(snap.at_unix_ms), b.unborn > 0)
+        .map(|up| format!(", {up}"))
+        .unwrap_or_default();
+    Some(format!(
+        "{}{times}{who}, {} cores{up}",
+        aterm_vitals::jobs::wire::person_name(&b.name),
+        words::cores(b.cores)
+    ))
+}
+
 /// Busiest now: the busiest processes in the chosen scope.
 fn busiest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
@@ -2043,28 +2072,7 @@ fn busiest_section(c: Ctx<'_>) -> Section<'_> {
     })
     .collect();
     let name = format!("Busiest now{}", c.suffix());
-    let mut line: Vec<String> = Vec::new();
-    if let Some(b) = snap
-        .facts
-        .busiest
-        .as_ref()
-        .filter(|b| c.bar == Bar::Global || b.scope.is_some_and(|s| c.in_scope(s)))
-    {
-        let who = b
-            .scope
-            .map(|s| format!(" in {}", c.scope_word(s)))
-            .unwrap_or_default();
-        let times = if b.n > 1 {
-            format!(" \u{d7}{}", b.n)
-        } else {
-            String::new()
-        };
-        line.push(format!(
-            "{}{times}{who}, {} cores",
-            aterm_vitals::jobs::wire::person_name(&b.name),
-            words::cores(b.cores)
-        ));
-    }
+    let mut line: Vec<String> = busiest_line(c).into_iter().collect();
     line.extend(rows.first().map(Row::said));
     if rows.is_empty() {
         line.push("nothing busy in this scope".into());

@@ -195,7 +195,7 @@ impl Exception {
     pub fn context_of(message: &str, fill: Option<ContextFill>) -> Self {
         let single = message
             .to_lowercase()
-            .contains(&aterm_phase::anchor("wall.cannot_be_compacted").to_lowercase());
+            .contains(&aterm_phase::anchor!("wall.cannot_be_compacted").to_lowercase());
         if single {
             return Self {
                 why: "One exchange fills the context, and compaction cannot shrink it.".to_string(),
@@ -300,7 +300,7 @@ pub fn refused_action(typed: Option<&str>, message: &str) -> &'static str {
 /// `Goal cleared after an unrecoverable error (<label>)`'s label, from a wall's message.
 #[must_use]
 pub fn goal_cleared_label(message: &str) -> Option<&str> {
-    let head = aterm_phase::anchor("wall.goal_cleared");
+    let head = aterm_phase::anchor!("wall.goal_cleared");
     let at = message.find(head)? + head.len();
     let rest = message[at..].trim_start().strip_prefix('(')?;
     rest.split(')').next().filter(|l| !l.is_empty())

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Launchd and systemd service management for `aterm secrets` ([`plist_text`], [`systemd_unit`],
-//! [`plist_path`], [`unit_path`], [`log_path`], [`launchctl_argv`], [`systemctl_argv`],
-//! [`install`], [`uninstall`], [`state`], [`own_home`], [`program_for_service`]).
+//! The launchd (macOS) and systemd user (Linux) jobs `aterm secrets` installs: the subscriber
+//! and the server.
 
 use crate::Error;
 use std::path::{Path, PathBuf};
@@ -88,12 +87,10 @@ pub fn log_path(home: &Path, job: Job) -> PathBuf {
 }
 
 /// The record that the person turned this login's subscriber off:
-/// `~/.config/aterm/secrets/subscriber-off`. `aterm secrets agent off` writes it, and so does
-/// a `join` or `create` with `--no-agent` where no subscriber runs; every install of the
-/// subscriber removes it ([`install`]), `agent on` among them. aterm's setup, System State's
-/// and `aterm init`'s alike, reads it as the person's choice: its Secrets vault row reads Sync
-/// off, and setup keeps the files as last synced without installing a subscriber. An
-/// explicit `agent on` or a new join can turn the subscriber back on.
+/// `~/.config/aterm/secrets/subscriber-off`. `agent off` writes it, and so does a `join` or
+/// `create` with `--no-agent` where no subscriber runs; an [`install`] of the subscriber
+/// removes it. aterm's setup (System State, `aterm init`) reads it as the person's choice: Sync
+/// shows off, and the files stay as last synced with no subscriber installed.
 pub fn subscriber_off_path(home: &Path) -> PathBuf {
     secrets_dir(home).join("subscriber-off")
 }
@@ -239,7 +236,7 @@ fn home_of_log(log: &Path) -> Option<&Path> {
     home.is_absolute().then_some(home)
 }
 
-/// The launchd property list for a job (pure) ([`log_path`], [`install`]).
+/// The launchd property list for a job, setting `HOME` when `log` is a [`log_path`].
 pub fn plist_text(label: &str, program: &Path, args: &[String], log: &Path) -> String {
     let string = |s: &str| format!("<string>{}</string>", xml_escape(s));
     let mut argv = String::new();
@@ -957,8 +954,7 @@ mod tests {
         }
     }
 
-    /// A scratch HOME is never this login's, so its state is read without asking launchd
-    /// (whose job is the login's own home's) anything.
+    /// A scratch HOME is never this login's, so its state is read without asking launchd.
     #[cfg(unix)]
     #[test]
     fn a_home_that_is_not_the_logins_has_no_job() {
@@ -971,9 +967,8 @@ mod tests {
         }
     }
 
-    /// THE PERSON'S RECORD THAT THE SUBSCRIBER IS OFF lies beside the vault's other
-    /// per-login state, private, and goes once it is on again; removing one that is not
-    /// there is no error. A home with none has none.
+    /// The record that the subscriber is off is private, goes once it is on again, and is no
+    /// error to remove when absent.
     #[cfg(unix)]
     #[test]
     fn the_record_that_the_subscriber_was_turned_off_is_kept_until_it_is_on_again() {
@@ -1529,11 +1524,8 @@ mod tests {
         assert!(!plist_path(home, Job::Subscriber).exists());
     }
 
-    /// A RESTART GAP IS NO CHANGE TO MAKE: a subscriber read installed but not
-    /// running is read again until it runs, within launchd's restart window from
-    /// when it was first seen down; past it, it is stopped, and a later read that
-    /// finds it still down past the window takes it so at once. NEGATIVE CONTROL:
-    /// one that never comes back is read stopped once the window has passed.
+    /// A subscriber read installed but not running is read again until it runs, within
+    /// launchd's restart window from when it was first seen down, and is stopped past it.
     #[test]
     fn a_subscriber_down_for_launchds_restart_gap_is_not_stopped() {
         use std::cell::Cell;

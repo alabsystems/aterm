@@ -25,7 +25,7 @@ fn api_key() -> String {
     format!("sk-ant-api03-LABLABLAB{}AA", "A".repeat(85))
 }
 
-/// The FAKE claude.ai OAuth token of `claude TAG --subscriber`: no credential anywhere.
+/// The fake claude.ai OAuth token of `claude TAG --subscriber`: no credential anywhere.
 pub fn oauth_token() -> String {
     format!("sk-ant-oat01-LABLABLAB{}AA", "A".repeat(80))
 }
@@ -60,9 +60,12 @@ pub struct UpOpts {
     /// `LAB_CLOCK=1`: the lab's sleep clock loaded into its instance and its Claude Code
     /// ([`crate::clock`]).
     pub clock: bool,
-    /// The lab's instance OPENS A WINDOW on this desk, in the same jail ([`windowed`]).
+    /// The lab's instance opens a window on this desk, in the same jail ([`windowed`]).
     pub window: bool,
-    /// `LAB_REROUTE=1`: the lab's Claude Code store build cloned into the jail's own atpkg prefix with its `agents/` twin and reroute stub ([`crate::reroute_prefix`]), and the instance rerouting, so `claude --by-name` runs stub → twin → store as the owner's sessions do.
+    /// `LAB_REROUTE=1`: the lab's Claude Code store build cloned into the scratch home's own atpkg
+    /// prefix with its `agents/` twin and reroute stub ([`crate::reroute_prefix`]), and the
+    /// instance rerouting, so `claude --by-name` runs stub → twin → store as the owner's sessions
+    /// do.
     pub reroute: bool,
 }
 
@@ -328,7 +331,7 @@ pub fn muse_version(run: &Run, bin: &str) -> String {
     }
 }
 
-/// `<bin> --version` run INSIDE the lab's jail.
+/// `<bin> --version` run inside the lab's jail.
 #[must_use]
 pub fn jailed_version(run: &Run, bin: &str, pick: fn(&str) -> Option<&str>) -> String {
     jailed_version_in(run, bin, &run.w.join("home"), pick)
@@ -384,36 +387,30 @@ const BIN_RAN: &str = "bin/ran";
 /// Written in `relay/` once the relay copied there showed it ran.
 const RELAY_RAN: &str = "relay/ran";
 
-/// The ad hoc signed clone of Claude Code a lab up with the clock runs
-/// ([`crate::clock::Layout`]).
+/// The ad hoc signed clone of Claude Code a lab up with the clock runs ([`crate::clock::Layout`]).
 const CLOCK_CLONE: &str = "clock/claude";
 
-/// Written beside [`CLOCK_CLONE`] once it showed it ran: its version line at
-/// `up`.
+/// Written beside [`CLOCK_CLONE`] once it showed it ran: its version line at `up`.
 const CLOCK_RAN: &str = "clock/ran";
 
-/// Written beside [`CLOCK_CLONE`] before it is laid ([`crate::clock::lay`])
-/// and removed before `up` first starts it: a clone with it was never
-/// started and goes at once. One without it (an older lab's too) counts as
-/// started.
+/// Written beside [`CLOCK_CLONE`] before it is laid ([`crate::clock::lay`]) and removed before
+/// `up` first starts it: a clone with it was never started and goes at once; one without it counts
+/// as started.
 pub(crate) const CLOCK_UNSTARTED: &str = "clock/unstarted";
 
-/// The holds on a lab's scratch, one directory each: a program the lab
-/// cloned into its scratch, held from before its first exec at the latest
-/// until it showed it ran ([`hold_scratch`], [`release_scratch`],
-/// [`REROUTE_HOLD`]). The lab may start it until
-/// `down` ends the jail, so `down` stamps each hold left then
-/// ([`stamp_holds`]), and the scratch stays until every stamp is spent
+/// The holds on a lab's scratch, one directory per program the lab cloned into it, from before its
+/// first exec at the latest until it showed it ran ([`hold_scratch`], [`release_scratch`],
+/// [`REROUTE_HOLD`]). The lab may start it until `down` ends the jail, so `down` stamps each hold
+/// left then ([`stamp_holds`]), and the scratch stays until every stamp is spent
 /// ([`scratch_may_go`]).
 pub(crate) const HELD: &str = "held";
 
-/// The hold on the scratch for the reroute prefix's clone of Claude Code,
-/// which [`crate::reroute_prefix::lay`] makes before the clone's exec and
-/// removes once the clone showed it ran.
+/// The hold on the scratch for the reroute prefix's clone of Claude Code, which
+/// [`crate::reroute_prefix::lay`] makes before the clone's exec and removes once it showed it ran.
 const REROUTE_HOLD: &str = "reroute";
 
-/// Hold the lab's scratch for a program about to be cloned into it and
-/// started (`name` names the clone).
+/// Hold the lab's scratch for a program about to be cloned into it and started (`name` names the
+/// clone).
 /// # Errors
 /// The hold could not be made.
 pub(crate) fn hold_scratch(run_dir: &Path, name: &str) -> std::io::Result<()> {
@@ -436,18 +433,15 @@ fn scratch_holds(run_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
 }
 
-/// Stamp what `down` (or an `up` that aborted) keeps once its jail is ended,
-/// so nothing can start a program from it any more: each scratch hold
-/// ([`HELD`]), a started [`CLOCK_CLONE`] ([`CLOCK_UNSTARTED`]), the lab
-/// program's copies (`relay/`, `bin/`) and an older lab program's
-/// `twin-src/`, unproven and with no reading stamped yet (none, or a blank
-/// one a cut-short write left: [`aterm_uds::deadline::exec_stamp`]), takes
-/// the awake clock's reading now ([`aterm_uds::deadline::try_stamp_exec`]).
-/// A copy's mtime is when it was laid, and a launch can first exec the relay
-/// long after that. A later `down` leaves a reading as it is, so a hold is
-/// spent once. Whether every stamp was written: one that was not leaves its
-/// directory's age to its mtime, so that `down` keeps them all
-/// ([`sweep_copies`]).
+/// Stamp what `down` (or an `up` that aborted) keeps once its jail is ended, when nothing can
+/// start a program from it any more: each scratch hold ([`HELD`]), a started [`CLOCK_CLONE`]
+/// ([`CLOCK_UNSTARTED`]), the lab program's copies (`relay/`, `bin/`) and an older lab program's
+/// `twin-src/`, each unproven and with no reading yet (none, or a blank one a cut-short write
+/// left), takes the awake clock's reading now ([`aterm_uds::deadline::try_stamp_exec`]). A copy's
+/// mtime is when it was laid, and a launch can first exec the relay long after that. A later
+/// `down` leaves a reading as it is, so a hold is spent once. Returns whether every stamp was
+/// written: an unwritten one leaves its directory's age to its mtime, so `down` then keeps every
+/// unproven copy ([`sweep_copies`]).
 #[must_use]
 fn stamp_holds(run_dir: &Path) -> bool {
     let clock = (run_dir.join(CLOCK_CLONE).exists() && !run_dir.join(CLOCK_UNSTARTED).exists())
@@ -478,9 +472,8 @@ fn stamp_holds(run_dir: &Path) -> bool {
     stamped
 }
 
-/// Whether the lab's scratch may go at `now`: every hold on it ([`HELD`])
-/// released, or spent ([`copies_may_go`]) when no stamp failed
-/// (`unstamped`, [`stamp_holds`]).
+/// Whether the lab's scratch may go at `now`: every hold on it ([`HELD`]) released, or spent
+/// ([`copies_may_go`]) when no stamp failed (`unstamped`, [`stamp_holds`]).
 fn scratch_may_go(run_dir: &Path, unstamped: bool, now: std::time::SystemTime) -> bool {
     scratch_holds(run_dir).is_ok_and(|holds| {
         holds
@@ -489,11 +482,10 @@ fn scratch_may_go(run_dir: &Path, unstamped: bool, now: std::time::SystemTime) -
     })
 }
 
-/// Whether a directory of copies may be removed: one started from it showed
-/// it ran (`ran`, or its `ran` marker), or no assessment of a copy in it is
-/// still going at `now`: [`aterm_uds::deadline::FIRST_EXEC_HANG`] has passed
-/// since its exec stamp on the awake clock, or since the directory changed
-/// when it has none ([`aterm_uds::deadline::copy_may_go`]).
+/// Whether a directory of copies may be removed: one started from it showed it ran (`ran`, or its
+/// `ran` marker), or no assessment of a copy in it is still going at `now`
+/// ([`aterm_uds::deadline::copy_may_go`]: [`aterm_uds::deadline::FIRST_EXEC_HANG`] has passed
+/// since its exec stamp on the awake clock, or since the directory changed when it has none).
 fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
     ran || fs::symlink_metadata(dir).is_err() || aterm_uds::deadline::copy_may_go(dir, now)
 }
@@ -509,12 +501,11 @@ pub(crate) fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
     )
 }
 
-/// Remove the directories of copies in `run_dir` that may go at `now`
-/// ([`copies_may_go`]): the lab's program's (`relay/`, `bin/`), the clock's
-/// clone of Claude Code (`clock/`), an older lab program's twin probe
-/// (`twin-src/`), and the scratch with its holds ([`scratch_may_go`]); the
-/// ones kept. `unstamped`: a stamp [`stamp_holds`] owed was not written, so
-/// what it stamps stays unless shown to run or gone.
+/// Remove the directories of copies in `run_dir` that may go at `now` ([`copies_may_go`]): the
+/// lab's program's (`relay/`, `bin/`), the clock's clone of Claude Code (`clock/`), an older lab
+/// program's twin probe (`twin-src/`), and the scratch with its holds ([`scratch_may_go`]).
+/// Returns the ones kept. `unstamped`: a stamp [`stamp_holds`] owed was not written, so what it
+/// stamps stays unless shown to run or gone.
 fn sweep_copies(
     run_dir: &Path,
     relay_ran: bool,
@@ -551,9 +542,8 @@ fn sweep_copies(
     kept
 }
 
-/// The end of `down`, once its logs are kept: the copies that may go, the
-/// scratch among them ([`sweep_copies`]), the run directory's own files, then
-/// the directory.
+/// The end of `down`, once its logs are kept: the copies that may go, the scratch among them
+/// ([`sweep_copies`]), the run directory's own files, then the directory.
 fn clear_run_dir(
     run_dir: &Path,
     relay_ran: bool,
@@ -697,7 +687,7 @@ fn jailed_command(
     Ok(cmd)
 }
 
-/// A WINDOWED instance launched in the jail ([`jailed_command`]).
+/// A windowed instance launched in the jail ([`jailed_command`]).
 /// # Errors
 /// The launch failed, the child ended before its socket answered, it made no progress for `hang`
 /// before it answered, or the run was interrupted (`interrupted`).
@@ -1039,8 +1029,8 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     }
 }
 
-/// Whether `up` may make the lab `run` names at `now`: what an earlier lab of
-/// the tag left is stamped ([`stamp_holds`]) and swept ([`sweep_copies`]).
+/// Whether `up` may make the lab `run` names at `now`: what an earlier lab of the tag left is
+/// stamped ([`stamp_holds`]) and swept ([`sweep_copies`]).
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -1738,7 +1728,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     Ok(keep)
 }
 
-/// What `lab up` writes for its TAB SHELLS in scratch `w` ([`tab_profile`]).
+/// What `lab up` writes for its tab shells in scratch `w` ([`tab_profile`]).
 fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
     let gbin = (!gemini_bin.is_empty()).then(|| run.join("gbin"));
     if let Some(dir) = &gbin {
@@ -1754,7 +1744,8 @@ fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
     );
 }
 
-/// THE LAB'S TAB SHELLS' STARTUP FILE ([`crate::gemini::LAB_GEMINI_KEY`]).
+/// The lab's tab shells' `.zshrc`, with Gemini CLI pointed at the stub
+/// ([`crate::gemini::LAB_GEMINI_KEY`]).
 #[must_use]
 pub fn tab_profile(port: &str, gbin: Option<&Path>) -> String {
     let mut s = String::from("PROMPT='lab$ '\n");
@@ -1875,9 +1866,8 @@ pub struct Launch {
     pub subscriber: bool,
     /// `--debug-log`: Claude Code's debug log into the scratch ([`crate::stats::debug_log`]).
     pub debug_log: bool,
-    /// `--by-name`: `claude` found on `PATH`, not the binary by path: in a
-    /// `LAB_REROUTE=1` lab the reroute stub, which execs the `agents/` twin,
-    /// which execs the store build.
+    /// `--by-name`: `claude` found on `PATH`, not the binary by path: in a `LAB_REROUTE=1` lab the
+    /// reroute stub, which execs the `agents/` twin, which execs the store build.
     pub by_name: bool,
     /// `-- <claude args>`.
     pub args: Vec<String>,
@@ -2061,7 +2051,8 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     ))
 }
 
-/// `claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [-- claude args]`.
+/// `claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name]
+/// [-- claude args]`.
 pub fn cmd_claude(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let tag = take_tag(&mut args)?;
@@ -2805,7 +2796,8 @@ mod tests {
         );
     }
 
-    /// `--by-name` launches `claude` found on `PATH`; without it the launcher names the binary by path.
+    /// `--by-name` launches `claude` found on `PATH`; without it the launcher names the binary by
+    /// path.
     #[test]
     fn by_name_launches_claude_through_path() {
         let run = recorded("", "0");
@@ -3161,12 +3153,8 @@ mod tests {
         }
     }
 
-    /// A DOWN KEEPS A SCRATCH A CLONE IN IT HOLDS: a build the lab cloned
-    /// into its scratch (agy-upgrade's, muse-upgrade's, twin's) that never
-    /// showed it ran keeps the scratch and `env.sh` past any wall time, its
-    /// hold stamped on the awake clock once `down` ended the jail; a later
-    /// `down` keeps that stamp, and goes on a restart since it. NEGATIVE
-    /// CONTROL: a build shown to run released its hold, and the scratch goes.
+    /// A clone held in the scratch that never showed it ran keeps the scratch and `env.sh` past any
+    /// wall time, until a restart since its stamp; one shown to run released its hold.
     #[test]
     fn a_down_keeps_a_scratch_a_clone_that_never_showed_it_ran_holds() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3186,7 +3174,7 @@ mod tests {
             assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
             if kept {
                 let stamp = run.run.join(HELD).join("agy-1/exec");
-                // above any reading the awake clock gives now: a restart since
+                // above any reading the awake clock gives now: a restart since the stamp
                 let restart = u64::MAX.to_string();
                 fs::write(&stamp, &restart).unwrap();
                 assert!(stamp_holds(&run.run), "{what}");
@@ -3197,12 +3185,9 @@ mod tests {
         }
     }
 
-    /// THE CLOCK'S CLONE OF CLAUDE CODE STAYS UNTIL IT SHOWED IT RAN: a
-    /// `clock/` whose clone was started and printed no version line at `up`
-    /// (an older lab's, with no mark at all, too) is kept past any wall time,
-    /// stamped once `down` ended the jail. NEGATIVE CONTROL: with its version
-    /// line recorded, with its mark that it was never started, or with no
-    /// clone, it goes unstamped, at once.
+    /// A clock clone with neither mark (started, and no version line at `up`) is stamped and kept
+    /// past any wall time; with its version line, its never-started mark, or no clone, it goes at
+    /// once, unstamped.
     #[test]
     fn the_clocks_clone_stays_until_it_showed_it_ran() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3231,13 +3216,8 @@ mod tests {
         }
     }
 
-    /// AN UNPROVEN COPY AGES ON THE AWAKE CLOCK FROM ITS DOWN: the relay a
-    /// launch laid long before its first exec, the lab program's copy an
-    /// interrupted `up` left, and an older lab program's twin probe are
-    /// stamped once `down` ended the jail, so neither the time since they
-    /// were laid nor a sleep frees them; a later `down` keeps that stamp, and
-    /// each goes on a restart since it. NEGATIVE CONTROL: unstamped, its age
-    /// is its mtime's on the wall clock, and it goes.
+    /// An unproven relay, lab-program copy or twin probe stamped at `down` waits on the awake clock
+    /// from that stamp, neither its age nor a sleep freeing it; unstamped, its age is its mtime's.
     #[test]
     fn an_unproven_copy_ages_on_the_awake_clock_from_its_down() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3272,7 +3252,6 @@ mod tests {
             assert_eq!(run.run.join("env.sh").is_file(), kept, "{what}");
             if kept {
                 let stamp = dir.join(aterm_uds::deadline::EXEC_STAMP);
-                // above any reading the awake clock gives now: a restart since
                 let restart = u64::MAX.to_string();
                 fs::write(&stamp, &restart).unwrap();
                 assert!(stamp_holds(&run.run), "{what}");
@@ -3283,13 +3262,9 @@ mod tests {
         }
     }
 
-    /// A STAMP `DOWN` COULD NOT WRITE KEEPS WHAT IT HOLDS: a scratch hold, a
-    /// started clock clone, an unproven copy of the lab's program (`relay/`,
-    /// `bin/`) or a twin probe whose stamp could not be written
-    /// (a full disk) keeps its directory and `env.sh` past any wall time,
-    /// since its mtime can predate its exec; a later `down` that can stamp it
-    /// starts its wait on the awake clock, and it goes on a restart since.
-    /// NEGATIVE CONTROL: by its mtime alone, each counts as spent.
+    /// A hold or unproven copy whose stamp could not be written (a full disk) keeps its directory
+    /// and `env.sh` past any wall time, since its mtime can predate its exec; a later `down` that
+    /// can stamp it starts its wait. By its mtime alone each would count as spent.
     #[test]
     fn a_down_that_cannot_stamp_a_hold_keeps_it() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3322,7 +3297,6 @@ mod tests {
             assert!(stamp_holds(&run.run), "{what}: a later down stamps it");
             clear_run_dir(&run.run, false, false, &run.tag, past);
             assert!(kept.is_dir(), "{what}: its wait runs from that stamp");
-            // above any reading the awake clock gives now: a restart since
             let restart = u64::MAX.to_string();
             fs::write(dir.join(aterm_uds::deadline::EXEC_STAMP), restart).unwrap();
             clear_run_dir(&run.run, false, false, &run.tag, made);
@@ -3330,14 +3304,9 @@ mod tests {
         }
     }
 
-    /// A BLANK STAMP IS WRITTEN AGAIN: a scratch hold, a started clock clone,
-    /// an unproven copy of the lab's program or a twin probe whose stamp holds
-    /// no reading (a write cut short by a
-    /// full disk or a kill leaves it blank) takes the awake clock's reading at
-    /// the next `down`, so it stays past any wall time, and goes on a restart
-    /// since; one that `down` cannot write again counts as unstamped. NEGATIVE
-    /// CONTROL: a blank stamp leaves its age to its mtime, and it counts as
-    /// spent.
+    /// A blank stamp (a write cut short) takes the awake clock's reading at the next `down`, so it
+    /// stays past any wall time and goes on a restart since; one `down` cannot write again counts
+    /// as unstamped. By its mtime alone it would count as spent.
     #[test]
     fn a_down_writes_a_blank_stamp_again() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3379,7 +3348,7 @@ mod tests {
                 "{what}: kept past any wall time"
             );
             assert!(run.run.join("env.sh").is_file(), "{what}");
-            // above any reading the awake clock gives now: a restart since
+            // a restart since the stamp
             fs::write(&stamp, u64::MAX.to_string()).unwrap();
             clear_run_dir(&run.run, false, false, &run.tag, made);
             assert!(!run.run.exists(), "{what}: the later down finished");
@@ -3411,7 +3380,7 @@ mod tests {
                 room_for(&left, past_the_hang(made)).is_err(),
                 "{what}: its wait runs on the awake clock from the up that stamped it"
             );
-            // above any reading the awake clock gives now: a restart since
+            // a restart since the stamp
             fs::write(
                 dir.join(aterm_uds::deadline::EXEC_STAMP),
                 u64::MAX.to_string(),

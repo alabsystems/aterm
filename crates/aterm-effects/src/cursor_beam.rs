@@ -271,11 +271,7 @@ impl CursorBeamRod {
             }
             let w = ((cw * hw * 2.0) as i32).max(1);
             let x = (ax - cw * hw) as i32;
-            let color = if mix > 0.0 {
-                lerp(target, mix)
-            } else {
-                cfg.color
-            };
+            let color = lerp(target, mix);
             let premul = premul_rgb(color, cov);
             if i < 2 {
                 // Full rod including the overshoot caps.
@@ -373,6 +369,7 @@ impl CursorBeamRod {
         }
         let inv_f_edge = 1.0 / f_edge;
         let inv_rx = 1.0 / rx;
+        let inv_ry = 1.0 / ry;
         let hw = cw * 0.5;
         let cell_x0 = (cx - hw).round() as i32;
         let cell_x1 = cell_x0 + geom.cw as i32;
@@ -382,7 +379,7 @@ impl CursorBeamRod {
         let mut y = band_y0;
         while y < band_y1 {
             let h = row_h.min(band_y1 - y);
-            let v = (y as f32 + h as f32 * 0.5 - cy) / ry;
+            let v = (y as f32 + h as f32 * 0.5 - cy) * inv_ry;
             let v2 = v * v;
             let w2 = 1.0 - v2;
             if w2 > 0.0 {

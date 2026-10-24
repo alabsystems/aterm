@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The worker shell's pure parts: framing, faults, the thread spread, the stderr tail and the
-//! shared channel's back-pressure (plan §8's queue saturation).
+//! shared channel's back-pressure.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -211,8 +211,8 @@ fn pool_limits_are_v1_but_the_window_and_the_size() {
     assert_eq!(none.limits().window_ns, LIMITS_V1.window_ns);
 }
 
-/// Dropping the receiver releases blocked sends, closes each reader's pipe and releases any
-/// writer blocked in that pipe. Keep both sets of handles on assertion failures as well.
+/// Dropping the receiver releases blocked sends, which closes each reader's pipe and releases any
+/// writer blocked in it; the drop runs, and joins every thread, on an assertion failure too.
 #[derive(Default)]
 struct Readers {
     rx: Option<mpsc::Receiver<(WorkerId, aterm_effects::aos_momentum::dist::Event)>>,
@@ -229,10 +229,9 @@ impl Drop for Readers {
     }
 }
 
-/// Plan §8's queue saturation: three readers into one channel of capacity 2 × 3. While the
-/// coordinator reads nothing, the readers block, so at most capacity + one in hand per reader are
-/// ever counted queued; once it reads, every frame arrives, in order per worker, and nothing is
-/// lost.
+/// Three readers into one channel of capacity 2 × 3 (design §11.5): while the coordinator reads
+/// nothing, at most capacity plus one in hand per reader are ever counted queued; once it reads,
+/// every frame arrives, in order per worker, and nothing is lost.
 #[test]
 fn a_full_channel_blocks_its_readers_and_loses_nothing() {
     const READERS: u32 = 3;

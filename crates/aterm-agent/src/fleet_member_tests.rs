@@ -388,7 +388,12 @@ fn init_then_join_registers_and_peers_checks_each_peer() {
         host: loopback(),
         ..Opts::default()
     };
-    ok(join(&member.places, &opts, &code));
+    let joined = ok(join(&member.places, &opts, &code));
+    assert!(
+        joined.contains("allow      facts:")
+            && joined.contains("`aterm fleet allow content` lets it"),
+        "{joined}"
+    );
     assert_eq!(
         read_key_file(&member.places.state).unwrap(),
         read_key_file(&issuer.places.state).unwrap(),
@@ -953,6 +958,41 @@ fn a_leave_where_no_writer_can_make_the_state_takes_the_fleet_out_of_aterm_toml(
         assert!(!places.state.is_dir(), "{odd}");
     }
     std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_leave_whose_state_it_makes_inherits_an_access_list_takes_the_fleet_out_of_aterm_toml() {
+    let world = World::new("leave-acl");
+    let parent = world.places.state.parent().unwrap().join("inherits");
+    std::fs::create_dir(&parent).unwrap();
+    let ran = aterm_uds::spawnfd::command("/bin/chmod")
+        .args(["+a", "everyone allow list,search,directory_inherit"])
+        .arg(&parent)
+        .status()
+        .expect("run chmod");
+    assert!(ran.success(), "chmod +a");
+    let places = Places {
+        state: parent.join("state"),
+        config: world.places.config.clone(),
+    };
+    world.write_config(&format!(
+        "[fleet]\nlisten = \"0.0.0.0:{}\"\nallow = \"facts\"\n",
+        closed_port()
+    ));
+    let listening = world.config();
+    assert!(
+        init(&places, &racing_init()).is_err(),
+        "no writer can lock there"
+    );
+    assert_eq!(world.config(), listening, "an init there writes nothing");
+    std::fs::remove_dir(&places.state).unwrap();
+    let left = ok(leave(&places, &[]));
+    assert!(
+        left.contains("[fleet] listen, allow and drive_from removed"),
+        "the first leave: {left}"
+    );
+    assert!(places.state.is_dir(), "made, as an init makes it");
 }
 
 #[test]
@@ -3038,7 +3078,7 @@ fn an_older_aterms_edit_never_comes_between_a_joins_marks_and_its_key() {
     let state = member.places.state.clone();
     let failed = with_step_hook(
         move |at| {
-            // An older aterm's edit of the book, where it can take the lock: every line written back unmarked.
+            // An older aterm's edit of the book under its lock: every line written back unmarked.
             if at == "key"
                 && let Ok(_book) = member::hold_book(&state)
             {
@@ -3186,7 +3226,7 @@ fn a_join_an_older_aterm_finished_still_reaches_only_the_issuer_it_binds() {
     let lock = member.lock_config();
     assert!(join(&member.places, &opts, &other_code).is_err());
     std::fs::remove_dir(&lock).unwrap();
-    // An older aterm finishes the join: it keeps aterm.toml's grants and records the issuer unmarked.
+    // An older aterm finishes the join: aterm.toml's grants kept, the issuer recorded unmarked.
     ok(join(&member.places, &opts, &other_code));
     member.write_config(&granted);
     let mut text = String::from("# The fleet's peers, one per line.\n");
@@ -3419,7 +3459,7 @@ fn a_leave_between_a_joins_steps_leaves_nothing_of_the_fleet_written_after_it() 
 
 #[test]
 fn a_join_again_a_leave_comes_into_while_it_dials_keeps_no_grant() {
-    // The leave stopped short of aterm.toml, or not: the join writes the level a join after it would.
+    // The leave stopped short of aterm.toml or not: the join writes the level a later join would.
     for (stopped, level) in [(false, "facts"), (true, "content")] {
         let (issuer, code, _serving) = issuing(&format!("dial-leave-{stopped}-issuer"));
         let member = World::new(&format!("dial-leave-{stopped}-member"));
@@ -3476,7 +3516,8 @@ fn a_join_again_a_leave_comes_into_while_it_dials_keeps_no_grant() {
 
 #[test]
 fn a_join_again_a_leave_and_an_unfinished_join_come_into_keeps_no_grant() {
-    // Before its first take of the book's lock, or between two: each leaves this fleet's key, and a book that names no issuer.
+    // Before its first take of the book's lock, or between two: each leaves this fleet's key and
+    // a book that names no issuer.
     for step in ["lock", "config", "book"] {
         let (issuer, code, _serving) = issuing(&format!("unfinished-{step}-issuer"));
         let member = World::new(&format!("unfinished-{step}-member"));
@@ -3544,7 +3585,8 @@ fn a_join_again_a_leave_and_an_unfinished_join_come_into_keeps_no_grant() {
 
 #[test]
 fn an_init_a_leave_comes_into_holds_the_fleet_whole_or_none_of_it() {
-    // Before the key, an init makes the fleet a leave left none of, and a rotate, of no fleet now, is refused; after it, the leave took the fleet out.
+    // Before the key, an init makes the fleet a leave left none of, and a rotate (of no fleet
+    // now) is refused; after it, the leave took the fleet out.
     for (step, rotate) in [
         ("key", false),
         ("key", true),
@@ -3629,7 +3671,8 @@ fn a_join_while_a_leave_edits_aterm_toml_leaves_no_fleet_half_held() {
     };
     let (dialled, at_lock) = std::sync::mpsc::channel();
     let (go, gone) = std::sync::mpsc::channel();
-    // The join holds its node key and the issuer's answer before the leave begins, so only its locked steps meet the leave.
+    // The join holds its node key and the issuer's answer before the leave begins, so only its
+    // locked steps meet the leave.
     let mut joining = Some(std::thread::spawn(move || {
         with_step_hook(
             move |at| {
@@ -4342,7 +4385,8 @@ impl Racing {
         }
     }
 
-    // The end the verb leaves on a fresh fixture with `other` where `when` puts it, and whether its last run did what it was asked.
+    // The end the verb leaves on a fresh fixture with `other` where `when` puts it, and whether
+    // its last run did what it was asked.
     fn run(&self, race: &Race, with: Option<(Other, When)>) -> (End, bool) {
         let (world, own) = self.fixture(race.fixture);
         let places = &world.places;
@@ -4384,7 +4428,8 @@ impl Racing {
                             reached.set(true);
                             pending.set(true);
                         }
-                        // A step under the book's lock: another verb waits it out, and comes at the next step past it.
+                        // A step under the book's lock: another verb waits it out and comes at
+                        // the next step past it.
                         if pending.get()
                             && (matches!(other, Other::Kill) || !member::book_held(dir))
                         {

@@ -546,7 +546,7 @@ pub(crate) fn portal_up(up: &Up) -> Result<(), String> {
     linux::start_display(up, Display::Xvfb)?;
     let dir = format!("{PORTAL_CONFIG}/xdg-desktop-portal");
     let _ = up.sh(&["install".into(), "-d".into(), dir.clone()]);
-    let conf = up.lima.shell(
+    let conf = up.guest.shell(
         &up.home,
         &["tee".into(), format!("{dir}/portals.conf")],
         Some(PORTALS_CONF),
@@ -1121,7 +1121,7 @@ fn orca(
     let mut kept = Vec::new();
     for (path, name) in [(&speechd_log, "speechd.log"), (&debug, "orca.debug")] {
         let to = results.join(format!("{}-{name}.txt", gui.name));
-        if gui.up.lima.copy_out(path, &to).ok() {
+        if gui.up.guest.copy_out(path, &to).ok() {
             kept.push(to.display().to_string());
         }
     }
@@ -1193,7 +1193,7 @@ fn orca_run(gui: &Gui<'_>, on: On<'_>, speechd_log: &str, debug: &str) -> Result
         format!("{d}/speechd-log"),
         format!("{d}/seat"),
     ]);
-    let made = up.lima.shell(
+    let made = up.guest.shell(
         &up.home,
         &["tee".into(), format!("{conf}/speechd.conf")],
         Some(SPEECHD_CONF),

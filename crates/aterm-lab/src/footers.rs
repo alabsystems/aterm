@@ -275,7 +275,7 @@ fn record(run: &Run, o: &Opts, out: PathBuf) -> Res {
                 "footer-busy",
                 &format!(
                     "mid-turn in the launch mode: {} on the mode row",
-                    aterm_phase::anchor("busy.interrupt")
+                    aterm_phase::anchor!("busy.interrupt")
                 ),
             )?;
         }

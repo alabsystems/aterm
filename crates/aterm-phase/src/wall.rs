@@ -612,8 +612,8 @@ const NOTICE_ROWS: usize = 3;
 #[must_use]
 pub fn login_expires_in(rows: &[String]) -> Option<u32> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge};
-    let head = const { crate::anchors::anchor_text("login.expires_in") };
-    let hint = const { crate::anchors::anchor_text("login.renew_hint") };
+    let head = const { crate::anchor!("login.expires_in") };
+    let hint = const { crate::anchor!("login.renew_hint") };
     let frame = composer_frame(rows)?;
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let above = frame.top.saturating_sub(NOTICE_ROWS)..frame.top;
@@ -869,7 +869,7 @@ fn newest_limit(rows: &[String]) -> Option<Newest> {
         }
         if echo.is_none()
             && let Some(chosen) = crate::text::trim(&line).strip_prefix('⎿').and_then(|out| {
-                crate::text::trim_start(out).strip_prefix(crate::anchors::anchor("model.set"))
+                crate::text::trim_start(out).strip_prefix(crate::anchor!("model.set"))
             })
         {
             set.get_or_insert_with(|| crate::text::trim(chosen).to_string());
@@ -1063,7 +1063,7 @@ fn limit_dialog_at(rows: &[String], i: usize) -> Option<usize> {
     let command = crate::text::trim(&rows[j])
         .strip_prefix('❯')
         .map(crate::text::trim);
-    (command == Some(crate::anchors::anchor("wall.limit_dialog"))).then_some(j)
+    (command == Some(crate::anchor!("wall.limit_dialog"))).then_some(j)
 }
 
 fn gapped_items(row: &str) -> impl Iterator<Item = &str> {
@@ -1126,7 +1126,7 @@ pub fn memory_banner_head(message: &str) -> &str {
 #[must_use]
 pub fn memory_wall(rows: &[String]) -> Option<Wall> {
     use crate::phase::{HINT_COLUMN, composer_frame, is_against_right_edge, status_block};
-    let anchor = const { crate::anchors::anchor_text("wall.memory") };
+    let anchor = const { crate::anchor!("wall.memory") };
     let frame = composer_frame(rows)?;
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let block = status_block(rows, frame.top);
@@ -3735,14 +3735,13 @@ mod tests {
 
     #[test]
     fn the_memory_banner_is_read_by_its_place() {
-        use crate::anchors::anchor_text;
         use crate::prompt::fixtures::{MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE};
         let r = screen(MEMORY_BANNER_BUSY);
         let w = memory_wall(&r).expect("the banner");
         assert_eq!(w.kind, WallKind::Memory);
         assert_eq!(w.placement, Placement::Banner);
         assert_eq!(w.reset, None);
-        assert!(w.message.starts_with(anchor_text("wall.memory")));
+        assert!(w.message.starts_with(crate::anchor!("wall.memory")));
         assert!(w.message.ends_with("claude --continue"), "{}", w.message);
         let mut shared = r.clone();
         let spinner = w.row - 1;
@@ -3835,7 +3834,6 @@ mod tests {
 
     #[test]
     fn a_quoted_memory_banner_is_not_a_wall() {
-        use crate::anchors::anchor_text;
         use crate::prompt::fixtures::{MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE};
         let r = screen(MEMORY_BANNER_BUSY);
         let at = memory_wall(&r).expect("the control").row;
@@ -3846,7 +3844,7 @@ mod tests {
             v
         };
         let right_aligned = |text: &str| format!("{text:>142}");
-        let no_size = format!("{} is back to normal", anchor_text("wall.memory"));
+        let no_size = format!("{} is back to normal", crate::anchor!("wall.memory"));
         assert_eq!(
             memory_wall(&with(right_aligned(&banner))).map(|w| w.row),
             Some(at)

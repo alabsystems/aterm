@@ -346,11 +346,17 @@ pub fn run(bin: &Path, args: &[String], dir: Option<&Path>) -> Out {
                 String::from_utf8_lossy(&o.stderr)
             ),
             secs,
+            signal: None,
+            not_started: None,
+            lost: None,
         },
         Err(e) => Out {
             code: None,
             text: format!("{} could not start: {e}", bin.display()),
             secs,
+            signal: None,
+            not_started: None,
+            lost: None,
         },
     }
 }
@@ -1134,6 +1140,9 @@ impl Ssh {
                     code: None,
                     text: format!("ssh could not start: {e}"),
                     secs: 0.0,
+                    signal: None,
+                    not_started: None,
+                    lost: None,
                 };
             }
         };
@@ -1171,6 +1180,9 @@ impl Ssh {
             code: status.ok().and_then(|s| s.code()),
             text,
             secs: t0.elapsed().as_secs_f64(),
+            signal: None,
+            not_started: None,
+            lost: None,
         }
     }
 
@@ -2293,6 +2305,9 @@ pub fn run_on_desktop(up: &Up, name: &str, line: &str, how: guest::Desktop, stre
             code: None,
             text,
             secs: 0.0,
+            signal: None,
+            not_started: None,
+            lost: None,
         }
     };
     let run_dir = up.layout.run();

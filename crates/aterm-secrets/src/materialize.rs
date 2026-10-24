@@ -107,7 +107,7 @@ pub fn apply(
     )
 }
 
-/// What a pass is to write, or what a pass cut short was writing: entry name → digest of the value.
+/// Entry name → value digest of what a pass is to write, or a pass cut short was writing.
 pub type Pending = BTreeMap<String, String>;
 
 /// [`apply`], resuming a pass cut short and saving ahead for this one.

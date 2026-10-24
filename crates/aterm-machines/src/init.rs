@@ -319,13 +319,13 @@ pub fn main_entry(
     ExitCode::from(code)
 }
 
-/// The develop layer as `aterm doctor` reads it on this Mac (design §5, S9;
-/// [`crate::init_develop::doctor`]): for the user `aterm init --develop` would converge, whose
-/// context (refusing root) is the one init builds when it leaves the workstation out. It is built
-/// only once the account's own `init.toml` is read with a `[develop]` table, or cannot be read,
-/// or an `--only` word asks ([`crate::init_develop::may_record`]), so on a Mac that records no
-/// develop layer doctor runs nothing for it (no `id -un`, no `dscl`) and shows no row. The
-/// caller asks only in the account's own shell.
+/// The develop layer as `aterm doctor` reads it on this Mac ([`crate::init_develop::doctor`]),
+/// for the user `aterm init --develop` would converge, in the context init builds when it leaves
+/// the workstation out (root refused). The context is built only once the account's own
+/// `init.toml` has a `[develop]` table or cannot be read, or an `--only` word asks
+/// ([`crate::init_develop::may_record`]), so on a Mac that records no develop layer doctor runs
+/// nothing for it (no `id -un`, no `dscl`) and shows no row. The caller asks only in the
+/// account's own shell.
 pub struct Doctor<S: System = Live> {
     sys: S,
     /// The account's home as its account record names it (`getpwuid`), where its `init.toml`
@@ -559,7 +559,9 @@ pub enum WorkstationGroup {
     InputActivation,
     /// The complete workstation profile, excluding optional repository setup.
     All,
-    /// Filter selected preference rows to keys in another app's sandbox container ([`crate::items::defaults::CONTAINED`]) withheld without Full Disk Access ([`crate::items::Item::withheld`]).
+    /// The selected preference rows whose keys sit in another app's sandbox container
+    /// ([`crate::items::defaults::CONTAINED`]), withheld without Full Disk Access
+    /// ([`crate::items::Item::withheld`]).
     Withheld,
 }
 
@@ -642,7 +644,8 @@ pub struct WorkstationRun {
     pub rows: Vec<ItemReport>,
     /// Each item whose apply or refresh ran, in run order.
     pub attempts: Vec<Attempt>,
-    /// The items that left keys in another app's container alone for want of Full Disk Access ([`Item::withheld`]), by id, held or not.
+    /// The items that left keys in another app's container alone for want of Full Disk Access
+    /// ([`Item::withheld`]), by id, held or not.
     pub withheld: Vec<String>,
     /// Each item's id and the setting it was built for.
     pub settings: Vec<(String, Setting)>,
@@ -677,7 +680,8 @@ pub struct Attempt {
     pub id: String,
     /// Whether its read-back verified the change.
     pub verified: bool,
-    /// The before-images the snapshot guard admitted for it immediately before its mutation, including a write that failed after partially taking effect.
+    /// The before-images the snapshot guard admitted for it just before its mutation,
+    /// including a write that failed after partially taking effect.
     pub preferences: Vec<(Target, Read<PValue>)>,
 }
 
@@ -746,7 +750,8 @@ impl Workstation {
             .collect())
     }
 
-    /// Run the shared engine and retain exactly which snapshotted items reached mutation, including a write that failed after partially taking effect.
+    /// Run the shared engine and retain exactly which snapshotted items reached mutation,
+    /// including a write that failed after partially taking effect.
     ///
     /// # Errors
     /// The journal cannot be resolved or the items' dependency order is invalid.
@@ -1218,7 +1223,8 @@ type Group = (Vec<Box<dyn Item>>, Place);
 /// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in).
 type Prepare<'a> = dyn Fn(&dyn System, &Ctx, Mode) -> Result<Vec<Group>, String> + 'a;
 
-/// Prepare workstation groups, reading optional profiles and prompting for vault credentials before probing.
+/// Prepare workstation groups, reading optional profiles and prompting for vault credentials
+/// before probing.
 fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>, String> {
     if ctx.console.is_none() {
         return Ok(vec![(
@@ -1563,11 +1569,9 @@ mod tests {
         );
     }
 
-    /// The widget, desktop and Dock items setup builds for one pass, each tagged with its
-    /// setting, share the pass's one relaunch: one `DesktopActivation`, as one
-    /// `init_preferences::selected_tagged_items` call makes it, among every item of the
-    /// whole selection. Negative control: one `selected_items` call per setting (the
-    /// System State merge) builds three activations with one id.
+    /// The widget, desktop and Dock items of one pass share its one relaunch: one
+    /// `DesktopActivation` across the whole selection, as one
+    /// `init_preferences::selected_tagged_items` call builds it.
     #[test]
     fn the_desktop_items_of_one_pass_share_one_activation() {
         let who = user("alice", 501);
@@ -3562,12 +3566,10 @@ mod tests {
         (Doctor::over(sys, home, None), setup)
     }
 
-    /// DOCTOR RUNS NOTHING FOR THE DEVELOP LAYER OF A MAC THAT RECORDS NONE: with no
-    /// `init.toml`, or one with no `[develop]` table, doctor composes no develop item and reads
-    /// no develop row without building the account's context, so no `id -un` or `dscl` runs,
-    /// and a context that could not be built shows nothing either. Negative controls: a profile
-    /// that records a checkout, an `--only` develop word, or a home the account record does not
-    /// give build the context, and here its failure is the one `develop.record` row.
+    /// With no `init.toml`, or one with no `[develop]` table, doctor composes and reads no
+    /// develop row and never builds the account's context (no `id -un`, no `dscl`). A profile
+    /// that records a checkout, an `--only` develop word, or no home from the account record
+    /// (the controls) build it, and its failure here is the one `develop.record` row.
     #[test]
     fn doctor_runs_nothing_for_the_develop_layer_of_a_mac_that_records_none() {
         let id = Cmd::new("/usr/bin/id").arg("-un").display();

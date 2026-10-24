@@ -206,10 +206,9 @@ fn a_row_waiting_on_a_person_carries_its_open_and_a_failure_its_reason() {
     );
 }
 
-/// A probe puts a row's reason in its description (`Observation::detail`):
-/// every row that needs a person, is not needed or was opted out of shows it
-/// under the row, where a screen reader reads it too, as a failure's reason
-/// always was. A waiting row shows what it waits on from its probe's note.
+/// A probe's reason (`Observation::detail`) shows under every row that needs a person, is not
+/// needed or was opted out of, where a screen reader reads it too; a waiting row shows what it
+/// waits on from its probe's note.
 #[test]
 fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
     let note = |subject: Subject, observed: Observation, selection: Selection| {
@@ -279,7 +278,7 @@ fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
         note(Subject::Setting(Setting::Secrets), code, all).as_deref(),
         Some("CODE")
     );
-    // NEGATIVE CONTROLS: a row read as aterm wants it, a group left as is,
+    // Negative controls: a row read as aterm wants it, a group left as is,
     // and a reading from while the row was still needed explain nothing.
     assert_eq!(
         note(
@@ -324,13 +323,10 @@ fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
     );
 }
 
-/// NO ENGINE WORDS UNDER A ROW THAT WILL CHANGE (§3.3: the value names the
-/// part that differs). A planned engine row's description is its own
-/// `from → to` line, and a blocked one's names the item it waits for or the
-/// rule its probe applied (a token file's mode): a row that differs or waits
-/// shows neither, busy or not, on a fresh Mac's most common view or
-/// anywhere. A row that differs shows no note; one that waits shows its own
-/// note, or the one every waiting row can say ([`WAITING_NOTE`]).
+/// The engine's descriptions (a planned row's `from → to` line, a blocked row's item or probe
+/// rule) never show under a row that differs or waits (§3.3: the value names the part that
+/// differs), busy or not: a row that differs shows no note, and one that waits shows its own note
+/// or [`WAITING_NOTE`].
 #[test]
 fn a_row_that_will_change_shows_no_engine_line_under_it() {
     let engine_lines = [
@@ -429,10 +425,9 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
     }
 }
 
-/// A WAITING ROW ALWAYS SAYS WHY (§3.3), in a person's words: the reason its
-/// probe gave in the note, or, where it gave none (or only blanks), the one
-/// thing true of every waiting row. Never the engine's description, busy or
-/// not, in any row of the page, and on the page as the row's note.
+/// A waiting row always says why in a person's words (§3.3): its probe's note, or
+/// [`WAITING_NOTE`] where it gave none or only blanks; never the engine's description, busy or
+/// not, in any row or on the page.
 #[test]
 fn a_waiting_row_always_says_why_and_never_in_the_engines_words() {
     const ENGINE: &str = "ENGINE LINE: waits for init.example@person";
@@ -479,12 +474,9 @@ fn a_waiting_row_always_says_why_and_never_in_the_engines_words() {
     }
 }
 
-/// AN ATERM RUN FROM A DISK IMAGE CANNOT KEEP THE VAULT IN SYNC, and only a
-/// person can move it: the Secrets row needs them and says the move in its
-/// note, the headline names the row and shows it, and the menu line carries
-/// the note (§3.6). The run's own row for the step (`blocked`, the stage's
-/// path-naming line) is no note on the page. (Ported from the checker's
-/// round-2 scratch test, which found the wait said nowhere.)
+/// An aterm run from a disk image cannot keep the vault in sync: the Secrets row needs the person
+/// and says the move in its note, the headline names and shows the row, and the menu line carries
+/// the note (§3.6). The run's own `blocked` row for the step is no note on the page.
 #[test]
 fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -514,7 +506,11 @@ fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
     assert_eq!(label(&compiled, "system-state/row/secrets/note"), move_it);
     assert_eq!(label(&compiled, HEADLINE), "Needs you: Secrets vault");
-    let head = headline(&status, &rows(&status, Selection::all()));
+    let head = headline(
+        &status,
+        &rows(&status, Selection::all()),
+        status.plan.as_ref(),
+    );
     assert_eq!(head.show, Some(secrets));
     let tree = format!("{:?}", compiled.semantics);
     assert!(
@@ -525,6 +521,33 @@ fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
     let line = crate::system_state_access::menu_line(&status, false).expect("a menu line");
     assert_eq!(line.label, "System State: Secrets vault needs you");
     assert_eq!(line.note.as_deref(), Some(move_it));
+}
+
+#[test]
+fn a_restore_failure_is_visible_even_when_its_group_is_left_as_is() {
+    let status = status_of("restore-blocked");
+    let detail = status.rows[0].detail.clone();
+    let mut app = SystemStateApp::new(status.plan.clone().unwrap());
+    app.publish(status.clone());
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
+    let text = format!("{:?}", compiled.semantics);
+    assert!(
+        text.contains(&detail),
+        "the operation's unresolved result stays visible"
+    );
+    assert!(app.needs_attention());
+    let selection = status.plan.as_ref().unwrap().selection;
+    assert!(!selection.contains(Setting::Widgets));
+    assert_eq!(
+        status
+            .observed
+            .iter()
+            .find(|o| o.subject == Subject::Setting(Setting::Widgets))
+            .unwrap()
+            .standing,
+        Standing::InPlace
+    );
+    assert!(crate::system_state_access::menu_line(&status, false).is_some());
 }
 
 #[test]
@@ -611,7 +634,7 @@ fn headlines_say_the_state_in_the_designs_words() {
             .plan
             .as_ref()
             .map_or_else(Selection::all, |plan| plan.selection);
-        headline(status, &rows(status, selection))
+        headline(status, &rows(status, selection), status.plan.as_ref())
     };
     assert_eq!(line(&status_of("checking")).text, "Checking this Mac…");
     assert_eq!(
@@ -660,16 +683,19 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert!(fixture_status("toggles").is_none());
 }
 
-/// ROWS THAT ONLY WAIT ARE NO CHANGE TO MAKE (§3.2): Set up now changes the
-/// rows that differ, so the count and the button come only with one; rows
-/// that only wait are named, page order, with a Show to the first, and each
-/// says what it waits on in its note. A row that differs counts the rows
-/// that will change with it, waiting ones too (each shows `Will change`).
+/// Rows that only wait are no change to make (§3.2): the count and Set up now come only with a
+/// row that differs, and the count then takes in the waiting rows too (each shows `Will change`).
+/// Rows that only wait are named in page order, with a Show to the first, each saying what it
+/// waits on.
 #[test]
 fn rows_that_only_wait_are_named_and_not_counted_as_changes() {
     let line = |observed: Vec<Observation>| {
         let status = with_readings(Selection::all(), observed);
-        headline(&status, &rows(&status, Selection::all()))
+        headline(
+            &status,
+            &rows(&status, Selection::all()),
+            status.plan.as_ref(),
+        )
     };
     let repositories = Subject::Setting(Setting::Repositories);
     let secrets = Subject::Setting(Setting::Secrets);
@@ -694,7 +720,7 @@ fn rows_that_only_wait_are_named_and_not_counted_as_changes() {
     assert_eq!((with_a_change.show, with_a_change.start), (None, true));
     // A fresh Mac: ten rows differ and the repositories wait on the vault.
     let fresh = status_of("fresh");
-    let fresh = headline(&fresh, &rows(&fresh, Selection::all()));
+    let fresh = headline(&fresh, &rows(&fresh, Selection::all()), fresh.plan.as_ref());
     assert_eq!(fresh.text, "11 changes to make");
     assert!(fresh.start);
     // Waiting is no attention: nothing here needs the person yet.
@@ -706,9 +732,9 @@ fn rows_that_only_wait_are_named_and_not_counted_as_changes() {
     assert!(!app.needs_attention());
 }
 
-/// A STEP THE LAST RUN COULD NOT FINISH lights the tab as a failed row does
-/// (§3.6), though no reading says so (a join the vault refused reads Not
-/// joined); one for a group left as is does not.
+/// A step the last run could not finish lights the tab as a failed row does (§3.6), though no
+/// reading says so (a join the vault refused reads Not joined); one for a group left as is does
+/// not.
 #[test]
 fn a_step_the_run_could_not_finish_lights_the_tab() {
     let joined_wrong = |selection: Selection| SetupStatus {
@@ -814,10 +840,9 @@ fn check_result_without_a_subject_still_signals_its_failure() {
     assert!(app.needs_attention());
 }
 
-/// A FAILURE THE RUN STILL RETRIES BY ITSELF lights nothing (§3.5, §3.6): a
-/// stage's error and a row that failed leave the tab's diamond dark while the
-/// worker retries them, and light it once it stops retrying; the page says
-/// the failure throughout. A row that needs a person lights it at once.
+/// A stage's error or a failed row the worker still retries leaves the tab's diamond dark, and
+/// lights it once retrying stops (§3.5, §3.6); the page says the failure throughout. A row that
+/// needs a person lights it at once.
 #[test]
 fn a_failure_the_run_still_retries_leaves_the_tab_dark() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -843,7 +868,11 @@ fn a_failure_the_run_still_retries_leaves_the_tab_dark() {
                 retrying,
                 ..with_readings(Selection::all(), readings.clone())
             };
-            let shown = headline(&status, &rows(&status, Selection::all()));
+            let shown = headline(
+                &status,
+                &rows(&status, Selection::all()),
+                status.plan.as_ref(),
+            );
             assert!(
                 shown.text.contains("failed")
                     || status
@@ -1076,6 +1105,335 @@ fn a_page_opened_by_hand_waits_for_the_plan_in_force() {
 }
 
 #[test]
+fn unknown_plan_check_stays_disabled_after_a_status_error() {
+    for status in [SetupStatus::default(), status_of("plan-unread")] {
+        let mut app = SystemStateApp::opened();
+        app.publish(status);
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 740.0);
+        let enabled = |key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .and_then(|node| node.state)
+                .unwrap()
+                .enabled
+        };
+        assert!(!enabled("system-state/check"));
+        assert!(enabled("system-state/restore"));
+        act(&mut app, "system-state/check");
+        assert!(app.take_action().is_none(), "Check submits no guessed plan");
+        assert!(!app.status.busy && !app.plan_known());
+        act(&mut app, "system-state/restore");
+        assert!(matches!(
+            app.take_action(),
+            Some(SystemStateAction::Restore)
+        ));
+    }
+}
+
+#[test]
+fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
+    for status in [SetupStatus::default(), status_of("plan-unread")] {
+        let (mut runtime, instance, view) = runtime_with_app(SystemStateApp::opened());
+        runtime.publish_system_state(status);
+        runtime.system_state_gesture(true);
+        let press = |runtime: &mut NativeRuntime, key: &str, value| {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(key),
+                        value,
+                    }),
+                )
+                .unwrap();
+        };
+        let compiled = |runtime: &NativeRuntime| {
+            let (app, state) = page_in(runtime, view);
+            compile(app, state, 999.0, 740.0)
+        };
+        let enabled = |tree: &CompiledUi, key: &str| {
+            tree.semantic(&UiKey::new(key))
+                .and_then(|node| node.state)
+                .unwrap()
+                .enabled
+        };
+        press(&mut runtime, "system-state/row/secrets/disclose", None);
+        for (key, text) in [
+            ("system-state/url", "http://typed.local:7484/v1/team"),
+            ("system-state/password", "inert-password"),
+        ] {
+            press(&mut runtime, key, Some(SemanticInput::Text(text.into())));
+        }
+        let tree = compiled(&runtime);
+        assert!(enabled(&tree, "system-state/url"));
+        assert!(enabled(&tree, "system-state/password"));
+        assert!(enabled(&tree, "system-state/restore"));
+        assert!(!enabled(&tree, "system-state/vault/join"));
+        press(&mut runtime, "system-state/vault/join", None);
+        assert!(runtime.take_system_state_action().is_none());
+
+        let mut selection = Selection::none();
+        selection.set(Setting::Permissions, true);
+        selection.set(Setting::Dock, true);
+        runtime.publish_system_state(SetupStatus {
+            plan: Some(Plan {
+                selection,
+                vault_url: "http://saved.local:7484/v1/team".into(),
+            }),
+            ..SetupStatus::default()
+        });
+        let (app, _) = page_in(&runtime, view);
+        assert_eq!(app.url.value(), "http://typed.local:7484/v1/team");
+        assert_eq!(app.password.text(), "inert-password");
+        assert_eq!(app.plan.selection, selection);
+        assert!(enabled(&compiled(&runtime), "system-state/vault/join"));
+        press(&mut runtime, "system-state/vault/join", None);
+        let (plan, admission, password) = submitted(runtime.take_system_state_action());
+        selection.set(Setting::Secrets, true);
+        assert_eq!(plan.selection, selection);
+        assert_eq!(plan.vault_url, "http://typed.local:7484/v1/team");
+        assert_eq!(admission, Admission::Person);
+        assert_eq!(
+            password.as_ref().and_then(SecretBytes::as_str),
+            Some("inert-password")
+        );
+        assert!(runtime.take_system_state_action().is_none());
+        assert!(!enabled(&compiled(&runtime), "system-state/vault/join"));
+    }
+}
+
+#[test]
+fn a_plan_read_failure_headline_survives_reopen_until_recovery() {
+    const WHY: &str = "injected saved plan read failure";
+    let mut app = crate::App::headless_for_test();
+    let wid = crate::WindowId(0);
+    app.set_system_state_handlers_for_test(
+        crate::system_state_host::InitialSetupHandlers::inert_for_test(),
+    );
+    assert!(app.open_system_state_tab());
+    let compiled = |app: &crate::App| {
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let (page, state) = page_in(&app.native_runtime, view);
+        compile(page, state, 999.0, 740.0)
+    };
+    let loading = label(&compiled(&app), HEADLINE);
+    let failure = SetupStatus {
+        rows: vec![SetupStatusRow {
+            name: "Setup state".into(),
+            status: "error".into(),
+            detail: WHY.into(),
+        }],
+        ..SetupStatus::default()
+    };
+    app.publish_system_state(SetupStatus {
+        rows: vec![SetupStatusRow {
+            status: "pending".into(),
+            ..failure.rows[0].clone()
+        }],
+        ..SetupStatus::default()
+    });
+    assert_eq!(label(&compiled(&app), HEADLINE), loading);
+    for retrying in [true, false] {
+        app.publish_system_state(SetupStatus {
+            retrying,
+            ..failure.clone()
+        });
+        assert_ne!(label(&compiled(&app), HEADLINE), loading);
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let page = page_in(&app.native_runtime, view).0;
+        assert!(!page.plan_known());
+        assert_eq!(page.needs_attention(), !retrying);
+        assert_eq!(
+            crate::system_state_access::menu_line(&page.status, false).is_some(),
+            !retrying
+        );
+    }
+    let failed = label(&compiled(&app), HEADLINE);
+    for operation in [
+        None,
+        Some(SetupOperation::Check),
+        Some(SetupOperation::Restore),
+    ] {
+        let mut busy_page = SystemStateApp::opened();
+        busy_page.publish(SetupStatus {
+            busy: true,
+            operation,
+            ..failure.clone()
+        });
+        assert_eq!(
+            label(
+                &compile(&busy_page, &SystemStateViewState::default(), 999.0, 740.0),
+                HEADLINE
+            ),
+            Headline::before_plan(&SetupStatus {
+                busy: true,
+                operation,
+                ..SetupStatus::default()
+            })
+            .text
+        );
+    }
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    app.dispatch_native_view_event(wid, view, AppEvent::ScrollLines(10_000))
+        .unwrap();
+    let scrolled = compiled(&app);
+    assert!(
+        scrolled
+            .semantics
+            .iter()
+            .any(|node| node.label.contains(WHY) && node.offscreen)
+    );
+    assert!(
+        scrolled
+            .semantic(&UiKey::new(HEADLINE))
+            .is_some_and(|node| !node.offscreen)
+    );
+    assert_eq!(label(&scrolled, HEADLINE), failed);
+    app.close_active_native_tab(wid).unwrap();
+    assert!(app.native_runtime.app(instance).is_none());
+    assert!(app.open_system_state_tab());
+    app.publish_system_state(failure.clone());
+    assert_eq!(label(&compiled(&app), HEADLINE), failed);
+
+    let mut selection = Selection::none();
+    selection.set(Setting::Dock, true);
+    let plan = Plan {
+        selection,
+        vault_url: "http://saved.local:7484/v1/team".into(),
+    };
+    let success = SetupStatus {
+        plan: Some(plan.clone()),
+        observed_vault_url: Some(plan.vault_url.clone()),
+        ..status_of("set-up")
+    };
+    app.publish_system_state(success.clone());
+    let settled = label(&compiled(&app), HEADLINE);
+    assert_ne!(settled, failed);
+    assert!(
+        !compiled(&app)
+            .semantics
+            .iter()
+            .any(|node| node.label.contains(WHY))
+    );
+    let (_, view) = app.active_native_view(wid).unwrap();
+    assert_eq!(page_in(&app.native_runtime, view).0.reviewed_plan(), plan);
+    for retrying in [true, false] {
+        // A later snapshot read failed, but the observer's settled rows remain cached.
+        app.publish_system_state(SetupStatus {
+            observed: success.observed.clone(),
+            observed_vault_url: success.observed_vault_url.clone(),
+            retrying,
+            ..failure.clone()
+        });
+        assert_eq!(label(&compiled(&app), HEADLINE), failed);
+        let page = page_in(&app.native_runtime, view).0;
+        assert!(page.plan_known());
+        assert_eq!(page.needs_attention(), !retrying);
+    }
+    app.publish_system_state(success);
+    assert_eq!(label(&compiled(&app), HEADLINE), settled);
+    assert!(!page_in(&app.native_runtime, view).0.needs_attention());
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn a_cached_success_failure_headline_waits_for_a_successful_plan_read() {
+    let mut selection = Selection::none();
+    selection.set(Setting::Dock, true);
+    let plan = Plan {
+        selection,
+        vault_url: "http://saved.local:7484/v1/team".into(),
+    };
+    let success = SetupStatus {
+        plan: Some(plan.clone()),
+        observed_vault_url: Some(plan.vault_url.clone()),
+        ..status_of("set-up")
+    };
+    let mut app = SystemStateApp::new(plan);
+    let view = SystemStateViewState::default();
+    app.publish(success.clone());
+    let settled = label(&compile(&app, &view, 999.0, 740.0), HEADLINE);
+    app.publish(SetupStatus {
+        rows: vec![SetupStatusRow {
+            name: "Setup state".into(),
+            status: "error".into(),
+            detail: "injected current plan read failure".into(),
+        }],
+        observed: success.observed.clone(),
+        observed_vault_url: success.observed_vault_url.clone(),
+        retrying: true,
+        ..SetupStatus::default()
+    });
+    assert!(app.plan_known());
+    assert_ne!(
+        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
+        settled
+    );
+    assert!(!app.needs_attention());
+    app.publish(success);
+    assert_eq!(
+        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
+        settled
+    );
+}
+
+#[test]
+fn a_generic_check_failure_headline_follows_only_the_exact_reviewed_plan() {
+    let mut selection = Selection::none();
+    selection.set(Setting::Dock, true);
+    let plan = Plan {
+        selection,
+        vault_url: "http://saved.local:7484/v1/team".into(),
+    };
+    let success = SetupStatus {
+        plan: Some(plan.clone()),
+        observed_vault_url: Some(plan.vault_url.clone()),
+        ..status_of("set-up")
+    };
+    let mut app = SystemStateApp::new(plan.clone());
+    let mut view = SystemStateViewState::default();
+    app.publish(success.clone());
+    let settled = label(&compile(&app, &view, 999.0, 740.0), HEADLINE);
+    let checked = SetupStatus {
+        retrying: true,
+        check: Some(SetupCheck {
+            plan,
+            rows: vec![SetupStatusRow {
+                name: "Check".into(),
+                status: "failed".into(),
+                detail: "injected selected check failure".into(),
+            }],
+        }),
+        ..success
+    };
+    app.publish(checked.clone());
+    assert_ne!(
+        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
+        settled
+    );
+    assert!(
+        !app.needs_attention(),
+        "retry suppression is only a signal rule"
+    );
+    app.act(
+        &mut view,
+        "system-state/url",
+        Some(SemanticInput::Text(
+            "http://draft.local:7484/v1/team".into(),
+        )),
+    );
+    for _ in 0..2 {
+        app.publish(checked.clone());
+        assert_eq!(
+            label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
+            settled
+        );
+        assert!(!app.needs_attention());
+    }
+}
+
+#[test]
 fn set_up_now_runs_the_plan_again_when_rows_differ() {
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("mixed"));
@@ -1097,19 +1455,32 @@ fn set_up_now_runs_the_plan_again_when_rows_differ() {
 fn unread_vault_rows_cannot_establish_that_the_mac_is_set_up() {
     let complete = status_of("set-up");
     let selection = complete.plan.as_ref().unwrap().selection;
-    let finished = headline(&complete, &rows(&complete, selection));
+    let finished = headline(
+        &complete,
+        &rows(&complete, selection),
+        complete.plan.as_ref(),
+    );
     let first_read = Headline::before_plan(&SetupStatus::default());
     assert_ne!(finished.text, first_read.text);
     for source in [None, Some("http://other-vault.local:7484/v1/team".into())] {
         let mut partial = complete.clone();
         partial.observed_vault_url = source;
-        let waiting = headline(&partial, &rows(&partial, selection));
+        let waiting = headline(&partial, &rows(&partial, selection), partial.plan.as_ref());
         assert_eq!(waiting.text, first_read.text);
         assert!(!waiting.start);
-        let no_managed = headline(&partial, &rows(&partial, Selection::none()));
+        let no_managed = headline(
+            &partial,
+            &rows(&partial, Selection::none()),
+            partial.plan.as_ref(),
+        );
         assert_eq!(
             no_managed.text,
-            headline(&complete, &rows(&complete, Selection::none())).text
+            headline(
+                &complete,
+                &rows(&complete, Selection::none()),
+                complete.plan.as_ref()
+            )
+            .text
         );
         partial
             .observed
@@ -1118,7 +1489,7 @@ fn unread_vault_rows_cannot_establish_that_the_mac_is_set_up() {
             .unwrap()
             .standing = Standing::Differs;
         assert!(
-            headline(&partial, &rows(&partial, selection)).start,
+            headline(&partial, &rows(&partial, selection), partial.plan.as_ref()).start,
             "a known change still offers setup while the other source is unread"
         );
     }
@@ -1128,7 +1499,11 @@ fn unread_vault_rows_cannot_establish_that_the_mac_is_set_up() {
 fn an_unknown_managed_row_keeps_the_headline_unread() {
     let complete = status_of("set-up");
     let selection = complete.plan.as_ref().unwrap().selection;
-    let finished = headline(&complete, &rows(&complete, selection));
+    let finished = headline(
+        &complete,
+        &rows(&complete, selection),
+        complete.plan.as_ref(),
+    );
     let first_read = Headline::before_plan(&SetupStatus::default());
     assert_ne!(finished.text, first_read.text);
 
@@ -1139,12 +1514,22 @@ fn an_unknown_managed_row_keeps_the_headline_unread() {
         .find(|row| row.subject == Subject::Setting(Setting::Repositories))
         .unwrap()
         .standing = Standing::Unknown;
-    let waiting = headline(&partial, &rows(&partial, selection));
+    let waiting = headline(&partial, &rows(&partial, selection), partial.plan.as_ref());
     assert_eq!(waiting.text, first_read.text);
     assert!(!waiting.start);
     assert_eq!(
-        headline(&partial, &rows(&partial, Selection::none())).text,
-        headline(&complete, &rows(&complete, Selection::none())).text
+        headline(
+            &partial,
+            &rows(&partial, Selection::none()),
+            partial.plan.as_ref()
+        )
+        .text,
+        headline(
+            &complete,
+            &rows(&complete, Selection::none()),
+            complete.plan.as_ref()
+        )
+        .text
     );
 
     partial
@@ -1154,7 +1539,7 @@ fn an_unknown_managed_row_keeps_the_headline_unread() {
         .unwrap()
         .standing = Standing::Differs;
     assert!(
-        headline(&partial, &rows(&partial, selection)).start,
+        headline(&partial, &rows(&partial, selection), partial.plan.as_ref()).start,
         "a known change still offers setup while another reading is unknown"
     );
 }
@@ -1700,11 +2085,10 @@ fn password_projection_never_contains_the_secret_and_grapheme_edits_work() {
     assert!(password.projection().text.is_empty());
 }
 
-/// A SYNC THE PERSON TURNED OFF IS THEIR CHOICE (§3.3, §4): the Secrets vault
-/// row reads Sync off in place, at the value it then wants, with its note; it
-/// is no change to make (no count, no Set up now), and it carries a quiet Turn
-/// On Sync whose press says whose it was. NEGATIVE CONTROL: a sync that is not
-/// set up differs, counted with Set up now, and has no Turn On Sync to press.
+/// A sync the person turned off is their choice (§3.3, §4): the Secrets row reads Sync off in
+/// place with its note, is no change to make, and carries a quiet Turn On Sync whose press says
+/// whose it was. Negative control: a sync not set up differs, is counted with Set up now, and has
+/// no Turn On Sync.
 #[test]
 fn a_sync_turned_off_reads_as_the_persons_choice_with_a_quiet_way_back_on() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -1728,7 +2112,7 @@ fn a_sync_turned_off_reads_as_the_persons_choice_with_a_quiet_way_back_on() {
         (Some(Chip::InPlace), Some(note))
     );
     assert!(!row.to_change());
-    let line = headline(&status, &all);
+    let line = headline(&status, &all, status.plan.as_ref());
     assert_eq!(
         (line.text.as_str(), line.start),
         ("This Mac is set up", false)
@@ -1754,17 +2138,16 @@ fn a_sync_turned_off_reads_as_the_persons_choice_with_a_quiet_way_back_on() {
     let all = rows(&status, Selection::all());
     let row = all.iter().find(|row| row.subject == secrets).unwrap();
     assert!(!row.turn_on_sync);
-    let line = headline(&status, &all);
+    let line = headline(&status, &all, status.plan.as_ref());
     assert_eq!((line.text.as_str(), line.start), ("1 change to make", true));
     app.publish(status);
     act(&mut app, "system-state/row/secrets/sync-on");
     assert!(app.take_action().is_none(), "nothing to turn on");
 }
 
-/// THE PAGE KEEPS ITS WORDS WHOLE in a narrow pane and at a large text size: in every
-/// scenario, from 1x text at 128 points, 1.5x at 160 and 2x at 200, up to a wide window, no
-/// text, button face or chip overflows its box or is cut by the card, with the vault open
-/// too. Below those widths a status chip's pill is wider than the card.
+/// In every scenario, from 1x text at 128 points, 1.5x at 160 and 2x at 200 up to a wide window,
+/// no text, button face or chip overflows its box or is cut by the card, the vault open too.
+/// Narrower, a status chip's pill is wider than the card.
 #[test]
 fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
@@ -1816,14 +2199,12 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
     assert!(cut.is_empty(), "{cut:#?}");
 }
 
-/// A SHORT WINDOW KEEPS THE PAGE'S CONTROLS IN VIEW: the brand and then the title give way
-/// before the headline's buttons or the footer leave the window, so either shows only where
-/// those are whole, the brand only beside the title, and a taller window never shows less.
-/// Whether they show depends on the window and the text size, not on which state the page is in,
-/// while the headline names at most one row. With such a headline, a window as tall as `least`
-/// (200 points at 1x, 320 at 1.5x, 440 at 2x, 320 wide) keeps the controls in view; the page
-/// before this rule needed 280, 448 and 592. A headline naming every setting as failed counts its
-/// own height, and is held to the order alone.
+/// A short window keeps the page's controls in view: the brand and then the title give way
+/// before the headline's buttons or the footer leave the window, the brand shows only beside the
+/// title, and a taller window never shows less. What shows depends on the window and the text
+/// size, not the page's state, while the headline names at most one row; then a window `least`
+/// tall (200 points at 1x, 320 at 1.5x, 440 at 2x, 320 wide) keeps the controls in view. A
+/// headline naming every setting as failed counts its own height and is held to the order alone.
 #[test]
 fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
@@ -2737,6 +3118,7 @@ fn page_states() -> Vec<(String, SetupStatus, bool)> {
         "non-alab",
         "failed",
         "mixed",
+        "restore-blocked",
         "fresh",
     ] {
         out.push((name.to_owned(), status_of(name), false));

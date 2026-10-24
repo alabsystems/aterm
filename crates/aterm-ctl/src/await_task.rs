@@ -70,8 +70,7 @@ struct Request {
     targets: Vec<Target>,
     combine: Combine,
     since: Option<u64>,
-    /// `facts=1`: a new fact word on a worker's task record answers too (the occupancy design's
-    /// manager door).
+    /// `facts=1`: a new fact word on a worker's task record answers too.
     facts: bool,
     fact_since: Option<u64>,
     timeout: Option<Duration>,
@@ -254,9 +253,8 @@ enum Leg {
     /// An `ERR` line, or a reply this client cannot read: the run's end, except an
     /// `ERR no such session @<sel>` after the baseline, which closes that target.
     Failed(io::Error),
-    /// A leg over a drive the peer did not serve, which the same leg a
-    /// moment later may be: its share for this machine's address full,
-    /// nothing listening at its port (an aterm restarting, its listener
+    /// A leg over a drive the peer did not serve but may serve a moment later: its share for this
+    /// machine's address full, nothing listening at its port (an aterm restarting, its listener
     /// rebinding), or the connection cut before the rows.
     Again(io::Error),
     /// A connect phase that already said why on stderr.
@@ -375,8 +373,8 @@ fn row_rev(row: &str) -> Option<u64> {
     row_field(row, "rev").and_then(|rev| rev.parse().ok())
 }
 
-/// A row's `fact_rev=`: 0 where it has none, as a record whose fact word was never edited
-/// answers (and an older server's every row).
+/// A row's `fact_rev=`, 0 where it has none (a record whose fact word was never edited, or any
+/// row from an older server).
 fn row_fact_rev(row: &str) -> u64 {
     row_field(row, "fact_rev")
         .and_then(|rev| rev.parse().ok())
@@ -394,9 +392,9 @@ fn row_closed(row: &str) -> bool {
     row_field(row, "state") == Some("closed")
 }
 
-/// News already observed by an all-wait survives subsequent legs. The server owns
-/// `task_news` from its qualifying request latch, including the initial baseline
-/// leg's edges the client has not read yet. Only absent bits use legacy edges.
+/// Whether `row` is news for `target`. A server's `task_news=` is authoritative (it latches from
+/// the qualifying request, covering the baseline leg's edges the client has not read yet); a row
+/// without one is judged by the target's `since` and `fact_since` edges.
 fn row_news(row: &str, target: &Target, facts: bool) -> bool {
     match row_field(row, "task_news") {
         Some("1") => return true,
@@ -445,8 +443,8 @@ fn gone_target(e: &io::Error, targets: &[Target], live: &[usize]) -> Option<usiz
 }
 
 /// One leg's request: each target with its edges, and under `facts=1` the request's own
-/// `fact_since=` for the targets whose element cannot carry one before the baseline named their
-/// `rev` (every such target's edge is the request's, [`run_await_task`]).
+/// `fact_since=` for the targets with no `rev` yet, whose element cannot carry a fact edge (each
+/// such target's edge is the request's, [`run_await_task`]).
 fn leg_request<'a>(
     targets: impl Iterator<Item = &'a Target>,
     combine: Combine,
@@ -1139,10 +1137,8 @@ mod tests {
         }
     }
 
-    /// `facts=1` rides every leg, and the re-arm carries each target's fact edge as its baseline
-    /// row read it (`fact_rev=`, 0 for a record whose word was never edited), so a word noted
-    /// between legs answers the next one. NEGATIVE CONTROL: without `facts=1` no leg asks for it
-    /// and no element carries a fact edge.
+    /// The re-arm carries each target's fact edge as its baseline row read it (0 with no
+    /// `fact_rev=`); without `facts=1` no leg asks for facts and no element carries a fact edge.
     #[test]
     fn under_facts_1_the_rearm_carries_each_targets_fact_edge() {
         let x = "/x.sock";
@@ -1261,8 +1257,8 @@ mod tests {
         );
     }
 
-    /// An all-wait owns news once it saw it, even when a fact clears or a terminal task
-    /// reopens while another target is still quiet. Server legs latch those rows too.
+    /// An all-wait keeps news it saw, even when a fact clears or a terminal task reopens before
+    /// the other target answers.
     #[test]
     fn all_waits_keep_terminal_news_that_came_and_went_between_legs() {
         all_waits_keep_news_between_legs(false, false);
@@ -1341,7 +1337,7 @@ mod tests {
         let legs = scripted(vec![
             (x, first, timed_out(&[baseline, other])),
             (x, second, timed_out(&[news, other])),
-            // A has cleared/reopened before this leg. It must not be asked again.
+            // s-a's news is held, so this leg does not ask for it again.
             (x, third, answered(&[final_news])),
         ]);
         let result = wait_task_groups(

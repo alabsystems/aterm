@@ -126,7 +126,8 @@ pub struct Args {
 
 /// The verb's arguments. Pure.
 /// # Errors
-/// A usage error: an unknown word, a flag without its value, no proposer, no `--out`.
+/// A usage error: an unknown word, a flag without its value or with a bad one, no proposer, no
+/// `--out`, flags that exclude or need each other, or a debug-only flag in a release build.
 pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let mut a = args.to_vec();
     let grid = take_flag(&mut a, "--grid");
@@ -786,8 +787,8 @@ fn remove_void_bundles(files: &[PathBuf]) -> Result<Vec<PathBuf>, Fail> {
 /// The searches `args` names.
 /// # Errors
 /// This lab's build names no commit (exit 1, before any evaluator is built), the pinned policy
-/// refused (exit 1), a worker could not be spawned, a void bundle could not be removed, or the
-/// summary could not be written.
+/// refused (exit 1), a worker could not be spawned or admitted, a void bundle could not be
+/// removed, or the summary could not be written.
 pub fn run(args: &Args, plans_text: Option<&str>, out: &Path) -> Result<(i32, String), Fail> {
     run_in(args, plans_text, out, LAB_BUILD)
 }
@@ -799,7 +800,8 @@ fn run_in(
     build: &str,
 ) -> Result<(i32, String), Fail> {
     check_build(build)?;
-    // Workers are spawned first, so they build their evaluators while the coordinator builds its own.
+    // Workers are spawned first, so they build their evaluators while the coordinator builds
+    // its own.
     let mut pool = match &args.workers {
         Some(p) => {
             crate::stop::install();
@@ -2177,9 +2179,8 @@ not a plan
         }
     }
 
-    /// A distributed bundle naming the grid has declared provenance (verify does not re-run the
-    /// grid for it), but what the grid fixes for free is checked: the plan is the grid's plan at
-    /// the index, the round is 0, and the counts are the grid's (design §11.3).
+    /// A distributed grid bundle's provenance is declared, yet its plan, round 0 and counts are
+    /// checked against the grid's.
     #[test]
     fn a_distributed_grid_bundle_is_declared_and_what_the_grid_fixes_is_checked() {
         let bytes = searched_bundle();
@@ -2235,8 +2236,8 @@ not a plan
         }
     }
 
-    /// The new flags' rules: `--threads` and `--workers` exclude each other, `--check` and the
-    /// debug overrides need `--workers`, and each value is bounded.
+    /// `--threads` and `--workers` exclude each other; `--check` and the debug overrides need
+    /// `--workers`.
     #[test]
     fn the_parallel_flags_are_exclusive_and_bounded() {
         let a = parse_args(&words(&["--grid", "--out", "o", "--threads", "4"])).expect("parses");

@@ -402,10 +402,10 @@ fn reassert_witness(layout: &Layout, program: &str, build: u64) -> Result<(), Fl
 /// Lay the shim of each command the up-to-date `build` exposes whose shim is gone or runs another
 /// of `program`'s builds, naming them.
 ///
-/// The commands come from the build's record ([`crate::store::recorded_exposes`]); a build
-/// staged before that record reads its signed manifest, which then becomes the record. When that
-/// manifest cannot be read, it lays nothing while a command of `program` is still on PATH under
-/// its own name ([`crate::installed_exposes`]), and otherwise fails with the read's error.
+/// The commands come from the build's record ([`crate::store::recorded_exposes`]), or else its
+/// signed manifest, which then becomes the record. When that manifest cannot be read, it lays
+/// nothing while a command of `program` is still on PATH under its own name
+/// ([`crate::installed_exposes`]), and otherwise fails with the read's error.
 fn lay_commands_off_path(
     fetcher: &dyn Fetcher,
     layout: &Layout,
@@ -856,11 +856,10 @@ pub(crate) struct Landing<'a> {
     pub download_turn: Option<&'a DownloadTicket<'a>>,
 }
 
-/// The order landings side by side take the link in: ONE TRANSFER AT A TIME, in the order
-/// their programs were taken ([`Self::ticket`]) — not in the order their threads reach the
-/// download, a coin flip between two lanes woken together — so the first program taken has
-/// the whole link, however slow, while a later one's landing gets as far as its transfer and
-/// waits there, its verify, unpack and activate overlapping the next transfer.
+/// The order landings side by side take the link in: one transfer at a time, in the order their
+/// programs were taken ([`Self::ticket`]), not the order their threads reach the download. The
+/// first program taken has the whole link; a later landing waits at its transfer, and each
+/// landing's verify, unpack and activate overlap the next one's transfer.
 #[derive(Default)]
 pub(crate) struct DownloadTurns {
     state: std::sync::Mutex<Turns>,
@@ -1188,7 +1187,7 @@ pub struct AppliedMember {
     pub tree_root: String,
 }
 
-/// What a [`rollback`].
+/// What a [`rollback`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackReport {
     /// The program rolled back.
@@ -1414,10 +1413,9 @@ fn apply_group(
     resolved_assets: &mut BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
 ) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
-    // `installed` itself, the map `decide` reads, is not widened (that would answer
-    // UpToDate for an unmoved pin); `decide` still returns Install, the re-stage
-    // [`Staged::was_live`] exists for. The scan runs only when the shim view was silent
-    // for every member.
+    // With no member installed, the group applies only when one is tombstoned in place.
+    // `installed`, the map `decide` reads, is not widened for that (it would answer UpToDate for
+    // an unmoved pin), so `decide` returns Install, the re-stage [`Staged::was_live`] exists for.
     if group.members.iter().all(|m| !installed.contains_key(m))
         && !tombstoned_in_place(layout, group.members.iter().map(String::as_str))
     {

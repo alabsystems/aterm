@@ -728,6 +728,149 @@ fn procs_rows_carry_labels_states_and_base_units() {
     assert!(all_text(&r).contains("more=2 rows"), "{}", all_text(&r));
 }
 
+/// Each process row carries its age at the reading, and each program its oldest member's, a
+/// lower bound while a member's birth went unread. NEGATIVE CONTROL: with no birth read, every
+/// age reads unavailable, never 0.
+#[test]
+fn procs_carry_each_age_and_each_programs_oldest() {
+    const MIN: i64 = 60_000;
+    let at = sample(11, &[0, 0, 0, 0], 1).at_unix_ms;
+    let born = |at_s: u64, busy: &[u64], k: u64| {
+        let mut input = sample(at_s, busy, k);
+        let procs = input.procs.as_mut().expect("a sweep");
+        procs.push(proc(203, 201, Some(7 * k), 10, "cargo", 501));
+        for p in procs.iter_mut() {
+            p.birth_ms = match p.pid {
+                200 => Some(at - 60 * MIN),
+                201 => Some(at - 47 * MIN),
+                _ => None,
+            };
+        }
+        input
+    };
+    let mut v = Vitals::new();
+    let _ = v.absorb(&born(10, &[0, 0, 0, 0], 0));
+    let s = v.absorb(&born(11, &[20, 30, 100, 90], 1));
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    let row = |pid: u32| {
+        text.lines()
+            .find(|l| l.starts_with(&format!("proc pid={pid} ")))
+            .unwrap_or_else(|| panic!("{pid}: {text}"))
+    };
+    assert!(row(201).ends_with(" age_ms=2820000"), "{}", row(201));
+    assert!(
+        row(202).ends_with(" age_ms=unavailable(not_sampled)"),
+        "{}",
+        row(202)
+    );
+    let j = render_json(&query(View::Procs, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let procs = j.get("procs").expect("procs");
+    let rows = match procs.get("rows") {
+        Some(Jv::Arr(rows)) => rows,
+        other => panic!("{other:?}"),
+    };
+    let age_of = |pid: u32| {
+        rows.iter()
+            .find(|r| r.get("pid") == Some(&Jv::u(u64::from(pid))))
+            .and_then(|r| r.get("age_ms"))
+            .cloned()
+    };
+    assert_eq!(age_of(200), Some(Jv::u(3_600_000)));
+    assert_eq!(age_of(203), Some(Jv::why("not_sampled")));
+    let programs = match procs.get("programs") {
+        Some(Jv::Arr(programs)) => programs,
+        other => panic!("{other:?}"),
+    };
+    let program = |exe: &str| {
+        programs
+            .iter()
+            .find(|g| g.get("exe") == Some(&Jv::s(exe)))
+            .unwrap_or_else(|| panic!("{exe}: {}", j.to_text()))
+    };
+    let cargo = program("cargo");
+    assert_eq!(cargo.get("n"), Some(&Jv::u(2)));
+    assert_eq!(
+        (cargo.get("scope"), cargo.get("tab")),
+        (Some(&Jv::s("tab")), Some(&Jv::u(1)))
+    );
+    assert_eq!(
+        cargo.get("age_ms"),
+        Some(&Jv::at_least(2_820_000, "not_sampled")),
+        "one member unread: its oldest may be older"
+    );
+    assert_eq!(program("zsh").get("age_ms"), Some(&Jv::u(3_600_000)));
+    assert_eq!(program("-").get("age_ms"), Some(&Jv::why("not_sampled")));
+    assert!(
+        programs
+            .iter()
+            .all(|g| g.get("scope") == Some(&Jv::s("tab"))),
+        "the tab's programs only: {}",
+        j.to_text()
+    );
+
+    let s = snapshot();
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("proc ")).collect();
+    assert!(
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|l| l.ends_with(" age_ms=unavailable(not_sampled)")),
+        "{text}"
+    );
+    let j = render_json(&query(View::Procs, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    match j.get("procs").and_then(|p| p.get("programs")) {
+        Some(Jv::Arr(programs)) => assert!(
+            !programs.is_empty()
+                && programs
+                    .iter()
+                    .all(|g| g.get("age_ms") == Some(&Jv::why("not_sampled"))),
+            "{}",
+            j.to_text()
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A pane's programs are its tab's: a program groups by tab, under its least pane's key, so a
+/// split tab's other pane lists them too. NEGATIVE CONTROL: another tab's program stays out.
+#[test]
+fn a_panes_programs_are_its_tabs() {
+    let group = |name: &str, tab: u64| ProgramGroup {
+        name: name.into(),
+        scope: ProcScope::Tab(tab),
+        n: 1,
+        cores: 0.5,
+        footprint: None,
+        born_ms: None,
+        unborn: 1,
+    };
+    let mut s = snapshot();
+    s.programs = vec![group("cargo", 7), group("vim", 12)];
+    let mut w = world();
+    w.target.key = 9;
+    w.target.panes = vec![7, 9];
+    let c = ctx(&w, Some(&s), true, true);
+    for scope in [ScopeArg::Pane, ScopeArg::Tab] {
+        let mut q = query(View::Procs, true);
+        q.scope = Some(scope);
+        let j = render_json(&q, &c);
+        let exes: Vec<Jv> = match j.get("procs").and_then(|p| p.get("programs")) {
+            Some(Jv::Arr(programs)) => programs
+                .iter()
+                .filter_map(|g| g.get("exe").cloned())
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(exes, [Jv::s("cargo")], "{scope:?}: {}", j.to_text());
+    }
+}
+
 #[test]
 fn unmeasured_figures_read_unavailable_never_zero() {
     let s = snapshot();

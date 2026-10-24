@@ -29,10 +29,9 @@ const KITTY_MAX_CAPS: f32 = 2.4;
 /// is (`assets/aterm-rainbow-kitty.png` reads about 24% on its dark ground).
 const RIBBON_DARK: f32 = 0.24;
 const RIBBON_LIGHT: f32 = 0.30;
-/// The left edge of the kitty's `h`-tall box behind a caret at `caret_x`,
-/// `caret_w` wide, measured from the pixels the art draws: its drawn left edge
-/// (the raised tail and the stretched hind foot) stands at the caret's middle,
-/// so the caret covers its haunch and the tail rises past the caret's top, as
+/// The left edge of the kitty's `h`-tall box behind a caret at `caret_x`, `caret_w` wide, placed by
+/// the pixels the art draws: its drawn left edge (the raised tail and stretched hind foot) stands
+/// at the caret's middle, so the caret covers its haunch, the tail rises past the caret's top, as
 /// in `assets/aterm-rainbow-kitty.png`, and none of it shows over the letters.
 fn kitty_x(caret_x: f32, caret_w: f32, h: f32, art: ImageArt) -> f32 {
     let drawn = art.mask().drawn(ArtSpan::BOX).unwrap_or(ArtSpan::BOX);
@@ -123,12 +122,9 @@ impl BrandSpec {
     }
 }
 
-/// THE BRAND LOCKUP (§3.1): `❯ aterm · ALab▌` in the terminal's mono face,
-/// the prompt and the caret in the icon's teal, a dim six-stripe ribbon behind
-/// the words that fades in under their first letter and ends flush at the
-/// caret, and the tabby behind the caret, which covers its haunch while the
-/// tail rises past the caret's top, as the brand image draws them.
-/// Text only for Serious Mode and high contrast.
+/// The brand lockup (§3.1): `❯ aterm · ALab▌` in the terminal's mono face, the prompt and caret in
+/// the icon's teal, a dim six-stripe ribbon behind the words, and the tabby behind the caret
+/// ([`kitty_x`]). Text only for Serious Mode and high contrast.
 pub(crate) fn paint_brand(
     prims: &mut Vec<DrawPrim>,
     rect: LogicalRect,
@@ -198,8 +194,6 @@ pub(crate) fn paint_brand(
         let h = spec.kitty_height();
         let art = ImageArt::BrandKitty { dark };
         let w = h * art.aspect();
-        // Placed by the pixels it draws, as the brand image is: the caret
-        // covers its haunch, and the tail rises past the caret's top.
         prims.push(DrawPrim::Image {
             x: kitty_x(caret_x, caret_w, h, art),
             y: baseline + px * 0.12 - h,
@@ -219,12 +213,11 @@ pub(crate) fn paint_brand(
     });
 }
 
-/// THE RIBBON (§3.1): six flat stripes, R O Y G B V, as tall as the x-height
-/// and centred on it, behind the words over `span`. It fades in over 24pt
-/// from the first letter and stops at the caret. Each stripe is its colour
-/// mixed into the page's `surface` in sRGB and painted opaque: the raster
-/// composites in linear light, where a 24% alpha reads twice as strong as the
-/// brand image's band.
+/// The ribbon (§3.1): six flat stripes, R O Y G B V, as tall as the x-height and centred on it,
+/// behind the words over `span`, fading in over 24pt from the first letter and stopping at the
+/// caret. Each stripe is its colour mixed into the page's `surface` in sRGB and painted opaque:
+/// the raster composites in linear light, where a 24% alpha reads twice as strong as the brand
+/// image's band.
 fn paint_ribbon(
     prims: &mut Vec<DrawPrim>,
     surface: [u8; 3],
@@ -368,10 +361,9 @@ impl Chip {
     }
 }
 
-/// A ROW'S CHIP, right-aligned in its rect: the check in the success green;
-/// `Will change` on an accent wash (a full accent pill with a ring while its
-/// step runs); `Needs you` in the band's warn amber; `Failed` in the danger
-/// red; `Left as is` as quiet words.
+/// A row's chip, right-aligned in its rect: the check in the success green; `Will change` on an
+/// accent wash (a full accent pill with a ring while its step runs); `Needs you` in the band's
+/// warn amber; `Failed` in the danger red; `Left as is` as quiet words.
 pub(crate) fn paint_chip(
     prims: &mut Vec<DrawPrim>,
     rect: LogicalRect,
@@ -468,8 +460,8 @@ pub(crate) fn paint_chip(
     }
 }
 
-/// The run's METER: a thin capsule, `done` of `total` filled in the accent.
-/// The node's value is `done,total`.
+/// The run's meter: a thin capsule, `done` of `total` filled in the accent. The node's value is
+/// `done,total`.
 pub(crate) fn paint_meter(
     prims: &mut Vec<DrawPrim>,
     rect: LogicalRect,
@@ -540,7 +532,7 @@ mod tests {
                 );
             }
         }
-        // An unreadable value draws the full lockup at the default size.
+        // Unreadable numbers fall back to the default size and scale.
         assert_eq!(
             BrandSpec::parse(Some("kitty,NaN,0")),
             BrandSpec {

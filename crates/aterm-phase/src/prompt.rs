@@ -192,7 +192,7 @@ fn without_position(title: &str) -> &str {
             .flatten()
     }
     let t = crate::text::trim_end(title);
-    if t.starts_with(const { crate::anchors::anchor_text("mcp.title") }) {
+    if t.starts_with(const { crate::anchor!("mcp.title") }) {
         return t;
     }
     if !t.as_bytes().last().is_some_and(u8::is_ascii_digit) {
@@ -211,25 +211,24 @@ fn without_position(title: &str) -> &str {
 /// Parses a box title row by its header grammar, returning `None` if a ` · ` suffix is unrecognized.
 #[must_use]
 pub fn parse_header(title: &str) -> Option<Header> {
-    use crate::anchors::anchor_text;
     let t = without_position(crate::text::trim(title));
     let (head, origin) = match t.split_once(" · ") {
         Some((head, rest)) => (head, Some(origin_of(rest)?)),
         None => (t, None),
     };
     let runs_on = head
-        .rfind(const { anchor_text("header.runs_on") })
+        .rfind(const { crate::anchor!("header.runs_on") })
         .filter(|_| head.ends_with(')'))
         .map(|at| {
             (
                 &head[..at],
-                &head[at + const { anchor_text("header.runs_on") }.len()..head.len() - 1],
+                &head[at + const { crate::anchor!("header.runs_on") }.len()..head.len() - 1],
             )
         })
         .filter(|(_, m)| !crate::text::trim(m).is_empty());
     let (base, runs_on, unsandboxed) = match runs_on {
         Some((base, machine)) => (base, Some(machine.to_string()), false),
-        None => match head.strip_suffix(const { anchor_text("header.unsandboxed") }) {
+        None => match head.strip_suffix(const { crate::anchor!("header.unsandboxed") }) {
             Some(base) => (base, None, true),
             None => (head, None, false),
         },
@@ -243,20 +242,19 @@ pub fn parse_header(title: &str) -> Option<Header> {
 }
 
 fn origin_of(rest: &str) -> Option<Origin> {
-    use crate::anchors::anchor_text;
     let rest = crate::text::trim(rest);
     let named =
         |s: &str| (!crate::text::trim(s).is_empty()).then(|| crate::text::trim(s).to_string());
-    if rest == const { anchor_text("origin.workflow") } {
+    if rest == const { crate::anchor!("origin.workflow") } {
         return Some(Origin::Workflow { name: None });
     }
-    if rest == const { anchor_text("origin.subagent") } {
+    if rest == const { crate::anchor!("origin.subagent") } {
         return Some(Origin::Subagent { name: None });
     }
-    if rest == const { anchor_text("origin.remote") } {
+    if rest == const { crate::anchor!("origin.remote") } {
         return Some(Origin::RemoteAgent);
     }
-    if rest == const { anchor_text("origin.plugin") } {
+    if rest == const { crate::anchor!("origin.plugin") } {
         return Some(Origin::Plugin { name: None });
     }
     let name = rest.strip_prefix("from the ")?;
@@ -360,8 +358,8 @@ impl Opt {
     #[must_use]
     pub fn recommended(&self) -> bool {
         let label = self.label.trim();
-        label.ends_with(const { crate::anchors::anchor_text("muse.question.recommended") })
-            || label.starts_with(const { crate::anchors::anchor_text("agy.question.recommended") })
+        label.ends_with(const { crate::anchor!("muse.question.recommended") })
+            || label.starts_with(const { crate::anchor!("agy.question.recommended") })
     }
 
     /// Returns `true` if the option label is an affirmative grant (`Yes...`).
@@ -551,8 +549,7 @@ impl PromptV2 {
     #[must_use]
     pub fn tool_card(&self) -> bool {
         self.kind == PromptKind::Tool
-            && self.base_title().as_deref()
-                != Some(const { crate::anchors::anchor_text("box.tool") })
+            && self.base_title().as_deref() != Some(const { crate::anchor!("box.tool") })
     }
 
     /// The time the countdown says is left before Claude Code denies the box (its `M:SS`, rounded down).
@@ -575,7 +572,7 @@ impl PromptV2 {
     pub fn foot_note(&self, rows: &[String]) -> Option<String> {
         let q = self.question.filter(|&q| {
             rows.get(q).map(|r| crate::text::trim(r))
-                == Some(const { crate::anchors::anchor_text("prompt.proceed") })
+                == Some(const { crate::anchor!("prompt.proceed") })
         })?;
         let over_blanks = |mut at: usize| {
             while at > 0 && crate::text::trim(&rows[at - 1]).is_empty() {
@@ -658,7 +655,6 @@ pub struct RmBreaker {
 /// Parses a `Dangerous rm/rmdir operation ...` note into an [`RmBreaker`].
 #[must_use]
 pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
-    use crate::anchors::anchor_text;
     let note = crate::text::trim(note);
     if note.matches("Dangerous").count() != 1 {
         return None;
@@ -668,7 +664,7 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
         (RmCommand::Rmdir, "box.rmdir_breaker.head"),
     ]
     .into_iter()
-    .find_map(|(c, id)| note.strip_prefix(anchor_text(id)).map(|r| (c, r)))?;
+    .find_map(|(c, id)| note.strip_prefix(crate::anchor(id)).map(|r| (c, r)))?;
     const SUFFIXES: &[(&str, &str, RmBreakerKind)] = &[
         (
             "box.rm_breaker.empty_var_in_substitution",
@@ -709,15 +705,15 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
     let (kind, target) = SUFFIXES
         .iter()
         .find_map(|&(id, then, kind)| {
-            rest.strip_prefix(anchor_text(id))
+            rest.strip_prefix(crate::anchor(id))
                 .and_then(|t| t.strip_prefix(then))
                 .map(|t| (kind, t))
         })
         .or_else(|| {
             let qualified =
-                rest.strip_prefix(const { anchor_text("box.rm_breaker.not_ruled_out") });
+                rest.strip_prefix(const { crate::anchor!("box.rm_breaker.not_ruled_out") });
             let why = qualified.unwrap_or(rest).strip_prefix("— ")?;
-            let too_many = const { anchor_text("box.rm_breaker.too_many") };
+            let too_many = const { crate::anchor!("box.rm_breaker.too_many") };
             if why.starts_with(too_many.trim_end_matches('(').trim_end()) {
                 return why
                     .strip_prefix(too_many)
@@ -725,7 +721,7 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
                     .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                     .map(|n| (RmBreakerKind::TooManySubstitutions, n));
             }
-            let nested = const { anchor_text("box.rm_breaker.nested_unanalyzed") };
+            let nested = const { crate::anchor!("box.rm_breaker.nested_unanalyzed") };
             if why.starts_with(nested) {
                 return (why == nested).then_some((RmBreakerKind::NestedUnanalyzed, why));
             }
@@ -945,7 +941,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         }
         PromptKind::McpServer => {
             v2.command = title
-                .strip_prefix(const { crate::anchors::anchor_text("mcp.title") })
+                .strip_prefix(const { crate::anchor!("mcp.title") })
                 .map(|name| crate::text::trim(name).to_string())
                 .unwrap_or_default();
             v2.description = prose_of(body, cur);
@@ -1000,7 +996,6 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
 }
 
 fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
-    use crate::anchors::anchor_text;
     use crate::question::QuestionOption;
     let opt = |n: Option<u8>, label: &str, focused: bool, row: usize| Opt {
         n,
@@ -1016,7 +1011,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
             .map(|o| opt(Some(o.n), &o.label, o.focused, o.row))
             .collect()
     };
-    let chat = const { anchor_text("question.chat") };
+    let chat = const { crate::anchor!("question.chat") };
     match &d.form {
         QuestionForm::Single {
             options: o,
@@ -1047,7 +1042,7 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
         QuestionForm::Review { submit, cancel, .. } => vec![
             opt(
                 Some(1),
-                const { anchor_text("question.review_submit") },
+                const { crate::anchor!("question.review_submit") },
                 submit.focused,
                 submit.row,
             ),
@@ -1063,15 +1058,13 @@ fn question_opts(d: &QuestionDialog, rows: &[String]) -> Vec<Opt> {
 }
 
 fn names_file_in_question(title: &str) -> bool {
-    use crate::anchors::anchor_text;
     let base = parse_header(title).map_or_else(|| crate::text::trim(title).to_string(), |h| h.base);
-    base == const { anchor_text("box.edit_notebook") } || is_ide_diff(&base)
+    base == const { crate::anchor!("box.edit_notebook") } || is_ide_diff(&base)
 }
 
 fn is_ide_diff(base: &str) -> bool {
-    use crate::anchors::anchor_text;
-    base.strip_prefix(const { anchor_text("box.ide_diff") })
-        .and_then(|rest| rest.strip_suffix(const { anchor_text("box.ide_diff.mark") }))
+    base.strip_prefix(const { crate::anchor!("box.ide_diff") })
+        .and_then(|rest| rest.strip_suffix(const { crate::anchor!("box.ide_diff.mark") }))
         .is_some_and(|ide| !crate::text::trim(ide).is_empty())
 }
 
@@ -1096,11 +1089,10 @@ fn question_file(row: &str) -> Option<String> {
 }
 
 fn subject_of(kind: PromptKind, title: &str, body: &[String]) -> String {
-    use crate::anchors::anchor_text;
     if kind == PromptKind::Skill {
         return title
             .trim()
-            .strip_prefix(const { anchor_text("box.skill") })
+            .strip_prefix(const { crate::anchor!("box.skill") })
             .and_then(|t| t.strip_suffix("\"?"))
             .unwrap_or_default()
             .to_string();
@@ -1118,7 +1110,6 @@ fn subject_of(kind: PromptKind, title: &str, body: &[String]) -> String {
 }
 
 fn is_question(footer: Option<&str>, options: &[Opt]) -> bool {
-    use crate::anchors::anchor_text;
     let footer_says = footer.is_some_and(|f| {
         let (select, navigate) = question_items(f);
         select || navigate
@@ -1126,8 +1117,8 @@ fn is_question(footer: Option<&str>, options: &[Opt]) -> bool {
     footer_says
         || options.iter().any(|o| {
             let l = crate::text::trim(&o.label);
-            l.strip_suffix('.').unwrap_or(l) == const { anchor_text("question.other") }
-                || l == const { anchor_text("question.chat") }
+            l.strip_suffix('.').unwrap_or(l) == const { crate::anchor!("question.other") }
+                || l == const { crate::anchor!("question.chat") }
         })
 }
 
@@ -1137,7 +1128,6 @@ fn is_tool_card(
     question: Option<usize>,
     options: &[Opt],
 ) -> bool {
-    use crate::anchors::anchor_text;
     let t = crate::text::trim(title);
     if t.starts_with("Do you want") || option_row(t, ARROW).is_some() || pointer_row(t, ARROW) {
         return false;
@@ -1146,8 +1136,8 @@ fn is_tool_card(
         let items: Vec<&str> = crate::text::trim(f).split(" · ").collect();
         items
             == [
-                const { anchor_text("prompt.cancel") },
-                const { anchor_text("prompt.amend") },
+                const { crate::anchor!("prompt.cancel") },
+                const { crate::anchor!("prompt.amend") },
             ]
     });
     let once: Vec<&Opt> = options.iter().filter(|o| o.role == Role::Once).collect();
@@ -1170,7 +1160,7 @@ fn warning_of(row: &str) -> Option<&str> {
 
 fn auto_deny_left(text: &str) -> Option<std::time::Duration> {
     let rest = text
-        .strip_prefix(const { crate::anchors::anchor_text("box.auto_deny") })?
+        .strip_prefix(const { crate::anchor!("box.auto_deny") })?
         .strip_prefix(' ')?;
     let time = rest.split(',').next()?;
     let (m, s) = time.split_once(':')?;
@@ -1210,7 +1200,7 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    text.starts_with(const { crate::anchors::anchor_text("box.auto_deny") })
+    text.starts_with(const { crate::anchor!("box.auto_deny") })
         .then_some((text, 0..end))
 }
 
@@ -1340,7 +1330,7 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
                 ),
             };
             if let Some(arg) = call
-                .strip_prefix(crate::anchors::anchor_text("box.read_call"))
+                .strip_prefix(crate::anchor!("box.read_call"))
                 .and_then(|c| c.strip_suffix(')'))
             {
                 let path = Some(arg).filter(|p| known_head && !p.is_empty());
@@ -1621,11 +1611,10 @@ fn wraps_onto(above: &str, below: &str, width: usize) -> bool {
 }
 
 fn question_footed(rows: &[String], footer: usize) -> Option<Found> {
-    use crate::anchors::anchor_text;
     let preview = rows[footer]
         .trim()
         .split(" · ")
-        .any(|item| item == const { anchor_text("question.add_notes") });
+        .any(|item| item == const { crate::anchor!("question.add_notes") });
     crate::question::footed(rows, footer, preview).map(|s| question_found(s, Some(footer)))
 }
 
@@ -1671,7 +1660,7 @@ fn is_question_footer(row: &str) -> bool {
 }
 
 fn question_items(footer: &str) -> (bool, bool) {
-    let select = const { crate::anchors::anchor_text("question.select") };
+    let select = const { crate::anchor!("question.select") };
     let items: Vec<&str> = crate::text::trim(footer).split(" · ").collect();
     (
         items.contains(&select),
@@ -1790,9 +1779,7 @@ fn footerless_box(rows: &[String]) -> Option<Found> {
     };
     let named = line(nearest);
     let (title, kind) = match header_kind(&named) {
-        Some(PromptKind::PlanExit)
-            if named == const { crate::anchors::anchor_text("plan.proceed") } =>
-        {
+        Some(PromptKind::PlanExit) if named == const { crate::anchor!("plan.proceed") } => {
             (plan_above().unwrap_or(nearest), PromptKind::PlanExit)
         }
         Some(kind) if kind.may_be_footerless() => (nearest, kind),
@@ -1842,7 +1829,7 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
     if has_composer_frame(rows) {
         return None;
     }
-    let proceed = const { crate::anchors::anchor_text("plan.proceed") };
+    let proceed = const { crate::anchor!("plan.proceed") };
     let (q, q_end) = (0..rows.len())
         .rev()
         .filter(|&i| {
@@ -2311,7 +2298,7 @@ fn pointer_row(row: &str, cur: &[char]) -> bool {
 const ARROW: &[char] = &['❯'];
 
 fn cursors(title: &str) -> &'static [char] {
-    if title == const { crate::anchors::anchor_text("limit.title") } {
+    if title == const { crate::anchor!("limit.title") } {
         &['❯', '›']
     } else {
         ARROW
@@ -2357,14 +2344,14 @@ pub fn kept_answer(label: &str) -> bool {
     let l = crate::text::trim(label).replace('’', "'").to_lowercase();
     KEPT_ANSWERS
         .iter()
-        .any(|id| l == crate::anchors::anchor_text(id).to_lowercase())
+        .any(|id| l == crate::anchors::anchor(id).to_lowercase())
 }
 
 fn kept_answer_head(text: &str) -> bool {
     let t = crate::text::trim(text).replace('’', "'").to_lowercase();
     t.split(' ').filter(|w| !w.is_empty()).count() >= 2
         && KEPT_ANSWERS.iter().any(|id| {
-            crate::anchors::anchor_text(id)
+            crate::anchors::anchor(id)
                 .to_lowercase()
                 .strip_prefix(&t)
                 .is_some_and(|rest| rest.starts_with(' '))
@@ -2385,7 +2372,7 @@ pub fn cut_short(label: &str) -> bool {
 pub fn is_wait_label(label: &str) -> bool {
     let Some(rest) = label
         .trim()
-        .strip_prefix(const { crate::anchors::anchor_text("limit.wait") })
+        .strip_prefix(const { crate::anchor!("limit.wait") })
     else {
         return false;
     };
@@ -2399,12 +2386,12 @@ pub fn is_wait_label(label: &str) -> bool {
 fn is_limit_menu_label(label: &str) -> bool {
     let l = crate::text::trim(label).replace('’', "'");
     is_wait_label(&l)
-        || l == const { crate::anchors::anchor_text("limit.stop") }
+        || l == const { crate::anchor!("limit.stop") }
         || l == "Don't continue automatically"
 }
 
 fn usage_limit_menu(title: &str, options: &[Opt]) -> bool {
-    title == const { crate::anchors::anchor_text("limit.title") }
+    title == const { crate::anchor!("limit.title") }
         && options.iter().any(|o| is_limit_menu_label(&o.label))
 }
 
@@ -2663,7 +2650,7 @@ fn unnumbered(
 fn kept_rows(lines: &[&str], starts: &[usize]) -> Vec<bool> {
     let longest = KEPT_ANSWERS
         .iter()
-        .map(|id| crate::anchors::anchor_text(id).chars().count())
+        .map(|id| crate::anchors::anchor(id).chars().count())
         .max()
         .unwrap_or(0);
     let owner = |i: usize| starts.partition_point(|&s| s <= i).saturating_sub(1);
@@ -2728,13 +2715,13 @@ fn beside_column(rows: &[String], block: &[usize], pointer: usize, cur: &[char])
 }
 
 const NAMED_LABELS: [&str; 2] = [
-    crate::anchors::anchor_text("held.deliver"),
-    crate::anchors::anchor_text("computer_use.deny"),
+    crate::anchor!("held.deliver"),
+    crate::anchor!("computer_use.deny"),
 ];
 
 fn opens_named_label(label: &str) -> bool {
     let l = label
-        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
+        .strip_suffix(const { crate::anchor!("option.esc") })
         .unwrap_or(label);
     NAMED_LABELS.iter().any(|n| {
         n.strip_prefix(l)
@@ -2744,7 +2731,7 @@ fn opens_named_label(label: &str) -> bool {
 
 fn vendor_label(label: &str) -> bool {
     let l = label
-        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
+        .strip_suffix(const { crate::anchor!("option.esc") })
         .unwrap_or(label);
     is_limit_menu_label(label) || NAMED_LABELS.contains(&l)
 }
@@ -2798,7 +2785,7 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     }
     let l = label.replace('’', "'").to_lowercase();
     let l = l
-        .strip_suffix(const { crate::anchors::anchor_text("option.esc") })
+        .strip_suffix(const { crate::anchor!("option.esc") })
         .unwrap_or(&l)
         .trim_end();
     let no = l == "no" || l.starts_with("no,") || l.starts_with("no ");
@@ -2818,7 +2805,7 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     } else if kind == PromptKind::Trust && l.starts_with("yes, i trust this folder") {
         Role::Trust
     } else if kind == PromptKind::ModelSwitch
-        && l.starts_with(&const { crate::anchors::anchor_text("model_switch.yes") }.to_lowercase())
+        && l.starts_with(&const { crate::anchor!("model_switch.yes") }.to_lowercase())
     {
         Role::Once
     } else if l.starts_with("allow") {
@@ -2867,14 +2854,14 @@ fn cancel_of(footer: &str, kind: PromptKind, title: &str, options: &[Opt]) -> Op
     let v = verb.to_lowercase();
     let backstop = options
         .iter()
-        .any(|o| o.label == const { crate::anchors::anchor_text("trust.no_backstop") });
+        .any(|o| o.label == const { crate::anchor!("trust.no_backstop") });
     let effect = if kind == PromptKind::Trust {
         if backstop {
             CancelEffect::Reject
         } else {
             CancelEffect::Exit
         }
-    } else if title == const { crate::anchors::anchor_text("settings.error") } {
+    } else if title == const { crate::anchor!("settings.error") } {
         CancelEffect::Exit
     } else if ["cancel", "reject", "deny"]
         .iter()
@@ -2894,7 +2881,7 @@ fn cancel_of(footer: &str, kind: PromptKind, title: &str, options: &[Opt]) -> Op
 }
 
 fn esc_cancel(options: &[Opt]) -> Option<Cancel> {
-    let marker = const { crate::anchors::anchor_text("option.esc") };
+    let marker = const { crate::anchor!("option.esc") };
     let (opt, verb) = options.iter().find_map(|o| {
         o.label
             .strip_suffix(marker)
@@ -6068,10 +6055,7 @@ mod tests {
         let p = parse_prompt_v2(&r).expect("the 26-column dialog");
         assert_eq!(
             (p.kind, p.title.as_str()),
-            (
-                PromptKind::UsageLimit,
-                crate::anchors::anchor_text("limit.title")
-            )
+            (PromptKind::UsageLimit, crate::anchor!("limit.title"))
         );
         let read: Vec<(&str, Role)> = p
             .options
@@ -6104,10 +6088,7 @@ mod tests {
             let p = parse_prompt_v2(&screen(fixture)).expect("the held message");
             assert_eq!(
                 (p.kind, p.title.as_str()),
-                (
-                    PromptKind::HeldMessage,
-                    crate::anchors::anchor_text("held.title")
-                ),
+                (PromptKind::HeldMessage, crate::anchor!("held.title")),
                 "{width}"
             );
             let options: Vec<(&str, Role, bool)> = p
@@ -7799,7 +7780,7 @@ mod tests {
             let mut retitled = r.clone();
             retitled[p.span.0] = " Something else entirely".to_string();
             let other = parse_prompt_v2(&retitled).expect("a setup dialog");
-            let proceed = crate::anchors::anchor_text("plan.proceed");
+            let proceed = crate::anchor!("plan.proceed");
             if text == PLAN_READY {
                 assert_eq!(other.kind, PromptKind::PlanExit, "{name} retitled");
                 assert_eq!(other.title, proceed, "{name} retitled");
@@ -8954,7 +8935,7 @@ mod tests {
         let block = block_from(&mcp, "Use this MCP server");
         assert_eq!(beside_column(&mcp, &block, 2, ARROW), None);
         let (with, without) = (
-            crate::anchors::anchor_text("setup.chrome_continue"),
+            crate::anchor!("setup.chrome_continue"),
             "Continue without browser tools",
         );
         let expected: [&[(&str, Role)]; 5] = [
@@ -9039,11 +9020,7 @@ mod tests {
         assert_eq!(
             read,
             [
-                (
-                    crate::anchors::anchor_text("setup.chrome_continue"),
-                    true,
-                    Role::Persist
-                ),
+                (crate::anchor!("setup.chrome_continue"), true, Role::Persist),
                 ("Continue without browser tools", false, Role::Deny)
             ]
         );
@@ -9657,7 +9634,7 @@ mod tests {
         assert!(!tail.iter().any(|r| r.contains("Ready to code?")));
         let cut = parse_prompt_v2(&tail).expect("the plan's tail");
         assert_eq!(cut.kind, PromptKind::PlanExit, "{cut:?}");
-        assert_eq!(cut.title, crate::anchors::anchor_text("plan.proceed"));
+        assert_eq!(cut.title, crate::anchor!("plan.proceed"));
         assert_eq!(
             crate::reader::read(Some("claude"), &tail, None).phase,
             crate::phase::Phase::Prompt
@@ -9666,7 +9643,7 @@ mod tests {
 
     #[test]
     fn the_plan_question_and_hint_ink_wrapped_are_one_dialog() {
-        let proceed = crate::anchors::anchor_text("plan.proceed");
+        let proceed = crate::anchor!("plan.proceed");
         let r = screen(PLAN_APPROVAL_60_2_1_300);
         let p = parse_prompt_v2(&r).expect("the 60-column dialog");
         assert_eq!(p.kind, PromptKind::PlanExit);

@@ -1922,12 +1922,9 @@ fn codex_landing(act: &str, reply: &str) -> Vec<String> {
     ]
 }
 
-/// A CODEX ROLLOUT IS READ AS A TRANSCRIPT IS: a landing's result is the report before
-/// the land acts, then the defense; a turn opens at its `task_started`, its prompt the
-/// first words typed into it past the context Codex adds itself (each guard's own test:
-/// [`a_codex_turns_prompt_is_its_first_words_past_codexs_own`]); a turn whose last words
-/// are commentary has no reply yet; and a person's own turn after the landing is its
-/// final answer alone.
+/// A codex rollout is read as a transcript is: a landing's result is the report before the land
+/// acts, then the defense; a turn whose last words are commentary has no reply yet; and a person's
+/// own turn after the landing is its final answer alone.
 #[test]
 fn a_codex_rollout_is_read_as_a_transcript_is() {
     let defense = "Nothing left: merged to origin/main at 4f2a9c1, worktree removed.";
@@ -1974,11 +1971,9 @@ fn a_codex_rollout_is_read_as_a_transcript_is() {
     assert_eq!(codex_report("", THREAD, DoneBy::Turn), Err("no-reply"));
 }
 
-/// A CODEX TURN'S PROMPT IS ITS FIRST WORDS PAST WHAT CODEX ADDS ITSELF, each guard where
-/// dropping it changes the result: a person's message steered into the land turn opens no
-/// turn of its own; an `<environment_context>` update or a directory-less `AGENTS.md`
-/// fragment opening the land turn is no prompt; and a person's prompt with an image
-/// attached is theirs (Codex's `<image …>` labels are no context), so its turn is its own.
+/// A codex turn's prompt is its first words past what Codex adds itself: a message steered into
+/// the land turn opens no turn, an `<environment_context>` update or a directory-less `AGENTS.md`
+/// fragment is no prompt, and a prompt with an image attached (`<image …>`) is the person's own.
 #[test]
 fn a_codex_turns_prompt_is_its_first_words_past_codexs_own() {
     let defense = "Nothing left: merged to origin/main at 4f2a9c1.";
@@ -2030,8 +2025,8 @@ fn a_codex_turns_prompt_is_its_first_words_past_codexs_own() {
     );
 }
 
-/// A CODEX TURN HAS ENDED once a matching `task_complete` or `turn_aborted` follows
-/// its newest `task_started`; a tail with no start has nothing to wait for.
+/// A codex turn has ended once a matching `task_complete` or `turn_aborted` follows its newest
+/// `task_started`; a tail with no start has nothing to wait for.
 #[test]
 fn a_codex_turn_ends_at_its_completion_or_abort() {
     let rows = codex_landing(LAND, "Nothing left: merged.");
@@ -2229,9 +2224,9 @@ fn an_aborted_codex_task_does_not_reuse_an_earlier_report() {
     );
 }
 
-/// A CODEX LANDING'S SNAPSHOT NAMES ITS ROLLOUT: `result` answers its text under
-/// `source=rollout`, `result full` reads no transcript of it, a missed result is never
-/// read again as a Claude Code transcript, and no rollout at all is said.
+/// A codex landing's snapshot names its rollout: `result` answers its text under
+/// `source=rollout`, `result full` reads no transcript of it, a missed result is never read again
+/// as a Claude Code transcript, and no rollout at all is said.
 #[test]
 fn a_codex_snapshot_names_its_rollout_and_answers_it() {
     let tasks = ScratchDir::new("result", "codex");

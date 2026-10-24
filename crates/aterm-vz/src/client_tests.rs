@@ -435,6 +435,82 @@ fn a_refused_connect_and_a_lost_guest_reach_the_session_in_their_words() {
 }
 
 #[test]
+fn a_session_waits_for_its_guests_own_power_off_and_hears_how_the_vm_stopped() {
+    // The bake's end: `Poweroff` on a command connection of the session's, and the session
+    // held until the helper says the VM stopped.
+    let mut rig = Rig::new();
+    let mut s = rig.booted(false);
+    let (_id, fd) = s.connect(aterm_vz_agent::COMMAND_PORT).unwrap();
+    crate::agent::poweroff(fd).unwrap();
+    assert_eq!(
+        s.wait_stopped().unwrap(),
+        crate::helper::POWERED_OFF,
+        "a guest that powered itself off"
+    );
+    s.detach();
+    assert_eq!(
+        rig.ended(),
+        format!("the VM stopped: {}", crate::helper::POWERED_OFF)
+    );
+    // The negative control: a VM the helper stopped (a `Stop` from another verb) is heard
+    // in the stop's words, which a bake never seals after.
+    let mut rig = Rig::new();
+    let mut s = rig.booted(false);
+    let paths = rig.paths();
+    let stopper = std::thread::spawn(move || stop(&paths, 60_000, SPAN));
+    let why = s.wait_stopped().unwrap();
+    assert_ne!(why, crate::helper::POWERED_OFF);
+    assert!(why.contains("stopped by a Stop"), "{why}");
+    stopper.join().unwrap().unwrap();
+    s.detach();
+    let _ = rig.ended();
+}
+
+#[test]
+fn a_command_lost_while_the_vm_stops_hears_why_it_stopped_never_only_stopping() {
+    // A guest that ignores the power-off: a `Stop` holds the VM in `Stopping` for its grace,
+    // then stops it hard, as the heartbeat detector does to a guest that stopped answering.
+    let mut rig = Rig::new();
+    rig.lab.start = Threaded::new(
+        Script {
+            guest_obeys: false,
+            ..obeying(AGENT)
+        },
+        &helper_a(),
+    );
+    let mut s = rig.booted(false);
+    let paths = rig.paths();
+    let stopper = std::thread::spawn(move || stop(&paths, 3_000, SPAN));
+    rig.state_until(|st| st.phase == Phase::Stopping);
+    // A command connection ended now: its words wait for the stop's own.
+    let why = s.why_lost();
+    assert!(why.contains("stopped by a Stop"), "{why}");
+    assert!(!why.contains("the VM is stopping"), "{why}");
+    stopper.join().unwrap().unwrap();
+    s.detach();
+    let _ = rig.ended();
+    // A `Lost` that another wait read first (on the VM, a command's `Release` once its
+    // connection ended) is still the words, though the helper has ended the session since.
+    let mut rig = Rig::new();
+    let mut s = rig.booted(false);
+    stop(&rig.paths(), 0, SPAN).unwrap();
+    let heard = s.wait_stopped().unwrap();
+    assert!(heard.contains("stopped by a Stop"), "{heard}");
+    assert_eq!(s.why_lost(), heard);
+    drop(s);
+    let _ = rig.ended();
+    // The negative control: on a ready VM nothing is waited for, and the words say so.
+    let mut rig = Rig::new();
+    let mut s = rig.booted(false);
+    assert_eq!(
+        s.why_lost(),
+        "the agent closed the command connection before its Exit (the VM is still ready)"
+    );
+    s.detach();
+    let _ = rig.ended();
+}
+
+#[test]
 fn up_prepares_the_disks_only_for_a_session_that_found_no_vm() {
     let mut rig = Rig::new();
     let mut prepared = 0;

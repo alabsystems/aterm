@@ -18,6 +18,9 @@ use crate::pins::KERNEL_RELEASE;
 /// The seed ISO's volume label, which cloud-init's NoCloud source looks for.
 pub const VOLUME: &str = "cidata";
 
+/// flash-kernel's initramfs post-update hook, which the seed diverts aside.
+pub const FLASH_KERNEL_HOOK: &str = "/etc/initramfs/post-update.d/flash-kernel";
+
 /// The interface the guest's one NAT device appears as.
 pub const INTERFACE: &str = "enp0s1";
 
@@ -33,12 +36,9 @@ pub const BOOT_TAG: &str = "aterm-boot";
 /// The virtiofs tag of the Rosetta share.
 pub const ROSETTA_TAG: &str = "rosetta";
 
-/// The agent's unit, `/etc/systemd/system/aterm-vz-agent.service` (§6): it runs the agent
-/// from the boot share, after the local file systems (the boot share among them) and with
-/// network-online's job in the boot transaction. It is the text the agent itself carries
-/// ([`aterm_vz_agent::boot::UNIT`]), which the agent rewrites the file to when the two
-/// differ: V2's first boot measured a copy here that differed in its `Description`, so
-/// every bake rewrote its unit at the agent's first start.
+/// The agent's unit, `/etc/systemd/system/aterm-vz-agent.service` (§6): the text the agent
+/// itself carries ([`aterm_vz_agent::boot::UNIT`]), so its first start finds no differing unit
+/// to rewrite.
 pub const AGENT_UNIT: &str = aterm_vz_agent::boot::UNIT;
 
 /// `/etc/systemd/system/rosettad.service` in lima's shape (fact 22), pointed at the
@@ -225,11 +225,19 @@ fn user_data(user: &User) -> String {
         format!("[mount, {BOOT_MOUNT}]"),
         format!("[mount, {ROSETTA_MOUNT}]"),
         // Stopped, then masked: `mask --now` reloads before it stops, and a running timer
-        // whose own unit file vanished fails ("Unit to trigger vanished", measured in V2's
-        // first bake), which leaves the guest `degraded`.
+        // whose unit file vanished fails ("Unit to trigger vanished"), leaving the guest
+        // `degraded`.
         format!("[systemctl, stop, {}]", MASKED.join(", ")),
         format!("[systemctl, mask, {}]", MASKED.join(", ")),
         format!("[apt-mark, hold, {holds}]"),
+        // The VM boots the host's pinned kernel and initrd, never the guest's own, and
+        // flash-kernel's initramfs hook finds no platform under that direct boot ("Unsupported
+        // platform ''", measured in V4's first bake): every package that triggers
+        // update-initramfs failed to configure. Diverted aside, dpkg keeps it there through
+        // flash-kernel's upgrades; run-parts skips the dotted name.
+        format!(
+            "[dpkg-divert, --local, --rename, --divert, {FLASH_KERNEL_HOOK}.aterm-vz, --add, {FLASH_KERNEL_HOOK}]"
+        ),
         format!("[loginctl, enable-linger, {}]", user.name),
         "[systemctl, daemon-reload]".to_string(),
         "[systemctl, enable, --now, --no-block, aterm-vz-agent.service, rosettad.service]"
@@ -316,6 +324,9 @@ mod tests {
              unattended-upgrades.service, ssh.socket]\n  - [systemctl, mask, apt-daily.timer, \
              apt-daily-upgrade.timer, unattended-upgrades.service, ssh.socket]\n",
             "  - [apt-mark, hold, linux-image-6.8.0-142-generic, linux-modules-6.8.0-142-generic]\n",
+            "  - [dpkg-divert, --local, --rename, --divert, \
+             /etc/initramfs/post-update.d/flash-kernel.aterm-vz, --add, \
+             /etc/initramfs/post-update.d/flash-kernel]\n",
             "  - [loginctl, enable-linger, lane]\n",
             "  - [systemctl, enable, --now, --no-block, aterm-vz-agent.service, rosettad.service]\n",
         ] {

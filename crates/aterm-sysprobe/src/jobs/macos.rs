@@ -352,6 +352,23 @@ fn pipe_kind(pid: c_int, fd: i32) -> FdKind {
     }
 }
 
+/// Whether a process's socket descriptors may be read in detail (`PROC_PIDFDSOCKETINFO`), from
+/// its `pbi_flags` now and whether it ran this same program at the reader's last pass.
+///
+/// That read holds an I/O reference on the descriptor. A close of it meanwhile (a `close`, an
+/// `exit`, an exec's close-on-exec sweep) drains the socket: XNU's `soo_drain` sets
+/// `SS_DRAINING`, which nothing clears, on the socket every process holding it shares, and from
+/// then on each blocking wait on it fails `EBADF` everywhere. Reading children while their execs
+/// closed the copies they inherited drained their parent's sockets that way, measured on macOS
+/// 27.0.1: this reader broke 8 blocked readers in the parent in 160 s, and none once it read only
+/// settled processes. So only a settled process's sockets are read: one that runs a program it
+/// exec'd before the last pass (no fork's inherited copies left for an exec to close) and is not
+/// exiting. A close of a socket another process shares, by a settled program while it is read,
+/// still drains it.
+pub(super) fn settled(flags: u32, execd_then: bool) -> bool {
+    execd_then && flags & darwin::PROC_FLAG_EXEC != 0 && flags & darwin::PROC_FLAG_INEXIT == 0
+}
+
 fn socket_kind(pid: c_int, fd: i32) -> FdKind {
     let mut buf = vec![0u8; darwin::SOCKET_SIZE];
     match fd_info(pid, fd, darwin::PROC_PIDFDSOCKETINFO, &mut buf).and(darwin::socket(&buf)) {
@@ -405,11 +422,13 @@ fn knotes_of(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
     )
 }
 
+/// `pid`'s descriptors; its sockets in detail only when `sockets` ([`settled`]), else `Other`.
 fn fds(
     pid: c_int,
     nfiles: u32,
     lanes: Lanes,
     start_us: Option<u64>,
+    sockets: bool,
 ) -> Option<(Vec<FdReading>, bool)> {
     let (list, mut truncated) = fd_list(pid, nfiles)?;
     let mut out = Vec::with_capacity(list.len());
@@ -422,6 +441,7 @@ fn fds(
         let kind = match i32::try_from(f.proc_fdtype).unwrap_or(-1) {
             libc::PROX_FDTYPE_VNODE if detail(&mut details) => vnode_kind(pid, f.proc_fd, start_us),
             libc::PROX_FDTYPE_PIPE if detail(&mut details) => pipe_kind(pid, f.proc_fd),
+            libc::PROX_FDTYPE_SOCKET if !sockets => FdKind::Other,
             libc::PROX_FDTYPE_SOCKET if detail(&mut details) => socket_kind(pid, f.proc_fd),
             libc::PROX_FDTYPE_KQUEUE if detail(&mut details) => kqueue_kind(pid, f.proc_fd, lanes),
             libc::PROX_FDTYPE_VNODE
@@ -441,13 +461,16 @@ fn fds(
     Some((out, truncated))
 }
 
-/// Read one process (see the parent module), with the [`StartFacts`] its thread list gives at `now_us`.
+/// Read one process (see the parent module), with the [`StartFacts`] its thread list gives at
+/// `now_us` and whether it runs a program it exec'd; `execd_then(start, name)` says whether the
+/// reader's last pass found it running that program then ([`settled`]).
 pub(super) fn read(
     pid: u32,
     want_fds: bool,
     lanes: Lanes,
     now_us: u64,
-) -> Option<(ProcFacts, Option<StartFacts>)> {
+    execd_then: impl FnOnce(Option<u64>, &str) -> bool,
+) -> Option<(ProcFacts, Option<StartFacts>, bool)> {
     let p = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
     let all = task_all(p);
     let bsd = match &all {
@@ -493,8 +516,10 @@ pub(super) fn read(
         },
     };
     facts.sid = getsid(p).or(facts.sid);
+    let flags = bsd.as_ref().map(|b| b.pbi_flags);
+    let runs_its_exec = flags.is_some_and(|f| f & darwin::PROC_FLAG_EXEC != 0);
     if facts.state == RunState::Zombie {
-        return Some((facts, None));
+        return Some((facts, None, false));
     }
     facts.counters = counters(p, all.as_ref().map(|a| &a.ptinfo));
     let listed = thread_handles(p, MAX_THREADS + 1);
@@ -509,12 +534,13 @@ pub(super) fn read(
     }
     if want_fds {
         let nfiles = all.as_ref().map_or(64, |a| a.pbsd.pbi_nfiles);
-        if let Some((list, cut)) = fds(p, nfiles, lanes, facts.start) {
+        let sockets = flags.is_some_and(|f| settled(f, execd_then(facts.start, &facts.name)));
+        if let Some((list, cut)) = fds(p, nfiles, lanes, facts.start, sockets) {
             facts.fds = Some(list);
             facts.fds_truncated = cut;
         }
     }
-    Some((facts, start))
+    Some((facts, start, runs_its_exec))
 }
 
 /// Device (`vst_dev`) and inode of every vnode `pid` holds, plus [`MAX_FDS`] truncation.

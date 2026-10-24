@@ -478,7 +478,8 @@ impl GroupSpec {
         self
     }
 
-    /// Whether the group paints a backdrop of its own, so all of its rect is drawn, not only its children.
+    /// Whether the group paints a backdrop of its own, so all of its rect is drawn, not only its
+    /// children.
     pub(crate) const fn paints_backdrop(&self) -> bool {
         matches!(
             self.role,
@@ -635,7 +636,7 @@ impl SliderSpec {
     }
 }
 
-/// A COLOUR WHEEL ([`UiContent::ColorWheel`]).
+/// A colour wheel ([`UiContent::ColorWheel`]).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ColorWheelSpec {
     pub(crate) label: String,
@@ -651,41 +652,41 @@ pub(crate) const MESSAGES_SEVERITY_AUDIT: &str = "settings.messages.severity";
 /// Settings ▸ Messages' hairline between rows in the log's container.
 pub(crate) const MESSAGES_RULE_AUDIT: &str = "settings.messages.rule";
 
-/// Settings ▸ Themes' row SLAB.
+/// Settings ▸ Themes' row slab.
 pub(crate) const THEME_SLAB_AUDIT: &str = "settings.themes.slab";
 
-/// Settings ▸ Themes' palette SWATCH.
+/// Settings ▸ Themes' palette swatch.
 pub(crate) const THEME_SWATCH_AUDIT: &str = "settings.themes.swatch";
 
-/// A COLOUR CHIP after words that name a colour (Modified's "Default: Automatic").
+/// A colour chip after words that name a colour (Modified's "Default: Automatic").
 pub(crate) const COLOR_CHIP_AUDIT: &str = "settings.color.chip";
 
 /// Settings ▸ Messages' scroll indicator.
 pub(crate) const MESSAGES_SCROLL_AUDIT: &str = "settings.messages.scroll";
 
-/// A Settings page's own SCROLL INDICATOR.
+/// A Settings page's own scroll indicator.
 pub(crate) const PAGE_SCROLL_AUDIT: &str = "settings.page.scroll";
 
-/// A display face's NAME drawn in that face (Text & Fonts' Display faces card).
+/// A display face's name drawn in that face (Text & Fonts' Display faces card).
 pub(crate) const DISPLAY_FACE_NAME_AUDIT: &str = "settings.text.display-face-name";
 
-/// About's WORDMARK, its label "aterm", in the hero's type.
+/// About's wordmark, its label "aterm", in the hero's type.
 pub(crate) const WORDMARK_AUDIT: &str = "settings.about.wordmark";
 
-/// System State's BRAND LOCKUP (`docs/DESIGN-system-state-2026-10-21.md`
+/// System State's brand lockup (`docs/DESIGN-system-state-2026-10-21.md`
 /// §3.1, [`crate::system_state::paint_brand`]): `❯ aterm · ALab▌` in the
 /// terminal's mono face over a dim six-stripe ribbon, and the rainbow kitty
-/// after the caret. Paint only; its value is the lockup's
+/// behind the caret. Paint only; its value is the lockup's
 /// [`crate::system_state::BrandSpec`], and its accessible parent names it.
 pub(crate) const SYSTEM_STATE_BRAND_AUDIT: &str = "system-state.brand";
 
-/// A System State row's CHIP (§3.3, [`crate::system_state::paint_chip`]):
+/// A System State row's chip (§3.3, [`crate::system_state::paint_chip`]):
 /// ✓, `Will change`, `Needs you`, `Failed` or the quiet `Left as is`,
 /// right-aligned in its rect. Paint only; its value is the chip's word, and
 /// the row's accessible label says it.
 pub(crate) const SYSTEM_STATE_CHIP_AUDIT: &str = "system-state.chip";
 
-/// System State's run METER (§3.2, [`crate::system_state::paint_meter`]): a
+/// System State's run meter (§3.2, [`crate::system_state::paint_meter`]): a
 /// thin capsule while a run is going. Paint only; its value is `done,total`,
 /// and the headline says the same in words.
 pub(crate) const SYSTEM_STATE_METER_AUDIT: &str = "system-state.meter";
@@ -801,7 +802,7 @@ pub(crate) struct SliderGeometry {
 
 const SLIDER_READOUT_FACE: crate::widget::TextFace = crate::widget::TextFace::Ui;
 
-/// WHERE A SLIDER'S READOUT STANDS.
+/// Where a slider's readout stands.
 pub(crate) fn slider_readout_place(text: &str, geometry: &SliderGeometry) -> (f32, f32) {
     let px = native_type_px(TypeStep::Caption).get();
     let width = crate::tray_raster::ui_text_width_for(SLIDER_READOUT_FACE, text, px);
@@ -966,7 +967,8 @@ fn fitted_placeholder(
         .join("\n")
 }
 
-/// `placeholder` fitted, when it is authored, to a text field `field_width` points wide that does (`swatch`) or does not draw a color swatch.
+/// `placeholder` fitted to a text field `field_width` points wide, with (`swatch`) or without a
+/// colour swatch.
 pub(crate) fn fit_native_field_placeholder(
     placeholder: &str,
     field_width: f32,
@@ -1027,7 +1029,8 @@ pub(crate) enum TextFieldEllipsis {
 /// The mark a field draws for the part of its value it cannot show.
 pub(crate) const TEXT_FIELD_ELLIPSIS: &str = "…";
 
-/// A PATH'S SHORTER FORMS, longest first.
+/// `path`'s shorter forms, longest first, as `(form, head_end, tail_start)`: each keeps whole
+/// components either side of an ellipsis.
 pub(crate) fn path_forms(path: &str) -> Vec<(String, usize, usize)> {
     let slashes: Vec<usize> = path
         .match_indices(path_separators(path))
@@ -1059,7 +1062,8 @@ pub(crate) fn path_forms(path: &str) -> Vec<(String, usize, usize)> {
     forms
 }
 
-/// Whether a field's value reads as a filesystem path, whose end (the file's name) says more than its start.
+/// Whether a field's value reads as a filesystem path, whose end (the file's name) says more
+/// than its start.
 pub(crate) fn reads_as_path(text: &str) -> bool {
     let bytes = text.as_bytes();
     text.starts_with('/')
@@ -1080,7 +1084,8 @@ pub(crate) fn path_separators(path: &str) -> &'static [char] {
     }
 }
 
-/// Where the last component of `path` (its file's name) starts, after its last separator ([`path_separators`]).
+/// Where the last component of `path` (its file's name) starts, after its last separator
+/// ([`path_separators`]).
 pub(crate) fn path_name_start(path: &str) -> usize {
     path.rfind(path_separators(path)).map_or(0, |at| at + 1)
 }
@@ -1091,7 +1096,8 @@ pub(crate) fn text_field_width_for_text(words: &str) -> f32 {
     crate::tray_raster::ui_text_width(words, size) + 2.0 * TEXT_FIELD_HORIZONTAL_PADDING
 }
 
-/// The width a text field needs to show `words` whole, its insets and, with `swatch`, its colour swatch included.
+/// The width a text field needs to show `words` whole, its insets and, with `swatch`, its colour
+/// swatch included.
 pub(crate) fn text_field_width_for(words: &str, swatch: bool) -> f32 {
     let size = native_type_px(TypeStep::Secondary).get();
     let swatch = if swatch {
@@ -1658,7 +1664,9 @@ pub(crate) struct EditorToolbarPlan {
 /// The most rows the toolbar takes before buttons give way.
 pub(crate) const EDITOR_TOOLBAR_MAX_ROWS: usize = 3;
 
-/// THE EDITOR TOOLBAR, MEASURED.
+/// Flow the editor toolbar's buttons into rows `bar_width` wide: the fewest rows, at most
+/// [`EDITOR_TOOLBAR_MAX_ROWS`], that hold them, with labels shortened from the last one first;
+/// only where no row count holds them do the yielding buttons give way, lowest rank first.
 pub(crate) fn plan_editor_toolbar(
     items: &[EditorToolbarItem],
     bar_width: f32,
@@ -1842,7 +1850,8 @@ const COMMAND_COMPLETION_RENDER_LIMIT: usize = 8;
 
 const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
 
-/// Exact editor paint rectangle derived from the same responsive shell metrics consumed by `EditorApp::view`.
+/// Exact editor paint rectangle derived from the same responsive shell metrics consumed by
+/// `EditorApp::view`.
 pub(crate) fn editor_text_viewport_rect_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -1881,7 +1890,7 @@ fn editor_text_viewport_rect_at_scale(
     )
 }
 
-/// The document rows the editor shows WHOLE.
+/// The document rows the editor shows whole.
 pub(crate) fn editor_visible_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -1893,7 +1902,7 @@ pub(crate) fn editor_visible_line_capacity_with_palette(
     whole_editor_rows(&geometry)
 }
 
-/// The document rows the editor PAINTS.
+/// The document rows the editor paints.
 pub(crate) fn editor_painted_line_capacity_with_palette(
     viewport: LogicalRect,
     palette: impl Into<EditorPalette>,
@@ -2158,7 +2167,8 @@ pub(crate) struct UiNode {
     pub(crate) joins: Joins,
 }
 
-/// A BOXED GROUP LISTED A PIECE AT A TIME READS AS ONE CARD.
+/// Which ends of a boxed group's piece join its neighbours, so a group listed a piece at a time
+/// reads as one card.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Joins {
     pub(crate) above: bool,
@@ -2172,7 +2182,7 @@ impl Joins {
     }
 }
 
-/// A scrolling list's ROOM ([`UiNode::room`]).
+/// A scrolling list's room ([`UiNode::room`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ListRoom {
     pub(crate) height: f32,
@@ -2198,7 +2208,7 @@ impl UiNode {
         }
     }
 
-    /// A SEGMENTED CONTROL.
+    /// Mark this node a segmented control ([`segments_of`]).
     pub(crate) const fn segmented(mut self) -> Self {
         self.segmented = true;
         self
@@ -2230,7 +2240,7 @@ impl UiNode {
         self
     }
 
-    /// Make this clipped column a scrolling list whose ROOM is the first `height` of it (THE LIST'S EDGE RULE).
+    /// Make this clipped column a scrolling list whose room is the first `height` of it.
     pub(crate) const fn room(mut self, height: f32, fades: bool) -> Self {
         self.room = Some(ListRoom {
             height,
@@ -2245,7 +2255,7 @@ impl UiNode {
         self.room(height, false)
     }
 
-    /// Mark this subtree a scrolling list's row OFF ITS SCREEN.
+    /// Mark this subtree a scrolling list's row off its screen.
     pub(crate) const fn offscreen(mut self) -> Self {
         self.offscreen = true;
         self
@@ -2262,7 +2272,8 @@ impl UiTree {
         Self { root }
     }
 
-    /// Apply the host's one keyboard-focus key to every standard control before any observer is compiled.
+    /// Apply the host's one keyboard-focus key to every standard control before any observer is
+    /// compiled.
     #[cfg(test)]
     pub(crate) fn apply_focus(mut self, focus: Option<&UiKey>) -> Self {
         self.apply_interaction(focus, None, None, true);
@@ -2513,6 +2524,14 @@ fn prim_ink(prim: &crate::widget::DrawPrim) -> Option<LogicalRect> {
             let half = width * 0.5;
             Some(LogicalRect::new(x - half, y - half, w + width, h + width))
         }
+        DrawPrim::Dashed {
+            x, y, w, h, width, ..
+        } => Some(LogicalRect::new(
+            x.min(x + w),
+            y.min(y + h),
+            w.abs().max(*width),
+            h.abs().max(*width),
+        )),
         DrawPrim::Panel { x, y, w, h, .. } => Some(LogicalRect::new(*x, *y, *w, *h)),
         DrawPrim::Line {
             x1,
@@ -2730,7 +2749,8 @@ fn row_words_whole(row: &UiNode, rect: LogicalRect, list: ListContext) -> bool {
     })
 }
 
-/// The band, from the top of named row `row` laid out `height` tall, its words paint in ([`row_words_whole`]).
+/// The band, from the top of named row `row` laid out `height` tall, its words paint in
+/// ([`row_words_whole`]).
 pub(crate) fn named_row_words(row: &UiNode, height: f32) -> Option<(f32, f32)> {
     is_named_row(row)
         .then(|| row_words_band(row, LogicalRect::new(0.0, 0.0, 4096.0, height)))
@@ -2803,7 +2823,9 @@ fn cuts_own_words(key: &UiKey, content: &UiContent, rect: LogicalRect, edges: Cu
     dropped.iter().any(|dropped| *dropped)
 }
 
-/// The band, from its top, that the words and icons of control `content` laid out `height` tall paint in: an edge of a list that crosses it draws the control as a picture only ([`cuts_own_words`]).
+/// The band, from its top, that the words and icons of control `content` laid out `height` tall
+/// paint in: an edge of a list that crosses it draws the control as a picture only
+/// ([`cuts_own_words`]).
 pub(crate) fn words_band(key: &UiKey, content: &UiContent, height: f32) -> Option<(f32, f32)> {
     let theme = aterm_render::Theme::default();
     let roles = crate::settings::Roles::from_theme(theme);
@@ -2872,14 +2894,15 @@ pub(crate) struct CompiledUi {
     pub(crate) default_action: Option<(UiKey, ActionId)>,
     pub(crate) segment_groups: Vec<SegmentGroup>,
     pub(crate) list_pictures: Vec<ListPicture>,
-    /// THE TAB STOPS OF A LIST THAT HOLDS EVERY ROW ([`ListRoom::lists_all`]),
-    /// in reading order, on its screen or off it: what Tab walks through
-    /// that list ([`Self::tab_past_screen`]), where [`Self::focus_order`]
-    /// holds only the stops its screen shows.
+    /// The tab stops of a list that holds every row ([`ListRoom::lists_all`]), in reading
+    /// order, on its screen or off it: what Tab walks through that list
+    /// ([`Self::tab_past_screen`]), where [`Self::focus_order`] holds only the stops its screen
+    /// shows.
     pub(crate) list_stops: Vec<UiKey>,
 }
 
-/// The picture of a control a list draws in the strip under its room ([`CompiledUi::list_pictures`]).
+/// The picture of a control a list draws in the strip under its room
+/// ([`CompiledUi::list_pictures`]).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ListPicture {
     pub(crate) key: UiKey,
@@ -2893,12 +2916,10 @@ pub(crate) struct SegmentGroup {
     pub(crate) segments: Vec<UiKey>,
 }
 
-/// TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: where a Tab
-/// (`forward`) or Shift-Tab passes over a scrolling list in reading order and
-/// Tab `order` holds none of its `controls` (its screen shows words only — a
-/// hero, a status card, a row's note), the list's first control (Shift-Tab:
-/// its last). `None` where the screen shows one of its controls (Tab walks
-/// into it, [`tab_past_screen`]) or the list holds none.
+/// Where Tab (`forward`) or Shift-Tab enters a scrolling list whose screen shows none of its
+/// `controls` (only words: a hero, a status card, a row's note): its first control (Shift-Tab:
+/// its last). `None` where Tab `order` holds one of them (Tab walks into it,
+/// [`tab_past_screen`]) or the list holds none.
 pub(crate) fn tab_into_unshown_list<'a>(
     controls: &[&'a UiKey],
     forward: bool,
@@ -2914,16 +2935,14 @@ pub(crate) fn tab_into_unshown_list<'a>(
     }
 }
 
-/// TAB WALKS THE WHOLE LIST, not just its screen: Tab (`forward`) or
-/// Shift-Tab from `current` to the window's next control in Tab `order`
-/// (`next`) is kept within the list's screen, but where it would leave the
-/// list from one of its `controls` (top to bottom; `index_of` says where a
-/// key stands among them, a segment where its control does) it moves to the
-/// list's next or previous control instead, and where it enters the list
-/// from a control outside it starts at the list's first control (Shift-Tab:
-/// its last); the list scrolls to it. A focus that is no stop of `order` and
-/// no control of the list (it left the order, s-25) is not entering: `next`
-/// is already where it stood. `None` keeps `next`.
+/// Tab walks the whole list, not just its screen. Within the list's screen, Tab (`forward`) or
+/// Shift-Tab from `current` goes to `next`, the window's next control in Tab `order`; where it
+/// would leave the list from one of its `controls` (top to bottom; `index_of` says where a key
+/// stands among them, a segment where its control does) it moves to the list's next or previous
+/// control instead, and where it enters the list from outside it starts at the list's first
+/// control (Shift-Tab: its last); the list scrolls to it. A focus that is neither a stop of
+/// `order` nor a control of the list is not entering: `next` is already where it stood. `None`
+/// keeps `next`.
 pub(crate) fn tab_past_screen(
     controls: &[&UiKey],
     index_of: impl Fn(&UiKey) -> Option<usize>,
@@ -2997,7 +3016,8 @@ impl CompiledUi {
         )
     }
 
-    /// THE STRIP UNDER A LIST'S ROOM TAKES A PRESS AS A SCROLL.
+    /// The control whose picture a list draws at `(x, y)` in the strip under its room, where a
+    /// press scrolls the list.
     pub(crate) fn list_picture_at(&self, x: f32, y: f32) -> Option<&UiKey> {
         self.list_pictures
             .iter()
@@ -3006,7 +3026,8 @@ impl CompiledUi {
             .map(|picture| &picture.key)
     }
 
-    /// THE ARROW MODEL OF A SEGMENTED CONTROL.
+    /// The segment an arrow's `step` from segment `key` lands on: `None` when `key` is no
+    /// segment, `Some(None)` past either end of its control.
     pub(crate) fn segment_step(&self, key: &UiKey, step: isize) -> Option<Option<UiKey>> {
         let group = self
             .segment_groups
@@ -3083,7 +3104,8 @@ impl CompiledUi {
         self.semantics.iter().find(|node| &node.key == key)
     }
 
-    /// Snap one pointer position through the exact HSV disk painted for `key` (a [`UiContent::ColorWheel`]).
+    /// Snap one pointer position through the exact HSV disk painted for `key` (a
+    /// [`UiContent::ColorWheel`]).
     pub(crate) fn color_wheel_pick_at(&self, key: &UiKey, x: f32, y: f32) -> Option<(f32, f32)> {
         if !x.is_finite() || !y.is_finite() {
             return None;
@@ -3139,7 +3161,8 @@ impl CompiledUi {
         Some(snap_slider_value(raw, low, high, control.spec.step))
     }
 
-    /// Resolve a pointer x-coordinate to the nearest UTF-8 grapheme boundary in the exact bounded text projection painted for `key`.
+    /// Resolve a pointer x-coordinate to the nearest UTF-8 grapheme boundary in the exact
+    /// bounded text projection painted for `key`.
     pub(crate) fn text_field_byte_at(&self, key: &UiKey, x: f32) -> Option<usize> {
         if !x.is_finite() {
             return None;
@@ -3202,7 +3225,8 @@ impl CompiledUi {
         })
     }
 
-    /// Canonical control serialization generated from semantic nodes—not from app-specific side tables.
+    /// Canonical control serialization generated from semantic nodes, not from app-specific
+    /// side tables.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         self.semantics
             .iter()
@@ -3334,7 +3358,8 @@ impl CompiledUi {
         failures
     }
 
-    /// THE EDGE AUDIT.
+    /// Every line of words or icon a clip edge slices through (a faded bottom edge aside), as
+    /// `paint-slice` lines.
     #[cfg(test)]
     pub(crate) fn sliced_marks(&self) -> Vec<String> {
         use crate::widget::DrawPrim;
@@ -3418,7 +3443,8 @@ impl CompiledUi {
         out
     }
 
-    /// THE AUDIT JUDGES WHAT PAINTS OVER WHAT.
+    /// Every two marks (words or icons) whose ink overlaps by at least `INK_OVERLAP_LEAST` each
+    /// way, as `paint-overlap` lines; a node repainting its own mark is no overlap.
     pub(crate) fn ink_overlaps(&self) -> Vec<String> {
         let theme = aterm_render::Theme::default();
         let roles = crate::settings::Roles::from_theme(theme);
@@ -3492,7 +3518,8 @@ impl CompiledUi {
         overlaps
     }
 
-    /// The `paint-text` record [`Self::paint_audit_lines`] prints for the first painted node keyed `key` that has a text-fit audit.
+    /// The `paint-text` record [`Self::paint_audit_lines`] prints for the first painted node
+    /// keyed `key` that has a text-fit audit.
     #[cfg(test)]
     pub(crate) fn text_fit_audit_line(&self, key: &UiKey) -> Option<String> {
         self.paint
@@ -3543,7 +3570,8 @@ impl CompiledUi {
         )
     }
 
-    /// Stable fingerprint of every visible semantic value and paint projection plus exact compiled geometry.
+    /// Stable fingerprint of every visible semantic value and paint projection plus exact
+    /// compiled geometry.
     pub(crate) fn fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -3591,7 +3619,7 @@ impl CompiledUi {
         self.tray_with_chrome(theme, theme, base_px)
     }
 
-    /// `Self::tray` with the CHROME palette and the TERMINAL theme split.
+    /// `Self::tray` with the chrome palette and the terminal theme given apart.
     pub(crate) fn tray_with_chrome(
         &self,
         chrome: impl Into<crate::chrome_band::ChromePalette>,
@@ -3964,7 +3992,7 @@ pub(crate) fn native_button_line_height() -> f32 {
     (native_type_px(TypeStep::Secondary).get() * 1.25).ceil()
 }
 
-/// A BUTTON'S LABEL WRAPPED TO ITS ROOM, at its words.
+/// A button's label wrapped to `room` at word boundaries; `None` when one word does not fit.
 pub(crate) fn native_button_label_lines(label: &str, room: f32) -> Option<Vec<String>> {
     let fits = |text: &str| native_button_label_width(text) <= room + TEXT_FIT_SLACK;
     let mut lines: Vec<String> = Vec::new();
@@ -5759,7 +5787,8 @@ pub(crate) fn fit_native_button_label(value: &str, max_width: f32) -> String {
     )
 }
 
-/// The width the painter needs to draw a native button label whole, in the face and rung [`fit_native_button_label`] elides against.
+/// The width the painter needs to draw a native button label whole, in the face and rung
+/// [`fit_native_button_label`] elides against.
 pub(crate) fn native_button_label_width(value: &str) -> f32 {
     visual_text_width(
         value,
@@ -5768,7 +5797,7 @@ pub(crate) fn native_button_label_width(value: &str) -> f32 {
     )
 }
 
-/// THE ONE SEPARATOR between facts a native page paints in a run.
+/// The one separator between facts a native page paints in a run.
 pub(crate) const FACT_SEPARATOR: &str = " \u{b7} ";
 
 /// Bounded visual projection for a one-line native body label.
@@ -5779,7 +5808,7 @@ pub(crate) fn fit_native_text_label(value: &str, max_width: f32) -> String {
     )
 }
 
-/// The width the painter needs to draw one-line native status copy WHOLE.
+/// The width the painter needs to draw one-line native status copy whole.
 pub(crate) fn native_status_label_width(value: &str) -> f32 {
     visual_text_width(
         value,
@@ -7409,7 +7438,7 @@ fn open_box(
     )
 }
 
-/// Where a DISCLOSURE button's label ends, from its trailing edge.
+/// Where a disclosure button's label ends, from its trailing edge.
 pub(crate) const DISCLOSURE_LABEL_END: f32 = 34.0;
 
 /// The room a disclosure button `width` wide gives its label's lines.
@@ -7693,7 +7722,7 @@ const SWITCH_TRACK_WIDTH: f32 = 42.0;
 const SWITCH_WORD_LEAD: f32 = 10.0;
 const SWITCH_WORD_GAP: f32 = 12.0;
 
-/// THE LEAST A WORDED SWITCH IS WIDE.
+/// The least width of a switch that shows its On or Off word.
 pub(crate) fn switch_least_width() -> f32 {
     let size = native_type_px(TypeStep::Secondary).get();
     let word = ["On", "Off"]
@@ -7948,16 +7977,13 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
     out
 }
 
-/// THE WORDS A CONTROL PAINTS ARE IN ITS NAME (WCAG 2.5.3, Label in Name).
+/// Whether the words a control paints are in its name (WCAG 2.5.3, Label in Name).
 pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
-    // A label painted on lines ([`native_button_label_lines`]) is its words
-    // with spaces between; one broken inside a word ends its line in a `-` or
-    // after a `/`, which joins the word again — a hyphen the break added, or
-    // one the word has; a code identifier broken with no mark (an
-    // aterm.toml key) is its lines joined as they are; and a label that has
-    // both (words wrapped, and an identifier among them broken at its own
-    // joints with no mark: "Open" / "aterm" / ".toml") joins each break as
-    // the name writes the two halves ([`joined_as_named`]).
+    // A label painted on lines ([`native_button_label_lines`]) is its words with spaces
+    // between; a break inside a word, which ends its line in a `-` (one the break added, or the
+    // word's own) or after a `/`, joins the word again; a code identifier broken with no mark
+    // (an aterm.toml key) joins as it is; and a label with both joins each break as the name
+    // writes the two halves ([`joined_as_named`]).
     if visual.contains('\n') {
         let joined = |hyphen: &str| {
             visual
@@ -8340,7 +8366,8 @@ impl Compiler {
         Ok(())
     }
 
-    /// A node off its screen, under `parent`: one of [`CompiledUi::list_stops`] only in `list`, a list that holds every row.
+    /// A node off its screen, under `parent`: one of [`CompiledUi::list_stops`] only in `list`,
+    /// a list that holds every row.
     fn offscreen_node(
         &mut self,
         key: UiKey,

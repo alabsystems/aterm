@@ -38,7 +38,8 @@ pub(super) fn grant_recorded(app: &App) -> bool {
         .any(|rec| rec.title == GRANTED_CAPTION)
 }
 
-/// Whether the question stands: an entry of the digest, or a `privacy.fda` row an older parent carried across an update.
+/// Whether the question stands: an entry of the digest, or a `privacy.fda` row an older parent
+/// carried across an update.
 pub(super) fn access_row(app: &App) -> bool {
     app.messages.live_by_key(KEY_FILE_ACCESS).is_some()
         || app
@@ -279,10 +280,10 @@ fn quiet(_app: &App, _now: Instant) -> bool {
     true
 }
 
-/// WHILE NO APPROVED REVISION ADMITS PERMISSIONS (a setup decision held, or none made)
-/// the launch check still reads — it puts nothing on screen — but the window's own pages
-/// wait for a revision: the Full Disk Access hand-over stays queued at its moment and a
-/// late `spctl` run's Developer Tools page is held. The owner's own press still opens.
+/// While no approved revision admits permissions (a setup decision held, or none made), the launch
+/// check still reads, putting nothing on screen, but the window's own pages wait: the Full Disk
+/// Access hand-over stays queued at its moment and a late `spctl` run's Developer Tools page is
+/// held. The owner's own press still opens.
 #[test]
 fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effects() {
     use crate::devtools_helper::{HandOver, Origin, test_arms};
@@ -343,7 +344,8 @@ fn launched(now: Instant) -> App {
     app
 }
 
-/// On the first launch on a new Mac, Full Disk Access opens at the quiet moment and Not now lets the folder warm-up walk.
+/// On the first launch on a new Mac, Full Disk Access opens at the quiet moment, and Not now lets
+/// the folder warm-up walk.
 #[test]
 fn a_new_mac_brings_the_owner_to_full_disk_access_then_to_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -695,8 +697,8 @@ fn own(probe: FdaProbe) -> ConsentState {
     consent
 }
 
-/// `probe`, read by a window another app started in-process: macOS names that app
-/// (here launchd's pid) responsible, and the probe reads ITS grant.
+/// `probe`, read by a window another app started in-process: macOS names that app (here
+/// launchd's pid) responsible, and the probe reads its grant.
 fn foreign(probe: FdaProbe) -> ConsentState {
     let mut consent = ConsentState::with_cached_probe_for_test(probe);
     consent.set_responsible_for_test(|pids| pids.iter().map(|_| Ok(1)).collect());
@@ -740,9 +742,9 @@ fn a_grant_aterm_reads_held_is_recorded_so_a_switch_off_brings_nothing_up() {
     assert_eq!(waiting.consent_launch.fda(), FdaLaunch::NotAsked);
 }
 
-/// A window started in-process by another terminal reads THAT terminal's grant (macOS
-/// holds the terminal responsible): it is never recorded as aterm's, at launch or at a
-/// waiting hand-over's quiet moment, so a later aterm of its own still gets the page.
+/// A window started in-process by another terminal reads that terminal's grant (macOS holds the
+/// terminal responsible): it is never recorded as aterm's, at launch or at a waiting hand-over's
+/// quiet moment, so a later aterm of its own still gets the page.
 #[test]
 fn another_terminals_grant_is_never_recorded_as_aterms() {
     use crate::devtools_helper::test_arms;
@@ -799,7 +801,8 @@ fn another_terminals_grant_is_never_recorded_as_aterms() {
     assert!(!grant_recorded(&waiting));
 }
 
-/// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 prompted for Downloads access.
+/// The owner's config directory (`~/.config/aterm`) on the Mac where 0.105.0 prompted for
+/// Downloads access.
 const OWNER_CONFIG_0_105: &[&str] = &[
     "connections-first-use",
     "kitty-collectibles.toml",
@@ -1036,7 +1039,8 @@ fn devtools_opened_within(window_s: u64) -> Option<u64> {
         .filter(|ago| *ago < window_s)
 }
 
-/// A Developer Tools page opened two minutes before holds the launch's Full Disk Access page back until its ten minutes are up.
+/// A Developer Tools page opened two minutes before holds the launch's Full Disk Access page back
+/// until its ten minutes are up.
 #[test]
 fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_drops_it() {
     use crate::consent_launch::FdaLaunch;
@@ -1070,7 +1074,8 @@ fn a_developer_tools_page_up_minutes_ago_holds_the_launch_page_back_and_never_dr
     assert!(app.fda_panel_up());
 }
 
-/// An update's successor on the fork lane holds the hand-over and brings the page up once the reading is the window's own.
+/// An update's successor on the fork lane holds the hand-over and brings the page up once the
+/// reading is the window's own.
 #[test]
 fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
     use crate::devtools_helper::{Origin, test_arms};
@@ -1198,8 +1203,8 @@ fn plan(revision: u64) -> Option<crate::InitialSetupPermissionPolicy> {
     })
 }
 
-/// THE WINDOW'S OWN ADMISSION of setup revision `revision`, as the page's automatic answer to
-/// the startup offer takes it.
+/// The window's own admission of setup revision `revision`, as the page's automatic answer to the
+/// startup offer takes it.
 fn window_admits(app: &mut App, revision: u64) {
     app.hold_initial_setup_permissions();
     app.note_system_state_apply(crate::system_state::Admission::Automatic);
@@ -1302,7 +1307,8 @@ fn ended(outcome: crate::debugger_access::Outcome) -> crate::debugger_access::La
     }
 }
 
-/// The first launch on a new Mac opens the Full Disk Access page, then the Developer Tools page, then the debugger-access alert, then the folder warm-up.
+/// The first launch on a new Mac opens the Full Disk Access page, then the Developer Tools page,
+/// then starts the debugger change (macOS's dialog, no alert of aterm's), then walks the folders.
 #[test]
 fn a_new_mac_turns_debugger_access_on_after_both_pages_and_before_the_folders() {
     use crate::consent_launch::FdaLaunch;
@@ -1450,9 +1456,9 @@ fn a_new_mac_turns_debugger_access_on_after_both_pages_and_before_the_folders() 
     );
 }
 
-/// THE PAGE NAMES THE DIALOG FOR A PRESENTED FRAME FIRST: the change starts only
-/// start through its injected worker arm — and a press queued behind the alert does
-/// not ask again.
+/// The page names macOS's dialog on a presented frame first, and the change starts only at a later
+/// look with the page up: a page with no new frame, or one the person left, starts nothing, and
+/// leaving takes the words away at once.
 #[test]
 fn the_page_names_macos_dialog_for_a_presented_frame_before_the_change() {
     use aterm_containment::consent::DebuggerChange;
@@ -1495,9 +1501,8 @@ fn the_page_names_macos_dialog_for_a_presented_frame_before_the_change() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// CANCEL IN MACOS'S DIALOG SETTLES THE ROW: declined in the access record for the
-/// revision, never retried in this process, and — ASKED_RECORD naming this Mac —
-/// never started by a later launch on it either.
+/// Cancel in macOS's dialog settles the row declined for the revision, never retried in this
+/// process or, with `ASKED_RECORD` naming this Mac, by a later launch.
 #[test]
 fn cancel_in_macos_dialog_settles_the_row_and_is_never_retried() {
     use aterm_containment::consent::DebuggerChange;
@@ -1525,14 +1530,9 @@ fn cancel_in_macos_dialog_settles_the_row_and_is_never_retried() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// A LATER REVISION ON A MAC WHOSE STEP IS OVER STILL SETTLES ITS ROW (design §6:
-/// the Permissions stage completes when every row is in place, not needed, or
-/// handed, declined or triggered in this revision). Cancelled in macOS's dialog at
-/// revision R, the next launch's admission of R + 1 starts nothing — once per Mac —
-/// and records the row declined for R + 1, so that revision's stage never waits on
-/// it for good. R's line stays.
-/// not made or its page waiting, the Developer Tools list unread, a hand-over waiting,
-/// a panel up, a moment that is not quiet, or the owner's recent decline.
+/// A later revision on a Mac whose step is over still settles its row: after a cancel at R, the
+/// next launch's admission of R + 1 starts nothing and records the row declined for R + 1, so that
+/// revision's Permissions stage never waits on it; R's line stays.
 #[test]
 fn a_later_revision_after_a_cancel_records_the_row_declined() {
     use aterm_containment::consent::DebuggerChange;
@@ -1567,12 +1567,9 @@ fn a_later_revision_after_a_cancel_records_the_row_declined() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// A LATER REVISION IN THIS PROCESS SETTLES THE ROW TOO, with no relaunch (design
-/// §6: a new approval asks again; the debugger once per Mac). Cancelled in macOS's
-/// dialog at revision R, the window's own admission of R again (a change to another
-/// group keeps it) queues nothing, so R's outcome stands; its admission of R + 1
-/// queues the step again, which reads the record again, finds this Mac in it, starts
-/// nothing and records the row declined for R + 1, as the next launch would.
+/// A later revision in this process settles the row too, with no relaunch: after a cancel at R,
+/// the window's admission of R again queues nothing, and its admission of R + 1 queues the step,
+/// which finds this Mac in the record, starts nothing and records the row declined for R + 1.
 #[test]
 fn a_later_revision_in_this_process_settles_the_row_with_no_second_dialog() {
     use aterm_containment::consent::DebuggerChange;
@@ -1643,14 +1640,10 @@ fn switches_on() -> super::app_config::PrivacyConfig {
     }
 }
 
-/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER (design §4, §6): with
-/// `notice`, `check` or `enabled` off the step starts nothing and records
-/// nothing — neither this Mac in the once-per-Mac record nor the admitted
-/// revision's row, which reads as the person's choice from the published opt-out
-/// while the switch is off — and once every switch is on again it goes on for the
-/// same revision, with no new approval: macOS's dialog comes. With no admission
-/// yet the step parks; the admission that comes while a switch is off pauses it
-/// the same way.
+/// A `[privacy]` switch off is a pause, never an answer: with `notice`, `check` or `enabled` off
+/// the step starts nothing and records nothing (neither this Mac nor the revision's row), and once
+/// every switch is on again it goes on for the same revision with no new approval. With no
+/// admission yet the step parks, and an admission while a switch is off pauses it the same way.
 #[test]
 fn a_privacy_switch_off_pauses_the_debugger_step_and_records_nothing() {
     for (name, privacy) in SWITCHES_OFF {
@@ -1713,12 +1706,9 @@ fn a_privacy_switch_off_pauses_the_debugger_step_and_records_nothing() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// A SWITCH TURNED OFF WHILE A KEPT ANSWER WAITS PAUSES THE STEP: the start's disk
-/// half recorded this Mac and its answer is kept (System State went away before
-/// the change started); the person then turns `notice`, `check` or `enabled` off.
-/// The look that would spend the answer reads the switches again, as admission
-/// does: nothing starts and nothing answers the revision, the answer stays kept,
-/// and once every switch is on again the change starts on it.
+/// A switch turned off while a kept answer waits pauses the step: the look that would spend the
+/// answer reads the switches again, starts nothing, answers nothing and keeps the answer, and once
+/// every switch is on again the change starts on it.
 #[test]
 fn a_switch_turned_off_while_a_kept_answer_waits_pauses_the_step() {
     use aterm_types::macos_setup::AccessOutcome;
@@ -1754,12 +1744,10 @@ fn a_switch_turned_off_while_a_kept_answer_waits_pauses_the_step() {
     }
 }
 
-/// DEBUGGER ACCESS TURNED OFF WHILE A KEPT ANSWER WAITS IS THE ROW'S WANTED STATE
-/// (design §4, `TurnedOff`): the look that spends the answer reads the rule and
-/// the record again, finds debugger access off by the person's choice (the
-/// observed record says it was allowed), starts nothing and settles the
-/// revision's row declined. CONTROL: with no such record the same look starts
-/// the change.
+/// Debugger access turned off while a kept answer waits is the row's wanted state (`TurnedOff`):
+/// the look that spends the answer finds it off by the person's choice (the observed record says
+/// it was allowed), starts nothing and settles the row declined. Control: with no such record the
+/// change starts.
 #[test]
 fn debugger_access_turned_off_while_a_kept_answer_waits_starts_nothing() {
     use crate::debugger_access::{DebuggerChangeLane, ObservedMarker, Origin, RecordsRead};
@@ -1800,11 +1788,9 @@ fn debugger_access_turned_off_while_a_kept_answer_waits_starts_nothing() {
     }
 }
 
-/// A NEW APPROVAL WHILE THE STEP'S CHANGE IS UNDER WAY JOINS IT (the checker's
-/// case): the window's own admission of R + 1 while R's change runs, macOS's
-/// dialog still up, is handed at once — never declined before anyone answered
-/// the dialog — starts nothing more, and takes the change's outcome when it
-/// ends: Cancel declines both revisions, and on grants both.
+/// A new approval while the step's change is under way joins it: the admission of R + 1 while R's
+/// dialog is up is handed at once, starts nothing more, and takes the change's outcome when it
+/// ends.
 #[test]
 fn a_new_revision_while_the_change_runs_takes_its_outcome() {
     use aterm_containment::consent::DebuggerChange;
@@ -1848,7 +1834,9 @@ fn a_new_revision_while_the_change_runs_takes_its_outcome() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// The step never starts while anything goes before it: the Full Disk Access decision
+/// The step never starts while anything goes before it: the Full Disk Access decision not made or
+/// its page waiting, the Developer Tools list unread, a hand-over waiting, a panel up, the owner's
+/// recent decline, System State not frontmost, or another macOS dialog up.
 #[test]
 fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
     use crate::consent_launch::FdaLaunch;
@@ -2107,7 +2095,8 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
     HOST_READ.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// On launch, an unread Mac line in the record starts its read on a background thread and acts on the result at the next look.
+/// On launch, an unread Mac line in the record starts its read on a background thread, and the
+/// next look acts on the result.
 #[test]
 fn the_debugger_steps_record_is_read_off_the_event_loop() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -2135,7 +2124,9 @@ fn the_debugger_steps_record_is_read_off_the_event_loop() {
     assert_eq!(workers(), 0, "nothing started");
 }
 
-/// THE START WRITES THIS MAC OFF THE EVENT LOOP: on a launch, the look that would start
+/// On a launch the start writes this Mac off the event loop: the look that would start waits for
+/// the write, then starts the change once, and a settle writes off the loop too. A step without the
+/// launch's recording lane writes in the look, on this thread.
 #[test]
 fn the_debugger_steps_start_writes_this_mac_off_the_event_loop() {
     use crate::debugger_access::DebuggerStepQueue;
@@ -2233,7 +2224,8 @@ fn the_debugger_steps_start_writes_this_mac_off_the_event_loop() {
     );
 }
 
-/// An app whose start's disk half has just recorded this Mac: the page named macOS's
+/// Brings `app` to a start whose disk half has just recorded this Mac, the page having named
+/// macOS's dialog, and returns the moment of the look that waited for the write.
 fn recorded_mid_start(app: &mut App, t: &mut Instant) -> Instant {
     app.look_for_debugger_moment(later(t), page_up);
     assert!(
@@ -2252,8 +2244,8 @@ fn recorded_mid_start(app: &mut App, t: &mut Instant) -> Instant {
     at
 }
 
-/// WHILE THE START'S DISK HALF IS OUT, THE STEP ONLY WAITS: a look then ends nothing, and once
-/// the answer is in it is spent before anything is judged again.
+/// While the start's disk half is out the step only waits: a look then ends nothing, and once the
+/// answer is in it is spent before anything is judged again.
 #[test]
 fn the_debugger_step_waits_out_its_disk_half_and_spends_it_first() {
     let mut t = Instant::now();
@@ -2324,7 +2316,8 @@ fn a_held_first_launch_setup_holds_the_debugger_step() {
     assert!(crate::debugger_access::read_asked(&config, "READY-MAC"));
 }
 
-/// AN ANSWER GIVEN WHILE THE START RECORDS SETTLES THE STEP: the owner answered
+/// An answer given while the start records settles the step declined with nothing started;
+/// unanswered, the change starts.
 #[test]
 fn an_answer_given_while_the_start_records_settles_the_step() {
     use aterm_types::macos_setup::AccessOutcome;
@@ -2455,7 +2448,8 @@ fn rule_reads_unrecognized(
     rule_reads(aterm_containment::consent::DebuggerMode::Unrecognized)
 }
 
-/// An app whose recorded answer waited out a decline's quiet on a reading older than [`crate::debugger_access::ASK_PROBE_FRESH`].
+/// An app whose recorded answer waited out a decline's quiet on a reading older than
+/// [`crate::debugger_access::ASK_PROBE_FRESH`].
 fn kept_on_an_aging_reading(
     app: &mut App,
     t: &mut Instant,
@@ -2501,7 +2495,8 @@ fn read_again_lands(app: &mut App) -> Instant {
     app.debugger_launch.next_deadline().expect("a later look")
 }
 
-/// Looks at the step's own deadlines from `next`, System State up, until it is over: the page names macOS's dialog, then the change starts.
+/// Looks at the step's own deadlines from `next`, System State up, until it is over: the page names
+/// macOS's dialog, then the change starts.
 fn looks_from(app: &mut App, next: Instant) {
     let mut next = Some(next);
     for _ in 0..2 {
@@ -2511,7 +2506,8 @@ fn looks_from(app: &mut App, next: Instant) {
     }
 }
 
-/// A KEPT ANSWER IS SPENT ON A FRESH READING OF THE RULE: once the decline quiet has
+/// A kept answer is spent on a fresh reading of the rule: once the decline's quiet has passed, an
+/// old reading is retired and read again, and the change starts only over a rule still off.
 #[test]
 fn a_kept_answer_is_spent_on_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;
@@ -2794,8 +2790,8 @@ fn a_headless_app_never_starts_or_probes() {
     assert_eq!(workers(), 0);
 }
 
-/// ONCE PER MAC: a second launch on the same config folder starts nothing and reads
-/// probe for it; another Mac sharing that folder (a synced config) is asked once.
+/// Once per Mac: a second launch on the same config folder starts nothing and reads no probe for
+/// it; another Mac sharing that folder (a synced config) is asked once.
 #[test]
 fn a_second_launch_on_the_same_mac_starts_nothing() {
     let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -2902,12 +2898,10 @@ fn an_answered_question_settles_without_a_start() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// NEVER FROM A CONTROL CLIENT: a plan admitted by a control client's Apply (`aterm
-/// ctl app act`), or one only a status names (a poll, a record edited by hand), is no
-/// standing yes — the step parks with nothing read, written or started, and the
-/// folders do not wait on it — and a control client's `Turn On…` is no person's press.
-/// POSITIVE CONTROL: the window's own admission of a later plan unparks it, and it
-/// starts.
+/// Never from a control client: a plan admitted by a control client's Apply (`aterm ctl app act`),
+/// or one only a status names, is no standing yes, so the step parks with nothing read, written or
+/// started, and a control client's `Turn On…` is no person's press. Positive control: the window's
+/// own admission of a later plan unparks it, and it starts.
 #[test]
 fn a_control_clients_act_never_starts_the_change() {
     use crate::workstation_setup::PagePress;
@@ -2966,8 +2960,8 @@ fn a_control_clients_act_never_starts_the_change() {
     assert!(debugger_alerts().is_empty());
 }
 
-/// NOT NEEDED ON A BUILD THAT IS NOT HARDENED (design §6): the step drops with
-/// nothing recorded or started, and a person's `Turn On…` starts nothing either.
+/// Not needed on a build that is not hardened: the step drops with nothing recorded or started, and
+/// a person's `Turn On…` starts nothing either.
 #[test]
 fn a_build_that_is_not_hardened_never_starts_it() {
     use aterm_containment::consent::SelfHardening;
@@ -2991,10 +2985,9 @@ fn a_build_that_is_not_hardened_never_starts_it() {
     }
 }
 
-/// A PERSON'S `Turn On…` on the Debugger row (design §3.4): their press on the page,
-/// while a plan with its Permissions group stands, is the yes — no alert of aterm's,
-/// whatever the once-per-Mac record says — and the page names macOS's dialog while
-/// the change is under way. One change at a time; nothing without an admitted plan.
+/// A person's `Turn On…` on the Debugger row, while an admitted plan stands, is the yes whatever
+/// the once-per-Mac record says: no alert of aterm's, and the page names macOS's dialog while the
+/// change is under way. One change at a time; nothing without an admitted plan.
 #[test]
 fn a_persons_turn_on_starts_the_change_with_no_alert() {
     use crate::workstation_setup::PagePress;
@@ -3034,13 +3027,9 @@ fn a_persons_turn_on_starts_the_change_with_no_alert() {
     assert_eq!(workers(), 1);
 }
 
-/// A PERSON'S `Turn On…` ANSWERS THE ONCE-PER-MAC QUESTION (design §6): their press
-/// writes this Mac into `ASKED_RECORD` and ends the launch step, parked or queued, as
-/// the step's own start does — so a Cancel in macOS's dialog is never followed by a
-/// second dialog: not from the window's admission later in this process (once the
-/// decline's quiet spell is over), not from a step already queued, and not at the next
-/// launch. A parked step, unpressed, is the
-/// control: the window's admission would start it (`a_control_clients_act_never_starts_the_change`).
+/// A person's `Turn On…` answers the once-per-Mac question: their press writes this Mac into
+/// `ASKED_RECORD` and ends the launch step, parked or queued, so a Cancel in macOS's dialog brings
+/// no second dialog in this process or at the next launch.
 #[test]
 fn a_persons_turn_on_answers_the_question_so_a_cancel_brings_no_second_dialog() {
     use crate::workstation_setup::PagePress;
@@ -3155,14 +3144,11 @@ fn open_entry(app: &App, key: &str) -> Option<aterm_messages::MessageId> {
         .map(|e| e.id)
 }
 
-/// The card's word on Full Disk Access ends only its own entries. Other reporters'
-/// entries under `privacy.` that a seamless update's successor adopted (here the vault
-/// join's, which stands until System State reads the Secrets row, and the Developer
-/// Tools line's) survive the launch check that finds the grant held, the one that finds
-/// a *Not now* on record, and a `[privacy]` switch turned off: none is ended, and the
-/// join's reporter raising it again restates it under the id it had, rather than
-/// posting it anew. The card's own entry ends on each: fixed where the probe read the
-/// grant, withdrawn where nothing read it.
+/// The card's word on Full Disk Access ends only its own entries: other reporters' `privacy.`
+/// entries a seamless update's successor adopted (the vault join's, the Developer Tools line's)
+/// survive a held grant, a *Not now* on record and a `[privacy]` switch turned off, and the join's
+/// reporter restates its entry under the id it had. The card's own entry ends on each: fixed where
+/// the probe read the grant, withdrawn where nothing read it.
 #[test]
 fn the_cards_word_ends_only_its_own_entries_across_an_update() {
     use crate::consent_card::{AccessRecord, PendingDecision};

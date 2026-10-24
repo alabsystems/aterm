@@ -47,7 +47,8 @@ enum AuthorizationWrite {
     /// An upgrade's plan and recoverable, unadmitted progress share one rename.
     UpgradePlan(Plan, scope::UpgradeProgress),
     Progress(Progress),
-    Workstation(Plan),
+    /// A matching staged choice keeps the Restore history its narrow pass still owes.
+    Workstation(Plan, Option<Restored>),
 }
 
 impl AuthorizationWrite {
@@ -56,7 +57,8 @@ impl AuthorizationWrite {
             Self::Plan(plan, provisional) => save_plan_as(root, plan, *provisional),
             Self::UpgradePlan(plan, recovery) => recovery.save(root, plan),
             Self::Progress(progress) => save_progress(root, *progress),
-            Self::Workstation(plan) => save_workstation_authorization(root, plan),
+            Self::Workstation(_, Some(restored)) => save_restored_decision(root, false, *restored),
+            Self::Workstation(plan, None) => save_workstation_authorization(root, plan),
         }
     }
 
@@ -72,12 +74,14 @@ impl AuthorizationWrite {
                 records.progress = Some(recovery.pending);
             }
             Self::Progress(progress) => records.progress = Some(*progress),
-            Self::Workstation(plan) => {
-                records.decision = if plan.selection.workstation().is_empty() {
+            Self::Workstation(plan, restored) => {
+                records.decision = if restored.is_none() && plan.selection.workstation().is_empty()
+                {
                     Decision::Applied(true)
                 } else {
                     Decision::Pending
                 };
+                records.restored = *restored;
             }
         }
     }
@@ -93,12 +97,13 @@ impl AuthorizationCommit {
         validate_plan(plan)?;
         let previous = baseline.records.plan.as_ref().map(|(plan, _)| plan);
         let prior = baseline.records.progress;
-        let mut next =
-            if previous == Some(plan) && prior.is_some_and(|progress| progress.belongs_to(plan)) {
-                prior.unwrap()
-            } else {
-                Progress::for_plan(plan)
-            };
+        let same_plan =
+            previous == Some(plan) && prior.is_some_and(|progress| progress.belongs_to(plan));
+        let mut next = if same_plan {
+            prior.unwrap()
+        } else {
+            Progress::for_plan(plan)
+        };
         if admission == Admission::Upgrade
             && let (Some(previous), Some(prior)) = (previous, prior)
             && prior.belongs_to(previous)
@@ -129,7 +134,10 @@ impl AuthorizationCommit {
         };
         let mut writes = vec![first, AuthorizationWrite::Progress(next)];
         if next.done & Stage::Workstation.bit() == 0 {
-            writes.push(AuthorizationWrite::Workstation(plan.clone()));
+            writes.push(AuthorizationWrite::Workstation(
+                plan.clone(),
+                same_plan.then_some(baseline.records.restored).flatten(),
+            ));
         }
         next.admitted = true;
         writes.push(AuthorizationWrite::Progress(next));
@@ -835,6 +843,59 @@ mod tests {
                 Some(first + 1)
             );
             assert_eq!(progress(root.path()).unwrap().unwrap().only, Some(only));
+        }
+    }
+
+    #[test]
+    fn a_restored_startup_keeps_ownership_across_its_workstation_write_error() {
+        for (restored, different, published) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let (root, mut plan) = if restored {
+                super::super::tests::staged_restored_choice()
+            } else {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let plan = Plan::default();
+                authorize_at(root.path(), &plan).unwrap();
+                (root, plan)
+            };
+            let kept = if different {
+                plan.selection.set(Setting::Spotlight, false);
+                None
+            } else {
+                decision_record(root.path()).unwrap().1
+            };
+            let original = revision_at(root.path()).unwrap();
+            let mut ticket = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+            let failed = attempt(
+                &mut ticket,
+                root.path(),
+                &plan,
+                |step, root| {
+                    if matches!(step, AuthorizationWrite::Workstation(..)) {
+                        if published {
+                            step.persist(root)?;
+                        }
+                        return Err("injected workstation decision failure".into());
+                    }
+                    step.persist(root)
+                },
+                observe,
+            );
+            assert!(failed.result.is_err());
+            assert!(ticket.pending());
+            let admitted = ticket.persist_at(root.path(), &plan).result.unwrap();
+            assert_eq!(
+                admitted,
+                Some(original + 1),
+                "restored={restored}, different={different}, published={published}: this is still the ticket's own publication"
+            );
+            assert_eq!(decision_record(root.path()).unwrap().1, kept);
         }
     }
 

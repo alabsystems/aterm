@@ -9180,7 +9180,7 @@ pub(super) fn busy_footer(rows: &[String]) -> bool {
     let Some((caret, draft)) = aterm_phase::phase::composer_draft(rows) else {
         return false;
     };
-    let busy = aterm_phase::anchors::anchor("busy.interrupt");
+    let busy = aterm_phase::anchor!("busy.interrupt");
     aterm_phase::phase::status_line(rows).is_some_and(|line| line.contains(busy))
         || rows
             .iter()

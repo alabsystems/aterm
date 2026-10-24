@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS kernel resource coalitions ([`coalition_of`], [`CoalitionIds`],
-//! [`crate::procs::processes_keeping`], [`coalitions`], [`self_check`], [`decode_usage`],
-//! [`decode_list`]).
+//! macOS kernel resource coalitions: each process's coalition id, and every coalition's counters.
 
 use std::collections::HashMap;
 
@@ -85,11 +83,11 @@ pub fn coalition_of(pid: u32) -> Option<u64> {
 /// ([`crate::procs::processes_keeping`]), so a sweep reads the coalition only of a process it has
 /// not read under its current version.
 ///
-/// A kept id stays the process's own while its version stays: xnu adopts a task into its
-/// coalitions only where it makes the task (`task_create_internal`, for a fork, a spawn, or the
-/// new task an exec makes; `coalition_adopt_task_internal` refuses a task already in one of that
-/// type) and removes it only as the task ends, and nothing moves a live task; a fork or an exec
-/// gives the process a new pid version (`p_idversion`), as a reused pid's new process has.
+/// A kept id stays the process's own while its version stays: xnu adopts a task into a coalition
+/// only as it makes the task (`task_create_internal`: a fork, a spawn, or an exec's new task;
+/// `coalition_adopt_task_internal` refuses a task already in one of that type) and removes it only
+/// as the task ends, and a fork or an exec gives the process a new pid version (`p_idversion`), as
+/// a reused pid's new process has.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoalitionIds {
     /// Each pid's kept id: the version it was read under, the id, and the sweep that last asked.
@@ -175,15 +173,17 @@ impl CoalitionIds {
     }
 }
 
-/// Whether the lane reads right on this OS build for live process `pid`.
+/// Whether the coalition lane reads right on this OS build for live process `pid`: `Ok` with its
+/// coalition's id.
 ///
 /// # Errors
-/// The word of the first check that missed.
+/// The word of the first check that missed; `unsupported` off macOS.
 pub fn self_check(pid: u32) -> Result<u64, &'static str> {
     imp::self_check(pid)
 }
 
-/// Decode coalition `id`'s counters from `raw` ([`crate::procs::kernel_timebase`], [`UNWRITTEN`]).
+/// Decode coalition `id`'s counters from `raw` at the Mach timebase `(numer, denom)`; `None` when
+/// the record's QoS count is not [`QOS_CLASSES`] (another layout).
 #[must_use]
 pub fn decode_usage(
     id: u64,

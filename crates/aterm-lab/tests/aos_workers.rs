@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos-search --workers` as processes (design §11.7, process tests): the six-line plans file on
-//! three workers at a ten-second lease, honest and under each injected fault, against one local
-//! run. Every run is held to the one-minute hang detector, never retried, and asserts its exit
-//! status, its counts by name, its fault's firing and `reaped == spawned`.
+//! `aos-search --workers` as processes (design §11.7): the six-line plans file on three workers at
+//! a ten-second lease, honest and under each injected fault, against one local run. Each run is
+//! held to the one-minute hang detector and never retried. A run is CPU-bound, so one past the
+//! detector on a host whose load exceeds its CPUs is COULD NOT RUN, naming the load.
 
 #![cfg(target_os = "macos")]
 
@@ -151,6 +151,15 @@ fn finish(mut child: Child, dir: aterm_tempfile::TempDir, out: PathBuf) -> Run {
         None => {
             let _ = child.kill();
             let _ = child.wait();
+            // The search is CPU-bound: the longest run, two searches, takes 8-9 s alone here and
+            // 53 s held to the efficiency cores (`taskpolicy -b`), and a full verify's load
+            // stretched it past the detector twice. On such a host the detector times the load.
+            if let Some(load) = aterm_spec::host::oversubscribed() {
+                aterm_spec::host::could_not_run(format!(
+                    "aos-search did not end within {MUST_HAPPEN:?} on an oversubscribed host \
+                     ({load})"
+                ));
+            }
             panic!("aos-search did not end within {MUST_HAPPEN:?}");
         }
     };

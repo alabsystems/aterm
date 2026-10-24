@@ -7,7 +7,6 @@ use std::collections::VecDeque;
 
 use aterm_json::{Map, Value};
 use aterm_phase::WallKind;
-use aterm_phase::anchors::anchor_text;
 
 use super::transcript;
 use super::usage::{Seen, SeenIds, TokenUsage};
@@ -59,21 +58,21 @@ pub const USER_MARKERS: [&str; 10] = [
     super::upgrade::MISSED_TASK_NOTICE,
 ];
 
-const KEY_TOOL_USE: &str = anchor_text("transcript.tool_use");
-const KEY_TOOL_RESULT: &str = anchor_text("transcript.tool_result");
-const KEY_TOOL_USE_ID: &str = anchor_text("transcript.tool_use_id");
-const KEY_IS_ERROR: &str = anchor_text("transcript.is_error");
-const KEY_TURN_DURATION: &str = anchor_text("transcript.turn_duration");
-const KEY_DURATION_MS: &str = anchor_text("transcript.durationMs");
-const KEY_COMPACT_BOUNDARY: &str = anchor_text("transcript.compact_boundary");
-const KEY_COMPACT_SUMMARY: &str = anchor_text("transcript.isCompactSummary");
-const KEY_QUEUE_TRANSCRIPT_ONLY: &str = anchor_text("transcript.queueTranscriptOnly");
-const KEY_API_ERROR: &str = anchor_text("transcript.isApiErrorMessage");
-const KEY_SIDECHAIN: &str = anchor_text("transcript.isSidechain");
-const KEY_META: &str = anchor_text("transcript.isMeta");
-const KEY_PROMPT_ID: &str = anchor_text("transcript.promptId");
-const KEY_PARENT: &str = anchor_text("transcript.parentUuid");
-const KEY_LOCAL_COMMAND: &str = anchor_text("transcript.local_command");
+const KEY_TOOL_USE: &str = aterm_phase::anchor!("transcript.tool_use");
+const KEY_TOOL_RESULT: &str = aterm_phase::anchor!("transcript.tool_result");
+const KEY_TOOL_USE_ID: &str = aterm_phase::anchor!("transcript.tool_use_id");
+const KEY_IS_ERROR: &str = aterm_phase::anchor!("transcript.is_error");
+const KEY_TURN_DURATION: &str = aterm_phase::anchor!("transcript.turn_duration");
+const KEY_DURATION_MS: &str = aterm_phase::anchor!("transcript.durationMs");
+const KEY_COMPACT_BOUNDARY: &str = aterm_phase::anchor!("transcript.compact_boundary");
+const KEY_COMPACT_SUMMARY: &str = aterm_phase::anchor!("transcript.isCompactSummary");
+const KEY_QUEUE_TRANSCRIPT_ONLY: &str = aterm_phase::anchor!("transcript.queueTranscriptOnly");
+const KEY_API_ERROR: &str = aterm_phase::anchor!("transcript.isApiErrorMessage");
+const KEY_SIDECHAIN: &str = aterm_phase::anchor!("transcript.isSidechain");
+const KEY_META: &str = aterm_phase::anchor!("transcript.isMeta");
+const KEY_PROMPT_ID: &str = aterm_phase::anchor!("transcript.promptId");
+const KEY_PARENT: &str = aterm_phase::anchor!("transcript.parentUuid");
+const KEY_LOCAL_COMMAND: &str = aterm_phase::anchor!("transcript.local_command");
 
 /// An id as the session log takes one (`aterm_slog::ShortId`'s rule).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

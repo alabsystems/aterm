@@ -1728,7 +1728,6 @@ fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
         would.push(format!("chmod 700 — {}", was.join(", ")));
         did.push(format!("made 0700 ({})", was.join(", ")));
     }
-    out.done("root", &would.join("; "), &did.join("; "));
     if !out.dry_run {
         for d in [p.root.as_path(), state] {
             if let Err(e) = ensure_private_dir(d) {
@@ -1737,6 +1736,7 @@ fn root_step(p: &Paths, state: &Path, out: &mut Out) -> bool {
             }
         }
     }
+    out.done("root", &would.join("; "), &did.join("; "));
     true
 }
 

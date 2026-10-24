@@ -794,7 +794,8 @@ impl MusicNotes {
         reduced_motion: bool,
     ) -> [Option<NoteSprite>; MAX_NOTES] {
         let mut out = [None; MAX_NOTES];
-        if self.live == 0 {
+        let mut rem = usize::from(self.live);
+        if rem == 0 {
             return out;
         }
         let mut i = 0;
@@ -802,6 +803,10 @@ impl MusicNotes {
             if let Some(sprite) = Self::resolve(note, now, reduced_motion) {
                 out[i] = Some(sprite);
                 i += 1;
+            }
+            rem -= 1;
+            if rem == 0 {
+                break;
             }
         }
         out

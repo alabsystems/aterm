@@ -217,7 +217,8 @@ pub enum SyncOutcome {
         /// The seq held.
         seq: u64,
     },
-    /// The source held an older version than this machine verified, so this machine's copy was put back.
+    /// The source held an older version than this machine verified, so this machine's copy was
+    /// put back.
     PutBack {
         /// The seq held, and now the source's.
         seq: u64,
@@ -344,7 +345,7 @@ impl Drop for StateLock {
     }
 }
 
-/// Default machine name derived from the computer name or local host name, or `"machine"`.
+/// Default machine name from the computer, LAN or host name (an `m<N>` tag first), or `"machine"`.
 pub fn default_host_name() -> String {
     let mut candidates = Vec::new();
     #[cfg(target_os = "macos")]
@@ -420,7 +421,7 @@ fn extract_machine_tag(raw: &str) -> Option<String> {
     None
 }
 
-/// 80-bit SHA-256 prefix of `recipient` encoded in lowercase RFC 4648 base32 (`xxxx-xxxx-xxxx-xxxx`).
+/// 80-bit SHA-256 prefix of `recipient` in lowercase RFC 4648 base32 (`xxxx-xxxx-xxxx-xxxx`).
 pub fn join_code(recipient: &Recipient) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let digest = sha256(&recipient.0);
@@ -610,11 +611,9 @@ struct State {
     /// The last apply left a file unwritten: the next fetch of the same version applies again.
     failed: bool,
     manifest: Manifest,
-    /// Entry name → digest of each value a pass is to write, saved before it writes and
-    /// cleared by its own save, and kept by the saves of passes that apply nothing: a pass cut
-    /// short in between leaves those files holding what it wrote under the manifest's older
-    /// digests, or none, and the next apply counts them the vault's all the same
-    /// ([`materialize::apply_resuming`]).
+    /// Entry name → digest of each value a pass is to write, saved before it writes and cleared
+    /// by its own save (a save that applies nothing keeps it), so the next apply still counts
+    /// the files a cut-short pass wrote as the vault's ([`materialize::apply_resuming`]).
     pending: materialize::Pending,
 }
 
@@ -1049,11 +1048,9 @@ pub enum Look {
     Answers,
     /// Transient transport failure or unreached source.
     Unreached(String),
-    /// Unreached, the last failure [`transport::Unheard::held`]: a timeout or no route to the
-    /// host, as macOS leaves this app's lookups and LAN connects while it holds them for a
-    /// person's answer to its Local Network question or after a Don't Allow. A host that is
-    /// off, or a server that takes the connection and then stalls, fails alike, so it is a hint
-    /// to name the setting, never a finding.
+    /// Unreached, the last failure [`transport::Unheard::held`], as macOS fails this app's LAN
+    /// traffic while its Local Network question is unanswered or denied. A host that is off or a
+    /// server that stalls fails alike, so this is a hint to name the setting, never a finding.
     Held(String),
     /// The endpoint or path holds no vault.
     NoVault(String),
@@ -1711,12 +1708,9 @@ const REASK: u64 = 60 * 60;
 const JOIN_GRACE: u64 = 5 * 60;
 
 /// The `requested` a join records when it saves the vault, before it asks for the password
-/// and posts: dated so the re-ask comes due [`JOIN_GRACE`] later. A running subscriber leaves
-/// the join that long to post its own request (asking in between, without the join's proof,
-/// would make the join's own request a change the server refuses for a while), and a join cut
-/// off before it posts (Ctrl-C at the password prompt ends the process; aterm quits mid-join)
-/// is asked for by whichever subscriber pass comes next after that, not an hour on. The join's
-/// own request, once queued, records when it asked ([`request_join`]).
+/// and posts: dated so the re-ask comes due [`JOIN_GRACE`] later. A subscriber asking sooner,
+/// without the join's proof, would make the join's own request a change the server refuses for
+/// a while; a join cut off before it posts is asked for after the grace, not an hour on.
 fn in_flight() -> u64 {
     now().saturating_sub(REASK - JOIN_GRACE)
 }
@@ -1943,7 +1937,7 @@ pub struct Settled {
 }
 
 impl Settled {
-    /// Whether any request in `listed` relevant to `approval` has not yet been judged at `(config, seq)`.
+    /// Whether a request in `listed` relevant to `approval` is unjudged at `(config, seq)`.
     pub fn due(
         &mut self,
         config: &Config,
@@ -2167,7 +2161,7 @@ fn default_pin(source: &Source) -> Option<[u8; 32]> {
     }
 }
 
-/// Join a vault: configure the source, ensure a machine identity, verify, sync, or queue a join request.
+/// Join a vault: configure the source and machine key, verify, then sync or queue a join request.
 pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutcome> {
     join_with(paths, options, ExpectedConfig::Any, |source| {
         transport::fetch(source, None, Duration::from_secs(30))
@@ -2500,7 +2494,7 @@ fn seq_of(bytes: &[u8]) -> Option<u64> {
     envelope::parse(bytes).ok().map(|parsed| parsed.seq)
 }
 
-/// Open the vault as an admin: fetch or restore the latest verified envelope and decrypt its admin locker.
+/// Open as an admin: fetch or restore the latest verified envelope and decrypt its admin locker.
 pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let pin = config
@@ -2752,7 +2746,7 @@ fn alab_release(
     })
 }
 
-/// Publish `doc` as the next version, rotating keys or join credentials when admins or machines are removed.
+/// Publish `doc` as the next version, rotating keys or join credentials when members leave.
 pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
     publish_as(paths, admin, doc, false)
 }
@@ -5611,10 +5605,8 @@ mod tests {
         server.borrow_mut().take().expect("running").stop();
     }
 
-    /// A join cut off between saving the vault and posting its request (the person stopped at
-    /// the password prompt, or aterm quit) leaves the machine waiting with nothing queued: the
-    /// pass of a subscriber already running asks [`JOIN_GRACE`] later, not an hour on, and not
-    /// sooner, while a join may still be about to post its own.
+    /// A join cut off before posting its request is asked for by a running subscriber
+    /// [`JOIN_GRACE`] after it saved the vault: not sooner, and not an hour on.
     #[test]
     fn a_join_cut_off_before_its_request_is_asked_for_after_the_grace() {
         let root = aterm_tempfile::tempdir().expect("tempdir");

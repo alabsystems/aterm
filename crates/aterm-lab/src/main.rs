@@ -84,6 +84,8 @@ mod linux_baseline;
 #[cfg(target_os = "macos")]
 mod linux_browser;
 #[cfg(target_os = "macos")]
+mod linux_driver;
+#[cfg(target_os = "macos")]
 mod linux_edges;
 #[cfg(target_os = "macos")]
 mod linux_gone;
@@ -93,6 +95,8 @@ mod linux_guest;
 mod linux_proof;
 #[cfg(target_os = "macos")]
 mod linux_vz;
+#[cfg(target_os = "macos")]
+mod linux_vz_driver;
 #[cfg(target_os = "macos")]
 mod linux_vz_host;
 #[cfg(target_os = "macos")]
@@ -384,7 +388,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons]
+  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene SCENE]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
@@ -392,7 +396,10 @@ Outside any lab (no jail, no stub):
                                  end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
                                  managed Claude Code's store build with its twin and reroute stub, and the instance reroutes)
-                                 --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
+                                 --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build);
+                                 --scene deck-busy|deck-calm|deck-absent reads the merged deck's fixture scene in place
+                                 of the machine, its front tab the scene's (debug build; headless, the Deck shows with
+                                 --env ATERM_DEV_STATS_DECK_HEADLESS=1 --env ATERM_DEV_HEADROOM_PX=<its height in px>)
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the

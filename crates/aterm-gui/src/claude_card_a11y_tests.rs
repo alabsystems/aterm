@@ -68,7 +68,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
         heard.value().contains(BYPASS)
             && heard
                 .value()
-                .contains(aterm_phase::anchor_text("notice.updated_details"))
+                .contains(aterm_phase::anchor!("notice.updated_details"))
             && !heard.value().contains(NOTICE.text)
             && !heard.value().contains("YOLO")
             && !heard.value().contains(LOGO),

@@ -41,7 +41,8 @@ pub enum Dir {
 }
 
 impl Dir {
-    /// The direction of a cell-space delta, by the dominant axis (D15's rule).
+    /// The direction of a cell-space delta, by the dominant axis (D15's rule; a tie goes
+    /// horizontal).
     #[inline]
     #[must_use]
     pub const fn of(dcol: i32, drow: i32) -> Self {
@@ -72,7 +73,8 @@ impl Dir {
     }
 }
 
-/// Why a move was admitted, as the licence gate (`CursorGlow::move_licensed`) and `classify_move` decided upstream.
+/// Why a move was admitted, as the licence gate (`CursorGlow::move_licensed`) and `classify_move`
+/// decided upstream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Licence {
     Typed,
@@ -190,7 +192,8 @@ pub struct CaretSeam {
     pub paint: f32,
 }
 
-/// One impulse, two bodies (D13, §7.2).
+/// One impulse, two bodies (D13, §7.2): the pet or the flying head reads it
+/// ([`companion::impulse_for`]).
 #[derive(Clone, Copy, Debug)]
 pub enum CompanionImpulse {
     Meteor {
@@ -225,7 +228,8 @@ pub struct Mend {
     pub deletes: u8,
 }
 
-/// The per-tick read-only context handed to every producer, so everything born on a frame is priced by one evaluation of the spine.
+/// The per-tick read-only context handed to every producer, so everything born on a frame is
+/// priced by one evaluation of the spine.
 #[derive(Clone, Copy)]
 pub struct Ctx<'a> {
     pub now: Instant,
@@ -243,11 +247,9 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// Whether a light at `(x, y)` reaching `reach` px stands within a cell
-    /// of the caret's block on paper: after an Enter a star's needles struck
-    /// through the block, and a diamond touching its corner read as part of
-    /// it. Stars on paper stand at least a cell clear of the block, every
-    /// side; on a dark page the caret's own light keeps them off.
+    /// Whether a light at `(x, y)` reaching `reach` px stands within a cell of the caret's block on
+    /// paper, where stars keep a cell clear of the block on every side; on a dark page the caret's
+    /// own light keeps them off, and this is false.
     #[inline]
     #[must_use]
     pub fn near_paper_caret(&self, (x, y): (i32, i32), reach: i32) -> bool {
@@ -295,7 +297,8 @@ pub const TAIL_FLOOR: Duration = Duration::from_millis(45);
 /// No busy re-arm.
 pub const ARM_MIN: Duration = Duration::from_millis(1);
 
-/// A producer's answer to "when do you next change what is on glass?", folded from three kinds of offer.
+/// A producer's answer to "when do you next change what is on glass?", folded from three kinds of
+/// offer.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Cadence {
     now: Instant,
@@ -628,7 +631,8 @@ impl Default for Engine {
 }
 
 impl Engine {
-    /// A disengaged engine with nothing live and a full glint bucket, so the first capital of a session chimes.
+    /// A disengaged engine with nothing live and a full glint bucket, so the first capital of a
+    /// session chimes.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -781,7 +785,8 @@ impl Engine {
         }
     }
 
-    /// The soft-wrapped word the ribbon keeps for the key that reflows it ([`ribbon::SoftWrap`]), if any.
+    /// The soft-wrapped word the ribbon keeps for the key that reflows it ([`ribbon::SoftWrap`]),
+    /// if any.
     #[inline]
     #[must_use]
     pub const fn soft_wrap_carry(&self) -> Option<ribbon::SoftWrap> {
@@ -1272,7 +1277,8 @@ impl Engine {
         self.follow_rows_with_park(rows, asked, now, None, false).0
     }
 
-    /// The same content follow, with the one exact short held park the host may be waiting to judge.
+    /// The same content follow, with the one exact short held park the host may be waiting to
+    /// judge.
     pub(crate) fn follow_rows_with_park(
         &mut self,
         rows: &[RowSample<'_>],
@@ -1462,7 +1468,7 @@ impl Engine {
         Some(run)
     }
 
-    /// THE CARET'S CARRY ([`witness::Witness::carry_caret`]).
+    /// The caret's carry ([`witness::Witness::carry_caret`]).
     #[inline]
     pub(crate) const fn carry_caret(&mut self, dr: i16) {
         if self.engaged {
@@ -1483,7 +1489,7 @@ impl Engine {
             .follow_hand(self.ribbon.cells(), rows, self.caret, rode_to)
     }
 
-    /// THE HAND RIDES ITS LINE.
+    /// The hand rides its line: its anchors lift from `run.row` by `run.dr`.
     #[inline]
     pub(crate) fn lift_hand(&mut self, run: witness::FollowRun) {
         let Some(to) = run.row.checked_add_signed(run.dr) else {
@@ -1493,7 +1499,8 @@ impl Engine {
         self.hand_run = Some(run);
     }
 
-    /// The hand's anchors lifted with a line that has no typed run to carry: [`Engine::lift_hand`] with no run.
+    /// The hand's anchors lifted with a line that has no typed run to carry: [`Engine::lift_hand`]
+    /// with no run.
     #[inline]
     pub(crate) fn lift_caret(&mut self, row: u16, to: u16) {
         self.lift_hand_anchors(row, to);
@@ -1645,7 +1652,8 @@ impl Engine {
         }
     }
 
-    /// The party (§27).
+    /// Queue a sing-along bar fan of `n` stars (a landing on a `ring` bar), staged at the caret on
+    /// the next tick.
     #[inline]
     pub const fn party(&mut self, now: Instant, n: u8, ring: bool) {
         if !self.engaged {
@@ -1669,7 +1677,8 @@ impl Engine {
         self.tick_with_restored_rows(now, geom, cfg, out, &[]);
     }
 
-    /// The host's sampled rows can lift a prior partial release on the very frame that shows its text again, after queued edits have replayed.
+    /// The host's sampled rows can lift a prior partial release on the very frame that shows its
+    /// text again, after queued edits have replayed.
     pub(crate) fn tick_with_restored_rows(
         &mut self,
         now: Instant,
@@ -1854,7 +1863,7 @@ impl Engine {
             retired: self.retired,
             followed: self.followed,
             follow_missed: self.follow_missed,
-            disp: self.spine.disp(),
+            disp: ctx.disp,
             flow: ctx.flow,
             tokens: self.stardust.budget.tokens(),
             fp: self.fp,
@@ -1966,8 +1975,8 @@ impl Engine {
         self.caret
     }
 
-    /// Lay a dark train into the letter guard's reach below a lettered
-    /// row, as it was (the brown segment's negative control).
+    /// Lay a dark train into the letter guard's reach below a lettered row (the brown segment's
+    /// negative control).
     #[cfg(test)]
     pub(crate) const fn lay_trains_in_guard(&mut self, on: bool) {
         self.meteor.trains_in_guard = on;
@@ -1998,7 +2007,8 @@ impl Engine {
         self.spine.phase()
     }
 
-    /// The spine itself, for the producers and for tests that need the raw metric beside its display twin.
+    /// The spine itself, for the producers and for tests that need the raw metric beside its
+    /// display twin.
     #[inline]
     #[must_use]
     pub const fn spine(&self) -> &Spine {
@@ -2012,7 +2022,8 @@ impl Engine {
         &self.stardust.budget
     }
 
-    /// The glyph probe (§5.4's hard gate), written by the host before seam point 3 from the same row probes it takes for the ledger.
+    /// The glyph probe (§5.4's hard gate), written by the host before seam point 3 from the same
+    /// row probes it takes for the ledger.
     #[inline]
     pub const fn probe_mut(&mut self) -> &mut GlyphProbe {
         self.stardust.probe_mut()
@@ -2089,8 +2100,7 @@ impl Engine {
         self.companion.take()
     }
 
-    /// The resident pet's receiving end (D13). The host reads it after its own
-    /// pet tick:
+    /// The resident pet's receiving end (D13). The host reads it after its own pet tick:
     ///
     /// ```
     /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
@@ -2160,7 +2170,8 @@ impl Engine {
         self.stardust.catch(star.x, star.y, star.born, at)
     }
 
-    /// The pet's drawn box this frame, window pixels (`None`: off glass): no star is drawn on its body ([`companion::PetShade`]).
+    /// The pet's drawn box this frame, window pixels (`None`: off glass): no star is drawn on its
+    /// body ([`companion::PetShade`]).
     #[inline]
     pub const fn note_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
         self.stardust.shade.note(body);
@@ -2730,12 +2741,8 @@ mod tests {
         t
     }
 
-    /// On paper the stars stand at least a cell clear of the caret's block,
-    /// every side: after an Enter a diamond touching the block's corner read
-    /// as part of it (looks6 round 2 N5, `e120`). Typing a row and taking a
-    /// Return, no painted star's rect comes within a cell of the caret on
-    /// paper; on dark (the control, where the caret's own light keeps them
-    /// off) the strikes lay stars there.
+    /// Typing a row and taking a Return on paper, no painted star comes within a cell of the
+    /// caret; on dark (the control) the strikes lay stars there.
     #[test]
     fn paper_stars_stand_a_cell_clear_of_the_caret() {
         let ms = Duration::from_millis;

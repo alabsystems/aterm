@@ -236,7 +236,8 @@ impl Scene {
 
     /// The reading `at_ms` from the first split tick: a split tick (at a
     /// whole number of windows) reads the coalitions, each process's
-    /// coalition and birth, and the leads. The host's dev seam
+    /// coalition, and the leads; every reading reads each process's birth,
+    /// as each of the host's whole readings does. The host's dev seam
     /// (`ATERM_DEV_WHY_FIXTURE`) asks it at any `at_ms`, a split tick where
     /// the host's own cadence makes one: every counter grows at its figure,
     /// so a scene whose processes keep one rate ([`Proc::fast`] unset) reads
@@ -283,7 +284,7 @@ impl Scene {
                 pgid: p.pid,
                 state: ProcState::Run,
                 coalition: split.then_some(p.coalition),
-                birth_ms: split.then_some(p.birth_ms),
+                birth_ms: Some(p.birth_ms),
                 ..ProcSample::default()
             })
             .collect();

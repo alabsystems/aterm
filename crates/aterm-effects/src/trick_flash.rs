@@ -755,7 +755,7 @@ fn find_word(
         cursor_col,
         exact_only,
     );
-    if !slot.rtl {
+    if !slot.rtl || typed.is_some_and(|h| h.anchor == Anchor::Exact) {
         return typed.map(|hit| (hit, false));
     }
     let mut mirror = slot.chars;

@@ -3,18 +3,13 @@
 
 //! Kimi Code (`kimi`, Moonshot AI) CLI harness version and screen grammar.
 //!
-//! WHAT IS MEASURED. Kimi Code 2.3.1 signed out, in a private headless aterm with a scratch
-//! `KIMI_CODE_HOME` (`fixtures/kimi-2.3.1-*.txt`): its welcome box, its composer (a rounded box
-//! whose first row is `│ > ` and the draft), the footer under it (the folder and a tip, then
-//! `context: N%` alone at the right), and the row a turn that failed ends on, `Error: <why>`
-//! indented under the transcript (`Error: LLM not set, send "/login" to login`). The quota and
-//! balance texts are the ones Kimi Code itself classifies a 429 by (its
-//! `KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`, in the 2.3.1 binary); the concurrency throttle a 429
-//! also says (`You've reached your concurrent request limit`) is a retryable rate limit to it, and
-//! no wall here. A busy turn is not measured (no signed-in account), so every phase is `idle` NOT
-//! authoritatively.
+//! Measured on Kimi Code 2.3.1 signed out (`fixtures/kimi-2.3.1-*.txt`): the welcome box, the
+//! composer (a rounded box whose first row is `│ > ` and the draft), the `context: N%` footer
+//! under it, and the indented `Error: <why>` row a failed turn ends on. The quota and balance
+//! texts are the patterns Kimi Code itself classifies a 429 by
+//! (`KIMI_QUOTA_EXHAUSTED_MESSAGE_PATTERNS`); its concurrency throttle is a retryable rate limit,
+//! not a wall. A busy turn is unmeasured, so no phase is authoritative.
 
-use crate::anchors::anchor_text;
 use crate::wall::{Placement, Wall, WallKind};
 
 /// Major component of the Kimi Code (`kimi`) harness version, starting at `0.1`.
@@ -23,7 +18,7 @@ pub const HARNESS_VERSION_MAJOR: u16 = 0;
 /// Minor component of the Kimi Code (`kimi`) harness version, starting at `0.1`.
 pub const HARNESS_VERSION_MINOR: u16 = 1;
 
-/// Version of the Kimi Code (`kimi`) harness, tracked independently per harness starting at `"0.1"`.
+/// Version of the Kimi Code (`kimi`) harness, tracked per harness from `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
 
 /// Structured incremental numeric version of the Kimi Code (`kimi`) harness.
@@ -96,7 +91,7 @@ fn caret_text(row: &str) -> Option<&str> {
 #[must_use]
 pub fn context_row(row: &str) -> Option<u8> {
     crate::text::trim(row)
-        .strip_prefix(anchor_text("kimi.footer.context"))?
+        .strip_prefix(crate::anchor!("kimi.footer.context"))?
         .strip_suffix('%')?
         .parse()
         .ok()
@@ -123,7 +118,7 @@ pub fn is_kimi_screen(rows: &[String]) -> bool {
         || rows.iter().any(|r| {
             crate::text::trim_start(r)
                 .strip_prefix('│')
-                .is_some_and(|inner| crate::text::contains(inner, anchor_text("kimi.welcome")))
+                .is_some_and(|inner| crate::text::contains(inner, crate::anchor!("kimi.welcome")))
         })
 }
 
@@ -135,7 +130,7 @@ pub fn is_kimi_screen(rows: &[String]) -> bool {
 pub fn wall(rows: &[String]) -> Option<Wall> {
     let (top, _, _) = composer_rows(rows)?;
     let last = rows[..top].iter().rposition(|r| !crate::text::blank(r))?;
-    let opener = anchor_text("kimi.error");
+    let opener = crate::anchor!("kimi.error");
     let at = (0..=last)
         .rev()
         .take_while(|&i| !crate::text::blank(&rows[i]))
@@ -176,7 +171,8 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
 #[path = "kimi_tests.rs"]
 mod tests;
 
-/// Kimi Code's screens, measured or hand-built (each file's head says which), for this crate's tests and a dependent crate's `#[cfg(test)]` code; not part of the documented API.
+/// Kimi Code's screens, measured or hand-built (each file's head says which), for tests here and
+/// in dependent crates; not part of the documented API.
 #[doc(hidden)]
 pub mod fixtures {
     /// Kimi Code 2.3.1 signed out at its idle composer, after the folder was trusted (MEASURED).

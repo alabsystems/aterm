@@ -156,7 +156,7 @@ pub(crate) fn rows(
         .collect();
     let lane_wl = if built && wanted.iter().any(|e| e.points()) {
         println!("\n=== {}: build lane-wl ===", cell.tag);
-        let out = cell.up.lima.shell_streamed(
+        let out = cell.up.guest.shell_streamed(
             &cell.up.home,
             &cell.cargo(
                 &cell.env,
@@ -461,10 +461,10 @@ impl Run<'_> {
             .parent()
             .map_or_else(String::new, |p| p.to_string_lossy().into_owned());
         let made = self.sh(&["install", "-d", &dir]);
-        let wrote = self
-            .up()
-            .lima
-            .shell(&self.up().home, &["tee".into(), path.into()], Some(text));
+        let wrote =
+            self.up()
+                .guest
+                .shell(&self.up().home, &["tee".into(), path.into()], Some(text));
         if made.ok() && wrote.ok() {
             Ok(())
         } else {
@@ -552,7 +552,7 @@ impl Run<'_> {
             .nth(3)
             .ok_or_else(|| format!("`image` answered {reply}"))?;
         let host = self.cell.results.join(&name);
-        let out = self.up().lima.copy_out(guest_png, &host);
+        let out = self.up().guest.copy_out(guest_png, &host);
         if out.ok() {
             Ok(())
         } else {
@@ -1695,7 +1695,7 @@ impl Run<'_> {
             .cell
             .results
             .join(format!("{}-{what}.png", self.gui.name));
-        let copied = self.up().lima.copy_out(&guest_png, &host);
+        let copied = self.up().guest.copy_out(&guest_png, &host);
         if !copied.ok() {
             return Err(format!("{guest_png}: {}", copied.tail(2)));
         }

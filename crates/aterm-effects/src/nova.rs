@@ -153,12 +153,12 @@ impl QuadSink<'_> {
         }
         let x0_u = x0 as u16;
         let w_u = (x1 - x0) as u16;
+        let mut row = y0 / self.cell_h;
         let mut yy = y0;
         while yy < y1 {
             if self.budget == 0 {
                 return;
             }
-            let row = yy / self.cell_h;
             let band_end = ((row + 1) * self.cell_h).min(y1);
             self.out.push(GlowQuad {
                 row: row as u16,
@@ -173,6 +173,7 @@ impl QuadSink<'_> {
             });
             self.budget -= 1;
             yy = band_end;
+            row += 1;
         }
     }
 
@@ -347,6 +348,10 @@ fn emit_rays(
         return 0;
     }
     let (cxf, cyf) = (env.cx as f32, env.cy as f32);
+    let core = env.core;
+    let samples_f = samples as f32;
+    let rot_turn = f32::from(env.feats.rot) / 16.0;
+    let nrays_f = nrays as f32;
     let mut emitted_samples = 0usize;
     for k in 0..nrays {
         let ang = if quasar {
@@ -357,9 +362,9 @@ fn emit_rays(
                 std::f32::consts::FRAC_PI_2
             }
         } else {
-            std::f32::consts::TAU * (f32::from(env.feats.rot) / 16.0 + k as f32 / nrays as f32)
+            std::f32::consts::TAU * (rot_turn + k as f32 / nrays_f)
         };
-        let (dx, dy) = (ang.cos(), ang.sin());
+        let (dy, dx) = ang.sin_cos();
         let major_x = dx.abs() >= dy.abs();
         let maj = dx.abs().max(dy.abs());
         let lm = len * maj;
@@ -367,13 +372,13 @@ fn emit_rays(
         let mut prev_m1 = 0.0f32;
         for j in 0..samples {
             let m0 = prev_m1;
-            let m1 = (lm * (j + 1) as f32 / samples as f32).round();
+            let m1 = (lm * (j + 1) as f32 / samples_f).round();
             prev_m1 = m1;
             if m1 <= m0 {
                 continue;
             }
             let quads_before = sink.out.len();
-            let sf = (j as f32 + 0.5) / samples as f32;
+            let sf = (j as f32 + 0.5) / samples_f;
             let th = 2.5 - 1.5 * sf;
             let cov = (fade * (1.0 - 0.65 * sf) * env.intensity).clamp(0.0, 1.0);
             let mm = 0.5 * (m0 + m1);
@@ -381,22 +386,24 @@ fn emit_rays(
                 let xa = cxf + ux * m0;
                 let xb = cxf + ux * m1;
                 let (x0, x1) = if xa <= xb { (xa, xb) } else { (xb, xa) };
+                let x0_i = x0.floor() as i32;
                 let yc = cyf + uy * mm;
                 let y0 = (yc - 0.5 * th).floor() as i32;
                 let y1 = ((yc + 0.5 * th).ceil() as i32).max(y0 + 1);
                 let frac = (th / (y1 - y0) as f32).min(1.0);
                 let a = (255.0 * cov * frac).round() as u8;
                 sink.push(
-                    x0.floor() as i32,
+                    x0_i,
                     y0,
-                    (x1.ceil() as i32 - x0.floor() as i32).max(1),
+                    (x1.ceil() as i32 - x0_i).max(1),
                     y1 - y0,
-                    premul_rgb(env.core, a),
+                    premul_rgb(core, a),
                 );
             } else {
                 let ya = cyf + uy * m0;
                 let yb = cyf + uy * m1;
                 let (y0, y1) = if ya <= yb { (ya, yb) } else { (yb, ya) };
+                let y0_i = y0.floor() as i32;
                 let xc = cxf + ux * mm;
                 let x0 = (xc - 0.5 * th).floor() as i32;
                 let x1 = ((xc + 0.5 * th).ceil() as i32).max(x0 + 1);
@@ -404,10 +411,10 @@ fn emit_rays(
                 let a = (255.0 * cov * frac).round() as u8;
                 sink.push(
                     x0,
-                    y0.floor() as i32,
+                    y0_i,
                     x1 - x0,
-                    (y1.ceil() as i32 - y0.floor() as i32).max(1),
-                    premul_rgb(env.core, a),
+                    (y1.ceil() as i32 - y0_i).max(1),
+                    premul_rgb(core, a),
                 );
             }
             emitted_samples += usize::from(sink.out.len() > quads_before);
@@ -453,6 +460,9 @@ fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
 
 /// Debris: 8–20 motes on analytic ballistic arcs (position is a closed form of age) on the wdeco Add stream, twinkling on the shared ≥ 350 ms phase grid (§6.4).
 pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
+    if out.len() >= cap || env.feats.debris == 0 {
+        return;
+    }
     let d = u64::from(env.feats.duration_ms);
     if !(DEBRIS_START_MS..d).contains(&t_ms) {
         return;
@@ -481,6 +491,7 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
     if alpha_pair[0] <= 0.01 && alpha_pair[1] <= 0.01 {
         return;
     }
+    let alpha_u8_pair = alpha_pair.map(|a| (a * 255.0).round() as u8);
     let sing_contract = if singularity { 1.0 - ease_out(qn) } else { 0.0 };
     let ch_f = env.cell_h as f32;
     let grav_drop = 0.5 * (2.2 * ch_f) * age * age;
@@ -491,20 +502,21 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
             break;
         }
         let s = mix(env.seed ^ u64::from(m).wrapping_mul(0xA24B_AED4_963E_E407));
-        let alpha = alpha_pair[((s >> 33) & 1) as usize];
-        if alpha <= 0.01 {
+        let phase_idx = ((s >> 33) & 1) as usize;
+        if alpha_pair[phase_idx] <= 0.01 {
             continue;
         }
         let r0 = (s & 0xffff) as f32 / 65535.0;
         let r1 = ((s >> 16) & 0xffff) as f32 / 65535.0;
         let r2 = ((s >> 32) & 0xff) as f32 / 255.0;
         let ang = std::f32::consts::TAU * r0;
+        let (sin_a, cos_a) = ang.sin_cos();
         let (x, y) = if singularity {
             let rr = env.r_max * (0.6 + 0.4 * r1) * sing_contract;
-            (cxf + ang.cos() * rr, cyf + ang.sin() * rr)
+            (cxf + cos_a * rr, cyf + sin_a * rr)
         } else {
             let speed = (0.4 + 1.2 * r1) * ch_f;
-            let (vx, vy) = (ang.cos() * speed, ang.sin() * speed - 0.6 * ch_f);
+            let (vx, vy) = (cos_a * speed, sin_a * speed - 0.6 * ch_f);
             (cxf + vx * age, cyf + vy * age + grav_drop)
         };
         if x < 0.0 || y < 0.0 || x >= grid_wf || y >= grid_hf {
@@ -526,13 +538,16 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
             },
             blend: DecoBlend::Add,
             color: mix_rgb(env.core, fringe, r2),
-            alpha: (alpha * 255.0).round() as u8,
+            alpha: alpha_u8_pair[phase_idx],
         });
     }
 }
 
 /// The Singularity darkening ring: ≤ [`MAX_RING_ARC_CELLS`] per-cell Over [`DecoGlyph::RingArc`] wdecos on the cells the contracting ring crosses (`nova_add` is additive and can only brighten).
 pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap: usize) {
+    if cap == 0 {
+        return;
+    }
     let Some((r, fade)) = ring_radius(t_ms, env.r_max, true) else {
         return;
     };

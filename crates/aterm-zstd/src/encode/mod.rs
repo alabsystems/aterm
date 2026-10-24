@@ -12,15 +12,21 @@ mod bits;
 mod block;
 mod fse;
 mod huffman;
+mod ldm;
 mod literals;
 mod matcher;
+mod opt;
 mod sequences;
+mod tree;
 
 use std::io::{self, Write};
 
 use self::block::BlockEncoder;
+use self::ldm::LdmParams;
 use self::matcher::{Matcher, Search};
+use self::opt::{OptParams, Parser};
 use self::sequences::Seq;
+use self::tree::TreeParams;
 use crate::frame::{BLOCK_MAX, Checksum, MAGIC};
 use crate::xxh64::Xxh64;
 
@@ -37,13 +43,22 @@ pub const LEVEL_MAX: u8 = 19;
 /// The level [`Options::new`] starts from.
 pub const LEVEL_DEFAULT: u8 = 3;
 
+/// How a level finds its sequences.
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    /// Hash chains, searched greedily or lazily.
+    Lazy(Search),
+    /// A binary tree, parsed by price.
+    Opt(OptParams),
+}
+
 /// One row of the level table.
 struct Level {
     window_log: u8,
-    search: Search,
+    strategy: Strategy,
 }
 
-const fn level(
+const fn lazy(
     window_log: u8,
     hash_log: u32,
     chain_log: u32,
@@ -53,45 +68,74 @@ const fn level(
 ) -> Level {
     Level {
         window_log,
-        search: Search {
+        strategy: Strategy::Lazy(Search {
             hash_log,
             chain_log,
             depth,
             lazy,
             target,
-        },
+        }),
     }
 }
 
-/// Levels 1 to 19: wider windows, deeper chains and lazier parsing as the level rises.
-/// Level 19's window is libzstd's at `-19` (8 MiB).
-///
-/// The rows past about 12 are placeholders until a tuned parser (S17 E2): deeper chains
-/// buy little there, and they cost most on a small alphabet, where every chain is long
-/// and each search walks its full depth. 2 MiB of four symbols at random encodes at
-/// 0.49 MB/s at level 19 against `zstd -19`'s 4.73 (one thread, release build, measured
-/// 2026-10-23 with the machine under load), still linear in the input: the walk stops at
-/// the depth, and at the ring.
+/// An optimal-parsing row: `depth` nodes compared per search, matches from `min_match`
+/// bytes, a match past `target` taken at once; `ultra` prices in fractions of a bit and
+/// prunes nothing, `two_pass` parses the first block twice.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one row of the level table, read as a table"
+)]
+const fn opt(
+    window_log: u8,
+    hash_log: u32,
+    tree_log: u32,
+    depth: u32,
+    min_match: u32,
+    target: u32,
+    ultra: bool,
+    two_pass: bool,
+) -> Level {
+    Level {
+        window_log,
+        strategy: Strategy::Opt(OptParams {
+            tree: TreeParams {
+                hash_log,
+                tree_log,
+                depth,
+                min_match,
+                target,
+            },
+            ultra,
+            two_pass,
+            ldm: None,
+        }),
+    }
+}
+
+/// Levels 1 to 19: wider windows, deeper searches and lazier parsing as the level rises;
+/// from 16 the parse is chosen by price over a binary tree, and a block is cut in parts where
+/// that costs less. Level 19's window is libzstd's at `-19` (8 MiB), and its tree holds every
+/// position of it; a wider window (`Options::window_log`) adds long matches from anchors.
 const LEVELS: [Level; LEVEL_MAX as usize] = [
-    level(19, 16, 16, 2, 0, 16),
-    level(20, 17, 17, 4, 0, 24),
-    level(21, 17, 18, 6, 1, 32),
-    level(21, 18, 18, 8, 1, 32),
-    level(21, 18, 19, 8, 2, 48),
-    level(21, 19, 19, 16, 2, 64),
-    level(22, 19, 20, 24, 2, 64),
-    level(22, 20, 20, 32, 2, 96),
-    level(22, 20, 21, 48, 2, 128),
-    level(22, 20, 21, 64, 2, 128),
-    level(22, 21, 22, 96, 2, 192),
-    level(22, 21, 22, 128, 2, 256),
-    level(22, 21, 22, 192, 2, 256),
-    level(22, 22, 22, 256, 2, 384),
-    level(22, 22, 23, 384, 2, 512),
-    level(23, 22, 23, 512, 2, 768),
-    level(23, 22, 23, 640, 2, 1024),
-    level(23, 22, 23, 768, 2, 2048),
-    level(23, 22, 23, 1024, 2, 4096),
+    lazy(19, 16, 16, 2, 0, 16),
+    lazy(20, 17, 17, 4, 0, 24),
+    lazy(21, 17, 18, 6, 1, 32),
+    lazy(21, 18, 18, 8, 1, 32),
+    lazy(21, 18, 19, 8, 2, 48),
+    lazy(21, 19, 19, 16, 2, 64),
+    lazy(22, 19, 20, 24, 2, 64),
+    lazy(22, 20, 20, 32, 2, 96),
+    lazy(22, 20, 21, 48, 2, 128),
+    lazy(22, 20, 21, 64, 2, 128),
+    lazy(22, 21, 22, 96, 2, 192),
+    lazy(22, 21, 22, 128, 2, 256),
+    lazy(22, 21, 22, 192, 2, 256),
+    lazy(22, 22, 22, 256, 2, 384),
+    lazy(22, 22, 23, 384, 2, 512),
+    opt(22, 22, 21, 32, 3, 48, false, false),
+    opt(23, 22, 22, 32, 4, 64, false, false),
+    opt(23, 22, 22, 64, 3, 64, true, false),
+    opt(23, 22, 23, 128, 3, 256, true, true),
 ];
 
 /// How a frame is written.
@@ -197,7 +241,7 @@ pub fn compress(content: &[u8], options: &Options) -> Vec<u8> {
 
 /// Writes one Zstandard frame of everything written to it into `W`.
 ///
-/// Input is held until a block (128 KiB, or the window if smaller) more than fits, so
+/// Input is held until more than a block (128 KiB, or the window if smaller) is pending, so
 /// small writes cost nothing; [`Write::flush`] ends the pending block early.
 /// [`Encoder::finish`] ends the frame: dropping the encoder without it leaves the frame
 /// unfinished, which a decoder refuses as an early end.
@@ -225,7 +269,7 @@ pub struct Encoder<W: Write> {
     /// The virtual position of `hist[0]` (see [`matcher`]).
     base: u32,
     /// The match finder, made at the first block.
-    matcher: Option<Matcher>,
+    matcher: Option<Finder>,
     blocks: BlockEncoder,
     hash: Xxh64,
     total: u64,
@@ -243,6 +287,31 @@ pub struct Encoder<W: Write> {
 struct Frame {
     /// The farthest a match may reach.
     max_dist: usize,
+}
+
+/// A level's match finder.
+#[derive(Debug)]
+enum Finder {
+    Lazy(Matcher),
+    Opt(Box<Parser>),
+}
+
+impl Finder {
+    /// The ring's length: a rebase must move positions by a multiple of it.
+    const fn ring_len(&self) -> u32 {
+        match self {
+            Self::Lazy(m) => m.chain_len(),
+            Self::Opt(p) => p.ring_len(),
+        }
+    }
+
+    /// Moves every position down by `by`, forgetting those below `keep_from`.
+    fn rebase(&mut self, by: u32, keep_from: u32) {
+        match self {
+            Self::Lazy(m) => m.rebase(by, keep_from),
+            Self::Opt(p) => p.rebase(by, keep_from),
+        }
+    }
 }
 
 /// The base past which positions are moved down, well before they could overflow.
@@ -341,7 +410,8 @@ impl<W: Write> Encoder<W> {
         if self.base > self.rebase_past
             && let Some(m) = self.matcher.as_mut()
         {
-            let by = (self.base - 1) / m.chain_len() * m.chain_len();
+            let ring = m.ring_len();
+            let by = (self.base - 1) / ring * ring;
             m.rebase(by, self.base);
             self.base -= by;
         }
@@ -358,14 +428,30 @@ impl<W: Write> Encoder<W> {
         let src = self.hist.get(start..end).unwrap_or_default();
         let searched = if src.len() > 1 && !src.iter().all(|&b| Some(&b) == src.first()) {
             let base = self.base;
-            if let Some(m) = self.matcher.as_mut() {
-                m.find(&self.hist, base, start, end, frame.max_dist, &mut self.seqs);
+            match self.matcher.as_mut() {
+                Some(Finder::Lazy(m)) => {
+                    m.find(&self.hist, base, start, end, frame.max_dist, &mut self.seqs);
+                }
+                Some(Finder::Opt(p)) => p.find(
+                    &self.hist,
+                    base,
+                    start,
+                    end,
+                    frame.max_dist,
+                    self.blocks.reps(),
+                    &mut self.seqs,
+                ),
+                None => self.seqs.clear(),
             }
             Some(self.seqs.as_slice())
         } else {
             None
         };
-        self.blocks.write(src, searched, last, &mut self.staged);
+        // Only the parse by price splits its blocks: a lazy level's speed is worth more
+        // than the few bytes.
+        let split = matches!(self.matcher, Some(Finder::Opt(_)));
+        self.blocks
+            .write(src, searched, split, last, &mut self.staged);
         self.encoded = end;
         if last && self.options.checksum == Checksum::Xxh64 {
             let sum = self.hash.digest() as u32;
@@ -390,13 +476,36 @@ impl<W: Write> Encoder<W> {
             Some(s) => (u64::BITS - s.max(1).leading_zeros()).clamp(10, u32::from(self.window_log)),
             None => u32::from(self.window_log),
         };
-        let row = self.options.row().search;
-        let search = Search {
-            hash_log: row.hash_log.min(table_log + 1),
-            chain_log: row.chain_log.min(table_log),
-            ..row
-        };
-        self.matcher = Some(Matcher::new(search, self.base + self.encoded as u32));
+        let first = self.base + self.encoded as u32;
+        self.matcher = Some(match self.options.row().strategy {
+            Strategy::Lazy(row) => Finder::Lazy(Matcher::new(
+                Search {
+                    hash_log: row.hash_log.min(table_log + 1),
+                    chain_log: row.chain_log.min(table_log),
+                    ..row
+                },
+                first,
+            )),
+            Strategy::Opt(row) => {
+                let tree = TreeParams {
+                    hash_log: row.tree.hash_log.min(table_log + 1),
+                    tree_log: row.tree.tree_log.min(table_log),
+                    ..row.tree
+                };
+                // A window wider than the tree's ring: long matches past it come from
+                // anchors (about one position in 16 under `ultra`, 128 otherwise).
+                let ldm = (table_log > tree.tree_log).then(|| {
+                    let rate_log = if row.ultra { 4 } else { 7 };
+                    LdmParams {
+                        table_log: table_log - rate_log,
+                        bucket_log: if row.ultra { 8 } else { 3 },
+                        min_len: if row.ultra { 32 } else { 64 },
+                        rate_log,
+                    }
+                });
+                Finder::Opt(Box::new(Parser::new(OptParams { tree, ldm, ..row }, first)))
+            }
+        });
         write_header(
             &mut self.staged,
             self.window_log,
@@ -571,12 +680,11 @@ mod tests {
 
     const BLOCK: usize = 128 << 10;
 
-    /// Three blocks. Noise; noise with two 4-byte copies from 125,000 and 130,000 bytes
-    /// back near its start, which cost more to code than they save, so the block is
-    /// written raw after its sequences were coded; then 16 noise bytes, 32 bytes copied
-    /// from 130,000 back, and text. After the raw block a decoder's repeat offsets are
-    /// still the frame's first ones; an encoder that kept the raw block's would name the
-    /// third block's copy by a repeat offset the decoder does not hold.
+    /// Three blocks: noise; noise with two 4-byte copies from 125,000 and 130,000 back,
+    /// which cost more than they save, so the block is coded and then written raw; then 16
+    /// noise bytes, 32 bytes copied from 130,000 back, and text. An encoder that kept the
+    /// raw block's repeat offsets would name the third block's copy by one the decoder
+    /// does not hold.
     fn raw_after_coding() -> Vec<u8> {
         let mut h = noise(2 * BLOCK + 16, 0x5EED);
         for (at, dist) in [(BLOCK + 40, 125_000), (BLOCK + 150, 130_000)] {
@@ -588,11 +696,10 @@ mod tests {
         h
     }
 
-    /// [`raw_after_coding`]'s frames at levels 3 and 9 (level 1's hash table is too small to
-    /// keep the far copies' sources), written in one call (its size declared, a single
-    /// segment) and streamed a block at a time with and without a flush after each, with
-    /// the rollback's fault switched on or not; each with the number of blocks whose coded
-    /// sequences were written raw.
+    /// [`raw_after_coding`] at levels 3 and 9 (level 1's hash table is too small to keep the
+    /// far copies' sources), streamed a block at a time with its size declared, undeclared,
+    /// and undeclared with a flush after each block, the rollback's fault switched on when
+    /// `keep_rejected`; each frame with its count of blocks coded, then written raw.
     fn raw_after_coding_frames(keep_rejected: bool) -> Vec<(String, Vec<u8>, usize)> {
         let input = raw_after_coding();
         let mut out = Vec::new();
@@ -618,10 +725,8 @@ mod tests {
         out
     }
 
-    /// A block whose sequences were coded but which is written raw leaves the entropy
-    /// state a decoder carries as it was (RFC 8878 §3.1.1.2: a raw block carries no
-    /// table and moves no repeat offset), so the blocks after it name their tables and
-    /// offsets from the state the decoder holds.
+    /// A raw block carries no table and moves no repeat offset (RFC 8878 §3.1.1.2), so a
+    /// block coded and then written raw leaves the entropy state as the decoder holds it.
     #[test]
     fn a_block_written_raw_leaves_the_decoder_state_alone() {
         let input = raw_after_coding();
@@ -631,9 +736,8 @@ mod tests {
         }
     }
 
-    /// The control: an encoder that keeps the raw block's state (the fault the rollback
-    /// prevents) writes frames of the same input that the decoder refuses or decodes to
-    /// other bytes, so the test above sees that fault.
+    /// The control: keeping the raw block's state (the fault the rollback prevents) gives
+    /// frames the decoder refuses or decodes to other bytes.
     #[test]
     fn keeping_a_raw_block_s_state_breaks_the_frame() {
         let input = raw_after_coding();
@@ -676,8 +780,8 @@ mod tests {
         }
     }
 
-    /// The control: at the default threshold the same stream never rebases, so the test
-    /// above saw a path this one does not, and both frames are the same bytes.
+    /// The control: at the default threshold the same stream never rebases, and its frame
+    /// is the rebased one's byte for byte.
     #[test]
     fn below_the_threshold_nothing_rebases() {
         let input = text(3 << 20, 7);
@@ -687,13 +791,11 @@ mod tests {
         assert!(plain == rebased, "a rebase changes no match");
     }
 
-    /// At a chain ring wider than a block (level 7 under a 2^20 window rings 2^20 links)
-    /// and with flushes cutting blocks at odd places, the buffer slides by amounts that
-    /// are not multiples of the ring, yet each rebase moves positions by one, so the
-    /// rebased stream's frame is the plain one's byte for byte. (At a 2^10 window, as in
-    /// the tests above, ring, block and window are all 1 KiB and any drop is a multiple.)
-    /// A rebase by another amount files chain links under other ring slots and changes
-    /// matches.
+    /// With a chain ring wider than a block (2^20 links at level 7 under a 2^20 window) and
+    /// flushes cutting blocks at odd places, the buffer slides by amounts that are not
+    /// multiples of the ring, yet each rebase moves positions by a multiple of it, so the
+    /// rebased frame is the plain one byte for byte. Under the 1 KiB window above, ring,
+    /// block and window are equal and every slide is already a multiple.
     #[test]
     fn a_rebase_past_a_wide_ring_changes_no_match() {
         let input = text(6 << 20, 13);
@@ -711,7 +813,7 @@ mod tests {
                 rebases += usize::from(now > moved);
                 moved = now;
             }
-            let ring = enc.matcher.as_ref().map(super::Matcher::chain_len);
+            let ring = enc.matcher.as_ref().map(super::Finder::ring_len);
             assert_eq!(ring, Some(1 << 20), "the ring is wider than a block");
             (enc.finish().unwrap(), rebases)
         };
@@ -722,8 +824,8 @@ mod tests {
         assert!(decode(&rebased) == input);
     }
 
-    /// However much is streamed and in whatever writes, the buffer holds at most two
-    /// windows and two blocks; it does fill, so the bound is the one that held it.
+    /// Whatever the writes, the buffer holds at most two windows and two blocks, and it
+    /// does fill past half of that.
     #[test]
     fn the_buffer_stays_within_its_bound() {
         let input = text(8 << 20, 11);

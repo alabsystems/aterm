@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! DECLARED WAKES (`docs/DESIGN-harness-occupancy-2026-10-20.md`).
+//! Declared wakes (`docs/DESIGN-harness-occupancy-2026-10-20.md`).
 //!
-//! THE BOOK (`WakeBook`): one session, one wake, one waiter and one loop. A wake is declared from
+//! The book (`WakeBook`): one session, one wake, one waiter and one loop. A wake is declared from
 //! the session's own tree, latches its condition's edge, and is told once: by the agent's own
 //! `await wake` (an answer written, then heard at the next turn the loop sees), or by a loop's
 //! door under `prompt` (a claim, then the one line). A crash mid-write allows one retell, and an
-//! answer unheard may be retold once by a door. `st` is the wake's state: 0 none, 1 pending, 2
+//! unheard answer may be retold once by a door. `st` is the wake's state: 0 none, 1 pending, 2
 //! ready, 3 answering, 4 answered, 5 claimed, 6 told, 7 gone (expired, taken or removed). An
 //! expiry ends a wake a teller holds too (answering, claimed): the write that ends after it
 //! changes nothing in the book, and a line it typed is the claim's one line, since gone is final.
-//! What the book cannot judge is its callers': the need and `unless=` at the tell, the loop's
-//! guards at a claim, a turn heard.
+//! The callers judge what the book cannot: the need and `unless=` at the tell, the loop's guards
+//! at a claim, and a turn heard.
 //!
-//! THE ROOM (`WakeRoom`): three sessions and one free build slot, their holds aged a < b < c. A
+//! The room (`WakeRoom`): three sessions and one free build slot, their holds aged a < b < c. A
 //! line or an answer that needs a slot reserves it, the oldest waiting hold first; a holder's
 //! re-ask is granted against its own reservation and renews nothing; a reservation ends at its
 //! lapse (its ten minutes, or its session's tab seen holding a slot).
 
 use aterm_spec::derive::{Liveness, Model};
 
-/// THE BOOK.
+/// The `WakeBook` model: one wake, from its declaration to its one tell or its end.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn wake_book_model() -> Model {
@@ -249,7 +249,7 @@ pub fn wake_book_liveness() -> Liveness {
     }
 }
 
-/// THE ROOM.
+/// The `WakeRoom` model: build-slot reservations across three sessions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn wake_room_model() -> Model {

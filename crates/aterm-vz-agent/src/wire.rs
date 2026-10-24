@@ -14,8 +14,8 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
-/// The protocol version a [`Hello`] names.
-pub const PROTO: u32 = 1;
+/// The protocol version a [`Hello`] names: 2 since the `Hello` carries the boot's key.
+pub const PROTO: u32 = 2;
 
 /// The largest payload a frame may carry: 1 MiB.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -86,10 +86,13 @@ pub enum Exit {
 }
 
 /// The agent's first frame on the watch connection.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Hello {
     /// [`PROTO`].
     pub proto: u32,
+    /// The boot's key, read from the key disk only guest root reads ([`crate::key`]): the
+    /// helper believes no frame of a dial whose `Hello` lacks it. It never leaves the helper.
+    pub key: crate::key::Key,
     /// The SHA-256 of the agent's own executable.
     pub agent_sha256: [u8; 32],
     /// The guest kernel's id of this boot.
@@ -98,6 +101,20 @@ pub struct Hello {
     pub kernel: String,
     /// The guest's uptime when the agent said hello.
     pub uptime_ms: u64,
+}
+
+impl fmt::Debug for Hello {
+    /// Every field but the key, which no log or report prints.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Hello")
+            .field("proto", &self.proto)
+            .field("key", &"<withheld>")
+            .field("agent_sha256", &self.agent_sha256)
+            .field("boot_id", &self.boot_id)
+            .field("kernel", &self.kernel)
+            .field("uptime_ms", &self.uptime_ms)
+            .finish()
+    }
 }
 
 /// A start job systemd still runs, and how long the agent has seen it.
@@ -376,6 +393,7 @@ impl Frame {
             },
             Self::Hello(h) => {
                 p.u32(h.proto);
+                p.0.extend_from_slice(&h.key);
                 p.0.extend_from_slice(&h.agent_sha256);
                 p.bytes(h.boot_id.as_bytes())?;
                 p.bytes(h.kernel.as_bytes())?;
@@ -470,6 +488,7 @@ impl Frame {
             }),
             HELLO => Self::Hello(Hello {
                 proto: t.u32()?,
+                key: t.array()?,
                 agent_sha256: t.array()?,
                 boot_id: t.text()?,
                 kernel: t.text()?,
@@ -596,6 +615,7 @@ mod tests {
             Frame::Exit(Exit::NotStarted("cargo: No such file or directory".into())),
             Frame::Hello(Hello {
                 proto: PROTO,
+                key: [0x5a; 32],
                 agent_sha256: [0xab; 32],
                 boot_id: "1b4c…".into(),
                 kernel: "6.8.0-142-generic".into(),
@@ -633,6 +653,25 @@ mod tests {
             read_frame(&mut r).unwrap().is_none(),
             "the end between frames is no frame"
         );
+    }
+
+    #[test]
+    fn a_hellos_debug_withholds_its_key() {
+        let hello = Hello {
+            proto: PROTO,
+            key: [0x5a; 32],
+            agent_sha256: [0xab; 32],
+            boot_id: "b".into(),
+            kernel: "k".into(),
+            uptime_ms: 1,
+        };
+        let text = format!("{:?}", Frame::Hello(hello));
+        assert!(text.contains("key: \"<withheld>\""), "{text}");
+        assert!(
+            !text.contains("90, 90"),
+            "the key's bytes (0x5a) are not printed: {text}"
+        );
+        assert!(text.contains("171, 171"), "the agent's hash is: {text}");
     }
 
     #[test]

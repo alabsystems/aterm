@@ -327,6 +327,20 @@ pub fn settings_frame_cost(frames: usize) -> Vec<(&'static str, f64, f64, f64)> 
         .map(|c| (c.what, c.p50_us, c.p90_us, c.p99_us))
         .collect()
 }
+#[cfg(all(feature = "bench-support", debug_assertions))]
+mod deck_frame_probe;
+/// What the `deck_frame_cost` bench measures: per stage, what it timed, the deck's prim count
+/// and µs per call at p50, p90 and p99. Its scenes are the debug-gated deck fixtures, so it
+/// builds where debug assertions are on (`--profile opt-test`).
+#[cfg(all(feature = "bench-support", debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn deck_frame_cost(frames: usize) -> Vec<(String, usize, f64, f64, f64)> {
+    deck_frame_probe::deck_frame_cost(frames)
+        .into_iter()
+        .map(|c| (c.what, c.prims, c.p50_us, c.p90_us, c.p99_us))
+        .collect()
+}
 /// What the `c_cut_cost` bench measures.
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]
@@ -910,7 +924,7 @@ pub(crate) fn font_px_for_scale(size: f32, scale: f64) -> f32 {
     }
 }
 
-/// A DEFAULT or configured font size (px at 1×) scaled by the text size scale (`font_size_scale`, in thousandths).
+/// A default or configured font size (px at 1×) scaled by the text size scale (`font_size_scale`, in thousandths).
 pub(crate) fn scaled_font_px(px: f32, scale_milli: u16) -> f32 {
     if scale_milli == 1000 {
         px
@@ -2842,7 +2856,7 @@ pub(crate) enum HarnessFact {
     LandHeld,
 }
 
-/// THE LOOP'S PAUSE AFTER SHORT TURNS, as the window is told it ([`HarnessFact::Pause`]).
+/// The loop's pause after short turns, as the window is told it ([`HarnessFact::Pause`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PausePlan {
     pub(crate) at_unix: i64,
@@ -4566,7 +4580,9 @@ impl LaunchPosture {
     };
 }
 
-/// THE HEADLESS ACTIVATION POSTURE.
+/// The launch posture: a headless instance is never activated and has no Dock icon
+/// (`Prohibited`); an update hand-off candidate keeps the default policy but does not
+/// activate itself.
 #[must_use]
 pub const fn launch_posture(headless: bool, handoff_candidate: bool) -> LaunchPosture {
     if headless {
@@ -5336,13 +5352,10 @@ impl TabIndex {
     }
 
     const fn close(&mut self, i: usize) -> bool {
-        // Distinct branch.
         if i >= self.count {
-            // Distinct branch.
             return false; // out of range: nothing to close
         }
         if self.count <= 1 {
-            // Distinct branch.
             return true; // closing the last tab → exit the app
         }
         self.count -= 1;
@@ -5609,7 +5622,6 @@ pub(crate) const fn rain_config_for_window(
     mut cfg: matrix_rain::RainConfig,
     wid: WindowId,
 ) -> matrix_rain::RainConfig {
-    // Distinct branch.
     if cfg.seed == 0 {
         // splitmix64 finalizer (never returns 0); the salt keeps window 0 off
         // the raw-zero input.
@@ -10128,7 +10140,8 @@ impl App {
         }
     }
 
-    /// THE ONE HAND-OVER.
+    /// Ask for the Developer Tools hand-over ([`devtools_helper::Moment::Asked`]); admission
+    /// may queue it for a quiet moment.
     pub(crate) fn hand_devtools_to_owner(
         &mut self,
         origin: devtools_helper::Origin,
@@ -10489,10 +10502,6 @@ impl App {
         }
         self.tick_fda_hand_over(now);
         if self.devtools_helper.hand_over_due(now) {
-            // The window's own, and a control client's act on System State's row,
-            // are steps of System State's run: only while System State is frontmost
-            // with no other macOS gesture up. A control verb's keeps the quiet moment
-            // alone.
             let quiet = if self
                 .devtools_helper
                 .queued()
@@ -10680,11 +10689,8 @@ impl App {
                 // (`App::publish_access_opt_outs`), not off this verdict.
                 self.debugger_launch.end();
                 if let Some(admitted) = admitted {
-                    // Settled for the admission's revision, so its Permissions
-                    // stage counts the row: a change under way is handed, the
-                    // rule on is granted, and an answer on the Security page or
-                    // an explicit opt-out (turned off) is declined — the row's
-                    // wanted state, never turned back on.
+                    // Settled for the admission's revision, so its Permissions stage counts
+                    // the row (`StepSettle::outcome`).
                     self.debugger_launch
                         .record(admitted.revision(), why.outcome());
                 }
@@ -10717,11 +10723,8 @@ impl App {
             }
             (StepVerdict::Drop(why), _, _, admitted, _) => {
                 self.debugger_launch.end();
-                // With an admission in hand, a drop that settles the row says so
-                // for its revision: this Mac's once-per-Mac step is over (an
-                // earlier revision's, perhaps cancelled in macOS's dialog).
-                // Every later revision's stage then completes; without the line
-                // it would wait on the row for good.
+                // With an admission in hand, a drop that settles the row records it for the
+                // revision, or that revision's Permissions stage would wait on the row for good.
                 if let (Some(admitted), Some(outcome)) = (admitted, why.outcome()) {
                     self.debugger_launch.record(admitted.revision(), outcome);
                 }
@@ -10742,9 +10745,8 @@ impl App {
         use debugger_access::HostAsked;
         let ended = self.debugger_launch.host_read_ended();
         if let Some(host) = self.debugger_launch.warm_host() {
-            // The record beside `aterm.toml`, read once, off the event loop: it
-            // lives in the home folder, which can sit on a volume that stopped
-            // The record is read once, off the event loop (`debugger_access::RecordRead::Thread`).
+            // The record beside `aterm.toml` is read once, off the event loop
+            // (`debugger_access::RecordRead::Thread`).
             if let Some((slot, read)) = self.debugger_launch.start_record_read(host) {
                 let config = config.to_path_buf();
                 let answer = move || {
@@ -10786,15 +10788,11 @@ impl App {
         (HostAsked::Cold, None)
     }
 
-    /// The Developer Tools list's read at a focus gain, off this thread: the
-    /// launch read at the first, then as [`devtools_watch::DevToolsWatch::wants_read`]
-    /// says. Its completion wakes the window ([`Self::on_devtools_probe_ready`]),
-    /// which asks for the page where it is due. Not while `[privacy] enabled` or
-    /// `check` is off: the probe would only answer that it is switched off, which
-    /// reads nothing, so the launch read stays owed and the first focus gain or
-    /// park after every switch is on again makes it
-    /// ([`Self::resume_held_launch_steps`]). A switch off is a pause, never an
-    /// answer.
+    /// Read the Developer Tools list off this thread at a focus gain: the launch read at the
+    /// first, then as [`devtools_watch::DevToolsWatch::wants_read`] says; its completion wakes
+    /// the window ([`Self::on_devtools_probe_ready`]). While `[privacy] enabled` or `check` is
+    /// off the read is held, not answered, and made at the first focus gain or park once
+    /// every switch is on again ([`Self::resume_held_launch_steps`]).
     pub(crate) fn read_devtools_list(&mut self, now: Instant) {
         let gate = self.config.privacy_probe_gate();
         if !gate.permits() {
@@ -10894,16 +10892,15 @@ impl App {
         false
     }
 
-    /// The standing yes spent, once the start's disk half has written this Mac into the
-    /// record (`prepared`). What can have changed meanwhile is read again (an answer on
-    /// the Security page, the admission, the `[privacy]` switches, the moment, a fresh
-    /// reading of the rule, a person's opt-out), and what holds the step keeps the answer
-    /// ([`debugger_access::DebuggerStepQueue::keep_prepared`]) for the next look. A read
-    /// that comes back with no reading is read again, the answer kept, until
-    /// [`debugger_access::REFUSED_FOR`] has passed and [`debugger_access::UNREAD_READS`]
-    /// such reads were made ([`debugger_access::DebuggerStepQueue::unread`]). Then the
-    /// admission is spent through [`debugger_access::DebuggerChangeLane::start_from_plan`]
-    /// and the change starts as a press's does.
+    /// Spend the standing yes once the start's disk half has written this Mac into the record
+    /// (`prepared`). What can have changed meanwhile is read again (an answer on the Security
+    /// page, the admission, the `[privacy]` switches, the moment, a fresh reading of the rule,
+    /// a person's opt-out); what holds the step keeps the answer for the next look
+    /// ([`debugger_access::DebuggerStepQueue::keep_prepared`]). A read with no reading is
+    /// made again until [`debugger_access::REFUSED_FOR`] has passed and
+    /// [`debugger_access::UNREAD_READS`] such reads were made, then the step is dropped.
+    /// Otherwise the change starts through
+    /// [`debugger_access::DebuggerChangeLane::start_from_plan`].
     fn spend_debugger_step(
         &mut self,
         now: Instant,
@@ -10947,12 +10944,9 @@ impl App {
             );
             return;
         };
-        // The `[privacy]` switches, read again where the answer is spent, as
-        // admission reads them after the standing yes: a kept answer may have
-        // waited any span (System State away, a decline's quiet, a dialog up)
-        // while the person switched `notice`, `check` or `enabled` off. The
-        // step pauses with the answer kept and nothing started or recorded,
-        // and goes on once every switch is on again ([`Self::debugger_step_look`]).
+        // A kept answer may have waited any span, so the `[privacy]` switches are read again
+        // here: one off pauses the step, the answer kept and nothing started or recorded,
+        // until every switch is on again ([`Self::debugger_step_look`]).
         if !self.access_steps_allowed() {
             self.debugger_launch.keep_prepared(prepared, read);
             self.debugger_launch.withdraw();
@@ -10980,10 +10974,8 @@ impl App {
             }
             return;
         }
-        // The reading the change starts on is as fresh as admission's: an older one
-        // is retired and the rule read again first. A rule on by then is a press the
-        // lane refuses: the step ends, the record standing, as it does for a rule
-        // `-status` calls unrecognized.
+        // The change starts on a reading as fresh as admission's: an older one is retired
+        // and the rule read again first.
         let gate = self.config.privacy_probe_gate();
         let cached = self.consent.debugger_cached(gate);
         let fresh = cached.filter(|row| {
@@ -10994,11 +10986,10 @@ impl App {
         });
         match fresh {
             Some(row) if row.probe().mode == DebuggerMode::Unknown && row.probe_age().is_some() => {
-                // A read that came back with no reading (`-status` timed out, did not
-                // start, or answered what the classifier does not claim) is no answer:
-                // this Mac is recorded already, so it is retired and the rule read
-                // again, for a bounded span. A closed gate's row, which no read made,
-                // is the lane's to refuse below.
+                // A read with no reading (`-status` timed out, did not start, or answered
+                // what the classifier does not claim) is retired and the rule read again, for
+                // a bounded span: this Mac is recorded already. A closed gate's row, which no
+                // read made, is the lane's to refuse below.
                 let label = row.probe().label.as_str();
                 if !self.debugger_launch.unread(now) {
                     aterm_log::info!(
@@ -11040,11 +11031,10 @@ impl App {
             self.debugger_step_ended(now, StartEnd::Refused(why), Some(revision));
             return;
         }
-        // Debugger access off by the person's choice by then — this process saw
-        // it go off, or the observed record says it was allowed or that aterm
-        // or something else turned it off — is the row's wanted state, as
-        // admission's [`debugger_access::StepSettle::TurnedOff`] says: aterm
-        // never turns it back on, and the row is declined for the revision.
+        // Debugger access turned off by the person's choice by then
+        // ([`debugger_access::off_is_chosen`]) is the row's wanted state, as for admission's
+        // [`debugger_access::StepSettle::TurnedOff`]: aterm never turns it back on, and the
+        // row is declined for the revision.
         if read.probe.mode == DebuggerMode::Disabled
             && debugger_access::off_is_chosen(read.drift_since.is_some(), read.recorded)
         {
@@ -11165,10 +11155,8 @@ impl App {
         }
     }
 
-    /// Where System State stands for the debugger step now: the focused window
-    /// whose visible view it is (`Self::system_state_frontmost`), with how many
-    /// frames that window has presented, and whether a macOS dialog this
-    /// process put up is up.
+    /// The debugger step's moment now: the focused window showing System State, with its
+    /// presented-frame count, and whether a macOS dialog this process put up is up.
     fn debugger_step_moment(&self) -> debugger_access::StepMoment {
         let page = if self.system_state_frontmost() {
             self.windows
@@ -11184,35 +11172,26 @@ impl App {
         }
     }
 
-    /// The debugger row's step for System State's headline ("Enter your
-    /// password for Debugger access", design §3.2): while the page names macOS's
-    /// dialog ahead of the change, and while a change System State started (its
-    /// own step, or a person's `Turn On…`) is under way, macOS's dialog perhaps
-    /// up. `App::system_state_access_step` answers it.
+    /// The Debugger row as System State's headline step ("Enter your password for Debugger
+    /// access", design §3.2): while the page names macOS's dialog ahead of the change, and
+    /// while a change System State started is under way. `App::system_state_access_step`
+    /// reads it.
     pub(crate) fn system_state_debugger_step(&self) -> Option<aterm_types::macos_setup::Access> {
         (self.debugger_launch.announced()
             || (self.debugger_launch.started().is_some() && self.debugger_change.under_way()))
         .then_some(aterm_types::macos_setup::Access::Debugger)
     }
 
-    /// A press on System State's Debugger row's `Turn On…` (design §3.4, §6):
-    /// `by_person` only for a person's press on the page
-    /// (`App::take_system_state_press` is `PagePress::Person`), never a control
-    /// client's `act` or `key`. Such a press, while a setup plan with its
-    /// Permissions group stands, is the yes ([`Self::admitted_by_press`], spent
-    /// through `OwnerYes::from_admitted`): the change starts as Settings ▸
-    /// Security's press starts it, with no alert of aterm's — macOS's
-    /// administrator dialog is the gesture — and whatever an earlier step or
-    /// Cancel recorded. The press answers the once-per-Mac question, as the
-    /// step's own start does: this Mac goes into `ASKED_RECORD` ahead of the
-    /// change and the launch step ends for this process
-    /// ([`Self::answer_debugger_question_by_press`]), so a Cancel in macOS's
-    /// dialog is never followed by a second one from the step, here or at a
-    /// later launch. `true` when the change started. `false` starts nothing:
-    /// not a person's press, no plan admitted, a build that is not hardened
-    /// (debugger access is not needed there, and the row says so), another macOS
-    /// dialog of this process up, a press the lane would refuse, or a record
-    /// that could not be written.
+    /// A press on System State's Debugger row's `Turn On…` (design §3.4, §6). Only a person's
+    /// press on the page (`by_person`; never a control client's `act` or `key`) on an admitted
+    /// plan with its Permissions group is the yes ([`Self::admitted_by_press`]): the change
+    /// starts as Settings ▸ Security's press does, whatever an earlier step recorded, with
+    /// macOS's administrator dialog as the only gesture, and the press answers the
+    /// once-per-Mac question ([`Self::answer_debugger_question_by_press`]). `true` when the
+    /// change started; `false` starts nothing: no person's press on an admitted plan, a closed
+    /// host gate ([`debugger_access::admit_begin`]), a build that is not hardened, another
+    /// macOS dialog of this process up, a press the lane would refuse, or a record that could
+    /// not be written.
     pub(crate) fn turn_on_debugger_from_system_state(&mut self, by_person: bool) -> bool {
         use aterm_containment::consent::{DebuggerChange, SelfHardening};
         let Some(admitted) = self.admitted_by_press(by_person) else {
@@ -11275,24 +11254,15 @@ impl App {
         started.is_ok()
     }
 
-    /// A PERSON'S `Turn On…` ANSWERS THE ONCE-PER-MAC QUESTION (design §6): the
-    /// launch step is over for this process, parked or queued
-    /// (`DebuggerStepQueue::answered_by_press`), and this Mac goes into
-    /// `ASKED_RECORD` ahead of the change (`DebuggerChangeLane::forgo`, the
-    /// model's `Forgo`), as the step's own start writes it, so neither this
-    /// process nor a later launch starts the step over a question the person
-    /// answered, Cancel included. The record goes down durably off the event
-    /// loop, as `start_debugger_step`'s does — the config folder lives in the
-    /// home folder, which can sit on a volume that stopped answering — on the
-    /// step's disk thread once the host key is read ([`Self::debugger_step_disk`];
-    /// a test's stand-in writes it here), or, the key not read yet, on a thread
-    /// that reads it too (`gethostuuid(2)` never runs on the event loop); the
-    /// press goes on, and a write that fails is logged. No config folder, or a
-    /// kernel that names no host: there is nothing to key a record to, and the
-    /// step never starts there either. `false` when no thread could take the
-    /// write, or a stand-in's write failed and the record does not already read
-    /// as naming this Mac: then nothing starts, as the step starts nothing it
-    /// could not record.
+    /// A person's `Turn On…` answers the once-per-Mac question (design §6): the launch step
+    /// ends for this process (`DebuggerStepQueue::answered_by_press`) and this Mac goes into
+    /// `ASKED_RECORD` ahead of the change (`DebuggerChangeLane::forgo`), so no later launch
+    /// starts the step over the person's answer, Cancel included. The record is written off
+    /// the event loop: on the step's disk thread once the host key is read
+    /// ([`Self::debugger_step_disk`]), else on a thread that reads the key too; a failed write
+    /// is logged and the press goes on. With no config folder or no host key there is nothing
+    /// to record. `false` when no thread could take the write, or a test stand-in's write
+    /// failed and the record does not already name this Mac: then nothing starts.
     fn answer_debugger_question_by_press(&mut self) -> bool {
         self.debugger_launch.answered_by_press();
         let Some(config) = self.consent_card_config.clone() else {
@@ -11349,12 +11319,9 @@ impl App {
         written.get().copied().unwrap_or(true)
     }
 
-    /// What became of a change System State started, for its revision's access
-    /// record and every revision the window admitted while it ran: on,
-    /// granted; Cancel in macOS's dialog (or a wrong password, or a write that
-    /// failed), declined — settled for those revisions and never retried.
-    /// Anything else (no answer, no child) records nothing beyond the
-    /// hand-over. A change System State did not start records nothing.
+    /// Record what became of a change System State started: on is granted; Cancel in macOS's
+    /// dialog, a wrong password or a failed write is declined, never retried. Anything else
+    /// records nothing beyond the hand-over.
     fn note_system_state_debugger_outcome(&mut self, outcome: debugger_access::Outcome) {
         use aterm_containment::consent::{DebuggerChange, DebuggerMode};
         use aterm_types::macos_setup::AccessOutcome;
@@ -11381,7 +11348,8 @@ impl App {
         }
     }
 
-    /// THE FULL DISK ACCESS HAND-OVER.
+    /// Ask for the Full Disk Access hand-over ([`devtools_helper::Moment::Asked`]); admission
+    /// may queue it for a quiet moment.
     pub(crate) fn hand_fda_to_owner(
         &mut self,
         origin: devtools_helper::Origin,
@@ -11747,9 +11715,8 @@ impl App {
             self.consent_launch.wait();
             return;
         }
-        // `enabled` or `check` off is a pause, never an answer: the warm-up waits,
-        // and the config change that turns the switch on again wakes the look;
-        // `warmup` set to anything but "automatic" is the answer.
+        // `enabled` or `check` off pauses the warm-up (turning it on again wakes the look);
+        // a `warmup` other than "automatic" skips it.
         if !self.config.privacy_probe_gate().permits() {
             self.consent_launch.wait();
             return;
@@ -11878,8 +11845,19 @@ impl App {
 
     fn note_launch_warmup_progress(&mut self) {
         if self.consent_launch.walking() && !self.consent_warmup.is_live() {
-            let rows = self.consent_warmup.rows().to_vec();
-            self.consent_launch.pass_ended(&rows);
+            // A newer explicit pass may have replaced these rows before the
+            // old launch's completion wake was drained. Never file its
+            // answers as the launch pass's.
+            let rows = if self
+                .consent_launch
+                .owns_rows(self.consent_warmup.generation())
+            {
+                self.consent_warmup.rows().to_vec()
+            } else {
+                Vec::new()
+            };
+            let retired = self.launch_warmup_retired();
+            self.consent_launch.pass_ended(&rows, retired);
         }
     }
 
@@ -12335,12 +12313,9 @@ impl App {
         }
     }
 
-    /// The card's word that Full Disk Access needs nothing ends its own rows and
-    /// entries (under [`message_reporters::KEY_FILE_ACCESS`]), and no others: other
-    /// reporters file under `privacy.` too (Mac setup, Developer Tools, the vault
-    /// join), and this check reads none of their causes. A word from a probe that read
-    /// the grant (`granted`) ends them fixed; one with no grant read (a `[privacy]`
-    /// switch off, a *Not now* on record) withdraws them, claiming no fix.
+    /// End the card's own rows and entries (under [`message_reporters::KEY_FILE_ACCESS`]),
+    /// never another `privacy.` reporter's: fixed when a probe read the grant (`granted`),
+    /// else withdrawn, claiming no fix.
     fn retract_macos_access_rows(&mut self, granted: bool, now: Instant) {
         self.consent_card_message = None;
         self.note_fda_regression(false);
@@ -12371,7 +12346,6 @@ impl App {
         }
         let cap = self.consent_card.lifecycle_deadline();
         if self.consent_card.phase() == consent_card::CardPhase::Settled {
-            // Distinct branch.
             return cap; // no deadline: a settled card owns no timer
         }
         match (cap, self.next_consent_probe_deadline(now)) {
@@ -12459,12 +12433,11 @@ impl App {
                                 self.retract_macos_access_rows(true, now);
                             }
                             consent_card::NotDue::Granted => {
-                                // The window's own probe reads aterm's own grant held on
-                                // this Mac, never asked for: recorded silently (no check
-                                // mark), so a later switch-off here is not taken for a new
-                                // Mac. In-process under another terminal it reads that
-                                // terminal's grant, and records nothing; nor does a build
-                                // whose grant the next build loses.
+                                // A grant held but never asked for is recorded silently (no
+                                // check mark), so a later switch-off here is not taken for a
+                                // new Mac. A probe that reads another terminal's grant
+                                // (in-process under it), or a build whose grant the next
+                                // build loses, records nothing.
                                 if self.consent.window_reads_own_grant()
                                     && (self.devtools_helper.reach().grant_stable)()
                                 {
@@ -12789,7 +12762,7 @@ impl App {
         notice
     }
 
-    /// Fold one observed consent fact through the rate-limiting gate and ACT on what it decides.
+    /// Fold one observed consent fact through the rate-limiting gate and act on what it decides.
     pub(crate) fn note_consent_attention(&mut self, event: consent_observer::AttentionEvent) {
         let outcome = self
             .consent_attention
@@ -12805,8 +12778,7 @@ impl App {
             self.post_consent_notification(notice);
         }
         if outcome.refresh_status_item {
-            // Call the existing menu-bar renderer; it re-fingerprints and
-            // rebuilds only if something actually moved.
+            // The menu-bar renderer rebuilds only if something moved.
             self.mark_status_dirty();
         }
     }
@@ -12829,11 +12801,9 @@ impl App {
     }
 
     fn note_warmup_denials(&mut self) {
-        // The launch pass asks on aterm's own initiative, after the Full Disk Access
-        // page was left or declined: a Don't Allow there is the owner's answer, not a
-        // need for the card to ask Full Disk Access again — on every wake that reports
-        // its rows, during the pass or after. A refused read in a session, or the
-        // owner's own pass, still raises it.
+        // A Don't Allow in the launch pass (aterm's own initiative, after the Full Disk
+        // Access page was left or declined) is the owner's answer, not a need for the card
+        // to ask again; a refused read in a session, or the owner's own pass, still raises it.
         if self
             .consent_launch
             .owns_rows(self.consent_warmup.generation())
@@ -12954,7 +12924,6 @@ impl App {
         let order = global_shed_order(&usages, cap);
         let mut reclaim = ScrollbackReclaim::default();
         if order.is_empty() {
-            // Distinct branch.
             return reclaim; // aggregate under the ceiling — nothing to do
         }
         let mut total: usize = usages.iter().map(|(_, b)| *b).sum();
@@ -13749,11 +13718,9 @@ impl App {
         ws.selecting = false;
         ws.gesture = None;
         if front_changed {
-            // Park the outgoing session's learned link estimate and install the incoming
-            // one. `take_link_estimate` clears the predictor as `reset_session` would;
-            // only the RTT/latch knowledge follows the session, with the bindings its
-            // line editor taught (Home, End, Ctrl-A, Ctrl-E, Delete), which the
-            // estimate carries.
+            // Park the outgoing session's link estimate and install the incoming one:
+            // `take_link_estimate` clears the predictor as `reset_session` would, and only the
+            // RTT/latch knowledge and the line-editor bindings it learned follow the session.
             if let Some(front_content::FrontContent::Terminal { session, .. }) = previous_front {
                 link_estimates.insert(session, ws.predictor.take_link_estimate());
             } else {
@@ -15502,7 +15469,6 @@ impl App {
                     crate::paste_banner::paste_lines(&text).len(),
                     self.window_hwnd(wid),
                 ) {
-                    // Distinct branch.
                     return; // user cancelled
                 }
             }
@@ -16317,7 +16283,6 @@ impl App {
             .get(session)
             .and_then(|s| s.term.try_lock().ok().map(|t| t.title_epoch()))
         else {
-            // Distinct branch.
             return; // unknown session or contended: next wake retries
         };
         let stale = self.title_drift.seen.get(&session).copied() != Some(live_epoch)
@@ -17003,7 +16968,6 @@ impl ApplicationHandler<Wake> for App {
                     None => Some(false),
                 }
             } else {
-                // Distinct branch.
                 Some(false) // headless / no window / unfocused: definitely not blinking
             };
             match blinking {
@@ -19122,13 +19086,11 @@ impl App {
                 let echo = self.echo_probe_open(wid, session);
                 let mut outcome = InputOutcome::Ok;
                 for ev in batch {
-                    // A controller `focus <in|out>` drives the whole focus seam through
-                    // `on_focus` (a driven window gets no `WindowEvent::Focused`, so the
-                    // cursor's focus look is reachable only there; it writes the DEC 1004
-                    // report itself, through the account). A pinned focus takes this route
-                    // only while `wid` still shows that session; otherwise
-                    // `input_to_session` routes it, so the report never reaches a tab that
-                    // became front after authorization.
+                    // A controller `focus <in|out>` goes through `on_focus`, which writes the
+                    // DEC 1004 report itself and is the only path to the cursor's focus look (a
+                    // driven window gets no `WindowEvent::Focused`). A pinned focus does so only
+                    // while `wid` still shows that session; otherwise `input_to_session` routes
+                    // it, so the report never reaches a tab that became front after authorization.
                     if let (InputEvent::Focus(f), Source::Controller) = (&ev, &src)
                         && session.is_none_or(|target| {
                             self.front_terminal(wid)
@@ -19156,7 +19118,6 @@ impl App {
                 self.echo_probe_close(echo);
                 self.escalate_pending_close(el);
                 if let Some(tx) = reply {
-                    // Distinct branch.
                     let _ = tx.send(outcome); // a caller that gave up is no error
                 }
             }
@@ -22416,9 +22377,8 @@ fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
                 );
             }
             if let Some((park, then)) = scheduled {
-                // The five-second local holder recheck is intentionally
-                // quiet. Logging it every time would turn a long package
-                // install into a steady stream of identical disk writes.
+                // The five-second holder recheck stays quiet: logging each one would write
+                // the same line every five seconds of a long package install.
                 if !(stamps.in_flight
                     && matches!(why, PassWhy::Published(_))
                     && park == PUBLISHED_HOLDER_RECHECK)
@@ -23564,10 +23524,10 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
                 crate::qos::Role::Responsive,
                 move || {
                     // `Responsive` on every order, the pre-dial one included: the first
-                    // window's mint waits on this compile, and the
-                    // compiler service runs at the requester's class, so at utility the
-                    // post-claim attach would wait on a demoted compile inside the update
-                    // freeze. It still ranks below the outgoing terminal's UI thread.
+                    // window's mint waits on this compile, and the compiler service runs at
+                    // the requester's class, so at utility the post-claim attach would wait on
+                    // a demoted compile inside the update freeze. It still ranks below the
+                    // outgoing terminal's UI thread.
                     if let Err(error) = warm.run(knobs) {
                         aterm_log::debug!(
                             "startup: the first-frame Metal warm failed ({error}); the first \

@@ -343,8 +343,8 @@ mod tests {
         }
     }
 
-    /// Counts that would give a 20-level tree (Fibonacci) are cut to 11 bits, still a
-    /// complete code that decodes.
+    /// Fibonacci counts, whose Huffman code reaches 23 bits, are cut to 11 bits and still
+    /// form a complete code that decodes.
     #[test]
     fn deep_trees_are_cut_to_eleven_bits() {
         let mut counts = [0u32; 256];

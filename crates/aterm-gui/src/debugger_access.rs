@@ -27,13 +27,15 @@ pub(crate) const RESULT_RECHECK: Duration = Duration::from_secs(5);
 /// The marker beside `aterm.toml` naming a change child in flight.
 pub(crate) const CHANGE_MARKER: &str = "privacy-debugger-change";
 
-/// The marker beside `aterm.toml` holding the last observed mode, when aterm first saw it, and who set it (design §3.5).
+/// The marker beside `aterm.toml` holding the last observed mode, when aterm first saw it, and
+/// who set it (design §3.5).
 pub(crate) const OBSERVED_MARKER: &str = "privacy-debugger-observed";
 
 /// The Mac-wide change lock beside `aterm.toml`.
 pub(crate) const CHANGE_LOCK: &str = "privacy-debugger-change.lock";
 
-/// Both markers hold one short line; anything bigger is not a record this build wrote and reads as nothing.
+/// Both markers hold one short line; anything bigger is not a record this build wrote, and
+/// reads as nothing.
 pub(crate) const MAX_MARKER_BYTES: usize = 96;
 
 /// Wall-clock seconds since the epoch: the markers' and the page's clock.
@@ -200,7 +202,9 @@ fn read_debugger_marker(config_path: &Path, name: &str) -> Option<String> {
         .and_then(|path| crate::config_marker::read_marker(&path, MAX_MARKER_BYTES))
 }
 
-/// The held change lock, released by `LOCK_UN` when this drops ([`HeldAdvisoryLock`](crate::native_document_host::HeldAdvisoryLock)), or by the kernel when its process dies.
+/// The held change lock: released by `LOCK_UN` when this drops
+/// ([`HeldAdvisoryLock`](crate::native_document_host::HeldAdvisoryLock)), or by the kernel when
+/// its process dies.
 #[derive(Debug)]
 pub(crate) struct ChangeLock {
     _held: crate::native_document_host::HeldAdvisoryLock,
@@ -260,7 +264,8 @@ impl Drop for PatienceForTest {
     }
 }
 
-/// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience` ([`acquire_advisory_lock_within`](crate::native_document_host::acquire_advisory_lock_within)).
+/// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience`
+/// ([`acquire_advisory_lock_within`](crate::native_document_host::acquire_advisory_lock_within)).
 pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTry {
     let Some(path) = marker_path(config_path, CHANGE_LOCK) else {
         return LockTry::Unavailable(std::io::Error::new(
@@ -300,7 +305,8 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
     }
 }
 
-/// Write the observed record, then, under the change lock, remove an ended change's marker if it still names `release`'s child.
+/// Write the observed record, then, under the change lock, remove an ended change's marker if
+/// it still names `release`'s child.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -344,7 +350,8 @@ pub(crate) fn settle_markers(
     }
 }
 
-/// [`settle_markers`] off the UI thread (two tiny files, still disk I/O, and a lock it may wait a second for).
+/// [`settle_markers`] off the UI thread: two tiny files, but disk I/O, and a lock it may wait a
+/// second for.
 pub(crate) fn settle_markers_detached(
     config_path: PathBuf,
     observed: Option<ObservedMarker>,
@@ -367,7 +374,8 @@ pub(crate) fn settle_markers_detached(
 pub(crate) struct RecordsRead {
     /// A predecessor's change child, still running.
     pub(crate) inherited: Option<ChangeMarker>,
-    /// A change marker naming a child that is gone, whose change was never judged (aterm quit before the re-probe, or a peer sits between taking its result and recording its re-probe).
+    /// A change marker naming a gone child whose change was never judged (aterm quit before the
+    /// re-probe, or a peer is between taking its result and recording its re-probe).
     pub(crate) stale: Option<ChangeMarker>,
     /// The last observed mode.
     pub(crate) observed: Option<ObservedMarker>,
@@ -375,7 +383,8 @@ pub(crate) struct RecordsRead {
     pub(crate) unsettled: bool,
 }
 
-/// Read both markers, off the UI thread, judging a change marker's child by pid and birth (`alive`), since a pid may be reused.
+/// Read both markers, off the UI thread, judging a change marker's child by pid and birth
+/// (`alive`), since a pid may be reused.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -492,7 +501,8 @@ impl Outcome {
     }
 }
 
-/// Why a press, or the host's start of a confirmed one, did nothing — in the owner's words, for "Nothing was changed: {why}.".
+/// Why a press, or the host's start of a confirmed one, did nothing, in the owner's words for
+/// "Nothing was changed: {why}.".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     NoWindow,
@@ -705,7 +715,8 @@ impl DebuggerAccessFlow {
         true
     }
 
-    /// The worker's re-read did not show the precondition: nothing was spawned, and what it read is the flow's observation now.
+    /// The worker's re-read did not show the precondition: nothing was spawned, and what it
+    /// read is the flow's observation now.
     pub(crate) const fn on_not_due(&mut self, observed: DebuggerProbe) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
@@ -717,7 +728,8 @@ impl DebuggerAccessFlow {
         Some(outcome)
     }
 
-    /// Another aterm holds the change lock: nothing was read or spawned for the change being re-checked.
+    /// Another aterm holds the change lock: nothing was read or spawned for the change being
+    /// re-checked.
     pub(crate) const fn on_peer_busy(&mut self) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
@@ -837,7 +849,8 @@ impl ChangeSlot {
         }
     }
 
-    /// Whether `job`'s worker has ended with something the park has not taken yet (the model's phase 5 when a child ran).
+    /// Whether `job`'s worker has ended with something the park has not taken yet (the model's
+    /// phase 5 when a child ran).
     #[cfg(test)]
     pub(crate) fn unread(&self, job: u64) -> bool {
         let inner = self.lock();
@@ -866,7 +879,8 @@ impl ChangeSlot {
     }
 }
 
-/// One confirmed change: the direction, its job number and the yes (the owner's in aterm's alert, or the window's own admission).
+/// One confirmed change: the direction, its job number and the yes (the owner's in aterm's
+/// alert, or the window's own admission).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ChangeTicket {
     change: DebuggerChange,
@@ -892,7 +906,8 @@ impl ChangeTicket {
     }
 }
 
-/// Everything the worker needs, handed through `ConsentGestures::run_devtools` (a plain function pointer, so the job carries its captures).
+/// Everything the worker needs, handed through `ConsentGestures::run_devtools`, a plain
+/// function pointer, so the job carries its captures.
 pub(crate) struct DevtoolsJob {
     change: DebuggerChange,
     gate: ProbeGate,
@@ -904,7 +919,8 @@ pub(crate) struct DevtoolsJob {
 }
 
 impl DevtoolsJob {
-    /// The job for one confirmed change; `ticket` carries the direction, the job number and the owner's yes.
+    /// The job for one confirmed change; `ticket` carries the direction, the job number and
+    /// the owner's yes.
     pub(crate) fn new(
         ticket: ChangeTicket,
         gate: ProbeGate,
@@ -948,12 +964,12 @@ pub(crate) fn inert_run_devtools(_job: DevtoolsJob) -> DevtoolsSpawn {
     DevtoolsSpawn::Inert
 }
 
-/// The live arm: one detached `consent-devtools` worker whose handle is dropped; while it lives it counts as an up macOS dialog ([`aterm_types::macos_setup::MacosDialog`]).
+/// The live arm: one detached `consent-devtools` worker, counted as an up macOS dialog
+/// ([`aterm_types::macos_setup::MacosDialog`]) while it lives.
 pub(crate) fn spawn_devtools_worker(job: DevtoolsJob) -> DevtoolsSpawn {
-    // Up from before this returns — so the UI thread's next look at
-    // `macos_dialog_up` already counts it, before the worker's first statement
-    // — until the worker is gone, however it ends (a panic drops it too). A
-    // thread that cannot start drops it with the closure.
+    // Taken before the spawn, so the UI thread's next `macos_dialog_up` already counts it, and
+    // dropped when the worker ends however it ends (a panic too), or with the closure if the
+    // thread cannot start.
     let dialog = aterm_types::macos_setup::MacosDialog::up();
     let spawned = crate::qos::spawn_lane_thread(
         "consent-devtools",
@@ -987,7 +1003,9 @@ impl Drop for WorkerGone {
     }
 }
 
-/// The worker's body, with the change runner injected (live: `aterm_containment::consent::run_devtools_change`; the Tier-1 bind uses `devtools_change_with_for_test` with a scripted read and a stand-in child).
+/// The worker's body, with the change runner injected (live:
+/// `aterm_containment::consent::run_devtools_change`; in tests,
+/// `devtools_change_with_for_test`).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1091,7 +1109,8 @@ where
     slot.publish_result(id, result);
 }
 
-/// The `LogOnly` records of design §3.8, as a fact; the words are `message_reporters::debugger_access_record`'s.
+/// The `LogOnly` records of design §3.8, as a fact; the words are
+/// `message_reporters::debugger_access_record`'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DebuggerRecord {
     On,
@@ -1126,7 +1145,8 @@ impl DriftWatch {
         self.drift_since
     }
 
-    /// Whether the watch judges now; `false` until the marker is read, and again while a mode waits for a fresh read of it.
+    /// Whether the watch judges now: `false` until the marker is read, and again while a mode
+    /// waits for a fresh read of it.
     pub(crate) const fn seeded(&self) -> bool {
         self.seeded
     }
@@ -1248,7 +1268,8 @@ impl LaneStep {
     }
 }
 
-/// The `App`-owned lane: the reducer, the shared result slot, the records reader's answer and the drift watch.
+/// The `App`-owned lane: the reducer, the shared result slot, the records reader's answer and
+/// the drift watch.
 pub(crate) struct DebuggerChangeLane {
     flow: DebuggerAccessFlow,
     slot: Arc<ChangeSlot>,
@@ -1281,7 +1302,8 @@ const fn never_alive(_child: &DevtoolsChild) -> bool {
 }
 
 impl DebuggerChangeLane {
-    /// A windowed instance reads liveness by pid and birth; a headless one never has a change child, and asks nothing.
+    /// A windowed instance reads liveness by pid and birth; a headless one never has a change
+    /// child, and asks nothing.
     pub(crate) fn new(headless: bool) -> Self {
         let mut lane = Self::with_liveness(if headless {
             never_alive
@@ -1292,7 +1314,8 @@ impl DebuggerChangeLane {
         lane
     }
 
-    /// A windowed lane with an injected liveness check (the successor's pid-and-birth read); tests pass a stand-in.
+    /// A windowed lane with an injected liveness check (the successor's pid-and-birth read);
+    /// tests pass a stand-in.
     pub(crate) fn with_liveness(alive: fn(&DevtoolsChild) -> bool) -> Self {
         Self {
             flow: DebuggerAccessFlow::new(),
@@ -1356,7 +1379,8 @@ impl DebuggerChangeLane {
         Arc::clone(&self.records)
     }
 
-    /// Settle the records without a reader: no marker location (headless, tests), or its thread could not start.
+    /// Settle the records without a reader: no marker location (headless, tests), or its
+    /// thread could not start.
     pub(crate) fn settle_records(&mut self, read: RecordsRead) {
         *self.ask_records().lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
     }
@@ -1366,7 +1390,8 @@ impl DebuggerChangeLane {
         self.refusal = refusal;
     }
 
-    /// Whether the park must keep re-reading: a change under way, or the records asked for and not yet read.
+    /// Whether the park must keep re-reading: a change under way, or the records asked for and
+    /// not yet read.
     pub(crate) const fn needs_poll(&self) -> bool {
         (self.records_asked && !self.flow.records_read())
             || matches!(
@@ -1375,7 +1400,8 @@ impl DebuggerChangeLane {
             )
     }
 
-    /// Whether the park calls [`Self::poll`]: [`Self::needs_poll`] (the model's `polling`), or a records read out or wanted.
+    /// Whether the park calls [`Self::poll`]: [`Self::needs_poll`] (the model's `polling`), or
+    /// a records read out or wanted.
     pub(crate) fn wants_poll(&self) -> bool {
         self.needs_poll() || self.records_out || self.records_again_at.is_some()
     }
@@ -1395,7 +1421,6 @@ impl DebuggerChangeLane {
         self.flow.records_read()
     }
 
-    /// Whether a change is under way.
     pub(crate) fn under_way(&self) -> bool {
         self.flow.phase() != Phase::Idle
     }
@@ -1405,12 +1430,15 @@ impl DebuggerChangeLane {
         self.flow.press_refusal(change)
     }
 
-    /// Whether debugger access reading off is the person's choice, from what this lane holds on record ([`off_is_chosen`]).
+    /// Whether debugger access reading off is the person's choice, from what this lane holds
+    /// on record ([`off_is_chosen`]).
     pub(crate) fn off_is_chosen(&self) -> bool {
         off_is_chosen(self.drift.drift_since().is_some(), self.drift.recorded())
     }
 
-    /// The owner's press and their answer (aterm's alert on Settings ▸ Security, or the window's own admission spent by [`Self::start_from_plan`] or a `Turn On…` press), and on a yes only, a new job armed in the slot.
+    /// The owner's press and their answer (aterm's alert on Settings ▸ Security, or the
+    /// window's own admission spent by [`Self::start_from_plan`] or a `Turn On…` press); a yes
+    /// arms a new job in the slot.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1474,7 +1502,8 @@ impl DebuggerChangeLane {
         }
     }
 
-    /// One park re-read (design §3.4 steps 4 and 6): the worker's slot, then the records, then a predecessor's child's liveness.
+    /// One park re-read (design §3.4 steps 4 and 6): the worker's slot, then the records, then
+    /// a predecessor's child's liveness.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1699,7 +1728,8 @@ impl DebuggerChangeLane {
     }
 }
 
-/// The record beside `aterm.toml` of the Macs on which aterm has started the debugger step by itself, or found the question answered: one `<host-uuid> <secs>` line per Mac.
+/// The record beside `aterm.toml` of the Macs where aterm started the debugger step itself or
+/// found the question answered: one `<host-uuid> <secs>` line per Mac.
 pub(crate) const ASKED_RECORD: &str = "privacy-debugger-asked";
 
 /// The Macs the asked record keeps.
@@ -1756,7 +1786,8 @@ pub(crate) fn read_asked(config_path: &Path, host: &str) -> bool {
     read_host_record(config_path, ASKED_RECORD, host)
 }
 
-/// Whether the once-per-Mac record `record` beside `config_path` names `host`, read as [`read_asked`] reads [`ASKED_RECORD`].
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`, as
+/// [`read_asked`] reads [`ASKED_RECORD`]; a bad key or a record that cannot be read names it.
 pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> bool {
     if !host_key_ok(host) {
         return true;
@@ -1770,12 +1801,13 @@ pub(crate) fn read_host_record(config_path: &Path, record: &str, host: &str) -> 
     }
 }
 
-/// Write `host` into the asked record, AHEAD of the change it stands for.
+/// Write `host` into the asked record, ahead of the change it stands for.
 pub(crate) fn note_asked(config_path: &Path, host: &str, now: u64) -> std::io::Result<()> {
     note_host_record(config_path, ASKED_RECORD, host, now)
 }
 
-/// Write `host` into the once-per-Mac record `record` beside `config_path`, as [`note_asked`] writes [`ASKED_RECORD`].
+/// Write `host` into the once-per-Mac record `record` beside `config_path`, as [`note_asked`]
+/// writes [`ASKED_RECORD`].
 pub(crate) fn note_host_record(
     config_path: &Path,
     record: &str,
@@ -1818,7 +1850,8 @@ pub(crate) fn note_host_record(
     )
 }
 
-/// Whether the once-per-Mac record `record` beside `config_path` names `host`, read the other way from [`read_host_record`].
+/// Whether the once-per-Mac record `record` beside `config_path` names `host`: an error where
+/// [`read_host_record`] answers yes for want of a reading (a bad key, an unreadable record).
 pub(crate) fn host_record_lists(
     config_path: &Path,
     record: &str,
@@ -1840,7 +1873,8 @@ pub(crate) fn host_record_lists(
         })
 }
 
-/// Take `host` out of the record `record` beside `config_path`, written as [`note_host_record`] writes it.
+/// Take `host` out of the record `record` beside `config_path`, written as
+/// [`note_host_record`] writes it.
 pub(crate) fn forget_host_record(
     config_path: &Path,
     record: &str,
@@ -1889,7 +1923,8 @@ pub(crate) enum StartPrep {
     NotRecorded,
 }
 
-/// What the disk half of the debugger step's start needs from the lane, copied so it can run off the event loop.
+/// What the disk half of the debugger step's start needs from the lane, copied so it can run
+/// off the event loop.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartDisk {
     followed: [Option<DevtoolsChild>; 4],
@@ -1897,10 +1932,11 @@ pub(crate) struct StartDisk {
 }
 
 impl StartDisk {
-    /// THE DISK HALF OF THE DEBUGGER STEP'S START: take the change lock, judge the marker, read the record and write this Mac into it durably, ahead of the change.
+    /// The disk half of the debugger step's start: take the change lock, judge the marker, read
+    /// the record and write this Mac into it durably, ahead of the change.
     pub(crate) fn prepare(self, config_path: &Path, host: &str, now: u64) -> StartPrep {
-        // A first launch may have no config directory yet. The record writer
-        // already creates it; the lock must be able to precede that write.
+        // A first launch may have no config directory yet, and the lock is taken before the
+        // record's write would create it.
         if let Some(parent) = config_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1946,31 +1982,29 @@ pub(crate) enum HostAsked {
 /// What System State's debugger step is judged on (`docs/DESIGN-system-state-2026-10-21.md` §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DebuggerStepFacts {
-    /// A windowed instance.
     pub(crate) windowed: bool,
     pub(crate) macos: bool,
     /// `[privacy] enabled && check`.
     pub(crate) privacy: bool,
     /// `[privacy] notice`: off pauses the step, and no key starts it.
     pub(crate) notice: bool,
-    /// A config folder to keep the record in: without one nothing would remember the step, and every launch would start it again.
+    /// A config folder to keep the record in (without one every launch would start the step).
     pub(crate) config: bool,
-    /// THE STANDING YES in hand (`App::admitted_access`): the window's own
-    /// admission of a setup plan with its Permissions group — its automatic
-    /// answer to the startup offer, or a person's press on the page — and that
-    /// plan still the one in force. Without it the step parks until one comes
+    /// The standing yes (`App::admitted_access`): the window's own admission of a setup plan
+    /// with its Permissions group, that plan still in force. Without it the step parks
     /// ([`StepVerdict::Park`]).
     pub(crate) admitted: bool,
     pub(crate) host: HostAsked,
     /// The shared debugger records (a predecessor's change, the observed mode) are read.
     pub(crate) records_read: bool,
-    /// A change under way ([`DebuggerChangeLane::under_way`]), this process's or an inherited one.
+    /// A change under way, this process's or an inherited one.
     pub(crate) under_way: bool,
-    /// The owner answered Settings ▸ Security's debugger-access alert in this process, yes or no (`OwnerQuiet::debugger_answered`).
+    /// The owner answered Settings ▸ Security's debugger-access alert in this process, either
+    /// way (`OwnerQuiet::debugger_answered`).
     pub(crate) answered: bool,
     /// The cached probe, `None` until the look reads it.
     pub(crate) probe: Option<DebuggerProbe>,
-    /// The probe was read within [`ASK_PROBE_FRESH`] (or by an instance's syscall-free arm, which answers at every read).
+    /// The probe was read within [`ASK_PROBE_FRESH`] (an instance's syscall-free arm always is).
     pub(crate) probe_fresh: bool,
     /// The observed record, as the lane holds it.
     pub(crate) recorded: Option<ObservedMarker>,
@@ -1980,15 +2014,15 @@ pub(crate) struct DebuggerStepFacts {
     pub(crate) self_hardened: SelfHardening,
     /// This process's Full Disk Access launch decision is made (not `FdaLaunch::Undecided`).
     pub(crate) fda_decided: bool,
-    /// This process's Developer Tools launch reading has completed, whatever it read (a refusal included).
+    /// This process's Developer Tools launch reading has completed, whatever it read.
     pub(crate) devtools_decided: bool,
     /// A Full Disk Access or Developer Tools hand-over waits, or aterm's helper panel is up.
     pub(crate) page: bool,
     /// The folder warm-up is walking (a macOS folder dialog may be up).
     pub(crate) warmup: bool,
-    /// System State is the visible, active view of a focused window with no overlay (`App::system_state_frontmost`).
+    /// System State is frontmost (`App::system_state_frontmost`).
     pub(crate) frontmost: bool,
-    /// A macOS dialog or page this process put up is up ([`aterm_types::macos_setup::macos_dialog_up`]).
+    /// A macOS dialog this process put up is up ([`aterm_types::macos_setup::macos_dialog_up`]).
     pub(crate) dialog_up: bool,
     /// The owner declined a Security gesture recently (`OwnerQuiet`).
     pub(crate) owner_quiet: bool,
@@ -2010,8 +2044,7 @@ pub(crate) enum StepVerdict {
     Drop(StepDrop),
 }
 
-/// Why the debugger step starts nothing this process and writes no record of
-/// this Mac.
+/// Why the debugger step drops ([`StepVerdict::Drop`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StepDrop {
     Headless,
@@ -2026,16 +2059,11 @@ pub(crate) enum StepDrop {
 }
 
 impl StepDrop {
-    /// What the drop says of the row for the revision whose admission is in
-    /// hand, where it settles the row: this Mac's once-per-Mac step is over
-    /// (`Asked`: an earlier revision's, perhaps cancelled in macOS's dialog).
-    /// `None` says nothing: a build that is not hardened and an account in
-    /// neither group read *not needed* on the row itself, a rule the probe
-    /// cannot read or Apple's tool does not recognise is read again, and the
-    /// rest have no window or record to settle it in. A `[privacy]` switch off
-    /// is no drop at all but a pause ([`StepVerdict::Pause`]), which records
-    /// nothing: the row reads as the person's choice from the published
-    /// opt-out while the switch is off, and is still to do once it is on.
+    /// What the drop says of the row for the revision in hand: `Asked` declines it, this Mac's
+    /// once-per-Mac step being over (an earlier revision's, perhaps cancelled in macOS's
+    /// dialog). The rest say nothing: an unhardened build and an account in neither the admin
+    /// nor the developer group read *not needed* on the row itself, an unrecognised or unread
+    /// rule is read again, and the others have no window or record to settle it in.
     pub(crate) const fn outcome(self) -> Option<AccessOutcome> {
         match self {
             Self::Asked => Some(AccessOutcome::Declined),
@@ -2140,7 +2168,8 @@ impl StepWait {
     }
 }
 
-/// Why the debugger step settles: the question is answered on this Mac, and the record says so with nothing started.
+/// Why the debugger step settles: the question is answered on this Mac, so the record says so
+/// and nothing starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StepSettle {
     Underway,
@@ -2150,10 +2179,8 @@ pub(crate) enum StepSettle {
 }
 
 impl StepSettle {
-    /// What the settle says of the row for the revision whose admission is in
-    /// hand: a change under way was handed to macOS's dialog, the rule on is
-    /// granted, and an answer on the Security page or an explicit opt-out is
-    /// declined.
+    /// What the settle says of the row for the revision in hand: a change under way is handed,
+    /// the rule on is granted, and an answer on the Security page or an opt-out is declined.
     pub(crate) const fn outcome(self) -> AccessOutcome {
         match self {
             Self::Underway => AccessOutcome::Handed,
@@ -2172,14 +2199,19 @@ impl StepSettle {
     }
 }
 
-/// Whether debugger access reading off is the person's choice: this process saw it go off (`drift`), or the observed record says it was allowed or that aterm or something else turned it off. Pure, so every launch judges it the same way.
+/// Whether debugger access reading off is the person's choice: this process saw it go off
+/// (`drift`), or the observed record says it was allowed or that aterm or something else turned
+/// it off. Pure, so every launch judges it the same way.
 pub(crate) fn off_is_chosen(drift: bool, recorded: Option<ObservedMarker>) -> bool {
     drift
         || recorded
             .is_some_and(|was| was.mode == DebuggerMode::Enabled || was.origin != Origin::Unknown)
 }
 
-/// THE DEBUGGER STEP'S ADMISSION (`docs/DESIGN-system-state-2026-10-21.md` §6). Pure, and the order is the contract: the instance's gates, the standing yes, the `[privacy]` switches, the record, the reads, the question answered here, whether the change can help, the moment, and a fresh probe.
+/// The debugger step's admission (`docs/DESIGN-system-state-2026-10-21.md` §6). Pure, and the
+/// order is the contract: the instance's gates, the standing yes, the `[privacy]` switches, the
+/// record, the reads, the question answered here, whether the change can help, the moment, and
+/// a fresh probe.
 pub(crate) fn admit_debugger_step(facts: &DebuggerStepFacts) -> StepVerdict {
     let gates = [
         (facts.windowed, StepDrop::Headless),
@@ -2192,9 +2224,8 @@ pub(crate) fn admit_debugger_step(facts: &DebuggerStepFacts) -> StepVerdict {
     if !facts.admitted {
         return StepVerdict::Park;
     }
-    // The `[privacy]` switches after the admission, before anything is read:
-    // off, the step pauses with nothing written or recorded, and goes on for
-    // the revision in force once they are on again.
+    // The switches come after the admission and before any read: off, the step pauses with
+    // nothing written.
     let switches = [
         (facts.privacy, StepPause::PrivacyOff),
         (facts.notice, StepPause::NoticeOff),
@@ -2279,7 +2310,10 @@ impl StartEnd {
 }
 
 impl DebuggerChangeLane {
-    /// THE STANDING YES SPENT: for a Mac the start's disk half has just written into [`ASKED_RECORD`], take `admitted`, the window's own admission of a setup plan with its Permissions group, as the yes a press takes ([`Self::begin`] with `OwnerYes::from_admitted`). No alert: macOS's administrator dialog is the one gesture left. Only On.
+    /// The standing yes spent: for a Mac the start's disk half has just written into
+    /// [`ASKED_RECORD`], take `admitted`, the window's own admission, as the yes a press takes
+    /// ([`Self::begin`] with `OwnerYes::from_admitted`). aterm raises no alert of its own, and
+    /// the change is always On.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2308,7 +2342,7 @@ impl DebuggerChangeLane {
         .map_err(StartEnd::Refused)
     }
 
-    /// [`Self::start_from_plan`] with its disk half run here, as the App runs the three steps apart.
+    /// [`Self::start_from_plan`] with its disk half run here, in one call.
     #[cfg(test)]
     pub(crate) fn start_now(
         &mut self,
@@ -2328,7 +2362,8 @@ impl DebuggerChangeLane {
         self.flow.press_refusal(DebuggerChange::On)
     }
 
-    /// What the disk half of [`Self::start_from_plan`] needs from this lane, copied, so it can run off the event loop ([`StartDisk::prepare`]).
+    /// What the disk half of [`Self::start_from_plan`] needs from this lane, copied so it can
+    /// run off the event loop ([`StartDisk::prepare`]).
     pub(crate) fn start_disk(&self) -> StartDisk {
         StartDisk {
             followed: self.followed(),
@@ -2355,7 +2390,7 @@ impl DebuggerChangeLane {
         }
     }
 
-    /// THE DEBUGGER STEP SETTLED: write this Mac into [`ASKED_RECORD`] and nothing else.
+    /// The debugger step settled: write this Mac into [`ASKED_RECORD`] and nothing else.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2375,7 +2410,8 @@ impl DebuggerChangeLane {
     }
 }
 
-/// The App's debugger step: queued on a windowed macOS instance until it starts, settles or drops, with the park's next look; parked while no standing yes is in hand.
+/// The App's debugger step: queued on a windowed macOS instance until it starts, settles or
+/// drops, with the park's next look; parked while no standing yes is in hand.
 #[derive(Debug)]
 pub(crate) struct DebuggerStepQueue {
     queued: bool,
@@ -2392,9 +2428,8 @@ pub(crate) struct DebuggerStepQueue {
     revision: Option<u64>,
     /// The page's headline names macOS's dialog ([`Self::announce`]).
     announced: Option<Announced>,
-    /// The change System State started (this step, or a person's `Turn On…`
-    /// on the page) and the setup revision it spent: its outcome is the access
-    /// record's for that revision.
+    /// The setup revision spent by the change System State started (this step, or a person's
+    /// `Turn On…`): the change's outcome is that revision's access record.
     started: Option<u64>,
     /// The revisions the window admitted while that change was under way
     /// ([`Self::join_started`]): the change in flight answers them too.
@@ -2416,7 +2451,10 @@ pub(crate) struct DebuggerStepQueue {
     unread_reads: u32,
 }
 
-/// THE ACCESS RECORD'S WRITER: the debugger row's outcomes for System State's Permissions stage (`aterm_types::macos_setup::access_record`), appended in order on a thread of its own, never in the UI thread's turn. A line whose write fails is lost with a warning, and the stage judges that row again.
+/// The access record's writer: the debugger row's outcomes
+/// (`aterm_types::macos_setup::access_record`), appended in order on a thread of its own,
+/// never in the UI thread's turn. A line whose write fails is lost with a warning, and the
+/// Permissions stage judges that row again.
 #[derive(Debug, Default)]
 struct AccessWriter {
     queue: Arc<Mutex<AccessQueue>>,
@@ -2495,7 +2533,8 @@ impl AccessWriter {
     }
 }
 
-/// The page's announcement of macOS's dialog: the window whose System State view names it, that window's presented-frame count then, and when.
+/// The page's announcement of macOS's dialog: the window whose System State view names it, that
+/// window's presented-frame count then, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Announced {
     window: crate::WindowId,
@@ -2503,22 +2542,27 @@ struct Announced {
     at: Instant,
 }
 
-/// Where System State stands for the debugger step at a look (the App's `debugger_step_moment`; a test's stand-in).
+/// Where System State stands for the debugger step at a look (the App's
+/// `debugger_step_moment`, or a test's stand-in).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StepMoment {
-    /// The focused window whose visible, active view is System State with no overlay, and how many frames it has presented. `None`: System State is not frontmost.
+    /// The focused window whose visible, active view is System State with no overlay, and how
+    /// many frames it has presented; `None` when System State is not frontmost.
     pub(crate) page: Option<(crate::WindowId, u64)>,
     /// A macOS dialog or page this process put up is up.
     pub(crate) dialog_up: bool,
 }
 
-/// How long the page names macOS's dialog before the change puts it up, at the least: long enough to read, and to outlast the page's status poll.
+/// The least time the page names macOS's dialog before the change puts it up: long enough to
+/// read, and to outlast the page's status poll.
 pub(crate) const ANNOUNCE_FOR: Duration = Duration::from_secs(2);
 
-/// How long starts refused before anything was written (a change on disk, the lane busy) may keep the debugger step queued, from the first refusal.
+/// How long starts refused before anything was written (a change on disk, the lane busy) may
+/// keep the debugger step queued, from the first refusal.
 pub(crate) const REFUSED_FOR: Duration = Duration::from_secs(5 * 60);
 
-/// How many reads of the rule that read nothing a recorded debugger step meets before [`REFUSED_FOR`] from the first can end it ([`DebuggerStepQueue::unread`]).
+/// How many readings that did not read the rule, over at least [`REFUSED_FOR`] from the first,
+/// end a recorded debugger step ([`DebuggerStepQueue::unread`]).
 pub(crate) const UNREAD_READS: u32 = 3;
 
 /// Where [`DebuggerStepQueue`] does its disk work.
@@ -2557,7 +2601,8 @@ impl DebuggerStepQueue {
         }
     }
 
-    /// A queued step with a stand-in host key whose read has ended, its record read on the asking thread.
+    /// A queued step with a stand-in host key already read, its record read on the asking
+    /// thread.
     #[cfg(test)]
     pub(crate) fn queued_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2568,7 +2613,8 @@ impl DebuggerStepQueue {
         }
     }
 
-    /// A queued step with a stand-in host key whose read is out, ended once `done` is set, its record read on the asking thread.
+    /// A queued step with a stand-in host key whose read ends once `done` is set, its record
+    /// read on the asking thread.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_host_for_test(
         host: fn() -> Option<&'static str>,
@@ -2582,7 +2628,7 @@ impl DebuggerStepQueue {
         }
     }
 
-    /// A queued step with a stand-in host key whose read has ended, its record read off the asking thread as a launch's is.
+    /// [`Self::queued_for_test`] with its record read off the asking thread, as a launch's is.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn reading_record_for_test(host: fn() -> Option<&'static str>) -> Self {
         Self {
@@ -2611,18 +2657,16 @@ impl DebuggerStepQueue {
         self.end();
     }
 
-    /// A `[privacy]` switch is off ([`StepVerdict::Pause`]): stop looking, with
-    /// nothing written or recorded, until [`Self::resume`]. A start's disk half
-    /// answered and kept ([`Self::keep_prepared`]) stays kept, for the look
-    /// after the resume to spend. A switch off is a pause, never an answer.
+    /// A `[privacy]` switch is off ([`StepVerdict::Pause`]): stop looking, with nothing
+    /// written or recorded, until [`Self::resume`]. A start's disk half answered and kept
+    /// ([`Self::keep_prepared`]) stays kept for the look after the resume.
     pub(crate) fn pause(&mut self) {
         self.paused = true;
         self.end();
     }
 
-    /// Every `[privacy]` switch is on again: a paused step looks again at the
-    /// next park, for the revision then in force, as if it had never paused.
-    /// Nothing for a step that is not paused.
+    /// Every `[privacy]` switch is on again: a paused step looks again at the next park, for
+    /// the revision then in force.
     pub(crate) fn resume(&mut self) {
         if std::mem::take(&mut self.paused) {
             self.queued = true;
@@ -2636,15 +2680,11 @@ impl DebuggerStepQueue {
         self.paused
     }
 
-    /// The window's own admission of setup revision `revision` came: a parked
-    /// step looks again at the next park. So does one over for an earlier
-    /// revision, as a later launch's would (design §6: a new approval asks
-    /// again), its record read again first: the step's own start and a
-    /// person's `Turn On…` write this Mac into it, so on a Mac that answered,
-    /// the look settles the new revision's row ([`StepDrop::Asked`]) with no
-    /// second dialog. Nothing for a step still queued, an admission of the
-    /// revision it came for (a change to another group keeps it, and its
-    /// outcome stands), or an instance that never queues it.
+    /// The window's own admission of setup revision `revision` came: a parked step looks again
+    /// at the next park, and so does one over for an earlier revision (design §6: a new
+    /// approval asks again), its record read again first, so on a Mac that answered the look
+    /// settles the new revision's row ([`StepDrop::Asked`]) with no second dialog. Nothing for a
+    /// step still queued, the revision it came for, or an instance that never queues it.
     pub(crate) fn unpark(&mut self, revision: u64) {
         let again = self
             .revision
@@ -2672,11 +2712,10 @@ impl DebuggerStepQueue {
     }
 
     /// A person's `Turn On…` answered the once-per-Mac question here
-    /// (`App::turn_on_debugger_from_system_state`): the step is over for this
-    /// revision, parked, paused or queued, and neither an admission of it nor
-    /// the `[privacy]` switches coming back on queues it again; one
-    /// of a later revision finds this Mac in the record ([`Self::unpark`]), so
-    /// a Cancel in macOS's dialog is never followed by the step's own.
+    /// (`App::turn_on_debugger_from_system_state`): the step is over for this revision, and
+    /// neither its admission nor the `[privacy]` switches coming back on queue it again. A later
+    /// revision finds this Mac in the record ([`Self::unpark`]), so a Cancel in macOS's dialog is
+    /// never followed by the step's own.
     pub(crate) fn answered_by_press(&mut self) {
         self.parked = false;
         self.paused = false;
@@ -2686,10 +2725,9 @@ impl DebuggerStepQueue {
         self.end();
     }
 
-    /// The page names macOS's dialog in `window`, which has presented
-    /// `presented` frames, from `now`: `true` when that is news (a first
-    /// announcement, or one moved to another window), which restarts the
-    /// count.
+    /// The page names macOS's dialog in `window`, which has presented `presented` frames, from
+    /// `now`: `true` when that is news (a first announcement, or another window), which
+    /// restarts [`Self::shown`]'s count.
     pub(crate) fn announce(
         &mut self,
         window: crate::WindowId,
@@ -2739,20 +2777,16 @@ impl DebuggerStepQueue {
         self.revision = Some(revision);
     }
 
-    /// The setup revision of the change System State started, while it is
-    /// under way.
+    /// The setup revision of the change System State started, while it is under way.
     pub(crate) const fn started(&self) -> Option<u64> {
         self.started
     }
 
-    /// The window's own admission of setup revision `revision` came while the
-    /// change System State started is under way, macOS's dialog perhaps still
-    /// up: that change answers it, so the step is not queued again for it (a
-    /// look would find this Mac in the record and decline the revision before
-    /// anyone answered the dialog). The revision is handed now, as the one that
-    /// started the change was, and the change's outcome is its outcome too
-    /// ([`Self::finish`]). The admission of a revision the step came for
-    /// already changes nothing.
+    /// The window's own admission of setup revision `revision` came while the change System
+    /// State started is under way: that change answers it, so the step is not queued again for
+    /// it (a look would find this Mac in the record and decline the revision before anyone
+    /// answered the dialog). The revision is recorded handed now and shares the change's
+    /// outcome ([`Self::finish`]); a revision the step came for already changes nothing.
     pub(crate) fn join_started(&mut self, revision: u64) {
         if self.revision.replace(revision) == Some(revision)
             || self.started == Some(revision)
@@ -2774,19 +2808,18 @@ impl DebuggerStepQueue {
             .collect()
     }
 
-    /// Append the debugger row's `outcome` for setup revision `revision` to
-    /// the access record (`aterm_types::macos_setup::access_record`), which
-    /// System State's Permissions stage reads so a row waiting on a person is
-    /// never retried. Off the UI thread, after every line asked for before it
-    /// ([`AccessWriter`]); nothing where no folder is named.
+    /// Append the debugger row's `outcome` for setup revision `revision` to the access record
+    /// (`aterm_types::macos_setup::access_record`), which System State's Permissions stage
+    /// reads so a row waiting on a person is never retried: off the UI thread, after every line
+    /// asked for before it ([`AccessWriter`]), and nothing where no folder is named.
     pub(crate) fn record(&self, revision: u64, outcome: AccessOutcome) {
         if let Some(dir) = &self.access_dir {
             self.access_writer.append(dir.clone(), revision, outcome);
         }
     }
 
-    /// Wait until every line [`Self::record`] took is written, or its write
-    /// failed: a test's read of the record. A one-minute hang detector.
+    /// Wait until every line [`Self::record`] took is written or failed (a one-minute hang
+    /// detector).
     #[cfg(test)]
     pub(crate) fn record_written_for_test(&self) {
         self.access_writer.drained_for_test();
@@ -2814,7 +2847,8 @@ impl DebuggerStepQueue {
         self.waiting.replace(why) != Some(why)
     }
 
-    /// The start at `now` was refused before anything was written or started ([`StartEnd::Refused`]).
+    /// The start at `now` was refused before anything was written or started
+    /// ([`StartEnd::Refused`]): `false` once refusals have lasted [`REFUSED_FOR`].
     pub(crate) fn refused(&mut self, now: Instant) -> bool {
         let since = *self.refused_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= REFUSED_FOR {
@@ -2825,7 +2859,11 @@ impl DebuggerStepQueue {
         true
     }
 
-    /// The spend's fresh reading did not read the rule after the disk half recorded this Mac (a `-status` that timed out, did not start or answered what the classifier does not claim: [`DebuggerMode::Unknown`] with an age). `true`: it is read again; `false`, the step over and the record standing, once [`UNREAD_READS`] such reads have lasted [`REFUSED_FOR`] from the first. The span is never restarted.
+    /// The spend's fresh reading did not read the rule after the disk half recorded this Mac
+    /// ([`DebuggerMode::Unknown`]: a `-status` that timed out, did not start or answered what
+    /// the classifier does not claim). `true`: it is read again; `false`: the step is over and
+    /// the record stands, once [`UNREAD_READS`] such reads have lasted [`REFUSED_FOR`] from the
+    /// first, a span never restarted.
     pub(crate) fn unread(&mut self, now: Instant) -> bool {
         let since = *self.unread_since.get_or_insert(now);
         self.unread_reads = self.unread_reads.saturating_add(1);
@@ -2872,7 +2910,8 @@ impl DebuggerStepQueue {
             .and_then(|(_, answer)| answer.get().copied())
     }
 
-    /// The record's read for `host`, the first time it is asked for that host: `Some((slot, where))`.
+    /// The record's read for `host`, the first time it is asked for that host: the slot it
+    /// answers into, and where it runs.
     pub(crate) fn start_record_read(
         &mut self,
         host: &'static str,
@@ -2889,12 +2928,13 @@ impl DebuggerStepQueue {
         Some((slot, self.record_read))
     }
 
-    /// Where this queue does its disk work: the record's read, the start's disk half and a settle's record.
+    /// Where this queue does its disk work.
     pub(crate) const fn record_read(&self) -> RecordRead {
         self.record_read
     }
 
-    /// The start's disk half, once per start, for a change that will start on `read`: `Some(slot)` when none is out or untaken.
+    /// The start's disk half, once per start, for a change that will start on `read`:
+    /// `Some(slot)` when none is out or untaken.
     pub(crate) fn start_prepare(
         &mut self,
         read: DebuggerFacts,
@@ -2914,7 +2954,8 @@ impl DebuggerStepQueue {
             .is_some_and(|(slot, _)| slot.get().is_none())
     }
 
-    /// The disk half's answer once it has ended, with the reading its change starts on, taken: the next start starts another.
+    /// Take the disk half's answer once it has ended, with the reading its change starts on;
+    /// the next start starts another.
     pub(crate) fn take_prepared(&mut self) -> Option<(StartPrep, DebuggerFacts)> {
         let (slot, read) = self.prepared.as_ref()?;
         let answer = (*slot.get()?, *read);
@@ -2968,15 +3009,18 @@ pub(crate) struct DebuggerFacts {
     pub(crate) self_hardened: SelfHardening,
     /// A change child in flight, this process's or a predecessor's.
     pub(crate) in_flight: Option<InFlightFacts>,
-    /// Anything under way (the alert, the re-read, the child, the re-probe) or the predecessor's records unread: no button is live.
+    /// Anything under way (the alert, the re-read, the child, the re-probe) or the
+    /// predecessor's records unread: no button is live.
     pub(crate) busy: bool,
-    /// The last recorded mode, when aterm first saw it, and who set it: "turned on from aterm on `<date>`" / "set outside aterm".
+    /// The last recorded mode, when aterm first saw it, and who set it ("turned on from aterm
+    /// on `<date>`" / "set outside aterm").
     pub(crate) recorded: Option<ObservedMarker>,
     /// Drift: allowed since this time, off now (in this process).
     pub(crate) drift_since: Option<u64>,
     /// What the last change in this process came to.
     pub(crate) last_outcome: Option<Outcome>,
-    /// Why the last confirmed change (a press, or System State's standing yes) started nothing.
+    /// Why the last confirmed change (a press, or System State's standing yes) started
+    /// nothing.
     pub(crate) refusal: Option<Refusal>,
 }
 
@@ -3005,7 +3049,8 @@ impl DebuggerFacts {
             && (change == DebuggerChange::Off || self.probe.member != DebuggerMember::NotMember)
     }
 
-    /// Whether the row and the alert must add that this aterm is not hardened, so any program the owner runs could take control of it.
+    /// Whether the row and the alert must add that this aterm is not hardened, so any program
+    /// the owner runs could take control of it.
     pub(crate) fn not_hardened(&self) -> bool {
         self.self_hardened != SelfHardening::Hardened
     }
@@ -4892,16 +4937,8 @@ mod tests {
         }
     }
 
-    /// EVERY WAY THE STEP ENDS WITH AN ADMISSION IN HAND SETTLES THE ROW FOR ITS
-    /// REVISION, OR SAYS WHY THE ROW SPEAKS FOR ITSELF (design §6: the
-    /// Permissions stage completes when every row is in place, not needed, or
-    /// handed, declined or triggered in this revision). A later revision on a
-    /// Mac whose step is over — cancelled in macOS's dialog once — is declined,
-    /// so its stage never waits on the row for good. A `[privacy]` switch off is
-    /// a pause, which records nothing (the published opt-out is the row's wanted
-    /// state while it is off). Not needed (a build that is not hardened, an
-    /// account in neither group) is the row's own reading, and a rule read
-    /// again later says nothing yet.
+    /// Every way the step ends with an admission in hand settles the row for its revision
+    /// (design §6), or leaves the row to its own reading.
     #[test]
     fn every_end_with_an_admission_says_what_the_row_is() {
         use AccessOutcome::{Declined, Granted, Handed};
@@ -5642,7 +5679,8 @@ mod tests {
     }
 }
 
-/// Tier-1 `debugger_access_conforms_to_the_model` (design §5.4): drives the production composition.
+/// Tier-1 `debugger_access_conforms_to_the_model` (design §5.4): drives the production
+/// composition.
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod conformance {
@@ -5655,7 +5693,8 @@ pub(crate) mod conformance {
     use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
     use std::sync::mpsc;
 
-    /// Normalise a mode by the change: its precondition is 0, its target 1, an unrecognised rule 2, and not read 3.
+    /// Normalise a mode by the change: its precondition is 0, its target 1, an unrecognised
+    /// rule 2, and not read 3.
     pub(crate) fn norm(mode: DebuggerMode, change: DebuggerChange) -> i64 {
         match mode {
             m if m == change.precondition() => 0,
@@ -6050,9 +6089,8 @@ pub(crate) mod conformance {
             rig
         }
 
-        /// A fresh lane in a process whose window holds no admission of a setup
-        /// plan (the model's `Admitted = 0` scenario: a control client's act, a
-        /// status poll or a hand-edited record admitted it, or nothing did).
+        /// A fresh lane in a process whose window holds no admission of a setup plan (the
+        /// model's `Admitted = 0`).
         fn unadmitted(change: DebuggerChange, world: DebuggerMode, fault: Fault) -> Self {
             let mut rig = Self::new(change, world, fault);
             rig.model = aterm_spec::interp::with_consts(&rig.model, &[("Admitted", 0)]);
@@ -6526,7 +6564,8 @@ pub(crate) mod conformance {
             self.check_invariants();
         }
 
-        /// System State's debugger step at its moment, in one step: the window's admission from a real `PermissionGate`, spent as the yes by `DebuggerChangeLane::start_now`.
+        /// System State's debugger step at its moment, in one step: the window's admission from a
+        /// real `PermissionGate`, spent as the yes by `DebuggerChangeLane::start_now`.
         fn plan_consent(&mut self) -> Plan {
             assert_eq!(
                 self.change,

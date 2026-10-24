@@ -3,7 +3,6 @@
 
 //! Gemini CLI screen grammar, measured on 0.46.0 and read from its bundle.
 
-use crate::anchors::anchor_text;
 use crate::phase::{Phase, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
 use crate::text::blank;
@@ -158,7 +157,7 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
         .iter()
         .find(|r| !blank(r))
         .is_some_and(|r| {
-            !crate::text::contains(r, const { anchor_text("gemini.footer.workspace") })
+            !crate::text::contains(r, const { crate::anchor!("gemini.footer.workspace") })
         });
     let status = rule.checked_sub(1);
     Some(Frame {
@@ -174,7 +173,7 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
 
 fn caret_text(row: &str) -> &str {
     let text = crate::text::trim_end(row).get(3..).unwrap_or("");
-    if text.strip_prefix("  ") == Some(const { anchor_text("gemini.composer.placeholder") }) {
+    if text.strip_prefix("  ") == Some(const { crate::anchor!("gemini.composer.placeholder") }) {
         ""
     } else {
         crate::text::trim(text)
@@ -252,9 +251,9 @@ enum Status {
 }
 
 const MODES: [&str; 3] = [
-    anchor_text("gemini.mode.yolo"),
-    anchor_text("gemini.mode.auto_edit"),
-    anchor_text("gemini.mode.plan"),
+    crate::anchor!("gemini.mode.yolo"),
+    crate::anchor!("gemini.mode.auto_edit"),
+    crate::anchor!("gemini.mode.plan"),
 ];
 
 fn status_words(row: &str) -> &str {
@@ -276,8 +275,8 @@ fn status_kind(row: &str) -> Status {
     let words = status_words(row);
     if words.is_empty() {
         Status::Blank
-    } else if words == const { anchor_text("gemini.status.shortcuts") }
-        || words == const { anchor_text("gemini.status.details") }
+    } else if words == const { crate::anchor!("gemini.status.shortcuts") }
+        || words == const { crate::anchor!("gemini.status.details") }
     {
         Status::Shortcuts
     } else {
@@ -316,9 +315,9 @@ fn ended_on(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 const TRUST_NOTICES: [&str; 3] = [
-    anchor_text("gemini.notice.still_trusted"),
-    anchor_text("gemini.notice.untrusted"),
-    anchor_text("gemini.notice.agents_skipped"),
+    crate::anchor!("gemini.notice.still_trusted"),
+    crate::anchor!("gemini.notice.untrusted"),
+    crate::anchor!("gemini.notice.agents_skipped"),
 ];
 
 fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
@@ -353,7 +352,7 @@ fn trust_notices_above(rows: &[String], from: usize, end: usize) -> usize {
 }
 
 fn is_banner_row(row: &str) -> bool {
-    let name = const { anchor_text("gemini.banner") };
+    let name = const { crate::anchor!("gemini.banner") };
     crate::text::find(row, name).is_some_and(|at| {
         row[at + name.len()..]
             .strip_prefix(" v")
@@ -518,7 +517,7 @@ pub fn interrupted(rows: &[String]) -> bool {
     ended_on(rows).is_some_and(|(from, end)| {
         rows[from..end].iter().any(|r| {
             r.strip_prefix("ℹ ").is_some_and(|t| {
-                crate::text::trim(t) == const { anchor_text("gemini.turn.cancelled") }
+                crate::text::trim(t) == const { crate::anchor!("gemini.turn.cancelled") }
             })
         })
     })
@@ -557,7 +556,7 @@ fn error_kind(message: &str) -> WallKind {
 pub fn wall(rows: &[String]) -> Option<Wall> {
     let (from, end) = ended_on(rows)?;
     let at = (from..end).rev().find(|&i| rows[i].starts_with("✕ "))?;
-    if !rows[at]["✕ ".len()..].starts_with(const { anchor_text("gemini.error.api") }) {
+    if !rows[at]["✕ ".len()..].starts_with(const { crate::anchor!("gemini.error.api") }) {
         return None;
     }
     let mut last = at;
@@ -601,7 +600,7 @@ pub fn stopped_error(w: &Wall) -> bool {
         }
     ) && w.placement == Placement::ErrorRow
         && w.message
-            .contains(const { anchor_text("gemini.error.unknown") })
+            .contains(const { crate::anchor!("gemini.error.unknown") })
 }
 
 /// Whether `rows` are Gemini CLI's by their layout alone, for a session whose program name says nothing: its composer under the live zone's rule (or with the UI details hidden), or one of its boxes, named ([`prompt`]: a kind this grammar reads, its one-shot `Allow once`, or the first row of its model-fallback dialog).
@@ -611,7 +610,7 @@ pub(crate) fn is_gemini_screen(rows: &[String]) -> bool {
             p.kind != PromptKind::Other
                 || p.options
                     .iter()
-                    .any(|o| o.label == const { anchor_text("gemini.box.once") })
+                    .any(|o| o.label == const { crate::anchor!("gemini.box.once") })
                 || is_fallback_head(&p.title)
         })
 }
@@ -679,14 +678,14 @@ fn numbered(text: &str) -> Option<(u8, &str, bool)> {
 }
 
 fn approval_role(label: &str) -> Role {
-    if label == const { anchor_text("gemini.box.once") } {
+    if label == const { crate::anchor!("gemini.box.once") } {
         Role::Once
-    } else if label == const { anchor_text("gemini.box.session") }
-        || label.ends_with(const { anchor_text("gemini.box.session.tail") })
-        || crate::text::contains(label, const { anchor_text("gemini.box.saved") })
+    } else if label == const { crate::anchor!("gemini.box.session") }
+        || label.ends_with(const { crate::anchor!("gemini.box.session.tail") })
+        || crate::text::contains(label, const { crate::anchor!("gemini.box.saved") })
     {
         Role::Persist
-    } else if label == const { anchor_text("gemini.box.deny") } {
+    } else if label == const { crate::anchor!("gemini.box.deny") } {
         Role::Deny
     } else {
         Role::Other
@@ -695,14 +694,14 @@ fn approval_role(label: &str) -> Role {
 
 fn role_of(kind: PromptKind, label: &str) -> Role {
     match kind {
-        PromptKind::Trust if label.starts_with(const { anchor_text("gemini.trust.folder") }) => {
+        PromptKind::Trust if label.starts_with(const { crate::anchor!("gemini.trust.folder") }) => {
             Role::Trust
         }
-        PromptKind::Trust if label.starts_with(const { anchor_text("gemini.trust.parent") }) => {
+        PromptKind::Trust if label.starts_with(const { crate::anchor!("gemini.trust.parent") }) => {
             Role::Persist
         }
-        PromptKind::Trust if label == const { anchor_text("gemini.trust.no") } => Role::Deny,
-        PromptKind::Question if label == const { anchor_text("gemini.question.custom") } => {
+        PromptKind::Trust if label == const { crate::anchor!("gemini.trust.no") } => Role::Deny,
+        PromptKind::Question if label == const { crate::anchor!("gemini.question.custom") } => {
             Role::Other
         }
         PromptKind::Question => Role::Answer,
@@ -718,16 +717,16 @@ fn is_tab_row(text: &str) -> bool {
 }
 
 fn is_fallback_head(text: &str) -> bool {
-    text.starts_with(const { anchor_text("gemini.fallback.no_access") })
+    text.starts_with(const { crate::anchor!("gemini.fallback.no_access") })
         || (text.starts_with("Model \"")
-            && text.ends_with(const { anchor_text("gemini.fallback.not_found") }))
-        || text == const { anchor_text("gemini.fallback.demand") }
+            && text.ends_with(const { crate::anchor!("gemini.fallback.not_found") }))
+        || text == const { crate::anchor!("gemini.fallback.demand") }
 }
 
 fn is_expansion_ask(text: &str) -> bool {
-    text.strip_prefix(const { anchor_text("gemini.box.expansion.head") })
+    text.strip_prefix(const { crate::anchor!("gemini.box.expansion.head") })
         .is_some_and(|rest| rest.starts_with(" ["))
-        && text.ends_with(const { anchor_text("gemini.box.expansion.ask") })
+        && text.ends_with(const { crate::anchor!("gemini.box.expansion.ask") })
 }
 
 fn is_expansion_row(text: &str) -> bool {
@@ -738,7 +737,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
     let over = |r: usize| first_option.is_none_or(|f| r < f);
     let title = texts.iter().find(|(_, t)| !t.is_empty());
     if let Some(&(row, t)) = title {
-        if t == const { anchor_text("gemini.question.title") } {
+        if t == const { crate::anchor!("gemini.question.title") } {
             let from = texts
                 .iter()
                 .find(|&&(r, t)| r > row && is_tab_row(t))
@@ -750,7 +749,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
                 .next();
             return (PromptKind::Question, asks);
         }
-        if t.starts_with(const { anchor_text("gemini.usage.title") }) {
+        if t.starts_with(const { crate::anchor!("gemini.usage.title") }) {
             return (PromptKind::UsageLimit, None);
         }
         if is_fallback_head(t) {
@@ -762,7 +761,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
     };
     if let Some(&(row, _)) = texts
         .iter()
-        .find(|(_, t)| *t == const { anchor_text("gemini.trust.title") })
+        .find(|(_, t)| *t == const { crate::anchor!("gemini.trust.title") })
     {
         return (PromptKind::Trust, Some(row));
     }
@@ -774,7 +773,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
     let Some(&(row, asks)) = over.next().and_then(|last| {
         if last
             .1
-            .starts_with(const { anchor_text("gemini.box.redirection") })
+            .starts_with(const { crate::anchor!("gemini.box.redirection") })
         {
             over.next()
         } else {
@@ -786,7 +785,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
     let tool = title
         .and_then(|(_, t)| t.strip_prefix("? "))
         .and_then(|t| t.split_whitespace().next());
-    let kind = if asks.starts_with(const { anchor_text("gemini.box.exec.ask") }) {
+    let kind = if asks.starts_with(const { crate::anchor!("gemini.box.exec.ask") }) {
         // `[Shell]` is the shell tool's; an MCP tool's box asks `Allow
         // execution of MCP tool "<tool>" from server "<server>"?`.
         if asks.ends_with("[Shell]?") {
@@ -794,13 +793,13 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
         } else {
             PromptKind::Other
         }
-    } else if asks == const { anchor_text("gemini.box.change.ask") } {
+    } else if asks == const { crate::anchor!("gemini.box.change.ask") } {
         match tool {
             Some("WriteFile") => PromptKind::Write,
             Some("Edit") => PromptKind::Edit,
             _ => PromptKind::Other,
         }
-    } else if is_expansion_ask(asks) || asks == const { anchor_text("gemini.box.proceed") } {
+    } else if is_expansion_ask(asks) || asks == const { crate::anchor!("gemini.box.proceed") } {
         PromptKind::Other
     } else {
         return (PromptKind::Other, None);
@@ -911,11 +910,11 @@ pub fn zone_offset_s(zone: &str) -> Option<i32> {
 #[must_use]
 pub fn footer_model(rows: &[String]) -> Option<String> {
     let head = rows.iter().rposition(|r| {
-        crate::text::contains(r, const { anchor_text("gemini.footer.workspace") })
+        crate::text::contains(r, const { crate::anchor!("gemini.footer.workspace") })
     })?;
     if !rows[head]
         .trim_end()
-        .ends_with(const { anchor_text("gemini.footer.model") })
+        .ends_with(const { crate::anchor!("gemini.footer.model") })
     {
         return None;
     }
@@ -930,11 +929,11 @@ pub fn banner_login(rows: &[String]) -> Option<String> {
     rows.iter().find_map(|r| {
         let t = crate::text::trim(
             r.trim_end()
-                .strip_suffix(const { anchor_text("gemini.banner.auth.tail") })?,
+                .strip_suffix(const { crate::anchor!("gemini.banner.auth.tail") })?,
         );
         let at = t
-            .find(const { anchor_text("gemini.banner.auth") })
-            .or_else(|| t.find(const { anchor_text("gemini.banner.google") }))?;
+            .find(const { crate::anchor!("gemini.banner.auth") })
+            .or_else(|| t.find(const { crate::anchor!("gemini.banner.google") }))?;
         Some(t[at..].to_string())
     })
 }
@@ -947,7 +946,7 @@ pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
         return None;
     }
     let first_option = p.options.first().map_or(p.span.1, |o| o.row);
-    let head = const { anchor_text("gemini.usage.resets") }.trim_end();
+    let head = const { crate::anchor!("gemini.usage.resets") }.trim_end();
     let inner = |r: &String| -> Option<String> {
         let inner = r.trim().strip_prefix('│')?.strip_suffix('│')?;
         Some(crate::text::trim(inner).to_string())
@@ -998,7 +997,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
 fn over_the_queue(rows: &[String], live: usize) -> &[String] {
     let over = &rows[..live.min(rows.len())];
     let queued = over.iter().rposition(|r| {
-        leading_spaces(r) == 2 && crate::text::trim(r) == const { anchor_text("gemini.queued") }
+        leading_spaces(r) == 2 && crate::text::trim(r) == const { crate::anchor!("gemini.queued") }
     });
     match queued {
         Some(q)
@@ -1056,7 +1055,8 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
             .map_or("", |&(_, t)| t)
     };
     let review = kind == PromptKind::Question
-        && question.is_some_and(|q| text_at(q) == const { anchor_text("gemini.question.review") });
+        && question
+            .is_some_and(|q| text_at(q) == const { crate::anchor!("gemini.question.review") });
     if first_option.is_none() && !review {
         return None;
     }
@@ -1067,7 +1067,7 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
         .iter()
         .find(|(_, t)| !t.is_empty())
         .map_or(b.first, |&(r, _)| r);
-    let title_text = if text_at(title_row) == const { anchor_text("gemini.box.action") } {
+    let title_text = if text_at(title_row) == const { crate::anchor!("gemini.box.action") } {
         texts
             .iter()
             .find(|&&(r, t)| r > title_row && !t.is_empty())
@@ -1087,7 +1087,7 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
         || is_fallback_head(title)
         || options
             .iter()
-            .any(|o| o.label == const { anchor_text("gemini.box.once") });
+            .any(|o| o.label == const { crate::anchor!("gemini.box.once") });
     if ordered && focus == 1 && named && tabs.is_none() {
         for o in &mut options {
             o.role = role_of(kind, &o.label);
@@ -1115,7 +1115,7 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
     match kind {
         PromptKind::Write => {
             path = named_after
-                .strip_prefix(const { anchor_text("gemini.box.writing") })
+                .strip_prefix(const { crate::anchor!("gemini.box.writing") })
                 .map(|p| crate::text::trim(p).to_string());
         }
         PromptKind::Edit => {
@@ -1169,8 +1169,8 @@ fn read_box(rows: &[String]) -> Option<PromptV2> {
         .rev()
         .find(|&&(r, t)| {
             r > keys_from
-                && (t.starts_with(const { anchor_text("gemini.question.keys") })
-                    || t.starts_with(const { anchor_text("gemini.question.submit") }))
+                && (t.starts_with(const { crate::anchor!("gemini.question.keys") })
+                    || t.starts_with(const { crate::anchor!("gemini.question.submit") }))
         })
         .map(|&(_, t)| t);
     Some(PromptV2 {

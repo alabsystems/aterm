@@ -296,29 +296,45 @@ pub fn judge_private_dir(dir: &Path) -> io::Result<PrivateDir> {
 
 /// Ensures `dir` exists as a mode-`0700` private directory, returning prior mode bits if narrowed.
 /// # Errors
-/// Returns an error if `dir` cannot be created or fails owner/symlink/ACL checks.
+/// Returns an error if `dir` cannot be created or fails owner/symlink/ACL checks, or is not private once made or narrowed (a volume that ignores modes; `NotFound` where it is gone by then).
 pub fn ensure_private_dir(dir: &Path) -> io::Result<Option<u32>> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    match judge_private_dir(dir)? {
+    use std::os::unix::fs::PermissionsExt as _;
+    ensure_private_dir_by(dir, |dir| {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    })
+}
+
+/// [`ensure_private_dir`], with `narrow` making `dir` 0700.
+fn ensure_private_dir_by(
+    dir: &Path,
+    narrow: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let was = match judge_private_dir(dir)? {
+        PrivateDir::Private => return Ok(None),
         PrivateDir::Missing => {
             if let Some(parent) = dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::DirBuilder::new().mode(0o700).create(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            match judge_private_dir(dir)? {
-                PrivateDir::Private => Ok(None),
-                PrivateDir::Missing | PrivateDir::Open(_) => Err(dir_refused(
-                    dir,
-                    "is not 0700 and this user's after it was made so",
-                )),
-            }
+            None
         }
-        PrivateDir::Open(mode) => {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            Ok(Some(mode))
-        }
-        PrivateDir::Private => Ok(None),
+        PrivateDir::Open(mode) => Some(mode),
+    };
+    narrow(dir)?;
+    match judge_private_dir(dir)? {
+        PrivateDir::Private => Ok(was),
+        PrivateDir::Missing => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the directory {} was removed as it was made 0700",
+                dir.display()
+            ),
+        )),
+        PrivateDir::Open(_) => Err(dir_refused(
+            dir,
+            "is not 0700 and this user's after it was made so",
+        )),
     }
 }
 
@@ -661,6 +677,31 @@ mod tests {
         let refusal = judge_private_dir(&link).unwrap_err();
         assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(refusal.raw_os_error().is_none(), "{refusal}");
+    }
+
+    #[test]
+    fn ensure_private_dir_refuses_one_its_narrowing_left_open() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let open = dir_in(root.path(), "open", 0o755);
+        // A volume that ignores modes: the chmod succeeds and changes nothing.
+        let refusal = super::ensure_private_dir_by(&open, |_| Ok(())).unwrap_err();
+        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(refusal.to_string().contains("is not 0700"), "{refusal}");
+        assert_eq!(judge_private_dir(&open).unwrap(), PrivateDir::Open(0o755));
+        assert_eq!(ensure_private_dir(&open).unwrap(), Some(0o755));
+    }
+
+    #[test]
+    fn ensure_private_dir_finds_one_removed_as_it_was_made_private_gone() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let open = dir_in(root.path(), "open", 0o755);
+        for dir in [open, root.path().join("missing")] {
+            let gone =
+                super::ensure_private_dir_by(&dir, |dir| std::fs::remove_dir(dir)).unwrap_err();
+            assert_eq!(gone.kind(), std::io::ErrorKind::NotFound, "{gone}");
+            assert!(gone.to_string().contains("was removed"), "{gone}");
+            assert_eq!(judge_private_dir(&dir).unwrap(), PrivateDir::Missing);
+        }
     }
 
     #[test]

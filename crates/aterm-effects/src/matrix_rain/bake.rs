@@ -162,6 +162,7 @@ impl RainBaker {
             if !any_lit {
                 continue;
             }
+            let row_off = y * cw;
             for x in 0..cw {
                 let mut num: u32 = 0;
                 let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
@@ -169,7 +170,7 @@ impl RainBaker {
                     num += wx * col_wy[mx as usize];
                 }
                 if num > 0 {
-                    rgba[(y * cw + x) * 4 + 3] = ((num * 255 + DEN / 2) / DEN) as u8;
+                    rgba[(row_off + x) * 4 + 3] = ((num * 255 + DEN / 2) / DEN) as u8;
                 }
             }
         }

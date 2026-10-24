@@ -269,13 +269,12 @@ impl ActiveEventLoop {
         self.p.exiting()
     }
 
-    /// LOCAL PATCH (aterm): whether the drain of user events that ran before this turn's
-    /// [`ApplicationHandler::about_to_wait`] found the queue empty, so every event sent before
-    /// that drain began has been handed to [`ApplicationHandler::user_event`]. The macOS drain
-    /// never waits on a sender: one that meets a sender part-way through a send stops there,
-    /// leaving that send and any made before it queued for the turn the sender's wake brings, and
-    /// this is then `false`. Every other backend's drain waits out a send in progress (a blocking
-    /// channel receive or lock), so this is always `true` there.
+    /// LOCAL PATCH (aterm): whether the user-event drain before this turn's
+    /// [`ApplicationHandler::about_to_wait`] emptied the queue, so every event sent before it began
+    /// reached [`ApplicationHandler::user_event`]. The macOS drain never waits on a sender: one
+    /// that meets a send in progress stops there and this is `false`, leaving that send and any
+    /// made before it queued for the turn the sender's wake brings. Every other backend's drain
+    /// waits out a send in progress, so this is always `true` there.
     ///
     /// [`ApplicationHandler::about_to_wait`]: crate::application::ApplicationHandler::about_to_wait
     /// [`ApplicationHandler::user_event`]: crate::application::ApplicationHandler::user_event
@@ -358,9 +357,8 @@ impl<T: 'static> EventLoopProxy<T> {
         self.event_loop_proxy.send_event(event)
     }
 
-    /// LOCAL PATCH (aterm): [`Self::send_event`] by a sender held part-way through its push, for
-    /// the tests of the crates above it (`aterm-gui`'s `headless_event_loop`), which must make a
-    /// turn's drain of user events meet a send in progress
+    /// LOCAL PATCH (aterm): [`Self::send_event`] by a sender held part-way through its push, so a
+    /// test (`aterm-gui`'s `headless_event_loop`) can make a drain meet a send in progress
     /// ([`ActiveEventLoop::user_events_drained`]). With the queue's lock taken it sends on `held`
     /// and waits for `release` (a one-minute hang detector), then pushes `event` and wakes the
     /// loop as [`Self::send_event`] does.

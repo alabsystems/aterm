@@ -725,8 +725,8 @@ pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
     let plain = strip_sgr(body);
     let phrase = format!(
         "{} \u{00B7} {}",
-        aterm_phase::anchor("fast.on"),
-        aterm_phase::anchor("fast.model_set")
+        aterm_phase::anchor!("fast.on"),
+        aterm_phase::anchor!("fast.model_set")
     );
     let at = plain
         .find(&phrase)
@@ -739,7 +739,7 @@ pub(crate) fn model_result_of(content: &str) -> Option<ModelResult> {
 }
 
 fn model_command_display(line: &str) -> Option<String> {
-    if !line.contains(aterm_phase::anchor("model.set")) {
+    if !line.contains(aterm_phase::anchor!("model.set")) {
         return None;
     }
     let v = super::transcript::command(line).ok()?;

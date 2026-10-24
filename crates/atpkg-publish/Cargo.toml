@@ -45,11 +45,12 @@ aterm-durable = { workspace = true }
 # channel's keys, the machine record, a merge base, a seal's trust-version.toml, the
 # lanes' unsigned staged manifests). Published manifests go through the client's verifier.
 aterm-toml = { workspace = true }
-# `spawnfd::command` builds every child, the `zstd` CLI included (clippy.toml bans std's
-# Command); `deadline::output_until` bounds the ones that can hang.
+# `spawnfd::command` builds every child (clippy.toml bans std's Command);
+# `deadline::output_until` bounds the ones that can hang.
 aterm-uds = { workspace = true }
-# The client's `.tar.zst` decoder and XXH64: each pack the `zstd` CLI writes
-# (artifact::tarwrite) is decoded and checked against the tar stream before it is signed.
+# The encoder every pack is compressed by (artifact::tarwrite::Zstd), and the client's
+# `.tar.zst` decoder and XXH64: each pack is decoded and checked against the tar stream
+# before it is signed.
 aterm-zstd = { workspace = true }
 # `targo metadata` and `--message-format=json` (artifact::pack), build-local's record,
 # and the publication engine's ledger (`mappings.json`).

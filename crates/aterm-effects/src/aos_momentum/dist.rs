@@ -909,7 +909,7 @@ pub enum Refusal {
         /// The token sent.
         sent: Token,
     },
-    /// Step 5 found a claim contradicted, or a proposer proposed after round 0.
+    /// The distributed search has no result.
     Dist(DistNoOutcome),
     /// The command was interrupted.
     Interrupted,

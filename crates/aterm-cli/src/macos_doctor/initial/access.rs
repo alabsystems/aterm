@@ -1,21 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Access rows of System State (`docs/DESIGN-system-state-2026-10-21.md`
-//! §3.3 and §6): what each grant reads, read without a prompt, and when the
-//! Permissions stage of one revision is complete.
+//! The Access rows of System State (`docs/DESIGN-system-state-2026-10-21.md` §3.3 and §6): what
+//! each grant reads, read without a prompt, and when the Permissions stage of one revision is
+//! complete. Nothing here opens System Settings or raises a dialog: the window's access lanes hand
+//! each step to macOS and record it in [`access_record`], and the stage only reads that record.
 //!
-//! The readings are typed facts the doctor already gathers; nothing here opens
-//! System Settings or raises a dialog. The window's access lanes hand each step
-//! to macOS and record it in [`access_record`]; the stage only reads that record,
-//! so a row waiting on a person never makes it retry.
-//!
-//! A grant the person opted out of (§4: the `[privacy]` switches and a debugger
-//! access turned off, which the window publishes through
-//! [`aterm_types::macos_setup::opt_out`], and a Not now in this approval) is
-//! honored as the row's wanted state: it reads in place, or not needed when its
-//! value is unread, and never asks for a person. A debugger access turned off is
-//! said only of a debugger that reads off ([`OptOut::WhileOff`]).
+//! A grant the person opted out of (§4: a `[privacy]` switch, a debugger access turned off, or a
+//! Not now in this approval) is honored as the row's wanted state and never asks for a person.
 
 use super::{Row, WAITING};
 use aterm_types::macos_setup::opt_out::OptOut;
@@ -87,19 +79,15 @@ pub(super) struct Grants {
 /// (Permissions turned off and on again) asks again (§6).
 pub(super) const NOT_NOW: &str = "You chose Not now. Setting Permissions up again asks again.";
 
-/// The Debugger row's description once this approval's step is declined: Cancel
-/// in macOS's dialog, an answer on aterm's Settings ▸ Security, or this Mac's
-/// step already over from an earlier approval. aterm's own step asks once per
-/// Mac (the window's `privacy-debugger-asked` record), so a new approval does
-/// not ask again, and [`NOT_NOW`]'s promise would be false here.
+/// The Debugger row's description once its step is declined (Cancel in macOS's dialog, an answer
+/// on aterm's Settings ▸ Security, or an earlier approval's step): the step asks once per Mac
+/// (the window's `privacy-debugger-asked` record), so [`NOT_NOW`]'s promise would be false.
 pub(super) const DEBUGGER_ANSWERED: &str = "aterm asks for debugger access once per Mac, and this Mac has answered: \
      setting Permissions up again does not ask again.";
 
-/// Why the person opted each grant out, in [`Access::ALL`] order, as its row
-/// says it: what the window published (`published`, [`opt_out::get`]: the
-/// config's switches, and a debugger access turned off, which is said only of a
-/// grant that reads off, `reads_off`), or a Not now the access record holds for
-/// this approval (`records`; the debugger's in [`DEBUGGER_ANSWERED`]'s words).
+/// Why the person opted each grant out, in [`Access::ALL`] order, as its row says it: what the
+/// window published ([`opt_out::get`]; an [`OptOut::WhileOff`] only where `reads_off`), else a
+/// Not now in this approval's `records` (the debugger's in [`DEBUGGER_ANSWERED`]'s words).
 pub(super) fn opted_out(
     published: [Option<OptOut>; 5],
     records: &[(Access, AccessOutcome)],
@@ -177,10 +165,8 @@ pub(super) fn read(selection: Selection, records: &[(Access, AccessOutcome)]) ->
 }
 
 impl Grants {
-    /// Whether `access` reads off: a definite reading, not an unread or
-    /// unconfirmed one. Full Disk Access reads `Not confirmed` at most (a
-    /// denied probe is no proof the switch is off), and macOS does not tell an
-    /// app whether it may use the local network.
+    /// Whether `access` reads a definite off. Full Disk Access never does (a refused probe reads
+    /// `Not confirmed`), nor does Local Network, which macOS does not report to an app.
     pub(super) fn reads_off(&self, access: Access) -> bool {
         match access {
             Access::DeveloperTools => self.devtools == DevTools::Off,
@@ -359,11 +345,10 @@ fn honor_opt_out(seen: Observation, why: &'static str) -> Observation {
     }
 }
 
-/// The rows the Permissions stage reports for `revision`, complete per §6 once
-/// every grant is in place, not needed, waiting on Full Disk Access, unreadable
-/// here (no step can be taken on it), or handed, declined or triggered in this
-/// revision. A row that is none of these waits for
-/// the window's lane or a person ([`WAITING`]): the pass parks, never retries it.
+/// The Permissions stage's rows for the revision `records` belong to, complete per §6 once every
+/// grant is in place, not needed, waiting on Full Disk Access, unreadable here (all but Local
+/// Network), or has a step recorded. Any other row waits for the window's lane or a person
+/// ([`WAITING`]): the pass parks, never retries it.
 pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -> Vec<Row> {
     let selection = {
         let mut selection = Selection::none();
@@ -401,10 +386,8 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
             (Standing::Waiting, _) if access == Access::DeveloperTools => {
                 (true, "waits on Full Disk Access".to_owned())
             }
-            // Full Disk Access, Developer Tools or the debugger rule that this
-            // Mac does not let aterm read: the window takes no step on an unread
-            // grant, so waiting for one would park the run for good. It counts
-            // as complete and the row says it could not be read.
+            // The window takes no step on a grant this Mac does not let aterm read, so waiting
+            // on one would park the run for good.
             (Standing::Unknown, None) if access != Access::LocalNetwork => (
                 true,
                 format!(
@@ -667,13 +650,8 @@ mod tests {
         assert_eq!(opted_out(published, &records, [false; 5])[1], Some(switch));
     }
 
-    /// A DEBUGGER TURNED OFF IS SAID ONLY OF A DEBUGGER THAT READS OFF: the
-    /// window publishes it from the record at every launch, before any probe
-    /// (System State design §4), and the record says what an off reading means,
-    /// not what the rule reads now. A debugger aterm turned on reads On and in
-    /// place, with no opt-out words; one whose rule could not be read here (the
-    /// probe timed out, a build outside the app bundle) reads unknown and says
-    /// so; only an Off reading is in place as the person chose.
+    /// The window publishes a debugger opt-out at every launch, before any probe (§4), so it is
+    /// said only of an Off reading; an On or unread debugger keeps its own row.
     #[test]
     fn a_turned_off_debugger_is_said_only_of_an_off_reading() {
         let why = "You turned debugger access off, so aterm leaves it off.";
@@ -738,11 +716,7 @@ mod tests {
         );
     }
 
-    /// THE DEBUGGER'S DECLINED ROW SAYS WHAT IS TRUE OF IT: its step asks once
-    /// per Mac, so after a Cancel in macOS's dialog (or an earlier approval's
-    /// step) setting Permissions up again does not ask again, and the row never
-    /// promises that it does; the other rows' Not now still says a new approval
-    /// asks again.
+    /// The debugger's step asks once per Mac, so its declined row never promises to ask again.
     #[test]
     fn a_declined_debugger_step_never_promises_to_ask_again() {
         let records = [

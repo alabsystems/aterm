@@ -1,51 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LOOP WAITS ON THE LOG (Phase 6 step 6H-5; rulings U27, T36, T37).
+//! The loop waits on the session log.
 //!
-//! While a read has shown a turn running and the host's session log holds that turn open,
-//! the loop waits for the turn's end or a box with
-//! `await log close=turn,need,kind=agent since=<log_seq> ep=<log_ep>` ([`LOG_WAITS`]).
-//! The cursor and the open turn come from one `status` reply ([`LogHead::of_status`]): the
-//! log prints them under one hold of its lock, so a record after them is past the cursor
-//! and answers the wait. The loop sends this over the wire; aterm-agent links no
-//! `aterm-slog` (T36).
+//! While a read has shown a turn running and the host's session log holds that turn open, the
+//! loop waits for the turn's end or a box with
+//! `await log close=turn,need,kind=agent since=<log_seq> ep=<log_ep>` ([`LOG_WAITS`]), sent over
+//! the wire (aterm-agent links no `aterm-slog`). The cursor and the open turn come from one
+//! `status` reply ([`LogHead::of_status`]), printed under one hold of the log's lock, so any
+//! later record is past the cursor and answers the wait. A session's first busy wait, and the
+//! first after a reconnect, read that `status` themselves, so the first turn waits on the log too.
 //!
-//! The log only wakes the loop. The screen read after it decides every press, as it did
-//! before: a turn the log closed while the screen still shows it running (a measured
-//! build's transcript can end a turn before its last frame is drawn) is read as running. The
-//! next wait then asks `status` again and takes the screen's own wait, `await gone <busy
-//! row>`, for as long as the log holds no turn open.
+//! The log only wakes the loop: the screen read after it decides every press, and a turn the log
+//! closed while the screen still shows it running (a transcript can end a turn before its last
+//! frame is drawn) is read as running.
 //!
-//! The loop learns that a host keeps a log from the `status` replies it reads ([`Caps::log`]).
-//! Its first busy wait of a session, and the first after each reconnect ([`Caps`] start
-//! over), reads that `status` itself before any decision has, so the first turn waits on the
-//! log too. A host that keeps no log (its `status` has no `log_seq=`) answers that one
-//! `status` and is waited on the screen from then on, as before. So is a host that refuses
-//! the wait, as an older build answers the comma list with `ERR usage`: the first refusal
-//! latches the loop onto the screen's wait for the rest of the session ([`Caps::await_log`]).
-//!
-//! The head is taken only when it still owes the record the wait would wake for. A head
-//! that already names an open need (`need=`: a box drawn and recorded between the busy read
-//! and this `status`), or a screen reader whose word owes no record (`agent=` neither `busy`
-//! nor `idle`), would put the cursor past the very record the wait is for: the wait would
-//! sleep its whole step. The screen's `await gone` serves those, and answers at once when the
-//! busy row is gone.
-//!
-//! Only a wait that follows a read showing the busy row is the log's. A look that starts
-//! on the screen's `await gone` (after a press the box did not take, say) keeps that wait:
-//! it answers at once while no busy row is drawn, and the read after it decides again. A
-//! log wait there would sleep its whole step, since the box it would wake for was raised
-//! before its cursor.
+//! Every other wait is the screen's own `await gone <busy row>`. A log wait would sleep its whole
+//! step, its record already behind the cursor, from a head that names an open need or whose
+//! reader word owes no record (`agent=` neither `busy` nor `idle`), and after a look that started
+//! on `await gone` (a press the box did not take, say). A host whose `status` prints no
+//! `log_seq=` ([`Caps::log`] follows each `status` read), or that refuses the wait (an older
+//! build answers the comma list with `ERR usage`; [`Caps::await_log`] latches until a
+//! reconnect), is waited on the screen.
 
 use super::*;
 
-/// What the loop's log wait lists: a turn's close, a need raised (a box, a question, a
-/// wall, a stall, a run's failure, the session's close), or an `agent` record (the screen
-/// reader's word moving). The last is how a turn the screen ends wakes the loop as soon as
-/// the reader publishes it, at most a sampling period (250 ms) after the frame, where the
-/// log's screen close of the turn waits a settle (1 s) past that (6H-5's bench, DESIGN
-/// §7.5).
+/// What the loop's log wait lists: a turn's close, a need raised (a box, a question, a wall, a
+/// stall, a run's failure, the session's close), or an `agent` record (the screen reader's word
+/// moving). The `agent` record wakes the loop at most a sampling period (250 ms) after the frame
+/// that ends a turn, where the log's own close of it waits a further settle (1 s).
 pub(super) const LOG_WAITS: &str = "close=turn,need,kind=agent";
 
 /// How many words a `status` reply prints for the session log, from `log_seq=` on:
@@ -121,10 +104,10 @@ pub(super) enum LogWoke {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// ONE WAIT ON THE LOG for a running turn's end or a box, at most `step` (module docs).
-    /// It starts from `at`, the cursor the last wait left standing. With none, it reads
-    /// `status` and starts from the head that reply prints, when that head still owes the
-    /// wake ([`LogHead::owes_a_wake`]). `at` is left set only after a timeout.
+    /// One wait on the log for a running turn's end or a box, at most `step`. It starts from
+    /// `at`, the cursor the last wait left standing, or else from the head a fresh `status`
+    /// prints when that head still owes the wake ([`LogHead::owes_a_wake`]). `at` is left set
+    /// only after a timeout.
     ///
     /// # Errors
     /// [`Fail::Lost`] when the host did not serve the request; [`Fail::Hard`] from
@@ -134,8 +117,6 @@ impl<C: Ctl> Session<'_, C> {
         at: &mut Option<LogHead>,
         step: Duration,
     ) -> Result<LogWoke, Fail> {
-        // `Caps::log` unknown (no `status` read yet this session, or since a reconnect) reads
-        // the `status` below, which learns it ([`Self::note_status`]).
         if self.caps.log == Some(false) || self.caps.await_log == Some(false) {
             *at = None;
             return Ok(LogWoke::Screen);
@@ -193,9 +174,7 @@ mod tests {
                         agent_detail=- log_seq=812 log_ep=1760000000 run=r3 turn=t17 step=p204 need=- \
                         need_since_ms=- rollout=- seq=104 hash=0\n";
 
-    /// [`LogHead::of_status`] reads the cursor and the open turn from the log's own words.
-    /// NEGATIVE CONTROLS: a reply with no log reads none, a `turn=-` holds no turn open, and
-    /// a `turn=` printed by another field ahead of the log's is never taken for the log's.
+    /// [`LogHead::of_status`] reads the cursor and the open turn from the log's own words only.
     #[test]
     fn a_status_reply_names_the_logs_cursor_and_its_open_turn() {
         assert_eq!(
@@ -240,11 +219,9 @@ mod tests {
         );
     }
 
-    /// A head that already shows what the wait would wake for owes no wake: a need the log
-    /// holds open (a box recorded before the cursor), or a reader word that owes no record.
-    /// `idle` still owes one (the turn's close, a settle on).
-    /// NEGATIVE CONTROLS: the live head owes its wake; a `need=` printed ahead of the log's
-    /// words is not the log's.
+    /// A head that already shows what the wait would wake for (an open need, or a reader word
+    /// that owes no record) owes no wake; `idle` still owes one, and a `need=` ahead of the
+    /// log's words is not the log's.
     #[test]
     fn a_head_that_already_names_the_wake_owes_none() {
         let boxed = LIVE.replace("need=-", "need=approval:bash");

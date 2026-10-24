@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance tests binding `WakeRoom` (`aterm_models_harness::wake_room_model`) to the
-//! pace's reservation table: [`Pace::ask`] (a slot line, from either pool) and [`Pace::reserve`]
-//! (an `await wake` answer) reserve and refuse, and [`Pace::retire`] lapses a reservation whose
-//! tab was seen holding a slot. The model's three sessions are `a`, `b` and `c`, their holds aged
-//! `a < b < c`; each one's reservation and wait are projected from the table, and a holder's
-//! re-ask is checked to keep its reservation as it was taken and draw no line.
+//! Tier-1 conformance of `WakeRoom` (`aterm_models_harness::wake_room_model`) to the pace's
+//! reservation table: [`Pace::ask`] (a slot line, from either pool) and [`Pace::reserve`] (an
+//! `await wake` answer) reserve and refuse, and [`Pace::retire`] lapses a reservation whose tab
+//! was seen holding a slot. A holder's re-ask must keep its reservation as taken and draw no
+//! line.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 

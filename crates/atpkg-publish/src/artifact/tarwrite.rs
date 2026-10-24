@@ -5,7 +5,6 @@
 //! through the [`Compressor`] port.
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,34 +12,23 @@ use aterm_zstd::xxh64::Xxh64;
 
 use crate::error::{Error, Result};
 
-/// The zstd level every pack is compressed at.
-pub const LEVEL: i32 = 19;
+/// The aterm-zstd level every pack is compressed at: its highest, a price-based parse over
+/// a binary tree as `zstd -19`'s is.
+pub const LEVEL: u8 = aterm_zstd::encode::LEVEL_MAX;
 
-/// The program every pack is compressed by.
-pub const COMPRESSOR: &str = "zstd";
-
-/// [`COMPRESSOR`]'s path on `PATH`.
-/// # Errors
-/// What is missing, worded for the lane's log: no executable `zstd` on `PATH`.
-pub fn compressor_on_path() -> std::result::Result<PathBuf, String> {
-    compressor_in(std::env::var_os("PATH").as_deref())
-}
-
-/// [`compressor_on_path`] over the `PATH` value `path` (`None`: unset).
-/// # Errors
-/// As [`compressor_on_path`].
-pub fn compressor_in(path: Option<&OsStr>) -> std::result::Result<PathBuf, String> {
-    path.and_then(|path| {
-        std::env::split_paths(path)
-            .map(|d| d.join(COMPRESSOR))
-            .find(|p| atpkg::toolchain::is_executable_file(p))
-    })
-    .ok_or_else(|| {
-        format!(
-            "no `{COMPRESSOR}` on this builder's PATH (every pack is compressed by the zstd CLI)"
-        )
-    })
-}
+/// Every pack's window, as a power of two: the widest the client's decoder accepts
+/// (`aterm_zstd::frame::WINDOW_MAX`, which libzstd's default decoder accepts too), so a
+/// repeat anywhere in the last 128 MiB of a pack's tar stream is one match.
+///
+/// RFC 8878 §3.1.1.1.2 recommends that an encoder not need a window over 8 MB and leaves a
+/// decoder free to refuse one. A pack departs from that for its ratio (the trust pack 8%
+/// under `zstd -19`'s 2^23 frame), because every client that installs packs takes 2^27:
+/// atpkg's own decoder, and libzstd's default limit before it. A streamed frame declares
+/// its window before its length is known (§3.1.1.1.1.2: no Single_Segment_Flag without a
+/// Frame_Content_Size), so a decoder held to 8 MB refuses every pack whose tar outgrows one
+/// block, and the client's decoder holds up to 128 MiB of window while it decodes one
+/// (it grows the window only as far as the stream reaches).
+pub const WINDOW_LOG: u8 = aterm_zstd::encode::WINDOW_LOG_MAX;
 
 /// What [`write`](fn@write) produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,8 +78,8 @@ pub trait Compressor {
     ///
     /// # Errors
     ///
-    /// Why the stream could not be compressed (a compressor that did not start or
-    /// failed), else `tar`'s own error.
+    /// Why the stream could not be compressed (a compressor that failed, or an asset that
+    /// could not be written), else `tar`'s own error.
     fn compress(
         &self,
         asset: &std::fs::File,
@@ -99,26 +87,48 @@ pub trait Compressor {
     ) -> io::Result<()>;
 }
 
-/// The zstd CLI at `program`, run as [`COMPRESSOR`] is: the tar stream on its stdin, the
-/// asset as its stdout.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZstdCli {
-    /// A name looked up on `PATH` ([`COMPRESSOR`] by default), or a path.
-    pub program: OsString,
-}
+/// aterm-zstd's encoder at [`LEVEL`] with a [`WINDOW_LOG`] window, in this process: the
+/// compressor every shipped pack is written by. One frame with its content checksum; its
+/// bytes depend only on the stream (never on how the tar writer cuts its writes), so a
+/// tree packs to the same asset every time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Zstd;
 
-impl Default for ZstdCli {
-    fn default() -> Self {
-        Self {
-            program: COMPRESSOR.into(),
+impl Compressor for Zstd {
+    fn compress(
+        &self,
+        asset: &std::fs::File,
+        tar: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<()> {
+        /// The encoder, with `flush` a no-op: the tar writer's last flush would otherwise
+        /// end the pending block early, ahead of the frame's last block.
+        struct Unflushed<W: Write>(aterm_zstd::encode::Encoder<W>);
+        impl<W: Write> Write for Unflushed<W> {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
+        let options = aterm_zstd::encode::Options::new()
+            .level(LEVEL)
+            .window_log(WINDOW_LOG)
+            .checksum(aterm_zstd::frame::Checksum::Xxh64);
+        let mut encoder = Unflushed(aterm_zstd::encode::Encoder::new(
+            io::BufWriter::with_capacity(1 << 20, asset),
+            options,
+        ));
+        tar(&mut encoder)?;
+        // `finish` writes the last block and the checksum, and flushes the buffer.
+        encoder.0.finish().map(drop)
     }
 }
 
 /// Raw zstd frames, uncompressed and each with its content checksum, of at most
 /// `frame_max` stream bytes each: what aterm-zstd's raw-block writer
-/// (`aterm_zstd::frame::write_raw`) writes, which every client's decoder reads like the
-/// CLI's frames.
+/// (`aterm_zstd::frame::write_raw`) writes, which every client's decoder reads as it reads
+/// [`Zstd`]'s frames.
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawFrames {
@@ -186,18 +196,18 @@ impl Compressor for RawFrames {
 }
 
 /// Pack the tree at `root` into `asset` (replaced), after normalizing its modes,
-/// compressed by the zstd CLI on `PATH` ([`ZstdCli::default`]).
+/// compressed by aterm-zstd's encoder ([`Zstd`]).
 ///
 /// # Errors
 /// A refusal for a symlink or special file in the tree, or a tree with no file at all; a
 /// could-not-run for any I/O failure.
 pub fn write(root: &Path, asset: &Path) -> Result<Packed> {
-    write_with(root, asset, &ZstdCli::default())
+    write_with(root, asset, &Zstd)
 }
 
 /// [`write`](fn@write), compressing with `compressor`: a pack's
-/// [`super::tools::Tools::compressor`], a zstd CLI at another path, or a stand-in that shows
-/// how the pack refuses a compressor that fails or writes another stream.
+/// [`super::tools::Tools::compressor`], or a stand-in that shows how the pack refuses a
+/// compressor that fails or writes another stream.
 ///
 /// # Errors
 /// As [`write`](fn@write).
@@ -382,51 +392,6 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
-/// How much of the compressor's stderr a failure quotes; the rest is read and dropped.
-const STDERR_KEPT: u64 = 16 * 1024;
-
-/// Owns the compressor until its exit is reaped; dropped unreaped, it kills and reaps the
-/// child.
-struct CompressorChild {
-    child: aterm_uds::spawnfd::Child,
-    input: Option<io::BufWriter<std::process::ChildStdin>>,
-    reaped: bool,
-}
-
-impl CompressorChild {
-    const fn new(child: aterm_uds::spawnfd::Child) -> Self {
-        Self {
-            child,
-            input: None,
-            reaped: false,
-        }
-    }
-
-    fn close_input(&mut self) {
-        if let Some(input) = self.input.take() {
-            let (pipe, _buffered) = input.into_parts();
-            drop(pipe);
-        }
-    }
-
-    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        self.close_input();
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
-    }
-}
-
-impl Drop for CompressorChild {
-    fn drop(&mut self) {
-        if !self.reaped {
-            let _ = self.child.kill();
-            self.close_input();
-            let _ = self.child.wait();
-        }
-    }
-}
-
 /// Writes the archive through `compressor` into `asset`; returns the tar stream's length.
 fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::Result<u64> {
     let file = std::fs::File::create(asset)?;
@@ -444,65 +409,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::
     aterm_durable::durable(&file)?;
     decodes_back(asset, n, sum)?;
     Ok(n)
-}
-
-impl Compressor for ZstdCli {
-    fn compress(
-        &self,
-        asset: &std::fs::File,
-        tar: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>,
-    ) -> io::Result<()> {
-        use aterm_uds::spawnfd::Stdio;
-        let shown = self.program.to_string_lossy();
-        let child = aterm_uds::spawnfd::command(&self.program)
-            .args(["-q", &format!("-{LEVEL}"), "--single-thread", "-c"])
-            .stdin(Stdio::piped())
-            .stdout(asset.try_clone()?)
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("`{shown}` (the pack's compressor) did not start: {e}"),
-                )
-            })?;
-        let child = CompressorChild::new(child);
-        let (streamed, said, status) = std::thread::scope(move |scope| {
-            let mut child = child;
-            let stdin = child
-                .child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("the compressor's stdin was not piped"))?;
-            child.input = Some(io::BufWriter::new(stdin));
-            let mut stderr = child
-                .child
-                .stderr
-                .take()
-                .ok_or_else(|| io::Error::other("the compressor's stderr was not piped"))?;
-            let drain = std::thread::Builder::new()
-                .name("pack-zstd-stderr".to_string())
-                .spawn_scoped(scope, move || {
-                    let mut said = Vec::new();
-                    let _ = stderr.by_ref().take(STDERR_KEPT).read_to_end(&mut said);
-                    let _ = io::copy(&mut stderr, &mut io::sink());
-                    said
-                })?;
-            let streamed = tar(child.input.as_mut().expect("the input was installed"));
-            let status = child.wait()?;
-            let said = drain
-                .join()
-                .map_err(|_| io::Error::other("the compressor's stderr drain panicked"))?;
-            Ok::<_, io::Error>((streamed, said, status))
-        })?;
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "`{shown}` failed ({status}): {}",
-                String::from_utf8_lossy(&said).trim()
-            )));
-        }
-        streamed
-    }
 }
 
 /// Reads `asset` back through the decoder every client installs it with: one or more

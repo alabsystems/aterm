@@ -13,7 +13,7 @@ fn blank_above(rows: &[String], start: usize) -> Vec<String> {
 }
 
 fn exited_under(rows: &[String], row: usize) -> bool {
-    let notice = aterm_phase::anchor("exit.resume");
+    let notice = aterm_phase::anchor!("exit.resume");
     rows[row..].iter().any(|r| r.trim_end() == notice)
 }
 

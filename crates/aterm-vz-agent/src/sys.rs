@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The agent's libc calls, declared here against the libc it links (musl in the guest):
-//! aterm-libc has no musl cell, and the agent needs a dozen functions (the design's §6).
-//! `kill` is every Unix's; the rest are the Linux guest's: vsock's `socket`, `bind`,
-//! `listen`, `accept4`, `connect` and `shutdown`, `clock_settime`, `mount`, `umount2`,
-//! and the identity switch's `setgroups`, `setgid`, `setuid` and `chdir`.
+//! The agent's libc calls, declared against the libc it links (musl in the guest), because
+//! aterm-libc has no musl cell. `kill` is every Unix's; the rest are the Linux guest's:
+//! vsock's `socket`, `bind`, `listen`, `accept4`, `connect` and `shutdown`, `clock_settime`,
+//! `mount`, `umount2`, and the identity switch's `setgroups`, `setgid`, `setuid` and `chdir`.
 
 use std::ffi::c_int;
 use std::io;

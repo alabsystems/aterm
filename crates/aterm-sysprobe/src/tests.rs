@@ -138,8 +138,6 @@ fn memory_available_is_free_inactive_and_purgeable_pages() {
     );
 }
 
-/// A process's working directory and executable are read from the OS: this
-/// test's own are what the process says they are.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_processs_working_directory_and_executable_are_its_own() {
@@ -293,8 +291,6 @@ fn a_leaders_input_is_shared_only_by_members_on_that_very_device() {
     assert_eq!(crate::stdin_sharers(u32::MAX), None);
 }
 
-/// The machine's facts read on this host: its physical memory and the
-/// kernel's pressure level, each one `sysctl`.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_machines_memory_and_pressure_are_read_on_this_host() {
@@ -309,9 +305,6 @@ fn the_machines_memory_and_pressure_are_read_on_this_host() {
     );
 }
 
-/// The swap counter reads on this host and never runs backwards: two reads
-/// of the same `HOST_VM_INFO64` counter, the second at least the first and
-/// within what the machine could swap between them.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_swap_counter_reads_on_this_host_and_never_runs_backwards() {
@@ -1286,13 +1279,11 @@ fn a_gpu_client_sums_its_queues() {
     );
 }
 
-/// Live: the GPU's user clients on this Mac, held to `ioreg` read after
-/// ours. Every entry both list has the same creator. A client's time can
-/// fall between two reads (a released queue leaves `AppUsage`, which GPU
-/// tests running beside this one do all the time), so the time is held to
-/// `ioreg`'s on WindowServer's busiest client only, whose queues live as
-/// long as the session: ours is at most `ioreg`'s and more than half of it
-/// (the same field in the same unit, not mach ticks or a timestamp).
+/// Live: the GPU's user clients on this Mac, held to `ioreg` read after ours: every entry both
+/// list has the same creator. A client's time can fall between reads (a released queue leaves
+/// `AppUsage`), so time is held only on WindowServer's busiest client, whose queues live as long
+/// as the session: ours is at most `ioreg`'s and at least half of it, the same field in the same
+/// unit.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn the_gpu_clients_read_as_ioreg_lists_them() {
@@ -1804,9 +1795,8 @@ fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
     assert_eq!(machine::rlimit_ceiling(u64::MAX, u64::MAX), None);
 }
 
-/// Live: the process table's ceilings on this host. The machine's is known
-/// and positive; one user's, where known, is no larger (macOS clamps
-/// `kern.maxprocperuid` to `kern.maxproc`).
+/// Live: the machine's process ceiling is known and positive; on macOS one user's is no larger
+/// (macOS clamps `kern.maxprocperuid` to `kern.maxproc`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_process_tables_ceilings_read_on_this_host() {

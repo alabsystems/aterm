@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`aterm_zstd::encode`] held to the crate's decoder: every frame it writes, at every
-//! level, window, checksum choice and way of feeding it, decodes to its input, and the
-//! frames together use every part of the format a compressed frame can carry.
+//! [`aterm_zstd::encode`] held to the crate's decoder: its frames across levels, windows,
+//! checksum choices and ways of feeding it decode to their input, and together use every
+//! part of the format a compressed frame can carry.
 
 use std::io::{self, Read, Write};
 
@@ -345,10 +345,9 @@ fn a_declared_content_size_is_held() {
     assert!(decode(&zst).unwrap() == big);
 }
 
-/// The negative control on the round trip: our frames, damaged, are refused. A wrong
-/// checksum is named as one; a frame cut short is an early end; a flipped bit anywhere is
-/// an error or, where it changes nothing the frame says, the same input — never other
-/// bytes passed off as the content.
+/// The negative control: our frames, damaged, are refused. A wrong checksum is named as
+/// one, a frame cut short is an early end, and a flipped bit decodes to an error or to the
+/// input itself, never to other bytes.
 #[test]
 fn a_damaged_frame_of_ours_is_refused() {
     let input = support::mixed(400_000, 31);

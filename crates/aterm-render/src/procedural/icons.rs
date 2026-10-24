@@ -70,15 +70,15 @@ struct Shape {
     /// the capitals' where the row up to the ceiling allows, whatever the cell's width. Like
     /// [`Self::flat`] it keeps none of the pixel and a half [`Self::half`] leaves under the
     /// ceiling: its stem's round end stops at its half height. Its stroke is held to its share
-    /// of this, not of `half`: in a narrow cell (Iosevka's half-em) `half`'s share was under
-    /// both weights' stems, and a bold `⤓` drew the regular one.
+    /// of this, not of `half`, whose share in a narrow cell (Iosevka's half-em) is under both
+    /// weights' stems and would draw a bold `⤓` at the regular stem.
     tall: f32,
     /// The half height `⏸`'s and `!`'s bars span: the capitals' where the row up to the ceiling
     /// allows, held to the room as [`Self::half`] is. `half` leaves a pixel and a half under the
-    /// ceiling, which the badges (their rings, the warning triangle, `↻`'s head) reach into past
-    /// their half height; a bar cut on whole rows ends at its half height, so where the tallest
-    /// letter stands that close over the capitals (on Menlo from 8 to 10 px `⏸` would be two to
-    /// four rows) the bars keep the share of the capitals they have on a roomier face.
+    /// ceiling for the badges (their rings, the warning triangle, `↻`'s head), which reach past
+    /// their half height; a bar cut on whole rows ends at its half height, so it drops that margin
+    /// and keeps its share of the capitals where the tallest letter stands close over them (held
+    /// to `half`, `⏸` on Menlo from 8 to 10 px would be two to four rows).
     flat: f32,
 }
 
@@ -653,7 +653,10 @@ mod tests {
         (x0, x1, y0, y1)
     }
 
-    /// An icon beside ink keeps to its own cell (ruling 257): no ink in its top row and, for a band's badge, none in its left or right column, at either stroke/cell parity. Cells under 8 px wide are not held to the edge columns: there the faces' own letters ink theirs too (SF Mono and Menlo at 8 to 10 px, in 5 and 6 px cells, set `mm` and `MM` touching across the cell edge), and the band lays its badge between blanks, where it spills.
+    /// An icon beside ink keeps to its own cell: no ink in its top row and, for a band's badge,
+    /// none in its edge columns, at either stroke/cell parity. Cells under 8 px wide are left out:
+    /// there the faces' own letters ink their edge columns too, and the band lays its badge
+    /// between blanks, where it spills.
     #[test]
     fn every_icon_draws_antialiased_ink_inside_its_cell() {
         for (cw, ch, m) in [
@@ -731,7 +734,7 @@ mod tests {
         }
     }
 
-    /// An icon between blank cells is drawn at the capitals' height (ruling 258) on a three-cell raster: a clear column at both ends, no ink above the tallest letter or below the baseline's row, the badges spilling into both blank cells, and centred on its own cell.
+    /// An icon between blank cells is drawn at the capitals' height on a three-cell raster: a clear column at both ends, no ink above the tallest letter or below the baseline's row, the badges spilling into both blank cells, and centred on its own cell.
     #[test]
     fn a_spilled_icon_is_as_tall_as_the_capitals_and_stays_in_its_three_cells() {
         for (cw, ch, m) in FACES {
@@ -830,7 +833,7 @@ mod tests {
         }
     }
 
-    /// Down a badge's centre column the `i` and the `!` are two clean cuts (fully clear rows) with a solid row between (ruling 253), the stem the longer cut and at least five rows, and the badge closes under the mark.
+    /// Down a badge's centre column the `i` and the `!` are two clean cuts (fully clear rows) with a solid row between, the stem the longer cut and at least five rows, and the badge closes under the mark.
     #[test]
     fn a_badges_dot_and_stem_are_cut_apart_on_whole_rows() {
         for (cw, ch, m) in FACES {
@@ -876,7 +879,10 @@ mod tests {
         }
     }
 
-    /// THE GLASS'S RING FAMILY IS ONE SET: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂` and `◆` drawn in their box, share one ink box on every face, inside their own cell on a raster of three cells as on one of their own, no taller than the face's own `●` ([`IconMetrics::disc`]) where it is under the capitals; `○`, `◌` and `⌂` are hollow at their centre and `●`, `⊘`, `◉`, `◈` and `◆` are not; `◌` is drawn on `○`'s line with gaps; `◐` is `●` left of its centre and `○` right of it; `◉` is `○` with a dot a clear gap inside it, and `◈` (where its box has the room) a diamond with one; `⌂`'s roof leaves the box's top corners clear and its walls stand on the box's floor; `◆` leaves them all clear.
+    /// The glass's ring family is one set: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂` and
+    /// `◆` drawn in their box, share one ink box on every face, inside their own cell on either
+    /// raster, no taller than the face's own `●` ([`IconMetrics::disc`]) where it is under the
+    /// capitals. Each mark's own shape (hollow, struck, dotted, halved, roofed) is asserted.
     #[test]
     fn the_ring_family_shares_one_outline() {
         let shorter = FACES.map(|(cw, ch, m)| {
@@ -1003,7 +1009,8 @@ mod tests {
         }
     }
 
-    /// `⤓` (Land) is as tall as the capitals in a cell of its own as well as between blanks, standing on the baseline's row, and narrows to its cell: an arrow is narrower than it is tall, so it keeps the height the font's glyph has beside a clock's digits (`⤓18:00`).
+    /// `⤓` (Land) is as tall as the capitals and stands on the baseline's row, in a cell of its own
+    /// as between blanks, as the font's own glyph does beside a clock's digits (`⤓18:00`).
     #[test]
     fn the_land_arrow_keeps_the_capitals_height_in_its_own_cell() {
         for (cw, ch, m) in FACES.into_iter().chain([(12, 24, M)]) {
@@ -1037,7 +1044,10 @@ mod tests {
         [24.0, 60.0, 46.0, 35.0, 6.0, 21.0, 4.796, 5.953],
     ];
 
-    /// `⤓` in a cell of its own is drawn at the face's stem, whole pixels, in a cell narrower than its capitals are tall: a bold `⤓` takes the bold stem and draws heavier, as the face's bold letters beside it do. Every other icon keeps its stroke held to its share of the cell's half width (the ring family's, of its radius), which here is under both stems, so each draws one raster at either weight: `✓` would draw 2 px against 3 at 12x30 if its stroke took `⤓`'s height.
+    /// `⤓` alone in a cell narrower than its capitals are tall takes the face's stem in whole
+    /// pixels, so a bold `⤓` draws heavier, as the face's bold letters beside it do. Every other
+    /// icon's stroke is held to its share of the cell's half width (the ring family's, of its
+    /// radius), which here is under both stems, so each draws one raster at either weight.
     #[test]
     fn a_bold_land_arrow_takes_the_bold_stem_in_a_narrow_cell() {
         for [cw, ch, baseline, cap, head, disc, regular, bold] in IOSEVKA_WINDOWS {
@@ -1161,7 +1171,7 @@ mod tests {
 
     /// The faces from 8 to 10 px (1x, regular) that [`SMALL_FACES`] leaves out, measured as it
     /// is (`Renderer::icon_metrics`): `[cell w, cell h, baseline, cap, stem, head, disc]`. They
-    /// stand apart because that list's control counts on every row's uncut `↻` crossing the
+    /// stand apart because that list's control counts on every face's uncut `↻` crossing the
     /// tallest letter.
     const SMALLEST_FACES: [(&str, [f32; 7]); 5] = [
         ("SF Mono 8", [5.0, 9.0, 8.0, 6.0, 0.663, 1.0, 6.0]),

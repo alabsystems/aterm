@@ -319,13 +319,17 @@ VERBS:
     (exit 1). With no terminal on stdin it prints the command, runs nothing, and exits 0.
     Refuses a row with `email` (use `accounts renew`).
   - `accounts browser <label> [--cli <id>]`
-    Opens the row's own browser profile (the one its headless sign-ins use, under
-    `<state>/accounts/browsers/`) in a window at the vendor's sign-in page, for a person to
-    sign in to the vendor's site once as the row's account. Its password manager is off. It
-    waits until you press Enter (or Ctrl-C) here or quit that browser, then closes it gently
-    so its cookies are saved. Then it opens the profile headlessly once more: it removes
-    Google's and the other identity providers' cookies (their keychain there is a mock one,
-    so any program of yours could read them), and asks whether the vendor keeps its session
+    Opens the row's own browser profile (the one its headless sign-ins use: Claude Code's
+    under `<state>/accounts/browsers/`, another CLI's under `<state>/accounts/vendor-browsers/`
+    unless Claude Code's own profile of that exact email is there) in a window at the vendor's
+    sign-in page, for a person to sign in to the vendor's site once as the row's account. Its
+    password manager is off. It waits until you press Enter (or Ctrl-C) here or quit that
+    browser, and ends so too when its terminal closes or it is told to stop, then closes the
+    window gently so its cookies are saved. Then it opens the profile headlessly once more: it
+    removes Google's and the other identity providers' cookies (Microsoft's among them, so an
+    Outlook webmail signs in again; their keychain there is a mock one, so any program of
+    yours could read them), and the next headless sign-in on the profile does so first where
+    a window ended without it; it asks whether the vendor keeps its session
     there (kimi.ai's and kimi.com's; for the others the next renewal checks it), exiting 1
     where it does not. It records only the page's host, how the window ended and that answer.
     Renewals then approve the CLI's page in that profile headlessly. Refuses without a
@@ -379,7 +383,10 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     `xai` or `grok`, `kimi`; a cell of `1`, or a vendor word: `global`/`mainland-cn` for kimi,
     whose bare `1` is held, `browser`/`device` for codex and grok), its rows labelled
     `<cli>-<machine label>`. A note naming a vendor (`kimi banned`) drops that vendor's
-    membership alone. It writes the roster and the CLI's store, never `~/.secrets`. With no
+    membership alone among these pools; Claude Code's own `accounts sync` drops the row on any
+    disqualifying note, a vendor's included, so `kimi banned` removes that account's Claude
+    Code row on every machine that syncs from the sheet too. It writes the roster and the
+    CLI's store, never `~/.secrets`. With no
     source named it reads nothing unless the roster exists: a vault file alone opts no
     machine in, and `aterm init`, `aterm secrets` and a window sync each CLI whose roster this
     machine keeps.
@@ -395,7 +402,8 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     keeps the host, flow and outcome, never the URL or code.
   - `accounts login <label> --cli <id>` runs that sign-in on this terminal for the person
     to approve (`proved_by = \"unchecked\"`); over SSH it opens no browser on this machine and
-    the CLI prints its URL for you to open.
+    the CLI prints its URL for you to open, a browser flow whose page calls back to this
+    machine (Codex's, Grok's `browser`) running as the CLI's device flow there.
   - `accounts browser <label> --cli <id>` is that window for the pool's row, at kimi.ai or
     kimi.com by the row's region, accounts.x.ai, or auth.openai.com. A renewal whose page
     waits on a person for 90 s stops `needs-sign-in` and names it. A Kimi row's email is never
@@ -4744,7 +4752,7 @@ pub trait AccountsHost {
         None
     }
 
-    /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here, quits the browser, or [`super::login_drive::HANG`] runs out ([`super::browser_window::run_window`]).
+    /// `accounts browser` ([`run_accounts_browser`]): `profile` opened in `browser` at `url` in a window, waited for until the person presses Enter or Ctrl-C here (or another of [`WINDOW_END_SIGNALS`] arrives), quits the browser, or [`super::login_drive::HANG`] runs out ([`super::browser_window::run_window`]).
     fn open_window(
         &self,
         browser: &Path,
@@ -4764,6 +4772,11 @@ pub trait AccountsHost {
     ) -> Result<super::browser_window::Tidied, String> {
         let _ = (browser, profile, session);
         Err("this host opens no browser".to_string())
+    }
+
+    /// `accounts browser`'s hold on the signals that would end this process while its window is open or its profile is being tidied ([`WindowEnds`]), from before the window until its record is written; this host holds none.
+    fn hold_window_ends(&self) -> WindowEnds {
+        WindowEnds::none()
     }
 }
 
@@ -4937,6 +4950,10 @@ impl AccountsHost for LiveAccounts {
             });
         super::browser_window::tidy_profile(&headless, profile, session, TIDY_WITHIN)
     }
+
+    fn hold_window_ends(&self) -> WindowEnds {
+        WindowEnds::hold()
+    }
 }
 
 /// How long `accounts browser`'s headless pass after its window ([`AccountsHost::tidy_profile`]) may take.
@@ -4945,24 +4962,126 @@ const TIDY_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `accounts browser`'s window has to exit after its hangup before its process group is killed.
 const WINDOW_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Set by [`window_until_enter`]'s own SIGINT handler.
+/// Set by [`WindowEnds`]'s handler; cleared by the outermost hold alone ([`WINDOW_HOLDS`]), so
+/// an end noted before the window opens still ends it.
 #[cfg(unix)]
 static WINDOW_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// How many [`WindowEnds::hold`]s are alive.
+#[cfg(unix)]
+static WINDOW_HOLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(unix)]
 extern "C" fn note_window_interrupt(_: libc::c_int) {
     WINDOW_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Runs `wait` with the end it polls: [`super::browser_window::WindowEnd::Done`] once a line (Enter) or the end of stdin is read, [`super::browser_window::WindowEnd::Interrupted`] once Ctrl-C is pressed. Ctrl-C reaches this process alone (the window is in its own process group), through a handler of its own, and the action it replaced is put back afterwards, as [`ignoring_interrupts`] puts back its own.
+/// The signals that end `accounts browser`'s window as Ctrl-C does ([`WindowEnds`]): Ctrl-C
+/// (SIGINT), its terminal closing (SIGHUP, which a closed tab sends its foreground job), a stop
+/// (SIGTERM) and Ctrl-\ (SIGQUIT). The window is in its own process group, so none reaches it.
+#[cfg(unix)]
+pub const WINDOW_END_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGINT, libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT];
+
+/// A hold on [`WINDOW_END_SIGNALS`] ([`AccountsHost::hold_window_ends`]): while it lives, each of
+/// them only notes that the window is to end ([`super::browser_window::WindowEnd::Interrupted`])
+/// instead of ending this process, so the window is hung up, its profile tidied and the window
+/// recorded however it was ended, and a second one during the tidy changes nothing; the actions
+/// it replaced are put back when it drops, as [`ignoring_interrupts`] puts back its own.
+pub struct WindowEnds {
+    #[cfg(unix)]
+    held: bool,
+    #[cfg(unix)]
+    was: Vec<(libc::c_int, libc::sigaction)>,
+    #[cfg(test)]
+    on_drop: Option<Box<dyn FnOnce()>>,
+}
+
+impl WindowEnds {
+    /// No hold.
+    #[must_use]
+    pub fn none() -> WindowEnds {
+        WindowEnds {
+            #[cfg(unix)]
+            held: false,
+            #[cfg(unix)]
+            was: Vec::new(),
+            #[cfg(test)]
+            on_drop: None,
+        }
+    }
+
+    /// No hold, `on_drop` run when it drops: a test host's.
+    #[cfg(test)]
+    fn noting(on_drop: impl FnOnce() + 'static) -> WindowEnds {
+        let mut ends = WindowEnds::none();
+        ends.on_drop = Some(Box::new(on_drop));
+        ends
+    }
+
+    /// Holds [`WINDOW_END_SIGNALS`]: each one's handler only notes the window's end. The
+    /// outermost hold starts with no end noted; one inside it (the window's own, inside
+    /// `accounts browser`'s) keeps an end noted before it.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn hold() -> WindowEnds {
+        use std::sync::atomic::Ordering;
+        let mut held = WindowEnds::none();
+        held.held = true;
+        if WINDOW_HOLDS.fetch_add(1, Ordering::SeqCst) == 0 {
+            WINDOW_INTERRUPTED.store(false, Ordering::SeqCst);
+        }
+        // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no flags).
+        let mut note: libc::sigaction = unsafe { std::mem::zeroed() };
+        note.sa_sigaction =
+            note_window_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        for signal in WINDOW_END_SIGNALS {
+            // SAFETY: as above.
+            let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid disposition for `signal` whose handler only stores to an atomic; `was` receives the one it replaces.
+            if unsafe { libc::sigaction(signal, &note, &mut was) } == 0 {
+                held.was.push((signal, was));
+            }
+        }
+        held
+    }
+
+    /// Non-Unix: no hold.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn hold() -> WindowEnds {
+        WindowEnds::none()
+    }
+}
+
+impl Drop for WindowEnds {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            for (signal, was) in self.was.drain(..).rev() {
+                // SAFETY: puts back the whole action this hold replaced.
+                unsafe { libc::sigaction(signal, &was, std::ptr::null_mut()) };
+            }
+            if self.held {
+                WINDOW_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[cfg(test)]
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
+}
+
+/// Runs `wait` with the end it polls: [`super::browser_window::WindowEnd::Done`] once a line (Enter) or the end of stdin is read, [`super::browser_window::WindowEnd::Interrupted`] once Ctrl-C is pressed or another of [`WINDOW_END_SIGNALS`] arrives. They reach this process alone (the window is in its own process group), through a hold of its own ([`WindowEnds`]), which `accounts browser` keeps past the window through its tidy and its record.
 #[cfg(unix)]
 fn window_until_enter<T>(
     wait: impl FnOnce(&dyn Fn() -> Option<super::browser_window::WindowEnd>) -> T,
 ) -> T {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    WINDOW_INTERRUPTED.store(false, Ordering::SeqCst);
+    let _held = WindowEnds::hold();
     let entered = Arc::new(AtomicBool::new(false));
     let reader = Arc::clone(&entered);
     std::thread::spawn(move || {
@@ -4970,23 +5089,6 @@ fn window_until_enter<T>(
         let _ = io::stdin().read_line(&mut line);
         reader.store(true, Ordering::SeqCst);
     });
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no flags).
-    let mut note: libc::sigaction = unsafe { std::mem::zeroed() };
-    note.sa_sigaction = note_window_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: as above.
-    let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid disposition for SIGINT whose handler only stores to an atomic; `was` receives the one it replaces.
-    let set = unsafe { libc::sigaction(libc::SIGINT, &note, &mut was) } == 0;
-    struct Restore(Option<libc::sigaction>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(was) = &self.0 {
-                // SAFETY: puts back the whole action this scope replaced.
-                unsafe { libc::sigaction(libc::SIGINT, was, std::ptr::null_mut()) };
-            }
-        }
-    }
-    let _restore = Restore(set.then_some(was));
     let ended = || {
         if WINDOW_INTERRUPTED.load(Ordering::SeqCst) {
             Some(super::browser_window::WindowEnd::Interrupted)
@@ -7752,7 +7854,7 @@ fn run_accounts_login_for(
     }
 }
 
-/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
+/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). From before the window until its record is written, the signals that would end this process only end the window ([`AccountsHost::hold_window_ends`]), and the profile carries [`super::browser_window::UNTIDIED_MARK`] until that pass has run, so a window whose pass never ran is made up by the next headless launch on the profile ([`super::browser_window::make_up_tidy`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
 fn run_accounts_browser(
     cli: Cli,
     env: &Env,
@@ -7882,6 +7984,16 @@ fn run_accounts_browser(
             &format!("{label}: its browser's password manager could not be turned off ({e})"),
         );
     }
+    let _ends = host.hold_window_ends();
+    if let Err(e) = super::browser_window::mark_untidied(&profile) {
+        return refuse(
+            err,
+            &format!(
+                "{label}: its browser profile could not be marked for the pass after the window \
+                 ({e})"
+            ),
+        );
+    }
     let site = super::login_drive::https_host(page).unwrap_or_else(|| "no-page".to_string());
     let _ = writeln!(
         out,
@@ -7898,7 +8010,8 @@ fn run_accounts_browser(
     let _ = writeln!(
         out,
         "once the window closes, aterm removes the cookies of Google and the other identity \
-         providers from that profile, so only {site}'s own sign-in stays in it"
+         providers (Microsoft's among them, an Outlook webmail's session too) from that \
+         profile; {site}'s sign-in, and any other site's it holds, stay in it"
     );
     let _ = writeln!(
         out,
@@ -7923,6 +8036,10 @@ fn run_accounts_browser(
         .zip(origin.as_deref())
         .map(|(key, origin)| (origin, key));
     let tidied = host.tidy_profile(&browser, &profile, session);
+    if tidied.is_ok() {
+        // A mark left in place only makes the next launch's pass run again.
+        let _ = super::browser_window::clear_untidied(&profile);
+    }
     let now = host.now();
     let state = match &tidied {
         Ok(t) => match t.session {

@@ -152,6 +152,17 @@ pub fn landing_stop_ink(i: usize) -> u32 {
         [i.min(SPECTRUM_STOPS - 1)]
 }
 
+#[inline]
+#[must_use]
+fn landing_spark_core_ink(i: usize) -> u32 {
+    static SPARK_CORE_LUT: OnceLock<[u32; SPECTRUM_STOPS]> = OnceLock::new();
+    SPARK_CORE_LUT.get_or_init(|| {
+        std::array::from_fn(|i| {
+            lerp_rgb(0x00FF_FFFF, hot_edge_ink(spectrum_stop(i)), SPARK_CORE_TINT)
+        })
+    })[i.min(SPECTRUM_STOPS - 1)]
+}
+
 /// Stations per train layer.
 pub const STATIONS_MAX: usize = 96;
 
@@ -1188,25 +1199,24 @@ pub struct Meteors {
     /// Whether tests lay each train layer cut square without end easing.
     #[cfg(test)]
     pub(crate) ends_square: bool,
-    /// Whether tests lay a dark train's fades as dims (looks6 N6's negative control).
+    /// Whether tests lay a dark train's fades as dims (the smudge's negative
+    /// control).
     #[cfg(test)]
     pub(crate) dims_dark_trains: bool,
-    /// Whether tests lay a train's warm stops as its others, as they were:
-    /// at their level on dark and their width on paper (looks6 round 3's
-    /// negative controls).
+    /// Whether tests lay a train's warm stops like its others: at their level
+    /// on dark and their width on paper (the warm stops' negative control).
     #[cfg(test)]
     pub(crate) warm_stops_plain: bool,
     /// Whether tests lay a train across a lettered row's letters (the
     /// strike-through's negative control).
     #[cfg(test)]
     pub(crate) trains_over_text: bool,
-    /// Whether tests lay a dark train into the letter guard's reach below
-    /// a lettered row's letters, as it was (the brown segment's negative
-    /// control).
+    /// Whether tests lay a dark train into the letter guard's reach below a
+    /// lettered row's letters (the brown stub's negative control).
     #[cfg(test)]
     pub(crate) trains_in_guard: bool,
-    /// Whether tests keep a dark head's petals after it lands (the stray
-    /// specks' negative control).
+    /// Whether tests keep a dark head's petals after it lands (the head fold's
+    /// negative control).
     #[cfg(test)]
     pub(crate) petals_stay: bool,
 }
@@ -1745,8 +1755,7 @@ impl Meteors {
 
 /// The least share of its light a dark train's colour keeps while it fades
 /// along the train: below it the train narrows at that share instead of
-/// dimming further, since a dimmed warm stop reads brown on a dark page
-/// (looks6 N6).
+/// dimming further, since a dimmed warm stop reads brown on a dark page.
 const DARK_TRAIN_CLEAN_SHARE: f32 = 1.0;
 
 /// A dark train's fade `k` of its light at half-width `half`, kept clean:
@@ -1786,11 +1795,9 @@ fn fit_room(k: f32, half: f32, room: f32) -> (f32, f32) {
     }
 }
 
-/// How much brighter a dark train lays a warm stop than its others: a red,
-/// an orange or a yellow added at the train's level reads maroon, brown and
-/// olive on a dark page, where a green, a blue or a violet at that level
-/// still reads as its hue (looks6 round 3: the `enter-bottom` Return's warm
-/// segment, `4b4721`, `5a4b2c`, `7a624c` and `693e3b` under `quick`).
+/// How much brighter a dark train lays a warm stop than its others: at the
+/// train's level a red, an orange or a yellow reads maroon, brown and olive
+/// on a dark page, where a green, a blue or a violet still reads as its hue.
 const DARK_WARM_TRAIN_GAIN: f32 = 1.8;
 
 /// [`DARK_WARM_TRAIN_GAIN`]'s share for `stop`: whole from red through
@@ -1807,8 +1814,7 @@ fn dark_warm_gain(stop: u32) -> f32 {
 
 /// The share of its width a paper train keeps where its ink is a darkened
 /// yellow: held to the paper's contrast a yellow stop's ink reads mustard
-/// and olive (looks6 round 3: `7d8616`, `9a7e16` and `b57b20` in the
-/// `enter-bottom` Return's stick), so the band thins out through it.
+/// and olive, so the band thins out through it.
 const PAPER_GOLD_WIDTH: f32 = 0.4;
 
 /// [`PAPER_GOLD_WIDTH`]'s share for a paper train's `ink`: whole from a
@@ -1897,10 +1903,9 @@ struct Flight {
 }
 
 /// The frame's lettered rows a train passes behind ([`KeepOut::behind_text`]),
-/// whether it does (tests lay it over them as the negative control), and
-/// how much of each row: its letters' bodies ([`TRAIN_TEXT_BAND`]), or on a
-/// dark page the train's whole reach of the letter guard
-/// ([`DARK_TRAIN_TEXT_BAND`], [`DARK_TRAIN_TEXT_PAD_PX`]).
+/// whether it does (`on`), and how much of each row: its letters' bodies
+/// ([`TRAIN_TEXT_BAND`]), or on a dark page the train's whole reach of the
+/// letter guard ([`DARK_TRAIN_TEXT_BAND`], [`DARK_TRAIN_TEXT_PAD_PX`]).
 #[derive(Clone, Copy)]
 struct Behind<'a> {
     keep: &'a KeepOut,
@@ -1945,16 +1950,18 @@ impl<'a> Behind<'a> {
         }
         let limit_sq = limit * limit;
         let mut min_sq = limit_sq;
+        let pad = self.pad;
+        let (band0, band1) = self.band;
         for &(x0, x1, y0, y1) in self.keep.rows() {
-            let (bx0, bx1) = (x0 as f32 - self.pad, x1 as f32 + self.pad);
+            let (bx0, bx1) = (x0 as f32 - pad, x1 as f32 + pad);
             let dx = (bx0 - x).max(x - bx1).max(0.0);
             let dx_sq = dx * dx;
             if dx_sq >= min_sq {
                 continue;
             }
             let ch = (y1 - y0) as f32;
-            let by0 = y0 as f32 + self.band.0 * ch - self.pad;
-            let by1 = y0 as f32 + self.band.1 * ch + self.pad;
+            let by0 = y0 as f32 + band0 * ch - pad;
+            let by1 = y0 as f32 + band1 * ch + pad;
             let dy = (by0 - y).max(y - by1).max(0.0);
             let d_sq = dx_sq + dy * dy;
             if d_sq <= 0.0 {
@@ -1983,20 +1990,22 @@ impl<'a> Behind<'a> {
     /// The rows `z0..z1` of a light over columns `x0..x1` and rows
     /// `y0..y1` that a lettered row's band touches, its eased edges and all.
     fn zone(self, (x0, x1): (i32, i32), (y0, y1): (i32, i32)) -> Option<(i32, i32)> {
-        if !self.on {
+        if !self.on || self.keep.rows().is_empty() {
             return None;
         }
         let feather = TRAIN_TEXT_FEATHER_PX;
         let reach = feather.ceil() as i32;
         let pad = self.pad.ceil() as i32;
+        let pad_reach = pad + reach;
+        let (band0, band1) = self.band;
         let mut zone: Option<(i32, i32)> = None;
         for &(rx0, rx1, ry0, ry1) in self.keep.rows() {
             if x1 <= rx0 - pad || x0 >= rx1 + pad {
                 continue;
             }
             let ch = (ry1 - ry0) as f32;
-            let b0 = (ry0 as f32 + self.band.0 * ch).floor() as i32 - pad - reach;
-            let b1 = (ry0 as f32 + self.band.1 * ch).ceil() as i32 + pad + reach;
+            let b0 = (ry0 as f32 + band0 * ch).floor() as i32 - pad_reach;
+            let b1 = (ry0 as f32 + band1 * ch).ceil() as i32 + pad_reach;
             let (a, b) = (b0.max(y0), b1.min(y1));
             if a < b {
                 zone = Some(zone.map_or((a, b), |(p, q)| (p.min(a), q.max(b))));
@@ -2005,9 +2014,9 @@ impl<'a> Behind<'a> {
         zone
     }
 
-    /// Takes the quads from `from` on out of the lettered rows' bands: a
-    /// station centred clear of a band still laid its width into it. Each
-    /// quad's rows in a band's reach are laid a pixel a row at the light
+    /// Cuts the quads from `from` on out of the lettered rows' bands, since a
+    /// station centred clear of a band can still reach into it: each quad's
+    /// rows in a band's reach are laid a pixel row at a time at the light
     /// [`Self::at`] leaves them (none inside, eased at the edges).
     fn cut_quads(self, quads: &mut Vec<GlowQuad>, from: usize) {
         if !self.on || self.keep.rows().is_empty() {
@@ -2124,23 +2133,19 @@ impl<'a> Behind<'a> {
 }
 
 /// The share of a lettered row's height a train passes behind: its
-/// letters' bodies, from just under the row's top to the baseline. Laid
-/// across them, a Return's crisp thread cut through `brown fox` of the
-/// printed line at its x-height and read as a strike-through; it shows
-/// again below the baseline.
+/// letters' bodies, from just under the row's top to the baseline, so a
+/// crisp thread never reads as a strike-through. Below the baseline it
+/// shows again.
 const TRAIN_TEXT_BAND: (f32, f32) = (0.06, 0.80);
 
 /// How many px a train eases out over at a lettered row's band.
 const TRAIN_TEXT_FEATHER_PX: f32 = 3.0;
 
 /// The share of a lettered row's height a dark train passes behind: all of
-/// it. Below the letters' bodies it still lay inside the letter guard's
-/// judge of the row's cells, which cut it there and eased it back over its
-/// feather into the next row, and a red, an orange or a yellow cut to a
-/// share of its light reads maroon, brown and olive on a dark page (looks6
-/// round 3: the `enter-bottom` Return's warm segment under `quick`,
-/// `4b4721`, `5a4b2c`, `7a624c` and `693e3b`, every one of them the guard's
-/// cut). A dark train is laid clean or not at all ([`dark_clean_taper`]).
+/// it. Below the letters' bodies the letter guard still judges the row's
+/// cells and would cut the train to a share of its light, and a cut red,
+/// orange or yellow reads maroon, brown or olive on a dark page. A dark
+/// train is laid clean or not at all ([`dark_clean_taper`]).
 const DARK_TRAIN_TEXT_BAND: (f32, f32) = (0.0, 1.0);
 
 /// How many px round a lettered row's span a dark train stays hidden: the
@@ -2150,8 +2155,8 @@ const DARK_TRAIN_TEXT_PAD_PX: f32 =
     crate::cursor_glow::LETTER_GUARD_RING as f32 + TRAIN_TEXT_FEATHER_PX;
 
 /// How long a dark head's petals and core take to fold into the landing
-/// once the head arrives, ms: kept, they stood as red, violet and amber
-/// specks against the caret's left edge.
+/// once the head arrives, ms; left standing they read as stray specks
+/// against the caret's left edge.
 const HEAD_FOLD_MS: f32 = 50.0;
 
 impl Flight {
@@ -2387,7 +2392,7 @@ fn build_stations(
     };
     // A dark train too short to reach full light between its eased ends
     // (a Return's first frames) is drawn at full light in its middle: dimmed
-    // whole it reads as a grey and brown smudge (looks6 N6).
+    // whole it reads as a grey and brown smudge.
     let ends_peak = if light || square || !clean || ease_head + ease_tail <= span * (30.0 / 32.0) {
         1.0
     } else {
@@ -2550,10 +2555,9 @@ fn draw_head(
     if f.headless {
         return;
     }
-    // On paper the head is its train's own eased end. Squashed flat to keep
-    // off the letters, its core drew a crisp one-pixel level line at the
-    // printed line's top after a Return (an overline, a hyphen), and its
-    // petals hairlines beside it.
+    // On paper the head is its train's own eased end: squashed flat to keep
+    // off the letters, a drawn core and petals read as an overline and
+    // hairlines at the printed line's top after a Return.
     if !ctx.cfg.dark_theme {
         return;
     }
@@ -2618,8 +2622,9 @@ fn draw_head(
             COMA_R_SCALE * COMA_PETAL_ORBIT * ry,
         );
         let coma_alpha = coma_cov as u8;
+        let step = std::f32::consts::TAU / (COMA_PETALS as f32);
         for i in 0..COMA_PETALS {
-            let a = spin + std::f32::consts::TAU * (i as f32) / (COMA_PETALS as f32);
+            let a = spin + step * (i as f32);
             let (sa, ca) = a.sin_cos();
             let (px, py) = (cx + orbit_x * ca, cy + orbit_y * sa);
             let rgb = if clean {
@@ -2693,9 +2698,8 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if cov < 1.0 {
         return;
     }
-    // On paper the pin would land on the caret's block itself: its level
-    // arms beside the block read as a strike-through, and its upright arm
-    // stood as a tick on the block's top edge. The landing's flash marks it.
+    // On paper the pin would land on the caret's block itself, its arms
+    // reading as a strike-through and a tick; the landing's flash marks it.
     if !ctx.cfg.dark_theme {
         return;
     }
@@ -2860,6 +2864,8 @@ fn burst_lance(
     let cw = (ctx.geom.cw as f32).max(1.0);
     let page = light.then_some(ctx.cfg.theme_bg);
     let hue = |s: f32| landing_ink_at(l, ox + dir.0 * s, cw, page);
+    let inv_span = 1.0 / span;
+    let inv_stations = 1.0 / (BURST_SEC_STATIONS - 1) as f32;
     let mut s0 = root;
     let mut done = 0.0_f32;
     for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
@@ -2881,7 +2887,7 @@ fn burst_lance(
             let stride = (thick * BURST_LIGHT_STEP_SHARE).max(1.0);
             let mut s = s0;
             while s <= s1 {
-                let t = (s - root) / span;
+                let t = (s - root) * inv_span;
                 let a = (ink * (1.0 - BURST_TIP_FADE * t)) as u8;
                 let rect = (
                     (ox + dir.0 * s).round() as i32 - half_side,
@@ -2894,10 +2900,11 @@ fn burst_lance(
             }
         } else {
             frame.beams.clear();
+            let ds = s1 - s0;
             for j in 0..BURST_SEC_STATIONS {
-                let f = j as f32 / (BURST_SEC_STATIONS - 1) as f32;
-                let s = s0 + (s1 - s0) * f;
-                let t = (s - root) / span;
+                let f = j as f32 * inv_stations;
+                let s = s0 + ds * f;
+                let t = (s - root) * inv_span;
                 frame.beams.push(BeamVertex {
                     x: ox + dir.0 * s,
                     y: oy + dir.1 * s,
@@ -3171,7 +3178,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
                 premul_rgb(rgb, (cov * SPARK_HALO_SHARE) as u8),
             );
         }
-        let core = lerp_rgb(0x00FF_FFFF, rgb, SPARK_CORE_TINT);
+        let core = landing_spark_core_ink(stop);
         let cap = frame.out.len() + SPARK_STAR_QUAD_CAP;
         push_twinkle_star(frame.out, geom, x, y, arm, cov as u8, false, core, cap);
     }
@@ -4031,11 +4038,9 @@ mod tests {
 
     #[test]
     fn a_dark_return_leaves_no_grey_or_brown_smudge() {
-        // looks6 N6: a dark Return's trains dimmed where they faded, and its
-        // head's seven dim petals summed to a grey blob ringed with brown;
-        // a dimmed white reads grey and a dimmed orange brown on a dark page.
-        // Laid on the page, a train's light is its hue at a clean level or
-        // nothing: few lit pixels read as a grey or a brown smudge, and the
+        // A dimmed white reads grey and a dimmed orange brown on a dark page,
+        // so a dark Return's train light is its hue at a clean level or
+        // nothing: few lit pixels read as a grey or brown smudge, and the
         // dimming trains (the negative control) leave many.
         let cfg = config();
         let page = cfg.theme_bg & 0x00FF_FFFF;
@@ -4155,12 +4160,8 @@ mod tests {
         );
     }
 
-    /// looks6 N5: on paper the pin lands on the caret's block itself. Its
-    /// level arms beside the block read as a strike-through, and its upright
-    /// arm, cut to the block, still stood as a three-pixel tick on the
-    /// block's top edge. On paper the pin draws nothing within a cell of the
-    /// block (the landing's flash marks it); the control is the same pin on
-    /// dark, whose arms reach there.
+    /// On paper the pin draws nothing within a cell of the caret's block (the
+    /// landing's flash marks it); on dark (the control) its arms reach there.
     #[test]
     fn on_paper_the_pin_draws_nothing_by_the_caret_s_block() {
         let t0 = Instant::now();
@@ -4238,11 +4239,8 @@ mod tests {
         sc.halos
     }
 
-    /// The head's lights folded into the landing: after a Return its petals
-    /// stood on as dots stuck to the caret's left edge (looks6 round 2 N6:
-    /// red, violet and amber at `e120`). Past [`HEAD_FOLD_MS`] after the
-    /// arrival the head lays no light; kept standing (the negative control),
-    /// it does.
+    /// Past [`HEAD_FOLD_MS`] after a Return's arrival the head lays no light;
+    /// kept standing (the negative control), it does.
     #[test]
     fn the_head_folds_into_its_landing() {
         let cfg = config();
@@ -4273,11 +4271,9 @@ mod tests {
         );
     }
 
-    /// Across a lettered row the trains pass behind the letters' bodies: a
-    /// Return's thread from the old line's end to the new line's start cut
-    /// the printed row's words at x-height (looks6 round 2 N6, `e120`), a
-    /// strike-through. No train or head light stands inside the row's
-    /// letter band; laid over the text (the negative control), it does.
+    /// Across a lettered row the trains pass behind the letters' bodies: no
+    /// train quad stands inside the row's letter band; laid over the text
+    /// (the negative control), one does.
     #[test]
     fn a_train_passes_behind_a_lettered_row() {
         let cfg = config();
@@ -4334,13 +4330,9 @@ mod tests {
         );
     }
 
-    /// On a dark page the head's lights are never grey or brown: a Return's
-    /// head kept a white core dimmed to a grey blob (`#57595e`) ringed with
-    /// brown petal fringes over the echo (looks6 round 2 N6). Its core wears
-    /// the train's hue at the head and its warm stops walk the night arc;
-    /// even at their soft edges at most one lit pixel in fifty of the head
-    /// reads grey or brown, and the white head with the warm petals (the
-    /// negative control) reads so far more.
+    /// On a dark page at most one lit pixel in fifty of the head reads grey or
+    /// brown, even at its lights' soft edges; the white head with the warm
+    /// petals (the negative control) reads so far more.
     #[test]
     fn a_dark_head_is_never_grey_or_brown() {
         let cfg = config();
@@ -4407,11 +4399,8 @@ mod tests {
         );
     }
 
-    /// On paper the meteor draws no head: squashed to keep off the letters,
-    /// its core drew a crisp one-pixel level line at the printed line's top
-    /// after a Return in every ribbon's Enter frame (looks6 round 2, `#4184ff`
-    /// at y316), and its petals hairlines beside it. The train's own eased end
-    /// is the head; on dark (the control) the head is drawn.
+    /// On paper the meteor draws no head (the train's own eased end is the
+    /// head); on dark (the control) it does.
     #[test]
     fn on_paper_the_meteor_draws_no_head() {
         let t0 = Instant::now();
@@ -4441,10 +4430,8 @@ mod tests {
         assert!(heads(true) > 0, "control: the dark meteor drew no head");
     }
 
-    /// On paper a landing's sparks stand a cell clear of the caret's block,
-    /// every side: a cross touching the block's corner read as part of it
-    /// (looks6 round 2 N5, `e120`). On dark (the control) they fly from the
-    /// block itself.
+    /// On paper a landing's sparks stand a cell clear of the caret's block on
+    /// every side; on dark (the control) they fly from the block itself.
     #[test]
     fn paper_sparks_stand_a_cell_clear_of_the_caret() {
         let t0 = Instant::now();
@@ -6217,18 +6204,13 @@ mod tests {
         (sc, g)
     }
 
-    /// The gallery's judges (looks6 round 3, N6): after every dark Return
-    /// in `enter-bottom` a brown stub, a block 4-5 px wide and 10 tall
-    /// peaking at `4d3419`, stood at the echo row's old caret cell, the
-    /// cell after `fox`: the line's kept span stopped at its last letter,
-    /// so the train's root at the cell after it stood alone while the rest
-    /// was held behind the letters. With the span reaching the cell its
-    /// caret stood in (`CursorGlow::keep_out_boxes`), that cell keeps the
-    /// page's dark across the flight, whether or not the train also keeps
-    /// clear of the letter guard's reach (`DARK_TRAIN_TEXT_PAD_PX`, which
-    /// alone narrows the root too); with the span cut at the letters and
-    /// the train laid into the guard's reach (the negative control) the
-    /// stub stands.
+    /// After a dark `enter-bottom` Return the echo row's old caret cell
+    /// (column 26) keeps the page's dark across the flight, since the line's
+    /// kept span reaches the cell its caret stood in
+    /// (`CursorGlow::keep_out_boxes`), whether or not the train also keeps
+    /// clear of the letter guard's reach (`DARK_TRAIN_TEXT_PAD_PX`); with the
+    /// span cut at the letters and the train laid into the guard's reach (the
+    /// negative control) a brown stub stands there.
     #[test]
     fn a_return_leaves_no_stub_at_the_cell_its_line_ended_in() {
         let mut cfg = config();
@@ -6267,13 +6249,9 @@ mod tests {
         );
     }
 
-    /// The gallery's judges (looks6 round 3, N6): the dark `enter-bottom`
-    /// Return's warm segment under `quick` read muddy (`4b4721`, `5a4b2c`,
-    /// `7a624c`, `693e3b`): a red, an orange or a yellow added at the
-    /// train's level reads maroon, brown and olive on a dark page. Along
-    /// the gallery's Return, every column whose brightest pixel is a warm
-    /// hue holds it at a clean level, few of them dark; laid at the other
-    /// stops' level (the negative control), many are.
+    /// Along the gallery's dark `enter-bottom` Return, every column whose
+    /// brightest pixel is a warm hue holds it at a clean level, few of them
+    /// dark; laid at the other stops' level (the negative control), many are.
     #[test]
     fn a_dark_return_s_warm_stops_read_clean_not_brown() {
         let mut cfg = config();
@@ -6331,12 +6309,10 @@ mod tests {
         );
     }
 
-    /// The gallery's judges (looks6 round 3): on paper the `enter-bottom`
-    /// Return's stick went muddy through its yellow (`7d8616`, `9a7e16`,
-    /// `b57b20`), a yellow stop's ink held to the paper's contrast. The band
-    /// thins out there: along the gallery's Return no column carries more
-    /// than a thread of mustard or olive; at its full width (the negative
-    /// control) the band stands there whole.
+    /// On paper a yellow stop's ink held to the paper's contrast reads mustard,
+    /// so the gallery's `enter-bottom` Return thins out there: no column
+    /// carries more than a thread of mustard or olive; at full width (the
+    /// negative control) the band stands there whole.
     #[test]
     fn a_paper_return_thins_through_its_mustard() {
         let mut cfg = config();

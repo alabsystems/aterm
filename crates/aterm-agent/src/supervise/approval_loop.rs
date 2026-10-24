@@ -2633,7 +2633,7 @@ impl<C: Ctl> Session<'_, C> {
             self.limit_retry_until(retry)?
         };
         let reset_unix = due.saturating_sub(self.limit_retry_grace_s());
-        let title = aterm_phase::anchor("gemini.usage.title");
+        let title = aterm_phase::anchor!("gemini.usage.title");
         let how = if relaunched {
             "the agent was relaunched while its dialog stood"
         } else {
@@ -2643,7 +2643,7 @@ impl<C: Ctl> Session<'_, C> {
         let message = match (placed, retry.reset.as_ref()) {
             (Some(reset), _) => format!(
                 "{title} the session's model; {how}. {}{reset}.",
-                aterm_phase::anchor("gemini.usage.resets"),
+                aterm_phase::anchor!("gemini.usage.resets"),
             ),
             (None, Some(drawn)) => format!(
                 "{title} the session's model; {how}. It names a reset the loop cannot place ({}).",
@@ -2864,7 +2864,7 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .and_then(|r| r.at_unix.is_none().then_some(r.reset.as_ref()).flatten())
             .map(ToString::to_string);
-        let retry = aterm_phase::anchor("gemini.usage.retry");
+        let retry = aterm_phase::anchor!("gemini.usage.retry");
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         let tries_by = LimitTry::of(&labels).unwrap_or(LimitTry::KeepTrying);
         let pressed = tries_by.pressed();

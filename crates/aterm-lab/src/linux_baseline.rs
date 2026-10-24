@@ -2474,7 +2474,7 @@ impl Session<'_> {
             .ok_or_else(|| format!("`image` answered {reply}"))?;
         let file = format!("{}-{}-{name}", self.arch.name(), self.screen.name());
         let to = self.results.join(&file);
-        let copied = self.up().lima.copy_out(guest_path, &to);
+        let copied = self.up().guest.copy_out(guest_path, &to);
         if !copied.ok() {
             return Err(format!("{guest_path} not copied out: {}", copied.tail(2)));
         }
@@ -4471,7 +4471,7 @@ impl Baseline {
             .collect();
             argv.extend(target.iter().map(|s| (*s).to_string()));
             let built = up
-                .lima
+                .guest
                 .shell_streamed(&up.home, &guest::with_env(&env, &argv), "  | ");
             if !built.ok() {
                 return Err(not_run(format!(
@@ -4700,9 +4700,9 @@ pub fn cmd_baseline(args: &[String]) -> Res {
                     argv.extend(["--features".into(), "aterm-gpu/wgpu-oracle".into()]);
                 }
                 println!("\n=== {tag}: build aterm-gui{oracle}, aterm-ctl ===");
-                let built = up
-                    .lima
-                    .shell_streamed(&up.home, &guest::with_env(&env, &argv), "  | ");
+                let built =
+                    up.guest
+                        .shell_streamed(&up.home, &guest::with_env(&env, &argv), "  | ");
                 if !built.ok() {
                     rows.push(proof::Row {
                         name: format!("{tag} build aterm-gui{oracle}"),
@@ -4731,11 +4731,7 @@ pub fn cmd_baseline(args: &[String]) -> Res {
     {
         eprintln!("aterm-lab: linux: guest build output NOT removed: {e}");
     }
-    if ask.keep_up {
-        up.stop_units();
-    } else {
-        up.release();
-    }
+    up.end(ask.keep_up);
     let report = proof::render(&rows, &[], t0.elapsed().as_secs_f64()).replacen(
         "LINUX LANE PROOF",
         if ask.record {

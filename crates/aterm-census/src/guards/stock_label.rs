@@ -10,18 +10,15 @@
 //! - a cargo-fuzz target (cargo-fuzz and its sanitizer runtime are stock nightly's);
 //! - shipped code that selects a stock channel by a literal: rustup's `"+nightly"` override as
 //!   one argument, or `"RUSTUP_TOOLCHAIN"` set to `"stable"`;
-//! - a Cargo target whose code builds only for a target Trust ships no std for. Trust ships its
-//!   host's std alone ([`TRUST_HOST`]), so Linux and Windows code is compiled by stock Rust
-//!   wherever it is compiled: the Linux and Windows lanes' guests (`aterm-lab`'s
-//!   `linux_guest.rs`, `windows_guest.rs`) and `verify cells`. Those lanes carry the label where
-//!   they select the stock compiler; a target that has no work on Trust's host carries its own.
-//!   It is a target root gated whole (`#![cfg(target_os = "linux")]`), or one whose `fn main`
-//!   keeps an arm for every target but that one (`#[cfg(not(windows))]`), the shape of a lane's
-//!   acceptance bench. A library module, or a member of a test suite, gated to Linux is not
-//!   such a target: the target it belongs to is one Trust builds.
+//! - a Cargo target whose code builds only for a target Trust ships no std for (Trust ships its
+//!   host's std alone, [`TRUST_HOST`]): a target root gated whole
+//!   (`#![cfg(target_os = "linux")]`), or one whose `fn main` keeps an arm for every target but
+//!   that one (`#[cfg(not(windows))]`). A library module or a test-suite member gated to Linux
+//!   belongs to a target Trust builds, so it is not one. The Linux and Windows lanes
+//!   (`aterm-lab`'s guests, `verify cells`) carry the label where they select the stock compiler.
 //!
-//! A remedy that names a stock command to a person runs nothing. Each such file carries a label
-//! in a comment; a label only inside a string (an error message) labels no code.
+//! Each file of these shapes carries a label in a comment; a label only inside a string (an
+//! error message) labels no code. A remedy that names a stock command to a person runs nothing.
 
 use std::collections::BTreeSet;
 

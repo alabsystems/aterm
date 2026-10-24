@@ -1302,7 +1302,10 @@ impl Pipeline {
     }
 }
 
-/// The framebuffer-fetch twin of a Unorm-law row (Metal on an Apple GPU, design §5 lane B6): the row's vertex stage, layout and binds, drawn into the sRGB view with no fixed-function blend under the row's write mask, by a fragment (`*_fetch` in `cell.metal`, compiled under `ATERM_FETCH`) that applies the row's blend in exact integers to the byte it reads back.
+/// The framebuffer-fetch twin of a Unorm-law row (Metal on an Apple GPU): the row's vertex stage,
+/// layout and binds, drawn into the sRGB view with no fixed-function blend under the row's write
+/// mask, by a fragment (`*_fetch` in `cell.metal`, compiled under `ATERM_FETCH`) that applies the
+/// row's blend in exact integers to the byte it reads back.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
@@ -1341,7 +1344,8 @@ impl FetchTwin {
         Self::Fx,
     ];
 
-    /// The twin of `row`, or `None` for a row that draws on the sRGB view or outside the frame plan.
+    /// The twin of `row`, or `None` for a row that draws on the sRGB view or outside the frame
+    /// plan.
     #[inline]
     pub(crate) const fn of(row: Pipeline) -> Option<Self> {
         Some(match row {
@@ -1387,7 +1391,8 @@ impl FetchTwin {
         }
     }
 
-    /// The twin's pipeline: its row's spec, with the twin's fragment, the sRGB view and no fixed-function blend.
+    /// The twin's pipeline: its row's spec, with the twin's fragment, the sRGB view and no
+    /// fixed-function blend.
     #[inline]
     pub(crate) const fn spec(self) -> PipelineSpec {
         let (fs, label) = self.fs_and_label();

@@ -185,7 +185,8 @@ impl CursorDroplet {
         self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
         self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
         let phase = self.slosh * std::f32::consts::TAU;
-        let shimmer = 0.5 + 0.35 * phase.sin() + 0.15 * (phase * 2.7 + 1.3).sin();
+        let phase_sin = phase.sin();
+        let shimmer = 0.5 + 0.35 * phase_sin + 0.15 * (phase * 2.7 + 1.3).sin();
 
         let dark = cfg.ground.is_none_or(aterm_render::theme_is_dark);
         let caustic = 0.05 * (shimmer - 0.5);
@@ -215,7 +216,7 @@ impl CursorDroplet {
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
         {
-            self.emit_bead(cr, cc, e, shimmer, phase, geom, cfg, out);
+            self.emit_bead(cr, cc, e, shimmer, (phase, phase_sin), geom, cfg, out);
         }
 
         let fp = ((self.slosh * 512.0) as u64)
@@ -245,7 +246,7 @@ impl CursorDroplet {
         cc: u16,
         e: f32,
         shimmer: f32,
-        phase: f32,
+        (phase, phase_sin): (f32, f32),
         geom: Geom,
         cfg: &DropletConfig,
         out: &mut Vec<GlowQuad>,
@@ -263,13 +264,19 @@ impl CursorDroplet {
             (0.62, 0.85, 0.66 + 0.16 * e),
             (0.40, 1.00, 0.86 + 0.14 * e),
         ];
+        let e_shear = 0.30 + 0.70 * e;
         for (k, &(rx, cov_x, ramp_t)) in discs.iter().enumerate() {
             let r = radius * rx;
             if r < 1.0 {
                 continue;
             }
             let cov = (cov_core * cov_x * DISC_SOFT_GAIN).min(COV_CAP);
-            let shear = (phase + k as f32 * 0.6).sin() * r * 0.10 * (0.30 + 0.70 * e);
+            let s = if k == 0 {
+                phase_sin
+            } else {
+                (phase + k as f32 * 0.6).sin()
+            };
+            let shear = s * r * 0.10 * e_shear;
             push_soft_disc(
                 out,
                 geom,
@@ -281,7 +288,7 @@ impl CursorDroplet {
         }
 
         let glint_cov = (cov_core * (0.80 + 0.20 * shimmer)).min(COV_CAP);
-        let gx = cx - radius * 0.30 + (phase.sin() * radius * 0.05);
+        let gx = cx - radius * 0.30 + (phase_sin * radius * 0.05);
         let gr = (radius * 0.14).max(1.5);
         push_soft_disc(
             out,
@@ -325,6 +332,11 @@ impl CursorDroplet {
             }
         }
 
+        let foot = i32::from(geom.origin_y) + (i32::from(cr) + 1) * ch as i32;
+        #[cfg(test)]
+        let cut_surface = !self.uncut;
+        #[cfg(not(test))]
+        let cut_surface = true;
         let belly = cy + radius * 0.80;
         let body = water_ramp(0.68);
         for &(dx, off, wake) in &DRIP_LANES {
@@ -332,7 +344,6 @@ impl CursorDroplet {
                 continue;
             }
             let u = (self.drip + off).fract();
-            let x = cx + dx * cw + (phase + off * 7.0).sin() * 1.5;
             let (y, r, stretch, cov) = if u < 0.30 {
                 let s = u / 0.30;
                 (belly, 1.2 + radius * 0.08 * s, 1.0, cov_core * 0.70 * s)
@@ -345,11 +356,14 @@ impl CursorDroplet {
                     cov_core * 0.70 * (1.0 - v),
                 )
             };
-            push_soft_disc(out, geom, (x, y), (r, r * stretch), body, cov.min(COV_CAP));
+            let ry = r * stretch;
+            if cut_surface && (y - ry).floor() as i32 >= foot {
+                continue;
+            }
+            let x = cx + dx * cw + (phase + off * 7.0).sin() * 1.5;
+            push_soft_disc(out, geom, (x, y), (r, ry), body, cov.min(COV_CAP));
         }
-        let foot = i32::from(geom.origin_y) + (i32::from(cr) + 1) * ch as i32;
-        #[cfg(test)]
-        if self.uncut {
+        if !cut_surface {
             return;
         }
         cut_at_surface(out, surface_from, foot);

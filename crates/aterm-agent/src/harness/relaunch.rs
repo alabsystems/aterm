@@ -46,7 +46,8 @@ pub(super) enum NoPlan {
     },
 }
 
-/// What every Claude Code relaunch exports (the survey switch, the one aterm also writes into the user's settings and exports from the managed launcher).
+/// What every Claude Code relaunch exports: the survey switch, which aterm also sets in the
+/// user's settings and the managed launcher.
 pub(super) const CLAUDE_LAUNCH_ENV: [(&str, &str); 1] = [(SURVEY_SWITCH_VAR, "1")];
 
 /// The environment variable Claude Code turns every rating survey off by.
@@ -79,7 +80,8 @@ pub(super) struct Launch<'a> {
     pub(super) login: Option<&'a str>,
     /// Whether the process it replaces authenticated by its stored login ([`Snapshot::stored_login`]).
     pub(super) stored_login: bool,
-    /// New model selection requires target-context equality before any signal.
+    /// Whether the line moves the model: without usage credits, a move needs a named model and a
+    /// captured Standard billing context equal to the target's.
     pub(super) billing: ModelBilling<'a>,
 }
 
@@ -388,7 +390,8 @@ pub fn caller_claude(pid: u32, home: &Path) -> Option<CallerClaude> {
     })
 }
 
-/// What a worker's line carries of its manager's claude home, `(home, homedir)` ([`CallerClaude::home`], [`CallerClaude::homedir`]), from the manager's exec environment `vars` and the directory its records were found in (`dir`, [`Records::dir`]), for a user whose home is `user_home`.
+/// The `(home, homedir)` a worker's line carries of its manager's Claude home ([`CallerClaude`]),
+/// from the manager's exec environment `vars` and its records' directory `dir` ([`Records::dir`]).
 pub(super) fn worker_homes(
     user_home: &Path,
     vars: super::upgrade_drive::HomeVars<'_>,
@@ -411,7 +414,8 @@ pub(super) fn worker_homes(
     }
 }
 
-/// The line a claude code worker's shell runs at its first prompt (`spawn agent=claude`), Claude Code's row of the one line every worker's is ([`super::worker::line`]).
+/// The line a Claude Code worker's shell runs at its first prompt (`spawn agent=claude`): Claude
+/// Code's row of [`super::worker::line`].
 pub fn task_launch_line(
     dialect: Dialect,
     exe: &Path,
@@ -1419,16 +1423,18 @@ fn await_held(
     }
 }
 
-/// What an `adopted` row promises of the relaunch's last step, which the tab's loop takes at its first idle point ([`resume`]), ranked as [`carry_on_once`] ranks it there.
+/// What an `adopted` row promises of the relaunch's last step, which the tab's loop takes at its
+/// first idle point ([`resume`]), ranked as [`carry_on_once`] ranks it there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Adopted {
-    /// A quiet restart ([`resumes_quietly`]) is resumed as it was with nothing typed, as the same move's `done:resumed` says ([`quiet_outcome`]).
+    /// A quiet restart ([`resumes_quietly`]), resumed with nothing typed (`done:resumed`).
     Quiet,
-    /// Nothing owed by the conversation's own records ([`nothing_owed`], the why it names: nobody asked it anything, its worker finished, its last turn is a person's own exchange, its loop resumed it first).
+    /// The conversation's own records owe nothing, for the why [`nothing_owed`] names.
     NothingOwed(&'static str),
-    /// Under autopilot land ([`Opts::land`]) no continuation of Cruise's is typed.
+    /// Under Autopilot Land ([`Opts::land`], or the tab's own) no continuation is typed.
     Land,
-    /// Any other move owes the continuation, which the tab's supervisor types at the agent's first idle point.
+    /// Any other move owes the continuation, which the tab's supervisor types at the agent's
+    /// first idle point.
     Owed,
 }
 
@@ -1521,7 +1527,7 @@ fn held_wait(t: &super::Timings, cause: &str) -> Duration {
     }
 }
 
-/// Whether [`await_held`] reads a relaunched agent as ended as it started ([`ShellBack`]: the line's command seen to run and end, its shell holding the tab for [`super::Timings::ended_at_once`] since).
+/// Whether [`await_held`] watches for a relaunched agent that ended as it started ([`ShellBack`]).
 pub(super) fn ends_at_once(cause: &str) -> bool {
     cause == CAUSE_HOST || ends_its_agent(cause)
 }
@@ -1561,7 +1567,10 @@ impl ShellBack {
         due
     }
 
-    /// One look at `now`: whether the shell holds its terminal ([`Kernel::shell_holds_tab`]) and, where the line's block is known, whether it is over ([`line_over`], `None`: unread).
+    /// One look at `now`, given whether the shell holds its terminal ([`Kernel::shell_holds_tab`])
+    /// and whether the line's block is over ([`line_over`]; `None`: unread). True once the shell
+    /// has held the tab for `ended_at_once` with the line run: its block over or, with no block
+    /// known, the shell seen to give the tab up before.
     pub(super) fn saw(&mut self, holds: Option<bool>, over: Option<bool>, now: Instant) -> bool {
         let ran = match holds {
             None => return false,
@@ -1633,7 +1642,8 @@ fn newest_block(c: &mut Client, tab: &str) -> Option<Value> {
     v.get("blocks")?.as_array()?.last().cloned()
 }
 
-/// Wait for the relaunched agent's first idle with the harness's `hand` on the tab (renewed first; at most `within`, [`super::Timings::first_idle`], before the hand is given back — an opening box is the supervisor's to answer once the step returns).
+/// Wait at most `within` for the relaunched agent's first idle, renewing the harness's `hand`
+/// first; an opening box is the supervisor's to answer once the step returns.
 pub(super) fn first_idle(
     c: &mut Client,
     hand: &mut Hand,
@@ -1679,7 +1689,8 @@ pub(super) fn carry_on(
     )
 }
 
-/// `tab_probe` is the seam for the race between the first ownership read and the typed continuation.
+/// [`carry_on`] with `tab_probe`, the seam for the race between the first ownership read and the
+/// typed continuation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn carry_on_with_tab_probe(
     opts: &Opts,
@@ -1718,8 +1729,7 @@ fn carry_on_once(
     let mut conversation_changed = false;
     let mut tail_available = true;
     let settled = wait_until(opts.timings.carry_settle, || {
-        // The hand the caller holds outlasts this wait (120 s against a 60 s
-        // lease): renewed through it.
+        // This wait (up to 120 s) outlasts the hand's 60 s lease: renew it throughout.
         if let Some(h) = hand.as_deref_mut() {
             h.keep(c);
         }
@@ -1881,7 +1891,8 @@ fn done_quietly(
     r
 }
 
-/// Why a conversation nobody but the harness asked anything is owed no carry-on ([`nothing_owed`]'s `done:taskless`; an [`Adopted::NothingOwed`] row says it too).
+/// Why a conversation nobody but the harness has asked anything is owed no carry-on
+/// (`done:taskless`).
 pub(super) const NOBODY_ASKED: &str = "nobody has asked this conversation anything";
 
 /// Why a relaunch whose conversation's record says its task landed is carried on with nothing ([`nothing_owed`]).
@@ -1984,9 +1995,9 @@ pub(super) const CONTINUE_FENCE_TRIES: usize = 3;
 
 /// The model after, for a restart whose continuation was typed.
 pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Option<Report> {
-    // A quiet restart's look, or that of a carry-on that typed nothing
-    // ([`restore_look`]): a sweep reads it, and types its line only into a
-    // tab whose own Autopilot is on, under the tab's own guards.
+    // A quiet restart's look, or that of a carry-on that typed nothing ([`restore_look`]):
+    // a sweep reads it, and types its line only into a tab whose own Autopilot is on, under
+    // the tab's own guards.
     if looks_back(st) {
         return restore_look(opts, r, st, key, now, None, |c, pid, tab| {
             process_in_tab(c, pid, tab, None, None)
@@ -2031,7 +2042,9 @@ fn told_nothing(opts: &Opts, records: &Records, key: &str, st: &St) -> Option<&'
 const RESTORE_LOST: &str =
     "Claude Code reported that something this session ran did not come back after the restart";
 
-/// A quiet restart's one look (`[harness] upgrade_ask = false`, `done:resumed`; [`St::confirming`] on a quiet record, open [`RESTORE_LOOK`]).
+/// The one look after a quiet restart or a carry-on that typed nothing, open [`RESTORE_LOOK`]: if
+/// the resumed agent warned that something did not come back, a tasked agent is told to restore
+/// what it relies on.
 pub(super) fn restore_look(
     opts: &Opts,
     r: &Report,
@@ -2496,10 +2509,7 @@ pub struct PoolRelaunch<'a> {
     pub resume: Option<&'a str>,
 }
 
-/// The argv that resumes session `id` of `cli`'s program, as each CLI's own `--help` spells it:
-/// codex's `resume <id>` subcommand (codex-old 0.164.0), grok's `--resume <id>` (grok 1.0.70's
-/// `-r, --resume [<SESSION_ID_OR_TITLE>]`), kimi's `--session <id>` (kimi 2.3.1's
-/// `-S, --session [id]`), and Claude Code's `--resume <id>`.
+/// The argv that resumes session `id` of `cli`'s program, as each CLI's `--help` spells it.
 #[must_use]
 pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
     let word = match cli {
@@ -2510,10 +2520,10 @@ pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
     [word.to_string(), id.to_string()]
 }
 
-/// The line that relaunches `cli`'s program as `how` says under the login `env` names
-/// ([`super::accounts_pool::login_env`]): the seam's variable exported with the row's value, or
-/// unset for the machine's default login; nothing of another CLI's seam. Codex's resume is a
-/// subcommand, so its pair leads the flags; every other CLI's follows them.
+/// The line that relaunches `cli`'s program as `how` says, under the login `env` names
+/// ([`super::accounts_pool::login_env`]): that CLI's variable exported with the row's value, or
+/// unset for the machine's default login. Codex's resume subcommand leads the flags; every other
+/// CLI's resume pair follows them.
 ///
 /// # Errors
 ///
@@ -2910,7 +2920,9 @@ impl AgentRun {
     }
 }
 
-/// What a Muse Code TUI's relaunch on exit needs beside the [`Snapshot`], whose `session` is the session its witness proved it holds (the `.session.lock` at session depth its process holds open and whose body names its pid, `upgrade_drive`'s `muse::witness`; `None`: none proven, and no relaunch then resumes anything).
+/// What a Muse Code TUI's relaunch on exit needs beside the [`Snapshot`]. The snapshot's `session`
+/// is the one whose `.session.lock` its process holds open with its pid in the body (`None`: none
+/// proven, and no relaunch then resumes anything).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MuseRun {
     /// The data home its sessions are under (canonical).
@@ -2927,7 +2939,10 @@ pub struct MuseRun {
     pub block: Option<u64>,
 }
 
-/// What an agy TUI's relaunch on exit needs beside the [`Snapshot`], whose `session` is the conversation its witness proved it holds (the presence lock `<config>/presence/<uuid>.lock` its process holds open, `upgrade_drive`'s `agy::witness`; `None`: none proven — a fresh agy that took no turn has none — and no relaunch then resumes anything) and whose `cwd` is its workspace (agy's is its launch directory, measured).
+/// What an agy TUI's relaunch on exit needs beside the [`Snapshot`]. The snapshot's `session` is
+/// the conversation whose presence lock (`<config>/presence/<uuid>.lock`) its process holds open
+/// (`None`: none proven, as for a fresh agy that took no turn, and no relaunch then resumes
+/// anything), and its `cwd` is the workspace, agy's launch directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgyRun {
     /// The config directory its conversations are under (canonical).
@@ -2944,7 +2959,10 @@ pub struct AgyRun {
     pub block: Option<u64>,
 }
 
-/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`], whose `pid` is the parent node (the tab's foreground job, `node <gemini script>`), whose `session` is the session the start-time rule named (the one session header of its project begun since it started, `upgrade_drive`'s `gemini::witness_read` as a running process reads it; `None`: none named, and no relaunch then resumes anything) and whose `cwd` is its project (the directory its sessions are kept under).
+/// What a Gemini CLI TUI's relaunch on exit needs beside the [`Snapshot`]. The snapshot's `pid` is
+/// the parent node (the tab's foreground job, `node <gemini script>`), its `session` the one
+/// session header of its project begun since it started (the start-time rule; `None`: none, and
+/// no relaunch then resumes anything), and its `cwd` the project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeminiRun {
     /// The gemini directory its sessions are under (canonical).
@@ -3126,7 +3144,9 @@ pub(super) enum SnapshotLane {
     None,
 }
 
-/// The lane a foreground process is read by, from the basename of the image the kernel mapped for it (`image`; `None`: unreadable), and for a Codex whether that image is an ALab build.
+/// The lane a foreground process is read by: a Gemini CLI by its `node` image and script, any
+/// other by the basename of its mapped image (`image`; `None`: unreadable), a Codex's lane only
+/// for an ALab build.
 pub(super) fn snapshot_lane(image: Option<&Path>, argv: &[String]) -> SnapshotLane {
     if super::upgrade_gemini::is_gemini_process(image, argv) {
         return SnapshotLane::Gemini;
@@ -3436,7 +3456,8 @@ pub enum ExitRecord {
     Crashed,
     /// The agent refused its own start, by its shell's exit status.
     Refused,
-    /// A gemini CLI'S own restart refused for its own session ID, read at the exit by its shell's word ([`ExitLook::restarted_itself`]).
+    /// A Gemini CLI's own restart, refused for its own session ID, read at the exit from its
+    /// shell's word ([`ExitLook::restarted_itself`]).
     Restarted,
 }
 
@@ -3494,7 +3515,8 @@ pub struct ExitLook {
     pub crashed: Option<bool>,
     /// A Muse Code's or an agy's shell says it refused its start ([`ExitRecord::Refused`]), with `crashed` `Some(false)`.
     pub refused: bool,
-    /// A gemini CLI'S own restart refused for its own session ID, with `crashed` `Some(true)` (`upgrade_gemini::ExitKind::Restarted`).
+    /// A Gemini CLI's shell says it restarted itself ([`ExitRecord::Restarted`]), with `crashed`
+    /// `Some(true)` (`upgrade_gemini::ExitKind::Restarted`).
     pub restarted_itself: bool,
 }
 
@@ -3524,7 +3546,7 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
     }
 }
 
-/// Follow a muse code's snapshot between the loop's idle points.
+/// Follow a Muse Code's snapshot between the loop's idle points.
 pub fn follow_muse(snap: &mut Snapshot) -> bool {
     let muse = match &snap.run {
         AgentRun::Muse(_) => true,
@@ -3551,7 +3573,8 @@ pub fn look_at_gemini_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
     super::upgrade_drive::gemini_look_at_exit(opts, snap)
 }
 
-/// Whether the exit is a gemini CLI'S own restart refused for its own session ID ([`ExitLook::restarted_itself`]), read as the exit is seen, before whose exit it is decided.
+/// Whether the exit is [`ExitRecord::Restarted`], read as the exit is seen, before deciding whose
+/// exit it is.
 pub fn restarted_itself(
     mut look: impl FnMut() -> Option<ExitLook>,
     mut wait: impl FnMut(Duration) -> bool,
@@ -4018,7 +4041,8 @@ fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str)
     r
 }
 
-/// How long after its agent was seen gone ([`St::exited_at`]).
+/// How long after its agent was seen gone ([`St::exited_at`]) a failed or landed restart's record
+/// still owns that exit.
 pub(super) const STOPPED_OWN_S: u64 = 2 * STALE_S;
 
 fn restart_of(st: &St, agent: upgrade::Agent, tab: &str, pid: u32) -> bool {
@@ -4107,7 +4131,8 @@ fn adopted_holds(opts: &Opts, st: &St, session: &str) -> bool {
             })
 }
 
-/// Whether the harness's own restart (the upgrade's, or a restart in place) ended the agent that left tab `opts.only_sid` after its step returned with the relaunch still to type (`wait:held`, `wait:typing`, `wait:shell-prompt`, `wait:resume` …).
+/// Whether the harness's own restart (the upgrade's, or a restart in place) ended the agent that
+/// left tab `opts.only_sid`, with its record still owning that exit.
 #[must_use]
 pub fn restarted(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> bool {
     restart_record(opts, agent, pid).is_some()
@@ -4636,9 +4661,8 @@ pub enum Outcome {
 /// [`Outcome`] from one [`after_exit`] step's word.
 #[must_use]
 pub fn outcome(step: &str) -> Outcome {
-    // The host hands every relaunched agent to its loop
-    // ([`Opts::hand_back`]), so no other word lands — and a carry-on that
-    // typed nothing (`done:no-continue`) is never one.
+    // The host hands every relaunched agent to its loop ([`Opts::hand_back`]), so no other word
+    // lands, and a carry-on that typed nothing (`done:no-continue`) is never one.
     if matches!(step, "adopted" | "done:fresh" | "landed" | "done:resumed") {
         Outcome::Relaunched
     } else if step == "wait:not-exited" {
@@ -4853,7 +4877,8 @@ impl Relaunches {
         }
     }
 
-    /// A crash streak whose agent has run [`HEALTHY`]ly by `now` (since the healthy run began, [`Self::last`]) starts the back-off over.
+    /// A crash streak whose agent has run for [`HEALTHY`] by `now`, since its healthy run
+    /// began, starts the back-off over.
     pub fn forgive(&mut self, now: Instant) {
         if self
             .last
@@ -4878,10 +4903,9 @@ impl Relaunches {
     pub fn attempted(&mut self, outcome: &Outcome, now: Instant) -> Say {
         match outcome {
             Outcome::Relaunched => {
-                // A landing of an exit someone asked for is no crash's: it
-                // neither climbs the crash back-off nor restarts the healthy
-                // run that forgives it — but it starts one a streak of misses
-                // alone never had.
+                // A landing of an exit someone asked for is no crash's: it neither climbs the
+                // crash back-off nor restarts the healthy run that forgives it, but it starts
+                // one a streak of misses alone never had.
                 if self.crash {
                     self.streak = self.streak.saturating_add(1);
                     self.last = Some(now);
@@ -4994,7 +5018,8 @@ impl Relaunches {
         self.failing
     }
 
-    /// Whether this relaunch's failing was said beside a standing word that asks for a conversation ([`Self::failing_said`]).
+    /// Whether this relaunch's failing was said beside a standing word that asks for a
+    /// conversation.
     #[must_use]
     pub const fn failing_said(&self) -> bool {
         self.failing_said

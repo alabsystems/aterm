@@ -475,6 +475,9 @@ impl OutputStreak {
     }
 
     fn retire_light_over_erased_ink(&mut self) {
+        if self.comets.iter().all(Option::is_none) && self.ribbon.is_none() {
+            return;
+        }
         let observed = &self.observed_rows;
         let inked = |row: u16, from: i32, to: i32| {
             to >= 0

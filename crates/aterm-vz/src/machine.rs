@@ -215,13 +215,58 @@ pub mod fake {
         /// [`Event::Console`].
         Console(Vec<u8>),
         /// The agent dials the watch listener ([`Event::Watch`]) and says hello with this
-        /// hash, then `Ready` when `ready`; its end is [`Seen::watch_end`].
+        /// hash and the key it read from the plan's key disk, then `Ready` when `ready`; its
+        /// end is [`Seen::watch_end`].
         Agent {
             /// The hash its `Hello` names.
             agent_sha256: [u8; 32],
             /// Whether `Ready` follows.
             ready: bool,
         },
+        /// A guest process that is not root dials the watch listener: with `speaks`, it has
+        /// written a hello naming this hash with a key it guessed, then `Ready` and a
+        /// `Beat`; else nothing. Its end joins [`Seen::forger_ends`].
+        Forger {
+            /// The hash its forged `Hello` names (the plan's, to pass that check).
+            agent_sha256: [u8; 32],
+            /// Whether it writes anything.
+            speaks: bool,
+        },
+        /// The agent's own watch code ([`aterm_vz_agent::watch::run`], over the agent's
+        /// Fake `System`, beating every `tick_ms`), on a thread, with the key it read from
+        /// the plan's key disk.
+        RealAgent {
+            /// The hash its `Hello` names.
+            agent_sha256: [u8; 32],
+            /// Its tick, in milliseconds.
+            tick_ms: u64,
+        },
+    }
+
+    /// The key a guest's root reads: the first of `plan`'s disks that is a key disk, or
+    /// zeros where none is.
+    #[must_use]
+    pub fn plan_key(plan: &Plan) -> aterm_vz_agent::key::Key {
+        plan.disks
+            .iter()
+            .find_map(|d| aterm_vz_agent::key::read_disk(&d.path).ok().flatten())
+            .unwrap_or([0; aterm_vz_agent::key::LEN])
+    }
+
+    /// The scripted agent's hello, with `key`.
+    #[must_use]
+    pub fn hello(
+        agent_sha256: [u8; 32],
+        key: aterm_vz_agent::key::Key,
+    ) -> aterm_vz_agent::wire::Hello {
+        aterm_vz_agent::wire::Hello {
+            proto: aterm_vz_agent::wire::PROTO,
+            key,
+            agent_sha256,
+            boot_id: BOOT_ID.into(),
+            kernel: "6.8.0-142-generic".into(),
+            uptime_ms: 1830,
+        }
     }
 
     /// The boot id the scripted agent's hello names.
@@ -269,6 +314,8 @@ pub mod fake {
         pub events: Arc<Mutex<Option<Sink>>>,
         /// The scripted agent's end of its watch connection.
         pub watch_end: Arc<Mutex<Option<UnixStream>>>,
+        /// Each forger's end of its dial, in order.
+        pub forger_ends: Arc<Mutex<Vec<UnixStream>>>,
     }
 
     impl Seen {
@@ -370,15 +417,10 @@ pub mod fake {
                             aterm_vz_agent::wire::write_frame(&mut guest, &frame)
                                 .expect("the scripted agent writes into its socket buffer");
                         };
-                        say(aterm_vz_agent::wire::Frame::Hello(
-                            aterm_vz_agent::wire::Hello {
-                                proto: aterm_vz_agent::wire::PROTO,
-                                agent_sha256: *agent_sha256,
-                                boot_id: BOOT_ID.into(),
-                                kernel: "6.8.0-142-generic".into(),
-                                uptime_ms: 1830,
-                            },
-                        ));
+                        say(aterm_vz_agent::wire::Frame::Hello(hello(
+                            *agent_sha256,
+                            plan_key(plan),
+                        )));
                         if *ready {
                             say(aterm_vz_agent::wire::Frame::Ready(
                                 aterm_vz_agent::wire::Ready {
@@ -392,6 +434,50 @@ pub mod fake {
                             .watch_end
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guest);
+                        Event::Watch(conn)
+                    }
+                    FakeEvent::Forger {
+                        agent_sha256,
+                        speaks,
+                    } => {
+                        let (conn, mut guest) =
+                            conn_pair(aterm_vz_agent::WATCH_PORT, &self.seen.live_conns);
+                        if *speaks {
+                            let mut forged = hello(*agent_sha256, [0x11; aterm_vz_agent::key::LEN]);
+                            forged.boot_id = "forged".into();
+                            for frame in [
+                                aterm_vz_agent::wire::Frame::Hello(forged),
+                                aterm_vz_agent::wire::Frame::Ready(aterm_vz_agent::wire::Ready {
+                                    state: "running".into(),
+                                    failed_units: Vec::new(),
+                                }),
+                                aterm_vz_agent::wire::Frame::Beat { uptime_ms: 1 },
+                            ] {
+                                aterm_vz_agent::wire::write_frame(&mut guest, &frame)
+                                    .expect("the forger writes into its socket buffer");
+                            }
+                        }
+                        self.seen
+                            .forger_ends
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(guest);
+                        Event::Watch(conn)
+                    }
+                    FakeEvent::RealAgent {
+                        agent_sha256,
+                        tick_ms,
+                    } => {
+                        let (conn, guest) =
+                            conn_pair(aterm_vz_agent::WATCH_PORT, &self.seen.live_conns);
+                        let said = hello(*agent_sha256, plan_key(plan));
+                        let tick = std::time::Duration::from_millis(*tick_ms);
+                        let system: Arc<dyn aterm_vz_agent::system::System> =
+                            Arc::new(aterm_vz_agent::fake::Fake::new());
+                        std::thread::Builder::new()
+                            .name("fake-guest agent".into())
+                            .spawn(move || aterm_vz_agent::watch::run(guest, &system, &said, tick))
+                            .expect("the agent's thread starts");
                         Event::Watch(conn)
                     }
                 });

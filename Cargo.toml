@@ -80,7 +80,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.132.0"
+version = "0.133.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -445,6 +445,16 @@ opt-level = 2
 # SHA-256 (`astream-digest`) in dev for `aterm-gui` `seamless` screen and wire
 # ladder hashing; overflow checks stay on.
 [profile.dev.package.astream-digest]
+opt-level = 2
+
+# The zstd encoder and decoder in dev: zstd_suite holds the encoder to libzstd's
+# ratio at level 19 and re-encodes megabyte inputs cut every way, all through
+# the optimal parser. Alone, alternating at a load of 9-21: zstd_suite 14.0 ->
+# 1.4 s wall, 97.5 -> 11.3 CPU-s; --lib 5.5 -> 0.5 s, 18.7 -> 1.3 CPU-s;
+# atpkg-publish's publish_suite, which compresses through it, 79 -> 72 CPU-s.
+# An edit rebuilds the crate's tests in 0.5-0.8 s at either level. Only
+# opt-level moves; debug assertions and overflow checks stay on.
+[profile.dev.package.aterm-zstd]
 opt-level = 2
 
 # Omit debug info in test executables so per-CGU object files in `deps/` stay

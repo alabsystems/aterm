@@ -68,9 +68,8 @@ const AUTHZ_NAMES: &[&str] = &[
 ];
 /// The requests for administrator rights a literal carries.
 const AUTHZ_LITERALS: &[&str] = &["authorizationdb write", "with administrator privileges"];
-/// THE YES TOKENS. The owner's yes a change spends, and the leaf module that
-/// alone can build one: the type, its private mark ([`Token::mark`]) and its
-/// doors.
+/// The owner's yes a change spends, and the leaf module that alone can build one: the type,
+/// its private mark ([`Token::mark`]) and its doors.
 const OWNER_YES: &str = "OwnerYes";
 const OWNER_YES_LEAF: &str = "crates/aterm-gui/src/native_settings_owner_yes.rs";
 /// The window's own admission `OwnerYes::from_admitted` spends, and its leaf:
@@ -87,13 +86,10 @@ const GATE_MODULE: &str = "permission_gate";
 /// to what privacy cannot stop.
 struct Token {
     ty: &'static str,
-    /// The private unit struct the token's field holds, defined in the leaf
-    /// and named nowhere else. Being private, nothing outside the leaf can
-    /// name it, so nothing there can build the token; being neither `Clone`
-    /// nor `Copy`, no `impl Copy` of the token compiles anywhere. A new token
-    /// needs a new value of it, so in the leaf a value of it (the word,
-    /// outside its definition and the token's field) is a mint; outside it,
-    /// only a macro's body could name it, to expand it in the leaf.
+    /// The private unit struct the token's field holds, defined in the leaf and named nowhere
+    /// else, so nothing outside the leaf can build the token; being neither `Clone` nor `Copy`,
+    /// it lets no `impl Copy` of the token compile. In the leaf a value of it (outside its
+    /// definition and the token's field) is a mint; outside it, only a macro's body could name it.
     mark: &'static str,
     /// The token, its mark, its doors, and nothing that could build one
     /// beside them.
@@ -240,44 +236,25 @@ const UNSAFE_READS: &[(&str, Bound)] = &[
     ("*mut", Bound::Sub),
 ];
 
-/// The rule. WHAT HOLDS THE YES, AND WHERE THE GUARD'S SIGHT ENDS: the
-/// compiler keeps each token to its leaf (a private field nothing outside the
-/// leaf can name), and this guard keeps the leaf to the shape that makes that
-/// so ([`leaf_findings`]) and reads the rest of the product for what privacy
-/// does not stop ([`outside_findings`]). The alert's arm is a type the door
-/// asks by its own path (`ConfirmArm::ask(gestures.confirm, ..)`): a plain
-/// enum in the yes's leaf, aterm's alert or nobody, each a unit, and a
-/// stand-in only in a test build ([`arm_findings`]); the leaf holds no
-/// function type on a shipped line. What the doors trust — the window's own
-/// admission and a person's press — comes through functions this guard keeps
-/// to their callers ([`FENCES`]), each caller one `App` method defined once in
-/// its file ([`caller_findings`]), from the window's event dispatch and wake
-/// pump in; the gate's transitions are named in its parent only in their App
-/// functions, as any word, and that parent brings in no source (a `mod` but
-/// the gate's leaf, an `include!`) and expands no product macro that takes a
-/// transition ([`gate_macro_findings`]). A file is test code only while no
-/// shipped line loads it ([`TestCode`]). It is lexical, and does not see:
-/// an unsafe read under another name — a generic helper
-/// (`fn dup<T>(t: &T) -> T { unsafe { ptr::read(t) } }`) or a renamed import
-/// of one, called from an item that names a token, or a read whose token type
-/// is inferred and never written (`let y = unsafe { mem::zeroed() };
-/// spend(y)`), or a token an `extern` fn returns; what a door's body hands
-/// out beside its one token (a minting closure or fn pointer it returns or
-/// stores: a door's return type is not read); what the alert's arm and the
-/// fenced callers' own bodies do (`ConfirmArm::ask` is the alert; a caller
-/// passes what it was handed); what reaches the fences' outermost callers
-/// (the window's event dispatch, `App::on_user_event`'s worker replies, and
-/// the page's own queue of actions, whose `Admission::Automatic` the page's
-/// tick makes); a transition a proc macro's expansion calls in the gate's
-/// parent (another crate's derive or attribute), or a macro from outside the
-/// product's source; a consumer that takes another type where a yes belongs (the
-/// chain from the yes to `DevToolsSecurity` is aterm-gui's types,
-/// `ChangeTicket` and `DevtoolsJob`); a crate-root `#[macro_use] extern
-/// crate` whose derive or attribute takes a std name a leaf uses bare
-/// (`Debug`); and what a std, core or alloc macro expands to (a mark named in
-/// aterm_log's source, a product crate, is seen). A leaf that is gone is not
-/// read: its token, defined anywhere else, is a namesake finding; a fence
-/// whose function is gone from its home is a finding there.
+/// The rule. The compiler keeps each token to its leaf (a private field nothing outside the
+/// leaf can name); this guard keeps the leaf to the shape that makes that so
+/// ([`leaf_findings`]), the alert's arm to a plain enum of aterm's alert or nobody, each a unit
+/// ([`arm_findings`]), the rest of the product to what privacy does not stop
+/// ([`outside_findings`]), and what the doors trust (the window's own admission and a person's
+/// press) to their fenced callers ([`FENCES`], [`caller_findings`], [`gate_macro_findings`]). A
+/// file is test code only while no shipped line loads it ([`TestCode`]).
+///
+/// It is lexical, and does not see an unsafe read under another name (a generic helper, a
+/// renamed import) or with an inferred token type, or a token an `extern` fn returns; what a
+/// door's body hands out beside its token (a door's return type is not read); what the alert's
+/// arm and the fenced callers' own bodies do; what reaches the outermost callers (the window's
+/// event dispatch, `App::on_user_event`'s worker replies, the page's queue of actions); a
+/// transition that a proc macro's expansion or a macro from outside the product calls in the
+/// gate's parent; a consumer that takes another type where a yes belongs (the yes reaches
+/// `DevToolsSecurity` through aterm-gui's `ChangeTicket` and `DevtoolsJob`); a crate-root
+/// `#[macro_use] extern crate` whose derive or attribute takes a std name a leaf uses bare; or
+/// what a std, core or alloc macro expands to (`aterm_log` is product source, so it is read). A
+/// leaf that is gone is not read: its token, defined anywhere else, is a namesake finding.
 pub(super) const DEVTOOLS_DOOR: Rule = Rule {
     id: "devtools-door",
     why: "DevToolsSecurity changes the debug right for the whole Mac and ENABLES when run with no \
@@ -427,16 +404,11 @@ const ACCESS: &str = "crates/aterm-gui/src/system_state_access.rs";
 const NATIVE_EVENTS: &str = "crates/aterm-gui/src/app_native.rs";
 const MOUSE_EVENTS: &str = "crates/aterm-gui/src/app_mouse.rs";
 
-/// A function a yes's input passes through: what the window's own admission
-/// is read from (the page's Apply, its acceptance, the status naming the plan),
-/// and a person's press (a gesture reaching the page, the press taken with the
-/// page's action). The leaves trust what these hand them, so each is named
-/// only in the bodies of `callers`: the page's own handlers, and the window's
-/// event dispatch and wake pump that deliver the window's own gestures and the
-/// worker's own replies. A new caller anywhere else could hand a door a made-up
-/// admission (`note_system_state_apply(Admission::Automatic)`, then
-/// `accepted_initial_setup_apply`, then `observe_initial_setup_permissions` of
-/// any plan) or a press nobody made (`admitted_by_press(true)`).
+/// A function a yes's input passes through: what the window's own admission is read from (the
+/// page's Apply, its acceptance, the status naming the plan) and a person's press. The leaves
+/// trust what these hand them, so each is named only in the bodies of `callers`; a caller
+/// anywhere else could hand a door a made-up admission or a press nobody made
+/// (`admitted_by_press(true)`).
 struct Fence {
     name: &'static str,
     /// The file that defines it (`fn <name>`): a fence whose function is gone
@@ -610,13 +582,12 @@ const FENCES: &[Fence] = &[
     },
 ];
 
-/// THE YES'S INPUTS, fenced ([`Fence`]): in aterm-gui's shipped code (test
-/// code is a `#[cfg(test)]` item, or a file its parent declares test-only
-/// that no shipped line loads), a fenced function named outside its callers'
-/// bodies; a caller defined twice or outside `impl App` ([`caller_findings`]);
-/// in the gate's parent, a module beside the gate's leaf or an `include!`;
-/// in any product macro's body, a gate transition ([`gate_macro_findings`]);
-/// and a fence whose function its home no longer defines.
+/// The yes's inputs, fenced ([`Fence`]). Findings: in aterm-gui's shipped code (test code is a
+/// `#[cfg(test)]` item, or a file its parent declares test-only that no shipped line loads), a
+/// fenced function named outside its callers' bodies; a caller defined twice or outside
+/// `impl App` ([`caller_findings`]); in the gate's parent, a module beside the gate's leaf or an
+/// `include!`; in any product macro's body, a gate transition ([`gate_macro_findings`]); and a
+/// fence whose function its home does not define.
 fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     // Over a tree that holds every home (a planted one holds a few twins).
     let whole = FENCES.iter().all(|f| tree.corpus.get(f.home).is_some());
@@ -722,13 +693,11 @@ fn fence_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// THE FENCES' CALLERS: each is one inherent method of [`CALLER_HOST`],
-/// defined once in its file's shipped code, at an `impl App`'s top. A fenced
-/// name is let through by the fn its line sits in, by name; so a second `fn`
-/// of a caller's name there — a free fn, a nested one, another impl's or a
-/// trait's — would carry the caller's leave to whatever calls it, from any
-/// file (`fn tick_system_state(app, answer)` running an `Apply` the page never
-/// made). A caller gone from its file lets nothing through.
+/// Each fence's caller is one inherent method of [`CALLER_HOST`], defined once in its file's
+/// shipped code, at an `impl App`'s top. A fenced name is let through by the name of the fn its
+/// line sits in, so a second `fn` of a caller's name there (a free fn, a nested one, another
+/// impl's or a trait's) would carry the caller's leave to whatever calls it. A caller gone from
+/// its file lets nothing through.
 fn caller_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let mut by_file: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for &(rel, by) in FENCES.iter().flat_map(|f| f.callers) {
@@ -787,11 +756,9 @@ fn fn_definitions<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usiz
     })
 }
 
-/// A MACRO THAT TAKES A GATE TRANSITION: in any product file's shipped code,
-/// a macro's body (`macro_rules!`, or a `macro` item) that names a gate
-/// transition as a method or a path (`$g.accepted()`, `PermissionGate::observe`).
-/// Invoked in the gate's parent it expands there, with that file's privacy,
-/// into a call no line of the file spells.
+/// A product macro whose body (`macro_rules!` or a `macro` item) names a gate transition as a
+/// method or a path (`$g.accepted()`, `PermissionGate::observe`): invoked in the gate's parent
+/// it expands there, with that file's privacy, into a call no line of the file spells.
 fn gate_macro_findings(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let transitions: Vec<&str> = FENCES
         .iter()
@@ -892,10 +859,9 @@ impl Flags {
     }
 }
 
-/// A TOKEN'S LEAF, every line of it (a `#[cfg(test)]` item's too): nothing in
-/// it reaches the private field from beside the leaf or expands into code the
-/// lines do not spell, the token and its mark keep their shape, and the token
-/// is built only inside its doors' bodies.
+/// Every line of a token's leaf (a `#[cfg(test)]` item's too): nothing in it reaches the
+/// private field from beside the leaf or expands into code the lines do not spell, the token
+/// and its mark keep their shape, and the token is built only inside its doors' bodies.
 fn leaf_findings(file: &SourceFile, token: &Token, out: &mut Vec<Finding>) {
     let code = file.lexed().code.as_str();
     let ty = token.ty;
@@ -1048,12 +1014,11 @@ const ARM_VARIANTS: &[&str] = &["Alert", "Nobody"];
 /// test build holds.
 const ARM_STAND_IN: &str = "StandIn";
 
-/// THE ALERT'S ARM, in the yes's leaf ([`DoorShape::Asks`]): a plain `enum`
-/// whose shipped variants are [`ARM_VARIANTS`], each a unit, and whose other
-/// variant is [`ARM_STAND_IN`] under a test `cfg`. A variant that carries a
-/// value on a shipped line (`Fixed(Option<bool>)`, asked as
-/// `Self::Fixed(answer) => answer`) is an answer whoever builds the arm picks,
-/// and holds no function type for the leaf's other rule to see.
+/// The alert's arm in the yes's leaf ([`DoorShape::Asks`]) is a plain `enum` whose shipped
+/// variants are [`ARM_VARIANTS`], each a unit, and whose other variant is [`ARM_STAND_IN`]
+/// under a test `cfg`. A variant that carries a value on a shipped line (`Fixed(Option<bool>)`)
+/// is an answer whoever builds the arm picks, and holds no function type for the leaf's other
+/// rule to see.
 fn arm_findings(file: &SourceFile, code: &str, arm: &str, flags: &mut Flags) {
     let mut enums = Vec::new();
     for at in hits(code, arm, Bound::Word) {
@@ -1593,17 +1558,14 @@ fn attributes(code: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// OUTSIDE THE LEAVES, every other product file (a test's too), its shipped
-/// lines: what no privacy stops. No line names a token's mark (only a
-/// macro's body could, compiled, and a macro the leaf invoked would expand it
-/// there with the leaf's privacy); no
-/// type takes a token's name and no import binds one to it; no `impl` of
-/// [`TOKEN_COPIES`] for a token; no alias renames one (a `type` naming it in
-/// its generics or at the top of its right side, a `use` renaming it), since
-/// the unsafe reads are found by the name; no `fn`, `const` or `static` that
-/// names a token holds an [`UNSAFE_READS`] read; and no line but its parent's
-/// one `#[path]` names a leaf's file, and that mount carries no attribute
-/// that could put another file in its place ([`mount_attributes`]).
+/// Every other product file (a test's too), its shipped lines, for what no privacy stops: a
+/// line naming a token's mark (only a macro's body could, and a macro the leaf invoked would
+/// expand it there with the leaf's privacy); a type taking a token's name, or an import binding
+/// one to it; an `impl` of [`TOKEN_COPIES`] for a token; an alias renaming one (a `type` naming
+/// it in its generics or at the top of its right side, a `use` renaming it), since the unsafe
+/// reads are found by the name; an [`UNSAFE_READS`] read in a `fn`, `const` or `static` that
+/// names a token; a line other than its parent's one `#[path]` naming a leaf's file; and an
+/// attribute on that mount that could put another file in its place ([`mount_attributes`]).
 fn outside_findings(file: &SourceFile, out: &mut Vec<Finding>) {
     let code = file.shipped_code();
     let mut flags = Flags::new(&code);
@@ -2049,10 +2011,10 @@ pub(super) const BOOT_ID_DOOR: Rule = Rule {
     check: boot_id_door,
 };
 
-/// A file of the tree that reads a sysctl by name ([`SYSCTL_BY_NAME`], the
-/// call on the CODE view) and holds the boot id's name in a literal (the TEXT
-/// view, so a comment naming it is no read): each such literal, wherever the
-/// call takes its name from — inline, a `const`, a helper of the same file.
+/// A file of the tree that reads a sysctl by name ([`SYSCTL_BY_NAME`], the call on the code
+/// view) and holds the boot id's name in a literal (the text view, so a comment naming it is no
+/// read): each such literal, wherever the call takes its name from (inline, a `const`, a helper
+/// of the same file).
 fn boot_id_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in product(tree) {
         if !file.mentions(&[BOOT_ID_SYSCTL]) || !file.mentions(SYSCTL_BY_NAME) {
@@ -2478,9 +2440,9 @@ mod tests {
         );
     }
 
-    // THE YES TOKENS' LEAVES, as planted twins of the real ones (the census
-    // reads the real files on every `verify census`). Each test plants into
-    // them, their mounts or a caller, and names the lines it expects.
+    // Planted twins of the yes tokens' leaves (the census reads the real files on every
+    // `verify census`). Each test plants into them, their mounts or a caller, and names the
+    // lines it expects.
 
     const YES_LEAF: &str = "crates/aterm-gui/src/native_settings_owner_yes.rs";
     const YES_PARENT: &str = "crates/aterm-gui/src/native_settings.rs";
@@ -2592,9 +2554,9 @@ impl PermissionGate {
                               pub(crate) use permission_gate::AdmittedAccess;\n\
                               use permission_gate::PermissionGate;\n";
 
-    /// A caller: it names, holds, aliases inside another type, spends and
-    /// reads the tokens, implements traits for other types, and reads a raw
-    /// pointer where it names no token. All of it is CONTROL.
+    /// A caller that names, holds, aliases inside another type, spends and reads the tokens,
+    /// implements traits for other types, and reads a raw pointer where it names no token: none
+    /// of it is a finding.
     const CALLER: &str = r#"use crate::native_settings::{OwnerAnswer, OwnerYes};
 type Answer = Option<OwnerYes>;
 pub(crate) struct ChangeTicket {
@@ -2659,25 +2621,15 @@ impl Default for PagePress {}
         lines.iter().map(|n| format!("{rel}:{n}")).collect()
     }
 
-    /// CONTROLS: the real leaves' shape — each token a braced struct with a
-    /// private mark field (`YesSeal`, `AdmissionSeal`), its doors (the free `owner_confirms_with` asking
-    /// its `ConsentGestures`, `OwnerYes::from_admitted` spending an
-    /// `AdmittedAccess` by value, `PermissionGate::admitted` on `&self`, each
-    /// token's `#[cfg(test)]` `for_test`), `::aterm_log::info!` and
-    /// `::std::matches!`, std derives on other types — their parents' one mount
-    /// each, and a caller that names, holds, spends and aliases inside
-    /// `Option` are no findings.
+    /// The real leaves, their parents' one mount each, and a caller that names, holds, spends and
+    /// aliases the tokens are silent.
     #[test]
     fn the_real_leaves_and_their_callers_are_silent() {
         assert_eq!(with_plant(YES, GATE, CALLER_FILE, ""), Vec::<String>::new());
     }
 
-    /// A TOKEN IS BUILT IN ITS DOORS' BODIES ALONE (the earlier reviews'
-    /// plants, moved into the leaves, where alone they still compile). Each is
-    /// a finding: a value of the mark, a `Ty { .. }` literal or a `Self { .. }` in
-    /// the token's `impl` outside a door; a fn of a door's name in another
-    /// type's `impl`, a trait impl's or a trait's default method, a nested
-    /// `mod`, or a second one under another `cfg`.
+    /// In a leaf, a value of the mark, a `Ty { .. }` literal or a `Self { .. }` outside a door's
+    /// body is a finding, including one in a fn of a door's name that is no door.
     #[test]
     fn a_leaf_builds_its_token_only_in_its_doors() {
         let cases: &[(&str, &str, &[usize])] = &[
@@ -2766,12 +2718,8 @@ impl Default for PagePress {}
         }
     }
 
-    /// A DOOR HOLDS ITS SHAPE, or it is no door, and its mints are findings:
-    /// `from_admitted` that takes no `AdmittedAccess` by value (none, a
-    /// reference, an `Option`); `owner_confirms_with` that calls no `&
-    /// ConsentGestures` parameter's `confirm`; `admitted` not on `&self`; a
-    /// `for_test` with no `#[cfg(test)]`. A fn nested in a door's body is a
-    /// finding of its own.
+    /// A door out of its `DoorShape` is no door, so its mints are findings; a fn nested in a
+    /// door's body is a finding of its own.
     #[test]
     fn a_door_holds_its_shape() {
         let from = "pub(crate) fn from_admitted(admitted: AdmittedAccess) -> Self {";
@@ -2828,19 +2776,11 @@ impl Default for PagePress {}
         assert_eq!(with_plant(&yes, GATE, CALLER_FILE, ""), at(YES_LEAF, &[11]));
     }
 
-    /// A LEAF HOLDS NOTHING THAT COULD BUILD BESIDE ITS DOORS. Each is a
-    /// finding in either leaf: a `mod` (whose child would reach the field); a
-    /// `macro_rules!` or `macro`; a macro invoked by any path but the extern
-    /// prelude's (a bare `matches!` a crate macro could shadow, `crate::x!`)
-    /// or one that brings in source (`::std::include!`); an attribute that may
-    /// expand (`cfg_attr`, a path attribute, a derive not std's by its bare
-    /// name); a glob import, a rename, an import over a derive's or a macro
-    /// root's name, an `extern crate`; `unsafe`; an `impl` for the mark; a
-    /// `type` alias; a function type on a shipped line (`fn(..)`, `impl
-    /// Fn(..)`, `dyn FnMut(..)`: an arm a caller supplies), CONTROL the same
-    /// arm under `#[cfg(test)]`. And the token keeps its shape: braced, every
-    /// field private, one of them its mark, deriving no `Clone`, `Copy` or
-    /// `Default`; the mark defined, private and deriving none of them either.
+    /// In either leaf, a plant that could build beside the doors, expand into code no line spells
+    /// or take an arm a caller supplies (a function type on a shipped line) is a finding, and so
+    /// is a token or mark out of shape (not braced, a public field, no mark field, a `Clone`,
+    /// `Copy` or `Default` derive, the mark public or gone). The stand-in arm under
+    /// `#[cfg(test)]` is silent.
     #[test]
     fn a_leaf_holds_nothing_that_builds_beside_its_doors() {
         let plants: &[(&str, &[usize])] = &[
@@ -2947,13 +2887,9 @@ impl Default for PagePress {}
         }
     }
 
-    /// THE ALERT'S ARM HOLDS ITS VARIANTS (the round-four checker's G7): aterm's
-    /// alert and nobody, each a unit, and a test's stand-in under a test `cfg`.
-    /// Each is a finding: a variant that carries the answer as a value
-    /// (`Fixed(Option<bool>)`, appended as a second arm or added to the leaf's
-    /// one), a value on `Alert`, the stand-in on a shipped line, another
-    /// variant even under a test `cfg`, a generic arm, an arm that is a struct
-    /// (with no enum left).
+    /// The arm holds aterm's alert and nobody, each a unit, and a test's stand-in under a test
+    /// `cfg`: a variant carrying a value, the stand-in on a shipped line, another variant even
+    /// under a test `cfg`, a generic arm and a struct arm are findings.
     #[test]
     fn the_alerts_arm_holds_its_variants() {
         let fixed = "pub(crate) enum ConfirmArm {\n    Alert,\n    Nobody,\n    \
@@ -3018,21 +2954,11 @@ impl Default for PagePress {}
         }
     }
 
-    /// OUTSIDE ITS LEAF, WHAT NO PRIVACY STOPS. Each is a finding: a type of a
-    /// token's name, or an import bound to it; an `impl` of `Clone`, `Copy` or
-    /// `Default` for a token (path-qualified, `unsafe`); a `type` alias of a
-    /// token (since the unsafe reads are found by the name); an `fn` or
-    /// `const` that names a token and holds an unsafe read (`mem::zeroed`, a
-    /// read through `*const`); a second mount of a leaf (`#[path]` outside its
-    /// parent, `include!`, a second `#[path]` in its parent); a token's mark
-    /// named at all (a macro's body that names it builds the token wherever
-    /// the leaf expands it, with the leaf's privacy); any of it in a file whose
-    /// name reads as a test's; an attribute on the leaf's mount that could put
-    /// another file in its place (`cfg_attr` with a `path`, an attribute
-    /// macro). CONTROLS: an alias of a type holding a token
-    /// (`Option<OwnerYes>`), a copy impl of another type, a fn naming a token
-    /// with no read, a raw read in a fn naming none, a mark's name in a string
-    /// or a comment, and an `allow` on the mount.
+    /// Outside its leaf, in a test-named file too: a type or import of a token's name, a copy
+    /// impl or `type` alias of a token, an unsafe read in an item naming one, a second mount, the
+    /// mark's name, and an attribute on the mount that could swap its file are findings. Silent:
+    /// an alias of a type holding a token, another type's copy impl, a fn naming a token with no
+    /// read, a raw read naming none, a mark in a string or comment, and an `allow` on the mount.
     #[test]
     fn outside_its_leaf_nothing_renames_copies_forges_or_remounts_a_token() {
         let caller = "pub(crate) struct OwnerYes;\n\
@@ -3097,9 +3023,8 @@ impl Default for PagePress {}
         }
     }
 
-    // THE YES'S INPUTS' TWINS: the host, the Turn On… chain, the App's way
-    // into the gate and the gate itself, each fenced function named only in
-    // its callers.
+    // Twins of the yes's inputs: the host, the Turn On… chain, the App's way into the gate and
+    // the gate itself, each fenced function named only in its callers.
 
     const HOST_TWIN: &str = "impl App {
     pub(crate) fn receive_system_state_status(&mut self, s: SetupStatus) {
@@ -3233,21 +3158,10 @@ impl Default for PagePress {}
         .count()
     }
 
-    /// THE YES'S INPUTS ARE TAKEN BY THEIR CALLERS ALONE (the round-3
-    /// checker's plants). The inputs' twins as they stand: CONTROL, silent.
-    /// Each plant is a finding: (a)
-    /// `admitted_by_press(true)` from a stranger; (b) the window's own
-    /// admission made up from a stranger (`note_system_state_apply` of
-    /// `Admission::Automatic`, `accepted_initial_setup_apply`,
-    /// `observe_initial_setup_permissions` of any plan), or from a status or
-    /// an action handed to the host's own entry points; a fenced function
-    /// taken as a value (`App::note_system_state_touch`); in the gate's parent,
-    /// a transition outside its App function, on the real gate or a fresh one,
-    /// or a module there (`#[path]` or inline) whose code could call one;
-    /// a file whose name reads as a test's but no parent declares test-only. A
-    /// fence whose home no longer defines its function is a finding at the
-    /// home. CONTROLS: the same calls in a `#[cfg(test)]` item, or in a module
-    /// its parent declares test-only.
+    /// The inputs' twins as they stand are silent. A fenced function named outside its callers (a
+    /// call or a value), a transition outside its App function or a module in the gate's parent,
+    /// a test-named file no parent declares test-only, and a fence whose home lost its function
+    /// are findings; a `#[cfg(test)]` item or a module its parent declares test-only is silent.
     #[test]
     fn the_yes_inputs_are_taken_by_their_callers_alone() {
         assert_eq!(fenced(SETUP_TWIN, &[]), Vec::<String>::new());
@@ -3359,18 +3273,12 @@ impl Default for PagePress {}
         &'static [(&'static str, usize)],
     );
 
-    /// THE ROUND-FOUR CHECKER'S SIDESTEPS of the fences, each a finding now,
-    /// at the lines named (of the plant appended to its file): G1–G3 a second
-    /// `fn` named like an allowed caller (`on_user_event`, `tick_system_state`,
-    /// `debugger_step_look`) beside the real one, which any file could call —
-    /// and so is one spelled across lines, in a trait's impl, or inside the
-    /// real caller's body; G4 a file its parent declares test-only that a
-    /// shipped `#[path]` mounts again; G5 a gate transition taken as a value
-    /// (`PermissionGate::accepted`), a macro's argument, or a one-line wrapper
-    /// in the gate's parent; G6 an `include!` in the gate's parent, and a macro
-    /// anywhere whose body takes a transition. CONTROLS: a macro whose body
-    /// names no transition as a method or a path; the same `include!` in
-    /// another file.
+    /// Each sidestep of the fences is flagged at the lines named: a second `fn` named like an
+    /// allowed caller, which any file could call (G1–G3, spelled across lines or in a trait's
+    /// impl too); a test-only file a shipped `#[path]` mounts again (G4); a gate transition taken
+    /// as a value, a macro's argument or a one-line wrapper (G5); an `include!` in the gate's
+    /// parent, or a macro whose body takes a transition (G6). An `include!` elsewhere and a macro
+    /// naming a transition as neither a method nor a path are silent.
     #[test]
     fn the_round_four_sidesteps_of_the_fences_are_flagged() {
         let cases: &[Sidestep] = &[
@@ -3554,24 +3462,19 @@ impl Default for PagePress {}
         }
     }
 
-    /// Where a checker's plant stands now.
+    /// What becomes of a plant.
     enum Fate {
         /// The census flags it, at these lines of the plant.
         Flagged(&'static [usize]),
-        /// rustc refuses it on the real tree (measured 2026-10-22, each
-        /// planted into aterm-gui and type-checked): why. The census need not
+        /// rustc refuses it when planted into aterm-gui, with this error; the census need not
         /// see it.
         Refused(&'static str),
     }
 
-    /// THE CHECKER'S ROUND-TWO PLANTS (each run alone, where the checker put
-    /// it): the tuple `OwnerYes(())` the old home's every line could build is
-    /// a braced struct with a field of a private mark in a leaf of its own now,
-    /// so a plant outside the leaf no longer compiles, and one of the same
-    /// kind moved into the leaf, where alone it could, is flagged. The unsafe
-    /// reads, aliases and copy impl no privacy stops are flagged where the
-    /// checker put them. P21, a `from_admitted` door that takes no admission,
-    /// is `a_door_holds_its_shape`'s first case.
+    /// Each plant runs alone. A token is a braced struct with a private mark field in a leaf of
+    /// its own, so a mint outside the leaf does not compile (`Refused`) and the same mint inside
+    /// it is flagged; the unsafe reads, aliases and copy impls no privacy stops are flagged where
+    /// they stand.
     #[test]
     fn the_checkers_plants_are_flagged_or_no_longer_compile() {
         use Fate::{Flagged, Refused};

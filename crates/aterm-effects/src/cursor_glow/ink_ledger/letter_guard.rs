@@ -1,42 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LETTER GUARD: whatever a frame's lights add up to, every letter they
+//! The letter guard: whatever a frame's lights add up to, every letter they
 //! lie on keeps the legibility bar.
 //!
-//! Each style keeps its own lights off the letters as it emits them (the ink
-//! ledger's tiers, the bed, the fire's cap, the ribbon's hold), each against
-//! its own account and floor, so the frame's sum can still wash a letter out:
-//! unguarded, the trail gallery measured the newest letters beside a dark
-//! caret at 2.65 to 4.17:1 (Beam, Comet, Laser, Lumen, Phaser, Sparkle),
-//! Water's wave through its letters at 2.3, a ribbon's Enter flare on the echo
-//! at 2.84 and a fire spark on `好` at 1.79. The guard is the one law over all
-//! of them, run once on the frame's finished streams before they are
-//! published: for each lettered cell of the frame's own text (the caret's own
-//! cell is the caret's law), it composites every light that reaches the cell
-//! exactly as the renderer will (the under-text quads on the ground, then the
-//! over-text quads and the halos on ground and ink alike), reads each pixel of
-//! the cell as solid ink ([`SOLID_SHARE`] of the clean ratio, as `aterm-lab
-//! trail-contrast` counts ink) against the worst ground within [`RING`] px of
-//! it, and where the cell would fall under [`LETTER_FLOOR`] it finds the
-//! largest share of those lights that keeps the floor. A letter whose solid
-//! ink reads under the floor on the bare page (a clean ratio under about
-//! 5.4:1: Solarized Dark's text, a 5:1 grey, many a coloured output) keeps
-//! [`OWN_SHARE`] of its own bare reading instead: the floor it cannot reach
-//! never leaves it to the whole light. Every light is then cut to that share
-//! over the cell (and its ring), easing back to its whole strength over the
-//! ledger's feather off the cell, so a bloom hugs its caret and a flare dims
-//! behind the word it crosses with no hard edge. A cell the lights leave at
-//! the floor is untouched, and a frame with no such cell is byte-identical to
-//! the one it would have drawn.
+//! Each style keeps its own lights off the letters against its own account,
+//! so the frame's sum can still wash a letter out. The guard is the one law
+//! over all of them, run once on the frame's finished streams before they are
+//! published. For each lettered cell of the frame's text but the caret's, it
+//! composites every light that reaches the cell exactly as the renderer will
+//! (the under-text quads on the ground, then the over-text quads and the halos
+//! on ground and ink alike), reads each pixel as solid ink ([`SOLID_SHARE`] of
+//! the clean ratio) against the worst ground within [`RING`] px, and where the
+//! cell falls under its bar finds the largest share of those lights that keeps
+//! it. The bar is [`LETTER_FLOOR`], or [`OWN_SHARE`] of the letter's own bare
+//! reading where that is under the floor (a clean ratio under about 5.4:1).
+//! Every light is then cut to that share over the cell and its ring, easing
+//! back to its whole strength over the ledger's feather. A frame with no cut
+//! is byte-identical to the one it would have drawn.
 //!
-//! A row's cuts are one eased ramp, not a cell-by-cell comb ([`RAMP_SLOPE`]):
-//! between its first and last cut cell, every cell (a word gap, a letter the
-//! whole light left at the floor) keeps no more than the least of each cut
-//! cell's share plus the slope per column between them. Cut letter by letter,
-//! Phaser's neon bar kept its whole light in each word gap between dimmed
-//! letters and its spectrum underline went dashed (2026-10-23, looks6 N1).
-//! The ramp only ever lowers a share, so every letter keeps its bar.
+//! A row's cuts ease as one ramp ([`RAMP_SLOPE`]) rather than cell by cell, so
+//! a word gap between dimmed letters dims with them. The ramp only lowers a
+//! share, so every letter keeps its bar.
 
 use super::*;
 
@@ -48,14 +33,12 @@ pub(crate) const LETTER_FLOOR: f32 = 4.6;
 /// judge counts, not the face's full colour.
 const SOLID_SHARE: f32 = 0.85;
 /// The share of its own bare reading a letter whose solid ink reads under
-/// [`LETTER_FLOOR`] on the bare page keeps under the lights ([`letter_bar`]).
-/// Given up on, such letters would lie unguarded: a 5.0:1 grey under
-/// Sparkle's caret bloom measured 1.01:1 and Solarized Dark's text under
-/// Laser's Enter bolt 1.34:1, the guard on or off.
+/// [`LETTER_FLOOR`] on the bare page keeps under the lights ([`letter_bar`]),
+/// so the floor it cannot reach never leaves it unguarded.
 const OWN_SHARE: f32 = 0.97;
 /// How far from an ink pixel its ground is read, px (the judge's ring),
 /// and how far round a lettered cell the guard judges a light: a light
-/// kept that far off a lettered row is never cut (the dark meteor train).
+/// kept that far off a lettered row is never cut.
 pub(crate) const RING: i32 = 2;
 /// Bisection steps for a cell's share.
 const STEPS: usize = 7;
@@ -721,15 +704,17 @@ fn solid_ink(ink: u32, ground: u32, table: &crate::color_math::RelativeLuminance
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, ground & 0x00FF_FFFF);
+    let mut hi_checked = false;
     for _ in 0..10 {
         let mid = 0.5 * (lo + hi);
         let mid_rgb = mix(mid);
-        if ratio(mid_rgb) >= want {
+        if mid_rgb == lo_rgb || ((!hi_checked || mid_rgb != hi_rgb) && ratio(mid_rgb) >= want) {
             lo = mid;
             lo_rgb = mid_rgb;
         } else {
             hi = mid;
             hi_rgb = mid_rgb;
+            hi_checked = true;
         }
         if lo_rgb == hi_rgb {
             break;
@@ -868,12 +853,12 @@ impl InkLedger {
 }
 
 impl CursorGlow {
-    /// THE LETTER GUARD ([`self`]): cut this frame's lights (`over`, the
+    /// The letter guard ([`self`]): cut this frame's lights (`over`, the
     /// frame's `cursor_glow_add`, and the glow's own under-text quads and
     /// halos) so every lettered cell of the frame's text but the caret's
-    /// keeps [`LETTER_FLOOR`]. Classic's spectrum wake is the v0.28
-    /// restoration and keeps its bytes (owner ruling); its one-colour face is
-    /// guarded. Returns a print of the cuts.
+    /// keeps its bar ([`letter_bar`]). Classic's spectrum face keeps its v0.28
+    /// bytes and is not guarded; its one-colour face is. Returns a print of
+    /// the cuts.
     pub(crate) fn guard_letters(
         &mut self,
         over: &mut Vec<GlowQuad>,
@@ -885,9 +870,6 @@ impl CursorGlow {
         if self.letter_guard.off {
             return 0;
         }
-        // Classic's spectrum face keeps its v0.28 bytes; its one-colour face
-        // (a colour the user chose) is guarded like every other light, in
-        // intensity only, so the chosen hue stays (looks6 N10).
         if (matches!(style, GlowStyle::Classic) && !self.last_classic_mono)
             || self.frame_text.rows.is_empty()
             || (over.is_empty() && self.under_out.is_empty() && self.halo_out.is_empty())
@@ -1083,24 +1065,19 @@ impl CursorGlow {
     }
 
     /// On a dim theme, veil the pet's body with the page under every letter
-    /// it lies beneath (looks6 N11). The renderer's knock-out rings each
-    /// glyph in a pixel of page, which keeps a bright theme's letters; a dim
-    /// theme's text over the coat read at its cell well under its own
-    /// reading (`dim-grey`'s `o` of `echo` at 3.94:1 under the body, its
-    /// bar [`letter_bar`] 4.6:1). Each lettered cell the body's box
-    /// ([`Self::note_pet_body`], padded [`PET_VEIL_PAD_PX`]) reaches, but
-    /// the caret's, takes the page at the least opacity that keeps the
-    /// letter at its bar over the worst coat the pet may wear (the letter's
-    /// own colour), as one run per row of lettered
-    /// cells, its ends eased over [`PET_VEIL_EASE_PX`] outside the lettered
-    /// cells (inside them, a word's first and last letters' outer pixels
-    /// read under the bar, looks6 review): the letters' row
-    /// reads as lying in front of the pet, which keeps its outline above
-    /// and below the row. A cell whose text reads past
-    /// [`PET_VEIL_THEME_BARE`] draws none. It runs after the guard (whose
-    /// cuts would thin it) into the under stream, under the glyphs and over
-    /// the coat, and is the guard's: the guard's negative control drops it.
-    /// The frame's print of what it drew.
+    /// it lies beneath: the renderer's knock-out ring keeps a bright theme's
+    /// letters, but a dim theme's text over the coat reads under its bar. Each
+    /// lettered cell but the caret's that the body's box
+    /// ([`Self::note_pet_body`], padded [`PET_VEIL_PAD_PX`]) reaches takes the
+    /// page at the least opacity that keeps the letter at its bar over the
+    /// worst coat (the letter's own colour). A row's adjacent veiled cells on
+    /// one page colour make one run at the greatest of their opacities, its
+    /// ends eased over [`PET_VEIL_EASE_PX`] outside the lettered cells (inside
+    /// them, a word's end letters' outer pixels would read under the bar). A
+    /// cell whose text reads past [`PET_VEIL_THEME_BARE`] draws none. It runs
+    /// after the guard (whose cuts would thin it), into the under stream, and
+    /// the guard's negative control drops it. Returns the frame's print of
+    /// what it drew.
     pub(crate) fn veil_letters_on_pet(&mut self, caret: Option<(u16, u16)>, geom: Geom) -> u64 {
         #[cfg(any(test, debug_assertions))]
         if self.letter_guard.off || self.pet_veil_off {
@@ -1118,10 +1095,6 @@ impl CursorGlow {
         let (bx0, bx1, by0, by1) = (bx0 - pad, bx1 + pad, by0 - pad, by1 + pad);
         let table = crate::color_math::relative_luminance_table();
         let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
-        let ratio = |a: u32, b: u32| {
-            let (la, lb) = (lum(a), lum(b));
-            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-        };
         // The least page opacity over the worst coat that keeps `ink` at
         // its bar on `ground`; `None` where the text needs no veil.
         let mut veil_memo: Option<((u32, u32), Option<u8>)> = None;
@@ -1133,16 +1106,26 @@ impl CursorGlow {
             }
             let ans = (|| {
                 let ink = solid_ink(ink, ground, table);
-                let bare = ratio(ink, ground);
+                let la = lum(ink);
+                let ratio_ink = |b: u32| {
+                    let lb = lum(b);
+                    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+                };
+                let bare = ratio_ink(ground);
                 if bare >= PET_VEIL_THEME_BARE {
                     return None;
                 }
                 let bar = (letter_bar(bare) + PET_VEIL_GUARD).min(bare);
                 // The worst coat is the letter's own colour (a coat may wear any).
                 let coat = ink;
-                let holds = |a: u8| {
+                let mut prev_g = coat;
+                let mut holds = |a: u8| {
                     let g = aterm_render::over_premul(coat, premul_rgb(ground, a), a) & 0x00FF_FFFF;
-                    ratio(ink, g) >= bar
+                    if g == prev_g {
+                        return false;
+                    }
+                    prev_g = g;
+                    ratio_ink(g) >= bar
                 };
                 Some((1..=u8::MAX).find(|&a| holds(a)).unwrap_or(u8::MAX))
             })();
@@ -1153,13 +1136,11 @@ impl CursorGlow {
         let text = &self.frame_text;
         let under = &mut self.under_out;
         let mut print = 0u64;
-        // One run: the lettered span `s0..s1` at full opacity, its eases
-        // laid outside it (thin to full over the `ease` px before its first
-        // lettered cell, full to thin over the `ease` px past its last), so
-        // every lettered pixel takes the whole veil. Where the body's box
-        // cuts the span, the ease lies in the box's pad, off the coat; beside
-        // the caret's cell (`wall`) the span ends full, the caret's cell
-        // taking none.
+        // One run: the lettered span `s0..s1` at full opacity, its eases laid
+        // outside it, so every lettered pixel takes the whole veil. Where the
+        // body's box cuts the span, the ease lies in the box's pad, off the
+        // coat; beside the caret's cell (`wall`) the span ends full, and the
+        // caret's cell takes none.
         let mut push = |under: &mut Vec<GlowQuad>,
                         (s0, wall0): (i32, bool),
                         (s1, wall1): (i32, bool),
@@ -1288,8 +1269,8 @@ mod tests {
         out
     }
 
-    /// N1 (looks6): a word gap between two cut letters keeps no more light
-    /// than they do beyond one slope step, and every share only falls.
+    /// A word gap between two cut letters keeps no more light than they do
+    /// beyond one slope step, and every share only falls.
     #[test]
     fn a_row_s_cuts_ease_as_one_ramp_through_its_word_gaps() {
         // "as the": columns 0-1 cut, 2 a gap, 3-5 cut; 4 left whole by its own cut.

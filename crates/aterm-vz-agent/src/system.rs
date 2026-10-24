@@ -17,7 +17,7 @@ pub struct Booted {
 }
 
 impl Booted {
-    /// Whether the guest is up: `running`, or `degraded` with its failed units named.
+    /// Whether the guest is up: `running` or `degraded`.
     #[must_use]
     pub fn is_up(&self) -> bool {
         matches!(self.state.as_str(), "running" | "degraded")
@@ -140,7 +140,8 @@ pub fn parse_jobs(text: &str) -> Vec<RawJob> {
         .collect()
 }
 
-/// `systemctl --failed --plain --no-legend --no-pager`'s units: each line's first word.
+/// `systemctl --failed --plain --no-legend --no-pager`'s units: each line's first word, when
+/// it holds a `.` (a unit name).
 #[must_use]
 pub fn parse_failed(text: &str) -> Vec<String> {
     text.lines()

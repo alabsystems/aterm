@@ -198,7 +198,7 @@ pub(super) fn served_since_notice(jsonl: &str, notice: &str) -> bool {
 }
 
 pub(super) fn chosen_since_notice(jsonl: &str, notice: &str) -> Option<String> {
-    let set = aterm_phase::anchor("model.set");
+    let set = aterm_phase::anchor!("model.set");
     let mut after = false;
     let mut model = false;
     let mut chosen = None;

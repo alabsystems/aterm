@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric`: fabric status, live traffic (`tail`), session-log brief (`brief`), lifecycle (`on`, `off`, `doctor` in [`crate::enable`]), and person commands (`mint-for`, `halt`, `inbox`, `post` in [`crate::person`]).
+//! `aterm fabric`: fabric status, live traffic (`tail`), session-log brief (`brief`), lifecycle
+//! (`on`, `off`, `doctor` in [`crate::enable`]), and person commands (`mint-for`, `halt`,
+//! `inbox`, `post` in [`crate::person`]).
 
 #[cfg(any(test, not(target_os = "macos")))]
 use aterm_uds::spawnfd::Stdio;
@@ -132,10 +134,11 @@ pub const TRAFFIC_ROWS: usize = 10;
 
 const TRAFFIC_SCAN_MAX: u64 = 1 << 20;
 
-/// An unhandled `task` or `ask` older than this is a warning: somebody was given work and nobody has taken it.
+/// An unhandled `task` or `ask` older than this is a warning.
 pub const STALE_WORK_MS: u64 = 10 * 60 * 1000;
 
-/// The bound on every socket this report and the operator's one-shot broker commands open: the dial, and each read and write ([`transport::connect`]).
+/// The bound on every socket this report and the operator's one-shot broker commands open: the
+/// dial, and each read and write ([`transport::connect`]).
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 const WORK_KINDS: [&str; 2] = ["task", "ask"];
@@ -167,14 +170,16 @@ pub enum Cmd {
     Off(crate::enable::OffOpts),
     /// `aterm fabric doctor [--retire-ghosts [--yes]]` ([`crate::enable::doctor`]).
     Doctor {
-        /// `--retire-ghosts`: publish `exited` for every presence row this node advertises live that no local instance hosts.
+        /// `--retire-ghosts`: publish `exited` for every presence row this machine's nodes
+        /// advertise (`live` or `away`) that no local instance hosts.
         retire_ghosts: bool,
         /// `--yes`: skip the y/N confirmation (requires `--retire-ghosts`).
         yes: bool,
     },
     /// `aterm fabric mint-for h-<name>|a-<name> …` ([`crate::person::mint_for`]).
     MintFor(crate::person::MintForOpts),
-    /// `aterm fabric halt|inbox|post --cap-file <cap> …` ([`crate::person`]): the verb, and what it was told.
+    /// `aterm fabric halt|inbox|post --cap-file <cap> …` ([`crate::person`]): the verb, and
+    /// what it was told.
     Person(String, crate::person::PersonCmd),
 }
 
@@ -392,7 +397,8 @@ pub enum Source {
     Env,
     /// `[fabric] command` in this file.
     File(PathBuf),
-    /// `command` in the rendezvous file at this path (`aterm fabric on` wrote it; aterm.toml has no command).
+    /// `command` in the rendezvous file at this path (`aterm fabric on` wrote it; aterm.toml
+    /// has no command).
     Rendezvous(PathBuf),
     /// None of those: the command a running instance (this pid) was armed with.
     Instance(u32),
@@ -425,7 +431,9 @@ impl Source {
     }
 }
 
-/// The aterm config file: `$XDG_CONFIG_HOME/aterm/aterm.toml`, else `$HOME/.config/aterm/aterm.toml` — the path `aterm-gui`'s `app_config::config_path` resolves on every Unix.
+/// The aterm config file: `$XDG_CONFIG_HOME/aterm/aterm.toml`, else
+/// `$HOME/.config/aterm/aterm.toml`, the path `aterm-gui`'s `app_config::config_path` resolves
+/// on every Unix.
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
     // `aterm_types::dirs::config_home`: `$XDG_CONFIG_HOME`, or a test binary's own root.
@@ -437,7 +445,9 @@ pub fn config_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
 }
 
-/// `[fabric] command` out of an aterm.toml's TEXT, through the parser the app loads the file with, as the ARGV it names — from either spelling ([`aterm_types::fabric_command`]): a string split on whitespace, or an array of strings taken word for word.
+/// `[fabric] command` out of an aterm.toml's text, through the parser the app loads the file
+/// with, as the argv it names. Either spelling ([`aterm_types::fabric_command`]): a string
+/// split on whitespace, or an array of strings taken word for word.
 pub fn command_in_toml(text: &str) -> Result<Option<Vec<String>>, String> {
     fabric_key(text, "command", command_of)
 }
@@ -472,7 +482,9 @@ pub(crate) fn command_of(v: &aterm_toml::Value) -> Result<Option<Vec<String>>, S
     Ok((!argv.is_empty()).then_some(argv))
 }
 
-/// How a bridge argv is SHOWN to a person: its words joined by spaces, a word a shell would not read as one word single-quoted (`'\''` for a quote in it), so the line reads like the command it is and a path with a space in it is visibly one word.
+/// How a bridge argv is shown to a person: its words joined by spaces, each one a shell would
+/// not read as one word single-quoted ([`shell_word`]), so a path with a space in it is
+/// visibly one word.
 #[must_use]
 pub fn shown_argv<S: AsRef<str>>(argv: &[S]) -> String {
     argv.iter()
@@ -481,7 +493,8 @@ pub fn shown_argv<S: AsRef<str>>(argv: &[S]) -> String {
         .join(" ")
 }
 
-/// One word of [`shown_argv`]: as it is when every character is a letter, a digit or one of `/-_.,:=+@%` (no shell reads any of those), else single-quoted, with a quote in it spelled `'\''`.
+/// One word of [`shown_argv`]: as it is when every character is a letter, a digit or one of
+/// `/-_.,:=+@%`, else single-quoted, with a quote in it spelled `'\''`.
 #[must_use]
 pub fn shell_word(w: &str) -> String {
     let plain = !w.is_empty()
@@ -524,7 +537,8 @@ fn fabric_key<T>(
     fabric.get(key).map_or(Ok(None), value)
 }
 
-/// `[fabric] presence` out of an aterm.toml's text: `Ok(None)` when the table or the key is absent (the bridge's default, `meta`, applies).
+/// `[fabric] presence` out of an aterm.toml's text: `Ok(None)` when the table or the key is
+/// absent (the bridge's default, `meta`, applies).
 pub fn presence_in_toml(text: &str) -> Result<Option<crate::presence::Mode>, String> {
     fabric_key(text, "presence", |v| match v.as_str() {
         Some(s) => crate::presence::Mode::parse(s).map(Some).ok_or_else(|| {
@@ -534,7 +548,8 @@ pub fn presence_in_toml(text: &str) -> Result<Option<crate::presence::Mode>, Str
     })
 }
 
-/// `[fabric] presence` from the aterm.toml [`config_path`] resolves, for a `serve` whose command line did not say.
+/// `[fabric] presence` from the aterm.toml [`config_path`] resolves, for a `serve` whose
+/// command line did not say.
 #[must_use]
 pub fn presence_from_config() -> crate::presence::Mode {
     key_from_config(
@@ -590,7 +605,8 @@ pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
     })
 }
 
-/// `[fabric] receipts` from the aterm.toml [`config_path`] resolves, for a `serve` whose command line said neither `--receipts` nor `--no-receipts`.
+/// `[fabric] receipts` from the aterm.toml [`config_path`] resolves, for a `serve` whose
+/// command line said neither `--receipts` nor `--no-receipts`.
 #[must_use]
 pub fn receipts_from_config() -> bool {
     key_from_config(receipts_in_toml, true, "receipts default to on")
@@ -606,7 +622,8 @@ pub fn log_in_toml(text: &str) -> Result<Option<crate::mirror::LogMode>, String>
     })
 }
 
-/// `[fabric] log` from `aterm.toml` (`auto` when absent; `off` with a stderr warning when unreadable or invalid).
+/// `[fabric] log` from `aterm.toml`: `auto` when absent, `off` with a stderr warning when
+/// unreadable or invalid.
 #[must_use]
 pub fn log_from_config() -> crate::mirror::LogMode {
     key_from_config_or(
@@ -656,7 +673,8 @@ fn is_link_verb<S: AsRef<str>>(words: &[S], i: usize, verb: &str) -> bool {
         && (words[i - 1].as_ref() == "link" || basename(words[i - 1].as_ref()) == "aterm-link")
 }
 
-/// The flags of an `aterm link serve …` / `aterm-link serve …` argv, or `None` when the argv is not a bridge at all.
+/// The flags of an `aterm link serve …` / `aterm-link serve …` argv, or `None` when the argv
+/// is not a bridge.
 #[must_use]
 pub fn serve_flags<S: AsRef<str>>(argv: &[S]) -> Option<Vec<String>> {
     let at = (0..argv.len()).find(|&i| is_link_verb(argv, i, "serve"))?;
@@ -668,7 +686,8 @@ pub fn serve_flags<S: AsRef<str>>(argv: &[S]) -> Option<Vec<String>> {
     )
 }
 
-/// The program prefix of a bridge command (`argv` before `link serve` / `serve`), with `argv[0]` resolved on `$PATH` and canonicalized, formatted with [`shown_argv`].
+/// The program prefix of a bridge command (`argv` before `link serve` / `serve`), with
+/// `argv[0]` resolved on `$PATH` and canonicalized, formatted with [`shown_argv`].
 #[must_use]
 pub fn bridge_program<S: AsRef<str>>(argv: &[S]) -> Option<String> {
     let at = (0..argv.len()).find(|&i| is_link_verb(argv, i, "serve"))?;
@@ -707,9 +726,7 @@ pub(crate) fn bridge_config<S: AsRef<str>>(argv: &[S]) -> Result<Config, String>
 /// One process, as `ps` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proc {
-    /// Its pid.
     pub pid: u32,
-    /// Its parent's pid.
     pub ppid: u32,
     /// Its command line, space-joined as `ps` prints it.
     pub cmd: String,
@@ -731,7 +748,8 @@ pub fn parse_ps(text: &str) -> Vec<Proc> {
         .collect()
 }
 
-/// The machine's process table, or empty when it cannot be read (a sandbox) — every consumer then says "not found" rather than guessing.
+/// The machine's process table, or empty when it cannot be read (a sandbox), so every consumer
+/// says "not found" rather than guessing.
 pub(crate) fn process_table() -> Vec<Proc> {
     #[cfg(target_os = "macos")]
     {
@@ -784,7 +802,8 @@ fn the_one_holder(scan: &aterm_uds::holders::HolderScan) -> Option<u32> {
     }
 }
 
-/// The launchd job label whose running pid is `pid`, from `launchctl list`'s `PID  Status  Label` rows.
+/// The launchd job label whose running pid is `pid`, from `launchctl list`'s
+/// `PID  Status  Label` rows.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_launchctl(text: &str, pid: u32) -> Option<String> {
@@ -812,17 +831,24 @@ fn launchd_label(_pid: u32) -> Option<String> {
 pub struct BrokerView {
     /// The broker socket the command names.
     pub endpoint: String,
-    /// Whether a broker ANSWERED — a connect and a `Hello` round trip, in this build's astream protocol.
+    /// Whether a broker answered: a connect and a `Hello` round trip in this build's astream
+    /// protocol.
     pub reachable: bool,
     /// Why it is not reachable, or why the cap file was refused.
     pub error: Option<String>,
-    /// A broker that answered the `Hello` in ANOTHER astream protocol (astream's `ProtocolMismatch`): nothing either side sends can be read by the other, so it is not `reachable`, and this names why.
+    /// A broker that answered the `Hello` in another astream protocol: neither side can read
+    /// what the other sends, so it is not `reachable`, and this names why.
     pub protocol: Option<astream_broker::ProtocolMismatch>,
-    /// The last line the broker's supervisor captured from its stderr (`<root>/broker.err`) and how old it is, read only when the broker does not answer: the broker's own reason it is not running — a log it refuses to open, an address in use — which `fabric on` otherwise only points at ([`crate::enable::supervisor_last_word`]).
+    /// The last line the broker's supervisor captured from its stderr (`<root>/broker.err`) and
+    /// its age, read only when the broker does not answer: the broker's own reason it is not
+    /// running, such as a log it refuses to open or an address in use
+    /// ([`crate::enable::supervisor_last_word`]).
     pub last_word: Option<String>,
     /// Whether every cap was attached, so the bus can be read.
     pub attached: bool,
-    /// Whether the broker refused the ring as LAPSED (astream's [`astream_broker::BrokerRefusal::is_expired`]): genuine grants whose `exp=` has passed, at the attach or on the head query.
+    /// Whether the broker refused the ring as lapsed
+    /// ([`astream_broker::BrokerRefusal::is_expired`]): genuine grants whose `exp=` has passed,
+    /// at the attach or on the head query.
     pub cap_expired: bool,
     /// The pid serving it: the one process of this user holding its listener ([`listener_pid`]).
     pub pid: Option<u32>,
@@ -832,21 +858,35 @@ pub struct BrokerView {
     pub head: Option<u64>,
     /// How long connect + hello + attach + head took.
     pub rtt_ms: Option<u64>,
-    /// `None` when the report reads the whole fleet (`/f/<F>/>`); `Some(faces)` when the broker is GUARDED and the cap files do not grant that — every broker `on` runs is — so every read is made over the faces the caps DO grant, and TRAFFIC says so.
+    /// `None` when the report reads the whole fleet (`/f/<F>/>`); `Some(faces)` when the broker
+    /// is guarded (every broker `on` runs is) and the cap files do not grant that, so every read
+    /// is made over the faces they do grant, and TRAFFIC says so.
     pub faces: Option<Vec<String>>,
-    /// Whether the broker checks capabilities, measured by attaching one grant minted under [`GUARD_PROBE_SECRET`]: `Some(true)` when it is refused; `Some(false)` when acknowledged, so the cap-forced `<src>`, `trust=human` and per-human halts rest on nothing.
+    /// Whether the broker checks capabilities, measured by attaching one grant minted under
+    /// [`GUARD_PROBE_SECRET`]: `Some(true)` when it is refused; `Some(false)` when acknowledged,
+    /// so the cap-forced `<src>`, `trust=human` and per-human halts rest on nothing.
     pub guarded: Option<bool>,
-    /// The broker's argv0 when that path now names a different file than the image it runs: an update swapped the build and this broker predates it.
+    /// The broker's argv0 when that path now names a different file than the image it runs: an
+    /// update replaced the build after this broker started.
     pub replaced: Option<String>,
-    /// What the broker's ack promises, read off the serving process's argv (a bounded, byte-preserving kernel argv read bracketed by matching process-start records; [`crate::durability`]): no wire request names the tier, and the argv is what the process was started with, not what a job file says it would be.
+    /// What the broker's ack promises, read off the serving process's argv
+    /// ([`crate::durability`]): no wire request names the tier, and the argv is what the process
+    /// was started with, not what a job file says it would be.
     pub durability: Option<crate::durability::Durability>,
-    /// What the broker SAYS it serves: its `Hello` answer's tag 0x01 ([`astream_broker::Client::served_durability`]) — the tier it was opened at, the one in force and why they differ.
+    /// What the broker says it serves, its `Hello` answer's tag 0x01
+    /// ([`astream_broker::Client::served_durability`]): the tier it was opened at, the one in
+    /// force, and why they differ.
     pub served: Option<astream_broker::ServedInfo>,
-    /// The log's health as the broker SAYS it: its `Hello` answer's entry 0x04 ([`astream_broker::Client::broker_health`]) — whether the log is POISONED (it refuses every write until it is reopened) and astream's reason, and the flushes it has issued since it opened.
+    /// The log's health as the broker says it, its `Hello` answer's entry 0x04
+    /// ([`astream_broker::Client::broker_health`]): whether the log is poisoned (it refuses every
+    /// write until reopened) and why, and the flushes issued since it opened.
     pub health: Option<astream_broker::HelloHealth>,
-    /// The log the serving process's argv names ([`crate::broker_args::BrokerArgs::log_path`]): where astream keeps its health snapshot.
+    /// The log the serving process's argv names ([`crate::broker_args::BrokerArgs::log_path`]),
+    /// beside which astream keeps its health snapshot.
     pub log: Option<PathBuf>,
-    /// astream's health snapshot beside that log (`<log>.health`, R5: what the log holds, who is attached, its flushes and its poison), as astream's own reader found it ([`astream_broker::read_health`]) — with whether the process that wrote it still serves the log.
+    /// astream's health snapshot beside that log (`<log>.health`: what the log holds, who is
+    /// attached, its flushes and its poison), as [`astream_broker::read_health`] found it, with
+    /// whether the process that wrote it still serves the log.
     pub snapshot: Option<Result<astream_broker::HealthRead, String>>,
 }
 
@@ -859,7 +899,9 @@ impl BrokerView {
         self.reachable && self.attached && self.head.is_some()
     }
 
-    /// The tier the report names: the one the serving process's argv names ([`Self::durability`]), else — a broker this host cannot read the argv of — the one its `Hello` says it was opened at ([`Self::served`]).
+    /// The tier the report names: the one the serving process's argv names
+    /// ([`Self::durability`]), else, for a broker whose argv this host cannot read, the one its
+    /// `Hello` says it was opened at ([`Self::served`]).
     #[must_use]
     pub fn tier(&self) -> Option<crate::durability::Durability> {
         self.durability.or_else(|| {
@@ -868,7 +910,9 @@ impl BrokerView {
         })
     }
 
-    /// astream's health snapshot ([`Self::snapshot`]) only when it is the serving broker's own NOW: astream's reader says its writer still serves the log, and that writer is [`Self::pid`] ([`crate::broker_health::is_current`]).
+    /// astream's health snapshot ([`Self::snapshot`]) only when it is the serving broker's own
+    /// now: its writer still serves the log and is [`Self::pid`]
+    /// ([`crate::broker_health::is_current`]).
     #[must_use]
     pub fn snapshot_now(&self) -> Option<&astream_broker::BrokerHealth> {
         match &self.snapshot {
@@ -879,7 +923,8 @@ impl BrokerView {
         }
     }
 
-    /// Whether the broker SAYS its log is poisoned, and why: the `Hello`'s entry 0x04 ([`Self::health`]), the in-band word, before the snapshot beside the log — which a poisoned broker has written too, but as old as its period.
+    /// Whether the broker says its log is poisoned, and why: the `Hello`'s entry 0x04
+    /// ([`Self::health`]) first, then the snapshot beside the log, which may be a period old.
     #[must_use]
     pub fn poisoned(&self) -> Option<&str> {
         self.health
@@ -888,7 +933,8 @@ impl BrokerView {
             .or_else(|| self.snapshot_now().and_then(|h| h.poisoned.as_deref()))
     }
 
-    /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), its launchd job, and what its own argv says it serves; no other process is read.
+    /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), its launchd job, and what
+    /// its own argv says it serves; no other process is read.
     pub(crate) fn locate(&mut self) {
         self.locate_with(listener_pid, launchd_label, replaced_build, |pid| {
             aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?)
@@ -932,7 +978,11 @@ fn replaced_build(pid: u32, exe: &str) -> Option<String> {
     (now != running).then(|| exe.to_string())
 }
 
-/// The inode of the executable image `pid` runs, whatever has happened to its path since: `/proc/<pid>/exe` follows to it even once it is unlinked. macOS reads its lowest vnode-backed mapping in this process ([`aterm_sysprobe::kproc::image_inode`]), the file `lsof -d txt` lists first, which keeps the inode the process mapped after a new file is renamed over its path: an `lsof` child cost 0.1-0.16 s of every broker start and `aterm fabric` step.
+/// The inode of the executable image `pid` runs, whatever has happened to its path since:
+/// `/proc/<pid>/exe` follows to it even once it is unlinked. macOS reads its lowest
+/// vnode-backed mapping in-process ([`aterm_sysprobe::kproc::image_inode`]), the file
+/// `lsof -d txt` lists first, which keeps the inode mapped after a new file is renamed over the
+/// path; an `lsof` child cost 0.1-0.16 s per read.
 #[cfg(target_os = "linux")]
 pub(crate) fn running_image_inode(pid: u32) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -983,7 +1033,10 @@ fn lsof_first_inode(text: &str) -> Option<u64> {
         .find_map(|l| l.strip_prefix('i').and_then(|n| n.parse().ok()))
 }
 
-/// The faces a report may read when the broker is guarded and `/f/<F>/>` is not granted: every grant's filter under `/f/<F>/` in the cap files, both modes (a guarded broker authorizes a read by any grant containing it), except the consumer-group names under `/f/<F>/cur/`, which are never published to.
+/// The faces a report may read when the broker is guarded and `/f/<F>/>` is not granted: every
+/// grant's filter under `/f/<F>/` in the cap files, either mode (a guarded broker authorizes a
+/// read by any grant containing it), except the consumer-group names under `/f/<F>/cur/`,
+/// which are never published to.
 #[must_use]
 pub fn readable_faces(fleet: &str, cap_files: &[String]) -> Vec<String> {
     let root = format!("/f/{fleet}/");
@@ -1009,16 +1062,20 @@ fn lapsed(e: &io::Error) -> bool {
     astream_broker::broker_refusal(e).is_some_and(astream_broker::BrokerRefusal::is_expired)
 }
 
-/// The words `aterm fabric`'s warning for a lapsed ring is built from ([`BrokerView::cap_expired`]), and that `doctor` picks the renewal by ([`crate::enable::fix_for`]).
+/// The words of `aterm fabric`'s lapsed-ring warning ([`BrokerView::cap_expired`]), by which
+/// `doctor` picks the renewal ([`crate::enable::fix_for`]).
 pub const CAP_LAPSED: &str = "refuses this node's cap as lapsed";
 
-/// The words `aterm fabric`'s warning for a poisoned log is built from ([`BrokerView::poisoned`]), and that `doctor` picks its remedy by ([`crate::enable::fix_for`]).
+/// The words of `aterm fabric`'s poisoned-log warning ([`BrokerView::poisoned`]), by which
+/// `doctor` picks its remedy ([`crate::enable::fix_for`]).
 pub const POISONED_WARNING: &str = "says its log is POISONED";
 
-/// The words of the warning for a broker whose flushes have failed without poisoning its log, which `doctor` picks the disk's remedy by.
+/// The words of the warning for a broker whose flushes failed without poisoning its log, by
+/// which `doctor` picks the disk's remedy.
 pub const FLUSH_FAILED_WARNING: &str = "says a flush of its log failed";
 
-/// Name the broker's process ([`BrokerView::locate`]), read the health snapshot beside its log, and reach it ([`reach_broker`]).
+/// Name the broker's process ([`BrokerView::locate`]), read the health snapshot beside its log,
+/// and reach it as [`reach_broker`] does.
 pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
     let mut view = BrokerView {
         endpoint: cfg.broker.clone(),
@@ -1035,7 +1092,8 @@ pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
     reach(cfg, view)
 }
 
-/// Reach the broker FOR REAL, naming no process: connect, `Hello` (does a broker answer at all), the whole ring attached ([`transport::attach_ring`]), head query.
+/// Reach the broker, naming no process: connect, `Hello`, the whole ring attached
+/// ([`transport::attach_ring`]), and a head query.
 pub(crate) fn reach_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
     reach(
         cfg,
@@ -1138,7 +1196,8 @@ fn supervisor_last_word(cfg: &Config) -> Option<String> {
     crate::enable::supervisor_last_word(&root)
 }
 
-/// The BROKER section's `health` row, and doctor's `health:` line: the log's health as the broker's own `Hello` said it ([`BrokerView::health`], [`crate::broker_health::in_band`]).
+/// The BROKER section's `health` row, and doctor's `health:` line: the log's health as the
+/// broker's own `Hello` said it ([`crate::broker_health::in_band`]).
 #[must_use]
 pub fn health_row(b: &BrokerView) -> Option<String> {
     match &b.health {
@@ -1152,7 +1211,9 @@ pub fn health_row(b: &BrokerView) -> Option<String> {
     }
 }
 
-/// The BROKER section's `holds` row at `now_ms`: what the log holds and who is attached, from astream's snapshot beside the log the serving process's argv names ([`BrokerView::snapshot`], [`crate::broker_health::snapshot_row`]), said as the serving broker's own only when astream's reader says so.
+/// The BROKER section's `holds` row at `now_ms`: what the log holds and who is attached, from
+/// astream's snapshot beside the log ([`crate::broker_health::snapshot_row`]), said as the
+/// serving broker's own only when astream's reader says so.
 #[must_use]
 pub fn holds_row(b: &BrokerView, now_ms: u64) -> Option<String> {
     let log = b.log.as_ref()?;
@@ -1230,18 +1291,21 @@ fn health_json(b: &BrokerView, now_ms: u64) -> J {
     ])
 }
 
-/// How much the top-level `aterm doctor`'s `fabric:` row asks of its reader ([`DoctorSummary`]), in that report's own three weights.
+/// How much the top-level `aterm doctor`'s `fabric:` row asks of its reader, in that report's
+/// three weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SummaryLevel {
     /// The broker answers, the bus reads, and it says its log takes writes.
     Ok,
-    /// A fact with nothing to fix here: the fabric is off, or a broker that answers does not say whether its log is poisoned (it predates the entry).
+    /// Nothing to fix here: the fabric is off, or a broker that answers does not say whether
+    /// its log is poisoned.
     Note,
-    /// Mail does not move: the broker does not answer, its bus cannot be read, or it says its log is poisoned.
+    /// Mail does not move: the broker does not answer, its bus cannot be read, or it says its
+    /// log is poisoned.
     Warn,
 }
 
-/// The fabric in ONE ROW, for the top-level `aterm doctor` ([`doctor_summary`]).
+/// The fabric in one row, for the top-level `aterm doctor` ([`doctor_summary`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorSummary {
     pub level: SummaryLevel,
@@ -1250,7 +1314,9 @@ pub struct DoctorSummary {
     pub unmeasured: bool,
 }
 
-/// Top-level `aterm doctor` `fabric:` row: probes the broker named by `$ATERM_FABRIC_COMMAND`, `aterm.toml`, or `fabric.toml` without querying local instances or scanning the roster.
+/// The top-level `aterm doctor`'s `fabric:` row: probes the broker the command names
+/// (`$ATERM_FABRIC_COMMAND` in a development build, `aterm.toml`, or the `fabric.toml`
+/// rendezvous file) without asking local instances or reading the roster.
 #[must_use]
 pub fn doctor_summary(withheld: Option<&str>) -> DoctorSummary {
     let config = config_path();
@@ -1312,7 +1378,8 @@ fn summary_for(
     }
 }
 
-/// [`doctor_summary`]'s verdict on one probe, pure: the broker's own words (its `Hello`'s served tier, entry 0x01, and its health, entry 0x04), never the argv's.
+/// [`doctor_summary`]'s verdict on one probe, pure: the broker's own words (its `Hello`'s
+/// served tier and health entries), never the argv's.
 #[must_use]
 pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     let at = safe(&b.endpoint, 256);
@@ -1407,7 +1474,8 @@ pub struct Traffic {
     pub off: u64,
     /// The publisher's wall clock (`t=`), ms — informational, `0` when absent.
     pub t_ms: u64,
-    /// Who sent it: the cap-forced `<src>` segment, or `<sid>@<node>` when a node attests which of its sessions spoke (the bridge's own rule).
+    /// Who sent it: the cap-forced `<src>` segment, or `<sid>@<node>` when a node attests which
+    /// of its sessions spoke (the bridge's own rule).
     pub from: String,
     /// Who it is for: `<sid>@<node>`, `fleet`, `all`, or `-` for a node's own face.
     pub to: String,
@@ -1586,7 +1654,8 @@ fn record_t(conn: &mut Conn, filter: &str, off: u64) -> Option<u64> {
     (*at == off).then(|| Body::decode(raw).0.t)
 }
 
-/// An `ask` or `task` whose `dl=` has passed with no `answer`, `report` or `ack` carrying its offset as `re=` anywhere on the fleet's `in` lanes (R8).
+/// An `ask` or `task` whose `dl=` has passed with no `answer`, `report` or `ack` carrying its
+/// offset as `re=` anywhere on the fleet's `in` lanes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overdue {
     /// The ask's offset — what a reply would carry as `re=`.
@@ -1601,7 +1670,8 @@ pub struct Overdue {
     pub dl: u64,
     /// How long past the deadline it is, ms.
     pub late_ms: u64,
-    /// Whether the asker's own bridge has already put `expired re=<off>` on the asker's lane — the verdict R8 makes that bridge responsible for.
+    /// Whether the asker's own bridge, which owns that verdict, has already put
+    /// `expired re=<off>` on the asker's lane.
     pub expired: bool,
 }
 
@@ -1648,7 +1718,8 @@ fn in_filters(fleet: &str, faces: Option<&[String]>) -> Vec<String> {
     }
 }
 
-/// The overdue asks among `records` as of `now_ms`, for tests: a `WORK_KINDS` record whose `t + dl` is past, and no `answer|report|ack` with `re=` naming it.
+/// The overdue asks among `records` as of `now_ms`, for tests: a `WORK_KINDS` record whose
+/// `t + dl` is past, and no `answer|report|ack` with `re=` naming it.
 #[cfg(test)]
 #[must_use]
 pub(crate) fn overdue_of(
@@ -1733,14 +1804,12 @@ pub struct MsgMeta {
     pub off: u64,
     /// The sender, as the endpoint renders it.
     pub from: String,
-    /// Its kind.
     pub kind: String,
 }
 
 /// What one local instance says about one of its sessions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalSession {
-    /// The session id.
     pub sid: String,
     /// Its title (pct-decoded, not yet escaped).
     pub title: String,
@@ -1762,7 +1831,8 @@ pub struct LocalSession {
     pub posts: Option<u64>,
     /// Every row above the watermark, for the age check.
     pub unhandled: Vec<MsgMeta>,
-    /// The last recorded hold transition's `(reason, origins)`, when held ([`last_hold`]): `fleet,local` when both slots stand.
+    /// The last hold transition's `(reason, origins)` while held ([`last_hold`]); `fleet,local`
+    /// when both slots stand.
     pub hold_why: Option<(String, String)>,
     /// The broadcast topics this session has opted into (`topic ls`), in topic order.
     pub topics: Vec<String>,
@@ -1773,9 +1843,7 @@ pub struct LocalSession {
 /// What one local instance says about itself.
 #[derive(Debug, Clone, Default)]
 pub struct InstanceView {
-    /// The instance pid.
     pub pid: u32,
-    /// Its control socket.
     pub sock: String,
     /// Whether `aterm ctl --pid <pid>` reaches it ([`aterm_ctl::pid_reaches`]).
     pub pid_reaches: bool,
@@ -1783,7 +1851,8 @@ pub struct InstanceView {
     pub error: Option<String>,
     /// `fabric status`'s `state=`.
     pub fabric: Option<String>,
-    /// `fabric status`'s `reason=`: why the bridge's broker link is down, when `state=stalled` (`-` otherwise).
+    /// `fabric status`'s `reason=`: why the bridge's broker link is down when `state=stalled`,
+    /// else `-`.
     pub reason: Option<String>,
     /// `fabric status`'s `rtt_ms=`: the bridge's last acknowledged round trip to the broker.
     pub rtt_ms: Option<u64>,
@@ -1791,14 +1860,16 @@ pub struct InstanceView {
     pub link_age_ms: Option<u64>,
     /// `fabric status`'s `supervised=`.
     pub supervised: Option<bool>,
-    /// `fabric status`'s `build=` — the instance's own build — and `bridge_build=`, the build its bridge named in `hello` (absent from an instance or a bridge from before the handshake).
+    /// `fabric status`'s `build=` (the instance's own build) and `bridge_build=` (the build its
+    /// bridge named in `hello`); absent from an instance or a bridge that predates them.
     pub build: Option<String>,
     pub bridge_build: Option<String>,
-    /// `fabric status`'s `lane_faults=`: how many of its bridge's lines the instance could not parse.
+    /// `fabric status`'s `lane_faults=`: bridge lines the instance could not parse.
     pub lane_faults: Option<u64>,
     /// The command it runs (or was launched with), decoded into its argv ([`status_argv`]).
     pub command: Option<Vec<String>>,
-    /// The PROGRAM that command runs ([`bridge_program`]): resolved when the report was read, so a substituted program is named beside its flags.
+    /// The program that command runs ([`bridge_program`]), resolved when the report was read so
+    /// a substituted program is named beside its flags.
     pub program: Option<String>,
     /// Its bridge child pid(s), from the process table.
     pub bridge_pids: Vec<u32>,
@@ -1806,11 +1877,11 @@ pub struct InstanceView {
     pub node: Option<String>,
     /// The state dir its bridge command names.
     pub state_dir: Option<String>,
-    /// Its sessions.
     pub sessions: Vec<LocalSession>,
 }
 
-/// The BRIDGES table's FABRIC cell: the state, plus the `stalled` reason or the last acked round trip and its age.
+/// The BRIDGES table's FABRIC cell: the state, plus the `stalled` reason or the last acked
+/// round trip and its age.
 #[must_use]
 pub fn fabric_cell(i: &InstanceView) -> String {
     let state = safe(i.fabric.as_deref().unwrap_or("-"), 32);
@@ -1836,7 +1907,9 @@ pub fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-/// Fill a session's inbox numbers from the two peeked replies: `inbox 0 --peek --meta` (its header counts every unlisted row as `pending=`, and it lists every un-landed post) and `inbox --peek --meta` (every message row).
+/// Fill a session's inbox numbers from the two peeked replies: `inbox 0 --peek --meta` (its
+/// header counts every unlisted row as `pending=`, and it lists every un-landed post) and
+/// `inbox --peek --meta` (every message row).
 pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &[String]) {
     let num = |k: &str| kv(header0, k).and_then(|v| v.parse::<u64>().ok());
     s.hold = kv(header0, "hold").and_then(|v| v.parse::<u8>().ok());
@@ -1866,7 +1939,8 @@ pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &
     s.unread = Some((s.unhandled.len() as u64).saturating_sub(s.pending.unwrap_or(0)));
 }
 
-/// The `(reason, origins)` of the LAST `kind=hold` transition in a `timeline` reply, when the session was held after it.
+/// The `(reason, origins)` of the last `kind=hold` transition in a `timeline` reply, when it
+/// left the session held.
 #[must_use]
 pub fn last_hold(timeline: &[String]) -> Option<(String, String)> {
     let row = timeline
@@ -2039,13 +2113,13 @@ pub(crate) fn session_ids(rows: &[String]) -> impl Iterator<Item = &str> {
 /// One SESSIONS row: a local session, a live remote one, or both joined.
 #[derive(Debug, Clone, Default)]
 pub struct SessionRow {
-    /// The session id.
     pub sid: String,
     /// The local instance hosting it, if one here does.
     pub pid: Option<u32>,
     /// The node its presence row (or its instance's bridge) names.
     pub node: String,
-    /// The bus presence `state=` as the report READS it — `away` for a `live` row whose node's will fired ([`crate::glance::AWAY`]), `gone` for a retired one still shown — or `-` when the bus has no row for it.
+    /// The bus presence `state=` as the report reads it (`away` for a `live` row whose node's
+    /// will fired, `gone` for a retired one still shown), or `-` when the bus has no row for it.
     pub bus: String,
     /// The local ctl view, when a local instance hosts it.
     pub local: Option<LocalSession>,
@@ -2071,11 +2145,11 @@ fn bus_field(row: &crate::glance::Row, key: &str) -> Option<String> {
 /// A presence row of a node (not a session).
 #[derive(Debug, Clone, Default)]
 pub struct NodeRow {
-    /// The node id.
     pub node: String,
     /// Its `host=`.
     pub host: String,
-    /// Its `state=` as the node's row carries it (`live`, or `away` once its will fired — `gone` from a bridge that predates the word).
+    /// Its `state=` as the node's row carries it: `live`, or `away` once its will fired (`gone`
+    /// from an older bridge).
     pub state: String,
     /// Its `fabric=`.
     pub fabric: String,
@@ -2086,7 +2160,8 @@ pub struct NodeRow {
 }
 
 impl NodeRow {
-    /// The state as the report says it: a will reads [`crate::glance::AWAY`] whichever word the bridge that registered it wrote.
+    /// The state as the report says it: a will reads [`crate::glance::AWAY`] whichever word the
+    /// bridge that registered it wrote.
     #[must_use]
     pub fn reads(&self) -> &str {
         if crate::glance::is_will(&self.state) {
@@ -2097,36 +2172,37 @@ impl NodeRow {
     }
 }
 
-/// The distinct-subject bound one producer — one node — may ever hold (`astream-broker`'s `MAX_SUBJECTS_PER_PRODUCER`).
+/// The distinct subjects one producer (one node) may ever hold.
 pub const SUBJECT_BUDGET: usize = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER;
 
-/// How much of [`SUBJECT_BUDGET`] spent is a WARNING: three quarters, while a thousand subjects — some five hundred sessions — are still left.
+/// How much of [`SUBJECT_BUDGET`] spent is a warning: three quarters, while about a thousand
+/// subjects are still left.
 pub const SUBJECT_BUDGET_WARN: usize = SUBJECT_BUDGET / 4 * 3;
 
 /// Everything `status` found.
 #[derive(Debug, Clone)]
 pub struct Report {
-    /// Where the command came from.
     pub source: Source,
     /// The command itself, as the argv it runs.
     pub command: Vec<String>,
     /// Whether its program lies in a cargo target directory ([`in_cargo_target_dir`]).
     pub program_in_target_dir: bool,
-    /// The PROGRAM the command runs ([`bridge_program`]), resolved when the report was read — what each instance's own is compared with.
+    /// The program the command runs ([`bridge_program`]), resolved when the report was read:
+    /// what each instance's own is compared with.
     pub program: Option<String>,
     /// The config file looked in, if any.
     pub config_path: Option<PathBuf>,
-    /// The parsed bridge config.
     pub cfg: Config,
-    /// What the bridge's presence rows carry: `--presence` on the command, else `[fabric] presence` in the config file, else `meta`.
+    /// What the bridge's presence rows carry: `--presence` on the command, else
+    /// `[fabric] presence` in the config file, else `meta`.
     pub presence: crate::presence::Mode,
-    /// Whether the bridge publishes receipts (R8): `--receipts`/`--no-receipts` on the command, else `[fabric] receipts` in the config file, else on.
+    /// Whether the bridge publishes receipts: `--receipts`/`--no-receipts` on the command, else
+    /// `[fabric] receipts` in the config file, else on.
     pub receipts: bool,
     /// The node id in the command's state dir.
     pub node: Option<String>,
     /// `(path, grant count or error)` per cap file.
     pub caps: Vec<(String, Result<usize, String>)>,
-    /// The broker probe.
     pub broker: BrokerView,
     /// Every local instance that answered or should have.
     pub instances: Vec<InstanceView>,
@@ -2138,15 +2214,17 @@ pub struct Report {
     pub nodes: Vec<NodeRow>,
     /// How many presence rows the roster read returned; `None` when it could not be read.
     pub roster_rows: Option<usize>,
-    /// Whether the roster read was cut at [`crate::glance::MAX_ROWS`]: past the cut, nodes and sessions exist that no section shows.
+    /// Whether the roster read was cut at [`crate::glance::MAX_ROWS`], so some nodes and
+    /// sessions are in no section.
     pub roster_truncated: bool,
-    /// The distinct subjects THIS node's producer holds on the bus, of [`SUBJECT_BUDGET`] ([`subjects_of`]), or why they could not be counted.
+    /// The distinct subjects this node's producer holds on the bus, of [`SUBJECT_BUDGET`]
+    /// ([`subjects_of`]), or why they could not be counted.
     pub subjects: Option<Result<usize, String>>,
     /// Bus session rows that are not live and not local (not shown in text).
     pub exited: usize,
     /// TRAFFIC, oldest first.
     pub traffic: Vec<Traffic>,
-    /// Every `ask`/`task` on the bus past its `dl=` with no reply (R8), each a warning; kept as data for `--json`.
+    /// Every `ask`/`task` on the bus past its `dl=` with no reply, each a warning.
     pub overdue: Vec<Overdue>,
     /// WARNINGS.
     pub warnings: Vec<String>,
@@ -2164,7 +2242,8 @@ pub enum Off {
 }
 
 impl Off {
-    /// The state alone — what `doctor` prints above its own `fix:` line, so the remedy is said once, in the shape every other finding uses.
+    /// The state alone: what `doctor` prints above its own `fix:` line, so the remedy is said
+    /// once.
     #[must_use]
     pub fn state(&self) -> String {
         match self {
@@ -2180,7 +2259,8 @@ impl Off {
         }
     }
 
-    /// The one line the operator reads (`status`): the state, and for an off fabric the verb that turns it on.
+    /// The one line `status` prints: the state, and for an off fabric the verb that turns it
+    /// on.
     #[must_use]
     pub fn message(&self) -> String {
         match self {
@@ -2346,7 +2426,8 @@ fn in_cargo_target_dir(program: &Path) -> bool {
             .any(|d| d.join("CACHEDIR.TAG").is_file())
 }
 
-/// Count distinct subjects `node`'s producer holds in the broker's last-value index across `/f/<fleet>/pub/<node>/>` and `/f/<fleet>/in/*/*/<node>/*`, bounded by [`SUBJECT_BUDGET`].
+/// Count the distinct subjects `node`'s producer holds in the broker's last-value index across
+/// `/f/<fleet>/pub/<node>/>` and `/f/<fleet>/in/*/*/<node>/*`, up to [`SUBJECT_BUDGET`].
 pub(crate) fn subjects_of(conn: &mut Conn, fleet: &str, node: &str) -> io::Result<usize> {
     let mut n = 0usize;
     for filter in [
@@ -2901,13 +2982,15 @@ fn warnings(
     w
 }
 
-/// The local clock's offset from UTC in seconds, read once in this process (`localtime_r`'s `tm_gmtoff`); `None` where the C library cannot say, and then every time prints in UTC and says so.
+/// The local clock's offset from UTC in seconds, read once per process (`tm_gmtoff`); `None`
+/// where the C library cannot say, and the report then prints UTC and says so.
 pub(crate) fn local_offset() -> Option<i64> {
     static OFFSET: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
     *OFFSET.get_or_init(aterm_uds::zone::local_offset_now)
 }
 
-/// A record's time at the clock's offset: `HH:MM:SS` within a day of `now`, `MM-DDTHH:MM` beyond it, `-` when the record carried none.
+/// A record's time at the clock's offset: `HH:MM:SS` within 20 hours of `now`, `MM-DDTHH:MM`
+/// beyond, `-` when the record carried none.
 #[must_use]
 pub fn clock(t_ms: u64, now_ms: u64, offset: i64) -> String {
     if t_ms == 0 {
@@ -3029,7 +3112,9 @@ fn connect_attached(cfg: &Config) -> io::Result<Conn> {
     Ok(conn)
 }
 
-/// Publish `state=exited` for each `(sid, node)` by rewriting its existing presence row (keeping `inc=`, `epoch=`, `gen=` intact) under [`crate::state::StateDir::lock_bridge`] and reserving sequences from the current incarnation.
+/// Publish `state=exited` for each `(sid, node)` by rewriting its presence row (`inc=`,
+/// `epoch=` and `gen=` kept) under [`crate::state::StateDir::lock_bridge`], with sequences
+/// reserved from the current incarnation.
 pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Result<usize> {
     let cfg = &report.cfg;
     let node = report_node(report)?;
@@ -3080,15 +3165,20 @@ pub fn publish_exited(report: &Report, ghosts: &[(String, String)]) -> io::Resul
 /// What [`retire_progress`] read back.
 #[derive(Debug, Default)]
 pub struct RetireProgress {
-    /// The `state=` of each named session's presence row under the node asked about; a sid with no row is absent.
+    /// The `state=` of each named session's presence row under the node asked about; a sid
+    /// with no row is absent.
     pub states: BTreeMap<String, String>,
     /// Why the bridge refused each named session it refused.
     pub refused: BTreeMap<String, String>,
-    /// Whether the node's `ev` face was read through to its head, so an empty `refused` entry means the bridge had refused nothing.
+    /// Whether the node's `ev` face was read through to its head, so an empty `refused` means
+    /// the bridge refused nothing.
     pub refusals_read: bool,
 }
 
-/// What the bus says of each named session of `node` since the doctor asked that node's bridge to retire it, read with the cap files' grants (a node's ring reads every member's `pub/` faces): the `state=` of its presence row under `node`, and why the bridge refused it, for every `presence-retire-refused` on `node`'s `ev` face at or after offset `since`.
+/// What the bus says of each named session of `node` since the doctor asked that node's bridge
+/// to retire it, read with the cap files' grants: the `state=` of its presence row, and why the
+/// bridge refused it, for every `presence-retire-refused` on `node`'s `ev` face at or after
+/// offset `since`.
 pub fn retire_progress(
     report: &Report,
     node: &str,
@@ -3143,7 +3233,8 @@ pub fn retire_progress(
     })
 }
 
-/// A bridge's `presence-retire-refused sid=<sid> reason=<r> [pid=<p>]` event as `(sid, why)`, the why in words; `None` for any other event.
+/// A bridge's `presence-retire-refused sid=<sid> reason=<r> [pid=<p>]` event as `(sid, why)`,
+/// the why in words; `None` for any other event.
 #[must_use]
 pub fn refused_retire_event(ev: &str) -> Option<(String, String)> {
     let rest = ev.strip_prefix("presence-retire-refused ")?;
@@ -3157,7 +3248,7 @@ pub fn refused_retire_event(ev: &str) -> Option<(String, String)> {
     Some((sid.to_string(), why))
 }
 
-/// One presence body with `state=` set to `exited` and `t=` refreshed; every other token kept in place.
+/// One presence body with `state=` set to `exited` and `t=` refreshed, every other token kept.
 pub(crate) fn retired_body(body: &str) -> String {
     let now = crate::now_ms().to_string();
     let mut out: Vec<String> = Vec::new();
@@ -3208,7 +3299,9 @@ pub(crate) fn unanswered(r: &Report) -> Vec<String> {
     out
 }
 
-/// THE GHOSTS: presence rows this machine's node advertises LIVE that no local instance hosts — `away` ones included, since a local node whose will fired with no instance here left exactly these behind (a crash, a `kill -9`).
+/// The ghosts: presence rows this machine's nodes advertise that no local instance hosts,
+/// `away` ones included, since a local node whose will fired with no instance here (a crash, a
+/// SIGKILL) leaves exactly these behind.
 pub(crate) fn ghost_rows<'r>(
     sessions: &'r [SessionRow],
     local: &BTreeSet<&str>,
@@ -3219,7 +3312,7 @@ pub(crate) fn ghost_rows<'r>(
         .collect()
 }
 
-/// Every session any local instance hosts, by pid, read as the report reads it (each instance's `sessions`).
+/// Every session any local instance hosts, by pid, from each instance's `sessions`.
 pub(crate) fn node_hosted() -> Result<BTreeMap<String, u32>, String> {
     let listed = aterm_ctl::local_instances().map_err(|e| e.reason)?;
     let mut hosted = BTreeMap::new();
@@ -3237,7 +3330,8 @@ pub(crate) fn node_hosted() -> Result<BTreeMap<String, u32>, String> {
     Ok(hosted)
 }
 
-/// Why a presence row may not be retired on an operator's request: the door the request came through is one instance's, the ghost list is the node's.
+/// Why a presence row may not be retired on an operator's request: the request came through
+/// one instance, but the ghost list is the node's.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RetireRefusal {
     /// A local instance hosts the session.
@@ -3269,13 +3363,14 @@ pub(crate) fn local_nodes<'r>(
         .collect()
 }
 
-/// Whether a SESSIONS row's `bus` is one the roster still ADVERTISES: `live`, or `away` with its node.
+/// Whether a SESSIONS row's `bus` is one the roster still advertises: `live`, or `away` (a node
+/// whose will fired).
 #[must_use]
 pub fn advertised(bus: &str) -> bool {
     bus == "live" || bus == crate::glance::AWAY
 }
 
-/// How many sessions the roster advertises on `node` — `live`, or `away` with a node whose will fired ([`advertised`]).
+/// How many sessions the roster advertises on `node` ([`advertised`]).
 #[must_use]
 pub fn live_sessions_on(r: &Report, node: &str) -> usize {
     r.sessions
@@ -6748,8 +6843,8 @@ mod running_argv_tests {
         }
     }
 
-    /// The broker is the process holding its listener: every other read is of the holder, and
-    /// none is made when nothing holds it.
+    /// Every other read (label, argv, replaced build) is of the holder, and none is made when
+    /// nothing holds it.
     #[test]
     fn the_broker_is_the_process_holding_its_listener() {
         let argv = words(&["/opt/aterm", "link", "broker", "/r/bus.sock", "/r/bus.log"]);
@@ -6792,10 +6887,8 @@ mod running_argv_tests {
         }
     }
 
-    /// The holder's own argv names the endpoint by the rule the listener scan names its bound
-    /// path by: its bytes, or the endpoint's canonical spelling, so a broker the scan finds
-    /// through another spelling of its folder is read whole, and one bound through a link that
-    /// the scan cannot find is not read either.
+    /// The holder's argv names the endpoint by its bytes or its canonical spelling, as the
+    /// listener scan names its bound path.
     #[cfg(unix)]
     #[test]
     fn the_holders_socket_word_names_the_endpoint_as_its_listener_does() {
@@ -6828,9 +6921,7 @@ mod running_argv_tests {
         );
     }
 
-    /// One holder is the broker; none, or two (a fork that kept the listener, a stale listener
-    /// beside a new one at its path), is no answer. A table the scan could not read leaves the
-    /// one holder it found the broker.
+    /// A table the scan could not read still leaves the one holder it found the broker.
     #[test]
     fn one_holder_is_the_broker_and_two_are_none() {
         let scan = |holders: &[u32]| aterm_uds::holders::HolderScan {
@@ -6849,8 +6940,7 @@ mod running_argv_tests {
         assert_eq!(the_one_holder(&incomplete), Some(71));
     }
 
-    /// The replaced-build check reads the holder's whole argv[0]; with no argv read it is not
-    /// made, for no other process's command line stands in for it.
+    /// With no argv read, the replaced-build check is not made.
     #[test]
     fn the_replaced_build_check_reads_the_whole_argv0() {
         let spaced = "/a b/aterm";

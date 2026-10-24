@@ -1157,10 +1157,10 @@ fn a_question_withheld_behind_a_draft_is_a_question_never_idle() {
     assert!(!p.head_off_screen);
     assert_eq!(why(&d), WITHHELD);
     assert_eq!(worker_phase(&r), Phase::Prompt);
-    let notice = row_of(&r, crate::anchors::anchor_text("dialog.deferred_question"));
+    let notice = row_of(&r, crate::anchor!("dialog.deferred_question"));
     assert_eq!(p.span, (notice, notice));
     let mut s = r.clone();
-    s[notice] = crate::anchors::anchor_text("dialog.deferred_suggestion").to_string();
+    s[notice] = crate::anchor!("dialog.deferred_suggestion").to_string();
     assert_eq!(
         why(&parse_prompt_v2(&s)
             .and_then(|p| p.question_dialog)

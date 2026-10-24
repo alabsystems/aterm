@@ -97,8 +97,9 @@ impl Probe {
     }
 
     /// Current thermal throttle level, or [`Why`] it is unavailable.
+    ///
     /// # Errors
-    /// Returns [`Why`] when the platform or machine provides no reading.
+    /// Returns [`Why`] when the platform or machine provides no reading (always on macOS).
     pub fn throttle(&mut self) -> Result<Throttle, Why> {
         #[cfg(target_os = "linux")]
         {
@@ -669,8 +670,7 @@ pub struct GpuClients {
     /// Whether the walk stopped at [`MAX_GPU_CLIENTS`].
     pub truncated: bool,
     /// Whether every child's entry id was read: not truncated, no identity read failed, and no
-    /// client came or went under the iterator. Missing counter properties do not establish that
-    /// a child was absent; its identity remains in [`Self::entries`].
+    /// client came or went under the iterator.
     pub complete: bool,
 }
 

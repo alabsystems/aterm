@@ -535,6 +535,38 @@ fn the_disk_lens_says_its_reading() {
     );
 }
 
+/// The close-up's busiest program says how long it has been up once it has run long, as a
+/// lower bound while a member's birth went unread. NEGATIVE CONTROLS: a young program, and one
+/// whose every birth went unread, say no age.
+#[test]
+fn the_busiest_program_says_how_long_it_has_been_up() {
+    let m = FaceMetrics::helvetica_neue();
+    let busiest = |born_ago_ms: Option<i64>, unborn: usize| {
+        let mut snap = lens_scene(Scene::Calm);
+        let at = snap.at_unix_ms;
+        let b = snap.facts.busiest.as_mut().expect("a busiest program");
+        b.born_ms = born_ago_ms.map(|ago| at - ago);
+        b.unborn = unborn;
+        busiest_line(two_columns(&snap, &m)).expect("its line")
+    };
+    assert_eq!(
+        busiest(Some(47 * MIN_MS), 0),
+        "rustc \u{d7}9 in Tab 3, 5.9 cores, up 47 min"
+    );
+    assert_eq!(
+        busiest(Some(47 * MIN_MS), 1),
+        "rustc \u{d7}9 in Tab 3, 5.9 cores, up \u{2265} 47 min",
+        "one member's birth unread: the oldest may be older"
+    );
+    for (young, unborn) in [(Some(5 * MIN_MS), 0), (None, 9)] {
+        assert_eq!(
+            busiest(young, unborn),
+            "rustc \u{d7}9 in Tab 3, 5.9 cores",
+            "{young:?}"
+        );
+    }
+}
+
 #[test]
 fn the_scope_filters_the_lists() {
     let snap = lens_scene(Scene::Calm);

@@ -179,7 +179,7 @@ pub(crate) struct PrivacySnapshot {
     /// Every bundle on disk claiming this process's `CFBundleIdentifier`, and
     /// the answer's age.
     claimants: Option<(Claimants, Duration)>,
-    /// No census answer exists yet — `census=pending`, as opposed to `off`.
+    /// No census answer exists yet: `census=pending`, as opposed to `off`.
     census_pending: bool,
     /// Whether `/usr/bin/trash` is on this Mac: without it the Security panel
     /// offers no move, and no row reads `trash=offered`.
@@ -214,7 +214,8 @@ pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSp
     split
 }
 
-/// Successful access establishes the observing host's scope directly.
+/// The FDA scope the report uses: a grant this process observed, with no scope measured, is this
+/// process's.
 pub(crate) const fn observed_fda_scope(
     fda: FdaState,
     measured: consent::FdaScope,
@@ -914,12 +915,15 @@ pub(crate) struct PrivacyAppFacts {
     /// The `observer log=` token.
     observer_log: &'static str,
     access_card: AccessCardInputs,
-    /// This user's programs macOS's program check holds now: the control worker's read ([`Self::with_program_check`]), `None` from the main hop.
+    /// This user's programs macOS's program check holds now: the control worker's read
+    /// ([`Self::with_program_check`]), `None` from the main hop.
     program_check: Option<(u32, u64)>,
 }
 
 impl PrivacyAppFacts {
-    /// These facts with `held`, this user's programs macOS's program check holds now and the longest held, ms ([`crate::sys_host::Shared::program_check_now`], read on the control worker: it may pull a reading).
+    /// These facts with `held`: this user's programs macOS's program check holds now and the
+    /// longest held, ms ([`crate::sys_host::Shared::program_check_now`], read on the control
+    /// worker, where it may pull a reading).
     pub(crate) fn with_program_check(mut self, held: Option<(u32, u64)>) -> Self {
         self.program_check = held;
         self
@@ -1619,10 +1623,9 @@ mod tests {
         }
     }
 
-    /// THE DEVTOOLS LINE COUNTS THE LIVE WAIT: it ends with how many of this user's programs
-    /// macOS's program check holds now and the longest held, `0` with no oldest when none is
-    /// held, and `-` for both when nothing was read; the JSON's `devtools` object carries the same
-    /// two values, `null` for `-`.
+    /// The devtools line ends with how many of this user's programs macOS's program check holds
+    /// now and the longest held: `0` with no oldest when none is held, `-` for both when nothing
+    /// was read. The JSON's `devtools` object carries the same two values, `null` for `-`.
     #[test]
     fn the_devtools_line_counts_the_live_wait() {
         let mut snap = snapshot(0, FdaState::Granted, SpikeEvidence::MEASURED);

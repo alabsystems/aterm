@@ -78,7 +78,8 @@ pub(crate) struct GpuShares {
 }
 
 impl GpuShares {
-    /// Take one sample's client read, if it carries one, and drop held shares once stale at `now_ns`.
+    /// Take one sample's client read, if it carries one, and drop held shares once stale at
+    /// `now_ns`.
     ///
     /// Over the window between this read and the last: an entry in both contributes its delta, an
     /// entry absent from a complete last enumeration all its time (it was created inside the
@@ -217,8 +218,8 @@ mod tests {
         assert!(close(g.share(7, "mtl"), 0.0));
     }
 
-    /// A valid walk saw a child, but its counter properties did not parse. Its later lifetime
-    /// total cannot be a birth inside the next window; subsequent deltas remain measurable.
+    /// A child a complete read saw without a readable counter is no birth in the next window;
+    /// its later deltas count.
     #[test]
     fn a_present_child_without_a_counter_is_no_birth() {
         let mut g = GpuShares::default();
@@ -254,10 +255,9 @@ mod tests {
         assert!(close(g.clients(), 0.25));
     }
 
-    /// A walk the registry changed under ends early: the clients it missed are
-    /// old, not born inside the next window, so their lifetime's time is no
-    /// share (WindowServer's would read as the whole GPU), while a client both
-    /// reads saw still counts its delta.
+    /// A walk the registry changed under ends early: the clients it missed are old, not born
+    /// inside the next window, so their lifetime's time is no share (WindowServer's would read
+    /// as the whole GPU), while a client both reads saw still counts its delta.
     #[test]
     fn a_client_an_incomplete_read_missed_is_no_birth() {
         let mut g = GpuShares::default();

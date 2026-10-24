@@ -6,66 +6,28 @@
 //! approved setup revision, which macOS gesture is up, a press on a Needs-you
 //! row, and the one quiet signal in aterm's menu-bar menu.
 //!
-//! * **Approved by default.** The admitted setup plan is the standing yes: its
-//!   access revision (`InitialSetupPermissionPolicy::revision`, read through
-//!   [`App::access_revision`]; the revision that admitted the Permissions
-//!   group, which a change to another group keeps) runs the steps no person has
-//!   to start — the Local Network trigger, the Full Disk Access page, the
-//!   Developer Tools page (once Full Disk Access reads on), the debugger (the
-//!   consent track's) and the folders (only while Full Disk Access is off) —
-//!   each once per approved revision. A revision approved while aterm runs
-//!   brings the pages back with no relaunch ([`App::rearm_access_steps`]).
-//!   The Local Network, Full Disk Access, Developer Tools and folder steps
-//!   take any admitted plan, whoever admitted it (design §6), because each
-//!   brings up only macOS's own question, which the person answers, and a
-//!   control client's act can already queue those pages. Only the debugger
-//!   step, where aterm itself starts an administrator-authorized change,
-//!   needs this window's own admission (`App::admitted_access`, the consent
-//!   track's).
-//! * **Only while System State is frontmost, one gesture at a time.** A step
-//!   puts something on screen only at [`App::access_step_moment`]: System State
-//!   is the visible view of a focused window, no other macOS dialog this
-//!   process started is up, and the quiet-moment rules hold. While a page,
-//!   panel or alert of these steps is up, or the folder pass walks, the window
-//!   holds a [`MacosDialog`], so the setup worker's own prompts wait too. The
-//!   folder pass parks between folders while the person is away from System
-//!   State (`consent_warmup::WarmupGate`).
-//! * **Not now.** A panel's Not now holds the window's own page, and a control
-//!   client's act on its row, for the rest of its revision and no longer
-//!   (`devtools_helper::declined_for`): a new access revision is a new
-//!   Permissions approval, which asks again, as the row says. The access
-//!   card's Not now (an older aterm's question, `consent_card::Marker::NotNow`)
-//!   is the Not now of the first approved revision it meets: noted and
-//!   recorded as that revision's, as the panel's would be, so the row reads as
-//!   the person's choice rather than waiting on them, and then retired, so a
-//!   later revision asks again too.
-//! * **A person's press, a client's act.** A Needs-you row's press opens its
-//!   page past any Not now. A control client's act never mints the yes: it
-//!   does nothing without an approved revision or with a `[privacy]` switch
-//!   off, and its pages — Full Disk Access, Developer Tools
-//!   (`devtools_helper::Origin::SystemStateAct`), and the Local Network and
-//!   Accessibility panes — are queued for the step moment, never opened at
-//!   once or while another macOS dialog is up, and held by every refusal the
-//!   window's own obeys, but once per revision
+//! * The admitted plan's access revision ([`App::access_revision`]; a change to another group
+//!   keeps it) is the standing yes. It runs, once per revision, the Local Network trigger, the
+//!   Full Disk Access page, the Developer Tools page (once Full Disk Access reads on), the
+//!   debugger (whose dialog comes once per Mac), and the folders (only while Full Disk Access is
+//!   off). Each but the debugger brings up only macOS's own question, so any admitted plan runs
+//!   it; the debugger step, an administrator-authorized change aterm starts, needs this
+//!   window's own admission (`App::admitted_access`).
+//! * A step puts something on screen only at [`App::access_step_moment`], one gesture at a
+//!   time; while one is up the window holds a [`MacosDialog`], so the setup worker's own
+//!   prompts wait too.
+//! * A panel's Not now holds the window's page, and a control client's act on its row, for
+//!   the rest of its revision (`devtools_helper::declined_for`). A new revision, even one
+//!   approved while aterm runs ([`App::rearm_access_steps`]), asks again.
+//! * A Needs-you row's press opens its page past any Not now. A control client's act never
+//!   mints the yes, and its pages wait for the step moment
 //!   ([`App::open_access_from_system_state`]).
-//! * **Records.** Each step writes `<revision> <row> <outcome>` to
-//!   `<state>/system-state-access` ([`aterm_types::macos_setup::access_record`]):
-//!   `handed`, `declined`, `triggered`, `granted`. System State reads them; a
-//!   build that is not grant-stable records nothing, and System State reads
-//!   that row as not needed itself.
-//! * **The quiet signal.** One menu line, `System State: <row> needs you` (or
-//!   `failed`; [`menu_line`]), composed when a status is published or a grant
-//!   regresses, which opens the tab. Nothing else is posted: the Full Disk
-//!   Access, Developer Tools and workstation digest entries are retired
-//!   ([`RETIRED_KEYS`]).
-//! * **Opt-outs.** `[privacy] enabled = false`, `check = false` or
-//!   `notice = false` run no step; `warmup = "never"` asks for no folder. Each
-//!   such switch, and a debugger access the person turned off (read from the
-//!   debugger record at every launch, `debugger_access::off_is_chosen`), is
-//!   told to the setup worker as the row's wanted state
-//!   ([`App::publish_access_opt_outs`]), with or without the window's own
-//!   admission; the debugger's only for a row that reads off
-//!   ([`OptOut::WhileOff`]).
+//! * Each step appends `<revision> <row> <outcome>` to `<state>/system-state-access`
+//!   ([`aterm_types::macos_setup::access_record`]), which System State reads.
+//! * The menu line ([`menu_line`]) is the only signal posted; the digest entries it replaced
+//!   are withdrawn ([`RETIRED_KEYS`]).
+//! * A `[privacy]` switch off, and a debugger the person turned off, are told to the setup
+//!   worker as the row's wanted state ([`App::publish_access_opt_outs`]).
 
 #[cfg(any(target_os = "macos", test))]
 use std::net::Ipv4Addr;
@@ -79,22 +41,17 @@ use aterm_types::macos_setup::{
 use crate::status_item::SystemStateLine;
 use crate::{App, SetupStatus, devtools_helper};
 
-/// How long the Local Network alert counts as up after the trigger. macOS gives
-/// no word when it shows the alert, when it is answered, or that it showed none
-/// (decided earlier), so this is a bound, not a reading: the next step waits
-/// this long once per revision, and an alert still unanswered after it may have
-/// System Settings beside it (macOS keeps both; neither answers the other).
+/// How long the Local Network alert counts as up after the trigger. macOS reports neither the
+/// alert nor its answer, so this is a bound, not a reading: the next step waits this long, and
+/// an alert still unanswered after it may have System Settings beside it.
 pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration = Duration::from_secs(30);
 
 /// How long a Local Network trigger that found no LAN to name waits before it
-/// looks again (the Wi-Fi may join after launch). A retry that falls due away
-/// from the step moment is moved on by as much, never left due.
+/// looks again (the Wi-Fi may join after launch).
 const LOCAL_NETWORK_RETRY: Duration = Duration::from_secs(60);
 
-/// How long a System Settings pane aterm opened with no panel of its own
-/// beside it (Local Network, Accessibility) counts as up. macOS says nothing
-/// when it closes, so this is a bound, as [`LOCAL_NETWORK_ALERT_HOLD`] is: the
-/// next step waits this long.
+/// How long a System Settings pane aterm opened with no panel of its own beside it (Local
+/// Network, Accessibility) counts as up: macOS says nothing when it closes.
 const PANE_HOLD: Duration = Duration::from_secs(30);
 
 /// The port the Local Network trigger connects a UDP socket to: discard. A UDP
@@ -115,16 +72,14 @@ const OPT_OUT_ROWS: [Access; 4] = [
 pub(crate) const PRIVACY_OFF: &str =
     "You turned aterm's privacy steps off in aterm.toml ([privacy]).";
 
-/// The Debugger row's description once its off reading is the person's choice:
-/// published as [`OptOut::WhileOff`], so the row says it only while it reads
-/// off, never of a debugger that reads on or could not be read.
+/// The Debugger row's description once its off reading is the person's choice, published as
+/// [`OptOut::WhileOff`] so it shows only while the row reads off.
 pub(crate) const DEBUGGER_OFF: &str = "You turned debugger access off, so aterm leaves it off.";
 
-/// The digest keys the redesign retired (§4): the Full Disk Access question and
-/// its regression, the Developer Tools line, the workstation lines, and the
-/// secrets vault's join lines. An entry an older aterm left open ends once per
-/// process — but for [`JOIN_PENDING_KEY`] — withdrawn, never as fixed: nothing
-/// here read its cause end.
+/// Digest keys System State replaced (§4): the Full Disk Access question and its regression,
+/// the Developer Tools line, the workstation lines and the vault's join and sync lines. An
+/// entry an older aterm left open under one is withdrawn once per process, never ended as
+/// fixed, since nothing here read its cause end.
 pub(crate) const RETIRED_KEYS: [&str; 8] = [
     "privacy.fda.needed",
     "privacy.fda.regressed",
@@ -136,9 +91,8 @@ pub(crate) const RETIRED_KEYS: [&str; 8] = [
     "privacy.secrets.not-synced",
 ];
 
-/// The vault join's waiting entry: it carries the approval code an admin Mac
-/// needs, so it ends only once System State has read the Secrets row
-/// (an observation of it, whose note carries a waiting code), never before.
+/// The vault join's waiting entry, which carries the approval code an admin Mac needs: it ends
+/// only once a status has read the Secrets row.
 pub(crate) const JOIN_PENDING_KEY: &str = "privacy.secrets.join-pending";
 
 /// What the access steps reach outside the App, injected so the steps are
@@ -211,9 +165,8 @@ pub(crate) struct AccessSteps {
     local_network_read: Option<u64>,
     /// Until when the Local Network alert counts as up.
     local_network_until: Option<Instant>,
-    /// The revision whose Local Network trigger found nothing to connect to
-    /// (no LAN yet, or no socket), and when to try it again. The other steps
-    /// go on meanwhile; the run's Permissions stage waits for the record.
+    /// The revision whose Local Network trigger found nothing to connect to (no LAN yet, or no
+    /// socket), and when to try it again.
     local_network_retry: Option<(u64, Instant)>,
     /// The opt-outs last told to the setup worker ([`App::publish_access_opt_outs`]),
     /// in [`OPT_OUT_ROWS`] order; `None` before the first.
@@ -243,10 +196,8 @@ pub(crate) struct AccessSteps {
     retired: bool,
     /// The vault join's waiting entry was ended since then ([`JOIN_PENDING_KEY`]).
     join_pending_retired: bool,
-    /// The launch folder pass's gate while it walks: open while System State is
-    /// frontmost and the `[privacy]` switches that started the pass are on,
-    /// shut while the person is away or a switch is off, so it parks between
-    /// folders.
+    /// The launch folder pass's gate while it walks: shut, so the pass parks between folders,
+    /// while System State is not frontmost or a `[privacy]` switch that started it is off.
     warmup_gate: Option<crate::consent_warmup::WarmupGate>,
     /// The approved access revision this process last saw: another one is a new
     /// approval in this process ([`App::rearm_access_steps`]).
@@ -363,16 +314,12 @@ fn managed(subject: Subject, selection: Selection) -> bool {
         }
 }
 
-/// THE ONE QUIET SIGNAL (§3.6, pure): `System State: <row> needs you`, from the
-/// rows the approved plan manages that wait for a person, plus a verified Full
-/// Disk Access grant that reads off; a row whose last attempt failed, or a step
-/// the last run could not finish, is said as it is (`System State: <row>
-/// failed`, `1 step failed`, not as needing anyone) once the run no longer
-/// retries it by itself, and not before (§3.5: the page alone says it
-/// meanwhile); several are counted (`System State: 2 need you`, `3 failed`,
-/// `1 needs you, 1 failed`). The note is the Secrets row's note while it needs
-/// you: a waiting vault approval code, or the move to Applications a vault
-/// member run from a disk image waits on. `None` when nothing does.
+/// The one quiet signal (§3.6, pure): `System State: <row> needs you`, from the managed rows
+/// that wait for a person plus a verified Full Disk Access grant that reads off. A failed row,
+/// or a step the last run could not finish, reads `System State: <row> failed` (`1 step
+/// failed`) once the run no longer retries it by itself (§3.5); several are counted
+/// (`2 need you`, `1 needs you, 1 failed`). The note is the Secrets row's while it needs you
+/// (a waiting vault approval code, or a move to Applications). `None` when nothing does.
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
     let selection = status
         .plan
@@ -398,10 +345,9 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
         .collect();
     failed.dedup();
     let mut failed: Vec<Option<Subject>> = failed.into_iter().map(Some).collect();
-    // A step the last run could not finish is a failure too, though no reading
-    // says so (a join the vault refused reads Not joined): one a row names
-    // is that row, any other a step of its own, counted but never named here,
-    // since the page's note names it in the run's words.
+    // A step the last run could not finish is a failure too, though no reading says so (a join
+    // the vault refused reads Not joined): one a row names counts as that row, any other is
+    // counted but not named, since the page's note names it.
     for row in status.failed_steps(status.plan.as_ref()) {
         match row {
             Some(row) if needs.contains(&row) || failed.contains(&Some(row)) => {}
@@ -447,19 +393,12 @@ impl App {
         self.config.privacy_probe_gate().permits() && self.config.privacy_notice()
     }
 
-    /// Which Permissions rows the person opted out of, and why, in
-    /// [`OPT_OUT_ROWS`] order: every row while a `[privacy]` switch is off
-    /// ([`OptOut::Always`]), and the debugger wherever an off reading is their
-    /// choice ([`crate::debugger_access::off_is_chosen`]: seen go off in this
-    /// process, or the observed record says it was allowed, or that aterm or
-    /// something else turned it off). Read from the record at every launch, so
-    /// it holds whether or not the window has its own admission, before any
-    /// probe and whatever the debugger step did: a debugger turned off reads as
-    /// the person's wanted state, never as Needs you or as a Not now (design
-    /// §4). The record says what an off reading means, not what the rule reads
-    /// now, so the debugger's is [`OptOut::WhileOff`]: the setup worker says it
-    /// only of a row that reads off, and a debugger that reads on, or could not
-    /// be read, keeps its own words.
+    /// Which Permissions rows the person opted out of, in [`OPT_OUT_ROWS`] order: every row
+    /// while a `[privacy]` switch is off ([`OptOut::Always`]), and the debugger wherever its off
+    /// reading is their choice ([`crate::debugger_access::off_is_chosen`], read from the
+    /// debugger record, so it holds with or without the window's own admission). The record
+    /// says what an off reading means, so the debugger's is [`OptOut::WhileOff`]: a debugger
+    /// that reads on, or could not be read, keeps its own words.
     pub(crate) fn access_opt_outs(&self) -> [Option<OptOut>; 4] {
         let off = (!self.access_steps_allowed()).then_some(OptOut::Always(PRIVACY_OFF));
         OPT_OUT_ROWS.map(|access| match access {
@@ -472,12 +411,9 @@ impl App {
     }
 
     /// Tell the setup worker which Permissions rows the person opted out of
-    /// ([`Self::access_opt_outs`]), so each reads off as their choice ("as you
-    /// chose: …") rather than one waiting on them. Cheap; called on each System
-    /// State tick so a config change or a debugger record read is taken at
-    /// once. `true` when that changed what the worker was told: the page's rows
-    /// are then read again (`App::tick_system_state`), so the rows and the menu
-    /// line agree with no restart.
+    /// ([`Self::access_opt_outs`]), so each reads as their choice. Called on each System State
+    /// tick; `true` when what the worker was told changed, so the page's rows are read again
+    /// (`App::tick_system_state`).
     pub(crate) fn publish_access_opt_outs(&mut self) -> bool {
         use aterm_types::macos_setup::opt_out;
         let opt_outs = self.access_opt_outs();
@@ -581,24 +517,19 @@ impl App {
             .is_some_and(|revision| self.access_steps.local_network_done != Some(revision))
     }
 
-    /// THE STEP MOMENT: an access step after Local Network may put its page,
-    /// panel or folder dialog on screen now — [`Self::local_network_moment`],
-    /// with Local Network done for the revision.
+    /// The step moment: an access step after Local Network may put its page, panel or folder
+    /// dialog on screen now ([`Self::local_network_moment`], with Local Network done).
     pub(crate) fn access_step_moment(&self, now: Instant) -> bool {
         !self.local_network_pending() && self.local_network_moment(now)
     }
 
-    /// THE LOCAL NETWORK STEP, first in the run: once per approved revision, a
-    /// UDP connect (nothing sent) to a unicast LAN address, which is what makes
-    /// macOS ask its Local Network question; recorded `triggered`. A revision
-    /// already recorded is done; a Mac with no LAN to name lets the other steps
-    /// go on and looks again every [`LOCAL_NETWORK_RETRY`], at the step's moment
-    /// only: a retry due away from it is moved on, so no deadline is left due.
-    /// A retry is dropped only for another approved revision. While none is
-    /// approved (an Apply holds the Permissions gate until its fresh status, a
-    /// Restore, a status that reads `Updating`) it is kept but arms no deadline
-    /// ([`Self::next_access_step_deadline`]), so the same revision coming back
-    /// — a change to another group keeps it (design §3.3) — looks again.
+    /// The Local Network step, first in the run: once per approved revision, a UDP connect
+    /// (nothing sent) to a unicast LAN address, which makes macOS ask its Local Network
+    /// question; recorded `triggered`. A revision already recorded is done. With no LAN to name
+    /// the other steps go on, and it looks again every [`LOCAL_NETWORK_RETRY`] at its moment
+    /// only: a retry due away from it is moved on. A retry is dropped only for another approved
+    /// revision; while none is approved it is kept but arms no deadline
+    /// ([`Self::next_access_step_deadline`]), so the same revision coming back looks again.
     pub(crate) fn tick_local_network_step(&mut self, now: Instant) {
         if self
             .access_steps
@@ -680,28 +611,28 @@ impl App {
         }
     }
 
-    /// The end of the consent lanes' turn: park or release a walking launch
-    /// folder pass by whether System State is frontmost and the `[privacy]`
-    /// switches that started it are still on, hold or release the
-    /// window's dialog guard, record the panels' Not now, spend the access
-    /// card's ([`Self::spend_card_not_now`]), bring the pages back for an
-    /// access revision approved in this process ([`Self::rearm_access_steps`]),
-    /// and end the retired digest entries once. Settled, a few compares per
-    /// park; the menu line is composed only when what it reads changes
-    /// ([`Self::refresh_system_state_menu_line`]).
+    /// The end of the consent lanes' turn: park or release a walking launch folder pass, hold
+    /// or release the window's dialog guard, record the panels' Not now, spend the access
+    /// card's ([`Self::spend_card_not_now`]), bring the pages back for a revision approved in
+    /// this process ([`Self::rearm_access_steps`]), and end the retired digest entries once.
     pub(crate) fn settle_access_steps(&mut self, now: Instant) {
         if self.access_steps.warmup_gate.is_some() && !self.consent_warmup.is_live() {
+            self.note_launch_warmup_progress();
             self.access_steps.warmup_gate = None;
         }
         if let Some(gate) = &self.access_steps.warmup_gate {
-            // Before each folder: System State frontmost, and the switches that
-            // let the launch pass start still on. One turned off mid-walk pauses
-            // it at the next folder; on again, it walks on.
-            gate.set(
-                (self.access_steps.reach.frontmost)(self)
-                    && self.access_steps_allowed()
-                    && self.config.privacy_warmup() == crate::app_config::PrivacyWarmup::Automatic,
-            );
+            // Losing admission retires this pass. A privacy switch off or
+            // leaving System State only pauses it between folders.
+            if self.access_revision().is_none() {
+                gate.retire();
+            } else {
+                gate.set(
+                    (self.access_steps.reach.frontmost)(self)
+                        && self.access_steps_allowed()
+                        && self.config.privacy_warmup()
+                            == crate::app_config::PrivacyWarmup::Automatic,
+                );
+            }
         }
         let up = self.access_steps.reach.holds_dialog && self.access_gesture_up(now);
         if up != self.access_steps.dialog.is_some() {
@@ -732,15 +663,10 @@ impl App {
         self.refresh_system_state_menu_line();
     }
 
-    /// Whether the approved revision's own Full Disk Access step is declined:
-    /// its panel's Not now under the revision's key (the access card's Not now,
-    /// spent on the revision, is noted there too), the fact that holds the
-    /// window's own page back for the rest of the revision
-    /// (`devtools_helper::declined_for`). The person chose Not now for this
-    /// approval, so a regressed grant does not light the menu line for it while
-    /// the row says so; a new approval asks again, and the line follows it. The
-    /// marker is read once per key, and again after a decline this process
-    /// notes; never without an approved revision.
+    /// Whether the approved revision's own Full Disk Access step is declined (its panel's Not
+    /// now under the revision's key, `devtools_helper::declined_for`): that holds the window's
+    /// page back and keeps a regressed grant off the menu line for the revision. Read once per
+    /// key and again after a decline this process notes; never without an approved revision.
     pub(crate) fn fda_declined_in_revision(&mut self) -> bool {
         if self.access_revision().is_none() {
             return false;
@@ -769,13 +695,11 @@ impl App {
         self.refresh_system_state_menu_line();
     }
 
-    /// Compose the menu line again from the latest status and the regression
-    /// flag (dark while the revision's Full Disk Access step is declined,
-    /// [`Self::fda_declined_in_revision`]): called where either changes (a
-    /// status publication, [`Self::note_fda_regression`], a decline noted),
-    /// never per park. An older aterm's vault-join entry ends once the selected
-    /// Secrets row has a usable reading for this vault. A waiting row must
-    /// carry its guidance before it can replace the entry's approval code.
+    /// Compose the menu line again from the latest status and the regression flag (dark while
+    /// the revision's Full Disk Access step is declined): called where either changes, never
+    /// per park. An older aterm's vault-join entry ends once the selected Secrets row has a
+    /// usable reading for this vault; a waiting row counts only once it carries its guidance,
+    /// which replaces the entry's approval code.
     pub(crate) fn refresh_system_state_menu_line(&mut self) {
         let regressed = self.access_steps.fda_regressed && !self.fda_declined_in_revision();
         let status = self.system_state_host.latest_status();
@@ -809,13 +733,11 @@ impl App {
         }
     }
 
-    /// The access steps' next look: the Local Network alert's or a pane's hold
-    /// ending; while the Local Network step or a client's pane act waits with an
-    /// aterm window focused, its next look for the moment; and the Local Network
-    /// retry, only for the approved revision while its moment can come (the
-    /// switches on and an aterm window focused; a focus gain wakes the loop).
-    /// A retry that fell due away from its moment was moved on by the step's
-    /// tick, so this never arms a deadline that is due again at once.
+    /// The access steps' next look: a hold ending; while the Local Network step or a client's
+    /// pane act waits with an aterm window focused, the next look for the moment; and the
+    /// approved revision's Local Network retry while its moment can come (the switches on and a
+    /// window focused; a focus gain wakes the loop). The step's tick moves a retry that fell due
+    /// away from its moment, so this never arms a deadline that is due again at once.
     pub(crate) fn next_access_step_deadline(&self, now: Instant) -> Option<Instant> {
         let hold = self
             .access_steps
@@ -857,11 +779,25 @@ impl App {
         }
     }
 
-    /// The launch folder pass started with `gate`: from now on it parks between
-    /// folders while System State is not frontmost or a `[privacy]` switch that
-    /// started it is off.
+    /// The launch folder pass started with `gate`, which parks it between folders from now on
+    /// ([`Self::settle_access_steps`]).
     pub(crate) fn park_launch_warmup_with(&mut self, gate: crate::consent_warmup::WarmupGate) {
         self.access_steps.warmup_gate = Some(gate);
+    }
+
+    /// Retire only the automatic launch pass. A person's explicit folder
+    /// pass has no gate and keeps its own intent.
+    pub(crate) fn retire_launch_warmup(&self) {
+        if let Some(gate) = &self.access_steps.warmup_gate {
+            gate.retire();
+        }
+    }
+
+    pub(crate) fn launch_warmup_retired(&self) -> bool {
+        self.access_steps
+            .warmup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.is_retired())
     }
 
     /// A verified Full Disk Access grant reads off (`true`), or that ended: the
@@ -882,12 +818,10 @@ impl App {
         self.access_steps.line.clone()
     }
 
-    /// The status item's menu line press: System State in the frontmost
-    /// window (else the first), raised. With no window at all — every one
-    /// closed while aterm keeps its menu bar item — the app's own new window
-    /// (Cmd-N's: its first shell spawned off the loop), with System State shown
-    /// in it once it is made, raised ([`Self::system_state_once_landed`]).
-    /// `true` when System State is up now; a window on its way answers `false`.
+    /// The status item's menu line press: System State in the frontmost window (else the
+    /// first), raised. With every window closed, a new window (Cmd-N's) shows it once made
+    /// ([`Self::system_state_once_landed`]). `true` when System State is up now; a window on its
+    /// way answers `false`.
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn open_system_state_from_status_item(&mut self) -> bool {
         let window = self
@@ -960,19 +894,13 @@ impl App {
         }
     }
 
-    /// A press on a Needs-you row's button (`Open Full Disk Access`,
-    /// `Turn On…`); `true` when System Settings (or the debugger change) is up
-    /// for it now. A person's press opens the page whatever aterm read, past any
-    /// Not now. `by_person` is false for a control client's `act`, which never
-    /// mints the standing yes: it does nothing without an approved revision or
-    /// with a `[privacy]` switch off; its Full Disk Access and Developer Tools
-    /// pages go through the window's own hand-over rules (Not now, an unstable
-    /// build, a grant, the ten-minute gap) as
-    /// [`devtools_helper::Origin::SystemStateAct`], and its Local Network and
-    /// Accessibility panes wait in [`Self::tick_queued_pane`], each queued for
-    /// the step moment ([`Self::access_step_moment`]: System State frontmost, no
-    /// other macOS gesture up) — so it answers `false` and the page comes at the
-    /// next step moment.
+    /// A press on a Needs-you row's button (`Open Full Disk Access`, `Turn On…`); `true` when
+    /// System Settings (or the debugger change) is up for it now. A person's press opens the
+    /// page past any Not now. A control client's act (`by_person` false) never mints the
+    /// standing yes: it does nothing without an approved revision or with a `[privacy]` switch
+    /// off, its Full Disk Access and Developer Tools pages pass the window's own hand-over rules
+    /// as [`devtools_helper::Origin::SystemStateAct`], and its Local Network and Accessibility
+    /// panes are queued for the step moment ([`Self::tick_queued_pane`]), answering `false`.
     pub(crate) fn open_access_from_system_state(
         &mut self,
         access: Access,
@@ -1030,11 +958,9 @@ impl App {
     }
 
     /// Full Disk Access from System State's row, through the one hand-over
-    /// ([`Self::fda_hand_over`]): a person's press opens the page with aterm's
-    /// panel (none while the grant reads held) past a Not now; a client's act is
-    /// queued for the step moment and judged there as the window's own is. A
-    /// reading still pending is "not yet": the act queues, and its moment reads
-    /// it again.
+    /// ([`Self::fda_hand_over`]): a person's press opens the page past a Not now; a client's act
+    /// is queued for the step moment and judged there as the window's own is. A probe still
+    /// pending reads as not granted, so the act queues and its moment reads it again.
     fn open_fda_from_system_state(&mut self, by_person: bool) -> devtools_helper::HandOver {
         use aterm_containment::consent::{FdaState, ProbeLabel};
         let origin = if by_person {
@@ -1058,11 +984,9 @@ impl App {
         answer
     }
 
-    /// A control client's act on the Local Network or Accessibility row, at the
-    /// step moment ([`Self::access_step_moment`]): its pane opens then, as a
-    /// queued Full Disk Access or Developer Tools act's page does, never while
-    /// another macOS gesture is up; an act still waiting after
-    /// [`devtools_helper::ASKED_LAPSE`] lapses, as a control verb's does.
+    /// A control client's act on the Local Network or Accessibility row: its pane opens at the
+    /// step moment ([`Self::access_step_moment`]), and an act still waiting after
+    /// [`devtools_helper::ASKED_LAPSE`] lapses.
     pub(crate) fn tick_queued_pane(&mut self, now: Instant) {
         let Some((access, asked)) = self.access_steps.pane_act else {
             return;
@@ -1090,21 +1014,14 @@ impl App {
         );
     }
 
-    /// A NEW APPROVAL IN THIS PROCESS ASKS AGAIN (design §6). Turning
-    /// Permissions off and on, or Set up, approves a new access revision while
-    /// aterm runs: the window's own Full Disk Access and Developer Tools pages
-    /// come back for it, as the launch check and the launch read would bring
-    /// them at the next launch ([`Self::rearm_fda_step`],
-    /// [`Self::rearm_devtools_step`]), each queued for the step moment and
-    /// judged there whole, one gesture at a time, Full Disk Access first. The
-    /// debugger step comes back by the window's own admission
-    /// (`DebuggerStepQueue::unpark`), and Local Network is per revision
-    /// already. The first revision this process sees is the launch path's; a
-    /// gap with none approved, and the same revision coming back (a change to
-    /// another group keeps it), change nothing. A `[privacy]` switch off is a
-    /// pause, never an answer: no step is queued while one is off, and the
-    /// revision is not taken as seen, so a revision approved meanwhile brings
-    /// its pages back once every switch is on again.
+    /// A new access revision approved while aterm runs (Permissions off and on, or Set up)
+    /// brings back the window's own Full Disk Access and Developer Tools pages, as the next
+    /// launch would ([`Self::rearm_fda_step`], [`Self::rearm_devtools_step`]), each queued for
+    /// the step moment (design §6). The debugger step comes back by the window's own admission
+    /// (`DebuggerStepQueue::unpark`), and Local Network is per revision already. The first
+    /// revision this process sees is the launch path's, and the same revision coming back
+    /// changes nothing. While a `[privacy]` switch is off nothing is queued and the revision is
+    /// not taken as seen, so one approved meanwhile asks once every switch is on.
     pub(crate) fn rearm_access_steps(&mut self, now: Instant) {
         let Some(revision) = self.access_revision() else {
             return;
@@ -1125,32 +1042,13 @@ impl App {
         self.rearm_devtools_step(now);
     }
 
-    /// A `[privacy]` SWITCH ON AGAIN RUNS WHAT IT HELD AT LAUNCH (design §4). A
-    /// switch off is a pause, never an answer, and that holds for the
-    /// decisions a launch makes once as well: with `enabled`, `check` or
-    /// `notice` off when aterm started, or turned off before they were made,
-    /// each is held, and the first park with the switches it needs on makes
-    /// it (a config change wakes the loop), before any lane below judges
-    /// anything:
-    ///
-    /// * the access card's launch check a switch settled before its verdict
-    ///   (`consent_card::CardHost::launch_held`, [`App::admit_card_policy`])
-    ///   runs again (`consent_card::CardState::rearm_launch`), with the Full
-    ///   Disk Access hand-over undecided again, so the Developer Tools page,
-    ///   the debugger step and the folders wait behind its verdict as at
-    ///   launch;
-    /// * the Developer Tools read a focus gain wanted while the probe was off
-    ///   (`devtools_watch::DevToolsWatch::read_held`; the launch read among
-    ///   them) is made, and a reading that only said the probe was off is
-    ///   forgotten, so it decides nothing, and its read, spent on nothing, is
-    ///   made again.
-    ///
-    /// Each then runs as at launch, judged whole at the step moment, one
-    /// gesture at a time, under the approved revision and its Not now. The
-    /// folder warm-up waits while a switch is off rather than settling
-    /// (`App::launch_warmup_look`), the debugger step pauses and resumes by
-    /// itself (`DebuggerStepQueue::resume`), and Local Network and a client's
-    /// queued act wait for the step moment. Settled, a few `bool` tests.
+    /// A `[privacy]` switch on again runs what it held at launch (design §4): a switch off is a
+    /// pause, never an answer. The first park with the needed switches on reruns the access
+    /// card's held launch check (`consent_card::CardState::rearm_launch`, with Full Disk Access
+    /// undecided again so the later steps wait behind its verdict), and makes the Developer
+    /// Tools read held while the probe was off (`devtools_watch::DevToolsWatch::read_held`),
+    /// forgetting a reading that only said the probe was off. The folder warm-up, the debugger
+    /// step (`DebuggerStepQueue::resume`), Local Network and queued acts resume by themselves.
     pub(crate) fn resume_held_launch_steps(&mut self, now: Instant) {
         if !cfg!(target_os = "macos") || self.headless {
             return;
@@ -1182,21 +1080,17 @@ impl App {
         }
     }
 
-    /// The access card's launch check decided whether Full Disk Access reads
-    /// off on a Mac where aterm never verified it (`unverified`:
-    /// `consent_launch::hands_over`, its Not now aside, which a revision
-    /// spends), or a grant was verified here since (`false`).
+    /// The access card's launch check found Full Disk Access off on a Mac where aterm never
+    /// verified it (`unverified`, per `consent_launch::hands_over`), or a grant was verified
+    /// here since (`false`).
     pub(crate) fn note_fda_unverified_here(&mut self, unverified: bool) {
         self.access_steps.fda_unverified_here = unverified;
     }
 
-    /// The window's own Full Disk Access page for a new access revision: only
-    /// where the launch check would bring it ([`Self::note_fda_unverified_here`])
-    /// and the grant does not read on. Queued, it is judged whole at the step
-    /// moment (`App::fda_hand_over`: this revision's Not now, its page shown
-    /// already, an unstable build, a grant, whose reading); a page aterm
-    /// brought up within ten minutes holds it until they are up, a wait rather
-    /// than a refusal, since the person has not seen this revision's page.
+    /// The window's own Full Disk Access page for a new access revision, only where the launch
+    /// check would bring it ([`Self::note_fda_unverified_here`]) and the grant does not read
+    /// on. It is judged whole at the step moment (`App::fda_hand_over`); a page aterm brought
+    /// up within [`atpkg::devtools::REOPEN_AFTER_S`] defers it rather than refusing it.
     fn rearm_fda_step(&mut self, now: Instant) {
         if !cfg!(target_os = "macos")
             || !self.devtools_helper.windowed()
@@ -1221,15 +1115,11 @@ impl App {
             .set_fda(crate::consent_launch::FdaLaunch::Waiting);
     }
 
-    /// The window's own Developer Tools page for a new access revision: the
-    /// watch's once-per-process latch is let go, so its next `not_granted`
-    /// reading asks again, and a completed reading that already says
-    /// `not_granted` asks now, unless aterm opened the page for this revision
-    /// already. Queued, it is judged whole at the step moment
-    /// (`App::devtools_hand_over`: Full Disk Access on, this revision's Not
-    /// now, a list that reads aterm on, an unstable build, a grant), behind
-    /// any Full Disk Access page; a page aterm brought up within ten minutes
-    /// holds it until they are up.
+    /// The window's own Developer Tools page for a new access revision: the watch's
+    /// once-per-process latch is let go, and a reading that already says `not_granted` queues
+    /// the page now unless aterm opened it for this revision. It is judged whole at the step
+    /// moment (`App::devtools_hand_over`), behind any Full Disk Access page, and a page aterm
+    /// brought up within [`atpkg::devtools::REOPEN_AFTER_S`] defers it.
     fn rearm_devtools_step(&mut self, now: Instant) {
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
@@ -1252,21 +1142,13 @@ impl App {
         }
     }
 
-    /// THE ACCESS CARD'S NOT NOW, from an older aterm's file-access question
-    /// (`consent_card::Marker::NotNow`), is the Not now of the first approved
-    /// revision it meets, and is then retired (design §6). While the steps are
-    /// allowed under an approved revision it is noted as that revision's panel
-    /// Not now (`FdaReach::note_declined` under the revision's key, unless one
-    /// is noted for its step already), so the window's own Full Disk Access page
-    /// and a control client's act on the row stay down for the rest of the
-    /// revision, as after the panel's own Not now
-    /// (`devtools_helper::declined_for`); it is recorded as the revision's
-    /// `declined` unless something is on record for the row in it, so the row
-    /// reads as the person's choice and the menu line does not name it; and the
-    /// marker is retired ([`Self::retire_card_not_now`]). A later revision is a
-    /// new approval, which asks again, as the row's Not now says. Until it is
-    /// spent the marker holds the window's own page in every revision
-    /// (`App::fda_admit_facts`).
+    /// The access card's Not now, an older aterm's answer (`consent_card::Marker::NotNow`), is
+    /// the Not now of the first approved revision it meets (design §6). Under an approved
+    /// revision with the steps allowed it is noted as that revision's panel Not now
+    /// (`FdaReach::note_declined`, unless one is noted already) and recorded `declined` unless
+    /// the row has a record in it, so the row reads as the person's choice; then it is retired
+    /// ([`Self::retire_card_not_now`]). Until spent it holds the window's own page in every
+    /// revision (`App::fda_admit_facts`).
     fn spend_card_not_now(&mut self) {
         if self.consent_card_host.marker != Some(crate::consent_card::Marker::NotNow) {
             return;
@@ -1293,13 +1175,10 @@ impl App {
         );
     }
 
-    /// Retire the access card's `not-now` once spent: the cache at once, the
-    /// file beside `aterm.toml` off the UI thread
-    /// (`consent_card::retire_not_now`, which leaves anything but a `not-now`
-    /// as found). Best effort, as the panel's own markers are: a file that could
-    /// not be removed is read again by the next launch and spent again, on the
-    /// same revision (nothing new is noted or recorded) or on the one approved
-    /// then.
+    /// Retire the access card's `not-now` once spent: the cache at once, the file beside
+    /// `aterm.toml` off the UI thread (`consent_card::retire_not_now`, which leaves anything but
+    /// a `not-now` as found). Best effort: a file that survives is spent again by the next
+    /// launch.
     fn retire_card_not_now(&mut self) {
         self.consent_card_host.marker = None;
         let Some(config_path) = self.consent_card_config.clone() else {

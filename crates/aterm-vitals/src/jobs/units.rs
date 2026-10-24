@@ -3,6 +3,7 @@
 
 //! Per-tab job units, member tracking, and per-tick stuck-process evaluation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::step::{self, Cx, Evidence, Fault, Progress, Track};
@@ -23,13 +24,16 @@ const SIDE_ALLOWANCE: u64 = 64 * 1024;
 const CHURN_WORK_NS_PER_S: u64 = 50_000_000;
 /// Bytes new children wrote that make churn "with work".
 const CHURN_WROTE: u64 = 64 * 1024;
-/// How long past the read that saw `fg` resume a job (the shell's terminal group,
-/// [`JobTick::read_ms`]) the reader may still feed the shell's notice of `fg`: the shell prints
-/// it before it hands the job the terminal.
+/// How long past the read that saw `fg` resume a job ([`JobTick::read_ms`]) the reader may still
+/// feed the shell's notice of `fg`, which the shell prints before it hands the job the terminal.
 const FG_NOTICE_MS: u64 = 1_000;
 /// Two wakes of a nested session's reader this close together, each over a tick keys were
 /// driven into the tab in, show the person's keys reach it.
 const RELAY_WAKES_MS: u64 = 60_000;
+
+/// The shortest tick a process's calls are judged over, the host's fast cadence
+/// ([`super::Demand::Fast`]): over a shorter one a single wake reads as a high rate.
+const RATE_MS: u64 = 2_000;
 
 /// Remembered process member of a job.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -42,13 +46,13 @@ pub struct Member {
     pub name: String,
     /// Host timestamp (ms) when first observed.
     pub first_ms: u64,
-    /// The most system calls a minute a pass read it make over a tick that no key was typed in
-    /// and the tab printed nothing in, nor in the next: its own idle wakes (a runtime's timer
-    /// threads), so no more over a tick is no sign it wrote.
+    /// The most system calls a minute a pass read it make over a tick of at least [`RATE_MS`]
+    /// that no key was typed in and the tab printed nothing in, nor in the next: its own idle
+    /// wakes (a runtime's timer threads, a server's poll timeout). Past it, it did more.
     pub idle: Option<u64>,
-    /// Its rate over the last tick, while no key was typed in that tick and the tab printed
-    /// nothing in it: its idle rate once this tick printed nothing either (a line the reader fed
-    /// a pass after the process wrote it is the process's).
+    /// Its rate over the last tick, while that tick was one its idle rate is learned over: its
+    /// idle rate once this tick printed nothing either (a line the reader fed a pass after the
+    /// process wrote it is the process's).
     pub pending: Option<u64>,
 }
 
@@ -98,17 +102,16 @@ struct Job {
     shell: Option<u32>,
     consumer_pid: Option<u32>,
     /// The last group other than the shell's in front of its block (an `a && b`'s second, the
-    /// group a block resumed it under): kept while a tick sees the shell take the terminal back
-    /// before `D` (the printed `pgid` is then the shell's), never a command's typed ahead of its
-    /// stop (a group one pass saw in front while a command the shell started was stopped behind
-    /// it; seen there by the job's next pass too, it is the job's).
+    /// group a block resumed it under), kept while a tick sees the shell take the terminal back
+    /// before `D` (the printed `pgid` is then the shell's). A group one pass saw in front while a
+    /// command the shell started was stopped behind it is the job's only once its next pass sees
+    /// it there too.
     front_pgid: Option<u32>,
     /// It ran in the background or stopped (`cmd &`, Ctrl-Z): a block that resumes it is `fg`'s,
     /// whose command is not its own, and whose `C` the shell's notice of `fg` follows.
     backgrounded: bool,
-    /// Through when the tab's output may be the shell's notice of the `fg` that resumed it after
-    /// it ran in the background or stopped: the resuming tick's read of the group in front plus
-    /// [`FG_NOTICE_MS`], since the notice follows `fg`'s `C` and may follow that tick's clock.
+    /// Through when the tab's output may be the shell's notice of the `fg` that resumed it: the
+    /// resuming tick's read of the group in front plus [`FG_NOTICE_MS`].
     fg_ms: Option<u64>,
     /// The block a pass resumed it in front under while that block's own job kept the block: it
     /// takes the block at a later pass that finds it open with the job still in front.
@@ -128,6 +131,9 @@ struct Job {
     /// A nested session's first terminal word: one its opener keeps every session it opens in
     /// (Emacs turns echo off) names no password prompt.
     first_word: Option<TermWord>,
+    /// A nested session whose own terminal is cooked had a line of its reach the tab as a line:
+    /// its opener copies its output (`script`), never redraws it (nvim's terminal).
+    lines_seen: bool,
     /// The last name the row printed.
     last_name: String,
     /// The last name a member other than the shell gave, the exited row's: the program exits
@@ -143,10 +149,9 @@ struct Job {
     named: Option<NamedWait>,
     named_progress: Option<u64>,
     busy_since: Option<u64>,
-    /// This tick it held the foreground at the person's own terminal read:
-    /// `tty-raw` or `tty-password` named from a mode word stamped after its
-    /// last terminal output, with no key queued, whatever its class
-    /// ([`demand_of`]).
+    /// This tick it held the foreground at the person's own terminal read (`tty-raw` or
+    /// `tty-password` from a mode word stamped after its last output, no key queued), whatever its
+    /// class ([`demand_of`]).
     person_read: bool,
     row: Option<JobRow>,
 }
@@ -159,7 +164,7 @@ enum Stir {
     /// Every live member's count was read at both readings and none moved, and none was born or
     /// reaped (a stopped process makes none, read or not, nor does a zombie).
     Still,
-    /// One that was read moved, none faster than its idle rate ([`Member::idle`]).
+    /// One that was read moved, none past its idle rate ([`Member::idle`]).
     Ticking,
     /// None that was read moved past its idle rate, and one that runs went unread (another
     /// user's), or none was read at an earlier pass.
@@ -167,14 +172,15 @@ enum Stir {
     /// None that was read moved past its idle rate, but one was born or reaped (a loop's short
     /// commands), or died since its last reading.
     Churned,
-    /// One read at both readings moved faster than its idle rate.
+    /// One read at both readings moved past its idle rate.
     Stirred,
 }
 
 impl Stir {
-    /// What `calls` system calls over `dt_ms` show of a process whose idle rate is `idle`.
+    /// What `calls` system calls over `dt_ms` show of a process whose idle rate is `idle`, judged
+    /// as over a tick of at least [`RATE_MS`].
     fn of_calls(calls: u64, dt_ms: u64, idle: Option<u64>) -> Self {
-        if idle.is_some_and(|i| per_min(calls, dt_ms) <= i) {
+        if idle.is_some_and(|i| per_min(calls, dt_ms.max(RATE_MS)) <= i) {
             Self::Ticking
         } else {
             Self::Stirred
@@ -217,6 +223,12 @@ struct TabFacts {
     /// The group holding the terminal, not the shell's, has no live process (its last one left
     /// for a group of its own).
     front_gone: bool,
+    /// The group holding the terminal, not the shell's, is a shell doing job control alone at
+    /// its line editor (a `bash` run in the tab, at its prompt): the tab's lines are the
+    /// background's, as with no group in front.
+    front_idle: bool,
+    /// The group in front is one the tab's root made.
+    root_fronted: bool,
     /// Background groups with a process that is neither stopped nor a zombie (one that can print).
     bg_units: usize,
 }
@@ -229,7 +241,8 @@ pub struct Jobs {
     zombies: HashMap<u32, (u64, u32)>,
     zombie_parents: HashMap<u32, u64>,
     d_since: HashMap<u32, u64>,
-    /// The first reading that saw each `(pid, exec)` not started, by what keeps it ([`StartWait`]), kept for the keys the last reading held.
+    /// The first reading that saw each `(pid, exec)` not started, by what keeps it
+    /// ([`StartWait`]), kept for the keys the last reading held.
     held_since: HashMap<(u32, u64, StartWait), u64>,
     /// The backed-up episode, while one is open.
     held_episode: Option<Backlog>,
@@ -241,8 +254,30 @@ pub struct Jobs {
     /// marks show it at a prompt or its line editor reads the terminal raw in front
     /// ([`discover`]). A pid that ran another program since (`exec ninja`) does none.
     job_control: HashMap<u32, (Option<u64>, String)>,
+    /// What each tab's last pass read of its root.
+    roots: HashMap<u64, RootSeen>,
     #[cfg(any(test, debug_assertions))]
     fault: Option<Fault>,
+}
+
+/// What a tab's last pass read of its root.
+#[derive(Clone, Debug, Default)]
+struct RootSeen {
+    /// The program it ran.
+    name: Option<String>,
+    /// The newest of the shell's marks it read (`JobTab::shell_ms`).
+    mark_ms: Option<u64>,
+    /// The program the root ran at the last pass that read a mark newer than the last pass's,
+    /// with no block open and the root running what the last pass saw: the program writing the
+    /// prompt's marks (a block's `C` is a mark too, and the root may have run `exec` past it).
+    prompt_name: Option<String>,
+    /// Whether a pass saw it put a group it made in front, while it ran that program: a shell
+    /// doing job control (pwsh, which never does, runs its cmdlets in its own group).
+    fronted: bool,
+    /// The open block it sat at a prompt under, alone in its group in front with its line editor
+    /// reading the terminal raw, a shell seen putting a group in front, and whether a second pass
+    /// in a row saw it so.
+    unmarked: Option<(u64, bool)>,
 }
 
 /// An open backed-up episode as the engine keeps it ([`HeldEpisode`] is what a view says).
@@ -408,8 +443,88 @@ impl Jobs {
         self.job_control.retain(|p, (start, name)| {
             alive(*p, *start) && sweep.get(p).is_some_and(|s| s.name == *name)
         });
-        for tab in &tick.tabs {
-            let (units, tf) = discover(tab, &sweep, &facts, &children, &mut self.job_control);
+        // A shell that gave way to another in place (`exec zsh`) writes no marks again (the new
+        // one's integration does not load), so the block it ran in never closes: two passes in a
+        // row that find the root at a prompt under it (alone in its group in front, its line
+        // editor reading the terminal raw, a shell seen putting a group it made in front) close
+        // it, with no status. And the root is a shell while it runs the program that wrote its
+        // prompt's marks (passes may read the block before the `C` of an `exec` and the root after
+        // it) or, in a tab whose marks never showed, at a pass that finds its line editor reading
+        // raw keys in front, running the program the last pass saw.
+        let mut roots = std::mem::take(&mut self.roots);
+        roots.retain(|k, _| tick.tabs.iter().any(|t| t.key == *k));
+        let mut root_shell: HashMap<u64, bool> = HashMap::new();
+        let tabs_now: Vec<Cow<'_, JobTab>> = tick
+            .tabs
+            .iter()
+            .map(|tab| {
+                let seen = roots.entry(tab.key).or_default();
+                let root = sweep.get(&tab.shell_pid).filter(|_| tab.shell_pid != 0);
+                let name = root.map(|r| r.name.as_str());
+                let steady = name.is_some() && seen.name.as_deref().is_none_or(|n| Some(n) == name);
+                if !steady {
+                    seen.fronted = false;
+                }
+                let rf = facts.get(&tab.shell_pid);
+                let pgid = rf.map(|f| f.pgid).or_else(|| root.map(|r| r.pgid));
+                let raw_front = pgid.is_some()
+                    && rf.and_then(|f| f.tpgid) == pgid
+                    && tab.tty.is_some_and(|m| !m.canonical);
+                let open = tab.block.as_ref().filter(|b| b.open).map(|b| b.id);
+                if steady
+                    && open.is_none()
+                    && tab.shell_ms.is_some()
+                    && tab.shell_ms != seen.mark_ms
+                {
+                    seen.prompt_name = name.map(str::to_owned);
+                }
+                seen.mark_ms = tab.shell_ms;
+                root_shell.insert(
+                    tab.key,
+                    if tab.shell_ms.is_some() {
+                        seen.prompt_name.as_deref() == name
+                    } else {
+                        steady && raw_front
+                    },
+                );
+                let alone = pgid.is_some_and(|g| {
+                    !tick.sweep.iter().any(|p| {
+                        p.pgid == g && p.pid != tab.shell_pid && p.state != ProcState::Zombie
+                    })
+                });
+                let prompt = raw_front && alone && seen.fronted;
+                seen.unmarked = match (open, seen.unmarked) {
+                    (Some(b), Some((u, true))) if u == b => Some((b, true)),
+                    (Some(b), Some((u, false))) if u == b && prompt => Some((b, true)),
+                    (Some(b), _) if prompt => Some((b, false)),
+                    _ => None,
+                };
+                seen.name = name.map(str::to_owned);
+                match (open, seen.unmarked) {
+                    (Some(b), Some((u, true))) if u == b => {
+                        let mut t = tab.clone();
+                        if let Some(k) = t.block.as_mut() {
+                            k.open = false;
+                        }
+                        Cow::Owned(t)
+                    }
+                    _ => Cow::Borrowed(tab),
+                }
+            })
+            .collect();
+        self.roots = roots;
+        for tab in tabs_now.iter().map(|t| &**t) {
+            let (units, tf) = discover(
+                tab,
+                &sweep,
+                &facts,
+                &children,
+                &mut self.job_control,
+                root_shell.get(&tab.key).copied().unwrap_or(false),
+            );
+            if let Some(r) = self.roots.get_mut(&tab.key).filter(|_| tf.root_fronted) {
+                r.fronted = true;
+            }
             tab_facts.insert(tab.key, tf);
             // A command the shell started that job control stopped (a debugger's traced child has
             // the debugger for its parent).
@@ -421,11 +536,11 @@ impl Jobs {
                         == Some(ProcState::Stopped)
             };
             for u in units {
-                // A group in front with no block open is the job that holds one of its processes:
-                // one whose block closed while the group held the terminal (a `fg` no block marks
-                // resumed it), before that job's pass keys it by the group. (A detached call is
-                // no such group: one a pass saw in its agent's group before its `setsid` leaves
-                // the agent's job a shell job.)
+                // A group in front with no block open is the job that holds one of its
+                // processes, until that job's pass keys it by the group: its block closed while
+                // the group held the terminal (a `fg` no block marks resumed it). A detached call
+                // is no such group, even one a pass saw in its agent's group before its `setsid`:
+                // the agent's job stays a shell job.
                 let found = self
                     .jobs
                     .iter()
@@ -437,8 +552,8 @@ impl Jobs {
                             .filter(|_| u.block.is_none() && u.kind == JobKind::Shell)
                     });
                 // A job whose block a newer one replaced hands this block what it holds of it
-                // (the shell, and a group in front it took for its own while the reader had not
-                // fed `D` yet): its command is over.
+                // (the shell, and a group in front it took before `D` was fed): its command is
+                // over.
                 let handed = |c: usize| {
                     let j = &self.jobs[c];
                     u.block.is_some() && j.block.is_some() && j.block != u.block
@@ -460,12 +575,11 @@ impl Jobs {
                 };
                 let resumes = u.block.and_then(|_| resumed(&u, tab, &claimed, &self.jobs));
                 let behind = found.is_some_and(|f| stopped_behind(&self.jobs[f]));
-                // The block's own command lives on in the shell's tree outside the unit, read
-                // this pass (a debugger whose child it put in front, a nested shell that brought
-                // one of its jobs forward): the job in front is part of it, and the block's job
-                // takes it in, members and all. A survivor launchd adopted, a command that
-                // exited before the pass read it, and one job control stopped behind the group in
-                // front (bash's list moving on past a Ctrl-Z) are no such command.
+                // The block's own command lives on in the shell's tree outside the unit (a
+                // debugger whose child it put in front, a nested shell that brought a job
+                // forward): the job in front is part of it. A survivor launchd adopted, a command
+                // that exited before the pass read it, and one stopped behind the group in front
+                // are no such command.
                 let lives = |f: usize| {
                     let j = &self.jobs[f];
                     let mut unknown = false;
@@ -507,16 +621,13 @@ impl Jobs {
                 } else if let Some(i) =
                     resumes.filter(|i| unsure && self.jobs[*i].deferred != u.block)
                 {
-                    // The group in front is a background job's (a parked or `&` one) while the block's
-                    // own job had a command of its own in front: the pass may have read the tab before
-                    // the reader fed that block's `D` (a `fg` typed ahead, `fg %1` right after a
-                    // Ctrl-Z), or the block's own command list brought the job forward (`make test &&
-                    // fg`; bash's `make; fg %1` past a Ctrl-Z of make). The job resumes in front, a
-                    // foreground job now, with what its group forked since the last pass, and the
-                    // block stays its own job's until a pass finds the same block open with the job
-                    // still in front.
-                    // One deferral stands under a block: the job a list brought forward last is
-                    // the one whose status its `fg` returns.
+                    // The group in front is a background job's while the block's own job had a
+                    // command of its own in front: the pass read the tab before `D` (a `fg`
+                    // typed ahead), or the block's list brought the job forward (`make && fg`).
+                    // The job resumes in front, and the block stays its own job's until a pass
+                    // finds it still open with the job in front. One deferral stands under a
+                    // block: the job a list brought forward last is the one whose status its
+                    // `fg` returns.
                     for (k, o) in self.jobs.iter_mut().enumerate() {
                         if k != i && o.key.tab == tab.key && o.deferred == u.block {
                             o.deferred = None;
@@ -543,12 +654,10 @@ impl Jobs {
                     }
                 } else if let Some(i) = resumes {
                     // Else the block's own job gives way to the job its group in front is
-                    // (`fg`'s block found a pass before the shell handed the terminal over, a
-                    // command list that ends in `fg`); what it held of the block goes with it. One
-                    // that had a command of its own in front is done with the block: it parks with
-                    // that command stopped behind, else ends with it (its row and its survivors an
-                    // orphan's, with no status: the block's `D` is the resumed job's); one that never
-                    // had (`fg`'s) leaves no row.
+                    // (`fg`'s block read before the shell handed the terminal over, a list that
+                    // ends in `fg`). One that had a command of its own in front parks with it
+                    // stopped behind, else ends with no status (the block's `D` is the resumed
+                    // job's); one that never had (`fg`'s) leaves no row.
                     if let Some(f) = found {
                         if unsure {
                             gave_way.insert(f);
@@ -564,10 +673,9 @@ impl Jobs {
                     if j.block.is_none() && !j.backgrounded && !u.command.is_empty() {
                         j.command.clone_from(&u.command);
                     }
-                    // A job a newer block resumes stopped under its old one (`fg` resumes it), and
-                    // the group in front is its own (a `cmd &` job never had one in front).
-                    // A job a pass already resumed in front under this block keeps that pass's
-                    // notice window.
+                    // A job a newer block resumes was stopped under its old one (`fg` resumes
+                    // it). A job a pass already resumed in front under this block keeps that
+                    // pass's notice window.
                     j.backgrounded |= j.block.is_some();
                     if j.backgrounded && j.deferred.take() != u.block {
                         j.fg_ms = Some(tick.read_ms.max(at) + FG_NOTICE_MS);
@@ -576,9 +684,8 @@ impl Jobs {
                     j.kind = JobKind::Shell;
                     j.consumer = Consumer::PersonFg;
                     j.block = u.block;
-                    // The block is its identity from now on, so the next tick finds it again
-                    // and opens no second job beside it, and the shell is its member then, as
-                    // it is any block's job's.
+                    // The block is its identity from now on, so the next tick finds it again and
+                    // opens no second job; the shell is a member, as in every block's job.
                     j.key.block = u.block;
                     j.shell = u.shell;
                     for p in &free {
@@ -639,10 +746,9 @@ impl Jobs {
                     j.pgid = u.pgid;
                 }
                 // A group in front while a command the shell started is stopped outside the
-                // unit may be a command typed ahead of the stop, not the job's (a debugger's
-                // traced child is the debugger's, stopped by it); still in front at the job's
-                // next pass it is (bash moving on through a list: a command typed ahead has its
-                // own block by then).
+                // unit may be a command typed ahead of the stop (a debugger's traced child is
+                // the debugger's own); still in front at the job's next pass, it is the job's (a
+                // command typed ahead has its own block by then).
                 if j.kind == JobKind::Shell
                     && u.pgid != tf.shell_pgid
                     && (!stopped_behind(j) || was == u.pgid)
@@ -660,7 +766,7 @@ impl Jobs {
             }
         }
 
-        for tab in &tick.tabs {
+        for tab in tabs_now.iter().map(|t| &**t) {
             for n in &tab.named {
                 if let Some(j) = self.jobs.iter_mut().find(|j| {
                     j.exited_ms.is_none()
@@ -675,7 +781,7 @@ impl Jobs {
             }
         }
 
-        let tabs: HashMap<u64, &JobTab> = tick.tabs.iter().map(|t| (t.key, t)).collect();
+        let tabs: HashMap<u64, &JobTab> = tabs_now.iter().map(|t| (t.key, &**t)).collect();
         // Each block a job was resumed in front under while the block's own job kept it, and
         // whether that job lives on as the shell waits for it: a child of the shell's outside
         // its group (stopped again, in front, or behind a later command of the list). `fg`
@@ -718,7 +824,7 @@ impl Jobs {
             .collect();
         // What each job's members did since its last pass, by this tick's readings of the members
         // it had (one born or reaped, or another user's that runs unread), and what its last pass
-        // read: a neighbour's, whatever the jobs' order.
+        // read so: a neighbour's, whatever the jobs' order.
         let stir_last: Vec<Stir> = self.jobs.iter().map(|j| j.stir).collect();
         let read_now: Vec<Stir> = self
             .jobs
@@ -743,7 +849,9 @@ impl Jobs {
                     read = match (now, was) {
                         _ if !alive(*p, m.start) => read.max(Stir::Churned),
                         (_, Some(_)) if state == Some(ProcState::Zombie) => read.max(Stir::Churned),
-                        (Some(a), Some(b)) if a != b => read.max(Stir::of_calls(a - b, dt, m.idle)),
+                        (Some(a), Some(b)) if a != b => {
+                            read.max(Stir::of_calls(a.abs_diff(b), dt, m.idle))
+                        }
                         (Some(_), Some(_)) => read,
                         _ if runs => read.max(Stir::Unknown),
                         _ => read,
@@ -773,11 +881,10 @@ impl Jobs {
                 })
                 .flatten();
             let elsewhere = scene_elsewhere(i);
-            // Another job of the tab may have written by this pass or its last (it was not read
-            // still at both, also one that ended at either): what the tab printed may be its. A
-            // nested session writes the tab only through its opener's job, which is judged in
-            // its stead, and the jobs that relay a nested session's writes up to the tab, its
-            // opener's and theirs in turn, are no neighbours of it.
+            // Another job of the tab not read still at this pass or its last (also one that ended
+            // at either) may have written what the tab printed. A nested session is no neighbour
+            // (its opener's job is judged in its stead), nor is a job that relays this one's
+            // writes up to the tab.
             let me = &self.jobs[i];
             let relays_me = |o: &Job| {
                 let mut cur = me;
@@ -863,24 +970,20 @@ impl Jobs {
             };
             let shellish = matches!(job.kind, JobKind::Shell | JobKind::ShellBg);
             // One of the job's own groups other than the shell's holds the terminal (a debugger at
-            // its prompt, the command bash moved on to past a stopped one of its list): a member
-            // stopped in another group is no stop of the job's, which is judged by its group in
-            // front.
+            // its prompt, the command bash moved on to past a stopped one): a member stopped in
+            // another group is no stop of the job's.
             let own_front = shellish
                 && tf.tpgid.is_some_and(|t| {
                     t != tf.shell_pgid && now.keys().any(|p| !zombie(p) && pgid_of(p) == Some(t))
                 });
-            // A block that closed while one of the job's own groups holds the terminal again, its
-            // job one that ran in the background or its `D` a stop, ended under it (the shell takes
-            // the terminal back before it prints a `D`): the job took the block of a command no
-            // pass saw, a `fg` typed ahead of that command's end, and the pass read the command's
-            // `D` before `fg`'s `C`, or the pass read a stop's `D` before the `fg` that resumed the
-            // job. The job runs on in front without the block or the shell, the block's status none
-            // of its, keyed by its group in front as a parked job is, so that group's own unit
-            // finds it while no block opens (a zle widget's `fg` writes none) and a newer block
-            // resumes it. One whose job did neither was closed by a command typed ahead of its end
-            // (zsh runs it once it wrote the `D`): the job ends with its block and leaves that
-            // group to its own unit.
+            // A block that closed while one of the job's own groups holds the terminal again: if
+            // the job ran in the background or the block ended in a stop, the pass read a `D`
+            // before the `fg` that resumed the job (the shell takes the terminal back before it
+            // prints a `D`). The job runs on in front without the block, its status or the shell,
+            // keyed by its group as a parked job is, so that group's unit finds it while no block
+            // opens (a zle widget's `fg` writes none). Otherwise a command typed ahead of the
+            // block's end closed it: the job ends with its block and leaves that group to its
+            // own unit.
             if block_closed
                 && own_front
                 && let Some(g) = tf.tpgid
@@ -985,12 +1088,11 @@ impl Jobs {
                 || (job.block.is_some() && block_closed)
                 || (matches!(job.kind, JobKind::AgentCall | JobKind::Nested)
                     && !alive(job.key.leader, job.key.start));
-            // A block's job that lent its block to a resumed job (a command list that brought it
-            // forward, a `fg` typed ahead) takes the block's status only when it cannot be the
-            // `fg`'s: `fg` returns its job's status, a stop's when the job stopped, and a list's
-            // `D` comes once the job left, so a `D` that is no stop, read while that job lives on
-            // (or after a newer block resumed it), is the block's own command's. A job that quit
-            // leaves it to nobody.
+            // A block's job that lent its block to a resumed job takes the block's status only
+            // when it cannot be the `fg`'s: `fg` returns its job's status (a stop's when it
+            // stopped) and a list's `D` comes once that job left, so a `D` that is no stop, read
+            // while that job lives on or after a newer block resumed it, is the block's own
+            // command's. A job that quit leaves it to nobody.
             if ended && let Some(b) = job.block {
                 let d = tab
                     .into_iter()
@@ -1071,21 +1173,17 @@ impl Jobs {
                 let was = prev.get(pid).and_then(|p| p.counters);
                 match (c.syscalls, was.and_then(|p| p.syscalls)) {
                     (Some(a), Some(b)) => {
-                        if a != b && !waiting_shell(pid) {
-                            match Stir::of_calls(a - b, dt, m.idle) {
+                        let d = a.abs_diff(b);
+                        if d > 0 && !waiting_shell(pid) {
+                            match Stir::of_calls(d, dt, m.idle) {
                                 Stir::Stirred => moved.push(*pid),
                                 _ => ticked = true,
                             }
                         }
-                        // What it made over a tick no key was typed in is its idle rate once
-                        // the tab printed nothing in that tick or this one.
-                        let idle = if printed {
-                            m.idle
-                        } else {
-                            m.idle.max(m.pending)
-                        };
-                        let rate = (dt > 0 && !printed && !typed)
-                            .then(|| per_min(a.saturating_sub(b), dt));
+                        // What it made over a tick no key was typed in is its idle rate once the
+                        // tab printed nothing in that tick or this one.
+                        let idle = m.idle.max(m.pending.filter(|_| !printed));
+                        let rate = (dt >= RATE_MS && !printed && !typed).then(|| per_min(d, dt));
                         idled.push((*pid, idle, rate));
                     }
                     _ => unread |= !stopped,
@@ -1202,24 +1300,26 @@ impl Jobs {
                             fds.iter().any(|f| matches!(f.kind, super::FdKind::Socket))
                         })
                 });
+            // A nested session takes none over a tick keys were typed in unless it made calls of
+            // its own: its opener echoes the person's keys (nvim's other window, Emacs's buffer).
             let stirred = either(Stir::Stirred)
                 || (!neighbour_stirred
+                    && !(job.kind == JobKind::Nested && typed)
                     && (stir != Stir::Still || job.stir != Stir::Still || relay));
             job.stir = stir;
             let credited_pty = stirred
                 && (holds_fg
                     || opener_front
                     || (job.kind == JobKind::ShellBg
-                        && (!tf.has_fg || tf.front_gone)
+                        && (!tf.has_fg || tf.front_gone || tf.front_idle)
                         && tf.bg_units == 1
                         && live.iter().any(|p| state_of(p) != Some(ProcState::Stopped))));
             let mut progress: Option<(Progress, u64)> = None;
             let mut out_growth: u64 = 0;
             let fresh = |stamp: Option<u64>| stamp.filter(|s| *s > floor && *s <= at);
             // The tab's output is a job's only over a tick the shell wrote no mark in (a block's
-            // own `C` is its floor): else it may be the shell's prompt, its notice of a stop, the
-            // echo of `fg`, or a command's that ran between two ticks. Nor is it while it may be
-            // the notice of the `fg` that resumed the job.
+            // own `C` is its floor; else it may be the prompt, a stop's notice, or a command that
+            // ran between two ticks) and past the notice of the `fg` that resumed the job.
             let shells = tab.is_some_and(|t| t.shell_ms.is_some_and(|s| s > floor));
             let own = |stamp: Option<u64>| {
                 fresh(stamp).filter(|s| !shells && job.fg_ms.is_none_or(|f| *s > f))
@@ -1227,11 +1327,21 @@ impl Jobs {
             if let Some(t) = tab.filter(|_| credited_pty) {
                 // The mode word is the foreground reader's (a background job's is the shell's
                 // line editor, raw at its prompt): a background writer is judged by its lines.
-                let canonical = job.kind == JobKind::ShellBg || t.tty.is_none_or(|m| m.canonical);
+                // A nested session at a cooked word of its own, once one of its lines reached the
+                // tab as a line, is judged by its lines too: what it prints without one (a
+                // spinner's `\r`) is no progress, though its opener keeps the tab's word raw. An
+                // opener that draws the screen (nvim) copies none of its lines as lines.
+                let session_lines = job.kind == JobKind::Nested
+                    && term.is_some_and(|w| w.canonical)
+                    && fresh(t.drawn_ms).is_none();
+                let canonical = job.kind == JobKind::ShellBg
+                    || t.tty.is_none_or(|m| m.canonical)
+                    || (session_lines && job.lines_seen);
                 let raw_counts = fault == Some(Fault::RawBytesProgress);
                 let line = canonical && !raw_counts;
-                if let Some(s) = own(t.line_output_ms).filter(|_| line) {
+                if let Some(s) = own(t.line_output_ms).filter(|_| line || session_lines) {
                     progress = Some((Progress::Line, s));
+                    job.lines_seen |= session_lines;
                 } else if let Some(s) = own(t.output_ms).filter(|_| !line) {
                     progress = Some((Progress::Raw, s));
                 }
@@ -1300,15 +1410,13 @@ impl Jobs {
                 progress = Some((Progress::InputConsumed, s));
             }
 
-            // Job control took the terminal from the stopped member's group (the shell has it, or
-            // the next command does): parked. Stopped in the group in front, it holds that group
-            // (a stage of a pipeline, a process substitution in the shell's own group whose pipe
-            // the shell writes). A group the program in front made for itself and stopped at the
-            // terminal (a ninja step at an ssh passphrase prompt) is that program's job's, judged
-            // by the program waiting on it, and stopped while the program runs in the background
-            // (`ninja &`) it is held: no `fg` resumes it. In a nested session, parked with its
-            // opener's job (sudo stops itself once the command it runs stops), or by its own
-            // terminal's group in front.
+            // A member stopped outside the group in front is parked (job control took the terminal
+            // from it), unless a program that does no job control made its group (a ninja step
+            // stopped at an ssh passphrase prompt): that stop is the program's job's, held while
+            // the program runs in the background (`ninja &`), since no `fg` resumes it. Stopped in
+            // the group in front, a member holds that group (a pipeline's stage). A nested
+            // session's member is parked while its opener is out of front (sudo stops itself once
+            // its command stops) or outside its terminal's group in front.
             let session_front = facts.get(&job.key.leader).and_then(|f| f.tpgid);
             let maker_of = |g: u32| {
                 live.iter().filter(|p| pgid_of(p) == Some(g)).find_map(|p| {
@@ -1352,9 +1460,9 @@ impl Jobs {
                         .filter(|p| pgid_of(p) == leader_group)
                         .all(|p| *p == job.key.leader));
             // A nested session's reader is judged by its own terminal's word, read with this
-            // tick's sweep: the tab's is its opener's relay (sudo and `script` keep it raw).
-            // A word the session had from its first reading names no password prompt: its opener
-            // keeps every session it opens in it (Emacs turns echo off for its shells).
+            // tick's sweep: the tab's is its opener's relay (sudo and `script` keep it raw). A
+            // no-echo line word the session has had since its first reading names no password
+            // prompt (`first_word`).
             if job.first_word.is_none() {
                 job.first_word = term;
             }
@@ -1371,6 +1479,7 @@ impl Jobs {
             let jf = JobFacts {
                 holds_fg: holds,
                 builtin,
+                reader: job.key.leader,
                 tty: if nested_holds {
                     session_word
                 } else {
@@ -1393,6 +1502,11 @@ impl Jobs {
                 program_check: fault != Some(Fault::IgnoreProgramCheck),
             };
             let wait = wait::name_job(&scene, &jf, &leaves, (shell_pid, shell_name));
+            let zombie_parent_waits = zombies.as_ref().is_some_and(|z| {
+                let name = sweep.get(&z.parent).map_or("", |s| s.name.as_str());
+                wait::wait_of(&scene, jf.consumer, z.parent, name)
+                    .is_some_and(|w| w.standing == Standing::Legit)
+            });
             job.person_read = matches!(wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
 
             if job.named.is_some() && job.track.last_progress_ms != job.named_progress {
@@ -1427,6 +1541,7 @@ impl Jobs {
                 // The tab's gate is its own reader's: a nested session's relay drains it.
                 gate: if holds_fg { gate } else { InputGate::default() },
                 zombies,
+                zombie_parent_waits,
                 wait,
                 named: named_standing,
             };
@@ -1597,7 +1712,12 @@ impl Jobs {
         }
     }
 
-    /// Folds this reading's programs that have not started into their first sightings, and its held ones (macOS's program check's, [`StartWait::ProgramCheck`]) into the backed-up episode: backed up when a key held now was held at the reading before (its first sighting is kept) or three are held at once (a normal exec reads held for under 0.3 ms, M2); the episode opens at the first backed-up reading and closes at the second reading in a row with nothing held. A translating or unstarted row is no part of it: its wait is not the check's.
+    /// Folds this reading's unstarted programs into their first sightings, and those macOS's
+    /// program check holds ([`StartWait::ProgramCheck`]) into the backed-up episode. A reading is
+    /// backed up when a key held now was held at the reading before (its first sighting is kept)
+    /// or three are held at once (a normal exec reads held for under 0.3 ms); the episode opens at
+    /// the first backed-up reading and closes at the second reading in a row with nothing held. A
+    /// `Translating` or `NotStarted` row is no part of it: its wait is not the check's.
     fn note_held(&mut self, at: u64, held: &[HeldProc]) {
         let all: BTreeSet<(u32, u64, StartWait)> = held.iter().map(held_key).collect();
         let keys: BTreeSet<&(u32, u64, StartWait)> = all
@@ -1644,7 +1764,10 @@ impl Jobs {
         }
     }
 
-    /// THE MEMBERS FLAT ON A FRESH DYLIB at this reading, before it updates them (§5.1's dylib case): each live job member read now that has started (not held), holds a dylib a build just wrote open (`FdKind::File::fresh_dylib`), and whose CPU reads what its member record kept from the reading before, at the same start. [`Self::findings`] names them only inside a backed-up episode.
+    /// The live job members flat on a fresh dylib at this reading, read before it updates them:
+    /// started (not held), holding a dylib a build just wrote open, with the CPU their member
+    /// record kept from the reading before at the same start. [`Self::findings`] names them only
+    /// inside a backed-up episode.
     fn flat_on_a_fresh_dylib(&self, facts: &HashMap<u32, &JobProc>) -> BTreeMap<u32, String> {
         let mut flat = BTreeMap::new();
         for j in self.jobs.iter().filter(|j| j.exited_ms.is_none()) {
@@ -1827,6 +1950,7 @@ impl Job {
             relays: false,
             wake_ms: None,
             first_word: None,
+            lines_seen: false,
             last_name: String::new(),
             member_name: String::new(),
             members: BTreeMap::new(),
@@ -1876,6 +2000,7 @@ impl Job {
             relays: false,
             wake_ms: None,
             first_word: None,
+            lines_seen: false,
             last_name: m.name.clone(),
             member_name: m.name.clone(),
             members,
@@ -1894,7 +2019,8 @@ impl Job {
     }
 }
 
-/// What a held time is kept by: the pid, the program it runs (so an exec starts a new one) and what keeps it.
+/// The key a held time is kept by: the pid, the program it runs (an exec starts a new one) and
+/// what keeps it.
 const fn held_key(h: &HeldProc) -> (u32, u64, StartWait) {
     (h.pid, h.exec, h.wait)
 }
@@ -2092,6 +2218,7 @@ fn discover(
     facts: &HashMap<u32, &JobProc>,
     children: &HashMap<u32, Vec<u32>>,
     job_control: &mut HashMap<u32, (Option<u64>, String)>,
+    root_shell: bool,
 ) -> (Vec<Unit>, TabFacts) {
     let shell = tab.shell_pid;
     let mut tf = TabFacts::default();
@@ -2130,30 +2257,32 @@ fn discover(
             .find(|p| sweep.get(&p.ppid).is_none_or(|q| q.pgid != g))
             .map(|p| p.ppid)
     };
-    let maker = |g: u32, members: &[u32]| made_by(g, members).filter(|m| *m != shell);
-    // The tab's root among them, and also while its marks show it at a prompt or its line
-    // editor reads the terminal raw in front (a shell with no integration): a root that does
-    // neither (`aterm -e ninja`) does no job control, and a stop in a group it made is held.
-    let at_prompt = tab.shell_ms.is_some() && tab.block.as_ref().is_none_or(|b| !b.open);
-    let line_editor = tf.tpgid == Some(tf.shell_pgid) && tab.tty.is_some_and(|m| !m.canonical);
-    for m in tf
+    // The tab's root among them, and also at a pass that found it a shell (`Jobs::absorb`): a
+    // root that is neither (`aterm -e ninja`, or the shell gave way to it: `exec ninja`) does no
+    // job control, a stop in a group it made is held, and in an open block the groups it or
+    // another program in the shell's own group made are the block's (`exec cmake --build`'s
+    // ninja, `$(ninja)`, a build in a pwsh tab, which keeps its children in its own group).
+    let front_maker = tf
         .tpgid
         .and_then(|t| groups.get(&t).map(|ms| (t, ms)))
-        .and_then(|(t, ms)| made_by(t, ms))
-        .into_iter()
-        .chain((at_prompt || line_editor).then_some(shell))
-    {
+        .and_then(|(t, ms)| made_by(t, ms));
+    tf.root_fronted = front_maker == Some(shell);
+    for m in front_maker.into_iter().chain(root_shell.then_some(shell)) {
         if let Some(q) = sweep.get(&m) {
             job_control.insert(m, (start_of(m), q.name.clone()));
         }
     }
+    let block_open = tab.block.as_ref().is_some_and(|b| b.open);
     let made: BTreeMap<u32, u32> = groups
         .iter()
         .filter(|(g, _)| **g != tf.shell_pgid)
         .filter_map(|(g, ms)| {
-            let m = maker(*g, ms).filter(|m| !job_control.contains_key(m))?;
+            let m = made_by(*g, ms).filter(|m| !job_control.contains_key(m))?;
             let h = sweep.get(&m).map(|q| q.pgid)?;
-            (h != tf.shell_pgid && h != *g && groups.contains_key(&h)).then_some((*g, h))
+            if h == tf.shell_pgid {
+                return block_open.then_some((*g, tf.shell_pgid));
+            }
+            (h != *g && groups.contains_key(&h)).then_some((*g, h))
         })
         .collect();
     for g in made.keys() {
@@ -2189,10 +2318,9 @@ fn discover(
             members,
             front: Vec::new(),
             consumer_pid: p.map(|p| p.ppid),
-            // Only the join names a call's command. Its leader is the agent's shell wrapper
-            // (`zsh -c …` leads every Claude Code call), so the leader's name would put every
-            // call in one command class, and a later `sleep 600` would be judged by an
-            // earlier build's μ.
+            // Only the join names a call's command: its leader is the agent's shell wrapper
+            // (`zsh -c …` leads every Claude Code call), whose name would put every call in one
+            // command class.
             command: hint.and_then(|h| h.command.clone()).unwrap_or_default(),
             block: None,
             shell: None,
@@ -2239,6 +2367,13 @@ fn discover(
             .any(|p| sweep.get(p).is_some_and(|s| s.state != ProcState::Zombie))
     });
     tf.front_gone = front.is_some() && !tf.front_live;
+    tf.front_idle = tab.tty.is_some_and(|m| !m.canonical)
+        && front.and_then(|g| groups.get(&g)).is_some_and(|ms| {
+            let mut live = ms
+                .iter()
+                .filter(|p| sweep.get(p).is_some_and(|s| s.state != ProcState::Zombie));
+            live.next().is_some_and(|p| job_control.contains_key(p)) && live.next().is_none()
+        });
     if let Some(b) = block {
         let mut members = vec![shell];
         members.extend(groups.get(&tf.shell_pgid).into_iter().flatten().copied());
@@ -2320,20 +2455,13 @@ fn discover(
     (units, tf)
 }
 
-/// The live job a block's group in front already belongs to, when that block
-/// resumes it: a background job (a parked job `fg` resumed), the foreground
-/// group a tick saw before its block (an engine restored running, or a fork
-/// swept before the reader fed its `C`), or a block's job whose block ended in
-/// a stop and whose last group in front (the stopped command, an `a && b`'s
-/// second) is in front again under the newer block (a stop and `fg` no tick
-/// saw; a command typed ahead of a block that ended is no stop, and its own
-/// job), or a job a block resumed whose own group (its key's: a parked or
-/// background job) is in front again under a newer one (it took the block of
-/// a command no pass saw, a `fg` typed ahead of that command's end, and the
-/// newer block is that `fg`'s): its index. Only
-/// the group in front is looked at:
-/// the shell's own group holds what no command owns (a process substitution
-/// the shell started, a survivor an earlier command left).
+/// The index of the live job a block's group in front already belongs to, when that block resumes
+/// it: a background or parked job (`fg`), the group a tick saw in front before its block, or an
+/// older block's job whose last group in front is in front again, where that block ended in a stop
+/// (a stop and `fg` no tick saw) or the group is the one its key names (it took the block of a
+/// command no pass saw, and the newer block is a `fg` typed ahead of that command's end). Only the
+/// group in front counts: the shell's own group holds what no command owns (a process
+/// substitution, a survivor an earlier command left).
 fn resumed(u: &Unit, tab: &JobTab, claimed: &HashMap<u32, usize>, jobs: &[Job]) -> Option<usize> {
     u.front
         .iter()
@@ -2539,16 +2667,14 @@ fn demand_of(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Demand {
     d
 }
 
-/// A live job the engine watches at its fast cadence whatever it waits on:
-/// stuck, or capable of suspicion (an agent's call, §11.5).
+/// A live job the engine watches at its fast cadence whatever it waits on: stuck, or capable of
+/// suspicion (an agent's call).
 fn watched_fast(r: &JobRow) -> bool {
     r.verdict == Verdict::Stuck || matches!(r.standing, Some(Standing::Capable | Standing::Capped))
 }
 
-/// The tabs whose every live job holds the foreground at the person's own
-/// terminal read (`at_person`, [`Job::person_read`]) and is not watched fast
-/// ([`watched_fast`], [`demand_of`]'s own exception), ascending:
-/// [`JobsView::parked_tabs`].
+/// The tabs, ascending, whose every live job holds the foreground at the person's own terminal read
+/// and is not [`watched_fast`] ([`JobsView::parked_tabs`]).
 fn parked_tabs(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Vec<u64> {
     let mut parked = BTreeSet::new();
     let mut not = BTreeSet::new();

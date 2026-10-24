@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inputs shared by the recorded-answer and differential tests.
+//! Inputs and helpers shared by the suite's tests.
 
 /// xxhsum's sanity buffer, the input the recorded XXH64 answers and CLI frames
 /// were made from: byte i is the top byte of the generator after i steps
@@ -196,13 +196,12 @@ pub fn far_repeat(seed: u64) -> Vec<u8> {
 }
 
 /// Rounds of three 128 KiB blocks: noise; noise with two 4-byte copies from
-/// 125,000 and 130,000 bytes back near its start, which cost more to code
-/// than they save (an encoder codes them, then writes the block raw); then 16
-/// noise bytes, 32 bytes copied from 130,000 back, and text. A raw block
-/// moves no repeat offset and sets no table (RFC 8878 §3.1.1.2), so the third
-/// block's copy must be named by its distance: an encoder that kept the raw
-/// block's state would name it by a repeat offset the decoder does not hold,
-/// or repeat a table the decoder never read.
+/// 125,000 and 130,000 back, which cost more than they save (an encoder codes
+/// them, then writes the block raw); then 16 noise bytes, 32 bytes copied
+/// from 130,000 back, and text. A raw block moves no repeat offset and sets
+/// no table (RFC 8878 §3.1.1.2), so an encoder that kept its state would name
+/// the third block's copy by a repeat offset the decoder does not hold, or
+/// repeat a table the decoder never read.
 pub fn raw_after_coding(rounds: usize, seed: u64) -> Vec<u8> {
     const BLOCK: usize = 128 << 10;
     let mut out = Vec::with_capacity(rounds * 3 * BLOCK);
@@ -302,8 +301,8 @@ pub fn sparse(len: usize, seed: u64) -> Vec<u8> {
 
 /// The input a recorded row names, `kind:len:seed`: `words`, `inserts`,
 /// `sparse`, `noise`, `one_code` and `rle_literals` (`len` counts their
-/// units) or `run` (`len`
-/// bytes of `z`, no seed used); and `text:0:<ascii>`, those bytes as written.
+/// units) or `run` (`len` bytes of `z`, no seed used); and `text:0:<ascii>`,
+/// those bytes as written.
 pub fn input(spec: &str) -> Vec<u8> {
     let mut parts = spec.splitn(3, ':');
     let (kind, len, seed) = (

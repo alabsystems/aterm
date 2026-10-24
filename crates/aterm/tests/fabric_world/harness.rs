@@ -65,14 +65,14 @@ pub fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
     until_within(DEADLINE, what, f)
 }
 
-/// [`until`] with a stated budget, for the one class of observable that has a PERIOD of its own.
+/// [`until`] with a stated budget, for an observable with a period of its own.
 pub use aterm_spec::wait::until_within;
 
 /// The budget for something the bridge's periodic backstop publishes.
 pub const PERIODIC_DEADLINE: Duration = Duration::from_secs(180);
 /// Fast-timers development seam as a [`World::boot_with`] environment entry.
 pub const FAST_TIMERS: (&str, &str) = (aterm_types::domain::ENV_DEV_FAST_TIMERS, "1");
-/// Bound on one control-verb reply (`2 * DEADLINE`).
+/// Bound on one control-verb reply.
 pub const VERB_DEADLINE: Duration = Duration::from_secs(2 * DEADLINE.as_secs());
 
 /// Connects to an instance's control socket and authenticates with `bound` read/write timeouts.
@@ -228,7 +228,8 @@ impl Drop for Reaped {
     }
 }
 
-/// `SIGKILL` `child` and reap it within [`DEADLINE`]; one still there then is left unreaped, since whether a program macOS's program check holds takes its signal is unmeasured.
+/// `SIGKILL` `child` and reap it within [`DEADLINE`]; one still there then is left unreaped
+/// (whether a child macOS's program check holds takes its signal is unmeasured).
 pub fn kill_reaped(child: &mut Child) {
     let _ = child.kill();
     let _ = aterm_spec::wait::within(DEADLINE, Duration::from_millis(10), || {
@@ -236,12 +237,15 @@ pub fn kill_reaped(child: &mut Child) {
     });
 }
 
-/// The words a wait on `pid`, a child this test spawned, ends the test COULD NOT RUN with when it ran out at [`DEADLINE`] while macOS's program check holds the child ([`aterm_uds::deadline::held_words`]); asked before the child is killed, so any other silence stays the test's failure.
+/// The COULD NOT RUN words for a wait on `pid`, a child this test spawned, that ran out at
+/// [`DEADLINE`] while macOS's program check holds it ([`aterm_uds::deadline::held_words`]). Ask
+/// before the child is killed, so any other silence stays the test's failure.
 fn held_at_deadline(pid: u32) -> Option<String> {
     aterm_uds::deadline::held_words(pid, DEADLINE, program_check(pid))
 }
 
-/// The next item `rx` carries from the output of `pid`, a child this test spawned, within [`DEADLINE`] of `since`; one that never comes ends the test as [`recv_judged`] does. The child's owner ends it as the test unwinds.
+/// The next item `rx` carries from `pid`'s output within [`DEADLINE`] of `since`, a miss judged as
+/// [`recv_judged`] does. The child's owner ends it as the test unwinds.
 pub fn recv_within<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     since: Instant,
@@ -251,7 +255,10 @@ pub fn recv_within<T>(
     recv_judged(rx, since, DEADLINE, pid, program_check, what)
 }
 
-/// The next item `rx` carries within `hang` of `since`, `hang` a hang detector on `pid`, the child whose output feeds it. At the deadline it asks `held` of the child, before anything kills it: COULD NOT RUN when macOS's program check holds it ([`aterm_uds::deadline::held_words`]), else the test fails naming `what` never came.
+/// The next item `rx` carries within `hang` (a hang detector) of `since`, from the output of
+/// `pid`. At the deadline, before anything kills the child, it asks `held`: COULD NOT RUN when
+/// macOS's program check holds it ([`aterm_uds::deadline::held_words`]), else the test fails
+/// naming `what`.
 pub fn recv_judged<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     since: Instant,
@@ -334,7 +341,8 @@ pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     Client::from_stream(s)
 }
 
-/// Reads the first line `child` prints on its piped stdout, bounded by [`DEADLINE`]; a child macOS's program check still holds then ends the test COULD NOT RUN ([`aterm_uds::deadline::held_words`]).
+/// Reads the first line `child` prints on its piped stdout within [`DEADLINE`]; a child macOS's
+/// program check still holds then ends the test COULD NOT RUN.
 pub fn first_line_within(child: &mut OwnedChild, what: &str) -> String {
     use std::io::BufRead;
     let out = child.stdout.take().expect("the child's stdout is piped");
@@ -499,7 +507,8 @@ pub fn end_bridge(state: &Path, launcher: Launcher) {
     });
 }
 
-/// These Fabric fixtures do not exercise update, package or machine configuration.
+/// The config every fixture seeds: no agent auto-prime, updates and packages off, and Universal
+/// Control left as it is.
 pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[update]\nenabled = false\nauto_apply = false\n\n[packages]\nenabled = false\n\n[machine]\nuniversal_control = \"leave\"\n";
 
 /// Seed a private config once; an intentional fixture edit survives relaunch.
@@ -521,7 +530,7 @@ pub fn prepare_fixture_config(tmp: &Path) {
     }
 }
 
-/// One booted world: a guarded broker, a headless aterm, and the bridge child aterm launched.
+/// What makes a node's grant ring from its node id ([`node_grants`] when a boot names none).
 pub type GrantsFor<'a> = &'a dyn Fn(&str) -> Vec<String>;
 
 struct Scratch {
@@ -677,6 +686,7 @@ fn end_owned_child(child: &mut OwnedChild) -> Result<(), String> {
     Err("owned instance not reaped after SIGKILL".into())
 }
 
+/// One booted world: a guarded broker, a headless aterm, and the bridge child aterm launched.
 pub struct World {
     pub tmp: PathBuf,
     pub broker: Option<Broker>,
@@ -1170,7 +1180,7 @@ impl World {
         });
     }
 
-    /// TAKE THE BROKER AWAY, and wait until the bridge has noticed.
+    /// Takes the broker away and waits until the bridge has noticed.
     pub fn stop_broker(&mut self) {
         if let Some(mut h) = self.handle.take() {
             h.shutdown();
@@ -1184,7 +1194,7 @@ impl World {
         });
     }
 
-    /// BRING THE BROKER BACK on the same log and socket path, and wait for the bridge to reattach.
+    /// Brings the broker back on the same log and socket path and waits for the bridge to reattach.
     pub fn start_broker(&mut self) {
         let _ = std::fs::remove_file(&self.broker_sock);
         let broker = if self.retained {
@@ -1399,7 +1409,7 @@ impl World {
         })
     }
 
-    /// Every `ev` record the node has published, newest last — over EVERY `ev` face it owns.
+    /// Every `ev` record the node has published, newest last, over every `ev` face it owns.
     pub fn ev(&self) -> Vec<String> {
         self.ev_on(&format!("/f/{FLEET}/pub/{}/>", self.node))
     }
@@ -1571,7 +1581,7 @@ pub fn topic_rows(w: &World, sid: &str, topic: &str) -> Vec<String> {
         .collect()
 }
 
-/// `Some` once the BRIDGE holds `topic` for `sid`: its persisted cursors, one topic per line.
+/// `Some` once the bridge holds `topic` for `sid`: its persisted cursors, one topic per line.
 pub fn bridge_holds(w: &World, sid: &str, topic: &str) -> Option<()> {
     std::fs::read_to_string(w.state.join(format!("topics/{sid}")))
         .ok()?
@@ -2003,7 +2013,7 @@ impl Fleet {
         Node::boot(self, tag, accept_from, args, env, self.next)
     }
 
-    /// Run `aterm link ls` against this fleet and answer its stdout.
+    /// Runs `aterm link ls` against this fleet and returns its stdout.
     pub fn ls(&self) -> String {
         let cap = self.cap_file("ls", &[format!("ro:/f/{FLEET}/pub/>")]);
         let mut cmd = Command::new(aterm_to_launch());
@@ -2190,7 +2200,7 @@ impl Node {
         inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
     }
 
-    /// Every `ev` record this node has published, newest last — over EVERY `ev` face it owns.
+    /// Every `ev` record this node has published, newest last, over every `ev` face it owns.
     pub fn ev(&self, fleet: &Fleet) -> Vec<String> {
         let filter = format!("/f/{FLEET}/pub/{}/>", self.node);
         fleet
@@ -2230,11 +2240,9 @@ impl Node {
     }
 }
 
-/// A WAIT THAT RUNS OUT ON A HELD CHILD ENDS COULD NOT RUN, AND ANY OTHER SILENCE FAILS: a channel
-/// nothing feeds, judged at 50 ms (the timeout branch under test, not a budget) with a reader that
-/// answers for the child's pid alone, ends COULD NOT RUN naming that pid when the reader says it is
-/// held, and fails naming what never came when it says not held or cannot tell; an item that came
-/// is returned.
+/// A wait judged at 50 ms (the timeout branch under test, not a budget) ends COULD NOT RUN naming
+/// the pid when the reader says the child is held, fails naming what never came otherwise, and
+/// returns an item that came.
 #[test]
 fn a_wait_that_runs_out_on_a_held_child_ends_could_not_run_and_any_other_silence_fails() {
     let (tx, rx) = std::sync::mpsc::channel::<String>();

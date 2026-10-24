@@ -327,8 +327,8 @@ struct Mock {
     task_lost: usize,
     hang_up_at: Option<&'static str>,
     hung_up: bool,
-    /// A host that keeps a session log (6H-5): its `status` prints the log's head, and `await
-    /// log` answers from here ([`LogWorld`]). `None` is a host with no log.
+    /// A host that keeps a session log: its `status` prints the log's head, and `await log`
+    /// answers from here ([`LogWorld`]). `None` is a host with no log.
     log: Option<LogWorld>,
     /// How many screens had been served when each `turn` request arrived.
     turns_served: Vec<usize>,
@@ -686,16 +686,16 @@ fn failed(code: i32, text: &str) -> CtlReply {
     }
 }
 
-/// THE MOCK HOST'S SESSION LOG (6H-5): what its `status` prints of the log, and how it
-/// answers `await log`. A wait sleeps through the turn's frames to the first that ends it,
-/// as the host's tracker does, and answers that frame's record: a turn's close at a rest,
-/// a step's open at a box, a question or a wall.
+/// The mock host's session log: what its `status` prints of the log, and how it answers
+/// `await log`. A wait sleeps through the turn's frames to the first that ends it, as the host's
+/// tracker does, and answers that frame's record: a turn's close at a rest, a step's open at a
+/// box, a question or a wall.
 #[derive(Debug)]
 struct LogWorld {
     /// The newest record (`log_seq=`); each answer is one more.
     seq: u64,
-    /// This many answers come while the next frame still shows the turn running: a turn a
-    /// measured build's transcript closed before its screen rested.
+    /// This many answers come while the next frame still shows the turn running: a turn the
+    /// transcript closed before its screen rested.
     early: usize,
     /// The log closed the turn the screen still shows running: `turn=-` until a frame rests.
     closed: bool,

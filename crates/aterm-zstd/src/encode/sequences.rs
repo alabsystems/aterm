@@ -134,7 +134,7 @@ const ML_SMALL: [u8; 128] = small_codes::<128>(&ML_CODES, MIN_MATCH);
 
 /// The literal length code of `ll` (RFC 8878 §3.1.1.3.2.1.1): codes 25 up each double.
 #[inline]
-const fn ll_code(ll: u32) -> u8 {
+pub(crate) const fn ll_code(ll: u32) -> u8 {
     if ll < 64 {
         LL_SMALL[ll as usize]
     } else {
@@ -144,7 +144,7 @@ const fn ll_code(ll: u32) -> u8 {
 
 /// The match length code of `ml` (RFC 8878 §3.1.1.3.2.1.1): codes 43 up each double.
 #[inline]
-const fn ml_code(ml: u32) -> u8 {
+pub(crate) const fn ml_code(ml: u32) -> u8 {
     let base = ml - MIN_MATCH;
     if base < 128 {
         ML_SMALL[base as usize]
@@ -400,8 +400,8 @@ mod tests {
     /// hold, and each value sits inside its code's range.
     #[test]
     fn length_codes_cover_every_value() {
-        // A block holds 128 KiB: a sequence carries fewer literals (it ends in a match), and a
-        // match of the whole block.
+        // A block holds 128 KiB: a sequence carries fewer literals than that (it ends in a
+        // match), and a match up to the whole block.
         for v in 0..(1u32 << 17) - MIN_MATCH {
             let c = ll_code(v);
             let (base, bits) = LL_CODES[usize::from(c)];

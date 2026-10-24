@@ -2,48 +2,41 @@
 // Copyright 2026 Andrew Yates
 
 //! `aos-workers-bench`: Aos M5b's measurement of useful accepted work per elapsed time, as
-//! pre-registered in design §11.8 (`docs/DESIGN-aos-hosted-execution-2026-10-21.md`), before the
-//! session it decides was run. Six arms of `aos-search --grid --plans F` in a Williams order; the
-//! validity gates, C0's bundle parity, the criteria C1–C3 and the reported statistics computed here
-//! and written with every raw figure to `DIR/record.txt`. Every figure is MEASURED (never scored):
-//! the session gates no build or push, it decides what the record may claim.
+//! pre-registered in design §11.8 (`docs/DESIGN-aos-hosted-execution-2026-10-21.md`). It runs six
+//! arms of `aos-search --grid --plans F` in a Williams order, computes the validity gates, C0's
+//! bundle parity, the criteria C1–C3 and the statistics, and writes them with every raw figure to
+//! `DIR/record.txt`. Every figure is measured, never scored: the session gates no build or push.
+//! The pure parts are apart from the effects (spawning the lab, `sysctl`, the files), so the tests
+//! drive them on captured summaries.
 //!
-//! The pure parts (the Williams order, the summary parser, C0's comparison, the gates, the
-//! criteria, the statistics and the record's text) are apart from the effects (spawning and waiting
-//! on the lab, `sysctl`, the files), so the tests drive the former on captured summaries.
-//!
-//! Where §11.8 is silent, the runner takes the fail-closed option, and says so here:
-//! * Gate 0, "one clean commit" and "one debug lab binary": every run's summary names one build,
-//!   which names a commit and does not end `-dirty`; the lab is a debug build, which the runner
-//!   knows only when `--lab` is byte-identical to itself; and the lab's file digest is the same at
-//!   the end as at the start. Otherwise the session is void.
+//! Where §11.8 is silent, the runner decides, and fails closed:
+//! * Gate 0: every run's summary names one build, which names a commit and does not end `-dirty`;
+//!   the lab is a debug build, known only when `--lab` is byte-identical to the runner; and the
+//!   lab's digest is the same at the end as at the start. Otherwise the session is void.
 //! * Only a gate-2 defect stops a session (§11.8 item 2). A void is decided at the end, so a void
 //!   session still runs every round and reports every figure.
-//! * C0's reference is the session's first A run that reproduces the M4 record (gate 1); every run,
-//!   the other A runs included, is compared with it, and a run before it waits for it. A run never
-//!   compared voids the session.
+//! * C0's reference is the session's first A run that reproduces the M4 record (gate 1). Every run
+//!   is compared with it, a run before it waits for it, and a run never compared voids the session.
 //! * A gate-2 defect is also: an exit other than 0, a `result=` other than `pass` with 2 winners, a
-//!   bundle missing or not decoding, a summary that does not parse, a run whose summary is not the
-//!   arm it was spawned as, `reaped != spawned` and `result=void`.
-//! * Gate 3 also counts `foreign`, `dropped`, `retries` and `cancelled`, and any fault armed or fired.
-//! * Gate 5: the summary floors `peak_rss_mb_sum` to whole MiB, so the bound adds a MiB less a byte.
-//! * Gate 4 fails when no round is valid. Gate 6 of a smoke run of N rounds needs N − ⌊N/6⌋ valid
-//!   rounds (10 of 12).
-//! * A smoke run (`--rounds` below 12) is never the registered session, and no claim is made from it.
-//! * The fault session runs after a valid clean session, or, in a smoke run only, after a clean
-//!   session that no defect stopped. Its C0 reference is its own A run, which must reproduce the M4
-//!   record or the fault session is void; it runs `min(3, N)` rounds; a C0 mismatch, a void or
-//!   `reaped != spawned` in it is a defect that stops it. With `--faults`, exit 0 needs every fault
-//!   shown in every one of its runs.
-//! * A fault's added wall time is the run's wall time less the median wall time of the clean
-//!   session's valid P8 runs (the faulted job's own lease-to-accept time is not in the summary), and
-//!   its added CPU the same difference of CPU, with the leases beyond the jobs. Neither is the
-//!   faulted attempt's wasted work, which §11.8 leaves unreported.
-//! * The wall time is spawn to the first poll that sees the exit, polled every 2 ms.
+//!   bundle missing or not decoding, a summary that does not parse or is not the arm it was spawned
+//!   as, `reaped != spawned` and `result=void`.
+//! * Gate 3 also counts `foreign`, `dropped`, `retries` and `cancelled`, and any fault armed or
+//!   fired.
+//! * Gate 4 fails when no round is valid. Gate 6 of a smoke run of N rounds needs N − ⌊N/6⌋ of
+//!   them valid.
+//! * A smoke run (`--rounds` below 12) is never the registered session, and no claim is made from
+//!   it.
+//! * The fault session follows a valid clean session, or, in a smoke run, one no defect stopped.
+//!   Its C0 reference is its own A run, which must reproduce the M4 record or the fault session is
+//!   void; it runs `min(3, N)` rounds, and a C0 mismatch, a void or `reaped != spawned` in it is a
+//!   defect that stops it.
+//! * A fault's added wall time and CPU are the run's less the median of the clean session's valid
+//!   P8 runs (the summary lacks the faulted job's lease-to-accept time), reported with the leases
+//!   beyond the jobs. Neither is the faulted attempt's wasted work, which §11.8 leaves unreported.
 //! * The summary prints each run's trip percentiles, not each job's trip, so the record reports the
 //!   median over the valid runs of each run's p50, p95 and p99.
-//! * The summary prints neither a worker's spawn-to-Hello time nor its declared evaluator build, so
-//!   process creation less the build is reported as not exposed.
+//! * The summary prints neither a worker's spawn-to-Hello time nor its evaluator build, so process
+//!   creation less the build is reported as not exposed.
 //! * The P8A grid `verify_ms` defect flag is judged per valid round, against that round's A.
 
 use std::fmt::Write as _;
@@ -1137,8 +1130,7 @@ impl Measured {
 /// A gate a run can fail without stopping the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Gate {
-    /// Gate 3: a clean P run counted a lost, expired, stale, duplicate, late progress or refused
-    /// frame.
+    /// Gate 3: a clean P run counted an event [`CLEAN_COUNTERS`] names, or armed or fired a fault.
     G3,
     /// Gate 5: a budget.
     G5,

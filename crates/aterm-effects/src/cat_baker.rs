@@ -45,15 +45,14 @@ enum SlotKey {
     Host(u64),
 }
 
-/// Host-side LRU bake cache of interned [`FxArt`]s (§5.5): what to keep baked,
-/// never where it lives on a GPU (`aterm-gpu`'s fx atlas keeps its own
-/// residency, uploading an art's region only when it is first drawn).
+/// Host-side LRU bake cache of interned [`FxArt`]s (§5.5): what to keep baked, never where it
+/// lives on a GPU (`aterm-gpu`'s fx atlas keeps its own residency, uploading an art's region only
+/// when it is first drawn).
 #[derive(Default)]
 pub struct CatBaker {
     cell_w: u16,
     cell_h: u16,
-    /// The widest tile a slot holds: `4·ch`, the §5.2 `W ≤ 4·ch` cap made
-    /// structural.
+    /// The widest tile a slot holds: `4·ch`, which makes the `W ≤ 4·ch` width cap structural.
     slot_w: u16,
     /// `min(32, ⌊2 MiB / slot_bytes⌋)` occupied-or-free slots.
     slots: Vec<Option<Slot>>,
@@ -85,7 +84,8 @@ impl CatBaker {
         }
     }
 
-    /// Per-tick prologue: advance the LRU clock, reset the bake budget, and on a cell-metric change wholesale-clear + version-bump (§5.5 invalidation).
+    /// Per-tick prologue: advance the LRU clock, reset the bake budget, and on a cell-metric
+    /// change clear the cache and bump its version (§5.5 invalidation).
     #[inline]
     pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
         self.clock = self.clock.wrapping_add(1);
@@ -95,11 +95,12 @@ impl CatBaker {
             self.cell_w = cell_w;
             self.cell_h = cell_h;
             if cell_h == 0 {
+                self.slot_w = 0;
+                self.slots.clear();
                 return;
             }
             self.slot_w = cell_h.saturating_mul(4);
             let slots = Self::slot_count(cell_h);
-            self.slots.clear();
             self.slots.resize_with(slots, || None);
         }
     }
@@ -143,21 +144,23 @@ impl CatBaker {
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.slots.iter().all(Option::is_none)
+    }
+
+    /// Whether a [`BakeKeyV4`] glyph tile fits inside the current slot dimensions.
+    #[inline]
+    const fn fits_v4(&self, key: &BakeKeyV4) -> bool {
+        // The whole baked tile is `key.w + PATCH_STRIP` wide and must fit the slot.
+        self.cell_h != 0
+            && key.w != 0
+            && (key.w as u32) + (PATCH_STRIP as u32) <= (self.slot_w as u32)
+            && key.h != 0
+            && (key.h as u32) <= 2 * (self.cell_h as u32)
     }
 
     /// Look up a [`BakeKeyV4`] glyph tile, baking on a miss when the per-frame budget allows.
     pub fn get_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
-        // The whole baked tile is `key.w + PATCH_STRIP` wide and must fit the slot.
-        if self.cell_h == 0
-            || key.w == 0
-            || u32::from(key.w) + u32::from(PATCH_STRIP) > u32::from(self.slot_w)
-        {
-            return None;
-        }
-        let ch = usize::from(self.cell_h);
-        let slot_h = 2 * ch;
-        if key.h == 0 || usize::from(key.h) > slot_h {
+        if !self.fits_v4(key) {
             return None;
         }
         let slot_key = SlotKey::Cat(*key);
@@ -175,17 +178,11 @@ impl CatBaker {
         out
     }
 
-    /// Look up a resident `BakeKeyV4` tile and stamp it used this frame without spending bake budget on a miss.
+    /// Look up a resident `BakeKeyV4` tile and stamp it used this frame, spending no bake budget
+    /// on a miss.
     #[inline]
     pub fn peek_v4(&mut self, key: &BakeKeyV4) -> Option<CatTile> {
-        if self.cell_h == 0
-            || key.w == 0
-            || u32::from(key.w) + u32::from(PATCH_STRIP) > u32::from(self.slot_w)
-        {
-            return None;
-        }
-        let slot_h = 2 * usize::from(self.cell_h);
-        if key.h == 0 || usize::from(key.h) > slot_h {
+        if !self.fits_v4(key) {
             return None;
         }
         self.touch(SlotKey::Cat(*key))
@@ -256,7 +253,8 @@ impl CatBaker {
         Some(CatTile { art })
     }
 
-    /// Bake a host-authored straight-alpha RGBA tile into the cache, keyed by a stable `host_id` so later calls are cache hits.
+    /// Bake a host-authored straight-alpha RGBA tile into the cache, keyed by a stable `host_id`
+    /// so later calls are cache hits.
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -295,7 +293,8 @@ impl CatBaker {
     }
 }
 
-/// COAT_RAMP — 16 similarity-ordered stops, black→gray→blue→brown→ginger→ cream→white (§5.3; adjacent indices are near-identical coats).
+/// Sixteen similarity-ordered coat stops, black → gray → blue → brown → ginger → cream → white;
+/// adjacent indices are near-identical coats.
 pub const COAT_RAMP: [u32; 16] = [
     0x0010_1014,
     0x001B_1B22,
@@ -315,7 +314,8 @@ pub const COAT_RAMP: [u32; 16] = [
     0x00FA_F4E8,
 ];
 
-/// Sixteen low-chroma natural iris stops (hazel, moss, storm blue, rose grey), visible without dominating the expression.
+/// Sixteen low-chroma natural iris stops (hazel, moss, storm blue, rose grey), visible without
+/// dominating the expression.
 pub const EYE_RAMP: [u32; 16] = [
     0x007A_5146,
     0x0087_5D50,
@@ -415,7 +415,7 @@ pub(crate) fn paint_dark_masked_disc(
                 continue;
             }
             let dx0 = x as f32 + 0.125 - cx;
-            let dx3 = x as f32 + 0.875 - cx;
+            let dx3 = dx0 + 0.75;
             let dx0_2 = dx0 * dx0;
             let dx3_2 = dx3 * dx3;
             let dx2_min = if dx0 > 0.0 {
@@ -452,7 +452,7 @@ pub(crate) fn paint_dark_masked_disc(
     }
 }
 
-/// v4 §2.1 pale outline lift for the darkest background-luminance band.
+/// Pale outline ink for the darkest background-luminance band (v4 §2.1).
 pub const OUTLINE_PALE: u32 = 0x00F4_E6DD;
 
 const EYE_INK_DARK: u32 = 0x0018_1520;
@@ -725,7 +725,8 @@ fn lift_coat_luminance(coat: (f32, f32, f32), floor: f32) -> (f32, f32, f32) {
     mix3(coat, pale, hi)
 }
 
-/// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`] as on the dark background classes, without the accent nudge (which cancels out of a two-coat comparison).
+/// `COAT_RAMP[coat]` lifted to [`COAT_MIN_LUM_DARK_BG`] as on the dark background classes, without
+/// the accent nudge (which cancels out of a two-coat comparison).
 #[cfg(test)]
 pub(crate) fn dark_bg_coat_stop(coat: u8) -> (f32, f32, f32) {
     let stop = rgb(COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)]);
@@ -804,7 +805,8 @@ pub(crate) fn paint_outline_halo(
     }
 }
 
-/// Accessory attachment: the normalized head-frame point where the accessory's own centre lands, plus its size relative to the head box (~0.4×).
+/// Accessory attachment: the normalized head-frame point where the accessory's centre lands, and
+/// its size relative to the head box.
 #[inline]
 #[must_use]
 pub const fn accessory_attach(acc: CatGlyphId) -> (f32, f32, f32) {
@@ -1301,7 +1303,7 @@ fn paint_variant_onto(
     }
 }
 
-/// Bake one authored glyph variant to an exact-size RGBA [`Tile`].
+/// Bake one authored glyph variant to a `(w + PATCH_STRIP) × h` RGBA [`Tile`].
 #[inline]
 #[must_use]
 pub fn bake_variant(id: CatGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {

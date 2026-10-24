@@ -63,10 +63,10 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
         h.shutdown();
     }
     w.broker.take();
-    // A shutdown cuts the broker's connections one by one, so the bridge's head query
-    // can still be answered after its inbox was cut, and the first stall reads
-    // `cut-inbox`; the redial that follows names the broker gone.
-    let fs = until("the fabric stalled on a gone broker", || {
+    // The shutdown wakes the broker's subscribers before it closes their connections, so the
+    // bridge can first report a cut subscription the broker still answers for (`cut-fleet`,
+    // `cut-inbox`, `cut-say`); its redial's verdict replaces that.
+    let fs = until("fabric=stalled on a redial's verdict", || {
         let fs = fabric_status(&w);
         (kv(&fs, "state") == Some("stalled")
             && matches!(kv(&fs, "reason"), Some("closed" | "no-socket" | "refused")))
@@ -74,6 +74,7 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     });
     assert_eq!(kv(&fs, "rtt_ms"), Some(rtt.to_string().as_str()), "{fs}");
     let s = status(&w);
+    assert!(s.contains(" fabric=stalled "), "{s}");
     assert!(s.contains(&format!(" fabric_rtt_ms={rtt} ")), "{s}");
 
     const WAIT: Duration = Duration::from_secs(300);

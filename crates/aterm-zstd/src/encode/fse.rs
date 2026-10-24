@@ -37,7 +37,7 @@ pub(crate) fn optimal_log(max_log: u32, n: usize, max_symbol: u32) -> u32 {
 
 /// `counts` scaled to sum `1 << log`, every present symbol at least 1, the rounding
 /// spent where it costs least: the `Normalized_Counter` a table description carries.
-/// Never writes -1 ("less than 1"), which a decoder reads the same as 1 for cost.
+/// Never writes -1 ("less than 1"): like 1, it holds one state, so it would save nothing.
 ///
 /// `counts` must hold at least two present symbols and at most `1 << log` of them.
 pub(crate) fn normalize(counts: &[u32], log: u32, norm: &mut Vec<i16>) {

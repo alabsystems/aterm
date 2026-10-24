@@ -34,7 +34,8 @@ path = "src/lib.rs"
 aterm-digest = { workspace = true }
 # The zstd CLI's TOOLS row (`aterm_uds::host::need_tool`), spawned through
 # `aterm_uds::spawnfd::command`, is the reference decoder the encoder's frames
-# are held to (tests/encode_cli.rs); without it that test ends COULD NOT RUN.
+# are held to, and its `-19` the size level 19 stays within 3% of
+# (tests/encode_cli.rs); without it those tests end COULD NOT RUN.
 aterm-uds = { workspace = true }
 # Scratch directories for the frames the CLI reads.
 aterm-tempfile = { workspace = true }

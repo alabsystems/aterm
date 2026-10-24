@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure supervisor tool-approval policy decider (`ApprovalState`, `ApprovalReading`, `ApprovalDecision`).
+//! Pure supervisor tool-approval policy decider: [`decide`] judges a box against an
+//! [`ApprovalCtx`] into a [`Decision`].
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,13 +30,17 @@ use crate::supervise::classify::{
 
 /// Rule identifier for the read-only Bash classifier approval rule.
 pub const RULE_READ_ONLY: &str = "read-only@classify-v9";
-/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (`This command requires approval`).
+/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note
+/// (`This command requires approval`).
 pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v4";
-/// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the rm resolver follows.
+/// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the
+/// rm resolver follows.
 pub const RULE_RM_BREAKER: &str = "rm-breaker@v8";
-/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm.
+/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a
+/// command that names no rm.
 pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v9";
-/// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
+/// The rm circuit breaker the safe rules could not prove, approved with a warning under
+/// `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
 /// The Read-outside-cwd rule's id.
 pub const RULE_READ_OUTSIDE_CWD: &str = "read-outside-cwd@v2";
@@ -57,7 +62,8 @@ pub const RULE_CREDITS_DECLINE: &str = "credits-decline@v1";
 pub const RULE_DECLINE: &str = "decline@v1";
 /// Full power.
 pub const RULE_MODEL_SWITCH: &str = "model-switch@v1";
-/// A box taller than the screen in a bypass session, declined with what its foot note flags ([`tall_box`]).
+/// A box taller than the screen in a bypass session, declined with what its foot note flags
+/// ([`tall_box`]).
 pub const RULE_TALL_BOX: &str = "tall-box@v1";
 /// Full power.
 pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
@@ -65,7 +71,8 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
 /// Gemini CLI's usage-limit dialog ([`limit_retry`]).
 pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
-/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`], [`LimitTry::StopThenResume`]).
+/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`],
+/// [`LimitTry::StopThenResume`]).
 pub const RULE_LIMIT_STOP: &str = "limit-stop@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
@@ -76,7 +83,8 @@ pub const RULE_AUTOCOMPACT_OFFER: &str = "autocompact-offer@v1";
 pub const RULE_ANSWER_LONG_TERM: &str = "answer-long-term@v1";
 /// The same under `short-term` ([`super::question::SHORT_TERM_TEXT`]).
 pub const RULE_ANSWER_SHORT_TERM: &str = "answer-short-term@v1";
-/// A prose question answered under `long-term` with its policy text instead of `[harness] answer_text`.
+/// A prose question answered under `long-term` with its policy text instead of
+/// `[harness] answer_text`.
 pub const RULE_PROSE_LONG_TERM: &str = "prose-long-term@v1";
 /// The same under `short-term`.
 pub const RULE_PROSE_SHORT_TERM: &str = "prose-short-term@v1";
@@ -173,7 +181,8 @@ pub enum Choice {
     },
 }
 
-/// How Claude Code's question dialog is answered ([`Choice::Answer`]; Codex's question takes a digit).
+/// How Claude Code's question dialog is answered ([`Choice::Answer`]; Codex's question takes a
+/// digit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     FocusEnter { steps: i32, target: AnswerTarget },
@@ -472,7 +481,8 @@ impl ApprovalCtx {
         ctx
     }
 
-    /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and the Read roots rebuilt around them.
+    /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and the Read roots
+    /// rebuilt around them.
     pub fn set_trust_roots(&mut self, specs: &[String], uid: u32) {
         let specs: Vec<String> = specs.iter().map(|s| own_claude_tmp(s, uid)).collect();
         self.trust_roots = roots_from_config(&specs, self.home.as_deref());
@@ -552,7 +562,7 @@ pub fn footer_mode(rows: &[String]) -> Option<Mode> {
         if let Some(mode) = crate::harness::footer::pill_indicator(r).and_then(Mode::of_indicator) {
             return Some(mode);
         }
-        if r.contains(aterm_phase::anchor("footer.shortcuts")) {
+        if r.contains(aterm_phase::anchor!("footer.shortcuts")) {
             return Some(Mode::Manual);
         }
     }
@@ -733,7 +743,8 @@ const fn draws_claude_boxes(program: Program) -> bool {
     }
 }
 
-/// Whether `program`'s usage-limit dialog is kept trying past the reset it names ([`limit_retry`], [`RULE_LIMIT_RETRY`]).
+/// Whether `program`'s usage-limit dialog is kept trying past the reset it names
+/// ([`limit_retry`], [`RULE_LIMIT_RETRY`]).
 #[must_use]
 pub const fn keeps_trying_its_limit(program: Program) -> bool {
     match program {
@@ -770,10 +781,8 @@ fn decide_box(
     ctx: &ApprovalCtx,
     trace: &mut dyn Trace,
 ) -> Decision {
-    // A program the supervisor does not host
-    // (`aterm_phase::Program::supervisable`: the generic reader's, and
-    // Codex's, whose screen aterm reads no more) is read, never answered: every box of its is a person's,
-    // whatever its reader names in it.
+    // A program the supervisor does not host (`aterm_phase::Program::supervisable`) is read,
+    // never answered: every box of its is a person's, whatever its reader names in it.
     if !reading.program.supervisable() {
         return decided_at(
             trace,
@@ -939,15 +948,20 @@ fn decide_box(
     }
 }
 
-/// Every Claude Code tool a box `p` may be a call of, where Claude Code draws no ask reason on a box of its kind (a file box).
+/// Every Claude Code tool a box `p` may be a call of, where Claude Code draws no ask reason on a
+/// box of its kind (a file box).
 #[must_use]
 pub fn unvoiced_tools(p: &PromptV2) -> &'static [&'static str] {
     let title = p.title.trim_start();
     match p.kind {
         PromptKind::Write | PromptKind::Overwrite => &["Write"],
         PromptKind::Read => &["Read", "Glob", "Grep"],
-        PromptKind::Edit if title.starts_with(anchor("box.edit")) => &["Edit", "Bash"],
-        PromptKind::Edit if title.starts_with(anchor("box.edit_notebook")) => &["NotebookEdit"],
+        PromptKind::Edit if title.starts_with(aterm_phase::anchor!("box.edit")) => {
+            &["Edit", "Bash"]
+        }
+        PromptKind::Edit if title.starts_with(aterm_phase::anchor!("box.edit_notebook")) => {
+            &["NotebookEdit"]
+        }
         PromptKind::Edit => &["Edit", "Write", "NotebookEdit", "Bash"],
         _ => &[],
     }
@@ -1033,7 +1047,7 @@ fn forced_read(reading: &Reading) -> Option<String> {
         || root_level
         || p.options
             .iter()
-            .any(|o| o.label.contains(anchor("box.read_grant")))
+            .any(|o| o.label.contains(aterm_phase::anchor!("box.read_grant")))
     {
         return None;
     }
@@ -1229,7 +1243,7 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
 }
 
 fn yes_no_to_proceed(prompt: &PromptV2, rows: &[String]) -> Result<(), String> {
-    let proceed = anchor("prompt.proceed");
+    let proceed = aterm_phase::anchor!("prompt.proceed");
     if !prompt
         .question
         .and_then(|q| rows.get(q))
@@ -1285,7 +1299,8 @@ fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     }
 }
 
-/// Read `rows` with the reader for `program` ([`aterm_phase::read`]) and [`decide`] the box on them.
+/// Read `rows` with the reader for `program` ([`aterm_phase::read`]) and [`decide`] the box on
+/// them.
 pub fn decide_screen(
     program: Option<&str>,
     rows: &[String],
@@ -1306,12 +1321,18 @@ fn row_of(rows: &[String], prompt: &PromptV2, text: &str) -> Option<usize> {
 
 fn file_path_row(rows: &[String], prompt: &PromptV2, path: &str) -> Option<usize> {
     row_of(rows, prompt, path)
-        .or_else(|| row_of(rows, prompt, &format!("{}{path})", anchor("box.read_call"))))
         .or_else(|| {
             row_of(
                 rows,
                 prompt,
-                &format!("{}{path}", anchor("muse.box.write_path")),
+                &format!("{}{path})", aterm_phase::anchor!("box.read_call")),
+            )
+        })
+        .or_else(|| {
+            row_of(
+                rows,
+                prompt,
+                &format!("{}{path}", aterm_phase::anchor!("muse.box.write_path")),
             )
         })
 }
@@ -1356,7 +1377,7 @@ fn amend_input_open(prompt: &PromptV2) -> bool {
     let footer_alone = prompt
         .footer
         .as_deref()
-        .is_some_and(|f| aterm_phase::footer_keys(f) == [anchor("prompt.cancel")]);
+        .is_some_and(|f| aterm_phase::footer_keys(f) == [aterm_phase::anchor!("prompt.cancel")]);
     footer_alone
         && prompt
             .options
@@ -1443,7 +1464,7 @@ fn command_readings(prompt: &PromptV2, rows: &[String], rm_breaker: bool) -> (Ve
 fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     // Every header form aterm-phase reads: an origin, `(unsandboxed)`,
     // `(runs on <m>)`. An unreadable suffix is no Bash header.
-    if prompt.base_title().as_deref() != Some(anchor("box.bash")) {
+    if prompt.base_title().as_deref() != Some(aterm_phase::anchor!("box.bash")) {
         return Decision::escalate(format!(
             "the box header is not a Bash header: {}",
             prompt.title
@@ -1542,7 +1563,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     }
     let rule_id = match prompt.notes.as_slice() {
         [] => RULE_READ_ONLY,
-        [note] if note == anchor("box.note_no_rule") => RULE_NO_RULE_READ_ONLY,
+        [note] if note == aterm_phase::anchor!("box.note_no_rule") => RULE_NO_RULE_READ_ONLY,
         [note, ..] => {
             return Decision::escalate(format!("the box carries a vendor note: {note}"));
         }
@@ -1567,7 +1588,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         },
         Err(why) if rule_id == RULE_NO_RULE_READ_ONLY => Decision::escalate(format!(
             "{why} (the box's vendor note: {})",
-            anchor("box.note_no_rule")
+            aterm_phase::anchor!("box.note_no_rule")
         )),
         Err(why) => Decision::escalate(why),
     }
@@ -1606,7 +1627,9 @@ const GLOB_SAFE: &[&str] = &[
     "md5sum",
 ];
 
-/// `Ok` when no reading holds a form the classifier cannot vet: an assignment, `env`, `export` or `xargs` on the walk to a program, a loop variable, or an unquoted glob beside a program off [`GLOB_SAFE`].
+/// `Ok` when no reading holds a form the classifier cannot vet: an assignment, `env`, `export` or
+/// `xargs` on the walk to a program, a loop variable, or an unquoted glob beside a program off
+/// [`GLOB_SAFE`].
 fn proof_gaps_clear(readings: &[String]) -> Result<(), String> {
     let assignment = |w: &str| {
         w.split_once('=').is_some_and(|(name, _)| {
@@ -1730,7 +1753,8 @@ fn plain_under_zsh(readings: &[String], ctx: &ApprovalCtx) -> Result<(), String>
     Ok(())
 }
 
-/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, and holds no brace expansion.
+/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, and
+/// holds no brace expansion.
 pub(crate) fn read_only_every_reading(
     readings: &[String],
     python_allow: &[String],
@@ -1809,14 +1833,16 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds no brace expansion, turns on no blank the screen cannot show, and holds no proof gap.
+/// `Ok` when every reading of a Bash box's command classifies read-only, reads no socket, holds
+/// no brace expansion, turns on no blank the screen cannot show, and holds no proof gap.
 pub(crate) fn readings_proven(readings: &[String], python_allow: &[String]) -> Result<(), String> {
     read_only_every_reading(readings, python_allow)?;
     blanks_shown(readings)?;
     proof_gaps_clear(readings)
 }
 
-/// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory word for a Bash box.
+/// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory
+/// word for a Bash box.
 ///
 /// # Errors
 ///
@@ -1829,7 +1855,8 @@ pub fn readings_read_only(readings: &[String], python_allow: &[String]) -> Resul
     secrets_free(readings, &default_secrets(home.as_deref()), home.as_deref())
 }
 
-/// `Ok` unless `line` reads a path the default secret list names under `home`: `aterm drive classify`'s secret half.
+/// `Ok` unless `line` reads a path the default secret list names under `home`:
+/// `aterm drive classify`'s secret half.
 ///
 /// # Errors
 ///
@@ -1938,7 +1965,8 @@ fn resolvable_breaker(b: &RmBreaker) -> Result<(), String> {
     Ok(())
 }
 
-/// The vendor's rm/rmdir breaker as a reason names it, in the note's own words (`the rm circuit breaker (statically-unresolvable target)`).
+/// The vendor's rm/rmdir breaker as a reason names it, in the note's own words
+/// (`the rm circuit breaker (statically-unresolvable target)`).
 pub fn rm_breaker_label(b: &RmBreaker) -> String {
     let id = match b.kind {
         RmBreakerKind::EmptyVariable {
@@ -1970,7 +1998,7 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmCommand::Rmdir => "rmdir",
     };
     if breaker_not_ruled_out(b) {
-        let not_ruled_out = anchor("box.rm_breaker.not_ruled_out").trim();
+        let not_ruled_out = aterm_phase::anchor!("box.rm_breaker.not_ruled_out").trim();
         return format!(
             "the {command} circuit breaker ({not_ruled_out}: {why}; the command need not name \
              {command})"
@@ -2044,7 +2072,10 @@ pub(crate) fn squashed(text: &str) -> String {
 }
 
 fn amend_open_label() -> String {
-    format!("{REFUSAL_LABEL}, {}", anchor("prompt.amend_no"))
+    format!(
+        "{REFUSAL_LABEL}, {}",
+        aterm_phase::anchor!("prompt.amend_no")
+    )
 }
 
 fn amended_label(text: &str) -> String {
@@ -2052,7 +2083,7 @@ fn amended_label(text: &str) -> String {
 }
 
 fn offers_amend(prompt: &PromptV2) -> bool {
-    let hint = anchor("prompt.amend");
+    let hint = aterm_phase::anchor!("prompt.amend");
     prompt
         .footer
         .as_deref()
@@ -2083,7 +2114,7 @@ fn refusal_of(prompt: &PromptV2, text: &str) -> Result<usize, String> {
     if prompt.options[k].label == REFUSAL_LABEL && !offers_amend(prompt) {
         return Err(format!(
             "the box does not offer `{}`",
-            anchor("prompt.amend")
+            aterm_phase::anchor!("prompt.amend")
         ));
     }
     Ok(k)
@@ -2133,7 +2164,7 @@ pub fn decline_step(
         if !offers_amend(prompt) {
             return Err(format!(
                 "the focused `No` is not offered `{}`",
-                anchor("prompt.amend")
+                aterm_phase::anchor!("prompt.amend")
             ));
         }
         return Ok(DeclineStep::Amend { guard });
@@ -2204,7 +2235,7 @@ fn read_readings(call: &str) -> impl Iterator<Item = &str> {
 }
 
 fn is_read_title(base: &str) -> bool {
-    base.strip_prefix(anchor("box.read"))
+    base.strip_prefix(aterm_phase::anchor!("box.read"))
         .is_some_and(|rest| matches!(rest, "" | "s" | "(s)"))
 }
 
@@ -2273,13 +2304,14 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
     Ok(())
 }
 
-/// Every component list a path's text may name, for the secrets check, which takes a hit on
-/// any of them, so each reading past the plain `/` split only adds refusals: split at `/` alone
-/// (a Unix name may hold a `\`) and at `\` too (Windows' separator, which Git Bash's MSYS layer
-/// also takes); a drive path (`C:\a`, `C:/a`) read as Git Bash spells it (`c`, `a`), so one
-/// Windows path's spellings, and a rule under a Windows home (`C:\Users\name/.secrets`),
-/// share their components; and a rooted path's `..` kept as a component (a symlink before it
-/// leads elsewhere, as `cat` resolves `..` on disk) and also taken lexically (where none does).
+/// Every component list a path's text may name, for the secrets check (a hit on any one
+/// refuses, so each reading past the plain `/` split only adds refusals):
+/// - split at `/` alone (a Unix name may hold a `\`), and at `\` too (Windows' separator, which
+///   Git Bash's MSYS layer also takes);
+/// - a drive path (`C:\a`, `C:/a`) read as Git Bash spells it (`c`, `a`), so a Windows path's
+///   spellings and a rule under a Windows home (`C:\Users\name/.secrets`) share components;
+/// - a rooted path's `..` kept as a component (a symlink before it may lead elsewhere, as `cat`
+///   resolves `..` on disk) and also taken lexically, for when none does.
 fn path_readings(path: &str) -> Vec<Vec<String>> {
     let (drive, rest) = match path.split_at_checked(2) {
         Some((d, rest))
@@ -2758,15 +2790,17 @@ fn unmeasured_box(program: Program, p: &PromptV2) -> Option<String> {
                  measured shell, file and network boxes",
                 p.command
             )),
-            PromptKind::Other if p.title == anchor("muse.box.network") => Some(format!(
-                "Muse Code's network box of a command: what it reaches past its sandbox (a \
+            PromptKind::Other if p.title == aterm_phase::anchor!("muse.box.network") => {
+                Some(format!(
+                    "Muse Code's network box of a command: what it reaches past its sandbox (a \
                  host, a Unix socket) is a person's to allow{}",
-                if p.command.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (`{}`)", p.command)
-                }
-            )),
+                    if p.command.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (`{}`)", p.command)
+                    }
+                ))
+            }
             _ => None,
         },
         Program::Claude
@@ -2792,13 +2826,13 @@ fn model_confirm<'p>(p: &'p PromptV2, rows: &[String]) -> Result<(&'static str, 
         .take_while(|r| !r.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let hook = anchor("model_switch.hook");
+    let hook = aterm_phase::anchor!("model_switch.hook");
     if subtitle.contains(hook) {
         return Err(format!(
             "the person's own PreModelSwitch hook asked for this confirmation (`{hook}`)"
         ));
     }
-    if subtitle != anchor("model_switch.cost") {
+    if subtitle != aterm_phase::anchor!("model_switch.cost") {
         return Err(format!(
             "a model-switch confirmation whose subtitle is not the cost warning: `{subtitle}`"
         ));
@@ -2813,7 +2847,7 @@ fn model_confirm<'p>(p: &'p PromptV2, rows: &[String]) -> Result<(&'static str, 
         [o] if !buys(o) => Ok((RULE_MODEL_CONFIRM, *o)),
         _ => Err(format!(
             "a model-switch confirmation without exactly one `{}` ({})",
-            anchor("model_switch.yes"),
+            aterm_phase::anchor!("model_switch.yes"),
             p.options
                 .iter()
                 .map(|o| format!("{}:{}", o.role.name(), o.label))
@@ -2880,7 +2914,7 @@ fn backstop_of(p: &PromptV2, rows: &[String]) -> Option<String> {
     let backstop = p.kind == PromptKind::Trust
         && p.options
             .iter()
-            .any(|o| o.role == Role::Deny && o.label == anchor("trust.no_backstop"));
+            .any(|o| o.role == Role::Deny && o.label == aterm_phase::anchor!("trust.no_backstop"));
     backstop.then(|| {
         let body = &rows[(p.span.0 + 1).min(rows.len())..p.span.1.min(rows.len())];
         backstop_warnings(body).join("; ")
@@ -2930,7 +2964,7 @@ fn credits_decline(
     let esc = p.footer.as_deref().is_some_and(|footer| {
         aterm_phase::prompt::footer_keys(footer)
             .iter()
-            .any(|key| key.eq_ignore_ascii_case(anchor("prompt.cancel")))
+            .any(|key| key.eq_ignore_ascii_case(aterm_phase::anchor!("prompt.cancel")))
     });
     let title = aterm_phase::prompt::title_row(p, rows);
     Some(match (esc, title, p.focused()) {
@@ -3029,14 +3063,19 @@ fn switches_model(opt: &Opt) -> bool {
 }
 
 fn refusal_pause_switch(program: Program, p: &PromptV2) -> Option<&Opt> {
-    if !draws_claude_boxes(program) || p.head_off_screen || p.title.trim() != anchor("paused.title")
+    if !draws_claude_boxes(program)
+        || p.head_off_screen
+        || p.title.trim() != aterm_phase::anchor!("paused.title")
     {
         return None;
     }
     match p.options.as_slice() {
         [switch, edit]
             if switches_model(switch)
-                && edit.label.trim_start().starts_with(anchor("paused.edit")) =>
+                && edit
+                    .label
+                    .trim_start()
+                    .starts_with(aterm_phase::anchor!("paused.edit")) =>
         {
             Some(switch)
         }
@@ -3187,7 +3226,7 @@ fn judged_row(p: &PromptV2, rows: &[String]) -> usize {
         PromptKind::NetworkRequest => row_of(
             rows,
             p,
-            &format!("{}{}", anchor("muse.box.full_url"), p.command),
+            &format!("{}{}", aterm_phase::anchor!("muse.box.full_url"), p.command),
         ),
         _ => p
             .path
@@ -3203,7 +3242,7 @@ fn limit_reset(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Option<
         return None;
     }
     let row = aterm_phase::reset_row(prompt, &ctx.reset_kinds)?;
-    let title = anchor("limit.title");
+    let title = aterm_phase::anchor!("limit.title");
     if prompt.title != title {
         return None;
     }
@@ -3225,7 +3264,7 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
     if !ctx.limit_wait {
         return Decision::escalate("a usage-limit dialog (limit_wait is off)");
     }
-    let title = anchor("limit.title");
+    let title = aterm_phase::anchor!("limit.title");
     if prompt.title != title {
         return Decision::escalate(format!(
             "a usage-limit dialog whose title is not `{title}`: {}",
@@ -3244,7 +3283,7 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
             } else {
                 "more than one"
             },
-            anchor("limit.wait"),
+            aterm_phase::anchor!("limit.wait"),
             if waits.is_empty() { "" } else { "s" },
             prompt
                 .options
@@ -3300,14 +3339,12 @@ pub(crate) enum LimitTry {
     /// no other to fall back to): `Keep trying` sends the turn again
     /// ([`RULE_LIMIT_RETRY`]).
     KeepTrying,
-    /// `Switch to <fallback>` over `Stop`, `Upgrade for higher limits`
-    /// between them under the Google login (a terminal quota of the model's
-    /// own bucket, `Usage limit reached for all Pro models.`): no `Keep
-    /// trying` on offer, so the try is its `Stop` ([`RULE_LIMIT_STOP`], the
-    /// option at `stop`) and the resume the turn-end policy types at the
-    /// error it leaves (`usage-resume@v1`), on the same due and ladder. The
-    /// bucket stays the session's model's: the switch is never pressed, nor
-    /// the upgrade.
+    /// `Switch to <fallback>` over `Stop` (with `Upgrade for higher limits` between them under
+    /// the Google login), for a terminal quota of the model's own bucket (`Usage limit reached
+    /// for all Pro models.`). With no `Keep trying` on offer the try is `Stop` (the option at
+    /// `stop`, [`RULE_LIMIT_STOP`]), and the turn-end policy types the resume at the error it
+    /// leaves (`usage-resume@v1`) on the same due and ladder. The switch and the upgrade are
+    /// never pressed, so the bucket stays the session's model's.
     StopThenResume { stop: usize },
 }
 
@@ -3316,14 +3353,16 @@ impl LimitTry {
     #[must_use]
     pub(crate) fn of(labels: &[&str]) -> Option<Self> {
         let switch = |l: &str| {
-            l.strip_prefix(anchor("gemini.usage.switch"))
+            l.strip_prefix(aterm_phase::anchor!("gemini.usage.switch"))
                 .is_some_and(|m| !m.trim().is_empty())
         };
         match labels {
-            [retry, "Stop"] if *retry == anchor("gemini.usage.retry") => Some(Self::KeepTrying),
+            [retry, "Stop"] if *retry == aterm_phase::anchor!("gemini.usage.retry") => {
+                Some(Self::KeepTrying)
+            }
             [first, "Stop"] if switch(first) => Some(Self::StopThenResume { stop: 1 }),
             [first, upgrade, "Stop"]
-                if switch(first) && *upgrade == anchor("gemini.usage.upgrade") =>
+                if switch(first) && *upgrade == aterm_phase::anchor!("gemini.usage.upgrade") =>
             {
                 Some(Self::StopThenResume { stop: 2 })
             }
@@ -3335,7 +3374,7 @@ impl LimitTry {
     #[must_use]
     pub(crate) fn tried(self) -> String {
         match self {
-            Self::KeepTrying => format!("{} is tried", anchor("gemini.usage.retry")),
+            Self::KeepTrying => format!("{} is tried", aterm_phase::anchor!("gemini.usage.retry")),
             Self::StopThenResume { .. } => "Stop and resume are tried".to_string(),
         }
     }
@@ -3344,7 +3383,9 @@ impl LimitTry {
     #[must_use]
     pub(crate) fn pressed(self) -> String {
         match self {
-            Self::KeepTrying => format!("{} is pressed", anchor("gemini.usage.retry")),
+            Self::KeepTrying => {
+                format!("{} is pressed", aterm_phase::anchor!("gemini.usage.retry"))
+            }
             Self::StopThenResume { .. } => "Stop is pressed and the turn resumed".to_string(),
         }
     }
@@ -3370,7 +3411,7 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
         return Decision::escalate("a usage-limit dialog (limit_wait is off)");
     }
     let labels: Vec<&str> = prompt.options.iter().map(|o| o.label.as_str()).collect();
-    let retry = anchor("gemini.usage.retry");
+    let retry = aterm_phase::anchor!("gemini.usage.retry");
     let Some(how) = LimitTry::of(&labels) else {
         return Decision::escalate(format!(
             "Gemini CLI's usage limit offers {}: only `{retry}` over `Stop`, or a switch's `Stop`, \
@@ -3397,12 +3438,12 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     };
     let (head, from, missing) = match &reset {
         Some(_) => (
-            anchor("gemini.usage.resets"),
+            aterm_phase::anchor!("gemini.usage.resets"),
             prompt.span.0 + 1,
             "the usage-limit dialog's reset row is not on the screen",
         ),
         None => (
-            anchor("gemini.usage.title"),
+            aterm_phase::anchor!("gemini.usage.title"),
             prompt.span.0,
             "the usage-limit dialog's title row is not on the screen",
         ),

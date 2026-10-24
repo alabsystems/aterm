@@ -588,6 +588,46 @@ pub fn duration_approx(secs: f64) -> String {
     format!("~{d:.0} {}", if d < 1.5 { "day" } else { "days" })
 }
 
+/// Format an elapsed time floored to the minute: `under 1 min`, `12 min`, `3 h`, `3 h 5 min`,
+/// `1 day`, `2 days 4 h`. Minutes are always `min`, never a bare `m`, which reads as megabytes
+/// (`sys jobs` keeps its own `12m`, [`crate::jobs::wire::age_words`]).
+#[must_use]
+pub fn duration(ms: u64) -> String {
+    let min = ms / 60_000;
+    let (d, h, m) = (min / 1440, min / 60 % 24, min % 60);
+    let days = |d: u64| format!("{d} {}", plural(d, "day", "days"));
+    match (d, h, m) {
+        (0, 0, 0) => "under 1 min".into(),
+        (0, 0, m) => format!("{m} min"),
+        (0, h, 0) => format!("{h} h"),
+        (0, h, m) => format!("{h} h {m} min"),
+        (d, 0, _) => days(d),
+        (d, h, _) => format!("{} {h} h", days(d)),
+    }
+}
+
+/// How long a program must have run before its chip gives its age ([`up_words`]): 10 minutes.
+pub const LONG_RUN_MS: u64 = 10 * 60_000;
+
+/// A program's age in words once it has run long ([`LONG_RUN_MS`]): `up 47 min`, `up 3 h 5 min`,
+/// never a bare clock and minutes, which read as time left. `partial` (a member's birth went
+/// unread, so the oldest may be older) says `up ≥ 47 min`. `None` while younger or unread.
+#[must_use]
+pub fn up_words(age_ms: Option<u64>, partial: bool) -> Option<String> {
+    let age = age_ms.filter(|a| *a >= LONG_RUN_MS)?;
+    Some(format!(
+        "up {}{}",
+        if partial { "≥ " } else { "" },
+        duration(age)
+    ))
+}
+
+/// A program group's age as its chip says it at `at_unix_ms` ([`up_words`]).
+#[must_use]
+pub fn program_age(g: &crate::model::ProgramGroup, at_unix_ms: i64) -> Option<String> {
+    up_words(g.age_ms(at_unix_ms), g.unborn > 0)
+}
+
 /// Format a `[0.0, 1.0]` share for the `%` column (`0%`, `<1%`, `12%`).
 #[must_use]
 pub fn pct(share: Option<f32>) -> String {
@@ -2720,6 +2760,83 @@ mod tests {
         assert_eq!(clock(NOW - 86_400_000 - 100 * MIN_MS, NOW, 0), "Tue 09:00");
     }
 
+    /// The deck's duration never writes a bare `m` (it reads as megabytes), floors to the
+    /// minute, and speaks as minutes and hours. NEGATIVE CONTROL: `sys jobs`' own `12m` stays.
+    #[test]
+    fn a_duration_says_min_and_h_never_a_bare_m() {
+        const MIN: u64 = 60_000;
+        for (ms, want) in [
+            (0, "under 1 min"),
+            (59_999, "under 1 min"),
+            (MIN, "1 min"),
+            (12 * MIN + 59_999, "12 min"),
+            (59 * MIN, "59 min"),
+            (60 * MIN, "1 h"),
+            (185 * MIN, "3 h 5 min"),
+            (23 * 60 * MIN + 59 * MIN, "23 h 59 min"),
+            (24 * 60 * MIN + 30 * MIN, "1 day"),
+            (52 * 60 * MIN + 7 * MIN, "2 days 4 h"),
+        ] {
+            let got = duration(ms);
+            assert_eq!(got, want, "{ms} ms");
+            let bare_m = |w: &str| {
+                w.strip_suffix('m')
+                    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            };
+            assert!(!got.split(' ').any(bare_m), "{got}");
+        }
+        assert_eq!(speak(&duration(185 * MIN)), "3 hours 5 minutes");
+        assert_eq!(speak(&duration(61 * MIN)), "1 hour 1 minute");
+        assert_eq!(speak(&duration(0)), "under 1 minute");
+        assert_eq!(
+            crate::jobs::wire::age_words(12 * MIN),
+            "12m",
+            "sys jobs keeps its own"
+        );
+    }
+
+    /// A program's age shows once it has run long, as `up …`, and as a lower bound while a
+    /// member's birth went unread. NEGATIVE CONTROLS: a young program and an unread age say
+    /// nothing.
+    #[test]
+    fn a_long_runner_says_how_long_it_has_been_up() {
+        const MIN: u64 = 60_000;
+        assert_eq!(
+            up_words(Some(47 * MIN), false).as_deref(),
+            Some("up 47 min")
+        );
+        assert_eq!(
+            up_words(Some(185 * MIN), true).as_deref(),
+            Some("up ≥ 3 h 5 min")
+        );
+        assert_eq!(
+            up_words(Some(LONG_RUN_MS), false).as_deref(),
+            Some("up 10 min")
+        );
+        assert_eq!(up_words(Some(LONG_RUN_MS - 1), false), None, "young");
+        assert_eq!(up_words(None, true), None, "unread");
+        assert_eq!(
+            speak(&up_words(Some(47 * MIN), true).expect("long")),
+            "up at least 47 minutes"
+        );
+        let at = 1_790_000_000_000;
+        let g = crate::model::ProgramGroup {
+            name: "rustc".into(),
+            scope: ProcScope::Tab(3),
+            n: 9,
+            cores: 5.9,
+            footprint: None,
+            born_ms: Some(at - 47 * 60_000),
+            unborn: 0,
+        };
+        assert_eq!(program_age(&g, at).as_deref(), Some("up 47 min"));
+        let partly = crate::model::ProgramGroup {
+            unborn: 1,
+            ..g.clone()
+        };
+        assert_eq!(program_age(&partly, at).as_deref(), Some("up ≥ 47 min"));
+    }
+
     #[test]
     fn scope_cells_name_their_unit() {
         let each = |res: Resource, aterm: ScopeFig, tab: ScopeFig, loc: &Locale| {
@@ -3090,6 +3207,8 @@ mod tests {
             cores: 5.9,
             n: 9,
             scope: Some(ProcScope::Tab(3)),
+            born_ms: None,
+            unborn: 9,
         });
         let busiest = (
             1,
@@ -3289,6 +3408,8 @@ mod tests {
             cores: 0.7,
             n: 1,
             scope: None,
+            born_ms: None,
+            unborn: 1,
         });
         let read = |s: &Snapshot| -> Vec<(Vec<String>, Option<Mark>, String)> {
             details(Resource::Cpu, s, &MAC)
@@ -3380,6 +3501,8 @@ mod tests {
             cores: 5.9,
             n: 9,
             scope: Some(ProcScope::Tab(3)),
+            born_ms: None,
+            unborn: 9,
         });
         assert!(
             row_sentence(Resource::Cpu, &s, &[2], &MAC).ends_with(

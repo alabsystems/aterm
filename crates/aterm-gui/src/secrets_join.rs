@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A CONFIGURED MAC'S SECRETS VAULT SUBSCRIBER, MENDED AT LAUNCH
+//! A configured Mac's secrets vault subscriber, mended at launch
 //! (docs/DESIGN-secrets-2026-10-20.md §7).
 //!
 //! Joining is System State's Secrets vault row's. On a launch that runs no setup, a
@@ -16,13 +16,16 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use aterm_secrets::client::Paths;
 
-/// The record beside `aterm.toml` of the Macs this window owes a subscriber: a join here asked for one and could not install it (this aterm ran from a disk image or an App Translocation copy, or launchd refused).
+/// The record beside `aterm.toml` of the Macs this window owes a subscriber: a join here asked for
+/// one and could not install it (this aterm ran from a disk image or an App Translocation copy, or
+/// launchd refused).
 pub(crate) const OWED_RECORD: &str = "secrets-subscriber-owed";
 
 /// Why this Mac's subscriber is not running, so its secrets do not follow the vault.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unsynced {
-    /// This aterm runs from a copy that goes away (a disk image, an App Translocation copy, a temporary or cache directory): a launchd job naming it would stop starting.
+    /// This aterm runs from a copy that goes away (a disk image, an App Translocation copy, a
+    /// temporary or cache directory), which a launchd job could not keep starting.
     Fleeting(String),
     /// The install failed, or the subscriber is not there: what failed.
     Failed(String),
@@ -67,9 +70,11 @@ pub(crate) struct Settled {
 pub(crate) enum Plist {
     /// None there.
     Absent,
-    /// There, running a program that is a file at a place that lasts — or one the reader cannot name (a plist in another shape than `aterm secrets` writes), which is left as it is.
+    /// There, running a file at a place that lasts, or a program the reader cannot name (a plist
+    /// in another shape than `aterm secrets` writes), which is left as it is.
     Sound,
-    /// There, running a program that is gone or does not last (a disk image ejected, an App Translocation copy, a temporary directory): launchd cannot start it.
+    /// There, running a program that is gone or does not last (a disk image ejected, an App
+    /// Translocation copy, a temporary directory): launchd cannot start it.
     Stale(String),
 }
 
@@ -106,7 +111,9 @@ pub(crate) struct Plan {
     pub(crate) unfinished: bool,
 }
 
-/// THE LAUNCH READ'S PLAN (pure): the subscriber is installed again when its plist runs a program that is gone or does not last, and installed when this Mac is owed one and has none; a plist with no line owed for it is never touched (its person may have turned it off).
+/// The launch read's plan (pure): the subscriber is installed again when its plist runs a program
+/// that is gone or does not last, and installed when this Mac is owed one and has none. An absent
+/// plist with no line owed for it stays absent (its person may have turned it off).
 pub(crate) fn plan(setup: &Setup) -> Plan {
     let install = match setup.plist {
         Plist::Stale(_) => true,
@@ -120,7 +127,8 @@ pub(crate) fn plan(setup: &Setup) -> Plan {
     }
 }
 
-/// The program a launchd plist that `aterm_secrets::service::plist_text` wrote runs: the first `<string>` of its `ProgramArguments` array, its XML entities read back.
+/// The program a launchd plist that `aterm_secrets::service::plist_text` wrote runs: the first
+/// `<string>` of its `ProgramArguments` array, its XML entities read back.
 pub(crate) fn plist_program(text: &str) -> Option<String> {
     const KEY: &str = "<key>ProgramArguments</key>";
     let at = text.find(KEY)?;
@@ -174,7 +182,9 @@ pub(crate) fn subscriber_plist(plist: &Path) -> Plist {
     }
 }
 
-/// The program a subscriber installed now runs, when it is a copy that lasts (`atpkg::stub::lasting`: not a disk image, an App Translocation copy, a temporary or a cache directory), which a launchd job may name; else where this aterm runs.
+/// `program` when it is a copy that lasts (`atpkg::stub::lasting`: not a disk image, an App
+/// Translocation copy, a temporary or a cache directory), which a launchd job may name; else
+/// [`Unsynced::Fleeting`].
 pub(crate) fn lasting_program(program: PathBuf) -> Result<PathBuf, Unsynced> {
     if atpkg::stub::lasting(&program) {
         Ok(program)
@@ -197,7 +207,8 @@ fn subscriber_program() -> Result<PathBuf, Unsynced> {
     })
 }
 
-/// This Mac's vault setup under `paths`: `source.toml`, `state.toml` and the subscriber's plist, never the network; `owed` read by the caller ([`OWED_RECORD`]).
+/// This Mac's vault setup under `paths`: `source.toml`, `state.toml` and the subscriber's plist,
+/// never the network; `owed` is read by the caller ([`OWED_RECORD`]).
 #[cfg(unix)]
 pub(crate) fn read_configured(paths: &Paths, owed: bool) -> Result<Configured, String> {
     use aterm_secrets::client::{self, Membership};
@@ -258,9 +269,9 @@ pub(crate) struct MendReach {
     pub(crate) paid: Box<dyn Fn() + Send>,
 }
 
-/// THE MEND: a configured Mac's read, acted on ([`plan`]): the owed line forgotten once
-/// paid and the subscriber installed when the plan says so. `None` for a Mac with no vault
-/// configured, or one whose configuration cannot be read (logged).
+/// The mend: a configured Mac's read, acted on ([`plan`]): the owed line forgotten once paid and
+/// the subscriber installed when the plan says so. `None` for a Mac with no vault configured, or
+/// one whose configuration cannot be read (logged).
 pub(crate) fn mend(reach: &MendReach) -> Option<Settled> {
     let setup = match (reach.configured)() {
         Ok(Configured::Some(setup)) => setup,
@@ -433,11 +444,10 @@ mod tests {
         }
     }
 
-    /// THE SUBSCRIBER'S REPAIR at launch: a plist running a copy that is gone or does not
-    /// last is installed again from this aterm; a debt is installed and a paid one
-    /// forgotten; a Mac with no plist and nothing owed is left as it is (its person may
-    /// have turned the subscriber off). An install that fails says why. A Mac with no vault
-    /// configured, or one that cannot be read, is left alone.
+    /// A plist running a copy that is gone or does not last is installed again; a debt is
+    /// installed and a paid one forgotten; a Mac with no plist and nothing owed is left as it is.
+    /// A failed install says why; a Mac with no vault configured, or one that cannot be read, is
+    /// left alone.
     #[test]
     fn a_stale_or_owed_subscriber_is_installed_at_launch() {
         let stale = Ok(Configured::Some(Setup {
@@ -502,8 +512,8 @@ mod tests {
         }
     }
 
-    /// installed; only an owed line with a sound plist is paid; only a pending Mac with no
-    /// subscriber and nothing owed is unfinished.
+    /// Only a stale plist, or an absent one that is owed, is installed; only an owed line with a
+    /// sound plist is paid; only a pending Mac with no subscriber and nothing owed is unfinished.
     #[test]
     fn the_launch_plan_installs_only_what_is_broken_or_owed() {
         let stale = Plist::Stale("/gone".to_string());
@@ -555,9 +565,8 @@ mod tests {
         );
     }
 
-    /// THE PLIST ON DISK: absent; sound when it runs a file at a lasting place; stale when
-    /// that file is gone or sits in a temporary directory (as a disk image or an App
-    /// Translocation copy does not last either).
+    /// A plist on disk: absent; sound when it runs a file at a lasting place; stale when that file
+    /// is gone or sits in a temporary directory.
     #[cfg(unix)]
     #[test]
     fn a_plist_is_judged_by_the_program_it_runs() {

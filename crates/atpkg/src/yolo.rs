@@ -19,9 +19,9 @@ pub struct Policy {
     pub flags: &'static [&'static str],
     /// Tokens that already decide the posture: a launch holding one and no `--yolo` runs as typed.
     pub markers: &'static [&'static str],
-    /// First words the injection goes behind (rule 3).
+    /// First words the flags go behind.
     pub after: &'static [&'static str],
-    /// First words left as typed (rule 3).
+    /// First words that leave a launch without `--yolo` as typed.
     pub skip: &'static [&'static str],
 }
 
@@ -105,13 +105,11 @@ pub(crate) struct WordOptions {
     pub(crate) optional: &'static [&'static str],
     /// Options that take no value.
     pub(crate) switches: &'static [&'static str],
-    /// The program's own spellings of the posture a typed `--yolo` sets, each among the
-    /// row's markers: another name of the flag's own option (grok's
-    /// `--dangerously-skip-permissions`, an alias of `--always-approve` that its parser
-    /// refuses to see twice), or the vendor's own `--yolo` option, which the flags override
-    /// and its parser refuses beside them (kimi's `-y`, `--yes` and `--auto-approve`, its
-    /// Ask When Needed mode, which `--auto` cannot join). An explicit `--yolo` drops each
-    /// one ahead of the first word along with itself.
+    /// The program's own spellings of the posture a typed `--yolo` sets, each among the row's
+    /// markers: another name of the flag's option (grok's `--dangerously-skip-permissions`, an
+    /// alias of `--always-approve` its parser refuses twice), or a weaker posture its parser
+    /// refuses beside the flags (kimi's `-y`, `--yes` and `--auto-approve`). An explicit
+    /// `--yolo` drops each one ahead of the first word along with itself.
     pub(crate) own_yolo: &'static [&'static str],
 }
 
@@ -148,11 +146,9 @@ pub(crate) fn word_options(program: &str) -> WordOptions {
             switches: &["-p", "--print"],
             ..WordOptions::default()
         },
-        // grok's top-level `PagerArgs` in the 1.0.45 source (github.com/xai-org/grok-build,
-        // `crates/codegen/xai-grok-pager/src/app/cli.rs`), checked against the 1.0.67
-        // binary's strings, which add `--add-dir`; the hidden and feature-gated options are
-        // left out, so a launch typing one runs as typed. `-v`, `--version` and `-h` are
-        // left out on purpose: those launches run as typed too.
+        // grok's top-level `PagerArgs` (1.0.45 source, `xai-grok-pager/src/app/cli.rs`) plus
+        // 1.0.67's `--add-dir`. Hidden and feature-gated options, `-v`, `--version` and `-h`
+        // are left out, so a launch typing one runs as typed.
         "grok" => WordOptions {
             values: &[
                 "-m",
@@ -297,13 +293,12 @@ pub enum Launch {
 }
 
 /// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
-/// runs as typed. An unknown leading option leaves the argv as typed (with a typed `--yolo` too,
-/// when the policy has `after` words), and so does a removal that would join a bare word to an
-/// optional value ([`Stop::Joins`]); else a typed `--yolo` becomes the policy's flags, dropping
-/// the program's own spellings of that posture ahead of the first word
-/// ([`WordOptions::own_yolo`], [`Launch::Flag`]); else a marker, a `skip` word or a self-update
-/// verb leaves it as typed; else the flags go in front, or behind an `after` word
-/// ([`Launch::Default`]).
+/// runs as typed, and so does an unknown leading option (with a typed `--yolo` too, when the
+/// policy has `after` words) or a removal that would join a bare word to an optional value
+/// ([`Stop::Joins`]). Else a typed `--yolo` becomes the policy's flags, dropping the program's
+/// own spellings of that posture ahead of the first word ([`Launch::Flag`]); else a marker, a
+/// `skip` word or a self-update verb runs as typed; else the flags go in front, or behind an
+/// `after` word ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);
@@ -411,7 +406,7 @@ pub fn default_echo_line(program: &str, args: &[String]) -> String {
     line(DEFAULT_ECHO_PREFIX, program, args)
 }
 
-/// Environment variable set when `--no-harness` or `--no-alab-harness` is passed on an agent launch.
+/// Set to `1` when an agent launch passes `--no-harness` or `--no-alab-harness`.
 pub const NO_HARNESS_ENV: &str = "ATERM_NO_HARNESS";
 
 /// Strip `--no-harness` and `--no-alab-harness` ahead of a literal `--` for an
@@ -446,11 +441,9 @@ mod tests {
         words.iter().map(|w| (*w).to_string()).collect()
     }
 
-    /// The roster: every vendor row spells its yolo posture in full — never the
-    /// word itself as a flag (that would hand claude and agy a flag they
-    /// refuse), every flag and marker safe to embed, its own flags among its
-    /// markers, and the exact expansions measured from each vendor's `--help`
-    /// (2026-10-19).
+    /// The roster: every vendor row spells its yolo posture in full — never the word itself as
+    /// a flag (claude and agy refuse it), every flag and marker safe to embed, its own flags
+    /// among its markers, and the exact expansions from each vendor's `--help`.
     #[test]
     fn every_row_spells_its_yolo_policy_in_full() {
         assert_eq!(flags_of("claude"), &["--dangerously-skip-permissions"]);
@@ -857,11 +850,10 @@ mod tests {
         assert_eq!(strip_no_harness("ay", &argv(&["--no-harness"])), None);
     }
 
-    /// grok and kimi, read from their parsers (grok's 1.0.45 source checked against the
-    /// 1.0.67 binary's strings; kimi 2.3.1's `commands.ts`), never by running either: the yolo
-    /// flag lands in front (behind grok's `agent`, whose own options follow it), a typed
-    /// `--yolo` becomes the vendor flag in place, an argv that already decides permissions
-    /// runs as typed, and the management words run as typed.
+    /// grok and kimi, read from their parsers, never by running either: the flag lands in front
+    /// (behind grok's `agent`, whose own options follow it), a typed `--yolo` becomes the vendor
+    /// flag in place, and an argv that already decides permissions or names a management word
+    /// runs as typed.
     #[test]
     fn grok_and_kimi_take_their_one_flag_where_their_parsers_read_it() {
         let d = |p: &str, a: &[&str]| decide(p, &argv(a));

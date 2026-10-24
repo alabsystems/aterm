@@ -604,7 +604,7 @@ fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_poo
 fn a_vendor_sign_in_presses_nothing_outside_the_flow_it_started() {
     let start = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_CODEX\
                  &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=s0&scope=openid";
-    let bound = FlowBound::of(start);
+    let bound = FlowBound::of(start).expect("unambiguous starting flow");
     assert_eq!(bound.client_id.as_deref(), Some("app_CODEX"));
     assert_eq!(bound.callback_port, Some(1455));
     let lure = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_OTHER\
@@ -1203,7 +1203,7 @@ fn the_window_and_the_headless_approver_open_one_profile_per_row() {
     let window = row_browser_profile(Cli::Kimi, &store, &shared, "kimi-one", Some(email));
     let approver = VendorApprover::new(Cli::Kimi, "kimi-one", Some(email), &shared, Some(&home));
     assert_eq!(window, approver.profile_dir(Some(email)));
-    assert!(window.starts_with(shared.join(BROWSER_PROFILES_DIR)));
+    assert!(window.starts_with(shared.join(VENDOR_PROFILES_DIR)));
     assert_eq!(
         approver.sign_in_once,
         "aterm harness accounts browser kimi-one --cli kimi"
@@ -1237,6 +1237,97 @@ fn the_window_and_the_headless_approver_open_one_profile_per_row() {
             "kimi-one",
             Some("kimi-one+2@example.com")
         )
+    );
+}
+
+/// A VENDOR'S SIGN-IN NEVER MOVES CLAUDE CODE'S RENEWAL TO ANOTHER PROFILE: a vendor row's
+/// profile is made under the vendors' own folder, so a Claude Code row keeps its label profile
+/// (a plain email and a plus-addressed one on that base alike), and a row with none is still
+/// read as having none (so its renewal still opens the person's browser). CONTROL: where Claude
+/// Code's own profile of that exact email exists, the vendors share it; and once a vendor's own
+/// profile exists, a later Claude Code profile of the email does not move the vendor off it.
+#[test]
+fn a_vendor_sign_in_makes_no_profile_claude_codes_renewal_would_pick() {
+    use super::super::accounts::Cli;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let shared = tmp.path().join("state/accounts");
+    let home = tmp.path().join("home");
+    let make = |dir: &Path| std::fs::create_dir_all(dir).expect("profile");
+
+    let m1 = browser_profile_dir(&shared, Some("m1"));
+    make(&m1);
+    assert_eq!(
+        resolve_browser_profile_dir(&shared, Some("m1"), Some("a@example.com")),
+        m1,
+        "CONTROL: the row's label profile"
+    );
+    let kimi = VendorApprover::new(Cli::Kimi, "kimi-m1", Some("a@example.com"), &shared, None);
+    make(&kimi.profile_dir(Some("a@example.com")));
+    let codex = row_browser_profile(
+        Cli::Codex,
+        &tmp.path().join("state/accounts-codex"),
+        &shared,
+        "codex-m1",
+        Some("a@example.com"),
+    );
+    make(&codex);
+    assert_eq!(
+        codex,
+        kimi.profile_dir(Some("a@example.com")),
+        "one per email"
+    );
+    assert_eq!(
+        resolve_browser_profile_dir(&shared, Some("m1"), Some("a@example.com")),
+        m1,
+        "a vendor's sign-in of the email leaves Claude Code's row on its label profile"
+    );
+
+    let m2 = browser_profile_dir(&shared, Some("m2"));
+    make(&m2);
+    assert_eq!(
+        resolve_browser_profile_dir(&shared, Some("m2"), Some("a+m2@example.com")),
+        m2,
+        "a plus-addressed Claude Code row keeps its label profile beside a vendor of its base"
+    );
+
+    assert!(!has_browser_profile(&shared, "m3", Some("b@example.com")));
+    let grok = VendorApprover::new(
+        Cli::Grok,
+        "grok-m3",
+        Some("b@example.com"),
+        &shared,
+        Some(&home),
+    );
+    make(&grok.profile_dir(Some("b@example.com")));
+    assert!(
+        !has_browser_profile(&shared, "m3", Some("b@example.com")),
+        "a row with no profile is not given the vendor's"
+    );
+    make(&grok.profile_dir(None));
+    assert!(
+        !has_browser_profile(&shared, "grok-m3", None),
+        "nor by its label key"
+    );
+
+    let claudes = browser_profile_dir(&shared, Some("c@example.com"));
+    make(&claudes);
+    let shares = VendorApprover::new(Cli::Kimi, "kimi-c", Some("c@example.com"), &shared, None);
+    assert_eq!(
+        shares.profile_dir(Some("c@example.com")),
+        resolve_browser_profile_dir(&shared, Some("c"), Some("c@example.com")),
+        "CONTROL: Claude Code's own profile of the exact email is shared"
+    );
+    assert_ne!(
+        shares.profile_dir(Some("c+2@example.com")),
+        claudes,
+        "CONTROL: a plus-addressed vendor row never shares its base's"
+    );
+    let kept = kimi.profile_dir(Some("a@example.com"));
+    make(&browser_profile_dir(&shared, Some("a@example.com")));
+    assert_eq!(
+        kimi.profile_dir(Some("a@example.com")),
+        kept,
+        "CONTROL: a vendor keeps its own profile once it has one"
     );
 }
 
@@ -1971,7 +2062,69 @@ fn parameter_pollution_userinfo_loopback_json_plus_siblings_and_input_guards() {
     );
     let start = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_CODEX\
                  &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=s0";
-    let bound = FlowBound::of(start);
+    let bound = FlowBound::of(start).expect("unambiguous starting flow");
+    assert_eq!(
+        FlowBound::of("https://auth.openai.com/oauth/authorize"),
+        Ok(FlowBound::default()),
+        "absent parameters remain absent, not conflicting"
+    );
+    let empty =
+        FlowBound::of("https://auth.openai.com/oauth/authorize?client_id=&redirect_uri=&state=")
+            .expect("present empty parameters remain distinct from absence");
+    assert_eq!(empty.client_id.as_deref(), Some(""));
+    assert_eq!(empty.redirect_uri.as_deref(), Some(""));
+    assert_eq!(empty.state.as_deref(), Some(""));
+    let identical = FlowBound::of(&format!(
+        "{start}&client_id=app_CODEX&redirect_uri=http%3a%2f%2flocalhost%3a1455%2fauth%2fcallback&state=s0"
+    ))
+    .expect("identical decoded duplicates keep their binding");
+    assert_eq!(identical, bound);
+    for conflicting in [
+        "client_id=app_OTHER",
+        "redirect_uri=http%3A%2F%2Flocalhost%3A1999%2Fauth%2Fcallback",
+        "state=s1",
+    ] {
+        assert!(
+            FlowBound::of(&format!("{start}&{conflicting}")).is_err(),
+            "an ambiguous starting flow must never become an unbound flow"
+        );
+    }
+    for valid in [&bound, &identical] {
+        let gate = Gate {
+            hosts: &["auth.openai.com"],
+            completion: Completion::Loopback,
+            code: None,
+            bound: Some(valid),
+            ..device_gate()
+        };
+        assert_eq!(
+            vendor_step(
+                &page(
+                    "http://localhost:1455/auth/callback?code=x&state=s0",
+                    "",
+                    "",
+                    &[],
+                    &[]
+                ),
+                &gate
+            ),
+            Step::Done,
+            "the identical starting flow's own callback still completes"
+        );
+        assert!(matches!(
+            vendor_step(
+                &page(
+                    "http://localhost:7777/auth/callback?code=x&state=s0",
+                    "",
+                    "",
+                    &[],
+                    &[]
+                ),
+                &gate
+            ),
+            Step::Refuse(_)
+        ));
+    }
     assert!(
         bound
             .outside(
@@ -2165,4 +2318,218 @@ fn parameter_pollution_userinfo_loopback_json_plus_siblings_and_input_guards() {
     );
     let act_code = vendor_act_js(&Step::FillOtp, Some("123456"));
     assert!(act_code.contains("\"submit\"") && act_code.contains(".filter(textInput)"));
+}
+
+#[test]
+fn cjk_otp_extraction_webmail_plus_siblings_and_spa_submit_guards() {
+    let link = "https://claude.ai/magic-link?token=recipient-bound&state=own";
+    let check_identity = |address: &str| {
+        assert!(super::super::accounts::email_refusal(address).is_none());
+        let plain = format!(
+            "To: {address}\r\n\r\nYour verification code is 654321.\r\nSign in: {link}\r\n"
+        );
+        let json = format!(
+            r#"{{"to":"{address}","text":"Your verification code is 654321. Sign in: {link}"}}"#
+        );
+        for mail in [plain, json] {
+            assert!(super::super::open_url::email_matches_target(&mail, address));
+            assert!(!super::super::open_url::email_matches_target(
+                &mail,
+                "owner@example.com"
+            ));
+            assert_eq!(
+                extract_otps_from_email(&mail, Some(address)),
+                ["654321".to_owned()],
+                "{address}"
+            );
+            assert!(extract_otps_from_email(&mail, Some("owner@example.com")).is_empty());
+            assert_eq!(
+                super::super::open_url::extract_magic_links_from_email(&mail, Some(address)),
+                [link.to_owned()],
+                "{address}"
+            );
+            assert!(
+                super::super::open_url::extract_magic_links_from_email(
+                    &mail,
+                    Some("owner@example.com")
+                )
+                .is_empty()
+            );
+        }
+    };
+    for punctuation in "!#$%&'*+-/=?^_`{|}~".chars() {
+        for local in [
+            format!("{punctuation}owner"),
+            format!("audit{punctuation}owner"),
+            format!("owner{punctuation}"),
+        ] {
+            check_identity(&format!("{local}@example.com"));
+        }
+    }
+    for local in [
+        "审计owner",
+        "e\u{301}owner",
+        "审计（owner",
+        "审计：owner",
+        "审计，owner",
+    ] {
+        check_identity(&format!("{local}@example.com"));
+    }
+    for recipient in [
+        r#""audit,owner@example.com,else""#,
+        r#""audit owner@example.com else""#,
+        r#""audit,owner@example.com"#,
+        r#""audit\" owner@example.com else""#,
+        r#""audit\" owner@example.com"#,
+        r#"audit\owner@example.com"#,
+    ] {
+        let mail = format!(
+            "To: {recipient}\r\n\r\nYour verification code is 654321.\r\nSign in: {link}\r\n"
+        );
+        assert!(!super::super::open_url::email_matches_target(
+            &mail,
+            "owner@example.com"
+        ));
+        assert!(extract_otps_from_email(&mail, Some("owner@example.com")).is_empty());
+        assert!(
+            super::super::open_url::extract_magic_links_from_email(
+                &mail,
+                Some("owner@example.com")
+            )
+            .is_empty()
+        );
+    }
+    let named = "To: \"Owner Name\" <owner@example.com>\r\n\r\nYour code is 654321.\r\n";
+    assert_eq!(
+        extract_otps_from_email(named, Some("owner@example.com")),
+        ["654321".to_owned()]
+    );
+
+    // 1. CJK OTP extraction: unspaced CJK verification lines with embedded ASCII letters
+    // (`您的Kimi登录验证码是839201，请在5分钟内使用。`, `【Kimi】验证码 123-456（5分钟内有效）`)
+    // prioritize the real 6-digit OTP and do not promote unspaced non-context CJK numbers
+    // (`客服电话：100080`) as standalone OTPs ahead of context-matched codes.
+    let cjk_mail = concat!(
+        "From: Kimi <noreply@kimi.com>\r\n",
+        "To: owner@example.com\r\n",
+        "Subject: 登录验证码\r\n\r\n",
+        "客服邮编：100080\r\n",
+        "您的Kimi登录验证码是839201，请在5分钟内使用。\r\n",
+    );
+    assert_eq!(
+        extract_otps_from_email(cjk_mail, Some("owner@example.com")),
+        vec!["839201".to_owned(), "100080".to_owned()],
+        "CJK context OTP must be extracted even when surrounded by CJK chars and ASCII brand/minute numbers, and prioritized ahead of non-context CJK numbers"
+    );
+
+    let cjk_hyphen_mail = concat!(
+        "From: Kimi <noreply@kimi.com>\r\n",
+        "To: owner@example.com\r\n\r\n",
+        "【Kimi】您的登录邮箱为：owner@example.com，安全码：456-789（10分钟内有效）。\r\n",
+    );
+    assert_eq!(
+        extract_otps_from_email(cjk_hyphen_mail, Some("owner@example.com")),
+        vec!["456789".to_owned()]
+    );
+
+    // 2. Base64 / Quoted-Printable / HTML-entity body recipient matching and envelope-only
+    // (`Delivered-To:`) plus-sibling protection (used by `poll_webmail_via_cdp` and catch-all
+    // mailboxes).
+    let b64_plus_body = "Sign in code for owner+1@example.com: 654321\r\n";
+    let b64_encoded = "U2lnbiBpbiBjb2RlIGZvciBvd25lcisxQGV4YW1wbGUuY29tOiA2NTQzMjE=";
+    let _ = b64_plus_body;
+    let envelope_plus_eml = format!(
+        "Delivered-To: owner@example.com\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n\
+         {b64_encoded}\r\n"
+    );
+    assert!(
+        !super::super::open_url::email_matches_target(&envelope_plus_eml, "owner@example.com"),
+        "Delivered-To envelope match must be rejected when decoded Base64 body names plus-sibling owner+1@example.com"
+    );
+    assert!(
+        !super::super::open_url::email_matches_target(&envelope_plus_eml, "owner+2@example.com"),
+        "Delivered-To envelope match must be rejected for sibling owner+2@example.com"
+    );
+    assert!(
+        super::super::open_url::email_matches_target(&envelope_plus_eml, "owner+1@example.com"),
+        "owner+1@example.com matches its own Base64-encoded body"
+    );
+
+    let cjk_body_only_eml = concat!(
+        "From: Kimi <noreply@kimi.com>\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+        "亲爱的用户（owner+2@example.com）：您的验证码为 314159。\r\n",
+    );
+    assert!(
+        !super::super::open_url::email_matches_target(cjk_body_only_eml, "owner@example.com"),
+        "CJK fullwidth parens around owner+2@example.com must isolate it from base owner@example.com"
+    );
+    assert!(
+        super::super::open_url::email_matches_target(cjk_body_only_eml, "owner+2@example.com"),
+        "CJK fullwidth parens around owner+2@example.com must match target owner+2@example.com"
+    );
+
+    // 3. `MailboxFlow` enforces `FlowBound` (rejecting conflicting `client_id`, state mismatch,
+    // external `redirect_uri`, and callback `?error=`), and `loopback_http_exchange` rejects
+    // userinfo spoofing (`http://127.0.0.1:80@evil.example:80/`).
+    let auth_url = "https://claude.ai/oauth/authorize?client_id=cid_1\
+                    &redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcallback&state=st_1";
+    let flow = super::super::open_url::MailboxFlow::new(auth_url).expect("valid flow");
+    assert!(
+        super::super::open_url::MailboxFlow::new(
+            "https://claude.ai/oauth/authorize?client_id=cid_1&client_id=cid_2\
+             &redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcallback&state=st_1"
+        )
+        .is_err(),
+        "conflicting client_id parameters must be rejected by MailboxFlow"
+    );
+    assert!(
+        !flow.admits_provider_url("https://claude.ai/oauth/authorize?client_id=cid_2&state=st_1"),
+        "MailboxFlow must reject provider URL for another client_id"
+    );
+    assert!(
+        !flow.admits_provider_url(
+            "https://claude.ai/login?redirect_uri=https%3A%2F%2Fevil.example%2Fcb"
+        ),
+        "MailboxFlow must reject provider URL with external redirect_uri"
+    );
+    assert!(
+        !flow
+            .is_callback("http://127.0.0.1:43123/callback?code=abc&state=st_1&error=access_denied"),
+        "MailboxFlow must reject callback URLs carrying an OAuth error parameter"
+    );
+    assert!(flow.is_callback("http://127.0.0.1:43123/callback?code=abc&state=st_1"));
+
+    let mut cookies = std::collections::BTreeMap::new();
+    assert_eq!(
+        super::super::open_url::loopback_http_exchange(
+            "GET",
+            "http://127.0.0.1:80@evil.example:80/cb",
+            &mut cookies,
+            None
+        )
+        .err(),
+        Some("loopback URL authority is not localhost or 127.0.0.1")
+    );
+
+    // 4. `VENDOR_PAGE_JS`, `vendor_act_js`, and `SUBMIT_INPUT_HELPERS_JS` classify
+    // `<input type="text" name="email_code">` as `"code"` before `"email"` and guard
+    // form-less SPA `submitInput` against `"Continue with Google"` / cancel buttons.
+    let code_idx = VENDOR_PAGE_JS
+        .find("return \"code\";")
+        .expect("code classification");
+    let name_email_idx = VENDOR_PAGE_JS
+        .find("if (n.includes(\"email\")) return \"email\";")
+        .expect("name email classification");
+    assert!(
+        code_idx < name_email_idx,
+        "code attributes (name*='code', name*='otp', one-time-code, numeric) must be checked before name.includes('email')"
+    );
+    let act_email = vendor_act_js(&Step::FillEmail, Some("owner@example.com"));
+    assert!(
+        act_email.contains("isCodeField") && act_email.contains("disallowedSubmitLabel"),
+        "vendor_act_js must exclude code fields when filling email and guard submitInput against third-party/cancel buttons"
+    );
 }

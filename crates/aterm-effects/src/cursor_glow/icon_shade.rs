@@ -217,19 +217,30 @@ fn drawn_rows(icon: PxBox, src: Option<&IconSrc>, (ox, oy): (i32, i32), out: &mu
 /// band's rows the parts left and right of its span, elsewhere whole slices.
 fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
     let (x0, x1, y0, y1) = rect;
-    let reaches = |b: &&PxBox| b.2 < y1 && b.3 > y0 && b.0 < x1 && b.1 > x0;
     if x0 >= x1
         || y0 >= y1
         || bands.is_empty()
         || y1 <= bands[0].2
         || y0 >= bands[bands.len() - 1].3
-        || !bands.iter().any(|b| reaches(&b))
     {
         return false;
     }
-    out.clear();
+    let mut hit = false;
     let mut y = y0;
-    for b in bands.iter().filter(reaches) {
+    for b in bands {
+        if b.3 <= y0 {
+            continue;
+        }
+        if b.2 >= y1 {
+            break;
+        }
+        if b.0 >= x1 || b.1 <= x0 {
+            continue;
+        }
+        if !hit {
+            out.clear();
+            hit = true;
+        }
         let (by0, by1) = (b.2.max(y0), b.3.min(y1));
         if by0 > y {
             out.push((x0, x1, y, by0));
@@ -241,6 +252,9 @@ fn cut_rect(rect: PxBox, bands: &[PxBox], out: &mut Vec<PxBox>) -> bool {
             out.push((b.1, x1, by0, by1));
         }
         y = by1;
+    }
+    if !hit {
+        return false;
     }
     if y < y1 {
         out.push((x0, x1, y, y1));

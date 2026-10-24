@@ -6,7 +6,7 @@
 const NBSP: char = '\u{a0}';
 
 /// The survey card's question (`survey.question`).
-const CARD: &str = aterm_phase::anchors::anchor_text("survey.question");
+const CARD: &str = aterm_phase::anchor!("survey.question");
 
 /// The survey card's head row: `●`, a space, the question.
 #[must_use]

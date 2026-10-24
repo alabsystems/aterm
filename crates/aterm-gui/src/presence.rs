@@ -1385,7 +1385,7 @@ mod tests {
         use aterm_phase::prompt::fixtures::composer;
         let banner = format!(
             "{} (140.4GB) \u{2014} restart and resume with claude --continue",
-            aterm_phase::anchor_text("wall.memory"),
+            aterm_phase::anchor!("wall.memory"),
         );
         let screen = |banner_row: &str, draft: &str| {
             let mut r = vec![

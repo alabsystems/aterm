@@ -23,8 +23,8 @@ pub fn art_of(w: u16, h: u16, texel: impl Fn(u16, u16) -> [u8; 4]) -> Arc<FxArt>
     Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, data).expect("a sized art"))
 }
 
-/// Texel `(x, y)` of the old suites' 64×64 sprite sheet: a distinct colour a
-/// texel, opaque in its top half (`y < 32`), translucent below.
+/// Texel `(x, y)` of a 64×64 sprite sheet: a distinct colour a texel, opaque in its top half
+/// (`y < 32`), translucent below.
 #[must_use]
 pub fn sheet_texel(x: u16, y: u16) -> [u8; 4] {
     let (x, y) = (u32::from(x), u32::from(y));
@@ -41,8 +41,7 @@ pub fn sheet_texel(x: u16, y: u16) -> [u8; 4] {
     ]
 }
 
-/// The `w × h` cut of the sheet at `(ax, ay)`, as its own art: what a sprite
-/// of the old path sampled 1:1 from that sub-rectangle.
+/// The `w × h` cut of the sheet at `(ax, ay)`, as its own art.
 pub fn cut(ax: u16, ay: u16, w: u16, h: u16) -> Arc<FxArt> {
     art_of(w, h, |x, y| sheet_texel(ax + x, ay + y))
 }

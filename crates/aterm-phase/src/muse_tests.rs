@@ -173,7 +173,7 @@ fn the_trust_box_is_a_trust_prompt_chosen_by_enter() {
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
     let p = r.prompt.expect("the box");
     assert_eq!(p.kind, PromptKind::Trust);
-    assert_eq!(p.title, anchor_text("muse.trust.title"));
+    assert_eq!(p.title, crate::anchor!("muse.trust.title"));
     assert_eq!(p.path.as_deref(), Some("/private/tmp/at.XXXXXX/mwork"));
     let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
     assert_eq!(labels, vec!["Trust and continue", "Quit"]);
@@ -197,7 +197,7 @@ fn the_sign_in_wall_is_a_wall_and_never_a_box() {
     );
     let w = r.wall.expect("the wall");
     assert_eq!(w.kind, WallKind::Auth);
-    assert!(w.message.starts_with(anchor_text("muse.signin.browser")));
+    assert!(w.message.starts_with(crate::anchor!("muse.signin.browser")));
     assert_eq!((r.prompt, r.composer), (None, None));
     assert_eq!(prompt(&rows), None);
     assert_eq!(crate::reader::MuseReader.prompt(&rows), None);
@@ -357,13 +357,16 @@ fn the_shell_box_is_a_bash_prompt_chosen_by_the_cursor_and_enter() {
     );
     let p = r.prompt.expect("the box");
     assert_eq!(p.kind, PromptKind::Bash);
-    assert_eq!(p.title, anchor_text("muse.box.shell"));
+    assert_eq!(p.title, crate::anchor!("muse.box.shell"));
     assert_eq!(p.command, "touch probe.txt");
     assert_eq!(p.readings(), vec!["touch probe.txt".to_string()]);
     let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
     assert_eq!(
         labels,
-        vec![anchor_text("muse.box.once"), anchor_text("muse.box.deny")]
+        vec![
+            crate::anchor!("muse.box.once"),
+            crate::anchor!("muse.box.deny")
+        ]
     );
     assert_eq!(roles(&p), vec![Role::Once, Role::Deny]);
     assert!(p.options[0].focused && !p.options[1].focused);
@@ -417,7 +420,7 @@ fn the_file_access_box_is_a_write_of_its_path() {
         );
         let p = r.prompt.expect("the box");
         assert_eq!(p.kind, PromptKind::Write);
-        assert_eq!(p.title, anchor_text("muse.box.file"));
+        assert_eq!(p.title, crate::anchor!("muse.box.file"));
         assert_eq!(
             p.path.as_deref(),
             Some("/private/tmp/at.lab0/proj/.agents/probe-write.md")
@@ -992,7 +995,7 @@ fn the_question_is_a_prompt_answered_by_the_cursor_and_enter() {
             vec![
                 "Red (Recommended)",
                 "Blue",
-                anchor_text("muse.question.none")
+                crate::anchor!("muse.question.none")
             ]
         );
         assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
@@ -1053,11 +1056,14 @@ fn the_question_in_a_narrow_tab_is_the_same_question() {
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec![crimson, "Blue", anchor_text("muse.question.none")]
+            vec![crimson, "Blue", crate::anchor!("muse.question.none")]
         );
         assert_eq!(roles(&p), vec![Role::Answer, Role::Answer, Role::Other]);
         assert_eq!(p.recommended().map(|o| o.label.as_str()), Some(crimson));
-        assert_eq!(p.footer.as_deref(), Some(anchor_text("muse.question.keys")));
+        assert_eq!(
+            p.footer.as_deref(),
+            Some(crate::anchor!("muse.question.keys"))
+        );
         let rows = screen(text);
         assert_eq!(
             p.question.map(|k| rows[k].as_str()),
@@ -1148,14 +1154,14 @@ fn a_refused_key_is_an_auth_wall() {
         (w.kind, w.placement, w.reset),
         (WallKind::Auth, Placement::ErrorRow, None)
     );
-    assert_eq!(w.message, anchor_text("muse.wall.key"));
+    assert_eq!(w.message, crate::anchor!("muse.wall.key"));
     assert_eq!(r.said_tail, None);
     let rows = screen(KEY_REJECTED);
     for sibling in ["muse.wall.saved_key", "muse.wall.no_login"] {
         let other = edited(
             &rows,
             "◆ your API key",
-            &format!("◆ {}", anchor_text(sibling)),
+            &format!("◆ {}", crate::anchor(sibling)),
         );
         assert_eq!(
             wall(&other).map(|w| w.kind),
@@ -1166,7 +1172,7 @@ fn a_refused_key_is_an_auth_wall() {
     let quoted = edited(
         &rows,
         "◆ your API key",
-        &format!("◆ It said: {}", anchor_text("muse.wall.key")),
+        &format!("◆ It said: {}", crate::anchor!("muse.wall.key")),
     );
     assert_eq!(wall(&quoted), None, "the control");
     assert!(said_tail(&quoted).is_some());
@@ -1899,8 +1905,8 @@ fn the_staged_shell_box_is_a_bash_prompt_of_its_whole_command() {
     assert_eq!(
         labels,
         vec![
-            anchor_text("muse.box.stage_once"),
-            anchor_text("muse.box.stage_abort")
+            crate::anchor!("muse.box.stage_once"),
+            crate::anchor!("muse.box.stage_abort")
         ]
     );
     assert_eq!(roles(&p), vec![Role::Once, Role::Deny]);
@@ -2070,11 +2076,11 @@ fn each_key_wall_names_muse_codes_own_remedy() {
         Some("update or unset META_API_KEY")
     );
     assert_eq!(
-        remedy(anchor_text("muse.wall.saved_key")).as_deref(),
+        remedy(crate::anchor!("muse.wall.saved_key")).as_deref(),
         Some("run `muse login` or add a new key")
     );
     assert_eq!(
-        remedy(anchor_text("muse.wall.no_login")).as_deref(),
+        remedy(crate::anchor!("muse.wall.no_login")).as_deref(),
         Some("run `muse login` or set META_API_KEY")
     );
     for text in [SIGNED_OUT, RATE_LIMIT_FINAL] {
@@ -2496,17 +2502,17 @@ fn the_network_box_is_a_network_request_of_its_url() {
         );
         let p = r.prompt.expect("the box");
         assert_eq!(p.kind, PromptKind::NetworkRequest, "{url}");
-        assert_eq!(p.title, anchor_text("muse.box.network"));
+        assert_eq!(p.title, crate::anchor!("muse.box.network"));
         assert_eq!((p.command.as_str(), p.path.as_deref()), (url, None));
         assert_eq!(p.notes, vec!["network: 127.0.0.1:50581 http".to_string()]);
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(
             labels,
             vec![
-                anchor_text("muse.box.once"),
-                anchor_text("muse.box.session"),
-                anchor_text("muse.box.always"),
-                anchor_text("muse.box.deny"),
+                crate::anchor!("muse.box.once"),
+                crate::anchor!("muse.box.session"),
+                crate::anchor!("muse.box.always"),
+                crate::anchor!("muse.box.deny"),
             ],
             "{url}"
         );
@@ -2519,7 +2525,7 @@ fn the_network_box_is_a_network_request_of_its_url() {
         assert_eq!(
             p.cancel.map(|c| (c.verb, c.effect)),
             Some((
-                anchor_text("muse.box.deny").to_string(),
+                crate::anchor!("muse.box.deny").to_string(),
                 CancelEffect::Reject
             ))
         );
@@ -2530,7 +2536,7 @@ fn the_network_box_is_a_network_request_of_its_url() {
         .filter(|r| !r.trim_start().starts_with("full URL:"))
         .cloned()
         .collect();
-    let tool = edited(&rows, "Would you like", anchor_text("muse.box.tool"));
+    let tool = edited(&rows, "Would you like", crate::anchor!("muse.box.tool"));
     let command = screen(BOX_NETWORK_COMMAND);
     let labels: Vec<String> = prompt(&command)
         .expect("the box")
@@ -2541,10 +2547,10 @@ fn the_network_box_is_a_network_request_of_its_url() {
     assert_eq!(
         labels,
         [
-            anchor_text("muse.box.once"),
-            anchor_text("muse.box.session"),
-            anchor_text("muse.box.always"),
-            anchor_text("muse.box.deny"),
+            crate::anchor!("muse.box.once"),
+            crate::anchor!("muse.box.session"),
+            crate::anchor!("muse.box.always"),
+            crate::anchor!("muse.box.deny"),
         ]
     );
     let pip = "python3 -m pip install --quiet --target /tmp/pylibs pyte 2>&1 | tail -n 3; \
@@ -2579,7 +2585,7 @@ fn the_tool_action_box_is_a_tool_call_of_its_tool() {
         );
         let p = r.prompt.expect("the box");
         assert_eq!(p.kind, PromptKind::Tool, "{name}");
-        assert_eq!(p.title, anchor_text("muse.box.tool"));
+        assert_eq!(p.title, crate::anchor!("muse.box.tool"));
         assert_eq!(
             (p.command.as_str(), p.path.as_deref(), p.notes.len()),
             (tool, None, 0),
@@ -2590,10 +2596,10 @@ fn the_tool_action_box_is_a_tool_call_of_its_tool() {
         assert_eq!(
             labels,
             [
-                anchor_text("muse.box.once"),
-                anchor_text("muse.box.session"),
-                anchor_text("muse.box.always_tool"),
-                anchor_text("muse.box.deny"),
+                crate::anchor!("muse.box.once"),
+                crate::anchor!("muse.box.session"),
+                crate::anchor!("muse.box.always_tool"),
+                crate::anchor!("muse.box.deny"),
             ],
             "{name}"
         );
@@ -2611,7 +2617,7 @@ fn the_tool_action_box_is_a_tool_call_of_its_tool() {
             p.cancel.map(|c| (c.key, c.verb, c.effect)),
             Some((
                 "esc".to_string(),
-                anchor_text("muse.box.deny").to_string(),
+                crate::anchor!("muse.box.deny").to_string(),
                 CancelEffect::Reject
             )),
             "{name}"
@@ -2620,10 +2626,13 @@ fn the_tool_action_box_is_a_tool_call_of_its_tool() {
     let rows = screen(BOX_TOOL_ACTION);
     let rowless: Vec<String> = rows
         .iter()
-        .filter(|r| !r.trim_start().starts_with(anchor_text("muse.box.tool_row")))
+        .filter(|r| {
+            !r.trim_start()
+                .starts_with(crate::anchor!("muse.box.tool_row"))
+        })
         .cloned()
         .collect();
-    let retitled = edited(&rows, "Would you like", anchor_text("muse.box.network"));
+    let retitled = edited(&rows, "Would you like", crate::anchor!("muse.box.network"));
     for other in [rowless, retitled] {
         assert_eq!(phase(&other), (Phase::Prompt, true));
         let p = prompt(&other).expect("still a box");
@@ -2663,7 +2672,7 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
         );
         let p = r.prompt.expect("the box");
         assert_eq!(p.kind, PromptKind::Other, "{name}");
-        assert_eq!(p.title, anchor_text("muse.box.network"));
+        assert_eq!(p.title, crate::anchor!("muse.box.network"));
         assert_eq!(
             (p.command.as_str(), p.path.as_deref(), p.command_rows.len()),
             (
@@ -2674,7 +2683,7 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
             "{name}"
         );
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
-        assert_eq!(labels, ["Allow once", anchor_text("muse.box.reject")]);
+        assert_eq!(labels, ["Allow once", crate::anchor!("muse.box.reject")]);
         assert!(roles(&p).iter().all(|&r| r == Role::Other), "{name}");
         assert!(p.options[focus].focused, "{name}");
         assert!(!p.options[1 - focus].focused, "{name}");
@@ -2683,7 +2692,7 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
             p.cancel,
             Some(Cancel {
                 key: "esc".to_string(),
-                verb: anchor_text("muse.box.reject").to_string(),
+                verb: crate::anchor!("muse.box.reject").to_string(),
                 effect: CancelEffect::Reject,
             }),
             "{name}"
@@ -2702,8 +2711,8 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
     );
     let retitled = edited(
         &screen(BOX_UNIX_SOCKET),
-        anchor_text("muse.box.network"),
-        anchor_text("muse.box.tool"),
+        crate::anchor!("muse.box.network"),
+        crate::anchor!("muse.box.tool"),
     );
     let p = prompt(&retitled).expect("still a box");
     assert_eq!(
@@ -2713,7 +2722,7 @@ fn the_unix_socket_box_is_a_persons_box_whose_esc_refuses() {
     );
     let refused = format!(
         "Done. Tool result: tool failed: {}",
-        anchor_text("muse.box.socket_refused")
+        crate::anchor!("muse.box.socket_refused")
     );
     for (text, said) in [
         (BOX_UNIX_SOCKET_APPROVED, "Done. Tool result: {"),
@@ -3125,9 +3134,9 @@ fn several_questions_and_a_multi_select_are_questions_of_no_roles() {
             position.map(str::to_string).into_iter().collect::<Vec<_>>()
         );
         let keys = if position.is_some() {
-            anchor_text("muse.question.keys_multi")
+            crate::anchor!("muse.question.keys_multi")
         } else {
-            anchor_text("muse.question.keys_toggle")
+            crate::anchor!("muse.question.keys_toggle")
         };
         assert_eq!(p.footer.as_deref(), Some(keys));
         assert!(!is_review(&p));
@@ -3147,7 +3156,7 @@ fn several_questions_and_a_multi_select_are_questions_of_no_roles() {
     let single = edited(
         &rows,
         "  Enter to select",
-        &format!("  {}", anchor_text("muse.question.keys")),
+        &format!("  {}", crate::anchor!("muse.question.keys")),
     );
     assert_eq!(
         roles(&prompt(&single).expect("the question")),
@@ -3209,8 +3218,8 @@ fn the_review_is_a_question_of_no_roles_whose_esc_goes_back() {
         assert_eq!(
             labels,
             vec![
-                (None, anchor_text("muse.question.submit"), Role::Other),
-                (None, anchor_text("muse.question.interrupt"), Role::Other),
+                (None, crate::anchor!("muse.question.submit"), Role::Other),
+                (None, crate::anchor!("muse.question.interrupt"), Role::Other),
             ]
         );
         assert_eq!(
@@ -3290,14 +3299,14 @@ fn a_meta_accounts_walls_are_sign_in_walls() {
             "finish onboarding at https://dev.meta.ai, then log in again",
         ),
     ] {
-        let walled = edited(&rows, "◆ your API key", &format!("◆ {}", anchor_text(id)));
+        let walled = edited(&rows, "◆ your API key", &format!("◆ {}", crate::anchor(id)));
         let w = wall(&walled).expect("the wall");
         assert_eq!(w.kind, WallKind::Auth, "{id}");
         assert_eq!(remedy(&w.message).as_deref(), Some(fix), "{id}");
         let quoted = edited(
             &rows,
             "◆ your API key",
-            &format!("◆ The page said: {}", anchor_text(id)),
+            &format!("◆ The page said: {}", crate::anchor(id)),
         );
         assert_eq!(wall(&quoted), None, "the control: {id}");
     }
@@ -3565,7 +3574,7 @@ fn a_queued_prompt_is_no_part_of_the_turn_and_its_run_goes_on() {
 
 #[test]
 fn muse_codes_title_says_whether_its_run_is_active() {
-    let spinner = anchor_text("muse.title.spinner");
+    let spinner = crate::anchor!("muse.title.spinner");
     assert_eq!(spinner.chars().count(), 10);
     for frame in spinner.chars() {
         assert!(title_runs(&format!("{frame} proj")), "{frame}");

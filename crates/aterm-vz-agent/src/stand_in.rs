@@ -9,10 +9,9 @@ use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 
-/// Wait to be signalled, while process `test` (the test that started this stand-in, its
-/// pid) lives: a test that fails before its kill leaves no stand-in parked behind it. The
-/// wait is on that one process, never this one's parent, so a group kill that misses a
-/// grandchild still leaves it running for the test to see.
+/// Wait to be signalled while process `test` (the test that started this stand-in) lives, so
+/// a test that fails before its kill strands no stand-in. It watches that pid, not its parent,
+/// so a group kill that misses a grandchild leaves it running for the test to see.
 fn park(test: &str) -> ExitCode {
     let Ok(test) = test.parse::<u32>() else {
         return ExitCode::from(2);

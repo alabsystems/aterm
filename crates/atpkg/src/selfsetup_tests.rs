@@ -1941,10 +1941,9 @@ fn an_uninstall_removes_a_bundle_whose_programs_ended_however_they_ended() {
     assert!(!app.exists(), "{out}");
 }
 
-/// Through sudo a shell asks the program ([`ENDED`]): the run shows the program ran once it
-/// printed, or the shell wrote that its run ended, but for an `ended 126` or `ended 127` that is
-/// the shell's own failure to exec it, which shows only a kernel refusal. No such line at all is
-/// sudo's end or the shell's.
+/// A run through sudo's shell ([`ENDED`]) shows the program ran once it printed or the shell
+/// wrote `ended <n>`, except a 126 or 127 that is the shell's own exec failure, which counts
+/// only for a kernel refusal. No such line at all is sudo's end or the shell's.
 #[test]
 fn a_run_through_sudo_shows_the_program_ran_by_its_end_or_a_kernel_refusal() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -2073,10 +2072,9 @@ fn sudo_names_a_kernel_refusal_of_the_atpkg_it_runs() {
     assert!(!sudo_refused_exec(account, Some(0), sh.as_bytes(), program));
 }
 
-/// Through sudo the program is asked by a shell that writes once its run ends: a program that
-/// ends with nothing on standard output, or that the kernel will not start, shows it ran, and
-/// one the shell could not exec (denied, gone) does not. No startup file of the account's, as
-/// sshd's `SSH_CLIENT` has bash read, or the environment's (`BASH_ENV`) writes to it.
+/// The shell sudo runs ([`ENDED`]) writes once the run ends: a quiet program or one the kernel
+/// refuses shows it ran, one the shell could not exec does not, and neither the account's
+/// `.bashrc` (read under sshd's `SSH_CLIENT`) nor `BASH_ENV` writes to its output.
 #[test]
 fn the_shell_a_run_through_sudo_asks_by_writes_once_the_run_ends() {
     let a = Account::new("ended");

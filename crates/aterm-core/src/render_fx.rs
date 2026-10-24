@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FX LAYERS: the engine's sprite and bitmap primitive (`docs/DESIGN-card-engine-2026-10-19.md` §4).
+//! Fx layers: the sprite and bitmap primitive (`docs/DESIGN-card-engine-2026-10-19.md` §4).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -213,7 +213,8 @@ pub enum FxTexels {
     Index8,
     /// Four bytes per texel, `R, G, B, A`, premultiplied.
     Rgba8Premul,
-    /// Four bytes per texel, `R, G, B, A`, straight alpha, drawn under [`FxBlend::Linear`] with the sprite's palette entry as tint and opacity.
+    /// Four bytes per texel, `R, G, B, A`, straight alpha, drawn under [`FxBlend::Linear`] with
+    /// the sprite's palette entry as tint and opacity.
     Rgba8Straight,
 }
 
@@ -316,7 +317,7 @@ impl FxRowRuns {
 /// The longest side, in texels, an [`FxArt`] may have.
 pub const FX_ART_MAX_SIDE: u16 = 2048;
 
-/// The art one frame may draw per texel width (the one-byte Index8 arts, and the four-byte RGBA ones).
+/// The most texels of distinct arts a frame may draw, per texel width (Index8 apart from RGBA).
 pub const FX_FRAME_ART_TEXELS: u64 = 1 << 22;
 
 /// An image the engine draws.
@@ -585,7 +586,7 @@ pub fn fx_layer_builds() -> u64 {
     FX_LAYER_BUILDS.load(Ordering::Relaxed)
 }
 
-/// How many deep copies of an [`FxContent`] payload this process has made (`metrics`' `fx_payload_copies`).
+/// How many deep copies of an [`FxContent`] payload this process has made.
 #[must_use]
 #[inline]
 pub fn fx_payload_copies() -> u64 {
@@ -611,7 +612,7 @@ fn count_here(builds: u64, copies: u64) {
     let _ = (builds, copies);
 }
 
-/// [`fx_layer_builds`] and [`fx_payload_copies`] booked on THIS thread.
+/// [`fx_layer_builds`] and [`fx_payload_copies`] booked on this thread.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]
@@ -652,7 +653,8 @@ impl FxContent {
     /// Sealed content of `items` over `palette`.
     ///
     /// # Panics (debug)
-    /// On a mixture of blends, a sprite over a zero-size art, or a palette index past the end (see [`Self::edit`]).
+    /// On a mixture of blends, a palette index past the end, a rect or ramp row additive at one
+    /// end only, or a sprite of a zero-size art.
     #[must_use]
     pub fn new(items: Vec<FxItem>, palette: Vec<FxInk>) -> Self {
         let mut content = Self {
@@ -664,7 +666,8 @@ impl FxContent {
         content
     }
 
-    /// An empty content with this one's room: what a producer refills in place of a content some frame still holds, so the new frame grows no vector the held one already grew.
+    /// An empty content with this one's capacity, for a producer to refill in place of a content
+    /// a frame still holds, so the new one grows no vector the held one already grew.
     #[must_use]
     pub fn empty_like(&self) -> Self {
         Self {
@@ -674,10 +677,11 @@ impl FxContent {
         }
     }
 
-    /// Change the items and the palette in place, then re-seal.
+    /// Change the items and the palette in place, then re-seal; a panic (in `f` or a refusal)
+    /// still leaves the content sealed, unchecked.
     ///
     /// # Panics (debug)
-    /// When content mixes [`FxBlend::Exact`] and [`FxBlend::Linear`], references out-of-bounds palette entries, or mixes additive and source-over stops.
+    /// As [`Self::new`].
     pub fn edit(&mut self, f: impl FnOnce(&mut Vec<FxItem>, &mut Vec<FxInk>)) {
         struct Reseal<'a> {
             content: &'a mut FxContent,
@@ -699,7 +703,8 @@ impl FxContent {
         guard.sealed = true;
     }
 
-    /// Sealed content WITHOUT the debug refusals, for the tests of what the renderers draw for a malformed item (nothing, per pixel law F).
+    /// Sealed content without the debug refusals, for tests of what the renderers draw for a
+    /// malformed item (nothing, per pixel law F).
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     #[must_use]
@@ -727,7 +732,7 @@ impl FxContent {
         &self.palette
     }
 
-    /// The hull of every item's bounds, in the content's space ([`PxRect::EMPTY`] when nothing can draw).
+    /// The hull of every item's bounds in the content's space, [`PxRect::EMPTY`] when none draws.
     #[must_use]
     #[inline]
     pub const fn extent(&self) -> PxRect {
@@ -748,7 +753,11 @@ impl FxContent {
         }
     }
 
-    /// Whether every pixel an item draws is opaque: rects, ramps and Index8 sprites over a palette whose every entry has alpha 255 (no RGBA sprite, whose texels this does not read). Under [`FxBlend::Exact`] such a pixel is its entry's colour whatever lies beneath (`over_premul` at `a = 255`), so a renderer may store it rather than blend it (the GPU's pass economy, `docs/DESIGN-card-engine-2026-10-19.md` §5 route (1)). An empty content is opaque.
+    /// Whether every pixel an item draws is opaque: rects, ramps and Index8 sprites, with no
+    /// RGBA sprite, over a palette whose every entry has alpha 255. Under [`FxBlend::Exact`] such
+    /// a pixel is its entry's colour whatever lies beneath, so a renderer may store it rather
+    /// than blend it (`docs/DESIGN-card-engine-2026-10-19.md` §5 route (1)). An empty content is
+    /// opaque.
     #[must_use]
     #[inline]
     pub const fn draws_opaque(&self) -> bool {
@@ -847,14 +856,15 @@ impl FxContent {
     }
 }
 
-/// Where a layer sits in the frame's painter's order (`docs/DESIGN-card-engine-2026-10-19.md` §4.5).
+/// Where a layer sits in the frame's painter's order
+/// (`docs/DESIGN-card-engine-2026-10-19.md` §4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FxSlot {
     /// Under the glyph ink.
     Under,
-    /// Over the glyphs, right after the cursor aurora (`cursor_glow_add`) and before the radial halos.
+    /// Over the glyphs: after the cursor aurora (`cursor_glow_add`), before the radial halos.
     Glow,
-    /// Over the glyphs, right after the nova light (so over pane chrome such as the scrollbar) and before the rain halos.
+    /// Over the glyphs and pane chrome: after the nova light, before the rain halos.
     Over,
 }
 
@@ -872,7 +882,8 @@ pub enum FxSpace {
 pub enum FxBlend {
     /// The Unorm byte law.
     Exact,
-    /// The companion sprites' linear-light law over an sRGB view (CPU `blend`), within its declared parity tolerance.
+    /// The companion sprites' linear-light law on an sRGB view (CPU `blend`), within
+    /// [`Self::parity`].
     Linear,
 }
 
@@ -923,7 +934,8 @@ impl FxLayer {
     /// A layer at offset `(0, 0)`, unclipped, without bloom or knock-out.
     ///
     /// # Panics (debug)
-    /// When the content cannot be drawn under `blend`, or a [`FxBlend::Linear`] layer asks for [`FxSlot::Glow`].
+    /// When the content cannot be drawn under `blend`, or a [`FxBlend::Linear`] layer asks for
+    /// [`FxSlot::Glow`].
     #[must_use]
     #[inline]
     pub fn new(
@@ -1023,9 +1035,8 @@ mod tests {
         assert!(FxArt::new(u16::MAX, u16::MAX, FxTexels::Rgba8Premul, Vec::new()).is_none());
     }
 
-    /// The run lists, expanded, are exactly the drawing texels: every
-    /// non-clear texel lies in one run of its own value, no clear texel lies
-    /// in any, runs are maximal and ordered.
+    /// Every non-clear texel lies in one run of its own value and no clear texel in any; runs
+    /// are maximal and ordered.
     #[test]
     fn run_lists_expand_to_exactly_the_drawing_texels() {
         let empty = FxArt::new(0, 0, FxTexels::Index8, Vec::new()).unwrap();
@@ -1189,7 +1200,7 @@ mod tests {
         assert!(content.accepts(FxBlend::Exact) && content.accepts(FxBlend::Linear));
     }
 
-    /// A content draws opaque exactly when every palette entry is alpha 255 and no item reads RGBA texels; the seal decides it again on every edit.
+    /// The seal decides opacity again on every edit.
     #[test]
     fn a_content_draws_opaque_only_over_an_opaque_palette_without_rgba_texels() {
         let rect = FxItem::Rect(FxRect {

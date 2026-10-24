@@ -648,12 +648,11 @@ fn run_in(
     }
 }
 
-/// Move each Rust toolchain build Spotlight still indexes
+/// On macOS, move each Rust toolchain build Spotlight still indexes
 /// ([`crate::store::spotlight_exposed_builds`]) into `<build>.noindex` behind a `<build>` link
-/// ([`crate::store::lay_aside`]), on macOS, where renaming it can disturb nothing: never the
-/// build `current` or a shim names (the one in use stays put until an update moves off it,
-/// and a pass after that moves it aside), a build a run holds a lease on or any live process
-/// runs from, or one held while macOS may still be assessing a first exec in it.
+/// ([`crate::store::lay_aside`]) where the rename disturbs nothing: never the build `current` or
+/// a shim names, a build a run leases or a live process runs from, or one held while macOS may
+/// still be assessing a first exec in it.
 fn lay_aside_unused(
     layout: &Layout,
     in_scope: &dyn Fn(&str) -> bool,
@@ -787,7 +786,7 @@ pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<Path
         .cloned()
 }
 
-/// The live process table ([`running_executables`]) under one ungated name.
+/// The live process table ([`running_executables`]), for the rest of the crate.
 pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
     running_executables()
 }
@@ -1377,9 +1376,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The shim view uses the anchored containment test, so a dev-link into
-    /// `~/src/store/ay/18/bin/aydev` claims nothing about our ay@18 and does not contest its
-    /// witness.
+    /// The shim view's containment test is anchored to the prefix, so a dev-link into
+    /// `~/src/store/ay/18/bin/aydev` claims nothing about ay@18 and does not contest its witness.
     #[cfg(unix)]
     #[test]
     fn a_shim_into_a_lookalike_store_outside_the_prefix_claims_nothing() {
@@ -2033,8 +2031,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A build that ships a Rust sysroot, as the store laid one before builds went aside: a
-    /// real directory at `store/<program>/<build>`.
+    /// A build that ships a Rust sysroot, as a real directory at `store/<program>/<build>`.
     #[cfg(target_os = "macos")]
     fn seed_toolchain(l: &Layout, program: &str, build: u64, shim: bool) -> PathBuf {
         let lib = l
@@ -2492,8 +2489,8 @@ mod tests {
         assert_eq!(sibling, Some(false), "`A.app.rollback` is not `A.app`");
     }
 
-    /// The real enumeration sees this very test process — the proof it reads the table
-    /// it claims to, in the resolved spelling [`InUse`] compares against.
+    /// The real enumeration lists this test process, in the resolved spelling [`InUse`] compares
+    /// against.
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     #[test]
     fn the_process_table_includes_this_process() {

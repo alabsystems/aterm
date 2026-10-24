@@ -18,7 +18,7 @@ use crate::mounts::{self, Op};
 use crate::serve::{self, Listener, Stream};
 use crate::system::{self, Booted, Facts, Identity, RawJob, System};
 use crate::wire::Share;
-use crate::{COMMAND_PORT, HOST_CID, WATCH_PORT, boot, sys, user, watch};
+use crate::{COMMAND_PORT, HOST_CID, WATCH_PORT, boot, key, sys, user, watch};
 
 /// A vsock listener that hands on only the host's connections.
 pub struct VsockListener(OwnedFd);
@@ -213,7 +213,9 @@ impl System for Guest {
         for op in mounts::plan(&mounts::parse(&info), shares)? {
             apply(&op)?;
         }
-        Ok(())
+        let after = std::fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|e| format!("/proc/self/mountinfo: {e}"))?;
+        mounts::check(&mounts::parse(&after), shares)
     }
 
     fn poweroff(&self) -> Result<(), String> {
@@ -249,9 +251,11 @@ pub fn register_rosetta() -> io::Result<bool> {
 }
 
 /// The agent in the guest: its unit and Rosetta's registration set up, the command
-/// listener bound, the watch connection dialed, then commands served until the listener
-/// fails. A failed dial is a fault (the helper listens before the guest has a userspace):
-/// it is written to the console and the agent exits.
+/// listener bound, the boot's key read from the key disk (`/sys/block`'s `vd*`, [`key::find`]),
+/// the watch connection dialed, then commands served until the listener fails. A failed
+/// dial is a fault (the helper listens before the guest has a userspace), and so is a boot
+/// with no key disk (the helper believes no hello without its key): either is written to the
+/// console and the agent exits.
 #[must_use]
 pub fn run() -> ExitCode {
     let say = |what: &str| eprintln!("aterm-vz-agent: {what}");
@@ -274,6 +278,15 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let boot_key = match key::find(Path::new("/sys/block"), Path::new("/dev")) {
+        Ok(k) => k,
+        Err(why) => {
+            say(&format!(
+                "no boot key: {why}; the host believes no hello without it"
+            ));
+            return ExitCode::FAILURE;
+        }
+    };
     let watch_conn = match dial(HOST_CID, WATCH_PORT) {
         Ok(c) => c,
         Err(e) => {
@@ -284,7 +297,7 @@ pub fn run() -> ExitCode {
         }
     };
     let system: Arc<dyn System> = Arc::new(Guest);
-    let hello = match crate::hello(system.as_ref(), Path::new("/proc/self/exe")) {
+    let hello = match crate::hello(system.as_ref(), Path::new("/proc/self/exe"), boot_key) {
         Ok(h) => h,
         Err(e) => {
             say(&format!("could not hash /proc/self/exe: {e}"));

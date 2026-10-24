@@ -522,6 +522,28 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// A dashed outline of `r`, or a dashed line where `r` has no width or
+    /// no height: `width` px thick, dashes `on` px long and `off` px apart,
+    /// one prim however long ([`DrawPrim::Dashed`]). Walls, hollow buckets,
+    /// the free-space outline, projections and missing days.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the merged deck's marks are its first painters")
+    )]
+    pub(crate) fn dashed(&mut self, r: Rect, width: f32, (on, off): (f32, f32), c: Rgba) {
+        let (x, y, w, h) = r;
+        self.prims.push(DrawPrim::Dashed {
+            x,
+            y,
+            w,
+            h,
+            width,
+            on,
+            off,
+            color: c,
+        });
+    }
+
     /// One square tile `t` px across at `(x, y)`, by its [`Rung`].
     pub(crate) fn tile(&mut self, x: f32, y: f32, t: f32, m: Mark, gutter: f32) {
         self.tile_rect(x, y, t, t, m, gutter, Some(self.inks.load_at(m.level)));
@@ -1210,5 +1232,180 @@ pub(crate) mod tests {
             count(false) + 2,
             "a bottom notch and a hollow cap"
         );
+    }
+
+    #[test]
+    fn a_dashed_mark_is_one_prim_however_long() {
+        let inks = inks();
+        let ink = a(inks.merged.axis, 0.85);
+        let mut p = Painter::new(&inks, 2.0, 24.0, false);
+        p.dashed((10.0, 4.0, 0.0, 36.0), 2.0, (3.0, 3.0), ink);
+        p.dashed((20.0, 4.0, 2000.0, 18.0), 2.0, (3.0, 2.0), ink);
+        assert_eq!(p.prims.len(), 2, "{:?}", p.prims);
+        assert!(matches!(
+            p.prims[0],
+            DrawPrim::Dashed { x, y, w, h, width, on, off, color }
+                if [x, y, w, h, width, on, off] == [10.0, 4.0, 0.0, 36.0, 2.0, 3.0, 3.0]
+                    && color == ink
+        ));
+    }
+
+    /// One panel of [`dashed_swatch`] at the painter's scale, `top` px
+    /// down: what the merged deck draws dashed, in the inks it draws them in.
+    fn dashed_swatch_panel(p: &mut Painter<'_>, top: f32, w: f32, h: f32) {
+        let (inks, s) = (*p.inks, p.s);
+        let m = inks.merged;
+        let pt = |v: f32| (v * s).round();
+        p.prims
+            .push(panel(0.0, top, w, h, 0.0, rgba(inks.ground, 0xFF)));
+        let ground = if inks.dark { "dark" } else { "light" };
+        p.figure(
+            pt(4.0),
+            top + pt(10.0),
+            format!("{s}x {ground}"),
+            m.secondary,
+            true,
+        );
+        let (lane, tall) = (top + pt(20.0), pt(16.0));
+        let mut x = pt(4.0);
+        let label = |p: &mut Painter<'_>, x: f32, words: &str| {
+            p.figure(x, top + pt(48.0), words.into(), m.axis, true);
+            x + p.figure_w(words, true)
+        };
+        let mut end = label(p, x, "wall");
+        for _ in 0..6 {
+            p.prims.push(panel(
+                x,
+                lane,
+                pt(4.0),
+                tall,
+                0.0,
+                rgba(m.heat_at(0.9), 0xFF),
+            ));
+            x += pt(5.0);
+        }
+        let wall = (x, lane - pt(1.0), 0.0, tall + pt(2.0));
+        p.dashed(wall, pt(1.0), (pt(1.5), pt(1.5)), a(m.secondary, 0.85));
+        x += pt(2.0);
+        for _ in 0..3 {
+            p.prims
+                .push(panel(x, lane, pt(1.5), tall, 0.0, rgba(inks.over, 0xFF)));
+            x += pt(2.5);
+        }
+        x = x.max(end) + pt(12.0);
+        end = label(p, x, "hollow buckets");
+        for i in 0..20 {
+            let bucket = (x, lane + pt(4.0), pt(2.4), tall - pt(4.0));
+            if (6..9).contains(&i) || i == 14 {
+                p.dashed(bucket, pt(0.5), (pt(1.5), pt(1.0)), a(m.axis, 0.85));
+            } else {
+                let level = 0.3 + 0.03 * i as f32;
+                let fill = (bucket.3 * level).round();
+                let ink = rgba(m.heat_at(level), 0xFF);
+                p.prims.push(panel(
+                    bucket.0,
+                    bucket.1 + bucket.3 - fill,
+                    bucket.2,
+                    fill,
+                    0.0,
+                    ink,
+                ));
+            }
+            x += pt(3.2);
+        }
+        x = x.max(end) + pt(12.0);
+        end = label(p, x, "free");
+        for i in 0..12 {
+            let used = i < 10;
+            let fill = if used { m.heat_at(0.95) } else { m.well };
+            p.prims
+                .push(panel(x, lane, pt(4.0), tall, 0.0, rgba(fill, 0xFF)));
+            x += pt(5.0);
+        }
+        let outline = (x - pt(10.6), lane - pt(0.6), pt(10.2), tall + pt(1.2));
+        p.dashed(outline, pt(1.0), (pt(1.5), pt(1.0)), rgba(m.needs, 0xFF));
+        x = x.max(end) + pt(12.0);
+        end = label(p, x, "projection");
+        for i in 0..10 {
+            let fill = (tall * (0.5 + 0.04 * i as f32)).round();
+            let ink = rgba(m.heat_at(0.8), 0xFF);
+            p.prims
+                .push(panel(x, lane + tall - fill, pt(2.4), fill, 0.0, ink));
+            x += pt(3.2);
+        }
+        let projection = (x + pt(0.6), lane - pt(1.0), pt(1.7), tall + pt(2.0));
+        p.dashed(projection, pt(0.8), (pt(1.5), pt(1.0)), rgba(m.needs, 0xFF));
+        x = x.max(end) + pt(16.0);
+        end = label(p, x, "missing day");
+        for day in 0..7 {
+            let bar = (x, lane + pt(6.0), pt(3.0), tall - pt(6.0));
+            if day == 4 {
+                p.dashed(bar, pt(0.5), (pt(1.5), pt(1.0)), a(m.axis, 0.85));
+            } else {
+                p.prims.push(panel(
+                    bar.0,
+                    bar.1,
+                    bar.2,
+                    bar.3,
+                    0.0,
+                    rgba(m.heat_at(0.5), 0xFF),
+                ));
+            }
+            x += pt(4.5);
+        }
+        x = x.max(end) + pt(20.0);
+        label(p, x, "lines");
+        for (row, (width, on, off)) in [(0.5, 1.5, 1.5), (1.0, 1.5, 1.5), (1.0, 3.0, 2.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let y = lane + pt(2.0 + 6.0 * row as f32);
+            p.dashed(
+                (x, y, pt(40.0), 0.0),
+                pt(width),
+                (pt(on), pt(off)),
+                rgba(m.secondary, 0xFF),
+            );
+        }
+    }
+
+    /// The merged deck's dashed marks at 1× and 2× on the mockups' dark
+    /// and light grounds, to read beside
+    /// `docs/design-studies/top-deck-*-2026-10-23.png`.
+    #[test]
+    #[ignore = "writes a PNG for a person to read: set ATERM_DECK_GALLERY to a directory"]
+    fn dashed_swatch() {
+        let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the gallery directory");
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (w_pt, h_pt) = (480.0_f32, 56.0_f32);
+        let (mut prims, mut top) = (Vec::new(), 0.0_f32);
+        for (ground, fg, accent) in [
+            ([0x30, 0x31, 0x35], [0xF8, 0xF8, 0xF2], [0x50, 0xFA, 0x7B]),
+            ([0xE2, 0xE3, 0xE5], [0x24, 0x29, 0x2F], [0x1A, 0x7F, 0x37]),
+        ] {
+            let inks = aterm_vitals::ink::vitals_inks(ground, fg, accent);
+            for s in [1.0_f32, 2.0] {
+                let mut p = Painter::new(&inks, s, 12.0 * s, false);
+                dashed_swatch_panel(&mut p, top, w_pt * 2.0, h_pt * s);
+                prims.append(&mut p.prims);
+                top += h_pt * s;
+            }
+        }
+        let (pixels, pw, ph) = crate::tray_raster::rasterize_tray(
+            &prims,
+            (w_pt * 2.0) as u32,
+            top as u32,
+            1.0,
+            [0, 0, 0, 0xFF],
+        );
+        let png =
+            crate::app_introspect::encode_rgba8_png(&pixels, pw, ph).expect("the swatch encodes");
+        let file = dir.join("dashed_swatch.png");
+        std::fs::write(&file, png).expect("the PNG writes");
+        eprintln!("{}", file.display());
     }
 }

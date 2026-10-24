@@ -20,14 +20,12 @@ use crate::{App, Wake};
 /// Provisioning callbacks installed by the shipped binary.
 #[derive(Clone, Copy)]
 pub struct InitialSetupHandlers {
-    /// Durably admit `plan` as the next run; the receipt says whose choice it
-    /// is ([`InitialSetupApplyReceipt::admission`]) and whether it shapes the
-    /// plan ([`InitialSetupApplyReceipt::chosen`]). A choice takes effect at
-    /// once (design §3.3): while a pass is running, it stops at its next stage
-    /// boundary and `plan` runs after it, wherever the page has gone by then,
-    /// and a later call overtakes one still waiting, whose dropped receipt
+    /// Durably admit `plan` (with its vault-typed flag and optional join
+    /// password) as the next run; the receipt says whose choice it is and
+    /// whether it shapes the plan. A choice takes effect at once (design §3.3):
+    /// a running pass stops at its next stage boundary and `plan` runs after
+    /// it, and a later call overtakes one still waiting, whose dropped receipt
     /// keeps the page's input.
-    /// Applies the reviewed plan with its vault-typed flag, optional join password, and receipt.
     pub apply: fn(Plan, bool, Option<SecretBytes>, InitialSetupApplyReceipt) -> bool,
     /// Start Check again for `plan`: its forced reading of every row, and the
     /// check itself, which a setup pass holding the worker refuses (design
@@ -42,19 +40,18 @@ pub struct InitialSetupHandlers {
     pub observe: fn(Plan) -> bool,
     /// Stop was pressed: the pass going now stops at its next stage boundary,
     /// and so does the run of every plan sent before the press that is still
-    /// being admitted, the moment it registers (design §3.3). Asked once: the
-    /// worker keeps it. It touches no file on the UI thread: the Stop's
-    /// request is saved on a worker, which [`Self::settle`] waits for.
+    /// being admitted, once it registers (design §3.3). Asked once: the worker
+    /// keeps it. It touches no file on the UI thread: a worker saves the Stop,
+    /// and [`Self::settle`] waits for that save.
     pub stop: fn(),
     /// The app is quitting, or an update's handoff is about to end it: wait,
     /// briefly, for what a Stop still owes the person's records (a plan it
     /// stops still being admitted, the Stop's save), so a quit right after a
     /// Stop never resumes the run (design §3.3). At once when nothing is owed.
     pub settle: fn(),
-    /// A person pressed the Secrets vault row's Turn On Sync: this Mac's
-    /// subscriber, which they turned off, is installed again on a worker,
-    /// which removes the record of their choice and reads the row again
-    /// (design §3.3). Whether that worker started.
+    /// Turn On Sync on the Secrets vault row: a worker reinstalls this Mac's
+    /// subscriber, removes the record of the person's opt-out and reads the
+    /// row again (design §3.3). Returns whether that worker started.
     pub sync_on: fn() -> bool,
 }
 
@@ -152,6 +149,9 @@ struct PendingApply {
     instance: crate::native_app::AppInstanceId,
     plan: Plan,
     answer: Receiver<bool>,
+    /// Stop may keep this admission's answer while withdrawing its right to
+    /// release automatic permission guidance in this process.
+    release_permissions: bool,
 }
 
 static HANDLERS: Mutex<Option<InitialSetupHandlers>> = Mutex::new(None);
@@ -285,9 +285,8 @@ impl App {
     /// An update's handoff is about to end this process: what a Stop still
     /// owes the records gets the same bounded wait a quit gives it
     /// ([`InitialSetupHandlers::settle`]); with nothing owed it returns at
-    /// once. Asked as the handoff starts, again among what the Commit's claim
-    /// answers, and once more right before its write, since the window handles
-    /// input in between.
+    /// once. The handoff asks as it starts, at the Commit's claim and right
+    /// before its write, since the window handles input in between.
     #[cfg(target_os = "macos")]
     pub(crate) fn settle_system_state_before_handoff(&self) {
         if let Some(handlers) = self.system_state_handlers() {
@@ -443,11 +442,10 @@ impl App {
         }
     }
 
-    /// The page follows the window's access step at once (design §3.2, §6):
-    /// where [`Self::system_state_access_step`] moved since the status was last
-    /// published, publish that status again, so the very next frame names
-    /// macOS's dialog — or stops naming it — rather than the next status poll's.
-    /// The poll itself is left as it was: no read is started or dropped.
+    /// The page follows the window's access step at once (design §3.2, §6): when
+    /// [`Self::system_state_access_step`] moved since the last publish, publish
+    /// the status again so the next frame names macOS's dialog, or stops naming
+    /// it. The status poll is left as it was.
     pub(crate) fn republish_system_state_access_step(&mut self) {
         if self.system_state_host.access_step == self.system_state_access_step() {
             return;
@@ -473,10 +471,8 @@ impl App {
         self.system_state_host.access_step
     }
 
-    /// Redraw the windows that show a System State page
-    /// ([`Self::system_state_showing_windows`]), and no other: the page's
-    /// status and its tick (the village's walk, an offer let go) change only
-    /// what the page draws.
+    /// Redraw only the windows that show a System State page: its status and
+    /// tick (the village's walk, an offer let go) change only what it draws.
     fn request_redraw_system_state_windows(&self) {
         for wid in self.system_state_showing_windows() {
             if let Some(os_window) = self.windows.get(&wid).and_then(|w| w.os_window.as_ref()) {
@@ -485,11 +481,9 @@ impl App {
         }
     }
 
-    /// The windows on screen whose active tab's visible plan has a System
-    /// State leaf, focused or not, so a page in an unfocused split pane is
-    /// among them. A window where the page is a background tab is not:
-    /// switching to that tab draws the page as it stands then; nor is an
-    /// occluded one ([`Self::system_state_on_screen`]).
+    /// The on-screen windows whose active tab's visible plan has a System State
+    /// leaf, focused or not. A window where the page is a background tab is not
+    /// among them: switching to that tab draws the page as it stands then.
     fn system_state_showing_windows(&self) -> Vec<crate::WindowId> {
         self.system_state_on_screen()
             .filter(|wid| {
@@ -607,7 +601,6 @@ impl App {
             self.system_state_host.next_status.get_or_insert(now);
         }
         self.poll_system_state_status(now);
-        // A tab indicator that changed redraws its own window (its tab chrome).
         self.refresh_system_state_tab_indicators();
         if changed {
             self.request_redraw_system_state_windows();
@@ -672,9 +665,9 @@ impl App {
             .map(|(wid, _)| *wid)
     }
 
-    /// The views of `instance` that are a leaf of some on-screen window's
-    /// active tab's visible plan, focused or not: every view of it someone can
-    /// see, the windows [`Self::system_state_showing_windows`] redraws.
+    /// The views of `instance` that are a leaf of some on-screen window's active
+    /// tab's visible plan, focused or not: those in the windows
+    /// [`Self::system_state_showing_windows`] redraws.
     fn system_state_seen_views(
         &self,
         instance: crate::native_app::AppInstanceId,
@@ -842,11 +835,15 @@ impl App {
         handlers: Option<InitialSetupHandlers>,
     ) {
         match action {
-            // Stop and a row's Open change no plan: they leave the review, the
-            // permission gate and the status generation alone. The worker
-            // keeps the Stop for a run whose plan is still being admitted.
+            // Stop changes no plan or status generation. It withdraws future
+            // automatic gestures locally even when the durable run already
+            // finished, and the worker keeps its ordinary durable Stop.
             SystemStateAction::Stop => {
                 let _ = self.take_system_state_press();
+                self.stop_initial_setup_permissions();
+                if let Some(pending) = &mut self.system_state_host.pending_apply {
+                    pending.release_permissions = false;
+                }
                 if let Some(handlers) = handlers {
                     (handlers.stop)();
                 }
@@ -881,9 +878,9 @@ impl App {
                     return;
                 };
                 // A run going now, or a plan still being admitted, stops for
-                // this one at its next step (§3.3): the worker's own doing,
-                // as it takes the plan, so the window never asks for a Stop
-                // that could reach this plan's own run.
+                // this one at its next step (§3.3): the worker does that as it
+                // takes the plan, so the window never sends a Stop that could
+                // reach this plan's own run.
                 self.begin_system_state_action(true);
                 self.note_system_state_apply(admission);
                 self.system_state_host.operation = None;
@@ -893,6 +890,7 @@ impl App {
                     instance,
                     plan: plan.clone(),
                     answer: receiver,
+                    release_permissions: true,
                 });
                 let started = if let Some(request) = self.system_state_host.pending.take() {
                     answer.receipt = Some(receipt);
@@ -946,7 +944,9 @@ impl App {
         }
     }
 
-    /// What every Apply, Check and Restore does first: a `mutating` one retires the review, holds the permission gate and the prior admission receipt; each clears a refused action's note and starts a new status generation.
+    /// What every Apply, Check and Restore does first: a `mutating` one retires the review,
+    /// holds the permission gate and forgets any pending Apply; each clears a refused action's
+    /// note and starts a new status generation.
     fn begin_system_state_action(&mut self, mutating: bool) {
         if mutating {
             if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState) {
@@ -991,7 +991,9 @@ impl App {
             // it and names the old one, which must not undo the choice when
             // it is shown again below.
             self.system_state_host.latest_status.plan = Some(pending.plan.clone());
-            self.accepted_initial_setup_apply();
+            if pending.release_permissions {
+                self.accepted_initial_setup_apply();
+            }
             if self.system_state_instance_has_view(pending.instance) {
                 self.native_runtime.accept_system_state_apply(pending.plan);
                 self.refresh_system_state_tab_indicators();

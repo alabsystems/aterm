@@ -44,10 +44,10 @@ fn lan(address: Ipv4Addr, mask: Ipv4Addr) -> LanInterface {
     }
 }
 
-/// THE LOCAL NETWORK TARGET: a private subnet's first host (its second when the
-/// first is this Mac), a link-local one only when no private subnet is up, and
-/// nothing on a subnet with no room for another host, a mask outside /8–/30, a
-/// tunnel (no broadcast: a VPN's `utun`) or a public address.
+/// The Local Network target: a private subnet's first host (its second when the first is this
+/// Mac), a link-local one only when no private subnet is up, and none on a subnet with no room
+/// for another host, a mask outside /8–/30, a tunnel (no broadcast: a VPN's `utun`) or a public
+/// address.
 #[test]
 fn the_lan_target_is_a_private_subnets_other_host() {
     let slash24 = ip(255, 255, 255, 0);
@@ -138,10 +138,9 @@ fn line(label: &str, note: Option<&str>) -> Option<SystemStateLine> {
     })
 }
 
-/// THE ONE QUIET SIGNAL (§3.6): only rows the approved plan manages that need a
-/// person or failed, each said as it is; one is named, several are counted; a
-/// regressed Full Disk Access grant counts once, as needing a person; the
-/// Secrets row's approval code rides along.
+/// The menu line says only rows the approved plan manages that need a person or failed: one is
+/// named, several are counted; a regressed Full Disk Access grant counts once, as needing a
+/// person; the Secrets row's approval code rides along.
 #[test]
 fn the_menu_line_names_what_needs_a_person() {
     let dock = Subject::Setting(Setting::Dock);
@@ -276,12 +275,10 @@ fn the_menu_line_names_what_needs_a_person() {
     );
 }
 
-/// A STEP THE LAST RUN COULD NOT FINISH IS A FAILURE ON THE MENU LINE (§3.6),
-/// as a failed row is, though no reading says so: a join the vault refused
-/// reads Not joined, and its stage's error is the vault failing. A step that
-/// names a row is that row, counted once with it; any other is a step of its
-/// own, counted and never named in the run's long words; one for a group
-/// left as is, or one that only waits or was blocked, is none.
+/// A step the last run could not finish is a failure on the menu line though no reading says so
+/// (a join the vault refused reads Not joined). A step that names a row is that row, counted once
+/// with it; any other is counted, never named; one for a group left as is, or one that only
+/// waits or was blocked, is none.
 #[test]
 fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -397,11 +394,9 @@ fn a_step_the_run_could_not_finish_is_on_the_menu_line() {
     }
 }
 
-/// A FAILURE THE RUN STILL RETRIES BY ITSELF IS THE PAGE'S ALONE (§3.5, §3.6):
-/// a stage's error, a pass that failed and a row that failed stay off the menu
-/// line while the worker retries them, and are said once it stops retrying. A
-/// row that needs a person, or a verified grant that reads off, is said at once,
-/// since no pass retries it.
+/// A failure the run still retries by itself (a stage's error, a failed pass or row) stays off
+/// the menu line until the worker stops retrying it; a row that needs a person, or a verified
+/// grant that reads off, is said at once, since no pass retries it.
 #[test]
 fn a_failure_the_run_still_retries_stays_off_the_menu_line() {
     let secrets = Subject::Setting(Setting::Secrets);
@@ -521,9 +516,9 @@ fn focus(app: &mut App, focused: bool) {
     }
 }
 
-/// THE LOCAL NETWORK STEP: nothing before an approved revision; then once per
-/// revision, first, recorded `triggered`, its alert counted as up for its hold
-/// (no later step meanwhile); a new revision asks again.
+/// The Local Network step: nothing before an approved revision; then once per revision, first,
+/// recorded `triggered`, its alert counted as up for its hold (no later step meanwhile); a new
+/// revision asks again.
 #[test]
 fn the_local_network_step_runs_first_and_once_per_approved_revision() {
     let mut app = App::headless_for_test();
@@ -1670,10 +1665,9 @@ fn new_mac(reach: crate::devtools_helper::Reach, fda: crate::devtools_helper::Fd
     app
 }
 
-/// THE STEP MOMENT THROUGH THE REAL TICK (§6): the window's own Full Disk Access
-/// page waits, queued, while System State is not the visible view, however many
-/// parks pass, and comes up at the first park it is; the folder warm-up after a
-/// Not now waits the same way.
+/// Through the real tick, the window's own Full Disk Access page waits queued while System State
+/// is not the visible view, however many parks pass, and comes up at the first park it is; the
+/// folder warm-up after a Not now waits the same way.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_windows_own_steps_wait_for_system_state_through_the_tick() {
@@ -1743,14 +1737,12 @@ fn the_windows_own_steps_wait_for_system_state_through_the_tick() {
     assert!(gate.is_open(), "back at System State, it walks on");
 }
 
-/// A CONTROL CLIENT'S ACT ON THE FULL DISK ACCESS ROW never mints the yes and
-/// passes nothing the window's own hand-over obeys: with no approved revision
-/// or a `[privacy]` switch off it does nothing; otherwise it is queued for the
-/// step moment as a System State act (never opened at once), held by the
-/// panel's Not now of this revision, the access
-/// card's Not now, an unstable build, the page within ten minutes and a grant;
-/// and once the page is up it writes the revision's marker but not the card's
-/// owner-acted record, so a regressed grant's menu line is never held dark.
+/// A control client's act on the Full Disk Access row never mints the yes: with no approved
+/// revision or a `[privacy]` switch off it does nothing; otherwise it is queued for the step
+/// moment as a System State act, refused by whatever holds the window's own page (the panel's or
+/// the card's Not now, an unstable build, the page within ten minutes, a grant) though a person's
+/// press passes each, and once up it writes no owner-acted record, so a regressed grant's menu
+/// line is never held dark.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_clients_act_on_full_disk_access_is_held_as_the_windows_own() {
@@ -1876,18 +1868,12 @@ fn a_queued_developer_tools_act_is_not_reported_opened() {
     assert_eq!(test_arms::opens(), before);
 }
 
-/// THE DEBUGGER'S OPT-OUT IS READ FROM THE RECORD AT EVERY LAUNCH (design §4):
-/// debugger access off by the person's choice — the observed record says it was
-/// allowed, or that aterm or something else turned it off — is the Debugger row's
-/// opt-out on a launch with no admission of the window's own and before any probe
-/// or step has run, so a row that reads off says the person turned it off, never
-/// Needs you or Not now. It is published as a while-off opt-out: the record says
-/// what an off reading means, not that the rule reads off now, so the worker
-/// says it of no other reading (`initial::access`'s
-/// `a_turned_off_debugger_is_said_only_of_an_off_reading`). CONTROLS: no record,
-/// or one that saw it off by nobody's hand (a new Mac's first reading), is no
-/// opt-out, and the other rows are untouched; a `[privacy]` switch off names that
-/// instead, on every row and whatever it reads.
+/// A debugger turned off by the person's choice, as the observed record says (it was allowed,
+/// or aterm or something else turned it off), is the Debugger row's opt-out at launch, before
+/// any admission, probe or step. It is a while-off opt-out: the record says what an off reading
+/// means, not that the rule reads off now (`initial::access`'s
+/// `a_turned_off_debugger_is_said_only_of_an_off_reading`). No record, or a new Mac's first
+/// reading, is no opt-out; a `[privacy]` switch off names itself on every row.
 #[test]
 fn a_debugger_turned_off_on_record_is_the_rows_opt_out_at_launch() {
     use super::{DEBUGGER_OFF, PRIVACY_OFF};
@@ -1976,12 +1962,10 @@ fn failed_triggers() -> u32 {
     FAILED_TRIGGERS.with(|t| *t.borrow())
 }
 
-/// THE LOCAL NETWORK RETRY NEVER SPINS THE LOOP: a trigger that found no LAN
-/// looks again a minute later, at the step's moment only. A retry that falls
-/// due while System State is away is moved on a minute — never left due, which
-/// would wake the event loop at once on every park — an unfocused window arms
-/// none, one of an earlier revision is dropped when another is approved, and
-/// while none is approved it is kept but arms nothing.
+/// The Local Network retry never spins the loop: a trigger that found no LAN looks again a
+/// minute later, at the step moment only. A retry due while System State is away is moved on a
+/// minute (left due, it would wake the loop on every park), an unfocused window arms none, a new
+/// approval drops an earlier revision's, and with none approved it is kept but arms nothing.
 #[test]
 fn a_failed_trigger_away_from_system_state_never_arms_a_deadline_due_now() {
     let retry = super::LOCAL_NETWORK_RETRY;
@@ -2073,13 +2057,9 @@ fn a_failed_trigger_away_from_system_state_never_arms_a_deadline_due_now() {
     );
 }
 
-/// A RETRY OUTLIVES A GAP IN THE APPROVAL (design §3.3: a change to another
-/// group keeps the access revision). The Local Network trigger finds no LAN
-/// under revision 7; the person then applies a change to another group, whose
-/// Apply holds the Permissions gate (no approved revision) until its fresh
-/// status names revision 7 again. The retry is kept through the gap and arms
-/// nothing during it; then it is armed again and looks for a LAN when due, so
-/// the run's Permissions stage is not left waiting on Local Network until a
+/// A Local Network retry outlives an Apply to another group, which holds the Permissions gate
+/// until its fresh status names the same access revision: kept and arming nothing through the
+/// gap, then armed again, so the Permissions stage does not wait on Local Network until a
 /// relaunch.
 #[test]
 fn a_retry_outlives_an_apply_that_keeps_the_access_revision() {
@@ -2123,14 +2103,11 @@ fn a_retry_outlives_an_apply_that_keeps_the_access_revision() {
     assert_eq!(app.next_access_step_deadline(due), Some(due + retry));
 }
 
-/// A CONTROL CLIENT'S ACT ON A SYSTEM STATE ROW is a step of the approved
-/// revision (§6): it is queued, never opened at once, and comes up only at the
-/// step moment — System State the visible view of the focused window and no
-/// other macOS dialog up — not at a control verb's quiet moment with a
-/// terminal tab in front. Developer Tools goes through the hand-over lane
-/// (`Origin::SystemStateAct`); Local Network and Accessibility wait for the
-/// same moment, their pane then counts as up for its hold, and an act still
-/// waiting after the lapse is dropped.
+/// A control client's act on a System State row is queued and comes up only at the step moment
+/// (System State the visible view of the focused window, no other macOS dialog up), never at a
+/// control verb's quiet moment with a terminal tab in front. Developer Tools goes through the
+/// hand-over lane (`Origin::SystemStateAct`); a Local Network or Accessibility pane then counts
+/// as up for its hold, and an act still waiting after the lapse is dropped.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_clients_act_on_a_row_waits_for_the_step_moment() {
@@ -2231,11 +2208,9 @@ fn a_clients_act_on_a_row_waits_for_the_step_moment() {
     );
 }
 
-/// A NEW APPROVAL ASKS AGAIN (§6: turning Permissions off and on again is a new
-/// approval; the row's Not now says so): the Full Disk Access panel's Not now,
-/// said under revision 1 and still inside its span, answers revision 1's step,
-/// which is recorded declined; under revision 2 the window's own page comes up
-/// at the step moment, and nothing records revision 2's step declined.
+/// A new approval asks again: the Full Disk Access panel's Not now answers revision 1's step
+/// (recorded `declined`), while under revision 2 the page comes up and nothing records it
+/// declined.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_not_now_of_an_earlier_revision_does_not_answer_a_new_approval() {
@@ -2273,13 +2248,11 @@ fn a_not_now_of_an_earlier_revision_does_not_answer_a_new_approval() {
     assert!(!records()[before..].contains(&(2, fda, AccessOutcome::Declined)));
 }
 
-/// THE ACCESS CARD'S NOT NOW (an older aterm's file-access question) IS SPENT ON
-/// THE FIRST APPROVED REVISION IT MEETS: recorded once as that revision's
-/// `declined` — the row reads as the person's choice, not as waiting on them —
-/// unless something is on record for the row in it already, and retired either
-/// way, so a later revision records nothing for it and asks again, as the row's
-/// Not now says. Without an approved revision, or with a `[privacy]` switch off,
-/// it is neither recorded nor spent.
+/// The access card's Not now (an older aterm's file-access question) is spent on the first
+/// approved revision it meets: recorded once as that revision's `declined` unless the row has
+/// something on record in it already, and retired either way, so a later revision asks again.
+/// Without an approved revision, or with a `[privacy]` switch off, it is neither recorded nor
+/// spent.
 #[test]
 fn the_access_cards_not_now_is_spent_on_the_first_revision_it_meets() {
     use crate::consent_card::Marker;
@@ -2353,13 +2326,10 @@ fn the_access_cards_not_now_is_spent_on_the_first_revision_it_meets() {
     assert_eq!(app.consent_card_host.marker, Some(Marker::NotNow));
 }
 
-/// THE ROW AND THE WINDOW AGREE ON THE ACCESS CARD'S NOT NOW (design §6): the
-/// row says "Setting Permissions up again asks again", and it does. Met under
-/// revision 1, the card's Not now is noted as revision 1's panel Not now and
-/// recorded as its `declined`, and the marker beside `aterm.toml` is removed. A
-/// later launch under revision 1 still brings nothing up; under revision 2
-/// (Permissions turned off and on again) nothing records the row declined and
-/// the window's own Full Disk Access page comes up at the step moment.
+/// The row and the window agree on the access card's Not now ("Setting Permissions up again
+/// asks again"): under revision 1 it is recorded `declined` and the marker beside `aterm.toml`
+/// is removed, and a later launch under revision 1 brings nothing up; under revision 2 nothing
+/// records the row declined and the window's own page comes up at the step moment.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_access_cards_not_now_holds_its_revision_and_a_new_one_asks_again() {
@@ -2431,13 +2401,10 @@ fn the_access_cards_not_now_holds_its_revision_and_a_new_one_asks_again() {
     assert!(app.fda_panel_up());
 }
 
-/// A NEW APPROVAL IN THIS PROCESS ASKS AGAIN (§6), with no relaunch: the
-/// window's own Full Disk Access page, held for the rest of revision 1 by its
-/// panel's Not now, comes back at the next step moment once Permissions is
-/// turned off and on again (revision 2); the same revision coming back after a
-/// gap with none approved brings nothing; a page brought up within ten minutes
-/// holds the next revision's until they are up, never refusing it; and a grant
-/// that reads on brings nothing.
+/// A new approval in this process brings the Full Disk Access page back with no relaunch: held
+/// for revision 1 by its Not now, it comes back for revision 2; the same revision after a gap
+/// brings nothing, a page within ten minutes delays the next revision's (a wait, not a
+/// refusal), and a grant that reads on brings nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_new_access_revision_in_this_process_brings_the_full_disk_access_page_back() {
@@ -2539,11 +2506,8 @@ fn a_new_access_revision_in_this_process_brings_the_full_disk_access_page_back()
     test_arms::forget_fda_declines();
 }
 
-/// A NEW APPROVAL IN THIS PROCESS ASKS AGAIN for Developer Tools too (§6): the
-/// watch asks once per process, so after revision 1's page and its Not now a
-/// `not_granted` reading asks nothing more; revision 2, approved with no
-/// relaunch, lets that latch go and brings the page back at the next step
-/// moment from the reading in hand.
+/// A new approval in this process asks again for Developer Tools too: the watch asks once per
+/// process, and revision 2 lets that latch go, bringing the page back at the next step moment.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_new_access_revision_in_this_process_brings_the_developer_tools_page_back() {
@@ -2613,11 +2577,9 @@ fn switches(off: Option<&str>) -> crate::app_config::PrivacyConfig {
     privacy
 }
 
-/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER, FOR LOCAL NETWORK: with
-/// one off when the revision's trigger would run, nothing is asked and nothing
-/// recorded, and on again the trigger runs for the same revision; with one off
-/// when a retry falls due, the retry is moved on (never left due) and, on again,
-/// looks for a LAN when it next falls due.
+/// A `[privacy]` switch off pauses the Local Network step, never answers it: the trigger runs for
+/// the same revision once the switch is on, and a retry that fell due meanwhile is moved on
+/// (never left due) and looks for a LAN when it next falls due.
 #[test]
 fn a_privacy_switch_off_pauses_the_local_network_step() {
     let retry = super::LOCAL_NETWORK_RETRY;
@@ -2679,10 +2641,9 @@ fn parks(app: &mut App, t: &mut Instant, n: u32) {
     }
 }
 
-/// A `[privacy]` SWITCH OFF IS A PAUSE, NEVER AN ANSWER, FOR THE WINDOW'S OWN FULL
-/// DISK ACCESS PAGE (design §4): queued by the launch check, it waits while a
-/// switch is off, still queued and with the folders waiting behind it, and comes
-/// up at the first step moment once every switch is on again.
+/// A `[privacy]` switch off pauses the window's own Full Disk Access page: queued by the launch
+/// check, it waits with the folders behind it and comes up at the first step moment once every
+/// switch is on again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_privacy_switch_off_pauses_the_full_disk_access_page() {
@@ -2721,8 +2682,8 @@ fn a_privacy_switch_off_pauses_the_full_disk_access_page() {
     }
 }
 
-/// The same for the window's own DEVELOPER TOOLS PAGE: queued, it waits while a
-/// switch is off and comes up once every switch is on again.
+/// A switch off pauses the window's queued Developer Tools page too: it comes up once every
+/// switch is on again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_privacy_switch_off_pauses_the_developer_tools_page() {
@@ -2763,9 +2724,8 @@ fn a_privacy_switch_off_pauses_the_developer_tools_page() {
     }
 }
 
-/// The same for A CONTROL CLIENT'S ACT ON THE ACCESSIBILITY ROW, queued for the
-/// step moment before the switch went off: no pane while it is off, and the pane
-/// once every switch is on again.
+/// A switch off holds a client's act on the Accessibility row queued before it went off: no pane
+/// while it is off, the pane once every switch is on again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_privacy_switch_off_pauses_a_clients_queued_act() {
@@ -2793,11 +2753,8 @@ fn a_privacy_switch_off_pauses_a_clients_queued_act() {
     }
 }
 
-/// A REVISION APPROVED WHILE A SWITCH IS OFF ASKS AGAIN ONCE IT IS ON (§6: a new
-/// approval asks again; a switch off is a pause, never an answer): revision 1's
-/// Full Disk Access page and its Not now; the person turns a `[privacy]` switch
-/// off and approves revision 2, which brings nothing up while the switch is off;
-/// with every switch on again revision 2's page comes up at the step moment.
+/// A revision approved while a switch is off brings nothing up until every switch is on again;
+/// then its Full Disk Access page comes up at the step moment.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_revision_approved_while_a_switch_is_off_asks_again_once_it_is_on() {
@@ -2839,9 +2796,8 @@ fn a_revision_approved_while_a_switch_is_off_asks_again_once_it_is_on() {
     test_arms::forget_fda_declines();
 }
 
-/// THE FOLDER PASS PARKS WHILE A SWITCH IS OFF: walking after a Full Disk Access
-/// Not now, it parks at the next folder once `enabled`, `check` or `notice` is
-/// turned off, or `warmup = "never"` is set, and walks on once they are back.
+/// Walking after a Full Disk Access Not now, the folder pass parks at the next folder once a
+/// switch is turned off or `warmup = "never"` is set, and walks on once they are back.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_privacy_switch_turned_off_mid_walk_parks_the_folders() {
@@ -2902,6 +2858,174 @@ fn a_privacy_switch_turned_off_mid_walk_parks_the_folders() {
         app.settle_access_steps(t);
         assert!(gate.is_open(), "{off} back: it walks on");
     }
+}
+
+#[cfg(target_os = "macos")]
+struct WithdrawingFolderProbe {
+    first: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    calls: std::sync::mpsc::Sender<String>,
+}
+
+#[cfg(target_os = "macos")]
+static WITHDRAWING_FOLDER_PROBE: std::sync::Mutex<Option<WithdrawingFolderProbe>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn withdrawing_folder_probe(path: &std::path::Path) -> crate::consent_warmup::ReadDirOutcome {
+    let (first, calls) = {
+        let mut probe = WITHDRAWING_FOLDER_PROBE.lock().unwrap();
+        let Some(probe) = probe.as_mut() else {
+            return crate::consent_warmup::ReadDirOutcome::Refused;
+        };
+        (probe.first.take(), probe.calls.clone())
+    };
+    let _ = calls.send(path.file_name().unwrap().to_string_lossy().into_owned());
+    if let Some((entered, release)) = first {
+        let _ = entered.send(());
+        let _ = release.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    }
+    crate::consent_warmup::ReadDirOutcome::Refused
+}
+
+#[cfg(target_os = "macos")]
+struct ReleaseWithdrawingFolder {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    gate: crate::consent_warmup::WarmupGate,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ReleaseWithdrawingFolder {
+    fn drop(&mut self) {
+        self.gate.set(true);
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        *WITHDRAWING_FOLDER_PROBE.lock().unwrap() = None;
+    }
+}
+
+/// A real worker is held in its first inert read. Revoking its admission
+/// retires the pass before another folder; a new approval starts a new pass.
+#[cfg(target_os = "macos")]
+fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
+    use crate::consent_launch::FdaLaunch;
+    use crate::consent_warmup::WarmupState;
+    use crate::devtools_helper::test_arms;
+    use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
+
+    let _serial = DIALOG_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entered_send, entered) = std::sync::mpsc::channel();
+    let (release, release_read) = std::sync::mpsc::channel();
+    let (calls_send, calls) = std::sync::mpsc::channel();
+    *WITHDRAWING_FOLDER_PROBE.lock().unwrap() = Some(WithdrawingFolderProbe {
+        first: Some((entered_send, release_read)),
+        calls: calls_send,
+    });
+    let mut app = new_mac(test_arms::opening(), test_arms::fda_opening());
+    app.config.privacy.as_mut().unwrap().warmup_folders =
+        Some(vec!["documents".into(), "downloads".into()]);
+    app.access_steps.set_reach(StepsReach {
+        holds_dialog: true,
+        ..stepping()
+    });
+    app.consent_warmup = WarmupState::with_read_dir_for_test(withdrawing_folder_probe);
+    app.consent_launch
+        .set_fda(FdaLaunch::Ended { owner_acted: false });
+    app.consent_launch
+        .note_launch_read(aterm_containment::consent::FdaState::Denied);
+    let now = Instant::now();
+    app.launch_warmup_look(now, |_, _| true);
+    entered.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert_eq!(
+        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+        "Documents"
+    );
+    let gate = app.access_steps.warmup_gate.clone().unwrap();
+    let mut cleanup = ReleaseWithdrawingFolder {
+        release: Some(release),
+        gate: gate.clone(),
+    };
+    assert!(gate.is_open());
+    assert!(macos_dialog_up(), "the first read retains the dialog slot");
+
+    withdraw(&mut app);
+    assert!(
+        !gate.is_open(),
+        "withdrawal closes the walking pass before dispatch returns"
+    );
+    app.settle_access_steps(now);
+    assert!(
+        !gate.is_open(),
+        "a revoked approval cannot reopen the old worker"
+    );
+    cleanup.release.take().unwrap().send(()).unwrap();
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while app.consent_warmup_live() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !app.consent_warmup.is_live(),
+        "the retired pass exits after its current read"
+    );
+    app.note_launch_warmup_progress();
+    app.settle_access_steps(now);
+    assert!(
+        calls.try_recv().is_err(),
+        "the revoked worker never probes Downloads"
+    );
+    assert!(
+        !macos_dialog_up(),
+        "the retired pass cannot strand the dialog slot"
+    );
+    let other_step = MacosDialog::when_none_up(Duration::ZERO).unwrap();
+    drop(other_step);
+
+    // A fresh admission can keep the access revision when another group was
+    // changed. It still gets a new worker and gate, never the retired worker.
+    app.accepted_initial_setup_apply();
+    approve(&mut app, 1);
+    app.settle_access_steps(now);
+    app.launch_warmup_look(now, |_, _| true);
+    assert_eq!(
+        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+        "Documents"
+    );
+    assert_eq!(
+        calls.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+        "Downloads"
+    );
+    let fresh_gate = app.access_steps.warmup_gate.clone().unwrap();
+    assert!(fresh_gate.is_open());
+    gate.set(true);
+    assert!(!gate.is_open(), "a retired worker's gate cannot be revived");
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while app.consent_warmup_live() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(!app.consent_warmup.is_live());
+    app.note_launch_warmup_progress();
+    app.settle_access_steps(now);
+    assert!(!macos_dialog_up());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_walking_folder_pass_retires_on_a_local_permission_hold() {
+    check_folder_permission_withdrawal(App::hold_initial_setup_permissions);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_walking_folder_pass_retires_on_a_revoked_permission_status() {
+    check_folder_permission_withdrawal(|app| {
+        app.observe_initial_setup_permissions(Some(InitialSetupPermissionPolicy {
+            revision: 1,
+            allowed: false,
+        }));
+        app.settle_access_steps(Instant::now());
+    });
 }
 
 /// THE MENU LINE STAYS DARK FOR A SPENT CARD'S NOT NOW THROUGH ITS REVISION (the
@@ -2986,11 +3110,10 @@ fn a_spent_card_not_now_keeps_the_menu_line_dark_in_its_own_revision() {
     test_arms::forget_fda_declines();
 }
 
-/// THE STATUS ITEM'S PRESS WITH NO WINDOW takes the new-window path, as Cmd-N
-/// does: with every window closed it asks for one (here, with no event loop, the
-/// ask is refused in its own message row, which is how a test sees the path),
-/// and answers `false` since nothing is up yet. A headless instance asks for
-/// none. CONTROL: with a window it shows System State in it at once, raised.
+/// The status item's press with no window asks for a new one, as Cmd-N does, and answers
+/// `false`; with no event loop the ask is refused in its own message row, which is how the test
+/// sees it. A headless instance asks for none; with a window (the control) System State shows
+/// in it at once, raised.
 #[test]
 fn the_status_item_with_no_window_asks_for_a_new_one() {
     let said_no_window = |app: &App| {
@@ -3017,9 +3140,9 @@ fn the_status_item_with_no_window_asks_for_a_new_one() {
     assert!(said_no_window(&app), "the ask's own refusal row");
 }
 
-/// THE NEW WINDOW THE STATUS ITEM ASKED FOR shows System State once its first
-/// shell lands, in that window, raised; a window that never came shows nothing.
-/// Unix only: the session it lands writes into `tab_spawn::tests`' libc pipe.
+/// The window the status item asked for shows System State, raised, once its first shell lands;
+/// a window that never came shows nothing. Unix only: the session writes into
+/// `tab_spawn::tests`' libc pipe.
 #[cfg(unix)]
 #[test]
 fn the_status_items_new_window_shows_system_state_once_it_lands() {
@@ -3069,23 +3192,18 @@ fn the_status_items_new_window_shows_system_state_once_it_lands() {
     assert!(!crate::app_tabs::take_raised_windows().contains(&wid));
 }
 
-/// The window's probe once a switch is on again: `enabled` or `check` off
-/// retires the cached Full Disk Access answer (a closed gate reads nothing),
-/// and the probe the next read dispatches answers `fda`, as its completion
-/// (`Wake::ConsentProbeReady`) would publish it.
+/// The window's probe once a switch is on again: `enabled` or `check` off retired the cached
+/// Full Disk Access answer, and the next read answers `fda`, as `Wake::ConsentProbeReady` would
+/// publish it.
 #[cfg(target_os = "macos")]
 fn reread(fda: aterm_containment::consent::FdaState) -> crate::consent_state::ConsentState {
     crate::consent_state::ConsentState::with_cached_probe_for_test(probe(fda))
 }
 
-/// A `[privacy]` SWITCH OFF AT LAUNCH HOLDS THE ACCESS CHECK, NEVER ANSWERS IT
-/// (design §4): with one off when aterm starts, the access card's launch check
-/// gives no verdict and nothing is queued, however many parks pass. Once every
-/// switch is on, the check runs again with the Full Disk Access hand-over
-/// undecided (the folders and the debugger step wait on it), and its verdict
-/// queues the window's own page for the step moment, as at launch; the
-/// access card's Not now still answers it. A check that gave its verdict is
-/// not run again for a switch turned off and on later.
+/// A `[privacy]` switch off at launch holds the access card's launch check with no verdict and
+/// nothing queued. Once every switch is on, the check runs again with the Full Disk Access
+/// hand-over undecided and its verdict queues the page for the step moment; the card's Not now
+/// still answers it, and a decided check does not run again for a later toggle.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_switch_off_at_launch_holds_the_access_check_until_it_is_on() {
@@ -3176,14 +3294,9 @@ fn a_switch_off_at_launch_holds_the_access_check_until_it_is_on() {
     }
 }
 
-/// A CHECK RUN AGAIN THAT GIVES NO VERDICT HOLDS NOTHING BACK: once every
-/// switch is on, the first park runs the access check again with the Full Disk
-/// Access hand-over undecided; when no verdict can come (here no worker can be
-/// started; a worker that never answers runs out of attempts the same way), the
-/// hand-over is not asked this process, so the debugger step and the folders
-/// that wait on it go on, even with the folder warm-up over already (with
-/// `warmup = "never"` and `notice` off it is settled before the switch comes
-/// on; with `enabled` or `check` off it waits).
+/// Once every switch is on, a re-run access check that can give no verdict (no worker starts
+/// here; one that never answers runs out of attempts the same way) leaves the Full Disk Access
+/// hand-over unasked, so the debugger step and the folders that wait on it go on.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_check_run_again_that_gives_no_verdict_holds_nothing_back() {
@@ -3223,10 +3336,8 @@ fn walking(off: Option<&str>) -> crate::app_config::PrivacyConfig {
     }
 }
 
-/// The same for THE FOLDER WARM-UP: with `enabled` or `check` off at launch it
-/// does not walk, and that is a pause, never an answer: it waits, never
-/// settled for the process, and walks at the first step moment once every
-/// switch is on again.
+/// A switch off at launch holds the folder warm-up too: `enabled` or `check` off leaves it
+/// unsettled, and it walks at the first step moment once every switch is on again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_switch_off_at_launch_holds_the_folder_warm_up_until_it_is_on() {
@@ -3253,11 +3364,9 @@ fn a_switch_off_at_launch_holds_the_folder_warm_up_until_it_is_on() {
     }
 }
 
-/// A FOLDER PASS WAITING FOR ITS MOMENT WAITS THROUGH A SWITCH (design §4; the
-/// round-3 checker's S1): after the Full Disk Access page's Not now the folders
-/// are next; a `[privacy]` switch turned off then asks for nothing, however
-/// many parks pass, and once every switch is on again the pass walks. `notice`
-/// off holds it at the step moment; `enabled` and `check` off hold it before.
+/// After the Full Disk Access page's Not now, a `[privacy]` switch turned off holds the waiting
+/// folder pass however many parks pass (`notice` at the step moment, `enabled` and `check`
+/// before it), and the pass walks once every switch is on again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_waiting_folder_pass_goes_on_after_a_switch() {
@@ -3284,12 +3393,10 @@ fn a_waiting_folder_pass_goes_on_after_a_switch() {
     }
 }
 
-/// A SWITCH OFF WHILE THE ACCESS CHECK'S WORKER READS (the round-3 checker's
-/// S2): the card settles for the switch, and the worker's verdict that lands
-/// once the switch is on again finds it settled; the check runs again at the
-/// first park, so the window's own Full Disk Access page comes once, and a new
-/// approval in this process brings it back. With every switch on throughout
-/// (`None`, the control) the worker's own verdict brings the page.
+/// A switch off while the access check's worker reads settles the card, so the late verdict
+/// finds it settled; the check runs again at the first park, the page comes once, and a new
+/// approval brings it back. With every switch on (`None`, the control) the worker's own verdict
+/// brings the page.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_switch_off_during_the_access_check_keeps_the_page() {
@@ -3339,9 +3446,8 @@ fn a_switch_off_during_the_access_check_keeps_the_page() {
     }
 }
 
-/// The same with THE FOLDER PASS ON (the round-3 checker's S2b): once the
-/// switch is on again the folders wait behind the check run again, and the
-/// Full Disk Access page comes first, never the folder dialogs instead.
+/// With the folder pass on, a switch off during the access check still brings the Full Disk
+/// Access page first once it is on again, the folders waiting behind the check run again.
 #[cfg(target_os = "macos")]
 #[test]
 fn after_a_switch_during_the_access_check_the_page_comes_before_the_folders() {
@@ -3378,11 +3484,10 @@ fn after_a_switch_during_the_access_check_the_page_comes_before_the_folders() {
     }
 }
 
-/// The same for THE DEVELOPER TOOLS LAUNCH READ: with `enabled` or `check` off
-/// at the first focus gain, nothing is read (a reading taken meanwhile only
-/// says the probe is off), and the read stays owed; the first park after every
-/// switch is on again forgets that reading, makes the launch read, and its
-/// `not_granted` brings the window's own page up at the step moment.
+/// A switch off at launch holds the Developer Tools launch read too: with `enabled` or `check`
+/// off at the first focus gain nothing is read and the read stays owed; once every switch is on,
+/// the first park forgets the off reading and reads, and `not_granted` brings the page up at the
+/// step moment.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_switch_off_at_launch_holds_the_developer_tools_read_until_it_is_on() {
@@ -3472,14 +3577,10 @@ fn a_switch_off_at_launch_holds_the_developer_tools_read_until_it_is_on() {
     }
 }
 
-/// A LAUNCH READ THAT LANDS WHILE A SWITCH IS OFF IS MADE AGAIN: the Developer
-/// Tools launch read goes out with every switch on, and `enabled` or `check`
-/// is turned off before its completion is handled, so the completion only says
-/// the probe is off. On again, that reading is forgotten and its read, spent on
-/// nothing, is owed again: the first park with a window focused reads once
-/// more, and `not_granted` asks for the page. Negative control: the
-/// `hold_read` in `App::resume_held_launch_steps` removed, nothing reads again
-/// in this process (the launch read is spent and nothing was held).
+/// A Developer Tools launch read whose completion lands after `enabled` or `check` went off is
+/// owed again: once every switch is on, the first park with a focused window reads once more and
+/// `not_granted` asks for the page. Without `hold_read` in `App::resume_held_launch_steps`,
+/// nothing reads again.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_launch_read_that_lands_while_a_switch_is_off_is_made_again() {
@@ -3557,10 +3658,8 @@ fn a_launch_read_that_lands_while_a_switch_is_off_is_made_again() {
     }
 }
 
-/// A SWITCH TOGGLED TWICE WHILE THE RE-RUN ACCESS CHECK IS OUT BRINGS THE PAGE
-/// ONCE: the check a switch held runs again, the switch goes off and on again
-/// with the first worker still out, a second worker starts, and both verdicts
-/// land: one Full Disk Access page, and nothing is left held.
+/// A switch toggled twice while the re-run access check is out starts a second worker; the two
+/// verdicts bring one Full Disk Access page, and nothing is left held.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_switch_toggled_twice_brings_the_page_once() {

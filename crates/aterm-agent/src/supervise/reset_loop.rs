@@ -567,7 +567,7 @@ impl<C: Ctl> Session<'_, C> {
                         if self.reset_not_ready(seq, &guard, deadline, opts, review)? {
                             Flow::Leave
                         } else {
-                            let what = aterm_phase::anchor("reset.checking");
+                            let what = aterm_phase::anchor!("reset.checking");
                             let why = KeepWhy::CheckTimeout;
                             self.reset_escape(&screen, &guard, why, what, opts, review)?
                         }

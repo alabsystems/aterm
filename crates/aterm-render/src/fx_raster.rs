@@ -13,7 +13,7 @@ use aterm_hash::FxHashSet;
 
 use crate::{add_sat, blend, glow_lerp, glow_lerp_rgb, over_premul};
 
-/// Row `r`'s pixel band in a frame of height `h` whose grid starts at `grid_top` with `cell_h`-tall rows: `grid_top + r·cell_h, grid_top + (r + 1)·cell_h)` clamped to `h`, with row 0 opened to the window top and the last row run to the frame bottom.
+/// Row `r`'s pixel band in a frame of height `h` whose grid starts at `grid_top` with `cell_h`-tall rows: `[grid_top + r·cell_h, grid_top + (r + 1)·cell_h)` clamped to `h`, with row 0 opened to the window top and the last row run to the frame bottom.
 #[inline]
 pub(crate) const fn band_px(
     r: usize,
@@ -149,19 +149,19 @@ pub struct FxSlice {
     pub y1: usize,
 }
 
-/// The internal canvas spelling retained for spill replay.
+/// [`FxSlice`], as the canvas and stamp code name it.
 pub(crate) type Slice = FxSlice;
 
 /// Where the stamps land: the frame's pixels ([`FramePx`]) or a spill strip's replay planes (`crate::spill`).
 pub(crate) trait FxCanvas {
     /// The window pixels this target holds; nothing outside is handed to it.
     fn bounds(&self) -> Slice;
-    /// The Exact flat paint `(c, a)` over row `y`, columns `x0, x1)` (`fill_flat`).
+    /// The Exact flat paint `(c, a)` over row `y`, columns `[x0, x1)` (`fill_flat`).
     fn flat(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8);
-    /// The Exact ramp over row `y`, columns `x0, x1)`: column `x0 + k` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1` (`fill_glow_span`).
+    /// The Exact ramp over row `y`, columns `[x0, x1)`: column `x0 + k` is ramp column `i0 + k` of a `qw`-wide ramp from `c0` to `c1` (`fill_glow_span`).
     #[allow(clippy::too_many_arguments)]
     fn ramp(&mut self, y: usize, x0: usize, x1: usize, i0: u32, qw: u32, c0: FxInk, c1: FxInk);
-    /// The Linear paint `(c, a)` over row `y`, columns `x0, x1)` (the FreeSprite `blend`; `a > 0`).
+    /// The Linear paint `(c, a)` over row `y`, columns `[x0, x1)` (the FreeSprite `blend`; `a > 0`).
     fn linear(&mut self, y: usize, x0: usize, x1: usize, c: u32, a: u8);
 }
 

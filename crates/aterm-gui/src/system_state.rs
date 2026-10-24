@@ -143,6 +143,24 @@ impl SetupStatus {
         )
     }
 
+    /// Failed results applicable to this review, whether or not the worker
+    /// still retries them. An unassigned result is about setup itself;
+    /// a named row counts only while this plan manages it.
+    fn result_failures<'a>(
+        &'a self,
+        plan: Option<&'a Plan>,
+    ) -> impl Iterator<Item = Option<Subject>> + 'a {
+        let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
+        self.results(plan)
+            .filter(|(row, _)| matches!(row.status.as_str(), "error" | "failed"))
+            .map(|(_, subject_name)| {
+                Subject::all()
+                    .into_iter()
+                    .find(|subject| subject.name() == subject_name)
+            })
+            .filter(move |row| row.is_none_or(|subject| manages(selection, subject)))
+    }
+
     /// The steps the last run could not finish (a stage error, a join the
     /// vault refused, a change that did not land), each with the row it
     /// names, if one: failures, which the menu line and the tab's attention
@@ -155,15 +173,7 @@ impl SetupStatus {
         plan: Option<&'a Plan>,
     ) -> impl Iterator<Item = Option<Subject>> + 'a {
         let signal = self.failures_signal();
-        let selection = plan.map_or_else(Selection::none, |plan| plan.selection);
-        self.results(plan)
-            .filter(move |(row, _)| signal && matches!(row.status.as_str(), "error" | "failed"))
-            .map(|(_, subject_name)| {
-                Subject::all()
-                    .into_iter()
-                    .find(|subject| subject.name() == subject_name)
-            })
-            .filter(move |row| row.is_none_or(|subject| manages(selection, subject)))
+        self.result_failures(plan).filter(move |_| signal)
     }
 
     /// The results the page shows under its headline: what an observation
@@ -646,13 +656,20 @@ impl Headline {
         match (status.busy, status.operation) {
             (true, None) => Self::line("Setting up this Mac…"),
             (true, Some(SetupOperation::Restore)) => Self::line("Restoring previous settings…"),
+            (false, _)
+                if status
+                    .result_failures(None)
+                    .any(|subject| subject.is_none()) =>
+            {
+                Self::line("Setup needs attention")
+            }
             _ => Self::line("Checking this Mac…"),
         }
     }
 }
 
 /// THE HEADLINE RULE (§3.2, pure).
-pub(crate) fn headline(status: &SetupStatus, rows: &[RowView]) -> Headline {
+pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Plan>) -> Headline {
     if status.access_step == Some(Access::Debugger) {
         return Headline::line(format!(
             "Enter your password for {}",
@@ -695,6 +712,12 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView]) -> Headline {
                 names.join(", ")
             ))
         };
+    }
+    if status
+        .result_failures(plan)
+        .any(|subject| subject.is_none())
+    {
+        return Headline::line("Setup needs attention");
     }
     if status.observed.is_empty() {
         return Headline::line("Checking this Mac…");
@@ -1277,12 +1300,16 @@ impl SystemStateApp {
     pub(crate) fn needs_attention(&self) -> bool {
         let signal = self.status.failures_signal();
         let reviewed = self.reviewed_plan();
-        self.plan_known
-            && (self
+        (self.plan_known
+            && self
                 .reviewed_rows()
                 .iter()
-                .any(|row| row.attention() && (signal || row.standing != Some(Standing::Failed)))
-                || self.status.failed_steps(Some(&reviewed)).next().is_some())
+                .any(|row| row.attention() && (signal || row.standing != Some(Standing::Failed))))
+            || self
+                .status
+                .failed_steps(self.plan_known.then_some(&reviewed))
+                .next()
+                .is_some()
     }
 
     /// Send the page's groups to the worker now (§3.3: a choice takes effect
@@ -1497,7 +1524,7 @@ impl SystemStateApp {
                 self.stopping = true;
                 self.actions.push_back(SystemStateAction::Stop);
             }
-            "system-state/check" if !self.status.busy => {
+            "system-state/check" if !self.status.busy && self.plan_known => {
                 let plan = self.reviewed_plan();
                 self.status.busy = true;
                 self.status.operation = Some(SetupOperation::Check);
@@ -1515,7 +1542,13 @@ impl SystemStateApp {
                 );
             }
             "system-state/headline/open" => {
-                if let Some(access) = headline(&self.status, &self.reviewed_rows()).open {
+                if let Some(access) = headline(
+                    &self.status,
+                    &self.reviewed_rows(),
+                    self.plan_known.then_some(&self.reviewed_plan()),
+                )
+                .open
+                {
                     self.actions.push_back(SystemStateAction::OpenAccess {
                         access,
                         by_person: self.by_person,
@@ -1523,7 +1556,13 @@ impl SystemStateApp {
                 }
             }
             "system-state/headline/show" => {
-                if let Some(subject) = headline(&self.status, &self.reviewed_rows()).show {
+                if let Some(subject) = headline(
+                    &self.status,
+                    &self.reviewed_rows(),
+                    self.plan_known.then_some(&self.reviewed_plan()),
+                )
+                .show
+                {
                     // The vault's fields sit under its row: Join, their last
                     // control, brings all of them into view.
                     let key = if subject == Subject::Setting(Setting::Secrets) && self.vault_shown()
@@ -1860,7 +1899,11 @@ impl<'a, 'b> Page<'a, 'b> {
     fn tree(mut self) -> UiTree {
         let (pad_x, pad_y, gap, row_h) = (self.m.pad_x, self.m.pad_y, self.m.gap, self.m.row_h);
         let headline = if self.app.plan_known {
-            headline(&self.app.status, &self.rows)
+            headline(
+                &self.app.status,
+                &self.rows,
+                Some(&self.app.reviewed_plan()),
+            )
         } else {
             Headline::before_plan(&self.app.status)
         };
@@ -2450,7 +2493,7 @@ impl<'a, 'b> Page<'a, 'b> {
             None,
             Some("Check"),
             StyleRef::Secondary,
-            !self.busy(),
+            !self.busy() && self.app.plan_known,
             room,
         );
         let mut restore = self.fitted_button(
@@ -3572,7 +3615,7 @@ impl<'a, 'b> Page<'a, 'b> {
                 "Join".to_owned(),
                 None,
                 StyleRef::Secondary,
-                enabled,
+                enabled && self.app.plan_known,
             ),
         ];
         let height = address_h + password_h + help_h + m.control_h * 3.0 + 4.0 * 5.0 + 10.0;
@@ -3690,7 +3733,7 @@ fn rule(key: String) -> UiNode {
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `debugger`,
 /// `needs-you`, `vault`, `set-up`, `non-alab`, `failed`, `check-failed`, `mixed`,
-/// `vault-source-mismatch` and `fresh`. Debug and dev-seam builds only: a release build carries none of
+/// `vault-source-mismatch`, `plan-unread` and `fresh`. Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
@@ -3737,6 +3780,15 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     };
     match name {
         "checking" => {}
+        "plan-unread" => {
+            status.plan = None;
+            status.observed_vault_url = None;
+            status.rows.push(SetupStatusRow {
+                name: "Setup".into(),
+                status: "failed".into(),
+                detail: "The saved setup plan could not be read.".into(),
+            });
+        }
         "vault-source-mismatch" => {
             status.plan.as_mut()?.vault_url = "http://reviewed-vault.local:7484/v1/team".into();
             let mut secrets = setting(Setting::Secrets, NeedsYou, Some("Awaiting code"));
@@ -3898,6 +3950,19 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 name: "Restore previous settings".to_owned(),
                 status: "restored".to_owned(),
                 detail: "Natural scrolling and Trackpad scrolling are as they were.".to_owned(),
+            }];
+        }
+        "restore-blocked" => {
+            // A completed Restore can leave an original unknown even while
+            // the current preference is in place for setup. Its operation
+            // result must remain visible, including for a group left as is.
+            status.plan = Some(Plan::from(Selection::none()));
+            status.finished = true;
+            status.observed = in_place();
+            status.rows = vec![SetupStatusRow {
+                name: "Restore: Widgets".into(),
+                status: "failed".into(),
+                detail: "The original value was not backed up; Widgets were left unchanged.".into(),
             }];
         }
         "fresh" => {

@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! System Settings hand-overs (`Privacy & Security` ▸ `Developer Tools` or `Full Disk Access`) and the helper panel beside them.
+//! System Settings hand-overs (`Privacy & Security` ▸ `Developer Tools` or `Full Disk Access`)
+//! and the helper panel beside them.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,10 +15,12 @@ use aterm_containment::consent::{
 use aterm_types::MutexExt as _;
 use aterm_types::macos_setup::Access;
 
-/// How long the owner's hands must have been off the keyboard and mouse before aterm puts System Settings in front of them: a pause, not a word being typed (the automatic update's 2.5 s gap is tuned for an apply landing mid-word, not for taking focus away).
+/// How long the owner's hands must have been off the keyboard and mouse before aterm puts System
+/// Settings in front of them: a pause, not a word being typed.
 pub(crate) const QUIET_FOR: Duration = Duration::from_secs(10);
 
-/// How recently the owner must have touched the keyboard or mouse to count as present: a page opened for nobody is a page found hours later with no idea why.
+/// How recently the owner must have touched the keyboard or mouse to count as present: a page
+/// opened while nobody is there is found hours later with no idea why.
 pub(crate) const PRESENT_WITHIN: Duration = Duration::from_secs(5 * 60);
 
 /// How often a waiting hand-over looks for its quiet moment while an aterm window is focused.
@@ -26,10 +29,15 @@ pub(crate) const RECHECK_EVERY: Duration = Duration::from_secs(5);
 /// How long a hand-over a control verb asked for waits for its quiet moment.
 pub(crate) const ASKED_LAPSE: Duration = Duration::from_secs(30 * 60);
 
-/// How long a process the owner started (not a successor an update brought in) waits before its first quiet moment: on a new Mac the owner sees System Settings seconds after aterm opens, once they pause ([`QUIET_FOR`]), rather than a minute and a half later.
+/// How long a process the owner started waits before its first quiet moment, so on a new Mac
+/// System Settings comes up at the owner's first pause; a successor an update brought in waits
+/// `consent_card::LAUNCH_SETTLE` instead.
 pub(crate) const COLD_START_SETTLE: Duration = Duration::from_secs(5);
 
-/// Whether now is a moment to put System Settings in front of the owner unasked: an aterm window is focused (they are looking at aterm, not at another app's work), the owner is present ([`PRESENT_WITHIN`]) but not typing or pointing ([`QUIET_FOR`]), this process has settled ([`Lane::settled`]: a successor an update just brought in is not "quiet" the second it starts), and no update hand-off is pending or in flight.
+/// Whether now is a moment to put System Settings in front of the owner unasked: an aterm window
+/// is focused, the owner is present ([`PRESENT_WITHIN`]) but not typing or pointing
+/// ([`QUIET_FOR`]), this process has settled ([`Lane::settled`]), and no update hand-off is
+/// pending or in flight.
 #[must_use]
 pub(crate) const fn quiet(
     focused: bool,
@@ -44,22 +52,22 @@ pub(crate) const fn quiet(
 /// Where a hand-over came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// The window's own, once per approved setup revision (`devtools_watch` for Developer Tools, the launch check, `App::note_launch_fda`, for Full Disk Access): a step of System State's run.
+    /// The window's own, once per approved setup revision (`devtools_watch` for Developer Tools,
+    /// the launch check, `App::note_launch_fda`, for Full Disk Access): a step of System State's
+    /// run.
     Automatic,
     /// A control client's act on System State's Full Disk Access or Developer Tools row
-    /// (`aterm ctl app act`, a key a client sends: `App::open_access_from_system_state`).
-    /// It never mints the yes, so it is a step of the approved revision as the window's
-    /// own is: judged at the step moment (`App::access_step_moment`: System State
-    /// frontmost, no macOS dialog up), never opened at once, and held by every refusal
-    /// the window's own obeys — a Not now only for its own revision — but once per
-    /// revision: it asks, and the ten-minute gap bounds how often. It lapses after
-    /// [`ASKED_LAPSE`] as a control verb's does.
+    /// (`App::open_access_from_system_state`). It never mints the yes, so it is a step of the
+    /// approved revision like the window's own: judged at the step moment, never opened at once,
+    /// held by a Not now under its revision, but not limited to once per revision (the ten-minute
+    /// gap bounds it). It lapses after [`ASKED_LAPSE`].
     SystemStateAct,
     /// The Settings ▸ Security card's button: the owner's press.
     Settings,
     /// The digest line's mover: the owner's press.
     Digest,
-    /// `aterm ctl devtools hand-over`: every in-session client can send it, so it is held to the window's own rules.
+    /// `aterm ctl devtools hand-over`: every in-session client can send it, so it is held to the
+    /// window's own rules.
     Ctl {
         /// Show the panel now instead of waiting for a quiet moment.
         now: bool,
@@ -72,7 +80,8 @@ impl Origin {
         matches!(self, Self::Settings | Self::Digest)
     }
 
-    /// How recently aterm may have opened the page with this origin still opening it again (`atpkg::devtools`' shared marker): never for an owner's press.
+    /// How long after aterm last opened the page (`atpkg::devtools`' shared marker) this origin
+    /// may open it again; `None` for an owner's press.
     pub(crate) const fn reopen_after_s(self) -> Option<u64> {
         match self {
             Self::Settings | Self::Digest => None,
@@ -116,7 +125,9 @@ pub(crate) enum Page {
     /// Privacy & Security ▸ Developer Tools.
     #[default]
     DeveloperTools,
-    /// Privacy & Security ▸ Full Disk Access (without it, aterm on a new Mac starts out asking for file access everywhere): the window's own hand-over at the first quiet moment of a launch that reads it off ([`admit_fda`]), and the panel beside the page the Security card's and the digest's *Open Settings* open.
+    /// Privacy & Security ▸ Full Disk Access: the window's own hand-over at the first quiet moment
+    /// of a launch that reads it off ([`admit_fda`]), and the panel beside the page the Security
+    /// card's and the digest's *Open Settings* open.
     FullDiskAccess,
 }
 
@@ -146,20 +157,12 @@ impl Page {
     }
 }
 
-/// WHETHER THE OWNER'S NOT NOW HOLDS a hand-over from `origin` back, for the page whose
-/// current key is `key` (`atpkg::devtools::revision_key`, or the running version with no
-/// approved revision): `last` is the newest decline whatever its age
-/// (`PageMarkers::last_declined`) and `held` whether one is inside its span
-/// (`PageMarkers::declined_until`). A step of System State's run — the window's own
-/// hand-over and a control client's act on its row ([`Origin::system_state_step`]) — is
-/// held back by a Not now under the approved revision for the rest of that revision
-/// (`atpkg::devtools::same_step`: a key written before the bundle id or this Mac was read
-/// is that revision's too) and by nothing else: a new access revision is a new
-/// Permissions approval (`docs/DESIGN-system-state-2026-10-21.md` §6: turning Permissions
-/// off and on again), which asks again, as the row's Not now says. The control verb
-/// (`aterm ctl devtools hand-over`), which no approval stands behind, is also held by any
-/// Not now for its span (30 days, 90 after a second), whatever revision or version it
-/// was said under. An owner's press is never asked. Pure.
+/// Whether the owner's Not now holds a hand-over from `origin` back, for the page whose current
+/// key is `key`: `last` is the newest decline (`PageMarkers::last_declined`) and `held` whether
+/// one is inside its span. A System State step ([`Origin::system_state_step`]) is held only by a
+/// Not now under its own revision (`atpkg::devtools::same_step`): a new revision is a new
+/// Permissions approval (`docs/DESIGN-system-state-2026-10-21.md` §6), which asks again. The
+/// control verb is also held by any Not now inside its span; an owner's press never. Pure.
 #[must_use]
 pub(crate) fn declined_for(
     origin: Origin,
@@ -175,7 +178,8 @@ pub(crate) fn declined_for(
     }
 }
 
-/// When [`admit`] is asked: as the request arrives, or at the quiet moment a waiting one was held for.
+/// When [`admit`] is asked: as the request arrives, or at the quiet moment a waiting one was held
+/// for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Moment {
     /// The request itself.
@@ -193,8 +197,8 @@ pub(crate) struct Facts {
     pub(crate) declined: bool,
     pub(crate) grant_stable: bool,
     pub(crate) recent: bool,
-    /// The window's own Full Disk Access probe reads the grant on: the window's own
-    /// hand-over waits for it, since without it the list cannot be read back.
+    /// The window's own Full Disk Access probe reads the grant on
+    /// ([`Refusal::NoFullDiskAccess`]).
     pub(crate) fda_on: bool,
 }
 
@@ -211,15 +215,18 @@ pub(crate) enum Refusal {
     Unstable,
     /// aterm opened the page moments ago.
     Recent,
-    /// aterm's row reads on while macOS still checks its new programs: the page holds nothing to add or switch on (`atpkg::devtools::Step::ListedOn`).
+    /// aterm's row reads on while macOS still checks its new programs: the page holds nothing to
+    /// add or switch on (`atpkg::devtools::Step::ListedOn`).
     Listed,
-    /// aterm already brought the page up for this approved revision, unasked ([`FdaFacts::shown_this_revision`]).
+    /// aterm already brought the page up for this approved revision, unasked
+    /// ([`FdaFacts::shown_this_revision`]).
     Shown,
     /// The window's own Developer Tools hand-over waits for Full Disk Access to read on:
     /// without it the list cannot be read back, so a switch flipped there could not be
     /// confirmed.
     NoFullDiskAccess,
-    /// Another app is responsible for this window ([`FdaFacts::own`]): the probe read that app's grant, which aterm's page cannot change.
+    /// Another app is responsible for this window ([`FdaFacts::own`]): the probe read that app's
+    /// grant, which aterm's page cannot change.
     NotOwn,
 }
 
@@ -251,14 +258,15 @@ pub(crate) enum Admit {
     PanelOnly,
     /// Open the page only: aterm is already on and switched on (an owner's press).
     PaneOnly,
-    /// Open the page and show the panel; on a list read whole and EMPTY, run `spctl developer-mode enable-terminal` first so the page exists.
+    /// Open the page and show the panel; on a list read whole and empty, run `spctl developer-mode
+    /// enable-terminal` first so the page exists.
     Hand {
         /// Run `spctl developer-mode enable-terminal` first.
         list_terminal: bool,
     },
 }
 
-/// WHO MAY BRING THE PAGE UP, AND WHEN. The window's own hand-over waits for Full Disk Access to read on.
+/// Who may bring the Developer Tools page up, and when.
 #[must_use]
 pub(crate) fn admit(origin: Origin, moment: Moment, facts: &Facts) -> Admit {
     let empty = facts.list.label == DevToolListLabel::Read && facts.list.rows == Some(0);
@@ -311,12 +319,15 @@ pub(crate) struct FdaFacts {
     pub(crate) grant_stable: bool,
     pub(crate) recent: bool,
     pub(crate) devtools_recent: bool,
-    /// aterm already brought this page up under the approved setup revision (`fda-pane-opened`'s key, `atpkg::devtools::same_step`).
+    /// aterm already brought this page up under the approved setup revision (`fda-pane-opened`'s
+    /// key, `atpkg::devtools::same_step`).
     pub(crate) shown_this_revision: bool,
     pub(crate) own: bool,
 }
 
-/// WHO MAY BRING THE FULL DISK ACCESS PAGE UP, AND WHEN. A control client's act on System State's row ([`Origin::SystemStateAct`]) is held as the window's own hand-over, but for once per revision, and is only ever queued.
+/// Who may bring the Full Disk Access page up, and when. A control client's act on System State's
+/// row ([`Origin::SystemStateAct`]) is held as the window's own hand-over except for the
+/// once-per-revision limit, and is queued, never opened at once.
 #[must_use]
 pub(crate) fn admit_fda(origin: Origin, moment: Moment, facts: &FdaFacts) -> Admit {
     if origin.owner_press() {
@@ -396,7 +407,9 @@ impl HandOver {
     }
 }
 
-/// The latest completed Developer Tools reading the lane judges by: the window's own reading (`ConsentState::devtools`), or the panel's one-shot list read joined with the tccd answers the window last read.
+/// The latest completed Developer Tools reading the lane judges by: the window's own
+/// (`ConsentState::devtools`), or the panel's one-shot list read joined with the tccd answers the
+/// window last read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reading {
     pub(crate) grant: DevToolGrant,
@@ -414,7 +427,8 @@ impl Reading {
         subject: None,
     };
 
-    /// This reading with a new list read: the verdict joined again with the same tccd answers, by the window's own rule (`consent::devtool_grant`).
+    /// This reading with a new list read, its verdict joined again with the same tccd answers
+    /// (`consent::devtool_grant`).
     #[must_use]
     pub(crate) fn with_list(self, list: DevToolList) -> Self {
         Self {
@@ -428,7 +442,8 @@ impl Reading {
 /// The tile's caption under aterm's icon.
 pub(crate) const TILE_CAPTION: &str = "aterm";
 
-/// The variant for a list aterm cannot read without Full Disk Access: the owner can see it, aterm cannot.
+/// The variant for a list aterm cannot read without Full Disk Access: the owner can see it, aterm
+/// cannot.
 pub(crate) const UNREAD_WORDS: &str = "aterm can't see this list without Full Disk Access. When \
                                        aterm's switch is on, press \"I've switched it on\".";
 
@@ -457,21 +472,23 @@ const fn lasting_unread(label: DevToolListLabel) -> bool {
     )
 }
 
-/// How many reads in a row that failed on their way the panel takes before it treats the failure as lasting: the UNREAD variant, and no more reads.
+/// How many reads in a row that failed on their way the panel takes before it treats the failure
+/// as lasting: the UNREAD variant, and no more reads.
 pub(crate) const READ_FAILURES_LASTING: u32 = 3;
 
-/// The drag ended with nothing taken (the list's drop is unmeasured: spike D15).
+/// The drag ended with nothing taken.
 pub(crate) const DROP_FAILED_WORDS: &str =
     "Didn't take? Press + below the Developer Tools list and choose aterm.";
 
-/// An accepted drop, and a whole read of the list [`DROP_CONFIRM_WITHIN`] or more later that still does not hold aterm: the panel cannot see which list System Settings shows, so it may have landed on another one — or on Finder, which takes a Copy of the bundle wherever it is let go.
+/// An accepted drop, and a whole read of the list [`DROP_CONFIRM_WITHIN`] or more later that
+/// still does not hold aterm.
 pub(crate) const DROP_UNCONFIRMED_WORDS: &str = "aterm did not reach Developer Tools. If it \
                                                  landed on another list in System Settings, \
                                                  switch it off there; if you let go over \
                                                  Finder, it made a copy of aterm there, which \
                                                  you can move to the Trash.";
 
-/// A drop something took, let go outside System Settings' window (a Finder window, the Desktop, another app): not the list, so the icon stays offered.
+/// A drop something took outside System Settings' window: not the list, so the icon stays offered.
 pub(crate) const DROP_OUTSIDE_WORDS: &str = "That landed outside System Settings. If Finder \
                                              made a copy of aterm there, you can move that \
                                              copy to the Trash.";
@@ -484,7 +501,8 @@ fn dropped_how() -> String {
     )
 }
 
-/// The footer link to aterm's own status screen, in atpkg's one spelling (`aterm doctor`'s banner prints it too).
+/// The footer link to aterm's own status screen, in atpkg's one spelling (`aterm doctor` prints
+/// it too).
 pub(crate) const STATUS_LINK: &str = atpkg::devtools::STATUS_LINK;
 
 fn show_list_failed_words(why: &str) -> String {
@@ -514,7 +532,8 @@ pub(crate) const FDA_PANEL_HOW: &str = "Drag aterm into the list (or press + bel
 pub(crate) const FDA_PANEL_HOW_PLUS: &str = "Press + below the list, choose aterm, enter your \
                                              password if macOS asks, and switch aterm on.";
 
-/// How, once the tile is spent: the switch, then the + route for a drop that landed elsewhere. aterm cannot read this list, so it never says where the drop went.
+/// How, once the tile is spent (aterm cannot read this list, so it never says where the drop
+/// went).
 pub(crate) const FDA_PANEL_DROPPED: &str = "Switch aterm on in the list. If aterm is not there, \
                                             press + below the list and choose aterm.";
 
@@ -547,7 +566,8 @@ pub(crate) fn checked_words(not_allowed: Option<u32>) -> Option<String> {
     }
 }
 
-/// Whole minutes from the opened marker's stamp `at` to `now` (unix seconds), for the Settings card.
+/// Whole minutes from the opened marker's stamp `at` to `now` (unix seconds), for the Settings
+/// card.
 #[must_use]
 pub(crate) const fn minutes_since(at: u64, now: u64) -> Option<u64> {
     if at > now.saturating_add(atpkg::devtools::STAMP_SKEW_S) {
@@ -580,7 +600,9 @@ pub(crate) enum Button {
     NotNow,
     /// The UNREAD variant's: the owner says aterm's switch is on.
     SwitchedOn,
-    /// Run `spctl developer-mode enable-terminal` so an empty list shows, then bring the page up again: the UNREAD variant's (aterm cannot see whether the list is empty), and a readable list's while it reads whole and empty with nothing listed by this panel yet (the hand-over's own run failed, or none ran).
+    /// Run `spctl developer-mode enable-terminal` so an empty list shows, then bring the page up
+    /// again: offered on the UNREAD variant (aterm cannot see whether the list is empty), and on a
+    /// readable list while it reads whole and empty with nothing listed by this panel yet.
     ShowList,
 }
 
@@ -594,7 +616,7 @@ impl Button {
         }
     }
 
-    /// Every button, in tag order: the live panel's buttons carry their index here as their `tag`, so one action reads which was pressed.
+    /// Every button, in tag order: a live panel button's `tag` is its index here.
     pub(crate) const ALL: [Self; 3] = [Self::NotNow, Self::SwitchedOn, Self::ShowList];
 
     /// The button's `tag` on the live panel.
@@ -647,7 +669,7 @@ pub(crate) struct Tile {
 pub(crate) const TILE_SPENT_HINT: &str = "Dropped.";
 
 impl Tile {
-    /// The hint beside the icon: the drag while it can be dragged ([`Self::step`]), then what happened.
+    /// The hint beside the icon: [`Self::step`] while it can be dragged, then what happened.
     pub(crate) const fn hint(&self) -> &'static str {
         if self.live {
             self.step
@@ -725,16 +747,19 @@ impl Content {
 /// How long the panel stays up at most: ten minutes.
 pub(crate) const PANEL_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// The panel lane's cadence while the panel is up: place it, check System Settings is still running, and (on a readable list) read it once.
+/// The panel lane's cadence while the panel is up: place it, check System Settings is still
+/// running, and (on a readable list) read it once.
 pub(crate) const PANEL_TICK: Duration = Duration::from_secs(2);
 
 /// How long the done words stay before the panel closes itself.
 pub(crate) const DONE_FOR: Duration = Duration::from_secs(4);
 
-/// How long after an accepted drop a readable list must read aterm on before the panel says it may have landed elsewhere.
+/// How long after an accepted drop a readable list must read aterm on before the panel says it
+/// may have landed elsewhere.
 pub(crate) const DROP_CONFIRM_WITHIN: Duration = Duration::from_secs(15);
 
-/// How long after a show System Settings may take to start before the lane takes its absence for the owner having quit it (`aterm doctor` opens the page after the window shows the panel).
+/// How long after a show System Settings may take to start before the lane takes its absence for
+/// the owner having quit it (`aterm doctor` opens the page after the window shows the panel).
 pub(crate) const SETTINGS_GRACE: Duration = Duration::from_secs(5);
 
 /// What the panel is showing.
@@ -746,7 +771,8 @@ pub(crate) enum Phase {
     DropFailed,
     /// Something outside System Settings' window took the owner's drop: the icon is still offered.
     DroppedOutside,
-    /// An accepted drop, and a readable list that did not read aterm on within [`DROP_CONFIRM_WITHIN`].
+    /// An accepted drop, and a readable list that did not read aterm on within
+    /// [`DROP_CONFIRM_WITHIN`].
     DroppedUnconfirmed,
     /// aterm's switch reads on: the done words, then the panel closes itself.
     Done,
@@ -772,7 +798,8 @@ pub(crate) enum PanelEvent {
         /// The drag ended with an operation (the destination took it).
         accepted: bool,
     },
-    /// The owner's drag ended taken by something outside System Settings' window ([`drop_landed`]): not the list, so the one drop is not spent.
+    /// The owner's drag ended taken by something outside System Settings' window
+    /// ([`drop_landed`]): not the list, so the one drop is not spent.
     DroppedOutside,
 }
 
@@ -835,7 +862,8 @@ pub(crate) struct Show {
     pub(crate) skips: bool,
 }
 
-/// THE PANEL'S STATE MACHINE: what it shows, and what each of the owner's presses, each reading and each turn of the lane asks.
+/// The panel's state machine: what it shows, and what each of the owner's presses, each reading
+/// and each turn of the lane asks.
 #[derive(Clone, Debug)]
 pub(crate) struct Panel {
     page: Page,
@@ -1142,7 +1170,8 @@ impl Panel {
         }
     }
 
-    /// The window's own reading completed while the panel is up: a grant is done; otherwise its tccd answers are the ones the panel's next list read is joined with (a newer answer can turn a row on into ListedOn, or a toggled row into a grant).
+    /// The window's own reading completed while the panel is up: a grant is done; otherwise the
+    /// panel's next list read joins with its tccd answers.
     pub(crate) fn note_reading(&mut self, reading: &Reading, now: Instant) -> Effect {
         if reading.grant == DevToolGrant::Granted {
             return self.granted(now);
@@ -1151,12 +1180,14 @@ impl Panel {
         Effect::default()
     }
 
-    /// Whether the panel was shown before any reading named the bundle id it reads the list for (an owner's press while the first reading was still out).
+    /// Whether the panel was shown before any reading named the bundle id it reads the list for
+    /// (an owner's press while the first reading was still out).
     pub(crate) const fn wants_subject(&self) -> bool {
         self.subject.is_none()
     }
 
-    /// A later reading named the bundle id: the panel's list reads start, and the icon to drag appears when the running copy is one aterm offers (`bundle`, [`drag_bundle`] for it).
+    /// A later reading named the bundle id: the panel's list reads start, and the icon to drag
+    /// appears when the running copy is one aterm offers (`bundle`, from [`drag_bundle`]).
     pub(crate) fn learn_subject(
         &mut self,
         subject: &'static str,
@@ -1222,7 +1253,8 @@ impl Panel {
         self.last_read.is_none()
     }
 
-    /// Whether the lane should read the list now: only a readable list, one read at a time, at most one per [`PANEL_TICK`] (sooner after a drop), never once done.
+    /// Whether the lane should read the list now: only a readable list, one read at a time, at
+    /// most one per [`PANEL_TICK`] (at once after a drop), never once done.
     pub(crate) fn wants_read(&self, now: Instant) -> bool {
         self.page == Page::DeveloperTools
             && self.unread.is_none()
@@ -1291,7 +1323,8 @@ impl Rect {
     }
 }
 
-/// How the live panel measures its words: AppKit's text system there, a fixed-width estimate in the tests.
+/// How the live panel measures its words: AppKit's text system there, a fixed-width estimate in
+/// the tests.
 pub(crate) trait Measure {
     fn text_height(&self, text: &str, tone: Tone, width: f64) -> f64;
     fn button_width(&self, title: &str) -> f64;
@@ -1324,7 +1357,9 @@ pub(crate) struct Layout {
     pub(crate) parts: Vec<(Part, Rect)>,
 }
 
-/// THE PANEL'S FRAMES, from its words: blocks stacked top to bottom at [`PANEL_W`], text wrapped, the tile's icon at the left with its caption, hint and path beside it, buttons right-aligned and wrapping onto a new row when they do not fit.
+/// The panel's frames, from its words: blocks stacked top to bottom at [`PANEL_W`], text wrapped,
+/// the tile's icon at the left with its caption, hint and path beside it, buttons right-aligned
+/// and wrapping onto a new row when they do not fit.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1421,7 +1456,8 @@ pub(crate) fn layout(content: &Content, measure: &dyn Measure) -> Layout {
     }
 }
 
-/// Whether the panel may come in front now: only while System Settings is the frontmost app, and not when it is in front already or its tile's drag runs.
+/// Whether the panel may come in front now: only while System Settings is the frontmost app, and
+/// not when it is in front already or its tile's drag runs.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1431,16 +1467,22 @@ pub(crate) const fn may_reveal(settings_front: bool, visible: bool, dragging: bo
     settings_front && !visible && !dragging
 }
 
-/// What the lane's placement turn does with a panel the owner has not moved and whose drag is not running ([`live`]'s `place_beside_settings`), from whether it is in front, whether System Settings is the active app, whether the panel has stood beside its window this show (`beside`), and that window as read now.
+/// What the lane's placement turn ([`live`]'s `place_beside_settings`) does with a panel the owner
+/// has not moved and whose drag is not running, from whether it is in front, whether System
+/// Settings is the active app, whether the panel has stood beside its window this show (`beside`),
+/// and that window as read now.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PlaceTurn {
     /// Leave it.
     Nothing,
-    /// Order it out: System Settings is still the active app but the window it stood beside left the screen (minimized), and a panel left up would jump to a screen corner and float over other apps' work.
+    /// Order it out: System Settings is still the active app but the window it stood beside left
+    /// the screen (minimized); a panel left up would jump to a screen corner over other apps' work.
     Hide,
-    /// Place it beside the window (`None`: the window was never found this show, the screen's corner, O27).
+    /// Place it beside the window (`None`: the window was never found this show, so the screen's
+    /// corner).
     Place(Option<Rect>),
-    /// Bring it back beside the window, which is on screen again (un-minimizing posts no activation, so only this turn sees it).
+    /// Bring it back beside the window, which is on screen again (un-minimizing posts no
+    /// activation, so only this turn sees it).
     Return(Rect),
 }
 
@@ -1464,7 +1506,9 @@ pub(crate) const fn place_turn(
     }
 }
 
-/// Whether a drop something took, let go at (`x`, `y`) in Cocoa screen space, landed on System Settings' window `settings` as the placement reads it — so on the list, as far as aterm can tell.
+/// Whether a drop something took, let go at (`x`, `y`) in Cocoa screen space, landed on System
+/// Settings' window `settings` as the placement reads it (true with no window read), so on the
+/// list as far as aterm can tell.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1487,7 +1531,8 @@ const PLACE_GAP: f64 = 12.0;
 /// System Settings' sidebar width.
 pub(crate) const SETTINGS_SIDEBAR_W: f64 = 220.0;
 
-/// Convert a Quartz window-list rectangle (origin top-left of the primary screen, y down) to Cocoa's screen space (origin bottom-left, y up).
+/// Convert a Quartz window-list rectangle (origin top-left of the primary screen, y down) to
+/// Cocoa's screen space (origin bottom-left, y up).
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1500,7 +1545,7 @@ pub(crate) fn cg_to_cocoa(cg: Rect, primary_h: f64) -> Rect {
     }
 }
 
-/// WHERE THE PANEL GOES, in Cocoa screen space.
+/// Where the panel goes, in Cocoa screen space.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1560,13 +1605,16 @@ pub(crate) fn place(panel_w: f64, panel_h: f64, settings: Option<Rect>, screens:
 pub(crate) enum Drift {
     /// It is where aterm left it (to within half a point).
     Still,
-    /// It moved on the same arrangement of screens: the owner moved it, and it stays where they put it.
+    /// It moved on the same arrangement of screens: the owner moved it, and it stays where they
+    /// put it.
     Owner,
-    /// It moved and the screens changed with it: macOS moved it off a display that went away or was rearranged, so aterm places it again.
+    /// It moved and the screens changed with it: macOS moved it off a display that went away or
+    /// was rearranged, so aterm places it again.
     Screens,
 }
 
-/// WHETHER THE OWNER MOVED THE PANEL: `placed` is where aterm left it, on screens whose frames were `placed_on`; `frame` and `screens` are now.
+/// Whether the owner moved the panel: `placed` is where aterm left it, on screens whose frames
+/// were `placed_on`; `frame` and `screens` are now.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1587,12 +1635,16 @@ pub(crate) fn drift(placed: Rect, placed_on: &[Rect], frame: Rect, screens: &[Re
     }
 }
 
-/// The smallest window counted as System Settings' main window, wide by [`SETTINGS_MIN_H`] high: its sheets, popovers and password window are smaller (the password window is 260 × 349 pt on 27.0).
+/// The smallest window counted as System Settings' main window, wide by [`SETTINGS_MIN_H`] high:
+/// its sheets, popovers and password window are smaller (the password window is 260 × 349 pt on
+/// 27.0).
 pub(crate) const SETTINGS_MIN_W: f64 = 320.0;
 /// See [`SETTINGS_MIN_W`].
 pub(crate) const SETTINGS_MIN_H: f64 = 240.0;
 
-/// One of System Settings' on-screen windows as the placement reads it: its layer, opacity and frame in Cocoa screen space — never its name, title or number, and kept no longer than the turn that read it (O27).
+/// One of System Settings' on-screen windows as the placement reads it: its layer, opacity and
+/// frame in Cocoa screen space, never its name, title or number, and kept no longer than the turn
+/// that read it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SettingsWindow {
     pub(crate) layer: isize,
@@ -1600,7 +1652,9 @@ pub(crate) struct SettingsWindow {
     pub(crate) bounds: Rect,
 }
 
-/// Which of `windows` is System Settings' main window, the one the panel stands beside: the largest on layer 0 with any opacity and at least [`SETTINGS_MIN_W`] × [`SETTINGS_MIN_H`], the first of equals.
+/// Which of `windows` is System Settings' main window, the one the panel stands beside: the
+/// largest on layer 0 with any opacity and at least [`SETTINGS_MIN_W`] × [`SETTINGS_MIN_H`], the
+/// first of equals.
 #[must_use]
 pub(crate) fn settings_main(windows: &[SettingsWindow]) -> Option<usize> {
     let area = |r: Rect| r.w * r.h;
@@ -1636,7 +1690,8 @@ fn secondary(windows: &[SettingsWindow], level: isize) -> impl Iterator<Item = &
         .map(|(_, window)| window)
 }
 
-/// Whether one of System Settings' secondary windows — its password window — lies under the panel at `panel`, floating at `level`: the panel orders out until it goes ([`cover_turn`]).
+/// Whether one of System Settings' secondary windows (its password window) lies under the panel
+/// at `panel`, floating at `level`: the panel orders out until it goes ([`cover_turn`]).
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1646,7 +1701,9 @@ pub(crate) fn under_panel(windows: &[SettingsWindow], panel: Rect, level: isize)
     secondary(windows, level).any(|window| window.bounds.overlap(panel) > 0.0)
 }
 
-/// Whether System Settings shows one of its secondary windows over its main window, wherever the panel stands: the owner may be typing their password, so the panel's list read waits and a drop is judged after it, never while it is typed (a drop judged at [`DROP_CONFIRM_WITHIN`] mid-password read as not landed).
+/// Whether System Settings shows one of its secondary windows over its main window, wherever the
+/// panel stands: the owner may be typing their password, so the panel's list read waits and a
+/// drop is judged after it (judged mid-password, it would read as not landed).
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1666,11 +1723,14 @@ pub(crate) enum Cover {
     Nothing,
     /// Order the panel out: one lies under it.
     Out,
-    /// Bring back the panel this ordered out: the window went, and System Settings is still the active app.
+    /// Bring back the panel this ordered out: the window went, and System Settings is still the
+    /// active app.
     Back,
 }
 
-/// [`Cover`] for one turn, from whether the panel is in front, whether a secondary window ordered it out (`yielded`), whether System Settings is the active app, and whether one lies under it now.
+/// [`Cover`] for one turn, from whether the panel is in front, whether a secondary window ordered
+/// it out (`yielded`), whether System Settings is the active app, and whether one lies under it
+/// now.
 #[must_use]
 #[cfg_attr(
     not(any(test, target_os = "macos")),
@@ -1689,7 +1749,9 @@ pub(crate) const fn cover_turn(
     }
 }
 
-/// The bundle the tile offers to drag: the running aterm's own bundle, when it is the INSTALLED copy (not a translocated or mounted image), it exists, and its bundle id is the one the list is read for.
+/// The bundle the tile offers to drag: the running aterm's own bundle, when it is the installed
+/// copy (not a translocated or mounted image), it exists, and its bundle id is the one the list is
+/// read for.
 #[must_use]
 pub(crate) fn drag_bundle(subject: Option<&str>) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -1721,7 +1783,9 @@ fn accepted_bundle(
     (installed && root_id.is_some() && root_id == subject).then_some(root)
 }
 
-/// What the hand-over does to the Mac and to its markers, injected like the consent probes (`consent_state::ConsentProbes`) and atpkg's own `Reach`: the window's instance gets [`Self::live`]; a headless instance and every unit test [`Self::inert`], which opens, runs, reads and writes nothing.
+/// What the hand-over does to the Mac and to its markers, injected like the consent probes
+/// (`consent_state::ConsentProbes`): the window's instance gets [`Self::live`]; a headless
+/// instance and every unit test get [`Self::inert`], which opens, runs, reads and writes nothing.
 #[derive(Clone, Copy)]
 pub(crate) struct Reach {
     pub(crate) open_pane: fn() -> bool,
@@ -1831,7 +1895,9 @@ const fn inert_no() -> bool {
     false
 }
 
-/// What the Full Disk Access hand-over does to the Mac and to its markers (`atpkg::devtools::FULL_DISK_ACCESS`), injected beside [`Reach`]: the window's instance gets [`Self::live`]; a headless instance and every unit test [`Self::inert`].
+/// What the Full Disk Access hand-over does to the Mac and to its markers
+/// (`atpkg::devtools::FULL_DISK_ACCESS`), injected beside [`Reach`]: the window's instance gets
+/// [`Self::live`]; a headless instance and every unit test get [`Self::inert`].
 #[derive(Clone, Copy)]
 pub(crate) struct FdaReach {
     pub(crate) open_pane: fn() -> bool,
@@ -1916,7 +1982,7 @@ const fn inert_drag_bundle(_subject: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-/// THE PANEL ITSELF, injected (`ConsentGestures`-style): main thread only.
+/// The panel itself, injected like `ConsentGestures`: main thread only.
 #[derive(Clone, Copy)]
 pub(crate) struct DevToolsHelperArm {
     pub(crate) show: fn(&Content, PanelEvents) -> bool,
@@ -1996,7 +2062,8 @@ struct Shared {
 /// The nudge a worker or a press sends (`Wake::DevToolsHandOver`).
 pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
 
-/// Where the live panel posts the owner's presses: the shared slot the park reads, and the nudge.
+/// Where the live panel posts the owner's presses: the shared slot the park reads, and the
+/// nudge.
 #[derive(Clone)]
 pub(crate) struct PanelEvents {
     panel: u64,
@@ -2040,7 +2107,8 @@ impl std::fmt::Debug for PanelEvents {
 /// What a `spctl developer-mode enable-terminal` run is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Listing {
-    /// A hand-over on a list read whole and empty: open the page and show the panel when it ends.
+    /// A hand-over on a list read whole and empty: open the page and show the panel when it
+    /// ends.
     HandOver(Origin),
     /// The panel's Show it: bring the page up again when it ends.
     ShowList,
@@ -2056,7 +2124,8 @@ impl Listing {
     }
 }
 
-/// Who waits on a `spctl` run besides its [`Listing`]: the owner's presses that were answered [`HandOver::Listing`] — told the page is on its way — and must hear how it came out, whichever ask's run they rode.
+/// Who waits on a `spctl` run besides its [`Listing`]: the owner's presses answered
+/// [`HandOver::Listing`], which must hear how it came out, whichever ask's run they rode.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Waiting {
     pub(crate) digest: bool,
@@ -2071,10 +2140,12 @@ struct Queued {
     listed: Option<Result<(), String>>,
 }
 
-/// A hand-over [`Lane::take_queued`] gives back at its quiet moment: who asked, and what the `spctl` run it already made answered, if one did.
+/// A hand-over [`Lane::take_queued`] gives back at its quiet moment: who asked, and what the
+/// `spctl` run it already made answered, if one did.
 pub(crate) type TakenHandOver = (Origin, Option<Result<(), String>>);
 
-/// How a Full Disk Access panel ended: why it closed, and whether the owner dropped aterm's icon first.
+/// How a Full Disk Access panel ended: why it closed, and whether the owner dropped aterm's icon
+/// first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FdaEnded {
     pub(crate) why: Closed,
@@ -2082,7 +2153,8 @@ pub(crate) struct FdaEnded {
 }
 
 impl FdaEnded {
-    /// Whether the owner acted on the page: anything but leaving the panel alone (Not now, or ten minutes with nothing dropped).
+    /// Whether the owner acted on the page: anything but leaving the panel alone (Not now, or
+    /// [`PANEL_FOR`] with nothing dropped).
     pub(crate) const fn owner_acted(self) -> bool {
         self.dropped || !matches!(self.why, Closed::NotNow | Closed::Lapsed)
     }
@@ -2123,7 +2195,8 @@ impl Default for Marks {
     }
 }
 
-/// THE `App`-OWNED HAND-OVER LANE: the hand-over waiting for its quiet moment, the `spctl` worker, the panel and its reads, and the latest reading.
+/// The `App`-owned hand-over lane: the hand-over waiting for its quiet moment, the `spctl` worker,
+/// the panel and its reads, and the latest reading.
 #[derive(Debug)]
 pub(crate) struct Lane {
     windowed: bool,
@@ -2239,7 +2312,8 @@ impl Lane {
         now.saturating_duration_since(self.born)
     }
 
-    /// This process was started by the owner, not brought in by an update: its first quiet moment may come [`COLD_START_SETTLE`] after it was made.
+    /// This process was started by the owner, not brought in by an update: its first quiet moment
+    /// may come [`COLD_START_SETTLE`] after it was made.
     pub(crate) const fn note_cold_start(&mut self) {
         self.settle = COLD_START_SETTLE;
     }
@@ -2264,10 +2338,9 @@ impl Lane {
         self.reading
     }
 
-    /// Forget a reading that only said the probe was switched off (`[privacy]
-    /// enabled` or `check`): it read nothing, so once every switch is on again
-    /// it decides nothing either, and the next completed reading takes its
-    /// place (`App::resume_held_launch_steps`). `true` when one was forgotten.
+    /// Forget a reading that only said the probe was switched off (`[privacy] enabled` or
+    /// `check`): it read nothing, so the next completed reading takes its place
+    /// (`App::resume_held_launch_steps`). `true` when one was forgotten.
     pub(crate) fn forget_switched_off_reading(&mut self) -> bool {
         let switched_off = self.reading.is_some_and(|reading| {
             reading.log.label == aterm_containment::consent::DevToolProbeLabel::RefusedDisabled
@@ -2278,7 +2351,9 @@ impl Lane {
         switched_off
     }
 
-    /// When aterm last opened the page for the owner (unix seconds, the shared marker any aterm writes, `aterm doctor` included), read at most once between focus gains: the Settings card's "last opened" line.
+    /// When aterm last opened the page for the owner (unix seconds, the shared marker any aterm
+    /// writes, `aterm doctor` included), read at most once between focus gains: the Settings
+    /// card's "last opened" line.
     pub(crate) fn last_opened_at(&mut self) -> Option<u64> {
         let reach = self.reach;
         *self
@@ -2286,24 +2361,30 @@ impl Lane {
             .get_or_insert_with(|| (reach.last_opened)().map(|(_, at)| at))
     }
 
-    /// This lane just wrote the marker at `at` (unix seconds; `None` when the clock could not be read, which reads the marker again).
+    /// This lane just wrote the marker at `at` (unix seconds; `None` when the clock could not be
+    /// read, which reads the marker again).
     pub(crate) fn noted_opened(&mut self, at: Option<u64>) {
         self.opened = at.map(Some);
     }
 
-    /// A focus gain: another process (`aterm doctor`) may have written the markers since, so the next [`Self::last_opened_at`] and [`Self::declined_marker`] read them again.
+    /// A focus gain: another process (`aterm doctor`) may have written the markers since, so the
+    /// next [`Self::last_opened_at`] and [`Self::declined_marker`] read them again.
     pub(crate) const fn forget_opened(&mut self) {
         self.opened = None;
         self.declined = None;
     }
 
-    /// The owner's Not now while it holds (when said, until when; unix seconds), read at most once between focus gains and this lane's own declines: the Settings card's line saying why aterm stays quiet.
+    /// The owner's Not now while it holds (when said, until when; unix seconds), read at most once
+    /// between focus gains and this lane's own declines: the Settings card's line saying why aterm
+    /// stays quiet.
     pub(crate) fn declined_marker(&mut self) -> Option<(u64, u64)> {
         let reach = self.reach;
         *self.declined.get_or_insert_with(|| (reach.declined)())
     }
 
-    /// A completed reading. aterm reading on ends a waiting hand-over and turns the panel to its done words; any other reading gives the panel its tccd answers, and — to a panel shown before any reading named the bundle id (an owner's press while the first reading was out) — the subject its list reads need and the icon to drag.
+    /// A completed reading. aterm reading on ends a waiting hand-over and turns the panel to its
+    /// done words; any other reading gives the panel its tccd answers and, to a panel shown before
+    /// any reading named the bundle id, the subject its list reads need and the icon to drag.
     pub(crate) fn note_reading(&mut self, reading: Reading, now: Instant) {
         self.reading = Some(reading);
         if reading.grant == DevToolGrant::Granted {
@@ -2353,7 +2434,9 @@ impl Lane {
         });
     }
 
-    /// The `spctl` run a hand-over the owner did not press made at its quiet moment ended at `now`, and the moment has passed (the owner is typing, or another app is in front): hold it for the next one, with what the run answered, so an Ok run is not made again and the panel still says Terminal is aterm's doing.
+    /// The `spctl` run a hand-over the owner did not press made at its quiet moment ended at `now`,
+    /// and the moment has passed: hold it for the next one with what the run answered, so an Ok
+    /// run is not made again and the panel still says Terminal is aterm's doing.
     pub(crate) fn queue_after_listing(
         &mut self,
         origin: Origin,
@@ -2380,7 +2463,8 @@ impl Lane {
         self.now_answered = Some(now);
     }
 
-    /// Whether the window answered a `now` within [`atpkg::devtools::REOPEN_NOW_AFTER_S`] before `now`: the next one is `recent` whether or not its asker opened the page.
+    /// Whether the window answered a `now` within [`atpkg::devtools::REOPEN_NOW_AFTER_S`] before
+    /// `now`: the next one is `recent` whether or not its asker opened the page.
     pub(crate) fn now_answered_within_its_minute(&self, now: Instant) -> bool {
         self.now_answered.is_some_and(|at| {
             now.saturating_duration_since(at)
@@ -2393,7 +2477,9 @@ impl Lane {
         self.queued = None;
     }
 
-    /// Whether a Full Disk Access hand-over or panel goes first: a Developer Tools one waits behind it (that list cannot be read without Full Disk Access, and one System Settings window shows one page).
+    /// Whether a Full Disk Access hand-over or panel goes first: a Developer Tools one waits behind
+    /// it (that list cannot be read without Full Disk Access, and one System Settings window shows
+    /// one page).
     pub(crate) fn fda_first(&self) -> bool {
         self.fda_queued.is_some()
             || self
@@ -2444,7 +2530,8 @@ impl Lane {
         self.fda_queued.is_some()
     }
 
-    /// The owner reached the Full Disk Access page another way, or the grant reads held: nothing waits any longer.
+    /// The owner reached the Full Disk Access page another way, or the grant reads held: nothing
+    /// waits any longer.
     pub(crate) fn drop_queued_fda(&mut self) {
         self.fda_queued = None;
     }
@@ -2456,7 +2543,8 @@ impl Lane {
             .is_some_and(|q| now >= q.next_check)
     }
 
-    /// The probe the waiting Full Disk Access hand-over judges by is being read again: look at `at`, not now (a look on a pending read would refuse it as unknown).
+    /// The probe the waiting Full Disk Access hand-over judges by is being read again: look at
+    /// `at`, not now (a look on a pending read would refuse it as unknown).
     pub(crate) const fn defer_fda(&mut self, at: Instant) {
         if let Some(queued) = self.fda_queued.as_mut() {
             queued.next_check = at;
@@ -2477,7 +2565,9 @@ impl Lane {
         self.queued.is_some() || self.listing.is_some()
     }
 
-    /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's Developer Tools panel is not taken away from them); otherwise it looks again [`RECHECK_EVERY`] later, or (a control client's act, after [`ASKED_LAPSE`]) lapses.
+    /// The waiting Full Disk Access hand-over, when `quiet` and no panel is up (an owner's
+    /// Developer Tools panel is not taken away from them); otherwise it looks again
+    /// [`RECHECK_EVERY`] later, or (a control client's act, after [`ASKED_LAPSE`]) lapses.
     pub(crate) fn take_queued_fda(&mut self, now: Instant, quiet: bool) -> Option<Origin> {
         let panel_up = self.panel.is_some();
         let queued = self.fda_queued.as_mut()?;
@@ -2501,7 +2591,8 @@ impl Lane {
         None
     }
 
-    /// The window's own Full Disk Access probe completed with `fda`: a grant ends a waiting hand-over and turns a Full Disk Access panel to its done words.
+    /// The window's own Full Disk Access probe completed with `fda`: a grant ends a waiting
+    /// hand-over and turns a Full Disk Access panel to its done words.
     pub(crate) fn note_fda(&mut self, fda: FdaState, now: Instant) {
         if fda != FdaState::Granted {
             return;
@@ -2522,7 +2613,8 @@ impl Lane {
         self.fda_ended.take()
     }
 
-    /// The waiting hand-over, when `quiet` (the caller judged [`quiet`] at `now`), with what its earlier `spctl` run answered; otherwise it looks again [`RECHECK_EVERY`] later, or lapses.
+    /// The waiting hand-over, when `quiet` (the caller judged [`quiet`] at `now`), with what its
+    /// earlier `spctl` run answered; otherwise it looks again [`RECHECK_EVERY`] later, or lapses.
     pub(crate) fn take_queued(&mut self, now: Instant, quiet: bool) -> Option<TakenHandOver> {
         let fda_first = self.fda_first();
         let queued = self.queued.as_mut()?;
@@ -2584,7 +2676,10 @@ impl Lane {
         }
     }
 
-    /// MAKE macOS ASK ABOUT ATERM AGAIN once the owner switched it on ([`Reach::refresh_verdict`], `atpkg::devtools::refresh_verdict`): syspolicyd keeps its verdict for this process, checked before the switch went on, until an aterm process it has not checked starts a new program (measured, design §7 D14).
+    /// Make macOS ask about aterm again once the owner switched it on ([`Reach::refresh_verdict`],
+    /// `atpkg::devtools::refresh_verdict`): syspolicyd keeps the verdict it reached for this
+    /// process before the switch went on until an aterm process it has not checked starts a new
+    /// program (measured).
     pub(crate) fn refresh_verdict(&mut self) -> bool {
         use std::sync::atomic::Ordering;
         if !self.windowed || self.refreshing.swap(true, Ordering::AcqRel) {
@@ -2627,7 +2722,8 @@ impl Lane {
         }
     }
 
-    /// The Settings card's press from `views` was answered [`HandOver::Listing`]: their bars hear the run's end.
+    /// The Settings card's press from `views` was answered [`HandOver::Listing`]: their bars hear
+    /// the run's end.
     pub(crate) fn wait_in_settings(
         &mut self,
         views: impl IntoIterator<Item = (crate::WindowId, crate::tab_model::ViewId)>,
@@ -2643,7 +2739,8 @@ impl Lane {
         self.listing
     }
 
-    /// A `spctl` run that ended: whose end it is, what it answered, and the owner's presses that waited on it.
+    /// A `spctl` run that ended: whose end it is, what it answered, and the owner's presses that
+    /// waited on it.
     pub(crate) fn take_listed(&mut self) -> Option<(Listing, Result<(), String>, Waiting)> {
         self.listing?;
         let listed = self.shared.lock_or_recover().listed.take()?;
@@ -2698,8 +2795,7 @@ impl Lane {
         true
     }
 
-    /// The keys a panel's Not now is noted under from now on, and the approved revision
-    /// it is recorded for ([`Marks`]).
+    /// Set the [`Marks`] a panel's Not now is noted under from now on.
     pub(crate) fn set_marks(&mut self, marks: Marks) {
         self.marks = marks;
     }
@@ -2755,7 +2851,11 @@ impl Lane {
         }
     }
 
-    /// THE PANEL'S TURN at the park: the owner's presses, a list read that ended, and — every [`PANEL_TICK`] — placement and System Settings still running; then the done words' time and the ten-minute bound; then, at that same cadence (or at once after a drop), one list read on a worker when the panel wants one, System Settings is frontmost and `read` names the gate (`None`: `[privacy] observer = false`, which reads nothing).
+    /// The panel's turn at the park: the owner's presses, a list read that ended, and, every
+    /// [`PANEL_TICK`], placement and System Settings still running; then the done words' time and
+    /// the ten-minute bound; then, at that cadence (or at once after a drop), one list read on a
+    /// worker when the panel wants one, System Settings is frontmost and `read` names the gate
+    /// (`None`: `[privacy] observer = false`, which reads nothing).
     pub(crate) fn tick_panel(
         &mut self,
         now: Instant,
@@ -2860,7 +2960,9 @@ impl Lane {
         }
     }
 
-    /// The park's deadline for this lane: the waiting hand-over's next look, only while `focused` says an aterm window is (a focus gain wakes the loop); the panel's next turn; and, while a worker is out, a re-read of its slot whatever its wake did.
+    /// The park's deadline for this lane: the waiting hand-over's next look, only while `focused`
+    /// says an aterm window is (a focus gain wakes the loop); the panel's next turn; and, while a
+    /// worker is out, a re-read of its slot whatever its wake did.
     pub(crate) fn next_deadline(
         &self,
         now: Instant,
@@ -2894,7 +2996,7 @@ impl Lane {
     }
 }
 
-/// THE PANEL ITSELF, on AppKit: the [`DevToolsHelperArm::live`] arm.
+/// The panel itself, on AppKit: the [`DevToolsHelperArm::live`] arm.
 #[cfg(target_os = "macos")]
 pub(crate) mod live {
     use std::borrow::Cow;
@@ -3030,7 +3132,8 @@ pub(crate) mod live {
 
             @sel(press:)
             fn press(&self, sender: Id) {
-                // SAFETY: `sender` is the live NSButton AppKit passes its action; `-tag` is `-(NSInteger)`.
+                // SAFETY: `sender` is the live NSButton AppKit passes its action; `-tag` is
+                // `-(NSInteger)`.
                 let tag = if sender.is_null() {
                     -1
                 } else {
@@ -3056,7 +3159,8 @@ pub(crate) mod live {
 
             @sel(workspaceDidActivate:)
             fn workspaceDidActivate(&self, note: Id) {
-                // SAFETY: `note` is the live NSNotification the workspace centre delivers, on the main thread.
+                // SAFETY: `note` is the live NSNotification the workspace centre delivers, on the
+                // main thread.
                 let front = unsafe { activated_settings(note) };
                 let _ = with_live(|live| {
                     live.settings_front = front;
@@ -3088,7 +3192,9 @@ pub(crate) mod live {
 
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
-                // SAFETY: inside AppKit's draw cycle on the main thread; `+windowBackgroundColor` is +0, `-set` is `-(void)`, `-bounds` `-(NSRect)` and `+fillRect:` `+(void)(NSRect)`.
+                // SAFETY: inside AppKit's draw cycle on the main thread; `+windowBackgroundColor`
+                // is +0, `-set` is `-(void)`, `-bounds` `-(NSRect)` and `+fillRect:`
+                // `+(void)(NSRect)`.
                 unsafe {
                     let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
                     let color =
@@ -3140,7 +3246,10 @@ pub(crate) mod live {
             @sel(drawRect:)
             fn drawRect(&self, _dirty: CGRect) {
                 let ivars = self.ivars();
-                // SAFETY: inside AppKit's draw cycle on the main thread; the icon is the live NSImage the ivars own; `-drawInRect:` is `-(void)(NSRect)`; the colour and path factories are +0 and non-raising, and `-set`, `-fill`, `-stroke` `-(void)`, `-setLineWidth:` `-(void)(CGFloat)`.
+                // SAFETY: inside AppKit's draw cycle on the main thread; the icon is the live
+                // NSImage the ivars own; `-drawInRect:` is `-(void)(NSRect)`; the colour and path
+                // factories are +0 and non-raising, and `-set`, `-fill`, `-stroke` `-(void)`,
+                // `-setLineWidth:` `-(void)(CGFloat)`.
                 unsafe {
                     let bounds = appkit::send_rect(self.as_id(), sel!(bounds));
                     if ivars.hover.get() && ivars.live.get() {
@@ -3212,7 +3321,8 @@ pub(crate) mod live {
                     return;
                 }
                 ivars.began.set(true);
-                // SAFETY: inside AppKit's `mouseDragged:` dispatch on the main thread, with the event that dispatch passed.
+                // SAFETY: inside AppKit's `mouseDragged:` dispatch on the main thread, with the
+                // event that dispatch passed.
                 if unsafe { begin_drag(self, event) } {
                     let tile = self.as_id();
                     let _ = with_live(|live| {
@@ -3314,7 +3424,8 @@ pub(crate) mod live {
             let Some(built) = build(mtm, content, events.clone()) else {
                 return false;
             };
-            // SAFETY: main thread; the target is the live object the observer registration names, kept by `Live` until `close` removes it.
+            // SAFETY: main thread; the target is the live object the observer registration names,
+            // kept by `Live` until `close` removes it.
             if !unsafe { observe_activation(built.target.as_id()) } {
                 aterm_log::warn!(
                     "devtools: the helper panel cannot watch which app is in front; not shown"
@@ -3355,7 +3466,8 @@ pub(crate) mod live {
                 Err(_) => Some(live),
             });
             if let Some(live) = refused {
-                // SAFETY: main thread; `live` still holds the target, released only after the centre lets it go.
+                // SAFETY: main thread; `live` still holds the target, released only after the
+                // centre lets it go.
                 unsafe { stop_observing(live.target.as_id()) };
                 return false;
             }
@@ -3520,7 +3632,8 @@ pub(crate) mod live {
             return;
         }
         if settings.is_none() && now.saturating_duration_since(since) < REVEAL_WAIT {
-            // SAFETY: main thread; the target lives as long as the panel, and `close` cancels what this schedules.
+            // SAFETY: main thread; the target lives as long as the panel, and `close` cancels what
+            // this schedules.
             unsafe { reveal_soon(live.target.as_id()) };
             return;
         }
@@ -3541,7 +3654,8 @@ pub(crate) mod live {
     /// Main thread.
     unsafe fn frame_and_level(live: &Live) -> (Rect, isize) {
         let panel = live.panel.id();
-        // SAFETY: main thread; `-frame` is `-(NSRect)` and `-level` `-(NSInteger)` on the live panel.
+        // SAFETY: main thread; `-frame` is `-(NSRect)` and `-level` `-(NSInteger)` on the live
+        // panel.
         unsafe {
             (
                 from_cg(appkit::send_rect(panel, sel!(frame))),
@@ -3578,7 +3692,8 @@ pub(crate) mod live {
         let Some(placed) = live.placed else {
             return;
         };
-        // SAFETY: main thread (`Live` lives on it); `-frame` is `-(NSRect)` on the live panel, and the screen queries are read-only.
+        // SAFETY: main thread (`Live` lives on it); `-frame` is `-(NSRect)` on the live panel, and
+        // the screen queries are read-only.
         let (frame, screens) =
             unsafe { (appkit::send_rect(live.panel.id(), sel!(frame)), screens()) };
         match drift(
@@ -3626,7 +3741,8 @@ pub(crate) mod live {
             return;
         }
         let panel = live.panel.id();
-        // SAFETY: main thread; `-frame` is `-(NSRect)` and `-setFrame:display:` `-(void)(NSRect, BOOL)` on the live panel.
+        // SAFETY: main thread; `-frame` is `-(NSRect)` and `-setFrame:display:`
+        // `-(void)(NSRect, BOOL)` on the live panel.
         unsafe {
             let frame = appkit::send_rect(panel, sel!(frame));
             let to = place(
@@ -3657,7 +3773,8 @@ pub(crate) mod live {
         let mut visible = Vec::new();
         let mut frames = Vec::new();
         let mut primary_h = 0.0;
-        // SAFETY: `+screens` is `+(NSArray *)`, +0; `-count`/`-objectAtIndex:` read it; `-visibleFrame` and `-frame` are `-(NSRect)` on each screen.
+        // SAFETY: `+screens` is `+(NSArray *)`, +0; `-count`/`-objectAtIndex:` read it;
+        // `-visibleFrame` and `-frame` are `-(NSRect)` on each screen.
         unsafe {
             let all = appkit::send_id(class(c"NSScreen").as_id(), sel!(screens));
             if !all.is_null() {
@@ -3686,7 +3803,9 @@ pub(crate) mod live {
     /// Any thread; read-only NSRunningApplication queries.
     unsafe fn settings_pid() -> Option<i32> {
         let id = appkit::nsstring(SETTINGS_ID)?;
-        // SAFETY: `+runningApplicationsWithBundleIdentifier:` is `+(NSArray *) (NSString *)`, +0; `-activationPolicy` is `-(NSInteger)` and `-processIdentifier` `-(pid_t)` on each element.
+        // SAFETY: `+runningApplicationsWithBundleIdentifier:` is `+(NSArray *)(NSString *)`, +0;
+        // `-activationPolicy` is `-(NSInteger)` and `-processIdentifier` `-(pid_t)` on each
+        // element.
         unsafe {
             let apps = appkit::send_id_id(
                 class(c"NSRunningApplication").as_id(),
@@ -3729,7 +3848,11 @@ pub(crate) mod live {
         else {
             return Vec::new();
         };
-        // SAFETY: `CGWindowListCopyWindowInfo` returns a +1 CFArray (the Copy rule), adopted here and released once; toll-free bridging makes it an NSArray of NSDictionaries, read with `-count`, `-objectAtIndex:` and `-objectForKey:` (+0 each), the numbers with `-integerValue`/ `-doubleValue`, and the bounds dictionary turned back into a CGRect by its own CoreGraphics reader into a local.
+        // SAFETY: `CGWindowListCopyWindowInfo` returns a +1 CFArray (the Copy rule), adopted here
+        // and released once; toll-free bridging makes it an NSArray of NSDictionaries, read with
+        // `-count`, `-objectAtIndex:` and `-objectForKey:` (+0 each), the numbers with
+        // `-integerValue`/`-doubleValue`, and the bounds dictionary turned back into a CGRect by
+        // its own CoreGraphics reader into a local.
         unsafe {
             let Some(list) = Obj::from_owned(CGWindowListCopyWindowInfo(
                 consts::CG_WINDOW_LIST_ON_SCREEN_NON_DESKTOP,
@@ -3805,7 +3928,8 @@ pub(crate) mod live {
         if note.is_null() {
             return false;
         }
-        // SAFETY: `-userInfo` is `-(NSDictionary *)`, +0 or nil; `-objectForKey:` `-(id)(id)`, +0 or nil — an NSRunningApplication under this key.
+        // SAFETY: `-userInfo` is `-(NSDictionary *)`, +0 or nil; `-objectForKey:` `-(id)(id)`, +0
+        // or nil — an NSRunningApplication under this key.
         unsafe {
             let info = appkit::send_id(note, sel!(userInfo));
             !info.is_null() && is_settings(appkit::send_id_id(info, sel!(objectForKey:), key.id()))
@@ -3831,7 +3955,8 @@ pub(crate) mod live {
         let Some(name) = appkit::nsstring(WORKSPACE_NAMES[0]) else {
             return false;
         };
-        // SAFETY: `-addObserver:selector:name:object:` is `-(void)(id, SEL, id, id)`; the selector is one the target declares; nil object means "from any sender".
+        // SAFETY: `-addObserver:selector:name:object:` is `-(void)(id, SEL, id, id)`; the selector
+        // is one the target declares; nil object means "from any sender".
         unsafe {
             let center = workspace_center();
             if center.is_null() {
@@ -3864,7 +3989,8 @@ pub(crate) mod live {
     /// # Safety
     /// Main thread; `target` is a live [`HelperTarget`].
     unsafe fn reveal_soon(target: Id) {
-        // SAFETY: `-performSelector:withObject:afterDelay:` is `-(void)(SEL, id, NSTimeInterval)`; the run loop retains the target until it fires, and `hide` and `close` cancel it.
+        // SAFETY: `-performSelector:withObject:afterDelay:` is `-(void)(SEL, id, NSTimeInterval)`;
+        // the run loop retains the target until it fires, and `hide` and `close` cancel it.
         unsafe {
             cancel_reveal_soon(target);
             appkit::send_v_sel_id_f64(
@@ -3880,7 +4006,8 @@ pub(crate) mod live {
     /// # Safety
     /// Main thread; `target` is a live [`HelperTarget`].
     unsafe fn cancel_reveal_soon(target: Id) {
-        // SAFETY: `+cancelPreviousPerformRequestsWithTarget:` is `+(void)(id)`; a target with nothing scheduled is a no-op.
+        // SAFETY: `+cancelPreviousPerformRequestsWithTarget:` is `+(void)(id)`; a target with
+        // nothing scheduled is a no-op.
         unsafe {
             appkit::send_v_id(
                 class(c"NSObject").as_id(),
@@ -3893,7 +4020,8 @@ pub(crate) mod live {
     /// # Safety
     /// Main thread.
     unsafe fn activate_aterm() {
-        // SAFETY: `+currentApplication` is `+(NSRunningApplication *)`, +0; `-activateWithOptions:` is `-(BOOL)(NSApplicationActivationOptions)`.
+        // SAFETY: `+currentApplication` is `+(NSRunningApplication *)`, +0; `-activateWithOptions:`
+        // is `-(BOOL)(NSApplicationActivationOptions)`.
         unsafe {
             let me = appkit::send_id(
                 class(c"NSRunningApplication").as_id(),
@@ -3921,7 +4049,9 @@ pub(crate) mod live {
             note_owner_move(live);
             live.dragging = true;
             let panel = live.panel.id();
-            // SAFETY: main thread; `-frame` is `-(NSRect)`, the window and screen queries are read-only; `-setIgnoresMouseEvents:` `-(void)(BOOL)`, `-setAlphaValue:` `-(void)(CGFloat)`, `-orderBack:` `-(void)(id)`.
+            // SAFETY: main thread; `-frame` is `-(NSRect)`, the window and screen queries are
+            // read-only; `-setIgnoresMouseEvents:` `-(void)(BOOL)`, `-setAlphaValue:`
+            // `-(void)(CGFloat)`, `-orderBack:` `-(void)(id)`.
             unsafe {
                 let frame = from_cg(appkit::send_rect(panel, sel!(frame)));
                 let on_settings =
@@ -3964,7 +4094,8 @@ pub(crate) mod live {
     /// # Safety
     /// Main thread; `tile` is the live tile view.
     unsafe fn dropped_in_settings(tile: Id, at: CGPoint) -> bool {
-        // SAFETY: main thread; read-only window and screen queries, and `-bounds` is `-(NSRect)` on the live tile.
+        // SAFETY: main thread; read-only window and screen queries, and `-bounds` is `-(NSRect)` on
+        // the live tile.
         let (settings, image) = unsafe {
             let screens = screens();
             (
@@ -3981,7 +4112,8 @@ pub(crate) mod live {
         if event.is_null() {
             return CGPoint::default();
         }
-        // SAFETY: `-locationInWindow` is `-(NSPoint)`; `-convertPoint:fromView:` `-(NSPoint)(NSPoint, NSView *)`, nil meaning window coordinates.
+        // SAFETY: `-locationInWindow` is `-(NSPoint)`; `-convertPoint:fromView:`
+        // `-(NSPoint)(NSPoint, NSView *)`, nil meaning window coordinates.
         unsafe {
             let at = appkit::send_point(event, sel!(locationInWindow));
             appkit::send_point_point_id(view, sel!(convertPoint:fromView:), at, Id::NIL)
@@ -3994,7 +4126,9 @@ pub(crate) mod live {
         let path = appkit::nsstring(bundle.to_str()?)?;
         let [file_url, url, text] = [TYPE_FILE_URL, TYPE_URL, TYPE_TEXT].map(appkit::nsstring);
         let (file_url, url, text) = (file_url?, url?, text?);
-        // SAFETY: `+fileURLWithPath:isDirectory:` is `+(NSURL *)(NSString *, BOOL)`, +0; `-absoluteString`/`-path` `-(NSString *)`, +0; `+[NSPasteboardItem new]` +1, adopted; `-setString:forType:` is `-(BOOL)(NSString *, NSPasteboardType)`.
+        // SAFETY: `+fileURLWithPath:isDirectory:` is `+(NSURL *)(NSString *, BOOL)`, +0;
+        // `-absoluteString`/`-path` `-(NSString *)`, +0; `+[NSPasteboardItem new]` +1, adopted;
+        // `-setString:forType:` is `-(BOOL)(NSString *, NSPasteboardType)`.
         unsafe {
             let ns_url = appkit::send_id_id_bool(
                 class(c"NSURL").as_id(),
@@ -4026,7 +4160,12 @@ pub(crate) mod live {
     /// Main thread, inside AppKit's `mouseDragged:` dispatch with its event.
     unsafe fn begin_drag(tile: &TileView, event: Id) -> bool {
         let ivars = tile.ivars();
-        // SAFETY: the payload as `pasteboard_item` says; `+alloc` and `-initWithPasteboardWriter:` (`-(id)(id<NSPasteboardWriting>)`) give a +1 NSDraggingItem, adopted; `-setDraggingFrame:contents:` is `-(void)(NSRect, id)`; `+arrayWithObject:` +0; and `-beginDraggingSessionWithItems:event:source:` is `-(NSDraggingSession *)(NSArray *, NSEvent *, id<NSDraggingSource>)`, +0 — the session runs in the event loop and returns at once (no nested tracking loop).
+        // SAFETY: the payload as `pasteboard_item` says; `+alloc` and `-initWithPasteboardWriter:`
+        // (`-(id)(id<NSPasteboardWriting>)`) give a +1 NSDraggingItem, adopted;
+        // `-setDraggingFrame:contents:` is `-(void)(NSRect, id)`; `+arrayWithObject:` +0; and
+        // `-beginDraggingSessionWithItems:event:source:` is
+        // `-(NSDraggingSession *)(NSArray *, NSEvent *, id<NSDraggingSource>)`, +0 — the session
+        // runs in the event loop and returns at once (no nested tracking loop).
         unsafe {
             let Some(writer) = pasteboard_item(&ivars.bundle) else {
                 aterm_log::warn!("devtools: the tile's drag has no payload for its bundle");
@@ -4127,7 +4266,11 @@ pub(crate) mod live {
     /// use of it (`close` clears it first).
     unsafe fn new_panel(delegate: Id) -> Option<Obj> {
         let title = appkit::nsstring(TITLE)?;
-        // SAFETY: `+alloc` then the designated initializer `-initWithContentRect:styleMask:backing:defer:` (`-(id)(NSRect, NSUInteger, NSUInteger, BOOL)`), which consumes the +1 and returns +1; every setter after it is `-(void)(BOOL)`, `-(void)(NSInteger)`, `-(void)(NSUInteger)` or `-(void)(id)` on the fresh panel.
+        // SAFETY: `+alloc` then the designated initializer
+        // `-initWithContentRect:styleMask:backing:defer:`
+        // (`-(id)(NSRect, NSUInteger, NSUInteger, BOOL)`), which consumes the +1 and returns +1;
+        // every setter after it is `-(void)(BOOL)`, `-(void)(NSInteger)`, `-(void)(NSUInteger)` or
+        // `-(void)(id)` on the fresh panel.
         unsafe {
             let raw = appkit::alloc(class(c"NSPanel"));
             if raw.is_null() {
@@ -4163,7 +4306,8 @@ pub(crate) mod live {
     /// # Safety
     /// Main thread; `panel` live.
     unsafe fn size_to_content(panel: Id, (width, height): (f64, f64)) {
-        // SAFETY: `-frame` is `-(NSRect)`; `-frameRectForContentRect:` `-(NSRect)(NSRect)`; `-setFrame:display:` `-(void)(NSRect, BOOL)`.
+        // SAFETY: `-frame` is `-(NSRect)`; `-frameRectForContentRect:` `-(NSRect)(NSRect)`;
+        // `-setFrame:display:` `-(void)(NSRect, BOOL)`.
         unsafe {
             let wanted = appkit::send_rect_rect(
                 panel,
@@ -4204,7 +4348,10 @@ pub(crate) mod live {
             _ => None,
         });
         let mut tile_out = None;
-        // SAFETY: main thread; `+array` +0 and `-setSubviews:` `-(void)(NSArray *)` clear the view (each old subview released by it); every subview below is fresh or the reused tile, framed with `-setFrame:` (`-(void)(NSRect)`) and added with `-addSubview:` (`-(void)(id)`), which retains it.
+        // SAFETY: main thread; `+array` +0 and `-setSubviews:` `-(void)(NSArray *)` clear the view
+        // (each old subview released by it); every subview below is fresh or the reused tile,
+        // framed with `-setFrame:` (`-(void)(NSRect)`) and added with `-addSubview:`
+        // (`-(void)(id)`), which retains it.
         unsafe {
             let empty = appkit::send_id(class(c"NSArray").as_id(), sel!(array));
             if !empty.is_null() {
@@ -4299,7 +4446,9 @@ pub(crate) mod live {
     /// Main thread.
     unsafe fn label(text: &str, tone: Tone) -> Option<Obj> {
         let words = appkit::nsstring(&shown(text, tone))?;
-        // SAFETY: `+wrappingLabelWithString:` is the documented non-raising factory, +0, retained here; `-setFont:`/`-setTextColor:` are `-(void)(id)` and `-setSelectable:` `-(void)(BOOL)`.
+        // SAFETY: `+wrappingLabelWithString:` is the documented non-raising factory, +0, retained
+        // here; `-setFont:`/`-setTextColor:` are `-(void)(id)` and `-setSelectable:`
+        // `-(void)(BOOL)`.
         unsafe {
             let field = Obj::retain(appkit::send_id_id(
                 class(c"NSTextField").as_id(),
@@ -4319,7 +4468,9 @@ pub(crate) mod live {
 
     impl Measure for AppKitMeasure {
         fn text_height(&self, text: &str, tone: Tone, width: f64) -> f64 {
-            // SAFETY: main thread (the witness); `-cell` is `-(id)`, +0, and `-cellSizeForBounds:` `-(NSSize)(NSRect)` — a wrapping cell answers the height its words take at that width.
+            // SAFETY: main thread (the witness); `-cell` is `-(id)`, +0, and `-cellSizeForBounds:`
+            // `-(NSSize)(NSRect)` — a wrapping cell answers the height its words take at that
+            // width.
             unsafe {
                 let Some(field) = label(text, tone) else {
                     return 0.0;
@@ -4355,7 +4506,8 @@ pub(crate) mod live {
 
     impl ContentView {
         fn build(mtm: MainThread) -> Option<Retained<Self>> {
-            // SAFETY: `alloc_ivars` returns a +1 instance owing one designated initializer, the next send: `-initWithFrame:` (`-(id)(NSRect)`), which consumes it and returns +1.
+            // SAFETY: `alloc_ivars` returns a +1 instance owing one designated initializer, the
+            // next send: `-initWithFrame:` (`-(id)(NSRect)`), which consumes it and returns +1.
             unsafe {
                 let raw = Self::alloc_ivars(mtm, ());
                 if raw.is_null() {
@@ -4375,7 +4527,10 @@ pub(crate) mod live {
         /// Main thread.
         unsafe fn titled(mtm: MainThread, title: &str, link: bool) -> Option<Retained<Self>> {
             let words = appkit::nsstring(title)?;
-            // SAFETY: `alloc_ivars` then `-initWithFrame:`, as for the content view; then `-setTitle:` `-(void)(NSString *)`, `-setBezelStyle:` `-(void)(NSUInteger)`, `-setBordered:` `-(void)(BOOL)`, `-setFont:`/ `-setContentTintColor:` `-(void)(id)` and `-setAlignment:` `-(void)(NSInteger)` on the fresh button.
+            // SAFETY: `alloc_ivars` then `-initWithFrame:`, as for the content view; then
+            // `-setTitle:` `-(void)(NSString *)`, `-setBezelStyle:` `-(void)(NSUInteger)`,
+            // `-setBordered:` `-(void)(BOOL)`, `-setFont:`/`-setContentTintColor:` `-(void)(id)`
+            // and `-setAlignment:` `-(void)(NSInteger)` on the fresh button.
             unsafe {
                 let raw = Self::alloc_ivars(mtm, ());
                 if raw.is_null() {
@@ -4408,7 +4563,8 @@ pub(crate) mod live {
         /// Main thread; `target` outlives the button's use of it (AppKit holds a control's target
         /// weakly; `Live` or the `Preview` keeps it).
         unsafe fn wire(&self, target: Id, action: Sel, tag: isize) {
-            // SAFETY: `-setTarget:` is `-(void)(id)`, `-setAction:` `-(void)(SEL)`, `-setTag:` `-(void)(NSInteger)`.
+            // SAFETY: `-setTarget:` is `-(void)(id)`, `-setAction:` `-(void)(SEL)`, `-setTag:`
+            // `-(void)(NSInteger)`.
             unsafe {
                 appkit::send_v_id(self.as_id(), sel!(setTarget:), target);
                 appkit::send_v_sel(self.as_id(), sel!(setAction:), action);
@@ -4422,7 +4578,10 @@ pub(crate) mod live {
             let path = appkit::nsstring(bundle.to_str()?)?;
             let name = appkit::nsstring(TILE_CAPTION)?;
             let role = appkit::nsstring("AXImage")?;
-            // SAFETY: `+sharedWorkspace` +0; `-iconForFile:` `-(NSImage *)(NSString *)`, +0, retained here; `-setSize:` `-(void)(NSSize)`; then `alloc_ivars` + `-initWithFrame:` as for the content view, and the accessibility setters `-(void)(BOOL)` / `-(void)(id)`.
+            // SAFETY: `+sharedWorkspace` +0; `-iconForFile:` `-(NSImage *)(NSString *)`, +0,
+            // retained here; `-setSize:` `-(void)(NSSize)`; then `alloc_ivars` + `-initWithFrame:`
+            // as for the content view, and the accessibility setters `-(void)(BOOL)` /
+            // `-(void)(id)`.
             unsafe {
                 let workspace =
                     appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
@@ -4478,7 +4637,8 @@ pub(crate) mod live {
 
         fn set_hover(&self, hover: bool) {
             if self.ivars().hover.replace(hover) != hover {
-                // SAFETY: main thread (AppKit's mouse-tracking dispatch or the lane); `-setNeedsDisplay:` is `-(void)(BOOL)`.
+                // SAFETY: main thread (AppKit's mouse-tracking dispatch or the lane);
+                // `-setNeedsDisplay:` is `-(void)(BOOL)`.
                 unsafe { appkit::send_v_bool(self.as_id(), sel!(setNeedsDisplay:), true) };
             }
         }
@@ -4539,7 +4699,8 @@ pub(crate) mod live {
     }
 }
 
-/// Stand-in arms for the tests that drive the lane through an `App`: nothing they hold reaches the OS, and what they were asked is counted per test thread.
+/// Stand-in arms for the tests that drive the lane through an `App`: nothing they hold reaches the
+/// OS, and what they were asked is counted per test thread.
 #[cfg(test)]
 pub(crate) mod test_arms {
     use std::cell::Cell;
@@ -5065,12 +5226,8 @@ mod tests {
         );
     }
 
-    /// A Not now under the approved revision holds a step of System State's run (the
-    /// window's own hand-over, a control client's act on its row) back for the rest of that
-    /// revision, said before or after the bundle id and this Mac were read, and nothing
-    /// else holds it: a Not now of an earlier revision, or an older aterm's under a version,
-    /// is answered by the new approval, inside its span or not. The control verb is also
-    /// held by any Not now for its span; an owner's press by neither.
+    /// A System State step is held only by a Not now under its own revision, written cold or
+    /// warm; the control verb also by any Not now inside its span; an owner's press by neither.
     #[test]
     fn a_not_now_holds_a_system_state_step_for_its_own_revision_only() {
         let key = "r4@com.aterm.aterm@UUID";
@@ -5106,8 +5263,8 @@ mod tests {
         }
     }
 
-    /// A panel's Not now is noted under the keys the window set and handed back once as
-    /// that revision's decline; with no approved revision nothing is handed back.
+    /// A Not now under an approved revision is handed back once as its decline; with no
+    /// revision, nothing is.
     #[test]
     fn a_not_now_is_handed_back_once_as_the_revisions_decline() {
         let now = Instant::now();

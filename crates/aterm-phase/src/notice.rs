@@ -90,8 +90,8 @@ fn details_from(
 /// Scans `rows` below `card` on a `cols`-wide pane for Claude Code's update notice.
 #[must_use]
 pub fn update_notice_scan(rows: &[String], card: &CardPlace, cols: usize) -> NoticeScan {
-    let updated = const { crate::anchors::anchor_text("notice.updated") };
-    let details = const { crate::anchors::anchor_text("notice.updated_details") };
+    let updated = const { crate::anchor!("notice.updated") };
+    let details = const { crate::anchor!("notice.updated_details") };
     let from = card.top.saturating_add(card.rows);
     let mut scan = NoticeScan {
         from,

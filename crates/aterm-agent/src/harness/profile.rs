@@ -26,7 +26,7 @@ const KEY_DOMAIN: &[u8] = b"aterm-account-v1";
 
 const KEY_BYTES: usize = 6;
 
-/// ONE ACCOUNT'S KEY, the same on every machine and holding no secret (design §3.1).
+/// One account's key: the same on every machine and holding no secret (design §3.1).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountKey {
     /// `c` for Claude Code, `x` for Codex, `g` for Grok Build, `k` for Kimi Code.
@@ -122,7 +122,7 @@ impl fmt::Debug for AccountKey {
     }
 }
 
-/// A WORD FROM THE VENDOR'S FILE.
+/// A word from the vendor's file: non-empty printable ASCII, at most [`WORD_MAX`] bytes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Word(Box<str>);
 
@@ -141,7 +141,7 @@ impl Word {
     }
 }
 
-/// THE PLAN, from `oauthAccount.organizationType` as Claude Code maps it.
+/// The plan, from `oauthAccount.organizationType` as Claude Code maps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanWord {
     /// `claude_max`.
@@ -192,7 +192,7 @@ impl PlanWord {
     }
 }
 
-/// THE PLAN AND ITS TIERS (design §3.3), each `None` where the profile does not say.
+/// The plan and its tiers (design §3.3), each `None` where the profile does not say.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plan {
     /// [`PlanWord`].
@@ -262,7 +262,7 @@ impl Credits {
     }
 }
 
-/// WHICH WINDOW A CACHED READING IS OF: aterm's closed bucket ids (design §7.2).
+/// Which window a cached reading is of: aterm's closed bucket ids (design §7.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Bucket {
     /// `five_hour`.
@@ -294,7 +294,7 @@ impl Bucket {
     }
 }
 
-/// ONE WINDOW AS THE CACHED `/usage` BODY HAD IT.
+/// One window as the cached `/usage` body had it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedWindow {
     /// [`Bucket`].
@@ -307,7 +307,7 @@ pub struct CachedWindow {
     pub resets_at: Option<i64>,
 }
 
-/// THE USAGE-CREDITS SPEND the body carries (`extra_usage`).
+/// The usage-credits spend the body carries (`extra_usage`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreditsMoney {
     /// `is_enabled`: whether credits can cover sends now.
@@ -324,7 +324,7 @@ pub struct CreditsMoney {
     pub disabled_reason: Option<Word>,
 }
 
-/// WHICH ONE-TIME CREDIT BLOCK.
+/// Which one-time credit block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OneTimeKind {
     /// The panel's "Claude Code and Cowork credit".
@@ -344,7 +344,7 @@ impl OneTimeKind {
     }
 }
 
-/// ONE ONE-TIME CREDIT BLOCK of the body.
+/// One one-time credit block of the body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OneTime {
     /// [`OneTimeKind`].
@@ -359,7 +359,7 @@ pub struct OneTime {
     pub limit_usd: Option<f64>,
 }
 
-/// THE `/usage` BODY CLAUDE CODE CACHED (`cachedUsageUtilization`, design F3).
+/// The `/usage` body Claude Code cached (`cachedUsageUtilization`, design F3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageCache {
     /// `fetchedAtMs`.
@@ -372,7 +372,7 @@ pub struct UsageCache {
     pub one_time: Vec<OneTime>,
 }
 
-/// HOW THE PLAN BILLS FABLE.
+/// How the plan bills Fable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FablePlan {
     /// Fable counts against the plan's own limits.
@@ -407,7 +407,7 @@ impl FablePlan {
     }
 }
 
-/// WHAT ONE `.claude.json` SAYS OF ITS ACCOUNT.
+/// What one `.claude.json` says of its account.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     /// The account's key; `None` with no `oauthAccount.accountUuid`.
@@ -418,7 +418,8 @@ pub struct Profile {
     pub credits: Credits,
     /// [`UsageCache`].
     pub usage: Option<UsageCache>,
-    /// When a cached `/usage` body that names ANOTHER ACCOUNT than this profile's was fetched (`fetchedAtMs`, Unix seconds).
+    /// When a cached `/usage` body that names another account than this profile's was fetched
+    /// (`fetchedAtMs`, Unix seconds).
     pub usage_of_another_at: Option<i64>,
     /// [`FablePlan`].
     pub fable: FablePlan,
@@ -428,7 +429,7 @@ pub struct Profile {
     pub credits_only: Option<Vec<String>>,
 }
 
-/// WHY NO PROFILE WAS READ, one closed word each ([`NoProfile::word`]).
+/// Why no profile was read, one closed word each ([`NoProfile::word`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoProfile {
     /// The home could not be resolved, so no file was looked for.
@@ -457,7 +458,7 @@ impl NoProfile {
     }
 }
 
-/// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME a process's environment names.
+/// The profile Claude Code keeps for the home a process's environment names.
 #[must_use]
 pub fn path_of(
     user_home: &Path,
@@ -492,7 +493,7 @@ pub fn effective(plain: &Path, records: Option<&Path>, custom_oauth: bool) -> Pa
     plain
 }
 
-/// THE KEY OF THE ACCOUNT SIGNED IN TO THE DEFAULT HOME of a user whose home is `user_home`.
+/// The key of the account signed in to the default home of a user whose home is `user_home`.
 #[must_use]
 pub fn default_home_key(user_home: &Path) -> Option<AccountKey> {
     let plain = path_of(user_home, None, None, || None)?;
@@ -658,8 +659,11 @@ pub(super) struct LaunchEnv {
 }
 
 /// The effective profile, with selection uncertainty preserved for a billing decision.
+///
 /// # Errors
-/// Missing process context or records, or selection metadata that cannot be read.
+///
+/// An unknown selector or records directory, a legacy `.config.json` or plain profile whose
+/// metadata cannot be read, or a legacy `.config.json` whose selection cannot be told.
 pub(super) fn effective_for_billing(
     plain: &Path,
     records: Option<&Path>,
@@ -698,7 +702,8 @@ pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
     raw.is_some_and(|url| !url.is_empty())
 }
 
-/// THE METHOD A CLAUDE CODE PROCESS'S LOGIN IS.
+/// The method a Claude Code process's login is: a subscription for a stored login that is
+/// renewable or on a known plan, else `None`.
 #[must_use]
 pub fn login_method(
     env: &[String],
@@ -803,8 +808,8 @@ pub struct SubscriptionDisplay {
     pub account: Option<AccountKey>,
 }
 
-/// ONE WEEKLY FIGURE, whichever source read it (Claude Code's `/usage` cache, this
-/// process's usage tap, the accounts store), for the one age rule ([`Self::words`]).
+/// One weekly figure, whichever source read it (Claude Code's `/usage` cache, this process's usage
+/// tap, the accounts store), for the one age rule ([`Self::words`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WeeklyFigure {
     /// Its share used, in tenths of a percent (0..=1000).
@@ -816,7 +821,7 @@ pub struct WeeklyFigure {
 }
 
 impl WeeklyFigure {
-    /// THE ONE AGE RULE of every weekly source, the footer's words at `now`: `weekly N% left`
+    /// The one age rule of every weekly source, the footer's words at `now`: `weekly N% left`
     /// while the figure is at most [`USAGE_CURRENT_S`] old (or stamped at most
     /// [`USAGE_SKEW_S`] ahead), `weekly N% left · Mm ago` up to [`USAGE_SHOWN_S`], and nothing
     /// for an older figure, one from further in the future, or one whose window has reset.
@@ -858,7 +863,7 @@ impl WeeklyFigure {
     }
 }
 
-/// WHY A CLAUDE CODE FOOTER HAS NO WEEKLY FIGURE ([`SubscriptionDisplay::weekly_gap`]).
+/// Why a Claude Code footer has no weekly figure ([`SubscriptionDisplay::weekly_gap`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeeklyGap {
     /// `[harness] usage_tap` is off, or the harness is off for Claude Code: only a person's
@@ -908,10 +913,10 @@ impl WeeklyGap {
     }
 }
 
-/// THE FOOTER'S NARROW FORM of weekly words [`WeeklyFigure::words`] or [`WeeklyGap::words`]
-/// said, for a rule too narrow for them beside the account: an aged figure without its
-/// `weekly ` and ` ago` (`61.5% left \u{b7} 59m`, after the week's own mark), any reason's
-/// `weekly ?`; `None` for words that are already their narrowest (a current figure, a wall's
+/// The footer's narrow form of the weekly words [`WeeklyFigure::words`] or [`WeeklyGap::words`]
+/// said, for a rule too narrow for them beside the account: an aged figure without its `weekly `
+/// and ` ago` (`61.5% left \u{b7} 59m`, after the week's own mark), any reason's `weekly ?`;
+/// `None` for words that are already their narrowest (a current figure, a wall's
 /// `weekly 0% left`).
 #[must_use]
 pub fn narrow_weekly(words: &str) -> Option<String> {
@@ -936,7 +941,7 @@ pub struct WeeklyReset {
     pub at: Option<i64>,
 }
 
-/// THE PLAN AS A DATED FACT (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4).
+/// The plan as a dated fact (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlanUsage {
     /// The account the reading is of.
@@ -1587,13 +1592,12 @@ pub fn agy_resume_for(
     super::upgrade_agy::told_line(&conversation, &relaunch_env, argv)
 }
 
-/// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`,
-/// `doing`) and `transcript_len` for an active `agy` session from
-/// `<config>/brain/<cid>/.system_generated/logs/transcript.jsonl` and
-/// `<config>/history.jsonl`. `files` is the current process's observed open-file paths,
-/// as [`super::upgrade_agy::lock_conversation`] consumes them. A unique held presence lock
-/// wins over a unique held database, then the launch's `--conversation`. Ambiguous held
-/// conversations at either evidence level are unknown; launch identity is the final fallback.
+/// Reads the survey [`super::excerpt::Excerpts`] (`prompts`, `said`, `said_end`, `doing`) and
+/// `transcript_len` for an active `agy` session from
+/// `<config>/brain/<cid>/.system_generated/logs/transcript.jsonl` and `<config>/history.jsonl`.
+/// `files` is the process's observed open-file paths: the conversation is the one it uniquely
+/// holds (a presence lock, then a conversation database), else its launch's `--conversation`;
+/// ambiguous holds read as unknown.
 #[must_use]
 pub fn agy_excerpts_for(
     argv: &[String],
@@ -2005,7 +2009,7 @@ impl Drop for Selected {
     }
 }
 
-/// THE ONE SELECTION behind [`subscription_for`] and [`plan_usage_for`].
+/// The one selection behind [`subscription_for`] and [`plan_usage_for`].
 fn selected_profile(
     env: &[String],
     user_home: &Path,
@@ -2172,7 +2176,7 @@ fn model_bucket(model: &str) -> Option<Bucket> {
     }
 }
 
-/// READ THE PROFILE AT `path` ([`parse`]).
+/// Read the profile at `path` ([`parse`]).
 /// # Errors
 /// [`NoProfile`]: why nothing was read.
 pub fn read(path: &Path) -> Result<Profile, NoProfile> {
@@ -2238,7 +2242,7 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// READ A PROFILE FROM ITS BYTES.
+/// Read a profile from its bytes.
 /// # Errors
 /// [`NoProfile::Unreadable`] for bytes that are not one JSON object.
 pub fn parse(bytes: &[u8]) -> Result<Profile, NoProfile> {
@@ -2468,7 +2472,8 @@ fn ms_to_s(ms: f64) -> Option<i64> {
     whole(ms).map(|ms| ms.div_euclid(1000))
 }
 
-/// AN INSTANT AS THE VENDOR WRITES ONE.
+/// An instant as the vendor writes one (a date, a `Z` time, or a time with a `±HH:MM` offset), in
+/// Unix seconds.
 #[must_use]
 pub fn instant(text: &str) -> Option<i64> {
     use aterm_types::rfc3339::{parse_utc, parse_utc_fractional};
@@ -2831,8 +2836,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for List<T> {
     }
 }
 
-/// ONE SCALAR OF THE ALLOWLIST, whatever its type turned out to be: an
-/// array or an object where a scalar was expected is read past, unkept.
+/// One scalar of the allowlist, whatever its type turned out to be: an array or an object where a
+/// scalar was expected is read past, unkept.
 #[derive(Default)]
 enum Leaf {
     /// The key was not there.
@@ -2915,7 +2920,7 @@ impl<'de> Deserialize<'de> for Leaf {
     }
 }
 
-/// A CLAUDE ACCOUNT ID, HASHED AS IT IS READ ([`AccountKey::claude`]).
+/// A Claude account id, hashed as it is read ([`AccountKey::claude`]).
 #[derive(Default)]
 struct Hashed(Option<AccountKey>);
 
@@ -2959,8 +2964,8 @@ impl<'de> Deserialize<'de> for Hashed {
     }
 }
 
-/// AN ARRAY OF WORDS, `None` unless the value is an array of strings that
-/// are all words (Claude Code reads anything else as unparseable).
+/// An array of words: `None` unless the value is an array of strings that are all words (Claude
+/// Code reads anything else as unparseable).
 #[derive(Default)]
 struct Words(Option<Vec<Word>>);
 
@@ -2991,12 +2996,10 @@ impl<'de> Deserialize<'de> for Words {
     }
 }
 
-/// `tengu_saffron_lattice.perModel`, as the one answer this reader needs:
-/// whether a FABLE model is billed to usage credits — `Some(true)` where any
-/// entry for an id that names Fable says `enabled: true` (Claude Code's own
-/// rule where two spellings of a model disagree), `Some(false)` where every
-/// such entry says `false`, `None` with no such entry or a value that is
-/// not an object.
+/// `tengu_saffron_lattice.perModel`, as the one answer this reader needs: whether a Fable model is
+/// billed to usage credits. `Some(true)` where any entry for an id that names Fable says
+/// `enabled: true` (Claude Code's own rule where two spellings of a model disagree), `Some(false)`
+/// where every such entry says `false`, `None` with no such entry or a value that is not an object.
 #[derive(Default)]
 struct FableEntries(Option<bool>);
 
@@ -3030,8 +3033,7 @@ impl<'de> Deserialize<'de> for FableEntries {
     }
 }
 
-/// A STORED CONSENT (`{ "<org or acct:id>": true }`): whether any entry
-/// holds `true`.
+/// A stored consent (`{ "<org or acct:id>": true }`): whether any entry holds `true`.
 #[derive(Default)]
 struct Consent(bool);
 
@@ -3059,7 +3061,7 @@ impl<'de> Deserialize<'de> for Consent {
     }
 }
 
-/// THE STORED CONSENTS PER FAMILY ([`family`], [`Consent`]).
+/// The stored consents per model family ([`family`], [`Consent`]).
 #[derive(Default)]
 struct Consents(Vec<String>);
 

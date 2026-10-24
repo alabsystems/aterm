@@ -25,7 +25,7 @@ pub const DEFAULT_BUDGET: Duration = Duration::from_secs(6 * 3600);
 /// Maximum time to wait for a foreign or silent `trustd` to leave the socket.
 pub const TRUSTD_WAIT: Duration = Duration::from_secs(330);
 
-/// Peak RSS threshold in bytes (`16 GiB`) above which a check is scheduled as heavy.
+/// Peak RSS (`16 GiB`) at or above which a check is scheduled as heavy.
 const HEAVY_BYTES: u64 = 16 << 30;
 
 /// How often the slots are polled.
@@ -156,7 +156,7 @@ impl Outcome {
 /// Parses CLI arguments after `trust run`.
 ///
 /// # Errors
-/// Returns an error on an unknown flag, missing flag value, or missing scope.
+/// An unknown flag, a missing or malformed flag value, or no scope or more than one.
 pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, String> {
     let mut cfg = Config::new(Path::new(""), Scope::WholeTree);
     let (mut packages, mut whole, mut remeasure) = (Vec::new(), false, false);
@@ -788,7 +788,8 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
         .collect()
 }
 
-/// Orders `names` for execution: unknown cost first, then descending duration.
+/// Orders `names` for execution, unknown cost first, then by descending CPU time, each with
+/// whether it is heavy (an unknown cost counts as heavy).
 #[must_use]
 pub fn order(names: &[&str], costs: &BTreeMap<String, Cost>) -> Vec<(usize, bool)> {
     let mut idx: Vec<usize> = (0..names.len()).collect();
@@ -908,7 +909,7 @@ pub enum Stopped {
 /// next check starts in another.
 ///
 /// # Errors
-/// Returns [`Stopped`] if interrupted or if a check fails to spawn.
+/// Returns [`Stopped`] if interrupted or if a check cannot be started.
 pub fn run_slots(
     jobs: Vec<Job>,
     slots: usize,
@@ -1651,9 +1652,9 @@ fn check_and_conclude(
     ))
 }
 
-/// The D27 gate's "proved (calculus)" counter over this run's records, judged against the
-/// current credit epoch ([`crate::trust_credit`]): a regression or an unreadable record or
-/// ledger fails a run that would pass, and joins a failing run's list.
+/// The "proved (calculus)" counter over this run's records, judged against the current credit
+/// epoch ([`crate::trust_credit`]): a regression or an unreadable record or ledger fails a run
+/// that would pass, and joins a failing run's list.
 fn with_credit(
     outcome: Outcome,
     repo: &Path,
@@ -1799,7 +1800,8 @@ fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out:
     }
 }
 
-/// Reduces `job`'s `--obligations` proof report beside its log and removes the raw directory on success.
+/// Reduces `job`'s `--obligations` proof report beside its log and removes the raw directory
+/// on success.
 fn reduce_report(job: &Job, repo: &Path) {
     let Some(report) = &job.report else {
         return;
@@ -1839,12 +1841,12 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
     Some((rev("HEAD")?, rev("HEAD^{tree}")?))
 }
 
-/// The slots are scratch: every check names its units by a fresh session nonce, so
-/// nothing one check builds is reused, and a kept slot only grows. A held slot stays
-/// ([`slot_held`]); those are returned.
+/// Empties `root`'s slots, which are scratch: every check names its units by a fresh session
+/// nonce, so nothing one check builds is reused and a kept slot only grows. A held slot
+/// ([`slot_held`]) stays; those are returned.
 ///
 /// # Errors
-/// A slot that could not be removed (the first such error).
+/// `root` exists and could not be read, or a slot could not be removed (the first such error).
 fn clear_slots(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let rd = match fs::read_dir(root) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1875,13 +1877,11 @@ fn slot_number(name: &str) -> Option<&str> {
         .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Whether slot `j<n>` under `root` is held, so no run empties it or starts a check in it:
-/// a `.check.<n>` record names a check the lane never saw end with nothing of it left, until
-/// a reap drops it ([`reap_stale_checks`]), or a program a check that was killed or failed
-/// left there may still be in its first exec, until [`aterm_uds::deadline::FIRST_EXEC_HANG`]
-/// of awake time has passed since that check's end ([`crate::gates::first_exec_hold`]). A
-/// run's own live checks hold theirs by their records, which go once the lane sees each end
-/// with nothing left.
+/// Whether slot `j<n>` under `root` is held, so no run empties it or starts a check in it: a
+/// `.check.<n>` record names a check the lane never saw end with nothing of it left, until a
+/// reap drops it ([`reap_stale_checks`]), or a program a killed or failed check left there may
+/// still be in its first exec ([`crate::gates::first_exec_hold`]). A run's own live checks hold
+/// theirs by their records.
 fn slot_held(root: &Path, n: impl std::fmt::Display) -> bool {
     fs::symlink_metadata(root.join(format!(".check.{n}"))).is_ok()
         || crate::gates::first_exec_hold(&root.join(format!("j{n}"))).is_some()
@@ -2087,33 +2087,24 @@ fn earlier_pid(text: &str) -> Option<i32> {
 /// for the process at that pid, which reads as another.
 const NO_SERIAL: u64 = u64::MAX;
 
-/// End the checks a killed run left, so no orphaned verifier runs on for hours, and hold
-/// each one's slot until nothing of it can still be in a first exec there ([`slot_held`]).
-/// The lane removes a record only once it saw that check end with nothing of it left, so a
-/// record here names a check whose end was never seen.
+/// End the checks a killed run left, so no orphaned verifier runs on for hours, and hold each
+/// one's slot until nothing of it can still be in a first exec there ([`slot_held`]). A record
+/// here names a check the lane never saw end with nothing of it left.
 ///
-/// A record from another boot goes at once: its processes went with that boot, and so did any
-/// first exec's hold. One whose lane still runs is that run's, and is left as it is.
-///
-/// Only a record that names its mark, its lane and this root signals: its check's processes
-/// are those whose environment carries the nonce, those an earlier sweep kept in the record,
-/// those in its root's session while that is proven the check's, and all they started
-/// ([`proc_tree::marked`]); nothing else is ever signalled. Those are ended, and the slot held
-/// from then. The record stays, holding the slot, while one of them is still listed, or the
-/// processes could not be wholly listed, or one of this user's tied to the check may be its
-/// ([`proc_tree::unread`]); once a reap finds nothing of the check, the record goes and the
-/// slot is held [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time from that reap, since
-/// nothing showed when its last process ran.
+/// A record from another boot goes at once, since its processes and any first exec's hold went
+/// with that boot; one whose lane still runs is that run's and is left alone. Only a record
+/// that names its mark, its lane and this root signals, and only its check's processes
+/// ([`proc_tree::marked`]). Each reap ends them and, unless it could not tell what is left
+/// ([`proc_tree::Left::Unread`]), holds the slot [`aterm_uds::deadline::FIRST_EXEC_HANG`] of
+/// awake time from then. The record stays while one is still listed, the listing is not whole,
+/// or one tied to the check may be its ([`proc_tree::unread`]); the reap that finds nothing
+/// takes it.
 ///
 /// Any other record signals nothing. One written under another root, which this one copies,
-/// names processes of that root's: it holds the slot from the first reap that found it until
-/// that stamp is spent. One that names no mark (an earlier build's), or no lane or root, is
-/// watched ([`proc_tree::Act::Watch`]): it stays while what it names may be listed (its mark's
-/// carriers, a member of its root's session, a process using the slot), each such reap
-/// holding the slot from then, and goes at a reap that finds none, the slot held
-/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] from that reap, since what it named may have
-/// exec'd there just before it went. No record goes on the strength of a stamp that could not
-/// be written.
+/// holds the slot from the first reap that found it until that stamp is spent. One that lacks
+/// its mark, its lane or its root is watched ([`proc_tree::Act::Watch`]): each reap holds the
+/// slot from then, and the one that finds none of what it names takes the record. No record
+/// goes on a stamp that could not be written.
 fn reap_stale_checks(root: &Path) {
     let boot = aterm_uds::process::boot_id();
     reap_stale_checks_with(root, boot.as_deref(), &mut |mark, slot, record, act| {
@@ -2635,9 +2626,9 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     .then_some(checkout)
 }
 
-/// Retire an admitted fallback root under its own existing run lock, unless a slot in
-/// it is held ([`held_slots`]): a later run retires it then. The selected explicit
-/// run-root cleanup remains separate.
+/// Retire an admitted fallback root under its own run lock, once its stale checks are reaped,
+/// unless a slot in it is still held ([`held_slots`]): a later run retires it then. Returns
+/// whether it is gone.
 fn retire(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Some(checkout) = cleanup_checkout(dir) else {
@@ -3086,12 +3077,11 @@ impl Checks for RealChecks<'_> {
     }
 }
 
-/// What a check's root runs first, `/bin/sh -c GATE <targo> <args>…` with the lane holding its
+/// What a check's root runs first, `/bin/sh -c GATE <targo> <args>…`, the lane holding its
 /// stdin's only writer: it waits for a line, which [`RealChecks::start`] writes once the
 /// record names the root, then execs targo through env(1), which drops what the shell adds to
 /// the environment (`PWD`, bash's `SHLVL`). A lane that dies first closes the pipe and the
-/// gate exits without exec'ing, so nothing waits on a lane that is gone, and nothing runs that
-/// no record names.
+/// gate exits without exec'ing, so nothing runs that no record names.
 const GATE: &str = "read -r go && exec /usr/bin/env -u PWD -u SHLVL \"$0\" \"$@\" </dev/null";
 
 /// Whether `path` is a file this process may exec, as execve(2) judges it but for a file some
@@ -3133,9 +3123,9 @@ impl RealCheck {
         i32::try_from(self.child.id()).ok()
     }
 
-    /// The end `usage` says; the record goes only when `left` found nothing of the check
-    /// left ([`proc_tree::Left::spent`]) and the slot is `held` as that needs, and otherwise
-    /// holds the slot for a later reap.
+    /// The end `usage` says. The record goes only when `left` found nothing of the check
+    /// ([`proc_tree::Left::spent`]) and the slot is `held` as that needs; otherwise it stays,
+    /// holding the slot for a later reap.
     fn reaped(
         &mut self,
         usage: aterm_uds::spawnfd::Rusage,
@@ -3167,13 +3157,12 @@ impl Check for RealCheck {
         if !self.child.exited()? {
             return Ok(None);
         }
-        // What the root started may run on without it, in its session or adopted by launchd: a
-        // signal ended the root before it waited for what it ran, and a root's own exit may
-        // leave what it detached. That is ended while the root is still unreaped, so its
-        // session is proven the check's. Only a root that exited 0 with nothing left showed
-        // that what ran in the slot ran: a failed build may be one whose build script was
-        // killed at its first exec, which macOS goes on assessing. Otherwise the slot is held
-        // from now ([`clear_slots`]), and the record stays unless that stamp was written.
+        // What the root started may run on without it, in its session or adopted by launchd;
+        // it is ended while the root is still unreaped, so its session is proven the check's.
+        // Only a root that exited 0 with nothing left showed that what ran in the slot ran: a
+        // failed build may be one whose build script was killed at its first exec, which macOS
+        // goes on assessing. Otherwise the slot is held from now ([`clear_slots`]), and the
+        // record stays unless that stamp was written.
         let left = proc_tree::end_marked(
             &self.mark,
             self.held(),
@@ -3322,9 +3311,9 @@ pub mod proc_tree {
         pub in_session: bool,
         /// Caught mid-spawn (macOS): a `posix_spawn` child whose new image is not in yet reads
         /// as its spawner (name, path, session), and a signal sent to it lands on that image,
-        /// maybe a `trustd`. It never ran a thread and never exec'd, which neither a fork (it
-        /// runs its parent's thread) nor a program held at its first exec (it exec'd) reads.
-        /// It is never signalled; the next listing reads it as what it became.
+        /// maybe a `trustd`. It has neither run a thread nor exec'd, where a fork runs its
+        /// parent's thread and a program held at its first exec has exec'd. It is never
+        /// signalled; the next listing reads it as what it became.
         pub spawning: bool,
         /// The parents through which alone it is the check's ([`marked`]), each by pid and
         /// serial, from its own up to the first that is the check's by itself: it is signalled
@@ -3394,6 +3383,11 @@ pub mod proc_tree {
         /// each such read showed, signalled or mid-spawn, by pid and serial: the check's for as
         /// long as that serial runs.
         fn send(&mut self, procs: &[Proc], sig: i32) -> Vec<(i32, u64)>;
+        /// How long a sweep waits for what it signalled to end before it lists again
+        /// ([`settle`]): a second for real processes.
+        fn settle_within(&self) -> Duration {
+            Duration::from_secs(1)
+        }
     }
 
     /// The session `root`, the root's pid, names, when every process in it is the check's: a
@@ -3452,8 +3446,7 @@ pub mod proc_tree {
         }
 
         // The pid can still pass to another process between the read and `kill`, kill(2)'s own
-        // race; no sweep stops anything, so that leaves nothing stuck. aterm_uds has no pidfd
-        // signal helper to close it on Linux.
+        // race; no sweep stops anything, so that leaves nothing stuck.
         fn send(&mut self, procs: &[Proc], sig: i32) -> Vec<(i32, u64)> {
             send_with(procs, sig, &mut kin, &mut |pid, sig| {
                 // SAFETY: `kill` takes two integers and touches no memory of ours.
@@ -3490,11 +3483,10 @@ pub mod proc_tree {
     /// Whether `listed` may be signalled, its pid read again right before the signal as `now`,
     /// and its parents through `kin`: it is still the process listed (no zombie, the listed
     /// serial) under the parent listed, each parent that tied it ([`Proc::tie`]) still holds
-    /// its serial under the next, and it is neither a `trustd` nor run by one. A child listed
-    /// under a parent that died since reads its reaper as its parent, and a row tied through
-    /// one whose pid then passed to another process finds another serial or parent along its
-    /// tie, so no stale tie, at any depth, signals anything; one that exec'd a `trustd` since
-    /// it was listed reads as one.
+    /// its serial under the next, and it is neither a `trustd` nor run by one. So a child whose
+    /// parent died since (it reads its reaper as its parent), one tied through a pid that passed
+    /// to another process, at any depth, and one that exec'd a `trustd` since it was listed are
+    /// never signalled.
     pub(super) fn may_signal(
         listed: &Proc,
         now: &Kin,
@@ -3615,12 +3607,11 @@ pub mod proc_tree {
         })
     }
 
-    /// How long a listing lists before it is not whole ([`table`]). Its lists come back to
-    /// back, each cheap (a serial per pid, a row only for a new one), and on a busy machine
-    /// every list may name a process not yet read (another program starting or exiting, or
-    /// one caught mid-spawn) for seconds on end, where an idle machine's listing is whole
-    /// within milliseconds; so a listing gives up after a time, not a count of lists, and one
-    /// that gives up sooner holds a slot whose check left nothing.
+    /// How long a listing lists before it is not whole ([`table`]). Each list is cheap (a
+    /// serial per pid, a row only for a new one), but on a busy machine every list may name a
+    /// process not yet read for seconds on end, where an idle machine's listing is whole within
+    /// milliseconds; so a listing gives up after a time, not a count of lists, and too short a
+    /// time holds slots whose checks left nothing.
     pub(super) const LISTING: Duration = Duration::from_secs(10);
 
     /// Rounds of `SIGKILL` a sweep sends, each settling up to a second, before it says one of
@@ -3630,9 +3621,9 @@ pub mod proc_tree {
     /// This user's processes but this one and its zombies, each judged against `mark`: the
     /// root and those it keeps by their pid and serial, any other by the environment it was
     /// exec'd with ([`aterm_uds::process::read_process_markers`]), read only once its thread
-    /// ran (a read of a program held mid-start can hang, M29). While this process does not
-    /// hold the root (`held`), a member of the session the root's pid names is read for its
-    /// use of `slot` ([`Proc::at_slot`]) and for whether the session is the root's
+    /// ran (a read of a program held mid-start can hang). While this process does not hold
+    /// the root (`held`), a member of the session the root's pid names is read for its use of
+    /// `slot` ([`Proc::at_slot`]) and for whether the session is the root's
     /// ([`Proc::in_session`]). A process gone mid-read is left out. `None` when they could not
     /// be listed.
     ///
@@ -3665,8 +3656,7 @@ pub mod proc_tree {
     /// it is reaped, after which a process given that pid reads its real serial, never this.
     const EXITED: u64 = u64::MAX;
 
-    /// [`table`] over the lists `pids` takes, ending not whole at the first list after
-    /// `within`, other than its first, that still names a process it did not read.
+    /// [`table`] over the lists `pids` takes, listing for up to `within`.
     pub(super) fn table_from(
         mark: &Mark,
         held: Option<i32>,
@@ -3700,9 +3690,8 @@ pub mod proc_tree {
         )
     }
 
-    /// [`table_from`]'s repeated lists and identity-checked row cache, ending not whole at the
-    /// first list after `within`, other than its first, that still names a process it did not
-    /// read; `now` is its clock.
+    /// [`table_from`]'s repeated lists and identity-checked row cache ([`table`]); `now` is its
+    /// clock.
     pub(super) fn table_read(
         within: Duration,
         now: &mut dyn FnMut() -> Duration,
@@ -3915,12 +3904,10 @@ pub mod proc_tree {
         })
     }
 
-    /// Sweeps what is left of a check, its processes those carrying `mark`, those in its
-    /// proven session, and all they started ([`marked`]), sparing every `trustd`: `act` says
-    /// whether they are ended or only watched. `held` is the root's pid while this process
-    /// holds it unreaped; `slot` is what a process not shown to be the check's must use to
-    /// count ([`unread`]); `record` is the check's, which keeps what the sweep signals
-    /// ([`Procs::keep`]).
+    /// Sweeps what is left of a check ([`marked`]), sparing every `trustd`; `act` says whether
+    /// its processes are ended or only watched. `held` is the root's pid while this process
+    /// holds it unreaped, `slot` is what a process not shown to be the check's must use to
+    /// count ([`unread`]), and `record` keeps what the sweep signals ([`Procs::keep`]).
     #[must_use]
     pub fn end_marked(
         mark: &Mark,
@@ -3948,10 +3935,10 @@ pub mod proc_tree {
     /// nothing tied to the check left ([`unread`]), says it ended. A signal ends what tied a
     /// survivor to the check (its parent, the carriers that proved its session), so each
     /// listing counts what a signal already reached as the check's ([`marked`]), and the
-    /// record keeps each before it is signalled, for a later sweep should this one's lane die
-    /// ([`Procs::keep`]); a record that cannot keep them gets no `SIGTERM`, which a survivor
-    /// could outlive, but `SIGKILL` at once. Each signal goes to children before their parents
-    /// ([`targets`]), and to no row caught mid-spawn. Nothing is signalled to watch.
+    /// record keeps each before it is signalled ([`Procs::keep`]); when it cannot, they get
+    /// `SIGKILL` at once, not a `SIGTERM` a survivor could outlive. Signals go to children
+    /// before their parents ([`targets`]) and never to a row caught mid-spawn; a watch
+    /// signals nothing.
     pub(super) fn end_marked_with(procs: &mut dyn Procs, slot: &Path, act: Act) -> Left {
         let mut reached = BTreeSet::new();
         let Some((first, found)) = list(procs, &reached) else {
@@ -4019,9 +4006,9 @@ pub mod proc_tree {
     }
 
     /// Waits until none of `set` runs but those caught mid-spawn, which no signal went to, for
-    /// at most a second.
+    /// at most [`Procs::settle_within`].
     fn settle(procs: &mut dyn Procs, set: &[Proc]) {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + procs.settle_within();
         while set.iter().any(|p| !p.spawning && procs.alive(p)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -4056,11 +4043,8 @@ pub mod proc_tree {
             assert!(stat_kin(line, 4243).is_none(), "another pid's line");
         }
 
-        /// A SIGNAL GOES ONLY TO THE PROCESS LISTED, UNDER THE PARENT LISTED, AND NO `trustd`:
-        /// its pid, read again right before the signal, must still hold the listed serial, not
-        /// as a zombie, under the listed parent (a child read under a parent whose pid was then
-        /// reused reads its reaper by now), each parent that tied it, when that alone did,
-        /// still holding its serial under the next, and be neither a `trustd` nor run by one.
+        /// The re-read before a signal must show the listed serial, no zombie, under the listed
+        /// parent, each tie still holding, and no `trustd` in it or its parent.
         #[test]
         fn a_signal_goes_only_to_the_process_listed_under_its_parent_and_no_trustd() {
             let listed = Proc {
@@ -4345,7 +4329,8 @@ pub mod trustd {
     /// Waits up to `wait` for `sock` to hold this build's `trustd` or nothing.
     ///
     /// # Errors
-    /// Returns an error describing what held the socket past `wait` and how to resolve it.
+    /// What held the socket once `wait` ran out or the run was interrupted, and how to resolve
+    /// it.
     pub fn wait_usable(
         sock: &Path,
         want: &str,
@@ -5313,9 +5298,8 @@ mod tests {
         assert_eq!(f.w.borrow().ended_by_lane, ["a"]);
     }
 
-    /// No check starts in a held slot: one held before the run (a record a stopped run
-    /// left), or one the lane just ended a check in; a slot a check left by its own exit is
-    /// used again.
+    /// A slot held before the run, or one the lane just ended a check in, takes no check; one
+    /// a check left by its own exit is used again.
     #[test]
     fn no_check_starts_in_a_held_slot() {
         let mut f = fake(&[("a", 2), ("b", 2)]);
@@ -5398,7 +5382,8 @@ mod tests {
         let Some(dir) = std::env::var_os(UMASK_PROBE_ENV) else {
             return;
         };
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail in this single-test process.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail in this
+        // single-test process.
         unsafe { umask(0o002) };
         let slot = PathBuf::from(dir).join("target-trust.noindex/j0");
         owner_dirs(&slot).unwrap();
@@ -5782,9 +5767,8 @@ mod tests {
         assert!(filed.is_empty() && named.started == ["alpha"], "{said}");
     }
 
-    /// A SLOT A KILLED CHECK LEFT STAYS while macOS may still be assessing a first exec in
-    /// it: a filing run could not run over it and a `-p` run names it, each leaving it in
-    /// place; once its hold is spent (a restart here) a run empties it.
+    /// A slot a killed check left stays while macOS may still be assessing a first exec in it:
+    /// a filing run is refused and a `-p` run keeps it. Once its hold is spent a run empties it.
     #[test]
     fn a_slot_a_killed_check_left_stays_until_its_hold_is_spent() {
         let held = |scope| {
@@ -5822,10 +5806,8 @@ mod tests {
         assert!(!slot.exists(), "{said}");
     }
 
-    /// A check a killed run left is ended, and the slot it ran in is stamped as one a kill
-    /// left, so it is held. So is the slot of every record an earlier build left, which names
-    /// no mark and so ends nothing: the reap that finds nothing of it takes the record, and
-    /// the stamp it wrote holds the slot.
+    /// A check a killed run left is ended and its slot held by a stamp; so is the slot of an
+    /// earlier build's record, which names no mark and ends nothing.
     #[test]
     fn a_reaped_check_holds_its_slot() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6995,11 +6977,10 @@ mod tests {
         true
     }
 
-    /// Reaps `root` until `record` is gone, as the runs after this one would: a sweep or a
-    /// reap whose listing is not whole keeps the record it watched, and a loaded machine's
-    /// listing (every pid of this user's, read again until a list names none it did not read,
-    /// giving up once it has listed for `proc_tree::LISTING`) may not be. `between` checks,
-    /// after each reap, what no reap may do. A one-minute hang detector.
+    /// Reaps `root` until `record` is gone, as the runs after this one would: a reap whose
+    /// listing is not whole, as a loaded machine's may not be within `proc_tree::LISTING`,
+    /// keeps the record it watched. `between` checks, after each reap, what no reap may do. A
+    /// one-minute hang detector.
     fn reap_until_gone(root: &Path, record: &Path, what: &str, mut between: impl FnMut()) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while record.exists() {
@@ -7044,9 +7025,9 @@ mod tests {
     }
 
     /// What a root leading its own session and group left when it was killed and reaped: a
-    /// subshell looping in its group, beating `beat` each turn. That is what a run killed
-    /// mid-check leaves once someone else ends its check's root, and the shape of a stranger's
-    /// pipeline whose leader exited, which a reused pid makes bear a dead root's group.
+    /// subshell looping in its group, beating `beat` each turn. A run killed mid-check leaves
+    /// this once someone else ends its root; a stranger's pipeline whose leader exited has the
+    /// same shape.
     struct Group {
         /// The root's pid, serial and `ps` start, read while it ran.
         root: u32,
@@ -7189,16 +7170,15 @@ mod tests {
         }
     }
 
-    /// A process table a sweep reads and signals in a test: a process is listed while it
-    /// lives, and `SIGTERM` or `SIGKILL` ends one that is not `stuck` (`SIGTERM` none that
+    /// A process table a sweep reads and signals in a test. A process is listed while it
+    /// lives; `SIGTERM` or `SIGKILL` ends one that is not `stuck` (`SIGTERM` none that
     /// `ignores_term`), each signal sent as the lane sends it, over the process's current row
-    /// ([`proc_tree::send_with`]), and launchd (pid 1) adopting the children of one it
-    /// ends; from listing `unlisted_from` on, the table cannot
-    /// be read, and each listing numbered in `partial` is not whole
-    /// ([`proc_tree::Listing::whole`]). Once the listing `becomes` numbers is read, a process
-    /// reads as the row it names (one that exec'd, or was reparented). The check's root has
-    /// pid `root`, which the sweep holds when `held` ([`proc_tree::proven_session`]). What a
-    /// sweep keeps goes in `kept`, unless the record is `unkept` ([`proc_tree::Procs::keep`]).
+    /// ([`proc_tree::send_with`]), and launchd (pid 1) adopts the children of one it ends.
+    /// From listing `unlisted_from` on the table cannot be read, and each listing numbered in
+    /// `partial` is not whole. Once the listing `becomes` numbers is read, a process reads as
+    /// the row it names (one that exec'd, or was reparented). The check's root has pid `root`,
+    /// which the sweep holds when `held`. What a sweep keeps goes in `kept`, unless the record
+    /// is `unkept`.
     struct Table {
         procs: Vec<(proc_tree::Proc, bool)>,
         stuck: BTreeSet<i32>,
@@ -7340,6 +7320,12 @@ mod tests {
                 &mut |pid, sig| table.borrow_mut().signal(pid, sig),
             )
         }
+
+        /// A listed process ends only as [`Table::signal`] ends it, never with time, so a
+        /// wait would only outlast one the test holds ([`Table::stuck`]).
+        fn settle_within(&self) -> Duration {
+            Duration::ZERO
+        }
     }
 
     /// A check's processes are those that carry its mark and all they started, by parent,
@@ -7369,13 +7355,9 @@ mod tests {
         assert_eq!(got, [200, 201, 202, 400]);
     }
 
-    /// A CHECK'S SESSION IS ALL THE CHECK'S ONCE PROVEN: what a process that could not be read
-    /// left in the root's session is the check's though its parent is gone, all it started
-    /// with it, but never a `trustd` or what it runs. The session is proven while the sweep
-    /// holds the root unreaped, or while one of the check's own processes listed in it, the
-    /// root or one carrying the mark, still runs in it after the listing; a process with no
-    /// mark that bears the session's number, or one of the check's in another session, proves
-    /// nothing.
+    /// What an unreadable process left in the root's session is the check's, with all it
+    /// started and never a `trustd` or what it runs, while the session is proven: by the held
+    /// root, or by a carrier of the mark still in it after the listing.
     #[test]
     fn a_checks_session_is_its_own_while_that_is_proven() {
         let withheld = |pid, ppid| proc_tree::Proc {
@@ -7471,13 +7453,10 @@ mod tests {
         assert_eq!(held.signalled(), BTreeSet::from([500, 501]));
     }
 
-    /// AN UNREAD PROCESS HOLDS ONLY WHAT IT IS TIED TO: one whose mark could not be read counts
-    /// toward a hold while its executable lies in the slot, where a program of the check's
-    /// may be in its first exec, or, on macOS, while its executable could not be read either
-    /// and one carrying the mark started it; one running from elsewhere, or tied to nothing,
-    /// does not, so a stranger's unreadable process (Linux's `ssh-agent`, which no one may
-    /// read) does not hold the slot for as long as it lives. A member of the root's session
-    /// counts whatever its mark, unless it is a `trustd`'s.
+    /// A process whose mark could not be read holds the slot only while it runs from the slot
+    /// or, on macOS, its executable is unread too and a carrier of the mark started it; a
+    /// stranger's (Linux's `ssh-agent`) never does. A member of the root's session counts
+    /// unless a `trustd` runs it.
     #[test]
     fn an_unread_process_counts_only_while_it_is_tied_to_the_check() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7546,12 +7525,9 @@ mod tests {
         }
     }
 
-    /// A SWEEP ENDS THE CHECK'S PROCESSES ONLY, AND NEVER STOPS ONE: each is sent `SIGTERM`,
-    /// then `SIGKILL` while it is still listed, and never `SIGSTOP` or `SIGCONT`. It says what
-    /// is left: nothing once they are gone; something while one outlives its kill, or the
-    /// table cannot be read again, or the last listing is not whole; unread, with nothing
-    /// signalled, when it cannot be read at all. A watch signals nothing and says the check
-    /// lives while one of its processes is listed.
+    /// A sweep signals only the check's processes, and only with `SIGTERM`, then `SIGKILL` for
+    /// survivors. It says what is left: ended only by a whole listing after the signals, and
+    /// unread, with nothing signalled, when it cannot list at all. A watch signals nothing.
     #[test]
     fn a_sweep_ends_the_checks_processes_and_says_what_is_left() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7646,10 +7622,8 @@ mod tests {
         }
     }
 
-    /// A PROCESS THAT BECAME A `trustd` SINCE IT WAS LISTED IS NEVER SIGNALLED: a check's
-    /// process listed before it exec'd a `trustd` (by its earlier name, carrying the mark, in
-    /// the check's session) reads as one when its signal is due, so it and what it runs are
-    /// sent nothing, while the rest of the check is ended.
+    /// A process listed before it exec'd a `trustd` reads as one at its signal, so it and what
+    /// it runs are spared while the rest of the check is ended.
     #[test]
     fn a_process_that_became_a_trustd_since_it_was_listed_is_never_signalled() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7672,11 +7646,9 @@ mod tests {
         assert_eq!(table.signalled(), BTreeSet::from([200]), "{:?}", table.sent);
     }
 
-    /// A ROW CAUGHT MID-SPAWN IS NEVER SIGNALLED: a `posix_spawn` child whose new image is not
-    /// in yet reads as its spawner, one of the check's, and a signal sent then lands on the
-    /// image, maybe a `trustd`, though the read right before it showed none. The sweep leaves
-    /// it to a later listing: one that reads it as a `trustd` spares it, one that reads it as
-    /// the check's ends it, and while it reads mid-spawn it is named, so the check lives.
+    /// A `posix_spawn` child whose image is not in yet is left to a later listing: read as a
+    /// `trustd` it is spared, read as the check's it is killed, and while still mid-spawn the
+    /// check lives.
     #[test]
     fn a_row_caught_mid_spawn_is_never_signalled() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7725,10 +7697,8 @@ mod tests {
         }
     }
 
-    /// A CHILD TIED TO THE CHECK BY A STALE PARENT IS NEVER SIGNALLED: the rows of one listing
-    /// are read at different moments, so a stranger's child can be listed under a parent pid
-    /// that was then given to one of the check's. By its signal the child reads launchd as
-    /// its parent, not the one listed, so it is sent nothing.
+    /// A stranger's child listed under a parent pid since given to one of the check's reads
+    /// launchd as its parent at its signal, so it is sent nothing.
     #[test]
     fn a_child_tied_to_the_check_by_a_stale_parent_is_never_signalled() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7744,15 +7714,10 @@ mod tests {
         assert_eq!(table.signalled(), BTreeSet::from([300]), "{:?}", table.sent);
     }
 
-    /// A CHILD TIED BY A PARENT WHOSE PID PASSED TO ANOTHER IS NEVER SIGNALLED, NOR ANYTHING IT
-    /// STARTED: a listing reads each pid once, so a parent of the check's read early that
-    /// exits, its pid taken by a stranger's process that forks, still stands in it, and the
-    /// stranger's child, read later, is listed under it and still has that parent pid at its
-    /// signal. That pid then holds another serial than the parent that tied the child, so the
-    /// child is sent nothing, nor is what it started, though their own parent, the child,
-    /// still holds; with nothing reached, nothing that ignores `SIGTERM` is sent `SIGKILL`
-    /// either. Nor is what a child started that was read under a stranger's pid, which then
-    /// passed to one of the check's: by the signal the child reads its reaper as its parent.
+    /// A child tied through a parent whose pid passed to a stranger's process finds another
+    /// serial at its signal, so it and what it started, at any depth, are sent nothing; nor are
+    /// a child read under a stranger's pid that then passed to one of the check's, which reads
+    /// its reaper as its parent by then, and what it started.
     #[test]
     fn a_child_tied_by_a_parent_whose_pid_passed_to_another_is_never_signalled() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7792,14 +7757,9 @@ mod tests {
         assert_eq!(table.signalled(), BTreeSet::from([300]), "{:?}", table.sent);
     }
 
-    /// WHAT OUTLIVES THE `SIGTERM` IS KILLED, THOUGH THE `SIGTERM` ENDED WHAT TIED IT: a process
-    /// that ignores `SIGTERM` and is tied to the check only by its session, which carriers that
-    /// die of the `SIGTERM` prove, or only by its parent, which dies of it, is tied to nothing
-    /// in the next listing. The `SIGTERM` reached it, so it is the check's: it is sent
-    /// `SIGKILL`, and the check ends only once it is gone, whether or not it would have held
-    /// the record as a member of the root's session ([`proc_tree::Proc::in_session`]). So is
-    /// one caught mid-spawn then, which the read before the `SIGTERM` showed the check's,
-    /// though no signal went to it.
+    /// A process tied only by a session or parent the `SIGTERM` ended is still the check's, the
+    /// `SIGTERM` having reached it, and is killed; so is a row caught mid-spawn that the read
+    /// before the `SIGTERM` showed the check's.
     #[test]
     fn what_outlives_the_sigterm_is_killed_though_the_sigterm_ended_its_ties() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7852,11 +7812,8 @@ mod tests {
         }
     }
 
-    /// A SWEEP KEEPS WHAT IT SIGNALS BEFORE THE SIGNAL, AND SENDS NO `SIGTERM` IT COULD NOT KEEP:
-    /// each process its re-read shows the check's is kept in the record first
-    /// ([`proc_tree::Procs::keep`]), so a later sweep finds what outlives the `SIGTERM` though
-    /// this one's lane dies. When the record cannot keep them, the first signal is `SIGKILL`,
-    /// which nothing outlives to lose its tie with that lane.
+    /// Each process a sweep signals is kept in the record first; when the record cannot keep
+    /// them, the first signal is `SIGKILL`.
     #[test]
     fn a_sweep_keeps_what_it_signals_and_sends_no_sigterm_it_could_not_keep() {
         let slot = Path::new("/nonexistent/root/j0");
@@ -7887,11 +7844,8 @@ mod tests {
         }
     }
 
-    /// NEITHER A FORK NOR A PROGRAM HELD AT ITS EXEC READS AS MID-SPAWN: a fork that ran shows
-    /// its parent's image but runs its parent's thread, and a program held at its first exec
-    /// (here one started suspended there, as `aterm_uds::deadline::Held` starts one) never ran
-    /// a thread but exec'd, so a sweep may signal either. Only a `posix_spawn` child whose image
-    /// is not in yet reads as both.
+    /// A fork that ran (its parent's thread) and a program held at its first exec (it exec'd)
+    /// are not mid-spawn; only a `posix_spawn` child whose image is not in yet is.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn neither_a_fork_nor_a_program_held_at_its_exec_reads_as_mid_spawn() {
@@ -7926,11 +7880,9 @@ mod tests {
         );
     }
 
-    /// A SWEEP CUT SHORT LEAVES NOTHING STOPPED: no sweep stops a process, so a lane killed
-    /// mid-sweep leaves each of the check's processes running or ended, never stopped with
-    /// nothing left to continue it (and a stopped trust worker would keep its `trustd` memory
-    /// grant). Here the sweep dies right after its first signal, which the check's process
-    /// ignores.
+    /// No sweep stops a process, so a lane killed mid-sweep leaves each of the check's
+    /// processes running or ended, never stopped (a stopped trust worker would keep its
+    /// `trustd` memory grant).
     #[test]
     fn a_sweep_cut_short_leaves_nothing_stopped() {
         /// The kernel's reads and signals, but the lane dies after its first send.
@@ -7981,10 +7933,9 @@ mod tests {
         );
     }
 
-    /// A signal re-reads its target first: a pid that holds another process than the one
-    /// listed, one listed with no serial, and one listed under another parent than it has now
-    /// are never signalled. The child shows it was spared by echoing a line written after
-    /// those sends, which a posted `SIGKILL` would have kept it from.
+    /// A pid holding another process than the one listed, a row with no serial, and one under
+    /// another parent than it has now are never signalled; the child's echo of a line written
+    /// after those sends proves it was spared.
     #[test]
     fn a_pid_holding_another_process_than_the_one_listed_is_never_signalled() {
         use proc_tree::Procs as _;
@@ -8037,9 +7988,8 @@ mod tests {
         assert!(killed, "the process listed was not signalled");
     }
 
-    /// A SIGNAL RE-READS ITS TARGET'S NAME: a process listed before it exec'd a `trustd` reads
-    /// as one at the send and is sent nothing. The copy shows it was spared by echoing a line
-    /// written after the sends, which a posted `SIGKILL` would have kept it from.
+    /// A process that reads as a `trustd` at the send is sent nothing; its echo of a line
+    /// written after the sends proves it was spared.
     #[test]
     fn a_process_that_reads_as_a_trustd_at_the_send_is_never_killed() {
         use proc_tree::Procs as _;
@@ -8124,16 +8074,11 @@ mod tests {
         }
     }
 
-    /// A RECORD FROM ANOTHER BOOT IS SPENT AT ONCE, judged by nothing and stamping nothing:
-    /// its processes and any first exec's hold went with that boot. ONE WHOSE LANE STILL RUNS
-    /// IS THAT RUN'S: no reap sweeps it, stamps its slot or takes it. ONE WRITTEN UNDER
-    /// ANOTHER ROOT (a copy's) is never swept: it holds the slot from the first stamp a reap
-    /// gave it, and goes once that is spent. ONE THAT NAMES NO MARK, OR NO LANE, ONLY WATCHES:
-    /// it stays while its watch finds anything, the slot held from each such reap, and goes at
-    /// one that finds nothing, the slot held from then. A record that names its mark, its lane
-    /// (gone, or this run) and this root is judged by its sweep: one that could not read keeps
-    /// it whatever the stamp, one that signalled what is still there keeps it and holds the
-    /// slot from now, and one that finds nothing left takes it, the slot held from now.
+    /// Another boot's record goes at once, stamping nothing; one whose lane runs is left alone,
+    /// unstamped; a copy's is never swept and goes once its first stamp is spent; one with no
+    /// mark or lane only watches. One naming its mark, a gone lane or this run, and this root is
+    /// judged by its sweep: an unread sweep keeps it whatever the stamp, and any other stamps
+    /// the slot from then and takes the record once nothing is left.
     #[test]
     fn each_record_is_judged_by_its_boot_its_lane_its_root_and_its_mark() {
         use proc_tree::{Act, Left};
@@ -8408,9 +8353,8 @@ mod tests {
         );
     }
 
-    /// A check record whose root is gone, someone else having ended it: what the root left
-    /// carries its mark, wherever it works and whatever adopted it, so the reap ends it and
-    /// holds the slot.
+    /// What a gone root left carries its mark wherever it works and whatever adopted it, so
+    /// the reap ends it and holds the slot.
     #[test]
     fn what_a_gone_root_left_carrying_its_mark_is_ended_by_the_reap() {
         let d = tmp("trust-lane-rootless");
@@ -8431,12 +8375,9 @@ mod tests {
         assert_eq!(held_slots(&root), [slot]);
     }
 
-    /// WHAT OUTLIVES THE REAP'S `SIGTERM` IS ENDED BY IT: a check's process that ignores
-    /// `SIGTERM`, whose environment reads without the mark (macOS withholds a platform
-    /// binary's; this one's is cleared besides), is tied to the check only by its parent, the
-    /// check's root, and the root's session, which only the root proves. The `SIGTERM` ends
-    /// the root, and with it both ties, yet the reap still kills what it reached, and takes the
-    /// record once it is gone.
+    /// A check's process that ignores `SIGTERM`, unmarked and tied only by the root and its
+    /// session, which the `SIGTERM` ends, is still killed by the reap, which then takes the
+    /// record.
     #[test]
     fn what_outlives_the_reaps_sigterm_is_ended_by_it() {
         let d = tmp("trust-lane-survivor");
@@ -8494,17 +8435,11 @@ mod tests {
         drop(quiet);
     }
 
-    /// WHAT IS LEFT IN A DEAD ROOT'S SESSION HOLDS THE SLOT WHILE IT MAY BE THE CHECK'S,
-    /// UNSIGNALLED: a process of this user's in the session of a check's dead root that
-    /// carries no mark is never signalled, whether the record names a mark or is an earlier
-    /// build's, since a pid reused by the leader of a stranger's pipeline would bear that
-    /// session too. One working in the slot or holding a file there holds the record whatever
-    /// the stamp says (a configure script's shell may yet exec a fresh build there). One
-    /// working elsewhere holds it only while nothing shows it is a stranger's: under an
-    /// earlier build's record, which names no nonce, it does; one whose environment reads
-    /// without the record's nonce is not the check's, so the reap takes that record. Once the
-    /// session is empty, a reap takes any record left, and the stamp it writes holds the slot,
-    /// since a member may have exec'd a fresh build there just before it was killed.
+    /// An unmarked member of a dead root's session is never signalled, since a reused pid can
+    /// make it a stranger's. Working in or holding a file in the slot, it holds the record
+    /// whatever the stamp says; working elsewhere, only under an earlier build's record, which
+    /// names no nonce. Once the session is empty a reap takes the record, and its stamp holds
+    /// the slot.
     #[test]
     fn what_a_dead_roots_session_holds_keeps_its_record_unsignalled() {
         let d = tmp("trust-lane-stranger");
@@ -8591,15 +8526,11 @@ mod tests {
         }
     }
 
-    /// A MEMBER THAT HAD A CONTROLLING TERMINAL IS A STRANGER'S: the check's session, made by
-    /// `setsid` with stdin null, never has one, but a terminal tab's shell that came to lead a
-    /// session at a dead root's reused pid has, and macOS keeps that mark on what the shell
-    /// left there when it exited. Such a member holds no record, though its environment cannot
-    /// be read and the record (an earlier build's) names no nonce; the reap signals it no more
-    /// than any member. The shell exits only once the member has exec'd, as a tab's shell's
-    /// children have long before it ends: macOS drops the mark from a process that execs after
-    /// its session's leader is gone, which a loaded machine's late exec did here. The record goes
-    /// at a reap whose listing is whole; a loaded machine's may not be, and that reap keeps it.
+    /// A member of a dead root's session that had a controlling terminal is a stranger's (the
+    /// check's session, made by `setsid` with stdin null, never has one; macOS keeps the mark on
+    /// what a tab's shell left when it exited), so it holds no record, even an earlier build's,
+    /// and is never signalled. The shell exits only once the member has exec'd, since macOS
+    /// drops the mark from a process that execs after its session's leader is gone.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_member_that_had_a_terminal_holds_no_record() {
@@ -8675,13 +8606,10 @@ mod tests {
         }
     }
 
-    /// A LIVE CHECK IS ENDED BY ITS MARK, never by a start's text (`ps` prints one in the
-    /// reader's zone and locale): a root still running, and what it left adopted outside its
-    /// tree in its session, are ended, and the slot held. That includes an orphan whose
-    /// environment macOS withholds (`/bin/sleep` itself), found by the root's session. The
-    /// root's loop may start its next `/bin/sleep` after the signal that ends the last one and
-    /// before its own: once nothing running proves the session the check's, that member is
-    /// left unsignalled and holds the record until it exits, so a later reap takes the record.
+    /// A live check is ended by its mark, never by a start's text (`ps` prints one in the
+    /// reader's zone and locale): the running root and what it left outside its tree, an orphan
+    /// whose environment macOS withholds among them, are ended and the slot held. A member the
+    /// root's loop starts after the last proof of its session holds the record until it exits.
     #[test]
     fn a_live_check_and_what_it_left_outside_its_tree_are_ended_by_the_reap() {
         let d = tmp("trust-lane-live");
@@ -8742,10 +8670,9 @@ mod tests {
         assert_eq!(held_slots(&root), [slot]);
     }
 
-    /// WHAT A CHECK LEFT IN ITS SESSION IS ENDED WHEN ITS ROOT EXITS: the lane sweeps before
-    /// it reaps the root, so the root's session is proven the check's, and an orphan there
-    /// whose environment macOS withholds is ended though no process carrying the mark is left;
-    /// what ran in the slot never showed it ran, so the slot is held.
+    /// The lane sweeps before it reaps an exited root, so the root's session is proven the
+    /// check's and an orphan there is ended though nothing carrying the mark is left; the slot
+    /// is held, since the check left something running.
     #[test]
     fn what_a_check_left_in_its_session_is_ended_when_its_root_exits() {
         use std::io::Write as _;
@@ -8809,11 +8736,9 @@ mod tests {
         assert_eq!(held_slots(d.path()), [target]);
     }
 
-    /// WHAT A GONE ROOT LEFT USING ITS SLOT HOLDS IT, UNSIGNALLED: with the root gone and
-    /// nothing carrying the mark, nothing proves the root's session the check's, but a member
-    /// working in the slot (a configure script's shell running a platform tool) may be the
-    /// check's and may yet exec a fresh build there. The record stays whatever the stamp says,
-    /// and goes once that member is gone.
+    /// With the root gone and nothing carrying the mark, a member working in the slot may still
+    /// be the check's and exec a fresh build there: it holds the record, unsignalled and
+    /// whatever the stamp says, until it is gone.
     #[test]
     fn what_a_gone_root_left_working_in_its_slot_holds_it_unsignalled() {
         let d = tmp("trust-lane-working");
@@ -8868,12 +8793,10 @@ mod tests {
         assert_eq!(held_slots(&root), [slot]);
     }
 
-    /// AN EARLIER BUILD'S RECORD NEVER SIGNALS: it names its root by pid alone, and the
-    /// process at that pid, though it started before the record was written, may be any of
-    /// this user's (a copy of the tree resets the record's time, and the clock can be set
-    /// back), so the reap signals nothing there, nor in its session. A session another
-    /// process leads at that pid holds nothing, so the first reap takes the record, and the
-    /// stamp it writes holds the slot.
+    /// An earlier build's record names its root by pid alone, and the process at that pid may
+    /// be any of this user's (a copied tree resets the record's time, and the clock can be set
+    /// back), so the reap signals nothing there or in its session; the first reap takes the
+    /// record, and its stamp holds the slot.
     #[test]
     fn an_earlier_builds_record_never_signals_the_process_at_its_pid() {
         let d = tmp("trust-lane-earlier-live");
@@ -8911,10 +8834,9 @@ mod tests {
         let _ = live.wait();
     }
 
-    /// A reap that could not read keeps the record, so the slot stays held whatever its
-    /// stamp says, and the check runs on; one that reads ends it, and once nothing of the check
-    /// is left a reap takes the record (the ending reap keeps it while a listing still names
-    /// the dying process, as a loaded machine's can).
+    /// A reap that could not read keeps the record and leaves the check running, the slot held
+    /// past a spent stamp; one that reads ends it, and a reap that finds nothing left takes the
+    /// record.
     #[test]
     fn a_reap_that_could_not_read_keeps_the_record_past_a_spent_stamp() {
         let d = tmp("trust-lane-unread");
@@ -8966,11 +8888,9 @@ mod tests {
         assert_eq!(held_slots(&root), [slot]);
     }
 
-    /// AN EARLIER BUILD'S RECORD ENDS NOTHING: it names no mark, so what its root's session
-    /// holds runs on. It holds the slot while a member of its gone root's session is left,
-    /// wherever that works, each reap holding it from then; the reap that finds none takes
-    /// the record, and the stamp it writes holds the slot until it is spent, since a member
-    /// may have exec'd a fresh build there just before it was killed.
+    /// An earlier build's record ends nothing: it holds the slot while a member of its gone
+    /// root's session is left, each reap renewing the stamp, and the reap that finds none takes
+    /// the record, its stamp holding the slot.
     #[test]
     fn an_earlier_builds_record_holds_its_slot_while_its_roots_session_is_left() {
         let d = tmp("trust-lane-earlier-session");
@@ -9060,11 +8980,9 @@ mod tests {
         (child, left)
     }
 
-    /// A RECORD OF ANOTHER ROOT, OR OF A RUN STILL GOING, SIGNALS NOTHING: a copy of a target
-    /// root carries the records of the live run it copied, beside a lock of its own, and a
-    /// run in the copy must not end that run's check; nor may any reap end a check whose run
-    /// still runs. The copy's record holds its slot by the first stamp a reap gave it and goes
-    /// once that is spent; the live run's is left as it is, unstamped, until that run is gone.
+    /// A copy's record (another root's) and a live run's record signal nothing: the copy's
+    /// holds its slot by the first stamp a reap gave it and goes once that is spent; the live
+    /// run's stays, unstamped, until that run is gone.
     #[test]
     fn a_copied_record_or_a_live_runs_record_signals_nothing() {
         let d = tmp("trust-lane-copy");
@@ -9152,10 +9070,8 @@ mod tests {
         assert_eq!(held_slots(&root), [root.join("j1")]);
     }
 
-    /// A RECORD GOES ON A STAMP ONLY ONCE THE STAMP IS WRITTEN: a check the lane ended, or one a
-    /// reap found ended, in a slot whose stamp cannot be written (here a directory at the
-    /// stamp's path) keeps its record, so the slot stays held with nothing else to hold
-    /// it; a later reap that writes the stamp takes the record.
+    /// In a slot whose stamp cannot be written, a check the lane ended or a reap found ended
+    /// keeps its record, which holds the slot until a reap that writes the stamp takes it.
     #[test]
     fn a_record_whose_stamp_cannot_be_written_holds_its_slot() {
         let d = tmp("trust-lane-unstamped");
@@ -9261,11 +9177,8 @@ mod tests {
         assert_eq!(listing.procs, owned, "the old stranger's row was replaced");
     }
 
-    /// A LISTING OUTLASTS A BUSY MACHINE'S CHURN, FOR `LISTING`: there each of many lists in a
-    /// row names a process not read yet (another program starting or exiting, one caught
-    /// mid-spawn), for seconds on end. Each list here takes 100 ms of a fake clock: churn that
-    /// stops before [`proc_tree::LISTING`] leaves a listing whole at the first list that names
-    /// none, and churn past it ends the listing not whole at the first list once it passed.
+    /// A listing outlasts churn for up to [`proc_tree::LISTING`]: churn that stops before it
+    /// ends whole at the first list that names nothing new, and churn past it ends not whole.
     #[test]
     fn a_listing_outlasts_a_busy_machines_churn() {
         use std::cell::Cell;
@@ -9305,11 +9218,9 @@ mod tests {
         );
     }
 
-    /// An exited, unreaped process keeps its pid and runs nothing again, though macOS reads no
-    /// serial of it: a listing that names one is whole all the same. A check's root is one
-    /// whenever its sweep runs, and so is any child another test has not reaped yet. Each list
-    /// here is this user's, cut to the child: on a busy machine the others may name processes
-    /// not yet read for longer than a listing lists, and that listing is not whole.
+    /// An exited, unreaped process, of which macOS reads no serial, leaves a listing whole; a
+    /// check's root is one whenever its sweep runs. Each list is cut to the child, since a busy
+    /// machine's other processes may keep a listing from being whole.
     #[test]
     fn an_unreaped_child_leaves_the_listing_whole() {
         let d = tmp("trust-lane-unreaped");
@@ -9431,12 +9342,9 @@ mod tests {
         assert_eq!(reads.get(), 1, "a stable row is read once");
     }
 
-    /// A LISTING IS WHOLE ONLY ONCE A LATER LIST NAMES NOTHING IT DID NOT READ: a process that
-    /// exits before its row is read may have forked one after the first list was taken, which
-    /// that list never names, so a sweep never answers that nothing of a check is left from
-    /// one list. Here the first list misses what a gone root left in its session; a later one
-    /// names it, so the listing reads it and it holds the slot. Lists that keep naming new
-    /// processes make no whole listing.
+    /// A listing is whole only once a later list names nothing it did not read: here a later
+    /// list names what the first missed in a gone root's session, which then holds the slot;
+    /// lists that keep naming new processes make no whole listing.
     #[test]
     fn a_process_the_first_list_missed_is_read_from_a_later_one() {
         let d = tmp("trust-lane-whole");
@@ -9524,9 +9432,8 @@ mod tests {
         (sock, keeper)
     }
 
-    /// A check starts only in a slot that is not held, so a stamp left there is spent and
-    /// goes: the first stamp a reap of the check's record finds is that reap's own. The check
-    /// carries its mark, and its record names it, its boot, its lane, its target root and its
+    /// Starting a check removes its slot's spent stamp, so the first stamp a reap of its record
+    /// finds is that reap's own; the record names the check's mark, boot, lane, target root and
     /// root.
     #[test]
     fn a_check_clears_the_spent_stamp_of_its_slot() {
@@ -9584,8 +9491,8 @@ mod tests {
         );
     }
 
-    /// A CHECK WHOSE ROOT CANNOT BE IDENTIFIED IS NOT STARTED: the root is ended while it waits
-    /// at its gate ([`GATE`]), and no record names it with an identity a reap would misread.
+    /// A check whose root cannot be identified is ended at its gate ([`GATE`]), never started,
+    /// and its record goes.
     #[test]
     fn a_check_whose_root_cannot_be_identified_is_ended_and_not_started() {
         use std::sync::atomic::{AtomicI32, Ordering};
@@ -9658,11 +9565,10 @@ mod tests {
         panic!("the lane outlived reading its root's serial: {started:?}");
     }
 
-    /// A LANE KILLED STARTING A CHECK LEAVES NO ROOT WAITING ON IT: the root waits at its gate
-    /// ([`GATE`]) for a line from the lane, so when the lane dies before the record names the
-    /// root, the root is never left stopped (a root started suspended would wait so until the
-    /// Mac restarts, since nothing else ever continues it) and runs nothing: it exits at its
-    /// pipe's end, and the next run's reap takes the record.
+    /// The root waits at its gate ([`GATE`]) for the lane's line, so a lane killed before the
+    /// record names the root leaves it neither stopped (as a root started suspended would stay,
+    /// with nothing to continue it) nor running targo: it exits, and the next reap takes the
+    /// record.
     #[test]
     fn a_lane_killed_starting_a_check_leaves_no_root_waiting() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -9717,11 +9623,10 @@ mod tests {
     const DIES_SWEEPING: &str = "trust_lane::tests::probe_a_lane_that_dies_after_its_sigterm";
 
     /// Run by [`what_a_dead_lanes_sigterm_reached_is_ended_by_the_next_reap`] in a process of
-    /// its own: starts a check under the directory [`DIES_SWEEPING_ENV`] names, its root
-    /// leading its own session with a member that ignores `SIGTERM` and whose environment reads
-    /// without the mark, writes the member's pid and serial to `member.pid` there, and ends the
-    /// check as `RealCheck::end` does, dying by `SIGKILL` as the sweep first waits after its
-    /// `SIGTERM`.
+    /// its own: starts a check under the directory [`DIES_SWEEPING_ENV`] names, its root leading
+    /// a session with a member that ignores `SIGTERM` and reads without the mark, writes the
+    /// member's pid and serial to `member.pid` there, and ends the check as `RealCheck::end`
+    /// does, dying by `SIGKILL` as the sweep first waits after its `SIGTERM`.
     #[test]
     fn probe_a_lane_that_dies_after_its_sigterm() {
         /// The kernel's reads and signals, but the lane dies once it has sent `SIGTERM`.
@@ -9823,11 +9728,9 @@ mod tests {
         panic!("the lane outlived its SIGTERM: {left:?}");
     }
 
-    /// WHAT A DEAD LANE'S `SIGTERM` REACHED IS ENDED BY THE NEXT REAP: the `SIGTERM` ends what
-    /// tied a survivor to the check (here its parent, the root, which alone proves the root's
-    /// session, and the survivor's environment reads without the mark), and a lane killed
-    /// before its `SIGKILL` takes what it knew with it. The record keeps each process before it
-    /// is signalled, so the next run's reap finds the survivor, ends it, and takes the record.
+    /// A lane killed between its `SIGTERM` and its `SIGKILL` leaves the record keeping what the
+    /// `SIGTERM` reached, so the next reap ends a survivor whose ties the `SIGTERM` ended (its
+    /// parent, the root, which alone proved the session) and takes the record.
     #[test]
     fn what_a_dead_lanes_sigterm_reached_is_ended_by_the_next_reap() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -9870,9 +9773,8 @@ mod tests {
         );
     }
 
-    /// THE GATE RUNS ITS PROGRAM ONLY ON THE LANE'S LINE, IN THE LANE'S ENVIRONMENT: what it
-    /// execs sees exactly the variables the lane set, none the shell adds, and at its pipe's
-    /// end it execs nothing.
+    /// The gate execs its program only on the lane's line, with exactly the variables the lane
+    /// set; at its pipe's end it execs nothing.
     #[test]
     fn the_gate_runs_its_program_only_on_the_lanes_line_in_the_lanes_environment() {
         let d = tmp("trust-lane-gate");
@@ -9932,11 +9834,8 @@ mod tests {
         assert!(!root.join(".check.0").exists());
     }
 
-    /// A TARGO THAT CANNOT BE EXEC'D STARTS NOTHING: the gate's env(1) execs it only once the
-    /// lane lets it go, and an exec error there (its exit 127 or 126) would read as the check's
-    /// own failure, holding the slot, with each queued check failing so in the next. The start
-    /// fails as a spawn of targo itself would, naming the exec error, with no record left and
-    /// no stamp, so the run stops as unstartable.
+    /// A targo that cannot be exec'd fails the start, naming the exec error, and leaves no
+    /// record or stamp, so the run stops as unstartable.
     #[test]
     fn a_targo_that_cannot_be_execd_starts_nothing() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -10066,11 +9965,9 @@ mod tests {
         assert_eq!(held_slots(&root), [slot]);
     }
 
-    /// A RECORD AN EARLIER BUILD LEFT HOLDS ITS SLOT through runs: a `-p` run starts its check
-    /// in another slot and leaves the record and the slot, and a filing run is refused, while
-    /// its gone root's session is left, no run signalling it; the run that finds the session
-    /// empty takes the record and is refused by the stamp it wrote, and once that is spent a
-    /// run empties the slot and files.
+    /// An earlier build's record holds its slot through runs, unsignalled, while its gone root's
+    /// session is left: a `-p` run uses another slot and a filing run is refused. The reap that
+    /// finds the session empty takes the record, and its stamp refuses filing until it is spent.
     #[test]
     fn an_earlier_builds_record_holds_its_slot_through_runs() {
         let mut s = site(Scope::Packages(vec!["alpha".into()]));
@@ -10132,10 +10029,8 @@ mod tests {
     }
 
     /// Ending a check ends all that carries its mark: its tree, a grandchild that left the
-    /// root's group and session, and an orphan from the root's group that launchd (or on
-    /// Linux a subreaper) adopted, which no walk of the root's tree finds. The root then execs
-    /// `/bin/sleep`, so only the end ends it: a root that waited for its children would exit on
-    /// its own once the signals that go to them first had ended them.
+    /// root's group and session, and an orphan launchd (or a Linux subreaper) adopted. The root
+    /// execs `/bin/sleep`, so only the end ends it.
     #[test]
     fn ending_a_check_ends_its_whole_tree() {
         let pgid = |pid: u32| {
@@ -10283,11 +10178,9 @@ mod tests {
         );
     }
 
-    /// A CHECK THAT FAILED HOLDS ITS SLOT: cargo fails a build whose build script was killed,
-    /// someone having ended it while macOS held it at its first exec from the slot, and macOS
-    /// goes on assessing that file. So a root that exits other than 0, though nothing of the
-    /// check is left, stamps its slot before its record goes, and the run's last clear keeps
-    /// the slot.
+    /// A root that exits other than 0, though nothing of the check is left, stamps its slot:
+    /// cargo fails a build whose build script was killed at its first exec from the slot, which
+    /// macOS goes on assessing.
     #[test]
     fn a_check_that_failed_holds_its_slot() {
         let d = tmp("trust-lane-failed");

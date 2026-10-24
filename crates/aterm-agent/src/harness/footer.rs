@@ -1848,9 +1848,9 @@ fn key_suffix(body: &str) -> Option<bool> {
         rest.strip_prefix(w)
             .is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_alphanumeric()))
     };
-    if word(aterm_phase::anchor("effort.key_on")) {
+    if word(aterm_phase::anchor!("effort.key_on")) {
         Some(true)
-    } else if word(aterm_phase::anchor("effort.key_off")) {
+    } else if word(aterm_phase::anchor!("effort.key_off")) {
         Some(false)
     } else {
         None
@@ -1873,27 +1873,27 @@ fn effort_result(content: &str) -> Option<EffortSaid> {
         .trim_start();
     let body = crate::harness::upgrade_models::strip_sgr(body);
     if let Some(rest) = past_key(&body) {
-        if let Some(after) = rest.strip_prefix(anchor("effort.top_on")) {
-            let stays = anchor("effort.stays");
+        if let Some(after) = rest.strip_prefix(aterm_phase::anchor!("effort.top_on")) {
+            let stays = aterm_phase::anchor!("effort.stays");
             let stays = after
                 .find(stays)
                 .map_or(Said::Unread, |at| level_word(&after[at + stays.len()..]));
             return Some(EffortSaid::Top { on: true, stays });
         }
-        if let Some(after) = rest.strip_prefix(anchor("effort.top_off")) {
+        if let Some(after) = rest.strip_prefix(aterm_phase::anchor!("effort.top_off")) {
             return Some(EffortSaid::Top {
                 on: false,
                 stays: level_word(after),
             });
         }
-        if rest.starts_with(anchor("effort.top_needs"))
-            || rest.starts_with(anchor("effort.top_unavailable"))
+        if rest.starts_with(aterm_phase::anchor!("effort.top_needs"))
+            || rest.starts_with(aterm_phase::anchor!("effort.top_unavailable"))
         {
             return Some(EffortSaid::Refused);
         }
     }
     let top = key_suffix(&body);
-    if body.starts_with(anchor("effort.auto")) {
+    if body.starts_with(aterm_phase::anchor!("effort.auto")) {
         return Some(EffortSaid::Level {
             said: Said::Unread,
             top,
@@ -2635,7 +2635,7 @@ pub fn is_mode_row(row: &str) -> bool {
     })
 }
 
-const VIM_INSERT: &str = aterm_phase::anchor_text("vim.insert");
+const VIM_INSERT: &str = aterm_phase::anchor!("vim.insert");
 
 fn pill_lead(row: &str) -> Option<&str> {
     let rest = row.strip_prefix("  ")?;
@@ -2666,7 +2666,7 @@ fn cycle_hint_len(after: &str) -> usize {
     };
     let line = &hint[..hint.find("  ").unwrap_or(hint.len())];
     if let Some(close) = line.find(')') {
-        return if line[..close].ends_with(aterm_phase::anchor_text("mode.cycle")) {
+        return if line[..close].ends_with(aterm_phase::anchor!("mode.cycle")) {
             2 + line[..=close].chars().count()
         } else {
             0
@@ -3916,7 +3916,7 @@ pub struct TopReply {
 }
 
 fn is_effort_hint(text: &str) -> bool {
-    text.ends_with(aterm_phase::anchor("effort.hint_tail"))
+    text.ends_with(aterm_phase::anchor!("effort.hint_tail"))
 }
 
 /// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule.
@@ -3928,7 +3928,6 @@ pub fn top_effort_answer(rows: &[String], top_rule: usize) -> Option<TopAnswer> 
 /// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule.
 #[must_use]
 pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
-    use aterm_phase::anchor;
     let top_rule = top_rule.min(rows.len());
     let mut end = top_rule;
     while end > 0 {
@@ -3953,14 +3952,14 @@ pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
         body.push_str(more.trim());
     }
     let rest = past_key(&body)?;
-    let answer = if rest.starts_with(anchor("effort.top_on")) {
+    let answer = if rest.starts_with(aterm_phase::anchor!("effort.top_on")) {
         TopAnswer::On
-    } else if rest.starts_with(anchor("effort.top_off")) {
+    } else if rest.starts_with(aterm_phase::anchor!("effort.top_off")) {
         TopAnswer::Off
-    } else if rest.starts_with(anchor("effort.top_needs")) {
+    } else if rest.starts_with(aterm_phase::anchor!("effort.top_needs")) {
         TopAnswer::NeedsWorkflows
     } else {
-        let named = rest.strip_prefix(anchor("effort.top_unavailable"))?;
+        let named = rest.strip_prefix(aterm_phase::anchor!("effort.top_unavailable"))?;
         let id = named.split_whitespace().next().unwrap_or("");
         let id = id.strip_suffix('.').unwrap_or(id);
         return Some(TopReply {

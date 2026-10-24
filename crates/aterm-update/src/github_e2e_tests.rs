@@ -22,6 +22,12 @@ const QUICK_STALL_SECS: &str = "8";
 
 const FRESH_STALL_SECS: u32 = 2;
 
+/// The fresh attempt's `--speed-limit` in place of the product's 4 KiB/s: curl judges speed
+/// over its last few seconds, so at 4 KiB/s the burst before the hold keeps the attempt
+/// "fast" for about 6 s more; at this limit the hold reads slow at once, and the attempt's
+/// average (the burst over about 3 s) still earns the quick bound for the resume.
+const FRESH_SPEED_LIMIT: u32 = 1024 * 1024;
+
 fn e2e_staging(dir: &std::path::Path) -> Staging {
     let root = dir.join("Updates");
     aterm_update_core::ensure_private_dir(&root.join("download")).expect("scratch updates root");
@@ -287,6 +293,8 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
              sed 's#^https://github.com/#http://127.0.0.1:{port}/#')\"; \
              elif [ $fresh = 1 ] && [ \"$prev\" = --speed-time ] && [ \"$a\" = {quick} ]; \
              then set -- \"$@\" {FRESH_STALL_SECS}; \
+             elif [ $fresh = 1 ] && [ \"$prev\" = --speed-limit ] && [ \"$a\" = 4096 ]; \
+             then set -- \"$@\" {FRESH_SPEED_LIMIT}; \
              else set -- \"$@\" \"$a\"; fi\n  prev=$a\ndone\nexec /usr/bin/curl \"$@\"\n"
         ),
     )

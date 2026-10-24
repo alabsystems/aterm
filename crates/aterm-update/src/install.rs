@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Staging (unpack → verify → publish) and application (lock → re-verify → atomic swap → re-exec) of an update.
+//! Staging (unpack → verify → publish) and application (lock → re-verify → atomic swap → re-exec)
+//! of an update.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,8 @@ use crate::paths::Staging;
 use crate::sys::rename_swap;
 use crate::{ApplyOutcome, bundle, verify};
 
-/// A freshly swapped build is auto-reverted after this many consecutive launches that find the boot sentinel still unconfirmed (a crash loop).
+/// A freshly swapped build is auto-reverted after this many consecutive launches that find the boot
+/// sentinel still unconfirmed (a crash loop).
 pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 
 /// How long a launch waits for the apply lock before starting on the installed build.
@@ -77,7 +79,8 @@ fn copy_attempt_lapsed(root: &Path) -> bool {
         .is_some_and(|age| age >= STALE_COPY_ATTEMPT_AFTER)
 }
 
-/// Reclaims copy attempts no writer and no caller can still use: past [`STALE_COPY_ATTEMPT_AFTER`] and abandoned by their caller or outliving it ([`copy_owner_gone`]).
+/// Reclaims copy attempts no writer and no caller can still use: past [`STALE_COPY_ATTEMPT_AFTER`]
+/// and abandoned by their caller or outliving it ([`copy_owner_gone`]).
 pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -182,10 +185,12 @@ fn ditto_bounded(
 
 const STAGE_UNPACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Slack the free-space check demands over the declared size: filesystem metadata, the extract's own scratch dir, and the verify step's writes.
+/// Slack the free-space check demands over the declared size: filesystem metadata, the extract's
+/// own scratch dir, and the verify step's writes.
 pub(crate) const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
 
-/// The one action a full disk's refusal names, the same for the download, the unpack and the free-space check.
+/// The one action a full disk's refusal names, the same for the download, the unpack and the
+/// free-space check.
 pub(crate) const FREE_SPACE_REMEDY: &str =
     "free some space and check for updates, which retries it at once";
 
@@ -231,7 +236,8 @@ pub(crate) fn unpack_failure(
     ))
 }
 
-/// Bytes still available to this user on the volume holding `path`, or `None` when the volume will not say (an unmounted or foreign path).
+/// Bytes still available to this user on the volume holding `path`, or `None` when the volume will
+/// not say (an unmounted or foreign path).
 pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -244,7 +250,8 @@ pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
     Some(u64::from(vfs.f_bavail) * vfs.f_frsize)
 }
 
-/// Refuse to unpack `needed` bytes into `dir` when the volume cannot hold them plus [`STAGE_FREE_SPACE_HEADROOM`].
+/// Refuse to unpack `needed` bytes into `dir` when the volume cannot hold them plus
+/// [`STAGE_FREE_SPACE_HEADROOM`].
 pub(crate) fn refuse_without_room(dir: &Path, needed: u64, what: &str) -> Result<(), String> {
     let Some(free) = free_bytes_at(dir) else {
         return Ok(());
@@ -298,7 +305,8 @@ pub(crate) struct ExpectedArtifact {
 }
 
 impl ExpectedArtifact {
-    /// The exact artifact a handoff authorizes, from its three parts: a nonzero build, a 40-hex commit and a 64-hex digest, both canonicalized.
+    /// The exact artifact a handoff authorizes, from its three parts: a nonzero build, a 40-hex
+    /// commit and a 64-hex digest, the last two canonicalized.
     pub(crate) fn from_parts(build: u64, commit: &str, dmg_sha256: &str) -> Result<Self, String> {
         if build == 0 {
             return Err("expected update build is malformed".to_string());
@@ -604,7 +612,8 @@ fn process_start(pid: u32) -> Option<(i64, i64)> {
     let raw_pid = i32::try_from(pid).ok()?;
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO
+    // fills; libproc returns the number of bytes it wrote.
     let read = unsafe {
         libc::proc_pidinfo(
             raw_pid,
@@ -696,7 +705,8 @@ fn trial_window_launch_path(staging: &Staging) -> PathBuf {
     staging.root.join("boot.sentinel.windowed")
 }
 
-/// How long a window-launched trial waits for a window to settle it before headless launches may count and confirm it again.
+/// How long a window-launched trial waits for a window to settle it before headless launches may
+/// count and confirm it again.
 pub(crate) const WINDOW_TRIAL_HEADLESS_WAIT: std::time::Duration =
     std::time::Duration::from_secs(48 * 60 * 60);
 
@@ -768,7 +778,8 @@ fn window_trial_wait_notice(build: u64, until: u64) -> String {
     )
 }
 
-/// Status message when `build`'s trial is waiting on a window ([`window_trial_wait_notice`]), or `None`.
+/// Status message when `build`'s trial is waiting on a window ([`window_trial_wait_notice`]), or
+/// `None`.
 pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> Option<String> {
     // Armed as the confirmation reads it ([`trial_armed_for`]): a trial whose
     // sentinel does not read but whose identity names the build is retried, so its
@@ -1210,7 +1221,8 @@ fn recover_abandoned_preswap_trial_if_exact(
     if ready.as_ref().is_some_and(|ready| {
         ready_matches_verified_identity(ready, candidate_build, &candidate_commit)
     }) {
-        // Reclaim `fixed` directly when `staged_app` already holds the candidate (e.g. cross-volume copy).
+        // Reclaim `fixed` directly when `staged_app` already holds the candidate (e.g. cross-volume
+        // copy).
         if verified_bundle_identity(&staging.staged_app)
             .is_ok_and(|(build, commit)| build == candidate_build && commit == candidate_commit)
         {
@@ -1651,7 +1663,8 @@ fn sync_swap_parents(a: &Path, b: &Path, flush: Flush) {
     }
 }
 
-/// Reads a bundle's sealed identity (build + commit), refusing anything that is not a plain directory with an intact, policy-satisfying signature.
+/// Reads a bundle's sealed identity (build + commit), refusing anything that is not a plain
+/// directory with an intact, policy-satisfying signature.
 pub(crate) fn verified_bundle_identity_at(app: &Path) -> Result<(u64, String), String> {
     verified_bundle_identity(app)
 }
@@ -2147,11 +2160,10 @@ fn sweep_stale_scratch(staging: &Staging) {
     sweep_left_incoming(staging, std::time::SystemTime::now());
 }
 
-/// [`sweep_left_incoming`] when the stage lock is free, which every check runs: one that
-/// stages nothing (up to date, covered, held) still reclaims what an earlier stage left,
-/// and one that finds the lock held leaves them to a later sweep. Returns when a later
-/// sweep has work: the longest hold this one kept, or FIRST_EXEC_HANG while a stage holds
-/// the lock; `None` when nothing is left to wait for.
+/// [`sweep_left_incoming`] when the stage lock is free, which every check runs, so one that
+/// stages nothing still reclaims what an earlier stage left. Returns the wait before a later
+/// sweep has work: the longest hold this one kept, or FIRST_EXEC_HANG while a stage holds the
+/// lock; `None` when nothing is left to wait for or the lock cannot be taken.
 pub(crate) fn sweep_left_incoming_unless_staging(staging: &Staging) -> Option<std::time::Duration> {
     match FileLock::acquire_within(&staging.stage_lock, std::time::Duration::ZERO) {
         Ok(_stage_lock) => sweep_left_incoming(staging, std::time::SystemTime::now()),
@@ -2175,10 +2187,10 @@ pub(crate) fn sweep_left_incoming_until_none_held(
 
 /// Reclaims the bundles earlier stages left in `staged/` (`.aterm-incoming-<nonce>.app`), each
 /// once the exec stamp beside it ([`incoming_exec_home`]) lets it go
-/// ([`aterm_uds::deadline::copy_may_go`]). One with no stamp (a stage that never started it, or
-/// an earlier build's, which stamped nothing) is stamped now and goes on a later sweep, so
-/// whatever started it has had FIRST_EXEC_HANG since; a stamp whose bundle is gone goes too.
-/// Runs under the stage lock, so no stage is in flight. Returns the longest hold it kept.
+/// ([`aterm_uds::deadline::copy_wait_left`]). One with no stamp (never started, or left by an
+/// earlier build) is stamped now and goes on a later sweep, so whatever started it has had
+/// FIRST_EXEC_HANG since; a stamp whose bundle is gone goes too. Runs under the stage lock.
+/// Returns the longest hold it kept.
 fn sweep_left_incoming(
     staging: &Staging,
     now: std::time::SystemTime,
@@ -2241,7 +2253,8 @@ fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
         .is_some_and(|expected| crate::commit_matches(&expected, sealed))
 }
 
-/// Pre-park handoff verification of the staged bundle's signature, build number, and commit before stopping parent PTY readers.
+/// Pre-park handoff verification of the staged bundle's signature, build number, and commit before
+/// stopping parent PTY readers.
 pub fn preverify_staged_handoff_candidate(
     current_build: u64,
     current_commit: Option<&str>,
@@ -2272,7 +2285,8 @@ pub const ROLLBACK_SOURCE_REMEDY: &str = "this install cannot update itself: rei
      build, build it with `targo --unverified ship dev-app`, whose ATermDevBuild mark the \
      updater leaves alone";
 
-/// The refusal both apply lanes mint when the installed bundle cannot be the swap's rollback source, with the remedy attached.
+/// The refusal both apply lanes mint when the installed bundle cannot be the swap's rollback
+/// source, with the remedy attached.
 pub fn rollback_source_refusal(installed: &Path, error: &str) -> String {
     format!(
         "the installed bundle at {} {ROLLBACK_SOURCE_REFUSAL_KEY} the swap installs: {error}; \
@@ -2281,17 +2295,20 @@ pub fn rollback_source_refusal(installed: &Path, error: &str) -> String {
     )
 }
 
-/// True when a refusal string is the installed-bundle one — permanent for this process until a person changes the bundle, never a retry candidate.
+/// True when a refusal string is the installed-bundle one — permanent for this process until a
+/// person changes the bundle, never a retry candidate.
 pub fn is_rollback_source_refusal(reason: &str) -> bool {
     reason.contains(ROLLBACK_SOURCE_REFUSAL_KEY)
 }
 
-/// The one sentence that names the way out of a non-writable install location ([`crate::INSTALL_LOCATION_REFUSAL_KEY`]).
+/// The one sentence that names the way out of a non-writable install location
+/// ([`crate::INSTALL_LOCATION_REFUSAL_KEY`]).
 pub(crate) const INSTALL_LOCATION_REMEDY: &str = "this install cannot update itself: move aterm.app to \
      a folder you can write to (such as ~/Applications), or have an administrator install \
      the update";
 
-/// The refusal for an install whose parent folder this user cannot write (an admin-installed `/Applications` run by a standard user, or an MDM-managed one).
+/// The refusal for an install whose parent folder this user cannot write (an admin-installed
+/// `/Applications` run by a standard user, or an MDM-managed one).
 pub(crate) fn install_location_refusal(app_root: &Path) -> String {
     format!(
         "{}: {}; {INSTALL_LOCATION_REMEDY}",
@@ -2384,13 +2401,12 @@ impl ProbeClock {
 }
 
 /// `fixed.unproven.v2`: the candidate a start probe is about to start, written before the
-/// probe starts it and cleared when the probe saw an exit of its own or never started the
-/// candidate, so an apply killed mid-probe still holds the candidate where it ran for
-/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, or until a restart, after which the
-/// record is dropped. Every install sharing this Updates root shares the one record, and every
-/// one's swap defers while it holds; so it does while an earlier build's `fixed.unproven`
-/// holds (on the wall clock), and while a record this build cannot parse is younger than
-/// FIRST_EXEC_HANG by its file's mtime.
+/// probe starts it and cleared when the probe saw an exit of its own or never started it, so an
+/// apply killed mid-probe still holds the candidate where it ran for
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, or until a restart. Every install
+/// sharing this Updates root shares the one record and defers its swap while it holds, as it
+/// does for an earlier build's `fixed.unproven` (on the wall clock) and for a record this build
+/// cannot parse that is younger than FIRST_EXEC_HANG by its mtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UnprovenCandidate {
     bundle: PathBuf,
@@ -2536,10 +2552,9 @@ impl UnprovenCandidate {
         let _ = std::fs::remove_file(unproven_candidate_path(staging));
     }
 
-    /// The candidate the record at `path` holds and the seconds it stays, whichever install's
-    /// path it names (`None` for a record this build cannot parse, which may name any), or
-    /// `None`, dropping a record whose hold is spent; one that cannot be read is kept and its
-    /// error returned.
+    /// The candidate the record at `path` holds (`None` for a record this build cannot parse)
+    /// and the seconds it stays; `None` when there is no record or its hold is spent, which
+    /// drops it. A record that cannot be read is kept and its error returned.
     fn holds_at(path: &Path, now: ProbeClock) -> std::io::Result<Option<(Option<PathBuf>, u64)>> {
         let hang = aterm_uds::deadline::FIRST_EXEC_HANG
             .as_secs()
@@ -2623,7 +2638,8 @@ fn preverify_installed_rollback_source_with(
     }
 }
 
-/// Check whether a cached pre-verification pass for an installed activation `build` is still valid against the operator floor and current install path.
+/// Check whether a cached pre-verification pass for an installed activation `build` is still valid
+/// against the operator floor and current install path.
 pub(crate) fn handoff_activation_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -2678,7 +2694,8 @@ fn handoff_floor_refusal(staging: &Staging, build: u64, machine: Option<&str>) -
     })
 }
 
-/// Check whether a cached pre-verification pass for staged `build` at `commit` still matches the published, unquarantined, floor-admitted stage.
+/// Check whether a cached pre-verification pass for staged `build` at `commit` still matches the
+/// published, unquarantined, floor-admitted stage.
 pub(crate) fn handoff_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -2734,13 +2751,15 @@ pub(crate) fn handoff_cached_pass_refusal_at(
     })
 }
 
-/// What a handoff pre-verification holds while it runs: the apply lock (when there is a staging root to take it in) and, under it, the verification budget.
+/// What a handoff pre-verification holds while it runs: the apply lock (when there is a staging
+/// root to take it in) and, under it, the verification budget.
 pub(crate) struct PreverifyGuard {
     _budget: verify::ApplyBudget,
     _lock: Option<FileLock>,
 }
 
-/// Enters a handoff pre-verification: takes `apply_lock` within [`APPLY_LOCK_WAIT`], then opens [`verify::APPLY_BUDGET`] for everything the check runs.
+/// Enters a handoff pre-verification: takes `apply_lock` within [`APPLY_LOCK_WAIT`], then opens
+/// [`verify::APPLY_BUDGET`] for everything the check runs.
 pub(crate) fn enter_preverify(apply_lock: Option<&Path>) -> Result<PreverifyGuard, String> {
     let lock = apply_lock
         .map(|path| FileLock::acquire_within(path, APPLY_LOCK_WAIT))
@@ -2928,7 +2947,7 @@ impl Drop for StageIncoming {
     }
 }
 
-/// Where `incoming`'s exec is stamped ([`aterm_uds::deadline::stamp_exec`]): a directory
+/// Where `incoming`'s exec is stamped ([`aterm_uds::deadline::try_stamp_exec`]): a directory
 /// beside the bundle, since a file in a bundle's root breaks its seal.
 fn incoming_exec_home(incoming: &Path) -> PathBuf {
     let mut home = incoming.as_os_str().to_os_string();
@@ -2948,7 +2967,8 @@ fn stamp_incoming_exec(incoming: &Path) -> std::io::Result<()> {
     })
 }
 
-/// Mount `dmg`, copy out `aterm.app`, verify its signature and identity, and atomically publish `staged/aterm.app` and `ready.toml`.
+/// Mount `dmg`, copy out `aterm.app`, verify its signature and identity, and atomically publish
+/// `staged/aterm.app` and `ready.toml`.
 pub fn stage_from_dmg(
     staging: &Staging,
     dmg: &Path,
@@ -3297,7 +3317,9 @@ fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
     central_directory_claim(&mut file, extent)
 }
 
-/// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) ZIP: `ditto -x -k` extract, then the same verification and publication as [`stage_from_dmg`] ([`verify_and_publish_incoming`]).
+/// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) ZIP: `ditto -x -k`
+/// extract, then the same verification and publication as [`stage_from_dmg`]
+/// ([`verify_and_publish_incoming`]).
 pub fn stage_from_zip(
     staging: &Staging,
     zip: &Path,
@@ -3526,29 +3548,36 @@ fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
     }
 }
 
-/// What a launch's boot does with a ready stage, by its image class ([`crate::ImageReplacement`]); [`boot_image_lane`] decides it.
+/// What a launch's boot does with a ready stage, by its image class ([`crate::ImageReplacement`]);
+/// [`boot_image_lane`] decides it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BootImageLane {
     /// Swap the stage in and exec the build it installed.
     SwapAndExec,
-    /// Leave the admitted stage for the window's automatic in-session lane and record this launch ([`ApplyOutcome::LeftForSession`]).
+    /// Leave the admitted stage for the window's automatic in-session lane and record this launch
+    /// ([`ApplyOutcome::LeftForSession`]).
     LeaveForSession,
-    /// Leave the stage for a manual install (`[update] auto_apply = false`) without recording an escape count.
+    /// Leave the stage for a manual install (`[update] auto_apply = false`) without recording an
+    /// escape count.
     LeaveForPress,
     /// Swap nothing: a LaunchServices-launched successor, whose parent swapped first.
     NeverSwap,
 }
 
-/// The left-stage record ([`left_stage_path`]) as one boot of a window that keeps its image found it, for [`boot_image_lane`].
+/// The left-stage record ([`left_stage_path`]) as one boot of a window that keeps its image found
+/// it, for [`boot_image_lane`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeftRecord {
-    /// It names this many launches that left this same stage and have ended ([`TrialLauncher::has_ended`]'s positive evidence; a clean quit and a crash alike).
+    /// It names this many launches that left this same stage and have ended
+    /// ([`TrialLauncher::has_ended`]'s positive evidence; a clean quit and a crash alike).
     Ended(usize),
-    /// It cannot count this launch: it could not be read or written, or the kernel will not name this process.
+    /// It cannot count this launch: it could not be read or written, or the kernel will not name
+    /// this process.
     Unusable,
 }
 
-/// The boot's lane for a ready stage: a launched successor never swaps, and a replaceable launch swaps and execs.
+/// The boot's lane for a ready stage: a launched successor never swaps, and a replaceable launch
+/// swaps and execs.
 pub(crate) const fn boot_image_lane(
     image: crate::ImageReplacement,
     auto_apply: bool,
@@ -3576,7 +3605,8 @@ pub(crate) enum RevertLane {
     ExitInstead,
 }
 
-/// The crash-loop revert's lane by image class: only a LaunchServices-launched successor exits instead of re-executing the restored build.
+/// The crash-loop revert's lane by image class: only a LaunchServices-launched successor exits
+/// instead of re-executing the restored build.
 pub(crate) const fn revert_lane(image: crate::ImageReplacement) -> RevertLane {
     match image {
         crate::ImageReplacement::LaunchedSuccessor => RevertLane::ExitInstead,
@@ -3586,7 +3616,9 @@ pub(crate) const fn revert_lane(image: crate::ImageReplacement) -> RevertLane {
     }
 }
 
-/// Applies a staged update if it is ready and strictly newer.
+/// Applies a staged update if it is ready and strictly newer; on success it re-execs and never
+/// returns. Each refusal is recorded here, after the inner call has let go of the apply lock, so
+/// the health ledger lock is never taken under it.
 pub fn apply_staged_if_ready(
     current_build: u64,
     current_commit: Option<&str>,
@@ -3942,10 +3974,10 @@ fn swap_admitted_stage(
     )?;
     let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
 
-    // The record goes down before the probe starts the candidate, so an apply killed
-    // mid-probe leaves it holding the candidate where it ran; with no record, no probe.
-    // `prepare_fixed_swap_candidate` deferred on any live record, and the apply lock keeps
-    // every other writer out, so this replaces none and the clear below drops only this one.
+    // The record goes down before the probe starts the candidate, so an apply killed mid-probe
+    // leaves it holding the candidate; with no record, no probe. `prepare_fixed_swap_candidate`
+    // deferred on any live record and the apply lock keeps other writers out, so this replaces
+    // no record and the clear below drops only this one.
     let started = UnprovenCandidate {
         bundle: prepared.fixed.clone(),
         started: ProbeClock::now(),
@@ -3965,11 +3997,10 @@ fn swap_admitted_stage(
         UnprovenCandidate::clear(staging);
     }
     if let Err(error) = probed {
-        // A probe that started the candidate and saw no exit of its own (killed at the
-        // probe's ceiling or by any other signal) leaves macOS assessing its first
-        // exec, which the kill does not end: the candidate stays exactly where it ran
-        // and its record stays ([`keep_unproven_candidate`]). Any other failure either
-        // ran it to an exit or never started it, and is backed out as before.
+        // A probe that started the candidate and saw no exit of its own leaves macOS assessing
+        // its first exec, which the kill does not end: the candidate and its record stay where
+        // they are ([`keep_unproven_candidate`]). Any other failure ran it to an exit or never
+        // started it, and is backed out.
         if probe_left_unproven(&error) {
             keep_unproven_candidate(&prepared, staging);
         } else {
@@ -4159,7 +4190,8 @@ fn record_left_launch(
     Ok(())
 }
 
-/// Swap the stage authorized by `expected` into the install path before launching a successor via LaunchServices.
+/// Swap the stage authorized by `expected` into the install path before launching a successor via
+/// LaunchServices.
 pub(crate) fn swap_staged_for_launch(
     current_build: u64,
     current_commit: &str,
@@ -4438,7 +4470,7 @@ fn check_boot_health_with_proof(
     };
     if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
         // An unconfirmed trial owns the fixed rollback path. Do not fall through
-        // into another apply transaction that could overwrite its sole OLD copy.
+        // into another apply transaction that could overwrite its sole old copy.
         return Some(ApplyOutcome::NotApplicable);
     }
     Some(revert_to_rollback(
@@ -4608,7 +4640,8 @@ fn revert_to_rollback(
     ApplyOutcome::ReExecFailed(err.to_string())
 }
 
-/// The running build takes the install path back from an activation a newer stage supersedes: the transaction behind [`crate::supersede_installed_activation`].
+/// The running build takes the install path back from an activation a newer stage supersedes: the
+/// transaction behind [`crate::supersede_installed_activation`].
 pub(crate) fn supersede_installed_activation(
     current_build: u64,
     current_commit: &str,
@@ -5098,7 +5131,8 @@ fn confirm_health_under_apply_lock(
     })
 }
 
-/// How many launches the boot sentinel has counted for `build` (0 when it is armed for another build, or not armed at all).
+/// How many launches the boot sentinel has counted for `build` (0 when it is armed for another
+/// build, or not armed at all).
 #[must_use]
 pub(crate) fn trial_launch_count(build: u64) -> u32 {
     Staging::resolve().map_or(0, |staging| trial_launch_count_at(&staging, build))
@@ -5147,7 +5181,8 @@ fn write_trial_launch_stamp(stamp: &Path, launch: TrialLauncher) -> std::io::Res
     file.write_all(format!("{} {} {}\n", name.pid, name.started.0, name.started.1).as_bytes())
 }
 
-/// Read the [`LaunchName`] recorded at `stamp` ([`write_trial_launch_stamp`]), or `None` if absent or malformed.
+/// Read the [`LaunchName`] recorded at `stamp` ([`write_trial_launch_stamp`]), or `None` if absent
+/// or malformed.
 pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -5509,7 +5544,9 @@ fn trial_give_back_lock(
     }
 }
 
-/// Confirms the running build reached a healthy checkpoint (window up / first frame): clears the boot sentinel, keeps the retained rollback bundle for the window that started from it ([`kept_predecessor_path`]) and GCs the orphaned post-swap copy.
+/// Confirms the running build reached a healthy checkpoint (window up / first frame): clears the
+/// boot sentinel, keeps the retained rollback bundle for the window that started from it
+/// ([`kept_predecessor_path`]) and GCs the orphaned post-swap copy.
 #[must_use]
 pub fn confirm_boot_health(
     current_build: u64,
@@ -5765,7 +5802,8 @@ fn records_unreadable_deferral(
     ApplyOutcome::Deferred(refusal)
 }
 
-/// Check the admission gates for a stage read under the apply lock: expected handoff artifact, floor withdrawals, quarantine, published bundle match, and roster freshness.
+/// Check the admission gates for a stage read under the apply lock: expected handoff artifact,
+/// floor withdrawals, quarantine, published bundle match, and roster freshness.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -5852,7 +5890,8 @@ fn roster_freshness_gate(ready: &Ready, now: u64) -> Option<ApplyOutcome> {
         .map(ApplyOutcome::Deferred)
 }
 
-/// Record that `staged` was re-confirmed against an admitted roster at `confirmed_at` (RFC3339) and withdraw any stale-roster apply refusal.
+/// Record that `staged` was re-confirmed against an admitted roster at `confirmed_at` (RFC3339) and
+/// withdraw any stale-roster apply refusal.
 pub(crate) fn confirm_roster_authorization(
     staging: &Staging,
     staged: &Ready,
@@ -5927,18 +5966,22 @@ fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
-/// Best-effort RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for the human-readable `staged_at`/status fields, computed in-process (no `/bin/date` fork).
+/// Best-effort RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, empty when the clock gives no time)
+/// for the human-readable `staged_at` and status fields.
 pub(crate) fn now_rfc3339() -> String {
     aterm_time::unix_secs().map_or_else(String::new, format_rfc3339)
 }
 
-/// Unix seconds now, or 0 on a pre-epoch clock, for the stage-failure retry budget's deadlines and the check lane's window and receipt.
+/// Unix seconds now, or 0 on a pre-epoch clock, for the stage-failure retry budget's deadlines and
+/// the check lane's window and receipt.
 #[must_use]
 pub(crate) fn unix_now_secs() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// Seconds between two of our own RFC3339 instants (`later - earlier`), or `None` when either string is not the exact `YYYY-MM-DDTHH:MM:SSZ` shape this module writes (e.g. the empty pre-epoch fallback) or `later` precedes `earlier`.
+/// Seconds between two RFC3339 instants as this module writes them (`later - earlier`), or `None`
+/// when either is not exactly `YYYY-MM-DDTHH:MM:SSZ` (such as the empty pre-epoch fallback) or
+/// `later` precedes `earlier`.
 pub(crate) fn rfc3339_delta_secs(earlier: &str, later: &str) -> Option<u64> {
     fn epoch(s: &str) -> Option<u64> {
         u64::try_from(aterm_types::rfc3339::parse_utc(s)?).ok()

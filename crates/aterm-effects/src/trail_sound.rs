@@ -1073,6 +1073,18 @@ struct Bed {
     sky_detune: f32,
 }
 
+impl Bed {
+    #[inline]
+    fn lfo_u1(&self) -> f32 {
+        0.5 * (1.0 + sin01(self.lfo1))
+    }
+
+    #[inline]
+    fn lfo_u2(&self) -> f32 {
+        0.5 * (1.0 + sin01(self.lfo2))
+    }
+}
+
 #[inline]
 const fn bed_kick(kind: SoundKind) -> f32 {
     match kind {
@@ -2885,10 +2897,8 @@ impl TrailSynth {
     fn bed_sample_with(&mut self, palette: &dyn Palette, dt: f32, lvl: f32) -> (f32, f32) {
         self.bed.lfo1 = (self.bed.lfo1 + 0.23 * dt).fract();
         self.bed.lfo2 = (self.bed.lfo2 + 0.71 * dt).fract();
-        let u1 = 0.5 * (1.0 + sin01(self.bed.lfo1));
-        let u2 = 0.5 * (1.0 + sin01(self.bed.lfo2));
 
-        let (m, side) = palette.bed_sample(self, dt, lvl, u1, u2);
+        let (m, side) = palette.bed_sample(self, dt, lvl);
         (m + side, m - side)
     }
 }
@@ -2910,14 +2920,7 @@ trait Palette {
     }
 
     #[inline]
-    fn bed_sample(
-        &self,
-        _s: &mut TrailSynth,
-        _dt: f32,
-        _lvl: f32,
-        _u1: f32,
-        _u2: f32,
-    ) -> (f32, f32) {
+    fn bed_sample(&self, _s: &mut TrailSynth, _dt: f32, _lvl: f32) -> (f32, f32) {
         (0.0, 0.0)
     }
 
@@ -3030,7 +3033,8 @@ impl Palette for LumenPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 165.0 * dt).fract();
         b.ph2 = (b.ph2 + 165.6 * dt).fract();
@@ -3153,7 +3157,8 @@ impl Palette for PhaserPalette {
         s.bed.timer = s.rnd_in(0.45, 1.2) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 196.0 * dt).fract();
         b.ph2 = (b.ph2 + 196.8 * dt).fract();
@@ -3256,7 +3261,8 @@ impl Palette for SparklePalette {
         s.bed.timer = s.rnd_in(0.15, 0.5) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        let u2 = s.bed.lfo_u2();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 261.6 * dt).fract();
         b.ph2 = (b.ph2 + 262.4 * dt).fract();
@@ -3403,7 +3409,7 @@ impl Palette for FirePalette {
         s.bed.timer = s.rnd_in(0.03, 0.18) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
         let k = (380.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
@@ -3567,7 +3573,7 @@ impl Palette for LaserPalette {
         s.bed.timer = s.rnd_in(0.5, 1.4) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
         let b = &mut s.bed;
         let k = (140.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
@@ -3674,8 +3680,9 @@ impl Palette for BeamPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
+        let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         let cut = 130.0 - 55.0 * b.droop;
         let k = (cut.max(60.0) * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
@@ -3832,8 +3839,10 @@ impl Palette for WaterPalette {
         s.bed.timer = s.rnd_in(0.25, 0.9) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let white = s.rnd() * 2.0 - 1.0;
+        let u1 = s.bed.lfo_u1();
+        let u2 = s.bed.lfo_u2();
         let b = &mut s.bed;
         let k = (600.0 * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
         b.lp1 += k * (white - b.lp1);
@@ -4009,7 +4018,8 @@ impl Palette for CometPalette {
         s.bed.timer = s.rnd_in(0.6, 1.6) / level.max(0.05);
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 110.0 * dt).fract();
         b.ph2 = (b.ph2 + 110.5 * dt).fract();
@@ -4389,7 +4399,8 @@ impl Palette for MarimbaPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
+        let u1 = s.bed.lfo_u1();
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 130.8 * dt).fract();
         b.ph2 = (b.ph2 + 196.2 * dt).fract();
@@ -4480,7 +4491,7 @@ impl Palette for FeltPalette {
         }
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         let b = &mut s.bed;
         b.ph1 = (b.ph1 + 98.0 * dt).fract();
         b.ph2 = (b.ph2 + 98.3 * dt).fract();

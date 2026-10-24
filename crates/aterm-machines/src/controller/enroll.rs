@@ -861,12 +861,11 @@ fn seconds_check(words: &str) -> String {
     format!("for n in {words}; do case $n in ''|*[!0-9]*|?????????????*) ok=;; esac; done\n")
 }
 
-/// Shell that sets `sess` to this boot's id, `boot` and `woke` to the Unix seconds of the
-/// boot and of the last wake, and `up` to the wall clock less `boot`: the seconds since
-/// boot, asleep or awake, which no step of the wall clock moves, since XNU moves the boot
-/// time with each step. The boot time is read again after the wall clock, so a step between
-/// the two reads shows as a boot time that moved. A reading of another form, or a boot time
-/// that moved, ends the script.
+/// Shell that sets `sess` to this boot's id, `boot` and `woke` to the Unix seconds of the boot
+/// and the last wake, and `up` to the wall clock less `boot`: seconds since boot, asleep or
+/// awake, which no wall-clock step moves, since XNU moves the boot time with each step. The
+/// boot time is read again after the wall clock, so a step between the reads shows as a moved
+/// boot time; that, or a reading of another form, ends the script.
 fn clock_reading(c: &Clocks<'_>) -> String {
     let Clocks {
         session,
@@ -895,14 +894,14 @@ fn stamp_line(staging: &str) -> String {
     format!("echo \"$sess $up $boot $woke\" > {staging}/exec\n")
 }
 
-/// The root script's refusal to clear `staging` while the agent an earlier enrollment
-/// started from it has not shown it ran. [`root_script`] stamps `exec` there with the boot's
-/// id and [`clock_reading`]'s readings just before the agent's first exec, and the agent
-/// writes `ran` first thing ([`crate::agent::install::main`]). A restart since releases it.
-/// Otherwise it holds for [`aterm_uds::deadline::FIRST_EXEC_HANG`] of `up` from the later of
-/// the stamp and the last wake, so time asleep is not counted. A stamp it cannot read, and
-/// a wake it cannot place on `up` (the wall clock stepped since the stamp too), hold for
-/// the whole of it from the moment this finds them: it stamps `exec` again then.
+/// The root script's refusal to clear `staging` while the agent an earlier enrollment started
+/// from it has not shown it ran: [`root_script`] stamps `exec` with [`clock_reading`]'s readings
+/// just before the agent's first exec, and the agent writes `ran` first thing
+/// ([`crate::agent::install::main`]). A restart since releases it; otherwise it holds for
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of `up` from the later of the stamp and the last
+/// wake, so time asleep is not counted. A stamp it cannot read, or a wake it cannot place on
+/// `up` (the wall clock stepped since the stamp too), makes it hold for the whole hang from now
+/// and stamp `exec` again.
 #[must_use]
 pub fn stage_guard(staging: &str) -> String {
     guard_reading(staging, &MAC_CLOCKS)
@@ -2724,7 +2723,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A stage with a staged agent, its `exec` stamp `stamp` when it is `Some`.
+    /// A stage with a staged agent, its `exec` stamp `stamp` when it is `Some`, and its `ran`
+    /// marker when `ran`.
     fn staged(stage: &Path, stamp: Option<&str>, ran: bool) {
         std::fs::create_dir_all(stage.join("payload")).unwrap();
         std::fs::write(stage.join("payload/aterm"), b"agent").unwrap();

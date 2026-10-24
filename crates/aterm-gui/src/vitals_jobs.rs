@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE VITALS HOST'S JOBS PASS: the stuck-process engine (`aterm_vitals::jobs`, design §11) fed on the probe thread, so the stats bars' marks (⊘ ◔ ☠ ◇ and the drawn pause) and the lens's Jobs well show the verdicts the engine reaches.
+//! The vitals host's jobs pass: the stuck-process engine (`aterm_vitals::jobs`) fed on the probe
+//! thread, so the stats bars' marks and the lens's Jobs well show its verdicts.
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,25 +21,32 @@ use aterm_vitals::jobs::{
 };
 use aterm_vitals::model::TabRoot;
 
-/// The engine's fast cadence (§11.3): also the floor between passes, so a
-/// 2 Hz lens does not double the detailed reads.
+/// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
+/// detailed reads.
 const FAST_MS: u64 = 2_000;
 
-/// The most CPU a process outside every job may have used for the pass to read its start: a held one has about 2 ms, the fork child's work before its exec (leftover M4), so its counters cannot tell it from an idle one and only the thread call decides. The development build's stand-in is read whatever its CPU: it stands for the kernel's answer, not for the choice of whom to ask.
+/// The most CPU a process outside every job may have used for the pass to read its start. A held
+/// one has used about 2 ms, the fork child's work before its exec (leftover M4), so its counters
+/// cannot tell it from an idle one: CPU only selects rows, and the thread call decides.
 pub(crate) const HELD_CPU_NS: u64 = 20_000_000;
 
-/// The readers the pass asks of this user's processes outside every job, and the held stand-in it reads (`KERNEL` live, `INERT` in unit tests): none reads a process's arguments or environment, which can hang on a program held mid-start (leftover M29).
+/// The readers the pass asks of this user's processes outside every job, and the held stand-in
+/// (`KERNEL` live, `INERT` in unit tests). None reads a process's arguments or environment, which
+/// can hang on a program held mid-start (leftover M29).
 #[derive(Clone, Copy)]
 pub(crate) struct HeldReaders {
-    /// Where a process stands at its start, one mount table read for the pass ([`probe::read_start_in`], [`probe::judge_start`]).
+    /// Where a process stands at its start, one mount table read for the pass
+    /// ([`probe::read_start_in`], [`probe::judge_start`]).
     pub(crate) start: fn(u32, &OnceCell<Table>) -> Option<AtStart>,
     /// Its pid version, which moves on exec ([`aterm_uds::process::read_identity`]).
     pub(crate) exec: fn(u32) -> Option<u64>,
     /// Its resource coalition ([`aterm_sysprobe::coalitions::coalition_of`]).
     pub(crate) coalition: fn(u32) -> Option<u64>,
-    /// Its executable's file name, the basename of [`aterm_sysprobe::process_path`] (`p_comm` cuts a name at 16 bytes).
+    /// Its executable's file name, the basename of [`aterm_sysprobe::process_path`] (`p_comm` cuts
+    /// a name at 16 bytes).
     pub(crate) exe_name: fn(u32) -> Option<String>,
-    /// The pid a development build stands in as held ([`crate::program_check_watch::held_stand_in`]).
+    /// The pid a development build stands in as held
+    /// ([`crate::program_check_watch::held_stand_in`]).
     pub(crate) stand_in: fn() -> Option<u32>,
 }
 
@@ -102,7 +110,10 @@ impl JobsPass {
         }
     }
 
-    /// One reading's pass: run the engine when it is due, or whenever `now` (a reading an edge asked: the loop paces those itself, on its own clock, and one that lands a little inside this pass's cadence must still look, or the job it was asked for goes unseen until the next edge), and return the view to publish (the last one when it is not due).
+    /// One reading's pass: runs the engine when it is due, or whenever `now` (an edge's reading:
+    /// the loop paces those on its own clock, and one landing inside this pass's cadence must
+    /// still look, or the job it was asked for goes unseen until the next edge). Returns the view
+    /// to publish, the last one when the engine did not run.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick(
         &mut self,
@@ -181,7 +192,15 @@ impl JobsPass {
     }
 }
 
-/// THIS USER'S PROGRAMS THAT HAVE NOT STARTED, members of a job or not (leftover §4.2, §5.1): a member of `members` (the pass's detailed readings, each judged from its own thread list, [`member_start`]) where it reads held, translating or unstarted; every other row of `sweep` of `self_uid` that is no zombie and has used at most [`HELD_CPU_NS`] (or is `stand_in`'s, which reads held whatever its CPU), where `start` reads it so. Each carries what keeps it ([`StartWait`]), is keyed by its pid version (`exec`, else its start, so an exec starts a new held time), named by its executable (a member's own reading, else `exe_name`, else its short name) and is aterm's when it is a member or `in_aterm` says so (aterm's coalition: words only). `start` is asked of nothing else, `exec` of the rows the list names alone, and `exe_name` of those outside every job alone.
+/// This user's programs that have not started, members of a job or not: each member of `members`
+/// (judged from its own thread list, [`member_start`]) that reads held, translating or unstarted,
+/// and each other row of `sweep` of `self_uid` that is no zombie, has used at most
+/// [`HELD_CPU_NS`] (or is `stand_in`, held whatever its CPU) and that `start` reads so. Each is
+/// keyed by its pid version (`exec`, else its start, so an exec starts a new held time), named by
+/// its executable (a member's own reading, else `exe_name`, else its short name), and is aterm's
+/// when it is a member or `in_aterm` (aterm's coalition) says so. `start` is asked only of those
+/// sweep rows but the stand-in, `exec` only of the rows listed, and `exe_name` only of listed rows
+/// outside every job.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn held_list(
     sweep: &[ProcessReading],
@@ -235,7 +254,8 @@ pub(crate) fn held_list(
     held
 }
 
-/// What keeps a process that stands `at` its start from starting, as the engine names it; `None` for one that started.
+/// What keeps a process that stands `at` its start from starting, as the engine names it; `None`
+/// for one that started.
 const fn start_wait(at: AtStart) -> Option<StartWait> {
     match at {
         AtStart::Started => None,
@@ -245,7 +265,10 @@ const fn start_wait(at: AtStart) -> Option<StartWait> {
     }
 }
 
-/// Where member reading `p` stands at its start ([`ProcFacts::program_check`]); `stand_in` (a development build's `program-check held <pid>`) reads held where the reading judged a start, as the kernel's own held reading needs (no zombie, none of another user's: their thread list is not read).
+/// Where member reading `p` stands at its start ([`ProcFacts::program_check`]). `stand_in` (a
+/// development build's `program-check held <pid>`) reads held only where the reading judged a
+/// start, as the kernel's own held reading needs: never for a zombie or another user's process,
+/// whose thread list is not read.
 fn member_start(p: &ProcFacts, stand_in: Option<u32>) -> Option<AtStart> {
     let judged = p.program_check();
     if stand_in == Some(p.pid) && judged.is_some() {
@@ -258,12 +281,21 @@ fn member_start(p: &ProcFacts, stand_in: Option<u32>) -> Option<AtStart> {
 /// How old the board's view may be and still speak for the canary ([`JobsBoard::evidence`]).
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 
-/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`] old does; so does a PARKED one (its demand idle: every live job waits only for the person, or none is live; and no program has not started, [`holds_a_wait`]) of any age while its reader runs (`reader`), because a parked engine is read again only on an edge (output that moves a screen, a parked screen's redraw at most once a floor, a session's fork, `exec` or exit the kernel watch hears, the disk watch's look; design §6.1), so no reading since says nothing changed that drew or that the kernel told of. A held program's start raises no such edge, and a view that holds a wait is read again on a timer instead, so past [`JOBS_FRESH`] its reader has stopped delivering.
+/// Whether a jobs view `age` old speaks for now: one at most [`JOBS_FRESH`] old does, and so does a
+/// parked one (demand idle and no [`holds_a_wait`]) of any age while its reader runs (`reader`). A
+/// parked engine is read again only on an edge (output that moves a screen, a parked screen's
+/// redraw at most once a floor, a session's fork, exec or exit, the disk watch's look), so no
+/// reading since means nothing that draws or that the kernel tells of changed. A start raises no
+/// edge, and a view that holds a wait is read on a timer instead, so past [`JOBS_FRESH`] its
+/// reader has stopped delivering.
 pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
     age <= JOBS_FRESH || (reader && view.demand == Demand::Idle && !holds_a_wait(view))
 }
 
-/// Whether `view` names a program of this user that has not started (macOS's program check holds it, Rosetta translates it, or its volume is not proven local), or stands in a backed-up episode that has not had its closing reading (leftover §5.1): it is read again after 30 s at the latest, whatever its demand (`vitals_host::job_demand_after`), since a start raises no edge.
+/// Whether `view` names a program of this user that has not started (held by macOS's program
+/// check, translating under Rosetta, or on a volume not proven local), or stands in a backed-up
+/// episode that has not had its closing reading. Such a view is read again within 30 s whatever
+/// its demand (`vitals_host::job_demand_after`), since a start raises no edge.
 pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
     let f = &view.findings;
     !f.program_check.is_empty()
@@ -272,7 +304,10 @@ pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
         || f.program_check_episode.is_some()
 }
 
-/// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's program check holds, a lower bound (`Findings::program_check`, aterm's and others'), and the longest held to now, ms (its first sighting's age plus the view's); `None` when the view does not speak for now ([`speaks_for_now`], its reader running `reader`).
+/// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's
+/// program check holds (a lower bound, aterm's and others'), and the longest held to now in ms (its
+/// first sighting's age plus the view's); `None` when the view does not speak for now
+/// ([`speaks_for_now`]).
 pub(crate) fn program_check_of(view: &JobsView, age: Duration, reader: bool) -> Option<(u32, u64)> {
     if !speaks_for_now(view, age, reader) {
         return None;
@@ -293,8 +328,8 @@ struct Posted {
     at: Instant,
 }
 
-/// THE JOBS BOARD: the view the loop last adopted, with its tabs' session ids, read by the
-/// harness workers' stall canary ([`JobsBoard::evidence`]); one leaf-locked slot.
+/// The view the loop last adopted, with its tabs' session ids, read by the harness workers' stall
+/// canary ([`JobsBoard::evidence`]); one leaf-locked slot.
 pub(crate) struct JobsBoard {
     slot: Mutex<Option<Posted>>,
 }
@@ -317,7 +352,12 @@ impl JobsBoard {
         *slot = Some(Posted { view, sids, at });
     }
 
-    /// WHAT THE VIEW SAYS OF SESSION `sid`'S AGENT'S BACKGROUND WORK at `now`: [`BackgroundEvidence::NoProgress`] with the call quiet longest when every live agent call of this session's tab that is background (or not known to be foreground: `Consumer::Agent`, which no join can tell apart today) reads `no_progress`; else `Unknown` — no view, one older than [`JOBS_FRESH`], none of this session's, or a live call of the agent's that does not read `no_progress`, which may be the work the screen waits on (system awareness §14.5's `AllStuck` asks every live job; its `Progressing` is not built), so the ladder is today's.
+    /// What the view says of session `sid`'s agent's background work at `now`:
+    /// [`BackgroundEvidence::NoProgress`] with the call quiet longest when every live agent call of
+    /// the session's tab that is background, or not known to be foreground (`Consumer::Agent`),
+    /// reads `no_progress`. Else `Unknown`: no view, one older than [`JOBS_FRESH`], no call of this
+    /// session's, or a live call that does not read `no_progress`, which may be the work the screen
+    /// waits on.
     pub(crate) fn evidence(&self, sid: &str, now: Instant) -> BackgroundEvidence {
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(posted) = slot
@@ -346,13 +386,11 @@ impl JobsBoard {
             })
     }
 
-    /// WHAT THE VIEW SAYS SESSION `sid`'S AGENT MAY BE TOLD at `now` (the hung-call design's R2;
-    /// `harness_host::WorkerIdle::facts`): every live agent call of this session's tab
-    /// ([`background_call_live`]) that reads `no_progress`, EACH REGARDLESS OF THE OTHERS (unlike
-    /// [`Self::evidence`], a call making progress beside it takes nothing from it), worst (quiet
-    /// longest) first, each with its leader's pid for the caller's re-proof, and the view's age;
-    /// `None` with no view or one older than [`JOBS_FRESH`]. The rows are copied under the lock
-    /// and nothing else is done there.
+    /// What session `sid`'s agent may be told at `now` (`harness_host::WorkerIdle::facts`): every
+    /// live agent call of the session's tab ([`background_call_live`]) that reads `no_progress`,
+    /// each regardless of the others (unlike [`Self::evidence`]), worst (quiet longest) first, with
+    /// its leader's pid for the caller's re-proof, and the view's age; `None` with no view or one
+    /// older than [`JOBS_FRESH`]. Only the copy of the rows runs under the lock.
     pub(crate) fn facts(
         &self,
         sid: &str,
@@ -384,19 +422,18 @@ impl JobsBoard {
     }
 }
 
-/// WHETHER THE CALL WHOSE LEADER IS `pid`, BORN AT `birth`, STILL LIVES
-/// (`harness_host::WorkerIdle::facts`' re-proof at the ask): one read of that process by the jobs
-/// engine's own reader, in the engine's own unit, naming the same start and no zombie. A pid a
-/// later process took, a call that ended and was reaped, or one that exited unreaped is not
-/// alive, so a fact never tells of a call that already ended. Kernel reads only (`proc_pidinfo`,
-/// `/proc`), never WindowServer.
+/// Whether the call whose leader is `pid`, born at `birth`, still lives (the facts' re-proof at
+/// the ask): one read by the jobs engine's own reader, in the engine's unit, naming the same start
+/// and no zombie, so a reused pid, a reaped call and an unreaped exit are not alive. Kernel reads
+/// only (`proc_pidinfo`, `/proc`), never WindowServer.
 pub(crate) fn leader_lives(pid: u32, birth: u64) -> bool {
     JobsReader::new()
         .read(ReadReq { pid, fds: false })
         .is_some_and(|f| f.start == Some(birth) && f.state != probe::RunState::Zombie)
 }
 
-/// The process's board: the loop posts each view it adopts (`App::post_jobs_reading`, to `VitalsHost`'s board: this one live, a test's own in a test), the workers read it.
+/// The process's board: the loop posts each view it adopts (`App::post_jobs_reading`, through
+/// `VitalsHost`'s board, which a test replaces with its own), and the workers read it.
 pub(crate) static BOARD: JobsBoard = JobsBoard::new();
 
 /// A row the canary reads as a live background call of the agent's.
@@ -423,12 +460,11 @@ fn background_call(r: &JobRow) -> BackgroundCall {
 }
 
 /// The bytes of a program's file name the kernel's short name keeps: Linux's `comm` holds 15
-/// (`TASK_COMM_LEN` less its NUL), and macOS's `p_comm` 16 (`MAXCOMLEN`), the cut used elsewhere.
+/// (`TASK_COMM_LEN` less its NUL), and macOS's `p_comm` 16 (`MAXCOMLEN`).
 pub(crate) const COMM_BYTES: usize = if cfg!(target_os = "linux") { 15 } else { 16 };
 
-/// A row's `exe` (its executable's basename, `JobRow::exe`) cut to [`COMM_BYTES`], back to a
-/// character boundary: a test binary's `aterm_gui-e0964a1b2c3d4e5f` is said `aterm_gui-e0964a` on
-/// macOS, its `p_comm` ([`BackgroundCall::exe`]), and a file name past the canary's 32 bytes is
+/// A row's `exe` (`JobRow::exe`) cut to [`COMM_BYTES`] at a character boundary, as the kernel's
+/// short name holds it, so a file name past the canary's 32 bytes ([`BackgroundCall::exe`]) is
 /// still said.
 fn comm_word(exe: &str) -> String {
     let end = exe
@@ -448,7 +484,10 @@ fn next_pass_ms(demand: Demand) -> u64 {
     demand.every_ms().unwrap_or(FAST_MS).max(FAST_MS)
 }
 
-/// HOW SOON A READING NO WINDOW SHOWS IS DUE AGAIN after one that gave `view` (the hung-call design's D1, "while any agent-call job is suspect"; leftover §9): while a live agent call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ; every `no_progress` row is one), the engine's own cadence ([`next_pass_ms`] of its `Demand`); else `None`, and the next reading is `vitals_host::job_demand_after`'s (a live job at the view's own `Demand`) or the disk watch's next look.
+/// How soon a reading no window shows is due again after one that gave `view`: while a live agent
+/// call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ)
+/// and the engine is not idle, the engine's own cadence ([`next_pass_ms`]); else `None`, and the
+/// next reading is `vitals_host::job_demand_after`'s or the disk watch's next look.
 pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
     let suspect = view.rows.iter().any(|r| {
         r.kind == JobKind::AgentCall
@@ -462,7 +501,12 @@ pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
 /// How far past the engine's cadence a window's reading lands while [`told_after`] paces it.
 const TOLD_BEAT: Duration = Duration::from_millis(250);
 
-/// HOW SOON A WINDOW'S READING IS DUE AGAIN while a live agent call of `view` reads `no_progress` (what `harness_host::WorkerIdle::facts` tells, only from a view no older than the facts gate, `aterm_agent::supervise::facts::FACT_FRESH_MS`, 5 s): a beat ([`TOLD_BEAT`]) past the engine's own cadence, so each reading lands past the pass's due and runs it while staying the bars' paced reading (its split still ticks); else `None`, and the window's own cadence stands. A background window's 5 s never meets the gate: each ask is paced from the last, then read and adopted.
+/// How soon a window's reading is due again while a live agent call of `view` reads `no_progress`
+/// (what `harness_host::WorkerIdle::facts` tells, only from a view no older than
+/// `aterm_agent::supervise::facts::FACT_FRESH_MS`, 5 s): a beat ([`TOLD_BEAT`]) past the engine's
+/// cadence, so each reading lands past the pass's due and runs it; else `None`, and the window's
+/// own cadence stands. A background window's 5 s cadence never meets the gate, since each reading
+/// is paced from the last, then read and adopted.
 pub(crate) fn told_after(view: &JobsView) -> Option<Duration> {
     view.rows
         .iter()
@@ -498,6 +542,7 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)])
                 tty: ttys.iter().find(|(key, _)| *key == t.key).map(|(_, m)| *m),
                 output_ms: feed.output_ms,
                 line_output_ms: feed.line_output_ms,
+                drawn_ms: feed.drawn_ms,
                 output_bytes: feed.output_bytes,
                 ..JobTab::default()
             }
@@ -505,14 +550,13 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)])
         .collect()
 }
 
-/// WHAT A SESSION'S PTY READER READ, FOR THE ENGINE (system-awareness §6.6, P2a): its newest feed
-/// that moved the screen, its newest feed that held a line, the bytes it has read, and the
-/// newest OSC 133 block. The reader writes it as it reads and feeds ([`Self::read`],
-/// [`Self::fed`]); the probe thread reads it at each pass ([`Self::at`]). Without it a printing
-/// `ping` reads quiet, and each command of a typed `while` loop is a job of its own. A write that
-/// moves no cell (Muse Code's colour reset at rest) is no output here, as it is no edge for the
-/// output wake ([`crate::vitals_host::ScreenMoves`]): counted, it would keep a program at rest
-/// running and the engine reading every 2 s.
+/// What a session's PTY reader read, for the engine: its newest feed that moved the screen, its
+/// newest feed that held a line, the bytes it has read, and the newest OSC 133 block. The reader
+/// writes it as it reads and feeds ([`Self::read`], [`Self::fed`]); the probe thread reads it at
+/// each pass ([`Self::at_pass`]). Without it a printing `ping` reads quiet, and each command of a
+/// typed `while` loop is a job of its own. A write that moves no cell (a colour reset at rest) is
+/// no output, as it is no edge for the output wake ([`crate::vitals_host::ScreenMoves`]): counted,
+/// it would keep a program at rest running and the engine reading every 2 s.
 #[derive(Debug, Default)]
 pub(crate) struct JobFeed(Mutex<Fed>);
 
@@ -520,11 +564,15 @@ pub(crate) struct JobFeed(Mutex<Fed>);
 struct Fed {
     output: Option<Instant>,
     line: Option<Instant>,
+    /// The newest moving feed that drew the screen ([`Lines::drawn`]).
+    drawn: Option<Instant>,
     /// The newest line the last pass found stamped past its millisecond, which it left to the
     /// next.
     owed_line: Option<Instant>,
     /// The newest output the last pass found stamped past its millisecond, as `owed_line`.
     owed_output: Option<Instant>,
+    /// The same of the newest drawing feed.
+    owed_drawn: Option<Instant>,
     /// The read being fed holds text after its last line feed so far: a line feed in its next
     /// chunk ends a line.
     text: bool,
@@ -557,6 +605,7 @@ struct FedBlock {
 pub(crate) struct TabFeed {
     pub(crate) output_ms: Option<u64>,
     pub(crate) line_output_ms: Option<u64>,
+    pub(crate) drawn_ms: Option<u64>,
     pub(crate) output_bytes: u64,
     pub(crate) block: Option<Block>,
     pub(crate) ended: Option<Block>,
@@ -574,27 +623,22 @@ impl JobFeed {
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     }
 
-    /// A feed of `chunk` left `term` as it stands (the reader, holding the term lock), `moved` when
-    /// it moved the screen ([`crate::vitals_host::ScreenMoves::fed`]): a moving feed is output
-    /// `now`, and a chunk holding a line feed and text of its read (in the chunk, or in one the
-    /// parse cut before it) is a line `now` (line ends alone are what the line discipline echoes
-    /// of a typed Enter, and a person pressing Enter at a hung command would otherwise restart
-    /// its quiet clock; a writer that leads with its line feed, `\n<record>`, still prints
-    /// lines). Each stamp is read under the
-    /// feed's lock, so a pass that read the feed before it stamps past the pass's clock, and a
-    /// line and the shell's marks parsed with it share one stamp: no pass sees the shell's
-    /// prompt as a line without its marks. The
-    /// block held is the newest one that ran: open from OSC 133 C, started `now` when first seen
-    /// so, and closed by D with D's status, which it keeps until another block runs. The shell
-    /// writes D and the next prompt's A together, and A archives the closed block at once, so a
-    /// feed that finds a newer prompt's block closes the held one with the status its archive
-    /// keeps; a block never seen open is held only while nothing ran before it. A terminal that
-    /// holds no block (a reset, a clear) leaves an open one open: the command runs on, and its
-    /// block closes at the next prompt. The block a newer one replaces is kept as the ended one,
-    /// closed with the status it ended with, so a command followed by another before the next
-    /// pass keeps its status. A feed that finds the current block changed (a prompt, a command
-    /// taken, its end) stamps the shell's own marks `now`; a terminal left with no block (a
-    /// program's reset) is none of the shell's.
+    /// A feed of `chunk` left `term` as it stands (the reader holds the term lock); `moved` when it
+    /// moved the screen ([`crate::vitals_host::ScreenMoves::fed`]). A moving feed is output `now`.
+    /// A chunk holding a line feed and text of its read (in the chunk, or in one the parse cut
+    /// before it) is a line `now`: a bare line end is the echo of a typed Enter, which must not
+    /// restart a hung command's quiet clock. Each stamp is taken under the feed's lock, so one made
+    /// after a pass read the feed is past that pass's clock, and a line and the shell's marks
+    /// parsed with it share one stamp.
+    ///
+    /// The block held is the newest that ran: open from OSC 133 C (started `now` when first seen
+    /// so), closed by D with D's status, and kept until another block runs. The shell writes D and
+    /// the next A together, and A archives the closed block at once, so a feed that finds a newer
+    /// prompt's block closes the held one with its archived status; a block never seen open is held
+    /// only while nothing ran before it. A terminal holding no block (a reset, a clear) leaves an
+    /// open one open until the next prompt. The block a newer one replaces is kept as the ended
+    /// one with its status. A feed that finds the current block changed stamps the shell's marks
+    /// `now`; a terminal left with no block is none of the shell's.
     pub(crate) fn fed(
         &self,
         term: &aterm_core::terminal::Terminal,
@@ -636,6 +680,9 @@ impl JobFeed {
         let now = now();
         if moved {
             fed.output = Some(now);
+            if lines.drawn {
+                fed.drawn = Some(now);
+            }
         }
         if line {
             fed.line = Some(now);
@@ -681,17 +728,15 @@ impl JobFeed {
         }
     }
 
-    /// The feed now, on the clock whose zero is `epoch` (the probe thread's): each stamp in whole
-    /// ms rounded up, so a read after a pass's clock is stamped past it, and at least 1 ms, so a
-    /// mode word stamped 0 is older than all of them ([`crate::vitals_host::TtyWord::current`]).
+    /// The feed now: [`Self::at_pass`] with no pass's clock.
     #[cfg(test)]
     pub(crate) fn at(&self, epoch: Instant) -> TabFeed {
         self.at_pass(epoch, None)
     }
 
-    /// The keys driven into the session's terminal (the person's, a driver's) as a pass at `at_ms`
-    /// finds their count: the clock of the newest pass that found it moved since the pass before
-    /// (the first pass notes it alone), which a session nested in the tab's woke over.
+    /// Notes the count of keys driven into the session's terminal (the person's or a driver's) as a
+    /// pass at `at_ms` finds it, and returns the clock of the newest pass that found it moved since
+    /// the pass before; the first pass only notes it.
     pub(crate) fn typed_at(
         &self,
         at_ms: u64,
@@ -705,12 +750,12 @@ impl JobFeed {
         fed.typed
     }
 
-    /// The feed at a pass whose clock reads `at_ms` ([`crate::vitals_host::Request::tab_reads`]),
-    /// as [`Self::at`], but for its newest line and output: one stamped past `at_ms` (fed in the
-    /// clock's own millisecond, or after the clock) is the next pass's, which reads it though a
-    /// newer one overwrote it first, and this pass the one the last left it. A writer that never
-    /// stops has a line stamped past every pass's millisecond, which was each pass's newest and
-    /// none's.
+    /// The feed at a pass whose clock reads `at_ms` (`None`: no pass), on the clock whose zero is
+    /// `epoch` (the probe thread's). Each stamp is whole ms rounded up, so a read after a pass's
+    /// clock is stamped past it, and at least 1 ms, so a mode word stamped 0 is older than all of
+    /// them ([`crate::vitals_host::TtyWord::current`]). A newest line or output stamped past
+    /// `at_ms` is the next pass's, even if a newer one overwrites it first, and this pass reads the
+    /// one the last left it, so a writer that never stops still has its lines read.
     pub(crate) fn at_pass(&self, epoch: Instant, at_ms: Option<u64>) -> TabFeed {
         let ms = |at: Instant| {
             u64::try_from(
@@ -740,9 +785,11 @@ impl JobFeed {
         let fed = &mut *fed;
         let line = defer(fed.line, &mut fed.owed_line);
         let output = defer(fed.output, &mut fed.owed_output);
+        let drawn = defer(fed.drawn, &mut fed.owed_drawn);
         TabFeed {
             output_ms: output.map(ms),
             line_output_ms: line.map(ms),
+            drawn_ms: drawn.map(ms),
             output_bytes: fed.bytes,
             block: fed.block.as_ref().map(block),
             ended: fed.ended.as_ref().map(block),
@@ -760,6 +807,11 @@ struct Lines {
     ended: bool,
     /// Text after its last line feed, or all of it when it holds none.
     tail: bool,
+    /// A control sequence that puts the cursor on a row of the program's choosing or moves rows
+    /// (CUP, HVP, VPA, DECSTBM, IL, DL, SU, SD): the program draws the screen (nvim, Emacs, a
+    /// pager), and its line feeds are cursor moves, not lines it printed. A spinner's `\r` and
+    /// erase draw nothing.
+    drawn: bool,
 }
 
 impl Lines {
@@ -768,7 +820,16 @@ impl Lines {
             ends: false,
             ended: false,
             tail: false,
+            drawn: false,
         };
+        lines.drawn = (0..chunk.len()).any(|i| {
+            let Some(rest) = chunk.get(i..).and_then(|c| c.strip_prefix(b"\x1b[")) else {
+                return false;
+            };
+            rest.iter()
+                .find(|b| (0x40..=0x7e).contains(*b))
+                .is_some_and(|b| matches!(b, b'H' | b'f' | b'd' | b'r' | b'L' | b'M' | b'S' | b'T'))
+        });
         for &b in chunk {
             match b {
                 b'\n' => {
@@ -914,7 +975,8 @@ fn fd(f: &probe::FdReading) -> Fd {
     Fd { fd: f.fd, kind }
 }
 
-/// The engine's reading of `p`, held at macOS's program check where [`member_start`] reads it so (`stand_in` included).
+/// The engine's reading of `p`, held at macOS's program check where [`member_start`] reads it so
+/// (`stand_in` included).
 fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
     JobProc {
         pid: p.pid,
@@ -963,11 +1025,9 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
 pub(crate) mod tests {
     use super::*;
 
-    /// The engine's cadence, and with no window the suspect rule's: while a
-    /// live agent call stands suspect, the engine's demand (2 s fast, 30 s
-    /// slow); an idle engine, an exited, running or listening call and jobs
-    /// that are no agent's ask nothing of it (a live job is still read at its
-    /// own demand, through `vitals_host::job_demand_after`).
+    /// The engine's cadence, and with no window the suspect rule's: a live agent call that stands
+    /// suspect asks for the engine's demand; an idle engine, an exited, running or listening call,
+    /// and a job that is no agent's ask nothing.
     #[test]
     fn the_engine_is_asked_again_at_its_own_cadence_never_faster_than_two_seconds() {
         assert_eq!(next_pass_ms(Demand::Fast), 2_000);
@@ -1010,11 +1070,8 @@ pub(crate) mod tests {
         assert_eq!(told_after(&view(vec![moving], Demand::Fast)), None);
     }
 
-    /// THE CANARY SAYS THE KERNEL'S SHORT NAME: a row naming an integration
-    /// test binary by its whole file name (38 bytes, past the canary's 32) is
-    /// said by its first [`COMM_BYTES`], as the kernel's short name holds it,
-    /// never as `-`; a short name is said whole and a multi-byte one is cut on
-    /// a character.
+    /// A file name past the canary's 32 bytes is said by its first [`COMM_BYTES`], never as `-`; a
+    /// multi-byte one is cut on a character.
     #[test]
     fn the_canary_names_a_call_by_the_kernels_short_name() {
         let said =
@@ -1054,13 +1111,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// THE CANARY'S EVIDENCE IS THIS SESSION'S BACKGROUND CALL THAT MADE NO
-    /// PROGRESS, the one quiet longest: of tab 4's rows (session `s-hung`),
-    /// an agent call of no known consumer at 20 minutes and a background one
-    /// at 31 minutes waiting in process 27098, the 31-minute one, named by
-    /// its waiting process; never a foreground call, a person's job or
-    /// another session's call, however long their quiet, and an exited call
-    /// does not count.
+    /// The canary's evidence is this session's background call quiet longest, named by its waiting
+    /// process; never a foreground call, a person's job, an exited call or another session's.
     #[test]
     fn the_board_names_this_sessions_background_call_quiet_longest() {
         use aterm_vitals::jobs::{NamedRow, Standing, TierB, Wait, WaitName};
@@ -1158,6 +1210,7 @@ pub(crate) mod tests {
         let fed = TabFeed {
             output_ms: Some(9),
             line_output_ms: Some(8),
+            drawn_ms: Some(7),
             output_bytes: 120,
             block: Some(Block {
                 id: 3,
@@ -1196,6 +1249,7 @@ pub(crate) mod tests {
             TabFeed {
                 output_ms: tabs[1].output_ms,
                 line_output_ms: tabs[1].line_output_ms,
+                drawn_ms: tabs[1].drawn_ms,
                 output_bytes: tabs[1].output_bytes,
                 block: tabs[1].block.clone(),
                 ended: tabs[1].ended.clone(),
@@ -1206,13 +1260,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE READER'S FEED ON THE ENGINE'S CLOCK: every read counts its bytes,
-    /// only a line feed with text of its read (in its chunk, or in one the
-    /// parse cut before it) stamps a line (a progress bar's `\r` redraw is
-    /// none, nor the echo of a typed Enter, but a record led by its line
-    /// feed is),
-    /// only a feed that moved the screen stamps output (a colour reset at rest
-    /// is none), and each stamp is ms past the probe thread's zero.
+    /// Every read counts its bytes; only a line feed with text of its read stamps a line (not a
+    /// `\r` redraw or a typed Enter's echo, but a record led by its line feed), only a feed that
+    /// moved the screen stamps output, and only one that puts the cursor on a row of its own stamps
+    /// a drawing (not a spinner's erase).
     #[test]
     fn a_line_feed_stamps_a_line_and_only_a_moving_feed_stamps_output() {
         const RESET: &[u8] = b"\x1b[39m\x1b[0m";
@@ -1259,12 +1310,22 @@ pub(crate) mod tests {
             Some(1),
             "a stamp is at least 1 ms"
         );
+        let spinner = "\r\x1b[2K\x1b[?25l\u{280b} fetching".as_bytes();
+        feed.fed(&term, spinner, true, || {
+            epoch + Duration::from_millis(8_000)
+        });
+        assert_eq!(feed.at(epoch).drawn_ms, None, "a spinner draws nothing");
+        let redraw = b"\x1b[12;1Htests/test_api.py::test_x PASSED\x1b[K\r\n";
+        feed.fed(&term, redraw, true, || epoch + Duration::from_millis(9_000));
+        assert_eq!(
+            feed.at(epoch).drawn_ms,
+            Some(9_000),
+            "nvim's row of its terminal"
+        );
     }
 
-    /// A LINE FED PAST A PASS'S CLOCK IS THE NEXT PASS'S: a writer that never stops (`kubectl
-    /// logs -f`) has a line fed past each pass's clock, in the clock's own millisecond, which a
-    /// newer one overwrites before the next pass; that pass reads the line the last one left it,
-    /// past the last clock and by its own.
+    /// A writer that never stops (`kubectl logs -f`) has a line fed past each pass's clock, which a
+    /// newer one overwrites before the next pass; that pass still reads it.
     #[test]
     fn a_line_fed_past_a_passs_clock_is_the_next_passs() {
         const LINE: &[u8] = b"GET /healthz 200\r\n";
@@ -1332,18 +1393,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE NEWEST BLOCK THAT RAN, AS THE READER LEFT IT: open from OSC 133 C
-    /// with the command the shell ran, closed by D with its status while
-    /// keeping its start and command, and held through the next prompt until
-    /// another block runs. The shell writes D and the next A in one burst, so
-    /// a feed that sees both still closes the block with D's status. A
-    /// terminal with no shell integration has none, and a feed that moved
-    /// nothing stamps no output. The block a newer one replaces is the ended
-    /// one, with its status even when it ended in the feed that ran the next.
-    /// The shell's own marks are stamped, and a line parsed with them shares
-    /// their stamp; a command's output is none of them, nor a reset while it
-    /// runs, which leaves its block open until the next prompt. A block Ctrl-Z
-    /// ended is stopped.
+    /// The feed holds the newest block that ran: open from OSC 133 C with its command, closed by D
+    /// with its status (D and the next A in one feed included), held through the next prompt, and
+    /// kept as the ended one once a newer block runs. The shell's marks are stamped, and a line
+    /// parsed with them shares their stamp; a command's output and a reset are not marks, and a
+    /// reset leaves the block open until the next prompt. A block Ctrl-Z ended is stopped.
     #[test]
     fn the_feed_holds_the_newest_block_that_ran_and_its_status() {
         let epoch = Instant::now();
@@ -1543,9 +1597,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// AN EDGE'S READING LOOKS (the loop paces edges on its own clock): one
-    /// asked inside the pass's cadence runs the engine anyway, so the job it
-    /// was asked for is seen now.
+    /// An edge's reading inside the pass's cadence runs the engine anyway.
     #[test]
     fn an_edges_reading_inside_the_cadence_runs_the_engine() {
         let Some(sweep) = aterm_sysprobe::processes() else {
@@ -1604,11 +1656,8 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
     }
 
-    /// THE PASS COUNTS THIS USER'S PROGRAMS THAT HAVE NOT STARTED, MEMBERS OR NOT: a member
-    /// held or translating by its own reading, and of the rest only this user's live rows with
-    /// at most 20 ms of CPU are asked for their start (a held one has about 2 ms), each with
-    /// what keeps it; the stand-in's pid reads held whatever its CPU, and is never asked; each
-    /// row is keyed by its pid version, and an orphan is aterm's by its coalition.
+    /// Members count by their own reading; of the rest only this user's live rows with at most
+    /// 20 ms of CPU are asked, and the stand-in reads held unasked whatever its CPU.
     #[test]
     fn the_jobs_pass_counts_this_users_held_programs_members_or_not() {
         use std::cell::RefCell;
@@ -1724,11 +1773,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE PASS HANDS THE ENGINE ITS HELD LIST: over a sweep with no tab, the rows its start
-    /// reader reads held, and the pid the stand-in names (a row with 400 ms of CPU, which the
-    /// pass would never ask), reach the view's program-check findings with their executables'
-    /// names, a row it reads translating its `translating` findings, and only the held ones in
-    /// this process's coalition count as aterm's.
+    /// The pass hands the engine its held list: held rows and the stand-in reach the program-check
+    /// findings, a translating row `translating`, and only those in this process's coalition count
+    /// as aterm's.
     #[test]
     fn the_pass_hands_the_engine_this_users_held_programs_and_the_stand_in() {
         const ME: u32 = 501;
@@ -1798,9 +1845,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE STAND-IN READS HELD WHERE THE READING JUDGED A START: a member
-    /// whose thread list was read, never a zombie's or another user's reading
-    /// (no start read), and a member the kernel reads held stays held.
+    /// The stand-in reads held only where the reading judged a start (never a zombie's or another
+    /// user's), and a member the kernel reads held stays held.
     #[test]
     fn a_stand_in_reads_held_only_where_the_reading_judged_a_start() {
         let read = ProcFacts {
@@ -1831,10 +1877,8 @@ pub(crate) mod tests {
         assert!(job_proc(&held, Some(30)).program_check, "the kernel's own");
     }
 
-    /// A view speaks for now for a minute; a PARKED one (demand idle, no program that has not
-    /// started) for as long as its reader runs. One that names a held, translating or unstarted
-    /// program or stands in a backed-up episode is read again every 30 s whatever its demand,
-    /// and a start raises no edge, so past the minute it does not speak.
+    /// A view speaks for now for a minute, and a parked one for as long as its reader runs; one
+    /// that holds a wait is read on a timer, not on edges, so past the minute it does not.
     #[test]
     fn a_parked_view_speaks_for_now_while_its_reader_runs() {
         use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
@@ -1892,9 +1936,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// PRIVACY'S COUNT: every held program of this user, aterm's and others', and the longest
-    /// held to now, its first sighting's age plus the view's; nothing from a view that does not
-    /// speak for now.
+    /// Privacy's count: every held program of this user, aterm's and others', and the longest held
+    /// to now; nothing from a view that does not speak for now.
     #[test]
     fn privacys_count_is_every_held_program_and_the_longest_wait_to_now() {
         use aterm_vitals::jobs::{Findings, Named};
@@ -1929,10 +1972,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// THE RE-PROOF READS THE ENGINE'S OWN BIRTH: this process, read by the jobs reader as the
-    /// engine reads a leader, lives at its own start, and a start one unit off is another process
-    /// (a pid a later process took), which does not. NEGATIVE CONTROL: a pid no process holds
-    /// lives at no start.
+    /// This process lives at its own start, a start one unit off is another process, and a pid no
+    /// process holds lives at no start (the negative control).
     #[test]
     fn a_leader_lives_only_at_its_own_birth() {
         let me = std::process::id();

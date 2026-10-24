@@ -51,6 +51,12 @@ struct SignInHost {
     /// The identity providers' cookies the pass after a window drops, or why it fails.
     tidy: Result<usize, String>,
     tidied: RefCell<Tidies>,
+    /// The holds on the signals that end a window alive now ([`AccountsHost::hold_window_ends`]).
+    holds: std::rc::Rc<Cell<i32>>,
+    /// At the window: whether the profile carried its untidied mark.
+    marked_at_window: Cell<Option<bool>>,
+    /// At the pass after the window: the holds alive, and whether the mark was still there.
+    at_tidy: Cell<Option<(i32, bool)>>,
 }
 
 impl SignInHost {
@@ -67,6 +73,9 @@ impl SignInHost {
             opened: RefCell::new(Vec::new()),
             tidy: Ok(0),
             tidied: RefCell::new(Vec::new()),
+            holds: std::rc::Rc::new(Cell::new(0)),
+            marked_at_window: Cell::new(None),
+            at_tidy: Cell::new(None),
         }
     }
 
@@ -123,6 +132,11 @@ impl AccountsHost for SignInHost {
             crate::harness::browser_window::profile_holder(profile).is_some(),
             "the profile is claimed for its window"
         );
+        self.marked_at_window.set(Some(
+            profile
+                .join(crate::harness::browser_window::UNTIDIED_MARK)
+                .is_file(),
+        ));
         Ok(self.ends.0)
     }
 
@@ -136,11 +150,23 @@ impl AccountsHost for SignInHost {
             profile.to_path_buf(),
             session.map(|(o, k)| (o.to_owned(), k.to_owned())),
         ));
+        self.at_tidy.set(Some((
+            self.holds.get(),
+            profile
+                .join(crate::harness::browser_window::UNTIDIED_MARK)
+                .is_file(),
+        )));
         let dropped = self.tidy.clone()?;
         Ok(crate::harness::browser_window::Tidied {
             dropped,
             session: session.map(|_| self.ends.1),
         })
+    }
+
+    fn hold_window_ends(&self) -> WindowEnds {
+        self.holds.set(self.holds.get() + 1);
+        let holds = std::rc::Rc::clone(&self.holds);
+        WindowEnds::noting(move || holds.set(holds.get() - 1))
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
@@ -701,6 +727,139 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
     let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &other_env, &empty);
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(out.contains("nothing was signed in"), "{out}");
+}
+
+/// `ACCOUNTS BROWSER` HOLDS THE SIGNALS THAT END IT AND MARKS THE PROFILE until the pass after
+/// the window has run: the window opens on a profile marked untidied, under one hold on the
+/// signals that would end this process, which is still held through the pass after the window
+/// and put back once the window is recorded; a pass that ran removes the mark. CONTROL: a pass
+/// that failed leaves the mark, for the next headless launch on the profile to make up.
+#[test]
+fn accounts_browser_holds_its_ends_through_the_pass_after_the_window_and_marks_it_until_then() {
+    let (tmp, env) = kimi_env("browser-holds");
+    let home = tmp.path().join("home");
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let profile = crate::harness::headless_oauth::row_browser_profile(
+        Cli::Kimi,
+        &store.dir,
+        &store.shared_dir(),
+        "kimi-one",
+        Some("kimi-one@example.com"),
+    );
+    let mark = profile.join(crate::harness::browser_window::UNTIDIED_MARK);
+    let host = SignInHost::desk(&home);
+    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(
+        host.marked_at_window.get(),
+        Some(true),
+        "marked before its window"
+    );
+    assert_eq!(
+        host.at_tidy.get(),
+        Some((1, true)),
+        "one hold alive through the pass after the window, the mark still there"
+    );
+    assert_eq!(host.holds.get(), 0, "put back once recorded");
+    assert!(!mark.exists(), "the pass ran, so the mark is gone");
+    assert!(
+        read(&store.ledger_path()).contains("www.kimi.ai window done"),
+        "recorded"
+    );
+
+    let failing = SignInHost {
+        tidy: Err("the headless browser did not start".to_owned()),
+        ..SignInHost::desk(&home)
+    };
+    let (code, out, err) = renew("accounts browser kimi-one --cli kimi", &env, &failing);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert_eq!(failing.at_tidy.get(), Some((1, true)));
+    assert_eq!(failing.holds.get(), 0);
+    assert!(
+        mark.is_file(),
+        "CONTROL: an untidied window leaves its mark"
+    );
+}
+
+/// Run in place by [`a_window_hold_keeps_this_process_through_a_hangup_a_stop_and_a_quit`]
+/// (`ATERM_TEST_WINDOW_ENDS` naming the file it writes): under a live [`WindowEnds`] hold it
+/// raises SIGHUP, SIGTERM and SIGQUIT at itself, then opens the window's own wait inside that
+/// hold, and writes whether the window's end was noted and what the window's wait first reads.
+/// With `ATERM_TEST_WINDOW_ENDS_BARE` set it holds nothing and raises SIGHUP alone, at its
+/// default action (no core signal, so no crash report). Anywhere else it is an empty test.
+#[cfg(unix)]
+#[test]
+fn window_ends_stand_in() {
+    use std::sync::atomic::Ordering;
+    let Some(out) = std::env::var_os("ATERM_TEST_WINDOW_ENDS").map(PathBuf::from) else {
+        return;
+    };
+    let bare = std::env::var_os("ATERM_TEST_WINDOW_ENDS_BARE").is_some();
+    let held = (!bare).then(WindowEnds::hold);
+    let raised: &[libc::c_int] = if bare {
+        // SAFETY: SIGHUP's default action, set before it is raised.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_DFL) };
+        &[libc::SIGHUP]
+    } else {
+        &[libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT]
+    };
+    for &signal in raised {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "held, each signal runs a handler that only notes it; bare, SIGHUP alone at its \
+                      default action, no core signal"
+        )]
+        // SAFETY: sends `signal` to this thread; a held one runs a handler that stores to an
+        // atomic.
+        unsafe {
+            libc::raise(signal);
+        }
+    }
+    let noted = WINDOW_INTERRUPTED.load(Ordering::SeqCst);
+    let window = window_until_enter(|ended| ended());
+    std::fs::write(&out, format!("survived noted={noted} window={window:?}")).expect("its line");
+    drop(held);
+    std::process::exit(0);
+}
+
+/// A LIVE HOLD ON A WINDOW'S ENDS KEEPS THIS PROCESS THROUGH A HANGUP, A STOP AND A QUIT: each
+/// only notes the window's end, so `accounts browser` hangs its window up, tidies the profile and
+/// records it when its terminal closes or it is told to stop, and one noted before the window
+/// opens ends the window at once. CONTROL: without the hold the first of them, its terminal's
+/// hangup, ends the stand-in before it writes a line.
+#[cfg(unix)]
+#[test]
+fn a_window_hold_keeps_this_process_through_a_hangup_a_stop_and_a_quit() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let exe = std::env::current_exe().expect("test exe");
+    let run = |name: &str, bare: bool| {
+        let out = tmp.path().join(name);
+        let mut cmd = aterm_uds::spawnfd::command(&exe);
+        cmd.args([
+            "harness::cli::tests::signin::window_ends_stand_in",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ATERM_TEST_WINDOW_ENDS", &out)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+        if bare {
+            cmd.env("ATERM_TEST_WINDOW_ENDS_BARE", "1");
+        }
+        let status = cmd.status().expect("the stand-in ran");
+        (status, std::fs::read_to_string(&out).ok())
+    };
+    let (status, line) = run("held", false);
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        line.as_deref(),
+        Some("survived noted=true window=Some(Interrupted)")
+    );
+    let (status, line) = run("bare", true);
+    assert_eq!(status.signal(), Some(libc::SIGHUP), "CONTROL: {status:?}");
+    assert_eq!(line, None, "CONTROL");
 }
 
 /// `ACCOUNTS BROWSER` opens nothing without a terminal, over SSH, under another sign-in's lock or

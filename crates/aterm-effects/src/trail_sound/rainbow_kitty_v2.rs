@@ -3231,7 +3231,7 @@ impl Palette for RainbowKittyV2Palette {
     ) {
     }
 
-    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32) -> (f32, f32) {
         s.bed_rainbow_sky(dt, lvl)
     }
 

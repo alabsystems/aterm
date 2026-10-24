@@ -161,6 +161,7 @@ impl CursorGlow {
                 .unwrap_or_default();
             let mut run: Option<i32> = None;
             let mut span: Option<(i32, i32)> = None;
+            let mut last_ground: Option<(u32, bool)> = None;
             let end = ft.col0 + ft.cols as i32;
             for col in ft.col0..=end {
                 let held = row_pairs
@@ -168,7 +169,21 @@ impl CursorGlow {
                     .copied()
                     .flatten()
                     .is_some_and(|(ink, ground)| {
-                        ink.is_some() || !super::emit::reads_as_page(ground & 0x00FF_FFFF, page)
+                        if ink.is_some() {
+                            return true;
+                        }
+                        let g = ground & 0x00FF_FFFF;
+                        if g == page {
+                            return false;
+                        }
+                        match last_ground {
+                            Some((prev_g, prev_held)) if prev_g == g => prev_held,
+                            _ => {
+                                let h = !super::emit::reads_as_page(g, page);
+                                last_ground = Some((g, h));
+                                h
+                            }
+                        }
                     });
                 match (held, run) {
                     (true, None) => run = Some(col),

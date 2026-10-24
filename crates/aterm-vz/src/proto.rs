@@ -481,6 +481,8 @@ fn take_plan(t: &mut Take<'_>) -> Result<Plan, ProtoError> {
     })
 }
 
+/// A hello as the lab hears it: every field but the boot's key, which never leaves the
+/// helper ([`crate::key`]).
 fn put_hello(p: &mut Put, h: &Hello) -> Result<(), ProtoError> {
     p.u32(h.proto);
     p.0.extend_from_slice(&h.agent_sha256);
@@ -493,6 +495,7 @@ fn put_hello(p: &mut Put, h: &Hello) -> Result<(), ProtoError> {
 fn take_hello(t: &mut Take<'_>) -> Result<Hello, ProtoError> {
     Ok(Hello {
         proto: t.u32()?,
+        key: [0; aterm_vz_agent::key::LEN],
         agent_sha256: t.array()?,
         boot_id: t.text()?,
         kernel: t.text()?,
@@ -812,6 +815,7 @@ mod tests {
     fn hello() -> Hello {
         Hello {
             proto: aterm_vz_agent::wire::PROTO,
+            key: [0; aterm_vz_agent::key::LEN],
             agent_sha256: [7; 32],
             boot_id: "b00t".into(),
             kernel: "6.8.0-142-generic".into(),

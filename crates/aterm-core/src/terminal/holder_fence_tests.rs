@@ -1171,10 +1171,10 @@ fn three_stopped_drawers_then_fg_keeps_the_first() -> Result<(), String> {
     }
 }
 
-/// Muse Code 1.4.12's launch after its launcher's clear: four newlines, then
-/// three reverse indexes at the top of a region (rows 1-7) that starts on
-/// its span's start, and its banner in the second row it opened (its own
-/// bytes are `aterm-gui`'s `fixtures/muse-1.4.12-inline-startup.bin`).
+/// Muse Code 1.4.12's launch after its launcher's clear: four newlines, then three reverse
+/// indexes at the top of a region (rows 1-7) that starts on its span's start, and its banner in
+/// the second row it opened (its own bytes are `aterm-gui`'s
+/// `src/fixtures/muse-1.4.12-inline-startup.bin`).
 fn muse_launch_keeps_its_banner() -> Result<(), String> {
     let mut t = Terminal::new(24, 40);
     t.process(b"$ muse\r\n\x1b[3J\x1b[H\x1b[2J");
@@ -1263,7 +1263,8 @@ fn rows_a_drawer_erases_above_its_start_are_its() {
     );
 }
 
-/// The erase law takes in only blank rows directly above the open span's start, on the current drawer's erase.
+/// The erase law takes in only blank rows directly above the open span's start, on the current
+/// drawer's erase.
 #[test]
 fn an_erase_above_the_start_takes_in_blank_rows_only() {
     let abs = |t: &Terminal, r: u64| t.main_grid().visible_to_absolute(0) + r;

@@ -22,7 +22,8 @@ const RESULT_READ_BYTES: u64 = 16 * 1024 * 1024;
 
 const SIDECAR_READ_BYTES: u64 = 8 * 1024;
 
-/// The longest the done edge waits for its turn's end row ([`settled`]): a DEADLINE, not a latency.
+/// The longest the done edge waits for its turn's end row ([`settled`]): a deadline, not a
+/// latency budget.
 pub const SETTLE_WITHIN: Duration = Duration::from_secs(5);
 
 /// How often the done edge reads the transcript's end again while it waits.
@@ -301,7 +302,8 @@ impl DoneBy {
     }
 }
 
-/// THE WORKER'S REPORT in the transcript tail `jsonl`, read at the done edge by rule `by`.
+/// The worker's report in the transcript tail `jsonl`, read at the done edge by rule `by`.
+///
 /// # Errors
 /// Why there is none, as a word: `no-reply`, `no-check`, `no-report` or `empty`.
 pub fn report(jsonl: &str, by: DoneBy) -> Result<Report, &'static str> {
@@ -314,12 +316,9 @@ struct Reading {
     by: DoneBy,
     /// [`report`]'s answer.
     report: Result<Report, &'static str>,
-    /// The user row that started the done edge's turn — the newest in the
-    /// settled tail, which stops at that turn's end ([`Opener::of`]: a
-    /// prompt, or a `<task-notification>` that woke the worker) — where
-    /// either rule found the newest turn's reply missing or unfinished
-    /// ([`LAG_MISSES`]): a reply Claude Code may not have written yet, which
-    /// [`reread`] reads again for that turn alone.
+    /// Where either rule found the newest turn's reply missing or unfinished ([`LAG_MISSES`]),
+    /// the user row that started the done edge's turn ([`Opener::of`]), which [`reread`] reads
+    /// again once Claude Code has written the reply.
     turn: Option<String>,
 }
 
@@ -398,13 +397,11 @@ fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
 }
 
 enum Mark {
-    /// A main-chain user row with words — any of which can start Claude
-    /// Code on a turn: a prompt [`report`] reads (`prompt`), or one it
-    /// reads past — a background command's `<task-notification>`, which
-    /// wakes a manager that ended its turn to wait, a slash command, the
-    /// `isMeta` rows Claude Code starts a turn on itself (a peer session's
-    /// message, its continuation after a usage limit resets; `meta`) — the
-    /// row's id, and when it was written (`at`, unix milliseconds).
+    /// A main-chain user row with words, which can start Claude Code on a turn: a prompt
+    /// [`report`] reads (`prompt`), or a row it reads past, such as a background command's
+    /// `<task-notification>`, a slash command, or an `isMeta` row Claude Code starts a turn on
+    /// itself (`meta`). It carries the row's id and when it was written (`at`, unix
+    /// milliseconds).
     Opens {
         uuid: Option<String>,
         prompt: bool,
@@ -484,8 +481,7 @@ fn is_turn_end(line: &str) -> bool {
         && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
 }
 
-/// THE DONE EDGE'S TURN, as its first read of the transcript places it
-/// ([`Opener::of`]).
+/// The done edge's turn, as its first read of the transcript places it ([`Opener::of`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Opener {
     /// The row that started it, by its id.
@@ -531,10 +527,8 @@ impl Opener {
 /// Where a turn ends in a read of the transcript ([`end_of`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct End {
-    /// Whether it has ended: a `turn_duration` row after its row, or the
-    /// next turn's start ([`Mark::ends_turn`]): a later prompt — one typed
-    /// after the turn was over, at its prompt again — or a tagged row after
-    /// the turn's words.
+    /// Whether it has ended: a `turn_duration` row after its row, or the next turn's start
+    /// ([`Mark::ends_turn`]): a later prompt, or a tagged row after the turn's words.
     ended: bool,
     /// Where its rows stop in the read (a line's start: just past its end
     /// row, at the next turn's row, else the read's end); `None` where the
@@ -675,7 +669,8 @@ pub fn settle_with(
     Settled { tail, waits, ended }
 }
 
-/// THE DONE EDGE'S TRANSCRIPT, SETTLED.
+/// The done edge's transcript, read again every [`SETTLE_EVERY`] until its turn's end shows,
+/// [`SETTLE_WITHIN`] passes or `stopping` says to stop.
 pub fn settled(
     path: &Path,
     first: String,
@@ -712,7 +707,7 @@ fn by_turn(newest: &TurnRows<'_>) -> Result<Report, &'static str> {
         .ok_or("empty")
 }
 
-/// THE WHOLE EXCHANGE since the task's user row.
+/// The whole exchange since the task's user row, and whether the read holds that row.
 #[must_use]
 pub fn thread(jsonl: &str) -> (String, bool) {
     let items = items(jsonl);
@@ -759,7 +754,7 @@ pub enum Source {
         transcript: Option<PathBuf>,
         turn: Option<String>,
     },
-    /// THE SCREEN of a harness whose reader alone reads its turns.
+    /// The screen of a harness whose reader alone reads its turns.
     Screen { program: String },
     /// A Codex rollout ([`snapshot_rollout`]): the conversation, the turn the
     /// report is the last words of, and the rollout it was read from.
@@ -771,7 +766,10 @@ pub enum Source {
 }
 
 impl Source {
-    /// The sidecar line: `source=transcript session=<pct> uuid=<pct>` or `source=none why=<word>` (and ` turn=<pct>` where it names the turn), then ` transcript=<pct>` when one was read.
+    /// The sidecar line: `source=transcript session=<pct> uuid=<pct>`, `source=none why=<word>`
+    /// (with ` turn=<pct>` where it names the turn), `source=screen program=<word>` or
+    /// `source=rollout thread=<pct> turn=<pct>` (with ` rollout=<pct>`), then
+    /// ` transcript=<pct>` when a transcript was read.
     #[must_use]
     pub fn line(&self) -> String {
         let pct = aterm_codec::pct::encode;
@@ -878,12 +876,13 @@ pub struct Snapshot {
     pub bytes: u64,
     /// Why there is no result ([`report`]'s word, or `no-transcript`).
     pub unavailable: Option<&'static str>,
-    /// The rule the result was read by: the one asked for, or the check's where the newest turn is a check.
+    /// The rule the result was read by: the one asked for, or the check's where the newest turn
+    /// is a check.
     pub by: DoneBy,
 }
 
-/// Remove only this session's numerically older result revisions. A delayed
-/// capture preserves equal, newer or unparseable revisions.
+/// Removes this session's result revisions older than `stem`'s and returns how many; equal,
+/// newer and unparseable revisions stay, so a delayed capture never removes a newer result.
 pub fn prune_results(tasks: &Path, stem: &str) -> usize {
     let Some((sid, rev)) = stem.rsplit_once('-') else {
         return 0;
@@ -935,7 +934,8 @@ pub fn result_stem(sel: Option<&str>, rev: u64) -> String {
     format!("{sid}-{rev}")
 }
 
-/// SNAPSHOT THE RESULT, at the done edge.
+/// Snapshots the result at the done edge.
+///
 /// # Errors
 /// A `stem` that is no such stem, or the directory or a file could not be written.
 pub fn snapshot(
@@ -984,7 +984,8 @@ pub fn snapshot(
     write_snapshot(tasks, stem, &text, &source, unavailable, by)
 }
 
-/// SNAPSHOT A SCREEN'S RESULT, at the done edge of a harness aterm reads no transcript of.
+/// Snapshots a screen's result at the done edge of a harness aterm reads no transcript of.
+///
 /// # Errors
 /// As [`snapshot`].
 pub fn snapshot_screen(
@@ -1020,7 +1021,8 @@ pub fn screen_said(turn_said: Option<&str>, said_tail: &str) -> String {
     }
 }
 
-/// A SCREEN-READ LANDING'S RESULT ([`snapshot_screen`]): the worker's `report`.
+/// A screen-read landing's result ([`snapshot_screen`]): the worker's `report` ahead of `said`,
+/// unless it is empty or the same words.
 #[must_use]
 pub fn with_report(report: Option<&str>, said: &str) -> String {
     match report
@@ -1137,7 +1139,8 @@ fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
     Some((String::from_utf8_lossy(&buf).into_owned(), start == 0))
 }
 
-/// THE `result [full]` REPLY over the snapshot at `path` ([`snapshot`]), framed `OK <n>` + `n` lines.
+/// The `result [full]` reply over the snapshot at `path` ([`snapshot`]), framed `OK <n>` and
+/// `n` lines.
 #[must_use]
 pub fn answer(path: &Path, full: bool) -> String {
     match source_of(path) {
@@ -1254,7 +1257,9 @@ impl Reread {
         }
     }
 
-    /// The snapshot at `path` and its sidecar written over with it, each through a rename and the text first, as [`snapshot`] writes them.
+    /// Writes it over the snapshot at `path` and its sidecar as [`snapshot`] does: text first,
+    /// each through a rename.
+    ///
     /// # Errors
     /// A file could not be written.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
@@ -1265,7 +1270,8 @@ impl Reread {
         )
     }
 
-    /// The `result [full]` reply for it ([`answer`]), whether or not it was written over the snapshot at `path`.
+    /// The `result [full]` reply for it ([`answer`]), whether or not it was written over the
+    /// snapshot at `path`.
     #[must_use]
     pub fn answer(&self, path: &Path, full: bool) -> String {
         reply(
@@ -1279,7 +1285,9 @@ impl Reread {
     }
 }
 
-/// A RESULT THE DONE EDGE MISSED, READ AGAIN.
+/// Reads again, for its turn alone, a result the done edge missed because the turn's reply was
+/// not yet written (`no-reply` or `no-marker`); `None` where there is no such miss, or the
+/// transcript no longer holds the turn's row or still has no report.
 #[must_use]
 pub fn reread(path: &Path) -> Option<Reread> {
     let Some(Source::Unavailable {
@@ -1300,11 +1308,10 @@ pub fn reread(path: &Path) -> Option<Reread> {
     Some(Reread { report, transcript })
 }
 
-/// A CODEX ROLLOUT'S CONVERSATION as [`items`] reads a transcript's, for
-/// conversation `thread`: each turn opens at its `task_started`, its prompt the
-/// first message typed into it that is no context Codex added itself
-/// ([`codex_context`]), each assistant message its words — a commentary one a
-/// turn that goes on past it.
+/// A Codex rollout's conversation `thread` as [`items`] reads a transcript's: each turn opens at
+/// its `task_started`, its prompt is the first user message that is no context Codex added
+/// ([`codex_context`]), and each assistant message is its words (a `commentary` one marks a turn
+/// that goes on past it).
 fn codex_items(jsonl: &str, thread: &str) -> Vec<Item> {
     let mut out = Vec::new();
     let mut turn = String::from("-");
@@ -1403,19 +1410,19 @@ fn codex_media_label(text: &str) -> bool {
     .any(|label| text.starts_with(label))
 }
 
-/// THE WORKER'S REPORT in the Codex rollout tail `jsonl` of conversation
-/// `thread`, read at the done edge by rule `by` as [`report`] reads a
-/// transcript's.
+/// The worker's report in the Codex rollout tail `jsonl` of conversation `thread`, read at the
+/// done edge by rule `by` as [`report`] reads a transcript's.
+///
 /// # Errors
 /// As [`report`].
 pub fn codex_report(jsonl: &str, thread: &str, by: DoneBy) -> Result<Report, &'static str> {
     read_items(&codex_items(jsonl, thread), by).1
 }
 
-/// Whether the newest turn in the Codex rollout tail `jsonl` has ended: a
-/// `task_complete` or `turn_aborted` after its `task_started` names that turn,
-/// with absent ids retaining the legacy boundary. A previous turn's late
-/// terminal or any message text cannot end it; a tail with no start is settled.
+/// Whether the newest turn in the Codex rollout tail `jsonl` has ended: a `task_complete` or
+/// `turn_aborted` after its `task_started` that names the same turn, or where either names no
+/// turn. A previous turn's late terminal or message text never ends it; a tail with no start
+/// reads as ended.
 #[must_use]
 pub fn codex_turn_ended(jsonl: &str) -> bool {
     let mut terminals: Vec<Option<String>> = Vec::new();
@@ -1448,9 +1455,9 @@ pub fn codex_turn_ended(jsonl: &str) -> bool {
     true
 }
 
-/// SNAPSHOT A CODEX WORKER'S RESULT, at its landing's done edge: its report in
-/// the tail of its `rollout` (the file and the text read from it), which names
-/// conversation `thread`.
+/// Snapshots a Codex worker's result at its landing's done edge: its report in the tail of its
+/// `rollout` (the file and the text read from it) of conversation `thread`.
+///
 /// # Errors
 /// As [`snapshot`].
 pub fn snapshot_rollout(

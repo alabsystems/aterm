@@ -3,15 +3,22 @@
 
 //! The window around each of the merged deck's scenes ([`aterm_vitals::fixtures`]): its tabs,
 //! its front tab and that tab's panes, and the needs its agent sessions publish, handed to the
-//! deck as the App hands a real window's ([`crate::App::deck_frame`]).
+//! deck as the App hands a real window's ([`crate::App::deck_frame`]). The tests' deck reads it,
+//! as do a debug build's deck scene (`ATERM_DEBUG_SCENE`, [`crate::icon_scene`]) and the
+//! `deck_frame_cost` bench.
 
 use aterm_vitals::fixtures::{self, DeckScene};
-use aterm_vitals::ink::VitalsInks;
-use aterm_vitals::model::Snapshot;
-use aterm_vitals::words::{Locale, Platform};
+#[cfg(any(test, feature = "bench-support"))]
+use aterm_vitals::{
+    ink::VitalsInks,
+    model::Snapshot,
+    words::{Locale, Platform},
+};
 
+#[cfg(any(test, feature = "bench-support"))]
 use super::DeckInput;
 use crate::needs::Need;
+#[cfg(any(test, feature = "bench-support"))]
 use crate::stats_plan::DeckForm;
 
 /// A scene's window.
@@ -41,19 +48,31 @@ impl DeckContext {
         }
     }
 
+    /// The front tab as the deck takes it ([`super::DeckFrame`]): its panes, the focused one
+    /// first; its label (`Tab 3`); and how many tabs the strip holds.
+    pub(crate) fn front_tab(&self) -> (Vec<u64>, String, usize) {
+        (
+            self.panes.clone(),
+            format!("Tab {}", self.front + 1),
+            self.titles.len(),
+        )
+    }
+
     /// The deck's input for this window over `snap`: its marks are the snapshot's jobs', as
     /// [`crate::App::stats_marks`] reads them.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn input<'a>(
         &self,
         snap: Option<&'a Snapshot>,
         form: DeckForm,
         inks: VitalsInks,
     ) -> DeckInput<'a> {
+        let (tab_panes, tab_label, tab_count) = self.front_tab();
         DeckInput {
             snap,
-            tab_panes: self.panes.clone(),
-            tab_label: format!("Tab {}", self.front + 1),
-            tab_count: self.titles.len(),
+            tab_panes,
+            tab_label,
+            tab_count,
             inks,
             dwc: false,
             marks: snap
@@ -71,6 +90,7 @@ impl DeckContext {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -116,5 +136,80 @@ mod tests {
             super::super::tests::dark_inks(),
         );
         assert_eq!(input.tab_label, "Tab 2");
+    }
+
+    /// A headless App whose one window draws the Deck.
+    #[cfg(unix)]
+    fn deck_app() -> (crate::App, crate::WindowId) {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("deck".into());
+        let deck = super::super::deck_px(
+            super::super::StatsBars::Deck,
+            app.windows[&wid].deck_form,
+            app.windows[&wid].scale,
+            app.win_cell_size(wid).1,
+        );
+        app.windows.get_mut(&wid).expect("window").metrics.head = deck;
+        app.backend.set_head(deck);
+        (app, wid)
+    }
+
+    /// A deck scene hands the deck its window's front tab, the one its readings name
+    /// (`ATERM_DEBUG_SCENE`, [`crate::icon_scene`]); with none the deck takes the window's own.
+    #[cfg(unix)]
+    #[test]
+    fn a_deck_scene_hands_the_deck_its_windows_front_tab() {
+        let _attached = super::super::tests::attach_stats();
+        let (mut app, wid) = deck_app();
+        let tab = |app: &crate::App| {
+            let f = app.deck_frame(wid).expect("the Deck draws");
+            (f.tab_panes, f.tab_label, f.tab_count)
+        };
+        app.vitals.deck_scene = None;
+        let own = tab(&app);
+        assert_eq!(own.1, "Tab 1");
+        assert_eq!(own.2, 1);
+        for scene in DeckScene::ALL {
+            app.vitals.deck_scene = Some(scene);
+            assert_eq!(tab(&app), DeckContext::of(scene).front_tab(), "{scene:?}");
+        }
+        assert_eq!(tab(&app), (vec![3, 5], "Tab 3".to_string(), 4));
+        app.vitals.deck_scene = None;
+        assert_eq!(tab(&app), own);
+    }
+
+    /// The lens's sentence (⌘C) names the deck scene's front tab, as the drawn lens does.
+    /// CONTROL: the window's own pane, read against the scene, names another tab.
+    #[cfg(unix)]
+    #[test]
+    fn a_deck_scenes_lens_sentence_names_its_front_tab() {
+        use crate::stats_paint::{Bar, Instrument};
+        let _attached = super::super::tests::attach_stats();
+        let (mut app, wid) = deck_app();
+        app.vitals.deck_scene = None;
+        let own = app.deck_tab_panes(wid);
+        let snap = std::sync::Arc::new(fixtures::snapshot(DeckScene::Busy));
+        app.vitals.snapshot = Some(std::sync::Arc::clone(&snap));
+        app.vitals.deck_scene = Some(DeckScene::Busy);
+        app.open_stats_lens(
+            wid,
+            Instrument::Cpu,
+            Bar::Global,
+            crate::stats_lens::Opened::Pinned,
+        );
+        let said = app.stats_lens_sentence(wid).expect("the lens's sentence");
+        let loc = Locale {
+            platform: Platform::host(),
+            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
+        };
+        let of =
+            |panes: &[u64]| crate::stats_lens::lens_sentence(&snap, Instrument::Cpu, panes, &loc);
+        assert_eq!(said, of(&DeckContext::of(DeckScene::Busy).panes));
+        assert!(said.contains("Tab 3"), "{said}");
+        assert_ne!(said, of(&own), "CONTROL: the window's own {own:?}");
     }
 }

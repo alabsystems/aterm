@@ -327,8 +327,8 @@ pub(super) fn keep_upgrade(root: &Path, plan: &Plan, record: &mut Value) -> Resu
 }
 
 /// Recover a readable, unadmitted run after the plan's rename but before its
-/// standalone progress publication. Ordinary records keep their old read/error
-/// scope; only a plan carrying the upgrade marker enables this fallback.
+/// standalone progress publication. Only a plan carrying the upgrade marker
+/// enables this fallback; any other record returns `physical` as it is.
 pub(super) fn upgrade_progress(
     root: &Path,
     physical: Option<Progress>,
@@ -395,22 +395,25 @@ mod tests {
         desktop.set(Setting::Desktop, true);
         for access in [None, Some(12), Some(13)] {
             for only in [None, Some(Selection::none()), Some(desktop)] {
-                let progress = Progress {
-                    done: Stage::Workstation.bit() | Stage::Permissions.bit(),
-                    completed: false,
-                    admitted: true,
-                    running: Some(Stage::Secrets),
-                    plan: [7; 32],
-                    revision: 13,
-                    stopped: true,
-                    access,
-                    admitted_vault: AdmittedVault::Configured([9; 32]),
-                    only,
-                };
-                assert_eq!(
-                    parse_progress(&progress_checkpoint(progress)).unwrap(),
-                    progress
-                );
+                for selection in [None, Some(Selection::none()), Some(Selection::all())] {
+                    let progress = Progress {
+                        done: Stage::Workstation.bit() | Stage::Permissions.bit(),
+                        completed: false,
+                        admitted: true,
+                        running: Some(Stage::Secrets),
+                        plan: [7; 32],
+                        revision: 13,
+                        stopped: true,
+                        access,
+                        admitted_vault: AdmittedVault::Configured([9; 32]),
+                        only,
+                        selection,
+                    };
+                    assert_eq!(
+                        parse_progress(&progress_checkpoint(progress)).unwrap(),
+                        progress
+                    );
+                }
             }
         }
     }
@@ -578,7 +581,7 @@ mod tests {
             plan: Some((narrow.clone(), true)),
             progress: None,
             decision,
-            restored: false,
+            restored: None,
             provisional,
             stop_request: None,
         };

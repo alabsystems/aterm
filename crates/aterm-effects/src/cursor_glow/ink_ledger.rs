@@ -737,18 +737,26 @@ impl InkLedger {
             return;
         }
         let w = f32::from(q.w);
-        let at = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+        let inv_w = 1.0 / w;
+        let ends = [16u32, 8, 0].map(|sh| {
+            let a = ((q.color >> sh) & 0xff) as f32;
+            let b = ((q.color2 >> sh) & 0xff) as f32;
+            (a, b - a)
+        });
         let colour = |x: i32, m: f32| {
-            let t = (x - x0) as f32 / w;
-            let ch = |sh: u32| {
-                let v = at(q.color, sh) + (at(q.color2, sh) - at(q.color, sh)) * t;
+            let t = (x - x0) as f32 * inv_w;
+            let ch = |idx: usize| {
+                let (a, da) = ends[idx];
+                let v = a + da * t;
                 ((v * m).round() as u32).min(255)
             };
-            (ch(16) << 16) | (ch(8) << 8) | ch(0)
+            (ch(0) << 16) | (ch(1) << 8) | ch(2)
         };
         for yi in 0..self.knots_y.len() - 1 {
             let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
             let ym = 0.5 * (ya + yb) as f32;
+            let ya_u = ya as u16;
+            let h_u = (yb - ya) as u16;
             let mut xa = self.knots_x[0];
             let mut ca = colour(xa, self.mask_at(xa as f32, ym));
             for xi in 0..self.knots_x.len() - 1 {
@@ -758,9 +766,9 @@ impl InkLedger {
                     out.push(GlowQuad {
                         row: q.row,
                         x: xa as u16,
-                        y: ya as u16,
+                        y: ya_u,
                         w: (xb - xa) as u16,
-                        h: (yb - ya) as u16,
+                        h: h_u,
                         color: ca,
                         alpha: 0,
                         color2: cb,
@@ -826,18 +834,21 @@ impl InkLedger {
                 cut = true;
                 for yi in 0..self.knots_y.len() - 1 {
                     let (ya, yb) = (self.knots_y[yi], self.knots_y[yi + 1]);
+                    let ym = 0.5 * (ya + yb) as f32;
+                    let ya_u = ya as u16;
+                    let h_u = (yb - ya) as u16;
                     for xi in 0..self.knots_x.len() - 1 {
                         let (xa, xb) = (self.knots_x[xi], self.knots_x[xi + 1]);
-                        let m = self.mask_at(0.5 * (xa + xb) as f32, 0.5 * (ya + yb) as f32);
+                        let m = self.mask_at(0.5 * (xa + xb) as f32, ym);
                         let color = scale_rgb(h.color, m);
                         if color & 0x00FF_FFFF == 0 {
                             continue;
                         }
                         pieces.push(RainHalo {
                             x: xa as u16,
-                            y: ya as u16,
+                            y: ya_u,
                             w: (xb - xa) as u16,
-                            h: (yb - ya) as u16,
+                            h: h_u,
                             color,
                             ..*h
                         });
@@ -1253,10 +1264,13 @@ impl CursorGlow {
                 })
         };
         let cr = i32::from(cr);
+        let mid_y = 0.5 * (top + bot);
+        let inv_ease = 1.0 / (fi + fy);
+        let inv_fx = 1.0 / fx;
         let mut print = 0u64;
         for q in quads.iter_mut().filter(|q| q.alpha == 0 && q.h > 0) {
             let ym = f32::from(q.y) + 0.5 * f32::from(q.h);
-            let (inside, across) = if ym < 0.5 * (top + bot) {
+            let (inside, across) = if ym < mid_y {
                 (ym - top, cr - 1)
             } else {
                 (bot - ym, cr + 1)
@@ -1266,7 +1280,7 @@ impl CursorGlow {
             } else {
                 across
             };
-            let hold = smooth((inside + fy) / (fi + fy));
+            let hold = smooth((inside + fy) * inv_ease);
             if hold >= 1.0 || row < 0 || !view.knows_row(row) {
                 continue;
             }
@@ -1289,7 +1303,7 @@ impl CursorGlow {
             if !near.is_finite() {
                 continue;
             }
-            let share = hold + (1.0 - hold) * smooth(near / fx);
+            let share = hold + (1.0 - hold) * smooth(near * inv_fx);
             if share >= 1.0 {
                 continue;
             }

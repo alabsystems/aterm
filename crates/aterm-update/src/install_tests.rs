@@ -579,10 +579,8 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A launch waiting for its roster confirmation is no stuck update: booking the wait
-/// restarts the pending clock (which counts from the stage's first sighting, across
-/// days the app was closed), so the overdue notice speaks only if the wait outlasts
-/// its hour.
+/// A launch waiting for its roster confirmation is no stuck update: booking the wait restarts
+/// the pending clock, so the overdue notice speaks only if the wait outlasts its hour.
 #[test]
 fn a_launch_waiting_for_its_roster_confirmation_restarts_the_overdue_clock() {
     let (s, root) = temp_staging();
@@ -820,8 +818,7 @@ fn a_confirmation_is_dated_by_the_roster_read_and_never_moves_backwards() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A FLOOR THAT IS THERE BUT COULD NOT BE READ WITHDRAWS NOTHING AND ADMITS
-/// NOTHING.
+/// A floor that is there but could not be read withdraws nothing and admits nothing.
 #[test]
 fn a_floor_that_could_not_be_read_admits_no_stage() {
     use std::os::unix::fs::PermissionsExt;
@@ -1181,7 +1178,8 @@ fn a_timeout_verifying_the_installed_bundle_is_not_a_person_refusal() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A `codesign` run that ended without a verdict (`CodesignError::judged_nothing_at`) does not record an installed-source refusal.
+/// A `codesign` run that ended without a verdict (`CodesignError::judged_nothing_at`) does not
+/// record an installed-source refusal.
 #[test]
 fn a_codesign_run_without_a_verdict_on_the_installed_bundle_is_not_a_person_refusal() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2403,13 +2401,9 @@ fn supersede_desk(
     )
 }
 
-/// A newer stage retires the unconfirmed activation without counting a launch of
-/// it: the running build is back at the install path, the activation's trial is
-/// disarmed at its two counted launches (never a third, which `check_boot_health`
-/// would revert and poison on), nothing is quarantined, the stage is untouched,
-/// and the boot apply's preconditions hold for the next candidate (the installed
-/// bundle is the running build, no trial owns the fixed path, `ready.toml` names
-/// the newer build).
+/// The running build goes back to the install path and the activation's trial is disarmed at
+/// its two counted launches (a third would revert and poison it); nothing is quarantined, and
+/// the boot apply's preconditions hold for the next candidate.
 #[test]
 fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch() {
     let (s, root, installed) = superseded_activation_desk();
@@ -3015,11 +3009,10 @@ fn active_trial_digest_rejects_same_build_commit_receipt_with_other_artifact() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Tier-1 conformance for the native update disk machine: drives the real
-/// fixed-path exchange, inverse rollback, sentinel, exact receipt, startup
-/// authority reducer, health cleanup and the settle without revert of a trial
-/// whose predecessor the running verifier refuses, projecting each observation
-/// onto the model Tier-0 proves and bug-mutates.
+/// Tier-1 conformance for the native update disk machine: drives the real fixed-path exchange,
+/// inverse rollback, sentinel, exact receipt, startup authority reducer, health cleanup and the
+/// settle without revert of a trial whose predecessor the verifier refuses, projecting each
+/// observation onto the model.
 #[test]
 fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_health_guards() {
     let model = aterm_models_misc::native_update_disk_transaction_model();
@@ -3614,7 +3607,8 @@ fn well_formed_zip(entries: &[(&str, u32)]) -> Vec<u8> {
     bytes
 }
 
-/// [`checked_zip_extraction_claim`] admits valid archives, trailing comments, and toolchain-sized bundles within the extraction cap.
+/// [`checked_zip_extraction_claim`] admits valid archives, trailing comments, and toolchain-sized
+/// bundles within the extraction cap.
 #[test]
 fn zip_claim_reads_every_directory_a_publisher_could_write() {
     assert_eq!(
@@ -3665,7 +3659,8 @@ fn zip_claim_reads_every_directory_a_publisher_could_write() {
     }
 }
 
-/// [`checked_zip_extraction_claim`] refuses oversized, truncated, mismatched, ambiguous, and trailer-less central directories.
+/// [`checked_zip_extraction_claim`] refuses oversized, truncated, mismatched, ambiguous, and
+/// trailer-less central directories.
 #[test]
 fn zip_claim_refuses_every_directory_it_cannot_bound() {
     let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;
@@ -3775,9 +3770,8 @@ fn zip_claim_refuses_every_directory_it_cannot_bound() {
     }
 }
 
-/// This machine's free space is checked before `ditto` is spawned: a declared
-/// size the volume cannot hold is refused; a size it holds passes; a volume that will not report passes too
-/// (`ditto` decides, with its stderr kept).
+/// Free space is checked before `ditto` is spawned: a declared size the volume cannot hold is
+/// refused, one it holds passes, and so does a volume that will not report (`ditto` decides).
 #[test]
 fn the_stage_refuses_an_unpack_the_volume_cannot_hold() {
     let (_s, root) = temp_staging();
@@ -3853,11 +3847,9 @@ fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A bundle a stage's start probe left unproven stays at its path while its exec stamp
-/// holds, and a later stage's sweep reclaims it once the stamp is spent or a restart came
-/// between; a sleep does not spend it. One with no stamp is stamped by the first sweep that
-/// finds it and goes on a later one; a stamp whose bundle is gone goes, and the published stage
-/// is never touched.
+/// A left bundle stays while its exec stamp holds (a sleep does not spend it) and goes once the
+/// stamp is spent or a restart came between. An unstamped one is stamped and goes on a later
+/// sweep; a stamp whose bundle is gone goes, and the published stage is never touched.
 #[test]
 fn a_bundle_a_stage_probe_left_unproven_goes_once_its_exec_stamp_is_spent() {
     let (s, root) = temp_staging();
@@ -3932,11 +3924,8 @@ fn a_bundle_a_stage_probe_left_unproven_goes_once_its_exec_stamp_is_spent() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// With automatic checks off no check comes to sweep, so the launch starts a sweep that takes
-/// a bundle a stage's probe left once its stamp is spent, then waits out each hold it kept
-/// (a live stamp, and the one it put on an unstamped bundle) and takes those too. It stays:
-/// every FIRST_EXEC_HANG it lists `staged/` again, so a bundle another process's asked check
-/// left goes once its hold is spent; it ends only when there is no `staged/` to sweep.
+/// With automatic checks off the launch's sweep takes each left bundle once its hold is spent,
+/// then lists `staged/` again every FIRST_EXEC_HANG, ending only when there is no `staged/`.
 #[test]
 fn with_automatic_checks_off_the_launch_sweep_takes_each_left_bundle_once_its_hold_is_spent() {
     use std::sync::atomic::AtomicBool;
@@ -4039,10 +4028,8 @@ fn with_automatic_checks_off_the_launch_sweep_takes_each_left_bundle_once_its_ho
     assert_eq!(read_id(&s.staged_app), "PUBLISHED");
 }
 
-/// With automatic checks off no scheduled check follows an asked one, so the asked check
-/// starts the sweep, which takes the bundle its probe left once the stamp is spent; another
-/// asked check while that sweep runs sends it round once more. With them on, it starts
-/// nothing: the next scheduled check sweeps.
+/// With automatic checks off an asked check starts the sweep, and another while it runs sends
+/// it round once more; with them on it starts none, since the next scheduled check sweeps.
 #[test]
 fn with_automatic_checks_off_an_asked_check_sweeps_what_it_left_once_its_stamp_is_spent() {
     use std::sync::mpsc::{Receiver, RecvTimeoutError::Disconnected, channel};
@@ -4092,7 +4079,6 @@ fn with_automatic_checks_off_an_asked_check_sweeps_what_it_left_once_its_stamp_i
     let mut second = None;
     crate::asked_check(false, &sweep, || second = Some(stage_left("SECOND")));
     let second = second.unwrap();
-    // The sweep's thread now holds the only `sleep`, so its channel closes when it ends.
     drop(sweep);
     for left in [&first, &second] {
         std::fs::write(stamp(left), &restarted).unwrap();
@@ -4127,9 +4113,8 @@ fn with_automatic_checks_off_an_asked_check_sweeps_what_it_left_once_its_stamp_i
     assert_eq!(read_id(&s.staged_app), "PUBLISHED");
 }
 
-/// A sweep that finds a stage holding the lock touches nothing, not even a spent bundle, and
-/// asks to come back once that stage's own bundle could be spent; once the lock is free it
-/// takes the spent bundle and asks for nothing.
+/// A sweep that finds the stage lock held touches nothing, not even a spent bundle, and asks to
+/// come back after FIRST_EXEC_HANG; once the lock is free it takes the spent bundle.
 #[test]
 fn a_sweep_that_finds_the_stage_lock_held_leaves_everything_and_comes_back_later() {
     let (s, _root) = temp_staging();
@@ -4643,7 +4628,8 @@ fn the_old_bundle_recheck_follows_the_operation_that_prepared_new() {
     );
 }
 
-/// A window launch leaves the stage for its window and execs only to revert or escape (Tier-1 of `NativeUpdateBootImage`).
+/// A window launch leaves the stage for its window and execs only to revert or escape (Tier-1 of
+/// `NativeUpdateBootImage`).
 #[test]
 fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_escape() {
     use crate::ImageReplacement::{LaunchedSuccessor, Replaceable, WindowKeepsImage};
@@ -4958,9 +4944,8 @@ fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_e
     );
 }
 
-/// Which start-probe failures leave the candidate unproven: a probe killed at its
-/// ceiling (the helper timeout or the apply budget), a wait that failed, and a signal
-/// that ended the candidate started it and never saw it exit.
+/// A probe killed at its ceiling (the helper timeout or the apply budget), a failed wait, or a
+/// signal's end leaves the candidate unproven; one that never started it or saw it exit does not.
 #[test]
 fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     let what = "candidate --version probe";
@@ -4987,9 +4972,8 @@ fn only_a_probe_that_lost_a_started_candidate_leaves_it_unproven() {
     }
 }
 
-/// A start probe killed before its candidate exited leaves it where it ran: every probe finds
-/// the candidate recorded before it starts it, so an apply killed mid-probe leaves the record
-/// holding it; with no record there is no probe.
+/// Every probe finds its candidate recorded before it starts it, so an apply killed mid-probe
+/// leaves the record holding it; with no record there is no probe.
 #[test]
 fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
     let (running, build, commit, other_commit) = (
@@ -5362,12 +5346,10 @@ fn an_unproven_copied_candidate_stays_beside_its_stage() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// No build drops a record in a format it cannot read. This build's record has a file of its
-/// own, so an earlier build's pass over `fixed.unproven` (which drops what does not parse as
-/// `v1`) leaves it holding. An earlier build's live `v1` record holds every install's swap on
-/// the wall clock, whichever install's candidate it names, and stays until it is spent. A
-/// record this build cannot parse, in either file, holds every swap for FIRST_EXEC_HANG by its
-/// file's mtime and goes only then.
+/// This build's record has a file of its own, so an earlier build's pass over `fixed.unproven`
+/// leaves it holding. An earlier build's live `v1` record holds every swap on the wall clock until
+/// it is spent, and a record this build cannot parse holds every swap for FIRST_EXEC_HANG by its
+/// file's mtime.
 #[test]
 fn no_build_drops_a_record_in_a_format_it_cannot_read() {
     let (s, root) = temp_staging();

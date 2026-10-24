@@ -663,14 +663,12 @@ mod unix {
     const PATH_JOINS: &str = "a vault at a path has no join queue: a machine joins it only when an admin approves its key: aterm secrets approve <age1…> --name <host>";
 
     /// What a publish that let a machine go from an open vault says: only its key is kept out,
-    /// since an open vault lets in any new key that reaches the server (§7).
+    /// since an open vault lets in any new key that reaches the server.
     const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve). The vault still lets in any new key that reaches its server, so if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
-    /// [`KEPT_OUT`] for a vault at a path. No server's queue reaches a path no server serves,
-    /// so nothing lets a machine in there but an admin's approve of its key, which a
-    /// `code-only` line does not stop. Whether a server serves the file is not knowable here;
-    /// one that does serves this version from its next request (`server::take_from_store`),
-    /// and the open vault's queue then makes [`KEPT_OUT`]'s steps the ones to take.
+    /// [`KEPT_OUT`] for a vault at a path: only an admin's approve of a key lets a machine in
+    /// there, which a `code-only` line does not stop. A server may still serve the file
+    /// (`server::take_from_store`), so the text gives [`KEPT_OUT`]'s steps too.
     const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>): if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the open vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// What marks a request whose key a `code-only` line names, where requests are listed.
@@ -1077,8 +1075,7 @@ mod unix {
         })
     }
 
-    /// `join`'s status line for a Mac awaiting approval of `code` (including [`retype`] hint when
-    /// applicable).
+    /// `join`'s status line for a Mac awaiting approval of `code`, with the [`retype`] hint if any.
     pub(super) fn waiting_line(host: &str, code: &str, retype: Option<&str>) -> String {
         let line = format!(
             "waiting for approval of {host} (code {code}): on an admin Mac run aterm secrets approve {code}"
@@ -1330,10 +1327,8 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// `--no-agent` where no subscriber runs: the person's choice that this Mac keeps none,
-    /// recorded ([`service::subscriber_off_path`]) so aterm's setup leaves it so and System
-    /// State reads its sync as off by choice. A subscriber that runs is left be, and so is
-    /// the record; one that cannot be written is a warning.
+    /// Record `--no-agent` as the person's choice ([`service::subscriber_off_path`]) unless a
+    /// subscriber runs; a record that cannot be written is a warning.
     pub(super) fn record_no_agent(
         paths: &Paths,
         state: &dyn Fn() -> crate::Result<service::State>,
@@ -1428,9 +1423,9 @@ mod unix {
             },
         )
         .inspect_err(|_| {
-            // Cut off after it saved the source (the server gone before the request was
-            // queued), the join leaves this Mac waiting with its request due at once: the
-            // subscriber that makes it goes in now, as once a request is queued.
+            // A join that fails after saving the source (the server gone before the request
+            // was queued) leaves this Mac waiting with its request due at once, so the
+            // subscriber that asks goes in now, as once a request is queued.
             if client::config(paths)
                 .ok()
                 .flatten()
@@ -1535,7 +1530,8 @@ mod unix {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// `create`, then this Mac's subscriber put in as `join` puts it in (unless `agent` is false, `--no-agent`).
+    /// `create`, then, for a vault at a URL, this Mac's approver unless `--no-agent`
+    /// ([`approver_here`]).
     pub(super) fn create(
         paths: &Paths,
         source: &str,
@@ -2190,7 +2186,7 @@ mod unix {
         ))
     }
 
-    /// What `host` could read in `doc`, said where it is let go (`revoke`, `admins remove`), so a person rotates all of it.
+    /// What `host` could read in `doc`, said where `revoke` or `admins remove` lets it go.
     pub(super) fn exposure(doc: &text::Document, host: &str) -> Option<String> {
         let admin = doc.admins().iter().any(|name| name == host);
         let held: Vec<String> = doc

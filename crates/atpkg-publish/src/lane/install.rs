@@ -226,7 +226,12 @@ pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
 
 /// The install, over an injected machine.
 /// # Errors
-/// A refusal for the wrong OS, a missing machine key or record, a dirty checkout, a lane run in flight, a build that produced nothing, a snapshot that does not hash to its build, or a unit its linter refuses.
+/// A refusal for the wrong OS, a missing machine key or record, a checkout git cannot read or
+/// one that is dirty, an atpkg store other than the one `XDG_CONFIG_HOME` names, a lane run in
+/// flight, a shell-era lane still in its first-exec hold, a build that failed, produced nothing
+/// or saw its inputs change, a snapshot that does not hash to its build, a unit its linter
+/// refuses, or a service manager that refuses to arm; an I/O error laying down the snapshot, its
+/// units or the live link.
 #[allow(clippy::too_many_lines)]
 pub fn install_with(
     ctx: &Ctx,
@@ -552,9 +557,10 @@ pub fn install_with(
     Ok(out)
 }
 
-/// `atpkg-publish lane disarm <lane>`: stop the units and remove them; the snapshots are left for inspection, each the stopped job could have been starting held from its bootout.
+/// `atpkg-publish lane disarm <lane>`: stop the units and remove them. The snapshots stay for
+/// inspection; each one the stopped job could have been starting is held from the bootout.
 /// # Errors
-/// Why the service manager refused.
+/// A refusal for the wrong OS, or why the service manager refused.
 pub fn disarm(ctx: &Ctx, kind: LaneKind, machine: &Machine) -> Result<()> {
     machine.check_os(kind)?;
     let stopped = machine.services.disarm(kind);
@@ -735,7 +741,9 @@ fn write_units(dir: &Path, units: &[Unit]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// The production build: the atpkg store's `targo`, in the explicit unverified lane, with `--locked` (the lockfile is the reviewed dependency set) and the scrubbed environment no stage of the workspace may inherit (a `RUSTFLAGS` replaces the config's flags).
+/// The production build: the atpkg store's `targo` in the unverified lane, with `--locked` (the
+/// lockfile is the reviewed dependency set) and the toolchain and flag variables scrubbed (a
+/// `RUSTFLAGS` replaces the config's flags).
 #[derive(Debug)]
 pub struct TargoBuild {
     /// The store's Trust bin dir.
@@ -828,7 +836,7 @@ fn uid() -> Result<String> {
 pub struct Launchd {
     /// `~/Library/LaunchAgents`.
     pub agents_dir: PathBuf,
-    /// The lanes' state root (launchd's own capture is rotated per arm).
+    /// The lanes' state root (launchd's own capture, `alab.launchd.log`, is emptied at each arm).
     pub state_dir: PathBuf,
 }
 
@@ -911,9 +919,9 @@ fn bootout_or_absent(
     if run(&["bootout", &format!("gui/{uid}/{label}")]).is_ok_and(|o| o.status.success()) {
         return true;
     }
-    // The documented legacy list is scoped to the caller's manager, not an explicit domain.
-    // Only Aqua for this nonroot uid establishes absence in the gui domain we tried to stop.
-    // `print` is deliberately unused: launchctl documents its output as a non-API.
+    // `launchctl list` answers for the caller's manager, not a named domain, so only an Aqua
+    // manager for this non-root uid makes it the gui domain's answer. `print` stays unused:
+    // launchctl documents its output as not an API.
     if uid == "0"
         || query_text(run, &["manageruid"]).as_deref() != Some(uid)
         || query_text(run, &["managername"]).as_deref() != Some("Aqua")
@@ -969,7 +977,7 @@ fn listed_label(text: &str, wanted: &str) -> Option<bool> {
 
 /// `plutil -lint` over rendered plists — what launchd reads.
 /// # Errors
-/// `plutil`'s refusal.
+/// `plutil`'s refusal, or a `plutil` that cannot run.
 pub fn lint_plists(paths: &[PathBuf]) -> Result<Lint> {
     if !Path::new("/usr/bin/plutil").is_file() {
         return Ok(Lint::NotRun("no /usr/bin/plutil on this host".into()));
@@ -993,7 +1001,8 @@ pub struct Systemd {
     pub unit_dir: PathBuf,
 }
 
-/// `systemd-analyze --user verify` over rendered units, where systemd is (said, never a pass, where it is not).
+/// `systemd-analyze --user verify` over rendered units where systemd is; where it is not,
+/// [`Lint::NotRun`], never a pass.
 /// # Errors
 /// The verifier's refusal.
 pub fn lint_systemd(paths: &[PathBuf]) -> Result<Lint> {

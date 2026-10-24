@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The job probe: what the stuck-process engine (`aterm_vitals::jobs`, `docs/DESIGN-system-awareness-2026-10-16.md` §11) needs to know about each member of a job, read only for the processes it names.
+//! The job probe: what the stuck-process engine (`aterm_vitals::jobs`,
+//! `docs/DESIGN-system-awareness-2026-10-16.md` §11) needs to know about each member of a job,
+//! read only for the processes it names.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,7 +14,8 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// A zombie's `kinfo_proc` (the sweep's fallback when the short BSD info refuses).
+/// A process's `kinfo_proc`, which a zombie answers too (the sweep's fallback when the short BSD
+/// info refuses).
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_kinfo(pid: std::ffi::c_int) -> Option<darwin::Kinfo> {
     macos::kinfo(pid)
@@ -495,7 +498,12 @@ impl ProcFacts {
 /// How long before a process's start a dylib it holds open may have been written and still read as fresh ([`fresh_dylib`]): a build writes a proc macro, then starts the compiler that loads it.
 pub const FRESH_DYLIB_US: u64 = 3_600_000_000;
 
-/// Whether a descriptor's file at `path`, its data last changed at `mtime_s` (seconds since the epoch), is a dylib a build just wrote for the process that started at `start_us` (µs since the epoch): its name ends `.dylib`, and it changed at most [`FRESH_DYLIB_US`] before that start, or since. macOS checks a program's new code as it loads it, so a started program that holds one open while its CPU stays flat may wait for that check (leftover §5.1's dylib case, U4): a heuristic, never a verdict. `false` with no start read.
+/// Whether a descriptor's file at `path`, its data last changed at `mtime_s` (seconds since the
+/// epoch), is a dylib a build just wrote for the process that started at `start_us` (µs since the
+/// epoch): its name ends `.dylib`, and it changed at most [`FRESH_DYLIB_US`] before that start, or
+/// since; `false` with no start read or a change time before the epoch. macOS checks a program's
+/// new code as it loads it, so a started program that holds one open while its CPU stays flat may
+/// wait for that check (the leftover-processes design's §5.1): a heuristic, never a verdict.
 #[must_use]
 pub fn fresh_dylib(path: &[u8], mtime_s: i64, start_us: Option<u64>) -> bool {
     let (Some(start_us), Ok(mtime_s)) = (start_us, u64::try_from(mtime_s)) else {
@@ -541,7 +549,10 @@ pub struct StartFacts {
     pub age_ms: Option<u64>,
 }
 
-/// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never ran and it is past [`PROGRAM_CHECK_AGE_MS`] while neither stopped nor traced; then [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, [`AtStart::Unstarted`] unless its executable's volume reads local (an unread mount proves nothing local), and [`AtStart::Held`] otherwise.
+/// Where a process with `f` stands at its start: [`AtStart::Started`] unless it shows the held
+/// signature (its one thread never ran, past [`PROGRAM_CHECK_AGE_MS`], neither stopped nor
+/// traced); then [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, else
+/// [`AtStart::Unstarted`] unless its executable's volume reads local, else [`AtStart::Held`].
 #[must_use]
 pub fn judge_start(f: &StartFacts) -> AtStart {
     if !(f.lone_zero && !f.stopped && !f.traced && f.age_ms >= Some(PROGRAM_CHECK_AGE_MS)) {
@@ -618,7 +629,7 @@ pub struct ReadReq {
     pub fds: bool,
 }
 
-/// An optional lane's state after its self-check (design §5.3).
+/// An optional lane's state after its self-check (the system-awareness design's §5.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     /// The self-check passed.
@@ -664,6 +675,9 @@ pub struct JobsReader {
     lanes: Option<Lanes>,
     /// The last size seen per `(pid, start, fd, ino)`.
     tails: HashMap<TailKey, u64>,
+    /// The processes the last pass found running a program they exec'd, by `(pid, start)`, each
+    /// with its short name then: the ones whose sockets this pass may read (`macos::settled`).
+    execd: HashMap<(u32, u64), String>,
 }
 
 /// An output file's identity for the tail check.
@@ -690,6 +704,7 @@ impl JobsReader {
             hz: hz.max(1),
             lanes: None,
             tails: HashMap::new(),
+            execd: HashMap::new(),
         }
     }
 
@@ -712,10 +727,15 @@ impl JobsReader {
         };
         let mounts = std::cell::OnceCell::new();
         let mut out = Vec::with_capacity(reqs.len());
+        let mut execd = HashMap::new();
         for r in reqs {
-            let Some((mut facts, start)) = self.read_raw(r.pid, r.fds, lanes, now) else {
+            let Some((mut facts, start, runs_its_exec)) = self.read_raw(r.pid, r.fds, lanes, now)
+            else {
                 continue;
             };
+            if runs_its_exec {
+                execd.insert(facts_key(r.pid, facts.start), facts.name.clone());
+            }
             let exe = (facts.state != RunState::Zombie)
                 .then(|| self.exe_path(r.pid))
                 .flatten();
@@ -748,6 +768,7 @@ impl JobsReader {
         let live: std::collections::HashSet<(u32, u64)> =
             out.iter().map(|f| facts_key(f.pid, f.start)).collect();
         self.tails.retain(|k, _| live.contains(&(k.0, k.1)));
+        self.execd = execd;
         out
     }
 
@@ -756,24 +777,29 @@ impl JobsReader {
         self.read_all(&[req]).pop()
     }
 
-    /// One process's facts, and the [`StartFacts`] its thread list gave (the macOS arm; `local` left for [`Self::read_all`], which holds the executable's path).
+    /// One process's facts, the [`StartFacts`] its thread list gave (the macOS arm; `local` left for [`Self::read_all`], which holds the executable's path), and whether it runs a program it exec'd (macOS; `false` elsewhere).
     fn read_raw(
         &self,
         pid: u32,
         fds: bool,
         lanes: Option<Lanes>,
         now_us: u64,
-    ) -> Option<(ProcFacts, Option<StartFacts>)> {
+    ) -> Option<(ProcFacts, Option<StartFacts>, bool)> {
         #[cfg(target_os = "macos")]
         {
             let _ = (&self.root, self.hz);
-            macos::read(pid, fds, lanes.unwrap_or(OFF_LANES), now_us)
+            let execd_then = |start, name: &str| {
+                self.execd
+                    .get(&facts_key(pid, start))
+                    .is_some_and(|then| then == name)
+            };
+            macos::read(pid, fds, lanes.unwrap_or(OFF_LANES), now_us, execd_then)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (lanes, now_us);
+            let _ = (lanes, now_us, &self.execd);
             if cfg!(target_os = "linux") || self.root != Path::new("/proc") {
-                linux::read(&self.root, pid, fds, self.hz).map(|f| (f, None))
+                linux::read(&self.root, pid, fds, self.hz).map(|f| (f, None, false))
             } else {
                 None
             }

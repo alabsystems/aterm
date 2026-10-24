@@ -3,8 +3,8 @@
 
 //! A started program's folder stays until the program showed it ran: macOS 27.0.1's
 //! syspolicyd crashes when a file it is assessing at its first exec goes, and every exec
-//! then waiting on it is stranded until a restart. [`aterm_uds::deadline`]'s stamp and
-//! marker, read and written through the [`System`] port.
+//! then waiting on it is stranded until a restart. This module reads and writes
+//! [`aterm_uds::deadline`]'s stamp and marker through the [`System`] port.
 
 use crate::port::{Cmd, Ran, System};
 use aterm_uds::deadline::{EXEC_STAMP, FIRST_EXEC_HANG, RAN};
@@ -16,10 +16,10 @@ use std::time::Duration;
 const MODE: u32 = 0o644;
 
 /// Record in `home`, just before a program under it starts, that it has not shown it ran:
-/// [`EXEC_STAMP`] with the awake-clock reading, and no [`RAN`]. Both are readable by all.
-/// Cancel an earlier uninstall's mark ([`crate::agent::reclaim::KEPT`]) before checking its
-/// reclaim claim. The job claims that mark atomically before it empties the folder: either
-/// cancellation wins, or the claim refuses this start until the job finishes.
+/// [`EXEC_STAMP`] with the awake-clock reading, and no [`RAN`]. An earlier uninstall's mark
+/// ([`crate::agent::reclaim::KEPT`]) is cancelled before its reclaim claim is checked; the job
+/// claims that mark atomically before it empties the folder, so either cancellation wins or the
+/// claim refuses this start until the job finishes.
 ///
 /// # Errors
 /// The reclaim claim is present or cannot be checked, the stamp cannot be written, or a

@@ -116,7 +116,8 @@ pub struct Cmd {
     pub env: Vec<(String, String)>,
     /// Variable names in `env` whose values [`Cmd::display`] masks.
     pub masked: Vec<String>,
-    /// Kill the process group at the deadline and return `Ok` with `status: None` and captured output instead of [`RunFailed::TimedOut`].
+    /// Kill the process group at the deadline and return `Ok` with `status: None` and what it
+    /// printed, instead of [`RunFailed::TimedOut`].
     pub keep_on_timeout: bool,
     /// The directory the program starts in; `/` when `None`.
     pub cwd: Option<PathBuf>,
@@ -400,7 +401,8 @@ pub trait Relaying {
 
 /// The operating system, as items see it.
 pub trait System: Sync {
-    /// Read one GitHub API endpoint through `agh` as `user` using the admitted development credential.
+    /// Read one GitHub API endpoint through `agh` as `user` with the admitted development
+    /// credential.
     ///
     /// # Errors
     /// The read's failure and its kind ([`GithubFailure`]).
@@ -415,7 +417,8 @@ pub trait System: Sync {
         ))
     }
 
-    /// Send one GitHub REST request as the controller account with `token` in `Authorization` and optional JSON `body`, refusing redirects.
+    /// Send one GitHub REST request as the controller account, with `token` in `Authorization`
+    /// and an optional JSON `body`, refusing redirects.
     fn github_rest(
         &self,
         _token: &Secret,
@@ -484,7 +487,9 @@ pub trait System: Sync {
     /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
 
-    /// Read a bounded regular file at `_path` (at most `_max` bytes) after verifying it is not a symlink, is owned by `_uid`, and has safe mode bits.
+    /// Read the regular file at `path` (at most `max` bytes) after checking it is no symlink, is
+    /// owned by `uid`, has no set-id or group/other write bit, and, when `private`, no group or
+    /// other access at all.
     fn read_owned_file(
         &self,
         path: &Path,
@@ -517,7 +522,8 @@ pub trait System: Sync {
     /// Change owner and group of `path` without following symlinks.
     fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
 
-    /// Set owner `uid:gid` and permission bits `mode` on the single-linked regular file at `path` via an open descriptor.
+    /// Set owner `uid:gid` and permission bits `mode` on the single-linked regular file at
+    /// `path` via an open descriptor.
     fn set_owner_and_mode(&self, path: &Path, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
         let _ = (path, uid, gid, mode);
         Err(io::Error::from(io::ErrorKind::Unsupported))
@@ -538,7 +544,8 @@ pub trait System: Sync {
     /// Rename `from` to `to`.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Atomically rename `from` to an absent `to`, failing with [`io::ErrorKind::AlreadyExists`] on collision.
+    /// Atomically rename `from` to an absent `to`, failing with
+    /// [`io::ErrorKind::AlreadyExists`] on collision.
     fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
         let _ = (from, to);
         Err(io::ErrorKind::Unsupported.into())
@@ -562,7 +569,8 @@ pub trait System: Sync {
         false
     }
 
-    /// When `pid` started, in unix seconds, as the kernel recorded it for any uid's process (what `ps -o lstart=` printed), or `None` when there is no such process.
+    /// When `pid` started, in Unix seconds, as the kernel recorded it for any uid's process (what
+    /// `ps -o lstart=` prints), or `None` when there is no such process.
     fn process_started(&self, pid: u32) -> Option<u64> {
         let _ = pid;
         None
@@ -652,12 +660,14 @@ pub trait System: Sync {
         None
     }
 
-    /// Whether this process holds Full Disk Access, as whoever runs the items measured it, once and without a prompt, before the run.
+    /// Whether this process holds Full Disk Access, as whoever runs the items measured it, once
+    /// and without a prompt, before the run.
     fn full_disk_access(&self) -> Option<bool> {
         None
     }
 
-    /// The app bundle this process runs from (`/Users//bob/Applications/aterm.app`), canonical, or `None` outside a bundle or when it cannot be read.
+    /// The app bundle this process runs from (`/Users//bob/Applications/aterm.app`), canonical,
+    /// or `None` outside a bundle or when it cannot be read.
     fn running_app(&self) -> Option<PathBuf> {
         None
     }
@@ -1580,7 +1590,8 @@ mod fake {
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
-        /// The commands whose [`System::run`] gives no answer within its budget ([`Fake::time_out`]).
+        /// The commands whose [`System::run`] gives no answer within its budget
+        /// ([`Fake::time_out`]).
         timeouts: Mutex<std::collections::BTreeSet<String>>,
         stage_commit_refused: Mutex<bool>,
         stage_abort_refused: Mutex<bool>,

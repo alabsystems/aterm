@@ -283,11 +283,9 @@ fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
     }
 }
 
-/// A host whose conversation's record ends on the turn the loop's last act
-/// opened once it typed one ([`IdleHost::act_taken`]), closed in 41 ms —
-/// Claude Code's record of a prompt it answered at once — and on the
-/// person's `land the two branches` before: recorded at `at_ms`, the
-/// loop's fixed clock.
+/// A host whose conversation's record ends on the person's `land the two branches` until the loop
+/// types an act ([`IdleHost::act_taken`]), then on that act's turn, closed in 41 ms (a prompt
+/// answered at once); each opened at `at_ms`, the loop's fixed clock.
 #[derive(Debug)]
 struct TypedRecordHost {
     typed: std::sync::atomic::AtomicBool,
@@ -2488,16 +2486,10 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
     assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
 }
 
-/// AN ESCALATION ON AN UNMOVED SCREEN IS NEVER TYPED AGAIN ON IT, through the
-/// loop ([`Session::type_fenced`], [`Session::input_unread`]): at a weekly
-/// wall's reset the continuation is written over the wall's suggestion, and
-/// the worker draws nothing for 100 s. The echo's hang detector runs
-/// out and the text is escalated `typed, not submitted`. Waits then wake
-/// with nothing drawn ([`Mock::unmoved_wakes`]) on a frame the loop keys as
-/// a new point at the same seq ([`Mock::unmoved_rekeyed`]), and the loop
-/// decides that unmoved screen again (the wall's act still owed on it) and
-/// writes nothing: one write in all, each decision on that seq skipped. NEGATIVE CONTROL: once the screen moves (the text drawn),
-/// the next decision acts on it, an Enter fenced on that read.
+/// An escalation (`typed, not submitted`) on a screen that never moves is never typed again on it
+/// ([`Session::type_fenced`], [`Session::input_unread`]), however often a wake rekeys that frame
+/// as a new point. Negative control: once the screen moves, the next decision acts, an Enter
+/// fenced on that read.
 #[test]
 fn an_escalation_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
     let mut shown = weekly_limited();
@@ -2591,18 +2583,9 @@ fn an_escalation_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
     );
 }
 
-/// AN ECHO THAT HUNG ON A FRAME DRAWN AFTER THE WRITE IS NEVER TYPED AGAIN ON
-/// IT ([`Session::type_fenced`], [`Session::input_unread`]): at a weekly
-/// wall's reset the continuation is written over the wall's suggestion; the
-/// worker draws one frame after the write, the composer empty (the
-/// suggestion gone, the text not drawn), and then nothing for 100 s. Every
-/// read shows the text on its way, so the echo's hang detector escalates it
-/// `typed, not submitted` on that frame. Waits then wake on a frame the loop
-/// keys as a new point at that seq ([`Mock::unmoved_rekeyed`]), and the
-/// loop decides it again and writes nothing: one write in all, each
-/// decision on that seq skipped. NEGATIVE CONTROL: once the screen moves
-/// (the text drawn), the next decision acts on it, an Enter fenced on that
-/// read.
+/// An echo that hung on a frame drawn after the write (escalated `typed, not submitted`) is never
+/// typed again on that frame ([`Session::type_fenced`], [`Session::input_unread`]). Negative
+/// control: once the screen moves, the next decision acts, an Enter fenced on that read.
 #[test]
 fn an_echo_that_hung_on_a_frame_drawn_after_the_write_is_never_typed_again_on_it() {
     let empty = weekly_limited();
@@ -3128,17 +3111,11 @@ fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
 
 const HAND_HOLDER: &str = "aterm-harness@1";
 
-/// THE PROBE'S `/usage` IS JUDGED BY WHAT THE SCREEN SHOWS, its echo waited
-/// on as an act's is ([`Session::probe_type`], [`Session::await_echo`]): the
-/// worker draws nothing for 15 s after the probe's write, past the write's
-/// reaction wait, and the screen as the write found it says nothing of the
-/// echo; once `/usage` shows whole, its Enter goes, fenced on that read, and
-/// nothing is left typed. Drawn nothing for two minutes, the echo's hang
-/// detector runs out and `/usage` is left typed; the next act on that
-/// unmoved screen is held, and the probe's gate shuts on it
-/// (`pending-input`), so nothing is typed again over it. NEGATIVE CONTROL:
-/// the screen moved to another text after the write: left typed at once,
-/// nothing held.
+/// The probe's `/usage` echo is waited on as an act's is ([`Session::probe_type`],
+/// [`Session::await_echo`]): drawn late, its Enter goes, fenced on the read that shows it whole;
+/// never drawn, it is left typed, the next act on that unmoved screen is held, and the probe's
+/// gate shuts (`pending-input`). Negative control: on a screen that moved to another text it is
+/// left typed at once, nothing held.
 #[test]
 fn the_probes_usage_is_judged_by_what_the_screen_shows() {
     use crate::supervise::policy::turn_end::ProbeGate;
@@ -3217,7 +3194,7 @@ fn the_probes_usage_is_judged_by_what_the_screen_shows() {
     );
     assert!(held, "the next act on that screen is held: {evidence}");
 
-    // NEGATIVE CONTROL: the screen moved to another text.
+    // Negative control: the screen moved to another text.
     let (typed, gate, held, _, enters, evidence) = act("other", None, "something else");
     assert!(
         typed.as_ref().is_some_and(
@@ -7174,8 +7151,8 @@ fn woken(end: &[&str]) -> Vec<String> {
 
 /// A host that hands the loop the agent's transcript `tail` and the launch of
 /// the process that writes it (`launched`, unix seconds; `None`: none), wants
-/// ONE point — the first offered, at a break of background work or idle,
-/// where it types nothing — and counts the background breaks offered.
+/// one point (the first offered, at a break of background work or idle,
+/// where it types nothing) and counts the background breaks offered.
 #[derive(Debug, Default)]
 struct CarriedHost {
     tail: Option<String>,
@@ -7567,10 +7544,9 @@ fn a_carried_wait_its_transcript_says_is_over_is_continued() {
     }
 }
 
-/// A host for BG-1's points read again: the agent's transcript `tail` (which
-/// a test may change between reads) and its process's launch; when it
-/// `wants` a point it wants ONE, counting the idle and the background breaks
-/// offered apart, and types nothing at either.
+/// A host for points read again: the agent's transcript `tail` (which a test may change between
+/// reads) and its process's launch; when it `wants` a point it wants one, counting the idle and
+/// the background breaks offered apart, and types nothing at either.
 #[derive(Debug, Default)]
 struct PointHost {
     tail: std::sync::Mutex<Option<String>>,
@@ -11610,7 +11586,7 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A host whose transcript LAGS the screen at a decision's first read
+/// A host whose transcript lags the screen at a decision's first read
 /// ([`IdleHost::transcript_tail`]: `fresh`) and has caught up when read
 /// again for that lag ([`IdleHost::transcript_tail_again`]: `again`).
 #[derive(Debug)]
@@ -13791,7 +13767,7 @@ fn a_login_left_at_a_weekly_limit_asks_the_rosters_word() {
     };
     for word in [
         next,
-        // NEGATIVE CONTROL.
+        // The negative control.
         RosterWord::Unlisted,
     ] {
         let host = Arc::new(AccountHost {
@@ -13924,7 +13900,7 @@ fn a_relaunch_switched_on_reaches_a_tab_waiting_at_its_weekly_limit() {
     let session_limit = "You've hit your session limit · resets 7:30pm (America/Los_Angeles)";
     for (message, edge) in [
         (weekly, true),
-        // NEGATIVE CONTROL: a session limit reads no roster word.
+        // Negative control: a session limit reads no roster word.
         (session_limit, false),
     ] {
         let (host, rows) = wait_at(message);
@@ -26633,10 +26609,10 @@ fn a_turn_the_points_key_cannot_tell_is_judged_by_its_submission() {
     }
 }
 
-/// A host that saw the agent LAUNCHED at `launch` (unix ms; `None`: it saw
-/// no launch, as for a supervisor attaching to an agent it did not start, or
-/// one a person keyed into since) and started this loop as the session's Off
-/// lifted where `lifted`; it wants no point and types nothing.
+/// A host that saw the agent launched at `launch` (unix ms; `None`: it saw no launch, as for a
+/// supervisor attaching to an agent it did not start, or one a person keyed into since) and
+/// started this loop as the session's Off lifted where `lifted`; it wants no point and types
+/// nothing.
 #[derive(Debug, Default)]
 struct LaunchHost {
     launch: Option<i64>,
@@ -27526,10 +27502,9 @@ fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_li
     );
 }
 
-/// A host whose step at an idle point, asked once `wanting`, MOVED the session
-/// where `moved` (the live upgrade's relaunch under Land: the agent ended and
-/// its line typed at the shell, no carry-on) or moved nothing, typing no turn
-/// either way.
+/// A host whose step at an idle point, asked once `wanting`, moved the session where `moved`
+/// (the live upgrade's relaunch under Land: the agent ended and its line typed at the shell, no
+/// carry-on) or moved nothing, typing no turn either way.
 #[derive(Debug)]
 struct RelaunchHost {
     moved: bool,

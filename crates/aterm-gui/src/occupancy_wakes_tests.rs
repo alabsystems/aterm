@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GUI book's tests (the occupancy slice-2 plan's 2.5): every proof, refusal, park, answer,
-//! level, K raise and carry on a scripted rig (virtual time, a fake process tree, a scripted
-//! machine snapshot), each guard with its negative control; one pid level on a real stand-in.
+//! Tests of the GUI's wake book on a scripted rig (virtual time, a fake process tree, a
+//! scripted machine snapshot), each guard with its negative control; one pid atom reads a real
+//! stand-in.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -94,7 +94,7 @@ fn link(pid: u32, birth_s: i64, ppid: u32) -> ProcLink {
     }
 }
 
-/// THE RIG: a scripted clock, mode, tree, machine snapshot, pace and loop words.
+/// The rig: a scripted clock, mode, tree, machine snapshot, pace and loop words.
 struct Rig {
     now: AtomicI64,
     mode: Mutex<Occupancy>,
@@ -268,10 +268,9 @@ fn denied_words(refusal: DeclarerRefusal) -> String {
     format!("ERR denied wake: {}\n", refusal.words())
 }
 
-/// EACH REFUSAL (S1): a peer of another session's tree, no kernel peer (a relay), a peer of the
-/// tab's but not of its agent's, and the owner's `off`, which refuses every verb and books
-/// nothing; a `pid:` atom outside the tree is refused too. NEGATIVE CONTROL: a descendant of the
-/// agent (its job's child) is admitted, its wake declared for the agent itself.
+/// A peer of another session's tree, no kernel peer, a peer of the tab's but not its agent's, a
+/// `pid:` atom outside the tree and the owner's `off` are each refused, booking nothing.
+/// NEGATIVE CONTROL: a descendant of the agent is admitted, its wake declared for the agent.
 #[test]
 fn each_refusal_of_a_peer_outside_the_tree_and_a_descendant_admitted() {
     let rig = Rig::new(Occupancy::Observe);
@@ -322,9 +321,9 @@ fn each_refusal_of_a_peer_outside_the_tree_and_a_descendant_admitted() {
     );
 }
 
-/// `await wake`, `wake taken` and `wake rm` FROM OUTSIDE THE TREE (a manager-shaped peer of
-/// another tab's) are refused, and the ready wake stays ready. NEGATIVE CONTROL
-/// `AwaitFromAnyone`: the same peer's await consumes it, and its `rm` removes it.
+/// `await wake`, `wake taken` and `wake rm` from outside the tree are refused and the ready
+/// wake stays ready. NEGATIVE CONTROL `AwaitFromAnyone`: the same peer's await consumes it
+/// and its `rm` removes it.
 #[test]
 fn an_outside_await_take_or_rm_is_refused_and_the_wake_stays_ready() {
     let rig = Rig::new(Occupancy::Observe);
@@ -366,8 +365,8 @@ fn an_outside_await_take_or_rm_is_refused_and_the_wake_stays_ready() {
     assert_eq!(removed, "OK wake #1 rm\n");
 }
 
-/// ONE PARK A SESSION: a second gives `ERR busy`; a park from outside the tree is refused and
-/// never takes the session's slot; with nothing open, the D4 usage answer.
+/// One park a session: a second is `ERR busy`, an outside park is refused without taking the
+/// slot, and with nothing open the answer is the usage line.
 #[test]
 fn a_second_park_is_busy_and_an_outside_park_never_takes_the_slot() {
     let rig = Rig::new(Occupancy::Observe);
@@ -404,9 +403,8 @@ fn answered_once(host: &WakeHost, rig: &Rig, a: &Seat, conn: u64) -> Option<u16>
     }
 }
 
-/// A REPLY THAT IS NOT DELIVERED LEAVES THE WAKE READY (S2): an answer written fails, or its
-/// reply's latch is released unwritten (the peer closed), and the wake is ready for the next
-/// wait; one delivered is told. NEGATIVE CONTROL `ToldBeforeWrite`: told on a failed write.
+/// An answer whose write fails, or whose reply latch is released unwritten, leaves the wake
+/// ready; one delivered is told. NEGATIVE CONTROL `ToldBeforeWrite`: told on a failed write.
 #[test]
 fn a_reply_socket_closed_before_the_answer_leaves_the_wake_ready() {
     let rig = Arc::new(Rig::new(Occupancy::Observe));
@@ -467,8 +465,8 @@ fn a_reply_socket_closed_before_the_answer_leaves_the_wake_ready() {
     );
 }
 
-/// `in:` ALONE IS AWAIT-ONLY (S13): declared so, unanswered before its time, answered by the
-/// await at it; a wake with a source atom beside it is not.
+/// A wake on `in:` alone is await-only and answered by the await at its time; one with a
+/// source atom beside it is not.
 #[test]
 fn a_time_alone_wake_is_await_only_and_answered_by_await() {
     let rig = Rig::new(Occupancy::Observe);
@@ -501,9 +499,8 @@ fn a_time_alone_wake_is_await_only_and_answered_by_await() {
     );
 }
 
-/// `need=slots>=1` UNDER OBSERVE (S9): answered once the scripted snapshot shows a free slot,
-/// with the slots it saw. NEGATIVE CONTROL `PaceOnAwait`: asked of the typed lines' pace, which
-/// grants nothing under observe, it never answers.
+/// `need=slots>=1` under observe is answered, with the slots it saw, once a slot frees.
+/// NEGATIVE CONTROL `PaceOnAwait`: asked of the typed lines' pace, it never answers.
 #[test]
 fn a_slots_need_under_observe_is_answered_when_a_slot_frees() {
     let run = || {
@@ -538,8 +535,8 @@ fn a_slots_need_under_observe_is_answered_when_a_slot_frees() {
     );
 }
 
-/// Three sessions' wakes, each needing a slot, parked on one free slot: the passes in the order
-/// given, and the sessions answered.
+/// Three sessions' wakes, each needing a slot, passed in `order` with no, one and then two
+/// slots free: the sessions answered at each.
 fn three_on_one(order: [(&str, u64); 3]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let rig = Rig::new(Occupancy::Observe);
     let host = WakeHost::default();
@@ -585,11 +582,9 @@ fn three_on_one(order: [(&str, u64); 3]) -> (Vec<String>, Vec<String>, Vec<Strin
     (none, one, two)
 }
 
-/// THREE SESSIONS, ONE SLOT, THREE PARKED AWAITS (S9): while no slot is usable each waits in the
-/// slots' line by its age; the one slot that frees is one answer, the oldest hold's, however the
-/// passes fall (the youngest asks first here); the rest wait by age, so the next slot is the next
-/// oldest's. NEGATIVE CONTROLS: `YoungestFirst` hands the slot to whoever asks first, and a
-/// reserve bypass answers all three on the one slot.
+/// Three parked awaits on one free slot get one answer, the oldest hold's, however the passes
+/// fall; the rest wait by age. NEGATIVE CONTROLS: `YoungestFirst` hands the slot to whoever
+/// asks first, and `AwaitSkipsReserve` answers all three.
 #[test]
 fn three_sessions_on_one_slot_get_one_answer_and_the_rest_wait_by_age() {
     let youngest_first = [(C, 3), (B, 2), (A, 1)];
@@ -611,7 +606,8 @@ fn three_sessions_on_one_slot_get_one_answer_and_the_rest_wait_by_age() {
     );
 }
 
-/// The outs of each step: the declaration, the job's exit (a tick), then ten looks a minute apart.
+/// The outs of each step: the declaration, the job's exit (a tick), `K_LOOKS` looks a minute
+/// apart, and a look after `taken`.
 fn k_run(rig: &Rig) -> Vec<Vec<Out>> {
     let host = WakeHost::default();
     let a = seat_a();
@@ -638,10 +634,9 @@ fn k_run(rig: &Rig) -> Vec<Vec<Out>> {
     steps
 }
 
-/// THE WAKE K (F1): a ready wake no door told raises the tab's K Entry at the tenth look under
-/// `prompt`, its event owed at its coming ready, and the Entry ends once the wake is taken.
-/// NEGATIVE CONTROLS: under `observe` nothing is owed; a clock fed only from a break path (no
-/// loop of this build runs one) never raises.
+/// Under `prompt`, a ready wake no door told raises the tab's K Entry at the tenth look, its
+/// event owed at its coming ready, and the Entry ends once it is taken. NEGATIVE CONTROLS:
+/// `observe` owes nothing; a K clock fed only from the break path never raises.
 #[test]
 fn a_ready_wake_untold_for_k_looks_raises_under_prompt_alone() {
     let prompt = k_run(&Rig::new(Occupancy::Prompt));
@@ -694,10 +689,9 @@ fn a_ready_wake_untold_for_k_looks_raises_under_prompt_alone() {
     );
 }
 
-/// THE HANDOFF: a book rides its session record (a TOML round trip), and the successor's restore
-/// reads it back, re-admits it under the current rules and reads its levels at once, so a job
-/// that exited in the gap is ready before any tick, and ordinals go on. NEGATIVE CONTROL
-/// `NoRearm`: a restore that arms no pid misses the exit.
+/// A book rides its session record through TOML, and the successor's restore re-admits it and
+/// reads its levels at once: a job that exited in the gap is ready before any tick, and
+/// ordinals go on. NEGATIVE CONTROL `NoRearm`: a restore that arms no pid misses the exit.
 #[test]
 fn a_book_rides_the_session_record_and_its_restore_reads_levels_at_once() {
     let rig = Rig::new(Occupancy::Observe);
@@ -752,10 +746,9 @@ fn a_book_rides_the_session_record_and_its_restore_reads_levels_at_once() {
     );
 }
 
-/// RE-ADMISSION ON RESTORE: a carried wake the current rules refuse (a file atom, which this build
-/// does not serve) ends `Expired why=admit`; a wake this build cannot read is dropped and the rest
-/// stand; a row that is no book restores nothing; and a record whose `wakes` is no row still
-/// reads, as the empty row (the record's lenient idiom), which restores nothing.
+/// A restore re-admits under the current rules: a carried file atom ends `Expired why=admit`,
+/// an unreadable wake is dropped, a row that is no book restores nothing, and a record whose
+/// `wakes` is no row reads as the empty row.
 #[test]
 fn a_restore_re_admits_under_the_current_rules_and_reads_leniently() {
     let rig = Rig::new(Occupancy::Observe);
@@ -867,8 +860,7 @@ fn a_pid_atom_reads_a_real_stand_ins_exit() {
     assert_eq!(state(&host, A, 1), Some(WakeState::Ready));
 }
 
-/// A REUSED PID READS EXITED BY BIRTH: the pid alive again, born after the declaration, is not
-/// the process the atom named.
+/// A pid alive again but born after the declaration reads exited.
 #[test]
 fn a_reused_pid_reads_exited_by_its_birth() {
     let rig = Rig::new(Occupancy::Observe);
@@ -992,8 +984,8 @@ fn an_unread_process_neither_readies_its_exit_nor_expires_its_agents_wakes() {
     );
 }
 
-/// The outs and the await's reply of one T-obs2 run under `mode`: a time wake awaited, and a job's
-/// wake no one awaits, for K looks.
+/// The await's reply and the outs under `mode` of a time wake awaited and a job's wake no one
+/// awaits, over K looks.
 fn t_obs2(mode: Occupancy) -> (Pass, Vec<Out>) {
     let rig = Rig::new(mode);
     let host = WakeHost::default();
@@ -1014,9 +1006,8 @@ fn t_obs2(mode: Occupancy) -> (Pass, Vec<Out>) {
     (answered, outs)
 }
 
-/// T-obs2-gui: under `observe` the await is answered and nothing else is owed (no Entry, no event;
-/// nothing here writes a task record's `fact=`). Under `prompt`: the events at each coming ready
-/// and the Entry at K, for the wake no one awaited.
+/// Under `observe` the await is answered and nothing else is owed (no Entry, no event); under
+/// `prompt`, an event at each coming ready and the Entry at K for the wake no one awaited.
 #[test]
 fn t_obs2_gui_observe_answers_the_await_and_owes_nothing_else() {
     let answer = Pass::Reply {
@@ -1044,8 +1035,8 @@ fn t_obs2_gui_observe_answers_the_await_and_owes_nothing_else() {
     );
 }
 
-/// THE AGENT GONE: its wakes end `Expired why=agent`, a parked wait hears it, and `waits why`
-/// says so.
+/// When the agent is gone its wakes end `Expired why=agent`, a parked wait hears it, and
+/// `waits why` says so.
 #[test]
 fn an_agent_gone_expires_its_wakes_and_waits_why_says_so() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1074,8 +1065,8 @@ fn an_agent_gone_expires_its_wakes_and_waits_why_says_so() {
     );
 }
 
-/// `waits` LISTS THE BOOK, and a peer outside the tree sees ordinals, states, priorities, kinds
-/// and times alone (S12): no label and no need.
+/// `waits` lists the book; a peer outside the tree sees only ordinals, states, priorities,
+/// kinds and times, no label and no need.
 #[test]
 fn waits_lists_the_book_redacted_outside_the_tree() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1118,7 +1109,7 @@ fn waits_lists_the_book_redacted_outside_the_tree() {
     assert_eq!(host.counts(A), (1, 0));
 }
 
-/// THE OWNER'S `off` ENDS EVERY BOOK (`Expired why=off`), and a parked wait hears it; `wake rm`
+/// The owner's `off` ends every book (`Expired why=off`) and a parked wait hears it; `wake rm`
 /// of the last open wake ends a park as `why=rm`.
 #[test]
 fn off_disarms_every_book_and_a_parked_wait_hears_its_end() {
@@ -1158,8 +1149,7 @@ fn off_disarms_every_book_and_a_parked_wait_hears_its_end() {
     assert_eq!(host.wake(&rig, &a, Some(400), "rm 2"), RM_USAGE);
 }
 
-/// FILE ATOMS ARE NOT SERVED YET (2.6 serves them): refused before any path is touched, in
-/// `when=` and in `unless=`.
+/// File atoms are refused before any path is touched, in `when=` and in `unless=`.
 #[test]
 fn a_file_atom_is_refused_until_it_is_served() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1175,8 +1165,8 @@ fn a_file_atom_is_refused_until_it_is_served() {
     assert_eq!(host.counts(A), (0, 0));
 }
 
-/// THE PARKED WAIT'S LOOP: an answer ready at once returns at once; a hang-up and a time run out
-/// end the park unanswered.
+/// The parked wait's loop: an answer ready at once returns at once; a hang-up and a time run
+/// out end the park unanswered.
 #[test]
 fn the_parked_wait_returns_its_answer_or_its_end_and_unparks() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1267,10 +1257,9 @@ fn booked(decls: &[&str]) -> Vec<DeclaredWake> {
     book.wakes
 }
 
-/// A BOOK CARRIED INTO THE OWNER'S `off` ARRIVES DISARMED (the 2.5 safety review's F1): restored
-/// under `off`, its wakes end `Expired why=off` at once, a tick past their time reads nothing,
-/// and once the mode leaves `off` no wait is answered by them. NEGATIVE CONTROL: the same restore
-/// under `observe` stays open, comes ready at its time, and is answered.
+/// A book restored under the owner's `off` arrives disarmed: its wakes end `Expired why=off` at
+/// once and no later wait is answered by them. NEGATIVE CONTROL: restored under `observe`, it
+/// comes ready at its time and is answered.
 #[test]
 fn a_book_restored_under_off_is_disarmed_and_never_answered() {
     let run = |mode: Occupancy| {
@@ -1327,12 +1316,9 @@ fn a_book_restored_under_off_is_disarmed_and_never_answered() {
     );
 }
 
-/// A VERB THAT READ THE MODE BEFORE A SWITCH TO `off` BOOKS AND ANSWERS NOTHING PAST IT (the 2.5
-/// safety review's F2): the switch set the mode and disarmed every book between the verb's first
-/// read and its lock, and the verb asks again under the lock, so a declaration and a park are
-/// refused `off`; a pass and a tick that meet the mode set but the book not yet disarmed disarm
-/// it themselves (the parked wait hears `EXPIRED why=off`; the exited job is not read ready).
-/// NEGATIVE CONTROL: the same stale read with the mode still `observe` books.
+/// A verb that read the mode before a switch to `off` asks again under the lock, so its
+/// declaration, park or `rm` is refused; a pass or tick that meets the mode set but the book not
+/// yet disarmed disarms it itself. NEGATIVE CONTROL: the same stale read with no switch books.
 #[test]
 fn a_verb_that_read_the_mode_before_a_switch_to_off_books_and_answers_nothing() {
     let a = seat_a();
@@ -1395,11 +1381,9 @@ fn a_verb_that_read_the_mode_before_a_switch_to_off_books_and_answers_nothing() 
     );
 }
 
-/// A PUBLISHED AGENT WHOSE PID ANOTHER PROCESS HOLDS IS NO AGENT: the harness's snapshot names pid
-/// 500 started at 99 s, and the process at 500 was born at 50 s, so the proof does not narrow to
-/// it, and a new agent of the tab's own tree (the shell's other child) is admitted for itself.
-/// NEGATIVE CONTROL: with the snapshot's start the process's birth, the proof narrows to it, and
-/// the same peer is refused.
+/// A published agent pid another process holds (snapshot start 99 s, the process born at 50 s)
+/// narrows nothing, so another process of the tab's tree is admitted for itself. NEGATIVE
+/// CONTROL: with the snapshot's start the process's birth, the proof narrows and refuses it.
 #[test]
 fn a_published_agent_pid_another_process_holds_narrows_nothing() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1423,8 +1407,8 @@ fn a_published_agent_pid_another_process_holds_narrows_nothing() {
     );
 }
 
-/// AN AGENT WHOSE PID WAS REUSED IS GONE: its wakes end `Expired why=agent` though a process
-/// holds its pid again. NEGATIVE CONTROL: the agent itself alive keeps them pending.
+/// An agent whose pid was reused is gone: its wakes end `Expired why=agent`. NEGATIVE CONTROL:
+/// the agent itself alive keeps them pending.
 #[test]
 fn an_agent_whose_pid_was_reused_is_gone() {
     let rig = Rig::new(Occupancy::Observe);
@@ -1447,11 +1431,10 @@ fn an_agent_whose_pid_was_reused_is_gone() {
     );
 }
 
-/// RE-ADMISSION HOLDS THE CURRENT BOUNDS: a carried book of more live wakes than
-/// [`MAX_WAKES`](aterm_agent::supervise::occupancy::wakes::MAX_WAKES) keeps the first of them and
-/// ends the rest `Expired why=admit`, and a wake whose `by=` reaches past
-/// [`BY_MAX_MS`](aterm_agent::supervise::occupancy::wakes::BY_MAX_MS) ends so too. NEGATIVE
-/// CONTROL: a `by=` at the bound itself stands.
+/// A restore holds the current bounds: wakes past
+/// [`MAX_WAKES`](aterm_agent::supervise::occupancy::wakes::MAX_WAKES) and a `by=` past
+/// [`BY_MAX_MS`](aterm_agent::supervise::occupancy::wakes::BY_MAX_MS) end `Expired why=admit`.
+/// NEGATIVE CONTROL: a `by=` at the bound itself stands.
 #[test]
 fn a_restore_holds_the_live_cap_and_the_by_bound() {
     use aterm_agent::supervise::occupancy::wakes::{BY_MAX_MS, MAX_WAKES};
@@ -1504,10 +1487,9 @@ fn a_restore_holds_the_live_cap_and_the_by_bound() {
     );
 }
 
-/// THE WINDOW'S DELIVERY RE-CHECKS THE OWNER'S `prompt` (W5): a wake's coming ready is recorded
-/// as its tab's `wake-ready` row only while `prompt` is in force, and a K Entry's move reaches the
-/// host as its note. NEGATIVE CONTROL: the same out delivered after a switch to `observe` records
-/// no row.
+/// Delivery records a wake's coming ready as its tab's `wake-ready` row only under `prompt`,
+/// and passes a K Entry's move to the host as its note. NEGATIVE CONTROL: the same out
+/// delivered under `observe` records no row.
 #[test]
 fn delivery_records_a_ready_row_under_prompt_alone() {
     let store = crate::session_store::new_store();
@@ -1565,9 +1547,8 @@ fn delivery_records_a_ready_row_under_prompt_alone() {
     crate::occupancy_host::set_mode(Occupancy::Observe);
 }
 
-/// A PARK'S MANIFEST CARRIES EACH SESSION'S BOOK: `SessionHandoff::from_store` writes the book the
-/// host holds for a session as its record's `wakes`. NEGATIVE CONTROL: a session with no book
-/// carries none.
+/// `SessionHandoff::from_store` carries the book the host holds for each session as its
+/// record's `wakes`. NEGATIVE CONTROL: a session with no book carries none.
 #[test]
 fn the_handoff_manifest_carries_each_sessions_book() {
     let store = crate::session_store::new_store();

@@ -246,12 +246,24 @@ impl History {
 
     /// Records the reading taken at `at_ns` in its corresponding second bucket.
     pub fn push_at(&mut self, v: Option<f32>, at_ns: u64) {
+        self.fold_at(v, at_ns, false);
+    }
+
+    /// Records a level read at `at_ns` as [`Self::push_at`] does, except that its second keeps
+    /// the largest reading taken in it rather than their mean: for a level such as memory
+    /// pressure, where the worst reading is the one to keep. A history takes one kind of push.
+    pub fn push_worst_at(&mut self, v: Option<f32>, at_ns: u64) {
+        self.fold_at(v, at_ns, true);
+    }
+
+    fn fold_at(&mut self, v: Option<f32>, at_ns: u64, worst: bool) {
         let v = v.filter(|x| x.is_finite());
         let second = at_ns / 1_000_000_000;
         match self.last {
             Some((last, n)) if second <= last => {
                 if let (Some(back), Some(new)) = (self.values.back_mut(), v) {
                     *back = Some(match *back {
+                        Some(old) if n > 0 && worst => old.max(new),
                         Some(old) if n > 0 => (old * n as f32 + new) / (n + 1) as f32,
                         _ => new,
                     });
@@ -455,6 +467,37 @@ mod tests {
         );
         assert_eq!(v.last(), Some(&Some(0.7)));
         assert!(v[..59].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_worst_history_keeps_each_seconds_largest_reading_on_the_mean_historys_seconds() {
+        let mut mean = History::with_capacity(60);
+        let mut worst = History::with_capacity(60);
+        let readings = [
+            (Some(1.0), 10 * S),
+            (Some(2.0), 10 * S + S / 2),
+            (Some(0.0), 10 * S + 3 * S / 4),
+            (None, 11 * S),
+            (None, 11 * S + S / 2),
+            (Some(1.0), 14 * S),
+            (Some(0.0), 30 * S),
+        ];
+        for (v, at) in readings {
+            mean.push_at(v, at);
+            worst.push_worst_at(v, at);
+        }
+        let w = worst.to_vec();
+        assert_eq!(w.len(), mean.len(), "the same seconds as the mean's");
+        assert_eq!(w[0], Some(2.0), "the second's worst, not its mean");
+        assert_eq!(mean.to_vec()[0], Some(1.0));
+        assert_eq!(w[1], None, "a second with no reading is hollow");
+        assert_eq!(
+            &w[2..5],
+            &[Some(1.0); 3],
+            "a short silence fills as the mean's"
+        );
+        assert!(w[5..20].iter().all(Option::is_none), "a long one is hollow");
+        assert_eq!(w[20], Some(0.0));
     }
 
     #[test]

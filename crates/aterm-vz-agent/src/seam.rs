@@ -78,14 +78,26 @@ impl System for Seam {
 }
 
 /// Serve commands on the unix socket `listen` (bound before the dial, as the guest binds
-/// its vsock port) and speak the watch connection to the unix socket `watch`.
+/// its vsock port) and speak the watch connection to the unix socket `watch`, its `Hello`
+/// carrying the key the key disk file `key_disk` holds (as the guest reads its device).
 #[must_use]
-pub fn run(listen: &Path, watch: &Path, tick: Duration) -> ExitCode {
+pub fn run(listen: &Path, watch: &Path, key_disk: &Path, tick: Duration) -> ExitCode {
     let say = |what: String| eprintln!("aterm-vz-agent (seam): {what}");
     let listener = match UnixListener::bind(listen) {
         Ok(l) => l,
         Err(e) => {
             say(format!("could not listen on {}: {e}", listen.display()));
+            return ExitCode::FAILURE;
+        }
+    };
+    let boot_key = match crate::key::read_disk(key_disk) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            say(format!("{} is no key disk", key_disk.display()));
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            say(format!("{}: {e}", key_disk.display()));
             return ExitCode::FAILURE;
         }
     };
@@ -104,7 +116,7 @@ pub fn run(listen: &Path, watch: &Path, tick: Duration) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hello = match crate::hello(system.as_ref(), &exe) {
+    let hello = match crate::hello(system.as_ref(), &exe, boot_key) {
         Ok(h) => h,
         Err(e) => {
             say(format!("could not hash {}: {e}", exe.display()));

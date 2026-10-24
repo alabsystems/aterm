@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Workspace tool provisioning (`targo --unverified verify provision`,
-//! [`aterm_uds::host::Provider::Workspace`], [`ROWS`], [`place`]).
+//! Workspace tool provisioning: `targo --unverified verify provision` fetches or builds each
+//! of [`ROWS`] ([`aterm_uds::host::Provider::Workspace`]).
 
 mod bash;
 mod fish;
@@ -54,8 +54,8 @@ pub struct Stamp {
     pub platform: Option<String>,
     /// When it was placed (Unix seconds).
     pub placed: u64,
-    /// Set by the retired adoption: a stamp with it is never admitted, so a run replaces
-    /// that copy.
+    /// Marks a copy provision adopted rather than placed. Nothing sets it now, and a stamp
+    /// with it is never admitted, so a run replaces that copy.
     #[serde(default)]
     pub adopted: bool,
 }
@@ -321,7 +321,8 @@ fn short(t: &Target) -> Option<&str> {
         .map(|(name, _)| name.as_str())
 }
 
-/// Returns `engine`'s executable on `machine` when present with a matching pin stamp ([`complete`]).
+/// Returns `engine`'s executable on `machine` when present with a matching pin stamp
+/// ([`complete`]).
 pub(crate) fn placed_browser(engine: Engine, machine: &Machine) -> Option<PathBuf> {
     let t = target(row(engine_name(engine))?, machine)?;
     complete(&t).then(|| t.dir.join(&t.exe))
@@ -621,7 +622,7 @@ fn rustup_row(
 }
 
 /// An unpacked row: fetch, check, unpack under its cap, hold the tree to its anchor and its
-/// pinned file to what [`Holds`] says it is, keep its `keep` files, stamp, place.
+/// pinned file to what [`Holds`] says it is, require its `keep` files, stamp, place.
 fn unpack_row(
     row: &Row,
     archive: &Archive,
@@ -711,9 +712,9 @@ fn unpack_row(
     Ok(t.dir.join(&t.exe))
 }
 
-/// The stamp's `sha256` of a files row at `version`: the sha256 of its `SHA256SUMS`, one
-/// `<sha256> *<name>` line a file in row order, so a changed pin of any file is another
-/// row's stamp.
+/// The stamp's `sha256` of a files row at `version`: the sha256 of a `SHA256SUMS` text (one
+/// `<sha256> *<name>` line per file, in row order), so a changed pin of any file changes
+/// the stamp.
 fn files_digest(files: &[Archive], version: &str) -> String {
     let mut sums = aterm_digest::Sha256::new();
     for file in files {
@@ -1087,7 +1088,8 @@ fn translated() -> bool {
     }
 }
 
-/// This machine's [`Machine`] for the checkout at `repo`; `None` where no `$HOME` names the caches.
+/// This machine's [`Machine`] for the checkout at `repo`; `None` where no `$HOME` names the
+/// caches.
 #[must_use]
 pub fn this_machine(repo: &Path) -> Option<Machine> {
     let home = std::env::var_os("HOME")

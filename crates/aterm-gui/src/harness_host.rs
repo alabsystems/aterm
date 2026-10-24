@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! In-GUI supervisor host (`aterm-harness-host`) that discovers agent sessions from the session store and manages per-session supervisor workers, relaunches, and live upgrades.
+//! In-GUI supervisor host (`aterm-harness-host`): discovers agent sessions from the session store
+//! and runs their supervisor workers, relaunches and live upgrades.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
@@ -88,16 +89,16 @@ pub(crate) fn usage_credits() -> bool {
 }
 
 /// [`USAGE_TAP`]: `[harness] usage_tap` is on and the harness supervises Claude Code
-/// ([`SupervisorConfig::usage_tap_on`]), so the relaunch lines aterm types now are offered the usage tap where an aterm can be named
-/// ([`usage_tap_armed`]). The Claude Code footer's word for a weekly figure it has not got
-/// (`claude_footer`, `profile::WeeklyGap`).
+/// ([`SupervisorConfig::usage_tap_on`]). It decides whether the relaunch lines aterm types are
+/// offered the usage tap ([`usage_tap_armed`]) and what the Claude Code footer says of a weekly
+/// figure it has not got (`claude_footer`, `profile::WeeklyGap`).
 pub(crate) fn usage_tap_on() -> bool {
     USAGE_TAP.load(Ordering::SeqCst)
 }
 
 /// The usage tap armed for the relaunch lines the background lane ([`live_acts`]) types under
-/// harness state `state` ([`tap::Armed::arm`], the block `aterm harness upgrade` arms by too):
-/// [`USAGE_TAP`], [`tap::stable_exe`] and the roster beside the active `aterm.toml`, now.
+/// harness state `state`, from [`USAGE_TAP`], [`tap::stable_exe`] and the roster beside the
+/// active `aterm.toml` ([`tap::Armed::arm`], which `aterm harness upgrade` arms by too).
 pub(crate) fn usage_tap_armed(state: &Path) -> Option<tap::Armed> {
     tap::Armed::arm(
         usage_tap_on(),
@@ -1406,7 +1407,8 @@ fn reset_read(line: Option<&str>, end: &ResetEnd, at: i64) -> Option<(ResetRead,
     )
 }
 
-/// The offer a limit reset's end puts on record (`accounts::note_offer`: the kind, its count, and the deadline where one was read; 2.1.304 counts each kind apart).
+/// The offer a limit reset's end puts on record (`accounts::note_offer`): the kind, its count, and
+/// the deadline where one was read. Claude Code 2.1.304 counts each kind apart.
 fn reset_offer(read: &ResetRead, end: &ResetEnd) -> Option<ResetOffer> {
     match *read {
         ResetRead::Used {
@@ -1721,7 +1723,7 @@ type ExitedFn = dyn Fn(&Snapshot, Duration) -> bool + Send + Sync;
 type AskedFn = dyn Fn(&str, &Snapshot) -> Option<restart_stamp::Cause> + Send + Sync;
 /// Tab `sid`'s copy of its proven self-claim's record ([`Acts::self_copy`]).
 type SelfCopyFn = dyn Fn(&str) -> Option<self_claimed::Copy> + Send + Sync;
-/// Whether tab `sid`'s proven self-claimed agent, the process `pid` started at `start`.
+/// Whether tab `sid`'s proven self-claimed agent, the process `pid` started at `start`, is idle.
 type SelfIdleFn = dyn Fn(&str, u32, &str) -> bool + Send + Sync;
 /// The crash rule's relaunch ([`Acts::self_relaunch`]).
 type SelfRelaunchFn = dyn Fn(&str, u32, &Snapshot, &self_claimed::Resume, Option<restart_stamp::Cause>) -> String
@@ -1780,7 +1782,7 @@ type TaskedFn = dyn Fn(&str, &Snapshot, &mut upgrade_drive::Tasked) -> Option<bo
 /// Whether the conversation a tab's agent holds says its task is finished ([`upgrade_drive::Finished::of_snapshot`], the tab's supervisor's own turns none).
 type FinishedFn =
     dyn Fn(&str, &Snapshot, &mut upgrade_drive::Finished) -> Option<bool> + Send + Sync;
-/// The reset the standing usage limit of the conversation a snapshot names names.
+/// The reset named by the standing usage limit of the conversation a snapshot names.
 type LimitResetFn = dyn Fn(&Snapshot) -> Option<u64> + Send + Sync;
 /// The tail of the transcript the Claude Code a snapshot names writes now ([`upgrade_drive::snapshot_transcript_tail`]; [`Acts::transcript_tail`]).
 type TranscriptTailFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
@@ -1881,7 +1883,7 @@ pub(crate) enum HostNote {
     DiskLowCleanupOff { free_gib: u64, floor_gib: u64 },
     /// The volume is at or above the floor.
     DiskPlenty,
-    /// Aterm.toml does not say what the owner meant by a `[disk]` removal knob.
+    /// `aterm.toml` does not say what the owner meant by a `[disk]` removal knob.
     DiskSettingsOff { notes: Vec<String> },
     /// A pass of the disk watch freed `bytes` (`went`: the largest of what went, each a line, biggest first).
     DiskFreed { bytes: u64, went: Vec<String> },
@@ -1895,7 +1897,7 @@ pub(crate) enum HostNote {
     },
     /// The volume is back above the emergency line: the alert ends.
     DiskFullOver,
-    /// Macos's program check is stuck ([`crate::program_check_watch`]).
+    /// macOS's program check is stuck ([`crate::program_check_watch`]).
     ProgramCheckStuck { workers: u64, limit: Option<u64> },
     /// The program check is not stuck.
     ProgramCheckUnstuck,
@@ -1937,9 +1939,11 @@ pub(crate) enum HostNote {
         agent: Program,
         standing: Option<aterm_agent::supervise::policy::exception::Exception>,
     },
-    /// The tab's lost login is back ([`IdleHost::login_back`], told once a loss), or the tab moved onto another login that works (an account move that landed, [`WorkerIdle::restart`]).
+    /// The tab's lost login is back ([`IdleHost::login_back`], told once a loss), or the tab moved
+    /// onto another login that works (an account move that landed, [`WorkerIdle::restart`]).
     LoginBack { sid: String },
-    /// The tab's usage or model limit ended with no sign-in that took ([`IdleHost::limit_over`]: the reset continued it, a `/clear` left it, another wall took its place).
+    /// The tab's usage or model limit ended with no sign-in that took ([`IdleHost::limit_over`]:
+    /// the reset continued it, a `/clear` left it, another wall took its place).
     LimitOver { sid: String },
     /// The stall canary's second rung ([`IdleHost::stall_unread`]).
     ResumeUnread {
@@ -2202,7 +2206,8 @@ pub(crate) struct Acts {
     pub(crate) self_relaunch: Arc<SelfRelaunchFn>,
     /// The snapshot of such an agent no read reached while it ran ([`relaunch::self_claimed_snapshot`]).
     pub(crate) self_snapshot: Arc<SelfSnapshotFn>,
-    /// Whether the harness's own restart (the upgrade's or the restart in place's, left in flight by its step) ended the agent that left ([`relaunch::restarted`], by the snapshot's pid).
+    /// Whether the harness's own restart (the upgrade's or the restart in place's, left in flight
+    /// by its step) ended the agent that left ([`relaunch::restarted`], by the snapshot's pid).
     pub(crate) restarted: Arc<RestartedFn>,
     /// One attempt at carrying that restart on ([`relaunch::carry_restart`]).
     pub(crate) carry: Arc<CarryFn>,
@@ -2218,7 +2223,8 @@ pub(crate) struct Acts {
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
     pub(crate) carry_in_flight: Arc<CarryInFlightFn>,
     pub(crate) restart: Arc<RestartFn>,
-    /// Whether the conversation the session's agent holds has a task (a person's or an orchestrator's prompt; the harness's own turns are none, [`WorkerIdle::taskless`]).
+    /// Whether the conversation the session's agent holds has a task (a person's or an
+    /// orchestrator's prompt; the harness's own turns are none, [`WorkerIdle::taskless`]).
     pub(crate) tasked: Arc<TaskedFn>,
     /// Whether the conversation the session's agent holds says its task is finished.
     pub(crate) finished: Arc<FinishedFn>,
@@ -2669,7 +2675,7 @@ const fn upgrades(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).upgrade
 }
 
-/// Whether the relaunch on exit is written for `agent` ([`on_agent_left`]): Claude Code's.
+/// Whether the relaunch on exit is written for `agent` ([`on_agent_left`]).
 const fn relaunches(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).relaunch
 }
@@ -2703,9 +2709,9 @@ const fn reads_transcript(agent: Program) -> bool {
 }
 
 /// The pooled CLI whose roster and store a session of `agent` reads its accounts from
-/// (`accounts.toml` for Claude Code, `accounts-codex.toml` for Codex): what its Account fact,
-/// menu and a11y node name. A program no pool keeps is `None`. Whether the host records or moves
-/// its accounts is [`accounts_for`]'s alone.
+/// (`accounts.toml` for Claude Code, `accounts-<cli>.toml` for Codex, Grok Build and Kimi Code):
+/// what its Account fact, menu and a11y node name. A program no pool keeps is `None`. Whether
+/// the host records or moves its accounts is [`accounts_for`]'s alone.
 pub(crate) const fn pool_cli(agent: Program) -> Option<accounts::Cli> {
     accounts::Cli::of(agent)
 }
@@ -3163,13 +3169,11 @@ impl WorkerIdle {
         crate::program_check_watch::stuck(self.hooks.acts.program_check)
     }
 
-    /// What the host does for a session of a pooled CLI other than Claude Code at `point`: a
-    /// hosted Codex is a codex-alab the worker watches beside, which answers its own walls
-    /// (`stay other-supervisor`); no other such session is hosted (no reader table of theirs,
-    /// [`agent_of`]), and none has a hosted relaunch lane to write a move's line, so the
-    /// advice of [`aterm_agent::harness::accounts_pool::session_move`] is not taken here, and
-    /// its launch's pick ([`aterm_agent::harness::accounts_pool::launch_env`]) is that CLI's
-    /// whole rotation.
+    /// Logs the host's account advice at `point` for a session of a pooled CLI other than Claude
+    /// Code, always a stay: a hosted Codex is a codex-alab the worker watches beside, which
+    /// answers its own walls (`stay other-supervisor`), and no other such CLI is hosted
+    /// ([`agent_of`]) or has a relaunch lane to write a move's line, so
+    /// [`aterm_agent::harness::accounts_pool::session_move`]'s advice is not taken here.
     fn pool_said(&self, point: AccountPoint) {
         let supervisor = if self.beside() {
             accounts::Supervisor::Own
@@ -3242,11 +3246,9 @@ impl std::fmt::Debug for WorkerIdle {
 impl IdleHost for WorkerIdle {
     /// A point asked for, or a look the worker scheduled come due.
     fn wants(&self) -> bool {
-        // Beside a proven self-claim the host takes no step (§4), and while
-        // macOS's program check is stuck it takes none either
-        // ([`Self::at_idle_on`]): what it owes waits, kept, and is asked for
-        // at the first wait step after the check clears, before the loop's
-        // own decision.
+        // Beside a proven self-claim the host takes no step, nor while macOS's program
+        // check is stuck (`Self::at_idle_on`): what it owes stays kept and is asked for at
+        // the first wait step after the check clears, before the loop's own decision.
         if self.beside() || (self.on() && self.program_check_stuck()) {
             return false;
         }
@@ -3278,7 +3280,10 @@ impl IdleHost for WorkerIdle {
             .evidence(&self.sid, Instant::now())
     }
 
-    /// This tab's live agent calls at no progress ([`IdleHost::facts`]), worst first, as of the board's view; `None` with no view or one older than [`crate::vitals_jobs::JOBS_FRESH`]. A call is named only once its leader is proved alive at its birth now ([`Acts::leader_lives`], after the board's lock is let go).
+    /// This tab's live agent calls at no progress ([`IdleHost::facts`]), worst first, as of the
+    /// board's view; `None` with no view or one older than [`crate::vitals_jobs::JOBS_FRESH`]. A
+    /// call is named only once its leader is proved alive at its birth ([`Acts::leader_lives`],
+    /// asked after the board's lock is let go).
     fn facts(&self) -> Option<aterm_agent::supervise::FactsReading> {
         let (age, calls) = self
             .hooks
@@ -3544,7 +3549,8 @@ impl IdleHost for WorkerIdle {
         Some((format!("upgrade step={step}"), kind))
     }
 
-    /// The agent rests at a point its loop's guard withheld from this worker ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's own act in flight).
+    /// The agent rests at a point its loop's guard withheld from this worker
+    /// ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's own act in flight).
     fn at_withheld_point(&self, wake: bool) -> Option<String> {
         if !self.on() || (wake && !self.settle_later.load(Ordering::SeqCst)) {
             return None;
@@ -3646,7 +3652,9 @@ impl IdleHost for WorkerIdle {
             .and_then(|snap| process_started(&snap.start))
     }
 
-    /// The tab's agent's relaunch is this host's, its continuation still owed ([`IdleHost::relaunch_owed`], [`relaunch::owed_of`] of the agent's own record, as [`Self::wants`] asks it).
+    /// The tab's agent's relaunch is this host's, its continuation still owed
+    /// ([`IdleHost::relaunch_owed`], [`relaunch::owed_of`] of the agent's own record, as
+    /// [`Self::wants`] asks it).
     fn relaunch_owed(&self) -> bool {
         (self.hooks.acts.owed)(&self.sid, carries_only(self.agent))
     }
@@ -3887,7 +3895,8 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.transcript_tail)(&snap)
     }
 
-    /// When the claude code whose transcript was last read was launched ([`IdleHost::launched_at`], bg-1).
+    /// When the Claude Code whose transcript was last read was launched
+    /// ([`IdleHost::launched_at`]).
     fn launched_at(&self) -> Option<i64> {
         if !reads_transcript(self.agent) {
             return None;
@@ -6031,7 +6040,7 @@ impl WorkerIdle {
         }
     }
 
-    /// The answer of a move that was not made ([`Self::account_move`] step 3), one transaction.
+    /// The answer of a move that was not made ([`Self::account_move`]), in one transaction.
     fn account_unmade(
         &self,
         seat: &AccountSeat,
@@ -6138,7 +6147,8 @@ fn land_snapshot(
     true
 }
 
-/// How long an idle point waits for its relaunch snapshot read; under load 268 one took 57 s (v3b-gl, 2026-10-22).
+/// How long an idle point waits for its relaunch snapshot read before it goes on without it: at
+/// load average 268 one read took 57 s.
 const POINT_READ_BOUND: Duration = Duration::from_millis(500);
 
 /// What [`Acts::inert`]'s idle point waits for its read: a hang detector's minute.
@@ -6278,7 +6288,8 @@ fn unwitnessed_said(sid: &str, snap: &Snapshot) {
     }
 }
 
-/// A read `snap` that cannot name the conversation (a codex-alab whose thread lock the read did not find this time) keeps what the earlier read `before` of the same process named.
+/// A read `snap` that cannot name the conversation (a codex-alab whose thread lock the read missed)
+/// keeps what the earlier read `before` of the same process named.
 fn keep_session(before: Option<&Snapshot>, snap: &mut Snapshot) {
     if snap.session.is_none()
         && let Some(before) = before
@@ -7321,7 +7332,8 @@ fn relaunched_gone(
 /// Whose exit it is when the agent a relaunch landed is gone again before any read of it and before any pass named it ([`relaunch_until_with`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GoneUnread {
-    /// Still that relaunch's: tried again on the record read at the exit (a Claude Code's relaunch reads its conversation's record again; a restart's carry never types twice).
+    /// Still that relaunch's: tried again on the record read at the exit (a Claude Code's relaunch
+    /// reads its conversation's record again; a restart's carry never types twice).
     TriedAgain,
     /// The landed process's own (the crash rule, [`self_claimed_exit`]).
     HandedBack,
@@ -8338,7 +8350,8 @@ impl Drop for Workers {
     }
 }
 
-/// The adopted-claim grace (the round-four plan, item 9).
+/// How long [`HostHandle::defer_adopted_claims`] holds a session off: more than two claim
+/// renewals.
 pub(crate) const ADOPTED_CLAIM_GRACE: Duration =
     Duration::from_secs(2 * aterm_agent::supervise::CLAIM_RENEW.as_secs() + 5);
 
@@ -9193,13 +9206,15 @@ impl HostHandle {
         ring();
     }
 
-    /// A newer build of `agent` alone may be installed (atpkg's marker of that agent's own twin: Muse Code's).
+    /// A newer build of `agent` alone may be installed (atpkg's marker of that agent's own twin,
+    /// as Muse Code and agy have: [`own_marker_agents`]).
     pub(crate) fn note_agent_activation(&self, agent: Program) {
         self.shared.activations.note_of(agent);
         ring();
     }
 
-    /// News of the accounts (the store's wake marker was replaced: `aterm harness accounts use`, a login found signed in, an account proven or struck, a limit reset's outcome).
+    /// News of the accounts (the store's wake marker was replaced: `aterm harness accounts use`, a
+    /// login found signed in, an account proven or struck, a limit reset's outcome).
     pub(crate) fn note_accounts(&self) {
         self.shared
             .switches
@@ -9537,13 +9552,10 @@ fn queue_restored_guarded(
         format!("{THREAD_PREFIX}restored"),
         crate::qos::Role::Background,
         move || {
-            // ONLY WHILE THIS WORKER OWNS THE QUEUE (F1-R8-G5): it lets the
-            // queue go (`running` cleared) only under the queue's lock, at
-            // the instant it ends with nothing left to say, so a panic
-            // caught here is always one of the queue it still runs — never
-            // one after a restore queued meanwhile started a worker of its
-            // own, whose attempts (the one it steps included) this would end
-            // as not relaunched while that worker went on and landed them.
+            // The worker clears `running` only under the queue's lock, as it ends with
+            // nothing left to say, so a panic caught here is always one of the queue it
+            // still runs, never one of a worker a later restore started, whose attempts
+            // this would end as not relaunched while that worker landed them.
             if caught(
                 "the restored agents' relaunch",
                 "what it still owed is said as not relaunched",
@@ -10517,7 +10529,7 @@ struct HostState {
 }
 
 impl HostState {
-    /// Named for what it is, not `new`.
+    /// The state a host thread starts with over `shared`.
     fn from_shared(shared: &Shared) -> Self {
         Self {
             workers: Workers::default(),
@@ -11300,11 +11312,13 @@ pub(crate) fn deadline_attention_stands(standing: Option<&str>) -> bool {
 /// The deadlines' marks ([`Acts::startup_mark`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StartupMark<'a> {
-    /// `stalled why=startup`, what `hold`s the screen ([`StartupHold::attention`]) the supervisor's attention.
+    /// `stalled why=startup`, with what holds the screen ([`StartupHold::attention`]) as the
+    /// supervisor's attention.
     Stalled { hold: &'a StartupHold },
     /// `working` again, and the attention the startup stall set taken down.
     Started,
-    /// `stalled why=held`, what `read` shows after `held_for` with nothing moving ([`held_attention`]) the supervisor's attention.
+    /// `stalled why=held`, with what `read` shows after `held_for` with nothing moving
+    /// ([`held_attention`]) as the supervisor's attention.
     Held {
         read: &'a HeldRead,
         held_for: Duration,
@@ -11369,7 +11383,8 @@ impl Startups {
     }
 }
 
-/// The startup deadline: a worker.
+/// One look of the startup and held deadlines over every session with a task record: marks what
+/// is due and returns when to look next.
 fn look_at_startups(
     books: &mut Startups,
     now: Instant,
@@ -11437,15 +11452,13 @@ fn look_at_startups(
             }
             (_, StartupSeen::Unread) => soonest(now + STARTUP_UNREAD_LOOK),
             (StartupState::Working, StartupSeen::Holds(hold)) => {
-                // The harness's own waits count no more here than at the
-                // held deadline: an agent's exit in hand for a relaunch
-                // (the shell in front through its back-off, which a
-                // successor that never saw the worker start reads as no
-                // agent) is not judged, and the deadline falls a whole one
-                // after the last look that found it so; at a screen the
-                // harness holds an act on for a hand, no sooner than a whole
-                // one after that hold ends — a driver's counted from the
-                // last look that found it standing.
+                // The harness's own waits count no more here than at the held deadline.
+                // An agent's exit in hand for a relaunch (whose shell a successor that
+                // never saw the worker start reads as no agent) is not judged, and the
+                // deadline falls a whole one after the last look that found it so. On a
+                // screen the harness holds an act on for a hand, it falls no sooner than a
+                // whole one after that hold ends, a driver's counted from the last look
+                // that found it standing.
                 if books.waits.relaunching.contains(&w.sid) {
                     books.off.insert(w.sid.clone(), now);
                     soonest(now + HELD_RELOOK);
@@ -11548,16 +11561,14 @@ fn look_at_held_stall(
     None
 }
 
-/// What a worker's screen read `seen` says of a worker of kind `expected` no proven
-/// claim carries: a codex worker starts only when codex-alab claims its tab, so a
-/// screen that reads as started is OpenAI's codex, or a codex-alab that has not
-/// carried it ([`StartupHold::NoComposer`]) — and, while codex-alab may not claim
-/// it (`claimable` false: a halt stands, or the session's Autopilot is off, where
-/// `harness policy` says `effective=off`), the tab is not judged yet
-/// ([`StartupSeen::Unread`]); any other worker's read is the screen's. Where codex-alab's
-/// own attention stands (`asked`) over a screen codex holds (read as codex's: `asked` is
-/// given only where no other agent is in front, `startups_of`), that is what holds it
-/// ([`StartupHold::Asked`]): codex-alab says which of its startup screens waits, and why.
+/// What screen read `seen` says of a worker of kind `expected` that no proven claim carries.
+/// A codex worker starts only when codex-alab claims its tab, so a codex screen that reads as
+/// started is OpenAI's codex or a codex-alab that has not carried it
+/// ([`StartupHold::NoComposer`]). While codex-alab may not claim the tab (`claimable` false: a
+/// halt stands, or the session's Autopilot is off) it is not judged yet
+/// ([`StartupSeen::Unread`]). Where codex-alab's own attention (`asked`, given only where no
+/// other agent is in front) stands over a codex screen, that is what holds it
+/// ([`StartupHold::Asked`]). Any other worker's read is the screen's.
 pub(crate) fn unclaimed(
     seen: StartupSeen,
     expected: Option<Program>,
@@ -12379,18 +12390,14 @@ fn visit_workers(
                 return None;
             }
             if !wanted.contains_key(sid) {
-                // Otherwise an agent that left a tab that lives on (it holds the
-                // tab no longer: [`keep_holding`] kept every one that does) is
-                // the worker's to handle; a tab that closed (or a policy that
-                // stopped) just stops it. Each is asked once: a stop rings the
-                // bell, and one asked again at each pass woke the host at once
-                // through the worker's whole wind-down. A worker handed its exit,
-                // or whose agent was back since, is still stopped when its tab
-                // closes (the stop's word ends its relaunch's pause, and says it
-                // is no exit). A step that ran at any time since the roster was
-                // read — still running, or over already — may be what the roster
-                // missed: the absence is judged by the pass the step's end rings
-                // ([`StepsSeen`]).
+                // An agent that left a tab that lives on (`keep_holding` kept every one
+                // that still holds it) is the worker's to handle; a closed tab or a stopped
+                // policy just stops it. Each is asked once: a stop rings the bell, so asking
+                // at every pass would wake the host through the worker's whole wind-down. A
+                // worker handed its exit, or whose agent came back, is still stopped when its
+                // tab closes: the stop's word ends its relaunch's pause and says it is no exit.
+                // A step that ran since the roster was read may be what the roster missed, so
+                // the absence is judged by the pass the step's end rings (`StepsSeen`).
                 if !steps.stepping(sid, w) {
                     if active && (hooks.acts.open)(sid) {
                         if !w.stop.load(Ordering::SeqCst) {
@@ -13114,11 +13121,13 @@ pub(crate) fn admitted(ctx: &crate::SessionCtx) -> Option<Program> {
     admitted_as(ctx, agent, group)
 }
 
-/// [`admitted`] for an `agent` (and its `group`) the caller read under the timeline's guard and has let go of.
+/// [`admitted`] for an `agent` (and its `group`) the caller read under the timeline's guard and
+/// has let go of.
 ///
-/// A proven self-claim admits its Codex before the sweep names the tab's program: the proof read
-/// the claimant leading the foreground group and running an ALab build. Waiting for the sweep had
-/// `status` print `autopilot=-` at the claim, and the worker decided under Cruise in a Land session.
+/// A proven self-claim admits its Codex before the sweep names the tab's program, since the proof
+/// read the claimant leading the foreground group on an ALab build. Waiting for the sweep would
+/// leave `status` printing `autopilot=-` at the claim and the worker deciding under Cruise in a
+/// Land session.
 pub(crate) fn admitted_as(
     ctx: &crate::SessionCtx,
     agent: Option<Program>,
@@ -13423,7 +13432,8 @@ fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
     body_end(session.run_hosted(&job.opts, Arc::clone(&job.stop), &mut out))
 }
 
-/// Whether the run of `job` that just returned was stopped by a seamless update's Commit ([`HostHandle::suspend`] marks the worker so, and nothing has decided or rolled back since).
+/// Whether the run of `job` that just returned was stopped by a seamless update's Commit
+/// ([`HostHandle::suspend`] marks the worker so, and nothing has decided or rolled back since).
 fn stopped_by_commit(job: &WorkerJob) -> bool {
     with_kept(job, |k| k.commit == Committed::Stopped)
 }
@@ -13466,10 +13476,9 @@ pub(crate) fn harness_drive_token() -> Option<upgrade_drive::HarnessToken> {
 }
 
 /// What every one of the window's sweeps over `home` and `state` is told: this instance's own
-/// socket `sock` with the harness's in-memory token presented on it ([`harness_drive_token`]),
-/// so what a sweep types there reads `by=harness`, and the window's own `[harness]` switches.
-/// [`live_acts`], [`live_view`] and [`crate::upgrade_host::word_writer_at`] each start from it,
-/// so none dials the window's socket with the token beside it.
+/// socket `sock` with the harness's token ([`harness_drive_token`]), and the window's own
+/// `[harness]` switches. [`live_acts`], [`live_view`] and [`crate::upgrade_host::word_writer_at`]
+/// each start from it, so none dials the socket without the token.
 pub(crate) fn window_drive_opts(
     home: std::path::PathBuf,
     state: std::path::PathBuf,
@@ -13925,7 +13934,8 @@ fn walled_between_upkeeps<T>(upkeep: &dyn Fn(UpkeepStep), wall: impl FnOnce() ->
     read
 }
 
-/// [`account_wall_live`] over the places it is given (`(home, harness state root, roster file)`, the last `None` where no config path is known, then no roster) and the caller's clock.
+/// [`account_wall_live`] over the places it is given (`(home, harness state root, roster file)`,
+/// the roster `None` where no config path is known) and the caller's clock.
 fn account_wall_at(
     (home, state, roster): (&Path, &Path, Option<&Path>),
     sid: &str,
@@ -14217,7 +14227,8 @@ fn task_fact_live(
     )
 }
 
-/// The deadlines' marks, made in-process and conditional on the record still reading what the look read (`task_record::mark_session_task_with`, read under the locks the mark takes).
+/// The deadlines' marks, made in-process and conditional on the record still reading what the look
+/// read (`task_record::mark_session_task_with`, read under the locks the mark takes).
 pub(crate) fn startup_mark_with(
     store: &Store,
     sid: &str,
@@ -15678,7 +15689,9 @@ const DISK_SHORT_LOOKS: u32 = 2;
 static DISK_NOTES_SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// What a look of a process that is not the owner's watch ([`disk_private`]: `private`, the rule that made it so) that would pass otherwise says of why it removes nothing, naming the rule as it is ([`DiskPrivate::why`]).
+/// The log line for a look below the warning line, or with an agent's demand waiting, in a
+/// process that is not the owner's disk watch (`private`, from [`disk_private`]): the level and
+/// the rule ([`DiskPrivate::why`]). `None` for any other look.
 fn disk_private_line(
     private: Option<DiskPrivate>,
     below_warn: bool,
@@ -16304,7 +16317,8 @@ fn disk_look_rows(
     (rows, map)
 }
 
-/// Whether the working directory `cwd` is one the board cannot place for its 8.3 short names alone (`C:\Users\ANDREW~1\x`: [`aterm_sysprobe::paths::short_spelled`]).
+/// Whether the working directory `cwd` is one the board cannot place for its 8.3 short names alone
+/// (`C:\Users\ANDREW~1\x`: [`aterm_sysprobe::paths::short_spelled`]).
 pub(crate) fn disk_short_spelled(cwd: &Path) -> bool {
     cfg!(windows) && aterm_sysprobe::paths::short_spelled(cwd).is_some()
 }
@@ -16350,7 +16364,8 @@ const DISK_SPELL_DEADLINE: Duration = Duration::from_secs(1);
 
 static DISK_SPELL_STUCK: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-/// The long spelling of `through` (an existing verbatim path through its last short name) as `name` gives it (`GetLongPathNameW`: [`aterm_sysprobe::volumes::long_name`]).
+/// The long spelling of `through` (an existing verbatim path through its last short name) as `name`
+/// gives it (`GetLongPathNameW`: [`aterm_sysprobe::volumes::long_name`]).
 fn disk_long_name_by(
     through: &Path,
     name: fn(&Path) -> Option<PathBuf>,
@@ -16483,7 +16498,8 @@ pub(crate) enum DiskPrivate {
     NoAccountHome,
     /// Its home's device cannot be named (a volume that keeps no file ids, fat or exFAT, or a home that cannot be opened).
     DeviceUnnamed,
-    /// Its home is not the account's and lies on the account home's volume, or on one that cannot be told apart from it (the account home's own device cannot be named).
+    /// Its home is not the account's and lies on the account home's volume, or on one that cannot
+    /// be told apart from it (the account home's own device cannot be named).
     ScratchHome,
 }
 
@@ -17295,7 +17311,9 @@ fn live_view(
 
 const WAKE_FALLBACK: Duration = Duration::from_secs(60);
 
-/// The activation thread's loop over `wait` (the parked [`ActivationWake::wait`]: `true` for a newer build, `false` for the fallback and a pulled trigger) until the host shuts down.
+/// The activation thread's loop over `wait` until the host shuts down. `wait` is the parked
+/// [`ActivationWake::wait`]: `true` for a newer build, `false` for the fallback or a pulled
+/// trigger.
 fn activation_loop(host: &HostHandle, mut wait: impl FnMut() -> bool) {
     accounts_look(
         &host.shared.switches,
@@ -17398,7 +17416,8 @@ pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
     arm
 }
 
-/// The live upkeep only where the instance runs as its account's own (`not_own` is `None`) or the development seam `accounts_sync::UPKEEP_SEAM` was admitted (`seam`).
+/// The live upkeep where the instance runs as its account's own (`not_own` is `None`) or the
+/// development seam `accounts_sync::UPKEEP_SEAM` was admitted (`seam`), else the inert one.
 const fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
     if not_own.is_none() || seam {
         AccountsUpkeep::Live
@@ -17532,7 +17551,8 @@ fn upkept_on(
     })
 }
 
-/// Park on the pushes that say a newer Claude Code is installed.
+/// Start the activation thread, parked on the markers that say a newer agent build is installed
+/// ([`activation_wake`]) with the accounts' upkeep beside it.
 fn spawn_activation_wake(host: HostHandle) {
     spawn_activation_wake_with(host, |host| {
         let mut wake = activation_wake(host);
@@ -17559,7 +17579,8 @@ type ActivationArm = Box<dyn FnOnce(&HostHandle) -> ArmedWake + Send>;
 type ActivationTask = Box<dyn FnOnce() + Send>;
 type ActivationSpawn = Arc<dyn Fn(ActivationTask) -> std::io::Result<()> + Send + Sync>;
 
-/// A failed spawn must not consume the one-shot arming closure.
+/// An activation start not yet made: a failed spawn leaves its one-shot arming closure here for
+/// the retry.
 struct PendingActivation {
     at: Instant,
     arm: Arc<Mutex<Option<ActivationArm>>>,
@@ -17674,7 +17695,8 @@ fn spawn_activation_wake_with(
     );
 }
 
-/// The shipping start with its OS spawn injected for the existing activation aggregate.
+/// [`spawn_activation_wake_with`] with the thread's spawn injected: an absent start is queued as
+/// [`ActivationStart::Pending`] and tried at once.
 fn spawn_activation_wake_on(
     host: HostHandle,
     arm: impl FnOnce(&HostHandle) -> ArmedWake + Send + 'static,

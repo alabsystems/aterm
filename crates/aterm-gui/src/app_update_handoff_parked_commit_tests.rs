@@ -477,13 +477,9 @@ fn note_settles_and_the_write(parked: &mut Parked) {
     }));
 }
 
-/// A SYSTEM STATE STOP CLICKED WHILE THE HANDOFF DRAINS INPUT: the window
-/// handles input from the handoff's start to the Commit's claim, so a Stop
-/// clicked in between may still owe the records its save (or a plan it stops,
-/// still being admitted). The Commit settles it among what its claim answers,
-/// and again right before its write, as a quit does (design §3.3): bounded,
-/// and at once when nothing is owed. Without those settles nothing comes
-/// before the write here, since this attempt never passed the handoff's start.
+/// A System State Stop clicked while the handoff drains input may still owe its save: the
+/// Commit settles it among what its claim answers and again right before its write, as a quit
+/// does. This attempt never passed the handoff's start, so both settles seen are the Commit's.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_commit_settles_a_system_state_stop_before_its_write() {
@@ -498,10 +494,9 @@ fn the_commit_settles_a_system_state_stop_before_its_write() {
     );
 }
 
-/// A settle that waited (a Stop's save still landing) held the main thread,
-/// and keys typed meanwhile would die with the `_exit`: the claim is held
-/// through one more input fence before the write, as for any answer that took
-/// a fence grain, and the write's own settle still comes right before it.
+/// A settle that waited held the main thread, and keys typed meanwhile would die with the
+/// `_exit`, so the claim goes through one more input fence; the write's own settle still comes
+/// right before the write.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_system_state_settle_that_waits_holds_the_commit_through_one_more_fence() {

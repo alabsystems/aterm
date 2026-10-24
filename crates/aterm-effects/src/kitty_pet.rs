@@ -707,6 +707,33 @@ pub struct PetDepartureSprite {
     pub colors: Option<CatColorKey>,
 }
 
+impl PetDepartureSprite {
+    /// The departing body's drawn rect in grid pixels.
+    #[must_use]
+    #[inline]
+    pub fn body_px(
+        &self,
+        cell_w: u16,
+        cell_h: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if self.alpha == 0 || cell_w == 0 || cell_h == 0 {
+            return None;
+        }
+        Some(drawn_body_px(
+            (self.col, self.row),
+            Stance {
+                scale_x: self.scale_x,
+                scale_y: self.scale_y,
+                lift: self.lift,
+            },
+            (cell_w, cell_h),
+            (cols, rows),
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Stance {
     scale_x: f32,
@@ -829,13 +856,8 @@ impl Departure {
         } else {
             stride.rem_euclid(1.0)
         };
-        let idx = (phase * cycle.len() as f32) as usize;
-        let frame = if idx < cycle.len() - 1 {
-            idx
-        } else {
-            cycle.len() - 1
-        };
-        (col, cycle[frame], dir < 0.0, Stance::NEUTRAL)
+        let idx = ((phase * cycle.len() as f32) as usize).min(cycle.len() - 1);
+        (col, cycle[idx], dir < 0.0, Stance::NEUTRAL)
     }
 
     #[inline]
@@ -5779,16 +5801,18 @@ impl PetBrain {
             let second_wash = since_sit >= cycle && since_sit < 2.0 * cycle;
             if in_wash && !(second_wash && self.groom_skip()) {
                 PetAction::Groom
-            } else if self.quiet >= self.loaf_after() {
-                let owed = CONTENT_DECAY
-                    * (self.quiet - SIT_AFTER).clamp(0.0, self.loaf_after() - SIT_AFTER);
-                if self.content + owed >= PURR_GATE && !self.settle_seed.is_multiple_of(3) {
-                    PetAction::Purr
-                } else {
-                    PetAction::Loaf
-                }
             } else {
-                PetAction::Sit
+                let loaf_after = self.loaf_after();
+                if self.quiet >= loaf_after {
+                    let owed = CONTENT_DECAY * (since_sit).clamp(0.0, loaf_after - SIT_AFTER);
+                    if self.content + owed >= PURR_GATE && !self.settle_seed.is_multiple_of(3) {
+                        PetAction::Purr
+                    } else {
+                        PetAction::Loaf
+                    }
+                } else {
+                    PetAction::Sit
+                }
             }
         } else if self.action == PetAction::Waking {
             // The wake's stretch ends in the seat it is drawn in.
@@ -5984,10 +6008,11 @@ impl PetBrain {
 
     #[inline]
     const fn sit_yawn(&self) -> bool {
-        !self.room_hold
-            && self.settle_seed.is_multiple_of(2)
-            && self.quiet >= self.loaf_after() - YAWN_DUR
-            && self.quiet < self.loaf_after()
+        if self.room_hold || !self.settle_seed.is_multiple_of(2) {
+            return false;
+        }
+        let loaf_after = self.loaf_after();
+        self.quiet >= loaf_after - YAWN_DUR && self.quiet < loaf_after
     }
 
     #[inline]
@@ -7527,6 +7552,11 @@ impl PetBrain {
         }
     }
 
+    #[inline]
+    fn mote_fade_env(u: f32) -> f32 {
+        (u / 0.15).min(1.0) * ((1.0 - u) / 0.35).clamp(0.0, 1.0)
+    }
+
     fn resolve_motes(&mut self) -> [Option<PetMoteSprite>; PET_MOTES_MAX] {
         let mut out = [None; PET_MOTES_MAX];
         let clock = self.clock;
@@ -7537,8 +7567,6 @@ impl PetBrain {
                 self.motes[i] = None;
                 continue;
             }
-            let fade_in = (u / 0.15).min(1.0);
-            let fade_out = ((1.0 - u) / 0.35).clamp(0.0, 1.0);
             let spin = if m.seed % 2 == 0 { 1.0 } else { -1.0 };
             *slot = Some(match m.kind {
                 PetMoteKind::Dust => PetMoteSprite {
@@ -7547,39 +7575,45 @@ impl PetBrain {
                     row: m.row - (0.08 + 0.22 * u),
                     scale: 0.5 + 1.3 * u,
                     rot: spin * (0.12 + 0.05 * f32::from(m.seed % 3) + 0.6 * u),
-                    alpha: (fade_in * fade_out * 235.0) as u8,
+                    alpha: (Self::mote_fade_env(u) * 235.0) as u8,
                     rgb: m.rgb,
                 },
                 PetMoteKind::Zee | PetMoteKind::ZeePop => {
                     let (col, row, scale, rot, peak, env, ink) = if m.kind == PetMoteKind::Zee {
-                        let su = look_slice_age(look_slice(u, ZEE_STEPS), ZEE_STEPS);
                         let (col, row) = m.drift(u);
                         let (px_col, px_row) = self.mote_px_cell(col, row);
+                        let ink = self.zee_ink_fade(px_col, px_row);
+                        if ink <= 0.0 {
+                            self.motes[i] = None;
+                            continue;
+                        }
+                        let su = look_slice_age(look_slice(u, ZEE_STEPS), ZEE_STEPS);
                         (
                             col,
                             row,
                             0.55 + 0.60 * su,
                             spin * (0.10 + 0.04 * f32::from(m.seed % 3) + 0.55 * su),
                             220.0,
-                            (su / 0.15).min(1.0) * ((1.0 - su) / 0.35).clamp(0.0, 1.0),
-                            self.zee_ink_fade(px_col, px_row),
+                            Self::mote_fade_env(su),
+                            ink,
                         )
                     } else {
                         let (col, row) = (m.col + m.dir * 0.25 * u, m.row - 0.55 * u);
+                        let ink = self.zee_ink_fade(col, row);
+                        if ink <= 0.0 {
+                            self.motes[i] = None;
+                            continue;
+                        }
                         (
                             col,
                             row,
                             0.85 + 0.55 * u,
                             spin * (0.14 + 0.8 * u),
                             245.0,
-                            fade_in * fade_out,
-                            self.zee_ink_fade(col, row),
+                            Self::mote_fade_env(u),
+                            ink,
                         )
                     };
-                    if ink <= 0.0 {
-                        self.motes[i] = None;
-                        continue;
-                    }
                     PetMoteSprite {
                         kind: m.kind,
                         col,
@@ -7600,8 +7634,7 @@ impl PetBrain {
                         row,
                         scale,
                         rot: spin * (0.11 + 0.05 * f32::from(m.seed % 3) + 0.4 * su),
-                        alpha: ((su / 0.15).min(1.0) * ((1.0 - su) / 0.35).clamp(0.0, 1.0) * 240.0)
-                            as u8,
+                        alpha: (Self::mote_fade_env(su) * 240.0) as u8,
                         rgb: m.rgb,
                     }
                 }
@@ -8099,9 +8132,10 @@ impl PetBrain {
         };
         self.last_pose = pose;
         self.last_facing = facing_left;
+        let alpha_clamped = self.alpha.clamp(0.0, 1.0);
         let mut frame = PetFrame {
-            alpha: (self.alpha.clamp(0.0, 1.0) * arrival * 255.0) as u8,
-            lane_alpha: (self.alpha.clamp(0.0, 1.0) * 255.0) as u8,
+            alpha: (alpha_clamped * arrival * 255.0) as u8,
+            lane_alpha: (alpha_clamped * 255.0) as u8,
             action: self.action,
             pose: self.species.skin(pose),
             col: self.col,
@@ -8121,9 +8155,10 @@ impl PetBrain {
         self.veil_over_letters(&mut frame, sense);
         self.last_presence = f32::from(frame.alpha) / 255.0;
         self.last_stance = Stance::of(&frame);
-        let lane = f32::from(frame.lane_alpha) / 255.0;
         self.last_drawn = core::array::from_fn(|i| {
-            frame.departures[i].map_or(0.0, |d| f32::from(d.alpha) / 255.0 * lane)
+            frame.departures[i].map_or(0.0, |d| {
+                f32::from(d.alpha) / 255.0 * (f32::from(frame.lane_alpha) / 255.0)
+            })
         });
         frame
     }
@@ -9301,7 +9336,7 @@ fn first_px_step(
     slope: (f32, f32),
     scale_at: impl Fn(f32) -> (f32, f32),
 ) -> Option<f32> {
-    if horizon <= 0.0 {
+    if horizon <= 0.0 || (slope.0 <= 0.0 && slope.1 <= 0.0) {
         return None;
     }
     let (w, h) = box_px;

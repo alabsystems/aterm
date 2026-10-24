@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Occupancy facts board, pace and reservation table ([`Pace`], [`pace_for`]), between-look sampler ([`sample_pass`]), and facts ring surfacing ([`cmd_occupancy`]).
+//! Occupancy facts board, pace and reservation table ([`Pace`], [`pace_for`]), between-look
+//! sampler ([`sample_pass`]), and facts ring surfacing ([`cmd_occupancy`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -30,7 +31,8 @@ pub(crate) const STALE_AFTER: Duration =
 /// How long the board remembers that a session's tab held a build slot.
 pub(crate) const HELD_KEEP: Duration = Duration::from_secs(48 * 3600);
 
-/// While a session under `prompt` has a `hold-room` line due or pending, the board samples its terms this often.
+/// While a session under `prompt` has a `hold-room` line due or pending, the board samples its
+/// terms this often.
 pub(crate) const SAMPLE_EVERY: Duration = aterm_sysprobe::slots::PERIOD;
 
 /// [`SAMPLE_EVERY`] in whole milliseconds.
@@ -80,7 +82,8 @@ fn x100(load: f64) -> Option<u32> {
         .then(|| (load * 100.0).round().min(f64::from(u32::MAX)) as u32)
 }
 
-/// The board of `snap` (`snap_unix_ms` is `None` before the first snapshot), with the home volume at `disk`, taken at `now_unix_ms`.
+/// The board of `snap` (`snap_unix_ms` is `None` before the first snapshot), with the home volume
+/// at `disk`, taken at `now_unix_ms`.
 pub(crate) fn board_of(
     snap: &Snapshot,
     snap_unix_ms: Option<i64>,
@@ -129,7 +132,8 @@ pub(crate) const fn slots_view(r: &SlotsRead) -> SlotsView {
     }
 }
 
-/// THE TABS THAT HOLD A BUILD SLOT (their keys, each once, in order).
+/// The keys of the tabs that hold a build slot, each once, in order: a holder counts only while
+/// its pid is still the process the slot recorded. `None` without a slot reading or a sweep.
 pub(crate) fn slot_tabs(
     read: &SlotsRead,
     procs: Option<&[ProcSample]>,
@@ -174,7 +178,8 @@ fn machine_wait(text: &str) -> Option<AwaitSys> {
     }
 }
 
-/// The facts of `snap` that `hold-room` judges at the board's cadence (readings within [`STALE_AFTER`] speak for the look; older ones keep their age).
+/// The facts of `snap` that `hold-room` judges at the board's cadence: readings within
+/// [`STALE_AFTER`] speak for the look; older ones keep their age.
 fn judged_snapshot(snap: &Snapshot) -> Snapshot {
     let stale_ms = u64::try_from(STALE_AFTER.as_millis()).unwrap_or(u64::MAX);
     Snapshot {
@@ -187,7 +192,7 @@ fn judged_snapshot(snap: &Snapshot) -> Snapshot {
     }
 }
 
-/// THE BOARD AND WHAT IT JUDGED ACROSS ITS LOOKS.
+/// The board and what it judged across its looks.
 #[derive(Debug, Default)]
 pub(crate) struct Judged {
     /// The board as last taken.
@@ -196,23 +201,28 @@ pub(crate) struct Judged {
     latch: Latch,
     /// How long that term has held, ms, once it spans its `for=`.
     slots_free_ms: Option<u64>,
-    /// Whether `hold-room`'s machine terms held at the last look; `None` where they could not be judged.
+    /// Whether `hold-room`'s machine terms held at the last look; `None` where they could not be
+    /// judged.
     room: Option<bool>,
-    /// Each supervised session's last look at which a build slot's holder lay in its tab (unix ms), kept [`HELD_KEEP`].
+    /// Each supervised session's last look at which a build slot's holder lay in its tab (unix
+    /// ms), kept [`HELD_KEEP`].
     held: BTreeMap<String, i64>,
     /// The machine's pace and the slots reserved ([`Pace`]).
     pace: Pace,
     /// What each session's loop last told ([`told`]), by sid.
     said: BTreeMap<String, OccupancySaid>,
-    /// The rows of the last [`ring::RING_ROWS`] minute looks ([`Look::Tick`]), oldest first ([`Self::look_row`]).
+    /// The rows of the last [`ring::RING_ROWS`] minute looks ([`Look::Tick`]), oldest first
+    /// ([`Self::look_row`]).
     rows: VecDeque<RingRow>,
     /// The ring's file was read into [`Self::rows`] (at the first look).
     seeded: bool,
     /// The supervised sessions as the last look named them (tab key, sid).
     sessions: Vec<(u64, String)>,
-    /// Each session whose loop under `prompt` last asked the board for `hold-room`'s reading, with when (unix ms).
+    /// Each session whose loop under `prompt` last asked the board for `hold-room`'s reading,
+    /// with when (unix ms).
     wanting: BTreeMap<String, i64>,
-    /// Each session's `hold-room` lines its loop told typed in the told hold: the last one's unix ms and count ([`Self::tell`]).
+    /// Each session's `hold-room` lines its loop told typed in the told hold: the last one's
+    /// unix ms and count ([`Self::tell`]).
     rooms_typed: BTreeMap<String, (i64, usize)>,
     /// When the board was last sampled between looks (unix ms).
     sampled_ms: Option<i64>,
@@ -221,7 +231,7 @@ pub(crate) struct Judged {
 }
 
 impl Judged {
-    /// THE LOOK that took `board` from `snap`, with the supervised `sessions`.
+    /// One look: `board`, taken from `snap`, judged with the supervised `sessions`.
     pub(crate) fn step(
         &mut self,
         board: FactsBoard,
@@ -313,7 +323,8 @@ impl Judged {
         })
     }
 
-    /// Session `sid`'s `hold-room` lines told typed in its hold begun at `since_ms` (last unix ms and count).
+    /// Session `sid`'s `hold-room` lines told typed in its hold begun at `since_ms` (last unix ms
+    /// and count).
     fn room_typed(&self, sid: &str, since_ms: i64) -> Option<(i64, usize)> {
         self.rooms_typed
             .get(sid)
@@ -321,12 +332,14 @@ impl Judged {
             .filter(|(at, _)| since_ms <= *at)
     }
 
-    /// Whether a sampler must start at `now_unix_ms` under `mode`, marking it running under the caller's lock ([`start_sampler`]).
+    /// Whether a sampler must start at `now_unix_ms` under `mode`, marking it running under the
+    /// caller's lock ([`start_sampler`]).
     pub(crate) fn sampler_due(&mut self, now_unix_ms: i64, mode: Occupancy) -> bool {
         self.sampling(now_unix_ms, mode) && !std::mem::replace(&mut self.sampler, true)
     }
 
-    /// Whether a sample is due at `now_unix_ms` under `mode` (sampling, and none taken within [`SAMPLE_EVERY`]).
+    /// Whether a sample is due at `now_unix_ms` under `mode` (sampling, and none taken within
+    /// [`SAMPLE_EVERY`]).
     pub(crate) fn sample_due(&self, now_unix_ms: i64, mode: Occupancy) -> bool {
         self.sampling(now_unix_ms, mode)
             && self
@@ -340,7 +353,8 @@ impl Judged {
         Some(b.as_of_unix_ms.min(b.slots_as_of_unix_ms?))
     }
 
-    /// Answer at a line's write for session `sid`'s line of `rule` (hold begun at `hold_since_ms`) at `now_unix_ms`.
+    /// Answer at a line's write for session `sid`'s line of `rule` (hold begun at
+    /// `hold_since_ms`) at `now_unix_ms`.
     pub(crate) fn answer(
         &mut self,
         sid: &str,
@@ -414,7 +428,8 @@ impl Judged {
         self.said.keys().cloned().collect()
     }
 
-    /// Seed rows left by a predecessor's ring (oldest first), taken once before this window's first row.
+    /// Seed rows left by a predecessor's ring (oldest first), taken once before this window's
+    /// first row.
     pub(crate) fn seed_rows(&mut self, rows: Vec<RingRow>) {
         if std::mem::replace(&mut self.seeded, true) {
             return;
@@ -423,7 +438,8 @@ impl Judged {
         self.rows = rows.into_iter().skip(keep).collect();
     }
 
-    /// Build the look's row at `now_unix_ms`, kept in [`Self::rows`] and returned for the ring's file.
+    /// Build the look's row at `now_unix_ms`, kept in [`Self::rows`] and returned for the ring's
+    /// file.
     pub(crate) fn look_row(&mut self, sessions: &[(u64, String)], now_unix_ms: i64) -> RingRow {
         let rows = sessions
             .iter()
@@ -452,7 +468,8 @@ impl Judged {
         row
     }
 
-    /// The row a look of `look` takes at `now_unix_ms` ([`Self::look_row`]): a minute tick takes one; a poke takes none.
+    /// The row a look of `look` takes at `now_unix_ms` ([`Self::look_row`]): a minute tick takes
+    /// one; a poke takes none.
     pub(crate) fn looked(
         &mut self,
         sessions: &[(u64, String)],
@@ -467,7 +484,8 @@ impl Judged {
         self.rows.back().map_or(0, RingRow::ready)
     }
 
-    /// Whole slot-minutes idle while a session was ready over the day before `now_unix_ms` ([`ring::idle_ready_ms`]).
+    /// Whole slot-minutes idle while a session was ready over the day before `now_unix_ms`
+    /// ([`ring::idle_ready_ms`]).
     pub(crate) fn idle_ready_min(&self, now_unix_ms: i64) -> u64 {
         ring::idle_ready_ms(&self.rows, now_unix_ms.saturating_sub(rules::DAY_MS)) / 60_000
     }
@@ -511,7 +529,8 @@ impl Judged {
         .aged_at(Some(now_unix_ms))
     }
 
-    /// Ask the pace for a line of `rule` in session `sid`'s hold begun at `hold_since_ms` at `now_unix_ms` ([`Pace::ask`]).
+    /// Ask the pace for a line of `rule` in session `sid`'s hold begun at `hold_since_ms` at
+    /// `now_unix_ms` ([`Pace::ask`]).
     pub(crate) fn pace(
         &mut self,
         sid: &str,
@@ -626,7 +645,7 @@ struct Waiting {
     asked_ms: i64,
 }
 
-/// THE PACE AND RESERVATION TABLE.
+/// The machine pace and the slot reservation table.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Pace {
     /// When each fact line of the last hour was granted, unix ms.
@@ -750,7 +769,7 @@ impl Pace {
         PaceGrant::Granted
     }
 
-    /// RESERVE A FREE BUILD SLOT for session `sid`, aged from `age_ms` (its open hold's start,
+    /// Reserve a free build slot for session `sid`, aged from `age_ms` (its open hold's start,
     /// else its wake's ready since), with `usable` slots the board proves at `now_ms`: an `await
     /// wake` answer whose need names slots takes one here, in every mode but off. Granted where
     /// `sid`'s own live reservation stands (kept as it was taken), or where a slot is left once
@@ -839,8 +858,8 @@ impl Pace {
         Reserve::Granted
     }
 
-    /// THE LAPSE of every reservation whose session's tab was seen holding a build slot since it
-    /// was taken (`held`: each session's last look so, unix ms): its build has the slot.
+    /// Lapse every reservation whose session's tab was seen holding a build slot since it was
+    /// taken (`held`: each session's last such look, unix ms): its build has the slot.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -871,7 +890,7 @@ impl Pace {
     }
 }
 
-/// THE NEGATIVE CONTROLS' FAULT POINTS in the pace ([`conformance`], the pace tests) and in the
+/// The negative controls' fault points in the pace ([`conformance`], the pace tests) and in the
 /// task record's fact word (`task_record::fact_edit`).
 #[cfg(test)]
 pub(crate) mod fault {
@@ -1134,7 +1153,8 @@ pub(crate) static SLOTS_ARMED: Arming = Arming::logged(
 /// Armed fresh reads when a slot rule's write re-reads the board ([`pace_for`]).
 pub(crate) static SLOTS_NOW: Arming = Arming::new();
 
-/// Max age of a slots reading the probe thread hands back ([`aterm_sysprobe::slots::SlotReader::read_within`]).
+/// Max age of a slots reading the probe thread hands back
+/// ([`aterm_sysprobe::slots::SlotReader::read_within`]).
 pub(crate) fn slots_period() -> Duration {
     use aterm_sysprobe::slots::{IDLE_PERIOD, PERIOD, REREAD};
     if SLOTS_NOW.armed() {
@@ -1193,11 +1213,11 @@ pub(crate) fn mode() -> Occupancy {
     }
 }
 
-/// THE GUI'S OWN GATE ON A WRITE OF THE OCCUPANCY DOOR'S (the occupancy design's §8 row 2):
-/// whether the owner's mode in force ([`mode`], set from their root `[harness] occupancy`) is
-/// `prompt`. Every host-side writer of slice 2's (a wake's claim, the task record's fact word, a
-/// ready-idle Entry, a wake's event) asks it beside the loop's own grant, so a word a loop tells,
-/// or a replay or an older loop says, never stands for the owner's `prompt`.
+/// The GUI's own gate on a write of the occupancy door's (the occupancy design's §8 row 2):
+/// whether the owner's mode in force ([`mode`], from their root `[harness] occupancy`) is
+/// `prompt`. Every host-side writer (a wake's claim, the task record's fact word, a ready-idle
+/// Entry, a wake's event) asks it beside the loop's own grant, so a word a loop tells, or a replay
+/// or an older loop says, never stands for the owner's `prompt`.
 pub(crate) fn prompt_now() -> bool {
     mode() == Occupancy::Prompt
 }
@@ -1225,7 +1245,8 @@ pub(crate) fn append_look(
     }
 }
 
-/// The facts ring's file as this window writes it; `None` before the first look or with no state directory.
+/// The facts ring's file as this window writes it; `None` before the first look or with no state
+/// directory.
 static RING: Mutex<Option<RingFile>> = Mutex::new(None);
 
 /// Record what session `sid`'s loop told (`IdleHost::occupancy_said`).
@@ -1315,7 +1336,8 @@ pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)], kind: Look) {
     }
 }
 
-/// Occupancy status fields for session `sid` (`occupancy`, `occupancy_hold`, `ready`, `slots`, `idle_ready_min`).
+/// Occupancy status fields for session `sid` (`occupancy`, `occupancy_hold`, `ready`, `slots`,
+/// `idle_ready_min`).
 pub(crate) fn status_fields(sid: Option<&str>) -> String {
     let now_unix_ms = aterm_time::unix_millis()
         .and_then(|ms| i64::try_from(ms).ok())
@@ -1408,7 +1430,8 @@ pub(crate) fn why_reply(
     lines_reply(&lines)
 }
 
-/// Format `occupancy check --replay`'s reply for session `sid` over `rows` and `ledger` in `(from_ms, to_ms)`.
+/// Format `occupancy check --replay`'s reply for session `sid` over `rows` and `ledger` in
+/// `(from_ms, to_ms)`.
 pub(crate) fn replay_reply(
     sid: &str,
     rows: &[RingRow],
@@ -1442,7 +1465,8 @@ fn lines_reply(lines: &[String]) -> String {
     out
 }
 
-/// Read the board as session `sid`'s host reads it now (`IdleHost::occupancy`, [`Judged::reading`]), starting the sampler under `prompt` if due.
+/// Read the board as session `sid`'s host reads it now (`IdleHost::occupancy`,
+/// [`Judged::reading`]), starting the sampler under `prompt` if due.
 pub(crate) fn reading_for(sid: &str) -> OccupancyReading {
     let Some(now_unix_ms) = aterm_time::unix_millis().and_then(|ms| i64::try_from(ms).ok()) else {
         return BOARD
@@ -1464,7 +1488,8 @@ pub(crate) fn reading_for(sid: &str) -> OccupancyReading {
     reading
 }
 
-/// Query the pace for session `sid`'s line of `rule` (hold begun at `hold_since_ms`), re-reading the board first for a slot rule under `prompt`.
+/// Query the pace for session `sid`'s line of `rule` (hold begun at `hold_since_ms`), re-reading
+/// the board first for a slot rule under `prompt`.
 pub(crate) fn pace_for(sid: &str, rule: RuleId, hold_since_ms: i64) -> PaceGrant {
     let mut reread = || {
         let _now = SLOTS_NOW.arm();
@@ -1501,7 +1526,8 @@ pub(crate) struct Reread {
     pub(crate) disk: Option<Level>,
 }
 
-/// Evaluate [`pace_for`] on `kept` under `mode` for session `sid`'s line of `rule` in its hold begun at `hold_since_ms` ([`Judged::answer`]).
+/// Evaluate [`pace_for`] on `kept` under `mode` for session `sid`'s line of `rule` in its hold
+/// begun at `hold_since_ms` ([`Judged::answer`]).
 pub(crate) fn pace_on(
     kept: &Mutex<Option<Judged>>,
     mode: Occupancy,
@@ -1528,7 +1554,8 @@ pub(crate) fn pace_on(
     judged.answer(sid, rule, hold_since_ms, now_unix_ms)
 }
 
-/// Run one pass of the sampler over `kept` at `now_unix_ms` under `mode`, returning `false` once no session under `prompt` wants the board.
+/// Run one pass of the sampler over `kept` at `now_unix_ms` under `mode`, returning `false` once
+/// no session under `prompt` wants the board.
 pub(crate) fn sample_pass(
     kept: &Mutex<Option<Judged>>,
     mode: Occupancy,
@@ -1555,7 +1582,8 @@ pub(crate) fn sample_pass(
     true
 }
 
-/// Spawn the sampler thread, arming the build slots and running [`sample_pass`] every [`SAMPLE_EVERY`].
+/// Spawn the sampler thread, arming the build slots and running [`sample_pass`] every
+/// [`SAMPLE_EVERY`].
 fn start_sampler() {
     let spawned = std::thread::Builder::new()
         .name(format!(

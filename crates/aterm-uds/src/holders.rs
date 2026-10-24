@@ -106,26 +106,71 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
     ))
 }
 
-/// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`,
-/// by each socket's own kernel record, never by a process's arguments: each socket descriptor's
-/// `PROC_PIDFDSOCKETINFO` ([`aterm_sysprobe::jobs::darwin::unix_listener`]). A bound path names
-/// `path` as [`SocketPath::names`] says. A table that cannot be read is `unreadable`.
+/// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`, by
+/// the socket's own kernel record, never by a process's arguments or descriptors: the kernel's
+/// table of unix-domain streams ([`aterm_sysprobe::jobs::darwin::unix_listeners`]), which names
+/// each listener's path, its user and the process that bound it. No other process's descriptor is
+/// read: a socket read through one (`PROC_PIDFDSOCKETINFO`) that its holder closes during the read
+/// fails every blocking wait on that socket from then on, in every process holding it (the drain
+/// `aterm_sysprobe::jobs::macos`'s `settled` names). So a holder is the live process that bound the
+/// listener, for as long as any process holds it: a fork that kept it is no holder, and the binder
+/// still is after closing its own copy while another process (a child mid-spawn) holds one. A bound
+/// path names `path` as [`SocketPath::names`] says. Each scan finds a listener of its own in the
+/// same table read, bound for the check, so a table this build misreads is refused, never read as
+/// no holder.
 ///
 /// # Errors
-/// The process listing failing.
+/// The process listing or the table read failing, or the check's listener not binding or not
+/// found in the table as this build reads it (`Unsupported`).
 #[cfg(target_vendor = "apple")]
 pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
-    let target = SocketPath::of(path);
-    let mut scan = HolderScan::default();
-    for pid in uid_pids()? {
-        if skip.contains(&pid) {
-            continue;
-        }
-        scan.scanned += 1;
-        match listener_table(pid, &target) {
-            TableRead::Holds => scan.holders.push(pid),
-            TableRead::Clear | TableRead::Exited => {}
-            TableRead::Unreadable => scan.unreadable.push(pid),
+    let check = TableCheck::bind()?;
+    let table = unix_stream_table()?;
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { ffi::geteuid() };
+    let own = aterm_sysprobe::jobs::darwin::UnixListenerRow {
+        pid: std::process::id(),
+        uid: me,
+        path: check.path.as_os_str().as_encoded_bytes(),
+    };
+    listener_holders(
+        aterm_sysprobe::jobs::darwin::unix_listeners(&table).as_deref(),
+        own,
+        &SocketPath::of(path),
+        &uid_pids()?,
+        skip,
+    )
+}
+
+/// The holders one table read's listeners `rows` name ([`scan_listener_holders`]): the pid of
+/// each listener `own`'s user made, bound at a path `target` names, once, when it is `live` and
+/// not in `skip`. `scanned` counts `live` but `skip`.
+///
+/// # Errors
+/// `Unsupported` when `rows` is no table read (`None`), or a read without `own`, the check's
+/// listener: a table this build misreads.
+#[cfg(target_vendor = "apple")]
+fn listener_holders(
+    rows: Option<&[aterm_sysprobe::jobs::darwin::UnixListenerRow<'_>]>,
+    own: aterm_sysprobe::jobs::darwin::UnixListenerRow<'_>,
+    target: &SocketPath,
+    live: &[u32],
+    skip: &[u32],
+) -> io::Result<HolderScan> {
+    let rows = rows.filter(|rows| rows.contains(&own)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the unix-domain stream table is not laid out as this build reads it",
+        )
+    })?;
+    let mut scan = HolderScan {
+        scanned: live.iter().filter(|pid| !skip.contains(pid)).count(),
+        ..HolderScan::default()
+    };
+    for row in rows {
+        let holds = row.uid == own.uid && target.names(row.path);
+        if holds && live.contains(&row.pid) && !skip.contains(&row.pid) && !scan.holds(row.pid) {
+            scan.holders.push(row.pid);
         }
     }
     Ok(scan)
@@ -204,72 +249,106 @@ impl SocketPath {
     }
 }
 
-/// What `pid`'s descriptor table says of a listener at `target`: each socket descriptor's record
-/// read and decoded, until one is a listener bound there.
+/// A listener this process binds for one table read to name ([`scan_listener_holders`]): it
+/// proves the read lays out a path, a user and a pid where this build reads them. Dropping it
+/// removes its file and closes it.
 #[cfg(target_vendor = "apple")]
-fn listener_table(pid: u32, target: &SocketPath) -> TableRead {
-    use aterm_sysprobe::jobs::darwin;
-    let Ok(pid) = i32::try_from(pid) else {
-        return TableRead::Unreadable;
-    };
-    let fds = match list_fds(pid) {
-        Ok(fds) => fds,
-        Err(Failed::Exited) => return TableRead::Exited,
-        Err(Failed::Closed | Failed::Dead | Failed::Refused | Failed::Other) => {
-            return TableRead::Unreadable;
-        }
-    };
-    let mut unreadable = false;
-    for (fd, kind) in fds {
-        if kind != darwin::PROX_FDTYPE_SOCKET {
-            continue;
-        }
-        let read = socket_record(pid, fd).and_then(|record| {
-            darwin::unix_listener(&record)
-                .ok_or(Failed::Other)
-                .map(|bound| bound.is_some_and(|bound| target.names(bound)))
-        });
-        match read {
-            Ok(true) => return TableRead::Holds,
-            Ok(false) | Err(Failed::Closed | Failed::Dead) => {}
-            Err(Failed::Exited) => return TableRead::Exited,
-            Err(Failed::Refused | Failed::Other) => unreadable = true,
-        }
+struct TableCheck {
+    path: std::path::PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(target_vendor = "apple")]
+impl TableCheck {
+    /// In this process's temporary folder, else in `/tmp`, whose sticky bit keeps the file this
+    /// user's: a `TMPDIR` too deep for `sun_path`, missing or closed does not stop the scan.
+    fn bind() -> io::Result<Self> {
+        Self::bind_in(&[std::env::temp_dir(), std::path::PathBuf::from("/tmp")])
     }
-    if unreadable {
-        TableRead::Unreadable
-    } else {
-        TableRead::Clear
+
+    /// The next of this process's check names that binds in the first of `dirs` that takes one:
+    /// a name an earlier process of this pid left behind is passed over, never removed.
+    fn bind_in(dirs: &[std::path::PathBuf]) -> io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let mut last = io::Error::from(io::ErrorKind::AddrInUse);
+        for dir in dirs {
+            for _ in 0..8 {
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = dir.join(format!("aterm-pcb-{}-{n}.sock", std::process::id()));
+                match std::os::unix::net::UnixListener::bind(&path) {
+                    Ok(listener) => {
+                        return Ok(Self {
+                            path,
+                            _listener: listener,
+                        });
+                    }
+                    Err(e) => {
+                        let taken = e.kind() == io::ErrorKind::AddrInUse;
+                        last = e;
+                        if !taken {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Err(last)
     }
 }
 
-/// `pid`'s descriptor `fd`'s `socket_fdinfo` (`PROC_PIDFDSOCKETINFO`), whole.
 #[cfg(target_vendor = "apple")]
-fn socket_record(
-    pid: i32,
-    fd: i32,
-) -> Result<[u8; aterm_sysprobe::jobs::darwin::SOCKET_SIZE], Failed> {
-    use aterm_sysprobe::jobs::darwin;
-    let mut buf = [0u8; darwin::SOCKET_SIZE];
-    let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
-    clear_errno();
-    // SAFETY: `buf` matches the structure size `PROC_PIDFDSOCKETINFO` writes.
-    let got = unsafe {
-        ffi::proc_pidfdinfo(
-            pid,
-            fd,
-            darwin::PROC_PIDFDSOCKETINFO,
-            buf.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if got <= 0 {
-        return Err(Failed::last());
+impl Drop for TableCheck {
+    fn drop(&mut self) {
+        drop(std::fs::remove_file(&self.path));
     }
-    if got != size {
-        return Err(Failed::Other);
+}
+
+/// The kernel's unix-domain stream table ([`aterm_sysprobe::jobs::darwin::UNIX_STREAM_TABLE`]),
+/// read whole: sized, then read into that size with room for streams opened between the two
+/// calls, again when it outgrew that room.
+#[cfg(target_vendor = "apple")]
+fn unix_stream_table() -> io::Result<Vec<u8>> {
+    let name = aterm_sysprobe::jobs::darwin::UNIX_STREAM_TABLE;
+    for _ in 0..4 {
+        let mut len: libc::size_t = 0;
+        // SAFETY: a size query: no buffer, and `len` a live `size_t` the call writes.
+        let sized = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if sized != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut table = vec![0u8; len + len / 4 + 4096];
+        let mut got: libc::size_t = table.len();
+        // SAFETY: `table` is `got` writable bytes; the call writes at most `got` of them and sets
+        // `got` to the count it wrote.
+        let read = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                table.as_mut_ptr().cast(),
+                &raw mut got,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0 {
+            table.truncate(got);
+            return Ok(table);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOMEM) {
+            return Err(err);
+        }
     }
-    Ok(buf)
+    Err(io::Error::other(
+        "the unix-domain stream table outgrew each read's room",
+    ))
 }
 
 /// One walk of this uid's processes except `skip`.
@@ -452,8 +531,8 @@ enum TableRead {
 enum Failed {
     /// `ESRCH`: no such process.
     Exited,
-    /// `EBADF`, or `ENOTSOCK` reading a socket's record: the descriptor was closed, or its
-    /// number reused for another kind, since the listing.
+    /// `EBADF`: the descriptor was closed, or its number reused for another kind, since the
+    /// listing.
     Closed,
     /// `ENOENT`, reading one descriptor or a working directory.
     Dead,
@@ -468,14 +547,13 @@ impl Failed {
     const ESRCH: i32 = 3;
     const EPERM: i32 = 1;
     const EBADF: i32 = 9;
-    const ENOTSOCK: i32 = 38;
     /// A descriptor's or a working directory's read's answer for a dead vnode.
     const ENOENT: i32 = 2;
 
     const fn of(errno: i32) -> Self {
         match errno {
             Self::ESRCH => Self::Exited,
-            Self::EBADF | Self::ENOTSOCK => Self::Closed,
+            Self::EBADF => Self::Closed,
             Self::ENOENT => Self::Dead,
             Self::EPERM => Self::Refused,
             _ => Self::Other,
@@ -981,7 +1059,7 @@ mod win_pids {
         // SAFETY: `info` points to `count` valid `WtsProcessInfoExW` entries.
         let entries = unsafe { std::slice::from_raw_parts(info, count as usize) };
         for e in entries {
-            // SAFETY: `e.pUserSid` and `me` are valid SIDs for the duration of the call.
+            // SAFETY: `e.pUserSid` and `own` are valid SIDs for the duration of the call.
             let same = !e.pUserSid.is_null()
                 && unsafe { ffi::IsValidSid(e.pUserSid) } != 0
                 && unsafe { ffi::EqualSid(own, e.pUserSid) } != 0;
@@ -1164,9 +1242,9 @@ pub use paths::{
 };
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to
-/// make a race certain), read a dead vnode as unknown (for a negative control), and read a
-/// process's working directory as a dead vnode (a scratch folder standing in for a volume
-/// force-unmounted under it).
+/// make a race certain), refuse chosen descriptor reads (`EPERM`), read a dead vnode as unknown
+/// (for a negative control), and read a process's working directory as a dead vnode (a scratch
+/// folder standing in for a volume force-unmounted under it).
 #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
 mod hook {
     use std::cell::Cell;
@@ -1225,8 +1303,8 @@ mod hook {
         }
     }
 
-    /// Every read of a descriptor's vnode a refusal can be shown to be the vnode's of, answered as
-    /// the kernel answers one it keeps from this process.
+    /// The `reads` for [`refusing`] that refuses every read, as the kernel refuses a vnode it
+    /// keeps from this process.
     #[cfg(test)]
     pub const ALWAYS: usize = usize::MAX;
 
@@ -1535,10 +1613,9 @@ mod listing_tests {
         );
     }
 
-    /// The process holding a listener is found by the path that listener is bound at, read from
-    /// the socket's own record, and by a spelling of that path whose folder resolves to the bound
-    /// one. A path the listener's process bound is compared, never resolved: a listener bound
-    /// through a link is found by that spelling alone. A listener bound elsewhere, or closed, is
+    /// A listener is found by the path it is bound at, read from the socket's own record, and by
+    /// a spelling whose folder resolves to that one; a listener bound through a link is found by
+    /// that spelling alone. A listener bound elsewhere, or closed in every process holding it, is
     /// not found.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
@@ -1592,7 +1669,17 @@ mod listing_tests {
         );
         drop((client, accepted, l1));
         std::fs::remove_file(&a).expect("unlink a");
-        let gone = scan(&a);
+        // A child another test is spawning holds a copy of the listener until its exec closes
+        // it, and the socket, its binder named, lives until every copy is closed: the wait is a
+        // hang detector.
+        let started = std::time::Instant::now();
+        let gone = loop {
+            let gone = scan(&a);
+            if !gone.holds(me) || started.elapsed() >= std::time::Duration::from_secs(60) {
+                break gone;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             !gone.holds(me),
             "a closed listener is held by nobody, with another still listening here: {gone:?}"
@@ -2228,19 +2315,90 @@ mod tests {
         assert_eq!(mine(), 0, "closed");
     }
 
-    /// A descriptor that is no socket when its socket record is read (its number reused for a
-    /// file since the listing typed it a socket) holds no listener: it reads as closed, never as
-    /// a refusal that leaves its table unknown.
+    /// One table read's rows name the holders: a live listener of this user's at the target,
+    /// once; not another user's, a dead binder's, a skipped one's or one bound elsewhere. A read
+    /// that is no table, or one without the check's own listener, is refused.
     #[test]
-    fn a_socket_read_of_a_descriptor_that_is_no_socket_is_closed() {
-        use std::os::fd::AsRawFd as _;
-        let pid = i32::try_from(std::process::id()).expect("a pid");
-        let file = std::fs::File::open("/dev/null").expect("/dev/null");
-        assert_eq!(
-            super::socket_record(pid, file.as_raw_fd()).err(),
-            Some(super::Failed::Closed)
+    fn a_table_read_names_its_live_binders_once_it_holds_its_own_listener() {
+        use aterm_sysprobe::jobs::darwin::UnixListenerRow as Row;
+        let row = |pid, uid, path: &'static [u8]| Row { pid, uid, path };
+        let own = row(7, 501, b"/t/aterm-pcb-7-0.sock");
+        let bus = b"/nowhere-folder/bus.sock";
+        let target = super::SocketPath::of(std::path::Path::new("/nowhere-folder/bus.sock"));
+        let rows = [
+            own,
+            row(41, 501, bus),
+            row(41, 501, bus),
+            row(42, 0, bus),
+            row(43, 501, bus),
+            row(44, 501, bus),
+            row(45, 501, b"/nowhere-folder/other.sock"),
+        ];
+        let live = [7, 41, 42, 44, 45, 46];
+        let scan = super::listener_holders(Some(&rows), own, &target, &live, &[44])
+            .expect("a read holding its own listener");
+        assert_eq!(scan.holders, [41], "{scan:?}");
+        assert_eq!(scan.scanned, 5, "the live processes but the skipped one");
+        assert!(
+            scan.unreadable.is_empty() && scan.sealed.is_empty(),
+            "{scan:?}"
         );
-        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-        assert!(super::socket_record(pid, a.as_raw_fd()).is_ok(), "a socket");
+        for refused in [None, Some(&rows[1..])] {
+            let e = super::listener_holders(refused, own, &target, &live, &[])
+                .expect_err("a misread table");
+            assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+        }
+    }
+
+    /// A check folder that refuses the bind (missing, or too deep for `sun_path`) passes it to
+    /// the next; with none that takes it the last refusal is the answer.
+    #[test]
+    fn the_table_check_binds_in_the_first_folder_that_takes_it() {
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let base = dir.path().to_path_buf();
+        let deep = base.join("d".repeat(120));
+        std::fs::create_dir(&deep).expect("a folder too deep for sun_path");
+        let missing = base.join("missing");
+        let check = super::TableCheck::bind_in(&[missing.clone(), deep.clone(), base.clone()])
+            .expect("bound in the folder that takes it");
+        assert_eq!(
+            check.path.parent(),
+            Some(base.as_path()),
+            "{}",
+            check.path.display()
+        );
+        drop(check);
+        assert!(super::TableCheck::bind_in(&[missing, deep]).is_err());
+    }
+
+    /// The check's listener is this process's at its path while it lives, and its file is gone
+    /// once it is dropped.
+    #[test]
+    fn the_table_check_listener_leaves_no_file() {
+        let check = super::TableCheck::bind().expect("a check listener");
+        let path = check.path.clone();
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "{}",
+            path.display()
+        );
+        let table = super::unix_stream_table().expect("the table");
+        let rows = aterm_sysprobe::jobs::darwin::unix_listeners(&table).expect("read as laid out");
+        // SAFETY: `geteuid` is a side-effect-free getter.
+        let uid = unsafe { ffi::geteuid() };
+        assert!(
+            rows.iter().any(|row| row.pid == std::process::id()
+                && row.uid == uid
+                && row.path == path.as_os_str().as_encoded_bytes()),
+            "the table names the check's listener"
+        );
+        drop(check);
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "{}",
+            path.display()
+        );
     }
 }

@@ -43,7 +43,8 @@ struct DoorHost {
     /// The task record's answer to the task door ([`IdleHost::task_fact`]); `None`, a record's:
     /// `noted` for a word, `cleared` for none.
     note: Mutex<Option<NoteOutcome>>,
-    /// A clear can remain fenced while a replacement note is accepted.
+    /// The answer to a clear, apart from `note`'s, so a clear can stay fenced while a
+    /// replacement note is taken; `None`, `note`'s.
     clear_note: Mutex<Option<NoteOutcome>>,
     /// The host's persistent task slot across loop instances: edits alone move its revision.
     record: Mutex<(Option<FactWord>, u64)>,
@@ -2083,11 +2084,8 @@ fn a_successor_says_the_carried_line_ready_idle_when_its_predecessor_would_have(
     );
 }
 
-/// A PERSON AT THE K-TH LOOK HOLDS THE RAISE (the slice-2 plan's D2, S15): a line the write holds
-/// taskless for K looks, whose K-th look's write finds a person's keys, is said ready-idle at no
-/// look: the break leaves its look to the write, whose `status` read the person shows in, and no
-/// word names the line while the person holds it. NEGATIVE CONTROL: the person arriving a look
-/// past the K-th finds the line raised there, taskless, standing on, held now by the person.
+/// A line held taskless for K looks whose K-th write finds a person's keys is said ready-idle at
+/// no look; a person arriving a look later finds it raised, held by the person.
 #[test]
 fn a_person_at_the_kth_look_holds_the_raise() {
     let run = |arrives: usize| {
@@ -2140,12 +2138,9 @@ fn a_person_at_the_kth_look_holds_the_raise() {
     assert!(after.writes().is_empty(), "{:?}", after.writes());
 }
 
-/// A SUCCESSOR COUNTS A CRASHED LINE FROM ITS INTENT, AND A TYPED ONE NOT AT ALL: a nudge whose
-/// write crashed after its intent row (its typed row lost), carried by a successor whose
-/// autopilot holds it, is said ready-idle K looks from that row; the same nudge typed, its typed
-/// row kept beside the same intent row, is the hold's nudge spent, and no word names a line.
-/// NEGATIVE CONTROL: `KUnseeded` counts the crashed line from the successor's first look, ten
-/// looks on.
+/// A nudge whose write crashed after its intent row is said ready-idle K looks from that row;
+/// typed (its typed row kept), it is the hold's nudge spent and no word names it. Negative
+/// control: `KUnseeded` counts from the successor's first look.
 #[test]
 fn a_successor_counts_a_crashed_line_from_its_intent_and_a_typed_one_not_at_all() {
     let first = Script::new("write-k-intent-1", Occupancy::Prompt, &[0, 31 * 60]).run(&mut nothing);
@@ -2209,10 +2204,8 @@ fn a_successor_counts_a_crashed_line_from_its_intent_and_a_typed_one_not_at_all(
     );
 }
 
-/// OF TWO LINES STANDING RAISED, THE WORD NAMES THE ONE DUE LONGEST: a person's exchange holds the
-/// nudge from 30 minutes and the room line from two hours, each past K looks by the last read (at
-/// three hours), and every word from the nudge's raise on names the nudge, from its first look:
-/// none moves to the room line at its own raise.
+/// With the nudge raised from 30 minutes and the room line from two hours, every word from the
+/// nudge's raise on names the nudge.
 #[test]
 fn of_two_lines_raised_the_word_names_the_one_due_longest() {
     let at_s: Vec<i64> = (0..=18).map(|i| i * 10 * 60).collect();
@@ -2326,12 +2319,9 @@ fn row(rule: &str, decision: &str) -> (String, String) {
     (rule.to_string(), decision.to_string())
 }
 
-/// THE MANAGER DOOR (the slice-2 plan's D1, W3): under `prompt` a managed Cruise worker's due
-/// room line, held by the managed guard alone, is noted once on its task record — its intent
-/// row, one `task_fact` with the episode's word, its `noted` row — and never typed, however many
-/// breaks stand past due. NEGATIVE CONTROLS: `NoteAndType` (the managed guard dropped from the
-/// break's guards) sends the line as well as noting it, and `NoteEachBreak` notes the episode at
-/// every break past due.
+/// Under `prompt` a managed Cruise worker's due room line, held by the managed guard alone, is
+/// noted once on its task record (intent row, one `task_fact`, `noted` row) and never typed.
+/// Negative controls: `NoteAndType` also sends it, `NoteEachBreak` notes it at every break.
 #[test]
 fn a_managed_cruise_workers_due_room_line_is_noted_once_and_never_typed() {
     let ran = managed_room(
@@ -2458,9 +2448,8 @@ fn the_holds_close_clears_the_word_the_door_noted() {
     );
 }
 
-/// Under Land a managed worker's due nudge is held by the autopilot's guard too, so the task
-/// door notes nothing: no line would have gone but for the manager. NEGATIVE CONTROL:
-/// `NoteOnManagedAlone` (the managed guard's verdict alone asked) notes it.
+/// Under Land the autopilot's guard holds a managed worker's due nudge too, so the task door
+/// notes nothing. Negative control: `NoteOnManagedAlone` notes it.
 #[test]
 fn a_land_workers_managed_nudge_is_never_noted() {
     let run = |tag: &str| {
@@ -2481,9 +2470,9 @@ fn a_land_workers_managed_nudge_is_never_noted() {
     );
 }
 
-/// T-obs2 for the task door: under `observe` a managed Cruise worker's due nudge books one
-/// would-be note (`fact-would@v1 … door=task`) however many breaks stand past due, and asks the
-/// host nothing; under `off`, nothing at all. NEGATIVE CONTROL: `NoteUnderObserve` asks it.
+/// Under `observe` a managed Cruise worker's due nudge books one would-be note
+/// (`fact-would@v1 … door=task`) and asks the host nothing; under `off`, nothing at all.
+/// Negative control: `NoteUnderObserve` asks it.
 #[test]
 fn under_observe_the_task_door_books_a_would_row_and_asks_nothing() {
     let run = |tag: &str, occupancy| {
@@ -2911,7 +2900,7 @@ fn a_runtime_close_retires_seeded_task_custody_before_a_new_hold_opens() {
 
 /// A standing word seeded with a hold open is taken up as the hold's (`DoorWatch::task_word`):
 /// that hold's close clears it under `prompt`, its row booked, and asks nothing under `observe`.
-/// CONTROL: the same close with no word seeded asks no clear, so the seeded word alone made it.
+/// Control: the same close with no word seeded asks no clear.
 #[test]
 fn a_word_seeded_under_an_open_hold_is_cleared_at_that_holds_close() {
     let word = FactWord::new(RuleId::HoldRoom, 1);
@@ -2953,12 +2942,9 @@ fn a_word_seeded_under_an_open_hold_is_cleared_at_that_holds_close() {
     );
 }
 
-/// A TAPE SLICE 2'S DOORS DID NOT RECORD HAS NO TASK DOOR (the slice-2 plan's F2 and D7): on a
-/// replay whose header names a slice-1 build's doors, a line the managed guard alone holds is no
-/// task door's (`door_task_due`), and a word the record carries at the seed is not cleared
-/// (`door_task_seed`), so such a tape's loop asks `host.task_fact` nothing it never recorded.
-/// NEGATIVE CONTROL: the same loop under a header with slice 2's doors in takes the line and asks
-/// the clear (answered `fenced`, so it books no row).
+/// On a replay whose header names a slice-1 build's doors, the task door neither takes a line
+/// (`door_task_due`) nor clears a seeded word (`door_task_seed`), so the loop asks
+/// `host.task_fact` nothing the tape never recorded; with slice 2's doors it does both.
 #[test]
 fn a_tape_without_slice_twos_doors_has_no_task_door() {
     use crate::supervise::occupancy::rules::{Guards, HoldSeen, Verdict};
@@ -3011,14 +2997,10 @@ fn a_tape_without_slice_twos_doors_has_no_task_door() {
     );
 }
 
-/// A MANAGED WORKER'S LINE BEFORE THE LOOP'S FIRST FOLD (its first turn, or a loop that carried
-/// an open hold; 2.4's safety review): the record no fold has read yet is read once, at the write
-/// past the owner's grant (`Session::managed_at_write`), and the managed guard holds the due
-/// nudge there; the next break notes it on the record, and nothing is typed. A read the server
-/// turned away holds the line, and the next write reads again. Under `observe` and `off` the
-/// record is not read. NEGATIVE CONTROLS: `ManagedUnread` (no read at the write) types the nudge
-/// into the managed worker, and a session with no task record is typed it after the same one
-/// read.
+/// Before the loop's first fold the task record is read once, at the write past the owner's
+/// grant (`Session::managed_at_write`), and the managed guard holds the due nudge; the next break
+/// notes it and nothing is typed. A refused read holds the line until the next write reads
+/// again; `observe` and `off` read nothing. Negative control: `ManagedUnread` types the nudge.
 #[test]
 fn a_managed_workers_line_before_its_first_fold_is_held_by_the_record_read_at_the_write() {
     let working = Some((

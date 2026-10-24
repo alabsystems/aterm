@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session spawning, PTY reader lifecycle, shell integration setup, and child proxy recursion provisioning.
+//! Session spawning, PTY reader lifecycle, shell integration setup and child proxy provisioning.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,10 +18,10 @@ use crate::{
     term_lock,
 };
 
-/// The shell-integration loader's load-once guard variable, which the shipped zsh/bash scripts check and then export.
+/// The integration loader's load-once guard, which the shipped zsh/bash scripts check and export.
 pub(crate) const SHELL_INTEGRATION_LOADED_GUARD: &str = "ATERM_SHELL_INTEGRATION_INSTALLED";
 
-/// The runtime outcome of the most recent shell-integration preparation, as opposed to the advertised capability constant.
+/// The runtime outcome of the last shell-integration preparation (not the advertised capability).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellIntegrationOutcome {
     /// The loader was written and injected.
@@ -30,14 +30,16 @@ pub(crate) enum ShellIntegrationOutcome {
     UnknownShell(String),
     /// The loader cache could not be written (the `std::io::Error` text).
     WriteFailed(String),
-    /// Config `shell_args` ask for a start no integration can stand in for (a command, a script, POSIX mode, …).
+    /// Config `shell_args` ask for a start no integration can stand in for (a command, a
+    /// script, POSIX mode, …).
     ArgsBypass(String),
 }
 
 static SHELL_INTEGRATION_OUTCOME: std::sync::Mutex<Option<ShellIntegrationOutcome>> =
     std::sync::Mutex::new(None);
 
-/// The recorded runtime outcome, `None` before any integrated spawn was attempted (e.g. an `-e <cmd>`-only run, where no promise is broken because no interactive shell exists to type into).
+/// The recorded runtime outcome; `None` before any integrated spawn was attempted (an
+/// `-e <cmd>`-only run has no interactive shell to integrate).
 pub(crate) fn shell_integration_outcome() -> Option<ShellIntegrationOutcome> {
     SHELL_INTEGRATION_OUTCOME
         .lock()
@@ -79,9 +81,12 @@ static AGENT_PRIME_RELEASED: AtomicBool = AtomicBool::new(false);
 /// What asks for a primer pass ([`prime_agents_if_due`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrimeCue {
-    /// A windowed aterm's launch, once it holds the sessions it will run and before the first of them is spawned or adopted.
+    /// A windowed aterm's launch, once it holds the sessions it will run and before the first
+    /// of them is spawned or adopted.
     Launch,
-    /// A session spawn: `adopted` when it re-adopts a running shell (a seamless update's handoff, the keeper), `spare` when it is a warm spare nobody has asked for yet ([`crate::spare`]).
+    /// A session spawn: `adopted` when it re-adopts a running shell (a seamless update's
+    /// handoff, the keeper), `spare` when it is a warm spare nobody has asked for yet
+    /// ([`crate::spare`]).
     Spawn { adopted: bool, spare: bool },
     /// A warm spare adopted into a tab.
     SpareAdopted,
@@ -112,7 +117,8 @@ pub(crate) enum AgentPrimeOutcome {
     Disabled,
     /// `$HOME` is unset or empty.
     NoHome,
-    /// This process runs from an app bundle that is not the release `aterm.app` (a dev bundle from `ship dev-app`, a renamed copy).
+    /// This process runs from an app bundle that is not the release `aterm.app` (a dev bundle
+    /// from `ship dev-app`, a renamed copy).
     NotReleaseBundle,
     Ran(aterm_primer::AutoPrime),
 }
@@ -221,7 +227,8 @@ fn handoff_committed() -> bool {
 
 /// Prime detected coding agents if `cue` starts a pass ([`PrimeSchedule::admit`]).
 pub(crate) fn prime_agents_if_due(cue: PrimeCue) {
-    // Unit tests construct `App`s that reach spawn seams, and headless instances are tests and agents' private instances: neither may write the `$HOME` it happened to inherit.
+    // Unit tests reach spawn seams, and headless instances are tests' and agents' private
+    // instances: neither may write the `$HOME` it inherited.
     if !agent_prime_permitted(cfg!(test), HEADLESS_INSTANCE.load(Ordering::Acquire)) {
         return;
     }
@@ -234,7 +241,8 @@ pub(crate) fn prime_agents_if_due(cue: PrimeCue) {
     }
 }
 
-/// The launch's first frame is on glass (a headless instance, which has none, asks at its first park).
+/// The launch's first frame is on glass: start the pass held until then (a headless instance,
+/// which has none, calls this at its first park).
 pub(crate) fn release_held_prime() {
     if AGENT_PRIME_RELEASED.load(Ordering::Acquire)
         || AGENT_PRIME_RELEASED.swap(true, Ordering::AcqRel)
@@ -419,7 +427,7 @@ pub(crate) struct ShellSubstitute {
     pub(crate) program: String,
     /// The line the pane shows above the substitute's first prompt.
     pub(crate) notice: String,
-    /// `SHELL` for the child when the broken shell came from `$SHELL`, which the child would otherwise inherit.
+    /// `SHELL` for the child when the broken shell came from `$SHELL`, which it would inherit.
     pub(crate) shell_env: Option<(String, String)>,
 }
 
@@ -544,14 +552,15 @@ mod records_shell_start_tests {
     }
 }
 
-/// Everything `spawn_session` needs to stand up a new tab's shell session, captured once at startup.
+/// Everything `spawn_session` needs to stand up a new tab's shell session, captured at startup.
 #[derive(Clone)]
 pub(crate) struct SessionFactory {
     pub(crate) spawn_cap: aterm_cap::Cap<aterm_cap::effects::Spawn>,
     pub(crate) sandbox_cap: aterm_cap::Cap<aterm_sandbox::Sandbox>,
     /// Terminal-identity env (term/colorterm/lang/…) shared by every tab.
     pub(crate) env_add: Vec<(String, String)>,
-    /// `-e <cmd>`: run this instead of `$SHELL` (also disables shell integration), as the OS's argv gave it ([`crate::cli::Cli::exec_command`]).
+    /// `-e <cmd>`: run this instead of `$SHELL` (no shell integration), as the OS's argv gave it
+    /// ([`crate::cli::Cli::exec_command`]).
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
     /// Config `shell` / `--shell`.
     pub(crate) shell_override: Option<String>,
@@ -561,13 +570,14 @@ pub(crate) struct SessionFactory {
     pub(crate) cwd: Option<String>,
     /// OS-sandbox wrap (macOS Seatbelt sbpl).
     pub(crate) sandbox_wrap: Option<String>,
-    /// Engine config (scrollback/cursor/theme/palette) applied to each tab's `Terminal`, byte-identical to the single-session path.
+    /// Engine config (scrollback/cursor/theme/palette) applied to each tab's `Terminal`.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
     /// Whether to inject OSC 133/633 shell integration, with a fresh nonce per tab.
     pub(crate) integrate: bool,
     /// Latency epoch shared across tabs.
     pub(crate) lat_epoch: Instant,
-    /// The event loop's turn state ([`LoopIdle`]), stamped by the main thread and read by every tab's PTY reader ([`gated_output_wake`]).
+    /// The event loop's turn state ([`LoopIdle`]), stamped by the main thread and read by every
+    /// tab's PTY reader ([`gated_output_wake`]).
     pub(crate) loop_idle: Arc<LoopIdle>,
     /// Desktop-notification channel shared by every tab (bounded, `notify::NOTIFY_QUEUE_CAP`).
     pub(crate) notify_tx: std::sync::mpsc::SyncSender<notify::NotifyMsg>,
@@ -579,17 +589,27 @@ pub(crate) struct SessionFactory {
     pub(crate) defer_adopted_readers: bool,
     /// A tab spawned off the event loop (`tab_spawn`).
     pub(crate) reader_after_install: bool,
-    /// The foreground-process-group probe each PTY gather samples for the foreground handback, and the status sweep reads for the group in front (`App::observe_session_statuses`).
+    /// The foreground-group probe each PTY gather samples for the foreground handback and the
+    /// status sweep reads for the group in front (`App::observe_session_statuses`).
     pub(crate) fg_probe: fn(i32) -> i32,
-    /// Whether a foreground group is gone, the liveness half of the foreground handback (a stopped job, or `gdb -tui` handing the terminal to its inferior, still runs and keeps its modes).
+    /// Whether a foreground group is gone: the liveness half of the foreground handback (a
+    /// stopped job, or `gdb -tui` handing the terminal to its inferior, still runs and keeps its
+    /// modes).
     pub(crate) fg_gone: crate::foreground_handback::FgGone,
-    /// Whether the shell `pid` runs a program it started at or after a wall-clock instant (unix epoch ms) where the foreground group cannot show it.
+    /// Whether the shell `pid` runs a program it started at or after a wall-clock instant (unix
+    /// epoch ms) where the foreground group cannot show it.
     pub(crate) program_probe: fn(i32, u64) -> bool,
-    /// The kernel's name for the leader of foreground group `pgid` when no other process is in its group, read when a file citation asks whether a shell in front is the one a person types into (`path_link::runs_here`).
+    /// The kernel's name for the leader of foreground group `pgid` when it is alone in its
+    /// group: a file citation asks it whether the shell in front is the one a person types into
+    /// (`path_link::runs_here`).
     pub(crate) lone_leader: fn(i32) -> Option<String>,
-    /// Whether the program leading foreground group `pgid` has handed the terminal to another program in its group, asked when a bare Ctrl-r/Ctrl-s decides whether an agent's composer owns it (`App::front_agent_composer`).
+    /// Whether the leader of foreground group `pgid` has handed the terminal to another program
+    /// in its group: a bare Ctrl-r/Ctrl-s asks it to decide whether an agent's composer owns the
+    /// key (`App::front_agent_composer`).
     pub(crate) handed_terminal: fn(i32) -> bool,
-    /// The image of foreground group `pgid`'s leader (card engine §3.4), read by each PTY gather at a foreground edge (given no last image) and by the parse stage's byte arm (given the group's last, which the read keeps for an unchanged process).
+    /// The image of foreground group `pgid`'s leader (card engine §3.4), read by each PTY gather
+    /// at a foreground edge (given no last image) and by the parse stage's byte arm (given the
+    /// group's last, which the read keeps for an unchanged process).
     pub(crate) edge_image: crate::holder_image::ReadImage,
     /// The edged inbox (card engine §3.5).
     pub(crate) edge_inbox: crate::holder_image::EdgeInbox,
@@ -598,22 +618,27 @@ pub(crate) struct SessionFactory {
     /// Each PTY reader's process watch on its shell (card engine §3.3), made at attach.
     #[cfg(unix)]
     pub(crate) proc_watch: fn(i32) -> Option<aterm_uds::procwatch::ProcWatch>,
-    /// The shell's live children, read after a restore for the groups its carried stopped drawers lead ([`shell_children`]).
+    /// The shell's live children, read after a restore for the groups its carried stopped
+    /// drawers lead ([`shell_children`]).
     #[cfg(unix)]
     pub(crate) shell_children: fn(i32) -> Vec<i32>,
-    /// Whether each PTY reader runs the dev `card-seen` probe ([`crate::holder_image::card_probe_requested`]).
+    /// Whether each PTY reader runs the dev `card-seen` probe
+    /// ([`crate::holder_image::card_probe_requested`]).
     pub(crate) card_probe: bool,
     /// Overlap handoff (incoming side), armed like [`Self::defer_adopted_readers`].
     pub(crate) rekey_deferred: Option<Arc<crate::shell_rekey::Deferred>>,
-    /// A warm spare's spawn (`crate::spare`), set only on the `aterm-spare` thread's factory copy, like [`Self::reader_after_install`].
+    /// A warm spare's spawn (`crate::spare`), set only on the `aterm-spare` thread's factory
+    /// copy, like [`Self::reader_after_install`].
     pub(crate) spare: Option<crate::spare::SpareSpawn>,
-    /// The light/dark side of the theme this spawn's session will draw, where it draws one of its own (`App::spawn_shell_appearance`).
+    /// The light/dark side of the theme this spawn's session will draw, where it draws one of
+    /// its own (`App::spawn_shell_appearance`).
     #[cfg(windows)]
     pub(crate) shell_appearance: Option<aterm_types::Appearance>,
 }
 
 impl SessionFactory {
-    /// What a spare spawned by this factory shares with a cold tab spawned by it now (`crate::spare`'s gate G4).
+    /// What a spare spawned by this factory shares with a cold tab spawned by it now
+    /// (`crate::spare`'s gate G4).
     pub(crate) fn spawn_fingerprint(&self) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
         let Self {
@@ -701,7 +726,7 @@ pub(crate) fn adopted_handoff_commit(
     rekey_deferred.filter(|_| adopted && !recovered).cloned()
 }
 
-/// Whether `s` is a well-formed session id (`s-` + 20 lower-case hex chars / 80 bits), the shape [`SessionId::generate`] produces.
+/// Whether `s` is a session id as [`SessionId::generate`] makes one: `s-` + 20 lower-case hex.
 pub(crate) fn is_valid_session_id(s: &str) -> bool {
     s.len() == 22 && aterm_types::control_request::Sid::parse(s).is_some()
 }
@@ -948,7 +973,8 @@ pub(crate) fn provision_observe_env(origin_sid: &SessionId) -> Vec<(String, Stri
     )]
 }
 
-/// Mint a fresh child identity and the three per-op capability edges (read/write/signal) this session grants over the child it is about to host.
+/// Mint a fresh child identity and the three per-op capability edges (read/write/signal) this
+/// session grants over the child it is about to host.
 pub(crate) fn provision_child_recursion_env() -> (Vec<(String, String)>, ChildProvision) {
     use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_SESSION_ID};
     let prov = ChildProvision {
@@ -1027,7 +1053,8 @@ pub(crate) fn provision_child_files(
     (env, prov, edge_file)
 }
 
-/// Insert the parent-preminted edges into a child-side [`EdgeTable`] from the injected env values, binding each to the child's `self_id` (dst) and `nonce`.
+/// Insert the parent-preminted edges from the injected env values into a child-side
+/// [`EdgeTable`], binding each to the child's `self_id` (dst) and `nonce`.
 pub(crate) fn install_parent_edges(
     table: &mut EdgeTable,
     self_id: &SessionId,
@@ -1098,12 +1125,16 @@ impl HandedMaster {
         self.0
     }
 
-    /// Adopt the master: move it into its session byte sink ([`master_sink`]), re-arming `FD_CLOEXEC` first (the outgoing process cleared it to survive the exec; left clear it would leak into every later subprocess).
+    /// Adopt the master into its session byte sink ([`master_sink`]), re-arming `FD_CLOEXEC`
+    /// first: the outgoing process cleared it to survive the exec, and left clear it would leak
+    /// into every later subprocess.
     pub(crate) fn into_sink(self) -> Arc<SinkWriter> {
         #[cfg(unix)]
         let _ = aterm_pty::set_cloexec(self.0, true);
         let master = std::mem::ManuallyDrop::new(self).0;
-        // SAFETY: `master` is the handed-off descriptor this handle owned solely (`HandedMaster::new` takes ownership, and nothing else closes it); the `ManuallyDrop` above gave that ownership up to the sink.
+        // SAFETY: `master` is the handed-off descriptor this handle owned solely
+        // (`HandedMaster::new` takes ownership and nothing else closes it); the `ManuallyDrop`
+        // above gave that ownership up to the sink.
         unsafe { master_sink(master) }
     }
 }
@@ -1132,9 +1163,9 @@ unsafe fn master_sink(master: i32) -> Arc<SinkWriter> {
 
 /// A live session handed across a seamless-update re-exec.
 pub(crate) struct Adopted {
-    /// The outgoing session's pool id, so the incoming boot places this shell back into its original pane.
+    /// The outgoing session's pool id, so the incoming boot puts this shell back in its pane.
     pub local_id: u64,
-    /// The PTY master fd inherited across the exec (cloexec was cleared before it), owned until [`spawn_session`] moves it into the session's sink.
+    /// The PTY master inherited across the exec, owned until [`spawn_session`] moves it to a sink.
     pub master: HandedMaster,
     /// The (still-running) child shell's pid == pgid.
     pub pid: i32,
@@ -1142,47 +1173,58 @@ pub(crate) struct Adopted {
     pub sid: SessionId,
     /// The session's restored launch nonce.
     pub nonce: LaunchNonce,
-    /// Screen carry: the outgoing engine's checkpoint, hydrated before the reader starts so the window shows the pre-update screen.
+    /// Screen carry: the outgoing engine's checkpoint, hydrated before the reader starts so the
+    /// window shows the pre-update screen.
     pub checkpoint: Option<aterm_core::terminal::TerminalCheckpoint>,
     /// Control carry (`crate::handoff_carry`).
     pub control: Option<crate::handoff_carry::ControlCarry>,
     /// `checkpoint` is not the program's last screen.
     pub repaint: bool,
-    /// This shell was spawned by a build before self-healing sessions (`session_store::predates_path_self_heal`).
+    /// This shell predates self-healing sessions (`session_store::predates_path_self_heal`).
     pub frozen_path: bool,
-    /// Broadcast opt-ins: the record's `topic add` set as `"<topic> <since>"` rows, already validated, re-seeded onto the adopted `SessionFabric` so a seamless update does not unsubscribe an agent from its topics.
+    /// Broadcast opt-ins: the record's validated `topic add` set as `"<topic> <since>"` rows,
+    /// re-seeded onto the adopted `SessionFabric` so an update keeps an agent's topics.
     pub topics: Vec<String>,
-    /// The process group the outgoing reader last saw holding the terminal (`SessionRecord::fg_holder`).
+    /// The process group the outgoing reader last saw in front (`SessionRecord::fg_holder`).
     pub fg_holder: i32,
     /// The record says this shell reads a re-key file at every prompt (`shell_rekey`).
     pub rekey: bool,
-    /// The record says this shell runs an integration loader that reads a body pointer at every prompt (`shell_body`).
+    /// The record says this shell runs an integration loader that reads a body pointer at
+    /// every prompt (`shell_body`).
     pub loader: bool,
     /// History carry (`crate::handoff_history`).
     pub history: crate::handoff_history::AdoptedHistory,
-    /// The handoff record's `"<origin> <reason>"` hold rows, unparsed, one per standing origin (`SessionRecord::hold_rows`, or a keeper meta's).
+    /// The handoff record's `"<origin> <reason>"` hold rows, unparsed, one per standing origin
+    /// (`SessionRecord::hold_rows`, or a keeper meta's).
     pub holds: Vec<String>,
     /// The fallback title for a checkpoint that carried no title of its own.
     pub title: String,
     /// Another supervisor's lease, the record's `"<holder> <remaining_ms>"` row, unparsed.
     pub supervisor: Option<String>,
-    /// The record's keyed escalations (`"<owner> <pct-text>"` attention rows), unparsed, seeded beside the lease.
+    /// The record's keyed escalations (`"<owner> <pct-text>"` attention rows), unparsed, seeded
+    /// beside the lease.
     pub attention_owners: Vec<String>,
-    /// Whether this build's in-GUI host holds off the session for its adopted-claim grace (`SessionRecord::claim_grace`).
+    /// Whether this build's in-GUI host holds off the session for its adopted-claim grace
+    /// (`SessionRecord::claim_grace`).
     pub claim_grace: bool,
-    /// The build that handed this shell across (the manifest's `outgoing_build`; `None` from a producer that wrote none), named by the handoff gap each of the session's recorders opens with ([`mark_handoff_gap`]).
+    /// The build that handed this shell across (the manifest's `outgoing_build`; `None` from a
+    /// producer that wrote none), named by each recorder's handoff gap ([`mark_handoff_gap`]).
     pub outgoing_build: Option<u64>,
     /// The PTY keeper's copy.
     pub keeper: Option<crate::keeper_link::Claim>,
-    /// The render debt: what the outgoing engine owed the alternate screen this session restores onto (rows moved, drawn columns cut) (`SessionRecord::render_debt`), only when non-zero and the screen was carried.
+    /// The render debt the outgoing engine owed the alternate screen this session restores onto
+    /// (rows moved, drawn columns cut; `SessionRecord::render_debt`), only when non-zero and the
+    /// screen was carried.
     pub render_debt: Option<aterm_core::terminal::RenderDebt>,
     /// The mailbox the handoff carried.
     pub fabric: crate::fabric::FabricCarry,
     /// The record's newest timeline id.
     pub timeline_id: u64,
-    /// The session log's epoch, node-id counters and seq count the record carried (`SessionRecord::log_ids`, `SessionRecord::log_seq`).
+    /// The session log's epoch, node-id counters and seq count the record carried
+    /// (`SessionRecord::log_ids`, `SessionRecord::log_seq`).
     pub log: crate::session_log::LogAdopt,
-    /// The pair the crash journal image this window takes over at its Commit keys this shell by, when the outgoing process held an image that was not its own (`SessionRecord::journal_key`).
+    /// The pair the crash journal image this window takes over at its Commit keys this shell
+    /// by, when the outgoing process held an image not its own (`SessionRecord::journal_key`).
     pub journal_key: Option<(u32, u64)>,
     /// The record's task row (`SessionRecord::task`), unparsed.
     pub task: Option<String>,
@@ -1192,7 +1234,9 @@ pub(crate) struct Adopted {
     pub wakes: Option<String>,
 }
 
-/// A seamless update's carried end, or a proven self-claim's carried face, onto an adopted session's timeline, before the session is registered (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8).
+/// Seed a seamless update's carried end, or a proven self-claim's carried face, onto an adopted
+/// session's timeline before the session is registered
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8).
 pub(crate) fn seed_adopted_end(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     row: Option<&str>,
@@ -1228,7 +1272,8 @@ pub(crate) fn seed_adopted_rows(
     crate::occupancy_wakes::seed_carried(id, ctx.self_id.as_str(), wakes);
 }
 
-/// Mark an adopted session's timeline, cast and temporal recorder as starting at the handoff ([`crate::session_timeline::HandoffGap`]), since none of them crosses the update.
+/// Mark an adopted session's timeline, cast and temporal recorder as starting at the handoff
+/// ([`crate::session_timeline::HandoffGap`]), since none of them crosses the update.
 pub(crate) fn mark_handoff_gap(
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     cast: &std::sync::Mutex<crate::cast::CastRecorder>,
@@ -1256,7 +1301,8 @@ pub(crate) fn mark_handoff_gap(
         .mark_handoff(gap);
 }
 
-/// Restore the broadcast opt-ins and standing halt a seamless update carried onto the adopting session's `SessionFabric`.
+/// Restore the broadcast opt-ins and standing halt a seamless update carried onto the adopting
+/// session's `SessionFabric`.
 pub(crate) fn seed_adopted_fabric(
     fabric: &crate::fabric::SessionFabric,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
@@ -1274,7 +1320,8 @@ pub(crate) fn seed_adopted_fabric(
     fabric.seed_carry(carry, timeline);
 }
 
-/// Authorize the adopted shell's nonce on the successor engine after `restore_checkpoint` restored `require_shell_integration_nonce`.
+/// Authorize the adopted shell's nonce on the successor engine after `restore_checkpoint`
+/// restored `require_shell_integration_nonce`.
 pub(crate) fn authorize_adopted_shell_nonce(
     engine: &mut aterm_core::terminal::Terminal,
     cp: &aterm_core::terminal::TerminalCheckpoint,
@@ -1383,7 +1430,9 @@ pub(crate) fn fit_adopted_log(
         .slog_fit_engine(next_block, started);
 }
 
-/// Install an adopted session's carried archive ([`hydrate_adopted_engine`]), and say so when it carried rows that were refused (`AltArchive::import`: an archive switched off here, or indices no archive reaches), so a fresh `offscreen` after the update is named in the log.
+/// Install an adopted session's carried archive ([`hydrate_adopted_engine`]), logging rows it
+/// refused (`AltArchive::import`: the archive is off here, or the indices reach past it) so a
+/// fresh `offscreen` after the update is explained.
 pub(crate) fn install_adopted_archive(
     engine: &mut aterm_core::terminal::Terminal,
     control: crate::handoff_carry::ControlCarry,
@@ -1402,7 +1451,7 @@ pub(crate) fn install_adopted_archive(
     }
 }
 
-/// The temporal recorder's first keyframe of session `id`'s engine, taken before its reader runs.
+/// Take the temporal recorder's first keyframe of session `id`'s engine before its reader runs.
 pub(crate) fn seed_temporal_keyframe(
     term: &Mutex<Terminal>,
     temporal: &std::sync::Mutex<crate::temporal::TemporalRecorder>,
@@ -1430,7 +1479,9 @@ pub(crate) fn seed_temporal_keyframe(
     true
 }
 
-/// Install the fallback title (`record_title`: [`Adopted::title`], the park's layout title or the handoff record's copy) when the checkpoint carried none, via `Terminal::restore_title` (capped, controls stripped, title epoch bumped).
+/// Install the fallback title (`record_title`: [`Adopted::title`], the park's layout title or
+/// the handoff record's copy) when the checkpoint carried none, via `Terminal::restore_title`
+/// (capped, controls stripped, title epoch bumped).
 pub(crate) fn seed_adopted_title(
     term: &Mutex<Terminal>,
     checkpoint: Option<&aterm_core::terminal::TerminalCheckpoint>,
@@ -1446,7 +1497,10 @@ pub(crate) fn seed_adopted_title(
     true
 }
 
-/// The console-host keyboard posture of the PTY behind `master` ([`Terminal::set_console_host_posture`]), keyed on the resize seam policy the session resizes under ([`crate::app_render::pty_resize_policy`]), so a `cast drift` replay under that policy rebuilds the same engine.
+/// The console-host keyboard posture of the PTY behind `master`
+/// ([`Terminal::set_console_host_posture`]), keyed on the resize policy the session resizes
+/// under ([`crate::app_render::pty_resize_policy`]), so a `cast drift` replay under that policy
+/// rebuilds the same engine.
 pub(crate) fn apply_pty_keyboard_posture(term: &Mutex<Terminal>, master: i32) {
     let policy = crate::app_render::pty_resize_policy(master);
     let host = aterm_pty::conpty_host(master);
@@ -1720,7 +1774,8 @@ pub(crate) fn spawn_session(
                     shell_version = crate::spare::shell_version(pid);
                 }
                 start.say();
-                // SAFETY: `master` is this session's forkpty master, freshly returned and owned solely here; the sink takes it over.
+                // SAFETY: `master` is this session's forkpty master, freshly returned and owned
+                // solely here; the sink takes it over.
                 let sink = unsafe { master_sink(master) };
                 (
                     master,
@@ -1859,7 +1914,7 @@ pub(crate) fn spawn_session(
             &mut adopt_history,
         );
         adopt_history.watch_input(&ctx.output_echo);
-        // A restored block can be running: the jobs feed holds it before any reading, even
+        // The jobs feed holds a restored block that can be running before any reading, even
         // while this session's reader waits to start.
         ctx.job_feed
             .fed(&term_lock(&term), &[], false, Instant::now);
@@ -2200,7 +2255,8 @@ impl Drop for PulseRestore {
     }
 }
 
-/// Seed the restored engine with the render debt its predecessor carried (`Adopted::render_debt`) and let the resize ledger look at it once, at attach.
+/// Seed the restored engine with the render debt its predecessor carried
+/// (`Adopted::render_debt`) and let the resize ledger look at it once, at attach.
 pub(crate) fn seed_adopted_render_debt(
     term: &Arc<Mutex<aterm_core::terminal::Terminal>>,
     timeline: &Mutex<crate::session_timeline::SessionTimeline>,
@@ -2217,7 +2273,7 @@ pub(crate) fn seed_adopted_render_debt(
         .evaluate_resizes(probe, crate::turn_ledger::now_ms());
 }
 
-/// Whether an adopted session's PTY gets the rows-1 → rows size pulse that makes its program redraw.
+/// Whether an adopted session's PTY gets the rows-1 → rows pulse that makes its program redraw.
 #[cfg(any(unix, test))]
 pub(crate) fn adoption_needs_size_pulse(
     checkpoint: Option<&aterm_core::terminal::TerminalCheckpoint>,
@@ -2478,7 +2534,8 @@ mod pty_keyboard_posture_tests {
                 name: *const u16,
             ) -> isize;
         }
-        // SAFETY: NULL attrs and name; manual-reset, initially unsignaled. `adopt_handoff` owns the handle from its `Ok` on.
+        // SAFETY: NULL attrs and name; manual-reset, initially unsignaled. `adopt_handoff` owns
+        // the handle from its `Ok` on.
         let client = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
         assert_ne!(client, 0, "CreateEventW");
         let master = aterm_pty::adopt_handoff(0, 0, 0, client)
@@ -2766,7 +2823,8 @@ impl DeferredReaderGate {
         self.inner.parked.load(Ordering::Acquire)
     }
 
-    /// Point-of-no-failure release, after the parent's Commit or once a tab spawned off the loop is registered (`tab_spawn`).
+    /// Point-of-no-failure release, after the parent's Commit or once a tab spawned off the
+    /// loop is registered (`tab_spawn`).
     pub(crate) fn release(&self) {
         self.inner.open.store(true, Ordering::Release);
         self.inner.ready.notify_all();
@@ -3271,7 +3329,8 @@ pub(crate) fn attach_reader(
     result
 }
 
-/// [`attach_reader`] with the reader's posts going to `post` (a warm spare's link, `crate::spare::SpareLink::post`, or a spawn's [`WakeTarget`]).
+/// [`attach_reader`] with the reader's posts going to `post` (a warm spare's link,
+/// `crate::spare::SpareLink::post`, or a spawn's [`WakeTarget`]).
 pub(crate) fn attach_reader_with_post(
     session: &mut Session,
     window: WindowId,
@@ -3332,7 +3391,8 @@ fn attach_reader_inner(
     factory: &SessionFactory,
     start_gate: Option<DeferredReaderGate>,
 ) -> Result<(), String> {
-    // A previous reader still winding down (a park that missed its deadline): wait it out — two readers on one master interleave bytes and corrupt both engines.
+    // A previous reader still winding down (a park that missed its deadline) is waited out:
+    // two readers on one master interleave bytes and corrupt both engines.
     if let Some(join) = session.reader_join.take() {
         let _ = join.join();
     }
@@ -3479,7 +3539,8 @@ fn attach_reader_inner(
     Ok(())
 }
 
-/// True when a parked/deferred session can be reattached without blocking the caller on either its old PTY reader or temporal writer.
+/// True when a parked or deferred session can be reattached without blocking the caller on its
+/// old PTY reader or temporal writer.
 #[must_use]
 pub(crate) fn reader_attach_ready(session: &Session) -> bool {
     session
@@ -3492,7 +3553,8 @@ pub(crate) fn reader_attach_ready(session: &Session) -> bool {
             .is_none_or(std::thread::JoinHandle::is_finished)
 }
 
-/// Whether a session's parser is behind its program because of an update's park (`SessionCtx::update_parked`).
+/// Whether a session's parser is behind its program because of an update's park
+/// (`SessionCtx::update_parked`).
 #[derive(Debug, Default)]
 pub(crate) struct UpdatePark(std::sync::atomic::AtomicU64);
 
@@ -3960,7 +4022,9 @@ mod shell_exit_tests {
         ended.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok()
     }
 
-    /// A SHELL ALREADY ON ITS WAY OUT WHEN ITS READER ATTACHES KEEPS ITS WAIT: Darwin's kqueue refuses an exit watch on a process that has begun to exit (`ESRCH`) before that process can be collected, so a shell of this process's own that failed at once, already exiting when a loaded machine attached its reader, keeps a [`super::ShellExit`] with no watch ([`super::shell_exit_of`]), and the wait for it ends at once once it is collectable. Before, it had none, and the exit was posted at the master's EOF before its status could be read: a shell killed at start read as a clean exit, its only pane closed. NEGATIVE CONTROL: an adopted shell no watch can be made for has no wait. Darwin's alone: Linux's pidfd watches a zombie, so there such a shell is watched.
+    /// A shell of this process's own already exiting when its reader attaches keeps a watchless
+    /// wait ([`super::shell_exit_of`]); an adopted one has none. Darwin's alone: Linux's pidfd
+    /// watches a zombie.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_shell_already_exiting_when_its_reader_attaches_keeps_its_wait() {
@@ -4434,7 +4498,9 @@ pub(crate) fn new_live_terminal(
     t
 }
 
-/// This process's alt-screen archive origin, stamped on every live session's archive ([`new_live_terminal`]) and printed by `offscreen origin=` and the turn ledger's `arch=<origin>:<last>` marks.
+/// This process's alt-screen archive origin, stamped on every live session's archive
+/// ([`new_live_terminal`]) and printed by `offscreen origin=` and the turn ledger's
+/// `arch=<origin>:<last>` marks.
 pub(crate) fn alt_archive_origin() -> u64 {
     static ORIGIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *ORIGIN.get_or_init(|| {
@@ -4604,7 +4670,8 @@ fn route_osc52_query(
     }
 }
 
-/// What aterm, running outside any sandbox, does at one session's program's request, decided once, at spawn, by [`host_reach`] from the containment mode its shell runs under.
+/// What aterm, running outside any sandbox, does at a session's program's request, decided at
+/// spawn by [`host_reach`] from the containment mode its shell runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostReach {
     /// The platform.
@@ -4633,7 +4700,7 @@ fn configure_clipboard(
     });
 }
 
-/// What this process's sessions reach on their programs' behalf ([`host_reach`] for the containment mode they run under).
+/// What this process's sessions reach for their programs ([`host_reach`] of their containment).
 pub(crate) fn session_host_reach() -> HostReach {
     host_reach(aterm_containment::mode_or_containment())
 }
@@ -4847,7 +4914,7 @@ pub(crate) fn window_op_wake(
     }
 }
 
-/// Maximum bytes a Kitty non-direct medium may supply (matches the engine's `MAX_KITTY_IMAGE_BYTES`).
+/// Maximum bytes a Kitty non-direct medium may supply (the engine's `MAX_KITTY_IMAGE_BYTES`).
 pub(crate) const MAX_KITTY_MEDIUM_BYTES: u64 = 4 * 1024 * 1024;
 
 fn configure_kitty_file_transfer(term: &Arc<Mutex<Terminal>>, reach: HostReach) {
@@ -4870,7 +4937,8 @@ pub(crate) fn read_kitty_medium(
     }
 }
 
-/// Consume a medium the engine took ([`read_kitty_medium`]'s read of it, `read` whether that read returned bytes).
+/// Consume a medium the engine took ([`read_kitty_medium`]'s read of it; `read` is whether that
+/// read returned bytes).
 pub(crate) fn consume_kitty_medium(
     medium: aterm_core::terminal::kitty_graphics::KittyMedium,
     name: &str,
@@ -4919,7 +4987,6 @@ fn consume_kitty_temp_file(path: &Path) {
 }
 
 fn consume_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) {
-    // Distinct branch.
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
         consume_kitty_temp_entry(dir, name, before_unlink); // the client's temp file
     }
@@ -4994,7 +5061,8 @@ fn kitty_temp_dirs() -> Vec<std::path::PathBuf> {
 #[cfg(unix)]
 fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
     let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `cname` is a valid NUL-terminated C string; `shm_open` with O_RDONLY either returns a valid fd or -1, which we check.
+    // SAFETY: `cname` is a valid NUL-terminated C string; `shm_open` with O_RDONLY returns a
+    // valid fd or -1, which is checked.
     let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
         return None;
@@ -5024,7 +5092,8 @@ fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
         if addr == libc::MAP_FAILED {
             return None;
         }
-        // SAFETY: `addr`/`len` describe a valid read-only mapping just established; copy the bytes out before unmapping.
+        // SAFETY: `addr`/`len` describe a valid read-only mapping just established; the bytes
+        // are copied out before unmapping.
         let bytes = unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), len) }.to_vec();
         // SAFETY: unmapping the exact `addr`/`len` we mapped above.
         unsafe { libc::munmap(addr, len) };
@@ -5094,7 +5163,8 @@ impl ReplyLane {
         self.queue(reply, ReplyJob::Bytes)
     }
 
-    /// [`Self::submit`] for a report the engine sent unasked, which the writer hands to its [`ReportRoute`] instead of writing it as a reply.
+    /// [`Self::submit`] for a report the engine sent unasked, which the writer hands to its
+    /// [`ReportRoute`] instead of writing it as a reply.
     pub(crate) fn submit_report(&self, report: std::sync::Arc<[u8]>) -> bool {
         self.queue(report, ReplyJob::Report)
     }
@@ -5193,7 +5263,8 @@ fn spawn_reply_writer(
     ))
 }
 
-/// Test seam: a real reply writer over `sink`, for the egress-contract tests that drive replies and pastes through one session's sink.
+/// Test seam: a real reply writer over `sink`, for the egress-contract tests that drive replies
+/// and pastes through one session's sink.
 #[cfg(all(test, unix))]
 pub(crate) fn spawn_reply_writer_for_test(
     sink: Arc<SinkWriter>,
@@ -5604,7 +5675,12 @@ fn shell_exit_watch(session: &Session) -> Option<ShellExit> {
     shell_exit_of(session.shell_identity)
 }
 
-/// [`shell_exit_watch`] of a shell not yet reaped. A shell of this process's own that no watch can be made for keeps a [`ShellExit`] with none: the kernel refuses an exit watch on a process that has begun to exit (`ESRCH`) a moment before that process can be collected, and a shell that fails at once is there by the time a loaded machine attaches its reader (measured: 290 of 300 such refusals came before the child was collectable). Its parent can still wait for it ([`ShellExit::await_retired`]); without the wait the exit was posted before its status could be read, and a shell killed at start was read as a clean exit, its only pane closed (`shell_exit_at_start_live_headless`, four suites beside eight CPU hogs, load 357).
+/// [`shell_exit_watch`] of a shell not yet reaped. A shell of this process's own that no watch
+/// can be made for keeps a [`ShellExit`] with none: the kernel refuses an exit watch (`ESRCH`)
+/// on a process that has begun to exit but cannot be collected yet, as a shell that fails at
+/// once often is by the time a loaded machine attaches its reader. Its parent still waits for
+/// it ([`ShellExit::await_retired`]), so the exit is not posted before its status can be read
+/// (a shell killed at start would read as a clean exit).
 #[cfg(unix)]
 fn shell_exit_of(identity: aterm_pty::ShellIdentity) -> Option<ShellExit> {
     let pid = u32::try_from(identity.pid).ok().filter(|pid| *pid > 1)?;
@@ -5616,27 +5692,36 @@ fn shell_exit_of(identity: aterm_pty::ShellIdentity) -> Option<ShellExit> {
     identity.verify().then_some(ShellExit { watch, pid })
 }
 
-/// The most the gather waits, once its shell's PTY has closed or its exit fired, for the kernel to retire the shell before the exit is posted. A hang detector, never a latency budget (at 20 ms a starved shell that failed at start read as a clean exit); a stop ends the wait at once ([`ShellExit::await_retired`]).
+/// The most the gather waits, once its shell's PTY has closed or its exit fired, for the kernel
+/// to retire the shell before the exit is posted: a hang detector, never a latency budget (a
+/// short bound reads a starved shell that failed at start as a clean exit). A stop ends the
+/// wait at once ([`ShellExit::await_retired`]).
 #[cfg(unix)]
 pub(crate) const SHELL_RETIRE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How often [`ShellExit::await_retired`] looks again for a shell that has exited, or could not be watched, and is not collectable yet: a nap, never a spin that would take the CPU the exiting process needs.
+/// How often [`ShellExit::await_retired`] looks again for a shell that has exited, or could not
+/// be watched, and is not collectable yet: a nap, never a spin that takes the CPU the exiting
+/// process needs.
 #[cfg(unix)]
 const RETIRE_LOOK: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// How often [`ShellExit::await_retired`] of a gather with no wake pipe (fd exhaustion) reads the gather's stop flag while the shell's exit watch is silent: a stop is all such a gather has, and the wait is a minute long.
+/// How often [`ShellExit::await_retired`] of a gather with no wake pipe (fd exhaustion) reads
+/// its stop flag while the exit watch is silent: a stop is all such a gather has during a wait
+/// of up to [`SHELL_RETIRE_HANG`].
 #[cfg(unix)]
 const RETIRE_STOP_LOOK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// A session's shell's exit watch ([`shell_exit_watch`]) and the pid it watches.
 #[cfg(unix)]
 pub(crate) struct ShellExit {
-    /// The kernel's exit watch; `None` for a shell of this process's own that was already on its way out when its reader attached ([`shell_exit_of`]).
+    /// The kernel's exit watch; `None` for a shell of this process's own that was already
+    /// exiting when its reader attached ([`shell_exit_of`]).
     watch: Option<std::os::fd::OwnedFd>,
     pid: u32,
 }
 
-/// Whether retirement was observed, remained unknown at the existing bound or error, or was cancelled by the reader's stop/wake.
+/// Whether retirement was observed, stayed unconfirmed (the bound passed, or an error), or was
+/// cancelled by the reader's stop or wake.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellRetirement {
@@ -5733,7 +5818,8 @@ impl ShellExit {
                     libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
                 )
             };
-            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`, left it zeroed; `si_pid` is defined in both.
+            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under
+            // `WNOHANG`, left it zeroed; `si_pid` is defined in both.
             let collectable = rc == 0 && unsafe { info.si_pid() } == pid;
             let finished = rc != 0 || collectable || Instant::now() >= deadline;
             let mut wake = libc::pollfd {
@@ -5968,9 +6054,12 @@ fn retire_gone(
 pub(crate) enum GatherMsg {
     /// The deferred start gate released.
     Started,
-    /// Every byte the master held when this reader started, which a park left unread ([`UpdatePark`]), went out in the batches before this one.
+    /// Every byte the master held when this reader started, which a park left unread
+    /// ([`UpdatePark`]), went out in the batches before this one.
     CaughtUp,
-    /// One gathered batch (buffer, filled length, the foreground change it carries, the group whose bytes end it — `edge.to` with an edge — and, with an edge, `edge.to`'s image as the gather read it at the edge, `crate::holder_image`).
+    /// One gathered batch: buffer, filled length, the foreground change it carries, the group
+    /// whose bytes end it (`edge.to` with an edge) and, with an edge, `edge.to`'s image as the
+    /// gather read it (`crate::holder_image`).
     Data(
         Vec<u8>,
         usize,
@@ -5984,16 +6073,17 @@ pub(crate) enum GatherMsg {
         i32,
         Option<Arc<crate::holder_image::HolderImage>>,
     ),
-    /// The process watch heard this process exit (card engine §3.7: a stopped drawer's mark is retired by liveness).
+    /// The process watch heard this process exit ([`retire_gone`]).
     Gone(i32),
     /// The master EOF'd on its own (shell exited).
     Eof,
-    /// The session's shell exited (its exit watch fired before the master's EOF), and what the master held then has been sent.
+    /// The session's shell exited (its exit watch fired before the master's EOF), and what the
+    /// master held then has been sent.
     Exited,
     /// Session teardown (wake pipe / stop flag).
     Wake,
     Reset(crate::manual_reset::ManualReset),
-    /// A host path changed the engine with no output to follow (a resize, a config or cell-size change).
+    /// A host path changed the engine with no output to follow (a resize, a config or cell size).
     Journal,
 }
 
@@ -6083,7 +6173,9 @@ fn spawn_pty_gather(
             let mut after_exit: Option<usize> = None;
             let mut exit_reported = false;
             loop {
-                // Stop before the next read, never between a read and its hand-off: bytes drained from the kernel must reach the engine (the checkpoint-tear contract), and the parse stage processes every batch it was sent.
+                // Stop only before a read, never between a read and its hand-off: bytes drained
+                // from the kernel must reach the engine, and the parse stage processes every
+                // batch it was sent.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = filled_tx.send(GatherMsg::Wake);
                     break;
@@ -6301,14 +6393,12 @@ struct PtyReaderWiring {
     park: (Arc<UpdatePark>, u64),
 }
 
-/// The dev `card-seen` probe over one parsed slice's visible rows and the fence they left, whose
-/// `mutations` are the terminal's screen mutations before the slice: a compose pass whose
-/// snapshot counted more shows what the slice drew. The card it dates is the newest card on
-/// screen only when [`crate::claude_card::admit`] admits it under the drawer's gate with no
-/// build policy (`GateBuild::ProvenanceOnly`; `card-seen` holds the card to the image's build
-/// itself): a card of the same build an earlier run left above the drawer's start is the newest
-/// until the drawer draws its own, and dating it would date the drawer's first output and put
-/// the card's row on the wrong card. At most
+/// The dev `card-seen` probe over one parsed slice's visible rows and the fence they left
+/// (`mutations`: the screen mutations before the slice; a compose pass whose snapshot counted
+/// more shows what it drew). It dates only a card [`crate::claude_card::admit`] admits under
+/// the drawer's gate with no build policy (`GateBuild::ProvenanceOnly`; `card-seen` holds the
+/// card to the image's build itself), so a card an earlier run of the same build left above
+/// the drawer's start is never dated as the drawer's. At most
 /// [`crate::holder_image::CARD_PROBE_BATCHES`] batches look for one token's card.
 fn note_card_seen_in(
     session: u64,
@@ -6377,7 +6467,7 @@ mod card_seen_probe_tests {
             String::new(),
             format!(
                 " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}2.1.304",
-                aterm_phase::anchor_text("launch.banner")
+                aterm_phase::anchor!("launch.banner")
             ),
             "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} Claude Max"
                 .to_string(),
@@ -6446,8 +6536,8 @@ mod card_seen_probe_tests {
             .collect()
     }
 
-    /// The probe dates the card by the screen mutations before the slice it first read it in,
-    /// and spends one of its batches per batch, however many slices that batch took.
+    /// The card is dated by the mutations before the slice it was first read in, and a batch
+    /// spends one of the budget's batches however many slices it took.
     #[test]
     fn the_probe_dates_the_card_by_the_slice_that_drew_it() {
         let (timeline, token) = drawer_timeline();
@@ -6490,11 +6580,9 @@ mod card_seen_probe_tests {
         );
     }
 
-    /// THE PROBE DATES THE DRAWER'S OWN CARD. Relaunched with no clear, Claude Code's first
-    /// output lands while the card an earlier run of the same build left above its start is
-    /// still the newest card on screen: the fence does not hold it, so the probe passes over it
-    /// and dates the slice that draws the drawer's own card below, at that card's row. On the
-    /// alternate screen it dates a card only once the drawer has cleared it.
+    /// Relaunched with no clear, the probe passes over the card the earlier run left and dates
+    /// the slice that draws the drawer's own card, at that card's row; on the alternate screen
+    /// it dates a card only once the drawer has cleared it.
     #[test]
     fn the_probe_passes_over_a_card_an_earlier_run_left_above_the_drawers_start() {
         let (timeline, token) = drawer_timeline();
@@ -6565,10 +6653,8 @@ mod card_seen_probe_tests {
         );
     }
 
-    /// The probe dates a card only under the drawer's own fence. While the fence's holder is
-    /// another token (its cut has not reached this drawer's exec, or has passed it), the card at
-    /// the span's start is that holder's and is not dated; under the drawer's token the same
-    /// rows are.
+    /// While the fence's holder is another token, the card at the span's start is that
+    /// holder's and is not dated; under the drawer's token the same rows are.
     #[test]
     fn the_probe_dates_no_card_under_another_holders_fence() {
         let (timeline, token) = drawer_timeline();
@@ -7260,14 +7346,15 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             };
             #[cfg(windows)]
             loop {
-                // Stop is honored at the top of every iteration, never between a read and its processing (bytes out of the kernel queue must reach the engine).
+                // Stop only before a read: bytes out of the kernel queue must reach the engine.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
                 let r = match aterm_pty::read_or_wake(master, &mut buf, wake_rd, -1, -1) {
                     aterm_pty::ReadOutcome::Wake => break,
                     aterm_pty::ReadOutcome::Idle => {
-                        // Wake-pipe-less fallback (fd exhaustion): honor the fd-free stop flag `Session::drop` raises, so an orphan-pinned reader still exits.
+                        // Wake-pipe-less fallback (fd exhaustion): honor the fd-free stop flag
+                        // `Session::drop` raises, so an orphan-pinned reader still exits.
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }
@@ -7411,7 +7498,8 @@ fn ingest_chunk_width(pending: impl FnOnce() -> bool, remaining: usize) -> usize
 }
 
 fn stamp_output_arrival(last_output_ns: &AtomicU64, now_ns: u64) {
-    // Load first: a flood between two presents finds the edge already stamped, and a plain load leaves the line shared instead of a failing RMW.
+    // Load first: a flood between two presents finds the edge already stamped, and a plain
+    // load leaves the cache line shared instead of a failing RMW.
     if last_output_ns.load(Ordering::Relaxed) == 0 {
         let _ = last_output_ns.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
     }
@@ -7443,7 +7531,9 @@ mod output_edge_stamp_tests {
     }
 }
 
-/// The age at which a posted `Wake::Output` still waiting for its handler is booked late (`metrics` `output_wake_late`, a debug-level note), and the delay after which an idle event loop turns once more to look at an armed latch.
+/// The age at which a posted `Wake::Output` still waiting for its handler is booked late
+/// (`metrics` `output_wake_late`, a debug-level note), and the delay after which an idle event
+/// loop turns once more to look at an armed latch.
 pub(crate) const WAKE_LATCH_EXPIRY_NS: u64 = 100_000_000;
 
 /// Bit 63 of an armed latch word.
@@ -7464,10 +7554,11 @@ pub(crate) const WAKE_LATCH_STAMP: u64 = WAKE_LATCH_STREAMING - 1;
 /// The shortest interval between two `Wake::Output` passes for one streaming session.
 pub(crate) const OUTPUT_CADENCE_NS: u64 = 4_000_000;
 
-/// How long a burst of posts (each under [`OUTPUT_CADENCE_NS`] after the one before) must have run before its session counts as streaming.
+/// How long a burst of posts, each under [`OUTPUT_CADENCE_NS`] after the one before, runs
+/// before its session counts as streaming.
 pub(crate) const STREAM_AFTER_NS: u64 = 16_000_000;
 
-/// How many posts a burst makes before its session counts as streaming even short of [`STREAM_AFTER_NS`].
+/// How many posts make a burst's session streaming even short of [`STREAM_AFTER_NS`].
 pub(crate) const STREAM_AFTER_POSTS: u32 = 16;
 
 /// The event loop's turn state as the PTY readers see it.
@@ -7494,13 +7585,15 @@ impl LoopIdle {
 /// What [`gated_output_wake`] did with one chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WakeGate {
-    /// Nothing posted: the latch was armed (the chunk rides the wake already posted), another reader won the arm, or the send failed.
+    /// Nothing posted: the latch was armed (the chunk rides the wake already posted), another
+    /// reader won the arm, or the send failed.
     Coalesced,
     /// A fresh wake on the latch's clear->armed edge.
     Posted,
     /// A stranded wake re-posted (see [`wake_stranded`]).
     Reposted,
-    /// Nothing posted: the UI thread holds the latch ([`WAKE_LATCH_HELD`]) and the chunk left it dirty, so the hold's release runs the pass.
+    /// Nothing posted: the UI thread holds the latch ([`WAKE_LATCH_HELD`]) and the chunk left
+    /// it dirty, so the hold's release runs the pass.
     Held,
 }
 
@@ -7643,7 +7736,8 @@ impl PostCadence {
     }
 }
 
-/// The latch word a `Wake::Output` pass stores before its work, from the `word` it found, so a chunk fed after the store posts again or leaves the hold dirty.
+/// The latch word a `Wake::Output` pass stores before its work, from the `word` it found, so a
+/// chunk fed after the store posts again or leaves the hold dirty.
 pub(crate) fn output_latch_after_pass(word: u64, now_ns: u64) -> u64 {
     if word & (WAKE_LATCH_STREAMING | WAKE_LATCH_HELD) == 0 {
         return 0;
@@ -7660,7 +7754,8 @@ pub(crate) enum HoldRelease {
     Pending { due_ns: u64 },
     /// Due, and nothing was fed since the pass that took it.
     Released,
-    /// Due and dirty: the caller runs the session's pass, which takes the hold again ([`output_latch_after_pass`]).
+    /// Due and dirty: the caller runs the session's pass, which takes the hold again
+    /// ([`output_latch_after_pass`]).
     Due,
 }
 
@@ -7685,11 +7780,13 @@ pub(crate) fn release_output_hold(latch: &AtomicU64, now_ns: u64) -> HoldRelease
     }
 }
 
-/// A read at least this big is fed as it is, and a held gather ([`gather_held_output`]) stops once it holds this much.
+/// A read at least this big is fed as it is, and a held gather ([`gather_held_output`]) stops
+/// once it holds this much.
 #[cfg(any(windows, test))]
 pub(crate) const HELD_GATHER_ENOUGH: usize = 16 * 1024;
 
-/// How long before its hold falls due a held gather is fed, so its bytes are in the engine when the hold's release runs the session's pass.
+/// How long before its hold falls due a held gather is fed, so its bytes are in the engine
+/// when the hold's release runs the session's pass.
 #[cfg(any(windows, test))]
 pub(crate) const HELD_GATHER_MARGIN_NS: u64 = 500_000;
 
@@ -7701,11 +7798,13 @@ pub(crate) const HELD_GATHER_MIN_NS: u64 = 1_000_000;
 #[cfg(any(windows, test))]
 pub(crate) const HELD_GATHER_STEP_NS: u64 = 1_000_000;
 
-/// How far past its request a held gather's wait is taken to wake, so the gather asks that much less and ends on time.
+/// How far past its request a held gather's wait is taken to wake, so the gather asks that
+/// much less and ends on time.
 #[cfg(any(windows, test))]
 pub(crate) const HELD_GATHER_WAIT_SLACK_NS: u64 = 500_000;
 
-/// Whether a reader that has just read `filled` bytes at `now_ns` gathers more before it feeds them ([`gather_held_output`]), and until when (`lat_epoch` ns).
+/// Whether a reader that has just read `filled` bytes at `now_ns` gathers more before it feeds
+/// them ([`gather_held_output`]), and until when (`lat_epoch` ns).
 #[cfg(any(windows, test))]
 pub(crate) fn begin_held_gather(
     latch: &AtomicU64,
@@ -7773,7 +7872,8 @@ pub(crate) fn gather_held_output(
 pub(crate) enum OutputWakeVerdict {
     /// No wake outstanding.
     Clear,
-    /// The wake was posted before `drained_through_ns`, every wake posted before that instant has been handed out, and the latch is still armed.
+    /// The wake was posted before `drained_through_ns`, every wake posted before that instant
+    /// has been handed out, and the latch is still armed.
     Lost { age_ns: u64 },
     /// Outstanding but not proven lost.
     Waiting { recheck_ns: u64, late: bool },
@@ -7811,7 +7911,8 @@ pub(crate) fn judge_output_wake(
 /// The lost-wake watchdog's memory between `about_to_wait` passes.
 #[derive(Debug, Default)]
 pub(crate) struct OutputWakeWatch {
-    /// The pass before the latest turn whose drain emptied the user-event queue: every wake posted before it has been handed out.
+    /// The pass before the latest turn whose drain emptied the user-event queue: every wake
+    /// posted before it has been handed out.
     drained_through_ns: u64,
     last_pass_ns: u64,
     late_booked: Vec<(u64, u64)>,
@@ -7829,7 +7930,13 @@ pub(crate) struct OutputWakePass {
 }
 
 impl OutputWakeWatch {
-    /// Judge every session's latch at `now_ns` (this `about_to_wait`'s stamp), heal the ones proven lost (cas from the observed word, so a concurrent handler clear or reader re-stamp is never clobbered), and book the late ones once. `drained` is whether this turn's drain of user events emptied the queue (`ActiveEventLoop::user_events_drained`): only then has every wake posted before the previous pass been handed out, and that pass becomes the drained-through instant. A drain that stopped at a sender part-way through a send may have left a wake posted before it queued.
+    /// Judge every session's latch at `now_ns` (this `about_to_wait`'s stamp), heal the ones
+    /// proven lost (a CAS from the observed word, so a concurrent handler clear or reader
+    /// re-stamp is never clobbered), and book the late ones once. `drained` is whether this
+    /// turn's drain emptied the user-event queue (`ActiveEventLoop::user_events_drained`): only
+    /// then has every wake posted before the previous pass been handed out, so that pass
+    /// becomes the drained-through instant (a drain that stopped part-way may leave such a wake
+    /// queued).
     pub(crate) fn pass<'a>(
         &mut self,
         now_ns: u64,
@@ -7929,7 +8036,9 @@ impl crate::App {
     }
 }
 
-/// The directory holding aterm's co-located CLI tools (`aterm-ctl`, `atpkg`) when running from a macOS .app bundle (`Contents/MacOS`), put on child sessions' path so the bundled Help's workflows run with no install step.
+/// The directory holding aterm's co-located CLI tools (`aterm-ctl`, `atpkg`), put on child
+/// sessions' path so the bundled Help's workflows run with no install step: a macOS .app
+/// bundle's `Contents/MacOS`, else [`windows_app_dir`] or [`linux_store_dir`].
 pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
     if cfg!(windows) {
         return windows_app_dir(exe?, |path| path.is_file());
@@ -7966,7 +8075,8 @@ pub(crate) fn linux_store_dir(
         .map(str::to_owned)
 }
 
-/// The two environment variables that make a no-terminal `sudo` reach aterm's askpass helper (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.1).
+/// The two environment variables that make a no-terminal `sudo` reach aterm's askpass helper
+/// (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.1).
 pub(crate) fn askpass_env(
     bundle: Option<&str>,
     contained: bool,
@@ -7996,7 +8106,9 @@ pub(crate) fn askpass_env(
     out
 }
 
-/// The one `("PATH", value)` pair the baseline `env_add` carries, composed because `aterm_pty::build_child_env` applies `env_add` by key overwrite (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH").
+/// The one `("PATH", value)` pair the baseline `env_add` carries, composed because
+/// `aterm_pty::build_child_env` applies `env_add` by key overwrite
+/// (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH").
 pub(crate) fn reroute_path_env(
     reroute_dir: Option<&str>,
     agents_dir: Option<&str>,
@@ -8035,7 +8147,9 @@ pub(crate) fn reroute_path_env(
     injected.then(|| ("PATH".to_string(), entries.join(&sep.to_string())))
 }
 
-/// The managed `agents/` directory every session gets in front of its path, created at launch if missing (one `mkdir -p`; nothing blocks the first frame), so the first tab on a fresh machine already has it on path and finds the twins atpkg lays later.
+/// The managed `agents/` directory every session gets in front of its path, created at launch
+/// if missing (one `mkdir -p`; nothing blocks the first frame), so the first tab on a fresh
+/// machine already has it on path and finds the twins atpkg lays later.
 pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String> {
     match layout.ensure_agents_dir() {
         Ok(dir) => dir.to_str().map(str::to_owned),
@@ -8652,7 +8766,8 @@ mod reroute_path_env_tests {
             .and_then(|pid| pid.parse::<libc::pid_t>().ok())
             .filter(|&pid| pid > 0);
         if let Some(pid) = job.filter(|_| elapsed < JOB) {
-            // SAFETY: `kill` takes no pointers, and `pid` is positive, so it names one process and never a group.
+            // SAFETY: `kill` takes no pointers, and `pid` is positive, so it names one process
+            // and never a group.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         assert!(
@@ -8700,7 +8815,8 @@ mod reroute_path_env_tests {
             );
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
-        // SAFETY: two live descriptors this test owns, each taken by exactly one `OwnedFd`; the stand-in's stdin is the copy std makes of `slave`.
+        // SAFETY: two live descriptors this test owns, each taken by exactly one `OwnedFd`; the
+        // stand-in's stdin is the copy std makes of `slave`.
         let (master, slave) = unsafe {
             use std::os::fd::{FromRawFd as _, OwnedFd};
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
@@ -8711,7 +8827,8 @@ mod reroute_path_env_tests {
             .env(CHILD, "1")
             .env("HISTFILE", "/dev/null")
             .stdin(std::process::Stdio::from(slave));
-        // SAFETY: the hook runs between fork and exec and calls only `setsid` and `ioctl`, both async-signal-safe, on the child's own stdin.
+        // SAFETY: the hook runs between fork and exec and calls only `setsid` and `ioctl`, both
+        // async-signal-safe, on the child's own stdin.
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(stand_in.command(), || {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
@@ -10246,7 +10363,8 @@ mod output_wake_coalesce_tests {
             let armed = word(&st);
             if st["busy"] == 1 {
                 let drained = st["drained"] as u64 * K;
-                // The bound stays 0: a latch the model holds through a cut turn was posted after the bound the last emptied drain set.
+                // The bound stays 0: a latch the model holds through a cut turn was posted
+                // after the bound the last emptied drain set.
                 let mut watch = OutputWakeWatch {
                     last_pass_ns: drained,
                     ..OutputWakeWatch::default()

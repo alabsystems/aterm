@@ -53,7 +53,7 @@ fn zsh_shell() -> Option<&'static str> {
     interned_test_shell(&ZSH, "zsh")
 }
 
-/// A shell [`Command`] in its hermetic environment, with the private.
+/// A shell [`Command`] in its hermetic environment, with the private home it points into.
 #[cfg(unix)]
 struct ShellCommand {
     cmd: Command,
@@ -103,7 +103,7 @@ fn mark_fish_completions_made(cmd: &Command) {
     }
 }
 
-/// Spawn a shell with a hermetic environment for integration tests.
+/// A shell command with a hermetic environment for integration tests.
 #[cfg(unix)]
 fn shell_command(shell: &str) -> ShellCommand {
     let mut cmd = Command::new(shell);
@@ -225,10 +225,9 @@ struct ShellLanes {
 #[cfg(unix)]
 impl ShellLanes {
     /// Every bash the bash tests run on: the OS's (`$ATERM_TEST_BASH`, else the `bash` row:
-    /// macOS's 3.2, a Linux host's own), then the pinned 5.3 ([`bash_5_3`]), whose
-    /// `${ ...; }` reads and PS0 hook the OS's 3.2 never takes. A missing 5.3 is noted where
-    /// the tree pins one for this host (`verify provision` builds it on a Mac). A bash test
-    /// gets its bash here and nowhere else, so each one runs on both.
+    /// macOS's 3.2, a Linux host's own), then the pinned 5.3 ([`bash_5_3`]), for the
+    /// `${ ...; }` reads and PS0 hook 3.2 lacks. A missing 5.3 is noted where the tree pins one
+    /// for this host. A bash test gets its bash here and nowhere else, so each runs on both.
     fn bashes(&mut self) -> Vec<&'static str> {
         static OS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let os = interned_test_shell(&OS, "bash").unwrap_or("bash");
@@ -2175,7 +2174,9 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
     );
 }
 
-/// Source a script under `shell` in a synthesized environment and report the boundary variables it.
+/// Run `report` under `shell` with `$ATERM_TEST_SCRIPT` naming the script `script_name`, in a
+/// synthesized environment (no multiplexer's variables but those `env` sets), and return its
+/// stdout and stderr.
 #[cfg(unix)]
 fn run_mux_probe(
     shell: &str,
@@ -2392,7 +2393,7 @@ const ATPKG_HOOK_FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 #[cfg(unix)]
 const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
 
-/// One live, interactive shell driven over pipes.
+/// One live, interactive shell, driven over pipes or a pty.
 #[cfg(unix)]
 struct LiveShell {
     label: String,
@@ -2584,11 +2585,10 @@ impl LiveShell {
         )
     }
 
-    /// [`Self::spawn`] on a new pty of its own (aterm-pty's pair), as a tab's
-    /// shell runs: its stdin, stdout and stderr the slave, its controlling terminal in a
-    /// session it leads; the test writes to and reads the master. Its stderr reaches the
-    /// master with its stdout, so [`Self::stderr`] reads a pipe nothing holds. The master's
-    /// end once every holder of the slave has closed it (`EIO` on Linux) is the read's EOF.
+    /// [`Self::spawn`] on a new pty of its own (aterm-pty's pair), as a tab's shell runs: the
+    /// slave its stdin, stdout, stderr and controlling terminal, in a session it leads. The test
+    /// writes to and reads the master; its stderr reaches the master with its stdout, so
+    /// [`Self::stderr`] reads a pipe nothing holds.
     fn spawn_on_pty(label: &str, cmd: &mut Command) -> Self {
         use std::os::fd::{FromRawFd as _, OwnedFd};
         use std::os::unix::process::CommandExt as _;
@@ -3317,7 +3317,8 @@ const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR
 #[cfg(unix)]
 const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
 
-/// The command for `argv`, to run on a pty of its own with [`LiveShell::spawn_on_pty`] (aterm-pty's pair, never `script(1)`, whose BSD and util-linux forms differ).
+/// The command for `argv`, to run on a pty of its own with [`LiveShell::spawn_on_pty`]
+/// (aterm-pty's pair, never `script(1)`, whose BSD and util-linux forms differ).
 #[cfg(unix)]
 fn pty_command(argv: &[&str]) -> Command {
     let (program, args) = argv.split_first().expect("a program to run");
@@ -3326,22 +3327,15 @@ fn pty_command(argv: &[&str]) -> Command {
     cmd
 }
 
-/// A shell [`LiveShell::spawn_on_pty`] starts has the pty for all three of its standard
-/// descriptors and for its controlling terminal, leading its process group: each descriptor
-/// is a terminal, what it writes to its stderr and to `/dev/tty` reaches the pty's master
-/// (as the probe it reads from its stdin came from it), and `ps` puts it in its own process
-/// group. A non-interactive `sh`, which opens no terminal of its own (an interactive one
-/// does, and a session leader's open takes the terminal), reaches the master through
-/// `/dev/tty` too: the spawn made the pty its controlling terminal. On Linux that guards the
-/// spawn's `TIOCSCTTY`, since Linux hands a session a terminal only on that ioctl or an open;
-/// on macOS the session has the pty without it (the probe passes with the ioctl removed).
-/// The probe never names the terminal: macOS's `ttyname` (`tty`) and `ps -o tty` find a name
-/// by walking `/dev`, and a walk while other tests' ptys come and go can miss this one (a
-/// loaded `verify test --all` printed "not a tty" for the stdin the next `tty <&1` named).
-/// Its markers are computed (`$((…))`) because the pty echoes the probe as typed. It runs in
-/// a scratch `HOME` ([`shell_command`]), so the history an interactive `sh` writes at its
-/// exit (macOS's `~/.bash_history`) lands there. NEGATIVE CONTROL: the same shell
-/// [`LiveShell::spawn`] starts on pipes has no terminal at all.
+/// A shell [`LiveShell::spawn_on_pty`] starts has the pty for its three standard descriptors and
+/// its controlling terminal, and leads its process group. A non-interactive `sh` opens no
+/// terminal of its own (an interactive one's open, as session leader, would take it), so its
+/// reaching the master through `/dev/tty` pins the spawn's `TIOCSCTTY` on Linux, which hands a
+/// session a terminal only on that ioctl or an open; macOS gives the session the pty without it.
+/// The probe never names the terminal: `ttyname` and `ps -o tty` walk `/dev`, which can miss a
+/// pty while other tests' come and go. Its markers are computed because the pty echoes the probe
+/// as typed, and its scratch `HOME` takes the history an interactive `sh` writes at exit. The
+/// same shell on pipes has no terminal at all.
 #[cfg(unix)]
 #[test]
 fn a_shell_on_its_pty_has_it_for_its_terminal() {
@@ -3479,7 +3473,9 @@ fn assert_live_path(label: &str, sh: &mut LiveShell, fx: &LiveFixture, at: usize
     );
 }
 
-/// The owner's scenario in one live bash or zsh (`label`, the hook's extension).
+/// The owner's scenario in one live bash or zsh (`label`, the hook's extension): `claude` runs the
+/// foreign one, then the twin once atpkg's pass lays it and its hook, then a re-laid twin, and a
+/// rewritten hook takes effect.
 #[cfg(unix)]
 fn posix_owner_scenario(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print: &str) {
     sh.send("claude");

@@ -32,7 +32,7 @@ pub struct Offer {
 /// Parse `Autocompact at ‹ 400k › tokens` into its size in tokens ([`size_tokens`]).
 #[must_use]
 pub fn accept_size(label: &str) -> Option<u32> {
-    let accept = const { crate::anchors::anchor_text("autocompact.accept") };
+    let accept = const { crate::anchor!("autocompact.accept") };
     let size = label
         .strip_prefix(accept)?
         .strip_prefix(" \u{2039} ")?
@@ -119,7 +119,7 @@ fn option_row(row: &str) -> Option<(usize, bool, &str)> {
 }
 
 fn is_title_row(row: &str) -> bool {
-    let title = const { crate::anchors::anchor_text("autocompact.title") };
+    let title = const { crate::anchor!("autocompact.title") };
     let t = crate::text::trim(row);
     t == title
         || t.strip_prefix(title).is_some_and(|rest| {
@@ -134,8 +134,8 @@ fn is_title_row(row: &str) -> bool {
 /// Parse an autocompact offer box from `rows` ([`crate::prompt::parse_prompt_v2`]).
 pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
     use crate::phase::{has_composer_frame, is_rule, leading_spaces};
-    let footer_text = const { crate::anchors::anchor_text("autocompact.footer") };
-    let more = const { crate::anchors::anchor_text("autocompact.more_above") };
+    let footer_text = const { crate::anchor!("autocompact.footer") };
+    let more = const { crate::anchor!("autocompact.more_above") };
     let blank = |r: &String| crate::text::trim(r).is_empty();
     let last = rows.iter().rposition(|r| !blank(r))?;
     let footer = if crate::text::trim(&rows[last]) == more {
@@ -234,7 +234,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         .filter(|t| !t.is_empty())
         .collect();
     let prose = body.join(" ");
-    let question = const { crate::anchors::anchor_text("autocompact.question") };
+    let question = const { crate::anchor!("autocompact.question") };
     if !prose.contains(&format!("{question} {} tokens instead?", size_words(size))) {
         return None;
     }
@@ -250,7 +250,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         .unwrap_or_default();
     Some(PromptV2 {
         kind: PromptKind::AutocompactOffer,
-        title: const { crate::anchors::anchor_text("autocompact.title") }.to_string(),
+        title: const { crate::anchor!("autocompact.title") }.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
         gutter: false,

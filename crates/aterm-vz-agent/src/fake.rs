@@ -42,7 +42,7 @@ impl Default for Fake {
 
 impl Fake {
     /// A guest already up (`running`, no jobs, the bus answering), whose clock reads
-    /// 2026-10-15, running commands as the agent's own user.
+    /// 2026-10-14, running commands as the agent's own user.
     #[must_use]
     pub fn new() -> Self {
         Self {

@@ -26,7 +26,8 @@ mod driver;
 #[path = "driver_windows.rs"]
 mod driver;
 
-/// `aterm doctor`'s own rows as converge items; `crates/aterm` composes them with the packages' repair items and `aterm pkg doctor`.
+/// `aterm doctor`'s own rows as converge items; `crates/aterm` composes them with the packages'
+/// repair items and `aterm pkg doctor`.
 pub mod doctor;
 mod manual;
 mod spotlight;
@@ -57,7 +58,8 @@ pub use windowing::{
 };
 
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
-/// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and `aterm help aterm`.
+/// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and
+/// `aterm help aterm`.
 #[cfg(not(windows))]
 macro_rules! session_shell {
     () => {
@@ -169,7 +171,8 @@ pub enum Verb {
     Agh,
     /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
-    /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`, `tape`, `replay`).
+    /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`,
+    /// `tape`, `replay`).
     Drive,
     /// `aterm link` — the fabric bridge (`serve`, `ls`, `notify`, `broker`, `mint`, `fabric`).
     Link,
@@ -177,7 +180,8 @@ pub enum Verb {
     Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
-    /// `aterm update` — the headless update lane (`status`, `check`, `identity`; on Linux also `enable`, `apply`, `rollback`).
+    /// `aterm update` — the headless update lane (`status`, `check`, `identity`; on Linux also
+    /// `enable`, `apply`, `rollback`).
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
@@ -187,7 +191,8 @@ pub enum Verb {
     Machines,
     /// `aterm init` — configure the current macOS login and optional GitHub bootstrap.
     Init,
-    /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets` (docs/DESIGN-secrets-2026-10-20.md).
+    /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets`
+    /// (docs/DESIGN-secrets-2026-10-20.md).
     Secrets,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
     Harness,
@@ -297,7 +302,8 @@ impl Verb {
         }
     }
 
-    /// Whether this is a windowing verb ([`parse_window_request`] parses it, [`route_launch`] routes it).
+    /// Whether this is a windowing verb ([`parse_window_request`] parses it, [`route_launch`]
+    /// routes it).
     #[must_use]
     pub const fn is_windowing(self) -> bool {
         match self {
@@ -537,7 +543,8 @@ const HELP_TAIL: &str = concat!(
     "    aterm doctor --read-only           Check this machine; change nothing.\n",
 );
 
-/// The diagnostic subcommands and their `--help` lines (`aterm list-themes --help` prints `aterm theme list`'s help instead): `aterm <name>` reports and exits without starting a shell.
+/// The diagnostic subcommands and their `--help` lines (`aterm list-themes --help` prints
+/// `aterm theme list`'s help instead): `aterm <name>` reports and exits without starting a shell.
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     (
         "show-config",
@@ -1020,7 +1027,8 @@ fn exceptions_row(facts: &ExceptionsFacts) -> (Mark, String) {
     }
 }
 
-/// `aterm list-kitty-commands` — every word the cursor cat obeys when it is TYPED at the terminal, language by language: its trick rows, then its names for the pet, then its filler words.
+/// `aterm list-kitty-commands` — every word the cursor cat obeys when it is typed at the
+/// terminal, by language (the rows of `tricks.toml`).
 pub(crate) fn list_kitty_commands_report() -> String {
     let mut out = String::new();
     for row in aterm_lexicon::TrickLexicon::all_rows() {
@@ -1035,9 +1043,11 @@ pub(crate) fn list_kitty_commands_report() -> String {
 pub enum Mark {
     /// The check passed.
     Ok,
-    /// A fact worth reporting that is not a failure — nothing to fix, or nothing aterm can fix, and never a reason to refuse to launch.
+    /// A fact worth reporting that is not a failure (nothing to fix, or nothing aterm can fix),
+    /// and never a reason to refuse to launch.
     Note,
-    /// A measured cost the person is paying now, with a fix only they can make (atpkg's `warn`): louder than a note, and a step for the person that leaves `aterm doctor` not ready.
+    /// A measured cost the person is paying now, with a fix only they can make (atpkg's `warn`):
+    /// louder than a note, and a step for the person that leaves `aterm doctor` not ready.
     Warn,
     /// The check failed; only the shell row fails.
     Fail,
@@ -1333,7 +1343,8 @@ impl DevtoolsFacts {
     }
 }
 
-/// Whether a shell can be started, and if not, which of the two causes `doctor` names (the driver's `shell_check` tells them apart).
+/// Whether a shell can be started, and if not, which of the two causes `doctor` names (the
+/// driver's `shell_check` tells them apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellCheck {
     /// A file this user can execute.
@@ -1601,13 +1612,20 @@ fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     }
 }
 
-/// The `devtools:` row's facts ([`devtools_read_and_hand_over`]): the list and tccd's answers, and the wait beside them ([`wait_beside`]: this user's programs macOS's program check holds now, [`aterm_uds::process::held_programs`], thread lists and start records only, no argument read, so it reads while the check's pool is full too).
+/// The `devtools:` row's facts ([`devtools_read_and_hand_over`]): the list and tccd's answers,
+/// and the wait beside them ([`wait_beside`]), which reads thread lists and start records only
+/// ([`aterm_uds::process::held_programs`]), never a process's arguments, so it reads while the
+/// check's pool is full too.
 fn devtools_facts(fix: bool, check_full: bool) -> DevtoolsFacts {
     let (facts, did) = devtools_read_and_hand_over(fix, check_full);
     DevtoolsFacts { facts, did }
 }
 
-/// The wait the `devtools:` row counts beside `facts`, the list as this run's hand-over left it: `held()`, this user's programs macOS's program check holds now; none when the hand-over switched aterm on (`before` not granted, `facts` granted). Every program held then started before the grant, which may still wait for them (leftover §5.1), so they say nothing of whether it took.
+/// The wait the `devtools:` row counts beside `facts` (the list as this run's hand-over left it):
+/// `held()`, this user's programs macOS's program check holds now, or none when the hand-over
+/// switched aterm on (`before` not granted, `facts` granted). Every program held then started
+/// before the grant, which may still wait for them (leftover §5.1), so they say nothing of
+/// whether it took.
 fn wait_beside(
     before: aterm_containment::DevToolGrant,
     facts: &atpkg::devtools::Facts,
@@ -2579,7 +2597,8 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     }
 }
 
-/// Format the `-V`/`--version` output: identity line, origin line, optional build number, `which_copy` lines, and the compiled update trust anchor fingerprint.
+/// Format the `-V`/`--version` output: identity line, origin line, optional build number,
+/// `which_copy` lines, and the compiled update trust anchor fingerprint.
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
     let mut out = format!(
@@ -2640,7 +2659,9 @@ fn answer_and_exit(text: &str, code: i32) -> ! {
     )
 }
 
-/// The effectful shell around [`decide_args`]: answers `--help`, `--version`, a diagnostic, `help` or `agents` and exits (2 on a usage error), or records the launch flags ([`SessionFlags`]) and returns whether `--quiet` was given.
+/// The effectful shell around [`decide_args`]: answers `--help`, `--version`, a diagnostic,
+/// `help` or `agents` and exits (2 on a usage error), or records the launch flags
+/// ([`SessionFlags`]) and returns whether `--quiet` was given.
 pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
     match decide_args(argv.into_iter().map(|a| a.to_string_lossy().into_owned())) {
         CliAction::Help => answer_and_exit(&help_text(), 0),
@@ -2934,7 +2955,8 @@ const fn session_limits(mode: aterm_containment::ContainmentMode) -> aterm_sandb
     }
 }
 
-/// Run the transparent PTY session: containment init, root-authority mint, protected shell spawn, and passthrough loop.
+/// Run the transparent PTY session: containment init, root-authority mint, protected shell
+/// spawn, and passthrough loop.
 pub fn session_main(quiet: bool) -> ! {
     let (rows, cols) = driver::host_winsize();
 
@@ -5128,9 +5150,8 @@ mod tests {
         assert!(facts.program_check.is_some(), "{facts:?}");
     }
 
-    /// A GRANT THIS RUN MADE IS NOT JUDGED BY PROGRAMS HELD BEFORE IT (leftover §5.1): when the
-    /// hand-over switched aterm on, every program held now started before the grant, which may
-    /// still wait for them, so the `devtools:` row counts no wait and stays ok; any other run
+    /// A grant this run made is not judged by programs held before it (leftover §5.1): when the
+    /// hand-over switched aterm on, the `devtools:` row counts no wait and stays ok; any other run
     /// counts what it reads.
     #[test]
     fn the_devtools_row_reads_no_wait_against_a_grant_this_run_made() {

@@ -79,20 +79,19 @@ struct DoorWatch {
     /// The open hold's held verdicts booked as `fact-held@v1` rows ([`Session::held_row`]):
     /// each episode by its rule and its ordinal in the hold, with the guard that held it.
     held: Vec<HeldKey>,
-    /// THE K CLOCK (the slice-2 plan's D2): how many looks each due episode of the hold has
-    /// stood untold, on the clock's milliseconds; fed after the decider at each break
-    /// ([`Session::door_k`]) and by the write's outcome ([`Session::door_k_wrote`]), which takes
-    /// the look where a write follows the break, and seeded on a carry from the episode's earliest
-    /// row ([`Session::door_seed`]).
+    /// The K clock: how many looks each due episode of the hold has stood untold, on the clock's
+    /// milliseconds; fed after the decider at each break ([`Session::door_k`]) and by the write's
+    /// outcome ([`Session::door_k_wrote`]), which takes the look where a write follows the break,
+    /// and seeded on a carry from the episode's earliest row ([`Session::door_seed`]).
     k_clock: DueClock<EpisodeKey>,
     /// The episodes the last break fed the K clock: each with its rule and the guard holding it
     /// (`None`: its pace, or a write that wrote nothing).
     k_due: Vec<(RuleId, EpisodeKey, Option<Guard>)>,
     /// What the K clock last raised: the told word's `ready_idle` while the hold stands.
     ready_idle: Option<SaidReadyIdle>,
-    /// THE TASK DOOR'S WORD (the slice-2 plan's D1): the fact word its host took that stands on
-    /// the session's task record, as far as this loop knows (a seed's too,
-    /// [`Session::door_task_seed`]): cleared at the hold's close.
+    /// The task door's word: the fact word its host took that stands on the session's task
+    /// record, as far as this loop knows (a seed's too, [`Session::door_task_seed`]): cleared at
+    /// the hold's close.
     task_word: Option<FactWord>,
     /// The hold closed with [`Self::task_word`] standing: its clear, owed at the next step under
     /// a grant ([`Session::door_task_owed`]).
@@ -497,7 +496,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         // A line the write takes at this break is looked at by the write, past its `status`
-        // read (`door_k_wrote`): a person it finds there holds the raise (S15).
+        // read (`door_k_wrote`): a person it finds there holds the raise.
         let look = self.hold.door.due.is_none();
         self.door_k(now_ms, look);
         self.hold.door.seen = Some((ready, guards, reading));
@@ -683,7 +682,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(door::write_held(due.rule, Self::write_at(host)))
     }
 
-    /// THE WRITE'S GUARDS, judged again on the one `status` read just before it (whose hands
+    /// The write's guards, judged again on the one `status` read just before it (whose hands
     /// are on the session, the halt, unread input), the task record before the loop's first fold
     /// read it (`Session::managed_at_write`), the composer's read (a composer the read cannot
     /// judge is a draft) and the host's `taskless`; `Err` with the guard that holds where a read
@@ -831,7 +830,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(Wrote::Typed)
     }
 
-    /// A WRITE THAT WROTE NOTHING after its intent row (`OccupancyDoor`'s `Skip`): its outcome
+    /// A write that wrote nothing after its intent row (`OccupancyDoor`'s `Skip`): its outcome
     /// row `skipped why=<why>`, the episode untold, and tried again only past the session's pace.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -879,7 +878,7 @@ impl<C: Ctl> Session<'_, C> {
             .collect()
     }
 
-    /// THE K CLOCK'S LOOK at `now_ms` (the clock's): the episodes [`DoorWatch::k_due`] names fed
+    /// The K clock's look at `now_ms` (the clock's): the episodes [`DoorWatch::k_due`] names fed
     /// to it, and of those standing the setup's K looks untold (`occupancy_k_looks`), the one due
     /// longest kept for the told word ([`DoorWatch::ready_idle`]). Where `look` is false (a break
     /// whose write takes the look) the clock is fed and what stands already read, none raised.
@@ -1125,9 +1124,9 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// THE TASK DOOR'S LINE at a break (the slice-2 plan's D1): the first rule whose line the
-    /// managed guard alone holds (`Guards::held_except`: every other guard clear, so the line
-    /// would have been typed but for the manager), in an episode the door has not booked
+    /// The task door's line at a break: the first rule whose line the managed guard alone holds
+    /// (`Guards::held_except`: every other guard clear, so the line would have been typed but
+    /// for the manager), in an episode the door has not booked
     /// ([`super::super::facts::FactsState::is_noted`]); `None` where none, and on a tape a build
     /// before slice 2's doors recorded.
     pub(super) fn door_task_due(
@@ -1165,13 +1164,13 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// THE TASK DOOR under `prompt` (W3: the one caller of `IdleHost::task_fact` with a word,
-    /// its `PromptGrant` the gate): the intent row (`fact-intent@v1 … door=task`), the host asked
-    /// to note the episode's fact word on the session's task record, and the outcome row
+    /// The task door under `prompt` (the one caller of `IdleHost::task_fact` with a word, its
+    /// `PromptGrant` the gate): the intent row (`fact-intent@v1 … door=task`), the host asked to
+    /// note the episode's fact word on the session's task record, and the outcome row
     /// (`fact-hold@v1`, `waiting … door=task noted`, or `skipped … door=task why=<word>`). The
     /// episode is booked once, but a `fenced` answer is tried again at the next break. Nothing is
-    /// typed: the line stays held by the manager. An older hold's clear must be acknowledged
-    /// first, so it cannot erase this note and a reused word still gets a fresh fact edge.
+    /// typed: the line stays held by the manager. Nothing is noted while an older hold's clear is
+    /// owed, so that clear cannot erase this note and a reused word still gets a fresh fact edge.
     fn door_task(
         &mut self,
         _grant: &super::super::config::PromptGrant,
@@ -1227,8 +1226,8 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// The task door under `observe` (F2: on a tape slice 2's doors recorded, as every live
-    /// loop's): the would-be note's row (`fact-would@v1 … door=task`), once an episode, and
+    /// The task door under `observe` (on a tape slice 2's doors recorded, as in every live
+    /// loop): the would-be note's row (`fact-would@v1 … door=task`), once an episode, and
     /// nothing asked of the host.
     fn door_task_would(
         &mut self,
@@ -1314,10 +1313,10 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The fact word the session's task record carries at the loop's first read of it
     /// (`Session::task_seed`, `fact` as `task` gave it), in a loop that measures the hold (its
-    /// start placed the wall, [`Self::hold_seed_from`]) and under a grant: with no hold open it
-    /// stands for no episode and is cleared now. A word the ledger assigns to a closed hold
-    /// is also cleared before a replacement; an open or still-unconsumed carried hold keeps
-    /// its own word, including when an older ledger has no task-note provenance.
+    /// start placed the wall, [`Self::hold_seed_from`]). An open or still-unconsumed carried hold
+    /// keeps it as its own word, even where an older ledger has no task-note provenance, unless
+    /// the ledger assigns it to a closed hold; otherwise its clear is owed, made now under a
+    /// grant ([`Self::door_task_owed`]).
     pub(super) fn door_task_seed(&mut self, fact: Option<FactWord>, cfg: &SupervisorConfig) {
         let Some(word) = fact else {
             return;

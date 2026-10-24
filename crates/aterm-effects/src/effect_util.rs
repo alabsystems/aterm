@@ -40,9 +40,9 @@ pub(crate) fn push_grid_quad(
     let ch = geom.ch as i32;
     let x0_u = x0 as u16;
     let w_u = (x1 - x0) as u16;
+    let mut row = y0 / ch;
     let mut yy = y0;
     while yy < y1 {
-        let row = yy / ch;
         let band_end = ((row + 1) * ch).min(y1);
         out.push(GlowQuad {
             row: row as u16,
@@ -56,6 +56,7 @@ pub(crate) fn push_grid_quad(
             alpha2: alpha,
         });
         yy = band_end;
+        row += 1;
     }
 }
 
@@ -148,12 +149,15 @@ pub(crate) fn push_soft_disc(
     peak: f32,
 ) {
     const SEGMENTS: usize = 4;
-    if peak < 1.0 || rx < 0.5 || ry < 0.5 {
+    if peak < 1.0 || rx < 0.5 || ry < 0.5 || color == 0 {
+        return;
+    }
+    let y0 = ((cy - ry).floor() as i32).max(geom.fx_top());
+    let y1 = ((cy + ry).ceil() as i32).min(geom.fx_bot());
+    if y0 >= y1 {
         return;
     }
     let inv_rx = 1.0 / rx;
-    let y0 = ((cy - ry).floor() as i32).max(geom.fx_top());
-    let y1 = ((cy + ry).ceil() as i32).min(geom.fx_bot());
     for y in y0..y1 {
         let dy = (y as f32 + 0.5 - cy) / ry;
         let dy2 = dy * dy;
@@ -220,16 +224,24 @@ pub(crate) fn push_fx_ramp(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
-    let ((c0, a0), (c1, a1)) = if left == right {
+    let ((c0, a0), (c1, a1)) = if left == right || (x0 == x && x1 == x + w) {
         (left, right)
     } else {
         let at = |px: i32| -> (u32, u8) {
             let t = (px - x) as f32 / w as f32;
             let lerp = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * t).round() as u32;
             let ch = |sh: u32| lerp((left.0 >> sh) & 0xff, (right.0 >> sh) & 0xff).min(255) << sh;
-            let alpha = lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8;
-            let alpha = if left.1 > 0 { alpha.max(1) } else { 0 };
-            (ch(16) | ch(8) | ch(0), alpha)
+            let color = if left.0 == right.0 {
+                left.0 & 0x00FF_FFFF
+            } else {
+                ch(16) | ch(8) | ch(0)
+            };
+            let alpha = if left.1 == right.1 {
+                left.1
+            } else {
+                (lerp(u32::from(left.1), u32::from(right.1)).min(255) as u8).max(1)
+            };
+            (color, alpha)
         };
         let end0 = if x0 == x { left } else { at(x0) };
         let end1 = if x1 == x + w { right } else { at(x1) };
@@ -239,9 +251,9 @@ pub(crate) fn push_fx_ramp(
     let oy = i32::from(geom.origin_y);
     let x0_u = x0 as u16;
     let w_u = (x1 - x0) as u16;
+    let mut row = (y0 - oy).div_euclid(ch);
     let mut yy = y0;
     while yy < y1 {
-        let row = (yy - oy).div_euclid(ch);
         let band_end = (oy + (row + 1) * ch).min(y1);
         out.push(GlowQuad {
             row: row.max(0) as u16,
@@ -255,6 +267,7 @@ pub(crate) fn push_fx_ramp(
             alpha2: a1,
         });
         yy = band_end;
+        row += 1;
     }
 }
 

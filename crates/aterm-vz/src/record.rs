@@ -9,6 +9,7 @@
 //! | `run/aterm-linux.json` | the record, written by rename once the socket is bound |
 //! | `run/helper.log` | the helper's stdout and stderr, appended |
 //! | `run/console.log` | hvc0, as the guest wrote it |
+//! | `run/key.img` | the boot's key disk (0600), attached read-only; removed when the helper exits |
 //! | `live/aterm-linux.img.lock` | the live disk's `flock`, held for the helper's whole life |
 //!
 //! A record names its helper by pid *and* unique id (`p_uniqueid`, never reused within a
@@ -68,6 +69,12 @@ impl Paths {
     #[must_use]
     pub fn console_log(&self) -> PathBuf {
         self.run_dir().join("console.log")
+    }
+
+    /// `run/key.img`: the boot's key disk ([`crate::key`]).
+    #[must_use]
+    pub fn key_disk(&self) -> PathBuf {
+        self.run_dir().join("key.img")
     }
 
     /// `live/aterm-linux.img`.
@@ -231,13 +238,15 @@ pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
     }
 }
 
-/// A dead helper's leftovers: its record and its socket, removed so the next bring-up boots.
-/// Only the record of the helper named `dead` is removed, so a record a new helper wrote
-/// meanwhile is kept.
+/// A dead helper's leftovers: its record, its socket and its boot's key disk, removed so the
+/// next bring-up boots and no key outlives its VM (a helper SIGKILLed by the escalation
+/// cannot remove its own, measured in V4). Only the leftovers of the helper named `dead` are
+/// removed, so what a new helper wrote meanwhile is kept.
 pub fn remove_leftovers(paths: &Paths, dead: &Record) {
     if Record::read(&paths.record()).as_ref() == Some(dead) {
         let _ = std::fs::remove_file(paths.record());
         let _ = std::fs::remove_file(paths.socket());
+        let _ = std::fs::remove_file(paths.key_disk());
     }
 }
 
@@ -373,8 +382,10 @@ mod tests {
         pids.0.borrow_mut().clear();
         assert_eq!(holder(&paths, &pids), Holder::Dead(r.clone()));
         std::fs::write(paths.socket(), b"").unwrap();
+        std::fs::write(paths.key_disk(), b"").unwrap();
         remove_leftovers(&paths, &r);
         assert!(!paths.record().exists() && !paths.socket().exists());
+        assert!(!paths.key_disk().exists(), "no key outlives its VM");
     }
 
     #[test]
@@ -384,8 +395,13 @@ mod tests {
         std::fs::create_dir_all(paths.run_dir()).unwrap();
         let newer = record(5000, 1);
         newer.write(&paths.record()).unwrap();
+        std::fs::write(paths.key_disk(), b"").unwrap();
         remove_leftovers(&paths, &record(4242, 77));
         assert_eq!(Record::read(&paths.record()), Some(newer));
+        assert!(
+            paths.key_disk().exists(),
+            "the newer helper's key disk stays"
+        );
     }
 
     #[test]

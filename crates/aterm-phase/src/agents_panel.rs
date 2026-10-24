@@ -403,7 +403,7 @@ fn more_row(row: &str, at: usize, end: usize, cols: Cols<'_>) -> Option<PanelRow
     let n_at = end - rest.len();
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     let words = &rest[digits..];
-    if digits == 0 || words != crate::anchors::anchor_text("panel.more") {
+    if digits == 0 || words != crate::anchor!("panel.more") {
         return None;
     }
     let n = rest[..digits].parse().ok()?;
@@ -418,7 +418,7 @@ fn more_row(row: &str, at: usize, end: usize, cols: Cols<'_>) -> Option<PanelRow
 
 /// The main row's body: `main`, alone or with `↑ N more` at the right.
 fn main_row(row: &str, body: usize, end: usize, cols: Cols<'_>, out: PanelRow) -> Option<PanelRow> {
-    let word = &crate::anchors::anchor_text("panel.main")[1..];
+    let word = &crate::anchor!("panel.main")[1..];
     let rest = row[body..end].strip_prefix(word)?;
     let name_end = body + word.len();
     let mut main = PanelRow {
@@ -436,7 +436,7 @@ fn main_row(row: &str, body: usize, end: usize, cols: Cols<'_>, out: PanelRow) -
     let more = crate::text::trim_start(rest);
     let n = more.strip_prefix(ARROW_UP)?.strip_prefix(' ')?;
     let digits = n.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || &n[digits..] != crate::anchors::anchor_text("panel.more") {
+    if digits == 0 || &n[digits..] != crate::anchor!("panel.more") {
         return None;
     }
     let n_at = end - n.len();
@@ -452,7 +452,7 @@ fn idle_row(row: &str, body: usize, end: usize, cols: Cols<'_>, out: PanelRow) -
         return None;
     }
     let words = text[digits..].strip_prefix(' ')?;
-    let noun = crate::anchors::anchor_text("panel.idle_agents");
+    let noun = crate::anchor!("panel.idle_agents");
     if words != noun && words.strip_suffix('s') != Some(noun) {
         return None;
     }
@@ -571,12 +571,11 @@ fn bar_elapsed(text: &str) -> Option<Elapsed> {
 
 /// The status's words in place of an elapsed time.
 fn word_elapsed(text: &str) -> Option<Elapsed> {
-    use crate::anchors::anchor_text;
-    if text == anchor_text("panel.awaiting") {
+    if text == crate::anchor!("panel.awaiting") {
         Some(Elapsed::AwaitingApproval)
-    } else if text == anchor_text("panel.idle") {
+    } else if text == crate::anchor!("panel.idle") {
         Some(Elapsed::Idle)
-    } else if text == anchor_text("panel.waiting") {
+    } else if text == crate::anchor!("panel.waiting") {
         Some(Elapsed::Waiting)
     } else {
         None
@@ -592,7 +591,7 @@ fn tokens(text: &str) -> Option<(Tokens, bool)> {
         (false, text.strip_prefix(ARROW_UP)?)
     };
     let rest = rest.strip_prefix(' ')?;
-    let words = crate::anchors::anchor_text("panel.tokens");
+    let words = crate::anchor!("panel.tokens");
     let (figure, worded) = match rest.strip_suffix(words) {
         Some(figure) => (figure, true),
         None => (rest, false),
@@ -628,7 +627,7 @@ fn tokens(text: &str) -> Option<(Tokens, bool)> {
 /// `N queued`.
 fn queued(text: &str) -> Option<u16> {
     let (n, words) = number(text)?;
-    (words == crate::anchors::anchor_text("panel.queued"))
+    (words == crate::anchor!("panel.queued"))
         .then(|| u16::try_from(n).ok())
         .flatten()
 }
@@ -655,7 +654,7 @@ fn warning(text: &str) -> bool {
     rest.is_empty()
         || rest
             .strip_prefix(' ')
-            .is_some_and(|w| w == crate::anchors::anchor_text("panel.large_workflow"))
+            .is_some_and(|w| w == crate::anchor!("panel.large_workflow"))
 }
 
 /// The run of bar cells `▰…▱` (or `█…░`) at the start of `text`: its filled
@@ -768,7 +767,7 @@ fn task_row(
     let mut segs: [(usize, usize, Seg); SEGMENTS_MAX] = [(0, 0, Seg::Warning); SEGMENTS_MAX];
     let mut n = 0;
     let mut seg_end = end;
-    let stop = crate::anchors::anchor_text("panel.workflows_stop");
+    let stop = crate::anchor!("panel.workflows_stop");
     if let Some(head) = row[seg_from..seg_end]
         .strip_suffix(stop)
         .and_then(|h| h.strip_suffix(SEP))

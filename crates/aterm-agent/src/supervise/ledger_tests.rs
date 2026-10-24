@@ -804,10 +804,8 @@ fn the_harness_turns_are_not_the_managers() {
     assert!(!history_detail(&l).contains("harness"), "{l:#?}");
 }
 
-/// The ledger leaves the drive's own carry-on after a relaunch out of the manager's turns, as it
-/// does the harness's other typing ([`the_harness_turns_are_not_the_managers`]):
-/// `history` names it `by=harness`, because the drive types it under the harness's hand, and
-/// SOURCES counts it as the harness's. A turn `history` names `by=ctl` is the manager's.
+/// The drive's carry-on after a relaunch (`history`'s `by=harness`) is the harness's turn, not
+/// the manager's; a `by=ctl` turn is the manager's.
 #[test]
 fn the_drives_carry_on_turn_reads_as_the_harness_not_the_manager() {
     let with = |by: &str| {
@@ -991,10 +989,8 @@ fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
     assert_eq!(l.mail[0].t, None);
 }
 
-/// THE LEDGER READS THE LOG: it reads the worker's `log class=turn` and this session's
-/// `log kinds=mail`, never `timeline`, and places every turn by its log record; NEGATIVE
-/// CONTROL: a log that cannot be read places nothing
-/// (`a_log_that_cannot_be_read_places_nothing_and_says_so`).
+/// The ledger reads the worker's `log class=turn` and this session's `log kinds=mail`, never
+/// `timeline`, and places every turn by its log record.
 #[test]
 fn the_ledger_reads_the_log_and_no_clock() {
     let mut host = whole_host();
@@ -1056,10 +1052,8 @@ fn the_ledger_renders_its_goldens() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// AN UNREAD LOG GUESSES NO TIME: when the worker's `log` cannot be read, the ledger places no
-/// turn and says, where the latency would be, that the session log could not be read, and its
-/// journal times (wall times) print as they are, with no `~`, in text, md and html; NEGATIVE
-/// CONTROL: a log the ledger read places its turns.
+/// When the worker's `log` cannot be read, the ledger places no turn, says so where the latency
+/// would be, and prints journal times with no `~` in text, md and html.
 #[test]
 fn an_unread_log_guesses_no_time() {
     let (dir, path) = journal_file("log-unread", &journal_lines());
@@ -1086,12 +1080,10 @@ fn an_unread_log_guesses_no_time() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// EVERY JOURNAL WORD HAS ITS OWN MARK: each [`Word`] but `EVENT`, and each [`Noted`] word
-/// (a line the journal keeps as `other`), marks its lines with a kind no other word, `EVENT`
-/// phase, turn, reply or mail shares, and never `unread`; each `EVENT` phase the loops print
-/// has its mark; an older build's `other` line of a word this build reads takes that word's
-/// mark; every mark is in [`MarkKind::ALL`]; NEGATIVE CONTROL: a word, an `EVENT` phase or a
-/// kind this reader does not know reads `unread`.
+/// Each [`Word`] but `EVENT`, and each [`Noted`] word, marks its lines with a kind no other word,
+/// `EVENT` phase, turn, reply or mail shares; each `EVENT` phase the loops print has its mark; an
+/// older build's `other` line of a known word takes that word's mark; an unknown word, phase or
+/// kind reads `unread`.
 #[test]
 fn every_journal_word_has_its_own_mark() {
     let mark = |line: &str| MarkKind::of_record(&JournalRecord::of_line(1, None, line, None));
@@ -1212,10 +1204,8 @@ fn every_journal_word_has_its_own_mark() {
     );
 }
 
-/// A LOOP JOURNALS ONLY WHAT THE LEDGER READS: a test build's journal refuses a line whose
-/// word the ledger would read `unread` (`assert_marked`), so every loop test that journals
-/// holds its producers to [`Word`] and [`Noted`]; a `Noted` word, a `Word` and an `EVENT`
-/// phase pass; NEGATIVE CONTROL: a word no loop writes panics, on the journal's own write.
+/// A test build's journal refuses a line whose word the ledger would read `unread`
+/// (`assert_marked`), so every loop test holds its producers to [`Word`] and [`Noted`].
 #[test]
 fn a_loop_journals_only_what_the_ledger_reads() {
     for line in [
@@ -1245,11 +1235,9 @@ fn a_loop_journals_only_what_the_ledger_reads() {
     assert!(why.contains("`PROBING seq=1 x`"), "{why}");
 }
 
-/// THE PAGE COLOURS EACH MARK AS ITS LEGEND ROW DOES: the script draws every mark by the
-/// item's swatch class (`colour(it.cls)`, never its kind), and each class a mark is drawn in
-/// takes the colour its `.swatch` rule in the style shows (the golden page leaves the script
-/// out, so only this reads it); NEGATIVE CONTROL: a mark coloured by its kind, or a class
-/// the script has no colour for, fails.
+/// The script colours every mark by its item's swatch class (`colour(it.cls)`), and each class
+/// takes the colour its `.swatch` rule shows. The golden page leaves the script out, so only this
+/// test reads it.
 #[test]
 fn the_page_colours_each_mark_as_its_legend_row_does() {
     use super::super::ledger_html::{SCRIPT, STYLE, swatch};
@@ -1299,10 +1287,8 @@ fn the_page_colours_each_mark_as_its_legend_row_does() {
     }
 }
 
-/// EVERY MARK HAS ITS OWN LEGEND ROW: the page's legend names each [`MarkKind`] once, after
-/// the reply its `working` bar, each in a swatch the style draws; an item's data says its
-/// swatch; NEGATIVE CONTROL: the golden page (`the_ledger_renders_its_goldens`)
-/// holds the legend's rows byte for byte.
+/// The page's legend names each [`MarkKind`] once, with the `working` bar after the reply, each in
+/// a swatch the style draws; an item's data says its swatch.
 #[test]
 fn every_mark_has_its_own_legend_row() {
     use super::super::ledger_html::{STYLE, legend, swatch};
@@ -1351,9 +1337,8 @@ fn every_mark_has_its_own_legend_row() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// A CARRIED TURN THE LOG HOLDS IS PLACED BY IT: a turn carried from an earlier aterm is
-/// placed by its own log record, and the history row does not call it timeless; NEGATIVE
-/// CONTROL: a turn the log does not hold has no time.
+/// A turn carried from an earlier aterm is placed by its own log record, and its history row does
+/// not call it timeless; a turn the log does not hold has no time.
 #[test]
 fn a_carried_turn_the_log_holds_is_placed_by_it() {
     let body = "turn 7 submitted=1 status=settled started_ms=5 dur_ms=3 seq=4 hash=0 \

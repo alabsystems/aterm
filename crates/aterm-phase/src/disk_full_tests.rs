@@ -4,7 +4,6 @@
 //! Tests for the disk-full notice reader.
 
 use super::*;
-use crate::anchors::anchor_text;
 use crate::prompt::fixtures::{
     TOOL_DISK_FULL_2_1_309, TOOL_DISK_FULL_40_2_1_309, TOOL_DISK_FULL_60_2_1_309,
     TOOL_ERROR_AUTO_MODE_2_1_309, TOOL_PRESTART_PRINTED_2_1_309,
@@ -22,7 +21,7 @@ fn measured_with(mapped: &str) -> (Vec<String>, usize) {
         .collect();
     let at = r
         .iter()
-        .position(|row| row.contains(anchor_text("wall.disk_full")))
+        .position(|row| row.contains(crate::anchor!("wall.disk_full")))
         .expect("the measured notice row");
     (r, at)
 }
@@ -43,7 +42,7 @@ fn the_measured_notice_reads_after_the_vendors_glyph() {
         (Code::Enospc, Source::Notification, at)
     );
     assert!(
-        d.message.starts_with(anchor_text("wall.disk_full")),
+        d.message.starts_with(crate::anchor!("wall.disk_full")),
         "{:?}",
         d.message
     );
@@ -93,7 +92,7 @@ fn the_glyphs_row_anywhere_else_is_not_the_notice() {
 fn notice(mapped: &str) -> String {
     format!(
         "{}{mapped}) · recent messages may not be saved for resume",
-        anchor_text("wall.disk_full")
+        crate::anchor!("wall.disk_full")
     )
 }
 
@@ -163,7 +162,7 @@ fn the_same_words_anywhere_else_are_not_the_notice() {
 
 fn measured_tool() -> (Vec<String>, usize, usize) {
     let r = screen(TOOL_DISK_FULL_2_1_309);
-    let head = format!("{RESULT_BODY}{}", anchor_text("wall.disk_full.tool"));
+    let head = format!("{RESULT_BODY}{}", crate::anchor!("wall.disk_full.tool"));
     let at = r
         .iter()
         .position(|row| row.starts_with(&head))
@@ -201,19 +200,19 @@ fn the_measured_tool_notice_reads_under_its_exit_row() {
         (d.source, d.code, d.row),
         (Source::ToolOutput, Code::Enospc, at)
     );
-    assert!(d.message.starts_with(anchor_text("wall.disk_full.tool")));
+    assert!(d.message.starts_with(crate::anchor!("wall.disk_full.tool")));
     assert!(
         r[at..at + rows]
             .iter()
-            .any(|row| row.contains(anchor_text("wall.disk_full.tool_dir")))
+            .any(|row| row.contains(crate::anchor!("wall.disk_full.tool_dir")))
     );
 
     let inodes: Vec<String> = r
         .iter()
         .map(|row| {
             row.replacen(
-                anchor_text("wall.disk_full.tool"),
-                anchor_text("wall.disk_full.tool_inodes"),
+                crate::anchor!("wall.disk_full.tool"),
+                crate::anchor!("wall.disk_full.tool_inodes"),
                 1,
             )
         })
@@ -224,11 +223,11 @@ fn the_measured_tool_notice_reads_under_its_exit_row() {
     );
     let quota_head = format!(
         "{}a test write beside this command's output file, on the volume holding /private/tmp/claude-502",
-        anchor_text("wall.disk_full.tool_quota")
+        crate::anchor!("wall.disk_full.tool_quota")
     );
     let quota_rest = format!(
         "{}, failed with EDQUOT, so whatever this command printed was lost.",
-        anchor_text("wall.disk_full.tool_dir").trim_start()
+        crate::anchor!("wall.disk_full.tool_dir").trim_start()
     );
     let quota = with_notice(&[&quota_head, &quota_rest]);
     assert_eq!(disk_full(&quota).map(|d| d.code), Some(Code::Edquot));
@@ -252,7 +251,7 @@ fn the_measured_tool_notice_reads_under_its_exit_row() {
 fn the_tool_notice_anywhere_else_is_not_read() {
     let (r, at, rows) = measured_tool();
     assert!(disk_full(&r).is_some(), "the screen the controls edit");
-    let dir = anchor_text("wall.disk_full.tool_dir");
+    let dir = crate::anchor!("wall.disk_full.tool_dir");
     let undirected: Vec<String> = r.iter().map(|row| row.replace(dir, "")).collect();
     assert_ne!(undirected, r);
     assert_eq!(disk_full(&undirected), None, "no directory phrase");
@@ -292,7 +291,7 @@ fn the_tool_notice_anywhere_else_is_not_read() {
 
     let head = format!(
         "{}this computer's volume holding /private/tmp/claude-502",
-        anchor_text("wall.disk_full.tool")
+        crate::anchor!("wall.disk_full.tool")
     );
     let mut stray = with_notice(&[&head]);
     stray.insert(
@@ -341,7 +340,7 @@ fn the_tool_notice_anywhere_else_is_not_read() {
     let footer = busy(
         &[],
         "",
-        &format!("  {}soon", anchor_text("wall.disk_full.tool")),
+        &format!("  {}soon", crate::anchor!("wall.disk_full.tool")),
     );
     assert_eq!(
         disk_full(&footer),
@@ -362,7 +361,7 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
         "the rewrap is the vendor's wrap"
     );
 
-    let dir = anchor_text("wall.disk_full.tool_dir");
+    let dir = crate::anchor!("wall.disk_full.tool_dir");
     let tail = &words[words
         .find("Free space on that volume")
         .expect("the measured tail")..];
@@ -376,7 +375,7 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
             format!(
                 "{}this computer's volume holding {volume}{dir} has 812 free inodes, so creating \
                  files there may fail and the command may have failed for that reason. {tail}",
-                anchor_text("wall.disk_full.tool_inodes")
+                crate::anchor!("wall.disk_full.tool_inodes")
             ),
             Code::Enospc,
         ),
@@ -384,7 +383,7 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
             format!(
                 "{}{beside}, failed with EDQUOT, so whatever this command printed was lost and its \
                  own writes may have failed with \"Disk quota exceeded\". {tail}",
-                anchor_text("wall.disk_full.tool_quota")
+                crate::anchor!("wall.disk_full.tool_quota")
             ),
             Code::Edquot,
         ),
@@ -392,7 +391,7 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
             format!(
                 "{}{beside}, failed with ENOSPC (the volume, or the user's quota on it, has no space \
                  left), so whatever this command printed was lost. {tail}",
-                anchor_text("wall.disk_full.tool")
+                crate::anchor!("wall.disk_full.tool")
             ),
             Code::Enospc,
         ),
@@ -422,7 +421,7 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
 
     let head = format!(
         "{}this computer's volume holding {volume}",
-        anchor_text("wall.disk_full.tool")
+        crate::anchor!("wall.disk_full.tool")
     );
     let mut far = vec![head];
     far.extend((1..TOOL_NOTICE_ROWS).map(|k| format!("build step {k} of 9")));
@@ -441,19 +440,16 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
     );
 }
 
-/// THE TOOL NOTICE IN A NARROW PANE, AS CLAUDE CODE DRAWS IT (2.1.309,
-/// MEASURED at 60 and 40 columns): the statfs form's rows under the exit
-/// line are the rewrap of its words at the pane's width less five, its
-/// directory phrase ends on the third row at both widths, and it reads with
-/// ENOSPC at its head row. The words are the 144-column capture's, its uid
-/// aside.
+/// The statfs tool notice as Claude Code 2.1.309 draws it at 60 and 40 columns: the 144-column
+/// capture's words rewrapped at the pane's width less five, the directory phrase ending on the
+/// third row, read with ENOSPC at its head row.
 #[test]
 fn a_narrow_panes_notice_as_drawn_reads() {
     let (r, at, rows) = measured_tool();
     let measured: Vec<&str> = r[at..at + rows].iter().map(|row| row.trim()).collect();
     let words_144 = measured.join(" ");
-    let head = format!("{RESULT_BODY}{}", anchor_text("wall.disk_full.tool"));
-    let dir = anchor_text("wall.disk_full.tool_dir");
+    let head = format!("{RESULT_BODY}{}", crate::anchor!("wall.disk_full.tool"));
+    let dir = crate::anchor!("wall.disk_full.tool_dir");
     for (cols, text) in [
         (60, TOOL_DISK_FULL_60_2_1_309),
         (40, TOOL_DISK_FULL_40_2_1_309),
@@ -487,13 +483,8 @@ fn a_narrow_panes_notice_as_drawn_reads() {
     }
 }
 
-/// THE TOOL NOTICE READS TO ITS SIXTH ROW AND NO FURTHER: the quota form
-/// (the bundle's template around the measured tail) rewrapped at 40
-/// columns, its temporary directory a path deep enough that the directory
-/// phrase ends on the notice's sixth row, reads with EDQUOT; deep enough
-/// that the phrase ends on its seventh, it is not read, that row taken for
-/// a later line of the command's output. A bound one row lower or higher
-/// fails one side.
+/// The quota tool notice at 40 columns reads when its directory phrase ends on its sixth row, and
+/// not on its seventh, which is taken for a later line of the command's output.
 #[test]
 fn the_tool_notice_reads_to_its_sixth_row_and_no_further() {
     let (r, at, rows) = measured_tool();
@@ -502,13 +493,13 @@ fn the_tool_notice_reads_to_its_sixth_row_and_no_further() {
     let tail = &words[words
         .find("Free space on that volume")
         .expect("the measured tail")..];
-    let dir = anchor_text("wall.disk_full.tool_dir");
+    let dir = crate::anchor!("wall.disk_full.tool_dir");
     let quota = |volume: &str| {
         format!(
             "{}a test write beside this command's output file, on the volume holding \
              {volume}{dir}, failed with EDQUOT, so whatever this command printed was lost and its \
              own writes may have failed with \"Disk quota exceeded\". {tail}",
-            anchor_text("wall.disk_full.tool_quota")
+            crate::anchor!("wall.disk_full.tool_quota")
         )
     };
     // The notice wrapped in a 40-column pane around a directory `depth`
@@ -586,7 +577,7 @@ fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
 fn a_goal_cleared_on_a_full_disk_reads_from_its_row() {
     let goal = format!(
         "{}disk full): \"ship the release\". Run /goal again to continue.",
-        anchor_text("wall.disk_full.goal")
+        crate::anchor!("wall.disk_full.goal")
     );
     let mut r = busy(&[], "", "  ? for shortcuts");
     r.insert(6, format!("  ⎿  {goal}"));
@@ -613,16 +604,16 @@ const MEASURED_DIR: &str = "/private/tmp/claude-502";
 fn pre_start_words(said: &str, code: &str) -> String {
     format!(
         "{}{said}{code}){}{MEASURED_DIR}{}{} {}",
-        anchor_text("wall.disk_full.pre_start"),
-        anchor_text("wall.disk_full.pre_start_volume"),
-        anchor_text("wall.disk_full.tool_dir"),
-        anchor_text("wall.disk_full.pre_start_ran"),
-        anchor_text("wall.disk_full.free_space"),
+        crate::anchor!("wall.disk_full.pre_start"),
+        crate::anchor!("wall.disk_full.pre_start_volume"),
+        crate::anchor!("wall.disk_full.tool_dir"),
+        crate::anchor!("wall.disk_full.pre_start_ran"),
+        crate::anchor!("wall.disk_full.free_space"),
     )
 }
 
 fn full_words() -> String {
-    pre_start_words(anchor_text("wall.disk_full.pre_start_full"), "ENOSPC")
+    pre_start_words(crate::anchor!("wall.disk_full.pre_start_full"), "ENOSPC")
 }
 
 fn in_error_place(text: &str, cols: usize) -> Vec<String> {
@@ -635,9 +626,8 @@ fn in_error_place(text: &str, cols: usize) -> Vec<String> {
     in_pane(r, cols)
 }
 
-/// `r` in a `cols`-column pane: its rules (the composer's) redrawn across
-/// that width, as Claude Code draws them (MEASURED: 40, 60, 144 and 179
-/// columns).
+/// `r` in a `cols`-column pane: its rules (the composer's) redrawn across that width, as Claude
+/// Code draws them.
 fn in_pane(mut r: Vec<String>, cols: usize) -> Vec<String> {
     for row in &mut r {
         if crate::phase::is_rule(row) {
@@ -708,7 +698,7 @@ fn a_command_not_started_reads_in_the_place_of_its_error_result() {
     );
     assert_eq!(disk_full(&r), None, "the classifier's words");
 
-    let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
+    let quota = pre_start_words(crate::anchor!("wall.disk_full.pre_start_quota"), "EDQUOT");
     for cols in [144, 100, 80, 60, 40] {
         for (words, code) in [(full_words(), Code::Enospc), (quota.clone(), Code::Edquot)] {
             let d = disk_full(&in_error_place(&words, cols))
@@ -720,7 +710,7 @@ fn a_command_not_started_reads_in_the_place_of_its_error_result() {
             );
             assert!(
                 d.message
-                    .starts_with(anchor_text("wall.disk_full.pre_start").trim_end()),
+                    .starts_with(crate::anchor!("wall.disk_full.pre_start").trim_end()),
                 "{:?}",
                 d.message
             );
@@ -728,18 +718,14 @@ fn a_command_not_started_reads_in_the_place_of_its_error_result() {
     }
 }
 
-/// A PRINTED COPY READS AT NO WIDTH: the bundle's words printed by a
-/// command, drawn in every pane from 40 to 220 columns, are never read as
-/// the notice, and the notice itself, word-wrapped into its error result's
-/// place, reads with its code at every one of those widths. Where each of
-/// the copy's breaks falls just after a space or inside the directory (the
-/// full form's at 170, 179, 193 and 218 columns) its rows are a word wrap's
-/// at a room five columns narrower than the notice's, and only the pane's
-/// width tells them apart. CONTROL: under a composer five columns narrower,
-/// the copy reads exactly at those widths, its rows the template's.
+/// A command's printed copy of the words is never read as the notice in a pane of 40 to 220
+/// columns, while the notice in its error result's place reads at each. Where the copy's breaks
+/// all fall after a space or inside the directory (170, 179, 193 and 218 columns for the full
+/// form), only the pane's width tells it from a word wrap: under a composer five columns
+/// narrower it reads at exactly those widths.
 #[test]
 fn a_printed_copy_reads_at_no_width() {
-    let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
+    let quota = pre_start_words(crate::anchor!("wall.disk_full.pre_start_quota"), "EDQUOT");
     for (words, code) in [(full_words(), Code::Enospc), (quota, Code::Edquot)] {
         let line = format!("Error: {words}");
         let like = word_like_widths(&line);
@@ -778,16 +764,9 @@ fn word_like_widths(line: &str) -> Vec<usize> {
         .collect()
 }
 
-/// THE MEASURED COPY AT 179 COLUMNS IS REFUSED BY WIDTH (2.1.309,
-/// MEASURED): a command's printed copy of the words on the `⎿` row, wrapped
-/// by column at 169 with each break just after a space (`… so the file`,
-/// `… a directory on`), rows a word wrap at a room of 169 also draws, which
-/// this reader read as the notice before it measured the pane. Claude
-/// Code's own word wrap at 179 columns puts `that` on the first row and
-/// `another` on the second (MEASURED the same day: the words as a failed
-/// command's output), so here the next word would have fit and the copy is
-/// not read. CONTROL: the copy's rows are [`in_printed_place`]'s at 179,
-/// and under a 174-column composer (a room of 169) they read.
+/// The measured 179-column copy is refused by width: its column wrap at 169 breaks after a space
+/// on each row, as a word wrap at a room of 169 would, but Claude Code's own wrap at 179 fits the
+/// next word on each row. Under a 174-column composer (a room of 169) it reads.
 #[test]
 fn the_measured_copy_at_179_columns_is_refused_by_width() {
     let line = format!("Error: {}", full_words());
@@ -821,14 +800,10 @@ fn the_measured_copy_at_179_columns_is_refused_by_width() {
     assert_eq!((d.code, d.row), (Code::Enospc, at));
 }
 
-/// THE VENDOR'S WRAP OF THE WORDS IS THE ROOM'S (2.1.309, MEASURED at 40,
-/// 60 and 179 columns): the pre-start words a failed command printed are
-/// drawn under its exit line as a word wrap at the pane's width less five,
-/// the room [`message_room`] reads off the composer's rule. Moved onto the
-/// `⎿` row in place of the exit line (where Claude Code draws its own
-/// notice, in the same error renderer) they read with ENOSPC, and they are
-/// the rows [`in_error_place`] draws there. Where they lie, under the exit
-/// line, they are a command's output and are not read.
+/// The pre-start words a failed command printed under its exit line are Claude Code 2.1.309's
+/// word wrap at the room [`message_room`] reads, the pane less five (measured at 40, 60 and 179
+/// columns): not read where they lie, but read with ENOSPC moved onto the `⎿` row, where they
+/// are the rows [`in_error_place`] draws.
 #[test]
 fn the_vendors_wrap_of_the_words_is_the_rooms() {
     let line = format!("Error: {}", full_words());
@@ -866,11 +841,8 @@ fn the_vendors_wrap_of_the_words_is_the_rooms() {
     }
 }
 
-/// ALL OF THE NOTICE OR NOTHING: Claude Code draws the notice whole (one
-/// line of the ten its error renderer draws), so cut after any of its rows
-/// (the rows under the cut blank, as a screen read mid-draw would hold
-/// them) it is not read, at 40 and 60 columns and at each width where a
-/// printed copy's rows are a word wrap's; whole, in the same place, it is.
+/// Claude Code draws the notice whole, so one cut after any of its rows (as a mid-draw read holds
+/// it) is not read, at 40 and 60 columns and at each word-like width; whole, it is.
 #[test]
 fn a_notice_cut_short_is_not_read() {
     let (_, at, _) = measured_error();
@@ -980,7 +952,7 @@ fn the_pre_start_words_anywhere_else_are_not_read() {
         "a command's output, `Error: ` and all"
     );
 
-    let dir = anchor_text("wall.disk_full.tool_dir");
+    let dir = crate::anchor!("wall.disk_full.tool_dir");
     let undirected = words.replace(dir, "");
     assert_ne!(undirected, words);
     assert_eq!(
@@ -1006,7 +978,7 @@ fn the_pre_start_words_anywhere_else_are_not_read() {
             "Delete files there that are no longer needed, then retry.",
         ),
     ] {
-        let changed = words.replace(anchor_text(part), other);
+        let changed = words.replace(crate::anchor(part), other);
         assert_ne!(changed, words);
         assert_eq!(
             disk_full(&in_error_place(&changed, 144)),
@@ -1023,7 +995,7 @@ fn the_pre_start_words_anywhere_else_are_not_read() {
             "ENOSPC: no space left on device",
         ),
     ] {
-        let other = pre_start_words(anchor_text(said), code);
+        let other = pre_start_words(crate::anchor(said), code);
         assert_eq!(
             disk_full(&in_error_place(&other, 144)),
             None,

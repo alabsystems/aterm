@@ -138,9 +138,9 @@ fn file_holders_are_lsof_s() {
     println!("{DONE}");
 }
 
-/// [`open_files`] (read in process) names the files `/usr/sbin/lsof -p <pid> -d 0-1023 -Fn`
-/// names for a process's descriptors, the reader it replaced, in descriptor order: a child
-/// holding one file as its stdin, `/dev/null` as its stdout and another file as its stderr.
+/// [`open_files`] (read in process) names, in descriptor order, the files
+/// `lsof -p <pid> -d 0-1023 -Fn` names for a process's descriptors: a child holding one file as
+/// its stdin, `/dev/null` as its stdout and another file as its stderr.
 #[cfg(target_os = "macos")]
 #[test]
 fn open_files_are_lsof_s() {
@@ -192,7 +192,7 @@ fn open_files_are_lsof_s() {
     assert_eq!(open_files(pid), None, "exited");
 }
 
-/// ONLY A COMPLETE SCAN NAMES THE HOLDERS: an unreadable table leaves them unknown, with or
+/// Only a complete scan names the holders: an unreadable table leaves them unknown, with or
 /// without a holder found.
 #[test]
 fn only_a_complete_holder_scan_can_establish_the_holder_set() {
@@ -1763,9 +1763,8 @@ const TAB: &str = "s-feedfacefeedfacefeed";
 /// A conversation id the stand-in agents hold.
 const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
 
-/// A person's prompt: what makes the conversation a transcript below stands
-/// for one with a task (a record of the harness's own turns alone is
-/// restarted afresh, never announced to, and is carried on with nothing).
+/// A person's prompt: it gives a test's transcript a task (one holding only the harness's own
+/// turns is restarted afresh, never announced to, and carried on with nothing).
 const ASKED: &str = r#"{"type":"user","message":{"role":"user","content":"fix the bug"}}"#;
 
 /// The stand-in agent's argv: this test binary, running only [`park_when_asked`].
@@ -2620,8 +2619,8 @@ pub(super) fn sh_script(exe: &Path, body: &str) {
         }
     }
     unsafe extern "C" {
-        /// `stdlib.h`, declared inline as `aterm-gui`'s `test_scratch` declares
-        /// it (the workspace's `libc` is `aterm-libc`, which does not carry it).
+        /// `stdlib.h`'s `atexit`, declared here because the workspace's `libc` (`aterm-libc`)
+        /// lacks it.
         fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
     }
     let mut beside = exe.as_os_str().to_owned();
@@ -2681,8 +2680,8 @@ fn ledger_lines(opts: &Opts) -> usize {
     std::fs::read_to_string(state_dir(opts).join("ledger.jsonl")).map_or(0, |t| t.lines().count())
 }
 
-/// The ready answer is read whatever byte the tail window starts on, also on the second byte of `é`
-/// (C3 A9).
+/// The ready answer is read whatever byte the tail window starts on, also the second byte of
+/// `é` (C3 A9).
 #[test]
 fn a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character() {
     let dir = scratch("tail");
@@ -3117,9 +3116,9 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
             hit
         })
     };
-    // The agent as `visit` judges it: the stand-in itself (its argv; until it execs, the host's
-    // own program is a fork of this same binary, which `wait_exec` passes before the host's
-    // `setsid`), its group its own and the pty's foreground (`ids`: `pgid == tpgid == pid`).
+    // The agent as `visit` judges it: the stand-in by its argv (until it execs, a fork carries its
+    // parent's, and the host's fork is this same binary, which `wait_exec` would pass), its group
+    // its own and the pty's foreground (`ids`: `pgid == tpgid == pid`).
     let leads = |agent: u32| {
         (0..3_000).any(|_| {
             let led = atpkg::caller_shell::process_args(agent)
@@ -3160,8 +3159,8 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
         let sf = register(&opts.home, agent, SESSION);
         let got = visit(&opts, &sf, &table(), &newer(), &Live);
         let again = visit(&opts, &sf, &table(), &newer(), &Live);
-        // SAFETY: kill takes two integers; the agent is this test's grandchild, alive until
-        // the host it parks under goes.
+        // SAFETY: kill takes two integers; the agent descends from this test and stays parked
+        // until its parent goes.
         let _ = unsafe { libc::kill(libc::pid_t::try_from(agent).expect("pid"), libc::SIGKILL) };
         let _ = host.kill();
         let _ = host.wait();
@@ -4839,8 +4838,8 @@ fn a_tabs_own_program_an_older_build_announced_to_is_released() {
     assert!(still_running);
 }
 
-/// A changed directory stamp is noticed on the next 250 ms poll, while a stable directory avoids
-/// reparsing all old JSON files.
+/// The roster is read again when the directory's stamp changes and, while it holds still, once
+/// [`SESSION_ROSTER_RESCAN`] has passed (an in-place write keeps the stamp).
 #[test]
 fn relaunch_roster_reuses_stable_files_but_rechecks_changes_and_in_place_writes() {
     let mut roster = SessionRosterCache::default();
@@ -6670,7 +6669,8 @@ fn a_hung_exit_past_its_bound_is_noted_once_and_nothing_is_forced() {
     }
 }
 
-/// The orphan pass skips a hung agent that already removed its session file while its pid lives.
+/// A hung agent that removed its session file while its pid lives is noted once past [`STALE_S`]
+/// by the orphan pass, which acts on nothing.
 #[test]
 fn a_hung_exit_with_no_session_file_is_noted_once_by_the_orphan_pass() {
     let dir = scratch("stuck-orphan");
@@ -6787,7 +6787,7 @@ fn a_relaunch_that_never_carries_on_is_noted_once_past_its_bound() {
     }
 }
 
-/// So too for an agent its shell has not reaped yet.
+/// A restart's agent that ended but is not reaped yet (a zombie) is seen gone ([`St::exited_at`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
@@ -7317,7 +7317,7 @@ fn a_quiet_wait_on_the_agents_work_owns_no_turn_end() {
     }
 }
 
-/// Muse code's quiet restart owns the turn end its log lags at ([`log_settles`]).
+/// Muse Code's quiet restart owns the turn end its log lags at ([`log_settles`]).
 #[test]
 fn the_muse_restarts_log_lag_owns_its_turn_end_for_the_settles_looks() {
     const GRACE: u32 = 120;
@@ -9159,8 +9159,8 @@ fn a_stopped_restart_a_hand_held_is_its_exits_counted_from_the_hand() {
     );
 }
 
-/// A restart's exit whose agent was seen gone before a hand held its tab, its stale bound stamped
-/// then.
+/// A restart whose agent was seen gone before a hand held its tab, carried through that hand,
+/// counts its stale bound from the lift.
 #[test]
 fn a_restart_carried_through_a_hand_counts_its_stale_bound_from_the_lift() {
     use super::super::relaunch::carry_restart;
@@ -9568,7 +9568,7 @@ fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
     assert!(super::super::relaunch::relaunch_cause(CAUSE_HOST));
 }
 
-/// Conformance test of `HarnessExitRecord` (aterm-spec).
+/// Conformance test of `HarnessExitRecord` (`aterm_models_harness::harness_exit_record_model`).
 #[test]
 fn the_real_exit_read_conforms_to_the_model() {
     let model = aterm_models_harness::harness_exit_record_model();
@@ -10201,11 +10201,10 @@ fn an_upgrade_record_keeps_the_fallbacks_origin() {
     assert_eq!(fallback_origin(&none), None);
 }
 
-/// THE PROFILE CONTEXT A LIVE SNAPSHOT CAPTURES of an agent started under the
-/// test's own home, read as `relaunch::snapshot_with` reads it off the
-/// process's exec environment ([`Records::billing_context`]): `HOME` names
-/// that home, no `CLAUDE_CONFIG_DIR`, no custom OAuth URL, and the login
-/// variable as `login` names it.
+/// The profile context a live snapshot captures of an agent started under the test's own home,
+/// read off the process's exec environment as `relaunch::snapshot_with` reads it
+/// ([`Records::billing_context`]): `HOME` names that home, no `CLAUDE_CONFIG_DIR`, no custom OAuth
+/// URL, and the login variable as `login` names it. Its profile file is written as `{}`.
 #[cfg(unix)]
 fn live_profile(opts: &Opts, login: Option<&str>) -> super::super::profile::Context {
     let env: Vec<String> = std::iter::once(format!("HOME={}", opts.home.display()))
@@ -13001,9 +13000,8 @@ fn held_step_shown(
     (r, st, rows, shown)
 }
 
-/// A wait long enough that a shell read as holding the tab throughout would
-/// have been read as ENDED (`Timings::FAST.ended_at_once` and several looks more): the
-/// negative controls wait it out.
+/// A wait long enough that a shell read as holding the tab throughout would have read as ended
+/// (`Timings::FAST.ended_at_once` and several looks more): the negative controls wait it out.
 #[cfg(unix)]
 const PAST_ENDED: Duration = Duration::from_millis(1_500);
 
@@ -13030,7 +13028,7 @@ fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
     assert_eq!(rows, 1);
 }
 
-/// A SHELL that holds its tab is no proof the agent ended.
+/// A shell that holds its tab is no proof the agent ended.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_whose_shell_has_not_run_its_line_yet_is_waited_on() {
@@ -13724,8 +13722,8 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A refusal with a model due (the ladder's `build-restart` keeps `model_to` set every pass) is
-/// still said and ledgered once.
+/// A refusal with a model due (`models::model_moves_now` answers `build-restart` every pass) is
+/// said and ledgered once.
 #[cfg(unix)]
 #[test]
 fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
@@ -15083,9 +15081,8 @@ impl Drop for Parked {
     }
 }
 
-/// A rig ends the stand-in agent it handed to [`Parked::reaped`] when the test
-/// did not: an agent the visit never signalled outlived its test, and the test
-/// binary, before.
+/// A rig ends the stand-in agent it handed to [`Parked::reaped`] when the test did not, so an
+/// agent the visit never signalled cannot outlive its test.
 #[cfg(unix)]
 #[test]
 fn a_rig_ends_the_agent_it_handed_to_its_reaper() {
@@ -15297,10 +15294,9 @@ fn ps_name(pid: u32) -> Option<String> {
         .map(|(_, _, _, name)| name)
 }
 
-/// A STAND-IN AGENT ([`parked`]) THAT LEADS A TERMINAL OF ITS OWN, as a
-/// Claude Code leads its aterm tab: a new session on a pty, that pty its
-/// controlling terminal, so its group is the terminal's foreground (`ids`:
-/// `pgid == tpgid == pid`) and a roster naming that group (`who …
+/// A stand-in agent ([`parked`]) that leads a terminal of its own, as a Claude Code leads its
+/// aterm tab: a new session on a pty that is its controlling terminal, so its group is the
+/// terminal's foreground (`ids`: `pgid == tpgid == pid`) and a roster naming that group (`who …
 /// fgpgid=<pid>`) claims it ([`host_candidates`]).
 #[cfg(unix)]
 fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> std::process::Child {
@@ -16452,8 +16448,8 @@ fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
     assert_eq!(st.waits.last().map(|w| w.word.as_str()), Some("w28"));
 }
 
-/// The product's 300 ms probe deadline covers a child that keeps running and one that exits while
-/// its finite child holds stdout.
+/// A version probe's deadline (300 ms here) bounds a child that keeps running and one that exits
+/// while its own child still holds stdout.
 #[cfg(unix)]
 #[test]
 fn a_version_probe_is_bounded_whole() {
@@ -17325,7 +17321,7 @@ fn a_bash_prompt_with_typing_after_its_mark_is_never_typed_at() {
 }
 
 /// The relaunch line is never typed into a program a person started at the returned prompt during
-/// the attempt's tries (a fenced turn can park 30 s).
+/// the attempt's tries (a fenced turn can park until its timeout).
 #[cfg(unix)]
 #[test]
 fn the_relaunch_line_is_never_typed_into_a_program_started_at_the_prompt() {
@@ -17578,7 +17574,7 @@ fn a_wide_prompt_glyph_never_hides_a_persons_typing() {
     }
 }
 
-/// A line a hand held is never typed into A SHELL a person used meanwhile.
+/// A line a hand held is never typed into a shell a person used meanwhile.
 #[cfg(unix)]
 #[test]
 fn a_line_a_hand_held_is_never_typed_into_a_shell_used_meanwhile() {
@@ -17941,7 +17937,8 @@ fn the_real_prompt_read_conforms_to_the_model() {
     );
 }
 
-/// `relaunch::end_asked_at`.
+/// `relaunch::end_asked_at` dates an exit only where its restart ended the agent itself: a cause
+/// filed after the agent left, an unknown one, or a line already typed dates nothing.
 #[test]
 fn only_a_restart_that_ended_its_agent_dates_a_persons_keys() {
     use super::super::relaunch::{
@@ -18065,8 +18062,7 @@ fn an_owners_now_moves_a_settling_session_and_the_wait_is_kept_until_then() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The ladder on Claude Code through the real `visit` (whose `look` shares `ladder_look` with the
-/// Codex visit).
+/// The ladder on Claude Code, climbed through the real `visit` and its [`ladder_look`].
 #[cfg(unix)]
 #[test]
 fn the_real_look_climbs_the_ladder_on_claude_code() {
@@ -19416,7 +19412,7 @@ fn a_listed_model_replaces_every_launch_model_spelling() {
     );
 }
 
-/// The relaunch argv end to end, by the calls the upgrade.
+/// The relaunch argv end to end, through the calls the upgrade makes.
 #[test]
 fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest() {
     const ID: &str = "446a0b3c-1979-414f-ae20-e06e26a2ef44";
@@ -19509,8 +19505,8 @@ fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest(
     }
 }
 
-/// A move outlives its record's removal (limits: [`St::moved_at`] lived in the conversation's
-/// record alone).
+/// A move outlives its record's removal (closed or pruned) and rides the next record, until the
+/// longest limit and its grace have passed.
 #[test]
 fn a_move_outlives_its_records_removal() {
     const WRITTEN: u64 = 1_791_477_331;
@@ -20288,7 +20284,7 @@ fn an_idle_look_of_another_process_counts_toward_no_lag() {
     assert_eq!(late.visit().step, "announced:1", "in a row: its second");
 }
 
-/// A user row the harness typed, as the E2E's transcripts hold one.
+/// A user row the harness typed, under its `[aterm harness]` mark.
 #[cfg(unix)]
 fn harness_row(text: &str) -> String {
     user_row(&format!("[aterm harness] {text}"))
@@ -22242,9 +22238,7 @@ fn own_row(kind: &str, meta: bool, text: &str) -> String {
     )
 }
 
-/// A conversation its worker ended with the token, then woken by Claude Code
-/// itself: a background task's notification and the usage-limit
-/// continuation, and the agent's answer.
+/// The tab a cold-restored [`TAB`] reopened from.
 #[cfg(unix)]
 const OLD_TAB: &str = "s-00000000000000000001";
 
@@ -22627,8 +22621,8 @@ fn a_moved_agents_finish_is_read_where_it_wrote_it_after_its_process_is_gone() {
     );
 }
 
-/// A moved agent's finish is found by its relaunch when the host never noted it ('s relative home
-/// wrong action).
+/// A moved agent's finish is found by its relaunch when the host never noted it, under a git
+/// worktree of its relative home that the repository registers.
 #[cfg(unix)]
 #[test]
 fn a_moved_agents_finish_is_found_by_its_relaunch_when_the_host_never_noted_it() {
@@ -22889,7 +22883,7 @@ fn a_finished_conversation_is_carried_on_with_nothing() {
     }
 }
 
-/// A relaunch into a done report in words asks the done check, never `KEEP GOING`.
+/// A relaunch into a done report in words asks the done check, never [`upgrade::CARRY_ON`].
 #[cfg(unix)]
 #[test]
 fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
@@ -23106,9 +23100,9 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
     }
 }
 
-/// A RELAUNCH INTO A TASK LAND'S ACT OR A WALL-CUT CHECK'S RETRY ENDED TYPES NOTHING.
 #[cfg(unix)]
-/// A relaunch into a task land's act landed types nothing.
+/// A relaunch into a task land's act landed types nothing, also where a wall cut the act and the
+/// loop's ledgered retry landed it.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
@@ -23187,7 +23181,7 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
     );
 }
 
-/// A relaunch the tab's loop resumed first is carried on with nothing (the live lab's live-rl-2).
+/// A relaunch the tab's loop resumed first is carried on with nothing.
 #[cfg(unix)]
 #[test]
 fn a_relaunch_the_tabs_loop_resumed_first_is_carried_on_with_nothing() {
@@ -24466,7 +24460,7 @@ fn the_looks_memo_reads_on_and_a_carry_ons_readers_share_one_read() {
     );
 }
 
-/// Upgrade stall tests through the real driver, and the Conformance test bind of
+/// Upgrade stall tests through the real driver, and the conformance bind of
 /// `harness_upgrade_never_strands_model`.
 #[path = "upgrade_stall_tests.rs"]
 mod stall;
@@ -25833,7 +25827,7 @@ fn a_moved_agents_finish_is_read_where_it_writes_now() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// [`a_moved_agents_finish_is_read_where_it_writes_now`] over a live process (xt-3).
+/// [`a_moved_agents_finish_is_read_where_it_writes_now`] over a live process.
 #[cfg(unix)]
 #[test]
 fn a_live_moved_agents_finish_is_read_where_it_writes_now() {
@@ -26745,7 +26739,7 @@ fn earlier_tab_notes_cannot_split_one_restored_identity_into_other_tabs() {
     );
 }
 
-/// A moved-HOME note needs complete absence evidence before it goes.
+/// A note of where a moved agent wrote is kept while any transcript evidence is unreadable.
 #[test]
 fn a_writes_note_is_kept_when_any_transcript_evidence_is_unreadable() {
     use std::io::{Error, ErrorKind, Result};
@@ -26949,8 +26943,8 @@ fn the_windows_step_answers_with_the_tabs_own_word_before_another_tabs() {
     assert_eq!(words(&[report(tab, "current")]), None);
 }
 
-/// The ladder's Conformance test bind on Claude Code's lane (`HarnessUpgradeLadder` against the
-/// real `look_facts` and `upgrade::next_step`).
+/// The ladder's conformance bind on Claude Code's lane (`HarnessUpgradeLadder` against the real
+/// `look_facts` and `upgrade::next_step`).
 #[path = "upgrade_ladder_claude_tests.rs"]
 mod ladder_claude;
 #[cfg(unix)]
@@ -26978,11 +26972,11 @@ fn a_bounded_reader_requires_complete_successful_utf8_evidence() {
 const CLOSED_TOKEN: &str = "closed-tok";
 
 /// A control server at `<dir>/a.sock` with `beside-tok` beside it, serving one connection after
-/// another until one presents `stop` ([`token_server_seen`]): a connection whose `AUTH` names
-/// `refused` is answered `ERR auth` and closed at its first line, as a seamless successor that
-/// rebound the socket answers the window's old token; one that names [`CLOSED_TOKEN`] is closed
-/// at its first line with nothing written; every other line is answered `ERR busy` when it asks
-/// for the hand and `OK` otherwise. It sends what it was sent, `(token, line)` in order.
+/// another until one presents `stop` ([`token_server_seen`]). A connection whose `AUTH` names
+/// `refused` is answered `ERR auth` and closed at its first line, as a successor that rebound the
+/// socket answers the window's old token; one naming [`CLOSED_TOKEN`] is closed at its first line
+/// with nothing written; any other line is answered `ERR busy` when it asks for the hand and `OK`
+/// otherwise. Its receiver gets what it was sent, `(token, line)` in order.
 #[cfg(unix)]
 fn token_server(
     dir: &Path,
@@ -27046,10 +27040,10 @@ fn token_server_seen(
 }
 
 /// The window's drive presents the harness's own token on the window's socket, probed once with
-/// `version`, so what it types reads `by=harness`; a refused token, answered `ERR auth` or with
-/// the connection closed and nothing written, is replaced once by the one beside the socket, and
-/// the request after it goes once, on that connection. With no token the token beside the socket
-/// goes, unprobed, as it always did, and so it does on any other socket.
+/// `version`, so what it types reads `by=harness`; a refused token (`ERR auth`, or the connection
+/// closed with nothing written) is replaced once by the one beside the socket, and the request
+/// after it goes once, on that connection. With no token, or on any other socket, the token beside
+/// the socket goes unprobed.
 #[cfg(unix)]
 #[test]
 fn the_window_drive_presents_the_harness_token_and_falls_back_beside_once() {

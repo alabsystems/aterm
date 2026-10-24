@@ -4,14 +4,13 @@
 //! Tests for the update notice's reader.
 
 use super::*;
-use crate::anchors::anchor_text;
 use crate::prompt::fixtures::{rows, screen};
 use crate::turn::{launch_card_place, launch_card_scan, launch_card_scrolled, launch_card_words};
 
 const WIDE: usize = 120;
 
 fn summary(changes: &str) -> String {
-    format!("{}{changes}", anchor_text("notice.updated"))
+    format!("{}{changes}", crate::anchor!("notice.updated"))
 }
 
 fn boxed(text: &str) -> String {
@@ -34,7 +33,7 @@ fn measured_notice() -> [String; 2] {
         boxed(&summary(
             " Got 33 features, 240 bugfixes, and 103 other changes.",
         )),
-        boxed(anchor_text("notice.updated_details")),
+        boxed(crate::anchor!("notice.updated_details")),
     ]
 }
 
@@ -187,7 +186,7 @@ const UNPLACED: [&str; 6] = [
 
 #[test]
 fn every_recorded_update_notice_is_placed_under_its_card() {
-    let updated = format!("{INDENT}{}", anchor_text("notice.updated"));
+    let updated = format!("{INDENT}{}", crate::anchor!("notice.updated"));
     let (mut placed, mut bare, mut unplaced) = (0, 0, 0);
     for (name, screen, cols) in corpus() {
         let shown = screen.iter().any(|row| row.starts_with(&updated));
@@ -253,13 +252,13 @@ fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
         assert_eq!((place.rows, place.end), (5, cols), "{name}");
         assert_eq!(notice_at(&screen, cols + 1), None, "{name}: one wider");
     }
-    let details = anchor_text("notice.updated_details");
+    let details = crate::anchor!("notice.updated_details");
     let (link, words) = details.split_once(" for").expect("the link");
     let cols = INDENT.len() + link.len() - 1;
     let broken = |at: usize, cols: usize| {
         let screen = card_over(&[
             String::new(),
-            boxed(anchor_text("notice.updated")),
+            boxed(crate::anchor!("notice.updated")),
             boxed(&link[..at]),
             boxed(&format!("{} for{words}", &link[at..])),
         ]);
@@ -273,7 +272,7 @@ fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
 
 #[test]
 fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
-    let details = anchor_text("notice.updated_details");
+    let details = crate::anchor!("notice.updated_details");
     let [head, tail] = measured_notice();
     let measured = card_over(&[String::new(), head.clone(), tail.clone()]);
     assert_eq!(
@@ -287,7 +286,7 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     );
     let bare = card_over(&[
         String::new(),
-        boxed(anchor_text("notice.updated")),
+        boxed(crate::anchor!("notice.updated")),
         tail.clone(),
     ]);
     assert_eq!(
@@ -341,7 +340,7 @@ fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     );
     let after_link = card_over(&[
         String::new(),
-        boxed(anchor_text("notice.updated")),
+        boxed(crate::anchor!("notice.updated")),
         boxed(link),
         boxed(&format!("for {words}")),
     ]);
@@ -541,7 +540,7 @@ fn whole_scrolled_card() -> (Vec<String>, CardPlace, Vec<String>) {
     let (cut, _) = scrolled(29);
     let banner = format!(
         " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}2.1.304",
-        anchor_text("launch.banner")
+        crate::anchor!("launch.banner")
     );
     let mut whole = vec![banner];
     whole.extend(cut);
@@ -588,7 +587,7 @@ fn a_scrolled_card_anchors_its_notice() {
     }
     let (at27, _) = scrolled(27);
     assert!(
-        at27[1].starts_with(&boxed(anchor_text("notice.updated"))),
+        at27[1].starts_with(&boxed(crate::anchor!("notice.updated"))),
         "CONTROL: the notice is on the 27-row screen: {at27:#?}"
     );
     assert_eq!(
@@ -644,7 +643,7 @@ fn a_kept_scrolled_card_is_the_reads() {
         .expect("the scrolled card");
     let banner = format!(
         " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}2.1.305",
-        anchor_text("launch.banner")
+        crate::anchor!("launch.banner")
     );
     let rewrites = [
         String::new(),

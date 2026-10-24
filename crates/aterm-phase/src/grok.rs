@@ -7,13 +7,14 @@
 //! a private headless aterm, a scratch `GROK_HOME`): the logo, `Approve in your browser to
 //! finish signing in.`, the device code, `Waiting for approval...` and the `ctrl+q  quit` key
 //! row, drawn instead of any composer. The limit and login-ended texts are the binary's own
-//! strings, the same bytes in 1.0.67 and 1.0.70 ([`crate::anchors::GROK_ANCHORS`]); no signed-in
+//! strings, the same bytes in 1.0.67 and 1.0.70 ([`crate::anchors::GROK_ANCHORS`]; the
+//! not-logged-in one is read whole, ``Not logged in. Run `grok login`.``, as 1.0.70 carries it,
+//! since its first words open other CLIs' lines too); no signed-in
 //! account has drawn them on a screen yet, so where they sit on one is not measured. The reader
 //! therefore claims nothing it has not seen: every phase is `idle` NOT authoritatively (its busy
 //! row and idle composer are unmeasured), and a wall is read only off a row that OPENS with one
 //! of those texts in the screen's live zone, never off prose that quotes one.
 
-use crate::anchors::anchor_text;
 use crate::wall::{Placement, Wall, WallKind};
 
 /// Major component of the Grok (`grok`) harness version, starting at `0.1`.
@@ -22,7 +23,7 @@ pub const HARNESS_VERSION_MAJOR: u16 = 0;
 /// Minor component of the Grok (`grok`) harness version, starting at `0.1`.
 pub const HARNESS_VERSION_MINOR: u16 = 1;
 
-/// Version of the Grok (`grok`) harness, tracked independently per harness starting at `"0.1"`.
+/// Version of the Grok (`grok`) harness, tracked per harness from `"0.1"`.
 pub const HARNESS_VERSION: &str = "0.1";
 
 /// Structured incremental numeric version of the Grok (`grok`) harness.
@@ -36,18 +37,18 @@ pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(
 /// the notice a turn ended on, with room for a composer and key rows under it.
 const LIVE_ROWS: usize = 12;
 
-/// The texts a usage limit opens its row with: the TUI's error card (an ASCII apostrophe) and
-/// the sampler's (a typographic one), each as the build carries it.
+/// The texts a usage limit opens its row with, as the build carries each: the plan limit's TUI
+/// error card (ASCII apostrophe) and sampler (typographic one), and the free-usage limit.
 const LIMIT_OPENERS: [&str; 3] = [
-    anchor_text("grok.wall.plan_rate_limit"),
-    anchor_text("grok.wall.plan_rate_limit.sampler"),
-    anchor_text("grok.wall.free_usage"),
+    crate::anchor!("grok.wall.plan_rate_limit"),
+    crate::anchor!("grok.wall.plan_rate_limit.sampler"),
+    crate::anchor!("grok.wall.free_usage"),
 ];
 
 /// The texts an ended login opens its row with.
 const AUTH_OPENERS: [&str; 2] = [
-    anchor_text("grok.auth.expired"),
-    anchor_text("grok.auth.not_logged_in"),
+    crate::anchor!("grok.auth.expired"),
+    crate::anchor!("grok.auth.not_logged_in"),
 ];
 
 /// The row Grok Build's sign-in screen asks the person to approve on, where the screen is that
@@ -56,10 +57,10 @@ const AUTH_OPENERS: [&str; 2] = [
 pub fn sign_in_row(rows: &[String]) -> Option<usize> {
     let approve = rows
         .iter()
-        .position(|r| crate::text::trim(r) == anchor_text("grok.signin.approve"))?;
+        .position(|r| crate::text::trim(r) == crate::anchor!("grok.signin.approve"))?;
     rows[approve + 1..]
         .iter()
-        .any(|r| crate::text::trim(r) == anchor_text("grok.signin.waiting"))
+        .any(|r| crate::text::trim(r) == crate::anchor!("grok.signin.waiting"))
         .then_some(approve)
 }
 
@@ -70,7 +71,7 @@ pub fn is_grok_screen(rows: &[String]) -> bool {
     sign_in_row(rows).is_some_and(|at| {
         rows[at..]
             .iter()
-            .any(|r| crate::text::trim(r) == anchor_text("grok.keys.quit"))
+            .any(|r| crate::text::trim(r) == crate::anchor!("grok.keys.quit"))
     })
 }
 
@@ -122,7 +123,8 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
 #[path = "grok_tests.rs"]
 mod tests;
 
-/// Grok Build's screens, measured or hand-built (each file's head says which), for this crate's tests and a dependent crate's `#[cfg(test)]` code; not part of the documented API.
+/// Grok Build's screens, measured or hand-built (each file's head says which), for tests here
+/// and in dependent crates; not part of the documented API.
 #[doc(hidden)]
 pub mod fixtures {
     /// Grok Build 1.0.70 signed out, its device sign-in screen (MEASURED).

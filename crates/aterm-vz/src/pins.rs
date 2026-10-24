@@ -9,10 +9,10 @@
 //! `ubuntu-kernel` rows read these constants); the lab finds what it placed through
 //! [`aterm_uds::host::TOOLS`]' rows of the same names.
 //!
-//! **A bump is one commit,** made while Ubuntu's primary host still serves the pinned
-//! release and once a newer dated release has passed the lane: the three sha256 rows and
-//! sizes below, [`IMAGE_SHA256`] and [`IMAGE_BYTES`], [`KERNEL_RELEASE`] (the root's
-//! module directory), and the release in the two `TOOLS` rows ([`RELEASE`] reads it).
+//! A bump is one commit, made while Ubuntu's primary host still serves the pinned release
+//! and once a newer dated release has passed the lane: the three files' sha256 and sizes,
+//! [`ROOT_MEMBER_BYTES`], [`IMAGE_SHA256`] and [`IMAGE_BYTES`], [`KERNEL_RELEASE`] (the
+//! root's module directory), and the release in the two `TOOLS` rows ([`RELEASE`] reads it).
 
 use std::path::{Path, PathBuf};
 
@@ -249,11 +249,9 @@ fn sized(path: &Path, bytes: u64) -> Result<(), Error> {
 }
 
 /// The words for a fetch of `url` that failed with `error` because Ubuntu moved its release
-/// to [`ARCHIVE_HOST`]: the primary host answers with a redirect there, which serves http
-/// only, and curl refuses it (`--proto-redir =https`) with `Protocol "http" disabled (in
-/// redirect)` (read 2026-10-23 on an archived release). `None` for any other failure, or a
-/// URL of another host. The words name the release, the redirect and the bump, then
-/// curl's own text.
+/// to [`ARCHIVE_HOST`]: the primary host redirects there, to http only, and curl refuses it
+/// (`--proto-redir =https`) with `Protocol "http" disabled (in redirect)`. `None` for any
+/// other failure, or a URL of another host.
 #[must_use]
 pub fn archived(url: &str, error: &str) -> Option<String> {
     let path = url.strip_prefix(&format!("https://{PRIMARY_HOST}/"))?;
@@ -452,9 +450,8 @@ mod tests {
         std::fs::File::open(dir).unwrap().set_times(times).unwrap();
     }
 
-    /// The tooling cache's reclaim (atpkg's) keeps a row the lane read at a bring-up, though
-    /// a clone of the base and a reuse of the laid kernel change no file's time. NEGATIVE
-    /// CONTROL: the row the lane has not read yet is still listed for its idle month.
+    /// The tooling reclaim keeps a row a bring-up read, though reading it changes no file's
+    /// time. The negative control: the row not read yet is still listed.
     #[cfg(unix)]
     #[test]
     fn a_bring_up_marks_its_rows_used_so_the_tooling_reclaim_keeps_them() {

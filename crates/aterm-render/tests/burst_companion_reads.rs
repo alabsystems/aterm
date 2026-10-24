@@ -5,6 +5,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::wcag::contrast;
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, ContrastFallback, GlowOwnership, PetFacts};
@@ -25,25 +26,6 @@ const KEY_MS: u64 = 50;
 const LINE: &str = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
 const BAR: f64 = 4.5;
 const SOLID_SHARE: f64 = 0.85;
-
-fn lin(c: u32) -> f64 {
-    let s = f64::from(c) / 255.0;
-    if s <= 0.040_45 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn luma(p: u32) -> f64 {
-    0.2126 * lin((p >> 16) & 0xff) + 0.7152 * lin((p >> 8) & 0xff) + 0.0722 * lin(p & 0xff)
-}
-
-fn contrast(a: u32, b: u32) -> f64 {
-    let (la, lb) = (luma(a), luma(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
-}
 
 fn median(px: &mut [u32]) -> u32 {
     let mid = px.len() / 2;

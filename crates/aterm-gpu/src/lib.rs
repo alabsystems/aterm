@@ -249,18 +249,15 @@ static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The GPU turn of a test or debug build on Windows: the thread that makes a device keeps it until
 /// the thread exits ([`take_gpu_turn`]), so one thread at a time draws.
 ///
-/// D3D12 devices are singletons per adapter, so the devices parallel tests make are one
-/// `ID3D12Device` driven from a command queue each. WARP (`d3d10warp.dll` 10.0.26100.9278 in the
-/// lane) crashes when two queues JIT shaders at once: `STATUS_ACCESS_VIOLATION` in its
-/// `Task_CompileShader` (`FeCleanup::Pass2`, `PixelJitProgram::ClassifyVars`) under concurrent
-/// `ExecuteCommandLists` (docs/measured/windows-warp-parallel-2026-10-23.md). Queues are
-/// free-threaded, so the fault is WARP's, and a person's aterm never reaches it: it makes one device
-/// at a time, and wgpu submits to one device one submission at a time. Creation alone is serialized
-/// already (`GPU_INIT`); the crash is in drawing, so the turn lasts as long as the thread. Every
-/// device takes it ([`GpuContext::one_at_a_time`]), so no test has to remember to. A debug aterm
-/// makes its device on a startup worker that exits, or on its main thread, so its turn is never
-/// contended; a thread that makes a device while another thread holds the turn waits for that thread
-/// to exit.
+/// D3D12 devices are singletons per adapter, so parallel tests drive one `ID3D12Device` from a
+/// command queue each, and WARP crashes (`STATUS_ACCESS_VIOLATION` in its shader JIT) when two
+/// queues compile shaders under concurrent `ExecuteCommandLists`
+/// (docs/measured/windows-warp-parallel-2026-10-23.md). A person's aterm makes one device at a
+/// time and never reaches it. The crash is in drawing, not creation (which `GPU_INIT` already
+/// serializes), so the turn lasts as long as the thread. Every device takes it
+/// ([`GpuContext::one_at_a_time`]); a thread that makes a device while another holds the turn
+/// waits for that thread to exit. A debug aterm makes its device on a startup worker that exits,
+/// or on its main thread, so its turn is never contended.
 #[cfg(all(windows, any(test, debug_assertions)))]
 static GPU_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -940,8 +937,8 @@ mod device_limits_tests {
         );
     }
 
-    /// The heap's sizing leans on one property, checked here rather than
-    /// assumed: a DROPPED bind group gives its descriptors back.
+    /// The heap's sizing leans on one property, checked here rather than assumed: a dropped
+    /// bind group gives its descriptors back.
     #[cfg(windows)]
     #[test]
     fn a_dropped_bind_group_returns_its_view_descriptors() {

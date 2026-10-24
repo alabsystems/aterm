@@ -62,7 +62,9 @@ impl SemanticFontResolution {
     }
 }
 
-/// The first slot (`regular`, `bold italic`, `emoji`, …) a [`SemanticFontResolution::Fallback`] status names as unresolved, so the specimen's status names the font that failed rather than the row that has focus.
+/// Each `(slot, family)` (`regular`, `bold italic`, `emoji`, …) a
+/// [`SemanticFontResolution::Fallback`] status names as unresolved, so the specimen's status names
+/// the font that failed rather than the row that has focus.
 pub(crate) fn unresolved_slots(status: &str) -> Vec<(&'static str, String)> {
     const SLOTS: [&str; 7] = [
         "regular",
@@ -392,7 +394,9 @@ use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_
 
 use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFace, TextWeight};
 
-/// How the chrome turns a char into a glyph of a [`ChromeFont`]: through the face's UNICODE cmap subtables ([`ChromeFont::unicode_glyph_index`]), as the terminal grid draws its primary face, never through `lookup_glyph_index`.
+/// How the chrome turns a char into a glyph of a [`ChromeFont`]: through the face's Unicode cmap
+/// subtables ([`ChromeFont::unicode_glyph_index`]), as the terminal grid draws its primary face,
+/// never through `lookup_glyph_index`.
 pub(crate) trait UnicodeChars {
     fn maps(&self, ch: char) -> bool;
     fn char_metrics(&self, ch: char, px: f32) -> ChromeMetrics;
@@ -537,7 +541,9 @@ mod synthesized {
 
     const SUB: usize = 4;
 
-    /// `ch` at `px`: its coverage bitmap and placement, in the convention every glyph the pen blits uses (`xmin`/`ymin` from the pen and the baseline, rows top-down), or `None` for a char the pen does not draw.
+    /// `ch` at `px`: its coverage bitmap and placement in the convention every glyph the pen blits
+    /// uses (`xmin`/`ymin` from the pen and the baseline, rows top-down), or `None` for a char the
+    /// pen does not draw.
     pub(super) fn rasterize(ch: char, px: f32) -> Option<(ChromeMetrics, Vec<u8>)> {
         let d = design(ch)?;
         let xmin = (d.left * px).floor() as i32;
@@ -607,7 +613,8 @@ enum UiCjkScript {
     Hangul,
 }
 
-/// Whether `ch` is in one of the East Asian blocks ([`ui_cjk_script`]): text of them breaks between its characters, with no hyphen.
+/// Whether `ch` is in one of the East Asian blocks ([`ui_cjk_script`]), whose text breaks between
+/// its characters with no hyphen.
 pub(crate) fn is_east_asian(ch: char) -> bool {
     ui_cjk_script(ch).is_some()
 }
@@ -688,7 +695,9 @@ impl UiCjkFace {
     }
 }
 
-/// The chrome's OWN fallback for East Asian text in a UI-face run (Segoe UI's labels: the tab strip's titles, Settings), at the run's weight: the faces Windows itself falls back to from Segoe UI ([`UI_CJK_FILES`]).
+/// The chrome's own fallback for East Asian text in a UI-face run (the tab strip's titles,
+/// Settings), at the run's weight: the faces Windows itself falls back to from Segoe UI
+/// ([`UI_CJK_FILES`]).
 pub(crate) struct UiCjkFaces {
     rungs: [Vec<UiCjkFace>; 2],
 }
@@ -958,7 +967,10 @@ pub(crate) enum LinesRule {
 
 type LinesAt = (LinesRule, u16, u32, u32);
 
-/// THE LINES `rule` LAYS `text` ON in `face` at `px` in a box `width` wide, as [`MeasureMemo`] keeps a measure: what `lay_out` lays out — which must measure only in `face` at `px` — kept with the advance of each char of `text` the face has no glyph for ([`ui_misses`]), so the lines depend on that font, those advances, `px` and `width` alone, and are laid out again once one measures otherwise. Text with an East Asian char the face lacks is never kept.
+/// The lines `rule` lays `text` on in `face` at `px` in a box `width` wide, memoised: `lay_out`
+/// must measure only in `face` at `px`, and kept lines are laid out again once a char the face has
+/// no glyph for ([`ui_misses`]) measures otherwise. Text with an East Asian char the face lacks is
+/// never kept.
 pub(crate) fn kept_lines(
     rule: LinesRule,
     face: TextFace,
@@ -1034,7 +1046,8 @@ pub(crate) fn measure_walks() -> u64 {
     MEASURE_WALKS.with(std::cell::Cell::get)
 }
 
-/// Of [`measure_walks`], the strings the UI face mapped every char of: the ones [`MeasureMemo`] can keep, so a layout that finds them kept walks none of them again (test-only).
+/// Of [`measure_walks`], the strings the UI face mapped every char of, which [`MeasureMemo`] can
+/// keep (test-only).
 #[cfg(test)]
 pub(crate) fn measure_walks_whole() -> u64 {
     WHOLE_WALKS.with(std::cell::Cell::get)
@@ -1133,7 +1146,8 @@ impl PreparedSemanticFont {
         self.renderer.is_some()
     }
 
-    /// Pure geometry from the already prepared face; no request, worker poll, font lock, fork, or rasterization is needed while laying out a specimen.
+    /// The cell height a specimen paints at `px`: pure geometry from the prepared face, with no
+    /// request, worker poll, font lock, fork or raster.
     pub(crate) fn specimen_cell_height(
         &self,
         px: f32,
@@ -1147,7 +1161,7 @@ impl PreparedSemanticFont {
         )
     }
 
-    /// The `(width, height)` cell a specimen paints at `px`: pure geometry, like [`Self::specimen_cell_height`].
+    /// The `(width, height)` cell a specimen paints at `px`, as pure geometry.
     pub(crate) fn specimen_cell_size(
         &self,
         px: f32,
@@ -1184,7 +1198,8 @@ thread_local! {
     static FONT_STORE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The font-store entries this thread has made so far (test-only; see `FONT_STORE_VISITS`): a render's text work is the difference across it.
+/// The font-store entries this thread has made so far (test-only): a render's text work is the
+/// difference across it.
 #[cfg(test)]
 pub(crate) fn font_store_visits() -> u64 {
     FONT_STORE_VISITS.with(std::cell::Cell::get)
@@ -1195,7 +1210,8 @@ thread_local! {
     static LINEAR_COMPOSITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// The linear-light composites this thread has run so far (test-only; see `LINEAR_COMPOSITES`): a raster's blend work is the difference across it.
+/// The linear-light composites this thread has run so far (test-only): a raster's blend work is
+/// the difference across it.
 #[cfg(test)]
 pub(crate) fn linear_composites() -> u64 {
     LINEAR_COMPOSITES.with(std::cell::Cell::get)
@@ -1214,7 +1230,9 @@ fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Install the renderer-resolved chrome faces — `(bytes, collection index)` of the PRIMARY terminal face and its real BOLD sibling (from `Renderer::chrome_primary_face` / `chrome_bold_face`) — so the tray text renders in the user's font.
+/// Install the renderer-resolved chrome faces, `(bytes, collection index)` of the primary terminal
+/// face and its real bold sibling (`Renderer::chrome_primary_face`, `chrome_bold_face`), so tray
+/// text renders in the user's font.
 pub(crate) fn set_chrome_fonts(
     primary: Option<(std::sync::Arc<[u8]>, u32)>,
     bold: Option<(std::sync::Arc<[u8]>, u32)>,
@@ -1420,7 +1438,8 @@ impl Drop for PendingChromeFontsForTest {
     }
 }
 
-/// Test-only twin of [`install_settled_chrome_fonts_for_test`] that installs `renderer` as production's [`set_chrome_fonts`] does (dormant, no warmup) but parks no worker, so nothing lands through this store later: for a test whose subject is a chain face landing outside the store (the live terminal parsing a cell the seed shares).
+/// Like [`install_settled_chrome_fonts_for_test`], but installs `renderer` as [`set_chrome_fonts`]
+/// does (dormant, no warmup) and parks no worker, so nothing lands through this store later.
 #[cfg(test)]
 pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
     let mut fonts = lock_fonts();
@@ -1429,7 +1448,8 @@ pub(crate) fn install_dormant_chrome_fonts_for_test(renderer: Renderer) -> u64 {
     fonts.semantic_ready_epoch
 }
 
-/// The broad CJK face the host's built-in fallback chain leads with, where it is installed — a file `aterm_render` parses, so a test draws with a real ideograph-bearing face rather than a stub.
+/// The broad CJK face the host's built-in fallback chain leads with, where it is installed, so a
+/// test draws with a real ideograph-bearing face.
 #[cfg(test)]
 pub(crate) fn cjk_chain_face_path_for_test() -> Option<&'static str> {
     const CANDIDATES: &[&str] = &[
@@ -1454,7 +1474,8 @@ pub(crate) fn cjk_chain_face_path_for_test() -> Option<&'static str> {
         .find(|path| std::path::Path::new(path).is_file())
 }
 
-/// Install a SETTLED semantic chrome font whose chain holds the host's CJK face, already parsed — the state the store reaches once the terminal has drawn an ideograph — plus the host UI faces.
+/// Install a settled semantic chrome font whose chain holds the host's CJK face already parsed
+/// (the store's state once the terminal has drawn an ideograph), plus the host UI faces.
 #[cfg(test)]
 pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
     let Some(path) = cjk_chain_face_path_for_test() else {
@@ -1478,7 +1499,9 @@ pub(crate) fn install_chrome_fonts_with_cjk_chain_for_test() -> bool {
     true
 }
 
-/// Install, DORMANT, a semantic seed whose chain holds the host's CJK face UNPARSED — a fresh window's state before anything drew an ideograph: the window's own order (configure, seal, fork the seed) with the cell shared between the sealed generation and the seed — plus the host UI faces.
+/// Install, dormant, a semantic seed whose chain holds the host's CJK face unparsed, plus the host
+/// UI faces: a fresh window's state before anything drew an ideograph, built in the window's own
+/// order (configure, seal, fork the seed). Returns the live renderer the seed shares its cell with.
 #[cfg(test)]
 pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
     let path = cjk_chain_face_path_for_test()?;
@@ -1493,13 +1516,16 @@ pub(crate) fn install_unparsed_cjk_chain_for_test() -> Option<Renderer> {
     Some(live)
 }
 
-/// Whether THIS test thread's chrome cascade draws `ch` from a face it holds parsed (the terminal stack and the coverage rung, [`ChromeFonts::face_for`]), read without parsing anything.
+/// Whether this test thread's chrome cascade draws `ch` from a face it holds parsed (the terminal
+/// stack and the coverage rung: [`ChromeFonts::face_for`]), without parsing anything.
 #[cfg(test)]
 pub(crate) fn chrome_cascade_reaches_for_test(ch: char) -> bool {
     lock_fonts().face_for(TextWeight::Regular, ch).is_some()
 }
 
-/// Whether THIS test thread's chrome draws `ch` in a run set in `face` from a face it holds parsed: the UI faces' own East Asian fallback at `face`'s weight, then the terminal cascade ([`ChromeFonts::ui_miss_face`]), read without parsing anything.
+/// Whether this test thread's chrome draws `ch` in a run set in `face` from a face it holds parsed
+/// (the UI faces' East Asian fallback at `face`'s weight, then the terminal cascade:
+/// [`ChromeFonts::ui_miss_face`]), without parsing anything.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn chrome_ui_reaches_for_test(face: TextFace, ch: char) -> bool {
     lock_fonts()
@@ -1513,7 +1539,8 @@ pub(crate) fn chrome_font_epoch_for_test() -> u64 {
     lock_fonts().semantic_ready_epoch
 }
 
-/// Direct semantic-view tests build no renderer backend, so they install the immutable proportional faces backend startup would, keeping [`default_chrome_fonts`] cold without replacing an installed semantic renderer.
+/// For direct semantic-view tests, which build no renderer backend: install the proportional UI
+/// faces backend startup would, leaving any installed semantic renderer in place.
 #[cfg(test)]
 pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     let ui = prepared_ui_font_assets();
@@ -1525,13 +1552,15 @@ pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     }
 }
 
-/// Replace THIS test thread's East Asian UI fallback ([`UiCjkFaces`]): `None` for a test whose subject is the terminal chain's rung under it (the state of a host with no such faces), or a cold store of its own.
+/// Replace this test thread's East Asian UI fallback ([`UiCjkFaces`]): `None` stands in for a host
+/// with no such faces, for a test of the terminal chain's rung under it.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn set_ui_cjk_faces_for_test(store: Option<Arc<UiCjkFaces>>) {
     lock_fonts().set_ui_cjk(store);
 }
 
-/// A cold East Asian UI fallback store of this host's faces, nothing parsed; `None` where the host has none (every host but Windows).
+/// A cold East Asian UI fallback store of this host's faces, nothing parsed, or `None` when the
+/// host has none.
 #[cfg(all(test, windows))]
 pub(crate) fn host_ui_cjk_faces_for_test() -> Option<Arc<UiCjkFaces>> {
     UiCjkFaces::host().map(Arc::new)
@@ -2074,7 +2103,8 @@ pub(crate) fn prepare_semantic_font(
     }
 }
 
-/// The width of `s` at `px` in the chrome stack: real advances (per-char face pick and fixed-point accumulation, the arithmetic the raster pen uses).
+/// The width of `s` at `px` in the chrome stack: real advances with the raster pen's per-char face
+/// pick and fixed-point accumulation.
 pub(crate) fn measure_text(s: &str, px: f32, weight: TextWeight) -> f32 {
     let mut fonts = lock_fonts();
     let mut pen_q: i64 = 0;
@@ -2097,7 +2127,9 @@ fn chrome_cap_ratio() -> f32 {
         .map_or(0.7, |f| f.cap_ratio)
 }
 
-/// The cap-height-centred baseline for a `size`-px run in the row `y0, y0 + row_h)`: `row_center + cap_height/2` (the leading-trim rule), via the machine-checked fixed-point law `aterm_render::chrome_metrics::baseline_in_row_q`; top and bottom gaps balance within 1px for any `(row_h, cap)` with `cap <= row_h`.
+/// The cap-height-centred baseline for a `size`-px run in the row `[y0, y0 + row_h)`
+/// (`aterm_render::chrome_metrics::baseline_in_row_q`): top and bottom gaps balance within 1px
+/// for any `cap <= row_h`.
 pub(crate) fn row_baseline(y0: f32, row_h: f32, size: f32) -> f32 {
     let cap_q = px_to_q(size * chrome_cap_ratio());
     q_to_px(baseline_in_row_q(px_to_q(y0), px_to_q(row_h), cap_q))
@@ -2111,7 +2143,8 @@ struct UiFontAssets {
     variable_semibold: Option<UiVariableSemibold>,
 }
 
-/// The variable UI face instanced at semibold, for the one painter that instances a variation itself (the Windows strip band's active label, [`crate::tab_bar::pixel_band`]).
+/// The variable UI face instanced at semibold, for the one painter that instances a variation
+/// itself (the strip band's active label, [`crate::tab_bar::pixel_band`]).
 #[derive(Clone)]
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct UiVariableSemibold {
@@ -2225,7 +2258,9 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
         .collect()
 }
 
-/// Install, as this test thread's UI faces, the first pair of the Linux ladder ([`LINUX_UI_FONT_PAIRS`]) whose files both parse, so a test can judge a layout's fit with Linux metrics on any host.
+/// Install, as this test thread's UI faces, the first pair of the Linux ladder
+/// ([`LINUX_UI_FONT_PAIRS`]) whose files both parse, so a test can judge a layout's fit with Linux
+/// metrics on any host.
 #[cfg(test)]
 pub(crate) fn install_linux_ui_fonts_for_test(
     root: Option<&std::path::Path>,
@@ -2361,7 +2396,9 @@ fn prepared_ui_font_assets() -> &'static UiFontAssets {
     ASSETS.get_or_init(resolve_ui_font_assets)
 }
 
-/// Populate the two process-global font `OnceLock`s [`set_chrome_fonts`] would otherwise initialise on whichever thread calls it first: the system UI face parse ([`prepared_ui_font_assets`]) and the embedded default store ([`chrome_fonts`]).
+/// Populate the two process-global font `OnceLock`s [`set_chrome_fonts`] would otherwise fill on
+/// whichever thread calls it first: the system UI face parse ([`prepared_ui_font_assets`]) and the
+/// embedded default store ([`chrome_fonts`]).
 #[cfg(not(test))]
 pub(crate) fn warm_chrome_font_assets() {
     let _ = prepared_ui_font_assets();
@@ -2372,7 +2409,9 @@ pub(crate) fn warm_chrome_font_assets() {
 #[cfg(test)]
 pub(crate) fn warm_chrome_font_assets() {}
 
-/// The pixel tab strip's font-readiness fingerprint (the Windows + Linux band, `crate::tab_bar::pixel_band`): the chrome-face install epoch with the coverage rung's size and the UI regular's presence folded in.
+/// The pixel tab strip's font-readiness fingerprint (`crate::tab_bar::pixel_band`): the
+/// chrome-face install epoch with the parsed East Asian UI faces, the coverage rung's size and
+/// the UI regular's presence folded in.
 pub(crate) fn strip_band_font_epoch() -> u64 {
     let mut fonts = lock_fonts();
     fonts.poll_semantic_renderer();
@@ -2395,7 +2434,8 @@ pub(crate) fn strip_band_ui_ready() -> bool {
     lock_fonts().ui_regular.is_some()
 }
 
-/// The variable semibold instance for the strip band's active label, or `None` when the host's UI regular is static (the caller then draws `TextFace::UiBold` through the `ChromeFont` path: the static `seguisb.ttf` sibling, or the regular).
+/// The variable semibold instance for the strip band's active label, or `None` when the host's UI
+/// regular is static (the caller then draws `TextFace::UiBold` from the static sibling or regular).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
     let installed = lock_fonts().ui_regular.clone()?;
@@ -2405,12 +2445,15 @@ pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
         .filter(|variable| Arc::ptr_eq(&variable.cmap, &installed))
 }
 
-/// Can the chrome stack draw EVERY char of `s` as real ink — the UI face first, then the terminal cascade ([`select_chrome_face`]: real bold sibling / user primary / embedded DejaVu), then the renderer's already-parsed chain faces ([`ChromeFonts::coverage`]), then the pen's own two glyphs ([`synthesized`])? This is exactly the per-char routing [`Canvas::text`]'s proportional arm performs, asked ahead of time: a char that fails ALL of them is one the pen would silently skip (advance-only), which for a tab TITLE means a hole where a glyph should be.
+/// Whether the chrome stack draws every char of `s` as real ink, routed as [`Canvas::text`]'s
+/// proportional arm routes it (UI face, terminal cascade, parsed chain faces, the pen's own
+/// glyphs); a char none of them draws would be a hole in a tab title.
 pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
     strip_band_run_coverable_in(TextFace::Ui, s)
 }
 
-/// [`strip_band_run_coverable`] for a label set in `face`: the faces parsed for its East Asian text are `face`'s weight's ([`UiCjkWeight::of`]).
+/// [`strip_band_run_coverable`] for a label set in `face`, whose East Asian text is looked up in
+/// the faces of `face`'s weight ([`UiCjkWeight::of`]).
 pub(crate) fn strip_band_run_coverable_in(face: TextFace, s: &str) -> bool {
     let (ui_cjk, coverage, wanted) = {
         let mut fonts = lock_fonts();
@@ -2459,7 +2502,8 @@ fn chain_may_draw_in_a_label(ch: char) -> bool {
         ))
 }
 
-/// One colour emoji the chrome draws inline in a label (the tab strip's titles, `tab_bar::pixel_band`): the colour face's own straight-alpha RGBA, `width × height`, at the size it was asked for.
+/// One colour emoji the chrome draws inline in a label (the tab strip's titles): the colour face's
+/// own straight-alpha RGBA, `width × height`, at the size it was asked for.
 #[cfg(any(windows, target_os = "linux"))]
 #[derive(Debug)]
 pub(crate) struct ChromeEmoji {
@@ -2468,7 +2512,8 @@ pub(crate) struct ChromeEmoji {
     pub(crate) rgba: Vec<u8>,
 }
 
-/// The colour glyph of the emoji grapheme `cluster` at `px` device px, from the chrome stack's semantic renderer: the terminal's own font set, its colour face included, so a tab title draws the emoji the grid draws.
+/// The colour glyph of the emoji grapheme `cluster` at `px` device px from the chrome stack's
+/// semantic renderer (the terminal's own font set), so a tab title draws the emoji the grid draws.
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn chrome_colour_emoji(cluster: &str, px: f32) -> Option<Arc<ChromeEmoji>> {
     type Memo = (
@@ -2522,7 +2567,8 @@ pub(crate) fn chrome_colour_emoji(cluster: &str, px: f32) -> Option<Arc<ChromeEm
     })
 }
 
-/// Slight negative tracking (em) per glyph advance of the UI face, which reads a touch loose at panel sizes.
+/// Slight negative tracking (em) per glyph advance of the UI face, which reads a touch loose at
+/// panel sizes.
 pub(crate) const UI_TRACKING_EM: f32 = -0.008;
 
 const PEN_PHASES: f32 = 4.0;
@@ -2534,7 +2580,8 @@ fn pen_phase(pen: f32) -> (i32, u8) {
     (whole as i32, phase as u8)
 }
 
-/// Width of `s` at `px` in the UI face: real advances plus `horizontal_kern` plus the [`UI_TRACKING_EM`] the raster pen applies.
+/// Width of `s` at `px` in the UI face: real advances plus `horizontal_kern` plus the
+/// [`UI_TRACKING_EM`] the raster pen applies.
 pub(crate) fn ui_text_width(s: &str, px: f32) -> f32 {
     ui_text_width_for(TextFace::Ui, s, px)
 }
@@ -2747,7 +2794,8 @@ fn ui_text_wrap_walk(
     ((ranges, scans), whole_font)
 }
 
-/// Exact, whitespace-preserving UI-face line breaks: after white space, or between CJK characters with kinsoku kept ([`aterm_grapheme::line_breaks`]), else inside a token too long for the line.
+/// Exact, whitespace-preserving UI-face line breaks: after white space, or between CJK characters
+/// with kinsoku kept ([`aterm_grapheme::line_breaks`]), else inside a token too long for the line.
 pub(crate) fn ui_text_wrap_ranges(
     text: &str,
     px: f32,
@@ -2772,12 +2820,14 @@ pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     width
 }
 
-/// The installed font [`ui_text_width_for`] measures `face` in, or `None` with no UI face installed (each scalar then measures 0.6 em).
+/// The installed font [`ui_text_width_for`] measures `face` in, or `None` with no UI face installed
+/// (each scalar then measures 0.6 em).
 pub(crate) fn ui_font_of(face: TextFace) -> Option<Arc<ChromeFont>> {
     lock_fonts().ui_font(face).cloned()
 }
 
-/// Whether every scalar in any substring advances at least `minimum` pixels under the same routing, tracking and kerning used by the proportional pen.
+/// Whether every scalar in any substring of `s` advances at least `minimum` pixels under the
+/// routing, tracking and kerning the proportional pen uses.
 pub(crate) fn ui_text_advances_at_least(face: TextFace, s: &str, px: f32, minimum: f32) -> bool {
     ui_text_width_with_floor(&mut lock_fonts(), face, s, px, minimum).1
 }
@@ -2873,7 +2923,9 @@ impl UiPen {
     }
 }
 
-/// What [`ui_text_width_for`] measures `text[..cut] + tail` at, for each of `cuts` (ascending byte offsets into `text`, each on a char boundary), in ONE pass of the pen: an elider that measured each shorter candidate afresh paid a whole measure per grapheme it shed.
+/// What [`ui_text_width_for`] measures `text[..cut] + tail` at for each of `cuts` (ascending byte
+/// offsets into `text`, each on a char boundary), in one pass of the pen, so an elider pays one
+/// measure rather than one per grapheme it sheds.
 pub(crate) fn ui_text_widths_at(
     face: TextFace,
     text: &str,
@@ -3379,10 +3431,8 @@ impl Canvas {
     }
 
     fn composite_at(&mut self, i: usize, c: [u8; 4], cov: f32, a: f32) {
-        // A fully covered opaque source replaces the destination exactly. The
-        // general linear-light source-over equation reduces to this copy, so do
-        // not pay three lookup/searches for the large opaque surfaces used by
-        // native views and modal cards.
+        // A fully covered opaque source replaces the destination exactly: source-over reduces to
+        // this copy, which spares large opaque surfaces (native views, modal cards) three lookups.
         if c[3] == u8::MAX && cov >= 1.0 {
             self.px[i..i + 4].copy_from_slice(&c);
             return;
@@ -3724,7 +3774,9 @@ fn retain_specimen_frame(key: u64, source: &Rc<Renderer>, frame: &Rc<aterm_rende
     });
 }
 
-/// One specimen frame as [`Canvas::terminal_specimen`] renders it, bypassing the frame memo: the shipping renderer's own output for `spec` at `scale` (on this thread's configured fork), the cursor scene played on that renderer's cells, for tests that compare the tray blit against it.
+/// One specimen frame as [`Canvas::terminal_specimen`] renders it, bypassing the frame memo: the
+/// shipping renderer's output for `spec` at `scale` on this thread's configured fork, with the
+/// cursor scene played on its cells, for tests that compare the tray blit against it.
 #[cfg(test)]
 pub(crate) fn render_specimen_frame_for_test(
     spec: &TerminalSpecimenSpec,
@@ -4191,6 +4243,120 @@ impl Canvas {
             }
         }
     }
+
+    /// A [`DrawPrim::Dashed`] stroke, its rect, `width` and dash pattern in
+    /// device px: the bands and dashes are disjoint device rects, so each
+    /// pixel is inked once and a translucent ink stays even at the corners.
+    fn dashed(
+        &mut self,
+        (x, y, w, h): (f32, f32, f32, f32),
+        width: f32,
+        (on, off): (f32, f32),
+        c: [u8; 4],
+    ) {
+        if on.is_nan() || on <= 0.0 {
+            return;
+        }
+        let dash = Dash {
+            on: dash_len(on),
+            off: if off > 0.0 { dash_len(off) } else { 0 },
+        };
+        let t = dash_len(width);
+        let (x0, x1) = (dash_px(x.min(x + w)), dash_px(x.max(x + w)));
+        let (y0, y1) = (dash_px(y.min(y + h)), dash_px(y.max(y + h)));
+        if x1 - x0 > 2 * t && y1 - y0 > 2 * t {
+            for (top, bottom) in [(y0, y0 + t), (y1 - t, y1)] {
+                self.fill_device((x0, top, x0 + t, bottom), c);
+                self.dash_band(dash, x0, (x0 + t, x1 - t), (top, bottom), true, c);
+                self.fill_device((x1 - t, top, x1, bottom), c);
+            }
+            for (left, right) in [(x0, x0 + t), (x1 - t, x1)] {
+                self.dash_band(dash, y0, (y0 + t, y1 - t), (left, right), false, c);
+            }
+        } else if x1 - x0 >= y1 - y0 {
+            let band = (y0, y0 + (y1 - y0).max(t));
+            self.dash_band(dash, x0, (x0, x1), band, true, c);
+        } else {
+            let band = (x0, x0 + (x1 - x0).max(t));
+            self.dash_band(dash, y0, (y0, y1), band, false, c);
+        }
+    }
+
+    /// The dashes of `dash` begun at `start`, within `run`, across `band`:
+    /// along x over rows `band` when `across`, else along y over columns
+    /// `band`. Only the dashes the canvas and clip show are walked.
+    fn dash_band(
+        &mut self,
+        dash: Dash,
+        start: i64,
+        run: (i64, i64),
+        band: (i64, i64),
+        across: bool,
+        c: [u8; 4],
+    ) {
+        let (vx0, vy0, vx1, vy1) = self.clipped_bounds(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        let (lo, hi) = if across {
+            (run.0.max(vx0.into()), run.1.min(vx1.into()))
+        } else {
+            (run.0.max(vy0.into()), run.1.min(vy1.into()))
+        };
+        for (a, b) in dash.within(start, lo, hi) {
+            let rect = if across {
+                (a, band.0, b, band.1)
+            } else {
+                (band.0, a, band.1, b)
+            };
+            self.fill_device(rect, c);
+        }
+    }
+
+    /// Ink the device rect `x0..x1 × y0..y1` fully, within the canvas and
+    /// the clip.
+    fn fill_device(&mut self, (x0, y0, x1, y1): (i64, i64, i64, i64), c: [u8; 4]) {
+        let (vx0, vy0, vx1, vy1) = self.clipped_bounds(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        let fit = |v: i64, lo: i32, hi: i32| v.clamp(lo.into(), hi.into()) as i32;
+        let (x0, x1) = (fit(x0, vx0, vx1), fit(x1, vx0, vx1));
+        let (y0, y1) = (fit(y0, vy0, vy1), fit(y1, vy0, vy1));
+        let mut memo = RimMemo::default();
+        for y in y0..y1 {
+            self.blend_span(x0, x1, y, c, 1.0, &mut memo);
+        }
+    }
+}
+
+/// A [`DrawPrim::Dashed`] stroke's pattern in whole device px: dashes `on`
+/// long, `off` apart (`off == 0` runs solid).
+#[derive(Clone, Copy)]
+struct Dash {
+    on: i64,
+    off: i64,
+}
+
+impl Dash {
+    /// The dashes of the pattern begun at `start`, cut to `lo..hi`, in order.
+    fn within(self, start: i64, lo: i64, hi: i64) -> impl Iterator<Item = (i64, i64)> {
+        let period = self.on + self.off;
+        let first = (lo - start).max(0) / period;
+        (first..)
+            .map(move |k| start + k * period)
+            .take_while(move |&at| at < hi)
+            .map(move |at| (at.max(lo), (at + self.on).min(hi)))
+            .filter(|(a, b)| a < b)
+    }
+}
+
+/// The farthest a dashed stroke's places and lengths reach, in device px:
+/// past any surface, and small enough that their sums never overflow.
+const DASH_REACH: f32 = 16_777_216.0;
+
+/// A dashed stroke's edge `v` (device px) on the nearest whole pixel.
+fn dash_px(v: f32) -> i64 {
+    v.round().clamp(-DASH_REACH, DASH_REACH) as i64
+}
+
+/// A dashed stroke's length `v` (device px) in whole pixels, at least one.
+fn dash_len(v: f32) -> i64 {
+    v.max(1.0).round().min(DASH_REACH) as i64
 }
 
 /// A half-open device-pixel rectangle in a retained tray raster.
@@ -4273,7 +4439,8 @@ pub(crate) fn rasterize_tray_pixels(
     )
 }
 
-/// Composite one retained straight-alpha RGBA surface over another in the same linear-light source-over space as tray primitive rasterization.
+/// Composite one retained straight-alpha RGBA surface over another, in the linear-light
+/// source-over space tray primitives rasterize in.
 pub(crate) fn composite_rgba_surface(
     destination: &mut Vec<u8>,
     destination_size: (u32, u32),
@@ -4418,7 +4585,8 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
 
 #[cfg(test)]
 thread_local! {
-    /// How many prims [`replay_tray`] drew on this thread: a test's evidence that the prims an opaque specimen covers were not drawn under it.
+    /// How many prims [`replay_tray`] drew on this thread: a test's evidence that prims an opaque
+    /// specimen covers are not drawn under it.
     pub(crate) static DRAWN_PRIMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -4508,7 +4676,8 @@ fn occluding_specimen(
         .map(|(index, rect, _)| (index, rect))
 }
 
-/// The device rect the occluding specimen covers of `region` ([`occluding_specimen`]), for a test that rasters exactly that rect.
+/// The device rect the occluding specimen covers of `region` ([`occluding_specimen`]), for a test
+/// that rasters exactly that rect.
 #[cfg(test)]
 pub(crate) fn occluded_rect_for_test(
     prims: &[DrawPrim],
@@ -4714,6 +4883,21 @@ fn replay_tray(
                 width,
                 color,
             } => cv.line_segment((x1 * s, y1 * s), (x2 * s, y2 * s), width * s, *color),
+            DrawPrim::Dashed {
+                x,
+                y,
+                w,
+                h,
+                width,
+                on,
+                off,
+                color,
+            } => cv.dashed(
+                (x * s, y * s, w * s, h * s),
+                width * s,
+                (on * s, off * s),
+                *color,
+            ),
             DrawPrim::BandIcon {
                 x,
                 y,
@@ -7665,6 +7849,358 @@ mod tests {
         let row_white = |y: u32| (0..pw).all(|x| px[((y * pw + x) * 4) as usize] == 255);
         let covered: Vec<u32> = (0..ph).filter(|&y| row_white(y)).collect();
         assert_eq!(covered, vec![4], "exactly the y=4 row is fully white");
+    }
+
+    /// A white [`DrawPrim::Dashed`], its lengths in frame px.
+    fn dashed(x: f32, y: f32, w: f32, h: f32, width: f32, on: f32, off: f32) -> DrawPrim {
+        DrawPrim::Dashed {
+            x,
+            y,
+            w,
+            h,
+            width,
+            on,
+            off,
+            color: [255, 255, 255, 255],
+        }
+    }
+
+    /// Whether the device pixel at `(x, y)` of a raster over black is inked.
+    fn inked(px: &[u8], pw: u32) -> impl Fn(u32, u32) -> bool + '_ {
+        move |x, y| px[((y * pw + x) * 4) as usize] > 0
+    }
+
+    /// `line`'s runs in order: whether each is inked, and how long it is.
+    fn runs_of(line: impl Iterator<Item = bool>) -> Vec<(bool, u32)> {
+        let mut runs: Vec<(bool, u32)> = Vec::new();
+        for ink in line {
+            match runs.last_mut() {
+                Some((was, n)) if *was == ink => *n += 1,
+                _ => runs.push((ink, 1)),
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn a_dashed_lines_dashes_and_gaps_run_their_asked_lengths_at_1x_and_2x() {
+        for scale in [1.0_f32, 2.0] {
+            for (on, off) in [(3.0_f32, 2.0_f32), (1.5, 1.5), (4.0, 1.0), (1.0, 3.0)] {
+                for across in [true, false] {
+                    let (w, h) = if across { (60.0, 0.0) } else { (0.0, 60.0) };
+                    let prim = dashed(2.0, 2.0, w, h, 1.0, on, off);
+                    let (px, pw, _) = rasterize_tray(&[prim], 64, 64, scale, [0, 0, 0, 255]);
+                    let lit = inked(&px, pw);
+                    let line = |cross: u32| -> Vec<bool> {
+                        (0..pw)
+                            .map(|i| if across { lit(i, cross) } else { lit(cross, i) })
+                            .collect()
+                    };
+                    let at = format!("{scale}x {on}/{off} across={across}");
+                    let (start, end, t) =
+                        ((2.0 * scale) as u32, (62.0 * scale) as u32, scale as u32);
+                    let first = line(start);
+                    for cross in start..start + t {
+                        assert_eq!(line(cross), first, "{at}: the stroke's rows dash alike");
+                    }
+                    for cross in [start - 1, start + t] {
+                        assert!(!line(cross).contains(&true), "{at}: it is {t} px thick");
+                    }
+                    assert!(
+                        !first[..start as usize].contains(&true)
+                            && !first[end as usize..].contains(&true),
+                        "{at}: the line stays between its ends"
+                    );
+                    let runs = runs_of(first[start as usize..end as usize].iter().copied());
+                    assert!(runs[0].0, "{at}: a line starts with a dash: {runs:?}");
+                    let asked = |ink: bool| if ink { on * scale } else { off * scale };
+                    let (last, whole) = runs.split_last().expect("a run");
+                    for &(ink, n) in whole {
+                        assert!(
+                            (n as f32 - asked(ink)).abs() <= 1.0,
+                            "{at}: a run of {n} px for {}: {runs:?}",
+                            asked(ink)
+                        );
+                    }
+                    assert!(last.1 as f32 <= asked(last.0) + 1.0, "{at}: {runs:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dashed_rect_dashes_all_four_edges_between_solid_corners() {
+        for scale in [1.0_f32, 2.0] {
+            let (on, off) = (3.0, 2.0);
+            let prim = dashed(4.0, 4.0, 40.0, 30.0, 1.0, on, off);
+            let (px, pw, ph) = rasterize_tray(&[prim], 48, 40, scale, [0, 0, 0, 255]);
+            let lit = inked(&px, pw);
+            let s = scale as u32;
+            let (x0, y0, x1, y1, t) = (4 * s, 4 * s, 44 * s, 34 * s, s);
+            let edges: [(&str, Vec<bool>); 4] = [
+                ("top", (x0..x1).map(|x| lit(x, y0)).collect()),
+                ("bottom", (x0..x1).map(|x| lit(x, y1 - 1)).collect()),
+                ("left", (y0..y1).map(|y| lit(x0, y)).collect()),
+                ("right", (y0..y1).map(|y| lit(x1 - 1, y)).collect()),
+            ];
+            for (name, edge) in &edges {
+                let runs = runs_of(edge.iter().copied());
+                let at = format!("{scale}x {name}");
+                assert!(
+                    runs.iter().filter(|(ink, _)| !ink).count() >= 4,
+                    "{at}: the edge is dashed: {runs:?}"
+                );
+                let (head, tail) = (runs[0], runs[runs.len() - 1]);
+                assert!(
+                    head.0 && head.1 >= t && tail.0 && tail.1 >= t,
+                    "{at}: the edge runs between its solid corners: {runs:?}"
+                );
+                for &(ink, n) in &runs[1..runs.len() - 2] {
+                    let asked = if ink { on } else { off } * scale;
+                    assert!(
+                        (n as f32 - asked).abs() <= 1.0,
+                        "{at}: a run of {n} px for {asked}: {runs:?}"
+                    );
+                }
+            }
+            for y in 0..ph {
+                for x in 0..pw {
+                    let outside = x < x0 || x >= x1 || y < y0 || y >= y1;
+                    let inside = x >= x0 + t && x < x1 - t && y >= y0 + t && y < y1 - t;
+                    let corner = (x < x0 + t || x >= x1 - t) && (y < y0 + t || y >= y1 - t);
+                    if outside || inside {
+                        assert!(!lit(x, y), "{scale}x ({x}, {y}) is off the outline");
+                    } else if corner {
+                        assert!(lit(x, y), "{scale}x the corner ({x}, {y}) is solid");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dashed_rect_too_thin_for_an_inside_is_one_dashed_band() {
+        for scale in [1.0_f32, 2.0] {
+            let at = |prim: DrawPrim| rasterize_tray(&[prim], 24, 24, scale, [0, 0, 0, 255]).0;
+            let pw = (24.0 * scale) as u32;
+            let s = scale as u32;
+            let tall = at(dashed(4.0, 2.0, 2.0, 20.0, 1.0, 2.0, 2.0));
+            let lit = inked(&tall, pw);
+            let (x0, x1, y0, y1) = (4 * s, 6 * s, 2 * s, 22 * s);
+            for y in 0..pw {
+                let across: Vec<bool> = (0..pw).map(|x| lit(x, y)).collect();
+                let band = &across[x0 as usize..x1 as usize];
+                assert!(
+                    band.iter().all(|&ink| ink == band[0]),
+                    "{scale}x row {y}: the band's columns dash as one: {across:?}"
+                );
+                assert!(
+                    !across[..x0 as usize].contains(&true)
+                        && !across[x1 as usize..].contains(&true),
+                    "{scale}x row {y}: the band is the rect's two widths"
+                );
+                assert!(
+                    (y0..y1).contains(&y) || !band[0],
+                    "{scale}x row {y}: the band stays between its ends"
+                );
+            }
+            let runs = runs_of((y0..y1).map(|y| lit(x0, y)));
+            let (last, whole) = runs.split_last().expect("a run");
+            assert!(
+                runs[0].0 && runs.len() >= 8,
+                "{scale}x: dashed from the top: {runs:?}"
+            );
+            assert!(
+                whole.iter().all(|&(_, n)| n == 2 * s) && last.1 <= 2 * s,
+                "{scale}x: 2 on, 2 off: {runs:?}"
+            );
+            assert!(
+                at(dashed(6.0, 2.0, -2.0, 20.0, 1.0, 2.0, 2.0)) == tall,
+                "{scale}x: a negative width spans the same rect"
+            );
+            let wide = at(dashed(2.0, 4.0, 20.0, 2.0, 1.0, 2.0, 2.0));
+            let wide_lit = inked(&wide, pw);
+            assert!(
+                (0..pw).all(|x| (0..pw).all(|y| wide_lit(x, y) == lit(y, x))),
+                "{scale}x: a wide thin rect is the tall one turned"
+            );
+            let hollow = at(dashed(4.0, 2.0, 3.0, 20.0, 1.0, 2.0, 2.0));
+            let hollow_lit = inked(&hollow, pw);
+            let (inside, right) = (5 * s..6 * s, 7 * s - 1);
+            for y in y0 + s..y1 - s {
+                assert!(
+                    inside.clone().all(|x| !hollow_lit(x, y)),
+                    "{scale}x row {y}: one more pixel than two widths has an inside"
+                );
+            }
+            for x in [x0, right] {
+                let side = runs_of((y0..y1).map(|y| hollow_lit(x, y)));
+                assert!(side.len() >= 8, "{scale}x column {x} is dashed: {side:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_translucent_dashed_stroke_inks_each_pixel_once() {
+        for (scale, width) in [(1.0_f32, 1.0_f32), (2.0, 1.5), (1.5, 2.0)] {
+            let ink = [255, 255, 255, 128];
+            let prims = [
+                DrawPrim::Dashed {
+                    x: 3.0,
+                    y: 3.0,
+                    w: 30.0,
+                    h: 20.0,
+                    width,
+                    on: 2.0,
+                    off: 1.0,
+                    color: ink,
+                },
+                DrawPrim::Dashed {
+                    x: 3.0,
+                    y: 28.0,
+                    w: 30.0,
+                    h: 0.0,
+                    width,
+                    on: 0.5,
+                    off: 0.0,
+                    color: ink,
+                },
+            ];
+            let (px, _, _) = rasterize_tray(&prims, 40, 34, scale, [0, 0, 0, 255]);
+            let inks: std::collections::BTreeSet<[u8; 4]> = px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[0] > 0)
+                .copied()
+                .collect();
+            assert_eq!(inks.len(), 1, "{scale}x: one blend of the ink: {inks:?}");
+        }
+    }
+
+    #[test]
+    fn a_dashed_stroke_lands_on_whole_device_pixels() {
+        let prims = [
+            dashed(2.3, 3.7, 27.4, 18.6, 0.8, 1.7, 1.2),
+            dashed(1.6, 26.2, 30.3, 0.0, 1.3, 2.2, 0.9),
+            dashed(33.4, 2.2, 0.0, 25.1, 0.6, 1.1, 1.4),
+        ];
+        let (px, _, _) = rasterize_tray(&prims, 36, 30, 1.5, [0, 0, 0, 255]);
+        let reds: std::collections::BTreeSet<u8> =
+            px.as_chunks::<4>().0.iter().map(|pixel| pixel[0]).collect();
+        assert_eq!(
+            reds,
+            std::collections::BTreeSet::from([0, 255]),
+            "no pixel is partly inked"
+        );
+    }
+
+    #[test]
+    fn a_clip_cuts_a_dashed_stroke_and_its_pop_frees_the_next() {
+        let solid = |y: f32| dashed(0.0, y, 40.0, 0.0, 1.0, 3.0, 0.0);
+        let prims = vec![
+            DrawPrim::ClipPush {
+                x: 10.0,
+                y: 0.0,
+                w: 12.0,
+                h: 30.0,
+            },
+            solid(4.0),
+            dashed(2.0, 8.0, 36.0, 14.0, 1.0, 2.0, 2.0),
+            DrawPrim::ClipPop,
+            solid(26.0),
+        ];
+        let (px, pw, ph) = rasterize_tray(&prims, 40, 30, 1.0, [0, 0, 0, 255]);
+        let lit = inked(&px, pw);
+        let row = |y: u32| (0..pw).filter(|&x| lit(x, y)).collect::<Vec<u32>>();
+        assert_eq!(row(4), (10..22).collect::<Vec<u32>>(), "the clip's columns");
+        assert!(
+            row(8).len() > 2 && row(8).len() < 12,
+            "the rect's top edge, dashed"
+        );
+        for y in (0..ph).filter(|&y| y != 26) {
+            for x in (0..10).chain(22..pw) {
+                assert!(!lit(x, y), "({x}, {y}) is outside the clip");
+            }
+        }
+        assert_eq!(
+            row(26),
+            (0..40).collect::<Vec<u32>>(),
+            "past the pop, whole"
+        );
+    }
+
+    #[test]
+    fn a_regional_raster_dashes_as_the_full_raster_does() {
+        let prims = [
+            dashed(3.0, 3.0, 50.0, 30.0, 1.0, 3.0, 2.0),
+            dashed(1.0, 40.0, 58.0, 0.0, 1.5, 1.5, 1.5),
+            dashed(56.0, 1.0, 0.0, 44.0, 1.0, 2.0, 1.0),
+        ];
+        let scale = 2.0;
+        let (full, full_width, _) = rasterize_tray(&prims, 60, 46, scale, [0, 0, 0, 255]);
+        let region = RasterRect {
+            x: 17,
+            y: 9,
+            width: 83,
+            height: 77,
+        };
+        let regional = rasterize_tray_region(&prims, scale, [0, 0, 0, 255], region);
+        let mut expected = Vec::with_capacity(regional.len());
+        for row in region.y..region.y + region.height {
+            let start = ((row * full_width + region.x) * 4) as usize;
+            expected.extend_from_slice(&full[start..start + (region.width * 4) as usize]);
+        }
+        assert!(
+            regional == expected,
+            "a tile's dashes keep the full raster's phase"
+        );
+    }
+
+    #[test]
+    fn a_zero_or_odd_dash_length_is_safe() {
+        let (blank, _, _) = rasterize_tray(&[], 32, 12, 2.0, [0, 0, 0, 255]);
+        let line = |on: f32, off: f32| dashed(2.0, 4.0, 28.0, 0.0, 1.0, on, off);
+        for on in [0.0, -3.0, f32::NAN, f32::NEG_INFINITY] {
+            let (px, _, _) = rasterize_tray(&[line(on, 2.0)], 32, 12, 2.0, [0, 0, 0, 255]);
+            assert!(px == blank, "on {on} draws nothing");
+        }
+        for off in [0.0, -2.0, f32::NAN, f32::NEG_INFINITY] {
+            let (px, pw, _) = rasterize_tray(&[line(3.0, off)], 32, 12, 2.0, [0, 0, 0, 255]);
+            let lit = inked(&px, pw);
+            assert!(
+                (4..60).all(|x| lit(x, 8) && lit(x, 9)),
+                "off {off} runs solid"
+            );
+        }
+        let (px, pw, _) = rasterize_tray(&[line(0.01, 0.01)], 32, 12, 1.0, [0, 0, 0, 255]);
+        let lit = inked(&px, pw);
+        let runs = runs_of((2..30).map(|x| lit(x, 4)));
+        assert!(
+            runs.len() == 28 && runs[0].0,
+            "the least dash and gap are a pixel each: {runs:?}"
+        );
+        for prim in [
+            dashed(-1e30, 4.0, f32::INFINITY, 0.0, 1.0, 0.01, 0.01),
+            dashed(f32::NEG_INFINITY, 2.0, f32::INFINITY, 0.0, 1.0, 1.0, 1.0),
+            dashed(f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, 3.0, 2.0),
+            dashed(0.0, 0.0, 1e30, 1e30, f32::INFINITY, f32::MAX, f32::MAX),
+        ] {
+            let (px, _, _) = rasterize_tray(&[prim], 32, 12, 2.0, [0, 0, 0, 255]);
+            assert_eq!(px.len(), blank.len(), "the canvas holds whatever it drew");
+        }
+        let (px, pw, _) = rasterize_tray(
+            &[dashed(-1e30, 4.0, f32::INFINITY, 0.0, 1.0, 0.01, 0.01)],
+            32,
+            12,
+            1.0,
+            [0, 0, 0, 255],
+        );
+        let lit = inked(&px, pw);
+        assert!(
+            (0..32).filter(|&x| lit(x, 4)).count() == 16,
+            "a line past the canvas dashes what the canvas shows"
+        );
     }
 
     #[test]

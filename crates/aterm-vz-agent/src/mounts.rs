@@ -103,9 +103,18 @@ fn bindable(path: &Path) -> bool {
         && !path.starts_with(AT)
 }
 
-/// The steps that take `mounted` to the share at [`AT`] with exactly `shares` bound:
-/// the share mounted if it is not, every bind of it an earlier `Mount` made detached
-/// (deepest first), then each share bound and made read-only (shallowest first).
+/// The steps that take `mounted` to the share at [`AT`] with exactly `shares` bound: every
+/// bind of it an earlier `Mount` made detached (deepest first), the share itself detached
+/// and mounted afresh, then each share bound and made read-only (shallowest first).
+///
+/// The fresh mount is the helper's swap's other half (§7): after a swap the share's old
+/// mount still holds each name's cached entry, and a bind made through it lands on the
+/// directory the swap took away (measured in V4: the bind's root reads `/repo//deleted`
+/// and its directory is gone). A new mount looks every name up again, unless a guest
+/// process still references the old mount: virtiofs keeps one superblock per device while
+/// anything does, and the new mount shares its cached entries. So the lab names each
+/// checkout's entries apart (a swap binds names never looked up), and [`check`] holds every
+/// bind to its own entry after the plan ran.
 ///
 /// # Errors
 /// A share's name is not one directory, or its path is not bindable.
@@ -135,10 +144,6 @@ pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
     let ours = |m: &&Mounted| m.fstype == FSTYPE && m.source == TAG;
     let at = Path::new(AT);
     let mut ops = Vec::new();
-    if !mounted.iter().filter(ours).any(|m| m.point == at) {
-        ops.push(Op::Mkdir(at.to_path_buf()));
-        ops.push(Op::MountShare);
-    }
     let mut stale: Vec<&PathBuf> = mounted
         .iter()
         .filter(ours)
@@ -148,6 +153,11 @@ pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
     stale.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
     stale.dedup();
     ops.extend(stale.into_iter().map(|p| Op::Unmount(p.clone())));
+    if mounted.iter().filter(ours).any(|m| m.point == at) {
+        ops.push(Op::Unmount(at.to_path_buf()));
+    }
+    ops.push(Op::Mkdir(at.to_path_buf()));
+    ops.push(Op::MountShare);
     binds.sort_by_key(|(_, to)| to.components().count());
     for (from, to) in binds {
         ops.push(Op::Mkdir(to.clone()));
@@ -155,6 +165,43 @@ pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
         ops.push(Op::ReadOnly(to));
     }
     Ok(ops)
+}
+
+/// Whether every share is bound at its path from the share's own entry once a [`plan`] ran:
+/// the topmost mount at the path is the `aterm` share's, rooted at `/<name>` exactly. A bind
+/// made through a cached entry a swap took away reads `/<name>//deleted` (measured in V4),
+/// and one made through another entry reads that entry's name.
+///
+/// # Errors
+/// A share whose path shows no such mount, naming what it shows.
+pub fn check(mounted: &[Mounted], shares: &[Share]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    for s in shares {
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&s.path));
+        let want = Path::new("/").join(&s.name);
+        match mounted.iter().rev().find(|m| m.point == path) {
+            Some(m) if m.fstype == FSTYPE && m.source == TAG && m.root == want => {}
+            Some(m) => {
+                return Err(format!(
+                    "share `{}` at {}: the mount there shows {} of {} `{}`, not {}",
+                    s.name,
+                    path.display(),
+                    m.root.display(),
+                    m.fstype,
+                    m.source,
+                    want.display()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "share `{}`: nothing is mounted at {}",
+                    s.name,
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -223,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_mount_detaches_every_earlier_bind_deepest_first_and_keeps_the_share() {
+    fn a_later_mount_detaches_every_earlier_bind_deepest_first_then_mounts_the_share_afresh() {
         let mounted = format!(
             "{BOOTED}\
              60 25 0:42 / /mnt/aterm ro,relatime shared:30 - virtiofs aterm ro\n\
@@ -237,12 +284,47 @@ mod tests {
             [
                 Op::Unmount(p("/Users//me/old/.git")),
                 Op::Unmount(p("/Users//me/old")),
+                Op::Unmount(p("/mnt/aterm")),
+                Op::Mkdir(p("/mnt/aterm")),
+                Op::MountShare,
                 Op::Mkdir(p("/Users//me/new")),
                 Op::Bind(p("/mnt/aterm/repo"), p("/Users//me/new")),
                 Op::ReadOnly(p("/Users//me/new")),
             ],
             "the boot and rosetta shares are another tag's and stay"
         );
+    }
+
+    #[test]
+    fn a_bind_is_believed_only_rooted_at_its_own_entry() {
+        let shares = [share("repo-1a", "/Users//me/new")];
+        let good = format!(
+            "{BOOTED}\
+             70 25 0:43 / /mnt/aterm ro,relatime shared:31 - virtiofs aterm ro\n\
+             71 25 0:43 /repo-1a /Users//me/new ro,relatime shared:31 - virtiofs aterm ro\n"
+        );
+        assert_eq!(check(&parse(&good), &shares), Ok(()));
+        // The negative controls: a bind through an entry the swap took away, a stale bind
+        // under a fresh one (the topmost decides), another entry's, and none at all.
+        let deleted = good.replace("/repo-1a /Users", "/repo-1a//deleted /Users");
+        let err = check(&parse(&deleted), &shares).unwrap_err();
+        assert!(err.contains("/repo-1a//deleted"), "{err}");
+        let stacked = format!(
+            "{good}72 71 0:43 /repo-0b /Users//me/new ro,relatime shared:31 - virtiofs aterm ro\n"
+        );
+        let err = check(&parse(&stacked), &shares).unwrap_err();
+        assert!(err.contains("shows /repo-0b"), "{err}");
+        let fresh_over_stale = format!(
+            "{deleted}73 71 0:43 /repo-1a /Users//me/new ro,relatime shared:31 - virtiofs aterm ro\n"
+        );
+        assert_eq!(check(&parse(&fresh_over_stale), &shares), Ok(()));
+        let other_fs = format!(
+            "{BOOTED}74 25 253:0 /home /Users//me/new rw,relatime shared:1 - ext4 /dev/vda rw\n"
+        );
+        let err = check(&parse(&other_fs), &shares).unwrap_err();
+        assert!(err.contains("ext4"), "{err}");
+        let err = check(&parse(BOOTED), &shares).unwrap_err();
+        assert!(err.contains("nothing is mounted at /Users//me/new"), "{err}");
     }
 
     #[test]

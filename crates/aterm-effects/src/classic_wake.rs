@@ -260,8 +260,18 @@ impl ClassicWake {
         }
         self.last = cur;
 
-        self.sparks
-            .retain(|s| now.saturating_duration_since(s.born).as_secs_f32() < s.life);
+        let mut last_alive: Option<((Instant, u32), bool)> = None;
+        self.sparks.retain(|s| {
+            let key = (s.born, s.life.to_bits());
+            match last_alive {
+                Some((prev_key, alive)) if prev_key == key => alive,
+                _ => {
+                    let alive = now.saturating_duration_since(s.born).as_secs_f32() < s.life;
+                    last_alive = Some((key, alive));
+                    alive
+                }
+            }
+        });
         if self.sparks.len() > Self::MAX_SPARKS {
             let drop = self.sparks.len() - Self::MAX_SPARKS;
             self.sparks.drain(0..drop);
@@ -435,10 +445,10 @@ impl ClassicWake {
     }
 
     #[inline]
-    fn spark_cov(s: &Spark, now: Instant, cfg: &GlowConfig) -> u8 {
+    fn spark_tf(s: &Spark, now: Instant) -> f32 {
         let age = now.saturating_duration_since(s.born).as_secs_f32();
         let frac = (age / s.life).clamp(0.0, 1.0);
-        let tf = if s.typing {
+        if s.typing {
             if frac < 0.55 {
                 1.0
             } else {
@@ -446,8 +456,7 @@ impl ClassicWake {
             }
         } else {
             1.0 - frac
-        };
-        ((s.born_cov as f32) * tf * cfg.intensity) as u8
+        }
     }
 
     fn build_runs(
@@ -468,8 +477,18 @@ impl ClassicWake {
         self.comet_runs[0].clear();
         let mut prev: Option<(u16, u16)> = None;
         let mut head_cov = 0u8;
+        let mut last_tf: Option<((Instant, u32, bool), f32)> = None;
         for s in &self.sparks {
-            let cov = Self::spark_cov(s, now, cfg);
+            let key = (s.born, s.life.to_bits(), s.typing);
+            let tf = match last_tf {
+                Some((prev_key, cached)) if prev_key == key => cached,
+                _ => {
+                    let cached = Self::spark_tf(s, now);
+                    last_tf = Some((key, cached));
+                    cached
+                }
+            };
+            let cov = (f32::from(s.born_cov) * tf * cfg.intensity) as u8;
             let here = (s.row, s.col);
             if cov == 0 {
                 prev = Some(here);
@@ -743,10 +762,12 @@ impl ClassicWake {
                     let (dx, dy) = (bx - ax, by - ay);
                     let len2 = dx * dx + dy * dy;
                     let across_rows = ay != by && len2 > 0.0;
+                    let inv_len2 = if across_rows { 1.0 / len2 } else { 0.0 };
                     for s in run {
                         let mut v = ink(s);
                         if across_rows {
-                            let t = (((s.x - ax) * dx + (s.y - ay) * dy) / len2).clamp(0.0, 1.0);
+                            let t =
+                                (((s.x - ax) * dx + (s.y - ay) * dy) * inv_len2).clamp(0.0, 1.0);
                             v.x = ax + dx * t;
                             v.y = ay + dy * t + drop;
                         }

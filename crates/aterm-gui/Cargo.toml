@@ -46,6 +46,16 @@ path = "benches/settings_frame_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
+# The top deck's frame per stage (deck_paint, prims_fp, rasterize_tray, fold) and
+# whole, on the merged deck's busy and calm scenes, timed: a measurement, not a gate. Its
+# scenes are debug-gated, so by hand it is
+# `targo --unverified bench --profile opt-test -p aterm-gui --features bench-support --bench deck_frame_cost`.
+[[bench]]
+name = "deck_frame_cost"
+path = "benches/deck_frame_cost.rs"
+harness = false
+required-features = ["bench-support"]
+
 # The byte arm's C cut (card engine §3.6), timed over `verify perf
 # throughput`'s corpus without and with the cut; by hand it is
 # `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`.

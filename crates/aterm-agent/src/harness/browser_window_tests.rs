@@ -351,6 +351,57 @@ fn aterms_own_lock_holds_a_profile_a_headless_shell_has_open() {
     }
 }
 
+/// A STALE LOCK WHOSE PID WAS TAKEN BY ANOTHER PROCESS HOLDS NOTHING: a lock naming a live
+/// process that started after the lock was written (its pid reused, as after a crash or a
+/// reboot) or another user's process (launchd's pid 1) is stale, so the profile is free and
+/// claimed. CONTROL: a lock naming a live process of this user that started before it was
+/// written is that browser's, and the profile is refused.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lock_whose_pid_now_names_a_later_or_another_users_process_is_stale() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let profile = tmp.path().join("profile");
+    let here = host_name().expect("this machine's name");
+    let own = std::process::id();
+    let own_pid = i32::try_from(own).expect("pid");
+    lock(&profile, &format!("{here}-{own}"));
+    assert_eq!(
+        profile_holder(&profile),
+        Some(Holder::Browser(own_pid)),
+        "CONTROL: written after this process started"
+    );
+    assert!(ProfileLock::claim(&profile).is_err(), "CONTROL: refused");
+
+    let at = std::ffi::CString::new(profile.join("SingletonLock").as_os_str().as_encoded_bytes())
+        .expect("path");
+    let long_ago = [
+        libc::timeval {
+            tv_sec: 1_000_000,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: 1_000_000,
+            tv_usec: 0,
+        },
+    ];
+    // SAFETY: `at` is a NUL-terminated path and `long_ago` two timevals, both outliving the
+    // call, which sets the link's own times and follows nothing.
+    assert_eq!(unsafe { libc::lutimes(at.as_ptr(), long_ago.as_ptr()) }, 0);
+    assert_eq!(
+        profile_holder(&profile),
+        None,
+        "this process started after that lock was written, so it is not its browser"
+    );
+    drop(ProfileLock::claim(&profile).expect("a stale lock leaves the profile free"));
+
+    lock(&profile, &format!("{here}-1"));
+    assert_eq!(
+        profile_holder(&profile),
+        None,
+        "launchd is no browser of this user's"
+    );
+}
+
 /// A holder's words say what to do: quit a browser of this machine, wait for aterm's own, and,
 /// for a lock naming another machine (perhaps stale there), remove the profile's
 /// `SingletonLock` rather than quit a browser that is not here. Each has its own static brief.
@@ -623,6 +674,61 @@ fn tidy_browser(
 
 fn cookie(name: &str, domain: &str) -> Value {
     json!({"name": name, "domain": domain, "path": "/", "value": "never-read", "secure": true})
+}
+
+/// A HEADLESS LAUNCH MAKES UP A WINDOW'S PASS THAT NEVER RAN: on a profile carrying the untidied
+/// mark it deletes every identity provider's cookie in a page of its own, leaves the browser open
+/// for the launch, and removes the mark. CONTROLS: an unmarked profile is not touched (not one
+/// call); a store that keeps a deleted cookie fails and keeps the mark for the next launch.
+#[test]
+fn a_launch_makes_up_a_windows_pass_that_never_ran_and_only_then() {
+    let deadline = || Instant::now() + Duration::from_secs(60);
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let profile = tmp.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile");
+    let store = vec![
+        cookie("SID", ".google.com"),
+        cookie("MSPAuth", ".login.live.com"),
+        cookie("kimi-auth", ".kimi.ai"),
+    ];
+
+    let (mut cdp, browser) = tidy_browser(store.clone(), false, true);
+    assert_eq!(make_up_tidy(&mut cdp, &profile, deadline()), None);
+    drop(cdp);
+    let seen = browser.join().expect("stand-in");
+    assert!(seen.methods.is_empty(), "CONTROL: {:?}", seen.methods);
+
+    mark_untidied(&profile).expect("mark");
+    let (mut cdp, browser) = tidy_browser(store.clone(), false, true);
+    assert_eq!(make_up_tidy(&mut cdp, &profile, deadline()), Some(Ok(2)));
+    drop(cdp);
+    let seen = browser.join().expect("stand-in");
+    assert_eq!(
+        seen.deleted,
+        [
+            json!({"name": "SID", "domain": ".google.com", "path": "/"}),
+            json!({"name": "MSPAuth", "domain": ".login.live.com", "path": "/"}),
+        ]
+    );
+    assert!(
+        !seen.methods.iter().any(|m| m == "Browser.close"),
+        "the launch keeps its browser: {:?}",
+        seen.methods
+    );
+    assert!(!profile.join(UNTIDIED_MARK).exists(), "made up");
+
+    mark_untidied(&profile).expect("mark");
+    let (mut cdp, browser) = tidy_browser(store, true, true);
+    let stuck = make_up_tidy(&mut cdp, &profile, deadline());
+    drop(cdp);
+    browser.join().expect("stand-in");
+    assert!(
+        stuck.is_some_and(|r| r.is_err_and(|why| why.contains("stayed"))),
+        "CONTROL"
+    );
+    assert!(profile.join(UNTIDIED_MARK).is_file(), "CONTROL: kept");
+    clear_untidied(&profile).expect("cleared");
+    clear_untidied(&profile).expect("clearing none is no error");
 }
 
 /// The pass after the window deletes every identity provider's cookie by its name, domain and

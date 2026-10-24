@@ -8,7 +8,6 @@ use std::path::Path;
 
 use aterm_json::Value;
 use aterm_phase::WallKind;
-use aterm_phase::anchors::anchor_text;
 
 use super::codex_rollout::{
     FORK_BURST_MS, Prefix, RolloutRead, Streamed, counts_of, is_thread_id, stamp_ms,
@@ -38,36 +37,36 @@ pub fn log_build(build: &str) -> Option<StepId> {
     })
 }
 
-const SESSION_META: &str = anchor_text("rollout.session_meta");
-const TURN_CONTEXT: &str = anchor_text("rollout.turn_context");
-const EVENT_MSG: &str = anchor_text("rollout.event_msg");
-const RESPONSE_ITEM: &str = anchor_text("rollout.response_item");
-const COMPACTED: &str = anchor_text("rollout.compacted");
-const TASK_COMPLETE: &str = anchor_text("rollout.task_complete");
-const TURN_ABORTED: &str = anchor_text("rollout.turn_aborted");
-const SETTINGS_APPLIED: &str = anchor_text("rollout.thread_settings_applied");
-const TOKEN_COUNT: &str = anchor_text("rollout.token_count");
-const FUNCTION_CALL: &str = anchor_text("rollout.function_call");
-const FUNCTION_OUTPUT: &str = anchor_text("rollout.function_call_output");
-const CUSTOM_CALL: &str = anchor_text("rollout.custom_tool_call");
-const CUSTOM_OUTPUT: &str = anchor_text("rollout.custom_tool_call_output");
-const KEY_ID: &str = anchor_text("rollout.id");
-const KEY_FORKED_FROM: &str = anchor_text("rollout.forked_from_id");
-const KEY_CLI_VERSION: &str = anchor_text("rollout.cli_version");
-const KEY_THREAD_ID: &str = anchor_text("rollout.thread_id");
-const KEY_TURN_ID: &str = anchor_text("rollout.turn_id");
-const KEY_CALL_ID: &str = anchor_text("rollout.call_id");
-const KEY_NAME: &str = anchor_text("rollout.name");
-const KEY_NAMESPACE: &str = anchor_text("rollout.namespace");
-const KEY_MODEL: &str = anchor_text("rollout.model");
-const KEY_EFFORT: &str = anchor_text("rollout.effort");
-const KEY_DURATION_MS: &str = anchor_text("rollout.duration_ms");
-const KEY_ERROR: &str = anchor_text("rollout.error");
-const KEY_ERROR_INFO: &str = anchor_text("rollout.codex_error_info");
-const USAGE_LIMIT: &str = anchor_text("rollout.usage_limit_exceeded");
-const COLLABORATION: &str = anchor_text("rollout.collaboration");
-const SPAWN_AGENT: &str = anchor_text("rollout.spawn_agent");
-const EXEC_COMMAND: &str = anchor_text("rollout.exec_command");
+const SESSION_META: &str = aterm_phase::anchor!("rollout.session_meta");
+const TURN_CONTEXT: &str = aterm_phase::anchor!("rollout.turn_context");
+const EVENT_MSG: &str = aterm_phase::anchor!("rollout.event_msg");
+const RESPONSE_ITEM: &str = aterm_phase::anchor!("rollout.response_item");
+const COMPACTED: &str = aterm_phase::anchor!("rollout.compacted");
+const TASK_COMPLETE: &str = aterm_phase::anchor!("rollout.task_complete");
+const TURN_ABORTED: &str = aterm_phase::anchor!("rollout.turn_aborted");
+const SETTINGS_APPLIED: &str = aterm_phase::anchor!("rollout.thread_settings_applied");
+const TOKEN_COUNT: &str = aterm_phase::anchor!("rollout.token_count");
+const FUNCTION_CALL: &str = aterm_phase::anchor!("rollout.function_call");
+const FUNCTION_OUTPUT: &str = aterm_phase::anchor!("rollout.function_call_output");
+const CUSTOM_CALL: &str = aterm_phase::anchor!("rollout.custom_tool_call");
+const CUSTOM_OUTPUT: &str = aterm_phase::anchor!("rollout.custom_tool_call_output");
+const KEY_ID: &str = aterm_phase::anchor!("rollout.id");
+const KEY_FORKED_FROM: &str = aterm_phase::anchor!("rollout.forked_from_id");
+const KEY_CLI_VERSION: &str = aterm_phase::anchor!("rollout.cli_version");
+const KEY_THREAD_ID: &str = aterm_phase::anchor!("rollout.thread_id");
+const KEY_TURN_ID: &str = aterm_phase::anchor!("rollout.turn_id");
+const KEY_CALL_ID: &str = aterm_phase::anchor!("rollout.call_id");
+const KEY_NAME: &str = aterm_phase::anchor!("rollout.name");
+const KEY_NAMESPACE: &str = aterm_phase::anchor!("rollout.namespace");
+const KEY_MODEL: &str = aterm_phase::anchor!("rollout.model");
+const KEY_EFFORT: &str = aterm_phase::anchor!("rollout.effort");
+const KEY_DURATION_MS: &str = aterm_phase::anchor!("rollout.duration_ms");
+const KEY_ERROR: &str = aterm_phase::anchor!("rollout.error");
+const KEY_ERROR_INFO: &str = aterm_phase::anchor!("rollout.codex_error_info");
+const USAGE_LIMIT: &str = aterm_phase::anchor!("rollout.usage_limit_exceeded");
+const COLLABORATION: &str = aterm_phase::anchor!("rollout.collaboration");
+const SPAWN_AGENT: &str = aterm_phase::anchor!("rollout.spawn_agent");
+const EXEC_COMMAND: &str = aterm_phase::anchor!("rollout.exec_command");
 
 /// The kinds of row past a copy the fold opens: any other is skipped by its
 /// raw bytes, unparsed (a quote inside a JSON string is escaped, so a

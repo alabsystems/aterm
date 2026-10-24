@@ -152,14 +152,14 @@ impl Lineage {
         Some(self.launcher_version? == launcher.idversion?)
     }
 
-    /// Orphaned. With a launcher version (Apple): launchd adopted it, and launchd did not
-    /// start it (`launchd`, [`launchd_idversion`]); `parent_uniqueid` is never called. Without
-    /// one (Linux, which keeps no original parent): init adopted it, or its parent is older
-    /// than `floor`, the unique id of the run it is judged for. No process a run started is
-    /// older than the run, so a parent born before it adopted the process (a subreaper, as
-    /// `systemd --user` is on desktop Linux), and the run's own launcher (born at `floor`) never
-    /// counts. `parent_uniqueid` reads the parent's unique id; `None` (unreadable, another uid)
-    /// is not orphaned.
+    /// Orphaned. With a launcher version (Apple): launchd adopted it, and its launcher's version
+    /// is not `launchd`, launchd's own ([`launchd_idversion`]; unread, nothing is orphaned);
+    /// `parent_uniqueid` is never called. Without one (Linux, which keeps no original parent):
+    /// init adopted it, or its parent is older than `floor`, the unique id of the run it is
+    /// judged for. No process the run started is older than the run, so such a parent is an
+    /// adopter (a subreaper, as `systemd --user` is on desktop Linux); the run's own launcher,
+    /// born at `floor`, never counts. `parent_uniqueid` reads the parent's unique id; `None`
+    /// (unreadable, another uid) is not orphaned.
     #[must_use]
     pub fn orphaned(
         &self,
@@ -263,7 +263,8 @@ pub struct GroupMembers {
     pub complete: bool,
 }
 
-/// Lists up to [`MAX_GROUP_PIDS`] members of process group `pgid` (`proc_listpids(PROC_PGRP_ONLY)`).
+/// Lists up to [`MAX_GROUP_PIDS`] members of process group `pgid`
+/// (`proc_listpids(PROC_PGRP_ONLY)`).
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -482,8 +483,8 @@ fn markers_from_words<'a>(words: impl Iterator<Item = &'a [u8]>) -> Markers {
 
 /// A number `pid`'s process holds that no other process given `pid` in this boot holds: its
 /// unique id on macOS (`p_uniqueid`, never reused within a boot), its start in clock ticks on
-/// Linux (`/proc/<pid>/stat`). Neither reads a clock's zone or a locale. `None` when unread: no
-/// such process, a zombie on macOS, or no reader here.
+/// Linux (`/proc/<pid>/stat`). `None` when unread: no such process, a zombie on macOS, or no
+/// reader here.
 #[must_use]
 pub fn process_serial(pid: i32) -> Option<u64> {
     if pid <= 0 {
@@ -504,7 +505,7 @@ pub fn process_serial(pid: i32) -> Option<u64> {
     }
 }
 
-/// This boot's id, which a record kept for one boot names  ([`astream_sys::boot_session`]).
+/// This boot's id, which a record kept for one boot names ([`astream_sys::boot_session`]).
 #[cfg(unix)]
 #[must_use]
 pub fn boot_id() -> Option<String> {
@@ -546,7 +547,10 @@ fn namespace_inode(link: &str) -> Option<String> {
     (!inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit())).then(|| inode.to_owned())
 }
 
-/// Whether macOS's program check holds `pid` now: `Some(true)` is the whole held predicate (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), one thread that never ran, 20 s or more since the fork, neither stopped nor traced, native, its executable on a local volume, as aterm-sysprobe's one reader judges it ([`aterm_sysprobe::jobs::at_start`]). `None` when unread (gone, another user's, a pid that is no process).
+/// Whether macOS's program check holds `pid` now: `Some(true)` when
+/// [`aterm_sysprobe::jobs::at_start`] judges it [`aterm_sysprobe::jobs::AtStart::Held`]
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2). `None` when unread (gone, another
+/// user's, a pid that is no process).
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -555,10 +559,9 @@ pub fn at_program_check(pid: i32) -> Option<bool> {
     aterm_sysprobe::jobs::at_start(pid).map(|at| at == aterm_sysprobe::jobs::AtStart::Held)
 }
 
-/// See the Apple twin: Linux has no program check, so a process its identity read names
-/// ([`read_identity`]: live, this uid's) is never held there, and one it does not (a gone pid,
-/// a zombie, another uid's process, a thread's id, pid 1) is unread, as Apple's `ESRCH` and
-/// `EPERM` are.
+/// See the Apple twin: Linux has no program check, so a process [`read_identity`] reads (live,
+/// this uid's) is never held there, and any other pid (gone, a zombie, another uid's, a thread's
+/// id, pid 1) is unread, as Apple's `ESRCH` and `EPERM` are.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn at_program_check(pid: i32) -> Option<bool> {
@@ -572,7 +575,11 @@ pub fn at_program_check(_pid: i32) -> Option<bool> {
     None
 }
 
-/// Whether `pid`'s one thread has run, for a reader that would read its arguments or signal it: `Some(false)` for a thread list that is one handle `0` at any age, arch, volume or stop ([`aterm_sysprobe::jobs::StartFacts::lone_zero`]), since a read of such a program's arguments can hang (M29) and whether a signal reaches it is unmeasured (U11); only [`at_program_check`]'s words weigh the rest. `None` when unread.
+/// Whether `pid`'s one thread has run, for a reader that would read its arguments or signal it:
+/// `Some(false)` for a thread list that is one handle `0`, whatever its age, arch, volume or stop
+/// ([`aterm_sysprobe::jobs::StartFacts::lone_zero`]), since reading such a program's arguments
+/// can hang and whether a signal reaches it is unmeasured. The other facts are
+/// [`at_program_check`]'s to weigh. `None` when unread.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -581,7 +588,8 @@ pub fn thread_ran(pid: i32) -> Option<bool> {
     aterm_sysprobe::jobs::read_start(pid, aterm_sysprobe::jobs::now_us()).map(|f| !f.lone_zero)
 }
 
-/// See the Apple twin: nothing on Linux holds a program before its first instruction, so every positive pid answers `Some(true)` with nothing read.
+/// See the Apple twin: nothing on Linux holds a program before its first instruction, so every
+/// positive pid answers `Some(true)` with nothing read.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn thread_ran(pid: i32) -> Option<bool> {
@@ -600,11 +608,12 @@ pub fn thread_ran(_pid: i32) -> Option<bool> {
 pub struct HeldNow {
     /// The programs judged held: a lower bound, since a row that cannot be read is not counted.
     pub count: usize,
-    /// The oldest held program's fork age, ms (an upper bound on how long it has been held); 0 when none is.
+    /// The oldest held program's fork age in ms (an upper bound on its wait); 0 when none is.
     pub oldest_ms: u64,
 }
 
-/// How long a program has waited at macOS's program check, in the words every surface that counts the wait shares: `20 s` under a minute, `5 m` under an hour, `9 h 59 m` past one (its minutes two digits: `10 h 05 m`).
+/// How long a program has waited at macOS's program check, as every surface that counts the wait
+/// words it: `20 s` under a minute, `5 m` under an hour, then `10 h 05 m`.
 #[must_use]
 pub fn held_age(ms: u64) -> String {
     let s = ms / 1000;
@@ -615,7 +624,8 @@ pub fn held_age(ms: u64) -> String {
     }
 }
 
-/// [`held_programs`]' count over `pids`, each read by `read`: a row `read` cannot read is skipped, and only one [`aterm_sysprobe::jobs::judge_start`] calls held is counted.
+/// [`held_programs`]' count over `pids`, each read by `read`: a row `read` cannot read is
+/// skipped, and only one [`aterm_sysprobe::jobs::judge_start`] calls held is counted.
 #[cfg(any(unix, windows))]
 #[must_use]
 pub fn held_among(
@@ -632,7 +642,9 @@ pub fn held_among(
         })
 }
 
-/// This user's programs macOS's program check holds now: one two-slot thread list per process of this uid, and the start records of a lone `0` only, with one mount table for them all (no argument or environment is read). `None` when the process list cannot be read, and off macOS.
+/// This user's programs macOS's program check holds now: one two-slot thread list per process of
+/// this uid, and the start records of a lone `0` only, with one mount table for them all (no
+/// argument or environment is read). `None` when the process list cannot be read, and off macOS.
 #[cfg(target_os = "macos")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -710,12 +722,10 @@ mod tests {
         );
     }
 
-    /// A read between two identity reads that disagree is refused: an exit, a pid reused (a
-    /// later birth) on every kernel, and an exec where the identity has a pid version. Linux's
-    /// identity has none, so an exec there reads as the same process and the read stands; only
-    /// a tier's own reads (the executable under the roots) see it. NEGATIVE CONTROL: compare the
-    /// two reads' pid versions alone, and on Linux, where both are `None`, the reused pid's read
-    /// stands.
+    /// A read between two identity reads that disagree is refused: an exit, a reused pid, or an
+    /// exec where the identity has a pid version. Linux's identity has none, so an exec there
+    /// is one identity and the read stands. Negative control: compare the pid versions alone,
+    /// and on Linux, where both are `None`, the reused pid's read stands.
     #[test]
     fn markers_read_across_an_exec_are_refused() {
         let id = |birth, idversion| super::super::Identity {
@@ -765,15 +775,13 @@ mod tests {
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     }
 
-    /// A child's four markers are read off the kernel's copy of its exec environment
-    /// (`KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux) between two identity reads,
-    /// and nothing once it has exited, unreaped or reaped, or for pid 1. Its serial is its own:
-    /// read again it is the same, this process's differs, and once it is reaped none reads. The child is this test
-    /// binary, run in place: macOS withholds a platform binary's environment (`/bin/sleep`'s).
-    /// NEGATIVE CONTROLS: hand the macOS parser an empty buffer in place of the child's
-    /// arguments, and its markers do not read; read Linux's `environ` without the identity
-    /// reads around it (`bracketed`), and the exited child's empty `environ` reads as withheld
-    /// markers.
+    /// A child's four markers are read off the kernel's copy of its exec environment between two
+    /// identity reads, and nothing once it has exited (unreaped or reaped) or for pid 1. Its
+    /// serial reads the same twice, differs from this process's, and is gone once it is reaped.
+    /// The child is this test binary run in place: macOS withholds a platform binary's
+    /// environment. Negative controls: an empty buffer in place of the child's arguments reads no
+    /// markers on macOS; on Linux, reading `environ` without `bracketed` reads the exited child's
+    /// empty file as withheld markers.
     #[test]
     fn a_spawned_childs_markers_are_read_off_its_exec_environment() {
         use super::super::{ProcessPresence, process_presence};
@@ -949,10 +957,10 @@ mod tests {
         assert!(launched_before(i32::MAX, i32::MIN));
     }
 
-    /// The Linux environment's words go through the same selection as macOS's: only the three
-    /// markers, the first of each, a word with no `=` skipped; an empty file is withheld and a
-    /// read past the bound is unknown. NEGATIVE CONTROL: start `markers_from_words` with
-    /// `withheld` false, and the empty file reads as an environment that names no run.
+    /// Linux's `environ` goes through the same selection as macOS's words; an empty file is
+    /// withheld and a read past the bound is unknown. Negative control: start
+    /// `markers_from_words` with `withheld` false, and the empty file reads as an environment
+    /// that names no run.
     #[test]
     fn linux_markers_are_read_off_environ_and_an_empty_one_is_withheld() {
         let environ = b"HOME=/h\0NO_EQUALS\0ATERM_VERIFY_RUN=71-1\0ATERM_CHILD=1\0\
@@ -999,7 +1007,7 @@ mod tests {
     }
 
     /// A launcher is proven by two pid versions that agree, and by nothing where the kernel
-    /// keeps none. NEGATIVE CONTROL: compare the two `Option`s directly, and the Linux row's two
+    /// keeps none. Negative control: compare the two `Option`s directly, and the Linux row's two
     /// missing versions read as a launch.
     #[test]
     fn a_launcher_is_proven_only_by_two_versions() {
@@ -1016,7 +1024,7 @@ mod tests {
     }
 
     /// With a launcher version, orphaned is launchd's rule and the parent is never read; without
-    /// one, init adopted it or a parent older than the run did. NEGATIVE CONTROLS: `<=` for `<`
+    /// one, init adopted it or a parent older than the run did. Negative controls: `<=` for `<`
     /// makes the run's own launcher (born at the floor) an adopter; dropping the older-parent
     /// clause misses the subreaper.
     #[test]

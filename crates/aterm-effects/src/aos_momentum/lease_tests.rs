@@ -78,7 +78,6 @@ fn void_by(l: &Ledger) -> Option<LeaseRefusal> {
     }
 }
 
-/// The design's bounds: 16 workers, a 60 s hello and window, a 5 s grace, 3 attempts, 17 items.
 #[test]
 fn limits_v1_are_the_designs() {
     assert_eq!(LIMITS_V1.max_workers, 16);

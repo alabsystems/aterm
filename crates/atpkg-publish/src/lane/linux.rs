@@ -15,7 +15,7 @@ use super::rows::{self, Fetched};
 use super::state::{LaneState, Lock, names};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, PackRequest, Packer, Signing};
 use crate::artifact::lineage_switch::{self, Switch};
-use crate::artifact::{pkgdoc, tarwrite, upload};
+use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{Replace, Slug};
@@ -101,7 +101,7 @@ pub fn live_switch(ctx: &Ctx) -> Result<Switch> {
     lineage_switch::read(ctx, &lineage_switch::default_trust_repo(ctx))
 }
 
-/// Production Linux builder ([`tarwrite::COMPRESSOR`]).
+/// Production Linux builder.
 #[derive(Debug)]
 pub struct TrustBuilder {
     trustc: PathBuf,
@@ -159,11 +159,10 @@ impl Builder for TrustBuilder {
                 self.trustc.display()
             ));
         }
-        Self::linker(t).ok_or_else(|| {
+        Self::linker(t).map(|_| ()).ok_or_else(|| {
             let arch = t.as_str().split('-').next().unwrap_or("");
             format!("no cross linker for {t} on this builder ({arch}-linux-gnu-gcc on PATH)")
-        })?;
-        tarwrite::compressor_on_path().map(|_| ())
+        })
     }
 
     fn env_for(&self, t: Triple) -> std::result::Result<Vec<(String, String)>, String> {

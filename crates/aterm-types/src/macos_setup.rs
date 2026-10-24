@@ -335,14 +335,8 @@ impl Subject {
     }
 }
 
-/// Where one row stands, read without changing anything. This is the converge
-/// model's outcome reduced once for display (design §5): `Ok` is
-/// [`Standing::InPlace`], a planned change [`Standing::Differs`], `Person`
-/// [`Standing::NeedsYou`], `Blocked`, `Deferred` and `Waits`
-/// [`Standing::Waiting`] with their reason, a change that did not land
-/// [`Standing::Failed`], a change macOS takes up at login
-/// [`Standing::AtLogin`], `Unknown` and `Unusable` [`Standing::Unknown`], and
-/// `NotApplicable` [`Standing::NotNeeded`].
+/// Where one row stands, read without changing anything: a converge outcome
+/// reduced once for display (`aterm_machines::init_observe::standing`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Standing {
     /// The Mac already reads as wanted.
@@ -393,9 +387,9 @@ pub struct Observation {
     /// A short note in a person's words, shown under the row (an approval code,
     /// what a waiting row waits on).
     pub note: Option<String>,
-    /// The row's description: why it stands as it does, in its probe's words. The
-    /// page shows it under a row that needs a person, is not needed, was opted out
-    /// of or failed; a row that differs or waits shows its note alone.
+    /// Why the row stands as it does, in its probe's words: shown under a row that
+    /// needs a person, is not needed, was opted out of or failed (a row that
+    /// differs or waits shows its note alone).
     pub detail: Option<String>,
 }
 
@@ -414,7 +408,7 @@ impl Observation {
     }
 }
 
-/// Bitmask of selected workstation profile groups.
+/// Bitmask of selected settings, one bit per [`Setting`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection(u16);
 
@@ -562,11 +556,39 @@ impl Access {
 }
 
 /// How many of macOS's own dialogs or pages this process has put on screen and
-/// not yet seen end: the setup worker's Accessibility, Automation and vault
-/// prompts, and the window's access hand-overs. Every one of them checks
-/// [`macos_dialog_up`] before starting, so only one macOS gesture is up at a
-/// time (`docs/DESIGN-system-state-2026-10-21.md` §6).
+/// not yet seen end. The setup worker's prompts and the window's access
+/// hand-overs each hold a [`MacosDialog`] while theirs is up, and an automatic
+/// step starts only when none is up (`MacosDialog::when_none_up`), so it never
+/// stacks a second one (`docs/DESIGN-system-state-2026-10-21.md` §6).
 static MACOS_DIALOGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static MACOS_DIALOG_WAITER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MACOS_DIALOG_WAITER_READY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register what wakes a caller that timed out waiting for another macOS
+/// dialog, once the last dialog ends. Immediate slot probes do not wait and
+/// never subscribe. The first registration wins.
+pub fn on_macos_dialog_waiter_ready(ready: fn()) {
+    let _ = MACOS_DIALOG_WAITER_READY.set(ready);
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn arm_macos_dialog_waiter() {
+    // This arm/check and the last drop's count transition/consume share one
+    // SeqCst order: neither side can miss the other across the two atomics.
+    MACOS_DIALOG_WAITER.store(true, std::sync::atomic::Ordering::SeqCst);
+    notify_macos_dialog_waiter();
+}
+
+fn notify_macos_dialog_waiter() {
+    if MACOS_DIALOGS.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && MACOS_DIALOG_WAITER.swap(false, std::sync::atomic::Ordering::SeqCst)
+        && let Some(ready) = MACOS_DIALOG_WAITER_READY.get()
+    {
+        ready();
+    }
+}
 
 /// Whether a macOS dialog or page this process started is still up.
 #[must_use]
@@ -611,6 +633,9 @@ impl MacosDialog {
                 return Some(Self(()));
             }
             if std::time::Instant::now() >= deadline {
+                if !limit.is_zero() {
+                    arm_macos_dialog_waiter();
+                }
                 return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -656,11 +681,10 @@ pub fn on_system_state_front(shown: fn()) {
 }
 
 /// The grants a person opted out of, which System State honors as the row's
-/// wanted state (`docs/DESIGN-system-state-2026-10-21.md` §4): `[privacy]
-/// enabled = false`, `check = false` or `notice = false`, and a debugger access
-/// that was turned off. The window owns the config and the debugger's records,
-/// so it publishes them here; the setup worker's readings and its Permissions
-/// stage read them. A panel's Not now is the access record's `declined`.
+/// wanted state (`docs/DESIGN-system-state-2026-10-21.md` §4): a `[privacy]`
+/// switch off (`enabled`, `check` or `notice`), or debugger access turned off. The
+/// window publishes them; the setup worker's readings and its Permissions stage
+/// read them. A panel's Not now is the access record's `declined`, not an opt-out.
 pub mod opt_out {
     use super::Access;
 
@@ -721,17 +745,17 @@ pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Drop for MacosDialog {
     fn drop(&mut self) {
-        MACOS_DIALOGS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if MACOS_DIALOGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            notify_macos_dialog_waiter();
+        }
     }
 }
 
 /// The per-revision record of access steps, a text file in aterm's state
 /// directory: one `<revision> <row> <outcome>` line per step. Unknown lines are
-/// skipped, so an older or newer aterm can share the file. Every line is
-/// written through [`append`], which calls the registered watcher
-/// ([`on_append`]) once the line is on disk: a step the window took, a grant it
-/// verified or the debugger's outcome is what System State's Access rows and a
-/// run parked on the Permissions stage wait for.
+/// skipped, so an older or newer aterm can share the file. [`append`] tells the
+/// registered watcher ([`on_append`]) once each line is on disk; System State's
+/// Access rows and a run parked on the Permissions stage wait for that.
 pub mod access_record {
     use std::io::Write as _;
     use std::path::Path;
@@ -972,9 +996,7 @@ mod tests {
         }
     }
 
-    /// A written step tells the registered watcher, once the line is on disk
-    /// (it reads the record again); a line that could not be written tells it
-    /// nothing.
+    /// The watcher reads the line back from disk; a failed write tells it nothing.
     #[test]
     fn a_written_access_step_tells_its_watcher_after_the_line_is_on_disk() {
         use std::sync::Mutex;
@@ -1024,6 +1046,12 @@ mod tests {
 
     #[test]
     fn a_macos_dialog_counts_as_up_only_while_its_guard_lives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READY: AtomicUsize = AtomicUsize::new(0);
+        fn ready() {
+            READY.fetch_add(1, Ordering::SeqCst);
+        }
+        on_macos_dialog_waiter_ready(ready);
         assert!(!macos_dialog_up());
         let first = MacosDialog::up();
         let second = MacosDialog::up();
@@ -1038,6 +1066,24 @@ mod tests {
         assert!(MacosDialog::when_none_up(std::time::Duration::ZERO).is_none());
         drop(waited);
         assert!(!macos_dialog_up());
+        assert_eq!(READY.load(Ordering::SeqCst), 0);
+
+        let first = MacosDialog::up();
+        let last = MacosDialog::up();
+        assert!(MacosDialog::when_none_up(std::time::Duration::from_nanos(1)).is_none());
+        drop(first);
+        assert_eq!(READY.load(Ordering::SeqCst), 0);
+        drop(last);
+        assert_eq!(READY.load(Ordering::SeqCst), 1);
+        drop(MacosDialog::up());
+        assert_eq!(READY.load(Ordering::SeqCst), 1, "the waiter was consumed");
+
+        // The last dialog can end after the timed-out caller saw contention
+        // but before it arms the wake. Its post-arm check still notifies once.
+        arm_macos_dialog_waiter();
+        assert_eq!(READY.load(Ordering::SeqCst), 2);
+        notify_macos_dialog_waiter();
+        assert_eq!(READY.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1076,8 +1122,6 @@ mod tests {
         assert_eq!(opt_out::get(Access::Debugger), None);
     }
 
-    /// A sentence that says the person turned a grant off is said only of a
-    /// grant that reads off; a `[privacy]` switch's of any reading.
     #[test]
     fn a_turned_off_opt_out_holds_only_of_an_off_reading() {
         use opt_out::OptOut;

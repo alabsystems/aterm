@@ -109,9 +109,8 @@ impl Vouch {
 }
 
 impl Candidate {
-    /// This candidate with the digest the lane measured from its downloaded bytes, its row
-    /// carrying it as every other row carries its documents' digest; `None` unless the
-    /// candidate is still [`Vouch::Measure`] and `digest` is its anchor's algorithm.
+    /// This candidate with the digest the lane measured from its downloaded bytes, set in its
+    /// row; `None` unless it is still [`Vouch::Measure`] and `digest` is its anchor's algorithm.
     #[must_use]
     pub(crate) fn measured(&self, digest: AuthenticatedDigest) -> Option<Self> {
         if self.vouch != Vouch::Measure || digest.alg() != self.anchor.digest_alg() {
@@ -401,7 +400,7 @@ fn off_pin(requested: &str, effective: &str) -> String {
     format!("{requested} was answered from {effective}, off its pinned host")
 }
 
-/// A plain-text head (claude's, kimi's and grok's): one canonical version, at most one `\n` after it.
+/// A plain-text head (claude's, kimi's, grok's): one canonical version, then at most one `\n`.
 fn plain_head_version(body: &[u8]) -> Option<Version> {
     let text = std::str::from_utf8(body).ok()?;
     Version::parse(text.strip_suffix('\n').unwrap_or(text))

@@ -955,6 +955,10 @@ mod tests {
         window.rows = 90;
         window.cols = 160;
         assert!(app.open_system_state_tab());
+        app.publish_system_state(crate::SetupStatus {
+            plan: Some(aterm_types::macos_setup::Plan::default()),
+            ..crate::SetupStatus::default()
+        });
         app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
             apply: |_, _, _, _| panic!("an old accessibility choice cannot follow Check"),
             check: |_| {

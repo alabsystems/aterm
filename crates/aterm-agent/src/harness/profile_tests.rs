@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the `.claude.json` allowlist reader ([`super::parse`], [`super::read`]).
+//! Tests for the `.claude.json` allowlist reader ([`super::parse`], [`super::read`]), the
+//! subscription display, and agy's and Muse's login, usage, model and effort reads.
 
 use aterm_json::{Value, json};
 use aterm_tempfile::TempDir as Tmp;
@@ -68,9 +69,8 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     }
 }
 
-/// THE ONE AGE RULE of every weekly figure: current for fifteen minutes, then with its age
-/// up to an hour, and nothing older, from the future or past its reset; tenths as the
-/// `/usage` cache has them.
+/// Every weekly figure's age rule: current for fifteen minutes, then shown with its age up to an
+/// hour; nothing older, from the future or past its reset. Tenths as the `/usage` cache has them.
 #[test]
 fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
     const AT: i64 = 1_792_050_000;
@@ -1280,12 +1280,10 @@ fn the_profile_path_follows_the_home_rule() {
     );
 }
 
-/// The file Claude Code reads for a home ([`effective`], 2.1.301's `v_()`):
-/// a `.config.json` in the records directory that holds a byte stands in
-/// for the plain profile, present or not, a link to one too; an empty one
-/// does only while it has a write bit and no plain file is there; and a
-/// custom OAuth URL renames the plain file, whose absence is then the
-/// renamed one's.
+/// The file Claude Code reads for a home ([`effective`], 2.1.301's `v_()`): a `.config.json` in
+/// the records directory that holds a byte stands in for the plain profile, present or not, a link
+/// to one too; an empty one does only while it has a write bit and no plain file is there; and a
+/// custom OAuth URL renames the plain file, whose absence is then the renamed one's.
 #[cfg(unix)]
 #[test]
 fn the_file_read_is_the_one_claude_code_picks() {
@@ -1690,9 +1688,8 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         )
         .expect("cached 3p subscription");
         assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 100% left"));
-        // Even with in-memory cache cleared and another reader holding the store lock
-        // past FRESH_S, a stale store reading whose weekly reset window is still open
-        // serves as fallback instead of dropping to unavailable.
+        // With the in-memory cache cleared and another reader holding the store lock past
+        // `FRESH_OPEN_S`, a stale store reading whose weekly window is still open is the fallback.
         AGY_USAGE_CACHE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1848,7 +1845,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     assert_eq!(switched_bucket.weekly_figure, None);
     assert_eq!(switched_bucket.weekly, None);
 
-    // A mid-session `/login` appended past 128 KB in `cli.log` overrides the startup email in the head.
+    // A mid-session `/login` in `cli.log`'s last 128 KiB overrides the startup email in its head.
     let mut big_log = log_bytes.to_vec();
     big_log.extend(std::iter::repeat_n(b'x', 200 * 1024));
     big_log.extend_from_slice(
@@ -2198,8 +2195,7 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
     assert_eq!(muse_exc.said.as_deref(), Some("Muse resume verified."));
     assert_eq!(muse_exc.doing.as_deref(), Some("read_file"));
 
-    // A trailing line larger than 64 KiB widens `read_jsonl_tail` instead of draining
-    // the entire tail buffer to empty.
+    // A trailing line over 64 KiB widens `read_jsonl_tail`'s window rather than emptying the tail.
     let mut large_log = muse_log.to_vec();
     let padding = "x".repeat(70 * 1024);
     large_log.extend_from_slice(

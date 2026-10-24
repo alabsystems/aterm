@@ -1168,7 +1168,8 @@ pub struct Evaluator {
     origin: Instant,
     /// The inputs stepped so far ([`Self::stepped`]).
     stepped: AtomicU64,
-    /// The grid's own selection, once a search ran the grid ([`Self::grid_selection`]): `None` inside when the grid has no training winner.
+    /// The grid's own selection, once a search ran the grid ([`Self::grid_selection`]); `None`
+    /// inside when the grid has no training winner.
     grid: OnceLock<Option<GridSelection>>,
     /// A held-out item's scenario replaced (tests only: `Evaluator::replacing`).
     #[cfg(test)]

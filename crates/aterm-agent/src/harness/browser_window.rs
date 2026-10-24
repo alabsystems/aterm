@@ -187,12 +187,31 @@ fn host_name() -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
-/// Whether process `pid` lives on this machine (`kill(pid, 0)` answers it or `EPERM`).
+/// Whether process `pid` lives on this machine as this user's (`kill(pid, 0)` answers it): a
+/// process of another user (`EPERM`, launchd's pid 1 among them) is none of the browsers this
+/// user's profiles are opened in.
 #[cfg(unix)]
 fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 sends nothing; it only asks whether `pid` exists.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // SAFETY: signal 0 sends nothing; it only asks whether `pid` exists and may be signalled.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Whether the live process `pid` started after the `SingletonLock` `lock` was written (its
+/// link's own modification time), so it reuses the pid of the browser that wrote it, which is
+/// gone: the browser holding a lock started before writing it. `false` where either time is
+/// not known (no start record on this system).
+#[cfg(unix)]
+fn started_after(pid: i32, lock: &Path) -> bool {
+    let Some(birth) = aterm_uds::process::read_process_birth(pid) else {
+        return false;
+    };
+    let Ok(written) = std::fs::symlink_metadata(lock).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let started = std::time::UNIX_EPOCH
+        + Duration::from_secs(birth.seconds)
+        + Duration::from_micros(birth.microseconds);
+    started > written
 }
 
 /// Who holds a browser profile open ([`profile_holder`]).
@@ -259,15 +278,17 @@ impl Holder {
 /// Who holds `profile` by Chromium's `SingletonLock` link (`<host>-<pid>`, read with
 /// `read_link` only): a live process of this machine, or any of another machine. `None` with no
 /// lock, an unreadable one, or one whose process on this machine is gone (a stale lock, which
-/// Chromium itself clears).
+/// Chromium itself clears): no longer this user's ([`alive`]), or a later process that reuses
+/// its pid ([`started_after`], as after a crash or a reboot).
 #[cfg(unix)]
 fn singleton_holder(profile: &Path) -> Option<Holder> {
-    let target = std::fs::read_link(profile.join("SingletonLock")).ok()?;
+    let lock = profile.join("SingletonLock");
+    let target = std::fs::read_link(&lock).ok()?;
     let target = target.to_string_lossy();
     let (host, pid) = target.rsplit_once('-')?;
     let pid: i32 = pid.parse().ok().filter(|pid| *pid > 0)?;
     if host_name().as_deref() == Some(host) {
-        alive(pid).then_some(Holder::Browser(pid))
+        (alive(pid) && !started_after(pid, &lock)).then_some(Holder::Browser(pid))
     } else {
         Some(Holder::Elsewhere {
             pid,
@@ -495,6 +516,116 @@ pub struct Tidied {
 /// request leaves the browser.
 const BLANK_PAGE: &str = "<!doctype html><title>aterm</title>";
 
+/// One CDP call within `deadline`, its error naming the method ([`tidy_over_cdp`]).
+fn call_by(
+    cdp: &mut super::headless_oauth::CdpClient,
+    session: Option<&str>,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value, String> {
+    cdp.call(
+        session,
+        method,
+        params,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(|why| format!("{method}: {why}"))
+}
+
+/// The keys (name, domain, path and partition) of the identity providers' cookies
+/// ([`idp_cookie`]) in `cdp`'s store, never their values.
+fn idp_cookie_keys(
+    cdp: &mut super::headless_oauth::CdpClient,
+    deadline: Instant,
+) -> Result<Vec<Value>, String> {
+    call_by(cdp, None, "Storage.getCookies", json!({}), deadline).map(|got| {
+        got.get("cookies")
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter(|c| {
+                        c.get("domain")
+                            .and_then(Value::as_str)
+                            .is_some_and(idp_cookie)
+                    })
+                    .map(|c| {
+                        let mut key = json!({
+                            "name": c.get("name").cloned().unwrap_or(Value::Null),
+                            "domain": c.get("domain").cloned().unwrap_or(Value::Null),
+                            "path": c.get("path").cloned().unwrap_or(Value::Null),
+                        });
+                        if let (Some(part), Some(map)) =
+                            (c.get("partitionKey"), key.as_object_mut())
+                        {
+                            map.insert("partitionKey".to_owned(), part.clone());
+                        }
+                        key
+                    })
+                    .collect::<Vec<Value>>()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// A blank page target in `cdp`'s browser, attached: its target id and page session.
+fn blank_target(
+    cdp: &mut super::headless_oauth::CdpClient,
+    deadline: Instant,
+) -> Result<(String, String), String> {
+    let target = call_by(
+        cdp,
+        None,
+        "Target.createTarget",
+        json!({"url": "about:blank"}),
+        deadline,
+    )?;
+    let target_id = target
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or("Target.createTarget: no targetId")?
+        .to_owned();
+    let attached = call_by(
+        cdp,
+        None,
+        "Target.attachToTarget",
+        json!({"targetId": target_id, "flatten": true}),
+        deadline,
+    )?;
+    let page = attached
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or("Target.attachToTarget: no sessionId")?
+        .to_owned();
+    Ok((target_id, page))
+}
+
+/// Every identity provider's cookie deleted through the page session `page` by its key
+/// ([`idp_cookie_keys`]), and the store read again to show none is left: how many there were.
+fn drop_idp_cookies(
+    cdp: &mut super::headless_oauth::CdpClient,
+    page: &str,
+    deadline: Instant,
+) -> Result<usize, String> {
+    let doomed = idp_cookie_keys(cdp, deadline)?;
+    for key in &doomed {
+        call_by(
+            cdp,
+            Some(page),
+            "Network.deleteCookies",
+            key.clone(),
+            deadline,
+        )?;
+    }
+    let left_over = idp_cookie_keys(cdp, deadline)?.len();
+    if left_over > 0 {
+        return Err(format!(
+            "{left_over} identity-provider cookie(s) stayed in the profile after their delete"
+        ));
+    }
+    Ok(doomed.len())
+}
+
 /// [`tidy_profile`] over `cdp` until `deadline`: every identity provider's cookie
 /// ([`idp_cookie`]) deleted by its name, domain and path (and partition) and the store read again
 /// to show none is left; then, where `session` names the vendor's origin and key, a blank page
@@ -508,75 +639,8 @@ pub fn tidy_over_cdp(
     session: Option<(&str, &str)>,
     deadline: Instant,
 ) -> Result<Tidied, String> {
-    let left = || deadline.saturating_duration_since(Instant::now());
-    let call = |cdp: &mut super::headless_oauth::CdpClient,
-                session: Option<&str>,
-                method: &str,
-                params: Value| {
-        cdp.call(session, method, params, left())
-            .map_err(|why| format!("{method}: {why}"))
-    };
-    let idp_cookies = |cdp: &mut super::headless_oauth::CdpClient| {
-        call(cdp, None, "Storage.getCookies", json!({})).map(|got| {
-            got.get("cookies")
-                .and_then(Value::as_array)
-                .map(|all| {
-                    all.iter()
-                        .filter(|c| {
-                            c.get("domain")
-                                .and_then(Value::as_str)
-                                .is_some_and(idp_cookie)
-                        })
-                        .map(|c| {
-                            let mut key = json!({
-                                "name": c.get("name").cloned().unwrap_or(Value::Null),
-                                "domain": c.get("domain").cloned().unwrap_or(Value::Null),
-                                "path": c.get("path").cloned().unwrap_or(Value::Null),
-                            });
-                            if let (Some(part), Some(map)) =
-                                (c.get("partitionKey"), key.as_object_mut())
-                            {
-                                map.insert("partitionKey".to_owned(), part.clone());
-                            }
-                            key
-                        })
-                        .collect::<Vec<Value>>()
-                })
-                .unwrap_or_default()
-        })
-    };
-    let doomed = idp_cookies(cdp)?;
-    let target = call(
-        cdp,
-        None,
-        "Target.createTarget",
-        json!({"url": "about:blank"}),
-    )?;
-    let target_id = target
-        .get("targetId")
-        .and_then(Value::as_str)
-        .ok_or("Target.createTarget: no targetId")?
-        .to_owned();
-    let attached = call(
-        cdp,
-        None,
-        "Target.attachToTarget",
-        json!({"targetId": target_id, "flatten": true}),
-    )?;
-    let page = attached
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or("Target.attachToTarget: no sessionId")?
-        .to_owned();
-    for key in &doomed {
-        call(cdp, Some(&page), "Network.deleteCookies", key.clone())?;
-    }
-    let left_over = idp_cookies(cdp)?.len();
-    if left_over > 0 {
-        return Err(format!(
-            "{left_over} identity-provider cookie(s) stayed in the profile after their delete"
-        ));
-    }
+    let (target_id, page) = blank_target(cdp, deadline)?;
+    let dropped = drop_idp_cookies(cdp, &page, deadline)?;
     let session = match session {
         None => None,
         Some((origin, key)) => Some(session_kept(cdp, &page, origin, key, deadline)?),
@@ -588,10 +652,62 @@ pub fn tidy_over_cdp(
         Duration::from_secs(2),
     );
     let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
-    Ok(Tidied {
-        dropped: doomed.len(),
-        session,
-    })
+    Ok(Tidied { dropped, session })
+}
+
+/// The file a browser profile holds from before a window opens on it until the pass after the
+/// window has dropped its identity providers' cookies ([`mark_untidied`], [`clear_untidied`]): a
+/// window whose pass never ran (its `accounts browser` killed, crashed or cut off) leaves it,
+/// and the next headless launch on the profile makes that pass up first ([`make_up_tidy`]).
+pub const UNTIDIED_MARK: &str = "aterm-untidied";
+
+/// How long a launch's [`make_up_tidy`] may take before the launch goes on.
+pub const MAKE_UP_WITHIN: Duration = Duration::from_secs(30);
+
+/// Marks `profile` as holding a window whose pass after it has not run yet ([`UNTIDIED_MARK`]).
+/// # Errors
+/// The mark could not be written.
+pub fn mark_untidied(profile: &Path) -> std::io::Result<()> {
+    std::fs::write(profile.join(UNTIDIED_MARK), "")
+}
+
+/// Removes `profile`'s [`UNTIDIED_MARK`] once its identity providers' cookies are gone.
+/// # Errors
+/// The mark is there and could not be removed.
+pub fn clear_untidied(profile: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(profile.join(UNTIDIED_MARK)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// A headless launch's make-up, over its `cdp` before it does anything else, of a window's pass
+/// that never ran on `profile` ([`UNTIDIED_MARK`]): every identity provider's cookie dropped in
+/// a blank page of its own ([`drop_idp_cookies`], the browser left open), and the mark removed
+/// once none is left. `None` where the profile is not marked; else how many were dropped, or
+/// why it failed (the mark kept, for the next launch to try again).
+pub fn make_up_tidy(
+    cdp: &mut super::headless_oauth::CdpClient,
+    profile: &Path,
+    deadline: Instant,
+) -> Option<Result<usize, String>> {
+    if !profile.join(UNTIDIED_MARK).exists() {
+        return None;
+    }
+    let made = blank_target(cdp, deadline).and_then(|(target_id, page)| {
+        let dropped = drop_idp_cookies(cdp, &page, deadline);
+        let _ = cdp.call(
+            None,
+            "Target.closeTarget",
+            json!({"targetId": target_id}),
+            Duration::from_secs(2),
+        );
+        dropped
+    });
+    if made.is_ok() {
+        let _ = clear_untidied(profile);
+    }
+    Some(made)
 }
 
 /// Whether `origin`'s `localStorage` in the page session `page` holds `key` ([`tidy_over_cdp`]):

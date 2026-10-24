@@ -2458,7 +2458,11 @@ fn evaluate(
         }
         reported.roots = roots_of(&seen.mark);
     }
-    if shared.stamp(&obs.inputs) != stamp {
+    let now = shared.stamp(&obs.inputs);
+    if now != stamp {
+        aterm_log::info!(
+            "spare gate: generation {stamp:016x} became {now:016x} before its visible run was judged; the run is not counted"
+        );
         return None;
     }
     let sample = judge(&obs, seen, last_scan);

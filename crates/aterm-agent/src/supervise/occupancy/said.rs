@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE DOOR SAYS TO ITS HOST (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
+//! What the door says to its host (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6).
 
 use super::door::PaceGrant;
 use super::reading::OccupancyReading;
@@ -75,8 +75,8 @@ pub struct SaidRule {
     pub at_ms: i64,
 }
 
-/// A DUE LINE PAST K LOOKS UNTOLD, as the host is told it (the slice-2 plan's D2): what the tab's
-/// `ready-idle` Entry names, closed words and numbers only.
+/// A due line past K looks untold, as the host is told it: what the tab's `ready-idle` Entry
+/// names, in closed words and numbers only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaidReadyIdle {
     /// The rule whose line stood due.
@@ -88,14 +88,15 @@ pub struct SaidReadyIdle {
     pub since_ms: i64,
 }
 
-/// THE DOOR'S STATE AS THE HOST IS TOLD IT, once a change ([module docs](self)).
+/// The door's state as the host is told it, once per change.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OccupancySaid {
     /// The mode the break ran under (`[harness] occupancy`).
     pub mode: Occupancy,
     /// The open hold; `None` once it closed.
     pub hold: Option<SaidHold>,
-    /// THE READY PROXY (§6).
+    /// Whether the host counts the session as ready while build slots stand idle
+    /// ([`rules::ready`]); false with no hold open.
     pub ready: bool,
     /// The guards the last break judged (§2.1's set, [`rules::Guards`]).
     pub guards: Option<Guards>,
@@ -111,9 +112,8 @@ pub struct OccupancySaid {
     pub ready_idle: Option<SaidReadyIdle>,
 }
 
-/// The derived form's bytes, with `ready_idle` printed only where it says something: a word with
-/// none prints as slice 1's did, so a tape that compares a told word's `Debug` replays unchanged
-/// (the slice-2 plan's D7).
+/// The derived form, with `ready_idle` printed only when set: a told word without it prints as
+/// slice 1's builds printed it, so a tape that compares a told word's `Debug` replays unchanged.
 impl std::fmt::Debug for OccupancySaid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("OccupancySaid");
@@ -144,8 +144,7 @@ impl OccupancySaid {
     }
 
     /// The due line past K looks the tab's `ready-idle` Entry names: under `prompt` alone, with
-    /// a hold open (the loop's half of the plan's W4; the GUI re-checks its own copy of the
-    /// owner's mode).
+    /// a hold open (the GUI re-checks its own copy of the owner's mode).
     #[must_use]
     pub fn ready_idle_under_prompt(&self) -> Option<SaidReadyIdle> {
         if self.mode != Occupancy::Prompt || self.hold.is_none() {
@@ -154,7 +153,7 @@ impl OccupancySaid {
         self.ready_idle
     }
 
-    /// The first guard the last break judged holding a line.
+    /// The first guard the last break judged holding a `wait-nudge@v1` line.
     #[must_use]
     pub fn guard(&self) -> Option<Guard> {
         self.guards
@@ -187,10 +186,10 @@ impl OccupancySaid {
     }
 }
 
-/// THE RULES A TOLD WORD CARRIES ([`OccupancySaid::rules`]), in [`RuleId::ALL`]'s order: every
-/// rule, for a recording whose host had slice 2's doors (`slice2`, `Fx::slice2_recorded`), and of
-/// an older recording only the rules its build had ([`RuleId::slice1`]), so its told words replay
-/// byte for byte. Every rule is slice 1's so far: both lists are [`RuleId::ALL`].
+/// The rules a told word carries ([`OccupancySaid::rules`]), in [`RuleId::ALL`]'s order: every
+/// rule when the recording's host had slice 2's doors (`slice2`), else slice 1's alone
+/// ([`RuleId::slice1`]), so an older tape's told words replay byte for byte. Every rule is
+/// slice 1's so far.
 #[must_use]
 pub fn told_rules(slice2: bool) -> Vec<RuleId> {
     RuleId::ALL
@@ -231,7 +230,7 @@ fn mark(holds: bool) -> &'static str {
     if holds { "✓" } else { "✗" }
 }
 
-/// THE `occupancy why` FORM of `said` at `now_ms` (unix).
+/// The `occupancy why` form of `said` at `now_ms` (unix), its clocks `offset_s` east of UTC.
 #[must_use]
 pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String> {
     let mut lines = Vec::new();

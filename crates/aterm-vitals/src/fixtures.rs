@@ -11,8 +11,9 @@
 //! mockup names it ("Spotlight", not `mdworker_shared`). Outside aterm only the Mac's top
 //! programs are listed; inside it every process is, so all tabs' and each tab's counts are their
 //! rows: busy's all tabs counts 21, one more than the mockup's 20, whose tiles leave Tab 2's
-//! shell out. A program's age, the program groups and the kept pressure are not on main yet;
-//! they join as they land.
+//! shell out. A program's age and the program groups are not on main yet; they join as they
+//! land. The mockups draw no past pressure level, so Memory's kept pressure holds the scene's
+//! level now over its whole run and its last two minutes.
 
 use std::sync::Arc;
 
@@ -599,6 +600,12 @@ fn trend(level: f32, slow: f32, spread: (f32, f32)) -> TrendView {
     }
 }
 
+/// The level Memory's kept pressure holds in each second and cell: the scene's level now,
+/// hollow where it reads none.
+fn kept_pressure(n: &Numbers) -> Option<Pressure> {
+    n.pressure.rank().map(|_| n.pressure)
+}
+
 /// The last two minutes, a second each, from the run's last four points.
 fn history(run: &Run, scale: f32) -> Vec<Option<f32>> {
     let tail = &run[run.len() - 4..];
@@ -741,6 +748,7 @@ fn procs(n: &Numbers) -> Vec<ProcView> {
                 scope,
                 refused: false,
                 gpu: None,
+                birth_ms: None,
             });
         }
     }
@@ -964,6 +972,7 @@ fn built(n: &Numbers) -> Snapshot {
             (n.mem.spread.0 * 128.0, n.mem.spread.1 * 128.0),
         ),
         history: history(&n.mem.run, 128.0),
+        pressure_history: vec![kept_pressure(n); HISTORY_LEN],
         rates: Some(MemRates {
             swapin_bps: swap_bps / 3.0,
             swapout_bps: swap_bps * 2.0 / 3.0,
@@ -1088,6 +1097,7 @@ fn built(n: &Numbers) -> Snapshot {
         CapBasis::Fixed,
         None,
     );
+    resources[mem_row].pressure = vec![kept_pressure(n); resources[mem_row].ring.len()].into();
     resources[mem_row].state = match n.pressure {
         Pressure::Warn => Some(State::Warn),
         Pressure::Critical => Some(State::Critical),
@@ -1306,6 +1316,8 @@ fn built(n: &Numbers) -> Snapshot {
             cores: cores_of(p) as f32,
             n: p.cores.len(),
             scope: Some(p.owner.scope(scene)),
+            born_ms: None,
+            unborn: p.cores.len(),
         });
     let aterm_cpu = aterm_now(cpu_row) as f32;
     let others: f32 = procs
@@ -1553,6 +1565,13 @@ mod tests {
             .map(|r| pct(s, r));
             assert_eq!(got, want);
         }
+        for (s, level) in [(&busy, Pressure::Warn), (&calm, Pressure::Normal)] {
+            let mem = &s.resources[Resource::Memory.index()];
+            assert_eq!(mem.pressure.len(), mem.ring.len(), "kept cell for cell");
+            assert!(mem.pressure.iter().all(|&p| p == Some(level)));
+            let m = s.mem.as_ref().expect("memory");
+            assert_eq!(m.pressure_history, vec![Some(level); m.history.len()]);
+        }
         let filling = busy.facts.filling.expect("busy fills");
         assert_eq!((filling.secs / 60.0).round(), 34.0);
         assert!(calm.facts.filling.is_none());
@@ -1632,7 +1651,7 @@ mod tests {
         assert!(s.facts.hour_writers.is_empty() && s.facts.writes_covered_s == 0.0);
         assert!(s.free_history.len() < 6, "under an hour of free history");
         for v in &s.resources {
-            assert!(v.now.is_none() && v.ring.is_empty());
+            assert!(v.now.is_none() && v.ring.is_empty() && v.pressure.is_empty());
             assert!(
                 v.tabs
                     .iter()

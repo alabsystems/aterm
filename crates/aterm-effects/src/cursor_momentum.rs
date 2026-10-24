@@ -63,7 +63,8 @@ pub struct TypingRate {
 }
 
 impl TypingRate {
-    /// The value at `now`: decayed over the elapsed gap on `tau`, snapped to exactly 0 once negligible.
+    /// The value at `now`: decayed over the elapsed gap on `tau`, snapped to exactly 0 once
+    /// negligible.
     #[must_use]
     #[inline]
     pub fn value(&self, now: Instant, tau: f32) -> f32 {
@@ -100,9 +101,11 @@ impl TypingRate {
 /// Host-side inputs for one tick.
 #[derive(Clone, Copy, Debug)]
 pub struct MomentumGlowConfig {
-    /// The user's switch (default on) combined with the host's gates: serious mode, focus, live viewport.
+    /// The user's switch (default on) combined with the host's gates: serious mode, focus, live
+    /// viewport.
     pub enabled: bool,
-    /// `0..=1` — the aurora's folded intensity (the brightness dial × the motion amplitude × the load-shed envelope), as every body takes it.
+    /// `0..=1` — the aurora's folded intensity (the brightness dial × the motion amplitude × the
+    /// load-shed envelope), as every body takes it.
     pub intensity: f32,
     /// The cool-down τ in seconds ([`MOMENTUM_GLOW_TAU_S`] unless configured).
     pub tau_s: f32,
@@ -112,14 +115,15 @@ pub struct MomentumGlowConfig {
     pub base: u32,
     /// The page the light lands on is dark: additive halo.
     pub dark_theme: bool,
-    /// The hue a LIGHT page's glow wears, `0x00RRGGBB`.
+    /// The hue a light page's glow wears, `0x00RRGGBB`.
     pub hue: u32,
     /// The theme's text and paper, which a light ground's glow solves its ink against.
     pub theme_fg: u32,
     pub theme_bg: u32,
     /// Whether the cursor is a block (the body tint applies); bar/underline get the halo only.
     pub block: bool,
-    /// The caret row's letters as columns `first..end` (a blank between two glyphs counts, as it reads as part of the line), or `None` for a blank row.
+    /// The caret row's letters as columns `first..end` (a blank between two glyphs counts, as it
+    /// reads as part of the line), or `None` for a blank row.
     pub glyph_span: Option<(i32, i32)>,
 }
 
@@ -151,7 +155,8 @@ struct LightInkMemo {
     text_alpha: f32,
 }
 
-/// The engine: one integrator plus the fingerprint law that tells frame cadence from the cool-down's sparse steps.
+/// The engine: one integrator plus the fingerprint law that tells frame cadence from the
+/// cool-down's sparse steps.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MomentumGlow {
     rate: TypingRate,
@@ -184,9 +189,8 @@ impl MomentumGlow {
         light_vivid: false,
     };
 
-    /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper
-    /// gold, looks6 N7) rather than the walk toward white every other glow
-    /// keeps ([`light_glow_ink`]). Off by default.
+    /// Whether the light-page glow wears its hue's vivid ink (Sparkle's paper gold) rather than
+    /// the walk toward white every other glow keeps ([`light_glow_ink`]). Off by default.
     #[inline]
     pub const fn set_light_vivid(&mut self, vivid: bool) {
         self.light_vivid = vivid;
@@ -211,7 +215,8 @@ impl MomentumGlow {
         *self = Self::DEFAULT;
     }
 
-    /// Frame cadence: the light is hot and its last two frames differed (the rainbow body's fingerprint law).
+    /// Frame cadence: the light is hot and its last two frames differed (the rainbow body's
+    /// fingerprint law).
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
@@ -247,7 +252,8 @@ impl MomentumGlow {
         self.stamp
     }
 
-    /// The analytic instant the latched amplitude decays below [`MOMENTUM_GLOW_HOT`] (`stamp + τ·ln(a/floor)`).
+    /// The analytic instant the latched amplitude decays below [`MOMENTUM_GLOW_HOT`]
+    /// (`stamp + τ·ln(a/floor)`).
     #[must_use]
     #[inline]
     pub fn cold_at(&self) -> Option<Instant> {
@@ -296,7 +302,8 @@ impl MomentumGlow {
         self.stamp.map(|stamp| stamp + after)
     }
 
-    /// One frame.
+    /// One frame for the caret at `cur`: a dark page's halo into `out`, a light page's glow into
+    /// `under`.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -464,8 +471,8 @@ fn emit_halo(
 /// How much of a fire's ember a dark page's typing halo takes ([`warm_halo`]).
 pub const MOMENTUM_FIRE_WARMTH: f32 = 0.8;
 
-/// The ember a fire's dark typing halo is warmed toward ([`warm_halo`]): a deep
-/// orange-red (hue 20 degrees); the rod's amber read tan and khaki round the caret.
+/// The ember a fire's dark typing halo is warmed toward ([`warm_halo`]): a deep orange-red (hue
+/// 20 degrees), since the rod's amber reads tan and khaki round the caret.
 pub const MOMENTUM_FIRE_EMBER: u32 = 0x00E0_4A00;
 
 /// Warm a dark page's additive halo (`quads`) toward `hue` by `share`.
@@ -502,18 +509,13 @@ fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
     mix_rgb(tint, ramp((a + warm).min(1.0), true), 0.5)
 }
 
-/// The light glow's ink for `hue`: walked toward white until, laid opaque on
-/// the page, the theme's text keeps [`LIGHT_GLOW_INK_BAR`] over it
-/// (`cursor_glow::light_ink_over_floor`); or, `vivid` (Sparkle's paper gold,
-/// looks6 N7), its vivid ink lifted (in value where the hue's brightest ink
-/// allows, else toward white) to the same floor
-/// (`cursor_glow::light_ink_vivid_over_floor`): a gold glow stays gold
-/// rather than greying to khaki.
+/// The light glow's ink for `hue`: walked toward white until, laid opaque on the page, the
+/// theme's text keeps [`LIGHT_GLOW_INK_BAR`] over it; or, `vivid` (Sparkle's paper gold), its
+/// vivid ink lifted to the same floor, so a gold glow stays gold rather than greying to khaki.
 ///
-/// The lift in value is taken only as far as the glow, stacked at any of its
-/// opacities on any light body of the spectrum, still leaves the theme's
-/// text [`crate::cursor_glow::BODY_CONTRAST_BAR`]: past that the ink is
-/// mixed back toward the walk toward white, which always keeps it.
+/// The vivid ink is kept only while the glow, stacked at any of its opacities on any light body
+/// of the spectrum, still leaves the theme's text [`crate::cursor_glow::BODY_CONTRAST_BAR`]; past
+/// that it is mixed back toward the walked ink, which always keeps it.
 fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> u32 {
     use crate::cursor_glow::{
         BODY_CONTRAST_BAR, LIGHT_BODY_ALPHA_CAP, light_body_ink, light_floor_at,
@@ -577,10 +579,12 @@ fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> u32 {
     mix(lo)
 }
 
-/// The margin past the body bar [`light_glow_ink`]'s vivid lift keeps when stacked, for the renderer's rounding.
+/// The margin past the body bar [`light_glow_ink`]'s vivid lift keeps when stacked, for the
+/// renderer's rounding.
 const LIGHT_GLOW_STACK_GUARD: f32 = 0.02;
 
-/// The share of the theme's text contrast on its paper a light glow keeps where it lies under a letter of the caret's row ([`MomentumGlowConfig::glyph_span`]).
+/// The share of the theme's text contrast on its paper a light glow keeps where it lies under a
+/// letter of the caret's row ([`MomentumGlowConfig::glyph_span`]).
 pub const LIGHT_GLOW_TEXT_KEEP: f32 = 0.97;
 
 /// The opacity `0..=255` at which the light glow's `ink` leaves the theme's
@@ -652,7 +656,8 @@ const fn smoothstep(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Colour temperature with momentum: amber → gold → warm white → white-hot on a dark theme.
+/// Colour temperature with momentum: amber → gold → warm white, then white-hot on a dark theme or
+/// deep orange on a light one.
 #[inline]
 #[must_use]
 pub fn ramp(a: f32, dark_theme: bool) -> u32 {

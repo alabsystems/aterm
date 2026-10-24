@@ -13,6 +13,7 @@
 // Beside the body nothing changes: a frame with the body away from the letters is byte-equal
 // with and without the knock-out, and the body itself keeps every pixel no glyph touches.
 
+use crate::wcag::{contrast, luma as rel_luma};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, WindowCpu};
@@ -24,25 +25,6 @@ const LINE: &str = "the kitty flies";
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature")
-}
-
-fn lin(c: u32) -> f64 {
-    let s = f64::from(c) / 255.0;
-    if s <= 0.040_45 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn rel_luma(p: u32) -> f64 {
-    0.2126 * lin((p >> 16) & 0xff) + 0.7152 * lin((p >> 8) & 0xff) + 0.0722 * lin(p & 0xff)
-}
-
-fn contrast(a: u32, b: u32) -> f64 {
-    let (la, lb) = (rel_luma(a), rel_luma(b));
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
 }
 
 /// A body's box: `(x, y, w, h)` in grid pixels.

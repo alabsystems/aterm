@@ -7,7 +7,8 @@
 //! read-only boot share. It listens on vsock port [`COMMAND_PORT`] for the host's
 //! commands (CID 2 only), one connection each, and runs each `Exec` as the lane user
 //! with exactly the host's environment, reporting exactly one of `Exited`, `Signaled` or
-//! `NotStarted`. At start it dials the host's [`WATCH_PORT`] and says `Hello` (its own
+//! `NotStarted`. At start it reads the boot's key from the key disk only root reads
+//! ([`key`]), dials the host's [`WATCH_PORT`] and says `Hello` (the key and its own
 //! SHA-256), `Booting` while systemd boots, `Ready` once the boot is over and the lane
 //! user's manager answers, then a `Beat` every [`watch::TICK`].
 //!
@@ -21,6 +22,7 @@
 pub mod boot;
 #[cfg(any(test, debug_assertions))]
 pub mod fake;
+pub mod key;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod mounts;
@@ -68,15 +70,16 @@ pub fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
     }
 }
 
-/// The agent's `Hello`: the protocol, the SHA-256 of its executable at `exe`
-/// (`/proc/self/exe` in the guest), and the guest's boot.
+/// The agent's `Hello`: the protocol, the boot's `key`, the SHA-256 of its executable at
+/// `exe` (`/proc/self/exe` in the guest), and the guest's boot.
 ///
 /// # Errors
 /// The executable could not be read.
-pub fn hello(system: &dyn system::System, exe: &Path) -> io::Result<wire::Hello> {
+pub fn hello(system: &dyn system::System, exe: &Path, key: key::Key) -> io::Result<wire::Hello> {
     let facts = system.facts();
     Ok(wire::Hello {
         proto: wire::PROTO,
+        key,
         agent_sha256: sha256_of(exe)?,
         boot_id: facts.boot_id,
         kernel: facts.kernel,
@@ -117,8 +120,8 @@ pub fn serve_with_watch<L: serve::Listener, W: serve::Stream>(
 
 /// The usage line of this host's bin.
 #[cfg(not(target_os = "linux"))]
-const USAGE: &str = "aterm-vz-agent --listen <unix socket> --watch <unix socket> [--tick-ms N] \
-                     (the macOS test seam; the agent itself runs in the Linux guest)";
+const USAGE: &str = "aterm-vz-agent --listen <unix socket> --watch <unix socket> --key <key disk> \
+                     [--tick-ms N] (the macOS test seam; the agent itself runs in the Linux guest)";
 
 // STOCK EXCEPTION: the guest's agent is cross-built for aarch64-unknown-linux-musl on
 // rustup's stable (`lab linux vz-agent`), because Trust ships no Linux std; its Linux
@@ -138,13 +141,14 @@ pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
-    let (mut listen, mut watch, mut tick) = (None, None, watch::TICK);
+    let (mut listen, mut watch, mut key, mut tick) = (None, None, None, watch::TICK);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = it.next();
         match (flag.to_str(), value) {
             (Some("--listen"), Some(v)) => listen = Some(std::path::PathBuf::from(v)),
             (Some("--watch"), Some(v)) => watch = Some(std::path::PathBuf::from(v)),
+            (Some("--key"), Some(v)) => key = Some(std::path::PathBuf::from(v)),
             (Some("--tick-ms"), Some(v)) => match v.to_str().and_then(|v| v.parse().ok()) {
                 Some(ms) => tick = Duration::from_millis(ms),
                 None => {
@@ -158,8 +162,8 @@ pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
             }
         }
     }
-    match (listen, watch) {
-        (Some(listen), Some(watch)) => seam::run(&listen, &watch, tick),
+    match (listen, watch, key) {
+        (Some(listen), Some(watch), Some(key)) => seam::run(&listen, &watch, &key, tick),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)

@@ -24,7 +24,7 @@ fn clip_to(s: &str, cells: usize) -> String {
 }
 
 fn trust_path(rows: &[String]) -> Option<&str> {
-    let title = aterm_phase::anchor("trust.title");
+    let title = aterm_phase::anchor!("trust.title");
     let at = rows.iter().position(|r| r.trim() == title)?;
     rows[at + 1..]
         .iter()
@@ -83,7 +83,7 @@ fn kind_and_subject(reader: &dyn ScreenReader, point: &Turn) -> (String, String)
     if let Some(path) = trust_path(rows)
         && rows
             .iter()
-            .any(|r| r.contains(aterm_phase::anchor("trust.yes")))
+            .any(|r| r.contains(aterm_phase::anchor!("trust.yes")))
     {
         return ("trust".to_string(), path.to_string());
     }
@@ -589,7 +589,8 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// Escalate via `meta set attention <text>` on the worker (bounded to the server cap) and append `ESCALATED seq=<n> attention=<reply>`.
+    /// Escalate via `meta set attention <text>` on the worker (bounded to the server cap) and
+    /// journal `ESCALATED seq=<n> attention=<reply>`.
     pub(super) fn escalate(
         &mut self,
         seq: u64,
@@ -624,7 +625,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// A box the loop did not answer, or a point the turn-end policy escalates (`reason`: why — a question the owner's policy may not answer among them), escalated ONCE PER REVIEW POINT.
+    /// Escalate a box the loop did not answer, or a point the turn-end policy hands over, once
+    /// per review point (`reason`: why, such as a question the owner's policy may not answer).
     pub(super) fn escalate_point(
         &mut self,
         point: &Turn,
@@ -662,7 +664,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when `ours` says its text is the kind being closed.
+    /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when
+    /// `ours` says its text is the kind being closed.
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
         Ok(match self.attention_text() {
             Some(text) if ours(text) => return self.clear_attention_entry(),
@@ -687,7 +690,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The episode is over: the `limited:` attention cleared if it is still ours (another writer's badge stays) and journaled as `CLEARED seq=<n> attention=<said> <why>`, `seq` the read it closed on.
+    /// The episode is over: clear the `limited:` attention if still ours (another writer's badge
+    /// stays) and journal `CLEARED seq=<n> attention=<said> <why>`.
     pub(super) fn close_episode(
         &mut self,
         seq: u64,
@@ -736,7 +740,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The worker answered on a point that is not the limit's notice (a look's point, or a read of an Off park), with no episode open.
+    /// The worker answered on a point that is not the limit's notice (a look's point, or a read
+    /// of an Off park), with no episode open.
     pub(super) fn adopted_limit_over(
         &mut self,
         seq: u64,
@@ -750,20 +755,21 @@ impl<C: Ctl> Session<'_, C> {
     }
 }
 
-/// THE KEY [`Session::needs_told`] HOLDS FOR A NEEDS ENTRY A LOOP BEFORE THIS ONE LEFT.
+/// The key [`Session::needs_told`] holds for a needs entry a loop before this one left.
 pub(super) const NEEDS_LEFT: u64 = 0;
 
 /// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken down.
 pub(super) const NEEDS_LEFT_DOWN: &str = "no need stands at the loop's start";
 
-/// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per entry, comma-joined, oldest first; an owner may hold a `:`) names an entry of `owner`.
+/// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per entry, comma-joined,
+/// oldest first; an owner may hold a `:`) names an entry of `owner`.
 pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
     kinds
         .split(',')
         .any(|entry| entry.split_once(':').is_some_and(|(_, o)| o == owner))
 }
 
-/// THE NEEDS ENTRY'S TEXT ([`Session::sync_needs`]).
+/// The needs entry's text: the first need and a count of the rest, within [`ATTENTION_BYTES`].
 pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
     let first = needs.first().map_or("", String::as_str);
     let more = match needs.len() {
@@ -778,7 +784,8 @@ pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE WORKER'S NEEDS YOU, ON THE PERSON'S SCREEN (Autopilot Cruise / Autopilot Land: loud, never blocking).
+    /// Bring the needs entry in line with the worker's standing needs: raise it (loud, never
+    /// blocking; not under Off), or take it down when none stands or another supervisor holds it.
     pub(super) fn sync_needs(
         &mut self,
         screen: &Screen,
@@ -850,7 +857,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// THE NEEDS ENTRY TAKEN DOWN, `why`: none stands now, an Off park, the loop's end.
+    /// Take the needs entry down for `why` (none stands now, an Off park, the loop's end).
     pub(super) fn needs_down(
         &mut self,
         seq: u64,
@@ -899,7 +906,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// THE WINDOW TOLD THE NEEDS SET ([`IdleHost::needs_standing`], [`Session::needs_heard`]).
+    /// Tell the window's host `key`'s needs set with `entry` ([`IdleHost::needs_standing`]),
+    /// unless it heard that last.
     fn tell_needs(&mut self, key: u64, needs: &[String], entry: &str) {
         if self.handing_over() {
             return;
@@ -921,7 +929,7 @@ impl<C: Ctl> Session<'_, C> {
             .is_some_and(|(k, told)| *k == key && told == entry)
     }
 
-    /// THE WINDOW TOLD AGAIN WHAT STANDS ([`Self::sync_needs`], [`Session::needs_told`]).
+    /// Tell the window's host again what stands, unless it heard that last.
     fn retell_standing(&mut self, key: u64) {
         if self.stall_host.is_none() || self.needs_heard_as(key, &self.needs_told_text) {
             return;
@@ -1082,7 +1090,7 @@ mod tests {
             .expect("row");
         rows[at] = format!("   echo {}", "x".repeat(200));
         let point = turn(Phase::Prompt, rows);
-        let banner = format!("{} (140.4GB)", aterm_phase::anchor_text("wall.memory"));
+        let banner = format!("{} (140.4GB)", aterm_phase::anchor!("wall.memory"));
         let flagged =
             format!("claude --dangerously-skip-permissions --model claude-opus-4-1 --resume {ID}");
         let reason = |line: &str| {

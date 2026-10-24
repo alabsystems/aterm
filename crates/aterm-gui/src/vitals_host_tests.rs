@@ -297,11 +297,8 @@ fn two_readings_give_this_process_a_scope_and_the_machine_its_cores() {
     }
 }
 
-/// A FULL READING ATTRIBUTES THE SLOTS' HOLDERS TO TABS, A HIDDEN ONE DOES
-/// NOT ([`Reader::read`], [`crate::occupancy_host::slot_tabs`]): over a slot
-/// directory of one free slot, the full reading's sweep finds no holder in
-/// any tab (`Some` of none), while the hidden reading, which sweeps no
-/// process, attributes nothing (`None`).
+/// Over one free slot, a full reading's sweep finds no holder in any tab (`Some` of none); a
+/// hidden reading, which sweeps no process, attributes nothing (`None`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_full_reading_attributes_the_slot_holders_and_a_hidden_one_does_not() {
@@ -709,10 +706,9 @@ fn each_account_once_keeps_the_newest_and_the_front() {
     );
 }
 
-/// THE PROBE THREAD CARRIES THE FOOTERS' WEEKS INTO THE MODEL ([`Reader::read`],
-/// [`Reader::read_machine`]): a request's week rows reach it on the day the reader's zone probe
-/// gives, each figure's and the reading's own, full or hidden, and the reading's facts carry the
-/// front account's run.
+/// A request's week rows reach the model ([`Reader::read`], [`Reader::read_machine`]) on the day
+/// the reader's zone probe gives, for each figure and the reading itself, full or hidden, and the
+/// reading's facts carry the front account's run.
 #[test]
 fn a_reading_carries_the_front_accounts_plan_week() {
     const AHEAD: i64 = 3 * 86_400;
@@ -1575,10 +1571,8 @@ fn delegated_work_pulls_once_before_any_snapshot_and_uses_the_earlier_deadline()
     assert_eq!(app.vitals_deadline(), None);
 }
 
-/// A VIEW IS AS OLD AS THE READING THAT MADE IT: the board counts a new view's age from when the
-/// probe began the oldest reading handed over since the loop last adopted one that carries it (a
-/// later reading may carry the same view), not from the adoption, so the facts gate sees the
-/// probe's read and the wait for the loop.
+/// A new view's age counts from when the probe began the oldest reading handed over since the
+/// last adoption that carries it, not from the adoption, so the facts gate sees the probe's read.
 #[test]
 fn a_views_age_counts_from_the_probes_read_not_its_adoption() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1613,9 +1607,8 @@ fn a_views_age_counts_from_the_probes_read_not_its_adoption() {
     assert_eq!((age, calls.len()), (Duration::from_secs(3), 1));
 }
 
-/// AN EARLIER READING OF AN OLDER VIEW DOES NOT AGE A NEW ONE: readings the loop never adopted
-/// (a `sys` pull's wakes no one) pile up while it sleeps, and the board counts a new view's age
-/// from the reading that made it, not from the first one handed over since the last adoption.
+/// Readings the loop never adopted pile up while it sleeps; a new view's age counts from the
+/// reading that made it, not from the first one handed over since the last adoption.
 #[test]
 fn an_earlier_reading_of_an_older_view_does_not_age_a_new_one() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1649,10 +1642,8 @@ fn an_earlier_reading_of_an_older_view_does_not_age_a_new_one() {
     assert_eq!((age, calls.len()), (Duration::from_secs(1), 1));
 }
 
-/// A WINDOWLESS ASK A FULL QUEUE DROPS IS ASKED AGAIN AT THE FLOOR: with no window showing the
-/// bars and a hung call standing, the reading `jobs_due` asks finds the thread's queue full (a
-/// `sys` pull's reading and an ask behind it, neither of which wakes the loop); it is due again
-/// `JOBS_FLOOR` on, not at the next edge or disk look, and once the thread is gone nothing is.
+/// With no window and a hung call standing, an ask the thread's full queue drops is due again
+/// `JOBS_FLOOR` on, not at the next edge or disk look; once the thread is gone, nothing is.
 #[test]
 fn a_dropped_windowless_ask_is_asked_again_at_the_floor() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1675,10 +1666,9 @@ fn a_dropped_windowless_ask_is_asked_again_at_the_floor() {
     assert_eq!(app.vitals.jobs_due, None, "no thread: nothing to ask");
 }
 
-/// A DROPPED ASK OUTLIVES A READING THAT DID NOT LOOK: the disk look's ask over a parked view (no
-/// cadence of its own) finds the queue full; the in-flight pull's whole reading, adopted before
-/// the retry, ran no engine pass (it carries the held view), so the ask is still due at the floor;
-/// a view a reading begun since made is the look, and nothing more is due.
+/// A dropped ask stays due at the floor across an in-flight pull's whole reading that ran no
+/// engine pass (it carries the held view); a view made by a reading begun since is the look, and
+/// then nothing is due.
 #[test]
 fn a_dropped_ask_outlives_a_whole_reading_that_did_not_look() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -1859,9 +1849,8 @@ fn with_no_window_the_disk_look_reads_once_and_the_board_names_the_hung_call() {
     assert_eq!(asked(&rx), 0, "nothing more within the tick");
 }
 
-/// WITH A WINDOW SHOWING THE BARS NOTHING CHANGES: the bars' cadence
-/// reads at once and then a period on; the disk watch's look asks
-/// nothing, and a jobs view whose engine is fast moves no deadline.
+/// With a window showing the bars, their cadence reads at once and then a period on; the disk
+/// watch's look asks nothing, and a jobs view whose engine is fast moves no deadline.
 #[cfg(unix)]
 #[test]
 fn with_a_window_showing_the_bars_the_look_and_the_engine_move_nothing() {
@@ -1909,10 +1898,8 @@ fn with_a_window_showing_the_bars_the_look_and_the_engine_move_nothing() {
     assert_eq!(asked(&rx), 1, "shown again: read at once");
 }
 
-/// A HIDDEN DECK AND THE ENGINE TOGETHER: a deck every window of which is
-/// occluded reads the machine counters every ten seconds (v2 §5.3), and with
-/// no window in view the disk watch's look asks one WHOLE reading for the
-/// jobs engine (the hung-call design's D1).
+/// A deck whose every window is occluded reads the machine counters every ten seconds, and with no
+/// window in view the disk watch's look asks one whole reading for the jobs engine.
 #[cfg(unix)]
 #[test]
 fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
@@ -2086,7 +2073,7 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
 }
 
-/// `status`'s `program_check=` with no program held: `0` on macOS, `-` where nothing is held at a check.
+/// `status`'s `program_check=` with no program held: `0` on macOS, `-` elsewhere.
 const NONE_HELD: &str = if cfg!(target_os = "macos") {
     "program_check=0"
 } else {
@@ -2163,7 +2150,8 @@ fn feed(app: &crate::App, bytes: &[u8]) {
     feed_tab(app, 0, bytes);
 }
 
-/// Feeds `bytes` to tab `tab`'s engine as its PTY reader does, counting the move and feeding the jobs feed.
+/// Feeds `bytes` to tab `tab`'s engine as its PTY reader does, counting the move and feeding the
+/// jobs feed.
 fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
     let s = app.pool.get(tab).expect("the tab");
     s.ctx.job_feed.read(bytes);
@@ -2676,8 +2664,8 @@ fn job_at_rest_leader() {
     drop(job);
 }
 
-/// THE PROBE THREAD'S PART, ON THIS MACHINE: drive `app`, no window in
-/// view, through 20 s of its clock in the loop's 100 ms turns.
+/// The probe thread's part on this machine: drive `app`, no window in view, through 20 s of its
+/// clock in the loop's 100 ms turns.
 #[cfg(target_os = "macos")]
 fn readings_at_rest(app: &mut crate::App, rx: &Receiver<Msg>, words: bool) -> Vec<u64> {
     readings_at_rest_with(app, rx, words, &mut crate::vitals_jobs::JobsPass::new())
@@ -2748,7 +2736,8 @@ fn engine_reads(
     );
 }
 
-/// The probe thread's zero that puts now at `at_ms` on its clock, which the request's feeds are read against.
+/// The probe thread's zero that puts now at `at_ms` on its clock, which the request's feeds are
+/// read against.
 #[cfg(target_os = "macos")]
 fn epoch_of(at_ms: u64) -> Instant {
     let now = Instant::now();
@@ -2772,14 +2761,8 @@ fn held_wait(app: &crate::App) -> (Option<aterm_vitals::jobs::WaitName>, Demand)
     (wait, view.demand)
 }
 
-/// A PROGRAM WAITING FOR THE PERSON AT ITS PROMPT ARMS NOTHING WITH NO
-/// WINDOW (design §6.1, "What arms nothing"; Autopilot Land's END, which saw 9
-/// to 10 timer wakes in its 20 s at rest on main, each a `system_vitals`
-/// fire, for Claude Code 2.1.306 and 2.1.307 and Gemini CLI): a raw program
-/// at rest on a real terminal, read through the probe thread's own step by
-/// the real engine on this machine's process table, is named `tty-raw` from
-/// the terminal word the loop hands it, and after the edge's reading nothing
-/// more is read in the 20 s.
+/// With no window, a raw program at its prompt is named `tty-raw` from the loop's terminal word,
+/// read once at the edge and not again in the 20 s (design §6.1, "What arms nothing").
 #[cfg(target_os = "macos")]
 #[test]
 fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
@@ -2805,11 +2788,8 @@ fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
     );
 }
 
-/// A PARKED SCREEN'S REDRAW IS READ AT MOST ONCE A FLOOR, AND NEVER ON A
-/// DEADLINE, WHILE THE TERMINAL SAYS IT STILL WAITS (design §6.1, "What
-/// brings job demand back"): a raw program at the person's read on a real
-/// terminal, parked by the real engine from the word its reading carried,
-/// redraws each second (a clock ticking) with no window.
+/// With no window, a parked raw program that redraws each second is read at most once a floor,
+/// never on a deadline, while the terminal says it still waits (design §6.1).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
@@ -2972,13 +2952,9 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
     assert!(read_req(&rx, "its redraw is an edge").jobs_now);
 }
 
-/// THE THREAD HANDS BACK THE WORDS IT READ WITH, AND THE LOOP PARKS FROM
-/// THEM: the real probe thread ([`run`], started as the product starts it)
-/// reads a raw program at the person's read on a real terminal through the
-/// engine's own step over this machine's process table, and hands its view
-/// back beside the words of the request it read; the loop names the park
-/// from them: the job's group, the word's raw mode and the driven input
-/// before it.
+/// The real probe thread ([`run`]) reads a raw program at the person's read and hands its view
+/// back with the request's words; the loop names the park from them (the job's group, the word's
+/// raw mode and the input driven before it).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
@@ -3062,9 +3038,8 @@ fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
     );
 }
 
-/// A PARK HOLDS ONLY WHILE THE TERMINAL SAYS THE PROGRAM STILL WAITS
-/// ([`Parked::holds`]): the same group in front, the same `ICANON` and
-/// `ECHO`, and no input driven since the word.
+/// [`Parked::holds`] only while the same group is in front, `ICANON` and `ECHO` are unchanged,
+/// and no input was driven since the word.
 #[cfg(unix)]
 #[test]
 fn a_park_holds_only_while_the_terminal_says_the_program_still_waits() {
@@ -3167,10 +3142,8 @@ fn a_canonical_job_at_rest_is_still_read_at_the_engines_cadence() {
     );
 }
 
-/// THE WORD'S FRESHNESS (§6.6): read through the sink, it is stamped newer
-/// than every output until the session's next output, then stamped 0 (its
-/// mode still holds, but it names no wait), and a key unread yields no
-/// word.
+/// Read through the sink, the word is stamped newer than every output until the session's next
+/// output, then stamped 0 (mode kept, no wait named); a key unread yields no word (§6.6).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
@@ -3261,9 +3234,8 @@ fn read_wait(req: &Request) -> (Option<aterm_vitals::jobs::WaitName>, Demand) {
     (wait, view.demand)
 }
 
-/// THE PROBE THREAD'S WHOLE READING NAMES A RAW PROGRAM FROM THE LOOP'S
-/// WORD: one [`Reader::read`] of the request the loop builds for a raw
-/// program at rest names it `tty-raw` and parks the engine.
+/// One [`Reader::read`] of the request the loop builds for a raw program at rest names it
+/// `tty-raw` and parks the engine.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
@@ -3286,10 +3258,8 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
 #[cfg(target_os = "macos")]
 const PING_LINE: &[u8] = b"64 bytes from 127.0.0.1: icmp_seq=1\r\n";
 
-/// THE PASS READS EACH TAB'S FEED ON THE PROBE THREAD'S CLOCK (system-awareness §6.6, P2a): a
-/// line the tab printed between two passes is its foreground job's progress: the job runs for 5 s
-/// after it, then is quiet only since it. Before the feed reached the engine a `ping` printing
-/// every 5 s read quiet from the pass that found it.
+/// A line the tab printed between two passes is its foreground job's progress on the probe
+/// thread's clock (§6.6): the job runs for 5 s after it, then is quiet only since it.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
@@ -3332,9 +3302,9 @@ fn a_line_the_tab_printed_between_passes_is_its_jobs_progress() {
     assert_eq!(quiet(12_000), Some(7_000), "quiet since the line");
 }
 
-/// A PASS THAT FINDS KEYS DRIVEN INTO A TAB STAMPS ITS FEED (system-awareness §6.6): the keys
-/// reach the engine as `JobTab::typed_ms`, the clock of the pass that found them, which a session
-/// nested in the tab's waits on before its terminal's word is the person's.
+/// Keys driven into a tab reach the engine as `JobTab::typed_ms`, stamped with the clock of the
+/// pass that found them, which a session nested in the tab waits on before its terminal's word is
+/// the person's (§6.6).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_pass_that_finds_keys_driven_into_a_tab_stamps_its_feed() {
@@ -3375,11 +3345,9 @@ const MID_SWEEP: CoalProbe = CoalProbe {
     ..CoalProbe::KERNEL
 };
 
-/// A READING TAKES ITS TABS BEFORE ITS SWEEP (system-awareness §6.6): what a tab's reader reads
-/// while the sweep runs is the next reading's. So a `D` and the exit of the command it closes,
-/// read during a sweep that still saw the command, never meet in one pass as a closed block over
-/// a live member (a false orphan), and a line printed then counts at the next reading, never at
-/// none.
+/// What a tab's reader reads while the sweep runs is the next reading's (§6.6), so a `D` and its
+/// command's exit read mid-sweep never meet as a closed block over a live member, and a line
+/// printed then counts at the next reading.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_reading_takes_its_tabs_before_its_sweep() {
@@ -3419,12 +3387,9 @@ fn a_reading_takes_its_tabs_before_its_sweep() {
     assert_eq!(quiet(), Some(false), "the next reading's progress");
 }
 
-/// A WRITE THAT MOVES NO CELL LEAVES THE WORD STANDING (`docs/measured/vitals-3-2026-10-22.md`,
-/// V1): Muse Code at rest writes a colour reset every ~9 s a tab, and the output stamp moves with
-/// it. A word voided by it would name the raw program's wait `unnamed` and ask the next reading in
-/// 2 s (`Demand::Fast`), keeping `system_vitals` armed at rest; the word follows the reader's
-/// moving feeds instead, so three resets leave it standing and a write that draws leaves it no
-/// wait to name.
+/// A write that moves no cell (Muse Code's colour reset every ~9 s at rest,
+/// `docs/measured/vitals-3-2026-10-22.md`) leaves the word standing, so no 2 s `Demand::Fast`
+/// reading arms; a write that draws leaves the word no wait to name.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_write_that_moves_no_cell_leaves_the_word_standing() {
@@ -3456,11 +3421,8 @@ fn a_write_that_moves_no_cell_leaves_the_word_standing() {
     );
 }
 
-/// A KEY DRIVEN AFTER THE WORD WAS READ VOIDS IT (§11.5: the tty names need
-/// an empty queue): a key typed into the session's own sink, which the raw
-/// program leaves unread and answers with nothing, and a worker's pull,
-/// which reads with the request the thread last held, names the wait
-/// unnamed, never `tty-raw` over that key.
+/// A key typed into the session's sink after the word was read voids the word for a worker's
+/// pull: the wait reads unnamed, never `tty-raw` (§11.5: the tty names need an empty queue).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
@@ -3483,9 +3445,8 @@ fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
     assert_eq!(read_wait(&held), (Some(WaitName::Unnamed), Demand::Fast));
 }
 
-/// THE WORD TAKES ITS STAMPS BEFORE IT READS THE TERMINAL (§6.6): output
-/// that lands between them and the `tcgetattr` leaves the word its mode but
-/// stamps it before all output, so it names no wait.
+/// Output landing between the word's stamps and its `tcgetattr` leaves the word its mode but
+/// stamps it before all output, so it names no wait (§6.6).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
@@ -3711,12 +3672,9 @@ fn the_test_reader_never_reads_the_thermal_state() {
     }
 }
 
-/// A HELD PROGRAM KEEPS THE READING WITH NO WINDOW GOING (leftover §5.1):
-/// a view with no job (the engine idle) but one program of this user held at
-/// macOS's program check is read again after 30 s, and so is one whose
-/// backed-up episode still owes its closing reading; a live job's own faster
-/// cadence stands beside it, and with neither nothing is due before the disk
-/// watch's next look.
+/// With no window, an idle view holding a program at macOS's program check, or a backed-up
+/// episode still owing its closing reading, is read again after 30 s; a live job's faster cadence
+/// stands beside it, and with neither nothing is due before the disk watch's next look.
 #[test]
 fn a_held_finding_keeps_the_windowless_reading_going() {
     use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
@@ -3764,10 +3722,9 @@ fn a_held_finding_keeps_the_windowless_reading_going() {
     );
 }
 
-/// THE EPISODE EDGE IS READ AGAINST THE VIEW BEFORE (leftover §5.1): an episode standing where
-/// none stood, or another one, opens; the view that names the drained episode, or one that stands
-/// in none after one that stood (the drained view itself skipped), drains; the same view adopted
-/// again, an episode still standing, and nothing either side make no edge.
+/// An episode standing where none or another stood opens; the view naming the drained episode, or
+/// one standing in none after one that stood (the drained view itself skipped), drains; the same
+/// view again, an episode still standing, or nothing either side makes no edge.
 #[test]
 fn an_episode_edge_is_read_against_the_view_before() {
     use crate::message_reporters::HeldEdge;
@@ -3807,12 +3764,9 @@ fn an_episode_edge_is_read_against_the_view_before() {
     }
 }
 
-/// A PROGRAM FIRST NAMED AS NOT STARTED FOR ANOTHER REASON IS RECORDED ONCE (leftover §5.1,
-/// §6.5): over the engine's own views, its first reading of a translating row is one
-/// `program-check.not-started` record saying "translating (Rosetta)", the same row in the next
-/// view none, and a row on a volume not proven local, new in a later view, one more saying it
-/// has not started; each record gives no age (the view that first names a row has just first
-/// seen it), no Entry and no Now.
+/// A translating row's first reading is one `program-check.not-started` record ("translating
+/// (Rosetta)") and the next view's none; a row on a volume not proven local, new later, is one
+/// more. No record gives an age, an Entry or a Now (leftover-processes design §6.5).
 #[test]
 fn a_program_first_named_as_not_started_is_recorded_once() {
     use crate::message_reporters as mr;
@@ -3886,10 +3840,8 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
     );
 }
 
-/// A HELD EPISODE IS A RECORD AT EACH EDGE AND RAISES NOTHING (leftover §5.1, §6.5): one
-/// `program-check.` record marks each edge, the opening saying when aterm started none of the
-/// held programs; nothing is filed in the digest, whatever the Developer Tools reading says (the
-/// list is System State's access step, never a digest line).
+/// A held episode is one `program-check.` record at each edge (the opening says when aterm started
+/// none of the held programs) and files nothing in the digest, whatever Developer Tools reads.
 #[test]
 fn a_held_episode_is_recorded_at_its_edges_and_raises_nothing() {
     use crate::devtools_helper::test_arms;
@@ -3983,9 +3935,9 @@ fn a_held_episode_is_recorded_at_its_edges_and_raises_nothing() {
     }
 }
 
-/// THE VERDICT REFRESH WAITS OUT A BACKED-UP EPISODE (leftover §5.1, §13): its prime is a new
-/// program and would wait in the same line, so a switch-on read while the adopted view stands in
-/// an episode starts none, and the next view that stands in none starts it, once.
+/// A verdict refresh's prime is a new program and would wait in the same line, so a switch-on read
+/// while the adopted view stands in a backed-up episode starts none; the next view that stands in
+/// none starts it, once (leftover-processes design §13).
 #[test]
 fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     use crate::devtools_helper::test_arms;
@@ -4038,4 +3990,67 @@ fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     );
     adopt(&mut app, 4, Findings::default());
     assert_eq!(app.devtools_helper.refreshes_started(), 1, "once");
+}
+
+/// With no deck scene the loop adopts the very reading the thread handed over.
+#[test]
+fn the_scene_seam_is_inert_unset() {
+    let slot = Arc::new(Mutex::new(Handover::default()));
+    let mut v = VitalsHost {
+        latest: Arc::clone(&slot),
+        deck_scene: None,
+        ..VitalsHost::default()
+    };
+    let live = Arc::new(Snapshot {
+        seq: 4,
+        at_unix_ms: 1_800_000_000_000,
+        ..Snapshot::default()
+    });
+    let _ = hand_over(&slot, &live, Vec::new(), Instant::now());
+    assert!(v.adopt(Instant::now()));
+    assert!(
+        v.snapshot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &live)),
+        "the reading as read"
+    );
+}
+
+/// A deck scene's readings are the scene's facts under each reading's sequence number: two
+/// readings adopt with increasing `seq` and the same facts, the scene's clock among them.
+#[test]
+fn the_deck_scene_ticks() {
+    use aterm_vitals::fixtures::{self, DeckScene};
+    let facts = |s: &Snapshot| Snapshot {
+        seq: 0,
+        ..s.clone()
+    };
+    for scene in DeckScene::ALL {
+        let slot = Arc::new(Mutex::new(Handover::default()));
+        let mut v = VitalsHost {
+            latest: Arc::clone(&slot),
+            deck_scene: Some(scene),
+            ..VitalsHost::default()
+        };
+        let mut held = Vec::new();
+        for seq in [7, 8] {
+            let live = Arc::new(Snapshot {
+                seq,
+                at_unix_ms: 1_800_000_000_000 + i64::try_from(seq).unwrap_or(0) * 1000,
+                self_pid: 42,
+                ..Snapshot::default()
+            });
+            let _ = hand_over(&slot, &live, Vec::new(), Instant::now());
+            assert!(v.adopt(Instant::now()), "{scene:?}: reading {seq} is new");
+            held.push(v.snapshot.clone().expect("adopted"));
+        }
+        assert_eq!(held.iter().map(|s| s.seq).collect::<Vec<_>>(), [7, 8]);
+        let want = facts(&fixtures::snapshot(scene));
+        for s in &held {
+            assert_eq!(facts(s), want, "{scene:?}: the scene's facts");
+        }
+        assert_eq!(
+            held[1].at_unix_ms,
+            fixtures::AT,
+            "{scene:?}: the scene's clock"
+        );
+    }
 }

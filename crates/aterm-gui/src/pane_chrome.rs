@@ -480,7 +480,8 @@ pub(crate) struct PaneOverlay {
     painted: Vec<GlowQuad>,
     /// The scrollbars the next splice draws, each under its fx layer id.
     bars: Vec<(u64, RoundedBar)>,
-    /// One fx layer a bar of `bars`, in their order: a bar that kept its look keeps its layer, so a settled bar is no damage.
+    /// One fx layer per bar of `bars`, in their order: a bar that kept its look keeps its
+    /// layer, so a settled bar is no damage.
     bar_layers: Vec<(u64, RoundedBar, FxLayer)>,
     /// The last build's `bar_layers`, which the next build takes its kept
     /// layers from (kept across builds for its capacity).
@@ -537,10 +538,9 @@ impl PaneOverlay {
         &self.facts
     }
 
-    /// What this frame's overlays draw, as the quads the retired path drew:
-    /// the ring and hollow cursors as they are, and each bar as
-    /// [`scrollbar::legacy_bar_quads`] (its fx layer lands those quads'
-    /// bytes: `the_scrollbar_layers_are_the_retired_quads_byte_for_byte_on_the_cpu`).
+    /// What this frame's overlays draw, as quads: the ring and hollow cursors as they
+    /// are, and each bar as [`scrollbar::legacy_bar_quads`], which its fx layer matches
+    /// byte for byte.
     #[cfg(test)]
     pub(crate) fn pending_quads(&self) -> Vec<GlowQuad> {
         let cell_h = self
@@ -737,8 +737,8 @@ impl PaneOverlay {
         self.fp
     }
 
-    /// One fx layer a bar of `bars`: the layer of a bar that kept its id and
-    /// look is the one it had, the rest are built afresh.
+    /// Lays one fx layer per bar of `bars`: a bar that kept its id and look keeps the
+    /// layer it had, the rest are built afresh.
     fn lay_bars(&mut self) {
         std::mem::swap(&mut self.bar_layers, &mut self.bar_spare);
         let kept = &mut self.bar_spare;
@@ -861,9 +861,8 @@ impl App {
             .nova_add
             .extend_from_slice(&overlay.pending);
         overlay.painted.clone_from(&overlay.pending);
-        // The bars draw first among the Over-slot Exact layers, as their quads
-        // drew in the nova pass before that slot: under every other producer's
-        // Over layer and the card's, which splices after.
+        // The bars draw first among the Over-slot Exact layers: under every
+        // other producer's Over layer and the card's, which splices after.
         let fx = &mut ws.input_scratch.fx_layers;
         fx.retain(|l| !overlay.painted_bars.contains(&l.id));
         let at = fx

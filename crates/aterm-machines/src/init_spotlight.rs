@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Rustup minimal-profile and `rust-docs` cleanup to keep toolchains out of Spotlight.
+//! Init items that keep Rust docs and aterm's build caches out of Spotlight, and note the build
+//! folders it still indexes.
 
 use crate::init_observe::{LastReading, Reading, TOOLCHAIN_NOTE};
 use crate::items::{Ctx, Item};
@@ -11,12 +12,13 @@ use aterm_toolchain::layout;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The rustup profile that installs no documentation.
 const MINIMAL: &str = "minimal";
 
-/// Keep this login's Rust toolchains from feeding Spotlight.
+/// Keep this login's Rust docs and aterm's build caches out of Spotlight.
 ///
 /// # Errors
 /// Init did not resolve exactly one user.
@@ -36,10 +38,16 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         rustup_home: set("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup")),
     };
     let pkg = aterm_toolchain::atpkg_prefix(home, set("XDG_CONFIG_HOME").as_deref());
+    let builds = BuildNoindex::new(
+        user.clone(),
+        home.to_path_buf(),
+        pkg,
+        rustup.cargo_home.clone(),
+    );
     Ok(vec![
         Box::new(Profile(rustup.clone())),
         Box::new(NoDocs(rustup, LastReading::default())),
-        Box::new(BuildNoindex::new(user.clone(), home.to_path_buf(), pkg)),
+        Box::new(builds),
     ])
 }
 
@@ -62,6 +70,15 @@ const MADE_BY_CARGO: &str = "created by cargo";
 /// The most a cache tag of cargo's is read for, in bytes: cargo writes under 200.
 const TAG_MAX: u64 = 4096;
 
+/// The files cargo keeps at the top of a cargo home, whatever names it: its package
+/// cache's locks (`.package-cache`; `.package-cache-mutate` since cargo 1.74) and its
+/// global cache tracker (`.global-cache`, since 1.78). A folder holding one is a cargo
+/// home, whose `registry` and `git` are cargo's download caches.
+const CARGO_HOME_MARKS: [&str; 3] = [".package-cache", ".package-cache-mutate", ".global-cache"];
+
+/// Cargo's download caches in its home, each tagged as a build folder is.
+const CARGO_CACHES: [&str; 2] = ["registry", "git"];
+
 /// What one search of a home folder found: the cargo build folders Spotlight indexes, or
 /// why it could not say.
 type Found = Result<BTreeSet<PathBuf>, String>;
@@ -71,7 +88,8 @@ static SHARED: std::sync::OnceLock<Arc<Inventory>> = std::sync::OnceLock::new();
 
 /// Forget the process's last Spotlight search for build folders, found or failed, so the
 /// next reading of the Rust in Spotlight row searches the home folder again: Check again's,
-/// which the person pressed to see the Mac as it is now.
+/// which the person pressed to see the Mac as it is now. It never waits on a search under
+/// way (one can take a minute), so the window that calls it stays live.
 pub fn search_again() {
     if let Some(inventory) = SHARED.get() {
         inventory.forget();
@@ -79,9 +97,18 @@ pub fn search_again() {
 }
 
 /// The last Spotlight search for build folders: the home it searched, when (Unix seconds),
-/// and what it found.
+/// the [`Inventory::generation`] it began in, and what it found.
+type Kept = (PathBuf, u64, u64, Found);
+
+/// The last Spotlight search for build folders, which readers share ([`INVENTORY_AGE`]).
 #[derive(Debug, Default)]
-struct Inventory(Mutex<Option<(PathBuf, u64, Found)>>);
+struct Inventory {
+    /// The last search, held for its whole run so readers share one search.
+    kept: Mutex<Option<Kept>>,
+    /// Bumped by [`Self::forget`]: a search that began in an earlier generation is stale.
+    /// An atomic, so a forget never waits on the lock a search under way holds.
+    generation: AtomicU64,
+}
 
 impl Inventory {
     /// The process's one inventory ([`SHARED`]); a test's item keeps its own.
@@ -96,25 +123,29 @@ impl Inventory {
         }
     }
 
-    /// Drop the search kept, so the next read searches again ([`search_again`]).
+    /// Make the search kept stale, and any under way, so the next read searches again
+    /// ([`search_again`]). It takes no lock: a search under way holds it.
     fn forget(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// What a search of `home` taken at most [`INVENTORY_AGE`] before `now` found, else
-    /// `search`'s, kept for the next reader: a search that failed stands as long as one
-    /// that found, so a home Spotlight cannot answer for is not searched on every read.
+    /// What a search of `home` taken at most [`INVENTORY_AGE`] before `now`, and since the
+    /// last [`Self::forget`], found, else `search`'s, kept for the next reader: a search
+    /// that failed stands as long as one that found, so a home Spotlight cannot answer for
+    /// is not searched on every read.
     fn read(&self, home: &Path, now: u64, search: impl FnOnce() -> Found) -> Found {
-        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((at_home, at, found)) = kept.as_ref()
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = self.generation.load(Ordering::Acquire);
+        if let Some((at_home, at, taken_in, found)) = kept.as_ref()
             && at_home == home
+            && *taken_in == generation
             && *at <= now
             && now - at < INVENTORY_AGE
         {
             return found.clone();
         }
         let found = search();
-        *kept = Some((home.to_path_buf(), now, found.clone()));
+        *kept = Some((home.to_path_buf(), now, generation, found.clone()));
         found
     }
 }
@@ -141,6 +172,12 @@ struct BuildNoindex {
     home: PathBuf,
     /// atpkg's prefix ([`aterm_toolchain::atpkg_prefix`]): its store and rustup views.
     pkg: PathBuf,
+    /// The cargo home this process's environment names (`CARGO_HOME`, else `~/.cargo`),
+    /// whose download caches (`registry`, `git`) carry the same cache tag as a build
+    /// folder and are none. An app launched from the Dock has launchd's environment, never
+    /// the `CARGO_HOME` a shell's startup file sets, so a cargo home is also recognised by
+    /// what cargo keeps in it ([`CARGO_HOME_MARKS`]).
+    cargo_home: PathBuf,
     /// The last probe's reading, which is System State's.
     reading: LastReading,
     /// The Spotlight search for project build folders, shared for [`INVENTORY_AGE`].
@@ -148,11 +185,12 @@ struct BuildNoindex {
 }
 
 impl BuildNoindex {
-    fn new(user: User, home: PathBuf, pkg: PathBuf) -> Self {
+    fn new(user: User, home: PathBuf, pkg: PathBuf, cargo_home: PathBuf) -> Self {
         Self {
             user,
             home,
             pkg,
+            cargo_home,
             reading: LastReading::default(),
             inventory: Inventory::shared(),
         }
@@ -269,6 +307,56 @@ impl BuildNoindex {
         })
     }
 
+    /// The paths the cargo home the environment names is reached by: as named, and the
+    /// folder it resolves to where that is a link (`~/.cargo` linked to a visible folder),
+    /// since Spotlight reports a folder by its own path.
+    fn cargo_homes(&self, sys: &dyn System) -> Vec<PathBuf> {
+        let mut homes = vec![self.cargo_home.clone()];
+        if let Ok(real) = sys.canonicalize(&self.cargo_home)
+            && real != self.cargo_home
+        {
+            homes.push(real);
+        }
+        homes
+    }
+
+    /// Whether `dir` holds what cargo keeps at the top of its home ([`CARGO_HOME_MARKS`]).
+    fn holds_cargo_home(sys: &dyn System, dir: &Path) -> bool {
+        CARGO_HOME_MARKS
+            .iter()
+            .any(|mark| sys.stat(&dir.join(mark)).is_ok_and(|s| !s.dir))
+    }
+
+    /// Whether `folder` is cargo's own, where it keeps its download caches: never a
+    /// project's build folder. Anything in the cargo home the environment names, by any of
+    /// its paths (`homes`, [`Self::cargo_homes`]), is; one that holds the home folder
+    /// (`CARGO_HOME=$HOME`) leaves out only its caches, `registry` and `git`. So is
+    /// anything in the `registry` or `git` of any folder under the home that holds what
+    /// cargo keeps at its home's top ([`Self::holds_cargo_home`]): the cargo home a shell
+    /// names that this process's environment does not.
+    fn cargo_keeps(&self, sys: &dyn System, homes: &[PathBuf], folder: &Path) -> bool {
+        let named = homes.iter().any(|home| {
+            if self.home.starts_with(home) {
+                CARGO_CACHES
+                    .into_iter()
+                    .any(|cache| folder.starts_with(home.join(cache)))
+            } else {
+                folder.starts_with(home)
+            }
+        });
+        named
+            || folder
+                .ancestors()
+                .take_while(|dir| *dir != self.home && dir.starts_with(&self.home))
+                .any(|dir| {
+                    dir.file_name()
+                        .is_some_and(|name| CARGO_CACHES.iter().any(|cache| name == *cache))
+                        && dir
+                            .parent()
+                            .is_some_and(|home| Self::holds_cargo_home(sys, home))
+                })
+    }
+
     /// Ask Spotlight which cargo build folders under `self.home` it indexes: the folders
     /// holding a [`BUILD_MARKER`] it holds, one line each, that cargo wrote.
     fn search(&self, sys: &dyn System) -> Found {
@@ -293,7 +381,9 @@ impl BuildNoindex {
             return Err("Spotlight inventory is not a complete NUL-delimited list".into());
         }
         // The marker sits at the top of its build folder: the folder is its parent, under
-        // the home folder and in no `.noindex` folder.
+        // the home folder and in no `.noindex` folder. Cargo tags its own download caches
+        // in its home (`registry`, `git`) the same way: they are no project's build folder.
+        let cargo_homes = self.cargo_homes(sys);
         let mut candidates = BTreeSet::new();
         for raw in text.split('\0').filter(|p| !p.is_empty()) {
             let Some(folder) = Path::new(raw).parent() else {
@@ -302,7 +392,11 @@ impl BuildNoindex {
             let kept_out = folder
                 .components()
                 .any(|part| part.as_os_str().to_string_lossy().ends_with(".noindex"));
-            if !kept_out && folder.starts_with(&self.home) && folder != self.home {
+            if !kept_out
+                && folder.starts_with(&self.home)
+                && folder != self.home
+                && !self.cargo_keeps(sys, &cargo_homes, folder)
+            {
                 candidates.insert(folder.to_path_buf());
             }
         }
@@ -781,6 +875,7 @@ mod tests {
                 user("alice", 501),
                 "/Users//alice".into(),
                 self.path().to_path_buf(),
+                "/Users//alice/.cargo".into(),
             ))]
         }
     }
@@ -839,10 +934,16 @@ mod tests {
 
     /// The item on a Mac with no atpkg prefix.
     fn alice_builds() -> Vec<Box<dyn Item>> {
+        cargo_home_builds("/Users//alice/.cargo")
+    }
+
+    /// [`alice_builds`] with `CARGO_HOME` at `cargo_home`.
+    fn cargo_home_builds(cargo_home: &str) -> Vec<Box<dyn Item>> {
         vec![Box::new(BuildNoindex::new(
             user("alice", 501),
             "/Users//alice".into(),
             "/Users//alice/Library/Application Support/aterm/pkg".into(),
+            cargo_home.into(),
         ))]
     }
 
@@ -973,10 +1074,8 @@ mod tests {
         assert_eq!(row_of(&rows).note, None);
     }
 
-    /// The person's own project `target` that Spotlight indexes is a quiet note on the Rust
-    /// in Spotlight row, with the folder named behind it: not Needs you, not a change, and
-    /// the run that reads it finishes. aterm never renames or links it, whatever stands
-    /// beside it.
+    /// The person's indexed project `target` is a quiet note with the folder named in its detail,
+    /// never a change, and is never renamed or linked whatever stands beside it.
     #[test]
     fn a_spotlit_project_folder_of_the_persons_is_a_note_and_never_touched() {
         let sys = with_a_spotlit_project(true);
@@ -1065,11 +1164,8 @@ mod tests {
         }
     }
 
-    /// Spotlight is asked for build folders, one line each (the `CACHEDIR.TAG` cargo
-    /// writes at the top of one), never for every artifact: a developer's home holds
-    /// thousands of `.rmeta` files, over the complete capture. A search that fails anyway
-    /// stands its age like one that found, so the home folder is not searched on every
-    /// probe; the next one after it finds again.
+    /// Spotlight is asked for build folders by `BUILD_MARKER`, and a search that fails (here, over
+    /// the complete capture) stands its age like one that found.
     #[test]
     fn spotlight_is_asked_for_build_folders_and_a_failed_search_stands_its_age() {
         let sys = with_a_spotlit_project(true);
@@ -1188,6 +1284,133 @@ mod tests {
         assert_eq!(read(&sys), projects(1));
     }
 
+    /// Cargo tags its download caches in its home (`registry`, `git`) exactly as it tags a
+    /// build folder. NEGATIVE CONTROL: with a visible `CARGO_HOME`, which Spotlight indexes,
+    /// they are cargo's own and never counted as the person's project build folders; a
+    /// project's beside them still is. A cargo home that holds the home folder leaves out
+    /// only those caches.
+    #[test]
+    fn cargos_download_caches_are_no_project_build_folders() {
+        let read = |items: Vec<Box<dyn Item>>, sys: &Fake| {
+            let rows = engine::run(&items, Mode::Plan, sys, &context(), &mut NoJournal);
+            Reading::of(&rows[0])
+        };
+        let caches = ["/Users//alice/cargo/registry", "/Users//alice/cargo/git"];
+        let sys = spotlit(&caches);
+        assert_eq!(
+            read(cargo_home_builds("/Users//alice/cargo"), &sys),
+            None,
+            "nothing of the person's to note"
+        );
+        let sys = spotlit(&[caches[0], caches[1], TARGET]);
+        assert_eq!(
+            read(cargo_home_builds("/Users//alice/cargo"), &sys),
+            Some(Reading::KeptOut {
+                projects: 1,
+                toolchain: false,
+            })
+        );
+        let caches = ["/Users//alice/registry", "/Users//alice/git"];
+        let sys = spotlit(&[caches[0], caches[1], TARGET]);
+        assert_eq!(
+            read(cargo_home_builds("/Users//alice"), &sys),
+            Some(Reading::KeptOut {
+                projects: 1,
+                toolchain: false,
+            })
+        );
+    }
+
+    /// System State reads inside the app, whose environment a launch from the Dock gives
+    /// it names no `CARGO_HOME`: a visible cargo home a shell's startup file names
+    /// (`~/cargo`) is still cargo's, by the files cargo keeps at its top, whichever it
+    /// wrote (`.package-cache`, `.global-cache`), and its download caches are no project
+    /// build folders. So are those of `~/.cargo` linked to a visible folder, which
+    /// Spotlight reports by the folder's own path. NEGATIVE CONTROLS: a `registry` and a
+    /// `git` cargo tagged beside neither (a target folder of that name) are build folders
+    /// like any other, and a project's beside the caches always counts.
+    #[test]
+    fn a_cargo_home_the_environment_does_not_name_is_still_cargos() {
+        let read = |sys: &Fake| {
+            let rows = engine::run(&alice_builds(), Mode::Plan, sys, &context(), &mut NoJournal);
+            Reading::of(&rows[0])
+        };
+        let projects = |projects| {
+            Some(Reading::KeptOut {
+                projects,
+                toolchain: false,
+            })
+        };
+        let visible = ["/Users//alice/cargo/registry", "/Users//alice/cargo/git"];
+        for mark in [".package-cache", ".global-cache"] {
+            let sys = spotlit(&[visible[0], visible[1], TARGET]);
+            sys.file(&format!("/Users//alice/cargo/{mark}"), b"");
+            assert_eq!(read(&sys), projects(1), "{mark}");
+        }
+        let sys = spotlit(&[visible[0], visible[1], TARGET]);
+        assert_eq!(read(&sys), projects(3), "nothing of cargo's beside them");
+        let real = [
+            "/Users//alice/dev/cargo/registry",
+            "/Users//alice/dev/cargo/git",
+        ];
+        let sys = spotlit(&[real[0], real[1], TARGET]);
+        sys.link("/Users//alice/.cargo", "/Users//alice/dev/cargo");
+        assert_eq!(read(&sys), projects(1), "~/.cargo is a link to them");
+        let sys = spotlit(&[real[0], real[1], TARGET]);
+        assert_eq!(
+            read(&sys),
+            projects(3),
+            "no link, nothing of cargo's beside them"
+        );
+    }
+
+    /// Check again ([`search_again`]) never waits on a search under way, which holds the
+    /// inventory's lock for as long as Spotlight takes (a minute, or more): the window that
+    /// presses it stays live. The search under way began before it, so the next reading
+    /// searches anew. The wait here is a hang detector: the stand-in search is held on a
+    /// channel until the forget has returned.
+    #[test]
+    fn check_again_never_waits_on_a_search_under_way() {
+        use std::sync::mpsc;
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let home = Path::new("/Users//alice");
+        let inventory = Arc::new(Inventory::default());
+        let (started, searching) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let search = {
+            let inventory = Arc::clone(&inventory);
+            std::thread::spawn(move || {
+                inventory.read(home, 0, || {
+                    started.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(BTreeSet::new())
+                })
+            })
+        };
+        searching.recv_timeout(HANG).expect("the search began");
+        let (forgot, forgetting) = mpsc::channel();
+        let forget = {
+            let inventory = Arc::clone(&inventory);
+            std::thread::spawn(move || {
+                inventory.forget();
+                forgot.send(()).unwrap();
+            })
+        };
+        let returned = forgetting.recv_timeout(HANG);
+        release.send(()).unwrap();
+        search.join().unwrap().unwrap();
+        forget.join().unwrap();
+        returned.expect("Check again waited on the search under way");
+        let searched = std::cell::Cell::new(false);
+        inventory
+            .read(home, 0, || {
+                searched.set(true);
+                Ok(BTreeSet::new())
+            })
+            .unwrap();
+        assert!(searched.get(), "a search begun before Check again is stale");
+    }
+
     /// The build `store/trust/current` names is the one in use, which atpkg never moves
     /// until an update makes another current, and the rustup view laid from it moves with
     /// the next update too: one note says so, never "older". A plain build no longer in
@@ -1257,6 +1480,7 @@ mod tests {
                 user("alice", 501),
                 "/Users//alice".into(),
                 "/Users//alice/Library/Application Support/aterm/pkg".into(),
+                "/Users//alice/.cargo".into(),
             )
         };
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];

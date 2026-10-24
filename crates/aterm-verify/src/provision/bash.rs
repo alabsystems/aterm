@@ -74,8 +74,8 @@ pub(super) fn build(
     )?;
     // Settled before the patches, so what a patch changes comes out newer than what it
     // is generated into, and `make` remakes exactly that (`y.tab.c` from a patched
-    // `parse.y`); a patch that changes both lays the generated file second, as 016 does
-    // `configure.ac` and `configure`.
+    // `parse.y`); a patch that changes both lays the generated file second, as bash53-016
+    // does `configure.ac` and `configure`.
     place::settle_times(&src)?;
     for patch in patches {
         let patch_url = patch.url_at(version);

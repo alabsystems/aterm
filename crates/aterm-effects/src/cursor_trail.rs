@@ -515,13 +515,23 @@ impl CursorTrail {
             let dedup = &mut self.dedup;
             const MASK: usize = CursorTrail::DEDUP_SLOTS - 1;
             const SHIFT: u32 = 32 - CursorTrail::DEDUP_SLOTS.trailing_zeros();
+            let mut last_cohort: Option<((Instant, u64), Option<u32>)> = None;
             self.sparks.retain(|s| {
-                let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
-                if age_ms >= s.life_ms {
+                let cohort_key = (s.born, s.life_ms);
+                let tf = match last_cohort {
+                    Some((prev_key, cached)) if prev_key == cohort_key => cached,
+                    _ => {
+                        let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
+                        let cached = (age_ms < s.life_ms)
+                            .then(|| ((s.life_ms - age_ms) * 255 / s.life_ms) as u32);
+                        last_cohort = Some((cohort_key, cached));
+                        cached
+                    }
+                };
+                let Some(tf) = tf else {
                     return false;
-                }
-                let tf = ((s.life_ms - age_ms) * 255 / s.life_ms) as u32;
-                let alpha = ((s.born_alpha as u32 * tf) / 255) as u8;
+                };
+                let alpha = ((u32::from(s.born_alpha) * tf) / 255) as u8;
                 if alpha == 0 {
                     return true;
                 }

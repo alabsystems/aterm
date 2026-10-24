@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The source guards: rules a type, a visibility or a clippy lint cannot express, each a small function over one shared, lexed corpus.
+//! The source guards: rules a type, a visibility or a clippy lint cannot express, each a small
+//! function over one shared, lexed corpus.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -278,7 +279,8 @@ pub(crate) struct Corpus {
 const CORPUS_DIRS: &[&str] = &["crates", "apps"];
 
 impl Corpus {
-    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped), in path order; then every file of the checkout and every script among them.
+    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped), in
+    /// path order; then every file of the checkout, and the scripts among them.
     pub(crate) fn read(root: &Path) -> Result<Self, String> {
         let mut paths = Vec::new();
         for dir in CORPUS_DIRS {
@@ -313,7 +315,8 @@ impl Corpus {
         })
     }
 
-    /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, the rest as scripts.
+    /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, the
+    /// rest as scripts.
     #[cfg(test)]
     pub(crate) fn of(files: &[(&str, &str)]) -> Self {
         let (rs, other): (Vec<_>, Vec<_>) = files.iter().partition(|(rel, _)| rel.ends_with(".rs"));
@@ -348,7 +351,9 @@ impl Corpus {
         self.files.iter().find(|f| f.rel == rel)
     }
 
-    /// The files under `prefix` that compile only under `test`: each file a test-gated `mod` declaration names (`#[cfg(all(test, unix))] #[path = "x.rs"] mod x;`), and every module such a file declares.
+    /// The files under `prefix` that compile only under `test`: each file a test-gated `mod`
+    /// declaration names (`#[cfg(all(test, unix))] #[path = "x.rs"] mod x;`), and every module
+    /// such a file declares, unless a shipped line also loads it.
     pub(crate) fn test_only(&self, prefix: &str) -> BTreeSet<String> {
         let prefixes = [prefix];
         let loads: Vec<(&str, Vec<Load>)> = self
@@ -438,7 +443,10 @@ fn in_dot_dir(rel: &str) -> bool {
         .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.starts_with('.')))
 }
 
-/// The directories the root `.gitignore` keeps out by a plain directory row (`name/` at any depth, `/path/` or `a/b/` from the root; no glob, no negation): tool state and caches (`.claude/`, `/.trust-cache/`), whose files no commit takes without `-f`, so no walk needs them.
+/// The directories the root `.gitignore` keeps out by a plain directory row (`name/` at any
+/// depth, `/path/` or `a/b/` from the root; no glob, no negation): tool state and caches
+/// (`.claude/`, `/.trust-cache/`), whose files no commit takes without `-f`, so no walk needs
+/// them.
 #[derive(Default)]
 pub(crate) struct Ignored {
     /// Rows without a `/` but their last: a directory of that name anywhere.
@@ -477,7 +485,8 @@ impl Ignored {
     }
 }
 
-/// Every file under `root/rel` ([`skipped_dir`]s and `ignored` directories aside) as a root-relative, `/`-separated path.
+/// Every file under `root/rel` ([`skipped_dir`]s and `ignored` directories aside) as a
+/// root-relative, `/`-separated path.
 pub(crate) fn walk(
     root: &Path,
     rel: &str,
@@ -510,7 +519,8 @@ pub(crate) fn walk(
     Ok(())
 }
 
-/// A script the guards read as plain lines (comments included: a rule says when it skips them).
+/// A script the guards read as plain lines (comments included: a rule says when it skips
+/// them).
 pub(crate) struct Script {
     pub(crate) rel: String,
     pub(crate) raw: String,
@@ -644,7 +654,8 @@ impl SourceFile {
             .filter(move |l| shipped.get(l.no - 1).copied().unwrap_or(true))
     }
 
-    /// The CODE view with every test-only line blanked, so an offset in it reads one line of the file and a rule can read a statement rustfmt wrapped as one.
+    /// The CODE view with every test-only line blanked, so an offset in it reads one line of the
+    /// file and a rule can read a statement rustfmt wrapped as one.
     pub(crate) fn shipped_code(&self) -> String {
         let mut shipped = self.shipped_lines().map(|l| l.no).peekable();
         let mut code = String::with_capacity(self.raw.len());
@@ -898,7 +909,8 @@ pub(crate) fn after_ws<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     s.trim_start_matches([' ', '\t']).strip_prefix(prefix)
 }
 
-/// Every name a line calls: the identifier before each `(` (spaces between allowed), whether it is a free call, a path's last segment or a method.
+/// Every name a line calls: the identifier before each `(` (spaces between allowed), whether it
+/// is a free call, a path's last segment or a method.
 pub(crate) fn calls(code: &str) -> Vec<&str> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -1020,10 +1032,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// A file a shipped line also loads ships, whatever gates it elsewhere,
-    /// and so does what it declares; a file only a test-only file loads stays
-    /// test-only. And each load resolves as rustc does: an attribute on the
-    /// `mod`'s own line, a `cfg_attr` path, an inline module's directory, an
+    /// A file a shipped line also loads ships, and so does what it declares; a file only a
+    /// test-only file loads stays test-only. Each load resolves as rustc resolves it: an
+    /// attribute on the `mod`'s own line, a `cfg_attr` path, an inline module's directory, an
     /// `include!` literal.
     #[test]
     fn a_test_module_a_shipped_line_also_loads_ships() {

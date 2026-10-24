@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cursor aurora: pure host-side animation that turns cursor motion into light: a comet of premultiplied additive quads along the swept path, a bloom crown around the head, and per-style particles.
+//! The cursor aurora: pure host-side animation that turns cursor motion into light: a comet of
+//! premultiplied additive quads along the swept path, a bloom crown around the head, and
+//! per-style particles.
 
 use aterm_time::Instant;
 use std::time::Duration;
@@ -16,7 +18,9 @@ use aterm_render::{
 
 use crate::rainbow_kitty::{self as rk, CaretSeam, CompanionImpulse};
 
-/// Host row slots for the content witness: the bands' eight rows ([`rk::witness::WITNESS_ROWS`]), a waiting key's source row and its neighbours ([`rk::witness::ARMING_ROWS`]), and the caret's row when it is outside both sets.
+/// Host row slots for the content witness: the bands' eight rows ([`rk::witness::WITNESS_ROWS`]),
+/// a waiting key's source row and its neighbours ([`rk::witness::ARMING_ROWS`]), and the caret's
+/// row when it is outside both sets.
 pub const CURSOR_WITNESS_ROWS: usize = RIBBON_LIST_ROWS + 1;
 
 const RIBBON_LIST_ROWS: usize = rk::witness::WITNESS_ROWS + rk::witness::ARMING_ROWS;
@@ -444,9 +448,8 @@ pub struct CursorGlow {
     light_body_unsolved: bool,
     #[cfg(test)]
     fire_light_squat: bool,
-    /// Test-only: lay a paper tongue's root in the flame's 2 px slabs over
-    /// its old 3 px ease, as it was: the negative control of the root's
-    /// feather.
+    /// Test-only: lay a paper tongue's root in the flame's 2 px slabs over a 3 px ease, the
+    /// negative control of the root's feather.
     #[cfg(test)]
     fire_light_root_coarse: bool,
     #[cfg(test)]
@@ -474,7 +477,8 @@ pub struct CursorGlow {
     /// The last word pass's icons still owe the published streams their
     /// shade ([`Self::shade_word_icons`]).
     word_icons_unshaded: bool,
-    /// The pet's drawn body box this frame, window pixels `(x0, x1, y0, y1)` ([`Self::note_pet_body`]).
+    /// The pet's drawn body box this frame, window pixels `(x0, x1, y0, y1)`
+    /// ([`Self::note_pet_body`]).
     pet_body: Option<(i32, i32, i32, i32)>,
     /// A test's negative control: no page veil under the pet's letters.
     #[cfg(any(test, debug_assertions))]
@@ -876,10 +880,8 @@ impl CursorGlow {
     const FIRE_DARK_AIR_TEMP: f32 = 0.72;
     const FIRE_DARK_AIR_TONGUE_CAP: f32 = 208.0;
     const FIRE_DARK_ROOT: f32 = 0.20;
-    /// A tongue in the air feathers in over this share of a cell from its
-    /// root: over a fifth, every tongue's hottest light would stand on one
-    /// hard edge, a ruler-straight floor along the run (the trail gallery's
-    /// `burst`).
+    /// A tongue in the air feathers in over this share of a cell from its root; at a fifth, every
+    /// tongue's hottest light would stand on one ruler-straight floor along the run.
     const FIRE_DARK_AIR_FOOT: f32 = 0.45;
     const FIRE_DARK_SPACING: f32 = 0.85;
     const FIRE_DARK_HALF_W: f32 = 0.70;
@@ -895,23 +897,19 @@ impl CursorGlow {
     const FIRE_METEOR_FEATHER: f32 = 0.5;
     const FIRE_METEOR_HEAD_EASE: f32 = 0.8;
     const FIRE_DARK_GAP_TONGUE: f32 = 0.95;
-    /// How tall a tongue in a lettered row's gap stands against the row's
-    /// kept rise: its tip fades to nothing, so it
-    /// stands past the row's top to show to the letters' cap height.
+    /// How tall a tongue in a lettered row's gap stands against the row's kept rise: its tip
+    /// fades to nothing, so it stands past the row's top to show up to the letters' cap height.
     const FIRE_DARK_GAP_RISE: f32 = 1.6;
-    /// The least a tongue in a gap inside the burning run stands, as a share
-    /// of the square root of the head's strength: held to the run's smoothed
-    /// heat alone, a gap three letters back in a cool run would stand a
-    /// candle flame a third of the row tall.
+    /// The least a tongue in a gap inside the burning run stands, as a share of the square root
+    /// of the head's strength; held to the run's smoothed heat alone, a gap in a cool run would
+    /// stand a candle flame.
     const FIRE_DARK_GAP_FLOOR: f32 = 0.8;
     const FIRE_DARK_CORE_ROOT_PX: f32 = 5.0;
     const FIRE_DARK_KEPT_CORE_COV: f32 = 255.0;
     const FIRE_DARK_KEPT_CORE_ROOT_PX: f32 = 4.0;
     const FIRE_DARK_CORE_CLEAR_PX: f32 = 1.0;
-    /// Under a kept letter's baseline, the pixels over which the flame's
-    /// light eases in from the letter's hold to the air's: eased over half
-    /// the band (some two pixels) with a core whole a pixel under it, the
-    /// light would step there in a hot bead line along the line.
+    /// Under a kept letter's baseline, the pixels over which the flame's light eases in from the
+    /// letter's hold to the air's; a two-pixel ease steps the light there in a hot bead line.
     const FIRE_DARK_CAP_EASE_PX: f32 = 4.0;
     /// How far a tongue's foot curls up at its side, a share of a cell: its
     /// root rounds, so the run stands on its tongues' own feet.
@@ -920,13 +918,10 @@ impl CursorGlow {
     /// an ember's orange-red, an orange.
     const FIRE_BLOOM_EMBER: f32 = 0.46;
     const FIRE_BLOOM_HEART: f32 = 0.52;
-    /// A core in the air burns in its tongue's lower body, as tall as this
-    /// share of the tongue, a teardrop as wide as [`Self::FIRE_DARK_AIR_CORE_W`]
-    /// of its tongue's half-width that narrows to a point by the power
-    /// [`Self::FIRE_DARK_AIR_CORE_TAPER`] of its rise: at seven tenths and a
-    /// power of 0.7, as a kept core burns, every core in the air would stand
-    /// a thin olive needle past its flame, the run a row of straight-sided
-    /// columns (the trail gallery's `burst`).
+    /// A core in the air burns in its tongue's lower body, as tall as this share of the tongue: a
+    /// teardrop [`Self::FIRE_DARK_AIR_CORE_W`] of its tongue's half-width wide that narrows to a
+    /// point by the power [`Self::FIRE_DARK_AIR_CORE_TAPER`] of its rise. As tall and sharp as a
+    /// kept core, every core in the air would stand a thin olive needle past its flame.
     const FIRE_DARK_AIR_CORE_REACH: f32 = 0.45;
     const FIRE_DARK_AIR_CORE_W: f32 = 0.80;
     /// Its heart's light: inside its flame, a core at the column control's
@@ -961,29 +956,24 @@ impl CursorGlow {
     /// Horizontal reach in cells of a light landing veil on either side of the caret's centre.
     pub(crate) const LIGHT_VEIL_REACH_CELLS: f32 = 1.5;
     const FIRE_LIGHT_HEADROOM: f32 = 0.08;
-    /// The highest a tongue in the air stands its root (and its gold
-    /// core's) off the air's floor, as a share of a row. Every tongue on one
-    /// floor stood its gold roots in a row of evenly spaced beads (looks6
-    /// N8); a core lifted alone hung as a gold stick mid-flame, and cores
-    /// shortened, narrowed or set off their axis to break the line burned
-    /// as a tan curtain (looks6 round 3), so the whole tongue rises.
+    /// The highest a tongue in the air stands its root (and its gold core's) off the air's floor,
+    /// as a share of a row. The whole tongue rises: on one floor the gold roots stand in a row of
+    /// evenly spaced beads, a core lifted alone hangs as a gold stick mid-flame, and cores
+    /// shortened, narrowed or set off their axis burn as a tan curtain.
     const FIRE_DARK_ROOT_LIFT: f32 = 0.34;
-    /// The step of a tongue's root lift from one tongue to the next along
-    /// the row, a share of [`Self::FIRE_DARK_ROOT_LIFT`] taken modulo one
-    /// (the golden ratio's): any two neighbours stand at least 0.38 of the
-    /// lift apart, so no three neighbouring roots share a floor. Drawn at
-    /// random, the gallery's `burst` drew three of five lifts under a pixel.
+    /// The step of a tongue's root lift from one tongue to the next along the row, a share of
+    /// [`Self::FIRE_DARK_ROOT_LIFT`] taken modulo one (the golden ratio's): any two neighbours
+    /// stand at least 0.38 of the lift apart, so no three neighbouring roots share a floor.
     const FIRE_DARK_ROOT_LIFT_STEP: f32 = 0.618_034;
     /// The least height a paper flame tongue keeps; shorter ones are dropped.
     const FIRE_LIGHT_TONGUE_MIN_PX: f32 = 3.0;
-    /// The height over which a short paper tongue fades in past [`Self::FIRE_LIGHT_TONGUE_MIN_PX`].
+    /// The height over which a short paper tongue fades in past
+    /// [`Self::FIRE_LIGHT_TONGUE_MIN_PX`].
     const FIRE_LIGHT_TONGUE_EASE_PX: f32 = 5.0;
     /// A paper tongue's widest half-width per pixel of its height (no tongue wider than tall).
     const FIRE_LIGHT_TONGUE_ASPECT: f32 = 0.45;
-    /// The least run over which a paper tongue's root eases in, laid a
-    /// pixel a slab: over 3 px in the flame's 2 px slabs a short gap
-    /// tongue's root stood cut flat in two steps (looks6 round 3:
-    /// `ffb875` to `fff6ee` from one row to the next).
+    /// The least run over which a paper tongue's root eases in, laid a pixel a slab; over 3 px in
+    /// the flame's 2 px slabs, a short gap tongue's root is cut flat in two steps.
     const FIRE_LIGHT_ROOT_EASE_PX: f32 = 6.0;
     const FIRE_LIGHT_ALPHA: f32 = 240.0;
     const FIRE_LIGHT_ROOT: f32 = 0.70;
@@ -1129,9 +1119,10 @@ impl CursorGlow {
         self.has_live_motion()
             || self.ember_live()
             || self.poof_hint_pending().is_some()
-            || (self.v2.engaged() && self.v2.fingerprint() != 0)
-            || (self.v2.engaged() && self.held_park.is_some())
-            || (self.v2.engaged() && self.torn_lay.is_some())
+            || (self.v2.engaged()
+                && (self.held_park.is_some()
+                    || self.torn_lay.is_some()
+                    || self.v2.fingerprint() != 0))
     }
 
     #[inline]
@@ -1296,7 +1287,8 @@ impl CursorGlow {
         self.dark_settled = false;
     }
 
-    /// Resets coordinate-space state and draws Rainbow Kitty's ribbon into the last caret over its curtain window.
+    /// Resets coordinate-space state and draws Rainbow Kitty's ribbon into the last caret over its
+    /// curtain window.
     #[inline]
     pub fn curtain(&mut self, now: Instant) {
         self.reset_space(Some(now));
@@ -1335,7 +1327,8 @@ impl CursorGlow {
         self.v2.hide_armed()
     }
 
-    /// Drops all in-flight light and forgets the last cursor position across a coordinate-space transition.
+    /// Drops all in-flight light and forgets the last cursor position across a coordinate-space
+    /// transition.
     #[inline]
     pub fn reset(&mut self) {
         self.reset_space(None);
@@ -1368,7 +1361,8 @@ impl CursorGlow {
         self.witness_asked.take();
     }
 
-    /// Advance one frame: observe the cursor at `cur` (`Some(row, col)` visible, `None` hidden), spawn on a move, decay, and emit the current light quads into `out`.
+    /// Advance one frame: observe the cursor at `cur` (`Some(row, col)` visible, `None` hidden),
+    /// spawn on a move, decay, and emit the current light quads into `out`.
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,

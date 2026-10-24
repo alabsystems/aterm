@@ -13,7 +13,7 @@ use std::path::Path;
 /// together, doubled for the other sessions on the volume and rounded up.
 pub const BRING_UP_FLOOR: u64 = 20 << 30;
 
-/// The floor V2's helper stops a running VM at, read with each heartbeat: about one
+/// The floor the helper stops a running VM at, read every [`crate::detect::TICK`]: about one
 /// proof's build output, so no run meets a full volume.
 pub const RUN_FLOOR: u64 = 4 << 30;
 
@@ -90,9 +90,8 @@ pub fn below_bring_up(free: &Free) -> Option<String> {
     })
 }
 
-/// The words V2's helper ends every in-flight `Out` with when it stops a running VM on
-/// `free`, below [`RUN_FLOOR`] (§4), else `None`. They say what happened to the VM; the
-/// run's verdict is the helper's.
+/// The words the helper ends every in-flight `Out` with when it stops a running VM on
+/// `free`, below [`RUN_FLOOR`] (§4), else `None`. The run's verdict is the helper's.
 #[must_use]
 pub fn below_run(free: &Free) -> Option<String> {
     (free.bytes < RUN_FLOOR).then(|| {
@@ -150,8 +149,8 @@ mod tests {
         let real = std::fs::canonicalize(dir.path()).unwrap();
         let link = real.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        // Measured: `/tmp/<volume>/vz.noindex/live/aterm-linux.img` during a bake, unresolved,
-        // matched the root volume's mount, not the scratch volume's under `/private/tmp`.
+        // Unresolved, a path under `/tmp` matches the root volume's mount, not the volume
+        // mounted under `/private/tmp`.
         assert_eq!(
             resolved(&link.join("live/aterm-linux.img")),
             real.join("live/aterm-linux.img")

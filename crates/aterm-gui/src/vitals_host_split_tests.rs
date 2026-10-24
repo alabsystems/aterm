@@ -1204,3 +1204,200 @@ fn the_reader_reads_its_scene_on_its_own_split_ticks() {
     let r = READS.take();
     assert_eq!((r.coalitions, r.swept), (0, 0), "the machine's");
 }
+
+/// This process's name as the sweep reads it, which the stand-in kernel's
+/// record must name for its birth to be taken.
+#[cfg(target_os = "macos")]
+fn own_swept_name() -> String {
+    let me = std::process::id();
+    aterm_sysprobe::processes()
+        .and_then(|s| s.procs.into_iter().find(|p| p.pid == me))
+        .map(|p| p.name)
+        .expect("this process swept")
+}
+
+/// This process's row and program in a whole reading.
+#[cfg(target_os = "macos")]
+fn own_birth(snap: &Snapshot) -> (Option<i64>, Option<i64>) {
+    let me = std::process::id();
+    let row = snap.procs.iter().find(|p| p.pid == me).expect("own row");
+    let program = snap
+        .programs
+        .iter()
+        .find(|g| g.scope == aterm_vitals::model::ProcScope::Aterm && g.name == row.name)
+        .expect("own program");
+    (row.birth_ms, program.born_ms)
+}
+
+/// BIRTHS RIDE EVERY WHOLE READING, split tick or not, so a program's age is
+/// there between split ticks; a jobs-only edge's reading too, since `sys`
+/// answers a pull from whichever whole reading is fresh, and a deck that no
+/// window shows still leaves `sys procs` its ages. NEGATIVE CONTROL: a hidden
+/// deck's machine-only reading sweeps nothing and reads no birth. (macOS: the
+/// stand-in kernel answers only where the sweep gives no birth of its own.)
+#[cfg(target_os = "macos")]
+#[test]
+fn births_ride_every_whole_reading() {
+    const BORN: i64 = 1_790_000_000_000;
+    let (mut reader, _) = stand_in_reader();
+    kernel(&[(std::process::id(), &own_swept_name(), BORN, false)]);
+    just_read(&mut reader);
+    READS.take();
+    let _ = reader.read_machine(&Request {
+        machine_only: true,
+        ..bars()
+    });
+    let r = READS.take();
+    assert_eq!(
+        (r.births, r.tables, r.coalitions),
+        (0, 0, 0),
+        "NEGATIVE CONTROL: a machine-only reading"
+    );
+    let unseen = Request {
+        deck: false,
+        ..bars()
+    };
+    let _ = reader.read(&unseen);
+    READS.take();
+    for (req, why) in [
+        (
+            Request {
+                jobs_now: true,
+                ..unseen.clone()
+            },
+            "a jobs-only edge, no window looking",
+        ),
+        (bars(), "the bars, between split ticks"),
+        (
+            Request {
+                pull: true,
+                ..unseen.clone()
+            },
+            "a pull, unarmed",
+        ),
+    ] {
+        let snap = reader.read(&req);
+        let r = READS.take();
+        assert_eq!(r.coalitions, 0, "{why}: not a split tick");
+        assert_eq!(own_birth(&snap), (Some(BORN), Some(BORN)), "{why}");
+    }
+}
+
+/// A birth the sweep gave (Linux's boot clock, Windows' creation time)
+/// reaches the model's sample as given.
+#[test]
+fn a_swept_birth_reaches_the_model() {
+    let epoch = Instant::now();
+    let read = |birth_ms| aterm_sysprobe::ProcessReading {
+        pid: 9,
+        birth_ms,
+        ..aterm_sysprobe::ProcessReading::default()
+    };
+    assert_eq!(proc_sample(&read(Some(5_000)), epoch).birth_ms, Some(5_000));
+    assert_eq!(proc_sample(&read(None), epoch).birth_ms, None);
+}
+
+/// A birth is read once and kept under its name and start; one the sweep
+/// gave (Linux, Windows) is taken as given. NEGATIVE CONTROL: a new process
+/// at the pid (another start) is read again.
+#[test]
+fn a_kept_birth_is_carried_without_a_read() {
+    let now = Instant::now();
+    kernel(&[(900, "zsh", 3_000, false), (901, "rustc", 4_000, false)]);
+    let mut split = SplitReader::new(STAND_IN, gauge());
+    let read = |split: &mut SplitReader, procs: &[ProcSample]| {
+        let mut s = Sample {
+            procs: Some(procs.to_vec()),
+            ..Sample::default()
+        };
+        split.births(&mut s, now);
+        (births(&s), READS.take().births)
+    };
+    let given = ProcSample {
+        birth_ms: Some(5_000),
+        ..swept(901, 1, "rustc", 31)
+    };
+    let mut procs = vec![swept(900, 1342, "zsh", 30), given];
+    READS.take();
+    assert_eq!(
+        read(&mut split, &procs),
+        (vec![Some(3_000), Some(5_000)], 1)
+    );
+    assert_eq!(
+        read(&mut split, &procs),
+        (vec![Some(3_000), Some(5_000)], 0)
+    );
+    kernel(&[(900, "zsh", 3_500, false)]);
+    procs[0].start = Some(35);
+    assert_eq!(
+        read(&mut split, &procs),
+        (vec![Some(3_500), Some(5_000)], 1)
+    );
+}
+
+/// Births keep their own gap clock: read between split ticks, they stay
+/// across a split gap that sends the leads' identities to be read again.
+#[test]
+fn births_read_between_split_ticks_outlast_the_split_gap() {
+    let t0 = Instant::now();
+    kernel(&[(1, "launchd", 1_000, true), (387, "mds", 2_000, true)]);
+    let mut split = SplitReader::new(STAND_IN, gauge());
+    let procs = vec![swept(387, 307, "mds", 20), swept(1, 1, "launchd", 10)];
+    let _ = tick_at(&mut split, procs.clone(), t0);
+    READS.take();
+    let half = SPLIT_WINDOW_MAX / 2 + Duration::from_secs(1);
+    let mut between = Sample {
+        procs: Some(procs.clone()),
+        ..Sample::default()
+    };
+    split.births(&mut between, t0 + half);
+    let s = tick_at(&mut split, procs, t0 + half * 2);
+    assert_eq!(births(&s), [Some(2_000), Some(1_000)]);
+    let r = READS.take();
+    assert_eq!(
+        (r.births, r.identities),
+        (0, 2),
+        "the births were read inside their window; the leads' were not"
+    );
+}
+
+/// A Mac whose coalitions lane is off still reads births: they need no
+/// coalition.
+#[cfg(target_os = "macos")]
+#[test]
+fn births_do_not_need_the_coalitions_lane() {
+    const BORN: i64 = 1_790_000_000_000;
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(
+        CoalProbe {
+            self_check: |_| Err("missed"),
+            ..STAND_IN
+        },
+        gauge(),
+    );
+    assert_eq!(reader.split.lane, CoalLane::Off);
+    kernel(&[(std::process::id(), &own_swept_name(), BORN, false)]);
+    READS.take();
+    let _ = reader.read(&bars());
+    let snap = reader.read(&bars());
+    assert_eq!(own_birth(&snap), (Some(BORN), Some(BORN)));
+    assert_eq!(READS.take().coalitions, 0, "no split tick");
+}
+
+/// Live (macOS): a whole reading that is no split tick carries this
+/// process's birth as its BSD info gives it, through the kernel's readers.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_kernels_birth_reaches_a_reading_between_split_ticks() {
+    let mut reader = Reader::new(Arc::default());
+    reader.split = SplitReader::new(CoalProbe::KERNEL, gauge());
+    just_read(&mut reader);
+    let _ = reader.read(&bars());
+    let snap = reader.read(&bars());
+    assert!(reader.split.coalition_ids.is_empty(), "no split tick");
+    let bsd =
+        aterm_uds::process::read_process_birth(i32::try_from(std::process::id()).expect("a pid"))
+            .expect("its BSD info");
+    let ms = i64::try_from(bsd.seconds * 1000 + bsd.microseconds / 1000).expect("ms");
+    assert_eq!(own_birth(&snap), (Some(ms), Some(ms)));
+}

@@ -391,6 +391,36 @@ fn the_process_sweep_decodes_names_times_and_parents() {
     }
 }
 
+/// Each process's birth is its creation `FILETIME` in unix ms. NEGATIVE CONTROL: a creation
+/// time before the unix epoch (or none) reads no birth.
+#[test]
+fn the_process_sweep_reads_each_birth_from_its_creation_time() {
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    let p = |pid, created| Proc {
+        pid,
+        ppid: 4,
+        created,
+        user: 0,
+        kernel: 0,
+        private: 0,
+        name: Some("rustc.exe"),
+    };
+    let buf = process_buffer(&[
+        p(5000, UNIX_EPOCH_TICKS + 17_900_000_000_000_000),
+        p(5001, 1000),
+        p(5002, 0),
+    ]);
+    let births: Vec<(u32, Option<i64>)> = processes(&buf, BASE)
+        .procs
+        .iter()
+        .map(|p| (p.pid, p.birth_ms))
+        .collect();
+    assert_eq!(
+        births,
+        [(5000, Some(1_790_000_000_000)), (5001, None), (5002, None)]
+    );
+}
+
 #[test]
 fn a_bad_process_buffer_reads_no_garbage() {
     let one = |name| Proc {

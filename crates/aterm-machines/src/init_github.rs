@@ -273,11 +273,10 @@ pub(super) fn auth_ready(
 }
 
 /// The token file's token, when git's own lookups already hand it back for every repository
-/// alike ([`native::lookups_answer`]: the secrets vault's helper reads the synced token itself)
-/// and GitHub signs it in as the configured account: the keychain is then neither written nor
-/// made git's only helper, so a rotation reaches git with nothing here to redo. `None` when
-/// they hand back another token or none, GitHub refuses it or signs it in as another account, or
-/// the token file is unusable: the keychain path then goes on as with no token source.
+/// alike ([`native::lookups_answer`]) and GitHub signs it in as the configured account: the
+/// keychain is then neither written nor made git's only helper. `None` when they hand back
+/// another token or none, GitHub refuses it or signs it in as another account, or the token file
+/// is unusable; the keychain path then goes on.
 /// # Errors
 /// They hand it back but GitHub did not say whom it signs in as: rewriting git's settings on
 /// that guess could remove the vault's helper for good.

@@ -347,15 +347,30 @@ pub fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
     let [l0, a0, b0] = oklab(ink);
     let at = |t: f32| oklab_to_rgb([l0 + (1.0 - l0) * t, a0 * (1.0 - t), b0 * (1.0 - t)]);
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, 0x00FF_FFFF);
     for _ in 0..12 {
-        let mid = (lo + hi) / 2.0;
-        if crate::color_math::relative_luminance_with(table, at(mid)) < lt {
+        let mid = (lo + hi) * 0.5;
+        let mid_rgb = at(mid);
+        if mid_rgb == lo_rgb {
             lo = mid;
+            continue;
+        }
+        if mid_rgb == hi_rgb {
+            hi = mid;
+            continue;
+        }
+        if crate::color_math::relative_luminance_with(table, mid_rgb) < lt {
+            lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
+        }
+        if lo_rgb == hi_rgb {
+            break;
         }
     }
-    at(hi)
+    hi_rgb
 }
 
 /// A light-ground dot's ring: `fresh` (the dot's hue, darkened by
@@ -374,25 +389,41 @@ fn print_ring(fresh: u32, ground: u32, veil: u8, top: f32) -> u32 {
     let g_lin = table.linear[((fresh >> 8) & 0xff) as usize];
     let b_lin = table.linear[(fresh & 0xff) as usize];
     let ring = |l: f32| at_luminance_linear(r_lin, g_lin, b_lin, lc, l);
-    let holds = |l: f32| {
-        let r = over_rgb(ring(l), fresh, veil) & 0x00FF_FFFF;
+    let holds_rgb = |ring_rgb: u32| {
+        let r = over_rgb(ring_rgb, fresh, veil) & 0x00FF_FFFF;
         let lr = crate::color_math::relative_luminance_with(table, r);
         (lr.max(lg) + 0.05) / (lr.min(lg) + 0.05) >= PRINT_RING_CONTRAST
     };
     let top = top.min(lc).max(0.0);
-    if holds(top) {
-        return ring(top);
+    let top_rgb = ring(top);
+    if holds_rgb(top_rgb) {
+        return top_rgb;
     }
     let (mut lo, mut hi) = (0.0f32, top);
+    let (mut lo_rgb, mut hi_rgb) = (ring(0.0), top_rgb);
     for _ in 0..12 {
-        let mid = (lo + hi) / 2.0;
-        if holds(mid) {
+        let mid = (lo + hi) * 0.5;
+        let mid_rgb = ring(mid);
+        if mid_rgb == lo_rgb {
             lo = mid;
+            continue;
+        }
+        if mid_rgb == hi_rgb {
+            hi = mid;
+            continue;
+        }
+        if holds_rgb(mid_rgb) {
+            lo = mid;
+            lo_rgb = mid_rgb;
         } else {
             hi = mid;
+            hi_rgb = mid_rgb;
+        }
+        if lo_rgb == hi_rgb {
+            break;
         }
     }
-    ring(lo)
+    lo_rgb
 }
 
 /// A `0..=1` share as a byte of opacity.
@@ -656,30 +687,34 @@ fn push_radial(
     let band_top = cy - (f32::from(place.ch) / 2.0).round() as i32;
     let (rxi, ryi) = (rx.round() as i32, ry.round() as i32);
     let px = |v: i32| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+    let x = px(cx - rxi);
+    let w = px(2 * rxi);
+    let rx_px = px(rxi).max(1);
+    let ry_px = px(ryi).max(1);
     for band in -1i32..=1 {
-        let top = band_top + band * ch_px;
-        let y0 = top.max(cy - ryi).max(clip0);
-        let y1 = (top + ch_px).min(cy + ryi).min(clip1);
         let Some(row) = i32::from(place.row)
             .checked_add(band)
             .and_then(|r| u16::try_from(r).ok())
         else {
             continue;
         };
+        let top = band_top + band * ch_px;
+        let y0 = top.max(cy - ryi).max(clip0);
+        let y1 = (top + ch_px).min(cy + ryi).min(clip1);
         if y1 <= y0 {
             continue;
         }
         halos.push(RainHalo {
             row,
-            x: px(cx - rxi),
+            x,
             y: px(y0),
-            w: px(2 * rxi),
+            w,
             h: px(y1 - y0),
             color,
             cx: place.cx,
             cy: place.cy,
-            rx: px(rxi).max(1),
-            ry: px(ryi).max(1),
+            rx: rx_px,
+            ry: ry_px,
             mode,
         });
     }

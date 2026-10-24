@@ -1609,8 +1609,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         result
     }
 
-    // An older build persisted this raw hash after consuming OTP 111111.
-    // Keep that history while accepting a fresh message's code in its own scope.
+    // A legacy seen-file line (the raw hash of OTP 111111) stays in the history, and a fresh
+    // message's code is still accepted in its own scope.
     let webmail_cfg = MailboxConfig {
         dir: None,
         ..cfg.clone()
@@ -3196,8 +3196,8 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock mailpit");
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
-        // Newer message mpit-2 is a non-auth email; once /api/v1/message/mpit-2 returns 200 OK,
-        // the poller must NOT request /api/v1/messages/mpit-2 before moving to /api/v1/message/mpit-1.
+        // The newer mpit-2 is not a sign-in email: after reading `/api/v1/message/mpit-2` the
+        // poller moves to mpit-1 without requesting `/api/v1/messages/mpit-2`.
         for expected_path in [
             "/api/v1/messages",
             "/api/v1/message/mpit-2",
@@ -3791,8 +3791,8 @@ fn approval_formaction_meta_refresh_and_multi_link_fallback() {
         )]
     );
 
-    // Multi-link fallback in `authorize_using_with_page`: if the first candidate link has no
-    // approval action, it automatically advances to the second candidate link in the email.
+    // `authorize_using_with_page` moves to the email's next candidate link when one has no
+    // approval action.
     let authorize_url = "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A9124%2Fcb&state=st_multi";
     let mut candidate_links = [
         "https://claude.ai/login?return_to=home".to_owned(),
@@ -4389,9 +4389,8 @@ fn css_custom_props_angle_bracket_entities_otp_priority_and_get_form_dedup() {
         vec!["654321".to_owned(), "941070".to_owned()]
     );
 
-    // 3. Hero OTP box placed immediately above its context caption outranks an earlier
-    // standalone 6-digit number, and a 6-line vertical OTP box is not corrupted by a 7th
-    // single-digit footnote line.
+    // 3. An OTP box just above its caption outranks an earlier bare 6-digit number, and a
+    // 6-line vertical OTP box survives a 7th single-digit footnote line.
     let hero_above_caption = concat!(
         "From: Anthropic <no-reply@anthropic.com>\r\n",
         "To: sol-m27@proton.me\r\n\r\n",
@@ -4600,7 +4599,7 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         Some("https://claude.ai/magic-link?token=nested_ok&state=s9")
     );
 
-    // 2. Proofpoint v3 with `*` replacements decoded from the `;base64!` table (`/` = 0x2F, `?` = 0x3F, `&` = 0x26 -> base64 "Lz8m").
+    // 2. Proofpoint v3 `*` placeholders decode from the `__;<base64>!` table (`Lz8m` is `/?&`).
     let ppv3_star = concat!(
         "To: sol-m27@proton.me\r\n\r\n",
         "https://urldefense.com/v3/__https://claude.ai*magic-link*token=ppv3_star*state=s2__;Lz8m!abc$\r\n"
@@ -4610,7 +4609,7 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         Some("https://claude.ai/magic-link?token=ppv3_star&state=s2")
     );
 
-    // 3. OTP email with SafeLinks/Proofpoint-wrapped non-auth footer links and opaque tracked footer anchors.
+    // 3. Wrapped or opaquely tracked footer links do not shadow the OTP.
     let otp_with_tracked_footers = concat!(
         "To: sol-m27@proton.me\r\n",
         "Subject: Your Claude verification code\r\n\r\n",
@@ -4630,7 +4629,7 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         "tracked non-auth footer links and revoke links must not shadow the 6-digit OTP"
     );
 
-    // 4. Opaque click-tracked magic-link email where "View in browser" precedes "Sign in to Claude".
+    // 4. Anchor text picks the opaque tracked sign-in link over an earlier "View in browser".
     let opaque_tracker_magic = concat!(
         "To: sol-m27@proton.me\r\n",
         "Subject: Sign in to Claude\r\n\r\n",
@@ -4679,8 +4678,7 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         );
     }
 
-    // 5. Top-level base64 OTP email must not treat raw 6-digit base64 lines (`482910`) as OTPs.
-    // "Your verification code is 739104 " in base64 is "WW91ciB2ZXJpZmljYXRpb24gY29kZSBpcyA3MzkxMDQg"
+    // 5. A top-level base64 body yields its decoded OTP (739104), never a raw base64 line.
     let top_level_b64_otp = concat!(
         "To: sol-m27@proton.me\r\n",
         "Subject: Your verification code\r\n",
@@ -4694,8 +4692,8 @@ fn nested_trackers_anchor_ranking_and_mime_otp_isolation() {
         "top-level base64 OTP email ignores raw base64 lines and extracts only the decoded OTP"
     );
 
-    // 6. Multipart MIME boundary resets OTP context so trailing context words before `--boundary`
-    // do not promote unrelated numbers in the next MIME part's headers or top lines.
+    // 6. A MIME boundary resets OTP context: context words before `--b1` promote no number
+    // in the next part's headers or top lines.
     let multipart_boundary_bleed = concat!(
         "To: sol-m27@proton.me\r\n",
         "Content-Type: multipart/alternative; boundary=\"b1\"\r\n\r\n",

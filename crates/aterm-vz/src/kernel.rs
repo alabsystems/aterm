@@ -21,7 +21,7 @@ pub const MAGIC_AT: usize = 56;
 /// The arm64 `Image` magic, `0x644d5241` little-endian.
 pub const MAGIC: [u8; 4] = *b"ARMd";
 
-/// The names the kernel's two files take in its directory.
+/// The gunzipped kernel's name in the kernel's directory.
 pub const IMAGE: &str = "Image";
 /// The initrd's name in the kernel's directory.
 pub const INITRD: &str = "initrd";
@@ -207,13 +207,12 @@ fn write_durably(
     aterm_durable::durable(&file).map_err(|e| io("flush", path, &e))
 }
 
-/// The kernel laid under `dir` (`vz.noindex/kernel`) for `want`, laying it first where it
-/// is not there whole ([`whole`]): `vmlinuz` gunzipped to [`IMAGE`] and `initrd` copied
-/// to [`INITRD`], each held to `want`, both made durable and 0444, in a scratch directory
-/// renamed into place whole. A key directory that is not whole is replaced. Every other
-/// kernel directory under `dir` (an older pin's, `<16 hex>-<16 hex>`) and every scratch a
-/// lay did not finish (`.partial-*`) is removed: the framework reads the kernel when a VM
-/// starts, so no booted VM needs one. Nothing else under `dir` is touched.
+/// The kernel laid under `dir` (`vz.noindex/kernel`) for `want`, laid first where it is not
+/// there whole ([`whole`]): `vmlinuz` gunzipped to [`IMAGE`] and `initrd` copied to
+/// [`INITRD`], each held to `want`, made durable and 0444 in a scratch directory renamed
+/// into place. A key directory that is not whole is replaced. Every other kernel directory
+/// (`<16 hex>-<16 hex>`) and unfinished scratch (`.partial-*`) under `dir` is removed, as the
+/// framework reads the kernel only when a VM starts; nothing else under `dir` is touched.
 ///
 /// # Errors
 /// [`Error::Input`] when a file is missing or is not its pin's (nothing is laid),
@@ -414,9 +413,8 @@ mod tests {
         input(gunzip_image(&kernel[..], Vec::new(), &want));
     }
 
-    /// A volume that fills while the kernel is written is a failed write, never a refused
-    /// pin, for the gunzip and for the initrd's copy, its last buffered tail included.
-    /// NEGATIVE CONTROL: the same writes with room succeed.
+    /// A volume that fills under the gunzip or the initrd's copy (its last buffered tail
+    /// included) is a failed write, never a refused pin; with room the same writes succeed.
     #[test]
     fn a_full_volume_is_a_failed_write_and_never_a_bad_input() {
         let kernel = image(MAGIC, 200_000);
@@ -569,8 +567,7 @@ mod tests {
     }
 
     /// A key directory that is not whole (an emptied file, a lost one) is laid again from
-    /// the pinned files, never trusted and never stuck. NEGATIVE CONTROL: a whole one is
-    /// kept as it is, its inode unchanged.
+    /// the pinned files; a whole one is kept, its inode unchanged.
     #[test]
     fn a_kernel_directory_that_is_not_whole_is_laid_again() {
         use std::os::unix::fs::MetadataExt as _;

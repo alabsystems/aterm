@@ -214,8 +214,8 @@ pub enum FaultKind {
     Kill(u16),
     /// Stop after item K: no progress, no reply, `Cancel` ignored.
     Hang(u16),
-    /// Stop after item K until `Cancel`, then ignore it: the remaining items, a progress frame each,
-    /// and the result.
+    /// Stop after item K until `Cancel`, then ignore it: the remaining items, a progress frame
+    /// each, and the result.
     Slow(u16),
     /// No progress after item 0 until `Cancel`, then the full result.
     Late,
@@ -245,13 +245,12 @@ pub enum FaultKind {
 /// A test fault and what it is keyed by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
-    /// `name@G.S.A[:K]`: the lease of search serial G, slot S, attempt A, whichever worker draws it.
+    /// `name@G.S.A[:K]`: the lease of search serial G, slot S, attempt A, whichever worker
+    /// draws it.
     At {
-        /// The behaviour.
         kind: FaultKind,
         /// The search serial, from 1.
         search: u32,
-        /// The slot.
         slot: u32,
         /// The attempt, from 1.
         attempt: u8,
@@ -767,7 +766,6 @@ fn lie(honest: RawClaim, _: FaultKind) -> RawClaim {
 /// What `--workers` was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolArgs {
-    /// How many workers.
     pub workers: usize,
     /// The lease window, when a debug build overrides it.
     pub lease_ms: Option<u64>,
@@ -852,13 +850,10 @@ pub struct Wire {
 /// What a pool did, once it is shut down.
 #[derive(Clone, Debug, Default)]
 pub struct PoolReport {
-    /// Workers spawned.
     pub spawned: usize,
-    /// Workers reaped.
     pub reaped: usize,
     /// Workers the coordinator killed.
     pub killed: usize,
-    /// The ledger's counts.
     pub counts: Counts,
     /// Each worker's peak RSS in bytes, where it was reaped with accounting.
     pub peaks: Vec<u64>,
@@ -870,7 +865,6 @@ pub struct PoolReport {
     pub foreign: Vec<(u32, &'static str)>,
     /// Spawn to the last hello, when every worker said hello.
     pub pool_ns: Option<Nanos>,
-    /// The transport.
     pub wire: Wire,
     /// Every accepted job's round trip.
     pub trips: Vec<Trip>,

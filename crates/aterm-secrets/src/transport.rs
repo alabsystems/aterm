@@ -443,16 +443,13 @@ fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
 }
 
 /// `<path>.lock`, held by one publisher from its check of the version a path holds to its
-/// rename over it, so two admins publishing at once cannot both pass the check and the
-/// later rename silently drop the other's version (a revocation, say). It is made by an
-/// exclusive create, which a shared mount (SMB, NFSv3 and later) also serializes, holds
-/// `<host> <pid>`, and goes when the publish ends. A server takes it too, over the vault
-/// file in its store, so an admin whose vault is that file publishes under the same rule,
-/// and only the server, under its state lock, clears one whose holder names its machine's host
-/// name and no longer runs ([`PublishLock::take_clearing_dead`]); two machines that share the
-/// mount and a host name are told apart by nothing, and two servers on one store are not
-/// serialized with each other. Any other one a killed publisher left
-/// behind refuses every publish until a person removes it.
+/// rename over it, so two admins publishing at once cannot both pass the check and one drop the
+/// other's version (a revocation, say). It is an exclusive create, which a shared mount (SMB,
+/// NFSv3 and later) also serializes; it holds `<host> <pid>` and goes when the publish ends. A
+/// server takes it too, over the vault file in its store, and only a server clears one left by
+/// a holder on its machine that no longer runs ([`PublishLock::take_clearing_dead`]); machines
+/// that share the mount and a host name are not told apart. Any other lock a killed publisher
+/// left refuses every publish until a person removes it.
 #[cfg(unix)]
 pub(crate) struct PublishLock(std::path::PathBuf);
 
@@ -539,9 +536,9 @@ pub(crate) fn held_by(holder: &str) -> String {
     }
 }
 
-/// Remove `lock` when it is a plain file whose holder line names this machine's host name and
-/// a pid no process has, the kernel says, and the file judged, held open until the remove so
-/// its inode cannot be handed to another, is still the one at that path.
+/// Remove `lock` when it is a plain file whose holder line names this machine's host name and a
+/// pid the kernel says no process has, and the path still holds the file judged (kept open
+/// until the remove, so its inode cannot be reused meanwhile).
 #[cfg(unix)]
 fn remove_dead(lock: &std::path::Path) -> bool {
     use std::io::Read as _;
@@ -1012,11 +1009,9 @@ mod tests {
         held(&first);
     }
 
-    /// TWO PUBLISHERS NEVER BOTH PASS THE CHECK: while another publisher holds the vault's
-    /// `<path>.lock`, a publish (or a replace) to the path is refused, naming the lock and
-    /// its holder; the vault and the holder's lock are left as they were. A publish leaves
-    /// no lock of its own behind, whether it lands or is refused as not newer. Negative
-    /// control: publish without taking the lock, and the held-lock publish lands seq 42.
+    /// While another publisher holds `<path>.lock`, a publish or replace to the path is refused,
+    /// naming the lock and its holder and leaving both as they were; a publish leaves no lock of
+    /// its own. Negative control: a publish that took no lock would land the held-lock seq 42.
     #[cfg(unix)]
     #[test]
     fn a_publish_to_a_path_another_publisher_holds_is_refused() {

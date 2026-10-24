@@ -29,11 +29,8 @@ pub(crate) enum Step {
 pub(crate) struct DevToolsWatch {
     /// The launch read was asked for.
     read_once: bool,
-    /// A read is owed once the probe is on again ([`Self::hold_read`]): a focus
-    /// gain's read held back by a `[privacy]` switch that was off, or a read made
-    /// whose completion only said a switch went off before it landed. The window
-    /// makes it then (`App::resume_held_launch_steps`), whatever else the gate
-    /// says.
+    /// A read is owed once the probe is on again ([`Self::hold_read`]); the window makes it then
+    /// (`App::resume_held_launch_steps`), whatever else the gate says.
     read_held: bool,
     /// Whether the last reading was `NotGranted`.
     awaiting_owner: bool,
@@ -78,13 +75,11 @@ impl DevToolsWatch {
                     .is_none_or(|at| now.saturating_duration_since(at) >= REREAD_EVERY))
     }
 
-    /// The probe could read nothing for a read that was due: a focus gain came
-    /// while `[privacy] enabled` or `check` was off (no read is spent; the launch
-    /// read stays owed), or a read went out and a switch went off before its
-    /// completion was handled, so the completion only said the probe was off (the
-    /// read was spent on nothing). Either way the first park with every switch on
-    /// while a window is focused, or the next focus gain, reads
-    /// ([`Self::read_held`]). A switch off is a pause, never an answer.
+    /// The probe could read nothing for a due read: a focus gain came while `[privacy] enabled` or
+    /// `check` was off (no read spent; the launch read stays owed), or a switch went off before a
+    /// read's completion was handled (the read spent on nothing). Either way the first park with
+    /// every switch on and a window focused, or the next focus gain, reads. A switch off is a
+    /// pause, never an answer.
     pub(crate) fn hold_read(&mut self) {
         self.read_held = true;
     }
@@ -99,7 +94,8 @@ impl DevToolsWatch {
         self.read_on_return = true;
     }
 
-    /// Resets the hand-over latch after an inconclusive helper attempt or a newly approved access revision.
+    /// Resets the hand-over latch after an inconclusive helper attempt or a newly approved access
+    /// revision.
     pub(crate) const fn forget_hand_over(&mut self) {
         self.handed_over = false;
     }
@@ -148,7 +144,8 @@ impl DevToolsWatch {
         std::mem::take(&mut self.refresh_owed)
     }
 
-    /// Holds a verdict refresh asked for while macOS's program check is backed up: its prime would wait in the same line.
+    /// Holds a verdict refresh asked for while macOS's program check is backed up: its prime would
+    /// wait in the same line.
     pub(crate) const fn hold_prime(&mut self) {
         self.prime_held = true;
     }
@@ -170,7 +167,8 @@ impl DevToolsWatch {
 mod tests {
     use super::*;
 
-    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per approved revision.
+    /// Reads once at launch, re-reads only while `NotGranted`, and hands over once per approved
+    /// revision.
     #[test]
     fn the_watch_reads_at_launch_and_while_the_owner_is_wanted() {
         let t0 = Instant::now();
@@ -216,9 +214,8 @@ mod tests {
         );
     }
 
-    /// A HELD READ IS MADE though the launch read was spent: a read that went out
-    /// and only learned a switch was off is owed again, once. `due` spends
-    /// nothing. NEGATIVE CONTROL: the same focus gain, nothing held, reads nothing.
+    /// A held read is made once though the launch read was spent; `due` spends nothing. Negative
+    /// control: the same focus gain with nothing held reads nothing.
     #[test]
     fn a_held_read_is_made_once_though_the_launch_read_was_spent() {
         let t0 = Instant::now();

@@ -937,6 +937,70 @@ fn the_sweep_reads_a_fixture_proc() {
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);
 }
 
+/// Each process's birth is its boot-clock start against `/proc/uptime` and the wall clock read
+/// once a sweep. NEGATIVE CONTROL: a tree with no `/proc/uptime` reads no birth.
+#[test]
+fn the_sweep_reads_each_processs_birth_on_the_boot_clock() {
+    const WALL_MS: i64 = 1_790_000_000_000;
+    let stat = |pid: u32, start_ticks: u64| {
+        format!(
+            "{pid} (rustc) R 1 {pid} 1 0 -1 4194304 0 0 0 0 5 5 0 0 20 0 1 0 {start_ticks} 0 0\n"
+        )
+    };
+    let (zsh, rustc) = (stat(4300, 900), stat(4301, 360_900));
+    let files = [
+        ("proc/4300/stat", zsh.as_str()),
+        ("proc/4300/status", "Name:\tzsh\nRssAnon:\t    1000 kB\n"),
+        ("proc/4301/stat", rustc.as_str()),
+        ("proc/4301/status", "Name:\trustc\nRssAnon:\t    1000 kB\n"),
+    ];
+    let births = |root: &aterm_tempfile::TempDir| {
+        let mut sweep = Root::new(root.path())
+            .with_wall_ms(|| Some(WALL_MS))
+            .processes(100, 4096)
+            .expect("a sweep");
+        sweep.procs.sort_by_key(|p| p.pid);
+        sweep
+            .procs
+            .iter()
+            .map(|p| (p.pid, p.birth_ms))
+            .collect::<Vec<_>>()
+    };
+    let mut with = files.to_vec();
+    with.push(("proc/uptime", "3609.50 7200.00\n"));
+    assert_eq!(
+        births(&tree(&with)),
+        [
+            (4300, Some(WALL_MS - 3_600_500)),
+            (4301, Some(WALL_MS - 500)),
+        ],
+        "started 9 s and 3609 s after boot, read 3609.5 s after it"
+    );
+    assert_eq!(
+        births(&tree(&files)),
+        [(4300, None), (4301, None)],
+        "no boot clock, no birth"
+    );
+}
+
+#[test]
+fn uptime_reads_to_the_nanosecond() {
+    assert_eq!(
+        linux::parse_uptime_ns("3609.50 7200.00\n"),
+        Some(3_609_500_000_000)
+    );
+    assert_eq!(linux::parse_uptime_ns("12 7\n"), Some(12_000_000_000));
+    assert_eq!(linux::parse_uptime_ns("0.000000001"), Some(1));
+    assert_eq!(
+        linux::parse_uptime_ns("1.0000000001"),
+        None,
+        "past the nanosecond"
+    );
+    assert_eq!(linux::parse_uptime_ns("1.-5"), None);
+    assert_eq!(linux::parse_uptime_ns(""), None);
+    assert_eq!(linux::parse_uptime_ns("18446744074 0"), None, "past u64 ns");
+}
+
 #[test]
 fn a_long_groups_line_never_cuts_the_footprint() {
     let status = |groups: usize| {

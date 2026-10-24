@@ -75,7 +75,10 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 /// Pulls that arm the split set (`sys why`).
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
 
-/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own `Demand` while a live job stands, and at the latest after Slow's 30 s while a program of this user has not started (macOS's program check holds it, Rosetta translates it, or its volume is not proven local: [`holds_a_wait`](crate::vitals_jobs::holds_a_wait)), for as long as that row stands, or while the backed-up episode has not yet had its closing reading (leftover §5.1, §9); else `None`. The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
+/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own
+/// `Demand` while a live job stands, and within Slow's 30 s while the view
+/// [`holds_a_wait`](crate::vitals_jobs::holds_a_wait); else `None`. Never under [`JOBS_FLOOR`].
+/// The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
 fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     let live = view
         .rows
@@ -92,7 +95,11 @@ fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     Some(Duration::from_millis(every).max(JOBS_FLOOR))
 }
 
-/// THE EPISODE EDGE `after`'s findings make against `before`'s (leftover §5.1): `Opened` when `after` stands in a backed-up episode that `before` did not (another opening, or none); else `Drained` when `after` names the episode that closed at it and `before` did not, or `before` stood in an episode and `after` stands in none (the drained view itself skipped); else `None`, so a view adopted again makes no edge.
+/// The episode edge `after`'s findings make against `before`'s: `Opened` when `after` stands in a
+/// backed-up episode `before` did not (another opening, or none); else `Drained` when `after` names
+/// the episode that closed at it and `before` did not, or `before` stood in an episode and `after`
+/// stands in none (the drained view itself skipped); else `None`, so a view adopted again makes no
+/// edge.
 pub(crate) fn held_edge(
     before: Option<&aterm_vitals::jobs::Findings>,
     after: &aterm_vitals::jobs::Findings,
@@ -109,7 +116,9 @@ pub(crate) fn held_edge(
         .map(HeldEdge::Drained)
 }
 
-/// THE PROGRAMS `after` NAMES AS NOT STARTED THAT `before` DID NOT (leftover §5.1): its `translating` and `not_started` findings whose pid `before`'s same list lacks, each with what keeps it, so a view adopted again names none and each program is told once while it stands.
+/// The programs `after` names as not started that `before` did not: its `translating` and
+/// `not_started` findings whose pid `before`'s same list lacks, each with what keeps it, so a view
+/// adopted again names none and each program is told once while it stands.
 pub(crate) fn newly_not_started<'a>(
     before: Option<&aterm_vitals::jobs::Findings>,
     after: &'a aterm_vitals::jobs::Findings,
@@ -202,12 +211,11 @@ pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 #[derive(Default)]
 pub(crate) struct Handover {
     snap: Option<Arc<Snapshot>>,
-    /// When the probe thread began the oldest of the readings handed over since the loop last
-    /// adopted one that carry `snap`'s jobs view: no later than that view's making when one of
-    /// them made it (a later reading may carry the view an earlier one made). A reading with a
-    /// new view starts this again, since an earlier reading's start (a `sys` pull's, which wakes
-    /// no one, while the loop slept) is not the new view's; a view the loop already adopted keeps
-    /// its first post on the board (`JobsBoard::post`).
+    /// When the probe thread began the oldest reading, handed over since the loop last adopted one,
+    /// that carries `snap`'s jobs view, so the view is dated no later than its making. A reading
+    /// with a new view restarts it, since an earlier reading's start (a `sys` pull's while the loop
+    /// slept) is not the new view's; a view the loop already adopted keeps its first post on the
+    /// board (`JobsBoard::post`).
     began: Option<Instant>,
     words: Vec<WordSeen>,
     job_events: Vec<aterm_vitals::events::Event>,
@@ -264,11 +272,13 @@ fn due_at(
 pub(crate) struct Request {
     /// This process's pid (aterm's tree is rooted here).
     pub(crate) self_pid: u32,
-    /// Every pane's shell: each terminal session a tab holds is its own root, so a split pane's processes count in that pane.
+    /// Every pane's shell: each terminal session a tab holds is its own root, so a split pane's
+    /// processes count in that pane.
     pub(crate) tabs: Vec<TabRoot>,
     /// Those roots' terminal mode words, where read ([`TtyWord`]).
     pub(crate) ttys: Vec<TtyWord>,
-    /// What those roots' PTY readers read, read again at each pass ([`crate::vitals_jobs::JobFeed`]).
+    /// What those roots' PTY readers read, read again at each pass
+    /// ([`crate::vitals_jobs::JobFeed`]).
     pub(crate) feeds: Vec<(u64, Arc<crate::vitals_jobs::JobFeed>)>,
     /// The keys driven into those roots' terminals, counted again at each pass
     /// ([`crate::vitals_jobs::JobFeed::typed_at`]).
@@ -277,19 +287,19 @@ pub(crate) struct Request {
     pub(crate) layout: Vec<PaneFact>,
     /// Authenticated global session ids for those process-local tab keys.
     pub(crate) session_ids: Vec<(u64, String)>,
-    /// The cadence this reading was asked at, ms: the gap rule's (v2 §5.4).
+    /// The cadence this reading was asked at, ms: the gap rule's (Stats Deck v2 §5.4).
     pub(crate) cadence_ms: u32,
-    /// Read the machine counters alone: every window that draws the bars is hidden (v2 §5.3).
+    /// Read the machine counters alone: every window that draws the bars is hidden (Stats Deck v2
+    /// §5.3).
     pub(crate) machine_only: bool,
     /// The stuck engine looks at this reading even inside its own cadence.
     pub(crate) jobs_now: bool,
     /// A control worker's pull ([`Msg::Pull`]; the thread sets it): it reads
     /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]).
     pub(crate) pull: bool,
-    /// A window in view shows the bars, as the Deck or the Sill (the Fleet
-    /// Monitor tab alone shows none): only then is the bars' reading a split
-    /// tick ([`split_due`]). The Sill draws no cause clause, but a close-up
-    /// opens from it as from the Deck, and a close-up's causes are the
+    /// A window in view shows the bars, as the Deck or the Sill (the Fleet Monitor tab alone shows
+    /// none): only then is the bars' reading a split tick ([`split_due`]). The Sill draws no cause
+    /// clause, but a close-up opens from it as from the Deck, and a close-up's causes are the
     /// episodes already open.
     pub(crate) deck: bool,
     /// Every agent session's token totals, each session once.
@@ -380,12 +390,10 @@ impl TtyWord {
 
     /// Returns the engine's word while no key was driven since the read. While no feed moved the
     /// screen since, it was read after every output the jobs feed holds, so it is stamped
-    /// `u64::MAX`, newer than each of their stamps however the ms round
-    /// ([`crate::vitals_jobs::JobFeed::at`]). After one it keeps its mode, which judges the job's
-    /// output, but is stamped 0, before every output stamp, so the engine names no wait from it (a
-    /// word older than the job's last output names none). Dropping that word instead left a
-    /// program that redraws all the time with no mode, judged canonical, and its output never
-    /// counted.
+    /// `u64::MAX`, newer than each of their stamps ([`crate::vitals_jobs::JobFeed::at_pass`]).
+    /// After one it keeps its mode, which judges the job's output, but is stamped 0, before every
+    /// output stamp, so the engine names no wait from it. Dropping the word instead would leave a
+    /// program that redraws all the time with no mode, judged canonical, and its output uncounted.
     pub(crate) fn current(&self) -> Option<(u64, aterm_vitals::jobs::TtyMode)> {
         (self.input.get() == self.input_seen).then(|| {
             let moved = self.output.count() != self.output_seen;
@@ -435,7 +443,8 @@ pub(crate) struct Parked {
     pub(crate) pgid: u32,
     /// The word the engine named the read from.
     pub(crate) word: WordSeen,
-    /// When a reading last looked at the session: the view that parked it, or its own write's [`OutputEdge::Recheck`].
+    /// When a reading last looked at the session: the view that parked it, or its own write's
+    /// [`OutputEdge::Recheck`].
     pub(crate) read_at: Instant,
 }
 
@@ -481,14 +490,14 @@ impl Parked {
     }
 }
 
-/// HOW MANY OF THE PTY READER'S FEEDS MOVED THE SCREEN (`docs/DESIGN-system-awareness-2026-10-16.md`
-/// §6.1, "What brings job demand back"): counted by the reader under its own hold of the term lock,
-/// after each feed, where the screen's generation ([`crate::control::screen_gen`]) is not the one it
-/// saw after its last feed. The output wake reads it WITHOUT the term lock
+/// How many of the PTY reader's feeds moved the screen
+/// (`docs/DESIGN-system-awareness-2026-10-16.md` §6.1): counted by the reader under its hold of the
+/// term lock, after each feed whose screen generation ([`crate::control::screen_gen`]) is not the
+/// one it saw after its last feed. The output wake reads it without the term lock
 /// ([`crate::App::vitals_output_kind`]), so a lock held elsewhere (a control worker's `text` or
-/// `status`, a watcher the same burst rang) never passes for a move, and a reading's terminal mode
-/// word holds while it stands ([`TtyWord`]): a write that moves no cell, such as Muse Code's colour
-/// reset at rest, never arms `system_vitals` (`docs/measured/vitals-3-2026-10-22.md`, V1).
+/// `status`) never passes for a move, and a reading's terminal mode word holds while it stands
+/// ([`TtyWord`]): a write that moves no cell, such as a colour reset at rest, never arms
+/// `system_vitals` (`docs/measured/vitals-3-2026-10-22.md`, V1).
 #[derive(Debug, Default)]
 pub(crate) struct ScreenMoves {
     /// The generation the reader saw after its last feed; only the feeding side takes it.
@@ -507,13 +516,13 @@ impl ScreenMoves {
             != Some(now);
         if moved {
             self.moves.fetch_add(1, Ordering::Release);
-            // THE WAKE PROTOCOL'S STORE-BUFFER PAIR, with [`Self::count_after_clear`]: the reader
+            // The wake protocol's store-buffer pair, with [`Self::count_after_clear`]: the reader
             // counts this move, then reads the session's wake latch to post or coalesce its wake;
             // the output wake clears that latch, then reads this count. Without a fence on each
-            // side both reads may take the value from before the other's write (the store-buffer
-            // outcome, which Release and Acquire allow): the reader coalesces into a wake whose
-            // pass reads the old count, and the move is no edge until the next one. The wake reads
-            // the count without the term lock, so only these fences order the two.
+            // side both reads may take the value from before the other's write (Release and
+            // Acquire allow it): the reader coalesces into a wake whose pass reads the old count,
+            // and the move is no edge until the next one. The wake reads the count without the
+            // term lock, so only these fences order the two.
             fence(Ordering::SeqCst);
         }
         moved
@@ -560,7 +569,8 @@ pub(crate) struct VitalsHost {
     latest: Arc<Mutex<Handover>>,
     /// The snapshot the Deck draws.
     pub(crate) snapshot: Option<Arc<Snapshot>>,
-    /// When the held snapshot's jobs view was adopted: where a reading no window shows counts its next from ([`Self::windowless_due`]).
+    /// When the held snapshot's jobs view was adopted: what a reading no window shows counts its
+    /// next from ([`Self::windowless_due`]).
     pub(crate) adopted_at: Option<Instant>,
     /// When the probe thread began the oldest reading carrying the held snapshot's jobs view
     /// since the adoption before (`Handover::began`): what the jobs board counts a new view's
@@ -590,6 +600,13 @@ pub(crate) struct VitalsHost {
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
+    /// The deck scene read in place of the machine (`ATERM_DEBUG_SCENE`, [`crate::icon_scene`]):
+    /// every reader of [`Self::snapshot`] (the deck, its lens, the tab meters, the jobs board)
+    /// reads the scene's facts ([`crate::icon_scene::deck_reading`]), and the deck's and its
+    /// lens's front tab is the scene window's ([`crate::App::deck_frame`],
+    /// [`crate::App::deck_tab_panes`]).
+    #[cfg(debug_assertions)]
+    pub(crate) deck_scene: Option<aterm_vitals::fixtures::DeckScene>,
 }
 
 impl Default for VitalsHost {
@@ -629,6 +646,8 @@ impl Default for VitalsHost {
             } else {
                 &PROC_EDGE
             },
+            #[cfg(debug_assertions)]
+            deck_scene: crate::icon_scene::deck(),
         }
     }
 }
@@ -657,6 +676,8 @@ impl VitalsHost {
             let over = self.job_events.len() - JOB_EVENTS_CAP;
             self.job_events.drain(..over);
         }
+        #[cfg(debug_assertions)]
+        let fresh = fresh.map(|snap| crate::icon_scene::deck_reading(self.deck_scene, snap));
         match fresh {
             Some(snap) if self.snapshot.as_ref().is_none_or(|s| s.seq != snap.seq) => {
                 let held = self.snapshot.as_ref().and_then(|s| s.jobs.as_ref());
@@ -1215,7 +1236,7 @@ impl CoalProbe {
     };
 }
 
-/// Threshold above which a split tick reads the whole process table for
+/// Threshold above which a reading reads the whole process table for
 /// births: one process's record (`KERN_PROC_PID`) cost 6.4 µs of CPU and
 /// the table's ~700 records 83 µs (m22, 2026-10-23), so past about a dozen
 /// the table is cheaper.
@@ -1268,6 +1289,9 @@ pub(crate) struct SplitReader {
     armed: &'static Arming,
     last: Option<Instant>,
     births: IdMap<u32, Birth>,
+    /// When [`Self::births`] last read: its own gap clock, since births are
+    /// read on every whole reading, split tick or not.
+    births_at: Option<Instant>,
     /// Each lead's identity by pid, kept while it leads and its birth and
     /// pid version stay ([`Self::identity`]).
     idents: IdMap<u32, Ident>,
@@ -1307,6 +1331,7 @@ impl SplitReader {
             armed,
             last: None,
             births: IdMap::default(),
+            births_at: None,
             idents: IdMap::default(),
             coalition_ids: aterm_sysprobe::coalitions::CoalitionIds::default(),
             wake_seen: None,
@@ -1326,27 +1351,30 @@ impl SplitReader {
             })
     }
 
-    fn fill(
-        &mut self,
-        sample: &mut Sample,
-        read: aterm_sysprobe::coalitions::CoalitionRead,
-        now: Instant,
-    ) {
+    /// Each swept process's birth where the sweep gave none (macOS, whose
+    /// sweep start is Mach time): kept under its name and kernel start (or
+    /// pid version), else read from its kernel record, or from the whole
+    /// table past [`BIRTHS_AT_ONCE`] unread. Run on every whole reading (one
+    /// with a sweep), not only on split ticks, so a program's age
+    /// ([`aterm_vitals::model::ProgramGroup`]) needs no coalitions lane.
+    pub(crate) fn births(&mut self, sample: &mut Sample, now: Instant) {
         let Some(procs) = sample.procs.as_mut() else {
             return;
         };
         if self
-            .last
+            .births_at
             .is_some_and(|t| now.saturating_duration_since(t) > SPLIT_WINDOW_MAX)
         {
             self.births.clear();
-            self.idents.clear();
         }
+        self.births_at = Some(now);
         let swept: IdSet<u32> = procs.iter().map(|p| p.pid).collect();
         self.births.retain(|pid, _| swept.contains(pid));
         let mut unread = Vec::new();
         for (i, p) in procs.iter_mut().enumerate() {
-            p.birth_ms = self.known(p);
+            if p.birth_ms.is_none() {
+                p.birth_ms = self.known(p);
+            }
             if p.birth_ms.is_none() {
                 unread.push(i);
             }
@@ -1357,6 +1385,25 @@ impl SplitReader {
         for i in unread {
             procs[i].birth_ms = self.read_birth(&procs[i], table.as_ref());
         }
+    }
+
+    fn fill(
+        &mut self,
+        sample: &mut Sample,
+        read: aterm_sysprobe::coalitions::CoalitionRead,
+        now: Instant,
+    ) {
+        if sample.procs.is_none() {
+            return;
+        }
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) > SPLIT_WINDOW_MAX)
+        {
+            self.idents.clear();
+        }
+        self.births(sample, now);
+        let procs = sample.procs.as_deref().unwrap_or_default();
         let born: IdMap<u32, (i64, Option<i32>)> = procs
             .iter()
             .filter_map(|p| Some((p.pid, (p.birth_ms?, p.version))))
@@ -1660,13 +1707,12 @@ pub(crate) struct TabReads {
 }
 
 impl Request {
-    /// Reads the pass's clock (`now`, ms past `epoch`, at 1 ms at the least), then each feed on
-    /// it, then each current mode word. A reading takes them before its sweep: a block's `D` and
-    /// the exit of the command it closes, read while the sweep runs, are the next pass's, never a
-    /// closed block over a member the sweep still saw (a false orphan). A feed rounds its stamps
-    /// up ([`crate::vitals_jobs::JobFeed::at`]), so whatever a reader reads after the clock is
-    /// stamped past it: no later than the next pass's, never at none, and a line or output stamped
-    /// past the pass's millisecond waits for the next pass ([`crate::vitals_jobs::JobFeed::at_pass`]).
+    /// Reads the pass's clock (`now`, ms past `epoch`, at least 1 ms), then each feed on it, then
+    /// each current mode word. A reading takes them before its sweep, so a block's `D` and the exit
+    /// of the command it closes, read while the sweep runs, are the next pass's, never a closed
+    /// block over a member the sweep still saw (a false orphan). A feed rounds its stamps up
+    /// ([`crate::vitals_jobs::JobFeed::at_pass`]), so whatever a reader reads after the clock is
+    /// stamped past it, and a line or output stamped past the clock waits for the next pass.
     pub(crate) fn tab_reads(&self, epoch: Instant, now: impl FnOnce() -> Instant) -> TabReads {
         let clock = now();
         let at_ms = u64::try_from(clock.saturating_duration_since(epoch).as_millis())
@@ -1871,6 +1917,11 @@ impl Reader {
         });
         if let Some(read) = coalitions {
             self.split.fill(&mut sample, read, now);
+        } else {
+            // Every whole reading, a jobs-only edge's too: `sys` answers a
+            // pull from whichever whole reading is fresh, so one read without
+            // births would leave its ages unread on macOS.
+            self.split.births(&mut sample, now);
         }
         let scene = self.fixture.as_mut().map(|fixture| {
             if split {
@@ -2049,7 +2100,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         }),
         coalition: p.coalition,
         version: p.version,
-        birth_ms: None,
+        birth_ms: p.birth_ms,
     }
 }
 
@@ -2669,8 +2720,8 @@ impl crate::App {
             self.serve_windowless_vitals(audience, now, delegated);
             return;
         };
-        // A call at no progress is told only from a view 5 s old: while one stands, a window
-        // slower than the engine reads a beat past its cadence (`vitals_jobs::told_after`).
+        // A call at no progress is told only from a view at most 5 s old: while one stands, a
+        // window slower than the engine reads a beat past its cadence (`vitals_jobs::told_after`).
         let period = self
             .vitals
             .snapshot
@@ -2783,11 +2834,11 @@ impl crate::App {
             if self.ask_reading(now, period, false, true) || !self.vitals.reader_runs() {
                 self.vitals.jobs_dropped = None;
             } else {
-                // The queue was full (a `sys` pull reading, two more asks behind it): a pull's
-                // reading wakes no one, so ask again at the floor, not at the next edge or look.
-                // The pull's own whole reading, adopted first at that wake, need not have looked
-                // (its engine paced, `jobs_now` off), so the ask stays owed until one begun since
-                // makes a new view (`VitalsHost::adopt`).
+                // The queue was full (a `sys` pull's reading, two more asks behind it). A pull's
+                // reading wakes no one, so ask again at the floor, not at the next edge or look;
+                // the pull's own reading need not have looked (its engine paced, `jobs_now` off),
+                // so the ask stays owed until one begun since makes a new view
+                // (`VitalsHost::adopt`).
                 self.vitals.jobs_dropped = Some(now);
                 self.vitals.jobs_due = Some(now + JOBS_FLOOR);
             }
@@ -2958,7 +3009,11 @@ impl crate::App {
         }
     }
 
-    /// WHAT THE VIEW JUST ADOPTED SAYS OF MACOS'S PROGRAM CHECK (leftover §5.1, §6.5): one `program-check.` record per episode edge it makes against `before` ([`held_edge`]), one naming the programs it first says have not started for another reason ([`newly_not_started`]), and a verdict refresh an episode held back ([`Self::refresh_devtools_verdict`]) started once the view stands in none.
+    /// Records what the view just adopted says of macOS's program check: one `program-check.`
+    /// record per episode edge it makes against `before` ([`held_edge`]), one naming the programs
+    /// it first says have not started for another reason ([`newly_not_started`]), and, once the
+    /// view stands in no episode, the verdict refresh an episode held back
+    /// ([`Self::refresh_devtools_verdict`]).
     fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
         let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone()) else {
             return;
@@ -2978,7 +3033,10 @@ impl crate::App {
         }
     }
 
-    /// ASKS MACOS ABOUT ATERM AGAIN ([`crate::devtools_helper::Lane::refresh_verdict`]) unless the adopted jobs view stands in a backed-up episode of macOS's program check: the prime is itself a new program and would wait in that line (leftover §5.1, §13), so it is held until the next view that stands in none ([`Self::note_held_episode`]).
+    /// Asks macOS about aterm again ([`crate::devtools_helper::Lane::refresh_verdict`]) unless the
+    /// adopted jobs view stands in a backed-up episode of macOS's program check: the prime is
+    /// itself a new program and would wait in that line, so it is held until the next view that
+    /// stands in none ([`Self::note_held_episode`]).
     pub(crate) fn refresh_devtools_verdict(&mut self) {
         let backed_up = self
             .jobs_view_now(Instant::now())
@@ -2994,7 +3052,8 @@ impl crate::App {
         }
     }
 
-    /// The adopted jobs view while it speaks for now ([`crate::vitals_jobs::speaks_for_now`]), and its age at `now`.
+    /// The adopted jobs view while it speaks for now ([`crate::vitals_jobs::speaks_for_now`]), and
+    /// its age at `now`.
     fn jobs_view_now(&self, now: Instant) -> Option<(&aterm_vitals::jobs::JobsView, Duration)> {
         let view = self.vitals.snapshot.as_ref()?.jobs.as_deref()?;
         let age = now.saturating_duration_since(self.vitals.adopted_at?);
@@ -3309,8 +3368,13 @@ impl crate::App {
     /// The sessions of this window's front tab ([`Self::tab_sessions`]): the
     /// tab the deck, its lens and Why now take as "this tab", as `sys why`
     /// takes its caller's (a tab split into panes is one,
-    /// [`aterm_vitals::model::TabRoot::tab`]).
+    /// [`aterm_vitals::model::TabRoot::tab`]). Under a debug build's deck scene
+    /// (`VitalsHost::deck_scene`), the scene window's front tab's: the panes its readings name.
     pub(crate) fn deck_tab_panes(&self, wid: crate::WindowId) -> Vec<u64> {
+        #[cfg(debug_assertions)]
+        if let Some(scene) = self.vitals.deck_scene {
+            return crate::stats_deck::deck_fixtures::DeckContext::of(scene).panes;
+        }
         self.windows
             .get(&wid)
             .and_then(|ws| ws.tab_set.active_index().and_then(|i| ws.tab_set.tab_at(i)))

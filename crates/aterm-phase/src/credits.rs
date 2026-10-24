@@ -75,7 +75,7 @@ pub fn in_use(rows: &[String]) -> Option<Credits> {
             }
         }
         if let Some(rest) = segment
-            .strip_prefix(crate::anchors::anchor("credits.in_use"))
+            .strip_prefix(crate::anchor!("credits.in_use"))
             .and_then(|rest| rest.strip_prefix(" for "))
         {
             let (name, tail) = rest
@@ -154,7 +154,7 @@ fn started(rest: &str) -> Started {
 /// The vendor's warning that the session or the weekly window is filling (module docs): `You've used <n>% of your session limit · resets <time>`, or of the `weekly limit`.
 #[must_use]
 pub fn usage_warning(rows: &[String]) -> Option<Warning> {
-    let lead = const { crate::anchors::anchor_text("usage.warning") };
+    let lead = const { crate::anchor!("usage.warning") };
     segments(rows).find_map(|segment| {
         let rest = segment.strip_prefix(lead)?.strip_prefix(' ')?;
         let (pct, rest) = rest.split_once("% of your ")?;

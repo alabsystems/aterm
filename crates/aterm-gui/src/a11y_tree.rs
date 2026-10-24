@@ -441,8 +441,9 @@ impl HarnessChip {
 }
 
 /// What a screen reader names the Account chip ([`HarnessChip::Account`]) of a session of
-/// `cli`'s pool: another CLI's names its product and the roster label its login is judged to
-/// (`Codex CLI · codex-1`; the product alone where none is judged), so a reader hears which
+/// `cli`'s pool: another CLI's names its product and the label its login is judged to in that
+/// CLI's own pool (`Codex CLI · codex-1`; the product alone where none is judged, as where only
+/// the footer's account, which Claude Code's roster judges, is known), so a reader hears which
 /// CLI's account it is; Claude Code's is `None`, its footer fact's own words standing
 /// (`claude_facts::fact_spoken_of`).
 pub(crate) fn account_chip_label(
